@@ -485,6 +485,7 @@ unsafe fn accept(
         to[11] = token;
         k.s.boost(r, (*slot.as_ptr()).priority(), ceiling(r));
         (*r.as_ptr()).boost_token = token;
+        thread::set_server(client, r);
     }
 }
 
@@ -623,12 +624,81 @@ pub unsafe fn cancel(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
 /// thread_set_priority of `t` (sched::set_priority): the slot of a thread
 /// that waits moves in its queue, a channel's or that of accepted
 /// requests, to the level of the thread's new effective priority, by the
-/// rules of the ready queue (spec 6.1, 6.3). Returns the wait, for `raise`
-/// after the scheduler's lock. O(1).
+/// rules of the ready queue (spec 6.1, 6.3). A client that waits for a
+/// reply and rose also raises the thread that works on its request, and the
+/// threads behind it, up to LIFT_DEPTH (`lift_servers`, spec 6.6). Returns
+/// the wait, for `raise` after the scheduler's lock. O(LIFT_DEPTH).
 ///
 /// # Safety
 /// As for `withdraw`.
 pub unsafe fn requeue(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Wait> {
+    // SAFETY: the caller's promise.
+    let waits = unsafe { move_slot(t, k) };
+    if let Some(Wait::Reply(_)) = waits {
+        // SAFETY: the caller's promise.
+        unsafe { lift_servers(t, k) };
+    }
+    waits
+}
+
+/// How many threads a rise of priority climbs along the chain of requests:
+/// the client's server, the server's own server, and so on (the layer's
+/// inheritance goes as deep, lib/posix-abi/src/sched.rs).
+const LIFT_DEPTH: usize = 8;
+
+/// The thread working on the request `client` waits for the reply to, if it
+/// still works on that request: it accepted it (`accept` noted its number)
+/// and its boost still carries the request's token (the reply and its next
+/// receive end it, and the number may name another thread by now).
+///
+/// # Safety
+/// `client` is alive; `k` is the locked scheduler.
+unsafe fn serving(client: NonNull<Thread>, k: &Locked<'_>) -> Option<NonNull<Thread>> {
+    // SAFETY: the caller's promise; a taken number names a live thread.
+    unsafe {
+        if !matches!((*client.as_ptr()).waits, Some(Wait::Reply(_))) {
+            return None;
+        }
+        let server = k.tokens.thread(thread::served_by(client)?)?;
+        (server != client
+            && (*server.as_ptr()).boost_token == k.tokens.last_token(thread::index(client)))
+        .then_some(server)
+    }
+}
+
+/// The client `client` waits for a reply at a level it has been raised to
+/// (`requeue`): the thread that works on its request works at that level
+/// at least, under its own ceiling, as at `accept`; if that thread waits
+/// for a reply in its turn, its slot follows its new level and the
+/// thread behind it is raised, up to LIFT_DEPTH threads. The ends of the
+/// chain that wait in a channel's queue have their slots moved and nothing
+/// more. O(LIFT_DEPTH).
+///
+/// # Safety
+/// As for `requeue`.
+unsafe fn lift_servers(client: NonNull<Thread>, k: &mut Locked<'_>) {
+    let mut from = client;
+    for _ in 0..LIFT_DEPTH {
+        // SAFETY: the caller's promise.
+        unsafe {
+            let Some(server) = serving(from, k) else {
+                return;
+            };
+            k.s.boost(server, from.as_ref().priority(), ceiling(server));
+            match move_slot(server, k) {
+                Some(Wait::Reply(_)) => from = server,
+                _ => return,
+            }
+        }
+    }
+}
+
+/// The slot of `t` moves in the queue it waits in to the level of its
+/// effective priority; the wait comes back.
+///
+/// # Safety
+/// As for `requeue`.
+unsafe fn move_slot(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Wait> {
     let slot = thread::slot(t);
     // SAFETY: the caller's promise, as in `withdraw`.
     unsafe {

@@ -427,6 +427,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::interrupt_leaves_an_accepted_request,
     ),
     (
+        "raising_a_client_raises_the_thread_that_serves_it",
+        calls::raising_a_client_raises_the_thread_that_serves_it,
+    ),
+    (
+        "a_rise_stops_at_a_server_that_went_back_to_receive",
+        calls::a_rise_stops_at_a_server_that_went_back_to_receive,
+    ),
+    (
+        "a_rise_climbs_a_chain_of_requests_eight_deep",
+        calls::a_rise_climbs_a_chain_of_requests_eight_deep,
+    ),
+    (
         "upcall_request_waits_for_the_reply",
         calls::upcall_request_waits_for_the_reply,
     ),

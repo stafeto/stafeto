@@ -80,11 +80,10 @@ pub struct Thread {
     /// its buffer (`drop_long`). Only `begin_long`, `update_long`,
     /// `end_long` and `drop_long` change it.
     long: Option<Long>,
-    /// Its number in the system table (spec 6.1, 7.8), from `create` until
-    /// it ends (sched::exit) or, when it never started, until its portion
-    /// of cleanup: the tokens of its requests carry it. None once it went
-    /// back (`give_number`), so a taken number always names a live thread.
-    index: Option<u16>,
+    /// Its number in the system table (spec 6.1, 7.8): the tokens of its
+    /// requests carry it, and a taken number always names a live thread;
+    /// and the number of the thread that serves its request.
+    numbers: Numbers,
     /// The token of the request whose client boosts it (spec 6.6): a reply
     /// with it ends the boost. 0 when a notification boosts it, or nothing.
     pub boost_token: u64,
@@ -107,6 +106,24 @@ pub struct Thread {
     /// channel's queue; the thread holds the channel, with one of its
     /// slots, until its portion. Set once at `create`.
     exit: Option<Source>,
+}
+
+/// The two system numbers a thread has, in one word so that they take the
+/// place of the one the thread had (the fields after them keep their
+/// offsets).
+#[derive(Clone, Copy)]
+#[repr(align(8))]
+struct Numbers {
+    /// Its number, from `create` until it ends (sched::exit) or, when it
+    /// never started, until its portion of cleanup; None once it went
+    /// back (`give_number`).
+    index: Option<u16>,
+    /// The number of the thread that accepted the request this thread
+    /// waits for the reply to (`accept`, spec 6.1): a rise of this thread's
+    /// priority goes on to that thread while its `boost_token` is the
+    /// token of the request (`channel::requeue`). Stale once the request is
+    /// answered; the token tells.
+    served_by: Option<u16>,
 }
 
 /// The bits of the notification of a thread's end (spec 6.5): bit 0, once.
@@ -150,6 +167,10 @@ struct Buffer {
 }
 
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
+// The cold tail of the path of a signal (S5, p99) follows the layout of
+// the thread: a field that grows it moves the fields behind it.
+const _: () = assert!(core::mem::size_of::<Numbers>() == 8);
+const _: () = assert!(core::mem::size_of::<Thread>() == 1360);
 const _: () = assert!(
     core::mem::size_of::<UserRegs>() + core::mem::size_of::<FpRegs>() == abi::UPCALL_CONTEXT_SIZE
 );
@@ -252,7 +273,10 @@ pub fn create_with_exit(
         slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
         transit: [None; MESSAGE_HANDLES],
         long: None,
-        index: None,
+        numbers: Numbers {
+            index: None,
+            served_by: None,
+        },
         boost_token: 0,
         siblings: None,
         buffer: None,
@@ -271,7 +295,7 @@ pub fn create_with_exit(
     // slot is in no queue.
     unsafe {
         (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
-        (*thread.as_ptr()).index = Some(index);
+        (*thread.as_ptr()).numbers.index = Some(index);
         if let (Some(source), Some((_, label, notice))) = ((*thread.as_ptr()).exit.as_mut(), exit) {
             source.attach(Owner::ThreadEnd(thread), notice, label);
         }
@@ -303,7 +327,24 @@ pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
 /// has not ended holds.
 pub fn index(t: NonNull<Thread>) -> u16 {
     // SAFETY: the caller holds the thread; only the field is read.
-    unsafe { (*t.as_ptr()).index }.expect("a thread that has not ended holds its number")
+    unsafe { (*t.as_ptr()).numbers.index }.expect("a thread that has not ended holds its number")
+}
+
+/// The thread `server` accepted the request of `client`, which waits for
+/// the reply (`channel::accept`).
+///
+/// # Safety
+/// Both are alive; `server` holds its number; the scheduler's lock is held.
+pub unsafe fn set_server(client: NonNull<Thread>, server: NonNull<Thread>) {
+    // SAFETY: the caller's promise; only the field is written.
+    unsafe { (*client.as_ptr()).numbers.served_by = Some(index(server)) };
+}
+
+/// The number of the thread that accepted the request `t` waits for the
+/// reply to, if `t` ever waited for one.
+pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).numbers.served_by }
 }
 
 /// Gives the number of `t` back to the table of thread numbers `tokens`,
@@ -314,7 +355,7 @@ pub fn index(t: NonNull<Thread>) -> u16 {
 /// `t` is alive; `tokens` is the locked table (sched::locked).
 pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     // SAFETY: the caller's promise; only the field is touched.
-    if let Some(index) = unsafe { (*t.as_ptr()).index.take() } {
+    if let Some(index) = unsafe { (*t.as_ptr()).numbers.index.take() } {
         tokens.free(index);
     }
 }
