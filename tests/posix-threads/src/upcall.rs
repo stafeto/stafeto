@@ -116,7 +116,9 @@ unsafe extern "C" fn dispatch() {
             (0x2000u64, pc, 5u64, buffer),
             (0x2000, pc, 0x80, buffer),
             (0x2000, pc, 0, buffer + 4096),
-            (0x2008, pc, 0, buffer),
+            // Past the lower half; a pointer that is not a multiple of 16
+            // is a valid one, which the processor checks at its first use.
+            (1 << 63, pc, 0, buffer),
             (0x2000, pc + 2, 0, buffer),
         ] {
             for (index, value) in [(31, sp), (32, pc), (33, flags), (35, buffer)] {

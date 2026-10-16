@@ -2793,8 +2793,16 @@ pub fn fault_during_a_long_call_does_not_enter(_: &Boot) -> Result<(), &'static 
 /// A return restores the exact native context: every general register, the
 /// stack pointer, the program counter, the flags of PSTATE, TPIDR_EL0 and the
 /// FP registers with FPCR and FPSR. The thread starts with all of those at
-/// zero, so the context sets each of them to a value that differs.
+/// zero, so the context sets each of them to a value that differs. A stack
+/// pointer that is not a multiple of 16 comes back as it was: code that
+/// faulted with an unaligned SP (the entry ran on it aligned down) must
+/// resume on it.
 pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(), &'static str> {
+    restore_native_context(0x80_1000)?;
+    restore_native_context(0x80_1008)
+}
+
+fn restore_native_context(sp: u64) -> Result<(), &'static str> {
     with_caller(|c| {
         use abi::UpcallControl as C;
         thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
@@ -2820,7 +2828,7 @@ pub fn upcall_return_restores_the_native_context_exactly(_: &Boot) -> Result<(),
         for (i, value) in context.iter_mut().enumerate() {
             *value = 0xABCD_0000 + i as u64;
         }
-        context[31] = 0x80_1000;
+        context[31] = sp;
         context[32] = pc;
         // N and C of NZCV, a thread pointer, FPCR.DN and FPSR.IOC.
         context[33] = 0xA000_0000;
