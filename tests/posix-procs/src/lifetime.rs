@@ -38,7 +38,6 @@ pub extern "C" fn ram_lifetime(pid: i32) -> i32 {
             let live = body.u32().map_err(|_| -8)?;
             let quota = body.u64().map_err(|_| -13)?;
             let used = body.u64().map_err(|_| -14)?;
-            let _lock_jobs = body.u32().map_err(|_| -16)?;
             let _places = body.u32().map_err(|_| -17)?;
             body.finish().map_err(|_| -9)?;
             if quota.saturating_sub(used) < 128 * 4096 {

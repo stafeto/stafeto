@@ -260,7 +260,7 @@ mod tests {
             assert!(read_wait_key(Reader::new(&extra)).is_err());
         }
         for method in [
-            Method::LockQuery,
+            Method::LockStart,
             Method::OpenCancel,
             Method::ChangeRelease,
             Method::WaitStart,

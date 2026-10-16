@@ -27,6 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=lock-deadlock.c");
     println!("cargo:rerun-if-changed=lock-simple-wait.c");
     println!("cargo:rerun-if-changed=lock-page-fragments.c");
+    println!("cargo:rerun-if-changed=lock-sweep-share.c");
     println!("cargo:rerun-if-changed=lock-fifo-full.c");
     println!("cargo:rerun-if-changed=files.c");
     println!("cargo:rerun-if-changed=stepfifo.inc");

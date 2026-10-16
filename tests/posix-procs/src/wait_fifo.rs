@@ -3,7 +3,6 @@
 //! Exact public WAIT receipts and notifications from two genuine workers.
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use posix_abi::WaitProbe;
-use posix_fs::wait::WaitToken;
 use proto_wire::Reader;
 static ARMED: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
 static SLOTS: [AtomicU32; 2] = [const { AtomicU32::new(u32::MAX) }; 2];
@@ -12,12 +11,12 @@ unsafe extern "C" {
     fn wait_fifo_index() -> u32;
     fn wait_fifo_ready(index: u32);
 }
-fn hook(phase: WaitProbe, token: WaitToken) -> bool {
+fn hook(phase: WaitProbe, key: proto_fs::WaitKey) -> bool {
     // SAFETY: the C fixture's TLS index is private to each worker.
     let index = unsafe { wait_fifo_index() }.wrapping_sub(1) as usize;
     if phase == WaitProbe::Receive && index < 2 && ARMED[index].swap(false, Ordering::AcqRel) {
-        SLOTS[index].store(token.slot() as u32, Ordering::Release);
-        GENERATIONS[index].store(token.generation(), Ordering::Release);
+        SLOTS[index].store(key.slot, Ordering::Release);
+        GENERATIONS[index].store(key.generation, Ordering::Release);
         // SAFETY: no native ownership or FILES_LOCK is held at this hook.
         unsafe { wait_fifo_ready(index as u32 + 1) };
     }

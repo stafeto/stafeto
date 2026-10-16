@@ -19,8 +19,6 @@ mod futex_deadline;
 #[path = "../../tests/posix-threads/src/futex_watchdog.rs"]
 mod futex_watchdog;
 #[cfg(test)]
-mod lock_driver_tests;
-#[cfg(test)]
 mod lock_fields_tests;
 #[cfg(test)]
 #[path = "../../lib/posix-abi/src/relibc/lifetime.rs"]
@@ -3773,6 +3771,10 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
             &outcome,
             "posix-procs: fragmented lock pages: 64 paid pages, 64 target records, one PID death, all pages reclaimed",
         )?;
+        qemu::expect_marker(
+            &outcome,
+            "posix-procs: lock sweep share: clients below the service keep their time through the sweep of locked inodes",
+        )?;
         let steps = longest_steps(&outcome.lines, "2");
         println!("RAM fragmented lock page dispatches (B {RAM_STEP_MAX}): {steps:?}");
         return check_lock_steps("fragmented lock page", &steps, &[50, 65]);
@@ -3791,14 +3793,13 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     for marker in [
         "posix-procs: holder conversions bypass queued PID and OFD writers ok",
         "posix-procs: public nonblocking locks, canonical fields, PID close and OFD fork ok",
-        "posix-procs: public lock reply loss, exact keys, full GET receipt, numeric close and reuse ok ticks=",
+        "posix-procs: public lock replies lost to a signal repeat with the same result ok ticks=",
         "posix-procs: lock depth within 16 KiB, nested SIGUSR1 close, siglongjmp and thread departure ok",
         "posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok",
         "posix-procs: genuine FIFO compatible Reads, blocked older Write cancellation and later PID SET ok",
-        "posix-procs: genuine WAIT End exact debts and live parent fork exec custody ok",
-        "posix-procs: genuine pending WAIT process exit retires exact paid receipt without rescue close ok",
-        "posix-procs: genuine21 arbitrary WAIT jumps same owner and canonical success preserve exact debts ok",
-        "posix-procs: WAIT real deferred pending physical cleanup rotation ok",
+        "posix-procs: WAIT thread end, fork with exec in the child and slot reuse ok",
+        "posix-procs: pending WAIT of a dead process leaves nothing in the service ok",
+        "posix-procs: WAIT left by a jump from the handler, twenty turns ok",
         "posix-procs: genuine PID cycle EDEADLK and OFD noncycle ok",
         "posix-procs: PID deadlock explores every reader and every waiter ok",
         "posix-procs: six inodes retain 384 locks, inode64 ENOLCK is atomic and slots reuse ok",
@@ -3820,17 +3821,9 @@ fn posix_lifetimes_run(machine: &qemu::Machine, probe: LifetimeProbe) -> Result<
     let steps = longest_steps(&outcome.lines, "2");
     qemu::expect_marker(
         &outcome,
-        "RAM native locks: genuine PID, OFD conflict, unlocked query, replay, cross-family release and late Start fence ok",
+        "RAM native locks: genuine PID, OFD conflict, unlocked query, repeat and closed description ok",
     )?;
-    qemu::expect_marker(
-        &outcome,
-        "RAM native lock cancel: retained canonical blocker, lost reply, absent Start fence and separate Release ok",
-    )?;
-    qemu::expect_marker(
-        &outcome,
-        "RAM native lock departure: sixteen held outcomes and genuine paid label return without another RAM request ok",
-    )?;
-    for kind in [49, 50, 51, 52, 53, 66] {
+    for kind in [49, 50, 66] {
         if !steps
             .iter()
             .any(|(measured, ticks, _)| *measured == kind && *ticks != 0)

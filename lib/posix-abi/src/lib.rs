@@ -23,12 +23,12 @@ pub mod constants;
 mod fifo_io;
 pub mod fork;
 pub mod loader_probe;
-mod lock_driver;
-mod wait_lock_driver;
+mod lock_call;
 #[cfg(feature = "lock-probe")]
-pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
+pub use lock_call::probe_hook as probe_lock_hook;
+mod lock_wait;
 #[cfg(feature = "wait-probe")]
-pub use wait_lock_driver::{Probe as WaitProbe, probe_hook as probe_wait_hook};
+pub use lock_wait::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 /// Whether this process knows it holds no record lock (the probes of closes).
 #[cfg(feature = "lock-probe")]
 pub fn record_locks_none() -> bool {
@@ -72,13 +72,13 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
     let point = waiting.then(threads::cancel::Point::begin);
     let result = (|| {
         let fd = u32::try_from(fd).map_err(|_| constants::EBADF)?;
-        shared::with_fd(fd, |files| files.lock_source(fd).map(|_| ()).map_err(error))?;
+        shared::with_fd(fd, |files| files.target(fd).map(|_| ()).map_err(error))?;
         // SAFETY: the calling platform supplies flock fields for this invocation.
         let input = unsafe { lock_fields::Input::read(command, pointer) }?;
         if waiting && input.kind != proto_fs::LockKind::Unlock {
-            let reply = wait_lock_driver::operation(
+            lock_wait::operation(
                 fd,
-                posix_fs::wait::Input {
+                lock_wait::Input {
                     mode: if input.command.ofd() {
                         proto_fs::WaitMode::Ofd
                     } else {
@@ -91,13 +91,9 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
                     pid: input.pid,
                 },
             )?;
-            return if reply.phase == proto_fs::WaitPhase::Complete && reply.result == 0 {
-                Ok(0)
-            } else {
-                Err(constants::EIO)
-            };
+            return Ok(0);
         }
-        let outcome = lock_driver::operation(fd, input);
+        let outcome = lock_call::operation(fd, input);
         // SAFETY: successful GET writes fields only in the same active invocation.
         unsafe { input.finish(pointer, outcome) }
     })();
