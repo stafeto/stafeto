@@ -5702,9 +5702,8 @@ fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<
 /// The keys of the line editor of the interactive shell, sent as a
 /// terminal sends them: each probe ends with the line the shell ran.
 fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
-    let line = |run: &mut qemu::Run, text: &'static str| {
-        run.expect_line(text, |l| l == text, DIALOG_STEP)
-    };
+    let line =
+        |run: &mut qemu::Run, text: &'static str| run.expect_line(text, |l| l == text, DIALOG_STEP);
     // History: Up brings back the last command.
     run.send("echo history-one")?;
     line(run, "history-one")?;
