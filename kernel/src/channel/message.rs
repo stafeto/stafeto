@@ -316,7 +316,7 @@ pub fn send(
         // queue since it was looked at: one CPU, and interrupts are masked
         // in the kernel (spec 8.1). The receiver it returns is alive.
         unsafe {
-            let r = meet(k, t, via, desc);
+            let r = meet(k, t, via, desc, crate::arch::timer::now());
             assert!(r == receiver, "the receiver of a request changed");
             if let Some(r) = r {
                 k.s.wake(r);
@@ -347,7 +347,7 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
     // Read before the scheduler's lock: the locks do not nest.
     let cleanup = cleanup::top();
     let next_timer = timer::first();
-    let r = sched::hand_off(next_timer, |k| {
+    let r = sched::hand_off(next_timer, |k, now| {
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive; a thread that waits in receive is alive, and
         // its slot lies in it.
@@ -363,7 +363,7 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
             if !k.s.can_hand_off(level, cleanup) || arch::irq_pending() || !testpoint::fast_path() {
                 return None;
             }
-            let taken = meet(k, t, via, desc);
+            let taken = meet(k, t, via, desc, now);
             assert!(taken == Some(r), "the receiver of a request changed");
             Some(r)
         }
@@ -383,9 +383,10 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
 /// channel for the wait: None. O(1).
 ///
 /// # Safety
-/// Under the scheduler's lock `k`: `t` runs and sends through `via`, whose
-/// channel is alive, with `desc`; its handles are on their way, and a
-/// receiver that waits has room for them in its process's table.
+/// Under the scheduler's lock `k`, at the counter value `now`: `t` runs and
+/// sends through `via`, whose channel is alive, with `desc`; its handles are
+/// on their way, and a receiver that waits has room for them in its
+/// process's table.
 /// Inlined into both paths: a call of its own costs each of them about 30
 /// instructions.
 #[inline(always)]
@@ -394,11 +395,12 @@ unsafe fn meet(
     t: NonNull<Thread>,
     via: Via,
     desc: Desc,
+    now: u64,
 ) -> Option<NonNull<Thread>> {
     // SAFETY: the caller's promise; a thread that waits in receive is
     // alive, and its slot lies in it.
     unsafe {
-        let running = k.s.block(crate::arch::timer::now());
+        let running = k.s.block(now);
         assert!(running == t, "a thread that does not run sends");
         let slot = thread::slot(t);
         (*slot.as_ptr()).set_priority(t.as_ref().priority());

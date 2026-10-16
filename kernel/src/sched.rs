@@ -390,18 +390,19 @@ pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
 }
 
 /// The fast path of send (spec 6.4): `meet` runs with the scheduler locked,
-/// as under `locked`, and either makes the meeting and returns the
-/// receiver, or returns None and changes nothing. The receiver then runs at
-/// once in place of the caller, which waits (Scheduler::hand_off), with a
-/// new quantum from now, and the timer is armed for the deadline it needs:
-/// the nearer of the end of that quantum when the receiver is round robin
-/// and `next_timer`, the nearest timer of a program (timer::first), which
-/// the caller read before the lock (spec 8, 10). The state is the one
-/// `wake` and the next decision would leave; the caller runs the receiver
-/// (thread::run). O(1).
+/// as under `locked`, given the counter value `hand_off` read before the
+/// lock (the sender's stint ends and the receiver's begins at it), and
+/// either makes the meeting and returns the receiver, or returns None and
+/// changes nothing. The receiver then runs at once in place of the caller,
+/// which waits (Scheduler::hand_off), with a new quantum from now, and the
+/// timer is armed for the deadline it needs: the nearer of the end of that
+/// quantum when the receiver is round robin and `next_timer`, the nearest
+/// timer of a program (timer::first), which the caller read before the lock
+/// (spec 8, 10). The state is the one `wake` and the next decision would
+/// leave; the caller runs the receiver (thread::run). O(1).
 pub fn hand_off(
     next_timer: Option<u64>,
-    meet: impl FnOnce(&mut Locked<'_>) -> Option<NonNull<Thread>>,
+    meet: impl FnOnce(&mut Locked<'_>, u64) -> Option<NonNull<Thread>>,
 ) -> Option<NonNull<Thread>> {
     let now = timer::now();
     let mut g = SCHED.lock();
@@ -412,10 +413,13 @@ pub fn hand_off(
     assert!(g.fired.is_none(), "a fired deadline waits at the fast path");
     // SAFETY: as in `locked`.
     let tokens = unsafe { &mut *TOKENS.0.get() };
-    let r = meet(&mut Locked {
-        s: &mut g.s,
-        tokens,
-    })?;
+    let r = meet(
+        &mut Locked {
+            s: &mut g.s,
+            tokens,
+        },
+        now,
+    )?;
     // SAFETY: the receiver is alive, and `meet` made it the meeting's: it
     // waits in no queue, above every ready thread and the cleanup.
     unsafe { g.s.hand_off(r, now) };
