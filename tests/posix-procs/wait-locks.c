@@ -126,3 +126,81 @@ static void public_wait_locks(void) {
     close(commands[1]); close(replies[0]); reap(holder, 0); close(fd);
     if (!failures) printf("posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok\n");
 }
+/* Signals that a delivery discards end no F_SETLKW: the waiter keeps its place. */
+struct quiet_waiter { int fd, result, done, release; };
+static void *quiet_worker(void *argument) {
+    struct quiet_waiter *waiter = argument;
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    waiter->result = fcntl(waiter->fd, 38, &lock);
+    __atomic_store_n(&waiter->done, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&waiter->release, __ATOMIC_ACQUIRE)) sched_yield();
+    lock.l_type = F_UNLCK;
+    fcntl(waiter->fd, 37, &lock);
+    return NULL;
+}
+static void public_wait_quiet_signals(void) {
+    const char *path = "/tmp/public-wait-quiet";
+    int holder_fd = open(path, O_CREAT | O_RDWR, 0666);
+    expect("open quiet WAIT file", holder_fd >= 0, 1);
+    if (holder_fd < 0) return;
+    int commands[2], replies[2];
+    if (pipe(commands) || pipe(replies)) { expect("quiet WAIT pipes", 0, 1); close(holder_fd); return; }
+    pid_t holder = fork();
+    expect("fork quiet WAIT holder", holder >= 0, 1);
+    if (holder == 0) {
+        close(commands[1]); close(replies[0]);
+        char command;
+        while (read(commands[0], &command, 1) == 1) {
+            if (command == 'Q') _exit(0);
+            struct flock lock = {.l_type = command == 'L' ? F_WRLCK : F_UNLCK,
+                                 .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+            if (fcntl(holder_fd, F_SETLK, &lock) || write(replies[1], &command, 1) != 1) _exit(91);
+        }
+        _exit(92);
+    }
+    close(commands[0]); close(replies[1]);
+    if (holder < 0) { close(commands[1]); close(replies[0]); close(holder_fd); return; }
+    expect("child holds the range for the quiet waiters", wait_holder_exchange(commands[1], replies[0], 'L'), 1);
+    struct quiet_waiter waiters[2] = {{.fd = open(path, O_RDWR)}, {.fd = open(path, O_RDWR)}};
+    expect("open quiet waiter descriptions", waiters[0].fd >= 0 && waiters[1].fd >= 0, 1);
+    pthread_t threads[2];
+    pthread_attr_t attributes;
+    expect("quiet attrs", pthread_attr_init(&attributes), 0);
+    expect("quiet 64 KiB allocation", pthread_attr_setstacksize(&attributes, PTHREAD_STACK_MIN), 0);
+    struct timespec pause = {0, 150000000};
+    sigset_t quiet, before;
+    sigemptyset(&quiet);
+    sigaddset(&quiet, SIGCHLD); sigaddset(&quiet, SIGWINCH); sigaddset(&quiet, SIGURG);
+    expect("create the first quiet waiter", pthread_create(&threads[0], &attributes, quiet_worker, &waiters[0]), 0);
+    nanosleep(&pause, NULL);
+    /* Both waiters sleep in the queue, then the signals come to the older. */
+    expect("hold the quiet signals in the main thread", pthread_sigmask(SIG_BLOCK, &quiet, &before), 0);
+    expect("create the second quiet waiter", pthread_create(&threads[1], &attributes, quiet_worker, &waiters[1]), 0);
+    nanosleep(&pause, NULL);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    expect("quiet child", child > 0, 1);
+    if (child > 0) reap(child, 0);
+    expect("quiet SIGWINCH", pthread_kill(threads[0], SIGWINCH), 0);
+    expect("quiet SIGURG", pthread_kill(threads[0], SIGURG), 0);
+    nanosleep(&pause, NULL);
+    expect("child releases the range", wait_holder_exchange(commands[1], replies[0], 'U'), 1);
+    for (unsigned n = 0; n < 6000 && !__atomic_load_n(&waiters[0].done, __ATOMIC_ACQUIRE)
+                         && !__atomic_load_n(&waiters[1].done, __ATOMIC_ACQUIRE); ++n) {
+        struct timespec tick = {0, 1000000}; nanosleep(&tick, NULL);
+    }
+    nanosleep(&pause, NULL);
+    expect("the first waiter keeps its place", __atomic_load_n(&waiters[0].done, __ATOMIC_ACQUIRE), 1);
+    expect("the second waiter stays behind", __atomic_load_n(&waiters[1].done, __ATOMIC_ACQUIRE), 0);
+    __atomic_store_n(&waiters[0].release, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&waiters[1].release, 1, __ATOMIC_RELEASE);
+    for (int i = 0; i < 2; i++) {
+        expect("join quiet waiter", pthread_join(threads[i], NULL), 0);
+        expect("quiet waiter result", waiters[i].result, 0);
+        close(waiters[i].fd);
+    }
+    pthread_sigmask(SIG_SETMASK, &before, NULL);
+    char quit = 'Q'; expect("stop quiet WAIT holder", write(commands[1], &quit, 1), 1);
+    close(commands[1]); close(replies[0]); reap(holder, 0); close(holder_fd);
+    if (!failures) printf("posix-procs: signals that a delivery discards keep the place in F_SETLKW ok\n");
+}

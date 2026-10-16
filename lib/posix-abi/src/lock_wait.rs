@@ -134,6 +134,7 @@ impl Wait {
         loop {
             match self.call(request) {
                 Err(Failure::Again) => {
+                    self.settle();
                     let _ = sys::yield_now();
                 }
                 other => return other,
@@ -149,12 +150,14 @@ impl Wait {
             match sys::send_handles(files.sessions().0, request.as_bytes(), [copy.erase()]) {
                 Ok(response) => match self.decode(&response) {
                     Err(Failure::Again) => {
+                        self.settle();
                         let _ = sys::yield_now();
                     }
                     other => return other,
                 },
                 Err(refused) if refused.error == Error::Interrupted => {
                     drop(refused.back);
+                    self.settle();
                     let _ = sys::yield_now();
                 }
                 Err(_) => return Err(Failure::Fatal(EIO)),
@@ -167,7 +170,7 @@ impl Wait {
     fn withdraw(&self) -> Option<WaitReply> {
         let cancel = self.keyed(Method::WaitCancel).ok()?;
         let mut last = None;
-        for turn in 0u32.. {
+        loop {
             match self.answer(&cancel) {
                 Ok(reply) if reply.phase == WaitPhase::Complete => {
                     last = Some(reply);
@@ -178,7 +181,6 @@ impl Wait {
                 }
                 Err(_) => break,
             }
-            let _ = turn;
         }
         self.release();
         last
@@ -194,15 +196,21 @@ impl Wait {
                     let _ = sys::yield_now();
                 }
                 Err(Status::Kernel(Error::Interrupted)) => {
+                    self.settle();
                     let _ = sys::yield_now();
                 }
                 _ => return,
             }
         }
     }
+    /// A signal that a delivery would discard, left pending under the closed
+    /// mask, keeps interrupting every kernel call: drop it.
+    fn settle(&self) {
+        crate::signals::discard_ignored(self.outer);
+    }
     /// A signal this thread would take, or a request of cancellation.
     fn signalled(&self) -> bool {
-        crate::signals::pending_beyond(self.outer) || crate::threads::cancel::requested()
+        crate::signals::pending_acting(self.outer) || crate::threads::cancel::requested()
     }
     /// Sleep on the channel with the caller's mask. Pending signals are
     /// checked after the mask opens, and the mask closes again before the
@@ -214,9 +222,13 @@ impl Wait {
             return false;
         };
         crate::signals::swap_mask(self.outer);
+        self.settle();
         if !self.signalled() {
             let _ = sys::receive(&self.channel);
         }
+        // Before the mask closes: a closed mask would send a signal that
+        // came meanwhile back to the process service.
+        self.settle();
         crate::signals::swap_mask(u64::MAX);
         drop(guard);
         self.signalled()
@@ -362,7 +374,8 @@ enum Last {
 
 /// Block until the lock is set, a signal ends the wait, or an error comes.
 pub(crate) fn operation(fd: u32, input: Input) -> Result<(), i32> {
-    let _outer = OuterRestart::enter();
+    let block = crate::threads::own_block();
+    let _outer = crate::long::OuterRestart::enter(&block.flags);
     loop {
         let saved = crate::signals::swap_mask(u64::MAX);
         let ended = (|| {
@@ -385,34 +398,10 @@ pub(crate) fn operation(fd: u32, input: Input) -> Result<(), i32> {
             Err(error) => return Err(error),
             Ok(Ended::Done(result)) => return result,
             Ok(Ended::Signalled) => {
-                if ending() || crate::threads::cancel::requested() {
+                if crate::long::ending(&block.flags, true) {
                     return Err(EINTR);
                 }
             }
         }
     }
-}
-
-/// Keeps the caller's NO_RESTART across this operation: a handler without
-/// SA_RESTART that runs inside it sets the flag, and the flag ends the wait.
-struct OuterRestart(u32);
-impl OuterRestart {
-    fn enter() -> Self {
-        Self(
-            crate::threads::own_block()
-                .flags
-                .fetch_and(!posix_thread::flag::NO_RESTART, Ordering::SeqCst)
-                & posix_thread::flag::NO_RESTART,
-        )
-    }
-}
-impl Drop for OuterRestart {
-    fn drop(&mut self) {
-        crate::threads::own_block()
-            .flags
-            .fetch_or(self.0, Ordering::SeqCst);
-    }
-}
-fn ending() -> bool {
-    crate::threads::own_block().flags.load(Ordering::SeqCst) & posix_thread::flag::NO_RESTART != 0
 }

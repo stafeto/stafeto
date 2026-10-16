@@ -244,9 +244,26 @@ pub(crate) fn thread_pending(block: &Block) -> u64 {
         )
 }
 
-/// Whether a signal is pending that `mask` would let through.
-pub(crate) fn pending_beyond(mask: SigSet) -> bool {
-    (thread_pending(own()) | process_pending()) & !mask != 0
+/// Whether a signal is pending that `mask` would let through and that a
+/// delivery would not discard: SIG_IGN and a default action of ignoring
+/// (SIGCHLD, SIGWINCH, SIGURG) end no wait.
+pub(crate) fn pending_acting(mask: SigSet) -> bool {
+    let open = (thread_pending(own()) | process_pending()) & !mask;
+    (1..=31).any(|signal| open & (1 << (signal - 1)) != 0 && !ignored(signal, &action(signal)))
+}
+
+/// Drops the signals of this thread that `mask` lets through and that a
+/// delivery would discard, so that their entries wake no wait again.
+pub(crate) fn discard_ignored(mask: SigSet) {
+    let block = own();
+    loop {
+        let open = thread_pending(block) & !mask;
+        let Some(signal) = (1..=31).find(|&s| open & (1 << (s - 1)) != 0 && ignored(s, &action(s)))
+        else {
+            return;
+        };
+        let _ = claim_thread_info(block, signal);
+    }
 }
 
 pub fn pending_unblocked() -> bool {
