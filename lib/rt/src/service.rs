@@ -568,6 +568,10 @@ mod steps {
     static RAN_BEGIN: AtomicU64 = AtomicU64::new(0);
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// The widest gap, over a run, between the clock and the CPU time of a
+    /// step less its waits: what ran in the middle (higher levels, the
+    /// kernel's cleaning) and the step is not charged with.
+    static GAP: AtomicU64 = AtomicU64::new(0);
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The same for the steps of detail 16 (the terminal's Watch).
     static FULL_16: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
@@ -691,6 +695,10 @@ mod steps {
             if printing {
                 crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
             }
+        }
+        let gap = whole.saturating_sub(counted).saturating_sub(ran);
+        if gap > GAP.fetch_max(gap, Ordering::Relaxed) && printing {
+            crate::println!("service gap: {tag} kind {kind} {gap} ticks of {whole}");
         }
         if waited > WAITS[kind].fetch_max(waited, Ordering::Relaxed) && printing {
             crate::println!("service wait: {tag} kind {kind} {waited} ticks of {whole}");

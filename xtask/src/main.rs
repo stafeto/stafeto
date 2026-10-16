@@ -5229,8 +5229,45 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         "process steps under icount on {}, {live} children live:\n{text}",
         machine.name
     );
+    if let Some((tag, kind, gap, whole)) = widest_gap(&outcome.lines) {
+        println!(
+            "widest gap between the clock and the CPU time of a step (what ran in the middle and the step is not charged with): {gap} ticks of {whole}, service {tag} kind {kind}"
+        );
+    }
     println!("C process steps passed: {}", log.display());
     Ok(())
+}
+
+/// The widest of the lines `service gap: T kind K G ticks of A` that `rt`
+/// prints (feature `step-stats`) when the gap between the clock and the CPU
+/// time of a step, less its waits, grows: (tag, kind, gap, whole step).
+fn widest_gap(lines: &[String]) -> Option<(String, usize, u64, u64)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let [
+                "service",
+                "gap:",
+                tag,
+                "kind",
+                kind,
+                gap,
+                "ticks",
+                "of",
+                whole,
+            ] = words.as_slice()
+            else {
+                return None;
+            };
+            Some((
+                (*tag).to_string(),
+                kind.parse().ok()?,
+                gap.parse().ok()?,
+                whole.parse().ok()?,
+            ))
+        })
+        .max_by_key(|row| row.2)
 }
 
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
@@ -8997,6 +9034,25 @@ mod tests {
                 Some("posix-thread-probe")
             );
         }
+    }
+
+    #[test]
+    fn widest_gap_reads_its_lines_only() {
+        let lines: Vec<String> = [
+            "service gap: 1 kind 26 900 ticks of 4000",
+            "service gap: 2 kind 46 11309 ticks of 16043",
+            "service gap: 1 kind 26 35104 ticks of 40304",
+            "service wait: 2 kind 25 90000 ticks of 170000",
+            "service gap: 1 kind x 99999 ticks of 100000",
+        ]
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect();
+        assert_eq!(
+            widest_gap(&lines),
+            Some(("1".to_string(), 26, 35104, 40304))
+        );
+        assert_eq!(widest_gap(&[]), None);
     }
 
     #[test]

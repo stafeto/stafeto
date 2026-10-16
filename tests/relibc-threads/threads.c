@@ -12,11 +12,13 @@
 #include <sched.h>
 #include <semaphore.h>
 #include <setjmp.h>
+#include <spawn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -902,6 +904,103 @@ static void *async_busy(void *arg) {
     return NULL;
 }
 
+/* pthread_mutex_setprioceiling takes the mutex at the old ceiling and
+ * lets it go at the old one: a thread that does it many times keeps no
+ * trace of the ceilings in its slots (it holds at most eight). */
+static void *ceiling_changer(void *arg) {
+    pthread_mutex_t *mutex = arg;
+    int old = 0;
+    for (int i = 0; i < 20; i++) {
+        int next = 11 + i;
+        int e = pthread_mutex_setprioceiling(mutex, next, &old);
+        if (e != 0 || old != 10 + i) {
+            printf("relibc-threads: setprioceiling round %d gave %d old %d\n", i, e, old);
+            return (void *)1;
+        }
+    }
+    /* And the mutex locks and unlocks at the ceiling it has. */
+    if (pthread_mutex_lock(mutex) != 0 || pthread_mutex_unlock(mutex) != 0) return (void *)2;
+    return NULL;
+}
+
+/* XSH pthread_mutex_lock: a thread that locks a mutex it holds deadlocks
+ * with PTHREAD_MUTEX_NORMAL (the timed lock says ETIMEDOUT) and is told
+ * EDEADLK with PTHREAD_MUTEX_ERRORCHECK, also with inheritance. */
+static void relock_own_mutex(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutex_t mutex;
+    CHECK(pthread_mutexattr_init(&attr) == 0);
+    CHECK(pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT) == 0);
+    CHECK(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_NORMAL) == 0);
+    CHECK(pthread_mutex_init(&mutex, &attr) == 0);
+    CHECK(pthread_mutex_lock(&mutex) == 0);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 20000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+    CHECK(pthread_mutex_timedlock(&mutex, &deadline) == ETIMEDOUT);
+    CHECK(pthread_mutex_unlock(&mutex) == 0);
+    CHECK(pthread_mutex_destroy(&mutex) == 0);
+    CHECK(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) == 0);
+    CHECK(pthread_mutex_init(&mutex, &attr) == 0);
+    CHECK(pthread_mutex_lock(&mutex) == 0);
+    CHECK(pthread_mutex_lock(&mutex) == EDEADLK);
+    CHECK(pthread_mutex_unlock(&mutex) == 0);
+    CHECK(pthread_mutex_destroy(&mutex) == 0);
+    CHECK(pthread_mutexattr_destroy(&attr) == 0);
+}
+
+/* A mutex of PTHREAD_PRIO_PROTECT may be shared between processes; one of
+ * PTHREAD_PRIO_INHERIT may not (ENOTSUP, a limit of this implementation). */
+static void shared_protocols(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutex_t mutex;
+    CHECK(pthread_mutexattr_init(&attr) == 0);
+    CHECK(pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_PROTECT) == 0);
+    CHECK(pthread_mutexattr_setprioceiling(&attr, 20) == 0);
+    CHECK(pthread_mutex_init(&mutex, &attr) == 0);
+    CHECK(pthread_mutex_destroy(&mutex) == 0);
+    CHECK(pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT) == 0);
+    CHECK(pthread_mutex_init(&mutex, &attr) == ENOTSUP);
+    CHECK(pthread_mutexattr_destroy(&attr) == 0);
+}
+
+/* A user without privilege: a process that does not exist is ESRCH, not
+ * EPERM; a negative step of nice is EPERM; a rise by posix_spawn is EPERM;
+ * a lower nice value for setpriority is EACCES. Runs last, as it
+ * gives the privilege up. */
+static void without_privilege(void) {
+    if (geteuid() != 0) return;
+    struct sched_param param = {0};
+    CHECK(sched_setscheduler(0, SCHED_OTHER, &param) >= 0);
+    CHECK(setuid(1000) == 0);
+    errno = 0;
+    CHECK(sched_getparam(99999, &param) == -1 && errno == ESRCH);
+    errno = 0;
+    CHECK(sched_getscheduler(99999) == -1 && errno == ESRCH);
+    param.sched_priority = 5;
+    errno = 0;
+    CHECK(sched_setscheduler(99999, SCHED_FIFO, &param) == -1 && errno == ESRCH);
+    errno = 0;
+    CHECK(nice(-1) == -1 && errno == EPERM);
+    errno = 0;
+    CHECK(setpriority(PRIO_PROCESS, 0, -3) == -1 && errno == EACCES);
+    posix_spawnattr_t spawn;
+    CHECK(posix_spawnattr_init(&spawn) == 0);
+    CHECK(posix_spawnattr_setflags(&spawn, POSIX_SPAWN_SETSCHEDULER) == 0);
+    CHECK(posix_spawnattr_setschedpolicy(&spawn, SCHED_FIFO) == 0);
+    param.sched_priority = 8;
+    CHECK(posix_spawnattr_setschedparam(&spawn, &param) == 0);
+    char *argv[] = {"nothing", NULL};
+    char *envp[] = {NULL};
+    pid_t pid;
+    int spawned = posix_spawn(&pid, "/bin/nothing", NULL, &spawn, argv, envp);
+    if (spawned != EPERM) FAIL("posix_spawn with SETSCHEDULER gave %d", spawned);
+    CHECK(posix_spawnattr_destroy(&spawn) == 0);
+    printf("relibc-threads: without privilege: ESRCH for a process that is none, EPERM for a negative nice and a rise by posix_spawn\n");
+}
+
 static void priorities(void) {
     sched_calls();
     tail_of_the_list();
@@ -930,6 +1029,17 @@ static void priorities(void) {
     CHECK(pthread_mutex_getprioceiling(&ceiling, &old) == 0 && old == 12);
     CHECK(pthread_mutex_setprioceiling(&ceiling, 33, &old) == EINVAL);
     CHECK(pthread_mutex_destroy(&ceiling) == 0);
+    /* Replacing the ceiling many times leaves the slots of the thread
+     * empty. */
+    pthread_mutex_t replaced;
+    make_mutex(&replaced, PTHREAD_PRIO_PROTECT, 10);
+    pthread_t changer = spawn_at(5, ceiling_changer, &replaced);
+    void *changed = (void *)9;
+    CHECK(pthread_join(changer, &changed) == 0 && changed == NULL);
+    CHECK(pthread_mutex_destroy(&replaced) == 0);
+    relock_own_mutex();
+    shared_protocols();
+    printf("relibc-threads: the ceiling is replaced at the old one, a relock of an own mutex deadlocks or says EDEADLK, PROTECT may be shared\n");
     /* The holder of a spin lock below its waiter lets go: the waiter waits
      * for it where it would only spin. */
     CHECK(pthread_spin_init(&spin, PTHREAD_PROCESS_PRIVATE) == 0);
@@ -952,6 +1062,7 @@ static void priorities(void) {
     CHECK(pthread_join(busy, &value) == 0);
     CHECK(value == PTHREAD_CANCELED && async_cleaned == 1);
     printf("relibc-threads: a busy thread with asynchronous cancellation is cancelled\n");
+    without_privilege();
 }
 
 int main(void) {

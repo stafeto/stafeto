@@ -2645,6 +2645,7 @@ static int setid_spawn(void) {
 #if !CHANGE_STEPS
 static int burn50_role(void);
 static int nice_role(void);
+static int sched_role(void);
 #endif
 
 static int role(const char *name) {
@@ -2664,6 +2665,7 @@ static int role(const char *name) {
 #if !CHANGE_STEPS
     if (strcmp(name, "burn50") == 0) return burn50_role();
     if (strcmp(name, "nicechild") == 0) return nice_role();
+    if (strcmp(name, "schedchild") == 0) return sched_role();
 #endif
     if (strcmp(name, "steptimer") == 0) return steptimer_role();
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
@@ -4852,6 +4854,11 @@ int main(int argc, char **argv) {
     expect("kill of the second sleeper", kill(second, SIGKILL), 0);
     reap("the second sleeper", second, 0, SIGKILL);
 
+#if !CHANGE_STEPS
+    printf("posix-procs: stage sched\n");
+    spawned_scheduling();
+    printf("posix-procs: sched ok\n");
+#endif
     printf("posix-procs: stage waits\n");
     waits(child);
     printf("posix-procs: stage kills\n");

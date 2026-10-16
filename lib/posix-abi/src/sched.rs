@@ -190,6 +190,47 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
     })?
 }
 
+/// The level a new process image starts at and the scheduling word its
+/// main thread applies to itself: the top level of the caller and `spec`
+/// (policy and priority), or the caller's own scheduling for None. EINVAL
+/// for a policy or priority out of range, EPERM for a rise the caller may
+/// not make.
+pub(crate) fn for_child(spec: Option<(i32, i32)>) -> Result<(u8, u64), i32> {
+    let own = unpack(crate::threads::own_block().sched.load(Ordering::Relaxed));
+    let (policy, priority) = spec.unwrap_or(own);
+    level_of(policy, priority)?;
+    if spec.is_some() && !permitted(own, (policy, priority)) {
+        return Err(EPERM);
+    }
+    Ok((top()?, START | pack(policy, priority)))
+}
+
+/// The POSIX policy of the calling thread.
+pub fn own_policy() -> i32 {
+    unpack(crate::threads::own_block().sched.load(Ordering::Relaxed)).0
+}
+
+/// Bit 63 of a start word: the word names a scheduling.
+pub(crate) const START: u64 = 1 << 63;
+
+/// The main thread of a new image applies the scheduling its parent chose
+/// (`Page::start_sched`): the checks were the parent's.
+pub(crate) fn start_apply(word: u64) {
+    if word & START == 0 {
+        return;
+    }
+    let (policy, priority) = unpack(word);
+    let Ok((level, kernel)) = level_of(policy, priority) else {
+        return;
+    };
+    let block = crate::threads::own_block();
+    block.sched.store(pack(policy, priority), Ordering::Relaxed);
+    block.policy.store(kernel as u64, Ordering::Relaxed);
+    if level != block.base_level.load(Ordering::Relaxed) as u8 || kernel != Policy::RoundRobin {
+        let _ = crate::threads::move_to(level, kernel, false);
+    }
+}
+
 /// pthread_getschedparam: the policy and priority of the thread `id`.
 pub fn thread_get(id: u64) -> Result<(i32, i32), i32> {
     crate::relibc::with_target(id, |block, _| unpack(block.sched.load(Ordering::Relaxed)))
@@ -209,10 +250,8 @@ fn thread_of(pid: i32) -> Result<u64, i32> {
     if pid == crate::process::getpid() {
         return Ok(1);
     }
-    // A process of another user is not the caller's to look at.
-    if crate::process::geteuid() != 0 {
-        return Err(EPERM);
-    }
+    // A process that does not exist is ESRCH whoever asks; one that does
+    // is not the caller's to read or set (EPERM).
     match crate::process::kill(pid, 0) {
         Ok(()) | Err(EPERM) => Err(EPERM),
         Err(e) => Err(e),

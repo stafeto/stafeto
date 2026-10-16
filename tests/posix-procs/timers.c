@@ -688,13 +688,22 @@ static int t_c_clock(void) {
     if (a == (clock_t)-1) return 1;
     t_nap(50);
     clock_t b = clock();
-    if (b == (clock_t)-1 || b < a + 40000) return 2;
-    if (b - a > 5000000) return 3;
+    /* clock() is processor time (as times() and CLOCK_PROCESS_CPUTIME_ID):
+     * a nap of 50 ms does not run it, 30 ms of work does. */
+    if (b == (clock_t)-1 || b < a || b - a > 20000) return 2;
+    struct timespec began, now;
+    clock_gettime(CLOCK_MONOTONIC, &began);
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while ((now.tv_sec - began.tv_sec) * 1000000000LL + (now.tv_nsec - began.tv_nsec) < 30000000LL);
+    clock_t d = clock();
+    if (d == (clock_t)-1 || d < b + 20000) return 3;
+    if (d - b > 5000000) return 7;
     pid_t child = fork();
     if (child < 0) return 4;
     if (child == 0) {
         clock_t c = clock();
-        _exit(c != (clock_t)-1 && c < b ? 0 : 1);
+        _exit(c != (clock_t)-1 && c < d ? 0 : 1);
     }
     int status = -1;
     if (waitpid(child, &status, 0) != child) return 5;

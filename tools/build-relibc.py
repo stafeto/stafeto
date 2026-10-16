@@ -51,7 +51,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F13: sched.h, the priorities of threads and mutexes (inheritance and
 # ceilings through the layer), CPU time, getrusage, times, nice; the thread
 # block grows to 240 bytes, platform interface 19; tagged pin-9cf64d18.
-COMMIT = "9cf64d18803704530392302e0aa6550b0ceb727e"
+# Then the checks of F13: the ceiling replaced at the old one, nice EPERM,
+# the scheduling attributes of posix_spawn, an own PRIO_INHERIT mutex; tagged
+# pin-b5af44ca.
+COMMIT = "b5af44ca5c688b2b5c9b55a471a4a4fba01bb8f4"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

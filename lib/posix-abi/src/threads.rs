@@ -183,6 +183,7 @@ pub unsafe fn attach_installed(tcb: *mut posix_thread::Tcb, id: u64) -> Result<(
     attach_resources(MAIN_SELF.load(Ordering::Acquire))?;
     // The top of the levels of the application threads: where main starts.
     crate::sched::set_top(own_block().base_level.load(Ordering::Relaxed) as u8);
+    crate::sched::start_apply(crate::process::page().start_sched.load(Ordering::Acquire));
     Ok(())
 }
 

@@ -1076,6 +1076,11 @@ pub struct Page {
     /// the thread whose posix_spawn made it ([P24-SPAWN]); the service
     /// writes it, and `ignored` too, before the process runs.
     pub start_mask: AtomicU64,
+    /// The scheduling of the main thread at the process's start: bit 63
+    /// when set, the policy in bits 0 to 7 and the priority in bits 8 to
+    /// 15 (POSIX_SPAWN_SETSCHEDULER and SETSCHEDPARAM, or the inheritance
+    /// of the caller's); the service writes it with `start_mask`.
+    pub start_sched: AtomicU64,
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
@@ -1144,7 +1149,8 @@ pub const CLD_CONTINUED: i32 = 6;
 /// process group u32, the caller's level u32, at which the loader runs,
 /// the signal mask u64 the child's main thread starts with (the caller's,
 /// or that of POSIX_SPAWN_SETSIGMASK) and the signals u64 whose action
-/// POSIX_SPAWN_SETSIGDEF sets to the default (bit n - 1 for signal n).
+/// POSIX_SPAWN_SETSIGDEF sets to the default (bit n - 1 for signal n), and
+/// the scheduling word u64 of the child's main thread (`Page::start_sched`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnStart {
     pub flags: u32,
@@ -1152,6 +1158,7 @@ pub struct SpawnStart {
     pub level: u8,
     pub mask: u64,
     pub default: u64,
+    pub sched: u64,
     /// The name the record shows: the last component of the program's
     /// path, with a terminating zero; all zeros keeps the parent's.
     pub name: [u8; NAME_LEN],
@@ -1164,13 +1171,14 @@ impl SpawnStart {
         w.u32(self.level.into())?;
         w.u64(self.mask)?;
         w.u64(self.default)?;
+        w.u64(self.sched)?;
         w.bytes(&self.name)
     }
 
     /// BAD_SIZE out of the layout or with a level past 63.
     pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
         let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
-        let (mask, default) = (r.u64()?, r.u64()?);
+        let (mask, default, sched) = (r.u64()?, r.u64()?, r.u64()?);
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         r.finish()?;
@@ -1184,6 +1192,7 @@ impl SpawnStart {
             level,
             mask,
             default,
+            sched,
             name,
         })
     }
@@ -1852,6 +1861,7 @@ mod tests {
             level: 30,
             mask: 1 << 9,
             default: 1 << 14,
+            sched: 1 << 63 | 1 | 5 << 8,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();

@@ -1492,9 +1492,9 @@ impl Processes {
                         least = least.min(i32::from(record.nice));
                         continue;
                     }
-                    // Another user's process is not the caller's to change.
-                    if euid != 0 && record.credentials.euid != euid && record.credentials.uid != uid
-                    {
+                    // POSIX: the real or the effective user ID of the caller
+                    // must equal the effective user ID of the target.
+                    if !records::may_renice(uid, euid, record.credentials.euid) {
                         denied = true;
                         continue;
                     }
@@ -2414,6 +2414,7 @@ impl Processes {
             page: PageStart::Spawn {
                 mask: start.mask,
                 default: start.default,
+                sched: start.sched,
             },
         };
         self.start_child(index, birth, r)
@@ -2839,6 +2840,8 @@ impl Processes {
         if let Some(page) = self.pages.page(index) {
             page.start_mask
                 .store(start.mask, core::sync::atomic::Ordering::Release);
+            page.start_sched
+                .store(start.sched, core::sync::atomic::Ordering::Release);
         }
         let Some(pending) = r.defer() else {
             let _ = sys::process_kill(&process);

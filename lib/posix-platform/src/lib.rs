@@ -301,18 +301,26 @@ pub unsafe extern "C" fn stafeto_clock_gettime(clock: c_int, out: *mut Timespec)
     }
 }
 
-/// The time the process has run, for `clock` (posix_abi::clock::process_time).
+/// The processor time of the process, for `clock` (the same figure as
+/// `times` and CLOCK_PROCESS_CPUTIME_ID: posix_abi::cpu::process_ns); the
+/// time the process has run when the kernel gives no figure.
 ///
 /// # Safety
 /// `out` is writable for a timespec.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_clock_process(out: *mut Timespec) -> c_int {
-    let time = posix_abi::clock::process_time();
+    let (seconds, nanos) = match posix_abi::cpu::process_ns() {
+        Ok(ns) => ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as _),
+        Err(_) => {
+            let time = posix_abi::clock::process_time();
+            (time.seconds, time.nanos)
+        }
+    };
     // SAFETY: the caller's promise.
     unsafe {
         out.write(Timespec {
-            tv_sec: time.seconds,
-            tv_nsec: time.nanos,
+            tv_sec: seconds,
+            tv_nsec: nanos,
         })
     };
     0
@@ -451,7 +459,15 @@ pub struct SpawnAttributes {
     pgroup: c_int,
     mask: u64,
     default: u64,
+    /// The spawn-schedpolicy and the sched_priority of spawn-schedparam.
+    policy: c_int,
+    priority: c_int,
 }
+
+/// POSIX_SPAWN_SETSCHEDPARAM and POSIX_SPAWN_SETSCHEDULER (the values of
+/// relibc's spawn.h): the layer takes them as the scheduling of the child.
+const SPAWN_SETSCHEDPARAM: c_int = 0x10;
+const SPAWN_SETSCHEDULER: c_int = 0x20;
 
 /// A file action as relibc's posix_spawn gives it: OPEN (1) of `path`
 /// with `flags` at `fd`, CLOSE (2) of `fd`, DUP2 (3) of `fd` to `newfd`,
@@ -607,7 +623,24 @@ unsafe fn spawn(
     let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
     // SAFETY: as above.
     let attributes = unsafe { attributes.as_ref() };
-    let (flags, pgroup) = attributes.map_or((0, 0), |a| (a.flags, a.pgroup));
+    let (flags, pgroup) = attributes.map_or((0, 0), |a| {
+        (
+            a.flags & !(SPAWN_SETSCHEDPARAM | SPAWN_SETSCHEDULER),
+            a.pgroup,
+        )
+    });
+    // The policy of the child: the attribute under SETSCHEDULER, else the
+    // caller's own (XSH posix_spawn) with the priority of SETSCHEDPARAM.
+    let sched = attributes.and_then(|a| {
+        if a.flags & SPAWN_SETSCHEDULER != 0 {
+            Some((a.policy, a.priority))
+        } else if a.flags & SPAWN_SETSCHEDPARAM != 0 {
+            let own = posix_abi::sched::own_policy();
+            Some((own, a.priority))
+        } else {
+            None
+        }
+    });
     let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
         return -posix_abi::constants::EINVAL;
     };
@@ -624,6 +657,7 @@ unsafe fn spawn(
         mask,
         default,
         umask,
+        sched,
     };
     // SAFETY: the caller's promise for argv, envp and the file actions.
     let (argv, envp, file_actions) =

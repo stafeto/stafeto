@@ -28,7 +28,90 @@ static int nice_role(void) {
     return value + 20;
 }
 
+/* The role: ends with its scheduling as its status, policy * 64 + priority. */
+static int sched_role(void) {
+    struct sched_param param;
+    if (sched_getparam(0, &param) != 0) return 1;
+    int policy = sched_getscheduler(0);
+    if (policy < 0) return 2;
+    printf("posix-procs: schedchild policy %d priority %d\n", policy, param.sched_priority);
+    return policy * 64 + param.sched_priority;
+}
+
+/* posix_spawn with the scheduling attributes: the child starts with the
+ * policy and priority they name (SETSCHEDULER; SETSCHEDPARAM keeps the
+ * caller's policy), and inherits the caller's without them. */
+static void spawned_scheduling(void) {
+    char *argv[] = {"procs-child", "schedchild", NULL};
+    char *envp[] = {NULL};
+    struct sched_param param = {7};
+    posix_spawnattr_t attr;
+    pid_t pid = -1;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER);
+    posix_spawnattr_setschedpolicy(&attr, SCHED_FIFO);
+    posix_spawnattr_setschedparam(&attr, &param);
+    expect("spawn with SETSCHEDULER", spawn_file(&pid, "/bin/procs-child", argv, envp, &attr), 0);
+    if (pid > 0) reap("the child is SCHED_FIFO at 7", pid, 1 * 64 + 7, 0);
+    /* A priority out of range is EINVAL, before anything is made. */
+    param.sched_priority = 33;
+    posix_spawnattr_setschedparam(&attr, &param);
+    expect("SETSCHEDULER with priority 33", spawn_file(&pid, "/bin/procs-child", argv, envp, &attr), EINVAL);
+    posix_spawnattr_destroy(&attr);
+    /* The caller's own scheduling goes to a child without attributes, and
+     * SETSCHEDPARAM changes only the priority. */
+    param.sched_priority = 20;
+    int moved = sched_setscheduler(0, SCHED_RR, &param);
+    if (moved < 0) printf("posix-procs: sched_setscheduler gave errno %d, uid %d euid %d\n", errno, (int)getuid(), (int)geteuid());
+    expect("the caller to SCHED_RR 20", moved >= 0, 1);
+    pid = -1;
+    expect("spawn without attributes", spawn_file(&pid, "/bin/procs-child", argv, envp, NULL), 0);
+    if (pid > 0) reap("the child inherits SCHED_RR at 20", pid, 2 * 64 + 20, 0);
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDPARAM);
+    param.sched_priority = 9;
+    posix_spawnattr_setschedparam(&attr, &param);
+    pid = -1;
+    expect("spawn with SETSCHEDPARAM", spawn_file(&pid, "/bin/procs-child", argv, envp, &attr), 0);
+    if (pid > 0) reap("the child is SCHED_RR at 9", pid, 2 * 64 + 9, 0);
+    posix_spawnattr_destroy(&attr);
+    param.sched_priority = 0;
+    expect("the caller back to SCHED_OTHER", sched_setscheduler(0, SCHED_OTHER, &param) >= 0, 1);
+}
+
+/* clock() is the processor time of the process, as times() and
+ * CLOCK_PROCESS_CPUTIME_ID give it: a process that slept 40 ms has not run
+ * them. */
+static void clock_is_cpu_time(void) {
+    struct timespec nap = {0, 40000000};
+    nanosleep(&nap, NULL);
+    long long cpu = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
+    clock_t c = clock();
+    long long since = (long long)c * (1000000000LL / CLOCKS_PER_SEC);
+    expect("clock() agrees with the process CPU clock (within 15 ms)",
+           since - cpu < 15000000LL && cpu - since < 15000000LL, 1);
+    if (!(since - cpu < 15000000LL)) printf("posix-procs: clock() %lld ns, CPU clock %lld ns\n", since, cpu);
+}
+
+/* The same as a user without privilege: a rise to a real-time policy by
+ * posix_spawn is EPERM and nothing is made. */
+static void spawned_scheduling_refused(void) {
+    char *argv[] = {"procs-child", "schedchild", NULL};
+    char *envp[] = {NULL};
+    struct sched_param param = {7};
+    posix_spawnattr_t attr;
+    pid_t pid = -1;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSCHEDULER);
+    posix_spawnattr_setschedpolicy(&attr, SCHED_FIFO);
+    posix_spawnattr_setschedparam(&attr, &param);
+    expect("spawn with SETSCHEDULER without privilege", spawn_file(&pid, "/bin/procs-child", argv, envp, &attr), EPERM);
+    posix_spawnattr_destroy(&attr);
+}
+
 static void accounts(void) {
+    clock_is_cpu_time();
+    spawned_scheduling_refused();
     /* The clocks of the process and of the thread run with the work. */
     long long process_before = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
     long long thread_before = cpu_ns(CLOCK_THREAD_CPUTIME_ID);

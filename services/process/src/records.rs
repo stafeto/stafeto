@@ -1072,6 +1072,14 @@ pub const fn exit_place(label: Label, create: &Create, loop_level: u8) -> ExitPl
 }
 
 /// What `handle_label` and `process_create` take for an exit place.
+/// Whether a caller with the real user ID `uid` and the effective user ID
+/// `euid` may set the nice value of a process whose effective user ID is
+/// `target` (XSH setpriority, EPERM): root may, and any other caller needs
+/// its real or effective user ID to equal the target's effective one.
+pub const fn may_renice(uid: u32, euid: u32, target: u32) -> bool {
+    euid == 0 || target == euid || target == uid
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExitPlace {
     pub label: u64,
@@ -1082,6 +1090,18 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renice_follows_the_effective_id_of_the_target() {
+        // A caller of the user 7 may set the nice of a process whose
+        // effective user is 7, whatever its real user is, and no other.
+        assert!(may_renice(7, 7, 7));
+        assert!(may_renice(7, 9, 7));
+        assert!(may_renice(7, 9, 9));
+        assert!(!may_renice(7, 7, 0));
+        assert!(!may_renice(7, 7, 8));
+        assert!(may_renice(7, 0, 8));
+    }
 
     #[test]
     fn exhausted_credentials_leave_the_real_record_unchanged() {

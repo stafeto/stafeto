@@ -1054,7 +1054,9 @@ impl Shadow {
 /// What posix_spawn of a file takes beyond the path and the strings: the
 /// spawn-flags and the process group (proto_process::SPAWN_FLAGS), the
 /// mask of POSIX_SPAWN_SETSIGMASK (None: the caller's), the signals of
-/// POSIX_SPAWN_SETSIGDEF and the caller's umask.
+/// POSIX_SPAWN_SETSIGDEF, the caller's umask and the scheduling of
+/// POSIX_SPAWN_SETSCHEDULER and POSIX_SPAWN_SETSCHEDPARAM (the policy and
+/// priority; None: the caller's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnAttributes {
     pub flags: u32,
@@ -1062,6 +1064,7 @@ pub struct SpawnAttributes {
     pub mask: Option<u64>,
     pub default: u64,
     pub umask: u32,
+    pub sched: Option<(i32, i32)>,
 }
 
 /// The errno of a refusal of SpawnStart.
@@ -1301,6 +1304,10 @@ pub fn spawn_search<'s, 'a>(
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
     }
+    // The scheduling the child starts with is checked before anything is
+    // made: EINVAL for a policy or priority out of range, EPERM for a
+    // rise the caller may not make.
+    let sched = crate::sched::for_child(attributes.sched)?;
     let mut shadow = Shadow::take()?;
     shadow.umask = attributes.umask;
     shadow.real_ids = attributes.flags & proto_process::SPAWN_RESETIDS != 0
@@ -1309,11 +1316,11 @@ pub fn spawn_search<'s, 'a>(
         .into_iter()
         .try_for_each(|action| shadow.apply(action))
         .and_then(|()| match search {
-            None => spawn_shadowed(file, argv, envp, attributes, &shadow),
+            None => spawn_shadowed(file, argv, envp, attributes, sched, &shadow),
             Some(search) => {
                 let mut program = [0; proto_loader::PATH_MAX];
                 let program = shadow.find_program(file, search, &mut program)?;
-                spawn_shadowed(program, argv, envp, attributes, &shadow)
+                spawn_shadowed(program, argv, envp, attributes, sched, &shadow)
             }
         });
     shadow.finish();
@@ -1431,6 +1438,7 @@ fn spawn_shadowed<'s>(
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     attributes: SpawnAttributes,
+    (level, sched): (u8, u64),
     shadow: &Shadow,
 ) -> Result<i32, i32> {
     use crate::constants::{EAGAIN, EIO};
@@ -1445,7 +1453,6 @@ fn spawn_shadowed<'s>(
         proto_loader::Carried::default(),
     )?;
     let block = &crate::threads::own_block;
-    let level = block().base_level.load(Ordering::Relaxed) as u8;
     let mask = attributes
         .mask
         .unwrap_or_else(|| block().mask.load(Ordering::SeqCst));
@@ -1455,6 +1462,7 @@ fn spawn_shadowed<'s>(
         level,
         mask,
         default: attributes.default,
+        sched,
         name: proto_process::name_of(path),
     };
     let mut w = Writer::new();
@@ -1589,15 +1597,16 @@ fn exec_stopped<'s>(
     let built = block(path, argv, envp, umask, &shadow, carried);
     shadow.finish();
     let (len, object) = built?;
-    let level = crate::threads::own_block()
-        .base_level
-        .load(Ordering::Relaxed) as u8;
+    // The new image keeps the policy and priority of the calling thread
+    // (XSH exec); it starts at the top level and moves there.
+    let (level, sched) = crate::sched::for_child(None)?;
     let start = SpawnStart {
         flags: 0,
         pgroup: 0,
         level,
         mask,
         default: 0,
+        sched,
         name: match source {
             ExecSource::Path(path) => proto_process::name_of(path),
             ExecSource::Descriptor(_) => [0; proto_process::NAME_LEN],
@@ -2071,6 +2080,7 @@ fn start_bare() -> Result<(u32, Handle<Channel>), i32> {
         level,
         mask: 0,
         default: 0,
+        sched: 0,
         name: [0; proto_process::NAME_LEN],
     };
     let mut w = Writer::new();
