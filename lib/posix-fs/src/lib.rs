@@ -253,7 +253,7 @@ const _: () = assert!(core::mem::size_of::<posix_fd::WaitRecords<wait::Recovery>
 const _: () = assert!(core::mem::size_of::<PosixFs>() <= 20480);
 
 // Typed control receipts retain their complete immutable source and outcome.
-const _: () = assert!(core::mem::size_of::<control::Recovery>() == 128);
+const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
 const _: () = assert!(
     core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 17408
 );

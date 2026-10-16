@@ -11,7 +11,7 @@
 //! when an older incompatible queued request has priority on that range.
 
 use super::constants::{EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOLCK, EOVERFLOW};
-use proto_fs::{LockCommand, LockKind, LockPhase, LockReply};
+use proto_fs::{LockCommand, LockKind, LockReply};
 
 /// The pinned relibc AArch64 flock layout. Padding stays in the caller's memory.
 #[repr(C)]
@@ -92,8 +92,7 @@ impl Input {
         })
     }
 
-    /// Apply one saved terminal outcome after the driver settled its exact key.
-    /// The driver resolves internal cancellation using its retained source reason.
+    /// Apply the reply of the service to the caller's fields.
     ///
     /// # Safety
     /// For successful GET, pointer names writable flock fields in this invocation.
@@ -104,9 +103,6 @@ impl Input {
         outcome: Result<LockReply, i32>,
     ) -> Result<i32, i32> {
         let reply = outcome?;
-        if reply.phase != LockPhase::Complete {
-            return Err(EIO);
-        }
         terminal_result(reply.result)?;
         if !self.command.get() {
             return if reply.blocker.is_none() {
@@ -137,7 +133,12 @@ impl Input {
     }
 }
 
-/// Map canonical service errors; transport retries and cancellation belong to the driver.
+/// The errno of a service refusal that comes in place of a reply.
+pub fn refusal(code: u32) -> i32 {
+    terminal_result(code).err().unwrap_or(EIO)
+}
+
+/// Map canonical service errors; transport retries belong to the caller.
 pub fn terminal_result(result: u32) -> Result<(), i32> {
     match result {
         0 => Ok(()),

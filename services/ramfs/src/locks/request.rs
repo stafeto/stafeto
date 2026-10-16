@@ -8,7 +8,7 @@ use super::{
     simple::{Command, Error, Request, Response},
 };
 use crate::{Fds, Ram, TentativeOpen, storage::Root};
-use proto_fs::{LockBlocker, LockKind, LockPhase, LockReply, LockStart};
+use proto_fs::{LockBlocker, LockKind, LockReply, LockStart};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Captured {
@@ -20,17 +20,12 @@ pub struct Captured {
 }
 
 impl Ram<'_> {
-    /// Capture WAIT using the same genuine SET validation, without Control custody.
+    /// Capture WAIT using the same genuine SET validation.
     pub fn capture_wait(&self, fds: &Fds, wire: proto_fs::WaitStart) -> Result<Captured, u32> {
         wire.validate().map_err(|error| error.code())?;
         self.capture_lock(
             fds,
             LockStart {
-                // This key is local capture input only; no Control queue is touched.
-                key: proto_fs::OpenKey {
-                    slot: 32 + wire.key.slot,
-                    generation: wire.key.generation,
-                },
                 description: wire.description,
                 command: if wire.mode.ofd() {
                     proto_fs::LockCommand::SetOfd
@@ -122,7 +117,6 @@ pub fn reply(result: Result<Response, Error>) -> LockReply {
                     Ok(pid) => pid,
                     Err(_) => {
                         return LockReply {
-                            phase: LockPhase::Complete,
                             result: proto_fs::OFFSET_OVERFLOW,
                             blocker: None,
                         };
@@ -155,7 +149,6 @@ pub fn reply(result: Result<Response, Error>) -> LockReply {
         ),
     };
     LockReply {
-        phase: LockPhase::Complete,
         result,
         blocker,
     }
@@ -164,7 +157,7 @@ pub fn reply(result: Result<Response, Error>) -> LockReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto_fs::{DataDescription, LockCommand, OpenKey, READ_ONLY, READ_WRITE, WRITE_ONLY};
+    use proto_fs::{DataDescription, LockCommand, READ_ONLY, READ_WRITE, WRITE_ONLY};
 
     fn who(pid: u32) -> proto_process::WhoReply {
         proto_process::WhoReply {
@@ -186,10 +179,6 @@ mod tests {
     fn wire(ram: &Ram<'_>, fds: &Fds, fd: u32) -> LockStart {
         let (source, _) = ram.capture_description(fds, fd).unwrap();
         LockStart {
-            key: OpenKey {
-                slot: 32,
-                generation: 1,
-            },
             description: DataDescription {
                 packed: ram.marked_open(fds, source).unwrap() & !proto_fs::OPEN_RANDOM,
                 generation: source.description.generation,
@@ -473,8 +462,7 @@ mod tests {
             assert_eq!(
                 reply(Err(error)),
                 LockReply {
-                    phase: LockPhase::Complete,
-                    result: code,
+                                result: code,
                     blocker: None
                 }
             );

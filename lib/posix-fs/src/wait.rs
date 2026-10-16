@@ -103,6 +103,9 @@ impl Recovery {
 }
 pub type Snapshot = WaitSnapshot<Recovery>;
 impl PosixFs {
+    pub fn lock_source(&self, fd: u32) -> Result<EntryToken, FsError> {
+        self.descriptors.entry_token(fd).map_err(FsError::from)
+    }
     /// Capacity is independent from Open, Control and ordinary I/O holds.
     pub fn wait_place(&self, owner: OwnerToken, current: Frame) -> WaitPlace {
         self.waits

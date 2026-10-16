@@ -22,10 +22,10 @@ pub mod constants;
 mod fifo_io;
 pub mod fork;
 pub mod loader_probe;
-mod lock_driver;
-mod wait_lock_driver;
+mod lock_call;
 #[cfg(feature = "lock-probe")]
-pub use lock_driver::{Probe as LockProbe, probe_hook as probe_lock_hook};
+pub use lock_call::probe_hook as probe_lock_hook;
+mod wait_lock_driver;
 #[cfg(feature = "wait-probe")]
 pub use wait_lock_driver::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 /// Whether this process knows it holds no record lock (the probes of closes).
@@ -95,7 +95,7 @@ pub unsafe fn file_lock(fd: c_int, command: c_int, pointer: *mut u8) -> Result<c
                 Err(constants::EIO)
             };
         }
-        let outcome = lock_driver::operation(fd, input);
+        let outcome = lock_call::operation(fd, input);
         // SAFETY: successful GET writes fields only in the same active invocation.
         unsafe { input.finish(pointer, outcome) }
     })();

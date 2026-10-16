@@ -11,7 +11,7 @@ mod lock_fields;
 
 use constants::{EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOLCK, EOVERFLOW};
 use lock_fields::Input;
-use proto_fs::{LockBlocker, LockCommand, LockKind, LockPhase, LockReply};
+use proto_fs::{LockBlocker, LockCommand, LockKind, LockReply};
 
 fn input(kind: i16, whence: i16, start: i64, length: i64, pid: i32) -> [u8; 32] {
     let mut bytes = [0xa5; 32];
@@ -32,7 +32,6 @@ fn finish(input: Input, bytes: &mut [u8; 32], reply: Result<LockReply, i32>) -> 
 }
 fn success(blocker: Option<LockBlocker>) -> LockReply {
     LockReply {
-        phase: LockPhase::Complete,
         result: 0,
         blocker,
     }
@@ -179,7 +178,7 @@ fn setters_never_write_flock_and_errors_preserve_every_byte() {
 }
 
 #[test]
-fn pending_or_failed_driver_outcome_never_changes_caller_fields() {
+fn failed_outcome_never_changes_caller_fields() {
     let mut bytes = input(1, 1, -1, 2, 0);
     let before = bytes;
     let copied = read(5, &bytes).unwrap();
@@ -190,8 +189,8 @@ fn pending_or_failed_driver_outcome_never_changes_caller_fields() {
             copied,
             &mut bytes,
             Ok(LockReply {
-                phase: LockPhase::Pending,
-                ..success(None)
+                result: proto_fs::RESOLVING,
+                blocker: None,
             })
         ),
         Err(EIO)

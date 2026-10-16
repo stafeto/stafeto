@@ -177,7 +177,6 @@ fn operation(
 /// One unlocked helper turn on the lock debt that fences the record.
 fn fence_turn(debt: CloseCommandFence) -> Result<(), i32> {
     match debt {
-        CloseCommandFence::Control(token) => crate::lock_driver::cleanup_step(token).map(drop),
         CloseCommandFence::Wait(token) => crate::wait_lock_driver::cleanup_step(token).map(drop),
     }
 }

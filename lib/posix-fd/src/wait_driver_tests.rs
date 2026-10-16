@@ -367,7 +367,7 @@ fn fixed_inline_packets_match_the_real_protocol_and_strict_envelopes() {
         proto_fs::write_wait_key(method, key, &mut expected).unwrap();
         assert_eq!(p.as_bytes(), expected.as_bytes());
     }
-    assert!(packet::Packet::keyed(Method::LockQuery, key).is_err());
+    assert!(packet::Packet::keyed(Method::LockStart, key).is_err());
     let mut out = Writer::new();
     reply(WaitPhase::Sleeping, 0).write(&mut out).unwrap();
     assert_eq!(

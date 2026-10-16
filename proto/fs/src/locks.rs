@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Exact nonblocking lock commands use the sixteen paid Control key domains.
+//! The one-step lock command: a description, a region and a command in, a
+//! result and a blocker out. The service keeps nothing between requests.
 
-use crate::{DataDescription, INVALID_ARGUMENT, Method, OpenKey};
+use crate::{DataDescription, INVALID_ARGUMENT, Method};
 use proto_wire::{Reader, Status, Writer};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,40 +51,8 @@ impl LockKind {
     }
 }
 
-fn validate_key(key: OpenKey) -> Result<(), Status> {
-    key.validate().map_err(Status::from_code)?;
-    if !(32..48).contains(&key.slot) {
-        return Err(Status::from_code(INVALID_ARGUMENT));
-    }
-    Ok(())
-}
-
-pub fn write_lock_key(method: Method, key: OpenKey, out: &mut Writer) -> Result<(), Status> {
-    validate_key(key)?;
-    if !matches!(
-        method,
-        Method::LockQuery | Method::LockRelease | Method::LockCancel
-    ) {
-        return Err(Status::from_code(INVALID_ARGUMENT));
-    }
-    method.header().write(out)?;
-    out.u32(key.slot)?;
-    out.u64(key.generation)
-}
-
-pub fn read_lock_key(mut input: Reader<'_>) -> Result<OpenKey, Status> {
-    let key = OpenKey {
-        slot: input.u32()?,
-        generation: input.u64()?,
-    };
-    input.finish()?;
-    validate_key(key)?;
-    Ok(key)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LockStart {
-    pub key: OpenKey,
     pub description: DataDescription,
     pub command: LockCommand,
     pub kind: LockKind,
@@ -94,7 +63,6 @@ pub struct LockStart {
 }
 impl LockStart {
     pub fn validate(self) -> Result<(), Status> {
-        validate_key(self.key)?;
         self.description.validate()?;
         if self.whence > 2
             || self.command.ofd() && self.pid != 0
@@ -107,8 +75,6 @@ impl LockStart {
     pub fn write(self, out: &mut Writer) -> Result<(), Status> {
         self.validate()?;
         Method::LockStart.header().write(out)?;
-        out.u32(self.key.slot)?;
-        out.u64(self.key.generation)?;
         out.u32(self.description.packed)?;
         out.u64(self.description.generation)?;
         out.u32(self.command as u32)?;
@@ -120,10 +86,6 @@ impl LockStart {
     }
     pub fn read(mut input: Reader<'_>) -> Result<Self, Status> {
         let request = Self {
-            key: OpenKey {
-                slot: input.u32()?,
-                generation: input.u64()?,
-            },
             description: DataDescription {
                 packed: input.u32()?,
                 generation: input.u64()?,
@@ -142,12 +104,6 @@ impl LockStart {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LockPhase {
-    Pending,
-    Complete,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LockBlocker {
     pub kind: LockKind,
     pub start: i64,
@@ -156,15 +112,13 @@ pub struct LockBlocker {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LockReply {
-    pub phase: LockPhase,
     pub result: u32,
     pub blocker: Option<LockBlocker>,
 }
 impl LockReply {
     /// Validate an already decoded immutable reply without another wire buffer.
     pub fn validate(self) -> Result<(), Status> {
-        if self.phase == LockPhase::Pending && (self.result != 0 || self.blocker.is_some())
-            || self.result != 0 && self.blocker.is_some()
+        if self.result != 0 && self.blocker.is_some()
             || self.blocker.is_some_and(|b| {
                 b.kind == LockKind::Unlock
                     || b.start < 0
@@ -180,7 +134,6 @@ impl LockReply {
     pub fn write(self, out: &mut Writer) -> Result<(), Status> {
         self.validate()?;
         out.u32(0)?;
-        out.u32(u32::from(self.phase == LockPhase::Complete))?;
         out.u32(self.result)?;
         out.u32(u32::from(self.blocker.is_some()))?;
         if let Some(blocker) = self.blocker {
@@ -196,11 +149,6 @@ impl LockReply {
         if status != Status::Ok {
             return Err(status);
         }
-        let phase = match input.u32()? {
-            0 => LockPhase::Pending,
-            1 => LockPhase::Complete,
-            _ => return Err(Status::BadSize),
-        };
         let result = input.u32()?;
         let blocker = match input.u32()? {
             0 => None,
@@ -214,7 +162,6 @@ impl LockReply {
         };
         input.finish()?;
         let reply = Self {
-            phase,
             result,
             blocker,
         };
@@ -229,10 +176,6 @@ mod tests {
 
     fn request() -> LockStart {
         LockStart {
-            key: OpenKey {
-                slot: 32,
-                generation: u64::MAX,
-            },
             description: DataDescription {
                 packed: 3 | (127 << crate::OPEN_DESCRIPTION_SHIFT),
                 generation: u64::MAX,
@@ -244,40 +187,6 @@ mod tests {
             length: -19,
             pid: -1,
         }
-    }
-
-    #[test]
-    fn control_domains_are_exact_and_separate_from_io_and_close() {
-        for slot in 0..80 {
-            let key = OpenKey {
-                slot,
-                generation: 1,
-            };
-            assert_eq!(validate_key(key).is_ok(), (32..48).contains(&slot));
-        }
-        assert!(
-            validate_key(OpenKey {
-                generation: 0,
-                ..request().key
-            })
-            .is_err()
-        );
-        for method in [Method::LockQuery, Method::LockRelease, Method::LockCancel] {
-            let mut out = Writer::new();
-            write_lock_key(method, request().key, &mut out).unwrap();
-            let mut input = Reader::new(out.as_bytes());
-            assert_eq!(crate::Header::read(&mut input).unwrap(), method.header());
-            assert_eq!(read_lock_key(input), Ok(request().key));
-            assert!(
-                read_lock_key(Reader::new(
-                    &out.as_bytes()[proto_wire::HEADER_LEN..out.as_bytes().len() - 1]
-                ))
-                .is_err()
-            );
-        }
-        let mut out = Writer::new();
-        assert!(write_lock_key(Method::ChangeRelease, request().key, &mut out).is_err());
-        assert!(out.as_bytes().is_empty());
     }
 
     #[test]
@@ -302,7 +211,7 @@ mod tests {
             );
             assert_eq!(LockStart::read(input), Ok(request));
             let body = &out.as_bytes()[proto_wire::HEADER_LEN..];
-            assert_eq!(body.len(), 56);
+            assert_eq!(body.len(), 44);
             for length in 0..body.len() {
                 assert!(LockStart::read(Reader::new(&body[..length])).is_err());
             }
@@ -310,14 +219,11 @@ mod tests {
             extra.push(0);
             assert!(LockStart::read(Reader::new(&extra)).is_err());
         }
-        for (number, method) in [
-            (50, Method::LockStart),
-            (51, Method::LockQuery),
-            (52, Method::LockRelease),
-            (53, Method::LockCancel),
-        ] {
-            assert_eq!(Method::from_number(number), Some(method));
-            assert!(crate::METHODS.contains(&number));
+        assert_eq!(Method::from_number(50), Some(Method::LockStart));
+        assert!(crate::METHODS.contains(&50));
+        for number in [51, 52, 53] {
+            assert_eq!(Method::from_number(number), None);
+            assert!(!crate::METHODS.contains(&number));
         }
     }
 
@@ -365,7 +271,7 @@ mod tests {
         );
         let mut out = Writer::new();
         request().write(&mut out).unwrap();
-        for offset in [24, 28] {
+        for offset in [12, 16] {
             let mut body = out.as_bytes()[proto_wire::HEADER_LEN..].to_vec();
             body[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
             assert!(LockStart::read(Reader::new(&body)).is_err());
@@ -373,25 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn replies_retain_terminal_result_and_distinguish_pid_from_ofd_blocker() {
+    fn replies_retain_result_and_distinguish_pid_from_ofd_blocker() {
         for reply in [
             LockReply {
-                phase: LockPhase::Pending,
                 result: 0,
                 blocker: None,
             },
             LockReply {
-                phase: LockPhase::Complete,
-                result: 0,
-                blocker: None,
-            },
-            LockReply {
-                phase: LockPhase::Complete,
                 result: crate::BAD_FD,
                 blocker: None,
             },
             LockReply {
-                phase: LockPhase::Complete,
                 result: 0,
                 blocker: Some(LockBlocker {
                     kind: LockKind::Read,
@@ -401,7 +299,6 @@ mod tests {
                 }),
             },
             LockReply {
-                phase: LockPhase::Complete,
                 result: 0,
                 blocker: Some(LockBlocker {
                     kind: LockKind::Write,
@@ -423,9 +320,13 @@ mod tests {
         }
         assert!(
             LockReply {
-                phase: LockPhase::Pending,
                 result: crate::BAD_FD,
-                blocker: None
+                blocker: Some(LockBlocker {
+                    kind: LockKind::Read,
+                    start: 0,
+                    length: 0,
+                    pid: -1,
+                }),
             }
             .validate()
             .is_err()

@@ -109,10 +109,7 @@ pub use info::NodeInfo;
 pub use time::Timestamp;
 
 mod locks;
-pub use locks::{
-    LockBlocker, LockCommand, LockKind, LockPhase, LockReply, LockStart, read_lock_key,
-    write_lock_key,
-};
+pub use locks::{LockBlocker, LockCommand, LockKind, LockReply, LockStart};
 
 mod wait;
 pub use wait::{
@@ -367,10 +364,7 @@ pub enum Method {
     /// Exact close key and description; detach the last local alias and retain its outcome.
     CloseEvent = 49,
     LockStart = 50,
-    LockQuery = 51,
-    LockRelease = 52,
-    /// Retain a canonical cancellation outcome until explicit Release.
-    LockCancel = 53,
+    /// Numbers 51 to 53 stay reserved.
     WaitStart = 54,
     WaitQuery = 55,
     WaitCancel = 56,
@@ -446,9 +440,6 @@ impl Method {
             48 => Some(Self::ChangeRelease),
             49 => Some(Self::CloseEvent),
             50 => Some(Self::LockStart),
-            51 => Some(Self::LockQuery),
-            52 => Some(Self::LockRelease),
-            53 => Some(Self::LockCancel),
             54 => Some(Self::WaitStart),
             55 => Some(Self::WaitQuery),
             56 => Some(Self::WaitCancel),
@@ -465,8 +456,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 54, 55, 56, 57, 58, 59, 60, 61, 62,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

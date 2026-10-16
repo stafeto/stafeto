@@ -5,6 +5,7 @@
 
 use super::{DescriptorFlags, FsError, PosixFs, Target};
 use entries::Frame;
+use proto_fs::DataDescription;
 pub use posix_fd::{CloseAdmission, CloseSnapshot, CloseToken, JobPlace, OwnerToken, WaitValue};
 
 pub type Snapshot = CloseSnapshot<Target, Frame>;
@@ -17,12 +18,15 @@ pub type Admission = CloseAdmission<Target, Frame>;
 pub(crate) struct RecordLocks {
     none: bool,
     epoch: u64,
+    /// Lock commands between their begin and their end.
+    commands: u32,
 }
 impl RecordLocks {
     pub(crate) const fn new() -> Self {
         Self {
             none: false,
             epoch: 0,
+            commands: 0,
         }
     }
 }
@@ -33,7 +37,6 @@ pub struct Asked(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseCommandFence {
-    Control(super::change::ControlToken),
     Wait(super::wait::WaitToken),
 }
 
@@ -47,24 +50,9 @@ impl PosixFs {
         if snapshot.complete {
             return Ok(None);
         }
-        let control = self.fence_lock_for_close(snapshot.entry)?;
-        let wait = self.fence_wait_for_close(snapshot.entry)?;
-        match (control, wait) {
-            (Some(c), Some(w)) => {
-                let prefer_wait = self
-                    .descriptors
-                    .update_close_metadata(token, |r| r.next_close_fence())
-                    .map_err(FsError::from)?;
-                Ok(Some(if prefer_wait {
-                    CloseCommandFence::Wait(w)
-                } else {
-                    CloseCommandFence::Control(c)
-                }))
-            }
-            (Some(c), None) => Ok(Some(CloseCommandFence::Control(c))),
-            (None, Some(w)) => Ok(Some(CloseCommandFence::Wait(w))),
-            (None, None) => Ok(None),
-        }
+        Ok(self
+            .fence_wait_for_close(snapshot.entry)?
+            .map(CloseCommandFence::Wait))
     }
     /// Whether closing `fd` only drops a name of a description that another
     /// descriptor keeps while the process is known to hold no record lock and
@@ -79,7 +67,7 @@ impl PosixFs {
     }
     /// Whether no lock command of the files is outstanding.
     pub fn no_lock_command(&self) -> bool {
-        self.control_tokens().next().is_none() && self.wait_tokens().next().is_none()
+        self.record_locks.commands == 0 && self.wait_tokens().next().is_none()
     }
     /// The question to put with a close event: the count of lock commands
     /// begun so far, or None while a lock command is outstanding, when no
@@ -98,10 +86,28 @@ impl PosixFs {
         }
     }
     /// A lock command begins: the process may hold a record lock from now
+    /// until the service says otherwise. The result names the open file
+    /// description the command acts on; `lock_ends` follows the reply.
+    pub fn lock_begins(&mut self, fd: u32) -> Result<DataDescription, FsError> {
+        let backend = match self.descriptors.get(fd).map_err(FsError::from)? {
+            Target::Ram(backend) | Target::Random(backend) => backend,
+            _ => return Err(FsError::InvalidArgument),
+        };
+        self.record_lock_command_begins();
+        self.record_locks.commands += 1;
+        Ok(DataDescription {
+            packed: backend.fd() | backend.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT,
+            generation: backend.generation(),
+        })
+    }
+    /// A lock command begins: the process may hold a record lock from now
     /// until the service says otherwise.
     pub(crate) fn record_lock_command_begins(&mut self) {
         self.record_locks.none = false;
         self.record_locks.epoch = self.record_locks.epoch.wrapping_add(1);
+    }
+    pub fn lock_ends(&mut self) {
+        self.record_locks.commands = self.record_locks.commands.saturating_sub(1);
     }
     pub fn pending_open(&self, fd: u32) -> Option<posix_fd::OpenToken> {
         self.descriptors.pending(fd)
