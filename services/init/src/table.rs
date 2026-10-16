@@ -1057,6 +1057,36 @@ mod tests {
         assert!(matches!(check(&cycle), Err(TableError::Cycle(_))));
     }
 
+    /// Spec 2, 2: the process service at 52, the terminal at 50, the files
+    /// and the pipes at 48, the clock no lower than the files (their client);
+    /// a client of the terminal above 50 is refused by rule 6.6.
+    #[test]
+    fn the_services_stand_at_their_levels() {
+        let table = ramfs::RTBENCH_POSIX_TABLE;
+        assert!(check(table).is_ok());
+        let level = |name: &str| table.iter().find(|r| r.name == name).unwrap().priority;
+        assert_eq!(level("posix"), 52);
+        assert_eq!(level("tty"), 50);
+        assert_eq!((level("ramfs"), level("pipe")), (48, 48));
+        assert!(level("clock") >= level("ramfs"));
+        // Every record that is a POSIX process stays below the services.
+        assert!(
+            table
+                .iter()
+                .filter(|r| r.is_posix())
+                .all(|r| r.ceiling < 40)
+        );
+        let mut raised = table.to_vec();
+        raised.push(client("loud", 30, 53, &["tty"]));
+        assert_eq!(
+            refused(&raised),
+            "tty at priority 50 is below the ceiling 53 of its client loud"
+        );
+        raised.pop();
+        raised.push(client("fine", 30, 50, &["tty"]));
+        assert!(check(&raised).is_ok());
+    }
+
     #[test]
     fn a_good_table_passes_in_dependency_order() {
         let names: Vec<&str> = TEST.iter().map(|r| r.name).collect();

@@ -23,6 +23,17 @@ impl StepSample {
             accounting_valid: counted <= whole,
         }
     }
+
+    /// The sample with `ran`, the CPU ticks of the thread in the step, as
+    /// its own part when that is shorter than the clock's: a thread of a
+    /// higher level that ran in the middle lengthens `whole`, not `ran`.
+    /// 0 stands for a thread that could not read its time.
+    pub fn cpu(mut self, ran: u64) -> Self {
+        if ran != 0 {
+            self.took = self.took.min(ran);
+        }
+        self
+    }
 }
 /// The reply/maintenance tail completes before the existing end clock is read.
 #[inline(always)]
@@ -40,6 +51,15 @@ mod tests {
         assert!(s.accounting_valid);
         assert_eq!((s.kind, s.detail), (58, 16));
     }
+    #[test]
+    fn a_thread_above_that_ran_in_the_middle_is_not_the_steps() {
+        let s = StepSample::measured(50, 32, 22_349, 0).cpu(19_699);
+        assert_eq!((s.whole, s.waited, s.took), (22_349, 0, 19_699));
+        // A reading longer than the clock's part, or none, changes nothing.
+        assert_eq!(StepSample::measured(50, 32, 100, 10).cpu(500).took, 90);
+        assert_eq!(StepSample::measured(50, 32, 100, 10).cpu(0).took, 90);
+    }
+
     #[test]
     fn excess_wait_is_visible_and_never_underflows() {
         let s = StepSample::measured(65, 32, 17, 18);

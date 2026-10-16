@@ -562,6 +562,10 @@ mod steps {
     /// from their own loops, and their waits are the preemption of the step,
     /// which stays in its own part.
     static LEADER: AtomicUsize = AtomicUsize::new(0);
+    /// The handle of the loop's own thread (made at the first step) and the
+    /// CPU ticks it had run when the step in progress began.
+    static SELF: AtomicU64 = AtomicU64::new(0);
+    static RAN_BEGIN: AtomicU64 = AtomicU64::new(0);
     static WAITS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
@@ -577,6 +581,26 @@ mod steps {
 
     pub fn report(tag: u8) {
         REPORT.store(tag, Ordering::Relaxed);
+    }
+
+    /// The CPU ticks the loop's thread has run (object_info THREAD_STATE
+    /// x5): the time of its own stints, which a thread of a higher level
+    /// that runs in the middle of a step does not lengthen, as the clock
+    /// does. 0 when the thread has no handle to itself.
+    fn own_ran() -> u64 {
+        let mut handle = SELF.load(Ordering::Relaxed);
+        if handle == 0 {
+            match crate::sys::self_thread() {
+                Ok(own) => {
+                    handle = own.into_raw().0;
+                    SELF.store(handle, Ordering::Relaxed);
+                }
+                Err(_) => return 0,
+            }
+        }
+        let own =
+            crate::handle::Handle::<crate::handle::Thread>::borrowed(crate::abi::Handle(handle));
+        crate::sys::thread_ran(&own).unwrap_or(0)
     }
 
     pub fn quiet() {
@@ -615,6 +639,7 @@ mod steps {
     /// Starts the count of a step: what an earlier send of the loop
     /// (between steps) waited does not belong to it.
     pub fn restart() {
+        RAN_BEGIN.store(own_ran(), Ordering::Relaxed);
         WAITED.store(0, Ordering::Relaxed);
         LEADER.store(crate::msgbuf::address(), Ordering::Relaxed);
         DEPARTED.store(false, Ordering::Relaxed);
@@ -642,7 +667,12 @@ mod steps {
             kind
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
-        let sample = super::StepSample::measured(kind, detail, whole, counted);
+        // The step's own part is the CPU time of the loop's thread: neither
+        // the wait for another service nor a thread of a higher level that
+        // ran in the middle belongs to it (spec 2, 2: the levels of the
+        // services are above those of the processes they serve).
+        let ran = own_ran().saturating_sub(RAN_BEGIN.load(Ordering::Relaxed));
+        let sample = super::StepSample::measured(kind, detail, whole, counted).cpu(ran);
         let (waited, took) = (sample.waited, sample.took);
         if detail == 32 {
             FULL[kind].fetch_max(took, Ordering::Relaxed);

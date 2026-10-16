@@ -9,6 +9,11 @@ use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
 
+/// The level of the file, pipe and clock services.
+pub const SERVICE_LEVEL: u8 = 48;
+/// The level of the process service, the highest of the POSIX services.
+pub const PROCESS_LEVEL: u8 = 52;
+
 const RAM_BASE: Record = Record {
     name: "ramfs",
     program: "ramfs",
@@ -16,8 +21,12 @@ const RAM_BASE: Record = Record {
         period_ns: 250 * MS,
         deadline_ns: 1000 * MS,
     }),
-    priority: 40,
-    ceiling: 40,
+    // Spec 2, 2: the levels of the services, above every POSIX process
+    // (ceilings up to 39): the process service 52, the terminal 50, the
+    // files and the pipes 48, the clock 48 (the file service is its
+    // client, so rule 6.6 puts the clock no lower than the files).
+    priority: SERVICE_LEVEL,
+    ceiling: SERVICE_LEVEL,
     // Checked standalone RAM adds measured readonly and code pages.
     // Backing, stack and runtime allowance retain their existing sizes.
     quota: if cfg!(all(debug_assertions, feature = "table-ramfs")) {
@@ -337,6 +346,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     Record {
         name: "posix",
         program: "posix-process-service",
+        priority: PROCESS_LEVEL,
+        ceiling: PROCESS_LEVEL,
         // Its own, and the eight objects of the pages of its records
         // (32 pages each); what its POSIX records take init adds.
         quota: 640 * PAGE,

@@ -378,6 +378,9 @@ fn main(_: u64) -> u64 {
     owner.channel = Handle::borrowed(channel.raw());
     owner.identities = Handle::borrowed(identities.raw());
     owner.level = level;
+    if owner.pages.make(&start.process).is_err() {
+        return 7;
+    }
     if owner.generations.make(&start.process).is_err() {
         return 7;
     }
