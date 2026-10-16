@@ -378,6 +378,37 @@ pub fn thread_set_priority(
     call::<{ Call::ThreadSetPriority.number() }>(&args).map(drop)
 }
 
+/// thread_set_priority with abi::POLICY_TAIL: the thread also goes to the
+/// tail of the list of its new level (XSH 2.8.4 for pthread_setschedparam
+/// and sched_setscheduler); the running thread yields to its equals.
+pub fn thread_set_priority_tail(
+    thread: &Handle<Thread>,
+    priority: u8,
+    policy: Policy,
+) -> Result<(), Error> {
+    let args = [
+        thread.raw().0,
+        priority.into(),
+        policy as u64 | abi::POLICY_TAIL,
+    ];
+    call::<{ Call::ThreadSetPriority.number() }>(&args).map(drop)
+}
+
+/// object_info(THREAD_STATE) x5: the counter ticks the thread has run.
+pub fn thread_ran(thread: &Handle<Thread>) -> Result<u64, Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(x[5])
+}
+
+/// object_info(PROCESS_TIME): the counter ticks the threads of the process
+/// have run, those that ended included.
+pub fn process_time(process: &Handle<Process>) -> Result<u64, Error> {
+    let args = [process.raw().0, abi::INFO_PROCESS_TIME, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(x[1])
+}
+
 /// Wake a thread from its current send or receive with Error::Interrupted.
 /// Requires MANAGE. Returns BadState if it waits in neither, as when it
 /// waits for the reply to an accepted request, which comes once; no

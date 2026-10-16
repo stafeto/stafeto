@@ -127,6 +127,7 @@ extern "C" fn files_loader_abort_capture(fd: i32, loaded: i32) -> i32 {
             level: 1,
             mask: 0,
             default: 0,
+            sched: 0,
             name: [0; proto_process::NAME_LEN],
         }
         .write(&mut request)?;

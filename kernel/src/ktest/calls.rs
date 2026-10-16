@@ -440,11 +440,11 @@ fn self_thread_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
     c.close(supplied)?;
     other.release();
     compared?;
-    let before = thread::info(c.thread);
+    let before = thread::info(c.thread).0;
     c.close(first)?;
     c.fails(n, &[first.0, abi::INFO_THREAD_CURRENT, 0], Error::BadHandle)?;
     check(
-        thread::info(c.thread).to_words() == before.to_words(),
+        thread::info(c.thread).0.to_words() == before.to_words(),
         "SELF Close changed the thread",
     )?;
     let fresh = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
@@ -1531,7 +1531,7 @@ fn request_to_the_dying(
 /// then. The thread at 10 is still ready.
 pub fn kill_hastens_a_dying_process(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
-        sched::set_priority(c.thread, 20, Policy::Fifo).map_err(|_| "no priority 20")?;
+        sched::set_priority(c.thread, 20, Policy::Fifo, false).map_err(|_| "no priority 20")?;
         let child = c.created(
             Call::ProcessCreate.number(),
             &[CHILD_QUOTA, 16, 20, 0, 0, 0],
@@ -7116,7 +7116,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             // Change levels after parking so the first continuation portion
             // spans all 63 legal levels, with one repeated level.
             for (i, t) in threads.iter().flatten().enumerate() {
-                sched::set_priority(*t, (i % 63 + 1) as u8, Policy::RoundRobin)
+                sched::set_priority(*t, (i % 63 + 1) as u8, Policy::RoundRobin, false)
                     .map_err(|_| "parked spread priority failed")?;
             }
         }
@@ -7124,7 +7124,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             threads
                 .iter()
                 .flatten()
-                .all(|t| thread::info(*t).state == abi::ThreadState::Parked),
+                .all(|t| thread::info(*t).0.state == abi::ThreadState::Parked),
             "object_info lost Parked",
         )?;
         let t = threads[0].unwrap();
@@ -7147,7 +7147,7 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
             unsafe { sched::request_upcall(t, CAUSE) } == Ok(()),
             "upcall refused a parked thread",
         )?;
-        sched::set_priority(t, 40, Policy::Fifo).map_err(|_| "parked priority failed")?;
+        sched::set_priority(t, 40, Policy::Fifo, false).map_err(|_| "parked priority failed")?;
         // SAFETY: The scheduler lock guards this retained thread during boosts.
         sched::locked(|k| unsafe {
             k.s.boost(t, 60, 63);

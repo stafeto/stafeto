@@ -221,7 +221,7 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
         let waited = unsafe { channel::cancel(t, k) };
         // SAFETY: as above.
         unsafe {
-            k.s.exit(t);
+            k.s.exit(t, timer::now());
             thread::give_number(t, k.tokens);
         }
         (!matches!(state, State::Stopped | State::Dead), waited)
@@ -331,7 +331,7 @@ unsafe fn interrupt_if(
 /// when it is alone there. Lower levels never run through yield.
 pub fn yield_running() {
     // SAFETY: the scheduler's threads are alive (`start`).
-    unsafe { SCHED.lock().s.yield_running() };
+    unsafe { SCHED.lock().s.yield_running(timer::now()) };
 }
 
 /// thread_set_priority: `priority` (1-63) becomes the base priority of
@@ -344,13 +344,18 @@ pub fn yield_running() {
 /// `resume` runs a thread raised above the running one, or another one
 /// when the running thread lowered itself below it. BAD_STATE for a
 /// thread that ended.
-pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<(), Error> {
+pub fn set_priority(
+    t: NonNull<Thread>,
+    priority: u8,
+    policy: Policy,
+    tail: bool,
+) -> Result<(), Error> {
     let now = timer::now();
     let waits = locked(|k| {
         // SAFETY: the caller holds a reference to `t`; the scheduler's
         // threads are alive, and so is the channel a thread waits in.
         unsafe {
-            k.s.set_priority(t, priority, policy, now)?;
+            k.s.set_priority(t, priority, policy, tail, now)?;
             Ok::<_, Error>(channel::requeue(t, k))
         }
     })?;

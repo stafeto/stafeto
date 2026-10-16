@@ -22,7 +22,7 @@ mod exit_intent;
 use crate::{allocation, constants::*};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use posix_thread::{Block, flag};
-use rt::abi::{Policy, Rights, ThreadState};
+use rt::abi::{Rights, ThreadState};
 use rt::handle::{Channel, Handle, Thread};
 use rt::sys;
 
@@ -738,7 +738,6 @@ pub unsafe fn create(
     block: *mut Block,
 ) -> Result<u64, i32> {
     let me = crate::threads::own_block();
-    let base = me.base_level.load(Ordering::Relaxed) as u8;
     // relibc maps the ABI page, the TLS and the TCB page in one piece
     // (`Tcb::os_new`) and gives it to the platform: the layer frees it
     // after the thread's end, or now if no thread comes of it.
@@ -755,6 +754,15 @@ pub unsafe fn create(
             (*generic).tcb_len,
         );
         (end - tls - PAGE, PAGE + tls + page)
+    };
+    // The thread's scheduling: its creator's, or what the attribute object
+    // of pthread_create gave (EINVAL for a policy or priority out of range).
+    let (sched_word, base, policy) = match crate::sched::for_new_thread(me) {
+        Ok(taken) => taken,
+        Err(errno) => {
+            unmap(tcb, tcb_len);
+            return Err(errno);
+        }
     };
     let reserved = exits().and_then(|exits| reserve().map(|index| (exits, index)));
     let Ok((exits, index)) = reserved else {
@@ -788,9 +796,7 @@ pub unsafe fn create(
             return Err(EIO);
         }
     };
-    // The creator's policy: round robin unless it asked for FIFO.
-    let policy_raw = me.policy.load(Ordering::Relaxed);
-    let policy = Policy::from_raw(policy_raw).unwrap_or(Policy::RoundRobin);
+    let policy_raw = policy as u64;
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
     let Ok(channel) = sys::channel_create(base) else {
@@ -839,6 +845,7 @@ pub unsafe fn create(
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);
         block.thread_id = id;
         block.policy.store(policy_raw, Ordering::Relaxed);
+        block.sched.store(sched_word, Ordering::Relaxed);
         block.cancel_point.store(0, Ordering::Relaxed);
     }
     place.tcb.store(tcb, Ordering::Relaxed);
@@ -1382,6 +1389,34 @@ pub fn cancel(id: u64) -> i32 {
         0
     })
     .unwrap_or_else(|code| code)
+}
+
+/// What ends the calling thread for a request of cancellation, in the form
+/// of relibc's pthread_exit(PTHREAD_CANCELED): the platform gives it at the
+/// start of the process.
+static CANCEL_EXIT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn configure_cancel(exit: fn() -> !) {
+    CANCEL_EXIT.store(exit as usize, Ordering::Release);
+}
+
+/// Whether the calling thread has asynchronous cancellation enabled and a
+/// request waits (XSH 2.9.5.1: such a thread may act on it at any time).
+pub fn async_cancel_due() -> bool {
+    let flags = crate::threads::own_block().flags.load(Ordering::SeqCst);
+    flags
+        & (flag::CANCEL_PENDING | flag::CANCEL_DISABLED | flag::CANCEL_ASYNCHRONOUS | flag::EXITING)
+        == flag::CANCEL_PENDING | flag::CANCEL_ASYNCHRONOUS
+}
+
+/// Ends the calling thread as a cancelled one does (its cleanup handlers
+/// run, its keys' destructors).
+pub fn cancel_exit() -> ! {
+    let exit = CANCEL_EXIT.load(Ordering::Acquire);
+    assert!(exit != 0, "no exit for a cancelled thread");
+    // SAFETY: only `configure_cancel` stores a value, a `fn() -> !`.
+    let exit: fn() -> ! = unsafe { core::mem::transmute(exit) };
+    exit()
 }
 
 /// Whether the calling thread's cancellation point acts now.

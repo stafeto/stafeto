@@ -156,6 +156,15 @@ const STEP: u64 = 1 << 63 | 0xFFFF;
 /// The label of the service's timer of the processes' timers (`timers`),
 /// a service label no record has. The heartbeat's timer has label 0.
 const TIMERS: u64 = 1 << 63 | 0xFFFE;
+/// The label of the notice that makes the next portion of a Create (the
+/// service's own place, as STEP is).
+const CREATING: u64 = 1 << 63 | 0xFFFD;
+/// The bits of the label of the notice that makes the next portion of a
+/// load: they are followed by the ticket of its place (loaders.rs), whose
+/// generation tells a notice of a place that went from one of the place's
+/// next load. No record has such a label.
+const PORTION: u64 = 1 << 63 | 1 << 62;
+const PORTION_MASK: u64 = 3 << 62;
 /// What the service holds for a loader (loaders.rs): its thread, the
 /// router of the program's signals once the record lives; the copy of its
 /// start channel C with NOTIFY, label 2, through which it hears that the
@@ -169,6 +178,44 @@ struct Held {
     /// The load is a copy of ForkStart: only ForkCommit and ForkAbort
     /// take it.
     fork: bool,
+    /// What the next portion of the load does (the place is Making), or
+    /// none once the thread started.
+    making: Option<Making>,
+    /// The place of the loop's channel that tells it of the next portion, at
+    /// the level of the one who asked (PORTION); made with the first notice
+    /// and closed with the place.
+    portion: Option<Handle<Channel>>,
+}
+/// A piece of putting the loader into a new process, one for each portion
+/// of the loop (spec 2, 3.1; term B bounds a portion): the page of the
+/// record, the loader's code, its read-only data, its data and stack, its
+/// thread and start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Work {
+    Page,
+    Code,
+    Rodata,
+    Data,
+    Thread,
+}
+struct Making {
+    work: Work,
+    /// The page a child of SpawnStart or ForkStart starts with; none for
+    /// an exec, which maps the record's page as it is.
+    birth: Option<Birth>,
+    /// The level of the loader's thread and of the place of the notices:
+    /// the level of the one who asked.
+    level: u8,
+}
+/// The Create that waits for its second portion: the process service's own
+/// receiving thread asked for it, one at a time.
+struct Creating {
+    pending: Pending,
+    index: usize,
+    /// The label of the record, so that a portion finds out that the record
+    /// went (its process ended) between the portions.
+    label: u64,
+    copy: Result<Handle<Process>, abi::Error>,
 }
 /// What a child of SpawnStart or ForkStart starts with: its spawn-flags
 /// and group, the level of its loader, its credentials and its page.
@@ -243,6 +290,10 @@ struct Processes {
     /// (STEP), and whether a step was told and not taken.
     step: Option<Handle<Channel>>,
     step_told: bool,
+    /// The Create in its portions, and the place that tells the loop of the
+    /// next one (CREATING).
+    creating: Option<Creating>,
+    creating_notice: Option<Handle<Channel>>,
     /// The loaders that run (5c), the loader's program, the session of the
     /// loaders with the RAM file service (proto_fs LOADERS) and a console
     /// for the programs they start.
@@ -289,6 +340,8 @@ impl Processes {
             terminals: Terminals::new(),
             step: None,
             step_told: false,
+            creating: None,
+            creating_notice: None,
             loaders: Loaders::new(),
             loader: None,
             files: None,
@@ -378,6 +431,9 @@ fn main(_: u64) -> u64 {
     owner.channel = Handle::borrowed(channel.raw());
     owner.identities = Handle::borrowed(identities.raw());
     owner.level = level;
+    if owner.pages.make(&start.process).is_err() {
+        return 7;
+    }
     if owner.generations.make(&start.process).is_err() {
         return 7;
     }
@@ -390,6 +446,12 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     owner.step = Some(step);
+    // The notice of the second portion of a Create, at the loop's level
+    // (the receiving thread that asks works there).
+    let Ok(creating) = sys::handle_label(&channel, Rights::NOTIFY, CREATING, level) else {
+        return 7;
+    };
+    owner.creating_notice = Some(creating);
     // The timers of the processes: one timer of the kernel on a labelled
     // copy of the channel, so that its notice comes apart from the
     // heartbeat's (label 0).
@@ -424,6 +486,14 @@ fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
         w.u32(id).expect("process credentials");
     }
 }
+/// The counter ticks a record's process and its waited-for children ran:
+/// what its parent's children's time grows by when it is waited for.
+fn cpu_ticks(record: &Record<Handle<Process>>) -> u64 {
+    record
+        .carried_ticks
+        .saturating_add(sys::process_time(&record.process).unwrap_or(0))
+        .saturating_add(record.children_ticks)
+}
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
@@ -452,6 +522,11 @@ impl Processes {
     /// record taken; the errors of the calls as the status, and nothing
     /// stays.
     fn create(&mut self, r: &mut Request<'_>) -> Answer {
+        // One Create at a time: only the receiving thread asks, and it waits
+        // for the answer.
+        if self.creating.is_some() || self.creating_notice.is_none() {
+            return refuse(proto_process::AGAIN);
+        }
         let Ok(create) = Create::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
@@ -516,7 +591,55 @@ impl Processes {
         // A record made in a used index never starts its generation over.
         self.generations.raise(index);
         self.publish_groups(index);
+        // The second portion makes the page and the sessions and answers.
+        let Some(pending) = r.defer() else {
+            let record = self.records.get(index).expect("a new record");
+            let _ = sys::process_kill(&record.process);
+            return Answer::Status(Status::BadSize);
+        };
+        self.creating = Some(Creating {
+            pending,
+            index,
+            label: label.raw(),
+            copy,
+        });
+        if self
+            .creating_notice
+            .as_ref()
+            .is_none_or(|n| sys::notify(n, 1).is_err())
+        {
+            self.created();
+        }
+        Answer::Deferred
+    }
+
+    /// The second portion of Create: the record's page, its session and its
+    /// identity session, and the answer (the PID and the label, a copy of
+    /// the process, the two sessions). A record that went between the
+    /// portions (its process ended) gets BAD_STATE.
+    fn created(&mut self) {
+        let Some(creating) = self.creating.take() else {
+            return;
+        };
+        let Creating {
+            pending,
+            index,
+            label,
+            copy,
+        } = creating;
+        let answer = |pending: Pending, status: Status| {
+            let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
+        };
+        let alive = self.records.find(label) == Some(index)
+            && self
+                .records
+                .get(index)
+                .is_some_and(|r| r.state == State::Loading);
+        if !alive {
+            return answer(pending, Status::Kernel(abi::Error::BadState));
+        }
         let record = self.records.get(index).expect("a new record");
+        let label = record.label;
         let identity = [label.pid(), record.parent, record.pgid, record.sid];
         let paged = self
             .pages
@@ -540,21 +663,26 @@ impl Processes {
         let (copy, session, who) = match (copy, session, who) {
             (Ok(copy), Ok(session), Ok(who)) => (copy, session, who),
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-                let record = self.records.get(index).expect("a new record");
                 let _ = sys::process_kill(&record.process);
-                return Answer::Status(Status::Kernel(e));
+                return answer(pending, Status::Kernel(e));
             }
         };
-        let w = r.reply();
+        let mut w = Writer::new();
         let written = w
             .u32(0)
             .and_then(|()| w.u32(label.pid()))
             .and_then(|()| w.u64(label.raw()));
         match written {
-            Ok(()) => Answer::Reply([copy.erase(), session.erase(), who.erase()].into()),
+            Ok(()) => {
+                let sent =
+                    pending.answer(w.as_bytes(), [copy.erase(), session.erase(), who.erase()]);
+                if sent.is_err() {
+                    let _ = sys::process_kill(&record.process);
+                }
+            }
             Err(status) => {
                 let _ = sys::process_kill(&copy);
-                Answer::Status(status)
+                answer(pending, status);
             }
         }
     }
@@ -704,6 +832,12 @@ impl Processes {
         if options & WNOWAIT == 0 {
             self.tell(parent, child);
             if matches!(result, WaitResult::Ended { .. }) {
+                // The parent's children's time grows by the child's own and
+                // its waited-for children's (getrusage RUSAGE_CHILDREN).
+                let ticks = self.records.get(child).map_or(0, cpu_ticks);
+                if let Some(p) = self.records.get_mut(parent) {
+                    p.children_ticks = p.children_ticks.saturating_add(ticks);
+                }
                 self.records.reap(child);
                 self.generations.set_groups(child, None);
             } else {
@@ -1279,6 +1413,125 @@ impl Processes {
             Delivery::Done | Delivery::Again => Answer::Status(Status::Ok),
             Delivery::Denied => refuse(proto_process::PERMISSION),
             Delivery::Refused => refuse(proto_process::INVALID),
+        }
+    }
+
+    /// Account of the record in `index` (`account_op`): its children's time,
+    /// and the nice value of the processes `which` and `who` select
+    /// (PRIO_PROCESS with 0 for the caller, PRIO_PGRP with 0 for its group,
+    /// PRIO_USER with 0 for its effective user). A setpriority is for the
+    /// processes of the caller's user (PERMISSION otherwise), and a nice
+    /// value lower than the process had needs the effective user 0
+    /// (ACCESS). O(RECORDS), a record at a time: no wait on anything.
+    fn account(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let Ok(operation) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let caller = self.records.get(index).expect("the caller");
+        match operation {
+            proto_process::account_op::CHILD_TIMES => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let ticks = caller.children_ticks;
+                let w = r.reply();
+                if w.u32(0).and_then(|()| w.u64(ticks)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            proto_process::account_op::NICE_GET | proto_process::account_op::NICE_SET => {
+                let set = operation == proto_process::account_op::NICE_SET;
+                let (Ok(which), Ok(who)) = (body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let value = if set {
+                    match body.u32() {
+                        Ok(value) => value as i32,
+                        Err(_) => return Answer::Status(Status::BadSize),
+                    }
+                } else {
+                    0
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let (euid, uid, pgid) =
+                    (caller.credentials.euid, caller.credentials.uid, caller.pgid);
+                let who = match (which, who) {
+                    (proto_process::PRIO_PROCESS, 0) => caller.label.pid(),
+                    (proto_process::PRIO_PGRP, 0) => pgid,
+                    (proto_process::PRIO_USER, 0) => euid,
+                    (_, who) => who,
+                };
+                let selected = |record: &Record<Handle<Process>>| match which {
+                    proto_process::PRIO_PROCESS => record.label.pid() == who,
+                    proto_process::PRIO_PGRP => record.pgid == who,
+                    _ => record.credentials.euid == who,
+                };
+                if !matches!(
+                    which,
+                    proto_process::PRIO_PROCESS
+                        | proto_process::PRIO_PGRP
+                        | proto_process::PRIO_USER
+                ) {
+                    return refuse(proto_process::INVALID);
+                }
+                let (mut found, mut changed, mut denied, mut lowered) = (false, 0u32, false, false);
+                let mut least = 20i32;
+                for i in 0..RECORDS {
+                    let Some(record) = self.records.get(i) else {
+                        continue;
+                    };
+                    if record.state == State::Loading || !selected(record) {
+                        continue;
+                    }
+                    found = true;
+                    if !set {
+                        least = least.min(i32::from(record.nice));
+                        continue;
+                    }
+                    // POSIX: the real or the effective user ID of the caller
+                    // must equal the effective user ID of the target.
+                    if !records::may_renice(uid, euid, record.credentials.euid) {
+                        denied = true;
+                        continue;
+                    }
+                    let new = value.clamp(-20, 19);
+                    if new < i32::from(record.nice) && euid != 0 {
+                        lowered = true;
+                        continue;
+                    }
+                    if let Some(record) = self.records.get_mut(i) {
+                        record.nice = new as i8;
+                        changed += 1;
+                    }
+                }
+                if !found {
+                    return refuse(proto_process::NO_PROCESS);
+                }
+                if set && changed == 0 {
+                    return refuse(if lowered {
+                        proto_process::ACCESS
+                    } else if denied {
+                        proto_process::PERMISSION
+                    } else {
+                        proto_process::NO_PROCESS
+                    });
+                }
+                let w = r.reply();
+                let done = if set {
+                    w.u32(0).and_then(|()| w.u32(changed))
+                } else {
+                    w.u32(0).and_then(|()| w.u32(least as u32))
+                };
+                if done.is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            _ => refuse(proto_process::INVALID),
         }
     }
 
@@ -2161,6 +2414,7 @@ impl Processes {
             page: PageStart::Spawn {
                 mask: start.mask,
                 default: start.default,
+                sched: start.sched,
             },
         };
         self.start_child(index, birth, r)
@@ -2300,31 +2554,11 @@ impl Processes {
         }
         self.generations.raise(child);
         self.publish_groups(child);
-        let record = self.records.get(child).expect("a new record");
-        let identity = [label.pid(), record.parent, record.pgid, record.sid];
-        let paged = self
-            .pages
-            .give(&make::own(), child, &record.process, identity);
-        if let (Ok(()), Some(page), Some(from)) =
-            (&paged, self.pages.page(child), self.pages.page(index))
-        {
-            birth.page.write(page, from);
-        }
-        if paged.is_ok() {
-            self.signal_newborn(child);
-        }
-        let image = self.loader.as_ref().expect("a loader");
-        let record = self.records.get(child).expect("a new record");
-        let placed =
-            paged.and_then(|()| image.place(&make::own(), &record.process, create.priority));
-        let thread = match placed {
-            Ok(thread) => thread,
-            Err(e) => {
-                let _ = sys::process_kill(&record.process);
-                return kernel(e);
-            }
-        };
+        // The reply waits for Boot; the page, the loader's code, its data
+        // and its thread follow in portions of the loop, one each, at the
+        // level of the one who asked (`next_portion`).
         let Some(pending) = r.defer() else {
+            let record = self.records.get(child).expect("a new record");
             let _ = sys::process_kill(&record.process);
             return Answer::Status(Status::BadSize);
         };
@@ -2334,17 +2568,134 @@ impl Processes {
             start: Some(pending),
             incoming: None,
             fork: matches!(birth.page, PageStart::Fork { .. }),
+            making: Some(Making {
+                work: Work::Page,
+                birth: Some(birth),
+                level: create.priority,
+            }),
+            portion: None,
         };
         let Some(slot) = self.loaders.take(child, index, proto_process::IMAGE, held) else {
+            let record = self.records.get(child).expect("a new record");
             let _ = sys::process_kill(&record.process);
             return Answer::Deferred;
         };
-        let started = sys::thread_start(&thread);
-        self.loaders.get_mut(slot).expect("a new place").held.thread = Some(thread);
-        if let Err(e) = started {
-            self.abort_load(child, Status::Kernel(e));
-        }
+        self.loaders.get_mut(slot).expect("a new place").stage = Stage::Making;
+        self.next_portion(slot);
         Answer::Deferred
+    }
+
+    /// Tells the loop to make the next portion of the load in place `slot`
+    /// (a notice of its own place at the level of the one who asked, which
+    /// stands among the requests by level), or ends the load when the
+    /// notice cannot be made.
+    fn next_portion(&mut self, slot: usize) {
+        let ticket = self.loaders.ticket(slot);
+        let Some(place) = self.loaders.get_mut(slot) else {
+            return;
+        };
+        let child = place.record;
+        let level = place.held.making.as_ref().map_or(1, |m| m.level);
+        if place.held.portion.is_none() {
+            place.held.portion = sys::handle_label(
+                &self.channel,
+                Rights::NOTIFY,
+                PORTION | ticket,
+                loaders::portion_level(level, self.level),
+            )
+            .ok();
+        }
+        let told = place
+            .held
+            .portion
+            .as_ref()
+            .is_some_and(|h| sys::notify(h, 1).is_ok());
+        if !told {
+            self.abort_load(child, Status::Kernel(abi::Error::NoMemory));
+        }
+    }
+
+    /// The portion the notice of `ticket` asks for: one piece of putting
+    /// the loader into the process of the place (`Work`), then the notice of
+    /// the next, or at the last the start of the loader's thread, after
+    /// which the loader says Boot. A notice of a place that went, or of an
+    /// earlier load in it, finds another ticket and does nothing; a piece
+    /// that fails ends the load, with the status of the call for the parent
+    /// that waits.
+    fn portion(&mut self, ticket: u64) {
+        let Some(slot) = self.loaders.portion_slot(ticket) else {
+            return;
+        };
+        let Some(place) = self.loaders.get_mut(slot) else {
+            return;
+        };
+        let Some(making) = place.held.making.take() else {
+            return;
+        };
+        let (child, parent) = (place.record, place.parent);
+        let outcome = self.make_piece(slot, child, parent, &making);
+        match outcome {
+            Err(e) => self.abort_load(child, Status::Kernel(e)),
+            Ok(None) => {}
+            Ok(Some(work)) => {
+                if let Some(place) = self.loaders.get_mut(slot) {
+                    place.held.making = Some(Making { work, ..making });
+                }
+                self.next_portion(slot);
+            }
+        }
+    }
+
+    /// The piece `making` names for the place in `slot`, which loads the
+    /// record in `child` for the record in `parent`: the next piece, or
+    /// None after the last.
+    fn make_piece(
+        &mut self,
+        slot: usize,
+        child: usize,
+        parent: usize,
+        making: &Making,
+    ) -> Result<Option<Work>, abi::Error> {
+        let incoming = self
+            .loaders
+            .get(slot)
+            .and_then(|p| p.held.incoming.as_ref());
+        let record = self.records.get(child).ok_or(abi::Error::BadState)?;
+        let process = incoming.unwrap_or(&record.process);
+        let image = self.loader.as_ref().ok_or(abi::Error::BadState)?;
+        match making.work {
+            Work::Page => {
+                if incoming.is_some() {
+                    // An exec: the page as it is.
+                    self.pages.map_again(child, process)?;
+                } else {
+                    let identity = [record.label.pid(), record.parent, record.pgid, record.sid];
+                    self.pages.give(&make::own(), child, process, identity)?;
+                    if let (Some(page), Some(from), Some(birth)) = (
+                        self.pages.page(child),
+                        self.pages.page(parent),
+                        making.birth.as_ref(),
+                    ) {
+                        birth.page.write(page, from);
+                    }
+                    self.signal_newborn(child);
+                }
+                Ok(Some(Work::Code))
+            }
+            Work::Code => image.map_code(process).map(|()| Some(Work::Rodata)),
+            Work::Rodata => image.map_rodata(process).map(|()| Some(Work::Data)),
+            Work::Data => image
+                .map_data(&make::own(), process)
+                .map(|()| Some(Work::Thread)),
+            Work::Thread => {
+                let thread = image.thread(process, making.level)?;
+                let started = sys::thread_start(&thread);
+                let place = self.loaders.get_mut(slot).ok_or(abi::Error::BadState)?;
+                place.held.thread = Some(thread);
+                place.stage = Stage::Booting;
+                started.map(|()| None)
+            }
+        }
     }
 
     /// List (Ф10): the first live record of the window of `LIST_WINDOW`
@@ -2408,6 +2759,10 @@ impl Processes {
                                 _ => 0,
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
+                            nice: i32::from(record.nice),
+                            ticks: record
+                                .carried_ticks
+                                .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
                             name: record.name,
                         }
                         .write(w)
@@ -2481,40 +2836,35 @@ impl Processes {
             Ok(process) => process,
             Err(e) => return kernel(e),
         };
-        let placed = self.pages.map_again(index, &process).and_then(|()| {
-            let image = self.loader.as_ref().expect("a loader");
-            image.place(&make::own(), &process, priority)
-        });
-        let thread = match placed {
-            Ok(thread) => thread,
-            Err(e) => {
-                let _ = sys::process_kill(&process);
-                return kernel(e);
-            }
-        };
         // The new image's main thread starts with the caller's mask.
         if let Some(page) = self.pages.page(index) {
             page.start_mask
                 .store(start.mask, core::sync::atomic::Ordering::Release);
+            page.start_sched
+                .store(start.sched, core::sync::atomic::Ordering::Release);
         }
         let Some(pending) = r.defer() else {
             let _ = sys::process_kill(&process);
             return Answer::Status(Status::BadSize);
         };
-        let started = sys::thread_start(&thread);
         let held = Held {
-            thread: Some(thread),
+            thread: None,
             ready: None,
             start: Some(pending),
             incoming: Some(process),
             fork: false,
+            making: Some(Making {
+                work: Work::Page,
+                birth: None,
+                level: priority,
+            }),
+            portion: None,
         };
-        if self.loaders.take(index, index, image, held).is_none() {
+        let Some(slot) = self.loaders.take(index, index, image, held) else {
             return Answer::Deferred;
-        }
-        if let Err(e) = started {
-            self.abort_load(index, Status::Kernel(e));
-        }
+        };
+        self.loaders.get_mut(slot).expect("a new place").stage = Stage::Making;
+        self.next_portion(slot);
         Answer::Deferred
     }
 
@@ -2563,6 +2913,10 @@ impl Processes {
             .flatten();
         let record = self.records.get_mut(index).expect("the caller");
         let old = core::mem::replace(&mut record.process, incoming);
+        // The time of the images before this one goes on counting.
+        record.carried_ticks = record
+            .carried_ticks
+            .saturating_add(sys::process_time(&old).unwrap_or(0));
         let ceiling = record.ceiling;
         record.image = image;
         record.committed_loader_ticket = committed_ticket;
@@ -3334,6 +3688,7 @@ impl Service<0> for Processes {
             n if n == Method::ExecAbort as u16 => self.exec_abort(index, r),
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
+            n if n == Method::Account as u16 => self.account(index, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
             n if n == Method::Queue as u16 => self.queue(index, r),
             n if n == Method::Timer as u16 => self.timer(index, r),
@@ -3373,6 +3728,14 @@ impl Service<0> for Processes {
     fn notification(&mut self, n: Notice) {
         if n.source == Source::Session && n.label == STEP {
             self.walk_step();
+            return;
+        }
+        if n.source == Source::Session && n.label == CREATING {
+            self.created();
+            return;
+        }
+        if n.source == Source::Session && n.label & PORTION_MASK == PORTION {
+            self.portion(n.label & !PORTION_MASK);
             return;
         }
         if n.source == Source::Timer && n.label == TIMERS {

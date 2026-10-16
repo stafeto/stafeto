@@ -119,6 +119,12 @@ pub struct Record<P> {
     pub name: [u8; proto_process::NAME_LEN],
     /// The name of the exec that ExecStart began.
     pub next_name: [u8; proto_process::NAME_LEN],
+    /// The nice value (setpriority), -20 to 19: its parent's at birth.
+    pub nice: i8,
+    /// The counter ticks the images before the last exec ran, and those its
+    /// children that were waited for ran, theirs included (getrusage).
+    pub carried_ticks: u64,
+    pub children_ticks: u64,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -446,6 +452,9 @@ impl<P> Records<P> {
                 self.records[p].as_ref().unwrap().name
             }),
             next_name: [0; proto_process::NAME_LEN],
+            nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
+            carried_ticks: 0,
+            children_ticks: 0,
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,
@@ -1063,6 +1072,14 @@ pub const fn exit_place(label: Label, create: &Create, loop_level: u8) -> ExitPl
 }
 
 /// What `handle_label` and `process_create` take for an exit place.
+/// Whether a caller with the real user ID `uid` and the effective user ID
+/// `euid` may set the nice value of a process whose effective user ID is
+/// `target` (XSH setpriority, EPERM): root may, and any other caller needs
+/// its real or effective user ID to equal the target's effective one.
+pub const fn may_renice(uid: u32, euid: u32, target: u32) -> bool {
+    euid == 0 || target == euid || target == uid
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExitPlace {
     pub label: u64,
@@ -1073,6 +1090,18 @@ pub struct ExitPlace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renice_follows_the_effective_id_of_the_target() {
+        // A caller of the user 7 may set the nice of a process whose
+        // effective user is 7, whatever its real user is, and no other.
+        assert!(may_renice(7, 7, 7));
+        assert!(may_renice(7, 9, 7));
+        assert!(may_renice(7, 9, 9));
+        assert!(!may_renice(7, 7, 0));
+        assert!(!may_renice(7, 7, 8));
+        assert!(may_renice(7, 0, 8));
+    }
 
     #[test]
     fn exhausted_credentials_leave_the_real_record_unchanged() {

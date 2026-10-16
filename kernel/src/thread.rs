@@ -172,6 +172,12 @@ unsafe impl Schedulable for Thread {
         // SAFETY: `this` points at a live thread.
         unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).sched) }
     }
+
+    unsafe fn charge(this: NonNull<Thread>, ticks: u64) {
+        // SAFETY: the thread holds a reference to its process, and the
+        // scheduler's lock, which the caller holds, guards the sum.
+        unsafe { (*this.as_ref().process.as_ptr()).charge(ticks) };
+    }
 }
 
 /// Threads whose slots have not gone back.
@@ -703,7 +709,10 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
 /// its state, with what it waits for, its base and effective priorities
 /// and its policy, read with the scheduler locked, since the scheduler and
 /// the channels change them there. O(1).
-pub fn info(thread: NonNull<Thread>) -> ThreadInfo {
+/// The ticks the thread has run, the stint it is in now included, come
+/// with it (x5).
+pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64) {
+    let now = crate::arch::timer::now();
     sched::locked(|_| {
         // SAFETY: the caller holds a reference to the thread; only its
         // fields are read.
@@ -720,12 +729,13 @@ pub fn info(thread: NonNull<Thread>) -> ThreadInfo {
             State::Dead => ThreadState::Ended,
             State::Parked => ThreadState::Parked,
         };
-        ThreadInfo {
+        let info = ThreadInfo {
             state,
             base: t.sched.base(),
             priority: t.sched.priority(),
             policy: Some(t.sched.policy()),
-        }
+        };
+        (info, t.sched.ran_at(now))
     })
 }
 

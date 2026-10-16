@@ -70,7 +70,7 @@ pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
         if !(*p).suspended {
             return false;
         }
-        k.s.park(t);
+        k.s.park(t, crate::arch::timer::now());
         (*p).parked.push(t);
         true
     }

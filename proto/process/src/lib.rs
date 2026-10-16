@@ -505,7 +505,30 @@ pub enum Method {
     /// `LIST_WINDOW` records from the cursor holds a live one, `1` u32 and
     /// its `Listing`; otherwise `0` u32. Any process may ask.
     List = 62,
+    /// What the process service keeps for the account of the process (F13):
+    /// a body of the operation u32 (`account_op`) and its arguments; the
+    /// reply is the status u32 and the operation's values.
+    Account = 63,
 }
+
+/// The operations of `Method::Account`, the first u32 of its body.
+pub mod account_op {
+    /// -> the counter ticks the caller's children that were waited for ran,
+    /// and theirs, u64 (getrusage RUSAGE_CHILDREN, times).
+    pub const CHILD_TIMES: u32 = 1;
+    /// which u32, who u32 (getpriority) -> the least nice value among the
+    /// processes selected, i32. ESRCH (`NO_PROCESS`) with none.
+    pub const NICE_GET: u32 = 2;
+    /// which u32, who u32, nice i32 (setpriority) -> the number of processes
+    /// changed u32. `PERMISSION` for a process of another user, `ACCESS` for
+    /// a lowered nice without privileges, `NO_PROCESS` with none selected.
+    pub const NICE_SET: u32 = 3;
+}
+
+/// PRIO_PROCESS, PRIO_PGRP and PRIO_USER of getpriority and setpriority.
+pub const PRIO_PROCESS: u32 = 0;
+pub const PRIO_PGRP: u32 = 1;
+pub const PRIO_USER: u32 = 2;
 
 /// The key of the shared memory of a file: its device and inode, never 0.
 pub const fn share_key(device: u64, inode: u64) -> u64 {
@@ -541,7 +564,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
     31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59, 60, 61, 62,
+    59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1053,6 +1076,11 @@ pub struct Page {
     /// the thread whose posix_spawn made it ([P24-SPAWN]); the service
     /// writes it, and `ignored` too, before the process runs.
     pub start_mask: AtomicU64,
+    /// The scheduling of the main thread at the process's start: bit 63
+    /// when set, the policy in bits 0 to 7 and the priority in bits 8 to
+    /// 15 (POSIX_SPAWN_SETSCHEDULER and SETSCHEDPARAM, or the inheritance
+    /// of the caller's); the service writes it with `start_mask`.
+    pub start_sched: AtomicU64,
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
@@ -1121,7 +1149,8 @@ pub const CLD_CONTINUED: i32 = 6;
 /// process group u32, the caller's level u32, at which the loader runs,
 /// the signal mask u64 the child's main thread starts with (the caller's,
 /// or that of POSIX_SPAWN_SETSIGMASK) and the signals u64 whose action
-/// POSIX_SPAWN_SETSIGDEF sets to the default (bit n - 1 for signal n).
+/// POSIX_SPAWN_SETSIGDEF sets to the default (bit n - 1 for signal n), and
+/// the scheduling word u64 of the child's main thread (`Page::start_sched`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnStart {
     pub flags: u32,
@@ -1129,6 +1158,7 @@ pub struct SpawnStart {
     pub level: u8,
     pub mask: u64,
     pub default: u64,
+    pub sched: u64,
     /// The name the record shows: the last component of the program's
     /// path, with a terminating zero; all zeros keeps the parent's.
     pub name: [u8; NAME_LEN],
@@ -1141,13 +1171,14 @@ impl SpawnStart {
         w.u32(self.level.into())?;
         w.u64(self.mask)?;
         w.u64(self.default)?;
+        w.u64(self.sched)?;
         w.bytes(&self.name)
     }
 
     /// BAD_SIZE out of the layout or with a level past 63.
     pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
         let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
-        let (mask, default) = (r.u64()?, r.u64()?);
+        let (mask, default, sched) = (r.u64()?, r.u64()?, r.u64()?);
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         r.finish()?;
@@ -1161,6 +1192,7 @@ impl SpawnStart {
             level,
             mask,
             default,
+            sched,
             name,
         })
     }
@@ -1199,6 +1231,12 @@ pub struct Listing {
     pub state: u32,
     /// The terminal plus one (0 for none): the console is 1.
     pub tty: u32,
+    /// The process's nice value, -20 to 19 (setpriority), which its
+    /// children inherit.
+    pub nice: i32,
+    /// The counter ticks the process has run, the images before an exec
+    /// included.
+    pub ticks: u64,
     pub name: [u8; NAME_LEN],
 }
 
@@ -1218,6 +1256,8 @@ impl Listing {
         ] {
             w.u32(word)?;
         }
+        w.u32(self.nice as u32)?;
+        w.u64(self.ticks)?;
         w.bytes(&self.name)
     }
 
@@ -1226,6 +1266,8 @@ impl Listing {
         for word in &mut words {
             *word = r.u32()?;
         }
+        let nice = r.u32()? as i32;
+        let ticks = r.u64()?;
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         Ok(Self {
@@ -1239,6 +1281,8 @@ impl Listing {
             egid: words[7],
             state: words[8],
             tty: words[9],
+            nice,
+            ticks,
             name,
         })
     }
@@ -1544,6 +1588,7 @@ mod tests {
             Method::Share,
             Method::ShareGrant,
             Method::List,
+            Method::Account,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -1799,6 +1844,8 @@ mod tests {
             egid: 0,
             state: 1,
             tty: 1,
+            nice: -5,
+            ticks: 1 << 40,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();
@@ -1814,6 +1861,7 @@ mod tests {
             level: 30,
             mask: 1 << 9,
             default: 1 << 14,
+            sched: 1 << 63 | 1 | 5 << 8,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();

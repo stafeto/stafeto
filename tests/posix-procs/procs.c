@@ -1288,6 +1288,94 @@ static int steps_resources(void) {
 
 static int steps_timers(void);
 
+#if PRIORITY_STEPS
+extern int stafeto_steps_level(int level);
+extern unsigned long long stafeto_steps_ticks(void);
+
+/* The client at level 30 asks the process service for a limit again and
+ * again while two spawners at level 10 (a record may have two loads at once)
+ * make loads. An ask is a request that stands in the service's queue behind
+ * at most the step that runs and then goes first, because the portions of a
+ * load queue at the level of the one who asked, below the client: it takes at
+ * most two steps and a round trip (xtask CALL_WAIT_MAX). The service itself
+ * runs above every client and keeps the CPU while it has work in its queue,
+ * so a client sends only between its busy periods; what the ask measures is
+ * the time in the queue. The loads end at once and are given time to be taken
+ * apart before the next round. */
+extern int stafeto_probe_load_start(int place, int *pid);
+extern int stafeto_probe_load_abort(int place, int pid);
+#include <semaphore.h>
+#define PRIORITY_ROUNDS 12
+static sem_t priority_go[2], priority_release[2], priority_ended[2];
+static volatile int priority_started[2];
+static volatile int priority_stop;
+static volatile int priority_failed;
+
+static void *priority_spawner(void *arg) {
+    int place = (int)(long)arg;
+    if (stafeto_steps_level(10)) {
+        priority_failed = 1;
+        return NULL;
+    }
+    for (;;) {
+        sem_wait(&priority_go[place]);
+        if (priority_stop) return NULL;
+        int pid = -1;
+        if (stafeto_probe_load_start(place, &pid)) priority_failed = 2;
+        priority_started[place] = 1;
+        sem_wait(&priority_release[place]);
+        if (!priority_failed && stafeto_probe_load_abort(place, pid)) priority_failed = 3;
+        sem_post(&priority_ended[place]);
+    }
+}
+
+static int steps_priority(void) {
+    pthread_t spawner[2];
+    for (int k = 0; k < 2; k++) {
+        if (sem_init(&priority_go[k], 0, 0) || sem_init(&priority_release[k], 0, 0)
+            || sem_init(&priority_ended[k], 0, 0))
+            return 1;
+    }
+    if (stafeto_steps_level(30)) return 2;
+    /* Let the kernel finish taking apart the processes the earlier probes
+     * ended: its portions run at the level of the one who ended them, above
+     * the client, and would be counted in its first asks. */
+    pause_ms(400);
+    for (long k = 0; k < 2; k++) {
+        if (pthread_create(&spawner[k], NULL, priority_spawner, (void *)k)) return 3;
+    }
+    unsigned long long worst = 0;
+    unsigned long long asks = 0;
+    struct rlimit limit;
+    for (int round = 0; round < PRIORITY_ROUNDS && !priority_failed; round++) {
+        priority_started[0] = priority_started[1] = 0;
+        sem_post(&priority_go[0]);
+        sem_post(&priority_go[1]);
+        while (!(priority_started[0] && priority_started[1]) && !priority_failed) {
+            unsigned long long began = stafeto_steps_ticks();
+            if (getrlimit(RLIMIT_NOFILE, &limit)) return 4;
+            unsigned long long took = stafeto_steps_ticks() - began;
+            if (took > worst) worst = took;
+            asks++;
+            struct timespec gap = {0, 100000};
+            nanosleep(&gap, NULL);
+        }
+        for (int k = 0; k < 2; k++) sem_post(&priority_release[k]);
+        for (int k = 0; k < 2; k++) sem_wait(&priority_ended[k]);
+        pause_ms(30);
+    }
+    priority_stop = 1;
+    for (int k = 0; k < 2; k++) {
+        sem_post(&priority_go[k]);
+        pthread_join(spawner[k], NULL);
+    }
+    if (priority_failed) return 10 + priority_failed;
+    if (stafeto_steps_level(30)) return 7;
+    printf("posix-procs: getlimit wait max %llu ticks in %llu asks\n", worst, asks);
+    return asks < 12 * 3 ? 8 : 0;
+}
+#endif
+
 static int steps_run(void) {
     int failed = 0;
     int fd = open("/tmp/probe", O_RDWR);
@@ -1319,6 +1407,15 @@ static int steps_run(void) {
     if (bounds) {
         printf("posix-procs: steps: the bounds probe failed %d\n", bounds);
         return 6;
+    }
+#endif
+#if PRIORITY_STEPS
+    /* Before the crowd: a record keeps 32 children at most, and the probe
+     * needs room for two loads at once. */
+    int priority = steps_priority();
+    if (priority) {
+        printf("posix-procs: steps: the priority probe failed %d errno %d\n", priority, errno);
+        return 7;
     }
 #endif
     pid_t branches[STEPS_BRANCHES];
@@ -2545,6 +2642,11 @@ static int setid_spawn(void) {
 
 #include "faults.c"
 #include "timers.c"
+#if !CHANGE_STEPS
+static int burn50_role(void);
+static int nice_role(void);
+static int sched_role(void);
+#endif
 
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
@@ -2559,6 +2661,11 @@ static int role(const char *name) {
 #if !CHANGE_STEPS
     if (strcmp(name, "timers") == 0) return timers_role();
     if (strcmp(name, "timers-exec") == 0) return timers_exec_role();
+#endif
+#if !CHANGE_STEPS
+    if (strcmp(name, "burn50") == 0) return burn50_role();
+    if (strcmp(name, "nicechild") == 0) return nice_role();
+    if (strcmp(name, "schedchild") == 0) return sched_role();
 #endif
     if (strcmp(name, "steptimer") == 0) return steptimer_role();
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
@@ -4704,6 +4811,10 @@ static void names(void) {
 
 #endif
 
+#if !CHANGE_STEPS
+#include "accounts.c"
+#endif
+
 int main(int argc, char **argv) {
 #if NATIVE_SCOPES_LAUNCHER
     return native_scopes_supervisor();
@@ -4743,6 +4854,11 @@ int main(int argc, char **argv) {
     expect("kill of the second sleeper", kill(second, SIGKILL), 0);
     reap("the second sleeper", second, 0, SIGKILL);
 
+#if !CHANGE_STEPS
+    printf("posix-procs: stage sched\n");
+    spawned_scheduling();
+    printf("posix-procs: sched ok\n");
+#endif
     printf("posix-procs: stage waits\n");
     waits(child);
     printf("posix-procs: stage kills\n");
@@ -4780,6 +4896,8 @@ int main(int argc, char **argv) {
 #if !CHANGE_STEPS
     printf("posix-procs: stage timers\n");
     run_role("/bin/procs-child", "timers", NULL);
+    printf("posix-procs: stage accounts\n");
+    accounts();
 #endif
 #if NAMES_PROBE
     printf("posix-procs: stage names\n");

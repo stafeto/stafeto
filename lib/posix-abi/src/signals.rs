@@ -247,11 +247,6 @@ pub(crate) fn thread_pending(block: &Block) -> u64 {
 /// Whether a signal is pending that `mask` would let through and that a
 /// delivery would not discard: SIG_IGN and a default action of ignoring
 /// (SIGCHLD, SIGWINCH, SIGURG) end no wait.
-// Out of line to bypass an overlay of the schedule (see the task about step
-// accounting under preemption): inlined, the code of the hot signal path
-// shifts an entropy service step in process-steps under the run of the
-// services at level 40, and the step counts that time as its own.
-#[inline(never)]
 pub(crate) fn pending_acting(mask: SigSet) -> bool {
     let open = (thread_pending(own()) | process_pending()) & !mask;
     (1..=31).any(|signal| open & (1 << (signal - 1)) != 0 && !ignored(signal, &action(signal)))
@@ -259,7 +254,6 @@ pub(crate) fn pending_acting(mask: SigSet) -> bool {
 
 /// Drops the signals of this thread that `mask` lets through and that a
 /// delivery would discard, so that their entries wake no wait again.
-#[inline(never)]
 pub(crate) fn discard_ignored(mask: SigSet) {
     let block = own();
     loop {
@@ -2095,6 +2089,13 @@ unsafe fn deliver_signal(
     block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
     posix_sync::resume_wait(abandoned);
+    // Asynchronous cancellation (XSH 2.9.5.1): the entry that
+    // `pthread_cancel` asked for outside a section of the layer acts at
+    // once; the deferral of entries stays through the end of the thread.
+    if entered && crate::relibc::async_cancel_due() {
+        let _deferred = preparation.take().expect("a preparation").settle_for_exit();
+        crate::relibc::cancel_exit();
+    }
     drop(preparation);
 }
 /// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the

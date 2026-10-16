@@ -155,6 +155,8 @@ pub enum PageStart {
     Spawn {
         mask: u64,
         default: u64,
+        /// The scheduling of the main thread (`Page::start_sched`).
+        sched: u64,
     },
     Fork {
         ignored: u64,
@@ -169,8 +171,13 @@ impl PageStart {
     pub fn write(self, page: &Page, from: &Page) {
         use core::sync::atomic::Ordering::{Acquire, Release};
         match self {
-            PageStart::Spawn { mask, default } => {
+            PageStart::Spawn {
+                mask,
+                default,
+                sched,
+            } => {
                 page.start_mask.store(mask, Release);
+                page.start_sched.store(sched, Release);
                 let ignored = from.ignored.load(Acquire) & !default;
                 page.ignored.store(ignored, Release);
             }
@@ -386,10 +393,15 @@ mod tests {
         PageStart::Spawn {
             mask: 1 << 3,
             default: bit(SIGTERM),
+            sched: 1 << 63 | 1 | 7 << 8,
         }
         .write(&spawned, &parent);
         assert_eq!(spawned.ignored.load(Ordering::Relaxed), bit(SIGHUP));
         assert_eq!(spawned.start_mask.load(Ordering::Relaxed), 1 << 3);
+        assert_eq!(
+            spawned.start_sched.load(Ordering::Relaxed),
+            1 << 63 | 1 | 7 << 8
+        );
         assert_eq!(spawned.caught.load(Ordering::Relaxed), 0);
     }
 }

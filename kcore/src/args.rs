@@ -53,6 +53,14 @@ pub fn policy_arg(raw: u64) -> Result<Policy, Error> {
     Policy::from_raw(raw).ok_or(Error::InvalidArgs)
 }
 
+/// The policy word of `thread_set_priority`: the policy in bits 0-7 and
+/// abi::POLICY_TAIL, whose bit says that the thread goes to the tail of
+/// its new level. INVALID_ARGS for any other bit or policy.
+pub fn policy_tail_arg(raw: u64) -> Result<(Policy, bool), Error> {
+    let tail = raw & abi::POLICY_TAIL != 0;
+    Ok((policy_arg(raw & !abi::POLICY_TAIL)?, tail))
+}
+
 /// The priority of a source's slot (spec 6.5) from a register: in
 /// `process_create` 0 exactly when there is no exit channel, in
 /// `handle_duplicate` exactly when there is no new label (`channel` false),
@@ -351,6 +359,12 @@ mod tests {
         assert_eq!(policy_arg(1), Ok(Policy::Fifo));
         for raw in [2, 1 << 32, u64::MAX] {
             assert_eq!(policy_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+        assert_eq!(policy_tail_arg(1), Ok((Policy::Fifo, false)));
+        assert_eq!(policy_tail_arg(0x100), Ok((Policy::RoundRobin, true)));
+        assert_eq!(policy_tail_arg(0x101), Ok((Policy::Fifo, true)));
+        for raw in [2, 0x102, 0x200, 0x300, 1 << 32, u64::MAX] {
+            assert_eq!(policy_tail_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
     }
 

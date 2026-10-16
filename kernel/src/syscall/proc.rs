@@ -11,8 +11,8 @@ use crate::{channel, sched, session};
 use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::args::{
-    check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg, priority_arg,
-    quota_arg, under_ceilings,
+    check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg, policy_tail_arg,
+    priority_arg, quota_arg, under_ceilings,
 };
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
@@ -291,7 +291,8 @@ pub(super) fn thread_exit(thread: NonNull<Thread>) -> ! {
 }
 
 /// thread_set_priority(x0 thread with MANAGE, x1 priority 1-63, x2
-/// policy): the thread's base priority and policy change. The priority is
+/// policy, with abi::POLICY_TAIL in bit 8 for the tail of the new level):
+/// the thread's base priority and policy change. The priority is
 /// no higher than the ceiling of the thread's process nor than the
 /// caller's (ACCESS_DENIED): a handle to another process's thread does not
 /// lift the thread above the caller's own ceiling. BAD_STATE for a thread
@@ -300,12 +301,12 @@ pub(super) fn thread_exit(thread: NonNull<Thread>) -> ! {
 /// does a thread the caller lowered itself below.
 pub(super) fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[1])?;
-    let policy = policy_arg(a[2])?;
+    let (policy, tail) = policy_tail_arg(a[2])?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     // SAFETY: the handle holds the target thread, which holds its process.
     let target_ceiling = unsafe { target.as_ref().process().as_ref() }.ceiling();
     under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
-    sched::set_priority(target, priority, policy)?;
+    sched::set_priority(target, priority, policy, tail)?;
     Ok(Values::none())
 }
 

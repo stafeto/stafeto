@@ -42,6 +42,7 @@ fn main() {
     println!("cargo:rerun-if-changed=jobs.c");
     println!("cargo:rerun-if-changed=faults.c");
     println!("cargo:rerun-if-changed=timers.c");
+    println!("cargo:rerun-if-changed=accounts.c");
     println!("cargo:rerun-if-changed=loader-abort.c");
     println!("cargo:rerun-if-changed=image-gates.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
@@ -127,6 +128,10 @@ fn main() {
         .arg(format!(
             "-DCHANGE_STEPS={}",
             u8::from(env::var_os("CARGO_FEATURE_CHANGE_STEPS").is_some())
+        ))
+        .arg(format!(
+            "-DPRIORITY_STEPS={}",
+            u8::from(env::var_os("CARGO_FEATURE_PRIORITY_STEPS").is_some())
         ))
         .arg(format!(
             "-DFIFO_STEPS={}",

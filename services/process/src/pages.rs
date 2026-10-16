@@ -3,8 +3,8 @@
 
 //! The pages of the records (proto_process::Page, spec 2, 3.1): one page
 //! each, in memory objects of GROUP pages, OBJECTS of them, which the
-//! service makes when a record of their indices first needs one and maps
-//! at its own address for as long as it lives. A new record's page is
+//! service makes at its start (`make`) and maps at its own address for as
+//! long as it lives. A new record's page is
 //! zeroed, gets its identity, and is mapped into its process at
 //! PAGE_ADDRESS, read and write, through a copy of the object's handle
 //! with those rights alone (rt::loader::map_narrowed). The service pays
@@ -60,18 +60,13 @@ impl Pages {
         )
     }
 
-    /// The page of a new record in `index` of process `pid`: its object
-    /// made and mapped in `own`, the service's process, when it is the
-    /// first; zeroed, with the identity, and mapped into `process`.
-    pub fn give(
-        &mut self,
-        own: &Handle<Process>,
-        index: usize,
-        process: &Handle<Process>,
-        identity: [u32; 4],
-    ) -> Result<(), Error> {
-        let group = index / GROUP;
-        if self.objects[group].is_none() {
+    /// Makes the objects of every group and maps them at the service's
+    /// start, so that no step of the loop makes one: a group is
+    /// GROUP pages, a call of the kernel far longer than the term B of a
+    /// step (spec 2, 3.1). The service's quota pays for them from the
+    /// start, as it did when the groups came one by one.
+    pub fn make(&mut self, own: &Handle<Process>) -> Result<(), Error> {
+        for (group, slot) in self.objects.iter_mut().enumerate() {
             let object = sys::mem_create((GROUP * PAGE) as u64)?;
             let at = BASE + group * GROUP * PAGE;
             sys::mem_map(
@@ -82,7 +77,24 @@ impl Pages {
                 at,
                 Access::ReadWrite,
             )?;
-            self.objects[group] = Some(object);
+            *slot = Some(object);
+        }
+        Ok(())
+    }
+
+    /// The page of a new record in `index` of process `pid`: zeroed, with
+    /// the identity, and mapped into `process`. Its group's object `make`
+    /// made at the start; BAD_STATE without one.
+    pub fn give(
+        &mut self,
+        _own: &Handle<Process>,
+        index: usize,
+        process: &Handle<Process>,
+        identity: [u32; 4],
+    ) -> Result<(), Error> {
+        let group = index / GROUP;
+        if self.objects[group].is_none() {
+            return Err(Error::BadState);
         }
         let at = BASE + index * PAGE;
         // SAFETY: the page is the record's, mapped at `at` in the service,

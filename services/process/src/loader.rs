@@ -108,20 +108,12 @@ impl Image {
         })
     }
 
-    /// Maps the loader into `process`, a new process: its code and
-    /// read-only data from the shared object, and a new object of its
-    /// data and stack, which the service pays for (through `own`, the
-    /// service's process, it fills it); then makes its thread at
-    /// `priority`, its stack pointer at the top of that object. The thread
-    /// waits for thread_start. On an error the caller kills the process.
-    pub fn place(
-        &self,
-        own: &Handle<Process>,
-        process: &Handle<Process>,
-        priority: u8,
-    ) -> Result<Handle<Thread>, Error> {
+    /// The first piece of putting the loader into `process`, a new process:
+    /// its code from the shared object. On an error the caller kills the
+    /// process. Each piece is a portion of the service's loop, no longer
+    /// than term B (spec 2, 3.1).
+    pub fn map_code(&self, process: &Handle<Process>) -> Result<(), Error> {
         let code = &self.layout.segments[Part::Code as usize];
-        let rodata = &self.layout.segments[Part::Rodata as usize];
         loader::map_narrowed(
             process,
             &self.shared,
@@ -129,17 +121,30 @@ impl Image {
             self.code_len,
             code.vaddr as usize,
             Access::ReadExec,
-        )?;
-        if self.rodata_len > 0 {
-            loader::map_narrowed(
-                process,
-                &self.shared,
-                self.code_len,
-                self.rodata_len,
-                rodata.vaddr as usize,
-                Access::Read,
-            )?;
+        )
+    }
+
+    /// The second piece: its read-only data from the shared object (none
+    /// to map for a loader without any).
+    pub fn map_rodata(&self, process: &Handle<Process>) -> Result<(), Error> {
+        if self.rodata_len == 0 {
+            return Ok(());
         }
+        let rodata = &self.layout.segments[Part::Rodata as usize];
+        loader::map_narrowed(
+            process,
+            &self.shared,
+            self.code_len,
+            self.rodata_len,
+            rodata.vaddr as usize,
+            Access::Read,
+        )
+    }
+
+    /// The third piece: a new object of the loader's data and stack, which
+    /// the service pays for (through `own`, the service's process, it fills
+    /// it), mapped into `process`.
+    pub fn map_data(&self, own: &Handle<Process>, process: &Handle<Process>) -> Result<(), Error> {
         let data = sys::mem_create(self.data_len)?;
         fill(own, &data, 0, self.data)?;
         loader::map_narrowed(
@@ -149,9 +154,13 @@ impl Image {
             self.data_len,
             self.data_at as usize,
             Access::ReadWrite,
-        )?;
+        )
         // The mapping holds the object; the loader unmaps it at its end.
-        drop(data);
+    }
+
+    /// The fourth piece: the loader's thread at `priority`, its stack pointer
+    /// at the top of the data object. The thread waits for thread_start.
+    pub fn thread(&self, process: &Handle<Process>, priority: u8) -> Result<Handle<Thread>, Error> {
         // x0: the loader's level, for the slots of its start channel.
         loader::thread_at(
             process,

@@ -158,7 +158,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             if !wait {
                 return Err(Error::WouldBlock);
             }
-            let running = k.s.block();
+            let running = k.s.block(crate::arch::timer::now());
             assert!(running == t, "a thread that does not run waits");
             let slot = thread::slot(t);
             (*slot.as_ptr()).set_priority(t.as_ref().priority());
@@ -398,7 +398,7 @@ unsafe fn meet(
     // SAFETY: the caller's promise; a thread that waits in receive is
     // alive, and its slot lies in it.
     unsafe {
-        let running = k.s.block();
+        let running = k.s.block(crate::arch::timer::now());
         assert!(running == t, "a thread that does not run sends");
         let slot = thread::slot(t);
         (*slot.as_ptr()).set_priority(t.as_ref().priority());

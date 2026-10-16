@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 38] = [
+pub(crate) const TESTS: [Test; 40] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -48,6 +48,8 @@ pub(crate) const TESTS: [Test; 38] = [
         thread_start_and_process_kill_check_their_handles,
     ),
     ("thread_states", thread_states),
+    ("cpu_time_counts_the_stints", cpu_time_counts_the_stints),
+    ("tail_goes_behind_equals", tail_goes_behind_equals),
     ("thread_end_is_heard_once", thread_end_is_heard_once),
     ("unheld_thread_end_is_heard", unheld_thread_end_is_heard),
     (
@@ -963,6 +965,111 @@ fn thread_states() -> Outcome {
     )
 }
 
+/// Burns CPU: a stint of a few hundred microseconds.
+fn burn() {
+    for i in 0..300_000u32 {
+        core::hint::black_box(i);
+    }
+}
+
+/// Spins, adds 1 to mark 0 and ends.
+extern "C" fn burn_and_mark(_: u64) -> ! {
+    burn();
+    MARKS[0].fetch_add(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// CPU time (object_info THREAD_STATE x5, PROCESS_TIME): the reading of a
+/// thread that spins grows, the sum of the process holds the time of a
+/// thread that ended, and a process with no thread has none.
+fn cpu_time_counts_the_stints() -> Outcome {
+    reset_marks();
+    let first = sys::thread_ran(&me()).map_err(|_| "THREAD_STATE x5 failed")?;
+    burn();
+    let second = sys::thread_ran(&me()).map_err(|_| "THREAD_STATE x5 failed")?;
+    check(
+        second > first,
+        "the reading of a thread that spun did not grow",
+    )?;
+    let before = sys::process_time(&own()).map_err(|_| "PROCESS_TIME failed")?;
+    check(
+        before >= second,
+        "the sum of the process is below a thread's reading",
+    )?;
+    let t = spawn(0, burn_and_mark, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    check(mark(0) == 1, "the spinning thread did not run to its end")?;
+    let ran = sys::thread_ran(&t).map_err(|_| "THREAD_STATE x5 of an ended thread failed")?;
+    let after = sys::process_time(&own()).map_err(|_| "PROCESS_TIME failed")?;
+    close(t)?;
+    check(ran > 0, "a thread that spun and ended has no time")?;
+    check(
+        after >= before + ran,
+        "the time of a thread that ended is not in the sum of its process",
+    )?;
+    let c = child(LOW)?;
+    let none = sys::process_time(&c).map_err(|_| "PROCESS_TIME of a child failed");
+    let refused = {
+        let mut x = [0; 10];
+        x[..3].copy_from_slice(&[c.raw().0, abi::INFO_PROCESS_TIME, 1]);
+        // SAFETY: object_info only reads its registers.
+        let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+        after[0] == Error::InvalidArgs.code()
+    };
+    close(c)?;
+    check(none == Ok(0), "a process with no thread has CPU time")?;
+    check(refused, "PROCESS_TIME took a reserved word")
+}
+
+/// Appends digit `i` to mark 0 and ends: the order the threads ran in.
+extern "C" fn append_digit(i: u64) -> ! {
+    let n = MARKS[0].load(Relaxed);
+    MARKS[0].store(n * 10 + i, Relaxed);
+    sys::thread_exit()
+}
+
+/// thread_set_priority with POLICY_TAIL (XSH 2.8.4): two ready threads at
+/// one level run in the order of their list; the bit moves the first
+/// behind the second, also at an unchanged level, and the call without it
+/// leaves them. The running caller with the bit yields to an equal.
+fn tail_goes_behind_equals() -> Outcome {
+    for (tail, order) in [(false, 12), (true, 21)] {
+        reset_marks();
+        let x = spawn(0, append_digit, 1, LOW, Policy::Fifo)?;
+        let y = spawn(1, append_digit, 2, LOW, Policy::Fifo)?;
+        let moved = if tail {
+            sys::thread_set_priority_tail(&x, LOW, Policy::Fifo)
+        } else {
+            sys::thread_set_priority(&x, LOW, Policy::Fifo)
+        };
+        moved.map_err(|_| "thread_set_priority failed")?;
+        let_run()?;
+        close(x)?;
+        close(y)?;
+        check(
+            mark(0) == order,
+            "the order of two equal threads is not the list's",
+        )?;
+    }
+    // The caller, running, with the bit: an equal thread runs first.
+    reset_marks();
+    let z = spawn(2, append_digit, 3, TEST_PRIORITY, Policy::Fifo)?;
+    check(
+        mark(0) == 0,
+        "an equal thread ran before the caller blocked",
+    )?;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "thread_set_priority failed")?;
+    check(mark(0) == 0, "an unchanged priority gave the CPU up")?;
+    sys::thread_set_priority_tail(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "thread_set_priority with TAIL failed")?;
+    close(z)?;
+    check(
+        mark(0) == 3,
+        "the caller with TAIL did not yield to an equal",
+    )
+}
+
 /// A stopped thread of init's process that runs add_mark(0) on the stack
 /// of slot 0, at `priority`, with its message buffer on page `page` above
 /// init's own.
@@ -1492,7 +1599,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let kinds = [
         [own, 0, 0],
         [own, abi::INFO_LOG + 1, 0],
-        [own, abi::INFO_THREAD_CURRENT + 1, 0],
+        [own, abi::INFO_PROCESS_TIME + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
@@ -1503,6 +1610,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             memory,
             table,
             stats,
+            abi::INFO_PROCESS_TIME,
             abi::INFO_MEMORY,
             thread_state,
             abi::INFO_THREAD_SELF,
@@ -1530,6 +1638,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (0, memory, Error::BadHandle),
         (0, table, Error::BadHandle),
         (0, stats, Error::BadHandle),
+        (0, abi::INFO_PROCESS_TIME, Error::BadHandle),
+        (resource, abi::INFO_PROCESS_TIME, Error::WrongType),
         (0, thread_state, Error::BadHandle),
         (0, abi::INFO_THREAD_CURRENT, Error::BadHandle),
         (own, abi::INFO_THREAD_CURRENT, Error::WrongType),
@@ -1554,7 +1664,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, state, 5),
         (own, memory, 4),
         (own, table, 4),
-        (thread, thread_state, 5),
+        (own, abi::INFO_PROCESS_TIME, 2),
+        (thread, thread_state, 6),
         (seen, channel_kind, 5),
     ]
     .map(|(h, kind, past)| {

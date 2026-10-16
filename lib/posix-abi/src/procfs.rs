@@ -181,7 +181,7 @@ fn content(node: &Node) -> Result<Text, i32> {
                     // priority nice num_threads itrealvalue starttime vsize rss
                     let _ = writeln!(
                         text,
-                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0",
+                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 0 0",
                         l.pid,
                         name_of(&l),
                         state_letter(&l),
@@ -190,6 +190,11 @@ fn content(node: &Node) -> Result<Text, i32> {
                         l.sid,
                         tty_nr(&l),
                         l.pgid,
+                        // utime in clock ticks of 100 a second: all the time
+                        // is user time.
+                        rt::time::ticks_to_ns(l.ticks) / 10_000_000,
+                        20 + l.nice,
+                        l.nice,
                     );
                 }
                 File::Cmdline => {
