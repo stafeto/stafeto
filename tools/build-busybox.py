@@ -88,9 +88,6 @@ BASE_OBJECTS = (
     "remove_file.o",
     # nc: connections over the loopback of the socket service (Ф9).
     "xconnect.o", "inet_common.o", "executable.o", "bb_do_delay.o",
-    # The line editor of ash.
-    "lineedit.o", "lineedit_ptr_hack.o", "read_key.o", "safe_gethostname.o",
-    "bb_qsort.o", "xrealloc_vector.o",
 )
 
 # The directories BusyBox's archives come from; build.rs links each.
@@ -302,16 +299,19 @@ def build(utilities: bool) -> None:
                  "ASH_ALIAS", "ASH_CMDCMD"):
         replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     replace(config, "# CONFIG_KILL is not set", "CONFIG_KILL=y")
-    # The line editor of the interactive shell: cursor keys, Home, End,
-    # Delete, Ctrl-A/E/K/U/W, history with Ctrl-R search, Tab completion of
-    # names and a prompt with the escapes of PS1. The terminal answers
-    # TIOCGWINSZ, so the editor asks it for the size of the screen.
-    replace(config, "# CONFIG_FEATURE_EDITING is not set", "CONFIG_FEATURE_EDITING=y")
-    replace(config, "CONFIG_FEATURE_EDITING_MAX_LEN=0", "CONFIG_FEATURE_EDITING_MAX_LEN=1024")
-    replace(config, "CONFIG_FEATURE_EDITING_HISTORY=0", "CONFIG_FEATURE_EDITING_HISTORY=255")
-    for name in ("FEATURE_REVERSE_SEARCH", "FEATURE_TAB_COMPLETION",
-                 "FEATURE_EDITING_FANCY_PROMPT", "FEATURE_EDITING_WINCH"):
-        replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
+    # The line editor of the interactive shell, in the build of the shell
+    # image only: the small build of the probes has no room for it (the
+    # quota of a test of os-test holds the shell of popen with 10% to
+    # spare). Cursor keys, Home, End, Delete, Ctrl-A/E/K/U/W, history with
+    # Ctrl-R search, Tab completion of names and the escapes of PS1; the
+    # terminal answers TIOCGWINSZ, so the editor asks it for the screen.
+    if utilities:
+        replace(config, "# CONFIG_FEATURE_EDITING is not set", "CONFIG_FEATURE_EDITING=y")
+        replace(config, "CONFIG_FEATURE_EDITING_MAX_LEN=0", "CONFIG_FEATURE_EDITING_MAX_LEN=1024")
+        replace(config, "CONFIG_FEATURE_EDITING_HISTORY=0", "CONFIG_FEATURE_EDITING_HISTORY=255")
+        for name in ("FEATURE_REVERSE_SEARCH", "FEATURE_TAB_COMPLETION",
+                     "FEATURE_EDITING_FANCY_PROMPT", "FEATURE_EDITING_WINCH"):
+            replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     # The utilities of XCU that BusyBox has (Ф10), with the features their
     # pages ask for; ps is the BusyBox one, over the /proc of the layer.
     for name in names:
