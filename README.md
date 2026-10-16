@@ -241,7 +241,7 @@ cargo xtask test         # host tests, boot checks, shell dialog, init and kerne
 cargo xtask ci           # formatting, clippy, licence checks, then everything test does; --jobs N as in test
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ; --minutes N runs HVF and VZ together
-cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART (`bash` starts GNU bash)
+cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART (`nano` starts GNU nano, `bash` GNU bash)
 cargo xtask os-test      # os-test's suites on relibc, a table in target/measure/
 cargo xtask open-posix   # the Open POSIX Test Suite (LTP 20260930) on relibc; --full runs every test; map in docs/open-posix-map.md
 cargo xtask coverage     # POSIX.1-2024 symbol, macro and header inventory
@@ -265,7 +265,7 @@ Bounded kernel paths and their costs:
 | `services/` | `init`, the UART driver, the RAM file, clock and process services |
 | `apps/` | the native shell |
 | `tests/` | guest test programs and probes |
-| `tools/` | relibc, BusyBox and bash builds, the VZ runner, licence check |
+| `tools/` | relibc, BusyBox, ncurses, nano and bash builds, the VZ runner, licence check |
 | `xtask/` | build, run, test and measurement commands |
 | `docs/` | debugging, kernel paths, status details, third-party licences |
 | `notes/` | design notes of individual parts |
@@ -355,11 +355,7 @@ of ncompress (public domain). Their licence texts and the exact sources
 travel in the image next to BusyBox's (`BUSYBOX-LICENSE`, `BUSYBOX-SOURCE`,
 `UTILITIES-LICENSE`).
 
-GNU bash (GPL-3.0-or-later) is in the shell image as `/bin/bash`, built
-unchanged from its release archive by `tools/build-bash.py` (the archive is
-fetched at build time and its SHA-256 checked, as BusyBox's is). The image
-carries its licence and the address of the exact source (`BASH-LICENSE`,
-`BASH-SOURCE`).
+| `tools/` | relibc, BusyBox, ncurses, nano and bash builds, the VZ runner, licence check |
 
 Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
 ci` checks the licence of every crate and file, that the GPL-2.0-only

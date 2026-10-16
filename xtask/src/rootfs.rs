@@ -38,6 +38,9 @@ pub enum Source {
     },
     /// These bytes, in an image file of this name.
     Bytes(&'static str, &'static [u8]),
+    /// The compiled terminfo entry of this name, which tools/build-ncurses.py
+    /// writes into target/ncurses/terminfo.
+    Terminfo(&'static str),
 }
 
 impl Source {
@@ -47,6 +50,7 @@ impl Source {
             Source::Elf(program) => elf_name(program),
             Source::Variant { program, tag, .. } => format!("{program}-{tag}.elf"),
             Source::Bytes(name, _) => name.to_string(),
+            Source::Terminfo(entry) => format!("terminfo-{entry}"),
         }
     }
 
@@ -55,7 +59,7 @@ impl Source {
     pub fn program(&self) -> Option<&'static str> {
         match *self {
             Source::Elf(program) | Source::Variant { program, .. } => Some(program),
-            Source::Bytes(..) => None,
+            Source::Bytes(..) | Source::Terminfo(_) => None,
         }
     }
 
@@ -65,6 +69,13 @@ impl Source {
             Source::Elf(program) => elf(program),
             Source::Variant { program, extra, .. } => grow_data(elf(program)?, extra),
             Source::Bytes(_, bytes) => Ok(bytes.to_vec()),
+            Source::Terminfo(entry) => {
+                let path = crate::target_dir()
+                    .join("ncurses/terminfo")
+                    .join(&entry[..1])
+                    .join(entry);
+                std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+            }
         }
     }
 }
@@ -332,8 +343,12 @@ fn dialog() -> Vec<RootFile> {
         // The shell of `system`, `popen` and `wordexp`.
         file("/bin/sh", 0o755, ROOT, "busybox-probe"),
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
+        // GNU nano (tools/build-nano.py).
+        file("/bin/nano", 0o755, ROOT, "nano"),
         // GNU bash beside ash (tools/build-bash.py); `sh` stays ash.
         file("/bin/bash", 0o755, ROOT, "bash"),
+        // htop (tools/build-htop.py).
+        file("/bin/htop", 0o755, ROOT, "htop"),
     ];
     files.extend(UTILITIES.iter().map(|name| {
         let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
@@ -370,6 +385,48 @@ fn dialog() -> Vec<RootFile> {
             0o644,
             ROOT,
             Source::Bytes("inputrc", INPUTRC),
+        ),
+    ]);
+    // The terminfo entries of ncurses' database that the image holds
+    // (tools/build-ncurses.py), where the library looks.
+    files.extend([
+        // The terminal of the programs that draw on the console (ncurses
+        // reads its entry from /usr/share/terminfo): an xterm-compatible one.
+        of(
+            "/etc/profile",
+            0o644,
+            ROOT,
+            Source::Bytes("profile", b"export TERM=xterm-256color\n"),
+        ),
+        dir("/usr"),
+        dir("/usr/share"),
+        dir("/usr/share/terminfo"),
+        dir("/usr/share/terminfo/l"),
+        dir("/usr/share/terminfo/v"),
+        dir("/usr/share/terminfo/x"),
+        of(
+            "/usr/share/terminfo/l/linux",
+            0o644,
+            ROOT,
+            Source::Terminfo("linux"),
+        ),
+        of(
+            "/usr/share/terminfo/v/vt100",
+            0o644,
+            ROOT,
+            Source::Terminfo("vt100"),
+        ),
+        of(
+            "/usr/share/terminfo/x/xterm",
+            0o644,
+            ROOT,
+            Source::Terminfo("xterm"),
+        ),
+        of(
+            "/usr/share/terminfo/x/xterm-256color",
+            0o644,
+            ROOT,
+            Source::Terminfo("xterm-256color"),
         ),
     ]);
     files.extend(devices());

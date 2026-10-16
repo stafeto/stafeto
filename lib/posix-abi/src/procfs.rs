@@ -92,11 +92,26 @@ fn parse(path: &[u8]) -> Option<Node> {
     let pid = core::str::from_utf8(number).ok()?.parse::<u32>().ok()?;
     match tail {
         None => Some(Node::Process(pid)),
-        Some(b"stat") => Some(Node::File(pid, File::Stat)),
-        Some(b"cmdline") => Some(Node::File(pid, File::Cmdline)),
-        Some(b"status") => Some(Node::File(pid, File::Status)),
-        Some(b"statm") => Some(Node::File(pid, File::Statm)),
-        Some(_) => None,
+        Some(name) => {
+            // `task/<pid>/<file>`: a process has its one thread of that
+            // number (htop reads the statistics of the main thread there).
+            let name = match name.strip_prefix(b"task/") {
+                Some(thread) => thread.strip_prefix(number)?.strip_prefix(b"/")?,
+                None => name,
+            };
+            file_named(name).map(|file| Node::File(pid, file))
+        }
+    }
+}
+
+/// The file of a process `name` names, if it is one of these.
+fn file_named(name: &[u8]) -> Option<File> {
+    match name {
+        b"stat" => Some(File::Stat),
+        b"cmdline" => Some(File::Cmdline),
+        b"status" => Some(File::Status),
+        b"statm" => Some(File::Statm),
+        _ => None,
     }
 }
 
@@ -362,9 +377,13 @@ fn content(node: &Node) -> Result<Text, i32> {
                     // pid (comm) state ppid pgrp session tty_nr tpgid flags
                     // minflt cminflt majflt cmajflt utime stime cutime cstime
                     // priority nice num_threads itrealvalue starttime vsize rss
+                    // and the 28 fields after it as Linux has them (rsslim,
+                    // the addresses, the signal sets, exit_signal 17,
+                    // processor and so on), which htop reads one by one.
                     let _ = writeln!(
                         text,
-                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 {} {}",
+                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 {} {} \
+                         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
                         l.pid,
                         name_of(&l),
                         state_letter(&l),
@@ -544,6 +563,45 @@ pub fn directory_pid(slot: u32, generation: u64) -> Option<u32> {
             })
             .map(|i| DIRECTORY_PID[i].load(Relaxed))
     })
+}
+
+/// The path of `name` read against the directory descriptor `dirfd`, when the
+/// descriptor is one of `/proc` of the image (`open_directory` marks the
+/// directories of processes; the directory `/proc` itself is the node that
+/// `stat` of `/proc` names): `/proc/<pid>/<name>` for the first and
+/// `/proc/<name>` for the second. The programs that walk `/proc` with
+/// `openat` (htop) open a process's files this way. `None` for an absolute
+/// name, any other descriptor and a path too long.
+pub fn relative(dirfd: i32, name: &[u8]) -> Option<Absolute> {
+    use posix_fs::Target;
+    if name.is_empty() || name[0] == b'/' {
+        return None;
+    }
+    let fd = u32::try_from(dirfd).ok()?;
+    let (slot, generation) = crate::shared::held(fd, |_, target| match target {
+        Target::Ram(ram) => Ok((ram.description_slot(), ram.generation())),
+        _ => Err(EIO),
+    })
+    .ok()?;
+    let mut text = Text::new();
+    match directory_pid(slot, generation) {
+        Some(pid) => write!(text, "/proc/{pid}/").ok()?,
+        None => {
+            let this = crate::names::fstatat(dirfd, None, 0).ok()?;
+            let proc = crate::names::fstatat(crate::names::AT_FDCWD, Some(b"/proc"), 0).ok()?;
+            if this.kind != 1 || (this.device, this.inode) != (proc.device, proc.inode) {
+                return None;
+            }
+            text.write_str("/proc/").ok()?;
+        }
+    }
+    if text.len + name.len() > text.bytes.len() {
+        return None;
+    }
+    let (head, tail) = (text.len, name.len());
+    text.bytes[head..head + tail].copy_from_slice(name);
+    text.len += tail;
+    absolute(&text.bytes[..text.len]).filter(Absolute::is_under)
 }
 
 /// `stat` of `/proc/<pid>` (a directory of the process's effective user),
