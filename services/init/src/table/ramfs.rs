@@ -573,11 +573,16 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-/// 544 pages: the layer's image grew by about 5 pages with the mappings of
-/// files, shared memory and the process service's rendezvous, and
-/// basic/time/strftime_l, whose heap needs a second chunk, had under 17 pages
-/// left of 512.
-const OS_TEST_QUOTA: u64 = 544 * PAGE;
+/// 610 pages. Measured on the whole of basic and Open POSIX (bisected on the
+/// quota with the tests that passed before): 554 pages pass and 553 do not,
+/// the tightest being pthread_cond_wait/2-2, pthread_cond_timedwait/2-4 and
+/// 2-7 (a stack is mapped for each thread, one after the other) and
+/// basic/time/strftime_l (a second chunk of heap); 610 leave 10.1%. The
+/// quota was 544 before the calls of message queues, semaphores and segments
+/// and the checks of the pages of a segment, which the programs that use
+/// semaphores carry, and 512 before the files, shared memory and the
+/// rendezvous of the process service.
+const OS_TEST_QUOTA: u64 = 610 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
@@ -814,6 +819,24 @@ pub const POSIX_SOCK_TABLE: &[Record] = &[
         name: "posix-sock",
         program: "posix-sock",
         args: b"posix-sock\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
+];
+
+/// The probe of message queues, semaphores and shared memory uses the loader probe's ordinary services and pool.
+pub const POSIX_IPC_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-ipc",
+        program: "posix-ipc",
+        args: b"posix-ipc\0",
         ..LOADER_CHANNELS_TABLE[6]
     },
     LOADER_CHANNELS_TABLE[7],

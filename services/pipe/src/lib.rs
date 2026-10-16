@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod admissions;
+pub mod ipc;
 pub mod named;
 pub mod sockets;
 pub mod watches;
@@ -263,6 +264,7 @@ pub struct Pipes {
     named_dropping: [u16; NAMED_MAX],
     named_dirty: u128,
     sockets: sockets::Sockets,
+    ipc: ipc::Ipc,
 }
 
 /// The pipe and the end of `description`, a held one of the kind asked.
@@ -294,6 +296,7 @@ impl Pipes {
             named_dropping: [0; NAMED_MAX],
             named_dirty: 0,
             sockets: sockets::Sockets::new(),
+            ipc: ipc::Ipc::new(),
         }
     }
 
@@ -443,6 +446,16 @@ impl Pipes {
         Ok(Some(n))
     }
 
+    /// The list of the operations that wait at the queue `queue` beyond the
+    /// pipes' ends: a socket's, then an IPC object's.
+    fn queue_of(&mut self, queue: u32) -> Result<&mut End, u32> {
+        if (queue as usize) < DESCRIPTIONS + SOCKETS {
+            self.sockets.queue(queue)
+        } else {
+            self.ipc_queue(queue)
+        }
+    }
+
     /// The operation `waiter` waits at `description`: FULL past WAITERS,
     /// after the operations `alive` says went are left out.
     pub fn wait(
@@ -452,7 +465,7 @@ impl Pipes {
         alive: impl Fn(Waiter) -> bool,
     ) -> Result<(), u32> {
         if description as usize >= DESCRIPTIONS {
-            let end = self.sockets.queue(description)?;
+            let end = self.queue_of(description)?;
             if end.waiters[..usize::from(end.count)].contains(&Some(waiter)) {
                 return Ok(());
             }
@@ -481,7 +494,7 @@ impl Pipes {
         alive: impl Fn(Waiter) -> bool,
     ) -> Result<(), u32> {
         if description as usize >= DESCRIPTIONS {
-            let end = self.sockets.queue(description)?;
+            let end = self.queue_of(description)?;
             end.keep(alive);
             return end.push(waiter);
         }
@@ -531,7 +544,7 @@ impl Pipes {
     /// The operation `waiter` waits at `description` no more.
     pub fn unwait(&mut self, description: u32, waiter: Waiter) {
         if description as usize >= DESCRIPTIONS {
-            if let Ok(end) = self.sockets.queue(description) {
+            if let Ok(end) = self.queue_of(description) {
                 end.keep(|w| w != waiter);
             }
             return;
@@ -607,7 +620,7 @@ impl Pipes {
         held.bits = 0;
         held.named = 0;
         held.socks = 0;
-        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due() || self.ipc.due()
     }
 
     /// One description that sessions which went let go of: its references
@@ -620,10 +633,12 @@ impl Pipes {
             self.unref(d, count, wakes);
         } else if self.named_dirty != 0 {
             self.named_step(wakes);
-        } else {
+        } else if self.sockets.due() {
             self.sock_step(wakes);
+        } else {
+            self.ipc_step(wakes);
         }
-        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due() || self.ipc.due()
     }
 
     /// Clone: a new session's holding of the descriptions `list` of
@@ -675,7 +690,7 @@ impl Pipes {
 
     /// Whether `step` has work.
     pub fn work_due(&self) -> bool {
-        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due()
+        self.dirty != 0 || self.named_dirty != 0 || self.sockets.due() || self.ipc.due()
     }
 
     /// The pipes in use.

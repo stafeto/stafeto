@@ -1,0 +1,17 @@
+[package]
+name = "gencat"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "BSD-2-Clause"
+description = "gencat, the message catalog compiler of FreeBSD, on relibc"
+build = "build.rs"
+
+[[bin]]
+name = "gencat"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

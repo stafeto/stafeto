@@ -28,6 +28,8 @@ quiet-steps = ["steps"]
 abi = { path = "../../lib/abi" }
 proto-init = { path = "../../proto/init" }
 proto-pipe = { path = "../../proto/pipe" }
+proto-process = { path = "../../proto/process" }
+posix-credentials = { path = "../../lib/posix-credentials" }
 proto-wire = { path = "../../proto/wire" }
 
 # The program alone runs on stafeto: the host tests of the library build

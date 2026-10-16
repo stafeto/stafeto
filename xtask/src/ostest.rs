@@ -34,7 +34,7 @@ use crate::{
 
 /// The image of a suite: the RAM files with the tests, pipes, the console
 /// and terminal, process and clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 12] = [
+const PROGRAMS: [ImageProgram; 13] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
     ("uart", "uart", crate::UART_STACK_SIZE, &[]),
     ("tty", "tty", crate::TTY_STACK_SIZE, &[]),
@@ -50,6 +50,7 @@ const PROGRAMS: [ImageProgram; 12] = [
     ("os-test-run", "os-test-run", crate::POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("gencat", "gencat", crate::POSIX_STACK_SIZE, &[]),
     (
         "virtio-rng",
         "virtio-rng",

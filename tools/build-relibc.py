@@ -41,10 +41,14 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F10b ready-made utilities: ioctl takes a variable argument list as on Linux
 # and reads an int argument from the low 32 bits,
 # paths.h has _PATH_DEFPATH and _PATH_STDPATH; tagged pin-6e21bd05.
+# F11b: message queues and named semaphores, the XSI queues, semaphore sets and
+# segments over the pipe service, nl_types, DES crypt, setkey and encrypt,
+# getdate, if_indextoname, dlopen(NULL) with honest errors, _POSIX_MESSAGE_PASSING
+# and _POSIX_SEMAPHORES; tagged pin-c0293c50.
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "6e21bd05d4c672551f512400faa824e10ea70a06"
+COMMIT = "c0293c503c1f46bf5a5221606de145d9b2806f4b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -59,6 +63,8 @@ BUILD_STD = "core,alloc,compiler_builtins"
 # OpenLibm supplies the C math exports, including binary128 long double.
 FEATURES = ""
 MATH_BUILD = "openlibm-0.8.0-linux-aarch64-strict-v2"
+# The headers whose name keeps an underscore (the others turn it into a slash).
+HEADER_NAMES = {"nl_types": "nl_types.h"}
 HEADER_POLICY = "limits-link-max-from-rust-v1"
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
@@ -232,7 +238,9 @@ def headers(env: dict, generator: Path) -> None:
         config = directory / "cbindgen.toml"
         if directory.name.startswith("_") or directory.name == "math" or not config.exists():
             continue
-        out = include / (directory.name.replace("_", "/") + ".h")
+        # sys_stat is sys/stat.h; nl_types.h keeps its underscore.
+        out = include / (HEADER_NAMES.get(directory.name)
+                         or directory.name.replace("_", "/") + ".h")
         out.parent.mkdir(parents=True, exist_ok=True)
         config_text = config.read_text()
         if directory.name == "limits":

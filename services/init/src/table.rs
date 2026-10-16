@@ -77,7 +77,7 @@ pub const PROCESS_SERVICE: &str = "posix";
 /// The services init gives a notary session of the process service on
 /// CONNECT (proto_process::NOTARY): through it they ask who a client is
 /// (Vouch) and map the page of the credentials generations (Register).
-pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE, TERMINAL_SERVICE];
+pub const VOUCHERS: &[&str] = &["clock", RAM_SERVICE, TERMINAL_SERVICE, PIPE_SERVICE];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
 pub const SET_ID_VOUCHERS: &[&str] = &[RAM_SERVICE];
@@ -755,6 +755,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-loader-channels") as usize
     + cfg!(feature = "table-posix-poll") as usize
     + cfg!(feature = "table-posix-sock") as usize
+    + cfg!(feature = "table-posix-ipc") as usize
     + cfg!(feature = "table-posix-pty") as usize
     + cfg!(feature = "table-posix-steps") as usize
     + cfg!(feature = "table-os-test") as usize
@@ -799,6 +800,7 @@ const _: () = assert!(
     feature = "table-loader-channels",
     feature = "table-posix-poll",
     feature = "table-posix-sock",
+    feature = "table-posix-ipc",
     feature = "table-posix-pty",
     feature = "table-posix-steps",
     feature = "table-os-test",
@@ -831,6 +833,8 @@ pub const TABLE: &[Record] = ramfs::LOADER_CHANNELS_TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_POLL_TABLE;
 #[cfg(feature = "table-posix-sock")]
 pub const TABLE: &[Record] = ramfs::POSIX_SOCK_TABLE;
+#[cfg(feature = "table-posix-ipc")]
+pub const TABLE: &[Record] = ramfs::POSIX_IPC_TABLE;
 #[cfg(feature = "table-posix-pty")]
 pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
 #[cfg(feature = "table-posix-lock-ring")]
@@ -1600,6 +1604,7 @@ mod tests {
             ramfs::LOADER_CHANNELS_TABLE,
             ramfs::POSIX_POLL_TABLE,
             ramfs::POSIX_SOCK_TABLE,
+            ramfs::POSIX_IPC_TABLE,
             ramfs::POSIX_PTY_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::POSIX_NATIVE_TABLE,

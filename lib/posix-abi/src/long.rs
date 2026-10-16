@@ -31,14 +31,32 @@ pub(crate) trait Custody {
 struct Mode<'a> {
     point: bool,
     authenticated: bool,
+    /// The copy of the identity session may be duplicated by the service
+    /// (it keeps it and has it vouched again when the credentials change).
+    duplicable: bool,
     custody: Option<&'a dyn Custody>,
+    /// The monotonic time in ns at which the wait ends with ETIMEDOUT.
+    deadline: Option<u64>,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
         Self {
             point,
             authenticated,
+            duplicable: false,
             custody: None,
+            deadline: None,
+        }
+    }
+}
+
+/// The thread's timer, set for a deadline and cancelled when the wait is over.
+struct Alarm(core::mem::ManuallyDrop<Handle<Timer>>, bool);
+
+impl Drop for Alarm {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = sys::timer_cancel(&self.0);
         }
     }
 }
@@ -87,6 +105,7 @@ impl Drop for ShortScope {
 /// One request to `service` and its long reply, copied into `out`: the
 /// kind and, for READY, the length. EINTR when the kernel interrupted the
 /// request before its reply; a refusal as `refusal` says.
+#[allow(clippy::too_many_arguments)]
 fn call(
     service: &Handle<Channel>,
     request: &[u8],
@@ -94,6 +113,7 @@ fn call(
     out: &mut [u8],
     refusal: Refusal<'_>,
     authenticated: bool,
+    duplicable: bool,
     custody: Option<&dyn Custody>,
 ) -> Result<(u32, usize, u64), i32> {
     let _scope = ShortScope::enter(custody.is_some())?;
@@ -101,7 +121,15 @@ fn call(
         .then(|| {
             crate::process::identity()
                 .and_then(|identity| {
-                    sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
+                    sys::handle_duplicate(
+                        identity,
+                        if duplicable {
+                            Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE
+                        } else {
+                            Rights::NOTIFY | Rights::TRANSFER
+                        },
+                    )
+                    .ok()
                 })
                 .ok_or(EIO)
         })
@@ -227,6 +255,32 @@ pub fn run_with(
     )
 }
 
+/// `run_with` that ends with ETIMEDOUT at the monotonic time `deadline` (ns)
+/// if the service has not answered: the thread's timer wakes its wait, and
+/// "cancel k" ends the operation in the service.
+pub fn run_until(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+    deadline: u64,
+    authenticated: bool,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            deadline: Some(deadline),
+            duplicable: true,
+            ..Mode::plain(true, authenticated)
+        },
+    )
+}
+
 /// `run_with` for an operation that is no point of cancellation
 /// (getentropy, getrandom, arc4random; XSH 2.9.5 allows no new points): a
 /// request of cancellation leaves the wait alone and stays for the next
@@ -265,6 +319,28 @@ pub fn run_with_identity(
         out,
         refusal,
         Mode::plain(true, true),
+    )
+}
+
+/// `run_with_identity` with a copy of the identity session that the service
+/// may duplicate, to keep and have vouched again (the IPC calls).
+pub fn run_with_duplicable_identity(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            duplicable: true,
+            ..Mode::plain(true, true)
+        },
     )
 }
 
@@ -315,7 +391,9 @@ pub(crate) fn run_drain(
         Mode {
             point: true,
             authenticated: true,
+            duplicable: false,
             custody,
+            deadline: None,
         },
     )
     .map(drop)
@@ -368,7 +446,9 @@ fn run_in(
     let Mode {
         point,
         authenticated,
+        duplicable,
         custody,
+        deadline,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -394,6 +474,7 @@ fn run_in(
                 out,
                 &start_refusal,
                 authenticated,
+                duplicable,
                 custody,
             ),
             Start::Admission(build) => {
@@ -405,6 +486,7 @@ fn run_in(
                     out,
                     &start_refusal,
                     authenticated,
+                    duplicable,
                     custody,
                 )
             }
@@ -425,6 +507,10 @@ fn run_in(
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
+    let mut alarm = Alarm(
+        Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed))),
+        false,
+    );
     // The first take brings the labelled copy: the service keeps it while
     // the operation waits. A take the kernel took back left the service
     // without it, and the next one brings a new copy.
@@ -451,6 +537,7 @@ fn run_in(
                 out,
                 refusal,
                 authenticated,
+                duplicable,
                 custody,
             ) {
                 Ok((long::READY, n, _)) => return Ok(n),
@@ -484,6 +571,7 @@ fn run_in(
                 out,
                 refusal,
                 authenticated,
+                duplicable,
                 custody,
             );
             drop(clone_guard);
@@ -510,6 +598,13 @@ fn run_in(
             drop(guard);
             continue;
         }
+        if let Some(deadline) = deadline {
+            if rt::time::reached(deadline) {
+                drop(guard);
+                break 'wait Some(ETIMEDOUT);
+            }
+            alarm.1 = sys::timer_set(&alarm.0, deadline).is_ok();
+        }
         let got = sys::receive(&channel);
         drop(guard);
         match got {
@@ -526,6 +621,7 @@ fn run_in(
                     out,
                     refusal,
                     authenticated,
+                    duplicable,
                     custody,
                 ) {
                     Ok((long::READY, n, _)) => return Ok(n),
@@ -570,6 +666,7 @@ fn run_in(
             out,
             refusal,
             authenticated,
+            duplicable,
             custody,
         ) {
             Ok((long::READY, n, _)) => return Ok(n),

@@ -106,6 +106,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gencat"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -186,8 +193,10 @@ name = "pipe"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "posix-credentials",
  "proto-init",
  "proto-pipe",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -328,6 +337,13 @@ name = "posix-heap"
 version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
+]
+
+[[package]]
+name = "posix-ipc"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
 ]
 
 [[package]]

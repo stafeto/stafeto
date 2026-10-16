@@ -537,6 +537,8 @@ pub fn os_test_with_fixtures(
     files.extend(network_databases());
     files.push(dir("/bin"));
     files.push(of("/bin/sh", 0o755, ROOT, Source::Elf("busybox-probe")));
+    // The message catalog compiler of the tests of nl_types.
+    files.push(of("/bin/gencat", 0o755, ROOT, Source::Elf("gencat")));
     files.push(dir("/os-test"));
     let mut list = String::new();
     for (n, (name, elf)) in tests.iter().enumerate() {
@@ -752,6 +754,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ];
             files.extend(devices());
             files.extend(network_databases());
+            files
+        }
+        "boot-posix-ipc.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-ipc", 0o755, ROOT, "posix-ipc"),
+                dir("/dev"),
+            ];
+            files.extend(devices());
             files
         }
         "boot-posix-pty.img" | "boot-posix-pty-steps.img" => {
@@ -1040,7 +1051,7 @@ mod tests {
         // the directories above them (it refuses a file without its
         // parent).
         let wanted = sources(&files);
-        assert_eq!(wanted.len(), 14);
+        assert_eq!(wanted.len(), 15);
         let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
         let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
         for path in [

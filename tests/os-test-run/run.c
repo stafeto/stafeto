@@ -53,6 +53,17 @@ static void nap(void) {
     nanosleep(&t, NULL);
 }
 
+/* A test that forks and leaves its children behind (a stress test that forks
+ * until the system is full, one that dies by a signal) leaves them to starve
+ * the tests after it: each test runs in a process group of its own, and the
+ * runner ends the group when the test is over and waits (3 s at most) until
+ * it is empty. */
+static void end_group(pid_t group) {
+    kill(-group, SIGKILL);
+    long long start = now_ms();
+    while (kill(-group, 0) == 0 && now_ms() - start < 3000) nap();
+}
+
 /* Runs the test `name` of the file `rel` in the directory `dir`. */
 static void run_one(const char *name, const char *dir, const char *rel) {
     printf("@@os-test begin %s\n", name);
@@ -65,7 +76,12 @@ static void run_one(const char *name, const char *dir, const char *rel) {
     snprintf(path, sizeof path, "./%s", rel);
     char *argv[] = {path, NULL};
     pid_t pid;
-    int e = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
+    int e = posix_spawn(&pid, path, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
     if (e != 0) {
         printf("@@os-test end %s error spawn %d\n", name, e);
         return;
@@ -82,11 +98,13 @@ static void run_one(const char *name, const char *dir, const char *rel) {
         if (now_ms() - start > limit_ms) {
             kill(pid, SIGKILL);
             waitpid(pid, &status, 0);
+            end_group(pid);
             printf("@@os-test end %s timeout\n", name);
             return;
         }
         nap();
     }
+    end_group(pid);
     if (WIFEXITED(status))
         printf("@@os-test end %s exit %d\n", name, WEXITSTATUS(status));
     else if (WIFSIGNALED(status))

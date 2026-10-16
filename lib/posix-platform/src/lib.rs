@@ -16,6 +16,7 @@
 #![no_std]
 
 mod files;
+mod ipc;
 mod mapping;
 mod names;
 mod signals;

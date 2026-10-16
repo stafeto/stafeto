@@ -47,6 +47,9 @@
 //! - ABANDON: no body: the session's long operations that wait go, as when
 //!   the session goes (the threads of an old image at exec). Reply: status.
 //!
+//! IPC, IPC_TAKE and IPC_CANCEL: the message queues, semaphores and shared
+//! memory segments of POSIX and XSI (module `ipc`).
+//!
 //! WatchStart/Take/Cancel use proto_wire::watch: at most 32 descriptions,
 //! one registration per actual description, READY through Cancel, which
 //! recomputes every original element and frees the registration.
@@ -60,6 +63,7 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
+pub mod ipc;
 pub mod named;
 pub mod sock;
 pub use named::{
@@ -160,10 +164,13 @@ pub enum Method {
     SockSendTake = 37,
     SockRecv = 38,
     SockRecvTake = 39,
+    Ipc = 40,
+    IpcTake = 41,
+    IpcCancel = 42,
 }
 
 impl Method {
-    pub const ALL: [Method; 38] = [
+    pub const ALL: [Method; 41] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -202,6 +209,9 @@ impl Method {
         Method::SockSendTake,
         Method::SockRecv,
         Method::SockRecvTake,
+        Method::Ipc,
+        Method::IpcTake,
+        Method::IpcCancel,
     ];
 
     pub const fn number(self) -> u16 {
@@ -219,7 +229,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
 ];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
