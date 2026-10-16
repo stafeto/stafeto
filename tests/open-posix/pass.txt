@@ -216,6 +216,7 @@ conformance/definitions/sys/shm_h/8-1-buildonly
 conformance/definitions/sys/shm_h/9-1-buildonly
 conformance/definitions/time_h/1-1-buildonly
 conformance/definitions/time_h/10-1-buildonly
+conformance/definitions/time_h/11-1-buildonly
 conformance/definitions/time_h/12-1-buildonly
 conformance/definitions/time_h/13-1-buildonly
 conformance/definitions/time_h/14-1-buildonly
@@ -573,6 +574,7 @@ conformance/interfaces/pthread_equal/2-1
 conformance/interfaces/pthread_exit/1-1
 conformance/interfaces/pthread_exit/2-1
 conformance/interfaces/pthread_exit/3-1
+conformance/interfaces/pthread_getcpuclockid/1-1
 conformance/interfaces/pthread_getcpuclockid/speculative/3-1
 conformance/interfaces/pthread_getschedparam/1-1
 conformance/interfaces/pthread_getschedparam/1-2

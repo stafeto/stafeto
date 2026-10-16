@@ -251,7 +251,11 @@ fn thread_of(pid: i32) -> Result<u64, i32> {
         return Ok(1);
     }
     // A process that does not exist is ESRCH whoever asks; one that does
-    // is not the caller's to read or set (EPERM).
+    // is not the caller's to read or set (EPERM). The system process
+    // (PID 1, the process service) exists and is the system's.
+    if pid == proto_process::INIT_PID as i32 {
+        return Err(EPERM);
+    }
     match crate::process::kill(pid, 0) {
         Ok(()) | Err(EPERM) => Err(EPERM),
         Err(e) => Err(e),

@@ -580,6 +580,8 @@ basic/spawn/posix_spawnattr_getsigmask
 basic/spawn/posix_spawnattr_init
 basic/spawn/posix_spawnattr_setflags
 basic/spawn/posix_spawnattr_setpgroup
+basic/spawn/posix_spawnattr_setschedparam
+basic/spawn/posix_spawnattr_setschedpolicy
 basic/spawn/posix_spawnattr_setsigdefault
 basic/spawn/posix_spawnattr_setsigmask
 basic/spawn/posix_spawnp
