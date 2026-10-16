@@ -19,6 +19,7 @@ pub mod jobs;
 #[cfg(test)]
 mod reference;
 pub mod retired;
+pub mod window;
 
 use discipline::Terminal;
 use proto_uart::WRITE_MAX;
