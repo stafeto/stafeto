@@ -172,12 +172,6 @@ unsafe impl Schedulable for Thread {
         // SAFETY: `this` points at a live thread.
         unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).sched) }
     }
-
-    unsafe fn charge(this: NonNull<Thread>, ticks: u64) {
-        // SAFETY: the thread holds a reference to its process, and the
-        // scheduler's lock, which the caller holds, guards the sum.
-        unsafe { (*this.as_ref().process.as_ptr()).charge(ticks) };
-    }
 }
 
 /// Threads whose slots have not gone back.

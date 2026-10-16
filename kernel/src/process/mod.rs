@@ -138,9 +138,10 @@ pub struct Process {
     pools: Pools,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
-    /// Counter ticks its threads have run, finished stints of threads that
-    /// ended included; the scheduler adds each stint as the thread leaves
-    /// the CPU (`Schedulable::charge`), under its lock.
+    /// Counter ticks the threads that left its list have run (`fold_time`);
+    /// the time of the threads still in the list is in their nodes, and
+    /// `cpu_time` adds it all up. A change of thread writes the thread's
+    /// node alone, never the process.
     cpu_ticks: u64,
     /// The threads it started and whether it ended, and why. A process
     /// lives exactly while it is whole (`stage`).
@@ -288,9 +289,11 @@ impl Process {
         self.ceiling
     }
 
-    /// A stint of `ticks` ended (`Schedulable::charge`).
-    pub(crate) fn charge(&mut self, ticks: u64) {
-        self.cpu_ticks = self.cpu_ticks.saturating_add(ticks);
+    /// The thread `t` leaves the list with the ticks it ran: they stay in
+    /// the sum of the process (`remove_thread`, under the scheduler's
+    /// lock or with interrupts masked).
+    fn fold_time(&mut self, t: &Thread) {
+        self.cpu_ticks = self.cpu_ticks.saturating_add(t.sched.ran());
     }
 }
 
@@ -527,23 +530,26 @@ pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
     unsafe { &mut (*process.as_ptr()).quota }
 }
 
-/// The ticks the threads of `process` have run: the sum of their finished
-/// stints and, when a thread of the process is on the CPU, its stint so
-/// far (object_info PROCESS_TIME). O(1).
+/// The ticks the threads of `process` have run: those of the threads that
+/// left its list and, for each thread in it, its finished stints and, when
+/// it is on the CPU, its stint so far (object_info PROCESS_TIME). One walk
+/// of at most abi::MAX_THREADS threads, whose nodes the scheduler's lock
+/// guards.
 pub fn cpu_time(process: NonNull<Process>) -> u64 {
     let now = crate::arch::timer::now();
-    sched::locked(|k| {
-        // SAFETY: the caller holds a reference to the process; the sum is
-        // guarded by the scheduler's lock, which is held; a running thread
-        // is alive.
+    sched::locked(|_| {
+        // SAFETY: the caller holds a reference to the process; the threads
+        // of its list are alive, and the lock guards their nodes and the
+        // sum.
         unsafe {
-            let sum = (*process.as_ptr()).cpu_ticks;
-            match k.s.running() {
-                Some(r) if r.as_ref().process() == process => {
-                    sum.saturating_add(now.saturating_sub(r.as_ref().sched.since()))
-                }
-                _ => sum,
+            let p = process.as_ptr();
+            let mut sum = (*p).cpu_ticks;
+            let mut next = (*p).threads;
+            while let Some(t) = next {
+                sum = sum.saturating_add(t.as_ref().sched.ran_at(now));
+                next = t.as_ref().siblings.and_then(|s| s.next);
             }
+            sum
         }
     })
 }
@@ -862,6 +868,7 @@ pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
             return;
         };
         let p = process.as_ptr();
+        (*p).fold_time(t.as_ref());
         (*p).thread_count -= 1;
         // The cursor of the stage Threads never names a thread that left.
         if (*p).threads_next == Some(t) {
