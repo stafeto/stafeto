@@ -3406,4 +3406,19 @@ mod tests {
         ipc.note_wait(3, (1 << 32) | 100_000, QUEUE_BASE, Block::Recv);
         assert_eq!(ipc.counted, 1);
     }
+
+    #[test]
+    fn the_name_of_a_segment_file_is_the_creators_number_and_a_used_one_is_refused() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let w = |n: u64| with_cred(&[0, 4096, 0o600, n]);
+        assert_eq!(r.err(&mut p, op::SHM_GET, &w(0), b""), 22);
+        let out = r.ok(&mut p, op::SHM_GET, &w(0xabcdef), b"");
+        assert_eq!(out.words[1], 0xabcdef);
+        assert_eq!(r.err(&mut p, op::SHM_GET, &w(0xabcdef), b""), 17);
+        // The answers of an attach name who may own the file.
+        let at = r.ok(&mut p, op::SHM_AT, &with_cred(&[out.words[0], 0]), b"");
+        assert_eq!((at.words[0], at.words[1], at.words[2], at.words[3]), (0xabcdef, 4096, 1000, 1000));
+        let st = r.ok(&mut p, op::SHM_CTL, &with_cred(&[out.words[0], IPC_STAT]), b"");
+        assert_eq!(st.words[14], 0xabcdef);
+    }
 }
