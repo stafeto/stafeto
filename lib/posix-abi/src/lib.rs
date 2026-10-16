@@ -14,6 +14,7 @@ pub mod altstack;
 pub mod change;
 pub mod clock;
 mod close_driver;
+pub mod cpu;
 mod drain_driver;
 mod drain_hooks;
 #[cfg(feature = "close-probe")]
@@ -47,6 +48,7 @@ pub mod procfs;
 pub mod random;
 pub mod relibc;
 pub mod resources;
+pub mod sched;
 pub mod shared;
 pub mod shares;
 pub mod signals;

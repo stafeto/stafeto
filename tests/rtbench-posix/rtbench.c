@@ -635,6 +635,134 @@ static int signals(void) {
     return error;
 }
 
+
+/* --- S30: asynchronous cancellation of a thread that computes --------- */
+
+static struct histogram s30;
+static volatile uint64_t s30_cleaned;
+static int s30_ready;
+
+static void s30_cleanup(void *argument) {
+    (void)argument;
+    s30_cleaned = ticks();
+}
+
+static void *s30_target(void *argument) {
+    struct worker *w = argument;
+    if (enter(w)) return NULL;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    pthread_cleanup_push(s30_cleanup, NULL);
+    store(&s30_ready, 1);
+    for (;;) {}
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+/* The thread at 28 computes without a call, a busy thread at 25 is below
+ * it; the main thread, above, cancels it. The time runs from the call of
+ * pthread_cancel to the first statement of the target's cleanup handler. */
+static int cancel_async(void) {
+    struct worker spinner;
+    bursts = 1;
+    if (start(&spinner, busy, BUSY_LEVEL, NULL)) return 1;
+    int error = 0;
+    for (int i = 0; i < 50 && !error; i++) {
+        struct worker target;
+        store(&s30_ready, 0);
+        s30_cleaned = 0;
+        if (start(&target, s30_target, SENDER_LEVEL, NULL)) { error = 1; break; }
+        while (!load(&s30_ready)) sleep_ns(100 * US);
+        sleep_ns(1 * MS);
+        uint64_t t0 = ticks();
+        error = pthread_cancel(target.thread);
+        if (error) { fail("pthread_cancel", error); break; }
+        sleep_ns(1 * MS);
+        if (!s30_cleaned) { fail("S30 the cleanup handler did not run", 0); error = 1; }
+        else record(&s30, ticks_ns(s30_cleaned - t0));
+        error |= pthread_join(target.thread, NULL);
+    }
+    bursts = 0;
+    error |= finish(&spinner);
+    return error;
+}
+
+/* --- inheritance_chain: a mutex through a chain of two holders -------- */
+
+static struct histogram chain_row;
+static pthread_mutex_t chain_m[2];
+static volatile int chain_a_has, chain_b_has, chain_go;
+static volatile uint64_t chain_got;
+
+static void *chain_a(void *argument) {
+    struct worker *w = argument;
+    if (enter(w)) return NULL;
+    pthread_mutex_lock(&chain_m[0]);
+    store((int *)&chain_a_has, 1);
+    while (!load((const int *)&chain_go)) sched_yield();
+    pthread_mutex_unlock(&chain_m[0]);
+    return NULL;
+}
+
+static void *chain_b(void *argument) {
+    struct worker *w = argument;
+    if (enter(w)) return NULL;
+    pthread_mutex_lock(&chain_m[1]);
+    store((int *)&chain_b_has, 1);
+    pthread_mutex_lock(&chain_m[0]);
+    pthread_mutex_unlock(&chain_m[0]);
+    pthread_mutex_unlock(&chain_m[1]);
+    return NULL;
+}
+
+static void *chain_c(void *argument) {
+    struct worker *w = argument;
+    if (enter(w)) return NULL;
+    pthread_mutex_lock(&chain_m[1]);
+    chain_got = ticks();
+    pthread_mutex_unlock(&chain_m[1]);
+    return NULL;
+}
+
+/* A at 10 holds M1, B at 15 holds M2 and waits for M1, a thread at 25
+ * computes, C at 28 waits for M2: from the moment A may let go to the
+ * moment C has M2, which takes A running at C's level through B. */
+static int inheritance(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_init(&chain_m[0], &attr);
+    pthread_mutex_init(&chain_m[1], &attr);
+    pthread_mutexattr_destroy(&attr);
+    struct worker spinner;
+    bursts = 1;
+    if (start(&spinner, busy, BUSY_LEVEL, NULL)) return 1;
+    int error = 0;
+    for (int i = 0; i < 20 && !error; i++) {
+        struct worker a, b, c;
+        store((int *)&chain_a_has, 0);
+        store((int *)&chain_b_has, 0);
+        store((int *)&chain_go, 0);
+        if (start(&a, chain_a, 10, NULL)) { error = 1; break; }
+        while (!load((const int *)&chain_a_has)) sleep_ns(100 * US);
+        if (start(&b, chain_b, 15, NULL)) { error = 1; break; }
+        while (!load((const int *)&chain_b_has)) sleep_ns(100 * US);
+        if (start(&c, chain_c, SENDER_LEVEL, NULL)) { error = 1; break; }
+        sleep_ns(2 * MS);
+        uint64_t t0 = ticks();
+        store((int *)&chain_go, 1);
+        error |= pthread_join(c.thread, NULL);
+        record(&chain_row, ticks_ns(chain_got - t0));
+        error |= pthread_join(b.thread, NULL);
+        error |= pthread_join(a.thread, NULL);
+    }
+    bursts = 0;
+    error |= finish(&spinner);
+    pthread_mutex_destroy(&chain_m[0]);
+    pthread_mutex_destroy(&chain_m[1]);
+    return error;
+}
+
 /* --- S6: from the readiness of the data to the return of read --------- */
 
 static struct histogram s6;
@@ -1604,7 +1732,7 @@ static int child(uint64_t entered, char **argv) {
 /* --- the run ---------------------------------------------------------- */
 
 static int one_round(void) {
-    return mutex_alone() || wake_idle() || futex_slow() || mutex_rivals() || heap_and_table() || signals() || read_ready()
+    return mutex_alone() || wake_idle() || futex_slow() || mutex_rivals() || heap_and_table() || signals() || cancel_async() || inheritance() || read_ready()
             || periodic_sleep() || service_round_trip() || generator() || processes();
 }
 
@@ -1662,8 +1790,9 @@ static void report(void) {
     row("s28_stop_threads_128", &s28[0], 0);
     row("s28_cont_threads_128", &s28[1], 0);
     row("s29_pipe_write_to_poll", &s29, 0);
+    row("s30_cancel_async_busy_25", &s30, 0);
     none("timer_1ms", "POSIX timers come with 5h");
-    none("inheritance_chain", "priority inheritance comes with 5h");
+    row("inheritance_chain", &chain_row, 0);
     struct line l = { .length = 0 };
     put(&l, "RTB2 s7_missed ");
     put_number(&l, s7_missed);

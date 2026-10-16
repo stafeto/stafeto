@@ -196,17 +196,31 @@ fn error(status: Status) -> c_int {
     }
 }
 fn valid(id: c_int) -> Result<(), c_int> {
-    if id == CLOCK_REALTIME || id == CLOCK_MONOTONIC {
+    if id == CLOCK_REALTIME || id == CLOCK_MONOTONIC || cpu_clock(id) {
         Ok(())
     } else {
         Err(EINVAL)
     }
 }
+/// Whether `id` is a CPU-time clock: of the process (2), of the calling
+/// thread (3), or of the thread whose number is `id >> 3` (low bits 6).
+fn cpu_clock(id: c_int) -> bool {
+    id == crate::cpu::CLOCK_PROCESS_CPUTIME_ID
+        || id == crate::cpu::CLOCK_THREAD_CPUTIME_ID
+        || (id > 0 && id & 7 == 6)
+}
 /// The time of clock `id`: MONOTONIC from the counter, REALTIME from the
 /// page or the service; no errno.
 pub fn gettime(id: c_int) -> Result<Time, c_int> {
     valid(id)?;
-    if id == CLOCK_MONOTONIC {
+    if cpu_clock(id) {
+        let ns = match id {
+            crate::cpu::CLOCK_PROCESS_CPUTIME_ID => crate::cpu::process_ns()?,
+            crate::cpu::CLOCK_THREAD_CPUTIME_ID => crate::cpu::thread_ns()?,
+            _ => crate::cpu::thread_ns_of((id >> 3) as u64)?,
+        };
+        Ok(Time::from_mono(ns))
+    } else if id == CLOCK_MONOTONIC {
         Ok(Time::from_mono(rt::time::ticks_to_ns(rt::time::now())))
     } else if let Some(read) = page_realtime() {
         read.map(|(time, _)| time)

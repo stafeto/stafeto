@@ -1337,6 +1337,10 @@ static int steps_priority(void) {
             return 1;
     }
     if (stafeto_steps_level(30)) return 2;
+    /* Let the kernel finish taking apart the processes the earlier probes
+     * ended: its portions run at the level of the one who ended them, above
+     * the client, and would be counted in its first asks. */
+    pause_ms(400);
     for (long k = 0; k < 2; k++) {
         if (pthread_create(&spawner[k], NULL, priority_spawner, (void *)k)) return 3;
     }
@@ -2638,6 +2642,10 @@ static int setid_spawn(void) {
 
 #include "faults.c"
 #include "timers.c"
+#if !CHANGE_STEPS
+static int burn50_role(void);
+static int nice_role(void);
+#endif
 
 static int role(const char *name) {
 #if PENDING_OPEN_PROBE
@@ -2652,6 +2660,10 @@ static int role(const char *name) {
 #if !CHANGE_STEPS
     if (strcmp(name, "timers") == 0) return timers_role();
     if (strcmp(name, "timers-exec") == 0) return timers_exec_role();
+#endif
+#if !CHANGE_STEPS
+    if (strcmp(name, "burn50") == 0) return burn50_role();
+    if (strcmp(name, "nicechild") == 0) return nice_role();
 #endif
     if (strcmp(name, "steptimer") == 0) return steptimer_role();
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
@@ -4797,6 +4809,10 @@ static void names(void) {
 
 #endif
 
+#if !CHANGE_STEPS
+#include "accounts.c"
+#endif
+
 int main(int argc, char **argv) {
 #if NATIVE_SCOPES_LAUNCHER
     return native_scopes_supervisor();
@@ -4873,6 +4889,8 @@ int main(int argc, char **argv) {
 #if !CHANGE_STEPS
     printf("posix-procs: stage timers\n");
     run_role("/bin/procs-child", "timers", NULL);
+    printf("posix-procs: stage accounts\n");
+    accounts();
 #endif
 #if NAMES_PROBE
     printf("posix-procs: stage names\n");

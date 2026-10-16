@@ -83,6 +83,11 @@ pub(crate) fn ask(w: &Writer) -> Result<u32, i32> {
     answer(w, |bytes| bytes.u32().unwrap_or(0))
 }
 
+/// `ask` for a reply of a u64 after the status.
+pub(crate) fn ask_value(w: &Writer) -> Result<u64, i32> {
+    answer(w, |bytes| bytes.u64().map_err(|_| crate::constants::EIO))?
+}
+
 /// `ask` for the reply of a timer's setting: the time left and the
 /// interval, in nanoseconds.
 pub(crate) fn ask_setting(w: &Writer) -> Result<[u64; 2], i32> {

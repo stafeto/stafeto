@@ -119,6 +119,12 @@ pub struct Record<P> {
     pub name: [u8; proto_process::NAME_LEN],
     /// The name of the exec that ExecStart began.
     pub next_name: [u8; proto_process::NAME_LEN],
+    /// The nice value (setpriority), -20 to 19: its parent's at birth.
+    pub nice: i8,
+    /// The counter ticks the images before the last exec ran, and those its
+    /// children that were waited for ran, theirs included (getrusage).
+    pub carried_ticks: u64,
+    pub children_ticks: u64,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -446,6 +452,9 @@ impl<P> Records<P> {
                 self.records[p].as_ref().unwrap().name
             }),
             next_name: [0; proto_process::NAME_LEN],
+            nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
+            carried_ticks: 0,
+            children_ticks: 0,
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,

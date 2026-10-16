@@ -2067,6 +2067,13 @@ unsafe fn deliver_signal(
     block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
     posix_sync::resume_wait(abandoned);
+    // Asynchronous cancellation (XSH 2.9.5.1): the entry that
+    // `pthread_cancel` asked for outside a section of the layer acts at
+    // once; the deferral of entries stays through the end of the thread.
+    if entered && crate::relibc::async_cancel_due() {
+        let _deferred = preparation.take().expect("a preparation").settle_for_exit();
+        crate::relibc::cancel_exit();
+    }
     drop(preparation);
 }
 /// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the

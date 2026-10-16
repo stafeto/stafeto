@@ -235,7 +235,7 @@ impl Drop for Held<'_> {
             );
             // A holder of a raising lock of the layer stays at the ceiling.
             if CEILING.load(Ordering::Relaxed) != 0 && !raised(block) {
-                set_level(block, block.base_level.load(Ordering::Relaxed) as u8);
+                set_level(block, posix_thread::effective_level(block));
             }
         }
         leave();
@@ -354,9 +354,10 @@ pub fn futex_wait(
             return Err(EAGAIN);
         }
         block.address.store(address, Ordering::Relaxed);
-        block
-            .level
-            .store(block.base_level.load(Ordering::Relaxed), Ordering::Relaxed);
+        block.level.store(
+            u32::from(posix_thread::effective_level(block)),
+            Ordering::Relaxed,
+        );
         insert(&held, block);
         block.flags.fetch_or(flag::WAITING, Ordering::SeqCst);
     }
@@ -603,7 +604,7 @@ fn lower() {
     let old = block.flags.fetch_sub(flag::RAISED_ONE, Ordering::SeqCst);
     debug_assert!(old & flag::RAISED_MASK != 0, "balanced raising locks");
     if old & flag::RAISED_MASK == flag::RAISED_ONE && CEILING.load(Ordering::Relaxed) != 0 {
-        set_level(block, block.base_level.load(Ordering::Relaxed) as u8);
+        set_level(block, posix_thread::effective_level(block));
     }
 }
 

@@ -616,6 +616,344 @@ static void flush_all_streams(void) {
     printf("relibc-threads: %d rounds of fflush(NULL) among streams that open and close ok\n", FLUSH_ROUNDS);
 }
 
+
+/* K: the priorities of POSIX (spec 2, 3.5): the calls of sched.h and the
+ * thread attributes, then the mutex protocols against a thread that
+ * computes between the holder and the waiter. The process starts at level
+ * 30 (priority 32 stands there), so that priority 5, 15, 20 and 25 are the
+ * levels 3, 13, 18 and 23. */
+static long long now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+static void burn_until(long long deadline) {
+    while (now_ns() < deadline) {}
+}
+static pthread_t spawn_at(int priority, void *(*body)(void *), void *arg) {
+    pthread_attr_t attr;
+    struct sched_param param = {priority};
+    int policy = -1;
+    CHECK(pthread_attr_init(&attr) == 0);
+    CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+    CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
+    CHECK(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0);
+    CHECK(pthread_attr_setschedparam(&attr, &param) == 0);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, &attr, body, arg) == 0);
+    CHECK(pthread_attr_destroy(&attr) == 0);
+    /* The new thread has what the attributes gave it. */
+    struct sched_param got;
+    CHECK(pthread_getschedparam(thread, &policy, &got) == 0);
+    CHECK(policy == SCHED_FIFO && got.sched_priority == priority);
+    return thread;
+}
+
+static void sched_calls(void) {
+    CHECK(sched_get_priority_min(SCHED_FIFO) == 1 && sched_get_priority_max(SCHED_FIFO) == 32);
+    CHECK(sched_get_priority_min(SCHED_RR) == 1 && sched_get_priority_max(SCHED_RR) == 32);
+    CHECK(sched_get_priority_min(SCHED_OTHER) == 0 && sched_get_priority_max(SCHED_OTHER) == 0);
+    errno = 0;
+    CHECK(sched_get_priority_max(99) == -1 && errno == EINVAL);
+    struct timespec quantum;
+    CHECK(sched_rr_get_interval(0, &quantum) == 0 && quantum.tv_sec == 0 && quantum.tv_nsec == 4000000);
+    CHECK(sched_getscheduler(0) == SCHED_OTHER);
+    struct sched_param param = {32};
+    CHECK(sched_setscheduler(0, SCHED_FIFO, &param) == SCHED_OTHER);
+    CHECK(sched_getscheduler(0) == SCHED_FIFO);
+    param.sched_priority = 0;
+    CHECK(sched_getparam(0, &param) == 0 && param.sched_priority == 32);
+    param.sched_priority = 33;
+    errno = 0;
+    CHECK(sched_setparam(0, &param) == -1 && errno == EINVAL);
+    param.sched_priority = 32;
+    errno = 0;
+    CHECK(sched_setscheduler(0, SCHED_OTHER, &param) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(sched_getscheduler(-1) == -1 && errno == ESRCH);
+    int policy;
+    struct sched_param got;
+    CHECK(pthread_getschedparam(pthread_self(), &policy, &got) == 0);
+    CHECK(policy == SCHED_FIFO && got.sched_priority == 32);
+    CHECK(pthread_setschedprio(pthread_self(), 31) == 0);
+    CHECK(pthread_getschedparam(pthread_self(), &policy, &got) == 0 && got.sched_priority == 31);
+    param.sched_priority = 32;
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_RR, &param) == 0);
+    CHECK(sched_getscheduler(0) == SCHED_RR);
+    CHECK(sched_setscheduler(0, SCHED_FIFO, &param) == SCHED_RR);
+    printf("relibc-threads: sched_get_priority_*, sched_setscheduler, sched_getparam and pthread_setschedparam agree\n");
+}
+
+/* XSH 2.8.4: a thread whose priority is set by pthread_setschedparam goes
+ * to the tail of its list, also at the same priority; pthread_setschedprio
+ * at the same priority leaves it where it is. A thread of the caller's own
+ * level that is ready runs at the first and not at the second. */
+static volatile int equal_ran, equal_go;
+static void *equal_thread(void *arg) {
+    (void)arg;
+    /* The creator waits for this thread to start: it gives the processor
+     * back at once, to the creator, which is its equal. */
+    while (!equal_go) sched_yield();
+    equal_ran = 1;
+    return NULL;
+}
+static void tail_of_the_list(void) {
+    struct sched_param param = {32};
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0);
+    equal_ran = equal_go = 0;
+    pthread_t t = spawn_at(32, equal_thread, NULL);
+    equal_go = 1;
+    CHECK(equal_ran == 0);
+    CHECK(pthread_setschedprio(pthread_self(), 32) == 0);
+    CHECK(equal_ran == 0);
+    CHECK(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0);
+    CHECK(equal_ran == 1);
+    CHECK(pthread_join(t, NULL) == 0);
+    printf("relibc-threads: pthread_setschedparam puts the thread behind an equal one, pthread_setschedprio does not\n");
+}
+
+static pthread_mutex_t protocol_mutex[2];
+static volatile int holder_has, holder_go, mid_ran, high_done, saw_mid;
+static volatile long long go_at, high_got;
+static void *holder(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    holder_has = 1;
+    while (!holder_go) sched_yield();
+    saw_mid = mid_ran;
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    return NULL;
+}
+static void *middle(void *arg) {
+    mid_ran = 1;
+    burn_until(now_ns() + (long long)(long)arg * 1000000LL);
+    return NULL;
+}
+static void *high(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    high_got = now_ns();
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    high_done = 1;
+    return NULL;
+}
+
+static void make_mutex(pthread_mutex_t *mutex, int protocol, int ceiling) {
+    pthread_mutexattr_t attr;
+    CHECK(pthread_mutexattr_init(&attr) == 0);
+    CHECK(pthread_mutexattr_setprotocol(&attr, protocol) == 0);
+    if (protocol == PTHREAD_PRIO_PROTECT) CHECK(pthread_mutexattr_setprioceiling(&attr, ceiling) == 0);
+    CHECK(pthread_mutex_init(mutex, &attr) == 0);
+    CHECK(pthread_mutexattr_destroy(&attr) == 0);
+}
+
+/* The holder (priority 5) has the mutex, a thread of priority 20 computes
+ * for 60 ms, and a thread of priority 25 asks for the mutex. How long the
+ * mutex takes to reach the last after the holder may let it go. */
+static long long inversion(int protocol) {
+    make_mutex(&protocol_mutex[0], protocol, 25);
+    holder_has = holder_go = mid_ran = high_done = 0;
+    pthread_t h = spawn_at(5, holder, NULL);
+    while (!holder_has) sleep_ms(1);
+    pthread_t m = spawn_at(20, middle, (void *)60L);
+    pthread_t t = spawn_at(25, high, NULL);
+    sleep_ms(3);
+    go_at = now_ns();
+    holder_go = 1;
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(pthread_join(m, NULL) == 0);
+    CHECK(pthread_join(h, NULL) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[0]) == 0);
+    return high_got - go_at;
+}
+
+/* The holder (priority 5) has a mutex of ceiling 25: a thread of priority
+ * 15 that becomes ready meanwhile does not run before the holder lets go. */
+static sem_t mid_gate;
+static void *gated_middle(void *arg) {
+    (void)arg;
+    CHECK(sem_wait(&mid_gate) == 0);
+    mid_ran = 1;
+    return NULL;
+}
+static int ceiling_held(int protocol) {
+    make_mutex(&protocol_mutex[0], protocol, 25);
+    holder_has = holder_go = mid_ran = saw_mid = 0;
+    CHECK(sem_init(&mid_gate, 0, 0) == 0);
+    pthread_t m = spawn_at(15, gated_middle, NULL);
+    sleep_ms(2);
+    pthread_t h = spawn_at(5, holder, NULL);
+    while (!holder_has) sleep_ms(1);
+    CHECK(sem_post(&mid_gate) == 0);
+    sleep_ms(3);
+    holder_go = 1;
+    CHECK(pthread_join(h, NULL) == 0);
+    CHECK(pthread_join(m, NULL) == 0);
+    CHECK(sem_destroy(&mid_gate) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[0]) == 0);
+    return saw_mid;
+}
+
+/* A (priority 5) has M1; B (15) has M2 and asks for M1; C (25) asks for M2;
+ * D (20) computes: A has to run at C's level through B. */
+static volatile int a_has, b_has;
+static void *chain_a(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    a_has = 1;
+    while (!holder_go) sched_yield();
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    return NULL;
+}
+static void *chain_b(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[1]) == 0);
+    b_has = 1;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_unlock(&protocol_mutex[1]) == 0);
+    return NULL;
+}
+static void *chain_c(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[1]) == 0);
+    high_got = now_ns();
+    CHECK(pthread_mutex_unlock(&protocol_mutex[1]) == 0);
+    return NULL;
+}
+static long long chain(void) {
+    make_mutex(&protocol_mutex[0], PTHREAD_PRIO_INHERIT, 0);
+    make_mutex(&protocol_mutex[1], PTHREAD_PRIO_INHERIT, 0);
+    a_has = b_has = holder_go = mid_ran = 0;
+    pthread_t a = spawn_at(5, chain_a, NULL);
+    while (!a_has) sleep_ms(1);
+    pthread_t b = spawn_at(15, chain_b, NULL);
+    while (!b_has) sleep_ms(1);
+    pthread_t d = spawn_at(20, middle, (void *)60L);
+    pthread_t c = spawn_at(25, chain_c, NULL);
+    sleep_ms(3);
+    go_at = now_ns();
+    holder_go = 1;
+    CHECK(pthread_join(c, NULL) == 0);
+    CHECK(pthread_join(d, NULL) == 0);
+    CHECK(pthread_join(b, NULL) == 0);
+    CHECK(pthread_join(a, NULL) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[1]) == 0);
+    return high_got - go_at;
+}
+
+/* Two threads that wait for each other's mutex: the one that closes the
+ * cycle is told EDEADLK. */
+static volatile int other_asks;
+static void *other_waits(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&protocol_mutex[1]) == 0);
+    other_asks = 1;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_unlock(&protocol_mutex[1]) == 0);
+    return NULL;
+}
+static void deadlock(void) {
+    make_mutex(&protocol_mutex[0], PTHREAD_PRIO_INHERIT, 0);
+    make_mutex(&protocol_mutex[1], PTHREAD_PRIO_INHERIT, 0);
+    other_asks = 0;
+    CHECK(pthread_mutex_lock(&protocol_mutex[0]) == 0);
+    pthread_t t = spawn_at(15, other_waits, NULL);
+    while (!other_asks) sleep_ms(1);
+    sleep_ms(3);
+    CHECK(pthread_mutex_lock(&protocol_mutex[1]) == EDEADLK);
+    CHECK(pthread_mutex_unlock(&protocol_mutex[0]) == 0);
+    CHECK(pthread_join(t, NULL) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[0]) == 0);
+    CHECK(pthread_mutex_destroy(&protocol_mutex[1]) == 0);
+}
+
+static volatile int spin_has, spin_done;
+static pthread_spinlock_t spin;
+static void *spin_holder(void *arg) {
+    (void)arg;
+    CHECK(pthread_spin_lock(&spin) == 0);
+    spin_has = 1;
+    burn_until(now_ns() + 2000000);
+    CHECK(pthread_spin_unlock(&spin) == 0);
+    return NULL;
+}
+static void *spin_waiter(void *arg) {
+    (void)arg;
+    CHECK(pthread_spin_lock(&spin) == 0);
+    spin_done = 1;
+    CHECK(pthread_spin_unlock(&spin) == 0);
+    return NULL;
+}
+
+static volatile int async_started, async_cleaned;
+static volatile unsigned long async_past;
+static void async_cleanup(void *arg) { (void)arg; async_cleaned = 1; }
+static void *async_busy(void *arg) {
+    (void)arg;
+    CHECK(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) == 0);
+    CHECK(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL) == 0);
+    pthread_cleanup_push(async_cleanup, NULL);
+    async_started = 1;
+    for (;;) async_past++;
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+static void priorities(void) {
+    sched_calls();
+    tail_of_the_list();
+    /* The main thread keeps the top of the levels. */
+    long long pi = inversion(PTHREAD_PRIO_INHERIT);
+    long long none = inversion(PTHREAD_PRIO_NONE);
+    printf("relibc-threads: the waiter of priority 25 gets the mutex %lld us after the holder may let go with inheritance, %lld us without\n",
+           pi / 1000, none / 1000);
+    CHECK(pi < 15000000LL);
+    CHECK(none > 25000000LL);
+    CHECK(ceiling_held(PTHREAD_PRIO_PROTECT) == 0);
+    CHECK(ceiling_held(PTHREAD_PRIO_NONE) == 1);
+    printf("relibc-threads: a thread holding a mutex of ceiling 25 is not preempted by priority 15\n");
+    long long through = chain();
+    printf("relibc-threads: along a chain of two mutexes the last waiter gets its mutex %lld us after the first holder may let go\n",
+           through / 1000);
+    CHECK(through < 15000000LL);
+    deadlock();
+    printf("relibc-threads: a cycle of holders is told EDEADLK\n");
+    /* The ceiling of a mutex is its to set, within 1 to 32. */
+    pthread_mutex_t ceiling;
+    make_mutex(&ceiling, PTHREAD_PRIO_PROTECT, 32);
+    int old = 0;
+    CHECK(pthread_mutex_getprioceiling(&ceiling, &old) == 0 && old == 32);
+    CHECK(pthread_mutex_setprioceiling(&ceiling, 12, &old) == 0 && old == 32);
+    CHECK(pthread_mutex_getprioceiling(&ceiling, &old) == 0 && old == 12);
+    CHECK(pthread_mutex_setprioceiling(&ceiling, 33, &old) == EINVAL);
+    CHECK(pthread_mutex_destroy(&ceiling) == 0);
+    /* The holder of a spin lock below its waiter lets go: the waiter waits
+     * for it where it would only spin. */
+    CHECK(pthread_spin_init(&spin, PTHREAD_PROCESS_PRIVATE) == 0);
+    spin_has = spin_done = 0;
+    pthread_t sh = spawn_at(5, spin_holder, NULL);
+    while (!spin_has) sleep_ms(1);
+    pthread_t sw = spawn_at(25, spin_waiter, NULL);
+    CHECK(pthread_join(sw, NULL) == 0 && spin_done);
+    CHECK(pthread_join(sh, NULL) == 0);
+    CHECK(pthread_spin_destroy(&spin) == 0);
+    printf("relibc-threads: a spin lock held below its waiter is waited for\n");
+    /* A thread that computes, with asynchronous cancellation, is cancelled
+     * at once. */
+    async_started = async_cleaned = 0;
+    pthread_t busy = spawn_at(15, async_busy, NULL);
+    while (!async_started) sleep_ms(1);
+    sleep_ms(2);
+    CHECK(pthread_cancel(busy) == 0);
+    void *value = NULL;
+    CHECK(pthread_join(busy, &value) == 0);
+    CHECK(value == PTHREAD_CANCELED && async_cleaned == 1);
+    printf("relibc-threads: a busy thread with asynchronous cancellation is cancelled\n");
+}
+
 int main(void) {
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
@@ -643,6 +981,8 @@ int main(void) {
     detach_after_end();
     stage = 10;
     flush_all_streams();
+    stage = 11;
+    priorities();
     printf("relibc-threads: ok\n");
     return 0;
 }

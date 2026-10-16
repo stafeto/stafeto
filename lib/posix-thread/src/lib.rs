@@ -9,7 +9,7 @@
 //! whose end the TCB starts at (relibc `Tcb::os_new`, `os_arch_activate`).
 //! The TCB starts with relibc's `GenericTcb` (`tls_end`, `tls_len`,
 //! `tcb_ptr`, `tcb_len`, 32 bytes), and its `os_specific` is the layer's
-//! `Block`, 192 bytes aligned to 16, which relibc sees as `[u64; 24]`.
+//! `Block`, 240 bytes aligned to 16, which relibc sees as `[u64; 30]`.
 //! The layer finds its block with two loads and an add, and never writes
 //! the register around its calls.
 //!
@@ -139,6 +139,43 @@ pub struct Block {
     /// Epoch and pending bits for job stops and continuation.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
+    /// The POSIX scheduling of the thread (posix-abi sched): the policy in
+    /// bits 0-7 (0 SCHED_OTHER, 1 SCHED_FIFO, 2 SCHED_RR), the priority in
+    /// bits 8-15. A thread starts with its creator's.
+    pub sched: AtomicU64,
+    /// The scheduling for the next thread this thread makes (pthread_create
+    /// with PTHREAD_EXPLICIT_SCHED), in the form of `sched` with bit 63 set;
+    /// 0 for none.
+    pub next_sched: AtomicU64,
+    /// The levels of the PTHREAD_PRIO_PROTECT mutexes the thread holds, a
+    /// byte each (0: empty); the thread runs at the highest of them.
+    pub protect: AtomicU64,
+    /// The level the waiters for the PTHREAD_PRIO_INHERIT mutexes the thread
+    /// holds lend it: the highest of their levels, 0 for none.
+    pub inherited: AtomicU32,
+    /// The number of the thread that holds the PTHREAD_PRIO_INHERIT mutex
+    /// this thread waits for (0 for none), the word it waits at, and the
+    /// level it lends that thread.
+    pub pi_owner: AtomicU32,
+    pub pi_level: AtomicU32,
+    pub pi_addr: AtomicUsize,
+}
+
+/// The level the thread runs at while it holds no lock of the layer: its
+/// base level, or higher when waiters for a mutex it holds lend it theirs
+/// (PTHREAD_PRIO_INHERIT) or a mutex it holds has a ceiling above it
+/// (PTHREAD_PRIO_PROTECT).
+pub fn effective_level(block: &Block) -> u8 {
+    let base = block.base_level.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    let inherited = block.inherited.load(core::sync::atomic::Ordering::Relaxed) as u8;
+    let protect = block
+        .protect
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .to_le_bytes()
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    base.max(inherited).max(protect)
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -151,7 +188,7 @@ pub struct Tcb {
 /// The offset of the block in the TCB and its size: relibc's
 /// `OsSpecific` must have this size (5a′ checks it).
 pub const BLOCK_OFFSET: usize = 32;
-pub const BLOCK_SIZE: usize = 192;
+pub const BLOCK_SIZE: usize = 240;
 /// The offset of the TCB in a `Page`: the ABI word and its padding.
 pub const TCB_OFFSET: usize = 16;
 pub const PAGE_SIZE: usize = 4096;
@@ -240,6 +277,13 @@ impl Block {
             policy: AtomicU64::new(0),
             stop_word: AtomicU64::new(0),
             cont_word: AtomicU64::new(0),
+            sched: AtomicU64::new(0),
+            next_sched: AtomicU64::new(0),
+            protect: AtomicU64::new(0),
+            inherited: AtomicU32::new(0),
+            pi_owner: AtomicU32::new(0),
+            pi_level: AtomicU32::new(0),
+            pi_addr: AtomicUsize::new(0),
         }
     }
 }

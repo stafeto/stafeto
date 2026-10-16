@@ -2910,7 +2910,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 13 options claimed, timers 202405",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 17 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
@@ -6018,6 +6018,12 @@ fn ash_dialog() -> Result<(), String> {
             &mut run,
             "kill $!; wait $!; ps -o pid | awk -v p=$! '$1==p' | wc -l",
             &["=0"],
+        )?;
+        // nice sets the nice value, which `ps` shows (/proc/<pid>/stat).
+        dialog_command(
+            &mut run,
+            "nice -n 5 /bin/sleep 100 & sleep 1; ps -o pid,nice | awk -v p=$! '$1==p {print $2}'; kill $!; wait $!",
+            &["=5"],
         )?;
         // The directory of /proc with a slash lists as without, and the
         // directory of a process lists its three files.

@@ -486,6 +486,14 @@ fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
         w.u32(id).expect("process credentials");
     }
 }
+/// The counter ticks a record's process and its waited-for children ran:
+/// what its parent's children's time grows by when it is waited for.
+fn cpu_ticks(record: &Record<Handle<Process>>) -> u64 {
+    record
+        .carried_ticks
+        .saturating_add(sys::process_time(&record.process).unwrap_or(0))
+        .saturating_add(record.children_ticks)
+}
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
@@ -824,6 +832,12 @@ impl Processes {
         if options & WNOWAIT == 0 {
             self.tell(parent, child);
             if matches!(result, WaitResult::Ended { .. }) {
+                // The parent's children's time grows by the child's own and
+                // its waited-for children's (getrusage RUSAGE_CHILDREN).
+                let ticks = self.records.get(child).map_or(0, cpu_ticks);
+                if let Some(p) = self.records.get_mut(parent) {
+                    p.children_ticks = p.children_ticks.saturating_add(ticks);
+                }
                 self.records.reap(child);
                 self.generations.set_groups(child, None);
             } else {
@@ -1399,6 +1413,125 @@ impl Processes {
             Delivery::Done | Delivery::Again => Answer::Status(Status::Ok),
             Delivery::Denied => refuse(proto_process::PERMISSION),
             Delivery::Refused => refuse(proto_process::INVALID),
+        }
+    }
+
+    /// Account of the record in `index` (`account_op`): its children's time,
+    /// and the nice value of the processes `which` and `who` select
+    /// (PRIO_PROCESS with 0 for the caller, PRIO_PGRP with 0 for its group,
+    /// PRIO_USER with 0 for its effective user). A setpriority is for the
+    /// processes of the caller's user (PERMISSION otherwise), and a nice
+    /// value lower than the process had needs the effective user 0
+    /// (ACCESS). O(RECORDS), a record at a time: no wait on anything.
+    fn account(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let Ok(operation) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let caller = self.records.get(index).expect("the caller");
+        match operation {
+            proto_process::account_op::CHILD_TIMES => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let ticks = caller.children_ticks;
+                let w = r.reply();
+                if w.u32(0).and_then(|()| w.u64(ticks)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            proto_process::account_op::NICE_GET | proto_process::account_op::NICE_SET => {
+                let set = operation == proto_process::account_op::NICE_SET;
+                let (Ok(which), Ok(who)) = (body.u32(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let value = if set {
+                    match body.u32() {
+                        Ok(value) => value as i32,
+                        Err(_) => return Answer::Status(Status::BadSize),
+                    }
+                } else {
+                    0
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let (euid, uid, pgid) =
+                    (caller.credentials.euid, caller.credentials.uid, caller.pgid);
+                let who = match (which, who) {
+                    (proto_process::PRIO_PROCESS, 0) => caller.label.pid(),
+                    (proto_process::PRIO_PGRP, 0) => pgid,
+                    (proto_process::PRIO_USER, 0) => euid,
+                    (_, who) => who,
+                };
+                let selected = |record: &Record<Handle<Process>>| match which {
+                    proto_process::PRIO_PROCESS => record.label.pid() == who,
+                    proto_process::PRIO_PGRP => record.pgid == who,
+                    _ => record.credentials.euid == who,
+                };
+                if !matches!(
+                    which,
+                    proto_process::PRIO_PROCESS
+                        | proto_process::PRIO_PGRP
+                        | proto_process::PRIO_USER
+                ) {
+                    return refuse(proto_process::INVALID);
+                }
+                let (mut found, mut changed, mut denied, mut lowered) = (false, 0u32, false, false);
+                let mut least = 20i32;
+                for i in 0..RECORDS {
+                    let Some(record) = self.records.get(i) else {
+                        continue;
+                    };
+                    if record.state == State::Loading || !selected(record) {
+                        continue;
+                    }
+                    found = true;
+                    if !set {
+                        least = least.min(i32::from(record.nice));
+                        continue;
+                    }
+                    // Another user's process is not the caller's to change.
+                    if euid != 0 && record.credentials.euid != euid && record.credentials.uid != uid
+                    {
+                        denied = true;
+                        continue;
+                    }
+                    let new = value.clamp(-20, 19);
+                    if new < i32::from(record.nice) && euid != 0 {
+                        lowered = true;
+                        continue;
+                    }
+                    if let Some(record) = self.records.get_mut(i) {
+                        record.nice = new as i8;
+                        changed += 1;
+                    }
+                }
+                if !found {
+                    return refuse(proto_process::NO_PROCESS);
+                }
+                if set && changed == 0 {
+                    return refuse(if lowered {
+                        proto_process::ACCESS
+                    } else if denied {
+                        proto_process::PERMISSION
+                    } else {
+                        proto_process::NO_PROCESS
+                    });
+                }
+                let w = r.reply();
+                let done = if set {
+                    w.u32(0).and_then(|()| w.u32(changed))
+                } else {
+                    w.u32(0).and_then(|()| w.u32(least as u32))
+                };
+                if done.is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
+            _ => refuse(proto_process::INVALID),
         }
     }
 
@@ -2625,6 +2758,10 @@ impl Processes {
                                 _ => 0,
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
+                            nice: i32::from(record.nice),
+                            ticks: record
+                                .carried_ticks
+                                .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
                             name: record.name,
                         }
                         .write(w)
@@ -2773,6 +2910,10 @@ impl Processes {
             .flatten();
         let record = self.records.get_mut(index).expect("the caller");
         let old = core::mem::replace(&mut record.process, incoming);
+        // The time of the images before this one goes on counting.
+        record.carried_ticks = record
+            .carried_ticks
+            .saturating_add(sys::process_time(&old).unwrap_or(0));
         let ceiling = record.ceiling;
         record.image = image;
         record.committed_loader_ticket = committed_ticket;
@@ -3544,6 +3685,7 @@ impl Service<0> for Processes {
             n if n == Method::ExecAbort as u16 => self.exec_abort(index, r),
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
+            n if n == Method::Account as u16 => self.account(index, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
             n if n == Method::Queue as u16 => self.queue(index, r),
             n if n == Method::Timer as u16 => self.timer(index, r),

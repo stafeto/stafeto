@@ -31,7 +31,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 18;
+pub const PLATFORM_INTERFACE: u64 = 19;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -68,6 +68,7 @@ fn value(result: Result<i64, c_int>) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_init(tcb: *mut c_void) -> c_int {
     posix_abi::relibc::configure(unmap);
+    posix_abi::relibc::configure_cancel(cancelled);
     // SAFETY: the caller's promise.
     match unsafe { posix_abi::threads::attach_installed(tcb.cast(), 1) } {
         Ok(()) => {
@@ -1219,9 +1220,31 @@ pub unsafe extern "C" fn stafeto_futex_wait(addr: *mut u32, val: u32, deadline: 
     // SAFETY: the caller's promise.
     let word = unsafe { &*addr.cast::<AtomicU32>() };
     let deadline = (deadline != u64::MAX).then_some(deadline);
-    match posix_sync::futex_wait(word, val, posix_sync::CLOCK_MONOTONIC, deadline) {
+    let waited = posix_sync::futex_wait(word, val, posix_sync::CLOCK_MONOTONIC, deadline);
+    cancel_if_asynchronous();
+    match waited {
         Ok(_) => 0,
         Err(errno) => -errno,
+    }
+}
+
+unsafe extern "C" {
+    /// relibc's pthread_exit.
+    fn pthread_exit(value: *mut c_void) -> !;
+}
+
+/// What ends a thread that asynchronous cancellation reaches:
+/// pthread_exit(PTHREAD_CANCELED).
+fn cancelled() -> ! {
+    // SAFETY: pthread_exit never returns; PTHREAD_CANCELED is (void *)-1.
+    unsafe { pthread_exit(usize::MAX as *mut c_void) }
+}
+
+/// A wait of the platform that a request of cancellation ended: a thread
+/// with asynchronous cancellation enabled ends here.
+fn cancel_if_asynchronous() {
+    if posix_abi::relibc::async_cancel_due() {
+        posix_abi::relibc::cancel_exit();
     }
 }
 
@@ -1234,6 +1257,165 @@ pub extern "C" fn stafeto_futex_wake(addr: *mut u32, count: u32) -> u32 {
 pub extern "C" fn stafeto_sched_yield() -> c_int {
     let _ = rt::sys::yield_now();
     0
+}
+
+/// getrusage: the time of the process (`who` 0, RUSAGE_SELF), of its
+/// children that were waited for (-1) or of the calling thread (1) in
+/// nanoseconds, or a negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_cpu_ns(who: c_int) -> i64 {
+    let ns = match who {
+        0 => posix_abi::cpu::process_ns(),
+        -1 => call(posix_abi::cpu::children_ns),
+        1 => posix_abi::cpu::thread_ns(),
+        _ => Err(EINVAL),
+    };
+    ns.map_or_else(
+        |errno| -i64::from(errno),
+        |ns| ns.min(i64::MAX as u64) as i64,
+    )
+}
+
+/// pthread_getcpuclockid: the id of the CPU-time clock of thread `tid`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_cpu_clock(tid: c_int) -> c_int {
+    posix_abi::cpu::thread_clock(tid as u64)
+}
+
+/// getpriority: 20 minus the nice value (1 to 40) of the process(es) named
+/// by `which` and `who`, or a negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getpriority(which: c_int, who: u32) -> c_int {
+    call(|| posix_abi::cpu::nice_get(which as u32, who))
+        .map_or_else(|errno| -errno, |nice| 20 - nice)
+}
+
+/// setpriority: `nice` for the process(es) named by `which` and `who`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setpriority(which: c_int, who: u32, nice: c_int) -> c_int {
+    call(|| posix_abi::cpu::nice_set(which as u32, who, nice)).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// sched_get_priority_min (`max` 0) and sched_get_priority_max (`max` 1):
+/// the priority, or a negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sched_priority_range(policy: c_int, max: c_int) -> c_int {
+    posix_abi::sched::priority_range(policy, max != 0).unwrap_or_else(|errno| -errno)
+}
+
+/// sched_getscheduler: the policy of the process, or a negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sched_getscheduler(pid: c_int) -> c_int {
+    call(|| posix_abi::sched::getscheduler(pid)).unwrap_or_else(|errno| -errno)
+}
+
+/// sched_getparam: the priority of the process into `priority`.
+///
+/// # Safety
+/// `priority` points to an int.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_sched_getparam(pid: c_int, priority: *mut c_int) -> c_int {
+    match call(|| posix_abi::sched::getparam(pid)) {
+        Ok(value) => {
+            // SAFETY: the caller's promise.
+            unsafe { priority.write(value) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// sched_setscheduler (a policy) and sched_setparam (a negative policy):
+/// the process's old policy, or a negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sched_set(pid: c_int, policy: c_int, priority: c_int) -> c_int {
+    call(|| posix_abi::sched::set(pid, policy, priority)).unwrap_or_else(|errno| -errno)
+}
+
+/// pthread_getschedparam of the thread `tid`.
+///
+/// # Safety
+/// `policy` and `priority` point to ints.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_thread_sched_get(
+    tid: c_int,
+    policy: *mut c_int,
+    priority: *mut c_int,
+) -> c_int {
+    match posix_abi::sched::thread_get(tid as u64) {
+        Ok((kind, value)) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                policy.write(kind);
+                priority.write(value);
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// pthread_setschedparam (`tail` 1) and pthread_setschedprio (`tail` 0,
+/// a negative policy) of the thread `tid`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_sched_set(
+    tid: c_int,
+    policy: c_int,
+    priority: c_int,
+    tail: c_int,
+) -> c_int {
+    posix_abi::sched::thread_set(tid as u64, policy, priority, tail != 0)
+        .map_or_else(|errno| -errno, |_| 0)
+}
+
+/// The policy and priority of the thread the caller makes next
+/// (PTHREAD_EXPLICIT_SCHED); a negative policy forgets them.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_next_sched(policy: c_int, priority: c_int) -> c_int {
+    posix_abi::sched::next_sched(policy, priority).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// futex_wait for a mutex of PTHREAD_PRIO_INHERIT that the thread `owner`
+/// holds.
+///
+/// # Safety
+/// `addr` is a live aligned word of the process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_futex_wait_pi(
+    addr: *mut u32,
+    val: u32,
+    deadline: u64,
+    owner: u32,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let word = unsafe { &*addr.cast::<AtomicU32>() };
+    let deadline = (deadline != u64::MAX).then_some(deadline);
+    let waited =
+        posix_abi::sched::futex_wait_pi(word, val, posix_sync::CLOCK_MONOTONIC, deadline, owner);
+    cancel_if_asynchronous();
+    match waited {
+        Ok(_) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+/// The unlock of a mutex of PTHREAD_PRIO_INHERIT: the waiters' levels go
+/// off the caller, then up to `count` wake.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_futex_wake_pi(addr: *mut u32, count: u32) -> u32 {
+    posix_abi::sched::futex_wake_pi(addr.cast::<AtomicU32>(), count)
+}
+
+/// The caller takes a mutex of PTHREAD_PRIO_PROTECT of ceiling `priority`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_protect_enter(priority: c_int) -> c_int {
+    posix_abi::sched::protect_enter(priority).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// The caller let a mutex of PTHREAD_PRIO_PROTECT of ceiling `priority` go.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_protect_leave(priority: c_int) {
+    posix_abi::sched::protect_leave(priority);
 }
 
 /// # Safety
