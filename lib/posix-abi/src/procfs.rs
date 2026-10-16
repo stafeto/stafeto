@@ -12,6 +12,12 @@
 //! listing of `/proc` (`getdents`) names the live PIDs, and `stat` of
 //! `/proc/<pid>` gives the directory of a process, owned by its effective
 //! user. A path to open for writing, or to create, is EROFS.
+//!
+//! `/proc/mounts` lists the mounted file systems in the shape Linux gives
+//! them (`getmntent` reads it, for `df`). A path reaches `/proc` by its
+//! absolute form: the current directory and the dots and slashes of the
+//! path are applied first (`absolute`), so `./proc/1` from `/` and
+//! `/etc/../proc/1` name the same node as `/proc/1`.
 
 use crate::constants::{
     EINVAL, EIO, EMFILE, ENOENT, O_ACCMODE, O_CLOEXEC, O_CLOFORK, O_CREAT, O_DIRECTORY, O_TRUNC,
@@ -36,6 +42,8 @@ enum Node {
     File(u32, File),
     /// `/proc/uptime`.
     Uptime,
+    /// `/proc/mounts`.
+    Mounts,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +61,9 @@ fn parse(path: &[u8]) -> Option<Node> {
     let rest = rest.strip_suffix(b"/").unwrap_or(rest);
     if rest == b"uptime" {
         return Some(Node::Uptime);
+    }
+    if rest == b"mounts" {
+        return Some(Node::Mounts);
     }
     let (number, tail) = match rest.iter().position(|&b| b == b'/') {
         Some(at) => (&rest[..at], Some(&rest[at + 1..])),
@@ -75,6 +86,42 @@ fn parse(path: &[u8]) -> Option<Node> {
 /// slash at its end: the image's directory serves those).
 pub fn is_under(path: &[u8]) -> bool {
     path.len() > b"/proc/".len() && path.starts_with(b"/proc/")
+}
+
+/// A path in its absolute form: made against the current directory, then
+/// simplified (`posix_path::simplify`).
+pub struct Absolute {
+    bytes: [u8; crate::names::MAX_PATH + 1],
+    length: usize,
+}
+
+impl Absolute {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+
+    /// Whether the path names a node under `/proc`.
+    pub fn is_under(&self) -> bool {
+        is_under(self.bytes())
+    }
+
+    /// Whether the path is the directory `/proc` itself.
+    pub fn is_proc(&self) -> bool {
+        matches!(self.bytes(), b"/proc" | b"/proc/")
+    }
+}
+
+/// The absolute form of `path`, if it can be made (an empty path, a path
+/// too long or one with a NUL byte has none: the file service answers it).
+pub fn absolute(path: &[u8]) -> Option<Absolute> {
+    let resolved =
+        crate::shared::with_files(|files| files.resolve(path).map_err(crate::error)).ok()?;
+    let mut out = Absolute {
+        bytes: [0; crate::names::MAX_PATH + 1],
+        length: 0,
+    };
+    out.length = posix_path::simplify(resolved.as_bytes(), &mut out.bytes);
+    Some(out)
 }
 
 /// The process `pid` in the service's table: its record is `pid % RECORDS`,
@@ -226,6 +273,10 @@ fn content(node: &Node) -> Result<Text, i32> {
                 }
             }
         }
+        Node::Mounts => {
+            // The root of the image is the file service's; /proc is this.
+            let _ = write!(text, "ramfs / ramfs rw 0 0\nproc /proc proc ro 0 0\n");
+        }
         Node::Process(_) => return Err(EINVAL),
     }
     Ok(text)
@@ -366,6 +417,7 @@ pub fn stat(path: &[u8]) -> Result<NodeInfo, i32> {
             )
         }
         Node::Uptime => (2, 0o444, 0, 0, 1),
+        Node::Mounts => (2, 0o444, 0, 0, 3),
     };
     let now = Timestamp::ZERO;
     Ok(NodeInfo {
@@ -407,28 +459,30 @@ pub fn is_directory(info: &NodeInfo) -> bool {
 }
 
 /// The entries of the listing of `/proc` in Linux's dirent64 records from
-/// `position` (the number of entries taken before): ".", "..", "uptime" and
-/// the live PIDs; for the directory of a process (`pid`), ".", ".." and its
-/// three files.
+/// `position`: ".", "..", "uptime", "mounts" and the live PIDs in ascending
+/// order; for the directory of a process (`pid`), ".", ".." and its three
+/// files. The offset after a PID is its number plus 4 (the fixed entries have
+/// 1 to 4), so a listing that goes on in several calls, while processes
+/// start and end, takes each process that lives throughout once.
 pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize, i32> {
+    /// The entries before the PIDs of `/proc`.
+    const FIXED: u64 = 4;
     let mut list = [0u32; PROCESSES];
     let count = match pid {
         Some(_) => 0,
         None => pids(&mut list)?,
     };
-    let total = match pid {
-        Some(_) => 5,
-        None => 3 + count,
-    };
-    let at = core::cell::Cell::new(usize::try_from(position).map_err(|_| EINVAL)?);
+    list[..count].sort_unstable();
+    let list = &list[..count];
+    let at = core::cell::Cell::new(position);
     posix_change::dirent::fill(
         out,
         |name| {
             let here = at.get();
-            if here >= total {
-                return Ok(None);
-            }
-            let (len, kind, inode) = if let Some(pid) = pid {
+            let (len, kind, inode, after) = if let Some(pid) = pid {
+                if here >= 5 {
+                    return Ok(None);
+                }
                 let (text, kind, inode): (&[u8], u8, u64) = match here {
                     0 => (b".", 4, u64::from(pid) << 4),
                     1 => (b"..", 4, 2),
@@ -442,18 +496,23 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
                     }
                 };
                 name[..text.len()].copy_from_slice(text);
-                (text.len(), kind, inode)
-            } else if here < 3 {
+                (text.len(), kind, inode, here + 1)
+            } else if here < FIXED {
                 let (text, kind, inode): (&[u8], u8, u64) = match here {
                     0 => (b".", 4, 2),
                     1 => (b"..", 4, 2),
-                    _ => (b"uptime", 8, 1),
+                    2 => (b"uptime", 8, 1),
+                    _ => (b"mounts", 8, 3),
                 };
                 name[..text.len()].copy_from_slice(text);
-                (text.len(), kind, inode)
+                (text.len(), kind, inode, here + 1)
             } else {
+                // The first process after the offset.
+                let Some(&number) = list.iter().find(|&&p| u64::from(p) + FIXED > here) else {
+                    return Ok(None);
+                };
                 let mut digits = [0u8; 10];
-                let mut n = list[here - 3];
+                let mut n = number;
                 let mut start = digits.len();
                 loop {
                     start -= 1;
@@ -465,20 +524,20 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
                 }
                 let len = digits.len() - start;
                 name[..len].copy_from_slice(&digits[start..]);
-                (len, 4, u64::from(list[here - 3]) << 4)
+                (len, 4, u64::from(number) << 4, u64::from(number) + FIXED)
             };
             let item = posix_change::dirent::Item {
                 inode,
                 kind,
                 name_len: len,
                 before: here as i64,
-                after: here as i64 + 1,
+                after: after as i64,
             };
-            at.set(here + 1);
+            at.set(after);
             Ok(Some(item))
         },
         |offset| {
-            at.set(offset as usize);
+            at.set(u64::try_from(offset).map_err(|_| EINVAL)?);
             Ok(())
         },
     )

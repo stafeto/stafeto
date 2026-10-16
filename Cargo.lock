@@ -213,6 +213,7 @@ dependencies = [
  "posix-heap",
  "posix-map",
  "posix-order",
+ "posix-path",
  "posix-random",
  "posix-request",
  "posix-signals",

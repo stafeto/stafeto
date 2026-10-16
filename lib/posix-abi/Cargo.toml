@@ -46,6 +46,7 @@ rt = { path = "../rt" }
 posix-heap = { path = "../posix-heap" }
 posix-map = { path = "../posix-map" }
 posix-order = { path = "../posix-order" }
+posix-path = { path = "../posix-path" }
 posix-request = { path = "../posix-request" }
 proto-wire = { path = "../../proto/wire" }
 proto-uart = { path = "../../proto/uart" }
