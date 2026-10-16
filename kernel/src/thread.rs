@@ -815,9 +815,7 @@ pub fn run(next: NonNull<Thread>) -> ! {
             thread.long.is_some(),
         ) {
             thread.regs.elr = entry;
-            if let Some(top) = thread.upcall.alternate_sp() {
-                thread.regs.sp = top;
-            }
+            thread.regs.sp = thread.upcall.entry_sp(thread.regs.sp);
             // The dispatcher starts a new control flow and leaves the
             // interrupted indirect branch unfinished. Return restores the old BTYPE.
             thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;

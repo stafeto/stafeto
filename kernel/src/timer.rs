@@ -276,6 +276,7 @@ pub fn first() -> Option<u64> {
 
 /// The nearest deadline during the scheduler's decision, on the single
 /// core with interrupts masked and no timer update in progress.
+#[cfg(not(feature = "locked-decide"))]
 pub fn first_for_decide() -> Option<u64> {
     // SAFETY: as above; the exit loop is between kernel operations.
     unsafe { (*TIMERS.as_ptr()).levels.nearest() }

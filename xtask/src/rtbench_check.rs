@@ -13,8 +13,13 @@
 //! commit. The rules, on each machine:
 //!
 //! - at least `MIN_SESSIONS` sessions, alternating in order;
-//! - the three rows `s5_*`: p50 of the head at most `S5_P50_MAX_NS` in every
-//!   session; the median over the sessions of the difference of the p99s
+//! - the three rows `s5_*`, the p50 in ticks of the counter (the file keeps
+//!   nanoseconds, and a cell of the histogram is a whole number of ticks):
+//!   p50 of the head at most `S5_P50_MAX_TICKS` in every session, which holds
+//!   the drift of the base between epochs, and the median over the sessions
+//!   of the difference of the p50s (head minus base of the same session) at
+//!   most `S5_P50_DELTA_MAX_TICKS`, which catches the growth from one
+//!   change; the median over the sessions of the difference of the p99s
 //!   (head minus base of the same session) at most `P99_SLACK_NS`, two ticks
 //!   of the counter;
 //! - the two rows `s10_*`: the median over the sessions of the ratio of the
@@ -39,9 +44,16 @@ use std::path::Path;
 
 /// The sessions a machine needs before its comparison counts.
 pub const MIN_SESSIONS: usize = 4;
-/// The most the p50 of the path of `pthread_kill` may have, in nanoseconds: the
-/// p50 of the base commit with room, from the acceptance of epoch 2.
-pub const S5_P50_MAX_NS: u64 = 543;
+/// The most the p50 of the path of `pthread_kill` may have, in ticks of the
+/// counter: the median p50 of the base is 13 ticks, and 10 % over it is 14.3,
+/// whole 14 (583 ns, the cell 591). A tick is the unit of the measure (the
+/// difference of two reads of the counter, one tick either way); the
+/// histogram cell [528, 543] holds exactly 13 ticks, so a limit in
+/// nanoseconds sat inside the noise of the base.
+pub const S5_P50_MAX_TICKS: u64 = 14;
+/// The most the median over the sessions of the p50 of the head minus the
+/// p50 of the base of the same session may be, in ticks (7.7 % of 13).
+pub const S5_P50_DELTA_MAX_TICKS: i64 = 1;
 /// Two ticks of the counter (83 ns at 24 MHz): the most the median of the
 /// differences of the p99 may be.
 pub const P99_SLACK_NS: u64 = 83;
@@ -68,10 +80,17 @@ struct Figures {
     p99: u64,
 }
 
+/// A time in nanoseconds as whole ticks of a counter of `hz`.
+fn ticks(ns: u64, hz: u64) -> i64 {
+    ((u128::from(ns) * u128::from(hz) + 500_000_000) / 1_000_000_000) as i64
+}
+
 #[derive(Debug)]
 struct Measured {
     commit: String,
     seconds: u64,
+    /// The frequency of the counter, from the line `counter N Hz`.
+    hz: u64,
     /// The host's uptime at the start of the run, in minutes.
     before: u64,
     rows: BTreeMap<String, Figures>,
@@ -111,6 +130,7 @@ fn uptime_minutes(line: &str) -> Option<u64> {
 fn parse_file(text: &str) -> Result<Measured, String> {
     let mut commit = None;
     let mut seconds = None;
+    let mut hz = None;
     let mut before = None;
     let mut rows = BTreeMap::new();
     for line in text.lines() {
@@ -123,6 +143,10 @@ fn parse_file(text: &str) -> Result<Measured, String> {
                 .split(',')
                 .next()
                 .and_then(|s| s.trim().parse::<u64>().ok());
+            hz = rest
+                .split_once("counter ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(|word| word.parse::<u64>().ok());
         } else if let Some((left, _)) = line.split_once(" | ") {
             let words: Vec<_> = left.split_whitespace().collect();
             // name n min p50 p99 max calls
@@ -136,6 +160,7 @@ fn parse_file(text: &str) -> Result<Measured, String> {
     Ok(Measured {
         commit: commit.ok_or("no commit line")?,
         seconds: seconds.ok_or("no seconds line")?,
+        hz: hz.filter(|hz| *hz > 0).ok_or("no counter frequency")?,
         before: before.ok_or("no uptime before line")?,
         rows,
     })
@@ -290,21 +315,31 @@ fn compare(
     let mut over = Vec::new();
     for name in S5_ROWS {
         let mut head_p50 = Vec::new();
+        let mut p50_deltas = Vec::new();
         let mut deltas = Vec::new();
         for (base, head) in &pairs {
             let (b, h) = (row(base, name, "base")?, row(head, name, "head")?);
-            head_p50.push(h.p50 as i64);
+            let head_ticks = ticks(h.p50, head.hz);
+            head_p50.push(head_ticks);
+            p50_deltas.push(head_ticks - ticks(b.p50, base.hz));
             deltas.push(h.p99 as i64 - b.p99 as i64);
         }
         let median = median_x2(&deltas);
+        let p50_median = median_x2(&p50_deltas);
         let mut broken = Vec::new();
         for (i, p50) in head_p50.iter().enumerate() {
-            if *p50 > S5_P50_MAX_NS as i64 {
+            if *p50 > S5_P50_MAX_TICKS as i64 {
                 broken.push(format!(
-                    "p50 {p50} over {S5_P50_MAX_NS} in session {}",
+                    "p50 {p50} ticks over {S5_P50_MAX_TICKS} in session {}",
                     i + 1
                 ));
             }
+        }
+        if p50_median > 2 * S5_P50_DELTA_MAX_TICKS {
+            broken.push(format!(
+                "median p50 difference {} ticks over {S5_P50_DELTA_MAX_TICKS}",
+                show_x2(p50_median)
+            ));
         }
         if median > 2 * P99_SLACK_NS as i64 {
             broken.push(format!(
@@ -316,8 +351,10 @@ fn compare(
             over.push(format!("{machine} {name}: {}", broken.join(", ")));
         }
         table += &format!(
-            "{name:<28} head p50 {}  p99 head minus base [{}] median {}  limit: p50 <= {S5_P50_MAX_NS}, median <= {P99_SLACK_NS}\n",
+            "{name:<28} head p50 {} ticks, minus base [{}] median {}  p99 head minus base [{}] median {}  limit: p50 <= {S5_P50_MAX_TICKS}, p50 median <= {S5_P50_DELTA_MAX_TICKS}, p99 median <= {P99_SLACK_NS}\n",
             list(&head_p50).replace('+', ""),
+            list(&p50_deltas),
+            show_x2(p50_median),
             list(&deltas),
             show_x2(median)
         );
@@ -474,7 +511,7 @@ mod tests {
         file(
             "4f3c7d0",
             600,
-            [(503, 1000), (503, 800), (423, 700)],
+            [(503, 1000), (503, 800), (503, 700)],
             [(1983, 7000), (1695, 7000)],
         )
     }
@@ -669,6 +706,28 @@ mod tests {
         );
     }
 
+    /// The p50 takes the values of the cells 463, 503, 543, 591, 639 (11 to
+    /// 15 ticks): 591 is 14 ticks and within the limit in any session, 639
+    /// is over; one session a tick above the base leaves the median in.
+    #[test]
+    fn the_p50_is_judged_in_ticks_of_the_counter() {
+        assert_eq!(ticks(463, 24_000_000), 11);
+        assert_eq!(ticks(503, 24_000_000), 12);
+        assert_eq!(ticks(543, 24_000_000), 13);
+        assert_eq!(ticks(591, 24_000_000), 14);
+        assert_eq!(ticks(639, 24_000_000), 15);
+        let heads = [
+            head([0, 0, 0], 591, 100),
+            head([0, 0, 0], 503, 100),
+            head([0, 0, 0], 543, 100),
+            head([0, 0, 0], 503, 100),
+        ];
+        check(&heads).unwrap();
+        // A file without the frequency of the counter has no ticks.
+        let broken = timed(&base(), 100).replace("counter 24000000 Hz", "counter ? Hz");
+        assert!(parse_file(&broken).unwrap_err().contains("frequency"));
+    }
+
     #[test]
     fn the_uptime_lines_of_the_host_parse() {
         let at = |line| uptime_minutes(line);
@@ -692,11 +751,21 @@ mod tests {
                 "p50 of s5 in one session",
                 [
                     head([0, 0, 0], 503, 100),
-                    head([0, 0, 0], 544, 100),
+                    head([0, 0, 0], 639, 100),
                     head([0, 0, 0], 503, 100),
                     head([0, 0, 0], 503, 100),
                 ],
-                "s5_kill_sleeping: p50 544 over 543 in session 2",
+                "s5_kill_sleeping: p50 15 ticks over 14 in session 2",
+            ),
+            (
+                "median p50 of s5 against the base",
+                [
+                    head([0, 0, 0], 591, 100),
+                    head([0, 0, 0], 591, 100),
+                    head([0, 0, 0], 591, 100),
+                    head([0, 0, 0], 503, 100),
+                ],
+                "s5_kill_busy_25: median p50 difference 2 ticks over 1",
             ),
             (
                 "p99 of s5",
@@ -760,7 +829,8 @@ mod tests {
     /// The limits are the numbers of the acceptance.
     #[test]
     fn the_limits_are_those_of_the_acceptance() {
-        assert_eq!(S5_P50_MAX_NS, 543);
+        assert_eq!(S5_P50_MAX_TICKS, 14);
+        assert_eq!(S5_P50_DELTA_MAX_TICKS, 1);
         assert_eq!(P99_SLACK_NS, 83);
         assert_eq!(S10_P50_PERCENT, 110);
         assert_eq!(MIN_SESSIONS, 4);

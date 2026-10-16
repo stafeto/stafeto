@@ -199,6 +199,7 @@ pub fn top() -> Option<u8> {
 /// The top level during the scheduler's decision. No kernel operation
 /// can change the queue between this read and the scheduler's lock on
 /// the single core with interrupts masked.
+#[cfg(not(feature = "locked-decide"))]
 pub fn top_for_decide() -> Option<u8> {
     // SAFETY: exit_loop calls this with interrupts masked and no cleanup
     // or call active on the single core.

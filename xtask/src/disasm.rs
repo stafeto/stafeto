@@ -4,7 +4,8 @@
 //! Checks on the disassembly of built ELF files: direct memory-helper
 //! calls in the shipping kernel's hot paths, the instruction pairs of
 //! Cortex-A53 erratum 835769, and the instruction sequences of erratum
-//! 843419.
+//! 843419. Also the places that read the virtual counter, which the
+//! PinePhone's A64 needs a workaround at (`counter_read_sites`).
 
 use std::path::Path;
 use std::process::Command;
@@ -240,6 +241,111 @@ pub fn erratum_835769(elf: &Path, objdump: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The number of lines of `text` that read the virtual counter
+/// (`mrs <register>, cntvct_el0`, in Rust, C or assembly), comments left out.
+fn counter_reads(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim_start().to_ascii_lowercase();
+            !(line.starts_with("//") || line.starts_with('*') || line.starts_with("/*"))
+                && line.contains("mrs")
+                && line.contains("cntvct_el0")
+        })
+        .count()
+}
+
+/// The source files under `dir` with reads of the virtual counter, and the
+/// number of reads in each, as paths relative to `root`.
+fn counter_read_sites_in(
+    root: &Path,
+    dir: &Path,
+    found: &mut Vec<(String, usize)>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "target") {
+                continue;
+            }
+            counter_read_sites_in(root, &path, found)?;
+        } else if path
+            .extension()
+            .is_some_and(|ext| ["rs", "S", "c", "h"].iter().any(|e| ext == *e))
+        {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let reads = counter_reads(&text);
+            if reads > 0 {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                found.push((relative.display().to_string(), reads));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every source file of the repository with `mrs ..., cntvct_el0`, sorted,
+/// with its number of reads. On the PinePhone's A64 a read of the counter
+/// may return a wrong value (erratum Allwinner "unknown1", [G30]), and the
+/// workaround has to stand at each place that reads it: one place in the
+/// kernel (`timer::now`) and the user-space reads of `rt` and `posix-abi`.
+/// A new place is a new place to patch, so it is listed by hand in
+/// `COUNTER_READ_SITES` or the check fails.
+pub fn counter_read_sites(root: &Path) -> Result<Vec<(String, usize)>, String> {
+    let mut found = Vec::new();
+    for top in [
+        "kernel", "kcore", "lib", "services", "apps", "proto", "tests",
+    ] {
+        let dir = root.join(top);
+        if dir.is_dir() {
+            counter_read_sites_in(root, &dir, &mut found)?;
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The places allowed to read the counter, with the number of reads in each.
+/// The shipping code: the kernel's `timer::now` and the three reads of
+/// user space. The rest are tests and benchmarks that time themselves.
+pub const COUNTER_READ_SITES: [(&str, usize); 8] = [
+    ("kernel/src/arch/aarch64/timer.rs", 1),
+    ("kernel/src/ktest.rs", 2),
+    ("kernel/src/ktest/el0.S", 8),
+    ("lib/posix-abi/src/signals.rs", 1),
+    ("lib/rt/src/sys.rs", 1),
+    ("lib/rt/src/time.rs", 1),
+    ("tests/init/src/main.rs", 2),
+    ("tests/rtbench-posix/rtbench.c", 2),
+];
+
+/// Fails when a source file outside `COUNTER_READ_SITES` reads the counter,
+/// or one of them reads it a different number of times.
+pub fn check_counter_read_sites(root: &Path) -> Result<(), String> {
+    let found = counter_read_sites(root)?;
+    let allowed: Vec<(String, usize)> = COUNTER_READ_SITES
+        .iter()
+        .map(|(path, n)| ((*path).to_owned(), *n))
+        .collect();
+    if found == allowed {
+        return Ok(());
+    }
+    let describe = |sites: &[(String, usize)]| {
+        sites
+            .iter()
+            .map(|(path, n)| format!("{path} ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(format!(
+        "reads of cntvct_el0 are at:\n  {}\nthe allowed places are:\n  {}\nA new read of the counter needs the A64 workaround; add the place to COUNTER_READ_SITES in xtask/src/disasm.rs with it",
+        describe(&found),
+        describe(&allowed)
+    ))
+}
+
 /// The loadable, executable segments of the ELF64 little-endian file
 /// `bytes`: (virtual address, contents).
 fn executable_segments(bytes: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
@@ -445,6 +551,32 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn counts_the_reads_of_the_counter_and_not_comments() {
+        let text = "// mrs x0, cntvct_el0\n    mrs     x0, CNTVCT_EL0\n\"isb\", \"mrs {}, cntvct_el0\"\n/// the CNTVCT_EL0 counter\n    mrs x1, cntfrq_el0\n";
+        assert_eq!(super::counter_reads(text), 2);
+    }
+
+    #[test]
+    fn the_reads_of_the_counter_are_at_the_listed_places() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        super::check_counter_read_sites(&root).unwrap();
+    }
+
+    #[test]
+    fn a_read_of_the_counter_at_a_new_place_is_found() {
+        let dir = std::env::temp_dir().join(format!("counter-sites-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("kernel/src")).unwrap();
+        std::fs::write(
+            dir.join("kernel/src/sched.rs"),
+            "fn f() { asm!(\"mrs {}, cntvct_el0\") }\n",
+        )
+        .unwrap();
+        let error = super::check_counter_read_sites(&dir).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(error.contains("kernel/src/sched.rs (1)"), "{error}");
+    }
 
     #[test]
     fn finds_an_access_followed_by_a_64_bit_multiply_accumulate() {

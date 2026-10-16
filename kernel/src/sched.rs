@@ -92,7 +92,7 @@ pub fn entry_polled() {
     // SAFETY: single core with interrupts masked, as above.
     let timing = unsafe { &mut *ENTRY_TIMING.0.get() };
     if timing.0 != 0 {
-        let elapsed = timer::now().wrapping_sub(timing.0);
+        let elapsed = timer::now().saturating_sub(timing.0);
         timing.1 = timing.1.max(elapsed);
         timing.0 = 0;
     }

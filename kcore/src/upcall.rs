@@ -50,8 +50,12 @@ pub fn validate_context(
     buffer: u64,
     expected: u64,
 ) -> Result<(), Error> {
-    crate::args::check_start(pc, sp, 1)?;
-    if flags & !(allowed & USER_PSTATE) != 0 || buffer != expected {
+    // The stack pointer of the interrupted code is restored as it was, even
+    // when it is not a multiple of 16: the processor checks the alignment of
+    // SP only at an access through it, and the entry ran on the pointer
+    // aligned down (`State::entry_sp`).
+    crate::args::check_start(pc, 0, 1)?;
+    if sp > USER_END as u64 || flags & !(allowed & USER_PSTATE) != 0 || buffer != expected {
         return Err(Error::InvalidArgs);
     }
     Ok(())
@@ -348,6 +352,16 @@ impl State {
             None
         }
     }
+    /// The stack pointer the entry just prepared starts with: the top of the
+    /// alternate stack when it must start there, else the interrupted
+    /// pointer `sp` aligned down to 16 (the entry's first `stp` through an
+    /// unaligned SP would fault with the entry shut, and a return requires
+    /// the aligned pointer of a call frame). The interrupted pointer itself
+    /// stays in the state for `Take` and is restored by the return.
+    #[inline(always)]
+    pub fn entry_sp(&self, sp: u64) -> u64 {
+        self.alternate_sp().unwrap_or(sp & !15)
+    }
     /// A request deferred by an internal borrow must not strand a new wait.
     pub fn interrupt_wait(&self) -> bool {
         self.deferred != 0 && self.pending && !self.masked
@@ -390,9 +404,12 @@ mod tests {
                 Err(Error::InvalidArgs)
             );
         }
-        for (pc, sp) in [(0x1002, 0x2000), (1 << 63, 0x2000), (0x1000, 0x2008)] {
+        for (pc, sp) in [(0x1002, 0x2000), (1 << 63, 0x2000), (0x1000, 1 << 63)] {
             assert_eq!(check(pc, sp, 0, 0x3000), Err(Error::InvalidArgs));
         }
+        // An unaligned pointer inside the lower half comes back as it was.
+        assert_eq!(check(0x1000, 0x2008, 0, 0x3000), Ok(()));
+        assert_eq!(check(0x1000, 0x2001, 0, 0x3000), Ok(()));
         assert_eq!(check(0x1000, 0x2000, 0, 0x4000), Err(Error::InvalidArgs));
     }
     #[test]
@@ -776,6 +793,23 @@ mod tests {
             assert_eq!(state.control(TAKE, 0, 0).unwrap().values()[3], sp);
             state.control(MASK, 0, 0).unwrap();
             state.returned().unwrap();
+        }
+    }
+    /// An interrupted pointer that is not a multiple of 16 (a fault of code
+    /// that has not aligned SP, with no alternate stack) starts the entry on
+    /// the pointer aligned down and is given back unchanged by `Take`.
+    #[test]
+    fn an_unaligned_interrupted_pointer_starts_the_entry_aligned() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(ENABLE, 0, 0).unwrap();
+        state.request().unwrap();
+        state.prepare(0x2000, 0, 0x7fff8, false).unwrap();
+        assert_eq!(state.entry_sp(0x7fff8), 0x7fff0);
+        assert_eq!(state.control(TAKE, 0, 0).unwrap().values()[3], 0x7fff8);
+        for sp in [0x7fff0, 0x7ffff, 0x7fff1, 0, 15] {
+            assert_eq!(state.entry_sp(sp) % 16, 0, "sp {sp:#x}");
+            assert!(state.entry_sp(sp) <= sp);
         }
     }
     /// Space for the state of the entry in a thread: 80 bytes since the fault

@@ -3,8 +3,13 @@
 
 //! Process suspension at the last decision before EL0 (spec 7.7).
 
-use super::*;
-use crate::sched::Locked;
+use super::{Process, Stage, release, retain};
+use crate::cleanup;
+use crate::object::Object;
+use crate::sched::{self, Locked};
+use crate::thread::Thread;
+use abi::Error;
+use core::ptr::NonNull;
 
 /// Set suspension in O(1). Continuation uses the existing cleanup item,
 /// retaining the process until its last portion or cancellation.

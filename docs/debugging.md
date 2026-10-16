@@ -159,7 +159,10 @@ xtask places the ELF next to the image: `target/stafeto.elf` for a normal
 build, `target/stafeto-ktest.elf` for a build with kernel tests,
 `target/stafeto-ktest-icount.elf` for a build with kernel tests under
 `-icount` (adds to the regular kernel tests the ones that need
-instruction-counted time), and `target/stafeto-probe.elf` and
+instruction-counted time), `target/stafeto-ktest-el0.elf` and
+`target/stafeto-ktest-icount-el0.elf` for the second image of each of those,
+which holds the EL0 tests (the kernel tests run in two images to stay under
+the size a test image may have), and `target/stafeto-probe.elf` and
 `target/stafeto-overflow.elf` for the fault probes (unknown instruction
 and stack overflow) from `cargo xtask test`. The right file is named by
 the `backtrace (look up: ...)` line itself in the panic output. With

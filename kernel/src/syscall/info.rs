@@ -21,30 +21,39 @@ const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): each kind has a
 /// function of its own, which checks x2 first (INVALID_ARGS) and then the
-/// handle; an unknown kind is INVALID_ARGS. For a process handle with any
-/// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
-/// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
-/// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
-/// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
-/// MEMORY takes a memory object's handle, a device window's too, with any
-/// rights and returns abi::MemoryInfo in x1-x3; THREAD_STATE a thread's and
-/// returns abi::ThreadInfo in x1-x4; CHANNEL a channel's, a labelled copy
-/// too, and returns abi::ChannelInfo in x1-x4; IRQ an interrupt binding's
-/// and returns abi::IrqInfo in x1-x3. LABEL takes a labelled copy of a
-/// channel and in x2 a handle of that channel with RECEIVE, and returns the
-/// copy's label in x1, O(1): ACCESS_DENIED for a copy of another channel,
-/// WRONG_TYPE for a channel handle without a label (the lookup of x2 comes
-/// first). SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
+/// handle; an unknown kind is INVALID_ARGS.
+///
+/// For a process handle with any rights: PROCESS_STATE returns
+/// abi::ProcessState::to_words in x1-x4, PROCESS_MEMORY the quota
+/// (abi::ProcessMemory) and PROCESS_HANDLES the table (abi::ProcessHandles)
+/// in x1-x3, and PROCESS_TIME in x1 the counter ticks the process's threads
+/// have run.
+///
+/// KERNEL_STATS takes the system resource with KSTATS and returns
+/// abi::KernelStats in x1-x8 (spec 16). MEMORY takes a memory object's
+/// handle, a device window's too, with any rights and returns
+/// abi::MemoryInfo in x1-x3. THREAD_STATE takes a thread's handle and
+/// returns abi::ThreadInfo in x1-x4 and the ticks the thread has run in x5.
+/// CHANNEL takes a channel's handle, a labelled copy too, and returns
+/// abi::ChannelInfo in x1-x4; IRQ an interrupt binding's and returns
+/// abi::IrqInfo in x1-x3.
+///
+/// LABEL takes a labelled copy of a channel and in x2 a handle of that
+/// channel with RECEIVE, and returns the copy's label in x1, O(1):
+/// ACCESS_DENIED for a copy of another channel, WRONG_TYPE for a channel
+/// handle without a label (the lookup of x2 comes first).
+///
+/// SELF_THREAD requires x0 zero and x2 a subset of MANAGE | DUPLICATE |
 /// TRANSFER, the rights the creator of a thread gets from thread_create,
-/// returning a new owned handle of those rights to the actual caller. Its
+/// and returns a new owned handle of those rights to the actual caller. Its
 /// handle-table insertion is paid by that process; failure retains no new
-/// reference. THREAD_CURRENT requires x2
-/// zero and compares the supplied Thread object with the caller, returning
-/// only bool 0/1. Both preserve registers outside their one-word result.
-/// LOG takes the system resource with
-/// KSTATS, takes up to abi::LOG_BATCH records of the kernel log into the
-/// start of the caller's message buffer and returns abi::LogBatch in
-/// x1-x3 (spec 16.3, crate::log::take).
+/// reference. THREAD_CURRENT requires x2 zero and compares the supplied
+/// Thread object with the caller, returning only bool 0/1. Both preserve
+/// registers outside their one-word result.
+///
+/// LOG takes the system resource with KSTATS, takes up to abi::LOG_BATCH
+/// records of the kernel log into the start of the caller's message buffer
+/// and returns abi::LogBatch in x1-x3 (spec 16.3, crate::log::take).
 pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     match a[1] {
         abi::INFO_PROCESS_STATE => process_state(thread, a),

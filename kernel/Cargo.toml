@@ -21,6 +21,8 @@ kcore = { path = "../kcore" }
 ktest = []
 # The kernel tests with those that need `-icount` added (ktest::el0).
 icount = ["ktest", "measure"]
+# The second image of the kernel tests: the EL0 tests alone (ktest::EL0_HALF).
+el0-half = ["ktest"]
 fault-probe = []
 overflow-probe = []
 measure = []
