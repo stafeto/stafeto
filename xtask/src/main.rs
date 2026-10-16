@@ -771,7 +771,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 13] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 14] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -1981,6 +1981,7 @@ fn write_elf_image(
     if let Some((licence, source)) = &bash_files {
         list.push((BASH_LICENSE, licence.as_slice()));
         list.push((BASH_SOURCE, source.as_bytes()));
+    }
     // An image with htop (GPL-2.0-or-later) carries its licence and where the
     // exact source is.
     let htop_files = if sources
