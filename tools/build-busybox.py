@@ -89,7 +89,8 @@ BASE_OBJECTS = (
     # nc: connections over the loopback of the socket service (Ф9).
     "xconnect.o", "inet_common.o", "executable.o", "bb_do_delay.o",
     # The line editor of ash.
-    "lineedit.o", "lineedit_ptr_hack.o", "read_key.o",
+    "lineedit.o", "lineedit_ptr_hack.o", "read_key.o", "safe_gethostname.o",
+    "bb_qsort.o", "xrealloc_vector.o",
 )
 
 # The directories BusyBox's archives come from; build.rs links each.

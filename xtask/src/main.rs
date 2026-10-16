@@ -6265,8 +6265,8 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
-        run.send("exit")?;
-        run.expect("exit", DIALOG_STEP)?;
+        // Ctrl-D on an empty line ends the shell.
+        run.type_raw(b"\x04")?;
         run.expect(
             "init: busybox-probe ended: exit code 0, not restarted",
             DIALOG_STEP,
