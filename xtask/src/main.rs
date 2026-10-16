@@ -5789,10 +5789,10 @@ fn ash_dialog() -> Result<(), String> {
             }
             run.expect("# ", DIALOG_STEP)?;
         }
-        // The terminal service edits the line before ash reads it (5f):
-        // DEL erases the "x" and its echo, and ash gets "echo abc".
+        // The line editor of the shell erases the "x" on screen (backspace
+        // and clear to the end of the line) and ash gets "echo abc".
         run.send("echo abx\x7fc")?;
-        run.expect("echo abx\x08 \x08c", DIALOG_STEP)?;
+        run.expect("echo abx\x08\x1b[Jc", DIALOG_STEP)?;
         run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // The name of the terminal is the layer's to resolve (5f): the
