@@ -17,6 +17,8 @@ bench = false
 math-probe = []
 park-probe = []
 fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
+# The client at level 30 against the spawner at level 10 (steps_priority).
+priority-steps = ["dep:posix-abi", "posix-abi/thread-probe", "dep:rt"]
 fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 spawn-churn = []
 lifetime-rules = ["lifetime-probe"]

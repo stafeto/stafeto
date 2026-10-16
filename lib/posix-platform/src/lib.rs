@@ -752,6 +752,27 @@ pub unsafe extern "C" fn stafeto_probe_commit_early(pid: *mut c_int) -> c_int {
     errno
 }
 
+/// A SpawnStart whose load waits for the parent, for the probe of the waits
+/// of other clients (posix_abi::process::probe_load_start): its errno, and
+/// the child's PID in `pid`.
+///
+/// # Safety
+/// `pid` points to an int.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_load_start(place: c_int, pid: *mut c_int) -> c_int {
+    let mut child = -1;
+    let errno = posix_abi::process::probe_load_start(place as usize, &mut child);
+    // SAFETY: the caller's promise.
+    unsafe { pid.write(child) };
+    errno
+}
+
+/// SpawnAbort of that load (posix_abi::process::probe_load_abort).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_load_abort(place: c_int, pid: c_int) -> c_int {
+    posix_abi::process::probe_load_abort(place as usize, pid)
+}
+
 /// The loads the calling record may have at once
 /// (posix_abi::process::probe_loads).
 #[unsafe(no_mangle)]

@@ -718,7 +718,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["change-steps", "fifo-steps", "procfs"],
+        &["change-steps", "fifo-steps", "procfs", "priority-steps"],
     ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
@@ -4445,68 +4445,19 @@ const S5_ICOUNT_SLACK: u64 = 300;
 /// instance): term B, in ticks under -icount.
 const RAM_STEP_MAX: u64 = TERM_B;
 
-/// The steps of the process service that are longer than term B today,
-/// until step 5z splits them: (kind, name, the limit with 4 branches of
-/// children (`process-steps 4`), the limit with 7 (`ci` and the plain
-/// command)). A step above its number fails `process-steps`; a step at or
-/// under B shows that its entry can go. Each number is the largest of
-/// four runs at e1-g2-steps (identical to the tick, since -icount is
-/// deterministic for one build; with 4 and 7 branches: Create 61,378 and
-/// 61,378, SpawnStart 92,323 and 92,556, ExecStart 51,039 and 50,833,
-/// ForkStart 53,737 and 54,153) plus NOISE_MARGIN; ForkStart again as the
-/// largest of four runs at the head of E1 with 4 and with 7 branches
-/// (53,772 and 55,793: the pin of relibc a5adc5f8, a table entry in
-/// `sysconf`, moved the 7-branch figure up from 54,610 at 30f48fe7).
-/// ExecStart with 7 branches is 52,895 (the largest of the runs at
-/// a604c161; 52,562 at the head of E3-1 part 1) since the probe runs the
-/// raw change jobs among the crowd. No step of the loop drains the closed
-/// ends of the identity sessions the probe clones: the thread `ends::taker`
-/// of services/process/src/ends.rs receives them one at a time, each a
-/// bounded call. The run with STEPS_SESSIONS (identity sessions cloned and
-/// closed before the exec steps, beside the one of the change stages)
-/// shows it: 1, 8 and 32 closed sessions give ExecStart 50,888, 50,670
-/// and 50,491, so the step does not grow with their number. The same
-/// source with one more call that does nothing (0 sessions) gives 50,888
-/// where the head gives 52,562: the figure moves by about 1,700 with the
-/// layout of the code. The
-/// margin covers what moves between builds: the layout of the code and the processes of the
-/// level above that run in the middle of a step (SpawnStart was 92,262 and
-/// 93,009 at 4e9abf5 and 92,369 at d7743c9 with the same source of the
-/// step).
-/// SpawnStart with 7 branches is 94,134 (95,634 with the margin): a run
-/// of fix round 2 of E3-1 part 1 with another layout of the code of the
-/// probe gave 94,134, 1,578 over the base of 92,556 that held before, more
-/// than the margin; the head of that round gives 92,231. The step is O(1)
-/// (one page of the loader's data is copied, `start_child` of
-/// services/process/src/main.rs), so the figure moves with the layout of
-/// the code and with the processes of the level above that run in the
-/// middle of the step. The entry goes in E5 (rv8.P3: Create, SpawnStart,
-/// ExecStart and ForkStart are cut into pieces no longer than B), and the
-/// base for 4 branches stays. Raising it again needs a new look at
-/// CALL_WAIT_MAX.
-const PROCESS_STEPS_ABOVE_B: [(usize, &str, u64, u64); 4] = [
-    (1, "Create", 61_378 + NOISE_MARGIN, 61_378 + NOISE_MARGIN),
-    (
-        22,
-        "SpawnStart",
-        92_323 + NOISE_MARGIN,
-        94_134 + NOISE_MARGIN,
-    ),
-    (
-        28,
-        "ExecStart",
-        51_039 + NOISE_MARGIN,
-        52_895 + NOISE_MARGIN,
-    ),
-    (
-        34,
-        "ForkStart",
-        53_772 + NOISE_MARGIN,
-        55_793 + NOISE_MARGIN,
-    ),
-];
+/// The most a portion of the process service may take: 0.8 of term B, so
+/// that the noise between builds (1,200 ticks seen) and the margin of a
+/// layout change stay inside B. Create, SpawnStart, ExecStart and ForkStart
+/// are cut into portions (spec 2, 3.1): the request makes the record and
+/// its process, and the page, the loader's code, its read-only data, its
+/// data and stack and its thread follow, one portion each, as notices of
+/// the loop's own channel at the level of the client, which the kernel
+/// puts among the requests by level. Measured at the cut (4 branches,
+/// -icount, the CPU time of the loop's thread): Create 8,659, SpawnStart
+/// 11,853, ExecStart 9,875, ForkStart 10,850, the longest portion 13,580.
+const PORTION_MAX: u64 = TERM_B * 8 / 10;
 
-/// The room the limits of PROCESS_STEPS_ABOVE_B leave over the largest
+/// The room the process-steps number of a step keeps over the largest
 /// measured step, in ticks: 1,200 is the noise the experts saw between
 /// builds, rounded up.
 const NOISE_MARGIN: u64 = 1_500;
@@ -4550,17 +4501,17 @@ const WAIT_MAX: u64 = 500_000;
 
 /// The most a step may wait for the answer of a service in a call that is
 /// no heartbeat, in ticks under -icount: one round trip (C_ipc about
-/// 2,000), the longest step of the process service that may be running
-/// (SpawnStart, 95,634 with its margin), and the step of the request
-/// itself (term B), with a room of 10 %: 95,634 + 20,410 + 2,034 = 118,078,
-/// and 118,078 + 10 % = 129,886 under 130,000, 11,922 of room. The room was
-/// 1,922 (1.6 %) under 120,000, and a next rise of SpawnStart would have
-/// failed every service; this limit moves with the sum, so a rise of
-/// SpawnStart by more than 10,000 needs a new look at it, and the cuts of
-/// Create, SpawnStart, ExecStart and ForkStart into pieces no longer than B
-/// (part 13) take the first term out of the sum. Seen at most 9,946 (ramfs
-/// FinishBinding with 248 children).
-const CALL_WAIT_MAX: u64 = 130_000;
+/// 2,000), the longest step of the callee that may be running (term B: the
+/// portions of the process service stay under 0.8 B), and the step of the
+/// request itself (term B), with a room of 10 %: 2 * 20,410 + 2,034 =
+/// 42,854, and 42,854 + 10 % = 47,139 under 48,000. It was 130,000 while
+/// SpawnStart ran as one step of 95,634 ticks with its margin; the cuts of
+/// Create, SpawnStart, ExecStart and ForkStart into portions (F13) took
+/// that term out of the sum. A client of level 30 that asks the process
+/// service for GetLimit while another thread at level 10 spawns waits at
+/// most that (the probe of `process-steps`, `steps_priority`). Seen at most
+/// 16,503 (ramfs, the wait of its step for the process service).
+const CALL_WAIT_MAX: u64 = 48_000;
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
@@ -4970,6 +4921,29 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The wait of a client at level 30 for GetLimit while two threads at level
+/// 10 make loads (`steps_priority` of tests/posix-procs): the longest ask
+/// stays under CALL_WAIT_MAX, two steps of B and a round trip. The ask is
+/// timed from the moment the client sends it. The service runs above every
+/// client and keeps the CPU while its queue holds work, so the client sends
+/// only between its busy periods, and the ask waits in the queue behind at
+/// most the step that runs. (The level the portions of a load stand at is
+/// held by the unit tests of the service, `portion_level` and
+/// `portion_slot`.)
+fn check_getlimit_wait(lines: &[String]) -> Result<(), String> {
+    let wait = qemu::number_after(lines, "posix-procs: getlimit wait max ")
+        .ok_or("the priority probe printed no wait of GetLimit")?;
+    println!(
+        "GetLimit at level 30 against SpawnStart at level 10: {wait} ticks of {CALL_WAIT_MAX}"
+    );
+    if wait > CALL_WAIT_MAX {
+        return Err(format!(
+            "GetLimit at level 30 waited {wait} ticks against a spawn at level 10, past {CALL_WAIT_MAX}"
+        ));
+    }
+    Ok(())
+}
+
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
@@ -5028,6 +5002,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
     qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
+    check_getlimit_wait(&outcome.lines)?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -5108,28 +5083,21 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
         ));
     }
-    // Every step of the process service stays under term B but the four
-    // that the list PROCESS_STEPS_ABOVE_B holds, each within its number.
-    for &(kind, name, at_4, at_7) in &PROCESS_STEPS_ABOVE_B {
-        let limit = if branches == 4 { at_4 } else { at_7 };
+    // Every step of the process service stays under term B, and the
+    // portions of the loads (Create, SpawnStart, ExecStart, ForkStart and
+    // the notices that make the next piece) under PORTION_MAX.
+    for kind in [1usize, 22, 28, 34, 64] {
         let ticks = longest(kind);
-        if ticks == 0 || ticks > limit {
+        println!("process service step {kind}: {ticks} of B {TERM_B}, portions {PORTION_MAX}");
+        if ticks == 0 || ticks > PORTION_MAX {
             return Err(format!(
-                "the process service: {name} took {ticks} ticks, past its exception {limit} (B {TERM_B})"
+                "the process service: kind {kind} took {ticks} ticks, past a portion {PORTION_MAX} (B {TERM_B}) or none"
             ));
         }
-        let verdict = if ticks > TERM_B {
-            format!("{} over B", ticks - TERM_B)
-        } else {
-            "under B: remove it from PROCESS_STEPS_ABOVE_B".to_owned()
-        };
-        println!("process service {name}: {ticks} of exception {limit}, B {TERM_B}: {verdict}");
     }
-    if let Some((kind, ticks, _)) = rows.iter().find(|(kind, ticks, _)| {
-        *ticks > TERM_B && !PROCESS_STEPS_ABOVE_B.iter().any(|(k, ..)| k == kind)
-    }) {
+    if let Some((kind, ticks, _)) = rows.iter().find(|(_, ticks, _)| *ticks > TERM_B) {
         return Err(format!(
-            "the process service: kind {kind} took {ticks} ticks, past B {TERM_B} and not in the exceptions"
+            "the process service: kind {kind} took {ticks} ticks, past B {TERM_B}"
         ));
     }
     if !loader.iter().any(|(k, ..)| *k == 9) {
@@ -9056,19 +9024,12 @@ mod tests {
         assert_eq!(wait_of(&longest_waits(&lines, "2"), 1), 0);
     }
 
-    #[test]
-    fn the_spawn_start_limit_holds_the_largest_run_and_the_call_wait_sum() {
-        // 94,134 is the run of fix round 2 with another layout of the probe;
-        // the limit of the call wait must hold the longest step of the
-        // process service, a step of the callee (term B) and a round trip.
-        let spawn = PROCESS_STEPS_ABOVE_B
-            .iter()
-            .find(|(k, ..)| *k == 22)
-            .expect("SpawnStart is in the list");
-        assert!(spawn.3 >= 94_134 + NOISE_MARGIN);
-        // The limit stands at least 10 % above the sum.
-        assert!((spawn.3 + TERM_B + 2_034) * 11 <= CALL_WAIT_MAX * 10);
-    }
+    // A client waits for the step running and then for its own: both are no
+    // longer than B; the limit stands 10 % above the sum; a portion has room
+    // for the noise inside B.
+    const _: () = assert!((2 * TERM_B + 2_034) * 11 <= CALL_WAIT_MAX * 10);
+    const _: () = assert!(CALL_WAIT_MAX == 48_000);
+    const _: () = assert!(PORTION_MAX + 1_200 < TERM_B);
 
     #[test]
     fn a_wait_past_the_limit_fails() {

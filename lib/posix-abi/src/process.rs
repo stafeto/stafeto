@@ -2099,6 +2099,40 @@ pub fn probe_commit_early(pid: &mut i32) -> i32 {
     committed.err().unwrap_or(0)
 }
 
+/// The parent's copies of C of the two loads `probe_load_start` made (a
+/// record may have LOADERS_OF_PARENT, 2, at once).
+static PROBE_LOAD_C: [core::sync::atomic::AtomicU64; 2] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// A SpawnStart for the probe of the waits of other clients while a load
+/// is made (the portions of the process service): the child's PID in `pid`
+/// and 0, or the errno of the refusal. `place` (0 or 1) is the load's own
+/// place for its copy of C; `probe_load_abort` ends the load.
+pub fn probe_load_start(place: usize, pid: &mut i32) -> i32 {
+    match start_bare() {
+        Ok((child, c)) => {
+            *pid = child as i32;
+            PROBE_LOAD_C[place & 1].store(c.into_raw().0, Ordering::SeqCst);
+            0
+        }
+        Err(errno) => errno,
+    }
+}
+
+/// SpawnAbort of the load `probe_load_start` made, and the close of the
+/// parent's copy of C: 0 or the errno.
+pub fn probe_load_abort(place: usize, pid: i32) -> i32 {
+    use proto_process::Method;
+    let aborted = request(Method::SpawnAbort, &[pid as u32]).and_then(|w| ask(&w));
+    let raw = PROBE_LOAD_C[place & 1].swap(0, Ordering::SeqCst);
+    if raw != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    }
+    aborted.err().unwrap_or(0)
+}
+
 /// The probe of the loads a record may have at once: up to
 /// three SpawnStarts that wait together, then SpawnAbort of each; how
 /// many the service took (LOADERS_OF_PARENT, 2, when no load of the

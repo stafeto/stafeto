@@ -173,6 +173,24 @@ extern "C" fn files_full_sessions() -> i32 {
     }
 }
 
+/// The level of the calling thread, for the priority probe of the steps
+/// (the layer's `set_level`): 0 or a negated errno.
+#[cfg(feature = "priority-steps")]
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_steps_level(level: i32) -> i32 {
+    match u8::try_from(level) {
+        Ok(level) => posix_abi::threads::set_level(level).map_or_else(|e| -e, |()| 0),
+        Err(_) => -22,
+    }
+}
+
+/// The counter, for the priority probe of the steps.
+#[cfg(feature = "priority-steps")]
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_steps_ticks() -> u64 {
+    rt::time::now()
+}
+
 #[cfg(feature = "lock-fifo-full")]
 mod lock_fifo_full;
 #[cfg(feature = "lifetime-probe")]

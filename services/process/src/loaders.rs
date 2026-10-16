@@ -65,6 +65,19 @@ pub fn set_ids(c: Credentials, (uid, gid): (u32, u32)) -> Credentials {
     }
 }
 
+/// The level of the place of the notices of the portions of a load: the
+/// level of the one who asked, so that the kernel puts a portion among the
+/// requests by that level (spec 2, 3.1), but never above the service's own.
+pub const fn portion_level(requester: u8, service: u8) -> u8 {
+    if requester < 1 {
+        1
+    } else if requester > service {
+        service
+    } else {
+        requester
+    }
+}
+
 /// The loaders that run at most: the service pays for their data and
 /// stack (five pages each) and holds a place of its channel for each.
 pub const LOADERS: usize = 16;
@@ -75,7 +88,11 @@ pub const LOADERS_OF_PARENT: usize = 2;
 /// Where a load is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// The process was made and the loader runs; it has not said Boot.
+    /// The record and its process exist, and the portions of the loop put
+    /// the loader into the process (page, code, data, thread); no loader
+    /// runs yet, and nothing of the place answers Boot.
+    Making,
+    /// The loader's thread was started; it has not said Boot.
     Booting,
     /// Boot came: the parent has the loader's start channel, and the
     /// loader opens and reads the program.
@@ -179,6 +196,17 @@ impl<T> Loaders<T> {
         Some(index)
     }
 
+    /// The place a notice of a portion names by its `ticket` (the ticket of
+    /// the place when it made the notice's place of the channel), while the
+    /// place holds that very load: a notice of a place that went, or of an
+    /// earlier load in the same place, finds another generation and names
+    /// none.
+    pub fn portion_slot(&self, ticket: u64) -> Option<usize> {
+        let slot = (ticket & 0xFF) as usize;
+        (slot < LOADERS && self.places[slot].is_some() && self.ticket(slot) == ticket)
+            .then_some(slot)
+    }
+
     /// The place of the loader of the record in `record`.
     pub fn of(&self, record: usize) -> Option<usize> {
         self.of_record
@@ -232,7 +260,7 @@ impl<T> Loaders<T> {
         match place.stage {
             Stage::Loading => Some(Loading),
             Stage::Loaded => Some(Handoff),
-            Stage::Booting | Stage::Ready => None,
+            Stage::Making | Stage::Booting | Stage::Ready => None,
         }
     }
 
@@ -381,6 +409,33 @@ mod tests {
         assert_eq!(reset.words(), [1, 1, 1, 4, 4, 4]);
         assert_eq!(set_ids(reset, (0, NO_ID)).words(), [1, 0, 0, 4, 4, 4]);
         assert_eq!(set_ids(reset, (NO_ID, 7)).words(), [1, 1, 1, 4, 7, 7]);
+    }
+
+    /// The notices of the portions of a load stand at the level of the one
+    /// who asked, never above the service's level and never at 0.
+    #[test]
+    fn a_portion_stands_at_the_level_of_the_one_who_asked() {
+        assert_eq!(portion_level(10, 52), 10);
+        assert_eq!(portion_level(52, 52), 52);
+        assert_eq!(portion_level(63, 52), 52);
+        assert_eq!(portion_level(0, 52), 1);
+    }
+
+    /// A notice of a place that went, or of an earlier load in the place,
+    /// does nothing: its ticket is another.
+    #[test]
+    fn a_notice_of_an_earlier_load_names_no_place() {
+        let mut t = Loaders::<()>::new();
+        let first = t.take(5, 0, 1, ()).unwrap();
+        let old = t.ticket(first);
+        assert_eq!(t.portion_slot(old), Some(first));
+        t.free(5).unwrap();
+        assert_eq!(t.portion_slot(old), None, "the place went");
+        let again = t.take(6, 0, 1, ()).unwrap();
+        assert_eq!(again, first, "the same place");
+        assert_eq!(t.portion_slot(old), None, "another load in it");
+        assert_eq!(t.portion_slot(t.ticket(again)), Some(again));
+        assert_eq!(t.portion_slot(old | 0xFF), None, "no such place");
     }
 
     /// A child's quota comes from the pool only while the service keeps

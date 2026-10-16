@@ -544,8 +544,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// requires 10% reserve; 528 pages leave 10.2%. The utilities part (the
 /// layer's /proc, the registry of open streams, the utmpx, syslog and
 /// getlogin code) added 3 pages to the 474: 477 measured, and 532 pages leave
-/// 10.3%.
-const STEPS_QUOTA: u64 = 532 * PAGE;
+/// 10.3%. The priority probe of the steps (two threads of the spawners, the
+/// semaphores, the offsets of the asks) added 5: 482 measured, and 540 pages
+/// leave 10.7%.
+const STEPS_QUOTA: u64 = 540 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping
