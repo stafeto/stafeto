@@ -5699,6 +5699,55 @@ fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<
     Ok(())
 }
 
+/// The keys of the line editor of the interactive shell, sent as a
+/// terminal sends them: each probe ends with the line the shell ran.
+fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
+    let line = |run: &mut qemu::Run, text: &'static str| {
+        run.expect_line(text, |l| l == text, DIALOG_STEP)
+    };
+    // History: Up brings back the last command.
+    run.send("echo history-one")?;
+    line(run, "history-one")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"\x1b[A\r")?;
+    line(run, "history-one")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Left, Home, Right, End and Delete move inside the line: b goes
+    // between a and c; Z goes after "echo " (Home, five Rights); End, Left
+    // and Delete remove the last character.
+    run.type_raw(b"echo ac\x1b[Db\r")?;
+    line(run, "abc")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo xy\x1b[H\x1b[C\x1b[C\x1b[C\x1b[C\x1b[CZ\x1b[F\x1b[D\x1b[3~\r")?;
+    line(run, "Zx")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Ctrl-A, Ctrl-E, Ctrl-K, Ctrl-U and Ctrl-W.
+    run.type_raw(b"two\x01echo \x05 words\r")?;
+    line(run, "two words")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo drop one\x15echo kept\x01\x0b\x15echo edited\r")?;
+    line(run, "edited")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo keep drop\x17\r")?;
+    line(run, "keep")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Tab completes a name; Backspace after it erases from the completed
+    // text and leaves no tab in the line.
+    run.type_raw(b"ls -1 /bin/mkt\t\r")?;
+    line(run, "/bin/mktemp")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo /et\t\x7f\x7f\r")?;
+    line(run, "/et")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Ctrl-C at the prompt drops the line and gives a fresh prompt.
+    run.type_raw(b"echo dropped\x03")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("echo fresh")?;
+    line(run, "fresh")?;
+    run.expect("# ", DIALOG_STEP)?;
+    Ok(())
+}
+
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5795,6 +5844,7 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("echo abx\x08\x1b[Jc", DIALOG_STEP)?;
         run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        line_editing(&mut run)?;
         // The name of the terminal is the layer's to resolve (5f): the
         // shell opens /dev/console for a redirection, and a file of /bin
         // that the shell forks and execs writes to the descriptor it
