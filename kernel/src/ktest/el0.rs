@@ -1427,7 +1427,7 @@ fn done_nop(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 fn start_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
     f.patterns[0] = Pattern::new(1);
     let t = spawn(f, 0, &raw const el0_pattern_loop, DATA_VA as u64)?;
-    sched::set_priority(t, PRIORITY, Policy::RoundRobin).map_err(|_| "no round robin")
+    sched::set_priority(t, PRIORITY, Policy::RoundRobin, false).map_err(|_| "no round robin")
 }
 
 fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -1928,7 +1928,7 @@ const STOP_WORD: usize = DATA_VA + 0x808;
 /// once, below the test's other threads.
 fn judge(f: &mut Fixture, slot: usize) -> Result<(), &'static str> {
     let t = spawn(f, slot, &raw const el0_done_at_once, 0)?;
-    sched::set_priority(t, JUDGE, FIFO).map_err(|_| "no judge")
+    sched::set_priority(t, JUDGE, FIFO, false).map_err(|_| "no judge")
 }
 
 /// How the process in slot `slot` lives, or why it ended.
@@ -2439,7 +2439,7 @@ fn done_exit_after_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// finds the process exited with code 0.
 fn start_last_exit(f: &mut Fixture) -> Result<(), &'static str> {
     let receiver = spawn(f, 0, &raw const el0_receive, 0)?;
-    sched::set_priority(receiver, PRIORITY + 2, FIFO).map_err(|_| "no receiver")?;
+    sched::set_priority(receiver, PRIORITY + 2, FIFO, false).map_err(|_| "no receiver")?;
     let p = f.processes[0].expect("the receiver's process");
     let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
     let h = give(p, Object::Channel(c), Rights::RECEIVE);
@@ -2770,7 +2770,7 @@ fn descendants(
     // pool.
     let crowd_quota = (crowd as u64).div_ceil(3) * PAGE_SIZE;
     let judge = spawn(f, 0, &raw const el0_alarm_then, 0)?;
-    sched::set_priority(judge, PRIORITY + 10, FIFO).map_err(|_| "no judge")?;
+    sched::set_priority(judge, PRIORITY + 10, FIFO, false).map_err(|_| "no judge")?;
     let parent = f.processes[0].expect("the judge's process");
     let quanta = 3 * abi::RR_QUANTUM_NS;
     let wake = timer::clock().deadline_after(timer::now(), quanta);
@@ -2802,7 +2802,7 @@ fn descendants(
             new_thread(f, 1, p, DATA_VA, entry, 0)
         })?;
     set_args(counter, &args);
-    sched::set_priority(counter, PRIORITY + 2, RR).map_err(|_| "no counter")?;
+    sched::set_priority(counter, PRIORITY + 2, RR, false).map_err(|_| "no counter")?;
     let grandchild = f.processes[1].expect("the grandchild");
     for slot in &mut f.crowd[..crowd] {
         let t = thread::create(grandchild, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO)
@@ -2897,7 +2897,7 @@ fn notice(bits: u64) -> [u64; 11] {
 fn start_kill_waiting(f: &mut Fixture) -> Result<(), &'static str> {
     let waiter = spawn(f, 0, &raw const el0_receive, 0)?;
     let killer = spawn(f, 1, &raw const el0_kill_notify_receive, 0)?;
-    sched::set_priority(killer, JUDGE, FIFO).map_err(|_| "no killer")?;
+    sched::set_priority(killer, JUDGE, FIFO, false).map_err(|_| "no killer")?;
     let p = f.processes[0].expect("the waiter's process");
     let q = f.processes[1].expect("the killer's process");
     let c = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
@@ -3385,7 +3385,7 @@ fn exit_channel_of(q: NonNull<Process>, p: NonNull<Process>) -> Result<u64, &'st
 /// second process, finds every client ended with PEER_CLOSED.
 fn start_replies_portions(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_take_then_exit, 0)?;
-    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
+    sched::set_priority(server, PRIORITY + 1, FIFO, false).map_err(|_| "no priority")?;
     let p = f.processes[0].expect("the service's process");
     let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
     let requests = give(p, Object::Channel(c), Rights::RECEIVE);
@@ -3438,7 +3438,7 @@ fn start_replies_level(f: &mut Fixture) -> Result<(), &'static str> {
     let client = spawn(f, 1, &raw const el0_send, 0)?;
     let killer = spawn(f, 2, &raw const el0_raise_then_kill, 0)?;
     for (t, priority) in [(server, 13), (client, 12), (killer, JUDGE)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
@@ -3493,7 +3493,7 @@ fn start_dead_client_memory(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_reply_after_notice, 0)?;
     let killer = spawn(f, 1, &raw const el0_kill_close_notify, 0)?;
     for (t, priority) in [(server, 13), (killer, 11)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [p, r] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
     let child =
@@ -3572,7 +3572,7 @@ fn done_dead_client_memory(f: &Fixture, t: &Thread) -> Result<(), &'static str> 
 fn start_kill_sender(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
     let killer = spawn(f, 1, &raw const el0_kill_notify_receive, 0)?;
-    sched::set_priority(killer, JUDGE, FIFO).map_err(|_| "no killer")?;
+    sched::set_priority(killer, JUDGE, FIFO, false).map_err(|_| "no killer")?;
     let q = f.processes[1].expect("the killer's process");
     let [own, send] = shared_channel(q, Rights::NOTIFY | Rights::RECEIVE, p, Rights::SEND)?;
     let target = give(q, Object::Process(p), Rights::MANAGE)?;
@@ -3614,7 +3614,7 @@ fn done_kill_sender(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// ready thread never ran.
 fn start_kill_states(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_check_after_notice, 0)?;
-    sched::set_priority(server, 16, FIFO).map_err(|_| "no priority")?;
+    sched::set_priority(server, 16, FIFO, false).map_err(|_| "no priority")?;
     let q = f.processes[0].expect("the service's process");
     let p = new_process(f, 1)?;
     let [requests, send] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
@@ -3716,9 +3716,9 @@ fn done_raised_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     match f.slot(t) {
         0 => {
             let (p, h) = f.handles[0].expect("the waiter's handle");
-            sched::set_priority(ready, 15, FIFO).map_err(|_| "no priority")?;
+            sched::set_priority(ready, 15, FIFO, false).map_err(|_| "no priority")?;
             process::close_handle(p, h, JUDGE).map_err(|_| "the handle did not close")?;
-            sched::set_priority(waiter, 20, FIFO).map_err(|_| "no priority")
+            sched::set_priority(waiter, 20, FIFO, false).map_err(|_| "no priority")
         }
         1 => check(
             t.regs.x[0] == Error::PeerClosed.code()
@@ -3746,7 +3746,7 @@ fn start_raised_replies(f: &mut Fixture) -> Result<(), &'static str> {
     let judge = spawn(f, 0, &raw const el0_done_at_once, 0)?;
     let client = spawn(f, 1, &raw const el0_send, 0)?;
     for (t, priority) in [(judge, JUDGE), (client, 12)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [r, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
     let entry = user_address(&raw const el0_done_at_once);
@@ -3772,11 +3772,11 @@ fn done_raised_replies(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     match f.slot(t) {
         0 => {
             let p = f.processes[2].expect("the service's process");
-            sched::set_priority(ready, 15, FIFO).map_err(|_| "no priority")?;
+            sched::set_priority(ready, 15, FIFO, false).map_err(|_| "no priority")?;
             // SAFETY: the test holds a reference to the process.
             let ended = unsafe { process::end(p, ProcessState::Killed, JUDGE) };
             check(ended, "the service's process did not end")?;
-            sched::set_priority(client, 20, FIFO).map_err(|_| "no priority")
+            sched::set_priority(client, 20, FIFO, false).map_err(|_| "no priority")
         }
         1 => check(
             t.regs.x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD]
@@ -3833,7 +3833,7 @@ fn done_close_in_place(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
                 process::close_handle(p, h, JUDGE).map_err(|_| "a handle did not close")?;
             }
             let second = f.threads[2].expect("the second waiter");
-            sched::set_priority(second, PRIORITY, FIFO).map_err(|_| "no priority")
+            sched::set_priority(second, PRIORITY, FIFO, false).map_err(|_| "no priority")
         }
         1 => check(
             t.regs.x[0] == Error::PeerClosed.code()
@@ -3891,7 +3891,7 @@ fn dead_client(f: &mut Fixture, reply: u64) -> Result<(), &'static str> {
     let client = spawn(f, 1, &raw const el0_send, 0)?;
     let killer = spawn(f, 2, &raw const el0_alarm_then, 0)?;
     for (t, priority) in [(client, 30), (killer, 40)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
@@ -3987,7 +3987,7 @@ fn start_killed_sender(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 1, &raw const el0_notice_then_take, 0)?;
     let killer = spawn(f, 2, &raw const el0_kill, 0)?;
     for (t, priority) in [(server, 12), (killer, JUDGE)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [q, r] = [1, 2].map(|i| f.processes[i].expect("a process of the test"));
     f.kept[0] = session::in_use() as u64;
@@ -4055,7 +4055,7 @@ fn start_labelled_close(f: &mut Fixture) -> Result<(), &'static str> {
     let sender = spawn(f, 1, &raw const el0_send_close, 0)?;
     let closer = spawn(f, 2, &raw const el0_close, 0)?;
     for (t, priority) in [(server, 13), (sender, 12), (closer, JUDGE)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [q, p, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
     f.kept[0] = session::in_use() as u64;
@@ -4179,7 +4179,7 @@ fn snap_pair(
 ) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_serve_snap, 0)?;
     let client = spawn(f, 1, &raw const el0_send_twice, 0)?;
-    sched::set_priority(server, priority, policy).map_err(|_| "no priority")?;
+    sched::set_priority(server, priority, policy, false).map_err(|_| "no priority")?;
     let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
     set_args(server, &[requests, 2]);
@@ -4194,7 +4194,7 @@ fn snap_pair(
 fn start_fast_hit(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_serve, 0)?;
     let client = spawn(f, 1, &raw const el0_send, 0)?;
-    sched::set_priority(server, PRIORITY + 2, FIFO).map_err(|_| "no priority")?;
+    sched::set_priority(server, PRIORITY + 2, FIFO, false).map_err(|_| "no priority")?;
     let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
     set_args(server, &[requests, 0]);
@@ -4238,7 +4238,7 @@ fn start_same_state(f: &mut Fixture) -> Result<(), &'static str> {
     let q = f.processes[1].expect("the client's process");
     let entry = &raw const el0_done_at_once;
     let ready = new_thread(f, 2, q, DATA_VA + PAGE, entry, 0)?;
-    sched::set_priority(ready, PRIORITY - 1, FIFO).map_err(|_| "no priority")
+    sched::set_priority(ready, PRIORITY - 1, FIFO, false).map_err(|_| "no priority")
 }
 
 fn done_same_state(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -4331,7 +4331,7 @@ fn start_cleanup_first(f: &mut Fixture) -> Result<(), &'static str> {
     let late = spawn(f, 0, &raw const el0_alarm_then, 0)?;
     let early = spawn(f, 2, &raw const el0_release_then_send, 0)?;
     for (t, priority) in [(server, 12), (late, 20), (early, 11)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+        sched::set_priority(t, priority, FIFO, false).map_err(|_| "no priority")?;
     }
     let [p, q] = [0, 2].map(|i| f.processes[i].expect("a process of the test"));
     let entry = user_address(&raw const el0_mark);
@@ -4424,7 +4424,7 @@ fn done_equal_ready(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 fn start_pending_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_receive, 0)?;
     let client = spawn(f, 1, &raw const el0_pending_send, 0)?;
-    sched::set_priority(server, PRIORITY + 2, FIFO).map_err(|_| "no priority")?;
+    sched::set_priority(server, PRIORITY + 2, FIFO, false).map_err(|_| "no priority")?;
     let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
     set_args(server, &[requests, 0]);
@@ -4463,7 +4463,7 @@ fn start_round_trips(f: &mut Fixture) -> Result<(), &'static str> {
     let client = spawn(f, 0, &raw const el0_measure, 0)?;
     let server = spawn(f, 1, &raw const el0_serve_loop, 0)?;
     spawn(f, 2, &raw const el0_yield_loop, 0)?;
-    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
+    sched::set_priority(server, PRIORITY + 1, FIFO, false).map_err(|_| "no priority")?;
     let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
     let [requests, send] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
     let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
@@ -4768,8 +4768,9 @@ fn start_suspended_fast_receiver(f: &mut Fixture) -> Result<(), &'static str> {
         channel::release(ch, Rights::NONE, CAUSE);
     }
     let judge = spawn(f, 2, &raw const el0_done_at_once, 0)?;
-    sched::set_priority(receiver, 20, Policy::Fifo).map_err(|_| "receiver priority failed")?;
-    sched::set_priority(judge, 1, Policy::Fifo).map_err(|_| "judge priority failed")?;
+    sched::set_priority(receiver, 20, Policy::Fifo, false)
+        .map_err(|_| "receiver priority failed")?;
+    sched::set_priority(judge, 1, Policy::Fifo, false).map_err(|_| "judge priority failed")?;
     // SAFETY: The fixture retains both threads, which have not entered EL0 yet.
     unsafe {
         (*receiver.as_ptr()).regs.x[0] = rh.0;
@@ -4800,7 +4801,8 @@ fn done_suspended_fast_receiver(f: &Fixture, t: &Thread) -> Result<(), &'static 
 
 fn start_suspended_el0_crowd(f: &mut Fixture) -> Result<(), &'static str> {
     let controller = spawn(f, 0, &raw const el0_continue_crowd, 0)?;
-    sched::set_priority(controller, 1, Policy::Fifo).map_err(|_| "controller priority failed")?;
+    sched::set_priority(controller, 1, Policy::Fifo, false)
+        .map_err(|_| "controller priority failed")?;
     let p = new_process(f, 1)?;
     process::control(p, true, CAUSE).map_err(|_| "crowd stop failed")?;
     for i in 0..MAX_THREADS as usize {

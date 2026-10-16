@@ -711,7 +711,14 @@ impl<T: Schedulable> Scheduler<T> {
     /// higher of the base and the boost, moves the thread. A ready thread
     /// raised goes to the tail of its new level with a new quantum, lowered
     /// to the head with the rest of its quantum, unchanged stays where it
-    /// is; a boost above the new base keeps it where it is. A thread that
+    /// is; a boost above the new base keeps it where it is. With `tail`
+    /// (pthread_setschedparam, sched_setscheduler, sched_setparam: XSH
+    /// 2.8.4 puts a thread whose policy or priority changed other than by
+    /// pthread_setschedprio at the tail of its new level) a ready thread
+    /// goes to the tail of its level with a new quantum whatever the
+    /// direction, also at an unchanged level, and a running one gives the
+    /// CPU up as by `yield`; a thread whose level a boost holds above its
+    /// base does not move. A thread that
     /// turns from FIFO to round robin gets a new quantum, running from
     /// `now` when it runs. A running thread stays on the CPU and keeps its
     /// quantum; lowered below a ready thread, it gives the CPU up at the
@@ -727,6 +734,7 @@ impl<T: Schedulable> Scheduler<T> {
         t: NonNull<T>,
         priority: u8,
         policy: Policy,
+        tail: bool,
         now: u64,
     ) -> Result<(), Error> {
         assert!((1..PRIORITY_LEVELS).contains(&priority));
@@ -748,14 +756,34 @@ impl<T: Schedulable> Scheduler<T> {
             _ => {}
         }
         // SAFETY: the caller's promise; the borrow ends before the move.
-        let level = unsafe {
+        let (level, to_tail) = unsafe {
             let n = node(t);
             n.policy = policy;
             n.base = priority;
-            n.effective()
+            (n.effective(), tail && n.boost <= n.base)
         };
         // SAFETY: the caller's promise.
-        unsafe { self.relevel(t, level) };
+        unsafe {
+            match (to_tail, node(t).state) {
+                (true, State::Ready) => {
+                    self.ready.remove(t);
+                    let n = node(t);
+                    n.link.set_level(level);
+                    n.slice_left = self.quantum;
+                    self.ready.push_tail(t);
+                }
+                (true, State::Running) => {
+                    Self::charge(t, now);
+                    let n = node(t);
+                    n.link.set_level(level);
+                    n.state = State::Ready;
+                    n.slice_left = self.quantum;
+                    self.running = None;
+                    self.ready.push_tail(t);
+                }
+                _ => self.relevel(t, level),
+            }
+        }
         Ok(())
     }
 
@@ -1169,7 +1197,7 @@ mod tests {
 
         fn set(&mut self, t: NonNull<Fake>, priority: u8, policy: Policy, now: u64) {
             // SAFETY: as above.
-            unsafe { self.s.set_priority(t, priority, policy, now) }.unwrap();
+            unsafe { self.s.set_priority(t, priority, policy, false, now) }.unwrap();
         }
 
         fn exit(&mut self, t: NonNull<Fake>) {
@@ -1609,7 +1637,7 @@ mod tests {
         assert_eq!(node(s).policy(), FIFO);
         w.exit(s);
         // SAFETY: the world keeps its threads alive.
-        let dead = unsafe { w.s.set_priority(s, 20, RR, 0) };
+        let dead = unsafe { w.s.set_priority(s, 20, RR, false, 0) };
         assert_eq!(dead, Err(Error::BadState));
     }
 
@@ -2445,5 +2473,74 @@ mod tests {
         unsafe { w.s.hand_off(receiver, 2 * MS) };
         assert_eq!(node(receiver).ran_at(5 * MS), MS + 3 * MS);
         assert_eq!(node(sender).ran(), MS);
+    }
+
+    fn set_tail(w: &mut World, t: NonNull<Fake>, priority: u8, policy: Policy, now: u64) {
+        // SAFETY: as above.
+        unsafe { w.s.set_priority(t, priority, policy, true, now) }.unwrap();
+    }
+
+    /// XSH 2.8.4: a thread whose policy or priority changed other than by
+    /// pthread_setschedprio goes to the tail of its new level, whichever
+    /// way the priority went and also when it stayed.
+    #[test]
+    fn tail_puts_a_changed_thread_behind_its_equals() {
+        let mut w = World::new();
+        let r = w.started('r', 30, RR);
+        let a = w.started('a', 10, FIFO);
+        let b = w.started('b', 10, FIFO);
+        let c = w.started('c', 10, FIFO);
+        let d = w.started('d', 5, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        // Unchanged: from the head to the tail.
+        set_tail(&mut w, a, 10, FIFO, MS);
+        assert_eq!(w.level(10), "bca");
+        // Lowered: the tail, not the head `set_priority` gives.
+        set_tail(&mut w, b, 5, FIFO, MS);
+        assert_eq!(w.level(5), "db");
+        // Raised: the tail.
+        set_tail(&mut w, d, 10, RR, MS);
+        assert_eq!(w.level(10), "cad");
+        assert_eq!(node(d).slice_left(), Q);
+        // Without the bit the same lowering goes to the head.
+        w.set(c, 5, FIFO, MS);
+        assert_eq!(w.level(5), "cb");
+        let _ = r;
+    }
+
+    #[test]
+    fn tail_makes_the_running_thread_yield_to_its_equals() {
+        let mut w = World::new();
+        let r = w.started('r', 10, FIFO);
+        w.started('q', 10, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        set_tail(&mut w, r, 10, FIFO, 2 * MS);
+        assert_eq!(w.s.running(), None);
+        assert_eq!(node(r).ran(), 2 * MS);
+        assert_eq!(w.pick(2 * MS), 'q');
+        assert_eq!(w.level(10), "r");
+        // Alone at its level, it gets the CPU back.
+        let mut w = World::new();
+        let r = w.started('r', 10, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        set_tail(&mut w, r, 12, FIFO, MS);
+        assert_eq!(w.pick(MS), 'r');
+    }
+
+    #[test]
+    fn tail_leaves_a_thread_at_a_boosted_level_alone() {
+        let mut w = World::new();
+        let r = w.started('r', 30, RR);
+        let a = w.started('a', 10, RR);
+        let b = w.started('b', 10, RR);
+        assert_eq!(w.pick(0), 'r');
+        w.boost(a, 20, 63);
+        assert_eq!(w.level(20), "a");
+        set_tail(&mut w, a, 10, RR, MS);
+        assert_eq!(w.level(20), "a");
+        // The boost ends: the base level, as a lowering does.
+        w.unboost(a);
+        assert_eq!(w.level(10), "ab");
+        let _ = (r, b);
     }
 }

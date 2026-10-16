@@ -50,6 +50,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_PROCESS_STATE => process_state(thread, a),
         abi::INFO_PROCESS_MEMORY => process_memory(thread, a),
         abi::INFO_PROCESS_HANDLES => process_handles(thread, a),
+        abi::INFO_PROCESS_TIME => process_time(thread, a),
         abi::INFO_KERNEL_STATS => kernel_stats_info(thread, a),
         abi::INFO_MEMORY => memory_info(thread, a),
         abi::INFO_THREAD_SELF => thread_self(thread, a),
@@ -95,6 +96,13 @@ fn process_handles(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         limit: limit.into(),
     };
     Ok(Values::new(&handles.to_words()))
+}
+
+/// PROCESS_TIME: x2 reserved; the ticks the process's threads have run.
+fn process_time(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    reserved_arg(a[2])?;
+    let p = lookup(thread, a[0], Rights::NONE, Object::process)?;
+    Ok(Values::new(&[process::cpu_time(p)]))
 }
 
 /// KERNEL_STATS: x2 is 0, or 1 for the call maxima in the buffer.
@@ -149,7 +157,9 @@ fn thread_current(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn thread_state(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
-    Ok(Values::new(&thread::info(t).to_words()))
+    let (info, ran) = thread::info(t);
+    let [a1, a2, a3, a4] = info.to_words();
+    Ok(Values::new(&[a1, a2, a3, a4, ran]))
 }
 
 /// CHANNEL: x2 reserved; a channel's counts.

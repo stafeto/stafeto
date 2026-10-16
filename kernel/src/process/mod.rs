@@ -288,12 +288,6 @@ impl Process {
         self.ceiling
     }
 
-    /// Ticks the process's threads have run, the stint of the running one
-    /// not included.
-    pub fn cpu_ticks(&self) -> u64 {
-        self.cpu_ticks
-    }
-
     /// A stint of `ticks` ended (`Schedulable::charge`).
     pub(crate) fn charge(&mut self, ticks: u64) {
         self.cpu_ticks = self.cpu_ticks.saturating_add(ticks);
@@ -531,6 +525,27 @@ pub fn refund(process: NonNull<Process>, bytes: u64) {
 pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
     // SAFETY: the caller's promise.
     unsafe { &mut (*process.as_ptr()).quota }
+}
+
+/// The ticks the threads of `process` have run: the sum of their finished
+/// stints and, when a thread of the process is on the CPU, its stint so
+/// far (object_info PROCESS_TIME). O(1).
+pub fn cpu_time(process: NonNull<Process>) -> u64 {
+    let now = crate::arch::timer::now();
+    sched::locked(|k| {
+        // SAFETY: the caller holds a reference to the process; the sum is
+        // guarded by the scheduler's lock, which is held; a running thread
+        // is alive.
+        unsafe {
+            let sum = (*process.as_ptr()).cpu_ticks;
+            match k.s.running() {
+                Some(r) if r.as_ref().process() == process => {
+                    sum.saturating_add(now.saturating_sub(r.as_ref().sched.since()))
+                }
+                _ => sum,
+            }
+        }
+    })
 }
 
 /// The quota of `process`, which the caller holds: object_info's

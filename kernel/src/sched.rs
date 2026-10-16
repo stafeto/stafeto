@@ -344,13 +344,18 @@ pub fn yield_running() {
 /// `resume` runs a thread raised above the running one, or another one
 /// when the running thread lowered itself below it. BAD_STATE for a
 /// thread that ended.
-pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<(), Error> {
+pub fn set_priority(
+    t: NonNull<Thread>,
+    priority: u8,
+    policy: Policy,
+    tail: bool,
+) -> Result<(), Error> {
     let now = timer::now();
     let waits = locked(|k| {
         // SAFETY: the caller holds a reference to `t`; the scheduler's
         // threads are alive, and so is the channel a thread waits in.
         unsafe {
-            k.s.set_priority(t, priority, policy, now)?;
+            k.s.set_priority(t, priority, policy, tail, now)?;
             Ok::<_, Error>(channel::requeue(t, k))
         }
     })?;

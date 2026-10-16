@@ -754,7 +754,9 @@ pub const INFO_KERNEL_STATS: u64 = 4;
 /// right needed, and returns `MemoryInfo::to_words` in x1-x3.
 pub const INFO_MEMORY: u64 = 5;
 /// THREAD_STATE takes a thread handle, with no right needed, and returns
-/// `ThreadInfo::to_words` in x1-x4.
+/// `ThreadInfo::to_words` in x1-x4 and in x5 the counter ticks the thread
+/// has run, the stint it is in now included (idle time and cleanup are
+/// nobody's).
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.
@@ -785,6 +787,10 @@ pub const INFO_THREAD_SELF: u64 = 12;
 /// THREAD_CURRENT takes a thread handle with any rights and x2 zero. It
 /// compares its kernel object with the caller and returns only bool 0 or 1.
 pub const INFO_THREAD_CURRENT: u64 = 13;
+/// PROCESS_TIME takes a process handle, with no right needed, and returns
+/// in x1 the counter ticks the threads of the process have run, those that
+/// ended and the stint of the running one included. O(1).
+pub const INFO_PROCESS_TIME: u64 = 14;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1300,6 +1306,16 @@ impl Policy {
     }
 }
 
+/// Bit 8 of the policy word of `thread_set_priority` (x2, policy in bits
+/// 0-7): the thread goes to the tail of the list of its new level, as XSH
+/// 2.8.4 says for a thread whose policy or priority changed by
+/// pthread_setschedparam, sched_setscheduler or sched_setparam, also at an
+/// unchanged level; the running thread gives the CPU up as by `yield`.
+/// Without the bit the rules of pthread_setschedprio apply (raised: tail,
+/// unchanged: stays, lowered: head). A thread at a level a boost holds
+/// above its base does not move.
+pub const POLICY_TAIL: u64 = 1 << 8;
+
 /// Errors of system calls (spec 12), each with its code in x0; zero means
 /// success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1399,6 +1415,7 @@ mod tests {
     fn self_thread_selectors_preserve_existing_numbers() {
         assert_eq!(INFO_THREAD_SELF, 12);
         assert_eq!(INFO_THREAD_CURRENT, 13);
+        assert_eq!((INFO_PROCESS_TIME, POLICY_TAIL), (14, 256));
         assert_eq!(INFO_LABEL, 11);
         assert_eq!(Call::ObjectInfo.number(), 27);
         assert_eq!(Call::ALL.len(), 34);
