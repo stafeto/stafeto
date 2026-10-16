@@ -206,6 +206,7 @@ cancellation, shared-state, input and interruption probes as well, and
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
 | `console-early-exit-vz` | the driver ends on Apple VZ before its function decodes its BARs: `init` skips the reset through BAR 0, clears the command word and restarts it |
 | `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox on relibc: `cat`, `ash -c`, an `ash` dialog (a POSIX process from `/bin/ash` that forks and execs the files of `/bin`), `ls` |
+| `bash-dialog`, `bash-shell-exit` | GNU bash 5.3 (`/bin/bash`, tools/build-bash.py) started from ash: version, history, Tab, Ctrl-C, jobs, `$(...)`, pipelines, `exit 3`, and the checks of the ash dialog that do not depend on ash |
 
 ## rtbench
 
