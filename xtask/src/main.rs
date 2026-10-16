@@ -30,6 +30,7 @@ mod service_sample;
 mod bash_dialog;
 mod disasm;
 mod entropy;
+mod htop_dialog;
 mod image;
 mod jobs;
 mod measure;
@@ -770,7 +771,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 12] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 13] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -791,6 +792,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 12] = [
     ),
     ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
     ("bash", "bash", POSIX_STACK_SIZE, &["interactive"]),
+    ("htop", "htop", POSIX_STACK_SIZE, &["interactive", "procfs"]),
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
@@ -1345,6 +1347,7 @@ commands:
             the shell ends the machine and gives its status)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
@@ -1559,6 +1562,7 @@ fn main() {
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
+        Some("htop-dialog") => htop_dialog::htop_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -1977,6 +1981,19 @@ fn write_elf_image(
     if let Some((licence, source)) = &bash_files {
         list.push((BASH_LICENSE, licence.as_slice()));
         list.push((BASH_SOURCE, source.as_bytes()));
+    // An image with htop (GPL-2.0-or-later) carries its licence and where the
+    // exact source is.
+    let htop_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "htop"))
+    {
+        Some(htop_dialog::htop_terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, source)) = &htop_files {
+        list.push((HTOP_LICENSE, licence.as_slice()));
+        list.push((HTOP_SOURCE, source.as_bytes()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -2876,6 +2893,9 @@ const BASH_SOURCE: &str = "BASH-SOURCE";
 const NANO_LICENSE: &str = "NANO-LICENSE";
 const NCURSES_LICENSE: &str = "NCURSES-LICENSE";
 const NANO_SOURCE: &str = "NANO-SOURCE";
+/// htop's licence and the note of its source in an image.
+const HTOP_LICENSE: &str = "HTOP-LICENSE";
+const HTOP_SOURCE: &str = "HTOP-SOURCE";
 
 /// The licence texts of the ready-made utilities in an image, and the symbol
 /// a BusyBox that holds them has.
@@ -3015,12 +3035,13 @@ fn busybox_build() -> Result<(), String> {
     })
 }
 
-/// ncurses and nano built (the object tests/nano links and the terminfo
-/// entries of the image), once in a run of xtask.
+/// ncurses, nano and htop built (the objects tests/nano and tests/htop link
+/// and the terminfo entries of the image), once in a run of xtask.
 fn nano_build() -> Result<(), String> {
     once(&NANO_BUILT, (), || {
         run_cmd(Command::new("python3").arg(root().join("tools/build-ncurses.py")))?;
-        run_cmd(Command::new("python3").arg(root().join("tools/build-nano.py")))
+        run_cmd(Command::new("python3").arg(root().join("tools/build-nano.py")))?;
+        run_cmd(Command::new("python3").arg(root().join("tools/build-htop.py")))
     })
 }
 
@@ -6188,6 +6209,7 @@ fn ash_dialog() -> Result<(), String> {
         ("-rwxr-xr-x", "1".to_string(), "bash", elf_size("bash")?),
         ("-rwxr-xr-x", links.clone(), "cat", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "head", busybox.clone()),
+        ("-rwxr-xr-x", "1".to_string(), "htop", elf_size("htop")?),
         ("-rwxr-xr-x", links.clone(), "ls", busybox.clone()),
         ("-rwxr-xr-x", links.clone(), "mktemp", busybox.clone()),
         ("-rwxr-xr-x", "1".to_string(), "nano", elf_size("nano")?),
@@ -7141,6 +7163,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
         job("nano-dialog", nano_dialog::nano_dialog),
+        job("htop-dialog", htop_dialog::htop_dialog),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
         job("bash-dialog", bash_dialog::bash_dialog),

@@ -347,6 +347,8 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/nano", 0o755, ROOT, "nano"),
         // GNU bash beside ash (tools/build-bash.py); `sh` stays ash.
         file("/bin/bash", 0o755, ROOT, "bash"),
+        // htop (tools/build-htop.py).
+        file("/bin/htop", 0o755, ROOT, "htop"),
     ];
     files.extend(UTILITIES.iter().map(|name| {
         let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
