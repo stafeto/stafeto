@@ -37,6 +37,7 @@ extern int ram_lock_commands(int pid);
 extern int close_driver_receipts(void);
 extern int close_driver_full_places(void);
 extern int lock_loss_run(int fd, int copy, int other);
+extern int lock_loss_process(int fd);
 extern void lock_signal_arm(unsigned mode);
 extern unsigned lock_signal_disarm(void);
 extern void close_driver_jump_arm(int fd);
@@ -764,6 +765,22 @@ int main(int argc, char **argv) {
         expect("public lock replies lost to a signal", lock_loss_run(receipt_fd, copy, other), 0);
         if (copy >= 0) expect("close copy of the receipt file", close(copy), 0);
         if (other >= 0) expect("close second receipt description", close(other), 0);
+        /* A process lock: the number closed while the reply is lost leaves no lock. */
+        int number = open("/tmp/public-lock-receipts", O_RDWR);
+        int alive = number >= 0 ? dup(number) : -1;
+        expect("number and copy for the process lock", number >= 0 && alive >= 0, 1);
+        if (alive >= 0) {
+            expect("process lock repeat after a closed number", lock_loss_process(number), EBADF);
+            pid_t observer = fork();
+            if (observer == 0) {
+                int probe = open("/tmp/public-lock-receipts", O_RDWR);
+                struct flock query = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 300, .l_len = 5};
+                _exit(probe >= 0 && fcntl(probe, F_GETLK, &query) == 0 && query.l_type == F_UNLCK ? 0 : 1);
+            }
+            expect("fork the observer of the process lock", observer >= 0, 1);
+            if (observer > 0) reap(observer, 0);
+            close(alive);
+        }
     }
     public_lock_signals();
     public_wait_locks();

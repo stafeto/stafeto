@@ -127,11 +127,17 @@ static void public_wait_locks(void) {
     if (!failures) printf("posix-procs: true WAIT unlock, SIGUSR1, restart, close/reuse and canonical success ok\n");
 }
 /* Signals that a delivery discards end no F_SETLKW: the waiter keeps its place. */
-struct quiet_waiter { int fd, result, done, release; };
+struct quiet_waiter { int fd, result, done, release, pending; };
 static void *quiet_worker(void *argument) {
     struct quiet_waiter *waiter = argument;
     struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    /* SIGURG is blocked here: it must stay pending after the wait. */
+    sigset_t held, seen;
+    sigemptyset(&held); sigaddset(&held, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &held, NULL);
     waiter->result = fcntl(waiter->fd, 38, &lock);
+    sigpending(&seen);
+    waiter->pending = sigismember(&seen, SIGURG);
     __atomic_store_n(&waiter->done, 1, __ATOMIC_RELEASE);
     while (!__atomic_load_n(&waiter->release, __ATOMIC_ACQUIRE)) sched_yield();
     lock.l_type = F_UNLCK;
@@ -191,6 +197,7 @@ static void public_wait_quiet_signals(void) {
     }
     nanosleep(&pause, NULL);
     expect("the first waiter keeps its place", __atomic_load_n(&waiters[0].done, __ATOMIC_ACQUIRE), 1);
+    expect("a blocked ignored signal stays pending", waiters[0].pending, 1);
     expect("the second waiter stays behind", __atomic_load_n(&waiters[1].done, __ATOMIC_ACQUIRE), 0);
     __atomic_store_n(&waiters[0].release, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&waiters[1].release, 1, __ATOMIC_RELEASE);

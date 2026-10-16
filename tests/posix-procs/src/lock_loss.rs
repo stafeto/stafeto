@@ -148,3 +148,17 @@ extern "C" fn lock_loss_run(fd: i32, copy: i32, other: i32) -> i32 {
     }
     result.map_or_else(|code| code, |()| 0)
 }
+
+/// A process lock goes by the number at each try: the number is closed while
+/// the reply is lost (a copy of the description lives on), the close dropped
+/// the locks of the process on the file, and the repeat must not take the
+/// lock again. The result is the errno of the call, or -1 without a loss.
+#[unsafe(no_mangle)]
+extern "C" fn lock_loss_process(fd: i32) -> i32 {
+    posix_abi::probe_lock_hook(Some(hook));
+    CLOSE.store(fd, Ordering::SeqCst);
+    let (result, _) = lost_once(fd, 6, 1, 300, 5);
+    CLOSE.store(-1, Ordering::SeqCst);
+    posix_abi::probe_lock_hook(None);
+    result.map_or_else(|code| code, |_| 0)
+}

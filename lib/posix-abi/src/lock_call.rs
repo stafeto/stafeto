@@ -66,13 +66,15 @@ fn send(transport: &posix_fs::Transport, wire: LockStart) -> Turn {
 /// deferred from the begin of the command to its end, so that a handler
 /// that leaves by a jump cannot leave the command count raised.
 pub(crate) fn operation(fd: u32, input: crate::lock_fields::Input) -> Result<LockReply, i32> {
-    // The description of the first try stays for the repeats: a number that
-    // another thread closed meanwhile must not hide a lock the first try took.
+    // An OFD command keeps the description of the first try for the repeats:
+    // a number that another thread closed meanwhile must not hide a lock the
+    // first try took. A process lock goes by the number each time, for the
+    // close dropped the locks of the process on the file.
     let mut named = None;
     loop {
         let turn = (|| {
             let _entries = rt::upcall::defer_entries().map_err(|_| EIO)?;
-            let (description, transport) = match named {
+            let (description, transport) = match named.filter(|_| input.command.ofd()) {
                 None => crate::shared::with_fd(fd, |files| {
                     let description = files.lock_begins(fd).map_err(crate::error)?;
                     Ok((description, files.transport()))
