@@ -4822,6 +4822,27 @@ const STARVATION_ENDS_WITHIN_10_S: &str = "yes";
 /// for room doubles from one millisecond to sixteen.
 const VOLLEY_REPEATS_MAX: u64 = 64;
 
+/// The rounds of the audit of the RAM file service that the steps probe
+/// saw end. A round starts every 250 ms of the clock, and the probe runs for
+/// seconds of it: a service whose audit stops after its first wait ends no
+/// more rounds.
+const AUDIT_ROUNDS_MIN: usize = 4;
+
+fn check_audit_rounds(lines: &[String]) -> Result<(), String> {
+    let rounds = lines
+        .iter()
+        .filter(|line| line.starts_with("ramfs: audit round "))
+        .count();
+    if rounds < AUDIT_ROUNDS_MIN {
+        return Err(format!(
+            "the RAM file service ended {rounds} rounds of its audit in the steps probe, \
+             fewer than {AUDIT_ROUNDS_MIN}: the audit does not go on after a wait"
+        ));
+    }
+    println!("ramfs: {rounds} rounds of the audit ended");
+    Ok(())
+}
+
 /// The longest step of the process service under -icount with the crowd
 /// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
 /// exec, the ends of all, and a Vouch with the identity channel full.
@@ -5143,6 +5164,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
     }
+    check_audit_rounds(&outcome.lines)?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");

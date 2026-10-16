@@ -290,6 +290,7 @@ fn main(_: u64) -> u64 {
         _audit_view: audit_view,
         audit_ready_ns: 0,
         audit_armed: false,
+        audit_rounds: 0,
         lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
         lock_paused: false,
         lock_sweep: SweepCursor::default(),
@@ -361,6 +362,8 @@ struct Fs {
     audit_ready_ns: u64,
     /// Whether the audit waits for its timer.
     audit_armed: bool,
+    /// The rounds of the audit that ended.
+    audit_rounds: u32,
     lock_share: ramfs::maintenance::Share,
     lock_paused: bool,
     lock_sweep: SweepCursor,
@@ -1810,14 +1813,12 @@ impl Service<0> for Fs {
             return;
         }
         // The slots with no session and no birth pass in this step.
-        let mut passed = 0;
-        while passed < AUDIT_EMPTY_RUN
-            && self.maintenance.remaining > 1
-            && self.audit_slot_empty(sessions, self.maintenance.position)
-        {
-            self.maintenance.complete(false, SESSIONS + BIRTHS);
-            passed += 1;
-        }
+        let departures = &self.departures;
+        let births = &*self.births;
+        self.maintenance
+            .skip_empty(SESSIONS + BIRTHS, AUDIT_EMPTY_RUN, |i| {
+                Self::slot_empty(departures, births, sessions, i)
+            });
         self.audit_ready_ns = now.saturating_add(AUDIT_STEP_NS);
         let mut client_work = false;
         let i = self.maintenance.position;
@@ -1833,7 +1834,13 @@ impl Service<0> for Fs {
             self.births[i - SESSIONS] = Some((label, fds));
         }
         work |= client_work;
+        let round_open = self.maintenance.remaining != 0;
         self.maintenance.complete(client_work, SESSIONS + BIRTHS);
+        if round_open && self.maintenance.remaining == 0 {
+            self.audit_rounds = self.audit_rounds.wrapping_add(1);
+            #[cfg(feature = "steps")]
+            rt::println!("ramfs: audit round {}", self.audit_rounds);
+        }
         // A maintenance notification makes reclamation progress with no client request.
         self.legacy_pending = self.maintenance_burst.again(
             work,
@@ -3159,12 +3166,17 @@ impl Fs {
     }
     /// Whether the slot `i` of the audit holds nothing to look at: no
     /// session, no birth, or a cell that has its own turns of cleanup.
-    fn audit_slot_empty(&self, sessions: &[Option<Session<Fds, 0>>], i: usize) -> bool {
-        self.departures.contains(i)
+    fn slot_empty(
+        departures: &ramfs::maintenance::Departures<{ (SESSIONS + BIRTHS).div_ceil(64) }>,
+        births: &[Option<(u64, Fds)>],
+        sessions: &[Option<Session<Fds, 0>>],
+        i: usize,
+    ) -> bool {
+        departures.contains(i)
             || if i < SESSIONS {
                 sessions.get(i).is_none_or(Option::is_none)
             } else {
-                self.births[i - SESSIONS].is_none()
+                births[i - SESSIONS].is_none()
             }
     }
     fn notify_maintenance(&self) {
