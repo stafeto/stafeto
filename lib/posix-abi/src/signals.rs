@@ -244,6 +244,34 @@ pub(crate) fn thread_pending(block: &Block) -> u64 {
         )
 }
 
+/// Whether a signal is pending that `mask` would let through and that a
+/// delivery would not discard: SIG_IGN and a default action of ignoring
+/// (SIGCHLD, SIGWINCH, SIGURG) end no wait.
+// Out of line to bypass an overlay of the schedule (see the task about step
+// accounting under preemption): inlined, the code of the hot signal path
+// shifts an entropy service step in process-steps under the run of the
+// services at level 40, and the step counts that time as its own.
+#[inline(never)]
+pub(crate) fn pending_acting(mask: SigSet) -> bool {
+    let open = (thread_pending(own()) | process_pending()) & !mask;
+    (1..=31).any(|signal| open & (1 << (signal - 1)) != 0 && !ignored(signal, &action(signal)))
+}
+
+/// Drops the signals of this thread that `mask` lets through and that a
+/// delivery would discard, so that their entries wake no wait again.
+#[inline(never)]
+pub(crate) fn discard_ignored(mask: SigSet) {
+    let block = own();
+    loop {
+        let open = thread_pending(block) & !mask;
+        let Some(signal) = (1..=31).find(|&s| open & (1 << (s - 1)) != 0 && ignored(s, &action(s)))
+        else {
+            return;
+        };
+        let _ = claim_thread_info(block, signal);
+    }
+}
+
 pub fn pending_unblocked() -> bool {
     let mask = own().mask.load(Ordering::SeqCst);
     (thread_pending(own()) | process_pending()) & !mask != 0

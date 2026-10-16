@@ -4,13 +4,12 @@
 //! Phase coordination after real WAIT replies, never a replacement service.
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use posix_abi::WaitProbe;
-use posix_fs::wait::WaitToken;
 static ARMED: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicU32 = AtomicU32::new(0);
 unsafe extern "C" {
     fn wait_probe_stage(stage: u32);
 }
-fn hook(phase: WaitProbe, _: WaitToken) -> bool {
+fn hook(phase: WaitProbe, _: proto_fs::WaitKey) -> bool {
     if phase == WaitProbe::Receive && ARMED.swap(false, Ordering::AcqRel) {
         // SAFETY: the lifetime C fixture provides the coordination function.
         unsafe { wait_probe_stage(1) };

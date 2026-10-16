@@ -15,8 +15,6 @@
 //! EIO to the operation that is still alive, or a place held longer, and
 //! never a second effect.
 
-mod lock_collect;
-
 use crate::constants::*;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::AtomicU32;
@@ -219,7 +217,6 @@ impl Service for Live {
         self.full_repeats = self.full_repeats.saturating_add(1);
         // What this process left behind may be what fills the table.
         collect(self.owner, self.here, Some(self.token), true);
-        crate::wait_lock_driver::collect(self.owner, self.here, None, true);
         // The pause grows from one millisecond to sixteen (a sleep of the
         // timer of the thread, outside the deferral of signals: a handler
         // that runs ends the sleep, the request goes again either way). The
@@ -317,8 +314,6 @@ pub(crate) fn take_place<R>(
     }
     loop {
         collect(Some(owner), here, None, true);
-        let lock_pending = collect_lock(Some(owner), here, None, true);
-        crate::wait_lock_driver::collect(Some(owner), here, None, true);
         crate::drain_hooks::collect(owner, here);
         let step = crate::shared::with_files(|files| match files.job_place(owner) {
             // Every job kind has custody separate from ordinary I/O holds.
@@ -327,7 +322,7 @@ pub(crate) fn take_place<R>(
                 Err(FsError::TooManyOpenFiles) => Err(EAGAIN),
                 Err(error) => Err(crate::error(error)),
             },
-            JobPlace::Full { own: true, .. } if !lock_pending => Err(EAGAIN),
+            JobPlace::Full { own: true, .. } => Err(EAGAIN),
             JobPlace::Full { sequence, .. } => Ok(Step::Wait(files.jobs_wait_address(), sequence)),
         })?;
         match step {
@@ -414,32 +409,6 @@ pub(crate) fn collect(
     }
 }
 
-/// Pay at most one Lock cleanup turn after selecting custody under the files lock.
-/// True retains an abandoned debt for the next admission or lifetime pass.
-fn collect_lock(
-    me: Option<OwnerToken>,
-    current: Frame,
-    skip: Option<ControlToken>,
-    blocking: bool,
-) -> bool {
-    let find = |files: &mut PosixFs| {
-        files
-            .pick_lock_cleanup(me, current, skip)
-            .map_err(crate::error)
-    };
-    lock_collect::turn(
-        || {
-            if blocking {
-                crate::shared::with_files(find)
-            } else {
-                crate::shared::try_with_files(find)
-            }
-        },
-        crate::lock_driver::cleanup_step,
-        wake_places,
-    )
-}
-
 /// The lifetime of the thread `owner` ended: its records lose the owner and
 /// wait for whoever collects (`help`). False when the lock of the files is
 /// busy; the caller asks again.
@@ -449,8 +418,6 @@ pub(crate) fn detach(owner: u64) -> bool {
     };
     crate::shared::try_with_files(|files| {
         while files.abandon_change_owner(owner).is_some() {}
-        while files.abandon_lock_owner(owner).is_some() {}
-        while files.abandon_wait_owner(owner).is_some() {}
         Ok(())
     })
     .is_ok()
@@ -460,8 +427,6 @@ pub(crate) fn detach(owner: u64) -> bool {
 /// collector of the threads pays their Release.
 pub(crate) fn help() {
     collect(None, Frame::main(0), None, false);
-    collect_lock(None, Frame::main(0), None, false);
-    crate::wait_lock_driver::collect(None, Frame::main(0), None, false);
 }
 
 /// The frame of the caller for an operation that takes a place: the same

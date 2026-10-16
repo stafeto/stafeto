@@ -36,9 +36,10 @@ extern int ram_close_event(void);
 extern int ram_lock_commands(int pid);
 extern int close_driver_receipts(void);
 extern int close_driver_full_places(void);
-extern int lock_driver_receipts(int fd);
-extern void lock_driver_signal_arm(unsigned mode);
-extern unsigned lock_driver_signal_disarm(void);
+extern int lock_loss_run(int fd, int copy, int other);
+extern int lock_loss_process(int fd);
+extern void lock_signal_arm(unsigned mode);
+extern unsigned lock_signal_disarm(void);
 extern void close_driver_jump_arm(int fd);
 extern int close_driver_jump_recover(int fd);
 static sigjmp_buf close_jump;
@@ -530,8 +531,8 @@ static size_t lock_stack_peak(void) {
 static void lock_signal(int number) {
     int saved_errno = errno;
     lock_signal_seen = number;
-    if (lock_signal_mode == 2 || lock_signal_mode == 7 || lock_signal_mode == 8)
-        siglongjmp(lock_jump, 1);
+    if (lock_signal_mode == 2) siglongjmp(lock_jump, 1);
+    if (lock_signal_mode == 3) pthread_exit(NULL);
     struct flock query;
     memset(&query, 0, sizeof query);
     query.l_type = F_WRLCK; query.l_whence = SEEK_SET;
@@ -540,16 +541,21 @@ static void lock_signal(int number) {
     errno = saved_errno;
 }
 void lock_probe_signal(void) { raise(SIGUSR1); }
+static int lock_async_sent;
+/* The signal is sent from another thread while this one is between the reply
+ * and the return of fcntl; the handler runs when the thread leaves it. */
 void lock_probe_signal_async(void) {
     __atomic_store_n(&lock_async_ready, 1, __ATOMIC_RELEASE);
-    while (lock_signal_seen != SIGUSR1) __asm__ volatile("yield");
+    while (!__atomic_load_n(&lock_async_sent, __ATOMIC_ACQUIRE))
+        __asm__ volatile("yield");
 }
 static void *lock_async_sender(void *argument) {
     while (!__atomic_load_n(&lock_async_ready, __ATOMIC_ACQUIRE))
         __asm__ volatile("yield");
-    return (void *)(uintptr_t)pthread_kill(*(pthread_t *)argument, SIGUSR1);
+    int sent = pthread_kill(*(pthread_t *)argument, SIGUSR1);
+    __atomic_store_n(&lock_async_sent, 1, __ATOMIC_RELEASE);
+    return (void *)(uintptr_t)sent;
 }
-void lock_probe_exit(void) { pthread_exit(NULL); }
 static void *lock_small_turn(void *argument) {
     unsigned mode = (unsigned)(uintptr_t)argument;
     if (lock_stack_begin()) return (void *)10;
@@ -563,16 +569,16 @@ static void *lock_small_turn(void *argument) {
     lock_signal_seen = 0;
     lock_signal_error = 0;
     if (sigsetjmp(lock_jump, 1) == 0) {
-        lock_driver_signal_arm(mode);
+        lock_signal_arm(mode);
         int result = fcntl(fd, 37, &lock);
-        if (mode == 2 || mode == 3 || mode == 7 || mode == 8 || mode == 9) return (void *)2;
-        if (mode == 6 && result != 0) return (void *)12;
+        if (mode == 2 || mode == 3) return (void *)2;
         if (result != 0 && errno != EBADF) return (void *)3;
         if (lock_signal_seen != SIGUSR1 || lock_signal_error) return (void *)4;
     }
-    if (lock_driver_signal_disarm() != 1) return (void *)5;
-    if (mode == 2 || mode == 7 || mode == 8) {
-        /* Admission must help the abandoned frame before close can fence it. */
+    if (lock_signal_disarm() != 1) return (void *)5;
+    if (mode == 2) {
+        /* After the jump the command count is balanced: a lock command and a
+         * close both go through. */
         struct flock admission;
         memset(&admission, 0, sizeof admission);
         admission.l_type = F_WRLCK; admission.l_whence = SEEK_SET;
@@ -609,17 +615,16 @@ static void public_lock_signals(void) {
     pthread_attr_t attributes;
     expect("lock pthread attributes", pthread_attr_init(&attributes), 0);
     expect("lock pthread published minimum", pthread_attr_setstacksize(&attributes, PTHREAD_STACK_MIN), 0);
-    for (unsigned turn = 0; turn < 107; turn++) {
-        /* Twenty departures and twenty jumps exceed the sixteen Control places.
-         * Later phases test signal interruption after the first request. */
+    for (unsigned turn = 0; turn < 45; turn++) {
+        /* Twenty departures and twenty jumps show that no turn leaves a
+         * count or a place behind. */
         unsigned mode = turn < 4 ? turn + 1 :
-                        turn < 24 ? 2 : turn < 44 ? 3 :
-                        turn < 45 ? 5 : turn < 46 ? 6 :
-                        turn < 66 ? 7 : turn < 86 ? 8 : turn < 106 ? 9 : 10;
+                        turn < 24 ? 2 : turn < 44 ? 3 : 10;
         pthread_t thread;
         pthread_t sender;
         void *result = (void *)99;
         __atomic_store_n(&lock_async_ready, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&lock_async_sent, 0, __ATOMIC_RELAXED);
         int started = pthread_create(&thread, &attributes, lock_small_worker,
                                      (void *)(uintptr_t)mode);
         expect("start minimum-stack lock worker", started, 0);
@@ -635,14 +640,13 @@ static void public_lock_signals(void) {
             expect("join asynchronous lock signal sender", pthread_join(sender, &result), 0);
             expect("asynchronous pthread_kill", (int)(uintptr_t)result, 0);
         }
-        if (mode == 3 || mode == 9) {
-            expect("thread departure reached accepted Start", lock_driver_signal_disarm(), 1);
+        if (mode == 3) {
+            expect("thread departure reached a lock reply", lock_signal_disarm(), 1);
             expect("departed lock fd is process shared", fcntl(lock_worker_fd, F_GETFD), 0);
             struct flock admission;
             memset(&admission, 0, sizeof admission);
             admission.l_type = F_WRLCK; admission.l_whence = SEEK_SET;
-            if (mode == 3)
-                expect("admit after departed owner before close", fcntl(lock_worker_fd, F_GETLK, &admission), 0);
+            expect("lock after the departed owner", fcntl(lock_worker_fd, F_GETLK, &admission), 0);
             expect("close departed thread lock", close(lock_worker_fd), 0);
         }
     }
@@ -659,6 +663,7 @@ static void public_lock_signals(void) {
 #include "lock-simple-wait.c"
 #include "lock-holder.c"
 #include "lock-page-fragments.c"
+#include "lock-sweep-share.c"
 #if LOCK_FIFO_FULL_ONLY
 #include "lock-fifo-full.c"
 #endif
@@ -677,7 +682,7 @@ int main(int argc, char **argv) {
     }
 #endif
     if (argc > 1 && strcmp(argv[1], "page-fragments-run") == 0)
-        return public_lock_page_fragments();
+        return public_lock_page_fragments() || public_lock_sweep_share();
     if (PAGE_FRAGMENTS_ONLY && argc <= 1) {
         char *args[] = {"procs-child", "page-fragments-run", NULL}, *env[] = {NULL};
         pid_t child = -1;
@@ -753,16 +758,37 @@ int main(int argc, char **argv) {
     int receipt_fd = open("/tmp/public-lock-receipts", O_CREAT | O_RDWR, 0666);
     expect("open public lock receipt file", receipt_fd >= 0, 1);
     if (receipt_fd >= 0) {
-        expect("public lock lost replies and numeric reuse", lock_driver_receipts(receipt_fd), 0);
-        expect("close public lock receipt file", close(receipt_fd), 0);
+        /* The probe closes receipt_fd itself, while a reply is lost. */
+        int copy = dup(receipt_fd);
+        int other = open("/tmp/public-lock-receipts", O_RDWR);
+        expect("copy and second description of the receipt file", copy >= 0 && other >= 0, 1);
+        expect("public lock replies lost to a signal", lock_loss_run(receipt_fd, copy, other), 0);
+        if (copy >= 0) expect("close copy of the receipt file", close(copy), 0);
+        if (other >= 0) expect("close second receipt description", close(other), 0);
+        /* A process lock: the number closed while the reply is lost leaves no lock. */
+        int number = open("/tmp/public-lock-receipts", O_RDWR);
+        int alive = number >= 0 ? dup(number) : -1;
+        expect("number and copy for the process lock", number >= 0 && alive >= 0, 1);
+        if (alive >= 0) {
+            expect("process lock repeat after a closed number", lock_loss_process(number), EBADF);
+            pid_t observer = fork();
+            if (observer == 0) {
+                int probe = open("/tmp/public-lock-receipts", O_RDWR);
+                struct flock query = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 300, .l_len = 5};
+                _exit(probe >= 0 && fcntl(probe, F_GETLK, &query) == 0 && query.l_type == F_UNLCK ? 0 : 1);
+            }
+            expect("fork the observer of the process lock", observer >= 0, 1);
+            if (observer > 0) reap(observer, 0);
+            close(alive);
+        }
     }
     public_lock_signals();
     public_wait_locks();
+    public_wait_quiet_signals();
     public_wait_fifo();
     public_wait_lifecycle();
     public_wait_process_exit();
     public_wait_arbitrary_jumps();
-    public_wait_pending_rotation();
     public_lock_deadlocks();
     public_simple_wait_graphs();
     public_lock_holders();

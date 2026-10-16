@@ -22,8 +22,7 @@ use ramfs::authority::{
 };
 use ramfs::job::{JobOperation, PathJob, ResolveJob, Seconds};
 use ramfs::locks::Owner;
-use ramfs::locks::jobs::Queue as LockQueue;
-use ramfs::locks::simple::{Command, Error as LockError, Response, SimpleLocks, SweepCursor};
+use ramfs::locks::simple::{Command, Response, SimpleLocks, SweepCursor};
 use ramfs::locks::simple_wait::Waits;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
@@ -109,10 +108,6 @@ struct LocksBss(UnsafeCell<core::mem::MaybeUninit<SimpleLocks>>);
 // SAFETY: the sole service thread initializes and owns all lock tables.
 unsafe impl Sync for LocksBss {}
 static LOCKS: LocksBss = LocksBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
-struct LockJobsBss(UnsafeCell<core::mem::MaybeUninit<LockQueue>>);
-// SAFETY: the sole service thread initializes and owns prepaid request custody.
-unsafe impl Sync for LockJobsBss {}
-static LOCK_JOBS: LockJobsBss = LockJobsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 struct WaitJobsBss(UnsafeCell<core::mem::MaybeUninit<WaitQueue>>);
 // SAFETY: the sole service thread initializes and owns independent WAIT custody.
 unsafe impl Sync for WaitJobsBss {}
@@ -123,6 +118,13 @@ unsafe impl Sync for WaitsBss {}
 static WAITS: WaitsBss = WaitsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
+const PACE_TIMER_LABEL: u64 = 0x5041_4345;
+/// The share of its time that the service gives to the maintenance of locks
+/// (the sweep of the table and the evaluation of waits): at most a quarter of
+/// every window. Beyond it the service sleeps to the end of the window and
+/// the clients below its priority run, however many inodes hold locks.
+const LOCK_WINDOW_NS: u64 = 10_000_000;
+const LOCK_BUDGET_NS: u64 = 2_500_000;
 /// Inodes without locks that one turn of the lock sweep passes. The circle
 /// has 1285 inodes and restarts every period of the wait timer; a turn per
 /// inode kept the service runnable for the whole period and held back the
@@ -201,12 +203,6 @@ fn main(_: u64) -> u64 {
         SimpleLocks::initialize_at(pointer);
         &mut *pointer
     };
-    // SAFETY: initialization writes each field directly into exclusive permanent storage.
-    let lock_jobs = unsafe {
-        let pointer = (*LOCK_JOBS.0.get()).as_mut_ptr();
-        LockQueue::initialize_at(pointer);
-        &mut *pointer
-    };
     // SAFETY: independent exclusive permanent allocations are initialized in place.
     let (wait_jobs, waits) = unsafe {
         let jobs = (*WAIT_JOBS.0.get()).as_mut_ptr();
@@ -235,6 +231,13 @@ fn main(_: u64) -> u64 {
     let Ok(wait_timer) = sys::timer_create(&wait_view, level) else {
         return 3;
     };
+    let Ok(pace_view) = sys::handle_label(&channel, Rights::RECEIVE, PACE_TIMER_LABEL, level)
+    else {
+        return 3;
+    };
+    let Ok(pace_timer) = sys::timer_create(&pace_view, level) else {
+        return 3;
+    };
     let heartbeat = Heartbeat {
         to: &start.parent,
         period_ns,
@@ -251,7 +254,6 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<Tables>()
             + core::mem::size_of::<Index>()
             + core::mem::size_of::<SimpleLocks>()
-            + core::mem::size_of::<LockQueue>()
             + core::mem::size_of::<WaitQueue>()
             + core::mem::size_of::<Waits<Handle<Channel>>>()
             + core::mem::size_of::<Ram<'static>>()
@@ -262,12 +264,15 @@ fn main(_: u64) -> u64 {
     let mut fs = Fs {
         ram,
         locks,
-        lock_jobs,
         wait_jobs,
         waits,
         wait_timer,
         _wait_view: wait_view,
         wait_timer_armed: false,
+        pace_timer,
+        _pace_view: pace_view,
+        lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
+        lock_paused: false,
         lock_sweep: SweepCursor::default(),
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
@@ -322,12 +327,16 @@ fn main(_: u64) -> u64 {
 struct Fs {
     ram: &'static mut Ram<'static>,
     locks: &'static mut SimpleLocks,
-    lock_jobs: &'static mut LockQueue,
     wait_jobs: &'static mut WaitQueue,
     waits: &'static mut Waits<Handle<Channel>>,
     wait_timer: Handle<Timer>,
     _wait_view: Handle<Channel>,
     wait_timer_armed: bool,
+    /// Ends the pause of lock maintenance at the end of its window.
+    pace_timer: Handle<Timer>,
+    _pace_view: Handle<Channel>,
+    lock_share: ramfs::maintenance::Share,
+    lock_paused: bool,
     lock_sweep: SweepCursor,
     lock_sweep_pending: bool,
     lock_maintenance_turn: bool,
@@ -505,15 +514,12 @@ impl Fs {
     }
 
     fn lock_custody_empty(
-        queue: &LockQueue,
         wait_queue: &WaitQueue,
         places: &ramfs::places::Places,
         fds: &Fds,
         label: u64,
     ) -> bool {
         fds.custody_empty()
-            && (!fds.departed || fds.lock_departure == 16)
-            && !queue.retains(places.place(label), label)
             && fds.wait_departure == 16
             && !wait_queue.retains(places.place(label), label)
     }
@@ -789,15 +795,6 @@ impl Fs {
 
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
-        if fds.departed && fds.lock_departure < 16 {
-            self.lock_jobs.depart(
-                self.places.place(label),
-                label,
-                usize::from(fds.lock_departure),
-            );
-            fds.lock_departure += 8;
-            return true;
-        }
         if fds.departed && fds.wait_departure < 16 {
             self.waits.departure(
                 self.wait_jobs,
@@ -1548,26 +1545,14 @@ impl Service<0> for Fs {
         self.waits.poll();
         self.lock_sweep.restart();
         self.lock_sweep_pending = self.locks.has_locks();
-        if !Self::lock_custody_empty(
-            self.lock_jobs,
-            self.wait_jobs,
-            self.places,
-            &s.data,
-            s.label(),
-        ) {
+        if !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label()) {
             self.departures.admit(self.places.place(s.label()));
         }
     }
 
     fn keep_departed(&self, s: &Session<Fds, 0>) -> bool {
         s.data.departed
-            && !Self::lock_custody_empty(
-                self.lock_jobs,
-                self.wait_jobs,
-                self.places,
-                &s.data,
-                s.label(),
-            )
+            && !Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, s.label())
     }
 
     /// A never-used clone retains its paid birth until cleanup finishes.
@@ -1588,7 +1573,7 @@ impl Service<0> for Fs {
             self.waits.poll();
             self.lock_sweep.restart();
             self.lock_sweep_pending = self.locks.has_locks();
-            if !Self::lock_custody_empty(self.lock_jobs, self.wait_jobs, self.places, fds, label) {
+            if !Self::lock_custody_empty(self.wait_jobs, self.places, fds, label) {
                 self.departures.admit(SESSIONS + i);
                 return;
             }
@@ -1617,6 +1602,11 @@ impl Service<0> for Fs {
             self.notify_maintenance();
             return;
         }
+        if notice.source == rt::abi::Source::Timer && notice.label == PACE_TIMER_LABEL {
+            self.lock_paused = false;
+            self.notify_maintenance();
+            return;
+        }
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
             self.legacy_pending = true;
@@ -1632,15 +1622,13 @@ impl Service<0> for Fs {
             );
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
-        self.lock_maintenance_turn = !self.lock_maintenance_turn;
+        self.lock_maintenance_turn = !self.lock_maintenance_turn && !self.lock_paused;
         if self.lock_maintenance_turn {
-            self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 3;
-            if self.lock_maintenance_work == 0 {
-                self.lock_jobs.cleanup_released(&mut self.ram.storage);
-            }
+            let began = rt::time::ticks_to_ns(rt::time::now());
+            self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 2;
             let page = self.lifetimes.as_ref();
             let (storage, descriptions) = self.ram.lock_parts();
-            if self.lock_maintenance_work == 1 && self.lock_sweep_pending {
+            if self.lock_maintenance_work == 0 && self.lock_sweep_pending {
                 self.locks
                     .sweep_run(
                         storage,
@@ -1658,7 +1646,7 @@ impl Service<0> for Fs {
                     self.lock_sweep.stop();
                 }
             }
-            if self.lock_maintenance_work == 2 {
+            if self.lock_maintenance_work == 1 {
                 let births = &*self.births;
                 let places = self.places;
                 self.waits.maintenance(
@@ -1690,6 +1678,13 @@ impl Service<0> for Fs {
                         let _ = sys::notify(handle, 1);
                     },
                 );
+            }
+            let ended = rt::time::ticks_to_ns(rt::time::now());
+            if let Some(until) = self.lock_share.charge(ended, ended.saturating_sub(began))
+                && self.lock_work_pending()
+            {
+                // The budget of this window is spent: sleep to its end.
+                self.lock_paused = sys::timer_set(&self.pace_timer, until).is_ok();
             }
             self.refresh_wait_timer();
             self.notify_maintenance();
@@ -1741,25 +1736,13 @@ impl Service<0> for Fs {
                 work = self.cleanup_step(&mut s.data, label);
                 (
                     label,
-                    Self::lock_custody_empty(
-                        self.lock_jobs,
-                        self.wait_jobs,
-                        self.places,
-                        &s.data,
-                        label,
-                    ),
+                    Self::lock_custody_empty(self.wait_jobs, self.places, &s.data, label),
                 )
             } else {
                 let birth = &mut self.births[i - SESSIONS];
                 let (label, mut fds) = birth.take().expect("retained departed birth");
                 work = self.cleanup_step(&mut fds, label);
-                let complete = Self::lock_custody_empty(
-                    self.lock_jobs,
-                    self.wait_jobs,
-                    self.places,
-                    &fds,
-                    label,
-                );
+                let complete = Self::lock_custody_empty(self.wait_jobs, self.places, &fds, label);
                 self.births[i - SESSIONS] = Some((label, fds));
                 (label, complete)
             };
@@ -2073,9 +2056,6 @@ impl Service<0> for Fs {
                         | Method::DataAck
                         | Method::ChangeRelease
                         | Method::LockStart
-                        | Method::LockQuery
-                        | Method::LockCancel
-                        | Method::LockRelease
                         | Method::WaitStart
                         | Method::WaitQuery
                         | Method::WaitArm
@@ -2093,10 +2073,7 @@ impl Service<0> for Fs {
         if r.method() == Method::BindPending as u16 {
             return self.bind_pending(r);
         }
-        if matches!(
-            Method::from_number(r.method()),
-            Some(Method::LockStart | Method::LockQuery | Method::LockRelease | Method::LockCancel)
-        ) {
+        if matches!(Method::from_number(r.method()), Some(Method::LockStart)) {
             return self.lock_request(&mut s.data, r);
         }
         if matches!(
@@ -2116,38 +2093,6 @@ impl Service<0> for Fs {
             Some(Method::OpenFifoGrant | Method::OpenFifoAck)
         ) {
             return self.fifo_request(&mut s.data, r);
-        }
-        // Keyed common operations preserve the native lock family's custody.
-        if matches!(
-            Method::from_number(r.method()),
-            Some(
-                Method::DataStart
-                    | Method::DataQuery
-                    | Method::DataCancel
-                    | Method::DataAck
-                    | Method::DataReadResult
-                    | Method::ChangeStart
-                    | Method::ChangeSecond
-                    | Method::ChangeStep
-                    | Method::ChangeQuery
-                    | Method::ChangeRelease
-                    | Method::OpenStart
-                    | Method::OpenCancel
-                    | Method::OpenQuery
-                    | Method::OpenFinish
-            )
-        ) {
-            let mut body = r.body();
-            if let (Ok(slot), Ok(generation)) = (body.u32(), body.u64())
-                && (32..48).contains(&slot)
-                && generation != 0
-            {
-                let place = self.places.place(r.label());
-                match self.lock_jobs.occupied(place, r.label(), slot) {
-                    Ok(None) => {}
-                    Ok(Some(_)) | Err(_) => return status(proto_fs::PERMISSION),
-                }
-            }
         }
         if matches!(
             Method::from_number(r.method()),
@@ -2308,7 +2253,6 @@ impl Service<0> for Fs {
                 .and_then(|()| reply.u32(u32::from(live)))
                 .and_then(|()| reply.u64(memory.quota))
                 .and_then(|()| reply.u64(memory.used))
-                .and_then(|()| reply.u32(self.lock_jobs.retained() as u32))
                 .and_then(|()| reply.u32(self.places.used() as u32))
                 .is_err()
             {
@@ -2852,9 +2796,6 @@ impl Service<0> for Fs {
                 | Method::ChangeQuery
                 | Method::ChangeRelease
                 | Method::LockStart
-                | Method::LockQuery
-                | Method::LockCancel
-                | Method::LockRelease
                 | Method::WaitStart
                 | Method::WaitQuery
                 | Method::WaitCancel
@@ -3172,7 +3113,7 @@ impl Fs {
         }
     }
     fn lock_work_pending(&self) -> bool {
-        self.lock_jobs.has_work() || self.waits.needs_work() || self.lock_sweep_pending
+        !self.lock_paused && (self.waits.needs_work() || self.lock_sweep_pending)
     }
     fn register_lifetimes(&mut self) -> bool {
         if self.lifetimes.is_some() {
@@ -3322,7 +3263,6 @@ impl Fs {
         Self::drop_identity_fields(ram, identities, fds);
         fds.binding = Binding::Cleanup;
         fds.departed = true;
-        fds.lock_departure = 0;
         fds.wait_departure = 0;
     }
 
@@ -4290,57 +4230,22 @@ impl Fs {
             _ => unreachable!(),
         }
     }
-    fn common_control_busy(&self, fds: &Fds, owner: u64, slot: u32) -> bool {
-        fds.resolvers
-            .iter()
-            .copied()
-            .filter(|&id| id != 0)
-            .any(|id| {
-                self.jobs
-                    .get((id & 255) as usize)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|job| {
-                        job.id == id
-                            && job.owner == owner
-                            && job.open_key.is_some_and(|key| key.slot == slot)
-                    })
-            })
-    }
-
+    /// One step: capture the region, apply the command, answer with the
+    /// result. Nothing is retained; a repeated request recomputes the same
+    /// answer, because a query changes nothing and a set is idempotent for
+    /// one owner.
     fn lock_start(
         &mut self,
         fds: &mut Fds,
-        place: usize,
         owner: u64,
         wire: proto_fs::LockStart,
     ) -> Result<proto_fs::LockReply, u32> {
         wire.validate().map_err(|error| error.code())?;
-        if let Some(id) = self.lock_jobs.occupied(place, owner, wire.key.slot)? {
-            if id.key() != wire.key {
-                return Err(if wire.key.generation <= id.key().generation {
-                    proto_fs::OPEN_RETIRED
-                } else {
-                    proto_fs::JOBS_FULL
-                });
-            }
-            self.lock_jobs.same_start(id, wire)?;
-            return self.lock_jobs.query(id);
-        }
         self.authenticate(fds, owner)?;
         if !wire.command.ofd() && !self.register_lifetimes() {
             return Err(proto_fs::NO_LOCKS);
         }
-        if self.common_control_busy(fds, owner, wire.key.slot) {
-            return Err(proto_fs::JOBS_FULL);
-        }
-        if wire.key.generation <= fds.open_watermarks[wire.key.slot as usize] {
-            return Err(proto_fs::OPEN_RETIRED);
-        }
         let captured = self.ram.capture_lock(fds, wire)?;
-        let id = self
-            .lock_jobs
-            .admit(place, owner, wire, captured, &mut self.ram.storage)?;
-        fds.open_watermarks[wire.key.slot as usize] = wire.key.generation;
         let page = self.lifetimes.as_ref();
         let (storage, descriptions) = self.ram.lock_parts();
         let live = |owner| match owner {
@@ -4364,10 +4269,6 @@ impl Fs {
                     .map(|()| Response::Changed),
             }
         };
-        let reply = ramfs::locks::request::reply(result);
-        self.lock_jobs
-            .complete_queued(id, reply)
-            .expect("paid synchronous lock receipt");
         if result == Ok(Response::Changed)
             && self.locks.revision(captured.request.inode) != previous_revision
         {
@@ -4376,7 +4277,7 @@ impl Fs {
         if let Some(owner) = self.locks.take_started() {
             self.waits.owner_started(owner);
         }
-        Ok(reply)
+        Ok(ramfs::locks::request::reply(result))
     }
 
     fn lock_request(&mut self, fds: &mut Fds, r: &mut Request<'_>) -> Answer {
@@ -4386,62 +4287,11 @@ impl Fs {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
-        let owner = r.label();
-        let place = self.places.place(owner);
-        let method = Method::from_number(r.method()).expect("native lock method");
-        let result = if method == Method::LockStart {
-            let wire = match proto_fs::LockStart::read(r.body()) {
-                Ok(wire) => wire,
-                Err(error) => return Answer::Status(error),
-            };
-            self.lock_start(fds, place, owner, wire)
-        } else {
-            let key = match proto_fs::read_lock_key(r.body()) {
-                Ok(key) => key,
-                Err(error) => return Answer::Status(error),
-            };
-            if self.common_control_busy(fds, owner, key.slot) {
-                return status(proto_fs::PERMISSION);
-            }
-            let occupied = match self.lock_jobs.occupied(place, owner, key.slot) {
-                Ok(id) => id.filter(|id| id.key() == key),
-                Err(code) => return status(code),
-            };
-            if method == Method::LockRelease {
-                fds.open_watermarks[key.slot as usize] =
-                    fds.open_watermarks[key.slot as usize].max(key.generation);
-                let result = occupied.map_or(Ok(true), |id| {
-                    self.lock_jobs.release(id, &mut self.ram.storage)
-                });
-                self.notify_maintenance();
-                return match result {
-                    Ok(true) => Answer::Status(Status::Ok),
-                    Ok(false) => status(proto_fs::RESOLVING),
-                    Err(code) => status(code),
-                };
-            }
-            if method == Method::LockCancel {
-                fds.open_watermarks[key.slot as usize] =
-                    fds.open_watermarks[key.slot as usize].max(key.generation);
-                occupied.map_or_else(
-                    || Ok(ramfs::locks::request::reply(Err(LockError::Cancelled))),
-                    |id| self.lock_jobs.query(id),
-                )
-            } else {
-                occupied.map_or_else(
-                    || {
-                        Err(
-                            if key.generation <= fds.open_watermarks[key.slot as usize] {
-                                proto_fs::OPEN_RETIRED
-                            } else {
-                                proto_fs::NO_ENTRY
-                            },
-                        )
-                    },
-                    |id| self.lock_jobs.query(id),
-                )
-            }
+        let wire = match proto_fs::LockStart::read(r.body()) {
+            Ok(wire) => wire,
+            Err(error) => return Answer::Status(error),
         };
+        let result = self.lock_start(fds, r.label(), wire);
         self.refresh_wait_timer();
         self.notify_maintenance();
         match result {

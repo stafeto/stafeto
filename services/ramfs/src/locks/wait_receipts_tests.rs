@@ -3,7 +3,7 @@
 extern crate std;
 use super::*;
 use crate::{Fds, Ram, storage::Root};
-use proto_fs::{DataDescription, LockCommand, LockKind, LockStart, OpenKey, WaitMode};
+use proto_fs::{DataDescription, LockCommand, LockKind, LockStart, WaitMode};
 
 fn queue() -> std::boxed::Box<Queue> {
     let mut allocation = std::boxed::Box::<Queue>::new_uninit();
@@ -36,10 +36,6 @@ fn fixture(ram: &mut Ram<'_>) -> (WaitStart, Captured) {
         pid: 0,
     };
     let capture = LockStart {
-        key: OpenKey {
-            slot: 32,
-            generation: 1,
-        },
         description: wire.description,
         command: LockCommand::SetOfd,
         kind: wire.kind,

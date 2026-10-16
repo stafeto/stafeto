@@ -4,7 +4,7 @@
 //! Immutable numeric close events retain physical debt through canonical confirmation.
 
 use crate::constants::*;
-use posix_fs::closing::{Asked, CloseAdmission, CloseCommandFence, CloseToken, OwnerToken};
+use posix_fs::closing::{Asked, CloseAdmission, CloseToken, OwnerToken};
 use posix_fs::{DescriptorFlags, FsError, Target, Transport};
 use proto_wire::Status;
 
@@ -46,14 +46,13 @@ fn ram(target: Target) -> Option<posix_fs::RamTarget> {
 }
 
 enum Admission {
-    /// The record this call started, its snapshot and fence read under the
+    /// The record this call started and its snapshot read under the
     /// admitting lock: the first turn needs no second look.
     Started(
         CloseToken,
         u32,
         Transport,
         posix_fs::closing::Snapshot,
-        Option<CloseCommandFence>,
         Option<Asked>,
     ),
     Pending(CloseToken),
@@ -126,17 +125,13 @@ fn operation(
                 None => files.begin_close_record(owner, fd, frame),
             };
             match result {
-                Ok(CloseAdmission::Started { token, snapshot }) => {
-                    let fence = files.close_command_fence(token).map_err(crate::error)?;
-                    Ok(Admission::Started(
-                        token,
-                        fd,
-                        files.transport(),
-                        snapshot,
-                        fence,
-                        files.record_locks_question(),
-                    ))
-                }
+                Ok(CloseAdmission::Started { token, snapshot }) => Ok(Admission::Started(
+                    token,
+                    fd,
+                    files.transport(),
+                    snapshot,
+                    files.record_locks_question(),
+                )),
                 Ok(CloseAdmission::PendingClose(token)) => Ok(Admission::Pending(token)),
                 Ok(CloseAdmission::PendingOpen(token)) => Ok(Admission::Open(token)),
                 Ok(CloseAdmission::Replaced(number)) => {
@@ -147,10 +142,10 @@ fn operation(
             }
         })?;
         match step {
-            Admission::Started(token, number, transport, snapshot, fence, asked) => {
+            Admission::Started(token, number, transport, snapshot, asked) => {
                 // Only this admitted continuation may infer success after an exact
                 // helper retires the confirmed record, including a delayed reply.
-                if first_turn(token, transport, snapshot, fence, asked)? {
+                if first_turn(token, transport, snapshot, asked)? {
                     return Ok(number);
                 }
                 drive(token)?;
@@ -174,27 +169,14 @@ fn operation(
     }
 }
 
-/// One unlocked helper turn on the lock debt that fences the record.
-fn fence_turn(debt: CloseCommandFence) -> Result<(), i32> {
-    match debt {
-        CloseCommandFence::Control(token) => crate::lock_driver::cleanup_step(token).map(drop),
-        CloseCommandFence::Wait(token) => crate::wait_lock_driver::cleanup_step(token).map(drop),
-    }
-}
-
 /// The first turn of the record this call admitted, from the state the
 /// admission read: Ok(true) when the record is retired.
 fn first_turn(
     token: CloseToken,
     transport: Transport,
     snapshot: posix_fs::closing::Snapshot,
-    fence: Option<CloseCommandFence>,
     asked: Option<Asked>,
 ) -> Result<bool, i32> {
-    if let Some(debt) = fence {
-        fence_turn(debt)?;
-        return Ok(false);
-    }
     if snapshot.complete {
         return Ok(false);
     }
@@ -217,16 +199,11 @@ fn step(token: CloseToken) -> Result<bool, i32> {
         let Ok(snapshot) = files.close_snapshot(token) else {
             return Ok(None);
         };
-        let fence = files.close_command_fence(token).map_err(crate::error)?;
-        Ok(Some((files.transport(), snapshot, fence)))
+        Ok(Some((files.transport(), snapshot)))
     })?;
-    let Some((transport, snapshot, fence)) = state else {
+    let Some((transport, snapshot)) = state else {
         return Ok(true);
     };
-    if let Some(debt) = fence {
-        fence_turn(debt)?;
-        return Ok(false);
-    }
     if !snapshot.complete {
         return event_step(token, transport, snapshot, None);
     }

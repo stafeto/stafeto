@@ -13,7 +13,6 @@ pub mod drain;
 pub mod fifo;
 pub mod open;
 mod target;
-pub mod wait;
 pub use target::{FifoTarget, RamTarget};
 
 use core::mem::ManuallyDrop;
@@ -243,17 +242,14 @@ pub struct PosixFs {
     terminal: Option<Handle<Channel>>,
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>,
-    waits: posix_fd::WaitRecords<wait::Recovery>,
     /// What the process knows about its record locks (`closing`).
     record_locks: closing::RecordLocks,
 }
 
-const _: () = assert!(core::mem::size_of::<wait::Recovery>() == 88);
-const _: () = assert!(core::mem::size_of::<posix_fd::WaitRecords<wait::Recovery>>() == 2560);
 const _: () = assert!(core::mem::size_of::<PosixFs>() <= 20480);
 
 // Typed control receipts retain their complete immutable source and outcome.
-const _: () = assert!(core::mem::size_of::<control::Recovery>() == 128);
+const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
 const _: () = assert!(
     core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 17408
 );
@@ -997,7 +993,6 @@ impl PosixFs {
             core::ptr::addr_of_mut!((*destination).pipes).write(pipes);
             core::ptr::addr_of_mut!((*destination).terminal).write(terminal);
             core::ptr::addr_of_mut!((*destination).paths).write(paths);
-            posix_fd::WaitRecords::initialize_at(core::ptr::addr_of_mut!((*destination).waits));
             Table::initialize_at(
                 core::ptr::addr_of_mut!((*destination).descriptors),
                 |target| matches!(target, Target::Tty(_)),
@@ -1098,7 +1093,8 @@ impl PosixFs {
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
         core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
-        self.discard_wait_after_fork();
+        // The threads that were in a lock command do not exist in the child.
+        self.lock_commands_forgotten();
         self.descriptors.discard_open_after_fork();
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
@@ -1210,7 +1206,6 @@ impl PosixFs {
             terminal: None,
             paths: PathState::new(),
             descriptors,
-            waits: posix_fd::WaitRecords::new(),
             record_locks: closing::RecordLocks::new(),
         })
     }
