@@ -167,8 +167,54 @@ static void public_wait_lifecycle(void) {
     expect("close lifecycle source", close(lifecycle_fd), 0);
     if (!failures) printf("posix-procs: WAIT thread end, fork with exec in the child and slot reuse ok\n");
 }
+/* A process executes a new image while a thread of the old one is in the wait:
+ * the image goes on as the same process, and the wait is gone with the old one. */
+static void public_wait_exec(void) {
+    int commands[2], replies[2];
+    pid_t holder;
+    lifecycle_fd = open("/tmp/public-wait-exec", O_CREAT | O_RDWR, 0666);
+    expect("open exec source", lifecycle_fd >= 0, 1);
+    if (lifecycle_fd < 0) return;
+    lifecycle_holder(commands, replies, &holder, NULL);
+    if (holder < 0) { close(lifecycle_fd); return; }
+    expect("exec blocker", wait_holder_exchange(commands[1], replies[0], 'L'), 1);
+    int ready[2];
+    if (pipe(ready)) { expect("exec pipe", 0, 1); lifecycle_stop(commands, replies, holder); close(lifecycle_fd); return; }
+    pid_t peer = fork();
+    expect("fork exec peer", peer >= 0, 1);
+    if (peer == 0) {
+        close(ready[0]);
+        __atomic_store_n(&wait_ready, 0, __ATOMIC_RELEASE);
+        wait_driver_arm(1);
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, lifecycle_plain_worker, NULL)) _exit(84);
+        if (!wait_stage(1)) _exit(85);
+        struct timespec settle = {0, 20000000}; nanosleep(&settle, NULL);
+        char ok = 'W';
+        if (write(ready[1], &ok, 1) != 1) _exit(86);
+        char *arguments[] = {"procs-child", "sleep", NULL};
+        char *environment[] = {NULL};
+        execve("/bin/procs-child", arguments, environment);
+        _exit(88);
+    }
+    close(ready[1]);
+    if (peer > 0) {
+        char accepted = 0;
+        expect("the peer waits in the service", read(ready[0], &accepted, 1), 1);
+        struct timespec settle = {0, 50000000}; nanosleep(&settle, NULL);
+        expect("the executed image of the same process leaves no waiter", wait_ghost_free(commands[1], replies[0]), 1);
+        expect("end the executed image", kill(peer, SIGKILL), 0);
+        int status = 0;
+        expect("reap the executed image", waitpid(peer, &status, 0), peer);
+    }
+    close(ready[0]);
+    lifecycle_stop(commands, replies, holder);
+    expect("close exec source", close(lifecycle_fd), 0);
+    if (!failures) printf("posix-procs: WAIT of a thread that exec replaces leaves nothing in the service ok\n");
+}
 /* A process dies with a thread in the wait. */
 void public_wait_process_exit(void) {
+    public_wait_exec();
     int commands[2], replies[2];
     pid_t holder;
     lifecycle_fd = open("/tmp/public-wait-process-exit", O_CREAT | O_RDWR, 0666);

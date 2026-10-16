@@ -31,14 +31,14 @@ fn hook() -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lock_driver_signal_arm(mode: u32) {
+pub extern "C" fn lock_signal_arm(mode: u32) {
     SEEN.store(0, Ordering::Release);
     MODE.store(mode, Ordering::Release);
     ARMED.store(true, Ordering::Release);
     posix_abi::probe_lock_hook(Some(hook));
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn lock_driver_signal_disarm() -> u32 {
+pub extern "C" fn lock_signal_disarm() -> u32 {
     posix_abi::probe_lock_hook(None);
     ARMED.store(false, Ordering::Release);
     let idle = posix_abi::shared::with_files(|files| Ok(files.no_lock_command())).unwrap_or(false);

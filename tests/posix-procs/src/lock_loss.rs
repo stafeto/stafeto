@@ -105,7 +105,7 @@ fn run(fd: i32) -> Result<(), i32> {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn lock_driver_receipts(fd: i32) -> i32 {
+extern "C" fn lock_loss_run(fd: i32) -> i32 {
     let began = rt::time::now();
     posix_abi::probe_lock_hook(Some(hook));
     let result = run(fd);

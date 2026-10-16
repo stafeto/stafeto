@@ -36,9 +36,9 @@ extern int ram_close_event(void);
 extern int ram_lock_commands(int pid);
 extern int close_driver_receipts(void);
 extern int close_driver_full_places(void);
-extern int lock_driver_receipts(int fd);
-extern void lock_driver_signal_arm(unsigned mode);
-extern unsigned lock_driver_signal_disarm(void);
+extern int lock_loss_run(int fd);
+extern void lock_signal_arm(unsigned mode);
+extern unsigned lock_signal_disarm(void);
 extern void close_driver_jump_arm(int fd);
 extern int close_driver_jump_recover(int fd);
 static sigjmp_buf close_jump;
@@ -568,13 +568,13 @@ static void *lock_small_turn(void *argument) {
     lock_signal_seen = 0;
     lock_signal_error = 0;
     if (sigsetjmp(lock_jump, 1) == 0) {
-        lock_driver_signal_arm(mode);
+        lock_signal_arm(mode);
         int result = fcntl(fd, 37, &lock);
         if (mode == 2 || mode == 3) return (void *)2;
         if (result != 0 && errno != EBADF) return (void *)3;
         if (lock_signal_seen != SIGUSR1 || lock_signal_error) return (void *)4;
     }
-    if (lock_driver_signal_disarm() != 1) return (void *)5;
+    if (lock_signal_disarm() != 1) return (void *)5;
     if (mode == 2) {
         /* After the jump the command count is balanced: a lock command and a
          * close both go through. */
@@ -615,8 +615,8 @@ static void public_lock_signals(void) {
     expect("lock pthread attributes", pthread_attr_init(&attributes), 0);
     expect("lock pthread published minimum", pthread_attr_setstacksize(&attributes, PTHREAD_STACK_MIN), 0);
     for (unsigned turn = 0; turn < 45; turn++) {
-        /* Twenty departures and twenty jumps exceed the sixteen Control places.
-         * Later phases test signal interruption after the first request. */
+        /* Twenty departures and twenty jumps show that no turn leaves a
+         * count or a place behind. */
         unsigned mode = turn < 4 ? turn + 1 :
                         turn < 24 ? 2 : turn < 44 ? 3 : 10;
         pthread_t thread;
@@ -640,7 +640,7 @@ static void public_lock_signals(void) {
             expect("asynchronous pthread_kill", (int)(uintptr_t)result, 0);
         }
         if (mode == 3) {
-            expect("thread departure reached a lock reply", lock_driver_signal_disarm(), 1);
+            expect("thread departure reached a lock reply", lock_signal_disarm(), 1);
             expect("departed lock fd is process shared", fcntl(lock_worker_fd, F_GETFD), 0);
             struct flock admission;
             memset(&admission, 0, sizeof admission);
@@ -757,7 +757,7 @@ int main(int argc, char **argv) {
     int receipt_fd = open("/tmp/public-lock-receipts", O_CREAT | O_RDWR, 0666);
     expect("open public lock receipt file", receipt_fd >= 0, 1);
     if (receipt_fd >= 0) {
-        expect("public lock lost replies and numeric reuse", lock_driver_receipts(receipt_fd), 0);
+        expect("public lock replies lost to a signal", lock_loss_run(receipt_fd), 0);
         expect("close public lock receipt file", close(receipt_fd), 0);
     }
     public_lock_signals();
