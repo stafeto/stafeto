@@ -288,6 +288,12 @@ pub fn openat_policy(
     if dirfd == names::AT_FDCWD || name.first() == Some(&b'/') {
         return open_policy(name, flags, mode, umask);
     }
+    // A name against a directory of /proc: the files of /proc are made when
+    // they are opened (procfs).
+    #[cfg(feature = "procfs")]
+    if let Some(path) = procfs::relative(dirfd, name) {
+        return procfs::open(path.bytes(), flags);
+    }
     let point = threads::cancel::Point::begin();
     let result = (|| {
         if name.is_empty() {

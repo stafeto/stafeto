@@ -485,6 +485,12 @@ pub fn fstatat(
         {
             return crate::procfs::stat(path.bytes());
         }
+        #[cfg(feature = "procfs")]
+        if dirfd != AT_FDCWD
+            && let Some(path) = crate::procfs::relative(dirfd, path)
+        {
+            return crate::procfs::stat(path.bytes());
+        }
         let placed = place(dirfd, path)?;
         let transport = crate::shared::with_files(|files| Ok(files.transport()))?;
         if let Some((kind, number)) = transport
