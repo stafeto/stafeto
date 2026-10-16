@@ -10,16 +10,16 @@ use super::*;
 
 /// The version `tools/build-nano.py` builds, as nano prints it in its title.
 fn version() -> Result<String, String> {
-    script_value("tools/build-nano.py", "VERSION")
+    packages::value("nano", "version")
 }
 
 /// nano's and ncurses' licence texts and the note of their copyright and of
 /// the exact sources of the programs in the image.
 pub fn nano_terms() -> Result<(Vec<u8>, Vec<u8>, String), String> {
     let version = version()?;
-    let sha256 = script_value("tools/build-nano.py", "SHA256")?;
-    let curses = script_value("tools/build-ncurses.py", "VERSION")?;
-    let curses_sha256 = script_value("tools/build-ncurses.py", "SHA256")?;
+    let sha256 = packages::value("nano", "sha256")?;
+    let curses = packages::value("ncurses", "version")?;
+    let curses_sha256 = packages::value("ncurses", "sha256")?;
     let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
     let licence = read(target_dir().join(format!("nano/nano-{version}/COPYING")))?;
     let ncurses = read(target_dir().join(format!("ncurses/ncurses-{curses}/COPYING")))?;
@@ -117,11 +117,7 @@ pub fn nano_dialog() -> Result<(), String> {
     busybox_build()?;
     nano_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image(
-        "boot-ash-dialog.img",
-        &ASH_INTERACTIVE_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_nano_terms(&image)?;
     let version = version()?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
