@@ -573,14 +573,16 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-/// 560 pages: the layer's image grew by about 5 pages with the mappings of
-/// files, shared memory and the process service's rendezvous, and
-/// basic/time/strftime_l, whose heap needs a second chunk, had under 17 pages
-/// left of 512; the calls of message queues, semaphores and segments added
-/// a page or two to the programs that use semaphores, and
-/// pthread_cond_wait/2-3 of Open POSIX, whose stacks are mapped one after
-/// the other, was left with a stack's room too few.
-const OS_TEST_QUOTA: u64 = 560 * PAGE;
+/// 610 pages. Measured on the whole of basic and Open POSIX (bisected on the
+/// quota with the tests that passed before): 554 pages pass and 553 do not,
+/// the tightest being pthread_cond_wait/2-2, pthread_cond_timedwait/2-4 and
+/// 2-7 (a stack is mapped for each thread, one after the other) and
+/// basic/time/strftime_l (a second chunk of heap); 610 leave 10.1%. The
+/// quota was 544 before the calls of message queues, semaphores and segments
+/// and the checks of the pages of a segment, which the programs that use
+/// semaphores carry, and 512 before the files, shared memory and the
+/// rendezvous of the process service.
+const OS_TEST_QUOTA: u64 = 610 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
