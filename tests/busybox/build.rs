@@ -41,6 +41,7 @@ fn main() {
         ("util-linux/lib.a", "busybox_util_linux"),
         ("sysklogd/lib.a", "busybox_sysklogd"),
         ("libpwdgrp/lib.a", "busybox_libpwdgrp"),
+        ("console-tools/lib.a", "busybox_console_tools"),
     ] {
         let path = root.join(archive);
         assert!(

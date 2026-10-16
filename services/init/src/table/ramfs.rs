@@ -159,16 +159,21 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// shell and its children get too. The image of the utilities feature is
 /// 3.2 MB, with the ready-made utilities (tools/build-ready-utils.py) in it;
 /// the dialog needs 803 pages of it at most (803 passes, 800 does not,
-/// bisected on ash-dialog), and 884 pages leave 10.1%.
-const BUSYBOX_DIALOG_QUOTA: u64 = 884 * PAGE;
+/// bisected on ash-dialog). GNU bash (tools/build-bash.py) is a program of
+/// 2.98 MB whose heap grows by doubling chunks up to 512 KiB, and a child of
+/// the shell gets the shell's quota: bash-dialog passes with 1 050 pages and
+/// fails with 1 000 (bisected), and 1 160 pages leave 10.5%.
+const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 
 /// What the process service adds to its own quota for the dialog: the
 /// children of the shell, the failed attempts of a search through PATH
 /// (forty searches with three misses each run in the dialog) and the reserve
-/// of the loaders. The dialog needs 5 145 pages at most with the quota above
-/// (5 145 passes, 5 138 does not, bisected on ash-dialog); 5 660 pages leave
-/// 10.0%.
-const BUSYBOX_DIALOG_POOL: u64 = 5660 * PAGE;
+/// of the loaders. The bash dialog holds a shell, its pipelines of three
+/// stages (each stage a copy of bash until it execs) and a command
+/// substitution, each with the quota above: with 1 160 pages of quota it
+/// passes with 9 500 pages and fails with 9 000 (bisected on bash-dialog);
+/// 10 450 pages leave 10.0%.
+const BUSYBOX_DIALOG_POOL: u64 = 10450 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,

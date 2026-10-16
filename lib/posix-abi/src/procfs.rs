@@ -5,8 +5,9 @@
 //! shape Linux gives it, and made from the process service's List.
 //!
 //! The directory `/proc` is a directory of the image. What lies under it
-//! has no file in the file service: `/proc/<pid>/stat`, `cmdline` and
-//! `status` and `/proc/uptime` are text made at the open of the path and
+//! has no file in the file service: `/proc/<pid>/stat`, `statm`, `cmdline`
+//! and `status`, and `/proc/uptime`, `stat`, `meminfo` and `loadavg` are
+//! text made at the open of the path and
 //! handed over as the read end of a pipe whose write end is closed, so the
 //! descriptor reads, polls, is inherited and closes like any other; the
 //! listing of `/proc` (`getdents`) names the live PIDs, and `stat` of
@@ -38,10 +39,16 @@ const DEVICE: u64 = 0x7072_6f63;
 enum Node {
     /// `/proc/<pid>`.
     Process(u32),
-    /// `/proc/<pid>/stat`, `cmdline` or `status`.
+    /// `/proc/<pid>/stat`, `statm`, `cmdline` or `status`.
     File(u32, File),
     /// `/proc/uptime`.
     Uptime,
+    /// `/proc/stat`.
+    SystemStat,
+    /// `/proc/meminfo`.
+    Meminfo,
+    /// `/proc/loadavg`.
+    Loadavg,
     /// `/proc/mounts`.
     Mounts,
 }
@@ -52,6 +59,7 @@ enum File {
     Stat,
     Cmdline,
     Status,
+    Statm,
 }
 
 /// The node a path under `/proc` names, if it is one of these. The path is
@@ -64,6 +72,15 @@ fn parse(path: &[u8]) -> Option<Node> {
     }
     if rest == b"mounts" {
         return Some(Node::Mounts);
+    }
+    if rest == b"stat" {
+        return Some(Node::SystemStat);
+    }
+    if rest == b"meminfo" {
+        return Some(Node::Meminfo);
+    }
+    if rest == b"loadavg" {
+        return Some(Node::Loadavg);
     }
     let (number, tail) = match rest.iter().position(|&b| b == b'/') {
         Some(at) => (&rest[..at], Some(&rest[at + 1..])),
@@ -78,6 +95,7 @@ fn parse(path: &[u8]) -> Option<Node> {
         Some(b"stat") => Some(Node::File(pid, File::Stat)),
         Some(b"cmdline") => Some(Node::File(pid, File::Cmdline)),
         Some(b"status") => Some(Node::File(pid, File::Status)),
+        Some(b"statm") => Some(Node::File(pid, File::Statm)),
         Some(_) => None,
     }
 }
@@ -128,7 +146,7 @@ pub fn absolute(path: &[u8]) -> Option<Absolute> {
 /// and the first live record from that index is the record itself when it
 /// is live, so one request answers.
 fn find(pid: u32) -> Result<Listing, i32> {
-    let (_, found) = crate::process::list(pid % PROCESSES as u32)?;
+    let (_, found, _) = crate::process::list(pid % PROCESSES as u32)?;
     found.filter(|l| l.pid == pid).ok_or(ENOENT)
 }
 
@@ -136,7 +154,7 @@ fn find(pid: u32) -> Result<Listing, i32> {
 pub fn pids(pids: &mut [u32; PROCESSES]) -> Result<usize, i32> {
     let (mut cursor, mut count) = (0, 0);
     loop {
-        let (next, found) = crate::process::list(cursor)?;
+        let (next, found, _) = crate::process::list(cursor)?;
         if let Some(listing) = found
             && count < PROCESSES
         {
@@ -152,9 +170,12 @@ pub fn pids(pids: &mut [u32; PROCESSES]) -> Result<usize, i32> {
 
 /// The text in a fixed buffer.
 struct Text {
-    bytes: [u8; 512],
+    bytes: [u8; TEXT],
     len: usize,
 }
+
+/// The most bytes a file of `/proc` holds.
+const TEXT: usize = 1024;
 
 impl Write for Text {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -169,7 +190,7 @@ impl Write for Text {
 impl Text {
     fn new() -> Self {
         Self {
-            bytes: [0; 512],
+            bytes: [0; TEXT],
             len: 0,
         }
     }
@@ -198,6 +219,74 @@ fn state_letter(l: &Listing) -> char {
     }
 }
 
+/// The state as the line `State:` of Linux's `status` has it.
+fn state_text(l: &Listing) -> &'static str {
+    match l.state {
+        1 => "T (stopped)",
+        2 => "Z (zombie)",
+        _ => "R (running)",
+    }
+}
+
+/// The bytes of a page, as Linux counts `statm` and `rss`.
+const PAGE: u64 = 4096;
+
+/// What the whole table of processes comes to.
+struct Totals {
+    /// Live processes.
+    processes: u32,
+    /// Those not stopped or ended.
+    running: u32,
+    /// The highest PID of a live process.
+    last_pid: u32,
+    /// The time all processes ran, those that ended included, in hundredths
+    /// of a second: it only grows.
+    busy: u64,
+}
+
+fn totals() -> Result<Totals, i32> {
+    let mut t = Totals {
+        processes: 0,
+        running: 0,
+        last_pid: 0,
+        busy: 0,
+    };
+    let (mut cursor, mut live) = (0, 0u64);
+    loop {
+        let (next, found, pool) = crate::process::list(cursor)?;
+        if let Some(l) = found {
+            t.processes += 1;
+            if l.state == 0 {
+                t.running += 1;
+            }
+            t.last_pid = t.last_pid.max(l.pid);
+            // The time of a zombie is in the pool's account already.
+            if l.state != 2 {
+                live = live.saturating_add(l.ticks);
+            }
+        }
+        match next {
+            Some(next) => cursor = next,
+            None => {
+                // The pool of the last reply is the latest: a process that
+                // ended while the table was read is counted there.
+                let all = live.saturating_add(pool.retired);
+                t.busy = rt::time::ticks_to_ns(all) / 10_000_000;
+                return Ok(t);
+            }
+        }
+    }
+}
+
+/// The calendar second the machine started: now less `up` seconds, 0 where
+/// the clock cannot be read.
+fn boot_time(up: u64) -> u64 {
+    crate::clock::gettime(crate::clock::CLOCK_REALTIME)
+        .ok()
+        .and_then(|now| u64::try_from(now.seconds).ok())
+        .map_or(0, |now| now.saturating_sub(up))
+}
+
 /// The terminal as Linux's tty_nr: the console is device 5,1, a PTY 136,n.
 fn tty_nr(l: &Listing) -> u32 {
     match l.tty {
@@ -212,11 +301,58 @@ fn content(node: &Node) -> Result<Text, i32> {
     match *node {
         Node::Uptime => {
             let ns = rt::time::ticks_to_ns(rt::time::now());
+            let busy = totals().map_or(0, |t| t.busy);
+            // The second number is the idle time of the one processor: the
+            // time since the start less the time the processes ran.
+            let idle = (ns / 10_000_000).saturating_sub(busy);
             let _ = writeln!(
                 text,
-                "{}.{:02} 0.00",
+                "{}.{:02} {}.{:02}",
                 ns / 1_000_000_000,
-                (ns / 10_000_000) % 100
+                (ns / 10_000_000) % 100,
+                idle / 100,
+                idle % 100
+            );
+        }
+        Node::SystemStat => {
+            let t = totals()?;
+            let up = rt::time::ticks_to_ns(rt::time::now()) / 10_000_000;
+            let idle = up.saturating_sub(t.busy);
+            // user nice system idle iowait irq softirq steal guest guest_nice
+            // in hundredths of a second: all the time the processes ran is
+            // user time.
+            for name in ["cpu ", "cpu0"] {
+                let _ = writeln!(text, "{name} {} 0 0 {idle} 0 0 0 0 0 0", t.busy);
+            }
+            let _ = write!(
+                text,
+                "intr 0\nctxt 0\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\n",
+                boot_time(up / 100),
+                t.last_pid,
+                t.running,
+            );
+        }
+        Node::Meminfo => {
+            let pool = crate::process::list(0)?.2;
+            let (total, free) = (pool.total >> 10, pool.free >> 10);
+            let _ = write!(
+                text,
+                "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
+                 Buffers:        {z:8} kB\nCached:         {z:8} kB\nSwapCached:     {z:8} kB\n\
+                 SwapTotal:      {z:8} kB\nSwapFree:       {z:8} kB\nShmem:          {z:8} kB\n",
+                z = 0
+            );
+        }
+        Node::Loadavg => {
+            let t = totals()?;
+            // The averages of the run queue are not kept (the layer does
+            // not see the scheduler's queue): 0.00 for each of the three.
+            let _ = writeln!(
+                text,
+                "0.00 0.00 0.00 {}/{} {}",
+                t.running.max(1),
+                t.processes,
+                t.last_pid
             );
         }
         Node::File(pid, kind) => {
@@ -228,7 +364,7 @@ fn content(node: &Node) -> Result<Text, i32> {
                     // priority nice num_threads itrealvalue starttime vsize rss
                     let _ = writeln!(
                         text,
-                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 0 0",
+                        "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 {} {}",
                         l.pid,
                         name_of(&l),
                         state_letter(&l),
@@ -242,7 +378,15 @@ fn content(node: &Node) -> Result<Text, i32> {
                         rt::time::ticks_to_ns(l.ticks) / 10_000_000,
                         20 + l.nice,
                         l.nice,
+                        l.memory,
+                        l.memory / PAGE,
                     );
+                }
+                File::Statm => {
+                    // size resident shared text lib data dt, in pages: all
+                    // the memory charged to the process is resident.
+                    let pages = l.memory / PAGE;
+                    let _ = writeln!(text, "{pages} {pages} 0 0 0 {pages} 0");
                 }
                 File::Cmdline => {
                     // The name the program has; nothing for a process that
@@ -256,9 +400,12 @@ fn content(node: &Node) -> Result<Text, i32> {
                 File::Status => {
                     let _ = write!(
                         text,
-                        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
+                        "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n\
+                         Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+                         VmSize:\t{:8} kB\nVmRSS:\t{:8} kB\nThreads:\t1\n",
                         name_of(&l),
-                        state_letter(&l),
+                        state_text(&l),
+                        l.pid,
                         l.pid,
                         l.parent,
                         l.uid,
@@ -269,6 +416,8 @@ fn content(node: &Node) -> Result<Text, i32> {
                         l.egid,
                         l.egid,
                         l.egid,
+                        l.memory >> 10,
+                        l.memory >> 10,
                     );
                 }
             }
@@ -418,6 +567,9 @@ pub fn stat(path: &[u8]) -> Result<NodeInfo, i32> {
         }
         Node::Uptime => (2, 0o444, 0, 0, 1),
         Node::Mounts => (2, 0o444, 0, 0, 3),
+        Node::SystemStat => (2, 0o444, 0, 0, 5),
+        Node::Meminfo => (2, 0o444, 0, 0, 6),
+        Node::Loadavg => (2, 0o444, 0, 0, 7),
     };
     let now = Timestamp::ZERO;
     Ok(NodeInfo {
@@ -460,13 +612,13 @@ pub fn is_directory(info: &NodeInfo) -> bool {
 
 /// The entries of the listing of `/proc` in Linux's dirent64 records from
 /// `position`: ".", "..", "uptime", "mounts" and the live PIDs in ascending
-/// order; for the directory of a process (`pid`), ".", ".." and its three
+/// order; for the directory of a process (`pid`), ".", ".." and its four
 /// files. The offset after a PID is its number plus 4 (the fixed entries have
 /// 1 to 4), so a listing that goes on in several calls, while processes
 /// start and end, takes each process that lives throughout once.
 pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize, i32> {
     /// The entries before the PIDs of `/proc`.
-    const FIXED: u64 = 4;
+    const FIXED: u64 = 7;
     let mut list = [0u32; PROCESSES];
     let count = match pid {
         Some(_) => 0,
@@ -480,7 +632,7 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
         |name| {
             let here = at.get();
             let (len, kind, inode, after) = if let Some(pid) = pid {
-                if here >= 5 {
+                if here >= 6 {
                     return Ok(None);
                 }
                 let (text, kind, inode): (&[u8], u8, u64) = match here {
@@ -490,6 +642,7 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
                         let (text, file): (&[u8], File) = match n {
                             2 => (b"cmdline", File::Cmdline),
                             3 => (b"stat", File::Stat),
+                            4 => (b"statm", File::Statm),
                             _ => (b"status", File::Status),
                         };
                         (text, 8, (u64::from(pid) << 4) | (1 + file as u64))
@@ -502,7 +655,10 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
                     0 => (b".", 4, 2),
                     1 => (b"..", 4, 2),
                     2 => (b"uptime", 8, 1),
-                    _ => (b"mounts", 8, 3),
+                    3 => (b"mounts", 8, 3),
+                    4 => (b"stat", 8, 5),
+                    5 => (b"meminfo", 8, 6),
+                    _ => (b"loadavg", 8, 7),
                 };
                 name[..text.len()].copy_from_slice(text);
                 (text.len(), kind, inode, here + 1)

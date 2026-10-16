@@ -213,7 +213,7 @@ fn devices() -> [RootFile; 5] {
 /// The names of /bin that hold BusyBox (Ф10): the utilities of XCU that are
 /// programs (the other ten of the 112 are builtins of the shell, `sh` is
 /// listed with the shell) and the applets the probes use (`mktemp`, `nc`).
-pub const UTILITIES: [&str; 86] = [
+pub const UTILITIES: [&str; 88] = [
     "awk",
     "basename",
     "bc",
@@ -273,6 +273,7 @@ pub const UTILITIES: [&str; 86] = [
     "readlink",
     "realpath",
     "renice",
+    "resize",
     "rm",
     "rmdir",
     "sed",
@@ -286,6 +287,7 @@ pub const UTILITIES: [&str; 86] = [
     "test",
     "time",
     "timeout",
+    "top",
     "touch",
     "tr",
     "true",
@@ -343,6 +345,8 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         // GNU nano (tools/build-nano.py).
         file("/bin/nano", 0o755, ROOT, "nano"),
+        // GNU bash beside ash (tools/build-bash.py); `sh` stays ash.
+        file("/bin/bash", 0o755, ROOT, "bash"),
     ];
     files.extend(UTILITIES.iter().map(|name| {
         let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
@@ -370,6 +374,15 @@ fn dialog() -> Vec<RootFile> {
             0o644,
             ROOT,
             Source::Bytes("utmpx", &UTMPX),
+        ),
+        // The keys of bash's line editor (readline reads /etc/inputrc): the
+        // sequences of the console terminal that the editor takes for
+        // Home, End and Delete when the terminal's name is not known.
+        of(
+            "/etc/inputrc",
+            0o644,
+            ROOT,
+            Source::Bytes("inputrc", INPUTRC),
         ),
     ]);
     // The terminfo entries of ncurses' database that the image holds
@@ -417,6 +430,15 @@ fn dialog() -> Vec<RootFile> {
     files.extend(devices());
     files
 }
+
+/// /etc/inputrc of the shell image.
+const INPUTRC: &[u8] = b"\"\\e[1~\": beginning-of-line\n\
+\"\\e[H\": beginning-of-line\n\
+\"\\eOH\": beginning-of-line\n\
+\"\\e[4~\": end-of-line\n\
+\"\\e[F\": end-of-line\n\
+\"\\eOF\": end-of-line\n\
+\"\\e[3~\": delete-char\n";
 
 /// The probe of POSIX processes (5c): BusyBox as `/bin/ls`, the probe as
 /// a child, a set-user-ID copy of it of root, a copy whose data asks for
