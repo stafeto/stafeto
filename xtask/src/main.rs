@@ -1297,7 +1297,9 @@ commands:
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
-  ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
+  ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits; the end of
+            the shell ends the machine and gives its status)
+  ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
@@ -1504,6 +1506,7 @@ fn main() {
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
+        Some("ash-shell-exit") => ash_shell_exit(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
@@ -2057,16 +2060,74 @@ fn run(args: &[String]) -> Result<(), String> {
     run_interactive_qemu(cmd, &a.elf)
 }
 
-fn run_interactive_qemu(mut cmd: Command, elf: &Path) -> Result<(), String> {
+fn run_interactive_qemu(cmd: Command, elf: &Path) -> Result<(), String> {
+    interactive_qemu(cmd, elf, Stdio::inherit(), None, false, None).map(|_| ())
+}
+
+/// What types into the stdin pipe of a run once the flag says a prompt has appeared.
+type Feeder = Box<dyn FnOnce(std::process::ChildStdin, &std::sync::atomic::AtomicBool) + Send>;
+
+/// The status init reports for the shell of the interactive image when its
+/// line `line` says the shell ended: the exit code, or 128 plus the signal.
+fn shell_status(line: &str) -> Option<i32> {
+    let rest = line
+        .trim()
+        .strip_prefix("init: busybox-probe ended: ")?
+        .strip_suffix(", not restarted")?;
+    if let Some(code) = rest.strip_prefix("exit code ") {
+        return code.parse().ok();
+    }
+    let signal = rest.strip_prefix("signal ")?;
+    let number = signal.split(' ').next()?.parse::<i32>().ok()?;
+    Some(128 + number)
+}
+
+/// Runs `cmd` with the console on the terminal (`-nographic` puts the host
+/// terminal in raw mode and carries Ctrl-A X for quitting). With `follow`,
+/// the end of the shell stops the machine: init has reported it, nothing
+/// more runs, and the shell's status comes back. `feed`, when given, gets
+/// the stdin pipe and a flag that turns true once a prompt has appeared.
+fn interactive_qemu(
+    mut cmd: Command,
+    elf: &Path,
+    stdin: Stdio,
+    feed: Option<Feeder>,
+    follow: bool,
+    limit: Option<Duration>,
+) -> Result<Option<i32>, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     cmd.arg("-nographic");
     let mut child = cmd
-        .stdin(Stdio::inherit())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{cmd:?}: {e}"))?;
+    let prompt = std::sync::Arc::new(AtomicBool::new(false));
+    let over = std::sync::Arc::new(AtomicBool::new(false));
+    if let Some(limit) = limit {
+        // A run with a limit is a probe: its machine is stopped when the
+        // limit passes (it is our own child).
+        let (over, pid) = (over.clone(), child.id().to_string());
+        std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            while !over.load(Ordering::SeqCst) {
+                if began.elapsed() > limit {
+                    let _ = Command::new("kill").arg(&pid).status();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+    }
+    if let (Some(feed), Some(pipe)) = (feed, child.stdin.take()) {
+        let flag = prompt.clone();
+        std::thread::spawn(move || feed(pipe, &flag));
+    }
     let mut source = child.stdout.take().ok_or("QEMU has no stdout")?;
     let mut output = Vec::new();
     let mut bytes = [0u8; 4096];
+    let mut status = None;
+    let mut partial = String::new();
     loop {
         let n = std::io::Read::read(&mut source, &mut bytes).map_err(|e| e.to_string())?;
         if n == 0 {
@@ -2079,17 +2140,31 @@ fn run_interactive_qemu(mut cmd: Command, elf: &Path) -> Result<(), String> {
         if output.len() > 65_536 {
             output.drain(..output.len() - 65_536);
         }
+        partial.push_str(&String::from_utf8_lossy(&bytes[..n]));
+        if partial.contains("# ") {
+            prompt.store(true, Ordering::SeqCst);
+        }
+        if follow && let Some(code) = partial.lines().find_map(shell_status) {
+            status = Some(code);
+            // The machine has nothing left to do; this is our own child.
+            let _ = child.kill();
+            break;
+        }
+        if let Some(cut) = partial.rfind('\n') {
+            partial.drain(..=cut);
+        }
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let result = child.wait().map_err(|e| e.to_string())?;
+    over.store(true, Ordering::SeqCst);
     let lines: Vec<String> = String::from_utf8_lossy(&output)
         .lines()
         .map(str::to_owned)
         .collect();
     symbolize::backtrace(&lines, elf);
-    if status.success() {
-        Ok(())
+    if status.is_some() || result.success() {
+        Ok(status)
     } else {
-        Err(format!("QEMU exited with {status}"))
+        Err(format!("QEMU exited with {result}"))
     }
 }
 
@@ -5699,6 +5774,54 @@ fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<
     Ok(())
 }
 
+/// The keys of the line editor of the interactive shell, sent as a
+/// terminal sends them: each probe ends with the line the shell ran.
+fn line_editing(run: &mut qemu::Run) -> Result<(), String> {
+    let line =
+        |run: &mut qemu::Run, text: &'static str| run.expect_line(text, |l| l == text, DIALOG_STEP);
+    // History: Up brings back the last command.
+    run.send("echo history-one")?;
+    line(run, "history-one")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"\x1b[A\r")?;
+    line(run, "history-one")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Left, Home, Right, End and Delete move inside the line: b goes
+    // between a and c; Z goes after "echo " (Home, five Rights); End, Left
+    // and Delete remove the last character.
+    run.type_raw(b"echo ac\x1b[Db\r")?;
+    line(run, "abc")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo xy\x1b[H\x1b[C\x1b[C\x1b[C\x1b[C\x1b[CZ\x1b[F\x1b[D\x1b[3~\r")?;
+    line(run, "Zx")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Ctrl-A, Ctrl-E, Ctrl-K, Ctrl-U and Ctrl-W.
+    run.type_raw(b"two\x01echo \x05 words\r")?;
+    line(run, "two words")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo drop one\x15echo kept\x01\x0b\x15echo edited\r")?;
+    line(run, "edited")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo keep drop\x17\r")?;
+    line(run, "keep")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Tab completes a name; Backspace after it erases from the completed
+    // text and leaves no tab in the line.
+    run.type_raw(b"ls -1 /bin/mkt\t\r")?;
+    line(run, "/bin/mktemp")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.type_raw(b"echo /et\t\x7f\x7f\r")?;
+    line(run, "/et")?;
+    run.expect("# ", DIALOG_STEP)?;
+    // Ctrl-C at the prompt drops the line and gives a fresh prompt.
+    run.type_raw(b"echo dropped\x03")?;
+    run.expect("# ", DIALOG_STEP)?;
+    run.send("echo fresh")?;
+    line(run, "fresh")?;
+    run.expect("# ", DIALOG_STEP)?;
+    Ok(())
+}
+
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5789,12 +5912,13 @@ fn ash_dialog() -> Result<(), String> {
             }
             run.expect("# ", DIALOG_STEP)?;
         }
-        // The terminal service edits the line before ash reads it (5f):
-        // DEL erases the "x" and its echo, and ash gets "echo abc".
+        // The line editor of the shell erases the "x" on screen (backspace
+        // and clear to the end of the line) and ash gets "echo abc".
         run.send("echo abx\x7fc")?;
-        run.expect("echo abx\x08 \x08c", DIALOG_STEP)?;
+        run.expect("echo abx\x08\x1b[Jc", DIALOG_STEP)?;
         run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        line_editing(&mut run)?;
         // The name of the terminal is the layer's to resolve (5f): the
         // shell opens /dev/console for a redirection, and a file of /bin
         // that the shell forks and execs writes to the descriptor it
@@ -6215,8 +6339,8 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
-        run.send("exit")?;
-        run.expect("exit", DIALOG_STEP)?;
+        // Ctrl-D on an empty line ends the shell.
+        run.type_raw(b"\x04")?;
         run.expect(
             "init: busybox-probe ended: exit code 0, not restarted",
             DIALOG_STEP,
@@ -6434,7 +6558,51 @@ fn ash_shell() -> Result<(), String> {
         BOOT_PROFILE,
     )?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-    run_interactive_qemu(cmd, &kernel.elf)
+    // The end of the shell ends the machine, and the command returns the
+    // shell's status to the terminal of the host.
+    match interactive_qemu(cmd, &kernel.elf, Stdio::inherit(), None, true, None)? {
+        Some(code) if code != 0 => exit(code),
+        _ => Ok(()),
+    }
+}
+
+/// The probe of the end of the interactive shell: `exit 3` typed at its
+/// prompt ends the machine and the run gives 3.
+fn ash_shell_exit() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ash-dialog.img",
+        &ASH_INTERACTIVE_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let feed = Box::new(
+        |mut pipe: std::process::ChildStdin, prompt: &std::sync::atomic::AtomicBool| {
+            use std::io::Write;
+            let began = std::time::Instant::now();
+            while !prompt.load(std::sync::atomic::Ordering::SeqCst) {
+                if began.elapsed() > BOOT_TIMEOUT {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = pipe.write_all(b"exit 3\r").and_then(|()| pipe.flush());
+            // Keep the pipe open: the machine ends by the shell's end.
+            std::thread::sleep(Duration::from_secs(600));
+        },
+    );
+    let limit = Some(BOOT_TIMEOUT + DIALOG_STEP * 4);
+    match interactive_qemu(cmd, &kernel.elf, Stdio::piped(), Some(feed), true, limit)? {
+        Some(3) => {
+            println!("BusyBox ash shell end probe passed: exit 3 ended the machine");
+            Ok(())
+        }
+        other => Err(format!(
+            "the shell's status was {other:?}, expected Some(3)"
+        )),
+    }
 }
 
 fn os_test_headers(args: &[String]) -> Result<(), String> {
@@ -6593,6 +6761,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("busybox", busybox_probe),
         job("ash", ash_probe),
         job("ash-dialog", ash_dialog),
+        job("ash-shell-exit", ash_shell_exit),
         job("ls", ls_probe),
         // One round of the benchmark under -icount: its rows are whole and
         // the path of pthread_kill stays under S5_ICOUNT_MAX.
