@@ -48,7 +48,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F7 K3: sigaltstack calls the layer, MINSIGSTKSZ 12288 and SIGSTKSZ 32768, the
 # long jump leaves the entry record to the layer's mark (platform interface
 # 17); tagged pin-65a12bf6.
-COMMIT = "e6888a33249c5cf286b2e635a0294f92ec56ccd0"
+COMMIT = "8afcf294e90439e836fd2341015803a822fe2e91"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
