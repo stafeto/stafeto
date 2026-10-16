@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -142,5 +143,11 @@ int main(int argc, char **argv) {
     }
     fclose(list);
     printf("os-test-run: done\n");
+    /* The console may still hold the end of the last test's output when the
+     * runner ends, and init's line about the runner's end overtakes it:
+     * the log of the batch then stops in the middle of that test. Wait
+     * until the output is out. */
+    fflush(stdout);
+    tcdrain(STDOUT_FILENO);
     return 0;
 }
