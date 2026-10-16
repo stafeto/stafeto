@@ -93,7 +93,8 @@ BASE_OBJECTS = (
 # The directories BusyBox's archives come from; build.rs links each.
 DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps",
                "networking", "archival", "archival/libarchive", "editors",
-               "findutils", "miscutils", "util-linux", "sysklogd", "libpwdgrp")
+               "findutils", "miscutils", "util-linux", "sysklogd", "libpwdgrp",
+               "console-tools")
 
 
 # The CONFIG names of the XCU utilities BusyBox has and the shell does not
@@ -138,6 +139,11 @@ UTILITIES = tuple(name.upper() for name in (
     "feature_tee_use_block_io feature_wc_large feature_xargs_support_parallel "
     "feature_mesg_enable_only_group feature_bc_interactive feature_sh_math_64 "
     "feature_sh_math_base feature_sh_read_frac feature_sh_histfilesize "
+    # The size of the window and the table of processes: resize asks
+    # the terminal for its size, top reads /proc/stat, meminfo, loadavg
+    # and the files of each process.
+    "resize feature_resize_print top feature_top_cpu_usage_percentage feature_top_cpu_global_percents "
+    "feature_top_interactive "
     "").split()) + OWN_CONFIGS
 
 

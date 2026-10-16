@@ -503,7 +503,8 @@ pub enum Method {
     /// record index; the reply is the status u32, the cursor to ask next
     /// u32 (`LIST_END` for no more), and, when the window of at most
     /// `LIST_WINDOW` records from the cursor holds a live one, `1` u32 and
-    /// its `Listing`; otherwise `0` u32. Any process may ask.
+    /// its `Listing`; otherwise `0` u32; then the service's pool, `Pool`
+    /// (the quota, what is left of it and the ticks of ended processes, u64 each). Any process may ask.
     List = 62,
     /// What the process service keeps for the account of the process (F13):
     /// a body of the operation u32 (`account_op`) and its arguments; the
@@ -1237,7 +1238,36 @@ pub struct Listing {
     /// The counter ticks the process has run, the images before an exec
     /// included.
     pub ticks: u64,
+    /// The bytes of memory charged to the process now (its quota's `used`).
+    pub memory: u64,
     pub name: [u8; NAME_LEN],
+}
+
+/// The memory the process service has to give to processes: its quota, and
+/// the part of it that no process holds. The tail of a List reply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pool {
+    pub total: u64,
+    pub free: u64,
+    /// The counter ticks the processes that ended ran, theirs alone: what
+    /// the time of the live processes lacks of the time all have run.
+    pub retired: u64,
+}
+
+impl Pool {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u64(self.total)?;
+        w.u64(self.free)?;
+        w.u64(self.retired)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
+        Ok(Self {
+            total: r.u64()?,
+            free: r.u64()?,
+            retired: r.u64()?,
+        })
+    }
 }
 
 impl Listing {
@@ -1258,6 +1288,7 @@ impl Listing {
         }
         w.u32(self.nice as u32)?;
         w.u64(self.ticks)?;
+        w.u64(self.memory)?;
         w.bytes(&self.name)
     }
 
@@ -1268,6 +1299,7 @@ impl Listing {
         }
         let nice = r.u32()? as i32;
         let ticks = r.u64()?;
+        let memory = r.u64()?;
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         Ok(Self {
@@ -1283,6 +1315,7 @@ impl Listing {
             tty: words[9],
             nice,
             ticks,
+            memory,
             name,
         })
     }
@@ -1846,11 +1879,20 @@ mod tests {
             tty: 1,
             nice: -5,
             ticks: 1 << 40,
+            memory: 3 << 20,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();
         listing.write(&mut w).unwrap();
         assert_eq!(Listing::read(&mut Reader::new(w.as_bytes())), Ok(listing));
+        let pool = Pool {
+            total: 64 << 20,
+            free: 5 << 20,
+            retired: 1 << 33,
+        };
+        let mut w = Writer::new();
+        pool.write(&mut w).unwrap();
+        assert_eq!(Pool::read(&mut Reader::new(w.as_bytes())), Ok(pool));
     }
 
     #[test]
