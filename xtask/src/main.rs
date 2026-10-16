@@ -4823,10 +4823,11 @@ const STARVATION_ENDS_WITHIN_10_S: &str = "yes";
 const VOLLEY_REPEATS_MAX: u64 = 64;
 
 /// The rounds of the audit of the RAM file service that the steps probe
-/// saw end. A round starts every 250 ms of the clock, and the probe runs for
-/// seconds of it: a service whose audit stops after its first wait ends no
-/// more rounds.
-const AUDIT_ROUNDS_MIN: usize = 4;
+/// saw end. A round starts every 250 ms of the clock and the probe runs for
+/// about 48 s of it, which is some 190 rounds; an audit that waits for a
+/// timer it no longer has goes on only by the events of other work and ends
+/// about a quarter of them. Half is the bound.
+const AUDIT_ROUNDS_MIN: usize = 100;
 
 fn check_audit_rounds(lines: &[String]) -> Result<(), String> {
     let rounds = lines
