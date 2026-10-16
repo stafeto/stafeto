@@ -253,6 +253,7 @@ fn main(_: u64) -> u64 {
         pump: Pump::new(),
         input: Input::Idle,
         report: tty::window::Reader::new(),
+        report_due: None,
         timer,
         _view: view,
         armed: None,
@@ -357,6 +358,8 @@ struct Tty {
     disconnect_work_due: bool,
     pump: Pump,
     report: tty::window::Reader,
+    /// When the bytes the reader holds go on as input, if it holds any.
+    report_due: Option<u64>,
     input: Input,
     /// The timer of VTIME and the deadline it is armed for.
     timer: Handle<Timer>,
@@ -1384,6 +1387,8 @@ impl Tty {
         self.devices[self.active]
             .console
             .input(&kept[..kept_len], now());
+        self.report_due = self.report.pending().then(|| now() + tty::window::HOLD_NS);
+        self.arm_timer();
         if let Some(size) = size {
             // A refused signal leaves the size as it was; the host's next
             // report brings it again.
@@ -1475,6 +1480,7 @@ impl Tty {
             .devices
             .iter()
             .filter_map(|d| d.readers.deadline())
+            .chain(self.report_due)
             .min();
         if deadline == self.armed {
             return;
@@ -3094,6 +3100,15 @@ impl Service<0> for Tty {
                 let ops = &mut *self.ops;
                 for device in self.devices.iter_mut() {
                     device.readers.expire(now(), |w| ops.tell(w.label, w.key));
+                }
+                if self.report_due.is_some_and(|due| due <= now()) {
+                    // No rest of a report came: the held bytes are input.
+                    self.report_due = None;
+                    self.select(0);
+                    let mut held = [0; tty::window::REPORT_MAX];
+                    let n = self.report.flush(&mut held);
+                    self.devices[0].console.input(&held[..n], now());
+                    self.tell_readers();
                 }
                 self.arm_timer();
             }

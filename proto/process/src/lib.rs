@@ -504,7 +504,7 @@ pub enum Method {
     /// u32 (`LIST_END` for no more), and, when the window of at most
     /// `LIST_WINDOW` records from the cursor holds a live one, `1` u32 and
     /// its `Listing`; otherwise `0` u32; then the service's pool, `Pool`
-    /// (the quota and what is left of it, u64 each). Any process may ask.
+    /// (the quota, what is left of it and the ticks of ended processes, u64 each). Any process may ask.
     List = 62,
     /// What the process service keeps for the account of the process (F13):
     /// a body of the operation u32 (`account_op`) and its arguments; the
@@ -1249,18 +1249,23 @@ pub struct Listing {
 pub struct Pool {
     pub total: u64,
     pub free: u64,
+    /// The counter ticks the processes that ended ran, theirs alone: what
+    /// the time of the live processes lacks of the time all have run.
+    pub retired: u64,
 }
 
 impl Pool {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u64(self.total)?;
-        w.u64(self.free)
+        w.u64(self.free)?;
+        w.u64(self.retired)
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
         Ok(Self {
             total: r.u64()?,
             free: r.u64()?,
+            retired: r.u64()?,
         })
     }
 }
@@ -1883,6 +1888,7 @@ mod tests {
         let pool = Pool {
             total: 64 << 20,
             free: 5 << 20,
+            retired: 1 << 33,
         };
         let mut w = Writer::new();
         pool.write(&mut w).unwrap();

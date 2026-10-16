@@ -239,7 +239,8 @@ struct Totals {
     running: u32,
     /// The highest PID of a live process.
     last_pid: u32,
-    /// The time the live processes ran, in hundredths of a second.
+    /// The time all processes ran, those that ended included, in hundredths
+    /// of a second: it only grows.
     busy: u64,
 }
 
@@ -250,20 +251,29 @@ fn totals() -> Result<Totals, i32> {
         last_pid: 0,
         busy: 0,
     };
-    let mut cursor = 0;
+    let (mut cursor, mut live) = (0, 0u64);
     loop {
-        let (next, found, _) = crate::process::list(cursor)?;
+        let (next, found, pool) = crate::process::list(cursor)?;
         if let Some(l) = found {
             t.processes += 1;
             if l.state == 0 {
                 t.running += 1;
             }
             t.last_pid = t.last_pid.max(l.pid);
-            t.busy += rt::time::ticks_to_ns(l.ticks) / 10_000_000;
+            // The time of a zombie is in the pool's account already.
+            if l.state != 2 {
+                live = live.saturating_add(l.ticks);
+            }
         }
         match next {
             Some(next) => cursor = next,
-            None => return Ok(t),
+            None => {
+                // The pool of the last reply is the latest: a process that
+                // ended while the table was read is counted there.
+                let all = live.saturating_add(pool.retired);
+                t.busy = rt::time::ticks_to_ns(all) / 10_000_000;
+                return Ok(t);
+            }
         }
     }
 }

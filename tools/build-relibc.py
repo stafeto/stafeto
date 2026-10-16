@@ -55,8 +55,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # the scheduling attributes of posix_spawn, an own PRIO_INHERIT mutex; tagged
 # pin-b5af44ca.
 # Terminal size: the standard error is not buffered, so that resize's question
-# to the terminal goes out before it reads the answer; tagged pin-e4311c19.
-COMMIT = "e4311c199e2c13a6f406bbbf4928c1661b6a6332"
+# to the terminal goes out before it reads the answer; tagged pin-4d8d6b17.
+COMMIT = "4d8d6b17626ce219c2018224a1f7825d91385cb1"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -244,6 +244,8 @@ struct Processes {
     /// The priority of the slot of a session: the loop's level.
     level: u8,
     records: Records<Handle<Process>>,
+    /// The counter ticks the processes that ended ran (List's pool).
+    retired_ticks: u64,
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
     /// The ExecCommit of each record that waits for init, by the record's
@@ -316,6 +318,7 @@ impl Processes {
             identities: Handle::borrowed(abi::Handle::INVALID),
             level: 1,
             records: Records::new(),
+            retired_ticks: 0,
             tickets: [0; RECORDS],
             replacing: [const { None }; RECORDS],
             replace_queue: Queue::new(),
@@ -2387,11 +2390,12 @@ fn kernel(e: abi::Error) -> Answer {
 
 /// The pool a List reply ends with: the service's quota, and what of it is
 /// left to give to children (as `free_quota`).
-fn pool() -> proto_process::Pool {
+fn pool(retired: u64) -> proto_process::Pool {
     let memory = sys::process_memory(&make::own()).ok();
     proto_process::Pool {
         total: memory.map_or(0, |m| m.quota),
         free: memory.map_or(0, |m| m.quota.saturating_sub(m.used)),
+        retired,
     }
 }
 
@@ -2722,7 +2726,7 @@ impl Processes {
                 .u32(0)
                 .and_then(|()| w.u32(proto_process::LIST_END))
                 .and_then(|()| w.u32(0))
-                .and_then(|()| pool().write(w))
+                .and_then(|()| pool(self.retired_ticks).write(w))
                 .is_ok()
             {
                 Answer::Reply(Outgoing::new())
@@ -2781,7 +2785,7 @@ impl Processes {
                     })
                 }
             })
-            .and_then(|()| pool().write(w));
+            .and_then(|()| pool(self.retired_ticks).write(w));
         if ok.is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -3809,6 +3813,14 @@ impl Service<0> for Processes {
             if let Some(notice) = self.terminal_notice.as_ref() {
                 let _ = sys::notify(notice, 1);
             }
+        }
+        // The time of the process stays in the account of the pool once it
+        // is gone, so that the sum of all the time never falls.
+        if let Some(r) = self.records.get(index) {
+            self.retired_ticks = self
+                .retired_ticks
+                .saturating_add(r.carried_ticks)
+                .saturating_add(sys::process_time(&r.process).unwrap_or(0));
         }
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.

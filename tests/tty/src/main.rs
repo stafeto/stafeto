@@ -371,6 +371,17 @@ fn run(probe: &Probe) -> Result<(), &'static str> {
         _ => return Err("the window size after the report"),
     }
     rt::println!("tty-probe: window report set 40 by 132");
+    // A lone Ctrl-] (the byte a report starts with) reaches the read at
+    // once, with no key after it: the service lets go of the byte when no
+    // report follows.
+    rt::println!("tty-probe: lone GS waits");
+    let n = probe
+        .read(16, &mut got)
+        .map_err(|_| "the read of a lone GS")?;
+    if got[..n] != *b"\x1d" {
+        return Err("the read did not give the lone GS");
+    }
+    rt::println!("tty-probe: lone GS came");
     // With ONLCR clear an LF goes out alone (XBD 11.2.3).
     let mut bare = opened;
     bare.oflag &= !proto_tty::ONLCR;

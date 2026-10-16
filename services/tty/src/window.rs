@@ -9,10 +9,14 @@
 //! travels in the byte stream and the terminal service takes it out before
 //! the discipline sees the input. Anything that does not complete the
 //! report goes on to the discipline as it came; a lone GS is held until
-//! the next byte comes (a typed Ctrl-] reaches the reader with it).
+//! the rest comes or the service's wait for it (HOLD_NS) passes, when the
+//! held bytes go on as input.
 
 /// The longest report: GS, `W`, five digits, `;`, five digits, GS.
 pub const REPORT_MAX: usize = 14;
+
+/// How long held bytes wait for the rest of a report, in nanoseconds.
+pub const HOLD_NS: u64 = 75_000_000;
 
 const GS: u8 = 0x1d;
 
@@ -75,6 +79,19 @@ impl Reader {
             }
         }
         (n, size)
+    }
+
+    /// Whether bytes are held back, waiting for the rest of a report.
+    pub fn pending(&self) -> bool {
+        self.len > 0
+    }
+
+    /// The held bytes, as they came, into `out` (REPORT_MAX bytes at
+    /// least): what no report followed within the time the service waits.
+    pub fn flush(&mut self, out: &mut [u8]) -> usize {
+        let mut n = 0;
+        self.release(out, &mut n);
+        n
     }
 
     fn step(&mut self, b: u8, out: &mut [u8], n: &mut usize) -> Option<Size> {
@@ -244,6 +261,21 @@ mod tests {
                 columns: 4
             })
         );
+    }
+
+    #[test]
+    fn held_bytes_are_flushed_as_they_came() {
+        let mut reader = Reader::new();
+        let (out, _) = run(&mut reader, b"a\x1dW4;");
+        assert_eq!(out, b"a");
+        assert!(reader.pending());
+        let mut flushed = [0; REPORT_MAX];
+        let n = reader.flush(&mut flushed);
+        assert_eq!(&flushed[..n], b"\x1dW4;");
+        assert!(!reader.pending());
+        let (out, size) = run(&mut reader, b"5;6\x1d");
+        assert_eq!((out.as_slice(), size), (&b"5;6"[..], None));
+        assert!(reader.pending());
     }
 
     #[test]

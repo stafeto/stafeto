@@ -5989,6 +5989,13 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
         run,
         "awk '$1==\"VmRSS:\" {print ($2>0)}' /proc/$$/status",
         &["1"],
+    )?;
+    // The counters only grow: the time of a child that ran and ended stays
+    // in the sum of the cpu line and out of the idle time of uptime.
+    dialog_command(
+        run,
+        "a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); awk 'BEGIN {for (i = 0; i < 2000000; i++) x += i}'; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
+        &["cpu-grew", "idle-grew"],
     )
 }
 
@@ -6660,6 +6667,10 @@ fn tty_probe(vz: bool) -> Result<(), String> {
         run.type_raw(&window::report(40, 132))?;
         run.type_raw(b"w")?;
         run.expect("tty-probe: window report set 40 by 132", DIALOG_STEP)?;
+        // One Ctrl-] alone, with nothing after it.
+        run.expect("tty-probe: lone GS waits", DIALOG_STEP)?;
+        run.type_raw(b"\x1d")?;
+        run.expect("tty-probe: lone GS came", DIALOG_STEP)?;
         // ONLCR clear: the console's driver adds no CR either.
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
