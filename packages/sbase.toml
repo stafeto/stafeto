@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# sbase applets linked into the BusyBox program (tools/build-ready-utils.py).
+# The SHA-256 is that of the tar stream after gunzip.
+# Format: docs/packages.md.
+
+name = "sbase"
+version = "git-b30fb568"
+kind = "base"
+url = "https://github.com/michaelforney/sbase/archive/b30fb56804bfed69b45ef0e944d2e029e4d26258.tar.gz"
+sha256 = "cab64e700200548a081e7ef24d2a40b04b15eda4de4495f130d4c65d5fa9f401"
+license = "MIT"
+license_file = "LICENSE"
+depends = ["busybox"]
+build = "tools/build-busybox.py"
+files = [
+  "/bin/getconf = elf:busybox-probe",
+  "/bin/join = elf:busybox-probe",
+  "/bin/pathchk = elf:busybox-probe",
+]

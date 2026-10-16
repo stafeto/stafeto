@@ -26,10 +26,13 @@ import subprocess
 import tarfile
 from urllib.request import urlopen
 
+import pkgdesc
 
-VERSION = "6.6"
-SHA256 = "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
-URL = f"https://ftp.gnu.org/gnu/ncurses/ncurses-{VERSION}.tar.gz"
+
+PACKAGE = pkgdesc.load("ncurses")
+VERSION = PACKAGE["version"]
+SHA256 = PACKAGE["sha256"]
+URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "ncurses"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"

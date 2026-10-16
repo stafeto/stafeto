@@ -13,9 +13,12 @@ import shutil
 import subprocess
 from urllib.request import urlopen
 
+import pkgdesc
 
-VERSION = "1.37.0"
-SHA256 = "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
+
+PACKAGE = pkgdesc.load("busybox")
+VERSION = PACKAGE["version"]
+SHA256 = PACKAGE["sha256"]
 ROOT = Path(__file__).resolve().parents[1]
 # Two builds of the same source: the one the probes use (the applets they
 # run) and the one of the shell image of the utilities (the applets of XCU),
@@ -209,7 +212,7 @@ def build(utilities: bool) -> None:
     work.mkdir(parents=True, exist_ok=True)
     LOG.write_text("")
     if not ARCHIVE.exists():
-        with urlopen(f"https://busybox.net/downloads/busybox-{VERSION}.tar.bz2") as response:
+        with urlopen(PACKAGE["url"]) as response:
             ARCHIVE.write_bytes(response.read())
     if sha256(ARCHIVE.read_bytes()).hexdigest() != SHA256:
         raise SystemExit("BusyBox source archive has an unexpected SHA-256")

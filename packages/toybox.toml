@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# toybox applets linked into the BusyBox program (tools/build-ready-utils.py).
+# The SHA-256 is that of the tar stream after gunzip.
+# Format: docs/packages.md.
+
+name = "toybox"
+version = "0.8.15"
+kind = "base"
+url = "https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz"
+sha256 = "323e8466849c40740ed1a061aa63260b72c6c4ab797858fedbd7028d256c28f9"
+license = "0BSD"
+license_file = "LICENSE"
+depends = ["busybox"]
+build = "tools/build-busybox.py"
+files = [
+  "/bin/file = elf:busybox-probe",
+  "/bin/iconv = elf:busybox-probe",
+]

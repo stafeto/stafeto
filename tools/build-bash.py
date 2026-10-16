@@ -25,10 +25,13 @@ import subprocess
 import tarfile
 from urllib.request import urlopen
 
+import pkgdesc
 
-VERSION = "5.3"
-SHA256 = "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
-URL = f"https://ftp.gnu.org/gnu/bash/bash-{VERSION}.tar.gz"
+
+PACKAGE = pkgdesc.load("bash")
+VERSION = PACKAGE["version"]
+SHA256 = PACKAGE["sha256"]
+URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "bash"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
