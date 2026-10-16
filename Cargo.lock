@@ -113,6 +113,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "htop"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+ "rt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [

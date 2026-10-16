@@ -345,6 +345,8 @@ fn dialog() -> Vec<RootFile> {
         file("/bin/busybox", 0o755, ROOT, "busybox-probe"),
         // GNU nano (tools/build-nano.py).
         file("/bin/nano", 0o755, ROOT, "nano"),
+        // htop (tools/build-htop.py).
+        file("/bin/htop", 0o755, ROOT, "htop"),
     ];
     files.extend(UTILITIES.iter().map(|name| {
         let path: &'static str = Box::leak(format!("/bin/{name}").into_boxed_str());
