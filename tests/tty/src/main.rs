@@ -13,6 +13,8 @@
 //! 3. with ICANON off, VMIN 1 and VTIME 0, three reads each give the one
 //!    byte xtask typed before it;
 //! 4. with ONLCR clear, an LF goes out with no CR before it;
+//! 4a. the host's report of its window, typed before a "w", sets the size
+//!    and does not reach the read, which gives the "w";
 //! 5. LINES numbered lines in writes of MAX_WRITE bytes, which xtask finds
 //!    whole and in their order.
 //!
@@ -181,6 +183,16 @@ impl Probe {
         proto_tty::attr_reply(self.call(w.as_bytes(), None, &mut buffer)?)
     }
 
+    pub fn get_winsize(&self) -> Result<proto_tty::Winsize, Status> {
+        let mut w = Writer::new();
+        proto_tty::Method::GetWinsize.header().write(&mut w)?;
+        w.u32(CONSOLE)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let reply = self.call(w.as_bytes(), None, &mut buffer)?;
+        status_of(reply)?;
+        proto_tty::Winsize::read(&mut proto_wire::Reader::new(&reply[4..]))
+    }
+
     pub fn set_attr(&self, termios: Termios, action: u32) -> Result<(), Status> {
         let mut w = Writer::new();
         SetAttr {
@@ -340,6 +352,25 @@ fn run(probe: &Probe) -> Result<(), &'static str> {
         rt::println!("tty-probe: raw read {i} gave {}", want as char);
     }
     rt::println!("tty-probe: raw reads gave each byte");
+    // The window: unknown until the host reports it. xtask types the
+    // report (window.rs) and then a "w"; the read gives the "w" alone, and
+    // the size is the report's.
+    if probe.get_winsize() != Ok(proto_tty::Winsize::new()) {
+        return Err("a window size before any report");
+    }
+    rt::println!("tty-probe: window report waits");
+    let mut got = [0; 16];
+    let n = probe
+        .read(16, &mut got)
+        .map_err(|_| "the read after the report")?;
+    if got[..n] != *b"w" {
+        return Err("the read after the report did not give the one byte typed");
+    }
+    match probe.get_winsize() {
+        Ok(size) if (size.row, size.column) == (40, 132) => {}
+        _ => return Err("the window size after the report"),
+    }
+    rt::println!("tty-probe: window report set 40 by 132");
     // With ONLCR clear an LF goes out alone (XBD 11.2.3).
     let mut bare = opened;
     bare.oflag &= !proto_tty::ONLCR;

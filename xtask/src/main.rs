@@ -6655,6 +6655,11 @@ fn tty_probe(vz: bool) -> Result<(), String> {
             run.expect(&format!("tty-probe: raw read {i} gave {b}"), DIALOG_STEP)?;
         }
         run.expect("tty-probe: raw reads gave each byte", DIALOG_STEP)?;
+        // The report of the host's window, then a byte for the read to give.
+        run.expect("tty-probe: window report waits", DIALOG_STEP)?;
+        run.type_raw(&window::report(40, 132))?;
+        run.type_raw(b"w")?;
+        run.expect("tty-probe: window report set 40 by 132", DIALOG_STEP)?;
         // ONLCR clear: the console's driver adds no CR either.
         run.expect_bytes(b"\nbare-lf\n", DIALOG_STEP)?;
         run.expect("tty-probe: wrote", DIALOG_STEP)?;
