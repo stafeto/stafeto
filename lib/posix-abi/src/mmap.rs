@@ -519,7 +519,10 @@ pub fn mark_past_end(start: usize, end: usize, prot: i32) {
 /// mapped anew).
 fn forget_past_end(start: usize, end: usize) {
     for range in &PAST_END {
-        let (low, high) = (range[0].load(Ordering::Acquire), range[1].load(Ordering::Acquire));
+        let (low, high) = (
+            range[0].load(Ordering::Acquire),
+            range[1].load(Ordering::Acquire),
+        );
         if high != 0 && low < end && start < high {
             range[1].store(0, Ordering::Release);
         }

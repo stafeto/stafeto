@@ -97,7 +97,9 @@ fn cut_past_end(fd: c_int, address: usize, len: usize, offset: u64, prot: c_int)
     let Ok((size, _)) = file_info(fd) else {
         return;
     };
-    let in_file = size.div_ceil(PAGE as u64).saturating_sub(offset / PAGE as u64) as usize;
+    let in_file = size
+        .div_ceil(PAGE as u64)
+        .saturating_sub(offset / PAGE as u64) as usize;
     let pages = len.div_ceil(PAGE);
     if in_file < pages {
         let start = address + in_file * PAGE;
