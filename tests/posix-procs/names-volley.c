@@ -686,7 +686,10 @@ static int vz_child_run(void) {
         VZ_CHECK(quota >= used && quota != 0);
         unsigned long long remaining = quota - used;
         /* The stack alone exceeds the real remaining quota by one page;
-         * TLS and thread metadata can only increase this request's cost. */
+         * TLS and thread metadata can only increase this request's cost.
+         * A creation that finds no memory collects the stack of the thread
+         * just joined (its frames go back to the quota) and tries again, so
+         * that stack counts as remaining too. */
         size_t refused_stack = (size_t)(remaining / 4096 + 1) * 4096;
         VZ_CHECK(refused_stack >= PTHREAD_STACK_MIN);
         {
@@ -698,7 +701,7 @@ static int vz_child_run(void) {
             VZ_CHECK(length > 0 && (size_t)length < sizeof line);
             VZ_CHECK(write(STDOUT_FILENO, line, (size_t)length) == length);
         }
-        VZ_CHECK(pthread_attr_setstacksize(&attr, refused_stack) == 0);
+        VZ_CHECK(pthread_attr_setstacksize(&attr, refused_stack + stack_size) == 0);
         int e = pthread_create(&eighth, &attr, vz_idle, NULL);
         if (e != EAGAIN) {
             printf("posix-procs: volley: the eighth thread of process %d gave %d, wanted EAGAIN\n", process, e);
