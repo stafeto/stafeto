@@ -481,7 +481,6 @@ conformance/interfaces/mmap/24-2
 conformance/interfaces/mmap/27-1
 conformance/interfaces/mmap/3-1
 conformance/interfaces/mmap/32-1
-conformance/interfaces/mmap/5-1
 conformance/interfaces/mmap/6-1
 conformance/interfaces/mmap/6-2
 conformance/interfaces/mmap/6-3
