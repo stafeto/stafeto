@@ -33,10 +33,8 @@ pub fn bit(signal: i32) -> Result<SigSet, Invalid> {
     Ok(1 << (signal - 1))
 }
 pub fn mask(set: SigSet) -> Result<SigSet, Invalid> {
-    if set & !VALID != 0 {
-        return Err(Invalid::Mask);
-    }
-    Ok(set & !UNBLOCKABLE)
+    // Every bit of a set is a signal (1 to 64); SIGKILL and SIGSTOP cannot be held.
+    Ok(set & VALID & !UNBLOCKABLE)
 }
 pub fn action_words(action: SigAction) -> [u64; 3] {
     [action.handler, action.mask, action.flags as u32 as u64]

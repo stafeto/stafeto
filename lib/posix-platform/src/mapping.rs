@@ -399,7 +399,9 @@ pub extern "C" fn stafeto_map_check(addr: *const c_void, len: usize) -> c_int {
 pub extern "C" fn stafeto_mlock(addr: *const c_void, len: usize) -> c_int {
     const PAGE: usize = 4096;
     let start = (addr as usize) & !(PAGE - 1);
-    let Some(end) = (addr as usize).checked_add(len).and_then(|e| e.checked_next_multiple_of(PAGE))
+    let Some(end) = (addr as usize)
+        .checked_add(len)
+        .and_then(|e| e.checked_next_multiple_of(PAGE))
     else {
         return -posix_abi::constants::ENOMEM;
     };
@@ -414,7 +416,9 @@ pub extern "C" fn stafeto_mlock(addr: *const c_void, len: usize) -> c_int {
 pub extern "C" fn stafeto_munlock(addr: *const c_void, len: usize) -> c_int {
     const PAGE: usize = 4096;
     let start = (addr as usize) & !(PAGE - 1);
-    let Some(end) = (addr as usize).checked_add(len).and_then(|e| e.checked_next_multiple_of(PAGE))
+    let Some(end) = (addr as usize)
+        .checked_add(len)
+        .and_then(|e| e.checked_next_multiple_of(PAGE))
     else {
         return -posix_abi::constants::ENOMEM;
     };
