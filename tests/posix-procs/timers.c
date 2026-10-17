@@ -598,8 +598,39 @@ static int t_c_itimer(void) {
     t_take(SIGALRM, &info, 0);
     t_nap(70);
     if (t_take(SIGALRM, &info, 10) != -1) return 11;
-    /* The processor time timers are the library's: a zero setting is accepted. */
-    if (setitimer(ITIMER_VIRTUAL, &v, NULL) || setitimer(ITIMER_PROF, &v, NULL)) return 12;
+    /* The processor time timers are the library's: a setting reads back, the
+     * signal comes while the process runs, and a zero setting takes it off. */
+    static const int which[2] = {ITIMER_VIRTUAL, ITIMER_PROF};
+    static const int signals[2] = {SIGVTALRM, SIGPROF};
+    for (int k = 0; k < 2; k++) {
+        struct itimerval cpu = {.it_value = {0, 30000}, .it_interval = {0, 30000}}, back;
+        if (t_block(signals[k])) return 20 + k;
+        if (setitimer(which[k], &cpu, NULL)) return 22 + k;
+        if (getitimer(which[k], &back) || back.it_interval.tv_sec || back.it_interval.tv_usec != 30000
+                || back.it_value.tv_sec || back.it_value.tv_usec <= 0 || back.it_value.tv_usec > 30000)
+            return 24 + k;
+        struct timespec begin, end;
+        clock_gettime(CLOCK_MONOTONIC, &begin);
+        volatile unsigned long spin = 0;
+        int seen = 0;
+        do {
+            for (int i = 0; i < 20000; i++) spin++;
+            seen = t_take(signals[k], &info, 0) == signals[k];
+            clock_gettime(CLOCK_MONOTONIC, &end);
+        } while (!seen && end.tv_sec - begin.tv_sec < 5);
+        if (!seen) return 26 + k;
+        memset(&cpu, 0, sizeof(cpu));
+        if (setitimer(which[k], &cpu, &back) || back.it_interval.tv_usec != 30000) return 28 + k;
+        if (getitimer(which[k], &back) || back.it_value.tv_sec || back.it_value.tv_usec
+                || back.it_interval.tv_sec || back.it_interval.tv_usec) return 30 + k;
+        t_take(signals[k], &info, 0);
+        clock_gettime(CLOCK_MONOTONIC, &begin);
+        do {
+            for (int i = 0; i < 20000; i++) spin++;
+            clock_gettime(CLOCK_MONOTONIC, &end);
+        } while ((end.tv_sec - begin.tv_sec) * 1000 + (end.tv_nsec - begin.tv_nsec) / 1000000 < 150);
+        if (t_take(signals[k], &info, 0) != -1) return 32 + k;
+    }
     if (getitimer(9, &now) != -1 || errno != EINVAL) return 14;
     v.it_value.tv_usec = 1000000;
     if (setitimer(ITIMER_REAL, &v, NULL) != -1 || errno != EINVAL) return 15;

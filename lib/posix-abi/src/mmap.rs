@@ -536,11 +536,7 @@ pub fn is_past_end(address: usize, write: bool) -> bool {
     PAST_END.iter().any(|range| {
         let high = range[1].load(Ordering::Acquire);
         let prot = range[2].load(Ordering::Acquire) as i32;
-        let wanted = if write {
-            PROT_WRITE
-        } else {
-            PROT_READ
-        };
+        let wanted = if write { PROT_WRITE } else { PROT_READ };
         high != 0
             && range[0].load(Ordering::Acquire) <= address
             && address < high
