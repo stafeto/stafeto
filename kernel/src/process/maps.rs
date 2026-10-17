@@ -134,6 +134,27 @@ pub fn check_free(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), 
     Ok(())
 }
 
+/// What the checks of a mem_map saw of `process`: a number that changes
+/// whenever a mapping or a message buffer joins it (`add_mapping`,
+/// thread::give_buffer). The second section of the call goes on only if it
+/// is the same.
+pub fn epoch(process: NonNull<Process>) -> u32 {
+    crate::obj::assert_held();
+    // SAFETY: the caller holds a reference to the process; OBJ guards the
+    // field.
+    unsafe { (*process.as_ptr()).maps_epoch }
+}
+
+/// A message buffer joined `process` (`epoch`).
+pub fn buffer_joined(process: NonNull<Process>) {
+    crate::obj::assert_held();
+    // SAFETY: as above.
+    unsafe {
+        let p = process.as_ptr();
+        (*p).maps_epoch = (*p).maps_epoch.wrapping_add(1);
+    }
+}
+
 /// Whether page `va` of `process`, which the caller holds, lies in one of
 /// its mappings, whose pages may not be mapped yet (thread_create, spec
 /// 6.2).
@@ -179,8 +200,10 @@ pub fn add_mapping(
     // SAFETY: as above.
     let table = unsafe { table(target) }.expect("the table was just made");
     let index = table
-        .insert(mapping)
+        .insert_free(mapping)
         .expect("a table with room takes a checked entry");
+    // SAFETY: as above; OBJ guards the field.
+    unsafe { (*p).maps_epoch = (*p).maps_epoch.wrapping_add(1) };
     table.set_busy(index, true);
     memory::retain_mapping(mapping.object);
     Ok(Change {

@@ -159,7 +159,40 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// that fails changes nothing but the block. Then the portions
 /// (`portions`), which never fail but for a process that ends meanwhile;
 /// the entry records the rights of x1 to map, which bound its mem_protect.
-pub(super) fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
+pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
+    let entry = clock::now();
+    // The checks that read every mapping and every thread of the process
+    // are a section of their own, and the entry goes in under the next one,
+    // which begins only if no mapping and no buffer joined the process
+    // between: each section is short, and the table that the first one saw
+    // is the table the second one changes (maps::epoch).
+    let first = loop {
+        let epoch = match objects(|| map_check(thread, a)) {
+            Ok(epoch) => epoch,
+            Err(e) => break Err(e),
+        };
+        match objects(|| map_add(thread, a, epoch)) {
+            Ok(Some(on)) => break Ok(on),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    match first {
+        Ok(on) => {
+            thread::begin_long(thread, Long::Change(on));
+            portions(thread, on, entry)
+        }
+        Err(e) => set_result(thread, Err(e)),
+    }
+}
+
+/// What mem_map's two sections look up alike: the process, the object, the
+/// rights it gives, and the pages, after the checks of the values, the
+/// handles, the state of the process and the range in the object.
+fn map_lookups(
+    thread: NonNull<Thread>,
+    a: &Args,
+) -> Result<(NonNull<crate::process::Process>, NonNull<Memory>, Rights, u64), Error> {
     let pages = range_arg(a[4], a[3])?;
     if !a[2].is_multiple_of(PAGE_SIZE) {
         return Err(Error::InvalidArgs);
@@ -177,13 +210,34 @@ pub(super) fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error
     if a[2].checked_add(a[3]).is_none_or(|end| end > size) {
         return Err(Error::InvalidArgs);
     }
+    Ok((target, m, rights, pages))
+}
+
+/// The first section of mem_map: everything up to the range touching no
+/// mapping and no message buffer (INVALID_ARGS, process::check_free). Gives
+/// the epoch of the process's mappings and buffers it saw.
+fn map_check(thread: NonNull<Thread>, a: &Args) -> Result<u32, Error> {
+    let (target, _, _, pages) = map_lookups(thread, a)?;
     process::check_free(target, a[4], pages)?;
+    Ok(process::epoch(target))
+}
+
+/// The second section: the same lookups, and, when nothing joined the
+/// process since `epoch`, the resources and the entry (LIMIT_REACHED,
+/// NO_MEMORY, process::add_mapping); None when something did and the
+/// checks have to be made again.
+fn map_add(thread: NonNull<Thread>, a: &Args, epoch: u32) -> Result<Option<Change>, Error> {
+    let (target, m, rights, pages) = map_lookups(thread, a)?;
+    if process::epoch(target) != epoch {
+        return Ok(None);
+    }
+    let access = access_arg(a[5])?;
     let map = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
     let offset = (a[2] / PAGE_SIZE) as u32;
     let mapping = Mapping::new(a[4], pages as u32, offset, m, Rights(rights.0 & map.0));
     let on = process::add_mapping(target, mapping, access)?;
     process::retain(target);
-    Ok(on)
+    Ok(Some(on))
 }
 
 /// mem_unmap(x0 process with MANAGE, x1 address, x2 length): the pages of

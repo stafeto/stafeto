@@ -49,7 +49,7 @@ mod upcall;
 use devices::{device_window_create, irq_ack, irq_bind};
 use handles::{handle_close, handle_duplicate};
 use info::{debug_write, object_info};
-use mem::{change, go_on, mem_create, mem_map, mem_protect, mem_unmap};
+use mem::{change, change_map, go_on, mem_create, mem_protect, mem_unmap};
 use messages::{channel_create, notify, receive, reply, send};
 use proc::{
     process_control, process_create, process_exit, process_kill, thread_create, thread_exit,
@@ -210,7 +210,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::Reply) => objects!(reply(thread, &args)),
         Some(Call::Notify) => objects!(notify(thread, &args)),
         Some(Call::MemCreate) => return mem_create(thread, &args),
-        Some(Call::MemMap) => return change(thread, &args, mem_map),
+        Some(Call::MemMap) => return change_map(thread, &args),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
         Some(Call::ProcessCreate) => objects!(process_create(thread, &args)),

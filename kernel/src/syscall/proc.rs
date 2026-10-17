@@ -119,6 +119,10 @@ fn new_child(
     start: Option<(Object, Rights)>,
 ) -> Result<(NonNull<Process>, Handle), Error> {
     let child = process::create_child(caller(thread), quota, limit, ceiling)?;
+    // The child is known to nothing yet but this call: the hold of the lock
+    // ends here and the rest of the call is a section of its own, so that
+    // neither is longer than OBJ_HOLD_MAX.
+    crate::obj::outside(|| {});
     match start {
         Some((object, rights)) => process::move_start(child, object, rights),
         None => process::reserve_start(child),

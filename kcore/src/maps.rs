@@ -114,6 +114,15 @@ impl<T: Copy> Maps<T> {
             self.check_free(mapping.start, mapping.pages.into()).is_ok(),
             "a mapping over another"
         );
+        self.insert_free(mapping)
+    }
+
+    /// `insert` for a range that the caller checked and that nothing has
+    /// changed since (the kernel's mem_map checks under one section and
+    /// inserts under the next, which it enters only if the table is as it
+    /// was): the scan of the whole table is not made twice.
+    pub fn insert_free(&mut self, mapping: Mapping<T>) -> Result<usize, Error> {
+        debug_assert!(self.check_free(mapping.start, mapping.pages.into()).is_ok());
         let index = self
             .entries
             .iter()

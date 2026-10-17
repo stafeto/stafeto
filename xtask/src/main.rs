@@ -4735,6 +4735,21 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the 128 threads of the portion, the cost the CPU time of a process
 /// (`getrusage`, `times`) needs.
 ///
+/// `OBJ_HOLD_MAX` 6 000 -> 4 000 (SMP stage 4): mem_map checks the mappings
+/// and the threads of the process in a section and enters the entry in the
+/// next, which begins only if nothing joined the process between
+/// (`maps::epoch`): 5 724 -> 2 939; process_create gives the lock back
+/// between the child and its first entries: 4 598 -> 2 957; the stage Space
+/// reads the entries of a table with no lock and takes it for the table that
+/// goes back: 4 099 -> 3 927 (the stage that holds longest now).
+///
+/// `THREADS_READY_MAX` 10 833 -> 12 195 (SMP stage 4): a thread of another
+/// CPU leaves the scheduler by a command, so `sched::exit` reads where the
+/// thread runs and what it was asked, marks its end for the CPUs that read it
+/// (`thread::mark_ended`), and each portion first looks at the gate wave
+/// (`control::gate_seen`): 24 instructions a thread, 1 358 for the 56 of
+/// the portion; the reviewer of the kernel decides whether it stays.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -4766,15 +4781,12 @@ const NULL_MAX: u64 = 271;
 /// C_cmd, decision 3 of the SMP design). A class of calls that holds longer
 /// goes in portions or narrows its section; the kernel prints the number as
 /// `obj hold ticks: longest=N`.
-const OBJ_HOLD_MAX: u64 = 6_000;
+const OBJ_HOLD_MAX: u64 = 4_000;
 /// The blocking time of a kernel call on four CPUs, B_4 = B + 3 *
 /// OBJ_HOLD_MAX: the call's own longest portion and the sections of the
 /// three CPUs ahead of it in the ticket lock. Decision of the stage 3
-/// review: `kernel_tests` prints B_4 against this bound now; the stage 4
-/// merge turns it into a failure, and it asks OBJ_HOLD_MAX to come down to
-/// 4 000 (`dc zva` in `phys::zero`, then the zeroing of a new page outside
-/// the section) so that B_4 fits. The ASID rollover adds its own term until
-/// stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
+/// review: `kernel_tests` fails B_4 above this bound from stage 4. The ASID
+/// rollover adds its own term until stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
 const B4_MAX: u64 = 32_000;
 /// The hold of the one section that makes a new generation of ASIDs, once
 /// in 65 535 switches of address space: it clears the table of ASIDs and
@@ -4786,7 +4798,7 @@ const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 10_833;
+const THREADS_READY_MAX: u64 = 12_195;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -8715,9 +8727,13 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
     let b4 = n + 3 * OBJ_HOLD_MAX;
-    println!(
-        "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX} (checked from stage 4)"
-    );
+    println!("B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}");
+    if b4 > B4_MAX {
+        return Err(format!(
+            "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
+            b4 - B4_MAX
+        ));
+    }
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
         None => Err(format!(
