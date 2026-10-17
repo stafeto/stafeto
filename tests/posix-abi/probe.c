@@ -19,8 +19,6 @@
 #include <unistd.h>
 #include <time.h>
 
-/* Linux's si_code of tgkill, which pthread_kill and raise use. */
-
 extern char **environ;
 /* The layer's thread table: 64 places, one of them the main thread's. */
 #define THREADS 64
@@ -112,7 +110,14 @@ static int signals(void) {
             || sigpending(&pending) || pending || signal_calls != 1
             || sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != signal_handler
             || previous.sa_flags != (int)SA_RESETHAND) return 165;
-    // All 64 bits of a set are signals: sigwait has no invalid set to refuse.
+    // All 64 bits of a set are signals: SIGRTMAX, bit 63, works.
+    {
+        sigset_t top;
+        int got = 0;
+        if (sigemptyset(&top) || sigaddset(&top, SIGRTMAX) || pthread_sigmask(SIG_BLOCK, &top, NULL)
+                || raise(SIGRTMAX) || sigwait(&top, &got) || got != SIGRTMAX
+                || pthread_sigmask(SIG_UNBLOCK, &top, NULL)) return 166;
+    }
     siginfo_t info = { .si_signo = 999, .si_code = -999, .si_value.sival_ptr = (void *)UINT64_C(18446744073709551615) };
     if (sigemptyset(&set) || sigaddset(&set, SIGUSR1) || raise(SIGUSR1) || raise(SIGUSR1)) return 170;
     errno = 777;

@@ -122,6 +122,14 @@ fn instant(clock: i32, absolute: bool, value: Timespec) -> Result<u64, i32> {
     Ok(target.clamp(i128::from(start), i128::from(u64::MAX)) as u64)
 }
 
+fn nanos_of(time: posix_time::Time) -> u64 {
+    nanos(Timespec {
+        tv_sec: time.seconds,
+        tv_nsec: time.nanos,
+    })
+    .clamp(0, i128::from(u64::MAX)) as u64
+}
+
 /// The deadline and interval of a setting, in the service's form.
 fn arming(clock: i32, flags: i32, new: Spec) -> Result<(u32, u64, u64), i32> {
     if flags & !TIMER_ABSTIME != 0 {
@@ -135,7 +143,15 @@ fn arming(clock: i32, flags: i32, new: Spec) -> Result<(u32, u64, u64), i32> {
         return Err(EINVAL);
     }
     let deadline = instant(clock, flags & TIMER_ABSTIME != 0, new.value)?;
-    let interval = nanos(new.interval).clamp(0, i128::from(u64::MAX)) as u64;
+    let mut interval = nanos(new.interval).clamp(0, i128::from(u64::MAX)) as u64;
+    // An interval is rounded up to a multiple of the clock's resolution
+    // (timer_settime).
+    if let Ok(res) = crate::clock::getres(clock) {
+        let res = nanos_of(res);
+        if res > 0 && interval > 0 {
+            interval = interval.div_ceil(res).saturating_mul(res);
+        }
+    }
     // An absolute time of CLOCK_REALTIME follows the steps of the calendar.
     let follows = flags & TIMER_ABSTIME != 0 && clock == crate::clock::CLOCK_REALTIME;
     Ok((

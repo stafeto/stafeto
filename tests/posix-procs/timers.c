@@ -206,14 +206,16 @@ static int t_c_queue_places(void) {
     union sigval v;
     v.sival_int = 111;
     if (sigqueue(getpid(), SIGUSR1, v)) return 2;
-    /* The queue holds SIGQUEUE_MAX occurrences of the process: more than one
-     * place, and a refusal (EAGAIN) once they are all taken. */
+    /* The queue holds SIGQUEUE_MAX occurrences of the process, exactly, and
+     * refuses (EAGAIN) the next. */
+    long limit = sysconf(_SC_SIGQUEUE_MAX);
+    if (limit < 32) return 14;
     int queued = 1;
-    for (; queued < 200; queued++) {
+    for (; queued < limit + 8; queued++) {
         v.sival_int = 222;
         if (sigqueue(getpid(), SIGUSR1, v)) break;
     }
-    if (errno != EAGAIN || queued < 2 || queued > 64) return 3;
+    if (errno != EAGAIN || queued != limit) return 3;
     siginfo_t info;
     if (t_take(SIGUSR1, &info, 1000) != SIGUSR1) return 4;
     if (info.si_code != SI_QUEUE || info.si_value.sival_int != 111) return 5;
@@ -490,8 +492,11 @@ static int t_c_least_interval(void) {
     if (timer_create(CLOCK_MONOTONIC, &e, &t)) return 2;
     struct itimerspec its = t_its(T_MS, 1), got;
     if (timer_settime(t, 0, &its, NULL)) return 3;
-    /* The interval stays what the program set. */
-    if (timer_gettime(t, &got) || got.it_interval.tv_sec || got.it_interval.tv_nsec == 0) return 4;
+    /* An interval of one nanosecond is rounded up to the resolution of the
+     * clock (timer_settime). */
+    struct timespec res;
+    if (clock_getres(CLOCK_MONOTONIC, &res) || res.tv_sec) return 6;
+    if (timer_gettime(t, &got) || got.it_interval.tv_sec || got.it_interval.tv_nsec != res.tv_nsec) return 4;
     t_got = 0;
     t_nap(200);
     its = t_its(0, 0);
