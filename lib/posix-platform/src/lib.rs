@@ -772,12 +772,22 @@ pub unsafe extern "C" fn stafeto_fexecve(
 /// (`stafeto_probe_fork_window`) runs in the parent before ForkCommit.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fork() -> c_int {
+    // The child reads the files as the shared mappings of the parent show
+    // them.
+    mapping::flush_files();
     let set = FORK_WINDOW.load(core::sync::atomic::Ordering::Acquire) != 0;
     let window = set.then_some(fork_window as fn());
-    match call(|| posix_abi::fork::fork(window)) {
+    match call(|| posix_abi::fork::fork_held(window)) {
         Ok(pid) => pid,
         Err(errno) => -errno,
     }
+}
+
+/// The end of fork for relibc, after it let go of its locks: the signals
+/// that came while fork held them are delivered.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fork_done() {
+    posix_abi::fork::deliver_after_fork();
 }
 
 /// The probes of the window of exec (posix_abi::process): ExecCommit
@@ -1288,6 +1298,20 @@ pub extern "C" fn stafeto_thread_release(id: c_int) {
     posix_abi::relibc::release(id as u64);
 }
 
+/// Whether a guard area for a stack may be cut: the table of mappings has
+/// room (1) or not (0).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_guard_room() -> c_int {
+    c_int::from(posix_abi::allocation::room_for_guard())
+}
+
+/// Frees the stacks and blocks of the threads that ended and were released,
+/// for a `pthread_create` that found no memory for its own.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_collect() {
+    let _ = posix_abi::relibc::collect();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_exit_thread(stack: *mut c_void, size: usize) -> ! {
     posix_abi::relibc::exit_thread(stack as usize, size)
@@ -1300,9 +1324,14 @@ pub unsafe extern "C" fn stafeto_futex_wait(addr: *mut u32, val: u32, deadline: 
     // SAFETY: the caller's promise.
     let word = unsafe { &*addr.cast::<AtomicU32>() };
     let deadline = (deadline != u64::MAX).then_some(deadline);
+    let before = posix_sync::clear_no_restart();
     let waited = posix_sync::futex_wait(word, val, posix_sync::CLOCK_MONOTONIC, deadline);
+    let ran = posix_sync::interrupted(before);
     cancel_if_asynchronous();
     match waited {
+        // A handler without SA_RESTART ran during the wait: the caller may
+        // report EINTR (sem_wait); the others look at their word again.
+        Ok(posix_sync::Woken::Entry) if ran => -posix_sync::EINTR,
         Ok(_) => 0,
         Err(errno) => -errno,
     }

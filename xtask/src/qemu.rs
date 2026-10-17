@@ -497,11 +497,12 @@ impl Run {
     }
 
     /// Waits up to `timeout` for the whole line `line` anywhere in the
-    /// output, before the last text found too; the next search still
-    /// starts where it did.
+    /// output (or its end, where another program's text came into the line
+    /// before it: two programs write to the one UART), before the last text
+    /// found too; the next search still starts where it did.
     pub fn expect_seen(&mut self, line: &str, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
-        while !self.lines.iter().any(|l| l == line) {
+        while !self.lines.iter().any(|l| l == line || l.ends_with(line)) {
             self.wait_on(deadline, &format!("{line:?} anywhere"))?;
         }
         Ok(())

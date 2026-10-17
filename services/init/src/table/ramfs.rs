@@ -551,8 +551,12 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// getlogin code) added 3 pages to the 474: 477 measured, and 532 pages leave
 /// 10.3%. The priority probe of the steps (two threads of the spawners, the
 /// semaphores, the offsets of the asks) added 5: 482 measured, and 540 pages
-/// leave 10.7%.
-const STEPS_QUOTA: u64 = 540 * PAGE;
+/// leave 10.7%. Goal I (64 signals with their tables of claims, the queue
+/// of the library's timers, the claims of the memory limits) added 12: 494
+/// measured; the guard page of each of the seven workers' stacks (a page the
+/// kernel counts while the stack is made) brought it to 501, and 560 pages
+/// leave 10.5%.
+const STEPS_QUOTA: u64 = 560 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping
@@ -584,6 +588,11 @@ pub const OS_TEST_TABLE: &[Record] = &[
         connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
+        // 35 and a ceiling of 36, as high as the entropy service allows: the
+        // 32 real-time priorities of the tests are the levels 4 to 35, and
+        // SCHED_OTHER stands below them at 3.
+        priority: 35,
+        ceiling: 36,
         ..POSIX
     },
     super::entropy::RNG,
@@ -591,7 +600,9 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-/// 610 pages. Measured on the whole of basic and Open POSIX (bisected on the
+/// 1,280 pages (it was 610: tests of Open POSIX start 30 threads, each with a
+/// stack of 64 KiB, and the thread tests of Open POSIX that run longer than
+/// the heap allows end in EAGAIN or OOM below that). The 610 pages were measured on the whole of basic and Open POSIX (bisected on the
 /// quota with the tests that passed before): 554 pages pass and 553 do not,
 /// the tightest being pthread_cond_wait/2-2, pthread_cond_timedwait/2-4 and
 /// 2-7 (a stack is mapped for each thread, one after the other) and
@@ -600,7 +611,7 @@ pub const OS_TEST_TABLE: &[Record] = &[
 /// and the checks of the pages of a segment, which the programs that use
 /// semaphores carry, and 512 before the files, shared memory and the
 /// rendezvous of the process service.
-const OS_TEST_QUOTA: u64 = 610 * PAGE;
+const OS_TEST_QUOTA: u64 = 1280 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {

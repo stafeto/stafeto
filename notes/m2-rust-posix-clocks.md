@@ -17,7 +17,7 @@ Resolution is ceil(1,000,000,000 / CNTFRQ): 16 ns at QEMU's 62.5 MHz,
 42 ns at Apple VZ's 24 MHz. It is independent of application priority.
 
 The posix-clock-service package owns one realtime anchor shared by all connected processes.
-Its initial value is the Unix epoch at service startup, explicitly unsynchronized.
+Its initial value is 2026-01-01 00:00:00 UTC at service startup (a system without a battery clock), explicitly unsynchronized (generation 0).
 RTC or time synchronization must supply an actual initial date in a later part.
 Connecting to this endpoint grants setting permission under init's capability list.
 Separate read/write permissions and user credentials remain future work.

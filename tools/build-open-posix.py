@@ -77,10 +77,35 @@ def clang() -> str:
     return found
 
 
+# Mistakes of the suite that stop a test from compiling anywhere: the member
+# `cid` that `stress1.c` of pthread_cond_wait sets is missing from its
+# `struct childdata` (the file of pthread_cond_timedwait has it).
+#
+# Two tests keep 1,024 `struct aiocb` (about 170 KiB) on the stack of main,
+# which has 64 KiB here: the array becomes static, and the test asks the
+# same of the library.
+SOURCE_FIXES = {
+    "conformance/interfaces/aio_read/9-1.c": (
+        "\tstruct aiocb aiocbs[NUM_AIOCBS];",
+        "\tstatic struct aiocb aiocbs[NUM_AIOCBS];",
+    ),
+    "conformance/interfaces/aio_write/7-1.c": (
+        "\tstruct aiocb aiocbs[NUM_AIOCBS];",
+        "\tstatic struct aiocb aiocbs[NUM_AIOCBS];",
+    ),
+    "stress/threads/pthread_cond_wait/stress1.c": (
+        "\tint fork;\n\tint *pBool;\n};",
+        "\tint fork;\n\tint *pBool;\n\tclockid_t cid;\n};",
+    ),
+}
+
+
 def fetch() -> None:
     """Download the release (once), check it, unpack the suite alone."""
     done = SOURCE / ".unpacked"
-    if done.exists() and done.read_text() == SHA256:
+    # The unpacked tree carries the fixes of SOURCE_FIXES: a changed list unpacks again.
+    stamp = SHA256 + hashlib.sha256(repr(sorted(SOURCE_FIXES.items())).encode()).hexdigest()
+    if done.exists() and done.read_text() == stamp:
         return
     WORK.mkdir(parents=True, exist_ok=True)
     if not ARCHIVE.exists() or hashlib.sha256(ARCHIVE.read_bytes()).hexdigest() != SHA256:
@@ -103,7 +128,13 @@ def fetch() -> None:
             target = SOURCE / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(tar.extractfile(member).read())
-    done.write_text(SHA256)
+    for name, (old, new) in SOURCE_FIXES.items():
+        path = SOURCE / name
+        text = path.read_text()
+        if old not in text:
+            raise SystemExit(f"{name}: the text to fix is not there")
+        path.write_text(text.replace(old, new, 1))
+    done.write_text(stamp)
 
 
 def inventory() -> list[tuple[str, str, Path]]:

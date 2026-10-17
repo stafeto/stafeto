@@ -4,8 +4,7 @@
 //! Signals for relibc's stafeto platform: relibc's Linux AArch64 layouts
 //! and numbers (struct sigaction, a 64-bit sigset_t, siginfo_t, SIG_BLOCK
 //! and the SA_ flags) translated to the layer's (posix-abi::signals). The
-//! layer has signals 1 to 31; a real-time signal is EINVAL, and the bits
-//! 32 to 64 of a set are dropped.
+//! layer has the signals 1 to 64, the real-time ones from SIGRTMIN (35).
 
 use super::{call, value};
 use core::ffi::c_int;
@@ -169,8 +168,6 @@ pub unsafe extern "C" fn stafeto_sigsuspend(mask: *const u64) -> c_int {
 
 /// Linux's siginfo_t: 128 bytes, the signal, errno and code first.
 const SIGINFO_SIZE: usize = 128;
-/// si_code of a signal sent by tkill (pthread_kill, raise).
-const SI_TKILL: c_int = -6;
 
 /// # Safety
 /// `set` is readable, `info` null or writable for a Linux siginfo_t,
@@ -195,13 +192,15 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
         call(|| posix_abi::signals::sigtimedwait(set, Some(&mut taken), timeout)).map(i64::from),
     );
     if status > 0 && !info.is_null() {
-        // A thread's signal says SI_TKILL; the process's carries what its
-        // sender gave: si_code, si_pid, si_uid, and SIGCHLD's si_status.
-        let code = if taken.si_code == posix_types::constants::SI_THREAD {
-            SI_TKILL
-        } else {
-            taken.si_code
-        };
+        // A thread's signal says SI_USER from this process; the process's
+        // carries what its sender gave: si_code, si_pid, si_uid, and
+        // SIGCHLD's si_status.
+        if taken.si_code == posix_types::constants::SI_THREAD {
+            taken.si_code = 0;
+            taken.si_pid = posix_abi::process::getpid();
+            taken.si_uid = posix_abi::process::getuid();
+        }
+        let code = taken.si_code;
         // SAFETY: the caller's promise.
         unsafe {
             info.write_bytes(0, SIGINFO_SIZE);

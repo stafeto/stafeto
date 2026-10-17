@@ -7,7 +7,10 @@
 pub use posix_types::{SigAction, SigSet, constants::*};
 pub const DEFAULT: u64 = 0;
 pub const IGNORE: u64 = 1;
-pub const VALID: SigSet = (1 << 31) - 1;
+/// The signals 1 to 64: the ordinary ones, and the real-time signals from 32.
+pub const VALID: SigSet = u64::MAX;
+/// The highest signal number.
+pub const SIGNAL_MAX: i32 = 64;
 pub const UNBLOCKABLE: SigSet = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 pub const FLAGS: i32 =
     SA_NODEFER | SA_RESETHAND | SA_SIGINFO | SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT | SA_ONSTACK;
@@ -24,16 +27,14 @@ pub enum Invalid {
     Handler,
 }
 pub fn bit(signal: i32) -> Result<SigSet, Invalid> {
-    if !(1..=31).contains(&signal) {
+    if !(1..=SIGNAL_MAX).contains(&signal) {
         return Err(Invalid::Signal);
     }
     Ok(1 << (signal - 1))
 }
 pub fn mask(set: SigSet) -> Result<SigSet, Invalid> {
-    if set & !VALID != 0 {
-        return Err(Invalid::Mask);
-    }
-    Ok(set & !UNBLOCKABLE)
+    // Every bit of a set is a signal (1 to 64); SIGKILL and SIGSTOP cannot be held.
+    Ok(set & VALID & !UNBLOCKABLE)
 }
 pub fn action_words(action: SigAction) -> [u64; 3] {
     [action.handler, action.mask, action.flags as u32 as u64]
@@ -61,7 +62,7 @@ pub fn default_action(signal: i32) -> DefaultAction {
     }
 }
 pub struct Actions {
-    values: [SigAction; 31],
+    values: [SigAction; 64],
 }
 impl Default for Actions {
     fn default() -> Self {
@@ -71,7 +72,7 @@ impl Default for Actions {
 impl Actions {
     pub const fn new() -> Self {
         Self {
-            values: [INITIAL; 31],
+            values: [INITIAL; 64],
         }
     }
     pub fn get(&self, signal: i32) -> Result<SigAction, Invalid> {
@@ -266,14 +267,13 @@ mod tests {
     }
     #[test]
     fn every_signal_bit_and_invalid_boundaries() {
-        for signal in 1..=31 {
+        for signal in 1..=64 {
             assert_eq!(bit(signal), Ok(1 << (signal - 1)));
         }
-        for signal in [i32::MIN, -1, 0, 32, i32::MAX] {
+        for signal in [i32::MIN, -1, 0, 65, i32::MAX] {
             assert_eq!(bit(signal), Err(Invalid::Signal));
         }
         assert_eq!(mask(VALID), Ok(VALID & !UNBLOCKABLE));
-        assert_eq!(mask(1 << 63), Err(Invalid::Mask));
     }
     #[test]
     fn invalid_action_is_atomic_and_uncatchable_queries_work() {
@@ -284,7 +284,6 @@ mod tests {
         }
         for action in [
             caught(128, 0),
-            caught(0, 1 << 63),
             SigAction {
                 handler: u64::MAX,
                 ..INITIAL
@@ -308,10 +307,6 @@ mod tests {
         assert_eq!(thread.change_mask(SIG_BLOCK, Some(first)), Ok(0));
         assert_eq!(thread.change_mask(-99, None), Ok(first));
         assert_eq!(thread.change_mask(-99, Some(second)), Err(Invalid::Mask));
-        assert_eq!(
-            thread.change_mask(SIG_BLOCK, Some(1 << 63)),
-            Err(Invalid::Mask)
-        );
         assert_eq!(thread.mask, first);
         assert_eq!(
             thread.change_mask(SIG_BLOCK, Some(second | UNBLOCKABLE)),
@@ -457,7 +452,6 @@ mod accept_tests {
         let mut thread = Thread::new(set);
         thread.generate(SIGUSR2, &actions).unwrap();
         thread.generate(SIGUSR1, &actions).unwrap();
-        assert_eq!(thread.accept(1 << 63), Err(Invalid::Mask));
         assert_eq!(thread.pending(), set);
         assert_eq!(thread.accept(0), Ok(None));
         assert_eq!(thread.accept(set | UNBLOCKABLE), Ok(Some(SIGUSR1)));

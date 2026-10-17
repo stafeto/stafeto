@@ -75,7 +75,15 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Review of the pin: a thread timer is deleted under its lock, mq_close removes
 # only the registration of its own process, lio_listio past the limit is
 # EINVAL, _PC_SYNC_IO is -1; tagged pin-71a760df.
-COMMIT = "71a760dfb53b4a326071e645d7ba855d3d63b142"
+# Goal I (Open POSIX to 1,850): _POSIX_REALTIME_SIGNALS, _POSIX_CPUTIME and
+# _POSIX_THREAD_CPUTIME claimed, SIGQUEUE_MAX 32, _POSIX_SPORADIC_SERVER -1,
+# timers on CPU-time clocks and ITIMER_VIRTUAL and ITIMER_PROF kept by the
+# library, conditions on a monotonic clock, gettimeofday, strftime, headers
+# (ucontext.h, sys/vfs.h, si_band, SIGPOLL), PTHREAD_KEYS_MAX 1024, the
+# limit of pthread_atfork, sem_wait that a handler interrupts, scheduling and
+# memory options, the end of fork, guard pages of stacks, join and detach of
+# a thread that is gone, one page of guard by default while the table of mappings has room, a collection when a stack finds no memory, named semaphore waits that ask again; tagged pin-8b8e3b42.
+COMMIT = "8b8e3b4249857ac45451e9841df11aa3a5e69f0c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -573,6 +573,22 @@ pub fn probe_mappings() -> u64 {
 /// parent, 0 in the child; EAGAIN, ENOMEM or ENOSYS as `copy` says, and
 /// for a service out of clones.
 pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
+    let result = fork_held(window);
+    deliver_after_fork();
+    result
+}
+
+/// The signals that waited during `fork_held` are delivered now.
+pub fn deliver_after_fork() {
+    crate::signals::route();
+    crate::signals::deliver_now();
+}
+
+/// `fork`, with the delivery of the signals that came meanwhile left to the
+/// caller (`deliver_after_fork`): a library that holds locks around the call
+/// (relibc's allocator and standard streams) lets them go first, since a
+/// handler may use them.
+pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
     // A program init started has no code in its map: nothing to stop for.
     let at = resume as *const () as u64;
     let code = crate::allocation::regions(|map| {
@@ -598,8 +614,6 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
         crate::signals::resume_others();
     }
     block.mask.store(mask, Ordering::SeqCst);
-    crate::signals::route();
-    crate::signals::deliver_now();
     // fork's errors are EAGAIN and ENOMEM (and ENOSYS above): a refusal
     // of the loader or of a service is a limit of the moment.
     result

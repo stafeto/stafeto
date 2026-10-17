@@ -66,7 +66,7 @@ static void end_group(pid_t group) {
 }
 
 /* Runs the test `name` of the file `rel` in the directory `dir`. */
-static void run_one(const char *name, const char *dir, const char *rel) {
+static void run_one(const char *name, const char *dir, const char *rel, const char *arg) {
     printf("@@os-test begin %s\n", name);
     fflush(stdout);
     if (chdir(dir) != 0) {
@@ -75,7 +75,7 @@ static void run_one(const char *name, const char *dir, const char *rel) {
     }
     char path[512];
     snprintf(path, sizeof path, "./%s", rel);
-    char *argv[] = {path, NULL};
+    char *argv[] = {path, (char *)arg, NULL};
     pid_t pid;
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
@@ -85,7 +85,7 @@ static void run_one(const char *name, const char *dir, const char *rel) {
     if (e == ENOEXEC) {
         /* A shell script of the suite: the shell of the image runs it, as
          * execvp does for a file that is no executable. */
-        char *shell_argv[] = {"sh", path, NULL};
+        char *shell_argv[] = {"sh", path, (char *)arg, NULL};
         e = posix_spawn(&pid, "/bin/sh", NULL, &attr, shell_argv, environ);
     }
     posix_spawnattr_destroy(&attr);
@@ -144,8 +144,10 @@ int main(int argc, char **argv) {
         }
         char *dir = strtok(NULL, " \n");
         char *rel = strtok(NULL, " \n");
+        /* An argument for a test that wants one (the fourth word), else none. */
+        char *arg = strtok(NULL, " \n");
         if (!name || !dir || !rel) continue;
-        run_one(name, dir, rel);
+        run_one(name, dir, rel, arg);
     }
     fclose(list);
     printf("os-test-run: done\n");

@@ -65,13 +65,13 @@ fn check_clock(clock: i32) -> Result<(), i32> {
     }
 }
 
-/// A timer on `clock` that sends `signal` (1 to 31; 0: SIGEV_NONE) with
+/// A timer on `clock` that sends `signal` (1 to 64; 0: SIGEV_NONE) with
 /// the value `value` (the bytes of sigval; with `own_id` the number of the
 /// timer): its `timer_t`. EAGAIN when the
 /// process holds its share of timers or the service has no place.
 pub fn create(clock: i32, signal: i32, value: u64, own_id: bool) -> Result<usize, i32> {
     check_clock(clock)?;
-    if !(0..=31).contains(&signal) {
+    if !(0..=64).contains(&signal) {
         return Err(EINVAL);
     }
     // Bit 8 of the signal: the value the signal carries is the timer's id.
@@ -122,6 +122,14 @@ fn instant(clock: i32, absolute: bool, value: Timespec) -> Result<u64, i32> {
     Ok(target.clamp(i128::from(start), i128::from(u64::MAX)) as u64)
 }
 
+fn nanos_of(time: posix_time::Time) -> u64 {
+    nanos(Timespec {
+        tv_sec: time.seconds,
+        tv_nsec: time.nanos,
+    })
+    .clamp(0, i128::from(u64::MAX)) as u64
+}
+
 /// The deadline and interval of a setting, in the service's form.
 fn arming(clock: i32, flags: i32, new: Spec) -> Result<(u32, u64, u64), i32> {
     if flags & !TIMER_ABSTIME != 0 {
@@ -135,8 +143,22 @@ fn arming(clock: i32, flags: i32, new: Spec) -> Result<(u32, u64, u64), i32> {
         return Err(EINVAL);
     }
     let deadline = instant(clock, flags & TIMER_ABSTIME != 0, new.value)?;
-    let interval = nanos(new.interval).clamp(0, i128::from(u64::MAX)) as u64;
-    Ok((1, deadline, interval))
+    let mut interval = nanos(new.interval).clamp(0, i128::from(u64::MAX)) as u64;
+    // An interval is rounded up to a multiple of the clock's resolution
+    // (timer_settime).
+    if let Ok(res) = crate::clock::getres(clock) {
+        let res = nanos_of(res);
+        if res > 0 && interval > 0 {
+            interval = interval.div_ceil(res).saturating_mul(res);
+        }
+    }
+    // An absolute time of CLOCK_REALTIME follows the steps of the calendar.
+    let follows = flags & TIMER_ABSTIME != 0 && clock == crate::clock::CLOCK_REALTIME;
+    Ok((
+        1 | if follows { op::ARMED_REALTIME } else { 0 },
+        deadline,
+        interval,
+    ))
 }
 
 /// Arms the timer with `new` (a zero value disarms it); the setting
@@ -173,4 +195,12 @@ pub fn set_alarm(value: u64, interval: u64) -> Result<[u64; 2], i32> {
 pub fn get_alarm() -> Result<[u64; 2], i32> {
     let w = request(proto_process::Method::Timer, &[op::ALARM_GET])?;
     ask_setting(&w)
+}
+
+/// The calendar of CLOCK_REALTIME was set `delta` ns ahead of the monotonic
+/// scale (superuser): the timers armed with an absolute time of it move.
+pub(crate) fn clock_step(delta: i64) -> Result<(), i32> {
+    let mut w = request(proto_process::Method::Timer, &[op::CLOCK_STEP])?;
+    w.u64(delta as u64).map_err(|_| EIO)?;
+    ask(&w).map(drop)
 }

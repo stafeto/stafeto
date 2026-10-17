@@ -189,6 +189,13 @@ impl Clock {
             generation: 0,
         })
     }
+    /// A clock whose calendar reads `seconds` after the Unix epoch at `mono`,
+    /// still unset (generation 0): the start of a system without a battery clock.
+    pub fn starting_at(mono: u64, hz: u64, seconds: i64) -> Result<Self, Error> {
+        let mut clock = Self::new(mono, hz)?;
+        clock.value = Time { seconds, nanos: 0 }.value()?;
+        Ok(clock)
+    }
     pub fn current(&self, now: u64) -> Result<i128, Error> {
         Ok(self.value + i128::from(now.checked_sub(self.mono).ok_or(Error::Invalid)?))
     }
@@ -230,6 +237,12 @@ mod tests {
     use proto_clock::{MONOTONIC, REALTIME};
     fn time(seconds: i64, nanos: i64) -> Time {
         Time { seconds, nanos }
+    }
+    #[test]
+    fn a_clock_may_start_after_the_epoch_unset() {
+        let c = Clock::starting_at(1_000, 62_500_000, 1_000_000).unwrap();
+        assert_eq!(c.get(REALTIME, 1_123).unwrap().time, time(1_000_000, 123));
+        assert_eq!(c.get(REALTIME, 1_123).unwrap().generation, 0);
     }
     #[test]
     fn calendar_moves_forward_and_backward_without_changing_monotonic() {

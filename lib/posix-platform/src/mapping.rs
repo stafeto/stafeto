@@ -10,8 +10,10 @@
 
 use super::call;
 use core::ffi::{c_int, c_void};
-use posix_abi::constants::{EACCES, EBADF, EINVAL, EIO, ENODEV, ENOMEM};
-use posix_abi::mmap::{self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE};
+use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM};
+use posix_abi::mmap::{
+    self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
+};
 
 const PAGE: usize = 4096;
 /// The lowest number the layer's descriptors of mapped files take: near the
@@ -86,6 +88,25 @@ fn fill(fd: c_int, address: usize, len: usize, offset: u64) {
             break;
         }
         done += got as usize;
+    }
+}
+
+/// The pages of a mapping of a file that lie wholly past its end get no
+/// access, and a reference to them is SIGBUS.
+fn cut_past_end(fd: c_int, address: usize, len: usize, offset: u64, prot: c_int) {
+    let Ok((size, _)) = file_info(fd) else {
+        return;
+    };
+    let in_file = size
+        .div_ceil(PAGE as u64)
+        .saturating_sub(offset / PAGE as u64) as usize;
+    let pages = len.div_ceil(PAGE);
+    if in_file < pages {
+        let start = address + in_file * PAGE;
+        let tail = (pages - in_file) * PAGE;
+        if mmap::mprotect(start, tail, PROT_NONE).is_ok() {
+            mmap::mark_past_end(start, start + tail, prot);
+        }
     }
 }
 
@@ -248,13 +269,15 @@ fn private_file(
     offset: u64,
 ) -> Result<usize, c_int> {
     let address = mmap::mmap(addr, len, prot | PROT_WRITE, flags, None)?;
-    fill(fd, address, len, offset);
+    // The whole of the last page too: the file shows through it up to its end.
+    fill(fd, address, len.div_ceil(PAGE) * PAGE, offset);
     if prot & PROT_WRITE == 0
         && let Err(errno) = mmap::mprotect(address, len, prot)
     {
         let _ = mmap::munmap(address, len);
         return Err(errno);
     }
+    cut_past_end(fd, address, len, offset, prot);
     Ok(address)
 }
 
@@ -337,7 +360,7 @@ fn shared_file(
             }
         }
     };
-    fill(kept, address, len, offset);
+    fill(kept, address, len.div_ceil(PAGE) * PAGE, offset);
     if matches!(got, Some(Got::Reserved)) {
         // The file is read: the others may map the object.
         let handed = mmap::object_at(address)
@@ -353,6 +376,7 @@ fn shared_file(
         close_released();
         return Err(errno);
     }
+    cut_past_end(kept, address, len, offset, prot);
     Ok(address)
 }
 
@@ -390,6 +414,53 @@ pub extern "C" fn stafeto_map_check(addr: *const c_void, len: usize) -> c_int {
     }
 }
 
+/// `mlock`: the range is rounded out to whole pages and checked, and the
+/// caller must be allowed to lock that much (RLIMIT_MEMLOCK; EPERM at 0
+/// for anyone but the superuser, ENOMEM past it). The memory is resident
+/// already, so nothing else is done.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_mlock(addr: *const c_void, len: usize) -> c_int {
+    const PAGE: usize = 4096;
+    let start = (addr as usize) & !(PAGE - 1);
+    let Some(end) = (addr as usize)
+        .checked_add(len)
+        .and_then(|e| e.checked_next_multiple_of(PAGE))
+    else {
+        return -posix_abi::constants::ENOMEM;
+    };
+    if let Err(errno) = posix_abi::resources::lock_check((end - start) as u64) {
+        return -errno;
+    }
+    stafeto_map_check(start as *const c_void, end - start)
+}
+
+/// `munlock`: the range is rounded out to whole pages and checked.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_munlock(addr: *const c_void, len: usize) -> c_int {
+    const PAGE: usize = 4096;
+    let start = (addr as usize) & !(PAGE - 1);
+    let Some(end) = (addr as usize)
+        .checked_add(len)
+        .and_then(|e| e.checked_next_multiple_of(PAGE))
+    else {
+        return -posix_abi::constants::ENOMEM;
+    };
+    stafeto_map_check(start as *const c_void, end - start)
+}
+
+/// `mlockall` (`flags` MCL_CURRENT, MCL_FUTURE) and `munlockall` (0 flags).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_mlockall(flags: c_int) -> c_int {
+    if flags == 0 {
+        posix_abi::resources::unlock_all();
+        return 0;
+    }
+    match posix_abi::resources::lock_all(flags & 1 != 0, flags & 2 != 0) {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
+}
+
 /// `msync`: shared mappings of files in the range that the program had
 /// writable are written back to their files (MS_SYNC and MS_ASYNC alike:
 /// the write is done on return, and its error is the error of the call).
@@ -407,6 +478,10 @@ pub extern "C" fn stafeto_msync(addr: *mut c_void, len: usize, flags: c_int) -> 
     }
     let mut pieces = [FilePiece::default(); PIECES];
     if flags & MS_INVALIDATE != 0 {
+        // A page that mlockall locked is not invalidated (EBUSY).
+        if posix_abi::resources::locked_all() {
+            return -EBUSY;
+        }
         let n = mmap::file_pieces(addr as usize, len, false, &mut pieces);
         for piece in &pieces[..n] {
             refresh(piece);
@@ -417,6 +492,17 @@ pub extern "C" fn stafeto_msync(addr: *mut c_void, len: usize, flags: c_int) -> 
     match write_back(&pieces[..n]) {
         Ok(()) => 0,
         Err(errno) => -errno,
+    }
+}
+
+/// Writes back every shared mapping of a file that the program had writable,
+/// as `msync` does: a process that starts from this one (fork) reads the
+/// files as the mappings show them.
+pub(crate) fn flush_files() {
+    let mut pieces = [FilePiece::default(); PIECES];
+    let n = mmap::file_pieces(0, usize::MAX / 2, true, &mut pieces);
+    if n > 0 {
+        let _ = write_back(&pieces[..n]);
     }
 }
 

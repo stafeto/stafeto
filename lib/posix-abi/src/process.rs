@@ -271,13 +271,13 @@ pub fn kill(pid: i32, signal: i32) -> Result<(), i32> {
 
 /// sigqueue of `signal` with the bytes `value` of the C union sigval to
 /// the process `pid` (above 0): the rules of kill, the signals the layer has
-/// (1 to 31), and 0 for a check alone. The information the receiver takes
+/// (1 to 64), and 0 for a check alone. The information the receiver takes
 /// carries SI_QUEUE, the caller's PID and real UID, and the value. The
-/// service keeps one place for a signal: EAGAIN while it waits already.
-/// A signal to the caller's own process comes to a thread of it before the
-/// return.
+/// service queues the occurrences (at most SIGQUEUE_MAX = 32 for a process
+/// at a time): EAGAIN past that. A signal to the caller's own process
+/// comes to a thread of it before the return.
 pub fn sigqueue(pid: i32, signal: i32, value: u64) -> Result<(), i32> {
-    if !(0..=31).contains(&signal) {
+    if !(0..=64).contains(&signal) {
         return Err(crate::constants::EINVAL);
     }
     if pid <= 0 {
@@ -291,6 +291,16 @@ pub fn sigqueue(pid: i32, signal: i32, value: u64) -> Result<(), i32> {
         crate::signals::deliver_now();
     }
     Ok(())
+}
+
+/// The occurrence of `signal` was taken off the page while the service holds
+/// more of it queued (`Page::more`): the service puts the next one there.
+pub fn signal_next(signal: i32) -> Result<(), i32> {
+    let w = request(
+        proto_process::Method::Account,
+        &[proto_process::account_op::SIGNAL_NEXT, signal as u32],
+    )?;
+    ask(&w).map(drop)
 }
 
 /// killpg of group `pgrp`: 0 is the caller's own, one or below is EINVAL

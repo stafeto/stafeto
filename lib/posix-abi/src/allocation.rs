@@ -294,6 +294,13 @@ pub fn regions<R>(f: impl FnOnce(&Map<Handle<Memory>>) -> R) -> R {
     heap(|state| f(&state.map))
 }
 
+/// Whether the kernel's table of mappings has room for the pieces a guard
+/// area cuts: a process with many threads gives its guard areas up when
+/// fewer than 64 places are left.
+pub fn room_for_guard() -> bool {
+    heap(|state| state.room() > 64)
+}
+
 /// The errno of a refused kernel call on a mapping.
 fn kernel_errno(error: rt::abi::Error) -> i32 {
     match error {

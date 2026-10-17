@@ -28,6 +28,19 @@ pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 /// The id of the CPU-time clock of the calling thread.
 pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 
+/// The id of the CPU-time clock of the process `pid`, another than the
+/// caller's (clock_getcpuclockid).
+pub const fn process_clock(pid: u32) -> i32 {
+    ((pid as u64) << 3 | 5) as i32
+}
+
+/// The time process `pid` has run, ns: the process service answers for a
+/// process the caller may signal (EPERM, ESRCH otherwise).
+pub fn process_ns_of(pid: u32) -> Result<u64, i32> {
+    let w = crate::process::request(Method::Account, &[account_op::PROCESS_TIME, pid])?;
+    crate::process::ask_value(&w).map(ns)
+}
+
 /// The nanoseconds `ticks` of the counter make.
 fn ns(ticks: u64) -> u64 {
     rt::time::ticks_to_ns(ticks)

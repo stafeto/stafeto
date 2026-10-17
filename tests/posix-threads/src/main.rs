@@ -345,13 +345,16 @@ fn failed(stage: usize) -> bool {
 /// has no helper thread.
 #[cfg(not(feature = "cancel-input"))]
 fn priorities() -> bool {
-    let main = MAIN_BASE.load(Ordering::Acquire) as u8;
+    // The level main started at is the top of the levels of the process; with
+    // a top of 32 or less main is SCHED_OTHER at the top.
+    let top = MAIN_BASE.load(Ordering::Acquire) as u8;
+    let main = if top > 32 { top - 32 } else { top };
     let me = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("own handle");
     let level = || sys::thread_info(&me).map_or(0, |info| info.base);
     let (mut heap, mut files) = (0, 0);
     abi::allocation::probe_hold(|| heap = level());
     abi::shared::probe_hold(|| files = level());
-    if heap != main + 1 || files != heap || level() != main {
+    if heap != top + 1 || files != heap || level() != main {
         rt::println!(
             "posix-thread-probe: main {} heap {} files {}",
             main,

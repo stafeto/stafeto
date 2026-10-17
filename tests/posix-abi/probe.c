@@ -19,9 +19,6 @@
 #include <unistd.h>
 #include <time.h>
 
-/* Linux's si_code of tgkill, which pthread_kill and raise use. */
-#define SI_TKILL_LINUX (-6)
-
 extern char **environ;
 /* The layer's thread table: 64 places, one of them the main thread's. */
 #define THREADS 64
@@ -69,7 +66,7 @@ static void info_handler(int sig, siginfo_t *info, void *raw) {
     sigset_t mask;
     struct sigaction previous;
     if (sig != SIGUSR1 || !info || !context || info->si_signo != sig
-            || info->si_code != SI_TKILL_LINUX || info->si_errno || info->si_value.sival_ptr
+            || info->si_code != SI_USER || info->si_pid != getpid() || info->si_uid != getuid() || info->si_errno || info->si_value.sival_ptr
             || context->uc_link || context->uc_sigmask || context->uc_stack.ss_sp
             || context->uc_stack.ss_size || context->uc_stack.ss_flags != SS_DISABLE
             || !context->uc_mcontext.sp || context->uc_mcontext.sp % 16
@@ -113,16 +110,19 @@ static int signals(void) {
             || sigpending(&pending) || pending || signal_calls != 1
             || sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != signal_handler
             || previous.sa_flags != (int)SA_RESETHAND) return 165;
-    set = UINT64_C(1) << 63;
-    accepted = 999;
-    if (sigwait(&set, &accepted) != EINVAL || accepted != 999) return 166;
+    // All 64 bits of a set are signals: SIGRTMAX, bit 63, works.
+    {
+        sigset_t top;
+        int got = 0;
+        if (sigemptyset(&top) || sigaddset(&top, SIGRTMAX) || pthread_sigmask(SIG_BLOCK, &top, NULL)
+                || raise(SIGRTMAX) || sigwait(&top, &got) || got != SIGRTMAX
+                || pthread_sigmask(SIG_UNBLOCK, &top, NULL)) return 166;
+    }
     siginfo_t info = { .si_signo = 999, .si_code = -999, .si_value.sival_ptr = (void *)UINT64_C(18446744073709551615) };
-    if (sigwaitinfo(&set, &info) != -1 || errno != EINVAL || info.si_signo != 999
-            || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 168;
     if (sigemptyset(&set) || sigaddset(&set, SIGUSR1) || raise(SIGUSR1) || raise(SIGUSR1)) return 170;
     errno = 777;
     if (sigwaitinfo(&set, &info) != SIGUSR1 || errno != 777 || info.si_signo != SIGUSR1
-            || info.si_code != SI_TKILL_LINUX || info.si_errno || info.si_pid || info.si_uid
+            || info.si_code != SI_USER || info.si_errno || info.si_pid != getpid() || info.si_uid != getuid()
             || sigpending(&pending)
             || pending || signal_calls != 1 || sigaction(SIGUSR1, NULL, &previous)
             || previous.sa_handler != signal_handler || previous.sa_flags != (int)SA_RESETHAND) return 171;
@@ -153,7 +153,7 @@ static int signals(void) {
         if (raise(SIGUSR1)) return 179;
         errno = 777;
         if (sigtimedwait(&set, &info, &invalid[i]) != SIGUSR1 || errno != 777
-                || info.si_signo != SIGUSR1 || info.si_code != SI_TKILL_LINUX || sigpending(&pending) || pending) return 180;
+                || info.si_signo != SIGUSR1 || info.si_code != SI_USER || info.si_pid != getpid() || sigpending(&pending) || pending) return 180;
         info.si_code = -999;
         info.si_value.sival_ptr = (void *)UINT64_C(18446744073709551615);
     }

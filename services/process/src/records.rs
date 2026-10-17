@@ -125,6 +125,11 @@ pub struct Record<P> {
     /// children that were waited for ran, theirs included (getrusage).
     pub carried_ticks: u64,
     pub children_ticks: u64,
+    /// The ticks its process had run at the last listing that sampled it,
+    /// and the time of that sample (the scale of the kernel's timers): a
+    /// process that ran none since a sample some time ago is asleep.
+    pub sample_ticks: u64,
+    pub sample_at: u64,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -454,6 +459,8 @@ impl<P> Records<P> {
             next_name: [0; proto_process::NAME_LEN],
             nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
             carried_ticks: 0,
+            sample_ticks: 0,
+            sample_at: 0,
             children_ticks: 0,
             parent_index: parent.map(|p| p as u16),
             linked,

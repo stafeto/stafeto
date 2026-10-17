@@ -628,7 +628,8 @@ static int constants(void) {
 #else
     {"_POSIX_SPIN_LOCKS", _SC_SPIN_LOCKS, -1, 'V', 1, 0},
 #endif
-#ifdef _POSIX_SPORADIC_SERVER
+/* -1 says the option is not supported. */
+#if defined(_POSIX_SPORADIC_SERVER) && _POSIX_SPORADIC_SERVER > 0
     {"_POSIX_SPORADIC_SERVER", _SC_SPORADIC_SERVER, _POSIX_SPORADIC_SERVER, 'O', 0, 1},
 #else
     {"_POSIX_SPORADIC_SERVER", _SC_SPORADIC_SERVER, -1, 'O', 0, 0},
@@ -678,7 +679,8 @@ static int constants(void) {
 #else
     {"_POSIX_THREAD_SAFE_FUNCTIONS", _SC_THREAD_SAFE_FUNCTIONS, -1, 'V', 1, 0},
 #endif
-#ifdef _POSIX_THREAD_SPORADIC_SERVER
+/* -1 says the option is not supported. */
+#if defined(_POSIX_THREAD_SPORADIC_SERVER) && _POSIX_THREAD_SPORADIC_SERVER > 0
     {"_POSIX_THREAD_SPORADIC_SERVER", _SC_THREAD_SPORADIC_SERVER, _POSIX_THREAD_SPORADIC_SERVER, 'O', 0, 1},
 #else
     {"_POSIX_THREAD_SPORADIC_SERVER", _SC_THREAD_SPORADIC_SERVER, -1, 'O', 0, 0},

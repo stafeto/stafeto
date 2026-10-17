@@ -595,7 +595,8 @@ static int names_truncate(void) {
     FAILS(ftruncate(fd, 0), EBADF);
     fd = open(NAMES_ROOT "/z/f", O_RDONLY);
     CHECK(fd >= 0);
-    FAILS(ftruncate(fd, 0), EBADF);
+    // A descriptor not open for writing is EINVAL (POSIX), a closed one EBADF.
+    FAILS(ftruncate(fd, 0), EINVAL);
     CHECK(close(fd) == 0);
     FAILS(ftruncate(1, 0), EINVAL);
     int dirfd = open(NAMES_ROOT "/z", O_RDONLY | O_DIRECTORY);

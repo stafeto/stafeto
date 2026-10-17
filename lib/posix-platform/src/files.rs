@@ -965,7 +965,10 @@ pub extern "C" fn stafeto_ftruncate(fd: c_int, length: i64) -> c_int {
                 return Err(EINVAL);
             };
             let length = u64::try_from(length).map_err(|_| EINVAL)?;
+            // A descriptor that is open but not for writing is EINVAL (the
+            // file service says EBADF; a closed number was refused above).
             posix_abi::change::truncate(target, length)
+                .map_err(|errno| if errno == EBADF { EINVAL } else { errno })
         })
     });
     value(posix_abi::finish_file_size(result).map(|()| 0)) as c_int

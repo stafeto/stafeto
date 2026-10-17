@@ -218,6 +218,12 @@ fn mmap0(
     }
     let shared = kind == MAP_SHARED;
     let pages = whole_pages(len)?;
+    // Under mlockall(MCL_FUTURE) a mapping is to be locked (EAGAIN past
+    // the limit of locked memory).
+    crate::resources::future_check((pages * PAGE) as u64)?;
+    if flags & MAP_FIXED != 0 {
+        forget_past_end(addr, addr.saturating_add(pages * PAGE));
+    }
     let fixed = flags & MAP_FIXED != 0;
     if fixed && !addr.is_multiple_of(PAGE) {
         return Err(EINVAL);
@@ -408,6 +414,7 @@ pub fn closed_files(out: &mut [(i32, u64, bool)]) -> usize {
 /// `munmap`: the pages of the range lose their mapping; a range with no
 /// mapping in it is not an error.
 pub fn munmap(addr: usize, len: usize) -> Result<(), i32> {
+    forget_past_end(addr, addr.saturating_add(len));
     if !addr.is_multiple_of(PAGE) || len == 0 {
         return Err(EINVAL);
     }
@@ -472,5 +479,67 @@ pub fn check_range(addr: usize, len: usize) -> Result<(), i32> {
         } else {
             Err(ENOMEM)
         }
+    })
+}
+
+/// Whether `address` lies in a mapping other processes share (MAP_SHARED):
+/// a wait there cannot be woken from another process, so it polls
+/// (`posix_sync::set_shared`).
+pub(crate) fn is_shared(address: usize) -> bool {
+    heap(|state| {
+        state
+            .map
+            .find(address)
+            .is_some_and(|index| state.map.object(state.map.piece(index).object()).shared)
+    })
+}
+
+/// The ranges of a mapping of a file that lie wholly past the end of the
+/// file (no access): a reference to one is a SIGBUS (`is_past_end`).
+const PAST_END_MAX: usize = 16;
+static PAST_END: [[core::sync::atomic::AtomicUsize; 3]; PAST_END_MAX] =
+    [const { [const { core::sync::atomic::AtomicUsize::new(0) }; 3] }; PAST_END_MAX];
+
+/// Notes that `[start, end)` is past the end of the file it maps, and that
+/// `prot` was asked for it.
+pub fn mark_past_end(start: usize, end: usize, prot: i32) {
+    for range in &PAST_END {
+        if range[1]
+            .compare_exchange(0, end, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            range[2].store(prot as usize, Ordering::Release);
+            range[0].store(start, Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// Forgets the ranges that touch `[start, end)` (they are unmapped or
+/// mapped anew).
+fn forget_past_end(start: usize, end: usize) {
+    for range in &PAST_END {
+        let (low, high) = (
+            range[0].load(Ordering::Acquire),
+            range[1].load(Ordering::Acquire),
+        );
+        if high != 0 && low < end && start < high {
+            range[1].store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Whether the fault of a read or, with `write`, a write at `address` is a
+/// reference past the end of a file that the protection asked for allowed
+/// (else it is a violation of the protection, and SIGSEGV).
+pub fn is_past_end(address: usize, write: bool) -> bool {
+    PAST_END.iter().any(|range| {
+        let high = range[1].load(Ordering::Acquire);
+        let prot = range[2].load(Ordering::Acquire) as i32;
+        let wanted = if write { PROT_WRITE } else { PROT_READ };
+        high != 0
+            && range[0].load(Ordering::Acquire) <= address
+            && address < high
+            && prot & wanted != 0
     })
 }

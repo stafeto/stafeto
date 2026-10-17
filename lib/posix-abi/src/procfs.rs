@@ -230,6 +230,7 @@ fn state_letter(l: &Listing) -> char {
     match l.state {
         1 => 'T',
         2 => 'Z',
+        3 => 'S',
         _ => 'R',
     }
 }
@@ -239,6 +240,7 @@ fn state_text(l: &Listing) -> &'static str {
     match l.state {
         1 => "T (stopped)",
         2 => "Z (zombie)",
+        3 => "S (sleeping)",
         _ => "R (running)",
     }
 }
