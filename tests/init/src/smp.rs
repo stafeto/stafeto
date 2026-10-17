@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 6] = [
+pub(crate) const TESTS: [Test; 7] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -32,6 +32,10 @@ pub(crate) const TESTS: [Test; 6] = [
     (
         "smp_signal_reaches_a_thread_at_el0_on_another_cpu",
         signal_across_cpus,
+    ),
+    (
+        "smp_log_of_another_cpu_is_read_without_changing_it",
+        log_across_cpus,
     ),
 ];
 
@@ -457,5 +461,73 @@ fn signal_across_cpus() -> Outcome {
         latency[SIGNALS - 1],
         time::frequency()
     );
+    Ok(())
+}
+
+/// The text a thread on CPU 2 writes to the log.
+const MARKER: &[u8] = b"smp log marker of a thread on CPU 2\n";
+
+extern "C" fn write_marker(_: u64) -> ! {
+    let _ = sys::debug_write(&resource(), MARKER);
+    MARKS[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The ring of a CPU is its own (SMP stage 3, decision of review 3): a
+/// thread on CPU 2 writes a line, which lands in the ring of CPU 2, and CPU 0
+/// reads that ring with `log_peek_other`, as the driver of the UART does,
+/// finds the line there and in no other ring, and finds it again at the same
+/// cursor: the read changed nothing.
+fn log_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 3 {
+        return Ok(());
+    }
+    reset_marks();
+    let t = spawn_on(0, 2, write_marker, 0, TEST_PRIORITY)?;
+    let wrote = wait_for(|| mark(0) == 1);
+    let_run()?;
+    close(t)?;
+    check(wrote, "the thread on CPU 2 did not write")?;
+    let mut records: [[u8; abi::LOG_RECORD]; abi::LOG_BATCH] =
+        [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
+    let mut found = [0u32; 8];
+    for pass in 0..2 {
+        for k in 1..n {
+            let (mut next, mut seen) = (1, 0);
+            loop {
+                let Ok((batch, after)) =
+                    sys::log_peek_other(&resource(), k as u64, next, &mut records)
+                else {
+                    return Err("log_peek_other failed for a CPU that is up");
+                };
+                seen += batch.count;
+                for r in &records[..(batch.count as usize).min(abi::LOG_BATCH)] {
+                    let len = usize::from(r[abi::LOG_LEN_AT]);
+                    let text = &r[abi::LOG_TEXT_AT..abi::LOG_TEXT_AT + len.min(abi::LOG_TEXT)];
+                    if text == MARKER {
+                        found[k] += 1;
+                    }
+                }
+                if batch.left == 0 {
+                    break;
+                }
+                next = after;
+            }
+            let _ = (pass, seen);
+        }
+    }
+    // The kth other CPU of CPU 0 is CPU k: the line is in ring 2, twice (two
+    // passes), and in no other.
+    check(
+        found[2] == 2 && found[1] == 0 && found[3] == 0,
+        "the line of CPU 2 was not in its ring alone, twice",
+    )?;
+    let past = sys::log_peek_other(&resource(), n as u64, 1, &mut records);
+    check(
+        past == Err(Error::InvalidArgs),
+        "a peek at a CPU that does not exist was not refused",
+    )?;
+    println!("smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice");
     Ok(())
 }

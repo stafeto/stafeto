@@ -85,6 +85,23 @@ pub fn peek(t: NonNull<Thread>, first: u64) -> (LogBatch, u64) {
     })
 }
 
+/// Non-destructive read of the ring of another CPU, the `k`th other than
+/// this one in the order of their numbers (1 for the first), from `first`;
+/// the owner's cursor stays, and nothing in the ring changes
+/// (`Ring::peek_shared`). None for a `k` past the CPUs that are up.
+pub fn peek_other(t: NonNull<Thread>, k: usize, first: u64) -> Option<(LogBatch, u64)> {
+    let me = crate::arch::cpu::this().index();
+    let cpu = (0..crate::smp::cpus()).filter(|&c| c != me).nth(k - 1)?;
+    let ring = crate::arch::cpu::block(cpu).local.ring.as_ptr();
+    // SAFETY: the rings of the CPUs that are up live for good, and only
+    // their owners write them.
+    Some(unsafe {
+        Ring::peek_shared(ring, first, |i, r| {
+            thread::write_words(t, i * LOG_RECORD, &r.words())
+        })
+    })
+}
+
 #[cfg(feature = "trace")]
 fn event(kind: u8, args: fmt::Arguments<'_>) {
     let mut chunks =

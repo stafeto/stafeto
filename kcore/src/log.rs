@@ -12,6 +12,7 @@
 
 use abi::{LOG_BATCH, LOG_KIND_AT, LOG_LEN_AT, LOG_RECORD, LOG_TEXT, LOG_TEXT_AT, LogBatch};
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 /// A record of the ring: LOG_RECORD bytes, as abi::LOG_RECORD lays them
 /// out but for byte 10, which holds `shown` here (spec 16.3).
@@ -83,6 +84,11 @@ pub struct Ring<const N: usize> {
     /// Records nobody showed or took that were written over since the
     /// last read.
     lost: u64,
+    /// Odd while the owner writes a record, and one more for each record
+    /// written (a seqlock): another CPU's read of the ring
+    /// (`peek_shared`) takes a record only when the number is even and the
+    /// same before and after its copy.
+    seq: AtomicU64,
 }
 
 impl<const N: usize> Ring<N> {
@@ -93,6 +99,7 @@ impl<const N: usize> Ring<N> {
             head: 0,
             taken: 0,
             lost: 0,
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -112,6 +119,9 @@ impl<const N: usize> Ring<N> {
     /// lost when nobody showed or took it. O(1).
     pub fn push(&mut self, time: u64, kind: u8, text: &[u8], shown: bool) {
         let len = text.len().min(LOG_TEXT);
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
         let place = (self.head % N as u64) as usize;
         let record = &mut self.records[place];
         if self.head >= N as u64
@@ -128,6 +138,82 @@ impl<const N: usize> Ring<N> {
         record.text[..len].copy_from_slice(&text[..len]);
         record.text[len..].fill(0);
         self.head += 1;
+        // The number of the record goes last, with release: a reader on
+        // another CPU that sees it even sees the record whole.
+        self.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
+    /// `peek` for the ring of another CPU, which its owner writes while this
+    /// reads: nothing in the ring changes. Each record is copied between two
+    /// looks at the seqlock and kept when the owner did not write meanwhile;
+    /// one the owner wrote over is counted lost. The reader waits for the
+    /// owner's push, a few instructions, which no interrupt cuts.
+    ///
+    /// # Safety
+    /// `this` points at a ring that lives for good, written by its owner
+    /// only.
+    pub unsafe fn peek_shared(
+        this: *const Self,
+        first: u64,
+        mut put: impl FnMut(usize, &Record),
+    ) -> (LogBatch, u64) {
+        // SAFETY: the caller's promise; every read is volatile, since the
+        // owner may write the place meanwhile.
+        let (_, head) = unsafe { Self::stable(this, |r| core::ptr::read_volatile(&r.head)) };
+        let oldest = head.saturating_sub(N as u64);
+        let mut next = first.max(oldest).min(head);
+        let mut lost = oldest.saturating_sub(first);
+        let mut count = 0;
+        while next < head && count < LOG_BATCH {
+            // SAFETY: as above.
+            let (_, (copy, now)) = unsafe {
+                Self::stable(this, |r| {
+                    let place = &r.records[(next % N as u64) as usize];
+                    (
+                        core::ptr::read_volatile(place),
+                        core::ptr::read_volatile(&r.head),
+                    )
+                })
+            };
+            if now.saturating_sub(N as u64) > next {
+                // Written over meanwhile.
+                lost += 1;
+            } else {
+                put(count, &copy);
+                count += 1;
+            }
+            next += 1;
+        }
+        (
+            LogBatch {
+                count: count as u64,
+                lost,
+                left: head.saturating_sub(next),
+            },
+            next,
+        )
+    }
+
+    /// `read` between two looks at the seqlock, again until the owner was
+    /// not writing.
+    ///
+    /// # Safety
+    /// As for `peek_shared`.
+    unsafe fn stable<T>(this: *const Self, read: impl Fn(&Self) -> T) -> (u64, T) {
+        loop {
+            // SAFETY: the caller's promise.
+            let before = unsafe { (*this).seq.load(Ordering::Acquire) };
+            if before & 1 == 0 {
+                // SAFETY: as above; `read` copies with volatile reads.
+                let value = read(unsafe { &*this });
+                fence(Ordering::Acquire);
+                // SAFETY: as above.
+                if unsafe { (*this).seq.load(Ordering::Relaxed) } == before {
+                    return (before, value);
+                }
+            }
+            core::hint::spin_loop();
+        }
     }
 
     /// A read (object_info LOG, spec 11): from the first record no read
@@ -448,6 +534,41 @@ mod tests {
         let (again, _) = ring.peek(0, |_, _| {});
         assert_eq!(again.lost, 4);
         assert_eq!(ring.take(|_, _| {}).count, 8);
+    }
+
+    #[test]
+    fn a_shared_peek_reads_what_peek_reads_and_changes_nothing() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=12 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let (mut own, mut shared) = (Vec::new(), Vec::new());
+        let (batch, next) = ring.peek(0, |_, r| own.push(number_of(r)));
+        // SAFETY: the ring lives here and nothing writes it meanwhile.
+        let (other, after) = unsafe {
+            Ring::peek_shared(&ring as *const Ring<8>, 0, |_, r| shared.push(number_of(r)))
+        };
+        assert_eq!((own, batch, next), (shared, other, after));
+        assert_eq!(
+            ring.take(|_, _| {}).count,
+            8,
+            "the cursor of the owner stayed"
+        );
+        // A cursor past the newest gives nothing and the newest back.
+        // SAFETY: as above.
+        let (none, end) =
+            unsafe { Ring::peek_shared(&ring as *const Ring<8>, u64::MAX, |_, _| {}) };
+        assert_eq!((none.count, none.lost, end), (0, 0, 12));
+    }
+
+    #[test]
+    fn each_record_is_pushed_between_an_odd_and_an_even_number() {
+        let mut ring = Ring::<8>::new();
+        assert_eq!(ring.seq.load(Ordering::Relaxed), 0);
+        ring.push(1, LOG_TEXT_KIND, b"x", false);
+        assert_eq!(ring.seq.load(Ordering::Relaxed), 2);
+        ring.push(2, LOG_TEXT_KIND, b"y", false);
+        assert_eq!(ring.seq.load(Ordering::Relaxed), 4);
     }
 
     #[test]

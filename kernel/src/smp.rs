@@ -401,3 +401,48 @@ pub fn lock_probe() {
         LOCK_WAIT.load(Ordering::Relaxed)
     );
 }
+
+/// What the probe of the period retires: a node, and whether the period
+/// that its retirement started has ended.
+struct ProbeNode(UnsafeCell<crate::qsbr::Deferred>);
+
+// SAFETY: the node is retired once, by CPU 0, which frees it itself.
+unsafe impl Sync for ProbeNode {}
+
+static PROBE_NODE: ProbeNode = ProbeNode(UnsafeCell::new(crate::qsbr::Deferred::new()));
+static PROBE_DONE: AtomicU8 = AtomicU8::new(0);
+
+unsafe fn probe_reclaim(_: core::ptr::NonNull<crate::qsbr::Deferred>) {
+    PROBE_DONE.store(1, Ordering::Release);
+}
+
+/// The probe of the period of reclamation with every CPU up: CPU 0 retires
+/// an object and passes its own quiescent points until the object is freed,
+/// which needs a point of each other CPU after the retirement (qsbr). Stops
+/// the kernel when no period ends in WAIT_SECONDS.
+pub fn qsbr_probe() {
+    let cpus = cpus();
+    if cpus < 2 {
+        return;
+    }
+    let began = timer::now();
+    // SAFETY: the node is in no list and stays in place for good.
+    unsafe {
+        crate::qsbr::retire(
+            core::ptr::NonNull::new_unchecked(PROBE_NODE.0.get()),
+            probe_reclaim,
+        )
+    };
+    let limit = began + WAIT_SECONDS * timer::frequency();
+    while PROBE_DONE.load(Ordering::Acquire) == 0 {
+        if timer::now() > limit {
+            panic!("qsbr probe: no period ended with {cpus} CPUs up");
+        }
+        crate::qsbr::quiesce();
+        core::hint::spin_loop();
+    }
+    kprintln!(
+        "qsbr       {cpus} CPUs: a period ended after {} ticks",
+        timer::now() - began
+    );
+}

@@ -771,6 +771,10 @@ pub const INFO_IRQ: u64 = 8;
 /// each, into the start of the calling thread's message buffer, and
 /// returns `LogBatch::to_words` in x1-x3 (spec 11, 16.3).
 pub const INFO_LOG: u64 = 9;
+/// object_info LOG x2: the number of the other CPU whose ring a peek reads
+/// (the kth other than the caller's, 1 for the first) goes in the bits from
+/// this one up, with the cursor plus 1 below.
+pub const LOG_OTHER_SHIFT: u32 = 56;
 // Kind 10 went with PROCESS_IDENTITY: process IDs live in the process
 // service (spec 11); a retired kind fails with INVALID_ARGS.
 /// LABEL takes a labelled copy of a channel, with no right needed, and in

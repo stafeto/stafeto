@@ -520,6 +520,39 @@ pub fn log_take(
     Ok(batch)
 }
 
+/// `log_peek` on the ring of the `k`th other CPU (1 for the first, in the
+/// order of the CPUs' numbers), which its owner writes meanwhile: nothing in
+/// it changes. INVALID_ARGS for a `k` past the CPUs. A driver that shows the
+/// log takes its own CPU's ring (`log_take`) and peeks at the others'.
+pub fn log_peek_other(
+    resource: &Handle<Resource>,
+    k: u64,
+    next: u64,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<(LogBatch, u64), Error> {
+    if next == 0 || k == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    if k >= 1 << (64 - abi::LOG_OTHER_SHIFT) || next >= 1 << abi::LOG_OTHER_SHIFT {
+        return Err(Error::InvalidArgs);
+    }
+    let args = [
+        resource.raw().0,
+        abi::INFO_LOG,
+        k << abi::LOG_OTHER_SHIFT | next,
+    ];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    let batch = LogBatch::from_words([x[1], x[2], x[3]]);
+    for (i, record) in records
+        .iter_mut()
+        .enumerate()
+        .take((batch.count as usize).min(LOG_BATCH))
+    {
+        msgbuf::read(i * LOG_RECORD, record);
+    }
+    Ok((batch, x[4]))
+}
+
 /// Reads the log at `next` (sequence plus one) without advancing the
 /// console reader. The returned cursor is the next sequence plus one.
 pub fn log_peek(

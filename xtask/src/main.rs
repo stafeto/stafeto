@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 238;
+const INIT_TESTS: u32 = 239;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -7619,10 +7619,18 @@ fn smp_report(lines: &[String], cpus: usize) -> Result<(), String> {
         "obj        {cpus} CPUs, {} sections: exclusion ok, longest wait ",
         2_000 * cpus
     );
-    match lines.iter().position(|l| l.starts_with(&lock)) {
-        Some(at) if at > sgi => Ok(()),
-        Some(_) => Err("the lock probe is reported before the SGI probe".into()),
-        None => Err(format!("the boot report has no line {lock:?}")),
+    let at = match lines.iter().position(|l| l.starts_with(&lock)) {
+        Some(at) if at > sgi => at,
+        Some(_) => return Err("the lock probe is reported before the SGI probe".into()),
+        None => return Err(format!("the boot report has no line {lock:?}")),
+    };
+    // The probe of the period of reclamation: an object retired by CPU 0 is
+    // freed once every CPU passed a quiescent point.
+    let qsbr = format!("qsbr       {cpus} CPUs: a period ended after ");
+    match lines.iter().position(|l| l.starts_with(&qsbr)) {
+        Some(q) if q > at => Ok(()),
+        Some(_) => Err("the period probe is reported before the lock probe".into()),
+        None => Err(format!("the boot report has no line {qsbr:?}")),
     }
 }
 
@@ -8833,11 +8841,12 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 4] = [
+const SMP_PROBE_LINES: [&str; 5] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
     "smp: 16000 calls on 4 CPUs, each took OBJ",
+    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
 ];
 
 /// `cargo xtask smp-probe`: the test init on `-smp 4` on the four TCG
@@ -10509,6 +10518,7 @@ mod tests {
             .collect();
         good.push("sgi        4 CPUs, all 12 pairs: ping and pong ok".into());
         good.push("obj        4 CPUs, 8000 sections: exclusion ok, longest wait 312 ticks".into());
+        good.push("qsbr       4 CPUs: a period ended after 912 ticks".into());
         assert_eq!(smp_report(&good, 4), Ok(()));
         let mut cut = good.clone();
         cut.remove(2);
@@ -10525,8 +10535,11 @@ mod tests {
         let mut no_probe = good.clone();
         no_probe.remove(4);
         assert!(smp_report(&no_probe, 4).unwrap_err().contains("sgi"));
+        let mut no_period = good.clone();
+        no_period.pop();
+        assert!(smp_report(&no_period, 4).unwrap_err().contains("qsbr"));
         let mut no_lock = good.clone();
-        no_lock.pop();
+        no_lock.remove(5);
         assert!(smp_report(&no_lock, 4).unwrap_err().contains("obj"));
         let mut early = good.clone();
         early.rotate_right(1);
