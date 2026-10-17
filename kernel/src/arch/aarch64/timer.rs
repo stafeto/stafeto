@@ -45,11 +45,21 @@ pub fn clock() -> Clock {
 /// reads the counter here and nowhere else: on the PinePhone this read
 /// needs the A64 counter workaround (spec 10).
 pub fn now() -> u64 {
+    // SAFETY: the ISB only keeps the read from happening before earlier
+    // instructions.
+    unsafe { core::arch::asm!("isb", options(nomem, nostack, preserves_flags)) };
+    now_unordered()
+}
+
+/// The virtual counter with no ISB before the read: right after an entry
+/// from EL0, which synchronizes, or where a few instructions of skew
+/// matter no more than the ISB costs (the stamp of a thread leaving for EL0).
+#[inline(always)]
+pub fn now_unordered() -> u64 {
     let ticks: u64;
-    // SAFETY: reading the counter has no side effects; the ISB keeps the read
-    // from happening before earlier instructions.
+    // SAFETY: reading the counter has no side effects.
     unsafe {
-        core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags))
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags))
     };
     ticks
 }
@@ -127,4 +137,37 @@ pub fn init() -> Clock {
     // A second init keeps the clock of the first: the frequency is fixed.
     let _ = CLOCK.set(clock);
     clock
+}
+
+/// What a CPU other than the first sets up for itself: its timer off and
+/// its PPI, banked per CPU, let through its interface at the priority of
+/// the kernel's lines.
+pub fn init_cpu() {
+    disarm();
+    gic::set_priority(INTID, DEFAULT_PRIORITY);
+    gic::unmask(INTID);
+}
+
+/// Arms this CPU's timer `ticks` from now, waits for its interrupt to
+/// reach the CPU interface, acknowledges and ends it, and tells whether it
+/// came with the counter at the deadline or after it (spec 10) and as
+/// INTID 27. The timer is off afterwards. Polls, since PSTATE masks
+/// interrupts in the kernel.
+pub fn self_test(ticks: u64) -> bool {
+    let deadline = now() + ticks;
+    arm(deadline);
+    let mut ok = false;
+    // A hundred times the deadline's distance, then give up.
+    while now() < deadline + 100 * ticks {
+        if fired() && super::irq_pending() {
+            if let Some(ack) = gic::acknowledge() {
+                ok = now() >= deadline && cval() == deadline && ack.intid() == INTID;
+                disarm();
+                gic::end(ack);
+            }
+            break;
+        }
+    }
+    disarm();
+    ok
 }

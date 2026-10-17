@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 231;
+const INIT_TESTS: u32 = 232;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1453,11 +1453,15 @@ fn main() {
             let icount = args.get(2).is_some_and(|a| a == "icount");
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
+        Some("smp-boot") => smp_boots(),
+        Some("smp-hvf") => smp_hvf(),
+        Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
         Some("wcet") => wcet::run(&args[1..]),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
+        Some("smp-vz") => vz::smp_boot(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
@@ -7263,6 +7267,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE).map(drop)
         }),
         job("boot 2G", two_gib_boot),
+        job("smp 4 GICv2", || smp_boot(&qemu::VIRT, GIC_V2_LINE)),
+        job("smp 4 GICv3", || smp_boot(&qemu::VIRT_V3, GIC_V3_LINE)),
+        job("smp 4 EL2 GICv2", || smp_boot(&qemu::VIRT_EL2, GIC_V2_LINE)),
+        job("smp 4 EL2 GICv3", || {
+            smp_boot(&qemu::VIRT_EL2_V3, GIC_V3_LINE)
+        }),
         job("console dialog 512M", || console_dialog(&qemu::VIRT)),
         job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
         job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
@@ -7441,6 +7451,120 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let hz = boot_report(&o.lines, m, size, gic)?;
     measure::record(m, &o.lines);
     Ok(hz)
+}
+
+/// `cargo xtask probe NAME...`: the boots of `ci` with these names, as
+/// `cargo xtask ci --list-groups` lists them with `--names`, and nothing
+/// else; what a change to one probe needs, built first.
+fn probes(names: &[String]) -> Result<(), String> {
+    let list: Vec<jobs::Job> = boot_jobs(Vec::new())
+        .into_iter()
+        .filter(|j| names.iter().any(|n| n == j.name()))
+        .collect();
+    if list.len() != names.len() || names.is_empty() {
+        return Err(format!(
+            "usage: cargo xtask probe NAME...; names of boots: {:?}",
+            boot_jobs(Vec::new())
+                .iter()
+                .map(|j| j.name().to_owned())
+                .collect::<Vec<_>>()
+        ));
+    }
+    relibc()?;
+    busybox_build()?;
+    jobs::run_all(list, 1)
+}
+
+/// `cargo xtask smp-boot`: the order check of the start and the SGIs in the
+/// built kernel, then the SMP boots of `ci` on the four TCG machines.
+fn smp_boots() -> Result<(), String> {
+    disasm::smp_order(&build(Variant::Normal)?.elf, &llvm_tool("llvm-objdump")?)?;
+    for (m, gic) in [
+        (&qemu::VIRT, GIC_V2_LINE),
+        (&qemu::VIRT_V3, GIC_V3_LINE),
+        (&qemu::VIRT_EL2, GIC_V2_LINE),
+        (&qemu::VIRT_EL2_V3, GIC_V3_LINE),
+    ] {
+        smp_boot(m, gic)?;
+        println!("smp boot on {}: ok", m.name);
+    }
+    Ok(())
+}
+
+/// `cargo xtask smp-hvf`: the SMP boot on the two HVF machines.
+fn smp_hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!(
+            "smp-hvf: skipped: needs macOS on Apple Silicon with the Hypervisor framework ({why})"
+        );
+        return Ok(());
+    }
+    for (m, gic) in [(&qemu::HVF_V3, GIC_V3_LINE), (&qemu::HVF_V2, GIC_V2_LINE)] {
+        smp_boot(m, gic)?;
+        println!("smp boot on {}: ok", m.name);
+    }
+    Ok(())
+}
+
+/// The CPUs of the SMP boots (`smp_boot`).
+const SMP_CPUS: usize = 4;
+
+/// The boot on machine `m` with `-smp 4` (SMP stage 2): the kernel starts
+/// every CPU through PSCI, each CPU reports its MPIDR, the exception
+/// level it runs at and that its own timer fired at its deadline, the
+/// probe of the SGIs finds every ping of each pair answered, and then
+/// the system comes up on CPU 0 as before.
+fn smp_boot(m: &qemu::Machine, gic: &str) -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
+    let size = std::fs::metadata(&a.boot_image)
+        .map_err(|e| format!("{}: {e}", a.boot_image.display()))?
+        .len();
+    boot_report(&o.lines, m, size, gic)?;
+    smp_report(&o.lines, SMP_CPUS)
+}
+
+/// The lines of a boot with `cpus` CPUs about them: `cpu N      MPIDR
+/// 0x.. EL1 timer ok` for each, the number N the CPU's Aff0, and the
+/// line of the SGI probe after them.
+fn smp_report(lines: &[String], cpus: usize) -> Result<(), String> {
+    let mut last = 0;
+    for n in 0..cpus {
+        let prefix = format!("cpu {n}      MPIDR ");
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with(&prefix))
+            .ok_or_else(|| format!("the boot report has no line of CPU {n}"))?;
+        let rest = lines[at][prefix.len()..]
+            .strip_suffix(" EL1 timer ok")
+            .ok_or_else(|| {
+                format!(
+                    "CPU {n} does not report EL1 and a timer that fired: {:?}",
+                    lines[at]
+                )
+            })?;
+        let mpidr = rest
+            .strip_prefix("0x")
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .ok_or_else(|| format!("CPU {n}: no MPIDR in {:?}", lines[at]))?;
+        if mpidr & 0xff != n as u64 {
+            return Err(format!("CPU {n} reports the MPIDR {mpidr:#x}"));
+        }
+        last = last.max(at);
+    }
+    let probe = format!(
+        "sgi        {cpus} CPUs, all {} pairs: ping and pong ok",
+        cpus * (cpus - 1)
+    );
+    match lines.iter().position(|l| *l == probe) {
+        Some(at) if at > last => Ok(()),
+        Some(_) => Err("the SGI probe is reported before the CPUs".into()),
+        None => Err(format!("the boot report has no line {probe:?}")),
+    }
 }
 
 /// Whether `l` is the kernel's first line, `stafeto <version> booting`,
@@ -8777,6 +8901,9 @@ fn hvf() -> Result<(), String> {
         if hz != HVF_HZ {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
+        // Four CPUs on the real processor: the start through PSCI, the
+        // block read without caches, the SGIs of every pair.
+        smp_boot(m, gic)?;
         console_dialog(m)?;
         trace_dialog(m)?;
         // relibc's pthreads and the POSIX processes, the loader of files
@@ -10115,6 +10242,35 @@ mod tests {
         let mut twice = report.to_vec();
         twice.push("stafeto 0.2.0 booting".into());
         assert!(check(&twice, &qemu::VIRT, GIC_V2_LINE).is_err());
+    }
+
+    /// The SMP boot wants every CPU's line, with EL1 and a timer that
+    /// fired, its Aff0 as its number, and the SGI probe after them.
+    #[test]
+    fn smp_report_needs_every_cpu_and_the_probe() {
+        let mut good: Vec<String> = (0..4)
+            .map(|n| format!("cpu {n}      MPIDR {:#x} EL1 timer ok", 0x8000_0000u64 + n))
+            .collect();
+        good.push("sgi        4 CPUs, all 12 pairs: ping and pong ok".into());
+        assert_eq!(smp_report(&good, 4), Ok(()));
+        let mut cut = good.clone();
+        cut.remove(2);
+        assert!(smp_report(&cut, 4).unwrap_err().contains("CPU 2"));
+        let mut el2 = good.clone();
+        el2[1] = "cpu 1      MPIDR 0x80000001 EL2 timer ok".into();
+        assert!(smp_report(&el2, 4).unwrap_err().contains("EL1"));
+        let mut late = good.clone();
+        late[3] = "cpu 3      MPIDR 0x80000003 EL1 timer late".into();
+        assert!(smp_report(&late, 4).is_err());
+        let mut wrong = good.clone();
+        wrong[2] = "cpu 2      MPIDR 0x80000003 EL1 timer ok".into();
+        assert!(smp_report(&wrong, 4).unwrap_err().contains("0x80000003"));
+        let mut no_probe = good.clone();
+        no_probe.pop();
+        assert!(smp_report(&no_probe, 4).unwrap_err().contains("sgi"));
+        let mut early = good.clone();
+        early.rotate_right(1);
+        assert!(smp_report(&early, 4).unwrap_err().contains("before"));
     }
 
     /// `cargo xtask run` boots VIRT; with `--hvf` it boots HVF_V3 only

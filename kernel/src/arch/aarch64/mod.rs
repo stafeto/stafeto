@@ -3,6 +3,7 @@
 
 pub mod backtrace;
 pub mod cache;
+pub mod cpu;
 pub mod exceptions;
 pub mod gic;
 pub mod mmio;
@@ -41,8 +42,8 @@ pub fn on_empty_stack(f: extern "C" fn() -> !) -> ! {
     // and the caller's frames hold nothing that needs dropping.
     unsafe {
         core::arch::asm!(
-            "adrp x1, boot_stack_top",
-            "add x1, x1, :lo12:boot_stack_top",
+            "mrs x1, tpidr_el1",
+            "ldr x1, [x1, #16]", // CpuBlock::stack_top
             "mov sp, x1",
             "mov x29, xzr",
             "mov x30, xzr",

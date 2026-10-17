@@ -15,8 +15,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/times.h>
 #include <unistd.h>
+#include <sched.h>
 #include <time.h>
 
 extern char **environ;
@@ -844,6 +847,107 @@ static int credentials(void) {
     return 0;
 }
 
+/* The part of the CPU time of the process spent in the kernel, which the
+ * layer gives apart from the whole (the system time of getrusage and times):
+ * a loop with no call grows the user time, a loop of calls the system time. */
+extern long stafeto_cpu_system_ns(int who);
+
+static long long monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+static int cpu_split(void) {
+    struct timespec total;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+    long long whole0 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+    long long system0 = stafeto_cpu_system_ns(0);
+    long long thread0 = stafeto_cpu_system_ns(1);
+    if (system0 < 0 || system0 > whole0 || thread0 < 0) return 296;
+    /* 20 ms at EL0: the counter is read at EL0, so no call enters the kernel. */
+    long long began = monotonic_ns();
+    while (monotonic_ns() - began < 20000000LL) {}
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+    long long whole1 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+    long long system1 = stafeto_cpu_system_ns(0);
+    long long spin_user = (whole1 - system1) - (whole0 - system0);
+    long long spin_system = system1 - system0;
+    if (system1 < 0 || spin_user < 10000000LL || spin_system > spin_user / 8) return 297;
+    /* 20 ms of calls into the kernel. */
+    began = monotonic_ns();
+    while (monotonic_ns() - began < 20000000LL) sched_yield();
+    long long system2 = stafeto_cpu_system_ns(0);
+    long long thread2 = stafeto_cpu_system_ns(1);
+    long long call_system = system2 - system1;
+    /* The entry and the return of a call count as the program's time, and
+     * on a slow host most of a call is that: the loop of calls shows only
+     * that the system time grows with the calls. */
+    if (system2 < 0 || call_system < 1000000LL || call_system < 20 * spin_system) return 298;
+    if (thread2 < thread0 + call_system / 2 || thread2 > system2) return 299;
+    /* Children that were waited for: none yet, and the call is whole. */
+    long long children = stafeto_cpu_system_ns(-1);
+    if (children < 0 || stafeto_cpu_system_ns(7) != -EINVAL) return 300;
+    return 0;
+}
+
+/* getrusage (self, thread, children) and times read the same split: a loop
+ * with no call grows ru_utime and tms_utime, a loop of calls grows ru_stime
+ * and tms_stime. */
+static long long microseconds(struct timeval t) {
+    return (long long)t.tv_sec * 1000000LL + t.tv_usec;
+}
+
+static void spin_user(long long nanoseconds) {
+    long long began = monotonic_ns();
+    while (monotonic_ns() - began < nanoseconds) {}
+}
+
+static void spin_calls(long long nanoseconds) {
+    long long began = monotonic_ns();
+    while (monotonic_ns() - began < nanoseconds) sched_yield();
+}
+
+static int usage_split(void) {
+    struct rusage self0, self1, self2, thread0, thread1, thread2, children;
+    if (getrusage(RUSAGE_SELF, &self0) || getrusage(RUSAGE_THREAD, &thread0)) return 301;
+    spin_user(20000000LL);
+    if (getrusage(RUSAGE_SELF, &self1) || getrusage(RUSAGE_THREAD, &thread1)) return 301;
+    long long user_self = microseconds(self1.ru_utime) - microseconds(self0.ru_utime);
+    long long user_thread = microseconds(thread1.ru_utime) - microseconds(thread0.ru_utime);
+    long long system_self = microseconds(self1.ru_stime) - microseconds(self0.ru_stime);
+    long long system_thread = microseconds(thread1.ru_stime) - microseconds(thread0.ru_stime);
+    if (user_self < 10000 || user_thread < 10000) return 302;
+    if (system_self > user_self / 8 || system_thread > user_thread / 8) return 303;
+    spin_calls(20000000LL);
+    if (getrusage(RUSAGE_SELF, &self2) || getrusage(RUSAGE_THREAD, &thread2)) return 301;
+    long long calls_self = microseconds(self2.ru_stime) - microseconds(self1.ru_stime);
+    long long calls_thread = microseconds(thread2.ru_stime) - microseconds(thread1.ru_stime);
+    if (calls_self < 1000 || calls_self < 20 * system_self) return 304;
+    if (calls_thread < 500 || calls_thread > calls_self) return 305;
+    if (getrusage(RUSAGE_CHILDREN, &children) || microseconds(children.ru_utime) < 0
+            || microseconds(children.ru_stime) < 0) return 306;
+    if (getrusage(77, &children) != -1 || errno != EINVAL) return 307;
+    /* A tick of times is 10 ms: wait for one tick of each kind. */
+    struct tms before, after;
+    if (times(&before) == (clock_t)-1) return 308;
+    long long began = monotonic_ns();
+    do {
+        spin_user(2000000LL);
+        if (times(&after) == (clock_t)-1) return 308;
+    } while (after.tms_utime == before.tms_utime && monotonic_ns() - began < 1000000000LL);
+    if (after.tms_utime <= before.tms_utime) return 309;
+    before = after;
+    began = monotonic_ns();
+    do {
+        spin_calls(2000000LL);
+        if (times(&after) == (clock_t)-1) return 308;
+    } while (after.tms_stime == before.tms_stime && monotonic_ns() - began < 1000000000LL);
+    if (after.tms_stime <= before.tms_stime) return 310;
+    if (after.tms_cutime < 0 || after.tms_cstime < 0) return 311;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -923,6 +1027,10 @@ int main(int argc, char **argv) {
     if (signal_result) return signal_result;
     int credentials_result = credentials();
     if (credentials_result) return credentials_result;
+    int split_result = cpu_split();
+    if (split_result) return split_result;
+    int usage_result = usage_split();
+    if (usage_result) return usage_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

@@ -51,7 +51,7 @@ primary_entry:
     adr     x20, _head              // kernel image PA
     mrs     x1, mpidr_el1
     and     x1, x1, #0xff
-    cbnz    x1, park                // one CPU in subproject 1
+    cbnz    x1, park                // the other CPUs start at secondary_entry, through PSCI
 
     mrs     x1, CurrentEL
     ubfx    x1, x1, #2, #2
@@ -59,63 +59,8 @@ primary_entry:
     b.ne    at_el1
 
     // EL2 (U-Boot, or QEMU with virtualization=on): drop to EL1.
-    mov     x1, #(1 << 31)          // HCR_EL2.RW: EL1 runs AArch64; no traps, no stage 2
-    msr     hcr_el2, x1
-    mov     x1, #3                  // CNTHCTL_EL2: EL1 may use the physical counter and timer
-    msr     cnthctl_el2, x1
-    msr     cntvoff_el2, xzr        // virtual time equals physical time
-    mov     x1, #0x33ff             // CPTR_EL2: RES1 bits, FP/SIMD not trapped
-    msr     cptr_el2, x1
-    msr     hstr_el2, xzr
-    msr     vttbr_el2, xzr
-    // MDCR_EL2, whose fields may hold anything after a warm reset: no debug
-    // or PMU traps to EL2 (TDE, TDA, TDOSA, TDRA, TPM, TPMCR clear), so the
-    // kernel's writes to MDSCR_EL1 and PMUSERENR_EL0 stay at EL1; there are
-    // no EL2 vectors to take them. HPMN leaves EL1 all PMCR_EL0.N event
-    // counters (HPMN = 0 is CONSTRAINED UNPREDICTABLE on v8.0). Without a
-    // PMU, or with an IMPLEMENTATION DEFINED one (PMUVer 0 or 0xF, the rule
-    // of kcore::sysreg::has_pmu), PMCR_EL0 is not read and HPMN is 0, as in
-    // Linux's EL2 setup. The profiling and trace buffers (v8.2 and later)
-    // stay with EL2: the kernel uses neither.
-    mov     x2, xzr
-    mrs     x1, id_aa64dfr0_el1
-    ubfx    x1, x1, #8, #4          // ID_AA64DFR0_EL1.PMUVer
-    cbz     x1, .Lset_mdcr
-    cmp     x1, #0xf
-    b.eq    .Lset_mdcr
-    mrs     x2, pmcr_el0
-    ubfx    x2, x2, #11, #5         // PMCR_EL0.N
-.Lset_mdcr:
-    msr     mdcr_el2, x2
-    mrs     x1, midr_el1            // EL1 reads VPIDR/VMPIDR as MIDR/MPIDR
-    msr     vpidr_el2, x1
-    mrs     x1, mpidr_el1
-    msr     vmpidr_el2, x1
-    ldr     x1, =SCTLR_MMU_OFF
-    msr     sctlr_el1, x1
-    // A GICv3 CPU interface (ID_AA64PFR0_EL1.GIC not 0) is reached through
-    // system registers only once EL2 lets EL1 do so: ICC_SRE_EL2.SRE and
-    // Enable, without which EL1's access to ICC_SRE_EL1 goes to EL2, which
-    // has no vectors [G39]. ICH_HCR_EL2 = 0 keeps the virtual CPU
-    // interface off.
-    // A GICv2 CPU has no such registers: the field is 0 and this is skipped.
-    mrs     x1, id_aa64pfr0_el1
-    ubfx    x1, x1, #24, #4         // ID_AA64PFR0_EL1.GIC
-    cbz     x1, .Lgic_done
-    mrs     x1, icc_sre_el2
-    orr     x1, x1, #(1 << 0)       // SRE
-    orr     x1, x1, #(1 << 3)       // Enable: EL1 may reach ICC_SRE_EL1
-    msr     icc_sre_el2, x1
-    isb
-    mrs     x1, icc_sre_el2
-    tbz     x1, #0, .Lgic_done      // SRE did not stick: no GICv3 CPU interface
-    msr     ich_hcr_el2, xzr
-.Lgic_done:
-    mov     x1, #0x3c5              // SPSR_EL2: EL1h with D, A, I, F masked
-    msr     spsr_el2, x1
     adr     x1, at_el1
-    msr     elr_el2, x1
-    eret
+    b       el2_drop
 
 at_el1:
     msr     spsel, #1
@@ -254,6 +199,122 @@ upper_half:
     mov     x1, x20
     mov     x29, xzr                // the frame-record chain ends here
     bl      kernel_main
+
+// The drop from EL2 to EL1, for every CPU: x1 is where EL1 goes on (EL1h,
+// DAIF masked, MMU off). Uses x1 to x3. Each CPU sets its own
+// VPIDR_EL2 and VMPIDR_EL2, which its EL1 reads as MIDR and MPIDR.
+el2_drop:
+    mov     x3, x1
+    mov     x1, #(1 << 31)          // HCR_EL2.RW: EL1 runs AArch64; no traps, no stage 2
+    msr     hcr_el2, x1
+    mov     x1, #3                  // CNTHCTL_EL2: EL1 may use the physical counter and timer
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr        // virtual time equals physical time
+    mov     x1, #0x33ff             // CPTR_EL2: RES1 bits, FP/SIMD not trapped
+    msr     cptr_el2, x1
+    msr     hstr_el2, xzr
+    msr     vttbr_el2, xzr
+    // MDCR_EL2, whose fields may hold anything after a warm reset: no debug
+    // or PMU traps to EL2 (TDE, TDA, TDOSA, TDRA, TPM, TPMCR clear), so the
+    // kernel's writes to MDSCR_EL1 and PMUSERENR_EL0 stay at EL1; there are
+    // no EL2 vectors to take them. HPMN leaves EL1 all PMCR_EL0.N event
+    // counters (HPMN = 0 is CONSTRAINED UNPREDICTABLE on v8.0). Without a
+    // PMU, or with an IMPLEMENTATION DEFINED one (PMUVer 0 or 0xF, the rule
+    // of kcore::sysreg::has_pmu), PMCR_EL0 is not read and HPMN is 0, as in
+    // Linux's EL2 setup. The profiling and trace buffers (v8.2 and later)
+    // stay with EL2: the kernel uses neither.
+    mov     x2, xzr
+    mrs     x1, id_aa64dfr0_el1
+    ubfx    x1, x1, #8, #4          // ID_AA64DFR0_EL1.PMUVer
+    cbz     x1, .Lset_mdcr
+    cmp     x1, #0xf
+    b.eq    .Lset_mdcr
+    mrs     x2, pmcr_el0
+    ubfx    x2, x2, #11, #5         // PMCR_EL0.N
+.Lset_mdcr:
+    msr     mdcr_el2, x2
+    mrs     x1, midr_el1            // EL1 reads VPIDR/VMPIDR as MIDR/MPIDR
+    msr     vpidr_el2, x1
+    mrs     x1, mpidr_el1
+    msr     vmpidr_el2, x1
+    ldr     x1, =SCTLR_MMU_OFF
+    msr     sctlr_el1, x1
+    // A GICv3 CPU interface (ID_AA64PFR0_EL1.GIC not 0) is reached through
+    // system registers only once EL2 lets EL1 do so: ICC_SRE_EL2.SRE and
+    // Enable, without which EL1's access to ICC_SRE_EL1 goes to EL2, which
+    // has no vectors [G39]. ICH_HCR_EL2 = 0 keeps the virtual CPU
+    // interface off.
+    // A GICv2 CPU has no such registers: the field is 0 and this is skipped.
+    mrs     x1, id_aa64pfr0_el1
+    ubfx    x1, x1, #24, #4         // ID_AA64PFR0_EL1.GIC
+    cbz     x1, .Lgic_done
+    mrs     x1, icc_sre_el2
+    orr     x1, x1, #(1 << 0)       // SRE
+    orr     x1, x1, #(1 << 3)       // Enable: EL1 may reach ICC_SRE_EL1
+    msr     icc_sre_el2, x1
+    isb
+    mrs     x1, icc_sre_el2
+    tbz     x1, #0, .Lgic_done      // SRE did not stick: no GICv3 CPU interface
+    msr     ich_hcr_el2, xzr
+.Lgic_done:
+    mov     x1, #0x3c5              // SPSR_EL2: EL1h with D, A, I, F masked
+    msr     spsr_el2, x1
+    msr     elr_el2, x3
+    eret
+
+
+// A CPU that PSCI CPU_ON started: the MMU and the caches are off, x0 is the
+// physical address of this CPU's start block (smp::StartBlock), at EL2 or
+// EL1 as the firmware pleases. The block was cleaned to memory before
+// CPU_ON, and this CPU has no cache of its own to read it from yet
+// [G18]. Block: +0 MAIR_EL1, +8 TCR_EL1, +16 TTBR0 for the switch (the
+// identity map), +24 TTBR1, +32 TTBR0 for the kernel (the empty table),
+// +40 the kernel stack top, +48 the CPU's block (both virtual).
+.global secondary_entry
+secondary_entry:
+    msr     daifset, #0xf
+    mov     x19, x0
+    mrs     x1, CurrentEL
+    ubfx    x1, x1, #2, #2
+    cmp     x1, #2
+    b.ne    1f
+    adr     x1, 1f
+    b       el2_drop
+1:  msr     spsel, #1
+    ldr     x1, =SCTLR_MMU_OFF
+    msr     sctlr_el1, x1
+    isb
+    ldp     x1, x2, [x19]           // MAIR_EL1, TCR_EL1: those of the CPU that built the tables
+    msr     mair_el1, x1
+    msr     tcr_el1, x2
+    ldp     x1, x2, [x19, #16]
+    msr     ttbr0_el1, x1
+    msr     ttbr1_el1, x2
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ldp     x20, x21, [x19, #32]    // read before the identity map goes
+    ldp     x22, x23, [x19, #48]
+    ldr     x1, =secondary_upper    // link-time (virtual) address
+    ldr     x0, =SCTLR_MMU_ON
+    msr     sctlr_el1, x0
+    isb
+    ic      iallu
+    dsb     nsh
+    isb
+    br      x1
+
+secondary_upper:
+    msr     ttbr0_el1, x20          // drop the identity map
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    mov     sp, x21
+    mov     x29, xzr
+    mov     x0, x22
+    bl      secondary_main
 
 park:
     wfe

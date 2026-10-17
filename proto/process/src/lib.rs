@@ -515,7 +515,8 @@ pub enum Method {
 /// The operations of `Method::Account`, the first u32 of its body.
 pub mod account_op {
     /// -> the counter ticks the caller's children that were waited for ran,
-    /// and theirs, u64 (getrusage RUSAGE_CHILDREN, times).
+    /// and theirs, u64, then the part of them spent in the kernel, u64
+    /// (getrusage RUSAGE_CHILDREN, times).
     pub const CHILD_TIMES: u32 = 1;
     /// which u32, who u32 (getpriority) -> the least nice value among the
     /// processes selected, i32. ESRCH (`NO_PROCESS`) with none.

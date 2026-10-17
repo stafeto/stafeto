@@ -8,9 +8,12 @@
 //! its process (object_info THREAD_STATE x5 and PROCESS_TIME), idle time and
 //! cleanup not included. The process service adds the time of each child
 //! that is waited for to its parent's account (Method::Account), and keeps
-//! the nice value of each process, which its children inherit. All of a
-//! process's time counts as user time: the kernel does not tell the time of
-//! a thread in a system call from the rest.
+//! the nice value of each process, which its children inherit. The kernel
+//! tells the part of the time spent in it, from each entry from EL0 to the
+//! decision that sends a thread back (THREAD_STATE x6, PROCESS_TIME x2):
+//! that is the system time (`process_split_ns`, `thread_split_ns`,
+//! `children_split_ns` give user and system time) and the rest is the user
+//! time. CPU-time clocks and `clock` count both.
 
 use crate::constants::*;
 use proto_process::{Method, account_op};
@@ -72,10 +75,40 @@ pub fn thread_ns_of(id: u64) -> Result<u64, i32> {
     })?
 }
 
+/// The user and the system time of the calling process, ns.
+pub fn process_split_ns() -> Result<(u64, u64), i32> {
+    sys::process_times(crate::allocation::process())
+        .map(split)
+        .map_err(|_| EIO)
+}
+
+/// The user and the system time of the calling thread, ns.
+pub fn thread_split_ns() -> Result<(u64, u64), i32> {
+    let block = crate::threads::own_block();
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(
+        block.thread.load(core::sync::atomic::Ordering::Relaxed),
+    ));
+    sys::thread_times(&thread).map(split).map_err(|_| EIO)
+}
+
+/// The user and the system time of the children that were waited for,
+/// theirs included, ns.
+pub fn children_split_ns() -> Result<(u64, u64), i32> {
+    let w = crate::process::request(Method::Account, &[account_op::CHILD_TIMES])?;
+    crate::process::ask_pair(&w).map(|[ticks, kernel]| split((ticks, kernel)))
+}
+
+/// User and system time in nanoseconds from the whole in ticks and the
+/// part of it spent in the kernel.
+fn split((ticks, kernel): (u64, u64)) -> (u64, u64) {
+    let kernel = kernel.min(ticks);
+    (ns(ticks - kernel), ns(kernel))
+}
+
 /// The time the children that were waited for ran, theirs included, ns.
 pub fn children_ns() -> Result<u64, i32> {
     let w = crate::process::request(Method::Account, &[account_op::CHILD_TIMES])?;
-    crate::process::ask_value(&w).map(ns)
+    crate::process::ask_pair(&w).map(|[ticks, _]| ns(ticks))
 }
 
 /// getpriority: the nice value of the process(es) `which` and `who` name.

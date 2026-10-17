@@ -1390,6 +1390,23 @@ pub extern "C" fn stafeto_cpu_ns(who: c_int) -> i64 {
     )
 }
 
+/// The part of the time `stafeto_cpu_ns` gives for `who` that was spent in
+/// the kernel (the system time of getrusage and times), in nanoseconds, or a
+/// negated errno; the rest is the user time.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_cpu_system_ns(who: c_int) -> i64 {
+    let split = match who {
+        0 => posix_abi::cpu::process_split_ns(),
+        -1 => call(posix_abi::cpu::children_split_ns),
+        1 => posix_abi::cpu::thread_split_ns(),
+        _ => Err(EINVAL),
+    };
+    split.map_or_else(
+        |errno| -i64::from(errno),
+        |(_, system)| system.min(i64::MAX as u64) as i64,
+    )
+}
+
 /// pthread_getcpuclockid: the id of the CPU-time clock of thread `tid`.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_thread_cpu_clock(tid: c_int) -> c_int {

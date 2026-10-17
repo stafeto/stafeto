@@ -116,8 +116,18 @@ pub fn user_pstate() -> u64 {
 /// SCTLR_EL1 bits for programs; keeps the debug channel and the
 /// performance monitors closed, whose registers are UNKNOWN after reset.
 /// Runs once the kernel tables are live: WXN would take execution away from
-/// head.S's writable image blocks. No thread runs yet (TPIDR_EL1 = 0).
+/// head.S's writable image blocks. No thread runs yet.
 pub fn init() {
+    init_registers();
+    USER_PSTATE.store(
+        kcore::upcall::user_pstate(registers::id_aa64pfr0_el1(), registers::id_aa64pfr1_el1()),
+        Ordering::Relaxed,
+    );
+}
+
+/// The system registers of this CPU that `init` describes: every CPU sets
+/// them for itself. The TLB entries of the CPU may hold the old WXN.
+pub fn init_registers() {
     // SAFETY: the kernel tables map nothing writable and executable at
     // once, so WXN takes nothing the kernel executes; the ISB makes the
     // writes take effect.
@@ -126,7 +136,6 @@ pub fn init() {
             "msr cpacr_el1, {cpacr}",
             "msr cntkctl_el1, {cntkctl}",
             "msr mdscr_el1, {mdscr}",
-            "msr tpidr_el1, xzr",
             "msr sctlr_el1, {sctlr}",
             "isb",
             cpacr = in(reg) CPACR_EL1,
@@ -146,32 +155,18 @@ pub fn init() {
             )
         };
     }
-    USER_PSTATE.store(
-        kcore::upcall::user_pstate(registers::id_aa64pfr0_el1(), registers::id_aa64pfr1_el1()),
-        Ordering::Relaxed,
-    );
-    // TLB entries may hold the old WXN.
     mmu::flush_tlb();
 }
 
-/// The register area of the running thread (TPIDR_EL1); null when none runs.
+/// The register area of the running thread, the first field of this CPU's
+/// block (arch::cpu); null when none runs.
 pub fn current() -> *mut UserRegs {
-    let regs: usize;
-    // SAFETY: reading TPIDR_EL1 has no side effects.
-    unsafe { asm!("mrs {}, tpidr_el1", out(reg) regs, options(nomem, nostack, preserves_flags)) };
-    regs as *mut UserRegs
+    super::cpu::current()
 }
 
 /// Makes no thread the running one.
 pub fn clear_current() {
-    // SAFETY: TPIDR_EL1 is read only by `current` and by entry from EL0,
-    // which cannot happen while the kernel runs.
-    unsafe {
-        asm!(
-            "msr tpidr_el1, xzr",
-            options(nomem, nostack, preserves_flags)
-        )
-    };
+    super::cpu::clear_current();
 }
 
 /// Returns to EL0 with `regs`, which become the running thread's

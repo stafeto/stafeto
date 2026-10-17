@@ -3,7 +3,7 @@
 
 //! What the kernel needs from the device tree at boot: RAM, reserved ranges,
 //! the boot image (initrd), the early console, the interrupt controller and
-//! the PSCI conduit.
+//! the PSCI conduit, the CPUs.
 
 use crate::fdt::{Event, Fdt, FdtError, MAX_DEPTH, be32, be64};
 use crate::gic::REDISTRIBUTOR_WINDOW;
@@ -126,6 +126,47 @@ impl Gic {
     }
 }
 
+/// The CPUs the kernel starts at most (`CpuList`).
+pub const MAX_CPUS: usize = 8;
+
+/// The affinity fields of an MPIDR_EL1 value: Aff3 to Aff0, the bits a
+/// `/cpus` node's `reg` holds.
+pub const MPIDR_AFFINITY: u64 = 0xFF_00FF_FFFF;
+
+/// The MPIDR of each enabled `/cpus/cpu@N` node, in the tree's order, at
+/// most MAX_CPUS; further nodes are left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuList {
+    mpidr: [u64; MAX_CPUS],
+    len: usize,
+}
+
+impl CpuList {
+    pub const fn new() -> Self {
+        Self {
+            mpidr: [0; MAX_CPUS],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, mpidr: u64) {
+        if self.len < MAX_CPUS && !self.as_slice().contains(&mpidr) {
+            self.mpidr[self.len] = mpidr;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u64] {
+        &self.mpidr[..self.len]
+    }
+}
+
+impl Default for CpuList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootInfo {
     pub memory: RegionList<MEMORY_REGIONS>,
@@ -137,6 +178,7 @@ pub struct BootInfo {
     /// The first enabled node of an interrupt controller the kernel knows.
     pub gic: Option<Gic>,
     pub psci: PsciConduit,
+    pub cpus: CpuList,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -315,6 +357,13 @@ fn classify(
     if !node.enabled() {
         return Ok(());
     }
+    if depth == 3
+        && parent == "cpus"
+        && node.device_type == b"cpu\0"
+        && let Some(r) = RegIter::new(node.reg, cells)?.next().transpose()?
+    {
+        info.cpus.push(r.base & MPIDR_AFFINITY);
+    }
     if info.uart_pl011.is_none() && node.is_compatible("arm,pl011") {
         info.uart_pl011 = RegIter::new(node.reg, cells)?.next().transpose()?;
     }
@@ -344,6 +393,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
         uart_pl011: None,
         gic: None,
         psci: PsciConduit::None,
+        cpus: CpuList::new(),
     };
     let mut stack = [Node::new(""); MAX_DEPTH + 1];
     let mut depth = 0usize;
@@ -422,6 +472,42 @@ mod tests {
 
     fn region(base: u64, size: u64) -> Region {
         Region { base, size }
+    }
+
+    #[test]
+    fn trees_without_cpu_nodes_list_none_and_apple_vz_lists_its_own() {
+        assert!(info(VIRT).unwrap().cpus.as_slice().is_empty());
+        let vz = info(APPLE_VZ).unwrap().cpus;
+        assert!(!vz.as_slice().is_empty() && vz.as_slice().len() <= MAX_CPUS);
+    }
+
+    #[test]
+    fn cpus_come_in_the_trees_order_without_repeats_and_up_to_the_limit() {
+        let mut tree = Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &[0, 0x4000_0000, 0, 0x400_0000])
+            .end()
+            .begin("cpus")
+            .cells("#address-cells", &[1])
+            .cells("#size-cells", &[0]);
+        for reg in [0x100u32, 0x101, 0x101, 0x1000_0102, 3, 4, 5, 6, 7, 8] {
+            tree = tree
+                .begin("cpu@0")
+                .prop("device_type", b"cpu\0")
+                .cells("reg", &[reg])
+                .end();
+        }
+        let blob = tree.end().end().finish();
+        let cpus = info(&blob).unwrap().cpus;
+        assert_eq!(
+            cpus.as_slice(),
+            [0x100, 0x101, 0x102, 3, 4, 5, 6, 7],
+            "the repeat and the part above the affinity fields are gone, and the list stops at {MAX_CPUS}"
+        );
     }
 
     #[test]

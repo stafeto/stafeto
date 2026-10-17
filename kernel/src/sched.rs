@@ -80,9 +80,12 @@ unsafe impl Sync for EntryTiming {}
 static ENTRY_TIMING: EntryTiming = EntryTiming(UnsafeCell::new((0, 0)));
 
 #[inline(always)]
-pub fn entry_started() {
+pub fn entry_started() -> u64 {
+    // The exception entry synchronized: no ISB before the read.
+    let now = timer::now_unordered();
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { (*ENTRY_TIMING.0.get()).0 = timer::now() };
+    unsafe { (*ENTRY_TIMING.0.get()).0 = now };
+    now
 }
 
 /// The interval of the entry ends at its first poll for an interrupt:
@@ -90,10 +93,24 @@ pub fn entry_started() {
 #[inline(always)]
 pub fn entry_polled() {
     // SAFETY: single core with interrupts masked, as above.
+    if unsafe { (*ENTRY_TIMING.0.get()).0 } != 0 {
+        entry_polled_at(timer::now());
+    }
+}
+
+/// `entry_polled` with the counter value `now`, which the caller read just
+/// before the poll: the way out of the kernel reads it once for the poll
+/// and the decision.
+#[inline(always)]
+fn entry_polled_at(now: u64) {
+    // SAFETY: single core with interrupts masked, as above.
     let timing = unsafe { &mut *ENTRY_TIMING.0.get() };
     if timing.0 != 0 {
-        let elapsed = timer::now().saturating_sub(timing.0);
-        timing.1 = timing.1.max(elapsed);
+        // The counter never runs backwards: `now` was read after the entry's.
+        let elapsed = now.wrapping_sub(timing.0);
+        if elapsed > timing.1 {
+            timing.1 = elapsed;
+        }
         timing.0 = 0;
     }
 }
@@ -470,13 +487,15 @@ pub fn resume() -> ! {
 /// nothing. Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
-        entry_polled();
+        let mut now = timer::now();
+        entry_polled_at(now);
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {
             crate::interrupt::handle(ack);
+            now = timer::now();
         }
-        match decide() {
+        match decide(now) {
             Some(Decision::Run(t)) => thread::run(t),
             // Another line of the same priority shows only after the EOI
             // of the one just handled (GICv2 running priority): poll again
@@ -495,8 +514,10 @@ extern "C" fn exit_loop() -> ! {
 /// quantum and the nearest timer of a program (timer::first); only the
 /// timer for a FIFO thread, for cleanup or while idle (spec 8, 10). The
 /// lock of the timers goes before the scheduler's is taken. A thread chosen
-/// after a timer's interrupt ends that interrupt's latency.
-fn decide() -> Option<Decision<Thread>> {
+/// after a timer's interrupt ends that interrupt's latency. `now` is the
+/// counter as `exit_loop` read it before the poll for an interrupt, or after
+/// the one it handled.
+fn decide(now: u64) -> Option<Decision<Thread>> {
     #[cfg(feature = "locked-decide")]
     let cleanup = cleanup::top();
     #[cfg(not(feature = "locked-decide"))]
@@ -505,7 +526,6 @@ fn decide() -> Option<Decision<Thread>> {
     let next_timer = crate::timer::first();
     #[cfg(not(feature = "locked-decide"))]
     let next_timer = crate::timer::first_for_decide();
-    let now = timer::now();
     let mut g = SCHED.lock();
     let g = &mut *g;
     // SAFETY: the scheduler's threads are alive.

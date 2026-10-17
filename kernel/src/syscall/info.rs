@@ -33,7 +33,7 @@ const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 /// abi::KernelStats in x1-x8 (spec 16). MEMORY takes a memory object's
 /// handle, a device window's too, with any rights and returns
 /// abi::MemoryInfo in x1-x3. THREAD_STATE takes a thread's handle and
-/// returns abi::ThreadInfo in x1-x4 and the ticks the thread has run in x5.
+/// returns abi::ThreadInfo in x1-x4, the ticks the thread has run in x5 and those it spent in the kernel in x6.
 /// CHANNEL takes a channel's handle, a labelled copy too, and returns
 /// abi::ChannelInfo in x1-x4; IRQ an interrupt binding's and returns
 /// abi::IrqInfo in x1-x3.
@@ -107,11 +107,13 @@ fn process_handles(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::new(&handles.to_words()))
 }
 
-/// PROCESS_TIME: x2 reserved; the ticks the process's threads have run.
+/// PROCESS_TIME: x2 reserved; the ticks the process's threads have run,
+/// and those of them spent in the kernel.
 fn process_time(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let p = lookup(thread, a[0], Rights::NONE, Object::process)?;
-    Ok(Values::new(&[process::cpu_time(p)]))
+    let (ran, kernel) = process::cpu_time(p);
+    Ok(Values::new(&[ran, kernel]))
 }
 
 /// KERNEL_STATS: x2 is 0, or 1 for the call maxima in the buffer.
@@ -166,9 +168,9 @@ fn thread_current(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn thread_state(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
-    let (info, ran) = thread::info(t);
+    let (info, ran, kernel) = thread::info(t);
     let [a1, a2, a3, a4] = info.to_words();
-    Ok(Values::new(&[a1, a2, a3, a4, ran]))
+    Ok(Values::new(&[a1, a2, a3, a4, ran, kernel]))
 }
 
 /// CHANNEL: x2 reserved; a channel's counts.

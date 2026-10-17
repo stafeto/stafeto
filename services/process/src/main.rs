@@ -504,11 +504,18 @@ fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
 }
 /// The counter ticks a record's process and its waited-for children ran:
 /// what its parent's children's time grows by when it is waited for.
-fn cpu_ticks(record: &Record<Handle<Process>>) -> u64 {
-    record
-        .carried_ticks
-        .saturating_add(sys::process_time(&record.process).unwrap_or(0))
-        .saturating_add(record.children_ticks)
+fn cpu_ticks(record: &Record<Handle<Process>>) -> (u64, u64) {
+    let (ran, kernel) = sys::process_times(&record.process).unwrap_or((0, 0));
+    (
+        record
+            .carried_ticks
+            .saturating_add(ran)
+            .saturating_add(record.children_ticks),
+        record
+            .carried_kernel
+            .saturating_add(kernel)
+            .saturating_add(record.children_kernel),
+    )
 }
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
@@ -850,9 +857,10 @@ impl Processes {
             if matches!(result, WaitResult::Ended { .. }) {
                 // The parent's children's time grows by the child's own and
                 // its waited-for children's (getrusage RUSAGE_CHILDREN).
-                let ticks = self.records.get(child).map_or(0, cpu_ticks);
+                let (ticks, kernel) = self.records.get(child).map_or((0, 0), cpu_ticks);
                 if let Some(p) = self.records.get_mut(parent) {
                     p.children_ticks = p.children_ticks.saturating_add(ticks);
+                    p.children_kernel = p.children_kernel.saturating_add(kernel);
                 }
                 self.records.reap(child);
                 self.generations.set_groups(child, None);
@@ -1523,9 +1531,13 @@ impl Processes {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                let ticks = caller.children_ticks;
+                let (ticks, kernel) = (caller.children_ticks, caller.children_kernel);
                 let w = r.reply();
-                if w.u32(0).and_then(|()| w.u64(ticks)).is_err() {
+                if w.u32(0)
+                    .and_then(|()| w.u64(ticks))
+                    .and_then(|()| w.u64(kernel))
+                    .is_err()
+                {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())
@@ -3138,9 +3150,9 @@ impl Processes {
         let record = self.records.get_mut(index).expect("the caller");
         let old = core::mem::replace(&mut record.process, incoming);
         // The time of the images before this one goes on counting.
-        record.carried_ticks = record
-            .carried_ticks
-            .saturating_add(sys::process_time(&old).unwrap_or(0));
+        let (ran, kernel) = sys::process_times(&old).unwrap_or((0, 0));
+        record.carried_ticks = record.carried_ticks.saturating_add(ran);
+        record.carried_kernel = record.carried_kernel.saturating_add(kernel);
         let ceiling = record.ceiling;
         record.image = image;
         record.committed_loader_ticket = committed_ticket;
