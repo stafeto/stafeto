@@ -201,6 +201,14 @@ pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String
 pub fn command(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Command {
     let mut c = Command::new("qemu-system-aarch64");
     c.args(args(m, kernel, boot_image));
+    // STAFETO_SMP=N runs any probe on N CPUs (the later `-smp` of a probe
+    // that sets its own wins), to find what a stage of SMP breaks.
+    if let Some(n) = std::env::var("STAFETO_SMP")
+        .ok()
+        .filter(|n| n.parse::<u32>().is_ok())
+    {
+        c.args(["-smp", &n]);
+    }
     c
 }
 

@@ -134,9 +134,16 @@ impl Ring {
     /// take the entry.
     fn push(&self, value: usize, to: usize) {
         let tail = self.tail.0.load(Ordering::Relaxed);
-        while tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
-            gic::send_sgi(to, SGI_CMD);
-            core::hint::spin_loop();
+        if tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
+            let limit = crate::arch::timer::now() + 2 * crate::arch::timer::frequency();
+            while tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
+                assert!(
+                    crate::arch::timer::now() < limit,
+                    "CPU {to} takes no command: its queue has been full for two seconds"
+                );
+                gic::send_sgi(to, SGI_CMD);
+                core::hint::spin_loop();
+            }
         }
         self.slots[tail as usize % RING].store(value, Ordering::Relaxed);
         self.tail.0.store(tail.wrapping_add(1), Ordering::Release);
