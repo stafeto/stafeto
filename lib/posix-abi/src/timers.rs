@@ -65,13 +65,13 @@ fn check_clock(clock: i32) -> Result<(), i32> {
     }
 }
 
-/// A timer on `clock` that sends `signal` (1 to 31; 0: SIGEV_NONE) with
+/// A timer on `clock` that sends `signal` (1 to 64; 0: SIGEV_NONE) with
 /// the value `value` (the bytes of sigval; with `own_id` the number of the
 /// timer): its `timer_t`. EAGAIN when the
 /// process holds its share of timers or the service has no place.
 pub fn create(clock: i32, signal: i32, value: u64, own_id: bool) -> Result<usize, i32> {
     check_clock(clock)?;
-    if !(0..=31).contains(&signal) {
+    if !(0..=64).contains(&signal) {
         return Err(EINVAL);
     }
     // Bit 8 of the signal: the value the signal carries is the timer's id.

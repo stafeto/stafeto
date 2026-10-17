@@ -27,6 +27,7 @@ mod image_probe_main;
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
+use posix_process_service::queued::Queued;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::shares::{Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
@@ -36,10 +37,11 @@ use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
     SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart,
     WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
+use core::sync::atomic::Ordering;
 use proto_wire::{Status, Writer, long};
 use rt::{
     abi::{self, Access, ObjectKind, Rights, Source},
@@ -152,6 +154,8 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 /// How long a process must have run no ticks, after a sample, for the listing
 /// to call it asleep (`list`).
 const SLEEP_AFTER_NS: u64 = 2_000_000;
+/// The first real-time signal (relibc's SIGRTMIN).
+const REALTIME_MIN: u8 = 35;
 /// The label of the service's own place for the notification that makes
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
@@ -236,7 +240,7 @@ enum Delivery {
     Done,
     Denied,
     Refused,
-    /// sigqueue found its signal waiting: no place for another.
+    /// sigqueue found SIGQUEUE_MAX occurrences waiting: no place for another.
     Again,
 }
 struct Processes {
@@ -259,6 +263,8 @@ struct Processes {
     replacer: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
+    /// The occurrences of signals queued behind the one on a page.
+    queued: Queued,
     /// The page of the credentials generations.
     generations: generations::Generations,
     /// Complete PID life stays independent of credentials and image changes.
@@ -327,6 +333,7 @@ impl Processes {
             replace_queue: Queue::new(),
             replacer: None,
             pages: pages::Pages::new(),
+            queued: Queued::new(),
             generations: generations::Generations::new(),
             lifetimes: lifetime_page::Lifetimes::new(),
             witnesses: [const { None }; RECORDS],
@@ -1311,11 +1318,82 @@ impl Processes {
         let Some(page) = self.pages.page(target) else {
             return Posted::Ignored;
         };
+        let bit = signals::bit(signal);
+        // Occurrences of sigqueue, and of a real-time signal however it was
+        // sent, wait in the queue behind the one on the page.
+        let by_sigqueue = (info.code == SI_QUEUE || signal >= REALTIME_MIN)
+            && proto_process::job::class(signal).is_none();
+        if info.code == SI_QUEUE && !self.has_place_for_queued(target, page) {
+            return Posted::Full;
+        }
+        // Older occurrences of the signal wait in the queue and none on the
+        // page: the new one goes behind them, the oldest to the page.
+        if by_sigqueue
+            && page.more.load(Ordering::SeqCst) & bit != 0
+            && page.pending.load(Ordering::SeqCst) & bit == 0
+            && page.ignored.load(Ordering::Acquire) & bit == 0
+        {
+            if !self.queued.push(target, signal, info) {
+                return Posted::Full;
+            }
+            self.promote(target, signal);
+            return Posted::Queued;
+        }
         let posted = signals::post(page, signal, info);
-        if posted == Posted::Pending {
-            self.request_router(target);
+        match posted {
+            Posted::Pending => self.request_router(target),
+            Posted::Merged if by_sigqueue => {
+                if !self.queued.push(target, signal, info) {
+                    return Posted::Full;
+                }
+                page.more.fetch_or(bit, Ordering::SeqCst);
+                // The page may have been emptied while the occurrence was
+                // queued: nobody would ask for it.
+                if page.pending.load(Ordering::SeqCst) & bit == 0 {
+                    self.promote(target, signal);
+                }
+                return Posted::Queued;
+            }
+            Posted::Ignored if page.more.load(Ordering::SeqCst) & bit != 0 => {
+                self.queued.drop_signal(target, signal);
+                page.more.store(self.queued.signals(target), Ordering::SeqCst);
+            }
+            _ => {}
         }
         posted
+    }
+
+    /// Whether the process of the record in `target` may have one more
+    /// occurrence of sigqueue wait: SIGQUEUE_MAX at a time, those on the page
+    /// and those queued behind.
+    fn has_place_for_queued(&self, target: usize, page: &Page) -> bool {
+        let mut waiting = self.queued.sent_by_sigqueue(target);
+        let mut pending = page.pending.load(Ordering::Acquire);
+        while pending != 0 {
+            let signal = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            waiting += usize::from(page.info[signal].code.load(Ordering::Relaxed) == SI_QUEUE);
+        }
+        waiting < proto_process::SIGQUEUE_MAX
+    }
+
+    /// Puts the oldest queued occurrence of `signal` on the page of the
+    /// record in `target`, if the page has none of it; a process that
+    /// ignores the signal loses the queue.
+    fn promote(&mut self, target: usize, signal: u8) {
+        let Some(page) = self.pages.page(target) else {
+            return;
+        };
+        let bit = signals::bit(signal);
+        if page.ignored.load(Ordering::Acquire) & bit != 0 {
+            self.queued.drop_signal(target, signal);
+        } else if page.pending.load(Ordering::SeqCst) & bit == 0
+            && let Some(info) = self.queued.take(target, signal)
+            && signals::post(page, signal, info) == Posted::Pending
+        {
+            self.request_router(target);
+        }
+        page.more.store(self.queued.signals(target), Ordering::SeqCst);
     }
 
     /// Delivers `signal` from the record in `sender` to the process of the
@@ -1372,11 +1450,9 @@ impl Processes {
             status: 0,
             value,
         };
-        let posted = self.signal(target, signal, info);
-        if code == SI_QUEUE
-            && posted == Posted::Merged
-            && proto_process::job::class(signal).is_none()
-        {
+        // Only sigqueue answers EAGAIN for a full queue; kill drops the
+        // occurrence of a real-time signal that finds none.
+        if self.signal(target, signal, info) == Posted::Full && code == SI_QUEUE {
             return Delivery::Again;
         }
         Delivery::Done
@@ -1446,6 +1522,19 @@ impl Processes {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())
+            }
+            proto_process::account_op::SIGNAL_NEXT => {
+                let (Ok(signal), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some(signal) = u8::try_from(signal)
+                    .ok()
+                    .filter(|s| (1..=SIGNAL_MAX).contains(s))
+                else {
+                    return refuse(proto_process::INVALID);
+                };
+                self.promote(index, signal);
+                Answer::Status(Status::Ok)
             }
             proto_process::account_op::NICE_GET | proto_process::account_op::NICE_SET => {
                 let set = operation == proto_process::account_op::NICE_SET;
@@ -3870,6 +3959,7 @@ impl Service<0> for Processes {
             }
         }
         self.routers[index] = None;
+        self.queued.clear(index);
         self.shares.drop_user(index);
         self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {

@@ -524,7 +524,15 @@ pub mod account_op {
     /// changed u32. `PERMISSION` for a process of another user, `ACCESS` for
     /// a lowered nice without privileges, `NO_PROCESS` with none selected.
     pub const NICE_SET: u32 = 3;
+    /// signal u32 -> status. The caller took the occurrence of a signal off
+    /// its page while `Page::more` had its bit: the service puts the next
+    /// queued one there (or drops the queue of a signal the process ignores).
+    pub const SIGNAL_NEXT: u32 = 4;
 }
+
+/// SIGQUEUE_MAX: the occurrences sent by sigqueue that wait for one process
+/// at a time (on its page and queued behind), at most.
+pub const SIGQUEUE_MAX: usize = 32;
 
 /// PRIO_PROCESS, PRIO_PGRP and PRIO_USER of getpriority and setpriority.
 pub const PRIO_PROCESS: u32 = 0;
@@ -1050,7 +1058,7 @@ pub mod job;
 
 pub const PAGE_ADDRESS: usize = 0x0D00_0000;
 /// The version of the page's layout.
-pub const PAGE_VERSION: u32 = 2;
+pub const PAGE_VERSION: u32 = 3;
 
 /// The page of a record (spec 2, 3.1, 3.3), one page in the process at
 /// PAGE_ADDRESS and in the service. The service writes the identity and
@@ -1085,6 +1093,10 @@ pub struct Page {
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
+    /// The signals that have more occurrences queued in the service behind
+    /// the one on the page (bit n - 1 for signal n): a thread that takes
+    /// one asks the service for the next (`account_op::SIGNAL_NEXT`).
+    pub more: AtomicU64,
     /// The information of the first sending of each pending signal.
     pub info: [PageInfo; 64],
 }

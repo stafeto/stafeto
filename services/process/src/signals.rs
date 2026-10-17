@@ -69,6 +69,10 @@ pub enum Posted {
     Pending,
     /// It waited already, with its first information.
     Merged,
+    /// It waited already, and this occurrence waits behind it.
+    Queued,
+    /// It waited already and no place is left behind it (sigqueue: EAGAIN).
+    Full,
 }
 
 /// The information of a sending: si_code, the sender's PID and real UID,
