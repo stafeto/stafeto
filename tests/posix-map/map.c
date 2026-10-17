@@ -142,15 +142,18 @@ static void errors(void) {
     errno = 0;
     check("mprotect off a page is EINVAL", p && mprotect(p + 1, PAGE, PROT_READ) == -1 && errno == EINVAL);
     errno = 0;
-    check("mprotect with PROT_EXEC is EACCES",
-          p && mprotect(p, PAGE, PROT_READ | PROT_EXEC) == -1 && errno == EACCES);
+    /* PROT_EXEC is accepted (the pages stay not executable). */
+    check("mprotect with PROT_EXEC is accepted",
+          p && mprotect(p, PAGE, PROT_READ | PROT_EXEC) == 0 && mprotect(p, PAGE, PROT_READ | PROT_WRITE) == 0);
     errno = 0;
     check("mprotect past the mapping is ENOMEM",
           p && mprotect(p, 64 * PAGE, PROT_READ) == -1 && errno == ENOMEM);
     check("the mapping is unchanged", p && !write_faults(p));
     errno = 0;
-    check("mmap with PROT_EXEC is EACCES",
-          mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EACCES);
+    {
+        void *x = mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check("mmap with PROT_EXEC is accepted", x != MAP_FAILED && munmap(x, PAGE) == 0);
+    }
     errno = 0;
     check("mmap with no kind is EINVAL",
           mmap(NULL, PAGE, PROT_READ, MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL);
