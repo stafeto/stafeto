@@ -116,4 +116,4 @@ pub const CLD_TRAPPED: i32 = 4;
 pub const CLD_STOPPED: i32 = 5;
 pub const CLD_CONTINUED: i32 = 6;
 /// Implementation-defined cause for pthread_kill and raise; no queued value.
-pub const SI_THREAD: i32 = 128;
+pub const SI_THREAD: i32 = -0x7fff_0000;

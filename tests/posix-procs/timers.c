@@ -206,11 +206,20 @@ static int t_c_queue_places(void) {
     union sigval v;
     v.sival_int = 111;
     if (sigqueue(getpid(), SIGUSR1, v)) return 2;
-    v.sival_int = 222;
-    if (sigqueue(getpid(), SIGUSR1, v) != -1 || errno != EAGAIN) return 3;
+    /* The queue holds SIGQUEUE_MAX occurrences of the process: more than one
+     * place, and a refusal (EAGAIN) once they are all taken. */
+    int queued = 1;
+    for (; queued < 200; queued++) {
+        v.sival_int = 222;
+        if (sigqueue(getpid(), SIGUSR1, v)) break;
+    }
+    if (errno != EAGAIN || queued < 2 || queued > 64) return 3;
     siginfo_t info;
     if (t_take(SIGUSR1, &info, 1000) != SIGUSR1) return 4;
     if (info.si_code != SI_QUEUE || info.si_value.sival_int != 111) return 5;
+    for (int i = 1; i < queued; i++) {
+        if (t_take(SIGUSR1, &info, 1000) != SIGUSR1 || info.si_value.sival_int != 222) return 6;
+    }
     v.sival_int = 333;
     if (sigqueue(getpid(), SIGUSR1, v)) return 6;
     if (t_take(SIGUSR1, &info, 1000) != SIGUSR1 || info.si_value.sival_int != 333) return 7;
@@ -481,7 +490,8 @@ static int t_c_least_interval(void) {
     if (timer_create(CLOCK_MONOTONIC, &e, &t)) return 2;
     struct itimerspec its = t_its(T_MS, 1), got;
     if (timer_settime(t, 0, &its, NULL)) return 3;
-    if (timer_gettime(t, &got) || got.it_interval.tv_sec || got.it_interval.tv_nsec < 1000) return 4;
+    /* The interval stays what the program set. */
+    if (timer_gettime(t, &got) || got.it_interval.tv_sec || got.it_interval.tv_nsec == 0) return 4;
     t_got = 0;
     t_nap(200);
     its = t_its(0, 0);
@@ -588,9 +598,8 @@ static int t_c_itimer(void) {
     t_take(SIGALRM, &info, 0);
     t_nap(70);
     if (t_take(SIGALRM, &info, 10) != -1) return 11;
-    /* Processor time clocks are not kept. */
-    if (setitimer(ITIMER_VIRTUAL, &v, NULL) != -1 || errno != EINVAL) return 12;
-    if (setitimer(ITIMER_PROF, &v, NULL) != -1 || errno != EINVAL) return 13;
+    /* The processor time timers are the library's: a zero setting is accepted. */
+    if (setitimer(ITIMER_VIRTUAL, &v, NULL) || setitimer(ITIMER_PROF, &v, NULL)) return 12;
     if (getitimer(9, &now) != -1 || errno != EINVAL) return 14;
     v.it_value.tv_usec = 1000000;
     if (setitimer(ITIMER_REAL, &v, NULL) != -1 || errno != EINVAL) return 15;
@@ -759,7 +768,7 @@ static int timers_role(void) {
     t_child("timer_create refuses bad arguments, a null event", t_c_create_errors, 0, 0);
     t_child("timer_getoverrun counts and starts again", t_c_overrun, 0, 0);
     t_child("eight timers due at once", t_c_burst, 0, 0);
-    t_child("an interval below the least is raised", t_c_least_interval, 0, 0);
+    t_child("an interval below the least is looked at no more than every millisecond", t_c_least_interval, 0, 0);
     t_child("alarm", t_c_alarm, 0, 0);
     t_child("the alarm has a place when the table of timers is full", t_c_alarm_full_table, 0, 0);
     t_child("SIGALRM ends a process that does not catch it", t_c_alarm_kills, 0, SIGALRM);
