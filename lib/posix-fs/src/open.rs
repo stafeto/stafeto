@@ -912,6 +912,9 @@ mod tests {
         // resident records, without an extra admission pool or per-fd buffer.
         assert!(size_of::<PosixFs>() <= 28672);
         assert!(size_of::<posix_fd::Table<Target, { crate::OPEN_MAX }, Recovery>>() <= 20480);
-        assert!(size_of::<posix_fd::Table<Target, { crate::OPEN_MAX }, Recovery, [u8; 1016]>>() <= 106496);
+        assert!(
+            size_of::<posix_fd::Table<Target, { crate::OPEN_MAX }, Recovery, [u8; 1016]>>()
+                <= 106496
+        );
     }
 }
