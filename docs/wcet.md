@@ -39,7 +39,7 @@ gone.
 ## How to run
 
 ```
-cargo xtask wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR]
+cargo xtask wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR] [--out DIR]
 cargo xtask wcet stack [--limit BYTES] [--elf FILE]
 ```
 
@@ -52,6 +52,8 @@ cargo xtask wcet stack [--limit BYTES] [--elf FILE]
   `ci` on its coverage.
 - `--all` runs every probe of the boot list that is not os-test, the guest
   probes of all groups included.
+- `--out DIR` names the directory under `target/` for the traces and the
+  report (`wcet` by default); runs to compare keep apart so.
 - `--skip PROBE` leaves a probe out of the run (or, with `--from`, out of the
   traces read); `--from DIR` reads the traces of an earlier run.
 - `stack` prints the deepest stack against the limit and writes the paths,

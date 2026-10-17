@@ -541,7 +541,7 @@ fn join(set: &BTreeSet<String>) -> String {
 
 /// The probes of `wcet coverage`: the boots of the kernel group of `ci`,
 /// with `EXTRA_PROBES`, less those in `skip`.
-fn probes(skip: &[String], all: bool) -> Vec<jobs::Job> {
+fn probes(skip: &[String], all: bool, traces: &Path) -> Vec<jobs::Job> {
     let mut wanted = crate::ci::kernel_boot_names();
     wanted.extend(EXTRA_PROBES.map(str::to_owned));
     let mut list = crate::boot_jobs(Vec::new());
@@ -554,7 +554,7 @@ fn probes(skip: &[String], all: bool) -> Vec<jobs::Job> {
         })
         .map(|job| {
             let (name, run) = job.into_parts();
-            let dir = target_dir().join("wcet/traces");
+            let dir = traces.to_owned();
             let label = name.clone();
             jobs::job(&name, move || {
                 TRACING.with(|t| *t.borrow_mut() = Some((dir, label)));
@@ -571,16 +571,18 @@ struct CoverageOptions {
     skip: Vec<String>,
     from: Option<PathBuf>,
     all: bool,
+    /// Where the traces and the report go, under the target directory.
+    out: String,
 }
 
 fn parse_coverage(args: &[String]) -> Result<CoverageOptions, String> {
-    let usage =
-        "usage: cargo xtask wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from TRACE-DIR]";
+    let usage = "usage: cargo xtask wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from TRACE-DIR] [--out DIR]";
     let mut o = CoverageOptions {
         jobs: jobs::default_jobs(),
         skip: Vec::new(),
         from: None,
         all: false,
+        out: "wcet".to_owned(),
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -599,6 +601,7 @@ fn parse_coverage(args: &[String]) -> Result<CoverageOptions, String> {
             }
             "--skip" => o.skip.push(value.clone()),
             "--from" => o.from = Some(value.into()),
+            "--out" => o.out = value.clone(),
             _ => return Err(usage.to_owned()),
         }
     }
@@ -610,13 +613,13 @@ fn coverage(args: &[String]) -> Result<(), String> {
     let traces = match &o.from {
         Some(dir) => dir.clone(),
         None => {
-            let traces = target_dir().join("wcet/traces");
+            let traces = target_dir().join(&o.out).join("traces");
             if traces.exists() {
                 std::fs::remove_dir_all(&traces).map_err(|e| e.to_string())?;
             }
             let so = build_plugin()?;
             let _ = PLUGIN.set(so);
-            let list = probes(&o.skip, o.all);
+            let list = probes(&o.skip, o.all, &traces);
             if list.is_empty() {
                 return Err("no probe to run".to_owned());
             }
@@ -628,10 +631,10 @@ fn coverage(args: &[String]) -> Result<(), String> {
             traces
         }
     };
-    report_coverage(&traces, &o.skip)
+    report_coverage(&traces, &o.skip, &target_dir().join(&o.out))
 }
 
-fn report_coverage(traces: &Path, skip: &[String]) -> Result<(), String> {
+fn report_coverage(traces: &Path, skip: &[String], out: &Path) -> Result<(), String> {
     let kernels = read_traces(traces, skip)?;
     if kernels.is_empty() {
         return Err(format!("no trace under {}", traces.display()));
@@ -650,7 +653,8 @@ fn report_coverage(traces: &Path, skip: &[String]) -> Result<(), String> {
         full += &f;
         full.push('\n');
     }
-    let file = target_dir().join("wcet/coverage.txt");
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let file = out.join("coverage.txt");
     std::fs::write(&file, &full).map_err(|e| format!("{}: {e}", file.display()))?;
     print!("{summary}");
     println!(

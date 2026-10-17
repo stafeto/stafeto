@@ -1372,7 +1372,7 @@ commands:
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps [branches [machine]] measure process service steps (2G by default)
-  wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR]
+  wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR] [--out DIR]
             run the kernel probes under QEMU's trace plugin and list the
             blocks of the entry paths that none ran (docs/wcet.md); --all runs
             every guest probe, not the kernel group's only
