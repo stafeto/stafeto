@@ -1298,6 +1298,20 @@ pub extern "C" fn stafeto_thread_release(id: c_int) {
     posix_abi::relibc::release(id as u64);
 }
 
+/// Frees the stacks and blocks of the threads that ended and were released,
+/// for a `pthread_create` that found no memory for its own.
+/// Whether a guard area for a stack may be cut: the table of mappings has
+/// room (1) or not (0).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_guard_room() -> c_int {
+    c_int::from(posix_abi::allocation::room_for_guard())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_collect() {
+    let _ = posix_abi::relibc::collect();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_exit_thread(stack: *mut c_void, size: usize) -> ! {
     posix_abi::relibc::exit_thread(stack as usize, size)

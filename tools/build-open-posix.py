@@ -80,7 +80,19 @@ def clang() -> str:
 # Mistakes of the suite that stop a test from compiling anywhere: the member
 # `cid` that `stress1.c` of pthread_cond_wait sets is missing from its
 # `struct childdata` (the file of pthread_cond_timedwait has it).
+#
+# Two tests keep 1,024 `struct aiocb` (about 170 KiB) on the stack of main,
+# which has 64 KiB here: the array becomes static, and the test asks the
+# same of the library.
 SOURCE_FIXES = {
+    "conformance/interfaces/aio_read/9-1.c": (
+        "\tstruct aiocb aiocbs[NUM_AIOCBS];",
+        "\tstatic struct aiocb aiocbs[NUM_AIOCBS];",
+    ),
+    "conformance/interfaces/aio_write/7-1.c": (
+        "\tstruct aiocb aiocbs[NUM_AIOCBS];",
+        "\tstatic struct aiocb aiocbs[NUM_AIOCBS];",
+    ),
     "stress/threads/pthread_cond_wait/stress1.c": (
         "\tint fork;\n\tint *pBool;\n};",
         "\tint fork;\n\tint *pBool;\n\tclockid_t cid;\n};",

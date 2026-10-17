@@ -82,8 +82,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (ucontext.h, sys/vfs.h, si_band, SIGPOLL), PTHREAD_KEYS_MAX 1024, the
 # limit of pthread_atfork, sem_wait that a handler interrupts, scheduling and
 # memory options, the end of fork, guard pages of stacks, join and detach of
-# a thread that is gone; tagged pin-98a83ccd.
-COMMIT = "98a83ccdcf50c263d8a45432b146442757802267"
+# a thread that is gone, one page of guard by default while the table of mappings has room, a collection when a stack finds no memory, named semaphore waits that ask again; tagged pin-80d8b1b5.
+COMMIT = "80d8b1b557df5eec9f37f6f1a96800ad1dc89d09"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
