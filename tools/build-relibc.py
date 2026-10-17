@@ -59,12 +59,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Goal Zh (basic to its ceiling): the functions of complex.h in binary128 with
 # the special values of C11 Annex G (double and float round once); NZERO,
 # devctl.h and the typed memory declarations; robust mutexes (the end of a
-# thread marks the ones it holds); a new thread yields once so that its
-# creator goes on first; a late request of cancellation acts when the thread
-# enables it or sets the asynchronous type; strtod converts a decimal constant
-# whole; wordexp prints with printf; aio signals with sigqueue; sysconf says 64
-# descriptors; SIGSTKSZ is 48 KiB; tagged pin-6faaf85f.
-COMMIT = "6faaf85f03435c82aad0f6eb1942b6f720fe9996"
+# thread marks the ones it holds); a late request of cancellation acts when
+# the thread enables it or sets the asynchronous type; strtod converts a
+# decimal constant whole; wordexp prints with printf; aio signals with
+# sigqueue; sysconf says 64 descriptors; SIGSTKSZ is 48 KiB; tagged
+# pin-c1cced60.
+COMMIT = "c1cced602e669ad5beeb019f74f96d08913dc3d9"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
