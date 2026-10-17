@@ -29,18 +29,18 @@ pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
 
-/// The access `prot` asks for: write means read too, and code is read only.
+/// The access `prot` asks for: write means read too, and code is not
+/// allowed (EACCES: the layer's objects carry no MAP_EXEC).
 fn access_of(prot: i32) -> Result<Access, i32> {
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(EINVAL);
     }
-    // PROT_EXEC is accepted and the pages are not executable: the objects
-    // of the layer carry no right to run code, so the bit asks for no more
-    // than reading (code in a mapping faults when it runs).
-    Ok(match prot & (PROT_READ | PROT_WRITE | PROT_EXEC) {
+    if prot & PROT_EXEC != 0 {
+        return Err(EACCES);
+    }
+    Ok(match prot & (PROT_READ | PROT_WRITE) {
         0 => Access::None,
-        PROT_READ | PROT_EXEC => Access::Read,
-        p if p & PROT_WRITE == 0 => Access::Read,
+        PROT_READ => Access::Read,
         _ => Access::ReadWrite,
     })
 }
@@ -539,7 +539,7 @@ pub fn is_past_end(address: usize, write: bool) -> bool {
         let wanted = if write {
             PROT_WRITE
         } else {
-            PROT_READ | PROT_EXEC
+            PROT_READ
         };
         high != 0
             && range[0].load(Ordering::Acquire) <= address
