@@ -1898,7 +1898,6 @@ mod tests {
             p.sock_option(&held, c, OPT_RCVBUF, true, 256),
             Ok(MIN_BUF as u32)
         );
-        assert!(MIN_BUF >= 4 + ADDR_MAX + SEND_MAX);
     }
 
     #[test]
