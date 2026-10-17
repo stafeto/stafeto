@@ -7321,6 +7321,21 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("smp 4 EL2 GICv3", || {
             smp_boot(&qemu::VIRT_EL2_V3, GIC_V3_LINE)
         }),
+        job("smp 4 CPU_ON refused", smp_cpu_on),
+        // The tests of SMP stage 4 on four CPUs, with the whole test init
+        // (the other stages of SMP, 5 and 6, bring the rest of ci to four).
+        job("smp 4 probes GICv2", || {
+            init_tests_on(&qemu::VIRT, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes GICv3", || {
+            init_tests_on(&qemu::VIRT_V3, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes EL2 GICv2", || {
+            init_tests_on(&qemu::VIRT_EL2, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes EL2 GICv3", || {
+            init_tests_on(&qemu::VIRT_EL2_V3, false, SMP_CPUS).map(drop)
+        }),
         job("console dialog 512M", || console_dialog(&qemu::VIRT)),
         job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
         job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
@@ -9172,6 +9187,7 @@ fn hvf() -> Result<(), String> {
         // Four CPUs on the real processor: the start through PSCI, the
         // block read without caches, the SGIs of every pair.
         smp_boot(m, gic)?;
+        init_tests_on(m, false, SMP_CPUS)?;
         console_dialog(m)?;
         trace_dialog(m)?;
         // relibc's pthreads and the POSIX processes, the loader of files
