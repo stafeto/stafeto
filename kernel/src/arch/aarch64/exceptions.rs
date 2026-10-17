@@ -164,7 +164,7 @@ pub fn fault_enters(mut thread: NonNull<Thread>, syndrome: u64, far: u64) -> boo
     // SAFETY: the running thread is alive; only its own entry state changes,
     // under the scheduler's lock.
     let upcall = &mut unsafe { thread.as_mut() }.upcall;
-    crate::sched::locked(|_| upcall.fault(syndrome, esr::fault_address(syndrome, far), long))
+    upcall.fault(syndrome, esr::fault_address(syndrome, far), long)
 }
 
 /// A fault of the program at EL0 enters the thread's open entry when the
@@ -212,6 +212,8 @@ fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     };
     // SAFETY: the running thread is alive.
     let cause = unsafe { thread.as_ref() }.priority();
+    crate::obj::serving(crate::obj::ENTRY_FAULT);
+    let _section = crate::obj::lock();
     // SAFETY: the thread's reference keeps the process until the end takes
     // its own; the thread is not used afterwards.
     unsafe { process::end(p, reason, cause) };

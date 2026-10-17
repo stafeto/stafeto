@@ -8,6 +8,7 @@
 //! all RAM.
 
 use crate::boot::Boot;
+use crate::obj::Guarded;
 use abi::Error;
 use core::ops::Range;
 use kcore::PAGE_SIZE;
@@ -16,7 +17,6 @@ use kcore::frames::{FrameAllocator, PhysMem};
 use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::memmap;
 use kcore::quota::Account;
-use kcore::sync::Lock;
 
 /// Physical memory through the linear map. `read` and `write` take any
 /// physical address, so only code that owns the memory it names may make one.
@@ -241,10 +241,11 @@ pub unsafe fn free(frame: Frame, quota: &mut Account) {
     core::mem::forget(frame);
 }
 
-pub static FRAMES: Lock<Option<Frames>> = Lock::new(None);
+/// The frames of memory, which `OBJ` guards (obj.rs).
+pub static FRAMES: Guarded<Option<Frames>> = Guarded::new(None);
 
 /// The allocator's metadata, which `init` carves out of usable RAM.
-static METADATA: Lock<Region> = Lock::new(Region { base: 0, size: 0 });
+static METADATA: Guarded<Region> = Guarded::new(Region { base: 0, size: 0 });
 
 /// Starts the allocator with the usable RAM that is mapped now; returns the
 /// rest, which becomes reachable with the kernel page tables.

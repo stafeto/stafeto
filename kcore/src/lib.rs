@@ -29,6 +29,7 @@ pub mod notify;
 pub mod pagelist;
 pub mod paging;
 pub mod process;
+pub mod qsbr;
 pub mod quota;
 pub mod sched;
 pub mod slab;

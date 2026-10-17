@@ -33,7 +33,7 @@ const _: () =
 
 /// Pages a portion of mem_map, mem_unmap or mem_protect takes at most
 /// (spec 7.7).
-pub const PORTION: u32 = 32;
+pub const PORTION: u32 = 16;
 
 /// Pages a portion takes at most when they become executable (mem_map or
 /// mem_protect with RX): the instruction cache is made coherent for each
@@ -157,6 +157,7 @@ pub fn add_mapping(
     mapping: Mapping<NonNull<Memory>>,
     access: Access,
 ) -> Result<Change, Error> {
+    crate::obj::assert_held();
     let p = target.as_ptr();
     // SAFETY: the caller's promise; only these fields are borrowed.
     unsafe {
@@ -219,6 +220,7 @@ pub fn begin_protect(
 /// edge that is left, idle and unchanged, holds a new reference to the
 /// object. Whatever stops the call, the edges stay whole.
 fn cut(target: NonNull<Process>, va: u64, pages: u64, op: Op) -> Result<Change, Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process; only the table
     // is changed.
     let table = unsafe { table(target) }.ok_or(Error::InvalidArgs)?;
@@ -255,6 +257,7 @@ fn cut(target: NonNull<Process>, va: u64, pages: u64, op: Op) -> Result<Change, 
 /// changed go before the portion ends ([G13]). True once every page of the
 /// entry is done.
 pub fn step_change(on: &mut Change) -> Result<bool, Error> {
+    crate::obj::assert_held();
     check_alive(on.target)?;
     // SAFETY: the process lives, and the entry is the call's.
     let (m, space) = unsafe { (entry(on), space(on.target)) };
@@ -276,7 +279,9 @@ pub fn step_change(on: &mut Change) -> Result<bool, Error> {
         }
     }
     if exec {
-        cache::sync_icache_frames(frames);
+        // The frames are the object's, and no table maps them yet: cache
+        // maintenance on them is no change of a link.
+        crate::obj::outside(|| cache::sync_icache_frames(frames));
     }
     match &mut on.op {
         Op::Map { access, prepaid } => {
@@ -303,6 +308,7 @@ pub fn step_change(on: &mut Change) -> Result<bool, Error> {
 /// `on` ended with its last portion, its process lives, and nothing uses
 /// it afterwards.
 pub unsafe fn finish_change(on: Change, cause: u8) {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise.
     let table = unsafe { table(on.target) }.expect("a table with a busy entry");
     let index = on.index as usize;
@@ -337,6 +343,7 @@ pub fn map_whole(
     va: usize,
     access: Access,
 ) -> Result<(), Error> {
+    crate::obj::assert_held();
     let pages = memory::pages(m) as u32;
     check_free(target, va as u64, pages.into())?;
     let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
@@ -362,6 +369,7 @@ pub fn map_whole(
 /// # Safety
 /// Nothing uses `on` afterwards.
 pub unsafe fn abandon_change(on: Change, cause: u8) {
+    crate::obj::assert_held();
     if check_alive(on.target).is_ok() {
         // SAFETY: the process lives, and the entry is the call's.
         let table = unsafe { table(on.target) }.expect("a table with a busy entry");
@@ -412,7 +420,10 @@ pub(super) unsafe fn release_all(process: NonNull<Process>, level: u8) -> bool {
             return true;
         };
         // Each entry that goes lets its reference to the object go.
-        (*t.as_ptr()).drain(|m| memory::release_mapping(m.object, level));
+        (*t.as_ptr()).drain(|m| {
+            let _section = crate::obj::lock();
+            memory::release_mapping(m.object, level)
+        });
         // The table owns one paid page; PageLog returns it with the shell.
     }
     true

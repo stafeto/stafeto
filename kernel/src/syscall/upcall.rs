@@ -66,23 +66,25 @@ pub(super) fn thread_upcall_return(thread: NonNull<Thread>) {
     }
 }
 
-// The changes of the entry's state run under the scheduler's lock, each in
-// a function of its own so that the lock stays off the path of the other
-// calls.
+// The entry's state is the thread's own: only the CPU that runs the thread
+// changes it, without a lock. A request from another CPU reaches the state
+// by a command that the owner executes (SMP stage 4); `pending` is the one
+// field another CPU reads. Each change is in a function of its own, which
+// keeps its code off the path of the other calls.
 #[inline(never)]
 fn locked_bind(upcall: &mut kcore::upcall::State, entry: u64) -> Result<(), Error> {
-    sched::locked(|_| upcall.bind(entry))
+    upcall.bind(entry)
 }
 #[inline(never)]
 fn locked_take(upcall: &mut kcore::upcall::State) -> Result<[u64; 4], Error> {
-    sched::locked(|_| upcall.take())
+    upcall.take()
 }
 #[inline(never)]
 fn locked_basic(
     upcall: &mut kcore::upcall::State,
     operation: UpcallControl,
 ) -> Result<kcore::upcall::Reply, Error> {
-    sched::locked(|_| upcall.control_basic(operation))
+    upcall.control_basic(operation)
 }
 #[inline(never)]
 fn locked_control(
@@ -91,5 +93,5 @@ fn locked_control(
     x1: u64,
     x2: u64,
 ) -> Result<kcore::upcall::Reply, Error> {
-    sched::locked(|_| upcall.control(operation, x1, x2))
+    upcall.control(operation, x1, x2)
 }

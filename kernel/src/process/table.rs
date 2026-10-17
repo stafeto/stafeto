@@ -58,6 +58,7 @@ pub(super) unsafe fn table<'a>(process: NonNull<Process>) -> (&'a mut Handles, C
 /// before it allocates anything for the call, so a full table costs
 /// nothing beyond the checks that come before it in the fixed order.
 pub fn handle_room(process: NonNull<Process>) -> Result<(), Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process; only the field
     // is read.
     if unsafe { (*process.as_ptr()).handles.room() } > 0 {
@@ -79,6 +80,7 @@ pub fn insert_handle(
     object: Object,
     rights: Rights,
 ) -> Result<Handle, Error> {
+    crate::obj::assert_held();
     assert!(
         check_alive(process).is_ok(),
         "a handle went into the table of a process that ended"
@@ -94,6 +96,7 @@ pub fn insert_handle(
 /// queues the object for cleanup at `cause`. BAD_HANDLE for a handle that
 /// is not live.
 pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Result<(), Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process other than the
     // handle, so the process outlives the release below.
     let (object, rights) = unsafe { process.as_mut() }.handles.remove(h)?;
@@ -108,6 +111,7 @@ pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Resu
 /// does not fit in the quota of `process`, which pays for it. After Ok the
 /// next `put_handles` cannot fail. It adds at most one chunk.
 pub fn reserve_handles(process: NonNull<Process>, n: usize) -> Result<(), Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process.
     let (handles, mut chunks) = unsafe { table(process) };
     handles.reserve(&mut chunks, n as u32)
@@ -118,6 +122,7 @@ pub fn reserve_handles(process: NonNull<Process>, n: usize) -> Result<(), Error>
 /// count of the object changes (spec 5.3). The call checked each of them
 /// (BAD_HANDLE, ACCESS_DENIED), and the table did not change since.
 pub fn take_handles(mut process: NonNull<Process>, values: &[u64]) -> Moving {
+    crate::obj::assert_held();
     let mut moving = [None; abi::MESSAGE_HANDLES];
     for (m, &v) in moving.iter_mut().zip(values) {
         // SAFETY: the caller holds a reference to the process other than
@@ -139,6 +144,7 @@ pub fn put_handles(
     process: NonNull<Process>,
     moving: Moving,
 ) -> [(u64, u64); abi::MESSAGE_HANDLES] {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process; only the field
     // is read.
     let stage = unsafe { (*process.as_ptr()).stage };
@@ -170,6 +176,7 @@ pub fn install_init_handles(
     first: NonNull<Thread>,
     boot: NonNull<Memory>,
 ) -> Result<(), Error> {
+    crate::obj::assert_held();
     let handles = [
         insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,
         insert_handle(init, Object::Process(init), abi::OWNER_RIGHTS)?,
@@ -196,6 +203,7 @@ pub fn install_init_handles(
 /// share the first page of the child's pool of blocks, which the child
 /// pays for: NO_MEMORY when its quota falls short.
 pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
+    crate::obj::assert_held();
     let stub = insert_handle(child, Object::Resource, Rights::NONE)?;
     assert!(
         stub == abi::START_CHANNEL,
@@ -215,6 +223,7 @@ pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
 /// of blocks, which the child pays for: NO_MEMORY when its quota falls
 /// short.
 pub fn move_start(child: NonNull<Process>, object: Object, rights: Rights) -> Result<(), Error> {
+    crate::obj::assert_held();
     let h = insert_handle(child, object, rights)?;
     assert!(
         h == abi::START_CHANNEL,

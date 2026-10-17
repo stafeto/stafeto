@@ -114,6 +114,14 @@ pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
     }
 }
 
+/// Whether the process of `t` is gated, as `park_selected` reads it first.
+#[inline(always)]
+pub fn gated_thread(t: NonNull<Thread>) -> bool {
+    // SAFETY: the scheduler holds the selected thread, which holds its
+    // process; the gate is atomic.
+    unsafe { gated(t.as_ref().process().as_ptr(), Ordering::Relaxed) }
+}
+
 /// The common EL0 return, including the fast send path: `t` runs next, and
 /// `process` is its process. The hot path reads the gate without the lock
 /// as a hint (one byte, never torn); `park_selected` decides under the
@@ -126,6 +134,8 @@ pub fn park_if_suspended(t: NonNull<Thread>, process: NonNull<Process>) -> bool 
     if unsafe { !gated(process.as_ptr(), Ordering::Relaxed) } {
         return false;
     }
+    crate::obj::serving(crate::obj::ENTRY_PARK);
+    let _section = crate::obj::lock();
     sched::locked(|k| park_selected(t, k))
 }
 
@@ -144,6 +154,7 @@ pub(crate) unsafe fn unlist(t: NonNull<Thread>, _k: &mut Locked<'_>) {
 /// # Safety
 /// The cleanup queue just took the process, holding its reference.
 pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
+    let section = crate::obj::lock();
     let left = sched::locked(|k| {
         // SAFETY: the queue holds the process and each parked thread is
         // held by the scheduler; the lock guards their shared links.
@@ -160,6 +171,7 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
             !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
         }
     });
+    drop(section);
     // SAFETY: the queue's reference goes only after the work ends.
     unsafe {
         let p = process.as_ptr();
@@ -171,6 +183,7 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
             );
         } else {
             (*p).resume_level = 0;
+            let _section = crate::obj::lock();
             release(process, level);
         }
     }

@@ -20,11 +20,11 @@
 //! level (spec 10).
 
 use crate::arch::timer;
+use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
 use kcore::sched::{Link, Linked, ReadyQueue};
-use kcore::sync::Lock;
 use kcore::time::stretch;
 
 /// What an item stands in the queue for.
@@ -53,7 +53,7 @@ impl Item {
     /// An item in no queue.
     pub const fn new() -> Item {
         Item {
-            link: Link::new(1),
+            link: Link::new(0),
             work: None,
         }
     }
@@ -67,7 +67,7 @@ unsafe impl Linked for Item {
     }
 }
 
-struct Queue {
+pub(crate) struct Queue {
     items: ReadyQueue<Item>,
     /// Items queued now.
     len: u64,
@@ -83,13 +83,17 @@ struct Queue {
 // interrupts masked inside the kernel.
 unsafe impl Send for Queue {}
 
-static QUEUE: Lock<Queue> = Lock::new(Queue {
-    items: ReadyQueue::new(),
-    len: 0,
-    longest: 0,
-    #[cfg(feature = "ktest")]
-    late: false,
-});
+impl Queue {
+    pub(crate) const fn new() -> Queue {
+        Queue {
+            items: ReadyQueue::new(),
+            len: 0,
+            longest: 0,
+            #[cfg(feature = "ktest")]
+            late: false,
+        }
+    }
+}
 
 /// Queues `work` at the tail of `level` (1-63): the last reference of its
 /// object just went, or its teardown begins (process::end), or timers of
@@ -121,7 +125,7 @@ pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
 /// # Safety
 /// `item` is alive and queued; its owner takes responsibility for its work.
 pub unsafe fn remove(item: NonNull<Item>) {
-    let mut q = QUEUE.lock();
+    let mut q = local().queue.lock();
     // SAFETY: the caller's promise.
     unsafe {
         q.items.remove(item);
@@ -158,7 +162,7 @@ pub unsafe fn raise_above(item: NonNull<Item>, level: u8) {
 /// # Safety
 /// As for `raise`.
 unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
-    let mut q = QUEUE.lock();
+    let mut q = local().queue.lock();
     // SAFETY: the caller's promise; the link is touched only while the
     // item is out of the queue.
     unsafe {
@@ -176,7 +180,7 @@ unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
 /// # Safety
 /// As for `enqueue`.
 unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
-    let mut q = QUEUE.lock();
+    let mut q = local().queue.lock();
     // SAFETY: the caller's promise.
     unsafe {
         let i = &mut *item.as_ptr();
@@ -193,7 +197,7 @@ unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
 
 /// The top level of the queue; None when it is empty.
 pub fn top() -> Option<u8> {
-    QUEUE.lock().items.top()
+    local().queue.lock().items.top()
 }
 
 /// The top level during the scheduler's decision, without the lock: one
@@ -203,7 +207,7 @@ pub fn top() -> Option<u8> {
 #[cfg(not(feature = "locked-decide"))]
 pub fn top_for_decide() -> Option<u8> {
     // SAFETY: the queue is a static; only its atomic mask is read.
-    unsafe { ReadyQueue::top_unlocked(&raw const (*QUEUE.as_ptr()).items) }
+    unsafe { ReadyQueue::top_unlocked(&raw const (*local().queue.as_ptr()).items) }
 }
 
 /// One portion (sched::resume): the item at the head of the top level
@@ -214,11 +218,11 @@ pub fn top_for_decide() -> Option<u8> {
 pub fn portion() {
     #[cfg(feature = "ktest")]
     if crate::arch::irq_pending() {
-        QUEUE.lock().late = true;
+        local().queue.lock().late = true;
     }
     let start = timer::now();
     let taken = {
-        let mut q = QUEUE.lock();
+        let mut q = local().queue.lock();
         q.items.top().map(|level| {
             let item = q.items.first(level).expect("a level with its bit set");
             // SAFETY: a queued item is alive and in this queue.
@@ -233,31 +237,59 @@ pub fn portion() {
     // SAFETY: the item's object stays alive until its portion, which is
     // this one; the item is not used afterwards.
     let work = unsafe { (*item.as_ptr()).work.take() }.expect("queued work");
+    crate::obj::serving(crate::obj::ENTRY_CLEANUP);
     // SAFETY: nothing refers to the object any more.
     unsafe {
         match work {
-            Work::Object(Object::Process(p)) => process::clean(p, level),
-            Work::Object(Object::Thread(t)) => thread::clean(t, level),
-            Work::Object(Object::Channel(c)) => channel::clean(c, level),
-            Work::Object(Object::Session(s)) => session::clean(s, level),
-            Work::Object(Object::Timer(t)) => crate::timer::clean(t, level),
-            Work::Object(Object::Memory(m)) => crate::memory::clean(m, level),
-            Work::Object(Object::Irq(b)) => crate::irq::clean(b, level),
+            Work::Object(Object::Process(p)) => {
+                crate::obj::serving(crate::obj::CLEAN_PROCESS);
+                process::clean(p, level)
+            }
+            Work::Object(Object::Thread(t)) => {
+                crate::obj::serving(crate::obj::CLEAN_THREAD);
+                let _section = crate::obj::lock();
+                thread::clean(t, level)
+            }
+            Work::Object(Object::Channel(c)) => {
+                crate::obj::serving(crate::obj::CLEAN_CHANNEL);
+                let _section = crate::obj::lock();
+                channel::clean(c, level)
+            }
+            Work::Object(Object::Session(s)) => {
+                crate::obj::serving(crate::obj::CLEAN_SESSION);
+                let _section = crate::obj::lock();
+                session::clean(s, level)
+            }
+            Work::Object(Object::Timer(t)) => {
+                crate::obj::serving(crate::obj::CLEAN_TIMER);
+                let _section = crate::obj::lock();
+                crate::timer::clean(t, level)
+            }
+            Work::Object(Object::Memory(m)) => {
+                crate::obj::serving(crate::obj::CLEAN_MEMORY);
+                crate::memory::clean(m, level)
+            }
+            Work::Object(Object::Irq(b)) => {
+                crate::obj::serving(crate::obj::CLEAN_IRQ);
+                let _section = crate::obj::lock();
+                crate::irq::clean(b, level)
+            }
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")
             }
             Work::Timers => crate::timer::fire(level),
         }
     }
+    crate::obj::serving(0);
     let took = stretch(start, timer::now());
     crate::testpoint::portion_done();
-    let mut q = QUEUE.lock();
+    let mut q = local().queue.lock();
     q.longest = q.longest.max(took);
 }
 
 /// Items queued now, for KSTATS (spec 16).
 pub fn len() -> u64 {
-    QUEUE.lock().len
+    local().queue.lock().len
 }
 
 /// A portion of a long call (spec 7.7) that began at `start`, in counter
@@ -265,30 +297,41 @@ pub fn len() -> u64 {
 /// add to the blocking of any thread (KSTATS x5).
 pub fn count_portion(start: u64) {
     let took = stretch(start, timer::now());
-    let mut q = QUEUE.lock();
+    let mut q = local().queue.lock();
     q.longest = q.longest.max(took);
 }
 
 /// The longest portion so far, of cleanup or of a long call, in counter
 /// ticks, for KSTATS.
 pub fn longest() -> u64 {
-    QUEUE.lock().longest
+    local().queue.lock().longest
 }
 
 /// The longest portion so far, which goes back to 0: a test that checks
 /// what a call counts takes it first (KSTATS x5).
 #[cfg(feature = "ktest")]
 pub fn take_longest() -> u64 {
-    core::mem::take(&mut QUEUE.lock().longest)
+    core::mem::take(&mut local().queue.lock().longest)
 }
 
 /// Runs portions until the queue is empty: tests that count the objects
 /// in pools call it, since the queue otherwise waits for the next way out
-/// of the kernel.
+/// of the kernel, and frees what waited for a quiescent period (qsbr).
 #[cfg(feature = "ktest")]
 pub fn drain() {
-    while top().is_some() {
-        portion();
+    loop {
+        while top().is_some() {
+            portion();
+        }
+        if !crate::qsbr::pending() {
+            return;
+        }
+        // The kernel stack is empty here too: a quiescent point frees the
+        // retired objects, which may queue more.
+        crate::qsbr::quiesce();
+        if top().is_none() {
+            return;
+        }
     }
 }
 
@@ -296,5 +339,5 @@ pub fn drain() {
 /// call.
 #[cfg(feature = "ktest")]
 pub fn take_late() -> bool {
-    core::mem::take(&mut QUEUE.lock().late)
+    core::mem::take(&mut local().queue.lock().late)
 }

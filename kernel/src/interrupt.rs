@@ -32,8 +32,13 @@ pub fn handle(ack: Ack) {
             sched::timer_fired();
             crate::testpoint::timer_fired();
         }
-    } else if !irq::deliver(intid) {
-        gic::mask(intid);
+    } else {
+        // `deliver` looks the line up without a lock and enters the section
+        // of its own for the post (irq.rs).
+        crate::obj::serving(crate::obj::ENTRY_INTERRUPT);
+        if !irq::deliver(intid) {
+            gic::mask(intid);
+        }
     }
     gic::end(ack);
 }

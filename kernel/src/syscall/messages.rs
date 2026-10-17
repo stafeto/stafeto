@@ -139,7 +139,10 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
         channel::send(thread, via, desc, values)
     });
     match sent {
-        Ok(Some(receiver)) => thread::run(receiver),
+        Ok(Some(receiver)) => {
+            crate::obj::leave();
+            thread::run(receiver)
+        }
         Ok(None) => {}
         Err(e) => set_result(thread, Err(e)),
     }

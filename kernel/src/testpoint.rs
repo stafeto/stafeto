@@ -107,22 +107,27 @@ mod points {
     use core::ptr::NonNull;
 
     pub fn portion_done() {
+        let _test = crate::obj::test_scope();
         el0::portion_done();
     }
 
     pub fn quota_stage(with_children: bool) {
+        let _test = crate::obj::test_scope();
         ktest::quota_stage(with_children);
     }
 
     pub fn heads_taken(level: u8, heads: usize) {
+        let _test = crate::obj::test_scope();
         el0::heads_taken(level, heads);
     }
 
     pub fn timer_fired() {
+        let _test = crate::obj::test_scope();
         el0::timer_fired();
     }
 
     pub fn idle() {
+        let _test = crate::obj::test_scope();
         el0::note_idle_stack();
     }
 
@@ -131,12 +136,19 @@ mod points {
     }
 
     pub fn test_call(thread: NonNull<Thread>, number: u16) -> bool {
+        let _test = crate::obj::test_scope();
         abi::TEST_CALLS.contains(&number) && el0::syscall(thread, number)
     }
 
     /// The running test judges init's end, and the tests go on: this never
     /// returns.
     pub fn init_ended() {
+        // Init ended in a section of the kernel, which the tests never
+        // return to.
+        if crate::obj::held() {
+            crate::obj::leave();
+        }
+        let _test = crate::obj::test_scope();
         el0::init_ended()
     }
 

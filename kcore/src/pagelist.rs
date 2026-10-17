@@ -22,7 +22,7 @@ pub const MAX_PAGES: usize = ENTRIES * ENTRIES;
 /// Frames, pages or nodes, one step of a release gives back at most; each
 /// may merge up to crate::frames::MAX_ORDER times in the frame allocator,
 /// two units of work of a portion (spec 7.7).
-pub const RELEASE_STEP: usize = 32;
+pub const RELEASE_STEP: usize = 28;
 
 /// Frames for the pages and nodes of a list, whose words the list reads
 /// and writes through PhysMem. Reading a page's frame needs PhysMem alone

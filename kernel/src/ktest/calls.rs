@@ -5378,6 +5378,37 @@ pub fn released_binding_masks_and_frees_its_line(_: &Boot) -> Result<(), &'stati
     })
 }
 
+/// The table of lines is read without a lock, so a binding that its last
+/// handle unbound keeps its memory until every CPU passed a quiescent point
+/// (qsbr): the cleanup portion that retires it leaves it in its pool and
+/// intact, and the point gives the place back.
+pub fn unbound_binding_waits_for_a_quiescent_period(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, _, b| {
+        let bindings = irq::in_use();
+        c.close(b)?;
+        check(
+            irq::bound(LINE).is_none(),
+            "the line still names the binding",
+        )?;
+        while cleanup::len() > 0 {
+            cleanup::portion();
+        }
+        check(
+            crate::qsbr::pending(),
+            "the portion did not retire the binding",
+        )?;
+        check(
+            irq::in_use() == bindings,
+            "the binding went before a quiescent point",
+        )?;
+        crate::qsbr::quiesce();
+        check(
+            irq::in_use() == bindings - 1 && !crate::qsbr::pending(),
+            "the quiescent point did not free the binding",
+        )
+    })
+}
+
 /// A notification in the channel's queue does not hold the line (spec
 /// 9, 13.4): with the slot of a delivery queued, the last handle to the
 /// binding masks the line and frees it, and irq_bind of it succeeds while

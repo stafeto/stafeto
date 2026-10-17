@@ -469,7 +469,7 @@ pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
     t.fp.fpcr = word(100);
     t.fp.fpsr = word(101);
     user::load_fp(&t.fp);
-    sched::locked(|_| t.upcall.returned()).expect("validated upcall return");
+    t.upcall.returned().expect("validated upcall return");
     Ok(())
 }
 
@@ -861,18 +861,16 @@ pub fn current() -> Option<NonNull<Thread>> {
     NonNull::new(user::current().cast())
 }
 
-/// The entry of the thread's handler, if one comes now, under the
-/// scheduler's lock: the entry address and the stack pointer it starts with.
-#[cold]
-#[inline(never)]
+/// The entry of the thread's handler, if one comes now: the entry address
+/// and the stack pointer it starts with. The state of the entry is the
+/// thread's own, changed by the CPU that runs it with no lock (syscall::upcall).
+#[inline(always)]
 fn prepare_entry(thread: &mut Thread) -> Option<(u64, u64)> {
-    sched::locked(|_| {
-        let long = thread.long.is_some();
-        thread
-            .upcall
-            .prepare(thread.regs.elr, thread.regs.spsr, thread.regs.sp, long)
-            .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
-    })
+    let long = thread.long.is_some();
+    thread
+        .upcall
+        .prepare(thread.regs.elr, thread.regs.spsr, thread.regs.sp, long)
+        .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
 }
 
 /// Runs `next` at EL0. A switch from another thread saves that one's FP

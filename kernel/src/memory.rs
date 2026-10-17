@@ -537,6 +537,7 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
         paid.used() == 0,
         "a memory object goes with frames charged to it"
     );
+    let _section = crate::obj::lock();
     // SAFETY: nothing uses the object afterwards; the payer's pool is
     // there, since the object holds the payer's shell.
     unsafe {

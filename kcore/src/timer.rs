@@ -397,7 +397,9 @@ pub struct Levels<T> {
 
 /// The value of `Levels::nearest` when no level has a deadline to wait for;
 /// no counter reaches it.
-const NO_DEADLINE: u64 = u64::MAX;
+/// A deadline is stored as its complement, so that no deadline is 0 and a
+/// `Levels` of zeros lives in .bss.
+const NO_DEADLINE: u64 = 0;
 
 impl<T: HeapNode> Levels<T> {
     pub const fn new() -> Self {
@@ -411,7 +413,7 @@ impl<T: HeapNode> Levels<T> {
 
     fn set_nearest(&mut self, nearest: Option<u64>) {
         self.nearest
-            .store(nearest.unwrap_or(NO_DEADLINE), Ordering::Relaxed);
+            .store(nearest.map_or(NO_DEADLINE, |n| !n), Ordering::Relaxed);
     }
 
     fn heap(&mut self, level: u8) -> &mut Heap<T> {
@@ -436,7 +438,7 @@ impl<T: HeapNode> Levels<T> {
     pub unsafe fn nearest_unlocked(this: *const Self) -> Option<u64> {
         // SAFETY: the caller's promise; no reference to the other fields.
         let n = unsafe { (*this).nearest.load(Ordering::Relaxed) };
-        (n != NO_DEADLINE).then_some(n)
+        (n != NO_DEADLINE).then_some(!n)
     }
 
     /// Whether the firing of `level` is queued: from `expired` until

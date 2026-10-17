@@ -13,21 +13,20 @@
 
 use crate::arch::timer;
 use crate::console;
+use crate::local::local;
 use crate::thread::{self, Thread};
 use abi::{LOG_KERNEL_KIND, LOG_RECORD, LOG_TEXT_KIND, LogBatch};
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use kcore::log::{Chunks, Ring};
-use kcore::sync::Lock;
+use kcore::log::Chunks;
+pub use kcore::log::Ring;
 
 /// The records of the ring: 64 of 80 bytes, 5 120 bytes of .bss.
 #[cfg(not(feature = "trace"))]
-const LOG_RECORDS: usize = 64;
+pub const LOG_RECORDS: usize = 64;
 #[cfg(feature = "trace")]
-const LOG_RECORDS: usize = 256;
-
-static RING: Lock<Ring<LOG_RECORDS>> = Lock::new(Ring::new());
+pub const LOG_RECORDS: usize = 256;
 
 /// Writes a record of `kind` with `bytes`, 1 to abi::LOG_TEXT of them, at
 /// the counter's time now: to the port as well, and shown, while the
@@ -39,7 +38,7 @@ fn record(kind: u8, bytes: &[u8]) {
     if shown {
         console::write_bytes(bytes);
     }
-    RING.lock().push(time, kind, bytes, shown);
+    local().ring.lock().push(time, kind, bytes, shown);
 }
 
 /// The bytes of a debug_write, up to abi::LOG_TEXT, as one record of
@@ -73,20 +72,23 @@ pub fn line(args: fmt::Arguments<'_>) {
 /// them. A thread that makes calls has its buffer. O(64): the ring and a
 /// copy of up to 960 bytes.
 pub fn take(t: NonNull<Thread>) -> LogBatch {
-    RING.lock()
+    local()
+        .ring
+        .lock()
         .take(|i, r| thread::write_words(t, i * LOG_RECORD, &r.words()))
 }
 
 /// Non-destructive read from `first`, also returning the next sequence.
 pub fn peek(t: NonNull<Thread>, first: u64) -> (LogBatch, u64) {
-    RING.lock().peek(first, |i, r| {
+    local().ring.lock().peek(first, |i, r| {
         thread::write_words(t, i * LOG_RECORD, &r.words())
     })
 }
 
 #[cfg(feature = "trace")]
 fn event(kind: u8, args: fmt::Arguments<'_>) {
-    let mut chunks = Chunks::new(|piece: &[u8]| RING.lock().push(timer::now(), kind, piece, false));
+    let mut chunks =
+        Chunks::new(|piece: &[u8]| local().ring.lock().push(timer::now(), kind, piece, false));
     let _ = chunks.write_fmt(args);
     chunks.finish();
 }
@@ -112,7 +114,7 @@ pub fn interrupt(line: u32) {
 /// What the kernel said before it had its port goes out on the port, in
 /// its order, and counts as shown (console::set_port, spec 3.2). O(64).
 pub fn show_early() {
-    RING.lock().show(|r| console::write_bytes(r.text()));
+    local().ring.lock().show(|r| console::write_bytes(r.text()));
 }
 
 /// The panic shows what nobody showed or took, oldest first, on the port
@@ -126,7 +128,7 @@ pub fn show_unshown() {
     }
     // SAFETY: the panic runs alone and never returns to a holder of the
     // lock; see above.
-    let ring = unsafe { &*RING.as_ptr() };
+    let ring = unsafe { &*local().ring.as_ptr() };
     for r in ring.unshown() {
         console::write_bytes(r.text());
     }

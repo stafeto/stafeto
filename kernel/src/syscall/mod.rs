@@ -60,6 +60,16 @@ use upcall::{
     thread_upcall_bind, thread_upcall_control, thread_upcall_request, thread_upcall_return,
 };
 
+/// Runs a call that reaches objects in a section under OBJ (obj.rs), as a
+/// block, not a closure: the section's lock and unlock lie in the arm of
+/// the call.
+macro_rules! objects {
+    ($call:expr) => {{
+        let _section = crate::obj::enter();
+        $call
+    }};
+}
+
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];
 
@@ -171,6 +181,7 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         // SAFETY: the single-core dispatch owns this state until it exits.
         unsafe { (*CALL_TIMING.0.get()).0 = clock::now() };
     }
+    crate::obj::serving(u64::from(number));
     dispatch_inner(thread, number);
     record_call(number);
 }
@@ -187,44 +198,54 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
     // Word by word: a copy of the slice would be a call of `memcpy`.
     let args: Args = [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]];
     let result = match Call::from_number(number) {
-        Some(Call::HandleClose) => handle_close(thread, &args),
-        Some(Call::HandleDuplicate) => handle_duplicate(thread, &args),
-        Some(Call::CreateChannel) => channel_create(thread, &args),
-        Some(Call::Send) => return send(thread, &args),
-        Some(Call::Receive) => return receive(thread, &args),
-        Some(Call::Reply) => reply(thread, &args),
-        Some(Call::Notify) => notify(thread, &args),
+        Some(Call::HandleClose) => objects!(handle_close(thread, &args)),
+        Some(Call::HandleDuplicate) => objects!(handle_duplicate(thread, &args)),
+        Some(Call::CreateChannel) => objects!(channel_create(thread, &args)),
+        Some(Call::Send) => return objects!(send(thread, &args)),
+        Some(Call::Receive) => return objects!(receive(thread, &args)),
+        Some(Call::Reply) => objects!(reply(thread, &args)),
+        Some(Call::Notify) => objects!(notify(thread, &args)),
         Some(Call::MemCreate) => return mem_create(thread, &args),
         Some(Call::MemMap) => return change(thread, &args, mem_map),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
-        Some(Call::ProcessCreate) => process_create(thread, &args),
-        Some(Call::ProcessKill) => process_kill(thread, &args),
-        Some(Call::ProcessControl) => process_control(thread, &args),
-        Some(Call::ProcessExit) => process_exit(thread, &args),
-        Some(Call::ThreadCreate) => thread_create(thread, &args),
-        Some(Call::ThreadStart) => thread_start(thread, &args),
-        Some(Call::ThreadExit) => thread_exit(thread),
-        Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
-        Some(Call::ThreadInterrupt) => thread_interrupt(thread, &args),
+        Some(Call::ProcessCreate) => objects!(process_create(thread, &args)),
+        Some(Call::ProcessKill) => objects!(process_kill(thread, &args)),
+        Some(Call::ProcessControl) => objects!(process_control(thread, &args)),
+        Some(Call::ProcessExit) => objects!(process_exit(thread, &args)),
+        Some(Call::ThreadCreate) => objects!(thread_create(thread, &args)),
+        Some(Call::ThreadStart) => objects!(thread_start(thread, &args)),
+        Some(Call::ThreadExit) => objects!(thread_exit(thread)),
+        Some(Call::ThreadSetPriority) => objects!(thread_set_priority(thread, &args)),
+        Some(Call::ThreadInterrupt) => objects!(thread_interrupt(thread, &args)),
         Some(Call::ThreadUpcallBind) => thread_upcall_bind(thread, &args),
         Some(Call::ThreadUpcallControl) => thread_upcall_control(thread, &args),
-        Some(Call::ThreadUpcallRequest) => thread_upcall_request(thread, &args),
+        Some(Call::ThreadUpcallRequest) => objects!(thread_upcall_request(thread, &args)),
         Some(Call::ThreadUpcallReturn) => return thread_upcall_return(thread),
         Some(Call::Yield) => yield_now(),
-        Some(Call::DeviceWindowCreate) => device_window_create(thread, &args),
-        Some(Call::IrqBind) => irq_bind(thread, &args),
-        Some(Call::IrqAck) => irq_ack(thread, &args),
+        Some(Call::DeviceWindowCreate) => objects!(device_window_create(thread, &args)),
+        Some(Call::IrqBind) => objects!(irq_bind(thread, &args)),
+        Some(Call::IrqAck) => objects!(irq_ack(thread, &args)),
         Some(Call::ClockNow) => clock_now(),
-        Some(Call::TimerCreate) => timer_create(thread, &args),
-        Some(Call::TimerSet) => timer_set(thread, &args),
-        Some(Call::TimerCancel) => timer_cancel(thread, &args),
-        Some(Call::ObjectInfo) => object_info(thread, &args),
-        Some(Call::DebugWrite) => debug_write(thread, &args),
+        Some(Call::TimerCreate) => objects!(timer_create(thread, &args)),
+        Some(Call::TimerSet) => objects!(timer_set(thread, &args)),
+        Some(Call::TimerCancel) => objects!(timer_cancel(thread, &args)),
+        Some(Call::ObjectInfo) => objects!(object_info(thread, &args)),
+        Some(Call::DebugWrite) => objects!(debug_write(thread, &args)),
         // Numbers no call has, and those of calls that come later.
         _ => return set_result(thread, Err(Error::InvalidArgs)),
     };
     set_result(thread, result);
+}
+
+/// Runs a call that reaches objects in a section under OBJ (obj.rs): the
+/// handle tables, channels, processes and memory its checks and changes
+/// read and link. A call that leaves for another thread or the way out
+/// ends the section itself (`obj::leave`).
+#[inline(always)]
+fn objects<R>(call: impl FnOnce() -> R) -> R {
+    let _section = crate::obj::enter();
+    call()
 }
 
 /// Writes a call's result into the thread's registers: 0 and the values

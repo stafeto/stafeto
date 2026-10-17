@@ -24,13 +24,13 @@
 
 use crate::arch::{self, gic, timer};
 use crate::channel::{self, Wait};
+use crate::local::local;
 use crate::thread::{self, THREADS, Thread};
 use crate::{cleanup, syscall};
 use abi::{Error, Policy};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
-use kcore::sync::Lock;
 use kcore::time::Clock;
 use kcore::token::Table;
 
@@ -38,7 +38,7 @@ use kcore::token::Table;
 /// bytes.
 pub type Tokens = Table<Thread, THREADS>;
 
-struct Sched {
+pub(crate) struct Sched {
     s: Scheduler<Thread>,
     /// The deadline the timer holds.
     armed: Armed,
@@ -50,41 +50,41 @@ struct Sched {
     /// The deadline of the timer interrupt that came last, and whether it
     /// woke the kernel from `wfi`, until a thread runs after it or the
     /// kernel sleeps again.
-    fired: Option<(u64, bool)>,
+    /// The deadline, never 0, and whether it woke the kernel: 0 is none,
+    /// all zeros, which keeps a CPU's data in .bss (an `Option` of a pair
+    /// with a `bool` would not be zeros).
+    fired: (u64, bool),
     /// The longest time from a deadline to the thread run after its
     /// interrupt, in ticks: after `wfi`, and otherwise.
     idle_latency: u64,
     irq_latency: u64,
 }
 
-/// The quantum is 0 until `init` knows the counter's frequency.
-static SCHED: Lock<Sched> = Lock::new(Sched {
-    s: Scheduler::new(0),
-    armed: Armed::new(),
-    idle: 0,
-    waking: false,
-    fired: None,
-    idle_latency: 0,
-    irq_latency: 0,
-});
+impl Sched {
+    /// The quantum is 0 until `init` knows the counter's frequency.
+    pub(crate) const fn new() -> Sched {
+        Sched {
+            s: Scheduler::new(0),
+            armed: Armed::new(),
+            idle: 0,
+            waking: false,
+            fired: (0, false),
+            idle_latency: 0,
+            irq_latency: 0,
+        }
+    }
+}
 
-/// EL0 entry timing on the single core. Interrupts stay masked from the
-/// exception vector through the first poll: in `exit_loop`, or between two
-/// portions of a long call (`entry_polled`).
-struct EntryTiming(UnsafeCell<(u64, u64)>);
-
-// SAFETY: the kernel runs on one core, and the entry-to-poll interval has
-// interrupts masked. No other context can access this state concurrently.
-unsafe impl Sync for EntryTiming {}
-
-static ENTRY_TIMING: EntryTiming = EntryTiming(UnsafeCell::new((0, 0)));
-
+/// Starts the timing of an entry from EL0, which the CPU keeps for itself
+/// (`Local::entry`): interrupts stay masked from the exception vector
+/// through the first poll, in `exit_loop` or between two portions of a long
+/// call (`entry_polled`).
 #[inline(always)]
 pub fn entry_started() -> u64 {
     // The exception entry synchronized: no ISB before the read.
     let now = timer::now_unordered();
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { (*ENTRY_TIMING.0.get()).0 = now };
+    unsafe { (*local().entry.get()).0 = now };
     now
 }
 
@@ -93,7 +93,7 @@ pub fn entry_started() -> u64 {
 #[inline(always)]
 pub fn entry_polled() {
     // SAFETY: single core with interrupts masked, as above.
-    if unsafe { (*ENTRY_TIMING.0.get()).0 } != 0 {
+    if unsafe { (*local().entry.get()).0 } != 0 {
         entry_polled_at(timer::now());
     }
 }
@@ -104,7 +104,7 @@ pub fn entry_polled() {
 #[inline(always)]
 fn entry_polled_at(now: u64) {
     // SAFETY: single core with interrupts masked, as above.
-    let timing = unsafe { &mut *ENTRY_TIMING.0.get() };
+    let timing = unsafe { &mut *local().entry.get() };
     if timing.0 != 0 {
         // The counter never runs backwards: `now` was read after the entry's.
         let elapsed = now.wrapping_sub(timing.0);
@@ -117,14 +117,14 @@ fn entry_polled_at(now: u64) {
 
 pub fn longest_entry_to_poll() -> u64 {
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { (*ENTRY_TIMING.0.get()).1 }
+    unsafe { (*local().entry.get()).1 }
 }
 
 /// Whether an entry started and has not polled yet.
 #[cfg(feature = "ktest")]
 pub fn entry_unpolled() -> bool {
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { (*ENTRY_TIMING.0.get()).0 != 0 }
+    unsafe { (*local().entry.get()).0 != 0 }
 }
 
 /// The start of the open entry interval, 0 when it has polled, and the
@@ -132,14 +132,14 @@ pub fn entry_unpolled() -> bool {
 #[cfg(feature = "ktest")]
 pub fn entry_timing() -> (u64, u64) {
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { *ENTRY_TIMING.0.get() }
+    unsafe { *local().entry.get() }
 }
 
 /// Puts `timing` back, as `entry_timing` read it.
 #[cfg(feature = "ktest")]
 pub fn set_entry_timing(timing: (u64, u64)) {
     // SAFETY: single core with interrupts masked, as above.
-    unsafe { *ENTRY_TIMING.0.get() = timing };
+    unsafe { *local().entry.get() = timing };
 }
 
 /// The table of thread numbers, which the scheduler's lock guards: only
@@ -170,7 +170,7 @@ pub struct Stats {
 
 /// The scheduler's counters for KSTATS.
 pub fn stats() -> Stats {
-    let g = SCHED.lock();
+    let g = local().sched.lock();
     Stats {
         idle: g.idle,
         idle_latency: g.idle_latency,
@@ -195,7 +195,8 @@ impl Timer for VirtualTimer {
 /// 250 000 at QEMU's 62.5 MHz, 96 000 at the A64's 24 MHz. Runs at boot,
 /// before any thread starts.
 pub fn init(clock: Clock) {
-    SCHED
+    local()
+        .sched
         .lock()
         .s
         .set_quantum(clock.ns_to_ticks(abi::RR_QUANTUM_NS));
@@ -208,7 +209,7 @@ pub fn init(clock: Clock) {
 pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to `t`; the one taken below keeps
     // it alive, and a pool object never moves, until `exit`.
-    unsafe { SCHED.lock().s.start(t)? };
+    unsafe { local().sched.lock().s.start(t)? };
     thread::retain(t);
     Ok(())
 }
@@ -256,7 +257,7 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
 /// The thread on the CPU: the one whose call or fault the kernel serves
 /// now; None while the kernel runs a portion of cleanup or idles.
 pub fn running() -> Option<NonNull<Thread>> {
-    SCHED.lock().s.running()
+    local().sched.lock().s.running()
 }
 
 /// Interrupt only an existing send or receive. The thread remains alive,
@@ -348,7 +349,7 @@ unsafe fn interrupt_if(
 /// when it is alone there. Lower levels never run through yield.
 pub fn yield_running() {
     // SAFETY: the scheduler's threads are alive (`start`).
-    unsafe { SCHED.lock().s.yield_running(timer::now()) };
+    unsafe { local().sched.lock().s.yield_running(timer::now()) };
 }
 
 /// thread_set_priority: `priority` (1-63) becomes the base priority of
@@ -396,7 +397,8 @@ pub struct Locked<'a> {
 /// thread numbers, so the code that changes them, with the threads'
 /// states, runs here.
 pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
-    let mut g = SCHED.lock();
+    crate::obj::assert_held();
+    let mut g = local().sched.lock();
     // SAFETY: the guard of the scheduler's lock lives until `f` returns,
     // so this is the only reference to the table (TOKENS).
     let tokens = unsafe { &mut *TOKENS.0.get() };
@@ -422,12 +424,13 @@ pub fn hand_off(
     meet: impl FnOnce(&mut Locked<'_>, u64) -> Option<NonNull<Thread>>,
 ) -> Option<NonNull<Thread>> {
     let now = timer::now();
-    let mut g = SCHED.lock();
+    crate::obj::assert_held();
+    let mut g = local().sched.lock();
     let g = &mut *g;
     // The decision that ran the caller took the deadline that fired, and
     // no interrupt came since: its latency needs no more.
     #[cfg(feature = "ktest")]
-    assert!(g.fired.is_none(), "a fired deadline waits at the fast path");
+    assert!(g.fired.0 == 0, "a fired deadline waits at the fast path");
     // SAFETY: as in `locked`.
     let tokens = unsafe { &mut *TOKENS.0.get() };
     let r = meet(
@@ -457,9 +460,9 @@ pub fn hand_off(
 pub fn timer_fired() {
     let now = timer::now();
     {
-        let mut g = SCHED.lock();
+        let mut g = local().sched.lock();
         let g = &mut *g;
-        g.fired = Some((timer::cval(), g.waking));
+        g.fired = (timer::cval().max(1), g.waking);
         // The line must drop before the EOI whatever `armed` remembers: the
         // hardware said the timer is on.
         VirtualTimer.disarm();
@@ -475,6 +478,7 @@ pub fn timer_fired() {
 /// depends on how deep the caller was. The caller's stack holds nothing
 /// with a `Drop`: it is abandoned.
 pub fn resume() -> ! {
+    crate::obj::end_test_scope();
     arch::on_empty_stack(exit_loop)
 }
 
@@ -502,7 +506,15 @@ extern "C" fn exit_loop() -> ! {
             // first. Deciding again costs nothing: the running thread went
             // to the head of its level already.
             Some(Decision::Clean) if arch::irq_pending() => {}
-            Some(Decision::Clean) => cleanup::portion(),
+            Some(Decision::Clean) => {
+                cleanup::portion();
+                // The kernel stack is empty again: a quiescent point, where
+                // what the portion retired may go (qsbr). The way to EL0 is
+                // one too, for the objects another CPU retires (stage 4).
+                if crate::qsbr::pending() {
+                    crate::qsbr::quiesce();
+                }
+            }
             Some(Decision::Idle) => sleep(),
             None => {}
         }
@@ -526,11 +538,16 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
     let next_timer = crate::timer::first();
     #[cfg(not(feature = "locked-decide"))]
     let next_timer = crate::timer::first_for_decide();
-    let mut g = SCHED.lock();
+    let mut g = local().sched.lock();
     let g = &mut *g;
     // SAFETY: the scheduler's threads are alive.
     let decision = unsafe { g.s.pick(now, cleanup) };
-    if let Decision::Run(t) = decision {
+    if let Decision::Run(t) = decision
+        && crate::process::gated_thread(t)
+    {
+        // A gated process parks its thread: the parked list is a link.
+        crate::obj::serving(crate::obj::ENTRY_PARK);
+        let _obj = crate::obj::lock();
         let mut k = Locked {
             s: &mut g.s,
             // SAFETY: the scheduler lock guards the table.
@@ -541,8 +558,9 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
         }
     }
     if let Decision::Run(_) = decision
-        && let Some((deadline, woke)) = g.fired.take()
+        && g.fired.0 != 0
     {
+        let (deadline, woke) = core::mem::take(&mut g.fired);
         let latency = now.saturating_sub(deadline);
         let max = if woke {
             &mut g.idle_latency
@@ -554,7 +572,7 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
     if let Decision::Idle = decision {
         // Nothing runs after the interrupt: the sleep that follows is no
         // part of its latency.
-        g.fired = None;
+        g.fired = (0, false);
     }
     let deadline = g.s.deadline(next_timer);
     g.armed.set(&mut VirtualTimer, deadline);
@@ -566,23 +584,25 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
 fn sleep() {
     crate::testpoint::idle();
     let slept = timer::now();
+    crate::qsbr::idle();
     let ack = gic::wait();
+    crate::qsbr::awake();
     let woke = timer::now();
     {
-        let mut g = SCHED.lock();
+        let mut g = local().sched.lock();
         g.idle += woke.saturating_sub(slept);
         g.waking = true;
     }
     if let Some(ack) = ack {
         crate::interrupt::handle(ack);
     }
-    SCHED.lock().waking = false;
+    local().sched.lock().waking = false;
 }
 
 /// The ready thread that runs next at `level`.
 #[cfg(feature = "ktest")]
 pub fn first(level: u8) -> Option<NonNull<Thread>> {
-    SCHED.lock().s.ready().first(level)
+    local().sched.lock().s.ready().first(level)
 }
 
 /// What the scheduler holds now (test builds).
@@ -601,7 +621,7 @@ pub struct View {
 /// The scheduler's `View` now (test builds).
 #[cfg(feature = "ktest")]
 pub fn view() -> View {
-    let g = SCHED.lock();
+    let g = local().sched.lock();
     View {
         running: g.s.running(),
         ready: g.s.ready().top().and_then(|l| g.s.ready().first(l)),
@@ -613,7 +633,7 @@ pub fn view() -> View {
 /// Forgets the longest latencies, so that a test measures its own.
 #[cfg(feature = "ktest")]
 pub fn reset_latencies() {
-    let mut g = SCHED.lock();
+    let mut g = local().sched.lock();
     g.idle_latency = 0;
     g.irq_latency = 0;
 }

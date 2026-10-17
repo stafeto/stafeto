@@ -191,6 +191,8 @@ extern "C" fn secondary_main(block: &'static CpuBlock) -> ! {
         .store(registers::current_el() as u32, Ordering::Relaxed);
     block.timer_ok.store(timer_ok as u32, Ordering::Relaxed);
     block.state.store(UP, Ordering::Release);
+    // This CPU only serves SGIs: no period of reclamation waits for it.
+    crate::qsbr::park_cpu(block.index());
     loop {
         if let Some(ack) = gic::wait() {
             handle(ack);

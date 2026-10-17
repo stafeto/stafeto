@@ -27,12 +27,15 @@ mod interrupt;
 mod irq;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod local;
 mod memory;
 mod mm;
+mod obj;
 mod object;
 mod panicking;
 mod process;
 mod psci;
+mod qsbr;
 mod sched;
 mod session;
 mod smp;

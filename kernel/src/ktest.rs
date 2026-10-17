@@ -586,6 +586,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::released_binding_masks_and_frees_its_line,
     ),
     (
+        "unbound_binding_waits_for_a_quiescent_period",
+        calls::unbound_binding_waits_for_a_quiescent_period,
+    ),
+    (
         "queued_notice_does_not_hold_the_line",
         calls::queued_notice_does_not_hold_the_line,
     ),
@@ -643,6 +647,9 @@ const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 8 } else { 0 };
 /// and xtask runs both for each kind of build (`Variant::el0_half`).
 #[cfg(feature = "el0-half")]
 pub fn run(_: &Boot) -> ! {
+    // The EL0 tests come through the kernel's entries alone (obj.rs).
+    crate::obj::strict();
+    let _test = crate::obj::test_scope();
     el0::run()
 }
 
@@ -723,6 +730,16 @@ fn finish() -> ! {
             kprintln!("call maximum ticks: {number}=not measured");
         } else {
             kprintln!("call maximum ticks: {number}={ticks}");
+        }
+    }
+    #[cfg(feature = "measure")]
+    {
+        let (longest, serving) = crate::obj::longest_hold();
+        kprintln!("obj hold ticks: longest={longest} serving={serving}");
+        for (kind, held) in crate::obj::holds_by_kind().iter().enumerate() {
+            if *held != 0 {
+                kprintln!("obj hold kind ticks: {kind}={held}");
+            }
         }
     }
     kprintln!("TESTS DONE total={total} failed={failed}");

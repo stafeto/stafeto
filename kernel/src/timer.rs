@@ -29,13 +29,14 @@
 use crate::arch::timer as clock;
 use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item, Work};
+use crate::local::local;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{Error, MAX_SYSTEM_TIMERS};
-use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use kcore::sync::{Budget, Lock};
-use kcore::timer::{Firing, HeapLink, HeapNode, LEVELS, Levels};
+use kcore::sync::Budget;
+pub(crate) use kcore::timer::LEVELS;
+use kcore::timer::{Firing, HeapLink, HeapNode, Levels};
 
 /// The bits of an expiry (spec 6.5): bit 0, once.
 const TIMER_BITS: u64 = 1;
@@ -73,34 +74,29 @@ unsafe impl HeapNode for Timer {
 
 /// The armed timers of the system by level, and the longest portion of
 /// firings so far in ticks, for KSTATS.
-struct Timers {
+pub(crate) struct Timers {
     levels: Levels<Timer>,
     longest_firing: u64,
 }
 
-static TIMERS: Lock<Timers> = Lock::new(Timers {
-    levels: Levels::new(),
-    longest_firing: 0,
-});
+impl Timers {
+    pub(crate) const fn new() -> Timers {
+        Timers {
+            levels: Levels::new(),
+            longest_firing: 0,
+        }
+    }
+}
 
-/// The items of the cleanup queue for the firings of levels 1-63, the
-/// first for level 1. The item of a level is queued from the interrupt
-/// that found its top expired until its last portion settles it: while
-/// the level is pending (kcore::timer::Levels::expired).
-struct Firings([UnsafeCell<Item>; LEVELS]);
-
-// SAFETY: an item is reached only through the cleanup queue, under its
-// lock, and by `expire` and `fire`, which queue it only while the level is
-// not pending and from its own portion.
-unsafe impl Sync for Firings {}
-
-static FIRINGS: Firings = Firings([const { UnsafeCell::new(Item::new()) }; LEVELS]);
-
-/// The item of the firings of `level`.
+/// The item of the firings of `level` (1-63) in this CPU's cleanup queue
+/// (`Local::firings`): queued from the interrupt that found the level's top
+/// expired until its last portion settles it, while the level is pending
+/// (kcore::timer::Levels::expired). Only `expire` and `fire` queue it, and
+/// only while the level is not pending and from its own portion.
 fn firing(level: u8) -> NonNull<Item> {
-    let item = &FIRINGS.0[usize::from(level) - 1];
-    // SAFETY: a static is never null.
-    unsafe { NonNull::new_unchecked(item.get()) }
+    let item = &local().firings[usize::from(level) - 1];
+    // SAFETY: a field is never null, and `local::of` made the item.
+    unsafe { NonNull::new_unchecked(item.get().cast()) }
 }
 
 /// Timers whose places have not gone back.
@@ -235,7 +231,7 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
     let now = clock::now();
     let level = level(t);
     {
-        let mut g = TIMERS.lock();
+        let mut g = local().timers.lock();
         // SAFETY: the timer is alive; one in the heap of its level stays in
         // place until it leaves, and its portion takes it out first.
         unsafe {
@@ -261,7 +257,7 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
 /// to 63 comparisons when the top of the level changes.
 pub fn cancel(t: NonNull<Timer>) {
     let level = level(t);
-    let mut g = TIMERS.lock();
+    let mut g = local().timers.lock();
     // SAFETY: the timer is alive and, if linked, in the heap of its level.
     unsafe {
         if (*t.as_ptr()).node.is_linked() {
@@ -273,7 +269,7 @@ pub fn cancel(t: NonNull<Timer>) {
 /// The nearest deadline of the levels whose firing is not queued, in O(1),
 /// for the kernel's timer (sched::decide, spec 8).
 pub fn first() -> Option<u64> {
-    TIMERS.lock().levels.nearest()
+    local().timers.lock().levels.nearest()
 }
 
 /// The nearest deadline during the scheduler's decision, without the
@@ -283,7 +279,7 @@ pub fn first() -> Option<u64> {
 #[cfg(not(feature = "locked-decide"))]
 pub fn first_for_decide() -> Option<u64> {
     // SAFETY: the timers are a static; only the atomic field is read.
-    unsafe { Levels::nearest_unlocked(&raw const (*TIMERS.as_ptr()).levels) }
+    unsafe { Levels::nearest_unlocked(&raw const (*local().timers.as_ptr()).levels) }
 }
 
 /// The kernel's timer interrupt at `now`, before its EOI
@@ -293,7 +289,7 @@ pub fn first_for_decide() -> Option<u64> {
 /// deadline leaves those levels out until their firing settles. Up to 63
 /// levels.
 pub fn expire(now: u64) {
-    let mut due = TIMERS.lock().levels.expired(now);
+    let mut due = local().timers.lock().levels.expired(now);
     while due != 0 {
         let level = due.trailing_zeros() as u8;
         due &= due - 1;
@@ -324,7 +320,7 @@ pub fn fire_at(level: u8, now: u64) {
     let start = clock::now();
     let mut step = Firing::new(level);
     loop {
-        let next = step.next(&mut TIMERS.lock().levels, now);
+        let next = step.next(&mut local().timers.lock().levels, now);
         let Some(t) = next else {
             break;
         };
@@ -335,11 +331,14 @@ pub fn fire_at(level: u8, now: u64) {
             if (*t.as_ptr()).dying {
                 continue;
             }
+            // One section for each post: the heap is this CPU's own.
+            crate::obj::serving(crate::obj::CLEAN_FIRE);
+            let _section = crate::obj::lock();
             let _ = Source::post(source(t), TIMER_BITS, level);
         }
     }
     let more = {
-        let mut g = TIMERS.lock();
+        let mut g = local().timers.lock();
         let more = step.finish(&mut g.levels, now);
         let took = clock::now().saturating_sub(start);
         g.longest_firing = g.longest_firing.max(took);
@@ -354,7 +353,7 @@ pub fn fire_at(level: u8, now: u64) {
 
 /// The longest portion of firings so far in ticks, for KSTATS (spec 16).
 pub fn longest_firing() -> u64 {
-    TIMERS.lock().longest_firing
+    local().timers.lock().longest_firing
 }
 
 /// The portion of a timer nothing refers to (cleanup::portion), at
@@ -370,7 +369,7 @@ pub fn longest_firing() -> u64 {
 pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
     {
         let own = self::level(t);
-        let mut g = TIMERS.lock();
+        let mut g = local().timers.lock();
         // SAFETY: the caller's promise; the timer is in the heap of its
         // level if linked.
         unsafe {
@@ -433,6 +432,6 @@ mod test_access {
     /// Forgets the longest portion of firings, so that a test measures its
     /// own.
     pub fn reset_longest_firing() {
-        TIMERS.lock().longest_firing = 0;
+        local().timers.lock().longest_firing = 0;
     }
 }

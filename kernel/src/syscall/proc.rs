@@ -186,6 +186,7 @@ pub(super) fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
     if own {
         // The caller ended with its process and may be gone.
         record_call(Call::ProcessKill.number());
+        crate::obj::leave();
         sched::resume()
     }
     if !ended {
@@ -204,6 +205,7 @@ pub(super) fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
     // its own reference.
     unsafe { process::end(caller(thread), exited, cause(thread)) };
     record_call(Call::ProcessExit.number());
+    crate::obj::leave();
     sched::resume()
 }
 
@@ -287,6 +289,7 @@ pub(super) fn thread_exit(thread: NonNull<Thread>) -> ! {
     // SAFETY: the running thread made the call and is not used afterwards.
     unsafe { thread::exit(thread) };
     record_call(Call::ThreadExit.number());
+    crate::obj::leave();
     sched::resume()
 }
 
