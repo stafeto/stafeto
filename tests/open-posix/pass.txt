@@ -306,6 +306,7 @@ conformance/interfaces/aio_read/3-2
 conformance/interfaces/aio_read/4-1
 conformance/interfaces/aio_read/5-1
 conformance/interfaces/aio_read/7-1
+conformance/interfaces/aio_read/9-1
 conformance/interfaces/aio_return/1-1
 conformance/interfaces/aio_return/2-1
 conformance/interfaces/aio_return/3-1
@@ -317,6 +318,7 @@ conformance/interfaces/aio_write/1-2
 conformance/interfaces/aio_write/2-1
 conformance/interfaces/aio_write/3-1
 conformance/interfaces/aio_write/5-1
+conformance/interfaces/aio_write/7-1
 conformance/interfaces/aio_write/8-1
 conformance/interfaces/aio_write/8-2
 conformance/interfaces/aio_write/9-1
@@ -841,6 +843,7 @@ conformance/interfaces/pthread_create/14-1
 conformance/interfaces/pthread_create/15-1
 conformance/interfaces/pthread_create/2-1
 conformance/interfaces/pthread_create/3-1
+conformance/interfaces/pthread_create/3-2
 conformance/interfaces/pthread_create/4-1
 conformance/interfaces/pthread_create/5-1
 conformance/interfaces/pthread_create/8-1
@@ -1984,5 +1987,7 @@ functional/timers/timers/twoptimers
 stress/mqueues/multi_send_rev_1
 stress/mqueues/multi_send_rev_2
 stress/signals/sigismember_stress_1
+stress/threads/fork/s-c1
+stress/threads/pthread_create/s-c1
 stress/threads/pthread_mutex_lock/s-c1
 stress/threads/pthread_mutex_lock/s-c2
