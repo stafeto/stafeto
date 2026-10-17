@@ -66,7 +66,13 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # whose deadline lies past a second ends at the deadline (the difference of
 # two times borrowed a second wrongly); clog near the unit circle keeps its
 # digits; tagged pin-5ee37a18.
-COMMIT = "c0bacbccc02a88216a89beb68770ba094b734afa"
+# Goal Z (Open POSIX to 1,720): aio on threads (a queue and a thread a
+# descriptor, cancel, suspend, lio_listio with notices), _POSIX_ASYNCHRONOUS_IO
+# and _POSIX_FSYNC, {AIO_MAX} 128, {MQ_PRIO_MAX}, mq_close takes off the
+# registration, mq_send waits for the notice it fired, mq_notify takes signal
+# 0, timers with SIGEV_THREAD kept by the library, sem_timedwait refuses a
+# time out of range when it would block; tagged pin-ba1f937e.
+COMMIT = "ba1f937e77aaf2f62532f7f9cbb2dad758774edc"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

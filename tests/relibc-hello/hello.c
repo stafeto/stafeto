@@ -373,6 +373,63 @@ static int long_transfers_and_aio(void) {
     return 0;
 }
 
+static volatile int timer_fired;
+static volatile int timer_value;
+static void timer_tell(union sigval value) {
+    timer_value = (int)(intptr_t)value.sival_ptr;
+    timer_fired++;
+}
+
+static int wait_fired(int count) {
+    for (int i = 0; i < 3000 && timer_fired < count; i++) {
+        struct timespec nap = {0, 1000000};
+        nanosleep(&nap, NULL);
+    }
+    return timer_fired >= count;
+}
+
+/* A timer whose notice is a function in a thread: it fires at its period,
+ * stops when disarmed, and takes an absolute time. */
+static int thread_timers(void) {
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_THREAD;
+    event.sigev_notify_function = NULL;
+    timer_t timer;
+    errno = 0;
+    CHECK(timer_create(CLOCK_MONOTONIC, &event, &timer) == -1 && errno == EINVAL);
+    event.sigev_notify_function = timer_tell;
+    event.sigev_value.sival_ptr = (void *)(intptr_t)7;
+    CHECK(timer_create(CLOCK_MONOTONIC, &event, &timer) == 0);
+    struct itimerspec none = {{0, 0}, {0, 0}}, every = {{0, 10000000}, {0, 10000000}}, seen;
+    CHECK(timer_gettime(timer, &seen) == 0 && seen.it_value.tv_sec == 0 && seen.it_value.tv_nsec == 0);
+    struct itimerspec bad = {{0, 0}, {0, 1000000000}};
+    errno = 0;
+    CHECK(timer_settime(timer, 0, &bad, NULL) == -1 && errno == EINVAL);
+    CHECK(timer_settime(timer, 0, &every, NULL) == 0);
+    CHECK(wait_fired(3) && timer_value == 7);
+    CHECK(timer_gettime(timer, &seen) == 0 && seen.it_interval.tv_nsec == 10000000);
+    struct itimerspec old;
+    CHECK(timer_settime(timer, 0, &none, &old) == 0 && old.it_interval.tv_nsec == 10000000);
+    struct timespec nap = {0, 50000000};
+    nanosleep(&nap, NULL);
+    int stopped = timer_fired;
+    nanosleep(&nap, NULL);
+    CHECK(timer_fired == stopped);
+    /* Once, at an absolute time. */
+    struct itimerspec at = {{0, 0}, {0, 0}};
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &at.it_value) == 0);
+    at.it_value.tv_nsec += 20000000;
+    if (at.it_value.tv_nsec >= 1000000000) { at.it_value.tv_sec++; at.it_value.tv_nsec -= 1000000000; }
+    CHECK(timer_settime(timer, TIMER_ABSTIME, &at, NULL) == 0);
+    CHECK(wait_fired(stopped + 1));
+    nanosleep(&nap, NULL);
+    CHECK(timer_fired == stopped + 1 && timer_getoverrun(timer) == 0);
+    CHECK(timer_delete(timer) == 0);
+    printf("relibc-hello: timers with a function in a thread\n");
+    return 0;
+}
+
 /* The ways a C program ends badly: each ends the process with status
  * 134, as SIGABRT would, after a word on fd 2 where there is one. */
 static int end_badly(const char *how) {
@@ -718,6 +775,8 @@ int main(int argc, char **argv) {
     status = memory_streams();
     if (status) return status;
     status = long_transfers_and_aio();
+    if (status) return status;
+    status = thread_timers();
     if (status) return status;
     status = constants();
     if (status) return status;
