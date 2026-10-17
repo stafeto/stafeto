@@ -442,16 +442,23 @@ conformance/interfaces/lio_listio/9-1
 conformance/interfaces/localtime/1-1
 conformance/interfaces/mktime/1-1
 conformance/interfaces/mlock/10-1
+conformance/interfaces/mlock/12-1
 conformance/interfaces/mlock/2-1
 conformance/interfaces/mlock/4-1
+conformance/interfaces/mlock/5-1
 conformance/interfaces/mlock/7-1
 conformance/interfaces/mlock/8-1
+conformance/interfaces/mlock/speculative/12-1
 conformance/interfaces/mlockall/13-1
 conformance/interfaces/mlockall/13-2
+conformance/interfaces/mlockall/15-1
 conformance/interfaces/mlockall/2-1
+conformance/interfaces/mlockall/3-6
+conformance/interfaces/mlockall/3-7
 conformance/interfaces/mlockall/7-1
 conformance/interfaces/mlockall/8-1
 conformance/interfaces/mlockall/9-1
+conformance/interfaces/mlockall/speculative/15-1
 conformance/interfaces/mmap/1-1
 conformance/interfaces/mmap/1-2
 conformance/interfaces/mmap/10-1
@@ -464,6 +471,7 @@ conformance/interfaces/mmap/13-1
 conformance/interfaces/mmap/14-1
 conformance/interfaces/mmap/16-1
 conformance/interfaces/mmap/17-1
+conformance/interfaces/mmap/18-1
 conformance/interfaces/mmap/19-1
 conformance/interfaces/mmap/20-1
 conformance/interfaces/mmap/21-1
@@ -471,13 +479,19 @@ conformance/interfaces/mmap/23-1
 conformance/interfaces/mmap/24-1
 conformance/interfaces/mmap/24-2
 conformance/interfaces/mmap/27-1
+conformance/interfaces/mmap/3-1
 conformance/interfaces/mmap/32-1
+conformance/interfaces/mmap/5-1
+conformance/interfaces/mmap/6-1
+conformance/interfaces/mmap/6-2
+conformance/interfaces/mmap/6-3
 conformance/interfaces/mmap/6-4
 conformance/interfaces/mmap/6-5
 conformance/interfaces/mmap/6-6
 conformance/interfaces/mmap/7-1
 conformance/interfaces/mmap/7-2
 conformance/interfaces/mmap/7-3
+conformance/interfaces/mmap/7-4
 conformance/interfaces/mmap/9-1
 conformance/interfaces/mq_close/1-1
 conformance/interfaces/mq_close/2-1
@@ -528,6 +542,7 @@ conformance/interfaces/mq_open/9-1
 conformance/interfaces/mq_open/9-2
 conformance/interfaces/mq_open/speculative/2-2
 conformance/interfaces/mq_open/speculative/2-3
+conformance/interfaces/mq_open/speculative/26-1
 conformance/interfaces/mq_open/speculative/6-1
 conformance/interfaces/mq_receive/1-1
 conformance/interfaces/mq_receive/10-1
@@ -622,7 +637,9 @@ conformance/interfaces/mq_unlink/speculative/7-2
 conformance/interfaces/munlock/10-1
 conformance/interfaces/munlock/11-1
 conformance/interfaces/munlock/2-1
+conformance/interfaces/munlock/7-1
 conformance/interfaces/munlock/9-1
+conformance/interfaces/munlockall/5-1
 conformance/interfaces/munlockall/6-1
 conformance/interfaces/munmap/1-1
 conformance/interfaces/munmap/1-2
@@ -678,6 +695,7 @@ conformance/interfaces/pthread_attr_init/3-1
 conformance/interfaces/pthread_attr_init/4-1
 conformance/interfaces/pthread_attr_setdetachstate/1-1
 conformance/interfaces/pthread_attr_setdetachstate/1-2
+conformance/interfaces/pthread_attr_setdetachstate/2-1
 conformance/interfaces/pthread_attr_setdetachstate/3-1
 conformance/interfaces/pthread_attr_setdetachstate/4-1
 conformance/interfaces/pthread_attr_setinheritsched/1-1
@@ -817,6 +835,7 @@ conformance/interfaces/pthread_create/1-1
 conformance/interfaces/pthread_create/1-2
 conformance/interfaces/pthread_create/1-3
 conformance/interfaces/pthread_create/1-5
+conformance/interfaces/pthread_create/1-6
 conformance/interfaces/pthread_create/11-1
 conformance/interfaces/pthread_create/12-1
 conformance/interfaces/pthread_create/14-1
@@ -826,9 +845,12 @@ conformance/interfaces/pthread_create/3-1
 conformance/interfaces/pthread_create/4-1
 conformance/interfaces/pthread_create/5-1
 conformance/interfaces/pthread_create/8-1
+conformance/interfaces/pthread_detach/1-1
 conformance/interfaces/pthread_detach/2-1
 conformance/interfaces/pthread_detach/2-2
 conformance/interfaces/pthread_detach/3-1
+conformance/interfaces/pthread_detach/4-1
+conformance/interfaces/pthread_detach/4-2
 conformance/interfaces/pthread_detach/4-3
 conformance/interfaces/pthread_equal/1-1
 conformance/interfaces/pthread_equal/1-2
@@ -857,7 +879,9 @@ conformance/interfaces/pthread_join/2-1
 conformance/interfaces/pthread_join/3-1
 conformance/interfaces/pthread_join/4-1
 conformance/interfaces/pthread_join/5-1
+conformance/interfaces/pthread_join/6-2
 conformance/interfaces/pthread_join/6-3
+conformance/interfaces/pthread_join/speculative/6-1
 conformance/interfaces/pthread_key_create/1-1
 conformance/interfaces/pthread_key_create/1-2
 conformance/interfaces/pthread_key_create/2-1
@@ -975,6 +999,8 @@ conformance/interfaces/pthread_rwlock_init/3-1
 conformance/interfaces/pthread_rwlock_init/4-1
 conformance/interfaces/pthread_rwlock_init/6-1
 conformance/interfaces/pthread_rwlock_rdlock/1-1
+conformance/interfaces/pthread_rwlock_rdlock/2-1
+conformance/interfaces/pthread_rwlock_rdlock/2-2
 conformance/interfaces/pthread_rwlock_rdlock/2-3
 conformance/interfaces/pthread_rwlock_rdlock/4-1
 conformance/interfaces/pthread_rwlock_rdlock/5-1
@@ -983,6 +1009,7 @@ conformance/interfaces/pthread_rwlock_timedrdlock/1-1
 conformance/interfaces/pthread_rwlock_timedrdlock/2-1
 conformance/interfaces/pthread_rwlock_timedrdlock/3-1
 conformance/interfaces/pthread_rwlock_timedrdlock/4-1
+conformance/interfaces/pthread_rwlock_timedrdlock/5-1
 conformance/interfaces/pthread_rwlock_timedrdlock/6-1
 conformance/interfaces/pthread_rwlock_timedrdlock/6-2
 conformance/interfaces/pthread_rwlock_timedrdlock/7-1
@@ -990,6 +1017,7 @@ conformance/interfaces/pthread_rwlock_timedwrlock/1-1
 conformance/interfaces/pthread_rwlock_timedwrlock/2-1
 conformance/interfaces/pthread_rwlock_timedwrlock/3-1
 conformance/interfaces/pthread_rwlock_timedwrlock/4-1
+conformance/interfaces/pthread_rwlock_timedwrlock/5-1
 conformance/interfaces/pthread_rwlock_timedwrlock/6-1
 conformance/interfaces/pthread_rwlock_timedwrlock/6-2
 conformance/interfaces/pthread_rwlock_timedwrlock/7-1
@@ -1004,6 +1032,7 @@ conformance/interfaces/pthread_rwlock_unlock/2-1
 conformance/interfaces/pthread_rwlock_unlock/3-1
 conformance/interfaces/pthread_rwlock_wrlock/1-1
 conformance/interfaces/pthread_rwlock_wrlock/2-1
+conformance/interfaces/pthread_rwlock_wrlock/3-1
 conformance/interfaces/pthread_rwlockattr_destroy/1-1
 conformance/interfaces/pthread_rwlockattr_destroy/2-1
 conformance/interfaces/pthread_rwlockattr_destroy/3-1
@@ -1027,6 +1056,7 @@ conformance/interfaces/pthread_setcanceltype/2-1
 conformance/interfaces/pthread_setschedparam/1-1
 conformance/interfaces/pthread_setschedparam/1-2
 conformance/interfaces/pthread_setschedparam/4-1
+conformance/interfaces/pthread_setschedparam/5-1
 conformance/interfaces/pthread_setschedprio/1-1
 conformance/interfaces/pthread_setspecific/1-1
 conformance/interfaces/pthread_setspecific/1-2
@@ -1104,6 +1134,8 @@ conformance/interfaces/sched_rr_get_interval/3-1
 conformance/interfaces/sched_rr_get_interval/4-1
 conformance/interfaces/sched_rr_get_interval/speculative/5-1
 conformance/interfaces/sched_setparam/11-1
+conformance/interfaces/sched_setparam/2-1
+conformance/interfaces/sched_setparam/2-2
 conformance/interfaces/sched_setparam/22-1
 conformance/interfaces/sched_setparam/23-1
 conformance/interfaces/sched_setparam/23-6
@@ -1149,6 +1181,8 @@ conformance/interfaces/sem_init/3-2
 conformance/interfaces/sem_init/3-3
 conformance/interfaces/sem_init/5-1
 conformance/interfaces/sem_init/5-2
+conformance/interfaces/sem_init/6-1
+conformance/interfaces/sem_init/7-1
 conformance/interfaces/sem_open/1-1
 conformance/interfaces/sem_open/1-2
 conformance/interfaces/sem_open/1-3
@@ -1167,6 +1201,7 @@ conformance/interfaces/sem_post/2-1
 conformance/interfaces/sem_post/4-1
 conformance/interfaces/sem_post/5-1
 conformance/interfaces/sem_post/6-1
+conformance/interfaces/sem_post/8-1
 conformance/interfaces/sem_timedwait/1-1
 conformance/interfaces/sem_timedwait/10-1
 conformance/interfaces/sem_timedwait/11-1
@@ -1182,6 +1217,7 @@ conformance/interfaces/sem_unlink/1-1
 conformance/interfaces/sem_unlink/2-1
 conformance/interfaces/sem_unlink/2-2
 conformance/interfaces/sem_unlink/3-1
+conformance/interfaces/sem_unlink/4-1
 conformance/interfaces/sem_unlink/4-2
 conformance/interfaces/sem_unlink/5-1
 conformance/interfaces/sem_unlink/6-1
@@ -1196,6 +1232,8 @@ conformance/interfaces/sem_wait/3-1
 conformance/interfaces/sem_wait/5-1
 conformance/interfaces/sem_wait/7-1
 conformance/interfaces/shm_open/1-1
+conformance/interfaces/shm_open/11-1
+conformance/interfaces/shm_open/13-1
 conformance/interfaces/shm_open/13-2
 conformance/interfaces/shm_open/14-1
 conformance/interfaces/shm_open/14-2
@@ -1203,6 +1241,7 @@ conformance/interfaces/shm_open/15-1
 conformance/interfaces/shm_open/16-1
 conformance/interfaces/shm_open/17-1
 conformance/interfaces/shm_open/18-1
+conformance/interfaces/shm_open/20-1
 conformance/interfaces/shm_open/20-2
 conformance/interfaces/shm_open/20-3
 conformance/interfaces/shm_open/21-1
@@ -1218,6 +1257,7 @@ conformance/interfaces/shm_open/31-1
 conformance/interfaces/shm_open/32-1
 conformance/interfaces/shm_open/34-1
 conformance/interfaces/shm_open/35-1
+conformance/interfaces/shm_open/37-1
 conformance/interfaces/shm_open/38-1
 conformance/interfaces/shm_open/39-1
 conformance/interfaces/shm_open/39-2
@@ -1236,6 +1276,7 @@ conformance/interfaces/shm_unlink/5-1
 conformance/interfaces/shm_unlink/6-1
 conformance/interfaces/shm_unlink/7-1
 conformance/interfaces/shm_unlink/8-1
+conformance/interfaces/shm_unlink/9-1
 conformance/interfaces/sigaction/1-1
 conformance/interfaces/sigaction/1-10
 conformance/interfaces/sigaction/1-11
@@ -1342,6 +1383,7 @@ conformance/interfaces/sigaction/13-6
 conformance/interfaces/sigaction/13-7
 conformance/interfaces/sigaction/13-8
 conformance/interfaces/sigaction/13-9
+conformance/interfaces/sigaction/16-1
 conformance/interfaces/sigaction/17-1
 conformance/interfaces/sigaction/17-10
 conformance/interfaces/sigaction/17-11
@@ -1940,6 +1982,8 @@ functional/timers/clocks/invaliddates
 functional/timers/clocks/twopsetclock
 functional/timers/timers/twoevtimers
 functional/timers/timers/twoptimers
+stress/mqueues/multi_send_rev_1
+stress/mqueues/multi_send_rev_2
 stress/signals/sigismember_stress_1
 stress/threads/pthread_mutex_lock/s-c1
 stress/threads/pthread_mutex_lock/s-c2

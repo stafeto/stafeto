@@ -80,9 +80,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # timers on CPU-time clocks and ITIMER_VIRTUAL and ITIMER_PROF kept by the
 # library, conditions on a monotonic clock, gettimeofday, strftime, headers
 # (ucontext.h, sys/vfs.h, si_band, SIGPOLL), PTHREAD_KEYS_MAX 1024, the
-# limit of pthread_atfork, sem_wait that a handler interrupts; tagged
-# pin-54be6cdf.
-COMMIT = "21e5dc11f5864de95ea15b925b192252547c3843"
+# limit of pthread_atfork, sem_wait that a handler interrupts, scheduling and
+# memory options, the end of fork, guard pages of stacks; tagged
+# pin-63f13a12.
+COMMIT = "63f13a120bd33d1247e05e0a540ebbbb446bf040"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
