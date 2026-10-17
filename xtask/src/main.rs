@@ -6095,7 +6095,7 @@ fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<
 /// has no size until the host reports its window (the bytes a terminal
 /// of the host would send, window.rs); a report sets the size `stty size`
 /// shows and gives the foreground group SIGWINCH; `resize` asks the terminal
-/// and sets what it answers; `top -b -n 1` lists the shell, and the files of
+/// and sets what it answers; `top -b -n 1` lists the shell (asleep, S, while it waits for top), and the files of
 /// /proc come in the shapes Linux gives them.
 fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     // Before the report the size is unknown, and stty says so.
@@ -6141,7 +6141,7 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     )?;
     run.expect_line(
         "the shell in top",
-        |l| l.split_whitespace().last() == Some("ash") && l.contains('R'),
+        |l| l.split_whitespace().last() == Some("ash") && l.split_whitespace().nth(3) == Some("S"),
         DIALOG_STEP,
     )?;
     run.expect("# ", DIALOG_STEP)?;
@@ -6601,7 +6601,8 @@ fn ash_dialog() -> Result<(), String> {
         dialog_command(
             &mut run,
             "ps -o pid,stat | awk -v p=$! '$1==p {print $2}'",
-            &["R"],
+            // A sleeping process runs no ticks: its state is S.
+            &["S"],
         )?;
         dialog_command(
             &mut run,
