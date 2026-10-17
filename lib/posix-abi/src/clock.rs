@@ -250,7 +250,18 @@ pub fn settime(id: c_int, time: Timespec) -> Result<(), c_int> {
         nanos: time.tv_nsec,
     };
     value.value().map_err(|_| EINVAL)?;
+    // The calendar's lead over the monotonic scale, before and after.
+    let lead = || realtime_anchor().map(|(calendar, mono)| calendar - i128::from(mono));
+    let before = lead();
     client()?
         .set(value, crate::process::identity())
-        .map_err(error)
+        .map_err(error)?;
+    // The timers armed with an absolute time follow the step.
+    if let (Ok(before), Ok(after)) = (before, lead()) {
+        let delta = (after - before).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        if delta != 0 {
+            let _ = crate::timers::clock_step(delta);
+        }
+    }
+    Ok(())
 }

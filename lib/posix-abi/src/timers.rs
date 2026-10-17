@@ -136,7 +136,9 @@ fn arming(clock: i32, flags: i32, new: Spec) -> Result<(u32, u64, u64), i32> {
     }
     let deadline = instant(clock, flags & TIMER_ABSTIME != 0, new.value)?;
     let interval = nanos(new.interval).clamp(0, i128::from(u64::MAX)) as u64;
-    Ok((1, deadline, interval))
+    // An absolute time of CLOCK_REALTIME follows the steps of the calendar.
+    let follows = flags & TIMER_ABSTIME != 0 && clock == crate::clock::CLOCK_REALTIME;
+    Ok((1 | if follows { op::ARMED_REALTIME } else { 0 }, deadline, interval))
 }
 
 /// Arms the timer with `new` (a zero value disarms it); the setting
@@ -173,4 +175,12 @@ pub fn set_alarm(value: u64, interval: u64) -> Result<[u64; 2], i32> {
 pub fn get_alarm() -> Result<[u64; 2], i32> {
     let w = request(proto_process::Method::Timer, &[op::ALARM_GET])?;
     ask_setting(&w)
+}
+
+/// The calendar of CLOCK_REALTIME was set `delta` ns ahead of the monotonic
+/// scale (superuser): the timers armed with an absolute time of it move.
+pub(crate) fn clock_step(delta: i64) -> Result<(), i32> {
+    let mut w = request(proto_process::Method::Timer, &[op::CLOCK_STEP])?;
+    w.u64(delta as u64).map_err(|_| EIO)?;
+    ask(&w).map(drop)
 }

@@ -38,8 +38,10 @@ const BATCH_TESTS: usize = 48;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
 const BATCH_ENTRIES: usize = 900;
 /// The time a conformance test may take (ms), and a functional or stress one.
-const LIMIT_MS: u64 = 10_000;
-const LONG_LIMIT_MS: u64 = 20_000;
+/// Tests of timers and clocks sleep for half a minute in all (timer_settime
+/// 1-2 runs 27 s), so the limit is far above the common case.
+const LIMIT_MS: u64 = 60_000;
+const LONG_LIMIT_MS: u64 = 120_000;
 /// How many times a batch is started again after a hang of the guest.
 const RESTARTS: usize = 8;
 
@@ -61,7 +63,14 @@ pub struct Row {
     pub detail: String,
 }
 
+/// Tests that sleep for minutes by their design: timer_settime 5-3 sets
+/// thirty timers in the past and sleeps 5 s after each.
+const SLOW: [&str; 1] = ["conformance/interfaces/timer_settime/5-3"];
+
 fn limit_of(name: &str) -> u64 {
+    if SLOW.contains(&name) {
+        return 240_000;
+    }
     if name.starts_with("conformance/") {
         LIMIT_MS
     } else {

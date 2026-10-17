@@ -38,7 +38,7 @@ use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
     Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
-    SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart,
+    SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart,
     WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
 use core::sync::atomic::Ordering;
@@ -156,6 +156,9 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 const SLEEP_AFTER_NS: u64 = 2_000_000;
 /// The first real-time signal (relibc's SIGRTMIN).
 const REALTIME_MIN: u8 = 35;
+/// SIGURG and SIGWINCH, the signals ignored by default besides SIGCHLD and SIGCONT.
+const SIGURG: u8 = 23;
+const SIGWINCH: u8 = 28;
 /// The label of the service's own place for the notification that makes
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
@@ -1756,8 +1759,14 @@ impl Processes {
                 value: due.value,
             };
             let posted = self.timer_signal(usize::from(due.owner), due.signal, info);
+            // A signal that is ignored by default and has no handler never
+            // gets taken as a signal: its expirations join the overrun.
+            let unseen = matches!(due.signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+                && self.pages.page(usize::from(due.owner)).is_some_and(|p| {
+                    p.caught.load(Ordering::Acquire) & signals::bit(due.signal) == 0
+                });
             self.timers
-                .account(due.slot, due.count, posted == Posted::Merged);
+                .account(due.slot, due.count, posted == Posted::Merged, unseen);
         }
         let nearest = self.timers.earliest();
         self.timer_arm(nearest);
@@ -1824,7 +1833,8 @@ impl Processes {
                 else {
                     return Answer::Status(Status::BadSize);
                 };
-                let deadline = (armed != 0).then_some(deadline);
+                let real = armed & op::ARMED_REALTIME != 0;
+                let deadline = (armed & 1 != 0).then_some(deadline);
                 let before = if operation == op::SET {
                     self.timers.set(owner, id, deadline, interval, now)
                 } else {
@@ -1832,6 +1842,9 @@ impl Processes {
                 };
                 match before {
                     Ok(before) => {
+                        if real && operation == op::SET {
+                            self.timers.mark_real(owner, id);
+                        }
                         // A nearer deadline arms the kernel's timer at it; a
                         // disarmed or later one leaves a wake-up that finds
                         // nothing due.
@@ -1842,6 +1855,19 @@ impl Processes {
                     }
                     Err(fail) => failed(fail),
                 }
+            }
+            op::CLOCK_STEP => {
+                let (Ok(delta), Ok(())) = (body.u64(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if self.records.get(index).is_none_or(|r| r.credentials.euid != 0) {
+                    return refuse(proto_process::PERMISSION);
+                }
+                self.timers.step(delta as i64, now);
+                self.timer_armed = u64::MAX;
+                let nearest = self.timers.earliest();
+                self.timer_arm(nearest);
+                Answer::Status(Status::Ok)
             }
             op::GET => {
                 let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {
@@ -1872,7 +1898,16 @@ impl Processes {
                 let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                match self.timers.overrun(owner, id) {
+                // The signal of the timer waits on the page: its own count
+                // is not complete, and the one delivered before shows.
+                let waiting = match self.timers.signal_of_id(owner, id) {
+                    Ok(signal) if (1..=SIGNAL_MAX).contains(&signal) => self
+                        .pages
+                        .page(index)
+                        .is_some_and(|p| p.pending.load(Ordering::Acquire) & signals::bit(signal) != 0),
+                    _ => false,
+                };
+                match self.timers.overrun(owner, id, waiting) {
                     Ok(n) => number(r, n),
                     Err(fail) => failed(fail),
                 }

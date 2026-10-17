@@ -6,8 +6,8 @@
 //! EINTR and, for a relative sleep, the time left; bit CANCEL of the channel
 //! or an entry with cancellation requested ends it at its cancellation
 //! point. An absolute deadline on CLOCK_REALTIME becomes a monotonic
-//! instant, checked on the calendar once it passed; a calendar set forward
-//! does not wake the sleep earlier, until the clock patch of relibc.
+//! instant, and the sleep looks at the calendar every 100 ms, so that a
+//! set of the calendar, ahead or back, moves the end of the sleep.
 use super::{cancel, own_block};
 use crate::constants::*;
 use core::sync::atomic::Ordering;
@@ -18,6 +18,10 @@ use rt::handle::{Channel, Handle, Timer};
 use rt::sys;
 
 pub const TIMER_ABSTIME: i32 = 1;
+
+/// How often a sleep on an absolute time of CLOCK_REALTIME looks at the
+/// calendar (ns).
+const CALENDAR_LOOK: u64 = 100_000_000;
 
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
@@ -38,8 +42,9 @@ fn absolute_target(deadline: Deadline) -> Result<u64, i32> {
 /// Whether an absolute deadline passed on its own clock.
 fn absolute_passed(deadline: Deadline) -> Result<bool, i32> {
     if deadline.clock == proto_clock::REALTIME {
-        let (time, _) = crate::clock::realtime_anchor()?;
-        return Ok(deadline.value() <= time);
+        // The calendar now: the anchor's, and the time since it.
+        let (time, mono) = crate::clock::realtime_anchor()?;
+        return Ok(deadline.value() <= time + (i128::from(now()) - i128::from(mono)));
     }
     Ok(deadline.value() <= i128::from(rt::time::ticks_to_ns(rt::time::now())))
 }
@@ -98,7 +103,13 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
     let mut at = target(deadline)?;
+    // An absolute time of CLOCK_REALTIME follows a set of the calendar, ahead
+    // or back, by a look at the anchor every CALENDAR_LOOK.
+    let follows = matches!(deadline, Sleep::Absolute(d) if d.clock == proto_clock::REALTIME);
     let result = loop {
+        if follows {
+            at = target(deadline)?;
+        }
         if rt::time::reached(at) {
             if passed(deadline)? {
                 break Ok(());
@@ -107,12 +118,17 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
             at = target(deadline)?;
             continue;
         }
+        let wake = if follows {
+            at.min(now().saturating_add(CALENDAR_LOOK))
+        } else {
+            at
+        };
         // An entry between the timer and `receive` stays pending and makes
         // `receive` return at once; a handler that sleeps itself cannot
         // take this wait's timer meanwhile.
         let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sleep entry deferral");
-        let _ = sys::timer_set(&timer, at);
+        let _ = sys::timer_set(&timer, wake);
         let got = sys::receive(&channel);
         drop(guard);
         match got {

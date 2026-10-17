@@ -1120,6 +1120,14 @@ pub mod timer_op {
     pub const ALARM_SET: u32 = 6;
     /// -> the setting of the alarm.
     pub const ALARM_GET: u32 = 7;
+    /// delta i64 (ns, two's complement in a u64): the calendar of
+    /// CLOCK_REALTIME was set `delta` ahead of the monotonic scale; the
+    /// timers armed with an absolute time of that clock move their deadlines
+    /// `delta` earlier (they may be due now). Only the superuser may tell.
+    pub const CLOCK_STEP: u32 = 8;
+    /// Bit of `armed` in SET: the deadline is an absolute time of
+    /// CLOCK_REALTIME and follows the steps of the calendar.
+    pub const ARMED_REALTIME: u32 = 2;
 }
 
 /// SA_NOCLDWAIT on SIGCHLD.

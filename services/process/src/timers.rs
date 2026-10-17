@@ -29,8 +29,11 @@ pub const EXPIRY_BUDGET: usize = 4;
 pub const DEAR_COST: usize = 2;
 /// DELAYTIMER_MAX: the overrun count stops here.
 pub const DELAYTIMER_MAX: u32 = i32::MAX as u32;
-/// The least interval of a periodic timer, in nanoseconds: a timer that
-/// fires more often than the clock's tick would hold the service.
+/// The least time between two looks of the service at a periodic timer, in
+/// nanoseconds: a timer that fires more often would hold the service. The
+/// interval of such a timer stays what the program set; the expirations the
+/// service did not look at are counted at the next look (`expire`), so that
+/// the overrun count follows the interval.
 pub const MIN_INTERVAL: u64 = 1_000_000;
 /// A deadline farther than this from now is set at this distance (about
 /// 146 years), so that the arithmetic of the kernel's timer never wraps.
@@ -61,9 +64,23 @@ struct Slot {
     armed: bool,
     owner: u8,
     signal: u8,
+    /// The overrun count of the signal that waits now, and of the one before
+    /// it (the last that was delivered, which `timer_getoverrun` shows while
+    /// the current one waits).
     overrun: u32,
+    last: u32,
+    /// The signal is one nobody takes (`account`): its expirations since the
+    /// first count as overruns of it.
+    unseen: bool,
+    /// The deadline is an absolute time of CLOCK_REALTIME: a step of the
+    /// calendar moves it (`step`).
+    real: bool,
     deadline: u64,
     interval: u64,
+    /// The service does not look at the timer before this time: a periodic
+    /// timer with an interval below MIN_INTERVAL waits that long between
+    /// looks.
+    not_before: u64,
     value: u64,
 }
 
@@ -74,8 +91,12 @@ const FREE: Slot = Slot {
     owner: 0,
     signal: 0,
     overrun: 0,
+    last: 0,
+    unseen: false,
+    real: false,
     deadline: 0,
     interval: 0,
+    not_before: 0,
     value: 0,
 };
 
@@ -206,6 +227,7 @@ impl Timers {
     }
 
     fn arm(slot: &mut Slot, deadline: Option<u64>, interval: u64, now: u64) {
+        slot.real = false;
         match deadline {
             None => {
                 slot.armed = false;
@@ -214,15 +236,14 @@ impl Timers {
             Some(deadline) => {
                 slot.armed = true;
                 slot.deadline = deadline.min(now.saturating_add(HORIZON));
-                slot.interval = if interval == 0 {
-                    0
-                } else {
-                    interval.clamp(MIN_INTERVAL, HORIZON)
-                };
+                slot.interval = interval.min(HORIZON);
+                slot.not_before = 0;
             }
         }
         // A new setting starts a new signal: no overrun carries over.
         slot.overrun = 0;
+        slot.last = 0;
+        slot.unseen = false;
     }
 
     /// Arms the timer `id` of `owner` at `deadline` (None: disarms) with
@@ -241,6 +262,25 @@ impl Timers {
         Ok(old)
     }
 
+    /// Marks the timer `id` of `owner`, just armed, as one whose deadline is
+    /// an absolute time of CLOCK_REALTIME.
+    pub fn mark_real(&mut self, owner: u8, id: u32) {
+        if let Some(slot) = self.find(owner, id) {
+            self.slots[slot].real = self.slots[slot].armed;
+        }
+    }
+
+    /// The calendar of CLOCK_REALTIME was set `delta` ns ahead of the
+    /// monotonic scale: the deadlines of the timers armed in it come
+    /// `delta` earlier (not before `now`).
+    pub fn step(&mut self, delta: i64, now: u64) {
+        for s in self.slots.iter_mut().filter(|s| s.used && s.armed && s.real) {
+            let moved = i128::from(s.deadline) - i128::from(delta);
+            s.deadline = moved.clamp(i128::from(now), i128::from(u64::MAX)) as u64;
+            s.not_before = 0;
+        }
+    }
+
     /// The setting of the timer `id` of `owner`.
     pub fn get(&self, owner: u8, id: u32, now: u64) -> Result<Setting, Fail> {
         let slot = self.find(owner, id).ok_or(Fail::Invalid)?;
@@ -248,9 +288,18 @@ impl Timers {
     }
 
     /// The overrun count of the timer `id` of `owner`.
-    pub fn overrun(&self, owner: u8, id: u32) -> Result<u32, Fail> {
+    /// While the signal of the timer waits (`waiting`) it is the count of the
+    /// signal delivered before; else the count of the one delivered last.
+    pub fn overrun(&self, owner: u8, id: u32, waiting: bool) -> Result<u32, Fail> {
         let slot = self.find(owner, id).ok_or(Fail::Invalid)?;
-        Ok(self.slots[slot].overrun)
+        let s = &self.slots[slot];
+        Ok(if waiting { s.last } else { s.overrun })
+    }
+
+    /// The signal of the timer `id` of `owner`.
+    pub fn signal_of_id(&self, owner: u8, id: u32) -> Result<u8, Fail> {
+        let slot = self.find(owner, id).ok_or(Fail::Invalid)?;
+        Ok(self.slots[slot].signal)
     }
 
     /// Arms the alarm of `owner` (None: disarms) with `interval`; the
@@ -302,7 +351,7 @@ impl Timers {
         self.slots
             .iter()
             .filter(|s| s.used && s.armed)
-            .map(|s| s.deadline)
+            .map(|s| s.deadline.max(s.not_before))
             .min()
     }
 
@@ -324,12 +373,12 @@ impl Timers {
         let mut found = [0usize; EXPIRY_BUDGET];
         let mut count = 0;
         for (i, s) in self.slots.iter().enumerate() {
-            if !(s.used && s.armed && s.deadline <= now) {
+            if !(s.used && s.armed && s.deadline.max(s.not_before) <= now) {
                 continue;
             }
             // Insert by deadline into the short list.
             let mut at = count;
-            while at > 0 && self.slots[found[at - 1]].deadline > s.deadline {
+            while at > 0 && self.slots[found[at - 1]].deadline.max(self.slots[found[at - 1]].not_before) > s.deadline.max(s.not_before) {
                 at -= 1;
             }
             if at >= EXPIRY_BUDGET {
@@ -368,6 +417,13 @@ impl Timers {
                     Ok(next) => s.deadline = next,
                     Err(_) => s.armed = false,
                 }
+                // The next look comes MIN_INTERVAL after this one at the
+                // soonest: the expirations in between join the next count.
+                s.not_before = if s.interval < MIN_INTERVAL {
+                    now.saturating_add(MIN_INTERVAL)
+                } else {
+                    0
+                };
                 count
             }
         };
@@ -384,9 +440,18 @@ impl Timers {
     /// Records what became of the signal of an expiration (`Expired`): sent
     /// as a new one, the overrun is the expirations that came with it
     /// beyond the first; found waiting, they all join the overrun.
-    pub fn account(&mut self, slot: usize, count: u64, merged: bool) {
+    ///
+    /// `unseen` says the signal is one nobody takes (ignored by default, no
+    /// handler): after the first, its expirations join the overrun of the
+    /// first, as if it waited.
+    pub fn account(&mut self, slot: usize, count: u64, merged: bool, unseen: bool) {
         let s = &mut self.slots[slot];
         let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let merged = merged || (unseen && s.unseen);
+        s.unseen = unseen;
+        if !merged {
+            s.last = s.overrun;
+        }
         s.overrun = if merged {
             s.overrun.saturating_add(count)
         } else {
@@ -438,15 +503,46 @@ mod tests {
         let e = t.expire(slot, 550 * MS);
         assert_eq!(e.count, 4, "200, 300, 400, 500");
         assert_eq!(t.earliest(), Some(600 * MS));
-        t.account(slot, e.count, false);
-        assert_eq!(t.overrun(1, id).unwrap(), 3);
+        t.account(slot, e.count, false, false);
+        assert_eq!(t.overrun(1, id, false).unwrap(), 3);
         // The next signal found the last one waiting: the overrun grows.
         let e = t.expire(slot, 600 * MS);
-        t.account(slot, e.count, true);
-        assert_eq!(t.overrun(1, id).unwrap(), 4);
+        t.account(slot, e.count, true, false);
+        assert_eq!(t.overrun(1, id, false).unwrap(), 4);
         // A new setting starts again.
         t.set(1, id, Some(700 * MS), 0, 650 * MS).unwrap();
-        assert_eq!(t.overrun(1, id).unwrap(), 0);
+        assert_eq!(t.overrun(1, id, false).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_step_of_the_calendar_moves_the_deadlines_that_follow_it() {
+        let mut t = Timers::new();
+        let (a, b) = (t.create(1, 12, 0, false).unwrap(), t.create(1, 12, 0, false).unwrap());
+        t.set(1, a, Some(10_000), 0, 100).unwrap();
+        t.mark_real(1, a);
+        t.set(1, b, Some(10_000), 0, 100).unwrap();
+        // The calendar is set 3,000 ns ahead: a comes earlier, b stays.
+        t.step(3_000, 500);
+        assert_eq!(t.get(1, a, 500).unwrap().remaining, 6_500);
+        assert_eq!(t.get(1, b, 500).unwrap().remaining, 9_500);
+        // Set 100,000 back: a is due now at the earliest, set back, it waits.
+        t.step(-5_000, 500);
+        assert_eq!(t.get(1, a, 500).unwrap().remaining, 11_500);
+        t.step(1_000_000, 500);
+        assert_eq!(t.get(1, a, 500).unwrap().remaining, 1);
+    }
+
+    #[test]
+    fn a_waiting_signal_shows_the_count_of_the_one_delivered_before() {
+        let mut t = Timers::new();
+        let id = t.create(1, 12, 0, false).unwrap();
+        let slot = t.find(1, id).unwrap();
+        t.account(slot, 100, false, false);
+        assert_eq!(t.overrun(1, id, false).unwrap(), 99);
+        assert_eq!(t.overrun(1, id, true).unwrap(), 0);
+        t.account(slot, 5, false, false);
+        assert_eq!(t.overrun(1, id, true).unwrap(), 99);
+        assert_eq!(t.overrun(1, id, false).unwrap(), 4);
     }
 
     #[test]
@@ -455,20 +551,31 @@ mod tests {
         let id = t.create(1, 12, 0, false).unwrap();
         let slot = t.find(1, id).unwrap();
         t.slots[slot].overrun = DELAYTIMER_MAX - 1;
-        t.account(slot, 5, true);
-        assert_eq!(t.overrun(1, id).unwrap(), DELAYTIMER_MAX);
-        t.account(slot, u64::MAX, false);
-        assert_eq!(t.overrun(1, id).unwrap(), DELAYTIMER_MAX);
+        t.account(slot, 5, true, false);
+        assert_eq!(t.overrun(1, id, false).unwrap(), DELAYTIMER_MAX);
+        t.account(slot, u64::MAX, false, false);
+        assert_eq!(t.overrun(1, id, false).unwrap(), DELAYTIMER_MAX);
     }
 
     #[test]
-    fn an_interval_below_the_least_is_raised_and_a_far_deadline_cut() {
+    fn a_short_interval_is_kept_and_looked_at_rarely_and_a_far_deadline_cut() {
         let mut t = Timers::new();
         let id = t.create(1, 12, 0, false).unwrap();
         t.set(1, id, Some(u64::MAX), 1, 10).unwrap();
         let s = t.get(1, id, 10).unwrap();
-        assert_eq!(s.interval, MIN_INTERVAL);
+        assert_eq!(s.interval, 1);
         assert_eq!(s.remaining, HORIZON);
+        // An interval of 16 ns: 100 expirations by the first look, and the
+        // next look is MIN_INTERVAL later, with all that came meanwhile.
+        t.set(1, id, Some(1_000), 16, 0).unwrap();
+        let slot = t.find(1, id).unwrap();
+        let first = t.expire(slot, 1_000 + 99 * 16);
+        assert_eq!(first.count, 100);
+        assert_eq!(t.earliest(), Some(1_000 + 99 * 16 + MIN_INTERVAL));
+        let later = 1_000 + 99 * 16 + MIN_INTERVAL;
+        assert_eq!(t.due(later - 1).1, 0);
+        assert_eq!(t.due(later).1, 1);
+        assert_eq!(t.expire(slot, later).count, (later - (1_000 + 100 * 16)) / 16 + 1);
     }
 
     #[test]

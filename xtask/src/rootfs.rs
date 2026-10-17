@@ -714,6 +714,11 @@ pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> 
     files.retain(|f| f.path != "/os-test/list");
     // The suite's helpers read /proc/<pid>/stat to see a child sleep.
     files.push(dir("/proc"));
+    // Programs the tests start by name (exec of /bin/sleep and /bin/ls):
+    // links of the shell's file, which BusyBox runs as the applet it is
+    // named as.
+    files.push(of("/bin/sleep", 0o755, ROOT, Source::Elf("busybox-probe")));
+    files.push(of("/bin/ls", 0o755, ROOT, Source::Elf("busybox-probe")));
     let mut list = String::new();
     let mut limit = None;
     for ((name, _), ms) in tests.iter().zip(limits) {
