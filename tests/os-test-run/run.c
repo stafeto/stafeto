@@ -82,6 +82,12 @@ static void run_one(const char *name, const char *dir, const char *rel) {
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
     posix_spawnattr_setpgroup(&attr, 0);
     int e = posix_spawn(&pid, path, NULL, &attr, argv, environ);
+    if (e == ENOEXEC) {
+        /* A shell script of the suite: the shell of the image runs it, as
+         * execvp does for a file that is no executable. */
+        char *shell_argv[] = {"sh", path, NULL};
+        e = posix_spawn(&pid, "/bin/sh", NULL, &attr, shell_argv, environ);
+    }
     posix_spawnattr_destroy(&attr);
     if (e != 0) {
         printf("@@os-test end %s error spawn %d\n", name, e);

@@ -4,6 +4,7 @@
 /* The first C program on relibc over the Rust POSIX layer: stdio with a
  * float, malloc, a file of the RAM file service through fopen and fread,
  * ENOENT, clock_gettime, and errno in the static TLS relibc built. */
+#include <aio.h>
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -246,6 +247,200 @@ static int memory_streams(void) {
     CHECK(fclose(growing) == 0);
     free(text);
     printf("relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec\n");
+    return 0;
+}
+
+static volatile int aio_told;
+static void aio_tell(union sigval value) { aio_told = (int)(intptr_t)value.sival_ptr; }
+
+static int wait_aio(struct aiocb *cb) {
+    for (int i = 0; i < 2000 && aio_error(cb) == EINPROGRESS; i++) {
+        struct timespec nap = {0, 1000000};
+        nanosleep(&nap, NULL);
+    }
+    return aio_error(cb);
+}
+
+/* Reads and writes of a file take all that is asked, whatever the size of
+ * a message of the file service; O_SYNC opens; aio runs on threads. */
+static int long_transfers_and_aio(void) {
+    static unsigned char pattern[6000], back[6000];
+    for (int i = 0; i < 6000; i++) pattern[i] = (unsigned char)(i * 7 + (i >> 8));
+    int fd = open("/tmp-long", O_RDWR | O_CREAT | O_TRUNC | O_SYNC, 0600);
+    CHECK(fd >= 0);
+    CHECK(write(fd, pattern, 3000) == 3000);
+    CHECK(pwrite(fd, pattern + 3000, 3000, 3000) == 3000);
+    CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    CHECK(read(fd, back, 6000) == 6000 && memcmp(back, pattern, 6000) == 0);
+    memset(back, 0, sizeof back);
+    CHECK(pread(fd, back, 5000, 500) == 5000 && memcmp(back, pattern + 500, 5000) == 0);
+    CHECK(read(fd, back, 10) == 0);
+
+#if !defined(_POSIX_ASYNCHRONOUS_IO) || _POSIX_ASYNCHRONOUS_IO < 200112L
+    CHECK(!"_POSIX_ASYNCHRONOUS_IO is claimed");
+#endif
+    CHECK(sysconf(_SC_ASYNCHRONOUS_IO) == _POSIX_ASYNCHRONOUS_IO);
+    CHECK(sysconf(_SC_AIO_MAX) == 128 && sysconf(_SC_AIO_LISTIO_MAX) == 128);
+
+    struct aiocb fresh;
+    memset(&fresh, 0, sizeof fresh);
+    CHECK(aio_error(&fresh) == EINVAL);
+    errno = 0;
+    CHECK(aio_return(&fresh) == -1 && errno == EINVAL);
+
+    struct aiocb cb;
+    memset(&cb, 0, sizeof cb);
+    cb.aio_fildes = fd;
+    cb.aio_buf = pattern;
+    cb.aio_nbytes = 2500;
+    cb.aio_offset = 6000;
+    cb.aio_sigevent.sigev_notify = SIGEV_THREAD;
+    cb.aio_sigevent.sigev_notify_function = aio_tell;
+    cb.aio_sigevent.sigev_value.sival_ptr = (void *)(intptr_t)42;
+    CHECK(aio_write(&cb) == 0);
+    CHECK(wait_aio(&cb) == 0);
+    CHECK(aio_return(&cb) == 2500);
+    errno = 0;
+    CHECK(aio_return(&cb) == -1 && errno == EINVAL && aio_error(&cb) == EINVAL);
+    for (int i = 0; i < 2000 && aio_told == 0; i++) {
+        struct timespec nap = {0, 1000000};
+        nanosleep(&nap, NULL);
+    }
+    CHECK(aio_told == 42);
+    CHECK(aio_cancel(fd, &cb) == AIO_ALLDONE && aio_cancel(fd, NULL) == AIO_ALLDONE);
+
+    memset(back, 0, sizeof back);
+    struct aiocb rd;
+    memset(&rd, 0, sizeof rd);
+    rd.aio_fildes = fd;
+    rd.aio_buf = back;
+    rd.aio_nbytes = 2500;
+    rd.aio_offset = 6000;
+    CHECK(aio_read(&rd) == 0 && wait_aio(&rd) == 0 && aio_return(&rd) == 2500);
+    CHECK(memcmp(back, pattern, 2500) == 0);
+
+    /* A bad descriptor is the error of the request, not of the call. */
+    struct aiocb bad;
+    memset(&bad, 0, sizeof bad);
+    bad.aio_fildes = -1;
+    bad.aio_buf = back;
+    bad.aio_nbytes = 1;
+    CHECK(aio_read(&bad) == 0 && wait_aio(&bad) == EBADF && aio_return(&bad) == -1);
+    CHECK(aio_fsync(O_SYNC, &bad) == -1 && errno == EBADF);
+
+    /* A list that waits: a write then a read of the bytes, in order. */
+    struct aiocb w2, r2;
+    memset(&w2, 0, sizeof w2);
+    memset(&r2, 0, sizeof r2);
+    unsigned char out[16] = "list of two....", in[16] = {0};
+    w2.aio_fildes = fd; w2.aio_buf = out; w2.aio_nbytes = 16; w2.aio_offset = 9000;
+    w2.aio_lio_opcode = LIO_WRITE;
+    r2.aio_fildes = fd; r2.aio_buf = in; r2.aio_nbytes = 16; r2.aio_offset = 9000;
+    r2.aio_lio_opcode = LIO_READ;
+    struct aiocb *many_list[1] = {&w2};
+    errno = 0;
+    CHECK(lio_listio(LIO_NOWAIT, many_list, (int)sysconf(_SC_AIO_LISTIO_MAX) + 1, NULL) == -1
+          && errno == EINVAL);
+    struct aiocb *list[2] = {&w2, &r2};
+    CHECK(lio_listio(LIO_WAIT, list, 2, NULL) == 0);
+    CHECK(aio_return(&w2) == 16 && aio_return(&r2) == 16 && memcmp(in, out, 16) == 0);
+
+    /* Requests queued for one descriptor end with a result or ECANCELED. */
+    struct aiocb many[8];
+    for (int i = 0; i < 8; i++) {
+        memset(&many[i], 0, sizeof many[i]);
+        many[i].aio_fildes = fd; many[i].aio_buf = pattern; many[i].aio_nbytes = 2000;
+        many[i].aio_offset = 10000 + 2000 * i;
+        CHECK(aio_write(&many[i]) == 0);
+    }
+    int cancelled = aio_cancel(fd, NULL);
+    CHECK(cancelled == AIO_CANCELED || cancelled == AIO_NOTCANCELED || cancelled == AIO_ALLDONE);
+    for (int i = 0; i < 8; i++) {
+        int err = wait_aio(&many[i]);
+        CHECK(err == 0 || err == ECANCELED);
+        CHECK(aio_return(&many[i]) == (err == 0 ? 2000 : -1));
+    }
+    /* A wait for a request ends when it does, and a wait that nothing ends
+     * times out with EAGAIN. */
+    CHECK(aio_write(&many[0]) == 0);
+    const struct aiocb *wait_list[2] = {NULL, &many[0]};
+    CHECK(aio_suspend(wait_list, 2, NULL) == 0 && aio_error(&many[0]) == 0);
+    CHECK(aio_return(&many[0]) == 2000);
+    struct aiocb idle;
+    memset(&idle, 0, sizeof idle);
+    const struct aiocb *idle_list[1] = {&idle};
+    struct timespec shortly = {0, 20000000};
+    errno = 0;
+    CHECK(aio_suspend(idle_list, 1, &shortly) == -1 && errno == EAGAIN);
+    CHECK(close(fd) == 0 && unlink("/tmp-long") == 0);
+    printf("relibc-hello: long transfers, O_SYNC, aio on threads\n");
+    return 0;
+}
+
+static volatile int timer_fired;
+static volatile int timer_value;
+static void timer_tell(union sigval value) {
+    timer_value = (int)(intptr_t)value.sival_ptr;
+    timer_fired++;
+}
+
+static int wait_fired(int count) {
+    for (int i = 0; i < 3000 && timer_fired < count; i++) {
+        struct timespec nap = {0, 1000000};
+        nanosleep(&nap, NULL);
+    }
+    return timer_fired >= count;
+}
+
+/* A timer whose notice is a function in a thread: it fires at its period,
+ * stops when disarmed, and takes an absolute time. */
+static int thread_timers(void) {
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_THREAD;
+    event.sigev_notify_function = NULL;
+    timer_t timer;
+    errno = 0;
+    CHECK(timer_create(CLOCK_MONOTONIC, &event, &timer) == -1 && errno == EINVAL);
+    event.sigev_notify_function = timer_tell;
+    event.sigev_value.sival_ptr = (void *)(intptr_t)7;
+    CHECK(timer_create(CLOCK_MONOTONIC, &event, &timer) == 0);
+    struct itimerspec none = {{0, 0}, {0, 0}}, every = {{0, 10000000}, {0, 10000000}}, seen;
+    CHECK(timer_gettime(timer, &seen) == 0 && seen.it_value.tv_sec == 0 && seen.it_value.tv_nsec == 0);
+    struct itimerspec bad = {{0, 0}, {0, 1000000000}};
+    errno = 0;
+    CHECK(timer_settime(timer, 0, &bad, NULL) == -1 && errno == EINVAL);
+    CHECK(timer_settime(timer, 0, &every, NULL) == 0);
+    CHECK(wait_fired(3) && timer_value == 7);
+    CHECK(timer_gettime(timer, &seen) == 0 && seen.it_interval.tv_nsec == 10000000);
+    struct itimerspec old;
+    CHECK(timer_settime(timer, 0, &none, &old) == 0 && old.it_interval.tv_nsec == 10000000);
+    struct timespec nap = {0, 50000000};
+    nanosleep(&nap, NULL);
+    int stopped = timer_fired;
+    nanosleep(&nap, NULL);
+    CHECK(timer_fired == stopped);
+    /* Once, at an absolute time. */
+    struct itimerspec at = {{0, 0}, {0, 0}};
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &at.it_value) == 0);
+    at.it_value.tv_nsec += 20000000;
+    if (at.it_value.tv_nsec >= 1000000000) { at.it_value.tv_sec++; at.it_value.tv_nsec -= 1000000000; }
+    CHECK(timer_settime(timer, TIMER_ABSTIME, &at, NULL) == 0);
+    CHECK(wait_fired(stopped + 1));
+    nanosleep(&nap, NULL);
+    CHECK(timer_fired == stopped + 1 && timer_getoverrun(timer) == 0);
+    CHECK(timer_delete(timer) == 0);
+    /* Deleting a timer that fires all the time: the helper frees it. */
+    for (int round = 0; round < 40; round++) {
+        timer_t fast;
+        struct itimerspec rapid = {{0, 200000}, {0, 200000}};
+        CHECK(timer_create(CLOCK_MONOTONIC, &event, &fast) == 0);
+        CHECK(timer_settime(fast, 0, &rapid, NULL) == 0);
+        struct timespec brief = {0, 300000 + round * 50000};
+        nanosleep(&brief, NULL);
+        CHECK(timer_delete(fast) == 0);
+    }
+    printf("relibc-hello: timers with a function in a thread\n");
     return 0;
 }
 
@@ -592,6 +787,10 @@ int main(int argc, char **argv) {
     int status = files();
     if (status) return status;
     status = memory_streams();
+    if (status) return status;
+    status = long_transfers_and_aio();
+    if (status) return status;
+    status = thread_timers();
     if (status) return status;
     status = constants();
     if (status) return status;

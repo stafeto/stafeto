@@ -31,7 +31,8 @@ pub const SEMSETS: usize = 8;
 pub const SEGS: usize = 8;
 /// The messages of all queues together.
 pub const MSGS: usize = 64;
-/// The messages one queue holds at most (the `mq_maxmsg` too).
+/// The messages one XSI queue holds at most; a POSIX queue holds up to
+/// `mq_maxmsg`, which is at most the pool (MSGS).
 pub const QUEUE_MSGS: usize = 16;
 /// The semaphores of a set at most.
 pub const SEMS_MAX: usize = 16;
@@ -2002,7 +2003,7 @@ impl Pipes {
             op::MQ_SEND => {
                 need(3 + Cred::WORDS)?;
                 let c = cred(3)?;
-                self.mq_send(held, w, &c, call.bytes, wakes)
+                self.mq_send(held, w, &c, call.bytes, out, wakes)
             }
             op::MQ_RECV => {
                 need(2 + Cred::WORDS)?;
@@ -2214,8 +2215,7 @@ impl Pipes {
                     return Err(fail(ENOENT));
                 }
                 let (maxmsg, msgsize) = if w[4] != 0 {
-                    if w[2] == 0 || w[2] > QUEUE_MSGS as u64 || w[3] == 0 || w[3] > TEXT_MAX as u64
-                    {
+                    if w[2] == 0 || w[2] > MSGS as u64 || w[3] == 0 || w[3] > TEXT_MAX as u64 {
                         return Err(fail(EINVAL));
                     }
                     (w[2] as u16, w[3] as u16)
@@ -2262,6 +2262,7 @@ impl Pipes {
         w: &[u64],
         c: &Cred,
         bytes: &[u8],
+        out: &mut Out,
         wakes: &mut Wakes,
     ) -> Result<Flow, u32> {
         let (_, queue, access, nonblock) = self.mq_slot(held, Endpoint::socket(slot_of(w[0])))?;
@@ -2302,6 +2303,9 @@ impl Pipes {
             && let Notify::Armed(d) = x.notify
         {
             x.notify = Notify::Fired(d);
+            // The send tells that it fired the registration, so that a
+            // sender of the registering process waits for the notice.
+            out.word(1);
         }
         Ipc::wake(x.waiters.waiters, wakes);
         Ok(Flow::Done)
@@ -2503,6 +2507,17 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_holds_up_to_the_pool_and_no_more() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        // mq_maxmsg may be as large as the pool of messages.
+        let d = open(&mut r, &mut p, b"/big", O_CREAT | 2, MSGS as u64, 1);
+        let out = r.ok(&mut p, op::MQ_GETATTR, &[d], b"");
+        assert_eq!(out.words[1], MSGS as u64);
+        let w = with_cred(&[O_CREAT | 2, 0o600, MSGS as u64 + 1, 1, 1]);
+        assert_eq!(r.err(&mut p, op::MQ_OPEN, &w, b"/bigger"), 22);
+    }
+
+    #[test]
     fn equal_priorities_keep_their_order() {
         let (mut p, mut r) = (pipes(), Run::new());
         let d = open(&mut r, &mut p, b"/q", O_CREAT | 2, 4, 1);
@@ -2674,13 +2689,17 @@ mod tests {
             panic!()
         };
         p.wait(queue, (5, 5), |_| true).unwrap();
-        r.ok(&mut p, op::MQ_SEND, &with_cred(&[d, 0, 0]), b"a");
+        // The send that fires the registration says so (a sender of the
+        // registering process then waits for the notice).
+        let sent = r.ok(&mut p, op::MQ_SEND, &with_cred(&[d, 0, 0]), b"a");
+        assert_eq!(sent.words[0], 1);
         assert!(r.wakes.iter().any(|w| w == (5, 5)));
         let out = r.ok(&mut p, op::MQ_NOTIFY_WAIT, &[d], b"");
         assert_eq!(out.words[0], 1);
         // Registered again, a second message to a non-empty queue sends nothing.
         r.ok(&mut p, op::MQ_NOTIFY, &[d, 1], b"");
-        r.ok(&mut p, op::MQ_SEND, &with_cred(&[d, 0, 0]), b"b");
+        let sent = r.ok(&mut p, op::MQ_SEND, &with_cred(&[d, 0, 0]), b"b");
+        assert_eq!(sent.words[0], 0);
         let (flow, _) = r.call(&mut p, 1, op::MQ_NOTIFY_WAIT, &[d], b"", None);
         assert!(matches!(flow, Ok(Flow::Wait { .. })));
         // Removed, the wait ends with 2.

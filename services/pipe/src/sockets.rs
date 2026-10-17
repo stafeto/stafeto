@@ -41,6 +41,12 @@ const PORT_FIRST: u32 = 49152;
 const PORT_COUNT: u32 = 16384;
 /// A write of this many bytes or fewer goes whole or waits, as a pipe's.
 const ATOMIC_SEND: usize = ATOMIC;
+/// The least a buffer may be set to (SO_RCVBUF, SO_SNDBUF): one datagram of
+/// SEND_MAX bytes with its record (4 bytes) and the longest sender's address.
+const MIN_BUF: usize = 4 + ADDR_MAX + SEND_MAX;
+/// The buffer of a datagram socket of the file namespace: two datagrams of
+/// SEND_MAX bytes, each with its record and the longest sender's address.
+const DGRAM_RCVBUF: usize = 2 * MIN_BUF;
 
 /// The descriptions a message carries and where in the receiver's stream
 /// (the count of bytes before, or of datagrams) they belong.
@@ -202,8 +208,11 @@ impl Sockets {
         (self.s[p].live && self.s[p].era == era).then_some(p)
     }
 
+    /// The bytes that fit in the buffer of `i` (SO_RCVBUF of it).
     fn room(&self, i: usize) -> usize {
-        RING - usize::from(self.s[i].len)
+        (self.s[i].rcvbuf as usize)
+            .min(RING)
+            .saturating_sub(usize::from(self.s[i].len))
     }
 
     /// `out.len()` bytes of the buffer of `i` from `offset` after its head.
@@ -392,6 +401,14 @@ impl Pipes {
         }
         let i = self.sockets.s.iter().position(|s| !s.live).ok_or(NFILE)?;
         let era = self.sockets.s[i].era.wrapping_add(1);
+        // A datagram socket of the file namespace holds two datagrams of
+        // the largest size and says so: SO_SNDBUF is twice the largest
+        // datagram, as a program that sizes its sends by it expects.
+        let (rcvbuf, sndbuf) = if domain == UNIX && kind == DGRAM {
+            (DGRAM_RCVBUF as u32, 2 * SEND_MAX as u32)
+        } else {
+            (RING as u32, RING as u32)
+        };
         self.sockets.s[i] = Sock {
             live: true,
             era,
@@ -401,6 +418,8 @@ impl Pipes {
             kind,
             creator,
             root,
+            rcvbuf,
+            sndbuf,
             ..Sock::FREE
         };
         self.sockets.dropping[i] = 0;
@@ -784,7 +803,7 @@ impl Pipes {
         };
         let size = |size: &mut u32| {
             if set {
-                *size = value.clamp(256, RING as u32);
+                *size = value.clamp(MIN_BUF as u32, RING as u32);
             }
             *size
         };
@@ -1870,6 +1889,35 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_is_never_set_below_one_datagram_with_the_longest_address() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let (c, _) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+        let c = sock(c);
+        assert_eq!(
+            p.sock_option(&held, c, OPT_RCVBUF, true, 256),
+            Ok(MIN_BUF as u32)
+        );
+    }
+
+    #[test]
+    fn two_datagrams_from_a_sender_with_the_longest_name_fit() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (c, d) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+        let (c, _d) = (sock(c), sock(d));
+        let mut path = vec![b'a'; proto_pipe::sock::NAME_MAX];
+        path[0] = b'/';
+        p.sock_bind(&held, c, Addr::unix(9, &path).unwrap())
+            .unwrap();
+        let big = [1u8; SEND_MAX];
+        assert!(matches!(p.sock_write(&held, c, &big, &mut w), Ok(Some(_))));
+        assert!(matches!(p.sock_write(&held, c, &big, &mut w), Ok(Some(_))));
+        assert_eq!(p.sock_write(&held, c, &big, &mut w), Ok(None));
+    }
+
+    #[test]
     fn a_blocking_datagram_send_to_a_full_buffer_waits_at_the_receiver() {
         let mut p = pipes();
         let mut held = Held::default();
@@ -1881,7 +1929,8 @@ mod tests {
         while let Ok(Some(_)) = p.sock_write(&held, c, &big, &mut w) {
             sent += 1;
         }
-        assert!(sent >= 4);
+        // The buffer holds two datagrams of the largest size.
+        assert_eq!(sent, 2);
         assert_eq!(p.sock_write(&held, c, &big, &mut w), Ok(None));
         assert_eq!(
             p.send_queue(&held, c, &Addr::NONE),

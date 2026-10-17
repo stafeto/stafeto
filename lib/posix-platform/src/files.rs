@@ -239,13 +239,42 @@ fn at_offset(
     }
 }
 
+/// Whether the descriptor is a file of the file service (a read of it
+/// returns all that is asked unless the file ends).
+pub(crate) fn is_file(fd: c_int) -> bool {
+    number(fd)
+        .and_then(|number| {
+            posix_abi::shared::held(number, |_, target| Ok(matches!(target, Target::Ram(_))))
+        })
+        .unwrap_or(false)
+}
+
 /// # Safety
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.read_at(fd, at, out))
+    // One message of the service holds MAX_READ bytes; a longer read gets
+    // the rest after it, up to the end of the file.
+    let mut done = 0;
+    loop {
+        let size = out.len() - done;
+        let at = offset.saturating_add(done as i64);
+        let rest = &mut out[done..];
+        let got = at_offset(fd, at, |files, fd, at| files.read_at(fd, at, rest));
+        if got == posix_request::MAX_READ as isize && size > posix_request::MAX_READ {
+            done += posix_request::MAX_READ;
+            continue;
+        }
+        return if got < 0 && done > 0 {
+            done as isize
+        } else if got < 0 {
+            got
+        } else {
+            done as isize + got
+        };
+    }
 }
 
 /// # Safety
@@ -259,7 +288,26 @@ pub unsafe extern "C" fn stafeto_pwrite(
 ) -> isize {
     // SAFETY: the caller's promise.
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    at_offset(fd, offset, |files, fd, at| files.write_at(fd, at, bytes))
+    // One message of the service holds MAX_WRITE less 8 bytes; the rest of a
+    // longer write goes after it (a failure after a part is its count).
+    let extent = proto_fs::MAX_WRITE - 8;
+    let mut done = 0;
+    loop {
+        let rest = &bytes[done..];
+        let at = offset.saturating_add(done as i64);
+        let got = at_offset(fd, at, |files, fd, at| files.write_at(fd, at, rest));
+        if got == extent as isize && rest.len() > extent {
+            done += extent;
+            continue;
+        }
+        return if got < 0 && done > 0 {
+            done as isize
+        } else if got < 0 {
+            got
+        } else {
+            done as isize + got
+        };
+    }
 }
 
 /// # Safety

@@ -292,6 +292,10 @@ fn link_all(
         .collect()
 }
 
+fn bytes_of(batch: &[(String, Vec<u8>)]) -> usize {
+    batch.iter().map(|t| t.1.len()).sum()
+}
+
 /// The rows of the `tests` (name, ELF bytes) run in as many boots of one
 /// batch as a hang of the guest takes: a test that began and did not end
 /// while the batch did is TIMEOUT, and the tests after it go to a new boot.
@@ -415,6 +419,7 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
     let all = tests_of(&work)?;
     let mut rows = Vec::new();
     let mut to_run = Vec::new();
+    let mut scripts: Vec<(String, Vec<u8>)> = Vec::new();
     for test in &all {
         if !wanted_name(&test.name, &listed) {
             continue;
@@ -426,7 +431,13 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
             detail: detail.to_owned(),
         };
         match (test.kind.as_str(), test.object.as_str()) {
-            ("SCRIPT", _) => rows.push(row("SCRIPT", "SKIP", "a shell script of the suite")),
+            ("SCRIPT", _) => {
+                let path = work.join("source").join(format!("{}.sh", test.name));
+                match std::fs::read(&path) {
+                    Ok(bytes) => scripts.push((test.name.clone(), bytes)),
+                    Err(e) => rows.push(row("SCRIPT", "SKIP", &format!("{}: {e}", path.display()))),
+                }
+            }
             ("ARGS", _) => rows.push(row("ARGS", "SKIP", "started with arguments from a file")),
             (_, "!compile") => rows.push(row("BUILD", "COMPILE", &test.detail)),
             ("BUILDONLY", _) => rows.push(row("PASS", "COMPILE", "compiled")),
@@ -459,6 +470,15 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
                 current.push((test.name.clone(), elf));
             }
         }
+    }
+    // The suite's shell scripts run from the image under its ash, which
+    // the "#!/bin/sh" line names.
+    for (name, bytes) in scripts {
+        let names: Vec<&str> = current.iter().map(|t| t.0.as_str()).collect();
+        if !fits(&names, bytes_of(&current), &name, bytes.len()) && !current.is_empty() {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push((name, bytes));
     }
     if !current.is_empty() {
         batches.push(current);
