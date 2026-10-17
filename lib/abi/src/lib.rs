@@ -756,7 +756,9 @@ pub const INFO_MEMORY: u64 = 5;
 /// THREAD_STATE takes a thread handle, with no right needed, and returns
 /// `ThreadInfo::to_words` in x1-x4 and in x5 the counter ticks the thread
 /// has run, the stint it is in now included (idle time and cleanup are
-/// nobody's).
+/// nobody's), and in x6 the part of them it spent in the kernel, from each
+/// entry from EL0 to the decision that sends a thread back (its system
+/// time; the rest is its user time).
 pub const INFO_THREAD_STATE: u64 = 6;
 /// CHANNEL takes a channel handle, a labelled copy too, with no right
 /// needed, and returns `ChannelInfo::to_words` in x1-x4.
@@ -789,7 +791,8 @@ pub const INFO_THREAD_SELF: u64 = 12;
 pub const INFO_THREAD_CURRENT: u64 = 13;
 /// PROCESS_TIME takes a process handle, with no right needed, and returns
 /// in x1 the counter ticks the threads of the process have run, those that
-/// ended and the stint of the running one included. O(1).
+/// ended and the stint of the running one included, and in x2 the part of
+/// them spent in the kernel. O(1).
 pub const INFO_PROCESS_TIME: u64 = 14;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and

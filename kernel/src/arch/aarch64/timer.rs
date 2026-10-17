@@ -45,11 +45,21 @@ pub fn clock() -> Clock {
 /// reads the counter here and nowhere else: on the PinePhone this read
 /// needs the A64 counter workaround (spec 10).
 pub fn now() -> u64 {
+    // SAFETY: the ISB only keeps the read from happening before earlier
+    // instructions.
+    unsafe { core::arch::asm!("isb", options(nomem, nostack, preserves_flags)) };
+    now_unordered()
+}
+
+/// The virtual counter with no ISB before the read: right after an entry
+/// from EL0, which synchronizes, or where a few instructions of skew
+/// matter no more than the ISB costs (the stamp of a thread leaving for EL0).
+#[inline(always)]
+pub fn now_unordered() -> u64 {
     let ticks: u64;
-    // SAFETY: reading the counter has no side effects; the ISB keeps the read
-    // from happening before earlier instructions.
+    // SAFETY: reading the counter has no side effects.
     unsafe {
-        core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags))
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack, preserves_flags))
     };
     ticks
 }

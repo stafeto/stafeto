@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 40] = [
+pub(crate) const TESTS: [Test; 41] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -49,6 +49,10 @@ pub(crate) const TESTS: [Test; 40] = [
     ),
     ("thread_states", thread_states),
     ("cpu_time_counts_the_stints", cpu_time_counts_the_stints),
+    (
+        "cpu_time_splits_user_and_kernel",
+        cpu_time_splits_user_and_kernel,
+    ),
     ("tail_goes_behind_equals", tail_goes_behind_equals),
     ("thread_end_is_heard_once", thread_end_is_heard_once),
     ("unheld_thread_end_is_heard", unheld_thread_end_is_heard),
@@ -1021,6 +1025,47 @@ fn cpu_time_counts_the_stints() -> Outcome {
     check(refused, "PROCESS_TIME took a reserved word")
 }
 
+/// The user and the kernel time of the calling thread, in ticks: what
+/// object_info THREAD_STATE x5 and x6 give (the user time is x5 less x6).
+fn user_and_kernel() -> Result<(u64, u64), &'static str> {
+    let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;
+    Ok((ran.saturating_sub(kernel), kernel))
+}
+
+/// The CPU time splits (spec 8): a loop at EL0 with no call grows the user
+/// time and next to nothing of the kernel time; a loop of calls grows the
+/// kernel time and next to nothing of the user time; the kernel time is
+/// part of the whole, and the process's sum has both.
+fn cpu_time_splits_user_and_kernel() -> Outcome {
+    let (user0, kernel0) = user_and_kernel()?;
+    burn();
+    let (user1, kernel1) = user_and_kernel()?;
+    let (spin_user, spin_kernel) = (user1 - user0, kernel1.saturating_sub(kernel0));
+    check(spin_user > 100_000, "a loop at EL0 grew no user time")?;
+    check(
+        spin_kernel < spin_user / 8,
+        "a loop at EL0 with no call grew the kernel time",
+    )?;
+    for _ in 0..2_000 {
+        let _ = sys::yield_now();
+    }
+    let (user2, kernel2) = user_and_kernel()?;
+    let (call_user, call_kernel) = (user2.saturating_sub(user1), kernel2.saturating_sub(kernel1));
+    check(call_kernel > 100_000, "a loop of calls grew no kernel time")?;
+    check(
+        call_user < call_kernel,
+        "a loop of calls grew the user time more than the kernel time",
+    )?;
+    let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;
+    check(kernel <= ran, "the kernel time is above the whole")?;
+    let (sum, sum_kernel) =
+        sys::process_times(&own()).map_err(|_| "PROCESS_TIME x1 and x2 failed")?;
+    check(
+        sum >= ran && sum_kernel >= kernel && sum_kernel <= sum,
+        "the sums of the process do not hold the thread's times",
+    )
+}
+
 /// Appends digit `i` to mark 0 and ends: the order the threads ran in.
 extern "C" fn append_digit(i: u64) -> ! {
     let n = MARKS[0].load(Relaxed);
@@ -1664,8 +1709,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, state, 5),
         (own, memory, 4),
         (own, table, 4),
-        (own, abi::INFO_PROCESS_TIME, 2),
-        (thread, thread_state, 6),
+        (own, abi::INFO_PROCESS_TIME, 3),
+        (thread, thread_state, 7),
         (seen, channel_kind, 5),
     ]
     .map(|(h, kind, past)| {

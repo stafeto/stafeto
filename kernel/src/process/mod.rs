@@ -144,6 +144,8 @@ pub struct Process {
     /// `cpu_time` adds it all up. A change of thread writes the thread's
     /// node alone, never the process.
     cpu_ticks: u64,
+    /// The part of `cpu_ticks` the threads spent at EL0.
+    user_ticks: u64,
     /// The threads it started and whether it ended, and why. A process
     /// lives exactly while it is whole (`stage`).
     life: Life,
@@ -300,6 +302,7 @@ impl Process {
     /// lock or with interrupts masked).
     fn fold_time(&mut self, t: &Thread) {
         self.cpu_ticks = self.cpu_ticks.saturating_add(t.sched.ran());
+        self.user_ticks = self.user_ticks.saturating_add(thread::user_ticks(t));
     }
 }
 
@@ -346,6 +349,7 @@ fn create(
         },
         ceiling,
         cpu_ticks: 0,
+        user_ticks: 0,
         life: Life::new(),
         threads: None,
         thread_count: 0,
@@ -538,10 +542,11 @@ pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
 
 /// The ticks the threads of `process` have run: those of the threads that
 /// left its list and, for each thread in it, its finished stints and, when
-/// it is on the CPU, its stint so far (object_info PROCESS_TIME). One walk
+/// it is on the CPU, its stint so far, with the part of the sum spent in
+/// the kernel (object_info PROCESS_TIME). One walk
 /// of at most abi::MAX_THREADS threads, whose nodes the scheduler's lock
 /// guards.
-pub fn cpu_time(process: NonNull<Process>) -> u64 {
+pub fn cpu_time(process: NonNull<Process>) -> (u64, u64) {
     let now = crate::arch::timer::now();
     sched::locked(|_| {
         // SAFETY: the caller holds a reference to the process; the threads
@@ -550,12 +555,14 @@ pub fn cpu_time(process: NonNull<Process>) -> u64 {
         unsafe {
             let p = process.as_ptr();
             let mut sum = (*p).cpu_ticks;
+            let mut user = (*p).user_ticks;
             let mut next = (*p).threads;
             while let Some(t) = next {
                 sum = sum.saturating_add(t.as_ref().sched.ran_at(now));
+                user = user.saturating_add(thread::user_ticks(t.as_ref()));
                 next = t.as_ref().siblings.and_then(|s| s.next);
             }
-            sum
+            (sum, sum.saturating_sub(user))
         }
     })
 }

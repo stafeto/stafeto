@@ -401,6 +401,23 @@ pub fn thread_ran(thread: &Handle<Thread>) -> Result<u64, Error> {
     Ok(x[5])
 }
 
+/// object_info(THREAD_STATE) x5 and x6: the counter ticks the thread has
+/// run, and those of them it spent in the kernel (its system time; the
+/// rest is its user time).
+pub fn thread_times(thread: &Handle<Thread>) -> Result<(u64, u64), Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok((x[5], x[6]))
+}
+
+/// object_info(PROCESS_TIME) x1 and x2: the counter ticks the threads of
+/// the process have run, and those of them spent in the kernel.
+pub fn process_times(process: &Handle<Process>) -> Result<(u64, u64), Error> {
+    let args = [process.raw().0, abi::INFO_PROCESS_TIME, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok((x[1], x[2]))
+}
+
 /// object_info(PROCESS_TIME): the counter ticks the threads of the process
 /// have run, those that ended included.
 pub fn process_time(process: &Handle<Process>) -> Result<u64, Error> {

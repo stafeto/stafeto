@@ -7,7 +7,7 @@
 // handle_exception(frame, index); they first check that the frame fits on
 // the kernel stack and otherwise switch to the emergency stack. Entries
 // from AArch64 EL0 save the program's registers straight into the running
-// thread (spec 8.1) and call handle_user_exception(index), which returns
+// thread (spec 8.1) and call handle_user_exception(regs, index), which returns
 // to EL0 through return_to_user. AArch32 EL0 never runs; its entries take
 // the kernel's path to a report.
 
@@ -194,8 +194,7 @@ user_exception:
     mrs     x3, tpidrro_el0
     stp     x2, x3, [x0, #USER_TPIDR]
     mov     x29, xzr                    // backtraces end at the entry from EL0
-    mov     x0, x1
-    bl      handle_user_exception
+    bl      handle_user_exception       // (regs x0, vector index x1)
     udf     #0                          // not reached: the handler returns to EL0 itself
 
 // return_to_user(regs x0): leaves the kernel for EL0 with the registers at

@@ -125,6 +125,10 @@ pub struct Record<P> {
     /// children that were waited for ran, theirs included (getrusage).
     pub carried_ticks: u64,
     pub children_ticks: u64,
+    /// The parts of `carried_ticks` and `children_ticks` the kernel ran
+    /// (system time; the rest of each is user time).
+    pub carried_kernel: u64,
+    pub children_kernel: u64,
     /// The ticks its process had run at the last listing that sampled it,
     /// and the time of that sample (the scale of the kernel's timers): a
     /// process that ran none since a sample some time ago is asleep.
@@ -462,6 +466,8 @@ impl<P> Records<P> {
             sample_ticks: 0,
             sample_at: 0,
             children_ticks: 0,
+            carried_kernel: 0,
+            children_kernel: 0,
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,

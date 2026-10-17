@@ -1131,7 +1131,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 231;
+const INIT_TESTS: u32 = 232;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1447,6 +1447,7 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("smp-boot") => smp_boots(),
+        Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
         Some("hvf") => hvf(),
@@ -7440,6 +7441,28 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let hz = boot_report(&o.lines, m, size, gic)?;
     measure::record(m, &o.lines);
     Ok(hz)
+}
+
+/// `cargo xtask probe NAME...`: the boots of `ci` with these names, as
+/// `cargo xtask ci --list-groups` lists them with `--names`, and nothing
+/// else; what a change to one probe needs, built first.
+fn probes(names: &[String]) -> Result<(), String> {
+    let list: Vec<jobs::Job> = boot_jobs(Vec::new())
+        .into_iter()
+        .filter(|j| names.iter().any(|n| n == j.name()))
+        .collect();
+    if list.len() != names.len() || names.is_empty() {
+        return Err(format!(
+            "usage: cargo xtask probe NAME...; names of boots: {:?}",
+            boot_jobs(Vec::new())
+                .iter()
+                .map(|j| j.name().to_owned())
+                .collect::<Vec<_>>()
+        ));
+    }
+    relibc()?;
+    busybox_build()?;
+    jobs::run_all(list, 1)
 }
 
 /// `cargo xtask smp-boot`: the order check of the start and the SGIs in the

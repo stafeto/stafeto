@@ -33,6 +33,7 @@ use crate::sched::{self, Tokens};
 use abi::{Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
@@ -106,6 +107,17 @@ pub struct Thread {
     /// channel's queue; the thread holds the channel, with one of its
     /// slots, until its portion. Set once at `create`.
     exit: Option<Source>,
+    /// The counter ticks the thread has spent at EL0 (spec 8): the
+    /// stretches between a way out of the kernel and the next entry from
+    /// EL0. `run` takes the counter from the field as the thread leaves for
+    /// EL0, and `user_ran` adds it back at the entry, so that the field
+    /// holds the whole of the stretches while the thread is in the kernel,
+    /// which is where every reader finds it (the CPU that runs a thread
+    /// at EL0 is the only one that would see the stretch half counted).
+    /// What the thread ran besides, `Node::ran` less this, it ran in the
+    /// kernel. Last, so that it takes the padding the struct ended with.
+    /// Only the CPU the thread runs on writes it.
+    user_ticks: AtomicU64,
 }
 
 /// The two system numbers a thread has, in one word so that they take the
@@ -284,6 +296,7 @@ pub fn create_with_exit(
         refs: Refs::one(),
         cleanup: Item::new(),
         exit: exit.map(|(c, _, _)| Source::new(c)),
+        user_ticks: AtomicU64::new(0),
     };
     let thread = process::paid_alloc(process, thread).inspect_err(|_| {
         if let Some((c, _, _)) = exit {
@@ -743,13 +756,41 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     }
 }
 
+/// The thread leaves the kernel for EL0 at `now`: its stretch there
+/// starts (`user_ran` ends it).
+#[inline(always)]
+fn user_resumes(thread: &Thread, now: u64) {
+    let ticks = &thread.user_ticks;
+    ticks.store(
+        ticks.load(Ordering::Relaxed).wrapping_sub(now),
+        Ordering::Relaxed,
+    );
+}
+
+/// An entry from EL0 at `now` ends the stretch the thread ran there. Runs
+/// on the CPU the thread ran on, with interrupts masked.
+#[inline(always)]
+pub fn user_ran(thread: NonNull<Thread>, now: u64) {
+    // SAFETY: the running thread is alive; only this CPU writes the field.
+    let ticks = &unsafe { &*thread.as_ptr() }.user_ticks;
+    ticks.store(
+        ticks.load(Ordering::Relaxed).wrapping_add(now),
+        Ordering::Relaxed,
+    );
+}
+
+/// The ticks `thread` has spent at EL0, up to its last entry from EL0.
+pub fn user_ticks(thread: &Thread) -> u64 {
+    thread.user_ticks.load(Ordering::Relaxed)
+}
+
 /// object_info THREAD_STATE of `thread`, which the caller holds (spec 11):
 /// its state, with what it waits for, its base and effective priorities
 /// and its policy, read with the scheduler locked, since the scheduler and
 /// the channels change them there. O(1).
 /// The ticks the thread has run, the stint it is in now included, come
-/// with it (x5).
-pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64) {
+/// with it (x5), and those of them it spent in the kernel (x6).
+pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
     let now = crate::arch::timer::now();
     sched::locked(|_| {
         // SAFETY: the caller holds a reference to the thread; only its
@@ -773,7 +814,8 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64) {
             priority: t.sched.priority(),
             policy: Some(t.sched.policy()),
         };
-        (info, t.sched.ran_at(now))
+        let ran = t.sched.ran_at(now);
+        (info, ran, ran.saturating_sub(user_ticks(t)))
     })
 }
 
@@ -864,18 +906,19 @@ pub fn run(next: NonNull<Thread>) -> ! {
         // The look is without the lock; the entry itself is made under the
         // scheduler's lock, as `request_upcall` makes its request, so that a
         // request from another core meets a whole state.
-        let prepared = if thread.upcall.is_pending() {
-            prepare_entry(thread)
-        } else {
-            None
-        };
-        if let Some((entry, sp)) = prepared {
+        if thread.upcall.is_pending()
+            && let Some((entry, sp)) = prepare_entry(thread)
+        {
             thread.regs.elr = entry;
             thread.regs.sp = sp;
             // The dispatcher starts a new control flow and leaves the
             // interrupted indirect branch unfinished. Return restores the old BTYPE.
             thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;
         }
+        // The stretch of the thread at EL0 starts here, and the next entry
+        // from EL0 ends it (`user_ran`): the way out of the kernel up to
+        // this point is the kernel's.
+        user_resumes(thread, crate::arch::timer::now_unordered());
         user::enter(next.as_ptr().cast())
     }
 }

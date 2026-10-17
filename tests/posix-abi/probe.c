@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sched.h>
 #include <time.h>
 
 extern char **environ;
@@ -844,6 +845,50 @@ static int credentials(void) {
     return 0;
 }
 
+/* The part of the CPU time of the process spent in the kernel, which the
+ * layer gives apart from the whole (the system time of getrusage and times):
+ * a loop with no call grows the user time, a loop of calls the system time. */
+extern long stafeto_cpu_system_ns(int who);
+
+static long long monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+    return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+static int cpu_split(void) {
+    struct timespec total;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+    long long whole0 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+    long long system0 = stafeto_cpu_system_ns(0);
+    long long thread0 = stafeto_cpu_system_ns(1);
+    if (system0 < 0 || system0 > whole0 || thread0 < 0) return 296;
+    /* 20 ms at EL0: the counter is read at EL0, so no call enters the kernel. */
+    long long began = monotonic_ns();
+    while (monotonic_ns() - began < 20000000LL) {}
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+    long long whole1 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+    long long system1 = stafeto_cpu_system_ns(0);
+    long long spin_user = (whole1 - system1) - (whole0 - system0);
+    long long spin_system = system1 - system0;
+    if (system1 < 0 || spin_user < 10000000LL || spin_system > spin_user / 8) return 297;
+    /* 20 ms of calls into the kernel. */
+    began = monotonic_ns();
+    while (monotonic_ns() - began < 20000000LL) sched_yield();
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+    long long whole2 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+    long long system2 = stafeto_cpu_system_ns(0);
+    long long thread2 = stafeto_cpu_system_ns(1);
+    long long call_user = (whole2 - system2) - (whole1 - system1);
+    long long call_system = system2 - system1;
+    if (system2 < 0 || call_system < 5000000LL || call_user >= call_system) return 298;
+    if (thread2 < thread0 + call_system / 2 || thread2 > system2) return 299;
+    /* Children that were waited for: none yet, and the call is whole. */
+    long long children = stafeto_cpu_system_ns(-1);
+    if (children < 0 || stafeto_cpu_system_ns(7) != -EINVAL) return 300;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -923,6 +968,8 @@ int main(int argc, char **argv) {
     if (signal_result) return signal_result;
     int credentials_result = credentials();
     if (credentials_result) return credentials_result;
+    int split_result = cpu_split();
+    if (split_result) return split_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

@@ -133,9 +133,12 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 /// and stops the machine. Then the scheduler decides who runs
 /// (sched::resume).
 #[unsafe(no_mangle)]
-extern "C" fn handle_user_exception(index: u64) -> ! {
-    crate::sched::entry_started();
-    let thread = thread::current().expect("an entry from EL0 with no thread running");
+extern "C" fn handle_user_exception(regs: *mut UserRegs, index: u64) -> ! {
+    let now = crate::sched::entry_started();
+    // SAFETY: vectors.S passes the register area of the running thread,
+    // the first field of the thread (TPIDR_EL1's block holds it).
+    let thread = unsafe { NonNull::new_unchecked(regs.cast::<Thread>()) };
+    thread::user_ran(thread, now);
     let syndrome = registers::esr_el1();
     match index {
         VECTOR_EL0_SYNC => match esr::svc_immediate(syndrome) {

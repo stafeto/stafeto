@@ -91,8 +91,13 @@ pub(crate) fn ask_value(w: &Writer) -> Result<u64, i32> {
 /// `ask` for the reply of a timer's setting: the time left and the
 /// interval, in nanoseconds.
 pub(crate) fn ask_setting(w: &Writer) -> Result<[u64; 2], i32> {
+    ask_pair(w)
+}
+
+/// `ask` for a reply of two u64 after the status.
+pub(crate) fn ask_pair(w: &Writer) -> Result<[u64; 2], i32> {
     answer(w, |bytes| match (bytes.u64(), bytes.u64()) {
-        (Ok(remaining), Ok(interval)) => Ok([remaining, interval]),
+        (Ok(first), Ok(second)) => Ok([first, second]),
         _ => Err(crate::constants::EIO),
     })?
 }
