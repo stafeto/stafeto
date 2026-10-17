@@ -256,6 +256,11 @@ fn split(names: &[String]) -> Split {
     }
 }
 
+/// The names of the probes of the kernel group.
+pub fn kernel_boot_names() -> Vec<String> {
+    split(&all_boot_names()).kernel
+}
+
 fn all_boot_names() -> Vec<String> {
     super::boot_jobs(Vec::new())
         .iter()
@@ -325,6 +330,9 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     }));
     steps.push(step("host", "clippy", &[], super::ci_lints));
     steps.push(step("host", "host tests", &[], super::host_tests));
+    steps.push(step("host", "kernel stack depth", &[], || {
+        super::wcet::run(&["stack".to_owned()])
+    }));
     steps.push(step("host", "shipping disassembly", &[KERNELS], || {
         let a = super::build(Variant::Normal)?;
         super::disasm::shipping(&a.elf, &super::llvm_tool("llvm-objdump")?)
@@ -343,6 +351,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("kernel", "timing boots", &BOOT_NEEDS, || {
         jobs::run_all(super::timing_jobs(), 1)
     }));
+    steps.push(step(
+        "kernel",
+        "trace plugin",
+        &BOOT_NEEDS,
+        super::wcet::smoke,
+    ));
     steps.push(step(
         "kernel",
         "measures",

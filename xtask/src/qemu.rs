@@ -193,6 +193,8 @@ pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String
         a.push("-initrd".into());
         a.push(b.display().to_string());
     }
+    // `wcet coverage` traces the kernel that runs (xtask/src/wcet.rs).
+    a.extend(crate::wcet::plugin_args(m.accel, kernel));
     a
 }
 

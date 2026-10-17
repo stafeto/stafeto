@@ -29,7 +29,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/qemu
-        key: qemu-${{ runner.arch }}-${{ env.QEMU_VERSION }}-1
+        key: qemu-${{ runner.arch }}-${{ env.QEMU_VERSION }}-2
         fail-on-cache-miss: ${{ inputs.build-qemu != 'true' }}
 
     - name: Build QEMU
@@ -40,7 +40,9 @@ runs:
         mkdir "$RUNNER_TEMP/qemu-src"
         tar -xJf "$RUNNER_TEMP/qemu.tar.xz" -C "$RUNNER_TEMP/qemu-src" --strip-components=1
         cd "$RUNNER_TEMP/qemu-src"
-        ./configure --prefix="$HOME/qemu" --target-list=aarch64-softmmu --disable-docs --disable-werror --disable-guest-agent --disable-user
+        # The plugin API (include/qemu-plugin.h is installed with QEMU) is what
+        # `cargo xtask wcet coverage` builds its trace plugin against.
+        ./configure --prefix="$HOME/qemu" --target-list=aarch64-softmmu --disable-docs --disable-werror --disable-guest-agent --disable-user --enable-plugins
         make -j"$(nproc)"
         make install
 
