@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 239;
+const INIT_TESTS: u32 = 240;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -8856,12 +8856,13 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 5] = [
+const SMP_PROBE_LINES: [&str; 6] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
     "smp: 16000 calls on 4 CPUs, each took OBJ",
     "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
+    "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
 ];
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG

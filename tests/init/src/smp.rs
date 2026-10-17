@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 7] = [
+pub(crate) const TESTS: [Test; 8] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -36,6 +36,10 @@ pub(crate) const TESTS: [Test; 7] = [
     (
         "smp_log_of_another_cpu_is_read_without_changing_it",
         log_across_cpus,
+    ),
+    (
+        "smp_raise_of_a_client_reaches_its_service_on_another_cpu",
+        raise_across_cpus,
     ),
 ];
 
@@ -556,5 +560,72 @@ fn log_across_cpus() -> Outcome {
         "a peek at a CPU that does not exist was not refused",
     )?;
     println!("smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice");
+    Ok(())
+}
+
+/// The service of the raise test: takes a request, and, while it works on
+/// it, watches its own priority until it is the one the client was raised
+/// to, or two seconds pass; mark 0 is what it saw last. Then it answers.
+extern "C" fn serve_until_raised(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    if let Ok(Received::Message { token, .. }) = sys::receive(&c)
+        && let Ok(own) = sys::self_thread()
+    {
+        let level = |t: &Handle<Thread>| sys::thread_info(t).map_or(0, |i| u64::from(i.priority));
+        let limit = now() + WAIT_NS;
+        loop {
+            let seen = level(&own);
+            MARKS[0].store(seen, Relaxed);
+            if seen >= u64::from(RAISED) || now() > limit {
+                break;
+            }
+            spin_loop();
+        }
+        let _ = token.reply(&[]);
+        let _ = own.close();
+    }
+    MARKS[3].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The level the client of the raise test is raised to.
+const RAISED: u8 = 40;
+
+/// A client on CPU 1 waits for the reply of a service on CPU 2, which works
+/// on its request at the client's level. Another thread raises the client
+/// (thread_set_priority, a command to CPU 1, which moves the client and goes
+/// on along the chain of requests, spec 6.6): the service, on CPU 2, is
+/// raised by a second command, and sees its own priority change.
+fn raise_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 3 {
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let server = spawn_on(0, 2, serve_until_raised, 0, LEVEL)?;
+    pause(20_000_000);
+    let client = spawn_on(1, 1, ask_once, 0, LEVEL)?;
+    pause(30_000_000);
+    let before = mark(0);
+    sys::thread_set_priority(&client, RAISED, Policy::Fifo).map_err(|_| "the raise failed")?;
+    let done = wait_for(|| mark(1) != 0 && mark(3) != 0);
+    let (seen, replied) = (mark(0), mark(1));
+    let_run()?;
+    for t in [server, client] {
+        close(t)?;
+    }
+    close(c)?;
+    check(done && replied == 1, "the client did not get its reply")?;
+    check(
+        before == u64::from(LEVEL),
+        "the service did not work at its client's level before the raise",
+    )?;
+    check(
+        seen >= u64::from(RAISED),
+        "a raise of the client did not reach its service on another CPU",
+    )?;
+    println!("smp: a client raised on CPU 1 raised its service on CPU 2 from {before} to {seen}");
     Ok(())
 }
