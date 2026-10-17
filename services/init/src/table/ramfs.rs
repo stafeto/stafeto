@@ -584,6 +584,11 @@ pub const OS_TEST_TABLE: &[Record] = &[
         connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
+        // 35 and a ceiling of 36, as high as the entropy service allows: the
+        // 32 real-time priorities of the tests are the levels 4 to 35, and
+        // SCHED_OTHER stands below them at 3.
+        priority: 35,
+        ceiling: 36,
         ..POSIX
     },
     super::entropy::RNG,

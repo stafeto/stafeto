@@ -29,18 +29,18 @@ pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
 
-/// The access `prot` asks for: write means read too, and code is not
-/// allowed (EACCES: the layer's objects carry no MAP_EXEC).
+/// The access `prot` asks for: write means read too, and code is read only.
 fn access_of(prot: i32) -> Result<Access, i32> {
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(EINVAL);
     }
-    if prot & PROT_EXEC != 0 {
-        return Err(EACCES);
-    }
-    Ok(match prot & (PROT_READ | PROT_WRITE) {
+    // PROT_EXEC is accepted and the pages are not executable: the objects
+    // of the layer carry no right to run code, so the bit asks for no more
+    // than reading (code in a mapping faults when it runs).
+    Ok(match prot & (PROT_READ | PROT_WRITE | PROT_EXEC) {
         0 => Access::None,
-        PROT_READ => Access::Read,
+        PROT_READ | PROT_EXEC => Access::Read,
+        p if p & PROT_WRITE == 0 => Access::Read,
         _ => Access::ReadWrite,
     })
 }
@@ -218,6 +218,9 @@ fn mmap0(
     }
     let shared = kind == MAP_SHARED;
     let pages = whole_pages(len)?;
+    // Under mlockall(MCL_FUTURE) a mapping is to be locked (EAGAIN past
+    // the limit of locked memory).
+    crate::resources::future_check((pages * PAGE) as u64)?;
     let fixed = flags & MAP_FIXED != 0;
     if fixed && !addr.is_multiple_of(PAGE) {
         return Err(EINVAL);

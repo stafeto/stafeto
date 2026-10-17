@@ -46,7 +46,7 @@ pub const SHM_MAX: u64 = 1 << 20;
 pub const QBYTES_DEFAULT: u32 = 8192;
 pub const QBYTES_MAX: u32 = 16384;
 /// The objects of a kind one root made at most.
-pub const ROOT_OBJECTS: usize = 6;
+pub const ROOT_OBJECTS: usize = 8;
 /// The semaphore adjustments, and the attachments and opens, the service
 /// keeps at most.
 pub const UNDO_MAX: usize = 32;

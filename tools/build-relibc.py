@@ -82,7 +82,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (ucontext.h, sys/vfs.h, si_band, SIGPOLL), PTHREAD_KEYS_MAX 1024, the
 # limit of pthread_atfork, sem_wait that a handler interrupts; tagged
 # pin-54be6cdf.
-COMMIT = "54be6cdf1b6b188bbb151ded29ba44b5d924f6c6"
+COMMIT = "21e5dc11f5864de95ea15b925b192252547c3843"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -772,12 +772,22 @@ pub unsafe extern "C" fn stafeto_fexecve(
 /// (`stafeto_probe_fork_window`) runs in the parent before ForkCommit.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fork() -> c_int {
+    // The child reads the files as the shared mappings of the parent show
+    // them.
+    mapping::flush_files();
     let set = FORK_WINDOW.load(core::sync::atomic::Ordering::Acquire) != 0;
     let window = set.then_some(fork_window as fn());
-    match call(|| posix_abi::fork::fork(window)) {
+    match call(|| posix_abi::fork::fork_held(window)) {
         Ok(pid) => pid,
         Err(errno) => -errno,
     }
+}
+
+/// The end of fork for relibc, after it let go of its locks: the signals
+/// that came while fork held them are delivered.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fork_done() {
+    posix_abi::fork::deliver_after_fork();
 }
 
 /// The probes of the window of exec (posix_abi::process): ExecCommit

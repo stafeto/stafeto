@@ -709,6 +709,12 @@ pub fn os_test_with_fixtures(
 /// of its own file with its time limit in milliseconds (`limits`, one for
 /// each test).
 pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> {
+    /// Tests that print a usage line without an argument: the number of
+    /// threads the suite's README gives them.
+    const ARGUMENTS: [(&str, &str); 2] = [
+        ("stress/mqueues/multi_send_rev_1", "2"),
+        ("stress/mqueues/multi_send_rev_2", "2"),
+    ];
     assert_eq!(tests.len(), limits.len());
     let mut files = os_test_with_fixtures(tests, &[]);
     files.retain(|f| f.path != "/os-test/list");
@@ -727,7 +733,11 @@ pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> 
             limit = Some(*ms);
         }
         let (directory, file) = name.rsplit_once('/').unwrap_or(("", name));
-        list.push_str(&format!("{name} /os-test/{directory} {file}\n"));
+        let argument = ARGUMENTS
+            .iter()
+            .find(|(test, _)| test == name)
+            .map_or(String::new(), |(_, arg)| format!(" {arg}"));
+        list.push_str(&format!("{name} /os-test/{directory} {file}{argument}\n"));
     }
     let list: &'static [u8] = Box::leak(list.into_bytes().into_boxed_slice());
     files.push(of(

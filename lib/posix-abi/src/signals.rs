@@ -735,12 +735,26 @@ pub(crate) fn route() -> bool {
             let _ = sys::notify(&channel, posix_sync::bit::WAKE);
             continue;
         }
+        // The thread that takes it is the one of the highest level among those
+        // the mask lets it through to: its handler runs at once, even while
+        // threads of a lower level hold the processor back.
+        let mut best = 0u8;
+        threads::each_block(|block| {
+            if block.end.load(Ordering::SeqCst) == 0
+                && block.flags.load(Ordering::SeqCst) & flag::EXITING == 0
+                && block.mask.load(Ordering::SeqCst) & bit == 0
+                && thread_pending(block) & bit == 0
+            {
+                best = best.max(posix_thread::effective_level(block));
+            }
+        });
         let mut entry = None;
         threads::each_block(|block| {
             if entry.is_some()
                 || block.end.load(Ordering::SeqCst) != 0
                 || block.flags.load(Ordering::SeqCst) & flag::EXITING != 0
                 || block.mask.load(Ordering::SeqCst) & bit != 0
+                || posix_thread::effective_level(block) < best
             {
                 return;
             }
