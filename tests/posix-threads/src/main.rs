@@ -307,14 +307,32 @@ fn fill_handles() -> Filled {
 /// Waits until the layer took back what the joined threads held (it does
 /// so once the kernel says they ended): their places, handles and memory.
 fn settle() -> bool {
-    for _ in 0..1000 {
+    settled(1)
+}
+
+/// Waits until `expected` places are occupied. A thread that was joined or
+/// detached still has to run its last call (`thread_exit`), and a thread
+/// below the caller's level never runs while the caller yields: a yield
+/// passes the processor to the same level only. Between its passes the wait
+/// therefore sleeps 1 ms, which lets every level run (a sleep takes no
+/// handle of the process, which the quota probes count), and its bound is
+/// a time (two seconds).
+fn settled(expected: usize) -> bool {
+    let limit = sys::clock_now().expect("settle clock") + 2_000_000_000;
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    loop {
         abi::relibc::collect();
-        if abi::relibc::occupied() == 1 {
+        if abi::relibc::occupied() == expected {
             return true;
         }
-        let _ = sys::yield_now();
+        if sys::clock_now().expect("settle clock") >= limit {
+            return false;
+        }
+        let _ = abi::threads::sleep::nanosleep(pause);
     }
-    false
 }
 
 fn failed(stage: usize) -> bool {

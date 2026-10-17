@@ -310,21 +310,10 @@ fn reserve_waits(base: usize) -> Result<(), usize> {
     CREATE_STOP.store(1, Ordering::Release);
     sys::notify(&create_go, 1).expect("kill-collect stop the creator");
     let mut value = ptr::null_mut();
-    if unsafe { ffi::pthread_join(helper, &mut value) } != 0 || !settled(base) {
+    if unsafe { ffi::pthread_join(helper, &mut value) } != 0 || !crate::settled(base) {
         return Err(1822);
     }
     Ok(())
-}
-
-fn settled(expected: usize) -> bool {
-    for _ in 0..1000 {
-        abi::relibc::collect();
-        if abi::relibc::occupied() == expected {
-            return true;
-        }
-        let _ = sys::yield_now();
-    }
-    false
 }
 
 pub(super) fn run() -> bool {
@@ -332,7 +321,7 @@ pub(super) fn run() -> bool {
     let ready_channel = sys::channel_create(30).expect("kill-collect ready channel");
     GATE.store(gate_channel.raw().0, Ordering::Release);
     READY.store(ready_channel.raw().0, Ordering::Release);
-    if !settled(1) {
+    if !crate::settled(1) {
         return failed(1801);
     }
     let base = abi::relibc::occupied();
@@ -361,7 +350,7 @@ pub(super) fn run() -> bool {
     if status != 0 && status != ESRCH {
         return failed(1805);
     }
-    if !settled(base) {
+    if !crate::settled(base) {
         return failed(1806);
     }
 
@@ -404,7 +393,7 @@ pub(super) fn run() -> bool {
     if status != 0 && status != ESRCH {
         return failed(1810);
     }
-    if !settled(base) {
+    if !crate::settled(base) {
         return failed(1811);
     }
     rt::println!(
