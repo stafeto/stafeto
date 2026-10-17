@@ -7,6 +7,8 @@
 KERNEL_PHYS = 0x40200000;
 KERNEL_VIRT = 0xFFFFFFFFC0000000;
 KOFF = KERNEL_VIRT - KERNEL_PHYS;
+/* Must equal kcore::bootinfo::MAX_CPUS. */
+MAX_CPUS = 8;
 
 ENTRY(_head)
 
@@ -72,6 +74,21 @@ SECTIONS
            "vectors.S tests another stack size")
     ASSERT(__stack_guard == boot_stack - 0x1000 && emergency_stack_top == __stack_guard,
            "the guard page and the emergency stack must lie right below the boot stack")
+
+    /* The kernel stacks of CPUs 1 and up, in the layout of the boot stack
+     * (vectors.S finds a CPU's emergency stack from its stack): the slot of
+     * CPU k is 128 KiB, the stack the upper 64 KiB, aligned to 128 KiB, with
+     * the guard page and the emergency stack right below it. CPU k's stack
+     * top is boot_stack_top + k * 128 KiB, which the first slot's start
+     * lets begin where the boot stack ends. mm::kmap leaves each guard page
+     * unmapped. */
+    .secondary_stacks (NOLOAD) : AT(ADDR(.secondary_stacks) - KOFF) {
+        secondary_stacks_start = .;
+        . += (MAX_CPUS - 1) * 0x20000;
+        secondary_stacks_end = .;
+    }
+    ASSERT(secondary_stacks_start == boot_stack_top && secondary_stacks_start % 0x10000 == 0 && (secondary_stacks_start + 0x10000) % 0x20000 == 0,
+           "the secondary stacks must start where the boot stack ends")
 
     . = ALIGN(4096);
     __image_end = .;

@@ -6,10 +6,11 @@
 //! linear map, and the devices the kernel uses.
 
 use super::phys::{self, Frames, LinearMem};
+use crate::arch::cpu::SLOT;
 use crate::arch::{mmu, symbols};
 use crate::boot::Boot;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::{Gic, Region};
+use kcore::bootinfo::{Gic, MAX_CPUS, Region};
 use kcore::frames::PhysMem;
 use kcore::layout::{LINEAR_BASE, image_pa};
 use kcore::memmap;
@@ -110,7 +111,7 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
             ),
             (
                 image.stack_guard + PAGE_SIZE as usize,
-                image.end,
+                image.secondary_stacks,
                 Attrs::KERNEL_DATA,
                 "boot stack",
             ),
@@ -125,6 +126,23 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 attrs,
                 what,
             );
+        }
+        // The slots of the stacks of CPUs 1 and up, each but for the guard
+        // page below its stack (kernel.ld).
+        for cpu in 1..MAX_CPUS {
+            let slot = image.secondary_stacks + (cpu - 1) * SLOT;
+            let guard = slot + SLOT / 2 - PAGE_SIZE as usize;
+            for (start, end) in [(slot, guard), (guard + PAGE_SIZE as usize, slot + SLOT)] {
+                map(
+                    &mut pt,
+                    &mut mem,
+                    start,
+                    pa(start),
+                    (end - start) as u64,
+                    Attrs::KERNEL_DATA,
+                    "stack of another CPU",
+                );
+            }
         }
         let ram = memmap::usable::<32>(boot.info.memory.as_slice(), boot.info.no_map.as_slice())
             .expect("linear map regions");

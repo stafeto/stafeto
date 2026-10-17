@@ -43,6 +43,9 @@ pub struct ImageLayout {
     pub text_end: usize,
     pub rodata_end: usize,
     pub stack_guard: usize,
+    /// Where the boot stack ends and the slots of the stacks of CPUs 1 and
+    /// up begin (kernel.ld).
+    pub secondary_stacks: usize,
     pub end: usize,
 }
 
@@ -52,6 +55,7 @@ pub fn image_layout() -> ImageLayout {
         text_end: symbol!("__text_end"),
         rodata_end: symbol!("__rodata_end"),
         stack_guard: symbol!("__stack_guard"),
+        secondary_stacks: symbol!("secondary_stacks_start"),
         end: symbol!("__image_end"),
     }
 }

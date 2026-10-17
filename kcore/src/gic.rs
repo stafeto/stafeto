@@ -85,9 +85,39 @@ pub const VIRTUAL_TIMER_INTID: u32 = 27;
 
 /// The bytes at the start of the first redistributor region of a GICv3
 /// that the kernel maps and searches for the redistributor of its CPU
-/// (spec 9): two frames of 128 KiB, or one of 256 KiB with vLPIs. The
-/// kernel runs on one CPU (spec 1.1), the first on every machine it boots.
-pub const REDISTRIBUTOR_WINDOW: u64 = 0x4_0000;
+/// (spec 9) for the redistributor of each CPU it starts: two frames of 128
+/// KiB, or one of 256 KiB with vLPIs, for each of MAX_CPUS CPUs.
+pub const REDISTRIBUTOR_WINDOW: u64 = 0x20_0000;
+
+/// GICD_SGIR (GICv2): software-generated interrupts [G25].
+pub const GICD_SGIR: usize = 0xF00;
+
+/// The SGIs of the kernel, from 0 as Linux takes them. Stage 2 of SMP
+/// uses them only for the probe of the pairs of CPUs.
+pub const SGI_PING: u32 = 0;
+pub const SGI_PONG: u32 = 1;
+pub const SGI_GO: u32 = 2;
+
+/// GICD_SGIR for SGI `intid` to the CPU interfaces in `targets` (the
+/// bits `own_interface` reads): TargetListFilter 0, the list in [23:16],
+/// INTID in [3:0].
+pub const fn sgir(targets: u32, intid: u32) -> u32 {
+    ((targets & 0xff) << 16) | (intid & 0xf)
+}
+
+/// ICC_SGI1R_EL1 (GICv3) for SGI `intid` to the CPU of `mpidr`: its Aff0
+/// picks the bit of TargetList within the range RS = Aff0 / 16 in [47:44],
+/// Aff1 in [23:16], Aff2 in [39:32], Aff3 in [55:48], INTID in [27:24],
+/// IRM clear.
+pub const fn sgi1r(mpidr: u64, intid: u32) -> u64 {
+    let aff0 = mpidr & 0xff;
+    (1 << (aff0 % 16))
+        | ((aff0 / 16) << 44)
+        | (((mpidr >> 8) & 0xff) << 16)
+        | (((mpidr >> 16) & 0xff) << 32)
+        | (((mpidr >> 32) & 0xff) << 48)
+        | (((intid & 0xf) as u64) << 24)
+}
 
 /// GICC_IAR reads 1020..=1023 when there is nothing to acknowledge.
 pub const FIRST_SPURIOUS: u32 = 1020;
@@ -231,6 +261,12 @@ impl Ack {
         self.0 & INTID_MASK
     }
 
+    /// The CPU interface that sent an SGI, GICC_IAR [12:10] (GICv2 only:
+    /// a GICv3 IAR has no source).
+    pub fn source(&self) -> u32 {
+        (self.0 >> 10) & 7
+    }
+
     /// The value to write to GICC_EOIR.
     pub fn eoi_value(self) -> u32 {
         self.0
@@ -240,6 +276,26 @@ impl Ack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sgi_registers() {
+        assert_eq!(sgir(0b0100, SGI_GO), (4 << 16) | 2);
+        assert_eq!(sgir(0x1ff, 0x13), (0xff << 16) | 3);
+        // CPU Aff0 = 5: bit 5 of the list in range 0.
+        assert_eq!(sgi1r(5, SGI_PONG), (1 << 5) | (1 << 24));
+        // Aff0 = 0x12: range 1, bit 2; Aff1 = 3, Aff2 = 4, Aff3 = 5.
+        let mpidr = (5 << 32) | (4 << 16) | (3 << 8) | 0x12;
+        assert_eq!(
+            sgi1r(mpidr, 7),
+            (1 << 2) | (1 << 44) | (3 << 16) | (4 << 32) | (5 << 48) | (7 << 24)
+        );
+    }
+
+    #[test]
+    fn an_sgi_acknowledge_names_its_source() {
+        let ack = Ack::from_iar((3 << 10) | 1).unwrap();
+        assert_eq!((ack.intid(), ack.source()), (1, 3));
+    }
 
     #[test]
     fn lines_come_from_typer() {

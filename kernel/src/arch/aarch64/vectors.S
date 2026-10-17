@@ -23,6 +23,8 @@
 .equ USER_ELR, 256
 .equ USER_SPSR, 264
 .equ USER_TPIDR, 272                    // TPIDR_EL0, then TPIDRRO_EL0
+.equ CPU_STACK_TOP, 16                  // offsets in arch::cpu::CpuBlock, which TPIDR_EL1 points at:
+                                        // the register area of the running thread comes first (0)
 
 .macro VECTOR index
     .org    exception_vectors + \index * 0x80   // fails to assemble if a slot overflows
@@ -36,6 +38,9 @@
 // their size, so bit KERNEL_STACK_SHIFT of the SP is set once the frame
 // would reach below the stack (kcore::layout::frame_fits). The test needs a
 // register: x0 and the SP swap through arithmetic, and nothing is lost.
+// Every CPU's stack has the layout of the boot stack: the emergency stack
+// and the guard page right below it, so the top of the emergency stack
+// follows from the SP that fell below the stack (kernel.ld).
 // Without room the entry stashes the SP and x0 in the EL0 thread registers
 // (the running thread's values are saved in its register area, and an
 // overflow stops the kernel, so nothing returns to EL0) and builds the
@@ -57,8 +62,9 @@
 1:  msr     tpidr_el0, x0               // interrupted SP - FRAME_SIZE
     sub     x0, sp, x0
     msr     tpidrro_el0, x0             // interrupted x0
-    adrp    x0, emergency_stack_top
-    add     x0, x0, :lo12:emergency_stack_top
+    mrs     x0, tpidr_el0               // the interrupted SP - FRAME_SIZE again
+    orr     x0, x0, #((1 << KERNEL_STACK_SHIFT) - 1)
+    sub     x0, x0, #0xfff              // (SP | 0xffff) + 1 is the stack's bottom; the guard page lies below it
     mov     sp, x0
     sub     sp, sp, #FRAME_SIZE
     mrs     x0, tpidrro_el0
@@ -69,13 +75,14 @@
 
 // Entry from EL0. SP_EL1 is the top of the kernel stack: return_to_user
 // leaves it there, so the stack is empty on every entry (spec 8.1). The
-// registers go straight into the running thread's area, which TPIDR_EL1
-// points at; x0 and x1 wait on the stack meanwhile, because the entry
+// registers go straight into the running thread's area, which the CPU
+// block that TPIDR_EL1 points at holds; x0 and x1 wait on the stack meanwhile, because the entry
 // needs two registers to work with.
 .macro USER_VECTOR index
     .org    exception_vectors + \index * 0x80
     stp     x0, x1, [sp, #-16]!
     mrs     x0, tpidr_el1
+    ldr     x0, [x0]                    // the running thread's registers: the first field of the CPU block
     stp     x2, x3, [x0, #(8 * 2)]
     ldp     x2, x3, [sp], #16
     stp     x2, x3, [x0]
@@ -192,15 +199,15 @@ user_exception:
     udf     #0                          // not reached: the handler returns to EL0 itself
 
 // return_to_user(regs x0): leaves the kernel for EL0 with the registers at
-// x0, which become the running thread's (TPIDR_EL1). SP_EL1 goes back to
-// the top of the kernel stack for the next entry. CLREX drops an exclusive
+// x0, which become the running thread's (the first field of the CPU block).
+// SP_EL1 goes back to the top of this CPU's kernel stack for the next entry. CLREX drops an exclusive
 // reservation, so that one thread's cannot let another's store-exclusive
 // succeed.
 .global return_to_user
 return_to_user:
-    msr     tpidr_el1, x0
-    adrp    x1, boot_stack_top
-    add     x1, x1, :lo12:boot_stack_top
+    mrs     x1, tpidr_el1
+    str     x0, [x1]
+    ldr     x1, [x1, #CPU_STACK_TOP]
     mov     sp, x1
     ldp     x1, x2, [x0, #USER_SP]      // SP_EL0, ELR
     msr     sp_el0, x1
