@@ -80,9 +80,10 @@ pub fn ask_boost(t: NonNull<Thread>, level: u8, ceiling: u8) {
 /// The end of `t`: the cause in bits 0-7, bit 8 when the owner drops the
 /// kernel's reference.
 pub fn ask_exit(t: NonNull<Thread>, held: bool, cause: u8) {
-    asked(t)
-        .exit
-        .store(0x200 | u16::from(held) << 8 | u16::from(cause), Ordering::Relaxed);
+    asked(t).exit.store(
+        0x200 | u16::from(held) << 8 | u16::from(cause),
+        Ordering::Relaxed,
+    );
 }
 
 /// What was asked of `t`: priority word, boost word, exit word; each is 0
@@ -168,7 +169,10 @@ impl Outbox {
 pub fn post(t: NonNull<Thread>, flag: u8) {
     debug_assert!(thread::cpu_of(t) != cpu::this().index());
     let mut o = local().outbox.lock();
-    assert!(o.n < OUTBOX, "a section posts more commands than the outbox holds");
+    assert!(
+        o.n < OUTBOX,
+        "a section posts more commands than the outbox holds"
+    );
     let n = o.n;
     o.items[n] = (t.as_ptr() as usize, flag);
     o.n += 1;
@@ -179,7 +183,10 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
 pub fn kick(to: usize) {
     debug_assert!(to != cpu::this().index());
     let mut o = local().outbox.lock();
-    assert!(o.n < OUTBOX, "a section posts more commands than the outbox holds");
+    assert!(
+        o.n < OUTBOX,
+        "a section posts more commands than the outbox holds"
+    );
     let n = o.n;
     o.items[n] = (to, 0);
     o.n += 1;

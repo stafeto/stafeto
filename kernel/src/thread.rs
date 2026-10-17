@@ -634,8 +634,14 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
     // SAFETY: the caller's promise; the counters are atomic. A teardown that
     // frees a buffer waits for them (`drop_buffer`).
     unsafe {
-        (*to.as_ptr()).numbers.copying.fetch_add(1, Ordering::Relaxed);
-        (*from.as_ptr()).numbers.copying.fetch_add(1, Ordering::Relaxed);
+        (*to.as_ptr())
+            .numbers
+            .copying
+            .fetch_add(1, Ordering::Relaxed);
+        (*from.as_ptr())
+            .numbers
+            .copying
+            .fetch_add(1, Ordering::Relaxed);
     }
     let mut pending = crate::local::local().copy.lock();
     assert!(pending.to.is_none(), "a message copy waits for another");
@@ -672,8 +678,14 @@ fn flush_copy_now() {
     // SAFETY: `copy_later`'s promise.
     unsafe {
         copy_message(to, from, start..end);
-        (*to.as_ptr()).numbers.copying.fetch_sub(1, Ordering::Release);
-        (*from.as_ptr()).numbers.copying.fetch_sub(1, Ordering::Release);
+        (*to.as_ptr())
+            .numbers
+            .copying
+            .fetch_sub(1, Ordering::Release);
+        (*from.as_ptr())
+            .numbers
+            .copying
+            .fetch_sub(1, Ordering::Release);
     }
 }
 

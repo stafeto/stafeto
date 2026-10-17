@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 232;
+const INIT_TESTS: u32 = 236;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1454,6 +1454,7 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("smp-boot") => smp_boots(),
+        Some("smp-probe") => smp_probes(),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
@@ -8801,9 +8802,48 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// hole fails, one child fewer faults, and init exits with 1. Gives the
 /// number of tests that passed.
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
+    init_tests_on(m, icount, 1)
+}
+
+/// The lines the tests of SMP stage 4 print when they ran on every one of
+/// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
+/// without them.
+const SMP_PROBE_LINES: [&str; 4] = [
+    "smp: 4 CPUs, threads ran together on every CPU",
+    "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
+    "smp: suspend and kill stopped the threads of the child on 4 CPUs",
+    "smp: 16000 calls on 4 CPUs, each took OBJ",
+];
+
+/// `cargo xtask smp-probe`: the test init on `-smp 4` on the four TCG
+/// machines and, on Apple silicon, the two HVF ones: all its tests, and
+/// each test of SMP stage 4 on four CPUs.
+fn smp_probes() -> Result<(), String> {
+    let mut machines = vec![
+        &qemu::VIRT,
+        &qemu::VIRT_V3,
+        &qemu::VIRT_EL2,
+        &qemu::VIRT_EL2_V3,
+    ];
+    match hvf_host() {
+        Ok(()) => machines.extend([&qemu::HVF_V3, &qemu::HVF_V2]),
+        Err(why) => println!("smp-probe: HVF skipped: {why}"),
+    }
+    for m in machines {
+        init_tests_on(m, false, SMP_CPUS)?;
+    }
+    Ok(())
+}
+
+/// `init_tests` with `cpus` CPUs: with more than one, the lines of the tests
+/// of SMP stage 4 must be there.
+fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, String> {
     let a = build(Variant::Normal)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
+    if cpus > 1 {
+        cmd.args(["-smp", &cpus.to_string()]);
+    }
     cmd.args(qemu::HEADLESS);
     if icount {
         cmd.args(qemu::ICOUNT);
@@ -8824,6 +8864,11 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     }
     for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
+    }
+    if cpus == SMP_CPUS {
+        for line in SMP_PROBE_LINES {
+            qemu::expect_line(&o, line)?;
+        }
     }
     log_markers(&o)?;
     child_panic_comes_whole(&o.lines)?;

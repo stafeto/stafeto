@@ -362,7 +362,10 @@ pub fn serve_exit(t: NonNull<Thread>) {
 /// The word of `thread_set_priority`'s ask: the priority, the policy and
 /// the tail, with a bit that says there is one.
 fn pack_level(priority: u8, policy: Policy, tail: bool) -> u16 {
-    1 << 15 | u16::from(tail) << 9 | u16::from(policy == Policy::RoundRobin) << 8 | u16::from(priority)
+    1 << 15
+        | u16::from(tail) << 9
+        | u16::from(policy == Policy::RoundRobin) << 8
+        | u16::from(priority)
 }
 
 fn unpack_level(word: u16) -> (u8, Policy, bool) {

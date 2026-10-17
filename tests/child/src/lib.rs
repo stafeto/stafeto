@@ -306,10 +306,15 @@ pub enum Role {
     /// Role::Server, whose handler of server::BUSY spins, yielding, until
     /// a notification comes to handle 1, a channel with RECEIVE.
     Busy = 33,
+    /// A thread on each CPU from 1 to argument 0 minus one, at priority
+    /// argument 1, each adds 1 to its mark (the CPU's number) for ever;
+    /// handle 0 is the child's own process. The first thread ends once they
+    /// run, so that threads of init that are lower never starve.
+    SmpSpin = 34,
 }
 
 impl Role {
-    pub const ALL: [Role; 33] = [
+    pub const ALL: [Role; 34] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -343,6 +348,7 @@ impl Role {
         Role::Spans,
         Role::Server,
         Role::Busy,
+        Role::SmpSpin,
     ];
 
     /// The role whose code is `code`.
