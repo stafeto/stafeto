@@ -11,7 +11,9 @@
 use super::call;
 use core::ffi::{c_int, c_void};
 use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM};
-use posix_abi::mmap::{self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_READ, PROT_WRITE};
+use posix_abi::mmap::{
+    self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
+};
 
 const PAGE: usize = 4096;
 /// The lowest number the layer's descriptors of mapped files take: near the
@@ -86,6 +88,23 @@ fn fill(fd: c_int, address: usize, len: usize, offset: u64) {
             break;
         }
         done += got as usize;
+    }
+}
+
+/// The pages of a mapping of a file that lie wholly past its end get no
+/// access, and a reference to them is SIGBUS.
+fn cut_past_end(fd: c_int, address: usize, len: usize, offset: u64, prot: c_int) {
+    let Ok((size, _)) = file_info(fd) else {
+        return;
+    };
+    let in_file = size.div_ceil(PAGE as u64).saturating_sub(offset / PAGE as u64) as usize;
+    let pages = len.div_ceil(PAGE);
+    if in_file < pages {
+        let start = address + in_file * PAGE;
+        let tail = (pages - in_file) * PAGE;
+        if mmap::mprotect(start, tail, PROT_NONE).is_ok() {
+            mmap::mark_past_end(start, start + tail, prot);
+        }
     }
 }
 
@@ -256,6 +275,7 @@ fn private_file(
         let _ = mmap::munmap(address, len);
         return Err(errno);
     }
+    cut_past_end(fd, address, len, offset, prot);
     Ok(address)
 }
 
@@ -354,6 +374,7 @@ fn shared_file(
         close_released();
         return Err(errno);
     }
+    cut_past_end(kept, address, len, offset, prot);
     Ok(address)
 }
 

@@ -11,9 +11,10 @@
 //! process is the level its main thread starts at (the layer keeps the level
 //! above it); priority 32 stands there, and priority p below it, down to
 //! level 1: the level of priority p is `top - 32 + p`, at least 1 and at
-//! most the top. SCHED_OTHER is the level below priority 1 (`top - 32`, at
-//! least 1): a thread of a real-time policy runs before the threads that
-//! have none, and the main thread moves there when the process starts.
+//! most the top. A process whose top is above 32 has SCHED_OTHER at `top - 32`,
+//! below priority 1: a thread of a real-time policy runs before the threads
+//! that have none, and the main thread moves there when the process starts.
+//! With a top of 32 or less SCHED_OTHER stays at the top, the base level.
 //!
 //! A thread's POSIX policy and priority are in its block (`sched`); its
 //! base level follows from them (`base_level`). The level it runs at is the
@@ -95,7 +96,13 @@ fn kernel_policy(policy: i32) -> Policy {
 
 /// The level of SCHED_OTHER under a process whose top level is `top`.
 fn other_level(top: u8) -> u8 {
-    top.saturating_sub(MAX_PRIORITY as u8).max(1)
+    // With room under the top for 32 levels of priorities, SCHED_OTHER is
+    // below them; a process with less room keeps it at the top.
+    if i32::from(top) > MAX_PRIORITY {
+        top - MAX_PRIORITY as u8
+    } else {
+        top
+    }
 }
 
 /// The base level and the kernel policy of `policy` and `priority`: EINVAL
@@ -106,7 +113,7 @@ pub(crate) fn level_of(policy: i32, priority: i32) -> Result<(u8, Policy), i32> 
         SCHED_OTHER if priority == 0 => Ok((other_level(top), Policy::RoundRobin)),
         SCHED_FIFO | SCHED_RR if (MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) => {
             // At least one above SCHED_OTHER, at most the top.
-            let level = (i32::from(top) - MAX_PRIORITY + priority).clamp(2, i32::from(top)) as u8;
+            let level = (i32::from(top) - MAX_PRIORITY + priority).max(1) as u8;
             Ok((level, kernel_policy(policy)))
         }
         _ => Err(EINVAL),

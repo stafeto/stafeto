@@ -83,7 +83,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # limit of pthread_atfork, sem_wait that a handler interrupts, scheduling and
 # memory options, the end of fork, guard pages of stacks; tagged
 # pin-63f13a12.
-COMMIT = "63f13a120bd33d1247e05e0a540ebbbb446bf040"
+COMMIT = "71a760dfb53b4a326071e645d7ba855d3d63b142"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

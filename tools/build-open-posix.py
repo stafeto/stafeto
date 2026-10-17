@@ -77,6 +77,17 @@ def clang() -> str:
     return found
 
 
+# Mistakes of the suite that stop a test from compiling anywhere: the member
+# `cid` that `stress1.c` of pthread_cond_wait sets is missing from its
+# `struct childdata` (the file of pthread_cond_timedwait has it).
+SOURCE_FIXES = {
+    "stress/threads/pthread_cond_wait/stress1.c": (
+        "\tint fork;\n\tint *pBool;\n};",
+        "\tint fork;\n\tint *pBool;\n\tclockid_t cid;\n};",
+    ),
+}
+
+
 def fetch() -> None:
     """Download the release (once), check it, unpack the suite alone."""
     done = SOURCE / ".unpacked"
@@ -103,6 +114,12 @@ def fetch() -> None:
             target = SOURCE / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(tar.extractfile(member).read())
+    for name, (old, new) in SOURCE_FIXES.items():
+        path = SOURCE / name
+        text = path.read_text()
+        if old not in text:
+            raise SystemExit(f"{name}: the text to fix is not there")
+        path.write_text(text.replace(old, new, 1))
     done.write_text(SHA256)
 
 
