@@ -20,7 +20,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use cpu::{CpuBlock, MAX_CPUS, UP};
 use kcore::bootinfo::MPIDR_AFFINITY;
-use kcore::gic::{Ack, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
+use kcore::gic::{Ack, SGI_CMD, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
 use kcore::layout::image_pa;
 
 /// What a CPU reads with its MMU and caches off, at the physical address
@@ -190,14 +190,10 @@ extern "C" fn secondary_main(block: &'static CpuBlock) -> ! {
         .level
         .store(registers::current_el() as u32, Ordering::Relaxed);
     block.timer_ok.store(timer_ok as u32, Ordering::Relaxed);
+    crate::sched::init_cpu();
     block.state.store(UP, Ordering::Release);
-    // This CPU only serves SGIs: no period of reclamation waits for it.
-    crate::qsbr::park_cpu(block.index());
-    loop {
-        if let Some(ack) = gic::wait() {
-            handle(ack);
-        }
-    }
+    // From here the CPU schedules the threads that are placed on it.
+    crate::sched::resume()
 }
 
 /// `PING[to][from]`: `from` wrote it for `to` before the SGI. Reset by
@@ -252,6 +248,8 @@ pub fn handle(ack: Ack) {
         SGI_GO if gic::sgi_from(&ack, 0) && GO[me].swap(0, Ordering::Acquire) != 0 => {
             ping_all(me, cpus)
         }
+        // The commands are in the queues to this CPU: any sender's.
+        SGI_CMD => crate::cmd::drain(),
         SGI_LOCK if gic::sgi_from(&ack, 0) && LOCK_GO[me].swap(0, Ordering::Acquire) != 0 => {
             lock_rounds(me)
         }

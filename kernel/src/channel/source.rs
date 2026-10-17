@@ -235,7 +235,7 @@ pub unsafe fn post(
             (*t.as_ptr()).waits = None;
             syscall::set_notification(t, n);
             k.s.boost(t, priority, ceiling(t));
-            k.s.wake(t);
+            sched::wake(k, t);
         }
         true
     });

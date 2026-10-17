@@ -233,7 +233,14 @@ pub(super) fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 /// (source Exit), unless that exit ended the process (thread::exit).
 pub(super) fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
-    let policy = policy_arg(a[5])?;
+    // The policy in bits 0-15 and the CPU plus one in bits 16-23, 0 for the
+    // CPU of the caller (abi::THREAD_CPU_SHIFT).
+    let policy = policy_arg(a[5] & 0xffff)?;
+    let cpu = match a[5] >> abi::THREAD_CPU_SHIFT {
+        0 => None,
+        n if n <= crate::smp::cpus() as u64 => Some(n as usize - 1),
+        _ => return Err(Error::InvalidArgs),
+    };
     check_start(a[1], a[2], priority)?;
     check_buffer(a[6])?;
     let notice = notify_priority_arg(a[8], a[7] != 0)?;
@@ -264,6 +271,9 @@ pub(super) fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values,
     let exit = exit.map(|(c, label)| (c, label, notice));
     let (entry, stack) = (a[1] as usize, a[2] as usize);
     let t = thread::create_with_exit(target, entry, stack, a[3], priority, policy, exit)?;
+    if let Some(cpu) = cpu {
+        thread::set_cpu(t, cpu);
+    }
     let h = thread::give_buffer(t, buffer)
         .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));
     // SAFETY: the reference `create` handed out goes; the handle, if it

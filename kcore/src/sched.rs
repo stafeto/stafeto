@@ -254,6 +254,14 @@ impl<T> Node<T> {
         self.state
     }
 
+    /// Whether the node stands in a `ParkedList`: linked, in no ready
+    /// queue. Unlike `state`, which the CPU of the thread changes, a list
+    /// changes under the lock of the objects, so this one is true for every
+    /// CPU that holds it.
+    pub fn is_parked_listed(&self) -> bool {
+        self.link.next.is_some() && !self.link.queued
+    }
+
     /// Ticks left of the quantum of a ready round-robin thread.
     pub fn slice_left(&self) -> u64 {
         self.slice_left

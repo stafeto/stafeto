@@ -22,6 +22,7 @@ mod arch;
 mod boot;
 mod channel;
 mod cleanup;
+mod cmd;
 mod init;
 mod interrupt;
 mod irq;

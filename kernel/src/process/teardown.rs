@@ -424,6 +424,15 @@ unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
     let mut work = 0;
     let mut work_in_section = 0;
     let mut section = None;
+    {
+        // Nothing leaves the scheduler while a thread of the process may
+        // still run at EL0 on another CPU (control::mark_ending).
+        let _section = crate::obj::lock();
+        // SAFETY: the caller's promise.
+        if unsafe { !super::control::gate_seen(process) } {
+            return false;
+        }
+    }
     // SAFETY: the caller's promise; a thread in the list is alive, since a
     // release only queues it, and its portion takes it out of the list
     // first.
@@ -496,7 +505,7 @@ unsafe fn wake_clients(process: NonNull<Process>, level: u8) -> bool {
                 };
                 (*t.as_ptr()).waits = None;
                 syscall::set_result(t, Err(Error::PeerClosed));
-                k.s.wake(t);
+                sched::wake(k, t);
                 heads += 1;
             }
             Some((heads, !accepted(process, k.s).is_empty()))

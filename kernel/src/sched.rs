@@ -31,7 +31,7 @@ use crate::{cleanup, syscall};
 use abi::{Error, Policy};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
+use kcore::sched::{Armed, Decision, Scheduler, Timer};
 use kcore::time::Clock;
 use kcore::token::Table;
 
@@ -196,11 +196,19 @@ impl Timer for VirtualTimer {
 /// 250 000 at QEMU's 62.5 MHz, 96 000 at the A64's 24 MHz. Runs at boot,
 /// before any thread starts.
 pub fn init(clock: Clock) {
-    local()
-        .sched
-        .lock()
-        .s
-        .set_quantum(clock.ns_to_ticks(abi::RR_QUANTUM_NS));
+    let quantum = clock.ns_to_ticks(abi::RR_QUANTUM_NS);
+    QUANTUM.store(quantum, core::sync::atomic::Ordering::Relaxed);
+    local().sched.lock().s.set_quantum(quantum);
+}
+
+/// The quantum in ticks, which every CPU's scheduler takes (`init_cpu`).
+static QUANTUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Sets the quantum of the scheduler of the CPU that runs this, which
+/// `init` set on CPU 0.
+pub fn init_cpu() {
+    let quantum = QUANTUM.load(core::sync::atomic::Ordering::Relaxed);
+    local().sched.lock().s.set_quantum(quantum);
 }
 
 /// A stopped thread becomes ready: the tail of its level with a new
@@ -208,11 +216,165 @@ pub fn init(clock: Clock) {
 /// BAD_STATE for a thread that started before. thread::start comes here,
 /// once it knows the thread's process lives.
 pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
-    // SAFETY: the caller holds a reference to `t`; the one taken below keeps
-    // it alive, and a pool object never moves, until `exit`.
-    unsafe { local().sched.lock().s.start(t)? };
+    if !thread::mark_started(t) {
+        return Err(Error::BadState);
+    }
     thread::retain(t);
+    if is_local(t) {
+        // SAFETY: the caller holds a reference to `t`; the one taken above
+        // keeps it alive, and a pool object never moves, until `exit`.
+        unsafe { local().sched.lock().s.start(t) }.expect("a thread that started before");
+    } else {
+        crate::cmd::post(t, crate::cmd::START);
+    }
     Ok(())
+}
+
+/// Whether the thread `t` runs on this CPU, which changes its scheduling
+/// state (cmd.rs).
+#[inline(always)]
+pub fn is_local(t: NonNull<Thread>) -> bool {
+    thread::cpu_of(t) == arch::cpu::this().index()
+}
+
+/// The end of a wait of `t`, which the section took out of its queue:
+/// ready on its own CPU, at once when that is this one, by a command
+/// otherwise (cmd::WAKE).
+///
+/// # Safety
+/// As for `Scheduler::wake`.
+#[inline(always)]
+pub unsafe fn wake(k: &mut Locked<'_>, t: NonNull<Thread>) {
+    if is_local(t) {
+        // SAFETY: the caller's promise.
+        unsafe { k.s.wake(t) };
+    } else {
+        crate::cmd::post(t, crate::cmd::WAKE);
+    }
+}
+
+/// The thread `t`, parked and out of its process's list, continues: on its
+/// CPU, by a command when that is another one (cmd::UNPARK).
+///
+/// # Safety
+/// As for `Scheduler::unpark`.
+pub unsafe fn unpark(k: &mut Locked<'_>, t: NonNull<Thread>) {
+    if is_local(t) {
+        // SAFETY: the caller's promise.
+        unsafe { k.s.unpark(t) };
+    } else {
+        crate::cmd::post(t, crate::cmd::UNPARK);
+    }
+}
+
+/// A boost of `t` to `level`: on its own CPU at once when that is this one,
+/// by a command otherwise, which also moves its slot in the queue it waits
+/// in and goes on along the chain of requests (cmd::BOOST, `serve_level`).
+/// True when it was done here.
+///
+/// # Safety
+/// As for `Scheduler::boost`.
+pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: u8) -> bool {
+    if is_local(t) {
+        // SAFETY: the caller's promise.
+        unsafe { k.s.boost(t, level, ceiling) };
+        return true;
+    }
+    crate::cmd::ask_boost(t, level, ceiling);
+    crate::cmd::post(t, crate::cmd::BOOST);
+    false
+}
+
+/// START, served by the CPU of the thread.
+pub fn serve_start(t: NonNull<Thread>) {
+    // SAFETY: the kernel's reference, which `start` took, keeps the thread.
+    unsafe { local().sched.lock().s.start(t) }.expect("a thread that started before");
+}
+
+/// UNPARK, served by the CPU of the thread.
+pub fn serve_unpark(t: NonNull<Thread>) {
+    // SAFETY: as above; the portion that asked took the thread out of its
+    // process's list.
+    unsafe { local().sched.lock().s.unpark(t) };
+}
+
+/// WAKE, served by the CPU of the thread.
+pub fn serve_wake(t: NonNull<Thread>) {
+    // SAFETY: as above; the section that asked took the thread out of its
+    // queue.
+    unsafe { local().sched.lock().s.wake(t) };
+}
+
+/// LEVEL and BOOST, served by the CPU of the thread, under OBJ: the new
+/// level, then the boost, then the slot of a thread that waits follows its
+/// level in its queue (`channel::requeue`), and the rise goes on along the
+/// chain of requests.
+pub fn serve_level(t: NonNull<Thread>) {
+    if thread::try_index(t).is_none() {
+        // The thread ended on its own CPU meanwhile.
+        return;
+    }
+    let (level, boost, _) = crate::cmd::take_asked(t);
+    let _section = crate::obj::lock();
+    let now = timer::now();
+    let waits = locked(|k| {
+        // SAFETY: as above; the scheduler's threads are alive.
+        unsafe {
+            if level != 0 && thread::is_held(t) {
+                let (priority, policy, tail) = unpack_level(level);
+                let _ = k.s.set_priority(t, priority, policy, tail, now);
+            }
+            if boost != 0 && thread::is_held(t) {
+                k.s.boost(t, (boost & 0x3f) as u8, ((boost >> 6) & 0x3f) as u8);
+            }
+            channel::requeue(t, k)
+        }
+    });
+    if let Some(w) = waits {
+        // SAFETY: the thread still waits in `w`.
+        unsafe { channel::raise(w) };
+    }
+}
+
+/// EXIT, served by the CPU of the thread: it leaves the scheduler, its
+/// registers stop being the CPU's live ones, and the kernel's reference
+/// goes when the asker left it to this CPU.
+pub fn serve_exit(t: NonNull<Thread>) {
+    // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
+    let (_, _, ask) = crate::cmd::take_asked(t);
+    let _section = crate::obj::lock();
+    // SAFETY: as above.
+    unsafe { local().sched.lock().s.exit(t, timer::now()) };
+    if thread::current() == Some(t) {
+        arch::user::clear_current();
+    }
+    locked(|k| {
+        // SAFETY: the thread is alive; its number goes back with its end.
+        unsafe { thread::give_number(t, k.tokens) }
+    });
+    if ask & 0x100 != 0 {
+        // SAFETY: the reference is the one `start` took, which the ask
+        // handed to this CPU.
+        unsafe { thread::release(t, (ask & 0xff) as u8) };
+    }
+}
+
+/// The word of `thread_set_priority`'s ask: the priority, the policy and
+/// the tail, with a bit that says there is one.
+fn pack_level(priority: u8, policy: Policy, tail: bool) -> u16 {
+    1 << 15 | u16::from(tail) << 9 | u16::from(policy == Policy::RoundRobin) << 8 | u16::from(priority)
+}
+
+fn unpack_level(word: u16) -> (u8, Policy, bool) {
+    (
+        (word & 0xff) as u8,
+        if word & 0x100 != 0 {
+            Policy::RoundRobin
+        } else {
+            Policy::Fifo
+        },
+        word & 0x200 != 0,
+    )
 }
 
 /// Ends `t` for the scheduler, whatever its state: it never runs again,
@@ -228,26 +390,43 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
+    // A thread that started runs on its CPU, which ends it (cmd::EXIT); one
+    // that never started stands in no scheduler.
+    let remote = thread::is_started(t) && !is_local(t);
     let (held, waited) = locked(|k| {
-        // SAFETY: `t` is alive; its node is read before the scheduler takes it.
-        let state = unsafe { t.as_ref() }.sched.state();
-        if state == State::Parked {
+        // SAFETY: `t` is alive; the list of a process's parked threads is
+        // under OBJ.
+        if unsafe { t.as_ref() }.sched.is_parked_listed() {
             // SAFETY: a parked thread belongs to its process list.
             unsafe { crate::process::unlist_parked(t, k) };
         }
         // SAFETY: `t` and the scheduler's threads are alive; the queue
         // gives up the thread before the scheduler ends it.
         let waited = unsafe { channel::cancel(t, k) };
-        // SAFETY: as above.
-        unsafe {
-            k.s.exit(t, timer::now());
-            thread::give_number(t, k.tokens);
+        if !remote {
+            // SAFETY: as above.
+            unsafe { k.s.exit(t, timer::now()) };
         }
-        (!matches!(state, State::Stopped | State::Dead), waited)
+        if remote {
+            // The number goes back once the owner ended the thread
+            // (`serve_exit`): the arguments of its commands lie under it.
+            crate::cmd::ask_exit(t, thread::mark_ended(t), cause);
+            return (false, waited);
+        }
+        // SAFETY: as above.
+        unsafe { thread::give_number(t, k.tokens) };
+        (thread::mark_ended(t), waited)
     });
     if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
         unsafe { via.let_go(cause) };
+    }
+    if remote {
+        crate::cmd::post(t, crate::cmd::EXIT);
+        return;
+    }
+    if thread::current() == Some(t) {
+        arch::user::clear_current();
     }
     if held {
         // SAFETY: the reference `start` took ends with the thread.
@@ -295,13 +474,19 @@ pub unsafe fn request_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error>
     // SAFETY: as the caller promises.
     unsafe {
         interrupt_if(t, cause, |thread| {
-            if matches!(thread.sched.state(), State::Stopped | State::Dead) {
+            if !thread.is_held() {
                 return Err(Error::BadState);
             }
             Ok(thread.upcall.request()?
                 && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
         })
+    }?;
+    if !is_local(t) {
+        // The thread may be at EL0 on its CPU: that CPU enters the kernel
+        // and the way back to EL0 finds the request (thread::run).
+        crate::cmd::kick(thread::cpu_of(t));
     }
+    Ok(())
 }
 
 /// Under the lock, `decide` says whether to end the send or receive of
@@ -329,7 +514,7 @@ unsafe fn interrupt_if(
             ));
             let waited = channel::withdraw(t, k);
             syscall::set_result(t, Err(Error::Interrupted));
-            k.s.wake(t);
+            wake(k, t);
             Ok::<_, Error>(Some(waited))
         }
     })?;
@@ -370,6 +555,19 @@ pub fn set_priority(
     tail: bool,
 ) -> Result<(), Error> {
     let now = timer::now();
+    if thread::is_started(t) && !is_local(t) {
+        // The CPU of the thread applies it, moves the slot of a thread that
+        // waits and goes on along the chain of requests (`serve_level`).
+        // A thread that ended is BAD_STATE, as for a local one.
+        return locked(|_| {
+            if !thread::is_held(t) {
+                return Err(Error::BadState);
+            }
+            crate::cmd::ask_level(t, pack_level(priority, policy, tail));
+            crate::cmd::post(t, crate::cmd::LEVEL);
+            Ok(())
+        });
+    }
     let waits = locked(|k| {
         // SAFETY: the caller holds a reference to `t`; the scheduler's
         // threads are alive, and so is the channel a thread waits in.
@@ -492,6 +690,14 @@ pub fn resume() -> ! {
 /// nothing. Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
+        if crate::cmd::posted() {
+            crate::cmd::flush();
+        }
+        // The kernel stack is empty: a quiescent point for the objects that
+        // other CPUs retire, and the way to EL0 follows (qsbr).
+        if crate::qsbr::pending() {
+            crate::qsbr::quiesce();
+        }
         let mut now = timer::now();
         entry_polled_at(now);
         if arch::irq_pending()

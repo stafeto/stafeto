@@ -232,7 +232,7 @@ unsafe fn take_request(
         if let Err(e) = fit {
             (*client.as_ptr()).waits = None;
             syscall::set_result(client, Err(e));
-            k.s.wake(client);
+            sched::wake(k, client);
             syscall::restart(t);
             return Taken::Request(via, Some(client));
         }
@@ -319,7 +319,7 @@ pub fn send(
             let r = meet(k, t, via, desc, crate::arch::timer::now());
             assert!(r == receiver, "the receiver of a request changed");
             if let Some(r) = r {
-                k.s.wake(r);
+                sched::wake(k, r);
             }
             r.is_some()
         }
@@ -357,6 +357,10 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
                 return None;
             }
             let r = thread_of(q.head()?);
+            if !sched::is_local(r) {
+                // The receiver of another CPU wakes by a command: the slow path.
+                return None;
+            }
             let n = &r.as_ref().sched;
             let boost = n.boost().max(t.as_ref().priority().min(ceiling(r)));
             let level = n.base().max(boost);
@@ -554,7 +558,7 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
                 Ok(()) => deliver(client, t, desc),
                 Err(e) => syscall::set_result(client, Err(e)),
             }
-            k.s.wake(client);
+            sched::wake(k, client);
         }
     });
     if fit.is_err() {
@@ -684,7 +688,11 @@ unsafe fn lift_servers(client: NonNull<Thread>, k: &mut Locked<'_>) {
             let Some(server) = serving(from, k) else {
                 return;
             };
-            k.s.boost(server, from.as_ref().priority(), ceiling(server));
+            if !sched::boost(k, server, from.as_ref().priority(), ceiling(server)) {
+                // The CPU of the server raises it, moves its slot and goes
+                // on along the chain (sched::serve_level).
+                return;
+            }
             match move_slot(server, k) {
                 Some(Wait::Reply(_)) => from = server,
                 _ => return,

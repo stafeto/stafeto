@@ -157,12 +157,18 @@ pub struct Process {
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
-    /// thread of the process runs only while it is 0. Read Relaxed: the
-    /// EL0 return takes a hint and `park_selected` decides under the
-    /// OBJ, which orders the decision. Written by atomic
-    /// read-modify-write with Release (no Acquire pairs with it);
+    /// thread of the process runs only while it is 0. The EL0 return reads
+    /// it with Acquire, after the CPU's quiescent mark, which orders the
+    /// read after the writer's `qsbr::begin_wait`: the CPU that passed a
+    /// point after the write sees the gate. `park_selected` decides under
+    /// OBJ. Written by atomic read-modify-write with Release;
     /// `SUSPENDED` changes under OBJ.
     gate: AtomicU8,
+    /// The epoch of the quiescent points that every CPU has to pass after
+    /// the end set `ENDING`, until the stage Threads saw it done; 0 for none
+    /// (qsbr::begin_wait). A thread of the process may be at EL0 on another
+    /// CPU until that CPU entered the kernel and saw the gate.
+    stop_epoch: u64,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,
     /// Nonzero while a continuation owns the cleanup item and a reference.
@@ -357,6 +363,7 @@ fn create(
         threads: None,
         thread_count: 0,
         gate: AtomicU8::new(0),
+        stop_epoch: 0,
         parked: ParkedList::new(),
         resume_level: 0,
         parent: None,
