@@ -551,8 +551,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// getlogin code) added 3 pages to the 474: 477 measured, and 532 pages leave
 /// 10.3%. The priority probe of the steps (two threads of the spawners, the
 /// semaphores, the offsets of the asks) added 5: 482 measured, and 540 pages
-/// leave 10.7%.
-const STEPS_QUOTA: u64 = 540 * PAGE;
+/// leave 10.7%. Goal I (64 signals with their tables of claims, the queue
+/// of the library's timers, the claims of the memory limits) added 12: 494
+/// measured, and 552 pages leave 10.5%.
+const STEPS_QUOTA: u64 = 552 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping
