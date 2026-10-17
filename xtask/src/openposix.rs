@@ -397,6 +397,13 @@ pub enum Select {
 
 /// The run of the tests `select` names.
 pub fn run(select: Select, jobs: usize) -> Result<(), String> {
+    run_part(select, jobs, None)
+}
+
+/// The `index`-th of `count` parts of the tests listed in PASSING (every
+/// `count`-th name of the sorted list, from `index`), run and checked on
+/// their own (`cargo xtask ci --group open-posix-N`).
+pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Result<(), String> {
     let pinned = matches!(select, Select::Pinned);
     let wanted_name = |name: &str, listed: &BTreeSet<&str>| match &select {
         Select::Pinned => listed.contains(name),
@@ -411,6 +418,10 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
     ostest::use_licence(LICENCE, work.join("source/COPYING"));
     let list = std::fs::read_to_string(crate::root().join(PASSING))
         .map_err(|e| format!("{PASSING}: {e}"))?;
+    let list = match part {
+        Some((index, count)) => part_of(&list, index, count),
+        None => list,
+    };
     let listed: BTreeSet<&str> = list
         .lines()
         .map(str::trim)
@@ -561,9 +572,37 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// The lines of the list of passes `list` that fall to part `index` of
+/// `count`.
+fn part_of(list: &str, index: usize, count: usize) -> String {
+    list.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .enumerate()
+        .filter(|(n, _)| n % count == index)
+        .map(|(_, l)| format!("{l}\n"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_parts_of_the_list_cover_it_once() {
+        let list = "# c\na/1\na/2\na/3\na/4\na/5\n";
+        let mut all: Vec<String> = (0..3)
+            .flat_map(|i| {
+                part_of(list, i, 3)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        all.sort();
+        assert_eq!(all, ["a/1", "a/2", "a/3", "a/4", "a/5"]);
+        assert_eq!(part_of(list, 1, 3), "a/2\na/5\n");
+    }
 
     fn row(name: &str, result: &'static str) -> Row {
         Row {
