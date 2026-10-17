@@ -23,6 +23,7 @@
 use core::cell::UnsafeCell;
 #[cfg(feature = "image-probe")]
 mod image_probe_main;
+use core::sync::atomic::Ordering;
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
@@ -38,10 +39,9 @@ use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
     Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
-    SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart,
-    WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId,
+    SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
-use core::sync::atomic::Ordering;
 use proto_wire::{Status, Writer, long};
 use rt::{
     abi::{self, Access, ObjectKind, Rights, Source},
@@ -1359,7 +1359,8 @@ impl Processes {
             }
             Posted::Ignored if page.more.load(Ordering::SeqCst) & bit != 0 => {
                 self.queued.drop_signal(target, signal);
-                page.more.store(self.queued.signals(target), Ordering::SeqCst);
+                page.more
+                    .store(self.queued.signals(target), Ordering::SeqCst);
             }
             _ => {}
         }
@@ -1396,7 +1397,8 @@ impl Processes {
         {
             self.request_router(target);
         }
-        page.more.store(self.queued.signals(target), Ordering::SeqCst);
+        page.more
+            .store(self.queued.signals(target), Ordering::SeqCst);
     }
 
     /// Delivers `signal` from the record in `sender` to the process of the
@@ -1893,7 +1895,11 @@ impl Processes {
                 let (Ok(delta), Ok(())) = (body.u64(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                if self.records.get(index).is_none_or(|r| r.credentials.euid != 0) {
+                if self
+                    .records
+                    .get(index)
+                    .is_none_or(|r| r.credentials.euid != 0)
+                {
                     return refuse(proto_process::PERMISSION);
                 }
                 self.timers.step(delta as i64, now);
@@ -1934,10 +1940,11 @@ impl Processes {
                 // The signal of the timer waits on the page: its own count
                 // is not complete, and the one delivered before shows.
                 let waiting = match self.timers.signal_of_id(owner, id) {
-                    Ok(signal) if (1..=SIGNAL_MAX).contains(&signal) => self
-                        .pages
-                        .page(index)
-                        .is_some_and(|p| p.pending.load(Ordering::Acquire) & signals::bit(signal) != 0),
+                    Ok(signal) if (1..=SIGNAL_MAX).contains(&signal) => {
+                        self.pages.page(index).is_some_and(|p| {
+                            p.pending.load(Ordering::Acquire) & signals::bit(signal) != 0
+                        })
+                    }
                     _ => false,
                 };
                 match self.timers.overrun(owner, id, waiting) {

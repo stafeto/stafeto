@@ -2195,7 +2195,6 @@ pub struct LinuxSigInfo {
 }
 const _: () = assert!(core::mem::size_of::<LinuxSigInfo>() == 128);
 
-
 impl LinuxSigInfo {
     /// The information of a signal of the process (kill, SIGCHLD): the
     /// code, the sender's PID and UID, and the status after them, where

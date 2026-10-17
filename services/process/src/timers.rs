@@ -274,7 +274,11 @@ impl Timers {
     /// monotonic scale: the deadlines of the timers armed in it come
     /// `delta` earlier (not before `now`).
     pub fn step(&mut self, delta: i64, now: u64) {
-        for s in self.slots.iter_mut().filter(|s| s.used && s.armed && s.real) {
+        for s in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.used && s.armed && s.real)
+        {
             let moved = i128::from(s.deadline) - i128::from(delta);
             s.deadline = moved.clamp(i128::from(now), i128::from(u64::MAX)) as u64;
             s.not_before = 0;
@@ -378,7 +382,12 @@ impl Timers {
             }
             // Insert by deadline into the short list.
             let mut at = count;
-            while at > 0 && self.slots[found[at - 1]].deadline.max(self.slots[found[at - 1]].not_before) > s.deadline.max(s.not_before) {
+            while at > 0
+                && self.slots[found[at - 1]]
+                    .deadline
+                    .max(self.slots[found[at - 1]].not_before)
+                    > s.deadline.max(s.not_before)
+            {
                 at -= 1;
             }
             if at >= EXPIRY_BUDGET {
@@ -517,7 +526,10 @@ mod tests {
     #[test]
     fn a_step_of_the_calendar_moves_the_deadlines_that_follow_it() {
         let mut t = Timers::new();
-        let (a, b) = (t.create(1, 12, 0, false).unwrap(), t.create(1, 12, 0, false).unwrap());
+        let (a, b) = (
+            t.create(1, 12, 0, false).unwrap(),
+            t.create(1, 12, 0, false).unwrap(),
+        );
         t.set(1, a, Some(10_000), 0, 100).unwrap();
         t.mark_real(1, a);
         t.set(1, b, Some(10_000), 0, 100).unwrap();
@@ -575,7 +587,10 @@ mod tests {
         let later = 1_000 + 99 * 16 + MIN_INTERVAL;
         assert_eq!(t.due(later - 1).1, 0);
         assert_eq!(t.due(later).1, 1);
-        assert_eq!(t.expire(slot, later).count, (later - (1_000 + 100 * 16)) / 16 + 1);
+        assert_eq!(
+            t.expire(slot, later).count,
+            (later - (1_000 + 100 * 16)) / 16 + 1
+        );
     }
 
     #[test]
