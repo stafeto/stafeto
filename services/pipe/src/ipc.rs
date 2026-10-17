@@ -2215,8 +2215,7 @@ impl Pipes {
                     return Err(fail(ENOENT));
                 }
                 let (maxmsg, msgsize) = if w[4] != 0 {
-                    if w[2] == 0 || w[2] > MSGS as u64 || w[3] == 0 || w[3] > TEXT_MAX as u64
-                    {
+                    if w[2] == 0 || w[2] > MSGS as u64 || w[3] == 0 || w[3] > TEXT_MAX as u64 {
                         return Err(fail(EINVAL));
                     }
                     (w[2] as u16, w[3] as u16)

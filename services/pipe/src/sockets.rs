@@ -207,7 +207,9 @@ impl Sockets {
 
     /// The bytes that fit in the buffer of `i` (SO_RCVBUF of it).
     fn room(&self, i: usize) -> usize {
-        (self.s[i].rcvbuf as usize).min(RING).saturating_sub(usize::from(self.s[i].len))
+        (self.s[i].rcvbuf as usize)
+            .min(RING)
+            .saturating_sub(usize::from(self.s[i].len))
     }
 
     /// `out.len()` bytes of the buffer of `i` from `offset` after its head.

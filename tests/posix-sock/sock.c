@@ -613,21 +613,24 @@ static int longest_steps(void) {
     for (int i = 0; i < 8; i++) fds[i] = pp[1];
     for (int kind = SOCK_STREAM; kind <= SOCK_DGRAM; kind++) {
         int pair[2];
+        /* The buffer of a datagram socket holds two datagrams of 800 bytes, so the datagrams
+           with descriptions are 300 bytes: four of them are held, the descriptions limit them. */
+        size_t size = kind == SOCK_DGRAM ? 300 : sizeof big;
         CHECK(socketpair(AF_UNIX, kind, 0, pair) == 0);
         for (int round = 0; round < 3; round++) {
-            for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == (int)sizeof big);
+            for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, size) == (int)size);
             /* The fifth message: a non-blocking socket is refused (a blocking one waits, see blocking_waits). */
             CHECK(fcntl(pair[0], F_SETFL, O_NONBLOCK) == 0);
-            CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == -1 && errno == EAGAIN);
+            CHECK(send_rights(pair[0], fds, 8, big, size) == -1 && errno == EAGAIN);
             CHECK(fcntl(pair[0], F_SETFL, 0) == 0);
             for (int i = 0; i < 4; i++) {
-                CHECK(recv_rights(pair[1], fds, &n, back, sizeof back) == (int)sizeof back && n == 8);
+                CHECK(recv_rights(pair[1], fds, &n, back, sizeof back) == (int)size && n == 8);
                 for (int k = 0; k < n; k++) if (fds[k] != pp[1]) close(fds[k]);
                 for (int k = 0; k < 8; k++) fds[k] = pp[1];
             }
         }
         /* The socket that goes with four messages in flight. */
-        for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, sizeof big) == (int)sizeof big);
+        for (int i = 0; i < 4; i++) CHECK(send_rights(pair[0], fds, 8, big, size) == (int)size);
         close(pair[0]); close(pair[1]);
         pause_ms(100);
     }
@@ -777,7 +780,8 @@ static int blocking_waits(void) {
     CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     close(sv[0]);
     CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
-    for (int i = 0; i < 5; i++) CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == 800 || i == 4);
+    /* The buffer of an AF_UNIX datagram socket holds two datagrams of 800 bytes. */
+    for (int i = 0; i < 3; i++) CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == 800 || i == 2);
     CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == -1 && errno == EAGAIN);
     close(sv[0]); close(sv[1]);
     /* Messages with descriptions: the sixth waits for the reader. */
