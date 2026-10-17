@@ -118,6 +118,16 @@ pub fn user_pstate() -> u64 {
 /// Runs once the kernel tables are live: WXN would take execution away from
 /// head.S's writable image blocks. No thread runs yet.
 pub fn init() {
+    init_registers();
+    USER_PSTATE.store(
+        kcore::upcall::user_pstate(registers::id_aa64pfr0_el1(), registers::id_aa64pfr1_el1()),
+        Ordering::Relaxed,
+    );
+}
+
+/// The system registers of this CPU that `init` describes: every CPU sets
+/// them for itself. The TLB entries of the CPU may hold the old WXN.
+pub fn init_registers() {
     // SAFETY: the kernel tables map nothing writable and executable at
     // once, so WXN takes nothing the kernel executes; the ISB makes the
     // writes take effect.
@@ -145,11 +155,6 @@ pub fn init() {
             )
         };
     }
-    USER_PSTATE.store(
-        kcore::upcall::user_pstate(registers::id_aa64pfr0_el1(), registers::id_aa64pfr1_el1()),
-        Ordering::Relaxed,
-    );
-    // TLB entries may hold the old WXN.
     mmu::flush_tlb();
 }
 

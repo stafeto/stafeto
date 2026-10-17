@@ -35,6 +35,7 @@ mod process;
 mod psci;
 mod sched;
 mod session;
+mod smp;
 mod syscall;
 mod testpoint;
 mod thread;
@@ -68,7 +69,9 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     memory::forbid(&boot.info);
     let clock = arch::timer::init();
     sched::init(clock);
+    smp::start(boot);
     report(boot, clock, &init);
+    smp::sgi_probe();
     #[cfg(feature = "fault-probe")]
     {
         // A window over the console's page leaves a record nobody showed:
@@ -142,6 +145,7 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
         }
     }
     kprintln!("psci       {:?}", info.psci);
+    smp::report();
     kprintln!("timer      {} Hz", clock.hz());
     for r in boot.usable.as_slice() {
         kprintln!("usable     {:#x}..{:#x}", r.base, r.end());

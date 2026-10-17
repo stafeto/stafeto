@@ -88,3 +88,25 @@ pub fn sync_icache_frames(frames: &[u64]) {
     unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
     crate::testpoint::code_synced(frames);
 }
+
+/// Cleans `len` bytes at the kernel address `addr` to memory, to the
+/// point of coherency, with `dc cvac` by the smallest data cache line of
+/// CTR_EL0, then `dsb ish` [G18]: what a CPU that starts with its MMU and
+/// caches off reads from memory is what was cleaned.
+#[inline(never)]
+pub fn clean_to_memory(addr: usize, len: usize) {
+    let ctr: u64;
+    // SAFETY: reading CTR_EL0 has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags))
+    };
+    let line = 4usize << ((ctr >> 16) & 0xf);
+    let mut at = addr & !(line - 1);
+    while at < addr + len {
+        // SAFETY: cleaning a line of mapped memory changes no data.
+        unsafe { core::arch::asm!("dc cvac, {}", in(reg) at, options(nostack, preserves_flags)) };
+        at += line;
+    }
+    // SAFETY: a barrier has no other effect.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+}

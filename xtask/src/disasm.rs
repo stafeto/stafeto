@@ -144,6 +144,103 @@ fn check_ram_main_frame(text: &str) -> Result<usize, String> {
     Ok(frame)
 }
 
+/// The instruction lines of the function `symbol` in the disassembly
+/// `text`; None when it is not there.
+fn body<'a>(text: &'a str, symbol: &str) -> Option<Vec<&'a str>> {
+    let mut lines = text.lines();
+    let header = format!(" <{symbol}>:");
+    lines.find(|l| l.ends_with(&header))?;
+    Some(
+        lines
+            .take_while(|l| !l.is_empty())
+            .filter(|l| instruction(l).is_some())
+            .collect(),
+    )
+}
+
+/// The position of the first instruction of `lines` whose mnemonic is
+/// `mnemonic` and whose operands contain `operands`.
+fn position(lines: &[&str], mnemonic: &str, operands: &str) -> Option<usize> {
+    lines
+        .iter()
+        .position(|l| instruction(l).is_some_and(|(m, o)| m == mnemonic && o.contains(operands)))
+}
+
+/// The orders that starting a CPU and sending an SGI need, which no
+/// QEMU machine can show (TCG has no cache and no weak order that
+/// reaches the GIC model): the start block is cleaned to memory with
+/// `dc cvac` and `dsb ish` before the PSCI call that starts the CPU, and
+/// each SGI's register write follows its barrier (GICv2 `dmb ishst`
+/// before GICD_SGIR; GICv3 `dsb ishst`, ICC_SGI1R_EL1, `isb`).
+fn check_smp_order(text: &str) -> Result<(), String> {
+    let need = |symbol: &str| {
+        body(text, symbol).ok_or_else(|| format!("{symbol} is missing from the kernel"))
+    };
+    let clean = need("kernel::arch::aarch64::cache::clean_to_memory")?;
+    let last_dc = clean
+        .iter()
+        .rposition(|l| instruction(l).is_some_and(|(m, o)| m == "dc" && o.starts_with("cvac")))
+        .ok_or("clean_to_memory has no dc cvac")?;
+    let dsb = clean
+        .iter()
+        .rposition(|l| instruction(l).is_some_and(|(m, o)| m == "dsb" && o == "ish"))
+        .ok_or("clean_to_memory has no dsb ish")?;
+    if dsb < last_dc {
+        return Err("clean_to_memory: the dsb ish does not follow the dc cvac".into());
+    }
+    let start = need("kernel::smp::start_one")?;
+    let cleaned = start
+        .iter()
+        .position(|l| l.contains("clean_to_memory"))
+        .ok_or("start_one does not clean the start block with clean_to_memory")?;
+    let call = start
+        .iter()
+        .position(|l| {
+            instruction(l).is_some_and(|(m, o)| {
+                m == "hvc" || m == "smc" || (m == "bl" && o.contains("psci::cpu_on"))
+            })
+        })
+        .ok_or("start_one makes no PSCI call")?;
+    if cleaned > call {
+        return Err("start_one calls PSCI CPU_ON before it cleans the start block".into());
+    }
+    let v2 = need("kernel::arch::aarch64::gic::send_sgi_v2")?;
+    let barrier = position(&v2, "dmb", "ishst").ok_or("send_sgi_v2 has no dmb ishst")?;
+    let write = v2
+        .iter()
+        .position(|l| instruction(l).is_some_and(|(m, _)| m.starts_with("str")))
+        .ok_or("send_sgi_v2 never writes GICD_SGIR")?;
+    if barrier > write {
+        return Err("send_sgi_v2 writes GICD_SGIR before its dmb ishst".into());
+    }
+    let v3 = need("kernel::arch::aarch64::gic::send_sgi_v3")?;
+    let dsb = position(&v3, "dsb", "ishst").ok_or("send_sgi_v3 has no dsb ishst")?;
+    let msr = v3
+        .iter()
+        .position(|l| {
+            instruction(l).is_some_and(|(m, o)| {
+                let o = o.to_ascii_lowercase();
+                m == "msr" && (o.contains("icc_sgi1r_el1") || o.contains("s3_0_c12_c11_5"))
+            })
+        })
+        .ok_or("send_sgi_v3 never writes ICC_SGI1R_EL1")?;
+    let isb = v3
+        .iter()
+        .rposition(|l| instruction(l).is_some_and(|(m, _)| m == "isb"))
+        .ok_or("send_sgi_v3 has no isb")?;
+    if !(dsb < msr && msr < isb) {
+        return Err("send_sgi_v3 does not run dsb ishst, the write, isb in that order".into());
+    }
+    Ok(())
+}
+
+/// `check_smp_order` on the kernel at `elf`.
+pub fn smp_order(elf: &Path, objdump: &Path) -> Result<(), String> {
+    check_smp_order(&disassemble(elf, objdump)?)?;
+    println!("SMP start and SGI order: dc cvac before CPU_ON, barriers before the SGI registers");
+    Ok(())
+}
+
 fn disassemble(elf: &Path, objdump: &Path) -> Result<String, String> {
     let output = Command::new(objdump)
         .args(["--disassemble", "--demangle", "--no-show-raw-insn"])
@@ -551,6 +648,61 @@ mod tests {
         );
     }
     use super::*;
+
+    /// A disassembly of the four functions `check_smp_order` reads, with
+    /// the lines of `broken` replaced by the text given for them.
+    fn smp_text(replace: &[(&str, &str)]) -> String {
+        let mut text = String::from(
+            "0 <kernel::arch::aarch64::cache::clean_to_memory>:\n\
+             0: \tdc\tcvac, x8\n4: \tdsb\tish\n8: \tret\n\n\
+             10 <kernel::smp::start_one>:\n\
+             10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>\n\
+             14: \tsmc\t#0x0\n\n\
+             20 <kernel::arch::aarch64::gic::send_sgi_v2>:\n\
+             20: \tdmb\tishst\n24: \tstr\tw1, [x8, #0xf00]\n28: \tret\n\n\
+             30 <kernel::arch::aarch64::gic::send_sgi_v3>:\n\
+             30: \tdsb\tishst\n34: \tmsr\tICC_SGI1R_EL1, x8\n38: \tisb\n3c: \tret\n\n",
+        );
+        for (from, to) in replace {
+            text = text.replace(from, to);
+        }
+        text
+    }
+
+    #[test]
+    fn the_order_of_the_start_and_the_sgi_barriers_is_checked() {
+        assert_eq!(check_smp_order(&smp_text(&[])), Ok(()));
+        let broken = |replace: &[(&str, &str)]| check_smp_order(&smp_text(replace)).unwrap_err();
+        // The clean of the start block gone, or after the PSCI call.
+        assert!(
+            broken(&[(
+                "10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>",
+                "10: \tnop"
+            )])
+            .contains("does not clean the start block")
+        );
+        assert!(
+            broken(&[(
+                "10: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>\n14: \tsmc\t#0x0",
+                "10: \tsmc\t#0x0\n14: \tbl\t0x0 <kernel::arch::aarch64::cache::clean_to_memory>"
+            )])
+            .contains("before it cleans")
+        );
+        // The clean without its dc cvac or its dsb.
+        assert!(broken(&[("dc\tcvac, x8", "nop")]).contains("no dc cvac"));
+        assert!(broken(&[("4: \tdsb\tish", "4: \tnop")]).contains("no dsb ish"));
+        // A write before the barrier, or no barrier.
+        assert!(broken(&[("dmb\tishst", "nop")]).contains("no dmb ishst"));
+        assert!(
+            broken(&[(
+                "20: \tdmb\tishst\n24: \tstr\tw1, [x8, #0xf00]",
+                "20: \tstr\tw1, [x8, #0xf00]\n24: \tdmb\tishst"
+            )])
+            .contains("before its dmb")
+        );
+        assert!(broken(&[("30: \tdsb\tishst", "30: \tnop")]).contains("no dsb ishst"));
+        assert!(broken(&[("38: \tisb", "38: \tnop")]).contains("no isb"));
+    }
 
     #[test]
     fn counts_the_reads_of_the_counter_and_not_comments() {

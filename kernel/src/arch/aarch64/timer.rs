@@ -128,3 +128,36 @@ pub fn init() -> Clock {
     let _ = CLOCK.set(clock);
     clock
 }
+
+/// What a CPU other than the first sets up for itself: its timer off and
+/// its PPI, banked per CPU, let through its interface at the priority of
+/// the kernel's lines.
+pub fn init_cpu() {
+    disarm();
+    gic::set_priority(INTID, DEFAULT_PRIORITY);
+    gic::unmask(INTID);
+}
+
+/// Arms this CPU's timer `ticks` from now, waits for its interrupt to
+/// reach the CPU interface, acknowledges and ends it, and tells whether it
+/// came with the counter at the deadline or after it (spec 10) and as
+/// INTID 27. The timer is off afterwards. Polls, since PSTATE masks
+/// interrupts in the kernel.
+pub fn self_test(ticks: u64) -> bool {
+    let deadline = now() + ticks;
+    arm(deadline);
+    let mut ok = false;
+    // A hundred times the deadline's distance, then give up.
+    while now() < deadline + 100 * ticks {
+        if fired() && super::irq_pending() {
+            if let Some(ack) = gic::acknowledge() {
+                ok = now() >= deadline && cval() == deadline && ack.intid() == INTID;
+                disarm();
+                gic::end(ack);
+            }
+            break;
+        }
+    }
+    disarm();
+    ok
+}

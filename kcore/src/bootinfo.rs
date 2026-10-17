@@ -357,10 +357,12 @@ fn classify(
     if !node.enabled() {
         return Ok(());
     }
-    if depth == 3 && parent == "cpus" && node.device_type == b"cpu\0" {
-        if let Some(r) = RegIter::new(node.reg, cells)?.next().transpose()? {
-            info.cpus.push(r.base & MPIDR_AFFINITY);
-        }
+    if depth == 3
+        && parent == "cpus"
+        && node.device_type == b"cpu\0"
+        && let Some(r) = RegIter::new(node.reg, cells)?.next().transpose()?
+    {
+        info.cpus.push(r.base & MPIDR_AFFINITY);
     }
     if info.uart_pl011.is_none() && node.is_compatible("arm,pl011") {
         info.uart_pl011 = RegIter::new(node.reg, cells)?.next().transpose()?;

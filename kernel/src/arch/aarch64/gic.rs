@@ -9,6 +9,7 @@
 //! pending interrupt ends all the same, and acknowledges the interrupt
 //! itself.
 
+use super::cpu;
 use super::mmio;
 use super::registers::{self, read_sysreg};
 use core::arch::asm;
@@ -18,19 +19,24 @@ use kcore::bootinfo::{BootInfo, GicVersion, Region};
 use kcore::gic::{
     self, Ack, CTLR_ENABLE, DEFAULT_PRIORITY, FIRST_SPI, Frame, GICC_CTLR, GICC_EOIR, GICC_IAR,
     GICC_PMR, GICD_CTLR, GICD_CTLR_RWP, GICD_CTLR_V3, GICD_ICACTIVER, GICD_ICENABLER, GICD_ICPENDR,
-    GICD_IGROUPR, GICD_IPRIORITYR, GICD_IROUTER, GICD_ISENABLER, GICD_ITARGETSR, GICD_TYPER,
-    GICR_CTLR, GICR_CTLR_RWP, GICR_TYPER, GICR_WAKER, ICC_SRE_SRE, PRIORITY_MASK, SGI_FRAME,
-    WAKER_CHILDREN_ASLEEP, WAKER_PROCESSOR_SLEEP,
+    GICD_IGROUPR, GICD_IPRIORITYR, GICD_IROUTER, GICD_ISENABLER, GICD_ITARGETSR, GICD_SGIR,
+    GICD_TYPER, GICR_CTLR, GICR_CTLR_RWP, GICR_TYPER, GICR_WAKER, ICC_SRE_SRE, PRIORITY_MASK,
+    SGI_FRAME, SGI_GO, SGI_PING, SGI_PONG, WAKER_CHILDREN_ASLEEP, WAKER_PROCESSOR_SLEEP,
 };
 use kcore::layout::LINEAR_BASE;
 
 /// Whether `init` found a GICv3 in the device tree.
 static V3: AtomicBool = AtomicBool::new(false);
-/// Virtual addresses of the distributor, and of the CPU interface (GICv2)
-/// or this CPU's redistributor, its RD_base frame (GICv3); zero until
-/// `init`.
+/// Virtual addresses of the distributor, and of the CPU interface (GICv2,
+/// the same address on every CPU: its registers are banked); zero until
+/// `init`. On a GICv3 each CPU's redistributor, its RD_base frame, is in
+/// its block (`cpu_base`).
 static DIST: AtomicUsize = AtomicUsize::new(0);
 static CPU: AtomicUsize = AtomicUsize::new(0);
+/// The window over the redistributors of a GICv3: its virtual address and
+/// size, where every CPU finds its own.
+static WINDOW: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// The lines of the distributor, from GICD_TYPER at `init`.
 static LINE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -86,12 +92,25 @@ fn wait_clear(at: usize, bits: u32, what: &str) {
     panic!("the GIC keeps {what} set");
 }
 
+/// The base of this CPU's own registers: the CPU interface of a GICv2, the
+/// redistributor of this CPU on a GICv3.
+fn cpu_base() -> usize {
+    match kind() {
+        GicVersion::V2 => base(&CPU),
+        GicVersion::V3 => {
+            let rd = cpu::this().gic.load(Ordering::Relaxed);
+            assert!(rd != 0, "the GIC is used before gic::init on this CPU");
+            rd
+        }
+    }
+}
+
 /// The block of `intid`'s registers: the distributor, or on a GICv3 for
 /// SGIs and PPIs the SGI frame of this CPU's redistributor
 /// (kcore::gic::frame).
 fn block(intid: u32) -> usize {
     match (kind(), gic::frame(intid)) {
-        (GicVersion::V3, Frame::Sgi) => base(&CPU) + SGI_FRAME,
+        (GicVersion::V3, Frame::Sgi) => cpu_base() + SGI_FRAME,
         _ => base(&DIST),
     }
 }
@@ -110,6 +129,7 @@ pub fn init(info: &BootInfo) {
         GicVersion::V2 => init_v2(cpu),
         GicVersion::V3 => init_v3(cpu),
     }
+    enable_ipi();
 }
 
 /// Masks the `intids` of the block at `at`, clears them pending and
@@ -134,12 +154,31 @@ fn init_v2(cpu: Region) {
     let lines = gic::lines(read(dist + GICD_TYPER));
     LINE_COUNT.store(lines, Ordering::Relaxed);
     reset_lines(dist, 0..lines);
-    let banked = core::array::from_fn(|i| read(dist + GICD_ITARGETSR + 4 * i));
-    let targets = gic::spi_targets(gic::own_interface(banked));
+    let targets = gic::spi_targets(own_interface());
     for intid in (FIRST_SPI..lines).step_by(4) {
         write(dist + gic::byte(GICD_ITARGETSR, intid).0, targets);
     }
     write(dist + GICD_CTLR, CTLR_ENABLE);
+    enable_cpu_interface_v2();
+}
+
+/// This CPU's interface bit, from its banked GICD_ITARGETSR0 to 7
+/// (kcore::gic::own_interface), which a GIC with one interface reads as 0:
+/// interface 0 then. It goes into the CPU's block, where `send_sgi` finds
+/// it [G25].
+fn own_interface() -> u32 {
+    let dist = base(&DIST);
+    let banked = core::array::from_fn(|i| read(dist + GICD_ITARGETSR + 4 * i));
+    let own = match gic::own_interface(banked) {
+        0 => 1,
+        own => own,
+    };
+    cpu::this().gic.store(own as usize, Ordering::Relaxed);
+    own
+}
+
+/// The priority mask and the enable of this CPU's interface.
+fn enable_cpu_interface_v2() {
     let cpu = base(&CPU);
     write(cpu + GICC_PMR, u32::from(PRIORITY_MASK));
     write(cpu + GICC_CTLR, CTLR_ENABLE);
@@ -170,17 +209,32 @@ fn init_v3(redistributors: Region) {
         // SAFETY: GICD_IROUTER is a 64-bit register of the distributor.
         unsafe { mmio::write64(at, gic::irouter(mpidr)) };
     }
-    let window = LINEAR_BASE + redistributors.base as usize;
+    WINDOW.store(
+        LINEAR_BASE + redistributors.base as usize,
+        Ordering::Relaxed,
+    );
+    WINDOW_SIZE.store(redistributors.size as usize, Ordering::Relaxed);
+    init_v3_cpu();
+}
+
+/// This CPU's part of the GICv3: its redistributor, found by its
+/// affinity in the window over the redistributors, woken, its SGIs and
+/// PPIs reset; then the CPU interface through its system registers, which
+/// head.S opened at EL2.
+fn init_v3_cpu() {
+    let window = WINDOW.load(Ordering::Relaxed);
+    let size = WINDOW_SIZE.load(Ordering::Relaxed) as u64;
+    let mpidr = registers::mpidr_el1();
     let typer = |at: u64| {
         // SAFETY: the kernel tables map the window; GICR_TYPER is a 64-bit
         // register of each RD_base frame in it.
         unsafe { mmio::read64(window + at as usize + GICR_TYPER) }
     };
     let affinity = gic::redistributor_affinity(mpidr);
-    let rd = gic::find_redistributor(typer, redistributors.size, affinity)
-        .expect("no redistributor for this CPU in the first 256 KiB");
+    let rd = gic::find_redistributor(typer, size, affinity)
+        .expect("no redistributor for this CPU in the window");
     let rd = window + rd as usize;
-    CPU.store(rd, Ordering::Relaxed);
+    cpu::this().gic.store(rd, Ordering::Relaxed);
     write(
         rd + GICR_WAKER,
         read(rd + GICR_WAKER) & !WAKER_PROCESSOR_SLEEP,
@@ -214,6 +268,63 @@ fn init_v3(redistributors: Region) {
     write_icc!("icc_igrpen1_el1", 1u8);
 }
 
+/// What a CPU other than the first sets up for itself, once `init` has
+/// run on CPU 0: its banked lines, SGIs and PPIs reset, and its CPU
+/// interface (GICv2) or redistributor and system registers (GICv3), as
+/// `init` leaves CPU 0's. Then `enable_ipi` and the timer's PPI.
+pub fn init_secondary() {
+    match kind() {
+        GicVersion::V2 => {
+            reset_lines(base(&DIST), 0..FIRST_SPI);
+            own_interface();
+            enable_cpu_interface_v2();
+        }
+        GicVersion::V3 => init_v3_cpu(),
+    }
+    enable_ipi();
+}
+
+/// Lets this CPU's SGIs of the kernel through (banked per CPU).
+pub fn enable_ipi() {
+    for intid in [SGI_PING, SGI_PONG, SGI_GO] {
+        set_priority(intid, DEFAULT_PRIORITY);
+        unmask(intid);
+    }
+}
+
+/// Sends SGI `intid` to CPU `target` (its number, arch::cpu), which is up.
+/// What the sender wrote for it first reaches it before the interrupt
+/// does, through the barrier the GIC's register needs [S2]: GICv2 `dmb
+/// ishst` before the write of GICD_SGIR; GICv3 `dsb ishst`, the write of
+/// ICC_SGI1R_EL1, `isb` (a system register write is not ordered by
+/// `dmb`).
+pub fn send_sgi(target: usize, intid: u32) {
+    let block = cpu::block(target);
+    match kind() {
+        GicVersion::V2 => send_sgi_v2(block.gic.load(Ordering::Relaxed) as u32, intid),
+        GicVersion::V3 => send_sgi_v3(block.mpidr.load(Ordering::Relaxed), intid),
+    }
+}
+
+/// GICv2: `dmb ishst`, then the write of GICD_SGIR (xtask's `smp_order`
+/// checks the order in the built kernel).
+#[inline(never)]
+fn send_sgi_v2(targets: u32, intid: u32) {
+    // SAFETY: a barrier has no other effect.
+    unsafe { asm!("dmb ishst", options(nostack, preserves_flags)) };
+    write(base(&DIST) + GICD_SGIR, gic::sgir(targets, intid));
+}
+
+/// GICv3: `dsb ishst`, the write of ICC_SGI1R_EL1, `isb`.
+#[inline(never)]
+fn send_sgi_v3(mpidr: u64, intid: u32) {
+    let value = gic::sgi1r(mpidr, intid);
+    // SAFETY: the write only raises an interrupt on the target.
+    unsafe {
+        asm!("dsb ishst", "msr icc_sgi1r_el1, {}", "isb", in(reg) value, options(nostack, preserves_flags))
+    };
+}
+
 /// Sets the priority of one line; lower values are more urgent.
 pub fn set_priority(intid: u32, priority: u8) {
     let (offset, shift) = gic::byte(GICD_IPRIORITYR, intid);
@@ -241,7 +352,7 @@ pub fn mask(intid: u32) {
     if kind() == GicVersion::V3 {
         match gic::frame(intid) {
             Frame::Distributor => wait_clear(at + GICD_CTLR, GICD_CTLR_RWP, "GICD_CTLR.RWP"),
-            Frame::Sgi => wait_clear(base(&CPU) + GICR_CTLR, GICR_CTLR_RWP, "GICR_CTLR.RWP"),
+            Frame::Sgi => wait_clear(cpu_base() + GICR_CTLR, GICR_CTLR_RWP, "GICR_CTLR.RWP"),
         }
     }
 }
@@ -381,6 +492,6 @@ mod test_access {
 
     /// GICR_WAKER of this CPU's redistributor (GICv3).
     pub fn waker() -> u32 {
-        read(base(&CPU) + GICR_WAKER)
+        read(cpu_base() + GICR_WAKER)
     }
 }

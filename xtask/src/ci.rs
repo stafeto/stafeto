@@ -175,6 +175,10 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("boot EL2 GICv2", 1),
     ("boot EL2 GICv3", 1),
     ("boot 2G", 1),
+    ("smp 4 GICv2", 2),
+    ("smp 4 GICv3", 2),
+    ("smp 4 EL2 GICv2", 2),
+    ("smp 4 EL2 GICv3", 2),
     ("console dialog 512M", 2),
     ("trace dialog 512M", 4),
     ("console dialog GICv3", 6),
@@ -208,6 +212,7 @@ const DEFAULT_WEIGHT: u32 = 20;
 /// tests, of the images and of their faults.
 const KERNEL_PREFIXES: &[&str] = &[
     "boot ",
+    "smp ",
     "console dialog",
     "trace dialog",
     "bad ",
@@ -327,7 +332,9 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("host", "host tests", &[], super::host_tests));
     steps.push(step("host", "shipping disassembly", &[KERNELS], || {
         let a = super::build(Variant::Normal)?;
-        super::disasm::shipping(&a.elf, &super::llvm_tool("llvm-objdump")?)
+        let objdump = super::llvm_tool("llvm-objdump")?;
+        super::disasm::shipping(&a.elf, &objdump)?;
+        super::disasm::smp_order(&a.elf, &objdump)
     }));
 
     // Boots.

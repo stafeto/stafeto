@@ -103,7 +103,7 @@ pub fn prepare(index: usize) -> &'static CpuBlock {
 pub fn attach(block: &'static CpuBlock) {
     // SAFETY: only the entry from EL0 and the functions below read TPIDR_EL1.
     unsafe {
-        asm!("msr tpidr_el1, {}", in(reg) block as *const CpuBlock, options(nomem, nostack, preserves_flags))
+        asm!("msr tpidr_el1, {}", in(reg) block as *const CpuBlock, options(nostack, preserves_flags))
     };
 }
 

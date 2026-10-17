@@ -47,3 +47,20 @@ pub fn id_aa64pfr0_el1() -> u64 {
 pub fn id_aa64pfr1_el1() -> u64 {
     read_sysreg!("id_aa64pfr1_el1")
 }
+
+pub fn mair_el1() -> u64 {
+    read_sysreg!("mair_el1")
+}
+
+pub fn tcr_el1() -> u64 {
+    read_sysreg!("tcr_el1")
+}
+
+pub fn ttbr1_el1() -> u64 {
+    read_sysreg!("ttbr1_el1")
+}
+
+/// The exception level the kernel runs at, 1 or 2 (CurrentEL [3:2]).
+pub fn current_el() -> u64 {
+    read_sysreg!("currentel") >> 2
+}
