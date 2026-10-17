@@ -550,6 +550,19 @@ pub fn select(
                     return Err(EBADF);
                 }
                 if count == watch::MAX {
+                    // More descriptors than a watch takes: EBADF for one that
+                    // is no descriptor, else EINVAL.
+                    for other in 0..nfds as usize {
+                        let named =
+                            has(&sets[0], other) || has(&sets[1], other) || has(&sets[2], other);
+                        if named
+                            && !crate::shared::with_files(|files| {
+                                Ok(files.target(other as u32).is_ok())
+                            })?
+                        {
+                            return Err(EBADF);
+                        }
+                    }
                     return Err(EINVAL);
                 }
                 items[count] = PollFd {

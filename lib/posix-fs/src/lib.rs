@@ -178,7 +178,7 @@ pub struct DirEntry {
 }
 
 /// Local descriptor bound. The RAM service separately bounds open descriptions.
-pub const OPEN_MAX: usize = 32;
+pub const OPEN_MAX: usize = 64;
 /// The longest current directory, in bytes.
 pub const MAX_CWD: usize = MAX_PATH;
 
@@ -246,12 +246,12 @@ pub struct PosixFs {
     record_locks: closing::RecordLocks,
 }
 
-const _: () = assert!(core::mem::size_of::<PosixFs>() <= 20480);
+const _: () = assert!(core::mem::size_of::<PosixFs>() <= 28672);
 
 // Typed control receipts retain their complete immutable source and outcome.
 const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
 const _: () = assert!(
-    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 17408
+    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 24576
 );
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
@@ -661,6 +661,17 @@ impl Transport {
             // the terminal service and its namespace entry.
             _ => Ok(CONSOLE_INFO),
         }
+    }
+
+    /// The open flags of the description of a file of the RAM service: the
+    /// access mode and `APPEND` (F_GETFL).
+    pub fn ram_open_flags(&self, target: Target) -> Result<u32, FsError> {
+        let ram = target.ram_target().ok_or(FsError::BadFileDescriptor)?;
+        let files = self.0.files();
+        files
+            .capture_description(ram.fd())
+            .map(|captured| captured.flags)
+            .map_err(FsError::from)
     }
 
     pub fn fstat(&self, target: Target) -> Result<Metadata, FsError> {

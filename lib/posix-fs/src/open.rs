@@ -910,8 +910,11 @@ mod tests {
         assert_eq!(size_of::<Target>(), 32);
         // Both full backend generations and the ticket are charged in existing
         // resident records, without an extra admission pool or per-fd buffer.
-        assert!(size_of::<PosixFs>() <= 20480);
-        assert!(size_of::<posix_fd::Table<Target, 32, Recovery>>() <= 12288);
-        assert!(size_of::<posix_fd::Table<Target, 32, Recovery, [u8; 1016]>>() <= 61440);
+        assert!(size_of::<PosixFs>() <= 28672);
+        assert!(size_of::<posix_fd::Table<Target, { crate::OPEN_MAX }, Recovery>>() <= 20480);
+        assert!(
+            size_of::<posix_fd::Table<Target, { crate::OPEN_MAX }, Recovery, [u8; 1016]>>()
+                <= 106496
+        );
     }
 }

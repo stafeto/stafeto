@@ -81,7 +81,8 @@ pub const PIPES: usize = 64;
 pub const CAPACITY: usize = 4096;
 /// {PIPE_BUF}: a write of at most this many bytes goes whole or not at all.
 pub const ATOMIC: usize = 512;
-/// The descriptions one session holds at most (the layer's OPEN_MAX).
+/// The descriptions one session holds at most: the pipe service's own share
+/// of the layer's table (OPEN_MAX is 64).
 pub const HELD_MAX: usize = 32;
 /// The live pipes one session made at most.
 pub const CREATED_MAX: usize = 16;

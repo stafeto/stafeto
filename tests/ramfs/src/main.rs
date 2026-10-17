@@ -823,6 +823,9 @@ fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'st
     Ok(())
 }
 
+/// The open descriptions one session holds at the file service.
+const SERVICE_SHARE: u32 = 32;
+
 fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     let mut fs = NativeFiles::connect(parent).map_err(|_| "limit connect")?;
     let source = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "limit open")?;
@@ -848,8 +851,10 @@ fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<()
     }
     fs.close(fresh).map_err(|_| "close fresh")?;
     fs.close(source).map_err(|_| "close limit source")?;
-    // The advertised local bound must also be reachable with distinct opens.
-    for expected in 3..OPEN_MAX as u32 {
+    // The service's share of the table (32 open descriptions for a session) is
+    // reachable with distinct opens, and the next open is refused by the service
+    // while the table of the layer still has places.
+    for expected in 3..3 + SERVICE_SHARE {
         if fs.open(b"/etc/motd", READ_ONLY) != Ok(expected) {
             return Err("distinct open descriptions reach local bound");
         }
@@ -857,7 +862,7 @@ fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<()
     if fs.open(b"/etc/motd", READ_ONLY) != Err(FsError::TooManyOpenFiles) {
         return Err("distinct open descriptor exhaustion");
     }
-    for fd in 3..OPEN_MAX as u32 {
+    for fd in 3..3 + SERVICE_SHARE {
         fs.close(fd).map_err(|_| "close distinct description")?;
     }
     Ok(())

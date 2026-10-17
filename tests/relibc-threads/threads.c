@@ -1065,6 +1065,157 @@ static void priorities(void) {
     without_privilege();
 }
 
+/* K: robust mutexes. A thread that ends holding one says EOWNERDEAD to the
+ * next owner, even to a thread that waits for it; an owner that unlocks
+ * before pthread_mutex_consistent makes it unusable (ENOTRECOVERABLE); one
+ * that repairs it first gets it back as an ordinary mutex. */
+static pthread_mutex_t robust_lock;
+static pthread_mutex_t robust_other;
+static volatile int robust_waiter_result = -1;
+static void *takes_robust(void *arg) {
+    (void)arg;
+    return (void *)(long)pthread_mutex_lock(&robust_lock);
+}
+static void *waits_robust(void *arg) {
+    (void)arg;
+    robust_waiter_result = pthread_mutex_lock(&robust_lock);
+    if (robust_waiter_result == EOWNERDEAD) pthread_mutex_consistent(&robust_lock);
+    pthread_mutex_unlock(&robust_lock);
+    return NULL;
+}
+static void robust_mutexes(void) {
+    pthread_mutexattr_t attr;
+    pthread_t thread, waiter;
+    void *value;
+    CHECK(pthread_mutexattr_init(&attr) == 0);
+    CHECK(pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0);
+    CHECK(pthread_mutex_init(&robust_lock, &attr) == 0);
+    CHECK(pthread_mutex_init(&robust_other, &attr) == 0);
+    /* A mutex that no owner died on is an ordinary one, and consistent says EINVAL. */
+    CHECK(pthread_mutex_lock(&robust_lock) == 0 && pthread_mutex_consistent(&robust_lock) == EINVAL);
+    CHECK(pthread_mutex_unlock(&robust_lock) == 0);
+    /* The owner ends; the next owner is told, repairs the state and goes on. */
+    CHECK(pthread_create(&thread, &small, takes_robust, NULL) == 0);
+    CHECK(pthread_join(thread, &value) == 0 && value == NULL);
+    CHECK(pthread_mutex_lock(&robust_lock) == EOWNERDEAD);
+    CHECK(pthread_mutex_trylock(&robust_lock) == EBUSY);
+    CHECK(pthread_mutex_consistent(&robust_lock) == 0 && pthread_mutex_consistent(&robust_lock) == EINVAL);
+    CHECK(pthread_mutex_unlock(&robust_lock) == 0);
+    CHECK(pthread_mutex_lock(&robust_lock) == 0 && pthread_mutex_unlock(&robust_lock) == 0);
+    /* An owner that unlocks without repairing: nobody can lock it again. */
+    CHECK(pthread_create(&thread, &small, takes_robust, NULL) == 0);
+    CHECK(pthread_join(thread, &value) == 0 && value == NULL);
+    CHECK(pthread_mutex_lock(&robust_lock) == EOWNERDEAD);
+    CHECK(pthread_mutex_unlock(&robust_lock) == 0);
+    CHECK(pthread_mutex_lock(&robust_lock) == ENOTRECOVERABLE);
+    CHECK(pthread_mutex_trylock(&robust_lock) == ENOTRECOVERABLE);
+    CHECK(pthread_mutex_destroy(&robust_lock) == 0);
+    /* A thread that waits when the owner ends is woken with EOWNERDEAD. */
+    CHECK(pthread_mutex_init(&robust_lock, &attr) == 0);
+    CHECK(pthread_mutex_lock(&robust_lock) == 0);
+    robust_waiter_result = -1;
+    CHECK(pthread_create(&waiter, &small, waits_robust, NULL) == 0);
+    sleep_ms(100);
+    CHECK(robust_waiter_result == -1);
+    CHECK(pthread_create(&thread, &small, takes_robust, NULL) == 0);
+    CHECK(pthread_mutex_unlock(&robust_lock) == 0);
+    CHECK(pthread_join(thread, &value) == 0);
+    CHECK(pthread_join(waiter, &value) == 0);
+    CHECK(robust_waiter_result == 0 || robust_waiter_result == EOWNERDEAD);
+    CHECK(pthread_mutex_lock(&robust_other) == 0 && pthread_mutex_unlock(&robust_other) == 0);
+    CHECK(pthread_mutex_destroy(&robust_lock) == 0 && pthread_mutex_destroy(&robust_other) == 0);
+    CHECK(pthread_mutexattr_destroy(&attr) == 0);
+    printf("relibc-threads: robust mutexes: owner death, consistent, not recoverable ok\n");
+}
+
+/* A request that came while cancellation was disabled acts as soon as the
+ * thread enables it with the asynchronous type, and one that came before the
+ * asynchronous type acts when the thread sets it. */
+static volatile int late_requested, late_passed;
+static void *enables_late(void *arg) {
+    int by_type = arg != NULL;
+    CHECK(pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL) == 0);
+    if (!by_type) CHECK(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL) == 0);
+    while (!late_requested) sleep_ms(1);
+    if (by_type) {
+        CHECK(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) == 0);
+        late_passed = 1;
+        CHECK(pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL) == 0);
+    } else {
+        late_passed = 1;
+        CHECK(pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) == 0);
+    }
+    late_passed = 2;
+    return NULL;
+}
+static void cancel_when_enabled(void) {
+    for (long by_type = 0; by_type < 2; by_type++) {
+        pthread_t thread;
+        void *value;
+        late_requested = late_passed = 0;
+        CHECK(pthread_create(&thread, &small, enables_late, (void *)by_type) == 0);
+        sleep_ms(20);
+        CHECK(pthread_cancel(thread) == 0);
+        late_requested = 1;
+        CHECK(pthread_join(thread, &value) == 0);
+        CHECK(value == PTHREAD_CANCELED && late_passed == 1);
+    }
+    printf("relibc-threads: a request acts when asynchronous cancellation is enabled ok\n");
+}
+
+/* A timed wait whose deadline lies past a whole second of CLOCK_REALTIME
+ * ends at the deadline: the difference between the deadline and now, which
+ * borrows a second, was a second too long. */
+#include <semaphore.h>
+static long long wait_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+static void at_second_end(void) {
+    struct timespec now;
+    do {
+        clock_gettime(CLOCK_REALTIME, &now);
+    } while (now.tv_nsec < 995000000L);
+}
+static void timed_waits_across_a_second(void) {
+    sem_t sem;
+    pthread_mutex_t held = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t other = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+    CHECK(sem_init(&sem, 0, 0) == 0);
+    for (int round = 0; round < 2; round++) {
+        struct timespec deadline;
+        long long start;
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(sem_timedwait(&sem, &deadline) == -1 && errno == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(pthread_mutex_lock(&held) == 0);
+        CHECK(pthread_mutex_timedlock(&held, &deadline) == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        CHECK(pthread_mutex_unlock(&held) == 0);
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(pthread_mutex_lock(&other) == 0);
+        CHECK(pthread_cond_timedwait(&never, &other, &deadline) == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        CHECK(pthread_mutex_unlock(&other) == 0);
+    }
+    printf("relibc-threads: timed waits across a second end at their deadline ok\n");
+}
+
 int main(void) {
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
@@ -1094,6 +1245,11 @@ int main(void) {
     flush_all_streams();
     stage = 11;
     priorities();
+    stage = 12;
+    robust_mutexes();
+    cancel_when_enabled();
+    stage = 13;
+    timed_waits_across_a_second();
     printf("relibc-threads: ok\n");
     return 0;
 }

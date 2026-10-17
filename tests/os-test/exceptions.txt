@@ -9,4 +9,3 @@
 #
 # Fields separated by tabs: name, exit code, output (\n is a newline, \\ a
 # backslash), the norm the outcome departs from, the stage that revisits it.
-io/dup3-clofork-fork	1	dup3: EBADF\n	POSIX.1-2024 dup: EBADF when fildes2 is not less than {OPEN_MAX}; dup3(1, 32, O_CLOFORK) must give EBADF, and {OPEN_MAX} is 32 here	5g
