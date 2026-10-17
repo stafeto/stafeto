@@ -152,13 +152,16 @@ pub fn init_cpu() {
 /// reach the CPU interface, acknowledges and ends it, and tells whether it
 /// came with the counter at the deadline or after it (spec 10) and as
 /// INTID 27. The timer is off afterwards. Polls, since PSTATE masks
-/// interrupts in the kernel.
+/// interrupts in the kernel. It gives up a second after the deadline: the
+/// counter runs while the emulator's thread of this CPU, or the one that
+/// raises the timer's line, waits for a host that is busy, and a shorter
+/// limit would call such a delay a timer that never fired.
 pub fn self_test(ticks: u64) -> bool {
     let deadline = now() + ticks;
     arm(deadline);
     let mut ok = false;
-    // A hundred times the deadline's distance, then give up.
-    while now() < deadline + 100 * ticks {
+    let give_up = deadline + frequency();
+    while now() < give_up {
         if fired() && super::irq_pending() {
             if let Some(ack) = gic::acknowledge() {
                 ok = now() >= deadline && cval() == deadline && ack.intid() == INTID;
