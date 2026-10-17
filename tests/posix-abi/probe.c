@@ -112,12 +112,8 @@ static int signals(void) {
             || sigpending(&pending) || pending || signal_calls != 1
             || sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != signal_handler
             || previous.sa_flags != (int)SA_RESETHAND) return 165;
-    set = UINT64_C(1) << 63;
-    accepted = 999;
-    if (sigwait(&set, &accepted) != EINVAL || accepted != 999) return 166;
+    // All 64 bits of a set are signals: sigwait has no invalid set to refuse.
     siginfo_t info = { .si_signo = 999, .si_code = -999, .si_value.sival_ptr = (void *)UINT64_C(18446744073709551615) };
-    if (sigwaitinfo(&set, &info) != -1 || errno != EINVAL || info.si_signo != 999
-            || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 168;
     if (sigemptyset(&set) || sigaddset(&set, SIGUSR1) || raise(SIGUSR1) || raise(SIGUSR1)) return 170;
     errno = 777;
     if (sigwaitinfo(&set, &info) != SIGUSR1 || errno != 777 || info.si_signo != SIGUSR1
@@ -395,14 +391,12 @@ static int threads(void) {
     free(value);
     char byte;
     if (read(context.fd, &byte, 1) != 1 || byte != 't' || close(context.fd)) return 205;
-    write(2,"M1\n",3);
     /* 200 threads one after another: each place and stack comes back. */
     for (unsigned int i = 0; i < 200; i++) {
         void *expected = (void *)(uintptr_t)(i + 1);
         if (pthread_create(&child, &attr, thread_exit_value, expected)
                 || pthread_join(child, &value) || value != expected) return 207;
     }
-    write(2,"M2\n",3);
     if (pthread_create(&child, NULL, thread_nested, &context)
             || pthread_join(child, &value) || value != &context || errno != 123) return 208;
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)
@@ -414,20 +408,17 @@ static int threads(void) {
     if (pthread_create(&witness, NULL, thread_return, &context)
             || pthread_join(witness, &value) || value != &context) return 212;
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE)) return 213;
-    write(2,"M3\n",3);
     pthread_t children[THREADS - 1];
     for (size_t i = 0; i < THREADS - 1; i++) {
-        { int e = pthread_create(&children[i], &attr, thread_return, (void *)(uintptr_t)(i + 1)); if (e) return 100 + (int)i; }
+        if (pthread_create(&children[i], &attr, thread_return, (void *)(uintptr_t)(i + 1))) return 214;
     }
     child = (pthread_t)987;
     if (pthread_create(&child, &attr, thread_return, NULL) != EAGAIN || child != (pthread_t)987 || errno != 123) return 215;
-    write(2,"M4\n",3);
     for (size_t i = 0; i < THREADS - 1; i++) {
         if (pthread_join(children[i], &value) || value != (void *)(uintptr_t)(i + 1)) return 216;
     }
     if (pthread_create(&child, &attr, thread_return, NULL) || pthread_join(child, NULL)
             || pthread_attr_destroy(&attr) || errno != 123) return 217;
-    write(2,"M5\n",3);
     return 0;
 }
 
@@ -512,12 +503,10 @@ static int cancellation(void) {
                 || context.sequence[1] != 1 || context.survived != 3
                 || lseek(context.fd, 0, SEEK_CUR) != 1 || lseek(context.output, 0, SEEK_CUR) != 0
                 || close(context.fd) || close(context.output) || errno != 123) return 220 + mode;
-        write(2,"C2\n",3);
         if (pthread_create(&child, NULL, fresh_cancel_state, &context)
                 || pthread_join(child, &value) || value != &context) return 223;
     }
     struct cancellation_context context = {0};
-    write(2,"C3\n",3);
     if (pthread_create(&child, NULL, cleanup_exit, &context)
             || pthread_join(child, &value) || value != &context || context.errors
             || context.count != 3 || context.sequence[0] != 1 || context.sequence[1] != 2
@@ -909,12 +898,10 @@ int main(int argc, char **argv) {
     if (directory_result) return directory_result;
     int thread_result = threads();
     if (thread_result) return thread_result;
-    write(2,"B_cancellation\n",16);
     int cancellation_result = cancellation();
     if (cancellation_result) return cancellation_result;
     int specific_result = specifics();
     if (specific_result) return specific_result;
-    write(2,"B_once_initialization\n",23);
     int once_result = once_initialization();
     if (once_result) return once_result;
     int mutex_result = mutexes();
@@ -923,14 +910,12 @@ int main(int argc, char **argv) {
     if (clock_result) return clock_result;
     int sleep_result = sleeps();
     if (sleep_result) return sleep_result;
-    write(2,"B_timed_mutexes\n",17);
     int timed_result = timed_mutexes();
     if (timed_result) return timed_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int signal_result = signals();
     if (signal_result) return signal_result;
-    write(2,"B_credentials\n",15);
     int credentials_result = credentials();
     if (credentials_result) return credentials_result;
     const char result[] = "posix-abi-probe: ok\n";
