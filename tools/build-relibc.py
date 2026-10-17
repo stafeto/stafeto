@@ -66,7 +66,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # whose deadline lies past a second ends at the deadline (the difference of
 # two times borrowed a second wrongly); clog near the unit circle keeps its
 # digits; tagged pin-5ee37a18.
-COMMIT = "5ee37a1862d3afa91a18487bc4bb0e481bc72f6c"
+COMMIT = "c0bacbccc02a88216a89beb68770ba094b734afa"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

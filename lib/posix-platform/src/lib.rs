@@ -129,7 +129,26 @@ pub unsafe extern "C" fn stafeto_write(fd: c_int, buf: *const u8, len: usize) ->
     } else {
         unsafe { core::slice::from_raw_parts(buf, len) }
     };
-    value(call(|| posix_abi::write(fd, bytes)).map(|n| n as i64)) as isize
+    // The layer takes one message of a write to a file or the console at a
+    // time; a write of a regular file completes, so the rest goes after a
+    // full message. A failure after a part is the count of the part, and a
+    // pipe or a terminal, which take all, end the loop at once.
+    let mut done = 0;
+    loop {
+        let rest = &bytes[done..];
+        let got = value(call(|| posix_abi::write(fd, rest)).map(|n| n as i64)) as isize;
+        if got == posix_request::MAX_WRITE as isize && rest.len() > posix_request::MAX_WRITE {
+            done += posix_request::MAX_WRITE;
+            continue;
+        }
+        return if got < 0 && done > 0 {
+            done as isize
+        } else if got < 0 {
+            got
+        } else {
+            done as isize + got
+        };
+    }
 }
 
 /// # Safety
@@ -145,7 +164,29 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
         // SAFETY: the caller's promise.
         unsafe { core::slice::from_raw_parts_mut(buf, len) }
     };
-    value(call(|| posix_abi::read(fd, buffer)).map(|n| n as i64)) as isize
+    // A read of a regular file fills the buffer unless the file ends; the
+    // layer returns one message of it, so the rest is read after a full
+    // message. A pipe, a terminal or a socket return what is there.
+    let mut done = 0;
+    loop {
+        let rest = &mut buffer[done..];
+        let size = rest.len();
+        let got = value(call(|| posix_abi::read(fd, rest)).map(|n| n as i64)) as isize;
+        if got == posix_request::MAX_READ as isize
+            && size > posix_request::MAX_READ
+            && files::is_file(fd)
+        {
+            done += posix_request::MAX_READ;
+            continue;
+        }
+        return if got < 0 && done > 0 {
+            done as isize
+        } else if got < 0 {
+            got
+        } else {
+            done as isize + got
+        };
+    }
 }
 
 /// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
@@ -162,6 +203,10 @@ const O_CLOEXEC: c_int = 0o2000000;
 /// relibc's O_CLOFORK of stafeto (POSIX 2024; Linux has none).
 const O_CLOFORK: c_int = 0o1_0000_0000;
 const O_NONBLOCK: c_int = 0o4000;
+/// O_DSYNC and O_SYNC (O_RSYNC is O_SYNC): the RAM service has every write
+/// done when the call returns, so an open takes the flags and leaves them
+/// out of the description.
+const O_SYNC_FLAGS: c_int = 0o4010000;
 
 /// Translates relibc Open flags into the process-local request interface.
 fn open_flags(flags: c_int) -> Result<c_int, c_int> {
@@ -176,7 +221,8 @@ fn open_flags(flags: c_int) -> Result<c_int, c_int> {
         | O_LARGEFILE
         | O_CLOEXEC
         | O_CLOFORK
-        | O_NONBLOCK;
+        | O_NONBLOCK
+        | O_SYNC_FLAGS;
     if flags & !known != 0 || flags & O_ACCMODE == O_ACCMODE {
         return Err(EINVAL);
     }
