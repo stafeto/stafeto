@@ -37,6 +37,7 @@
 
 use abi::{Error, PRIORITY_LEVELS, Policy};
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const LEVELS: usize = PRIORITY_LEVELS as usize;
 
@@ -301,29 +302,48 @@ unsafe fn link<'a, T: Linked>(t: NonNull<T>) -> &'a mut Link<T> {
 /// the queue keeps only the head: the tail is the item before it. A bit for
 /// each level with an item in it. Every operation takes constant time.
 pub struct ReadyQueue<T> {
-    mask: u64,
+    /// Stored with the owner's lock held; `top_unlocked` reads it without.
+    mask: AtomicU64,
     heads: [Option<NonNull<T>>; LEVELS],
 }
 
 impl<T: Linked> ReadyQueue<T> {
     pub const fn new() -> Self {
         ReadyQueue {
-            mask: 0,
+            mask: AtomicU64::new(0),
             heads: [None; LEVELS],
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.mask == 0
+        self.mask() == 0
     }
 
     /// The highest level with an item: 63 minus the leading zeros of the
     /// mask, one instruction (CLZ).
     pub fn top(&self) -> Option<u8> {
-        if self.mask == 0 {
+        // SAFETY: `self` is a valid reference.
+        unsafe { Self::top_unlocked(self) }
+    }
+
+    fn mask(&self) -> u64 {
+        self.mask.load(Ordering::Relaxed)
+    }
+
+    /// `top` for a reader that does not hold the lock of the queue: the
+    /// scheduler's decision. Only the atomic mask is touched, so a writer
+    /// on another core may change the queue meanwhile; the answer is one
+    /// that some state of the queue had.
+    ///
+    /// # Safety
+    /// `this` points to a queue that is alive.
+    pub unsafe fn top_unlocked(this: *const Self) -> Option<u8> {
+        // SAFETY: the caller's promise; no reference to the other fields.
+        let mask = unsafe { (*this).mask.load(Ordering::Relaxed) };
+        if mask == 0 {
             None
         } else {
-            Some(63 - self.mask.leading_zeros() as u8)
+            Some(63 - mask.leading_zeros() as u8)
         }
     }
 
@@ -389,7 +409,7 @@ impl<T: Linked> ReadyQueue<T> {
                 l.prev = Some(t);
                 l.next = Some(t);
                 self.heads[level] = Some(t);
-                self.mask |= 1 << level;
+                self.mask.store(self.mask() | 1 << level, Ordering::Relaxed);
                 return;
             };
             let tail = link(head).prev.expect("a ring");
@@ -416,7 +436,8 @@ impl<T: Linked> ReadyQueue<T> {
             let next = l.next.take().expect("a ring");
             if next == t {
                 self.heads[level] = None;
-                self.mask &= !(1 << level);
+                self.mask
+                    .store(self.mask() & !(1 << level), Ordering::Relaxed);
                 return;
             }
             link(prev).next = Some(next);
@@ -2194,6 +2215,59 @@ mod tests {
     fn ready_queue_is_520_bytes() {
         assert_eq!(core::mem::size_of::<ReadyQueue<Item>>(), 520);
         assert_eq!(core::mem::size_of::<ReadyQueue<Fake>>(), 520);
+    }
+
+    /// The scheduler's decision reads the top level without the queue's
+    /// lock while another core pushes and removes. The reader sees only
+    /// tops that some state of the queue had: none, level 3 or level 7.
+    #[test]
+    fn top_unlocked_sees_only_states_of_the_queue() {
+        struct Shared(*mut ReadyQueue<Item>);
+        // SAFETY: the reader touches only the atomic mask.
+        unsafe impl Send for Shared {}
+        let mut items: Vec<Box<Item>> = [3u8, 7]
+            .iter()
+            .map(|&level| {
+                Box::new(Item {
+                    link: Link::new(level),
+                    name: 'x',
+                })
+            })
+            .collect();
+        let ptrs: Vec<NonNull<Item>> = items.iter_mut().map(|b| NonNull::from(&mut **b)).collect();
+        let mut q = ReadyQueue::new();
+        let shared = Shared(&raw mut q);
+        let stop = core::sync::atomic::AtomicBool::new(false);
+        let seen = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let shared = shared;
+                let mut seen = [0u32; 3];
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: the queue outlives the scope.
+                    match unsafe { ReadyQueue::top_unlocked(shared.0) } {
+                        None => seen[0] += 1,
+                        Some(3) => seen[1] += 1,
+                        Some(7) => seen[2] += 1,
+                        Some(other) => panic!("a top of {other} was never there"),
+                    }
+                }
+                seen
+            });
+            for _ in 0..200_000 {
+                // SAFETY: the items stay alive and in place; the levels
+                // are theirs.
+                unsafe {
+                    q.push_tail(ptrs[0]);
+                    q.push_tail(ptrs[1]);
+                    q.remove(ptrs[1]);
+                    q.remove(ptrs[0]);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(seen.iter().sum::<u32>() > 0);
+        assert_eq!(q.top(), None);
     }
 
     struct Rng(u64);

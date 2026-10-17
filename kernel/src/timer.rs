@@ -34,8 +34,7 @@ use crate::process::{self, Process};
 use abi::{Error, MAX_SYSTEM_TIMERS};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
-use kcore::sync::Lock;
+use kcore::sync::{Budget, Lock};
 use kcore::timer::{Firing, HeapLink, HeapNode, LEVELS, Levels};
 
 /// The bits of an expiry (spec 6.5): bit 0, once.
@@ -111,7 +110,7 @@ static LIVE: Live = Live::new();
 /// abi::MAX_SYSTEM_TIMERS (spec 10): with them the heap of a level is at
 /// most 13 deep, and arming or cancelling takes at most 13 steps. Read and
 /// changed with interrupts masked inside the kernel (spec 8.1).
-static CREATED: AtomicU32 = AtomicU32::new(0);
+static CREATED: Budget = Budget::new();
 
 /// A timer of `payer`, the process of the thread that makes it, on `c`,
 /// an open channel, whose slot has `priority` and `label`, as timer_create
@@ -128,13 +127,14 @@ pub fn create(
     priority: u8,
 ) -> Result<NonNull<Timer>, Error> {
     process::timer_room(payer)?;
-    // The check and the count below are two steps: right on one core with
-    // no preemption inside the kernel; more cores need one fetch_update.
-    // The bound is shared by all: 43 processes of 192 timers reach it.
-    if CREATED.load(Ordering::Relaxed) >= MAX_SYSTEM_TIMERS {
+    // The check and the count are one step (`Budget::take`), so cores that
+    // race for the last place cannot both get it. The bound is shared by
+    // all: 43 processes of 192 timers reach it. A refusal below gives the
+    // place back.
+    if !CREATED.take(MAX_SYSTEM_TIMERS) {
         return Err(Error::LimitReached);
     }
-    channel::reserve_source(c)?;
+    channel::reserve_source(c).inspect_err(|_| CREATED.give())?;
     let timer = Timer {
         node: HeapLink::new(),
         source: Source::new(c),
@@ -143,7 +143,10 @@ pub fn create(
         dying: false,
         cleanup: Item::new(),
     };
-    let t = process::paid_alloc(payer, timer).inspect_err(|_| channel::remove_source(c))?;
+    let t = process::paid_alloc(payer, timer).inspect_err(|_| {
+        channel::remove_source(c);
+        CREATED.give();
+    })?;
     // SAFETY: the timer was just made, and nothing else refers to it.
     unsafe {
         (*t.as_ptr())
@@ -151,7 +154,6 @@ pub fn create(
             .attach(Owner::Timer(t), priority, label)
     };
     process::retain_shell(payer);
-    CREATED.fetch_add(1, Ordering::Relaxed);
     LIVE.made();
     Ok(t)
 }
@@ -274,12 +276,14 @@ pub fn first() -> Option<u64> {
     TIMERS.lock().levels.nearest()
 }
 
-/// The nearest deadline during the scheduler's decision, on the single
-/// core with interrupts masked and no timer update in progress.
+/// The nearest deadline during the scheduler's decision, without the
+/// lock: one relaxed load (`Levels::nearest_unlocked`), which a holder of
+/// the lock on another core may change meanwhile. The decision arms the
+/// timer from it, and an update that comes later re-arms it.
 #[cfg(not(feature = "locked-decide"))]
 pub fn first_for_decide() -> Option<u64> {
-    // SAFETY: as above; the exit loop is between kernel operations.
-    unsafe { (*TIMERS.as_ptr()).levels.nearest() }
+    // SAFETY: the timers are a static; only the atomic field is read.
+    unsafe { Levels::nearest_unlocked(&raw const (*TIMERS.as_ptr()).levels) }
 }
 
 /// The kernel's timer interrupt at `now`, before its EOI
@@ -382,7 +386,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
         let payer = (*t.as_ptr()).payer;
         (*t.as_ptr()).source.detach(level);
         process::paid_free(payer, t);
-        CREATED.fetch_sub(1, Ordering::Relaxed);
+        CREATED.give();
         LIVE.gone(t);
         process::release_shell(payer, level);
     }

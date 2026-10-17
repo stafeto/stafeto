@@ -10,6 +10,33 @@ use crate::sched::{self, Locked};
 use crate::thread::Thread;
 use abi::Error;
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
+
+/// The bit of `Process::gate` that process_control sets and clears.
+const SUSPENDED: u8 = 1;
+/// The bit of `Process::gate` that the end of the process sets, for good:
+/// its threads leave the scheduler a portion at a time (stage Threads), and
+/// none of them enters EL0 meanwhile.
+const ENDING: u8 = 2;
+
+/// The process ends: its threads stop at the gate from now on (`ENDING`).
+///
+/// # Safety
+/// `process` is alive.
+pub(super) unsafe fn mark_ending(process: NonNull<Process>) {
+    // SAFETY: the caller's promise; the gate is atomic.
+    unsafe { &(*process.as_ptr()).gate }.fetch_or(ENDING, Ordering::Release);
+}
+
+/// Whether the threads of `p` stop at the gate, with `order` for the read.
+///
+/// # Safety
+/// `p` is alive.
+#[inline(always)]
+unsafe fn gated(p: *const Process, order: Ordering) -> bool {
+    // SAFETY: the caller's promise; the gate is atomic.
+    unsafe { &(*p).gate }.load(order) != 0
+}
 
 /// Set suspension in O(1). Continuation uses the existing cleanup item,
 /// retaining the process until its last portion or cancellation.
@@ -22,10 +49,15 @@ pub fn control(process: NonNull<Process>, suspend: bool, cause: u8) -> Result<()
             if (*p).stage != Stage::Whole {
                 return Err(Error::BadState);
             }
-            if (*p).suspended == suspend {
+            let gate = &(*p).gate;
+            if (gate.load(Ordering::Relaxed) & SUSPENDED != 0) == suspend {
                 return Ok(false);
             }
-            (*p).suspended = suspend;
+            if suspend {
+                gate.fetch_or(SUSPENDED, Ordering::Release);
+            } else {
+                gate.fetch_and(!SUSPENDED, Ordering::Release);
+            }
             if suspend {
                 return Ok(cancel(process));
             }
@@ -64,15 +96,16 @@ pub(super) unsafe fn cancel(process: NonNull<Process>) -> bool {
     }
 }
 
-/// Park the selected thread under the scheduler lock, before counting
-/// a fired deadline as an EL0 return. One thread per exit-loop iteration.
+/// Park the selected thread, if its process is suspended or ending, under
+/// the scheduler lock, before counting a fired deadline as an EL0 return.
+/// One thread per exit-loop iteration.
 #[inline(always)]
 pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
     // SAFETY: the scheduler holds the selected thread, which holds its
     // process; the lock guards both its state and its process list.
     unsafe {
         let p = t.as_ref().process().as_ptr();
-        if !(*p).suspended {
+        if !gated(p, Ordering::Relaxed) {
             return false;
         }
         k.s.park(t, crate::arch::timer::now());
@@ -81,13 +114,16 @@ pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
     }
 }
 
-/// The common EL0 return, including the fast send path. The hot path
-/// reads the flag on the single core with interrupts masked.
+/// The common EL0 return, including the fast send path: `t` runs next, and
+/// `process` is its process. The hot path reads the gate without the lock
+/// as a hint (one byte, never torn); `park_selected` decides under the
+/// scheduler's lock. A change after the hint is caught at the next EL0
+/// return of the thread.
 #[inline(always)]
-pub fn park_if_suspended(t: NonNull<Thread>) -> bool {
-    // SAFETY: thread::run owns the selected thread and its process;
-    // interrupts remain masked, so the flag stays unchanged before locking.
-    if unsafe { !(*t.as_ref().process().as_ptr()).suspended } {
+pub fn park_if_suspended(t: NonNull<Thread>, process: NonNull<Process>) -> bool {
+    // SAFETY: thread::run owns the selected thread and its process. A
+    // change of the gate after this read is caught at the next EL0 return.
+    if unsafe { !gated(process.as_ptr(), Ordering::Relaxed) } {
         return false;
     }
     sched::locked(|k| park_selected(t, k))
@@ -114,14 +150,14 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
         unsafe {
             let p = process.as_ptr();
             assert!((*p).resume_level != 0, "a continuation has no reference");
-            if !(*p).suspended {
+            if !gated(p, Ordering::Relaxed) {
                 for _ in 0..64 {
                     let Some(t) = (*p).parked.first() else { break };
                     (*p).parked.remove(t);
                     k.s.unpark(t);
                 }
             }
-            !(*p).suspended && (*p).parked.first().is_some()
+            !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
         }
     });
     // SAFETY: the queue's reference goes only after the work ends.

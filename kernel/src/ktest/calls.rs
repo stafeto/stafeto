@@ -7434,6 +7434,61 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
     })
 }
 
+/// A thread of a process that ended and that the stage Threads has not taken
+/// off yet stops at the gate before EL0, as one of a suspended process does:
+/// on more cores another core may select it in the portions between.
+pub fn ending_process_stops_its_threads_at_the_gate(_: &Boot) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let mut thread_made = None;
+    let result = (|| {
+        let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::RoundRobin)
+            .map_err(|_| "no thread")?;
+        thread_made = Some(t);
+        thread::start(t).map_err(|_| "start failed")?;
+        // SAFETY: The test retains p while ending it.
+        unsafe {
+            process::end(p, ProcessState::Killed, CAUSE);
+        }
+        check(
+            // SAFETY: The test retains the thread.
+            unsafe { t.as_ref().sched.state() } == State::Ready,
+            "the end took the thread off before its portion",
+        )?;
+        // The cleanup queue has not run: the thread is selectable.
+        let parked = sched::locked(|k| {
+            // SAFETY: The scheduler owns its threads.
+            let kcore::sched::Decision::Run(r) = (unsafe { k.s.pick(timer::now(), None) }) else {
+                return Err("the thread of the ending process was not selectable");
+            };
+            check(r == t, "another thread was selected")?;
+            Ok(process::park_selected(r, k))
+        })?;
+        check(parked, "a thread of an ending process escaped its EL0 gate")?;
+        check(
+            thread::info(t).0.state == abi::ThreadState::Parked,
+            "the thread of an ending process was not parked",
+        )
+    })();
+    if let Some(t) = thread_made {
+        // SAFETY: The test holds the creation reference; exit precedes release.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    // SAFETY: The test releases its process creation reference once.
+    unsafe {
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result?;
+    check(
+        counts == (process::in_use(), thread::in_use()),
+        "an ending-process object stayed",
+    )
+}
+
 /// Accepted replies are delivered whole; the client parks before EL0.
 pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
     with_reply_wait(true, |w| {

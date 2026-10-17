@@ -176,13 +176,30 @@ pub fn byte(bank: usize, intid: u32) -> (usize, u32) {
     (bank + (intid & !3) as usize, 8 * (intid % 4))
 }
 
+/// The interface bit of the reading CPU from `banked`, its GICD_ITARGETSR0
+/// to GICD_ITARGETSR7: the first of the eight words that has a bit set in
+/// any of its four bytes, as Linux's gic_get_cpumask reads them. Each byte
+/// of those registers holds the reading CPU's own interface bit (IHI 0048B
+/// 4.3.12), whichever core booted. 0 when no byte has one.
+pub const fn own_interface(banked: [u32; 8]) -> u32 {
+    let mut i = 0;
+    while i < 8 {
+        let w = banked[i];
+        let mask = (w | w >> 8 | w >> 16 | w >> 24) & 0xff;
+        if mask != 0 {
+            return mask;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// The GICD_ITARGETSR word that sends four shared lines to the reading
-/// CPU, from `banked`, its GICD_ITARGETSR0: each byte of that banked
-/// register holds the reading CPU's own interface bit (IHI 0048B 4.3.12),
-/// whichever core booted. A GIC with one CPU interface reads it as zero
-/// and ignores the targets; 0x01 then stands for interface 0 [G25].
-pub const fn spi_targets(banked: u32) -> u32 {
-    let own = match banked & 0xff {
+/// CPU, from `own`, its interface bit (`own_interface`). A GIC with one CPU
+/// interface reads the banked registers as zero and ignores the targets;
+/// 0x01 then stands for interface 0 [G25].
+pub const fn spi_targets(own: u32) -> u32 {
+    let own = match own & 0xff {
         0 => 0x01,
         own => own,
     };
@@ -252,6 +269,23 @@ mod tests {
         assert_eq!(spi_targets(0x0101_0101), 0x0101_0101);
         assert_eq!(spi_targets(0x0404_0404), 0x0404_0404);
         assert_eq!(spi_targets(0x8080_8080), 0x8080_8080);
+        // Interface 1 and 2 reach every line, whatever core booted.
+        assert_eq!(spi_targets(0x02), 0x0202_0202);
+        assert_eq!(spi_targets(0x04), 0x0404_0404);
+    }
+
+    #[test]
+    fn own_interface_is_the_first_bit_found_in_the_banked_words() {
+        assert_eq!(own_interface([0; 8]), 0);
+        assert_eq!(own_interface([0x0202_0202, 0, 0, 0, 0, 0, 0, 0]), 0x02);
+        assert_eq!(own_interface([0x4000_0000, 0, 0, 0, 0, 0, 0, 0]), 0x40);
+        // A word of zeros is passed over, and the first with a bit counts.
+        assert_eq!(
+            own_interface([0, 0, 0x0000_0800, 0x0101_0101, 0, 0, 0, 0]),
+            0x08
+        );
+        assert_eq!(own_interface([0, 0, 0, 0, 0, 0, 0, 0x0101_0101]), 0x01);
+        assert_eq!(spi_targets(own_interface([0x0404_0404; 8])), 0x0404_0404);
     }
 
     #[test]

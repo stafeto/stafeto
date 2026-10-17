@@ -47,6 +47,7 @@ use crate::thread::{self, Siblings, Thread};
 use crate::timer::Timer;
 use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
+use core::sync::atomic::AtomicU8;
 use kcore::PAGE_SIZE;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
@@ -153,8 +154,13 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
-    /// Guarded by the scheduler lock; tested before every EL0 return.
-    suspended: bool,
+    /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
+    /// thread of the process runs only while it is 0. Read Relaxed: the
+    /// EL0 return takes a hint and `park_selected` decides under the
+    /// scheduler lock, which orders the decision. Written by atomic
+    /// read-modify-write with Release (no Acquire pairs with it);
+    /// `SUSPENDED` changes under the scheduler lock.
+    gate: AtomicU8,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,
     /// Nonzero while a continuation owns the cleanup item and a reference.
@@ -343,7 +349,7 @@ fn create(
         life: Life::new(),
         threads: None,
         thread_count: 0,
-        suspended: false,
+        gate: AtomicU8::new(0),
         parked: ParkedList::new(),
         resume_level: 0,
         parent: None,
@@ -779,6 +785,10 @@ unsafe fn life(process: NonNull<Process>) -> *mut Life {
 /// As for `end`.
 unsafe fn stop(process: NonNull<Process>, cause: u8) {
     let p = process.as_ptr();
+    // The process is ending: no thread of it enters EL0 again, whichever
+    // core selects it before the stage Threads takes it off.
+    // SAFETY: the caller's reference keeps the process alive.
+    unsafe { control::mark_ending(process) };
     // SAFETY: the caller's reference keeps the process alive; the running
     // thread is alive and holds its process.
     unsafe {

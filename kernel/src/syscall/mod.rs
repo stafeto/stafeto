@@ -222,7 +222,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
         // Numbers no call has, and those of calls that come later.
-        _ => Err(Error::InvalidArgs),
+        _ => return set_result(thread, Err(Error::InvalidArgs)),
     };
     set_result(thread, result);
 }

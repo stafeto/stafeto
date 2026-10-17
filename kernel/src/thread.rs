@@ -43,10 +43,10 @@ pub struct Thread {
     pub regs: UserRegs,
     /// Saved while the thread does not run.
     pub fp: FpRegs,
-    /// The handler entry (spec 11). A request from another thread
-    /// changes it under the scheduler's lock (sched::request_upcall); the
-    /// thread itself changes it without that lock (bind, control, the entry
-    /// in `run`) while the kernel runs on one core (the unlocked path ends when it runs on more).
+    /// The handler entry (spec 11). Every change runs under the scheduler's
+    /// lock: a request from another thread (sched::request_upcall), and the
+    /// thread's own bind, control, return, fault and the entry in `run`.
+    /// `run` looks at `is_pending` first, without the lock.
     pub upcall: kcore::upcall::State,
     /// What the scheduler keeps in the thread: the base priority, which
     /// `create` or thread_set_priority gave, the boost of a notification or
@@ -429,7 +429,10 @@ pub fn buffer_page(t: NonNull<Thread>) -> Option<usize> {
 /// Restore only the current EL0 context from a retained, fixed buffer area.
 /// All context validation precedes changes; split fields avoid aliasing the buffer.
 pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
-    // SAFETY: the current thread is held by the scheduler; execution is serial.
+    // SAFETY: the current thread is held by the scheduler. The fields
+    // `can_return` reads (depth, deferred, masked, entering) are written
+    // only by the thread itself, so the read needs no lock; `returned`
+    // writes under it.
     let t = unsafe { thread.as_mut() };
     if !t.upcall.can_return() {
         return Err(Error::BadState);
@@ -453,7 +456,7 @@ pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
     t.fp.fpcr = word(100);
     t.fp.fpsr = word(101);
     user::load_fp(&t.fp);
-    t.upcall.returned().expect("validated upcall return");
+    sched::locked(|_| t.upcall.returned()).expect("validated upcall return");
     Ok(())
 }
 
@@ -816,6 +819,20 @@ pub fn current() -> Option<NonNull<Thread>> {
     NonNull::new(user::current().cast())
 }
 
+/// The entry of the thread's handler, if one comes now, under the
+/// scheduler's lock: the entry address and the stack pointer it starts with.
+#[cold]
+#[inline(never)]
+fn prepare_entry(thread: &mut Thread) -> Option<(u64, u64)> {
+    sched::locked(|_| {
+        let long = thread.long.is_some();
+        thread
+            .upcall
+            .prepare(thread.regs.elr, thread.regs.spsr, thread.regs.sp, long)
+            .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
+    })
+}
+
 /// Runs `next` at EL0. A switch from another thread saves that one's FP
 /// and SIMD registers and loads next's; TTBR0 goes to next's address space
 /// unless it holds it already; then the kernel returns to EL0 with next's
@@ -823,7 +840,9 @@ pub fn current() -> Option<NonNull<Thread>> {
 /// entry, and no value on the caller's stack is ever dropped, so the caller
 /// holds none with a `Drop`: no lock guard, `AddressSpace` or the like.
 pub fn run(next: NonNull<Thread>) -> ! {
-    if process::park_if_suspended(next) {
+    // SAFETY: `next` is alive and holds its process; only the field is read.
+    let mut process = unsafe { next.as_ref().process };
+    if process::park_if_suspended(next, process) {
         sched::resume();
     }
     let prev = current();
@@ -840,17 +859,19 @@ pub fn run(next: NonNull<Thread>) -> ! {
             }
             user::load_fp(&next.as_ref().fp);
         }
-        let mut process = next.as_ref().process;
         process.as_mut().activate();
         let thread = &mut *next.as_ptr();
-        if let Some(entry) = thread.upcall.prepare(
-            thread.regs.elr,
-            thread.regs.spsr,
-            thread.regs.sp,
-            thread.long.is_some(),
-        ) {
+        // The look is without the lock; the entry itself is made under the
+        // scheduler's lock, as `request_upcall` makes its request, so that a
+        // request from another core meets a whole state.
+        let prepared = if thread.upcall.is_pending() {
+            prepare_entry(thread)
+        } else {
+            None
+        };
+        if let Some((entry, sp)) = prepared {
             thread.regs.elr = entry;
-            thread.regs.sp = thread.upcall.entry_sp(thread.regs.sp);
+            thread.regs.sp = sp;
             // The dispatcher starts a new control flow and leaves the
             // interrupted indirect branch unfinished. Return restores the old BTYPE.
             thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;

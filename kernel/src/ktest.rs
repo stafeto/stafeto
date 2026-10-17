@@ -314,6 +314,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::suspended_reply_keeps_its_result,
     ),
     (
+        "ending_process_stops_its_threads_at_the_gate",
+        calls::ending_process_stops_its_threads_at_the_gate,
+    ),
+    (
         "process_kill_ends_threads_in_every_state",
         calls::process_kill_ends_threads_in_every_state,
     ),
@@ -854,14 +858,13 @@ fn every_line_is_group_1(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// Every shared line goes to this CPU (spec 9): GICD_ITARGETSR holds this
-/// CPU's interface bit on a GICv2, the byte of the banked GICD_ITARGETSR0
-/// (line 0's, kcore::gic::spi_targets), or reads as zero where it has one
-/// CPU interface only (IHI 0048B 4.3.12, as QEMU's); GICD_IROUTER holds this
-/// CPU's affinity on a GICv3, and not IROUTER_ANY.
+/// CPU's interface bit on a GICv2, the byte its banked GICD_ITARGETSR0 to 7
+/// hold (line 0's, kcore::gic::own_interface), or reads as zero where the
+/// GIC has one CPU interface only (IHI 0048B 4.3.12, as QEMU's);
+/// GICD_IROUTER holds this CPU's affinity on a GICv3, and not IROUTER_ANY.
 fn shared_lines_route_to_this_cpu(_: &Boot) -> Result<(), &'static str> {
     let here = match gic::version() {
-        GicVersion::V2 if gic::cpu_interfaces() == 1 => 0,
-        GicVersion::V2 => u64::from(kcore::gic::spi_targets(gic::route(0) as u32) & 0xff),
+        GicVersion::V2 => gic::route(0),
         GicVersion::V3 => kcore::gic::irouter(registers::mpidr_el1()),
     };
     check(

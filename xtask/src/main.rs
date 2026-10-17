@@ -4722,6 +4722,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the 128 threads of the portion, the cost the CPU time of a process
 /// (`getrusage`, `times`) needs.
 ///
+/// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
+/// reads of the scheduler's decision and the upcall state under the
+/// scheduler lock moved the null call from 263 to 267 instructions (the
+/// compiler's layout of the path; no single change owns them).
+///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
 /// 1. The commit that trips a guard either gives the path back or raises
@@ -4741,7 +4746,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
-const NULL_MAX: u64 = 266;
+const NULL_MAX: u64 = 271;
 const THREADS_READY_MAX: u64 = 12_896;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
@@ -10362,10 +10367,10 @@ mod tests {
             )
         };
         assert_eq!(null(NULL_MAX), Ok(0));
-        assert_eq!(null(262), Ok(4));
+        assert_eq!(null(NULL_MAX - 4), Ok(4));
         let error = null(NULL_MAX + 1).unwrap_err();
         assert!(
-            error.contains("null=267") && error.contains("1 past"),
+            error.contains(&format!("null={}", NULL_MAX + 1)) && error.contains("1 past"),
             "{error}"
         );
         let mut teardown = [0; 10];
@@ -10399,7 +10404,7 @@ mod tests {
         );
         assert_eq!(
             guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX, NULL_KEEP),
-            Some("lower NULL_MAX to 253".to_owned())
+            Some("lower NULL_MAX to 258".to_owned())
         );
         assert_eq!(
             guard_lower_hint(
@@ -10550,6 +10555,88 @@ mod tests {
         .collect();
         found.sort();
         assert!(found.is_empty(), "{word} in {found:?}");
+    }
+
+    /// The state of a thread's upcall entry changes only under the
+    /// scheduler's lock, so that a request from another core meets a whole
+    /// state (SMP preparation): each call of a method that changes it, outside
+    /// the kernel tests, has `locked(` on its line or in the six lines
+    /// before it.
+    #[test]
+    fn upcall_state_changes_run_under_the_scheduler_lock() {
+        let calls = [
+            ".bind(",
+            ".control(",
+            ".control_basic(",
+            ".take(",
+            ".fault(",
+            ".prepare(",
+            ".returned(",
+        ];
+        let mut bare = Vec::new();
+        let mut seen = 0;
+        for (name, text) in texts(&["kernel/src"]) {
+            if name.starts_with("kernel/src/ktest") {
+                continue;
+            }
+            let lines: Vec<_> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let is_upcall = line.contains("upcall")
+                    || (n > 0 && lines[n - 1].trim_end().ends_with(".upcall"));
+                if !is_upcall || !calls.iter().any(|c| line.contains(c)) {
+                    continue;
+                }
+                seen += 1;
+                let from = n.saturating_sub(6);
+                if !lines[from..=n].iter().any(|l| l.contains("locked(")) {
+                    bare.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            seen >= 7,
+            "the scan found {seen} calls, expected at least 7"
+        );
+        assert!(
+            bare.is_empty(),
+            "upcall state changed without the lock: {bare:?}"
+        );
+    }
+
+    /// The gate before EL0 is one atomic byte: the hot path reads it as a
+    /// hint and `park_selected` decides under the scheduler's lock, and each
+    /// change (suspend, continue, end) writes it with Release.
+    #[test]
+    fn process_gate_is_read_relaxed_and_written_release() {
+        let text = std::fs::read_to_string(root().join("kernel/src/process/control.rs"))
+            .expect("the file of process control");
+        let hot = text
+            .split("pub fn park_if_suspended")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("park_if_suspended");
+        assert!(
+            hot.contains("gated(") && hot.contains("park_selected"),
+            "the hot read does not hand over to park_selected"
+        );
+        for write in [
+            "fetch_or(SUSPENDED, Ordering::Release)",
+            "fetch_and(!SUSPENDED, Ordering::Release)",
+            "fetch_or(ENDING, Ordering::Release)",
+        ] {
+            assert!(text.contains(write), "no {write}");
+        }
+        assert!(!text.contains("suspended: bool"));
+    }
+
+    /// The count of timers of the system checks its bound and counts in one
+    /// step (kcore::sync::Budget), and nothing reads it apart.
+    #[test]
+    fn system_timers_are_counted_in_one_step() {
+        let text = std::fs::read_to_string(root().join("kernel/src/timer.rs"))
+            .expect("the file of timers");
+        assert!(text.contains("CREATED.take(MAX_SYSTEM_TIMERS)"));
+        assert!(!text.contains("CREATED.load") && !text.contains("CREATED.count"));
     }
 
     /// The kernel tests wake their threads through timers of programs

@@ -13,6 +13,7 @@
 //! yet, and `Firing` takes one portion of a level's expired timers.
 
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Where a timer stands in the heap: its parent and children, and its
 /// deadline in counter ticks. Only the heap changes it; the deadline stays
@@ -384,8 +385,19 @@ pub struct Levels<T> {
     heaps: [Heap<T>; LEVELS],
     nonempty: u64,
     pending: u64,
-    nearest: Option<u64>,
+    /// The nearest deadline, or `NO_DEADLINE`. Stored with the owner's lock
+    /// held and read through `nearest_unlocked` by the scheduler's decision
+    /// without it: one relaxed load or store, never torn. A stale value
+    /// makes the reader arm the timer of its own CPU for a deadline that
+    /// has moved. With more CPUs (stage 2) an update from another CPU does
+    /// not re-arm that CPU's timer, so a stale `nearest` re-arms only the
+    /// CPU that read it.
+    nearest: AtomicU64,
 }
+
+/// The value of `Levels::nearest` when no level has a deadline to wait for;
+/// no counter reaches it.
+const NO_DEADLINE: u64 = u64::MAX;
 
 impl<T: HeapNode> Levels<T> {
     pub const fn new() -> Self {
@@ -393,8 +405,13 @@ impl<T: HeapNode> Levels<T> {
             heaps: [const { Heap::new() }; LEVELS],
             nonempty: 0,
             pending: 0,
-            nearest: None,
+            nearest: AtomicU64::new(NO_DEADLINE),
         }
+    }
+
+    fn set_nearest(&mut self, nearest: Option<u64>) {
+        self.nearest
+            .store(nearest.unwrap_or(NO_DEADLINE), Ordering::Relaxed);
     }
 
     fn heap(&mut self, level: u8) -> &mut Heap<T> {
@@ -405,7 +422,21 @@ impl<T: HeapNode> Levels<T> {
     /// The nearest deadline of the levels that are not pending, in O(1):
     /// what the kernel's timer needs (spec 8, 10).
     pub fn nearest(&self) -> Option<u64> {
-        self.nearest
+        // SAFETY: `self` is a valid reference.
+        unsafe { Self::nearest_unlocked(self) }
+    }
+
+    /// `nearest` for a reader that does not hold the lock of the levels:
+    /// the scheduler's decision. Only the atomic field is touched, so a
+    /// writer on another core may change the levels meanwhile; the value
+    /// is one that some state of the levels had.
+    ///
+    /// # Safety
+    /// `this` points to levels that are alive.
+    pub unsafe fn nearest_unlocked(this: *const Self) -> Option<u64> {
+        // SAFETY: the caller's promise; no reference to the other fields.
+        let n = unsafe { (*this).nearest.load(Ordering::Relaxed) };
+        (n != NO_DEADLINE).then_some(n)
     }
 
     /// Whether the firing of `level` is queued: from `expired` until
@@ -436,7 +467,7 @@ impl<T: HeapNode> Levels<T> {
                 (n, f) => n.or(f),
             };
         }
-        self.nearest = nearest;
+        self.set_nearest(nearest);
     }
 
     /// Puts `t` in at `level` for `deadline`: O(log n), and the nearest
@@ -449,7 +480,8 @@ impl<T: HeapNode> Levels<T> {
         unsafe { self.heap(level).insert(t, deadline) };
         self.nonempty |= bit(level);
         if self.pending & bit(level) == 0 {
-            self.nearest = Some(self.nearest.map_or(deadline, |n| n.min(deadline)));
+            let near = self.nearest().map_or(deadline, |n| n.min(deadline));
+            self.set_nearest(Some(near));
         }
     }
 
@@ -497,7 +529,7 @@ impl<T: HeapNode> Levels<T> {
         }
         if due != 0 {
             self.pending |= due;
-            self.nearest = nearest;
+            self.set_nearest(nearest);
         }
         due
     }
@@ -917,6 +949,49 @@ mod tests {
         // SAFETY: the timer is alive and out of the heaps.
         unsafe { l.insert(10, ps[3], 50) };
         assert_eq!(l.nearest(), Some(200), "a timer of a pending level counts");
+    }
+
+    /// The scheduler's decision reads the nearest deadline without the
+    /// lock of the levels while another core changes them. The reader sees
+    /// only values some state of the levels had: none, 100 or 200.
+    #[test]
+    fn nearest_unlocked_sees_only_states_of_the_levels() {
+        struct Shared(*mut Levels<Timer>);
+        // SAFETY: the reader touches only the atomic field.
+        unsafe impl Send for Shared {}
+        let (_ts, ps) = timers(2);
+        let mut l = Levels::new();
+        let shared = Shared(&raw mut l);
+        let stop = core::sync::atomic::AtomicBool::new(false);
+        let seen = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let shared = shared;
+                let mut seen = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: the levels outlive the scope.
+                    let near = unsafe { Levels::nearest_unlocked(shared.0) };
+                    assert!(
+                        matches!(near, None | Some(100) | Some(200)),
+                        "a deadline of {near:?} was never there"
+                    );
+                    seen += 1;
+                }
+                seen
+            });
+            for _ in 0..200_000 {
+                // SAFETY: the timers are alive and out of the heaps.
+                unsafe {
+                    l.insert(10, ps[0], 200);
+                    l.insert(20, ps[1], 100);
+                    l.remove(10, ps[0]);
+                    l.remove(20, ps[1]);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        assert!(seen > 0);
+        assert_eq!(l.nearest(), None);
     }
 
     #[test]

@@ -134,7 +134,8 @@ fn init_v2(cpu: Region) {
     let lines = gic::lines(read(dist + GICD_TYPER));
     LINE_COUNT.store(lines, Ordering::Relaxed);
     reset_lines(dist, 0..lines);
-    let targets = gic::spi_targets(read(dist + GICD_ITARGETSR));
+    let banked = core::array::from_fn(|i| read(dist + GICD_ITARGETSR + 4 * i));
+    let targets = gic::spi_targets(gic::own_interface(banked));
     for intid in (FIRST_SPI..lines).step_by(4) {
         write(dist + gic::byte(GICD_ITARGETSR, intid).0, targets);
     }
@@ -303,8 +304,8 @@ pub fn wait() -> Option<Ack> {
 
 #[cfg(feature = "ktest")]
 pub use test_access::{
-    control, cpu_interfaces, is_active, is_edge, is_enabled, is_group_1, priority, priority_mask,
-    route, set_pending, version, waker,
+    control, is_active, is_edge, is_enabled, is_group_1, priority, priority_mask, route,
+    set_pending, version, waker,
 };
 
 /// What the kernel tests read and steer here (crate::ktest).
@@ -376,11 +377,6 @@ mod test_access {
             // SAFETY: GICD_IROUTER is a 64-bit register of the distributor.
             GicVersion::V3 => unsafe { mmio::read64(dist + GICD_IROUTER + 8 * intid as usize) },
         }
-    }
-
-    /// The CPU interfaces of a GICv2: GICD_TYPER.CPUNumber + 1.
-    pub fn cpu_interfaces() -> u32 {
-        ((read(base(&DIST) + GICD_TYPER) >> 5) & 7) + 1
     }
 
     /// GICR_WAKER of this CPU's redistributor (GICv3).
