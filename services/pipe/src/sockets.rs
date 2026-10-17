@@ -41,9 +41,12 @@ const PORT_FIRST: u32 = 49152;
 const PORT_COUNT: u32 = 16384;
 /// A write of this many bytes or fewer goes whole or waits, as a pipe's.
 const ATOMIC_SEND: usize = ATOMIC;
+/// The least a buffer may be set to (SO_RCVBUF, SO_SNDBUF): one datagram of
+/// SEND_MAX bytes with its record (4 bytes) and the longest sender's address.
+const MIN_BUF: usize = 4 + ADDR_MAX + SEND_MAX;
 /// The buffer of a datagram socket of the file namespace: two datagrams of
-/// SEND_MAX bytes, each with its record (4 bytes) and sender's address.
-const DGRAM_RCVBUF: usize = 1700;
+/// SEND_MAX bytes, each with its record and the longest sender's address.
+const DGRAM_RCVBUF: usize = 2 * MIN_BUF;
 
 /// The descriptions a message carries and where in the receiver's stream
 /// (the count of bytes before, or of datagrams) they belong.
@@ -800,7 +803,7 @@ impl Pipes {
         };
         let size = |size: &mut u32| {
             if set {
-                *size = value.clamp(256, RING as u32);
+                *size = value.clamp(MIN_BUF as u32, RING as u32);
             }
             *size
         };
@@ -1883,6 +1886,36 @@ mod tests {
             p.step(&mut w);
         }
         assert_eq!((p.live_sockets(), p.in_flight()), (0, 0));
+    }
+
+    #[test]
+    fn a_buffer_is_never_set_below_one_datagram_with_the_longest_address() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let (c, _) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+        let c = sock(c);
+        assert_eq!(
+            p.sock_option(&held, c, OPT_RCVBUF, true, 256),
+            Ok(MIN_BUF as u32)
+        );
+        assert!(MIN_BUF >= 4 + ADDR_MAX + SEND_MAX);
+    }
+
+    #[test]
+    fn two_datagrams_from_a_sender_with_the_longest_name_fit() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (c, d) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+        let (c, _d) = (sock(c), sock(d));
+        let mut path = vec![b'a'; proto_pipe::sock::NAME_MAX];
+        path[0] = b'/';
+        p.sock_bind(&held, c, Addr::unix(9, &path).unwrap())
+            .unwrap();
+        let big = [1u8; SEND_MAX];
+        assert!(matches!(p.sock_write(&held, c, &big, &mut w), Ok(Some(_))));
+        assert!(matches!(p.sock_write(&held, c, &big, &mut w), Ok(Some(_))));
+        assert_eq!(p.sock_write(&held, c, &big, &mut w), Ok(None));
     }
 
     #[test]

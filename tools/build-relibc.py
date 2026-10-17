@@ -72,7 +72,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # registration, mq_send waits for the notice it fired, mq_notify takes signal
 # 0, timers with SIGEV_THREAD kept by the library, sem_timedwait refuses a
 # time out of range when it would block; tagged pin-ba1f937e.
-COMMIT = "ba1f937e77aaf2f62532f7f9cbb2dad758774edc"
+# Review of the pin: a thread timer is deleted under its lock, mq_close removes
+# only the registration of its own process, lio_listio past the limit is
+# EINVAL, _PC_SYNC_IO is -1; tagged pin-517dca5b.
+COMMIT = "517dca5b62574b3deaf416acdb58b48e38dbe641"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -337,6 +337,10 @@ static int long_transfers_and_aio(void) {
     w2.aio_lio_opcode = LIO_WRITE;
     r2.aio_fildes = fd; r2.aio_buf = in; r2.aio_nbytes = 16; r2.aio_offset = 9000;
     r2.aio_lio_opcode = LIO_READ;
+    struct aiocb *many_list[1] = {&w2};
+    errno = 0;
+    CHECK(lio_listio(LIO_NOWAIT, many_list, (int)sysconf(_SC_AIO_LISTIO_MAX) + 1, NULL) == -1
+          && errno == EINVAL);
     struct aiocb *list[2] = {&w2, &r2};
     CHECK(lio_listio(LIO_WAIT, list, 2, NULL) == 0);
     CHECK(aio_return(&w2) == 16 && aio_return(&r2) == 16 && memcmp(in, out, 16) == 0);
@@ -426,6 +430,16 @@ static int thread_timers(void) {
     nanosleep(&nap, NULL);
     CHECK(timer_fired == stopped + 1 && timer_getoverrun(timer) == 0);
     CHECK(timer_delete(timer) == 0);
+    /* Deleting a timer that fires all the time: the helper frees it. */
+    for (int round = 0; round < 40; round++) {
+        timer_t fast;
+        struct itimerspec rapid = {{0, 200000}, {0, 200000}};
+        CHECK(timer_create(CLOCK_MONOTONIC, &event, &fast) == 0);
+        CHECK(timer_settime(fast, 0, &rapid, NULL) == 0);
+        struct timespec brief = {0, 300000 + round * 50000};
+        nanosleep(&brief, NULL);
+        CHECK(timer_delete(fast) == 0);
+    }
     printf("relibc-hello: timers with a function in a thread\n");
     return 0;
 }

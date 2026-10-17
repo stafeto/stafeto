@@ -382,6 +382,15 @@ static int mq_notifies(void) {
     sigpending(&wait);
     CHECK(!sigismember(&wait, SIGUSR1));
     CHECK(mq_notify(q, NULL) == 0);
+    /* A child that closes its copy of the descriptor leaves its parent's registration. */
+    CHECK(mq_notify(q, &ev) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) _exit(mq_close(q) == 0 ? 0 : 1);
+    CHECK(wait_ok(pid));
+    errno = 0;
+    CHECK(mq_notify(q, &ev) == -1 && errno == EBUSY);
+    CHECK(mq_notify(q, NULL) == 0);
     /* A function in a thread. */
     memset(&ev, 0, sizeof ev);
     ev.sigev_notify = SIGEV_THREAD;
