@@ -468,16 +468,62 @@ bytes of a message past the registers (up to 960) are copied after the call's
 section ends, and the zeroing of a fresh frame in a portion of `mem_create`
 goes on outside it.
 
-`OBJ_HOLD_MAX` (xtask) bounds the longest hold in instructions under
-`-icount`; the kernel counts the longest hold of each kind of section
-(`obj hold kind ticks`). With N CPUs a section waits for at most N-1 holds, so
-B_N = B + (N-1) * OBJ_HOLD_MAX + C_cmd. The longest holds measured (SMP stage
-3, instructions): first `mem_map` of a process 5 753, `process_create`
+`OBJ_HOLD_MAX` (xtask, 4 000 since stage 4) bounds the longest hold in
+instructions under `-icount`; the kernel counts the longest hold of each kind
+of section (`obj hold kind ticks`). With N CPUs a section waits for at most
+N-1 holds, so B_N = B + (N-1) * OBJ_HOLD_MAX + C_cmd, and xtask fails B_4 =
+B + 3 * OBJ_HOLD_MAX above 32 000 (27 469 now: B 15 469). The longest holds
+measured in stage 3 were first `mem_map` of a process 5 753, `process_create`
 5 248, `thread_create` 4 696, the stage Replies of process teardown 4 099 (32
-clients), `mem_unmap` 2 956, `mem_protect` 2 524, and once in 65 535 switches
-of address space the new generation of ASIDs 13 417 (`OBJ_ASID_ROLLOVER_MAX`,
-until the ASID rework of stage 5). A channel's stage Close takes one section
-for each waiter it wakes.
+clients) and `mem_unmap` 2 956; stage 4 cut them: `mem_map` checks the
+mappings and the threads of the process in one section and enters the entry
+in the next, which begins only if no mapping and no message buffer joined the
+process between (`maps::epoch`): 2 939; `process_create` gives the lock back
+between the child and its first entries: 2 957; the stage Space reads the
+entries of a table with no lock and takes it for each table that goes back,
+the continuation of a suspended process unparks its 64 threads in sections
+of 16. The longest hold is now 2 957 (`mem_unmap`); once in 65 535 switches
+of address space the new generation of ASIDs holds 13 417
+(`OBJ_ASID_ROLLOVER_MAX`, until the ASID rework of stage 5). A channel's stage
+Close takes one section for each waiter it wakes.
+
+## Commands between CPUs (SMP stage 4)
+
+A thread's scheduling state belongs to the CPU it runs on
+(`thread::cpu_of`: the creator's, or the one `thread_create` x5 bits 16-23
+name, plus one). Another CPU asks by a command (kernel/src/cmd.rs): a flag in
+the thread (`WAKE`, `START`, `UNPARK`, `LEVEL`, `BOOST`, `EXIT`), the
+arguments in a table by thread number, the thread in the one-writer queue
+"CPU i to CPU j" of the sender (1 024 places: a thread stands in the queues
+once at most), and one SGI to the CPU. A section posts into its CPU's outbox,
+and the outbox goes out after the section ended and after the copy of a
+message that a woken thread reads (`thread::flush_copy`): the SGI is no part
+of the hold of OBJ. The owner takes the commands where it handles the SGI, on
+an empty kernel stack, no lock held; the commands that touch objects take
+OBJ there (a section of their own, at most one per thread). A request to
+another CPU's thread in EL0 (`thread_upcall_request`) sets the thread's
+`pending` flag and sends an SGI with no command: that CPU enters the kernel,
+and the way back to EL0 finds the request (S5x).
+
+Synchronous IPC with the service on another CPU: the client sleeps, the
+service is boosted to the client's level at `accept` (the thread waits, so
+the write of its level is safe under OBJ), the reply wakes the client by a
+command; a raise of the client goes along the chain of requests, each hop a
+command to the CPU of the next thread. The fast path of `send` takes only a
+receiver of its own CPU.
+
+A suspension and the end of a process need every thread of it out of EL0:
+`process_control` outside OBJ and the stage Threads wait for every CPU to
+pass a quiescent point after the gate went up (`qsbr::synchronize`,
+`control::gate_seen`); a CPU in EL0 is asked by SGI, and the way to EL0 is a
+quiescent point (one load of `qsbr::PENDING`). The wait adds to the blocking
+time of its caller, not of the CPUs it waits for.
+
+The kernel tests measure at stage 4, instructions under -icount: B 15 469
+(unchanged), `null` 265 of `NULL_MAX` 271, S5 2 881 of 3 063, the OBJ hold 2
+957 of 4 000. `threads_ready` rose from 10 833 to 12 285 (26 instructions a
+thread: the exit reads where the thread runs and what it was asked), its
+guard to 12 289.
 
 The state of a thread's upcall entry changes without a lock: only the CPU
 that runs the thread touches it. The table of interrupt lines is read without
