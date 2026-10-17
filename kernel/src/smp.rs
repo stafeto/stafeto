@@ -8,7 +8,7 @@
 //! block and idles in `wfi`, serving the kernel's SGIs. Nothing is
 //! scheduled on it yet: the scheduler stays on CPU 0 (stages 3 and 4). A
 //! CPU other than CPU 0 touches no kernel structure but its own block and
-//! the atomics here: the console and the locks are for one CPU until then.
+//! the atomics here: the console and OBJ are for CPU 0 until then.
 //!
 //! The probe of the SGIs lets every CPU ping every other and checks each
 //! pong: what a sender wrote before its SGI is there when the SGI comes.
@@ -17,10 +17,10 @@ use crate::arch::{cache, cpu, gic, registers, symbols, timer};
 use crate::boot::Boot;
 use crate::psci;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use cpu::{CpuBlock, MAX_CPUS, UP};
 use kcore::bootinfo::MPIDR_AFFINITY;
-use kcore::gic::{Ack, SGI_GO, SGI_PING, SGI_PONG};
+use kcore::gic::{Ack, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
 use kcore::layout::image_pa;
 
 /// What a CPU reads with its MMU and caches off, at the physical address
@@ -252,6 +252,9 @@ pub fn handle(ack: Ack) {
         SGI_GO if gic::sgi_from(&ack, 0) && GO[me].swap(0, Ordering::Acquire) != 0 => {
             ping_all(me, cpus)
         }
+        SGI_LOCK if gic::sgi_from(&ack, 0) && LOCK_GO[me].swap(0, Ordering::Acquire) != 0 => {
+            lock_rounds(me)
+        }
         _ => {}
     }
     gic::end(ack);
@@ -303,5 +306,83 @@ pub fn sgi_probe() {
     kprintln!(
         "sgi        {cpus} CPUs, all {} pairs: ping and pong ok",
         cpus * (cpus - 1)
+    );
+}
+
+/// `LOCK_GO[cpu]`: CPU 0 asks the CPU to take part in the probe of OBJ.
+static LOCK_GO: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+/// `LOCK_DONE[cpu]`: the CPU finished its rounds.
+static LOCK_DONE: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
+/// The longest wait for OBJ any CPU saw in the probe, in ticks.
+static LOCK_WAIT: AtomicU64 = AtomicU64::new(0);
+
+/// Sections each CPU takes in the probe of OBJ.
+const LOCK_ROUNDS: u64 = 2_000;
+
+/// What the probe's sections change: a plain word, read, held for a few
+/// instructions and written back. It is whole only if the sections exclude
+/// each other.
+struct Counter(UnsafeCell<u64>);
+
+// SAFETY: the word is touched only inside a section under OBJ.
+unsafe impl Sync for Counter {}
+
+static COUNTER: Counter = Counter(UnsafeCell::new(0));
+
+/// The rounds of one CPU in the probe of OBJ: each takes a section, and adds
+/// one to the counter by a read, a pause and a write that another CPU in the
+/// section would overwrite.
+fn lock_rounds(me: usize) {
+    let mut longest = 0;
+    for _ in 0..LOCK_ROUNDS {
+        let asked = timer::now();
+        let section = crate::obj::enter();
+        longest = longest.max(timer::now() - asked);
+        // SAFETY: inside the section under OBJ.
+        unsafe {
+            let word = COUNTER.0.get();
+            let seen = word.read_volatile();
+            for _ in 0..16 {
+                core::hint::spin_loop();
+            }
+            word.write_volatile(seen + 1);
+        }
+        drop(section);
+    }
+    LOCK_WAIT.fetch_max(longest, Ordering::Relaxed);
+    LOCK_DONE[me].store(1, Ordering::Release);
+}
+
+/// The probe of the lock OBJ, on CPU 0, with every CPU up (aarch64.md, probe
+/// 4): each CPU takes LOCK_ROUNDS sections at once, and the counter that
+/// they add to must come out whole. Stops the kernel when it does not, or
+/// when a CPU does not finish.
+pub fn lock_probe() {
+    let cpus = cpus();
+    if cpus < 2 {
+        return;
+    }
+    for (to, go) in LOCK_GO.iter().enumerate().take(cpus).skip(1) {
+        go.store(1, Ordering::Release);
+        gic::send_sgi(to, SGI_LOCK);
+    }
+    lock_rounds(0);
+    let limit = timer::now() + WAIT_SECONDS * timer::frequency();
+    while (0..cpus).any(|c| LOCK_DONE[c].load(Ordering::Acquire) == 0) {
+        if timer::now() > limit {
+            panic!("lock probe: a CPU did not finish its rounds");
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: every CPU finished its sections.
+    let counter = unsafe { COUNTER.0.get().read_volatile() };
+    let expected = LOCK_ROUNDS * cpus as u64;
+    assert!(
+        counter == expected,
+        "lock probe: {counter} of {expected} additions survived: OBJ does not exclude"
+    );
+    kprintln!(
+        "obj        {cpus} CPUs, {expected} sections: exclusion ok, longest wait {} ticks",
+        LOCK_WAIT.load(Ordering::Relaxed)
     );
 }

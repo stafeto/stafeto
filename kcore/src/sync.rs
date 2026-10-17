@@ -118,9 +118,9 @@ impl<T> Drop for LockGuard<'_, T> {
 /// A ticket lock, without data: a CPU takes the next ticket and waits until
 /// the lock serves it, so the CPUs go in the order they came and none waits
 /// for more than the sections of the CPUs ahead of it. The wait on AArch64
-/// is `sevl; wfe; ldaxrh`: the holder's `stlrh` to the served number clears
-/// the waiter's exclusive monitor, which wakes it (Arm ARM B2.9.2). The
-/// holder masks interrupts (spec 8.1), so no section is preempted.
+/// polls the served number with `ldarh` and `yield`; the holder's `stlrh`
+/// publishes the next. The holder masks interrupts (spec 8.1), so no section
+/// is preempted.
 pub struct Ticket {
     next: AtomicU16,
     serving: AtomicU16,
@@ -145,20 +145,19 @@ impl Ticket {
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     #[inline(always)]
     fn wait(&self, ticket: u16) {
-        // SAFETY: loads a halfword of the lock; `ldaxrh` acquires it, and the
-        // monitor it arms lets the `stlrh` of `unlock` wake the `wfe`.
+        // SAFETY: loads a halfword of the lock with acquire. The wait spins
+        // on `yield`: a section is a few thousand instructions, and QEMU's
+        // `wfe` never wakes for the `stlrh` of `unlock`, the event of a
+        // cleared exclusive monitor, which hardware delivers (Arm ARM
+        // B2.9.2); under a hypervisor a `wfe` may trap as well.
         unsafe {
             core::arch::asm!(
-                // Served already: no wait, the common case.
-                "ldaxrh {s:w}, [{p}]",
+                "2:",
+                "ldarh {s:w}, [{p}]",
                 "cmp {s:w}, {t:w}",
                 "b.eq 3f",
-                "sevl",
-                "2:",
-                "wfe",
-                "ldaxrh {s:w}, [{p}]",
-                "cmp {s:w}, {t:w}",
-                "b.ne 2b",
+                "yield",
+                "b 2b",
                 "3:",
                 p = in(reg) self.serving.as_ptr(),
                 t = in(reg) u32::from(ticket),

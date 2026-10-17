@@ -162,7 +162,7 @@ extern "C" fn handle_user_exception(regs: *mut UserRegs, index: u64) -> ! {
 pub fn fault_enters(mut thread: NonNull<Thread>, syndrome: u64, far: u64) -> bool {
     let long = thread::long(thread).is_some();
     // SAFETY: the running thread is alive; only its own entry state changes,
-    // under the scheduler's lock.
+    // under OBJ.
     let upcall = &mut unsafe { thread.as_mut() }.upcall;
     upcall.fault(syndrome, esr::fault_address(syndrome, far), long)
 }

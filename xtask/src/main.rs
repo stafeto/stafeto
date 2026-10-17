@@ -7577,10 +7577,21 @@ fn smp_report(lines: &[String], cpus: usize) -> Result<(), String> {
         "sgi        {cpus} CPUs, all {} pairs: ping and pong ok",
         cpus * (cpus - 1)
     );
-    match lines.iter().position(|l| *l == probe) {
-        Some(at) if at > last => Ok(()),
-        Some(_) => Err("the SGI probe is reported before the CPUs".into()),
-        None => Err(format!("the boot report has no line {probe:?}")),
+    let sgi = match lines.iter().position(|l| *l == probe) {
+        Some(at) if at > last => at,
+        Some(_) => return Err("the SGI probe is reported before the CPUs".into()),
+        None => return Err(format!("the boot report has no line {probe:?}")),
+    };
+    // The probe of the lock OBJ: every CPU's sections added to a plain word,
+    // and all of them came out whole.
+    let lock = format!(
+        "obj        {cpus} CPUs, {} sections: exclusion ok, longest wait ",
+        2_000 * cpus
+    );
+    match lines.iter().position(|l| l.starts_with(&lock)) {
+        Some(at) if at > sgi => Ok(()),
+        Some(_) => Err("the lock probe is reported before the SGI probe".into()),
+        None => Err(format!("the boot report has no line {lock:?}")),
     }
 }
 
@@ -10369,6 +10380,7 @@ mod tests {
             .map(|n| format!("cpu {n}      MPIDR {:#x} EL1 timer ok", 0x8000_0000u64 + n))
             .collect();
         good.push("sgi        4 CPUs, all 12 pairs: ping and pong ok".into());
+        good.push("obj        4 CPUs, 8000 sections: exclusion ok, longest wait 312 ticks".into());
         assert_eq!(smp_report(&good, 4), Ok(()));
         let mut cut = good.clone();
         cut.remove(2);
@@ -10383,8 +10395,11 @@ mod tests {
         wrong[2] = "cpu 2      MPIDR 0x80000003 EL1 timer ok".into();
         assert!(smp_report(&wrong, 4).unwrap_err().contains("0x80000003"));
         let mut no_probe = good.clone();
-        no_probe.pop();
+        no_probe.remove(4);
         assert!(smp_report(&no_probe, 4).unwrap_err().contains("sgi"));
+        let mut no_lock = good.clone();
+        no_lock.pop();
+        assert!(smp_report(&no_lock, 4).unwrap_err().contains("obj"));
         let mut early = good.clone();
         early.rotate_right(1);
         assert!(smp_report(&early, 4).unwrap_err().contains("before"));
@@ -10904,6 +10919,59 @@ mod tests {
         assert!(
             locked.is_empty(),
             "upcall state of a thread changed under a lock: {locked:?}"
+        );
+    }
+
+    /// The order of locks is in kernel/src/obj.rs: `OBJ` is the only lock the
+    /// CPUs share, and what a CPU alone owns takes none. So outside the kernel
+    /// tests no `kcore::sync::Lock` guards kernel data, the ticket is taken
+    /// only in obj.rs, `Own` cells live only in `Local` (local.rs), and the
+    /// data `OBJ` guards are the five that the order names: a new lock or
+    /// datum has to change this list, and so decide its place in the order.
+    #[test]
+    fn locks_of_the_kernel_are_the_ones_the_order_names() {
+        const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
+        let mut found = Vec::new();
+        let mut guarded = Vec::new();
+        for (name, text) in texts(&["kernel/src"]) {
+            if name.starts_with("kernel/src/ktest") {
+                continue;
+            }
+            for (n, line) in text.lines().enumerate() {
+                let at = format!("{name}:{}", n + 1);
+                if line.contains("kcore::sync::Lock") || line.contains("Lock<") {
+                    found.push(format!("{at}: a kcore Lock"));
+                }
+                if name != "kernel/src/obj.rs" && line.contains("Ticket") {
+                    found.push(format!("{at}: a ticket outside obj.rs"));
+                }
+                if name != "kernel/src/local.rs" && line.contains("Own<") {
+                    found.push(format!("{at}: an Own cell outside local.rs"));
+                }
+                if line.starts_with("static ") && line.contains("Guarded<")
+                    || line.starts_with("pub static ") && line.contains("Guarded<")
+                {
+                    let datum = line
+                        .split("static ")
+                        .nth(1)
+                        .and_then(|rest| rest.split(':').next())
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    guarded.push(datum);
+                }
+            }
+        }
+        assert!(found.is_empty(), "locks the order does not name: {found:?}");
+        guarded.sort();
+        let mut expected: Vec<String> = GUARDED.iter().map(|s| (*s).to_owned()).collect();
+        expected.sort();
+        assert_eq!(guarded, expected, "data under OBJ are not the named ones");
+        let obj =
+            std::fs::read_to_string(workspace_root().unwrap().join("kernel/src/obj.rs")).unwrap();
+        assert!(
+            obj.contains("The order of locks is this module's"),
+            "the order of locks is not written in obj.rs"
         );
     }
 

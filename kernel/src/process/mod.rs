@@ -159,9 +159,9 @@ pub struct Process {
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
     /// thread of the process runs only while it is 0. Read Relaxed: the
     /// EL0 return takes a hint and `park_selected` decides under the
-    /// scheduler lock, which orders the decision. Written by atomic
+    /// OBJ, which orders the decision. Written by atomic
     /// read-modify-write with Release (no Acquire pairs with it);
-    /// `SUSPENDED` changes under the scheduler lock.
+    /// `SUSPENDED` changes under OBJ.
     gate: AtomicU8,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,
@@ -204,7 +204,7 @@ pub struct Process {
     /// the levels the clients had. Any thread of the process may answer.
     /// A request holds no reference to its client: while it stands here the
     /// client lives, and a client that ends takes its slot out
-    /// (channel::cancel). Reached only with the scheduler locked
+    /// (channel::cancel). Reached only under OBJ
     /// (`accepted`).
     accepted: ReadyQueue<Slot<Owner>>,
     /// How far its teardown came.
@@ -551,7 +551,7 @@ pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
 /// left its list and, for each thread in it, its finished stints and, when
 /// it is on the CPU, its stint so far, with the part of the sum spent in
 /// the kernel (object_info PROCESS_TIME). One walk
-/// of at most abi::MAX_THREADS threads, whose nodes the scheduler's lock
+/// of at most abi::MAX_THREADS threads, whose nodes OBJ
 /// guards.
 pub fn cpu_time(process: NonNull<Process>) -> (u64, u64) {
     let now = crate::arch::timer::now();
@@ -925,7 +925,7 @@ pub fn timer_room(process: NonNull<Process>) -> Result<(), Error> {
 
 /// The queue of the requests `process` accepted (Process::accepted), which
 /// changes together with the states of the clients in it: reached only
-/// with the scheduler locked, which `_locked` shows (sched::locked).
+/// under OBJ, which `_locked` shows (sched::locked).
 ///
 /// # Safety
 /// `process` is alive.

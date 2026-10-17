@@ -453,6 +453,37 @@ window that goes.
 | a teardown that a thread at a high level starts (`process_kill`, the last handle to a big process or to a channel with many waiters) | runs at the level of its cause (spec 7.7), the Close and Replies stages at the higher of the cause and their top waiter: the chunks of the whole teardown follow one another at that level, with interrupt polls between them, and no thread at or below that level runs until they end | each chunk as in its row; in all, the sum of the object's chunks | no single number since stage 3, which took the end into chunks: the call part, 350 (`end_call`), then the Threads chunks at S, the longest 13,213 (`threads_ready`), then the chunks of the later stages, each at most B (the rows above); in stage 1.3c, when the call stopped the threads, `process_kill` of a child with 64 threads that never ran took 42,961 with its whole teardown; closing a channel with 60 waiting receivers is no single path: two chunks of the Close stage at their level, the longer 3,844 (test build), then each of the 60 receivers it wakes runs above the closer and exits on its own, about 1,100 instructions each |
 | B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 16,738 under -icount at E1-G1 (`first_map`, 512M; `release`, 16,060, on 2G), bound `KERNEL_B_MAX` 18,000, budget of the services `TERM_B` 20,410; before that 20,538 under -icount (test build) since process suspension (20,536 after stage 3): a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
 
+## The lock OBJ (SMP stage 3)
+
+One ticket lock, `OBJ` (kernel/src/obj.rs), guards every change to the
+links between kernel objects: channels and their queues, handle tables,
+mappings, processes and threads, thread numbers, the frames of memory and the
+ASIDs. A CPU holds it with interrupts masked, inside one section: a call (the
+calls that reach objects take it at their start, a long call at each
+portion), an interrupt that posts to a channel, a portion of cleanup, a fault
+that ends a process. Teardown takes narrow sections: one for a few threads,
+one for each handle released, one for each post of a timer. What a CPU alone
+owns, its scheduler, timers, cleanup queue and log ring, has no lock. The
+bytes of a message past the registers (up to 960) are copied after the call's
+section ends, and the zeroing of a fresh frame in a portion of `mem_create`
+goes on outside it.
+
+`OBJ_HOLD_MAX` (xtask) bounds the longest hold in instructions under
+`-icount`; the kernel counts the longest hold of each kind of section
+(`obj hold kind ticks`). With N CPUs a section waits for at most N-1 holds, so
+B_N = B + (N-1) * OBJ_HOLD_MAX + C_cmd. The longest holds measured (SMP stage
+3, instructions): first `mem_map` of a process 5 753, `process_create`
+5 248, `thread_create` 4 696, the stage Replies of process teardown 4 099 (32
+clients), `mem_unmap` 2 956, `mem_protect` 2 524, and once in 65 535 switches
+of address space the new generation of ASIDs 13 417 (`OBJ_ASID_ROLLOVER_MAX`,
+until the ASID rework of stage 5). A channel's stage Close takes one section
+for each waiter it wakes.
+
+The state of a thread's upcall entry changes without a lock: only the CPU
+that runs the thread touches it. The table of interrupt lines is read without
+a lock too; a binding that its last handle unbound goes back after every CPU
+passed a quiescent point (kernel/src/qsbr.rs).
+
 ## Process suspension
 
 `process_control` (call 36, MANAGE) sets or clears the process flag in O(1).

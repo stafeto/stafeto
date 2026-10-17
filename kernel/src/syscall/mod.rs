@@ -61,8 +61,8 @@ use upcall::{
 };
 
 /// Runs a call that reaches objects in a section under OBJ (obj.rs), as a
-/// block, not a closure: the section's lock and unlock lie in the arm of
-/// the call.
+/// block that lies in the arm of the call, with the section's lock and
+/// unlock in it.
 macro_rules! objects {
     ($call:expr) => {{
         let _section = crate::obj::enter();
@@ -174,6 +174,7 @@ impl Values {
 /// has written the caller's result first. A thread in a long call goes on
 /// with it (`go_on`).
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
+    let _production = crate::obj::production();
     #[cfg(feature = "trace")]
     crate::log::syscall(number, crate::thread::index(thread));
     #[cfg(feature = "measure")]
@@ -183,6 +184,9 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     }
     crate::obj::serving(u64::from(number));
     dispatch_inner(thread, number);
+    // The section of the call ended: the bytes of a message it delivered go
+    // between the buffers outside OBJ, before anything runs (thread.rs).
+    thread::flush_copy();
     record_call(number);
 }
 

@@ -75,6 +75,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     smp::start(boot);
     report(boot, clock, &init);
     smp::sgi_probe();
+    smp::lock_probe();
     #[cfg(feature = "fault-probe")]
     {
         // A window over the console's page leaves a record nobody showed:

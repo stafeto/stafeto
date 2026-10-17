@@ -203,7 +203,7 @@ pub fn top() -> Option<u8> {
 /// The top level during the scheduler's decision, without the lock: one
 /// relaxed load of the queue's mask (`ReadyQueue::top_unlocked`), which a
 /// holder of the lock on another core may change meanwhile. The decision
-/// treats the answer as a hint and takes the scheduler's lock before it acts.
+/// treats the answer as a hint and takes OBJ before it acts.
 #[cfg(not(feature = "locked-decide"))]
 pub fn top_for_decide() -> Option<u8> {
     // SAFETY: the queue is a static; only its atomic mask is read.
@@ -252,7 +252,6 @@ pub fn portion() {
             }
             Work::Object(Object::Channel(c)) => {
                 crate::obj::serving(crate::obj::CLEAN_CHANNEL);
-                let _section = crate::obj::lock();
                 channel::clean(c, level)
             }
             Work::Object(Object::Session(s)) => {

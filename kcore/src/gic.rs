@@ -97,6 +97,8 @@ pub const GICD_SGIR: usize = 0xF00;
 pub const SGI_PING: u32 = 0;
 pub const SGI_PONG: u32 = 1;
 pub const SGI_GO: u32 = 2;
+/// CPU 0 asks a CPU to take part in the probe of the lock OBJ.
+pub const SGI_LOCK: u32 = 3;
 
 /// GICD_SGIR for SGI `intid` to the CPU interfaces in `targets` (the
 /// bits `own_interface` reads): TargetListFilter 0, the list in [23:16],

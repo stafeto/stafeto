@@ -25,9 +25,10 @@
 //!    a frame, the teardown of a detached object (`outside`).
 //!
 //! Test builds check the places that change a link nobody else guards
-//! (`assert_held`): once the EL0 tests start, such a change outside a
-//! section stops the kernel, but for the code of the tests themselves
-//! (`test_scope`), which calls the kernel's functions without an entry.
+//! (`assert_held`): inside an entry of the kernel (`production`), such a
+//! change outside a section stops the kernel. The code of the tests
+//! themselves, which calls the kernel's functions without an entry, and
+//! the boot are exempt (`test_scope`).
 
 use crate::arch::cpu;
 use core::cell::UnsafeCell;
@@ -225,17 +226,21 @@ pub fn held() -> bool {
 pub fn assert_held() {
     #[cfg(obj_checks)]
     assert!(
-        held() || !STRICT.load(Relaxed) || IN_TEST.load(Relaxed),
+        held() || IN_TEST.load(Relaxed),
         "a link of objects changes outside OBJ"
     );
 }
 
-/// From now on `assert_held` stops the kernel, but for the code of the
-/// tests themselves (`test_scope`): the EL0 tests run through the kernel's
-/// own entries.
-#[cfg(obj_checks)]
-pub fn strict() {
-    STRICT.store(true, Relaxed);
+/// Stops a test build that works on what no link reaches while it holds
+/// `OBJ` (rule 3): the copy of a message, which goes outside the section.
+#[inline(always)]
+#[track_caller]
+pub fn assert_not_held() {
+    #[cfg(obj_checks)]
+    assert!(
+        !held() || IN_TEST.load(Relaxed),
+        "work on unlinked data inside OBJ"
+    );
 }
 
 /// The code of a test runs inside: it calls the kernel's functions without
@@ -261,10 +266,35 @@ impl Drop for TestScope {
     }
 }
 
+/// Whether the code that runs is a test's or the boot's: the checks of
+/// `assert_held` leave it alone. True until the first entry of the kernel.
 #[cfg(obj_checks)]
-static STRICT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static IN_TEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// An entry of the kernel runs inside: the checks apply to it, whoever
+/// called it. The tests call `dispatch` with the checks on this way.
 #[cfg(obj_checks)]
-static IN_TEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub struct Production(bool);
+
+#[cfg(obj_checks)]
+pub fn production() -> Production {
+    Production(IN_TEST.swap(false, Relaxed))
+}
+
+#[cfg(obj_checks)]
+impl Drop for Production {
+    fn drop(&mut self) {
+        IN_TEST.store(self.0, Relaxed);
+    }
+}
+
+#[cfg(not(obj_checks))]
+pub struct Production;
+
+#[cfg(not(obj_checks))]
+pub fn production() -> Production {
+    Production
+}
 
 /// The checks are off in the build that ships and in the images that count
 /// instructions; the hooks of the tests stay.
@@ -275,9 +305,6 @@ pub struct TestScope;
 pub fn test_scope() -> TestScope {
     TestScope
 }
-
-#[cfg(all(feature = "ktest", not(obj_checks)))]
-pub fn strict() {}
 
 #[cfg(not(obj_checks))]
 pub fn end_test_scope() {}

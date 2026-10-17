@@ -34,7 +34,7 @@ impl Via {
     /// A request that waits in the queue holds what it went through from
     /// now on (spec 6.1): the channel, or one more copy of the session, so
     /// that CLIENT_GONE comes after the request (spec 5.3). Only counts, so
-    /// it runs under the scheduler's lock.
+    /// it runs under OBJ.
     fn hold(self) {
         match self {
             Via::Channel(c) => retain(c, Rights::NONE),
@@ -44,7 +44,7 @@ impl Via {
 
     /// The reference a wait held goes at `cause`, which may queue what it
     /// held (spec 7.7); the last copy of a session posts CLIENT_GONE
-    /// (session::release), so it runs after the scheduler's lock.
+    /// (session::release), so it runs after OBJ.
     ///
     /// # Safety
     /// The reference is the caller's: `hold` took it, or a wait in receive
@@ -78,7 +78,7 @@ pub enum Wait {
 
 /// What the first look of receive at a channel's queue came to.
 enum Looked {
-    /// What it took under the scheduler's lock, if anything.
+    /// What it took under OBJ, if anything.
     Done(Option<Taken>),
     /// The request at the head, of this client, whose handles need room in
     /// the receiver's table first.
@@ -113,7 +113,7 @@ fn drop_handles(t: NonNull<Thread>, values: &[u64]) {
 /// request ends. Then the head of the top level of the queue leaves it: a
 /// slot, emptied into x0-x11, after which `t` works at the slot's priority
 /// under its ceiling until its next receive, and the slot lets its owner
-/// go at that priority after the scheduler's lock; or a request, which `t`
+/// go at that priority after OBJ; or a request, which `t`
 /// takes (`accept`) once its handles have room in the table of `t`'s
 /// process (process::reserve_handles), the reference of its sender's wait
 /// going after the lock. A request whose handles find no room fails its
@@ -255,7 +255,7 @@ unsafe fn take_request(
 /// the reply (Ok), its own slot at the level of its effective priority and
 /// its handles out of its process's table (process::take_handles): the
 /// receiver becomes ready at the tail of its level with a new quantum, the
-/// reference of its wait going after the scheduler's lock; or else the
+/// reference of its wait going after OBJ; or else the
 /// slot goes to the tail of its level in the channel's queue (spec 6.3),
 /// holding `via` and the handles (Thread::transit) until a receive takes
 /// it. A message of registers alone may take the fast path (`fast_send`),
@@ -339,12 +339,12 @@ pub fn send(
 /// is below the receiver's effective priority after the boost the request
 /// gives it, no interrupt is pending, and that priority is above every
 /// ready thread's. The state is the one the slow path leaves. The
-/// reference of the receiver's wait goes after the scheduler's lock.
+/// reference of the receiver's wait goes after OBJ.
 /// Returns the receiver, which the caller runs; None, with nothing changed,
 /// when a condition fails. O(1).
 fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>> {
     let c = via.channel();
-    // Read before the scheduler's lock: the locks do not nest.
+    // The hints are the CPU's own, read before the section.
     let cleanup = cleanup::top();
     let next_timer = timer::first();
     let r = sched::hand_off(next_timer, |k, now| {
@@ -383,7 +383,7 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
 /// channel for the wait: None. O(1).
 ///
 /// # Safety
-/// Under the scheduler's lock `k`, at the counter value `now`: `t` runs and
+/// Under OBJ `k`, at the counter value `now`: `t` runs and
 /// sends through `via`, whose channel is alive, with `desc`; its handles are
 /// on their way, and a receiver that waits has room for them in its
 /// process's table.
@@ -420,7 +420,7 @@ unsafe fn meet(
 /// comes to (spec 6.1, 6.2, 11): x0 0, x1 the description, x2-x9 bytes
 /// 0-63 from the sender's registers, zero past the length; bytes 64 up to
 /// the length go from the sender's message buffer into the receiver's, at
-/// the same offsets (thread::copy_message); the handles on their way in
+/// the same offsets (thread::copy_later); the handles on their way in
 /// `from` (Thread::transit) go into the table of `to`'s process, which
 /// made room for them, and their values and info words into `to`'s buffer
 /// (process::put_handles, thread::write_handles). O(1): at most 960 bytes
@@ -441,7 +441,7 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
             [f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9]];
         mask_tail(&mut x[2..10], desc.len);
         if desc.len > INLINE_MAX {
-            thread::copy_message(to, from, INLINE_MAX..desc.len);
+            thread::copy_later(to, from, INLINE_MAX..desc.len);
         }
         if desc.handles > 0 {
             let put = process::put_handles(to.as_ref().process(), thread::take_transit(from));
@@ -627,7 +627,7 @@ pub unsafe fn cancel(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
 /// rules of the ready queue (spec 6.1, 6.3). A client that waits for a
 /// reply and rose also raises the thread that works on its request, and the
 /// threads behind it, up to LIFT_DEPTH (`lift_servers`, spec 6.6). Returns
-/// the wait, for `raise` after the scheduler's lock. O(LIFT_DEPTH).
+/// the wait, for `raise` after OBJ. O(LIFT_DEPTH).
 ///
 /// # Safety
 /// As for `withdraw`.
@@ -714,7 +714,7 @@ unsafe fn move_slot(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Wait> {
     }
 }
 
-/// After `requeue` of a thread that waits in `w`, once the scheduler's lock
+/// After `requeue` of a thread that waits in `w`, once OBJ
 /// went (sched::set_priority, spec 7.7): a channel at its stage Close, or a
 /// process at its stage Replies, goes up in the cleanup queue to the level
 /// of its top waiter when that is higher. O(1).

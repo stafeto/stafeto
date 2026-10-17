@@ -213,7 +213,7 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 /// own and queues the process for its first stage: Threads at S for a
 /// process with threads in its list past `stopped`, the thread the call
 /// took off when it heads the list, Stop at S for one with children,
-/// Replies otherwise (`stage_level`). It takes the scheduler's lock.
+/// Replies otherwise (`stage_level`). It takes OBJ.
 ///
 /// # Safety
 /// `process` is alive and whole; a continuation may own its cleanup item.
@@ -250,7 +250,7 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
 /// The level the stage of `process` runs at (spec 7.7): S, the higher of
 /// its ceiling and R, at the stages Threads and Stop; the higher of R and
 /// the top level of its accepted requests at the stage Replies, read under
-/// the scheduler's lock; R at the others. O(1).
+/// OBJ; R at the others. O(1).
 ///
 /// # Safety
 /// `process` is alive; only the fields are read.
@@ -273,7 +273,7 @@ unsafe fn stage_level(process: NonNull<Process>) -> u8 {
 /// thread_set_priority moved a client in the queue of accepted requests of
 /// `process` (channel::raise): at the stage Replies the process goes up in
 /// the cleanup queue to the level of its top client when that is higher
-/// (spec 7.7). Nothing at other stages. It takes the scheduler's lock.
+/// (spec 7.7). Nothing at other stages. It takes OBJ.
 ///
 /// # Safety
 /// `process` is alive: a client waits for its reply.
@@ -475,7 +475,7 @@ unsafe fn stop_child(process: NonNull<Process>, level: u8) -> bool {
 /// The stage Replies, taken at `level`: up to REPLIES_PORTION clients at
 /// the top level of the queue of accepted requests of `process` leave it,
 /// each woken with PEER_CLOSED in x0 alone at the tail of its level with a
-/// new quantum (spec 6.8), under one hold of the scheduler's lock. True
+/// new quantum (spec 6.8), under one hold of OBJ. True
 /// once the queue is empty; a process that took no request passes at once.
 ///
 /// # Safety

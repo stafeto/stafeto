@@ -141,6 +141,7 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
     match sent {
         Ok(Some(receiver)) => {
             crate::obj::leave();
+            thread::flush_copy();
             thread::run(receiver)
         }
         Ok(None) => {}

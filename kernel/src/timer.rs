@@ -22,9 +22,9 @@
 //! its slot's while the slot stands in the channel's queue. The last one
 //! marks it dying and queues it (spec 7.7): a dying timer fires no more,
 //! and its portion takes it off its heap and lets the channel and the
-//! payer's shell go. The lock of the levels and the scheduler's are never
-//! held together: a post takes the scheduler's lock only once the lock of
-//! the levels went.
+//! payer's shell go. The levels of timers belong to the CPU that arms them
+//! (local.rs): they take no lock, and a post enters its own section under
+//! OBJ.
 
 use crate::arch::timer as clock;
 use crate::channel::{self, Channel, Owner, Source};

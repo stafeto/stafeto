@@ -42,7 +42,7 @@ unsafe fn gated(p: *const Process, order: Ordering) -> bool {
 /// retaining the process until its last portion or cancellation.
 pub fn control(process: NonNull<Process>, suspend: bool, cause: u8) -> Result<(), Error> {
     let cancelled = sched::locked(|_| {
-        // SAFETY: the caller holds the process; the scheduler lock guards
+        // SAFETY: the caller holds the process; OBJ guards
         // suspension, the parked list and its continuation state.
         unsafe {
             let p = process.as_ptr();
@@ -97,7 +97,7 @@ pub(super) unsafe fn cancel(process: NonNull<Process>) -> bool {
 }
 
 /// Park the selected thread, if its process is suspended or ending, under
-/// the scheduler lock, before counting a fired deadline as an EL0 return.
+/// OBJ, before counting a fired deadline as an EL0 return.
 /// One thread per exit-loop iteration.
 #[inline(always)]
 pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
@@ -125,7 +125,7 @@ pub fn gated_thread(t: NonNull<Thread>) -> bool {
 /// The common EL0 return, including the fast send path: `t` runs next, and
 /// `process` is its process. The hot path reads the gate without the lock
 /// as a hint (one byte, never torn); `park_selected` decides under the
-/// scheduler's lock. A change after the hint is caught at the next EL0
+/// OBJ. A change after the hint is caught at the next EL0
 /// return of the thread.
 #[inline(always)]
 pub fn park_if_suspended(t: NonNull<Thread>, process: NonNull<Process>) -> bool {
@@ -142,7 +142,7 @@ pub fn park_if_suspended(t: NonNull<Thread>, process: NonNull<Process>) -> bool 
 /// A parked thread exits: unlink it before the scheduler marks it dead.
 ///
 /// # Safety
-/// `t` is alive and parked; `k` holds the scheduler lock.
+/// `t` is alive and parked; `k` holds OBJ.
 pub(crate) unsafe fn unlist(t: NonNull<Thread>, _k: &mut Locked<'_>) {
     // SAFETY: the caller's promise; its process owns this parked link.
     unsafe { (*t.as_ref().process().as_ptr()).parked.remove(t) };

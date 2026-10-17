@@ -28,11 +28,14 @@ pub struct Local {
     pub ring: Own<Ring<LOG_RECORDS>>,
     /// The objects this CPU retired and has not freed (qsbr).
     pub retired: Own<crate::qsbr::Retired>,
+    /// The copy of message bytes that waits for the end of a section
+    /// (thread::copy_later).
+    pub copy: Own<crate::thread::PendingCopy>,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,
     /// The items of the cleanup queue for the firings of the levels of
     /// timers, level 1 first (timer). Zeros until `init`: an `Item` is not
-    /// all zeros, and a `Local` of zeros lives in .bss, not in the image.
+    /// all zeros, and a `Local` of zeros lives in .bss, outside the image file.
     pub firings: [UnsafeCell<MaybeUninit<Item>>; LEVELS],
 }
 
@@ -48,6 +51,7 @@ impl Local {
             queue: Own::new(crate::cleanup::Queue::new()),
             ring: Own::new(Ring::new()),
             retired: Own::new(crate::qsbr::Retired::new()),
+            copy: Own::new(crate::thread::PendingCopy::new()),
             entry: UnsafeCell::new((0, 0)),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],
         }
@@ -71,9 +75,9 @@ pub fn local() -> &'static Local {
 
 /// A datum of one CPU: its owner borrows it with `lock`, which takes no
 /// lock, since nothing else reaches it. Test builds count the borrow and
-/// stop the kernel on a second one while the first lives, as the lock of
-/// one CPU did (kcore::sync::Lock); the build that ships has neither the
-/// count nor its instructions.
+/// stop the kernel on a second one while the first lives, as the flag of the
+/// lock of one CPU did; the build that ships has neither the count nor its
+/// instructions.
 pub struct Own<T> {
     value: UnsafeCell<T>,
     #[cfg(obj_checks)]

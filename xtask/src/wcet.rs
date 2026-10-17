@@ -19,11 +19,19 @@ use crate::{KERNEL_TARGET, cargo, jobs, llvm_tool, root, run_cmd, target_dir};
 /// system calls, every entry from EL0 (which ends in the scheduler's
 /// `resume` and so handles the interrupts), the exceptions of the kernel
 /// itself and the vector table.
-const ENTRIES: [(&str, &str); 4] = [
+const ENTRIES: [(&str, &str); 7] = [
     ("system calls", "kernel::syscall::dispatch"),
     ("entries from EL0 and interrupts", "handle_user_exception"),
     ("exceptions at EL1", "handle_exception"),
     ("vector table", "exception_vectors"),
+    // The paths of SMP stage 3 that no direct call from an entry reaches: the
+    // SGIs of the probes, among them the rounds of the lock probe, which the
+    // CPUs other than CPU 0 run; the reclamation of a binding of an interrupt
+    // line after its quiescent period (a call through a pointer), and the
+    // period itself.
+    ("SGIs of the probes", "kernel::smp::handle"),
+    ("reclaim of a binding", "kernel::irq::reclaim"),
+    ("quiescent period", "kernel::qsbr::poll"),
 ];
 
 /// The probes of `wcet coverage` that the kernel group of `ci` does not

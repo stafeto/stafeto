@@ -16,7 +16,7 @@ pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Resul
         return Err(Error::BadState);
     }
     // SAFETY: only the current thread configures its own entry, under the
-    // scheduler's lock, which a request from another core takes too.
+    // OBJ, which a request from another core takes too.
     let upcall = &mut unsafe { thread.as_mut() }.upcall;
     locked_bind(upcall, a[0])?;
     Ok(Values::none())

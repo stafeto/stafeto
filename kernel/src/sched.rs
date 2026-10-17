@@ -19,8 +19,9 @@
 //! requests change together with the states of the threads that wait in
 //! them, and so does the table of thread numbers (spec 6.1, 7.8), which
 //! lies here, in memory the kernel takes at boot: the code that changes
-//! them runs under the scheduler's lock (`locked`). The lock of the
-//! timers is never held with it (crate::timer).
+//! them runs under OBJ (`locked`, obj.rs). The scheduler itself, with its
+//! ready queue, belongs to the CPU that runs it (local.rs): it takes no
+//! lock, and the code under OBJ reaches it freely.
 
 use crate::arch::{self, gic, timer};
 use crate::channel::{self, Wait};
@@ -142,12 +143,12 @@ pub fn set_entry_timing(timing: (u64, u64)) {
     unsafe { *local().entry.get() = timing };
 }
 
-/// The table of thread numbers, which the scheduler's lock guards: only
+/// The table of thread numbers, which OBJ guards: only
 /// `locked` reaches it, while it holds that lock. Zeroed at boot (spec
 /// 7.8).
 static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
 
-/// A value the scheduler's lock guards, apart from SCHED.
+/// A value OBJ guards, apart from SCHED.
 struct Guarded<T>(UnsafeCell<T>);
 
 // SAFETY: only `locked` reaches the value, while it holds the scheduler's
@@ -265,7 +266,7 @@ pub fn running() -> Option<NonNull<Thread>> {
 /// future call. A thread that waits for the reply to an accepted request
 /// is not interrupted: BAD_STATE, as for a thread that waits for nothing,
 /// and the reply comes once (spec 6.1). Wait references and moved handles
-/// are released outside the scheduler lock. O(1), at most four handles.
+/// are released outside OBJ. O(1), at most four handles.
 ///
 /// # Safety
 /// `t` is alive and the caller holds a reference throughout this call.
@@ -280,7 +281,7 @@ pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
 }
 
 /// thread_upcall_request: the look at the target's state, the request
-/// and the look at its wait happen under the scheduler's lock with the
+/// and the look at its wait happen under OBJ with the
 /// interruption they decide, so no other path can start or end the wait
 /// in between (spec 8.1). BAD_STATE for a stopped or ended thread. A
 /// request that enables an entry ends a send or receive as `interrupt`
@@ -384,14 +385,14 @@ pub fn set_priority(
     Ok(())
 }
 
-/// What the scheduler's lock guards for the rest of the kernel: the
+/// What OBJ guards for the rest of the kernel: the
 /// scheduler, and the table of thread numbers.
 pub struct Locked<'a> {
     pub s: &'a mut Scheduler<Thread>,
     pub tokens: &'a mut Tokens,
 }
 
-/// Runs `f` with the scheduler locked. The queues of channels and of
+/// Runs `f` under OBJ. The queues of channels and of
 /// accepted requests hold the slots of threads that wait
 /// (kcore::notify::Queue), and requests take tokens from the table of
 /// thread numbers, so the code that changes them, with the threads'
@@ -399,7 +400,7 @@ pub struct Locked<'a> {
 pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
     crate::obj::assert_held();
     let mut g = local().sched.lock();
-    // SAFETY: the guard of the scheduler's lock lives until `f` returns,
+    // SAFETY: the guard of OBJ lives until `f` returns,
     // so this is the only reference to the table (TOKENS).
     let tokens = unsafe { &mut *TOKENS.0.get() };
     f(&mut Locked {
@@ -408,7 +409,7 @@ pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
     })
 }
 
-/// The fast path of send (spec 6.4): `meet` runs with the scheduler locked,
+/// The fast path of send (spec 6.4): `meet` runs under OBJ,
 /// as under `locked`, given the counter value `hand_off` read before the
 /// lock (the sender's stint ends and the receiver's begins at it), and
 /// either makes the meeting and returns the receiver, or returns None and
@@ -453,7 +454,7 @@ pub fn hand_off(
 /// thread whose quantum is over goes to the tail of its level; an
 /// interrupt that came for a timer of a program ends no quantum. Then each
 /// level of timers of programs whose top expired queues its firing in the
-/// cleanup queue at that level, after the scheduler's lock (spec 10).
+/// cleanup queue at that level, after OBJ (spec 10).
 /// `resume` arms the timer again. The deadline that fired, CNTV_CVAL_EL0,
 /// waits for the next thread to run, which measures the latency for
 /// KSTATS.
@@ -550,7 +551,7 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
         let _obj = crate::obj::lock();
         let mut k = Locked {
             s: &mut g.s,
-            // SAFETY: the scheduler lock guards the table.
+            // SAFETY: OBJ guards the table.
             tokens: unsafe { &mut *TOKENS.0.get() },
         };
         if crate::process::park_selected(t, &mut k) {

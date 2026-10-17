@@ -647,8 +647,6 @@ const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 8 } else { 0 };
 /// and xtask runs both for each kind of build (`Variant::el0_half`).
 #[cfg(feature = "el0-half")]
 pub fn run(_: &Boot) -> ! {
-    // The EL0 tests come through the kernel's entries alone (obj.rs).
-    crate::obj::strict();
     let _test = crate::obj::test_scope();
     el0::run()
 }
