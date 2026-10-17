@@ -118,9 +118,12 @@ impl<T> Drop for LockGuard<'_, T> {
 /// A ticket lock, without data: a CPU takes the next ticket and waits until
 /// the lock serves it, so the CPUs go in the order they came and none waits
 /// for more than the sections of the CPUs ahead of it. The wait on AArch64
-/// polls the served number with `ldarh` and `yield`; the holder's `stlrh`
-/// publishes the next. The holder masks interrupts (spec 8.1), so no section
-/// is preempted.
+/// sleeps in `wfe` over an exclusive `ldaxrh` of the served number: the
+/// holder's `stlrh` clears the monitor and wakes it, and the `sev` after the
+/// store wakes a waiter whose monitor the emulator does not model. The
+/// event stream of the generic timer (`CNTKCTL_EL1.EVNTEN`) wakes it at
+/// least every few tens of microseconds in any case. The holder masks
+/// interrupts (spec 8.1), so no section is preempted.
 pub struct Ticket {
     next: AtomicU16,
     serving: AtomicU16,
@@ -145,20 +148,18 @@ impl Ticket {
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     #[inline(always)]
     fn wait(&self, ticket: u16) {
-        // SAFETY: loads a halfword of the lock with acquire. The wait spins
-        // on `yield`: a section is a few thousand instructions, and QEMU's
-        // `wfe` never wakes for the `stlrh` of `unlock`, the event of a
-        // cleared exclusive monitor, which hardware delivers (Arm ARM
-        // B2.9.2); under a hypervisor a `wfe` may trap as well.
+        // SAFETY: loads a halfword of the lock with acquire. `sevl` makes
+        // the first `wfe` fall through, so the loop reads the number once
+        // before it sleeps; after that each `wfe` sleeps until the monitor
+        // of `ldaxrh` clears, a `sev` arrives or the event stream ticks.
         unsafe {
             core::arch::asm!(
+                "sevl",
                 "2:",
-                "ldarh {s:w}, [{p}]",
+                "wfe",
+                "ldaxrh {s:w}, [{p}]",
                 "cmp {s:w}, {t:w}",
-                "b.eq 3f",
-                "yield",
-                "b 2b",
-                "3:",
+                "b.ne 2b",
                 p = in(reg) self.serving.as_ptr(),
                 t = in(reg) u32::from(ticket),
                 s = out(reg) _,
@@ -180,6 +181,7 @@ impl Ticket {
     pub fn unlock(&self, ticket: u16) {
         self.serving
             .store(ticket.wrapping_add(1), Ordering::Release);
+        wake();
     }
 
     /// Serves the next ticket for the holder, which has not kept its own:
@@ -189,11 +191,22 @@ impl Ticket {
         let ticket = self.serving.load(Ordering::Relaxed);
         self.serving
             .store(ticket.wrapping_add(1), Ordering::Release);
+        wake();
     }
 
     /// Whether no CPU holds or awaits the lock.
     pub fn is_free(&self) -> bool {
         self.next.load(Ordering::Relaxed) == self.serving.load(Ordering::Relaxed)
+    }
+}
+
+/// The `sev` after a release: it wakes every CPU in `wfe`.
+#[inline(always)]
+fn wake() {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    // SAFETY: `sev` only signals an event.
+    unsafe {
+        core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
     }
 }
 

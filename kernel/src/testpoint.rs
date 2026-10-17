@@ -97,6 +97,11 @@ mod points {
     /// table goes (process::maps).
     #[inline(always)]
     pub fn mapping_released() {}
+
+    /// After `irq::deliver` read the binding of `line` without a lock and
+    /// before it takes `OBJ`.
+    #[inline(always)]
+    pub fn line_read(_: u32) {}
 }
 
 /// The test build: each point goes to the tests.
@@ -180,5 +185,10 @@ mod points {
 
     pub fn mapping_released() {
         ktest::calls::mapping_released();
+    }
+
+    pub fn line_read(line: u32) {
+        let _test = crate::obj::test_scope();
+        ktest::calls::line_read(line);
     }
 }

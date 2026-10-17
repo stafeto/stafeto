@@ -975,9 +975,9 @@ pub fn run(next: NonNull<Thread>) -> ! {
         }
         process.as_mut().activate();
         let thread = &mut *next.as_ptr();
-        // The look is without the lock; the entry itself is made under the
-        // OBJ, as `request_upcall` makes its request, so that a
-        // request from another core meets a whole state.
+        // Neither the look nor the entry takes `OBJ`: the thread runs on
+        // this CPU alone, so the state of its entry is this CPU's own
+        // (syscall::upcall).
         if thread.upcall.is_pending()
             && let Some((entry, sp)) = prepare_entry(thread)
         {

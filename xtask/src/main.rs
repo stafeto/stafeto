@@ -4766,6 +4766,15 @@ const NULL_MAX: u64 = 271;
 /// goes in portions or narrows its section; the kernel prints the number as
 /// `obj hold ticks: longest=N`.
 const OBJ_HOLD_MAX: u64 = 6_000;
+/// The blocking time of a kernel call on four CPUs, B_4 = B + 3 *
+/// OBJ_HOLD_MAX: the call's own longest portion and the sections of the
+/// three CPUs ahead of it in the ticket lock. Decision of the stage 3
+/// review: `kernel_tests` prints B_4 against this bound now; the stage 4
+/// merge turns it into a failure, and it asks OBJ_HOLD_MAX to come down to
+/// 4 000 (`dc zva` in `phys::zero`, then the zeroing of a new page outside
+/// the section) so that B_4 fits. The ASID rollover adds its own term until
+/// stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
+const B4_MAX: u64 = 32_000;
 /// The hold of the one section that makes a new generation of ASIDs, once
 /// in 65 535 switches of address space: it clears the table of ASIDs and
 /// flushes the TLB. The ASID rework of SMP stage 5 (#356) moves that out of
@@ -4776,7 +4785,7 @@ const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 10_810;
+const THREADS_READY_MAX: u64 = 10_833;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -8704,6 +8713,10 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
 fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
+    let b4 = n + 3 * OBJ_HOLD_MAX;
+    println!(
+        "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX} (checked from stage 4)"
+    );
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
         None => Err(format!(

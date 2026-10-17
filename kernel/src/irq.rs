@@ -278,6 +278,7 @@ pub fn deliver(line: u32) -> bool {
     let Some(b) = line_binding(line) else {
         return false;
     };
+    crate::testpoint::line_read(line);
     let _section = crate::obj::lock();
     // The line may have been unbound meanwhile, by a CPU that held `OBJ`.
     if line_binding(line) != Some(b) {

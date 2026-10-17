@@ -18,6 +18,15 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+// Memory order: the marks and the epoch counter use SeqCst. A reader's
+// "mark, then read LINES" has to be ordered against the writer's "change
+// LINES, then read the marks": with only release stores and acquire loads
+// the writer may read a stale mark while the reader reads the stale LINES,
+// and the binding goes while the reader still holds it. In the Rust model
+// only SeqCst orders that pair (a store, then a load of another location,
+// on each side). On AArch64 SeqCst stores and loads are the `stlr` and
+// `ldar` the release and acquire forms already use, so it costs nothing.
+
 /// The mark of an idle CPU: past every epoch.
 pub const IDLE: u64 = u64::MAX;
 
@@ -40,18 +49,18 @@ impl<const N: usize> Grace<N> {
     /// The epoch of an object that was just unlinked: the counter moves on,
     /// so that every quiescent point after this call writes it or more.
     pub fn retire(&self) -> u64 {
-        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// CPU `cpu` is quiescent: it holds no pointer to what was retired
     /// before now.
     pub fn quiesce(&self, cpu: usize) {
-        self.seen[cpu].store(self.epoch.load(Ordering::Acquire), Ordering::Release);
+        self.seen[cpu].store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// CPU `cpu` goes idle: it holds nothing until `quiesce` marks it awake.
     pub fn idle(&self, cpu: usize) {
-        self.seen[cpu].store(IDLE, Ordering::Release);
+        self.seen[cpu].store(IDLE, Ordering::SeqCst);
     }
 
     /// Whether every one of the first `cpus` CPUs was quiescent after the
@@ -59,7 +68,7 @@ impl<const N: usize> Grace<N> {
     pub fn passed(&self, epoch: u64, cpus: usize) -> bool {
         self.seen[..cpus]
             .iter()
-            .all(|s| s.load(Ordering::Acquire) >= epoch)
+            .all(|s| s.load(Ordering::SeqCst) >= epoch)
     }
 }
 

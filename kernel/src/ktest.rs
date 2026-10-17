@@ -590,6 +590,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::unbound_binding_waits_for_a_quiescent_period,
     ),
     (
+        "last_shell_reference_comes_with_the_binding_reclaim",
+        calls::last_shell_reference_comes_with_the_binding_reclaim,
+    ),
+    (
+        "line_unbound_while_delivery_waits_for_obj_gets_nothing",
+        calls::line_unbound_while_delivery_waits_for_obj_gets_nothing,
+    ),
+    (
         "queued_notice_does_not_hold_the_line",
         calls::queued_notice_does_not_hold_the_line,
     ),
