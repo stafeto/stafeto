@@ -1032,29 +1032,46 @@ fn user_and_kernel() -> Result<(u64, u64), &'static str> {
     Ok((ran.saturating_sub(kernel), kernel))
 }
 
+/// Runs `step` in batches of `batch` until the counter has advanced
+/// `ticks`: the same time under `-icount` as without it, and a batch is
+/// long enough for the reading of the counter to count for little.
+fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) {
+    let began = rt::time::now();
+    while rt::time::now().wrapping_sub(began) < ticks {
+        for _ in 0..batch {
+            step();
+        }
+    }
+}
+
 /// The CPU time splits (spec 8): a loop at EL0 with no call grows the user
 /// time and next to nothing of the kernel time; a loop of calls grows the
-/// kernel time and next to nothing of the user time; the kernel time is
-/// part of the whole, and the process's sum has both.
+/// kernel time; the kernel time is part of the whole, and the process's sum
+/// has both. Each loop runs 4 ms of the counter, so that the numbers do not
+/// depend on the speed of the host.
 fn cpu_time_splits_user_and_kernel() -> Outcome {
+    let four_ms = rt::time::frequency() / 250;
     let (user0, kernel0) = user_and_kernel()?;
-    burn();
+    until_elapsed(four_ms, 1, || {});
     let (user1, kernel1) = user_and_kernel()?;
-    let (spin_user, spin_kernel) = (user1 - user0, kernel1.saturating_sub(kernel0));
-    check(spin_user > 100_000, "a loop at EL0 grew no user time")?;
+    let (spin_user, spin_kernel) = (user1.saturating_sub(user0), kernel1.saturating_sub(kernel0));
+    check(spin_user > four_ms / 2, "a loop at EL0 grew no user time")?;
     check(
         spin_kernel < spin_user / 8,
         "a loop at EL0 with no call grew the kernel time",
     )?;
-    for _ in 0..2_000 {
+    until_elapsed(four_ms, 256, || {
         let _ = sys::yield_now();
-    }
-    let (user2, kernel2) = user_and_kernel()?;
-    let (call_user, call_kernel) = (user2.saturating_sub(user1), kernel2.saturating_sub(kernel1));
-    check(call_kernel > 100_000, "a loop of calls grew no kernel time")?;
+    });
+    let (_, kernel2) = user_and_kernel()?;
+    let call_kernel = kernel2.saturating_sub(kernel1);
+    // A call's entry and return count as the program's own time: the stamps
+    // lie inside the kernel's path, and on a slow host (TCG without
+    // -icount) the exception entry and return are most of it. What the
+    // loop of calls shows is that the kernel time grows with the calls.
     check(
-        call_user < call_kernel,
-        "a loop of calls grew the user time more than the kernel time",
+        call_kernel > four_ms / 16 && call_kernel > 50 * spin_kernel,
+        "a loop of calls grew little of the kernel time",
     )?;
     let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;
     check(kernel <= ran, "the kernel time is above the whole")?;

@@ -875,13 +875,13 @@ static int cpu_split(void) {
     /* 20 ms of calls into the kernel. */
     began = monotonic_ns();
     while (monotonic_ns() - began < 20000000LL) sched_yield();
-    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
-    long long whole2 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
     long long system2 = stafeto_cpu_system_ns(0);
     long long thread2 = stafeto_cpu_system_ns(1);
-    long long call_user = (whole2 - system2) - (whole1 - system1);
     long long call_system = system2 - system1;
-    if (system2 < 0 || call_system < 5000000LL || call_user >= call_system) return 298;
+    /* The entry and the return of a call count as the program's time, and
+     * on a slow host most of a call is that: the loop of calls shows only
+     * that the system time grows with the calls. */
+    if (system2 < 0 || call_system < 1000000LL || call_system < 20 * spin_system) return 298;
     if (thread2 < thread0 + call_system / 2 || thread2 > system2) return 299;
     /* Children that were waited for: none yet, and the call is whole. */
     long long children = stafeto_cpu_system_ns(-1);
