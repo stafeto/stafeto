@@ -896,7 +896,6 @@ conformance/interfaces/pthread_rwlock_rdlock/6-2
 conformance/interfaces/pthread_rwlock_timedrdlock/2-1
 conformance/interfaces/pthread_rwlock_timedrdlock/3-1
 conformance/interfaces/pthread_rwlock_timedrdlock/4-1
-conformance/interfaces/pthread_rwlock_timedrdlock/6-2
 conformance/interfaces/pthread_rwlock_timedrdlock/7-1
 conformance/interfaces/pthread_rwlock_timedwrlock/2-1
 conformance/interfaces/pthread_rwlock_timedwrlock/3-1
