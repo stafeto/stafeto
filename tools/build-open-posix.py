@@ -103,7 +103,9 @@ SOURCE_FIXES = {
 def fetch() -> None:
     """Download the release (once), check it, unpack the suite alone."""
     done = SOURCE / ".unpacked"
-    if done.exists() and done.read_text() == SHA256:
+    # The unpacked tree carries the fixes of SOURCE_FIXES: a changed list unpacks again.
+    stamp = SHA256 + hashlib.sha256(repr(sorted(SOURCE_FIXES.items())).encode()).hexdigest()
+    if done.exists() and done.read_text() == stamp:
         return
     WORK.mkdir(parents=True, exist_ok=True)
     if not ARCHIVE.exists() or hashlib.sha256(ARCHIVE.read_bytes()).hexdigest() != SHA256:
@@ -132,7 +134,7 @@ def fetch() -> None:
         if old not in text:
             raise SystemExit(f"{name}: the text to fix is not there")
         path.write_text(text.replace(old, new, 1))
-    done.write_text(SHA256)
+    done.write_text(stamp)
 
 
 def inventory() -> list[tuple[str, str, Path]]:
