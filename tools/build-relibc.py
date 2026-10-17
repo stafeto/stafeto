@@ -122,7 +122,7 @@ def llvm(name: str) -> Path:
     found = shutil.which(name)
     if found is None:
         raise SystemExit(f"missing {name}; install LLVM")
-    return Path(found).resolve()
+    return Path(found).absolute()
 
 
 def fetch(env: dict) -> None:

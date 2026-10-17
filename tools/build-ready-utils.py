@@ -66,6 +66,13 @@ NCOMPRESS_DEFINES = ("-DUTIME_H=1", "-DLSTAT=1", "-DBITS=14")
 TOYBOX_FLAGS = ("-funsigned-char", "-fno-strict-aliasing")
 
 
+def gnu_sed() -> bool:
+    """Whether the `sed` on PATH is GNU sed (toybox's scripts use it by that name)."""
+    found = subprocess.run(["sed", "--version"], text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, check=False)
+    return found.returncode == 0 and "GNU sed" in found.stdout
+
+
 def tool(name: str, brew_formula: str | None = None) -> Path:
     if brew_formula:
         path = Path(f"/opt/homebrew/opt/{brew_formula}/bin/{name}")
@@ -74,7 +81,7 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
     found = shutil.which(name)
     if found is None:
         raise SystemExit(f"missing {name}; install LLVM, lld and GNU sed (brew install llvm lld gnu-sed)")
-    return Path(found).resolve()
+    return Path(found).absolute()
 
 
 def licence_files(work: Path) -> dict[str, Path]:
@@ -206,8 +213,8 @@ class Build:
             # generates are those of one command.
             source = fetch(self.work, "toybox", "-" + applet)
             env = dict(os.environ)
-            if shutil.which("gsed") is None:
-                raise SystemExit("missing gsed; install GNU sed (brew install gnu-sed)")
+            if shutil.which("gsed") is None and not gnu_sed():
+                raise SystemExit("missing GNU sed; install it (brew install gnu-sed) or put it first on PATH as sed")
             self.run("scripts/single.sh", applet, cwd=source, env={**env, "NOBUILD": "1"})
             objects = self.build / "toybox" / f"objects-{applet}"
             shutil.rmtree(objects, ignore_errors=True)
