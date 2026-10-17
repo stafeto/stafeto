@@ -23,7 +23,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from the head of the E1 cleanup (`cleanup-1008`, db64046); the sections on pipes and random numbers keep the figures of their own steps.
+Numbers below are from `main` at e6635e5 (after #147); the sections on processes, pipes and random numbers keep the figures of their own steps.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -36,7 +36,7 @@ on three kinds of machine:
   with the Virtio PCI console driven by a user-space service
   (`cargo xtask vz`).
 
-**Kernel.** 33 system calls, the same on every machine, over 64-bit handles
+**Kernel.** 34 system calls, the same on every machine, over 64-bit handles
 with rights: processes, threads, channels, sessions, timers, memory
 objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
 four handles; a service runs at its client's priority under its own
@@ -49,8 +49,8 @@ a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
 image is 162,880 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
 The longest stretch the kernel runs without taking an interrupt (term B of the
-kernel) is 16,738 ticks under `-icount`, below the limit of 18,000 that
-`xtask` enforces; teardown of a session and its message buffers runs in
+kernel) stays below the limit of 18,000 ticks that `xtask` enforces under
+`-icount`; teardown of a session and its message buffers runs in
 portions of 32 entries.
 
 **User space and services.** `init` starts services from a table in
@@ -67,7 +67,20 @@ service loops and starts children through a start protocol.
 `uptime`, `ps`, `mem`, `bench`, `trace` and `crash uart`; the last one
 crashes the driver, `init` restarts it and the shell reconnects. Separate
 images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
-and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
+and an interactive `ash` on the UART with `echo` and `ls -la`. The shell image
+of `cargo xtask ash-shell` is an interactive BusyBox `ash` with line editing
+(cursor keys, history, Tab completion), GNU bash 5.3 (`bash`), GNU nano 9.2
+(`nano`), htop 3.5.3 (`htop`) and BusyBox `top`, all running over ncurses 6.6
+and the terminfo entries of `xterm`, `xterm-256color`, `vt100` and `linux`.
+The terminal service keeps the window size: the host sends it on the first
+prompt and on every resize, `TIOCGWINSZ` and `TIOCSWINSZ` work as on Linux, and
+the foreground group gets `SIGWINCH`. The shell image carries 94 of the 112
+utilities of POSIX.1-2024 XCU (each answers `command -v`): the ten built-ins of
+`ash`, `sh`, 77 BusyBox applets and six ready-made programs (`getconf`, `join`,
+`pathchk`, `file`, `iconv`, `compress`). `ps`, `top` and `df` read `/proc`,
+which the layer serves. [docs/packages.md](docs/packages.md) describes how every
+third-party program of the image is a package built from one description
+file. BusyBox
 links statically with relibc over the Rust POSIX layer. The dialog's
 `ash` is a POSIX process started from `/bin/ash`; it forks and execs the
 files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipelines work in
@@ -167,36 +180,53 @@ devices of the RAM service) and the names of `mkstemp` need no request once
 the key is there, and a child of `fork` takes a key of its own. On HVF and
 Apple VZ (10 minutes, p50) `getentropy` of 32 and of 256 bytes takes 0.21 and
 0.93 us with two kernel calls (S23, S24), and a read of 4 KiB of
-`/dev/urandom` 12.3 us (S25). Creating the temporary file waits for 5i.
-[notes/m5e2-entropy.md](notes/m5e2-entropy.md) has the rows, the steps of
+`/dev/urandom` 12.3 us (S25). [notes/m5e2-entropy.md](notes/m5e2-entropy.md) has the rows, the steps of
 the services and the limits.
 
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
-os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
-`exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite. The current run of 242 tests gives 185 PASS, 49 FAIL,
-7 UNSUPPORTED and 1 UNKNOWN (UNSUPPORTED is a test that needs an option
-`unistd.h` does not claim and exits by itself without passing;
-UNKNOWN is a test whose only expectations are marked unknown); `ci` fails
-when a test that passed stops passing. The PTY and termios suites exercise
-the terminal APIs, and readiness tests cover all four waiting interfaces.
-`cargo xtask coverage` counts 754 of the 1,035 required XSH interfaces
-(72.9 %) and 124 of 206 optional ones (60.2 %, 101 of the 124 belong to
-options `unistd.h` does not claim; the claimed options show 23 of 23);
-functions that only return
-`ENOSYS` (60 required, 20 optional) do not count. The `unistd.h` macros and
-`sysconf` agree and claim only what exists. Most of the 49 failures are
-`fcntl` open-file-description locks, which answer `ENOSYS`. relibc
+os-test's `basic` suite passes 1,183 of its 1,187 tests (the three `dlfcn`
+tests need a dynamic loader and `pthread_setcanceltype` is open), with no
+listed exception; its io, malloc, process and signal suites, `basic/spawn`,
+`basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
+`ci` from files, one boot a suite. `ci` fails when a test that passed stops
+passing. The Open POSIX Test Suite (LTP 20260930) runs on relibc in `ci` and
+passes 1,770 of its 2,036 tests; the map of the rest is in
+[docs/open-posix-map.md](docs/open-posix-map.md). The PTY and termios suites
+exercise the terminal APIs, and readiness tests cover all four waiting
+interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
+(1,035 of 1,035), and no required function only returns `ENOSYS`. The
+`unistd.h` macros and `sysconf` agree and claim only what exists. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
 
-**Tests.** The kernel test image runs 192 tests (208 under `-icount`),
-the EL0 test `init` runs 229 and `kcore` has 416 host tests; `cargo xtask
-ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
-Apple silicon. A full `cargo xtask ci` takes 3 min 34 s on a warm cache
-(it took 736 s before the E1 cleanup).
+**Files, locks and memory.** The RAM file service creates files,
+directories and FIFOs, keeps owners and modes, and serves `/tmp`. `fcntl`
+record locks and open-file-description locks work, blocking ones included. `mmap`, `munmap`,
+`mprotect` and `msync` cover anonymous and file mappings, private and shared;
+shared objects reach a forked child as the same pages, and `shm_open` opens a
+file of `/dev/shm`.
+
+**Real time and timers.** The kernel counts the ticks every thread has run, which
+`getrusage`, `times` and the CPU-time clocks report. `SCHED_FIFO` and
+`SCHED_RR` run at priorities 1 to 32, `sched_*` and `pthread_*sched*` set them,
+and `posix_spawn` takes `POSIX_SPAWN_SETSCHEDULER` and `SETSCHEDPARAM`.
+`PTHREAD_PRIO_INHERIT` mutexes pass priority along chains up to depth 8 and
+report a cycle with `EDEADLK`; `PTHREAD_PRIO_PROTECT` uses ceilings. POSIX
+timers, `alarm` and `sigqueue` live in the process service, and faults reach
+programs as signals on an alternate stack when asked.
+
+**Sockets and message passing.** AF_UNIX stream and datagram sockets
+(`socketpair`, names in the file system, `SCM_RIGHTS`) and the IPv4 loopback
+run in the pipe service. The same service holds POSIX message queues, XSI
+queues, semaphores and shared memory, and named semaphores. The library
+brings asynchronous I/O (`aio_*`, `lio_listio`) over threads.
+
+**Tests.** `kcore` has 438 host tests; `cargo xtask ci` runs them with the
+kernel tests, the EL0 test `init` and the guest probes, and `cargo xtask hvf`
+runs the set on Apple silicon. `ci` runs on every pull request on GitHub
+Actions.
 
 **Known limits.**
 
@@ -208,7 +238,7 @@ Apple silicon. A full `cargo xtask ci` takes 3 min 34 s on a warm cache
 - One CPU core only; no SMP.
 - No PinePhone port yet.
 - `fork` copies everything the layer maps, with no copy on write (about
-  70 us a MiB on HVF); shared anonymous memory and mappings made past the
+  70 us a MiB on HVF); mappings made past the
   layer are not in the copy, and a program that `init` starts itself gets
   `ENOSYS`.
 - 255 POSIX processes at once: the process service holds 256 records,
@@ -303,6 +333,7 @@ Bounded kernel paths and their costs:
 | Step | What it brings | State |
 |---|---|---|
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
+| Cleanup after kernel audit 4 | named imports in the system call modules, the `B on` line takes the largest row, Virtio capability check in the VZ console driver | ✅ [#73](https://github.com/stafeto/stafeto/pull/73) |
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | ✅ |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
@@ -313,14 +344,25 @@ Bounded kernel paths and their costs:
 | POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
 | POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | ✅ [#83](https://github.com/stafeto/stafeto/pull/83) |
 | POSIX: random numbers | a Virtio entropy driver and an entropy service, a ChaCha20 generator in the layer, `getentropy`, `getrandom`, `arc4random`, `/dev/random` and `/dev/urandom`, names of `mkstemp` from the generator; rtbench rows of the generator | ✅ [#82](https://github.com/stafeto/stafeto/pull/82) |
-| POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | 🚧 parts [#86](https://github.com/stafeto/stafeto/pull/86), [#87](https://github.com/stafeto/stafeto/pull/87), [#88](https://github.com/stafeto/stafeto/pull/88) merged; the rest in four parts (5i-5 to 5i-8) |
-| Cleanup E1 | honest os-test and coverage counts, the services' budget of 20,410 ticks and the kernel's of 18,000 in `xtask`, a faster `ci`, clone counting in O(1), the IPC loss probe removed, erratum 843419 check, terminal `Watch` of at most 16 elements | 🚧 on `cleanup-1008`, ready to merge |
-| POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
-| POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |
-| POSIX: shared memory | file `mmap`, `mprotect`, `msync`, `shm_open` (done); named semaphores | 🚧 |
-| POSIX: rest of the C library | complex and long double math, `fenv`, `iconv`, message catalogues, `wordexp`, user and group databases | ⬜ |
-| POSIX: local sockets | AF_UNIX sockets; IPv4 comes with the network subproject | ⬜ |
-| POSIX: utilities | the POSIX utilities from BusyBox and the missing ones | ⬜ |
+| POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, owners and modes, accounts and resource limits, hard-limit checks, FIFOs; names and metadata operations through the Change method family with bounded lookup and starvation-resistant proofs | ✅ [#86](https://github.com/stafeto/stafeto/pull/86)–[#89](https://github.com/stafeto/stafeto/pull/89), [#92](https://github.com/stafeto/stafeto/pull/92)–[#95](https://github.com/stafeto/stafeto/pull/95), [#110](https://github.com/stafeto/stafeto/pull/110), [#113](https://github.com/stafeto/stafeto/pull/113), [#117](https://github.com/stafeto/stafeto/pull/117) |
+| POSIX: file locks | `fcntl` record locks and open-file-description locks, nonblocking and waiting, with bounded paid custody, recovery of a client's locks, bounded lock lists per inode and a one-step client | ✅ [#96](https://github.com/stafeto/stafeto/pull/96), [#99](https://github.com/stafeto/stafeto/pull/99)–[#100](https://github.com/stafeto/stafeto/pull/100), [#102](https://github.com/stafeto/stafeto/pull/102), [#104](https://github.com/stafeto/stafeto/pull/104), [#106](https://github.com/stafeto/stafeto/pull/106), [#108](https://github.com/stafeto/stafeto/pull/108), [#111](https://github.com/stafeto/stafeto/pull/111), [#116](https://github.com/stafeto/stafeto/pull/116), [#134](https://github.com/stafeto/stafeto/pull/134) |
+| POSIX: terminal output and input | UART transmit paced in portions, waiting for physical terminal output with replayable drain observers, recovery of drains after jumps and thread departure, flushed console input | ✅ [#98](https://github.com/stafeto/stafeto/pull/98), [#101](https://github.com/stafeto/stafeto/pull/101), [#103](https://github.com/stafeto/stafeto/pull/103), [#105](https://github.com/stafeto/stafeto/pull/105) |
+| Cleanup E1 | honest os-test and coverage counts, the services' budget of 20,410 ticks and the kernel's of 18,000 in `xtask`, a faster `ci`, clone counting in O(1), the IPC loss probe removed, erratum 843419 check, terminal `Watch` of at most 16 elements | ✅ [#90](https://github.com/stafeto/stafeto/pull/90) |
+| Signal entry | one entry lane into signal handlers, process signals without a ring of layers in the kernel, the router in the POSIX layer | ✅ [#91](https://github.com/stafeto/stafeto/pull/91) |
+| POSIX: conformance | the full os-test suite and Open POSIX in `ci`, a census of POSIX tests, acceptance fixes, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step; `basic` at 1,183 of 1,187, Open POSIX at 1,770 of 2,036, required interfaces 1,035 of 1,035 | ✅ [#85](https://github.com/stafeto/stafeto/pull/85), [#109](https://github.com/stafeto/stafeto/pull/109), [#115](https://github.com/stafeto/stafeto/pull/115), [#132](https://github.com/stafeto/stafeto/pull/132), [#145](https://github.com/stafeto/stafeto/pull/145), [#146](https://github.com/stafeto/stafeto/pull/146) |
+| POSIX: timers and scheduling | POSIX timers, `alarm`, queued signals and clock service, faults as signals with an alternate stack, fault entry in the kernel | ✅ [#121](https://github.com/stafeto/stafeto/pull/121), [#123](https://github.com/stafeto/stafeto/pull/123) |
+| POSIX: real time | CPU time of threads and processes, `SCHED_FIFO` and `SCHED_RR`, priority inheritance and ceilings for mutexes, service levels, process service in bounded portions, `nice`, `getrusage` | ✅ [#133](https://github.com/stafeto/stafeto/pull/133) |
+| POSIX: shared memory | kernel `mem_unmap` of a range inside a mapping, file `mmap`, `mprotect`, `msync`, `shm_open` | ✅ [#122](https://github.com/stafeto/stafeto/pull/122), [#127](https://github.com/stafeto/stafeto/pull/127) |
+| POSIX: rest of the C library | complex and long double math, `fenv`, `iconv`, message catalogues, `wordexp`, user and group databases, message queues, XSI IPC, named semaphores, `crypt`, `getdate` | ✅ [#114](https://github.com/stafeto/stafeto/pull/114), [#119](https://github.com/stafeto/stafeto/pull/119)–[#120](https://github.com/stafeto/stafeto/pull/120), [#131](https://github.com/stafeto/stafeto/pull/131) |
+| POSIX: local sockets | AF_UNIX stream and datagram sockets and the IPv4 loopback; IPv4 over a network comes with the network subproject | ✅ [#125](https://github.com/stafeto/stafeto/pull/125) |
+| POSIX: utilities | BusyBox applets, `ps` over `/proc`, `getlogin`, `syslog`, `utmpx`, `getconf`, `join`, `pathchk`, `file`, `iconv`, `compress` (94 of 112 XCU utilities), the usual options of BusyBox utilities, `/proc/mounts`, `du` and `df` | ✅ [#129](https://github.com/stafeto/stafeto/pull/129), [#130](https://github.com/stafeto/stafeto/pull/130), [#137](https://github.com/stafeto/stafeto/pull/137) |
+| Interactive shell | line editing in `ash` (history, Tab, Ctrl-R), the end of the shell ends `cargo xtask ash-shell` | ✅ [#136](https://github.com/stafeto/stafeto/pull/136) |
+| Terminal window, bash, nano, htop, top | window size and `SIGWINCH` from the host, `top` and the files of `/proc`, GNU bash 5.3, ncurses, GNU nano, htop | ✅ [#140](https://github.com/stafeto/stafeto/pull/140)–[#142](https://github.com/stafeto/stafeto/pull/142) |
+| Audit 5 and stability fixes | audit 5 fixes, the misaligned `LDXR` probe, lost wakeups and stop ownership of `fork`, `sigsuspend`, a flaky threads probe | ✅ [#112](https://github.com/stafeto/stafeto/pull/112), [#124](https://github.com/stafeto/stafeto/pull/124), [#126](https://github.com/stafeto/stafeto/pull/126), [#128](https://github.com/stafeto/stafeto/pull/128), [#135](https://github.com/stafeto/stafeto/pull/135), [#138](https://github.com/stafeto/stafeto/pull/138), [#147](https://github.com/stafeto/stafeto/pull/147) |
+| Packages in the build | every third-party program is a package with one description file; the shell image is built from the list | ✅ [#144](https://github.com/stafeto/stafeto/pull/144) |
+| CI on GitHub Actions | guest boots in parallel, direct native linking, `cargo xtask ci` on every pull request | ✅ [#77](https://github.com/stafeto/stafeto/pull/77), [#107](https://github.com/stafeto/stafeto/pull/107), [#139](https://github.com/stafeto/stafeto/pull/139) |
+| POSIX: Open POSIX to 1,850 | more of the Open POSIX Test Suite passing (branch `open-posix-i`) | 🚧 |
+| POSIX: remaining utilities | the 18 XCU utilities not yet in the image: `at batch csplit gencat gettext locale localedef lp m4 mailx msgfmt newgrp ngettext pax pr tabs tput write` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 
 ### Later subprojects

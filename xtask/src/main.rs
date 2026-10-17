@@ -28,6 +28,7 @@ mod owner_lifetime;
 mod service_sample;
 
 mod bash_dialog;
+mod ci;
 mod disasm;
 mod entropy;
 mod htop_dialog;
@@ -1446,7 +1447,7 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("gdb") => gdb(),
-        Some("ci") => jobs::parse_jobs("ci", &args[1..]).and_then(ci),
+        Some("ci") => ci::run(&args[1..]),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
         Some("rtbench") => match &args[1..] {
@@ -9007,18 +9008,11 @@ fn no_transport_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn ci(jobs: usize) -> Result<(), String> {
-    // The descriptions of the packages and the owners of the files of the
-    // shell image: cheap, so first.
-    packages::check()?;
-    // First: the licence check and the C programs take relibc's build.
-    relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;
-    no_transport_probe()?;
-    disasm::check_counter_read_sites(&root())?;
-    layer_c_names()?;
-    run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
-    run_cmd(cargo().args([
+/// The lints of `ci`: clippy over the host crates, the programs and the
+/// kernel. All of them run and the error names those that failed.
+fn ci_lints() -> Result<(), String> {
+    let mut failed = ci::Lints::default();
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "abi",
@@ -9086,10 +9080,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]));
     // The libraries of init, of the UART driver and of the shell and their
     // tests on the host; their programs build for stafeto alone, below.
-    run_cmd(cargo().args([
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "init",
@@ -9116,8 +9110,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
-    run_cmd(cargo().args([
+    ]));
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "abi",
@@ -9128,9 +9122,9 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]));
     // The kernel's code: every unsafe block says why it is sound.
-    run_cmd(cargo().args([
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "kcore",
@@ -9141,8 +9135,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "warnings",
         "-D",
         "clippy::undocumented_unsafe_blocks",
-    ]))?;
-    run_cmd(cargo().args([
+    ]));
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "proto-init",
@@ -9241,9 +9235,9 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]));
     // Init as it ships, without the feature of the probe of a stop.
-    run_cmd(cargo().args([
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "init",
@@ -9252,8 +9246,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
-    run_cmd(cargo().args([
+    ]));
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "posix-shared-probe",
@@ -9264,10 +9258,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]));
     // The layer under relibc (posix-abi without its C names), apart: the
     // feature would take the C names from the programs above.
-    run_cmd(cargo().args([
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "posix-platform",
@@ -9300,8 +9294,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
-    run_cmd(cargo().args([
+    ]));
+    failed.lint(cargo().args([
         "clippy",
         "--package",
         "posix-thread-probe",
@@ -9312,7 +9306,7 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--",
         "-D",
         "warnings",
-    ]))?;
+    ]));
     for variant in Variant::ALL {
         let mut cmd = cargo();
         cmd.args([
@@ -9326,23 +9320,15 @@ fn ci(jobs: usize) -> Result<(), String> {
         if let Some(feature) = variant.feature() {
             cmd.args(["--features", feature]);
         }
-        run_cmd(cmd.args([
+        failed.lint(cmd.args([
             "--",
             "-D",
             "warnings",
             "-D",
             "clippy::undocumented_unsafe_blocks",
-        ]))?;
+        ]));
     }
-    test(jobs)?;
-    // The complete basic suite: every test of tests/os-test/basic-pass.txt
-    // still passes.
-    ostest::run_full_basic(jobs)?;
-    // The tests of the Open POSIX Test Suite that pass still pass
-    // (tests/open-posix/pass.txt); `open-posix --full` runs all of them.
-    openposix::run(openposix::Select::Pinned, jobs)?;
-    let a = build(Variant::Normal)?;
-    disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
+    failed.finish()
 }
 
 #[cfg(test)]
