@@ -238,6 +238,6 @@ mod tests {
         }
         assert_eq!(limits.values[CORE].hard, 0);
         assert_eq!(limits.values[STACK].hard, 64 * 1024);
-        assert_eq!(limits.values[NOFILE].hard, 32);
+        assert_eq!(limits.values[NOFILE].hard, 64);
     }
 }
