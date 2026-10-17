@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 236;
+const INIT_TESTS: u32 = 237;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -4741,13 +4741,15 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// (`maps::epoch`): 5 724 -> 2 939; process_create gives the lock back
 /// between the child and its first entries: 4 598 -> 2 957; the stage Space
 /// reads the entries of a table with no lock and takes it for the table that
-/// goes back: 4 099 -> 3 927 (the stage that holds longest now).
+/// goes back: 4 099 -> 3 927; the continuation of a process whose gate
+/// opened unparks its 64 threads in sections of 16 (`control::portion`):
+/// 4 112 -> 1 100. The longest hold is now MemUnmap, 2 957.
 ///
-/// `THREADS_READY_MAX` 10 833 -> 12 195 (SMP stage 4): a thread of another
+/// `THREADS_READY_MAX` 10 833 -> 12 289 (SMP stage 4): a thread of another
 /// CPU leaves the scheduler by a command, so `sched::exit` reads where the
 /// thread runs and what it was asked, marks its end for the CPUs that read it
 /// (`thread::mark_ended`), and each portion first looks at the gate wave
-/// (`control::gate_seen`): 24 instructions a thread, 1 358 for the 56 of
+/// (`control::gate_seen`): 26 instructions a thread, 1 452 for the 56 of
 /// the portion; the reviewer of the kernel decides whether it stays.
 ///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
@@ -4798,7 +4800,7 @@ const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 12_195;
+const THREADS_READY_MAX: u64 = 12_289;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -8884,6 +8886,13 @@ fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, 
     if cpus == SMP_CPUS {
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
+        }
+        if !o
+            .lines
+            .iter()
+            .any(|l| l.starts_with("smp: a thread at EL0 on CPU 1 ran "))
+        {
+            return Err("the test init printed no time of a thread at EL0 on CPU 1".into());
         }
     }
     log_markers(&o)?;

@@ -19,6 +19,11 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 
+/// A message copy waits (`Local::deferred`).
+pub const COPY: u32 = 1;
+/// The outbox holds commands (`Local::deferred`).
+pub const OUTBOX: u32 = 2;
+
 /// The data of one CPU, in its block (cpu::CpuBlock).
 #[repr(C, align(64))]
 pub struct Local {
@@ -33,6 +38,9 @@ pub struct Local {
     pub copy: Own<crate::thread::PendingCopy>,
     /// The commands for other CPUs that sections posted (cmd.rs).
     pub outbox: Own<crate::cmd::Outbox>,
+    /// What the end of a call has still to do (`thread::flush_copy`): the
+    /// bits `COPY` and `OUTBOX`, one load for both.
+    pub deferred: core::sync::atomic::AtomicU32,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,
     /// The items of the cleanup queue for the firings of the levels of
@@ -55,6 +63,7 @@ impl Local {
             retired: Own::new(crate::qsbr::Retired::new()),
             copy: Own::new(crate::thread::PendingCopy::new()),
             outbox: Own::new(crate::cmd::Outbox::new()),
+            deferred: core::sync::atomic::AtomicU32::new(0),
             entry: UnsafeCell::new((0, 0)),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],
         }

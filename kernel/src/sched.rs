@@ -693,24 +693,26 @@ pub fn resume() -> ! {
 /// nothing. Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
-        if crate::cmd::posted() {
-            crate::cmd::flush();
-        }
-        // The kernel stack is empty: a quiescent point for the objects that
-        // other CPUs retire, and the way to EL0 follows (qsbr).
-        if crate::qsbr::pending() {
-            crate::qsbr::quiesce();
-        }
         let mut now = timer::now();
         entry_polled_at(now);
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {
             crate::interrupt::handle(ack);
+            // The commands the interrupt posted go out before the decision.
+            crate::cmd::flush_posted();
             now = timer::now();
         }
         match decide(now) {
-            Some(Decision::Run(t)) => thread::run(t),
+            Some(Decision::Run(t)) => {
+                // The kernel stack is empty and a way to EL0 follows: a
+                // quiescent point for the objects other CPUs retire, and the
+                // end of a wait for every CPU to be in the kernel once (qsbr).
+                if crate::qsbr::pending() {
+                    crate::qsbr::quiesce();
+                }
+                thread::run(t)
+            }
             // Another line of the same priority shows only after the EOI
             // of the one just handled (GICv2 running priority): poll again
             // first. Deciding again costs nothing: the running thread went
@@ -718,6 +720,7 @@ extern "C" fn exit_loop() -> ! {
             Some(Decision::Clean) if arch::irq_pending() => {}
             Some(Decision::Clean) => {
                 cleanup::portion();
+                crate::cmd::flush_posted();
                 // The kernel stack is empty again: a quiescent point, where
                 // what the portion retired may go (qsbr). The way to EL0 is
                 // one too, for the objects another CPU retires (stage 4).
@@ -805,6 +808,7 @@ fn sleep() {
     }
     if let Some(ack) = ack {
         crate::interrupt::handle(ack);
+        crate::cmd::flush_posted();
     }
     local().sched.lock().waking = false;
 }

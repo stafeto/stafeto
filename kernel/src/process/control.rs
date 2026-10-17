@@ -180,30 +180,40 @@ pub(crate) unsafe fn unlist(t: NonNull<Thread>, _k: &mut Locked<'_>) {
     unsafe { (*t.as_ref().process().as_ptr()).parked.remove(t) };
 }
 
+/// Parked threads that continue under one hold of OBJ.
+const UNPARK_SECTION: usize = 16;
+
 /// Up to 64 parked threads continue at their current levels with fresh
 /// quanta. A new suspension ends the work before any thread is released.
 ///
 /// # Safety
 /// The cleanup queue just took the process, holding its reference.
 pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
-    let section = crate::obj::lock();
-    let left = sched::locked(|k| {
-        // SAFETY: the queue holds the process and each parked thread is
-        // held by the scheduler; the lock guards their shared links.
-        unsafe {
-            let p = process.as_ptr();
-            assert!((*p).resume_level != 0, "a continuation has no reference");
-            if !gated(p, Ordering::Relaxed) {
-                for _ in 0..64 {
-                    let Some(t) = (*p).parked.first() else { break };
-                    (*p).parked.remove(t);
-                    sched::unpark(k, t);
+    // The 64 threads go in sections of UNPARK_SECTION: no other CPU waits
+    // for the whole portion.
+    let mut left = false;
+    for _ in 0..64 / UNPARK_SECTION {
+        let _section = crate::obj::lock();
+        left = sched::locked(|k| {
+            // SAFETY: the queue holds the process and each parked thread is
+            // held by the scheduler; the lock guards their shared links.
+            unsafe {
+                let p = process.as_ptr();
+                assert!((*p).resume_level != 0, "a continuation has no reference");
+                if !gated(p, Ordering::Relaxed) {
+                    for _ in 0..UNPARK_SECTION {
+                        let Some(t) = (*p).parked.first() else { break };
+                        (*p).parked.remove(t);
+                        sched::unpark(k, t);
+                    }
                 }
+                !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
             }
-            !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
+        });
+        if !left {
+            break;
         }
-    });
-    drop(section);
+    }
     // SAFETY: the queue's reference goes only after the work ends.
     unsafe {
         let p = process.as_ptr();

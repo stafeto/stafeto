@@ -112,6 +112,13 @@ pub fn enter() -> Section {
     }
 }
 
+/// Runs `f` in a section entered at the entry of a call, and ends it.
+#[inline(always)]
+pub fn enter_with<R>(f: impl FnOnce() -> R) -> R {
+    let _section = enter();
+    f()
+}
+
 /// Enters a section under `OBJ`: waits for the lock, or joins the section
 /// this CPU holds.
 #[inline(always)]

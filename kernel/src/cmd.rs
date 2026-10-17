@@ -176,6 +176,9 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
     let n = o.n;
     o.items[n] = (t.as_ptr() as usize, flag);
     o.n += 1;
+    local()
+        .deferred
+        .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
 }
 
 /// Asks CPU `to` to enter the kernel, with no command: a thread of it at
@@ -190,12 +193,17 @@ pub fn kick(to: usize) {
     let n = o.n;
     o.items[n] = (to, 0);
     o.n += 1;
+    local()
+        .deferred
+        .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
 }
 
-/// Whether the outbox holds commands.
+/// `flush` when the outbox holds commands.
 #[inline(always)]
-pub fn posted() -> bool {
-    local().outbox.lock().n != 0
+pub fn flush_posted() {
+    if local().deferred.load(Ordering::Relaxed) & crate::local::OUTBOX != 0 {
+        flush();
+    }
 }
 
 /// Sends what the sections posted: each thread's flag, the thread into the
@@ -203,6 +211,9 @@ pub fn posted() -> bool {
 /// something new. Outside OBJ, with the copies of messages made.
 #[inline(never)]
 pub fn flush() {
+    local()
+        .deferred
+        .fetch_and(!crate::local::OUTBOX, Ordering::Relaxed);
     let me = cpu::this().index();
     let mut mask = 0u32;
     {

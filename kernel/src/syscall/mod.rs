@@ -60,6 +60,19 @@ use upcall::{
     thread_upcall_bind, thread_upcall_control, thread_upcall_request, thread_upcall_return,
 };
 
+/// process_control, and for a suspension the wait for every CPU: it is
+/// complete when no thread of the process is at EL0 on another CPU, which
+/// holds once every CPU has been in the kernel since the gate went up. The
+/// wait is outside OBJ, which the CPUs it waits for may need to get there.
+#[inline(never)]
+fn process_control_waited(thread: NonNull<Thread>, args: &Args) -> Result<Values, Error> {
+    let r = crate::obj::enter_with(|| process_control(thread, args));
+    if r.is_ok() && args[1] == 0 {
+        crate::qsbr::synchronize();
+    }
+    r
+}
+
 /// Runs a call that reaches objects in a section under OBJ (obj.rs), as a
 /// block that lies in the arm of the call, with the section's lock and
 /// unlock in it.
@@ -215,16 +228,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
         Some(Call::ProcessCreate) => objects!(process_create(thread, &args)),
         Some(Call::ProcessKill) => objects!(process_kill(thread, &args)),
-        Some(Call::ProcessControl) => {
-            let r = objects!(process_control(thread, &args));
-            if r.is_ok() && args[1] == 0 {
-                // A suspension is complete when no thread of the process
-                // is at EL0 on another CPU: every CPU has been in the
-                // kernel since the gate went up, outside OBJ.
-                crate::qsbr::synchronize();
-            }
-            r
-        }
+        Some(Call::ProcessControl) => process_control_waited(thread, &args),
         Some(Call::ProcessExit) => objects!(process_exit(thread, &args)),
         Some(Call::ThreadCreate) => objects!(thread_create(thread, &args)),
         Some(Call::ThreadStart) => objects!(thread_start(thread, &args)),

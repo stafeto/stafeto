@@ -110,10 +110,10 @@ pub struct Thread {
     /// The counter ticks the thread has spent at EL0 (spec 8): the
     /// stretches between a way out of the kernel and the next entry from
     /// EL0. `run` takes the counter from the field as the thread leaves for
-    /// EL0, and `user_ran` adds it back at the entry, so that the field
-    /// holds the whole of the stretches while the thread is in the kernel,
-    /// which is where every reader finds it (the CPU that runs a thread
-    /// at EL0 is the only one that would see the stretch half counted).
+    /// EL0 and sets bit 63, and `user_ran` adds it back at the entry and
+    /// clears the bit, so that the field holds the whole of the stretches
+    /// while the thread is in the kernel; a reader on another CPU sees the
+    /// bit and adds its own counter (`user_ticks`).
     /// What the thread ran besides, `Node::ran` less this, it ran in the
     /// kernel. Last, so that it takes the padding the struct ended with.
     /// Only the CPU the thread runs on writes it.
@@ -464,6 +464,7 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
 pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     // SAFETY: the caller's promise; only the field is touched.
     if let Some(index) = try_index(t) {
+        // SAFETY: the caller's promise; only the field is written.
         unsafe { (*t.as_ptr()).numbers.index = NONE };
         tokens.free(index);
     }
@@ -644,6 +645,9 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
             .copying
             .fetch_add(1, Ordering::Relaxed);
     }
+    crate::local::local()
+        .deferred
+        .fetch_or(crate::local::COPY, Ordering::Relaxed);
     let mut pending = crate::local::local().copy.lock();
     assert!(pending.to.is_none(), "a message copy waits for another");
     *pending = PendingCopy {
@@ -659,14 +663,24 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
 /// the delivery made ready.
 #[inline(always)]
 pub fn flush_copy() {
-    let pending = crate::local::local().copy.lock().to.is_some();
-    if pending {
-        flush_copy_now();
+    if crate::local::local().deferred.load(Ordering::Relaxed) != 0 {
+        flush_deferred();
     }
 }
 
+/// The copy that waits, then the commands that the call posted: a thread
+/// of another CPU reads the message once it is woken, so the commands go
+/// out after the copy (cmd.rs).
 #[inline(never)]
+fn flush_deferred() {
+    flush_copy_now();
+    crate::cmd::flush();
+}
+
 fn flush_copy_now() {
+    crate::local::local()
+        .deferred
+        .fetch_and(!crate::local::COPY, Ordering::Relaxed);
     let PendingCopy {
         to: Some(to),
         from: Some(from),
@@ -955,13 +969,19 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     }
 }
 
+/// Bit 63 of `Thread::user_ticks`: the thread is at EL0, and the low bits
+/// hold the ticks it ran there less the counter when the stretch began, so
+/// that a reader on another CPU adds its own counter (`user_ticks`).
+const AT_EL0: u64 = 1 << 63;
+
 /// The thread leaves the kernel for EL0 at `now`: its stretch there
-/// starts (`user_ran` ends it).
+/// starts (`user_ran` ends it). One store, so that another CPU never reads
+/// half of the change.
 #[inline(always)]
 fn user_resumes(thread: &Thread, now: u64) {
     let ticks = &thread.user_ticks;
     ticks.store(
-        ticks.load(Ordering::Relaxed).wrapping_sub(now),
+        ticks.load(Ordering::Relaxed).wrapping_sub(now) | AT_EL0,
         Ordering::Relaxed,
     );
 }
@@ -973,14 +993,20 @@ pub fn user_ran(thread: NonNull<Thread>, now: u64) {
     // SAFETY: the running thread is alive; only this CPU writes the field.
     let ticks = &unsafe { &*thread.as_ptr() }.user_ticks;
     ticks.store(
-        ticks.load(Ordering::Relaxed).wrapping_add(now),
+        ticks.load(Ordering::Relaxed).wrapping_add(now) & !AT_EL0,
         Ordering::Relaxed,
     );
 }
 
-/// The ticks `thread` has spent at EL0, up to its last entry from EL0.
-pub fn user_ticks(thread: &Thread) -> u64 {
-    thread.user_ticks.load(Ordering::Relaxed)
+/// The ticks `thread` has spent at EL0 at `now`, the stretch it is in
+/// included: any CPU may ask.
+pub fn user_ticks(thread: &Thread, now: u64) -> u64 {
+    let w = thread.user_ticks.load(Ordering::Relaxed);
+    if w & AT_EL0 != 0 {
+        w.wrapping_add(now) & !AT_EL0
+    } else {
+        w
+    }
 }
 
 /// object_info THREAD_STATE of `thread`, which the caller holds (spec 11):
@@ -1014,7 +1040,7 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             policy: Some(t.sched.policy()),
         };
         let ran = t.sched.ran_at(now);
-        (info, ran, ran.saturating_sub(user_ticks(t)))
+        (info, ran, ran.saturating_sub(user_ticks(t, now)))
     })
 }
 

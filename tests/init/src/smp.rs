@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 4] = [
+pub(crate) const TESTS: [Test; 5] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -25,6 +25,7 @@ pub(crate) const TESTS: [Test; 4] = [
         suspend_and_kill,
     ),
     ("smp_lock_holds_under_calls_of_every_cpu", lock_under_load),
+    ("smp_time_of_a_thread_at_el0_on_another_cpu", time_across_cpus),
 ];
 
 /// How long a wait for another CPU may last, in nanoseconds: far longer
@@ -338,5 +339,46 @@ fn lock_under_load() -> Outcome {
     )?;
     check(before.live == after.live, "the table lost or kept a handle")?;
     println!("smp: {} calls on {n} CPUs, each took OBJ", rounds);
+    Ok(())
+}
+
+/// Runs at EL0 until mark 3 says to stop: mark `slot` moves.
+extern "C" fn spin_marked(slot: u64) -> ! {
+    while MARKS[3].load(Relaxed) == 0 {
+        MARKS[slot as usize].fetch_add(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// The times of a thread that runs at EL0 on another CPU: read from CPU 0
+/// while it runs, its time is what it ran (the stretch it is in included),
+/// and its system part is a small share of it.
+fn time_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let t = spawn_on(0, 1, spin_marked, 0, TEST_PRIORITY)?;
+    pause(40_000_000);
+    let (ran, system) = sys::thread_times(&t).map_err(|_| "thread_times failed")?;
+    let moved = mark(0) != 0;
+    MARKS[3].store(1, Relaxed);
+    let ended = wait_for(|| {
+        sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended)
+    });
+    let_run()?;
+    close(t)?;
+    let (ran_ns, system_ns) = (time::ticks_to_ns(ran), time::ticks_to_ns(system));
+    check(moved && ended, "the thread on the other CPU did not run and stop")?;
+    check(
+        (30_000_000..4_000_000_000).contains(&ran_ns),
+        "the time of a thread at EL0 on another CPU is not what it ran",
+    )?;
+    check(
+        system_ns < ran_ns / 2,
+        "a thread at EL0 on another CPU has most of its time in the kernel",
+    )?;
+    println!("smp: a thread at EL0 on CPU 1 ran {ran_ns} ns, {system_ns} ns of them in the kernel");
     Ok(())
 }

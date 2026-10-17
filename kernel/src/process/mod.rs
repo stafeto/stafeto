@@ -69,8 +69,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, add_mapping, begin_protect, begin_unmap, check_free, device_windows,
-    buffer_joined, epoch, finish_change, in_mapping, map_whole, step_change,
+    Change, abandon_change, add_mapping, begin_protect, begin_unmap, buffer_joined, check_free,
+    device_windows, epoch, finish_change, in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -314,7 +314,9 @@ impl Process {
     /// lock or with interrupts masked).
     fn fold_time(&mut self, t: &Thread) {
         self.cpu_ticks = self.cpu_ticks.saturating_add(t.sched.ran());
-        self.user_ticks = self.user_ticks.saturating_add(thread::user_ticks(t));
+        self.user_ticks = self
+            .user_ticks
+            .saturating_add(thread::user_ticks(t, crate::arch::timer::now()));
     }
 }
 
@@ -577,7 +579,7 @@ pub fn cpu_time(process: NonNull<Process>) -> (u64, u64) {
             let mut next = (*p).threads;
             while let Some(t) = next {
                 sum = sum.saturating_add(t.as_ref().sched.ran_at(now));
-                user = user.saturating_add(thread::user_ticks(t.as_ref()));
+                user = user.saturating_add(thread::user_ticks(t.as_ref(), now));
                 next = t.as_ref().siblings.and_then(|s| s.next);
             }
             (sum, sum.saturating_sub(user))

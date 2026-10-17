@@ -192,7 +192,15 @@ pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
 fn map_lookups(
     thread: NonNull<Thread>,
     a: &Args,
-) -> Result<(NonNull<crate::process::Process>, NonNull<Memory>, Rights, u64), Error> {
+) -> Result<
+    (
+        NonNull<crate::process::Process>,
+        NonNull<Memory>,
+        Rights,
+        u64,
+    ),
+    Error,
+> {
     let pages = range_arg(a[4], a[3])?;
     if !a[2].is_multiple_of(PAGE_SIZE) {
         return Err(Error::InvalidArgs);
