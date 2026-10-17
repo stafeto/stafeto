@@ -521,21 +521,20 @@ fn log_across_cpus() -> Outcome {
     let mut records: [[u8; abi::LOG_RECORD]; abi::LOG_BATCH] =
         [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
     let mut found = [0u32; 8];
-    for pass in 0..2 {
-        for k in 1..n {
-            let (mut next, mut seen) = (1, 0);
+    for _pass in 0..2 {
+        for (k, slot) in found.iter_mut().enumerate().take(n).skip(1) {
+            let mut next = 1;
             loop {
                 let Ok((batch, after)) =
                     sys::log_peek_other(&resource(), k as u64, next, &mut records)
                 else {
                     return Err("log_peek_other failed for a CPU that is up");
                 };
-                seen += batch.count;
                 for r in &records[..(batch.count as usize).min(abi::LOG_BATCH)] {
                     let len = usize::from(r[abi::LOG_LEN_AT]);
                     let text = &r[abi::LOG_TEXT_AT..abi::LOG_TEXT_AT + len.min(abi::LOG_TEXT)];
                     if text == MARKER {
-                        found[k] += 1;
+                        *slot += 1;
                     }
                 }
                 if batch.left == 0 {
@@ -543,7 +542,6 @@ fn log_across_cpus() -> Outcome {
                 }
                 next = after;
             }
-            let _ = (pass, seen);
         }
     }
     // The kth other CPU of CPU 0 is CPU k: the line is in ring 2, twice (two
