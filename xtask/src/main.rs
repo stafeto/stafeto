@@ -52,6 +52,7 @@ mod rtbench_check;
 mod stubs;
 mod symbolize;
 mod vz;
+mod wcet;
 mod window;
 
 use std::ffi::OsString;
@@ -1371,6 +1372,12 @@ commands:
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
   process-steps [branches [machine]] measure process service steps (2G by default)
+  wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR]
+            run the kernel probes under QEMU's trace plugin and list the
+            blocks of the entry paths that none ran (docs/wcet.md); --all runs
+            every guest probe, not the kernel group's only
+  wcet stack [--limit BYTES]
+            the deepest kernel stack of the entry paths against its size
             under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -1448,6 +1455,7 @@ fn main() {
         }
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
+        Some("wcet") => wcet::run(&args[1..]),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
         Some("rtbench") => match &args[1..] {

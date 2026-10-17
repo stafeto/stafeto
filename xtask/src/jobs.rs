@@ -39,6 +39,11 @@ impl Job {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// The name and the check, to wrap it in another job.
+    pub fn into_parts(self) -> (String, Box<dyn FnOnce() -> Result<(), String> + Send>) {
+        (self.name, self.run)
+    }
 }
 
 pub fn job(name: &str, run: impl FnOnce() -> Result<(), String> + Send + 'static) -> Job {

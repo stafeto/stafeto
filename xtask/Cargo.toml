@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
+kcore = { path = "../kcore" }
 
 [dev-dependencies]
 entries = { path = "../lib/entries" }
