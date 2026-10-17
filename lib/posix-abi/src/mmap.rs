@@ -474,3 +474,15 @@ pub fn check_range(addr: usize, len: usize) -> Result<(), i32> {
         }
     })
 }
+
+/// Whether `address` lies in a mapping other processes share (MAP_SHARED):
+/// a wait there cannot be woken from another process, so it polls
+/// (`posix_sync::set_shared`).
+pub(crate) fn is_shared(address: usize) -> bool {
+    heap(|state| {
+        state
+            .map
+            .find(address)
+            .is_some_and(|index| state.map.object(state.map.piece(index).object()).shared)
+    })
+}

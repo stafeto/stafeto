@@ -1082,9 +1082,9 @@ fn wait(
 ) -> Result<(i32, SigInfo), i32> {
     let block = own();
     let set = posix_signals::mask(set).map_err(|_| EINVAL)?;
-    if set & !block.mask.load(Ordering::SeqCst) != 0 {
-        return Err(EINVAL);
-    }
+    // A signal of the set that the caller left unblocked is not refused (POSIX
+    // leaves it undefined): the wait takes it when it is pending, and a
+    // handler may run for it as it arrives.
     // The thread's own signals first, then the process's on the page, with
     // their information.
     let take = || loop {

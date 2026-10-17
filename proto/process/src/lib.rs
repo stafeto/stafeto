@@ -1228,7 +1228,8 @@ pub struct Listing {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
-    /// 0 running, 1 stopped, 2 a zombie.
+    /// 0 running, 1 stopped, 2 a zombie, 3 asleep (it ran no ticks since a sample
+    /// taken some milliseconds before).
     pub state: u32,
     /// The terminal plus one (0 for none): the console is 1.
     pub tty: u32,

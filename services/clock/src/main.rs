@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
+//! System-wide realtime anchor. Starts at 2026-01-01 00:00:00 UTC until explicitly set.
 #![no_std]
 #![no_main]
 use core::cell::UnsafeCell;
@@ -38,6 +38,10 @@ unsafe impl Sync for CloneTable {}
 
 static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
 
+/// The calendar at the service's start: 2026-01-01 00:00:00 UTC, as the system
+/// has no battery clock (a program that reads zero seconds finds no time).
+const START_SECONDS: i64 = 1_767_225_600;
+
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -56,7 +60,7 @@ fn main(_: u64) -> u64 {
     if rt::service::register(&start.parent, &channel).is_err() {
         return 3;
     }
-    let Ok(clock) = Clock::new(now(), rt::time::frequency()) else {
+    let Ok(clock) = Clock::starting_at(now(), rt::time::frequency(), START_SECONDS) else {
         return 4;
     };
     let Ok(page) = Page::new(&start.process) else {
@@ -71,7 +75,7 @@ fn main(_: u64) -> u64 {
             priority: level,
         }),
     };
-    rt::println!("clock: ready (unsynchronized epoch)");
+    rt::println!("clock: ready (unsynchronized start)");
     let _ = rt::service::run::<Clocks, SESSIONS, 0>(
         &channel,
         &mut Clocks {

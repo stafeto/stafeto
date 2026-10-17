@@ -14,4 +14,5 @@ test = false
 bench = false
 
 [dependencies]
-posix-crt = { path = "../../lib/posix-crt" }
+# The Open POSIX tests read /proc/<pid>/stat, which the layer makes.
+posix-crt = { path = "../../lib/posix-crt", features = ["procfs"] }

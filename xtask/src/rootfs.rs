@@ -712,6 +712,8 @@ pub fn open_posix(tests: &[(String, Vec<u8>)], limits: &[u64]) -> Vec<RootFile> 
     assert_eq!(tests.len(), limits.len());
     let mut files = os_test_with_fixtures(tests, &[]);
     files.retain(|f| f.path != "/os-test/list");
+    // The suite's helpers read /proc/<pid>/stat to see a child sleep.
+    files.push(dir("/proc"));
     let mut list = String::new();
     let mut limit = None;
     for ((name, _), ms) in tests.iter().zip(limits) {

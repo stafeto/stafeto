@@ -40,6 +40,7 @@ use rt::sys;
 
 pub const EINVAL: i32 = 22;
 pub const EAGAIN: i32 = 11;
+pub const EINTR: i32 = 4;
 pub const ETIMEDOUT: i32 = 110;
 /// The clocks of a deadline (spec 2, 3.4): MONOTONIC now; the clock patch
 /// of relibc adds the clock of the caller without changing the call.
@@ -311,6 +312,51 @@ fn probe() {
     }
 }
 
+/// How long a wait on a word of a shared mapping lasts at most, in ns: no
+/// waker in another process can reach the bucket of this one, so such a
+/// wait looks at its word again every millisecond (`set_shared`).
+const SHARED_POLL_NS: u64 = 1_000_000;
+static SHARED: AtomicUsize = AtomicUsize::new(0);
+
+/// The function that says whether an address lies in a mapping other
+/// processes share (MAP_SHARED). Called once at the start of the process.
+pub fn set_shared(hook: fn(usize) -> bool) {
+    SHARED.store(hook as usize, Ordering::Release);
+}
+
+fn shared(address: usize) -> bool {
+    let hook = SHARED.load(Ordering::Acquire);
+    if hook == 0 {
+        return false;
+    }
+    // SAFETY: only `set_shared` stores a value, a `fn(usize) -> bool`.
+    let hook: fn(usize) -> bool = unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(hook) };
+    hook(address)
+}
+
+/// Clears the NO_RESTART mark of the calling thread (a handler without
+/// SA_RESTART ran) and returns whether it was set, for a wait that reports
+/// EINTR when such a handler ran during it (`interrupted`).
+pub fn clear_no_restart() -> bool {
+    current().is_some_and(|block| {
+        block.flags.fetch_and(!flag::NO_RESTART, Ordering::SeqCst) & flag::NO_RESTART != 0
+    })
+}
+
+/// Whether a handler without SA_RESTART ran in the calling thread since
+/// `clear_no_restart`; `before` is what that returned, and a mark that was
+/// set then is set again, for the long operation around the wait.
+pub fn interrupted(before: bool) -> bool {
+    let Some(block) = current() else {
+        return false;
+    };
+    let ran = block.flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0;
+    if before {
+        block.flags.fetch_or(flag::NO_RESTART, Ordering::SeqCst);
+    }
+    ran
+}
+
 /// How a wait ended without an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Woken {
@@ -344,6 +390,13 @@ pub fn futex_wait(
         return Err(EINVAL);
     }
     let address = ptr::from_ref(word) as usize;
+    // A word in a mapping other processes share: the wait polls.
+    let poll = (timer != 0 && shared(address))
+        .then(|| rt::time::ticks_to_ns(rt::time::now()) + SHARED_POLL_NS);
+    let wake_at = match (deadline, poll) {
+        (Some(d), Some(p)) => Some(d.min(p)),
+        (d, p) => d.or(p),
+    };
     let bucket = bucket(address);
     // Counted before the comparison: a waker that changed the word sees it.
     bucket.waiters.fetch_add(1, Ordering::SeqCst);
@@ -363,7 +416,7 @@ pub fn futex_wait(
     }
     let channel = Handle::<Channel>::borrowed(abi::Handle(channel));
     let timer = Handle::<Timer>::borrowed(abi::Handle(timer));
-    if let Some(deadline) = deadline {
+    if let Some(deadline) = wake_at {
         let _ = sys::timer_set(&timer, deadline);
     }
     probe();
@@ -387,13 +440,16 @@ pub fn futex_wait(
                 if deadline.is_some_and(rt::time::reached) {
                     break Err(ETIMEDOUT);
                 }
+                if poll.is_some_and(rt::time::reached) {
+                    break Ok(Woken::Woken);
+                }
             }
             Ok(_) => {}
             Err(Error::Interrupted) => break Ok(Woken::Entry),
             Err(error) => panic!("wait by address: {error:?}"),
         }
     };
-    if deadline.is_some() {
+    if wake_at.is_some() {
         let _ = sys::timer_cancel(&timer);
     }
     let held = lock(bucket);

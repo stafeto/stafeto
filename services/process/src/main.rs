@@ -149,6 +149,9 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     methods
 };
+/// How long a process must have run no ticks, after a sample, for the listing
+/// to call it asleep (`list`).
+const SLEEP_AFTER_NS: u64 = 2_000_000;
 /// The label of the service's own place for the notification that makes
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
@@ -2744,6 +2747,26 @@ impl Processes {
                 break;
             }
         }
+        // A process that has run no ticks since the last sample, some
+        // 2 ms before, sleeps (state 3); the first sample, or a process that
+        // ran, is running.
+        let sleeping = found.is_some_and(|i| {
+            let now = Self::timer_now();
+            let Some(record) = self.records.get_mut(i) else {
+                return false;
+            };
+            let ticks = record
+                .carried_ticks
+                .saturating_add(sys::process_time(&record.process).unwrap_or(0));
+            let idle = record.sample_at != 0
+                && ticks == record.sample_ticks
+                && now.saturating_sub(record.sample_at) >= SLEEP_AFTER_NS;
+            if ticks != record.sample_ticks || record.sample_at == 0 {
+                record.sample_ticks = ticks;
+                record.sample_at = now;
+            }
+            idle
+        });
         let next = found.map_or(window_end, |i| i + 1);
         let next = if next >= RECORDS {
             proto_process::LIST_END
@@ -2771,6 +2794,7 @@ impl Processes {
                             state: match record.state {
                                 State::Zombie(_) => 2,
                                 _ if record.stopped.is_some() => 1,
+                                _ if sleeping => 3,
                                 _ => 0,
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),

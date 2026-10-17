@@ -1300,9 +1300,14 @@ pub unsafe extern "C" fn stafeto_futex_wait(addr: *mut u32, val: u32, deadline: 
     // SAFETY: the caller's promise.
     let word = unsafe { &*addr.cast::<AtomicU32>() };
     let deadline = (deadline != u64::MAX).then_some(deadline);
+    let before = posix_sync::clear_no_restart();
     let waited = posix_sync::futex_wait(word, val, posix_sync::CLOCK_MONOTONIC, deadline);
+    let ran = posix_sync::interrupted(before);
     cancel_if_asynchronous();
     match waited {
+        // A handler without SA_RESTART ran during the wait: the caller may
+        // report EINTR (sem_wait); the others look at their word again.
+        Ok(posix_sync::Woken::Entry) if ran => -posix_sync::EINTR,
         Ok(_) => 0,
         Err(errno) => -errno,
     }
