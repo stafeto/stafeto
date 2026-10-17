@@ -3216,7 +3216,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
         "relibc-hello: long transfers, O_SYNC, aio on threads",
         "relibc-hello: timers with a function in a thread",
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 19 options claimed, timers 202405",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
