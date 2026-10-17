@@ -64,8 +64,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # decimal constant whole; wordexp prints with printf; aio signals with
 # sigqueue; sysconf says 64 descriptors; SIGSTKSZ is 48 KiB; a timed wait
 # whose deadline lies past a second ends at the deadline (the difference of
-# two times borrowed a second wrongly); tagged pin-0fdf038a.
-COMMIT = "0fdf038a72bd7871e289dbd9abb3f3706e721099"
+# two times borrowed a second wrongly); clog near the unit circle keeps its
+# digits; tagged pin-5ee37a18.
+COMMIT = "5ee37a1862d3afa91a18487bc4bb0e481bc72f6c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

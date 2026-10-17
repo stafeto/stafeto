@@ -8,6 +8,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <complex.h>
+#include <sys/select.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -192,6 +194,19 @@ static int files(void) {
     CHECK(strtod("0xg", &end) == 0.0 && strcmp(end, "xg") == 0);
     CHECK(strtof("3.4028234e38", &end) == 3.4028234e38f && strtof("1.17549435e-38", &end) == 1.17549435e-38f);
     CHECK(strtof("16777217", &end) == 16777216.0f && strtof("0.1", &end) == 0.1f);
+    /* clog near the unit circle: x*x + y*y - 1 is about 2^-70 here, and the
+     * real part -0x1.16ea2fa2cp-72 needs it formed without cancelling (the
+     * sum of logl(x) and log1pl(t*t)/2 gave -0x1.16ea2fa2bfcp-72). */
+    double complex near_one = CMPLX(0.7071067257624838, 0.7071068366106069);
+    CHECK(creal(clog(near_one)) == -0x1.16ea2fa2c0000p-72);
+    /* select names more descriptors than a watch takes: a descriptor that is
+     * none gives EBADF before EINVAL does. */
+    fd_set many;
+    FD_ZERO(&many);
+    for (int i = 0; i < 41; i++) FD_SET(i, &many);
+    struct timeval none = {0, 0};
+    errno = 0;
+    CHECK(select(41, &many, NULL, NULL, &none) == -1 && errno == EBADF);
     volatile double two = 2.0, ten = 10.0, zero = 0.0;
     CHECK(fabs(sqrt(two) - 1.41421356) < 1e-6 && pow(two, ten) == 1024.0 && sin(zero) == 0.0);
     printf("relibc-hello: directories, stat, descriptors, mmap, math\n");
