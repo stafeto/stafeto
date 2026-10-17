@@ -31,7 +31,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 19;
+pub const PLATFORM_INTERFACE: u64 = 20;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -1298,11 +1298,16 @@ pub extern "C" fn stafeto_thread_release(id: c_int) {
     posix_abi::relibc::release(id as u64);
 }
 
-/// Whether a guard area for a stack may be cut: the table of mappings has
-/// room (1) or not (0).
+/// The stack of a new thread: `size` bytes with `guard` bytes of hole below
+/// them (no mapping, no memory). The lowest address of the stack, or the
+/// negated errno. `munmap` of the stack and its guard together gives both
+/// back.
 #[unsafe(no_mangle)]
-pub extern "C" fn stafeto_guard_room() -> c_int {
-    c_int::from(posix_abi::allocation::room_for_guard())
+pub extern "C" fn stafeto_stack_map(size: usize, guard: usize) -> isize {
+    match posix_abi::mmap::stack_map(size, guard) {
+        Ok(address) => address as isize,
+        Err(errno) => -(errno as isize),
+    }
 }
 
 /// Frees the stacks and blocks of the threads that ended and were released,

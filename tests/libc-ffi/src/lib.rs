@@ -184,6 +184,14 @@ unsafe extern "C" {
     pub fn pthread_attr_init(attr: *mut Attr) -> c_int;
     pub fn pthread_attr_destroy(attr: *mut Attr) -> c_int;
     pub fn pthread_attr_setstacksize(attr: *mut Attr, size: usize) -> c_int;
+    pub fn pthread_attr_setguardsize(attr: *mut Attr, size: usize) -> c_int;
+    pub fn pthread_attr_getguardsize(attr: *const Attr, size: *mut usize) -> c_int;
+    pub fn pthread_attr_getstack(
+        attr: *const Attr,
+        address: *mut *mut c_void,
+        size: *mut usize,
+    ) -> c_int;
+    pub fn pthread_getattr_np(thread: pthread_t, attr: *mut Attr) -> c_int;
     pub fn pthread_attr_setdetachstate(attr: *mut Attr, state: c_int) -> c_int;
     pub fn pthread_mutex_init(mutex: *mut Mutex, attr: *const MutexAttr) -> c_int;
     pub fn pthread_mutex_destroy(mutex: *mut Mutex) -> c_int;
