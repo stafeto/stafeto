@@ -1460,7 +1460,7 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("smp-boot") => smp_boots(),
-        Some("smp-probe") => smp_probes(),
+        Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
@@ -8849,10 +8849,13 @@ const SMP_PROBE_LINES: [&str; 5] = [
     "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
 ];
 
-/// `cargo xtask smp-probe`: the test init on `-smp 4` on the four TCG
+/// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
 /// machines and, on Apple silicon, the two HVF ones: all its tests, and
 /// each test of SMP stage 4 on four CPUs.
-fn smp_probes() -> Result<(), String> {
+fn smp_probes(only: Option<&String>) -> Result<(), String> {
+    if let Some(name) = only {
+        return init_tests_on(qemu::machine(Some(name))?, false, SMP_CPUS).map(drop);
+    }
     let mut machines = vec![
         &qemu::VIRT,
         &qemu::VIRT_V3,
