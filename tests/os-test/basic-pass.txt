@@ -990,6 +990,8 @@ basic/unistd/close
 basic/unistd/confstr
 basic/unistd/crypt
 basic/unistd/dup
+basic/unistd/dup2
+basic/unistd/dup3
 basic/unistd/encrypt
 basic/unistd/execl
 basic/unistd/execle
