@@ -112,7 +112,7 @@ static int files(void) {
     struct utsname name;
     CHECK(uname(&name) == 0 && strcmp(name.sysname, "stafeto") == 0);
     struct rlimit limit;
-    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 32);
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 64);
 
     /* Pages back from an edge and from the middle, which splits the
      * mapping: then each piece left goes alone. */
@@ -152,6 +152,15 @@ static int files(void) {
     CHECK(unlink(temp) == 0 && close(made) == 0 && close(shared) == 0);
     CHECK(close(appended) == 0 && close(readwrite) == 0 && unlink("/tmp/probe-flags") == 0);
 
+    /* The table holds 64 descriptors: numbers up to 63 are taken by dup2,
+     * dup3 and F_DUPFD, and 64 is EBADF (EINVAL for the minimum of F_DUPFD). */
+    CHECK(dup2(2, 42) == 42 && (fcntl(42, F_GETFL) & O_ACCMODE) == O_WRONLY);
+    CHECK(dup3(1, 63, O_CLOEXEC) == 63 && fcntl(63, F_GETFD) == FD_CLOEXEC);
+    CHECK(dup2(2, 64) == -1 && errno == EBADF && dup3(1, 64, 0) == -1 && errno == EBADF);
+    CHECK(fcntl(2, F_DUPFD, 64) == -1 && errno == EINVAL);
+    int far = fcntl(2, F_DUPFD, 50);
+    CHECK(far == 50 && close(far) == 0 && close(42) == 0 && close(63) == 0);
+
     /* writev keeps the bytes of the parts before one that fails; a count
      * of parts outside 1 to IOV_MAX is EINVAL. */
     int scratch = open("/tmp/probe", O_RDWR);
@@ -159,6 +168,30 @@ static int files(void) {
     CHECK(scratch >= 0 && writev(scratch, parts, 2) == 2);
     CHECK(writev(scratch, parts, 0) == -1 && errno == EINVAL && close(scratch) == 0);
 
+    /* strtod converts a decimal constant whole, whatever its exponent: the
+     * digits are not accumulated in floating point, the string past the
+     * constant stays, no conversion leaves *endptr at the string, and the
+     * range errors say ERANGE. */
+    char *end;
+    errno = 0;
+    CHECK(strtod("1e308", &end) == 1e308 && *end == 0 && errno == 0);
+    CHECK(strtod("1.7976931348623157e308x", &end) == 1.7976931348623157e308 && *end == 'x');
+    CHECK(strtod("123456789012345678901234567890e-10", &end) == 123456789012345678901234567890e-10);
+    CHECK(strtod("0.1", &end) == 0.1 && strtod("2.2250738585072014e-308", &end) == 2.2250738585072014e-308);
+    CHECK(strtod("4.9e-324", &end) == 4.9e-324 && strtod("  -.5e1z", &end) == -5.0 && *end == 'z');
+    CHECK(strtod("1e", &end) == 1.0 && *end == 'e' && strtod("1.e+", &end) == 1.0 && *end == 'e');
+    CHECK(strtod("1e400", &end) > 1e308 && errno == ERANGE && *end == 0);
+    errno = 0;
+    CHECK(strtod("-1e400", &end) < -1e308 && errno == ERANGE);
+    errno = 0;
+    CHECK(strtod("1e-400", &end) == 0.0 && errno == ERANGE);
+    errno = 0;
+    CHECK(strtod("-abc", &end) == 0.0 && strcmp(end, "-abc") == 0 && errno == 0);
+    CHECK(strtod("0x1p-1074", &end) == 4.9e-324 && *end == 0);
+    CHECK(strtod("0x1.8p3", &end) == 12.0 && strtod("0x1p1000", &end) == 0x1p1000);
+    CHECK(strtod("0xg", &end) == 0.0 && strcmp(end, "xg") == 0);
+    CHECK(strtof("3.4028234e38", &end) == 3.4028234e38f && strtof("1.17549435e-38", &end) == 1.17549435e-38f);
+    CHECK(strtof("16777217", &end) == 16777216.0f && strtof("0.1", &end) == 0.1f);
     volatile double two = 2.0, ten = 10.0, zero = 0.0;
     CHECK(fabs(sqrt(two) - 1.41421356) < 1e-6 && pow(two, ten) == 1024.0 && sin(zero) == 0.0);
     printf("relibc-hello: directories, stat, descriptors, mmap, math\n");
@@ -493,9 +526,9 @@ static int constants(void) {
         printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
         return 24;
     }
-    /* The layer's descriptor table holds 32, and poll answers EINVAL past it. */
-    if (sysconf(_SC_OPEN_MAX) != 32 || errno != 0) {
-        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 32\n", sysconf(_SC_OPEN_MAX));
+    /* The layer's descriptor table holds 64. */
+    if (sysconf(_SC_OPEN_MAX) != 64 || errno != 0) {
+        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 64\n", sysconf(_SC_OPEN_MAX));
         return 25;
     }
     printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, %d options claimed, timers %ld\n",

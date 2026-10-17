@@ -586,7 +586,7 @@ static void review(void) {
         int other = open("/tmp/posix-map-other", O_RDWR | O_CREAT | O_TRUNC, 0600);
         check("review: another file", other >= 0 && ftruncate(other, PAGE) == 0);
         int kept = -1;
-        for (int n = 3; n < 32; n++) {
+        for (int n = 3; n < 64; n++) {
             if (n != fd && n != other && fcntl(n, F_GETFD) >= 0 && (fcntl(n, F_GETFD) & FD_CLOEXEC)) kept = n;
         }
         check("review: the layer keeps a descriptor", kept > 2);

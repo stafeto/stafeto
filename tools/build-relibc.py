@@ -60,7 +60,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # and the double and float ones round that result once; NZERO, devctl.h and
 # the typed memory declarations, robust mutexes (a thread's end marks the ones
 # it holds); 53 more basic tests pass.
-COMMIT = "8f2117b806fbcd5839fece8bec0b14a634623d6d"
+COMMIT = "6faaf85f03435c82aad0f6eb1942b6f720fe9996"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

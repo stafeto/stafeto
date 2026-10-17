@@ -96,7 +96,7 @@ pub const BLOCK_MAX: usize = HEADER + 2 * PATH_MAX + DESCRIPTORS * DESCRIPTOR + 
 /// The descriptors a block carries at most, and the bytes of each: the
 /// number u32, what it names u32 (`Names`) and the service's number of its
 /// open description u32.
-pub const DESCRIPTORS: usize = 32;
+pub const DESCRIPTORS: usize = 64;
 pub const DESCRIPTOR: usize = 28;
 
 /// What a descriptor of a block names.
@@ -1706,8 +1706,11 @@ mod tests {
             "fd 0 twice"
         );
         let mut far = out[..len].to_vec();
-        far[at..at + 4].copy_from_slice(&32u32.to_le_bytes());
-        assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 32");
+        far[at..at + 4].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 64");
+        let mut last = out[..len].to_vec();
+        last[at..at + 4].copy_from_slice(&63u32.to_le_bytes());
+        assert!(Block::read(&last).is_ok(), "fd 63 is the last of the table");
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
@@ -2296,6 +2299,6 @@ mod fifo_identity_tests {
         for (actual, expected) in read.descriptors().zip(descriptors) {
             assert_eq!(actual, expected);
         }
-        assert_eq!(DESCRIPTOR * DESCRIPTORS, 896);
+        assert_eq!(DESCRIPTOR * DESCRIPTORS, 1792);
     }
 }

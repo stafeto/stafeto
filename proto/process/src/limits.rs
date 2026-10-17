@@ -105,7 +105,7 @@ impl ResourceLimits {
             soft: 8 * 1024 * 1024,
             hard: 8 * 1024 * 1024,
         };
-        values[NOFILE] = Limit { soft: 32, hard: 32 };
+        values[NOFILE] = Limit { soft: 64, hard: 64 };
         values[STACK] = Limit {
             soft: 64 * 1024,
             hard: 64 * 1024,
