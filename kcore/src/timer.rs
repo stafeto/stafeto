@@ -387,7 +387,11 @@ pub struct Levels<T> {
     pending: u64,
     /// The nearest deadline, or `NO_DEADLINE`. Stored with the owner's lock
     /// held and read through `nearest_unlocked` by the scheduler's decision
-    /// without it: one relaxed load or store, never torn.
+    /// without it: one relaxed load or store, never torn. A stale value
+    /// makes the reader arm the timer of its own CPU for a deadline that
+    /// has moved. With more CPUs (stage 2) an update from another CPU does
+    /// not re-arm that CPU's timer, so a stale `nearest` re-arms only the
+    /// CPU that read it.
     nearest: AtomicU64,
 }
 

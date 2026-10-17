@@ -155,10 +155,11 @@ pub struct Process {
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
-    /// thread of the process runs only while it is 0. Changed by atomic
-    /// read-modify-write with Release, so that a core that reads it with
-    /// Acquire before an EL0 return sees what came before the change;
-    /// `suspended` changes under the scheduler lock.
+    /// thread of the process runs only while it is 0. Read Relaxed: the
+    /// EL0 return takes a hint and `park_selected` decides under the
+    /// scheduler lock, which orders the decision. Written by atomic
+    /// read-modify-write with Release (no Acquire pairs with it);
+    /// `SUSPENDED` changes under the scheduler lock.
     gate: AtomicU8,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,

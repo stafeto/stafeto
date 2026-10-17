@@ -10,7 +10,6 @@ use crate::thread::{self, Thread};
 use abi::{Error, Rights, UpcallControl};
 use core::ptr::NonNull;
 
-#[cold]
 #[inline(never)]
 pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if thread::buffer_page(thread).is_none() {
@@ -26,7 +25,6 @@ pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Resul
 /// like any other unknown one (spec 11). The five that need no argument are
 /// the path of every entry (S5 counts its instructions) and stay in this
 /// function; the others (13 to 16, with x1 and x2) go to a call of their own.
-#[cold]
 #[inline(never)]
 pub(super) fn thread_upcall_control(
     mut thread: NonNull<Thread>,

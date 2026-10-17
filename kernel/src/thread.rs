@@ -429,10 +429,12 @@ pub fn buffer_page(t: NonNull<Thread>) -> Option<usize> {
 /// Restore only the current EL0 context from a retained, fixed buffer area.
 /// All context validation precedes changes; split fields avoid aliasing the buffer.
 pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
-    // SAFETY: the current thread is held by the scheduler; only this core
-    // runs it, and the state of its entry changes under the lock.
+    // SAFETY: the current thread is held by the scheduler. The fields
+    // `can_return` reads (depth, deferred, masked, entering) are written
+    // only by the thread itself, so the read needs no lock; `returned`
+    // writes under it.
     let t = unsafe { thread.as_mut() };
-    if !sched::locked(|_| t.upcall.can_return()) {
+    if !t.upcall.can_return() {
         return Err(Error::BadState);
     }
     let buffer = t.buffer.as_ref().ok_or(Error::BadState)?;

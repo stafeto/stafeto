@@ -4722,6 +4722,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the 128 threads of the portion, the cost the CPU time of a process
 /// (`getrusage`, `times`) needs.
 ///
+/// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
+/// reads of the scheduler's decision and the upcall state under the
+/// scheduler lock moved the null call from 263 to 267 instructions (the
+/// compiler's layout of the path; no single change owns them).
+///
 /// Rules for a guard that fires (the paths are deterministic under -icount,
 /// so a firing is no noise and a repeat does not clear it):
 /// 1. The commit that trips a guard either gives the path back or raises
@@ -4741,7 +4746,7 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    room the guard keeps (4, and 16 for S5; it does not fail), and
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
-const NULL_MAX: u64 = 266;
+const NULL_MAX: u64 = 271;
 const THREADS_READY_MAX: u64 = 12_896;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
@@ -10362,10 +10367,10 @@ mod tests {
             )
         };
         assert_eq!(null(NULL_MAX), Ok(0));
-        assert_eq!(null(262), Ok(4));
+        assert_eq!(null(NULL_MAX - 4), Ok(4));
         let error = null(NULL_MAX + 1).unwrap_err();
         assert!(
-            error.contains("null=267") && error.contains("1 past"),
+            error.contains(&format!("null={}", NULL_MAX + 1)) && error.contains("1 past"),
             "{error}"
         );
         let mut teardown = [0; 10];
@@ -10399,7 +10404,7 @@ mod tests {
         );
         assert_eq!(
             guard_lower_hint("NULL_MAX", 17, NULL_SLACK, NULL_MAX, NULL_KEEP),
-            Some("lower NULL_MAX to 253".to_owned())
+            Some("lower NULL_MAX to 258".to_owned())
         );
         assert_eq!(
             guard_lower_hint(
@@ -10567,7 +10572,6 @@ mod tests {
             ".fault(",
             ".prepare(",
             ".returned(",
-            ".can_return(",
         ];
         let mut bare = Vec::new();
         let mut seen = 0;
@@ -10590,8 +10594,8 @@ mod tests {
             }
         }
         assert!(
-            seen >= 8,
-            "the scan found {seen} calls, expected at least 8"
+            seen >= 7,
+            "the scan found {seen} calls, expected at least 7"
         );
         assert!(
             bare.is_empty(),
@@ -10603,7 +10607,7 @@ mod tests {
     /// hint and `park_selected` decides under the scheduler's lock, and each
     /// change (suspend, continue, end) writes it with Release.
     #[test]
-    fn process_gate_is_acquired_and_released() {
+    fn process_gate_is_read_relaxed_and_written_release() {
         let text = std::fs::read_to_string(root().join("kernel/src/process/control.rs"))
             .expect("the file of process control");
         let hot = text
