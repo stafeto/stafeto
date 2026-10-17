@@ -56,9 +56,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # pin-b5af44ca.
 # Terminal size: the standard error is not buffered, so that resize's question
 # to the terminal goes out before it reads the answer; tagged pin-4d8d6b17.
-# Goal Zh, complex.h: the 48 functions of C11 Annex G are computed in binary128
-# and the double and float ones round that result once; 44 more basic tests pass.
-COMMIT = "daa26264b714c809a339415591a604b4d1c34752"
+# Goal Zh, complex.h: the functions of C11 Annex G are computed in binary128
+# and the double and float ones round that result once; NZERO, devctl.h and
+# the typed memory declarations, robust mutexes (a thread's end marks the ones
+# it holds); 53 more basic tests pass.
+COMMIT = "d6d2f336b57ae7227fdf10db44153e2c0d956556"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

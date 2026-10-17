@@ -133,10 +133,24 @@ static int files(void) {
      * input is no longer the console's input. F_SETFL takes no change. */
     int input = dup(0), file = open("/etc/motd", O_RDONLY);
     CHECK(input >= 0 && file >= 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDONLY);
-    CHECK(dup2(file, 0) == 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDWR);
+    CHECK(dup2(file, 0) == 0 && (fcntl(0, F_GETFL) & (O_ACCMODE | O_APPEND)) == O_RDONLY);
     CHECK(fcntl(0, F_SETFL, fcntl(0, F_GETFL)) == 0);
     CHECK(fcntl(0, F_SETFL, O_NONBLOCK) == -1 && errno == EINVAL);
     CHECK(dup2(input, 0) == 0 && close(input) == 0 && close(file) == 0);
+    /* F_GETFL gives the flags the file was opened with: the access mode and
+     * O_APPEND, shared by a duplicate; mkostemp passes O_APPEND on. */
+    int appended = open("/tmp/probe-flags", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int readwrite = open("/tmp/probe-flags", O_RDWR);
+    CHECK(appended >= 0 && readwrite >= 0);
+    CHECK((fcntl(appended, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_WRONLY | O_APPEND));
+    CHECK((fcntl(readwrite, F_GETFL) & (O_ACCMODE | O_APPEND)) == O_RDWR);
+    int shared = dup(appended);
+    CHECK(shared >= 0 && (fcntl(shared, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_WRONLY | O_APPEND));
+    char temp[] = "/tmp/probe-XXXXXX";
+    int made = mkostemp(temp, O_CLOEXEC | O_APPEND);
+    CHECK(made >= 0 && (fcntl(made, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_RDWR | O_APPEND));
+    CHECK(unlink(temp) == 0 && close(made) == 0 && close(shared) == 0);
+    CHECK(close(appended) == 0 && close(readwrite) == 0 && unlink("/tmp/probe-flags") == 0);
 
     /* writev keeps the bytes of the parts before one that fails; a count
      * of parts outside 1 to IOV_MAX is EINVAL. */

@@ -663,6 +663,17 @@ impl Transport {
         }
     }
 
+    /// The open flags of the description of a file of the RAM service: the
+    /// access mode and `APPEND` (F_GETFL).
+    pub fn ram_open_flags(&self, target: Target) -> Result<u32, FsError> {
+        let ram = target.ram_target().ok_or(FsError::BadFileDescriptor)?;
+        let files = self.0.files();
+        files
+            .capture_description(ram.fd())
+            .map(|captured| captured.flags)
+            .map_err(FsError::from)
+    }
+
     pub fn fstat(&self, target: Target) -> Result<Metadata, FsError> {
         let info = self.descriptor_information(target)?;
         Ok(Metadata {

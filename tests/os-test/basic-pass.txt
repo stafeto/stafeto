@@ -116,6 +116,7 @@ basic/ctype/tolower
 basic/ctype/tolower_l
 basic/ctype/toupper
 basic/ctype/toupper_l
+basic/devctl/posix_devctl
 basic/dirent/alphasort
 basic/dirent/closedir
 basic/dirent/dirfd
@@ -492,6 +493,7 @@ basic/pthread/pthread_join
 basic/pthread/pthread_key_create
 basic/pthread/pthread_key_delete
 basic/pthread/pthread_mutex_clocklock
+basic/pthread/pthread_mutex_consistent
 basic/pthread/pthread_mutex_destroy
 basic/pthread/pthread_mutex_getprioceiling
 basic/pthread/pthread_mutex_init
@@ -740,6 +742,7 @@ basic/stdlib/mblen
 basic/stdlib/mbstowcs
 basic/stdlib/mbtowc
 basic/stdlib/mkdtemp
+basic/stdlib/mkostemp
 basic/stdlib/mkstemp
 basic/stdlib/mrand48
 basic/stdlib/nrand48
@@ -830,6 +833,9 @@ basic/sys_mman/munlock
 basic/sys_mman/munlockall
 basic/sys_mman/munmap
 basic/sys_mman/posix_madvise
+basic/sys_mman/posix_mem_offset
+basic/sys_mman/posix_typed_mem_get_info
+basic/sys_mman/posix_typed_mem_open
 basic/sys_mman/shm_open
 basic/sys_mman/shm_unlink
 basic/sys_msg/msgctl
@@ -839,6 +845,7 @@ basic/sys_msg/msgsnd
 basic/sys_resource/getpriority
 basic/sys_resource/getrlimit
 basic/sys_resource/getrusage
+basic/sys_resource/setpriority
 basic/sys_resource/setrlimit
 basic/sys_select/FD_CLR
 basic/sys_select/FD_ISSET
