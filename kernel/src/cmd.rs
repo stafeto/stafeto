@@ -97,6 +97,11 @@ pub fn take_asked(t: NonNull<Thread>) -> (u16, u16, u16) {
     )
 }
 
+/// A timer whose last reference went on this CPU is in the heap of another
+/// one, which takes it off (`timer::reap`): the pointer of the timer stands
+/// in the queue with bit 0 set.
+pub const REAP: u8 = 64;
+
 /// Places in a queue: every thread of the system, once.
 const RING: usize = 1024;
 const _: () = assert!(THREADS <= RING);
@@ -122,23 +127,30 @@ impl Ring {
         }
     }
 
-    /// The writer's.
-    fn push(&self, t: NonNull<Thread>) {
+    /// The writer's: `value` is a thread's address, or a timer's with bit 0
+    /// set. A thread stands in the queues once at most, but the timers that
+    /// other CPUs let go come in any number, so a full queue is waited for:
+    /// the writer holds no lock here (`flush`), and the reader needs none to
+    /// take the entry.
+    fn push(&self, value: usize, to: usize) {
         let tail = self.tail.0.load(Ordering::Relaxed);
-        debug_assert!(tail.wrapping_sub(self.head.0.load(Ordering::Relaxed)) < RING as u32);
-        self.slots[tail as usize % RING].store(t.as_ptr() as usize, Ordering::Relaxed);
+        while tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
+            gic::send_sgi(to, SGI_CMD);
+            core::hint::spin_loop();
+        }
+        self.slots[tail as usize % RING].store(value, Ordering::Relaxed);
         self.tail.0.store(tail.wrapping_add(1), Ordering::Release);
     }
 
     /// The reader's.
-    fn pop(&self) -> Option<NonNull<Thread>> {
+    fn pop(&self) -> Option<usize> {
         let head = self.head.0.load(Ordering::Relaxed);
         if head == self.tail.0.load(Ordering::Acquire) {
             return None;
         }
-        let t = self.slots[head as usize % RING].load(Ordering::Relaxed);
+        let value = self.slots[head as usize % RING].load(Ordering::Relaxed);
         self.head.0.store(head.wrapping_add(1), Ordering::Release);
-        NonNull::new(t as *mut Thread)
+        Some(value)
     }
 }
 
@@ -175,6 +187,21 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
     );
     let n = o.n;
     o.items[n] = (t.as_ptr() as usize, flag);
+    o.n += 1;
+    local()
+        .deferred
+        .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
+}
+
+/// Posts the end of timer `t`, which another CPU's heap holds, for that CPU.
+pub fn post_reap(t: NonNull<crate::timer::Timer>) {
+    let mut o = local().outbox.lock();
+    assert!(
+        o.n < OUTBOX,
+        "a section posts more commands than the outbox holds"
+    );
+    let n = o.n;
+    o.items[n] = (t.as_ptr() as usize, REAP);
     o.n += 1;
     local()
         .deferred
@@ -224,6 +251,16 @@ pub fn flush() {
                 mask |= 1 << what;
                 continue;
             }
+            if flag == REAP {
+                // SAFETY: the timer holds on to its pool and shell until
+                // the owner takes it.
+                let to = crate::timer::owner_cpu(unsafe {
+                    NonNull::new_unchecked(what as *mut crate::timer::Timer)
+                });
+                RINGS[to][me].push(what | 1, to);
+                mask |= 1 << to;
+                continue;
+            }
             // SAFETY: the kernel's reference keeps the thread of a command.
             let t = unsafe { NonNull::new_unchecked(what as *mut Thread) };
             let to = thread::cpu_of(t);
@@ -231,7 +268,7 @@ pub fn flush() {
             // the arguments) is there when the owner takes the flag.
             let before = thread_cmds(t).fetch_or(flag, Ordering::Release);
             if before == 0 {
-                RINGS[to][me].push(t);
+                RINGS[to][me].push(t.as_ptr() as usize, to);
             }
             mask |= 1 << to;
         }
@@ -252,7 +289,17 @@ fn thread_cmds<'a>(t: NonNull<Thread>) -> &'a AtomicU8 {
 pub fn drain() {
     let me = cpu::this().index();
     for from in (0..crate::smp::cpus()).filter(|&f| f != me) {
-        while let Some(t) = RINGS[me][from].pop() {
+        while let Some(value) = RINGS[me][from].pop() {
+            if value & 1 != 0 {
+                // SAFETY: the sender left the timer to this CPU (`REAP`).
+                crate::timer::reap(unsafe {
+                    NonNull::new_unchecked((value & !1) as *mut crate::timer::Timer)
+                });
+                continue;
+            }
+            // SAFETY: a thread of the queue is alive: the kernel's reference
+            // keeps it until its commands are served.
+            let t = unsafe { NonNull::new_unchecked(value as *mut Thread) };
             let flags = thread_cmds(t).swap(0, Ordering::Acquire);
             serve(t, flags);
         }

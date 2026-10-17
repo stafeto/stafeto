@@ -69,6 +69,6 @@ pub(super) fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Err
 /// that is not armed is left as it is: 0.
 pub(super) fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
-    timer::cancel(t);
+    timer::cancel(t)?;
     Ok(Values::none())
 }

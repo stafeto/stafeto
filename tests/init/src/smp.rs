@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 8] = [
+pub(crate) const TESTS: [Test; 9] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -40,6 +40,10 @@ pub(crate) const TESTS: [Test; 8] = [
     (
         "smp_raise_of_a_client_reaches_its_service_on_another_cpu",
         raise_across_cpus,
+    ),
+    (
+        "smp_timer_of_another_cpu_is_armed_there_and_let_go_there",
+        timer_across_cpus,
     ),
 ];
 
@@ -627,5 +631,67 @@ fn raise_across_cpus() -> Outcome {
         "a raise of the client did not reach its service on another CPU",
     )?;
     println!("smp: a client raised on CPU 1 raised its service on CPU 2 from {before} to {seen}");
+    Ok(())
+}
+
+/// Makes a timer, arms it for 30 ms on this CPU, and says which (marks 1 and
+/// 2: the handles of the channel and of the timer).
+extern "C" fn arm_timer(_: u64) -> ! {
+    let made = sys::channel_create(QUIET).and_then(|c| {
+        let t = sys::timer_create(&c, QUIET)?;
+        let deadline = time::ticks_to_ns(time::now()) + 30_000_000;
+        sys::timer_set(&t, deadline)?;
+        Ok((c, t))
+    });
+    if let Ok((c, t)) = made {
+        MARKS[1].store(c.into_raw().0, Relaxed);
+        MARKS[2].store(t.into_raw().0, Relaxed);
+        MARKS[0].store(1, Relaxed);
+    } else {
+        MARKS[0].store(2, Relaxed);
+    }
+    while MARKS[3].load(Relaxed) == 0 {
+        spin_loop();
+    }
+    sys::thread_exit()
+}
+
+/// A timer a thread on CPU 1 armed lives in the heap of CPU 1: CPU 0 may
+/// neither cancel nor arm it (BAD_STATE), and when CPU 0 lets go its last
+/// handle while it is armed, CPU 1 takes it off its heap and frees it, so
+/// that its deadline, which passes meanwhile, finds nothing there.
+fn timer_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let thread = spawn_on(0, 1, arm_timer, 0, TEST_PRIORITY)?;
+    let armed = wait_for(|| mark(0) != 0);
+    check(
+        armed && mark(0) == 1,
+        "the thread on CPU 1 did not arm its timer",
+    )?;
+    let channel = Handle::<Channel>::from_raw(abi::Handle(mark(1)));
+    let timer = Handle::<Timer>::from_raw(abi::Handle(mark(2)));
+    let cancelled = sys::timer_cancel(&timer);
+    let rearmed = sys::timer_set(&timer, time::ticks_to_ns(time::now()) + 1_000_000_000);
+    // The last handle goes on this CPU, while the timer is armed on CPU 1.
+    close(timer)?;
+    pause(100_000_000);
+    close(channel)?;
+    MARKS[3].store(1, Relaxed);
+    let ended =
+        wait_for(|| sys::thread_info(&thread).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close(thread)?;
+    check(
+        cancelled == Err(Error::BadState) && rearmed == Err(Error::BadState),
+        "a timer armed on another CPU was cancelled or armed again from this one",
+    )?;
+    check(ended, "the thread on CPU 1 did not stop")?;
+    println!(
+        "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on"
+    );
     Ok(())
 }

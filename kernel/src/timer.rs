@@ -38,6 +38,9 @@ use kcore::sync::Budget;
 pub(crate) use kcore::timer::LEVELS;
 use kcore::timer::{Firing, HeapLink, HeapNode, Levels};
 
+/// `Timer::cpu` of a timer that was never armed.
+const NO_CPU: u8 = u8::MAX;
+
 /// The bits of an expiry (spec 6.5): bit 0, once.
 const TIMER_BITS: u64 = 1;
 
@@ -56,6 +59,13 @@ pub struct Timer {
     /// Its last reference went: it fires no more, and its portion takes it
     /// off the heap.
     dying: bool,
+    /// The CPU whose heap the timer is armed in, from its first
+    /// `timer_set` for good: NO_CPU before. Only that CPU sets, cancels and
+    /// fires it, and takes its portion (SMP stage 4).
+    cpu: u8,
+    /// The level of the cleanup its last release started, for the CPU that
+    /// owns it when another one let it go (`reap`).
+    cause: u8,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
 }
@@ -137,6 +147,8 @@ pub fn create(
         refs: Refs::one(),
         payer,
         dying: false,
+        cpu: NO_CPU,
+        cause: 0,
         cleanup: Item::new(),
     };
     let t = process::paid_alloc(payer, timer).inspect_err(|_| {
@@ -208,6 +220,14 @@ pub unsafe fn release(t: NonNull<Timer>, cause: u8) {
         if refs(t).release() {
             let p = t.as_ptr();
             (*p).dying = true;
+            let owner = (*p).cpu;
+            if owner != NO_CPU && usize::from(owner) != crate::arch::cpu::this().index() {
+                // The heap that holds it is another CPU's: that CPU takes
+                // it off and queues it (cmd::REAP, `reap`).
+                (*p).cause = cause;
+                crate::cmd::post_reap(t);
+                return;
+            }
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
             cleanup::enqueue(item, Object::Timer(t), cause);
         }
@@ -228,6 +248,7 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
     if channel::is_closed(c) {
         return Err(Error::PeerClosed);
     }
+    bind(t)?;
     let now = clock::now();
     let level = level(t);
     {
@@ -255,7 +276,10 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
 /// armed timer leaves the heap of its level, and what it posted stays in
 /// its slot. A timer that is not armed is left as it is. O(log n), and up
 /// to 63 comparisons when the top of the level changes.
-pub fn cancel(t: NonNull<Timer>) {
+pub fn cancel(t: NonNull<Timer>) -> Result<(), Error> {
+    if !owned(t) {
+        return Err(Error::BadState);
+    }
     let level = level(t);
     let mut g = local().timers.lock();
     // SAFETY: the timer is alive and, if linked, in the heap of its level.
@@ -263,6 +287,46 @@ pub fn cancel(t: NonNull<Timer>) {
         if (*t.as_ptr()).node.is_linked() {
             g.levels.remove(level, t);
         }
+    }
+    Ok(())
+}
+
+/// Whether this CPU may touch the heap entry of `t`: it is the one that
+/// armed it first, or nobody did.
+fn owned(t: NonNull<Timer>) -> bool {
+    // SAFETY: the caller's handle holds the timer; only the field is read.
+    let owner = unsafe { (*t.as_ptr()).cpu };
+    owner == NO_CPU || usize::from(owner) == crate::arch::cpu::this().index()
+}
+
+/// Binds `t` to this CPU at its first arming; BAD_STATE when another CPU
+/// armed it before: a timer is armed, cancelled and fired by one CPU.
+fn bind(t: NonNull<Timer>) -> Result<(), Error> {
+    if !owned(t) {
+        return Err(Error::BadState);
+    }
+    // SAFETY: as above; the caller's handle is the only way to arm it.
+    unsafe { (*t.as_ptr()).cpu = crate::arch::cpu::this().index() as u8 };
+    Ok(())
+}
+
+/// The CPU that owns `t`, whose last reference another CPU dropped.
+pub fn owner_cpu(t: NonNull<Timer>) -> usize {
+    // SAFETY: the caller holds the timer until the command is served.
+    usize::from(unsafe { (*t.as_ptr()).cpu })
+}
+
+/// REAP, served by the CPU that owns the timer: its last reference went on
+/// another CPU, which marked it dying and left the rest to this one, whose
+/// heap holds it; it goes to this CPU's cleanup queue at the level of the
+/// release, and its portion takes it off the heap.
+pub fn reap(t: NonNull<Timer>) {
+    let _section = crate::obj::lock();
+    // SAFETY: the timer is dying and in no queue; its slot holds the pool.
+    unsafe {
+        let p = t.as_ptr();
+        let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+        cleanup::enqueue(item, Object::Timer(t), (*p).cause);
     }
 }
 
