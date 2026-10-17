@@ -85,7 +85,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # a thread that is gone, one page of guard by default while the table of mappings has room, a collection when a stack finds no memory, named semaphore waits that ask again; tagged pin-8b8e3b42.
 # Thread stacks: the guard is a hole below the stack, made with the stack by one
 # call of the layer (platform interface 20); tagged pin-403a3c56.
-COMMIT = "403a3c56b627b7cf6526649fa192216d36fc8930"
+# getrusage and times give the system time (stafeto_cpu_system_ns) apart from
+# the user time; tagged pin-cf8e95e9.
+COMMIT = "cf8e95e90ddf605f63d876f17bed26879c71b1a8"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

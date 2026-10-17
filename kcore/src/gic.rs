@@ -267,6 +267,12 @@ impl Ack {
         (self.0 >> 10) & 7
     }
 
+    /// Whether a GICv2 SGI came from the CPU interface `interface_bit` (its
+    /// bit in a target list), which is the interface `source()` names.
+    pub fn is_from_interface(&self, interface_bit: u32) -> bool {
+        interface_bit == 1 << self.source()
+    }
+
     /// The value to write to GICC_EOIR.
     pub fn eoi_value(self) -> u32 {
         self.0
@@ -295,6 +301,15 @@ mod tests {
     fn an_sgi_acknowledge_names_its_source() {
         let ack = Ack::from_iar((3 << 10) | 1).unwrap();
         assert_eq!((ack.intid(), ack.source()), (1, 3));
+    }
+
+    #[test]
+    fn an_sgi_is_from_the_interface_its_source_names() {
+        let ack = Ack::from_iar((2 << 10) | 1).unwrap();
+        assert!(ack.is_from_interface(0b100));
+        for wrong in [0b001, 0b010, 0b1000, 0b110, 0] {
+            assert!(!ack.is_from_interface(wrong));
+        }
     }
 
     #[test]

@@ -306,6 +306,19 @@ pub fn send_sgi(target: usize, intid: u32) {
     }
 }
 
+/// Whether the SGI `ack` came from CPU `sender`. A GICv2 IAR names the
+/// sending CPU interface, which is compared with the one in the sender's
+/// block; a GICv3 IAR has no source, so the pair is checked by the flags the
+/// sender wrote (kernel::smp).
+pub fn sgi_from(ack: &Ack, sender: usize) -> bool {
+    match kind() {
+        GicVersion::V2 => {
+            ack.is_from_interface(cpu::block(sender).gic.load(Ordering::Relaxed) as u32)
+        }
+        GicVersion::V3 => true,
+    }
+}
+
 /// GICv2: `dmb ishst`, then the write of GICD_SGIR (xtask's `smp_order`
 /// checks the order in the built kernel).
 #[inline(never)]

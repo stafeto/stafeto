@@ -1447,11 +1447,13 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("smp-boot") => smp_boots(),
+        Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
+        Some("smp-vz") => vz::smp_boot(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
@@ -7481,6 +7483,21 @@ fn smp_boots() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask smp-hvf`: the SMP boot on the two HVF machines.
+fn smp_hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!(
+            "smp-hvf: skipped: needs macOS on Apple Silicon with the Hypervisor framework ({why})"
+        );
+        return Ok(());
+    }
+    for (m, gic) in [(&qemu::HVF_V3, GIC_V3_LINE), (&qemu::HVF_V2, GIC_V2_LINE)] {
+        smp_boot(m, gic)?;
+        println!("smp boot on {}: ok", m.name);
+    }
+    Ok(())
+}
+
 /// The CPUs of the SMP boots (`smp_boot`).
 const SMP_CPUS: usize = 4;
 
@@ -8876,6 +8893,9 @@ fn hvf() -> Result<(), String> {
         if hz != HVF_HZ {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
+        // Four CPUs on the real processor: the start through PSCI, the
+        // block read without caches, the SGIs of every pair.
+        smp_boot(m, gic)?;
         console_dialog(m)?;
         trace_dialog(m)?;
         // relibc's pthreads and the POSIX processes, the loader of files

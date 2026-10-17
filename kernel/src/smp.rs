@@ -223,14 +223,16 @@ impl Matrix {
 
 /// An SGI of the probe on the CPU that took it, acknowledged: the flags
 /// the senders wrote name the pairs; each is read with acquire, after the
-/// SGI, so that the sender's barrier shows. Ends the interrupt.
+/// SGI, so that the sender's barrier shows. On a GICv2 the source of the SGI
+/// must be the CPU interface of the sender whose flag is read. Ends the
+/// interrupt.
 pub fn handle(ack: Ack) {
     let me = cpu::this().index();
     let cpus = cpus();
     match ack.intid() {
         SGI_PING => {
             for from in (0..cpus).filter(|&f| f != me) {
-                if PING.at(me, from).swap(0, Ordering::Acquire) != 0 {
+                if gic::sgi_from(&ack, from) && PING.at(me, from).swap(0, Ordering::Acquire) != 0 {
                     GOT_PING.at(me, from).store(1, Ordering::Relaxed);
                     PONG.at(from, me).store(1, Ordering::Release);
                     gic::send_sgi(from, SGI_PONG);
@@ -239,12 +241,15 @@ pub fn handle(ack: Ack) {
         }
         SGI_PONG => {
             for from in (0..cpus).filter(|&f| f != me) {
-                if PONG.at(me, from).swap(0, Ordering::Acquire) != 0 {
+                if gic::sgi_from(&ack, from) && PONG.at(me, from).swap(0, Ordering::Acquire) != 0 {
                     GOT_PONG.at(me, from).store(1, Ordering::Relaxed);
                 }
             }
         }
-        SGI_GO if GO[me].swap(0, Ordering::Acquire) != 0 => ping_all(me, cpus),
+        // CPU 0 asks for it.
+        SGI_GO if gic::sgi_from(&ack, 0) && GO[me].swap(0, Ordering::Acquire) != 0 => {
+            ping_all(me, cpus)
+        }
         _ => {}
     }
     gic::end(ack);
@@ -259,7 +264,8 @@ fn ping_all(me: usize, cpus: usize) {
 
 /// The probe of the SGIs, on CPU 0, with every CPU up: each CPU pings each
 /// other one and gets its pong. CPU 0 serves its own SGIs by polling. Stops
-/// the kernel naming the pair whose ping or pong did not come.
+/// the kernel naming the pair whose ping or pong did not come (on a GICv2
+/// also the pair whose SGI named another CPU interface as its source).
 pub fn sgi_probe() {
     let cpus = cpus();
     if cpus < 2 {

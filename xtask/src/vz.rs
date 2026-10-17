@@ -80,6 +80,15 @@ pub fn command(kernel: &Path, boot: &Path) -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// `command` for a machine with `cpus` processors.
+pub fn command_cpus(kernel: &Path, boot: &Path, cpus: usize) -> Result<Command, String> {
+    let mut cmd = Command::new(runner()?);
+    cmd.args(["--cpus", &cpus.to_string()])
+        .arg(kernel)
+        .arg(boot);
+    Ok(cmd)
+}
+
 /// The kernel image and the boot image of VZ, and a line of the report
 /// with the kernel's size: the build that ships (spec 3.4).
 fn images() -> Result<(crate::Artifacts, std::path::PathBuf), String> {
@@ -103,6 +112,27 @@ pub fn run() -> Result<(), String> {
     } else {
         Err(format!("vz-run exited with {status}"))
     }
+}
+
+/// `cargo xtask smp-vz` (SMP stage 2): the machine has four processors; the
+/// kernel's log, which the Virtio console's driver shows, has the line of
+/// each CPU (MPIDR, EL1, its timer) and the line of the SGI probe, and the
+/// shell connects.
+pub fn smp_boot() -> Result<(), String> {
+    let (kernel, boot) = images()?;
+    let mut run = qemu::Run::start(
+        command_cpus(&kernel.image, &boot, crate::SMP_CPUS)?,
+        qemu::Input::Pipe,
+    )?;
+    let result = (|| {
+        let whole = |line: &'static str| move |l: &str| l == line;
+        run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), BOOT_TIMEOUT)?;
+        crate::smp_report(run.lines(), crate::SMP_CPUS)
+    })();
+    run.stop();
+    stop_hint(result).map_err(|e| format!("SMP boot on VZ: {e}"))?;
+    println!("smp boot on VZ with {} CPUs: ok", crate::SMP_CPUS);
+    Ok(())
 }
 
 /// `cargo xtask console-restart-vz` (spec 13.5; spec 2, section 4): the

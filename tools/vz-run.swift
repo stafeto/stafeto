@@ -7,14 +7,24 @@ import Virtualization
 // --window-reports: the guest's console is served by the terminal service,
 // which takes the size of the window of the runner's terminal as a report.
 let windowReports = CommandLine.arguments.contains("--window-reports")
-let arguments = CommandLine.arguments.filter { $0 != "--window-reports" }
+var arguments = CommandLine.arguments.filter { $0 != "--window-reports" }
+// --cpus N: the machine has N processors (one by default).
+var cpuCount = 1
+if let at = arguments.firstIndex(of: "--cpus") {
+    guard at + 1 < arguments.count, let n = Int(arguments[at + 1]), n >= 1 else {
+        fputs("usage: vz-run [--window-reports] [--cpus N] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+        exit(2)
+    }
+    cpuCount = n
+    arguments.removeSubrange(at...(at + 1))
+}
 guard arguments.count == 3 else {
-    fputs("usage: vz-run [--window-reports] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+    fputs("usage: vz-run [--window-reports] [--cpus N] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
     exit(2)
 }
 
 let configuration = VZVirtualMachineConfiguration()
-configuration.cpuCount = 1
+configuration.cpuCount = cpuCount
 configuration.memorySize = 512 * 1024 * 1024
 let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
 boot.initialRamdiskURL = URL(fileURLWithPath: arguments[2])
