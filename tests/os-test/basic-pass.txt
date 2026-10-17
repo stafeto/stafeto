@@ -532,6 +532,7 @@ basic/pthread/pthread_rwlockattr_init
 basic/pthread/pthread_rwlockattr_setpshared
 basic/pthread/pthread_self
 basic/pthread/pthread_setcancelstate
+basic/pthread/pthread_setcanceltype
 basic/pthread/pthread_setschedparam
 basic/pthread/pthread_setschedprio
 basic/pthread/pthread_setspecific
