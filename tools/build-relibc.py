@@ -56,7 +56,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # pin-b5af44ca.
 # Terminal size: the standard error is not buffered, so that resize's question
 # to the terminal goes out before it reads the answer; tagged pin-4d8d6b17.
-COMMIT = "4d8d6b17626ce219c2018224a1f7825d91385cb1"
+# timespec::subtract: a borrowed second adds the negative nanosecond
+# difference (sem_timedwait waited up to a second too long); tagged pin-285e07a0.
+COMMIT = "285e07a09ffd81681cf5a8912ff014480ab6af8f"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -112,7 +114,7 @@ def llvm(name: str) -> Path:
     found = shutil.which(name)
     if found is None:
         raise SystemExit(f"missing {name}; install LLVM")
-    return Path(found).resolve()
+    return Path(found).absolute()
 
 
 def fetch(env: dict) -> None:

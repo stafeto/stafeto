@@ -25,3 +25,13 @@ rustflags = [
     # Erratum 835769, as above.
     "-C", "target-feature=+fix-cortex-a53-835769",
 ]
+
+# Host tests on Linux: the crates that link rt carry its `_start` (the
+# program entry), which the C runtime of the host already defines. The
+# host's own `_start` comes first and the one of rt stays unused. macOS has
+# no such symbol, so its tests link without this.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

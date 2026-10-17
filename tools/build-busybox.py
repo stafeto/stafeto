@@ -173,7 +173,7 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
     found = shutil.which(name)
     if found is None:
         raise SystemExit(f"missing {name}; install LLVM, lld and GNU Make")
-    return Path(found).resolve()
+    return Path(found).absolute()
 
 
 def ready_utilities() -> None:
