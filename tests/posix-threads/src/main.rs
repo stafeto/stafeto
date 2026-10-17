@@ -331,7 +331,7 @@ fn settled(expected: usize) -> bool {
         if sys::clock_now().expect("settle clock") >= limit {
             return false;
         }
-        let _ = unsafe { layer::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = abi::threads::sleep::nanosleep(pause);
     }
 }
 
