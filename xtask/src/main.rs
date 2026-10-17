@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 237;
+const INIT_TESTS: u32 = 238;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1211,10 +1211,12 @@ enum Variant {
     TestIcountEl0,
     FaultProbe,
     OverflowProbe,
+    /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
+    CpuOnRefused,
 }
 
 impl Variant {
-    const ALL: [Variant; 8] = [
+    const ALL: [Variant; 9] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1223,6 +1225,7 @@ impl Variant {
         Variant::TestIcountEl0,
         Variant::FaultProbe,
         Variant::OverflowProbe,
+        Variant::CpuOnRefused,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1239,6 +1242,7 @@ impl Variant {
             Variant::TestIcountEl0 => Some("icount,el0-half"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+            Variant::CpuOnRefused => Some("cpu-on-refused"),
         }
     }
 
@@ -1248,7 +1252,8 @@ impl Variant {
             Variant::Normal
             | Variant::TraceNormal
             | Variant::FaultProbe
-            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::OverflowProbe
+            | Variant::CpuOnRefused => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
             | Variant::Trace
@@ -1286,6 +1291,7 @@ impl Variant {
             Variant::TestIcountEl0 => "stafeto-ktest-icount-el0",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
+            Variant::CpuOnRefused => "stafeto-cpu-on",
         }
     }
 }
@@ -1455,6 +1461,7 @@ fn main() {
         }
         Some("smp-boot") => smp_boots(),
         Some("smp-probe") => smp_probes(),
+        Some("smp-cpu-on") => smp_cpu_on(),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
@@ -8853,6 +8860,41 @@ fn smp_probes() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask smp-cpu-on`: PSCI refuses CPU_ON for the third CPU of four
+/// (a kernel built with `cpu-on-refused`): the boot says so, goes on with
+/// three CPUs, all of which report, the SGI probe runs on three, and the
+/// shell connects.
+fn smp_cpu_on() -> Result<(), String> {
+    let a = build(Variant::CpuOnRefused)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
+    let has = |p: &str| o.lines.iter().any(|l| l.starts_with(p));
+    if !has("smp        CPU_ON of MPIDR 0x2 refused: Some(-2); going on with the CPUs that are up")
+    {
+        return Err("the boot did not say that CPU_ON was refused".into());
+    }
+    for n in 0..3 {
+        if !has(&format!("cpu {n}      MPIDR ")) {
+            return Err(format!("the boot report has no line of CPU {n}"));
+        }
+    }
+    if has("cpu 3      MPIDR ") {
+        return Err("a fourth CPU reports after a refusal".into());
+    }
+    if !o
+        .lines
+        .iter()
+        .any(|l| l == "sgi        3 CPUs, all 6 pairs: ping and pong ok")
+    {
+        return Err("the SGI probe did not run on three CPUs".into());
+    }
+    println!("smp boot with CPU_ON refused for one CPU: three CPUs, ok");
+    Ok(())
+}
+
 /// `init_tests` with `cpus` CPUs: with more than one, the lines of the tests
 /// of SMP stage 4 must be there.
 fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, String> {
@@ -8887,12 +8929,15 @@ fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, 
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
         }
-        if !o
-            .lines
-            .iter()
-            .any(|l| l.starts_with("smp: a thread at EL0 on CPU 1 ran "))
-        {
-            return Err("the test init printed no time of a thread at EL0 on CPU 1".into());
+        for start in [
+            "smp: a thread at EL0 on CPU 1 ran ",
+            "smp: signal to a thread at EL0 on CPU 1: median ",
+        ] {
+            if let Some(line) = o.lines.iter().find(|l| l.starts_with(start)) {
+                println!("{line}");
+            } else {
+                return Err(format!("the test init printed no line {start:?}"));
+            }
         }
     }
     log_markers(&o)?;

@@ -112,14 +112,20 @@ pub fn start(boot: &Boot) {
         .store(timer_ok as u32, Ordering::Relaxed);
     let mut up = 1;
     for &mpidr in others.take(MAX_CPUS - 1) {
-        start_one(boot, up, mpidr);
-        up += 1;
+        if start_one(boot, up, mpidr) {
+            up += 1;
+        }
     }
     UP_COUNT.store(up as u32, Ordering::Relaxed);
 }
 
+/// Starts the CPU of `mpidr` as CPU `index`; false when PSCI refuses (CPU
+/// not present, already on, denied): the kernel goes on with the CPUs it
+/// has, and the next CPU of the tree takes the number. A CPU that PSCI
+/// accepted and that does not come up stops the kernel: it may still come
+/// up, and nothing could tell it to stay out.
 #[inline(never)]
-fn start_one(boot: &Boot, index: usize, mpidr: u64) {
+fn start_one(boot: &Boot, index: usize, mpidr: u64) -> bool {
     let block = cpu::prepare(index);
     let pa = |va: usize| image_pa(boot.kernel_pa, va);
     // SAFETY: the CPU of this block has not started: nothing else reads it.
@@ -141,9 +147,19 @@ fn start_one(boot: &Boot, index: usize, mpidr: u64) {
     );
     let entry = pa(secondary_entry as *const () as usize);
     let context = pa(start as *const StartBlock as usize);
-    match psci::cpu_on(mpidr, entry, context) {
-        Some(0) => {}
-        status => panic!("PSCI CPU_ON of CPU {index} (MPIDR {mpidr:#x}) returned {status:?}"),
+    #[cfg(feature = "cpu-on-refused")]
+    let status = if mpidr & 0xff == 2 {
+        Some(-2)
+    } else {
+        psci::cpu_on(mpidr, entry, context)
+    };
+    #[cfg(not(feature = "cpu-on-refused"))]
+    let status = psci::cpu_on(mpidr, entry, context);
+    if status != Some(0) {
+        kprintln!(
+            "smp        CPU_ON of MPIDR {mpidr:#x} refused: {status:?}; going on with the CPUs that are up"
+        );
+        return false;
     }
     let limit = timer::now() + WAIT_SECONDS * timer::frequency();
     while block.state.load(Ordering::Acquire) != UP {
@@ -152,6 +168,7 @@ fn start_one(boot: &Boot, index: usize, mpidr: u64) {
         }
         core::hint::spin_loop();
     }
+    true
 }
 
 /// What CPU 0 says of each CPU: the boot report. The CPUs set the numbers

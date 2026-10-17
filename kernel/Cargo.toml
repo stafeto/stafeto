@@ -25,6 +25,8 @@ icount = ["ktest", "measure"]
 el0-half = ["ktest"]
 fault-probe = []
 overflow-probe = []
+# The kernel acts as if PSCI refused CPU_ON for the third CPU (xtask smp-cpu-on).
+cpu-on-refused = []
 measure = []
 atomic-locks = ["kcore/atomic-locks"]
 locked-decide = []

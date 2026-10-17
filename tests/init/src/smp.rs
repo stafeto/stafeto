@@ -14,7 +14,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 5] = [
+pub(crate) const TESTS: [Test; 6] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -25,7 +25,14 @@ pub(crate) const TESTS: [Test; 5] = [
         suspend_and_kill,
     ),
     ("smp_lock_holds_under_calls_of_every_cpu", lock_under_load),
-    ("smp_time_of_a_thread_at_el0_on_another_cpu", time_across_cpus),
+    (
+        "smp_time_of_a_thread_at_el0_on_another_cpu",
+        time_across_cpus,
+    ),
+    (
+        "smp_signal_reaches_a_thread_at_el0_on_another_cpu",
+        signal_across_cpus,
+    ),
 ];
 
 /// How long a wait for another CPU may last, in nanoseconds: far longer
@@ -364,13 +371,14 @@ fn time_across_cpus() -> Outcome {
     let (ran, system) = sys::thread_times(&t).map_err(|_| "thread_times failed")?;
     let moved = mark(0) != 0;
     MARKS[3].store(1, Relaxed);
-    let ended = wait_for(|| {
-        sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended)
-    });
+    let ended = wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
     close(t)?;
     let (ran_ns, system_ns) = (time::ticks_to_ns(ran), time::ticks_to_ns(system));
-    check(moved && ended, "the thread on the other CPU did not run and stop")?;
+    check(
+        moved && ended,
+        "the thread on the other CPU did not run and stop",
+    )?;
     check(
         (30_000_000..4_000_000_000).contains(&ran_ns),
         "the time of a thread at EL0 on another CPU is not what it ran",
@@ -380,5 +388,74 @@ fn time_across_cpus() -> Outcome {
         "a thread at EL0 on another CPU has most of its time in the kernel",
     )?;
     println!("smp: a thread at EL0 on CPU 1 ran {ran_ns} ns, {system_ns} ns of them in the kernel");
+    Ok(())
+}
+
+/// The handler of the entry of the thread on another CPU: counts, and notes
+/// the counter at which it began.
+unsafe fn signalled() {
+    MARKS[2].store(time::now(), Relaxed);
+    MARKS[1].fetch_add(1, Relaxed);
+}
+
+rt::upcall_entry!(signalled_entry, signalled);
+
+/// Binds the entry, then runs at EL0 with no call at all until mark 3 says
+/// to stop: the request of another CPU has to bring it into the kernel.
+extern "C" fn signalled_thread(_: u64) -> ! {
+    // SAFETY: the handler touches the marks alone.
+    unsafe {
+        let _ = rt::upcall::bind(signalled_entry);
+        let _ = rt::upcall::enable();
+    }
+    MARKS[0].store(1, Relaxed);
+    while MARKS[3].load(Relaxed) == 0 {
+        spin_loop();
+    }
+    sys::thread_exit()
+}
+
+/// Rounds of the signal test.
+const SIGNALS: usize = 100;
+
+/// A thread at EL0 on CPU 1 in a loop with no call gets thread_upcall_request
+/// from CPU 0 (SMP stage 4, S5x): its CPU enters the kernel for it, and the
+/// handler runs. The time from the request to the handler, in counter
+/// ticks, is printed (rtbench-style row S5x).
+fn signal_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let t = spawn_on(0, 1, signalled_thread, 0, TEST_PRIORITY)?;
+    let ready = wait_for(|| mark(0) == 1);
+    let mut latency = [0u64; SIGNALS];
+    let mut all = ready;
+    for slot in latency.iter_mut() {
+        if !all {
+            break;
+        }
+        let seen = mark(1);
+        let before = time::now();
+        all = sys::thread_upcall_request(&t).is_ok() && wait_for(|| mark(1) > seen);
+        *slot = mark(2).saturating_sub(before);
+        pause(100_000);
+    }
+    MARKS[3].store(1, Relaxed);
+    let ended = wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close(t)?;
+    check(
+        ready && all && ended,
+        "a request did not reach the thread at EL0 on the other CPU",
+    )?;
+    latency.sort_unstable();
+    println!(
+        "smp: signal to a thread at EL0 on CPU 1: median {} ticks, longest {} ticks of {SIGNALS} (counter {} Hz)",
+        latency[SIGNALS / 2],
+        latency[SIGNALS - 1],
+        time::frequency()
+    );
     Ok(())
 }
