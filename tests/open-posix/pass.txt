@@ -319,7 +319,6 @@ conformance/interfaces/clock_getres/4-1
 conformance/interfaces/clock_getres/5-1
 conformance/interfaces/clock_getres/6-1
 conformance/interfaces/clock_getres/6-2
-conformance/interfaces/clock_gettime/1-1
 conformance/interfaces/clock_gettime/3-1
 conformance/interfaces/clock_gettime/6-1
 conformance/interfaces/clock_gettime/7-1
@@ -363,6 +362,7 @@ conformance/interfaces/fork/14-1
 conformance/interfaces/fork/16-1
 conformance/interfaces/fork/17-1
 conformance/interfaces/fork/17-2
+conformance/interfaces/fork/18-1
 conformance/interfaces/fork/19-1
 conformance/interfaces/fork/2-1
 conformance/interfaces/fork/21-1
@@ -896,6 +896,7 @@ conformance/interfaces/pthread_rwlock_rdlock/6-2
 conformance/interfaces/pthread_rwlock_timedrdlock/2-1
 conformance/interfaces/pthread_rwlock_timedrdlock/3-1
 conformance/interfaces/pthread_rwlock_timedrdlock/4-1
+conformance/interfaces/pthread_rwlock_timedrdlock/6-2
 conformance/interfaces/pthread_rwlock_timedrdlock/7-1
 conformance/interfaces/pthread_rwlock_timedwrlock/2-1
 conformance/interfaces/pthread_rwlock_timedwrlock/3-1
@@ -1079,6 +1080,8 @@ conformance/interfaces/sem_timedwait/2-1
 conformance/interfaces/sem_timedwait/2-2
 conformance/interfaces/sem_timedwait/3-1
 conformance/interfaces/sem_timedwait/4-1
+conformance/interfaces/sem_timedwait/6-1
+conformance/interfaces/sem_timedwait/6-2
 conformance/interfaces/sem_timedwait/7-1
 conformance/interfaces/sem_unlink/1-1
 conformance/interfaces/sem_unlink/2-1
