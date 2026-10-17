@@ -196,14 +196,14 @@ pub fn top() -> Option<u8> {
     QUEUE.lock().items.top()
 }
 
-/// The top level during the scheduler's decision. No kernel operation
-/// can change the queue between this read and the scheduler's lock on
-/// the single core with interrupts masked.
+/// The top level during the scheduler's decision, without the lock: one
+/// relaxed load of the queue's mask (`ReadyQueue::top_unlocked`), which a
+/// holder of the lock on another core may change meanwhile. The decision
+/// treats the answer as a hint and takes the scheduler's lock before it acts.
 #[cfg(not(feature = "locked-decide"))]
 pub fn top_for_decide() -> Option<u8> {
-    // SAFETY: exit_loop calls this with interrupts masked and no cleanup
-    // or call active on the single core.
-    unsafe { (*QUEUE.as_ptr()).items.top() }
+    // SAFETY: the queue is a static; only its atomic mask is read.
+    unsafe { ReadyQueue::top_unlocked(&raw const (*QUEUE.as_ptr()).items) }
 }
 
 /// One portion (sched::resume): the item at the head of the top level

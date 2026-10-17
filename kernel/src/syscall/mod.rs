@@ -175,6 +175,7 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     record_call(number);
 }
 
+#[inline(always)]
 fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
     if crate::testpoint::test_call(thread, number) {
         return;

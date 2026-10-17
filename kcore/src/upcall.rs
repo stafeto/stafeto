@@ -4,6 +4,7 @@
 //! Coalesced user entry requests; signal queues and dispositions live at EL0.
 use crate::layout::USER_END;
 use abi::{Error, UpcallControl};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// AArch64 EL0 flags: NZCV, TCO, DIT, SSBS and BTYPE. Mode and IRQ masks stay zero.
 /// Field positions follow Arm Trusted Firmware include/arch/aarch64/arch.h.
@@ -82,7 +83,11 @@ pub struct State {
     depth: u32,
     deferred: u32,
     masked: bool,
-    pending: bool,
+    /// An entry waits for the thread's next way to EL0. The only field that
+    /// a core other than the thread's own reads without the scheduler's
+    /// lock (`is_pending`): the way to EL0 looks at it first and takes the
+    /// lock only for an entry.
+    pending: AtomicBool,
     entering: bool,
     /// Whether a fault of the thread enters instead of ending its process.
     faults: bool,
@@ -155,7 +160,7 @@ impl State {
             depth: 0,
             deferred: 0,
             masked: true,
-            pending: false,
+            pending: AtomicBool::new(false),
             entering: false,
             faults: false,
             faulted: false,
@@ -172,7 +177,7 @@ impl State {
         crate::args::check_start(entry, 0, 1)?;
         self.entry = entry;
         self.masked = true;
-        self.pending = false;
+        self.pending.store(false, Ordering::Release);
         self.faulted = false;
         Ok(())
     }
@@ -181,7 +186,7 @@ impl State {
         if self.entry == 0 {
             return Err(Error::BadState);
         }
-        self.pending = true;
+        self.pending.store(true, Ordering::Release);
         Ok(!self.masked)
     }
     /// `thread_upcall_control` with the parsed operation of x0 and the
@@ -319,16 +324,23 @@ impl State {
         }
         self.esr = esr;
         self.far = far;
-        self.pending = true;
+        self.pending.store(true, Ordering::Release);
         self.faulted = true;
         true
     }
+    /// Whether an entry waits, as the last change under the lock left it.
+    /// A request that another core makes after this look is seen by the
+    /// thread's next entry into the kernel.
+    #[inline(always)]
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
     pub fn prepare(&mut self, pc: u64, flags: u64, sp: u64, long_call: bool) -> Option<u64> {
-        if self.entry == 0 || self.masked || self.deferred != 0 || !self.pending || long_call {
+        if self.entry == 0 || self.masked || self.deferred != 0 || !self.is_pending() || long_call {
             return None;
         }
         self.masked = true;
-        self.pending = false;
+        self.pending.store(false, Ordering::Release);
         self.entering = true;
         self.pc = pc;
         self.flags = flags;
@@ -364,7 +376,7 @@ impl State {
     }
     /// A request deferred by an internal borrow must not strand a new wait.
     pub fn interrupt_wait(&self) -> bool {
-        self.deferred != 0 && self.pending && !self.masked
+        self.deferred != 0 && self.is_pending() && !self.masked
     }
     pub fn can_return(&self) -> bool {
         self.depth != 0 && self.deferred == 0 && self.masked && !self.entering
@@ -468,6 +480,31 @@ mod tests {
         assert_eq!(state.control(TAKE, 0, 0), Ok(Reply::new([1, 0x2000, 0, 0])));
         state.returned().unwrap();
         assert_eq!(state.prepare(0x2000, 0, 0, false), None);
+    }
+    /// The look the way to EL0 takes without the lock follows the state
+    /// that changes under it: a request or a fault sets it, an entry or a
+    /// new binding clears it.
+    #[test]
+    fn the_unlocked_look_follows_request_fault_prepare_and_bind() {
+        let mut state = State::new();
+        assert!(!state.is_pending());
+        state.bind(0x1000).unwrap();
+        state.control(ENABLE, 0, 0).unwrap();
+        assert!(!state.is_pending());
+        state.request().unwrap();
+        assert!(state.is_pending());
+        assert_eq!(state.prepare(0x2000, 0, 0, true), None);
+        assert!(state.is_pending(), "a refused entry dropped the request");
+        assert_eq!(state.prepare(0x2000, 0, 0, false), Some(0x1000));
+        assert!(!state.is_pending(), "an entry left its request standing");
+        state.control(TAKE, 0, 0).unwrap();
+        state.returned().unwrap();
+        state.control(UpcallControl::Faults, 1, 0).unwrap();
+        assert!(state.fault(0x92, 0x10, false));
+        assert!(state.is_pending());
+        state.control(MASK, 0, 0).unwrap();
+        state.bind(0x3000).unwrap();
+        assert!(!state.is_pending(), "a new binding kept the request");
     }
     #[test]
     fn nested_requests_keep_each_original_pc_and_coalesce_pending() {

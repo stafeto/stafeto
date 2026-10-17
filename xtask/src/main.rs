@@ -10552,6 +10552,89 @@ mod tests {
         assert!(found.is_empty(), "{word} in {found:?}");
     }
 
+    /// The state of a thread's upcall entry changes only under the
+    /// scheduler's lock, so that a request from another core meets a whole
+    /// state (SMP preparation): each call of a method that changes it, outside
+    /// the kernel tests, has `locked(` on its line or in the six lines
+    /// before it.
+    #[test]
+    fn upcall_state_changes_run_under_the_scheduler_lock() {
+        let calls = [
+            ".bind(",
+            ".control(",
+            ".control_basic(",
+            ".take(",
+            ".fault(",
+            ".prepare(",
+            ".returned(",
+            ".can_return(",
+        ];
+        let mut bare = Vec::new();
+        let mut seen = 0;
+        for (name, text) in texts(&["kernel/src"]) {
+            if name.starts_with("kernel/src/ktest") {
+                continue;
+            }
+            let lines: Vec<_> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let is_upcall = line.contains("upcall")
+                    || (n > 0 && lines[n - 1].trim_end().ends_with(".upcall"));
+                if !is_upcall || !calls.iter().any(|c| line.contains(c)) {
+                    continue;
+                }
+                seen += 1;
+                let from = n.saturating_sub(6);
+                if !lines[from..=n].iter().any(|l| l.contains("locked(")) {
+                    bare.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            seen >= 8,
+            "the scan found {seen} calls, expected at least 8"
+        );
+        assert!(
+            bare.is_empty(),
+            "upcall state changed without the lock: {bare:?}"
+        );
+    }
+
+    /// The gate before EL0 is one atomic byte: the hot path reads it as a
+    /// hint and `park_selected` decides under the scheduler's lock, and each
+    /// change (suspend, continue, end) writes it with Release.
+    #[test]
+    fn process_gate_is_acquired_and_released() {
+        let text = std::fs::read_to_string(root().join("kernel/src/process/control.rs"))
+            .expect("the file of process control");
+        let hot = text
+            .split("pub fn park_if_suspended")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("park_if_suspended");
+        assert!(
+            hot.contains("gated(") && hot.contains("park_selected"),
+            "the hot read does not hand over to park_selected"
+        );
+        for write in [
+            "fetch_or(SUSPENDED, Ordering::Release)",
+            "fetch_and(!SUSPENDED, Ordering::Release)",
+            "fetch_or(ENDING, Ordering::Release)",
+        ] {
+            assert!(text.contains(write), "no {write}");
+        }
+        assert!(!text.contains("suspended: bool"));
+    }
+
+    /// The count of timers of the system checks its bound and counts in one
+    /// step (kcore::sync::Budget), and nothing reads it apart.
+    #[test]
+    fn system_timers_are_counted_in_one_step() {
+        let text = std::fs::read_to_string(root().join("kernel/src/timer.rs"))
+            .expect("the file of timers");
+        assert!(text.contains("CREATED.take(MAX_SYSTEM_TIMERS)"));
+        assert!(!text.contains("CREATED.load") && !text.contains("CREATED.count"));
+    }
+
     /// The kernel tests wake their threads through timers of programs
     /// (spec 10): the test builds keep no deadline of their own for the
     /// kernel's timer to serve besides the programs' timers.

@@ -12,7 +12,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 pub struct Lock<T> {
     #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
@@ -119,6 +119,43 @@ const EMPTY: u8 = 0;
 const SETTING: u8 = 1;
 const READY: u8 = 2;
 
+/// A count of things the whole system holds, bounded by a maximum that no
+/// race may pass: `take` checks the bound and counts in one step, so two
+/// cores that each see room for one more cannot both take it.
+pub struct Budget(AtomicU32);
+
+impl Budget {
+    pub const fn new() -> Self {
+        Budget(AtomicU32::new(0))
+    }
+
+    /// Counts one more unless `max` are counted already; false then.
+    pub fn take(&self, max: u32) -> bool {
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// Gives back one that `take` counted.
+    pub fn give(&self) {
+        let before = self.0.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before != 0, "a budget gave back more than it took");
+    }
+
+    /// The count now.
+    pub fn count(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A value set once and read ever after, such as what the boot learns: it
 /// lives in static data, because the kernel stack starts over on every
 /// entry from EL0 (spec 8.1). A second `set` fails and hands its value back.
@@ -183,6 +220,36 @@ impl<T> Drop for SetOnce<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Eight threads race for 1 000 places each; none is taken past the
+    /// bound, and every place goes to exactly one thread.
+    #[test]
+    fn budget_never_passes_its_bound_under_a_race() {
+        const MAX: u32 = 1_000;
+        let budget = Budget::new();
+        let won: u32 = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut won = 0;
+                        for _ in 0..MAX {
+                            if budget.take(MAX) {
+                                won += 1;
+                            }
+                            std::thread::yield_now();
+                        }
+                        won
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(won, MAX);
+        assert_eq!(budget.count(), MAX);
+        assert!(!budget.take(MAX));
+        budget.give();
+        assert!(budget.take(MAX), "a place given back was not free again");
+    }
 
     #[test]
     fn guard_gives_access_and_keeps_changes() {
