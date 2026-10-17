@@ -198,7 +198,11 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     crate::obj::serving(u64::from(number));
     dispatch_inner(thread, number);
     // The section of the call ended: the bytes of a message it delivered go
-    // between the buffers outside OBJ, before anything runs (thread.rs).
+    // between the buffers outside OBJ, before anything runs, which
+    // `sched::resume` sees to for a call that comes from EL0; the kernel
+    // tests, which call this and look at the buffers, see to it here
+    // (thread.rs).
+    #[cfg(feature = "ktest")]
     thread::flush_copy();
     record_call(number);
 }
