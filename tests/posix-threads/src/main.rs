@@ -48,6 +48,8 @@ mod entry_calls;
 #[cfg(not(feature = "cancel-input"))]
 mod futex;
 #[cfg(not(feature = "cancel-input"))]
+mod guard;
+#[cfg(not(feature = "cancel-input"))]
 mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
@@ -523,6 +525,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !long::run(parent)
         || !clocks::run(clocks)
         || !capacity::run()
+        || !guard::run()
         || !specific::run()
         || !once::run()
         || !mutex::run()

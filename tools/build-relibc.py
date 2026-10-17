@@ -83,7 +83,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # limit of pthread_atfork, sem_wait that a handler interrupts, scheduling and
 # memory options, the end of fork, guard pages of stacks, join and detach of
 # a thread that is gone, one page of guard by default while the table of mappings has room, a collection when a stack finds no memory, named semaphore waits that ask again; tagged pin-8b8e3b42.
-COMMIT = "8b8e3b4249857ac45451e9841df11aa3a5e69f0c"
+# Thread stacks: the guard is a hole below the stack, made with the stack by one
+# call of the layer (platform interface 20); tagged pin-403a3c56.
+COMMIT = "403a3c56b627b7cf6526649fa192216d36fc8930"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

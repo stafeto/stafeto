@@ -44,6 +44,9 @@ const MAX_CHUNK: usize = 1024;
 /// The places of the table kept for objects of the program's own and the
 /// heap's chunks when freed pages lose their access.
 const RESERVE: usize = 16;
+/// The places of the table kept for the stacks of threads (an object each,
+/// 63 at most): the heap stops cutting its pieces when fewer are left.
+const STACK_RESERVE: usize = 64;
 
 struct Config {
     process: Handle<Process>,
@@ -148,6 +151,13 @@ pub fn probe_committed() -> usize {
     heap(|state| state.space.count(Page::Free) * PAGE + state.space.count(Page::User) * PAGE)
 }
 
+/// The pages of the room in objects of their own, holes of guards
+/// included, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_own_pages() -> usize {
+    heap(|state| state.space.count(Page::Own))
+}
+
 /// Runs `run` holding the heap's lock, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold(run: impl FnOnce()) {
@@ -243,10 +253,16 @@ pub unsafe fn after_fork(
     }
     // The files the parent's shared mappings write to: the child's
     // descriptors are the parent's numbers.
-    let mut backs = [(0usize, None::<posix_map::Back>, true, false); posix_map::MAX_PIECES];
+    let mut backs = [(0usize, None::<posix_map::Back>, true, false, 0usize); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
         let object = state.map.object(piece.object());
-        *slot = (piece.address, object.back, object.may_write, object.dirty);
+        *slot = (
+            piece.address,
+            object.back,
+            object.may_write,
+            object.dirty,
+            piece.guard(),
+        );
     }
     state.map.forget();
     let mut last = None;
@@ -265,13 +281,14 @@ pub unsafe fn after_fork(
                                 entry.shared,
                                 inherited.and_then(|(_, back, ..)| *back),
                             );
-                            if let Some(&(_, _, may_write, dirty)) = inherited {
+                            if let Some(&(_, _, may_write, dirty, _)) = inherited {
                                 object.may_write = may_write;
                                 object.dirty = dirty;
                             }
                             object
                         })?;
                 last = Some(object);
+                restore_hole(state, &backs, entry.address);
                 continue;
             }
             (None, Some(object)) => object,
@@ -284,21 +301,33 @@ pub unsafe fn after_fork(
             entry.offset,
             object,
         )?;
+        restore_hole(state, &backs, entry.address);
     }
     Ok(())
+}
+
+/// The piece the child's loader mapped at `address` has the hole the
+/// parent's piece there had (the room's use is copied whole).
+fn restore_hole(
+    state: &mut State,
+    backs: &[(usize, Option<posix_map::Back>, bool, bool, usize)],
+    address: usize,
+) {
+    let guard = backs
+        .iter()
+        .find(|entry| entry.0 == address)
+        .map_or(0, |entry| entry.4);
+    if guard != 0
+        && let Some(index) = state.map.find(address)
+    {
+        state.map.set_guard(index, guard);
+    }
 }
 
 /// Runs `f` on the pieces of the memory map, by address, under the heap's
 /// lock.
 pub fn regions<R>(f: impl FnOnce(&Map<Handle<Memory>>) -> R) -> R {
     heap(|state| f(&state.map))
-}
-
-/// Whether the kernel's table of mappings has room for the pieces a guard
-/// area cuts: a process with many threads gives its guard areas up when
-/// fewer than 64 places are left.
-pub fn room_for_guard() -> bool {
-    heap(|state| state.room() > 64)
 }
 
 /// The errno of a refused kernel call on a mapping.
@@ -442,10 +471,15 @@ impl State {
         let mut at = address;
         while at < end {
             let index = self.map.find(at).ok_or(ENOMEM)?;
-            let to = end.min(self.map.piece(index).end());
+            let piece = *self.map.piece(index);
+            let to = end.min(piece.end());
             // SAFETY: the caller gives up these pages.
             unsafe { sys::mem_unmap(&config().process, at, (to - at) as u64) }
                 .map_err(|e| self.refused(e))?;
+            if at == piece.address && piece.guard() != 0 {
+                // The piece loses its first page: nothing guards it now.
+                self.space.set(piece.hole(), piece.guard(), Page::Unbacked);
+            }
             let gone = self
                 .map
                 .unmap(index, at, (to - at) / PAGE)
@@ -509,7 +543,8 @@ impl State {
     pub(crate) fn within_data(&self, pages: usize) -> Result<(), i32> {
         let limit = LIMIT_DATA.load(Ordering::Relaxed);
         if limit != u64::MAX {
-            let used = self.space.count(Page::User) + self.space.count(Page::Own);
+            let used =
+                self.space.count(Page::User) + self.space.count(Page::Own) - self.map.guard_pages();
             if ((used + pages) * PAGE) as u64 > limit {
                 return Err(ENOMEM);
             }
@@ -576,9 +611,15 @@ impl State {
     pub(crate) fn take(&mut self, pages: usize) -> Result<usize, i32> {
         for attempt in 0..2 {
             if let Some(address) = self.space.find(pages, Page::Free, false) {
-                if self
-                    .protect_or_compact(address, pages, Access::ReadWrite)
-                    .is_err()
+                // The places the stacks of threads need stay free: below
+                // them the pages come whole, with no cut (`restore_whole`).
+                if self.room() <= STACK_RESERVE {
+                    self.compact();
+                }
+                if self.room() <= STACK_RESERVE
+                    || self
+                        .protect_or_compact(address, pages, Access::ReadWrite)
+                        .is_err()
                 {
                     self.restore_whole(address, pages)?;
                 }
@@ -614,11 +655,19 @@ impl State {
         access: Access,
         shared: bool,
         source: Source,
+        guard: usize,
     ) -> Result<(usize, usize), i32> {
+        // A hole below the pages is kept free of anything else: its pages
+        // are the room's, no entry of the kernel's table.
         let address = match at {
             Some(address) if self.space.all(address, pages, Page::Unbacked) => address,
             Some(_) => return Err(ENOMEM),
-            None => self.space.find(pages, Page::Unbacked, true).ok_or(ENOMEM)?,
+            None => {
+                self.space
+                    .find(pages + guard, Page::Unbacked, true)
+                    .ok_or(ENOMEM)?
+                    + guard * PAGE
+            }
         };
         if self.room() == 0 || !self.map.has_room_for_object() {
             return Err(ENOMEM);
@@ -667,6 +716,11 @@ impl State {
             })
             .map_err(|_| ENOMEM)?;
         self.space.set(address, pages, Page::Own);
+        if guard != 0 {
+            self.space.set(address - guard * PAGE, guard, Page::Own);
+            let piece = self.map.find(address).ok_or(ENOMEM)?;
+            self.map.set_guard(piece, guard);
+        }
         if access == Access::None {
             // The object has one piece and the table has room for the
             // piece, so only the failure of the kernel can refuse this.

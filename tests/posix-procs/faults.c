@@ -25,6 +25,7 @@
  *   fault inside the handler of another fault enters its own handler.
  */
 #include <setjmp.h>
+#include <pthread.h>
 #include <sys/mman.h>
 
 _Static_assert(MINSIGSTKSZ >= 1904 + 4096, "the stack holds the entry frame and the delivery");
@@ -462,6 +463,75 @@ static int f_fault_in_fault(void) {
     return f_stage == 2 ? 0 : 20 + f_stage % 70;
 }
 
+/* The guard of a thread's stack is a hole below it. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *g_base;
+static size_t g_size, g_guard;
+static volatile int g_ready;
+
+static void g_note(void) {
+    pthread_attr_t attr;
+    void *base;
+    if (pthread_getattr_np(pthread_self(), &attr) || pthread_attr_getstack(&attr, &base, &g_size)
+        || pthread_attr_getguardsize(&attr, &g_guard))
+        _exit(90);
+    g_base = base;
+}
+/* Writes the lowest word of its stack (allowed), then `below` bytes under it. */
+static size_t g_below;
+static void *g_writer(void *arg) {
+    (void)arg;
+    g_note();
+    *(volatile char *)g_base = 1;
+    if (g_guard < g_below || g_guard == 0) _exit(91);
+    *(volatile char *)(g_base - g_below) = 1;
+    return (void *)1;
+}
+static int g_thread_run(size_t guard, size_t below) {
+    pthread_attr_t attr;
+    pthread_t t;
+    pthread_attr_init(&attr);
+    pthread_attr_setguardsize(&attr, guard);
+    g_below = below;
+    if (pthread_create(&t, &attr, g_writer, NULL)) return 1;
+    pthread_join(t, NULL);
+    return 2; /* the write went through */
+}
+static int g_one_page(void) { return g_thread_run(4096, 1); }
+static int g_sixteen_pages(void) { return g_thread_run(16 * 4096, 16 * 4096); }
+static int g_top_of_hole(void) { return g_thread_run(4096, 4096); }
+static void *g_parked(void *arg) {
+    (void)arg;
+    g_note();
+    g_ready = 1;
+    pthread_mutex_lock(&g_lock);
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+/* A live thread of the parent keeps its guard in a child of fork: the
+ * stack is there, the hole below it is not. */
+static int g_forked_hole(void) {
+    pthread_t t;
+    pthread_mutex_lock(&g_lock);
+    g_ready = 0;
+    if (pthread_create(&t, NULL, g_parked, NULL)) return 1;
+    while (!g_ready) sched_yield();
+    char *base = g_base;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        *(volatile char *)base = 1; /* its stack: mapped */
+        *(volatile char *)(base - 8) = 1; /* its guard: SIGSEGV */
+        _exit(3);
+    }
+    pthread_mutex_unlock(&g_lock);
+    pthread_join(t, NULL);
+    if (pid < 0) return 2;
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) return 3;
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV ? 0 : 4;
+}
+
 static void f_child(const char *what, int (*fn)(void), int code, int sig) {
     fflush(stdout);
     pid_t pid = fork();
@@ -508,6 +578,10 @@ static int faults_role(void) {
     f_child("load from address 0 without a handler", f_default_null, 0, SIGSEGV);
     f_child("blocked SIGSEGV ends the process", f_blocked, 0, SIGSEGV);
     f_child("a fault inside the handler of a fault", f_fault_in_fault, 0, 0);
+    f_child("a write into the guard of a thread's stack", g_one_page, 0, SIGSEGV);
+    f_child("a write 16 pages down in a guard of 16 pages", g_sixteen_pages, 0, SIGSEGV);
+    f_child("a write at the top of the guard", g_top_of_hole, 0, SIGSEGV);
+    f_child("a child of fork has the guard of its parent's thread", g_forked_hole, 0, 0);
     if (!failures) printf("posix-procs: faults: sigaltstack, SA_ONSTACK, classes of faults, nesting ok\n");
     return failures != 0;
 }

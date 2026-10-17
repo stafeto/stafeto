@@ -81,12 +81,19 @@ unsafe extern "C" fn dupper(_: *mut c_void) -> *mut c_void {
 /// makes file requests with a signal raised inside the files' section,
 /// and finds the deepest painted byte that changed.
 unsafe extern "C" fn small_stack(_: *mut c_void) -> *mut c_void {
-    let Some(block) = threads::probe_block(ffi::pthread_self()) else {
+    // The stack is an object of its own; relibc says where it lies.
+    let mut attr = ffi::Attr::new();
+    let mut bottom = ptr::null_mut();
+    let mut size = 0usize;
+    // SAFETY: the calling thread is live; the out parameters are locals.
+    if unsafe {
+        ffi::pthread_getattr_np(ffi::pthread_self(), &mut attr) != 0
+            || ffi::pthread_attr_getstack(&attr, &mut bottom, &mut size) != 0
+    } {
         return ptr::null_mut();
-    };
-    // The stack lies right below the page of the TCB.
-    let top = ptr::from_ref(block) as usize & !0xfff;
-    let bottom = top - PTHREAD_STACK_MIN;
+    }
+    let bottom = bottom as usize;
+    let top = bottom + size;
     let marker = 0u8;
     let here = ptr::from_ref(&marker) as usize;
     let painted = here - 512;

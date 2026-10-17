@@ -26,9 +26,9 @@ use core::mem::MaybeUninit;
 pub const MAX_PIECES: usize = MAX_MAPPINGS as usize;
 
 /// The objects of a map at most. Few pieces show an object of their own: the
-/// heap's chunks, the loader's segments and the large, shared and file
-/// mappings.
-pub const MAX_OBJECTS: usize = 32;
+/// heap's chunks, the loader's segments, the large, shared and file
+/// mappings, and the stack of each thread (64 threads at most).
+pub const MAX_OBJECTS: usize = 96;
 
 /// The page of the map.
 pub const PAGE: usize = 4096;
@@ -41,6 +41,11 @@ pub struct Piece {
     pub address: usize,
     pages: u32,
     offset: u32,
+    /// The pages just below `address` that no object shows and that nothing
+    /// else may take: the guard of a thread's stack. They are no entry of
+    /// the kernel's table and cost no frame; a reference to one is a
+    /// translation fault.
+    guard: u16,
     access: u8,
     /// The index of the object in the map.
     object: u8,
@@ -58,6 +63,7 @@ impl Piece {
             address,
             pages: u32::try_from(pages).expect("pages of a piece"),
             offset: u32::try_from(offset).expect("offset of a piece"),
+            guard: 0,
             access: access.raw() as u8,
             object: u8::try_from(object).expect("object of a piece"),
         }
@@ -72,6 +78,17 @@ impl Piece {
         self.offset as usize
     }
 
+    /// The pages of the hole just below the piece.
+    pub const fn guard(&self) -> usize {
+        self.guard as usize
+    }
+
+    /// The first address of the hole below the piece (the piece's own when
+    /// it has none).
+    pub const fn hole(&self) -> usize {
+        self.address - self.guard as usize * PAGE
+    }
+
     pub fn access(&self) -> Access {
         Access::from_raw(u64::from(self.access)).expect("an access of a piece")
     }
@@ -79,6 +96,13 @@ impl Piece {
     pub fn with_access(self, access: Access) -> Piece {
         Piece {
             access: access.raw() as u8,
+            ..self
+        }
+    }
+
+    pub fn with_guard(self, pages: usize) -> Piece {
+        Piece {
+            guard: u16::try_from(pages).expect("guard of a piece"),
             ..self
         }
     }
@@ -409,6 +433,7 @@ impl<H> Map<H> {
         }
         let mut at = index;
         let object = piece.object();
+        // The hole below the piece stays with the piece's first part.
         if before != 0 {
             self.insert_piece(
                 at,
@@ -418,7 +443,8 @@ impl<H> Map<H> {
                     piece.access(),
                     piece.offset(),
                     object,
-                ),
+                )
+                .with_guard(piece.guard()),
             );
             at += 1;
         }
@@ -428,7 +454,8 @@ impl<H> Map<H> {
             piece.access(),
             piece.offset() + before,
             object,
-        );
+        )
+        .with_guard(if before == 0 { piece.guard() } else { 0 });
         if after != 0 {
             self.insert_piece(
                 at + 1,
@@ -442,6 +469,47 @@ impl<H> Map<H> {
             );
         }
         Ok(at)
+    }
+
+    /// The piece at `index` has `pages` pages of hole below it (0 for none).
+    pub fn set_guard(&mut self, index: usize, pages: usize) {
+        let piece = *self.piece(index);
+        *self.piece_mut(index) = piece.with_guard(pages);
+    }
+
+    /// A range of `pages` pages from `address` is given up: every hole it
+    /// touches is released as far as the range takes it, and what lies
+    /// below the range goes with it (a hole is one run next to its piece).
+    /// A range that reaches the piece takes the whole hole; one that ends
+    /// inside the hole leaves the pages from its end on. `freed(address,
+    /// pages)` gets each run of the hole given up.
+    pub fn trim_holes(
+        &mut self,
+        address: usize,
+        pages: usize,
+        mut freed: impl FnMut(usize, usize),
+    ) {
+        let end = address.saturating_add(pages.saturating_mul(PAGE));
+        for index in 0..self.len {
+            let piece = *self.piece(index);
+            if piece.guard == 0 || piece.address <= address || end <= piece.hole() {
+                continue;
+            }
+            // The range starts below the piece and ends above the hole's
+            // start: it touches the hole.
+            let keep = if end >= piece.address {
+                0
+            } else {
+                (piece.address - end) / PAGE
+            };
+            freed(piece.hole(), piece.guard() - keep);
+            self.set_guard(index, keep);
+        }
+    }
+
+    /// The pages of all the holes.
+    pub fn guard_pages(&self) -> usize {
+        self.iter().map(Piece::guard).sum()
     }
 
     /// The pages of the range inside the piece at `index` get `access`
@@ -557,11 +625,11 @@ mod tests {
         assert_eq!(map.iter().last().unwrap().end(), 0x1006_4000);
     }
 
-    /// The 129th piece is refused, and the map still holds the 128; the 33rd
+    /// The 129th piece is refused, and the map still holds the 128; the 97th
     /// object is refused too.
     #[test]
-    fn a_map_holds_128_pieces_and_32_objects() {
-        assert_eq!((MAX_PIECES, MAX_OBJECTS), (128, 32));
+    fn a_map_holds_128_pieces_and_96_objects() {
+        assert_eq!((MAX_PIECES, MAX_OBJECTS), (128, 96));
         let mut map = Map::new();
         let one = map
             .push(0x1000_0000, 1, Access::ReadWrite, 0, object(0, 1))
@@ -763,5 +831,62 @@ mod tests {
         assert_eq!(map.edges(0x11000, 1), 1);
         assert_eq!(map.edges(0x10000, 1), 1);
         assert_eq!(map.edges(0x10000, 4), 0);
+    }
+
+    /// A hole stays with the first part of a cut piece and goes with the
+    /// pieces that lose their first page.
+    #[test]
+    fn a_hole_follows_the_first_part_of_its_piece() {
+        let mut map = Map::new();
+        map.push(0x20000, 8, Access::ReadWrite, 0, object(1, 8))
+            .unwrap();
+        map.set_guard(0, 2);
+        assert_eq!((map.piece(0).guard(), map.piece(0).hole()), (2, 0x1E000));
+        assert_eq!(map.guard_pages(), 2);
+        map.protect(0, 0x23000, 2, Access::Read).unwrap();
+        assert_eq!(map.iter().map(|p| p.guard()).collect::<Vec<_>>(), [2, 0, 0]);
+        // The first page cut away: the second piece starts a new run.
+        map.protect(0, 0x20000, 1, Access::Read).unwrap();
+        assert_eq!(
+            map.iter().map(|p| p.guard()).collect::<Vec<_>>(),
+            [2, 0, 0, 0]
+        );
+        // Access changes keep the hole.
+        map.protect(0, 0x20000, 1, Access::ReadWrite).unwrap();
+        assert_eq!(map.piece(0).guard(), 2);
+        assert_eq!(map.guard_pages(), 2);
+    }
+
+    /// Giving up a range frees the hole as far as the range takes it.
+    #[test]
+    fn a_range_frees_the_hole_it_touches() {
+        let mut freed = Vec::new();
+        let mut run = |map: &mut Map<u32>, address: usize, pages: usize| {
+            freed.clear();
+            map.trim_holes(address, pages, |a, n| freed.push((a, n)));
+            (freed.clone(), map.piece(0).guard())
+        };
+        let make = || {
+            let mut map = Map::new();
+            map.push(0x20000, 4, Access::ReadWrite, 0, object(1, 4))
+                .unwrap();
+            map.set_guard(0, 3); // hole 0x1D000..0x20000
+            map
+        };
+        // The stack alone, or a range above the hole: nothing.
+        assert_eq!(run(&mut make(), 0x20000, 4), (vec![], 3));
+        assert_eq!(run(&mut make(), 0x30000, 4), (vec![], 3));
+        // A range below the hole: nothing.
+        assert_eq!(run(&mut make(), 0x10000, 3), (vec![], 3));
+        // The whole hole and the stack, or the hole and more.
+        assert_eq!(run(&mut make(), 0x1D000, 7), (vec![(0x1D000, 3)], 0));
+        assert_eq!(run(&mut make(), 0x10000, 0x20), (vec![(0x1D000, 3)], 0));
+        // The top of the hole to the stack: all of it.
+        assert_eq!(run(&mut make(), 0x1F000, 1), (vec![(0x1D000, 3)], 0));
+        // The lowest page of the hole: the pages from its end on are kept.
+        assert_eq!(run(&mut make(), 0x1D000, 1), (vec![(0x1D000, 1)], 2));
+        // A range that ends inside the hole frees what lies below its end.
+        assert_eq!(run(&mut make(), 0x1C000, 2), (vec![(0x1D000, 1)], 2));
+        assert_eq!(run(&mut make(), 0x1E000, 1), (vec![(0x1D000, 2)], 1));
     }
 }

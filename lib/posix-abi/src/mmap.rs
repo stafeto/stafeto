@@ -75,6 +75,11 @@ fn whole_pages(len: usize) -> Result<usize, i32> {
 /// the heap lose their access, those of an object of their own are
 /// unmapped. Pages in no mapping are left alone.
 fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
+    // The holes the range touches go first: they are no mapping, and the
+    // runs below must not see them.
+    state.map.trim_holes(address, pages, |at, count| {
+        state.space.set(at, count, Page::Unbacked);
+    });
     // The runs first: the calls below change the states.
     let mut list = [(Page::Free, 0usize, 0usize); posix_map::MAX_PIECES * 2];
     let mut n = 0;
@@ -261,12 +266,12 @@ fn mmap0(
                 })
             } else {
                 state
-                    .make_own(Some(addr), pages, first, shared, source)
+                    .make_own(Some(addr), pages, first, shared, source, 0)
                     .map(|(_, at)| at)
             }
         } else if shared || pages >= OWN_FROM {
             state
-                .make_own(None, pages, first, shared, source)
+                .make_own(None, pages, first, shared, source, 0)
                 .map(|(_, at)| at)
         } else {
             let at = state.take(pages)?;
@@ -409,6 +414,38 @@ pub fn fd_of_key(key: u64) -> Option<i32> {
 /// descriptors and tells the process service of the keys.
 pub fn closed_files(out: &mut [(i32, u64, bool)]) -> usize {
     heap(|state| state.take_closed(out))
+}
+
+/// The stack of a thread (`pthread_create`): an object of its own of `size`
+/// bytes, writable, with `guard` bytes of hole just below it: pages of the
+/// room that no mapping, no later `mmap` and no entry of the kernel's table
+/// takes, so that a stack that overflows faults there and the guard costs
+/// no memory and no place in the table. Returns the lowest address of the
+/// stack. `munmap` of the stack with its guard (from the address `guard`
+/// bytes below, `size + guard` bytes) gives both back.
+pub fn stack_map(size: usize, guard: usize) -> Result<usize, i32> {
+    load_limits();
+    if size == 0 || !size.is_multiple_of(PAGE) || !guard.is_multiple_of(PAGE) {
+        return Err(EINVAL);
+    }
+    let (pages, hole) = (size / PAGE, guard / PAGE);
+    if hole > posix_map::space::ROOM_PAGES {
+        return Err(ENOMEM);
+    }
+    crate::resources::future_check(size as u64)?;
+    heap(|state| {
+        state.within_data(pages)?;
+        state
+            .make_own(
+                None,
+                pages,
+                Access::ReadWrite,
+                false,
+                Source::anonymous(),
+                hole,
+            )
+            .map(|(_, at)| at)
+    })
 }
 
 /// `munmap`: the pages of the range lose their mapping; a range with no

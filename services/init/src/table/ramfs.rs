@@ -553,10 +553,9 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// semaphores, the offsets of the asks) added 5: 482 measured, and 540 pages
 /// leave 10.7%. Goal I (64 signals with their tables of claims, the queue
 /// of the library's timers, the claims of the memory limits) added 12: 494
-/// measured; the guard page of each of the seven workers' stacks (a page the
-/// kernel counts while the stack is made) brought it to 501, and 560 pages
-/// leave 10.5%.
-const STEPS_QUOTA: u64 = 560 * PAGE;
+/// measured. The guard of a stack is a hole that takes no frame, so the
+/// seven workers' stacks add nothing: 544 pages leave 10.1%.
+const STEPS_QUOTA: u64 = 544 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retains 572 charged pages. Up to four prepaid mapping
