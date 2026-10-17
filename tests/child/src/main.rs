@@ -394,6 +394,7 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
         start: Some(start),
         priority: level,
         policy: Policy::Fifo,
+        cpu: 0,
     };
     // SAFETY: only the loader uses WINDOW.
     let g = unsafe { loader::load(&own, &program, WINDOW, params) }.map_err(|(e, _)| e)?;

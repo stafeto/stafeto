@@ -97,7 +97,13 @@ pub fn peek_other(t: NonNull<Thread>, k: usize, first: u64) -> Option<(LogBatch,
     // their owners write them.
     Some(unsafe {
         Ring::peek_shared(ring, first, |i, r| {
-            thread::write_words(t, i * LOG_RECORD, &r.words())
+            let mut words = r.words();
+            // Byte 10, zero in a record that `take` gives, says the kernel
+            // showed this one on its console: the driver that reads the
+            // ring of another CPU shows the rest, among them what that CPU
+            // said before the driver started (abi::LOG_SHOWN_AT).
+            words[abi::LOG_SHOWN_AT / 8] |= u64::from(r.shown) << (8 * (abi::LOG_SHOWN_AT % 8));
+            thread::write_words(t, i * LOG_RECORD, &words)
         })
     })
 }

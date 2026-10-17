@@ -431,42 +431,19 @@ impl Uart {
                 return;
             }
             let log = &self.log;
-            // Ring 0 is this CPU's, taken; the others are peeked at from
-            // the end they had when the driver first looked (what they said
-            // before, the kernel showed or the driver's start took), and
+            // Ring 0 is this CPU's, taken; the others are peeked at, and
             // the records of all come out in the order of their times.
-            let mut fetch = |k: usize, cursor: &mut u64, into: &mut uart::log::Records| {
-                if k == 0 {
-                    return Some(sys::log_take(log, into).unwrap_or(LogBatch {
-                        count: 0,
-                        lost: 0,
-                        left: 0,
-                    }));
-                }
-                // The first look asks for the end: a cursor past every record.
-                let started = *cursor != 0;
-                let first = if started {
-                    *cursor
-                } else {
-                    (1 << abi::LOG_OTHER_SHIFT) - 1
-                };
-                match sys::log_peek_other(log, k as u64, first, into) {
-                    Ok((batch, next)) => {
-                        *cursor = next;
-                        Some(if !started {
-                            LogBatch {
-                                count: 0,
-                                lost: 0,
-                                left: batch.left,
-                            }
-                        } else {
-                            batch
-                        })
-                    }
-                    Err(_) => None,
-                }
+            let mut take = |into: &mut uart::log::Records| {
+                sys::log_take(log, into).unwrap_or(LogBatch {
+                    count: 0,
+                    lost: 0,
+                    left: 0,
+                })
             };
-            let batch = sources.batch(&mut fetch, records);
+            let mut peek = |k: u64, cursor: u64, into: &mut uart::log::Records| {
+                sys::log_peek_other(log, k, cursor, into).ok()
+            };
+            let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             uart::log::text(records, batch, |bytes| {
                 // A batch fits: twelve records and the line of those lost.

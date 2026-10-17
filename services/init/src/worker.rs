@@ -336,6 +336,11 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
         ceiling: record.ceiling,
         priority: record.priority,
         policy: Policy::Fifo,
+        // The driver of the console and its log (the record that has `log`)
+        // runs on CPU 1 when the machine has one: its requests come from
+        // the shell on CPU 0 across CPUs (SMP stage 4); with one CPU the
+        // loader leaves it on CPU 0.
+        cpu: if record.log { 2 } else { 0 },
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;

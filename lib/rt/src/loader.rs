@@ -37,6 +37,10 @@ pub struct Params<'a> {
     /// The first thread's priority and policy.
     pub priority: u8,
     pub policy: Policy,
+    /// The CPU of the first thread (SMP stage 4): 0 for the CPU of the
+    /// caller, n for CPU n - 1 when it is up; on a machine without it the
+    /// thread goes to the caller's CPU.
+    pub cpu: u8,
 }
 
 /// A process that `load` made and its first thread.
@@ -91,13 +95,14 @@ pub unsafe fn load(
     )?;
     // SAFETY: the caller's promise for `window`.
     let filled = unsafe {
-        fill(
+        fill_on(
             own,
             &process,
             program,
             window,
             params.priority,
             params.policy,
+            params.cpu,
         )
     };
     match filled {
@@ -131,6 +136,8 @@ pub struct SpawnParams<'a> {
     pub ceiling: u8,
     pub priority: u8,
     pub policy: Policy,
+    /// The CPU of the first thread (`Params::cpu`).
+    pub cpu: u8,
 }
 
 /// A program `spawn` loaded, whose first thread does not run yet: its
@@ -185,6 +192,7 @@ pub unsafe fn spawn(
         start: Some(b),
         priority: params.priority,
         policy: params.policy,
+        cpu: params.cpu,
     };
     // SAFETY: the caller's promise for `window`.
     let child = unsafe { load(own, program, window, load_params) }.map_err(|(e, _)| e)?;
@@ -254,6 +262,23 @@ pub unsafe fn fill(
     priority: u8,
     policy: Policy,
 ) -> Result<Handle<Thread>, Error> {
+    // SAFETY: the promise of `fill`'s caller.
+    unsafe { fill_on(own, process, program, window, priority, policy, 0) }
+}
+
+/// `fill` with the first thread on CPU `cpu` - 1 (`Params::cpu`).
+///
+/// # Safety
+/// As for `load`.
+pub unsafe fn fill_on(
+    own: &Handle<Process>,
+    process: &Handle<Process>,
+    program: &Program<'_>,
+    window: usize,
+    priority: u8,
+    policy: Policy,
+    cpu: u8,
+) -> Result<Handle<Thread>, Error> {
     for part in Part::ALL {
         let segment = &program.segments[part as usize];
         if segment.mem_size > 0 {
@@ -269,7 +294,7 @@ pub unsafe fn fill(
     };
     // SAFETY: as above.
     unsafe { place(own, process, &segment, Access::ReadWrite, window) }?;
-    first_thread(process, program.entry, priority, policy)
+    first_thread(process, program.entry, priority, policy, cpu)
 }
 
 /// A new memory object with the whole pages of `segment`, its file bytes
@@ -330,15 +355,24 @@ fn first_thread(
     entry: u64,
     priority: u8,
     policy: Policy,
+    cpu: u8,
 ) -> Result<Handle<Thread>, Error> {
-    thread_at(
-        process,
-        entry,
-        INIT_STACK_TOP,
-        START_CHANNEL.0,
-        priority,
-        policy,
-    )
+    let at = |cpu| {
+        thread_on(
+            process,
+            entry,
+            INIT_STACK_TOP,
+            START_CHANNEL.0,
+            priority,
+            policy,
+            cpu,
+        )
+    };
+    match at(cpu) {
+        // A machine with fewer CPUs: the thread goes where the caller is.
+        Err(Error::InvalidArgs) if cpu != 0 => at(0),
+        first => first,
+    }
 }
 
 /// thread_create in `process`, another process the caller made, at
@@ -354,13 +388,27 @@ pub fn thread_at(
     priority: u8,
     policy: Policy,
 ) -> Result<Handle<Thread>, Error> {
+    thread_on(process, entry, stack, x0, priority, policy, 0)
+}
+
+/// `thread_at` on CPU `cpu` - 1 (thread_create x5, abi::THREAD_CPU_SHIFT);
+/// 0 is the CPU of the caller.
+pub fn thread_on(
+    process: &Handle<Process>,
+    entry: u64,
+    stack: u64,
+    x0: u64,
+    priority: u8,
+    policy: Policy,
+    cpu: u8,
+) -> Result<Handle<Thread>, Error> {
     let x = [
         process.raw().0,
         entry,
         stack,
         x0,
         priority.into(),
-        policy as u64,
+        policy as u64 | u64::from(cpu) << abi::THREAD_CPU_SHIFT,
         INIT_MSGBUF,
         0,
         0,

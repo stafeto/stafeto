@@ -815,6 +815,9 @@ pub const LOG_BATCH: usize = 12;
 /// Where a record holds its kind, the length of its text and its text.
 pub const LOG_KIND_AT: usize = 8;
 pub const LOG_LEN_AT: usize = 9;
+/// Byte 10 of a record that a peek at another CPU's ring gives: 1 when the
+/// kernel showed it on its console, 0 otherwise and in every other read.
+pub const LOG_SHOWN_AT: usize = 10;
 pub const LOG_TEXT_AT: usize = 16;
 /// The kind of a record of debug_write's bytes.
 pub const LOG_TEXT_KIND: u8 = 1;

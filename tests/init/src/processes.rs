@@ -401,6 +401,7 @@ pub(crate) fn spawn_under(
         ceiling,
         priority,
         policy: Policy::Fifo,
+        cpu: 0,
     };
     // SAFETY: only the loader maps and uses LOADER_WINDOW.
     Ok(unsafe { loader::spawn(&own(), &program, LOADER_WINDOW, params) })
