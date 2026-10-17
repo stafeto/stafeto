@@ -400,8 +400,8 @@ pub fn run(select: Select, jobs: usize) -> Result<(), String> {
     run_part(select, jobs, None)
 }
 
-/// The `index`-th of `count` parts of the tests listed in PASSING (every
-/// `count`-th name of the sorted list, from `index`), run and checked on
+/// The `index`-th of `count` parts of the tests listed in PASSING (the `index`-th
+/// run of the sorted list cut into `count` runs), run and checked on
 /// their own (`cargo xtask ci --group open-posix-N`).
 pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Result<(), String> {
     let pinned = matches!(select, Select::Pinned);
@@ -573,15 +573,19 @@ pub fn run_part(select: Select, jobs: usize, part: Option<(usize, usize)>) -> Re
 }
 
 /// The lines of the list of passes `list` that fall to part `index` of
-/// `count`.
+/// `count`: a run of neighbours, so that the tests that share a boot in a
+/// whole run mostly share it in a part.
 fn part_of(list: &str, index: usize, count: usize) -> String {
-    list.lines()
+    let names: Vec<&str> = list
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .enumerate()
-        .filter(|(n, _)| n % count == index)
-        .map(|(_, l)| format!("{l}\n"))
-        .collect()
+        .collect();
+    let (from, to) = (
+        names.len() * index / count,
+        names.len() * (index + 1) / count,
+    );
+    names[from..to].iter().map(|l| format!("{l}\n")).collect()
 }
 
 #[cfg(test)]
@@ -601,7 +605,7 @@ mod tests {
             .collect();
         all.sort();
         assert_eq!(all, ["a/1", "a/2", "a/3", "a/4", "a/5"]);
-        assert_eq!(part_of(list, 1, 3), "a/2\na/5\n");
+        assert_eq!(part_of(list, 1, 3), "a/2\na/3\n");
     }
 
     fn row(name: &str, result: &'static str) -> Row {
