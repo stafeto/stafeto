@@ -62,9 +62,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # thread marks the ones it holds); a late request of cancellation acts when
 # the thread enables it or sets the asynchronous type; strtod converts a
 # decimal constant whole; wordexp prints with printf; aio signals with
-# sigqueue; sysconf says 64 descriptors; SIGSTKSZ is 48 KiB; tagged
-# pin-c1cced60.
-COMMIT = "c1cced602e669ad5beeb019f74f96d08913dc3d9"
+# sigqueue; sysconf says 64 descriptors; SIGSTKSZ is 48 KiB; a timed wait
+# whose deadline lies past a second ends at the deadline (the difference of
+# two times borrowed a second wrongly); tagged pin-0fdf038a.
+COMMIT = "0fdf038a72bd7871e289dbd9abb3f3706e721099"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

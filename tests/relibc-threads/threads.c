@@ -1163,6 +1163,59 @@ static void cancel_when_enabled(void) {
     printf("relibc-threads: a request acts when asynchronous cancellation is enabled ok\n");
 }
 
+/* A timed wait whose deadline lies past a whole second of CLOCK_REALTIME
+ * ends at the deadline: the difference between the deadline and now, which
+ * borrows a second, was a second too long. */
+#include <semaphore.h>
+static long long wait_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+static void at_second_end(void) {
+    struct timespec now;
+    do {
+        clock_gettime(CLOCK_REALTIME, &now);
+    } while (now.tv_nsec < 995000000L);
+}
+static void timed_waits_across_a_second(void) {
+    sem_t sem;
+    pthread_mutex_t held = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t other = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+    CHECK(sem_init(&sem, 0, 0) == 0);
+    for (int round = 0; round < 2; round++) {
+        struct timespec deadline;
+        long long start;
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(sem_timedwait(&sem, &deadline) == -1 && errno == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(pthread_mutex_lock(&held) == 0);
+        CHECK(pthread_mutex_timedlock(&held, &deadline) == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        CHECK(pthread_mutex_unlock(&held) == 0);
+        at_second_end();
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec++;
+        deadline.tv_nsec = 0;
+        start = wait_ns();
+        CHECK(pthread_mutex_lock(&other) == 0);
+        CHECK(pthread_cond_timedwait(&never, &other, &deadline) == ETIMEDOUT);
+        CHECK(wait_ns() - start < 100000000LL);
+        CHECK(pthread_mutex_unlock(&other) == 0);
+    }
+    printf("relibc-threads: timed waits across a second end at their deadline ok\n");
+}
+
 int main(void) {
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
@@ -1195,6 +1248,8 @@ int main(void) {
     stage = 12;
     robust_mutexes();
     cancel_when_enabled();
+    stage = 13;
+    timed_waits_across_a_second();
     printf("relibc-threads: ok\n");
     return 0;
 }

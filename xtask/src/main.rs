@@ -5646,6 +5646,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
         &output,
         "relibc-threads: a request acts when asynchronous cancellation is enabled ok",
     )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: timed waits across a second end at their deadline ok",
+    )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");
     Ok(())
