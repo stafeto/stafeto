@@ -1489,7 +1489,9 @@ impl Processes {
                     || proto_process::job::class(signal).is_some()
             })
         }) else {
-            return refuse(proto_process::NO_PROCESS);
+            return self
+                .init_pid(index, pid, signal)
+                .unwrap_or_else(|| refuse(proto_process::NO_PROCESS));
         };
         match self.deliver(index, target, signal) {
             Delivery::Done | Delivery::Again => Answer::Status(Status::Ok),
@@ -1630,6 +1632,21 @@ impl Processes {
         }
     }
 
+    /// PID 1 is init, which has no record of its own: it belongs to root and
+    /// ignores what it is sent, so a signal to it is allowed to root alone
+    /// (PERMISSION for anyone else) and goes nowhere. None for another PID.
+    fn init_pid(&self, sender: usize, pid: i32, signal: u8) -> Option<Answer> {
+        if pid != INIT_PID as i32 || signal > SIGNAL_MAX {
+            return None;
+        }
+        let creds = self.records.get(sender)?.credentials;
+        Some(if creds.euid == 0 {
+            Answer::Status(Status::Ok)
+        } else {
+            refuse(proto_process::PERMISSION)
+        })
+    }
+
     /// sigqueue of the record in `index`: pid u32, signal u32 and the value
     /// u64. One process only (NO_PROCESS for a PID of 0 or below), the
     /// rules of kill; AGAIN when the signal waits already and no other
@@ -1654,7 +1671,9 @@ impl Processes {
                         || proto_process::job::class(signal).is_some()
                 })
         }) else {
-            return refuse(proto_process::NO_PROCESS);
+            return self
+                .init_pid(index, pid, signal)
+                .unwrap_or_else(|| refuse(proto_process::NO_PROCESS));
         };
         match self.deliver_with(index, target, signal, SI_QUEUE, value) {
             Delivery::Done => Answer::Status(Status::Ok),

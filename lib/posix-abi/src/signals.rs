@@ -1116,6 +1116,9 @@ pub fn suspend(mask: SigSet) -> i32 {
         }
     }
     block.mask.store(old, Ordering::SeqCst);
+    // A signal of the process that the temporary mask held back waits on
+    // the page: the old mask lets it through now.
+    route();
     if thread_pending(block) & !old != 0 {
         deliver_now();
     }
