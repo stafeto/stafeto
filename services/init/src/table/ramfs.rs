@@ -591,7 +591,9 @@ pub const OS_TEST_TABLE: &[Record] = &[
 ];
 
 /// The quota of the runner of os-test, which each test it starts gets too.
-/// 610 pages. Measured on the whole of basic and Open POSIX (bisected on the
+/// 1,280 pages (it was 610: tests of Open POSIX start 30 threads, each with a
+/// stack of 64 KiB, and the thread tests of Open POSIX that run longer than
+/// the heap allows end in EAGAIN or OOM below that). The 610 pages were measured on the whole of basic and Open POSIX (bisected on the
 /// quota with the tests that passed before): 554 pages pass and 553 do not,
 /// the tightest being pthread_cond_wait/2-2, pthread_cond_timedwait/2-4 and
 /// 2-7 (a stack is mapped for each thread, one after the other) and
@@ -600,7 +602,7 @@ pub const OS_TEST_TABLE: &[Record] = &[
 /// and the checks of the pages of a segment, which the programs that use
 /// semaphores carry, and 512 before the files, shared memory and the
 /// rendezvous of the process service.
-const OS_TEST_QUOTA: u64 = 610 * PAGE;
+const OS_TEST_QUOTA: u64 = 1280 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {

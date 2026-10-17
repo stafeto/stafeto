@@ -75,7 +75,7 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Review of the pin: a thread timer is deleted under its lock, mq_close removes
 # only the registration of its own process, lio_listio past the limit is
 # EINVAL, _PC_SYNC_IO is -1; tagged pin-71a760df.
-COMMIT = "9a30e83e3a63ac8c9287f9c96ebbf680b565ac57"
+COMMIT = "0cb7de0224a1ea2c87f315439df8bb46b9c8017b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
