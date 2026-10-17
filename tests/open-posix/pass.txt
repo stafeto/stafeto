@@ -351,6 +351,7 @@ conformance/interfaces/clock_settime/3-1
 conformance/interfaces/clock_settime/5-1
 conformance/interfaces/clock_settime/5-2
 conformance/interfaces/clock_settime/6-1
+conformance/interfaces/clock_settime/6-9
 conformance/interfaces/clock_settime/8-1
 conformance/interfaces/ctime/1-1
 conformance/interfaces/difftime/1-1

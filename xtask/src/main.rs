@@ -7092,7 +7092,7 @@ fn ls_probe() -> Result<(), String> {
     const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
-    for entry in ["etc", "tmp", "motd"] {
+    for entry in ["etc", "tmp", "motd-broken-on-purpose"] {
         qemu::expect_line(&output, entry)?;
     }
     println!("BusyBox ls guest probe passed");
