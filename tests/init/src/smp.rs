@@ -239,6 +239,12 @@ fn suspend_and_kill() -> Outcome {
     kid.start()?;
     kid.serve(Role::SmpSpin, &[n as u64, LEVEL.into()], &[Gift::Own])?;
     reset_kid_marks();
+    reset_marks();
+    // A thread of init's own, below the child's, on CPU 1: it runs once the
+    // child's thread there is parked, and keeps that CPU at EL0 while the
+    // wait for the quiescent points goes on (qsbr::synchronize): only a way
+    // to EL0 that is a quiescent point lets that wait end.
+    let low = spawn_on(1, 1, spin_marked, 1, LOW)?;
     let_run()?;
     let moving = |before: &[u64; 8]| (1..n).all(|i| kid_mark(i) > before[i]);
     let snapshot = || {
@@ -271,6 +277,11 @@ fn suspend_and_kill() -> Outcome {
     )?;
     sys::process_kill(&kid.process).map_err(|_| "process_kill failed")?;
     let_run()?;
+    MARKS[3].store(1, Relaxed);
+    let ended =
+        wait_for(|| sys::thread_info(&low).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    close(low)?;
+    check(ended, "the thread of init on CPU 1 did not stop")?;
     let gone = snapshot();
     pause(30_000_000);
     let after = snapshot();
@@ -361,35 +372,53 @@ extern "C" fn spin_marked(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// The times of a thread that runs at EL0 on another CPU: read from CPU 0
-/// while it runs, its time is what it ran (the stretch it is in included),
-/// and its system part is a small share of it.
+/// Calls the kernel until mark 3 says to stop, so that a good part of its
+/// time is system time: mark `slot` moves.
+extern "C" fn call_marked(slot: u64) -> ! {
+    while MARKS[3].load(Relaxed) == 0 {
+        let _ = sys::clock_now();
+        MARKS[slot as usize].fetch_add(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// The times of a thread that calls the kernel on another CPU: read from
+/// CPU 0 while it runs, its time is what it ran (the stretch it is in
+/// included), and both its system part and its user part are a share of it.
 fn time_across_cpus() -> Outcome {
     let n = cpus()?;
     if n < 2 {
         return Ok(());
     }
     reset_marks();
-    let t = spawn_on(0, 1, spin_marked, 0, TEST_PRIORITY)?;
-    pause(40_000_000);
-    let (ran, system) = sys::thread_times(&t).map_err(|_| "thread_times failed")?;
+    let t = spawn_on(0, 1, call_marked, 0, TEST_PRIORITY)?;
+    pause(10_000_000);
+    // Read again and again while it runs: it is at EL0 for two thirds of
+    // them, where its stretch is open, and in the kernel for the rest.
+    let (mut sane, mut last) = (true, (0, 0));
+    for _ in 0..40 {
+        pause(1_000_000);
+        let (ran, system) = sys::thread_times(&t).map_err(|_| "thread_times failed")?;
+        let (ran_ns, system_ns) = (time::ticks_to_ns(ran), time::ticks_to_ns(system));
+        sane &= ran_ns >= last.0
+            && system_ns >= ran_ns / 20
+            && system_ns <= ran_ns / 20 * 19
+            && ran_ns < 4_000_000_000;
+        last = (ran_ns, system_ns);
+    }
     let moved = mark(0) != 0;
     MARKS[3].store(1, Relaxed);
     let ended = wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
     close(t)?;
-    let (ran_ns, system_ns) = (time::ticks_to_ns(ran), time::ticks_to_ns(system));
+    let (ran_ns, system_ns) = last;
     check(
         moved && ended,
         "the thread on the other CPU did not run and stop",
     )?;
     check(
-        (30_000_000..4_000_000_000).contains(&ran_ns),
-        "the time of a thread at EL0 on another CPU is not what it ran",
-    )?;
-    check(
-        system_ns < ran_ns / 2,
-        "a thread at EL0 on another CPU has most of its time in the kernel",
+        sane && ran_ns >= 40_000_000,
+        "the time of a thread on another CPU is not what it ran, with a share in the kernel",
     )?;
     println!("smp: a thread at EL0 on CPU 1 ran {ran_ns} ns, {system_ns} ns of them in the kernel");
     Ok(())
