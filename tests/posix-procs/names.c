@@ -1031,7 +1031,7 @@ static int names_dup3(void) {
     CHECK(close(30) == 0);
     FAILS(dup3(fd, fd, 0), EINVAL);
     FAILS(dup3(fd, 29, O_APPEND), EINVAL);
-    FAILS(dup3(1, 32, 0), EBADF);
+    FAILS(dup3(1, 64, 0), EBADF);
     FAILS(dup3(99, 29, 0), EBADF);
     FAILS(dup3(-1, 29, 0), EBADF);
     CHECK(close(fd) == 0);

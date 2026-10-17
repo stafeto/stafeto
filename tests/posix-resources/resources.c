@@ -333,7 +333,7 @@ static void nofile(void) {
         if (fd < 0) break;
         opened[count++] = fd;
     }
-    check("physical capacity remains finite under infinity", count == 27 && errno == EMFILE);
+    check("physical capacity remains finite under infinity", count == 31 && errno == EMFILE);
     while (count) close(opened[--count]);
     struct rlimit invalid = {9, 8};
     errno = 0;

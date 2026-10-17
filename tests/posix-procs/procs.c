@@ -3307,16 +3307,22 @@ static void dup3_across_fork(void) {
     int fd = open("/etc/motd", O_RDONLY);
     expect("dup3 to 31 with O_CLOFORK", dup3(fd, 31, O_CLOFORK), 31);
     expect("dup3 to 30 with O_CLOEXEC", dup3(fd, 30, O_CLOEXEC), 30);
+    /* The table has 64 places: the numbers above 31 go through fork too. */
+    expect("dup3 to 40", dup3(fd, 40, 0), 40);
+    expect("dup3 to 63 with O_CLOFORK", dup3(fd, 63, O_CLOFORK), 63);
     pid_t child = fork();
     if (child == 0) {
         errno = 0;
         int closed = fcntl(31, F_GETFD) == -1 && errno == EBADF;
         int kept = fcntl(30, F_GETFD) >= 0;
-        _exit(closed && kept ? 0 : closed ? 2 : 1);
+        int high = fcntl(40, F_GETFD) >= 0 && fcntl(63, F_GETFD) == -1 && errno == EBADF;
+        _exit(closed && kept && high ? 0 : closed && kept ? 3 : closed ? 2 : 1);
     }
     expect("fork", child > 0, 1);
     reap("a child of a fork sees the O_CLOFORK descriptor closed", child, 0, 0);
     expect("the parent keeps the descriptor", fcntl(31, F_GETFD) >= 0, 1);
+    close(63);
+    close(40);
     close(31);
     close(30);
     close(fd);

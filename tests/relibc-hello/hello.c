@@ -8,6 +8,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <complex.h>
+#include <sys/select.h>
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -112,7 +114,7 @@ static int files(void) {
     struct utsname name;
     CHECK(uname(&name) == 0 && strcmp(name.sysname, "stafeto") == 0);
     struct rlimit limit;
-    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 32);
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 64);
 
     /* Pages back from an edge and from the middle, which splits the
      * mapping: then each piece left goes alone. */
@@ -133,10 +135,33 @@ static int files(void) {
      * input is no longer the console's input. F_SETFL takes no change. */
     int input = dup(0), file = open("/etc/motd", O_RDONLY);
     CHECK(input >= 0 && file >= 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDONLY);
-    CHECK(dup2(file, 0) == 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDWR);
+    CHECK(dup2(file, 0) == 0 && (fcntl(0, F_GETFL) & (O_ACCMODE | O_APPEND)) == O_RDONLY);
     CHECK(fcntl(0, F_SETFL, fcntl(0, F_GETFL)) == 0);
     CHECK(fcntl(0, F_SETFL, O_NONBLOCK) == -1 && errno == EINVAL);
     CHECK(dup2(input, 0) == 0 && close(input) == 0 && close(file) == 0);
+    /* F_GETFL gives the flags the file was opened with: the access mode and
+     * O_APPEND, shared by a duplicate; mkostemp passes O_APPEND on. */
+    int appended = open("/tmp/probe-flags", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int readwrite = open("/tmp/probe-flags", O_RDWR);
+    CHECK(appended >= 0 && readwrite >= 0);
+    CHECK((fcntl(appended, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_WRONLY | O_APPEND));
+    CHECK((fcntl(readwrite, F_GETFL) & (O_ACCMODE | O_APPEND)) == O_RDWR);
+    int shared = dup(appended);
+    CHECK(shared >= 0 && (fcntl(shared, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_WRONLY | O_APPEND));
+    char temp[] = "/tmp/probe-XXXXXX";
+    int made = mkostemp(temp, O_CLOEXEC | O_APPEND);
+    CHECK(made >= 0 && (fcntl(made, F_GETFL) & (O_ACCMODE | O_APPEND)) == (O_RDWR | O_APPEND));
+    CHECK(unlink(temp) == 0 && close(made) == 0 && close(shared) == 0);
+    CHECK(close(appended) == 0 && close(readwrite) == 0 && unlink("/tmp/probe-flags") == 0);
+
+    /* The table holds 64 descriptors: numbers up to 63 are taken by dup2,
+     * dup3 and F_DUPFD, and 64 is EBADF (EINVAL for the minimum of F_DUPFD). */
+    CHECK(dup2(2, 42) == 42 && (fcntl(42, F_GETFL) & O_ACCMODE) == O_WRONLY);
+    CHECK(dup3(1, 63, O_CLOEXEC) == 63 && fcntl(63, F_GETFD) == FD_CLOEXEC);
+    CHECK(dup2(2, 64) == -1 && errno == EBADF && dup3(1, 64, 0) == -1 && errno == EBADF);
+    CHECK(fcntl(2, F_DUPFD, 64) == -1 && errno == EINVAL);
+    int far = fcntl(2, F_DUPFD, 50);
+    CHECK(far == 50 && close(far) == 0 && close(42) == 0 && close(63) == 0);
 
     /* writev keeps the bytes of the parts before one that fails; a count
      * of parts outside 1 to IOV_MAX is EINVAL. */
@@ -145,6 +170,43 @@ static int files(void) {
     CHECK(scratch >= 0 && writev(scratch, parts, 2) == 2);
     CHECK(writev(scratch, parts, 0) == -1 && errno == EINVAL && close(scratch) == 0);
 
+    /* strtod converts a decimal constant whole, whatever its exponent: the
+     * digits are not accumulated in floating point, the string past the
+     * constant stays, no conversion leaves *endptr at the string, and the
+     * range errors say ERANGE. */
+    char *end;
+    errno = 0;
+    CHECK(strtod("1e308", &end) == 1e308 && *end == 0 && errno == 0);
+    CHECK(strtod("1.7976931348623157e308x", &end) == 1.7976931348623157e308 && *end == 'x');
+    CHECK(strtod("123456789012345678901234567890e-10", &end) == 123456789012345678901234567890e-10);
+    CHECK(strtod("0.1", &end) == 0.1 && strtod("2.2250738585072014e-308", &end) == 2.2250738585072014e-308);
+    CHECK(strtod("4.9e-324", &end) == 4.9e-324 && strtod("  -.5e1z", &end) == -5.0 && *end == 'z');
+    CHECK(strtod("1e", &end) == 1.0 && *end == 'e' && strtod("1.e+", &end) == 1.0 && *end == 'e');
+    CHECK(strtod("1e400", &end) > 1e308 && errno == ERANGE && *end == 0);
+    errno = 0;
+    CHECK(strtod("-1e400", &end) < -1e308 && errno == ERANGE);
+    errno = 0;
+    CHECK(strtod("1e-400", &end) == 0.0 && errno == ERANGE);
+    errno = 0;
+    CHECK(strtod("-abc", &end) == 0.0 && strcmp(end, "-abc") == 0 && errno == 0);
+    CHECK(strtod("0x1p-1074", &end) == 4.9e-324 && *end == 0);
+    CHECK(strtod("0x1.8p3", &end) == 12.0 && strtod("0x1p1000", &end) == 0x1p1000);
+    CHECK(strtod("0xg", &end) == 0.0 && strcmp(end, "xg") == 0);
+    CHECK(strtof("3.4028234e38", &end) == 3.4028234e38f && strtof("1.17549435e-38", &end) == 1.17549435e-38f);
+    CHECK(strtof("16777217", &end) == 16777216.0f && strtof("0.1", &end) == 0.1f);
+    /* clog near the unit circle: x*x + y*y - 1 is about 2^-70 here, and the
+     * real part -0x1.16ea2fa2cp-72 needs it formed without cancelling (the
+     * sum of logl(x) and log1pl(t*t)/2 gave -0x1.16ea2fa2bfcp-72). */
+    double complex near_one = CMPLX(0.7071067257624838, 0.7071068366106069);
+    CHECK(creal(clog(near_one)) == -0x1.16ea2fa2c0000p-72);
+    /* select names more descriptors than a watch takes: a descriptor that is
+     * none gives EBADF before EINVAL does. */
+    fd_set many;
+    FD_ZERO(&many);
+    for (int i = 0; i < 41; i++) FD_SET(i, &many);
+    struct timeval none = {0, 0};
+    errno = 0;
+    CHECK(select(41, &many, NULL, NULL, &none) == -1 && errno == EBADF);
     volatile double two = 2.0, ten = 10.0, zero = 0.0;
     CHECK(fabs(sqrt(two) - 1.41421356) < 1e-6 && pow(two, ten) == 1024.0 && sin(zero) == 0.0);
     printf("relibc-hello: directories, stat, descriptors, mmap, math\n");
@@ -479,9 +541,9 @@ static int constants(void) {
         printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
         return 24;
     }
-    /* The layer's descriptor table holds 32, and poll answers EINVAL past it. */
-    if (sysconf(_SC_OPEN_MAX) != 32 || errno != 0) {
-        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 32\n", sysconf(_SC_OPEN_MAX));
+    /* The layer's descriptor table holds 64. */
+    if (sysconf(_SC_OPEN_MAX) != 64 || errno != 0) {
+        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 64\n", sysconf(_SC_OPEN_MAX));
         return 25;
     }
     printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, %d options claimed, timers %ld\n",

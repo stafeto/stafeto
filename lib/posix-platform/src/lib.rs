@@ -1547,6 +1547,9 @@ pub unsafe extern "C" fn stafeto_setcancelstate(state: c_int, old: *mut c_int) -
             };
             // SAFETY: the caller's promise.
             unsafe { old.write(value) };
+            // A request that waited for the state to be enabled acts now
+            // when the type is asynchronous.
+            cancel_if_asynchronous();
             0
         }
         Err(errno) => -errno,
@@ -1570,6 +1573,8 @@ pub unsafe extern "C" fn stafeto_setcanceltype(kind: c_int, old: *mut c_int) -> 
     };
     // SAFETY: the caller's promise.
     unsafe { old.write(value) };
+    // A request that came before the asynchronous type acts now (XSH 2.9.5.1).
+    cancel_if_asynchronous();
     0
 }
 

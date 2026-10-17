@@ -266,12 +266,17 @@ static int directories(void) {
     if (open("motd", O_RDONLY | O_DIRECTORY) != -1 || errno != ENOTDIR) return 79;
     fd = open("/", O_RDONLY | O_DIRECTORY);
     if (fd < 0 || (dir = fdopendir(fd)) == NULL || dirfd(dir) != fd || closedir(dir)) return 80;
-    DIR *held[30];
-    for (int i = 0; i < 30; i++) if ((held[i] = opendir("/")) == NULL) return 81;
-    if (opendir("/") != NULL || errno != EMFILE || open("motd", O_RDONLY) != -1 || errno != EMFILE) return 82;
+    /* The file service holds 32 descriptions for a session, and the layer's
+     * table of 64 has room for the rest: the directories run out at the
+     * service's limit. */
+    DIR *held[64];
+    int held_count = 0;
+    while (held_count < 64 && (held[held_count] = opendir("/")) != NULL) held_count++;
+    if (held_count != 32) return 81;
+    if (errno != EMFILE || open("motd", O_RDONLY) != -1 || errno != EMFILE) return 82;
     saved_fd = dirfd(held[7]);
     if (closedir(held[7]) || (held[7] = opendir("/tmp")) == NULL || dirfd(held[7]) != saved_fd) return 83;
-    for (int i = 0; i < 30; i++) if (closedir(held[i])) return 84;
+    for (int i = 0; i < held_count; i++) if (closedir(held[i])) return 84;
     fd = open("motd", O_RDONLY);
     if (fd != 0 || close(fd)) return 85;
     return 0;

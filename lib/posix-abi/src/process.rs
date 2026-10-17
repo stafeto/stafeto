@@ -719,12 +719,14 @@ impl Shadow {
             .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
         let frame = crate::change::frame();
         let captured = crate::shared::with_descriptors(&numbers, |files| {
-            let mut open = [None; posix_fs::OPEN_MAX];
+            // The snapshot goes into the shadow itself, and the loop below
+            // holds each of its targets (no second table on the stack).
             for (fd, target, flags) in files.descriptors() {
-                open[fd as usize] = Some((target, flags.close_on_exec));
+                shadow.entries[fd as usize] = Some((target, flags.close_on_exec));
             }
-            for (fd, entry) in open.iter().enumerate() {
-                if let Some((_, close_on_exec)) = entry {
+            for fd in 0..posix_fs::OPEN_MAX {
+                if let Some((_, close_on_exec)) = &shadow.entries[fd] {
+                    let close_on_exec = *close_on_exec;
                     let (target, held) =
                         if matches!(files.target(fd as u32), Ok(posix_fs::Target::Fifo(_))) {
                             let owner = owner.ok_or(crate::constants::EIO)?;
@@ -737,7 +739,7 @@ impl Shadow {
                             (target, ShadowHold::Ordinary(target))
                         };
                     shadow.held[fd] = Some(held);
-                    shadow.entries[fd] = Some((target, *close_on_exec));
+                    shadow.entries[fd] = Some((target, close_on_exec));
                 }
             }
             let own = files.cwd();

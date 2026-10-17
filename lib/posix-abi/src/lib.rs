@@ -507,6 +507,15 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             )
             .map(|_| Some(0)),
         },
+        posix_fs::Target::Ram(_) | posix_fs::Target::Random(_) if set.is_none() => {
+            let flags = transport.ram_open_flags(target).map_err(error)?;
+            let append = if flags & proto_fs::APPEND != 0 {
+                O_APPEND
+            } else {
+                0
+            };
+            Ok(Some((flags & 3) as c_int | append))
+        }
         _ => Ok(None),
     })
 }

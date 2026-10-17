@@ -56,9 +56,17 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # pin-b5af44ca.
 # Terminal size: the standard error is not buffered, so that resize's question
 # to the terminal goes out before it reads the answer; tagged pin-4d8d6b17.
-# timespec::subtract: a borrowed second adds the negative nanosecond
-# difference (sem_timedwait waited up to a second too long); tagged pin-285e07a0.
-COMMIT = "285e07a09ffd81681cf5a8912ff014480ab6af8f"
+# Goal Zh (basic to its ceiling): the functions of complex.h in binary128 with
+# the special values of C11 Annex G (double and float round once); NZERO,
+# devctl.h and the typed memory declarations; robust mutexes (the end of a
+# thread marks the ones it holds); a late request of cancellation acts when
+# the thread enables it or sets the asynchronous type; strtod converts a
+# decimal constant whole; wordexp prints with printf; aio signals with
+# sigqueue; sysconf says 64 descriptors; SIGSTKSZ is 48 KiB; a timed wait
+# whose deadline lies past a second ends at the deadline (the difference of
+# two times borrowed a second wrongly); clog near the unit circle keeps its
+# digits; tagged pin-5ee37a18.
+COMMIT = "5ee37a1862d3afa91a18487bc4bb0e481bc72f6c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

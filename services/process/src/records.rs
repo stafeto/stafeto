@@ -1831,7 +1831,7 @@ mod tests {
         let initial = records.get(i).unwrap().limits;
         records.get_mut(i).unwrap().credentials.euid = 1000;
         assert_eq!(
-            records.set_limit(i, NOFILE, Limit { soft: 32, hard: 33 }, 1),
+            records.set_limit(i, NOFILE, Limit { soft: 64, hard: 65 }, 1),
             Err(proto_process::PERMISSION)
         );
         assert_eq!(records.get(i).unwrap().limits, initial);
@@ -1853,7 +1853,7 @@ mod tests {
             records.set_limit(
                 i,
                 NOFILE,
-                Limit { soft: 16, hard: 32 },
+                Limit { soft: 16, hard: 64 },
                 proto_process::GENERATION_DEAD - 1
             ),
             Err(proto_process::AGAIN)
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(child.limits, limits);
         assert_eq!(child.root, root);
         assert_ne!(child.label.pid(), root.pid);
-        assert_eq!(limits.values[proto_process::NOFILE].soft, 32);
+        assert_eq!(limits.values[proto_process::NOFILE].soft, 64);
         assert!(
             limits
                 .values
