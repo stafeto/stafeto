@@ -1528,6 +1528,39 @@ impl Processes {
                 }
                 Answer::Reply(Outgoing::new())
             }
+            proto_process::account_op::PROCESS_TIME => {
+                let (Ok(pid), Ok(())) = (body.u32(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Some(target) = self.records.find_pid(pid) else {
+                    // Init has no record: it is root's and has run nothing.
+                    return if pid == INIT_PID {
+                        if caller.credentials.euid == 0 {
+                            let w = r.reply();
+                            if w.u32(0).and_then(|()| w.u64(0)).is_err() {
+                                return Answer::Status(Status::BadSize);
+                            }
+                            Answer::Reply(Outgoing::new())
+                        } else {
+                            refuse(proto_process::PERMISSION)
+                        }
+                    } else {
+                        refuse(proto_process::NO_PROCESS)
+                    };
+                };
+                let record = self.records.get(target).expect("the target");
+                if !signals::may_signal(caller.credentials, record.credentials, 0, false) {
+                    return refuse(proto_process::PERMISSION);
+                }
+                let ticks = record
+                    .carried_ticks
+                    .saturating_add(sys::process_time(&record.process).unwrap_or(0));
+                let w = r.reply();
+                if w.u32(0).and_then(|()| w.u64(ticks)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
             proto_process::account_op::SIGNAL_NEXT => {
                 let (Ok(signal), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);

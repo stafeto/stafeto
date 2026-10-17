@@ -528,6 +528,11 @@ pub mod account_op {
     /// its page while `Page::more` had its bit: the service puts the next
     /// queued one there (or drops the queue of a signal the process ignores).
     pub const SIGNAL_NEXT: u32 = 4;
+    /// pid u32 -> the counter ticks the process `pid` has run, u64 (the
+    /// CPU-time clock of another process). `NO_PROCESS` for none (PID 1,
+    /// init, has none of its own and runs 0), `PERMISSION` for a process
+    /// the caller could not send a signal to.
+    pub const PROCESS_TIME: u32 = 5;
 }
 
 /// SIGQUEUE_MAX: the occurrences sent by sigqueue that wait for one process

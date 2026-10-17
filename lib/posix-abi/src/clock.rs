@@ -208,6 +208,7 @@ fn cpu_clock(id: c_int) -> bool {
     id == crate::cpu::CLOCK_PROCESS_CPUTIME_ID
         || id == crate::cpu::CLOCK_THREAD_CPUTIME_ID
         || (id > 0 && id & 7 == 6)
+        || (id > 0 && id & 7 == 5)
 }
 /// The time of clock `id`: MONOTONIC from the counter, REALTIME from the
 /// page or the service; no errno.
@@ -217,6 +218,7 @@ pub fn gettime(id: c_int) -> Result<Time, c_int> {
         let ns = match id {
             crate::cpu::CLOCK_PROCESS_CPUTIME_ID => crate::cpu::process_ns()?,
             crate::cpu::CLOCK_THREAD_CPUTIME_ID => crate::cpu::thread_ns()?,
+            _ if id & 7 == 5 => crate::cpu::process_ns_of((id >> 3) as u32)?,
             _ => crate::cpu::thread_ns_of((id >> 3) as u64)?,
         };
         Ok(Time::from_mono(ns))
