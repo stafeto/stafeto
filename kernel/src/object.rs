@@ -164,6 +164,7 @@ impl Refs {
     /// the queue would free it twice.
     #[track_caller]
     pub fn retain(&mut self) {
+        crate::obj::assert_held();
         self.check();
         assert!(self.0 > 0, "an object nobody refers to is retained");
         self.0 = self.0.checked_add(1).expect("references overflow");
@@ -174,6 +175,7 @@ impl Refs {
     /// a reference of the caller keeps.
     #[track_caller]
     pub fn take(&mut self) {
+        crate::obj::assert_held();
         self.check();
         self.0 = self.0.checked_add(1).expect("references overflow");
     }
@@ -181,6 +183,7 @@ impl Refs {
     /// Drops a reference; true when it was the last.
     #[track_caller]
     pub fn release(&mut self) -> bool {
+        crate::obj::assert_held();
         self.check();
         self.0 = self
             .0
@@ -192,6 +195,7 @@ impl Refs {
     /// Drops `n` references, none of them the last.
     #[track_caller]
     pub fn release_many(&mut self, n: u32) {
+        crate::obj::assert_held();
         self.check();
         self.0 = self
             .0

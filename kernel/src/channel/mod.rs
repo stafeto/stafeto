@@ -16,7 +16,7 @@
 //! the receiver's with their references; a request that waits in a queue
 //! carries them (Thread::transit). The queues change together with the
 //! states of the threads in them, so every change to them happens under the
-//! scheduler's lock (sched::locked). A channel lives while references to it
+//! OBJ (sched::locked). A channel lives while references to it
 //! are left: handles with any rights, threads that wait in it, the sources
 //! of notifications that have a slot there (sessions, exits of processes,
 //! timers and interrupt bindings, each through its `Source`), and the
@@ -64,7 +64,7 @@ pub struct Channel {
     /// The slot of label 0.
     slot: Slot<Owner>,
     /// Slots with something posted and requests, or receivers that wait;
-    /// reached only with the scheduler locked (`queue`).
+    /// reached only under OBJ (`queue`).
     queue: Queue<Owner>,
     /// Handles to it with RECEIVE; the last one to go closes it.
     receivers: u32,
@@ -134,7 +134,7 @@ unsafe fn refs<'a>(c: NonNull<Channel>) -> &'a mut Refs {
 }
 
 /// The queue of `c`, which changes together with the states of the
-/// threads in it: reached only with the scheduler locked, which `_locked`
+/// threads in it: reached only under OBJ, which `_locked`
 /// shows (sched::locked).
 ///
 /// # Safety
@@ -201,7 +201,7 @@ pub fn is_closed(c: NonNull<Channel>) -> bool {
 
 /// object_info CHANNEL of `c`, which the caller holds (spec 11): the slots
 /// and requests in its queue and the receivers that wait there, read with
-/// the scheduler locked, its sources, the slot of label 0 among them, and
+/// OBJed, its sources, the slot of label 0 among them, and
 /// whether it is closed. O(1).
 pub fn info(c: NonNull<Channel>) -> ChannelInfo {
     // SAFETY: the caller holds a reference to the channel.
@@ -305,7 +305,7 @@ fn ceiling(t: NonNull<Thread>) -> u8 {
 }
 
 /// What receive or the stage Close took from a channel's queue, which it
-/// lets go after the scheduler's lock.
+/// lets go after OBJ.
 enum Taken {
     /// A notification slot, which held its owner.
     Slot(Owner),
@@ -324,7 +324,7 @@ enum Taken {
 /// its wait letting go what it held and a sender's handles going, up to
 /// abi::MESSAGE_HANDLES, at the cause of the close; or slots, emptied, each
 /// letting its owner go at that cause (a session whose copies went goes, as
-/// after receive); a head a time under the scheduler's lock, what it held
+/// after receive); a head a time under OBJ, what it held
 /// after it. With heads left the channel goes back to the head of the
 /// higher of the cause and their top level (spec 7.7), and otherwise the
 /// queue's reference goes, which queues the shell at the cause when it was
@@ -337,18 +337,24 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
     // SAFETY: the caller's promise: the queue's reference keeps the channel
     // at its stage Close, and nothing refers to a shell.
     if unsafe { refs(c) }.get() == 0 {
+        let _section = crate::obj::lock();
         // SAFETY: as above.
         unsafe { free(c, level) };
         return;
     }
     // SAFETY: as above; only the field is read.
     let cause = unsafe { (*c.as_ptr()).cause };
+    let section = crate::obj::lock();
     // SAFETY: as above.
     let top = sched::locked(|k| unsafe { queue(c, k.s).top() });
+    drop(section);
     let mut woken = 0u32;
     let mut heads = 0;
     let mut work = 0;
     while work < CLOSE_PORTION {
+        // One section for each waiter woken: the stage is O(CLOSE_PORTION)
+        // of them, and no other CPU waits for more than one.
+        let _section = crate::obj::lock();
         let head = sched::locked(|k| {
             // SAFETY: the channel is alive; a thread that waits is alive,
             // and a queued slot holds its owner, in which it lies.
@@ -396,6 +402,7 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
         heads += 1;
         work += 1;
     }
+    let _section = crate::obj::lock();
     // SAFETY: as above.
     let left = sched::locked(|k| unsafe { queue(c, k.s).top() });
     crate::testpoint::heads_taken(level, heads);

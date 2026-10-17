@@ -40,6 +40,7 @@ use crate::irq::Irq;
 use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
+use crate::obj::Guarded;
 use crate::object::{self, Block, Chunks, Handles, Live, Moving, Object, Refs};
 use crate::sched;
 use crate::session::Session;
@@ -55,7 +56,6 @@ use kcore::process::Life;
 use kcore::quota::Account;
 use kcore::sched::{ParkedList, ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
-use kcore::sync::Lock;
 
 pub(crate) mod control;
 mod maps;
@@ -63,7 +63,7 @@ mod table;
 mod teardown;
 
 pub(crate) use control::unlist as unlist_parked;
-pub use control::{control, park_if_suspended, park_selected};
+pub use control::{control, gated_thread, park_if_suspended, park_selected};
 #[cfg(feature = "icount")]
 pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
@@ -159,9 +159,9 @@ pub struct Process {
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
     /// thread of the process runs only while it is 0. Read Relaxed: the
     /// EL0 return takes a hint and `park_selected` decides under the
-    /// scheduler lock, which orders the decision. Written by atomic
+    /// OBJ, which orders the decision. Written by atomic
     /// read-modify-write with Release (no Acquire pairs with it);
-    /// `SUSPENDED` changes under the scheduler lock.
+    /// `SUSPENDED` changes under OBJ.
     gate: AtomicU8,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,
@@ -204,7 +204,7 @@ pub struct Process {
     /// the levels the clients had. Any thread of the process may answer.
     /// A request holds no reference to its client: while it stands here the
     /// client lives, and a client that ends takes its slot out
-    /// (channel::cancel). Reached only with the scheduler locked
+    /// (channel::cancel). Reached only under OBJ
     /// (`accepted`).
     accepted: ReadyQueue<Slot<Owner>>,
     /// How far its teardown came.
@@ -257,7 +257,7 @@ unsafe impl Send for Process {}
 /// The shells of processes with no parent: at boot the reserve, a page
 /// for init's shell taken before init's quota is counted (spec 7.5);
 /// in test builds the kernel tests' processes. Its pages stay.
-static ROOTS: Lock<Pool<Process>> = Lock::new(Pool::new());
+static ROOTS: Guarded<Pool<Process>> = Guarded::new(Pool::new());
 
 /// Processes whose shells have not gone.
 static LIVE: Live = Live::new();
@@ -283,6 +283,9 @@ impl Process {
     pub fn activate(&mut self) {
         let space = self.space();
         if !space.is_active() {
+            // The ASIDs are shared (obj.rs); the way into EL0 holds no section.
+            crate::obj::serving(crate::obj::ENTRY_ASID);
+            let _section = crate::obj::lock();
             space.activate();
         }
     }
@@ -452,6 +455,7 @@ impl Paid for Irq {
 /// page when the pool grows (spec 7.5, 7.8). NO_MEMORY when the quota
 /// falls short.
 pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the payer; the value is no
     // field of it.
     unsafe { paid_slot(payer, value) }.map_err(|_| Error::NoMemory)
@@ -466,6 +470,7 @@ pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<
 /// child's shell), and the payer is alive: the object holds the payer's
 /// shell, or it is a thread of the payer. Nothing uses it afterwards.
 pub unsafe fn paid_free<T: Paid>(payer: NonNull<Process>, object: NonNull<T>) {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; only the pool is touched.
     unsafe { T::pool(&mut (*payer.as_ptr()).pools).free(object) }
 }
@@ -516,6 +521,7 @@ pub fn create_child(
 /// fit, or once the process passed its stage Quota (spec 7.5). Only the
 /// field is borrowed (see `refs`).
 pub fn charge(process: NonNull<Process>, bytes: u64) -> Result<(), Error> {
+    crate::obj::assert_held();
     // SAFETY: the caller holds a reference to the process, or the process
     // is the parent of one it holds; only the field is borrowed.
     unsafe { (*process.as_ptr()).quota.charge(bytes) }
@@ -523,6 +529,7 @@ pub fn charge(process: NonNull<Process>, bytes: u64) -> Result<(), Error> {
 
 /// Gives back to the quota of `process` bytes a charge took, as `charge`.
 pub fn refund(process: NonNull<Process>, bytes: u64) {
+    crate::obj::assert_held();
     // SAFETY: as in `charge`.
     unsafe { (*process.as_ptr()).quota.refund(bytes) }
 }
@@ -544,7 +551,7 @@ pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
 /// left its list and, for each thread in it, its finished stints and, when
 /// it is on the CPU, its stint so far, with the part of the sum spent in
 /// the kernel (object_info PROCESS_TIME). One walk
-/// of at most abi::MAX_THREADS threads, whose nodes the scheduler's lock
+/// of at most abi::MAX_THREADS threads, whose nodes OBJ
 /// guards.
 pub fn cpu_time(process: NonNull<Process>) -> (u64, u64) {
     let now = crate::arch::timer::now();
@@ -679,6 +686,7 @@ unsafe fn child_links<'a>(child: NonNull<Process>) -> &'a mut ChildLinks {
 /// `create_child` comes here; init and the kernel tests' processes
 /// (`create_init`, `create_root`) have no parent.
 fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
+    crate::obj::assert_held();
     // SAFETY: the caller holds references to both; only the fields of the
     // tree are touched.
     unsafe {
@@ -856,6 +864,7 @@ pub fn thread_room(process: NonNull<Process>) -> Result<(), Error> {
 /// Puts `t`, a new thread of `process`, at the head of its threads, after
 /// `thread_room` let it.
 pub fn add_thread(process: NonNull<Process>, t: NonNull<Thread>) {
+    crate::obj::assert_held();
     // SAFETY: the process and its threads are alive, and a thread holds a
     // reference to its process; only the list's fields are touched.
     unsafe {
@@ -879,6 +888,7 @@ pub fn add_thread(process: NonNull<Process>, t: NonNull<Thread>) {
 /// # Safety
 /// `t` is a live thread of `process`.
 pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; only the list's fields are touched.
     unsafe {
         let Some(Siblings { prev, next }) = (*t.as_ptr()).siblings.take() else {
@@ -915,7 +925,7 @@ pub fn timer_room(process: NonNull<Process>) -> Result<(), Error> {
 
 /// The queue of the requests `process` accepted (Process::accepted), which
 /// changes together with the states of the clients in it: reached only
-/// with the scheduler locked, which `_locked` shows (sched::locked).
+/// under OBJ, which `_locked` shows (sched::locked).
 ///
 /// # Safety
 /// `process` is alive.

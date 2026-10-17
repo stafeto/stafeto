@@ -62,7 +62,14 @@ pub const CPACR_EL1: u64 = 0b11 << 20;
 /// CNTKCTL_EL1.EL0VCTEN: EL0 reads CNTVCT_EL0 and CNTFRQ_EL0 (spec 10).
 /// EL0PCTEN (bit 0), EL0VTEN (bit 8) and EL0PTEN (bit 9) stay clear: no
 /// physical counter and no timer registers for programs.
-pub const CNTKCTL_EL1: u64 = 1 << 1;
+///
+/// EVNTEN with EVNTI 8 and EVNTDIR 0 is the event stream: bit 8 of the
+/// virtual counter rising sends an event every 512 ticks (about 21 us at
+/// 24 MHz). It bounds the sleep of a `wfe` that waits for the lock OBJ
+/// (`sync::Ticket`) if its wake-up got lost.
+pub const CNTKCTL_EL1: u64 = (1 << 1) | CNTKCTL_EVNTEN | (CNTKCTL_EVNTI << 4);
+const CNTKCTL_EVNTEN: u64 = 1 << 2;
+const CNTKCTL_EVNTI: u64 = 8;
 
 /// MDSCR_EL1: TDCC traps EL0 access to the debug communication channel;
 /// MDE, KDE and SS stay clear: no breakpoints, watchpoints or
@@ -115,7 +122,7 @@ mod tests {
     #[test]
     fn el0_gets_fp_and_the_virtual_counter_only() {
         assert_eq!(CPACR_EL1, 0x30_0000);
-        assert_eq!(CNTKCTL_EL1, 0b10);
+        assert_eq!(CNTKCTL_EL1, 0b1000_0110);
         assert_eq!(MDSCR_EL1, 0x1000);
     }
 

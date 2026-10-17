@@ -47,12 +47,16 @@ pub struct CpuBlock {
     /// it). GICv3: the virtual address of its redistributor's RD_base
     /// frame.
     pub gic: AtomicUsize,
+    /// What the CPU owns (local.rs), on cache lines of its own after the
+    /// header: the CPU reaches it from TPIDR_EL1 with one load or store.
+    pub local: crate::local::Local,
 }
 
 const _: () = {
     assert!(core::mem::offset_of!(CpuBlock, regs) == 0);
     assert!(core::mem::offset_of!(CpuBlock, stack_top) == 16);
-    assert!(core::mem::size_of::<CpuBlock>() == 64);
+    // The header is one line, and what the CPU owns starts on the next.
+    assert!(core::mem::offset_of!(CpuBlock, local) == 64);
 };
 
 impl CpuBlock {
@@ -66,6 +70,7 @@ impl CpuBlock {
             level: AtomicU32::new(0),
             timer_ok: AtomicU32::new(0),
             gic: AtomicUsize::new(0),
+            local: crate::local::Local::new(),
         }
     }
 
@@ -96,6 +101,7 @@ pub fn prepare(index: usize) -> &'static CpuBlock {
     let b = block(index);
     b.index.store(index as u32, Ordering::Relaxed);
     b.stack_top.store(stack_top_of(index), Ordering::Relaxed);
+    crate::local::init(&b.local);
     b
 }
 

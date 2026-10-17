@@ -12,7 +12,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
 use core::sync::atomic::AtomicBool;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 pub struct Lock<T> {
     #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
@@ -112,6 +112,107 @@ impl<T> Drop for LockGuard<'_, T> {
             // SAFETY: this guard is the only one on the single core.
             *self.lock.locked.get() = false;
         }
+    }
+}
+
+/// A ticket lock, without data: a CPU takes the next ticket and waits until
+/// the lock serves it, so the CPUs go in the order they came and none waits
+/// for more than the sections of the CPUs ahead of it. The wait on AArch64
+/// sleeps in `wfe` over an exclusive `ldaxrh` of the served number: the
+/// holder's `stlrh` clears the monitor and wakes it, and the `sev` after the
+/// store wakes a waiter whose monitor the emulator does not model. The
+/// event stream of the generic timer (`CNTKCTL_EL1.EVNTEN`) wakes it at
+/// least every few tens of microseconds in any case. The holder masks
+/// interrupts (spec 8.1), so no section is preempted.
+pub struct Ticket {
+    next: AtomicU16,
+    serving: AtomicU16,
+}
+
+impl Ticket {
+    pub const fn new() -> Self {
+        Self {
+            next: AtomicU16::new(0),
+            serving: AtomicU16::new(0),
+        }
+    }
+
+    /// Waits for the lock and returns the ticket that `unlock` takes back.
+    #[inline(always)]
+    pub fn lock(&self) -> u16 {
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        self.wait(ticket);
+        ticket
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    #[inline(always)]
+    fn wait(&self, ticket: u16) {
+        // SAFETY: loads a halfword of the lock with acquire. `sevl` makes
+        // the first `wfe` fall through, so the loop reads the number once
+        // before it sleeps; after that each `wfe` sleeps until the monitor
+        // of `ldaxrh` clears, a `sev` arrives or the event stream ticks.
+        unsafe {
+            core::arch::asm!(
+                "sevl",
+                "2:",
+                "wfe",
+                "ldaxrh {s:w}, [{p}]",
+                "cmp {s:w}, {t:w}",
+                "b.ne 2b",
+                p = in(reg) self.serving.as_ptr(),
+                t = in(reg) u32::from(ticket),
+                s = out(reg) _,
+                options(nostack),
+            );
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    #[inline(always)]
+    fn wait(&self, ticket: u16) {
+        while self.serving.load(Ordering::Acquire) != ticket {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Serves the next ticket: the `stlrh` that wakes the waiters.
+    #[inline(always)]
+    pub fn unlock(&self, ticket: u16) {
+        self.serving
+            .store(ticket.wrapping_add(1), Ordering::Release);
+        wake();
+    }
+
+    /// Serves the next ticket for the holder, which has not kept its own:
+    /// while the lock is held the number served is the holder's ticket.
+    #[inline(always)]
+    pub fn unlock_held(&self) {
+        let ticket = self.serving.load(Ordering::Relaxed);
+        self.serving
+            .store(ticket.wrapping_add(1), Ordering::Release);
+        wake();
+    }
+
+    /// Whether no CPU holds or awaits the lock.
+    pub fn is_free(&self) -> bool {
+        self.next.load(Ordering::Relaxed) == self.serving.load(Ordering::Relaxed)
+    }
+}
+
+/// The `sev` after a release: it wakes every CPU in `wfe`.
+#[inline(always)]
+fn wake() {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    // SAFETY: `sev` only signals an event.
+    unsafe {
+        core::arch::asm!("sev", options(nomem, nostack, preserves_flags));
+    }
+}
+
+impl Default for Ticket {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -282,6 +383,66 @@ mod tests {
         let l = Lock::new(0);
         let _a = l.lock();
         let _b = l.lock();
+    }
+
+    /// Eight threads add to a plain counter under the lock, across the wrap
+    /// of the 16-bit ticket: no addition is lost.
+    #[test]
+    fn ticket_lock_excludes_across_the_wrap() {
+        struct Shared(core::cell::UnsafeCell<u64>);
+        // SAFETY: the test touches the cell only under the lock.
+        unsafe impl Sync for Shared {}
+        impl Shared {
+            /// # Safety
+            /// The lock is held.
+            unsafe fn add(&self) {
+                // SAFETY: the caller holds the lock.
+                unsafe { *self.0.get() += 1 };
+            }
+        }
+        let lock = Ticket::new();
+        lock.next.store(u16::MAX - 100, Ordering::Relaxed);
+        lock.serving.store(u16::MAX - 100, Ordering::Relaxed);
+        let shared = Shared(core::cell::UnsafeCell::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..2_000 {
+                        let t = lock.lock();
+                        // SAFETY: the lock is held.
+                        unsafe { shared.add() };
+                        lock.unlock(t);
+                    }
+                });
+            }
+        });
+        // SAFETY: the threads are done.
+        assert_eq!(unsafe { *shared.0.get() }, 16_000);
+        assert!(lock.is_free());
+    }
+
+    /// The lock serves tickets in the order they were taken.
+    #[test]
+    fn ticket_lock_serves_in_order() {
+        let lock = Ticket::new();
+        let first = lock.lock();
+        let order = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let (lock, order) = (&lock, &order);
+            for id in 0..3u32 {
+                scope.spawn(move || {
+                    let t = lock.lock();
+                    order.lock().unwrap().push(id);
+                    lock.unlock(t);
+                });
+                // The next thread starts after this one took its ticket.
+                while lock.next.load(Ordering::Relaxed) != 2 + id as u16 {
+                    std::thread::yield_now();
+                }
+            }
+            lock.unlock(first);
+        });
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
     }
 
     #[test]

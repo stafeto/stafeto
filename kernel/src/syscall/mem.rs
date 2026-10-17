@@ -3,7 +3,9 @@
 
 //! The calls of memory objects (spec 7, 11): mem_create, mem_map, mem_unmap and mem_protect, long calls in portions.
 
-use super::{Args, Values, caller, cause, dispatch, lookup, restart, run_portions, set_result};
+use super::{
+    Args, Values, caller, cause, dispatch, lookup, objects, restart, run_portions, set_result,
+};
 use crate::arch::timer as clock;
 use crate::memory::{self, Memory};
 use crate::object::Object;
@@ -35,7 +37,7 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     if number != long.call().number() {
         // SAFETY: the running thread is alive, and nothing uses what its
         // call held afterwards.
-        unsafe { thread::drop_long(thread, cause(thread)) };
+        unsafe { objects(|| thread::drop_long(thread, cause(thread))) };
         cleanup::count_portion(entry);
         sched::entry_polled();
         if arch::irq_pending() {
@@ -76,18 +78,20 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
 /// call writes its own result.
 pub(super) fn mem_create(thread: NonNull<Thread>, a: &Args) {
     let entry = clock::now();
-    let made = memory_size_arg(a[0]).and_then(|pages| {
-        let kind = memory_kind_arg(a[1], pages)?;
-        if matches!(kind, MemoryKind::Contiguous { .. }) {
-            lookup(thread, a[2], Rights::DEVICE, Object::resource)?;
-        }
-        process::reserve_handles(caller(thread), 1)?;
-        match kind {
-            MemoryKind::Pages => memory::create(caller(thread), pages),
-            MemoryKind::Contiguous { order, uncached } => {
-                memory::create_contiguous(caller(thread), order, uncached)
+    let made = objects(|| {
+        memory_size_arg(a[0]).and_then(|pages| {
+            let kind = memory_kind_arg(a[1], pages)?;
+            if matches!(kind, MemoryKind::Contiguous { .. }) {
+                lookup(thread, a[2], Rights::DEVICE, Object::resource)?;
             }
-        }
+            process::reserve_handles(caller(thread), 1)?;
+            match kind {
+                MemoryKind::Pages => memory::create(caller(thread), pages),
+                MemoryKind::Contiguous { order, uncached } => {
+                    memory::create_contiguous(caller(thread), order, uncached)
+                }
+            }
+        })
     });
     match made {
         Ok(m) => {
@@ -116,6 +120,7 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
         return;
     };
     thread::end_long(thread);
+    let _section = crate::obj::lock();
     let base = memory::contiguous_base(m);
     let rights = if base.is_some() {
         DMA_MEMORY_RIGHTS
@@ -234,7 +239,7 @@ pub(super) fn change(
     first: fn(NonNull<Thread>, &Args) -> Result<Change, Error>,
 ) {
     let entry = clock::now();
-    match first(thread, a) {
+    match objects(|| first(thread, a)) {
         Ok(on) => {
             thread::begin_long(thread, Long::Change(on));
             portions(thread, on, entry)
@@ -256,6 +261,7 @@ pub(super) fn change(
 /// way the call's reference to the process goes, at the caller's priority.
 fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
     let Some((result, start)) = run_portions(thread, entry, || {
+        let _section = crate::obj::lock();
         let done = process::step_change(&mut on)?;
         if !done {
             thread::update_long(thread, Long::Change(on));
@@ -265,6 +271,7 @@ fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
         return;
     };
     thread::end_long(thread);
+    let _section = crate::obj::lock();
     // SAFETY: the call is over, and its reference to the process goes
     // last.
     unsafe {

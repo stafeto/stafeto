@@ -17,6 +17,7 @@ use super::kmap::FrameTables;
 use super::phys::FRAMES;
 use crate::arch::{mmu, registers, symbols};
 use crate::boot::Boot;
+use crate::obj::Guarded;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
@@ -24,10 +25,9 @@ use kcore::asid::{self, AsidAllocator, AsidTag};
 use kcore::layout::image_pa;
 use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK, TableMemory};
 use kcore::quota::Account;
-use kcore::sync::Lock;
 use kcore::tlb::{self, Mmu};
 
-static ASIDS: Lock<Option<AsidAllocator>> = Lock::new(None);
+static ASIDS: Guarded<Option<AsidAllocator>> = Guarded::new(None);
 
 /// Physical address of head.S's empty root table; zero until `init`.
 static EMPTY_ROOT: AtomicU64 = AtomicU64::new(0);

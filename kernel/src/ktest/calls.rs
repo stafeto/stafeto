@@ -5378,6 +5378,132 @@ pub fn released_binding_masks_and_frees_its_line(_: &Boot) -> Result<(), &'stati
     })
 }
 
+/// The table of lines is read without a lock, so a binding that its last
+/// handle unbound keeps its memory until every CPU passed a quiescent point
+/// (qsbr): the cleanup portion that retires it leaves it in its pool and
+/// intact, and the point gives the place back.
+pub fn unbound_binding_waits_for_a_quiescent_period(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, _, b| {
+        let bindings = irq::in_use();
+        c.close(b)?;
+        check(
+            irq::bound(LINE).is_none(),
+            "the line still names the binding",
+        )?;
+        while cleanup::len() > 0 {
+            cleanup::portion();
+        }
+        check(
+            crate::qsbr::pending(),
+            "the portion did not retire the binding",
+        )?;
+        check(
+            irq::in_use() == bindings,
+            "the binding went before a quiescent point",
+        )?;
+        crate::qsbr::quiesce();
+        check(
+            irq::in_use() == bindings - 1 && !crate::qsbr::pending(),
+            "the quiescent point did not free the binding",
+        )
+    })
+}
+
+/// A binding keeps the shell of the process that pays for it until its
+/// place goes back (spec 7.7): with the process gone to its last stage while
+/// the quiescent period of its binding runs, the reclaim gives the last
+/// reference to the shell, queues it, and the cleanup frees it.
+pub fn last_shell_reference_comes_with_the_binding_reclaim(_: &Boot) -> Result<(), &'static str> {
+    let processes = process::in_use();
+    let bindings = irq::in_use();
+    let c = Caller::new()?;
+    let made = (|| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let copy = c.created(
+            Call::HandleDuplicate.number(),
+            &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
+        )?;
+        let b = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), copy.0, 20, 0])?;
+        for handle in [b, copy, h, r] {
+            c.close(handle)?;
+        }
+        Ok(())
+    })();
+    // The caller's references go, and the portions run without a quiescent
+    // point (`drain` has one): the binding is retired and waits for its
+    // period.
+    // SAFETY: the references are the test's, and nothing uses them afterwards.
+    unsafe {
+        thread::release(c.thread, CAUSE);
+        process::release(c.process, CAUSE);
+    }
+    while cleanup::len() > 0 {
+        cleanup::portion();
+    }
+    made?;
+    check(
+        crate::qsbr::pending() && irq::in_use() == bindings + 1,
+        "the binding did not wait for its quiescent period",
+    )?;
+    check(
+        process::in_use() == processes + 1,
+        "the shell went while its binding stood",
+    )?;
+    crate::qsbr::quiesce();
+    cleanup::drain();
+    check(
+        irq::in_use() == bindings && !crate::qsbr::pending(),
+        "the quiescent point did not free the binding",
+    )?;
+    check(
+        process::in_use() == processes,
+        "the reclaim did not give the last reference to the shell",
+    )
+}
+
+/// The handle that the test point in `irq::deliver` closes, as the process
+/// and the handle's number, while the point is armed.
+static UNBIND_AT_LINE_READ: Lock<Option<(usize, u64)>> = Lock::new(None);
+
+/// The test point after `irq::deliver` read the binding of its line without
+/// a lock: it closes the armed handle, as a CPU does that unbinds the line
+/// at this very moment.
+pub fn line_read(_: u32) {
+    let armed = UNBIND_AT_LINE_READ.lock().take();
+    if let Some((process, handle)) = armed
+        && let Some(process) = NonNull::new(process as *mut Process)
+    {
+        let _ = process::close_handle(process, Handle(handle), CAUSE);
+    }
+}
+
+/// `deliver` reads the line's binding before it takes `OBJ`, and reads it
+/// again under `OBJ`: when another CPU unbound the line in between, the
+/// interrupt gets nothing, the binding that is still in place is not
+/// touched, and the line stays masked as the unbinding left it.
+pub fn line_unbound_while_delivery_waits_for_obj_gets_nothing(
+    _: &Boot,
+) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        let ch = channel_of(c, h)?;
+        let sources = channel::sources(ch);
+        *UNBIND_AT_LINE_READ.lock() = Some((c.process.as_ptr() as usize, b.0));
+        let delivered = irq::deliver(LINE);
+        let left = UNBIND_AT_LINE_READ.lock().take();
+        check(left.is_none(), "the test point did not run")?;
+        check(!delivered, "the interrupt of an unbound line was delivered")?;
+        check(
+            irq::bound(LINE).is_none() && !gic::is_enabled(LINE),
+            "the line stayed bound or open",
+        )?;
+        check(
+            channel::sources(ch) == sources,
+            "the interrupt reached the channel of the unbound binding",
+        )
+    })
+}
+
 /// A notification in the channel's queue does not hold the line (spec
 /// 9, 13.4): with the slot of a delivery queued, the last handle to the
 /// binding masks the line and frees it, and irq_bind of it succeeds while

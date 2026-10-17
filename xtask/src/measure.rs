@@ -47,6 +47,7 @@ fn measured_line(line: &str) -> bool {
         "call maximum ticks:",
         "fp switch ticks:",
         "upcall ticks:",
+        "obj hold ticks:",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix))

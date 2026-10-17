@@ -29,10 +29,11 @@ use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
+use crate::qsbr::{self, Deferred};
 use abi::{Error, IrqInfo};
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, Ordering};
 use kcore::gic::{FIRST_SPI, FIRST_SPURIOUS};
-use kcore::sync::Lock;
 
 /// The bits of an interrupt (spec 6.5): bit 0 at each delivery.
 const IRQ_BITS: u64 = 1;
@@ -60,8 +61,15 @@ pub struct Irq {
     /// The process whose pool of bindings holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
+    /// The level the cleanup that retired the binding ran at, for the
+    /// release of its payer's shell once the memory goes (`reclaim`).
+    level: u8,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
+    /// The binding waits in the list of retired objects for the end of a
+    /// quiescent period (qsbr), since another CPU may read `LINES` and hold
+    /// the binding without a lock.
+    deferred: Deferred,
 }
 
 // SAFETY: bindings are reached under the kernel's rules (spec 8.1): one
@@ -70,13 +78,12 @@ unsafe impl Send for Irq {}
 
 /// The binding of each shared line, the first for INTID 32: 988 entries
 /// of 8 bytes, outside every quota, like the table of thread numbers (spec
-/// 7.8). An entry names a binding from `bind` until its last handle.
-struct Lines([Option<NonNull<Irq>>; LINE_COUNT]);
-
-// SAFETY: as for Irq.
-unsafe impl Send for Lines {}
-
-static LINES: Lock<Lines> = Lock::new(Lines([None; LINE_COUNT]));
+/// 7.8). An entry names a binding from `bind` until its last handle, or is
+/// null. Written under `OBJ` with release, read without a lock with acquire
+/// (`line_binding`): the binding a reader loaded stays in place until every
+/// CPU passed a quiescent point after it left the table (qsbr).
+static LINES: [AtomicPtr<Irq>; LINE_COUNT] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; LINE_COUNT];
 
 /// Bindings whose places have not gone back.
 static LIVE: Live = Live::new();
@@ -89,7 +96,12 @@ fn entry(line: u32) -> usize {
 /// Whether `line`, a shared line irq_bind checked, has a binding (spec 9):
 /// irq_bind of it fails with BAD_STATE.
 pub fn is_bound(line: u32) -> bool {
-    LINES.lock().0[entry(line)].is_some()
+    line_binding(line).is_some()
+}
+
+/// The binding of `line`, read without a lock (see LINES).
+fn line_binding(line: u32) -> Option<NonNull<Irq>> {
+    NonNull::new(LINES[entry(line)].load(Ordering::Acquire))
 }
 
 /// A binding of `line`, a shared line with no binding, to `c`, an open
@@ -120,14 +132,16 @@ pub fn bind(
         edge,
         masked: false,
         payer,
+        level: 0,
         cleanup: Item::new(),
+        deferred: Deferred::new(),
     };
     let b = process::paid_alloc(payer, irq).inspect_err(|_| channel::remove_source(c))?;
     // SAFETY: the binding was just made, and nothing else refers to it.
     unsafe { (*b.as_ptr()).source.attach(Owner::Irq(b), priority, label) };
     process::retain_shell(payer);
     LIVE.made();
-    LINES.lock().0[entry(line)] = Some(b);
+    LINES[entry(line)].store(b.as_ptr(), Ordering::Release);
     gic::set_trigger(line, edge);
     gic::unmask(line);
     Ok(b)
@@ -208,7 +222,7 @@ pub unsafe fn release_handle(b: NonNull<Irq>, cause: u8) {
         (*p).handles -= 1;
         if (*p).handles == 0 {
             gic::mask((*p).line);
-            LINES.lock().0[entry((*p).line)] = None;
+            LINES[entry((*p).line)].store(core::ptr::null_mut(), Ordering::Release);
         }
         release(b, cause);
     }
@@ -259,13 +273,21 @@ pub fn deliver(line: u32) -> bool {
     if !(FIRST_SPI..FIRST_SPURIOUS).contains(&line) {
         return false;
     }
-    let Some(b) = LINES.lock().0[entry(line)] else {
+    // The lookup takes no lock: the binding stays in place until this CPU
+    // passes a quiescent point, which it does not before this returns.
+    let Some(b) = line_binding(line) else {
         return false;
     };
+    crate::testpoint::line_read(line);
+    let _section = crate::obj::lock();
+    // The line may have been unbound meanwhile, by a CPU that held `OBJ`.
+    if line_binding(line) != Some(b) {
+        return false;
+    }
     let p = b.as_ptr();
-    // SAFETY: LINES names a binding only while handles to it are left,
-    // each with its reference, and none goes during the post: the binding
-    // and its attached source live until it returns.
+    // SAFETY: LINES names the binding still, under OBJ, so handles to it are
+    // left, each with its reference, and none goes during the post: the
+    // binding and its attached source live until it returns.
     unsafe {
         if (*p).masked {
             return true;
@@ -293,8 +315,27 @@ pub unsafe fn clean(b: NonNull<Irq>, level: u8) {
     // the payer's pool is there, since the binding holds the payer's shell,
     // whose reference goes last.
     unsafe {
-        let payer = (*b.as_ptr()).payer;
         (*b.as_ptr()).source.detach(level);
+        (*b.as_ptr()).level = level;
+        // Another CPU may read the binding from LINES as long as no period
+        // passed since the line let go of it.
+        qsbr::retire(NonNull::from(&mut (*b.as_ptr()).deferred), reclaim);
+    }
+}
+
+/// Gives the memory of a binding back once the period passed: its place in
+/// the payer's pool, and the reference to the payer's shell, which goes
+/// last.
+///
+/// # Safety
+/// `d` is the `deferred` of a retired binding, in a section under `OBJ`.
+unsafe fn reclaim(d: NonNull<Deferred>) {
+    let offset = core::mem::offset_of!(Irq, deferred);
+    // SAFETY: the node is the field of a binding, which stays alive until
+    // here; the payer's pool is there, since the binding holds its shell.
+    unsafe {
+        let b = NonNull::new_unchecked(d.as_ptr().byte_sub(offset).cast::<Irq>());
+        let (payer, level) = ((*b.as_ptr()).payer, (*b.as_ptr()).level);
         process::paid_free(payer, b);
         LIVE.gone(b);
         process::release_shell(payer, level);
@@ -319,7 +360,7 @@ mod test_access {
 
     /// The binding LINES names for `line`, a shared line.
     pub fn bound(line: u32) -> Option<NonNull<Irq>> {
-        LINES.lock().0[entry(line)]
+        line_binding(line)
     }
 
     /// The process that pays for `b`, which the test holds.

@@ -8,6 +8,7 @@
 //! all RAM.
 
 use crate::boot::Boot;
+use crate::obj::Guarded;
 use abi::Error;
 use core::ops::Range;
 use kcore::PAGE_SIZE;
@@ -16,7 +17,6 @@ use kcore::frames::{FrameAllocator, PhysMem};
 use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::memmap;
 use kcore::quota::Account;
-use kcore::sync::Lock;
 
 /// Physical memory through the linear map. `read` and `write` take any
 /// physical address, so only code that owns the memory it names may make one.
@@ -209,18 +209,107 @@ pub fn alloc(order: u8, quota: &mut Account) -> Result<Frame, Error> {
 }
 
 /// Zeroes the block of 2^`order` frames at `pa` through the linear map,
-/// the one place that zeroes frames for the kernel (spec 7.3, 7.4). A
-/// loop of word stores, which the compiler makes a loop of `stp` pairs:
-/// the call of `memset` that `write_bytes` becomes costs three times as
-/// many instructions for a frame.
+/// the one place that zeroes frames for the kernel (spec 7.3, 7.4). With
+/// the MMU and the data cache on, `dc zva` zeroes a block of the size
+/// DCZID_EL0 names (64 bytes on the machines we run on) in one instruction;
+/// without them, or where DZP forbids it, a loop of word stores does,
+/// which the compiler makes a loop of `stp` pairs: the call of `memset`
+/// that `write_bytes` becomes costs three times as many instructions for a
+/// frame ([G12]: `dc zva` on memory that is not Normal and cacheable
+/// faults).
 ///
 /// # Safety
 /// The block is RAM the caller owns, and nothing else reaches it meanwhile.
 pub unsafe fn zero(pa: u64, order: u8) {
     let start = LINEAR_BASE + pa as usize;
-    for word in (start..start + (PAGE_SIZE << order) as usize).step_by(8) {
+    let end = start + (PAGE_SIZE << order) as usize;
+    #[cfg(target_os = "none")]
+    if let Some(block) = zva_block() {
+        // SAFETY: the caller's promise; `start` is page aligned, so it is
+        // aligned to `block`, and `end - start` is a multiple of 4096.
+        unsafe { zero_by_blocks(start, end, block) };
+        return;
+    }
+    for word in (start..end).step_by(8) {
         // SAFETY: the caller's promise; the linear map covers all RAM.
         unsafe { (word as *mut u64).write(0) };
+    }
+}
+
+/// The size in bytes of the block `dc zva` zeroes, when this CPU may use it
+/// here: DCZID_EL0.DZP clear, and SCTLR_EL1.M and C set (the linear map is
+/// Normal write-back memory then).
+#[cfg(target_os = "none")]
+#[inline(always)]
+fn zva_block() -> Option<usize> {
+    const DZP: u64 = 1 << 4;
+    const MC: u64 = 0b101;
+    let dczid: u64;
+    let sctlr: u64;
+    // SAFETY: reads of two system registers, with no side effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {d}, dczid_el0",
+            "mrs {s}, sctlr_el1",
+            d = out(reg) dczid,
+            s = out(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (dczid & DZP == 0 && sctlr & MC == MC).then(|| 4usize << (dczid & 0xf))
+}
+
+/// Zeroes `start..end` with `dc zva` of `block` bytes: eight to a turn of
+/// the loop when a page holds as many blocks, one otherwise.
+///
+/// # Safety
+/// As for `zero`; `start` and `end` are multiples of `block`, and
+/// `end - start` of eight blocks when `block` is at most 512.
+#[cfg(target_os = "none")]
+#[inline(always)]
+unsafe fn zero_by_blocks(start: usize, end: usize, block: usize) {
+    // SAFETY: the stores of `dc zva` stay inside the blocks of the range,
+    // which the caller owns.
+    unsafe {
+        if block <= 512 {
+            core::arch::asm!(
+                "2:",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "cmp {p}, {e}",
+                "b.lo 2b",
+                p = inout(reg) start => _,
+                b = in(reg) block,
+                e = in(reg) end,
+                options(nostack),
+            );
+        } else {
+            core::arch::asm!(
+                "2:",
+                "dc zva, {p}",
+                "add {p}, {p}, {b}",
+                "cmp {p}, {e}",
+                "b.lo 2b",
+                p = inout(reg) start => _,
+                b = in(reg) block,
+                e = in(reg) end,
+                options(nostack),
+            );
+        }
     }
 }
 
@@ -241,10 +330,11 @@ pub unsafe fn free(frame: Frame, quota: &mut Account) {
     core::mem::forget(frame);
 }
 
-pub static FRAMES: Lock<Option<Frames>> = Lock::new(None);
+/// The frames of memory, which `OBJ` guards (obj.rs).
+pub static FRAMES: Guarded<Option<Frames>> = Guarded::new(None);
 
 /// The allocator's metadata, which `init` carves out of usable RAM.
-static METADATA: Lock<Region> = Lock::new(Region { base: 0, size: 0 });
+static METADATA: Guarded<Region> = Guarded::new(Region { base: 0, size: 0 });
 
 /// Starts the allocator with the usable RAM that is mapped now; returns the
 /// rest, which becomes reachable with the kernel page tables.

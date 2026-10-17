@@ -4759,7 +4759,33 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 ///    the next commit lowers the constant, so that a shorter path does not
 ///    turn into room for later growth.
 const NULL_MAX: u64 = 271;
-const THREADS_READY_MAX: u64 = 12_896;
+/// The longest hold of the lock OBJ (kernel/src/obj.rs) in instructions
+/// under -icount, over every kernel test and EL0 test of both images: the
+/// term of each other CPU's wait for it (B_N = B + (N-1) * OBJ_HOLD_MAX +
+/// C_cmd, decision 3 of the SMP design). A class of calls that holds longer
+/// goes in portions or narrows its section; the kernel prints the number as
+/// `obj hold ticks: longest=N`.
+const OBJ_HOLD_MAX: u64 = 6_000;
+/// The blocking time of a kernel call on four CPUs, B_4 = B + 3 *
+/// OBJ_HOLD_MAX: the call's own longest portion and the sections of the
+/// three CPUs ahead of it in the ticket lock. Decision of the stage 3
+/// review: `kernel_tests` prints B_4 against this bound now; the stage 4
+/// merge turns it into a failure, and it asks OBJ_HOLD_MAX to come down to
+/// 4 000 (`dc zva` in `phys::zero`, then the zeroing of a new page outside
+/// the section) so that B_4 fits. The ASID rollover adds its own term until
+/// stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
+const B4_MAX: u64 = 32_000;
+/// The hold of the one section that makes a new generation of ASIDs, once
+/// in 65 535 switches of address space: it clears the table of ASIDs and
+/// flushes the TLB. The ASID rework of SMP stage 5 (#356) moves that out of
+/// OBJ; until then it has its own bound.
+const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
+/// The room above the longest hold that `check_obj_hold` leaves before it
+/// asks to lower `OBJ_HOLD_MAX` (rule 4 of the guards), and what a lowered
+/// limit keeps above the measure.
+const OBJ_HOLD_SLACK: u64 = 500;
+const OBJ_HOLD_KEEP: u64 = 250;
+const THREADS_READY_MAX: u64 = 10_833;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -7560,10 +7586,21 @@ fn smp_report(lines: &[String], cpus: usize) -> Result<(), String> {
         "sgi        {cpus} CPUs, all {} pairs: ping and pong ok",
         cpus * (cpus - 1)
     );
-    match lines.iter().position(|l| *l == probe) {
-        Some(at) if at > last => Ok(()),
-        Some(_) => Err("the SGI probe is reported before the CPUs".into()),
-        None => Err(format!("the boot report has no line {probe:?}")),
+    let sgi = match lines.iter().position(|l| *l == probe) {
+        Some(at) if at > last => at,
+        Some(_) => return Err("the SGI probe is reported before the CPUs".into()),
+        None => return Err(format!("the boot report has no line {probe:?}")),
+    };
+    // The probe of the lock OBJ: every CPU's sections added to a plain word,
+    // and all of them came out whole.
+    let lock = format!(
+        "obj        {cpus} CPUs, {} sections: exclusion ok, longest wait ",
+        2_000 * cpus
+    );
+    match lines.iter().position(|l| l.starts_with(&lock)) {
+        Some(at) if at > sgi => Ok(()),
+        Some(_) => Err("the lock probe is reported before the SGI probe".into()),
+        None => Err(format!("the boot report has no line {lock:?}")),
     }
 }
 
@@ -8499,6 +8536,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
             measured.push((what, rows, ticks));
         }
+        check_obj_hold(m.name, &lines)?;
         let (margin, to_term) = b_margin(m.name, &measured)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
@@ -8551,6 +8589,105 @@ const PORTION_LINES: [&str; 7] = [
     "suspension scopes",
 ];
 
+/// The kinds of section the kernel names in `obj hold kind ticks: K=N`
+/// (kernel/src/obj.rs): a call by its number below 40, then the entries
+/// and the cleanup of each kind of object.
+fn obj_kind_name(kind: usize) -> String {
+    const ENTRIES: [&str; 14] = [
+        "interrupt",
+        "cleanup",
+        "fault",
+        "other",
+        "park",
+        "asid",
+        "clean thread",
+        "clean channel",
+        "clean session",
+        "clean timer",
+        "clean irq",
+        "fire timers",
+        "clean memory",
+        "teardown stage",
+    ];
+    match kind {
+        0..40 => abi::Call::from_number(kind as u16)
+            .map_or_else(|| format!("call {kind}"), |c| format!("{c:?}")),
+        _ => ENTRIES
+            .get(kind - 40)
+            .map_or_else(|| format!("kind {kind}"), |n| (*n).to_owned()),
+    }
+}
+
+/// The longest hold of OBJ per kind of section over the kernel tests of
+/// both images, from the lines `obj hold kind ticks: K=N`: the longest of
+/// them but the ASID rollover may not pass OBJ_HOLD_MAX, the rollover
+/// OBJ_ASID_ROLLOVER_MAX. Kind 0 is the code of a test and counts nowhere.
+fn check_obj_hold(name: &str, lines: &[String]) -> Result<(), String> {
+    const ASID: usize = 45;
+    let mut longest = [0u64; 64];
+    for line in lines {
+        let Some(rest) = line.strip_prefix("obj hold kind ticks: ") else {
+            continue;
+        };
+        let Some((kind, ticks)) = rest.split_once('=') else {
+            return Err(format!("the kernel printed {line:?} for OBJ"));
+        };
+        let (Ok(kind), Ok(ticks)) = (kind.trim().parse::<usize>(), ticks.trim().parse::<u64>())
+        else {
+            return Err(format!("the kernel printed {line:?} for OBJ"));
+        };
+        if kind != 0 && kind < longest.len() {
+            longest[kind] = longest[kind].max(ticks);
+        }
+    }
+    let (kind, held) = longest
+        .iter()
+        .enumerate()
+        .filter(|&(kind, _)| kind != ASID)
+        .max_by_key(|&(_, &held)| held)
+        .map(|(kind, &held)| (kind, held))
+        .ok_or("the kernel printed no obj hold ticks")?;
+    if held == 0 {
+        return Err("the kernel printed no obj hold ticks".to_owned());
+    }
+    println!(
+        "OBJ hold on {name}: longest={held} ({}) of OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+        obj_kind_name(kind)
+    );
+    let over: Vec<String> = longest
+        .iter()
+        .enumerate()
+        .filter(|&(kind, &held)| kind != ASID && held > OBJ_HOLD_MAX)
+        .map(|(kind, &held)| format!("{}={held}", obj_kind_name(kind)))
+        .collect();
+    if !over.is_empty() {
+        return Err(format!(
+            "OBJ hold on {name}: {} past OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+            over.join(", ")
+        ));
+    }
+    let rollover = longest[ASID];
+    println!(
+        "OBJ hold of an ASID rollover on {name}: {rollover} of OBJ_ASID_ROLLOVER_MAX {OBJ_ASID_ROLLOVER_MAX}"
+    );
+    if rollover > OBJ_ASID_ROLLOVER_MAX {
+        return Err(format!(
+            "OBJ hold of an ASID rollover on {name}: {rollover} is {} past OBJ_ASID_ROLLOVER_MAX {OBJ_ASID_ROLLOVER_MAX}",
+            rollover - OBJ_ASID_ROLLOVER_MAX
+        ));
+    }
+    if let Some(hint) = guard_lower_hint(
+        "OBJ_HOLD_MAX",
+        OBJ_HOLD_MAX - held,
+        OBJ_HOLD_SLACK,
+        OBJ_HOLD_MAX,
+        OBJ_HOLD_KEEP,
+    ) {
+        println!("{hint}");
+    }
+    Ok(())
+}
+
 /// The longest row of the PORTION_LINES among the `measured` lines (name,
 /// rows, ticks), with its line: the blocking time B of every level (spec
 /// 15.3). The teardown row `threads` is a count of threads and takes no
@@ -8576,6 +8713,10 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
 fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
+    let b4 = n + 3 * OBJ_HOLD_MAX;
+    println!(
+        "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX} (checked from stage 4)"
+    );
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
         None => Err(format!(
@@ -10252,6 +10393,7 @@ mod tests {
             .map(|n| format!("cpu {n}      MPIDR {:#x} EL1 timer ok", 0x8000_0000u64 + n))
             .collect();
         good.push("sgi        4 CPUs, all 12 pairs: ping and pong ok".into());
+        good.push("obj        4 CPUs, 8000 sections: exclusion ok, longest wait 312 ticks".into());
         assert_eq!(smp_report(&good, 4), Ok(()));
         let mut cut = good.clone();
         cut.remove(2);
@@ -10266,8 +10408,11 @@ mod tests {
         wrong[2] = "cpu 2      MPIDR 0x80000003 EL1 timer ok".into();
         assert!(smp_report(&wrong, 4).unwrap_err().contains("0x80000003"));
         let mut no_probe = good.clone();
-        no_probe.pop();
+        no_probe.remove(4);
         assert!(smp_report(&no_probe, 4).unwrap_err().contains("sgi"));
+        let mut no_lock = good.clone();
+        no_lock.pop();
+        assert!(smp_report(&no_lock, 4).unwrap_err().contains("obj"));
         let mut early = good.clone();
         early.rotate_right(1);
         assert!(smp_report(&early, 4).unwrap_err().contains("before"));
@@ -10550,7 +10695,10 @@ mod tests {
             THREADS_READY_MAX,
         )
         .unwrap_err();
-        assert!(error.contains("threads_ready=12904"), "{error}");
+        assert!(
+            error.contains(&format!("threads_ready={}", THREADS_READY_MAX + 8)),
+            "{error}"
+        );
         assert!(guard_margin("x", &NORMAL_BUILD_ROWS, &[0; 5], "none", 1).is_err());
     }
 
@@ -10578,7 +10726,10 @@ mod tests {
                 THREADS_READY_MAX,
                 THREADS_READY_KEEP
             ),
-            Some("lower THREADS_READY_MAX to 12771".to_owned())
+            Some(format!(
+                "lower THREADS_READY_MAX to {}",
+                THREADS_READY_MAX - 129 + THREADS_READY_KEEP
+            ))
         );
         // S5 keeps 10 % above its measure: a measure 301 under the number
         // (room 301) asks for the measure plus 279, which leaves room 279.
@@ -10721,13 +10872,14 @@ mod tests {
         assert!(found.is_empty(), "{word} in {found:?}");
     }
 
-    /// The state of a thread's upcall entry changes only under the
-    /// scheduler's lock, so that a request from another core meets a whole
-    /// state (SMP preparation): each call of a method that changes it, outside
-    /// the kernel tests, has `locked(` on its line or in the six lines
-    /// before it.
+    /// The state of a thread's entry is its own: the CPU that runs the thread
+    /// changes it, with no lock (a request from another CPU reaches it by a
+    /// command that the owner executes, SMP stage 4). So no call that
+    /// changes it outside the kernel tests has `locked(` on its line or in
+    /// the six lines before it; `request`, which another thread makes,
+    /// runs under the lock of the objects.
     #[test]
-    fn upcall_state_changes_run_under_the_scheduler_lock() {
+    fn upcall_state_changes_of_a_thread_run_without_a_lock() {
         let calls = [
             ".bind(",
             ".control(",
@@ -10737,8 +10889,9 @@ mod tests {
             ".prepare(",
             ".returned(",
         ];
-        let mut bare = Vec::new();
+        let mut locked = Vec::new();
         let mut seen = 0;
+        let mut requests = 0;
         for (name, text) in texts(&["kernel/src"]) {
             if name.starts_with("kernel/src/ktest") {
                 continue;
@@ -10747,13 +10900,27 @@ mod tests {
             for (n, line) in lines.iter().enumerate() {
                 let is_upcall = line.contains("upcall")
                     || (n > 0 && lines[n - 1].trim_end().ends_with(".upcall"));
-                if !is_upcall || !calls.iter().any(|c| line.contains(c)) {
+                if !is_upcall {
+                    continue;
+                }
+                if line.contains(".request(") {
+                    requests += 1;
+                    let from = n.saturating_sub(12);
+                    assert!(
+                        lines[from..=n]
+                            .iter()
+                            .any(|l| l.contains("interrupt_if") || l.contains("locked(")),
+                        "a request of an entry outside the lock: {name}:{}",
+                        n + 1
+                    );
+                }
+                if !calls.iter().any(|c| line.contains(c)) {
                     continue;
                 }
                 seen += 1;
                 let from = n.saturating_sub(6);
-                if !lines[from..=n].iter().any(|l| l.contains("locked(")) {
-                    bare.push(format!("{name}:{}", n + 1));
+                if lines[from..=n].iter().any(|l| l.contains("locked(")) {
+                    locked.push(format!("{name}:{}", n + 1));
                 }
             }
         }
@@ -10761,9 +10928,63 @@ mod tests {
             seen >= 7,
             "the scan found {seen} calls, expected at least 7"
         );
+        assert_eq!(requests, 1, "the scan found {requests} requests");
         assert!(
-            bare.is_empty(),
-            "upcall state changed without the lock: {bare:?}"
+            locked.is_empty(),
+            "upcall state of a thread changed under a lock: {locked:?}"
+        );
+    }
+
+    /// The order of locks is in kernel/src/obj.rs: `OBJ` is the only lock the
+    /// CPUs share, and what a CPU alone owns takes none. So outside the kernel
+    /// tests no `kcore::sync::Lock` guards kernel data, the ticket is taken
+    /// only in obj.rs, `Own` cells live only in `Local` (local.rs), and the
+    /// data `OBJ` guards are the five that the order names: a new lock or
+    /// datum has to change this list, and so decide its place in the order.
+    #[test]
+    fn locks_of_the_kernel_are_the_ones_the_order_names() {
+        const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
+        let mut found = Vec::new();
+        let mut guarded = Vec::new();
+        for (name, text) in texts(&["kernel/src"]) {
+            if name.starts_with("kernel/src/ktest") {
+                continue;
+            }
+            for (n, line) in text.lines().enumerate() {
+                let at = format!("{name}:{}", n + 1);
+                if line.contains("kcore::sync::Lock") || line.contains("Lock<") {
+                    found.push(format!("{at}: a kcore Lock"));
+                }
+                if name != "kernel/src/obj.rs" && line.contains("Ticket") {
+                    found.push(format!("{at}: a ticket outside obj.rs"));
+                }
+                if name != "kernel/src/local.rs" && line.contains("Own<") {
+                    found.push(format!("{at}: an Own cell outside local.rs"));
+                }
+                if line.starts_with("static ") && line.contains("Guarded<")
+                    || line.starts_with("pub static ") && line.contains("Guarded<")
+                {
+                    let datum = line
+                        .split("static ")
+                        .nth(1)
+                        .and_then(|rest| rest.split(':').next())
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    guarded.push(datum);
+                }
+            }
+        }
+        assert!(found.is_empty(), "locks the order does not name: {found:?}");
+        guarded.sort();
+        let mut expected: Vec<String> = GUARDED.iter().map(|s| (*s).to_owned()).collect();
+        expected.sort();
+        assert_eq!(guarded, expected, "data under OBJ are not the named ones");
+        let obj =
+            std::fs::read_to_string(workspace_root().unwrap().join("kernel/src/obj.rs")).unwrap();
+        assert!(
+            obj.contains("The order of locks is this module's"),
+            "the order of locks is not written in obj.rs"
         );
     }
 

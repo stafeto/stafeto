@@ -56,7 +56,7 @@ impl Owner {
 
     /// The slot just went into the queue, and it holds its owner from now
     /// on (spec 6.5); the channel holds its own slot. Only counts, so it
-    /// runs under the scheduler's lock.
+    /// runs under OBJ.
     fn hold(self) {
         match self {
             Owner::Channel => {}
@@ -201,7 +201,7 @@ pub fn notify(c: NonNull<Channel>, bits: u64, cause: u8) -> Result<(), Error> {
 /// works at the slot's priority under its ceiling, it becomes ready at the
 /// tail of that level with a new quantum (spec 6.1), and the reference of
 /// its wait goes. Otherwise the slot goes to the tail of its level in the
-/// queue of slots and holds its owner there. It takes the scheduler's lock
+/// queue of slots and holds its owner there. It takes OBJ
 /// itself. O(1).
 ///
 /// # Safety

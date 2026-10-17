@@ -54,18 +54,18 @@ pub struct Thread {
     /// of a request's client (spec 6.6) and the effective priority they
     /// make, the policy, the state, the rest of a quantum and the links of
     /// the ready list. Only the scheduler changes it (sched), and the
-    /// channel under the scheduler's lock.
+    /// channel under OBJ.
     pub sched: Node<Thread>,
     /// What it waits for in `send` or `receive`, and where its slot stands
     /// meanwhile (channel::Wait); only the channel changes it, under the
-    /// scheduler's lock.
+    /// OBJ.
     pub waits: Option<Wait>,
     /// Its own slot of a channel's queue (spec 6.1): its place there while
     /// it waits in `receive`, its request while it waits in `send`, and its
     /// place in the queue of accepted requests of the process that took
     /// the request, at the level of its effective priority when it began
     /// to wait, and at each thread_set_priority since (channel::requeue,
-    /// spec 6.3). Only the channel changes it, under the scheduler's lock.
+    /// spec 6.3). Only the channel changes it, under OBJ.
     slot: Slot<Owner>,
     /// The handles of its request or reply on their way (spec 6.1): out of
     /// its process's table, until the meeting puts them into the table of
@@ -347,7 +347,7 @@ pub fn index(t: NonNull<Thread>) -> u16 {
 /// the reply (`channel::accept`).
 ///
 /// # Safety
-/// Both are alive; `server` holds its number; the scheduler's lock is held.
+/// Both are alive; `server` holds its number; OBJ is held.
 pub unsafe fn set_server(client: NonNull<Thread>, server: NonNull<Thread>) {
     // SAFETY: the caller's promise; only the field is written.
     unsafe { (*client.as_ptr()).numbers.served_by = Some(index(server)) };
@@ -469,7 +469,7 @@ pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
     t.fp.fpcr = word(100);
     t.fp.fpsr = word(101);
     user::load_fp(&t.fp);
-    sched::locked(|_| t.upcall.returned()).expect("validated upcall return");
+    t.upcall.returned().expect("validated upcall return");
     Ok(())
 }
 
@@ -483,12 +483,86 @@ pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
 /// `to` and `from` are alive and differ, and nothing else borrows their
 /// buffers.
 pub unsafe fn copy_message(to: NonNull<Thread>, from: NonNull<Thread>, range: Range<usize>) {
+    // The bytes of a message go between two buffers that no link reaches
+    // and that no thread touches meanwhile, so the copy runs outside OBJ
+    // (`copy_later`).
+    crate::obj::assert_not_held();
     // SAFETY: the caller's promise; the two buffers are two objects.
     let (to, from) = unsafe { (&mut (*to.as_ptr()).buffer, &(*from.as_ptr()).buffer) };
     let (Some(to), Some(from)) = (to.as_mut(), from.as_ref()) else {
         unreachable!("a thread that takes part in a message has its buffer");
     };
     to.frame.copy_from(&from.frame, range);
+}
+
+/// The copy of the bytes of a message that `deliver` began inside a section,
+/// to be made outside it (`flush_copy`): up to 960 bytes. Zeros are none.
+pub struct PendingCopy {
+    to: Option<NonNull<Thread>>,
+    from: Option<NonNull<Thread>>,
+    start: usize,
+    end: usize,
+}
+
+impl PendingCopy {
+    pub const fn new() -> Self {
+        Self {
+            to: None,
+            from: None,
+            start: 0,
+            end: 0,
+        }
+    }
+}
+
+/// Asks for the copy of bytes `range` of `from`'s message buffer into `to`'s,
+/// to be made when the call leaves its section under OBJ (`flush_copy`): the
+/// threads are not woken to run before the call ends, and nothing runs
+/// between. Outside a section the copy is made at once (the kernel tests call
+/// the channel functions that way).
+///
+/// # Safety
+/// As for `copy_message`; the threads stay alive and in place until
+/// `flush_copy`, which the call that delivers makes before it ends.
+pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Range<usize>) {
+    if !crate::obj::held() {
+        // SAFETY: the caller's promise.
+        return unsafe { copy_message(to, from, range) };
+    }
+    let mut pending = crate::local::local().copy.lock();
+    assert!(pending.to.is_none(), "a message copy waits for another");
+    *pending = PendingCopy {
+        to: Some(to),
+        from: Some(from),
+        start: range.start,
+        end: range.end,
+    };
+}
+
+/// Makes the copy that `copy_later` left, outside OBJ: each call that
+/// delivers a message ends with it, and so does the way into a thread that
+/// the delivery made ready.
+#[inline(always)]
+pub fn flush_copy() {
+    let pending = crate::local::local().copy.lock().to.is_some();
+    if pending {
+        flush_copy_now();
+    }
+}
+
+#[inline(never)]
+fn flush_copy_now() {
+    let PendingCopy {
+        to: Some(to),
+        from: Some(from),
+        start,
+        end,
+    } = core::mem::replace(&mut *crate::local::local().copy.lock(), PendingCopy::new())
+    else {
+        return;
+    };
+    // SAFETY: `copy_later`'s promise.
+    unsafe { copy_message(to, from, start..end) };
 }
 
 /// Writes `words` into the message buffer of `t` from byte `offset` on
@@ -709,7 +783,7 @@ pub unsafe fn exit(t: NonNull<Thread>) {
 }
 
 /// Whether `t` waits in send, in receive or for a reply (spec 6.1), read
-/// with the scheduler locked: the stage Threads counts its work by it.
+/// under OBJ: the stage Threads counts its work by it.
 pub fn waits(t: NonNull<Thread>) -> bool {
     // SAFETY: the caller holds the thread, or its process's list does;
     // only the field is read.
@@ -786,7 +860,7 @@ pub fn user_ticks(thread: &Thread) -> u64 {
 
 /// object_info THREAD_STATE of `thread`, which the caller holds (spec 11):
 /// its state, with what it waits for, its base and effective priorities
-/// and its policy, read with the scheduler locked, since the scheduler and
+/// and its policy, read under OBJ, since the scheduler and
 /// the channels change them there. O(1).
 /// The ticks the thread has run, the stint it is in now included, come
 /// with it (x5), and those of them it spent in the kernel (x6).
@@ -861,18 +935,16 @@ pub fn current() -> Option<NonNull<Thread>> {
     NonNull::new(user::current().cast())
 }
 
-/// The entry of the thread's handler, if one comes now, under the
-/// scheduler's lock: the entry address and the stack pointer it starts with.
-#[cold]
-#[inline(never)]
+/// The entry of the thread's handler, if one comes now: the entry address
+/// and the stack pointer it starts with. The state of the entry is the
+/// thread's own, changed by the CPU that runs it with no lock (syscall::upcall).
+#[inline(always)]
 fn prepare_entry(thread: &mut Thread) -> Option<(u64, u64)> {
-    sched::locked(|_| {
-        let long = thread.long.is_some();
-        thread
-            .upcall
-            .prepare(thread.regs.elr, thread.regs.spsr, thread.regs.sp, long)
-            .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
-    })
+    let long = thread.long.is_some();
+    thread
+        .upcall
+        .prepare(thread.regs.elr, thread.regs.spsr, thread.regs.sp, long)
+        .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
 }
 
 /// Runs `next` at EL0. A switch from another thread saves that one's FP
@@ -903,9 +975,9 @@ pub fn run(next: NonNull<Thread>) -> ! {
         }
         process.as_mut().activate();
         let thread = &mut *next.as_ptr();
-        // The look is without the lock; the entry itself is made under the
-        // scheduler's lock, as `request_upcall` makes its request, so that a
-        // request from another core meets a whole state.
+        // Neither the look nor the entry takes `OBJ`: the thread runs on
+        // this CPU alone, so the state of its entry is this CPU's own
+        // (syscall::upcall).
         if thread.upcall.is_pending()
             && let Some((entry, sp)) = prepare_entry(thread)
         {
