@@ -16,6 +16,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+/// When set, a failed job does not stop the jobs after it: every job runs
+/// and the error names all the failed ones (`cargo xtask ci`).
+static KEEP_GOING: AtomicBool = AtomicBool::new(false);
+
+pub fn keep_going(on: bool) {
+    KEEP_GOING.store(on, Ordering::Relaxed);
+}
+
+fn keeps_going() -> bool {
+    KEEP_GOING.load(Ordering::Relaxed)
+}
+
 /// A check that stands alone: it shares with the others only what the
 /// builds of xtask guard (`once`, BUILD_LOCK).
 pub struct Job {
@@ -68,10 +80,22 @@ struct Done {
 /// jobs.
 pub fn run_all(jobs: Vec<Job>, limit: usize) -> Result<(), String> {
     if limit <= 1 {
+        let mut failed = Vec::new();
         for job in jobs {
-            (job.run)().map_err(|e| format!("{}: {e}", job.name))?;
+            let result = (job.run)().map_err(|e| format!("{}: {e}", job.name));
+            match result {
+                Err(e) if keeps_going() => {
+                    println!("== FAILED: {e}");
+                    failed.push(e);
+                }
+                other => other?,
+            }
         }
-        return Ok(());
+        return if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{} failed: {}", failed.len(), failed.join(", ")))
+        };
     }
     let start = Instant::now();
     let names: Vec<String> = jobs.iter().map(|j| j.name.clone()).collect();
@@ -100,7 +124,7 @@ pub fn run_all(jobs: Vec<Job>, limit: usize) -> Result<(), String> {
                         catch_unwind(AssertUnwindSafe(job.run))
                             .unwrap_or_else(|_| Err("panicked".to_owned()))
                     });
-                    if result.is_err() {
+                    if result.is_err() && !keeps_going() {
                         failed.store(true, Ordering::Relaxed);
                     }
                     let done = Done {

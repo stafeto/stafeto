@@ -23,61 +23,24 @@ env:
   # machine models and timers on every host.
   QEMU_VERSION: "11.1.2"
 
+# `build` builds once what the groups need and hands it over in a cache
+# keyed by the run. Each group runs its part of `cargo xtask ci` (the list
+# of the groups: `cargo xtask ci --list-groups`) in a job of its own, and
+# every group runs to the end whatever the others do. `ci` is green when
+# `build` and all the groups are.
 jobs:
-  ci:
-    name: cargo xtask ci
+  build:
+    name: build
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system packages
-        run: |
-          # The C probes need the clang of the developers' Macs (23): the
-          # distribution's clang 18 lacks the __INT64_C family relibc's headers use.
-          sudo install -d -m 0755 /etc/apt/keyrings
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
-          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION" make python3 git curl \
-            ca-certificates bzip2 xz-utils patch ninja-build pkg-config libglib2.0-dev libpixman-1-dev python3-venv flex bison
-          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
-          "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version | head -1
-
-      - name: Restore QEMU
-        id: qemu
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup
         with:
-          path: ~/qemu
-          key: qemu-${{ runner.arch }}-${{ env.QEMU_VERSION }}-1
-
-      - name: Build QEMU
-        if: steps.qemu.outputs.cache-hit != 'true'
-        run: |
-          curl -fsSL "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz" -o "$RUNNER_TEMP/qemu.tar.xz"
-          mkdir "$RUNNER_TEMP/qemu-src"
-          tar -xJf "$RUNNER_TEMP/qemu.tar.xz" -C "$RUNNER_TEMP/qemu-src" --strip-components=1
-          cd "$RUNNER_TEMP/qemu-src"
-          ./configure --prefix="$HOME/qemu" --target-list=aarch64-softmmu --disable-docs --disable-werror --disable-guest-agent --disable-user
-          make -j"$(nproc)"
-          make install
-
-      - name: Put QEMU on PATH
-        run: |
-          echo "$HOME/qemu/bin" >> "$GITHUB_PATH"
-          "$HOME/qemu/bin/qemu-system-aarch64" --version
-
-      - name: Install the pinned Rust toolchain
-        run: |
-          if ! command -v rustup >/dev/null; then
-            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          "$HOME/.cargo/bin/rustup" show active-toolchain || "$HOME/.cargo/bin/rustup" toolchain install
+          build-qemu: "true"
 
       - name: Restore caches
-        id: cache
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -85,18 +48,18 @@ jobs:
             ~/.cargo/git
             ~/.rustup/toolchains
             target
-          key: ci2-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-relibc.py', 'tools/build-busybox.py', 'tools/build-ready-utils.py', 'tools/build-os-test.py', 'tools/build-open-posix.py') }}-${{ github.run_id }}
+          key: ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
           restore-keys: |
-            ci2-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-relibc.py', 'tools/build-busybox.py', 'tools/build-ready-utils.py', 'tools/build-os-test.py', 'tools/build-open-posix.py') }}-
-            ci2-${{ runner.arch }}-
+            ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-
+            ci3-${{ runner.arch }}-
 
-      - name: Install the pinned toolchain from the cache
+      - name: Install the pinned toolchain
         run: rustup toolchain install
 
-      - name: cargo xtask ci
-        run: cargo xtask ci --jobs "$CI_JOBS"
+      - name: cargo xtask ci --group build
+        run: cargo xtask ci --group build --jobs "$CI_JOBS"
 
-      - name: Save caches
+      - name: Save the build for the groups
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -105,7 +68,7 @@ jobs:
             ~/.cargo/git
             ~/.rustup/toolchains
             target
-          key: ci2-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-relibc.py', 'tools/build-busybox.py', 'tools/build-ready-utils.py', 'tools/build-os-test.py', 'tools/build-open-posix.py') }}-${{ github.run_id }}
+          key: ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
 
       - name: Collect logs
         if: failure()
@@ -113,14 +76,89 @@ jobs:
           mkdir -p ci-logs
           find target -type f \( -name '*.log' -o -name '*.out' -o -name '*.serial' -o -name 'config.log' \) -size -50M -print0 \
             | xargs -0 -r -I{} cp --parents {} ci-logs/ || true
-          find target -maxdepth 3 -type f \( -name '*.stamp' -o -name 'manifest' \) -print0 | xargs -0 -r -I{} cp --parents {} ci-logs/ || true
           df -h > ci-logs/df.txt; free -m > ci-logs/free.txt; nproc > ci-logs/nproc.txt
 
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-logs
+          name: ci-logs-build
           path: ci-logs
           if-no-files-found: ignore
           retention-days: 14
+
+  group:
+    name: ${{ matrix.group }}
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - host
+          - kernel
+          - os-test
+          - open-posix-1
+          - open-posix-2
+          - open-posix-3
+          - guests-1
+          - guests-2
+          - guests-3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+
+      - name: Restore the build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            target
+          key: ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Install the pinned toolchain from the cache
+        run: rustup toolchain install
+
+      - name: Date the sources before the build
+        # The build job compiled these very sources. Cargo takes a source
+        # newer than its build for changed, and the checkout of this job is
+        # newer than the build it restored.
+        run: git ls-files -z | xargs -0 touch -d '2001-01-01 00:00:00'
+
+      - name: cargo xtask ci --group ${{ matrix.group }}
+        run: cargo xtask ci --group "${{ matrix.group }}" --jobs "$CI_JOBS"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          find target -type f \( -name '*.log' -o -name '*.out' -o -name '*.serial' -o -name 'config.log' \) -size -50M -print0 \
+            | xargs -0 -r -I{} cp --parents {} ci-logs/ || true
+          df -h > ci-logs/df.txt; free -m > ci-logs/free.txt; nproc > ci-logs/nproc.txt
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ matrix.group }}
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ci:
+    name: ci
+    if: always()
+    needs: [build, group]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Every group is green
+        run: |
+          echo "build: ${{ needs.build.result }}, groups: ${{ needs.group.result }}"
+          test "${{ needs.build.result }}" = success
+          test "${{ needs.group.result }}" = success

@@ -116,6 +116,68 @@ fn entries<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     files + directories.len() + 32
 }
 
+/// What the link of one test gives: its stripped ELF, the error of a
+/// native linker that refused it, or an error that stops the run.
+type Linked = Result<Result<Vec<u8>, String>, String>;
+
+/// Every test that compiled, linked on the threads of the host (a link is
+/// about a third of a second and there are over a thousand of them).
+/// Entry `n` is the test `n`, `None` for a test that did not compile.
+fn link_all(
+    link: &ProbeLink,
+    link_dir: &Path,
+    tests: &[Test],
+    objcopy: &Path,
+    objdump: &Path,
+) -> Vec<Option<Linked>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Linked>>> = Mutex::new(tests.iter().map(|_| None).collect());
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let number = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(test) = tests.get(number) else { break };
+                    if test.built.starts_with('!') {
+                        continue;
+                    }
+                    let scratch = link_dir.join(format!("test-{number}"));
+                    let elf = link_dir.join(format!("test-{number}.elf"));
+                    let result = link.link(&test.built, &scratch, &elf);
+                    let linked = (|| -> Linked {
+                        if let Err(error) = result {
+                            let _ = std::fs::remove_dir_all(&scratch);
+                            return if error.starts_with("native linker exited ") {
+                                Ok(Err(error))
+                            } else {
+                                Err(format!("link infrastructure for {}: {error}", test.name))
+                            };
+                        }
+                        crate::disasm::erratum_835769(&elf, objdump)?;
+                        crate::disasm::erratum_843419(&elf)?;
+                        let stripped = link_dir.join(format!("test-{number}.stripped"));
+                        crate::run_cmd(
+                            Command::new(objcopy)
+                                .arg("--strip-all")
+                                .arg(&elf)
+                                .arg(&stripped),
+                        )?;
+                        let bytes = std::fs::read(&stripped).map_err(|e| e.to_string())?;
+                        for path in [&elf, &stripped] {
+                            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                        }
+                        std::fs::remove_dir_all(&scratch).map_err(|e| e.to_string())?;
+                        Ok(Ok(bytes))
+                    })();
+                    slots.lock().unwrap_or_else(PoisonError::into_inner)[number] = Some(linked);
+                }
+            });
+        }
+    });
+    slots.into_inner().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Individual corpus failures are census rows; missing tools remain command failures.
 pub fn run(jobs: usize) -> Result<(), String> {
     let begun = Instant::now();
@@ -168,6 +230,7 @@ pub fn run(jobs: usize) -> Result<(), String> {
     let mut batches = Vec::new();
     let mut files = Batch::default();
     let mut contents = std::collections::BTreeMap::new();
+    let mut linked = link_all(&link, &link_dir, &tests, &objcopy, &objdump);
     for (number, test) in tests.iter().enumerate() {
         let path = sources
             .get(test.name.as_str())
@@ -184,12 +247,9 @@ pub fn run(jobs: usize) -> Result<(), String> {
             );
             continue;
         }
-        let scratch = link_dir.join(format!("test-{number}"));
-        let elf = link_dir.join(format!("test-{number}.elf"));
-        let result = link.link(&test.built, &scratch, &elf);
-        if let Err(error) = result {
-            let _ = std::fs::remove_dir_all(&scratch);
-            if error.starts_with("native linker exited ") {
+        let bytes = match linked[number].take() {
+            Some(Ok(Ok(bytes))) => bytes,
+            Some(Ok(Err(error))) => {
                 record(
                     &mut rows,
                     &test.name,
@@ -200,23 +260,12 @@ pub fn run(jobs: usize) -> Result<(), String> {
                 );
                 continue;
             }
-            write_rows(&rows)?;
-            return Err(format!("link infrastructure for {}: {error}", test.name));
-        }
-        crate::disasm::erratum_835769(&elf, &objdump)?;
-        crate::disasm::erratum_843419(&elf)?;
-        let stripped = link_dir.join(format!("test-{number}.stripped"));
-        crate::run_cmd(
-            Command::new(&objcopy)
-                .arg("--strip-all")
-                .arg(&elf)
-                .arg(&stripped),
-        )?;
-        let bytes = std::fs::read(&stripped).map_err(|e| e.to_string())?;
-        for path in [&elf, &stripped] {
-            std::fs::remove_file(path).map_err(|e| e.to_string())?;
-        }
-        std::fs::remove_dir_all(&scratch).map_err(|e| e.to_string())?;
+            Some(Err(error)) => {
+                write_rows(&rows)?;
+                return Err(error);
+            }
+            None => return Err(format!("{}: not linked", test.name)),
+        };
         let fixture = source_fixture(&test.name, &source);
         if !fits(&files, &test.name, bytes.len(), fixture.as_ref()) && !files.tests.is_empty() {
             batches.push(std::mem::take(&mut files));
