@@ -453,7 +453,13 @@ pub fn take_longest() -> u64 {
 pub fn drain() {
     loop {
         while top().is_some() {
+            // Each portion is a stretch of its own, as between two polls of
+            // the way out of the kernel (obj::stretch_begins).
+            #[cfg(feature = "measure")]
+            crate::obj::stretch_begins(timer::now());
             portion();
+            #[cfg(feature = "measure")]
+            crate::obj::stretch_ends(timer::now());
         }
         if !crate::qsbr::pending() {
             return;

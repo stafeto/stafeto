@@ -40,6 +40,9 @@ pub struct Counted {
     /// Kernel time, longest entry, OBJ taken, wait, longest wait: for each CPU.
     pub cpus: Vec<[u64; 5]>,
     pub longest_hold: u64,
+    /// The most takes of OBJ in a stretch between two polls, by the tickets
+    /// of every CPU (kernel/src/obj.rs): an upper bound of one CPU's k.
+    pub most_takes: u64,
 }
 
 /// The rows of a run, each storm row with what the kernel counted for it.
@@ -89,6 +92,13 @@ pub fn parse(lines: &[String]) -> (Vec<Row>, Vec<Counted>) {
                 }
                 pending.cpus[at] = [n[2], n[3], n[4], n[5], n[6]];
             }
+        } else if let Some(rest) = line.strip_prefix("smp-measure OBJ takes in a stretch ") {
+            // `0=12 1=300 3=900`: the longest stretch by count of takes.
+            pending.most_takes = rest
+                .split(' ')
+                .filter_map(|w| w.split_once('=')?.0.parse().ok())
+                .max()
+                .unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("smp-measure OBJ longest hold ") {
             pending.longest_hold = rest
                 .split(' ')
@@ -214,11 +224,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .max()
             .unwrap_or(0);
         let hold = storms.iter().map(|s| s.longest_hold).max().unwrap_or(0);
+        let takes = storms.iter().map(|s| s.most_takes).max().unwrap_or(0);
         let bound = (cpus as u64 - 1) * hold;
         let instructions = (cpus as u64 - 1) * OBJ_HOLD_MAX;
         let _ = writeln!(
             report,
-            "  under the storms: longest entry {longest_entry} (CPU 0: {entry_cpu0}), longest OBJ hold {hold}, longest OBJ wait {longest_wait} (bound {bound} = (N-1) * the longest hold), wait share of the kernel time {}.{} %",
+            "  under the storms: longest entry {longest_entry} (CPU 0: {entry_cpu0}), longest OBJ hold {hold}, most takes of OBJ in a stretch {takes} (tickets of every CPU), longest OBJ wait {longest_wait} (bound {bound} = (N-1) * the longest hold), wait share of the kernel time {}.{} %",
             share / 10,
             share % 10
         );

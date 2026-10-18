@@ -86,6 +86,8 @@ pub fn entry_started() -> u64 {
     let now = timer::now_unordered();
     // SAFETY: single core with interrupts masked, as above.
     unsafe { (*local().entry.get()).0 = now };
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_begins(now);
     now
 }
 
@@ -95,7 +97,24 @@ pub fn entry_started() -> u64 {
 pub fn entry_polled() {
     // SAFETY: single core with interrupts masked, as above.
     if unsafe { (*local().entry.get()).0 } != 0 {
-        entry_polled_at(timer::now());
+        let now = timer::now();
+        entry_polled_at(now);
+        // The next portion begins a stretch of its own (`entry_started`).
+        #[cfg(feature = "measure")]
+        crate::obj::stretch_ends(now);
+    }
+}
+
+/// A poll of the way out of the kernel at `now`: the stretch of the entry,
+/// if open, ends, and so does the stretch of OBJ's takes, and a new one
+/// begins (obj::stretch_ends).
+#[inline(always)]
+fn polled_at(now: u64) {
+    entry_polled_at(now);
+    #[cfg(feature = "measure")]
+    {
+        crate::obj::stretch_ends(now);
+        crate::obj::stretch_begins(now);
     }
 }
 
@@ -762,7 +781,7 @@ pub fn resume() -> ! {
 extern "C" fn exit_loop() -> ! {
     loop {
         let mut now = timer::now();
-        entry_polled_at(now);
+        polled_at(now);
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {
@@ -866,11 +885,15 @@ fn sleep() {
     crate::mm::aspace::leave();
     crate::testpoint::idle();
     let slept = timer::now();
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_ends(slept);
     local().time.sleeps(slept);
     crate::qsbr::idle();
     let ack = gic::wait();
     crate::qsbr::awake();
     let woke = timer::now();
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_begins(woke);
     local().time.woke(woke);
     {
         let mut g = local().sched.lock();

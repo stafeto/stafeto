@@ -117,7 +117,7 @@ impl Caller {
         let mut t = self.thread;
         // SAFETY: the thread is the test's and never runs.
         unsafe { t.as_mut() }.regs.x[..10].copy_from_slice(&with_marks(args));
-        syscall::dispatch(t, number);
+        super::dispatch(t, number);
         let mut after = [0; 10];
         // SAFETY: as above.
         after.copy_from_slice(&unsafe { t.as_ref() }.regs.x[..10]);
@@ -132,7 +132,7 @@ impl Caller {
         let mut t = self.thread;
         // SAFETY: the thread is the test's and never runs.
         unsafe { t.as_mut() }.regs.elr += 4;
-        syscall::dispatch(t, number);
+        super::dispatch(t, number);
         let mut after = [0; 10];
         // SAFETY: as above.
         after.copy_from_slice(&unsafe { t.as_ref() }.regs.x[..10]);

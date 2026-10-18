@@ -35,7 +35,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 #[cfg(feature = "measure")]
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use kcore::sync::Ticket;
 
@@ -81,7 +81,12 @@ pub const CLEAN_PROCESS: u64 = 53;
 #[inline(always)]
 pub fn serving(_what: u64) {
     #[cfg(feature = "measure")]
-    SERVING.store(_what, Relaxed);
+    {
+        SERVING.store(_what, Relaxed);
+        if _what != 0 {
+            LAST_KIND.store(_what as u32, Relaxed);
+        }
+    }
 }
 
 /// A section under `OBJ`: dropping the guard that took the lock gives it
@@ -203,6 +208,117 @@ pub fn outside<R>(work: impl FnOnce() -> R) -> R {
     r
 }
 
+/// The takes of `OBJ` in a stretch of a CPU between two polls for an
+/// interrupt: each may wait for (N-1) holds of the other CPUs, so xtask
+/// bounds the blocking time of N CPUs by the longest stretch with k takes
+/// plus k * (N-1) * OBJ_HOLD_MAX, over every k. A stretch begins at an entry
+/// from EL0, at a poll, or on waking from `wfi`; it ends at a poll, at the
+/// way to EL0, or at `wfi`. The last count holds `TAKES_KEPT` takes and more.
+/// The takes are the tickets of the lock, which cost a take nothing: exact
+/// on one CPU, and more than this CPU's own on several. The kernel tests
+/// open a stretch for each call they make and close it when the call
+/// returns, and drop the stretch of a test call from EL0 (`stretch_drop`):
+/// the code of a test is in no stretch.
+#[cfg(feature = "measure")]
+pub const TAKES_KEPT: usize = 16;
+
+/// What the last named section served, which names a stretch.
+#[cfg(feature = "measure")]
+static LAST_KIND: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(feature = "measure")]
+struct Stretch {
+    /// The counter when the stretch began, 0 when none is open.
+    since: AtomicU64,
+    /// The tickets of the lock when the stretch began.
+    tickets: AtomicU32,
+    /// The longest stretch so far with each count of takes, in ticks, and
+    /// the kind of its last section.
+    longest: [AtomicU64; TAKES_KEPT + 1],
+    kind: [AtomicU32; TAKES_KEPT + 1],
+}
+
+/// Each CPU's own, written by that CPU alone.
+#[cfg(feature = "measure")]
+static STRETCH: [Stretch; crate::arch::cpu::MAX_CPUS] = [const {
+    Stretch {
+        since: AtomicU64::new(0),
+        tickets: AtomicU32::new(0),
+        longest: [const { AtomicU64::new(0) }; TAKES_KEPT + 1],
+        kind: [const { AtomicU32::new(0) }; TAKES_KEPT + 1],
+    }
+}; crate::arch::cpu::MAX_CPUS];
+
+/// The stretch open on this CPU ends at `now`, and counts with its takes.
+#[cfg(feature = "measure")]
+#[inline(always)]
+pub fn stretch_ends(now: u64) {
+    let s = &STRETCH[crate::arch::cpu::this().index()];
+    let since = s.since.load(Relaxed);
+    if since != 0 {
+        let takes = OBJ.tickets().wrapping_sub(s.tickets.load(Relaxed) as u16);
+        let k = usize::from(takes).min(TAKES_KEPT);
+        let took = now.wrapping_sub(since);
+        let kind = LAST_KIND.load(Relaxed);
+        if took > s.longest[k].load(Relaxed) {
+            s.longest[k].store(took, Relaxed);
+            s.kind[k].store(kind, Relaxed);
+        }
+        // The most takes of a stretch of each kind, with its length.
+        let worst = &TAKES_BY_KIND[kind as usize];
+        let packed = (k as u64) << 48 | took.min(0xffff_ffff_ffff);
+        if packed > worst.load(Relaxed) {
+            worst.store(packed, Relaxed);
+        }
+        s.since.store(0, Relaxed);
+    }
+}
+
+/// The most takes of a stretch by the kind of its last section, in bits
+/// 48-63, and that stretch's length below.
+#[cfg(feature = "measure")]
+static TAKES_BY_KIND: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+/// The most takes in a stretch of each kind, and its length (TAKES_BY_KIND).
+#[cfg(all(feature = "measure", feature = "ktest"))]
+pub fn takes_by_kind() -> [(u64, u64); KINDS] {
+    core::array::from_fn(|i| {
+        let packed = TAKES_BY_KIND[i].load(Relaxed);
+        (packed >> 48, packed & 0xffff_ffff_ffff)
+    })
+}
+
+/// A stretch begins on this CPU at `now`, with no take yet.
+#[cfg(feature = "measure")]
+#[inline(always)]
+pub fn stretch_begins(now: u64) {
+    let s = &STRETCH[crate::arch::cpu::this().index()];
+    s.since.store(now, Relaxed);
+    s.tickets.store(u32::from(OBJ.tickets()), Relaxed);
+    LAST_KIND.store(0, Relaxed);
+}
+
+/// The stretch open on this CPU counts for nothing: the code of a test runs
+/// in it.
+#[cfg(all(feature = "measure", feature = "ktest"))]
+pub fn stretch_drop() {
+    STRETCH[crate::arch::cpu::this().index()].since.store(0, Relaxed);
+}
+
+/// The longest stretch with each count of takes over every CPU, in ticks,
+/// with the kind of its last section: the lines `obj takes ticks: k=C` of
+/// the measuring images.
+#[cfg(all(feature = "measure", any(feature = "ktest", feature = "smp-measure")))]
+pub fn stretches_by_takes() -> [(u64, u32); TAKES_KEPT + 1] {
+    core::array::from_fn(|k| {
+        STRETCH
+            .iter()
+            .map(|s| (s.longest[k].load(Relaxed), s.kind[k].load(Relaxed)))
+            .max()
+            .unwrap_or((0, 0))
+    })
+}
+
 /// The longest hold of `OBJ` so far, in ticks, and the kind that served it:
 /// `OBJ_HOLD_MAX` of xtask bounds it.
 #[cfg(feature = "measure")]
@@ -215,6 +331,16 @@ pub fn longest_hold() -> (u64, u64) {
         .map(|(kind, &held)| (held, kind as u64))
         .max()
         .unwrap_or((0, 0))
+}
+
+/// Forgets the stretches so far (`smpm::reset`).
+#[cfg(feature = "smp-measure")]
+pub fn reset_stretches() {
+    for s in &STRETCH {
+        for took in &s.longest {
+            took.store(0, Relaxed);
+        }
+    }
 }
 
 /// Forgets the holds so far (`smpm::reset`).

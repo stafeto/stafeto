@@ -4949,6 +4949,10 @@ const OBJ_HOLD_MAX: u64 = 4_000;
 /// review: `kernel_tests` fails B_4 above this bound from stage 4. The ASID
 /// section that begins a new generation is a section like the rest (stage 5).
 const B4_MAX: u64 = 32_000;
+/// Whether `kernel_tests` fails B_4 with the takes of OBJ in a stretch
+/// above B4_MAX: off while stretches of the cleanup of memory, channels and
+/// processes and of mem_create take OBJ once a frame or an item.
+const B4_TAKES_ENFORCED: bool = false;
 /// The room above the longest hold that `check_obj_hold` leaves before it
 /// asks to lower `OBJ_HOLD_MAX` (rule 4 of the guards), and what a lowered
 /// limit keeps above the measure.
@@ -8806,7 +8810,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             measured.push((what, rows, ticks));
         }
         check_obj_hold(m.name, &lines)?;
-        let (margin, to_term) = b_margin(m.name, &measured)?;
+        let (margin, to_term) = b_margin(m.name, &measured, &lines)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
             m.name
@@ -8969,18 +8973,63 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
         .unwrap_or(("none", "none", 0))
 }
 
+/// The longest stretch between two polls for an interrupt with each count
+/// k of takes of OBJ, from the lines `obj takes ticks: k=C` of the kernel
+/// (kernel/src/obj.rs; the last k counts that many takes and more): pairs
+/// (k, C).
+fn stretches_by_takes(lines: &[String]) -> Result<Vec<(u64, u64)>, String> {
+    let mut by_k = std::collections::BTreeMap::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix("obj takes ticks: ") else {
+            continue;
+        };
+        let parsed = rest
+            .split_once('=')
+            .and_then(|(k, c)| Some((k.trim().parse::<u64>().ok()?, c.trim().parse::<u64>().ok()?)));
+        let Some((k, c)) = parsed else {
+            return Err(format!("the kernel printed {line:?} for OBJ"));
+        };
+        let longest = by_k.entry(k).or_insert(0);
+        *longest = c.max(*longest);
+    }
+    if by_k.is_empty() {
+        return Err("the kernel printed no obj takes ticks".to_owned());
+    }
+    Ok(by_k.into_iter().collect())
+}
+
+/// The blocking time of a call on `cpus` CPUs: each take of OBJ in a
+/// stretch may wait for the holds of the (N-1) other CPUs, so B_N is the
+/// largest C + k * (N-1) * OBJ_HOLD_MAX over the stretches (k, C), and over
+/// B with one take (the rows, measured apart from the stretches). The term
+/// and the k that give it.
+fn b_n(cpus: u64, b: u64, stretches: &[(u64, u64)]) -> (u64, u64, u64) {
+    std::iter::once((1, b))
+        .chain(stretches.iter().copied())
+        .map(|(k, c)| (c + k * (cpus - 1) * OBJ_HOLD_MAX, k, c))
+        .max()
+        .unwrap_or((0, 0, 0))
+}
+
 /// The margins of the longest portion in `measured`, which the `B on` line
 /// prints, under KERNEL_B_MAX and under TERM_B; an error when it is past
-/// KERNEL_B_MAX.
-fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
+/// KERNEL_B_MAX, or when B_4 with the takes of OBJ in `lines` is past
+/// B4_MAX.
+fn b_margin(
+    name: &str,
+    measured: &[(&str, &[&str], Vec<u64>)],
+    lines: &[String],
+) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
-    // B_N = B + (N-1) * OBJ_HOLD_MAX (the command's own work, C_cmd, is in B
-    // and in the holds): printed for the CPU counts of the table of docs/smp.md.
+    let stretches = stretches_by_takes(lines)?;
+    let shown: Vec<String> = stretches.iter().map(|(k, c)| format!("{k}={c}")).collect();
+    println!("OBJ takes on {name}: longest stretch by takes {}", shown.join(" "));
+    // The command's own work, C_cmd, is in the stretch and in the holds.
     for cpus in [2, 8] {
-        let b_n = n + (cpus - 1) * OBJ_HOLD_MAX;
+        let (b, k, c) = b_n(cpus, n, &stretches);
         println!(
-            "B_{cpus} on {name}: {b_n} = B {n} + {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+            "B_{cpus} on {name}: {b} = {c} + {k} * {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
             cpus - 1
         );
     }
@@ -8991,6 +9040,22 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
             "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
             b4 - B4_MAX
         ));
+    }
+    // With the takes: printed, and no error until every stretch takes OBJ
+    // at most once, or twice in a short one (B4_TAKES_ENFORCED).
+    let (b4, k, c) = b_n(4, n, &stretches);
+    println!(
+        "B_4 with the takes on {name}: {b4} = {c} + {k} * 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}"
+    );
+    if b4 > B4_MAX {
+        let past = format!(
+            "B_4 with the takes on {name}: {b4} = {c} + {k} * 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
+            b4 - B4_MAX
+        );
+        if B4_TAKES_ENFORCED {
+            return Err(past);
+        }
+        println!("{past}");
     }
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
@@ -11431,7 +11496,11 @@ mod tests {
         };
         let margin = |n| {
             let ticks = ticks_of(&log(n), "suspension scopes", &SUSPENSION_ROWS)?;
-            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)])
+            b_margin(
+                "t",
+                &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)],
+                &["obj takes ticks: 1=100".to_owned()],
+            )
         };
         assert_eq!(margin(KERNEL_B_MAX), Ok((0, TERM_B - KERNEL_B_MAX)));
         assert!(
@@ -11439,6 +11508,34 @@ mod tests {
                 .unwrap_err()
                 .contains("past KERNEL_B_MAX")
         );
+    }
+
+    /// Each take of OBJ in a stretch counts (N-1) holds: a short stretch
+    /// with two takes may pass B4_MAX where B with one does not, and a log
+    /// with no line of takes fails.
+    #[test]
+    fn b_4_counts_every_take_of_obj_in_a_stretch() {
+        let rows = |n: u64| {
+            let log = vec![format!(
+                "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
+                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+            )];
+            ticks_of(&log, "suspension scopes", &SUSPENSION_ROWS).unwrap()
+        };
+        let margin = |takes: &[&str]| {
+            let lines: Vec<String> = takes.iter().map(|l| (*l).to_owned()).collect();
+            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], rows(10_000))], &lines)
+        };
+        let fits = B4_MAX - 2 * 3 * OBJ_HOLD_MAX;
+        assert!(margin(&[&format!("obj takes ticks: 2={fits}")]).is_ok());
+        let over = margin(&["obj takes ticks: 0=5", &format!("obj takes ticks: 2={}", fits + 1)]);
+        if B4_TAKES_ENFORCED {
+            assert!(over.unwrap_err().contains("2 * 3 * OBJ_HOLD_MAX"));
+        } else {
+            assert!(over.is_ok());
+        }
+        assert!(margin(&[]).unwrap_err().contains("no obj takes"));
+        assert_eq!(b_n(4, 7, &[(0, 9), (3, 1)]), (1 + 9 * OBJ_HOLD_MAX, 3, 1));
     }
 
     #[test]
