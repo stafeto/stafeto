@@ -24,7 +24,7 @@ Unknown keys are refused.
 | `build` | The build script, from the workspace root. |
 | `program` | The image program its build links, if it has one of its own. |
 | `dirs` | Directories only this package needs. |
-| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>` or `bytes:<name>`. Several paths may name one program (the hard links of BusyBox). |
+| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or `link:<name>`, a symbolic link to a file of its own directory (`/bin/cat = link:busybox`: `ls -l` shows `cat -> busybox`). Several paths may name one program (hard links), and the links to one name share one file of the image. A link must name a file of the image that is no link itself. |
 | `license_file` | Optional: the licence file in the source tree, for tools that read it. |
 
 Example (`packages/nano.toml`):
@@ -58,12 +58,14 @@ them for the licence notes of the image.
   packages claim, an unknown dependency or a dependency cycle each stop it.
   It also checks that every file of the shell image belongs to exactly one
   package or to the base system (init and the services: `SYSTEM_PATHS` in
-  `xtask/src/rootfs.rs`). `cargo xtask ci` runs this check first.
+  `xtask/src/rootfs.rs`), and that every link names a file of its directory
+  in the image. `/bin` holds the programs of the packages; the RAM service
+  and the test program `login-probe` are in `/libexec`. `cargo xtask ci` runs this check first.
 - `cargo xtask packages table` builds the image and prints a table with the
   name, version, licence, kind, number of files and bytes of each package.
   A program that several paths name counts once, for the first package that
   names it, so the packages linked into BusyBox (sbase, toybox, ncompress)
-  show 0 bytes. `cargo xtask ash-dialog` prints the same table.
+  show 0 bytes (their names are links to `busybox`). `cargo xtask ash-dialog` prints the same table.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 

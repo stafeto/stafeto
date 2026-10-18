@@ -12,22 +12,79 @@ var arguments = CommandLine.arguments.filter { $0 != "--window-reports" }
 var cpuCount = 1
 if let at = arguments.firstIndex(of: "--cpus") {
     guard at + 1 < arguments.count, let n = Int(arguments[at + 1]), n >= 1 else {
-        fputs("usage: vz-run [--window-reports] [--cpus N] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+        fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
         exit(2)
     }
     cpuCount = n
     arguments.removeSubrange(at...(at + 1))
 }
+// --time SECONDS: the time the guest's clock starts at, in seconds since
+// the epoch (the host's time by default).
+var startTime = UInt64(Date().timeIntervalSince1970)
+if let at = arguments.firstIndex(of: "--time") {
+    guard at + 1 < arguments.count, let t = UInt64(arguments[at + 1]) else {
+        fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+        exit(2)
+    }
+    startTime = t
+    arguments.removeSubrange(at...(at + 1))
+}
 guard arguments.count == 3 else {
-    fputs("usage: vz-run [--window-reports] [--cpus N] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
+    fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
     exit(2)
+}
+
+// VZ has no PL031, so the guest's clock service starts at the time the
+// boot image carries in its file `boot-time` (lib/rtc): 16 bytes, the
+// signature STAFTIME and the seconds as a little-endian u64. The boot
+// image is the signature STAFBOOT, the version and the number of files
+// (u32 each), then 48 bytes for each file: its name (32 bytes, padded with
+// zeros), its offset and its size (u64 each; lib/bootimg). The runner writes
+// the seconds into a copy of the image, which the guest boots, and removes
+// the copy when it ends. An image without the file boots as it is.
+var stampedImage: String? = nil
+func stamped(_ path: String, _ seconds: UInt64) -> String {
+    guard var image = FileManager.default.contents(atPath: path), image.count >= 16,
+        image.prefix(8) == Data("STAFBOOT".utf8)
+    else {
+        return path
+    }
+    func u64(_ at: Int) -> Int {
+        var value: UInt64 = 0
+        for i in 0..<8 {
+            value |= UInt64(image[at + i]) << (8 * UInt64(i))
+        }
+        return Int(truncatingIfNeeded: value)
+    }
+    let count = Int(image[12]) | Int(image[13]) << 8 | Int(image[14]) << 16 | Int(image[15]) << 24
+    for n in 0..<count {
+        let entry = 16 + 48 * n
+        guard entry + 48 <= image.count else { break }
+        let name = image[entry..<(entry + 32)].prefix { $0 != 0 }
+        guard name == Data("boot-time".utf8) else { continue }
+        let offset = u64(entry + 32)
+        guard u64(entry + 40) >= 16, offset + 16 <= image.count,
+            image[offset..<(offset + 8)] == Data("STAFTIME".utf8)
+        else {
+            return path
+        }
+        for i in 0..<8 {
+            image[offset + 8 + i] = UInt8((seconds >> (8 * UInt64(i))) & 0xff)
+        }
+        let copy = NSTemporaryDirectory() + "vz-run-\(getpid()).img"
+        guard FileManager.default.createFile(atPath: copy, contents: image) else { return path }
+        stampedImage = copy
+        atexit { if let copy = stampedImage { unlink(copy) } }
+        return copy
+    }
+    return path
 }
 
 let configuration = VZVirtualMachineConfiguration()
 configuration.cpuCount = cpuCount
 configuration.memorySize = 512 * 1024 * 1024
 let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
-boot.initialRamdiskURL = URL(fileURLWithPath: arguments[2])
+boot.initialRamdiskURL = URL(fileURLWithPath: stamped(arguments[2], startTime))
 boot.commandLine = "console=hvc0"
 configuration.bootLoader = boot
 // The guest reads a pipe of the runner's, which the runner fills from its

@@ -15,5 +15,5 @@ license_file = "UNLICENSE"
 depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = [
-  "/bin/compress = elf:busybox-probe",
+  "/bin/compress = link:busybox",
 ]

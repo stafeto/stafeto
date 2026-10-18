@@ -36,7 +36,8 @@ pub struct Package {
     /// Directories that only this package needs.
     pub dirs: Vec<String>,
     /// The installed files: the path in the image and where its bytes come
-    /// from (`elf:<program>`, `terminfo:<entry>` or `bytes:<name>`).
+    /// from (`elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or
+    /// `link:<target>`, a symbolic link).
     pub files: Vec<(String, String)>,
 }
 
@@ -239,7 +240,18 @@ fn validate(p: &Package, origin: &str) -> Result<(), String> {
         }
         match from.split_once(':') {
             Some(("elf" | "terminfo" | "bytes", rest)) if !rest.is_empty() => {}
-            _ => return fail(&format!("{from:?} is none of elf:, terminfo:, bytes:")),
+            // A link names a file of its own directory.
+            Some(("link", rest))
+                if !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+                    && !matches!(rest, "." | "..") => {}
+            _ => {
+                return fail(&format!(
+                    "{from:?} is none of elf:, terminfo:, bytes:, link:<name>"
+                ));
+            }
         }
     }
     for dir in &p.dirs {
@@ -387,6 +399,7 @@ pub fn table(image: &str) -> Result<(), String> {
                 .join(&entry[..1])
                 .join(entry),
             crate::rootfs::Source::Bytes(_, bytes) => return Ok(bytes.len() as u64),
+            crate::rootfs::Source::Link(target) => return Ok(target.len() as u64),
             crate::rootfs::Source::Variant { .. } => return Err("a variant has no package".into()),
         };
         std::fs::metadata(&path)

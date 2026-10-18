@@ -53,6 +53,7 @@ impl RamTarget {
             FileKind::Character => 3,
             FileKind::Fifo => 4,
             FileKind::Socket => 5,
+            FileKind::Symlink => 6,
         };
         self.packed = (self.packed & !KIND_MASK) | (tag << KIND_SHIFT);
         self
@@ -66,6 +67,7 @@ impl RamTarget {
             3 => Ok(FileKind::Character),
             4 => Ok(FileKind::Fifo),
             5 => Ok(FileKind::Socket),
+            6 => Ok(FileKind::Symlink),
             _ => Err(FsError::Io),
         }
     }
@@ -237,5 +239,19 @@ mod fifo_tests {
             FifoTarget::from_packed(good.packed(), 1, 0),
             Err(FsError::Io)
         );
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests {
+    use super::*;
+
+    /// A listing of a directory names a symbolic link of the image with the
+    /// kind the file service gives it; the layer reads it as a link.
+    #[test]
+    fn a_symbolic_link_is_a_kind_of_the_wire_and_of_a_target() {
+        assert_eq!(FileKind::from_wire(5), Ok(FileKind::Symlink));
+        assert_eq!(FileKind::from_wire(crate::SYMLINK), Ok(FileKind::Symlink));
+        assert_eq!(FileKind::from_wire(7), Err(FsError::Io));
     }
 }

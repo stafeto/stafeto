@@ -6,10 +6,14 @@
 //! owner and the number of a file of the boot image, whose bytes are the
 //! content (a program as its ELF file, as the linker wrote it). Entries
 //! with one file number are hard links of one file, so they agree on mode
-//! and owner. A directory has file number 0.
+//! and owner. A directory has file number 0. A symbolic link names a file
+//! of the boot image whose bytes are its target (no terminator), and its
+//! mode is the type and 0o777; links to one target share that file, and
+//! each is an inode of its own.
 //!
-//! Everything is little endian. A 16-byte header (the signature
-//! `STAFROOT`, the version as u32, the number of entries as u32), a table
+//! Everything is little endian. A 24-byte header (the signature
+//! `STAFROOT`, the version as u32, the number of entries as u32, the time
+//! of the build in seconds since the epoch as u64, 0 for none), a table
 //! with a 24-byte entry per path (the offset of the path from the start of
 //! the file as u32, its length as u16, 2 zero bytes, the mode, the user
 //! and the group as u32 each, the file number as u32), then the paths. The
@@ -23,7 +27,7 @@
 use core::fmt;
 
 pub const MAGIC: [u8; 8] = *b"STAFROOT";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// The entries of a table at most: the RAM service keeps a table of this
 /// size.
 pub const ENTRIES_MAX: usize = 1024;
@@ -36,7 +40,10 @@ pub const NAME_MAX: usize = 255;
 pub const FORMAT: u32 = 0o170_000;
 pub const DIRECTORY: u32 = 0o040_000;
 pub const REGULAR: u32 = 0o100_000;
-const HEADER_SIZE: usize = 16;
+pub const SYMLINK: u32 = 0o120_000;
+/// The permission bits of a symbolic link.
+pub const SYMLINK_MODE: u32 = 0o777;
+const HEADER_SIZE: usize = 24;
 const ENTRY_SIZE: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +65,9 @@ pub enum Error {
     /// Entry `n` does not come after the entry before it in the strictly
     /// ascending order of the paths.
     Order(u32),
-    /// Entry `n`'s mode is neither a directory's nor a regular file's, or
-    /// has bits beyond the type and the 12 permission bits.
+    /// Entry `n`'s mode is neither a directory's, a regular file's nor a
+    /// symbolic link's, or has bits beyond the type and the 12 permission
+    /// bits, or is a symbolic link with permission bits other than 0o777.
     BadMode(u32),
     /// Entry `n` is a directory with a file number, or a file with a number
     /// at or over the number of files of the image (or FILES_MAX).
@@ -84,7 +92,10 @@ impl fmt::Display for Error {
             Error::TooMany(n) => write!(f, "{n} entries, over {ENTRIES_MAX}"),
             Error::BadPath(n) => write!(f, "the path of entry {n} is not a good absolute path"),
             Error::Order(n) => write!(f, "entry {n} does not follow its predecessor in the order"),
-            Error::BadMode(n) => write!(f, "the mode of entry {n} is not a file's or directory's"),
+            Error::BadMode(n) => write!(
+                f,
+                "the mode of entry {n} is not a file's, directory's or link's"
+            ),
             Error::BadFile(n) => write!(f, "the file number of entry {n} does not fit its kind"),
             Error::NoParent(n) => write!(f, "entry {n} has no parent directory in the table"),
             Error::LinkMismatch(n) => write!(
@@ -111,6 +122,10 @@ impl Entry<'_> {
     pub fn is_directory(&self) -> bool {
         self.mode & FORMAT == DIRECTORY
     }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode & FORMAT == SYMLINK
+    }
 }
 
 /// A table whose header, entries and paths are checked.
@@ -118,6 +133,7 @@ impl Entry<'_> {
 pub struct Rootfs<'a> {
     bytes: &'a [u8],
     count: u32,
+    time: u64,
 }
 
 impl<'a> Rootfs<'a> {
@@ -152,7 +168,11 @@ impl<'a> Rootfs<'a> {
                 len,
             });
         }
-        let table = Rootfs { bytes, count };
+        let table = Rootfs {
+            bytes,
+            count,
+            time: u64_at(bytes, 16),
+        };
         // The first entry of each file number, to compare its links with.
         let mut first = [u16::MAX; FILES_MAX];
         for n in 0..count {
@@ -162,6 +182,7 @@ impl<'a> Rootfs<'a> {
             }
             match entry.mode & FORMAT {
                 DIRECTORY | REGULAR if entry.mode & !(FORMAT | 0o7777) == 0 => {}
+                SYMLINK if entry.mode == SYMLINK | SYMLINK_MODE => {}
                 _ => return Err(Error::BadMode(n)),
             }
             if entry.is_directory() {
@@ -195,6 +216,12 @@ impl<'a> Rootfs<'a> {
 
     pub fn len(&self) -> usize {
         self.count as usize
+    }
+
+    /// The time of the build in seconds since the epoch; 0 for none. The
+    /// files of the table have it as their times.
+    pub fn time(&self) -> u64 {
+        self.time
     }
 
     pub fn is_empty(&self) -> bool {
@@ -270,6 +297,12 @@ fn u16_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
 
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut b = [0; 8];
+    b.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(b)
+}
+
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
     let mut b = [0; 4];
     b.copy_from_slice(&bytes[at..at + 4]);
@@ -286,12 +319,18 @@ pub mod write {
     /// `files` is the number of files of the boot image. The result is read
     /// back by the reader, which names what is wrong.
     pub fn rootfs(entries: &[Entry<'_>], files: u32) -> Result<Vec<u8>, Error> {
+        rootfs_at(entries, files, 0)
+    }
+
+    /// `rootfs` for a build at `time` seconds since the epoch.
+    pub fn rootfs_at(entries: &[Entry<'_>], files: u32, time: u64) -> Result<Vec<u8>, Error> {
         let mut sorted = entries.to_vec();
         sorted.sort_by(|a, b| a.path.cmp(b.path));
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+        out.extend_from_slice(&time.to_le_bytes());
         let mut offset = HEADER_SIZE + ENTRY_SIZE * sorted.len();
         for (n, entry) in sorted.iter().enumerate() {
             // The reader reports a path too long for the field.
@@ -409,6 +448,17 @@ mod tests {
     }
 
     #[test]
+    fn the_time_of_the_build_is_in_the_header() {
+        let entries = [dir("/d")];
+        let none = Rootfs::parse(&rootfs(&entries, 2).unwrap(), 2)
+            .unwrap()
+            .time();
+        assert_eq!(none, 0);
+        let bytes = write::rootfs_at(&entries, 2, 1_790_000_000).unwrap();
+        assert_eq!(Rootfs::parse(&bytes, 2).unwrap().time(), 1_790_000_000);
+    }
+
+    #[test]
     fn the_header_and_the_cut_bytes_are_refused() {
         let bytes = rootfs(&[dir("/d"), file("/d/f", 0o644, 1)], 2).unwrap();
         assert!(matches!(
@@ -419,10 +469,10 @@ mod tests {
         bad[0] = b'X';
         assert_eq!(Rootfs::parse(&bad, 2).unwrap_err(), Error::BadSignature);
         bad = bytes.clone();
-        bad[8] = 2;
+        bad[8] = 1;
         assert_eq!(
             Rootfs::parse(&bad, 2).unwrap_err(),
-            Error::BadVersion { found: 2, known: 1 }
+            Error::BadVersion { found: 1, known: 2 }
         );
         assert!(matches!(
             Rootfs::parse(&bytes[..HEADER_SIZE + ENTRY_SIZE], 2),
@@ -491,6 +541,36 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_links_share_a_target_file_and_not_a_file_with_a_program() {
+        let link = |path| Entry {
+            path,
+            mode: SYMLINK | SYMLINK_MODE,
+            uid: 0,
+            gid: 0,
+            file: 2,
+        };
+        let bytes = rootfs(
+            &[
+                dir("/bin"),
+                file("/bin/sh", 0o755, 1),
+                link("/bin/a"),
+                link("/bin/b"),
+            ],
+            3,
+        )
+        .unwrap();
+        let read = Rootfs::parse(&bytes, 3).unwrap();
+        let a = read.entry(read.find("/bin/a").unwrap() as u32);
+        assert!(a.is_symlink() && !a.is_directory());
+        assert_eq!(a.file, read.entry(read.find("/bin/b").unwrap() as u32).file);
+        // A program and a link cannot be links of one file.
+        assert_eq!(
+            rootfs(&[file("/f", 0o777, 2), link("/g")], 3).unwrap_err(),
+            Error::LinkMismatch(1)
+        );
+    }
+
+    #[test]
     fn modes_file_numbers_and_links_are_checked() {
         let bad_mode = |mode| Entry {
             mode,
@@ -499,7 +579,9 @@ mod tests {
         for mode in [
             0,
             0o020_644,
-            0o120_777,
+            // A link has the permission bits 0o777 only.
+            SYMLINK | 0o644,
+            SYMLINK | 0o7777,
             REGULAR | 0o10_000,
             DIRECTORY | 0o20_000,
             // A bit above the type: no stat field has it.

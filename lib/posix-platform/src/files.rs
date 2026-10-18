@@ -55,6 +55,7 @@ const S_IFSOCK: u32 = 0o140_000;
 const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
+const DT_LNK: u8 = 10;
 const DT_SOCK: u8 = 12;
 const DT_REG: u8 = 8;
 
@@ -154,6 +155,7 @@ fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Resul
                 FileKind::Character => DT_CHR,
                 FileKind::Fifo => DT_FIFO,
                 FileKind::Socket => DT_SOCK,
+                FileKind::Symlink => DT_LNK,
             };
             Ok(Some(posix_change::dirent::Item {
                 inode: entry.inode,
