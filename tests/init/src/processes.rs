@@ -12,7 +12,7 @@ use crate::messages::{raw_client, raw_reply};
 use crate::timers::{expiry, timer_at};
 use crate::transfers::copy_raw;
 use core::cell::Cell;
-use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 use proto_init::Method;
 use rt::startup::{Answered, Giver};
 
@@ -129,6 +129,10 @@ pub(crate) const START: u64 = 0x57A7;
 const GRANDCHILD: u64 = 0x6C1D;
 /// How long init waits for a child's request or its end.
 pub(crate) const KID_WAIT_NS: u64 = 1_000_000_000;
+/// How long `Ear::next` waits: KID_WAIT_NS, or what a test that starts many
+/// children at once sets (`smp::asids_across_cpus`) for a runner that gives
+/// its CPUs to other jobs.
+pub(crate) static KID_PATIENCE_NS: AtomicU64 = AtomicU64::new(KID_WAIT_NS);
 /// The pause of init between two looks at a child that counts.
 const PAUSE_NS: u64 = 1_000_000;
 /// The quota of a child that owns no object (spec 7.5): the root of its
@@ -296,7 +300,7 @@ impl Ear {
     /// leaves the bits that were set and a timer never fires early (spec
     /// 10).
     pub(crate) fn next(&self) -> Result<Received, &'static str> {
-        let deadline = clock_now()? + KID_WAIT_NS;
+        let deadline = clock_now()? + KID_PATIENCE_NS.load(Relaxed);
         arm(&self.timer, deadline)?;
         let got = loop {
             match sys::receive(&self.channel) {

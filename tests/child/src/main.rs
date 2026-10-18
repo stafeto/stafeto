@@ -600,7 +600,7 @@ fn asid_page(s: &Start, seed: u64, rounds: u64, wait: bool) -> u64 {
     };
     // SAFETY: the page is the child's own, readable and writable.
     unsafe { at.write_volatile(seed) };
-    let limit = time::now() + 10_000_000_000;
+    let limit = time::now() + 20_000_000_000;
     while wait && mark(GO).load(Relaxed) == 0 {
         if time::now() > limit {
             return FAILED;

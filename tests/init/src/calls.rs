@@ -1069,6 +1069,11 @@ fn cpu_time_splits_user_and_kernel() -> Outcome {
     // lie inside the kernel's path, and on a slow host (TCG without
     // -icount) the exception entry and return are most of it. What the
     // loop of calls shows is that the kernel time grows with the calls.
+    if !(call_kernel > four_ms / 16 && call_kernel > 50 * spin_kernel) {
+        println!(
+            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel}, the loop of calls kernel {call_kernel} (4 ms are {four_ms} ticks)"
+        );
+    }
     check(
         call_kernel > four_ms / 16 && call_kernel > 50 * spin_kernel,
         "a loop of calls grew little of the kernel time",

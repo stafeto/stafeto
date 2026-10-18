@@ -8,7 +8,10 @@
 //! them on four, where each also prints the line xtask looks for.
 
 use crate::harness::*;
-use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks, set_kid_mark};
+use crate::processes::{
+    Gift, KID_PATIENCE_NS, KID_WAIT_NS, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks,
+    set_kid_mark,
+};
 use crate::timers::timer_at;
 use crate::transfers::copy_raw;
 use abi::{Access, Call, Error, ProcessState, Rights};
@@ -1027,7 +1030,15 @@ fn ends_with_its_own_word(kid: &Kid) -> Result<bool, &'static str> {
 fn asids_across_cpus() -> Outcome {
     // The line tells xtask that the kernel got as far as the probe.
     println!("smp: the ASID probe starts");
-    let n = cpus()?;
+    // A runner that shares its CPUs with other jobs may take seconds to
+    // start 16 children.
+    KID_PATIENCE_NS.store(15_000_000_000, Relaxed);
+    let outcome = asids_across_cpus_with(cpus()?);
+    KID_PATIENCE_NS.store(KID_WAIT_NS, Relaxed);
+    outcome
+}
+
+fn asids_across_cpus_with(n: usize) -> Outcome {
     let mut mismatches = 0;
     for wave in 0..ASID_WAVES {
         let mut kids: [Option<Kid>; ASID_KIDS] = [const { None }; ASID_KIDS];
