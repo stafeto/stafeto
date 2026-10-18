@@ -151,9 +151,14 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     methods
 };
-/// How long a process must have run no ticks, after a sample, for the listing
-/// to call it asleep (`list`).
+/// How long after a sample a listing judges a process again (`list`): a
+/// listing sooner repeats the last verdict.
 const SLEEP_AFTER_NS: u64 = 2_000_000;
+/// The share of the time since the last sample that a process may have run
+/// and still be called asleep, as 1 in this many: a thread that waits on a
+/// word of a shared mapping looks at it every millisecond (lib/posix-sync),
+/// which costs it a few percent of the time, and it sleeps all the same.
+const ASLEEP_SHARE: u64 = 4;
 /// The first real-time signal (relibc's SIGRTMIN).
 const REALTIME_MIN: u8 = 35;
 /// SIGURG and SIGWINCH, the signals ignored by default besides SIGCHLD and SIGCONT.
@@ -2942,9 +2947,10 @@ impl Processes {
                 break;
             }
         }
-        // A process that has run no ticks since the last sample, some
-        // 2 ms before, sleeps (state 3); the first sample, or a process that
-        // ran, is running.
+        // A process that ran at most a quarter of the time since the last
+        // sample, some 2 ms before or more, sleeps (state 3); the first
+        // sample, or a process that ran more, is running. A listing sooner
+        // than that repeats the verdict of the sample.
         let sleeping = found.is_some_and(|i| {
             let now = Self::timer_now();
             let Some(record) = self.records.get_mut(i) else {
@@ -2953,14 +2959,19 @@ impl Processes {
             let ticks = record
                 .carried_ticks
                 .saturating_add(sys::process_time(&record.process).unwrap_or(0));
-            let idle = record.sample_at != 0
-                && ticks == record.sample_ticks
-                && now.saturating_sub(record.sample_at) >= SLEEP_AFTER_NS;
-            if ticks != record.sample_ticks || record.sample_at == 0 {
+            if record.sample_at == 0 {
+                record.sample_ticks = ticks;
+                record.sample_at = now;
+                return false;
+            }
+            let elapsed = now.saturating_sub(record.sample_at);
+            if elapsed >= SLEEP_AFTER_NS {
+                let ran = rt::time::ticks_to_ns(ticks.saturating_sub(record.sample_ticks));
+                record.sample_asleep = ran.saturating_mul(ASLEEP_SHARE) <= elapsed;
                 record.sample_ticks = ticks;
                 record.sample_at = now;
             }
-            idle
+            record.sample_asleep
         });
         let next = found.map_or(window_end, |i| i + 1);
         let next = if next >= RECORDS {
