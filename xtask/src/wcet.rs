@@ -37,9 +37,18 @@ const ENTRIES: [(&str, &str); 7] = [
 ];
 
 /// The probes of `wcet coverage` that the kernel group of `ci` does not
-/// run already: the steps of the process service and the two that run
-/// under `-icount` with a service.
-const EXTRA_PROBES: [&str; 3] = ["process-steps", "entropy", "rtbench-short"];
+/// run already: the steps of the process service, the two that run under
+/// `-icount` with a service, the tests of the test init (the guest probes),
+/// and the kernel tests of the icount build (the
+/// test kernel and the one with the EL0 tests are images of their own).
+const EXTRA_PROBES: [&str; 6] = [
+    "process-steps",
+    "entropy",
+    "rtbench-short",
+    "init tests 512M",
+    "init tests 512M icount",
+    "kernel tests icount",
+];
 
 // ---- the disassembly ----
 
@@ -629,6 +638,10 @@ fn probes(skip: &[String], all: bool, traces: &Path) -> Vec<jobs::Job> {
     list.push(jobs::job("process-steps", || {
         crate::process_steps(&crate::qemu::VIRT_2G, 7)
     }));
+    list.push(jobs::job("kernel tests icount", || {
+        let machine = crate::qemu::machine(Some(&"512M".to_owned()))?;
+        crate::kernel_tests(machine, crate::Variant::TestIcount).map(|_| ())
+    }));
     list.into_iter()
         .filter(|j| {
             (all || wanted.iter().any(|w| w == j.name())) && !skip.iter().any(|s| s == j.name())
@@ -705,6 +718,7 @@ fn coverage(args: &[String]) -> Result<(), String> {
                 return Err("no probe to run".to_owned());
             }
             // A failed probe leaves its trace and does not stop the others.
+            jobs::keep_going(true);
             let ran = jobs::run_all(list, o.jobs);
             if let Err(e) = &ran {
                 println!("== a probe failed, its trace is kept: {e}");

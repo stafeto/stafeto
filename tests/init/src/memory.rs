@@ -9,7 +9,7 @@ use crate::harness::*;
 use crate::timers::timer_at;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 22] = [
+pub(crate) const TESTS: [Test; 23] = [
     (
         "mem_create_checks_its_arguments",
         mem_create_checks_its_arguments,
@@ -63,6 +63,10 @@ pub(crate) const TESTS: [Test; 22] = [
         buffer_page_cannot_be_protected,
     ),
     ("busy_mapping_is_bad_state", busy_mapping_is_bad_state),
+    (
+        "change_of_a_process_that_ends_is_abandoned",
+        change_of_a_process_that_ends_is_abandoned,
+    ),
     (
         "thread_buffer_cannot_land_in_a_mapping",
         thread_buffer_cannot_land_in_a_mapping,
@@ -912,6 +916,118 @@ fn busy_mapping_is_bad_state() -> Outcome {
         mapped.is_ok() && protected.is_ok() && unmapped.is_ok(),
         "mem_protect or mem_unmap failed once no call worked on the mapping",
     )
+}
+
+/// The child the changes of `change_big` work on, and the memory object they
+/// map, as raw handles of init.
+static TARGET: AtomicU64 = AtomicU64::new(0);
+static TARGET_MEMORY: AtomicU64 = AtomicU64::new(0);
+/// The call `kill_target` waits for: 0 mem_map, 1 mem_unmap, 2 mem_protect;
+/// and the call `change_big` makes now, by the same numbers.
+static TARGET_OP: AtomicU64 = AtomicU64::new(0);
+static TARGET_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// Maps, makes read-only and unmaps BIG bytes at WINDOW of the child TARGET,
+/// again and again, until a call fails or ROUNDS rounds went: mark 0 notes 1
+/// when the call failed with BAD_STATE, 2 when every call passed and 3 when
+/// one failed otherwise.
+extern "C" fn change_big(_: u64) -> ! {
+    const ROUNDS: u32 = 200;
+    let child = Handle::<Process>::borrowed(abi::Handle(TARGET.load(Relaxed)));
+    let m = Handle::<Memory>::borrowed(abi::Handle(TARGET_MEMORY.load(Relaxed)));
+    let mut seen = 2;
+    'rounds: for _ in 0..ROUNDS {
+        for call in [0, 2, 1] {
+            TARGET_NOW.store(call, Relaxed);
+            // SAFETY: the window is the child's, and only this thread changes it.
+            let result = unsafe {
+                match call {
+                    0 => sys::mem_map(&child, &m, 0, BIG, WINDOW, Access::ReadWrite).map(|_| ()),
+                    1 => sys::mem_unmap(&child, WINDOW, BIG),
+                    _ => sys::mem_protect(&child, WINDOW, BIG, Access::Read),
+                }
+            };
+            if let Err(e) = result {
+                seen = if e == Error::BadState { 1 } else { 3 };
+                break 'rounds;
+            }
+        }
+    }
+    MARKS[0].store(seen, Relaxed);
+    sys::thread_exit()
+}
+
+/// Waits on channel `c` for the timer of `kill_one`, and once the call
+/// TARGET_OP of `change_big` is in the middle of its portions (mem_protect RW
+/// of the window of the child says BAD_STATE) kills the child: mark 3 notes it.
+extern "C" fn kill_target(c: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(c));
+    let t = Handle::<Timer>::borrowed(abi::Handle(PROBE_TIMER.load(Relaxed)));
+    let child = Handle::<Process>::borrowed(abi::Handle(TARGET.load(Relaxed)));
+    while sys::receive(&c).is_ok() {
+        // SAFETY: RW is the access of the mapping unless a call makes it
+        // read-only; the call changes nothing when it fails.
+        let probed = unsafe { sys::mem_protect(&child, WINDOW, BIG, Access::ReadWrite) };
+        if probed == Err(Error::BadState)
+            && TARGET_NOW.load(Relaxed) == TARGET_OP.load(Relaxed)
+            && sys::process_kill(&child).is_ok()
+        {
+            MARKS[3].store(1, Relaxed);
+            break;
+        }
+        let now = sys::clock_now().unwrap_or(0);
+        let _ = sys::timer_set(&t, now + PROBE_PERIOD_NS);
+    }
+    sys::thread_exit()
+}
+
+/// One try of `change_of_a_process_that_ends_is_abandoned` for the call
+/// `op`: whether the call failed with BAD_STATE after the child ended.
+fn kill_one(op: u64) -> Result<bool, &'static str> {
+    reset_marks();
+    let target = sys::process_create(4 << 20, 16, LEVEL).map_err(|_| "process_create failed")?;
+    let m = memory_object(BIG / PAGE as u64)?;
+    TARGET.store(target.raw().0, Relaxed);
+    TARGET_MEMORY.store(m.raw().0, Relaxed);
+    TARGET_OP.store(op, Relaxed);
+    let c = channel(QUIET)?;
+    let t = timer_at(&c, HIGH)?;
+    PROBE_TIMER.store(t.raw().0, Relaxed);
+    let prober = spawn(1, kill_target, c.raw().0, HIGH, Policy::Fifo)?;
+    let mapper = spawn(0, change_big, 0, LEVEL, Policy::Fifo)?;
+    let armed = clock_now().and_then(|now| arm(&t, now + PROBE_PERIOD_NS));
+    let ran = armed.and_then(|()| let_run());
+    for h in [prober, mapper] {
+        close(h)?;
+    }
+    close(t)?;
+    close(c)?;
+    close(m)?;
+    close(target)?;
+    ran?;
+    Ok(mark(0) == 1 && mark(3) == 1)
+}
+
+/// A change of a process that ends while the call is in its portions is
+/// abandoned (spec 7.7): a mem_map, a mem_unmap and a mem_protect of BIG
+/// bytes of a child, which a thread at HIGH kills once that call is busy,
+/// fail with BAD_STATE, and what they did stays consistent for the teardown
+/// of the child. A try that missed its call is made again.
+fn change_of_a_process_that_ends_is_abandoned() -> Outcome {
+    for op in 0..3 {
+        let mut abandoned = false;
+        for _ in 0..8 {
+            abandoned = kill_one(op)?;
+            if abandoned {
+                break;
+            }
+        }
+        check(
+            abandoned,
+            "a change of a child that ended in its portions did not fail with BAD_STATE",
+        )?;
+    }
+    Ok(())
 }
 
 /// Once a mem_map of `map_big` is busy (`caught_busy` on channel `c`), asks
