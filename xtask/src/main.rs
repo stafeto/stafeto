@@ -5426,11 +5426,40 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Published concurrent snapshots must preserve the part's memory reserve.
+/// The console takes a line of more than 64 bytes in several writes, and a
+/// line of the services' timing (`service wait:` and the like, lib/rt)
+/// that another CPU writes meanwhile may land inside it: such a line goes
+/// back where it came from, and the rest of the split line, the next line,
+/// joins its start.
+fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let cut = line
+            .find("service ")
+            .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
+        match (cut, lines.get(i + 1)) {
+            (Some(at), Some(rest)) => {
+                out.push(line[at..].to_owned());
+                out.push(format!("{}{rest}", &line[..at]));
+                i += 2;
+            }
+            _ => {
+                out.push(line.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     let mut snapshots = 0;
     let mut names_workload = false;
     let mut names_capacity = false;
-    for line in lines {
+    let lines = rejoin_split_lines(lines);
+    for line in &lines {
         let capacity = line.starts_with("posix-procs: names quota:")
             || line.starts_with("posix-procs: names capacity memory:");
         names_workload |= line.starts_with("posix-procs: names workload memory:");
@@ -11735,6 +11764,28 @@ mod tests {
     /// in `Local::queue_spin`, `Own` cells live only in `Local` (local.rs), and the
     /// data `OBJ` guards are the five that the order names: a new lock or
     /// datum has to change this list, and so decide its place in the order.
+    /// A timing line of a service inside a long line of posix-procs goes
+    /// out of it, and the rest of the line joins it again.
+    #[test]
+    fn a_service_line_inside_a_split_line_goes_back_out() {
+        let lines: Vec<String> = [
+            "posix-procs: names quota: process 1, quota 552 pages, used 513 pservice wait: 10 kind 64 29846 ticks of 31452",
+            "ages, remaining 39",
+            "posix-procs: steps done",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "service wait: 10 kind 64 29846 ticks of 31452",
+                "posix-procs: names quota: process 1, quota 552 pages, used 513 pages, remaining 39",
+                "posix-procs: steps done",
+            ]
+        );
+    }
+
     #[test]
     fn locks_of_the_kernel_are_the_ones_the_order_names() {
         const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
