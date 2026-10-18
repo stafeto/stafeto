@@ -230,7 +230,7 @@ pub fn fund_mapping(on: &mut Change) -> Result<(), Error> {
 }
 
 /// The resources of mem_map and its entry in one step: `reserve_mapping`
-/// and `fund_mapping`; a failure changes nothing but the table page. The
+/// and `fund_mapping`; a failure leaves the table page and no entry. The
 /// caller holds a reference to `target`, which lives.
 pub fn add_mapping(
     target: NonNull<Process>,
