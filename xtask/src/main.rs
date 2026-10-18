@@ -1473,6 +1473,7 @@ commands:
   ash       run a BusyBox ash builtin script in QEMU
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits; the end of
             the shell ends the machine and gives its status)
+  dist       build the release files of this version in target/dist (docs/release.md)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   packages  check the package descriptions (packages/*.toml) and that every file
@@ -1708,6 +1709,7 @@ fn main() {
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
+        Some("dist") => dist(),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
@@ -6197,6 +6199,14 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"uname -s; id -u; id -un"#,
         &[r#"stafeto"#, r#"0"#, r#"root"#],
     ),
+    // The version of the workspace manifest is the release field.
+    (
+        r#"uname -a; uname -m"#,
+        &[
+            concat!("~stafeto stafeto ", env!("CARGO_PKG_VERSION"), " "),
+            r#"aarch64"#,
+        ],
+    ),
     // The shell starts with TERM in its environment: the variable the
     // command sets and the one it had are both there.
     (
@@ -7316,6 +7326,32 @@ fn ash_shell() -> Result<(), String> {
         Some(code) if code != 0 => exit(code),
         _ => Ok(()),
     }
+}
+
+/// `cargo xtask dist`: the release files of the workspace's version in
+/// target/dist (tools/dist.py): the QEMU archive with the boot image of the
+/// shell, the kernel with its symbols, the sources of the GPL packages, the
+/// SBOM and SHA256SUMS.
+fn dist() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    nano_build()?;
+    bash_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
+    run_cmd(
+        Command::new("python3")
+            .arg(root().join("tools/dist.py"))
+            .args(["--version", env!("CARGO_PKG_VERSION")])
+            .arg("--image")
+            .arg(&kernel.image)
+            .arg("--elf")
+            .arg(&kernel.elf)
+            .arg("--boot")
+            .arg(&image)
+            .arg("--out")
+            .arg(target_dir().join("dist")),
+    )
 }
 
 /// The probe of the end of the interactive shell: `exit 3` typed at its

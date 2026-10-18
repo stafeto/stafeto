@@ -1,0 +1,84 @@
+name: release
+
+# A tag `v<version>` builds the release files of that version on a clean
+# machine, after the same groups as ci have passed on the tagged commit, and
+# leaves a draft release for the owner to read and publish (docs/release.md).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  LLVM_VERSION: "23"
+  QEMU_VERSION: "11.1.2"
+
+jobs:
+  ci:
+    name: ci
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: release
+    needs: ci
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: The tag names the version of the workspace
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - uses: ./.github/actions/setup
+        with:
+          qemu: "false"
+
+      - name: Restore caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            target
+          key: release-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
+          restore-keys: |
+            ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-
+            ci3-${{ runner.arch }}-
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - name: cargo xtask dist
+        run: cargo xtask dist
+
+      - name: Check the sums
+        run: cd target/dist && sha256sum --check SHA256SUMS
+
+      - name: Notes of the release
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          python3 tools/release-notes.py "$VERSION" "$GITHUB_REF_NAME" "$previous" > release-notes.md
+
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=--draft
+          case "$VERSION" in *-*) flags="$flags --prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" $flags \
+            --title "stafeto $VERSION" --notes-file release-notes.md \
+            target/dist/*

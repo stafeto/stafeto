@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "0.2.0-pre.1"
 dependencies = [
  "abi",
  "bootimg",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "posix-platform"
-version = "0.1.0"
+version = "0.2.0-pre.1"
 dependencies = [
  "posix-abi",
  "posix-change",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0-pre.1"
 dependencies = [
  "abi",
  "bootimg",

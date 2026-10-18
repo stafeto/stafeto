@@ -4,6 +4,9 @@ members = ["tests/ramfs-gc", "tests/ramfs-holder", "apps/shell", "kcore", "proto
 default-members = ["kcore", "lib/abi", "lib/entries", "lib/rtc", "lib/bootimg", "lib/ext4ro", "lib/posix-path", "lib/posix-fd", "lib/posix-change", "lib/posix-heap", "lib/posix-map", "lib/posix-order", "lib/posix-types", "lib/posix-request", "lib/posix-time", "lib/posix-signals", "lib/posix-signal-queue", "lib/posix-credentials", "proto/process", "proto/fs", "proto/init", "proto/uart", "proto/wire", "proto/clock", "proto/pipe", "proto/loader", "xtask", "proto/tty", "lib/virtio-pci", "proto/entropy", "lib/posix-random"]
 
 [workspace.package]
+# The one place of the system's version: `uname`, the kernel crate and the release
+# archives of `cargo xtask dist` take it from here.
+version = "0.2.0-pre.1"
 edition = "2024"
 authors = ["Sergey Subbotin <ssubbotin@gmail.com>"]
 repository = "https://github.com/stafeto/stafeto"
