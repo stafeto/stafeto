@@ -275,7 +275,11 @@ fn main(_: u64) -> u64 {
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
-    let tables = unsafe { &mut *TABLES.0.get() };
+    let tables = unsafe {
+        let pointer = (*TABLES.0.get()).as_mut_ptr();
+        Tables::initialize_at(pointer);
+        &mut *pointer
+    };
     let mut fs = Fs {
         ram,
         locks,
@@ -438,6 +442,26 @@ struct Identities {
     free: u16,
 }
 impl Identities {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            rt::bss::fill_none(addr_of_mut!((*at).slots));
+            let next = addr_of_mut!((*at).next).cast::<u16>();
+            for i in 0..SESSIONS {
+                next.add(i).write(if i + 1 < SESSIONS {
+                    (i + 1) as u16
+                } else {
+                    u16::MAX
+                });
+            }
+        }
+    }
+
     const fn new() -> Self {
         let mut next = [u16::MAX; SESSIONS];
         let mut i = 0;
@@ -511,19 +535,35 @@ struct Tables {
     job_generations: [u64; ramfs::storage::PREPARATIONS],
     seconds: Seconds,
 }
-struct Bss(UnsafeCell<Tables>);
+struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
 unsafe impl Sync for Bss {}
-static TABLES: Bss = Bss(UnsafeCell::new(Tables {
-    places: ramfs::places::Places::new(),
-    clones: Clones::new(),
-    sessions: [const { None }; SESSIONS],
-    births: [None; BIRTHS],
-    identities: Identities::new(),
-    jobs: [const { None }; ramfs::storage::PREPARATIONS],
-    job_generations: [0; ramfs::storage::PREPARATIONS],
-    seconds: Seconds::new(),
-}));
+static TABLES: Bss = Bss(UnsafeCell::new(core::mem::MaybeUninit::zeroed()));
+
+impl Tables {
+    /// The tables as `new` makes them, in place: the zeroed `.bss` holds
+    /// them, and only the non-zero bytes (the `None`s of the arrays, the
+    /// lists of free places) are written, so the image carries no zeros for
+    /// the 2.9 MB of tables.
+    ///
+    /// # Safety
+    /// `tables` is valid for writes, exclusive and zeroed.
+    #[inline(never)]
+    unsafe fn initialize_at(tables: *mut Tables) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            addr_of_mut!((*tables).places).write(ramfs::places::Places::new());
+            // A new table of clones is all zeros.
+            rt::bss::fill_none(addr_of_mut!((*tables).sessions));
+            rt::bss::fill_none(addr_of_mut!((*tables).births));
+            Identities::initialize_at(addr_of_mut!((*tables).identities));
+            rt::bss::fill_none(addr_of_mut!((*tables).jobs));
+            addr_of_mut!((*tables).job_generations).write([0; ramfs::storage::PREPARATIONS]);
+            Seconds::initialize_at(addr_of_mut!((*tables).seconds));
+        }
+    }
+}
 
 impl Fs {
     /// The index of the birth of the session `label`: its slot.

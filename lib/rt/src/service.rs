@@ -1120,6 +1120,24 @@ impl<const N: usize> Default for LongOps<N> {
 }
 
 impl<const N: usize> LongOps<N> {
+    /// What `new` makes, in place in zeroed memory (a service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        assert!(N <= u16::MAX as usize, "places fit u16");
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            crate::bss::fill_none(addr_of_mut!((*at).ops));
+            let free = addr_of_mut!((*at).free).cast::<u16>();
+            for i in 0..N {
+                free.add(i).write((N - 1 - i) as u16);
+            }
+            addr_of_mut!((*at).free_len).write(N);
+        }
+    }
+
     pub const fn new() -> Self {
         assert!(N <= u16::MAX as usize, "places fit u16");
         let mut free = [0; N];

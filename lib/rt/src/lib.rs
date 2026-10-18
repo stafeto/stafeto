@@ -21,6 +21,7 @@
 
 #![no_std]
 
+pub mod bss;
 pub mod console;
 pub mod dma;
 pub mod fs;

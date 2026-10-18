@@ -40,6 +40,18 @@ impl<const N: usize> Default for Pool<N> {
 }
 
 impl<const N: usize> Pool<N> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        let list = unsafe { core::ptr::addr_of_mut!((*at).list) }.cast::<Option<Registration>>();
+        for i in 0..N {
+            // SAFETY: the element `i` of the array is in bounds.
+            unsafe { list.add(i).write(None) };
+        }
+    }
+
     pub const fn new() -> Self {
         Self { list: [None; N] }
     }

@@ -503,6 +503,25 @@ impl Default for Ipc {
 }
 
 impl Ipc {
+    /// What `new` makes, in place in zeroed memory.
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub(super) unsafe fn initialize_at(at: *mut Ipc) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            crate::fill(addr_of_mut!((*at).queues), Queue::FREE);
+            crate::fill(addr_of_mut!((*at).sems), SemSet::FREE);
+            crate::fill(addr_of_mut!((*at).segs), Seg::FREE);
+            crate::fill(addr_of_mut!((*at).msgs), Msg::FREE);
+            crate::fill(addr_of_mut!((*at).undo), UNDO_FREE);
+            crate::fill(addr_of_mut!((*at).holds), HOLD_FREE);
+            crate::fill(addr_of_mut!((*at).blocked), BLOCKED_FREE);
+            addr_of_mut!((*at).pool).write(End::NONE);
+        }
+    }
+
     pub const fn new() -> Ipc {
         Ipc {
             queues: [Queue::FREE; QUEUES],

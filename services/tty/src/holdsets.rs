@@ -71,6 +71,34 @@ impl<const C: usize, const N: usize> Default for HoldSets<C, N> {
 }
 
 impl<const C: usize, const N: usize> HoldSets<C, N> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        assert!(N == C + ROOTS, "a set for each clone and each root");
+        assert!(N < NONE as usize, "sets are 16 bits");
+        // SAFETY: each element is in bounds and written once.
+        unsafe {
+            let sets = addr_of_mut!((*at).sets).cast::<HoldSet>();
+            let next = addr_of_mut!((*at).next).cast::<u16>();
+            for i in 0..N {
+                sets.add(i).write(HoldSet::new());
+                next.add(i)
+                    .write(if i + 1 < N { (i + 1) as u16 } else { NONE });
+            }
+            let by_place = addr_of_mut!((*at).by_place).cast::<u16>();
+            for i in 0..C {
+                by_place.add(i).write(NONE);
+            }
+            let roots = addr_of_mut!((*at).roots).cast::<(u64, u16)>();
+            for i in 0..ROOTS {
+                roots.add(i).write((0, NONE));
+            }
+        }
+    }
+
     pub const fn new() -> Self {
         assert!(N == C + ROOTS, "a set for each clone and each root");
         assert!(N < NONE as usize, "sets are 16 bits");

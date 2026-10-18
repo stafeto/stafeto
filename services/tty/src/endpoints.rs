@@ -214,6 +214,32 @@ impl Default for Endpoints {
     }
 }
 impl Endpoints {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each element is in bounds and written once.
+        unsafe {
+            let descriptions = addr_of_mut!((*at).descriptions).cast::<Description>();
+            for i in 0..DESCRIPTIONS {
+                descriptions.add(i).write(Description::empty());
+            }
+            let instances = addr_of_mut!((*at).instances).cast::<Instance>();
+            for i in 0..TERMINALS {
+                let mut instance = Instance::empty();
+                if i == 0 {
+                    instance.generation = 1;
+                    instance.allocated = true;
+                    instance.locked = false;
+                    instance.mode = 0o620;
+                }
+                instances.add(i).write(instance);
+            }
+        }
+    }
+
     pub const fn new() -> Self {
         let mut instances = [Instance::empty(); TERMINALS];
         instances[0].generation = 1;

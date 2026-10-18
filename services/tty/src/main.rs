@@ -175,19 +175,37 @@ impl Device {
         }
     }
 }
-struct Bss(UnsafeCell<Tables>);
+struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
 unsafe impl Sync for Bss {}
-static TABLES: Bss = Bss(UnsafeCell::new(Tables {
-    sessions: [const { None }; SESSIONS],
-    ops: LongOps::new(),
-    watches: watch::Pool::new(),
-    clones: Clones::new(),
-    devices: [const { Device::new() }; TERMINALS],
-    endpoints: Endpoints::new(),
-    holdsets: HoldSets::new(),
-    pins: [None; OPERATIONS],
-}));
+static TABLES: Bss = Bss(UnsafeCell::new(core::mem::MaybeUninit::zeroed()));
+
+impl Tables {
+    /// The tables as `new` makes them, in place: the zeroed `.bss` holds
+    /// them, and only the non-zero bytes are written, so the image carries
+    /// no zeros for the 280 KB of tables.
+    ///
+    /// # Safety
+    /// `tables` is valid for writes, exclusive and zeroed.
+    #[inline(never)]
+    unsafe fn initialize_at(tables: *mut Tables) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            rt::bss::fill_none(addr_of_mut!((*tables).sessions));
+            LongOps::initialize_at(addr_of_mut!((*tables).ops));
+            watch::Pool::initialize_at(addr_of_mut!((*tables).watches));
+            // A new table of clones is all zeros.
+            let devices = addr_of_mut!((*tables).devices).cast::<Device>();
+            for i in 0..TERMINALS {
+                devices.add(i).write(Device::new());
+            }
+            Endpoints::initialize_at(addr_of_mut!((*tables).endpoints));
+            HoldSets::initialize_at(addr_of_mut!((*tables).holdsets));
+            rt::bss::fill_none(addr_of_mut!((*tables).pins));
+        }
+    }
+}
 
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
@@ -228,7 +246,11 @@ fn main(_: u64) -> u64 {
         return NO_PLACES;
     };
     // SAFETY: only the main thread reaches TABLES, here once.
-    let tables = unsafe { &mut *TABLES.0.get() };
+    let tables = unsafe {
+        let pointer = (*TABLES.0.get()).as_mut_ptr();
+        Tables::initialize_at(pointer);
+        &mut *pointer
+    };
     let mut service = Tty {
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
