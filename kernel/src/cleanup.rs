@@ -64,27 +64,40 @@ impl Item {
 /// The lock of one CPU's queue and the queue it guards, for as long as the
 /// guard lives.
 struct QueueGuard {
-    // Declared first: the borrow of the queue ends before the lock does.
-    queue: OwnGuard<'static, Queue>,
+    queue: *mut Queue,
+    // Declared before the lock's release in `drop`: the borrow ends first.
+    _borrow: Option<OwnGuard<'static, Queue>>,
     block: &'static CpuBlock,
+    /// Whether the guard holds the spin lock: a push in a section under
+    /// `OBJ` does not, since every other CPU that changes the queue does it
+    /// in a section too, and a section excludes it. It does not count its
+    /// borrow either (`Own`): the section is the exclusion.
+    spinning: bool,
 }
 
 impl core::ops::Deref for QueueGuard {
     type Target = Queue;
     fn deref(&self) -> &Queue {
-        &self.queue
+        // SAFETY: the guard holds the queue's lock or a section of `OBJ`.
+        unsafe { &*self.queue }
     }
 }
 
 impl core::ops::DerefMut for QueueGuard {
     fn deref_mut(&mut self) -> &mut Queue {
-        &mut self.queue
+        // SAFETY: as above.
+        unsafe { &mut *self.queue }
     }
 }
 
 impl Drop for QueueGuard {
     fn drop(&mut self) {
-        self.block.local.queue_spin.store(false, Ordering::Release);
+        // The borrow goes first (a field drops after `drop` returns, so
+        // take it here), then the lock.
+        self._borrow = None;
+        if self.spinning {
+            self.block.local.queue_spin.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -92,17 +105,20 @@ impl Drop for QueueGuard {
 /// a holder never waits for anything while it holds the lock, so the wait
 /// is as long as one of the short holds below.
 fn lock_queue(block: &'static CpuBlock) -> QueueGuard {
-    while block
-        .local
-        .queue_spin
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+    spin_lock_queue(block, true)
+}
+
+fn spin_lock_queue(block: &'static CpuBlock, spinning: bool) -> QueueGuard {
+    if spinning {
+        while block.local.queue_spin.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
     }
     QueueGuard {
-        queue: block.local.queue.lock(),
+        queue: block.local.queue.as_ptr().cast_mut(),
+        _borrow: spinning.then(|| block.local.queue.lock()),
         block,
+        spinning,
     }
 }
 
@@ -116,8 +132,8 @@ impl Item {
     /// queue's lock (`push`), read by a section on another CPU that raises
     /// or removes the item.
     fn cpu(this: NonNull<Item>) -> usize {
-        // SAFETY: the caller's item is alive; the owner tag is atomic.
-        unsafe { (*this.as_ptr()).link.owner() as usize }
+        // SAFETY: the caller's item is alive; the owner tag is a byte.
+        unsafe { Link::owner_at(&raw const (*this.as_ptr()).link) as usize }
     }
 }
 
@@ -269,11 +285,22 @@ unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
 /// # Safety
 /// As for `enqueue`.
 unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
-    let mut q = lock_own_queue();
-    // SAFETY: the caller's promise.
+    let this = cpu::this();
+    // A push in a section under `OBJ` takes no lock: every other CPU that
+    // changes this queue does it in a section too, which excludes it, and
+    // the portion that takes items off it runs on this CPU.
+    let spin = !crate::obj::held();
+    if spin {
+        while this.local.queue_spin.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: the lock or the section excludes the other CPUs; the caller's
+    // promise for the item.
     unsafe {
+        let q = &mut *this.local.queue.as_ptr().cast_mut();
         let i = &mut *item.as_ptr();
-        i.link.set_owner(cpu::this().index() as u8);
+        i.link.set_owner(this.index() as u8);
         i.work = Some(work);
         i.link.set_level(level);
         if head {
@@ -281,8 +308,11 @@ unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
         } else {
             q.items.push_tail(item);
         }
+        q.len += 1;
     }
-    q.len += 1;
+    if spin {
+        this.local.queue_spin.store(false, Ordering::Release);
+    }
 }
 
 /// The top level of the queue; None when it is empty.

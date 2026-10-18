@@ -742,10 +742,9 @@ pub fn resume() -> ! {
 /// pending is acknowledged and handled first; then the decision, and the
 /// chosen thread runs at EL0, one portion of cleanup runs, or the kernel
 /// sleeps until an interrupt. A portion begins only with no interrupt
-/// pending. TPIDR_EL1 and the FP registers keep
-/// the last thread's meanwhile, and so does TTBR0 until a portion of cleanup
-/// or the idle wait (`aspace::leave`), so going back to that thread costs
-/// nothing. Leaves only through thread::run.
+/// pending. TTBR0, TPIDR_EL1 and the FP registers keep
+/// the last thread's meanwhile, so going back to that thread costs
+/// nothing; the idle wait takes TTBR0 off it (`aspace::leave`). Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
         let mut now = timer::now();
@@ -774,9 +773,6 @@ extern "C" fn exit_loop() -> ! {
             // to the head of its level already.
             Some(Decision::Clean) if arch::irq_pending() => {}
             Some(Decision::Clean) => {
-                // A portion may free the tables of a process whose thread
-                // ran here last: no table walk of this CPU may reach them.
-                crate::mm::aspace::leave();
                 cleanup::portion();
                 crate::cmd::flush_posted();
                 // The kernel stack is empty again: a quiescent point, where
