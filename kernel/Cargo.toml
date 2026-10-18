@@ -33,6 +33,9 @@ cpu-on-refused = []
 # for 20 ms (xtask smp-window).
 window-probe = []
 measure = []
+# The counters of SMP stage 6: kernel time and waits for OBJ of each CPU, printed on
+# request of the program (xtask smp-measure).
+smp-measure = ["measure"]
 # The ASID is 4 bits wide, so that a new generation begins every dozen switches of
 # address space (xtask smp-asid).
 asid-probe = ["kcore/narrow-asid"]

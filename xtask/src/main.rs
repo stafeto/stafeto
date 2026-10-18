@@ -49,6 +49,7 @@ mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod rtbench_check;
+mod smpmeasure;
 mod stubs;
 mod symbolize;
 mod vz;
@@ -1135,7 +1136,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 247;
+const INIT_TESTS: u32 = 249;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1232,10 +1233,12 @@ enum Variant {
     UnmapLocal,
     /// ASIDs 3 bits wide, for the boot of the shell under VZ (`vz::smp_asid`).
     AsidProbe3,
+    /// The counters of kernel time and OBJ waits of each CPU (`smp_measure`).
+    SmpMeasure,
 }
 
 impl Variant {
-    const ALL: [Variant; 17] = [
+    const ALL: [Variant; 18] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1253,6 +1256,7 @@ impl Variant {
         Variant::AsidEarly,
         Variant::UnmapLocal,
         Variant::AsidProbe3,
+        Variant::SmpMeasure,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1278,6 +1282,7 @@ impl Variant {
             Variant::AsidEarly => Some("break-asid-retire"),
             Variant::UnmapLocal => Some("break-unmap-local"),
             Variant::AsidProbe3 => Some("asid-probe-3"),
+            Variant::SmpMeasure => Some("smp-measure"),
         }
     }
 
@@ -1304,7 +1309,8 @@ impl Variant {
             | Variant::TestEl0
             | Variant::BaselineEl0
             | Variant::TraceEl0
-            | Variant::TestIcountEl0 => (TEST_KERNEL_LIMIT, "test builds"),
+            | Variant::TestIcountEl0
+            | Variant::SmpMeasure => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -1343,6 +1349,7 @@ impl Variant {
             Variant::AsidEarly => "stafeto-asid-early",
             Variant::UnmapLocal => "stafeto-unmap-local",
             Variant::AsidProbe3 => "stafeto-asid-3",
+            Variant::SmpMeasure => "stafeto-smp-measure",
         }
     }
 }
@@ -1516,6 +1523,7 @@ fn main() {
         Some("smp-window") => smp_window(),
         Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
         Some("smp-hvf") => smp_hvf(),
+        Some("smp-measure") => smpmeasure::run(&args[1..]),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
@@ -1605,8 +1613,13 @@ fn main() {
         Some("posix-fifo") => posix_fifo_probe(),
         Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
+        // STAFETO_MACHINE names the machine (qemu::MACHINES), for instance
+        // `HVF GICv3`; STAFETO_SMP gives it CPUs.
         Some("posix-procs") => {
-            posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(&qemu::VIRT, count))
+            let named = std::env::var("STAFETO_MACHINE").ok();
+            qemu::machine(named.as_ref()).and_then(|machine| {
+                posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(machine, count))
+            })
         }
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-lifecycle-rules") => {
@@ -4877,6 +4890,13 @@ const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
 const THREADS_READY_MAX: u64 = 13_119;
 const S5_ICOUNT_MAX: u64 = 3_063;
+/// S5x on the real processor (SMP stage 6): the median of 200 requests for
+/// the handler of a thread on another CPU, in ticks of the counter (16 ns),
+/// with the target waiting in WFI and with a lower thread on its CPU. The
+/// bound is the largest median of six runs on each machine of `HVF` plus
+/// 10 % (`cargo xtask smp-probe` on a quiet host). The limit of the board
+/// (stage 7) replaces these.
+const S5X_HVF_MAX: [(&str, u64, u64); 2] = [("HVF GICv3", 294, 101), ("HVF GICv2", 340, 216)];
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
@@ -8821,6 +8841,15 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
 fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
+    // B_N = B + (N-1) * OBJ_HOLD_MAX (the command's own work, C_cmd, is in B
+    // and in the holds): printed for the CPU counts of the table of docs/smp.md.
+    for cpus in [2, 8] {
+        let b_n = n + (cpus - 1) * OBJ_HOLD_MAX;
+        println!(
+            "B_{cpus} on {name}: {b_n} = B {n} + {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+            cpus - 1
+        );
+    }
     let b4 = n + 3 * OBJ_HOLD_MAX;
     println!("B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}");
     if b4 > B4_MAX {
@@ -8919,11 +8948,10 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 12] = [
+const SMP_PROBE_LINES: [&str; 11] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
-    "smp: 16000 calls on 4 CPUs, each took OBJ",
     "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
@@ -9211,7 +9239,43 @@ fn init_tests_in(
                 "smp window  20 mem_map calls, the most passes of the checks in one: 1",
             )?;
         }
+        if !o.lines.iter().any(|l| {
+            l.starts_with("smp: ")
+                && l.contains(" calls on 4 CPUs in ")
+                && l.ends_with(" ms, each took OBJ")
+        }) {
+            return Err("the test init printed no line of the calls of 4 CPUs on OBJ".into());
+        }
+        if hvf {
+            let (rows, _) = smpmeasure::parse(&o.lines);
+            for (name, idle, lower) in S5X_HVF_MAX {
+                if name != m.name {
+                    continue;
+                }
+                for (row, limit) in [
+                    ("S5x target waiting, its CPU idle", idle),
+                    ("S5x target waiting, a lower thread on its CPU", lower),
+                ] {
+                    let found = rows
+                        .iter()
+                        .find(|r| r.name == row)
+                        .ok_or_else(|| format!("the test init printed no row {row:?}"))?;
+                    println!(
+                        "{row} on {name}: median {} ticks (limit {limit}), p99 {}, longest {}",
+                        found.median, found.p99, found.longest
+                    );
+                    if found.median > limit {
+                        return Err(format!(
+                            "{row} on {name}: median {} ticks is past S5X_HVF_MAX {limit}",
+                            found.median
+                        ));
+                    }
+                }
+            }
+        }
         for start in [
+            "smp: litmus MP ",
+            "smp: litmus SB ",
             "smp: a thread at EL0 on CPU 1 ran ",
             "smp: signal to a thread at EL0 on CPU 1: median ",
             "smp: 20 mem_map calls while another CPU made ",

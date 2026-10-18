@@ -1061,12 +1061,12 @@ fn cpu_time_splits_user_and_kernel() -> Outcome {
     // it gets in the kernel, and a host that is busy makes them slow in
     // some rounds.
     let (mut spin_user, mut spin_kernel, mut spin_elapsed) = (0, 0, 0);
-    let (mut user0, mut kernel0) = user_and_kernel()?;
-    let (mut user1, mut kernel1) = (user0, kernel0);
+    let mut kernel1 = 0;
     for round in 0..3 {
-        (user0, kernel0) = user_and_kernel()?;
+        let (user0, kernel0) = user_and_kernel()?;
         let elapsed = until_elapsed(four_ms, 1, || {});
-        (user1, kernel1) = user_and_kernel()?;
+        let (user1, kernel_end) = user_and_kernel()?;
+        kernel1 = kernel_end;
         let (user, kernel) = (user1.saturating_sub(user0), kernel1.saturating_sub(kernel0));
         check(user > four_ms / 2, "a loop at EL0 grew no user time")?;
         check(
