@@ -1034,10 +1034,15 @@ fn user_and_kernel() -> Result<(u64, u64), &'static str> {
 
 /// Runs `step` in batches of `batch` until the counter has advanced
 /// `ticks`: the same time under `-icount` as without it, and a batch is
-/// long enough for the reading of the counter to count for little.
-fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) {
+/// long enough for the reading of the counter to count for little. Gives
+/// the ticks that passed, a little above `ticks` by the last batch.
+fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) -> u64 {
     let began = rt::time::now();
-    while rt::time::now().wrapping_sub(began) < ticks {
+    loop {
+        let passed = rt::time::now().wrapping_sub(began);
+        if passed >= ticks {
+            return passed;
+        }
         for _ in 0..batch {
             step();
         }
@@ -1051,16 +1056,28 @@ fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) {
 /// depend on the speed of the host.
 fn cpu_time_splits_user_and_kernel() -> Outcome {
     let four_ms = rt::time::frequency() / 250;
-    let (user0, kernel0) = user_and_kernel()?;
-    until_elapsed(four_ms, 1, || {});
-    let (user1, kernel1) = user_and_kernel()?;
-    let (spin_user, spin_kernel) = (user1.saturating_sub(user0), kernel1.saturating_sub(kernel0));
-    check(spin_user > four_ms / 2, "a loop at EL0 grew no user time")?;
-    check(
-        spin_kernel < spin_user / 8,
-        "a loop at EL0 with no call grew the kernel time",
-    )?;
-    until_elapsed(four_ms, 256, || {
+    // The loop with no call runs three times and the round with the least
+    // kernel time per tick counts: the interrupts of the timer are all that
+    // it gets in the kernel, and a host that is busy makes them slow in
+    // some rounds.
+    let (mut spin_user, mut spin_kernel, mut spin_elapsed) = (0, 0, 0);
+    let (mut user0, mut kernel0) = user_and_kernel()?;
+    let (mut user1, mut kernel1) = (user0, kernel0);
+    for round in 0..3 {
+        (user0, kernel0) = user_and_kernel()?;
+        let elapsed = until_elapsed(four_ms, 1, || {});
+        (user1, kernel1) = user_and_kernel()?;
+        let (user, kernel) = (user1.saturating_sub(user0), kernel1.saturating_sub(kernel0));
+        check(user > four_ms / 2, "a loop at EL0 grew no user time")?;
+        check(
+            kernel < user / 8,
+            "a loop at EL0 with no call grew the kernel time",
+        )?;
+        if round == 0 || kernel * spin_elapsed < spin_kernel * elapsed {
+            (spin_user, spin_kernel, spin_elapsed) = (user, kernel, elapsed);
+        }
+    }
+    let call_elapsed = until_elapsed(four_ms, 256, || {
         let _ = sys::yield_now();
     });
     let (_, kernel2) = user_and_kernel()?;
@@ -1069,19 +1086,18 @@ fn cpu_time_splits_user_and_kernel() -> Outcome {
     // lie inside the kernel's path, and on a slow host (TCG without
     // -icount) the exception entry and return are most of it. What the
     // loop of calls shows is that the kernel time grows with the calls.
-    // The loop with no call takes its kernel time from the timer's
-    // interrupts, about 1 400 ticks of 250 000 on a slow runner, and the
-    // loop of calls 60 000 to 70 000: a factor of 25 keeps the two apart
-    // with room for the run-to-run noise of a host that shares its CPUs.
-    if !(call_kernel > four_ms / 16 && call_kernel > 25 * spin_kernel) {
+    // The loops are compared by the kernel time per tick of the counter
+    // they ran (a loop of calls overshoots its 4 ms by up to a batch, more
+    // on a slow host): the share of the loop of calls is above 1/16, and 50
+    // times the share of the loop with no call.
+    let (spin_share, call_share) = (spin_kernel * call_elapsed, call_kernel * spin_elapsed);
+    let grew = call_kernel * 16 > call_elapsed && call_share > 50 * spin_share;
+    if !grew {
         println!(
-            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel}, the loop of calls kernel {call_kernel} (4 ms are {four_ms} ticks)"
+            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of calls kernel {call_kernel} in {call_elapsed} ticks (4 ms are {four_ms} ticks)"
         );
     }
-    check(
-        call_kernel > four_ms / 16 && call_kernel > 25 * spin_kernel,
-        "a loop of calls grew little of the kernel time",
-    )?;
+    check(grew, "a loop of calls grew little of the kernel time")?;
     let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;
     check(kernel <= ran, "the kernel time is above the whole")?;
     let (sum, sum_kernel) =

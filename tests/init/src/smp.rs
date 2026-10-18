@@ -923,16 +923,17 @@ const SERVICE_LEVEL: u8 = 15;
 /// The thread the raiser of the boost test raises.
 static RAISED_CLIENT: AtomicU64 = AtomicU64::new(0);
 
-/// Raises and lowers the client of the boost test by one level for 300 ms,
-/// which ends before the clients of the killed process are released (400 ms
-/// after its threads ended in the kernel built with `window-probe`); it
+/// Raises and lowers the client of the boost test by one level until the
+/// client is released (MARKS[1]), which the kernel built with `window-probe`
+/// does 400 ms after the threads of the killed process ended: the raises
+/// cover that window however late the process is killed on a loaded host. It
 /// cannot be a thread of CPU 0, which is busy with the end of the process
 /// meanwhile.
 extern "C" fn raise_and_lower(_: u64) -> ! {
     let client = Handle::<Thread>::borrowed(abi::Handle(RAISED_CLIENT.load(Relaxed)));
     let mut level = RAISED;
-    let until = now() + 300_000_000;
-    while now() < until {
+    let limit = now() + 20_000_000_000;
+    while MARKS[1].load(Relaxed) == 0 && now() < limit {
         level = if level == RAISED { RAISED + 1 } else { RAISED };
         // Fails once the client was released and ended.
         let _ = sys::thread_set_priority(&client, level, Policy::Fifo);

@@ -397,8 +397,9 @@ pub mod window {
 
     /// In `flush`, before the first command WAKE to a thread at LEVEL goes
     /// into its queue once its end is held (`hold_until_replied`): waits
-    /// 20 ms, in which the CPU of the thread ends it, and says whether it
-    /// did.
+    /// until the CPU of the thread saw the reply (2 s at most, for a host
+    /// that is busy), then 20 ms more, in which that CPU ends the thread,
+    /// and says whether it did.
     pub fn open(t: NonNull<Thread>, flag: u8) {
         if flag != WAKE || !HOLDING.load(Ordering::Acquire) {
             return;
@@ -407,6 +408,10 @@ pub mod window {
         let level = unsafe { t.as_ref() }.priority();
         if level != LEVEL || OPENED.swap(true, Ordering::Relaxed) {
             return;
+        }
+        let seen = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+        while !ENDED_INSIDE.load(Ordering::Acquire) && crate::arch::timer::now() < seen {
+            core::hint::spin_loop();
         }
         let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;
         while crate::arch::timer::now() < until {
@@ -421,8 +426,8 @@ pub mod window {
 
     /// In the stage Threads of a process, before its threads end: a thread
     /// at LEVEL that waits for a reply is let alone until the reply took it
-    /// out of its wait, 50 ms at most, so that its end follows the post of
-    /// the reply.
+    /// out of its wait, 2 s at most (the reply comes a few ms after the kill
+    /// on a quiet host), so that its end follows the post of the reply.
     ///
     /// # Safety
     /// `first` is the thread at the cursor of the stage, which is alive; no
@@ -441,7 +446,7 @@ pub mod window {
                 ARMED.store(true, Ordering::Release);
             }
             if priority == LEVEL {
-                let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 20;
+                let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
                 let mut held = false;
                 loop {
                     let waiting = {

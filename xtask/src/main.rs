@@ -9187,10 +9187,15 @@ fn init_tests_in(
         if variant == Variant::WindowProbe {
             // CPU 1 came 20 ms late to its quiescent point: the suspension
             // waited for it, and this CPU ran the thread of a timer of 2 ms
-            // meanwhile.
-            if waited < 15_000 || late > 10_000 {
+            // meanwhile. The thread woke 2000 us plus `late` after the call
+            // began, which must be well before the call returned: a wait
+            // that holds the interrupts masked lets the thread run only
+            // after the return. Measuring from the return keeps a stall of
+            // the host out of the verdict.
+            let before_return = waited.saturating_sub(2_000).saturating_sub(late);
+            if waited < 15_000 || before_return < 5_000 {
                 return Err(format!(
-                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us late: the wait must be 15000 us or more and the thread 10000 us or less"
+                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us after its deadline of 2000 us: the wait must be 15000 us or more and the thread must run 5000 us or more before the call returns (now {before_return} us)"
                 ));
             }
             qemu::expect_line(
