@@ -1768,8 +1768,14 @@ fn target_rows(
     let rows = upcall_rounds(&target);
     MARKS[3].store(1, Relaxed);
     let _ = sys::send(&c, &[0]);
-    let ended =
-        wait_for(|| sys::thread_info(&target).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    // Both threads have ended before their slots serve again: a message
+    // buffer is the page of one thread at a time.
+    let ended = wait_for(|| {
+        [Some(&target), spinner.as_ref()]
+            .into_iter()
+            .flatten()
+            .all(|t| sys::thread_info(t).is_ok_and(|i| i.state == abi::ThreadState::Ended))
+    });
     let_run()?;
     close(target)?;
     if let Some(t) = spinner {
@@ -1807,13 +1813,20 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     let _ = sys::debug_write(&resource(), b"smp-measure report");
     STORM_OVER.store(1, Relaxed);
     let stopped = wait_for(|| STORM_DONE[..others].iter().all(|d| d.load(Relaxed) != 0));
+    // The flag is set before the thread's last call: the next storm takes
+    // the stacks and message buffers of these threads again once they ended.
+    let ended = wait_for(|| {
+        kept.iter()
+            .flatten()
+            .all(|t| sys::thread_info(t).is_ok_and(|i| i.state == abi::ThreadState::Ended))
+    });
     let_run()?;
     for t in kept.into_iter().flatten() {
         close(t)?;
     }
     close(c)?;
     close(m)?;
-    check(stopped, "a thread of the storm did not stop")?;
+    check(stopped && ended, "a thread of the storm did not stop")?;
     rows
 }
 
