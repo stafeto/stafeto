@@ -4917,6 +4917,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// item by a section on another CPU cannot meet them; 7 instructions in the
 /// push of each of the 64 threads of the portion. 13 115 measured. The
 /// reviewer of the kernel decides whether it stays.
+/// `THREADS_READY_MAX` 13 119 -> 13 197 (audit 6, rv6.7): the lock of the
+/// cleanup queue is a ticket lock, so that a CPU waits only for the holds of
+/// the CPUs ahead of it; its take and its release are some instructions
+/// longer than the swap, about one a thread of the portion. 13 193
+/// measured. The reviewer of the kernel decides whether it stays.
 ///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
@@ -4965,7 +4970,7 @@ const B4_TAKES_ENFORCED: bool = false;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_119;
+const THREADS_READY_MAX: u64 = 13_197;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
