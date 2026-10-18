@@ -287,6 +287,26 @@ pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: 
     false
 }
 
+/// A boost of `t` to `level` with no command, for a thread that runs on this
+/// CPU or waits. Another CPU may do it for a thread that waits only: its CPU
+/// touches nothing of it until the end of its wait, which only a section
+/// under OBJ gives (`wake`), and a waiting thread stands in no ready queue,
+/// so the boost changes its level and nothing else (`Scheduler::boost`).
+/// A thread that is ready or runs on another CPU takes a command
+/// (`boost`). Checked in the test build.
+///
+/// # Safety
+/// As for `Scheduler::boost`; `t` waits or runs on this CPU.
+pub unsafe fn boost_in_place(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: u8) {
+    debug_assert!(
+        // SAFETY: the caller's promise; only the state is read.
+        is_local(t) || unsafe { t.as_ref() }.sched.state() == kcore::sched::State::Waiting,
+        "a thread of another CPU is boosted with no command while it does not wait"
+    );
+    // SAFETY: the caller's promise.
+    unsafe { k.s.boost(t, level, ceiling) };
+}
+
 /// START, served by the CPU of the thread, unless the thread ended since:
 /// the kernel's reference goes with its EXIT.
 pub fn serve_start(t: NonNull<Thread>) {
@@ -329,11 +349,12 @@ pub fn serve_wake(t: NonNull<Thread>) {
 /// chain of requests.
 pub fn serve_level(t: NonNull<Thread>) {
     let _section = crate::obj::lock();
+    // What was asked goes whether or not the thread ended meanwhile: its
+    // number is another thread's next, once it gives it back (EXIT).
+    let (level, boost) = crate::cmd::take_level(t);
     if !thread::is_held(t) {
-        // The thread ended meanwhile; its number may be another thread's.
         return;
     }
-    let (level, boost, _) = crate::cmd::take_asked(t);
     let now = timer::now();
     let waits = locked(|k| {
         // SAFETY: as above; the scheduler's threads are alive.
@@ -358,9 +379,9 @@ pub fn serve_level(t: NonNull<Thread>) {
 /// registers stop being the CPU's live ones, and the kernel's reference
 /// goes when the asker left it to this CPU.
 pub fn serve_exit(t: NonNull<Thread>) {
-    // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
-    let (_, _, ask) = crate::cmd::take_asked(t);
     let _section = crate::obj::lock();
+    // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
+    let ask = crate::cmd::take_exit(t);
     // SAFETY: as above.
     unsafe { local().sched.lock().s.exit(t, timer::now()) };
     if thread::current() == Some(t) {

@@ -29,7 +29,7 @@ use crate::arch::gic;
 use crate::local::local;
 use crate::thread::{self, THREADS, Thread};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kcore::gic::SGI_CMD;
 
 /// The thread waits and its wait ended (Scheduler::wake).
@@ -45,61 +45,77 @@ pub const BOOST: u8 = 16;
 /// The thread ends (`ask_exit`).
 pub const EXIT: u8 = 32;
 
-/// The arguments of the commands LEVEL, BOOST and EXIT, by thread number: a
-/// plain store each, whose last value stands, and that the owner takes with a
-/// swap. A thread keeps its number until its EXIT is served.
-struct Asked {
-    level: AtomicU16,
-    boost: AtomicU16,
-    exit: AtomicU16,
+/// The arguments of the commands LEVEL, BOOST and EXIT, by thread number,
+/// three words of 16 bits in one: the last value of each stands. Every
+/// access is in a section under OBJ (the asker's, the owner's `serve_level`
+/// and `serve_exit`, the end of the number's thread), so plain loads and
+/// stores do, and a thread with no ask costs one load (`clear_asked`). A
+/// thread keeps its number until its EXIT is served.
+static ASKED: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
+
+const LEVEL_SHIFT: u32 = 0;
+const BOOST_SHIFT: u32 = 16;
+const EXIT_SHIFT: u32 = 32;
+const WORD: u64 = 0xffff;
+
+fn asked<'a>(t: NonNull<Thread>) -> &'a AtomicU64 {
+    crate::obj::assert_held();
+    &ASKED[usize::from(thread::index(t))]
 }
 
-static ASKED: [Asked; THREADS] = [const {
-    Asked {
-        level: AtomicU16::new(0),
-        boost: AtomicU16::new(0),
-        exit: AtomicU16::new(0),
-    }
-}; THREADS];
+fn put(t: NonNull<Thread>, shift: u32, word: u16) {
+    let a = asked(t);
+    let all = a.load(Ordering::Relaxed);
+    a.store(
+        all & !(WORD << shift) | u64::from(word) << shift,
+        Ordering::Relaxed,
+    );
+}
 
-fn asked<'a>(t: NonNull<Thread>) -> &'a Asked {
-    &ASKED[usize::from(thread::index(t))]
+fn peek(t: NonNull<Thread>, shift: u32) -> u16 {
+    ((asked(t).load(Ordering::Relaxed) >> shift) & WORD) as u16
 }
 
 /// The new priority and policy asked of `t`, a word of `pack_level`.
 pub fn ask_level(t: NonNull<Thread>, word: u16) {
-    asked(t).level.store(word, Ordering::Relaxed);
+    put(t, LEVEL_SHIFT, word);
 }
 
 /// The boost asked of `t`: the larger of two asks stands (a boost only
 /// raises).
 pub fn ask_boost(t: NonNull<Thread>, level: u8, ceiling: u8) {
-    let word = &asked(t).boost;
     let ask: u16 = 1 << 12 | u16::from(ceiling) << 6 | u16::from(level);
-    let old = word.load(Ordering::Relaxed);
+    let old = peek(t, BOOST_SHIFT);
     if old == 0 || (old & 0x3f).min((old >> 6) & 0x3f) < u16::from(level.min(ceiling)) {
-        word.store(ask, Ordering::Relaxed);
+        put(t, BOOST_SHIFT, ask);
     }
 }
 
 /// The end of `t`: the cause in bits 0-7, bit 8 when the owner drops the
 /// kernel's reference.
 pub fn ask_exit(t: NonNull<Thread>, held: bool, cause: u8) {
-    asked(t).exit.store(
+    put(
+        t,
+        EXIT_SHIFT,
         0x200 | u16::from(held) << 8 | u16::from(cause),
-        Ordering::Relaxed,
     );
 }
 
-/// What was asked of `t`: priority word, boost word, exit word; each is 0
-/// when nothing was.
-pub fn take_asked(t: NonNull<Thread>) -> (u16, u16, u16) {
-    let a = asked(t);
-    (
-        a.level.swap(0, Ordering::Relaxed),
-        a.boost.swap(0, Ordering::Relaxed),
-        a.exit.swap(0, Ordering::Relaxed),
-    )
+/// What was asked of `t` as a new level: priority word, boost word; each is
+/// 0 when nothing was. The ask of the end stays.
+pub fn take_level(t: NonNull<Thread>) -> (u16, u16) {
+    let level = peek(t, LEVEL_SHIFT);
+    let boost = peek(t, BOOST_SHIFT);
+    put(t, LEVEL_SHIFT, 0);
+    put(t, BOOST_SHIFT, 0);
+    (level, boost)
+}
+
+/// What was asked of `t` as its end: 0 when nothing was.
+pub fn take_exit(t: NonNull<Thread>) -> u16 {
+    let word = peek(t, EXIT_SHIFT);
+    put(t, EXIT_SHIFT, 0);
+    word
 }
 
 /// A timer whose last reference went on this CPU is in the heap of another
@@ -381,12 +397,12 @@ pub mod window {
     /// 20 ms, in which the CPU of the thread ends it, and says whether it
     /// did.
     pub fn open(t: NonNull<Thread>, flag: u8) {
+        if flag != WAKE || !HOLDING.load(Ordering::Acquire) {
+            return;
+        }
         // SAFETY: the kernel's reference keeps the thread.
-        if flag != WAKE
-            || !HOLDING.load(Ordering::Acquire)
-            || unsafe { t.as_ref() }.priority() != LEVEL
-            || OPENED.swap(true, Ordering::Relaxed)
-        {
+        let level = unsafe { t.as_ref() }.priority();
+        if level != LEVEL || OPENED.swap(true, Ordering::Relaxed) {
             return;
         }
         let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;

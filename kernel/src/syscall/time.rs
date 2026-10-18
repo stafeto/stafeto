@@ -55,8 +55,10 @@ pub(super) fn timer_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
 /// reached fires in the call: bit 0 into the timer's slot, which goes to
 /// the top receiver that waits or into the channel's queue, as notify
 /// puts it; any other arms the timer, and an armed one moves. PEER_CLOSED
-/// once the channel closed, and the timer stays as it was. No memory is
-/// taken.
+/// once the channel closed, and the timer stays as it was. BAD_STATE for
+/// a timer that another CPU armed: a timer belongs to the CPU that armed it
+/// first, whose heap holds it, and only that CPU arms or cancels it
+/// (SMP stage 4, a change of the ABI). No memory is taken.
 pub(super) fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     let deadline = clock::clock().ns_to_ticks(a[1]);
@@ -66,7 +68,8 @@ pub(super) fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Err
 
 /// timer_cancel(x0 timer with MANAGE): the timer is armed no more; bits it
 /// posted stay in its slot until receive takes them (spec 10). A timer
-/// that is not armed is left as it is: 0.
+/// that is not armed is left as it is: 0. BAD_STATE for a timer that
+/// another CPU armed, as for timer_set.
 pub(super) fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     timer::cancel(t)?;

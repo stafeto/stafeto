@@ -470,9 +470,6 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
 pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     // SAFETY: the caller's promise; only the field is touched.
     if let Some(index) = try_index(t) {
-        // What was asked of the thread and not served is no ask of the next
-        // owner of the number.
-        crate::cmd::take_asked(t);
         // SAFETY: the caller's promise; only the field is written.
         unsafe { (*t.as_ptr()).numbers.index = NONE };
         tokens.free(index);

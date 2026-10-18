@@ -3248,7 +3248,11 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
-        "Assertion `how == NULL` failed.",
+        // The failed assert and the panic of relibc write their line in
+        // pieces, and the other runs write theirs between the pieces, so the
+        // line may come apart: each piece is looked for alone.
+        "Assertion `how == NULL",
+        "` failed.",
         "RELIBC PANIC: ",
     ] {
         qemu::expect_marker(&outcome, marker)?;
@@ -4767,6 +4771,14 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// (`control::gate_seen`): 26 instructions a thread, 1 452 for the 56 of
 /// the portion; the reviewer of the kernel decides whether it stays.
 ///
+/// `THREADS_READY_MAX` 12 289 -> 12 531 (SMP stage 4, review of the commands):
+/// the CPU's own end of a thread asks whether commands are on their way to
+/// it (`cmd::pending`) and, when one is, leaves the kernel's reference and
+/// the number to the command EXIT; the serve functions look at where the
+/// number's arguments stand under OBJ. 12 527 measured, 336 instructions
+/// over the 12 191 of the commit before: 5 a thread for the 64 of the
+/// portion. The reviewer of the kernel decides whether it stays.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -4815,7 +4827,7 @@ const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 12_289;
+const THREADS_READY_MAX: u64 = 12_531;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).

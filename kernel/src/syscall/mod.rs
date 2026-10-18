@@ -64,10 +64,10 @@ use upcall::{
 /// complete when no thread of the process is at EL0 on another CPU, which
 /// holds once every CPU has been in the kernel since the gate went up. The
 /// wait is a long call (`Long::Quiet`): this CPU takes its interrupts and
-/// runs its scheduler between the looks, and holds no lock. None while the
-/// wait goes on.
+/// runs its scheduler between the looks, and holds no lock. The call writes
+/// its own result, when the wait is over.
 #[inline(never)]
-fn process_control_waited(thread: NonNull<Thread>, args: &Args) -> Option<Result<Values, Error>> {
+fn process_control_waited(thread: NonNull<Thread>, args: &Args) {
     let r = crate::obj::enter_with(|| process_control(thread, args));
     if r.is_ok() && args[1] == 0 && crate::smp::cpus() > 1 {
         #[cfg(feature = "window-probe")]
@@ -80,10 +80,9 @@ fn process_control_waited(thread: NonNull<Thread>, args: &Args) -> Option<Result
                 limit: crate::qsbr::wait_limit(),
             },
         );
-        restart(thread);
-        return None;
+        return restart(thread);
     }
-    Some(r)
+    set_result(thread, r);
 }
 
 /// Runs a call that reaches objects in a section under OBJ (obj.rs), as a
@@ -245,10 +244,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
         Some(Call::ProcessCreate) => objects!(process_create(thread, &args)),
         Some(Call::ProcessKill) => objects!(process_kill(thread, &args)),
-        Some(Call::ProcessControl) => match process_control_waited(thread, &args) {
-            Some(r) => r,
-            None => return,
-        },
+        Some(Call::ProcessControl) => return process_control_waited(thread, &args),
         Some(Call::ProcessExit) => objects!(process_exit(thread, &args)),
         Some(Call::ThreadCreate) => objects!(thread_create(thread, &args)),
         Some(Call::ThreadStart) => objects!(thread_start(thread, &args)),

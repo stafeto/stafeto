@@ -152,7 +152,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                 q.take_slot();
                 let (n, priority) = notice(slot);
                 syscall::set_notification(t, n);
-                k.s.boost(t, priority, ceiling);
+                sched::boost_in_place(k, t, priority, ceiling);
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {
@@ -487,7 +487,7 @@ unsafe fn accept(
         let to = &mut (*r.as_ptr()).regs.x;
         to[10] = via.label();
         to[11] = token;
-        k.s.boost(r, (*slot.as_ptr()).priority(), ceiling(r));
+        sched::boost_in_place(k, r, (*slot.as_ptr()).priority(), ceiling(r));
         (*r.as_ptr()).boost_token = token;
         thread::set_server(client, r);
     }

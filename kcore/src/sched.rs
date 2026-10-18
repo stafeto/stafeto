@@ -241,7 +241,12 @@ impl<T> Node<T> {
     }
 
     /// Ticks the thread has run at `now`: the finished stints and, for the
-    /// running thread, the current one. O(1).
+    /// running thread, the current one. O(1). The thread's own CPU changes
+    /// these fields with no lock of the objects, so a reader on another CPU,
+    /// as object_info and times() are, may see a stint that ended while it
+    /// read counted again, or missing: the sum of two reads can fall below
+    /// the first by the length of one stint's end. Each reading is right
+    /// to within that, and the sum of a thread that is not running is exact.
     pub fn ran_at(&self, now: u64) -> u64 {
         if self.state == State::Running {
             self.ran.saturating_add(now.saturating_sub(self.since))
