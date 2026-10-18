@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <spawn.h>
@@ -670,6 +671,14 @@ static void public_lock_signals(void) {
 
 int main(int argc, char **argv) {
 #if LOCK_FIFO_FULL_ONLY
+    /* The probe times the steps of the file service while 64 waiters and
+     * their holders run. On four CPUs under icount a vCPU that waits for
+     * the others adds their time to the step, so the processes of the probe
+     * stay on one CPU, as the steps' limit assumes. */
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(0, &one);
+    expect("pin the full FIFO probe to CPU 0", sched_setaffinity(0, sizeof one, &one), 0);
     if (argc > 1 && strcmp(argv[1], "lock-fifo-full-run") == 0)
         return public_lock_fifo_full();
     if (argc <= 1) {

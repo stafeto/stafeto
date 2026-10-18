@@ -248,12 +248,24 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 18] = [
+const SYSTEM_PATHS: [&str; 30] = [
     "/bin",
     "/libexec",
     "/libexec/ramfs",
     "/dev",
     "/proc",
+    "/sys",
+    "/sys/devices",
+    "/sys/devices/system",
+    "/sys/devices/system/cpu",
+    "/sys/devices/system/cpu/cpu0",
+    "/sys/devices/system/cpu/cpu1",
+    "/sys/devices/system/cpu/cpu2",
+    "/sys/devices/system/cpu/cpu3",
+    "/sys/devices/system/cpu/cpu4",
+    "/sys/devices/system/cpu/cpu5",
+    "/sys/devices/system/cpu/cpu6",
+    "/sys/devices/system/cpu/cpu7",
     "/root",
     "/var",
     "/var/log",
@@ -343,6 +355,21 @@ fn shell_files() -> Result<Vec<RootFile>, String> {
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
+        // The directory of the CPUs, which htop and `nproc --all` count: a
+        // directory for each CPU the machine can have, of which the
+        // listing (the layer's) names the CPUs that are up.
+        dir("/sys"),
+        dir("/sys/devices"),
+        dir("/sys/devices/system"),
+        dir("/sys/devices/system/cpu"),
+        dir("/sys/devices/system/cpu/cpu0"),
+        dir("/sys/devices/system/cpu/cpu1"),
+        dir("/sys/devices/system/cpu/cpu2"),
+        dir("/sys/devices/system/cpu/cpu3"),
+        dir("/sys/devices/system/cpu/cpu4"),
+        dir("/sys/devices/system/cpu/cpu5"),
+        dir("/sys/devices/system/cpu/cpu6"),
+        dir("/sys/devices/system/cpu/cpu7"),
         // The home of root (the account's directory in /etc/passwd), where
         // htop and the other programs keep their settings.
         RootFile {

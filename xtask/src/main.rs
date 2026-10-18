@@ -30,6 +30,7 @@ mod service_sample;
 mod bash_dialog;
 mod ci;
 mod clock_probe;
+mod cpus_dialog;
 mod disasm;
 mod entropy;
 mod htop_dialog;
@@ -1471,6 +1472,8 @@ commands:
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
+  cpus-dialog [N]  check the CPUs in an ash dialog on N CPUs (4 by default): nproc, /proc/stat,
+            the spread of loops over the CPUs, taskset, htop
   ncdu-dialog  check ncdu in an ash dialog in QEMU: directory sizes, hard links counted once, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
@@ -1705,6 +1708,12 @@ fn main() {
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
+        Some("cpus-dialog") => args
+            .get(1)
+            .map_or(Ok(SMP_CPUS), |n| {
+                n.parse().map_err(|_| format!("{n}: not a number"))
+            })
+            .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
@@ -3357,6 +3366,10 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
         "relibc-hello: long transfers, O_SYNC, aio on threads",
         "relibc-hello: timers with a function in a thread",
+        &format!(
+            "relibc-hello: cpus conf={0} online={0} mask={0} on=1",
+            qemu::cpus()
+        ),
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
@@ -7466,6 +7479,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash-dialog", ash_dialog),
         job("nano-dialog", nano_dialog::nano_dialog),
         job("htop-dialog", htop_dialog::htop_dialog),
+        job("cpus-dialog smp 1", || cpus_dialog::cpus_dialog(1)),
+        job("cpus-dialog smp 4", || cpus_dialog::cpus_dialog(SMP_CPUS)),
         job("ncdu-dialog", ncdu_dialog::ncdu_dialog),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
@@ -7522,6 +7537,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // one; the kernel tests, whose harness runs the code of the tests
         // on CPU 0 with the others outside the scheduler, and waits for
         // them at the first retired ASID.
+        job("relibc-hello smp 4", || {
+            qemu::on_cpus(SMP_CPUS, relibc_hello_probe)
+        }),
         job("relibc-threads smp 4", || {
             qemu::on_cpus(SMP_CPUS, || relibc_threads_probe(&qemu::VIRT))
         }),

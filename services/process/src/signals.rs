@@ -174,6 +174,8 @@ impl PageStart {
     /// the service does so before the record is a target of any walk.
     pub fn write(self, page: &Page, from: &Page) {
         use core::sync::atomic::Ordering::{Acquire, Release};
+        // The CPUs a process may use pass to its children.
+        page.cpus.store(from.cpus.load(Acquire), Release);
         match self {
             PageStart::Spawn {
                 mask,

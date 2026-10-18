@@ -214,6 +214,18 @@ pub fn on_cpus<T>(n: usize, f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// The CPUs the machines this thread starts get: `on_cpus`, else
+/// STAFETO_SMP, else 1.
+pub fn cpus() -> usize {
+    match CPUS.get() {
+        0 => std::env::var("STAFETO_SMP")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1),
+        own => own,
+    }
+}
+
 pub fn command(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Command {
     let mut c = Command::new("qemu-system-aarch64");
     c.args(args(m, kernel, boot_image));
@@ -519,6 +531,12 @@ impl Run {
                 tail(&self.transcript.lines())
             )),
         }
+    }
+
+    /// All the output so far as lines, the one that no LF ended yet (a screen
+    /// that a program draws with cursor movements) included.
+    pub fn text(&self) -> Vec<String> {
+        self.transcript.lines()
     }
 
     /// The lines that ended so far, a CR before the LF cut.

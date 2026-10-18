@@ -1018,8 +1018,12 @@ pub fn user_ran(thread: NonNull<Thread>, now: u64) {
     crate::smpm::entered(now);
     // SAFETY: the running thread is alive; only this CPU writes the field.
     let ticks = &unsafe { &*thread.as_ptr() }.user_ticks;
+    // The word holds the ticks of the earlier stretches less the counter at
+    // this stretch's start. Those ticks are fewer than the counter then
+    // was, so the word is negative with bit 63 set, and adding `now` gives
+    // the ticks with bit 63 clear again: no mask is needed.
     ticks.store(
-        ticks.load(Ordering::Relaxed).wrapping_add(now) & !AT_EL0,
+        ticks.load(Ordering::Relaxed).wrapping_add(now),
         Ordering::Relaxed,
     );
 }

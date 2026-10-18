@@ -330,6 +330,31 @@ pub unsafe fn thread_create_with(
     buffer: usize,
     exit: Option<(&Handle<Channel>, u8)>,
 ) -> Result<Handle<Thread>, Error> {
+    // SAFETY: the caller's promise.
+    unsafe {
+        thread_create_on(
+            process, entry, stack, arg, priority, policy, buffer, exit, 0,
+        )
+    }
+}
+
+/// `thread_create_with` on CPU `cpu` - 1 (x5, abi::THREAD_CPU_SHIFT); 0 is
+/// the CPU of the caller. INVALID_ARGS for a CPU that is not up.
+///
+/// # Safety
+/// As for `thread_create`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn thread_create_on(
+    process: &Handle<Process>,
+    entry: extern "C" fn(u64) -> !,
+    stack: usize,
+    arg: u64,
+    priority: u8,
+    policy: Policy,
+    buffer: usize,
+    exit: Option<(&Handle<Channel>, u8)>,
+    cpu: u8,
+) -> Result<Handle<Thread>, Error> {
     let (channel, notice) = exit.map_or((0, 0), |(c, p)| (c.raw().0, p.into()));
     let args = [
         process.raw().0,
@@ -337,7 +362,7 @@ pub unsafe fn thread_create_with(
         stack as u64,
         arg,
         priority.into(),
-        policy as u64,
+        policy as u64 | u64::from(cpu) << abi::THREAD_CPU_SHIFT,
         buffer as u64,
         channel,
         notice,
@@ -424,6 +449,35 @@ pub fn process_time(process: &Handle<Process>) -> Result<u64, Error> {
     let args = [process.raw().0, abi::INFO_PROCESS_TIME, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(x[1])
+}
+
+/// What a CPU counts about its time (object_info CPU), in counter ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuInfo {
+    /// The CPUs that are up.
+    pub cpus: u64,
+    /// The ticks since the CPU started.
+    pub since: u64,
+    /// The ticks it slept in `wfi`.
+    pub idle: u64,
+    /// The ticks its entries from EL0 spent in the kernel.
+    pub system: u64,
+    /// The CPU of the caller.
+    pub current: u64,
+}
+
+/// object_info(CPU) of CPU `index`: no handle and no right needed.
+/// INVALID_ARGS for a CPU that is not up.
+pub fn cpu_info(index: u64) -> Result<CpuInfo, Error> {
+    let args = [0, abi::INFO_CPU, index];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(CpuInfo {
+        cpus: x[1],
+        since: x[2],
+        idle: x[3],
+        system: x[4],
+        current: x[5],
+    })
 }
 
 /// Wake a thread from its current send or receive with Error::Interrupted.
