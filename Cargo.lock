@@ -7,6 +7,14 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "ash-launcher"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+ "rt",
+]
+
+[[package]]
 name = "bash"
 version = "0.1.0"
 dependencies = [

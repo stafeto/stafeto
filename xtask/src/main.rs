@@ -792,21 +792,28 @@ const SHELL_SERVICES: [ImageProgram; 7] = [
     ("loader", "loader", 0, &[]),
 ];
 /// The services after the programs of the packages.
-const SHELL_SERVICES_LAST: [ImageProgram; 3] = [
+const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
+    // The program init starts for the dialog; BusyBox is the file it spawns.
+    (
+        "ash-launcher",
+        "ash-launcher",
+        POSIX_STACK_SIZE,
+        &["interactive"],
+    ),
     ("tty", "tty", TTY_STACK_SIZE, &[]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// How the program a package names (`program` in packages/<name>.toml) is
 /// built for the image: its stack and the features of its crate. The
-/// programs of stack 0 (every package but BusyBox, which init starts as the
-/// launcher) go into the image as their ELF files alone, which the process
-/// service starts from the RAM files.
+/// programs of stack 0 go into the image as their ELF files alone, which the
+/// process service starts from the RAM files; init starts the launcher
+/// (`ash-launcher`), which spawns BusyBox from its file.
 const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
     (
         "busybox-probe",
         "busybox-probe",
-        POSIX_STACK_SIZE,
+        0,
         &["ash-interactive", "utilities"],
     ),
     ("bash", "bash", 0, &["interactive"]),
@@ -6638,6 +6645,31 @@ fn ash_dialog() -> Result<(), String> {
                 &["function:called", "bypassed"],
             ),
             ("command -v printf", &["printf"]),
+            // The time zones come from the TZif files of /usr/share/zoneinfo
+            // (UTC needs no file) and from POSIX rules in TZ; 2200000000 is
+            // after the last transition of the files, which the rule in their
+            // footer gives.
+            (
+                "for z in UTC Europe/Berlin Asia/Kolkata Australia/Sydney; do TZ=$z date -d @1700000000 '+%Y-%m-%d %H:%M:%S %Z'; done",
+                &[
+                    "2023-11-14 22:13:20 UTC",
+                    "2023-11-14 23:13:20 CET",
+                    "2023-11-15 03:43:20 IST",
+                    "2023-11-15 09:13:20 AEDT",
+                ],
+            ),
+            (
+                "TZ=Europe/Berlin date -d @1720000000 '+%H:%M:%S %Z'; TZ=Australia/Sydney date -d @1720000000 '+%H:%M:%S %Z'; TZ=America/Los_Angeles date -d @1720000000 '+%H:%M:%S %Z %z'",
+                &["11:46:40 CEST", "19:46:40 AEST", "02:46:40 PDT -0700"],
+            ),
+            (
+                "TZ=Europe/Berlin date -d @2200000000 '+%Y-%m-%d %H:%M:%S %Z'; TZ=America/New_York date -d @2200000000 '+%H:%M:%S %Z'",
+                &["2039-09-19 01:06:40 CEST", "19:06:40 EDT"],
+            ),
+            (
+                "TZ=EST5EDT date -d @1720000000 '+%H:%M:%S %Z'; TZ=XYZ-3 date -d @1720000000 '+%H:%M:%S %Z'; TZ=Nowhere/Land date -d @1720000000 '+%H:%M:%S %Z'",
+                &["05:46:40 EDT", "12:46:40 XYZ", "09:46:40 UTC"],
+            ),
         ];
         for (command, expected) in builtin_cases {
             run.send(command)?;
