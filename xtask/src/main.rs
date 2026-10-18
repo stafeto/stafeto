@@ -3313,6 +3313,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: malloc heap x",
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
+        "relibc-hello: gettimeofday, putenv after clearenv, mkstemp errno",
         "relibc-hello: directories, stat, descriptors, mmap, math",
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
         "relibc-hello: long transfers, O_SYNC, aio on threads",
@@ -6099,7 +6100,12 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"uname -s; id -u; id -un"#,
         &[r#"stafeto"#, r#"0"#, r#"root"#],
     ),
-    (r#"env A=1 env | grep -c '^A=1'"#, &[r#"=1"#]),
+    // The shell starts with TERM in its environment: the variable the
+    // command sets and the one it had are both there.
+    (
+        r#"env A=1 env | grep -c -e '^A=1$' -e '^TERM=xterm-256color$'"#,
+        &[r#"=2"#],
+    ),
     (
         r#"echo 3+4 | bc; printf 'a\nb\n' > /tmp/ed1; printf '1d\nw\nq\n' | ed -s /tmp/ed1; cat /tmp/ed1"#,
         &[r#"7"#, r#"b"#],

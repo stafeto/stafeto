@@ -134,6 +134,7 @@ basic/stdio/scanf
 basic/stdio/vdprintf
 basic/stdio/vprintf
 basic/stdio/vscanf
+basic/stdlib/abort
 basic/wchar/getwchar
 basic/wchar/putwchar
 basic/wchar/vwprintf

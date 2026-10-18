@@ -97,6 +97,10 @@ pub fn htop_dialog() -> Result<(), String> {
         run.send("echo htop-status:$?")?;
         run.expect_line("the status", |l| l == "htop-status:0", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        // htop saved its settings in the home of root.
+        run.send("test -s /root/.config/htop/htoprc && echo htoprc-saved")?;
+        run.expect_line("the settings file", |l| l == "htoprc-saved", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
         // Ctrl-D on an empty line ends ash.
         run.type_raw(b"\x04")?;
         run.expect(
@@ -113,6 +117,7 @@ pub fn htop_dialog() -> Result<(), String> {
             || line.contains("out of memory")
             || line.contains("I/O error")
             || line.contains("Error opening terminal")
+            || line.contains("Cannot save configuration")
     }) {
         return Err("htop dialog faulted".into());
     }

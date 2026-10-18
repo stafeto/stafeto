@@ -34,7 +34,7 @@ unsafe extern "C" {
 /// fork, one of the loader has), which makes a session of its own, opens
 /// the console, which becomes the session's controlling terminal with the
 /// getty's group in its foreground, puts it in descriptors 0, 1 and 2 and
-/// execs `/bin/ash -i -l`; the launcher, in another session, waits for it.
+/// sets `TERM` and execs `/bin/ash -i`; the launcher, in another session, waits for it.
 /// INTR at the console so reaches the shell and its commands and never
 /// the launcher.
 #[cfg(feature = "ash-interactive")]
@@ -60,6 +60,7 @@ unsafe extern "C" {
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char)
     -> c_int;
     fn _exit(status: c_int) -> !;
+    fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn __errno_location() -> *mut c_int;
     static environ: *const *const c_char;
@@ -71,14 +72,7 @@ unsafe extern "C" {
 #[cfg(feature = "ash-interactive")]
 fn getty() -> ! {
     const O_RDWR: c_int = 2;
-    // A login shell reads /etc/profile, which sets TERM for the programs
-    // that draw on the console.
-    let argv = [
-        c"ash".as_ptr(),
-        c"-i".as_ptr(),
-        c"-l".as_ptr(),
-        core::ptr::null(),
-    ];
+    let argv = [c"ash".as_ptr(), c"-i".as_ptr(), core::ptr::null()];
     // SAFETY: the child of fork, alone in its process; the strings are
     // NUL-terminated and live on; environ is relibc's.
     unsafe {
@@ -96,6 +90,13 @@ fn getty() -> ! {
         }
         if console > 2 {
             close(console);
+        }
+        // The terminal of the shell's programs (ncurses reads the entry of
+        // /usr/share/terminfo): the console is an xterm-compatible terminal.
+        // The shell starts with this variable in its environment, which
+        // `env A=1 env` of the dialogs must show with the new one.
+        if setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1) != 0 {
+            _exit(126);
         }
         execve(c"/bin/ash".as_ptr(), argv.as_ptr(), environ);
         _exit(127)

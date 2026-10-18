@@ -53,11 +53,6 @@ UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outl
 # What `configure` cannot learn by running a program: filled in as the
 # build needs them.
 CACHE: dict[str, str] = {}
-# htop's configure finds clock_gettime but never defines HAVE_CLOCK_GETTIME,
-# so its clock functions (generic/gettime.c) fall back on gettimeofday, which
-# the layer leaves out as POSIX.1-2024 does (ENOSYS). The macro says that
-# clock_gettime is there.
-DEFINES = "-DHAVE_CLOCK_GETTIME=1"
 CONFIGURE = (
     "--host=aarch64-linux-gnu", "--build=aarch64-apple-darwin",
     "--enable-unicode", "--disable-affinity", "--disable-hwloc", "--disable-sensors",
@@ -132,7 +127,7 @@ def main() -> None:
     cc = " ".join((str(clang), "--target=aarch64-linux-gnu", "-nostdinc",
                    f"-isystem {RELIBC / 'include'}", f"-idirafter {COMPAT}", "-mno-outline-atomics",
                    "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
-                   A53_ERRATA, "-fno-pic", DEFINES, *UNWIND_CFLAGS))
+                   A53_ERRATA, "-fno-pic", *UNWIND_CFLAGS))
     env = dict(os.environ, **CACHE, CC=cc, CFLAGS="-Os -w",
                CPPFLAGS=f"-I{NCURSES / 'include'}",
                CURSES_CFLAGS=f"-I{NCURSES / 'include'}",

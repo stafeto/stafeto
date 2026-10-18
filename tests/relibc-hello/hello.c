@@ -23,6 +23,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
 #include <termios.h>
@@ -748,6 +749,42 @@ static int constants(void) {
     return 0;
 }
 
+/* gettimeofday is clock_gettime(CLOCK_REALTIME) in microseconds; putenv puts
+ * a new variable where the list ends, also after the idiom of clearenv
+ * (environ[0] = NULL); mkstemp in a directory that is not there fails with
+ * ENOENT at the first try. */
+extern char **environ;
+
+static int small_calls(void) {
+    struct timeval tv;
+    struct timespec ts;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CHECK(gettimeofday(&tv, NULL) == 0);
+#pragma clang diagnostic pop
+    CHECK(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+    CHECK(tv.tv_usec >= 0 && tv.tv_usec < 1000000);
+    long long apart = ((long long)ts.tv_sec - tv.tv_sec) * 1000000
+                      + (ts.tv_nsec / 1000 - tv.tv_usec);
+    CHECK(apart >= 0 && apart < 1000000);
+    CHECK(setenv("SMALL_FIRST", "1", 1) == 0);
+    CHECK(setenv("SMALL_SECOND", "2", 1) == 0);
+    environ[0] = NULL;
+    static char entry[] = "SMALL_NEW=3";
+    CHECK(putenv(entry) == 0);
+    CHECK(environ[0] != NULL && strcmp(environ[0], "SMALL_NEW=3") == 0);
+    CHECK(environ[1] == NULL);
+    CHECK(getenv("SMALL_NEW") != NULL && strcmp(getenv("SMALL_NEW"), "3") == 0);
+    char name[] = "/absent-directory/file.XXXXXX";
+    errno = 0;
+    CHECK(mkstemp(name) == -1 && errno == ENOENT);
+    char dir[] = "/absent-directory/dir.XXXXXX";
+    errno = 0;
+    CHECK(mkdtemp(dir) == NULL && errno == ENOENT);
+    printf("relibc-hello: gettimeofday, putenv after clearenv, mkstemp errno\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) return end_badly(argv[1]);
     printf("relibc-hello: printf argc=%d argv0=%s pi=%.3f\n", argc, argv[0], 3.14159);
@@ -786,7 +823,9 @@ int main(int argc, char **argv) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return 8;
     printf("relibc-hello: monotonic %lld.%09ld\n", (long long)now.tv_sec, now.tv_nsec);
-    int status = files();
+    int status = small_calls();
+    if (status) return status;
+    status = files();
     if (status) return status;
     status = memory_streams();
     if (status) return status;
