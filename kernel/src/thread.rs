@@ -33,7 +33,7 @@ use crate::sched::{self, Tokens};
 use abi::{Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
@@ -84,7 +84,7 @@ pub struct Thread {
     /// Its number in the system table (spec 6.1, 7.8): the tokens of its
     /// requests carry it, and a taken number always names a live thread;
     /// and the number of the thread that serves its request.
-    numbers: Numbers,
+    pub(crate) numbers: Numbers,
     /// The token of the request whose client boosts it (spec 6.6): a reply
     /// with it ends the boost. 0 when a notification boosts it, or nothing.
     pub boost_token: u64,
@@ -110,33 +110,52 @@ pub struct Thread {
     /// The counter ticks the thread has spent at EL0 (spec 8): the
     /// stretches between a way out of the kernel and the next entry from
     /// EL0. `run` takes the counter from the field as the thread leaves for
-    /// EL0, and `user_ran` adds it back at the entry, so that the field
-    /// holds the whole of the stretches while the thread is in the kernel,
-    /// which is where every reader finds it (the CPU that runs a thread
-    /// at EL0 is the only one that would see the stretch half counted).
+    /// EL0 and sets bit 63, and `user_ran` adds it back at the entry and
+    /// clears the bit, so that the field holds the whole of the stretches
+    /// while the thread is in the kernel; a reader on another CPU sees the
+    /// bit and adds its own counter (`user_ticks`).
     /// What the thread ran besides, `Node::ran` less this, it ran in the
     /// kernel. Last, so that it takes the padding the struct ended with.
     /// Only the CPU the thread runs on writes it.
     user_ticks: AtomicU64,
 }
 
-/// The two system numbers a thread has, in one word so that they take the
-/// place of the one the thread had (the fields after them keep their
-/// offsets).
-#[derive(Clone, Copy)]
-#[repr(align(8))]
-struct Numbers {
+/// The two system numbers a thread has, with what other CPUs need to know
+/// of it, in one word so that they take the place of the one the thread had
+/// (the fields after them keep their offsets).
+#[repr(C, align(8))]
+pub(crate) struct Numbers {
     /// Its number, from `create` until it ends (sched::exit) or, when it
-    /// never started, until its portion of cleanup; None once it went
+    /// never started, until its portion of cleanup; NONE once it went
     /// back (`give_number`).
-    index: Option<u16>,
+    index: u16,
     /// The number of the thread that accepted the request this thread
     /// waits for the reply to (`accept`, spec 6.1): a rise of this thread's
     /// priority goes on to that thread while its `boost_token` is the
     /// token of the request (`channel::requeue`). Stale once the request is
     /// answered; the token tells.
-    served_by: Option<u16>,
+    served_by: u16,
+    /// The CPU the thread runs on, from `create` (the creator's) or the
+    /// call that made it (abi::THREAD_CPU_SHIFT), until it ends: only that
+    /// CPU changes the thread's scheduling state (cmd.rs). Written before
+    /// the thread starts.
+    cpu: u8,
+    /// STARTED: the thread started; HELD: the scheduler holds it, from its
+    /// start until it ends. These stand in for the states Stopped and Dead,
+    /// which the scheduler's own field gives only to the CPU of the thread.
+    /// Written under OBJ.
+    flags: u8,
+    /// What other CPUs asked of the thread's CPU and it has not served
+    /// (cmd::WAKE and the like).
+    pub(crate) cmds: AtomicU8,
+    /// How many copies of a message are being made to or from its buffer
+    /// (`copy_later`).
+    copying: AtomicU8,
 }
+
+const NONE: u16 = u16::MAX;
+const STARTED: u8 = 1;
+const HELD: u8 = 2;
 
 /// The bits of the notification of a thread's end (spec 6.5): bit 0, once.
 const EXIT_BITS: u64 = 1;
@@ -152,6 +171,11 @@ pub enum Long {
     /// mem_map, mem_unmap or mem_protect: the busy entry it changes
     /// (process::maps).
     Change(Change),
+    /// process_control, a suspension: the wait for every CPU to have been in
+    /// the kernel since the gate went up, for `epoch` (qsbr::begin_wait), until
+    /// `limit` on the counter. The call starts over between the looks, so
+    /// that the scheduler and the interrupts of this CPU run in between.
+    Quiet { epoch: u64, limit: u64 },
 }
 
 impl Long {
@@ -160,6 +184,7 @@ impl Long {
         match self {
             Long::Create(_) => Call::MemCreate,
             Long::Change(on) => on.call(),
+            Long::Quiet { .. } => Call::ProcessControl,
         }
     }
 }
@@ -216,10 +241,74 @@ impl Thread {
         self.process
     }
 
+    /// Whether the scheduler holds the thread (`is_held`).
+    pub fn is_held(&self) -> bool {
+        self.numbers.flags & HELD != 0
+    }
+
     /// The effective priority: the level of the cleanup the thread's calls
     /// and faults cause (spec 7.7).
     pub fn priority(&self) -> u8 {
         self.sched.priority()
+    }
+}
+
+/// The CPU `t` runs on.
+#[inline(always)]
+pub fn cpu_of(t: NonNull<Thread>) -> usize {
+    // SAFETY: the caller holds the thread; the field is written before it
+    // starts.
+    usize::from(unsafe { (*t.as_ptr()).numbers.cpu })
+}
+
+/// Puts the stopped thread `t` on CPU `cpu`, which is up.
+pub fn set_cpu(t: NonNull<Thread>, cpu: usize) {
+    // SAFETY: the caller holds the thread, which has not started.
+    unsafe {
+        assert!(
+            (*t.as_ptr()).numbers.flags & STARTED == 0,
+            "a thread moves after it started"
+        );
+        (*t.as_ptr()).numbers.cpu = cpu as u8;
+    }
+}
+
+/// Whether `t` started, whether or not it ended since. Read under OBJ.
+pub fn is_started(t: NonNull<Thread>) -> bool {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).numbers.flags & STARTED != 0 }
+}
+
+/// Whether the scheduler holds `t`: it started and has not ended. Read
+/// under OBJ.
+pub fn is_held(t: NonNull<Thread>) -> bool {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).numbers.flags & HELD != 0 }
+}
+
+/// Notes under OBJ that `t` started: the scheduler holds it from now on.
+/// False when it started before.
+pub fn mark_started(t: NonNull<Thread>) -> bool {
+    // SAFETY: the caller holds the thread; OBJ guards the fields.
+    unsafe {
+        let n = &mut (*t.as_ptr()).numbers;
+        if n.flags & STARTED != 0 {
+            return false;
+        }
+        n.flags |= STARTED | HELD;
+        true
+    }
+}
+
+/// Notes under OBJ that the scheduler lets `t` go: whether its reference
+/// is still the scheduler's to drop.
+pub fn mark_ended(t: NonNull<Thread>) -> bool {
+    // SAFETY: as above.
+    unsafe {
+        let n = &mut (*t.as_ptr()).numbers;
+        let held = n.flags & HELD != 0;
+        n.flags &= !HELD;
+        held
     }
 }
 
@@ -286,8 +375,12 @@ pub fn create_with_exit(
         transit: [None; MESSAGE_HANDLES],
         long: None,
         numbers: Numbers {
-            index: None,
-            served_by: None,
+            index: NONE,
+            served_by: NONE,
+            cpu: crate::arch::cpu::this().index() as u8,
+            flags: 0,
+            cmds: AtomicU8::new(0),
+            copying: AtomicU8::new(0),
         },
         boost_token: 0,
         siblings: None,
@@ -308,7 +401,7 @@ pub fn create_with_exit(
     // slot is in no queue.
     unsafe {
         (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
-        (*thread.as_ptr()).numbers.index = Some(index);
+        (*thread.as_ptr()).numbers.index = index;
         if let (Some(source), Some((_, label, notice))) = ((*thread.as_ptr()).exit.as_mut(), exit) {
             source.attach(Owner::ThreadEnd(thread), notice, label);
         }
@@ -340,7 +433,14 @@ pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
 /// has not ended holds.
 pub fn index(t: NonNull<Thread>) -> u16 {
     // SAFETY: the caller holds the thread; only the field is read.
-    unsafe { (*t.as_ptr()).numbers.index }.expect("a thread that has not ended holds its number")
+    try_index(t).expect("a thread that has not ended holds its number")
+}
+
+/// The number of `t`, if it holds one.
+pub fn try_index(t: NonNull<Thread>) -> Option<u16> {
+    // SAFETY: the caller holds the thread; only the field is read.
+    let n = unsafe { (*t.as_ptr()).numbers.index };
+    (n != NONE).then_some(n)
 }
 
 /// The thread `server` accepted the request of `client`, which waits for
@@ -350,14 +450,15 @@ pub fn index(t: NonNull<Thread>) -> u16 {
 /// Both are alive; `server` holds its number; OBJ is held.
 pub unsafe fn set_server(client: NonNull<Thread>, server: NonNull<Thread>) {
     // SAFETY: the caller's promise; only the field is written.
-    unsafe { (*client.as_ptr()).numbers.served_by = Some(index(server)) };
+    unsafe { (*client.as_ptr()).numbers.served_by = index(server) };
 }
 
 /// The number of the thread that accepted the request `t` waits for the
 /// reply to, if `t` ever waited for one.
 pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
     // SAFETY: the caller holds the thread; only the field is read.
-    unsafe { (*t.as_ptr()).numbers.served_by }
+    let n = unsafe { (*t.as_ptr()).numbers.served_by };
+    (n != NONE).then_some(n)
 }
 
 /// Gives the number of `t` back to the table of thread numbers `tokens`,
@@ -368,7 +469,9 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
 /// `t` is alive; `tokens` is the locked table (sched::locked).
 pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     // SAFETY: the caller's promise; only the field is touched.
-    if let Some(index) = unsafe { (*t.as_ptr()).numbers.index.take() } {
+    if let Some(index) = try_index(t) {
+        // SAFETY: the caller's promise; only the field is written.
+        unsafe { (*t.as_ptr()).numbers.index = NONE };
         tokens.free(index);
     }
 }
@@ -421,6 +524,12 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>, cause: u8) {
     let Some(Buffer { va, frame }) = buffer else {
         return;
     };
+    // A copy of a message that another CPU is making outside OBJ reads or
+    // writes the frame: it ends in the time of 960 bytes, and needs no lock.
+    // SAFETY: the caller's promise; the counter is atomic.
+    while unsafe { (*t.as_ptr()).numbers.copying.load(Ordering::Acquire) } != 0 {
+        core::hint::spin_loop();
+    }
     let unmapped = process::unmap_page(p, va);
     assert!(
         unmapped.is_none_or(|pa| pa == frame.pa()),
@@ -529,6 +638,21 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
         // SAFETY: the caller's promise.
         return unsafe { copy_message(to, from, range) };
     }
+    // SAFETY: the caller's promise; the counters are atomic. A teardown that
+    // frees a buffer waits for them (`drop_buffer`).
+    unsafe {
+        (*to.as_ptr())
+            .numbers
+            .copying
+            .fetch_add(1, Ordering::Relaxed);
+        (*from.as_ptr())
+            .numbers
+            .copying
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    crate::local::local()
+        .deferred
+        .fetch_or(crate::local::COPY, Ordering::Relaxed);
     let mut pending = crate::local::local().copy.lock();
     assert!(pending.to.is_none(), "a message copy waits for another");
     *pending = PendingCopy {
@@ -539,19 +663,39 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
     };
 }
 
+/// Waits until the copies of messages to or from the buffer of `t` are made
+/// (`copy_later`): the CPU that makes them holds no lock and needs nothing
+/// of this one.
+pub fn wait_copies(t: NonNull<Thread>) {
+    // SAFETY: the caller holds the thread; the counter is atomic.
+    while unsafe { (*t.as_ptr()).numbers.copying.load(Ordering::Acquire) } != 0 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Makes the copy that `copy_later` left, outside OBJ: each call that
 /// delivers a message ends with it, and so does the way into a thread that
 /// the delivery made ready.
 #[inline(always)]
 pub fn flush_copy() {
-    let pending = crate::local::local().copy.lock().to.is_some();
-    if pending {
-        flush_copy_now();
+    if crate::local::local().deferred.load(Ordering::Relaxed) != 0 {
+        flush_deferred();
     }
 }
 
+/// The copy that waits, then the commands that the call posted: a thread
+/// of another CPU reads the message once it is woken, so the commands go
+/// out after the copy (cmd.rs).
 #[inline(never)]
+fn flush_deferred() {
+    flush_copy_now();
+    crate::cmd::flush();
+}
+
 fn flush_copy_now() {
+    crate::local::local()
+        .deferred
+        .fetch_and(!crate::local::COPY, Ordering::Relaxed);
     let PendingCopy {
         to: Some(to),
         from: Some(from),
@@ -562,7 +706,17 @@ fn flush_copy_now() {
         return;
     };
     // SAFETY: `copy_later`'s promise.
-    unsafe { copy_message(to, from, start..end) };
+    unsafe {
+        copy_message(to, from, start..end);
+        (*to.as_ptr())
+            .numbers
+            .copying
+            .fetch_sub(1, Ordering::Release);
+        (*from.as_ptr())
+            .numbers
+            .copying
+            .fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Writes `words` into the message buffer of `t` from byte `offset` on
@@ -691,6 +845,7 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
                 process::release(on.target, cause);
             }
         }
+        Some(Long::Quiet { .. }) => crate::qsbr::end_wait(),
         None => {}
     }
 }
@@ -830,13 +985,19 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     }
 }
 
+/// Bit 63 of `Thread::user_ticks`: the thread is at EL0, and the low bits
+/// hold the ticks it ran there less the counter when the stretch began, so
+/// that a reader on another CPU adds its own counter (`user_ticks`).
+const AT_EL0: u64 = 1 << 63;
+
 /// The thread leaves the kernel for EL0 at `now`: its stretch there
-/// starts (`user_ran` ends it).
+/// starts (`user_ran` ends it). One store, so that another CPU never reads
+/// half of the change.
 #[inline(always)]
 fn user_resumes(thread: &Thread, now: u64) {
     let ticks = &thread.user_ticks;
     ticks.store(
-        ticks.load(Ordering::Relaxed).wrapping_sub(now),
+        ticks.load(Ordering::Relaxed).wrapping_sub(now) | AT_EL0,
         Ordering::Relaxed,
     );
 }
@@ -848,14 +1009,20 @@ pub fn user_ran(thread: NonNull<Thread>, now: u64) {
     // SAFETY: the running thread is alive; only this CPU writes the field.
     let ticks = &unsafe { &*thread.as_ptr() }.user_ticks;
     ticks.store(
-        ticks.load(Ordering::Relaxed).wrapping_add(now),
+        ticks.load(Ordering::Relaxed).wrapping_add(now) & !AT_EL0,
         Ordering::Relaxed,
     );
 }
 
-/// The ticks `thread` has spent at EL0, up to its last entry from EL0.
-pub fn user_ticks(thread: &Thread) -> u64 {
-    thread.user_ticks.load(Ordering::Relaxed)
+/// The ticks `thread` has spent at EL0 at `now`, the stretch it is in
+/// included: any CPU may ask.
+pub fn user_ticks(thread: &Thread, now: u64) -> u64 {
+    let w = thread.user_ticks.load(Ordering::Relaxed);
+    if w & AT_EL0 != 0 {
+        w.wrapping_add(now) & !AT_EL0
+    } else {
+        w
+    }
 }
 
 /// object_info THREAD_STATE of `thread`, which the caller holds (spec 11):
@@ -889,7 +1056,7 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             policy: Some(t.sched.policy()),
         };
         let ran = t.sched.ran_at(now);
-        (info, ran, ran.saturating_sub(user_ticks(t)))
+        (info, ran, ran.saturating_sub(user_ticks(t, now)))
     })
 }
 

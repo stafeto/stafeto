@@ -65,9 +65,10 @@ impl Retired {
 /// The object stays in place and alive until `reclaim` runs, and `d` is in
 /// no list.
 pub unsafe fn retire(d: NonNull<Deferred>, reclaim: unsafe fn(NonNull<Deferred>)) {
+    let epoch = GRACE.retire();
     // SAFETY: the caller's promise; only the node is written.
     unsafe {
-        (*d.as_ptr()).epoch = GRACE.retire();
+        (*d.as_ptr()).epoch = epoch;
         (*d.as_ptr()).reclaim = Some(reclaim);
         (*d.as_ptr()).next = None;
     }
@@ -79,6 +80,9 @@ pub unsafe fn retire(d: NonNull<Deferred>, reclaim: unsafe fn(NonNull<Deferred>)
     }
     list.tail = Some(d);
     PENDING.fetch_add(1, Relaxed);
+    // A CPU long at EL0 enters the kernel for it: the period of the object
+    // ends in the time the CPUs take to answer, whatever they run.
+    kick(epoch);
 }
 
 /// Whether some object waits for its period.
@@ -90,6 +94,8 @@ pub fn pending() -> bool {
 /// This CPU is at a quiescent point: it frees what it retired whose period
 /// passed.
 pub fn quiesce() {
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::lag();
     GRACE.quiesce(cpu::this().index());
     poll();
 }
@@ -136,8 +142,44 @@ fn poll() {
     }
 }
 
-/// A CPU that went idle for good, such as a secondary one that serves SGIs
-/// alone: no period waits for it.
-pub fn park_cpu(cpu: usize) {
-    GRACE.idle(cpu);
+/// How long a CPU may take to reach a quiescent point once it was asked to,
+/// in seconds of the counter: far longer than the longest stretch of the
+/// kernel, short enough to stop a machine that lost a CPU.
+const WAIT_SECONDS: u64 = 2;
+
+/// Starts a wait for every CPU to pass a quiescent point: the epoch to wait
+/// for, taken now, after the change the wait is for (a gate of a process, a
+/// flag). The CPUs quiesce at the top of the way out of the kernel while a
+/// wait is open (`pending`), and the CPUs in EL0 are asked to enter the
+/// kernel (`kick`). Ends with `end_wait`.
+pub fn begin_wait() -> u64 {
+    PENDING.fetch_add(1, Relaxed);
+    let epoch = GRACE.retire();
+    kick(epoch);
+    epoch
+}
+
+/// The wait for `epoch` is over.
+pub fn end_wait() {
+    PENDING.fetch_sub(1, Relaxed);
+}
+
+/// Whether every CPU passed a quiescent point since `epoch`.
+pub fn passed(epoch: u64) -> bool {
+    GRACE.passed(epoch, crate::smp::cpus())
+}
+
+/// Asks every CPU that has not passed a point since `epoch` to enter the
+/// kernel: its next way out is one.
+pub fn kick(epoch: u64) {
+    let me = cpu::this().index();
+    for other in (0..crate::smp::cpus()).filter(|&c| c != me && !GRACE.cpu_passed(c, epoch)) {
+        crate::arch::gic::send_sgi(other, kcore::gic::SGI_CMD);
+    }
+}
+
+/// The counter value at which a wait that begins now has run out: a CPU
+/// that did not reach a quiescent point by then is lost.
+pub fn wait_limit() -> u64 {
+    crate::arch::timer::now() + WAIT_SECONDS * crate::arch::timer::frequency()
 }

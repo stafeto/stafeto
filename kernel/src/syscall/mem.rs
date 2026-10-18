@@ -50,7 +50,26 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     match long {
         Long::Create(m) => make(thread, m, entry),
         Long::Change(on) => portions(thread, on, entry),
+        Long::Quiet { epoch, limit } => quiet(thread, epoch, limit),
     }
+}
+
+/// The wait of a suspension for every CPU (`Long::Quiet`): over once each
+/// CPU has passed a quiescent point since the gate went up; otherwise the
+/// laggards are asked again and the call starts over, with a CPU that has
+/// not answered in two seconds a stop of the kernel.
+fn quiet(thread: NonNull<Thread>, epoch: u64, limit: u64) {
+    if crate::qsbr::passed(epoch) {
+        crate::qsbr::end_wait();
+        thread::end_long(thread);
+        return set_result(thread, Ok(Values::none()));
+    }
+    assert!(
+        clock::now() < limit,
+        "a CPU did not reach a quiescent point"
+    );
+    crate::qsbr::kick(epoch);
+    restart(thread);
 }
 
 /// mem_create(x0 size, x1 flags, x2 resource): a memory object of `size`
@@ -155,11 +174,57 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// message buffer of its threads (INVALID_ARGS, process::check_free); then
 /// the resources, which the process pays for whoever calls: a place in its
 /// table of mappings (LIMIT_REACHED), the block of the table and the most
-/// tables the range may take (NO_MEMORY, process::add_mapping). A call
+/// tables the range may take (NO_MEMORY, process::reserve_mapping and fund_mapping). A call
 /// that fails changes nothing but the block. Then the portions
 /// (`portions`), which never fail but for a process that ends meanwhile;
 /// the entry records the rights of x1 to map, which bound its mem_protect.
-pub(super) fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
+pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
+    let entry = clock::now();
+    // Each section is short, and the range is taken with a busy entry in the
+    // one that checks it: no mapping and no buffer of another call joins it
+    // after the checks, so they are made once (maps::reserve_mapping). The
+    // page of the table of a process that has none is made in a section of
+    // its own, after the checks that need no table, and the tables the
+    // range may take are paid for in the last (maps::fund_mapping).
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_begins();
+    let first = objects(|| map_table_needed(thread, a))
+        .and_then(|needed| match needed {
+            Some(target) => objects(|| process::make_table(target)),
+            None => Ok(()),
+        })
+        .and_then(|()| objects(|| map_reserve(thread, a)))
+        .and_then(|on| {
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::map_gap();
+            objects(|| map_fund(thread, on))
+        });
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_ends();
+    match first {
+        Ok(on) => {
+            thread::begin_long(thread, Long::Change(on));
+            portions(thread, on, entry)
+        }
+        Err(e) => set_result(thread, Err(e)),
+    }
+}
+
+/// What mem_map's two sections look up alike: the process, the object, the
+/// rights it gives, and the pages, after the checks of the values, the
+/// handles, the state of the process and the range in the object.
+fn map_lookups(
+    thread: NonNull<Thread>,
+    a: &Args,
+) -> Result<
+    (
+        NonNull<crate::process::Process>,
+        NonNull<Memory>,
+        Rights,
+        u64,
+    ),
+    Error,
+> {
     let pages = range_arg(a[4], a[3])?;
     if !a[2].is_multiple_of(PAGE_SIZE) {
         return Err(Error::InvalidArgs);
@@ -177,13 +242,58 @@ pub(super) fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error
     if a[2].checked_add(a[3]).is_none_or(|end| end > size) {
         return Err(Error::InvalidArgs);
     }
-    process::check_free(target, a[4], pages)?;
+    Ok((target, m, rights, pages))
+}
+
+/// The section before the first one, for a process with no table of
+/// mappings: the checks up to the range touching no message buffer, in the
+/// order of spec 11, so that the page of the table is not asked of a quota
+/// before they pass; the process whose table the next section makes. None
+/// when there is a table, and the next section checks everything.
+fn map_table_needed(
+    thread: NonNull<Thread>,
+    a: &Args,
+) -> Result<Option<NonNull<crate::process::Process>>, Error> {
+    let (target, _, _, pages) = map_lookups(thread, a)?;
+    if process::has_table(target) {
+        return Ok(None);
+    }
+    process::check_buffers(target, a[4], pages)?;
+    Ok(Some(target))
+}
+
+/// The first section of mem_map: everything up to the range touching no
+/// mapping and no message buffer (INVALID_ARGS), then the entry, busy
+/// (LIMIT_REACHED).
+fn map_reserve(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
+    let (target, m, rights, pages) = map_lookups(thread, a)?;
+    process::check_buffers(target, a[4], pages)?;
+    let access = access_arg(a[5])?;
     let map = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
     let offset = (a[2] / PAGE_SIZE) as u32;
     let mapping = Mapping::new(a[4], pages as u32, offset, m, Rights(rights.0 & map.0));
-    let on = process::add_mapping(target, mapping, access)?;
+    let on = process::reserve_mapping(target, mapping, access)?;
     process::retain(target);
     Ok(on)
+}
+
+/// The second section of mem_map: the tables the range may take are paid
+/// for (NO_MEMORY); a call that fails here gives its entry up, and its
+/// reference to the process goes.
+fn map_fund(thread: NonNull<Thread>, mut on: Change) -> Result<Change, Error> {
+    match process::fund_mapping(&mut on) {
+        Ok(()) => Ok(on),
+        Err(e) => {
+            let cause = cause(thread);
+            // SAFETY: nothing uses the change afterwards, and its reference
+            // to the process goes last.
+            unsafe {
+                process::abandon_change(on, cause);
+                process::release(on.target, cause);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// mem_unmap(x0 process with MANAGE, x1 address, x2 length): the pages of

@@ -771,6 +771,10 @@ pub const INFO_IRQ: u64 = 8;
 /// each, into the start of the calling thread's message buffer, and
 /// returns `LogBatch::to_words` in x1-x3 (spec 11, 16.3).
 pub const INFO_LOG: u64 = 9;
+/// object_info LOG x2: the number of the other CPU whose ring a peek reads
+/// (the kth other than the caller's, 1 for the first) goes in the bits from
+/// this one up, with the cursor plus 1 below.
+pub const LOG_OTHER_SHIFT: u32 = 56;
 // Kind 10 went with PROCESS_IDENTITY: process IDs live in the process
 // service (spec 11); a retired kind fails with INVALID_ARGS.
 /// LABEL takes a labelled copy of a channel, with no right needed, and in
@@ -811,6 +815,9 @@ pub const LOG_BATCH: usize = 12;
 /// Where a record holds its kind, the length of its text and its text.
 pub const LOG_KIND_AT: usize = 8;
 pub const LOG_LEN_AT: usize = 9;
+/// Byte 10 of a record that a peek at another CPU's ring gives: 1 when the
+/// kernel showed it on its console, 0 otherwise and in every other read.
+pub const LOG_SHOWN_AT: usize = 10;
 pub const LOG_TEXT_AT: usize = 16;
 /// The kind of a record of debug_write's bytes.
 pub const LOG_TEXT_KIND: u8 = 1;
@@ -1318,6 +1325,12 @@ impl Policy {
 /// unchanged: stays, lowered: head). A thread at a level a boost holds
 /// above its base does not move.
 pub const POLICY_TAIL: u64 = 1 << 8;
+
+/// `thread_create` x5: the policy in bits 0-7 and, in bits 16-23, the CPU
+/// the thread runs on, plus one. Zero is the CPU of the creating thread; a
+/// number past the CPUs that are up is INVALID_ARGS. The thread stays on that
+/// CPU: the kernel never moves a thread by itself.
+pub const THREAD_CPU_SHIFT: u32 = 16;
 
 /// Errors of system calls (spec 12), each with its code in x0; zero means
 /// success.

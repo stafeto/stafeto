@@ -234,8 +234,8 @@ pub unsafe fn post(
             let (n, priority) = notice(slot);
             (*t.as_ptr()).waits = None;
             syscall::set_notification(t, n);
-            k.s.boost(t, priority, ceiling(t));
-            k.s.wake(t);
+            sched::boost_in_place(k, t, priority, ceiling(t));
+            sched::wake(k, t);
         }
         true
     });

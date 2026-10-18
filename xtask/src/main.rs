@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 232;
+const INIT_TESTS: u32 = 244;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1211,10 +1211,15 @@ enum Variant {
     TestIcountEl0,
     FaultProbe,
     OverflowProbe,
+    /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
+    CpuOnRefused,
+    /// A window between the post of a command and its flush, and the end of
+    /// a thread inside it (`smp_window`).
+    WindowProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 8] = [
+    const ALL: [Variant; 10] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1223,6 +1228,8 @@ impl Variant {
         Variant::TestIcountEl0,
         Variant::FaultProbe,
         Variant::OverflowProbe,
+        Variant::CpuOnRefused,
+        Variant::WindowProbe,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1239,6 +1246,8 @@ impl Variant {
             Variant::TestIcountEl0 => Some("icount,el0-half"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+            Variant::CpuOnRefused => Some("cpu-on-refused"),
+            Variant::WindowProbe => Some("window-probe"),
         }
     }
 
@@ -1248,7 +1257,9 @@ impl Variant {
             Variant::Normal
             | Variant::TraceNormal
             | Variant::FaultProbe
-            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::OverflowProbe
+            | Variant::CpuOnRefused
+            | Variant::WindowProbe => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
             | Variant::Trace
@@ -1286,6 +1297,8 @@ impl Variant {
             Variant::TestIcountEl0 => "stafeto-ktest-icount-el0",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
+            Variant::CpuOnRefused => "stafeto-cpu-on",
+            Variant::WindowProbe => "stafeto-window",
         }
     }
 }
@@ -1454,6 +1467,9 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("smp-boot") => smp_boots(),
+        Some("smp-probe") => smp_probes(args.get(1)),
+        Some("smp-cpu-on") => smp_cpu_on(),
+        Some("smp-window") => smp_window(),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
@@ -3232,7 +3248,11 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
-        "Assertion `how == NULL` failed.",
+        // The failed assert and the panic of relibc write their line in
+        // pieces, and the other runs write theirs between the pieces, so the
+        // line may come apart: each piece is looked for alone.
+        "Assertion `how == NULL",
+        "` failed.",
         "RELIBC PANIC: ",
     ] {
         qemu::expect_marker(&outcome, marker)?;
@@ -4734,6 +4754,31 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the 128 threads of the portion, the cost the CPU time of a process
 /// (`getrusage`, `times`) needs.
 ///
+/// `OBJ_HOLD_MAX` 6 000 -> 4 000 (SMP stage 4): mem_map checks the mappings
+/// and the threads of the process in a section and enters the entry in the
+/// next, which begins only if nothing joined the process between
+/// (`maps::epoch`): 5 724 -> 2 939; process_create gives the lock back
+/// between the child and its first entries: 4 598 -> 2 957; the stage Space
+/// reads the entries of a table with no lock and takes it for the table that
+/// goes back: 4 099 -> 3 927; the continuation of a process whose gate
+/// opened unparks its 64 threads in sections of 16 (`control::portion`):
+/// 4 112 -> 1 100. The longest hold is now MemUnmap, 2 957.
+///
+/// `THREADS_READY_MAX` 10 833 -> 12 289 (SMP stage 4): a thread of another
+/// CPU leaves the scheduler by a command, so `sched::exit` reads where the
+/// thread runs and what it was asked, marks its end for the CPUs that read it
+/// (`thread::mark_ended`), and each portion first looks at the gate wave
+/// (`control::gate_seen`): 26 instructions a thread, 1 452 for the 56 of
+/// the portion; the reviewer of the kernel decides whether it stays.
+///
+/// `THREADS_READY_MAX` 12 289 -> 12 531 (SMP stage 4, review of the commands):
+/// the CPU's own end of a thread asks whether commands are on their way to
+/// it (`cmd::pending`) and, when one is, leaves the kernel's reference and
+/// the number to the command EXIT; the serve functions look at where the
+/// number's arguments stand under OBJ. 12 527 measured, 336 instructions
+/// over the 12 191 of the commit before: 5 a thread for the 64 of the
+/// portion. The reviewer of the kernel decides whether it stays.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -4765,15 +4810,12 @@ const NULL_MAX: u64 = 271;
 /// C_cmd, decision 3 of the SMP design). A class of calls that holds longer
 /// goes in portions or narrows its section; the kernel prints the number as
 /// `obj hold ticks: longest=N`.
-const OBJ_HOLD_MAX: u64 = 6_000;
+const OBJ_HOLD_MAX: u64 = 4_000;
 /// The blocking time of a kernel call on four CPUs, B_4 = B + 3 *
 /// OBJ_HOLD_MAX: the call's own longest portion and the sections of the
 /// three CPUs ahead of it in the ticket lock. Decision of the stage 3
-/// review: `kernel_tests` prints B_4 against this bound now; the stage 4
-/// merge turns it into a failure, and it asks OBJ_HOLD_MAX to come down to
-/// 4 000 (`dc zva` in `phys::zero`, then the zeroing of a new page outside
-/// the section) so that B_4 fits. The ASID rollover adds its own term until
-/// stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
+/// review: `kernel_tests` fails B_4 above this bound from stage 4. The ASID
+/// rollover adds its own term until stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
 const B4_MAX: u64 = 32_000;
 /// The hold of the one section that makes a new generation of ASIDs, once
 /// in 65 535 switches of address space: it clears the table of ASIDs and
@@ -4785,7 +4827,7 @@ const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 10_833;
+const THREADS_READY_MAX: u64 = 12_531;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
@@ -7299,6 +7341,22 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("smp 4 EL2 GICv3", || {
             smp_boot(&qemu::VIRT_EL2_V3, GIC_V3_LINE)
         }),
+        job("smp 4 CPU_ON refused", smp_cpu_on),
+        job("smp 4 window", smp_window),
+        // The tests of SMP stage 4 on four CPUs, with the whole test init
+        // (the other stages of SMP, 5 and 6, bring the rest of ci to four).
+        job("smp 4 probes GICv2", || {
+            init_tests_on(&qemu::VIRT, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes GICv3", || {
+            init_tests_on(&qemu::VIRT_V3, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes EL2 GICv2", || {
+            init_tests_on(&qemu::VIRT_EL2, false, SMP_CPUS).map(drop)
+        }),
+        job("smp 4 probes EL2 GICv3", || {
+            init_tests_on(&qemu::VIRT_EL2_V3, false, SMP_CPUS).map(drop)
+        }),
         job("console dialog 512M", || console_dialog(&qemu::VIRT)),
         job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
         job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
@@ -7597,10 +7655,18 @@ fn smp_report(lines: &[String], cpus: usize) -> Result<(), String> {
         "obj        {cpus} CPUs, {} sections: exclusion ok, longest wait ",
         2_000 * cpus
     );
-    match lines.iter().position(|l| l.starts_with(&lock)) {
-        Some(at) if at > sgi => Ok(()),
-        Some(_) => Err("the lock probe is reported before the SGI probe".into()),
-        None => Err(format!("the boot report has no line {lock:?}")),
+    let at = match lines.iter().position(|l| l.starts_with(&lock)) {
+        Some(at) if at > sgi => at,
+        Some(_) => return Err("the lock probe is reported before the SGI probe".into()),
+        None => return Err(format!("the boot report has no line {lock:?}")),
+    };
+    // The probe of the period of reclamation: an object retired by CPU 0 is
+    // freed once every CPU passed a quiescent point.
+    let qsbr = format!("qsbr       {cpus} CPUs: a period ended after ");
+    match lines.iter().position(|l| l.starts_with(&qsbr)) {
+        Some(q) if q > at => Ok(()),
+        Some(_) => Err("the period probe is reported before the lock probe".into()),
+        None => Err(format!("the boot report has no line {qsbr:?}")),
     }
 }
 
@@ -8714,9 +8780,13 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
     let b4 = n + 3 * OBJ_HOLD_MAX;
-    println!(
-        "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX} (checked from stage 4)"
-    );
+    println!("B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}");
+    if b4 > B4_MAX {
+        return Err(format!(
+            "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
+            b4 - B4_MAX
+        ));
+    }
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
         None => Err(format!(
@@ -8801,9 +8871,109 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// hole fails, one child fewer faults, and init exits with 1. Gives the
 /// number of tests that passed.
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
-    let a = build(Variant::Normal)?;
+    init_tests_on(m, icount, 1)
+}
+
+/// The lines the tests of SMP stage 4 print when they ran on every one of
+/// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
+/// without them.
+const SMP_PROBE_LINES: [&str; 9] = [
+    "smp: 4 CPUs, threads ran together on every CPU",
+    "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
+    "smp: suspend and kill stopped the threads of the child on 4 CPUs",
+    "smp: 16000 calls on 4 CPUs, each took OBJ",
+    "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
+    "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
+    "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
+    "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
+    "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
+];
+
+/// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
+/// machines and, on Apple silicon, the two HVF ones: all its tests, and
+/// each test of SMP stage 4 on four CPUs.
+fn smp_probes(only: Option<&String>) -> Result<(), String> {
+    if let Some(name) = only {
+        return init_tests_on(qemu::machine(Some(name))?, false, SMP_CPUS).map(drop);
+    }
+    let mut machines = vec![
+        &qemu::VIRT,
+        &qemu::VIRT_V3,
+        &qemu::VIRT_EL2,
+        &qemu::VIRT_EL2_V3,
+    ];
+    match hvf_host() {
+        Ok(()) => machines.extend([&qemu::HVF_V3, &qemu::HVF_V2]),
+        Err(why) => println!("smp-probe: HVF skipped: {why}"),
+    }
+    for m in machines {
+        init_tests_on(m, false, SMP_CPUS)?;
+    }
+    Ok(())
+}
+
+/// `cargo xtask smp-cpu-on`: PSCI refuses CPU_ON for the third CPU of four
+/// (a kernel built with `cpu-on-refused`): the boot says so, goes on with
+/// three CPUs, all of which report, the SGI probe runs on three, and the
+/// shell connects.
+fn smp_cpu_on() -> Result<(), String> {
+    let a = build(Variant::CpuOnRefused)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
+    let has = |p: &str| o.lines.iter().any(|l| l.starts_with(p));
+    if !has("smp        CPU_ON of MPIDR 0x2 refused: Some(-2); going on with the CPUs that are up")
+    {
+        return Err("the boot did not say that CPU_ON was refused".into());
+    }
+    for n in 0..3 {
+        if !has(&format!("cpu {n}      MPIDR ")) {
+            return Err(format!("the boot report has no line of CPU {n}"));
+        }
+    }
+    if has("cpu 3      MPIDR ") {
+        return Err("a fourth CPU reports after a refusal".into());
+    }
+    if !o
+        .lines
+        .iter()
+        .any(|l| l == "sgi        3 CPUs, all 6 pairs: ping and pong ok")
+    {
+        return Err("the SGI probe did not run on three CPUs".into());
+    }
+    println!("smp boot with CPU_ON refused for one CPU: three CPUs, ok");
+    Ok(())
+}
+
+/// `cargo xtask smp-window`: the test init on four CPUs with a kernel that
+/// holds the end of the client of one test until its reply is posted and
+/// keeps the command of that reply from going out for 20 ms: the client's
+/// CPU ends the client in the window, and the kernel says so.
+fn smp_window() -> Result<(), String> {
+    init_tests_in(Variant::WindowProbe, &qemu::VIRT, false, SMP_CPUS).map(drop)
+}
+
+/// `init_tests` with `cpus` CPUs: with more than one, the lines of the tests
+/// of SMP stage 4 must be there.
+fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, String> {
+    init_tests_in(Variant::Normal, m, icount, cpus)
+}
+
+/// `init_tests_on` with the kernel of `variant`.
+fn init_tests_in(
+    variant: Variant,
+    m: &qemu::Machine,
+    icount: bool,
+    cpus: usize,
+) -> Result<usize, String> {
+    let a = build(variant)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
+    if cpus > 1 {
+        cmd.args(["-smp", &cpus.to_string()]);
+    }
     cmd.args(qemu::HEADLESS);
     if icount {
         cmd.args(qemu::ICOUNT);
@@ -8824,6 +8994,52 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     }
     for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
+    }
+    if cpus == SMP_CPUS {
+        for line in SMP_PROBE_LINES {
+            qemu::expect_line(&o, line)?;
+        }
+        let waited = qemu::number_after(&o.lines, "smp: suspend waited ");
+        let late = qemu::number_after(
+            &o.lines,
+            " us for the CPUs, a timer of this CPU woke its thread ",
+        );
+        let (Some(waited), Some(late)) = (waited, late) else {
+            return Err("the test init printed no line of the wait of a suspension".into());
+        };
+        if variant == Variant::WindowProbe {
+            // CPU 1 came 20 ms late to its quiescent point: the suspension
+            // waited for it, and this CPU ran the thread of a timer of 2 ms
+            // meanwhile.
+            if waited < 15_000 || late > 10_000 {
+                return Err(format!(
+                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us late: the wait must be 15000 us or more and the thread 10000 us or less"
+                ));
+            }
+            qemu::expect_line(
+                &o,
+                "smp window  a thread ended on its CPU between the post of its command and the flush",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  a boost of a thread that ended on its CPU was left alone",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  20 mem_map calls, the most passes of the checks in one: 1",
+            )?;
+        }
+        for start in [
+            "smp: a thread at EL0 on CPU 1 ran ",
+            "smp: signal to a thread at EL0 on CPU 1: median ",
+            "smp: 20 mem_map calls while another CPU made ",
+        ] {
+            if let Some(line) = o.lines.iter().find(|l| l.starts_with(start)) {
+                println!("{line}");
+            } else {
+                return Err(format!("the test init printed no line {start:?}"));
+            }
+        }
     }
     log_markers(&o)?;
     child_panic_comes_whole(&o.lines)?;
@@ -9045,6 +9261,7 @@ fn hvf() -> Result<(), String> {
         // Four CPUs on the real processor: the start through PSCI, the
         // block read without caches, the SGIs of every pair.
         smp_boot(m, gic)?;
+        init_tests_on(m, false, SMP_CPUS)?;
         console_dialog(m)?;
         trace_dialog(m)?;
         // relibc's pthreads and the POSIX processes, the loader of files
@@ -10394,6 +10611,7 @@ mod tests {
             .collect();
         good.push("sgi        4 CPUs, all 12 pairs: ping and pong ok".into());
         good.push("obj        4 CPUs, 8000 sections: exclusion ok, longest wait 312 ticks".into());
+        good.push("qsbr       4 CPUs: a period ended after 912 ticks".into());
         assert_eq!(smp_report(&good, 4), Ok(()));
         let mut cut = good.clone();
         cut.remove(2);
@@ -10410,8 +10628,11 @@ mod tests {
         let mut no_probe = good.clone();
         no_probe.remove(4);
         assert!(smp_report(&no_probe, 4).unwrap_err().contains("sgi"));
+        let mut no_period = good.clone();
+        no_period.pop();
+        assert!(smp_report(&no_period, 4).unwrap_err().contains("qsbr"));
         let mut no_lock = good.clone();
-        no_lock.pop();
+        no_lock.remove(5);
         assert!(smp_report(&no_lock, 4).unwrap_err().contains("obj"));
         let mut early = good.clone();
         early.rotate_right(1);

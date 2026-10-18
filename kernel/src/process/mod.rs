@@ -69,8 +69,9 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, add_mapping, begin_protect, begin_unmap, check_free, device_windows,
-    finish_change, in_mapping, map_whole, step_change,
+    Change, abandon_change, begin_protect, begin_unmap, check_buffers, device_windows,
+    finish_change, fund_mapping, has_table, in_mapping, make_table, map_whole, reserve_mapping,
+    step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -157,12 +158,18 @@ pub struct Process {
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
-    /// thread of the process runs only while it is 0. Read Relaxed: the
-    /// EL0 return takes a hint and `park_selected` decides under the
-    /// OBJ, which orders the decision. Written by atomic
-    /// read-modify-write with Release (no Acquire pairs with it);
+    /// thread of the process runs only while it is 0. The EL0 return reads
+    /// it with Acquire, after the CPU's quiescent mark, which orders the
+    /// read after the writer's `qsbr::begin_wait`: the CPU that passed a
+    /// point after the write sees the gate. `park_selected` decides under
+    /// OBJ. Written by atomic read-modify-write with Release;
     /// `SUSPENDED` changes under OBJ.
     gate: AtomicU8,
+    /// The epoch of the quiescent points that every CPU has to pass after
+    /// the end set `ENDING`, until the stage Threads saw it done; 0 for none
+    /// (qsbr::begin_wait). A thread of the process may be at EL0 on another
+    /// CPU until that CPU entered the kernel and saw the gate.
+    stop_epoch: u64,
     /// Parked threads use their scheduler links, with changing levels.
     parked: ParkedList<Thread>,
     /// Nonzero while a continuation owns the cleanup item and a reference.
@@ -305,7 +312,9 @@ impl Process {
     /// lock or with interrupts masked).
     fn fold_time(&mut self, t: &Thread) {
         self.cpu_ticks = self.cpu_ticks.saturating_add(t.sched.ran());
-        self.user_ticks = self.user_ticks.saturating_add(thread::user_ticks(t));
+        self.user_ticks = self
+            .user_ticks
+            .saturating_add(thread::user_ticks(t, crate::arch::timer::now()));
     }
 }
 
@@ -357,6 +366,7 @@ fn create(
         threads: None,
         thread_count: 0,
         gate: AtomicU8::new(0),
+        stop_epoch: 0,
         parked: ParkedList::new(),
         resume_level: 0,
         parent: None,
@@ -566,7 +576,7 @@ pub fn cpu_time(process: NonNull<Process>) -> (u64, u64) {
             let mut next = (*p).threads;
             while let Some(t) = next {
                 sum = sum.saturating_add(t.as_ref().sched.ran_at(now));
-                user = user.saturating_add(thread::user_ticks(t.as_ref()));
+                user = user.saturating_add(thread::user_ticks(t.as_ref(), now));
                 next = t.as_ref().siblings.and_then(|s| s.next);
             }
             (sum, sum.saturating_sub(user))

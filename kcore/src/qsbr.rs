@@ -63,6 +63,11 @@ impl<const N: usize> Grace<N> {
         self.seen[cpu].store(IDLE, Ordering::SeqCst);
     }
 
+    /// Whether CPU `cpu` was quiescent after the retirement at `epoch`.
+    pub fn cpu_passed(&self, cpu: usize, epoch: u64) -> bool {
+        self.seen[cpu].load(Ordering::SeqCst) >= epoch
+    }
+
     /// Whether every one of the first `cpus` CPUs was quiescent after the
     /// retirement at `epoch`.
     pub fn passed(&self, epoch: u64, cpus: usize) -> bool {

@@ -20,7 +20,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use cpu::{CpuBlock, MAX_CPUS, UP};
 use kcore::bootinfo::MPIDR_AFFINITY;
-use kcore::gic::{Ack, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
+use kcore::gic::{Ack, SGI_CMD, SGI_GO, SGI_LOCK, SGI_PING, SGI_PONG};
 use kcore::layout::image_pa;
 
 /// What a CPU reads with its MMU and caches off, at the physical address
@@ -112,14 +112,20 @@ pub fn start(boot: &Boot) {
         .store(timer_ok as u32, Ordering::Relaxed);
     let mut up = 1;
     for &mpidr in others.take(MAX_CPUS - 1) {
-        start_one(boot, up, mpidr);
-        up += 1;
+        if start_one(boot, up, mpidr) {
+            up += 1;
+        }
     }
     UP_COUNT.store(up as u32, Ordering::Relaxed);
 }
 
+/// Starts the CPU of `mpidr` as CPU `index`; false when PSCI refuses (CPU
+/// not present, already on, denied): the kernel goes on with the CPUs it
+/// has, and the next CPU of the tree takes the number. A CPU that PSCI
+/// accepted and that does not come up stops the kernel: it may still come
+/// up, and nothing could tell it to stay out.
 #[inline(never)]
-fn start_one(boot: &Boot, index: usize, mpidr: u64) {
+fn start_one(boot: &Boot, index: usize, mpidr: u64) -> bool {
     let block = cpu::prepare(index);
     let pa = |va: usize| image_pa(boot.kernel_pa, va);
     // SAFETY: the CPU of this block has not started: nothing else reads it.
@@ -141,9 +147,19 @@ fn start_one(boot: &Boot, index: usize, mpidr: u64) {
     );
     let entry = pa(secondary_entry as *const () as usize);
     let context = pa(start as *const StartBlock as usize);
-    match psci::cpu_on(mpidr, entry, context) {
-        Some(0) => {}
-        status => panic!("PSCI CPU_ON of CPU {index} (MPIDR {mpidr:#x}) returned {status:?}"),
+    #[cfg(feature = "cpu-on-refused")]
+    let status = if mpidr & 0xff == 2 {
+        Some(-2)
+    } else {
+        psci::cpu_on(mpidr, entry, context)
+    };
+    #[cfg(not(feature = "cpu-on-refused"))]
+    let status = psci::cpu_on(mpidr, entry, context);
+    if status != Some(0) {
+        kprintln!(
+            "smp        CPU_ON of MPIDR {mpidr:#x} refused: {status:?}; going on with the CPUs that are up"
+        );
+        return false;
     }
     let limit = timer::now() + WAIT_SECONDS * timer::frequency();
     while block.state.load(Ordering::Acquire) != UP {
@@ -152,6 +168,7 @@ fn start_one(boot: &Boot, index: usize, mpidr: u64) {
         }
         core::hint::spin_loop();
     }
+    true
 }
 
 /// What CPU 0 says of each CPU: the boot report. The CPUs set the numbers
@@ -190,14 +207,10 @@ extern "C" fn secondary_main(block: &'static CpuBlock) -> ! {
         .level
         .store(registers::current_el() as u32, Ordering::Relaxed);
     block.timer_ok.store(timer_ok as u32, Ordering::Relaxed);
+    crate::sched::init_cpu();
     block.state.store(UP, Ordering::Release);
-    // This CPU only serves SGIs: no period of reclamation waits for it.
-    crate::qsbr::park_cpu(block.index());
-    loop {
-        if let Some(ack) = gic::wait() {
-            handle(ack);
-        }
-    }
+    // From here the CPU schedules the threads that are placed on it.
+    crate::sched::resume()
 }
 
 /// `PING[to][from]`: `from` wrote it for `to` before the SGI. Reset by
@@ -252,6 +265,8 @@ pub fn handle(ack: Ack) {
         SGI_GO if gic::sgi_from(&ack, 0) && GO[me].swap(0, Ordering::Acquire) != 0 => {
             ping_all(me, cpus)
         }
+        // The commands are in the queues to this CPU: any sender's.
+        SGI_CMD => crate::cmd::drain(),
         SGI_LOCK if gic::sgi_from(&ack, 0) && LOCK_GO[me].swap(0, Ordering::Acquire) != 0 => {
             lock_rounds(me)
         }
@@ -384,5 +399,50 @@ pub fn lock_probe() {
     kprintln!(
         "obj        {cpus} CPUs, {expected} sections: exclusion ok, longest wait {} ticks",
         LOCK_WAIT.load(Ordering::Relaxed)
+    );
+}
+
+/// What the probe of the period retires: a node, and whether the period
+/// that its retirement started has ended.
+struct ProbeNode(UnsafeCell<crate::qsbr::Deferred>);
+
+// SAFETY: the node is retired once, by CPU 0, which frees it itself.
+unsafe impl Sync for ProbeNode {}
+
+static PROBE_NODE: ProbeNode = ProbeNode(UnsafeCell::new(crate::qsbr::Deferred::new()));
+static PROBE_DONE: AtomicU8 = AtomicU8::new(0);
+
+unsafe fn probe_reclaim(_: core::ptr::NonNull<crate::qsbr::Deferred>) {
+    PROBE_DONE.store(1, Ordering::Release);
+}
+
+/// The probe of the period of reclamation with every CPU up: CPU 0 retires
+/// an object and passes its own quiescent points until the object is freed,
+/// which needs a point of each other CPU after the retirement (qsbr). Stops
+/// the kernel when no period ends in WAIT_SECONDS.
+pub fn qsbr_probe() {
+    let cpus = cpus();
+    if cpus < 2 {
+        return;
+    }
+    let began = timer::now();
+    // SAFETY: the node is in no list and stays in place for good.
+    unsafe {
+        crate::qsbr::retire(
+            core::ptr::NonNull::new_unchecked(PROBE_NODE.0.get()),
+            probe_reclaim,
+        )
+    };
+    let limit = began + WAIT_SECONDS * timer::frequency();
+    while PROBE_DONE.load(Ordering::Acquire) == 0 {
+        if timer::now() > limit {
+            panic!("qsbr probe: no period ended with {cpus} CPUs up");
+        }
+        crate::qsbr::quiesce();
+        core::hint::spin_loop();
+    }
+    kprintln!(
+        "qsbr       {cpus} CPUs: a period ended after {} ticks",
+        timer::now() - began
     );
 }

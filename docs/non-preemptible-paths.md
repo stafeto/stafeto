@@ -439,7 +439,7 @@ window that goes.
 | `thread_exit` | unmaps the message-buffer page, flushing its TLB entry, and returns the frame (a running thread carries no handles of a request); gives the thread's number back; removes the thread from the process's list; the last running thread terminates the process, as in the process termination row; otherwise a thread made with an exit channel (`thread_create` `x7`) posts bit 0 into its slot at `x8` as `notify` does, once it left the scheduler, and the queued slot holds the thread | constant: process termination is too | 483 (test build, `thread exit notice`): a thread whose end wakes a receiver of its process waiting on the exit channel |
 | `clock_now` | reads the counter and turns ticks into nanoseconds, rounded down | constant: one 64-by-64-bit multiplication and a shift (`abi::time::Scale`) | 293 |
 | `timer_create` | checks the room in the caller's table (spec 11), the caller's 192 timers (`abi::MAX_TIMERS`) and the system's 8,192 (`abi::MAX_SYSTEM_TIMERS`, one count), takes one of the channel's 1024 slots, then a slot in the caller's pool of timers (the pool growth row), and inserts the handle | constant: at most one growth of the caller's pool of timers and of its pool of blocks; the timer is not armed |  |
-| `timer_set` | on a closed channel returns `PEER_CLOSED` and changes nothing; otherwise turns the deadline into ticks by `abi::time::Scale` (an estimate and at most two steps up for counters up to 1 GHz, three for deadlines past 2^62 ns, about hz / 10^9 + 2 for a faster counter), takes an armed timer off the heap of its level, then posts bit 0 at once for a deadline the counter reached, as `notify` does, or puts the timer into that heap; the nearest deadline is walked again when the top of the level changed | O(log n): a removal and an insertion, or a removal and a post of O(1); and a walk of 63 levels | 2,122 (test build): the top of a heap of 8,130, the system's 8,192 timers (`abi::MAX_SYSTEM_TIMERS`) in all, moved before every other timer, among 63 levels with timers |
+| `timer_set` | on a closed channel returns `PEER_CLOSED` and changes nothing; on a timer that another CPU armed first returns `BAD_STATE` (from stage 4 on a timer belongs to the CPU that armed it, and `timer_cancel` answers the same: a change of the ABI); otherwise turns the deadline into ticks by `abi::time::Scale` (an estimate and at most two steps up for counters up to 1 GHz, three for deadlines past 2^62 ns, about hz / 10^9 + 2 for a faster counter), takes an armed timer off the heap of its level, then posts bit 0 at once for a deadline the counter reached, as `notify` does, or puts the timer into that heap; the nearest deadline is walked again when the top of the level changed | O(log n): a removal and an insertion, or a removal and a post of O(1); and a walk of 63 levels | 2,122 (test build): the top of a heap of 8,130, the system's 8,192 timers (`abi::MAX_SYSTEM_TIMERS`) in all, moved before every other timer, among 63 levels with timers |
 | `timer_cancel` | takes an armed timer off the heap of its level, and walks the levels when its top changed; bits it posted stay in its slot | O(log n), at most 13 steps with the system's 8,192 timers, and a walk of 63 levels | 2,690 (test build, `timers_8192`): the root of a heap of 8,130, the system's 8,192 timers in all, whose place the last node takes |
 | the last reference to a timer (`timer::release`: `handle_close`, the Handles stage, or `receive` or the Close stage that took its slot) | marks the timer dying and puts it at the tail of the cleanup queue at the level of the cause; it stays in the heap of its level until its chunk or a chunk of firings takes it off | constant |  |
 | a timer chunk (`timer::clean`) | takes the timer off the heap of its level if it is armed, returns its slot to the channel's limit and its place to its payer's pool of timers (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | O(log n) for the heap and a walk of 63 levels, the rest constant |  |
@@ -468,16 +468,62 @@ bytes of a message past the registers (up to 960) are copied after the call's
 section ends, and the zeroing of a fresh frame in a portion of `mem_create`
 goes on outside it.
 
-`OBJ_HOLD_MAX` (xtask) bounds the longest hold in instructions under
-`-icount`; the kernel counts the longest hold of each kind of section
-(`obj hold kind ticks`). With N CPUs a section waits for at most N-1 holds, so
-B_N = B + (N-1) * OBJ_HOLD_MAX + C_cmd. The longest holds measured (SMP stage
-3, instructions): first `mem_map` of a process 5 753, `process_create`
+`OBJ_HOLD_MAX` (xtask, 4 000 since stage 4) bounds the longest hold in
+instructions under `-icount`; the kernel counts the longest hold of each kind
+of section (`obj hold kind ticks`). With N CPUs a section waits for at most
+N-1 holds, so B_N = B + (N-1) * OBJ_HOLD_MAX + C_cmd, and xtask fails B_4 =
+B + 3 * OBJ_HOLD_MAX above 32 000 (27 469 now: B 15 469). The longest holds
+measured in stage 3 were first `mem_map` of a process 5 753, `process_create`
 5 248, `thread_create` 4 696, the stage Replies of process teardown 4 099 (32
-clients), `mem_unmap` 2 956, `mem_protect` 2 524, and once in 65 535 switches
-of address space the new generation of ASIDs 13 417 (`OBJ_ASID_ROLLOVER_MAX`,
-until the ASID rework of stage 5). A channel's stage Close takes one section
-for each waiter it wakes.
+clients) and `mem_unmap` 2 956; stage 4 cut them: `mem_map` checks the
+mappings and the threads of the process in one section and enters the entry
+in the next, which begins only if no mapping and no message buffer joined the
+process between (`maps::epoch`): 2 939; `process_create` gives the lock back
+between the child and its first entries: 2 957; the stage Space reads the
+entries of a table with no lock and takes it for each table that goes back,
+the continuation of a suspended process unparks its 64 threads in sections
+of 16. The longest hold is now 2 957 (`mem_unmap`); once in 65 535 switches
+of address space the new generation of ASIDs holds 13 417
+(`OBJ_ASID_ROLLOVER_MAX`, until the ASID rework of stage 5). A channel's stage
+Close takes one section for each waiter it wakes.
+
+## Commands between CPUs (SMP stage 4)
+
+A thread's scheduling state belongs to the CPU it runs on
+(`thread::cpu_of`: the creator's, or the one `thread_create` x5 bits 16-23
+name, plus one). Another CPU asks by a command (kernel/src/cmd.rs): a flag in
+the thread (`WAKE`, `START`, `UNPARK`, `LEVEL`, `BOOST`, `EXIT`), the
+arguments in a table by thread number, the thread in the one-writer queue
+"CPU i to CPU j" of the sender (1 024 places: a thread stands in the queues
+once at most), and one SGI to the CPU. A section posts into its CPU's outbox,
+and the outbox goes out after the section ended and after the copy of a
+message that a woken thread reads (`thread::flush_copy`): the SGI is no part
+of the hold of OBJ. The owner takes the commands where it handles the SGI, on
+an empty kernel stack, no lock held; the commands that touch objects take
+OBJ there (a section of their own, at most one per thread). A request to
+another CPU's thread in EL0 (`thread_upcall_request`) sets the thread's
+`pending` flag and sends an SGI with no command: that CPU enters the kernel,
+and the way back to EL0 finds the request (S5x).
+
+Synchronous IPC with the service on another CPU: the client sleeps, the
+service is boosted to the client's level at `accept` (the thread waits, so
+the write of its level is safe under OBJ), the reply wakes the client by a
+command; a raise of the client goes along the chain of requests, each hop a
+command to the CPU of the next thread. The fast path of `send` takes only a
+receiver of its own CPU.
+
+A suspension and the end of a process need every thread of it out of EL0:
+`process_control` outside OBJ and the stage Threads wait for every CPU to
+pass a quiescent point after the gate went up (`qsbr::synchronize`,
+`control::gate_seen`); a CPU in EL0 is asked by SGI, and the way to EL0 is a
+quiescent point (one load of `qsbr::PENDING`). The wait adds to the blocking
+time of its caller, not of the CPUs it waits for.
+
+The kernel tests measure at stage 4, instructions under -icount: B 15 469
+(unchanged), `null` 265 of `NULL_MAX` 271, S5 2 881 of 3 063, the OBJ hold 2
+957 of 4 000. `threads_ready` rose from 10 833 to 12 285 (26 instructions a
+thread: the exit reads where the thread runs and what it was asked), its
+guard to 12 289.
 
 The state of a thread's upcall entry changes without a lock: only the CPU
 that runs the thread touches it. The table of interrupt lines is read without

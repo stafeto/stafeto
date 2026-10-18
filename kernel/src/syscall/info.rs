@@ -198,9 +198,27 @@ fn label_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::new(&[session::label(s)]))
 }
 
-/// LOG: x2 is 0 to take the records, or a cursor plus 1 to peek at them.
+/// LOG: x2 is 0 to take the records of this CPU's ring, or a cursor plus 1 to
+/// peek at them; with k > 0 in the top byte of x2 (bits 56-63, SMP stage 4)
+/// the peek reads the ring of the kth other CPU, INVALID_ARGS for a k past
+/// the CPUs. A take is of the CPU's own ring alone.
 fn log_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+    let (k, cursor) = (
+        a[2] >> abi::LOG_OTHER_SHIFT,
+        a[2] & ((1 << abi::LOG_OTHER_SHIFT) - 1),
+    );
+    if k != 0 {
+        if cursor == 0 {
+            return Err(Error::InvalidArgs);
+        }
+        let (batch, next) = usize::try_from(k)
+            .ok()
+            .and_then(|k| crate::log::peek_other(thread, k, cursor - 1))
+            .ok_or(Error::InvalidArgs)?;
+        let [count, lost, left] = batch.to_words();
+        return Ok(Values::new(&[count, lost, left, next + 1]));
+    }
     if a[2] == 0 {
         Ok(Values::new(&crate::log::take(thread).to_words()))
     } else {

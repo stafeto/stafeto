@@ -375,7 +375,7 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
                     _ => unreachable!("a thread in a channel's queue waits for no channel"),
                 };
                 syscall::set_result(t, Err(Error::PeerClosed));
-                k.s.wake(t);
+                sched::wake(k, t);
                 Some(Taken::Request(via, sender))
             }
         });

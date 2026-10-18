@@ -17,6 +17,11 @@ use kcore::gic::Ack;
 /// serves it (spec 9). O(1) but for the timer's part.
 pub fn handle(ack: Ack) {
     let intid = ack.intid();
+    if intid < 16 {
+        // A software-generated interrupt: a command from another CPU, or the
+        // probe's. `smp::handle` ends it.
+        return crate::smp::handle(ack);
+    }
     #[cfg(feature = "trace")]
     crate::log::interrupt(intid);
     if intid == timer::INTID {

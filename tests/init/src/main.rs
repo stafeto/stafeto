@@ -39,6 +39,7 @@ mod memory;
 mod messages;
 mod processes;
 mod runtime;
+mod smp;
 mod timers;
 mod transfers;
 
@@ -48,7 +49,7 @@ use processes::prepare;
 rt::entry!(main);
 
 /// The tests of each module, in the order they run.
-const MODULES: [&[Test]; 9] = [
+const MODULES: [&[Test]; 10] = [
     &calls::TESTS,
     &channels::TESTS,
     &timers::TESTS,
@@ -58,6 +59,7 @@ const MODULES: [&[Test]; 9] = [
     &transfers::TESTS,
     &devices::TESTS,
     &runtime::TESTS,
+    &smp::TESTS,
 ];
 
 fn main(_: u64) -> u64 {

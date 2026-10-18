@@ -45,6 +45,9 @@ static HELD: [AtomicU64; HELD_MAX] = [const { AtomicU64::new(0) }; HELD_MAX];
 /// The stacks of the helper threads of a role.
 static STACKS: [Stack<8192>; 2] = [const { Stack::new() }; 2];
 
+/// The stacks of the spinning threads of Role::SmpSpin, which call nothing.
+static SPIN_STACKS: [Stack<512>; 3] = [const { Stack::new() }; 3];
+
 /// The role of the start data with its words and the handles that came
 /// under child::NAMES. The child holds the handles until it ends; the
 /// roles view them (`Handle::borrowed`).
@@ -253,6 +256,7 @@ fn run(s: &Start) -> u64 {
             }
         }
         Role::Churn => churn(s, a[0]),
+        Role::SmpSpin => smp_spin(s, a[0] as usize, a[1] as u8),
         Role::Wfi => {
             let at = mark(FAULT_AT).as_ptr();
             // SAFETY: the instruction is the fault the role exists for; its
@@ -297,6 +301,19 @@ fn run(s: &Start) -> u64 {
             let c = Handle::<Channel>::borrowed(s.handles[0]);
             match sys::receive(&c) {
                 Ok(Received::Message { .. }) => sys::process_exit(0),
+                _ => FAILED,
+            }
+        }
+        Role::TakeThenWait => {
+            let c = Handle::<Channel>::borrowed(s.handles[0]);
+            match sys::receive(&c) {
+                Ok(Received::Message { .. }) => {
+                    // No second receive: it would end the boost of the request.
+                    mark(SEEN).store(1, Relaxed);
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
                 _ => FAILED,
             }
         }
@@ -390,6 +407,7 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
         start: Some(start),
         priority: level,
         policy: Policy::Fifo,
+        cpu: 0,
     };
     // SAFETY: only the loader uses WINDOW.
     let g = unsafe { loader::load(&own, &program, WINDOW, params) }.map_err(|(e, _)| e)?;
@@ -529,6 +547,40 @@ extern "C" fn buffer_then_exit(_: u64) -> ! {
     mark(SEEN).store(u64::from(fresh), Relaxed);
     mark(HELPER).fetch_add(1, Relaxed);
     sys::thread_exit()
+}
+
+/// Role::SmpSpin.
+fn smp_spin(s: &Start, cpus: usize, priority: u8) -> u64 {
+    let own = Handle::<Process>::borrowed(s.handles[0]);
+    for cpu in 1..cpus.min(4) {
+        let mut x = [0; 10];
+        x[0] = own.raw().0;
+        x[1] = spinner as *const () as u64;
+        x[2] = SPIN_STACKS[cpu - 1].top() as u64;
+        x[3] = cpu as u64;
+        x[4] = priority.into();
+        x[5] = Policy::Fifo as u64 | ((cpu as u64 + 1) << abi::THREAD_CPU_SHIFT);
+        x[6] = buffer(cpu) as u64;
+        // SAFETY: each thread has a stack of its own, which nothing else uses.
+        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+        if Error::from_code(after[0]).is_some() {
+            return FAILED;
+        }
+        let t = Handle::<Thread>::from_raw(abi::Handle(after[1]));
+        if sys::thread_start(&t).is_err() {
+            return FAILED;
+        }
+        core::mem::forget(t);
+    }
+    // The first thread ends; the process lives while the others do.
+    sys::thread_exit()
+}
+
+extern "C" fn spinner(cpu: u64) -> ! {
+    let count = mark(cpu as usize);
+    loop {
+        count.fetch_add(1, Relaxed);
+    }
 }
 
 /// Role::LastThread.

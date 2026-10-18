@@ -26,6 +26,38 @@ const ENDING: u8 = 2;
 pub(super) unsafe fn mark_ending(process: NonNull<Process>) {
     // SAFETY: the caller's promise; the gate is atomic.
     unsafe { &(*process.as_ptr()).gate }.fetch_or(ENDING, Ordering::Release);
+    // Its threads on other CPUs stop at the gate on their next entry into
+    // the kernel: the stage Threads waits for every CPU to have made one.
+    // SAFETY: as above; OBJ guards the field.
+    unsafe {
+        let p = process.as_ptr();
+        if (*p).threads.is_some() && crate::smp::cpus() > 1 && (*p).stop_epoch == 0 {
+            (*p).stop_epoch = crate::qsbr::begin_wait();
+        }
+    }
+}
+
+/// Whether the CPUs have seen the gate of an ending process: true at once
+/// when nothing waits. Otherwise asks the laggards again and says no.
+///
+/// # Safety
+/// `process` is alive and at its stage Threads; OBJ is held.
+pub(super) unsafe fn gate_seen(process: NonNull<Process>) -> bool {
+    // SAFETY: the caller's promise.
+    unsafe {
+        let p = process.as_ptr();
+        let epoch = (*p).stop_epoch;
+        if epoch == 0 {
+            return true;
+        }
+        if !crate::qsbr::passed(epoch) {
+            crate::qsbr::kick(epoch);
+            return false;
+        }
+        crate::qsbr::end_wait();
+        (*p).stop_epoch = 0;
+        true
+    }
 }
 
 /// Whether the threads of `p` stop at the gate, with `order` for the read.
@@ -105,7 +137,7 @@ pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
     // process; the lock guards both its state and its process list.
     unsafe {
         let p = t.as_ref().process().as_ptr();
-        if !gated(p, Ordering::Relaxed) {
+        if !gated(p, Ordering::Acquire) {
             return false;
         }
         k.s.park(t, crate::arch::timer::now());
@@ -119,7 +151,7 @@ pub fn park_selected(t: NonNull<Thread>, k: &mut Locked<'_>) -> bool {
 pub fn gated_thread(t: NonNull<Thread>) -> bool {
     // SAFETY: the scheduler holds the selected thread, which holds its
     // process; the gate is atomic.
-    unsafe { gated(t.as_ref().process().as_ptr(), Ordering::Relaxed) }
+    unsafe { gated(t.as_ref().process().as_ptr(), Ordering::Acquire) }
 }
 
 /// The common EL0 return, including the fast send path: `t` runs next, and
@@ -131,7 +163,7 @@ pub fn gated_thread(t: NonNull<Thread>) -> bool {
 pub fn park_if_suspended(t: NonNull<Thread>, process: NonNull<Process>) -> bool {
     // SAFETY: thread::run owns the selected thread and its process. A
     // change of the gate after this read is caught at the next EL0 return.
-    if unsafe { !gated(process.as_ptr(), Ordering::Relaxed) } {
+    if unsafe { !gated(process.as_ptr(), Ordering::Acquire) } {
         return false;
     }
     crate::obj::serving(crate::obj::ENTRY_PARK);
@@ -148,30 +180,40 @@ pub(crate) unsafe fn unlist(t: NonNull<Thread>, _k: &mut Locked<'_>) {
     unsafe { (*t.as_ref().process().as_ptr()).parked.remove(t) };
 }
 
+/// Parked threads that continue under one hold of OBJ.
+const UNPARK_SECTION: usize = 16;
+
 /// Up to 64 parked threads continue at their current levels with fresh
 /// quanta. A new suspension ends the work before any thread is released.
 ///
 /// # Safety
 /// The cleanup queue just took the process, holding its reference.
 pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
-    let section = crate::obj::lock();
-    let left = sched::locked(|k| {
-        // SAFETY: the queue holds the process and each parked thread is
-        // held by the scheduler; the lock guards their shared links.
-        unsafe {
-            let p = process.as_ptr();
-            assert!((*p).resume_level != 0, "a continuation has no reference");
-            if !gated(p, Ordering::Relaxed) {
-                for _ in 0..64 {
-                    let Some(t) = (*p).parked.first() else { break };
-                    (*p).parked.remove(t);
-                    k.s.unpark(t);
+    // The 64 threads go in sections of UNPARK_SECTION: no other CPU waits
+    // for the whole portion.
+    let mut left = false;
+    for _ in 0..64 / UNPARK_SECTION {
+        let _section = crate::obj::lock();
+        left = sched::locked(|k| {
+            // SAFETY: the queue holds the process and each parked thread is
+            // held by the scheduler; the lock guards their shared links.
+            unsafe {
+                let p = process.as_ptr();
+                assert!((*p).resume_level != 0, "a continuation has no reference");
+                if !gated(p, Ordering::Relaxed) {
+                    for _ in 0..UNPARK_SECTION {
+                        let Some(t) = (*p).parked.first() else { break };
+                        (*p).parked.remove(t);
+                        sched::unpark(k, t);
+                    }
                 }
+                !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
             }
-            !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
+        });
+        if !left {
+            break;
         }
-    });
-    drop(section);
+    }
     // SAFETY: the queue's reference goes only after the work ends.
     unsafe {
         let p = process.as_ptr();

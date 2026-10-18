@@ -28,7 +28,7 @@
 extern crate alloc;
 
 use abi::time::next_release;
-use abi::{Access, Error, LOG_BATCH, LOG_RECORD, Source};
+use abi::{Access, Error, LOG_BATCH, LOG_RECORD, LogBatch, Source};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
@@ -258,6 +258,8 @@ struct State {
     rooms: Rooms<Handle<Channel>>,
     input: Input<Pending, Handle<Channel>>,
     records: [[u8; LOG_RECORD]; LOG_BATCH],
+    /// The rings of the CPUs, merged into `records` (uart::log::Sources).
+    sources: uart::log::Sources,
     read: [u8; RX_RING],
 }
 
@@ -284,6 +286,7 @@ fn state() -> Option<&'static mut State> {
         rooms: Rooms::new(),
         input: Input::new(),
         records: [[0; LOG_RECORD]; LOG_BATCH],
+        sources: uart::log::Sources::new(),
         read: [0; RX_RING],
     }))
 }
@@ -588,14 +591,28 @@ impl Driver {
     fn take_log(&mut self) {
         for _ in 0..LOG_BATCHES {
             let State {
-                output, records, ..
+                output,
+                records,
+                sources,
+                ..
             } = &mut *self.state;
             if !output.log_done() || !output.accepts_log() {
                 return;
             }
-            let Ok(batch) = sys::log_take(&self.log, records) else {
-                return;
+            let log = &self.log;
+            // Ring 0 is this CPU's, taken; the others are peeked at, and
+            // the records of all come out in the order of their times.
+            let mut take = |into: &mut uart::log::Records| {
+                sys::log_take(log, into).unwrap_or(LogBatch {
+                    count: 0,
+                    lost: 0,
+                    left: 0,
+                })
             };
+            let mut peek = |k: u64, cursor: u64, into: &mut uart::log::Records| {
+                sys::log_peek_other(log, k, cursor, into).ok()
+            };
+            let batch = sources.next(&mut take, &mut peek, records);
             self.left = batch.left;
             uart::log::text(records, batch, |bytes| {
                 // A batch fits: twelve records and the line of those lost.

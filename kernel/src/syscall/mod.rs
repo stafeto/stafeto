@@ -49,7 +49,7 @@ mod upcall;
 use devices::{device_window_create, irq_ack, irq_bind};
 use handles::{handle_close, handle_duplicate};
 use info::{debug_write, object_info};
-use mem::{change, go_on, mem_create, mem_map, mem_protect, mem_unmap};
+use mem::{change, change_map, go_on, mem_create, mem_protect, mem_unmap};
 use messages::{channel_create, notify, receive, reply, send};
 use proc::{
     process_control, process_create, process_exit, process_kill, thread_create, thread_exit,
@@ -59,6 +59,31 @@ use time::{clock_now, timer_cancel, timer_create, timer_set};
 use upcall::{
     thread_upcall_bind, thread_upcall_control, thread_upcall_request, thread_upcall_return,
 };
+
+/// process_control, and for a suspension the wait for every CPU: it is
+/// complete when no thread of the process is at EL0 on another CPU, which
+/// holds once every CPU has been in the kernel since the gate went up. The
+/// wait is a long call (`Long::Quiet`): this CPU takes its interrupts and
+/// runs its scheduler between the looks, and holds no lock. The call writes
+/// its own result, when the wait is over.
+#[inline(never)]
+fn process_control_waited(thread: NonNull<Thread>, args: &Args) {
+    let r = crate::obj::enter_with(|| process_control(thread, args));
+    if r.is_ok() && args[1] == 0 && crate::smp::cpus() > 1 {
+        #[cfg(feature = "window-probe")]
+        crate::cmd::window::arm_lag(thread);
+        let epoch = crate::qsbr::begin_wait();
+        thread::begin_long(
+            thread,
+            thread::Long::Quiet {
+                epoch,
+                limit: crate::qsbr::wait_limit(),
+            },
+        );
+        return restart(thread);
+    }
+    set_result(thread, r);
+}
 
 /// Runs a call that reaches objects in a section under OBJ (obj.rs), as a
 /// block that lies in the arm of the call, with the section's lock and
@@ -185,7 +210,11 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     crate::obj::serving(u64::from(number));
     dispatch_inner(thread, number);
     // The section of the call ended: the bytes of a message it delivered go
-    // between the buffers outside OBJ, before anything runs (thread.rs).
+    // between the buffers outside OBJ, before anything runs, which
+    // `sched::resume` sees to for a call that comes from EL0; the kernel
+    // tests, which call this and look at the buffers, see to it here
+    // (thread.rs).
+    #[cfg(feature = "ktest")]
     thread::flush_copy();
     record_call(number);
 }
@@ -210,12 +239,12 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::Reply) => objects!(reply(thread, &args)),
         Some(Call::Notify) => objects!(notify(thread, &args)),
         Some(Call::MemCreate) => return mem_create(thread, &args),
-        Some(Call::MemMap) => return change(thread, &args, mem_map),
+        Some(Call::MemMap) => return change_map(thread, &args),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
         Some(Call::ProcessCreate) => objects!(process_create(thread, &args)),
         Some(Call::ProcessKill) => objects!(process_kill(thread, &args)),
-        Some(Call::ProcessControl) => objects!(process_control(thread, &args)),
+        Some(Call::ProcessControl) => return process_control_waited(thread, &args),
         Some(Call::ProcessExit) => objects!(process_exit(thread, &args)),
         Some(Call::ThreadCreate) => objects!(thread_create(thread, &args)),
         Some(Call::ThreadStart) => objects!(thread_start(thread, &args)),

@@ -114,11 +114,41 @@ impl<T: Copy> Maps<T> {
             self.check_free(mapping.start, mapping.pages.into()).is_ok(),
             "a mapping over another"
         );
+        self.insert_free(mapping)
+    }
+
+    /// `insert` for a range that the caller checked and that nothing has
+    /// changed since (the kernel's mem_map checks under one section and
+    /// inserts under the next, which it enters only if the table is as it
+    /// was): the scan of the whole table is not made twice.
+    pub fn insert_free(&mut self, mapping: Mapping<T>) -> Result<usize, Error> {
+        debug_assert!(self.check_free(mapping.start, mapping.pages.into()).is_ok());
         let index = self
             .entries
             .iter()
             .position(Option::is_none)
             .ok_or(Error::LimitReached)?;
+        self.entries[index] = Some(mapping);
+        Ok(index)
+    }
+
+    /// `check_free` and `insert_free` in one pass over the table: INVALID_ARGS
+    /// when `mapping` shares a page with another, else its index, with
+    /// LIMIT_REACHED when MAX_MAPPINGS are there (the order of spec 11).
+    pub fn insert_checked(&mut self, mapping: Mapping<T>) -> Result<usize, Error> {
+        let mut free = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            match e {
+                Some(m) if m.overlaps(mapping.start, mapping.pages.into()) => {
+                    return Err(Error::InvalidArgs);
+                }
+                Some(_) => {}
+                None => {
+                    free.get_or_insert(i);
+                }
+            }
+        }
+        let index = free.ok_or(Error::LimitReached)?;
         self.entries[index] = Some(mapping);
         Ok(index)
     }
@@ -310,6 +340,29 @@ mod tests {
         assert_eq!(core::mem::size_of::<Mapping<NonNull<u8>>>(), 32);
         assert_eq!(core::mem::size_of::<Maps<NonNull<u8>>>(), 4096);
         assert_eq!(core::mem::size_of::<Maps<u32>>(), 4096);
+    }
+
+    #[test]
+    fn insert_checked_refuses_an_overlap_before_a_full_table() {
+        let mut maps = Maps::new();
+        for i in 0..MAX_MAPPINGS as u64 {
+            let at = i * 2 * PAGE;
+            assert_eq!(maps.insert_checked(mapping(at, 1, 1)), Ok(i as usize));
+        }
+        // The table is full: a range that is free finds no place, and one
+        // that overlaps is INVALID_ARGS first (spec 11).
+        let beyond = MAX_MAPPINGS as u64 * 2 * PAGE;
+        assert_eq!(
+            maps.insert_checked(mapping(beyond, 1, 1)),
+            Err(Error::LimitReached)
+        );
+        assert_eq!(
+            maps.insert_checked(mapping(0, 1, 1)),
+            Err(Error::InvalidArgs)
+        );
+        // A place that opened is the first one taken.
+        maps.remove(5);
+        assert_eq!(maps.insert_checked(mapping(beyond, 1, 1)), Ok(5));
     }
 
     #[test]

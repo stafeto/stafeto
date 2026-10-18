@@ -12,6 +12,7 @@ use crate::messages::{raw_client, raw_reply};
 use crate::timers::{expiry, timer_at};
 use crate::transfers::copy_raw;
 use core::cell::Cell;
+use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 use proto_init::Method;
 use rt::startup::{Answered, Giver};
 
@@ -384,6 +385,10 @@ impl Ear {
 /// `channel`, `quota`, room for `limit` handles, ceiling `ceiling` and its
 /// thread at `priority`, which does not run yet; the error of the spawn,
 /// or why the program could not be read.
+/// The CPU, plus one, the first thread of the next child runs on (rt::loader
+/// `SpawnParams::cpu`); 0 is the CPU of the caller.
+pub(crate) static SPAWN_CPU: AtomicU8 = AtomicU8::new(0);
+
 pub(crate) fn spawn_under(
     channel: &Handle<Channel>,
     quota: u64,
@@ -401,6 +406,7 @@ pub(crate) fn spawn_under(
         ceiling,
         priority,
         policy: Policy::Fifo,
+        cpu: SPAWN_CPU.load(Relaxed),
     };
     // SAFETY: only the loader maps and uses LOADER_WINDOW.
     Ok(unsafe { loader::spawn(&own(), &program, LOADER_WINDOW, params) })

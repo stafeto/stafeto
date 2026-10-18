@@ -99,6 +99,9 @@ pub const SGI_PONG: u32 = 1;
 pub const SGI_GO: u32 = 2;
 /// CPU 0 asks a CPU to take part in the probe of the lock OBJ.
 pub const SGI_LOCK: u32 = 3;
+/// A CPU has commands for the receiver in the queues of the other CPUs, or
+/// asks it to pass a quiescent point (cmd.rs).
+pub const SGI_CMD: u32 = 4;
 
 /// GICD_SGIR for SGI `intid` to the CPU interfaces in `targets` (the
 /// bits `own_interface` reads): TargetListFilter 0, the list in [23:16],

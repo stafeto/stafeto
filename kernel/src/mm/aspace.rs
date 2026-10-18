@@ -96,6 +96,35 @@ fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -
     })
 }
 
+/// The tables of a space that went (`SpaceRelease::step`): read from the
+/// linear map, which needs no lock; given back one at a time, each under the
+/// lock of the frames, and refunded to `quota`.
+struct Releasing<'a> {
+    quota: &'a mut Account,
+}
+
+// SAFETY: a table is read through the linear map and given back once; the
+// space owns every table it reaches. Nothing is allocated or written.
+unsafe impl TableMemory for Releasing<'_> {
+    fn alloc_table(&mut self) -> Option<u64> {
+        unreachable!("a space that went takes no table");
+    }
+
+    fn free_table(&mut self, pa: u64) {
+        with_tables(|t| t.free_table(pa));
+        self.quota.refund(PAGE_SIZE);
+    }
+
+    fn read(&self, pa: u64) -> u64 {
+        // SAFETY: the tables of a space that went are the release's alone.
+        kcore::frames::PhysMem::read(&unsafe { crate::mm::phys::LinearMem::new() }, pa)
+    }
+
+    fn write(&mut self, _: u64, _: u64) {
+        unreachable!("a space that went is not written");
+    }
+}
+
 /// Tables from the frame allocator that a mapping paid for up front (spec
 /// 7.5): `left` bytes of the quota are charged and not spent yet, and each
 /// table spends a page of them. A table past them stops the kernel: the
@@ -305,10 +334,21 @@ impl AddressSpace {
     }
 
     /// Switches TTBR0 to this space, with a new ASID when its old one is of
-    /// an earlier generation (kcore::tlb::switch_to).
+    /// an earlier generation (kcore::tlb::switch_to). A new generation
+    /// reuses the ASIDs that spaces on other CPUs run with, which takes the
+    /// agreement of every CPU on the flush (SMP stage 5): with more than one
+    /// CPU up, the kernel stops instead, at the first space that finds no
+    /// ASID of this generation and none free.
     pub fn activate(&mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
-        with_asids(|a| tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu));
+        with_asids(|a| {
+            assert!(
+                crate::smp::cpus() < 2 || a.current(&self.tag).is_some() || a.free_asids() > 0,
+                "the ASIDs of a generation ran out with more than one CPU up: \
+                 a new generation needs the flush of every CPU (SMP stage 5)"
+            );
+            tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu)
+        });
     }
 
     /// Takes TTBR0 off the tables and drops their TLB entries with the
@@ -366,7 +406,10 @@ impl SpaceRelease {
     /// every table went, and on every step after that.
     pub fn step(&mut self, quota: &mut Account) -> bool {
         if !self.spent {
-            self.spent = with_charged(quota, |mem| self.tables.step(mem));
+            // The entries of the tables are read with no lock, for nothing
+            // else reaches a space that went; the allocator is locked for
+            // the one table that goes back (`Releasing`).
+            self.spent = self.tables.step(&mut Releasing { quota });
         }
         self.spent
     }

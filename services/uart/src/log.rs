@@ -89,6 +89,181 @@ pub fn text(records: &Records, batch: LogBatch, mut put: impl FnMut(&[u8])) {
     }
 }
 
+/// The rings of the CPUs the driver shows: its own CPU's, taken, and those
+/// of up to SOURCES - 1 other CPUs, peeked at (SMP stage 4, review 3 of
+/// stage 3: `take` is of the CPU's own ring, and the driver merges what the
+/// others wrote by the counter at which each record was written).
+pub const SOURCES: usize = 4;
+
+/// What the driver holds of one ring: up to LOG_BATCH records it fetched and
+/// has not put out, and, for a ring it peeks at, where it goes on.
+pub struct Source {
+    records: Records,
+    /// Records in `records`, and the next one to put out.
+    count: usize,
+    next: usize,
+    /// The cursor of a peek (sequence plus one): 0 before the first, then
+    /// where the next one starts.
+    pub cursor: u64,
+    /// The ring does not exist: no such CPU.
+    absent: bool,
+    /// Records the fetch said were left in the ring.
+    left: u64,
+    /// Records lost that no batch told of yet.
+    lost: u64,
+}
+
+impl Source {
+    pub const fn new() -> Source {
+        Source {
+            records: [[0; LOG_RECORD]; LOG_BATCH],
+            count: 0,
+            next: 0,
+            cursor: 0,
+            absent: false,
+            left: 0,
+            lost: 0,
+        }
+    }
+
+    /// The time of the record this source puts out next, if it holds one.
+    fn time(&self) -> Option<u64> {
+        let bytes = self
+            .records
+            .get(self.next)
+            .filter(|_| self.next < self.count)?;
+        Some(u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")))
+    }
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The sources of the driver, merged.
+pub struct Sources {
+    pub sources: [Source; SOURCES],
+}
+
+impl Sources {
+    pub const fn new() -> Sources {
+        Sources {
+            sources: [const { Source::new() }; SOURCES],
+        }
+    }
+
+    /// Whether the driver has records to put out or knows of some left in a
+    /// ring.
+    pub fn more(&self) -> bool {
+        self.sources.iter().any(|s| s.next < s.count || s.left > 0)
+    }
+
+    /// `batch` with the two reads of a driver: `take` of the ring of its own
+    /// CPU, and `peek(k, cursor, records)` of the ring of the `k`th other
+    /// CPU (object_info LOG), which gives None for a CPU that does not
+    /// exist. The first look at another ring starts at its oldest record,
+    /// for what that CPU said before the driver started and the kernel did
+    /// not show goes out too; the records the kernel showed
+    /// (abi::LOG_SHOWN_AT) are left out.
+    pub fn next(
+        &mut self,
+        take: &mut impl FnMut(&mut Records) -> LogBatch,
+        peek: &mut impl FnMut(u64, u64, &mut Records) -> Option<(LogBatch, u64)>,
+        out: &mut Records,
+    ) -> LogBatch {
+        let mut fetch = |k: usize, cursor: &mut u64, into: &mut Records| {
+            if k == 0 {
+                return Some(take(into));
+            }
+            let first = if *cursor == 0 { 1 } else { *cursor };
+            let (mut batch, next) = peek(k as u64, first, into)?;
+            *cursor = next;
+            let count = (batch.count as usize).min(LOG_BATCH);
+            let mut kept = 0;
+            for i in 0..count {
+                if into[i][abi::LOG_SHOWN_AT] == 0 {
+                    into[kept] = into[i];
+                    kept += 1;
+                }
+            }
+            batch.count = kept as u64;
+            Some(batch)
+        };
+        self.batch(&mut fetch, out)
+    }
+
+    /// The next batch, up to LOG_BATCH records in the order of the times
+    /// they were written, from the sources' records and from `fetch` where a
+    /// source ran dry: `fetch(k, cursor, records)` fills `records` from
+    /// source `k` (0 takes the own ring, k > 0 peeks at the kth other CPU's
+    /// from `cursor`) and says what came, or None for a ring that does not
+    /// exist. A source is asked again only when its records are all put out.
+    /// The batch goes into `out`; `left` of it counts what the driver
+    /// still holds and what the rings said they have.
+    pub fn batch(
+        &mut self,
+        fetch: &mut impl FnMut(usize, &mut u64, &mut Records) -> Option<LogBatch>,
+        out: &mut Records,
+    ) -> LogBatch {
+        let mut count = 0;
+        let mut lost = 0;
+        while count < LOG_BATCH {
+            let mut best: Option<(u64, usize)> = None;
+            for k in 0..SOURCES {
+                let s = &mut self.sources[k];
+                if s.absent {
+                    continue;
+                }
+                if s.next >= s.count {
+                    match fetch(k, &mut s.cursor, &mut s.records) {
+                        None => {
+                            s.absent = true;
+                            continue;
+                        }
+                        Some(b) => {
+                            s.count = (b.count as usize).min(LOG_BATCH);
+                            s.next = 0;
+                            s.left = b.left;
+                            s.lost += b.lost;
+                        }
+                    }
+                }
+                if let Some(t) = s.time()
+                    && best.is_none_or(|(bt, _)| t < bt)
+                {
+                    best = Some((t, k));
+                }
+            }
+            let Some((_, k)) = best else { break };
+            let s = &mut self.sources[k];
+            out[count] = s.records[s.next];
+            s.next += 1;
+            count += 1;
+        }
+        for s in &mut self.sources {
+            lost += core::mem::take(&mut s.lost);
+        }
+        let left: u64 = self
+            .sources
+            .iter()
+            .map(|s| (s.count - s.next) as u64 + if s.next >= s.count { s.left } else { 0 })
+            .sum();
+        LogBatch {
+            count: count as u64,
+            lost,
+            left,
+        }
+    }
+}
+
+impl Default for Sources {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +339,100 @@ mod tests {
         let mut want = [b'k'; LOG_TEXT].to_vec();
         want.extend_from_slice(b" ELR=0x1000\nshell: crashing uart\n");
         assert_eq!(joined(&records, 0), want);
+    }
+
+    /// A source for `batch`: the records of ring `k`, `LOG_BATCH` at a time.
+    fn ring(
+        rings: &[Vec<[u8; LOG_RECORD]>],
+    ) -> impl FnMut(usize, &mut u64, &mut Records) -> Option<LogBatch> + '_ {
+        move |k, cursor, into| {
+            let all = rings.get(k)?;
+            let from = *cursor as usize;
+            let part: Vec<_> = all.iter().skip(from).take(LOG_BATCH).collect();
+            for (i, r) in part.iter().enumerate() {
+                into[i] = **r;
+            }
+            *cursor += part.len() as u64;
+            Some(LogBatch {
+                count: part.len() as u64,
+                lost: 0,
+                left: (all.len() - (from + part.len())) as u64,
+            })
+        }
+    }
+
+    #[test]
+    fn records_of_every_cpu_come_out_in_the_order_of_their_times() {
+        let rings = [
+            vec![raw(10, LOG_TEXT_KIND, b"a0"), raw(40, LOG_TEXT_KIND, b"a1")],
+            vec![raw(20, LOG_TEXT_KIND, b"b0"), raw(30, LOG_TEXT_KIND, b"b1")],
+            vec![raw(5, LOG_TEXT_KIND, b"c0"), raw(50, LOG_TEXT_KIND, b"c1")],
+        ];
+        let mut sources = Sources::new();
+        let mut out: Records = [[0; LOG_RECORD]; LOG_BATCH];
+        let batch = sources.batch(&mut ring(&rings), &mut out);
+        let mut texts = Vec::new();
+        text(&out, batch, |p| texts.extend_from_slice(p));
+        assert_eq!(texts, b"c0a0b0b1a1c1");
+        assert_eq!((batch.count, batch.left), (6, 0));
+        assert!(!sources.more());
+    }
+
+    #[test]
+    fn the_first_look_at_another_ring_shows_what_the_kernel_did_not() {
+        let mut shown = raw(5, LOG_TEXT_KIND, b"shown");
+        shown[abi::LOG_SHOWN_AT] = 1;
+        let ring1 = [
+            shown,
+            raw(6, LOG_TEXT_KIND, b"early"),
+            raw(9, LOG_TEXT_KIND, b"late"),
+        ];
+        let mut sources = Sources::new();
+        let mut out: Records = [[0; LOG_RECORD]; LOG_BATCH];
+        let mut take = |_: &mut Records| LogBatch {
+            count: 0,
+            lost: 0,
+            left: 0,
+        };
+        let mut peek = |k: u64, cursor: u64, into: &mut Records| {
+            if k != 1 {
+                return None;
+            }
+            let from = (cursor - 1) as usize;
+            for (i, r) in ring1[from..].iter().enumerate() {
+                into[i] = *r;
+            }
+            Some((
+                LogBatch {
+                    count: (ring1.len() - from) as u64,
+                    lost: 0,
+                    left: 0,
+                },
+                ring1.len() as u64 + 1,
+            ))
+        };
+        let batch = sources.next(&mut take, &mut peek, &mut out);
+        let mut texts = Vec::new();
+        text(&out, batch, |p| texts.extend_from_slice(p));
+        assert_eq!(texts, b"earlylate");
+        // The next look goes on where the last stopped: nothing new.
+        let again = sources.next(&mut take, &mut peek, &mut out);
+        assert_eq!(again.count, 0);
+    }
+
+    #[test]
+    fn a_ring_with_more_than_a_batch_goes_on_in_the_next() {
+        let many: Vec<_> = (0..20).map(|n| raw(100 + n, LOG_TEXT_KIND, b"x")).collect();
+        let rings = [many, vec![raw(1, LOG_TEXT_KIND, b"y")]];
+        let mut sources = Sources::new();
+        let mut out: Records = [[0; LOG_RECORD]; LOG_BATCH];
+        let mut fetch = ring(&rings);
+        let first = sources.batch(&mut fetch, &mut out);
+        assert_eq!(first.count, LOG_BATCH as u64);
+        assert_eq!(out[0][LOG_TEXT_AT], b'y');
+        assert!(sources.more());
+        let second = sources.batch(&mut fetch, &mut out);
+        assert_eq!(first.count + second.count, 21);
+        assert!(!sources.more());
     }
 }
