@@ -21,7 +21,7 @@
 
 use crate::arch::cpu::{self, CpuBlock};
 use crate::arch::timer;
-use crate::local::{OwnGuard, local};
+use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
@@ -65,13 +65,10 @@ impl Item {
 /// guard lives.
 struct QueueGuard {
     queue: *mut Queue,
-    // Declared before the lock's release in `drop`: the borrow ends first.
-    _borrow: Option<OwnGuard<'static, Queue>>,
     block: &'static CpuBlock,
     /// Whether the guard holds the spin lock: a push in a section under
     /// `OBJ` does not, since every other CPU that changes the queue does it
-    /// in a section too, and a section excludes it. It does not count its
-    /// borrow either (`Own`): the section is the exclusion.
+    /// in a section too, and a section excludes it.
     spinning: bool,
 }
 
@@ -92,9 +89,6 @@ impl core::ops::DerefMut for QueueGuard {
 
 impl Drop for QueueGuard {
     fn drop(&mut self) {
-        // The borrow goes first (a field drops after `drop` returns, so
-        // take it here), then the lock.
-        self._borrow = None;
         if self.spinning {
             self.block.local.queue_spin.store(false, Ordering::Release);
         }
@@ -116,7 +110,6 @@ fn spin_lock_queue(block: &'static CpuBlock, spinning: bool) -> QueueGuard {
     }
     QueueGuard {
         queue: block.local.queue.as_ptr().cast_mut(),
-        _borrow: spinning.then(|| block.local.queue.lock()),
         block,
         spinning,
     }
@@ -402,8 +395,7 @@ pub fn portion() {
     crate::obj::serving(0);
     let took = stretch(start, timer::now());
     crate::testpoint::portion_done();
-    let mut q = lock_own_queue();
-    q.longest = q.longest.max(took);
+    note_longest(took);
 }
 
 /// Items queued now, for KSTATS (spec 16).
@@ -415,9 +407,19 @@ pub fn len() -> u64 {
 /// ticks, counts toward the longest portion as one of cleanup does: both
 /// add to the blocking of any thread (KSTATS x5).
 pub fn count_portion(start: u64) {
-    let took = stretch(start, timer::now());
-    let mut q = lock_own_queue();
-    q.longest = q.longest.max(took);
+    note_longest(stretch(start, timer::now()));
+}
+
+/// Notes a portion that took `took` ticks. Only this CPU reads or writes
+/// `longest`, so it takes no lock, and it touches the field alone: another
+/// CPU may be raising an item of the queue meanwhile.
+fn note_longest(took: u64) {
+    let q = cpu::this().local.queue.as_ptr().cast_mut();
+    // SAFETY: the field is the owner's alone, and the owner is this CPU.
+    unsafe {
+        let longest = &raw mut (*q).longest;
+        *longest = (*longest).max(took);
+    }
 }
 
 /// The longest portion so far, of cleanup or of a long call, in counter

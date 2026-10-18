@@ -4816,11 +4816,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// over the 12 191 of the commit before: 5 a thread for the 64 of the
 /// portion. The reviewer of the kernel decides whether it stays.
 ///
-/// `THREADS_READY_MAX` 12 531 -> 13 127 (SMP stage 5, the lock of the cleanup
+/// `THREADS_READY_MAX` 12 531 -> 13 119 (SMP stage 5, the lock of the cleanup
 /// queue): the queue of a CPU takes a spin lock for a push outside a section
 /// under `OBJ` and for each portion, so that the raise and the removal of an
 /// item by a section on another CPU cannot meet them; 7 instructions in the
-/// push of each of the 64 threads of the portion. 13 123 measured. The
+/// push of each of the 64 threads of the portion. 13 115 measured. The
 /// reviewer of the kernel decides whether it stays.
 ///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
@@ -4866,7 +4866,7 @@ const B4_MAX: u64 = 32_000;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_127;
+const THREADS_READY_MAX: u64 = 13_119;
 const S5_ICOUNT_MAX: u64 = 3_063;
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
