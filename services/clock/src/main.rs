@@ -63,7 +63,7 @@ fn source_time(
         }
         // SAFETY: the window is mapped at RTC_AT for the service's life and
         // the data register is a 32-bit word at its start.
-        let reading = unsafe { core::ptr::read_volatile((RTC_AT + rtc::PL031_DR) as *const u32) };
+        let reading = unsafe { rt::mmio::read32(RTC_AT + rtc::PL031_DR) };
         return rtc::from_pl031(reading).map(|s| (s as i64, "PL031"));
     }
     let image = start.take::<Memory>("bootimage").ok()?;
