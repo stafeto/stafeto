@@ -309,11 +309,16 @@ impl<T: Copy> Maps<T> {
         self.entries[index].take().expect("a mapping at the index")
     }
 
-    /// Takes every mapping out of the table, busy or not, in one pass, and
-    /// hands each to `f`: the teardown of the process (spec 7.7). The table
-    /// is empty afterwards.
-    pub fn drain(&mut self, f: impl FnMut(Mapping<T>)) {
-        self.entries.iter_mut().filter_map(Option::take).for_each(f);
+    /// Takes up to `n` mappings out of the table, busy or not, and hands
+    /// each to `f`: a portion of the teardown of the process (spec 7.7).
+    /// True when the table is empty afterwards.
+    pub fn drain(&mut self, n: usize, f: impl FnMut(Mapping<T>)) -> bool {
+        self.entries
+            .iter_mut()
+            .filter_map(Option::take)
+            .take(n)
+            .for_each(f);
+        self.is_empty()
     }
 }
 
@@ -450,7 +455,9 @@ mod tests {
         assert!(maps.iter().all(|m| m.object != 7));
         assert_eq!(maps.insert(next), Ok(i));
         let mut drained = 0;
-        maps.drain(|_| drained += 1);
+        assert!(!maps.drain(120, |_| drained += 1));
+        assert_eq!((drained, maps.len()), (120, 8));
+        assert!(maps.drain(120, |_| drained += 1));
         assert_eq!((drained, maps.is_empty()), (128, true));
     }
 

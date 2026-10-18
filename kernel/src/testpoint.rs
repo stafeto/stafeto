@@ -164,7 +164,12 @@ mod points {
 
     pub fn test_call(thread: NonNull<Thread>, number: u16) -> bool {
         let _test = crate::obj::test_scope();
-        abi::TEST_CALLS.contains(&number) && el0::syscall(thread, number)
+        let test = abi::TEST_CALLS.contains(&number);
+        #[cfg(feature = "measure")]
+        if test {
+            crate::obj::stretch_drop();
+        }
+        test && el0::syscall(thread, number)
     }
 
     /// The running test judges init's end, and the tests go on: this never

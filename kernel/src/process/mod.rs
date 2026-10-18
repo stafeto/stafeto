@@ -788,6 +788,15 @@ pub fn check_alive(process: NonNull<Process>) -> Result<(), Error> {
     }
 }
 
+/// Whether `process` lives, read without OBJ while another CPU may end it:
+/// the window probe waits on it (cmd::window::exec_gap).
+#[cfg(feature = "window-probe")]
+pub fn alive_unlocked(process: NonNull<Process>) -> bool {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    // SAFETY: the caller's reference keeps the process alive.
+    unsafe { (*life(process)).is_alive() }
+}
+
 /// The process's life, as a raw pointer to its field (see `refs`). Test
 /// builds stop a process that went, as `Refs::check` does.
 ///

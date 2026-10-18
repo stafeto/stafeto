@@ -25,7 +25,6 @@ use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
-use core::sync::atomic::Ordering;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::time::stretch;
 
@@ -90,7 +89,7 @@ impl core::ops::DerefMut for QueueGuard {
 impl Drop for QueueGuard {
     fn drop(&mut self) {
         if self.spinning {
-            self.block.local.queue_spin.store(false, Ordering::Release);
+            self.block.local.queue_spin.unlock_held();
         }
     }
 }
@@ -104,9 +103,7 @@ fn lock_queue(block: &'static CpuBlock) -> QueueGuard {
 
 fn spin_lock_queue(block: &'static CpuBlock, spinning: bool) -> QueueGuard {
     if spinning {
-        while block.local.queue_spin.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
+        block.local.queue_spin.lock();
     }
     QueueGuard {
         queue: block.local.queue.as_ptr().cast_mut(),
@@ -294,9 +291,7 @@ unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
     // the portion that takes items off it runs on this CPU.
     let spin = !crate::obj::held();
     if spin {
-        while this.local.queue_spin.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
+        this.local.queue_spin.lock();
     }
     // SAFETY: the lock or the section excludes the other CPUs; the caller's
     // promise for the item.
@@ -314,7 +309,7 @@ unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
         q.len += 1;
     }
     if spin {
-        this.local.queue_spin.store(false, Ordering::Release);
+        this.local.queue_spin.unlock_held();
     }
 }
 
@@ -453,7 +448,13 @@ pub fn take_longest() -> u64 {
 pub fn drain() {
     loop {
         while top().is_some() {
+            // Each portion is a stretch of its own, as between two polls of
+            // the way out of the kernel (obj::stretch_begins).
+            #[cfg(feature = "measure")]
+            crate::obj::stretch_begins(timer::now());
             portion();
+            #[cfg(feature = "measure")]
+            crate::obj::stretch_ends(timer::now());
         }
         if !crate::qsbr::pending() {
             return;

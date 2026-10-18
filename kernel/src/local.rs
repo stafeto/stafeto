@@ -32,8 +32,11 @@ pub struct Local {
     pub queue: Own<crate::cleanup::Queue>,
     /// Held while anything touches `queue` that may run on another CPU
     /// too: the owner's portion and push, and the `raise` and `remove` of
-    /// an item queued here by a section on another CPU (cleanup.rs).
-    pub queue_spin: core::sync::atomic::AtomicBool,
+    /// an item queued here by a section on another CPU (cleanup.rs). The
+    /// second lock CPUs share, after OBJ: a ticket lock, so that a CPU waits
+    /// for at most the short holds of the CPUs ahead of it; a section under
+    /// OBJ may take it, and no one takes OBJ while holding it.
+    pub queue_spin: kcore::sync::Ticket,
     pub ring: Own<Ring<LOG_RECORDS>>,
     /// The objects this CPU retired and has not freed (qsbr).
     pub retired: Own<crate::qsbr::Retired>,
@@ -66,7 +69,7 @@ impl Local {
             sched: Own::new(Sched::new()),
             timers: Own::new(Timers::new()),
             queue: Own::new(crate::cleanup::Queue::new()),
-            queue_spin: core::sync::atomic::AtomicBool::new(false),
+            queue_spin: kcore::sync::Ticket::new(),
             ring: Own::new(Ring::new()),
             retired: Own::new(crate::qsbr::Retired::new()),
             copy: Own::new(crate::thread::PendingCopy::new()),

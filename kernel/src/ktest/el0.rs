@@ -4729,7 +4729,7 @@ fn pend(thread: NonNull<Thread>) {
 /// x1 on success.
 fn call(t: NonNull<Thread>, number: u16, args: &[u64]) -> Result<u64, Error> {
     set_args(t, args);
-    syscall::dispatch(t, number);
+    super::dispatch(t, number);
     // SAFETY: the thread belongs to the test and does not run yet.
     let x = unsafe { t.as_ref() }.regs.x;
     match x[0] {

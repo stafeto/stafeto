@@ -1140,7 +1140,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 255;
+const INIT_TESTS: u32 = 256;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1229,6 +1229,9 @@ enum Variant {
     /// a queue after the room for its handles (`smp_window`).
     WindowNoBlockCheck,
     WindowNoHeadCheck,
+    /// The same without the second look at the life of the process after the
+    /// portion of a mem_map RX gave OBJ back (`smp_window`).
+    WindowNoAliveCheck,
     /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
     /// address space (`smp_asid`), and the same with one deliberate break
     /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
@@ -1247,7 +1250,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 20] = [
+    const ALL: [Variant; 21] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1260,6 +1263,7 @@ impl Variant {
         Variant::WindowProbe,
         Variant::WindowNoBlockCheck,
         Variant::WindowNoHeadCheck,
+        Variant::WindowNoAliveCheck,
         Variant::AsidProbe,
         Variant::AsidNoReserved,
         Variant::AsidNoFlush,
@@ -1288,6 +1292,7 @@ impl Variant {
             Variant::WindowProbe => Some("window-probe"),
             Variant::WindowNoBlockCheck => Some("break-block-check"),
             Variant::WindowNoHeadCheck => Some("break-head-check"),
+            Variant::WindowNoAliveCheck => Some("break-alive-check"),
             Variant::AsidProbe => Some("asid-probe"),
             Variant::AsidNoReserved => Some("break-asid-reserved"),
             Variant::AsidNoFlush => Some("break-asid-flush"),
@@ -1310,6 +1315,7 @@ impl Variant {
             | Variant::WindowProbe
             | Variant::WindowNoBlockCheck
             | Variant::WindowNoHeadCheck
+            | Variant::WindowNoAliveCheck
             | Variant::AsidProbe
             | Variant::AsidNoReserved
             | Variant::AsidNoFlush
@@ -1359,6 +1365,7 @@ impl Variant {
             Variant::WindowProbe => "stafeto-window",
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
             Variant::WindowNoHeadCheck => "stafeto-window-no-head",
+            Variant::WindowNoAliveCheck => "stafeto-window-no-alive",
             Variant::AsidProbe => "stafeto-asid",
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
             Variant::AsidNoFlush => "stafeto-asid-no-flush",
@@ -4910,6 +4917,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// item by a section on another CPU cannot meet them; 7 instructions in the
 /// push of each of the 64 threads of the portion. 13 115 measured. The
 /// reviewer of the kernel decides whether it stays.
+/// `THREADS_READY_MAX` 13 119 -> 13 197 (audit 6, rv6.7): the lock of the
+/// cleanup queue is a ticket lock, so that a CPU waits only for the holds of
+/// the CPUs ahead of it; its take and its release are some instructions
+/// longer than the swap, about one a thread of the portion. 13 193
+/// measured. The reviewer of the kernel decides whether it stays.
 ///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
@@ -4949,12 +4961,16 @@ const OBJ_HOLD_MAX: u64 = 4_000;
 /// review: `kernel_tests` fails B_4 above this bound from stage 4. The ASID
 /// section that begins a new generation is a section like the rest (stage 5).
 const B4_MAX: u64 = 32_000;
+/// Whether `kernel_tests` fails B_4 with the takes of OBJ in a stretch
+/// above B4_MAX: off while stretches of the cleanup of memory, channels and
+/// processes and of mem_create take OBJ once a frame or an item.
+const B4_TAKES_ENFORCED: bool = false;
 /// The room above the longest hold that `check_obj_hold` leaves before it
 /// asks to lower `OBJ_HOLD_MAX` (rule 4 of the guards), and what a lowered
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_119;
+const THREADS_READY_MAX: u64 = 13_197;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -5410,11 +5426,40 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Published concurrent snapshots must preserve the part's memory reserve.
+/// The console takes a line of more than 64 bytes in several writes, and a
+/// line of the services' timing (`service wait:` and the like, lib/rt)
+/// that another CPU writes meanwhile may land inside it: such a line goes
+/// back where it came from, and the rest of the split line, the next line,
+/// joins its start.
+fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = &lines[i];
+        let cut = line
+            .find("service ")
+            .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
+        match (cut, lines.get(i + 1)) {
+            (Some(at), Some(rest)) => {
+                out.push(line[at..].to_owned());
+                out.push(format!("{}{rest}", &line[..at]));
+                i += 2;
+            }
+            _ => {
+                out.push(line.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     let mut snapshots = 0;
     let mut names_workload = false;
     let mut names_capacity = false;
-    for line in lines {
+    let lines = rejoin_split_lines(lines);
+    for line in &lines {
         let capacity = line.starts_with("posix-procs: names quota:")
             || line.starts_with("posix-procs: names capacity memory:");
         names_workload |= line.starts_with("posix-procs: names workload memory:");
@@ -8808,7 +8853,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             measured.push((what, rows, ticks));
         }
         check_obj_hold(m.name, &lines)?;
-        let (margin, to_term) = b_margin(m.name, &measured)?;
+        let (margin, to_term) = b_margin(m.name, &measured, &lines)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
             m.name
@@ -8971,18 +9016,66 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
         .unwrap_or(("none", "none", 0))
 }
 
+/// The longest stretch between two polls for an interrupt with each count
+/// k of takes of OBJ, from the lines `obj takes ticks: k=C` of the kernel
+/// (kernel/src/obj.rs; the last k counts that many takes and more): pairs
+/// (k, C).
+fn stretches_by_takes(lines: &[String]) -> Result<Vec<(u64, u64)>, String> {
+    let mut by_k = std::collections::BTreeMap::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix("obj takes ticks: ") else {
+            continue;
+        };
+        let parsed = rest.split_once('=').and_then(|(k, c)| {
+            Some((k.trim().parse::<u64>().ok()?, c.trim().parse::<u64>().ok()?))
+        });
+        let Some((k, c)) = parsed else {
+            return Err(format!("the kernel printed {line:?} for OBJ"));
+        };
+        let longest = by_k.entry(k).or_insert(0);
+        *longest = c.max(*longest);
+    }
+    if by_k.is_empty() {
+        return Err("the kernel printed no obj takes ticks".to_owned());
+    }
+    Ok(by_k.into_iter().collect())
+}
+
+/// The blocking time of a call on `cpus` CPUs: each take of OBJ in a
+/// stretch may wait for the holds of the (N-1) other CPUs, so B_N is the
+/// largest C + k * (N-1) * OBJ_HOLD_MAX over the stretches (k, C), and over
+/// B with one take (the rows, measured apart from the stretches). The term
+/// and the k that give it.
+fn b_n(cpus: u64, b: u64, stretches: &[(u64, u64)]) -> (u64, u64, u64) {
+    std::iter::once((1, b))
+        .chain(stretches.iter().copied())
+        .map(|(k, c)| (c + k * (cpus - 1) * OBJ_HOLD_MAX, k, c))
+        .max()
+        .unwrap_or((0, 0, 0))
+}
+
 /// The margins of the longest portion in `measured`, which the `B on` line
 /// prints, under KERNEL_B_MAX and under TERM_B; an error when it is past
-/// KERNEL_B_MAX.
-fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
+/// KERNEL_B_MAX, or when B_4 with the takes of OBJ in `lines` is past
+/// B4_MAX.
+fn b_margin(
+    name: &str,
+    measured: &[(&str, &[&str], Vec<u64>)],
+    lines: &[String],
+) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
-    // B_N = B + (N-1) * OBJ_HOLD_MAX (the command's own work, C_cmd, is in B
-    // and in the holds): printed for the CPU counts of the table of docs/smp.md.
+    let stretches = stretches_by_takes(lines)?;
+    let shown: Vec<String> = stretches.iter().map(|(k, c)| format!("{k}={c}")).collect();
+    println!(
+        "OBJ takes on {name}: longest stretch by takes {}",
+        shown.join(" ")
+    );
+    // The command's own work, C_cmd, is in the stretch and in the holds.
     for cpus in [2, 8] {
-        let b_n = n + (cpus - 1) * OBJ_HOLD_MAX;
+        let (b, k, c) = b_n(cpus, n, &stretches);
         println!(
-            "B_{cpus} on {name}: {b_n} = B {n} + {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+            "B_{cpus} on {name}: {b} = {c} + {k} * {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
             cpus - 1
         );
     }
@@ -8993,6 +9086,22 @@ fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, 
             "B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
             b4 - B4_MAX
         ));
+    }
+    // With the takes: printed, and no error until every stretch takes OBJ
+    // at most once, or twice in a short one (B4_TAKES_ENFORCED).
+    let (b4, k, c) = b_n(4, n, &stretches);
+    println!(
+        "B_4 with the takes on {name}: {b4} = {c} + {k} * 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}"
+    );
+    if b4 > B4_MAX {
+        let past = format!(
+            "B_4 with the takes on {name}: {b4} = {c} + {k} * 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX} is {} past {B4_MAX}",
+            b4 - B4_MAX
+        );
+        if B4_TAKES_ENFORCED {
+            return Err(past);
+        }
+        println!("{past}");
     }
     match KERNEL_B_MAX.checked_sub(n) {
         Some(margin) => Ok((margin, TERM_B - n)),
@@ -9185,6 +9294,15 @@ fn smp_window() -> Result<(), String> {
             o.lines.iter().any(|l| {
                 l.contains("the head of a channel's queue moved while its receiver made room")
             })
+        },
+    )?;
+    smp_window_break(
+        Variant::WindowNoAliveCheck,
+        "the second look at the life of a process after the icache of a mem_map RX",
+        |_, r| {
+            r.failed
+                .iter()
+                .any(|(name, _)| name == "smp_exec_map_of_a_process_killed_meanwhile_fails")
         },
     )
 }
@@ -11433,7 +11551,11 @@ mod tests {
         };
         let margin = |n| {
             let ticks = ticks_of(&log(n), "suspension scopes", &SUSPENSION_ROWS)?;
-            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)])
+            b_margin(
+                "t",
+                &[("suspension scopes", &SUSPENSION_ROWS[..], ticks)],
+                &["obj takes ticks: 1=100".to_owned()],
+            )
         };
         assert_eq!(margin(KERNEL_B_MAX), Ok((0, TERM_B - KERNEL_B_MAX)));
         assert!(
@@ -11441,6 +11563,41 @@ mod tests {
                 .unwrap_err()
                 .contains("past KERNEL_B_MAX")
         );
+    }
+
+    /// Each take of OBJ in a stretch counts (N-1) holds: a short stretch
+    /// with two takes may pass B4_MAX where B with one does not, and a log
+    /// with no line of takes fails.
+    #[test]
+    fn b_4_counts_every_take_of_obj_in_a_stretch() {
+        let rows = |n: u64| {
+            let log = vec![format!(
+                "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
+                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+            )];
+            ticks_of(&log, "suspension scopes", &SUSPENSION_ROWS).unwrap()
+        };
+        let margin = |takes: &[&str]| {
+            let lines: Vec<String> = takes.iter().map(|l| (*l).to_owned()).collect();
+            b_margin(
+                "t",
+                &[("suspension scopes", &SUSPENSION_ROWS[..], rows(10_000))],
+                &lines,
+            )
+        };
+        let fits = B4_MAX - 2 * 3 * OBJ_HOLD_MAX;
+        assert!(margin(&[&format!("obj takes ticks: 2={fits}")]).is_ok());
+        let over = margin(&[
+            "obj takes ticks: 0=5",
+            &format!("obj takes ticks: 2={}", fits + 1),
+        ]);
+        if B4_TAKES_ENFORCED {
+            assert!(over.unwrap_err().contains("2 * 3 * OBJ_HOLD_MAX"));
+        } else {
+            assert!(over.is_ok());
+        }
+        assert!(margin(&[]).unwrap_err().contains("no obj takes"));
+        assert_eq!(b_n(4, 7, &[(0, 9), (3, 1)]), (1 + 9 * OBJ_HOLD_MAX, 3, 1));
     }
 
     #[test]
@@ -11600,12 +11757,35 @@ mod tests {
         );
     }
 
-    /// The order of locks is in kernel/src/obj.rs: `OBJ` is the only lock the
-    /// CPUs share, and what a CPU alone owns takes none. So outside the kernel
-    /// tests no `kcore::sync::Lock` guards kernel data, the ticket is taken
-    /// only in obj.rs, `Own` cells live only in `Local` (local.rs), and the
+    /// The order of locks is in kernel/src/obj.rs: `OBJ`, then the ticket of
+    /// each CPU's cleanup queue, are the locks the CPUs share, and what a CPU
+    /// alone owns takes none. So outside the kernel tests no
+    /// `kcore::sync::Lock` guards kernel data, a ticket is only in obj.rs and
+    /// in `Local::queue_spin`, `Own` cells live only in `Local` (local.rs), and the
     /// data `OBJ` guards are the five that the order names: a new lock or
     /// datum has to change this list, and so decide its place in the order.
+    /// A timing line of a service inside a long line of posix-procs goes
+    /// out of it, and the rest of the line joins it again.
+    #[test]
+    fn a_service_line_inside_a_split_line_goes_back_out() {
+        let lines: Vec<String> = [
+            "posix-procs: names quota: process 1, quota 552 pages, used 513 pservice wait: 10 kind 64 29846 ticks of 31452",
+            "ages, remaining 39",
+            "posix-procs: steps done",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "service wait: 10 kind 64 29846 ticks of 31452",
+                "posix-procs: names quota: process 1, quota 552 pages, used 513 pages, remaining 39",
+                "posix-procs: steps done",
+            ]
+        );
+    }
+
     #[test]
     fn locks_of_the_kernel_are_the_ones_the_order_names() {
         const GUARDED: [&str; 5] = ["FRAMES", "METADATA", "ROOTS", "ASIDS", "TOKENS"];
@@ -11620,7 +11800,10 @@ mod tests {
                 if line.contains("kcore::sync::Lock") || line.contains("Lock<") {
                     found.push(format!("{at}: a kcore Lock"));
                 }
-                if name != "kernel/src/obj.rs" && line.contains("Ticket") {
+                // The second lock of the order: the ticket of a CPU's cleanup
+                // queue (obj.rs).
+                let queue_lock = name == "kernel/src/local.rs" && line.contains("queue_spin");
+                if name != "kernel/src/obj.rs" && line.contains("Ticket") && !queue_lock {
                     found.push(format!("{at}: a ticket outside obj.rs"));
                 }
                 if name != "kernel/src/local.rs" && line.contains("Own<") {

@@ -112,9 +112,15 @@ pub fn idle() {
     poll();
 }
 
-/// This CPU wakes from idle.
+/// This CPU wakes from idle. The fence orders the store of its epoch
+/// before every later load of a link: the store and the loads of a reader
+/// make a pair with the retirer's, which no Acquire load alone keeps in
+/// order (an `ldapr` of FEAT_LRCPC may pass the store); xtask's `smp_order`
+/// checks the `dmb ish` in the built kernel.
+#[inline(never)]
 pub fn awake() {
     GRACE.quiesce(cpu::this().index());
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Frees the retired objects of this CPU whose period passed.

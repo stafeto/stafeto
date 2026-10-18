@@ -21,8 +21,9 @@
 //! section under OBJ ended: the thread goes into the queue and the SGI is no
 //! part of its hold. The owner takes the commands where it handles the SGI
 //! (`drain`), on an empty kernel stack, and serves each thread's flags in a
-//! fixed order; a thread that ended meanwhile is skipped, and a woken
-//! thread waits for the copy of its message (`serve_wake`).
+//! fixed order, up to DRAIN_BATCH threads in one section; a thread that
+//! ended meanwhile is skipped, and a woken thread waits for the copy of its
+//! message first (`drain`).
 
 use crate::arch::cpu::{self, MAX_CPUS};
 use crate::arch::gic;
@@ -117,11 +118,6 @@ pub fn take_exit(t: NonNull<Thread>) -> u16 {
     word
 }
 
-/// A timer whose last reference went on this CPU is in the heap of another
-/// one, which takes it off (`timer::reap`): the pointer of the timer stands
-/// in the queue with bit 0 set.
-pub const REAP: u8 = 64;
-
 /// Places in a queue: every thread of the system, once.
 const RING: usize = 1024;
 const _: () = assert!(THREADS <= RING);
@@ -147,26 +143,23 @@ impl Ring {
         }
     }
 
-    /// The writer's: `value` is a thread's address, or a timer's with bit 0
-    /// set. A thread stands in the queues once at most, but the timers that
-    /// other CPUs let go come in any number, so a full queue is waited for:
-    /// the writer holds no lock here (`flush`), and the reader needs none to
-    /// take the entry.
-    fn push(&self, value: usize, to: usize) {
+    /// The writer's: `value` is a thread's address. A thread stands in the
+    /// queues once at most, so a queue of THREADS places is never full, and
+    /// the writer never waits (the dying timers go by a chain under OBJ,
+    /// timer::reap).
+    fn push(&self, value: usize) {
         let tail = self.tail.0.load(Ordering::Relaxed);
-        if tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
-            let limit = crate::arch::timer::now() + 2 * crate::arch::timer::frequency();
-            while tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) >= RING as u32 {
-                assert!(
-                    crate::arch::timer::now() < limit,
-                    "CPU {to} takes no command: its queue has been full for two seconds"
-                );
-                gic::send_sgi(to, SGI_CMD);
-                core::hint::spin_loop();
-            }
-        }
+        assert!(
+            tail.wrapping_sub(self.head.0.load(Ordering::Acquire)) < RING as u32,
+            "a queue of commands is full: a thread stands in it twice"
+        );
         self.slots[tail as usize % RING].store(value, Ordering::Relaxed);
         self.tail.0.store(tail.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Whether the reader has nothing to take.
+    fn is_empty(&self) -> bool {
+        self.head.0.load(Ordering::Relaxed) == self.tail.0.load(Ordering::Acquire)
     }
 
     /// The reader's.
@@ -231,45 +224,26 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
         return;
     }
     debug_assert!(thread::cpu_of(t) != cpu::this().index());
-    let mut o = local().outbox.lock();
-    assert!(
-        o.n < OUTBOX,
-        "a section posts more commands than the outbox holds"
-    );
-    let n = o.n;
-    o.items[n] = (t.as_ptr() as usize, PUSH | flag);
-    o.n += 1;
-    local()
-        .deferred
-        .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
-}
-
-/// Posts the end of timer `t`, which another CPU's heap holds, for that CPU.
-pub fn post_reap(t: NonNull<crate::timer::Timer>) {
-    let mut o = local().outbox.lock();
-    assert!(
-        o.n < OUTBOX,
-        "a section posts more commands than the outbox holds"
-    );
-    let n = o.n;
-    o.items[n] = (t.as_ptr() as usize, REAP);
-    o.n += 1;
-    local()
-        .deferred
-        .fetch_or(crate::local::OUTBOX, Ordering::Relaxed);
+    add(t.as_ptr() as usize, PUSH | flag);
 }
 
 /// Asks CPU `to` to enter the kernel, with no command: a thread of it at
-/// EL0 is to see what changed in its state (`pending` of an upcall).
+/// EL0 is to see what changed in its state (`pending` of an upcall), or a
+/// dying timer waits for it (timer::reap).
 pub fn kick(to: usize) {
     debug_assert!(to != cpu::this().index());
+    add(to, 0);
+}
+
+/// Puts an item in the outbox: a thread with its flags, or a CPU with 0.
+fn add(what: usize, flag: u8) {
     let mut o = local().outbox.lock();
     assert!(
         o.n < OUTBOX,
         "a section posts more commands than the outbox holds"
     );
     let n = o.n;
-    o.items[n] = (to, 0);
+    o.items[n] = (what, flag);
     o.n += 1;
     local()
         .deferred
@@ -302,16 +276,6 @@ pub fn flush() {
                 mask |= 1 << what;
                 continue;
             }
-            if flag == REAP {
-                // SAFETY: the timer holds on to its pool and shell until
-                // the owner takes it.
-                let to = crate::timer::owner_cpu(unsafe {
-                    NonNull::new_unchecked(what as *mut crate::timer::Timer)
-                });
-                RINGS[to][me].push(what | 1, to);
-                mask |= 1 << to;
-                continue;
-            }
             debug_assert!(flag & PUSH != 0);
             // SAFETY: the kernel's reference keeps the thread of a command
             // until the owner serves it, and the owner takes it from this
@@ -320,7 +284,7 @@ pub fn flush() {
             #[cfg(feature = "window-probe")]
             window::open(t, flag & !PUSH);
             let to = thread::cpu_of(t);
-            RINGS[to][me].push(t.as_ptr() as usize, to);
+            RINGS[to][me].push(t.as_ptr() as usize);
             mask |= 1 << to;
         }
         o.n = 0;
@@ -335,27 +299,64 @@ fn thread_cmds<'a>(t: NonNull<Thread>) -> &'a AtomicU8 {
     unsafe { &(*t.as_ptr()).numbers.cmds }
 }
 
-/// The owner's: takes the commands in the queues to this CPU and serves
-/// each thread's flags. On the empty kernel stack, no lock held.
+/// The threads one SGI serves, in one section under OBJ, with the dying
+/// timers that fill the rest of the places: one take of OBJ between two
+/// polls for an interrupt (decision 3 of the SMP design).
+pub const DRAIN_BATCH: usize = 8;
+
+/// The owner's, where it handles the SGI: takes up to DRAIN_BATCH threads
+/// from the queues to this CPU, one from each queue in turn, and serves each
+/// thread's flags in one section, after the copies of the messages of the
+/// woken ones. What is left waits for the SGI this CPU sends itself, which
+/// the next poll for an interrupt takes. On the empty kernel stack, no lock
+/// held.
 pub fn drain() {
     let me = cpu::this().index();
-    for from in (0..crate::smp::cpus()).filter(|&f| f != me) {
-        while let Some(value) = RINGS[me][from].pop() {
-            if value & 1 != 0 {
-                // SAFETY: the sender left the timer to this CPU (`REAP`).
-                crate::timer::reap(unsafe {
-                    NonNull::new_unchecked((value & !1) as *mut crate::timer::Timer)
-                });
-                continue;
+    let cpus = crate::smp::cpus();
+    let mut batch = [(NonNull::<Thread>::dangling(), 0u8); DRAIN_BATCH];
+    let mut n = 0;
+    'take: loop {
+        let before = n;
+        for from in (0..cpus).filter(|&f| f != me) {
+            if n == DRAIN_BATCH {
+                break 'take;
             }
-            // SAFETY: a thread of the queue is alive: the kernel's reference
-            // keeps it until its commands are served.
-            let t = unsafe { NonNull::new_unchecked(value as *mut Thread) };
-            let flags = thread_cmds(t).swap(0, Ordering::Acquire);
-            #[cfg(feature = "window-probe")]
-            window::taken(t, flags);
+            if let Some(value) = RINGS[me][from].pop() {
+                // SAFETY: a thread of the queue is alive: the kernel's
+                // reference keeps it until its commands are served.
+                let t = unsafe { NonNull::new_unchecked(value as *mut Thread) };
+                let flags = thread_cmds(t).swap(0, Ordering::Acquire);
+                #[cfg(feature = "window-probe")]
+                window::taken(t, flags);
+                batch[n] = (t, flags);
+                n += 1;
+            }
+        }
+        if n == before {
+            break;
+        }
+    }
+    if n == 0 && !crate::timer::reaps_waiting() {
+        return;
+    }
+    // A woken thread reads its message: the copy of the CPU that woke it
+    // comes after the flag, takes the time of 960 bytes and needs no OBJ.
+    for &(t, flags) in &batch[..n] {
+        if flags & WAKE != 0 {
+            thread::wait_copies(t);
+        }
+    }
+    let timers_left = {
+        let _section = crate::obj::lock();
+        for &(t, flags) in &batch[..n] {
             serve(t, flags);
         }
+        crate::timer::reap(DRAIN_BATCH - n)
+    };
+    // A batch that was not full left the queues empty, and each later push
+    // comes with an SGI of its own.
+    if timers_left || n == DRAIN_BATCH && (0..cpus).any(|f| f != me && !RINGS[me][f].is_empty()) {
+        gic::send_sgi(me, SGI_CMD);
     }
 }
 
@@ -627,6 +628,27 @@ pub mod window {
         crate::sched::running()
             // SAFETY: the running thread is alive.
             .is_some_and(|t| unsafe { t.as_ref() }.priority() == GAP_LEVEL)
+    }
+
+    /// The priority of the thread whose mem_map RX waits, in its portion
+    /// outside OBJ, for the end of the process it maps into (`exec_gap`).
+    pub const EXEC_LEVEL: u8 = 12;
+
+    /// In the portion of a mem_map or mem_protect that makes pages
+    /// executable, outside OBJ (process::step_change): a thread at
+    /// EXEC_LEVEL waits up to 2 s until another CPU killed `target`, so that
+    /// the portion takes OBJ again with its process ended.
+    pub fn exec_gap(target: NonNull<crate::process::Process>) {
+        let at_level = crate::sched::running()
+            // SAFETY: the running thread is alive.
+            .is_some_and(|t| unsafe { t.as_ref() }.priority() == EXEC_LEVEL);
+        if !at_level {
+            return;
+        }
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+        while crate::process::alive_unlocked(target) && crate::arch::timer::now() < until {
+            core::hint::spin_loop();
+        }
     }
 
     /// A mem_map begins (syscall::mem::change_map).

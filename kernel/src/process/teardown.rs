@@ -6,7 +6,11 @@
 //! of its end to its exit channel.
 
 use super::table::table;
-use super::*;
+use super::{
+    Channel, ChildLinks, Error, LIVE, NonNull, Object, Owner, PAGE_SIZE, Process, ProcessState,
+    ROOTS, Source, Thread, accepted, child_links, cleanup, control, end, object, pages, paid_free,
+    refs, refund, release, release_shell, remove_thread, sched, thread,
+};
 use crate::syscall;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7):
@@ -121,7 +125,7 @@ pub enum Stage {
     Buffers,
     /// The entries of the table of its mappings, at most abi::MAX_MAPPINGS,
     /// each letting its memory object go, and the block of the table
-    /// (maps::release_all). One portion. After Space, so that no TLB entry
+    /// (maps::release_all), MAPPINGS_PORTION entries a portion. After Space, so that no TLB entry
     /// maps a frame of an object that goes.
     Mappings,
     /// The free part of its quota goes back to the parent, and the

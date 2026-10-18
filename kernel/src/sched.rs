@@ -84,8 +84,10 @@ impl Sched {
 pub fn entry_started() -> u64 {
     // The exception entry synchronized: no ISB before the read.
     let now = timer::now_unordered();
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).0 = now };
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_begins(now);
     now
 }
 
@@ -93,9 +95,26 @@ pub fn entry_started() -> u64 {
 /// `exit_loop`'s, or one between two portions of a long call (spec 7.7).
 #[inline(always)]
 pub fn entry_polled() {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     if unsafe { (*local().entry.get()).0 } != 0 {
-        entry_polled_at(timer::now());
+        let now = timer::now();
+        entry_polled_at(now);
+        // The next portion begins a stretch of its own (`entry_started`).
+        #[cfg(feature = "measure")]
+        crate::obj::stretch_ends(now);
+    }
+}
+
+/// A poll of the way out of the kernel at `now`: the stretch of the entry,
+/// if open, ends, and so does the stretch of OBJ's takes, and a new one
+/// begins (obj::stretch_ends).
+#[inline(always)]
+fn polled_at(now: u64) {
+    entry_polled_at(now);
+    #[cfg(feature = "measure")]
+    {
+        crate::obj::stretch_ends(now);
+        crate::obj::stretch_begins(now);
     }
 }
 
@@ -105,11 +124,12 @@ pub fn entry_polled() {
 #[inline(always)]
 fn entry_polled_at(now: u64) {
     let cpu = local();
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     let timing = unsafe { &mut *cpu.entry.get() };
     if timing.0 != 0 {
-        // The counter never runs backwards: `now` was read after the entry's.
-        let elapsed = now.wrapping_sub(timing.0);
+        // `now` was read after the entry's; a counter that steps back (the
+        // A64's, #355) gives an interval of 0.
+        let elapsed = now.saturating_sub(timing.0);
         if elapsed > timing.1 {
             timing.1 = elapsed;
         }
@@ -119,14 +139,14 @@ fn entry_polled_at(now: u64) {
 }
 
 pub fn longest_entry_to_poll() -> u64 {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).1 }
 }
 
 /// Whether an entry started and has not polled yet.
 #[cfg(feature = "ktest")]
 pub fn entry_unpolled() -> bool {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).0 != 0 }
 }
 
@@ -134,14 +154,14 @@ pub fn entry_unpolled() -> bool {
 /// longest interval so far.
 #[cfg(feature = "ktest")]
 pub fn entry_timing() -> (u64, u64) {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { *local().entry.get() }
 }
 
 /// Puts `timing` back, as `entry_timing` read it.
 #[cfg(feature = "ktest")]
 pub fn set_entry_timing(timing: (u64, u64)) {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { *local().entry.get() = timing };
 }
 
@@ -150,11 +170,12 @@ pub fn set_entry_timing(timing: (u64, u64)) {
 /// 7.8).
 static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
 
-/// A value OBJ guards, apart from SCHED.
+/// A value OBJ guards, which `locked` lends together with this CPU's
+/// scheduler.
 struct Guarded<T>(UnsafeCell<T>);
 
-// SAFETY: only `locked` reaches the value, while it holds the scheduler's
-// lock, which makes the access exclusive.
+// SAFETY: only `locked` reaches the value, inside a section under OBJ,
+// which makes the access exclusive.
 unsafe impl<T: Send> Sync for Guarded<T> {}
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.
@@ -352,10 +373,8 @@ pub fn serve_unpark(t: NonNull<Thread>) {
 }
 
 /// WAKE, served by the CPU of the thread, unless it ended since, once the
-/// copy of its message is made (`flush_copy` of the CPU that woke it comes
-/// after the flag, and takes the time of 960 bytes).
+/// copy of its message is made (cmd::drain waits for it).
 pub fn serve_wake(t: NonNull<Thread>) {
-    thread::wait_copies(t);
     let _section = crate::obj::lock();
     if !thread::is_held(t) {
         return;
@@ -762,7 +781,7 @@ pub fn resume() -> ! {
 extern "C" fn exit_loop() -> ! {
     loop {
         let mut now = timer::now();
-        entry_polled_at(now);
+        polled_at(now);
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {
@@ -866,11 +885,15 @@ fn sleep() {
     crate::mm::aspace::leave();
     crate::testpoint::idle();
     let slept = timer::now();
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_ends(slept);
     local().time.sleeps(slept);
     crate::qsbr::idle();
     let ack = gic::wait();
     crate::qsbr::awake();
     let woke = timer::now();
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_begins(woke);
     local().time.woke(woke);
     {
         let mut g = local().sched.lock();

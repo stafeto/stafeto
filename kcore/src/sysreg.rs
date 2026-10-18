@@ -63,13 +63,26 @@ pub const CPACR_EL1: u64 = 0b11 << 20;
 /// EL0PCTEN (bit 0), EL0VTEN (bit 8) and EL0PTEN (bit 9) stay clear: no
 /// physical counter and no timer registers for programs.
 ///
-/// EVNTEN with EVNTI 8 and EVNTDIR 0 is the event stream: bit 8 of the
-/// virtual counter rising sends an event every 512 ticks (about 21 us at
-/// 24 MHz). It bounds the sleep of a `wfe` that waits for the lock OBJ
-/// (`sync::Ticket`) if its wake-up got lost.
-pub const CNTKCTL_EL1: u64 = (1 << 1) | CNTKCTL_EVNTEN | (CNTKCTL_EVNTI << 4);
+/// EVNTEN with EVNTDIR 0 is the event stream: bit EVNTI of the virtual
+/// counter rising sends an event every 2^(EVNTI+1) ticks. It bounds the sleep
+/// of a `wfe` that waits for the lock OBJ (`sync::Ticket`) if its wake-up got
+/// lost. `cntkctl_el1` takes EVNTI from the counter's frequency.
+pub const CNTKCTL_EL1: u64 = (1 << 1) | CNTKCTL_EVNTEN;
 const CNTKCTL_EVNTEN: u64 = 1 << 2;
-const CNTKCTL_EVNTI: u64 = 8;
+
+/// The period of the event stream, about: 20 us.
+const EVENT_PERIOD_HZ: u64 = 50_000;
+
+/// CNTKCTL_EL1 for a counter of `frequency` Hz: EVNTI the largest bit whose
+/// rise comes at most every 2^(EVNTI+1) ticks, 20 to 40 us, so that a lost
+/// wake-up costs the same time on any board (EVNTI 8 at the 24 MHz of the
+/// A64, 21 us; 10 at the 62.5 MHz of QEMU, 33 us).
+pub const fn cntkctl_el1(frequency: u64) -> u64 {
+    let ticks = frequency / EVENT_PERIOD_HZ;
+    let evnti = if ticks < 2 { 0 } else { ticks.ilog2() as u64 };
+    let evnti = if evnti > 15 { 15 } else { evnti };
+    CNTKCTL_EL1 | evnti << 4
+}
 
 /// MDSCR_EL1: TDCC traps EL0 access to the debug communication channel;
 /// MDE, KDE and SS stay clear: no breakpoints, watchpoints or
@@ -122,8 +135,28 @@ mod tests {
     #[test]
     fn el0_gets_fp_and_the_virtual_counter_only() {
         assert_eq!(CPACR_EL1, 0x30_0000);
-        assert_eq!(CNTKCTL_EL1, 0b1000_0110);
+        assert_eq!(cntkctl_el1(24_000_000), 0b1000_0110);
         assert_eq!(MDSCR_EL1, 0x1000);
+    }
+
+    /// The event stream comes every 20 to 40 us whatever the frequency.
+    #[test]
+    fn the_event_stream_period_follows_the_counter() {
+        for (hz, evnti) in [
+            (24_000_000, 8),
+            (62_500_000, 10),
+            (1_000_000_000, 14),
+            (19_200_000, 8),
+        ] {
+            assert_eq!(cntkctl_el1(hz) >> 4 & 0xf, evnti, "{hz} Hz");
+            let period_ns = (2u64 << evnti) * 1_000_000_000 / hz;
+            assert!(
+                (20_000..40_000).contains(&period_ns),
+                "{hz} Hz: {period_ns} ns"
+            );
+        }
+        assert_eq!(cntkctl_el1(0) >> 4 & 0xf, 0);
+        assert_eq!(cntkctl_el1(u64::MAX) >> 4 & 0xf, 15);
     }
 
     #[test]

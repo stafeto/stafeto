@@ -385,13 +385,27 @@ pub fn lines() -> u32 {
     LINE_COUNT.load(Ordering::Relaxed)
 }
 
+/// GICv2: the read of GICC_IAR, then `dmb ishld`, so that the handler's
+/// later loads from memory, the queue of commands an SGI announces among
+/// them, come after it (xtask's `smp_order` checks the order in the built
+/// kernel). Without the barrier a load of the queue may pass the read of
+/// the Device register, see the queue empty, and the command waits for
+/// the next SGI.
+#[inline(never)]
+fn acknowledge_v2() -> u32 {
+    let iar = read(base(&CPU) + GICC_IAR);
+    // SAFETY: a barrier has no other effect.
+    unsafe { asm!("dmb ishld", options(nostack, preserves_flags)) };
+    iar
+}
+
 /// Acknowledges once: GICC_IAR, or ICC_IAR1_EL1 on a GICv3. The interrupt
 /// becomes active until `end`; None for a spurious read, which needs no
 /// EOI.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
 pub fn acknowledge() -> Option<Ack> {
     let iar = match kind() {
-        GicVersion::V2 => read(base(&CPU) + GICC_IAR),
+        GicVersion::V2 => acknowledge_v2(),
         GicVersion::V3 => {
             let iar: u64;
             // SAFETY: reading ICC_IAR1_EL1 acknowledges the interrupt, as

@@ -37,6 +37,9 @@ window-probe = []
 # no second look at the head of a queue after the room for its handles.
 break-block-check = ["window-probe"]
 break-head-check = ["window-probe"]
+# No second look at the life of the process after the portion of a mem_map RX
+# gave OBJ back for the instruction cache.
+break-alive-check = ["window-probe"]
 measure = []
 # The counters of SMP stage 6: kernel time and waits for OBJ of each CPU, printed on
 # request of the program (xtask smp-measure).

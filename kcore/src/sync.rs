@@ -194,6 +194,13 @@ impl Ticket {
         wake();
     }
 
+    /// The tickets handed out so far, modulo 2^16: how many times the lock
+    /// was taken since an earlier count, by any CPU.
+    #[inline(always)]
+    pub fn tickets(&self) -> u16 {
+        self.next.load(Ordering::Relaxed)
+    }
+
     /// Whether no CPU holds or awaits the lock.
     pub fn is_free(&self) -> bool {
         self.next.load(Ordering::Relaxed) == self.serving.load(Ordering::Relaxed)

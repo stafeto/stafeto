@@ -71,7 +71,7 @@ use kcore::paging::{
 use kcore::quota::Account;
 use kcore::sched::State;
 use kcore::slab::Pool;
-use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
+use kcore::sysreg::{self, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
@@ -767,9 +767,31 @@ fn finish() -> ! {
                 kprintln!("obj hold kind ticks: {kind}={held}");
             }
         }
+        for (k, (took, kind)) in crate::obj::stretches_by_takes().iter().enumerate() {
+            if *took != 0 {
+                kprintln!("obj takes ticks: {k}={took}");
+                kprintln!("obj takes kind: {k}={kind}");
+            }
+        }
+        for (kind, (k, took)) in crate::obj::takes_by_kind().iter().enumerate() {
+            if *took != 0 {
+                kprintln!("obj takes of kind: {kind} k={k} ticks={took}");
+            }
+        }
     }
     kprintln!("TESTS DONE total={total} failed={failed}");
     crate::psci::system_off()
+}
+
+/// Call `number` of `t` as an entry makes it: in a stretch of its own for
+/// the takes of OBJ (obj::stretch_begins), which the code of the test
+/// before and after stays out of.
+fn dispatch(t: NonNull<crate::thread::Thread>, number: u16) {
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_begins(crate::arch::timer::now());
+    crate::syscall::dispatch(t, number);
+    #[cfg(feature = "measure")]
+    crate::obj::stretch_ends(crate::arch::timer::now());
 }
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
@@ -1806,7 +1828,7 @@ fn system_registers_open_el0(_: &Boot) -> Result<(), &'static str> {
         "FP and SIMD instructions trap",
     )?;
     check(
-        registers::cntkctl_el1() == CNTKCTL_EL1,
+        registers::cntkctl_el1() == sysreg::cntkctl_el1(crate::arch::timer::frequency()),
         "EL0 cannot read the virtual counter, or can reach more timer registers",
     )?;
     check(

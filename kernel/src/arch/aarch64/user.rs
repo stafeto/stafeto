@@ -11,7 +11,7 @@
 use super::{mmu, registers};
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
+use kcore::sysreg::{self, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
 /// A program's registers, saved on every entry from EL0 and loaded on the
 /// way back, in the layout of vectors.S (USER_*).
@@ -139,7 +139,7 @@ pub fn init_registers() {
             "msr sctlr_el1, {sctlr}",
             "isb",
             cpacr = in(reg) CPACR_EL1,
-            cntkctl = in(reg) CNTKCTL_EL1,
+            cntkctl = in(reg) sysreg::cntkctl_el1(super::timer::frequency()),
             mdscr = in(reg) MDSCR_EL1,
             sctlr = in(reg) SCTLR_EL1,
             options(nostack, preserves_flags),

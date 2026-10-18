@@ -1171,7 +1171,10 @@ pub fn run(next: NonNull<Thread>) -> ! {
         // The stretch of the thread at EL0 starts here, and the next entry
         // from EL0 ends it (`user_ran`): the way out of the kernel up to
         // this point is the kernel's.
-        user_resumes(thread, crate::arch::timer::now_unordered());
+        let now = crate::arch::timer::now_unordered();
+        #[cfg(feature = "measure")]
+        crate::obj::stretch_ends(now);
+        user_resumes(thread, now);
         user::enter(next.as_ptr().cast())
     }
 }
