@@ -1,7 +1,7 @@
-# WCET inputs: block coverage and kernel stack depth
+# WCET inputs: block coverage, kernel stack depth and the computed bound
 
-Two tools in xtask give the inputs of a worst-case execution time
-analysis of the kernel. Neither changes the kernel.
+Three tools in xtask give the inputs of a worst-case execution time
+analysis of the kernel and a first computed bound. None changes the kernel.
 
 ## What is measured
 
@@ -9,7 +9,10 @@ analysis of the kernel. Neither changes the kernel.
 (the boots of the kernel and of its images, the kernel tests, the
 init and service tests), the steps of the process service
 (`process-steps`) and two probes that run under `-icount` (`entropy`,
-`rtbench-short`) under a QEMU TCG plugin (tools/wcet/trace.c) that records
+`rtbench-short`), the tests of the test init (`init tests 512M`, with and
+without `icount`) and the kernel tests of the icount build (`kernel tests
+icount`: the test kernel and the one with the EL0 tests are images of their own)
+under a QEMU TCG plugin (tools/wcet/trace.c) that records
 every translation block of the kernel that executes. From the kernel's ELF
 file (`llvm-objdump`) it takes the functions, their basic blocks and the
 call graph, and lists, for each entry path, the blocks of the functions the
@@ -54,6 +57,8 @@ cargo xtask wcet stack [--limit BYTES] [--elf FILE]
   probes of all groups included.
 - `--out DIR` names the directory under `target/` for the traces and the
   report (`wcet` by default); runs to compare keep apart so.
+- A probe that fails does not stop the others: its trace is kept and the run
+  goes on.
 - `--skip PROBE` leaves a probe out of the run (or, with `--from`, out of the
   traces read); `--from DIR` reads the traces of an earlier run.
 - `stack` prints the deepest stack against the limit and writes the paths,
@@ -92,3 +97,137 @@ plugin and checks that `kernel_main` is in the trace.
 - A second exception on top of the first is not summed: kernel code runs
   with interrupts masked, and the exceptions of the kernel itself stop the
   machine on the emergency stack (kernel.ld).
+
+## The computed bound
+
+`cargo xtask wcet bound` computes, for each system call and for the interrupt
+paths, the longest path in instructions from the control-flow graph of the
+kernel's basic blocks and its call graph, and sets it against the longest
+measure of the kernel tests under `-icount`.
+
+### How the bound is computed
+
+1. The kernel tests of the icount build run under the trace plugin
+   (tools/wcet/trace.c). The plugin writes, for each translation block that
+   ran, its address, its instructions and its executions (to within a factor
+   of two when a run ends by a kill). The report checks that each translation
+   block agrees with the disassembly: it lies in a function of the image and
+   has no branch inside it. The cost of a basic block is its number of
+   instructions in the disassembly, which the trace confirms for each block
+   that ran; the plugin itself adds no instruction to the guest.
+2. Each function of the image (`llvm-objdump`) gets a control-flow graph: its
+   basic blocks, the edges of its branches, the calls in each block, and its
+   exits (a return, a tail call). The targets of a `br` that is the jump of a
+   `match` come from the table in the image (the section's bytes), read by the
+   pattern the compiler emits: the address of the table, a load of an entry
+   and an add to a base. A `br` to the address of a function is a tail call.
+3. A block costs its instructions and the bound of every function it calls.
+   At a branch the path takes the longer way. A loop costs (B - 1) times its
+   longest pass from the header back to the header, plus the longest way from
+   the header to where the path leaves the loop; B is the bound of the loop
+   in tools/wcet/bounds.toml, the most times its header runs for one entry.
+   Nested loops multiply. A loop with several ways in (a region the compiler
+   made by jumping into its middle) costs B times the sum of its blocks, B
+   being the most times any of its blocks runs.
+4. A call of a function that never returns (a panic, a halt) ends its path,
+   which is no path of the analysis. Functions that never return are found
+   from the graph.
+5. The copies and fills of the builtins (`memcpy`, `memmove`, `memset`) cost by
+   the size the call site sets with `mov x2, #n`, or the size an annotation
+   `[[copy]]` gives for the function; the loops of the builtins count only for
+   a copy with no size.
+
+### What one row means
+
+For a system call the estimate is the longest path through `dispatch` between
+its two counter reads (the interval the kernel measures with `CALL_TIMING`),
+with the handlers priced at nothing, plus the longest path of the call's
+handler, plus `calibration.counter_read` from the annotations. The frame of a
+call is the same for every call: the path through `dispatch` that leaves the
+section, flushes the commands the call posted (at most `OUTBOX` = 96) and
+copies a message. The measure is the longest of the kernel tests for that
+call. For a call that works in portions (`mem_create`, `mem_map`,
+`mem_unmap`, `mem_protect`) the kernel polls for an interrupt between two
+portions, so the estimate is the path of one portion, and the measure is the
+longest of the rows that measure a portion (`memory portions`). The rows of
+the interrupt paths name the test rows that measure them.
+
+The estimate is a bound on what the code can do with the loop bounds of the
+annotation file. The tests reach a small part of it: a call that posts one
+command measures a few hundred instructions where the frame holds the path of
+96. An estimate below its measure is an error of the analysis (a path or a
+bound missing) or an incomplete trace, and the command prints it with the word
+`BELOW THE MEASURE`. The report prints the margin of the tightest entry as the
+calibration margin.
+
+### How to run
+
+```
+cargo xtask wcet bound [--from OUT-DIR] [--out DIR] [--annotations FILE]
+```
+
+Without `--from` the command runs the kernel tests of the icount build under
+the plugin (about a minute with the build), then analyses
+`target/stafeto-ktest-icount.elf`. The traces and the lines of the tests stay
+in `target/<out>/bound-traces` and `target/<out>/measured`, and `--from` reads
+them again, which is what to use while editing the annotations (a few seconds).
+The report is `target/<out>/bound.txt`: the table of estimates and measures,
+the loops without a bound (each with its address, its size and the constants
+it compares against), the calls through a register that nothing resolves, the
+recursion, the loops with several ways in, the loops on the analysed paths with
+their bounds, the bounds that no loop matched, and the longest functions.
+
+The kernel group of `ci` runs it as the step `wcet bound`. The step prints the
+table. It fails when the analysis breaks (an annotation names no function, a
+call of the kernel has no `[[call]]` entry, the file does not parse) and never
+on a number: an estimate below a measure, or a loop without a bound, is printed
+and leaves the step green.
+
+### The annotation file
+
+tools/wcet/bounds.toml holds one table for each kind of fact, each with a
+reason (`why`):
+
+| Table | What it says |
+| --- | --- |
+| `[calibration]` | `counter_read`: instructions added to every estimate |
+| `[dispatch]` | the function of the system call dispatch, and the one it restarts a long call in |
+| `[[call]]` | a call by its `abi::Call` name, the functions that carry it out, `long` for a call that works in portions, `portions` for the test rows that measure it |
+| `[[path]]` | a path no call starts (symbol, test rows that measure it) |
+| `[[loop]]` | `function`, `at` (the offset of the header block from the function's start, or `*` for every loop of it), `bound` |
+| `[atomic]` | the bound of a loop that is no more than a lock word's protocol or a compare-and-swap retry (at most six blocks, no call) |
+| `[[free]]` | a prefix of function names priced at nothing: code of the test builds, the way out of the kernel |
+| `[[copy]]` | the size of the copies of a function whose call sites set no constant |
+| `[[indirect]]` | the targets of a call through a register, by the offset of the instruction |
+| `[[noreturn]]`, `[[unreachable]]` | a function that never returns, a block that cannot run |
+
+A loop on an analysed path with no bound is named in the report with the
+constants it compares against and the functions it calls, which is the hint for
+the bound. A bound that matches no loop is named too: after an edit of the
+kernel the offsets move, and the report shows which annotations to renew.
+
+### Limits
+
+- Calls and jumps through a register are followed only where an annotation
+  names the targets or the pattern of a `match` is read from the image. Other
+  ones (the calls of `dyn` traits) are listed and count nothing; their
+  functions are the formatting of panics, which are no paths of the analysis.
+- A table that the pattern does not match gives no targets: the `br` is listed.
+  A table is read up to the next table of the function or to the first entry
+  that is no instruction of the function.
+- Recursion is listed, and the second call of the cycle counts nothing. Once
+  `dispatch` has been entered by `go_on` for another call, the nested call is
+  an entry of its own, priced at nothing for the restart.
+- A bound of a loop is a reading of the code with a reason, and the tool
+  checks it against the tests only through the estimates: a bound that is too
+  small shows as an estimate below a measure when a test reaches it.
+- The analysis reads the first image of the icount build. The second image
+  holds the EL0 tests with the same kernel code, and its measures count in the
+  comparison.
+- The paths of the interrupt and of the cleanup portion reach the loops over
+  the queues of commands (`RING` = 1024 entries a queue) and the stages of the
+  teardown. Their bounds multiply along the nesting, so these estimates are far
+  above the tests.
+- Time is the number of instructions. Memory, cache and lock waits of other
+  CPUs add to it; B_N = B + (N - 1) * OBJ_HOLD_MAX (docs/smp.md) adds the holds
+  of the others.

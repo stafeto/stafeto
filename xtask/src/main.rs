@@ -1136,7 +1136,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 253;
+const INIT_TESTS: u32 = 255;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -8671,6 +8671,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         let r = qemu::parse_report(&o.lines);
         qemu::counted_verdict(&o, &r, None)?;
         qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
+        wcet::note_run(&a.elf, &o.lines);
         lines.extend(o.lines);
         passed.extend(r.passed);
     }

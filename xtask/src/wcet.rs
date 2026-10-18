@@ -15,6 +15,8 @@ use std::process::Command;
 
 use crate::{KERNEL_TARGET, cargo, jobs, llvm_tool, root, run_cmd, target_dir};
 
+mod bound;
+
 /// The entry paths of the kernel, by the symbol each one starts at: the
 /// system calls, every entry from EL0 (which ends in the scheduler's
 /// `resume` and so handles the interrupts), the exceptions of the kernel
@@ -35,9 +37,18 @@ const ENTRIES: [(&str, &str); 7] = [
 ];
 
 /// The probes of `wcet coverage` that the kernel group of `ci` does not
-/// run already: the steps of the process service and the two that run
-/// under `-icount` with a service.
-const EXTRA_PROBES: [&str; 3] = ["process-steps", "entropy", "rtbench-short"];
+/// run already: the steps of the process service, the two that run under
+/// `-icount` with a service, the tests of the test init (the guest probes),
+/// and the kernel tests of the icount build (the
+/// test kernel and the one with the EL0 tests are images of their own).
+const EXTRA_PROBES: [&str; 6] = [
+    "process-steps",
+    "entropy",
+    "rtbench-short",
+    "init tests 512M",
+    "init tests 512M icount",
+    "kernel tests icount",
+];
 
 // ---- the disassembly ----
 
@@ -118,6 +129,42 @@ struct Image {
     /// function lands at, as a veneer of an erratum workaround does when
     /// it jumps back; each begins a block.
     landings: Vec<BTreeSet<u64>>,
+    /// The bytes of the sections that load: address and contents, for the
+    /// tables of a `match` that the code jumps through.
+    sections: Vec<(u64, Vec<u8>)>,
+}
+
+/// The sections of a 64-bit little-endian ELF file that take memory and have
+/// contents (`SHF_ALLOC`, not `SHT_NOBITS`).
+fn load_sections(elf: &Path) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+    let bad = || format!("{}: not a 64-bit ELF file", elf.display());
+    let at = |o: usize, n: usize| -> Result<u64, String> {
+        let b = bytes.get(o..o + n).ok_or_else(bad)?;
+        Ok(b.iter().rev().fold(0u64, |a, &x| a << 8 | u64::from(x)))
+    };
+    if bytes.get(..4) != Some(b"\x7fELF") || bytes.get(4) != Some(&2) {
+        return Err(bad());
+    }
+    let (shoff, shentsize, shnum) = (
+        at(0x28, 8)? as usize,
+        at(0x3a, 2)? as usize,
+        at(0x3c, 2)? as usize,
+    );
+    let mut sections = Vec::new();
+    for i in 0..shnum {
+        let h = shoff + i * shentsize;
+        let (kind, flags) = (at(h + 4, 4)?, at(h + 8, 8)?);
+        let (addr, off, size) = (
+            at(h + 16, 8)?,
+            at(h + 24, 8)? as usize,
+            at(h + 32, 8)? as usize,
+        );
+        if flags & 2 != 0 && kind != 8 && size > 0 {
+            sections.push((addr, bytes.get(off..off + size).ok_or_else(bad)?.to_vec()));
+        }
+    }
+    Ok(sections)
 }
 
 fn parse_hex(text: &str) -> Option<u64> {
@@ -187,6 +234,7 @@ impl Image {
         let mut image = Image {
             landings: vec![BTreeSet::new(); functions.len()],
             functions,
+            sections: Vec::new(),
         };
         for (f, function) in image.functions.iter().enumerate() {
             for insn in &function.insns {
@@ -212,7 +260,18 @@ impl Image {
         if !out.status.success() {
             return Err(format!("llvm-objdump {} failed", elf.display()));
         }
-        Image::parse(&String::from_utf8_lossy(&out.stdout))
+        let mut image = Image::parse(&String::from_utf8_lossy(&out.stdout))?;
+        image.sections = load_sections(elf)?;
+        Ok(image)
+    }
+
+    /// `len` bytes at `addr` in the sections that load.
+    fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let (base, bytes) = self.sections.iter().find(|(base, bytes)| {
+            *base <= addr && addr + len as u64 <= *base + bytes.len() as u64
+        })?;
+        let at = (addr - base) as usize;
+        bytes.get(at..at + len)
     }
 
     fn by_name(&self, name: &str) -> Option<usize> {
@@ -396,22 +455,45 @@ fn build_plugin() -> Result<PathBuf, String> {
     Ok(so)
 }
 
-/// The traces of one run of a probe: the blocks that ran, each once.
-fn read_trace(text: &str, covered: &mut HashSet<u64>) {
+/// A block of the traces: the instructions of its translation block and how
+/// many times it ran (to within a factor of two when the run ended by a kill).
+#[derive(Clone, Copy, Default)]
+struct Ran {
+    insns: u64,
+    count: u64,
+}
+
+/// The traces of one run of a probe: the blocks that ran, each once, and for
+/// each block that began at an address the longest it was and the most times
+/// it ran.
+fn read_trace(text: &str, covered: &mut HashSet<u64>, blocks: &mut BTreeMap<u64, Ran>) {
     for line in text.lines() {
-        let Some((start, n)) = line.split_once(' ') else {
+        let mut fields = line.split_whitespace();
+        let (Some(start), Some(n)) = (fields.next(), fields.next()) else {
             continue;
         };
-        let (Some(start), Ok(n)) = (parse_hex(start), n.trim().parse::<u64>()) else {
+        let (Some(start), Ok(n)) = (parse_hex(start), n.parse::<u64>()) else {
             continue;
         };
+        let count = fields
+            .next()
+            .and_then(|c| c.parse::<u64>().ok())
+            .unwrap_or(1);
         covered.extend((0..n).map(|i| start + 4 * i));
+        let ran = blocks.entry(start).or_default();
+        ran.insns = ran.insns.max(n);
+        ran.count = ran.count.max(count);
     }
 }
 
 /// What the traces of a kernel hold: the addresses of the instructions
-/// that ran and the probes that ran it.
-type Traced = (HashSet<u64>, BTreeSet<String>);
+/// that ran, the blocks with their counts and the probes that ran it.
+#[derive(Default)]
+struct Traced {
+    covered: HashSet<u64>,
+    blocks: BTreeMap<u64, Ran>,
+    probes: BTreeSet<String>,
+}
 
 /// The executed instruction addresses of every kernel under `dir`: the
 /// traces of the probes not in `skip`, by the stem of the kernel's file,
@@ -438,8 +520,8 @@ fn read_traces(dir: &Path, skip: &[String]) -> Result<BTreeMap<String, Traced>, 
             let text = std::fs::read_to_string(file.path())
                 .map_err(|e| format!("{}: {e}", file.path().display()))?;
             let entry = kernels.entry(kernel).or_default();
-            read_trace(&text, &mut entry.0);
-            entry.1.insert(label.clone());
+            read_trace(&text, &mut entry.covered, &mut entry.blocks);
+            entry.probes.insert(label.clone());
         }
     }
     Ok(kernels)
@@ -556,6 +638,10 @@ fn probes(skip: &[String], all: bool, traces: &Path) -> Vec<jobs::Job> {
     list.push(jobs::job("process-steps", || {
         crate::process_steps(&crate::qemu::VIRT_2G, 7)
     }));
+    list.push(jobs::job("kernel tests icount", || {
+        let machine = crate::qemu::machine(Some(&"512M".to_owned()))?;
+        crate::kernel_tests(machine, crate::Variant::TestIcount).map(|_| ())
+    }));
     list.into_iter()
         .filter(|j| {
             (all || wanted.iter().any(|w| w == j.name())) && !skip.iter().any(|s| s == j.name())
@@ -632,6 +718,7 @@ fn coverage(args: &[String]) -> Result<(), String> {
                 return Err("no probe to run".to_owned());
             }
             // A failed probe leaves its trace and does not stop the others.
+            jobs::keep_going(true);
             let ran = jobs::run_all(list, o.jobs);
             if let Err(e) = &ran {
                 println!("== a probe failed, its trace is kept: {e}");
@@ -649,14 +736,14 @@ fn report_coverage(traces: &Path, skip: &[String], out: &Path) -> Result<(), Str
     }
     let mut summary = String::new();
     let mut full = String::new();
-    for (kernel, (covered, probes)) in &kernels {
+    for (kernel, traced) in &kernels {
         let elf = target_dir().join(format!("{kernel}.elf"));
         if !elf.is_file() {
             println!("no {}: the traces of {kernel} are not used", elf.display());
             continue;
         }
         let image = Image::load(&elf)?;
-        let (s, f) = coverage_report(kernel, probes, &image, covered);
+        let (s, f) = coverage_report(kernel, &traced.probes, &image, &traced.covered);
         summary += &s;
         full += &f;
         full.push('\n');
@@ -690,7 +777,10 @@ pub fn smoke() -> Result<(), String> {
     TRACING.with(|t| *t.borrow_mut() = None);
     result?;
     let kernels = read_traces(&dir, &[])?;
-    let (covered, _) = kernels.get("stafeto").ok_or("the plugin wrote no trace")?;
+    let covered = &kernels
+        .get("stafeto")
+        .ok_or("the plugin wrote no trace")?
+        .covered;
     let image = Image::load(&target_dir().join("stafeto.elf"))?;
     let main = image.by_name("kernel_main").ok_or("no kernel_main")?;
     if !covered.contains(&image.functions[main].start) {
@@ -1009,11 +1099,14 @@ fn stack(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub use bound::note_run;
+
 pub fn run(args: &[String]) -> Result<(), String> {
     match args {
         [cmd, rest @ ..] if cmd == "coverage" => coverage(rest),
         [cmd, rest @ ..] if cmd == "stack" => stack(rest),
-        _ => Err("usage: cargo xtask wcet coverage|stack".to_owned()),
+        [cmd, rest @ ..] if cmd == "bound" => bound::run(rest),
+        _ => Err("usage: cargo xtask wcet coverage|stack|bound".to_owned()),
     }
 }
 
@@ -1067,7 +1160,13 @@ ffffffffc0000030:      \tret
     #[test]
     fn the_trace_of_a_run_covers_the_instructions_of_its_blocks() {
         let mut covered = HashSet::new();
-        read_trace("ffffffffc0000000 1\nffffffffc000000c 1\n", &mut covered);
+        let mut blocks = BTreeMap::new();
+        read_trace(
+            "ffffffffc0000000 1\nffffffffc000000c 1 4\nffffffffc000000c 1 2\n",
+            &mut covered,
+            &mut blocks,
+        );
+        assert_eq!(blocks[&0xffffffffc000000c].count, 4);
         assert!(covered.contains(&0xffffffffc000000c));
         assert!(!covered.contains(&0xffffffffc0000004));
         let image = Image::parse(LISTING).unwrap();

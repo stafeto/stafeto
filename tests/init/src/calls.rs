@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 41] = [
+pub(crate) const TESTS: [Test; 42] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -38,6 +38,10 @@ pub(crate) const TESTS: [Test; 41] = [
     (
         "thread_set_priority_checks_its_arguments",
         thread_set_priority_checks_its_arguments,
+    ),
+    (
+        "set_priority_moves_a_waiting_thread",
+        set_priority_moves_a_waiting_thread,
     ),
     (
         "thread_create_checks_its_arguments",
@@ -937,6 +941,36 @@ fn start_and_kill_cases(c: &Handle<Process>, t: &Handle<Thread>) -> Outcome {
     check(
         killed.is_ok() && late,
         "a stopped thread of a process that ended did not fail with BAD_STATE alone",
+    )
+}
+
+/// A new priority for a thread that waits in receive moves its slot in the
+/// queue of the channel (spec 6.1, 6.3): two receivers wait, one is raised
+/// above the other, lowered again and put behind it with the tail policy, and
+/// the other changes its policy; then an empty request ends each of them, and
+/// a new priority for one that ended fails with BAD_STATE.
+fn set_priority_moves_a_waiting_thread() -> Outcome {
+    let s = channel(QUIET)?;
+    let a = spawn(0, echo_until_empty, s.raw().0, LOW, Policy::Fifo)?;
+    let b = spawn(1, echo_until_empty, s.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let moved = [HIGH, LEVEL, LOW]
+        .iter()
+        .all(|&p| sys::thread_set_priority(&a, p, Policy::Fifo).is_ok())
+        && sys::thread_set_priority_tail(&b, LEVEL, Policy::Fifo).is_ok()
+        && sys::thread_set_priority(&b, HIGH, Policy::RoundRobin).is_ok();
+    let stopped = sys::send(&s, &[]).is_ok() && sys::send(&s, &[]).is_ok();
+    let_run()?;
+    let ended = sys::thread_set_priority(&a, LOW, Policy::Fifo) == Err(Error::BadState)
+        && sys::thread_set_priority(&b, LOW, Policy::Fifo) == Err(Error::BadState);
+    close(a)?;
+    close(b)?;
+    close(s)?;
+    check(moved, "a new priority for a waiting thread failed")?;
+    check(stopped, "an empty request did not end a waiting thread")?;
+    check(
+        ended,
+        "a new priority for a thread that ended did not fail with BAD_STATE",
     )
 }
 

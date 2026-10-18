@@ -376,6 +376,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         &BOOT_NEEDS,
         super::wcet::smoke,
     ));
+    // Prints the computed bound against the measure of each call; it fails
+    // only when the analysis itself breaks (an annotation names no function,
+    // a call has no entry), and never on a number.
+    steps.push(step("kernel", "wcet bound", &BOOT_NEEDS, || {
+        super::wcet::run(&["bound".to_owned()])
+    }));
     steps.push(step(
         "kernel",
         "measures",

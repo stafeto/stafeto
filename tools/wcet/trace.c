@@ -2,9 +2,13 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 // QEMU TCG plugin: the translation blocks of the kernel that ran. The
-// first execution of a block appends one line "<start> <instructions>"
-// (hexadecimal address, decimal count) to "<prefix>.<pid>.trace". The line
-// is written at once, so the file is whole when the run ends by a kill.
+// first execution of a block appends one line "<start> <instructions>
+// <executions>" (hexadecimal address, decimal counts) to
+// "<prefix>.<pid>.trace", and so does every execution whose number is a
+// power of two; the last line of a block holds its count to within a factor
+// of two. Each line is written at once, so the file is whole when the run
+// ends by a kill. Under -icount the instructions of a block times its
+// executions is the count of instructions the block cost the run.
 // Only addresses in the upper half of the address space are kept: the
 // kernel is linked there (kernel/kernel.ld), and the boot code that runs
 // before the MMU is on is not part of any entry path.
@@ -26,7 +30,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 struct block {
     uint64_t start;
     unsigned insns;
-    int seen;
+    uint64_t count;
 };
 
 static int out_fd = -1;
@@ -34,12 +38,14 @@ static int out_fd = -1;
 static void executed(unsigned int vcpu, void *data)
 {
     struct block *b = data;
-    if (__atomic_exchange_n(&b->seen, 1, __ATOMIC_RELAXED)) {
+    uint64_t count = __atomic_add_fetch(&b->count, 1, __ATOMIC_RELAXED);
+    if (count & (count - 1)) {
         return;
     }
-    char line[48];
-    int n = snprintf(line, sizeof line, "%llx %u\n",
-                     (unsigned long long)b->start, b->insns);
+    char line[80];
+    int n = snprintf(line, sizeof line, "%llx %u %llu\n",
+                     (unsigned long long)b->start, b->insns,
+                     (unsigned long long)count);
     if (write(out_fd, line, n) < 0) {
         return;
     }
