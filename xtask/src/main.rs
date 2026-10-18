@@ -7427,19 +7427,17 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             init_tests_on(&qemu::VIRT_EL2_V3, false, SMP_CPUS).map(drop)
         }),
         // Guests that run on several CPUs at once, on four beside their runs
-        // on one: the POSIX processes (fork, exec, signals, the times of a
-        // child), the threads of relibc, the locks of the layer and the RAM
+        // on one: the threads of relibc, the locks of the layer and the RAM
         // file system. Not here, each for its reason (docs/smp.md): the
         // probes of the shell and of the services whose watchdogs a boot
         // that TCG makes slow on four CPUs (the invalidations of the TLB
-        // reach every CPU, each one stops them all) overruns; posix-threads,
+        // reach every CPU, each one stops them all) overruns; posix-procs,
+        // which takes 60 s on the runners of ci with four CPUs, its limit;
+        // posix-threads,
         // whose 2 x 10^5 handoffs outrun the limit on TCG with CPUs beyond
         // one; the kernel tests, whose harness runs the code of the tests
         // on CPU 0 with the others outside the scheduler, and waits for
         // them at the first retired ASID.
-        job("posix-procs smp 4", || {
-            qemu::on_cpus(SMP_CPUS, || posix_procs_probe(&qemu::VIRT))
-        }),
         job("relibc-threads smp 4", || {
             qemu::on_cpus(SMP_CPUS, || relibc_threads_probe(&qemu::VIRT))
         }),

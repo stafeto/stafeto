@@ -181,7 +181,6 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("smp 4 EL2 GICv3", 2),
     ("smp 4 CPU_ON refused", 2),
     ("smp 4 window", 2),
-    ("posix-procs smp 4", 50),
     ("relibc-threads smp 4", 15),
     ("posix-sync smp 4", 6),
     ("posix-lock-core smp 4", 10),

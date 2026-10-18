@@ -977,6 +977,8 @@ const SERVICE_LEVEL: u8 = 15;
 
 /// The thread the raiser of the boost test raises.
 static RAISED_CLIENT: AtomicU64 = AtomicU64::new(0);
+static RAISES: AtomicU64 = AtomicU64::new(0);
+static RAISES_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Raises and lowers the client of the boost test by one level until the
 /// client is released (MARKS[1]), which the kernel built with `window-probe`
@@ -991,7 +993,10 @@ extern "C" fn raise_and_lower(_: u64) -> ! {
     while MARKS[1].load(Relaxed) == 0 && now() < limit {
         level = if level == RAISED { RAISED + 1 } else { RAISED };
         // Fails once the client was released and ended.
-        let _ = sys::thread_set_priority(&client, level, Policy::Fifo);
+        RAISES.fetch_add(1, Relaxed);
+        if sys::thread_set_priority(&client, level, Policy::Fifo).is_err() {
+            RAISES_FAILED.fetch_add(1, Relaxed);
+        }
         pause(500_000);
     }
     MARKS[2].store(1, Relaxed);
@@ -1045,6 +1050,11 @@ fn boost_of_a_service_that_ended() -> Outcome {
         state == Ok(ProcessState::Killed),
         "the process of the service did not end killed",
     )?;
+    println!(
+        "smp window  the raiser made {} requests, {} of them failed",
+        RAISES.load(Relaxed),
+        RAISES_FAILED.load(Relaxed)
+    );
     // The kernel built with `window-probe` notes the boost it left alone in
     // the ring of the CPU that met it, and the driver of the UART shows that
     // ring when it can, which on a busy host is after the run ended: the

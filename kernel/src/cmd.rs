@@ -494,6 +494,7 @@ pub mod window {
         if flags & EXIT == 0 || !is_service(t) || TAKEN.swap(true, Ordering::Relaxed) {
             return;
         }
+        kprintln!("smp window  the end of a service is held for 150 ms");
         let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 3 / 20;
         while crate::arch::timer::now() < until {
             core::hint::spin_loop();
