@@ -1634,9 +1634,10 @@ fn check_rollover(first: u64, second: u64) -> Result<(), &'static str> {
     let start = aspace::asid_generation();
     aspace::use_up_asids();
     a.activate();
+    let first_asid = a.asid();
     check(
-        aspace::asid_generation() == start + 1 && a.asid() == Some(1),
-        "running out of ASIDs did not begin a new generation at ASID 1",
+        aspace::asid_generation() == start + 1 && first_asid.is_some_and(|asid| asid != 0),
+        "running out of ASIDs did not begin a new generation",
     )?;
     check(
         read_user(USER_VA) == 0xA1,
@@ -1645,8 +1646,8 @@ fn check_rollover(first: u64, second: u64) -> Result<(), &'static str> {
     aspace::use_up_asids();
     b.activate();
     check(
-        aspace::asid_generation() == start + 2 && b.asid() == Some(1),
-        "the second rollover did not hand out ASID 1 again",
+        aspace::asid_generation() == start + 2 && b.asid() == first_asid,
+        "the second rollover did not hand out the first ASID again",
     )?;
     check(
         read_user(USER_VA) == 0xB2,
@@ -1658,7 +1659,7 @@ fn check_rollover(first: u64, second: u64) -> Result<(), &'static str> {
     )?;
     a.activate();
     check(
-        a.asid().is_some_and(|asid| asid > 1),
+        a.asid().is_some_and(|asid| Some(asid) != first_asid),
         "the old space did not get a new ASID",
     )?;
     check(

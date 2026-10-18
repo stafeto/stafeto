@@ -849,6 +849,7 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
 /// Nothing to do: sleeps in `wfi` with interrupts masked until one is
 /// pending, and handles it; the time asleep counts for KSTATS.
 fn sleep() {
+    crate::mm::aspace::leave();
     crate::testpoint::idle();
     let slept = timer::now();
     crate::qsbr::idle();

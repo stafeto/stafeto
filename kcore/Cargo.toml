@@ -15,3 +15,5 @@ abi = { path = "../lib/abi" }
 
 [features]
 atomic-locks = []
+# ASIDs 4 bits wide, for the probe build of the kernel (feature asid-probe).
+narrow-asid = []

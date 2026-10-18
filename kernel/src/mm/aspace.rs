@@ -21,12 +21,17 @@ use crate::obj::Guarded;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
-use kcore::asid::{self, AsidAllocator, AsidTag};
+use kcore::asid::{self, AsidAllocator, AsidCpus, AsidTag};
 use kcore::layout::image_pa;
 use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK, TableMemory};
 use kcore::quota::Account;
 use kcore::tlb::{self, Mmu};
 
+/// The ASIDs, in two parts (kcore::asid): what the CPUs share without a
+/// lock, which the switch of address space on its fast path reads and
+/// writes with a compare-and-swap, and what `OBJ` guards, which a new
+/// ASID, a new generation or the release of an ASID changes.
+static CPUS: AsidCpus = AsidCpus::new();
 static ASIDS: Guarded<Option<AsidAllocator>> = Guarded::new(None);
 
 /// Physical address of head.S's empty root table; zero until `init`.
@@ -39,8 +44,36 @@ pub fn init(boot: &Boot) {
         image_pa(boot.kernel_pa, symbols::empty_table()),
         Ordering::Relaxed,
     );
-    let bits = asid::asid_bits(registers::id_aa64mmfr0_el1());
+    // The probe build squeezes the ASID to 4 bits, so that a new generation
+    // begins every dozen switches of address space (xtask smp-asid).
+    let bits = if cfg!(feature = "asid-probe") {
+        4
+    } else {
+        asid::asid_bits(registers::id_aa64mmfr0_el1())
+    };
     *ASIDS.lock() = Some(AsidAllocator::new(bits));
+}
+
+/// Points TTBR0 of this CPU at the empty table with ASID 0 when it holds a
+/// space, as a CPU does that has nothing to run. Another CPU may retire the
+/// space meanwhile (`AddressSpace::retire` takes only its own CPU's TTBR0
+/// off the tables): a walk through the tables of a space that went would
+/// fill this CPU's TLB with entries under an ASID that is issued again.
+pub fn leave() {
+    let empty = empty_root();
+    if registers::ttbr0_el1() & TTBR_ROOT_MASK != empty {
+        // SAFETY: the empty table maps nothing.
+        unsafe { mmu::set_ttbr0(asid::ttbr0(empty, 0)) };
+    }
+}
+
+/// Zeroes the map of a new generation, 8 KiB, by cache blocks (`dc zva`,
+/// [G12]): a few hundred instructions where a loop of stores takes thousands.
+fn zero_map(words: &mut [u64]) {
+    let start = words.as_mut_ptr() as usize;
+    // SAFETY: the words are the allocator's own, which the caller holds
+    // under `OBJ`.
+    unsafe { super::phys::zero_range(start, start + core::mem::size_of_val(words)) };
 }
 
 fn with_asids<R>(f: impl FnOnce(&mut AsidAllocator) -> R) -> R {
@@ -293,7 +326,7 @@ impl AddressSpace {
                     .expect("a page of a whole mapping is mapped");
             }
         });
-        with_asids(|a| tlb::forget_range(a, &self.tag, va, pages, &mut Cpu));
+        tlb::forget_range(&self.tag, va, pages, &mut Cpu);
     }
 
     /// Gives the `pages` pages from `va`, each of which a page maps, the
@@ -308,7 +341,7 @@ impl AddressSpace {
                     .expect("a page of a whole mapping is mapped");
             }
         });
-        with_asids(|a| tlb::forget_range(a, &self.tag, va, pages, &mut Cpu));
+        tlb::forget_range(&self.tag, va, pages, &mut Cpu);
     }
 
     /// Unmaps the page at `va`, drops its TLB entry and returns the frame
@@ -317,7 +350,7 @@ impl AddressSpace {
     /// (kcore::tlb::forget_range): the frame may go elsewhere right after.
     pub fn unmap(&mut self, va: usize) -> Result<u64, MapError> {
         let pa = with_tables(|mem| self.tables.unmap_page(mem, va as u64))?;
-        with_asids(|a| tlb::forget_range(a, &self.tag, va as u64, 1, &mut Cpu));
+        tlb::forget_range(&self.tag, va as u64, 1, &mut Cpu);
         Ok(pa)
     }
 
@@ -326,29 +359,27 @@ impl AddressSpace {
         with_tables(|mem| self.tables.translate(mem, va as u64))
     }
 
-    /// Whether TTBR0 holds this space's tables. The space in TTBR0 always
-    /// has an ASID of this generation: a new generation begins only in the
-    /// `activate` of another space, which then takes TTBR0.
+    /// Whether TTBR0 holds this space's tables.
     pub fn is_active(&self) -> bool {
         registers::ttbr0_el1() & TTBR_ROOT_MASK == self.tables.root()
     }
 
     /// Switches TTBR0 to this space, with a new ASID when its old one is of
-    /// an earlier generation (kcore::tlb::switch_to). A new generation
-    /// reuses the ASIDs that spaces on other CPUs run with, which takes the
-    /// agreement of every CPU on the flush (SMP stage 5): with more than one
-    /// CPU up, the kernel stops instead, at the first space that finds no
-    /// ASID of this generation and none free.
+    /// an earlier generation that no CPU kept (kcore::tlb::switch_fast and
+    /// `switch_slow`). A space that ran on this CPU lately, in this
+    /// generation, switches with one compare-and-swap and no lock. The
+    /// slow path takes `OBJ` for a hold of its own length: a new generation
+    /// only raises the counter, reserves what the CPUs run and zeroes the
+    /// map by cache blocks, and each CPU flushes its TLB at its own next
+    /// slow switch.
     pub fn activate(&mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
-        with_asids(|a| {
-            assert!(
-                crate::smp::cpus() < 2 || a.current(&self.tag).is_some() || a.free_asids() > 0,
-                "the ASIDs of a generation ran out with more than one CPU up: \
-                 a new generation needs the flush of every CPU (SMP stage 5)"
-            );
-            tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu)
-        });
+        let cpu = crate::arch::cpu::this().index();
+        if tlb::switch_fast(&CPUS, cpu, &self.tag, root, &mut Cpu) {
+            return;
+        }
+        crate::obj::serving(crate::obj::ENTRY_ASID);
+        with_asids(|a| tlb::switch_slow(a, &CPUS, cpu, &self.tag, root, empty, &mut Cpu, zero_map));
     }
 
     /// Takes TTBR0 off the tables and drops their TLB entries with the
@@ -361,7 +392,7 @@ impl AddressSpace {
         // nothing to drop.
         let mut space = ManuallyDrop::new(self);
         let (root, empty) = (space.tables.root(), empty_root());
-        with_asids(|a| tlb::retire(a, &mut space.tag, root, empty, &mut Cpu));
+        with_asids(|a| tlb::retire(a, &CPUS, &mut space.tag, root, empty, &mut Cpu));
         // SAFETY: the space is never dropped or used again, so the tables
         // pass to the release, the only value that names them from now on.
         let tables = unsafe { core::ptr::read(&space.tables) };
@@ -433,7 +464,7 @@ mod test_access {
     impl AddressSpace {
         /// The space's ASID, when it has one of this generation.
         pub fn asid(&self) -> Option<u16> {
-            with_asids(|a| a.current(&self.tag))
+            CPUS.current(&self.tag)
         }
     }
 
@@ -457,16 +488,20 @@ mod test_access {
     }
 
     pub fn asid_generation() -> u64 {
-        with_asids(|a| a.generation())
+        CPUS.generation()
     }
 
-    /// Takes every ASID still free in this generation, so that the next
-    /// activation of a space without one begins a new generation.
+    /// Takes every ASID still free in this generation, for a CPU that runs
+    /// nothing, so that the next activation of a space without one begins a
+    /// new generation.
     pub fn use_up_asids() {
+        let cpu = crate::arch::cpu::this().index();
         with_asids(|a| {
             for _ in 0..a.free_asids() {
-                let _ = a.activate(&mut AsidTag::default());
+                let _ = a.activate(&CPUS, cpu, &AsidTag::default(), zero_map);
             }
+            // Nothing the throw-away tags took stays with the CPU.
+            CPUS.forget_active(cpu);
         });
     }
 }

@@ -4815,13 +4815,8 @@ const OBJ_HOLD_MAX: u64 = 4_000;
 /// OBJ_HOLD_MAX: the call's own longest portion and the sections of the
 /// three CPUs ahead of it in the ticket lock. Decision of the stage 3
 /// review: `kernel_tests` fails B_4 above this bound from stage 4. The ASID
-/// rollover adds its own term until stage 5 (`OBJ_ASID_ROLLOVER_MAX`).
+/// section that begins a new generation is a section like the rest (stage 5).
 const B4_MAX: u64 = 32_000;
-/// The hold of the one section that makes a new generation of ASIDs, once
-/// in 65 535 switches of address space: it clears the table of ASIDs and
-/// flushes the TLB. The ASID rework of SMP stage 5 (#356) moves that out of
-/// OBJ; until then it has its own bound.
-const OBJ_ASID_ROLLOVER_MAX: u64 = 14_000;
 /// The room above the longest hold that `check_obj_hold` leaves before it
 /// asks to lower `OBJ_HOLD_MAX` (rule 4 of the guards), and what a lowered
 /// limit keeps above the measure.
@@ -8686,8 +8681,8 @@ fn obj_kind_name(kind: usize) -> String {
 
 /// The longest hold of OBJ per kind of section over the kernel tests of
 /// both images, from the lines `obj hold kind ticks: K=N`: the longest of
-/// them but the ASID rollover may not pass OBJ_HOLD_MAX, the rollover
-/// OBJ_ASID_ROLLOVER_MAX. Kind 0 is the code of a test and counts nowhere.
+/// them, the section of the ASIDs (kind 45) included, may not pass
+/// OBJ_HOLD_MAX. Kind 0 is the code of a test and counts nowhere.
 fn check_obj_hold(name: &str, lines: &[String]) -> Result<(), String> {
     const ASID: usize = 45;
     let mut longest = [0u64; 64];
@@ -8709,7 +8704,6 @@ fn check_obj_hold(name: &str, lines: &[String]) -> Result<(), String> {
     let (kind, held) = longest
         .iter()
         .enumerate()
-        .filter(|&(kind, _)| kind != ASID)
         .max_by_key(|&(_, &held)| held)
         .map(|(kind, &held)| (kind, held))
         .ok_or("the kernel printed no obj hold ticks")?;
@@ -8723,7 +8717,7 @@ fn check_obj_hold(name: &str, lines: &[String]) -> Result<(), String> {
     let over: Vec<String> = longest
         .iter()
         .enumerate()
-        .filter(|&(kind, &held)| kind != ASID && held > OBJ_HOLD_MAX)
+        .filter(|&(_, &held)| held > OBJ_HOLD_MAX)
         .map(|(kind, &held)| format!("{}={held}", obj_kind_name(kind)))
         .collect();
     if !over.is_empty() {
@@ -8732,16 +8726,10 @@ fn check_obj_hold(name: &str, lines: &[String]) -> Result<(), String> {
             over.join(", ")
         ));
     }
-    let rollover = longest[ASID];
     println!(
-        "OBJ hold of an ASID rollover on {name}: {rollover} of OBJ_ASID_ROLLOVER_MAX {OBJ_ASID_ROLLOVER_MAX}"
+        "OBJ hold of an ASID section on {name}: {} of OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+        longest[ASID]
     );
-    if rollover > OBJ_ASID_ROLLOVER_MAX {
-        return Err(format!(
-            "OBJ hold of an ASID rollover on {name}: {rollover} is {} past OBJ_ASID_ROLLOVER_MAX {OBJ_ASID_ROLLOVER_MAX}",
-            rollover - OBJ_ASID_ROLLOVER_MAX
-        ));
-    }
     if let Some(hint) = guard_lower_hint(
         "OBJ_HOLD_MAX",
         OBJ_HOLD_MAX - held,

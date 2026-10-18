@@ -8,7 +8,7 @@
 //! caches whatever the tables in TTBR0 map, at any moment, and a walker
 //! that may still read a cleared descriptor until a barrier.
 
-use crate::asid::{AsidAllocator, AsidTag, tlbi_asid, tlbi_page, ttbr0};
+use crate::asid::{AsidAllocator, AsidCpus, AsidTag, tlbi_asid, tlbi_page, ttbr0};
 use crate::paging::TTBR_ROOT_MASK;
 
 /// TTBR0 and the TLB of this CPU; the kernel implements them with MSR and
@@ -35,19 +35,42 @@ pub trait Mmu {
     fn user_pages_invalidated(&mut self);
 }
 
+/// Puts the tables rooted at `root` into TTBR0 with the ASID of `tag` when
+/// the switch needs no lock (`AsidCpus::fast`); false when it does
+/// (`switch_slow`).
+pub fn switch_fast(
+    cpus: &AsidCpus,
+    cpu: usize,
+    tag: &AsidTag,
+    root: u64,
+    mmu: &mut impl Mmu,
+) -> bool {
+    let Some(asid) = cpus.fast(cpu, tag) else {
+        return false;
+    };
+    mmu.set_ttbr0(ttbr0(root, asid));
+    true
+}
+
 /// Puts the tables rooted at `root` into TTBR0 with an ASID of this
-/// generation. A new generation flushes the TLB first, with TTBR0 on the
-/// empty table `empty`: otherwise a walk of the old tables between the
+/// generation, under the lock of the allocator. A CPU that owes a flush
+/// (a generation began since its last switch) flushes first, with TTBR0 on
+/// the empty table `empty`: otherwise a walk of the old tables between the
 /// flush and the new TTBR0 would bring their entries back under an ASID
-/// the new generation hands to another space.
-pub fn switch_to(
+/// the new generation hands to another space. `clear` empties the map of
+/// a new generation (`AsidAllocator::activate`).
+#[allow(clippy::too_many_arguments)]
+pub fn switch_slow(
     asids: &mut AsidAllocator,
-    tag: &mut AsidTag,
+    cpus: &AsidCpus,
+    cpu: usize,
+    tag: &AsidTag,
     root: u64,
     empty: u64,
     mmu: &mut impl Mmu,
+    clear: impl FnOnce(&mut [u64]),
 ) {
-    let act = asids.activate(tag);
+    let act = asids.activate(cpus, cpu, tag, clear);
     if act.flush_tlb {
         mmu.set_ttbr0(ttbr0(empty, 0));
         mmu.flush_all();
@@ -60,20 +83,17 @@ pub fn switch_to(
 /// rights (spec 7.4, 7.7), and makes the stores that changed their
 /// descriptors reach the table walker before this returns: one `dsb
 /// ishst` for the stores, a `tlbi vale1is` a page, and one `dsb ish` after
-/// the last, with no `isb` ([G13], [G15]). Without an ASID of this
-/// generation the TLB holds nothing of the space (the flush that began the
-/// generation dropped it), so only the barrier is left: the next
-/// activation may put the tables into TTBR0 with no barrier of its own.
-/// O(pages): the caller keeps `pages` within a portion (spec 7.7).
-pub fn forget_range(
-    asids: &AsidAllocator,
-    tag: &AsidTag,
-    start: u64,
-    pages: u64,
-    mmu: &mut impl Mmu,
-) {
+/// the last, with no `isb` ([G13], [G15]). The TLBIs reach every CPU, so
+/// a thread of the space on another CPU loses the entries too. They name
+/// the ASID the tag holds, of whichever generation: a CPU that ran the
+/// space when the generation ended keeps the entries under that number
+/// (`AsidAllocator::reserved`). A space that never ran has no entry
+/// anywhere, so only the barrier is left: the next activation may put the
+/// tables into TTBR0 with no barrier of its own. O(pages): the caller
+/// keeps `pages` within a portion (spec 7.7).
+pub fn forget_range(tag: &AsidTag, start: u64, pages: u64, mmu: &mut impl Mmu) {
     mmu.tables_written();
-    if let Some(asid) = asids.current(tag) {
+    if let Some(asid) = tag.asid() {
         for i in 0..pages {
             mmu.invalidate_user_page(tlbi_page(start + (i << 12), asid));
         }
@@ -81,11 +101,13 @@ pub fn forget_range(
     }
 }
 
-/// Makes the tables rooted at `root` safe to free: TTBR0 leaves them, and
-/// the TLB drops every entry of their ASID, which is free again afterwards.
-/// In this order, so that no walk brings the entries back in between.
+/// Makes the tables rooted at `root` safe to free: TTBR0 of this CPU
+/// leaves them, and the TLBs of every CPU drop each entry of their ASID,
+/// which is free again afterwards. In this order, so that no walk of this
+/// CPU brings the entries back in between.
 pub fn retire(
     asids: &mut AsidAllocator,
+    cpus: &AsidCpus,
     tag: &mut AsidTag,
     root: u64,
     empty: u64,
@@ -94,7 +116,7 @@ pub fn retire(
     if mmu.ttbr0() & TTBR_ROOT_MASK == root {
         mmu.set_ttbr0(ttbr0(empty, 0));
     }
-    if let Some(asid) = asids.release(tag) {
+    if let Some(asid) = asids.release(cpus, tag) {
         mmu.invalidate_asid(tlbi_asid(asid));
     }
 }
@@ -105,6 +127,48 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     const EMPTY: u64 = 0x4000_1000;
+
+    /// The ASIDs of the machine and the allocator, one CPU's view (CPU 0).
+    struct Asids {
+        cpus: AsidCpus,
+        alloc: AsidAllocator,
+    }
+
+    impl Asids {
+        fn new(bits: u32) -> Asids {
+            Asids {
+                cpus: AsidCpus::new(),
+                alloc: AsidAllocator::new(bits),
+            }
+        }
+        fn generation(&self) -> u64 {
+            self.cpus.generation()
+        }
+    }
+
+    /// The switch of CPU `cpu`: the fast path, then the slow one.
+    fn switch_on(
+        a: &mut Asids,
+        cpu: usize,
+        tag: &AsidTag,
+        root: u64,
+        empty: u64,
+        mmu: &mut impl Mmu,
+    ) {
+        if !switch_fast(&a.cpus, cpu, tag, root, mmu) {
+            switch_slow(&mut a.alloc, &a.cpus, cpu, tag, root, empty, mmu, |w| {
+                w.fill(0)
+            });
+        }
+    }
+
+    fn switch_to(a: &mut Asids, tag: &AsidTag, root: u64, empty: u64, mmu: &mut impl Mmu) {
+        switch_on(a, 0, tag, root, empty, mmu)
+    }
+
+    fn retire(a: &mut Asids, tag: &mut AsidTag, root: u64, empty: u64, mmu: &mut impl Mmu) {
+        super::retire(&mut a.alloc, &a.cpus, tag, root, empty, mmu)
+    }
     const PAGES: [u64; 3] = [0x40_0000, 0x40_1000, 0x80_0000];
 
     #[derive(Debug, PartialEq, Eq)]
@@ -151,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_new_generation_flushes_with_ttbr0_on_the_empty_table() {
-        let mut asids = AsidAllocator::new(8);
+        let mut asids = Asids::new(8);
         let mut log = Log::default();
         let mut tags: Vec<AsidTag> = (0..256).map(|_| AsidTag::default()).collect();
         for tag in &mut tags[..255] {
@@ -159,7 +223,7 @@ mod tests {
         }
         assert!(!log.ops.contains(&Op::FlushAll));
         log.ops.clear();
-        switch_to(&mut asids, &mut tags[255], 0x6000, EMPTY, &mut log);
+        switch_to(&mut asids, &tags[255], 0x6000, EMPTY, &mut log);
         assert_eq!(
             log.ops,
             [
@@ -172,11 +236,11 @@ mod tests {
 
     #[test]
     fn retire_leaves_the_tables_before_their_asid_goes() {
-        let mut asids = AsidAllocator::new(8);
+        let mut asids = Asids::new(8);
         let mut log = Log::default();
         let (mut running, mut other) = (AsidTag::default(), AsidTag::default());
-        switch_to(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
-        switch_to(&mut asids, &mut running, 0x6000, EMPTY, &mut log);
+        switch_to(&mut asids, &other, 0x5000, EMPTY, &mut log);
+        switch_to(&mut asids, &running, 0x6000, EMPTY, &mut log);
         log.ops.clear();
         retire(&mut asids, &mut running, 0x6000, EMPTY, &mut log);
         assert_eq!(
@@ -187,7 +251,7 @@ mod tests {
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
         assert_eq!(log.ops, [Op::InvalidateAsid(tlbi_asid(1))]);
         log.ops.clear();
-        forget_range(&asids, &other, PAGES[0], 1, &mut log);
+        forget_range(&other, PAGES[0], 1, &mut log);
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
         assert_eq!(
             log.ops,
@@ -202,12 +266,12 @@ mod tests {
     /// alone ([G13]).
     #[test]
     fn forget_range_ends_with_one_dsb_ish() {
-        let mut asids = AsidAllocator::new(8);
+        let mut asids = Asids::new(8);
         let mut log = Log::default();
-        let (mut ran, never_ran) = (AsidTag::default(), AsidTag::default());
-        switch_to(&mut asids, &mut ran, 0x5000, EMPTY, &mut log);
+        let (ran, never_ran) = (AsidTag::default(), AsidTag::default());
+        switch_to(&mut asids, &ran, 0x5000, EMPTY, &mut log);
         log.ops.clear();
-        forget_range(&asids, &ran, 0x40_0000, 3, &mut log);
+        forget_range(&ran, 0x40_0000, 3, &mut log);
         assert_eq!(
             log.ops,
             [
@@ -219,7 +283,7 @@ mod tests {
             ]
         );
         log.ops.clear();
-        forget_range(&asids, &never_ran, 0x40_0000, 3, &mut log);
+        forget_range(&never_ran, 0x40_0000, 3, &mut log);
         assert_eq!(log.ops, [Op::TablesWritten]);
     }
 
@@ -358,13 +422,13 @@ mod tests {
     /// not find the page.
     #[test]
     fn an_unmap_without_an_asid_reaches_the_walker_before_the_space_runs() {
-        let mut asids = AsidAllocator::new(8);
+        let mut asids = Asids::new(8);
         let mut m = Model::new();
         m.tables.insert(0x5000, (1, PAGES.into_iter().collect()));
-        let mut tag = AsidTag::default();
+        let tag = AsidTag::default();
         assert!(m.unmap(0x5000, PAGES[0]));
-        forget_range(&asids, &tag, PAGES[0], 1, &mut m);
-        switch_to(&mut asids, &mut tag, 0x5000, EMPTY, &mut m);
+        forget_range(&tag, PAGES[0], 1, &mut m);
+        switch_to(&mut asids, &tag, 0x5000, EMPTY, &mut m);
         m.check(0);
     }
 
@@ -380,7 +444,7 @@ mod tests {
     /// page it unmapped, and a space that went leaves nothing in the TLB.
     #[test]
     fn no_space_sees_what_it_should_not() {
-        let mut asids = AsidAllocator::new(8);
+        let mut asids = Asids::new(8);
         let mut m = Model::new();
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut ids = 0;
@@ -409,7 +473,7 @@ mod tests {
                 0 => {
                     let va = PAGES[(x >> 32) as usize % PAGES.len()];
                     if m.unmap(s.root, va) {
-                        forget_range(&asids, &s.tag, va, 1, &mut m);
+                        forget_range(&s.tag, va, 1, &mut m);
                         assert!(
                             m.stale.is_empty() && m.pending.is_empty(),
                             "step {step}: the walker or a TLBI may still keep page {va:#x} after forget_range"
@@ -421,7 +485,7 @@ mod tests {
                     // them are mapped.
                     let unmapped = [PAGES[0], PAGES[1]].map(|va| m.unmap(s.root, va));
                     if unmapped.contains(&true) {
-                        forget_range(&asids, &s.tag, PAGES[0], 2, &mut m);
+                        forget_range(&s.tag, PAGES[0], 2, &mut m);
                         assert!(
                             m.stale.is_empty() && m.pending.is_empty(),
                             "step {step}: the walker or a TLBI may still keep a page after forget_range"
@@ -442,7 +506,7 @@ mod tests {
                     m.stale.retain(|&(root, _)| root != s.root);
                     *s = new_space(&mut m, s.root, x >> 40);
                 }
-                _ => switch_to(&mut asids, &mut s.tag, s.root, EMPTY, &mut m),
+                _ => switch_to(&mut asids, &s.tag, s.root, EMPTY, &mut m),
             }
             m.check(step);
         }
@@ -464,7 +528,6 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn unmap_call(
         m: &mut Model,
-        asids: &AsidAllocator,
         tag: &AsidTag,
         maps: &mut crate::maps::Maps<u32>,
         refs: &mut u32,
@@ -496,7 +559,7 @@ mod tests {
             if last && early {
                 release(m, refs)?;
             }
-            forget_range(asids, tag, va, n, m);
+            forget_range(tag, va, n, m);
             if last && !early {
                 release(m, refs)?;
             }
@@ -512,13 +575,13 @@ mod tests {
     #[test]
     fn the_reference_goes_after_the_last_dsb_ish() {
         for early in [false, true] {
-            let mut asids = AsidAllocator::new(8);
+            let mut asids = Asids::new(8);
             let mut m = Model::new();
             let base = 0x40_0000;
             m.tables
                 .insert(0x5000, (1, (0..6).map(|i| base + (i << 12)).collect()));
-            let mut tag = AsidTag::default();
-            switch_to(&mut asids, &mut tag, 0x5000, EMPTY, &mut m);
+            let tag = AsidTag::default();
+            switch_to(&mut asids, &tag, 0x5000, EMPTY, &mut m);
             let mut maps = crate::maps::Maps::new();
             maps.insert(crate::maps::Mapping::new(
                 base,
@@ -533,9 +596,8 @@ mod tests {
             let mut outcome = Ok(());
             for (page, pages) in calls {
                 let args = (0x5000, base + (page << 12), pages);
-                outcome = outcome.and_then(|()| {
-                    unmap_call(&mut m, &asids, &tag, &mut maps, &mut refs, args, early)
-                });
+                outcome = outcome
+                    .and_then(|()| unmap_call(&mut m, &tag, &mut maps, &mut refs, args, early));
             }
             if early {
                 assert!(
@@ -547,5 +609,139 @@ mod tests {
                 assert_eq!((refs, maps.len()), (0, 0));
             }
         }
+    }
+
+    /// Four CPUs, each with its own TTBR0 and TLB; a TLBI by ASID reaches
+    /// every TLB, a flush its own. A CPU walks the tables in its TTBR0 at
+    /// any moment and keeps what it finds, as (ASID, space).
+    struct Multi {
+        ttbr0: [u64; 4],
+        tlb: [HashSet<(u16, u32)>; 4],
+        /// Root of live tables and the space they belong to.
+        spaces: HashMap<u64, u32>,
+    }
+
+    struct On<'a> {
+        m: &'a mut Multi,
+        cpu: usize,
+    }
+
+    impl Multi {
+        fn walk(&mut self) {
+            for c in 0..4 {
+                let root = self.ttbr0[c] & TTBR_ROOT_MASK;
+                if root == EMPTY {
+                    continue;
+                }
+                let space = *self
+                    .spaces
+                    .get(&root)
+                    .expect("a CPU holds tables that went back to the allocator");
+                self.tlb[c].insert(((self.ttbr0[c] >> 48) as u16, space));
+            }
+        }
+
+        /// What each CPU may use: an entry under the ASID in its TTBR0
+        /// belongs to the space in its TTBR0.
+        fn check(&self, step: usize) {
+            for c in 0..4 {
+                let root = self.ttbr0[c] & TTBR_ROOT_MASK;
+                let asid = (self.ttbr0[c] >> 48) as u16;
+                for &(a, space) in &self.tlb[c] {
+                    if a != asid || root == EMPTY {
+                        continue;
+                    }
+                    assert_eq!(
+                        space, self.spaces[&root],
+                        "step {step}: CPU {c} runs space {} and holds a page of space {space} under ASID {a}",
+                        self.spaces[&root]
+                    );
+                }
+            }
+        }
+    }
+
+    impl Mmu for On<'_> {
+        fn ttbr0(&self) -> u64 {
+            self.m.ttbr0[self.cpu]
+        }
+        fn set_ttbr0(&mut self, ttbr: u64) {
+            self.m.walk();
+            self.m.ttbr0[self.cpu] = ttbr;
+            self.m.walk();
+        }
+        fn flush_all(&mut self) {
+            self.m.walk();
+            self.m.tlb[self.cpu].clear();
+            self.m.walk();
+        }
+        fn invalidate_asid(&mut self, operand: u64) {
+            self.m.walk();
+            let asid = (operand >> 48) as u16;
+            for tlb in &mut self.m.tlb {
+                tlb.retain(|&(a, _)| a != asid);
+            }
+            self.m.walk();
+        }
+        fn tables_written(&mut self) {}
+        fn invalidate_user_page(&mut self, _: u64) {}
+        fn user_pages_invalidated(&mut self) {}
+    }
+
+    /// Spaces on four CPUs at once, 300 of them on 8-bit ASIDs: random
+    /// switches (a space may run on several CPUs), spaces that go (the
+    /// CPUs that still hold their tables leave them first, as an idle CPU
+    /// does) and are replaced on the same root. No CPU ever uses an entry
+    /// of another space under the ASID it runs with, across generations
+    /// that each CPU only learns of at its next switch.
+    #[test]
+    fn four_cpus_never_use_an_entry_of_another_space() {
+        let mut a = Asids::new(8);
+        let mut m = Multi {
+            ttbr0: [ttbr0(EMPTY, 0); 4],
+            tlb: Default::default(),
+            spaces: HashMap::new(),
+        };
+        let root = |i: u64| 0x1000_0000 + i * 0x1000;
+        let mut tags: Vec<AsidTag> = (0..300).map(|_| AsidTag::default()).collect();
+        for i in 0..300 {
+            m.spaces.insert(root(i), i as u32);
+        }
+        let mut next_id = 300;
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for step in 0..60_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let i = (x >> 8) as usize % 300;
+            let cpu = (x >> 24) as usize % 4;
+            match x % 16 {
+                0 => {
+                    // The space goes: every CPU leaves its tables, one
+                    // retires the space.
+                    for c in 0..4 {
+                        if m.ttbr0[c] & TTBR_ROOT_MASK == root(i as u64) {
+                            On { m: &mut m, cpu: c }.set_ttbr0(ttbr0(EMPTY, 0));
+                        }
+                    }
+                    let mut mmu = On { m: &mut m, cpu };
+                    retire(&mut a, &mut tags[i], root(i as u64), EMPTY, &mut mmu);
+                    m.spaces.insert(root(i as u64), next_id);
+                    next_id += 1;
+                }
+                1 => {
+                    // The CPU idles.
+                    On { m: &mut m, cpu }.set_ttbr0(ttbr0(EMPTY, 0));
+                }
+                _ => {
+                    if m.ttbr0[cpu] & TTBR_ROOT_MASK != root(i as u64) {
+                        let mut mmu = On { m: &mut m, cpu };
+                        switch_on(&mut a, cpu, &tags[i], root(i as u64), EMPTY, &mut mmu);
+                    }
+                }
+            }
+            m.check(step);
+        }
+        assert!(a.generation() > 10, "only {} generations", a.generation());
     }
 }

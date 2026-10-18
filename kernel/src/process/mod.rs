@@ -290,9 +290,8 @@ impl Process {
     pub fn activate(&mut self) {
         let space = self.space();
         if !space.is_active() {
-            // The ASIDs are shared (obj.rs); the way into EL0 holds no section.
-            crate::obj::serving(crate::obj::ENTRY_ASID);
-            let _section = crate::obj::lock();
+            // The fast path of the switch takes no lock; the slow one takes
+            // `OBJ` for the ASIDs itself (AddressSpace::activate).
             space.activate();
         }
     }
