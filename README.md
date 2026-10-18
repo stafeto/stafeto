@@ -46,7 +46,6 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) i
 - Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target.
 - Network: virtio-net, a TCP/IP stack and IPv4 sockets.
 - Packages and apps: a package format, signed packages, an app sandbox.
-- Phone shell: home screen, notifications, settings, a UI toolkit.
 
 ## Build from source
 
