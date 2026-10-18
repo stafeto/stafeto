@@ -37,8 +37,11 @@ to `target/dist/`.
 | `stafeto-<version>-sbom.spdx.json` | SPDX 2.3: name, version, licence, URL and SHA-256 of stafeto, relibc and every package |
 | `SHA256SUMS` | SHA-256 of every file above |
 
-The notes come from `tools/release-notes.py`: the pull requests merged since
-the previous `v*` tag and the Roadmap section of `README.md`.
+The notes come from `tools/release-notes.py`: the summary written for the
+version in `docs/releases/<version>.md` (a short introduction when there is
+none), the table of files and a link to the changes since the previous `v*`
+tag. Write the summary before tagging: what the release brings, how to try
+it, its limits.
 
 ## Versions
 
