@@ -27,7 +27,11 @@ bounded, and how to measure them.
 | `OBJ_HOLD_MAX` | 4 000 | longest hold of `OBJ`, instructions (icount) |
 | `B4_MAX` | 32 000 | B + 3 * `OBJ_HOLD_MAX` |
 | `S5_ICOUNT_MAX` | 3 063 | S5 on one CPU, instructions |
-| `S5X_HVF_MAX` | 294 / 101 (GICv3), 340 / 216 (GICv2) | median of S5x on HVF, ticks of 16 ns: target in WFI / behind a lower thread |
+| `S5X_HVF_MAX` | 294 / 101 (GICv3), 340 / 216 (GICv2) | median of S5x on HVF, ticks of 16 ns: target in WFI / behind a lower thread; the guard of a regression |
+
+`S5X_HVF_MAX` is the guard of a regression: it bounds the median, which a host
+that preempts a vCPU leaves alone. The real-time limit of S5x bounds the longest
+request, and the board (stage 7) gives it.
 
 B_N = B + (N - 1) * `OBJ_HOLD_MAX`, S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`; `cargo
 xtask kernel-test 512M icount` prints B_2, B_4, B_8 and fails B_4 above `B4_MAX`.
@@ -65,7 +69,13 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   acquire) and SB (dmb) for up to 10^6 rounds (on HVF the forbidden outcomes
   are 0, and SB without dmb shows both threads reading 0 in 9 rounds of 10)
   and a lock torture of 250 ms (some 850 000 calls on HVF).
-- `ci` runs the test init, `smp 4 window` and `smp 4 asid` on 4 CPUs, and six
+- `cargo xtask smp-window`: the test init on 4 CPUs with a kernel that holds
+  a thread at a chosen point (`window-probe`): a receive or a send holds after
+  its first look at a request for its entry, until another CPU makes the
+  request, and a receive holds between its two sections, until the head of
+  the queue moves. Then the kernels without the look under `OBJ` before a wait
+  and without the second look at the head, each of which must fail.
+- `ci` runs the test init, `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
   guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 

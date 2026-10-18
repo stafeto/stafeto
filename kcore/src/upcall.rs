@@ -82,7 +82,9 @@ pub struct State {
     far: u64,
     depth: u32,
     deferred: u32,
-    masked: bool,
+    /// The thread's own mask: only the CPU that runs the thread changes it,
+    /// and `request` of another CPU reads it under OBJ (`is_masked`).
+    masked: AtomicBool,
     /// An entry waits for the thread's next way to EL0. The only field that
     /// a core other than the thread's own reads without the scheduler's
     /// lock (`is_pending`): the way to EL0 looks at it first and takes the
@@ -159,7 +161,7 @@ impl State {
             far: 0,
             depth: 0,
             deferred: 0,
-            masked: true,
+            masked: AtomicBool::new(true),
             pending: AtomicBool::new(false),
             entering: false,
             faults: false,
@@ -176,18 +178,33 @@ impl State {
         }
         crate::args::check_start(entry, 0, 1)?;
         self.entry = entry;
-        self.masked = true;
+        self.set_masked(true);
         self.pending.store(false, Ordering::Release);
         self.faulted = false;
         Ok(())
     }
-    /// Return whether an existing IPC wait should be interrupted now.
+    /// The mask. Relaxed: the owner stores it without a lock, and a request
+    /// that reads a stale value does no harm. Stale "masked" leaves the
+    /// request pending, which the owner sees on its next way to EL0 (and
+    /// its look under OBJ before a wait, `deliverable`, which follows the
+    /// owner's own store). Stale "open" ends a wait that the owner's mask
+    /// would have kept: an `Interrupted` that comes without an entry.
+    #[inline(always)]
+    fn is_masked(&self) -> bool {
+        self.masked.load(Ordering::Relaxed)
+    }
+    #[inline(always)]
+    fn set_masked(&self, value: bool) {
+        self.masked.store(value, Ordering::Relaxed);
+    }
+    /// Return whether an existing IPC wait should be interrupted now. Read
+    /// by a CPU other than the thread's own, under OBJ.
     pub fn request(&mut self) -> Result<bool, Error> {
         if self.entry == 0 {
             return Err(Error::BadState);
         }
         self.pending.store(true, Ordering::Release);
-        Ok(!self.masked)
+        Ok(!self.is_masked())
     }
     /// `thread_upcall_control` with the parsed operation of x0 and the
     /// arguments x1 and x2.
@@ -204,15 +221,15 @@ impl State {
     /// makes some of them (S5 counts the instructions of that path).
     #[inline(always)]
     pub fn control_basic(&mut self, operation: UpcallControl) -> Result<Reply, Error> {
-        let was = u64::from(self.masked);
+        let was = u64::from(self.is_masked());
         let plain = Reply::new([was, 0, 0]);
         match operation {
             UpcallControl::Mask => {
-                self.masked = true;
+                self.set_masked(true);
                 Ok(plain)
             }
             UpcallControl::Enable if !self.entering => {
-                self.masked = false;
+                self.set_masked(false);
                 Ok(plain)
             }
             UpcallControl::Take => self.take().map(Reply::new),
@@ -239,7 +256,12 @@ impl State {
         self.entering = false;
         let fault = u64::from(self.faulted) * TAKE_FAULT;
         self.faulted = false;
-        Ok([u64::from(self.masked) | fault, self.pc, self.flags, self.sp])
+        Ok([
+            u64::from(self.is_masked()) | fault,
+            self.pc,
+            self.flags,
+            self.sp,
+        ])
     }
     /// The operations 13 to 16, off the path of the five that a signal's
     /// entry makes (S5 counts its instructions).
@@ -250,7 +272,7 @@ impl State {
         x1: u64,
         x2: u64,
     ) -> Result<Reply, Error> {
-        let was = u64::from(self.masked);
+        let was = u64::from(self.is_masked());
         let plain = Reply::new([was, 0, 0]);
         match operation {
             UpcallControl::Faults if x1 <= 1 => {
@@ -306,7 +328,7 @@ impl State {
         };
         self.depth = depth;
         self.deferred = deferred;
-        self.masked = true;
+        self.set_masked(true);
         self.faulted = false;
         Ok(())
     }
@@ -319,7 +341,7 @@ impl State {
     /// refuses an entry then, the call returns to its own `svc`, and the
     /// thread would fault there for ever.
     pub fn fault(&mut self, esr: u64, far: u64, long_call: bool) -> bool {
-        if !self.faults || self.entry == 0 || self.masked || self.deferred != 0 || long_call {
+        if !self.faults || self.entry == 0 || self.is_masked() || self.deferred != 0 || long_call {
             return false;
         }
         self.esr = esr;
@@ -336,10 +358,15 @@ impl State {
         self.pending.load(Ordering::Relaxed)
     }
     pub fn prepare(&mut self, pc: u64, flags: u64, sp: u64, long_call: bool) -> Option<u64> {
-        if self.entry == 0 || self.masked || self.deferred != 0 || !self.is_pending() || long_call {
+        if self.entry == 0
+            || self.is_masked()
+            || self.deferred != 0
+            || !self.is_pending()
+            || long_call
+        {
             return None;
         }
-        self.masked = true;
+        self.set_masked(true);
         self.pending.store(false, Ordering::Release);
         self.entering = true;
         self.pc = pc;
@@ -376,7 +403,7 @@ impl State {
     }
     /// A request deferred by an internal borrow must not strand a new wait.
     pub fn interrupt_wait(&self) -> bool {
-        self.deferred != 0 && self.is_pending() && !self.masked
+        self.deferred != 0 && self.is_pending() && !self.is_masked()
     }
     /// A request that the thread's next way to EL0 would turn into an entry
     /// is pending now. A thread that is about to block checks it under the
@@ -384,17 +411,17 @@ impl State {
     /// after the thread's last look, while the thread was in the kernel and
     /// waited for nothing yet, found no wait to end.
     pub fn deliverable(&self) -> bool {
-        self.entry != 0 && !self.masked && self.is_pending()
+        self.entry != 0 && !self.is_masked() && self.is_pending()
     }
     pub fn can_return(&self) -> bool {
-        self.depth != 0 && self.deferred == 0 && self.masked && !self.entering
+        self.depth != 0 && self.deferred == 0 && self.is_masked() && !self.entering
     }
     pub fn returned(&mut self) -> Result<(), Error> {
         if !self.can_return() {
             return Err(Error::BadState);
         }
         self.depth -= 1;
-        self.masked = false;
+        self.set_masked(false);
         Ok(())
     }
 }

@@ -32,6 +32,11 @@ cpu-on-refused = []
 # the reply to it is on its way, and holds a CPU back from a quiescent point
 # for 20 ms (xtask smp-window).
 window-probe = []
+# The probe kernel with one deliberate break each (xtask smp-window): no look
+# at the request of the entry under OBJ before a receive or a send waits, and
+# no second look at the head of a queue after the room for its handles.
+break-block-check = ["window-probe"]
+break-head-check = ["window-probe"]
 measure = []
 # The counters of SMP stage 6: kernel time and waits for OBJ of each CPU, printed on
 # request of the program (xtask smp-measure).

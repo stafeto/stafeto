@@ -532,6 +532,59 @@ pub mod window {
         }
     }
 
+    /// The priority of the thread whose receive or send the probe holds
+    /// after its look at the request of the entry that no lock covers.
+    pub const WAIT_LEVEL: u8 = 14;
+    /// The priority of the receiver the probe holds between the two sections
+    /// of its receive.
+    pub const HEAD_LEVEL: u8 = 13;
+
+    /// Out of OBJ, until `done` or 2 s (a host that is busy).
+    fn hold_outside(done: impl Fn() -> bool) {
+        crate::obj::outside(|| {
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+            while !done() && crate::arch::timer::now() < until {
+                core::hint::spin_loop();
+            }
+        });
+    }
+
+    /// In receive and send, right after the look at the request of the
+    /// entry that no lock covers (`interrupt_wait`): a thread at WAIT_LEVEL
+    /// that has no request yet waits, out of OBJ, until another CPU made
+    /// one. The request finds no wait to end (thread_upcall_request answers
+    /// Ok), and the look under OBJ before the wait has to find it.
+    pub fn after_check(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        let upcall = unsafe { &t.as_ref().upcall };
+        // SAFETY: as above.
+        if unsafe { t.as_ref() }.base_priority() == WAIT_LEVEL && !upcall.is_pending() {
+            hold_outside(|| upcall.is_pending());
+        }
+    }
+
+    static MOVED: AtomicU32 = AtomicU32::new(0);
+
+    /// The head of a queue of requests left it (a receiver took it, or its
+    /// sender was recalled).
+    pub fn head_moved() {
+        MOVED.fetch_add(1, Ordering::Release);
+    }
+
+    /// In receive, after the room for the handles of the request at the head
+    /// was made: a receiver at HEAD_LEVEL waits, out of OBJ, until the head
+    /// moved, which another receiver on another CPU or a recall does.
+    pub fn in_gap(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.base_priority() == HEAD_LEVEL {
+            let seen = MOVED.load(Ordering::Acquire);
+            hold_outside(|| MOVED.load(Ordering::Acquire) != seen);
+            if MOVED.load(Ordering::Acquire) != seen {
+                kprintln!("smp window  the head of a queue moved while its receiver made room");
+            }
+        }
+    }
+
     /// The priority of the caller of a suspension that the probe holds a
     /// CPU back for.
     pub const LAG_LEVEL: u8 = 19;

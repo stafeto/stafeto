@@ -67,10 +67,13 @@ pub(super) fn thread_upcall_return(thread: NonNull<Thread>) {
 }
 
 // The entry's state is the thread's own: only the CPU that runs the thread
-// changes it, without a lock. A request from another CPU reaches the state
-// by a command that the owner executes (SMP stage 4); `pending` is the one
-// field another CPU reads. Each change is in a function of its own, which
-// keeps its code off the path of the other calls.
+// changes it, without a lock. A request from another CPU (`sched::
+// request_upcall`, under OBJ) sets `pending` and reads `masked`; both are
+// atomic, and no other field is read by another CPU. A request ends a wait
+// of the thread by the same section that looks at it (`channel::receive`
+// and `send` look at `deliverable` under OBJ before they wait). Each
+// change is in a function of its own, which keeps its code off the path of
+// the other calls.
 #[inline(never)]
 fn locked_bind(upcall: &mut kcore::upcall::State, entry: u64) -> Result<(), Error> {
     upcall.bind(entry)
