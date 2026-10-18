@@ -45,6 +45,7 @@ impl<const N: usize> Pool<N> {
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
     pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the field is in bounds.
         let list = unsafe { core::ptr::addr_of_mut!((*at).list) }.cast::<Option<Registration>>();
         for i in 0..N {
             // SAFETY: the element `i` of the array is in bounds.

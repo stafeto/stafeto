@@ -462,19 +462,6 @@ impl Identities {
         }
     }
 
-    const fn new() -> Self {
-        let mut next = [u16::MAX; SESSIONS];
-        let mut i = 0;
-        while i + 1 < SESSIONS {
-            next[i] = (i + 1) as u16;
-            i += 1;
-        }
-        Self {
-            slots: [const { None }; SESSIONS],
-            next,
-            free: 0,
-        }
-    }
     /// The first free index, which the caller fills at once.
     fn take_free(&mut self) -> Option<usize> {
         let i = usize::from(self.free);

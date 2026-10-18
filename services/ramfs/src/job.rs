@@ -67,6 +67,7 @@ impl Seconds {
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
     pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the field is in bounds.
         let slots = unsafe { core::ptr::addr_of_mut!((*at).slots) }.cast::<Option<Resolve>>();
         for i in 0..SECONDS {
             // SAFETY: the element `i` of the array is in bounds.

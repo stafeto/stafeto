@@ -2058,7 +2058,7 @@ fn write_elf_image(
     let mut relibc = false;
     let mut ready = false;
     let mut files = Vec::new();
-    for (file, elf, stack) in sources {
+    for (file, elf, _) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
         disasm::erratum_835769(elf, &objdump)?;
         disasm::erratum_843419(elf)?;
