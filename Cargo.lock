@@ -199,6 +199,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ncdu"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+ "rt",
+]
+
+[[package]]
 name = "os-test-probe"
 version = "0.1.0"
 dependencies = [

@@ -165,6 +165,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("ash-dialog", 80),
     ("nano-dialog", 22),
     ("htop-dialog", 3),
+    ("ncdu-dialog", 3),
     ("ash-shell-exit", 1),
     ("bash-shell-exit", 5),
     ("bash-dialog", 41),
