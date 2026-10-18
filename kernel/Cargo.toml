@@ -29,7 +29,8 @@ overflow-probe = []
 cpu-on-refused = []
 # The kernel widens the window between the section that posts a command and
 # its flush, and holds the end of a thread of a process that is killed until
-# the reply to it is on its way (xtask smp-window).
+# the reply to it is on its way, and holds a CPU back from a quiescent point
+# for 20 ms (xtask smp-window).
 window-probe = []
 measure = []
 atomic-locks = ["kcore/atomic-locks"]

@@ -9,6 +9,7 @@
 
 use crate::harness::*;
 use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks};
+use crate::timers::timer_at;
 use crate::transfers::copy_raw;
 use abi::{Call, Error, ProcessState, Rights};
 use core::hint::spin_loop;
@@ -255,10 +256,24 @@ fn suspend_and_kill() -> Outcome {
     reset_marks();
     // A thread of init's own, below the child's, on CPU 1: it runs once the
     // child's thread there is parked, and keeps that CPU at EL0 while the
-    // wait for the quiescent points goes on (qsbr::synchronize): only a way
-    // to EL0 that is a quiescent point lets that wait end.
+    // wait for the quiescent points goes on: only a way to EL0 that is a
+    // quiescent point lets that wait end.
     let low = spawn_on(1, 1, spin_marked, 1, LOW)?;
     let_run()?;
+    // A thread of init's own on this CPU, above init, waits for a timer of
+    // this CPU: the suspension waits for the other CPUs between looks, so
+    // that this CPU takes the timer's interrupt and runs the thread meanwhile.
+    let hear = if n >= 3 {
+        let c = channel(QUIET)?;
+        CHANNEL.store(c.raw().0, Relaxed);
+        // Its notification is at NOTICE, above init: the portion that
+        // posts it runs at once, where a notification at the lowest level
+        // would wait for init to stop.
+        let t = timer_at(&c, NOTICE)?;
+        Some((c, t, spawn_on(2, 0, timer_listener, 0, HIGH)?))
+    } else {
+        None
+    };
     let moving = |before: &[u64; 8]| (1..n).all(|i| kid_mark(i) > before[i]);
     let snapshot = || {
         let mut s = [0; 8];
@@ -272,7 +287,19 @@ fn suspend_and_kill() -> Outcome {
         wait_for(|| moving(&zero)),
         "the threads of the child did not run on every CPU",
     )?;
-    sys::process_control(&kid.process, true, 0).map_err(|e| {
+    // The level at which the kernel built with `window-probe` holds a CPU
+    // back from its quiescent point once, 20 ms.
+    sys::thread_set_priority(&me(), LAG_LEVEL, Policy::Fifo).map_err(|_| "init lowered itself")?;
+    let deadline = now() + 2_000_000;
+    if let Some((_, t, _)) = &hear {
+        sys::timer_set(t, deadline).map_err(|_| "the timer was not armed")?;
+    }
+    let began = now();
+    let suspended = sys::process_control(&kid.process, true, 0);
+    let waited = now() - began;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "init could not take its priority back")?;
+    suspended.map_err(|e| {
         println!("process_control: {e:?}");
         "process_control failed"
     })?;
@@ -304,8 +331,35 @@ fn suspend_and_kill() -> Outcome {
         gone == after,
         "a thread of a killed process ran on another CPU",
     )?;
+    if let Some((c, t, l)) = hear {
+        let heard = wait_for(|| mark(2) != 0);
+        let late = mark(2).saturating_sub(deadline);
+        close(l)?;
+        close(t)?;
+        close(c)?;
+        check(heard, "the thread that waits for the timer did not run")?;
+        println!(
+            "smp: suspend waited {} us for the CPUs, a timer of this CPU woke its thread {} us after its deadline",
+            waited / 1000,
+            late / 1000
+        );
+    }
     println!("smp: suspend and kill stopped the threads of the child on {n} CPUs");
     Ok(())
+}
+
+/// The level init suspends at: the kernel built with `window-probe` holds
+/// CPU 2 back from a quiescent point for 20 ms once for a suspension made
+/// at it (kernel cmd::window).
+const LAG_LEVEL: u8 = 19;
+
+/// Waits for the timer's notification and marks when it came (mark 2).
+extern "C" fn timer_listener(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    if sys::receive(&c).is_ok() {
+        MARKS[2].store(now(), SeqCst);
+    }
+    sys::thread_exit()
 }
 
 /// Rounds of the lock test on each CPU.

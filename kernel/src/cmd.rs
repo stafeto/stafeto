@@ -445,4 +445,31 @@ pub mod window {
             next = after;
         }
     }
+
+    /// The priority of the caller of a suspension that the probe holds a
+    /// CPU back for.
+    pub const LAG_LEVEL: u8 = 19;
+    /// The CPU the probe holds back.
+    const LAG_CPU: usize = 1;
+
+    static LAG: AtomicBool = AtomicBool::new(false);
+
+    /// A suspension (process_control) by a thread at LAG_LEVEL begins: the
+    /// next quiescent point of CPU 2 comes 20 ms late.
+    pub fn arm_lag(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.priority() == LAG_LEVEL {
+            LAG.store(true, Ordering::Release);
+        }
+    }
+
+    /// At the start of a quiescent point (qsbr::quiesce).
+    pub fn lag() {
+        if cpu::this().index() == LAG_CPU && LAG.swap(false, Ordering::Acquire) {
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;
+            while crate::arch::timer::now() < until {
+                core::hint::spin_loop();
+            }
+        }
+    }
 }

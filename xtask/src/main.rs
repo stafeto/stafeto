@@ -8986,7 +8986,23 @@ fn init_tests_in(
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
         }
+        let waited = qemu::number_after(&o.lines, "smp: suspend waited ");
+        let late = qemu::number_after(
+            &o.lines,
+            " us for the CPUs, a timer of this CPU woke its thread ",
+        );
+        let (Some(waited), Some(late)) = (waited, late) else {
+            return Err("the test init printed no line of the wait of a suspension".into());
+        };
         if variant == Variant::WindowProbe {
+            // CPU 2 came 20 ms late to its quiescent point: the suspension
+            // waited for it, and this CPU ran the thread of a timer of 2 ms
+            // meanwhile.
+            if waited < 15_000 || late > 10_000 {
+                return Err(format!(
+                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us late: the wait must be 15000 us or more and the thread 10000 us or less"
+                ));
+            }
             qemu::expect_line(
                 &o,
                 "smp window  a thread ended on its CPU between the post of its command and the flush",

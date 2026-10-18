@@ -94,6 +94,8 @@ pub fn pending() -> bool {
 /// This CPU is at a quiescent point: it frees what it retired whose period
 /// passed.
 pub fn quiesce() {
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::lag();
     GRACE.quiesce(cpu::this().index());
     poll();
 }
@@ -176,32 +178,8 @@ pub fn kick(epoch: u64) {
     }
 }
 
-/// Waits until every other CPU has passed a quiescent point after this call:
-/// what this CPU wrote before is seen by each of them on its next way to
-/// EL0 (the gate of a process). This CPU holds nothing meanwhile, and the
-/// caller holds no lock: the CPUs it waits for may need OBJ to get there.
-pub fn synchronize() {
-    if crate::smp::cpus() < 2 {
-        return;
-    }
-    let me = cpu::this().index();
-    GRACE.idle(me);
-    let epoch = begin_wait();
-    let limit = crate::arch::timer::now() + WAIT_SECONDS * crate::arch::timer::frequency();
-    let mut asked = crate::arch::timer::now();
-    while !passed(epoch) {
-        let now = crate::arch::timer::now();
-        if now > limit {
-            panic!("a CPU did not reach a quiescent point");
-        }
-        // A CPU that took the first ask may have been in the middle of a
-        // section: ask again now and then.
-        if now - asked > crate::arch::timer::frequency() / 20_000 {
-            kick(epoch);
-            asked = now;
-        }
-        core::hint::spin_loop();
-    }
-    end_wait();
-    GRACE.quiesce(me);
+/// The counter value at which a wait that begins now has run out: a CPU
+/// that did not reach a quiescent point by then is lost.
+pub fn wait_limit() -> u64 {
+    crate::arch::timer::now() + WAIT_SECONDS * crate::arch::timer::frequency()
 }

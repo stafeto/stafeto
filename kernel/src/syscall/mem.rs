@@ -50,7 +50,26 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     match long {
         Long::Create(m) => make(thread, m, entry),
         Long::Change(on) => portions(thread, on, entry),
+        Long::Quiet { epoch, limit } => quiet(thread, epoch, limit),
     }
+}
+
+/// The wait of a suspension for every CPU (`Long::Quiet`): over once each
+/// CPU has passed a quiescent point since the gate went up; otherwise the
+/// laggards are asked again and the call starts over, with a CPU that has
+/// not answered in two seconds a stop of the kernel.
+fn quiet(thread: NonNull<Thread>, epoch: u64, limit: u64) {
+    if crate::qsbr::passed(epoch) {
+        crate::qsbr::end_wait();
+        thread::end_long(thread);
+        return set_result(thread, Ok(Values::none()));
+    }
+    assert!(
+        clock::now() < limit,
+        "a CPU did not reach a quiescent point"
+    );
+    crate::qsbr::kick(epoch);
+    restart(thread);
 }
 
 /// mem_create(x0 size, x1 flags, x2 resource): a memory object of `size`

@@ -171,6 +171,11 @@ pub enum Long {
     /// mem_map, mem_unmap or mem_protect: the busy entry it changes
     /// (process::maps).
     Change(Change),
+    /// process_control, a suspension: the wait for every CPU to have been in
+    /// the kernel since the gate went up, for `epoch` (qsbr::begin_wait), until
+    /// `limit` on the counter. The call starts over between the looks, so
+    /// that the scheduler and the interrupts of this CPU run in between.
+    Quiet { epoch: u64, limit: u64 },
 }
 
 impl Long {
@@ -179,6 +184,7 @@ impl Long {
         match self {
             Long::Create(_) => Call::MemCreate,
             Long::Change(on) => on.call(),
+            Long::Quiet { .. } => Call::ProcessControl,
         }
     }
 }
@@ -843,6 +849,7 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
                 process::release(on.target, cause);
             }
         }
+        Some(Long::Quiet { .. }) => crate::qsbr::end_wait(),
         None => {}
     }
 }
