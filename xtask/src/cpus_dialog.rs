@@ -97,6 +97,9 @@ fn dialog(cpus: usize) -> Result<(), String> {
         run.send("ls /sys/devices/system/cpu")?;
         run.expect("# ", DIALOG_STEP)?;
         answers(&mut run, "nproc --all", "nproc --all", &n)?;
+        // sysconf, which getconf reads.
+        answers(&mut run, "getconf _NPROCESSORS_CONF", "_NPROCESSORS_CONF", &n)?;
+        answers(&mut run, "getconf _NPROCESSORS_ONLN", "_NPROCESSORS_ONLN", &n)?;
         let mask = format!("affinity mask: {:x}", (1u32 << cpus) - 1);
         run.send("taskset -p $$")?;
         run.expect_line(
