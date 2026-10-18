@@ -8671,6 +8671,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         let r = qemu::parse_report(&o.lines);
         qemu::counted_verdict(&o, &r, None)?;
         qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
+        wcet::note_run(&a.elf, &o.lines);
         lines.extend(o.lines);
         passed.extend(r.passed);
     }

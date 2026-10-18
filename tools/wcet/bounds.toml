@@ -1,0 +1,150 @@
+[calibration]
+counter_read = 0
+
+[dispatch]
+function = "kernel::syscall::dispatch"
+restart = "kernel::syscall::mem::go_on"
+
+[[call]]
+name = "HandleClose"
+handlers = ["kernel::syscall::handles::handle_close"]
+
+[[call]]
+name = "HandleDuplicate"
+handlers = ["kernel::syscall::handles::handle_duplicate"]
+
+[[call]]
+name = "CreateChannel"
+handlers = ["kernel::syscall::messages::channel_create"]
+
+[[call]]
+name = "Send"
+handlers = ["kernel::syscall::messages::send"]
+
+[[call]]
+name = "Receive"
+handlers = ["kernel::syscall::messages::receive"]
+
+[[call]]
+name = "Reply"
+handlers = ["kernel::syscall::messages::reply"]
+
+[[call]]
+name = "Notify"
+handlers = ["kernel::syscall::messages::notify"]
+
+[[call]]
+name = "MemCreate"
+handlers = ["kernel::syscall::mem::mem_create"]
+
+[[call]]
+name = "MemMap"
+handlers = ["kernel::syscall::mem::change_map"]
+
+[[call]]
+name = "MemUnmap"
+handlers = ["kernel::syscall::mem::change", "kernel::syscall::mem::mem_unmap"]
+
+[[call]]
+name = "MemProtect"
+handlers = ["kernel::syscall::mem::change", "kernel::syscall::mem::mem_protect"]
+
+[[call]]
+name = "ProcessCreate"
+handlers = ["kernel::syscall::proc::process_create"]
+
+[[call]]
+name = "ProcessKill"
+handlers = ["kernel::syscall::proc::process_kill"]
+
+[[call]]
+name = "ProcessExit"
+handlers = ["kernel::syscall::proc::process_exit"]
+
+[[call]]
+name = "ThreadCreate"
+handlers = ["kernel::syscall::proc::thread_create"]
+
+[[call]]
+name = "ThreadStart"
+handlers = ["kernel::syscall::proc::thread_start"]
+
+[[call]]
+name = "ThreadExit"
+handlers = ["kernel::syscall::proc::thread_exit"]
+
+[[call]]
+name = "ThreadSetPriority"
+handlers = ["kernel::syscall::proc::thread_set_priority"]
+
+[[call]]
+name = "ThreadInterrupt"
+handlers = ["kernel::syscall::proc::thread_interrupt"]
+
+[[call]]
+name = "ThreadUpcallBind"
+handlers = ["kernel::syscall::upcall::thread_upcall_bind"]
+
+[[call]]
+name = "ThreadUpcallControl"
+handlers = ["kernel::syscall::upcall::thread_upcall_control"]
+
+[[call]]
+name = "ThreadUpcallRequest"
+handlers = ["kernel::syscall::upcall::thread_upcall_request"]
+
+[[call]]
+name = "ThreadUpcallReturn"
+handlers = ["kernel::syscall::upcall::thread_upcall_return"]
+
+[[call]]
+name = "Yield"
+handlers = ["kernel::syscall::proc::yield_now"]
+
+[[call]]
+name = "DeviceWindowCreate"
+handlers = ["kernel::syscall::devices::device_window_create"]
+
+[[call]]
+name = "IrqBind"
+handlers = ["kernel::syscall::devices::irq_bind"]
+
+[[call]]
+name = "IrqAck"
+handlers = ["kernel::syscall::devices::irq_ack"]
+
+[[call]]
+name = "ClockNow"
+handlers = ["kernel::syscall::time::clock_now"]
+
+[[call]]
+name = "TimerCreate"
+handlers = ["kernel::syscall::time::timer_create"]
+
+[[call]]
+name = "TimerSet"
+handlers = ["kernel::syscall::time::timer_set"]
+
+[[call]]
+name = "TimerCancel"
+handlers = ["kernel::syscall::time::timer_cancel"]
+
+[[call]]
+name = "ObjectInfo"
+handlers = ["kernel::syscall::info::object_info"]
+
+[[call]]
+name = "DebugWrite"
+handlers = ["kernel::syscall::info::debug_write"]
+
+[[call]]
+name = "ProcessControl"
+handlers = ["kernel::syscall::process_control_waited"]
+
+[[free]]
+prefix = "kernel::ktest::"
+why = "the kernel tests' own code: test points hand control to it in the test builds, and the kernel that ships has none of it"
+
+[atomic]
+bound = 1
+why = "a retry of a store-exclusive or a wait for the turn of a ticket lock: one pass on the CPU the measurement runs on; every further pass is another CPU's hold, which B_N adds as (N - 1) * OBJ_HOLD_MAX (docs/smp.md)"
