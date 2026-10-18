@@ -37,6 +37,23 @@ fn keys(run: &mut qemu::Run, bytes: &[u8], line: &str) -> Result<(), String> {
     run.expect(PROMPT, DIALOG_STEP)
 }
 
+/// Ctrl-C at the prompt of the line editor, and the fresh prompt it gives.
+/// readline notes a signal that came between two of its reads only at the
+/// next key (bash's hook runs after an EINTR of `read`), and a key costs
+/// the shell a few hundred microseconds here, about the time the host
+/// needs to answer the echo of the one before. A Ctrl-C that found the
+/// shell outside its read gets no prompt; the second one finds the shell
+/// waiting in `read` and ends it with EINTR, which is the property.
+fn interrupt_readline(run: &mut qemu::Run) -> Result<(), String> {
+    run.type_raw(b"\x03")?;
+    run.expect("^C", DIALOG_STEP)?;
+    if run.expect(PROMPT, Duration::from_millis(500)).is_ok() {
+        return Ok(());
+    }
+    run.type_raw(b"\x03")?;
+    run.expect(PROMPT, DIALOG_STEP)
+}
+
 /// bash's properties.
 fn properties(run: &mut qemu::Run) -> Result<(), String> {
     // History: Up brings the last command back.
@@ -102,10 +119,9 @@ fn properties(run: &mut qemu::Run) -> Result<(), String> {
 fn shared(run: &mut qemu::Run, bin_count: &str) -> Result<(), String> {
     // Ctrl-C at the prompt drops the line and gives a fresh prompt: the
     // text typed with it never runs (the check of the whole output below).
-    std::thread::sleep(Duration::from_secs(1));
-    run.type_raw(b"echo dropped\x03")?;
-    run.expect("^C", DIALOG_STEP)?;
-    std::thread::sleep(Duration::from_secs(1));
+    run.type_raw(b"echo dropped")?;
+    run.expect("echo dropped", DIALOG_STEP)?;
+    interrupt_readline(run)?;
     say(run, "echo fresh", &["fresh"])?;
     let builtins: &[(&str, &[&str])] = &[
         ("echo arithmetic:$((6 * 7))", &["arithmetic:42"]),
