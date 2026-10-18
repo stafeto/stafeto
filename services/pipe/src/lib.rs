@@ -279,6 +279,18 @@ fn split(held: &Held, description: u32, write: Option<bool>) -> Result<(usize, u
     Ok((pipe, is_write as usize))
 }
 
+/// Writes `value` into each element of the array at `array`.
+///
+/// # Safety
+/// `array` is valid for writes, and nothing reads it before.
+pub(crate) unsafe fn fill<T: Copy, const N: usize>(array: *mut [T; N], value: T) {
+    let first = array.cast::<T>();
+    for i in 0..N {
+        // SAFETY: the element `i` of the array is in bounds.
+        unsafe { first.add(i).write(value) };
+    }
+}
+
 impl Default for Pipes {
     fn default() -> Self {
         Self::new()
@@ -286,6 +298,26 @@ impl Default for Pipes {
 }
 
 impl Pipes {
+    /// What `new` makes, in place in zeroed memory: the service keeps its
+    /// pipes in `.bss`, and only the places whose free state has a non-zero
+    /// byte are written.
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Pipes) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            fill(addr_of_mut!((*at).pipes), Pipe::FREE);
+            fill(
+                addr_of_mut!((*at).named_descriptions),
+                named::Description::FREE,
+            );
+            sockets::Sockets::initialize_at(addr_of_mut!((*at).sockets));
+            ipc::Ipc::initialize_at(addr_of_mut!((*at).ipc));
+        }
+    }
+
     pub const fn new() -> Pipes {
         Pipes {
             pipes: [Pipe::FREE; PIPES],
@@ -774,6 +806,31 @@ impl<const N: usize> Roots<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tables written in place into zeroed memory (the service's
+    /// `.bss`) hold the bytes `new` makes.
+    #[test]
+    fn initialize_at_in_zeroed_memory_equals_new() {
+        let size = core::mem::size_of::<Pipes>();
+        let mut place = std::vec![0u8; size + 16];
+        let at = place
+            .as_mut_ptr()
+            .wrapping_add(place.as_ptr().align_offset(16))
+            .cast::<Pipes>();
+        // SAFETY: the place is zeroed, aligned and `size` bytes long.
+        unsafe { Pipes::initialize_at(at) };
+        let made = Box::new(Pipes::new());
+        // SAFETY: both are `size` bytes of one object each; padding bytes are
+        // zero in both (a zeroed place, a constant).
+        let (a, b) = unsafe {
+            (
+                core::slice::from_raw_parts(at.cast::<u8>(), size),
+                core::slice::from_raw_parts(core::ptr::from_ref(&*made).cast::<u8>(), size),
+            )
+        };
+        let differs = a.iter().zip(b).filter(|(x, y)| x != y).count();
+        assert_eq!(differs, 0);
+    }
 
     fn pipes() -> Box<Pipes> {
         Box::new(Pipes::new())

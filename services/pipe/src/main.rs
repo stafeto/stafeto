@@ -111,20 +111,35 @@ struct Tables {
     named: Admissions<Handle<Channel>>,
     io: [IoCapture; OPERATIONS],
 }
-struct Bss(UnsafeCell<Tables>);
+struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
 unsafe impl Sync for Bss {}
-static TABLES: Bss = Bss(UnsafeCell::new(Tables {
-    sessions: [const { None }; SESSIONS],
-    births: [None; BIRTHS],
-    pipes: Pipes::new(),
-    ops: LongOps::new(),
-    watches: pipe::watches::Pool::new(),
-    roots: Roots::new(),
-    clones: Clones::new(),
-    named: Admissions::new(),
-    io: [IoCapture::EMPTY; OPERATIONS],
-}));
+static TABLES: Bss = Bss(UnsafeCell::new(core::mem::MaybeUninit::zeroed()));
+
+impl Tables {
+    /// The tables as `new` makes them, in place: the zeroed `.bss` holds
+    /// them, and only the non-zero bytes are written, so the image carries
+    /// no zeros for the 700 KB of tables.
+    ///
+    /// # Safety
+    /// `tables` is valid for writes, exclusive and zeroed.
+    #[inline(never)]
+    unsafe fn initialize_at(tables: *mut Tables) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            rt::bss::fill_none(addr_of_mut!((*tables).sessions));
+            rt::bss::fill_none(addr_of_mut!((*tables).births));
+            Pipes::initialize_at(addr_of_mut!((*tables).pipes));
+            LongOps::initialize_at(addr_of_mut!((*tables).ops));
+            pipe::watches::Pool::initialize_at(addr_of_mut!((*tables).watches));
+            addr_of_mut!((*tables).roots).write(Roots::new());
+            // A new table of clones is all zeros.
+            Admissions::initialize_at(addr_of_mut!((*tables).named));
+            rt::bss::fill(addr_of_mut!((*tables).io), IoCapture::EMPTY);
+        }
+    }
+}
 
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
@@ -153,7 +168,11 @@ fn main(_: u64) -> u64 {
         }),
     };
     // SAFETY: only the main thread reaches TABLES, here once.
-    let tables = unsafe { &mut *TABLES.0.get() };
+    let tables = unsafe {
+        let pointer = (*TABLES.0.get()).as_mut_ptr();
+        Tables::initialize_at(pointer);
+        &mut *pointer
+    };
     let mut service = PipeService {
         pipes: &mut tables.pipes,
         ops: &mut tables.ops,

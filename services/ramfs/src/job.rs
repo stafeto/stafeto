@@ -62,6 +62,19 @@ pub struct Seconds {
     reserved: u32,
 }
 impl Seconds {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the field is in bounds.
+        let slots = unsafe { core::ptr::addr_of_mut!((*at).slots) }.cast::<Option<Resolve>>();
+        for i in 0..SECONDS {
+            // SAFETY: the element `i` of the array is in bounds.
+            unsafe { slots.add(i).write(None) };
+        }
+    }
+
     pub const fn new() -> Self {
         Self {
             slots: [const { None }; SECONDS],

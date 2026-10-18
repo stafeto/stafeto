@@ -171,6 +171,15 @@ pub struct Sockets {
 }
 
 impl Sockets {
+    /// What `new` makes, in place in zeroed memory.
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub(super) unsafe fn initialize_at(at: *mut Sockets) {
+        // SAFETY: the field is in bounds and written once.
+        unsafe { crate::fill(core::ptr::addr_of_mut!((*at).s), Sock::FREE) };
+    }
+
     pub const fn new() -> Self {
         Self {
             s: [Sock::FREE; SOCKETS],

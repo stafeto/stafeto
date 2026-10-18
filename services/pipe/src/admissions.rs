@@ -62,6 +62,24 @@ impl<H> Default for Admissions<H> {
 }
 
 impl<H> Admissions<H> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            let list = addr_of_mut!((*at).list).cast::<Option<Admission<H>>>();
+            let free = addr_of_mut!((*at).free).cast::<u8>();
+            for i in 0..NAMED_MAX {
+                list.add(i).write(None);
+                free.add(i).write((NAMED_MAX - 1 - i) as u8);
+            }
+            addr_of_mut!((*at).free_len).write(NAMED_MAX);
+        }
+    }
+
     pub const fn new() -> Self {
         let mut free = [0; NAMED_MAX];
         let mut i = 0;
