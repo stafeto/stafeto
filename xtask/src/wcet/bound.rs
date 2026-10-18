@@ -218,14 +218,17 @@ pub struct CallEntry {
     pub handlers: Vec<String>,
     /// The call can be a restart of a long call: `go_on` then runs.
     pub long: bool,
+    /// The rows (`<what> ticks: <row>`) that measure one portion of the call,
+    /// when the longest call of the kernel tests is the sum of its portions.
+    pub portions: Vec<String>,
 }
 
 /// An entry that is no system call: a path with its own measurement.
 pub struct PathEntry {
     pub name: String,
     pub symbol: String,
-    /// `<what> ticks: <row>` of the line a kernel test prints.
-    pub measured: String,
+    /// `<what> ticks: <row>` of the lines a kernel test prints: the longest.
+    pub measured: Vec<String>,
 }
 
 #[derive(Default)]
@@ -250,6 +253,13 @@ pub struct Annotations {
     /// of a lock word, or a wait for an event: a retry of a store-exclusive, a
     /// turn of a ticket lock. Another CPU causes each pass past the first.
     pub atomic: Option<(u64, String)>,
+    /// Copies and fills of a size that the call site does not set to a constant.
+    pub copies: Vec<Copy>,
+}
+
+pub struct Copy {
+    pub function: String,
+    pub bytes: u64,
 }
 
 impl Annotations {
@@ -299,7 +309,16 @@ impl Annotations {
                     name: text_of(&t, "name", &what)?,
                     handlers: list_of(&t, "handlers"),
                     long: matches!(t.get("long"), Some(Value::Text(s)) if s == "yes"),
+                    portions: list_of(&t, "portions"),
                 }),
+                "copy" => {
+                    why()?;
+                    a.copies.push(Copy {
+                        function: text_of(&t, "function", &what)?,
+                        bytes: u64::try_from(number_of(&t, "bytes", &what)?)
+                            .map_err(|_| format!("{what}: `bytes` must not be negative"))?,
+                    });
+                }
                 "atomic" => {
                     a.atomic = Some((
                         u64::try_from(number_of(&t, "bound", &what)?)
@@ -316,7 +335,7 @@ impl Annotations {
                 "path" => a.paths.push(PathEntry {
                     name: text_of(&t, "name", &what)?,
                     symbol: text_of(&t, "symbol", &what)?,
-                    measured: text_of(&t, "measured", &what)?,
+                    measured: list_of(&t, "measured"),
                 }),
                 other => return Err(format!("unknown table [{other}]")),
             }
@@ -348,6 +367,9 @@ enum Exit {
 #[derive(Clone, Debug)]
 enum CallSite {
     Direct(usize),
+    /// A call of memcpy, memmove or memset with the size in bytes when the
+    /// call site sets it to a constant.
+    Copy(usize, Option<u64>),
     /// A call through a register that the annotations resolve.
     Choice(Vec<usize>),
     /// A call through a register, address of the instruction.
@@ -411,7 +433,15 @@ impl Cfg {
                         .and_then(|t| image.containing(t).map(|g| (t, g)))
                     {
                         Some((t, g)) if t == image.functions[g].start => {
-                            b.calls.push(CallSite::Direct(g));
+                            if is_copy(&image.functions[g].name) {
+                                let before = &function.insns[first..];
+                                let at =
+                                    before.iter().position(|i| i.addr == insn.addr).unwrap_or(0);
+                                b.calls
+                                    .push(CallSite::Copy(g, constant_size(&before[..at])));
+                            } else {
+                                b.calls.push(CallSite::Direct(g));
+                            }
                         }
                         _ => b.calls.push(CallSite::Stray(insn.addr)),
                     },
@@ -470,6 +500,35 @@ impl Cfg {
         }
         Cfg { blocks }
     }
+}
+
+/// Whether `name` is one of the functions that copy or fill bytes.
+fn is_copy(name: &str) -> bool {
+    matches!(
+        name,
+        "memcpy" | "memset" | "memmove" | "compiler_builtins::mem::memmove"
+    )
+}
+
+/// The size a call of memcpy gets when the last write of x2 before it
+/// is `mov x2, #n`.
+fn constant_size(before: &[super::Insn]) -> Option<u64> {
+    let last = before
+        .iter()
+        .rev()
+        .find(|i| reg(operand_list(&i.operands)[0]) == Some(2))?;
+    if !matches!(last.mnemonic.as_str(), "mov" | "movz") {
+        return None;
+    }
+    super::immediate(operand_list(&last.operands).get(1)?)
+}
+
+/// The instructions of a copy or fill of `bytes` bytes by the functions of the
+/// kernel's builtins, on the longest of their paths: the head and the tail by
+/// bytes (at most 15 each), the middle by words at the most 22 instructions
+/// for a word (a source that is not aligned).
+fn copy_cost(bytes: u64) -> u64 {
+    100 + 22 * (bytes / 8 + 1)
 }
 
 /// Where a jump through a register goes.
@@ -671,132 +730,68 @@ fn branch_edge(
     }
 }
 
-// ---- dominators and loops ----
+// ---- loops ----
 
-struct Loops {
-    /// Reverse postorder of the blocks reachable from the entry.
-    rpo: Vec<usize>,
-    /// By header: the blocks of the loop, its latches and the loop it is in.
-    body: BTreeMap<usize, BTreeSet<usize>>,
-    parent: BTreeMap<usize, Option<usize>>,
-    /// Back edges whose target does not dominate their source.
-    irreducible: Vec<(usize, usize)>,
-}
-
-impl Loops {
-    fn find(cfg: &Cfg) -> Loops {
-        let n = cfg.blocks.len();
-        let mut order: Vec<usize> = Vec::new();
-        let mut state = vec![0u8; n];
-        // Iterative depth-first search, postorder.
-        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-        state[0] = 1;
-        while let Some(&mut (b, ref mut at)) = stack.last_mut() {
-            if let Some(&s) = cfg.blocks[b].succ.get(*at) {
+/// The strongly connected components of the graph of `nodes` under `edges`,
+/// a component's blocks in the order of their numbers, the components in an
+/// order where each comes before every component it leads to.
+fn components(nodes: &BTreeSet<usize>, edges: &dyn Fn(usize) -> Vec<usize>) -> Vec<Vec<usize>> {
+    let mut index: HashMap<usize, usize> = HashMap::new();
+    let mut low: HashMap<usize, usize> = HashMap::new();
+    let mut on_stack: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut found: Vec<Vec<usize>> = Vec::new();
+    for &root in nodes {
+        if index.contains_key(&root) {
+            continue;
+        }
+        // Depth-first search with its own stack: a node, its edges and the next one to take.
+        let mut work: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+        index.insert(root, index.len());
+        low.insert(root, index[&root]);
+        stack.push(root);
+        on_stack.insert(root);
+        work.push((root, edges(root), 0));
+        while let Some((v, next, at)) = work.last_mut() {
+            let v = *v;
+            if let Some(&w) = next.get(*at) {
                 *at += 1;
-                if state[s] == 0 {
-                    state[s] = 1;
-                    stack.push((s, 0));
+                if !nodes.contains(&w) {
+                    continue;
+                }
+                if !index.contains_key(&w) {
+                    index.insert(w, index.len());
+                    low.insert(w, index[&w]);
+                    stack.push(w);
+                    on_stack.insert(w);
+                    work.push((w, edges(w), 0));
+                } else if on_stack.contains(&w) {
+                    let l = low[&v].min(index[&w]);
+                    low.insert(v, l);
                 }
             } else {
-                order.push(b);
-                stack.pop();
-            }
-        }
-        order.reverse();
-        let rpo = order;
-        let mut number = vec![usize::MAX; n];
-        for (i, &b) in rpo.iter().enumerate() {
-            number[b] = i;
-        }
-        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for &b in &rpo {
-            for &s in &cfg.blocks[b].succ {
-                preds[s].push(b);
-            }
-        }
-        // Dominators (Cooper, Harvey, Kennedy).
-        let mut idom: Vec<Option<usize>> = vec![None; n];
-        idom[0] = Some(0);
-        let intersect = |idom: &Vec<Option<usize>>, mut a: usize, mut b: usize| {
-            while a != b {
-                while number[a] > number[b] {
-                    a = idom[a].unwrap_or(0);
+                work.pop();
+                if let Some((u, _, _)) = work.last() {
+                    let l = low[u].min(low[&v]);
+                    low.insert(*u, l);
                 }
-                while number[b] > number[a] {
-                    b = idom[b].unwrap_or(0);
-                }
-            }
-            a
-        };
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in rpo.iter().skip(1) {
-                let mut new: Option<usize> = None;
-                for &p in &preds[b] {
-                    if idom[p].is_none() {
-                        continue;
+                if low[&v] == index[&v] {
+                    let mut comp = Vec::new();
+                    while let Some(w) = stack.pop() {
+                        on_stack.remove(&w);
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
                     }
-                    new = Some(match new {
-                        None => p,
-                        Some(q) => intersect(&idom, p, q),
-                    });
-                }
-                if new != idom[b] {
-                    idom[b] = new;
-                    changed = true;
+                    comp.sort_unstable();
+                    found.push(comp);
                 }
             }
-        }
-        let dominates = |a: usize, mut b: usize| {
-            loop {
-                if a == b {
-                    return true;
-                }
-                match idom[b] {
-                    Some(p) if p != b => b = p,
-                    _ => return false,
-                }
-            }
-        };
-        let mut body: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-        let mut irreducible = Vec::new();
-        for &u in &rpo {
-            for &h in &cfg.blocks[u].succ {
-                if number[h] > number[u] {
-                    continue;
-                }
-                if !dominates(h, u) {
-                    irreducible.push((u, h));
-                    continue;
-                }
-                // The natural loop of the back edge u -> h.
-                let set = body.entry(h).or_insert_with(|| BTreeSet::from([h]));
-                let mut work = vec![u];
-                while let Some(x) = work.pop() {
-                    if set.insert(x) {
-                        work.extend(preds[x].iter().copied());
-                    }
-                }
-            }
-        }
-        let mut parent = BTreeMap::new();
-        for (&h, set) in &body {
-            let up = body
-                .iter()
-                .filter(|&(&o, other)| o != h && other.contains(&h) && other.len() >= set.len())
-                .min_by_key(|(_, other)| other.len())
-                .map(|(&o, _)| o);
-            parent.insert(h, up);
-        }
-        Loops {
-            rpo,
-            body,
-            parent,
-            irreducible,
         }
     }
+    found.reverse();
+    found
 }
 
 // ---- the analysis ----
@@ -819,6 +814,9 @@ pub struct Issues {
     pub recursion: BTreeSet<(usize, usize)>,
     pub irreducible: BTreeSet<(usize, u64)>,
     pub veneers: BTreeSet<usize>,
+    /// Functions with a copy or fill whose size no call site sets to a constant
+    /// and no annotation gives: the loops of the copy count at their bounds.
+    pub unsized_copies: BTreeSet<usize>,
     pub open_jumps: BTreeSet<(usize, u64)>,
 }
 
@@ -839,6 +837,19 @@ pub struct Analyzer<'a> {
     pub issues: Issues,
     /// The loops the annotations bounded and the blocks they matched.
     pub used: BTreeSet<(usize, u64)>,
+    /// The blocks of each loop that no annotation bounded, for the report.
+    pub bodies: BTreeMap<(usize, u64), BTreeSet<usize>>,
+    /// Every loop on the paths analysed: its bound (1 for none), the header of
+    /// the loop it is in, and its blocks.
+    pub seen: BTreeMap<(usize, u64), Seen>,
+}
+
+#[derive(Clone)]
+pub struct Seen {
+    pub bound: u64,
+    pub parent: Option<u64>,
+    pub blocks: usize,
+    pub bounded: bool,
 }
 
 impl<'a> Analyzer<'a> {
@@ -861,6 +872,8 @@ impl<'a> Analyzer<'a> {
             open: Vec::new(),
             issues: Issues::default(),
             used: BTreeSet::new(),
+            bodies: BTreeMap::new(),
+            seen: BTreeMap::new(),
         }
     }
 
@@ -869,6 +882,11 @@ impl<'a> Analyzer<'a> {
     pub fn frame_of(&mut self, function: usize, zero: BTreeSet<usize>) {
         self.zero.extend(zero);
         self.window = Some(Window { function });
+    }
+
+    /// Prices more functions at nothing.
+    pub fn free_functions(&mut self, zero: impl IntoIterator<Item = usize>) {
+        self.zero.extend(zero);
     }
 
     fn cfg(&mut self, f: usize) -> &Cfg {
@@ -975,6 +993,19 @@ impl<'a> Analyzer<'a> {
 
     fn call_cost(&mut self, f: usize, site: &CallSite, complete: &mut bool) -> u64 {
         match site {
+            CallSite::Copy(g, size) => {
+                if let Some(n) = size {
+                    return copy_cost(*n);
+                }
+                let name = &self.image.functions[f].name;
+                if let Some(c) = self.ann.copies.iter().find(|c| &c.function == name) {
+                    return copy_cost(c.bytes);
+                }
+                self.issues.unsized_copies.insert(f);
+                let w = self.wcet(*g);
+                *complete &= w.complete;
+                w.insns
+            }
             CallSite::Direct(g) if self.noreturn.contains(g) => 0,
             CallSite::Direct(g) => {
                 let w = self.wcet(*g);
@@ -1012,13 +1043,7 @@ impl<'a> Analyzer<'a> {
         let image = self.image;
         let function = &image.functions[f];
         let cfg_len = self.cfg(f).blocks.len();
-        let loops = Loops::find(self.cfg(f));
         let mut complete = true;
-        for &(_, h) in &loops.irreducible {
-            let at = self.cfg(f).blocks[h].start;
-            self.issues.irreducible.insert((f, at));
-            complete = false;
-        }
         // Each block's own cost: its instructions and what it calls.
         let mut cost = vec![0u64; cfg_len];
         let mut dead = vec![false; cfg_len];
@@ -1083,10 +1108,9 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
-        let all: BTreeSet<usize> = loops.rpo.iter().copied().collect();
+        let all: BTreeSet<usize> = (0..cfg_len).collect();
         let mut ctx = Solve {
             f,
-            loops: &loops,
             cost: &cost,
             dead: &dead,
             tails: &tails,
@@ -1149,6 +1173,8 @@ impl<'a> Analyzer<'a> {
         Some(cost)
     }
 
+    /// The longest ways through the blocks of a region: the function, or
+    /// the body of the loop that begins at `header`.
     fn solve(
         &mut self,
         ctx: &mut Solve,
@@ -1156,52 +1182,71 @@ impl<'a> Analyzer<'a> {
         members: &BTreeSet<usize>,
         header: Option<usize>,
     ) -> Region {
+        let succ: Vec<Vec<usize>> = (0..self.cfg(ctx.f).blocks.len())
+            .map(|b| self.cfg(ctx.f).blocks[b].succ.clone())
+            .collect();
+        let inside = |b: usize| -> Vec<usize> {
+            succ[b]
+                .iter()
+                .copied()
+                .filter(|t| members.contains(t) && Some(*t) != header)
+                .collect()
+        };
         let mut arrive: HashMap<usize, u64> = HashMap::from([(entry, 0)]);
-        let mut skipped: HashSet<usize> = HashSet::new();
         let mut outs: Vec<Out2> = Vec::new();
         let mut latch = 0u64;
-        let order: Vec<usize> = ctx
-            .loops
-            .rpo
-            .iter()
-            .copied()
-            .filter(|b| members.contains(b))
-            .collect();
-        for b in order {
-            if skipped.contains(&b) {
+        for comp in components(members, &inside) {
+            let looped = comp.len() > 1 || inside(comp[0]).contains(&comp[0]);
+            if !looped {
+                let b = comp[0];
+                let Some(&a) = arrive.get(&b) else { continue };
+                let d = a + ctx.cost[b];
+                if ctx.dead[b] {
+                    continue;
+                }
+                for &t in &succ[b] {
+                    self.leave(
+                        Out::Edge(t),
+                        d,
+                        members,
+                        header,
+                        &mut arrive,
+                        &mut outs,
+                        &mut latch,
+                    );
+                }
+                self.leave_by_exit(ctx, b, d, &mut outs);
                 continue;
             }
-            let Some(&a) = arrive.get(&b) else { continue };
-            if ctx.loops.body.contains_key(&b)
-                && ctx.loops.parent[&b] == header
-                && Some(b) != header
-            {
-                let inner_blocks = ctx.loops.body[&b].clone();
-                let inner = self.solve(ctx, b, &inner_blocks, Some(b));
-                let at = self.cfg(ctx.f).blocks[b].start;
-                let offset = at - self.image.functions[ctx.f].start;
-                let name = self.image.functions[ctx.f].name.clone();
-                let blocks = ctx.loops.body[&b].clone();
-                let mut bound = self
-                    .ann
-                    .loops
-                    .iter()
-                    .find(|l| l.function == name && (l.at == offset || l.at == ANY))
-                    .map(|l| l.bound);
-                if bound.is_none()
-                    && let Some((n, _)) = &self.ann.atomic
-                    && self.holds_atomic(ctx.f, &blocks)
-                {
-                    bound = Some(*n);
-                }
-                if bound.is_some() {
-                    self.used.insert((ctx.f, at));
-                }
-                let bound = bound.unwrap_or_else(|| {
-                    self.issues.loops.insert((ctx.f, at));
-                    *ctx.complete = false;
-                    1
-                });
+            let entries: Vec<usize> = comp
+                .iter()
+                .copied()
+                .filter(|b| arrive.contains_key(b))
+                .collect();
+            let Some(a) = entries.iter().map(|b| arrive[b]).max() else {
+                continue;
+            };
+            let set: BTreeSet<usize> = comp.iter().copied().collect();
+            let key = entries
+                .iter()
+                .map(|&b| self.cfg(ctx.f).blocks[b].start)
+                .min()
+                .unwrap_or(0);
+            let bound = self.bound_of(ctx, key, &set, entries.len() > 1);
+            let parent = header.map(|h| self.cfg(ctx.f).blocks[h].start);
+            let bounded = !self.bodies.contains_key(&(ctx.f, key));
+            self.seen.insert(
+                (ctx.f, key),
+                Seen {
+                    bound,
+                    parent,
+                    blocks: set.len(),
+                    bounded,
+                },
+            );
+            if let [h] = entries[..] {
+                // One way in: the loop of the header `h`; its passes and its exits.
+                let inner = self.solve(ctx, h, &set, Some(h));
                 for out in &inner.outs {
                     let cost = a + (bound - 1) * inner.latch + out.cost;
                     self.leave(
@@ -1209,7 +1254,6 @@ impl<'a> Analyzer<'a> {
                         cost,
                         members,
                         header,
-                        &skipped,
                         &mut arrive,
                         &mut outs,
                         &mut latch,
@@ -1221,55 +1265,90 @@ impl<'a> Analyzer<'a> {
                         cost: a + bound * inner.latch,
                     });
                 }
-                skipped.extend(ctx.loops.body[&b].iter().copied());
                 continue;
             }
-            let d = a + ctx.cost[b];
-            if ctx.dead[b] {
-                continue;
-            }
-            for &t in &self.cfg(ctx.f).blocks[b].succ.clone() {
-                self.leave(
-                    Out::Edge(t),
-                    d,
-                    members,
-                    header,
-                    &skipped,
-                    &mut arrive,
-                    &mut outs,
-                    &mut latch,
-                );
-            }
-            let exits = self.cfg(ctx.f).blocks[b].exits.clone();
-            for e in exits {
-                match e {
-                    Exit::Return => outs.push(Out2 {
-                        kind: Out::Leave,
-                        cost: d,
-                    }),
-                    Exit::Tail(_) => outs.push(Out2 {
-                        kind: Out::Leave,
-                        cost: d + ctx.tails[b],
-                    }),
-                    Exit::Veneer => outs.push(Out2 {
-                        kind: Out::Leave,
-                        cost: d,
-                    }),
-                    Exit::Computed(_) => outs.push(Out2 {
-                        kind: Out::Leave,
-                        cost: d + ctx.tails[b],
-                    }),
-                    Exit::Stop => {}
+            // Several ways in: every block of it runs at most `bound` times.
+            let total = a + bound * set.iter().map(|&b| ctx.cost[b]).sum::<u64>();
+            for &b in &set {
+                if ctx.dead[b] {
+                    continue;
                 }
+                for &t in succ[b].iter().filter(|t| !set.contains(t)) {
+                    self.leave(
+                        Out::Edge(t),
+                        total,
+                        members,
+                        header,
+                        &mut arrive,
+                        &mut outs,
+                        &mut latch,
+                    );
+                }
+                self.leave_by_exit(ctx, b, total, &mut outs);
             }
         }
         Region { outs, latch }
     }
 
-    /// Whether the blocks hold an instruction of a lock word's protocol.
+    /// The paths of block `b` that leave the function, at `cost`.
+    fn leave_by_exit(&mut self, ctx: &Solve, b: usize, cost: u64, outs: &mut Vec<Out2>) {
+        for e in self.cfg(ctx.f).blocks[b].exits.clone() {
+            let extra = match e {
+                Exit::Return | Exit::Veneer => 0,
+                Exit::Tail(_) | Exit::Computed(_) => ctx.tails[b],
+                Exit::Stop => continue,
+            };
+            outs.push(Out2 {
+                kind: Out::Leave,
+                cost: cost + extra,
+            });
+        }
+    }
+
+    /// The bound of the loop at `key` (the address of its header, of the
+    /// first of its ways in when it has several) over the blocks `set`: the
+    /// annotation of the loop or of the whole function, or the one that
+    /// stands for a lock word's protocol; 1 and a name in the issues when none.
+    fn bound_of(&mut self, ctx: &mut Solve, key: u64, set: &BTreeSet<usize>, several: bool) -> u64 {
+        let function = &self.image.functions[ctx.f];
+        let offset = key - function.start;
+        let named = |at: u64| {
+            self.ann
+                .loops
+                .iter()
+                .find(|l| l.function == function.name && l.at == at)
+                .map(|l| l.bound)
+        };
+        // The loop's own annotation, then the one for a lock word's protocol,
+        // then the one for the whole function.
+        let found = named(offset)
+            .or_else(|| {
+                let (n, _) = self.ann.atomic.as_ref()?;
+                self.holds_atomic(ctx.f, set).then_some(*n)
+            })
+            .or_else(|| named(ANY));
+        if found.is_some() {
+            self.used.insert((ctx.f, key));
+            return found.unwrap_or(1);
+        }
+        self.issues.loops.insert((ctx.f, key));
+        if several {
+            self.issues.irreducible.insert((ctx.f, key));
+        }
+        self.bodies.insert((ctx.f, key), set.clone());
+        *ctx.complete = false;
+        1
+    }
+
+    /// Whether the blocks are no more than the protocol of a lock word or the
+    /// retry of a compare-and-swap: at most six blocks that call nothing, one
+    /// of which has a store-exclusive or a wait for an event.
     fn holds_atomic(&mut self, f: usize, blocks: &BTreeSet<usize>) -> bool {
         let function = &self.image.functions[f];
         let cfg = self.cfg(f);
+        if blocks.len() > 6 || blocks.iter().any(|&b| !cfg.blocks[b].calls.is_empty()) {
+            return false;
+        }
         blocks.iter().any(|&b| {
             let blk = &cfg.blocks[b];
             function.insns[blk.first..blk.first + blk.len]
@@ -1294,7 +1373,6 @@ impl<'a> Analyzer<'a> {
         cost: u64,
         members: &BTreeSet<usize>,
         header: Option<usize>,
-        skipped: &HashSet<usize>,
         arrive: &mut HashMap<usize, u64>,
         outs: &mut Vec<Out2>,
         latch: &mut u64,
@@ -1302,10 +1380,8 @@ impl<'a> Analyzer<'a> {
         match kind {
             Out::Edge(t) if Some(t) == header => *latch = (*latch).max(cost),
             Out::Edge(t) if members.contains(&t) => {
-                if !skipped.contains(&t) {
-                    let e = arrive.entry(t).or_insert(0);
-                    *e = (*e).max(cost);
-                }
+                let e = arrive.entry(t).or_insert(0);
+                *e = (*e).max(cost);
             }
             kind => outs.push(Out2 { kind, cost }),
         }
@@ -1330,6 +1406,7 @@ impl<'a> Analyzer<'a> {
                 for c in &b.calls {
                     match c {
                         CallSite::Direct(g) => next.push(*g),
+                        CallSite::Copy(..) => {}
                         CallSite::Choice(gs) => next.extend(gs.iter().copied()),
                         _ => {}
                     }
@@ -1372,7 +1449,6 @@ struct Region {
 
 struct Solve<'a> {
     f: usize,
-    loops: &'a Loops,
     cost: &'a [u64],
     dead: &'a [bool],
     tails: &'a [u64],
@@ -1433,14 +1509,20 @@ pub fn note_run(elf: &Path, lines: &[String]) {
 /// ticks of the counter (instructions under -icount). A call that no test made
 /// is not in the map.
 fn call_maxima(lines: &[String]) -> BTreeMap<u16, u64> {
-    lines
-        .iter()
-        .filter_map(|l| l.strip_prefix("call maximum ticks: "))
-        .filter_map(|l| {
-            let (n, m) = l.split_once('=')?;
-            Some((n.trim().parse().ok()?, m.trim().parse().ok()?))
-        })
-        .collect()
+    let mut maxima: BTreeMap<u16, u64> = BTreeMap::new();
+    for l in lines {
+        let Some(l) = l.strip_prefix("call maximum ticks: ") else {
+            continue;
+        };
+        let Some((n, m)) = l.split_once('=') else {
+            continue;
+        };
+        if let (Ok(n), Ok(m)) = (n.trim().parse::<u16>(), m.trim().parse::<u64>()) {
+            let e = maxima.entry(n).or_default();
+            *e = (*e).max(m);
+        }
+    }
+    maxima
 }
 
 /// The row `row` of the line `<what> ticks: row=N ...`.
@@ -1451,11 +1533,12 @@ fn row_ticks(lines: &[String], spec: &str) -> Option<u64> {
     lines
         .iter()
         .filter_map(|l| l.strip_prefix(prefix.as_str()))
-        .find_map(|l| {
+        .filter_map(|l| {
             l.split_whitespace()
                 .find_map(|f| f.strip_prefix(key.as_str()))
-                .and_then(|n| n.parse().ok())
+                .and_then(|n| n.parse::<u64>().ok())
         })
+        .max()
 }
 
 struct Row {
@@ -1531,8 +1614,22 @@ fn analyse(
     frame.find_noreturn(&reach);
     frame.frame_of(dispatch, zero);
     let frame_cost = frame.wcet(dispatch);
+    if std::env::var_os("WCET_DEBUG").is_some() {
+        let mut rows: Vec<(u64, String)> = frame
+            .analysed()
+            .into_iter()
+            .map(|f| (frame.wcet(f).insns, image.functions[f].name.clone()))
+            .collect();
+        rows.sort_by(|a, b| b.cmp(a));
+        for (n, name) in rows.iter().take(25) {
+            eprintln!("frame callee {n:>8} {name}");
+        }
+    }
 
     let mut plain = Analyzer::new(image, ann);
+    // A restart of a long call with the number of another call goes through
+    // `dispatch` again, which measures that call as an entry of its own.
+    plain.free_functions([dispatch]);
     plain.find_noreturn(&reach);
     let restart_cost = plain.wcet(restart);
     let maxima = call_maxima(lines);
@@ -1565,7 +1662,16 @@ fn analyse(
                 insns,
                 complete: longest.complete && frame_cost.complete,
             }),
-            measured: maxima.get(&number).copied(),
+            measured: {
+                let rows = entry
+                    .map(|c| c.portions.iter().filter_map(|r| row_ticks(lines, r)).max())
+                    .unwrap_or(None);
+                if entry.is_some_and(|c| c.long) {
+                    rows
+                } else {
+                    maxima.get(&number).copied().max(rows)
+                }
+            },
             open: 0,
         });
         let mut reached = frame.reach(dispatch);
@@ -1592,7 +1698,7 @@ fn analyse(
                 insns: w.insns.saturating_add_signed(ann.calibration),
                 complete: w.complete,
             }),
-            measured: row_ticks(lines, &p.measured),
+            measured: p.measured.iter().filter_map(|r| row_ticks(lines, r)).max(),
             open: 0,
         });
         path_reaches.push(plain.reach(named(&p.symbol)?));
@@ -1668,8 +1774,30 @@ fn analyse(
             }
         }
     }
+    // How far the calibration can move before an estimate is below its measure.
+    let slack = calls
+        .iter()
+        .chain(&paths)
+        .filter_map(|r| match (r.estimate, r.measured) {
+            (Some(e), Some(m)) if e.complete => Some(e.insns as i64 - m as i64),
+            _ => None,
+        })
+        .min();
+    if let Some(slack) = slack {
+        let line = format!(
+            "calibration margin: the estimate of the tightest entry is {slack:+} instructions from its measure"
+        );
+        let _ = writeln!(text, "\n{line}");
+        let _ = writeln!(summary, "  {line}");
+    }
     // What could not be resolved on the analysed paths.
     let issues = [&frame.issues, &plain.issues];
+    let bodies: BTreeMap<(usize, u64), BTreeSet<usize>> = frame
+        .bodies
+        .iter()
+        .chain(plain.bodies.iter())
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
     let loops: BTreeSet<(usize, u64)> = issues
         .iter()
         .flat_map(|i| i.loops.iter().copied())
@@ -1680,7 +1808,7 @@ fn analyse(
         loops.len()
     );
     for &(f, at) in &loops {
-        let hint = loop_hint(image, f, at);
+        let hint = loop_hint(image, f, bodies.get(&(f, at)));
         let ran = traced
             .and_then(|t| t.blocks.get(&at))
             .map_or(String::new(), |r| {
@@ -1738,6 +1866,16 @@ fn analyse(
             .collect(),
     );
     section(
+        "functions that copy or fill a size no call site sets and no annotation gives",
+        issues
+            .iter()
+            .flat_map(|i| i.unsized_copies.iter())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|&f| short(&image.functions[f].name))
+            .collect(),
+    );
+    section(
         "loops with a second way in",
         issues
             .iter()
@@ -1763,12 +1901,33 @@ fn analyse(
         .iter()
         .filter(|l| {
             !used.iter().any(|&(f, at)| {
-                image.functions[f].name == l.function && at - image.functions[f].start == l.at
+                image.functions[f].name == l.function
+                    && (l.at == ANY || at - image.functions[f].start == l.at)
             })
         })
         .map(|l| format!("loop {} +{:#x}: {}", short(&l.function), l.at, l.why))
         .collect();
     section("bounds that no loop on the analysed paths matched", unused);
+    let mut seen: BTreeMap<(usize, u64), Seen> = frame.seen.clone();
+    seen.extend(plain.seen.clone());
+    let _ = writeln!(
+        text,
+        "\n== loops on the analysed paths, with their bounds: {}",
+        seen.len()
+    );
+    for (&(f, at), s) in &seen {
+        let inside = s.parent.map_or(String::new(), |p| {
+            format!(", inside the loop at +{:#x}", p - image.functions[f].start)
+        });
+        let _ = writeln!(
+            text,
+            "  {} bound {}{inside}, {} blocks{}",
+            locate(image, f, at),
+            s.bound,
+            s.blocks,
+            if s.bounded { "" } else { " (no bound)" }
+        );
+    }
     if let Some(t) = traced {
         let mut agree = 0usize;
         let mut off_image = 0usize;
@@ -1826,21 +1985,19 @@ fn analyse(
 
 /// What a loop does, for the line that names it: its size, the constants it
 /// compares against and the functions it calls.
-fn loop_hint(image: &Image, f: usize, at: u64) -> String {
+fn loop_hint(image: &Image, f: usize, body: Option<&BTreeSet<usize>>) -> String {
     let function = &image.functions[f];
     let cfg = Cfg::build(image, f, &Annotations::default());
-    let loops = Loops::find(&cfg);
-    let Some(h) = cfg.blocks.iter().position(|b| b.start == at) else {
-        return String::new();
-    };
-    let Some(body) = loops.body.get(&h) else {
+    let Some(body) = body else {
         return String::new();
     };
     let mut constants = BTreeSet::new();
     let mut callees = BTreeSet::new();
     let mut insns = 0;
     for &b in body {
-        let blk = &cfg.blocks[b];
+        let Some(blk) = cfg.blocks.get(b) else {
+            continue;
+        };
         insns += blk.len;
         for i in &function.insns[blk.first..blk.first + blk.len] {
             if matches!(i.mnemonic.as_str(), "cmp" | "cmn" | "subs" | "ands" | "tst")
@@ -1938,21 +2095,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut text = String::new();
     let mut summary = String::new();
     let mut below = Vec::new();
+    // The kernel of the second image is the same code with other tests: the
+    // first image gives the graph, and the measures of both are the longest.
+    let mut lines: Vec<String> = Vec::new();
     for stem in IMAGES {
         let file = measured.join(format!("{stem}.txt"));
-        let lines: Vec<String> = std::fs::read_to_string(&file)
-            .map_err(|e| format!("{}: {e}", file.display()))?
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        let elf = target_dir().join(format!("{stem}.elf"));
-        let image = Image::load(&elf)?;
-        let report = analyse(stem, &image, &ann, &lines, kernels.get(stem))?;
-        text += &report.text;
-        text.push('\n');
-        summary += &report.summary;
-        below.extend(report.below);
+        lines.extend(
+            std::fs::read_to_string(&file)
+                .map_err(|e| format!("{}: {e}", file.display()))?
+                .lines()
+                .map(str::to_owned),
+        );
     }
+    let stem = IMAGES[0];
+    let elf = target_dir().join(format!("{stem}.elf"));
+    let image = Image::load(&elf)?;
+    let report = analyse(stem, &image, &ann, &lines, kernels.get(stem))?;
+    text += &report.text;
+    summary += &report.summary;
+    below.extend(report.below);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let file = out.join("bound.txt");
     std::fs::write(&file, &text).map_err(|e| format!("{}: {e}", file.display()))?;
