@@ -31,7 +31,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 20;
+pub const PLATFORM_INTERFACE: u64 = 21;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -1415,6 +1415,40 @@ pub extern "C" fn stafeto_cpu_system_ns(who: c_int) -> i64 {
         |errno| -i64::from(errno),
         |(_, system)| system.min(i64::MAX as u64) as i64,
     )
+}
+
+/// getrusage and times: the user and the system time of `who` (0, 1 and -1
+/// as in `stafeto_cpu_ns`) in nanoseconds from one reading of the kernel, or
+/// a negated errno. The two parts of separate readings drift apart by what
+/// the kernel counts between them: a host that stalls the guest there moves
+/// that time from the user part to the system part, and the user time of a
+/// later reading may fall below an earlier one.
+///
+/// # Safety
+/// `user` and `system` are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_cpu_split_ns(
+    who: c_int,
+    user: *mut u64,
+    system: *mut u64,
+) -> c_int {
+    let split = match who {
+        0 => posix_abi::cpu::process_split_ns(),
+        -1 => call(posix_abi::cpu::children_split_ns),
+        1 => posix_abi::cpu::thread_split_ns(),
+        _ => Err(EINVAL),
+    };
+    match split {
+        Ok((u, s)) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                user.write(u);
+                system.write(s);
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 /// pthread_getcpuclockid: the id of the CPU-time clock of thread `tid`.
