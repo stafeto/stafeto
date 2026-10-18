@@ -180,18 +180,25 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// the entry records the rights of x1 to map, which bound its mem_protect.
 pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
     let entry = clock::now();
-    // The checks that read every mapping and every thread of the process
-    // are a section of their own, which also takes the range with a busy
-    // entry: no mapping and no buffer of another call joins it after the
-    // checks, so they are made once. The next section pays for the tables
-    // (maps::reserve_mapping, maps::fund_mapping): each section is short.
+    // Each section is short, and the range is taken with a busy entry in the
+    // one that checks it: no mapping and no buffer of another call joins it
+    // after the checks, so they are made once (maps::reserve_mapping). The
+    // page of the table of a process that has none is made in a section of
+    // its own, after the checks that need no table, and the tables the
+    // range may take are paid for in the last (maps::fund_mapping).
     #[cfg(feature = "window-probe")]
     crate::cmd::window::map_begins();
-    let first = objects(|| map_reserve(thread, a)).and_then(|on| {
-        #[cfg(feature = "window-probe")]
-        crate::cmd::window::map_gap();
-        objects(|| map_fund(thread, on))
-    });
+    let first = objects(|| map_table_needed(thread, a))
+        .and_then(|needed| match needed {
+            Some(target) => objects(|| process::make_table(target)),
+            None => Ok(()),
+        })
+        .and_then(|()| objects(|| map_reserve(thread, a)))
+        .and_then(|on| {
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::map_gap();
+            objects(|| map_fund(thread, on))
+        });
     #[cfg(feature = "window-probe")]
     crate::cmd::window::map_ends();
     match first {
@@ -238,12 +245,29 @@ fn map_lookups(
     Ok((target, m, rights, pages))
 }
 
+/// The section before the first one, for a process with no table of
+/// mappings: the checks up to the range touching no message buffer, in the
+/// order of spec 11, so that the page of the table is not asked of a quota
+/// before they pass; the process whose table the next section makes. None
+/// when there is a table, and the next section checks everything.
+fn map_table_needed(
+    thread: NonNull<Thread>,
+    a: &Args,
+) -> Result<Option<NonNull<crate::process::Process>>, Error> {
+    let (target, _, _, pages) = map_lookups(thread, a)?;
+    if process::has_table(target) {
+        return Ok(None);
+    }
+    process::check_buffers(target, a[4], pages)?;
+    Ok(Some(target))
+}
+
 /// The first section of mem_map: everything up to the range touching no
-/// mapping and no message buffer (INVALID_ARGS, process::check_free), then
-/// the entry, busy (LIMIT_REACHED, NO_MEMORY for the table's page).
+/// mapping and no message buffer (INVALID_ARGS), then the entry, busy
+/// (LIMIT_REACHED).
 fn map_reserve(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let (target, m, rights, pages) = map_lookups(thread, a)?;
-    process::check_free(target, a[4], pages)?;
+    process::check_buffers(target, a[4], pages)?;
     let access = access_arg(a[5])?;
     let map = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
     let offset = (a[2] / PAGE_SIZE) as u32;

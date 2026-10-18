@@ -116,21 +116,55 @@ fn page_address(m: &Mapping<NonNull<Memory>>, page: u32) -> u64 {
 /// ended, at most abi::MAX_THREADS. The caller holds a reference to the
 /// process.
 pub fn check_free(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), Error> {
-    #[cfg(feature = "window-probe")]
-    crate::cmd::window::map_checked();
-    let end = va + (pages << kcore::PAGE_SHIFT);
     // SAFETY: the caller holds a reference to the process; only the table
-    // and the list of threads are read.
+    // is read.
+    if let Some(table) = unsafe { table(process) } {
+        table.check_free(va, pages)?;
+    }
+    check_buffers(process, va, pages)
+}
+
+/// INVALID_ARGS when `pages` pages from `va` touch the message buffer of a
+/// thread of `process` (`check_free` without the mappings).
+pub fn check_buffers(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), Error> {
+    let end = va + (pages << kcore::PAGE_SHIFT);
+    // SAFETY: the caller holds a reference to the process; only the list of
+    // threads is read.
     unsafe {
-        if let Some(table) = table(process) {
-            table.check_free(va, pages)?;
-        }
         let mut next = (*process.as_ptr()).threads;
         while let Some(t) = next {
             if thread::buffer_page(t).is_some_and(|b| (va..end).contains(&(b as u64))) {
                 return Err(Error::InvalidArgs);
             }
             next = (*t.as_ptr()).siblings.and_then(|s| s.next);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `process` has its table of mappings: no mapping stands anywhere
+/// until it has.
+pub fn has_table(process: NonNull<Process>) -> bool {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    unsafe { table(process) }.is_some()
+}
+
+/// The table of mappings of `target`, made when it has none: NO_MEMORY when
+/// its quota falls short for the page, which is the table's afterwards.
+pub fn make_table(target: NonNull<Process>) -> Result<(), Error> {
+    crate::obj::assert_held();
+    let p = target.as_ptr();
+    // SAFETY: the caller's promise; only these fields are borrowed.
+    unsafe {
+        if (*p).maps.is_none() {
+            let (quota, log) = (&mut (*p).quota, &mut (*p).pages);
+            let page = PaidPages::new(KernelPages, quota, log)
+                .alloc_page()
+                .ok_or(Error::NoMemory)?;
+            let t = page.cast::<Table>();
+            t.write(Table::new());
+            (*p).maps = Some(t);
         }
     }
     Ok(())
@@ -145,42 +179,29 @@ pub fn in_mapping(process: NonNull<Process>, va: usize) -> bool {
     unsafe { table(process) }.is_some_and(|t| t.check_free(va as u64, 1).is_err())
 }
 
-/// The entry of mem_map, step (6), `mapping`, whose range the call checked
-/// (`check_free`) in the same section: LIMIT_REACHED when `target` has
-/// abi::MAX_MAPPINGS mappings; NO_MEMORY when its quota falls short for the
-/// page of its table at its first mapping, which then stays the table's. The
-/// entry goes in, busy, with a new reference to its object: the range is
-/// taken from now on, whatever section comes next, so that no call of
-/// another CPU can take it or put a message buffer in it, and the checks do
-/// not repeat. `fund_mapping` pays for the tables; until then the change
-/// holds no bytes. The caller holds a reference to `target`, which lives.
+/// The entry of mem_map, steps (5) and (6), `mapping`: INVALID_ARGS when its
+/// range shares a page with a mapping (the buffers of the threads the call
+/// checked, `check_buffers`, in the same section), LIMIT_REACHED when
+/// `target` has abi::MAX_MAPPINGS mappings, NO_MEMORY when its quota falls
+/// short for the page of its table at its first mapping, which then stays
+/// the table's. The entry goes in, busy, with a new reference to its object:
+/// the range is taken from now on, whatever section comes next, so that no
+/// call of another CPU can take it or put a message buffer in it, and the
+/// checks do not repeat. `fund_mapping` pays for the tables; until then the
+/// change holds no bytes. The caller holds a reference to `target`, which
+/// lives.
 pub fn reserve_mapping(
     target: NonNull<Process>,
     mapping: Mapping<NonNull<Memory>>,
     access: Access,
 ) -> Result<Change, Error> {
     crate::obj::assert_held();
-    let p = target.as_ptr();
-    // SAFETY: the caller's promise; only these fields are borrowed.
-    unsafe {
-        if table(target).is_some_and(|t| t.len() == kcore::maps::MAX_MAPPINGS) {
-            return Err(Error::LimitReached);
-        }
-        if (*p).maps.is_none() {
-            let (quota, log) = (&mut (*p).quota, &mut (*p).pages);
-            let page = PaidPages::new(KernelPages, quota, log)
-                .alloc_page()
-                .ok_or(Error::NoMemory)?;
-            let t = page.cast::<Table>();
-            t.write(Table::new());
-            (*p).maps = Some(t);
-        }
-    }
-    // SAFETY: as above.
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_checked();
+    make_table(target)?;
+    // SAFETY: as above; the table was just made.
     let table = unsafe { table(target) }.expect("the table was just made");
-    let index = table
-        .insert_free(mapping)
-        .expect("a table with room takes a checked entry");
+    let index = table.insert_checked(mapping)?;
     table.set_busy(index, true);
     memory::retain_mapping(mapping.object);
     Ok(Change {
