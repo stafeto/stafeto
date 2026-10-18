@@ -464,6 +464,9 @@ pub fn served_by(t: NonNull<Thread>) -> Option<u16> {
 pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     // SAFETY: the caller's promise; only the field is touched.
     if let Some(index) = try_index(t) {
+        // What was asked of the thread and not served is no ask of the next
+        // owner of the number.
+        crate::cmd::take_asked(t);
         // SAFETY: the caller's promise; only the field is written.
         unsafe { (*t.as_ptr()).numbers.index = NONE };
         tokens.free(index);
@@ -656,6 +659,16 @@ pub unsafe fn copy_later(to: NonNull<Thread>, from: NonNull<Thread>, range: Rang
         start: range.start,
         end: range.end,
     };
+}
+
+/// Waits until the copies of messages to or from the buffer of `t` are made
+/// (`copy_later`): the CPU that makes them holds no lock and needs nothing
+/// of this one.
+pub fn wait_copies(t: NonNull<Thread>) {
+    // SAFETY: the caller holds the thread; the counter is atomic.
+    while unsafe { (*t.as_ptr()).numbers.copying.load(Ordering::Acquire) } != 0 {
+        core::hint::spin_loop();
+    }
 }
 
 /// Makes the copy that `copy_later` left, outside OBJ: each call that

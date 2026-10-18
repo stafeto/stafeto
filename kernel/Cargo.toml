@@ -27,6 +27,10 @@ fault-probe = []
 overflow-probe = []
 # The kernel acts as if PSCI refused CPU_ON for the third CPU (xtask smp-cpu-on).
 cpu-on-refused = []
+# The kernel widens the window between the section that posts a command and
+# its flush, and holds the end of a thread of a process that is killed until
+# the reply to it is on its way (xtask smp-window).
+window-probe = []
 measure = []
 atomic-locks = ["kcore/atomic-locks"]
 locked-decide = []

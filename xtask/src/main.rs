@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 241;
+const INIT_TESTS: u32 = 242;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1213,10 +1213,13 @@ enum Variant {
     OverflowProbe,
     /// PSCI refuses CPU_ON for the third CPU (`smp_cpu_on`).
     CpuOnRefused,
+    /// A window between the post of a command and its flush, and the end of
+    /// a thread inside it (`smp_window`).
+    WindowProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 9] = [
+    const ALL: [Variant; 10] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1226,6 +1229,7 @@ impl Variant {
         Variant::FaultProbe,
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
+        Variant::WindowProbe,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1243,6 +1247,7 @@ impl Variant {
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
+            Variant::WindowProbe => Some("window-probe"),
         }
     }
 
@@ -1253,7 +1258,8 @@ impl Variant {
             | Variant::TraceNormal
             | Variant::FaultProbe
             | Variant::OverflowProbe
-            | Variant::CpuOnRefused => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::CpuOnRefused
+            | Variant::WindowProbe => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
             | Variant::Trace
@@ -1292,6 +1298,7 @@ impl Variant {
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
+            Variant::WindowProbe => "stafeto-window",
         }
     }
 }
@@ -1462,6 +1469,7 @@ fn main() {
         Some("smp-boot") => smp_boots(),
         Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
+        Some("smp-window") => smp_window(),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
@@ -7322,6 +7330,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             smp_boot(&qemu::VIRT_EL2_V3, GIC_V3_LINE)
         }),
         job("smp 4 CPU_ON refused", smp_cpu_on),
+        job("smp 4 window", smp_window),
         // The tests of SMP stage 4 on four CPUs, with the whole test init
         // (the other stages of SMP, 5 and 6, bring the rest of ci to four).
         job("smp 4 probes GICv2", || {
@@ -8856,7 +8865,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 7] = [
+const SMP_PROBE_LINES: [&str; 8] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
@@ -8864,6 +8873,7 @@ const SMP_PROBE_LINES: [&str; 7] = [
     "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
+    "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
 ];
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
@@ -8924,10 +8934,28 @@ fn smp_cpu_on() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask smp-window`: the test init on four CPUs with a kernel that
+/// holds the end of the client of one test until its reply is posted and
+/// keeps the command of that reply from going out for 20 ms: the client's
+/// CPU ends the client in the window, and the kernel says so.
+fn smp_window() -> Result<(), String> {
+    init_tests_in(Variant::WindowProbe, &qemu::VIRT, false, SMP_CPUS).map(drop)
+}
+
 /// `init_tests` with `cpus` CPUs: with more than one, the lines of the tests
 /// of SMP stage 4 must be there.
 fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, String> {
-    let a = build(Variant::Normal)?;
+    init_tests_in(Variant::Normal, m, icount, cpus)
+}
+
+/// `init_tests_on` with the kernel of `variant`.
+fn init_tests_in(
+    variant: Variant,
+    m: &qemu::Machine,
+    icount: bool,
+    cpus: usize,
+) -> Result<usize, String> {
+    let a = build(variant)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     if cpus > 1 {
@@ -8957,6 +8985,12 @@ fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, 
     if cpus == SMP_CPUS {
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
+        }
+        if variant == Variant::WindowProbe {
+            qemu::expect_line(
+                &o,
+                "smp window  a thread ended on its CPU between the post of its command and the flush",
+            )?;
         }
         for start in [
             "smp: a thread at EL0 on CPU 1 ran ",

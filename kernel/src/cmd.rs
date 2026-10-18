@@ -8,16 +8,21 @@
 //! `BOOST`, `EXIT`), the arguments in the thread's own words, and the thread
 //! in the queue "CPU i to CPU j" of the sender, then an SGI. A queue has one
 //! writer and one reader and never waits: a thread stands in the queues once
-//! at most (the flags are set at the first command only, and the reader
-//! clears them when it takes the thread), so THREADS places are enough and
-//! a full queue cannot happen.
+//! at most (the reader clears the flags when it takes the thread, and the
+//! first command after that puts the thread in a queue again), so THREADS
+//! places are enough and a full queue cannot happen.
 //!
-//! A section posts into the CPU's outbox (`post`); the outbox is sent at
-//! the top of the loop of the way out of the kernel (`flush`), after the
-//! copy of a message that a woken thread reads (thread::flush_copy), and
-//! after the section under OBJ ended: the SGI is no part of its hold. The
-//! owner takes the commands where it handles the SGI (`drain`), on an empty
-//! kernel stack, and serves each thread's flags in a fixed order.
+//! A section posts into the CPU's outbox (`post`): the flag goes into the
+//! thread inside the section, under OBJ, so that the owner's own end of the
+//! thread sees a command on its way (`pending`) and hands the kernel's
+//! reference to the command (`sched::exit`). The outbox is sent at the top
+//! of the loop of the way out of the kernel (`flush`), after the copy of a
+//! message that a woken thread reads (thread::flush_copy), and after the
+//! section under OBJ ended: the thread goes into the queue and the SGI is no
+//! part of its hold. The owner takes the commands where it handles the SGI
+//! (`drain`), on an empty kernel stack, and serves each thread's flags in a
+//! fixed order; a thread that ended meanwhile is skipped, and a woken
+//! thread waits for the copy of its message (`serve_wake`).
 
 use crate::arch::cpu::{self, MAX_CPUS};
 use crate::arch::gic;
@@ -184,8 +189,30 @@ impl Outbox {
     }
 }
 
-/// Posts `flag` for `t`, a thread of another CPU, to go out at `flush`.
+/// The outbox item of a thread that goes into the queue to its CPU, with the
+/// flag that found it in none.
+const PUSH: u8 = 128;
+
+/// Whether commands of `t` are on their way to its CPU: set, and not yet
+/// taken by the owner. Read on the owner, under OBJ.
+pub fn pending(t: NonNull<Thread>) -> bool {
+    thread_cmds(t).load(Ordering::Relaxed) != 0
+}
+
+/// Posts `flag` for `t`, a thread of another CPU, under OBJ: the flag goes
+/// into the thread now, and the thread into the queue to its CPU at `flush`
+/// when no command stood there before (the one that did puts it in). The
+/// owner's own end of a thread with a command on its way sets `EXIT` the
+/// same way. The kernel's reference keeps the thread until the owner
+/// serves the commands.
 pub fn post(t: NonNull<Thread>, flag: u8) {
+    crate::obj::assert_held();
+    // Release: what the section wrote for the owner (the arguments, the
+    // delivered message) is there when the owner takes the flag.
+    let before = thread_cmds(t).fetch_or(flag, Ordering::Release);
+    if before != 0 {
+        return;
+    }
     debug_assert!(thread::cpu_of(t) != cpu::this().index());
     let mut o = local().outbox.lock();
     assert!(
@@ -193,7 +220,7 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
         "a section posts more commands than the outbox holds"
     );
     let n = o.n;
-    o.items[n] = (t.as_ptr() as usize, flag);
+    o.items[n] = (t.as_ptr() as usize, PUSH | flag);
     o.n += 1;
     local()
         .deferred
@@ -240,9 +267,9 @@ pub fn flush_posted() {
     }
 }
 
-/// Sends what the sections posted: each thread's flag, the thread into the
-/// queue to its CPU when it is not in one, and one SGI to each CPU that has
-/// something new. Outside OBJ, with the copies of messages made.
+/// Sends what the sections posted: each thread into the queue to its CPU,
+/// and one SGI to each CPU that has something new. Outside OBJ, with the
+/// copies of messages made.
 #[inline(never)]
 pub fn flush() {
     local()
@@ -268,15 +295,15 @@ pub fn flush() {
                 mask |= 1 << to;
                 continue;
             }
-            // SAFETY: the kernel's reference keeps the thread of a command.
+            debug_assert!(flag & PUSH != 0);
+            // SAFETY: the kernel's reference keeps the thread of a command
+            // until the owner serves it, and the owner takes it from this
+            // queue.
             let t = unsafe { NonNull::new_unchecked(what as *mut Thread) };
+            #[cfg(feature = "window-probe")]
+            window::open(t, flag & !PUSH);
             let to = thread::cpu_of(t);
-            // Release: what the section wrote for the owner (the message,
-            // the arguments) is there when the owner takes the flag.
-            let before = thread_cmds(t).fetch_or(flag, Ordering::Release);
-            if before == 0 {
-                RINGS[to][me].push(t.as_ptr() as usize, to);
-            }
+            RINGS[to][me].push(t.as_ptr() as usize, to);
             mask |= 1 << to;
         }
         o.n = 0;
@@ -331,5 +358,91 @@ fn serve(t: NonNull<Thread>, flags: u8) {
     }
     if flags & EXIT != 0 {
         sched::serve_exit(t);
+    }
+}
+
+/// The probe of the window between the section that posts a command and
+/// its flush (`window-probe`; tests/init/src/smp.rs, the test of the client
+/// that ends with its reply on its way).
+#[cfg(feature = "window-probe")]
+pub mod window {
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+
+    /// The priority of the thread the probe watches: the client of the test.
+    pub const LEVEL: u8 = 17;
+
+    static OPENED: AtomicBool = AtomicBool::new(false);
+    static HOLDING: AtomicBool = AtomicBool::new(false);
+    static ENDED_INSIDE: AtomicBool = AtomicBool::new(false);
+
+    /// In `flush`, before the first command WAKE to a thread at LEVEL goes
+    /// into its queue once its end is held (`hold_until_replied`): waits
+    /// 20 ms, in which the CPU of the thread ends it, and says whether it
+    /// did.
+    pub fn open(t: NonNull<Thread>, flag: u8) {
+        // SAFETY: the kernel's reference keeps the thread.
+        if flag != WAKE
+            || !HOLDING.load(Ordering::Acquire)
+            || unsafe { t.as_ref() }.priority() != LEVEL
+            || OPENED.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;
+        while crate::arch::timer::now() < until {
+            core::hint::spin_loop();
+        }
+        if ENDED_INSIDE.load(Ordering::Acquire) {
+            kprintln!(
+                "smp window  a thread ended on its CPU between the post of its command and the flush"
+            );
+        }
+    }
+
+    /// In the stage Threads of a process, before its threads end: a thread
+    /// at LEVEL that waits for a reply is let alone until the reply took it
+    /// out of its wait, 50 ms at most, so that its end follows the post of
+    /// the reply.
+    ///
+    /// # Safety
+    /// `first` is the thread at the cursor of the stage, which is alive; no
+    /// section of OBJ is held.
+    pub unsafe fn hold_until_replied(first: Option<NonNull<Thread>>) {
+        let mut next = first;
+        while let Some(t) = next {
+            // SAFETY: the caller's promise; the list is of live threads.
+            let (priority, after) = unsafe {
+                (
+                    t.as_ref().priority(),
+                    (*t.as_ptr()).siblings.and_then(|s| s.next),
+                )
+            };
+            if priority == LEVEL {
+                let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 20;
+                let mut held = false;
+                loop {
+                    let waiting = {
+                        let _section = crate::obj::lock();
+                        thread::waits(t)
+                    };
+                    if waiting && !held {
+                        held = true;
+                        HOLDING.store(true, Ordering::Release);
+                    }
+                    if !waiting {
+                        if held {
+                            ENDED_INSIDE.store(true, Ordering::Release);
+                        }
+                        break;
+                    }
+                    if crate::arch::timer::now() > until {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+            next = after;
+        }
     }
 }

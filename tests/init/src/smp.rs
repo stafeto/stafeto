@@ -8,13 +8,14 @@
 //! them on four, where each also prints the line xtask looks for.
 
 use crate::harness::*;
-use crate::processes::{Gift, Kid, LEAF_QUOTA, kid_mark, reset_kid_marks};
-use abi::{Call, Error, Rights};
+use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks};
+use crate::transfers::copy_raw;
+use abi::{Call, Error, ProcessState, Rights};
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 9] = [
+pub(crate) const TESTS: [Test; 10] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -44,6 +45,10 @@ pub(crate) const TESTS: [Test; 9] = [
     (
         "smp_timer_of_another_cpu_is_armed_there_and_let_go_there",
         timer_across_cpus,
+    ),
+    (
+        "smp_client_ends_on_its_cpu_while_its_reply_is_on_its_way",
+        client_ends_with_reply_on_its_way,
     ),
 ];
 
@@ -692,6 +697,74 @@ fn timer_across_cpus() -> Outcome {
     check(ended, "the thread on CPU 1 did not stop")?;
     println!(
         "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on"
+    );
+    Ok(())
+}
+
+/// The process the killer of the reply test ends, by its handle.
+static VICTIM: AtomicU64 = AtomicU64::new(0);
+
+/// The priority of the client of the reply test: the kernel built with
+/// `window-probe` holds the end of a thread at it until its reply was posted
+/// and widens the window between the post and the flush (kernel cmd::window).
+const WINDOW_LEVEL: u8 = 17;
+/// The killer's, above the client's.
+const KILLER: u8 = 18;
+
+/// Says it is about to end the victim, and ends it.
+extern "C" fn kill_victim(_: u64) -> ! {
+    let p = Handle::<Process>::borrowed(abi::Handle(VICTIM.load(Relaxed)));
+    MARKS[0].store(1, SeqCst);
+    MARKS[1].store(if sys::process_kill(&p).is_ok() { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// A client on CPU 1 waits for the reply of init on CPU 0; the process of
+/// the client is killed, its end on CPU 1 begins, and the reply goes out:
+/// the CPU of the client ends it while the wake that the reply posted for it
+/// is on its way from CPU 0. The wake finds the thread ended and does
+/// nothing; the kernel goes on (the kernel built with `window-probe` makes
+/// the order sure and prints the line xtask looks for).
+fn client_ends_with_reply_on_its_way() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    let send = copy_raw(&c, Rights::SEND | Rights::TRANSFER)?;
+    SPAWN_CPU.store(2, Relaxed);
+    let kid = Kid::load(LEAF_QUOTA, 16, WINDOW_LEVEL);
+    SPAWN_CPU.store(0, Relaxed);
+    let kid = kid?;
+    kid.start()?;
+    kid.serve(Role::Send, &[1], &[Gift::Given(send)])?;
+    VICTIM.store(kid.process.raw().0, Relaxed);
+    let Ok(Received::Message { token, .. }) = sys::receive(&c) else {
+        return Err("the client's request did not come");
+    };
+    let killer = spawn_on(0, 1, kill_victim, 0, KILLER)?;
+    check(
+        wait_for(|| mark(0) != 0),
+        "the killer on CPU 1 did not start",
+    )?;
+    // The CPUs see the gate of the process meanwhile: its end waits for the
+    // reply, which follows.
+    pause(3_000_000);
+    let _ = token.reply(&[]);
+    let done = wait_for(|| mark(1) != 0);
+    let state = kid.end();
+    let_run()?;
+    close(killer)?;
+    kid.close()?;
+    close(c)?;
+    check(done && mark(1) == 1, "process_kill of the client failed")?;
+    check(
+        state == Ok(ProcessState::Killed),
+        "the client's process did not end killed",
+    )?;
+    println!(
+        "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on"
     );
     Ok(())
 }

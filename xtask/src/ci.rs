@@ -180,6 +180,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("smp 4 EL2 GICv2", 2),
     ("smp 4 EL2 GICv3", 2),
     ("smp 4 CPU_ON refused", 2),
+    ("smp 4 window", 2),
     ("smp 4 probes GICv2", 25),
     ("smp 4 probes GICv3", 25),
     ("smp 4 probes EL2 GICv2", 25),

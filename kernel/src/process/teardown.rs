@@ -433,6 +433,11 @@ unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
             return false;
         }
     }
+    #[cfg(feature = "window-probe")]
+    // SAFETY: the caller's promise; no section is held here.
+    unsafe {
+        crate::cmd::window::hold_until_replied((*p).threads_next)
+    };
     // SAFETY: the caller's promise; a thread in the list is alive, since a
     // release only queues it, and its portion takes it out of the list
     // first.

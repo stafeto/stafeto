@@ -216,6 +216,8 @@ pub fn init_cpu() {
 /// BAD_STATE for a thread that started before. thread::start comes here,
 /// once it knows the thread's process lives.
 pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
+    // The flag of START goes into the thread inside the section (cmd::post).
+    let _section = crate::obj::lock();
     if !thread::mark_started(t) {
         return Err(Error::BadState);
     }
@@ -285,21 +287,37 @@ pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: 
     false
 }
 
-/// START, served by the CPU of the thread.
+/// START, served by the CPU of the thread, unless the thread ended since:
+/// the kernel's reference goes with its EXIT.
 pub fn serve_start(t: NonNull<Thread>) {
+    let _section = crate::obj::lock();
+    if !thread::is_held(t) {
+        return;
+    }
     // SAFETY: the kernel's reference, which `start` took, keeps the thread.
     unsafe { local().sched.lock().s.start(t) }.expect("a thread that started before");
 }
 
-/// UNPARK, served by the CPU of the thread.
+/// UNPARK, served by the CPU of the thread, unless it ended since.
 pub fn serve_unpark(t: NonNull<Thread>) {
+    let _section = crate::obj::lock();
+    if !thread::is_held(t) {
+        return;
+    }
     // SAFETY: as above; the portion that asked took the thread out of its
     // process's list.
     unsafe { local().sched.lock().s.unpark(t) };
 }
 
-/// WAKE, served by the CPU of the thread.
+/// WAKE, served by the CPU of the thread, unless it ended since, once the
+/// copy of its message is made (`flush_copy` of the CPU that woke it comes
+/// after the flag, and takes the time of 960 bytes).
 pub fn serve_wake(t: NonNull<Thread>) {
+    thread::wait_copies(t);
+    let _section = crate::obj::lock();
+    if !thread::is_held(t) {
+        return;
+    }
     // SAFETY: as above; the section that asked took the thread out of its
     // queue.
     unsafe { local().sched.lock().s.wake(t) };
@@ -310,21 +328,21 @@ pub fn serve_wake(t: NonNull<Thread>) {
 /// level in its queue (`channel::requeue`), and the rise goes on along the
 /// chain of requests.
 pub fn serve_level(t: NonNull<Thread>) {
-    if thread::try_index(t).is_none() {
-        // The thread ended on its own CPU meanwhile.
+    let _section = crate::obj::lock();
+    if !thread::is_held(t) {
+        // The thread ended meanwhile; its number may be another thread's.
         return;
     }
     let (level, boost, _) = crate::cmd::take_asked(t);
-    let _section = crate::obj::lock();
     let now = timer::now();
     let waits = locked(|k| {
         // SAFETY: as above; the scheduler's threads are alive.
         unsafe {
-            if level != 0 && thread::is_held(t) {
+            if level != 0 {
                 let (priority, policy, tail) = unpack_level(level);
                 let _ = k.s.set_priority(t, priority, policy, tail, now);
             }
-            if boost != 0 && thread::is_held(t) {
+            if boost != 0 {
                 k.s.boost(t, (boost & 0x3f) as u8, ((boost >> 6) & 0x3f) as u8);
             }
             channel::requeue(t, k)
@@ -394,9 +412,13 @@ fn unpack_level(word: u16) -> (u8, Policy, bool) {
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     // A thread that started runs on its CPU, which ends it (cmd::EXIT); one
-    // that never started stands in no scheduler.
-    let remote = thread::is_started(t) && !is_local(t);
+    // that never started stands in no scheduler. The CPU's own end of a
+    // thread with commands on their way leaves the kernel's reference and
+    // the number to the command EXIT, which follows them (`serve_exit`).
+    let started = thread::is_started(t);
+    let remote = started && !is_local(t);
     let (held, waited) = locked(|k| {
+        let deferred = remote || (started && crate::cmd::pending(t));
         // SAFETY: `t` is alive; the list of a process's parked threads is
         // under OBJ.
         if unsafe { t.as_ref() }.sched.is_parked_listed() {
@@ -410,10 +432,11 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
             // SAFETY: as above.
             unsafe { k.s.exit(t, timer::now()) };
         }
-        if remote {
+        if deferred {
             // The number goes back once the owner ended the thread
             // (`serve_exit`): the arguments of its commands lie under it.
             crate::cmd::ask_exit(t, thread::mark_ended(t), cause);
+            crate::cmd::post(t, crate::cmd::EXIT);
             return (false, waited);
         }
         // SAFETY: as above.
@@ -423,10 +446,6 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
         unsafe { via.let_go(cause) };
-    }
-    if remote {
-        crate::cmd::post(t, crate::cmd::EXIT);
-        return;
     }
     if thread::current() == Some(t) {
         arch::user::clear_current();
