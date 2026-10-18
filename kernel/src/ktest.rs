@@ -71,7 +71,7 @@ use kcore::paging::{
 use kcore::quota::Account;
 use kcore::sched::State;
 use kcore::slab::Pool;
-use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
+use kcore::sysreg::{self, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
@@ -1828,7 +1828,7 @@ fn system_registers_open_el0(_: &Boot) -> Result<(), &'static str> {
         "FP and SIMD instructions trap",
     )?;
     check(
-        registers::cntkctl_el1() == CNTKCTL_EL1,
+        registers::cntkctl_el1() == sysreg::cntkctl_el1(crate::arch::timer::frequency()),
         "EL0 cannot read the virtual counter, or can reach more timer registers",
     )?;
     check(

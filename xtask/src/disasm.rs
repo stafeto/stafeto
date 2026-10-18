@@ -213,6 +213,26 @@ fn check_smp_order(text: &str) -> Result<(), String> {
     if barrier > write {
         return Err("send_sgi_v2 writes GICD_SGIR before its dmb ishst".into());
     }
+    let ack = need("kernel::arch::aarch64::gic::acknowledge_v2")?;
+    let read = ack
+        .iter()
+        .position(|l| instruction(l).is_some_and(|(m, _)| m.starts_with("ldr")))
+        .ok_or("acknowledge_v2 never reads GICC_IAR")?;
+    let after = position(&ack, "dmb", "ishld").ok_or("acknowledge_v2 has no dmb ishld")?;
+    if after < read {
+        return Err("acknowledge_v2 runs its dmb ishld before it reads GICC_IAR".into());
+    }
+    let awake = need("kernel::qsbr::awake")?;
+    let fence = position(&awake, "dmb", "ish").ok_or("qsbr::awake has no dmb ish")?;
+    // The store of the epoch, an `stlr` or `str`; a `stp` of a frame is the
+    // way to a panic.
+    let store = awake
+        .iter()
+        .position(|l| instruction(l).is_some_and(|(m, _)| m == "stlr" || m == "str"))
+        .ok_or("qsbr::awake never stores its epoch")?;
+    if fence < store {
+        return Err("qsbr::awake stores its epoch after its dmb ish".into());
+    }
     let v3 = need("kernel::arch::aarch64::gic::send_sgi_v3")?;
     let dsb = position(&v3, "dsb", "ishst").ok_or("send_sgi_v3 has no dsb ishst")?;
     let msr = v3
@@ -237,7 +257,9 @@ fn check_smp_order(text: &str) -> Result<(), String> {
 /// `check_smp_order` on the kernel at `elf`.
 pub fn smp_order(elf: &Path, objdump: &Path) -> Result<(), String> {
     check_smp_order(&disassemble(elf, objdump)?)?;
-    println!("SMP start and SGI order: dc cvac before CPU_ON, barriers before the SGI registers");
+    println!(
+        "SMP start and SGI order: dc cvac before CPU_ON, barriers before the SGI registers, after GICC_IAR and after the epoch of a wake"
+    );
     Ok(())
 }
 
@@ -649,7 +671,7 @@ mod tests {
     }
     use super::*;
 
-    /// A disassembly of the four functions `check_smp_order` reads, with
+    /// A disassembly of the six functions `check_smp_order` reads, with
     /// the lines of `broken` replaced by the text given for them.
     fn smp_text(replace: &[(&str, &str)]) -> String {
         let mut text = String::from(
@@ -661,7 +683,11 @@ mod tests {
              20 <kernel::arch::aarch64::gic::send_sgi_v2>:\n\
              20: \tdmb\tishst\n24: \tstr\tw1, [x8, #0xf00]\n28: \tret\n\n\
              30 <kernel::arch::aarch64::gic::send_sgi_v3>:\n\
-             30: \tdsb\tishst\n34: \tmsr\tICC_SGI1R_EL1, x8\n38: \tisb\n3c: \tret\n\n",
+             30: \tdsb\tishst\n34: \tmsr\tICC_SGI1R_EL1, x8\n38: \tisb\n3c: \tret\n\n\
+             40 <kernel::arch::aarch64::gic::acknowledge_v2>:\n\
+             40: \tldr\tw0, [x8, #0xc]\n44: \tdmb\tishld\n48: \tret\n\n\
+             50 <kernel::qsbr::awake>:\n\
+             50: \tstlr\tx9, [x8]\n54: \tdmb\tish\n58: \tret\n\n",
         );
         for (from, to) in replace {
             text = text.replace(from, to);
@@ -702,6 +728,24 @@ mod tests {
         );
         assert!(broken(&[("30: \tdsb\tishst", "30: \tnop")]).contains("no dsb ishst"));
         assert!(broken(&[("38: \tisb", "38: \tnop")]).contains("no isb"));
+        // The read of GICC_IAR without the barrier after it, or before it.
+        assert!(broken(&[("44: \tdmb\tishld", "44: \tnop")]).contains("no dmb ishld"));
+        assert!(
+            broken(&[(
+                "40: \tldr\tw0, [x8, #0xc]\n44: \tdmb\tishld",
+                "40: \tdmb\tishld\n44: \tldr\tw0, [x8, #0xc]"
+            )])
+            .contains("before it reads GICC_IAR")
+        );
+        // The wake from idle without its fence, or with the store after it.
+        assert!(broken(&[("54: \tdmb\tish", "54: \tnop")]).contains("no dmb ish"));
+        assert!(
+            broken(&[(
+                "50: \tstlr\tx9, [x8]\n54: \tdmb\tish",
+                "50: \tdmb\tish\n54: \tstlr\tx9, [x8]"
+            )])
+            .contains("after its dmb ish")
+        );
     }
 
     #[test]

@@ -84,7 +84,7 @@ impl Sched {
 pub fn entry_started() -> u64 {
     // The exception entry synchronized: no ISB before the read.
     let now = timer::now_unordered();
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).0 = now };
     #[cfg(feature = "measure")]
     crate::obj::stretch_begins(now);
@@ -95,7 +95,7 @@ pub fn entry_started() -> u64 {
 /// `exit_loop`'s, or one between two portions of a long call (spec 7.7).
 #[inline(always)]
 pub fn entry_polled() {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     if unsafe { (*local().entry.get()).0 } != 0 {
         let now = timer::now();
         entry_polled_at(now);
@@ -124,11 +124,12 @@ fn polled_at(now: u64) {
 #[inline(always)]
 fn entry_polled_at(now: u64) {
     let cpu = local();
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     let timing = unsafe { &mut *cpu.entry.get() };
     if timing.0 != 0 {
-        // The counter never runs backwards: `now` was read after the entry's.
-        let elapsed = now.wrapping_sub(timing.0);
+        // `now` was read after the entry's; a counter that steps back (the
+        // A64's, #355) gives an interval of 0.
+        let elapsed = now.saturating_sub(timing.0);
         if elapsed > timing.1 {
             timing.1 = elapsed;
         }
@@ -138,14 +139,14 @@ fn entry_polled_at(now: u64) {
 }
 
 pub fn longest_entry_to_poll() -> u64 {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).1 }
 }
 
 /// Whether an entry started and has not polled yet.
 #[cfg(feature = "ktest")]
 pub fn entry_unpolled() -> bool {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { (*local().entry.get()).0 != 0 }
 }
 
@@ -153,14 +154,14 @@ pub fn entry_unpolled() -> bool {
 /// longest interval so far.
 #[cfg(feature = "ktest")]
 pub fn entry_timing() -> (u64, u64) {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { *local().entry.get() }
 }
 
 /// Puts `timing` back, as `entry_timing` read it.
 #[cfg(feature = "ktest")]
 pub fn set_entry_timing(timing: (u64, u64)) {
-    // SAFETY: single core with interrupts masked, as above.
+    // SAFETY: the CPU's own field, with interrupts masked, as above.
     unsafe { *local().entry.get() = timing };
 }
 
