@@ -251,6 +251,12 @@ impl Thread {
     pub fn priority(&self) -> u8 {
         self.sched.priority()
     }
+
+    /// The level the thread was given, without a boost.
+    #[cfg(feature = "window-probe")]
+    pub fn base_priority(&self) -> u8 {
+        self.sched.base()
+    }
 }
 
 /// The CPU `t` runs on.

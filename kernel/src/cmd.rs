@@ -438,7 +438,7 @@ pub mod window {
             // SAFETY: the caller's promise; the list is of live threads.
             let (priority, after) = unsafe {
                 (
-                    t.as_ref().priority(),
+                    t.as_ref().base_priority(),
                     (*t.as_ptr()).siblings.and_then(|s| s.next),
                 )
             };
@@ -483,7 +483,9 @@ pub mod window {
     fn is_service(t: NonNull<Thread>) -> bool {
         // SAFETY: the callers hold the thread: the kernel's reference keeps
         // it until its commands are served.
-        unsafe { t.as_ref() }.priority() == SERVICE_LEVEL
+        // The level it was given: a client raised from another CPU boosts it
+        // before its process ends, and the probe holds its end all the same.
+        unsafe { t.as_ref() }.base_priority() == SERVICE_LEVEL
     }
 
     /// In `drain`, right after the owner took the flags of `t`: the first
