@@ -79,6 +79,38 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 
+## What programs see of the CPUs
+
+- `object_info` CPU (kind 15, no handle and no lock) gives the CPUs up, the
+  ticks of one CPU since it started, those it slept in `wfi` and those its
+  entries from EL0 spent in the kernel, and the caller's CPU. The owner of
+  a CPU counts the ticks of its entries when the entry polls (`Local::time`,
+  3 instructions on the path of the null call) and its sleeps in `sleep`;
+  the other CPUs read the words with one load each.
+- `sysconf(_SC_NPROCESSORS_CONF)` and `_SC_NPROCESSORS_ONLN`, `sched_getaffinity`
+  and the listing of `/sys/devices/system/cpu` (which BusyBox `nproc --all`
+  and htop count) give the CPUs that are up. `/proc/stat` has a line `cpuN`
+  for each CPU (user, system and idle from that call) and `/proc/cpuinfo` a
+  record for each; the field `processor` of `/proc/<pid>/stat` is the CPU of
+  the process's main thread.
+- The process service puts the main thread of every new image (spawn, fork
+  and exec) on the least busy CPU of the mask its page allows
+  (`Page::cpus`, 0 for all). A CPU is busy when it was awake a quarter of
+  the last window of 10 ms (the time asleep from `object_info` CPU, read once
+  per CPU when a window closes) and each image put on it in the last two
+  windows counts as one more; among equals the CPU after the last choice wins,
+  so images made in a row go to different CPUs. The step reads no process
+  record, so it costs the same with a hundred processes (`process-steps`
+  places on one CPU too, with 248 children live). A thread starts on the CPU of its creator or, when
+  the mask does not allow that, on the lowest CPU it names.
+  `sched_setaffinity` writes the mask of its process: the kernel moves no
+  thread, so the mask works for the threads made later and for the next exec
+  (`taskset -c N command`).
+- `cargo xtask cpus-dialog [N]` runs the dialog on N CPUs: `nproc`, the CPU
+  lines, `taskset -p`, one loop per CPU on different CPUs, the busy time of
+  each CPU, a command under `taskset -c` and htop with a meter for each CPU.
+  `ci` runs it on 1 and on 4 CPUs.
+
 ## Not on several CPUs
 
 - The kernel tests: their harness runs the tests on CPU 0 with the other CPUs

@@ -154,6 +154,12 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 /// How long a process must have run no ticks, after a sample, for the listing
 /// to call it asleep (`list`).
 const SLEEP_AFTER_NS: u64 = 2_000_000;
+/// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
+/// runs at most this many).
+const MAX_CPUS: usize = 8;
+/// The window over which a placement judges whether a process keeps its CPU
+/// busy (`Processes::place`).
+const LOAD_WINDOW_NS: u64 = 10_000_000;
 /// The first real-time signal (relibc's SIGRTMIN).
 const REALTIME_MIN: u8 = 35;
 /// SIGURG and SIGWINCH, the signals ignored by default besides SIGCHLD and SIGCONT.
@@ -256,6 +262,16 @@ struct Processes {
     records: Records<Handle<Process>>,
     /// The counter ticks the processes that ended ran (List's pool).
     retired_ticks: u64,
+    /// The CPU the last placement chose (`place`).
+    placed_last: u8,
+    /// The placement window (`place`): when it began (0: none yet), the
+    /// ticks since start and asleep of each CPU then, the load of each CPU
+    /// over the last window that ended in thousandths, and the images put
+    /// on each CPU in this window and in the one before.
+    window_at: u64,
+    window_marks: [(u64, u64); MAX_CPUS],
+    window_load: [u32; MAX_CPUS],
+    window_issued: [[u32; MAX_CPUS]; 2],
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
     /// The ExecCommit of each record that waits for init, by the record's
@@ -331,6 +347,11 @@ impl Processes {
             level: 1,
             records: Records::new(),
             retired_ticks: 0,
+            placed_last: 0,
+            window_at: 0,
+            window_marks: [(0, 0); MAX_CPUS],
+            window_load: [0; MAX_CPUS],
+            window_issued: [[0; MAX_CPUS]; 2],
             tickets: [0; RECORDS],
             replacing: [const { None }; RECORDS],
             replace_queue: Queue::new(),
@@ -2858,6 +2879,75 @@ impl Processes {
         }
     }
 
+    /// The CPU for the main thread of the image of the record `child`
+    /// (spawn, fork and exec): the least busy of the CPUs its page allows
+    /// (`Page::cpus`, all when 0), the next after the last placement among
+    /// equals. One CPU, or a machine whose CPUs the kernel does not tell, is
+    /// CPU 0. The step costs the same however many processes live: it reads
+    /// no record. A CPU is busy when it was awake a quarter of the last
+    /// window of LOAD_WINDOW_NS (the time it slept, from object_info CPU,
+    /// which one call per CPU reads at the close of a window), and each image
+    /// put on it in this window and the one before counts as one more, since
+    /// it may not have run enough to show in that time yet.
+    fn place(&mut self, child: usize) -> u8 {
+        let Ok(info) = sys::cpu_info(0) else {
+            return 0;
+        };
+        let cpus = (info.cpus as usize).clamp(1, MAX_CPUS);
+        // The images of the probe of the steps place on one CPU as well,
+        // so that it measures the placement with the crowd it makes.
+        if cpus == 1 && !cfg!(feature = "steps") {
+            return 0;
+        }
+        let allowed = self.pages.page(child).map_or(0, |page| {
+            page.cpus.load(core::sync::atomic::Ordering::Acquire)
+        });
+        let now = Self::timer_now();
+        if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
+            self.close_window(cpus, now);
+        }
+        let busy = |p: &Self, c: usize| {
+            u32::from(p.window_load[c] >= 250) + p.window_issued[0][c] + p.window_issued[1][c]
+        };
+        // Among the least busy, the first after the CPU of the last
+        // placement: images made one after the other, before any of them
+        // has run to show in the time, still go to different CPUs.
+        let last = usize::from(self.placed_last);
+        let cpu = (1..=cpus)
+            .map(|step| (last + step) % cpus)
+            .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
+            .min_by_key(|&c| busy(self, c))
+            .map_or(0, |c| c as u8);
+        self.placed_last = cpu;
+        let issued = &mut self.window_issued[0][usize::from(cpu)];
+        *issued = issued.saturating_add(1);
+        cpu
+    }
+
+    /// Ends the placement window at `now` (ns) and begins the next: the
+    /// load of each CPU over the window that ends, from the kernel's count
+    /// of its time (the first window has none).
+    fn close_window(&mut self, cpus: usize, now: u64) {
+        let first = self.window_at == 0;
+        for c in 0..cpus {
+            let Ok(info) = sys::cpu_info(c as u64) else {
+                continue;
+            };
+            let (since, idle) = self.window_marks[c];
+            let span = info.since.wrapping_sub(since);
+            let slept = info.idle.wrapping_sub(idle).min(span);
+            self.window_load[c] = if first || span == 0 {
+                0
+            } else {
+                (1000 - u128::from(slept) * 1000 / u128::from(span)) as u32
+            };
+            self.window_marks[c] = (info.since, info.idle);
+        }
+        self.window_issued[1] = self.window_issued[0];
+        self.window_issued[0] = [0; MAX_CPUS];
+        self.window_at = now;
+    }
+
     /// The piece `making` names for the place in `slot`, which loads the
     /// record in `child` for the record in `parent`: the next piece, or
     /// None after the last.
@@ -2868,6 +2958,11 @@ impl Processes {
         parent: usize,
         making: &Making,
     ) -> Result<Option<Work>, abi::Error> {
+        let cpu = if matches!(making.work, Work::Thread) {
+            self.place(child)
+        } else {
+            0
+        };
         let incoming = self
             .loaders
             .get(slot)
@@ -2900,8 +2995,11 @@ impl Processes {
                 .map_data(&make::own(), process)
                 .map(|()| Some(Work::Thread)),
             Work::Thread => {
-                let thread = image.thread(process, making.level)?;
+                let thread = image.thread(process, making.level, cpu)?;
                 let started = sys::thread_start(&thread);
+                if let Some(record) = self.records.get_mut(child) {
+                    record.cpu = cpu;
+                }
                 let place = self.loaders.get_mut(slot).ok_or(abi::Error::BadState)?;
                 place.held.thread = Some(thread);
                 place.stage = Stage::Booting;
@@ -2993,6 +3091,10 @@ impl Processes {
                                 _ => 0,
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
+                            cpu: u32::from(record.cpu),
+                            cpus: self.pages.page(i).map_or(0, |page| {
+                                page.cpus.load(core::sync::atomic::Ordering::Acquire)
+                            }),
                             nice: i32::from(record.nice),
                             ticks: record
                                 .carried_ticks

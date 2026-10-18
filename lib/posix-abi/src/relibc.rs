@@ -809,7 +809,7 @@ pub unsafe fn create(
     };
     // SAFETY: the caller's promise: the stack and entry are the thread's.
     let made = unsafe {
-        sys::thread_create_with(
+        sys::thread_create_on(
             allocation::process(),
             entry,
             stack,
@@ -818,6 +818,8 @@ pub unsafe fn create(
             policy,
             BUFFERS + index * PAGE,
             Some((&borrowed::<Channel>(exits), ceiling)),
+            // The creator's CPU, or one the process's mask allows.
+            crate::cpus::new_thread_cpu(),
         )
     };
     let Ok(native) = made else {

@@ -4,7 +4,9 @@
 /* The first C program on relibc over the Rust POSIX layer: stdio with a
  * float, malloc, a file of the RAM file service through fopen and fread,
  * ENOENT, clock_gettime, and errno in the static TLS relibc built. */
+#define _GNU_SOURCE
 #include <aio.h>
+#include <sched.h>
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
@@ -743,6 +745,20 @@ static int constants(void) {
     if (sysconf(_SC_OPEN_MAX) != 64 || errno != 0) {
         printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 64\n", sysconf(_SC_OPEN_MAX));
         return 25;
+    }
+    /* The CPUs: sysconf, the mask of sched_getaffinity and the CPU the thread
+       runs on agree, and the CPU is one of those that are up. */
+    {
+        long conf = sysconf(_SC_NPROCESSORS_CONF), online = sysconf(_SC_NPROCESSORS_ONLN);
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof set, &set) != 0) {
+            printf("relibc-hello: sched_getaffinity failed, errno %d\n", errno);
+            return 26;
+        }
+        int cpu = sched_getcpu();
+        printf("relibc-hello: cpus conf=%ld online=%ld mask=%d on=%d\n", conf, online, CPU_COUNT(&set),
+               cpu >= 0 && cpu < conf ? 1 : 0);
     }
     printf("relibc-hello: constants: _POSIX_VERSION %ld, _POSIX_SUBPROFILE %ld, %d options claimed, timers %ld\n",
            sysconf(_SC_VERSION), (long)_POSIX_SUBPROFILE, claimed, sysconf(_SC_TIMERS));

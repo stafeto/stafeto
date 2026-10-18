@@ -134,6 +134,8 @@ pub struct Record<P> {
     /// process that ran none since a sample some time ago is asleep.
     pub sample_ticks: u64,
     pub sample_at: u64,
+    /// The CPU its main thread was put on (`Processes::place`).
+    pub cpu: u8,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -465,6 +467,7 @@ impl<P> Records<P> {
             carried_ticks: 0,
             sample_ticks: 0,
             sample_at: 0,
+            cpu: 0,
             children_ticks: 0,
             carried_kernel: 0,
             children_kernel: 0,

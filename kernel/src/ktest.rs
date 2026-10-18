@@ -270,6 +270,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_label_answers_the_channels_owner,
     ),
     (
+        "object_info_cpu_reads_the_time_of_a_cpu",
+        calls::object_info_cpu_reads_the_time_of_a_cpu,
+    ),
+    (
         "closing_a_handle_releases_its_object",
         calls::closing_a_handle_releases_its_object,
     ),

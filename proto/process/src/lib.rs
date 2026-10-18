@@ -1097,6 +1097,11 @@ pub struct Page {
     /// 15 (POSIX_SPAWN_SETSCHEDULER and SETSCHEDPARAM, or the inheritance
     /// of the caller's); the service writes it with `start_mask`.
     pub start_sched: AtomicU64,
+    /// The CPUs the process may place its threads on, bit n for CPU n
+    /// (sched_setaffinity); 0 for all of them. A child takes its parent's
+    /// and an exec keeps it, and the service puts the main thread of a new
+    /// image on one of these.
+    pub cpus: AtomicU64,
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
@@ -1260,6 +1265,10 @@ pub struct Listing {
     pub state: u32,
     /// The terminal plus one (0 for none): the console is 1.
     pub tty: u32,
+    /// The CPU the process's main thread runs on.
+    pub cpu: u32,
+    /// The CPUs the process may use (`Page::cpus`, 0 for all).
+    pub cpus: u64,
     /// The process's nice value, -20 to 19 (setpriority), which its
     /// children inherit.
     pub nice: i32,
@@ -1311,23 +1320,26 @@ impl Listing {
             self.egid,
             self.state,
             self.tty,
+            self.cpu,
         ] {
             w.u32(word)?;
         }
         w.u32(self.nice as u32)?;
         w.u64(self.ticks)?;
         w.u64(self.memory)?;
+        w.u64(self.cpus)?;
         w.bytes(&self.name)
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
-        let mut words = [0; 10];
+        let mut words = [0; 11];
         for word in &mut words {
             *word = r.u32()?;
         }
         let nice = r.u32()? as i32;
         let ticks = r.u64()?;
         let memory = r.u64()?;
+        let cpus = r.u64()?;
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         Ok(Self {
@@ -1341,6 +1353,8 @@ impl Listing {
             egid: words[7],
             state: words[8],
             tty: words[9],
+            cpu: words[10],
+            cpus,
             nice,
             ticks,
             memory,
@@ -1905,6 +1919,8 @@ mod tests {
             egid: 0,
             state: 1,
             tty: 1,
+            cpu: 3,
+            cpus: 0b1100,
             nice: -5,
             ticks: 1 << 40,
             memory: 3 << 20,

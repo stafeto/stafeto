@@ -798,6 +798,15 @@ pub const INFO_THREAD_CURRENT: u64 = 13;
 /// ended and the stint of the running one included, and in x2 the part of
 /// them spent in the kernel. O(1).
 pub const INFO_PROCESS_TIME: u64 = 14;
+/// CPU takes x0 zero and in x2 the number of a CPU that is up, and returns
+/// what that CPU counts about its own time, read only and without a lock:
+/// in x1 the CPUs that are up, in x2 the counter ticks since the CPU
+/// started, in x3 those it slept in `wfi` (idle), in x4 those its entries
+/// from EL0 spent in the kernel (system time; the rest of the ticks since
+/// the start is user time and the kernel's other work) and in x5 the number
+/// of the CPU the caller runs on. INVALID_ARGS for a CPU past those that
+/// are up or a handle in x0.
+pub const INFO_CPU: u64 = 15;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1833,6 +1842,7 @@ mod tests {
     #[test]
     fn thread_info_round_trips() {
         assert_eq!(INFO_THREAD_STATE, 6);
+        assert_eq!(INFO_CPU, 15);
         let states = [
             ThreadState::Stopped,
             ThreadState::Ready,

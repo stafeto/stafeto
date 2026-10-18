@@ -6,7 +6,7 @@
 //!
 //! The directory `/proc` is a directory of the image. What lies under it
 //! has no file in the file service: `/proc/<pid>/stat`, `statm`, `cmdline`
-//! and `status`, and `/proc/uptime`, `stat`, `meminfo` and `loadavg` are
+//! and `status`, and `/proc/uptime`, `stat`, `meminfo`, `cpuinfo` and `loadavg` are
 //! text made at the open of the path and
 //! handed over as the read end of a pipe whose write end is closed, so the
 //! descriptor reads, polls, is inherited and closes like any other; the
@@ -45,6 +45,8 @@ enum Node {
     Uptime,
     /// `/proc/stat`.
     SystemStat,
+    /// `/proc/cpuinfo`.
+    Cpuinfo,
     /// `/proc/meminfo`.
     Meminfo,
     /// `/proc/loadavg`.
@@ -75,6 +77,9 @@ fn parse(path: &[u8]) -> Option<Node> {
     }
     if rest == b"stat" {
         return Some(Node::SystemStat);
+    }
+    if rest == b"cpuinfo" {
+        return Some(Node::Cpuinfo);
     }
     if rest == b"meminfo" {
         return Some(Node::Meminfo);
@@ -190,7 +195,7 @@ struct Text {
 }
 
 /// The most bytes a file of `/proc` holds.
-const TEXT: usize = 1024;
+const TEXT: usize = 2048;
 
 impl Write for Text {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -336,10 +341,56 @@ fn content(node: &Node) -> Result<Text, i32> {
             let up = rt::time::ticks_to_ns(rt::time::now()) / 10_000_000;
             let idle = up.saturating_sub(t.busy);
             // user nice system idle iowait irq softirq steal guest guest_nice
-            // in hundredths of a second: all the time the processes ran is
-            // user time.
-            for name in ["cpu ", "cpu0"] {
-                let _ = writeln!(text, "{name} {} 0 0 {idle} 0 0 0 0 0 0", t.busy);
+            // in hundredths of a second. Each CPU has a line of its own from
+            // the kernel's count of its time (user, system, idle); the line
+            // of the sum comes first. Without the kernel's count (a CPU it
+            // does not tell) all the time the processes ran is user time on
+            // CPU 0.
+            let cpus = crate::cpus::count();
+            let (mut rows, mut sum) = (
+                [crate::cpus::Times {
+                    user: 0,
+                    system: 0,
+                    idle: 0,
+                }; 8],
+                crate::cpus::Times {
+                    user: 0,
+                    system: 0,
+                    idle: 0,
+                },
+            );
+            let known = (0..cpus.min(rows.len()))
+                .map(|i| crate::cpus::times(i).map(|row| rows[i] = row))
+                .all(|row| row.is_some());
+            if known {
+                for row in &rows[..cpus.min(8)] {
+                    sum.user += row.user;
+                    sum.system += row.system;
+                    sum.idle += row.idle;
+                }
+            } else {
+                rows[0] = crate::cpus::Times {
+                    user: t.busy,
+                    system: 0,
+                    idle,
+                };
+                sum = rows[0];
+            }
+            let _ = writeln!(
+                text,
+                "cpu  {} 0 {} {} 0 0 0 0 0 0",
+                sum.user, sum.system, sum.idle
+            );
+            for (i, row) in rows
+                .iter()
+                .enumerate()
+                .take(if known { cpus.min(8) } else { 1 })
+            {
+                let _ = writeln!(
+                    text,
+                    "cpu{i} {} 0 {} {} 0 0 0 0 0 0",
+                    row.user, row.system, row.idle
+                );
             }
             let _ = write!(
                 text,
@@ -348,6 +399,19 @@ fn content(node: &Node) -> Result<Text, i32> {
                 t.last_pid,
                 t.running,
             );
+        }
+        Node::Cpuinfo => {
+            // One record for each CPU, in the shape of Linux's on aarch64:
+            // the numbers htop and the scripts that count "processor" lines
+            // read.
+            for i in 0..crate::cpus::count() {
+                let _ = write!(
+                    text,
+                    "processor\t: {i}\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd\n\
+                     CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\n\
+                     CPU part\t: 0xd03\nCPU revision\t: 4\n\n"
+                );
+            }
         }
         Node::Meminfo => {
             let pool = crate::process::list(0)?.2;
@@ -385,7 +449,7 @@ fn content(node: &Node) -> Result<Text, i32> {
                     let _ = writeln!(
                         text,
                         "{} ({}) {} {} {} {} {} {} 0 0 0 0 0 {} 0 0 0 {} {} 1 0 0 {} {} \
-                         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 {} 0 0 0 0 0 0 0 0 0 0 0 0 0",
                         l.pid,
                         name_of(&l),
                         state_letter(&l),
@@ -401,6 +465,7 @@ fn content(node: &Node) -> Result<Text, i32> {
                         l.nice,
                         l.memory,
                         l.memory / PAGE,
+                        l.cpu,
                     );
                 }
                 File::Statm => {
@@ -628,6 +693,7 @@ pub fn stat(path: &[u8]) -> Result<NodeInfo, i32> {
         Node::Uptime => (2, 0o444, 0, 0, 1),
         Node::Mounts => (2, 0o444, 0, 0, 3),
         Node::SystemStat => (2, 0o444, 0, 0, 5),
+        Node::Cpuinfo => (2, 0o444, 0, 0, 8),
         Node::Meminfo => (2, 0o444, 0, 0, 6),
         Node::Loadavg => (2, 0o444, 0, 0, 7),
     };
@@ -671,14 +737,15 @@ pub fn is_directory(info: &NodeInfo) -> bool {
 }
 
 /// The entries of the listing of `/proc` in Linux's dirent64 records from
-/// `position`: ".", "..", "uptime", "mounts" and the live PIDs in ascending
+/// `position`: ".", "..", "uptime", "mounts", "stat", "meminfo", "loadavg",
+/// "cpuinfo" and the live PIDs in ascending
 /// order; for the directory of a process (`pid`), ".", ".." and its four
 /// files. The offset after a PID is its number plus 4 (the fixed entries have
 /// 1 to 4), so a listing that goes on in several calls, while processes
 /// start and end, takes each process that lives throughout once.
 pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize, i32> {
     /// The entries before the PIDs of `/proc`.
-    const FIXED: u64 = 7;
+    const FIXED: u64 = 8;
     let mut list = [0u32; PROCESSES];
     let count = match pid {
         Some(_) => 0,
@@ -718,7 +785,8 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
                     3 => (b"mounts", 8, 3),
                     4 => (b"stat", 8, 5),
                     5 => (b"meminfo", 8, 6),
-                    _ => (b"loadavg", 8, 7),
+                    6 => (b"loadavg", 8, 7),
+                    _ => (b"cpuinfo", 8, 8),
                 };
                 name[..text.len()].copy_from_slice(text);
                 (text.len(), kind, inode, here + 1)

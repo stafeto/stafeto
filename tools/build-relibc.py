@@ -93,7 +93,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # directory gave EEXIST), abort prints no line; tagged pin-1535ddaf.
 # getrusage and times read the user and the system time in one call of the layer
 # (platform interface 21); tagged pin-920d3cb6.
-COMMIT = "920d3cb6ccd84e140fdfe5bf2ab2033e13085cbf"
+# Goal #415 (visible CPUs): sysconf gives the CPUs that are up, sched_getaffinity
+# and sched_setaffinity go to the layer, sched_getcpu, pthread_setaffinity_np and
+# pthread_getaffinity_np, CPU_COUNT counts the whole set; tagged pin-e4248533.
+COMMIT = "e42485337bf0086eba11ca5e903aa35334d27e7b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

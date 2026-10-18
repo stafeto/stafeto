@@ -208,8 +208,18 @@ const O_NONBLOCK: c_int = 0o4000;
 /// out of the description.
 const O_SYNC_FLAGS: c_int = 0o4010000;
 
+/// O_PATH, as Linux has it: the open only names the place, and the layer
+/// takes it as the ordinary read-only open of a directory (htop opens the
+/// directory of each CPU so).
+const O_PATH_FLAG: c_int = 0o10000000;
+
 /// Translates relibc Open flags into the process-local request interface.
 fn open_flags(flags: c_int) -> Result<c_int, c_int> {
+    let flags = if flags & O_PATH_FLAG != 0 {
+        flags & !O_PATH_FLAG & !O_ACCMODE
+    } else {
+        flags
+    };
     let known = O_ACCMODE
         | O_CREAT
         | O_EXCL
@@ -1495,6 +1505,51 @@ pub unsafe extern "C" fn stafeto_sched_getparam(pid: c_int, priority: *mut c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_sched_set(pid: c_int, policy: c_int, priority: c_int) -> c_int {
     call(|| posix_abi::sched::set(pid, policy, priority)).unwrap_or_else(|errno| -errno)
+}
+
+/// The CPUs that are up (sysconf `_SC_NPROCESSORS_CONF` and
+/// `_SC_NPROCESSORS_ONLN`), at least 1.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_cpu_count() -> c_int {
+    posix_abi::cpus::count() as c_int
+}
+
+/// The CPU the calling thread runs on (sched_getcpu).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_cpu_current() -> c_int {
+    posix_abi::cpus::current() as c_int
+}
+
+/// sched_getaffinity: the mask of the process `pid` into `size` bytes at
+/// `mask`, or a negated errno.
+///
+/// # Safety
+/// `mask` points to `size` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_sched_getaffinity(
+    pid: c_int,
+    size: usize,
+    mask: *mut u8,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let out = unsafe { core::slice::from_raw_parts_mut(mask, size) };
+    posix_abi::cpus::getaffinity(pid, out).map_or_else(|errno| -errno, |()| 0)
+}
+
+/// sched_setaffinity: the mask of the process `pid` from `size` bytes at
+/// `mask`, or a negated errno.
+///
+/// # Safety
+/// `mask` points to `size` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_sched_setaffinity(
+    pid: c_int,
+    size: usize,
+    mask: *const u8,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let bytes = unsafe { core::slice::from_raw_parts(mask, size) };
+    posix_abi::cpus::setaffinity(pid, bytes).map_or_else(|errno| -errno, |()| 0)
 }
 
 /// pthread_getschedparam of the thread `tid`.
