@@ -23,7 +23,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from `main` at e6635e5 (after #147); the sections on processes, pipes and random numbers keep the figures of their own steps.
+Numbers below are from `main` at 01aed08 (after #165); the sections on processes, pipes and random numbers keep the figures of their own steps.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -191,7 +191,7 @@ listed exception; its io, malloc, process and signal suites, `basic/spawn`,
 `basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
 `ci` from files, one boot a suite. `ci` fails when a test that passed stops
 passing. The Open POSIX Test Suite (LTP 20260930) runs on relibc in `ci` and
-passes 1,770 of its 2,036 tests; the map of the rest is in
+passes 1,985 of its 2,036 tests; the map of the rest is in
 [docs/open-posix-map.md](docs/open-posix-map.md). The PTY and termios suites
 exercise the terminal APIs, and readiness tests cover all four waiting
 interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
@@ -235,7 +235,9 @@ Actions.
   clears RAM at a reset, so the log does not outlive it; the same image
   under HVF shows the panic. On VZ `rtbench` runs beside the console's
   driver.
-- One CPU core only; no SMP.
+- SMP runs on up to 8 CPUs (QEMU, HVF and VZ are tested with 4); the
+  bounds of a real-time analysis on several CPUs still wait for a board
+  (docs/smp.md).
 - No PinePhone port yet.
 - `fork` copies everything the layer maps, with no copy on write (about
   70 us a MiB on HVF); mappings made past the
@@ -361,7 +363,12 @@ Bounded kernel paths and their costs:
 | Audit 5 and stability fixes | audit 5 fixes, the misaligned `LDXR` probe, lost wakeups and stop ownership of `fork`, `sigsuspend`, a flaky threads probe | ✅ [#112](https://github.com/stafeto/stafeto/pull/112), [#124](https://github.com/stafeto/stafeto/pull/124), [#126](https://github.com/stafeto/stafeto/pull/126), [#128](https://github.com/stafeto/stafeto/pull/128), [#135](https://github.com/stafeto/stafeto/pull/135), [#138](https://github.com/stafeto/stafeto/pull/138), [#147](https://github.com/stafeto/stafeto/pull/147) |
 | Packages in the build | every third-party program is a package with one description file; the shell image is built from the list | ✅ [#144](https://github.com/stafeto/stafeto/pull/144) |
 | CI on GitHub Actions | guest boots in parallel, direct native linking, `cargo xtask ci` on every pull request | ✅ [#77](https://github.com/stafeto/stafeto/pull/77), [#107](https://github.com/stafeto/stafeto/pull/107), [#139](https://github.com/stafeto/stafeto/pull/139) |
-| POSIX: Open POSIX to 1,850 | more of the Open POSIX Test Suite passing (branch `open-posix-i`) | 🚧 |
+| POSIX: Open POSIX to 1,985 | real-time signals and their queue, CPU-time clocks and timers, `sched_*` for other processes, thread stack guards, 1,985 of 2,036 tests | ✅ [#149](https://github.com/stafeto/stafeto/pull/149), [#152](https://github.com/stafeto/stafeto/pull/152) |
+| CI in parallel groups | `cargo xtask ci` runs every step and prints a summary; nine groups run in parallel on GitHub Actions in about 10 minutes | ✅ [#150](https://github.com/stafeto/stafeto/pull/150) |
+| SMP | per-CPU kernel data, one short object lock `OBJ` with `wfe`, commands between CPUs, partitioned fixed-priority scheduling, cross-CPU IPC with priority lift, QSBR, ASIDs and TLB on several CPUs, measurements on 2 and 4 CPUs, `ci` on `-smp 4` (see `docs/smp.md`) | ✅ [#151](https://github.com/stafeto/stafeto/pull/151), [#153](https://github.com/stafeto/stafeto/pull/153), [#155](https://github.com/stafeto/stafeto/pull/155)–[#158](https://github.com/stafeto/stafeto/pull/158) |
+| WCET tools | `cargo xtask wcet coverage` (kernel basic blocks under tests), `wcet stack` (kernel stack depth), `wcet bound` (a bound per call from the block graph) | ✅ [#154](https://github.com/stafeto/stafeto/pull/154), [#159](https://github.com/stafeto/stafeto/pull/159) |
+| Interactive polish and tools | real-time clock at boot, BusyBox applets as symbolic links, a clean `/bin`, `putenv`, `mkstemp`, a quiet `abort`, ncdu, visible CPUs (`nproc`, `/proc/stat` per CPU, `sched_setaffinity`, `taskset`), stable probes | ✅ [#160](https://github.com/stafeto/stafeto/pull/160)–[#165](https://github.com/stafeto/stafeto/pull/165) |
+| Audit 6 | the kernel after SMP: bounded command handling and one object lock per stretch, GICv2 interrupt acknowledge barrier | 🚧 |
 | POSIX: remaining utilities | the 18 XCU utilities not yet in the image: `at batch csplit gencat gettext locale localedef lp m4 mailx msgfmt newgrp ngettext pax pr tabs tput write` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 
@@ -371,7 +378,6 @@ Bounded kernel paths and their costs:
 - Phone shell: home screen, notifications, settings, a UI toolkit.
 - Packages: package format, signatures, app sandbox.
 - Network: virtio-net, a TCP/IP stack and IPv4 sockets.
-- SMP: more than one CPU core.
 
 ## License
 
