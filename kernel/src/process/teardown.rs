@@ -6,7 +6,11 @@
 //! of its end to its exit channel.
 
 use super::table::table;
-use super::*;
+use super::{
+    Channel, ChildLinks, Error, LIVE, NonNull, Object, Owner, PAGE_SIZE, Process, ProcessState,
+    ROOTS, Source, Thread, accepted, child_links, cleanup, control, end, object, pages, paid_free,
+    refs, refund, release, release_shell, remove_thread, sched, thread,
+};
 use crate::syscall;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7):

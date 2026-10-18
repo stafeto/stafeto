@@ -170,11 +170,12 @@ pub fn set_entry_timing(timing: (u64, u64)) {
 /// 7.8).
 static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
 
-/// A value OBJ guards, apart from SCHED.
+/// A value OBJ guards, which `locked` lends together with this CPU's
+/// scheduler.
 struct Guarded<T>(UnsafeCell<T>);
 
-// SAFETY: only `locked` reaches the value, while it holds the scheduler's
-// lock, which makes the access exclusive.
+// SAFETY: only `locked` reaches the value, inside a section under OBJ,
+// which makes the access exclusive.
 unsafe impl<T: Send> Sync for Guarded<T> {}
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.

@@ -16,7 +16,10 @@
 //! goes. The entries go at the stage Mappings, after the stage Space took
 //! the ASID and with it every TLB entry of the process.
 
-use super::*;
+use super::{
+    AddressSpace, Error, KernelPages, Memory, NonNull, PAGE_SIZE, PaidPages, Process, charge,
+    check_alive, refund, thread,
+};
 use crate::arch::cache;
 use crate::memory;
 use abi::{Access, Call};

@@ -5,7 +5,10 @@
 //! and closes, the handles of messages, init's first handles and the start
 //! entry of a child.
 
-use super::*;
+use super::{
+    Chunks, Error, Handle, Handles, KernelPages, Moving, NonNull, Object, PaidPages, Process,
+    Rights, Stage, check_alive, object,
+};
 
 impl Process {
     /// What `kind` makes of the object behind `h`, checked in the order of
@@ -173,8 +176,8 @@ pub fn put_handles(
 #[cfg(not(feature = "ktest"))]
 pub fn install_init_handles(
     init: NonNull<Process>,
-    first: NonNull<Thread>,
-    boot: NonNull<Memory>,
+    first: NonNull<super::Thread>,
+    boot: NonNull<super::Memory>,
 ) -> Result<(), Error> {
     crate::obj::assert_held();
     let handles = [

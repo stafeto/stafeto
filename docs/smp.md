@@ -13,7 +13,14 @@ bounded, and how to measure them.
 - The objects that CPUs share (channels, handle tables, mappings, processes,
   thread numbers, frames, ASIDs) are guarded by one ticket lock, `OBJ`, taken
   with interrupts masked for the links of the objects only. Copies of
-  messages and the teardown of detached objects run outside it.
+  messages and the teardown of detached objects run outside it. The second
+  lock CPUs share is the ticket lock of each CPU's cleanup queue
+  (`queue_spin`): a section under `OBJ` may take it, and its holder takes
+  nothing.
+- A queue of commands carries threads alone, each once at most, so it never
+  fills; a timer whose last reference goes on another CPU than its heap's
+  joins a chain of that CPU under `OBJ`. The owner serves up to 8 threads in
+  one section and sends itself an SGI for the rest.
 - Freed memory waits for a quiescent period (QSBR) of all CPUs.
 - Scheduling is partitioned and fixed-priority: a thread has a CPU mask, by
   default its creator's CPU, and the kernel does not balance. A service on
@@ -25,7 +32,7 @@ bounded, and how to measure them.
 | --- | --- | --- |
 | `KERNEL_B_MAX` | 18 000 | longest non-preemptible portion of one CPU, instructions |
 | `OBJ_HOLD_MAX` | 4 000 | longest hold of `OBJ`, instructions (icount) |
-| `B4_MAX` | 32 000 | B + 3 * `OBJ_HOLD_MAX` |
+| `B4_MAX` | 32 000 | B_4, below |
 | `S5_ICOUNT_MAX` | 3 063 | S5 on one CPU, instructions |
 | `S5X_HVF_MAX` | 294 / 101 (GICv3), 340 / 216 (GICv2) | median of S5x on HVF, ticks of 16 ns: target in WFI / behind a lower thread; the guard of a regression |
 
@@ -33,8 +40,25 @@ bounded, and how to measure them.
 that preempts a vCPU leaves alone. The real-time limit of S5x bounds the longest
 request, and the board (stage 7) gives it.
 
-B_N = B + (N - 1) * `OBJ_HOLD_MAX`, S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`; `cargo
-xtask kernel-test 512M icount` prints B_2, B_4, B_8 and fails B_4 above `B4_MAX`.
+Each take of `OBJ` waits for at most the holds of the N - 1 other CPUs, so a
+stretch between two polls for an interrupt that runs C instructions and takes
+`OBJ` k times blocks for C + k * (N - 1) * `OBJ_HOLD_MAX`, and B_N is the
+largest of these over the stretches, and B + (N - 1) * `OBJ_HOLD_MAX` for the
+rows of B. The measuring images count k from the tickets of the lock: `cargo
+xtask kernel-test 512M icount` prints the longest stretch for each k
+(`OBJ takes`), B_2, B_4, B_8, and fails B + 3 * `OBJ_HOLD_MAX` above
+`B4_MAX`. With `OBJ_HOLD_MAX` 4 000 a stretch fits `B4_MAX` with one take
+and C up to 20 000, or with two and C up to 8 000; the stretches of mem_create
+and of the cleanup of memory, channels and processes take `OBJ` once a frame
+or an item, and B_4 with the takes is printed, without an error, until they
+take it once (`B4_TAKES_ENFORCED`). S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`.
+
+A service on another CPU than its client runs at the client's level, a
+distributed inheritance: the response time R of the client adds the
+interference of the threads above that level on the service's CPU and the
+longest request of another client to the service, and the call costs 347
+ticks on HVF against 12 on one CPU: a real-time client wants the receiving
+thread of its service on its own CPU.
 Under `-icount` QEMU runs the CPUs one after the other, so waits for a lock
 and cross-CPU latencies there show the length of its time slice. Path lengths
 come from the single-CPU tests, waits and latencies from HVF.

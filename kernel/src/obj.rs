@@ -8,11 +8,12 @@
 //! taken for a section of a kernel call with interrupts masked and held
 //! for at most `OBJ_HOLD_MAX` instructions (xtask).
 //!
-//! The order of locks is this module's: `OBJ` is the only lock CPUs share.
-//! What a CPU alone owns (its scheduler, timers, cleanup queue and log
-//! ring, `local`) has no lock, since nothing but that CPU reaches it, and
-//! a section under `OBJ` reaches it freely. So no lock is taken while
-//! `OBJ` is held, and none stands before it. The rules that keep it so:
+//! The order of locks is this module's: `OBJ` first, then the ticket lock
+//! of a CPU's cleanup queue (`Local::queue_spin`), the only other lock CPUs
+//! share, which a section may take and whose holder takes nothing. What a
+//! CPU alone owns (its scheduler, timers and log ring, `local`) has no
+//! lock, since nothing but that CPU reaches it, and a section under `OBJ`
+//! reaches it freely. The rules that keep it so:
 //!
 //! 1. `lock` takes `OBJ` unless this CPU holds it already, and a guard
 //!    that took it gives it back when it drops. A section nests, then, and
