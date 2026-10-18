@@ -311,10 +311,13 @@ pub enum Role {
     /// handle 0 is the child's own process. The first thread ends once they
     /// run, so that threads of init that are lower never starve.
     SmpSpin = 34,
+    /// Takes a request through handle 0, a channel with RECEIVE, marks SEEN
+    /// and spins for good, answering nothing.
+    TakeThenWait = 35,
 }
 
 impl Role {
-    pub const ALL: [Role; 34] = [
+    pub const ALL: [Role; 35] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -349,6 +352,7 @@ impl Role {
         Role::Server,
         Role::Busy,
         Role::SmpSpin,
+        Role::TakeThenWait,
     ];
 
     /// The role whose code is `code`.

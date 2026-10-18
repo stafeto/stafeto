@@ -16,7 +16,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 11] = [
+pub(crate) const TESTS: [Test; 12] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -54,6 +54,10 @@ pub(crate) const TESTS: [Test; 11] = [
     (
         "smp_mapping_is_made_once_while_another_cpu_makes_threads",
         mapping_while_threads_join,
+    ),
+    (
+        "smp_boost_leaves_a_service_that_ended_on_its_cpu_alone",
+        boost_of_a_service_that_ended,
     ),
 ];
 
@@ -892,6 +896,86 @@ fn mapping_while_threads_join() -> Outcome {
     check(made > 0, "no thread was made meanwhile")?;
     println!(
         "smp: {mapped} mem_map calls while another CPU made {made} threads in the same process"
+    );
+    Ok(())
+}
+
+/// The priority of the service of the boost test: the kernel built with
+/// `window-probe` keeps the owner of a thread at it from serving the thread's
+/// end for 40 ms (kernel cmd::window).
+const SERVICE_LEVEL: u8 = 15;
+
+/// The thread the raiser of the boost test raises.
+static RAISED_CLIENT: AtomicU64 = AtomicU64::new(0);
+
+/// Raises and lowers the client of the boost test by one level for 50 ms,
+/// which ends before the clients of the killed process are released (80 ms
+/// after its threads ended in the kernel built with `window-probe`); it
+/// cannot be a thread of CPU 0, which is busy with the end of the process
+/// meanwhile.
+extern "C" fn raise_and_lower(_: u64) -> ! {
+    let client = Handle::<Thread>::borrowed(abi::Handle(RAISED_CLIENT.load(Relaxed)));
+    let mut level = RAISED;
+    let until = now() + 50_000_000;
+    while now() < until {
+        level = if level == RAISED { RAISED + 1 } else { RAISED };
+        // Fails once the client was released and ended.
+        let _ = sys::thread_set_priority(&client, level, Policy::Fifo);
+        pause(500_000);
+    }
+    MARKS[2].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A client on CPU 1 waits for the reply of a service in a child on CPU 2.
+/// The child is killed from CPU 0; the end of its thread is on its way to
+/// CPU 2, which has taken it and not served it yet, while a thread on CPU 3
+/// raises the client again and again (thread_set_priority, on CPU 1, whose
+/// chain of requests still finds the service by its number). The boost of
+/// the service is left alone: no command stands in the queue of CPU 2 past
+/// the release of the thread (the kernel built with `window-probe` keeps the
+/// clients of the killed process waiting for it, panics when the boost is
+/// posted and prints the line xtask looks for).
+fn boost_of_a_service_that_ended() -> Outcome {
+    let n = cpus()?;
+    if n < 4 {
+        return Ok(());
+    }
+    reset_marks();
+    reset_kid_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let receive = copy_raw(&c, Rights::RECEIVE | Rights::TRANSFER)?;
+    SPAWN_CPU.store(3, Relaxed);
+    let kid = Kid::load_under(LEAF_QUOTA, 16, RAISED, SERVICE_LEVEL);
+    SPAWN_CPU.store(0, Relaxed);
+    let kid = kid?;
+    kid.start()?;
+    kid.serve(Role::TakeThenWait, &[], &[Gift::Given(receive)])?;
+    let client = spawn_on(1, 1, ask_once, 0, LEVEL)?;
+    check(
+        wait_for(|| kid_mark(child::SEEN) == 1),
+        "the service did not take the request",
+    )?;
+    RAISED_CLIENT.store(client.raw().0, Relaxed);
+    let raiser = spawn_on(2, 3, raise_and_lower, 0, LEVEL)?;
+    sys::process_kill(&kid.process).map_err(|_| "process_kill of the service failed")?;
+    let done = wait_for(|| mark(1) != 0);
+    let state = kid.end();
+    let raised = wait_for(|| mark(2) != 0);
+    let_run()?;
+    close(raiser)?;
+    close(client)?;
+    kid.close()?;
+    close(c)?;
+    check(raised, "the raiser did not end")?;
+    check(done, "the client was not released when the service ended")?;
+    check(
+        state == Ok(ProcessState::Killed),
+        "the process of the service did not end killed",
+    )?;
+    println!(
+        "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on"
     );
     Ok(())
 }

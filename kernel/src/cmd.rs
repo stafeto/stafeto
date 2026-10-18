@@ -49,8 +49,7 @@ pub const EXIT: u8 = 32;
 /// three words of 16 bits in one: the last value of each stands. Every
 /// access is in a section under OBJ (the asker's, the owner's `serve_level`
 /// and `serve_exit`, the end of the number's thread), so plain loads and
-/// stores do, and a thread with no ask costs one load (`clear_asked`). A
-/// thread keeps its number until its EXIT is served.
+/// stores do. A thread keeps its number until its EXIT is served.
 static ASKED: [AtomicU64; THREADS] = [const { AtomicU64::new(0) }; THREADS];
 
 const LEVEL_SHIFT: u32 = 0;
@@ -225,6 +224,8 @@ pub fn post(t: NonNull<Thread>, flag: u8) {
     crate::obj::assert_held();
     // Release: what the section wrote for the owner (the arguments, the
     // delivered message) is there when the owner takes the flag.
+    #[cfg(feature = "window-probe")]
+    window::posted(t, flag);
     let before = thread_cmds(t).fetch_or(flag, Ordering::Release);
     if before != 0 {
         return;
@@ -351,6 +352,8 @@ pub fn drain() {
             // keeps it until its commands are served.
             let t = unsafe { NonNull::new_unchecked(value as *mut Thread) };
             let flags = thread_cmds(t).swap(0, Ordering::Acquire);
+            #[cfg(feature = "window-probe")]
+            window::taken(t, flags);
             serve(t, flags);
         }
     }
@@ -434,6 +437,9 @@ pub mod window {
                     (*t.as_ptr()).siblings.and_then(|s| s.next),
                 )
             };
+            if priority == SERVICE_LEVEL {
+                ARMED.store(true, Ordering::Release);
+            }
             if priority == LEVEL {
                 let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 20;
                 let mut held = false;
@@ -462,6 +468,62 @@ pub mod window {
         }
     }
 
+    /// The priority of the service the boost probe watches: the process of
+    /// the test's service.
+    pub const SERVICE_LEVEL: u8 = 15;
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    static LEFT_ALONE: AtomicBool = AtomicBool::new(false);
+
+    fn is_service(t: NonNull<Thread>) -> bool {
+        // SAFETY: the callers hold the thread: the kernel's reference keeps
+        // it until its commands are served.
+        unsafe { t.as_ref() }.priority() == SERVICE_LEVEL
+    }
+
+    /// In `drain`, right after the owner took the flags of `t`: the first
+    /// EXIT of a thread at SERVICE_LEVEL waits 40 ms before it is served,
+    /// with the thread let go (`mark_ended`) and its number kept, in which
+    /// a boost from the chain of requests of another CPU finds it.
+    pub fn taken(t: NonNull<Thread>, flags: u8) {
+        if flags & EXIT == 0 || !is_service(t) || TAKEN.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 25;
+        while crate::arch::timer::now() < until {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// At the end of the stage Threads of the process that had a thread at
+    /// SERVICE_LEVEL, no section held: its clients stay in their wait for
+    /// 80 ms, in which the test raises them from other CPUs.
+    pub fn hold_replies() {
+        if ARMED.swap(false, Ordering::Acquire) {
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2 / 25;
+            while crate::arch::timer::now() < until {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// In `post`, under OBJ: a boost posted for a thread at SERVICE_LEVEL
+    /// that the scheduler let go would stand in the queue past the release
+    /// of the thread.
+    pub fn posted(t: NonNull<Thread>, flag: u8) {
+        if flag & BOOST != 0 && is_service(t) && !thread::is_held(t) {
+            panic!("a boost was posted for a thread that the scheduler let go");
+        }
+    }
+
+    /// In `sched::boost`: a boost of a thread of another CPU that the
+    /// scheduler let go was left alone.
+    pub fn boost_left_alone(t: NonNull<Thread>) {
+        if is_service(t) && !LEFT_ALONE.swap(true, Ordering::Relaxed) {
+            kprintln!("smp window  a boost of a thread that ended on its CPU was left alone");
+        }
+    }
+
     /// The priority of the caller of a suspension that the probe holds a
     /// CPU back for.
     pub const LAG_LEVEL: u8 = 19;
@@ -471,7 +533,7 @@ pub mod window {
     static LAG: AtomicBool = AtomicBool::new(false);
 
     /// A suspension (process_control) by a thread at LAG_LEVEL begins: the
-    /// next quiescent point of CPU 2 comes 20 ms late.
+    /// next quiescent point of CPU 1 comes 20 ms late.
     pub fn arm_lag(t: NonNull<Thread>) {
         // SAFETY: the caller is the running thread.
         if unsafe { t.as_ref() }.priority() == LAG_LEVEL {

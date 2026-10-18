@@ -460,7 +460,15 @@ unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
                 section.take();
             }
         }
-        (*p).threads_next.is_none()
+        let done = (*p).threads_next.is_none();
+        #[cfg(feature = "window-probe")]
+        if done {
+            // The threads are gone and the stage is not Replies yet: the
+            // clients of the process stay in their wait for a while.
+            section.take();
+            crate::cmd::window::hold_replies();
+        }
+        done
     }
 }
 

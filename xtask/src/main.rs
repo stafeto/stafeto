@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 243;
+const INIT_TESTS: u32 = 244;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -8877,7 +8877,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 8] = [
+const SMP_PROBE_LINES: [&str; 9] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
@@ -8886,6 +8886,7 @@ const SMP_PROBE_LINES: [&str; 8] = [
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
     "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
+    "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
 ];
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
@@ -9007,7 +9008,7 @@ fn init_tests_in(
             return Err("the test init printed no line of the wait of a suspension".into());
         };
         if variant == Variant::WindowProbe {
-            // CPU 2 came 20 ms late to its quiescent point: the suspension
+            // CPU 1 came 20 ms late to its quiescent point: the suspension
             // waited for it, and this CPU ran the thread of a timer of 2 ms
             // meanwhile.
             if waited < 15_000 || late > 10_000 {
@@ -9018,6 +9019,10 @@ fn init_tests_in(
             qemu::expect_line(
                 &o,
                 "smp window  a thread ended on its CPU between the post of its command and the flush",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  a boost of a thread that ended on its CPU was left alone",
             )?;
             qemu::expect_line(
                 &o,

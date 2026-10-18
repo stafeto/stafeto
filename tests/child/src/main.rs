@@ -304,6 +304,19 @@ fn run(s: &Start) -> u64 {
                 _ => FAILED,
             }
         }
+        Role::TakeThenWait => {
+            let c = Handle::<Channel>::borrowed(s.handles[0]);
+            match sys::receive(&c) {
+                Ok(Received::Message { .. }) => {
+                    // No second receive: it would end the boost of the request.
+                    mark(SEEN).store(1, Relaxed);
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+                _ => FAILED,
+            }
+        }
         Role::Send => {
             let c = Handle::<Channel>::borrowed(s.handles[0]);
             match sys::send(&c, &a[0].to_le_bytes()) {

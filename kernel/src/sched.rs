@@ -271,7 +271,8 @@ pub unsafe fn unpark(k: &mut Locked<'_>, t: NonNull<Thread>) {
 
 /// A boost of `t` to `level`: on its own CPU at once when that is this one,
 /// by a command otherwise, which also moves its slot in the queue it waits
-/// in and goes on along the chain of requests (cmd::BOOST, `serve_level`).
+/// in and goes on along the chain of requests (cmd::BOOST, `serve_level`);
+/// a thread of another CPU that the scheduler no longer holds is left alone.
 /// True when it was done here.
 ///
 /// # Safety
@@ -281,6 +282,15 @@ pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: 
         // SAFETY: the caller's promise.
         unsafe { k.s.boost(t, level, ceiling) };
         return true;
+    }
+    // The owner let the thread go (`exit`) and its end is on its way: the
+    // number stays until `serve_exit`, so the chain of requests still finds
+    // the thread, but a command posted now would stand in the queue past the
+    // release of the kernel's reference.
+    if !thread::is_held(t) {
+        #[cfg(feature = "window-probe")]
+        crate::cmd::window::boost_left_alone(t);
+        return false;
     }
     crate::cmd::ask_boost(t, level, ceiling);
     crate::cmd::post(t, crate::cmd::BOOST);
