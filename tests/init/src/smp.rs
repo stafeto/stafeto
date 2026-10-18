@@ -955,6 +955,12 @@ fn mapping_while_threads_join() -> Outcome {
     reset_marks();
     let m = sys::mem_create(PAGE as u64).map_err(|_| "mem_create failed")?;
     let maker = spawn_on(0, 1, make_threads, 0, LOW)?;
+    // A host that is busy starts CPU 1 late: the calls below begin when the
+    // thread has made its first thread, so that they overlap its work.
+    check(
+        wait_for(|| mark(0) > 0),
+        "the thread on CPU 1 made no thread",
+    )?;
     sys::thread_set_priority(&me(), GAP_LEVEL, Policy::Fifo).map_err(|_| "init lowered itself")?;
     let mut mapped = 0;
     for i in 0..GAP_CALLS as usize {
@@ -1600,8 +1606,24 @@ static STORM_CHANNEL: AtomicU64 = AtomicU64::new(0);
 /// Set by each thread of the storm when it ends; the rows keep the marks.
 static STORM_DONE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Receives and replies until the request with the word 0 (the stop of the
+/// rows) is answered. A flag the thread tests between two calls would let it
+/// end before the stop is sent: a host that holds its CPU back there leaves
+/// the sender of the stop in its call for good.
+fn serve_until_stopped(c: &Handle<Channel>) -> ! {
+    loop {
+        if let Ok(Received::Message { token, words, .. }) = sys::receive(c) {
+            let _ = token.reply(&[]);
+            if words[0] == 0 {
+                break;
+            }
+        }
+    }
+    sys::thread_exit()
+}
+
 /// Binds the entry of the handler, then waits for a message that never comes
-/// until mark 3: a request for the handler wakes it, and the CPU it is on
+/// until the stop: a request for the handler wakes it, and the CPU it is on
 /// leaves WFI or its lower thread.
 extern "C" fn waiting_target(_: u64) -> ! {
     // SAFETY: the handler touches the marks alone.
@@ -1611,12 +1633,7 @@ extern "C" fn waiting_target(_: u64) -> ! {
     }
     let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
     MARKS[0].store(1, Relaxed);
-    while MARKS[3].load(Relaxed) == 0 {
-        if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
-            let _ = token.reply(&[]);
-        }
-    }
-    sys::thread_exit()
+    serve_until_stopped(&c)
 }
 
 /// A thread of a lower level that holds its CPU at EL0 until mark 3.
@@ -1653,16 +1670,11 @@ extern "C" fn storm(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// Receives and replies until mark 3: the service of a call.
+/// Receives and replies until the stop: the service of a call.
 extern "C" fn echo_service(_: u64) -> ! {
     let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
     MARKS[0].store(1, Relaxed);
-    while MARKS[3].load(Relaxed) == 0 {
-        if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
-            let _ = token.reply(&[]);
-        }
-    }
-    sys::thread_exit()
+    serve_until_stopped(&c)
 }
 
 /// Median, 99th percentile and longest of the rounds, in ticks.
@@ -1714,7 +1726,6 @@ fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'stati
         *row = time::now().wrapping_sub(before);
         pause(50_000);
     }
-    MARKS[3].store(1, Relaxed);
     let _ = sys::send(&c, &[0]);
     let ended =
         wait_for(|| sys::thread_info(&server).is_ok_and(|i| i.state == abi::ThreadState::Ended));
