@@ -3345,6 +3345,10 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
         "relibc-hello: long transfers, O_SYNC, aio on threads",
         "relibc-hello: timers with a function in a thread",
+        &format!(
+            "relibc-hello: cpus conf={0} online={0} mask={0} on=1",
+            qemu::cpus()
+        ),
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
@@ -7510,6 +7514,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // one; the kernel tests, whose harness runs the code of the tests
         // on CPU 0 with the others outside the scheduler, and waits for
         // them at the first retired ASID.
+        job("relibc-hello smp 4", || {
+            qemu::on_cpus(SMP_CPUS, relibc_hello_probe)
+        }),
         job("relibc-threads smp 4", || {
             qemu::on_cpus(SMP_CPUS, || relibc_threads_probe(&qemu::VIRT))
         }),
