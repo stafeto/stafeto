@@ -45,7 +45,8 @@ pub const START_DATA_NAMES: [&str; 6] = [
 ];
 /// The name of the boot image, read-only, in the start data of the
 /// process service, which loads the POSIX processes from there (serve.rs),
-/// and of the RAM file service, which shows the files of its table.
+/// of the RAM file service, which shows the files of its table, and of the
+/// clock service, which reads the start time of a VZ machine from it.
 pub const BOOT_IMAGE: &str = "bootimage";
 /// The name of the RAM file service's record: it gets the boot image.
 pub const RAM_SERVICE: &str = "ramfs";

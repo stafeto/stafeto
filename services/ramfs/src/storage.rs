@@ -1120,6 +1120,13 @@ impl<'a> Storage<'a> {
             };
         }
         if let Some(tree) = tree {
+            // The files of the image have the time of its build, or the
+            // time of the start when the table has none.
+            let made = i64::try_from(tree.time())
+                .ok()
+                .filter(|&seconds| seconds > 0)
+                .and_then(|seconds| proto_fs::Timestamp::new(seconds, 0).ok())
+                .unwrap_or(now);
             let etc = tree.find("/etc");
             out.state.nodes[0].links += u32::from(tree.root_links()) - u32::from(etc.is_some());
             for n in 0..tree.len() {
@@ -1145,10 +1152,15 @@ impl<'a> Storage<'a> {
                 }
                 if out.state.nodes[slot].kind == 0 {
                     let file = crate::image_file(&tree, n);
+                    let (kind, mode) = if entry.is_symlink() {
+                        (SYMLINK, 0o777)
+                    } else {
+                        (file.kind(), entry.mode & 0o7777)
+                    };
                     out.state.nodes[slot] = Node {
                         generation: 1,
-                        kind: file.kind(),
-                        mode: entry.mode & 0o7777,
+                        kind,
+                        mode,
                         uid: entry.uid,
                         gid: entry.gid,
                         links: u32::from(tree.links(n)),
@@ -1159,7 +1171,7 @@ impl<'a> Storage<'a> {
                             tree.data(n).len() as u64
                         },
                         boot_visible_length: tree.data(n).len() as u64,
-                        times: [now; 3],
+                        times: [made; 3],
                         boot: canonical(&tree, n),
                         ..Node::EMPTY
                     };
@@ -2113,7 +2125,7 @@ impl<'a> Storage<'a> {
         let n = &self.state.nodes[token.slot as usize];
         let bytes = if token.slot == 3 {
             crate::MOTD
-        } else if n.boot != NONE && n.kind == crate::REG {
+        } else if n.boot != NONE && (n.kind == crate::REG || n.kind == SYMLINK) {
             self.tree.as_ref().unwrap().data(n.boot)
         } else {
             &[]

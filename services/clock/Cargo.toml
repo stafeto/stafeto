@@ -19,3 +19,4 @@ proto-init = { path = "../../proto/init" }
 proto-process = { path = "../../proto/process" }
 posix-credentials = { path = "../../lib/posix-credentials" }
 rt = { path = "../../lib/rt" }
+rtc = { path = "../../lib/rtc" }

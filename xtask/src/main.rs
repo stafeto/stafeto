@@ -29,6 +29,7 @@ mod service_sample;
 
 mod bash_dialog;
 mod ci;
+mod clock_probe;
 mod disasm;
 mod entropy;
 mod htop_dialog;
@@ -1422,6 +1423,7 @@ commands:
   posix-interrupt-vz verify live IPC interruption on the Virtio console on Apple VZ
   console-restart-vz crash the Virtio console's driver on Apple VZ; init stops the
             device and restarts it
+  clock-vz  check that the clock starts at the time vz-run writes into the image;
   console-early-exit-vz end the Virtio console's driver before it decodes its BARs;
             init stops the function and restarts it
   posix-shared verify cross-thread Rust POSIX file and directory state
@@ -1689,6 +1691,7 @@ fn main() {
         Some("posix-interrupt-vz") => posix_interrupt_probe(true),
         Some("console-restart-vz") => vz::console_restart(),
         Some("console-early-exit-vz") => vz::console_early_exit(),
+        Some("clock-vz") => vz::clock(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -2171,6 +2174,16 @@ fn write_elf_image(
             elf_names.push(raw);
         }
     }
+    // A VZ machine has no PL031: its runner writes the time of the host into
+    // this file before it boots the image (tools/vz-run.swift).
+    let seed = rtc::seed_file(0);
+    if name.contains("vz")
+        && sources
+            .iter()
+            .any(|(file, _, _)| *file == "posix-clock-service")
+    {
+        list.push((rtc::SEED_FILE, seed.as_slice()));
+    }
     let first = list.len() as u32;
     for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
         list.push((file.as_str(), bytes.as_slice()));
@@ -2178,7 +2191,12 @@ fn write_elf_image(
     let table = if listed.is_empty() {
         None
     } else {
-        Some(rootfs::table(&listed, first, list.len() as u32 + 1)?)
+        Some(rootfs::table_at(
+            &listed,
+            first,
+            list.len() as u32 + 1,
+            rootfs::build_time()?,
+        )?)
     };
     if let Some(table) = &table {
         list.push(("rootfs", table.as_slice()));
@@ -6177,7 +6195,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
     ),
     (
-        r#"logname; login-probe login"#,
+        r#"logname; /libexec/login-probe login"#,
         &[
             r#"user"#,
             r#"~login-probe: getlogin user"#,
@@ -6188,7 +6206,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        r#"logger -t tagx hello-journal; login-probe syslog"#,
+        r#"logger -t tagx hello-journal; /libexec/login-probe syslog"#,
         &[
             r#"~login-probe: setlogmask returned 255"#,
             r#"login-probe: syslog written"#,
@@ -6240,7 +6258,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         &[r#"COMMAND"#, r#"~PID"#],
     ),
     (
-        r#"login-probe utmpx"#,
+        r#"/libexec/login-probe utmpx"#,
         &[
             r#"login-probe: entries at the start 0"#,
             r#"login-probe: 0 failures"#,
@@ -6432,6 +6450,7 @@ fn ash_dialog() -> Result<(), String> {
     nano_build()?;
     bash_build()?;
     let kernel = build(Variant::Normal)?;
+    clock_probe::date_images_back()?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_ready_terms(&image)?;
     image_has_bash_terms(&image)?;
@@ -6445,25 +6464,25 @@ fn ash_dialog() -> Result<(), String> {
         Ok(meta.len().to_string())
     };
     let busybox = elf_size("busybox-probe")?;
-    // One file of BusyBox under each of its names: ash, sh, busybox and
-    // the utilities (rootfs.rs), all links of one file.
-    let links = (3 + rootfs::utilities()).to_string();
+    // BusyBox is one file; ash, sh and the utilities are symbolic links to
+    // it (rootfs.rs), each as long as its target name.
+    let link = |name: &'static str| ("lrwxrwxrwx", "1".to_string(), name, "7".to_string());
     let bin_listing = [
-        ("-rwxr-xr-x", links.clone(), "ash", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "busybox", busybox.clone()),
+        link("ash"),
+        // One more link: /libexec/login-probe is a name of the same file.
+        ("-rwxr-xr-x", "2".to_string(), "busybox", busybox.clone()),
         ("-rwxr-xr-x", "1".to_string(), "bash", elf_size("bash")?),
-        ("-rwxr-xr-x", links.clone(), "cat", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "head", busybox.clone()),
+        link("cat"),
+        link("head"),
         ("-rwxr-xr-x", "1".to_string(), "htop", elf_size("htop")?),
-        ("-rwxr-xr-x", links.clone(), "ls", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "mktemp", busybox.clone()),
+        link("ls"),
+        link("mktemp"),
         ("-rwxr-xr-x", "1".to_string(), "nano", elf_size("nano")?),
-        ("-rwxr-xr-x", links.clone(), "nc", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "sh", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "sleep", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "timeout", busybox.clone()),
-        ("-rwxr-xr-x", links.clone(), "wc", busybox),
-        ("-rwsr-x---", "1".to_string(), "ramfs", elf_size("ramfs")?),
+        link("nc"),
+        link("sh"),
+        link("sleep"),
+        link("timeout"),
+        link("wc"),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
     let bin_count = (bin_listing.len() + rootfs::utilities() - 8).to_string();
@@ -6584,13 +6603,20 @@ fn ash_dialog() -> Result<(), String> {
         // The directories show as such: st_mode of a directory.
         run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        // The time of the host in `date`, the time of the build on the files.
+        clock_probe::check(&mut run, &image)?;
         // The files of the boot image's table: the modes and the sizes of
-        // the ELF files (four names of BusyBox, a set-user-ID file), one
+        // the ELF files, the links to BusyBox with their targets, one
         // command each.
         for (mode, links, name, size) in &bin_listing {
             let command = format!("ls -l /bin/{name}");
             run.send(&command)?;
             run.expect(&command, DIALOG_STEP)?;
+            let tail = if mode.starts_with('l') {
+                format!("/bin/{name} -> busybox")
+            } else {
+                format!("/bin/{name}")
+            };
             run.expect_line(
                 name,
                 |line| {
@@ -6598,12 +6624,28 @@ fn ash_dialog() -> Result<(), String> {
                     line.starts_with(mode)
                         && words.get(1).copied() == Some(links.as_str())
                         && words.contains(&size.as_str())
-                        && words.last() == Some(&format!("/bin/{name}").as_str())
+                        && line.ends_with(&tail)
                 },
                 DIALOG_STEP,
             )?;
             run.expect("# ", DIALOG_STEP)?;
         }
+        // The service and the test program are in /libexec, set-user-ID
+        // service of another owner among them.
+        let service = "ls -l /libexec/ramfs";
+        run.send(service)?;
+        run.expect(service, DIALOG_STEP)?;
+        let ramfs_size = elf_size("ramfs")?;
+        run.expect_line(
+            "/libexec/ramfs",
+            |line| {
+                line.starts_with("-rwsr-x---")
+                    && line.split_whitespace().any(|word| word == ramfs_size)
+                    && line.ends_with("/libexec/ramfs")
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("ls --help")?;
         run.expect("ls --help", DIALOG_STEP)?;
         run.expect("Usage: ls", DIALOG_STEP)?;
@@ -7573,6 +7615,8 @@ fn host_tests() -> Result<(), String> {
         "posix-signal-queue",
         "--package",
         "entries",
+        "--package",
+        "rtc",
         "--package",
         "posix-credentials",
         "--package",
@@ -9898,6 +9942,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "entries",
         "--package",
+        "rtc",
+        "--package",
         "posix-credentials",
         "--package",
         "proto-process",
@@ -10009,6 +10055,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-signal-queue",
         "--package",
         "entries",
+        "--package",
+        "rtc",
         "--package",
         "posix-abi",
         "--package",

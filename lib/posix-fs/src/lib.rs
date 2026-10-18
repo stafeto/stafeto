@@ -131,8 +131,13 @@ pub enum FileKind {
     Character,
     Fifo,
     Socket,
+    /// A symbolic link, as a listing of a directory shows it.
+    Symlink,
 }
 
+/// The kind of a symbolic link in the file service (proto_fs's NodeInfo and
+/// the records of a directory).
+pub const SYMLINK: u32 = 5;
 /// The kind of a pipe's node information (NodeInfo::kind).
 pub const FIFO: u32 = 4;
 /// The kind of a socket's node information: a socket of the pipe service,
@@ -145,6 +150,7 @@ impl FileKind {
             1 => Ok(Self::Directory),
             2 => Ok(Self::Regular),
             3 => Ok(Self::Character),
+            SYMLINK => Ok(Self::Symlink),
             FIFO => Ok(Self::Fifo),
             SOCKET => Ok(Self::Socket),
             _ => Err(FsError::Io),

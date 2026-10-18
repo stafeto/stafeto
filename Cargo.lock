@@ -310,6 +310,7 @@ dependencies = [
  "proto-process",
  "proto-wire",
  "rt",
+ "rtc",
 ]
 
 [[package]]
@@ -827,6 +828,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtc"
+version = "0.1.0"
+dependencies = [
+ "bootimg",
+]
+
+[[package]]
 name = "safe-mmio"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1025,6 +1033,7 @@ dependencies = [
  "posix-types",
  "proto-fs",
  "proto-wire",
+ "rtc",
 ]
 
 [[package]]

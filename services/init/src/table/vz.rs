@@ -153,7 +153,9 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     CONSOLE,
     super::ramfs::RAM_FIFO_CLOCKED,
     super::ramfs::BUSYBOX_DIALOG_TABLE[2],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[3],
+    // No PL031 on VZ: the clock starts at the time `tools/vz-run.swift`
+    // wrote into the boot image.
+    super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
     // The image of this table has no entropy service.
     Record {
