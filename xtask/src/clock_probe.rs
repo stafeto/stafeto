@@ -28,6 +28,16 @@ pub fn image_time(path: &Path) -> Result<u64, String> {
     Ok(table.time())
 }
 
+/// How long before the run the dialog's image is dated: the files of the
+/// image keep that date while the machine's clock has the time of the boot.
+pub const AGE: u64 = 3 * 86_400;
+
+/// Dates the images built from now on `AGE` seconds back.
+pub fn date_images_back() -> Result<(), String> {
+    crate::rootfs::set_build_time(host_now()?.saturating_sub(AGE));
+    Ok(())
+}
+
 fn host_now() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -79,9 +89,9 @@ pub fn check(run: &mut qemu::Run, image: &Path) -> Result<(), String> {
                 "{path} is dated {modified}, the image was built at {built}"
             ));
         }
-        if guest <= built {
+        if guest < built + AGE - SKEW {
             return Err(format!(
-                "the guest's date {guest} is not after the build {built}"
+                "{path} is dated {modified}, no earlier than the boot at {guest}"
             ));
         }
         run.expect("# ", DIALOG_STEP)?;

@@ -6442,6 +6442,7 @@ fn ash_dialog() -> Result<(), String> {
     nano_build()?;
     bash_build()?;
     let kernel = build(Variant::Normal)?;
+    clock_probe::date_images_back()?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
     image_has_ready_terms(&image)?;
     image_has_bash_terms(&image)?;

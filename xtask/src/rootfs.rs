@@ -995,10 +995,23 @@ pub fn elf_name(program: &str) -> String {
     format!("{program}.elf")
 }
 
+/// A time `set_build_time` fixed for the images built from now on; 0 for none.
+static BUILD_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fixes the build time of the images built from now on (a dialog that
+/// checks the time of the files makes it differ from the time of the boot).
+pub fn set_build_time(seconds: u64) {
+    BUILD_TIME.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The time the files of an image get: SOURCE_DATE_EPOCH when it is set
 /// (seconds since the epoch, so that a build repeats), else the time of the
 /// build.
 pub fn build_time() -> Result<u64, String> {
+    let fixed = BUILD_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if fixed != 0 {
+        return Ok(fixed);
+    }
     match std::env::var("SOURCE_DATE_EPOCH") {
         Ok(text) => text
             .trim()
