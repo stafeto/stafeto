@@ -15,9 +15,9 @@
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELPER, IMAGE, MADE, MARKS, MOST_USED,
-    NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SERVED_AT,
-    SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, GO, HELPER, IMAGE, MADE, MARKS, MISMATCH,
+    MOST_USED, NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN,
+    SERVED_AT, SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -257,6 +257,8 @@ fn run(s: &Start) -> u64 {
         }
         Role::Churn => churn(s, a[0]),
         Role::SmpSpin => smp_spin(s, a[0] as usize, a[1] as u8),
+        Role::AsidPage => asid_page(s, a[0], a[1], a[2] != 0),
+        Role::UnmapAcross => unmap_across(s, a[0] as u8),
         Role::Wfi => {
             let at = mark(FAULT_AT).as_ptr();
             // SAFETY: the instruction is the fault the role exists for; its
@@ -581,6 +583,91 @@ extern "C" fn spinner(cpu: u64) -> ! {
     loop {
         count.fetch_add(1, Relaxed);
     }
+}
+
+/// A page of a new object at SCRATCH, RW, of the child's own process.
+fn own_page(s: &Start) -> Option<(ManuallyDrop<Handle<Process>>, *mut u64)> {
+    let own = Handle::<Process>::borrowed(s.handles[0]);
+    let m = sys::mem_create(PAGE).ok()?;
+    sys::mem_map(&own, &m, 0, PAGE, SCRATCH, Access::ReadWrite).ok()?;
+    Some((own, SCRATCH as *mut u64))
+}
+
+/// Role::AsidPage.
+fn asid_page(s: &Start, seed: u64, rounds: u64, wait: bool) -> u64 {
+    let Some((_, at)) = own_page(s) else {
+        return FAILED;
+    };
+    // SAFETY: the page is the child's own, readable and writable.
+    unsafe { at.write_volatile(seed) };
+    let limit = time::now() + 10_000_000_000;
+    while wait && mark(GO).load(Relaxed) == 0 {
+        if time::now() > limit {
+            return FAILED;
+        }
+        let _ = sys::yield_now();
+    }
+    for _ in 0..rounds {
+        let _ = sys::yield_now();
+        // SAFETY: as above.
+        if unsafe { at.read_volatile() } != seed {
+            return MISMATCH;
+        }
+    }
+    0
+}
+
+/// Role::UnmapAcross: the reader on CPU 1.
+extern "C" fn page_reader(_: u64) -> ! {
+    let reads = mark(HELPER);
+    loop {
+        // SAFETY: the page is mapped until the main thread unmaps it, and
+        // then the load is the fault the role exists for.
+        unsafe { (SCRATCH as *const u64).read_volatile() };
+        reads.fetch_add(1, Relaxed);
+    }
+}
+
+/// Role::UnmapAcross.
+fn unmap_across(s: &Start, priority: u8) -> u64 {
+    let Some((own, at)) = own_page(s) else {
+        return FAILED;
+    };
+    // SAFETY: the page is the child's own, readable and writable.
+    unsafe { at.write_volatile(1) };
+    let mut x = [0; 10];
+    x[0] = own.raw().0;
+    x[1] = page_reader as *const () as u64;
+    x[2] = SPIN_STACKS[0].top() as u64;
+    x[4] = priority.into();
+    x[5] = Policy::Fifo as u64 | (2 << abi::THREAD_CPU_SHIFT);
+    x[6] = buffer(1) as u64;
+    // SAFETY: the thread has a stack of its own, which nothing else uses.
+    let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+    if Error::from_code(after[0]).is_some() {
+        return FAILED;
+    }
+    let t = Handle::<Thread>::from_raw(abi::Handle(after[1]));
+    if sys::thread_start(&t).is_err() {
+        return FAILED;
+    }
+    core::mem::forget(t);
+    let limit = time::now() + 2_000_000_000;
+    while mark(HELPER).load(Relaxed) < 1000 {
+        if time::now() > limit {
+            return FAILED;
+        }
+        let _ = sys::yield_now();
+    }
+    // SAFETY: only the reader reaches the page, and it faults on it.
+    if unsafe { sys::mem_unmap(&own, SCRATCH, PAGE) }.is_err() {
+        return FAILED;
+    }
+    let until = time::now() + 300_000_000;
+    while time::now() < until {
+        let _ = sys::yield_now();
+    }
+    NO_FAULT
 }
 
 /// Role::LastThread.

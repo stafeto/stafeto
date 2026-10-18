@@ -116,7 +116,9 @@ pub fn retire(
     if mmu.ttbr0() & TTBR_ROOT_MASK == root {
         mmu.set_ttbr0(ttbr0(empty, 0));
     }
-    if let Some(asid) = asids.release(cpus, tag) {
+    if let Some(asid) = asids.release(cpus, tag)
+        && !cfg!(feature = "break-aside")
+    {
         mmu.invalidate_asid(tlbi_asid(asid));
     }
 }

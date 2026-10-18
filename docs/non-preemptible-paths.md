@@ -917,3 +917,12 @@ ASID the tag holds whatever its generation, since a CPU that ran the process
 when the generation ended keeps entries under that number. A process that
 goes gives its ASID back whether the tag is of this generation or reserved
 by a CPU, and `aside1is` runs before the number can be issued again.
+
+`cargo xtask smp-asid` runs the probes of this stage on a kernel with 4-bit
+ASIDs (`asid-probe`, a new generation every dozen switches): 88 processes on
+four CPUs read their own pages in waves and one by one, and a page unmapped on
+CPU 0 faults the thread that reads it on CPU 1. Four kernels with one
+deliberate break each must fail them: no reserved ASIDs, no deferred flush, no
+`aside1is` at the end of a process (HVF; TCG drops its TLB at every change of
+ASID and shows none of the three) and a `tlbi vale1` for an unmap (TCG; HVF
+broadcasts it).

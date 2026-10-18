@@ -185,7 +185,9 @@ impl AsidAllocator {
     /// An allocator for `bits`-wide ASIDs, 8 or 16.
     pub fn new(bits: u32) -> AsidAllocator {
         assert!(
-            bits == 8 || bits == MAX_BITS || (cfg!(feature = "narrow-asid") && bits == 4),
+            bits == 8
+                || bits == MAX_BITS
+                || (cfg!(feature = "narrow-asid") && (bits == 3 || bits == 4)),
             "ASIDs are 8 or 16 bits wide"
         );
         let mut a = AsidAllocator {
@@ -282,11 +284,16 @@ impl AsidAllocator {
                 self.reserved[cpu] = running;
             }
             let kept = self.reserved[cpu];
-            if kept != 0 {
+            if kept != 0 && !cfg!(feature = "break-reserved") {
                 self.set((kept & ASID_MASK) as usize);
             }
         }
-        cpus.flush_pending.store(ALL_CPUS, Relaxed);
+        let owed = if cfg!(feature = "break-flush") {
+            0
+        } else {
+            ALL_CPUS
+        };
+        cpus.flush_pending.store(owed, Relaxed);
     }
 
     /// The map as a new generation has it, the kernel's number the only one

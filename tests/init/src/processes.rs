@@ -226,6 +226,11 @@ pub(crate) fn kid_mark(i: usize) -> u64 {
     unsafe { &*(KID_MARKS as *const AtomicU64).add(i) }.load(Relaxed)
 }
 
+pub(crate) fn set_kid_mark(i: usize, value: u64) {
+    // SAFETY: as in `kid_mark`.
+    unsafe { &*(KID_MARKS as *const AtomicU64).add(i) }.store(value, Relaxed);
+}
+
 pub(crate) fn reset_kid_marks() {
     for i in 0..PAGE / 8 {
         // SAFETY: as in `kid_mark`.

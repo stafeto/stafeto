@@ -8,7 +8,7 @@
 //! them on four, where each also prints the line xtask looks for.
 
 use crate::harness::*;
-use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks};
+use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks, set_kid_mark};
 use crate::timers::timer_at;
 use crate::transfers::copy_raw;
 use abi::{Access, Call, Error, ProcessState, Rights};
@@ -16,7 +16,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 12] = [
+pub(crate) const TESTS: [Test; 14] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -58,6 +58,14 @@ pub(crate) const TESTS: [Test; 12] = [
     (
         "smp_boost_leaves_a_service_that_ended_on_its_cpu_alone",
         boost_of_a_service_that_ended,
+    ),
+    (
+        "smp_processes_keep_their_pages_across_asid_generations",
+        asids_across_cpus,
+    ),
+    (
+        "smp_unmap_reaches_a_thread_on_another_cpu",
+        unmap_across_cpus,
     ),
 ];
 
@@ -977,5 +985,147 @@ fn boost_of_a_service_that_ended() -> Outcome {
     println!(
         "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on"
     );
+    Ok(())
+}
+
+/// Processes alive at once in a wave: more than the 15 ASIDs of the probe
+/// kernel (`asid-probe`) hold, so that its generation changes all the time.
+const ASID_KIDS: usize = 16;
+/// The quota of a child of Role::AsidPage: a page and the tables for it.
+const ASID_QUOTA: u64 = LEAF_QUOTA + 6 * PAGE as u64;
+/// The first wave spreads its children over the CPUs; each later one puts
+/// them all on one CPU, where a number two of them share meets in its TLB.
+const ASID_WAVES: u64 = 4;
+/// Reads of its own page a child makes, a yield between each.
+const ASID_ROUNDS: u64 = 150;
+/// Children that run one after the other after the waves: each frees its
+/// ASID, which the next generation of the probe kernel hands out again.
+const ASID_SEQUENCE: u64 = 24;
+
+/// How a child of Role::AsidPage ended: Ok(true) when it read only its own
+/// word.
+fn ends_with_its_own_word(kid: &Kid) -> Result<bool, &'static str> {
+    match kid.end()? {
+        ProcessState::Exited { code: 0 } => Ok(true),
+        ProcessState::Exited { code } if code == child::MISMATCH => Ok(false),
+        other => {
+            println!("smp: a child of the ASID probe ended with {other:?}");
+            Err("a child of the ASID probe ended some other way")
+        }
+    }
+}
+
+/// Processes on every CPU map a page of their own at one address, with
+/// their own word in it, and read it back round after round, yielding to the
+/// others of their CPU. Waves of 16 at once, then a run of children that
+/// each begin after the one before ended: ASIDs of the generation turn
+/// over again and again on the probe kernel (4-bit ASIDs), and are freed
+/// and issued again. No process may read the word of another one, which a
+/// TLB entry left under its ASID (a number the new generation handed out
+/// without a flush on this CPU, or a freed one with its entries still on
+/// another CPU) would show.
+fn asids_across_cpus() -> Outcome {
+    // The line tells xtask that the kernel got as far as the probe.
+    println!("smp: the ASID probe starts");
+    let n = cpus()?;
+    let mut mismatches = 0;
+    for wave in 0..ASID_WAVES {
+        let mut kids: [Option<Kid>; ASID_KIDS] = [const { None }; ASID_KIDS];
+        let mut result: Outcome = Ok(());
+        // The children wait for the mark GO, so that all of them hold an
+        // ASID at once before any begins its rounds.
+        reset_kid_marks();
+        for (i, slot) in kids.iter_mut().enumerate() {
+            if result.is_err() {
+                break;
+            }
+            let cpu = if wave == 0 {
+                i % n
+            } else {
+                (wave as usize) % n
+            };
+            SPAWN_CPU.store((cpu + 1) as u8, Relaxed);
+            let seed = 0x5EED_0000 + wave * 100 + i as u64;
+            result = Kid::load(ASID_QUOTA, 16, LOW).and_then(|kid| {
+                let started = kid.start().and_then(|()| {
+                    kid.serve(Role::AsidPage, &[seed, ASID_ROUNDS, 1], &[Gift::Own])
+                });
+                *slot = Some(kid);
+                started
+            });
+        }
+        SPAWN_CPU.store(0, Relaxed);
+        set_kid_mark(child::GO, 1);
+        for kid in kids.iter().flatten() {
+            if result.is_ok() {
+                match ends_with_its_own_word(kid) {
+                    Ok(true) => {}
+                    Ok(false) => mismatches += 1,
+                    Err(e) => result = Err(e),
+                }
+            }
+        }
+        for kid in kids.into_iter().flatten() {
+            kid.close()?;
+        }
+        let_run()?;
+        result?;
+    }
+    for i in 0..ASID_SEQUENCE {
+        SPAWN_CPU.store((i as usize % n + 1) as u8, Relaxed);
+        let kid = Kid::load(ASID_QUOTA, 16, LOW);
+        SPAWN_CPU.store(0, Relaxed);
+        let kid = kid?;
+        let result = kid
+            .start()
+            .and_then(|()| kid.serve(Role::AsidPage, &[0x5E0_0000 + i, 20, 0], &[Gift::Own]))
+            .and_then(|()| ends_with_its_own_word(&kid));
+        kid.close()?;
+        let_run()?;
+        if !result? {
+            mismatches += 1;
+        }
+    }
+    check(
+        mismatches == 0,
+        "a process read the page of another one under its ASID",
+    )?;
+    println!(
+        "smp: {} processes on {n} CPUs read only their own pages, in waves of {ASID_KIDS} and one by one",
+        ASID_WAVES * ASID_KIDS as u64 + ASID_SEQUENCE
+    );
+    Ok(())
+}
+
+/// A thread of a child on CPU 1 reads a page of the child's process; the
+/// child's first thread, on this CPU, unmaps the page: the reader's next
+/// load faults and ends the process in a data abort at the page. Only a
+/// TLBI that reaches the other CPU (`tlbi vale1is`) makes it so: the TLB
+/// of CPU 1 holds the page, hot, when the unmap goes.
+fn unmap_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    println!("smp: the unmap probe starts");
+    reset_kid_marks();
+    let kid = Kid::load(SPIN_QUOTA, 16, LEVEL)?;
+    let state = kid
+        .start()
+        .and_then(|()| kid.serve(Role::UnmapAcross, &[LEVEL.into()], &[Gift::Own]))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    let_run()?;
+    match state? {
+        ProcessState::Fault { far, .. } => check(
+            far == child::SCRATCH as u64,
+            "the reader on CPU 1 faulted at another address",
+        )?,
+        ProcessState::Exited { code } if code == child::NO_FAULT => {
+            return Err("the thread on CPU 1 still read the page after its unmap");
+        }
+        _ => return Err("the child of the unmap probe ended some other way"),
+    }
+    println!("smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1");
     Ok(())
 }

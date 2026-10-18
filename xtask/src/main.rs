@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 244;
+const INIT_TESTS: u32 = 246;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1216,10 +1216,21 @@ enum Variant {
     /// A window between the post of a command and its flush, and the end of
     /// a thread inside it (`smp_window`).
     WindowProbe,
+    /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
+    /// address space (`smp_asid`), and the same with one deliberate break
+    /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
+    /// of a process, and an unmap whose TLBI stays on its CPU.
+    AsidProbe,
+    AsidNoReserved,
+    AsidNoFlush,
+    AsidNoAside,
+    UnmapLocal,
+    /// ASIDs 3 bits wide, for the boot of the shell under VZ (`vz::smp_asid`).
+    AsidProbe3,
 }
 
 impl Variant {
-    const ALL: [Variant; 10] = [
+    const ALL: [Variant; 16] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1230,6 +1241,12 @@ impl Variant {
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
         Variant::WindowProbe,
+        Variant::AsidProbe,
+        Variant::AsidNoReserved,
+        Variant::AsidNoFlush,
+        Variant::AsidNoAside,
+        Variant::UnmapLocal,
+        Variant::AsidProbe3,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1248,6 +1265,12 @@ impl Variant {
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
             Variant::WindowProbe => Some("window-probe"),
+            Variant::AsidProbe => Some("asid-probe"),
+            Variant::AsidNoReserved => Some("break-asid-reserved"),
+            Variant::AsidNoFlush => Some("break-asid-flush"),
+            Variant::AsidNoAside => Some("break-asid-aside"),
+            Variant::UnmapLocal => Some("break-unmap-local"),
+            Variant::AsidProbe3 => Some("asid-probe-3"),
         }
     }
 
@@ -1259,7 +1282,13 @@ impl Variant {
             | Variant::FaultProbe
             | Variant::OverflowProbe
             | Variant::CpuOnRefused
-            | Variant::WindowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::WindowProbe
+            | Variant::AsidProbe
+            | Variant::AsidNoReserved
+            | Variant::AsidNoFlush
+            | Variant::AsidNoAside
+            | Variant::UnmapLocal
+            | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
             | Variant::Trace
@@ -1299,6 +1328,12 @@ impl Variant {
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
             Variant::WindowProbe => "stafeto-window",
+            Variant::AsidProbe => "stafeto-asid",
+            Variant::AsidNoReserved => "stafeto-asid-no-reserved",
+            Variant::AsidNoFlush => "stafeto-asid-no-flush",
+            Variant::AsidNoAside => "stafeto-asid-no-aside",
+            Variant::UnmapLocal => "stafeto-unmap-local",
+            Variant::AsidProbe3 => "stafeto-asid-3",
         }
     }
 }
@@ -1470,6 +1505,7 @@ fn main() {
         Some("smp-probe") => smp_probes(args.get(1)),
         Some("smp-cpu-on") => smp_cpu_on(),
         Some("smp-window") => smp_window(),
+        Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
         Some("smp-hvf") => smp_hvf(),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
@@ -1478,6 +1514,7 @@ fn main() {
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
         Some("smp-vz") => vz::smp_boot(),
+        Some("smp-asid-vz") => vz::smp_asid(),
         Some("rtbench") => match &args[1..] {
             [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
@@ -7338,6 +7375,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("smp 4 CPU_ON refused", smp_cpu_on),
         job("smp 4 window", smp_window),
+        job("smp 4 asid", || smp_asid(None)),
         // The tests of SMP stage 4 on four CPUs, with the whole test init
         // (the other stages of SMP, 5 and 6, bring the rest of ci to four).
         job("smp 4 probes GICv2", || {
@@ -8865,7 +8903,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 9] = [
+const SMP_PROBE_LINES: [&str; 11] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
@@ -8875,6 +8913,8 @@ const SMP_PROBE_LINES: [&str; 9] = [
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
     "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
     "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
+    "smp: 88 processes on 4 CPUs read only their own pages, in waves of 16 and one by one",
+    "smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1",
 ];
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
@@ -8943,6 +8983,116 @@ fn smp_window() -> Result<(), String> {
     init_tests_in(Variant::WindowProbe, &qemu::VIRT, false, SMP_CPUS).map(drop)
 }
 
+/// `cargo xtask smp-asid [probe|breaks]` (SMP stage 5): the test init on four CPUs with the
+/// ASID squeezed to 4 bits, so that processes on four CPUs make a new
+/// generation every dozen switches: the kernel says 64 generations began and
+/// every test passes, on the TCG machine and, on Apple silicon, under HVF.
+/// Then the kernels with a deliberate break each must fail the probe that
+/// exists for it: under HVF the three breaks of the ASIDs (the TLB of TCG
+/// drops everything when the ASID changes and hides them), under TCG the unmap
+/// whose TLBI stays on its CPU (HVF broadcasts the local TLBI too, so it
+/// hides that one).
+fn smp_asid(only: Option<&str>) -> Result<(), String> {
+    let hvf = hvf_host();
+    let mut machines = vec![&qemu::VIRT];
+    match &hvf {
+        Ok(()) => machines.push(&qemu::HVF_V3),
+        Err(why) => println!("smp-asid: HVF skipped: {why}"),
+    }
+    if only != Some("breaks") {
+        for m in machines {
+            init_tests_retrying(Variant::AsidProbe, m)?;
+        }
+    }
+    if only == Some("probe") {
+        return Ok(());
+    }
+    let breaks = [
+        (Variant::UnmapLocal, &qemu::VIRT, "unmap"),
+        (Variant::AsidNoReserved, &qemu::HVF_V3, "reserved ASID"),
+        (Variant::AsidNoFlush, &qemu::HVF_V3, "deferred flush"),
+        (Variant::AsidNoAside, &qemu::HVF_V3, "aside1is"),
+    ];
+    for (variant, m, what) in breaks {
+        if m.is_hvf() && hvf.is_err() {
+            continue;
+        }
+        smp_asid_break(variant, m, what)?;
+    }
+    Ok(())
+}
+
+/// The test init on `m` with `variant`'s kernel, which has one deliberate
+/// break: Ok when a probe of SMP stage 5 fails or the kernel stops, Err when
+/// the run passes. A run that stops before the probes began (the flake of
+/// the stage 4 test of a boost under HVF, which stops the kernel in about one
+/// run in ten, also without the stage 5 change) says nothing and is repeated.
+fn smp_asid_break(variant: Variant, m: &qemu::Machine, what: &str) -> Result<(), String> {
+    let a = build(variant)?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
+    let probes = [
+        "smp_processes_keep_their_pages_across_asid_generations",
+        "smp_unmap_reaches_a_thread_on_another_cpu",
+    ];
+    for _ in 0..SMP_ASID_TRIES {
+        let mut cmd = qemu::command(m, &a.image, Some(&image));
+        cmd.args(["-smp", &SMP_CPUS.to_string()]);
+        cmd.args(qemu::HEADLESS);
+        let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
+        let r = qemu::parse_report(&o.lines);
+        let reached = o.lines.iter().any(|l| l == "smp: the ASID probe starts");
+        if r.done.is_none() && !reached {
+            println!("smp asid: a run stopped before the probes began, again");
+            continue;
+        }
+        // A break shows as a failed probe, as another test that reads the
+        // wrong page, or as a kernel that stops once the probes began; the
+        // one test that fails under HVF without any break does not count.
+        let caught = r
+            .failed
+            .iter()
+            .any(|(name, _)| probes.contains(&name.as_str()) || name != qemu::HOLE_TEST)
+            || r.done.is_none();
+        if !caught {
+            return Err(format!(
+                "no probe caught the kernel without {what} on {}: the run failed {:?}",
+                m.name, r.failed
+            ));
+        }
+        println!(
+            "smp asid: the kernel without {what} is caught on {}: failed {:?}, counted {:?}",
+            m.name,
+            r.failed.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+            r.done
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "the kernel without {what} on {} stopped before the probes in each of {SMP_ASID_TRIES} runs",
+        m.name
+    ))
+}
+
+/// How often `smp_asid` repeats a run that stops before its probes.
+const SMP_ASID_TRIES: usize = 4;
+
+/// `init_tests_in` that repeats a run which stops before the probes began,
+/// as `smp_asid_break` does: the stage 4 flake under HVF.
+fn init_tests_retrying(variant: Variant, m: &qemu::Machine) -> Result<usize, String> {
+    let mut last = String::new();
+    for _ in 0..SMP_ASID_TRIES {
+        match init_tests_in(variant, m, false, SMP_CPUS) {
+            Ok(n) => return Ok(n),
+            Err(e) if m.is_hvf() && e.contains("counting None") => {
+                println!("smp asid: a run on {} stopped early, again: {e}", m.name);
+                last = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
 /// `init_tests` with `cpus` CPUs: with more than one, the lines of the tests
 /// of SMP stage 4 must be there.
 fn init_tests_on(m: &qemu::Machine, icount: bool, cpus: usize) -> Result<usize, String> {
@@ -8995,6 +9145,9 @@ fn init_tests_in(
         let (Some(waited), Some(late)) = (waited, late) else {
             return Err("the test init printed no line of the wait of a suspension".into());
         };
+        if variant == Variant::AsidProbe {
+            qemu::expect_line(&o, "smp asid  generation 16 of narrow ASIDs began")?;
+        }
         if variant == Variant::WindowProbe {
             // CPU 1 came 20 ms late to its quiescent point: the suspension
             // waited for it, and this CPU ran the thread of a timer of 2 ms
@@ -9036,7 +9189,7 @@ fn init_tests_in(
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    let made = CHILD_FAULTS - usize::from(hvf);
+    let made = CHILD_FAULTS - usize::from(hvf) + usize::from(cpus > 1);
     if faults != made {
         return Err(format!(
             "{faults} process fault lines; the test init makes {made}"

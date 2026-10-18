@@ -17,3 +17,9 @@ abi = { path = "../lib/abi" }
 atomic-locks = []
 # ASIDs 4 bits wide, for the probe build of the kernel (feature asid-probe).
 narrow-asid = []
+# Deliberate breaks of the ASID scheme, for the probes that must catch them
+# (xtask smp-asid): a new generation reserves no number a CPU runs, leaves
+# no flush to the CPUs, and a process that goes does not drop its ASID.
+break-reserved = []
+break-flush = []
+break-aside = []

@@ -45,13 +45,27 @@ pub fn init(boot: &Boot) {
         Ordering::Relaxed,
     );
     // The probe build squeezes the ASID to 4 bits, so that a new generation
-    // begins every dozen switches of address space (xtask smp-asid).
-    let bits = if cfg!(feature = "asid-probe") {
+    // begins every dozen switches of address space (xtask smp-asid), and
+    // the build for the shell under VZ to 3 (xtask smp-asid-vz).
+    let bits = if cfg!(feature = "asid-probe-3") {
+        3
+    } else if cfg!(feature = "asid-probe") {
         4
     } else {
         asid::asid_bits(registers::id_aa64mmfr0_el1())
     };
     *ASIDS.lock() = Some(AsidAllocator::new(bits));
+}
+
+/// The probe kernel names a generation that is a power of two from 2 on,
+/// once each (xtask smp-asid).
+#[cfg(feature = "asid-probe")]
+fn probe_says_generations() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let g = CPUS.generation();
+    if g >= 2 && g.is_power_of_two() && SAID.fetch_max(g, Ordering::Relaxed) < g {
+        kprintln!("smp asid  generation {g} of narrow ASIDs began");
+    }
 }
 
 /// Points TTBR0 of this CPU at the empty table with ASID 0 when it holds a
@@ -380,6 +394,8 @@ impl AddressSpace {
         }
         crate::obj::serving(crate::obj::ENTRY_ASID);
         with_asids(|a| tlb::switch_slow(a, &CPUS, cpu, &self.tag, root, empty, &mut Cpu, zero_map));
+        #[cfg(feature = "asid-probe")]
+        probe_says_generations();
     }
 
     /// Takes TTBR0 off the tables and drops their TLB entries with the
