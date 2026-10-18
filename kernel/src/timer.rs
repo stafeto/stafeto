@@ -33,7 +33,9 @@ use crate::local::local;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{Error, MAX_SYSTEM_TIMERS};
+use crate::arch::cpu::MAX_CPUS;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use kcore::sync::Budget;
 pub(crate) use kcore::timer::LEVELS;
 use kcore::timer::{Firing, HeapLink, HeapNode, Levels};
@@ -66,6 +68,9 @@ pub struct Timer {
     /// The level of the cleanup its last release started, for the CPU that
     /// owns it when another one let it go (`reap`).
     cause: u8,
+    /// The next timer in the chain of the dying timers that wait for the
+    /// CPU that owns them (`REAPED`), 0 for none; under OBJ.
+    next_reaped: usize,
     /// Its place in the cleanup queue once nothing refers to it.
     cleanup: Item,
 }
@@ -149,6 +154,7 @@ pub fn create(
         dying: false,
         cpu: NO_CPU,
         cause: 0,
+        next_reaped: 0,
         cleanup: Item::new(),
     };
     let t = process::paid_alloc(payer, timer).inspect_err(|_| {
@@ -223,9 +229,9 @@ pub unsafe fn release(t: NonNull<Timer>, cause: u8) {
             let owner = (*p).cpu;
             if owner != NO_CPU && usize::from(owner) != crate::arch::cpu::this().index() {
                 // The heap that holds it is another CPU's: that CPU takes
-                // it off and queues it (cmd::REAP, `reap`).
+                // it off and queues it (`reap`).
                 (*p).cause = cause;
-                crate::cmd::post_reap(t);
+                post_reap(t, usize::from(owner));
                 return;
             }
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
@@ -310,24 +316,57 @@ fn bind(t: NonNull<Timer>) -> Result<(), Error> {
     Ok(())
 }
 
-/// The CPU that owns `t`, whose last reference another CPU dropped.
-pub fn owner_cpu(t: NonNull<Timer>) -> usize {
-    // SAFETY: the caller holds the timer until the command is served.
-    usize::from(unsafe { (*t.as_ptr()).cpu })
+/// The dying timers whose last reference went on another CPU, by the CPU
+/// whose heap holds them, linked through `Timer::next_reaped` (0 ends a
+/// chain). OBJ guards every access, the owner's and the others', so plain
+/// loads and stores do; the chain needs no queue between CPUs, and any number
+/// of timers fits.
+static REAPED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Puts `t` in the chain of CPU `owner`, under OBJ, and asks that CPU in
+/// (cmd::kick) when the chain was empty: a chain that was not has an SGI on
+/// its way, or its owner left timers and sent itself one (`reap`).
+///
+/// # Safety
+/// `t` is dying, in no queue, and only its pool holds it.
+unsafe fn post_reap(t: NonNull<Timer>, owner: usize) {
+    crate::obj::assert_held();
+    let first = REAPED[owner].load(Relaxed);
+    // SAFETY: the caller's promise; the field is the chain's.
+    unsafe { (*t.as_ptr()).next_reaped = first };
+    REAPED[owner].store(t.as_ptr() as usize, Relaxed);
+    if first == 0 {
+        crate::cmd::kick(owner);
+    }
 }
 
-/// REAP, served by the CPU that owns the timer: its last reference went on
-/// another CPU, which marked it dying and left the rest to this one, whose
-/// heap holds it; it goes to this CPU's cleanup queue at the level of the
-/// release, and its portion takes it off the heap.
-pub fn reap(t: NonNull<Timer>) {
-    let _section = crate::obj::lock();
-    // SAFETY: the timer is dying and in no queue; its slot holds the pool.
-    unsafe {
-        let p = t.as_ptr();
-        let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-        cleanup::enqueue(item, Object::Timer(t), (*p).cause);
+/// Whether a dying timer waits for this CPU (cmd::drain): a hint read
+/// outside OBJ, which the SGI of the kick follows.
+pub fn reaps_waiting() -> bool {
+    REAPED[crate::arch::cpu::this().index()].load(Relaxed) != 0
+}
+
+/// Up to `n` dying timers of this CPU's chain, whose last reference went on
+/// another CPU, go to this CPU's cleanup queue at the level of the release,
+/// and their portions take them off the heap; under OBJ. True when timers
+/// stay in the chain.
+pub fn reap(n: usize) -> bool {
+    crate::obj::assert_held();
+    let head = &REAPED[crate::arch::cpu::this().index()];
+    for _ in 0..n {
+        let Some(t) = NonNull::new(head.load(Relaxed) as *mut Timer) else {
+            return false;
+        };
+        // SAFETY: the timer is dying and in no queue but the chain; its
+        // slot holds the pool.
+        unsafe {
+            let p = t.as_ptr();
+            head.store((*p).next_reaped, Relaxed);
+            let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+            cleanup::enqueue(item, Object::Timer(t), (*p).cause);
+        }
     }
+    head.load(Relaxed) != 0
 }
 
 /// The nearest deadline of the levels whose firing is not queued, in O(1),

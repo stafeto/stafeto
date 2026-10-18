@@ -121,7 +121,7 @@ pub enum Stage {
     Buffers,
     /// The entries of the table of its mappings, at most abi::MAX_MAPPINGS,
     /// each letting its memory object go, and the block of the table
-    /// (maps::release_all). One portion. After Space, so that no TLB entry
+    /// (maps::release_all), MAPPINGS_PORTION entries a portion. After Space, so that no TLB entry
     /// maps a frame of an object that goes.
     Mappings,
     /// The free part of its quota goes back to the parent, and the

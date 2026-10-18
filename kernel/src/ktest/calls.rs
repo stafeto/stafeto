@@ -4231,9 +4231,10 @@ pub fn prepaid_tables_come_back(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// A mem_map whose caller's process ends between two portions keeps the
-/// pages it mapped (spec 7.7): with an interrupt pending all along, two
-/// entries map two portions of an object of LONG_PAGES pages into a
-/// target whose tables exist, each counting toward the longest portion
+/// pages it mapped (spec 7.7): with an interrupt pending all along, the
+/// first entry checks and polls, and the second maps a portion of an object
+/// of LONG_PAGES pages into a target whose tables exist, each counting
+/// toward the longest portion
 /// (KERNEL_STATS x5); once the caller's process went, the target has a
 /// mapping of those pages alone, idle, which holds the object, the rest
 /// does not translate, and what the call paid for tables came back.
@@ -4252,7 +4253,7 @@ pub fn abandoned_map_keeps_its_prefix(_: &Boot) -> Result<(), &'static str> {
 fn abandoned_map(c: &Caller) -> Result<(), &'static str> {
     let (h, m) = make_memory(c, LONG_PAGES)?;
     let (t, th) = target_of(c)?;
-    let done = 2 * u64::from(process::PORTION);
+    let done = u64::from(process::PORTION);
     let n = Call::MemMap.number();
     let args = [
         th.0,

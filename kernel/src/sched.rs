@@ -371,10 +371,8 @@ pub fn serve_unpark(t: NonNull<Thread>) {
 }
 
 /// WAKE, served by the CPU of the thread, unless it ended since, once the
-/// copy of its message is made (`flush_copy` of the CPU that woke it comes
-/// after the flag, and takes the time of 960 bytes).
+/// copy of its message is made (cmd::drain waits for it).
 pub fn serve_wake(t: NonNull<Thread>) {
-    thread::wait_copies(t);
     let _section = crate::obj::lock();
     if !thread::is_held(t) {
         return;

@@ -458,28 +458,36 @@ pub fn device_windows(process: NonNull<Process>) -> usize {
     })
 }
 
-/// The stage Mappings (spec 7.7): every entry of the table, busy or not,
-/// leaves it, its reference to the object going at `level`. Its paid page
-/// stays in the page log until shell cleanup. The stage Space took the ASID, so no
-/// TLB entry maps a frame of an object that goes. One portion: at most
-/// abi::MAX_MAPPINGS entries, each O(1).
+/// The entries of the table of mappings a portion of the stage Mappings
+/// takes, in one section under OBJ.
+pub const MAPPINGS_PORTION: usize = 16;
+
+/// A portion of the stage Mappings (spec 7.7): up to MAPPINGS_PORTION
+/// entries of the table, busy or not, leave it, each letting its reference
+/// to the object go at `level`, in one section; true once the table is
+/// empty, which then leaves the process. Its paid page stays in the page log
+/// until shell cleanup. The stage Space took the ASID, so no TLB entry maps
+/// a frame of an object that goes. Each entry O(1), the table's scan
+/// abi::MAX_MAPPINGS slots.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
 pub(super) unsafe fn release_all(process: NonNull<Process>, level: u8) -> bool {
     let p = process.as_ptr();
+    let _section = crate::obj::lock();
     // SAFETY: the caller's promise; only the table and its references are
     // touched, and each entry's reference goes with the entry.
     unsafe {
-        let Some(t) = (*p).maps.take() else {
+        let Some(t) = (*p).maps else {
             return true;
         };
-        // Each entry that goes lets its reference to the object go.
-        (*t.as_ptr()).drain(|m| {
-            let _section = crate::obj::lock();
+        let empty = (*t.as_ptr()).drain(MAPPINGS_PORTION, |m| {
             memory::release_mapping(m.object, level)
         });
-        // The table owns one paid page; PageLog returns it with the shell.
+        if empty {
+            // The table owns one paid page; PageLog returns it with the shell.
+            (*p).maps = None;
+        }
+        empty
     }
-    true
 }
