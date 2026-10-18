@@ -114,15 +114,19 @@ impl CpuTime {
     /// The CPU goes to sleep at `now`.
     pub fn sleeps(&self, now: u64) {
         use core::sync::atomic::Ordering::Relaxed;
-        self.idle
-            .store(self.idle.load(Relaxed).wrapping_sub(now) | ASLEEP, Relaxed);
+        self.idle.store(
+            self.idle.load(Relaxed).wrapping_sub(now) | ASLEEP,
+            core::sync::atomic::Ordering::Release,
+        );
     }
 
     /// The CPU woke at `now`.
     pub fn woke(&self, now: u64) {
         use core::sync::atomic::Ordering::Relaxed;
-        self.idle
-            .store(self.idle.load(Relaxed).wrapping_add(now) & !ASLEEP, Relaxed);
+        self.idle.store(
+            self.idle.load(Relaxed).wrapping_add(now) & !ASLEEP,
+            core::sync::atomic::Ordering::Release,
+        );
     }
 
     /// An entry from EL0 lasted `ticks` up to its poll.
@@ -134,10 +138,15 @@ impl CpuTime {
     }
 
     /// The ticks since the start, the ticks asleep and the ticks of entries
-    /// at `now`: the sleep that lasts counts up to `now`.
-    pub fn read(&self, now: u64) -> [u64; 3] {
+    /// at the counter `now` gives: the sleep that lasts counts up to it.
+    /// `now` is called after the word of the sleep is loaded (Acquire, the
+    /// owner stores it Release), so that a CPU that went to sleep between
+    /// the two never has a counter later than the reader's: a reader whose
+    /// counter was older would take `idle` below zero (near 2^63).
+    pub fn read(&self, now: impl FnOnce() -> u64) -> [u64; 3] {
         use core::sync::atomic::Ordering::Relaxed;
-        let idle = self.idle.load(Relaxed);
+        let idle = self.idle.load(core::sync::atomic::Ordering::Acquire);
+        let now = now();
         let idle = if idle & ASLEEP != 0 {
             idle.wrapping_add(now) & !ASLEEP
         } else {

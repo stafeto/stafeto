@@ -214,12 +214,13 @@ pub fn init_cpu() {
     local().time.started(timer::now());
 }
 
-/// What CPU `index` counts about its time at `now` (`CpuTime::read`) and
+/// What CPU `index` counts about its time (`CpuTime::read`, with the counter
+/// read after its words) and
 /// the number of CPUs that are up, None for a CPU past them (object_info
 /// CPU). Takes no lock: the words are the owner's, read with one load each.
-pub fn cpu_time(index: usize, now: u64) -> Option<(usize, [u64; 3])> {
+pub fn cpu_time(index: usize) -> Option<(usize, [u64; 3])> {
     let cpus = crate::smp::cpus();
-    (index < cpus).then(|| (cpus, arch::cpu::block(index).local.time.read(now)))
+    (index < cpus).then(|| (cpus, arch::cpu::block(index).local.time.read(timer::now)))
 }
 
 /// A stopped thread becomes ready: the tail of its level with a new

@@ -264,6 +264,14 @@ struct Processes {
     retired_ticks: u64,
     /// The CPU the last placement chose (`place`).
     placed_last: u8,
+    /// The placement window (`place`): when it began (0: none yet), the
+    /// ticks since start and asleep of each CPU then, the load of each CPU
+    /// over the last window that ended in thousandths, and the images put
+    /// on each CPU in this window and in the one before.
+    window_at: u64,
+    window_marks: [(u64, u64); MAX_CPUS],
+    window_load: [u32; MAX_CPUS],
+    window_issued: [[u32; MAX_CPUS]; 2],
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
     /// The ExecCommit of each record that waits for init, by the record's
@@ -340,6 +348,10 @@ impl Processes {
             records: Records::new(),
             retired_ticks: 0,
             placed_last: 0,
+            window_at: 0,
+            window_marks: [(0, 0); MAX_CPUS],
+            window_load: [0; MAX_CPUS],
+            window_issued: [[0; MAX_CPUS]; 2],
             tickets: [0; RECORDS],
             replacing: [const { None }; RECORDS],
             replace_queue: Queue::new(),
@@ -2870,62 +2882,70 @@ impl Processes {
     /// The CPU for the main thread of the image of the record `child`
     /// (spawn, fork and exec): the least busy of the CPUs its page allows
     /// (`Page::cpus`, all when 0), the next after the last placement among
-    /// equals. A process is busy on its CPU when it ran a quarter of the last
-    /// window of LOAD_WINDOW_NS, or is still in its first window.
-    /// One CPU, or a machine whose CPUs the kernel does not tell, is CPU 0.
+    /// equals. One CPU, or a machine whose CPUs the kernel does not tell, is
+    /// CPU 0. The step costs the same however many processes live: it reads
+    /// no record. A CPU is busy when it was awake a quarter of the last
+    /// window of LOAD_WINDOW_NS (the time it slept, from object_info CPU,
+    /// which one call per CPU reads at the close of a window), and each image
+    /// put on it in this window and the one before counts as one more, since
+    /// it may not have run enough to show in that time yet.
     fn place(&mut self, child: usize) -> u8 {
         let Ok(info) = sys::cpu_info(0) else {
             return 0;
         };
         let cpus = (info.cpus as usize).clamp(1, MAX_CPUS);
-        if cpus == 1 {
+        // The images of the probe of the steps place on one CPU as well,
+        // so that it measures the placement with the crowd it makes.
+        if cpus == 1 && !cfg!(feature = "steps") {
             return 0;
         }
         let allowed = self.pages.page(child).map_or(0, |page| {
             page.cpus.load(core::sync::atomic::Ordering::Acquire)
         });
         let now = Self::timer_now();
-        let mut busy = [0u32; MAX_CPUS];
-        for i in (0..RECORDS).filter(|&i| i != child) {
-            let Some(record) = self.records.get_mut(i) else {
-                continue;
-            };
-            if matches!(record.state, State::Zombie(_)) {
-                continue;
-            }
-            let ticks = record
-                .carried_ticks
-                .saturating_add(sys::process_time(&record.process).unwrap_or(0));
-            // The load of the process over a window of LOAD_WINDOW_NS: busy
-            // when it ran at least a quarter of it. The window the process
-            // starts with counts it as busy (it is starting), and a window
-            // closes at the first placement after its end, so that the
-            // answer does not depend on how often placements come.
-            if record.load_at == 0 {
-                record.load_at = now;
-                record.load_ticks = ticks;
-                record.load_busy = true;
-            } else if now.saturating_sub(record.load_at) >= LOAD_WINDOW_NS {
-                let ran = rt::time::ticks_to_ns(ticks.saturating_sub(record.load_ticks));
-                record.load_busy = ran.saturating_mul(4) >= now - record.load_at;
-                record.load_at = now;
-                record.load_ticks = ticks;
-            }
-            if record.load_busy {
-                busy[usize::from(record.cpu).min(MAX_CPUS - 1)] += 1;
-            }
+        if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
+            self.close_window(cpus, now);
         }
+        let busy = |p: &Self, c: usize| {
+            u32::from(p.window_load[c] >= 250) + p.window_issued[0][c] + p.window_issued[1][c]
+        };
         // Among the least busy, the first after the CPU of the last
-        // placement: processes made one after the other, before any of
-        // them has run to show in the counts, still go to different CPUs.
+        // placement: images made one after the other, before any of them
+        // has run to show in the time, still go to different CPUs.
         let last = usize::from(self.placed_last);
         let cpu = (1..=cpus)
             .map(|step| (last + step) % cpus)
             .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
-            .min_by_key(|&c| busy[c])
+            .min_by_key(|&c| busy(self, c))
             .map_or(0, |c| c as u8);
         self.placed_last = cpu;
+        let issued = &mut self.window_issued[0][usize::from(cpu)];
+        *issued = issued.saturating_add(1);
         cpu
+    }
+
+    /// Ends the placement window at `now` (ns) and begins the next: the
+    /// load of each CPU over the window that ends, from the kernel's count
+    /// of its time (the first window has none).
+    fn close_window(&mut self, cpus: usize, now: u64) {
+        let first = self.window_at == 0;
+        for c in 0..cpus {
+            let Ok(info) = sys::cpu_info(c as u64) else {
+                continue;
+            };
+            let (since, idle) = self.window_marks[c];
+            let span = info.since.wrapping_sub(since);
+            let slept = info.idle.wrapping_sub(idle).min(span);
+            self.window_load[c] = if first || span == 0 {
+                0
+            } else {
+                (1000 - u128::from(slept) * 1000 / u128::from(span)) as u32
+            };
+            self.window_marks[c] = (info.since, info.idle);
+        }
+        self.window_issued[1] = self.window_issued[0];
+        self.window_issued[0] = [0; MAX_CPUS];
+        self.window_at = now;
     }
 
     /// The piece `making` names for the place in `slot`, which loads the

@@ -95,8 +95,13 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   the process's main thread.
 - The process service puts the main thread of every new image (spawn, fork
   and exec) on the least busy CPU of the mask its page allows
-  (`Page::cpus`, 0 for all); a process is busy when it ran since the last
-  look or has no look yet. A thread starts on the CPU of its creator or, when
+  (`Page::cpus`, 0 for all). A CPU is busy when it was awake a quarter of
+  the last window of 10 ms (the time asleep from `object_info` CPU, read once
+  per CPU when a window closes) and each image put on it in the last two
+  windows counts as one more; among equals the CPU after the last choice wins,
+  so images made in a row go to different CPUs. The step reads no process
+  record, so it costs the same with a hundred processes (`process-steps`
+  places on one CPU too, with 248 children live). A thread starts on the CPU of its creator or, when
   the mask does not allow that, on the lowest CPU it names.
   `sched_setaffinity` writes the mask of its process: the kernel moves no
   thread, so the mask works for the threads made later and for the next exec

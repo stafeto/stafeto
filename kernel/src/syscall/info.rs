@@ -235,8 +235,7 @@ fn log_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn cpu_info(a: &Args) -> Result<Values, Error> {
     reserved_arg(a[0])?;
     let index = usize::try_from(a[2]).map_err(|_| Error::InvalidArgs)?;
-    let (cpus, [since, idle, system]) =
-        sched::cpu_time(index, crate::arch::timer::now()).ok_or(Error::InvalidArgs)?;
+    let (cpus, [since, idle, system]) = sched::cpu_time(index).ok_or(Error::InvalidArgs)?;
     Ok(Values::new(&[
         cpus as u64,
         since,
