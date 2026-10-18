@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 21] = [
+pub(crate) const TESTS: [Test; 22] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -57,6 +57,10 @@ pub(crate) const TESTS: [Test; 21] = [
     (
         "smp_mapping_is_made_once_while_another_cpu_makes_threads",
         mapping_while_threads_join,
+    ),
+    (
+        "smp_exec_map_of_a_process_killed_meanwhile_fails",
+        exec_map_of_a_killed_process,
     ),
     (
         "smp_boost_leaves_a_service_that_ended_on_its_cpu_alone",
@@ -941,6 +945,72 @@ extern "C" fn make_threads(_: u64) -> ! {
 const GAP_LEVEL: u8 = 16;
 /// Calls of mem_map the kernel counts.
 const GAP_CALLS: u64 = 20;
+
+/// The priority at which the kernel built with `window-probe` holds the
+/// portion of a mem_map RX outside OBJ, after the instruction cache, until
+/// another CPU killed the process it maps into (kernel cmd::window).
+const EXEC_LEVEL: u8 = 12;
+/// How long the killer of the exec test waits after init marked its call.
+const EXEC_KILL_NS: u64 = 200_000_000;
+
+/// Waits for mark 2, which init sets right before its mem_map, then for
+/// EXEC_KILL_NS, and ends the victim; mark 1 says it did.
+extern "C" fn kill_victim_later(_: u64) -> ! {
+    let p = Handle::<Process>::borrowed(abi::Handle(VICTIM.load(Relaxed)));
+    while MARKS[2].load(SeqCst) == 0 {
+        spin_loop();
+    }
+    pause(EXEC_KILL_NS);
+    MARKS[1].store(if sys::process_kill(&p).is_ok() { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// Init maps a page RX into a child while a thread on CPU 1 kills the child
+/// EXEC_KILL_NS after init's mark: a call that lasted that long saw the kill
+/// and fails with BAD_STATE.
+/// The kernel built with `window-probe` holds the portion outside OBJ until
+/// the kill, so that the portion has to look at the life of the process
+/// again before it maps; elsewhere the kill comes after the call.
+fn exec_map_of_a_killed_process() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    kid.start()?;
+    let m = sys::mem_create(PAGE as u64).map_err(|_| "mem_create failed")?;
+    VICTIM.store(kid.process.raw().0, Relaxed);
+    let killer = spawn_on(0, 1, kill_victim_later, 0, KILLER)?;
+    sys::thread_set_priority(&me(), EXEC_LEVEL, Policy::Fifo).map_err(|_| "init lowered itself")?;
+    MARKS[2].store(1, SeqCst);
+    let began = now();
+    let mapped = sys::mem_map(&kid.process, &m, 0, PAGE as u64, WINDOW, Access::ReadExec);
+    // The kill began during the call when the call lasted past its time.
+    let killed_first = now() - began >= EXEC_KILL_NS;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "init could not take its priority back")?;
+    let done = wait_for(|| mark(1) != 0);
+    let state = kid.end();
+    let_run()?;
+    close(killer)?;
+    close(m)?;
+    kid.close()?;
+    check(done && mark(1) == 1, "process_kill of the child failed")?;
+    check(
+        state == Ok(ProcessState::Killed),
+        "the child did not end killed",
+    )?;
+    check(
+        !killed_first || mapped == Err(Error::BadState),
+        "a mem_map RX into a process killed during the call mapped its page",
+    )?;
+    println!(
+        "smp: a mem_map RX {} the kill of its process: {mapped:?}",
+        if killed_first { "lasted into" } else { "came before" }
+    );
+    Ok(())
+}
 
 /// A thread on another CPU makes threads in init's process, each of which
 /// puts a message buffer into it, while init maps pages into the same

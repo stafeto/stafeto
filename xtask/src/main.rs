@@ -1140,7 +1140,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 255;
+const INIT_TESTS: u32 = 256;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1229,6 +1229,9 @@ enum Variant {
     /// a queue after the room for its handles (`smp_window`).
     WindowNoBlockCheck,
     WindowNoHeadCheck,
+    /// The same without the second look at the life of the process after the
+    /// portion of a mem_map RX gave OBJ back (`smp_window`).
+    WindowNoAliveCheck,
     /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
     /// address space (`smp_asid`), and the same with one deliberate break
     /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
@@ -1247,7 +1250,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 20] = [
+    const ALL: [Variant; 21] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1260,6 +1263,7 @@ impl Variant {
         Variant::WindowProbe,
         Variant::WindowNoBlockCheck,
         Variant::WindowNoHeadCheck,
+        Variant::WindowNoAliveCheck,
         Variant::AsidProbe,
         Variant::AsidNoReserved,
         Variant::AsidNoFlush,
@@ -1288,6 +1292,7 @@ impl Variant {
             Variant::WindowProbe => Some("window-probe"),
             Variant::WindowNoBlockCheck => Some("break-block-check"),
             Variant::WindowNoHeadCheck => Some("break-head-check"),
+            Variant::WindowNoAliveCheck => Some("break-alive-check"),
             Variant::AsidProbe => Some("asid-probe"),
             Variant::AsidNoReserved => Some("break-asid-reserved"),
             Variant::AsidNoFlush => Some("break-asid-flush"),
@@ -1310,6 +1315,7 @@ impl Variant {
             | Variant::WindowProbe
             | Variant::WindowNoBlockCheck
             | Variant::WindowNoHeadCheck
+            | Variant::WindowNoAliveCheck
             | Variant::AsidProbe
             | Variant::AsidNoReserved
             | Variant::AsidNoFlush
@@ -1359,6 +1365,7 @@ impl Variant {
             Variant::WindowProbe => "stafeto-window",
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
             Variant::WindowNoHeadCheck => "stafeto-window-no-head",
+            Variant::WindowNoAliveCheck => "stafeto-window-no-alive",
             Variant::AsidProbe => "stafeto-asid",
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
             Variant::AsidNoFlush => "stafeto-asid-no-flush",
@@ -9248,6 +9255,15 @@ fn smp_window() -> Result<(), String> {
             o.lines.iter().any(|l| {
                 l.contains("the head of a channel's queue moved while its receiver made room")
             })
+        },
+    )?;
+    smp_window_break(
+        Variant::WindowNoAliveCheck,
+        "the second look at the life of a process after the icache of a mem_map RX",
+        |_, r| {
+            r.failed
+                .iter()
+                .any(|(name, _)| name == "smp_exec_map_of_a_process_killed_meanwhile_fails")
         },
     )
 }

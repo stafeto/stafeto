@@ -336,7 +336,16 @@ pub fn step_change(on: &mut Change) -> Result<bool, Error> {
     if exec {
         // The frames are the object's, and no table maps them yet: cache
         // maintenance on them is no change of a link.
-        crate::obj::outside(|| cache::sync_icache_frames(frames));
+        crate::obj::outside(|| {
+            cache::sync_icache_frames(frames);
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::exec_gap(on.target);
+        });
+        // OBJ went back meanwhile, and a kill on another CPU may have begun
+        // the end of the process, whose tables the portion leaves alone
+        // (obj.rs, rule 3).
+        #[cfg(not(feature = "break-alive-check"))]
+        check_alive(on.target)?;
     }
     match &mut on.op {
         Op::Map { access, prepaid } => {

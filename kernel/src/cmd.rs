@@ -631,6 +631,27 @@ pub mod window {
             .is_some_and(|t| unsafe { t.as_ref() }.priority() == GAP_LEVEL)
     }
 
+    /// The priority of the thread whose mem_map RX waits, in its portion
+    /// outside OBJ, for the end of the process it maps into (`exec_gap`).
+    pub const EXEC_LEVEL: u8 = 12;
+
+    /// In the portion of a mem_map or mem_protect that makes pages
+    /// executable, outside OBJ (process::step_change): a thread at
+    /// EXEC_LEVEL waits up to 2 s until another CPU killed `target`, so that
+    /// the portion takes OBJ again with its process ended.
+    pub fn exec_gap(target: NonNull<crate::process::Process>) {
+        let at_level = crate::sched::running()
+            // SAFETY: the running thread is alive.
+            .is_some_and(|t| unsafe { t.as_ref() }.priority() == EXEC_LEVEL);
+        if !at_level {
+            return;
+        }
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+        while crate::process::alive_unlocked(target) && crate::arch::timer::now() < until {
+            core::hint::spin_loop();
+        }
+    }
+
     /// A mem_map begins (syscall::mem::change_map).
     pub fn map_begins() {
         if watched() {
