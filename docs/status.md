@@ -1,296 +1,235 @@
 # Status details
 
-The README gives the short status. This page keeps the details that are
-useful when working on the code: what the kernel offers, what the Rust
-POSIX layer covers, and which commands check each piece. It describes
-`main` at a2eb60a (step 5c, `posix_spawn` and `exec` from files) with step 5d (`fork`) and step 5e (pipes) on top. The cleanup branch `cleanup-1008` (db64046) changes the counts: os-test 185 PASS, 49 FAIL, 7 UNSUPPORTED, 1 UNKNOWN of 242; the services' budget 20,410 ticks, the kernel's longest path 16,738 of 18,000; the terminal's `Watch` takes at most 16 elements and `poll` splits larger sets.
+The README gives the short picture; this page keeps the details of each part of the system and its known limits. Numbers are from `main` after #165, unless a section names its own step.
 
-## Kernel
+**Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
+turns on the MMU, reads the device tree and checks its boot image. It runs
+on three kinds of machine:
 
-- **Boot:** arm64 Image, drop from EL2, MMU on, device tree, checked boot
-  image. GICv2 or GICv3 is chosen from the device tree; drivers reach
-  device registers with single loads and stores, which a hypervisor can
-  emulate.
-- **Memory:** kernel page tables with W^X, a buddy frame allocator,
-  object pools, an address space with an ASID per process. Every process
-  pays for its kernel memory from its quota. Memory objects take all their
-  pages when they are made; a process maps them R, RW or RX into its own
-  space or into a process whose handle with `MANAGE` it holds. The
-  segments and the stack of `init` are memory objects too. A holder of
-  `DEVICE` makes a contiguous object for a device's DMA: one aligned block
-  whose physical address comes back with the handle, never executable,
-  and uncached in every mapping when asked; `rt::dma` cleans and
-  invalidates cache lines from EL0.
-- **Execution:** EL0 threads with registers and FP/SIMD saved on every
-  switch; 64 priority levels, round robin with a 4 ms quantum and FIFO;
-  tickless timer preemption. A thread made with an exit channel
-  (`thread_create` `x7`, `x8`) tells of its end through `thread_exit` with
-  a notification once it left the scheduler, so its stack may go; the end
-  of its process replaces it.
-- **System calls:** `handle_close`, `handle_duplicate`, `channel_create`,
-  `send`, `receive`, `reply`, `notify`, `mem_create`,
-  `mem_map`, `mem_unmap`, `mem_protect`, `process_create`, `process_kill`,
-  `process_exit`, `thread_create`, `thread_start`, `thread_exit`,
-  `thread_set_priority`, `thread_interrupt`, `thread_upcall_bind`,
-  `thread_upcall_control`, `thread_upcall_request`, `thread_upcall_return`,
-  `yield`, `device_window_create`, `irq_bind`, `irq_ack`, `clock_now`,
-  `timer_create`, `timer_set`, `timer_cancel`, `object_info`,
-  `debug_write`; 33 in all, the same on every machine. Numbers 29
-  (`console_poll` of the old VZ build) and 35 (`request_identity`) are
-  retired and fail as unknown ones, and so does kind 10 of `object_info`;
-  the process service names its clients by the labels of the sessions it
-  gives. Kind 12 returns one owned NONE or exactly MANAGE capability of the actual calling
-  thread, paid by its handle table and quota. Kind 13 compares a supplied
-  Thread object with the caller and returns bool 0/1; raw handle values do
-  not establish identity. Both preserve the ordinary ObjectInfo result span.
-  A thread has one entry: a handler address, a mask, a pending request and a
-  nested deferral. Control operations 0-4 are Mask, Enable, Take, Defer and
-  Resume; the numbers 5-12 of epoch 1 are retired, fail as INVALID_ARGS and
-  are never issued again. Return remains argument-free and restores the
-  innermost context. The layers above the kernel share the one entry (the
-  resident handler of the POSIX layer runs first, then the program's), and
-  the choice of the thread that receives a signal of the process lies in
-  the POSIX layer.
-  Kind 11 of `object_info`, LABEL, gives the owner of a channel
-  (with RECEIVE) the label of a labelled copy of it, O(1): the process
-  service's Vouch. `process_kill` takes the level of the teardown it starts.
-- **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in
-  registers and the rest through a per-thread message buffer; up to four
-  handles move with a message and keep their rights and labels. A service
-  works at its client's priority under its own ceiling until it replies; a
-  fast path hands the CPU straight to a waiting service. A live IPC wait
-  can be interrupted.
-- **Upcalls:** a thread with `MANAGE` rights can enter a computing or
-  IPC-waiting thread of another process and later restore its registers,
-  TLS, FP/SIMD state and message buffer, including nested entries. The
-  POSIX layer delivers signals this way.
-- **Devices:** a device interrupt reaches its driver as a channel
-  notification, and the line stays masked until `irq_ack`; a device window
-  maps device registers into a driver, never executable; a driver that dies
-  frees its line at once.
-- **Timers:** program timers fire at the priority of their slots, in
-  bounded portions after the timer interrupt; a process pays for up to
-  192, the system holds up to 8,192, and arming never fails.
-- **Faults:** a fault ends only its own process, and the parent learns why
-  through its exit channel.
-- **Kernel log:** a ring of 64 records that the console driver reads; the
-  kernel prints a record itself only while no driver holds the console,
-  and a panic prints what nobody showed.
+- QEMU `virt` under emulation (TCG), with GICv2 or GICv3;
+- QEMU with HVF on a Mac with Apple silicon, on Apple's GICv3 and on
+  QEMU's GICv2;
+- Apple Virtualization.framework without QEMU: the same kernel image,
+  with the Virtio PCI console driven by a user-space service
+  (`cargo xtask vz`).
 
-Bounded paths with interrupts masked are listed in
-[non-preemptible-paths.md](non-preemptible-paths.md).
+**Kernel.** 34 system calls, the same on every machine, over 64-bit handles
+with rights: processes, threads, channels, sessions, timers, memory
+objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
+four handles; a service runs at its client's priority under its own
+ceiling, and a fast path hands the CPU straight to a waiting service. The
+scheduler has 64 priority levels (round robin and FIFO) with tickless
+preemption. Every process pays for its kernel memory from a quota, memory
+is never writable and executable at once, and long operations run in
+bounded portions. Device interrupts reach drivers as notifications, and
+a driver gets contiguous, optionally uncached memory for DMA. The kernel
+drives no device with DMA. A fault ends only its own process. The kernel
+image is 162,880 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+The longest stretch the kernel runs without taking an interrupt (term B of the
+kernel) stays below the limit of 18,000 ticks that `xtask` enforces under
+`-icount`; teardown of a session and its message buffers runs in
+portions of 32 entries.
 
-## User space
+**User space and services.** `init` starts services from a table in
+dependency order, hands out sessions by name, restarts a service that
+crashes or goes silent and marks it broken after five failures in 60 s.
+The PL011 driver (`services/uart`) owns the console on interrupts and
+shows the kernel log; on Apple VZ the Virtio console's driver
+(`services/virtio-console`) does the same with the same protocol, and
+`init` resets its device before its DMA memory goes. A RAM file service (`services/ramfs`) holds files
+and directories. Programs build on `lib/rt`, which owns handles, runs
+service loops and starts children through a start protocol.
 
-- `lib/rt`: handles that own their table entries, one time scale shared
-  with the kernel, bounded waits, the start protocol (`proto/wire`,
-  `proto/init`), service loops with per-client sessions and a heartbeat.
-- `services/init`: service table in dependency order, names through
-  `connect`, restarts with a growing pause, broken after five failures in
-  60 s.
-- `services/uart`: PL011 console on interrupts at priority 60, kernel log
-  between whole client lines, one input reader at a time (`proto/uart`).
-- `services/virtio-console`: the Virtio PCI console of Apple VZ with the
-  same protocol and the same rings, on its INTx line, its queues in a
-  contiguous uncached DMA object from `init`; output never waits for
-  the host, and the end of the host's input leaves the console with
-  output; `init` resets the device and clears the function's command
-  word before the object goes.
-- `services/ramfs`: RAM files and directories (`proto/fs`). Next to its
-  fixed tree it shows the files of the boot image's table `rootfs`
-  (`lib/bootimg/src/rootfs.rs`): each has a path, a mode, an owner and
-  the bytes of a file of the image (a program's ELF file), which the
-  service reads from its read-only mapping of the image without a copy;
-  `READ_AT` reads at an offset. Paths are at most 511 bytes (512 with the
-  terminator, as `PATH_MAX`), names at most 255.
-  Naming proofs retain the bucket counter and the parent's name generation:
-  `name_valid = bucket_same || parent_same`. A directory move or a counter
-  wrap raises the checked global epoch. Foreign colliding names retain a
-  proof; a chain walk retains a published cursor in its bucket. Repeated
-  changes of names in the operation's directories and buckets, directory
-  moves or access checks can keep an operation waiting.
-  New names allocate their listing cookie at commit and append in constant
-  work; a replacing rename takes the destination's cookie and position.
-  `process-steps` checks publication after 500 rival names and a replacing
-  rename with 32 page-owning nodes queued for reclamation. The Start fixture
-  fills 96 jobs (the expenditure root's share); extending the observed slope
-  of about 20 ticks per place to 127 jobs estimates about 17,800 ticks against
-  B = 20,410. The 127-place number is an estimate.
-- `services/clock` and `services/process`: realtime clock, process
-  identity and credentials for the POSIX layer (`proto/clock`,
-  `proto/process`). The process service keeps 256 records, PID = index +
-  256 * generation, and gives each its session through a label of its
-  own. A thread of the service asks `init` for each POSIX process `init`
-  loaded (`ADOPT`, root only for the record of the table that has it),
-  makes its record and gives `init` the session (`ADOPTED`), which `init`
-  puts in the process's start data before the process starts; `init`
-  never sends the service a request. A process gets a session for its
-  native child (`Child`, 32 live children a record, a handle with
-  `MANAGE`). A record goes with the last copy of its session.
+**Shells.** The native shell boots by default and knows `help`, `echo`,
+`uptime`, `ps`, `mem`, `bench`, `trace` and `crash uart`; the last one
+crashes the driver, `init` restarts it and the shell reconnects. Separate
+images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
+and an interactive `ash` on the UART with `echo` and `ls -la`. The shell image
+of `cargo xtask ash-shell` is an interactive BusyBox `ash` with line editing
+(cursor keys, history, Tab completion), GNU bash 5.3 (`bash`), GNU nano 9.2
+(`nano`), htop 3.5.3 (`htop`) and BusyBox `top`, all running over ncurses 6.6
+and the terminfo entries of `xterm`, `xterm-256color`, `vt100` and `linux`.
+The terminal service keeps the window size: the host sends it on the first
+prompt and on every resize, `TIOCGWINSZ` and `TIOCSWINSZ` work as on Linux, and
+the foreground group gets `SIGWINCH`. The shell image carries 94 of the 112
+utilities of POSIX.1-2024 XCU (each answers `command -v`): the ten built-ins of
+`ash`, `sh`, 77 BusyBox applets and six ready-made programs (`getconf`, `join`,
+`pathchk`, `file`, `iconv`, `compress`). `ps`, `top` and `df` read `/proc`,
+which the layer serves. [docs/packages.md](packages.md) describes how every
+third-party program of the image is a package built from one description
+file. BusyBox
+links statically with relibc over the Rust POSIX layer. The dialog's
+`ash` is a POSIX process started from `/bin/ash`; it forks and execs the
+files of `/bin` (`/bin/ls -la`, `/bin/ash -c 'exit 3'`). Pipelines work in
+the dialog (`ls /etc | cat`, a pipeline of three, `ls /bin | wc -l`, a job
+in the background with `wait`), and `/dev/null` takes redirections. The
+terminal service provides canonical input, termios and window sizes,
+process groups, Ctrl-C/Ctrl-Z and `jobs`, `bg` and `fg`. Interactive ash
+also runs through a PTY master. The service has eight PTY pairs beside
+the console; `posix_openpt`, `grantpt`, `unlockpt` and `ptsname` expose
+`/dev/ptmx` and `/dev/pts/N`. `poll`, `ppoll`, `select` and `pselect`
+wait on pipes and terminal descriptions. [notes/m5f-tty.md](../notes/m5f-tty.md)
+has their limits and checks.
 
-## Rust POSIX layer
+**POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
+interface. The C library is relibc (a fork pinned by
+`tools/build-relibc.py`, `cargo xtask relibc`); below it the Rust layer
+is the system part, with no C names of its own: the platform functions
+`stafeto_*` relibc calls (`lib/posix-platform`) over paths, descriptors,
+files, `stat` and directories; the heap; the table of threads, waits by
+address and deferred cancellation; clocks and sleep; signal actions,
+masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and `SA_SIGINFO`; process
+IDs and credentials. Every POSIX program starts through `posix-crt` and
+relibc, the Rust guest probes on a C main too (`tests/libc-ffi`); the
+native probe `posix-tls` checks the layer's TCB for threads relibc did not
+start. The layer runs without helper
+threads: a single-threaded program has one thread; mutexes, `once` and joins
+wait by address in the layer with no kernel call when uncontended; the heap,
+the descriptor table and the table of threads live under the layer's locks,
+whose holders run at the process ceiling; a read of the console is a long
+operation in two steps that a signal interrupts. Guest probes check them on
+QEMU and Apple VZ.
 
-The [E3 cleanup followups](../notes/e3-followups.md) remove the directory
-restart cap, reserve independent Control custody, separate its FS version 14
-keys, and bound maintenance self-notifications without cleanup progress.
-The [queued signal probe](../notes/e3-queued-signals.md) requires a genuine
-kernel Interrupted while rename retains its operation through the handler.
+**Processes.** The process service creates every POSIX process, keeps its
+record (256 of them; PID = index + 256 * generation, never 1) and hands
+out its sessions. `posix_spawn` and `exec` start a program from a file of
+the RAM file service: a loader in the new process opens the file through
+a session that only `init` and the process service hand out, maps its
+segments and jumps; an error before the image is ready comes back from
+`posix_spawn`, a set-ID file sets the new process's IDs, and the parent
+holds no handle of the child. A spawned child shares the open
+descriptions its parent keeps; `exec` keeps the PID, the open files and
+the mask, and an `exec` that fails leaves the old image whole.
+`posix_spawn` takes `POSIX_SPAWN_SETPGROUP`, `SETSID`, `SETSIGMASK`,
+`SETSIGDEF`, `RESETIDS` and file actions; `waitpid`, `waitid` and
+`WNOHANG` take zombies and
+tell an exit from a death by a signal (`WIFSIGNALED` for `SIGTERM` differs
+from `exit(143)`); `kill`, `killpg`, `kill(0)` and `kill(-1)` reach any
+process, a handler runs on the target's router thread, and `SIGKILL`
+works on a child that blocks every signal; `SIGCHLD` carries the child's
+PID and status to `sigwaitinfo`. Process groups and sessions follow
+`setpgid`, `setsid`, `getpgid` and `getsid`; orphans go to PID 1, which
+the service itself plays. The clock service asks the process service for
+the effective UID before `clock_settime`. The C probe `posix-procs`,
+`cargo xtask process-steps` and `rtbench` rows S10 to S22 check it; on HVF a
+`posix_spawn` of a file takes 102 us p50 to the child's `main` and an
+`exec` 113 us (10-minute run of 5c; 121 and 139 us in the run of 5d, at a
+host load of about 2).
 
-Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
-pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
-platform the layer's `stafeto_*` functions (`lib/posix-platform`, interface
-14). The layer exports no C names (`cargo xtask ci` checks it) and keeps the
-system part; the C probe `posix-abi` and the Rust guest probes on a C main
-(`tests/libc-ffi`) are programs on relibc, and the native probe
-`posix-tls` checks the layer's TCB for threads relibc did not start. Since step 5a the layer has no helper threads;
-[m5a-transport](../notes/m5a-transport.md) says how it works and where it
-stops. The rows below date from the layer's own C surface; relibc now
-provides the C side of each.
+`fork` copies the parent's whole memory (the heap, the segments, the
+stack) into the child through the child's own loader, at the forking
+thread's level and with no change to the kernel. The parent's other
+threads stop first and the child has one thread; descriptions, offsets
+and the mask carry over, pending signals do not, and a signal sent to the
+group during the copy reaches both. `vfork` is `fork`, and `pthread_atfork`
+handlers run in POSIX's order. There is no copy on write: the child pays
+for every page, so the cost grows with the parent's memory. On HVF (10
+minutes, p50) `fork` to the child's first statement takes 102 us for a
+small parent, 172 us with 1 MiB of heap and 623 us with 8 MiB (rows S15);
+`fork`, `exec` of a small file and `waitpid` take 246 us (S16); each other
+thread of the parent adds about 7 us to a `fork` and 5 us to an `exec`
+(S17, S18). [notes/m5d-fork.md](../notes/m5d-fork.md) has the table and the
+limits, [notes/m5b-processes.md](../notes/m5b-processes.md) and
+[notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md) those of the steps
+before.
 
-| Area | Interfaces | Notes |
-|---|---|---|
-| Paths and files | working directory, `open`/`read`/`write`, `lseek` with 64-bit offsets, `dup`/`dup2`/`dup3`, `stat`/`fstat`/`lstat` | [fs](../notes/m2-rust-posix-fs.md), [seek](../notes/m2-rust-posix-seek.md), [fds](../notes/m2-rust-posix-fds.md), [stat](../notes/m2-rust-posix-stat.md) |
-| Directories | `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies, `scandir`, `alphasort` | [dir](../notes/m2-rust-posix-dir.md), [scan](../notes/m2-rust-posix-scan.md) |
-| C runtime | startup, `errno` per thread, `malloc` family, C/POSIX locale, `strcoll`, `strxfrm`, `qsort`, `qsort_r` | [abi](../notes/m2-rust-posix-abi.md), [heap](../notes/m2-rust-posix-heap.md) |
-| Thread block and TCB | a TCB in relibc's layout per thread, the layer's block in it: mask, pending signals, cancellation, the thread's channel and timer, its node of a wait by address | [m5a](../notes/m5a-transport.md) |
-| Waits and locks | a table of waits by address (`posix-sync`): no kernel call without waiters; the layer's locks, the heap's, the files', the threads' and the actions', raise their holder to the process ceiling; a signal inside a section comes at its end | [m5a](../notes/m5a-transport.md) |
-| Shared state | the process's files and heap under the layer's locks, in the calling thread; console reads and writes outside the files' lock | [m5a](../notes/m5a-transport.md), [input](../notes/m2-rust-posix-input.md), [messages](../notes/m2-rust-posix-messages.md) |
-| Interruption | IPC interruption and `EINTR`; an accepted request is answered once (no reply journals); console reads as long operations in two steps that a signal cancels, `SA_RESTART`; nested cancellation windows | [m5a](../notes/m5a-transport.md), [interrupt](../notes/m2-rust-posix-interrupt.md), [cancel-reentry](../notes/m2-rust-posix-cancel-reentry.md), [borrow guards](../notes/m2-interruptible-borrow-guards.md); history: [shared owner](../notes/m2-rust-posix-shared.md), [uart-cancel](../notes/m2-rust-posix-uart-cancel.md), [file](../notes/m2-rust-posix-file-replies.md), [thread](../notes/m2-rust-posix-thread-replies.md), [clock](../notes/m2-rust-posix-clock-replies.md), [heap](../notes/m2-rust-posix-heap-replies.md) |
-| Threads | `pthread_create`/`join`/`detach`/`exit`, deferred cancellation and cleanup handlers, keys, `pthread_once`, 64 live threads | [threads](../notes/m2-rust-posix-threads.md), [cancel](../notes/m2-rust-posix-deferred-cancel.md), [keys](../notes/m2-rust-posix-thread-data.md), [once](../notes/m2-rust-posix-once.md), [capacity](../notes/m2-rust-posix-thread-capacity.md) |
-| Mutexes and time | NORMAL, ERRORCHECK and RECURSIVE mutexes, `pthread_mutex_timedlock`, `pthread_mutex_clocklock`, `clock_gettime`/`getres`/`settime`, `nanosleep`, `clock_nanosleep` | [mutex](../notes/m2-rust-posix-mutex.md), [timed](../notes/m2-rust-posix-timed-mutex.md), [clocks](../notes/m2-rust-posix-clocks.md), [sleep](../notes/m2-rust-posix-sleep.md) |
-| Priorities | `sched_get_priority_max`/`min`, `sched_getparam`/`setparam`, `sched_getscheduler`/`setscheduler` (the caller's own process), `sched_rr_get_interval`, `pthread_setschedparam`/`getschedparam`/`setschedprio`, the scheduling attributes of thread creation, `PTHREAD_PRIO_INHERIT` (chains to a depth of 8, `EDEADLK` for a cycle) and `PTHREAD_PRIO_PROTECT` with its ceilings, spin locks that wait by address, asynchronous cancellation of a thread that computes. SCHED_FIFO and SCHED_RR run from 1 to 32, SCHED_OTHER is 0; priority p is the level `top - 32 + p` (at least 1) where `top` is the level the main thread started at; a thread whose priority is set goes to the tail of its level (`thread_set_priority` with `POLICY_TAIL`). `posix_spawn` takes `POSIX_SPAWN_SETSCHEDULER` and `POSIX_SPAWN_SETSCHEDPARAM` (the child's main thread applies the policy and priority at its start; a new image keeps the caller's). A process that does not exist is ESRCH, one that does is not the caller's to read or set (EPERM). Limit of this implementation: a `PTHREAD_PRIO_INHERIT` mutex shared between processes is refused by `pthread_mutex_init` with ENOTSUP (the owner would be a thread of another process); `PTHREAD_PRIO_PROTECT` works between processes. | `posix_abi::sched`, `posix_sync`, `posix_platform`, the relibc fork |
-| CPU time and nice | `getrusage` (self, children, thread), `times`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`, `clock_getcpuclockid` and `pthread_getcpuclockid`, `getpriority`, `setpriority`, `nice`; the kernel counts the ticks each thread has run (`object_info` THREAD_STATE x5, PROCESS_TIME) and, of them, the ticks it spent in the kernel, from each entry from EL0 to the decision that sends a thread back (THREAD_STATE x6, PROCESS_TIME x2: the system time, the rest is the user time; the layer gives both as `stafeto_cpu_ns` and `stafeto_cpu_system_ns`), the process service adds a child's time to its parent's when the parent waits for it and keeps the nice value of each process, which a child inherits and `/proc/<pid>/stat` shows. `clock()` is the same processor time as `times`. relibc gives `ru_utime`, `ru_stime`, `tms_utime` and `tms_stime` from one reading, `stafeto_cpu_split_ns` (`getrusage` for the process, its children and the thread, and `times`): two readings let the kernel time between them move from the user part to the system part; `/proc/<pid>/stat` still shows all of the time as user time; `_POSIX_CPUTIME` is not claimed until the timers of the CPU clocks | `posix_abi::cpu`, `services/process/src/main.rs` (`account`) |
-| Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
-| Processes | `getpid`, `getppid`, `getpgrp` and `getsid(0)` read the process's page of its record; real, effective and saved UID/GID (eight calls) go through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
-| Spawn and `exec` | `posix_spawn` and `exec` of a file of the RAM service through a loader in the new process: `argv`, `envp`, the current directory, file actions (`adddup2`, `addclose`, `addopen`, `addchdir`), `SETPGROUP`, `SETSID`, `SETSIGMASK`, `SETSIGDEF`, `RESETIDS`, set-ID files, descriptions shared with the child, `FD_CLOEXEC`, a failed `exec` that leaves the old image whole | [m5c](../notes/m5c-spawn-exec.md) |
-| `fork` | a full copy of the parent's memory by the child's loader, at the forking thread's level; the other threads stop first; the child has one thread, its descriptions shared with the parent's and its layer bound to its own handles; `vfork` is `fork`; `pthread_atfork` in POSIX's order | [m5d](../notes/m5d-fork.md) |
-| Pipes | `pipe`, `pipe2` (`O_NONBLOCK`, `O_CLOEXEC`, `O_CLOFORK`) through the pipe service: a ring of 4 KiB per pipe, `PIPE_BUF` 512, blocking reads and writes as long operations in two steps that a signal cancels (`SA_RESTART`), `SIGPIPE` before `EPIPE`, `fstat` as a FIFO, `ESPIPE`; ends cross `fork`, `posix_spawn` (`adddup2`) and `exec`; `/dev/null` as a null device of the RAM service (`O_CHANGES`) | [m5e](../notes/m5e-pipes.md) |
-| Terminals and jobs | `termios`, `/dev/console`, `/dev/tty`, eight PTYs with grant/unlock/name and window size; personal controlling terminals, foreground groups, Ctrl-C/Ctrl-Z, `SIGTTIN`/`SIGTTOU`, `SIGSTOP`/`SIGCONT`, `WUNTRACED`/`WCONTINUED`; `ash` built-ins and jobs through a PTY | [m5f](../notes/m5f-tty.md) |
-| Readiness | `poll`, `ppoll`, `select`, `pselect`, up to 32 descriptors; masks and absolute deadlines, cancellable watches, one notification session across repeated Take calls; ready writers below the polling reader can run | [m5f](../notes/m5f-tty.md) |
-| Random numbers | `getentropy` (up to 256 bytes, `EINVAL` past it), `getrandom` (`GRND_NONBLOCK`, `GRND_RANDOM`, `GRND_INSECURE`), `/dev/random` and `/dev/urandom` as character devices of the RAM service (reads served by the layer, writes dropped, `O_CHANGES`), `arc4random`, `arc4random_buf`, `arc4random_uniform`, the names of `mkstemp` and `mkdtemp`: a ChaCha20 generator with fast key erasure in each process, keyed by the entropy service (the Virtio entropy device through `virtio-rng`); a forked child takes its own key; `ENOSYS` without the service | [m5e2](../notes/m5e2-entropy.md) |
-| Memory map | the layer's map mirrors the kernel's table of mappings: pieces (24 bytes each, at most 128) that show 96 objects at most, cut as the kernel cuts them; `mmap` anonymous and of files, `MAP_PRIVATE` and `MAP_SHARED`, `MAP_FIXED`, `munmap`, `mprotect` and `msync` over several pieces, one piece at a time; the pages the program unmaps lose their access (a fault, SIGSEGV) and the free runs are joined when the table runs short; a mapping of 256 KiB or more, a shared one and one of a file have an object of their own; the heap grows by chunks of twice the last (64 KiB to 4 MiB, less in a small quota); the room is 32 MiB from `0x1000_0000`. Shared objects go to a forked child as the same pages, and the process service's rendezvous gives unrelated processes the same object by the key of the file (`shm_open` is a file of `/dev/shm`); a shared mapping of a file is written back by `msync` and `munmap` through a descriptor the layer keeps (not at `exit`, and `write` does not show in a mapping before `msync`). RLIMIT_DATA, RLIMIT_AS and RLIMIT_STACK are kept by the process service; the layer counts DATA and AS below the quota. `PROT_EXEC` is `EACCES`. A mapping made past the layer by a direct kernel call is not in the map | `lib/posix-map`, `posix_abi::allocation`, `posix_abi::mmap`, `posix_platform::mapping`, `services/process/src/shares.rs` |
-| Process lifetime | `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
+Pipes live in their own service (`services/pipe`): 64 pipes with a ring
+of 4 KiB each, `PIPE_BUF` 512, blocking reads and writes as long
+operations in two steps that a signal cancels (`SA_RESTART` continues them),
+`SIGPIPE` before `EPIPE`, `O_NONBLOCK` as a flag of the description. Ends
+cross `fork`, `posix_spawn` (`adddup2`) and `exec`, and the service sees a
+dead process as an end that closes (the reader gets end of file). `/dev/null`
+is a null device of the RAM service. Every step of the service stays below
+the services' budget of 20,410 ticks (`cargo xtask process-steps`). On HVF
+(10 minutes, p50) a byte goes through two pipes to another process and back
+in 5.5 us (S19), 1 MiB goes through a pipe at 250 MB/s in writes of 512
+bytes and 432 MB/s in writes of 4 KiB (S20), and `ls /etc | cat` as two
+`fork`s and two `exec`s takes 623 us (S22).
+[notes/m5e-pipes.md](../notes/m5e-pipes.md) has the rows, the limits and the
+conformance list.
 
-relibc gives conditions, semaphores and stdio over the layer
-(`relibc-threads` checks the first two). Not there yet: `fexecve`,
-named pipes, queued signals (`sigqueue`),
-POSIX timers, asynchronous cancellation,
-general ELF TLS. BusyBox
-runs on relibc since 5a′; see [m2-ram-posix](../notes/m2-ram-posix.md) for
-its first steps.
+**Random numbers.** A driver for the Virtio entropy device
+(`services/virtio-rng`) feeds the entropy service (`services/entropy`), which
+gives each POSIX process a key of 32 bytes; the layer of the process runs a
+ChaCha20 generator with fast key erasure on it, so `getentropy`, `getrandom`,
+`arc4random`, the reads of `/dev/random` and `/dev/urandom` (character
+devices of the RAM service) and the names of `mkstemp` need no request once
+the key is there, and a child of `fork` takes a key of its own. On HVF and
+Apple VZ (10 minutes, p50) `getentropy` of 32 and of 256 bytes takes 0.21 and
+0.93 us with two kernel calls (S23, S24), and a read of 4 KiB of
+`/dev/urandom` 12.3 us (S25). [notes/m5e2-entropy.md](../notes/m5e2-entropy.md) has the rows, the steps of
+the services and the limits.
 
-## Probe commands
+**C library.** relibc (MIT) is the C library of every POSIX program,
+BusyBox included; its platform is the layer's `stafeto_*` functions.
+os-test's `basic` suite passes 1,183 of its 1,187 tests (the three `dlfcn`
+tests need a dynamic loader and `pthread_setcanceltype` is open), with no
+listed exception; its io, malloc, process and signal suites, `basic/spawn`,
+`basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
+`ci` from files, one boot a suite. `ci` fails when a test that passed stops
+passing. The Open POSIX Test Suite (LTP 20260930) runs on relibc in `ci` and
+passes 1,985 of its 2,036 tests; the map of the rest is in
+[docs/open-posix-map.md](open-posix-map.md). The PTY and termios suites
+exercise the terminal APIs, and readiness tests cover all four waiting
+interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
+(1,035 of 1,035), and no required function only returns `ENOSYS`. The
+`unistd.h` macros and `sysconf` agree and claim only what exists. relibc
+builds at its own level 3: user-space programs have no size limit, only
+the kernel has one. Coverage details are in
+[posix-coverage.md](posix-coverage.md).
 
-`cargo xtask help` lists them all. `posix-abi` runs the thread,
-cancellation, shared-state, input and interruption probes as well, and
-`test` and `ci` run `posix-abi`, `ramfs`, `ext4ro`, the relibc probes,
-`posix-procs`, the BusyBox probes and os-test's io, malloc and signal suites
-(within 420 s).
+**Files, locks and memory.** The RAM file service creates files,
+directories and FIFOs, keeps owners and modes, and serves `/tmp`. `fcntl`
+record locks and open-file-description locks work, blocking ones included. `mmap`, `munmap`,
+`mprotect` and `msync` cover anonymous and file mappings, private and shared;
+shared objects reach a forked child as the same pages, and `shm_open` opens a
+file of `/dev/shm`.
 
-| Command | Checks |
-|---|---|
-| `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
-| `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
-| `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes; the files of the boot image's table: modes, owners, links, reads at an offset, the longest path |
-| `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` measured; size limits apply to the kernel |
-| `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
-| `posix-poll` | mixed file/pipe/terminal readiness, masks and deadlines, Cancel/Take/Gone, 32 aliases, 32 different descriptions in two Watches of 16, and a ready writer below the waiting reader |
-| `posix-sock`, `posix-sock-steps` | the C probe of sockets on relibc: a stream and a datagram pair of AF_UNIX, shutdown, EPIPE with SIGPIPE and MSG_NOSIGNAL, the IPv4 loopback (names, queue, refusal, options, MSG_PEEK, an out-of-band byte and `sockatmark`, datagrams with the sender's address, truncation, a default destination), names in the file system (a node of kind socket, a stale name, the types), `O_NONBLOCK`, `poll` and `select`, descriptions in flight (a pipe end and a socket, the sender closing first, a caller with no room, a file refused), a socket across `fork`, `exec` and `posix_spawn`, a blocked `accept`, `getaddrinfo`, `getnameinfo` and the name databases; the steps variant boots the service with its step statistics and fails when a step passes term B |
-| `posix-pty`, `posix-pty-steps` | PTY lifecycle, real UID grant, spawn aliases and rollback, window size and signals, interactive ash jobs and HUP; the quiet steps variant measures a late Clone with 32 descriptions and a full root pool |
-| `posix-tty-control-steps` | full terminal control intervals with sixteen live clients, including the first Acquire and inherited personal controlling-terminal pairs |
-| `posix-procs` | the C probe of processes on relibc: `fork` (a copy of the parent's memory, descriptors, signals, threads, `vfork`, `pthread_atfork`), `posix_spawn` and `exec` from files (`/bin/ls /etc`, `argv`, `envp`, set-ID, 32 live children, 1,100 in a row, descriptors, a failed `exec`), exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, faults as signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP` with `si_code` and `si_addr`), `sigaltstack` and `SA_ONSTACK` (an overflow of the main stack caught on the alternate stack, nested signals, a handler without the flag, a forked child, an overflow of the stack itself), a `fork` in a handler in the middle of a long `rename`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
-| `os-test` | os-test (Sortix, ISC, pinned) io, malloc, process and signal suites, `basic/spawn`, `basic/unistd` `exec*` and the `basic` tests that call `fork` or `pipe` (among them `stdio`, `wchar` and `fmtmsg`) on relibc, a boot a suite with the tests started from files; PASS, FAIL, UNSUPPORTED (a test that exits by itself without passing, of an option `unistd.h` does not claim (PS, SPN, TSH, XSI by their macros), and readiness tests without explicit coverage; a hang or a death by signal stays FAIL) and UNKNOWN (tests whose only expectations are `.unknown`, matched; os-test's own classifier is looser and also gives UNKNOWN to a test that has defined expectations) in `target/measure/os-test.txt`, with the run time of each suite's job; a test that runs 10 s is killed, the run stops after 900 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
-| `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches; 248 with 7, in `ci`), a child that forks among them, and the longest step of each kind of the loader's copy; it fails when the own part of the longest Vouch or RetainedLoader passes 8,000 ticks, a wait of a step passes CALL_WAIT_MAX or WAIT_MAX, a step of a service passes term B in its own part, a ForkStart passes the longest SpawnStart or a Clone of the RAM file service passes term B; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
-| `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
-| `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
-| `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
-| `console-early-exit-vz` | the driver ends on Apple VZ before its function decodes its BARs: `init` skips the reset through BAR 0, clears the command word and restarts it |
-| `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox on relibc: `cat`, `ash -c`, an `ash` dialog (a POSIX process from `/bin/ash` that forks and execs the files of `/bin`), `ls` |
-| `nano-dialog` | GNU nano (`/bin/nano`, tools/build-nano.py, with ncurses of tools/build-ncurses.py and the terminfo entries of `/usr/share/terminfo`) started from ash: its screen, text typed and saved with Ctrl-O, arrow keys, an existing file read and written back, Ctrl-X |
-| `bash-dialog`, `bash-shell-exit` | GNU bash 5.3 (`/bin/bash`, tools/build-bash.py) started from ash: version, history, Tab, Ctrl-C, jobs, `$(...)`, pipelines, `exit 3`, and the checks of the ash dialog that do not depend on ash |
+**Real time and timers.** The kernel counts the ticks every thread has run, which
+`getrusage`, `times` and the CPU-time clocks report. `SCHED_FIFO` and
+`SCHED_RR` run at priorities 1 to 32, `sched_*` and `pthread_*sched*` set them,
+and `posix_spawn` takes `POSIX_SPAWN_SETSCHEDULER` and `SETSCHEDPARAM`.
+`PTHREAD_PRIO_INHERIT` mutexes pass priority along chains up to depth 8 and
+report a cycle with `EDEADLK`; `PTHREAD_PRIO_PROTECT` uses ceilings. POSIX
+timers, `alarm` and `sigqueue` live in the process service, and faults reach
+programs as signals on an alternate stack when asked.
 
-## rtbench
+**Sockets and message passing.** AF_UNIX stream and datagram sockets
+(`socketpair`, names in the file system, `SCM_RIGHTS`) and the IPv4 loopback
+run in the pipe service. The same service holds POSIX message queues, XSI
+queues, semaphores and shared memory, and named semaphores. The library
+brings asynchronous I/O (`aio_*`, `lio_listio`) over threads.
 
-`cargo xtask rtbench` adapts six
-[Thread-Metric](https://github.com/zephyrproject-rtos/zephyr/blob/main/tests/benchmarks/thread_metric/thread_metric_readme.txt)
-workloads to stafeto's primitives: baseline arithmetic, cooperative
-yields, preemptive notifications, channel request and reply,
-self-notification and memory-object allocation. After
-[Zyclictest](https://docs.zephyrproject.org/latest/services/debugging/zyclictest.html)
-it measures 1,000 periodic timer wakeups at 1 ms, idle and under a
-lower-priority CPU load. It reports median operations per second, timer
-p99 and worst latency, and missed periods, three runs per machine
-(`--repeats N` changes that). These are adapted workloads, which give no official
-Thread-Metric results, and virtual machines do not give a physical
-worst-case latency. On Apple VZ the benchmark runs as a client of `init`
-beside the Virtio console's driver, which shows its lines, at priority 60
-with a 50 ms timer above every thread of the benchmark.
+**Tests.** `kcore` has 438 host tests; `cargo xtask ci` runs them with the
+kernel tests, the EL0 test `init` and the guest probes, and `cargo xtask hvf`
+runs the set on Apple silicon. `ci` runs on every pull request on GitHub
+Actions.
 
-### rtbench 2
+**Known limits.**
 
-`cargo xtask rtbench --minutes N` runs rtbench 2 for N minutes on HVF,
-then on Apple VZ; `cargo xtask rtbench --short` runs one round on TCG
-(`ci` does). It is a C program over pthreads (`tests/rtbench-posix`)
-beside a hostile load (`tests/rtbench-load`: a worker that makes and
-kills processes of 128 threads and large memory objects). Its rows: S1 a
-mutex without a rival, S2 `futex_wake` without waiters, S3 a mutex with
-rivals at levels 10, 20 and 30, S4 `malloc`/`free` and `dup`/`close`, S5
-`pthread_kill` to a sleeping, a reading and a busy thread, S6 a `read` of
-ready data, S7 an absolute sleep of 1 ms, S8 a pair waiting by address
-and a waiter in the same bucket, S9 a round trip to a service, S10 `kill` of another process to the first
-statement of its handler (the target sleeps; and with a thread at level 25
-running all the time), S11 a `waitpid` of a ready zombie and from a
-child's `_exit` to the return of `waitpid`, S12 `killpg` to a group of
-32 to the last `waitpid`, S13 `posix_spawn` of a file to the child's `main`,
-S14 `exec` to the new image's `main`, S15 `fork` to the child's first
-statement with a heap of the start size, 1 MiB and 8 MiB, S16 `fork`, `exec`
-and `waitpid` of a small file, S17 `fork` with 1, 8, 32 and 63 other threads
-(asleep or running below the forker), S18 `exec` with the same threads,
-S19 a byte through two pipes to another process and back, S20 1 MiB through
-a pipe in writes of 512 bytes and of 4 KiB, S22 `ls /etc | cat` as two
-`fork`s, two `exec`s and two pipes.
-Each row
-gives n, min, p50, p99, max in ns and kernel calls per operation, with a
-histogram, in `target/measure/rtbench-<machine>.txt`.
-
-10 minutes at 8c254c0 against the same run before step 5a (bf764f6),
-p50 on HVF and VZ: S1 3,327 → 0 ns with 12 → 0 kernel calls; S4
-`malloc`/`free` 1,215 → 335 ns, `dup`/`close` 2,047 → 423 ns; S5 4,351 →
-463 ns; S6 959 → 1,343 ns (the console's read in two steps); S3 rival at
-20: 6,783 → 98,303 ns, since waiters now take the mutex by level and the
-rival at 30 goes first.
-
-10 minutes on the last commit of step 5a′ (relibc's mutex, dlmalloc and
-pthreads over the layer, relibc at its own level 3) against 8c254c0, p50
-/ p99 on HVF: every row within two counter ticks or 10 % of 5a; S1 and S2
-still make no kernel call; S4 `malloc`/`free` of 64 bytes falls from 335
-/ 3,007 ns to under one tick (dlmalloc's cache); S4 `dup`/`close` 375 /
-463 ns, S6 1,343 / 2,495 ns, S7 3,583 / 7,039 ns. VZ: S4 `dup`/`close`
-423 / 463 ns, S6 1,343 / 2,367 ns, S7 3,583 / 7,295 ns. relibc built for
-size (level `s`) had S4 `dup`/`close` at 671 / 751 ns and S6 at 2,175 /
-3,583 ns.
-
-10 minutes on the head of step 5c (HVF / VZ, p50 / p99, 4,500 samples a
-row): S13 `posix_spawn` of a file to the child's `main` 102 / 152 and 102 /
-156 us (step 5b, from a boot-image record: 55 us p50; the first loader, that
-read with `ReadAt`, took 221 us); S14 `exec` to the new image's `main` 113 /
-143 and 113 / 147 us; S12 `killpg` to a group of 32 623 / 918 and 639 / 934
-us.
-
-10 minutes on the head of step 5d (HVF / VZ, p50 / p99, 1,260 samples a
-row, 630 for S18; host load about 2): S15 `fork` to the child's first
-statement 102 / 131 and 102 / 129 us with the start heap, 172 / 205 and
-172 / 205 us with 1 MiB, 623 / 737 and 623 / 737 us with 8 MiB; S16 `fork`,
-`exec` and `waitpid` 246 / 303 and 246 / 287 us; S17 with 63 sleeping
-threads 541 / 754 and 524 / 721 us, with 63 running 639 / 885 and 639 / 819
-us; S18 `exec` with 63 running threads 442 / 606 and 442 / 622 us. The
-same run gave S13 121 / 205 and 117 / 209 us, S14 139 / 176 and 129 / 168
-us. [notes/m5d-fork.md](../notes/m5d-fork.md) has every row.
-
-10 minutes on the head of step 5e (HVF / VZ, p50 / p99, 125 rounds; 125,000
-samples of S19, 375 of S20, 1,250 of S22): S19 a byte through two pipes and
-back 5.5 / 6.4 and 5.5 / 6.3 us with 12 kernel calls (S9, an empty round
-trip to a service, 0.42 us with one call); S20 1 MiB in writes of 512 bytes
-250 / 222 and 250 / 221 MB/s (p50 / p99 of the time), in writes of 4 KiB
-432 / 381 and 432 / 385 MB/s; S22 `ls /etc | cat` 623 / 770 and 623 / 770
-us. [notes/m5e-pipes.md](../notes/m5e-pipes.md) has every row.
+- Apple VZ gives the kernel no port: a kernel panic there shows nothing
+  and powers the machine off (a VZ probe fails with a hint), and VZ
+  clears RAM at a reset, so the log does not outlive it; the same image
+  under HVF shows the panic. On VZ `rtbench` runs beside the console's
+  driver.
+- SMP runs on up to 8 CPUs (QEMU, HVF and VZ are tested with 4); the
+  bounds of a real-time analysis on several CPUs still wait for a board
+  (docs/smp.md).
+- No PinePhone port yet.
+- `fork` copies everything the layer maps, with no copy on write (about
+  70 us a MiB on HVF); mappings made past the
+  layer are not in the copy, and a program that `init` starts itself gets
+  `ENOSYS`.
+- 255 POSIX processes at once: the process service holds 256 records,
+  and the RAM file and clock services keep 320 sessions each.
+- Pipes: 64 of 4 KiB in the pipe service; one session (a process) has 16
+  live pipes (`EMFILE`), and a tree of processes under one program
+  `init` started has 48 of them (`ENFILE`), 96 of the 128 blocking reads
+  and writes that may wait (`EAGAIN` past them, and past 8 at one end or
+  16 in one process) and 255 sessions of the service's 320.
+- Random numbers come from the Virtio entropy device alone. After a
+  restart of the entropy service the processes that ran before keep their
+  generators but not their session: their children get `ENOSYS` from
+  `getentropy`, and `arc4random` ends them.
+- Files live in RAM; ext4 is read from an image inside the guest, with no
+  block driver.

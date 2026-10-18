@@ -2,56 +2,42 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""The notes of a release (.github/workflows/release.yml, docs/release.md):
-a short introduction, the pull requests merged since the previous tag and
-the Roadmap section of README.md.
+"""The notes of a release (.github/workflows/release.yml, docs/release.md).
+A summary written by hand in docs/releases/<version>.md comes first; a
+release without one gets a short introduction. The table of release files
+and a link to the pull requests merged since the previous tag follow.
 
     release-notes.py <version> <tag> [<previous tag>]
 """
 
-import re
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def merged_pull_requests(tag: str, previous: str | None) -> list[tuple[int, str]]:
-    """(number, title) of the merge commits of GitHub between the tags; the
-    title is the first line of the merge commit's body."""
-    span = f"{previous}..{tag}" if previous else tag
-    log = subprocess.run(
-        ["git", "log", "--first-parent", "--merges", "--reverse", "--format=%s%x1f%b%x1e", span],
-        cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE).stdout
-    found = []
-    for entry in log.split("\x1e"):
-        subject, _, body = entry.strip().partition("\x1f")
-        match = re.match(r"Merge pull request #(\d+) ", subject)
-        if match:
-            title = next((line.strip() for line in body.splitlines() if line.strip()), subject)
-            found.append((int(match.group(1)), title))
-    return found
-
-
-def roadmap() -> str:
-    """The Roadmap section of README.md, without its heading."""
-    text = (ROOT / "README.md").read_text()
-    match = re.search(r"^## Roadmap\n(.*?)(?=^## )", text, re.M | re.S)
-    if match is None:
-        raise SystemExit("release-notes: README.md has no Roadmap section")
-    return match.group(1).strip()
-
-
-def notes(version: str, tag: str, previous: str | None) -> str:
-    pulls = merged_pull_requests(tag, previous)
-    since = f"since {previous}" if previous else "so far"
-    lines = [
-        f"stafeto {version}: a pre-release to boot in QEMU on aarch64.",
+def summary(version: str) -> str:
+    """The summary written for this version, or a short introduction."""
+    written = ROOT / "docs" / "releases" / f"{version}.md"
+    if written.exists():
+        return written.read_text().strip()
+    return "\n".join([
+        f"stafeto {version}: a POSIX system on its own capability microkernel for AArch64, to boot in QEMU.",
         "",
         f"Download `stafeto-{version}-aarch64-virt.tar.xz`, unpack it and run `./run.sh` "
         "(`--cpus N` for several CPUs, `--hvf` on a Mac with Apple silicon). "
         "The README in the archive lists what is inside and the limits.",
+    ])
+
+
+def notes(version: str, tag: str, previous: str | None) -> str:
+    repository = "https://github.com/stafeto/stafeto"
+    changes = (f"{repository}/compare/{previous}...{tag}" if previous
+               else f"{repository}/pulls?q=is%3Apr+is%3Amerged")
+    lines = [
+        summary(version),
+        "",
+        "## Files",
         "",
         "| File | Content |",
         "| --- | --- |",
@@ -61,11 +47,10 @@ def notes(version: str, tag: str, previous: str | None) -> str:
         f"| `stafeto-{version}-sbom.spdx.json` | the packages with versions, licences, URLs and SHA-256 |",
         "| `SHA256SUMS` | SHA-256 of every file above |",
         "",
-        f"## Merged pull requests {since}",
+        f"The plans are in the [README]({repository}#where-it-is-going); "
+        f"every change of this release is in the [merged pull requests]({changes}).",
         "",
     ]
-    lines += [f"- {title} (#{number})" for number, title in pulls] or ["- none"]
-    lines += ["", "## Roadmap", "", roadmap(), ""]
     return "\n".join(lines)
 
 
