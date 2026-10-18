@@ -36,6 +36,16 @@ impl<const N: usize> Default for Waits<N> {
 }
 
 impl<const N: usize> Waits<N> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the field is in bounds and written once; `keys` is zero in
+        // `new`.
+        unsafe { rt::bss::fill_none(core::ptr::addr_of_mut!((*at).waits)) };
+    }
+
     pub const fn new() -> Self {
         Self {
             waits: [None; N],

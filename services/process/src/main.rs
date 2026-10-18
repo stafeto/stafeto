@@ -60,7 +60,7 @@ mod loader;
 mod make;
 mod pages;
 mod replace;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
 /// the channel with no label at place 0, a record's at its index plus 1,
@@ -345,68 +345,54 @@ struct Processes {
     timer_armed: u64,
 }
 impl Processes {
-    const fn new() -> Self {
-        Self {
-            channel: Handle::borrowed(abi::Handle::INVALID),
-            identities: Handle::borrowed(abi::Handle::INVALID),
-            level: 1,
-            records: Records::new(),
-            retired_ticks: 0,
-            placed_last: 0,
-            window_at: 0,
-            window_marks: [(0, 0); MAX_CPUS],
-            window_load: [0; MAX_CPUS],
-            window_issued: [[0; MAX_CPUS]; 2],
-            tickets: [0; RECORDS],
-            replacing: [const { None }; RECORDS],
-            replace_queue: Queue::new(),
-            replacer: None,
-            pages: pages::Pages::new(),
-            queued: Queued::new(),
-            generations: generations::Generations::new(),
-            lifetimes: lifetime_page::Lifetimes::new(),
-            witnesses: [const { None }; RECORDS],
-            routers: [const { None }; RECORDS],
-            shares: Shares::new(),
-            ops: LongOps::new(),
-            waits: Waits::new(),
-            walks: [const { None }; RECORDS],
-            walking: Queue::new(),
-            later: [const { None }; LATER],
-            tty_walk: None,
-            orphan_walk: None,
-            #[cfg(feature = "tty-probe")]
-            tty_probe: None,
-            terminal_notice: None,
-            loader_terminal: None,
-            terminals: Terminals::new(),
-            step: None,
-            step_told: false,
-            creating: None,
-            creating_notice: None,
-            loaders: Loaders::new(),
-            loader: None,
-            files: None,
-            clock: None,
-            console: None,
-            timers: Timers::new(),
-            timer: None,
-            timer_armed: u64::MAX,
+    /// What `new` makes, in place in zeroed memory: the records of the
+    /// service are too big for a stack, and a static of `new` would be
+    /// `.data`, which the boot image carries with its zeros.
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once; the others are
+        // zero in `new`.
+        unsafe {
+            addr_of_mut!((*at).level).write(1);
+            Records::initialize_at(addr_of_mut!((*at).records));
+            rt::bss::fill_none(addr_of_mut!((*at).replacing));
+            addr_of_mut!((*at).replacer).write(None);
+            Queued::initialize_at(addr_of_mut!((*at).queued));
+            LongOps::initialize_at(addr_of_mut!((*at).ops));
+            Waits::initialize_at(addr_of_mut!((*at).waits));
+            rt::bss::fill_none(addr_of_mut!((*at).walks));
+            rt::bss::fill_none(addr_of_mut!((*at).later));
+            addr_of_mut!((*at).tty_walk).write(None);
+            addr_of_mut!((*at).orphan_walk).write(None);
+            addr_of_mut!((*at).creating).write(None);
+            Shares::initialize_at(addr_of_mut!((*at).shares));
+            Loaders::initialize_at(addr_of_mut!((*at).loaders));
+            Terminals::initialize_at(addr_of_mut!((*at).terminals));
+            addr_of_mut!((*at).timer_armed).write(u64::MAX);
         }
     }
 }
 /// The loop's state, in .bss: the records are
-/// too big for the main thread's stack.
-struct Owner(UnsafeCell<Processes>);
+/// too big for the main thread's stack, and `main` writes the places that
+/// are not zero (`Processes::initialize_at`).
+struct Owner(UnsafeCell<MaybeUninit<Processes>>);
 // SAFETY: only the main thread reaches it (`main`), once.
 unsafe impl Sync for Owner {}
-static OWNER: Owner = Owner(UnsafeCell::new(Processes::new()));
+static OWNER: Owner = Owner(UnsafeCell::new(MaybeUninit::zeroed()));
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
         return 1;
     };
-    // SAFETY: the main thread is the one that reaches OWNER, here once.
-    let owner = unsafe { &mut *OWNER.0.get() };
+    // SAFETY: the main thread is the one that reaches OWNER, here once; it
+    // is zeroed until `initialize_at`.
+    let owner = unsafe {
+        let at = OWNER.0.get().cast::<Processes>();
+        Processes::initialize_at(at);
+        &mut *at
+    };
     if let Ok(console) = start.take::<Resource>("console") {
         // A copy for the programs the loaders start, when init gave the
         // service a console it may copy.

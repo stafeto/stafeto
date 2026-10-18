@@ -275,6 +275,25 @@ impl<P> Records<P> {
         record.limits.values[resource] = value;
         Ok(true)
     }
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once; the others are
+        // zero in `new`.
+        unsafe {
+            rt::bss::fill_none(addr_of_mut!((*at).records));
+            let free = addr_of_mut!((*at).free).cast::<u16>();
+            for i in 0..RECORDS {
+                free.add(i).write((RECORDS - 1 - i) as u16);
+            }
+            addr_of_mut!((*at).free_len).write(RECORDS);
+            rt::bss::fill(addr_of_mut!((*at).listed), true);
+        }
+    }
+
     /// No record, every index free, index 0 on top.
     pub const fn new() -> Self {
         let mut free = [0; RECORDS];

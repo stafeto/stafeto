@@ -28,12 +28,6 @@ pub struct Pages {
 }
 
 impl Pages {
-    pub const fn new() -> Self {
-        Self {
-            objects: [const { None }; OBJECTS],
-        }
-    }
-
     /// The page of the record in `index`, once `prepare` made its object.
     pub fn page(&self, index: usize) -> Option<&'static Page> {
         self.objects[index / GROUP].as_ref()?;

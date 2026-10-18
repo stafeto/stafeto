@@ -71,6 +71,20 @@ pub struct Shares<T> {
 }
 
 impl<T> Shares<T> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once; `ages` is zero
+        // in `new`.
+        unsafe {
+            rt::bss::fill_none(addr_of_mut!((*at).entries));
+            rt::bss::fill_none(addr_of_mut!((*at).grants));
+        }
+    }
+
     pub const fn new() -> Self {
         Shares {
             entries: [const { None }; SHARES],
