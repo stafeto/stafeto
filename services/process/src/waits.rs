@@ -40,6 +40,7 @@ impl<const N: usize> Waits<N> {
     ///
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
     pub unsafe fn initialize_at(at: *mut Self) {
         // SAFETY: the field is in bounds and written once; `keys` is zero in
         // `new`.

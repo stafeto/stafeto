@@ -72,6 +72,7 @@ impl Terminals {
     ///
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
     pub unsafe fn initialize_at(at: *mut Self) {
         // The one copy of the constant is in `.rodata`.
         const BLANK: Terminal = Terminal::new();

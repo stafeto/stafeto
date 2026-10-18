@@ -75,6 +75,7 @@ impl<T> Shares<T> {
     ///
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
     pub unsafe fn initialize_at(at: *mut Self) {
         use core::ptr::addr_of_mut;
         // SAFETY: each field is in bounds and written once; `ages` is zero
