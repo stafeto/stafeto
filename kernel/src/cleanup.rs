@@ -19,11 +19,13 @@
 //! (crate::timer::expire), and whose portion fires expired timers of that
 //! level (spec 10).
 
+use crate::arch::cpu::{self, CpuBlock};
 use crate::arch::timer;
 use crate::local::local;
 use crate::object::Object;
 use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::time::stretch;
 
@@ -56,6 +58,75 @@ impl Item {
             link: Link::new(0),
             work: None,
         }
+    }
+}
+
+/// The lock of one CPU's queue and the queue it guards, for as long as the
+/// guard lives.
+struct QueueGuard {
+    queue: *mut Queue,
+    block: &'static CpuBlock,
+    /// Whether the guard holds the spin lock: a push in a section under
+    /// `OBJ` does not, since every other CPU that changes the queue does it
+    /// in a section too, and a section excludes it.
+    spinning: bool,
+}
+
+impl core::ops::Deref for QueueGuard {
+    type Target = Queue;
+    fn deref(&self) -> &Queue {
+        // SAFETY: the guard holds the queue's lock or a section of `OBJ`.
+        unsafe { &*self.queue }
+    }
+}
+
+impl core::ops::DerefMut for QueueGuard {
+    fn deref_mut(&mut self) -> &mut Queue {
+        // SAFETY: as above.
+        unsafe { &mut *self.queue }
+    }
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        if self.spinning {
+            self.block.local.queue_spin.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Takes the queue of CPU `block`. Interrupts are masked in the kernel and
+/// a holder never waits for anything while it holds the lock, so the wait
+/// is as long as one of the short holds below.
+fn lock_queue(block: &'static CpuBlock) -> QueueGuard {
+    spin_lock_queue(block, true)
+}
+
+fn spin_lock_queue(block: &'static CpuBlock, spinning: bool) -> QueueGuard {
+    if spinning {
+        while block.local.queue_spin.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    QueueGuard {
+        queue: block.local.queue.as_ptr().cast_mut(),
+        block,
+        spinning,
+    }
+}
+
+/// The queue of the CPU that runs this.
+fn lock_own_queue() -> QueueGuard {
+    lock_queue(cpu::this())
+}
+
+impl Item {
+    /// The CPU whose queue holds the item, or held it last: set under that
+    /// queue's lock (`push`), read by a section on another CPU that raises
+    /// or removes the item.
+    fn cpu(this: NonNull<Item>) -> usize {
+        // SAFETY: the caller's item is alive; the owner tag is a byte.
+        unsafe { Link::owner_at(&raw const (*this.as_ptr()).link) as usize }
     }
 }
 
@@ -120,18 +191,36 @@ pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
     unsafe { push(item, work.into(), level, true) }
 }
 
-/// Takes an item's work out of the queue in O(1).
+/// Takes an item's work out of the queue in O(1): true when it was queued.
+/// False when the owner's portion took it off the queue already, with its
+/// work, which happens with no hold of `OBJ` (`portion`): that portion
+/// runs the work and keeps the reference the item stood for, and the item
+/// is not in the queue until the portion queues it again.
 ///
 /// # Safety
-/// `item` is alive and queued; its owner takes responsibility for its work.
-pub unsafe fn remove(item: NonNull<Item>) {
-    let mut q = local().queue.lock();
-    // SAFETY: the caller's promise.
+/// `item` is alive; its work belongs to the object, which is at its stage
+/// or in its continuation, and queued or in its portion.
+pub unsafe fn remove(item: NonNull<Item>) -> bool {
+    // The item is queued on the CPU that pushed it, which may be another
+    // CPU than this: its queue, under its lock.
+    let mut q = loop {
+        let at = Item::cpu(item);
+        let q = lock_queue(cpu::block(at));
+        if Item::cpu(item) == at {
+            break q;
+        }
+    };
+    // SAFETY: the caller's promise; the link is read under the queue's
+    // lock, which `portion` holds when it takes the item.
     unsafe {
+        if !(*item.as_ptr()).link.is_queued() {
+            return false;
+        }
         q.items.remove(item);
         (*item.as_ptr()).work = None;
     }
     q.len -= 1;
+    true
 }
 
 /// Moves a queued object to the head of `level`, unless it stands higher:
@@ -162,28 +251,59 @@ pub unsafe fn raise_above(item: NonNull<Item>, level: u8) {
 /// # Safety
 /// As for `raise`.
 unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
-    let mut q = local().queue.lock();
+    // The queue of the CPU that pushed the item, under its lock; a CPU
+    // that owns another queue than this one raises the item there and asks
+    // its owner to look again (its next way out of the kernel decides).
+    let (mut q, at) = loop {
+        let at = Item::cpu(item);
+        let q = lock_queue(cpu::block(at));
+        if Item::cpu(item) == at {
+            break (q, at);
+        }
+    };
     // SAFETY: the caller's promise; the link is touched only while the
-    // item is out of the queue.
-    unsafe {
+    // queue's lock is held.
+    let raised = unsafe {
         let link = &raw mut (*item.as_ptr()).link;
-        assert!((*link).is_queued(), "an item is raised while not queued");
+        // The owner took the item meanwhile: its portion runs, and there
+        // is nothing to raise.
+        if !(*link).is_queued() {
+            return;
+        }
         let own = (*link).level();
-        if own < level || level_too && own == level {
+        let raised = own < level || level_too && own == level;
+        if raised {
             q.items.remove(item);
             (*link).set_level(level);
             q.items.push_head(item);
         }
+        raised
+    };
+    drop(q);
+    if raised && at != cpu::this().index() {
+        crate::arch::gic::send_sgi(at, kcore::gic::SGI_CMD);
     }
 }
 
 /// # Safety
 /// As for `enqueue`.
 unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
-    let mut q = local().queue.lock();
-    // SAFETY: the caller's promise.
+    let this = cpu::this();
+    // A push in a section under `OBJ` takes no lock: every other CPU that
+    // changes this queue does it in a section too, which excludes it, and
+    // the portion that takes items off it runs on this CPU.
+    let spin = !crate::obj::held();
+    if spin {
+        while this.local.queue_spin.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    // SAFETY: the lock or the section excludes the other CPUs; the caller's
+    // promise for the item.
     unsafe {
+        let q = &mut *this.local.queue.as_ptr().cast_mut();
         let i = &mut *item.as_ptr();
+        i.link.set_owner(this.index() as u8);
         i.work = Some(work);
         i.link.set_level(level);
         if head {
@@ -191,13 +311,16 @@ unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
         } else {
             q.items.push_tail(item);
         }
+        q.len += 1;
     }
-    q.len += 1;
+    if spin {
+        this.local.queue_spin.store(false, Ordering::Release);
+    }
 }
 
 /// The top level of the queue; None when it is empty.
 pub fn top() -> Option<u8> {
-    local().queue.lock().items.top()
+    lock_own_queue().items.top()
 }
 
 /// The top level during the scheduler's decision, without the lock: one
@@ -218,25 +341,26 @@ pub fn top_for_decide() -> Option<u8> {
 pub fn portion() {
     #[cfg(feature = "ktest")]
     if crate::arch::irq_pending() {
-        local().queue.lock().late = true;
+        lock_own_queue().late = true;
     }
     let start = timer::now();
-    let taken = {
-        let mut q = local().queue.lock();
-        q.items.top().map(|level| {
-            let item = q.items.first(level).expect("a level with its bit set");
-            // SAFETY: a queued item is alive and in this queue.
-            unsafe { q.items.remove(item) };
-            q.len -= 1;
-            (item, level)
-        })
+    let (work, level) = {
+        let mut q = lock_own_queue();
+        let Some(level) = q.items.top() else {
+            return;
+        };
+        let item = q.items.first(level).expect("a level with its bit set");
+        // SAFETY: a queued item is alive and in this queue; its work is
+        // taken in the same hold, so that an item that is not queued has no
+        // work either (`remove` says false then).
+        let work = unsafe {
+            q.items.remove(item);
+            (*item.as_ptr()).work.take()
+        };
+        q.len -= 1;
+        (work.expect("queued work"), level)
     };
-    let Some((item, level)) = taken else {
-        return;
-    };
-    // SAFETY: the item's object stays alive until its portion, which is
-    // this one; the item is not used afterwards.
-    let work = unsafe { (*item.as_ptr()).work.take() }.expect("queued work");
+    crate::testpoint::portion_taken();
     crate::obj::serving(crate::obj::ENTRY_CLEANUP);
     // SAFETY: nothing refers to the object any more.
     unsafe {
@@ -282,35 +406,44 @@ pub fn portion() {
     crate::obj::serving(0);
     let took = stretch(start, timer::now());
     crate::testpoint::portion_done();
-    let mut q = local().queue.lock();
-    q.longest = q.longest.max(took);
+    note_longest(took);
 }
 
 /// Items queued now, for KSTATS (spec 16).
 pub fn len() -> u64 {
-    local().queue.lock().len
+    lock_own_queue().len
 }
 
 /// A portion of a long call (spec 7.7) that began at `start`, in counter
 /// ticks, counts toward the longest portion as one of cleanup does: both
 /// add to the blocking of any thread (KSTATS x5).
 pub fn count_portion(start: u64) {
-    let took = stretch(start, timer::now());
-    let mut q = local().queue.lock();
-    q.longest = q.longest.max(took);
+    note_longest(stretch(start, timer::now()));
+}
+
+/// Notes a portion that took `took` ticks. Only this CPU reads or writes
+/// `longest`, so it takes no lock, and it touches the field alone: another
+/// CPU may be raising an item of the queue meanwhile.
+fn note_longest(took: u64) {
+    let q = cpu::this().local.queue.as_ptr().cast_mut();
+    // SAFETY: the field is the owner's alone, and the owner is this CPU.
+    unsafe {
+        let longest = &raw mut (*q).longest;
+        *longest = (*longest).max(took);
+    }
 }
 
 /// The longest portion so far, of cleanup or of a long call, in counter
 /// ticks, for KSTATS.
 pub fn longest() -> u64 {
-    local().queue.lock().longest
+    lock_own_queue().longest
 }
 
 /// The longest portion so far, which goes back to 0: a test that checks
 /// what a call counts takes it first (KSTATS x5).
 #[cfg(feature = "ktest")]
 pub fn take_longest() -> u64 {
-    core::mem::take(&mut local().queue.lock().longest)
+    core::mem::take(&mut lock_own_queue().longest)
 }
 
 /// Runs portions until the queue is empty: tests that count the objects
@@ -338,5 +471,5 @@ pub fn drain() {
 /// call.
 #[cfg(feature = "ktest")]
 pub fn take_late() -> bool {
-    core::mem::take(&mut local().queue.lock().late)
+    core::mem::take(&mut lock_own_queue().late)
 }

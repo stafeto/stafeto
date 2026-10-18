@@ -33,6 +33,21 @@ cpu-on-refused = []
 # for 20 ms (xtask smp-window).
 window-probe = []
 measure = []
+# The ASID is 4 bits wide, so that a new generation begins every dozen switches of
+# address space (xtask smp-asid).
+asid-probe = ["kcore/narrow-asid"]
+# 3 bits for the boot of the shell under VZ, which has few processes (xtask
+# smp-asid-vz).
+asid-probe-3 = ["asid-probe"]
+# The probe kernel with one deliberate break each (xtask smp-asid): no reserved
+# ASIDs, no deferred flush, no aside1is at the end of a process, an ASID
+# that goes before the other CPUs left the tables, and a TLBI of an
+# unmapped page that stays on its own CPU.
+break-asid-reserved = ["asid-probe", "kcore/break-reserved"]
+break-asid-flush = ["asid-probe", "kcore/break-flush"]
+break-asid-aside = ["asid-probe", "kcore/break-aside"]
+break-asid-retire = ["asid-probe"]
+break-unmap-local = []
 atomic-locks = ["kcore/atomic-locks"]
 locked-decide = []
 baseline = ["ktest", "atomic-locks", "locked-decide"]

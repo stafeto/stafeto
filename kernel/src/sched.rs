@@ -744,7 +744,7 @@ pub fn resume() -> ! {
 /// sleeps until an interrupt. A portion begins only with no interrupt
 /// pending. TTBR0, TPIDR_EL1 and the FP registers keep
 /// the last thread's meanwhile, so going back to that thread costs
-/// nothing. Leaves only through thread::run.
+/// nothing; the idle wait takes TTBR0 off it (`aspace::leave`). Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
         let mut now = timer::now();
@@ -849,6 +849,7 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
 /// Nothing to do: sleeps in `wfi` with interrupts masked until one is
 /// pending, and handles it; the time asleep counts for KSTATS.
 fn sleep() {
+    crate::mm::aspace::leave();
     crate::testpoint::idle();
     let slept = timer::now();
     crate::qsbr::idle();

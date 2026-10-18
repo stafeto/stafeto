@@ -20,6 +20,16 @@ mod points {
     #[inline(always)]
     pub fn portion_done() {}
 
+    /// In a portion of cleanup, after the item left the queue and its work
+    /// was taken, before the work runs (cleanup::portion).
+    #[inline(always)]
+    pub fn portion_taken() {}
+
+    /// After each section of a continuation's portion released `OBJ`, with
+    /// the number of the section (process::control::portion).
+    #[inline(always)]
+    pub fn section_done(_: usize) {}
+
     /// After a portion of the stage Close of a channel or of the stage
     /// Replies of a process (channel::clean, process::clean): the level it
     /// ran at and the heads it took.
@@ -119,6 +129,18 @@ mod points {
     pub fn quota_stage(with_children: bool) {
         let _test = crate::obj::test_scope();
         ktest::quota_stage(with_children);
+    }
+
+    /// The tests that measure a portion pay one load for this point.
+    #[inline(always)]
+    pub fn portion_taken() {
+        if ktest::calls::kill_armed() {
+            ktest::calls::portion_taken();
+        }
+    }
+
+    pub fn section_done(number: usize) {
+        ktest::calls::section_done(number);
     }
 
     pub fn heads_taken(level: u8, heads: usize) {

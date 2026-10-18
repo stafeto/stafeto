@@ -61,9 +61,15 @@ pub enum State {
 /// Where an item of a `ReadyQueue` stands: its level and its neighbours
 /// there. The item keeps it inside itself; only the queue changes the
 /// neighbours, and the level changes only while the item is in no list.
+const QUEUED: u8 = 1;
+
 pub struct Link<T> {
     level: u8,
-    queued: bool,
+    /// Bit 0: the item stands in a queue. Bits 1-7: a tag the owner of the
+    /// queue puts in the item, which a section on another CPU reads to find
+    /// the queue (kernel cleanup: the CPU, below 8). One byte for both keeps
+    /// the link's size and the code that makes one as they were.
+    queued: u8,
     prev: Option<NonNull<T>>,
     next: Option<NonNull<T>>,
 }
@@ -73,7 +79,7 @@ impl<T> Link<T> {
     pub const fn new(level: u8) -> Link<T> {
         Link {
             level,
-            queued: false,
+            queued: 0,
             prev: None,
             next: None,
         }
@@ -83,15 +89,36 @@ impl<T> Link<T> {
         self.level
     }
 
+    /// The tag of the queue's owner (`set_owner`), 0 until one is set, read
+    /// through a pointer while the item may be written on another CPU (a
+    /// byte: never torn).
+    ///
+    /// # Safety
+    /// `this` points at a live link.
+    pub unsafe fn owner_at(this: *const Link<T>) -> u8 {
+        // SAFETY: the caller's promise; a volatile read of one byte.
+        unsafe { core::ptr::read_volatile(&raw const (*this).queued) >> 1 }
+    }
+
+    /// Sets the tag, `owner` below 128, in a link that is in no list.
+    pub fn set_owner(&mut self, owner: u8) {
+        assert!(
+            !self.is_queued() && owner < 128,
+            "the owner of a queued item changes"
+        );
+        // SAFETY: the field is this link's own byte.
+        unsafe { core::ptr::write_volatile(&raw mut self.queued, owner << 1) }
+    }
+
     /// Moves an item that is in no list to `level`.
     pub fn set_level(&mut self, level: u8) {
-        assert!(!self.queued, "the level of a queued item changes");
+        assert!(!self.is_queued(), "the level of a queued item changes");
         self.level = level;
     }
 
     /// Whether the item stands in a queue.
     pub fn is_queued(&self) -> bool {
-        self.queued
+        self.queued & QUEUED != 0
     }
 }
 
@@ -125,7 +152,10 @@ impl<T: Linked> ParkedList<T> {
         // SAFETY: the caller's promise; neighbours stay in this ring.
         unsafe {
             let l = link(t);
-            assert!(!l.queued && l.next.is_none(), "a parked link is occupied");
+            assert!(
+                !l.is_queued() && l.next.is_none(),
+                "a parked link is occupied"
+            );
             if let Some(h) = self.head {
                 let tail = link(h).prev.expect("a parked ring");
                 l.prev = Some(tail);
@@ -264,7 +294,7 @@ impl<T> Node<T> {
     /// changes under the lock of the objects, so this one is true for every
     /// CPU that holds it.
     pub fn is_parked_listed(&self) -> bool {
-        self.link.next.is_some() && !self.link.queued
+        self.link.next.is_some() && !self.link.is_queued()
     }
 
     /// Ticks left of the quantum of a ready round-robin thread.
@@ -416,8 +446,8 @@ impl<T: Linked> ReadyQueue<T> {
         // ring, and each borrow of a link ends before the next begins.
         unsafe {
             let l = link(t);
-            assert!(!l.queued, "an item is queued twice");
-            l.queued = true;
+            assert!(!l.is_queued(), "an item is queued twice");
+            l.queued |= QUEUED;
             let Some(head) = self.heads[level] else {
                 l.prev = Some(t);
                 l.next = Some(t);
@@ -443,8 +473,8 @@ impl<T: Linked> ReadyQueue<T> {
         unsafe {
             let level = Self::level(t);
             let l = link(t);
-            assert!(l.queued, "an item leaves a queue it is not in");
-            l.queued = false;
+            assert!(l.is_queued(), "an item leaves a queue it is not in");
+            l.queued &= !QUEUED;
             let prev = l.prev.take().expect("a ring");
             let next = l.next.take().expect("a ring");
             if next == t {
@@ -985,7 +1015,7 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise.
         let (state, queued) = unsafe {
             let n = node(t);
-            (n.state, n.link.queued)
+            (n.state, n.link.is_queued())
         };
         match state {
             State::Running => {

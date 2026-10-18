@@ -112,6 +112,10 @@ pub struct Process {
     /// first, so the tables go before the threads' message buffers and the
     /// objects of the mappings, whose frames the tables mapped.
     retired: Option<SpaceRelease>,
+    /// The wait of `retired` for the end of a quiescent period: the node of
+    /// its ASID's reclaim (teardown::release_space), registered by the
+    /// first portion of the stage Space.
+    space_node: crate::qsbr::Deferred,
     /// The table of its mappings, in a block of its pool of blocks, from
     /// its first mapping until the stage Mappings (spec 7.4).
     maps: Option<NonNull<maps::Table>>,
@@ -290,9 +294,8 @@ impl Process {
     pub fn activate(&mut self) {
         let space = self.space();
         if !space.is_active() {
-            // The ASIDs are shared (obj.rs); the way into EL0 holds no section.
-            crate::obj::serving(crate::obj::ENTRY_ASID);
-            let _section = crate::obj::lock();
+            // The fast path of the switch takes no lock; the slow one takes
+            // `OBJ` for the ASIDs itself (AddressSpace::activate).
             space.activate();
         }
     }
@@ -343,6 +346,7 @@ fn create(
     let process = Process {
         space: Some(space),
         retired: None,
+        space_node: crate::qsbr::Deferred::new(),
         maps: None,
         handles,
         refs: Refs::one(),

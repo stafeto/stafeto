@@ -483,8 +483,8 @@ between the child and its first entries: 2 957; the stage Space reads the
 entries of a table with no lock and takes it for each table that goes back,
 the continuation of a suspended process unparks its 64 threads in sections
 of 16. The longest hold is now 2 957 (`mem_unmap`); once in 65 535 switches
-of address space the new generation of ASIDs holds 13 417
-(`OBJ_ASID_ROLLOVER_MAX`, until the ASID rework of stage 5). A channel's stage
+of address space the new generation of ASIDs holds 13 417 up to stage 4, and
+2 387 from stage 5 (below). A channel's stage
 Close takes one section for each waiter it wakes.
 
 ## Commands between CPUs (SMP stage 4)
@@ -895,3 +895,34 @@ readiness record. Replacing each WatchTake notification session makes
 S29 fail; omitting the native worker notices makes S28 fail. Hardware
 rows retain n, minimum, p50, p99, maximum and the full histogram in
 `target/measure/rtbench-hvf.txt` and `rtbench-vz.txt`.
+
+## ASIDs on several CPUs (SMP stage 5)
+
+An ASID is a number of a generation, and the tag of a process holds both
+(kcore/src/asid.rs). A CPU that switches to a process whose tag is of the
+current generation does it with one compare-and-swap of its own `active`
+word and takes no lock. Every other switch takes `OBJ` for a hold that does
+not grow with the number of ASIDs: a new tag searches a two-level map (at
+most 16 words), and a new generation only raises the counter, zeroes the map
+of 8 KiB with `dc zva` (128 blocks), reserves the numbers the CPUs run
+(`reserved`, at most one a CPU) and sets every CPU's bit in `flush_pending`.
+Each CPU runs `tlbi vmalle1` for itself at its next slow switch, with TTBR0
+on the empty table. The ASID section is counted in `OBJ_HOLD_MAX` like any
+other: 2 387 instructions for a generation of 65 535. `OBJ_ASID_ROLLOVER_MAX`
+and its term in B_4 are gone.
+
+The TLBIs of the unmap and of the release of an ASID (`vale1is`, `aside1is`,
+`dsb ish`) reach every CPU and need no interrupt between CPUs. They name the
+ASID the tag holds whatever its generation, since a CPU that ran the process
+when the generation ended keeps entries under that number. A process that
+goes gives its ASID back whether the tag is of this generation or reserved
+by a CPU, and `aside1is` runs before the number can be issued again.
+
+`cargo xtask smp-asid` runs the probes of this stage on a kernel with 4-bit
+ASIDs (`asid-probe`, a new generation every dozen switches): 88 processes on
+four CPUs read their own pages in waves and one by one, and a page unmapped on
+CPU 0 faults the thread that reads it on CPU 1. Four kernels with one
+deliberate break each must fail them: no reserved ASIDs, no deferred flush, no
+`aside1is` at the end of a process (HVF; TCG drops its TLB at every change of
+ASID and shows none of the three) and a `tlbi vale1` for an unmap (TCG; HVF
+broadcasts it).

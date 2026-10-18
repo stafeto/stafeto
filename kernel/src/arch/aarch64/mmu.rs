@@ -68,8 +68,17 @@ pub fn tables_written() {
 /// `user_pages_invalidated` ([G13]); `operand` comes from
 /// kcore::asid::tlbi_page.
 pub fn invalidate_user_page(operand: u64) {
+    #[cfg(not(feature = "break-unmap-local"))]
     // SAFETY: TLB maintenance only drops cached translations.
-    unsafe { asm!("tlbi vale1is, {}", in(reg) operand, options(nostack, preserves_flags)) };
+    unsafe {
+        asm!("tlbi vale1is, {}", in(reg) operand, options(nostack, preserves_flags))
+    };
+    // The probe kernel drops the entry of this CPU alone (xtask smp-asid).
+    #[cfg(feature = "break-unmap-local")]
+    // SAFETY: as above.
+    unsafe {
+        asm!("tlbi vale1, {}", in(reg) operand, options(nostack, preserves_flags))
+    };
 }
 
 /// Completes the TLB invalidations before it on every CPU: `dsb ish` with

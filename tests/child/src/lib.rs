@@ -71,6 +71,8 @@ pub const NO_FAULT: u64 = 0xFA17;
 /// The code a child ends with when its start data named no role, and
 /// when a call of its role failed.
 pub const FAILED: u64 = 0xBAD;
+/// The code of Role::AsidPage that read another process's word.
+pub const MISMATCH: u64 = 0xA51D;
 /// The codes a child ends with when rt::startup failed (`start_failed`).
 pub const START_FAILED: u64 = 0x57A7_0000;
 
@@ -109,6 +111,9 @@ pub const SEEN: usize = 8;
 /// server::BUSY starts to spin.
 pub const SERVED_AT: usize = 9;
 pub const SPINS: usize = 10;
+/// The mark init sets to 1 to let the children of Role::AsidPage that wait
+/// for it begin their rounds.
+pub const GO: usize = 11;
 
 /// The protocol of the test service, Role::Server and Role::Busy
 /// (rt::service): a request is the header of a method alone
@@ -314,10 +319,25 @@ pub enum Role {
     /// Takes a request through handle 0, a channel with RECEIVE, marks SEEN
     /// and spins for good, answering nothing.
     TakeThenWait = 35,
+    /// Maps a page of a new object of its own at SCRATCH, RW, through
+    /// handle 0, its own process with MANAGE, writes the word in argument 0
+    /// to it, and yields argument 1 times, reading the word back after each:
+    /// ends with 0 when it always read its own word, with MISMATCH when it
+    /// read another's (a TLB entry of another process under its ASID). With
+    /// argument 2 set it first yields until the mark GO is 1.
+    AsidPage = 36,
+    /// Maps a page at SCRATCH as AsidPage does, starts a thread on CPU 1 at
+    /// priority argument 0 that reads the page for good, waits until that
+    /// thread has read it a thousand times (mark HELPER), then unmaps the
+    /// page from its own CPU and waits 3 s: the reader on CPU 1 must
+    /// fault (the process ends in a data abort at SCRATCH); a child that
+    /// outlives the wait ends with NO_FAULT, one that never saw the reader
+    /// with FAILED.
+    UnmapAcross = 37,
 }
 
 impl Role {
-    pub const ALL: [Role; 35] = [
+    pub const ALL: [Role; 37] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -353,6 +373,8 @@ impl Role {
         Role::Busy,
         Role::SmpSpin,
         Role::TakeThenWait,
+        Role::AsidPage,
+        Role::UnmapAcross,
     ];
 
     /// The role whose code is `code`.

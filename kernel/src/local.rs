@@ -30,6 +30,10 @@ pub struct Local {
     pub sched: Own<Sched>,
     pub timers: Own<Timers>,
     pub queue: Own<crate::cleanup::Queue>,
+    /// Held while anything touches `queue` that may run on another CPU
+    /// too: the owner's portion and push, and the `raise` and `remove` of
+    /// an item queued here by a section on another CPU (cleanup.rs).
+    pub queue_spin: core::sync::atomic::AtomicBool,
     pub ring: Own<Ring<LOG_RECORDS>>,
     /// The objects this CPU retired and has not freed (qsbr).
     pub retired: Own<crate::qsbr::Retired>,
@@ -59,6 +63,7 @@ impl Local {
             sched: Own::new(Sched::new()),
             timers: Own::new(Timers::new()),
             queue: Own::new(crate::cleanup::Queue::new()),
+            queue_spin: core::sync::atomic::AtomicBool::new(false),
             ring: Own::new(Ring::new()),
             retired: Own::new(crate::qsbr::Retired::new()),
             copy: Own::new(crate::thread::PendingCopy::new()),

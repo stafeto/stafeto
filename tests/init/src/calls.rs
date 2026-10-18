@@ -1069,8 +1069,17 @@ fn cpu_time_splits_user_and_kernel() -> Outcome {
     // lie inside the kernel's path, and on a slow host (TCG without
     // -icount) the exception entry and return are most of it. What the
     // loop of calls shows is that the kernel time grows with the calls.
+    // The loop with no call takes its kernel time from the timer's
+    // interrupts, about 1 400 ticks of 250 000 on a slow runner, and the
+    // loop of calls 60 000 to 70 000: a factor of 25 keeps the two apart
+    // with room for the run-to-run noise of a host that shares its CPUs.
+    if !(call_kernel > four_ms / 16 && call_kernel > 25 * spin_kernel) {
+        println!(
+            "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel}, the loop of calls kernel {call_kernel} (4 ms are {four_ms} ticks)"
+        );
+    }
     check(
-        call_kernel > four_ms / 16 && call_kernel > 50 * spin_kernel,
+        call_kernel > four_ms / 16 && call_kernel > 25 * spin_kernel,
         "a loop of calls grew little of the kernel time",
     )?;
     let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;

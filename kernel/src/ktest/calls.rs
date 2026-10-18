@@ -7560,6 +7560,142 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
     })
 }
 
+/// Where the armed kill of `continuation_ended_while_its_portion_runs` goes
+/// off: the process to end and the point.
+static KILL_AT_POINT: Lock<Option<(usize, KillPoint)>> = Lock::new(None);
+
+#[derive(Clone, Copy, PartialEq)]
+enum KillPoint {
+    /// After the portion took the item off the queue.
+    Taken,
+    /// After the first section of the continuation's portion.
+    Section(usize),
+}
+
+/// Whether `KILL_AT_POINT` is armed: the points read it first, so that a
+/// portion the tests measure pays one load for them.
+static KILL_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether the kill is armed.
+#[inline(always)]
+pub fn kill_armed() -> bool {
+    KILL_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn kill_at(point: KillPoint) {
+    if !KILL_ARMED.load(core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _test = crate::obj::test_scope();
+    let armed = {
+        let mut armed = KILL_AT_POINT.lock();
+        match *armed {
+            Some((process, at)) if at == point => {
+                KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                armed.take().map(|_| process)
+            }
+            _ => None,
+        }
+    };
+    if let Some(process) = armed.and_then(|p| NonNull::new(p as *mut Process)) {
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(process, ProcessState::Killed, CAUSE) };
+    }
+}
+
+/// The test point after the cleanup portion took an item off the queue.
+pub fn portion_taken() {
+    kill_at(KillPoint::Taken);
+}
+
+/// The test point after a section of a continuation's portion.
+pub fn section_done(number: usize) {
+    kill_at(KillPoint::Section(number));
+}
+
+/// A process with 80 parked threads continues, so its continuation queues;
+/// the kill that ends it comes at `point` of the continuation's portion,
+/// as it does from another CPU: the item has left the queue, or the
+/// portion stands between two sections. The teardown takes over the
+/// continuation's reference and item: nothing stands in the queue twice,
+/// the stages run, and every object goes.
+fn continuation_ended_at(point: KillPoint) -> Result<(), &'static str> {
+    const CROWD: usize = 80;
+    let counts = (process::in_use(), thread::in_use());
+    cleanup::drain();
+    let p = process::create_root(QUOTA, 512, CEILING).map_err(|_| "no crowd process")?;
+    let mut threads = [None; CROWD];
+    let result = (|| {
+        for slot in threads.iter_mut() {
+            let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::RoundRobin)
+                .map_err(|_| "no crowd thread")?;
+            thread::start(t).map_err(|_| "crowd start failed")?;
+            *slot = Some(t);
+        }
+        process::control(p, true, CAUSE).map_err(|_| "stop failed")?;
+        park_crowd(CROWD)?;
+        process::control(p, false, CAUSE).map_err(|_| "continue failed")?;
+        check(cleanup::len() == 1, "the continuation was not queued")?;
+        *KILL_AT_POINT.lock() = Some((p.as_ptr() as usize, point));
+        KILL_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+        cleanup::portion();
+        let left = KILL_AT_POINT.lock().take();
+        check(left.is_none(), "the test point did not run")?;
+        check(
+            process::progress(p).0 != Stage::Whole,
+            "the kill did not begin the teardown",
+        )?;
+        check(
+            cleanup::len() == 1,
+            "the process does not stand once in the queue",
+        )?;
+        cleanup::drain();
+        check(
+            threads
+                .iter()
+                .flatten()
+                // SAFETY: the test still holds each thread reference.
+                .all(|t| unsafe { t.as_ref().sched.state() == State::Dead }),
+            "the teardown left a parked thread",
+        )
+    })();
+    *KILL_AT_POINT.lock() = None;
+    KILL_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    for t in threads.into_iter().flatten() {
+        // SAFETY: each thread has the test's creation reference.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    // SAFETY: the test's reference to the process goes once.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        counts == (process::in_use(), thread::in_use()),
+        "an object of the continuation stayed",
+    )
+}
+
+/// The kill comes after the portion took the continuation's item off the
+/// queue, before its work runs.
+pub fn continuation_ended_after_the_queue_gave_it_up(_: &Boot) -> Result<(), &'static str> {
+    continuation_ended_at(KillPoint::Taken)
+}
+
+/// The kill comes between two sections of the continuation's portion, with
+/// work left.
+pub fn continuation_ended_between_its_sections(_: &Boot) -> Result<(), &'static str> {
+    continuation_ended_at(KillPoint::Section(0))
+}
+
+/// The kill comes after the last section, which leaves work for the next
+/// portion: the process stands in the queue by then.
+pub fn continuation_ended_after_its_last_section(_: &Boot) -> Result<(), &'static str> {
+    continuation_ended_at(KillPoint::Section(3))
+}
+
 /// A thread of a process that ended and that the stage Threads has not taken
 /// off yet stops at the gate before EL0, as one of a suspended process does:
 /// on more cores another core may select it in the portions between.

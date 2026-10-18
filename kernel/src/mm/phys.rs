@@ -222,16 +222,30 @@ pub fn alloc(order: u8, quota: &mut Account) -> Result<Frame, Error> {
 /// The block is RAM the caller owns, and nothing else reaches it meanwhile.
 pub unsafe fn zero(pa: u64, order: u8) {
     let start = LINEAR_BASE + pa as usize;
-    let end = start + (PAGE_SIZE << order) as usize;
+    // SAFETY: the caller's promise; the linear map covers all RAM.
+    unsafe { zero_range(start, start + (PAGE_SIZE << order) as usize) };
+}
+
+/// Zeroes the words of `start..end`, the way `zero` does: `dc zva` where
+/// the range holds whole turns of the loop (eight blocks when a block is at
+/// most 512 bytes), word stores otherwise.
+///
+/// # Safety
+/// The range is RAM the caller owns, `start` and `end` are word aligned,
+/// and nothing else reaches it meanwhile.
+pub unsafe fn zero_range(start: usize, end: usize) {
     #[cfg(target_os = "none")]
     if let Some(block) = zva_block() {
-        // SAFETY: the caller's promise; `start` is page aligned, so it is
-        // aligned to `block`, and `end - start` is a multiple of 4096.
-        unsafe { zero_by_blocks(start, end, block) };
-        return;
+        let unit = if block <= 512 { 8 * block } else { block };
+        if start.is_multiple_of(unit) && end.is_multiple_of(unit) {
+            // SAFETY: the caller's promise, and both ends are multiples of
+            // what `zero_by_blocks` needs.
+            unsafe { zero_by_blocks(start, end, block) };
+            return;
+        }
     }
     for word in (start..end).step_by(8) {
-        // SAFETY: the caller's promise; the linear map covers all RAM.
+        // SAFETY: the caller's promise.
         unsafe { (word as *mut u64).write(0) };
     }
 }

@@ -135,6 +135,52 @@ pub fn smp_boot() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask smp-asid-vz` (SMP stage 5): `smp_boot` with the kernel of 3-bit
+/// ASIDs, then the UART driver crashes and restarts four times: the boot and
+/// each new driver take an ASID of the 7, so that a new generation begins over
+/// four processors; the shell still answers. VZ shows no output of the test
+/// init, so the probes of `smp_asid` do not run here; the kernel's log shows
+/// the generations that began.
+pub fn smp_asid() -> Result<(), String> {
+    let kernel = build(Variant::AsidProbe3)?;
+    let boot = build_boot_image("boot-vz.img", &VZ_PROGRAMS, BOOT_PROFILE)?;
+    let mut run = qemu::Run::start(
+        command_cpus(&kernel.image, &boot, crate::SMP_CPUS)?,
+        qemu::Input::Pipe,
+    )?;
+    let result = (|| {
+        let whole = |line: &'static str| move |l: &str| l == line;
+        run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), BOOT_TIMEOUT)?;
+        crate::smp_report(run.lines(), crate::SMP_CPUS)?;
+        run.expect(PROMPT, DIALOG_STEP)?;
+        for _ in 0..4 {
+            run.send("crash uart")?;
+            run.expect_line(CRASHING, whole(CRASHING), DIALOG_STEP)?;
+            run.expect_seen(RECONNECTED, DIALOG_STEP)?;
+            run.expect(PROMPT, DIALOG_STEP)?;
+        }
+        run.send("echo after the generations")?;
+        run.expect_line(
+            "after the generations",
+            whole("after the generations"),
+            DIALOG_STEP,
+        )
+    })();
+    let seen: Vec<String> = run
+        .lines()
+        .iter()
+        .filter(|l| l.starts_with("smp asid  generation "))
+        .cloned()
+        .collect();
+    run.stop();
+    stop_hint(result).map_err(|e| format!("SMP ASID probe on VZ: {e}"))?;
+    println!(
+        "smp asid on VZ with {} CPUs: ok; generations seen in the log: {seen:?}",
+        crate::SMP_CPUS
+    );
+    Ok(())
+}
+
 /// `cargo xtask console-restart-vz` (spec 13.5; spec 2, section 4): the
 /// driver starts and the shell connects; `echo` goes through the
 /// interrupt; `crash uart` ends the driver with a fault, and init resets
