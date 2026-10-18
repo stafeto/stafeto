@@ -157,6 +157,9 @@ const SLEEP_AFTER_NS: u64 = 2_000_000;
 /// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
 /// runs at most this many).
 const MAX_CPUS: usize = 8;
+/// The window over which a placement judges whether a process keeps its CPU
+/// busy (`Processes::place`).
+const LOAD_WINDOW_NS: u64 = 10_000_000;
 /// The first real-time signal (relibc's SIGRTMIN).
 const REALTIME_MIN: u8 = 35;
 /// SIGURG and SIGWINCH, the signals ignored by default besides SIGCHLD and SIGCONT.
@@ -259,6 +262,8 @@ struct Processes {
     records: Records<Handle<Process>>,
     /// The counter ticks the processes that ended ran (List's pool).
     retired_ticks: u64,
+    /// The CPU the last placement chose (`place`).
+    placed_last: u8,
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
     /// The ExecCommit of each record that waits for init, by the record's
@@ -334,6 +339,7 @@ impl Processes {
             level: 1,
             records: Records::new(),
             retired_ticks: 0,
+            placed_last: 0,
             tickets: [0; RECORDS],
             replacing: [const { None }; RECORDS],
             replace_queue: Queue::new(),
@@ -2863,10 +2869,9 @@ impl Processes {
 
     /// The CPU for the main thread of the image of the record `child`
     /// (spawn, fork and exec): the least busy of the CPUs its page allows
-    /// (`Page::cpus`, all when 0), lowest number first among equals. A
-    /// process is busy on its CPU when it ran ticks since the sample the
-    /// last placement or listing took (or has no sample yet, as a process
-    /// just made), the same measure a listing uses for a sleeping process.
+    /// (`Page::cpus`, all when 0), the next after the last placement among
+    /// equals. A process is busy on its CPU when it ran a quarter of the last
+    /// window of LOAD_WINDOW_NS, or is still in its first window.
     /// One CPU, or a machine whose CPUs the kernel does not tell, is CPU 0.
     fn place(&mut self, child: usize) -> u8 {
         let Ok(info) = sys::cpu_info(0) else {
@@ -2891,21 +2896,36 @@ impl Processes {
             let ticks = record
                 .carried_ticks
                 .saturating_add(sys::process_time(&record.process).unwrap_or(0));
-            let asleep = record.sample_at != 0
-                && ticks == record.sample_ticks
-                && now.saturating_sub(record.sample_at) >= SLEEP_AFTER_NS;
-            if ticks != record.sample_ticks || record.sample_at == 0 {
-                record.sample_ticks = ticks;
-                record.sample_at = now;
+            // The load of the process over a window of LOAD_WINDOW_NS: busy
+            // when it ran at least a quarter of it. The window the process
+            // starts with counts it as busy (it is starting), and a window
+            // closes at the first placement after its end, so that the
+            // answer does not depend on how often placements come.
+            if record.load_at == 0 {
+                record.load_at = now;
+                record.load_ticks = ticks;
+                record.load_busy = true;
+            } else if now.saturating_sub(record.load_at) >= LOAD_WINDOW_NS {
+                let ran = rt::time::ticks_to_ns(ticks.saturating_sub(record.load_ticks));
+                record.load_busy = ran.saturating_mul(4) >= now - record.load_at;
+                record.load_at = now;
+                record.load_ticks = ticks;
             }
-            if !asleep {
+            if record.load_busy {
                 busy[usize::from(record.cpu).min(MAX_CPUS - 1)] += 1;
             }
         }
-        (0..cpus)
+        // Among the least busy, the first after the CPU of the last
+        // placement: processes made one after the other, before any of
+        // them has run to show in the counts, still go to different CPUs.
+        let last = usize::from(self.placed_last);
+        let cpu = (1..=cpus)
+            .map(|step| (last + step) % cpus)
             .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
             .min_by_key(|&c| busy[c])
-            .map_or(0, |c| c as u8)
+            .map_or(0, |c| c as u8);
+        self.placed_last = cpu;
+        cpu
     }
 
     /// The piece `making` names for the place in `slot`, which loads the

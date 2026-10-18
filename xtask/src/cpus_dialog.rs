@@ -106,8 +106,9 @@ fn dialog(cpus: usize) -> Result<(), String> {
         )?;
         run.expect("# ", DIALOG_STEP)?;
         // One loop for each CPU, in the background; they are made one after
-        // the other, so that each placement sees the loops before it.
-        run.send("for i in 1 2 3 4 5 6 7 8; do [ $i -le $(nproc) ] && { while :; do :; done; } & [ $i -le $(nproc) ] && echo loop:$!; done")?;
+        // the other, so that each placement sees the loops before it, and
+        // nothing else is made in between (`nproc` runs before them).
+        run.send("n=$(nproc); for i in 1 2 3 4 5 6 7 8; do [ $i -le $n ] && { while :; do :; done; } & [ $i -le $n ] && echo loop:$!; done")?;
         let mut pids = Vec::new();
         for _ in 0..cpus {
             let line = run.expect_line("a loop", |l| l.starts_with("loop:"), DIALOG_STEP)?;

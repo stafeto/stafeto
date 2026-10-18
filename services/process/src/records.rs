@@ -136,6 +136,12 @@ pub struct Record<P> {
     pub sample_at: u64,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
+    /// The load window of `Processes::place`: the ticks and the time at its
+    /// start (0: none yet) and whether the process kept its CPU busy over
+    /// the last window that ended.
+    pub load_ticks: u64,
+    pub load_at: u64,
+    pub load_busy: bool,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -468,6 +474,9 @@ impl<P> Records<P> {
             sample_ticks: 0,
             sample_at: 0,
             cpu: 0,
+            load_ticks: 0,
+            load_at: 0,
+            load_busy: false,
             children_ticks: 0,
             carried_kernel: 0,
             children_kernel: 0,
