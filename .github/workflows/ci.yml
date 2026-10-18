@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # The release workflow runs the same groups on the commit of a tag.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}

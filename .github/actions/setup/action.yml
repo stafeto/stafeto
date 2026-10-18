@@ -2,6 +2,9 @@ name: setup
 description: The system packages, the QEMU of the developers' Macs and rustup, as the jobs of ci need them.
 
 inputs:
+  qemu:
+    description: Install QEMU (the release build runs no machine and leaves it out).
+    default: "true"
   build-qemu:
     description: Build QEMU when the cache has none (otherwise a cache miss is an error).
     default: "false"
@@ -26,6 +29,7 @@ runs:
 
     - name: Restore QEMU
       id: qemu
+      if: inputs.qemu == 'true'
       uses: actions/cache@v4
       with:
         path: ~/qemu
@@ -33,7 +37,7 @@ runs:
         fail-on-cache-miss: ${{ inputs.build-qemu != 'true' }}
 
     - name: Build QEMU
-      if: steps.qemu.outputs.cache-hit != 'true'
+      if: inputs.qemu == 'true' && steps.qemu.outputs.cache-hit != 'true'
       shell: bash
       run: |
         curl -fsSL "https://download.qemu.org/qemu-$QEMU_VERSION.tar.xz" -o "$RUNNER_TEMP/qemu.tar.xz"
@@ -47,6 +51,7 @@ runs:
         make install
 
     - name: Put QEMU on PATH
+      if: inputs.qemu == 'true'
       shell: bash
       run: |
         echo "$HOME/qemu/bin" >> "$GITHUB_PATH"

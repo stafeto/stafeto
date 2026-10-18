@@ -273,6 +273,7 @@ cargo xtask test         # host tests, boot checks, shell dialog, init and kerne
 cargo xtask ci           # formatting, clippy, licence checks, then everything test does; --jobs N as in test
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ; --minutes N runs HVF and VZ together
+cargo xtask dist         # release files of this version in target/dist (docs/release.md)
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART (`nano` starts GNU nano, `bash` GNU bash)
 cargo xtask os-test      # os-test's suites on relibc, a table in target/measure/
 cargo xtask open-posix   # the Open POSIX Test Suite (LTP 20260930) on relibc; --full runs every test; map in docs/open-posix-map.md

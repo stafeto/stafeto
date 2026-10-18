@@ -927,6 +927,19 @@ pub unsafe extern "C" fn stafeto_getgroups(size: c_int, out: *mut u32) -> c_int 
 /// relibc's struct utsname: six fields of 65 bytes.
 const UTS: usize = 65;
 
+/// The release field of `uname`: the system's version, from the workspace
+/// manifest at build time.
+const RELEASE: &str = env!("CARGO_PKG_VERSION");
+const _: () = assert!(RELEASE.len() < UTS);
+
+/// The version field of `uname`: the commit of a release build
+/// (`cargo xtask dist` sets STAFETO_COMMIT), `dev` in other builds.
+const BUILD: &str = match option_env!("STAFETO_COMMIT") {
+    Some(commit) => commit,
+    None => "dev",
+};
+const _: () = assert!(BUILD.len() < UTS);
+
 /// # Safety
 /// `out` is writable for a struct utsname.
 #[unsafe(no_mangle)]
@@ -935,8 +948,8 @@ pub unsafe extern "C" fn stafeto_uname(out: *mut [[u8; UTS]; 6]) -> c_int {
     for (field, text) in fields.iter_mut().zip([
         &b"stafeto"[..],
         b"stafeto",
-        b"0.1.0",
-        b"5a'",
+        RELEASE.as_bytes(),
+        BUILD.as_bytes(),
         b"aarch64",
         b"",
     ]) {
