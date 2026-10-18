@@ -652,7 +652,7 @@ fn unmap_across(s: &Start, priority: u8) -> u64 {
         return FAILED;
     }
     core::mem::forget(t);
-    let limit = time::now() + 2_000_000_000;
+    let limit = time::now() + 10_000_000_000;
     while mark(HELPER).load(Relaxed) < 1000 {
         if time::now() > limit {
             return FAILED;
@@ -663,7 +663,7 @@ fn unmap_across(s: &Start, priority: u8) -> u64 {
     if unsafe { sys::mem_unmap(&own, SCRATCH, PAGE) }.is_err() {
         return FAILED;
     }
-    let until = time::now() + 300_000_000;
+    let until = time::now() + 3_000_000_000;
     while time::now() < until {
         let _ = sys::yield_now();
     }

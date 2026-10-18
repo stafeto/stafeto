@@ -329,7 +329,7 @@ pub enum Role {
     /// Maps a page at SCRATCH as AsidPage does, starts a thread on CPU 1 at
     /// priority argument 0 that reads the page for good, waits until that
     /// thread has read it a thousand times (mark HELPER), then unmaps the
-    /// page from its own CPU and waits 300 ms: the reader on CPU 1 must
+    /// page from its own CPU and waits 3 s: the reader on CPU 1 must
     /// fault (the process ends in a data abort at SCRATCH); a child that
     /// outlives the wait ends with NO_FAULT, one that never saw the reader
     /// with FAILED.

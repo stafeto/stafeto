@@ -64,6 +64,9 @@ pub enum State {
 pub struct Link<T> {
     level: u8,
     queued: bool,
+    /// A tag the owner of the queue puts in the item, which a section on
+    /// another CPU reads to find the queue (kernel cleanup: the CPU).
+    owner: core::sync::atomic::AtomicU8,
     prev: Option<NonNull<T>>,
     next: Option<NonNull<T>>,
 }
@@ -74,6 +77,7 @@ impl<T> Link<T> {
         Link {
             level,
             queued: false,
+            owner: core::sync::atomic::AtomicU8::new(0),
             prev: None,
             next: None,
         }
@@ -81,6 +85,16 @@ impl<T> Link<T> {
 
     pub fn level(&self) -> u8 {
         self.level
+    }
+
+    /// The tag of the queue's owner (`set_owner`), 0 until one is set.
+    pub fn owner(&self) -> u8 {
+        self.owner.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_owner(&self, owner: u8) {
+        self.owner
+            .store(owner, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Moves an item that is in no list to `level`.
