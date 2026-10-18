@@ -6393,10 +6393,12 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     dialog_command(run, "awk '{print NF}' /proc/$$/statm", &["7"])?;
     dialog_command(run, "awk '{print ($1>0 && $1==$2)}' /proc/$$/statm", &["1"])?;
     dialog_command(run, "grep -c '^Name:.ash$' /proc/$$/status", &["1"])?;
+    // The shell waits for awk: asleep, or running when its sample says it
+    // ran more than a quarter of the time since the last (process service).
     dialog_command(
         run,
-        "awk '$1==\"State:\" {print $2 $3}' /proc/$$/status",
-        &["R(running)"],
+        "awk '$1==\"State:\" {print ($2==\"R\" || $2==\"S\")}' /proc/$$/status",
+        &["1"],
     )?;
     dialog_command(
         run,

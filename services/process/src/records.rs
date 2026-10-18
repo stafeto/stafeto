@@ -130,10 +130,12 @@ pub struct Record<P> {
     pub carried_kernel: u64,
     pub children_kernel: u64,
     /// The ticks its process had run at the last listing that sampled it,
-    /// and the time of that sample (the scale of the kernel's timers): a
-    /// process that ran none since a sample some time ago is asleep.
+    /// the time of that sample (the scale of the kernel's timers) and what
+    /// the sample said: a process that ran only a small share of the time
+    /// since a sample some time ago is asleep (`sleeping`).
     pub sample_ticks: u64,
     pub sample_at: u64,
+    pub sample_asleep: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
     /// The index of its parent's record while the parent lives.
@@ -467,6 +469,7 @@ impl<P> Records<P> {
             carried_ticks: 0,
             sample_ticks: 0,
             sample_at: 0,
+            sample_asleep: false,
             cpu: 0,
             children_ticks: 0,
             carried_kernel: 0,
