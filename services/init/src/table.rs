@@ -1875,6 +1875,7 @@ mod tests {
             let posix = table.iter().filter(|r| {
                 [
                     "busybox-probe",
+                    "ash-launcher",
                     "posix-probe",
                     "posix-abi-probe",
                     "posix-procs",
