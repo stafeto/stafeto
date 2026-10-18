@@ -1423,6 +1423,7 @@ commands:
   posix-interrupt-vz verify live IPC interruption on the Virtio console on Apple VZ
   console-restart-vz crash the Virtio console's driver on Apple VZ; init stops the
             device and restarts it
+  clock-vz  check that the clock starts at the time vz-run writes into the image;
   console-early-exit-vz end the Virtio console's driver before it decodes its BARs;
             init stops the function and restarts it
   posix-shared verify cross-thread Rust POSIX file and directory state
@@ -1690,6 +1691,7 @@ fn main() {
         Some("posix-interrupt-vz") => posix_interrupt_probe(true),
         Some("console-restart-vz") => vz::console_restart(),
         Some("console-early-exit-vz") => vz::console_early_exit(),
+        Some("clock-vz") => vz::clock(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
