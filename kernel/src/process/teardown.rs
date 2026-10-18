@@ -239,11 +239,15 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
         let continued = control::cancel(process);
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
-        if !continued {
+        if continued == control::Continuation::None {
             refs(process).take();
         }
-        let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-        cleanup::enqueue(item, Object::Process(process), stage_level(process));
+        // A continuation whose portion runs keeps the reference and the
+        // item: its next section queues the process (`control::portion`).
+        if continued != control::Continuation::Running {
+            let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+            cleanup::enqueue(item, Object::Process(process), stage_level(process));
+        }
     }
 }
 
@@ -254,7 +258,7 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
 ///
 /// # Safety
 /// `process` is alive; only the fields are read.
-unsafe fn stage_level(process: NonNull<Process>) -> u8 {
+pub(super) unsafe fn stage_level(process: NonNull<Process>) -> u8 {
     let p = process.as_ptr();
     // SAFETY: the caller's promise.
     unsafe {

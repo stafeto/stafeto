@@ -314,6 +314,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::suspended_crowds_stop_again_and_die,
     ),
     (
+        "continuation_ended_after_the_queue_gave_it_up",
+        calls::continuation_ended_after_the_queue_gave_it_up,
+    ),
+    (
+        "continuation_ended_between_its_sections",
+        calls::continuation_ended_between_its_sections,
+    ),
+    (
+        "continuation_ended_after_its_last_section",
+        calls::continuation_ended_after_its_last_section,
+    ),
+    (
         "suspended_reply_keeps_its_result",
         calls::suspended_reply_keeps_its_result,
     ),

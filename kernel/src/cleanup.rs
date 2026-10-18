@@ -192,9 +192,10 @@ pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
 }
 
 /// Takes an item's work out of the queue in O(1): true when it was queued.
-/// False when the owner's portion took it off the queue already, which
-/// happens with no hold of `OBJ` (`portion`): that portion runs the work
-/// and keeps the reference the item stood for.
+/// False when the owner's portion took it off the queue already, with its
+/// work, which happens with no hold of `OBJ` (`portion`): that portion
+/// runs the work and keeps the reference the item stood for, and the item
+/// is not in the queue until the portion queues it again.
 ///
 /// # Safety
 /// `item` is alive; its work belongs to the object, which is at its stage
@@ -343,22 +344,23 @@ pub fn portion() {
         lock_own_queue().late = true;
     }
     let start = timer::now();
-    let taken = {
+    let (work, level) = {
         let mut q = lock_own_queue();
-        q.items.top().map(|level| {
-            let item = q.items.first(level).expect("a level with its bit set");
-            // SAFETY: a queued item is alive and in this queue.
-            unsafe { q.items.remove(item) };
-            q.len -= 1;
-            (item, level)
-        })
+        let Some(level) = q.items.top() else {
+            return;
+        };
+        let item = q.items.first(level).expect("a level with its bit set");
+        // SAFETY: a queued item is alive and in this queue; its work is
+        // taken in the same hold, so that an item that is not queued has no
+        // work either (`remove` says false then).
+        let work = unsafe {
+            q.items.remove(item);
+            (*item.as_ptr()).work.take()
+        };
+        q.len -= 1;
+        (work.expect("queued work"), level)
     };
-    let Some((item, level)) = taken else {
-        return;
-    };
-    // SAFETY: the item's object stays alive until its portion, which is
-    // this one; the item is not used afterwards.
-    let work = unsafe { (*item.as_ptr()).work.take() }.expect("queued work");
+    crate::testpoint::portion_taken();
     crate::obj::serving(crate::obj::ENTRY_CLEANUP);
     // SAFETY: nothing refers to the object any more.
     unsafe {
