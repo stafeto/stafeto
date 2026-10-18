@@ -206,14 +206,14 @@ pub fn ncdu_dialog() -> Result<(), String> {
         // The files of /proc are on a file system of their own (their device
         // number is not the one of `/proc` itself): with `-x` ncdu marks each
         // row `>` and counts no size; without it no row has the mark.
-        let (other, _) = browse(&mut run, "ncdu -x /proc", &["uptime", "Items: 8"])?;
+        let (other, _) = browse(&mut run, "ncdu -x /proc", &["uptime", "Items: 9"])?;
         let marked = other.matches("> 0.0 B [").count();
         if marked < 5 {
             return Err(format!(
                 "ncdu -x /proc marks {marked} rows as another file system: {other:?}"
             ));
         }
-        let (same, _) = browse(&mut run, "ncdu /proc", &["uptime", "Items: 8"])?;
+        let (same, _) = browse(&mut run, "ncdu /proc", &["uptime", "Items: 9"])?;
         if same.contains("> 0.0 B [") {
             return Err(format!(
                 "ncdu /proc marks rows as another file system: {same:?}"
