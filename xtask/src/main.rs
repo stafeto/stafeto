@@ -7333,6 +7333,19 @@ fn ash_shell() -> Result<(), String> {
 /// shell, the kernel with its symbols, the sources of the GPL packages, the
 /// SBOM and SHA256SUMS.
 fn dist() -> Result<(), String> {
+    // The commit goes into the version field of `uname`; the builds below
+    // see it through their environment.
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .current_dir(root())
+        .output()
+        .map_err(|e| format!("git rev-parse: {e}"))?;
+    let commit = String::from_utf8_lossy(&commit.stdout).trim().to_string();
+    if commit.is_empty() {
+        return Err("git rev-parse gave no commit".into());
+    }
+    // SAFETY: xtask is one thread here, before any build starts.
+    unsafe { std::env::set_var("STAFETO_COMMIT", &commit) };
     relibc()?;
     busybox_build()?;
     nano_build()?;

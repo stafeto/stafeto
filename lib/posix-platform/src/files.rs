@@ -932,6 +932,14 @@ const UTS: usize = 65;
 const RELEASE: &str = env!("CARGO_PKG_VERSION");
 const _: () = assert!(RELEASE.len() < UTS);
 
+/// The version field of `uname`: the commit of a release build
+/// (`cargo xtask dist` sets STAFETO_COMMIT), `dev` in other builds.
+const BUILD: &str = match option_env!("STAFETO_COMMIT") {
+    Some(commit) => commit,
+    None => "dev",
+};
+const _: () = assert!(BUILD.len() < UTS);
+
 /// # Safety
 /// `out` is writable for a struct utsname.
 #[unsafe(no_mangle)]
@@ -941,7 +949,7 @@ pub unsafe extern "C" fn stafeto_uname(out: *mut [[u8; UTS]; 6]) -> c_int {
         &b"stafeto"[..],
         b"stafeto",
         RELEASE.as_bytes(),
-        b"5a'",
+        BUILD.as_bytes(),
         b"aarch64",
         b"",
     ]) {
