@@ -21,8 +21,6 @@ dirs = [
   "/usr/share/terminfo/x",
 ]
 files = [
-  # The terminal of the programs that draw on the console.
-  "/etc/profile = bytes:profile",
   "/usr/share/terminfo/l/linux = terminfo:linux",
   "/usr/share/terminfo/v/vt100 = terminfo:vt100",
   "/usr/share/terminfo/x/xterm = terminfo:xterm",

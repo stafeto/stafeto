@@ -87,7 +87,11 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # call of the layer (platform interface 20); tagged pin-403a3c56.
 # getrusage and times give the system time (stafeto_cpu_system_ns) apart from
 # the user time; tagged pin-cf8e95e9.
-COMMIT = "cf8e95e90ddf605f63d876f17bed26879c71b1a8"
+# Goal I2 (shell): putenv puts a new variable where the list of environ ends
+# (the idiom of clearenv moves the end ahead of the last element), mkstemp,
+# mkostemps and mkdtemp end with the errno of a failed try (a missing
+# directory gave EEXIST), abort prints no line; tagged pin-1535ddaf.
+COMMIT = "1535ddaf445b1164dbc99e2c170c894b1697b814"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -248,12 +248,13 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 17] = [
+const SYSTEM_PATHS: [&str; 18] = [
     "/bin",
     "/libexec",
     "/libexec/ramfs",
     "/dev",
     "/proc",
+    "/root",
     "/var",
     "/var/log",
     "/var/run",
@@ -278,7 +279,6 @@ fn is_system(path: &str) -> bool {
 fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
         "inputrc" => Ok(INPUTRC),
-        "profile" => Ok(b"export TERM=xterm-256color\n"),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -343,6 +343,12 @@ fn shell_files() -> Result<Vec<RootFile>, String> {
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
+        // The home of root (the account's directory in /etc/passwd), where
+        // htop and the other programs keep their settings.
+        RootFile {
+            mode: 0o700,
+            ..dir("/root")
+        },
         dir("/var"),
         dir("/var/log"),
         dir("/var/run"),
