@@ -330,6 +330,9 @@ static LOCK_GO: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
 static LOCK_DONE: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
 /// The longest wait for OBJ any CPU saw in the probe, in ticks.
 static LOCK_WAIT: AtomicU64 = AtomicU64::new(0);
+/// The sections all CPUs finished so far in the probe of OBJ: the watch
+/// of CPU 0 looks for a stretch of WAIT_SECONDS in which it did not move.
+static LOCK_SECTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Sections each CPU takes in the probe of OBJ.
 const LOCK_ROUNDS: u64 = 2_000;
@@ -363,6 +366,7 @@ fn lock_rounds(me: usize) {
             word.write_volatile(seen + 1);
         }
         drop(section);
+        LOCK_SECTIONS.fetch_add(1, Ordering::Relaxed);
     }
     LOCK_WAIT.fetch_max(longest, Ordering::Relaxed);
     LOCK_DONE[me].store(1, Ordering::Release);
@@ -371,7 +375,12 @@ fn lock_rounds(me: usize) {
 /// The probe of the lock OBJ, on CPU 0, with every CPU up (aarch64.md, probe
 /// 4): each CPU takes LOCK_ROUNDS sections at once, and the counter that
 /// they add to must come out whole. Stops the kernel when it does not, or
-/// when a CPU does not finish.
+/// when no CPU finishes a section in WAIT_SECONDS before all are done: a
+/// ticket lock hands over in order, so the time of the probe grows with the
+/// stalls of the host (a CPU that the host does not run holds up all the
+/// CPUs behind it, and an emulator on a loaded host stalls them for
+/// milliseconds), while a lock that is lost or held for good stops the
+/// sections for good.
 pub fn lock_probe() {
     let cpus = cpus();
     if cpus < 2 {
@@ -382,9 +391,15 @@ pub fn lock_probe() {
         gic::send_sgi(to, SGI_LOCK);
     }
     lock_rounds(0);
-    let limit = timer::now() + WAIT_SECONDS * timer::frequency();
+    let mut seen = LOCK_SECTIONS.load(Ordering::Relaxed);
+    let mut moved = timer::now();
     while (0..cpus).any(|c| LOCK_DONE[c].load(Ordering::Acquire) == 0) {
-        if timer::now() > limit {
+        let now = timer::now();
+        let sections = LOCK_SECTIONS.load(Ordering::Relaxed);
+        if sections != seen {
+            seen = sections;
+            moved = now;
+        } else if now - moved > WAIT_SECONDS * timer::frequency() {
             panic!("lock probe: a CPU did not finish its rounds");
         }
         core::hint::spin_loop();
