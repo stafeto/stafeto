@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# ncdu 1.x (C, ncurses).
+# Format: docs/packages.md.
+
+name = "ncdu"
+version = "1.22"
+kind = "addon"
+url = "https://dev.yorhel.nl/download/ncdu-1.22.tar.gz"
+sha256 = "0ad6c096dc04d5120581104760c01b8f4e97d4191d6c9ef79654fa3c691a176b"
+license = "MIT"
+depends = ["busybox", "ncurses"]
+build = "tools/build-ncdu.py"
+program = "ncdu"
+files = [
+  "/bin/ncdu = elf:ncdu",
+]

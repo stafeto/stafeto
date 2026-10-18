@@ -20,7 +20,7 @@ Unknown keys are refused.
 | `url` | The https URL of the source archive. |
 | `sha256` | SHA-256 of the archive, 64 lowercase hex digits. |
 | `license` | SPDX expression of the licence. |
-| `depends` | Names of the packages it needs (nano and htop need ncurses). |
+| `depends` | Names of the packages it needs (nano, htop and ncdu need ncurses). |
 | `build` | The build script, from the workspace root. |
 | `program` | The image program its build links, if it has one of its own. |
 | `dirs` | Directories only this package needs. |

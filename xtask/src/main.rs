@@ -41,6 +41,7 @@ mod native_scopes;
 #[cfg(test)]
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
 mod native_stop_barrier_tests;
+mod ncdu_dialog;
 mod openposix;
 mod ostest;
 mod packages;
@@ -797,7 +798,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 3] = [
 ];
 /// How the program a package names (`program` in packages/<name>.toml) is
 /// built for the image: its stack and the features of its crate.
-const PACKAGE_PROGRAMS: [ImageProgram; 4] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -807,6 +808,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 4] = [
     ("bash", "bash", POSIX_STACK_SIZE, &["interactive"]),
     ("htop", "htop", POSIX_STACK_SIZE, &["interactive", "procfs"]),
     ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
+    ("ncdu", "ncdu", POSIX_STACK_SIZE, &["interactive"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -1469,6 +1471,7 @@ commands:
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
+  ncdu-dialog  check ncdu in an ash dialog in QEMU: directory sizes, hard links counted once, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
@@ -1702,6 +1705,7 @@ fn main() {
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
+        Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -2134,6 +2138,20 @@ fn write_elf_image(
     if let Some((licence, source)) = &htop_files {
         list.push((HTOP_LICENSE, licence.as_slice()));
         list.push((HTOP_SOURCE, source.as_bytes()));
+    }
+    // An image with ncdu (MIT) carries its licence and where the exact source
+    // is.
+    let ncdu_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "ncdu"))
+    {
+        Some(ncdu_dialog::ncdu_terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, source)) = &ncdu_files {
+        list.push((NCDU_LICENSE, licence.as_slice()));
+        list.push((NCDU_SOURCE, source.as_bytes()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3051,6 +3069,9 @@ const NANO_SOURCE: &str = "NANO-SOURCE";
 /// htop's licence and the note of its source in an image.
 const HTOP_LICENSE: &str = "HTOP-LICENSE";
 const HTOP_SOURCE: &str = "HTOP-SOURCE";
+/// ncdu's licence and the note of its source in an image.
+const NCDU_LICENSE: &str = "NCDU-LICENSE";
+const NCDU_SOURCE: &str = "NCDU-SOURCE";
 
 /// The licence texts of the ready-made utilities in an image, and the symbol
 /// a BusyBox that holds them has.
@@ -6479,6 +6500,7 @@ fn ash_dialog() -> Result<(), String> {
         link("mktemp"),
         ("-rwxr-xr-x", "1".to_string(), "nano", elf_size("nano")?),
         link("nc"),
+        ("-rwxr-xr-x", "1".to_string(), "ncdu", elf_size("ncdu")?),
         link("sh"),
         link("sleep"),
         link("timeout"),
@@ -7444,6 +7466,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash-dialog", ash_dialog),
         job("nano-dialog", nano_dialog::nano_dialog),
         job("htop-dialog", htop_dialog::htop_dialog),
+        job("ncdu-dialog", ncdu_dialog::ncdu_dialog),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
         job("bash-dialog", bash_dialog::bash_dialog),
