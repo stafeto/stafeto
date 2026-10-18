@@ -91,7 +91,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (the idiom of clearenv moves the end ahead of the last element), mkstemp,
 # mkostemps and mkdtemp end with the errno of a failed try (a missing
 # directory gave EEXIST), abort prints no line; tagged pin-1535ddaf.
-COMMIT = "1535ddaf445b1164dbc99e2c170c894b1697b814"
+# getrusage and times read the user and the system time in one call of the layer
+# (platform interface 21); tagged pin-920d3cb6.
+COMMIT = "920d3cb6ccd84e140fdfe5bf2ab2033e13085cbf"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
