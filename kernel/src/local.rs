@@ -47,6 +47,9 @@ pub struct Local {
     pub deferred: core::sync::atomic::AtomicU32,
     /// The start of the open entry interval and the longest one (sched).
     pub entry: UnsafeCell<(u64, u64)>,
+    /// The time this CPU has slept and spent in the kernel, which other CPUs
+    /// read (object_info CPU).
+    pub time: CpuTime,
     /// The items of the cleanup queue for the firings of the levels of
     /// timers, level 1 first (timer). Zeros until `init`: an `Item` is not
     /// all zeros, and a `Local` of zeros lives in .bss, outside the image file.
@@ -70,8 +73,81 @@ impl Local {
             outbox: Own::new(crate::cmd::Outbox::new()),
             deferred: core::sync::atomic::AtomicU32::new(0),
             entry: UnsafeCell::new((0, 0)),
+            time: CpuTime::new(),
             firings: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; LEVELS],
         }
+    }
+}
+
+/// Bit 63 of `CpuTime::idle`: the CPU sleeps, and the low bits hold the
+/// ticks it slept before less the counter when it went to sleep, so that a
+/// reader on another CPU adds its own counter (as `Thread::user_ticks` does).
+const ASLEEP: u64 = 1 << 63;
+
+/// What one CPU counts about its time, in counter ticks. Only the owner
+/// writes the words, each with one store (no lock, no read-modify-write
+/// instruction), and any CPU reads them (object_info CPU).
+pub struct CpuTime {
+    /// The counter when the CPU started, 0 for the boot CPU.
+    since: core::sync::atomic::AtomicU64,
+    /// The sleep in `wfi`, with `ASLEEP` while it lasts.
+    idle: core::sync::atomic::AtomicU64,
+    /// The entries from EL0, from the entry to its first poll for an
+    /// interrupt (the system time of the threads it served).
+    system: core::sync::atomic::AtomicU64,
+}
+
+impl CpuTime {
+    const fn new() -> CpuTime {
+        CpuTime {
+            since: core::sync::atomic::AtomicU64::new(0),
+            idle: core::sync::atomic::AtomicU64::new(0),
+            system: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The CPU starts at `now`.
+    pub fn started(&self, now: u64) {
+        self.since.store(now, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The CPU goes to sleep at `now`.
+    pub fn sleeps(&self, now: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.idle
+            .store(self.idle.load(Relaxed).wrapping_sub(now) | ASLEEP, Relaxed);
+    }
+
+    /// The CPU woke at `now`.
+    pub fn woke(&self, now: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.idle
+            .store(self.idle.load(Relaxed).wrapping_add(now) & !ASLEEP, Relaxed);
+    }
+
+    /// An entry from EL0 lasted `ticks` up to its poll.
+    #[inline(always)]
+    pub fn entered(&self, ticks: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.system
+            .store(self.system.load(Relaxed).wrapping_add(ticks), Relaxed);
+    }
+
+    /// The ticks since the start, the ticks asleep and the ticks of entries
+    /// at `now`: the sleep that lasts counts up to `now`.
+    pub fn read(&self, now: u64) -> [u64; 3] {
+        use core::sync::atomic::Ordering::Relaxed;
+        let idle = self.idle.load(Relaxed);
+        let idle = if idle & ASLEEP != 0 {
+            idle.wrapping_add(now) & !ASLEEP
+        } else {
+            idle
+        };
+        [
+            now.saturating_sub(self.since.load(Relaxed)),
+            idle,
+            self.system.load(Relaxed),
+        ]
     }
 }
 

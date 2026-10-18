@@ -104,8 +104,9 @@ pub fn entry_polled() {
 /// and the decision.
 #[inline(always)]
 fn entry_polled_at(now: u64) {
+    let cpu = local();
     // SAFETY: single core with interrupts masked, as above.
-    let timing = unsafe { &mut *local().entry.get() };
+    let timing = unsafe { &mut *cpu.entry.get() };
     if timing.0 != 0 {
         // The counter never runs backwards: `now` was read after the entry's.
         let elapsed = now.wrapping_sub(timing.0);
@@ -113,6 +114,7 @@ fn entry_polled_at(now: u64) {
             timing.1 = elapsed;
         }
         timing.0 = 0;
+        cpu.time.entered(elapsed);
     }
 }
 
@@ -209,6 +211,15 @@ static QUANTUM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 pub fn init_cpu() {
     let quantum = QUANTUM.load(core::sync::atomic::Ordering::Relaxed);
     local().sched.lock().s.set_quantum(quantum);
+    local().time.started(timer::now());
+}
+
+/// What CPU `index` counts about its time at `now` (`CpuTime::read`) and
+/// the number of CPUs that are up, None for a CPU past them (object_info
+/// CPU). Takes no lock: the words are the owner's, read with one load each.
+pub fn cpu_time(index: usize, now: u64) -> Option<(usize, [u64; 3])> {
+    let cpus = crate::smp::cpus();
+    (index < cpus).then(|| (cpus, arch::cpu::block(index).local.time.read(now)))
 }
 
 /// A stopped thread becomes ready: the tail of its level with a new
@@ -854,10 +865,12 @@ fn sleep() {
     crate::mm::aspace::leave();
     crate::testpoint::idle();
     let slept = timer::now();
+    local().time.sleeps(slept);
     crate::qsbr::idle();
     let ack = gic::wait();
     crate::qsbr::awake();
     let woke = timer::now();
+    local().time.woke(woke);
     {
         let mut g = local().sched.lock();
         g.idle += woke.saturating_sub(slept);

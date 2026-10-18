@@ -154,6 +154,9 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
 /// How long a process must have run no ticks, after a sample, for the listing
 /// to call it asleep (`list`).
 const SLEEP_AFTER_NS: u64 = 2_000_000;
+/// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
+/// runs at most this many).
+const MAX_CPUS: usize = 8;
 /// The first real-time signal (relibc's SIGRTMIN).
 const REALTIME_MIN: u8 = 35;
 /// SIGURG and SIGWINCH, the signals ignored by default besides SIGCHLD and SIGCONT.
@@ -2858,6 +2861,54 @@ impl Processes {
         }
     }
 
+    /// The CPU for the main thread of the image of the record `child`
+    /// (spawn, fork and exec): the least busy of the CPUs its page allows
+    /// (`Page::cpus`, all when 0), lowest number first among equals. A
+    /// process is busy on its CPU when it ran ticks since the sample the
+    /// last placement or listing took (or has no sample yet, as a process
+    /// just made), the same measure a listing uses for a sleeping process.
+    /// One CPU, or a machine whose CPUs the kernel does not tell, is CPU 0.
+    fn place(&mut self, child: usize) -> u8 {
+        let Ok(info) = sys::cpu_info(0) else {
+            return 0;
+        };
+        let cpus = (info.cpus as usize).clamp(1, MAX_CPUS);
+        if cpus == 1 {
+            return 0;
+        }
+        let allowed = self
+            .pages
+            .page(child)
+            .map_or(0, |page| page.cpus.load(core::sync::atomic::Ordering::Acquire));
+        let now = Self::timer_now();
+        let mut busy = [0u32; MAX_CPUS];
+        for i in (0..RECORDS).filter(|&i| i != child) {
+            let Some(record) = self.records.get_mut(i) else {
+                continue;
+            };
+            if matches!(record.state, State::Zombie(_)) {
+                continue;
+            }
+            let ticks = record
+                .carried_ticks
+                .saturating_add(sys::process_time(&record.process).unwrap_or(0));
+            let asleep = record.sample_at != 0
+                && ticks == record.sample_ticks
+                && now.saturating_sub(record.sample_at) >= SLEEP_AFTER_NS;
+            if ticks != record.sample_ticks || record.sample_at == 0 {
+                record.sample_ticks = ticks;
+                record.sample_at = now;
+            }
+            if !asleep {
+                busy[usize::from(record.cpu).min(MAX_CPUS - 1)] += 1;
+            }
+        }
+        (0..cpus)
+            .filter(|&c| allowed == 0 || allowed >> c & 1 != 0)
+            .min_by_key(|&c| busy[c])
+            .map_or(0, |c| c as u8)
+    }
+
     /// The piece `making` names for the place in `slot`, which loads the
     /// record in `child` for the record in `parent`: the next piece, or
     /// None after the last.
@@ -2868,6 +2919,11 @@ impl Processes {
         parent: usize,
         making: &Making,
     ) -> Result<Option<Work>, abi::Error> {
+        let cpu = if matches!(making.work, Work::Thread) {
+            self.place(child)
+        } else {
+            0
+        };
         let incoming = self
             .loaders
             .get(slot)
@@ -2900,8 +2956,11 @@ impl Processes {
                 .map_data(&make::own(), process)
                 .map(|()| Some(Work::Thread)),
             Work::Thread => {
-                let thread = image.thread(process, making.level)?;
+                let thread = image.thread(process, making.level, cpu)?;
                 let started = sys::thread_start(&thread);
+                if let Some(record) = self.records.get_mut(child) {
+                    record.cpu = cpu;
+                }
                 let place = self.loaders.get_mut(slot).ok_or(abi::Error::BadState)?;
                 place.held.thread = Some(thread);
                 place.stage = Stage::Booting;
@@ -2993,6 +3052,10 @@ impl Processes {
                                 _ => 0,
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
+                            cpu: u32::from(record.cpu),
+                            cpus: self.pages.page(i).map_or(0, |page| {
+                                page.cpus.load(core::sync::atomic::Ordering::Acquire)
+                            }),
                             nice: i32::from(record.nice),
                             ticks: record
                                 .carried_ticks

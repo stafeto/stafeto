@@ -91,7 +91,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (the idiom of clearenv moves the end ahead of the last element), mkstemp,
 # mkostemps and mkdtemp end with the errno of a failed try (a missing
 # directory gave EEXIST), abort prints no line; tagged pin-1535ddaf.
-COMMIT = "1535ddaf445b1164dbc99e2c170c894b1697b814"
+# Goal #415 (visible CPUs): sysconf gives the CPUs that are up, sched_getaffinity
+# and sched_setaffinity go to the layer, sched_getcpu, pthread_setaffinity_np and
+# pthread_getaffinity_np, CPU_COUNT counts the whole set; tagged pin-d32b2b34.
+COMMIT = "d32b2b3450c6c09e444e5d29e36eff8e6d24c9b0"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

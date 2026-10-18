@@ -69,6 +69,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_IRQ => irq_info(thread, a),
         abi::INFO_LABEL => label_info(thread, a),
         abi::INFO_LOG => log_info(thread, a),
+        abi::INFO_CPU => cpu_info(a),
         _ => Err(Error::InvalidArgs),
     }
 }
@@ -226,6 +227,23 @@ fn log_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         let [count, lost, left] = batch.to_words();
         Ok(Values::new(&[count, lost, left, next + 1]))
     }
+}
+
+/// CPU: x0 and x1's reserved word are 0 and x2 is a CPU that is up; its
+/// counts, read without a lock (abi::INFO_CPU): the CPUs up, the ticks
+/// since it started, asleep and in entries, and the caller's CPU.
+fn cpu_info(a: &Args) -> Result<Values, Error> {
+    reserved_arg(a[0])?;
+    let index = usize::try_from(a[2]).map_err(|_| Error::InvalidArgs)?;
+    let (cpus, [since, idle, system]) =
+        sched::cpu_time(index, crate::arch::timer::now()).ok_or(Error::InvalidArgs)?;
+    Ok(Values::new(&[
+        cpus as u64,
+        since,
+        idle,
+        system,
+        crate::arch::cpu::this().index() as u64,
+    ]))
 }
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's

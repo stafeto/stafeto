@@ -15,6 +15,7 @@ pub mod change;
 pub mod clock;
 mod close_driver;
 pub mod cpu;
+pub mod cpus;
 mod drain_driver;
 mod drain_hooks;
 #[cfg(feature = "close-probe")]

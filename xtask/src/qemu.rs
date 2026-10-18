@@ -521,6 +521,12 @@ impl Run {
         }
     }
 
+    /// All the output so far as lines, the one that no LF ended yet (a screen
+    /// that a program draws with cursor movements) included.
+    pub fn text(&self) -> Vec<String> {
+        self.transcript.lines()
+    }
+
     /// The lines that ended so far, a CR before the LF cut.
     pub fn lines(&self) -> &[String] {
         &self.lines

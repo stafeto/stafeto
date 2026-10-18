@@ -391,6 +391,24 @@ pub fn thread_at(
     thread_on(process, entry, stack, x0, priority, policy, 0)
 }
 
+/// `thread_at` on CPU `cpu` (0 and up; the CPU of the caller when `cpu` is
+/// not one that is up): the first thread of a program the caller puts on a
+/// CPU of its choice.
+pub fn thread_placed(
+    process: &Handle<Process>,
+    entry: u64,
+    stack: u64,
+    x0: u64,
+    priority: u8,
+    policy: Policy,
+    cpu: u8,
+) -> Result<Handle<Thread>, Error> {
+    match thread_on(process, entry, stack, x0, priority, policy, cpu.saturating_add(1)) {
+        Err(Error::InvalidArgs) if cpu != 0 => thread_on(process, entry, stack, x0, priority, policy, 0),
+        placed => placed,
+    }
+}
+
 /// `thread_at` on CPU `cpu` - 1 (thread_create x5, abi::THREAD_CPU_SHIFT);
 /// 0 is the CPU of the caller.
 pub fn thread_on(

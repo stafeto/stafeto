@@ -59,11 +59,12 @@ def relibc_commit() -> str:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.COMMIT
-# libbb keeps BusyBox's own list of objects but for the one that needs
-# sched_getaffinity; objects a program does not name stay out of the link.
+# libbb keeps BusyBox's own list of objects (alloc_affinity.o, the one that
+# reads the mask of sched_getaffinity, is among them: nproc and taskset
+# use it); objects a program does not name stay out of the link.
 # Nothing of BusyBox's own is written here: an applet BusyBox lacks is not
 # provided (login-probe, the guest test of the C library, is the exception).
-EXCLUDED_OBJECTS = ("alloc_affinity.o",)
+EXCLUDED_OBJECTS = ()
 # The small build keeps the objects of libbb it always had: the others pull
 # in more of relibc (syslog, and with it the time zone data) than the probes
 # have room for.
@@ -147,6 +148,9 @@ UTILITIES = tuple(name.upper() for name in (
     # and the files of each process.
     "resize feature_resize_print top feature_top_cpu_usage_percentage feature_top_cpu_global_percents "
     "feature_top_interactive "
+    # The CPUs: nproc counts the mask of sched_getaffinity, taskset reads and
+    # sets it (-p, -c and a command to run under a mask).
+    "nproc taskset feature_taskset_fancy feature_taskset_cpulist "
     "").split()) + OWN_CONFIGS
 
 

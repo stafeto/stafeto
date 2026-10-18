@@ -158,11 +158,17 @@ impl Image {
         // The mapping holds the object; the loader unmaps it at its end.
     }
 
-    /// The fourth piece: the loader's thread at `priority`, its stack pointer
-    /// at the top of the data object. The thread waits for thread_start.
-    pub fn thread(&self, process: &Handle<Process>, priority: u8) -> Result<Handle<Thread>, Error> {
+    /// The fourth piece: the loader's thread at `priority` on CPU `cpu`, its
+    /// stack pointer at the top of the data object. The thread waits for
+    /// thread_start. A CPU that is not up puts it where the service runs.
+    pub fn thread(
+        &self,
+        process: &Handle<Process>,
+        priority: u8,
+        cpu: u8,
+    ) -> Result<Handle<Thread>, Error> {
         // x0: the loader's level, for the slots of its start channel.
-        loader::thread_at(
+        loader::thread_placed(
             process,
             self.layout.entry,
             self.data_at + self.data_len,
@@ -171,6 +177,7 @@ impl Image {
             // The program's first thread: SCHED_OTHER, round robin (spec
             // 2), as a forked child's thread goes on.
             Policy::RoundRobin,
+            cpu,
         )
     }
 

@@ -30,6 +30,7 @@ mod service_sample;
 mod bash_dialog;
 mod ci;
 mod clock_probe;
+mod cpus_dialog;
 mod disasm;
 mod entropy;
 mod htop_dialog;
@@ -1469,6 +1470,8 @@ commands:
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
+  cpus-dialog [N]  check the CPUs in an ash dialog on N CPUs (4 by default): nproc, /proc/stat,
+            the spread of loops over the CPUs, taskset, htop
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
@@ -1702,6 +1705,12 @@ fn main() {
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
+        Some("cpus-dialog") => args
+            .get(1)
+            .map_or(Ok(SMP_CPUS), |n| {
+                n.parse().map_err(|_| format!("{n}: not a number"))
+            })
+            .and_then(cpus_dialog::cpus_dialog),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -7444,6 +7453,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("ash-dialog", ash_dialog),
         job("nano-dialog", nano_dialog::nano_dialog),
         job("htop-dialog", htop_dialog::htop_dialog),
+        job("cpus-dialog smp 1", || cpus_dialog::cpus_dialog(1)),
+        job("cpus-dialog smp 4", || cpus_dialog::cpus_dialog(SMP_CPUS)),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
         job("bash-dialog", bash_dialog::bash_dialog),

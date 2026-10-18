@@ -193,20 +193,25 @@ pub unsafe extern "C" fn stafeto_getdents(
     let result = number(fd).and_then(|number| {
         // The directory /proc lists the live processes (procfs).
         #[cfg(feature = "procfs")]
-        if let Ok(info) = posix_abi::names::fstatat(fd, None, 0)
-            && posix_abi::procfs::is_directory(&info)
-        {
-            let pid = posix_abi::shared::held(number, |_, target| {
-                Ok(match target {
-                    Target::Ram(ram) => {
-                        posix_abi::procfs::directory_pid(ram.description_slot(), ram.generation())
-                    }
-                    _ => None,
+        if let Ok(info) = posix_abi::names::fstatat(fd, None, 0) {
+            // The directory of the CPUs lists the ones that are up.
+            if posix_abi::cpus::is_directory(&info) {
+                return posix_abi::cpus::entries(out, position);
+            }
+            if posix_abi::procfs::is_directory(&info) {
+                let pid = posix_abi::shared::held(number, |_, target| {
+                    Ok(match target {
+                        Target::Ram(ram) => posix_abi::procfs::directory_pid(
+                            ram.description_slot(),
+                            ram.generation(),
+                        ),
+                        _ => None,
+                    })
                 })
-            })
-            .ok()
-            .flatten();
-            return posix_abi::procfs::entries(out, position, pid);
+                .ok()
+                .flatten();
+                return posix_abi::procfs::entries(out, position, pid);
+            }
         }
         posix_abi::shared::held(number, |transport, target| {
             entries(transport, target, out, position)

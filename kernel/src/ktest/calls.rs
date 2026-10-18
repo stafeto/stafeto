@@ -597,6 +597,45 @@ fn label_cases(c: &Caller, own: Handle, other: Handle) -> Result<(), &'static st
     result
 }
 
+/// object_info CPU (abi::INFO_CPU) needs no handle and no lock: it gives the
+/// CPUs up, the ticks since the CPU started, asleep and in entries, and the
+/// caller's CPU; a CPU past those up and a handle in x0 are INVALID_ARGS; an
+/// entry from EL0 that polls adds its length to the time in entries, and
+/// nothing else.
+pub fn object_info_cpu_reads_the_time_of_a_cpu(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ObjectInfo.number();
+        let cpus = crate::smp::cpus() as u64;
+        let here = arch::cpu::this().index() as u64;
+        let before = c.call(n, &[0, abi::INFO_CPU, here]);
+        check(before[0] == 0, "object_info CPU refused the CPU of the caller")?;
+        check(
+            before[1] == cpus && before[5] == here,
+            "object_info CPU gave a wrong count of CPUs or CPU of the caller",
+        )?;
+        check(
+            before[2] > 0 && before[3].saturating_add(before[4]) <= before[2],
+            "the time asleep and in entries exceeds the time since the start",
+        )?;
+        c.fails(n, &[0, abi::INFO_CPU, cpus], Error::InvalidArgs)?;
+        c.fails(n, &[0, abi::INFO_CPU, u64::MAX], Error::InvalidArgs)?;
+        let process = c.created(n, &[0, abi::INFO_THREAD_SELF, 0])?;
+        c.fails(n, &[process.0, abi::INFO_CPU, here], Error::InvalidArgs)?;
+        c.close(process)?;
+        // An entry that lasts at least a tick adds to the system time.
+        let first = sched::entry_started();
+        while timer::now() == first {
+            core::hint::spin_loop();
+        }
+        sched::entry_polled();
+        let after = c.call(n, &[0, abi::INFO_CPU, here]);
+        check(
+            after[4] > before[4] && after[3] >= before[3],
+            "a polled entry did not add to the system time",
+        )
+    })
+}
+
 /// A handle holds its object: the last close queues a thread and a
 /// process for cleanup at the level of the caller, 10, and their portions
 /// let them go back to their pools; a closed handle is bad from then on.
