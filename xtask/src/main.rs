@@ -798,7 +798,10 @@ const SHELL_SERVICES_LAST: [ImageProgram; 3] = [
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// How the program a package names (`program` in packages/<name>.toml) is
-/// built for the image: its stack and the features of its crate.
+/// built for the image: its stack and the features of its crate. The
+/// programs of stack 0 (every package but BusyBox, which init starts as the
+/// launcher) go into the image as their ELF files alone, which the process
+/// service starts from the RAM files.
 const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
     (
         "busybox-probe",
@@ -806,10 +809,10 @@ const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
         POSIX_STACK_SIZE,
         &["ash-interactive", "utilities"],
     ),
-    ("bash", "bash", POSIX_STACK_SIZE, &["interactive"]),
-    ("htop", "htop", POSIX_STACK_SIZE, &["interactive", "procfs"]),
-    ("nano", "nano", POSIX_STACK_SIZE, &["interactive"]),
-    ("ncdu", "ncdu", POSIX_STACK_SIZE, &["interactive"]),
+    ("bash", "bash", 0, &["interactive"]),
+    ("htop", "htop", 0, &["interactive", "procfs"]),
+    ("nano", "nano", 0, &["interactive"]),
+    ("ncdu", "ncdu", 0, &["interactive"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -2035,6 +2038,12 @@ fn write_boot_image_files(
     write_elf_image(name, &sources, extra)
 }
 
+/// Strips the symbols and the non-loadable sections off `elf`, the image's
+/// copy of the linker's file.
+fn strip_elf(elf: &Path, objcopy: &Path) -> Result<(), String> {
+    run_cmd(Command::new(objcopy).arg("--strip-all").arg(elf))
+}
+
 fn write_elf_image(
     name: &str,
     sources: &[(&str, PathBuf, u32)],
@@ -2042,6 +2051,12 @@ fn write_elf_image(
 ) -> Result<PathBuf, String> {
     let target = target_dir();
     let objdump = llvm_tool("llvm-objdump")?;
+    let objcopy = llvm_tool("llvm-objcopy")?;
+    // The image carries each program's ELF file without symbols and debug
+    // information (the checks below read the linker's file with them): the
+    // loader and exec read the loadable segments alone.
+    let mut relibc = false;
+    let mut ready = false;
     let mut files = Vec::new();
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
@@ -2050,6 +2065,15 @@ fn write_elf_image(
         if *file == "ramfs" {
             disasm::ram_main_frame(elf, &objdump)?;
         }
+        relibc |= links_relibc(&std::fs::read(elf).map_err(|e| why(e.to_string()))?);
+        ready |= std::fs::read(elf)
+            .map_err(|e| why(e.to_string()))?
+            .windows(READY_MARK.len())
+            .any(|w| w == READY_MARK);
+        strip_elf(elf, &objcopy)?;
+    }
+    for (file, elf, stack) in sources {
+        let why = |e: String| format!("{}: {e}", elf.display());
         // A program of stack 0 goes into the image as its ELF file alone:
         // the loader, and the programs only files of the table name.
         if *stack == 0 {
@@ -2062,10 +2086,6 @@ fn write_elf_image(
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
     // An image with a program on relibc carries relibc's licence notices.
-    let mut relibc = false;
-    for (_, elf, _) in sources {
-        relibc |= links_relibc(&std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?);
-    }
     let notices = if relibc {
         Some(
             std::fs::read(notices_path())
@@ -2092,12 +2112,7 @@ fn write_elf_image(
     // image with BusyBox's.
     let mut ready_licence = None;
     for (_, elf, _) in sources {
-        if elf.file_name().is_some_and(|n| n == "busybox-probe")
-            && std::fs::read(elf)
-                .map_err(|e| format!("{}: {e}", elf.display()))?
-                .windows(READY_MARK.len())
-                .any(|w| w == READY_MARK)
-        {
+        if ready && elf.file_name().is_some_and(|n| n == "busybox-probe") {
             let (licence, source) = ready_terms()?;
             if let Some((_, note)) = &mut busybox_files {
                 note.push_str(&source);
