@@ -174,28 +174,26 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// message buffer of its threads (INVALID_ARGS, process::check_free); then
 /// the resources, which the process pays for whoever calls: a place in its
 /// table of mappings (LIMIT_REACHED), the block of the table and the most
-/// tables the range may take (NO_MEMORY, process::add_mapping). A call
+/// tables the range may take (NO_MEMORY, process::reserve_mapping and fund_mapping). A call
 /// that fails changes nothing but the block. Then the portions
 /// (`portions`), which never fail but for a process that ends meanwhile;
 /// the entry records the rights of x1 to map, which bound its mem_protect.
 pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
     let entry = clock::now();
     // The checks that read every mapping and every thread of the process
-    // are a section of their own, and the entry goes in under the next one,
-    // which begins only if no mapping and no buffer joined the process
-    // between: each section is short, and the table that the first one saw
-    // is the table the second one changes (maps::epoch).
-    let first = loop {
-        let epoch = match objects(|| map_check(thread, a)) {
-            Ok(epoch) => epoch,
-            Err(e) => break Err(e),
-        };
-        match objects(|| map_add(thread, a, epoch)) {
-            Ok(Some(on)) => break Ok(on),
-            Ok(None) => {}
-            Err(e) => break Err(e),
-        }
-    };
+    // are a section of their own, which also takes the range with a busy
+    // entry: no mapping and no buffer of another call joins it after the
+    // checks, so they are made once. The next section pays for the tables
+    // (maps::reserve_mapping, maps::fund_mapping): each section is short.
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_begins();
+    let first = objects(|| map_reserve(thread, a)).and_then(|on| {
+        #[cfg(feature = "window-probe")]
+        crate::cmd::window::map_gap();
+        objects(|| map_fund(thread, on))
+    });
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_ends();
     match first {
         Ok(on) => {
             thread::begin_long(thread, Long::Change(on));
@@ -241,30 +239,37 @@ fn map_lookups(
 }
 
 /// The first section of mem_map: everything up to the range touching no
-/// mapping and no message buffer (INVALID_ARGS, process::check_free). Gives
-/// the epoch of the process's mappings and buffers it saw.
-fn map_check(thread: NonNull<Thread>, a: &Args) -> Result<u32, Error> {
-    let (target, _, _, pages) = map_lookups(thread, a)?;
-    process::check_free(target, a[4], pages)?;
-    Ok(process::epoch(target))
-}
-
-/// The second section: the same lookups, and, when nothing joined the
-/// process since `epoch`, the resources and the entry (LIMIT_REACHED,
-/// NO_MEMORY, process::add_mapping); None when something did and the
-/// checks have to be made again.
-fn map_add(thread: NonNull<Thread>, a: &Args, epoch: u32) -> Result<Option<Change>, Error> {
+/// mapping and no message buffer (INVALID_ARGS, process::check_free), then
+/// the entry, busy (LIMIT_REACHED, NO_MEMORY for the table's page).
+fn map_reserve(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let (target, m, rights, pages) = map_lookups(thread, a)?;
-    if process::epoch(target) != epoch {
-        return Ok(None);
-    }
+    process::check_free(target, a[4], pages)?;
     let access = access_arg(a[5])?;
     let map = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
     let offset = (a[2] / PAGE_SIZE) as u32;
     let mapping = Mapping::new(a[4], pages as u32, offset, m, Rights(rights.0 & map.0));
-    let on = process::add_mapping(target, mapping, access)?;
+    let on = process::reserve_mapping(target, mapping, access)?;
     process::retain(target);
-    Ok(Some(on))
+    Ok(on)
+}
+
+/// The second section of mem_map: the tables the range may take are paid
+/// for (NO_MEMORY); a call that fails here gives its entry up, and its
+/// reference to the process goes.
+fn map_fund(thread: NonNull<Thread>, mut on: Change) -> Result<Change, Error> {
+    match process::fund_mapping(&mut on) {
+        Ok(()) => Ok(on),
+        Err(e) => {
+            let cause = cause(thread);
+            // SAFETY: nothing uses the change afterwards, and its reference
+            // to the process goes last.
+            unsafe {
+                process::abandon_change(on, cause);
+                process::release(on.target, cause);
+            }
+            Err(e)
+        }
+    }
 }
 
 /// mem_unmap(x0 process with MANAGE, x1 address, x2 length): the pages of

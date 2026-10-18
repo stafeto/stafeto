@@ -1132,7 +1132,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 242;
+const INIT_TESTS: u32 = 243;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -9007,10 +9007,15 @@ fn init_tests_in(
                 &o,
                 "smp window  a thread ended on its CPU between the post of its command and the flush",
             )?;
+            qemu::expect_line(
+                &o,
+                "smp window  20 mem_map calls, the most passes of the checks in one: 1",
+            )?;
         }
         for start in [
             "smp: a thread at EL0 on CPU 1 ran ",
             "smp: signal to a thread at EL0 on CPU 1: median ",
+            "smp: 20 mem_map calls while another CPU made ",
         ] {
             if let Some(line) = o.lines.iter().find(|l| l.starts_with(start)) {
                 println!("{line}");

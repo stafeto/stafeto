@@ -116,6 +116,8 @@ fn page_address(m: &Mapping<NonNull<Memory>>, page: u32) -> u64 {
 /// ended, at most abi::MAX_THREADS. The caller holds a reference to the
 /// process.
 pub fn check_free(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), Error> {
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::map_checked();
     let end = va + (pages << kcore::PAGE_SHIFT);
     // SAFETY: the caller holds a reference to the process; only the table
     // and the list of threads are read.
@@ -134,27 +136,6 @@ pub fn check_free(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), 
     Ok(())
 }
 
-/// What the checks of a mem_map saw of `process`: a number that changes
-/// whenever a mapping or a message buffer joins it (`add_mapping`,
-/// thread::give_buffer). The second section of the call goes on only if it
-/// is the same.
-pub fn epoch(process: NonNull<Process>) -> u32 {
-    crate::obj::assert_held();
-    // SAFETY: the caller holds a reference to the process; OBJ guards the
-    // field.
-    unsafe { (*process.as_ptr()).maps_epoch }
-}
-
-/// A message buffer joined `process` (`epoch`).
-pub fn buffer_joined(process: NonNull<Process>) {
-    crate::obj::assert_held();
-    // SAFETY: as above.
-    unsafe {
-        let p = process.as_ptr();
-        (*p).maps_epoch = (*p).maps_epoch.wrapping_add(1);
-    }
-}
-
 /// Whether page `va` of `process`, which the caller holds, lies in one of
 /// its mappings, whose pages may not be mapped yet (thread_create, spec
 /// 6.2).
@@ -164,16 +145,16 @@ pub fn in_mapping(process: NonNull<Process>, va: usize) -> bool {
     unsafe { table(process) }.is_some_and(|t| t.check_free(va as u64, 1).is_err())
 }
 
-/// The resources of mem_map, step (6), and its entry, `mapping`, whose
-/// range the call checked (`check_free`): LIMIT_REACHED when `target`
-/// has abi::MAX_MAPPINGS mappings; NO_MEMORY when its quota falls short for
-/// the page of its table at its first mapping, or for the most page
-/// tables the range may take, which are
-/// charged to it now (spec 7.5). A failure changes nothing but the table page,
-/// which stays the table's. Then the entry goes in, busy, with a new
-/// reference to its object; returns the change, and the bytes charged for
-/// tables. The caller holds a reference to `target`, which lives.
-pub fn add_mapping(
+/// The entry of mem_map, step (6), `mapping`, whose range the call checked
+/// (`check_free`) in the same section: LIMIT_REACHED when `target` has
+/// abi::MAX_MAPPINGS mappings; NO_MEMORY when its quota falls short for the
+/// page of its table at its first mapping, which then stays the table's. The
+/// entry goes in, busy, with a new reference to its object: the range is
+/// taken from now on, whatever section comes next, so that no call of
+/// another CPU can take it or put a message buffer in it, and the checks do
+/// not repeat. `fund_mapping` pays for the tables; until then the change
+/// holds no bytes. The caller holds a reference to `target`, which lives.
+pub fn reserve_mapping(
     target: NonNull<Process>,
     mapping: Mapping<NonNull<Memory>>,
     access: Access,
@@ -195,23 +176,53 @@ pub fn add_mapping(
             (*p).maps = Some(t);
         }
     }
-    let prepaid = kcore::paging::tables_bound(mapping.start, mapping.pages.into()) * PAGE_SIZE;
-    charge(target, prepaid)?;
     // SAFETY: as above.
     let table = unsafe { table(target) }.expect("the table was just made");
     let index = table
         .insert_free(mapping)
         .expect("a table with room takes a checked entry");
-    // SAFETY: as above; OBJ guards the field.
-    unsafe { (*p).maps_epoch = (*p).maps_epoch.wrapping_add(1) };
     table.set_busy(index, true);
     memory::retain_mapping(mapping.object);
     Ok(Change {
         target,
         index: index as u32,
         done: 0,
-        op: Op::Map { access, prepaid },
+        op: Op::Map { access, prepaid: 0 },
     })
+}
+
+/// The tables the range of the reserved entry `on` may take are charged to
+/// the quota of its process (spec 7.5): NO_MEMORY when it falls short, and
+/// BAD_STATE when the process ended since `reserve_mapping`. On an error the
+/// caller gives the change up (`abandon_change`).
+pub fn fund_mapping(on: &mut Change) -> Result<(), Error> {
+    crate::obj::assert_held();
+    check_alive(on.target)?;
+    // SAFETY: the process lives, and the entry is the call's.
+    let m = unsafe { entry(on) };
+    let prepaid = kcore::paging::tables_bound(m.start, m.pages.into()) * PAGE_SIZE;
+    charge(on.target, prepaid)?;
+    if let Op::Map { prepaid: held, .. } = &mut on.op {
+        *held = prepaid;
+    }
+    Ok(())
+}
+
+/// The resources of mem_map and its entry in one step: `reserve_mapping`
+/// and `fund_mapping`; a failure changes nothing but the table page. The
+/// caller holds a reference to `target`, which lives.
+pub fn add_mapping(
+    target: NonNull<Process>,
+    mapping: Mapping<NonNull<Memory>>,
+    access: Access,
+) -> Result<Change, Error> {
+    let mut on = reserve_mapping(target, mapping, access)?;
+    if let Err(e) = fund_mapping(&mut on) {
+        // SAFETY: nothing uses the change afterwards.
+        unsafe { abandon_change(on, 1) };
+        return Err(e);
+    }
+    Ok(on)
 }
 
 /// Begins a mem_unmap of `pages` pages from `va` in the table of `target`,

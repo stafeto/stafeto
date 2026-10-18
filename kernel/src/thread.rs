@@ -498,7 +498,6 @@ pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
         unsafe { phys::free(frame, process::account(p)) };
         return Err(e);
     }
-    process::buffer_joined(p);
     // SAFETY: as above; only the fields are written.
     unsafe {
         (*t.as_ptr()).buffer = Some(Buffer { va, frame });

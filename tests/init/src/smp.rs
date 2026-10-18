@@ -11,12 +11,12 @@ use crate::harness::*;
 use crate::processes::{Gift, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks};
 use crate::timers::timer_at;
 use crate::transfers::copy_raw;
-use abi::{Call, Error, ProcessState, Rights};
+use abi::{Access, Call, Error, ProcessState, Rights};
 use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 10] = [
+pub(crate) const TESTS: [Test; 11] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -50,6 +50,10 @@ pub(crate) const TESTS: [Test; 10] = [
     (
         "smp_client_ends_on_its_cpu_while_its_reply_is_on_its_way",
         client_ends_with_reply_on_its_way,
+    ),
+    (
+        "smp_mapping_is_made_once_while_another_cpu_makes_threads",
+        mapping_while_threads_join,
     ),
 ];
 
@@ -819,6 +823,75 @@ fn client_ends_with_reply_on_its_way() -> Outcome {
     )?;
     println!(
         "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on"
+    );
+    Ok(())
+}
+
+/// Makes threads of init's own process that never start, and lets them go,
+/// until mark 3 says to stop; mark 0 counts them. Each takes a message
+/// buffer page into the process.
+extern "C" fn make_threads(_: u64) -> ! {
+    while MARKS[3].load(Relaxed) == 0 {
+        let mut x = [0; 10];
+        x[0] = own().raw().0;
+        x[1] = 0x1000;
+        x[4] = LOW.into();
+        x[5] = Policy::Fifo as u64;
+        x[6] = buffer(3) as u64;
+        // SAFETY: the thread never starts, so it runs nothing.
+        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+        if Error::from_code(after[0]).is_none() {
+            let _ = Handle::<Thread>::from_raw(abi::Handle(after[1])).close();
+            MARKS[0].fetch_add(1, Relaxed);
+        }
+    }
+    sys::thread_exit()
+}
+
+/// The priority at which the kernel built with `window-probe` takes 1 ms
+/// between the two sections of mem_map and counts the passes of its checks
+/// (kernel cmd::window).
+const GAP_LEVEL: u8 = 16;
+/// Calls of mem_map the kernel counts.
+const GAP_CALLS: u64 = 20;
+
+/// A thread on another CPU makes threads in init's process, each of which
+/// puts a message buffer into it, while init maps pages into the same
+/// process: each mem_map makes its checks once and goes on, whatever joins
+/// the process between its sections (the kernel built with `window-probe`
+/// leaves 1 ms between them and says how many passes the worst call took).
+fn mapping_while_threads_join() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let m = sys::mem_create(PAGE as u64).map_err(|_| "mem_create failed")?;
+    let maker = spawn_on(0, 1, make_threads, 0, LOW)?;
+    sys::thread_set_priority(&me(), GAP_LEVEL, Policy::Fifo).map_err(|_| "init lowered itself")?;
+    let mut mapped = 0;
+    for i in 0..GAP_CALLS as usize {
+        let at = WINDOW + i * PAGE;
+        if sys::mem_map(&own(), &m, 0, PAGE as u64, at, Access::ReadWrite).is_ok() {
+            mapped += 1;
+            // SAFETY: nothing of init uses the page.
+            let _ = unsafe { sys::mem_unmap(&own(), at, PAGE as u64) };
+        }
+    }
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "init could not take its priority back")?;
+    MARKS[3].store(1, Relaxed);
+    let ended =
+        wait_for(|| sys::thread_info(&maker).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let made = mark(0);
+    let_run()?;
+    close(maker)?;
+    close(m)?;
+    check(ended, "the thread on CPU 1 did not stop")?;
+    check(mapped == GAP_CALLS, "a mem_map failed while threads joined")?;
+    check(made > 0, "no thread was made meanwhile")?;
+    println!(
+        "smp: {mapped} mem_map calls while another CPU made {made} threads in the same process"
     );
     Ok(())
 }

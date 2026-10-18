@@ -69,8 +69,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, add_mapping, begin_protect, begin_unmap, buffer_joined, check_free,
-    device_windows, epoch, finish_change, in_mapping, map_whole, step_change,
+    Change, abandon_change, begin_protect, begin_unmap, check_free, device_windows, finish_change,
+    fund_mapping, in_mapping, map_whole, reserve_mapping, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -156,9 +156,6 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
-    /// Changes whenever a mapping or a message buffer joins the process
-    /// (maps::epoch).
-    maps_epoch: u32,
     /// The gate before EL0 (`control::SUSPENDED`, `control::ENDING`): a
     /// thread of the process runs only while it is 0. The EL0 return reads
     /// it with Acquire, after the CPU's quiescent mark, which orders the
@@ -367,7 +364,6 @@ fn create(
         life: Life::new(),
         threads: None,
         thread_count: 0,
-        maps_epoch: 0,
         gate: AtomicU8::new(0),
         stop_epoch: 0,
         parked: ParkedList::new(),

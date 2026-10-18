@@ -367,7 +367,7 @@ fn serve(t: NonNull<Thread>, flags: u8) {
 #[cfg(feature = "window-probe")]
 pub mod window {
     use super::*;
-    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::{AtomicBool, AtomicU32};
 
     /// The priority of the thread the probe watches: the client of the test.
     pub const LEVEL: u8 = 17;
@@ -469,6 +469,62 @@ pub mod window {
             let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;
             while crate::arch::timer::now() < until {
                 core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// The priority of the caller of mem_map that the probe watches: the
+    /// time between its two sections is 1 ms, and it counts the passes of
+    /// its checks.
+    pub const GAP_LEVEL: u8 = 16;
+    /// Calls of mem_map at GAP_LEVEL the probe counts before it speaks.
+    const GAP_CALLS: u32 = 20;
+
+    static CHECKS: AtomicU32 = AtomicU32::new(0);
+    static MOST: AtomicU32 = AtomicU32::new(0);
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+
+    fn watched() -> bool {
+        crate::sched::running()
+            // SAFETY: the running thread is alive.
+            .is_some_and(|t| unsafe { t.as_ref() }.priority() == GAP_LEVEL)
+    }
+
+    /// A mem_map begins (syscall::mem::change_map).
+    pub fn map_begins() {
+        if watched() {
+            CHECKS.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The checks of a mem_map ran (process::check_free).
+    pub fn map_checked() {
+        if watched() {
+            CHECKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Between the two sections of a mem_map: 1 ms, in which the CPUs that
+    /// make calls on the same process get their sections.
+    pub fn map_gap() {
+        if watched() {
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 1000;
+            while crate::arch::timer::now() < until {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// A mem_map ended its sections: after GAP_CALLS calls the probe says how
+    /// many passes of the checks the worst call needed.
+    pub fn map_ends() {
+        if watched() {
+            MOST.fetch_max(CHECKS.load(Ordering::Relaxed), Ordering::Relaxed);
+            if CALLS.fetch_add(1, Ordering::Relaxed) + 1 == GAP_CALLS {
+                kprintln!(
+                    "smp window  {GAP_CALLS} mem_map calls, the most passes of the checks in one: {}",
+                    MOST.load(Ordering::Relaxed)
+                );
             }
         }
     }
