@@ -902,21 +902,21 @@ fn mapping_while_threads_join() -> Outcome {
 
 /// The priority of the service of the boost test: the kernel built with
 /// `window-probe` keeps the owner of a thread at it from serving the thread's
-/// end for 40 ms (kernel cmd::window).
+/// end for 150 ms (kernel cmd::window).
 const SERVICE_LEVEL: u8 = 15;
 
 /// The thread the raiser of the boost test raises.
 static RAISED_CLIENT: AtomicU64 = AtomicU64::new(0);
 
-/// Raises and lowers the client of the boost test by one level for 50 ms,
-/// which ends before the clients of the killed process are released (80 ms
+/// Raises and lowers the client of the boost test by one level for 300 ms,
+/// which ends before the clients of the killed process are released (400 ms
 /// after its threads ended in the kernel built with `window-probe`); it
 /// cannot be a thread of CPU 0, which is busy with the end of the process
 /// meanwhile.
 extern "C" fn raise_and_lower(_: u64) -> ! {
     let client = Handle::<Thread>::borrowed(abi::Handle(RAISED_CLIENT.load(Relaxed)));
     let mut level = RAISED;
-    let until = now() + 50_000_000;
+    let until = now() + 300_000_000;
     while now() < until {
         level = if level == RAISED { RAISED + 1 } else { RAISED };
         // Fails once the client was released and ended.

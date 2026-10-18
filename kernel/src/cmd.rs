@@ -482,14 +482,14 @@ pub mod window {
     }
 
     /// In `drain`, right after the owner took the flags of `t`: the first
-    /// EXIT of a thread at SERVICE_LEVEL waits 40 ms before it is served,
+    /// EXIT of a thread at SERVICE_LEVEL waits 150 ms before it is served,
     /// with the thread let go (`mark_ended`) and its number kept, in which
     /// a boost from the chain of requests of another CPU finds it.
     pub fn taken(t: NonNull<Thread>, flags: u8) {
         if flags & EXIT == 0 || !is_service(t) || TAKEN.swap(true, Ordering::Relaxed) {
             return;
         }
-        let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 25;
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 3 / 20;
         while crate::arch::timer::now() < until {
             core::hint::spin_loop();
         }
@@ -497,10 +497,10 @@ pub mod window {
 
     /// At the end of the stage Threads of the process that had a thread at
     /// SERVICE_LEVEL, no section held: its clients stay in their wait for
-    /// 80 ms, in which the test raises them from other CPUs.
+    /// 400 ms, in which the test raises them from other CPUs.
     pub fn hold_replies() {
         if ARMED.swap(false, Ordering::Acquire) {
-            let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2 / 25;
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2 / 5;
             while crate::arch::timer::now() < until {
                 core::hint::spin_loop();
             }
