@@ -40,6 +40,8 @@ mod qsbr;
 mod sched;
 mod session;
 mod smp;
+#[cfg(feature = "smp-measure")]
+mod smpm;
 mod syscall;
 mod testpoint;
 mod thread;

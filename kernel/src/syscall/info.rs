@@ -256,6 +256,19 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
     let len = inline_len_arg(a[1])?;
     lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
     let words: &[u64; 8] = a[2..].try_into().expect("x2-x9");
-    crate::log::text(&abi::inline_bytes(words)[..len]);
+    let text = &abi::inline_bytes(words)[..len];
+    #[cfg(feature = "smp-measure")]
+    match text {
+        b"smp-measure reset" => {
+            crate::smpm::reset();
+            return Ok(Values::new(&[a[1]]));
+        }
+        b"smp-measure report" => {
+            crate::smpm::report();
+            return Ok(Values::new(&[a[1]]));
+        }
+        _ => {}
+    }
+    crate::log::text(text);
     Ok(Values::new(&[a[1]]))
 }

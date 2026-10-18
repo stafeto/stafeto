@@ -858,32 +858,71 @@ static long long monotonic_ns(void) {
     return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
 }
 
+/* Writes "text value\n" to the console, for a probe that is about to fail. */
+static void note(const char *text, long long value) {
+    char line[96];
+    size_t n = 0;
+    while (*text && n < 60) line[n++] = *text++;
+    line[n++] = ' ';
+    char digits[24];
+    size_t d = 0;
+    unsigned long long magnitude = value < 0 ? 0ULL - (unsigned long long)value : (unsigned long long)value;
+    do digits[d++] = (char)('0' + magnitude % 10); while ((magnitude /= 10) != 0);
+    if (value < 0) line[n++] = '-';
+    while (d) line[n++] = digits[--d];
+    line[n++] = '\n';
+    (void)!write(1, line, n);
+}
+
 static int cpu_split(void) {
     struct timespec total;
-    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
-    long long whole0 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
-    long long system0 = stafeto_cpu_system_ns(0);
     long long thread0 = stafeto_cpu_system_ns(1);
-    if (system0 < 0 || system0 > whole0 || thread0 < 0) return 296;
-    /* 20 ms at EL0: the counter is read at EL0, so no call enters the kernel. */
-    long long began = monotonic_ns();
-    while (monotonic_ns() - began < 20000000LL) {}
-    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
-    long long whole1 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
-    long long system1 = stafeto_cpu_system_ns(0);
-    long long spin_user = (whole1 - system1) - (whole0 - system0);
-    long long spin_system = system1 - system0;
-    if (system1 < 0 || spin_user < 10000000LL || spin_system > spin_user / 8) return 297;
+    /* 20 ms at EL0, three times: the counter is read at EL0, so no call
+     * enters the kernel, and the least of the system time per nanosecond
+     * counts (the interrupts of the timer are all that the loop gets in
+     * the kernel, and a busy host makes them slow in some rounds). */
+    long long spin_elapsed = 0, spin_system = 0, system1 = 0;
+    for (int round = 0; round < 3; round++) {
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+        long long whole0 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+        long long system0 = stafeto_cpu_system_ns(0);
+        if (system0 < 0 || system0 > whole0 || thread0 < 0) return 296;
+        long long began = monotonic_ns();
+        while (monotonic_ns() - began < 20000000LL) {}
+        long long elapsed = monotonic_ns() - began;
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &total)) return 295;
+        long long whole1 = (long long)total.tv_sec * 1000000000LL + total.tv_nsec;
+        system1 = stafeto_cpu_system_ns(0);
+        long long user = (whole1 - system1) - (whole0 - system0);
+        long long system = system1 - system0;
+        if (system1 < 0 || user < 10000000LL || system > user / 8) return 297;
+        if (round == 0 || system * spin_elapsed < spin_system * elapsed) {
+            spin_elapsed = elapsed;
+            spin_system = system;
+        }
+    }
     /* 20 ms of calls into the kernel. */
-    began = monotonic_ns();
+    long long began = monotonic_ns();
     while (monotonic_ns() - began < 20000000LL) sched_yield();
-    long long system2 = stafeto_cpu_system_ns(0);
+    long long calls_elapsed = monotonic_ns() - began;
+    /* The thread first: the window of the process holds the window of the
+     * thread, as in usage_split. */
     long long thread2 = stafeto_cpu_system_ns(1);
+    long long system2 = stafeto_cpu_system_ns(0);
     long long call_system = system2 - system1;
     /* The entry and the return of a call count as the program's time, and
      * on a slow host most of a call is that: the loop of calls shows only
      * that the system time grows with the calls. */
-    if (system2 < 0 || call_system < 1000000LL || call_system < 20 * spin_system) return 298;
+    /* Per nanosecond that each loop ran: a host that stalls the guest
+     * stretches a loop and the interrupts of the timer in it. */
+    if (system2 < 0 || call_system < 1000000LL
+            || call_system * spin_elapsed < 20 * spin_system * calls_elapsed) {
+        note("cpu_split: spin ns", spin_elapsed);
+        note("cpu_split: spin system ns", spin_system);
+        note("cpu_split: calls ns", calls_elapsed);
+        note("cpu_split: calls system ns", call_system);
+        return 298;
+    }
     if (thread2 < thread0 + call_system / 2 || thread2 > system2) return 299;
     /* Children that were waited for: none yet, and the call is whole. */
     long long children = stafeto_cpu_system_ns(-1);
@@ -898,32 +937,61 @@ static long long microseconds(struct timeval t) {
     return (long long)t.tv_sec * 1000000LL + t.tv_usec;
 }
 
-static void spin_user(long long nanoseconds) {
+/* Spins for `nanoseconds` and gives the time that passed, a little more
+ * (more still when the host stalls the guest). */
+static long long spin_user(long long nanoseconds) {
     long long began = monotonic_ns();
     while (monotonic_ns() - began < nanoseconds) {}
+    return monotonic_ns() - began;
 }
 
-static void spin_calls(long long nanoseconds) {
+static long long spin_calls(long long nanoseconds) {
     long long began = monotonic_ns();
     while (monotonic_ns() - began < nanoseconds) sched_yield();
+    return monotonic_ns() - began;
 }
 
 static int usage_split(void) {
     struct rusage self0, self1, self2, thread0, thread1, thread2, children;
-    if (getrusage(RUSAGE_SELF, &self0) || getrusage(RUSAGE_THREAD, &thread0)) return 301;
-    spin_user(20000000LL);
-    if (getrusage(RUSAGE_SELF, &self1) || getrusage(RUSAGE_THREAD, &thread1)) return 301;
-    long long user_self = microseconds(self1.ru_utime) - microseconds(self0.ru_utime);
-    long long user_thread = microseconds(thread1.ru_utime) - microseconds(thread0.ru_utime);
-    long long system_self = microseconds(self1.ru_stime) - microseconds(self0.ru_stime);
-    long long system_thread = microseconds(thread1.ru_stime) - microseconds(thread0.ru_stime);
-    if (user_self < 10000 || user_thread < 10000) return 302;
-    if (system_self > user_self / 8 || system_thread > user_thread / 8) return 303;
-    spin_calls(20000000LL);
-    if (getrusage(RUSAGE_SELF, &self2) || getrusage(RUSAGE_THREAD, &thread2)) return 301;
+    /* The loop with no call runs three times and the least of its system
+     * time per nanosecond counts: a host that is busy makes the interrupts
+     * of the timer slow in some rounds, and they are all that the loop
+     * with no call gets in the kernel. */
+    long long spin_ns = 0, system_self = 0;
+    for (int round = 0; round < 3; round++) {
+        if (getrusage(RUSAGE_SELF, &self0) || getrusage(RUSAGE_THREAD, &thread0)) return 301;
+        long long ns = spin_user(20000000LL);
+        if (getrusage(RUSAGE_SELF, &self1) || getrusage(RUSAGE_THREAD, &thread1)) return 301;
+        long long user_self = microseconds(self1.ru_utime) - microseconds(self0.ru_utime);
+        long long user_thread = microseconds(thread1.ru_utime) - microseconds(thread0.ru_utime);
+        long long system_round = microseconds(self1.ru_stime) - microseconds(self0.ru_stime);
+        long long system_thread = microseconds(thread1.ru_stime) - microseconds(thread0.ru_stime);
+        if (user_self < 10000 || user_thread < 10000) return 302;
+        if (system_round > user_self / 8 || system_thread > user_thread / 8) return 303;
+        if (round == 0 || system_round * spin_ns < system_self * ns) {
+            spin_ns = ns;
+            system_self = system_round;
+        }
+    }
+    long long calls_ns = spin_calls(20000000LL);
+    /* The thread is read before the process here, and after it at the start
+     * (above): the window of the process holds the window of the thread, so
+     * that a host that stalls the guest between two reads cannot put the
+     * time of the thread above the time of the process. */
+    if (getrusage(RUSAGE_THREAD, &thread2) || getrusage(RUSAGE_SELF, &self2)) return 301;
     long long calls_self = microseconds(self2.ru_stime) - microseconds(self1.ru_stime);
     long long calls_thread = microseconds(thread2.ru_stime) - microseconds(thread1.ru_stime);
-    if (calls_self < 1000 || calls_self < 20 * system_self) return 304;
+    /* The loop of calls grows the system time 20 times as fast as the loop
+     * with no call, which gets it from the timer's interrupts alone: per
+     * nanosecond that each of them ran, since a host that stalls the guest
+     * stretches a loop and the interrupts with it. */
+    if (calls_self < 1000 || calls_self * spin_ns < 20 * system_self * calls_ns) {
+        note("usage_split: spin ns", spin_ns);
+        note("usage_split: spin system us", system_self);
+        note("usage_split: calls ns", calls_ns);
+        note("usage_split: calls system us", calls_self);
+        return 304;
+    }
     if (calls_thread < 500 || calls_thread > calls_self) return 305;
     if (getrusage(RUSAGE_CHILDREN, &children) || microseconds(children.ru_utime) < 0
             || microseconds(children.ru_stime) < 0) return 306;
@@ -948,7 +1016,7 @@ static int usage_split(void) {
     return 0;
 }
 
-int main(int argc, char **argv) {
+static int probe(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
     /* errno is relibc's, in the static TLS of this thread: TPIDR_EL0 names
@@ -1034,4 +1102,11 @@ int main(int argc, char **argv) {
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;
+}
+
+int main(int argc, char **argv) {
+    int code = probe(argc, argv);
+    /* The exit status keeps 8 bits: say a code of 256 or more whole. */
+    if (code > 255) note("posix-abi-probe: failed with code", code);
+    return code;
 }

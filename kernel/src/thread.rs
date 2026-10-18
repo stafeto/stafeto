@@ -251,6 +251,12 @@ impl Thread {
     pub fn priority(&self) -> u8 {
         self.sched.priority()
     }
+
+    /// The level the thread was given, without a boost.
+    #[cfg(feature = "window-probe")]
+    pub fn base_priority(&self) -> u8 {
+        self.sched.base()
+    }
 }
 
 /// The CPU `t` runs on.
@@ -995,6 +1001,8 @@ const AT_EL0: u64 = 1 << 63;
 /// half of the change.
 #[inline(always)]
 fn user_resumes(thread: &Thread, now: u64) {
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::resumed(now);
     let ticks = &thread.user_ticks;
     ticks.store(
         ticks.load(Ordering::Relaxed).wrapping_sub(now) | AT_EL0,
@@ -1006,6 +1014,8 @@ fn user_resumes(thread: &Thread, now: u64) {
 /// on the CPU the thread ran on, with interrupts masked.
 #[inline(always)]
 pub fn user_ran(thread: NonNull<Thread>, now: u64) {
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::entered(now);
     // SAFETY: the running thread is alive; only this CPU writes the field.
     let ticks = &unsafe { &*thread.as_ptr() }.user_ticks;
     ticks.store(

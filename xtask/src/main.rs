@@ -49,6 +49,7 @@ mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod rtbench_check;
+mod smpmeasure;
 mod stubs;
 mod symbolize;
 mod vz;
@@ -1135,7 +1136,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 247;
+const INIT_TESTS: u32 = 253;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1219,6 +1220,11 @@ enum Variant {
     /// A window between the post of a command and its flush, and the end of
     /// a thread inside it (`smp_window`).
     WindowProbe,
+    /// The same without the look under OBJ at a request for the entry before
+    /// a receive or a send waits, and without the second look at the head of
+    /// a queue after the room for its handles (`smp_window`).
+    WindowNoBlockCheck,
+    WindowNoHeadCheck,
     /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
     /// address space (`smp_asid`), and the same with one deliberate break
     /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
@@ -1232,10 +1238,12 @@ enum Variant {
     UnmapLocal,
     /// ASIDs 3 bits wide, for the boot of the shell under VZ (`vz::smp_asid`).
     AsidProbe3,
+    /// The counters of kernel time and OBJ waits of each CPU (`smp_measure`).
+    SmpMeasure,
 }
 
 impl Variant {
-    const ALL: [Variant; 17] = [
+    const ALL: [Variant; 20] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1246,6 +1254,8 @@ impl Variant {
         Variant::OverflowProbe,
         Variant::CpuOnRefused,
         Variant::WindowProbe,
+        Variant::WindowNoBlockCheck,
+        Variant::WindowNoHeadCheck,
         Variant::AsidProbe,
         Variant::AsidNoReserved,
         Variant::AsidNoFlush,
@@ -1253,6 +1263,7 @@ impl Variant {
         Variant::AsidEarly,
         Variant::UnmapLocal,
         Variant::AsidProbe3,
+        Variant::SmpMeasure,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1271,6 +1282,8 @@ impl Variant {
             Variant::OverflowProbe => Some("overflow-probe"),
             Variant::CpuOnRefused => Some("cpu-on-refused"),
             Variant::WindowProbe => Some("window-probe"),
+            Variant::WindowNoBlockCheck => Some("break-block-check"),
+            Variant::WindowNoHeadCheck => Some("break-head-check"),
             Variant::AsidProbe => Some("asid-probe"),
             Variant::AsidNoReserved => Some("break-asid-reserved"),
             Variant::AsidNoFlush => Some("break-asid-flush"),
@@ -1278,6 +1291,7 @@ impl Variant {
             Variant::AsidEarly => Some("break-asid-retire"),
             Variant::UnmapLocal => Some("break-unmap-local"),
             Variant::AsidProbe3 => Some("asid-probe-3"),
+            Variant::SmpMeasure => Some("smp-measure"),
         }
     }
 
@@ -1290,6 +1304,8 @@ impl Variant {
             | Variant::OverflowProbe
             | Variant::CpuOnRefused
             | Variant::WindowProbe
+            | Variant::WindowNoBlockCheck
+            | Variant::WindowNoHeadCheck
             | Variant::AsidProbe
             | Variant::AsidNoReserved
             | Variant::AsidNoFlush
@@ -1304,7 +1320,8 @@ impl Variant {
             | Variant::TestEl0
             | Variant::BaselineEl0
             | Variant::TraceEl0
-            | Variant::TestIcountEl0 => (TEST_KERNEL_LIMIT, "test builds"),
+            | Variant::TestIcountEl0
+            | Variant::SmpMeasure => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -1336,6 +1353,8 @@ impl Variant {
             Variant::OverflowProbe => "stafeto-overflow",
             Variant::CpuOnRefused => "stafeto-cpu-on",
             Variant::WindowProbe => "stafeto-window",
+            Variant::WindowNoBlockCheck => "stafeto-window-no-block",
+            Variant::WindowNoHeadCheck => "stafeto-window-no-head",
             Variant::AsidProbe => "stafeto-asid",
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
             Variant::AsidNoFlush => "stafeto-asid-no-flush",
@@ -1343,6 +1362,7 @@ impl Variant {
             Variant::AsidEarly => "stafeto-asid-early",
             Variant::UnmapLocal => "stafeto-unmap-local",
             Variant::AsidProbe3 => "stafeto-asid-3",
+            Variant::SmpMeasure => "stafeto-smp-measure",
         }
     }
 }
@@ -1516,6 +1536,7 @@ fn main() {
         Some("smp-window") => smp_window(),
         Some("smp-asid") => smp_asid(args.get(1).map(String::as_str)),
         Some("smp-hvf") => smp_hvf(),
+        Some("smp-measure") => smpmeasure::run(&args[1..]),
         Some("probe") => probes(&args[1..]),
         Some("gdb") => gdb(),
         Some("ci") => ci::run(&args[1..]),
@@ -1605,8 +1626,13 @@ fn main() {
         Some("posix-fifo") => posix_fifo_probe(),
         Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
+        // STAFETO_MACHINE names the machine (qemu::MACHINES), for instance
+        // `HVF GICv3`; STAFETO_SMP gives it CPUs.
         Some("posix-procs") => {
-            posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(&qemu::VIRT, count))
+            let named = std::env::var("STAFETO_MACHINE").ok();
+            qemu::machine(named.as_ref()).and_then(|machine| {
+                posix_procs_count(&args[1..]).and_then(|count| posix_procs_repeat(machine, count))
+            })
         }
         Some("posix-lifetimes") => posix_lifetimes_probe(&qemu::VIRT),
         Some("posix-lock-lifecycle-rules") => {
@@ -4877,6 +4903,13 @@ const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
 const THREADS_READY_MAX: u64 = 13_119;
 const S5_ICOUNT_MAX: u64 = 3_063;
+/// S5x on the real processor (SMP stage 6): the median of 200 requests for
+/// the handler of a thread on another CPU, in ticks of the counter (16 ns),
+/// with the target waiting in WFI and with a lower thread on its CPU. The
+/// bound is the largest median of six runs on each machine of `HVF` plus
+/// 10 % (`cargo xtask smp-probe` on a quiet host). The limit of the board
+/// (stage 7) replaces these.
+const S5X_HVF_MAX: [(&str, u64, u64); 2] = [("HVF GICv3", 294, 101), ("HVF GICv2", 340, 216)];
 const S4_ICOUNT_MAX: u64 = 3_478;
 /// The room above which a guard asks to be lowered (rule 4).
 const NULL_SLACK: u64 = 16;
@@ -7406,6 +7439,35 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("smp 4 probes EL2 GICv3", || {
             init_tests_on(&qemu::VIRT_EL2_V3, false, SMP_CPUS).map(drop)
         }),
+        // Guests that run on several CPUs at once, on four beside their runs
+        // on one: the threads of relibc, the locks of the layer and the RAM
+        // file system. Not here, each for its reason (docs/smp.md): the
+        // probes of the shell and of the services whose watchdogs a boot
+        // that TCG makes slow on four CPUs (the invalidations of the TLB
+        // reach every CPU, each one stops them all) overruns; posix-procs,
+        // which takes 60 s on the runners of ci with four CPUs, its limit;
+        // posix-threads,
+        // whose 2 x 10^5 handoffs outrun the limit on TCG with CPUs beyond
+        // one; the kernel tests, whose harness runs the code of the tests
+        // on CPU 0 with the others outside the scheduler, and waits for
+        // them at the first retired ASID.
+        job("relibc-threads smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || relibc_threads_probe(&qemu::VIRT))
+        }),
+        job("posix-sync smp 4", || {
+            qemu::on_cpus(SMP_CPUS, posix_sync_probe)
+        }),
+        job("posix-lock-core smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || {
+                posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Core)
+            })
+        }),
+        job("posix-lock-queue-core smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || {
+                posix_lifetimes_run(&qemu::VIRT, LifetimeProbe::Fifo)
+            })
+        }),
+        job("ramfs smp 4", || qemu::on_cpus(SMP_CPUS, ramfs_probe)),
         job("console dialog 512M", || console_dialog(&qemu::VIRT)),
         job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
         job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
@@ -8821,6 +8883,15 @@ fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, 
 fn b_margin(name: &str, measured: &[(&str, &[&str], Vec<u64>)]) -> Result<(u64, u64), String> {
     let (what, row, n) = blocking_time(measured);
     println!("B on {name}: {row}={n} ({what})");
+    // B_N = B + (N-1) * OBJ_HOLD_MAX (the command's own work, C_cmd, is in B
+    // and in the holds): printed for the CPU counts of the table of docs/smp.md.
+    for cpus in [2, 8] {
+        let b_n = n + (cpus - 1) * OBJ_HOLD_MAX;
+        println!(
+            "B_{cpus} on {name}: {b_n} = B {n} + {} * OBJ_HOLD_MAX {OBJ_HOLD_MAX}",
+            cpus - 1
+        );
+    }
     let b4 = n + 3 * OBJ_HOLD_MAX;
     println!("B_4 on {name}: {b4} = B {n} + 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}");
     if b4 > B4_MAX {
@@ -8919,16 +8990,19 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 12] = [
+const SMP_PROBE_LINES: [&str; 15] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
-    "smp: 16000 calls on 4 CPUs, each took OBJ",
     "smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice",
     "smp: a client raised on CPU 1 raised its service on CPU 2 from 10 to 40",
     "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on",
     "smp: a client on CPU 1 ended with the reply from CPU 0 on its way, the kernel went on",
     "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
+    "smp: a request after the first look of receive ended the call Interrupted, the entry came",
+    "smp: a request after the first look of send ended the call Interrupted, the entry came",
+    "smp: a receiver that lost the head of the queue to a receiver on another CPU took the next request",
+    "smp: a receiver that lost the head of the queue to a recall of its sender took the next request",
     "smp: 88 processes on 4 CPUs read only their own pages, in waves of 16 and one by one",
     "smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1",
     "smp: 4 processes that ended on CPU 0 with a thread on CPU 1 left no entry under their ASIDs",
@@ -8997,7 +9071,57 @@ fn smp_cpu_on() -> Result<(), String> {
 /// keeps the command of that reply from going out for 20 ms: the client's
 /// CPU ends the client in the window, and the kernel says so.
 fn smp_window() -> Result<(), String> {
-    init_tests_in(Variant::WindowProbe, &qemu::VIRT, false, SMP_CPUS).map(drop)
+    init_tests_in(Variant::WindowProbe, &qemu::VIRT, false, SMP_CPUS)?;
+    smp_window_break(
+        Variant::WindowNoBlockCheck,
+        "the look under OBJ before a receive or a send waits",
+        |_, r| {
+            [
+                "smp_request_before_a_receive_waits_ends_it",
+                "smp_request_before_a_send_waits_ends_it",
+            ]
+            .iter()
+            .all(|t| r.failed.iter().any(|(name, _)| name == t))
+        },
+    )?;
+    smp_window_break(
+        Variant::WindowNoHeadCheck,
+        "the second look at the head of a queue",
+        |o, _| {
+            o.lines.iter().any(|l| {
+                l.contains("the head of a channel's queue moved while its receiver made room")
+            })
+        },
+    )
+}
+
+/// The probe kernel of `variant`, which lacks one check of the window probe,
+/// on four CPUs: `caught` says whether the run shows what the check is for
+/// (the probes of the check fail, or the kernel stops at its assertion).
+fn smp_window_break(
+    variant: Variant,
+    what: &str,
+    caught: impl Fn(&qemu::Outcome, &qemu::TestReport) -> bool,
+) -> Result<(), String> {
+    let a = build(variant)?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
+    cmd.args(["-smp", &SMP_CPUS.to_string()]);
+    cmd.args(qemu::HEADLESS);
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
+    let r = qemu::parse_report(&o.lines);
+    if !caught(&o, &r) {
+        return Err(format!(
+            "no probe caught the kernel without {what}: the run failed {:?}, counted {:?}",
+            r.failed, r.done
+        ));
+    }
+    println!(
+        "smp window: the kernel without {what} is caught: failed {:?}, counted {:?}",
+        r.failed.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(),
+        r.done
+    );
+    Ok(())
 }
 
 /// `cargo xtask smp-asid [probe|breaks]` (SMP stage 5): the test init on four CPUs with the
@@ -9187,15 +9311,24 @@ fn init_tests_in(
         if variant == Variant::WindowProbe {
             // CPU 1 came 20 ms late to its quiescent point: the suspension
             // waited for it, and this CPU ran the thread of a timer of 2 ms
-            // meanwhile.
-            if waited < 15_000 || late > 10_000 {
+            // meanwhile. The thread woke 2000 us plus `late` after the call
+            // began, which must be well before the call returned: a wait
+            // that holds the interrupts masked lets the thread run only
+            // after the return. Measuring from the return keeps a stall of
+            // the host out of the verdict.
+            let before_return = waited.saturating_sub(2_000).saturating_sub(late);
+            if waited < 15_000 || before_return < 5_000 {
                 return Err(format!(
-                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us late: the wait must be 15000 us or more and the thread 10000 us or less"
+                    "the suspension waited {waited} us for a CPU held back for 20 ms, and a timer of the waiting CPU woke its thread {late} us after its deadline of 2000 us: the wait must be 15000 us or more and the thread must run 5000 us or more before the call returns (now {before_return} us)"
                 ));
             }
             qemu::expect_line(
                 &o,
                 "smp window  a thread ended on its CPU between the post of its command and the flush",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  the head of a queue moved while its receiver made room",
             )?;
             qemu::expect_line(
                 &o,
@@ -9206,7 +9339,43 @@ fn init_tests_in(
                 "smp window  20 mem_map calls, the most passes of the checks in one: 1",
             )?;
         }
+        if !o.lines.iter().any(|l| {
+            l.starts_with("smp: ")
+                && l.contains(" calls on 4 CPUs in ")
+                && l.ends_with(" ms, each took OBJ")
+        }) {
+            return Err("the test init printed no line of the calls of 4 CPUs on OBJ".into());
+        }
+        if hvf {
+            let (rows, _) = smpmeasure::parse(&o.lines);
+            for (name, idle, lower) in S5X_HVF_MAX {
+                if name != m.name {
+                    continue;
+                }
+                for (row, limit) in [
+                    ("S5x target waiting, its CPU idle", idle),
+                    ("S5x target waiting, a lower thread on its CPU", lower),
+                ] {
+                    let found = rows
+                        .iter()
+                        .find(|r| r.name == row)
+                        .ok_or_else(|| format!("the test init printed no row {row:?}"))?;
+                    println!(
+                        "{row} on {name}: median {} ticks (limit {limit}), p99 {}, longest {}",
+                        found.median, found.p99, found.longest
+                    );
+                    if found.median > limit {
+                        return Err(format!(
+                            "{row} on {name}: median {} ticks is past S5X_HVF_MAX {limit}",
+                            found.median
+                        ));
+                    }
+                }
+            }
+        }
         for start in [
+            "smp: litmus MP ",
+            "smp: litmus SB ",
             "smp: a thread at EL0 on CPU 1 ran ",
             "smp: signal to a thread at EL0 on CPU 1: median ",
             "smp: 20 mem_map calls while another CPU made ",

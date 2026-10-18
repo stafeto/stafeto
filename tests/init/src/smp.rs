@@ -16,10 +16,10 @@ use crate::timers::timer_at;
 use crate::transfers::copy_raw;
 use abi::{Access, Call, Error, ProcessState, Rights};
 use core::hint::spin_loop;
-use core::sync::atomic::Ordering::SeqCst;
+use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 15] = [
+pub(crate) const TESTS: [Test; 21] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -74,6 +74,21 @@ pub(crate) const TESTS: [Test; 15] = [
         "smp_asid_of_a_process_that_ended_is_clean_on_every_cpu",
         asid_after_end_across_cpus,
     ),
+    (
+        "smp_request_before_a_receive_waits_ends_it",
+        request_before_receive_waits,
+    ),
+    (
+        "smp_request_before_a_send_waits_ends_it",
+        request_before_send_waits,
+    ),
+    (
+        "smp_receiver_loses_the_head_to_another_receiver",
+        head_taken_by_another_receiver,
+    ),
+    ("smp_receiver_loses_the_head_to_a_recall", head_recalled),
+    ("smp_measures_of_stage_6", stage_6_measures),
+    ("smp_litmus_tests_of_memory_order", litmus_tests),
 ];
 
 /// How long a wait for another CPU may last, in nanoseconds: far longer
@@ -385,30 +400,50 @@ extern "C" fn timer_listener(_: u64) -> ! {
     sys::thread_exit()
 }
 
-/// Rounds of the lock test on each CPU.
-const ROUNDS: u64 = 4000;
+/// How long every CPU churns the table in the lock test: the rounds it
+/// manages in that time are as many as its host lets it, a few thousand on
+/// TCG and some hundred thousand on the real processor (HVF).
+const TORTURE_NS: u64 = 250_000_000;
+/// Rounds between two readings of the clock.
+const TORTURE_BATCH: u64 = 64;
 /// The quota of the child that spins on every CPU: its threads, buffers and
 /// tables.
 const SPIN_QUOTA: u64 = LEAF_QUOTA + 10 * PAGE as u64;
 
-/// Duplicates and closes a handle of init's table `ROUNDS` times, as every
-/// CPU does at once: each takes OBJ, and the table is one.
-extern "C" fn churn_handles(slot: u64) -> ! {
-    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
-    let mut ok = 0;
-    for _ in 0..ROUNDS {
-        if let Ok(d) = sys::handle_duplicate(&*c, Rights::NONE)
-            && d.close().is_ok()
-        {
-            ok += 1;
+static TORTURE_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// Calls made and calls that succeeded, of each CPU's thread.
+static TORTURE: [[AtomicU64; 2]; 4] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 4];
+
+/// Duplicates and closes a handle of init's table until the deadline, as
+/// every CPU does at once: each takes OBJ, and the table is one. Gives the
+/// rounds made and the rounds that went through.
+fn churn(c: &Handle<Channel>) -> (u64, u64) {
+    let (mut tried, mut ok) = (0, 0);
+    let until = TORTURE_UNTIL.load(Relaxed);
+    while now() < until {
+        for _ in 0..TORTURE_BATCH {
+            tried += 1;
+            if let Ok(d) = sys::handle_duplicate(c, Rights::NONE)
+                && d.close().is_ok()
+            {
+                ok += 1;
+            }
         }
     }
-    MARKS[slot as usize].store(ok, Relaxed);
+    (tried, ok)
+}
+
+extern "C" fn churn_handles(slot: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    let (tried, ok) = churn(&c);
+    TORTURE[slot as usize][0].store(tried, Relaxed);
+    TORTURE[slot as usize][1].store(ok, Relaxed);
+    MARKS[slot as usize].store(1, Relaxed);
     sys::thread_exit()
 }
 
-/// Every CPU takes OBJ in calls on one table: all the rounds of all of them
-/// succeed, and the table holds what it did.
+/// Every CPU takes OBJ in calls on one table for TORTURE_NS: all the rounds
+/// of all of them succeed, and the table holds what it did.
 fn lock_under_load() -> Outcome {
     let n = cpus()?;
     if n < 2 {
@@ -418,6 +453,8 @@ fn lock_under_load() -> Outcome {
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
     let before = sys::process_handles(&own()).map_err(|_| "PROCESS_HANDLES failed")?;
+    let began = now();
+    TORTURE_UNTIL.store(began + TORTURE_NS, Relaxed);
     let mut kept = [None, None, None];
     for cpu in 1..n.min(4) {
         kept[cpu - 1] = Some(spawn_on(
@@ -428,16 +465,13 @@ fn lock_under_load() -> Outcome {
             TEST_PRIORITY,
         )?);
     }
-    let mut mine = 0;
-    for _ in 0..ROUNDS {
-        if let Ok(d) = sys::handle_duplicate(&c, Rights::NONE)
-            && d.close().is_ok()
-        {
-            mine += 1;
-        }
+    let (tried, ok) = churn(&c);
+    let done = wait_for(|| (0..n.min(4) - 1).all(|i| mark(i) != 0));
+    let (mut tried_all, mut ok_all) = (tried, ok);
+    for row in &TORTURE[..n.min(4) - 1] {
+        tried_all += row[0].load(Relaxed);
+        ok_all += row[1].load(Relaxed);
     }
-    let done = wait_for(|| (0..n - 1).all(|i| mark(i) != 0));
-    let rounds: u64 = (0..n - 1).map(mark).sum::<u64>() + mine;
     let_run()?;
     for t in kept.into_iter().flatten() {
         close(t)?;
@@ -446,11 +480,14 @@ fn lock_under_load() -> Outcome {
     close(c)?;
     check(done, "a CPU did not finish its rounds")?;
     check(
-        rounds == ROUNDS * n as u64,
+        ok_all == tried_all && tried_all > 0,
         "a call on one CPU failed while the others held OBJ",
     )?;
     check(before.live == after.live, "the table lost or kept a handle")?;
-    println!("smp: {} calls on {n} CPUs, each took OBJ", rounds);
+    println!(
+        "smp: {ok_all} calls on {n} CPUs in {} ms, each took OBJ",
+        (now() - began) / 1_000_000
+    );
     Ok(())
 }
 
@@ -590,6 +627,37 @@ extern "C" fn write_marker(_: u64) -> ! {
     let _ = sys::debug_write(&resource(), MARKER);
     MARKS[0].store(1, Relaxed);
     sys::thread_exit()
+}
+
+/// Whether a line that begins with `prefix` is in the ring of any CPU
+/// other than this one (`log_peek_other`, as the driver of the UART reads
+/// them): the way to see a line of the kernel that its CPU prints through the
+/// driver, which may come late or after the end of the run.
+fn ring_has_line(prefix: &[u8], n: usize) -> Result<bool, &'static str> {
+    let mut records: [[u8; abi::LOG_RECORD]; abi::LOG_BATCH] =
+        [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
+    for cpu in 1..n {
+        let mut next = 1;
+        loop {
+            let Ok((batch, after)) =
+                sys::log_peek_other(&resource(), cpu as u64, next, &mut records)
+            else {
+                return Err("log_peek_other failed for a CPU that is up");
+            };
+            for r in &records[..(batch.count as usize).min(abi::LOG_BATCH)] {
+                let len = usize::from(r[abi::LOG_LEN_AT]);
+                let text = &r[abi::LOG_TEXT_AT..abi::LOG_TEXT_AT + len.min(abi::LOG_TEXT)];
+                if text.starts_with(prefix) {
+                    return Ok(true);
+                }
+            }
+            if batch.left == 0 {
+                break;
+            }
+            next = after;
+        }
+    }
+    Ok(false)
 }
 
 /// The ring of a CPU is its own (SMP stage 3, decision of review 3): a
@@ -922,20 +990,26 @@ const SERVICE_LEVEL: u8 = 15;
 
 /// The thread the raiser of the boost test raises.
 static RAISED_CLIENT: AtomicU64 = AtomicU64::new(0);
+static RAISES: AtomicU64 = AtomicU64::new(0);
+static RAISES_FAILED: AtomicU64 = AtomicU64::new(0);
 
-/// Raises and lowers the client of the boost test by one level for 300 ms,
-/// which ends before the clients of the killed process are released (400 ms
-/// after its threads ended in the kernel built with `window-probe`); it
+/// Raises and lowers the client of the boost test by one level until the
+/// client is released (MARKS[1]), which the kernel built with `window-probe`
+/// does 400 ms after the threads of the killed process ended: the raises
+/// cover that window however late the process is killed on a loaded host. It
 /// cannot be a thread of CPU 0, which is busy with the end of the process
 /// meanwhile.
 extern "C" fn raise_and_lower(_: u64) -> ! {
     let client = Handle::<Thread>::borrowed(abi::Handle(RAISED_CLIENT.load(Relaxed)));
     let mut level = RAISED;
-    let until = now() + 300_000_000;
-    while now() < until {
+    let limit = now() + 20_000_000_000;
+    while MARKS[1].load(Relaxed) == 0 && now() < limit {
         level = if level == RAISED { RAISED + 1 } else { RAISED };
         // Fails once the client was released and ended.
-        let _ = sys::thread_set_priority(&client, level, Policy::Fifo);
+        RAISES.fetch_add(1, Relaxed);
+        if sys::thread_set_priority(&client, level, Policy::Fifo).is_err() {
+            RAISES_FAILED.fetch_add(1, Relaxed);
+        }
         pause(500_000);
     }
     MARKS[2].store(1, Relaxed);
@@ -990,7 +1064,314 @@ fn boost_of_a_service_that_ended() -> Outcome {
         "the process of the service did not end killed",
     )?;
     println!(
+        "smp window  the raiser made {} requests, {} of them failed",
+        RAISES.load(Relaxed),
+        RAISES_FAILED.load(Relaxed)
+    );
+    // The kernel built with `window-probe` notes the boost it left alone in
+    // the ring of the CPU that met it, and the driver of the UART shows that
+    // ring when it can, which on a busy host is after the run ended: the
+    // line xtask looks for is said from here, once the ring holds it.
+    if ring_has_line(b"smp window  a boost of a thread that ended", n)? {
+        println!("smp window  a boost of a thread that ended on its CPU was left alone");
+    }
+    println!(
         "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on"
+    );
+    Ok(())
+}
+
+/// The priority at which the kernel built with `window-probe` holds the
+/// receive or the send of a thread between its first look at a request for
+/// its entry, which no lock covers, and the look under OBJ before it waits
+/// (kernel cmd::window).
+const WAIT_LEVEL: u8 = 14;
+/// The priority of the receiver the kernel holds between the two sections of
+/// its receive, after the room for the handles of the request at the head.
+const HEAD_LEVEL: u8 = 13;
+
+/// What the threads of the probes of the window say: [0] the thread that
+/// sends or waits is about to call, [1] its result, [2] and [3] the results
+/// of the two receivers, [4] the result of the late sender, [5] the entries
+/// of its handler that ran. 1 is the outcome the probe wants.
+static STEPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// The raw value of the handle the sender of the probe carries.
+static CARRIED: AtomicU64 = AtomicU64::new(0);
+
+fn reset_steps() {
+    for s in &STEPS {
+        s.store(0, Relaxed);
+    }
+}
+
+fn step(i: usize) -> u64 {
+    STEPS[i].load(SeqCst)
+}
+
+/// The handler of the entry of the probes: counts.
+unsafe fn counted() {
+    STEPS[5].fetch_add(1, SeqCst);
+}
+
+rt::upcall_entry!(counted_entry, counted);
+
+/// Binds and opens the entry of the calling thread.
+fn open_entry() {
+    // SAFETY: the handler touches the counter alone.
+    unsafe {
+        let _ = rt::upcall::bind(counted_entry);
+        let _ = rt::upcall::enable();
+    }
+}
+
+/// Waits in receive, with its entry open: step 1 is 1 when the call ended
+/// Interrupted.
+extern "C" fn waits_in_receive(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    open_entry();
+    STEPS[0].store(1, SeqCst);
+    let ended = matches!(sys::receive(&c), Err(Error::Interrupted));
+    STEPS[1].store(if ended { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// Waits in send to a channel nobody receives from, with its entry open.
+extern "C" fn waits_in_send(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    open_entry();
+    STEPS[0].store(1, SeqCst);
+    let ended = matches!(sys::send(&c, &[1]), Err(Error::Interrupted));
+    STEPS[1].store(if ended { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// A thread at WAIT_LEVEL on CPU 1 is about to call `body`; once it is in
+/// the kernel, a request for its entry from CPU 0 finds nothing to end (the
+/// answer is Ok): the call has to end Interrupted, and the entry has to
+/// come. The kernel built with `window-probe` holds the call out of OBJ
+/// until the request was made, whenever it comes; the kernel without the
+/// look under OBJ lets the call wait, and the test ends it by a second
+/// request after the time is up.
+fn request_ends_the_call(
+    body: extern "C" fn(u64) -> !,
+    what: &'static str,
+    said: &'static str,
+) -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_steps();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let t = spawn_on(0, 1, body, 0, WAIT_LEVEL)?;
+    let ready = wait_for(|| step(0) == 1);
+    // The thread reaches the kernel, and the point of the probe.
+    pause(20_000_000);
+    let asked = sys::thread_upcall_request(&t);
+    let ended = wait_for(|| step(1) != 0);
+    if !ended {
+        // It waits for ever: the request found no wait to end and the call
+        // did not look. Another request ends it now.
+        let _ = sys::thread_upcall_request(&t);
+        wait_for(|| step(1) != 0);
+    }
+    let entered = wait_for(|| step(5) != 0);
+    let_run()?;
+    close(t)?;
+    close(c)?;
+    check(ready, "the thread did not reach its call")?;
+    check(asked.is_ok(), "thread_upcall_request failed")?;
+    check(ended, what)?;
+    check(step(1) == 1, "the call did not end Interrupted")?;
+    check(entered, "the entry of the thread did not come")?;
+    println!("{said}");
+    Ok(())
+}
+
+fn request_before_receive_waits() -> Outcome {
+    request_ends_the_call(
+        waits_in_receive,
+        "a request made after the first look of receive was lost: the call waited",
+        "smp: a request after the first look of receive ended the call Interrupted, the entry came",
+    )
+}
+
+fn request_before_send_waits() -> Outcome {
+    request_ends_the_call(
+        waits_in_send,
+        "a request made after the first look of send was lost: the call waited",
+        "smp: a request after the first look of send ended the call Interrupted, the entry came",
+    )
+}
+
+/// Sends a request with a handle (the one in CARRIED) and waits for its
+/// reply, with its entry open: step 1 is 1 for the reply, 2 for Interrupted.
+extern "C" fn sends_a_handle(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    let carried = Handle::<Channel>::from_raw(abi::Handle(CARRIED.load(Relaxed)));
+    open_entry();
+    STEPS[0].store(1, SeqCst);
+    let result = sys::send_handles(&c, &[1], [carried.erase()]);
+    STEPS[1].store(
+        match result {
+            Ok(_) => 1,
+            Err(r) if r.error == Error::Interrupted => 2,
+            Err(_) => 3,
+        },
+        SeqCst,
+    );
+    sys::thread_exit()
+}
+
+/// Takes one request, answers it, and says so in step `slot`.
+extern "C" fn takes_one(slot: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    let result = match sys::receive(&c) {
+        Ok(Received::Message { token, .. }) => {
+            let _ = token.reply(&[]);
+            1
+        }
+        Ok(_) => 2,
+        Err(_) => 3,
+    };
+    STEPS[slot as usize].store(result, SeqCst);
+    sys::thread_exit()
+}
+
+/// The request the receiver that lost its head waits for, from a thread of
+/// its own, since init spins while it waits.
+extern "C" fn sends_late(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    STEPS[4].store(if sys::send(&c, &[2]).is_ok() { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// How the two probes of the head of a queue end: the three threads they
+/// leave and the handles they hold.
+struct Head {
+    c: Handle<Channel>,
+    spare: Handle<Channel>,
+    sender: Handle<Thread>,
+    first: Handle<Thread>,
+    /// Whether the kernel holds the first receiver at the point of the probe
+    /// (`window-probe`): the sender of the request is not answered yet when
+    /// the test comes to move the head.
+    held: bool,
+}
+
+impl Head {
+    /// A request with a handle waits at the head of a channel's queue, from
+    /// CPU 3. A receiver on CPU 1 finds it and makes room for its handle;
+    /// the kernel built with `window-probe` holds it there, out of OBJ,
+    /// until the head moved.
+    fn begin() -> Result<Head, &'static str> {
+        reset_steps();
+        let c = channel(QUIET)?;
+        let spare = channel(QUIET)?;
+        CHANNEL.store(c.raw().0, Relaxed);
+        CARRIED.store(copy_raw(&spare, Rights::TRANSFER)?.0, Relaxed);
+        let sender = spawn_on(0, 3, sends_a_handle, 0, TEST_PRIORITY)?;
+        check(wait_for(|| step(0) == 1), "the sender did not start")?;
+        // Its request is in the queue.
+        pause(20_000_000);
+        let first = spawn_on(1, 1, takes_one, 2, HEAD_LEVEL)?;
+        // The receiver is in the gap of the probe, or has taken the request.
+        pause(20_000_000);
+        let held = step(1) == 0 && step(2) == 0;
+        Ok(Head {
+            c,
+            spare,
+            sender,
+            first,
+            held,
+        })
+    }
+
+    /// The request that follows, from a thread on CPU 2, which the receiver
+    /// that lost the head takes once it waits again; then the threads go.
+    fn finish(self, extra: Handle<Thread>) -> Result<(), &'static str> {
+        let late = spawn_on(2, 2, sends_late, 0, LEVEL)?;
+        let got = wait_for(|| step(4) != 0);
+        let_run()?;
+        for t in [self.sender, self.first, late, extra] {
+            close(t)?;
+        }
+        close(self.spare)?;
+        close(self.c)?;
+        check(got && step(4) == 1, "the next request did not arrive")
+    }
+}
+
+/// The receiver on CPU 1 loses the head to a second receiver on CPU 2: it
+/// has to look again and, with the queue empty, wait: the next request
+/// reaches it. The kernel that does not look again stops in its `assert`.
+/// Where the kernel does not hold the receiver, it takes the request itself,
+/// and the second receiver takes the next.
+fn head_taken_by_another_receiver() -> Outcome {
+    let n = cpus()?;
+    if n < 4 {
+        return Ok(());
+    }
+    let head = Head::begin()?;
+    let second = spawn_on(3, 2, takes_one, 3, LEVEL)?;
+    pause(20_000_000);
+    let early = step(3);
+    let settled = wait_for(|| step(1) != 0);
+    let held = head.held;
+    head.finish(second)?;
+    let both = wait_for(|| step(2) == 1 && step(3) == 1);
+    check(
+        settled && step(1) == 1,
+        "the sender's request was not answered",
+    )?;
+    check(
+        !held || early == 1,
+        "the second receiver did not take the request the first one lost",
+    )?;
+    check(both, "a receiver did not take its request")?;
+    println!(
+        "smp: a receiver that lost the head of the queue to a receiver on another CPU took the next request"
+    );
+    Ok(())
+}
+
+/// The receiver on CPU 1 loses the head to the recall of its sender (a
+/// request for the entry of the sender, from this CPU): the same look, the
+/// same wait. A second receiver takes the request that the first one would
+/// have, where the kernel does not hold the first one.
+fn head_recalled() -> Outcome {
+    let n = cpus()?;
+    if n < 4 {
+        return Ok(());
+    }
+    let head = Head::begin()?;
+    let asked = sys::thread_upcall_request(&head.sender);
+    let held = head.held;
+    let settled = wait_for(|| step(1) != 0);
+    let second = spawn_on(3, 2, takes_one, 3, LEVEL)?;
+    pause(20_000_000);
+    head.finish(second)?;
+    // The requests taken: the sender's, unless it was recalled, and the late
+    // one.
+    let taken = wait_for(|| {
+        u64::from(step(2) == 1) + u64::from(step(3) == 1) == if step(1) == 1 { 2 } else { 1 }
+    });
+    check(
+        !held || asked.is_ok(),
+        "the recall of the sender, which waited in the queue, failed",
+    )?;
+    check(settled, "the sender's request did not end")?;
+    check(
+        step(1) == if held { 2 } else { 1 },
+        "the sender's request ended some other way",
+    )?;
+    check(
+        taken,
+        "the requests were not taken by the receivers, each once",
+    )?;
+    println!(
+        "smp: a receiver that lost the head of the queue to a recall of its sender took the next request"
     );
     Ok(())
 }
@@ -1203,4 +1584,483 @@ fn asid_after_end_across_cpus() -> Outcome {
         "smp: {END_ROUNDS} processes that ended on CPU 0 with a thread on CPU 1 left no entry under their ASIDs"
     );
     Ok(())
+}
+
+// SMP stage 6: the numbers of the decision (`cargo xtask smp-measure` takes
+// them from the lines, on QEMU under -icount and on HVF).
+
+/// Rounds of each row.
+const MEASURE_ROUNDS: usize = 100;
+/// Pages the storm maps at once: the longest section of OBJ is a mapping.
+const STORM_PAGES: usize = 16;
+
+static STORM_OVER: AtomicU64 = AtomicU64::new(0);
+static STORM_MEMORY: AtomicU64 = AtomicU64::new(0);
+static STORM_CHANNEL: AtomicU64 = AtomicU64::new(0);
+/// Set by each thread of the storm when it ends; the rows keep the marks.
+static STORM_DONE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Binds the entry of the handler, then waits for a message that never comes
+/// until mark 3: a request for the handler wakes it, and the CPU it is on
+/// leaves WFI or its lower thread.
+extern "C" fn waiting_target(_: u64) -> ! {
+    // SAFETY: the handler touches the marks alone.
+    unsafe {
+        let _ = rt::upcall::bind(signalled_entry);
+        let _ = rt::upcall::enable();
+    }
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    MARKS[0].store(1, Relaxed);
+    while MARKS[3].load(Relaxed) == 0 {
+        if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+            let _ = token.reply(&[]);
+        }
+    }
+    sys::thread_exit()
+}
+
+/// A thread of a lower level that holds its CPU at EL0 until mark 3.
+extern "C" fn lower_spinner(_: u64) -> ! {
+    while MARKS[3].load(Relaxed) == 0 {
+        spin_loop();
+    }
+    sys::thread_exit()
+}
+
+/// Calls of the storm: duplicate and close a handle, make a channel, map and
+/// unmap the pages of a memory object (the longest section of OBJ), each
+/// CPU at once, until the storm is over.
+extern "C" fn storm(slot: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(STORM_CHANNEL.load(Relaxed)));
+    let m = Handle::<Memory>::borrowed(abi::Handle(STORM_MEMORY.load(Relaxed)));
+    let at = WINDOW + slot as usize * STORM_PAGES * PAGE;
+    while STORM_OVER.load(Relaxed) == 0 {
+        for _ in 0..4 {
+            if let Ok(d) = sys::handle_duplicate(&*c, Rights::NONE) {
+                let _ = d.close();
+            }
+        }
+        if let Ok(x) = sys::channel_create(QUIET) {
+            let _ = x.close();
+        }
+        let len = (STORM_PAGES * PAGE) as u64;
+        if sys::mem_map(&own(), &m, 0, len, at, Access::ReadWrite).is_ok() {
+            // SAFETY: nothing of init uses these pages.
+            let _ = unsafe { sys::mem_unmap(&own(), at, len) };
+        }
+    }
+    STORM_DONE[slot as usize].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Receives and replies until mark 3: the service of a call.
+extern "C" fn echo_service(_: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
+    MARKS[0].store(1, Relaxed);
+    while MARKS[3].load(Relaxed) == 0 {
+        if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+            let _ = token.reply(&[]);
+        }
+    }
+    sys::thread_exit()
+}
+
+/// Median, 99th percentile and longest of the rounds, in ticks.
+fn spread(mut rows: [u64; MEASURE_ROUNDS]) -> (u64, u64, u64) {
+    rows.sort_unstable();
+    (
+        rows[MEASURE_ROUNDS / 2],
+        rows[MEASURE_ROUNDS * 99 / 100],
+        rows[MEASURE_ROUNDS - 1],
+    )
+}
+
+/// Requests the handler of `t` once for each round and gives the ticks from
+/// the request to the handler's first instruction.
+fn upcall_rounds(t: &Handle<Thread>) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+    let mut rows = [0u64; MEASURE_ROUNDS];
+    for (round, slot) in rows.iter_mut().enumerate() {
+        let seen = mark(1);
+        let before = time::now();
+        let asked = sys::thread_upcall_request(t);
+        let sent = asked.is_ok() && wait_for(|| mark(1) > seen);
+        if !sent {
+            println!(
+                "smp measure: round {round}: the request gave {asked:?}, the handler ran {} times (seen {seen}), the target is {:?}",
+                mark(1),
+                sys::thread_info(t).map(|i| i.state)
+            );
+        }
+        check(sent, "a request did not reach the handler of the target")?;
+        *slot = mark(2).saturating_sub(before);
+        pause(100_000);
+    }
+    Ok(rows)
+}
+
+/// The ticks of each of the rounds of a call to the service on `cpu`.
+fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    // Above this thread, which spins while it waits for it on this CPU.
+    let server = spawn_on(slot, cpu, echo_service, 0, TEST_PRIORITY + 1)?;
+    check(wait_for(|| mark(0) == 1), "the service did not start")?;
+    let mut rows = [0u64; MEASURE_ROUNDS];
+    let mut done = true;
+    for row in rows.iter_mut() {
+        let before = time::now();
+        done &= sys::send(&c, &[1]).is_ok();
+        *row = time::now().wrapping_sub(before);
+        pause(50_000);
+    }
+    MARKS[3].store(1, Relaxed);
+    let _ = sys::send(&c, &[0]);
+    let ended =
+        wait_for(|| sys::thread_info(&server).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close(server)?;
+    close(c)?;
+    check(done && ended, "a call to the service failed")?;
+    Ok(rows)
+}
+
+fn print_row(name: &str, rows: [u64; MEASURE_ROUNDS]) {
+    let (median, p99, longest) = spread(rows);
+    println!(
+        "smp measure: {name}: median {median} ticks, p99 {p99}, longest {longest} of {MEASURE_ROUNDS} (counter {} Hz)",
+        time::frequency()
+    );
+}
+
+/// A target on `cpu` that waits for a message, with `lower` threads of a
+/// lower level that hold the CPU at EL0 when given: the rows of requests for
+/// its handler. A target on another CPU than this one has to be woken by
+/// an interrupt between CPUs.
+fn target_rows(
+    cpu: usize,
+    slots: &[usize],
+    lower: bool,
+) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    // Above this thread, which spins while it waits for the target on this CPU.
+    let target = spawn_on(slots[0], cpu, waiting_target, 0, TEST_PRIORITY + 1)?;
+    let spinner = if lower {
+        Some(spawn_on(slots[1], cpu, lower_spinner, 0, LOW)?)
+    } else {
+        None
+    };
+    check(wait_for(|| mark(0) == 1), "the target did not start")?;
+    pause(2_000_000);
+    let rows = upcall_rounds(&target);
+    MARKS[3].store(1, Relaxed);
+    let _ = sys::send(&c, &[0]);
+    let ended =
+        wait_for(|| sys::thread_info(&target).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close(target)?;
+    if let Some(t) = spinner {
+        close(t)?;
+    }
+    close(c)?;
+    check(ended, "the target did not end")?;
+    rows
+}
+
+/// The rows of stage 6 that a storm of calls from the other CPUs runs
+/// under: `kind` 0 the handler of a thread waiting on this CPU, 1 a call
+/// to a service on this CPU. The kernel built with `smp-measure` is told to
+/// count from the start of the storm and to print its counters at its end.
+fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+    STORM_OVER.store(0, Relaxed);
+    for done in &STORM_DONE {
+        done.store(0, Relaxed);
+    }
+    let m = sys::mem_create((STORM_PAGES * PAGE) as u64).map_err(|_| "mem_create failed")?;
+    STORM_MEMORY.store(m.raw().0, Relaxed);
+    let c = channel(QUIET)?;
+    STORM_CHANNEL.store(c.raw().0, Relaxed);
+    let others = n.min(4) - 1;
+    let mut kept = [None, None, None];
+    for cpu in 1..=others {
+        kept[cpu - 1] = Some(spawn_on(cpu - 1, cpu, storm, (cpu - 1) as u64, LOW)?);
+    }
+    let _ = sys::debug_write(&resource(), b"smp-measure reset");
+    let rows = if kind == 0 {
+        target_rows(0, &[3], false)
+    } else {
+        call_rounds(0, 3)
+    };
+    let _ = sys::debug_write(&resource(), b"smp-measure report");
+    STORM_OVER.store(1, Relaxed);
+    let stopped = wait_for(|| STORM_DONE[..others].iter().all(|d| d.load(Relaxed) != 0));
+    let_run()?;
+    for t in kept.into_iter().flatten() {
+        close(t)?;
+    }
+    close(c)?;
+    close(m)?;
+    check(stopped, "a thread of the storm did not stop")?;
+    rows
+}
+
+/// The numbers of the decision of SMP (tasks/2026-10-17-smp/decision.md,
+/// stage 6): the latency of a request to a thread on another CPU (S5x) with
+/// the target waiting in WFI and with a lower thread on its CPU, a call to
+/// a service on this CPU and on another, and under a storm of calls from
+/// the other CPUs the request to a thread of this CPU (S5) and a local call.
+fn stage_6_measures() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    print_row(
+        "S5x target waiting, its CPU idle",
+        target_rows(1, &[0], false)?,
+    );
+    print_row(
+        "S5x target waiting, a lower thread on its CPU",
+        target_rows(1, &[0, 1], true)?,
+    );
+    print_row("call to a service on this CPU", call_rounds(0, 0)?);
+    let far = if n > 2 { 2 } else { 1 };
+    print_row("call to a service on another CPU", call_rounds(far, 0)?);
+    print_row(
+        "S5 on this CPU under a storm of the others",
+        storm_rows(n, 0)?,
+    );
+    print_row(
+        "call to a service on this CPU under a storm of the others",
+        storm_rows(n, 1)?,
+    );
+    Ok(())
+}
+
+// The litmus tests of memory order (aarch64.md, probe 3): two threads on two
+// CPUs run the two halves of a pattern, round after round, and the outcomes
+// are counted. The forbidden ones (MP with release and acquire, SB with
+// dmb) may never come; the same patterns without the barriers show how far
+// the host reorders (none on TCG, some on the real processor). On the
+// real processor the rounds go up to LITMUS_ROUNDS; a slow host stops
+// early.
+
+/// Rounds of a pattern at most, and the time that bounds a pattern.
+const LITMUS_ROUNDS: u64 = 1_000_000;
+const LITMUS_NS: u64 = 3_000_000_000;
+/// A host that does not reach LITMUS_ROUNDS in LITMUS_NS at this pace stops
+/// after LITMUS_PROBE_NS: the slow TCG of ci.
+const LITMUS_PROBE_NS: u64 = 150_000_000;
+
+/// A word of a pattern on a cache line of its own.
+#[repr(align(128))]
+struct Line(AtomicU64);
+
+static LITMUS_X: Line = Line(AtomicU64::new(0));
+static LITMUS_Y: Line = Line(AtomicU64::new(0));
+/// The round the threads run next, the round each finished, and what each
+/// read.
+static LITMUS_GO: Line = Line(AtomicU64::new(0));
+static LITMUS_DONE: [Line; 2] = [Line(AtomicU64::new(0)), Line(AtomicU64::new(0))];
+static LITMUS_SAW: [Line; 2] = [Line(AtomicU64::new(0)), Line(AtomicU64::new(0))];
+static LITMUS_STOP: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pattern {
+    MpStrong,
+    MpWeak,
+    SbStrong,
+    SbWeak,
+}
+
+impl Pattern {
+    const ALL: [Pattern; 4] = [
+        Pattern::MpStrong,
+        Pattern::MpWeak,
+        Pattern::SbStrong,
+        Pattern::SbWeak,
+    ];
+
+    fn from(n: u64) -> Pattern {
+        Pattern::ALL[n as usize]
+    }
+}
+
+/// One half of a pattern: `role` 0 or 1. MP: role 0 writes the data and
+/// then the flag, role 1 waits for the flag and reads the data (what it
+/// read: flag seen in bit 0, data in bit 1). SB: each writes its word,
+/// then reads the other's.
+fn litmus_half(pattern: Pattern, role: u64) -> u64 {
+    use core::sync::atomic::{Ordering::Acquire, Ordering::Release, fence};
+    let (x, y) = (&LITMUS_X.0, &LITMUS_Y.0);
+    match (pattern, role) {
+        (Pattern::MpStrong, 0) => {
+            x.store(1, Relaxed);
+            y.store(1, Release);
+            0
+        }
+        (Pattern::MpWeak, 0) => {
+            x.store(1, Relaxed);
+            y.store(1, Relaxed);
+            0
+        }
+        (Pattern::MpStrong | Pattern::MpWeak, _) => {
+            let order = if pattern == Pattern::MpStrong {
+                Acquire
+            } else {
+                Relaxed
+            };
+            let mut flag = 0;
+            for _ in 0..2000 {
+                flag = y.load(order);
+                if flag != 0 {
+                    break;
+                }
+                spin_loop();
+            }
+            flag | (x.load(Relaxed) << 1)
+        }
+        (Pattern::SbStrong, 0) => {
+            x.store(1, Relaxed);
+            fence(SeqCst);
+            y.load(Relaxed)
+        }
+        (Pattern::SbStrong, _) => {
+            y.store(1, Relaxed);
+            fence(SeqCst);
+            x.load(Relaxed)
+        }
+        (Pattern::SbWeak, 0) => {
+            x.store(1, Relaxed);
+            y.load(Relaxed)
+        }
+        (Pattern::SbWeak, _) => {
+            y.store(1, Relaxed);
+            x.load(Relaxed)
+        }
+    }
+}
+
+/// A thread of a pattern: waits for each round, runs its half, says what it
+/// read and that it is done.
+extern "C" fn litmus_thread(arg: u64) -> ! {
+    let (role, pattern) = (arg & 1, Pattern::from(arg >> 1));
+    let mut round = 0;
+    loop {
+        let go = loop {
+            let go = LITMUS_GO.0.load(Acquire);
+            if go > round || LITMUS_STOP.load(Relaxed) != 0 {
+                break go;
+            }
+            spin_loop();
+        };
+        if LITMUS_STOP.load(Relaxed) != 0 {
+            break;
+        }
+        round = go;
+        LITMUS_SAW[role as usize]
+            .0
+            .store(litmus_half(pattern, role), Relaxed);
+        LITMUS_DONE[role as usize].0.store(round, Release);
+    }
+    sys::thread_exit()
+}
+
+/// Runs `pattern` for as many rounds as the host allows: the rounds, the
+/// rounds in which the flag of MP was seen, and the weak outcomes.
+fn litmus_run(pattern: Pattern, a: usize, b: usize) -> Result<(u64, u64, u64), &'static str> {
+    LITMUS_STOP.store(0, Relaxed);
+    LITMUS_GO.0.store(0, Relaxed);
+    for d in &LITMUS_DONE {
+        d.0.store(0, Relaxed);
+    }
+    let p = pattern as u64;
+    let t0 = spawn_on(0, a, litmus_thread, p << 1, TEST_PRIORITY + 1)?;
+    let t1 = spawn_on(1, b, litmus_thread, (p << 1) | 1, TEST_PRIORITY + 1)?;
+    let began = now();
+    let (mut rounds, mut seen, mut weak) = (0u64, 0u64, 0u64);
+    let mut ok = true;
+    while rounds < LITMUS_ROUNDS {
+        if rounds % 1024 == 0 {
+            let elapsed = now() - began;
+            // The pace of the first LITMUS_PROBE_NS decides if the pattern
+            // can reach LITMUS_ROUNDS within LITMUS_NS.
+            if elapsed > LITMUS_NS
+                || (elapsed > LITMUS_PROBE_NS && rounds * LITMUS_NS < LITMUS_ROUNDS * elapsed)
+            {
+                break;
+            }
+        }
+        LITMUS_X.0.store(0, Relaxed);
+        LITMUS_Y.0.store(0, Relaxed);
+        rounds += 1;
+        LITMUS_GO.0.store(rounds, Release);
+        let limit = now() + WAIT_NS;
+        while LITMUS_DONE[0].0.load(Acquire) < rounds || LITMUS_DONE[1].0.load(Acquire) < rounds {
+            if now() > limit {
+                ok = false;
+                break;
+            }
+            spin_loop();
+        }
+        if !ok {
+            break;
+        }
+        let (r0, r1) = (LITMUS_SAW[0].0.load(Relaxed), LITMUS_SAW[1].0.load(Relaxed));
+        match pattern {
+            Pattern::MpStrong | Pattern::MpWeak => {
+                // r1: bit 0 the flag, bit 1 the data.
+                if r1 & 1 != 0 {
+                    seen += 1;
+                    if r1 >> 1 == 0 {
+                        weak += 1;
+                    }
+                }
+            }
+            Pattern::SbStrong | Pattern::SbWeak => {
+                if r0 == 0 && r1 == 0 {
+                    weak += 1;
+                }
+            }
+        }
+    }
+    LITMUS_STOP.store(1, Relaxed);
+    let _ = wait_for(|| {
+        sys::thread_info(&t0).is_ok_and(|i| i.state == abi::ThreadState::Ended)
+            && sys::thread_info(&t1).is_ok_and(|i| i.state == abi::ThreadState::Ended)
+    });
+    let_run()?;
+    close(t0)?;
+    close(t1)?;
+    check(ok, "a litmus thread did not finish its round")?;
+    Ok((rounds, seen, weak))
+}
+
+fn litmus_tests() -> Outcome {
+    let n = cpus()?;
+    if n < 3 {
+        return Ok(());
+    }
+    // CPUs 1 and 2, and this thread spins on CPU 0.
+    let (a, b) = (1, 2);
+    let mut counts = [(0, 0, 0); 4];
+    for (i, pattern) in Pattern::ALL.into_iter().enumerate() {
+        counts[i] = litmus_run(pattern, a, b)?;
+    }
+    let [mp, mp_weak, sb, sb_weak] = counts;
+    println!(
+        "smp: litmus MP with release and acquire: {} rounds, flag seen in {}, data missed {}; with no barrier: {} rounds, flag seen in {}, data missed {}",
+        mp.0, mp.1, mp.2, mp_weak.0, mp_weak.1, mp_weak.2
+    );
+    println!(
+        "smp: litmus SB with dmb: {} rounds, both read 0 in {}; with no barrier: {} rounds, both read 0 in {}",
+        sb.0, sb.2, sb_weak.0, sb_weak.2
+    );
+    check(
+        mp.2 == 0,
+        "MP with release and acquire: the flag came without the data",
+    )?;
+    check(sb.2 == 0, "SB with dmb: both threads read the old value")?;
+    check(mp.0 > 0 && sb.0 > 0, "a litmus pattern ran no round")
 }

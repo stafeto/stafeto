@@ -397,8 +397,9 @@ pub mod window {
 
     /// In `flush`, before the first command WAKE to a thread at LEVEL goes
     /// into its queue once its end is held (`hold_until_replied`): waits
-    /// 20 ms, in which the CPU of the thread ends it, and says whether it
-    /// did.
+    /// until the CPU of the thread saw the reply (2 s at most, for a host
+    /// that is busy), then 20 ms more, in which that CPU ends the thread,
+    /// and says whether it did.
     pub fn open(t: NonNull<Thread>, flag: u8) {
         if flag != WAKE || !HOLDING.load(Ordering::Acquire) {
             return;
@@ -407,6 +408,10 @@ pub mod window {
         let level = unsafe { t.as_ref() }.priority();
         if level != LEVEL || OPENED.swap(true, Ordering::Relaxed) {
             return;
+        }
+        let seen = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+        while !ENDED_INSIDE.load(Ordering::Acquire) && crate::arch::timer::now() < seen {
+            core::hint::spin_loop();
         }
         let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 50;
         while crate::arch::timer::now() < until {
@@ -421,8 +426,8 @@ pub mod window {
 
     /// In the stage Threads of a process, before its threads end: a thread
     /// at LEVEL that waits for a reply is let alone until the reply took it
-    /// out of its wait, 50 ms at most, so that its end follows the post of
-    /// the reply.
+    /// out of its wait, 2 s at most (the reply comes a few ms after the kill
+    /// on a quiet host), so that its end follows the post of the reply.
     ///
     /// # Safety
     /// `first` is the thread at the cursor of the stage, which is alive; no
@@ -433,7 +438,7 @@ pub mod window {
             // SAFETY: the caller's promise; the list is of live threads.
             let (priority, after) = unsafe {
                 (
-                    t.as_ref().priority(),
+                    t.as_ref().base_priority(),
                     (*t.as_ptr()).siblings.and_then(|s| s.next),
                 )
             };
@@ -441,7 +446,7 @@ pub mod window {
                 ARMED.store(true, Ordering::Release);
             }
             if priority == LEVEL {
-                let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 20;
+                let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
                 let mut held = false;
                 loop {
                     let waiting = {
@@ -478,7 +483,9 @@ pub mod window {
     fn is_service(t: NonNull<Thread>) -> bool {
         // SAFETY: the callers hold the thread: the kernel's reference keeps
         // it until its commands are served.
-        unsafe { t.as_ref() }.priority() == SERVICE_LEVEL
+        // The level it was given: a client raised from another CPU boosts it
+        // before its process ends, and the probe holds its end all the same.
+        unsafe { t.as_ref() }.base_priority() == SERVICE_LEVEL
     }
 
     /// In `drain`, right after the owner took the flags of `t`: the first
@@ -489,6 +496,7 @@ pub mod window {
         if flags & EXIT == 0 || !is_service(t) || TAKEN.swap(true, Ordering::Relaxed) {
             return;
         }
+        kprintln!("smp window  the end of a service is held for 150 ms");
         let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 3 / 20;
         while crate::arch::timer::now() < until {
             core::hint::spin_loop();
@@ -521,6 +529,59 @@ pub mod window {
     pub fn boost_left_alone(t: NonNull<Thread>) {
         if is_service(t) && !LEFT_ALONE.swap(true, Ordering::Relaxed) {
             kprintln!("smp window  a boost of a thread that ended on its CPU was left alone");
+        }
+    }
+
+    /// The priority of the thread whose receive or send the probe holds
+    /// after its look at the request of the entry that no lock covers.
+    pub const WAIT_LEVEL: u8 = 14;
+    /// The priority of the receiver the probe holds between the two sections
+    /// of its receive.
+    pub const HEAD_LEVEL: u8 = 13;
+
+    /// Out of OBJ, until `done` or 2 s (a host that is busy).
+    fn hold_outside(done: impl Fn() -> bool) {
+        crate::obj::outside(|| {
+            let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+            while !done() && crate::arch::timer::now() < until {
+                core::hint::spin_loop();
+            }
+        });
+    }
+
+    /// In receive and send, right after the look at the request of the
+    /// entry that no lock covers (`interrupt_wait`): a thread at WAIT_LEVEL
+    /// that has no request yet waits, out of OBJ, until another CPU made
+    /// one. The request finds no wait to end (thread_upcall_request answers
+    /// Ok), and the look under OBJ before the wait has to find it.
+    pub fn after_check(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        let upcall = unsafe { &t.as_ref().upcall };
+        // SAFETY: as above.
+        if unsafe { t.as_ref() }.base_priority() == WAIT_LEVEL && !upcall.is_pending() {
+            hold_outside(|| upcall.is_pending());
+        }
+    }
+
+    static MOVED: AtomicU32 = AtomicU32::new(0);
+
+    /// The head of a queue of requests left it (a receiver took it, or its
+    /// sender was recalled).
+    pub fn head_moved() {
+        MOVED.fetch_add(1, Ordering::Release);
+    }
+
+    /// In receive, after the room for the handles of the request at the head
+    /// was made: a receiver at HEAD_LEVEL waits, out of OBJ, until the head
+    /// moved, which another receiver on another CPU or a recall does.
+    pub fn in_gap(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.base_priority() == HEAD_LEVEL {
+            let seen = MOVED.load(Ordering::Acquire);
+            hold_outside(|| MOVED.load(Ordering::Acquire) != seen);
+            if MOVED.load(Ordering::Acquire) != seen {
+                kprintln!("smp window  the head of a queue moved while its receiver made room");
+            }
         }
     }
 

@@ -139,7 +139,11 @@ pub fn lock() -> Section {
 
 #[inline(always)]
 fn acquire(me: usize) {
+    #[cfg(feature = "smp-measure")]
+    let began = crate::arch::timer::now_unordered();
     OBJ.lock();
+    #[cfg(feature = "smp-measure")]
+    crate::smpm::waited(crate::arch::timer::now_unordered().wrapping_sub(began));
     OWNER.store(me, Relaxed);
     #[cfg(feature = "measure")]
     SINCE.store(crate::arch::timer::now_unordered(), Relaxed);
@@ -211,6 +215,14 @@ pub fn longest_hold() -> (u64, u64) {
         .map(|(kind, &held)| (held, kind as u64))
         .max()
         .unwrap_or((0, 0))
+}
+
+/// Forgets the holds so far (`smpm::reset`).
+#[cfg(feature = "smp-measure")]
+pub fn reset_holds() {
+    for held in &BY_KIND {
+        held.store(0, Relaxed);
+    }
 }
 
 /// The longest hold of each kind of section (`KINDS`).
