@@ -5,7 +5,8 @@
 //! `rootfs` (lib/bootimg/src/rootfs.rs) names each with its path, mode and
 //! owner and takes the bytes from a file of the image: a program's ELF file
 //! as the linker wrote it, a variant of one (its own copy, with more
-//! memory in its data segment when asked), or bytes of the list itself.
+//! memory in its data segment when asked), bytes of the list itself, or the
+//! target of a symbolic link.
 //! `table` writes the table of an image, and `tests` checks that each
 //! image's list names programs the image has.
 
@@ -41,6 +42,9 @@ pub enum Source {
     /// The compiled terminfo entry of this name, which tools/build-ncurses.py
     /// writes into target/ncurses/terminfo.
     Terminfo(&'static str),
+    /// A symbolic link to this target, a name in the directory of the link.
+    /// Its bytes are the target; links to one target share the image file.
+    Link(&'static str),
 }
 
 impl Source {
@@ -51,6 +55,7 @@ impl Source {
             Source::Variant { program, tag, .. } => format!("{program}-{tag}.elf"),
             Source::Bytes(name, _) => name.to_string(),
             Source::Terminfo(entry) => format!("terminfo-{entry}"),
+            Source::Link(target) => format!("link-{target}"),
         }
     }
 
@@ -59,7 +64,7 @@ impl Source {
     pub fn program(&self) -> Option<&'static str> {
         match *self {
             Source::Elf(program) | Source::Variant { program, .. } => Some(program),
-            Source::Bytes(..) | Source::Terminfo(_) => None,
+            Source::Bytes(..) | Source::Terminfo(_) | Source::Link(_) => None,
         }
     }
 
@@ -69,6 +74,7 @@ impl Source {
             Source::Elf(program) => elf(program),
             Source::Variant { program, extra, .. } => grow_data(elf(program)?, extra),
             Source::Bytes(_, bytes) => Ok(bytes.to_vec()),
+            Source::Link(target) => Ok(target.as_bytes().to_vec()),
             Source::Terminfo(entry) => {
                 let path = crate::target_dir()
                     .join("ncurses/terminfo")
@@ -242,9 +248,10 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 16] = [
+const SYSTEM_PATHS: [&str; 17] = [
     "/bin",
-    "/bin/ramfs",
+    "/libexec",
+    "/libexec/ramfs",
     "/dev",
     "/proc",
     "/var",
@@ -291,6 +298,12 @@ pub fn package_files(packages: &[crate::packages::Package]) -> Result<Vec<RootFi
             files.push(match kind {
                 "elf" => file(leak(path), 0o755, ROOT, leak(name)),
                 "terminfo" => of(leak(path), 0o644, ROOT, Source::Terminfo(leak(name))),
+                "link" => of(
+                    leak(path),
+                    bootimg::rootfs::SYMLINK_MODE,
+                    ROOT,
+                    Source::Link(leak(name)),
+                ),
                 "bytes" => of(
                     leak(path),
                     0o644,
@@ -304,20 +317,20 @@ pub fn package_files(packages: &[crate::packages::Package]) -> Result<Vec<RootFi
     Ok(files)
 }
 
-/// How many names of /bin beyond `ash`, `sh` and `busybox` hold the BusyBox
-/// program in the shell image: the utilities of the packages that BusyBox
+/// How many names of /bin beyond `ash`, `sh` and `busybox` are links to
+/// BusyBox in the shell image: the utilities of the packages that BusyBox
 /// carries.
 pub fn utilities() -> usize {
     files_of("boot-ash-dialog.img")
         .iter()
-        .filter(|f| f.source == Some(Source::Elf("busybox-probe")))
+        .filter(|f| f.source == Some(Source::Link("busybox")))
         .count()
-        - 3
+        - 2
 }
 
 /// The shell's image: the base system (the RAM service, its directories and
 /// files) and the files of the packages in `packages/`: BusyBox with its
-/// applet names (the shell, `ash`, among them) as hard links, and the
+/// applet names (the shell, `ash`, among them) as symbolic links, and the
 /// add-ons. The service is a set-user-ID file of another owner.
 fn dialog() -> Vec<RootFile> {
     shell_files().unwrap_or_else(|e| panic!("the shell image: {e}"))
@@ -326,7 +339,8 @@ fn dialog() -> Vec<RootFile> {
 fn shell_files() -> Result<Vec<RootFile>, String> {
     let mut files = vec![
         dir("/bin"),
-        file("/bin/ramfs", 0o4750, USER, "ramfs"),
+        dir("/libexec"),
+        file("/libexec/ramfs", 0o4750, USER, "ramfs"),
         dir("/dev"),
         dir("/proc"),
         dir("/var"),
@@ -382,6 +396,21 @@ pub fn check_owners(
         for path in p.files.iter().map(|f| &f.0).chain(&p.dirs) {
             if !files.iter().any(|f| f.path == path) {
                 wrong.push(format!("{path} of {} is not in the image", p.name));
+            }
+        }
+    }
+    // A link names a file of its own directory that the image has and that
+    // is no link itself.
+    for f in files {
+        if let Some(Source::Link(target)) = f.source {
+            let at = f.path.rfind('/').unwrap_or(0);
+            let whole = format!("{}/{target}", &f.path[..at]);
+            let kind = files.iter().find(|g| g.path == whole).map(|g| g.source);
+            if !matches!(kind, Some(Some(source)) if !matches!(source, Source::Link(_))) {
+                wrong.push(format!(
+                    "{} links to {whole}, which is no file of the image",
+                    f.path
+                ));
             }
         }
     }
@@ -966,9 +995,31 @@ pub fn elf_name(program: &str) -> String {
     format!("{program}.elf")
 }
 
-/// The table for `files`: the file of `sources()[i]` is file `first + i`
-/// of an image of `total` files, the table itself the last.
+/// The time the files of an image get: SOURCE_DATE_EPOCH when it is set
+/// (seconds since the epoch, so that a build repeats), else the time of the
+/// build.
+pub fn build_time() -> Result<u64, String> {
+    match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| format!("SOURCE_DATE_EPOCH={text:?} is no number of seconds")),
+        Err(_) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|e| format!("the clock of the host is before the epoch: {e}")),
+    }
+}
+
+/// The table for `files` of a build with no time.
+#[cfg(test)]
 pub fn table(files: &[RootFile], first: u32, total: u32) -> Result<Vec<u8>, String> {
+    table_at(files, first, total, 0)
+}
+
+/// The table for `files` of a build at `time`: the file of `sources()[i]` is
+/// file `first + i` of an image of `total` files, the table itself the last.
+pub fn table_at(files: &[RootFile], first: u32, total: u32, time: u64) -> Result<Vec<u8>, String> {
     let wanted = sources(files);
     let entries: Vec<Entry<'_>> = files
         .iter()
@@ -977,7 +1028,11 @@ pub fn table(files: &[RootFile], first: u32, total: u32) -> Result<Vec<u8>, Stri
                 None => (rootfs::DIRECTORY, 0),
                 Some(source) => {
                     let n = wanted.iter().position(|s| *s == source).unwrap_or(0);
-                    (rootfs::REGULAR, first + n as u32)
+                    let kind = match source {
+                        Source::Link(_) => rootfs::SYMLINK,
+                        _ => rootfs::REGULAR,
+                    };
+                    (kind, first + n as u32)
                 }
             };
             Entry {
@@ -989,7 +1044,7 @@ pub fn table(files: &[RootFile], first: u32, total: u32) -> Result<Vec<u8>, Stri
             }
         })
         .collect();
-    rootfs::write::rootfs(&entries, total).map_err(|e| format!("rootfs: {e}"))
+    rootfs::write::rootfs_at(&entries, total, time).map_err(|e| format!("rootfs: {e}"))
 }
 
 #[cfg(test)]
@@ -1061,6 +1116,69 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_links_of_the_shell_image_read_back_as_links_to_busybox() {
+        let files = files_of("boot-ash-dialog.img");
+        let total = sources(&files).len() as u32 + 3;
+        let bytes = table(&files, 3, total).unwrap();
+        let read = Rootfs::parse(&bytes, total).unwrap();
+        let find = |path| read.entry(read.find(path).unwrap() as u32);
+        let (cat, ls, busybox) = (find("/bin/cat"), find("/bin/ls"), find("/bin/busybox"));
+        assert!(cat.is_symlink() && ls.is_symlink() && !busybox.is_symlink());
+        assert_eq!(cat.file, ls.file);
+        assert_eq!(cat.mode, rootfs::SYMLINK | 0o777);
+        assert_eq!(
+            Source::Link("busybox").bytes(|_| Err("no program".into())),
+            Ok(b"busybox".to_vec())
+        );
+        // The service and the test program are out of /bin.
+        assert!(read.find("/bin/ramfs").is_none() && read.find("/bin/login-probe").is_none());
+        assert!(find("/libexec/ramfs").mode & 0o4000 != 0);
+        assert!(find("/libexec/login-probe").mode & rootfs::FORMAT == rootfs::REGULAR);
+    }
+
+    /// A link to a name the image lacks, or to another link, is refused.
+    #[test]
+    fn a_link_must_name_a_file_of_its_directory() {
+        let image = "boot-ash-dialog.img";
+        let packages = crate::packages::of_image(image).unwrap();
+        let mut dangling = files_of(image);
+        dangling.push(of("/bin/ghost", 0o777, ROOT, Source::Link("nothing")));
+        let mut owned = packages.clone();
+        owned[0]
+            .files
+            .push(("/bin/ghost".into(), "link:nothing".into()));
+        let error = check_owners(image, &dangling, &owned).unwrap_err();
+        assert!(
+            error.contains("/bin/ghost links to /bin/nothing"),
+            "{error}"
+        );
+        let mut chained = files_of(image);
+        chained.push(of("/bin/again", 0o777, ROOT, Source::Link("cat")));
+        owned[0].files.pop();
+        owned[0]
+            .files
+            .push(("/bin/again".into(), "link:cat".into()));
+        let error = check_owners(image, &chained, &owned).unwrap_err();
+        assert!(error.contains("/bin/again links to /bin/cat"), "{error}");
+    }
+
+    #[test]
+    fn the_table_carries_the_time_of_the_build() {
+        let bytes = table_at(&ramfs(), 5, 9, 1_790_000_123).unwrap();
+        assert_eq!(Rootfs::parse(&bytes, 9).unwrap().time(), 1_790_000_123);
+        assert_eq!(
+            Rootfs::parse(&table(&ramfs(), 5, 9).unwrap(), 9)
+                .unwrap()
+                .time(),
+            0
+        );
+        // SOURCE_DATE_EPOCH is a number of seconds.
+        assert!(
+            build_time().unwrap() > 1_700_000_000 || std::env::var("SOURCE_DATE_EPOCH").is_ok()
+        );
+    }
+
+    #[test]
     fn the_table_must_fit_the_image() {
         // One file too few: the second program's number is out of range.
         assert!(table(&ramfs(), 5, 6).is_err());
@@ -1127,6 +1245,7 @@ mod tests {
             Ok(match source {
                 Source::Elf("busybox-probe") => 1000,
                 Source::Elf(_) => 10,
+                Source::Link(_) => 0,
                 _ => 1,
             })
         })

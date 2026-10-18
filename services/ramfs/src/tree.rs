@@ -29,6 +29,9 @@ pub enum Error {
     Table(bootimg::rootfs::Error),
     /// An entry replaces fixed `/etc/motd` or lies at or under `/tmp`.
     Reserved(u32),
+    /// A symbolic link whose target in the image is empty, longer than a
+    /// path or holds a NUL.
+    BadLink(u32),
 }
 
 /// What the service keeps of the table: for each entry (and `/`, in the
@@ -114,12 +117,13 @@ impl Index {
             if entry.is_directory() {
                 self.canon[n] = n as u16;
                 self.links[n] = 2 + self.directories(table, n);
-            } else if [
-                crate::NULL_DEVICE,
-                crate::RANDOM_DEVICES[0],
-                crate::RANDOM_DEVICES[1],
-            ]
-            .contains(&entry.path)
+            } else if entry.is_symlink()
+                || [
+                    crate::NULL_DEVICE,
+                    crate::RANDOM_DEVICES[0],
+                    crate::RANDOM_DEVICES[1],
+                ]
+                .contains(&entry.path)
             {
                 self.canon[n] = n as u16;
                 self.links[n] = 1;
@@ -135,6 +139,7 @@ impl Index {
         for n in 0..len {
             let entry = table.entry(n as u32);
             if !entry.is_directory()
+                && !entry.is_symlink()
                 && ![
                     crate::NULL_DEVICE,
                     crate::RANDOM_DEVICES[0],
@@ -186,16 +191,33 @@ pub fn load<'a>(image: &'a [u8], index: &'a mut Index) -> Result<Tree<'a>, Error
         .ok_or(Error::Missing)?;
     let table = Rootfs::parse(table.data, image.count()).map_err(Error::Table)?;
     index.fill(&table)?;
-    Ok(Tree {
+    let tree = Tree {
         image,
         table,
         index,
-    })
+    };
+    for n in 0..tree.len() {
+        let target = tree.data(n);
+        if tree.entry(n).is_symlink()
+            && (target.is_empty()
+                || target.len() > bootimg::rootfs::PATH_MAX
+                || target.contains(&0))
+        {
+            return Err(Error::BadLink(u32::from(n)));
+        }
+    }
+    Ok(tree)
 }
 
 impl<'a> Tree<'a> {
     pub fn find(&self, path: &str) -> Option<u16> {
         self.table.find(path).map(|n| n as u16)
+    }
+
+    /// The time of the build of the image in seconds since the epoch, which
+    /// its files have as their times; 0 for none.
+    pub fn time(&self) -> u64 {
+        self.table.time()
     }
 
     /// The entries of the table.
@@ -211,7 +233,8 @@ impl<'a> Tree<'a> {
         self.table.entry(u32::from(n))
     }
 
-    /// The bytes of the file of entry `n`; empty for a directory.
+    /// The bytes of the file of entry `n`: the contents of a file, the
+    /// target of a symbolic link; empty for a directory.
     pub fn data(&self, n: u16) -> &'a [u8] {
         let entry = self.entry(n);
         if entry.is_directory() {
@@ -311,6 +334,87 @@ mod tests {
         assert_eq!(tree.data(1), b"alpha bytes");
         assert_eq!(tree.data(5), b"beta");
         assert_eq!(tree.data(0), b"");
+    }
+
+    #[test]
+    fn symbolic_links_of_the_image_are_inodes_of_their_own_with_the_target_as_bytes() {
+        use bootimg::rootfs::{SYMLINK, SYMLINK_MODE};
+        let bytes = test_image(&[
+            entry("/bin", DIRECTORY | 0o755, 0),
+            entry("/bin/a", SYMLINK | SYMLINK_MODE, 2),
+            entry("/bin/b", SYMLINK | SYMLINK_MODE, 2),
+            entry("/bin/busybox", REGULAR | 0o755, 1),
+        ]);
+        let mut index = Index::new();
+        let tree = load(&bytes, &mut index).unwrap();
+        assert_eq!((tree.canonical(1), tree.canonical(2)), (1, 2));
+        assert_eq!((tree.links(1), tree.links(2), tree.links(3)), (1, 1, 1));
+        assert_eq!(tree.data(1), b"beta");
+        let mut ram = crate::Ram::with_tree(proto_fs::Timestamp::ZERO, tree);
+        // The listing of the directory shows the links.
+        let mut fds = crate::Fds::default();
+        let fd = ram.open(&mut fds, "/bin", proto_fs::READ_ONLY).unwrap();
+        let mut names = alloc::vec::Vec::new();
+        while let Some(record) = ram
+            .directory_read(&mut fds, fd, proto_fs::Timestamp::ZERO)
+            .unwrap()
+        {
+            names.push(record.name().to_vec());
+        }
+        assert_eq!(
+            names,
+            [
+                b".".to_vec(),
+                b"..".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"busybox".to_vec()
+            ]
+        );
+        let a = ram.storage.resolve(b"/bin/a").unwrap();
+        assert_eq!(ram.storage.node(a).unwrap().kind, crate::storage::SYMLINK);
+        let mut out = [0; 16];
+        assert_eq!(ram.storage.read(a, 0, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"beta");
+    }
+
+    #[test]
+    fn the_files_of_an_image_have_the_time_of_its_build() {
+        let entries = [
+            entry("/f", REGULAR | 0o644, 1),
+            entry("/d", DIRECTORY | 0o755, 0),
+        ];
+        let start = proto_fs::Timestamp::new(1_767_225_600, 5).unwrap();
+        for (time, expected) in [(1_790_000_000, 1_790_000_000), (0, 1_767_225_600)] {
+            let table = bootimg::rootfs::write::rootfs_at(&entries, 3, time).unwrap();
+            let bytes = bootimg::write::image(&[
+                ("init", b"init"),
+                ("a", b"alpha bytes"),
+                (ROOTFS, &table),
+            ])
+            .unwrap();
+            let mut index = Index::new();
+            let ram = crate::Ram::with_tree(start, load(&bytes, &mut index).unwrap());
+            for path in [b"/f".as_slice(), b"/d"] {
+                let node = ram.storage.resolve(path).unwrap();
+                let times = ram.storage.node(node).unwrap().times;
+                assert!(times.iter().all(|t| t.seconds == expected), "{path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_symbolic_link_with_no_target_or_a_target_with_a_nul_is_refused() {
+        use bootimg::rootfs::{SYMLINK, SYMLINK_MODE};
+        let table =
+            bootimg::rootfs::write::rootfs(&[entry("/l", SYMLINK | SYMLINK_MODE, 1)], 3).unwrap();
+        for target in [&b""[..], b"a\0b"] {
+            let bytes =
+                bootimg::write::image(&[("init", b"init"), ("t", target), (ROOTFS, &table)])
+                    .unwrap();
+            let mut index = Index::new();
+            assert!(matches!(load(&bytes, &mut index), Err(Error::BadLink(0))));
+        }
     }
 
     #[test]

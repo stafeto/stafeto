@@ -14,6 +14,7 @@ use proto_clock::page;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
 use proto_wire::clones::Clones;
+use rt::abi::Access;
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
@@ -42,6 +43,37 @@ static CLONE_TABLE: CloneTable = CloneTable(UnsafeCell::new(Clones::new()));
 /// has no battery clock (a program that reads zero seconds finds no time).
 const START_SECONDS: i64 = 1_767_225_600;
 
+/// Where the service maps the window over the PL031 and the boot image.
+const RTC_AT: usize = 0x10_0000_0000;
+const IMAGE_AT: usize = 0x11_0000_0000;
+
+/// The time of the hardware clock or of the host, and where it came from:
+/// the PL031 when init gave the record a window `rtc` with its REGISTER
+/// reply (QEMU `virt`), else
+/// the file `boot-time` of the boot image, which init gives the record
+/// (`bootimage`) and `tools/vz-run.swift` fills for a VZ start. `None`
+/// leaves the service at START_SECONDS.
+fn source_time(
+    start: &mut rt::startup::Startup,
+    registered: &mut rt::service::Registered,
+) -> Option<(i64, &'static str)> {
+    if let Ok(window) = registered.take::<Memory>("rtc") {
+        if sys::mem_map(&start.process, &window, 0, 4096, RTC_AT, Access::Read).is_err() {
+            return None;
+        }
+        // SAFETY: the window is mapped at RTC_AT for the service's life and
+        // the data register is a 32-bit word at its start.
+        let reading = unsafe { core::ptr::read_volatile((RTC_AT + rtc::PL031_DR) as *const u32) };
+        return rtc::from_pl031(reading).map(|s| (s as i64, "PL031"));
+    }
+    let image = start.take::<Memory>("bootimage").ok()?;
+    let size = sys::memory_info(&image).ok()?.size;
+    sys::mem_map(&start.process, &image, 0, size, IMAGE_AT, Access::Read).ok()?;
+    // SAFETY: the image stays mapped, read-only, for the life of the process.
+    let bytes = unsafe { core::slice::from_raw_parts(IMAGE_AT as *const u8, size as usize) };
+    rtc::from_image(bytes).map(|s| (s as i64, "the boot image"))
+}
+
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -52,15 +84,22 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let args = ServiceArgs::read(start.args()).ok();
+    let period_ns = ServiceArgs::read(start.args())
+        .ok()
+        .map_or(0, |a| a.period_ns);
     let level = sys::thread_info(&start.thread).map_or(1, |i| i.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
     };
-    if rt::service::register(&start.parent, &channel).is_err() {
+    let Ok(mut registered) = rt::service::register(&start.parent, &channel) else {
         return 3;
-    }
-    let Ok(clock) = Clock::starting_at(now(), rt::time::frequency(), START_SECONDS) else {
+    };
+    let source = source_time(&mut start, &mut registered);
+    let Ok(clock) = Clock::starting_at(
+        now(),
+        rt::time::frequency(),
+        source.map_or(START_SECONDS, |(seconds, _)| seconds),
+    ) else {
         return 4;
     };
     let Ok(page) = Page::new(&start.process) else {
@@ -71,11 +110,16 @@ fn main(_: u64) -> u64 {
         issued: 0,
         heartbeat: Some(Heartbeat {
             to: &start.parent,
-            period_ns: args.map_or(0, |a| a.period_ns),
+            period_ns,
             priority: level,
         }),
     };
-    rt::println!("clock: ready (unsynchronized start)");
+    match source {
+        Some((seconds, from)) => {
+            rt::println!("clock: ready (started at {seconds} from {from})");
+        }
+        None => rt::println!("clock: ready (unsynchronized start)"),
+    }
     let _ = rt::service::run::<Clocks, SESSIONS, 0>(
         &channel,
         &mut Clocks {

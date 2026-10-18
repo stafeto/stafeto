@@ -15,6 +15,6 @@ license_file = "LICENSE"
 depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = [
-  "/bin/file = elf:busybox-probe",
-  "/bin/iconv = elf:busybox-probe",
+  "/bin/file = link:busybox",
+  "/bin/iconv = link:busybox",
 ]

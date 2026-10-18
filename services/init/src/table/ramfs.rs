@@ -3,7 +3,7 @@
 
 //! RAM file service and its guest probe in a dedicated boot image.
 
-use super::{Kind, Record, Restart};
+use super::{Kind, Record, Restart, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -139,7 +139,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
         quota: POSIX_ABI_TABLE[1].quota + BUSYBOX_DIALOG_POOL,
         ..POSIX_ABI_TABLE[1]
     },
-    POSIX_ABI_TABLE[2],
+    CLOCK_RTC,
     PIPE,
     Record {
         args: b"ash-launch\0",
@@ -151,6 +151,21 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::entropy::RNG,
     super::entropy::ENTROPY,
 ];
+
+/// The page of the PL031 of QEMU `virt` (rtc::PL031_BASE): the clock
+/// service reads the time of the host there when it starts.
+const RTC: Window = Window {
+    name: "rtc",
+    base: 0x0901_0000,
+    len: PAGE,
+};
+
+/// The clock service with the window over the PL031, for the machines that
+/// have one (QEMU `virt`, HVF).
+pub const CLOCK_RTC: Record = Record {
+    windows: &[RTC],
+    ..POSIX_ABI_TABLE[2]
+};
 
 /// The quota of the launcher, which the shell and its children get too.
 const DIALOG_QUOTA: u64 = 512 * PAGE;

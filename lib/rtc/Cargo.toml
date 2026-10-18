@@ -1,0 +1,17 @@
+[package]
+name = "rtc"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Where the clock service gets the time it starts at: the PL031 of QEMU virt, or the time a host runner wrote into the boot image"
+
+[lib]
+bench = false
+
+[dependencies]
+bootimg = { path = "../bootimg" }
+
+[dev-dependencies]
+bootimg = { path = "../bootimg", features = ["write"] }
