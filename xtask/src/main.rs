@@ -11728,10 +11728,11 @@ mod tests {
         );
     }
 
-    /// The order of locks is in kernel/src/obj.rs: `OBJ` is the only lock the
-    /// CPUs share, and what a CPU alone owns takes none. So outside the kernel
-    /// tests no `kcore::sync::Lock` guards kernel data, the ticket is taken
-    /// only in obj.rs, `Own` cells live only in `Local` (local.rs), and the
+    /// The order of locks is in kernel/src/obj.rs: `OBJ`, then the ticket of
+    /// each CPU's cleanup queue, are the locks the CPUs share, and what a CPU
+    /// alone owns takes none. So outside the kernel tests no
+    /// `kcore::sync::Lock` guards kernel data, a ticket is only in obj.rs and
+    /// in `Local::queue_spin`, `Own` cells live only in `Local` (local.rs), and the
     /// data `OBJ` guards are the five that the order names: a new lock or
     /// datum has to change this list, and so decide its place in the order.
     #[test]
@@ -11748,7 +11749,10 @@ mod tests {
                 if line.contains("kcore::sync::Lock") || line.contains("Lock<") {
                     found.push(format!("{at}: a kcore Lock"));
                 }
-                if name != "kernel/src/obj.rs" && line.contains("Ticket") {
+                // The second lock of the order: the ticket of a CPU's cleanup
+                // queue (obj.rs).
+                let queue_lock = name == "kernel/src/local.rs" && line.contains("queue_spin");
+                if name != "kernel/src/obj.rs" && line.contains("Ticket") && !queue_lock {
                     found.push(format!("{at}: a ticket outside obj.rs"));
                 }
                 if name != "kernel/src/local.rs" && line.contains("Own<") {
