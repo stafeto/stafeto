@@ -259,23 +259,6 @@ pub fn console_early_exit() -> Result<(), String> {
 /// Init's line of the end of the first instance of `exit-before-decoding`.
 const EARLY_END: &str = "init: uart ended: exit code 8; restarts in 100 ms";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_run_that_stopped_gets_the_hint() {
-        let stopped: Result<(), String> = Err(
-            "the output ended before x; last lines: [\"guest stopped: the kernel powered off\"]"
-                .into(),
-        );
-        assert!(stop_hint(stopped).unwrap_err().ends_with(HINT));
-        let timed_out: Result<(), String> = Err("timed out waiting for x".into());
-        assert_eq!(stop_hint(timed_out), Err("timed out waiting for x".into()));
-        assert_eq!(stop_hint(Ok(1)), Ok(1));
-    }
-}
-
 /// `cargo xtask clock-vz` (stafeto-design#380): VZ has no PL031, so the
 /// runner writes the time it is given (`--time`) into the file `boot-time`
 /// of a copy of the boot image, and the clock service starts there. The
@@ -301,4 +284,21 @@ pub fn clock() -> Result<(), String> {
     stop_hint(result).map_err(|e| format!("clock on VZ: {e}"))?;
     println!("clock on VZ: started at {seconds}, the time the runner wrote: ok");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_that_stopped_gets_the_hint() {
+        let stopped: Result<(), String> = Err(
+            "the output ended before x; last lines: [\"guest stopped: the kernel powered off\"]"
+                .into(),
+        );
+        assert!(stop_hint(stopped).unwrap_err().ends_with(HINT));
+        let timed_out: Result<(), String> = Err("timed out waiting for x".into());
+        assert_eq!(stop_hint(timed_out), Err("timed out waiting for x".into()));
+        assert_eq!(stop_hint(Ok(1)), Ok(1));
+    }
 }
