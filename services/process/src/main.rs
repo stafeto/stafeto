@@ -2876,10 +2876,9 @@ impl Processes {
         if cpus == 1 {
             return 0;
         }
-        let allowed = self
-            .pages
-            .page(child)
-            .map_or(0, |page| page.cpus.load(core::sync::atomic::Ordering::Acquire));
+        let allowed = self.pages.page(child).map_or(0, |page| {
+            page.cpus.load(core::sync::atomic::Ordering::Acquire)
+        });
         let now = Self::timer_now();
         let mut busy = [0u32; MAX_CPUS];
         for i in (0..RECORDS).filter(|&i| i != child) {

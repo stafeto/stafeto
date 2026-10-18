@@ -608,7 +608,10 @@ pub fn object_info_cpu_reads_the_time_of_a_cpu(_: &Boot) -> Result<(), &'static 
         let cpus = crate::smp::cpus() as u64;
         let here = arch::cpu::this().index() as u64;
         let before = c.call(n, &[0, abi::INFO_CPU, here]);
-        check(before[0] == 0, "object_info CPU refused the CPU of the caller")?;
+        check(
+            before[0] == 0,
+            "object_info CPU refused the CPU of the caller",
+        )?;
         check(
             before[1] == cpus && before[5] == here,
             "object_info CPU gave a wrong count of CPUs or CPU of the caller",

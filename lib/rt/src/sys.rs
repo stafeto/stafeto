@@ -331,7 +331,11 @@ pub unsafe fn thread_create_with(
     exit: Option<(&Handle<Channel>, u8)>,
 ) -> Result<Handle<Thread>, Error> {
     // SAFETY: the caller's promise.
-    unsafe { thread_create_on(process, entry, stack, arg, priority, policy, buffer, exit, 0) }
+    unsafe {
+        thread_create_on(
+            process, entry, stack, arg, priority, policy, buffer, exit, 0,
+        )
+    }
 }
 
 /// `thread_create_with` on CPU `cpu` - 1 (x5, abi::THREAD_CPU_SHIFT); 0 is

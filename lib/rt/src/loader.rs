@@ -403,8 +403,18 @@ pub fn thread_placed(
     policy: Policy,
     cpu: u8,
 ) -> Result<Handle<Thread>, Error> {
-    match thread_on(process, entry, stack, x0, priority, policy, cpu.saturating_add(1)) {
-        Err(Error::InvalidArgs) if cpu != 0 => thread_on(process, entry, stack, x0, priority, policy, 0),
+    match thread_on(
+        process,
+        entry,
+        stack,
+        x0,
+        priority,
+        policy,
+        cpu.saturating_add(1),
+    ) {
+        Err(Error::InvalidArgs) if cpu != 0 => {
+            thread_on(process, entry, stack, x0, priority, policy, 0)
+        }
         placed => placed,
     }
 }
