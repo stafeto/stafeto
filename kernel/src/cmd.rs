@@ -355,8 +355,7 @@ pub fn drain() {
     };
     // A batch that was not full left the queues empty, and each later push
     // comes with an SGI of its own.
-    if timers_left || n == DRAIN_BATCH && (0..cpus).any(|f| f != me && !RINGS[me][f].is_empty())
-    {
+    if timers_left || n == DRAIN_BATCH && (0..cpus).any(|f| f != me && !RINGS[me][f].is_empty()) {
         gic::send_sgi(me, SGI_CMD);
     }
 }

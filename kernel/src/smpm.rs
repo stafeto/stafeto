@@ -118,6 +118,12 @@ pub fn report() {
     let (held, kind) = crate::obj::longest_hold();
     kprintln!("smp-measure OBJ longest hold {held} ticks (kind {kind})");
     let stretches = crate::obj::stretches_by_takes();
-    let most = stretches.iter().rposition(|&(took, _)| took != 0).unwrap_or(0);
-    kprintln!("smp-measure OBJ takes in a stretch {most}={}", stretches[most].0);
+    let most = stretches
+        .iter()
+        .rposition(|&(took, _)| took != 0)
+        .unwrap_or(0);
+    kprintln!(
+        "smp-measure OBJ takes in a stretch {most}={}",
+        stretches[most].0
+    );
 }

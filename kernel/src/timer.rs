@@ -26,6 +26,7 @@
 //! (local.rs): they take no lock, and a post enters its own section under
 //! OBJ.
 
+use crate::arch::cpu::MAX_CPUS;
 use crate::arch::timer as clock;
 use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item, Work};
@@ -33,7 +34,6 @@ use crate::local::local;
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{Error, MAX_SYSTEM_TIMERS};
-use crate::arch::cpu::MAX_CPUS;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use kcore::sync::Budget;

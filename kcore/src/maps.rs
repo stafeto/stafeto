@@ -313,7 +313,11 @@ impl<T: Copy> Maps<T> {
     /// each to `f`: a portion of the teardown of the process (spec 7.7).
     /// True when the table is empty afterwards.
     pub fn drain(&mut self, n: usize, f: impl FnMut(Mapping<T>)) -> bool {
-        self.entries.iter_mut().filter_map(Option::take).take(n).for_each(f);
+        self.entries
+            .iter_mut()
+            .filter_map(Option::take)
+            .take(n)
+            .for_each(f);
         self.is_empty()
     }
 }

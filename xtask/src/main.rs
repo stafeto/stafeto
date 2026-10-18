@@ -8990,9 +8990,9 @@ fn stretches_by_takes(lines: &[String]) -> Result<Vec<(u64, u64)>, String> {
         let Some(rest) = line.strip_prefix("obj takes ticks: ") else {
             continue;
         };
-        let parsed = rest
-            .split_once('=')
-            .and_then(|(k, c)| Some((k.trim().parse::<u64>().ok()?, c.trim().parse::<u64>().ok()?)));
+        let parsed = rest.split_once('=').and_then(|(k, c)| {
+            Some((k.trim().parse::<u64>().ok()?, c.trim().parse::<u64>().ok()?))
+        });
         let Some((k, c)) = parsed else {
             return Err(format!("the kernel printed {line:?} for OBJ"));
         };
@@ -9031,7 +9031,10 @@ fn b_margin(
     println!("B on {name}: {row}={n} ({what})");
     let stretches = stretches_by_takes(lines)?;
     let shown: Vec<String> = stretches.iter().map(|(k, c)| format!("{k}={c}")).collect();
-    println!("OBJ takes on {name}: longest stretch by takes {}", shown.join(" "));
+    println!(
+        "OBJ takes on {name}: longest stretch by takes {}",
+        shown.join(" ")
+    );
     // The command's own work, C_cmd, is in the stretch and in the holds.
     for cpus in [2, 8] {
         let (b, k, c) = b_n(cpus, n, &stretches);
@@ -11540,11 +11543,18 @@ mod tests {
         };
         let margin = |takes: &[&str]| {
             let lines: Vec<String> = takes.iter().map(|l| (*l).to_owned()).collect();
-            b_margin("t", &[("suspension scopes", &SUSPENSION_ROWS[..], rows(10_000))], &lines)
+            b_margin(
+                "t",
+                &[("suspension scopes", &SUSPENSION_ROWS[..], rows(10_000))],
+                &lines,
+            )
         };
         let fits = B4_MAX - 2 * 3 * OBJ_HOLD_MAX;
         assert!(margin(&[&format!("obj takes ticks: 2={fits}")]).is_ok());
-        let over = margin(&["obj takes ticks: 0=5", &format!("obj takes ticks: 2={}", fits + 1)]);
+        let over = margin(&[
+            "obj takes ticks: 0=5",
+            &format!("obj takes ticks: 2={}", fits + 1),
+        ]);
         if B4_TAKES_ENFORCED {
             assert!(over.unwrap_err().contains("2 * 3 * OBJ_HOLD_MAX"));
         } else {

@@ -302,7 +302,9 @@ pub fn stretch_begins(now: u64) {
 /// in it.
 #[cfg(all(feature = "measure", feature = "ktest"))]
 pub fn stretch_drop() {
-    STRETCH[crate::arch::cpu::this().index()].since.store(0, Relaxed);
+    STRETCH[crate::arch::cpu::this().index()]
+        .since
+        .store(0, Relaxed);
 }
 
 /// The longest stretch with each count of takes over every CPU, in ticks,

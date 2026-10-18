@@ -1007,7 +1007,11 @@ fn exec_map_of_a_killed_process() -> Outcome {
     )?;
     println!(
         "smp: a mem_map RX {} the kill of its process: {mapped:?}",
-        if killed_first { "lasted into" } else { "came before" }
+        if killed_first {
+            "lasted into"
+        } else {
+            "came before"
+        }
     );
     Ok(())
 }
