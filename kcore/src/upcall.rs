@@ -378,6 +378,14 @@ impl State {
     pub fn interrupt_wait(&self) -> bool {
         self.deferred != 0 && self.is_pending() && !self.masked
     }
+    /// A request that the thread's next way to EL0 would turn into an entry
+    /// is pending now. A thread that is about to block checks it under the
+    /// lock the requester decides under: a request that came from another CPU
+    /// after the thread's last look, while the thread was in the kernel and
+    /// waited for nothing yet, found no wait to end.
+    pub fn deliverable(&self) -> bool {
+        self.entry != 0 && !self.masked && self.is_pending()
+    }
     pub fn can_return(&self) -> bool {
         self.depth != 0 && self.deferred == 0 && self.masked && !self.entering
     }
@@ -404,6 +412,18 @@ mod tests {
     const ADOPT: UpcallControl = UpcallControl::Adopt;
     const QUERY: UpcallControl = UpcallControl::Query;
     const ESR_DABT: u64 = 0x9200_0004;
+    #[test]
+    fn a_request_is_deliverable_once_the_entry_is_open() {
+        let mut state = State::new();
+        assert!(!state.deliverable(), "no entry, no request");
+        state.bind(0x1000).unwrap();
+        assert_eq!(state.request(), Ok(false), "bound entries start shut");
+        assert!(!state.deliverable(), "a shut entry holds the request");
+        state.control_basic(ENABLE).unwrap();
+        assert!(state.deliverable(), "an open entry takes it now");
+        assert!(state.prepare(0x2000, 0, 0x3000, false).is_some());
+        assert!(!state.deliverable(), "the entry took the request");
+    }
     #[test]
     fn restoration_rejects_privilege_interrupt_masks_and_foreign_buffer() {
         let check =

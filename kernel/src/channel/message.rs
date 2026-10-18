@@ -158,6 +158,13 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             if !wait {
                 return Err(Error::WouldBlock);
             }
+            // A request for the thread's entry that another CPU made while
+            // this call was on its way found no wait to end (`sched::
+            // request_upcall` decides under this lock): the call ends here,
+            // and the entry comes on the way to EL0.
+            if t.as_ref().upcall.deliverable() {
+                return Err(Error::Interrupted);
+            }
             let running = k.s.block(crate::arch::timer::now());
             assert!(running == t, "a thread that does not run waits");
             let slot = thread::slot(t);

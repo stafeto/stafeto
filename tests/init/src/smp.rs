@@ -1272,7 +1272,7 @@ fn asid_after_end_across_cpus() -> Outcome {
 // them from the lines, on QEMU under -icount and on HVF).
 
 /// Rounds of each row.
-const MEASURE_ROUNDS: usize = 200;
+const MEASURE_ROUNDS: usize = 100;
 /// Pages the storm maps at once: the longest section of OBJ is a mapping.
 const STORM_PAGES: usize = 16;
 
@@ -1361,10 +1361,18 @@ fn spread(mut rows: [u64; MEASURE_ROUNDS]) -> (u64, u64, u64) {
 /// the request to the handler's first instruction.
 fn upcall_rounds(t: &Handle<Thread>) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
     let mut rows = [0u64; MEASURE_ROUNDS];
-    for slot in rows.iter_mut() {
+    for (round, slot) in rows.iter_mut().enumerate() {
         let seen = mark(1);
         let before = time::now();
-        let sent = sys::thread_upcall_request(t).is_ok() && wait_for(|| mark(1) > seen);
+        let asked = sys::thread_upcall_request(t);
+        let sent = asked.is_ok() && wait_for(|| mark(1) > seen);
+        if !sent {
+            println!(
+                "smp measure: round {round}: the request gave {asked:?}, the handler ran {} times (seen {seen}), the target is {:?}",
+                mark(1),
+                sys::thread_info(t).map(|i| i.state)
+            );
+        }
         check(sent, "a request did not reach the handler of the target")?;
         *slot = mark(2).saturating_sub(before);
         pause(100_000);

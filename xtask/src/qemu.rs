@@ -198,12 +198,32 @@ pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String
     a
 }
 
+thread_local! {
+    /// The CPUs the machines this thread starts get (`on_cpus`), 0 for the
+    /// default.
+    static CPUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` with every machine that this thread starts given `n` CPUs: the
+/// jobs of `ci` run on threads of their own, and one of them goes on four
+/// CPUs while the next stays on one.
+pub fn on_cpus<T>(n: usize, f: impl FnOnce() -> T) -> T {
+    let before = CPUS.replace(n);
+    let result = f();
+    CPUS.set(before);
+    result
+}
+
 pub fn command(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Command {
     let mut c = Command::new("qemu-system-aarch64");
     c.args(args(m, kernel, boot_image));
     // STAFETO_SMP=N runs any probe on N CPUs (the later `-smp` of a probe
-    // that sets its own wins), to find what a stage of SMP breaks.
-    if let Some(n) = std::env::var("STAFETO_SMP")
+    // that sets its own wins), to find what a stage of SMP breaks; `on_cpus`
+    // does it for the jobs of one thread.
+    let own = CPUS.get();
+    if own > 0 {
+        c.args(["-smp", &own.to_string()]);
+    } else if let Some(n) = std::env::var("STAFETO_SMP")
         .ok()
         .filter(|n| n.parse::<u32>().is_ok())
     {
