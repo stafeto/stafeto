@@ -1102,6 +1102,9 @@ const TEST_INIT_LINES: [&str; 6] = [
 /// of `a_kernel_line_fills_records_in_turn` faults behind a window over
 /// the console's page, and its line stays in the kernel log (spec 3.2).
 const CHILD_FAULTS: usize = 13;
+/// Children that fault with a line on four CPUs besides the unmap probe's: the
+/// rounds of the probe of the ASIDs of ended processes (tests/init/src/smp.rs).
+const SMP_END_FAULTS: usize = 4;
 /// The panic of a child (tests/child, Role::Panic): rt prints where it
 /// panicked, then this message on a line of its own (spec 13.2).
 const CHILD_PANIC_AT: &str = "panic: panicked at tests/child/src/main.rs:";
@@ -1132,7 +1135,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 246;
+const INIT_TESTS: u32 = 247;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1219,18 +1222,20 @@ enum Variant {
     /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
     /// address space (`smp_asid`), and the same with one deliberate break
     /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
-    /// of a process, and an unmap whose TLBI stays on its CPU.
+    /// of a process, an ASID that goes before the other CPUs left the
+    /// tables, and an unmap whose TLBI stays on its CPU.
     AsidProbe,
     AsidNoReserved,
     AsidNoFlush,
     AsidNoAside,
+    AsidEarly,
     UnmapLocal,
     /// ASIDs 3 bits wide, for the boot of the shell under VZ (`vz::smp_asid`).
     AsidProbe3,
 }
 
 impl Variant {
-    const ALL: [Variant; 16] = [
+    const ALL: [Variant; 17] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1245,6 +1250,7 @@ impl Variant {
         Variant::AsidNoReserved,
         Variant::AsidNoFlush,
         Variant::AsidNoAside,
+        Variant::AsidEarly,
         Variant::UnmapLocal,
         Variant::AsidProbe3,
     ];
@@ -1269,6 +1275,7 @@ impl Variant {
             Variant::AsidNoReserved => Some("break-asid-reserved"),
             Variant::AsidNoFlush => Some("break-asid-flush"),
             Variant::AsidNoAside => Some("break-asid-aside"),
+            Variant::AsidEarly => Some("break-asid-retire"),
             Variant::UnmapLocal => Some("break-unmap-local"),
             Variant::AsidProbe3 => Some("asid-probe-3"),
         }
@@ -1287,6 +1294,7 @@ impl Variant {
             | Variant::AsidNoReserved
             | Variant::AsidNoFlush
             | Variant::AsidNoAside
+            | Variant::AsidEarly
             | Variant::UnmapLocal
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
@@ -1332,6 +1340,7 @@ impl Variant {
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
             Variant::AsidNoFlush => "stafeto-asid-no-flush",
             Variant::AsidNoAside => "stafeto-asid-no-aside",
+            Variant::AsidEarly => "stafeto-asid-early",
             Variant::UnmapLocal => "stafeto-unmap-local",
             Variant::AsidProbe3 => "stafeto-asid-3",
         }
@@ -8910,7 +8919,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 11] = [
+const SMP_PROBE_LINES: [&str; 12] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
@@ -8922,6 +8931,7 @@ const SMP_PROBE_LINES: [&str; 11] = [
     "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
     "smp: 88 processes on 4 CPUs read only their own pages, in waves of 16 and one by one",
     "smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1",
+    "smp: 4 processes that ended on CPU 0 with a thread on CPU 1 left no entry under their ASIDs",
 ];
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
@@ -8999,6 +9009,9 @@ fn smp_window() -> Result<(), String> {
 /// drops everything when the ASID changes and hides them), under TCG the unmap
 /// whose TLBI stays on its CPU (HVF broadcasts the local TLBI too, so it
 /// hides that one).
+/// The kernel that frees an ASID before every CPU left the tables (the CPUs
+/// never leave them) is caught on both: it stops at the first process whose
+/// tables a CPU still holds.
 fn smp_asid(only: Option<&str>) -> Result<(), String> {
     let hvf = hvf_host();
     let mut machines = vec![&qemu::VIRT];
@@ -9019,6 +9032,16 @@ fn smp_asid(only: Option<&str>) -> Result<(), String> {
         (Variant::AsidNoReserved, &qemu::HVF_V3, "reserved ASID"),
         (Variant::AsidNoFlush, &qemu::HVF_V3, "deferred flush"),
         (Variant::AsidNoAside, &qemu::HVF_V3, "aside1is"),
+        (
+            Variant::AsidEarly,
+            &qemu::VIRT,
+            "the period before aside1is",
+        ),
+        (
+            Variant::AsidEarly,
+            &qemu::HVF_V3,
+            "the period before aside1is",
+        ),
     ];
     for (variant, m, what) in breaks {
         if m.is_hvf() && hvf.is_err() {
@@ -9040,6 +9063,7 @@ fn smp_asid_break(variant: Variant, m: &qemu::Machine, what: &str) -> Result<(),
     let probes = [
         "smp_processes_keep_their_pages_across_asid_generations",
         "smp_unmap_reaches_a_thread_on_another_cpu",
+        "smp_asid_of_a_process_that_ended_is_clean_on_every_cpu",
     ];
     for _ in 0..SMP_ASID_TRIES {
         let mut cmd = qemu::command(m, &a.image, Some(&image));
@@ -9048,7 +9072,11 @@ fn smp_asid_break(variant: Variant, m: &qemu::Machine, what: &str) -> Result<(),
         let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
         let r = qemu::parse_report(&o.lines);
         let reached = o.lines.iter().any(|l| l == "smp: the ASID probe starts");
-        if r.done.is_none() && !reached {
+        // The probe kernel that lets an ASID go while a CPU holds the tables
+        // stops at the first process that ends so, which may be before the
+        // probes began.
+        let held = o.lines.iter().any(|l| l.contains("still holds the tables"));
+        if r.done.is_none() && !reached && !held {
             println!("smp asid: a run stopped before the probes began, again");
             continue;
         }
@@ -9059,7 +9087,8 @@ fn smp_asid_break(variant: Variant, m: &qemu::Machine, what: &str) -> Result<(),
             .failed
             .iter()
             .any(|(name, _)| probes.contains(&name.as_str()) || name != qemu::HOLE_TEST)
-            || r.done.is_none();
+            || r.done.is_none()
+            || held;
         if !caught {
             return Err(format!(
                 "no probe caught the kernel without {what} on {}: the run failed {:?}",
@@ -9196,7 +9225,7 @@ fn init_tests_in(
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    let made = CHILD_FAULTS - usize::from(hvf) + usize::from(cpus > 1);
+    let made = CHILD_FAULTS - usize::from(hvf) + if cpus > 1 { 1 + SMP_END_FAULTS } else { 0 };
     if faults != made {
         return Err(format!(
             "{faults} process fault lines; the test init makes {made}"

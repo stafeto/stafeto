@@ -19,7 +19,10 @@
 
 use crate::bootinfo::MAX_CPUS;
 use crate::paging::TTBR_ROOT_MASK;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{
+    AtomicU32, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 /// The widest ASID the architecture has.
 const MAX_BITS: u32 = 16;
@@ -67,6 +70,13 @@ pub struct AsidTag {
 impl AsidTag {
     fn load(&self) -> u64 {
         self.id.load(Relaxed)
+    }
+
+    /// The tag as `AsidCpus::fast` reads it: with Acquire, so that a tag of
+    /// the new generation comes with the emptied `active` words that the
+    /// generation wrote before it published the tag (`activate`).
+    fn load_acquire(&self) -> u64 {
+        self.id.load(Acquire)
     }
 
     /// The ASID the tag names, of whichever generation: the TLB of a CPU
@@ -138,8 +148,18 @@ impl AsidCpus {
     /// flushed since the generation began. One compare-and-swap puts the
     /// tag into `active`; a new generation that empties `active` first
     /// makes it fail, and one that comes later keeps the number reserved.
+    ///
+    /// The read of the tag is Acquire, and `activate` writes a tag it just
+    /// issued with Release after the new generation swapped the `active`
+    /// words to 0. Without the pair a CPU may see the tag of the new
+    /// generation before it sees its own `active` emptied: the
+    /// compare-and-swap passes, the new generation has taken the number
+    /// into `reserved` from the stale value, and this CPU skips the
+    /// `tlbi vmalle1` it owes. A tag of the old generation needs no order:
+    /// the generation read in the same condition decides it through the one
+    /// cell `active`.
     pub fn fast(&self, cpu: usize, tag: &AsidTag) -> Option<u16> {
-        let id = tag.load();
+        let id = tag.load_acquire();
         let active = &self.active[cpu].0;
         let old = active.load(Relaxed);
         if old != 0
@@ -229,7 +249,9 @@ impl AsidAllocator {
         let mut id = tag.load();
         if id >> GEN_SHIFT != cpus.generation() {
             id = self.new_context(cpus, id, clear);
-            tag.id.store(id, Relaxed);
+            // Release: the swaps of `active` in `new_generation` come first
+            // for a CPU that reads the tag in `AsidCpus::fast`.
+            tag.id.store(id, Release);
         }
         let mine = 1 << cpu;
         let flush_tlb = cpus.flush_pending.fetch_and(!mine, Relaxed) & mine != 0;

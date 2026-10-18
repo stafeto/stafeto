@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::SeqCst;
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 14] = [
+pub(crate) const TESTS: [Test; 15] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -69,6 +69,10 @@ pub(crate) const TESTS: [Test; 14] = [
     (
         "smp_unmap_reaches_a_thread_on_another_cpu",
         unmap_across_cpus,
+    ),
+    (
+        "smp_asid_of_a_process_that_ended_is_clean_on_every_cpu",
+        asid_after_end_across_cpus,
     ),
 ];
 
@@ -1138,5 +1142,65 @@ fn unmap_across_cpus() -> Outcome {
         _ => return Err("the child of the unmap probe ended some other way"),
     }
     println!("smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1");
+    Ok(())
+}
+
+/// Rounds of `asid_after_end_across_cpus`.
+const END_ROUNDS: u64 = 4;
+
+/// A child with a thread on CPU 1 that reads its page in a loop ends on
+/// CPU 0 (its first thread unmaps the page, the reader faults), so its
+/// ASID is active on CPU 1 when the process goes: the CPU keeps TTBR0 of
+/// the last thread it ran, and a walk ahead of its code would fill its TLB
+/// with entries of the tables that go. Then one child after the other on
+/// CPU 1, more than the 15 ASIDs of the probe kernel hold, each reading its
+/// own word at the address the ended child mapped: the number of the ended
+/// process comes up again, and no child may read what the ended one left.
+/// The probe kernel stops when the ASID goes while a CPU still has the
+/// tables in TTBR0 (`SpaceRelease::drop_asid`), which a walk of silicon
+/// cannot be made to show on TCG.
+fn asid_after_end_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    let mut mismatches = 0;
+    for round in 0..END_ROUNDS {
+        reset_kid_marks();
+        let kid = Kid::load(SPIN_QUOTA, 16, LEVEL)?;
+        let state = kid
+            .start()
+            .and_then(|()| kid.serve(Role::UnmapAcross, &[LEVEL.into()], &[Gift::Own]))
+            .and_then(|()| kid.end());
+        kid.close()?;
+        let_run()?;
+        match state? {
+            ProcessState::Fault { .. } => {}
+            _ => return Err("the child that ends on CPU 0 ended some other way"),
+        }
+        for i in 0..=ASID_KIDS as u64 {
+            SPAWN_CPU.store(2, Relaxed);
+            let kid = Kid::load(ASID_QUOTA, 16, LOW);
+            SPAWN_CPU.store(0, Relaxed);
+            let kid = kid?;
+            let seed = 0xE0D_0000 + round * 100 + i;
+            let result = kid
+                .start()
+                .and_then(|()| kid.serve(Role::AsidPage, &[seed, 20, 0], &[Gift::Own]))
+                .and_then(|()| ends_with_its_own_word(&kid));
+            kid.close()?;
+            let_run()?;
+            if !result? {
+                mismatches += 1;
+            }
+        }
+    }
+    check(
+        mismatches == 0,
+        "a process read the page of one that ended with its ASID active on another CPU",
+    )?;
+    println!(
+        "smp: {END_ROUNDS} processes that ended on CPU 0 with a thread on CPU 1 left no entry under their ASIDs"
+    );
     Ok(())
 }

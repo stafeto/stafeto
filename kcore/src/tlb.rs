@@ -101,10 +101,38 @@ pub fn forget_range(tag: &AsidTag, start: u64, pages: u64, mmu: &mut impl Mmu) {
     }
 }
 
-/// Makes the tables rooted at `root` safe to free: TTBR0 of this CPU
-/// leaves them, and the TLBs of every CPU drop each entry of their ASID,
-/// which is free again afterwards. In this order, so that no walk of this
-/// CPU brings the entries back in between.
+/// The first half of making the tables rooted at `root` safe to free:
+/// TTBR0 of this CPU leaves them. Every other CPU does the same at its
+/// next quiescent point (`aspace::leave`), and `retire_asid` runs once all
+/// of them passed one.
+pub fn leave_tables(root: u64, empty: u64, mmu: &mut impl Mmu) {
+    if mmu.ttbr0() & TTBR_ROOT_MASK == root {
+        mmu.set_ttbr0(ttbr0(empty, 0));
+    }
+}
+
+/// The second half: the TLBs of every CPU drop each entry of the ASID of
+/// `tag`, which is free again afterwards. The caller runs it when no CPU
+/// holds the tables in TTBR0 any more: a walk of a CPU that does would
+/// bring entries back under a number that is issued again, and `release`
+/// of the tag would hand it out.
+pub fn retire_asid(
+    asids: &mut AsidAllocator,
+    cpus: &AsidCpus,
+    tag: &mut AsidTag,
+    mmu: &mut impl Mmu,
+) {
+    if let Some(asid) = asids.release(cpus, tag)
+        && !cfg!(feature = "break-aside")
+    {
+        mmu.invalidate_asid(tlbi_asid(asid));
+    }
+}
+
+/// Both halves in a row, for a space no other CPU ever ran or that nothing
+/// else can reach: TTBR0 of this CPU leaves the tables, and the ASID goes
+/// with its TLB entries, in this order, so that no walk of this CPU brings
+/// the entries back in between.
 pub fn retire(
     asids: &mut AsidAllocator,
     cpus: &AsidCpus,
@@ -113,14 +141,8 @@ pub fn retire(
     empty: u64,
     mmu: &mut impl Mmu,
 ) {
-    if mmu.ttbr0() & TTBR_ROOT_MASK == root {
-        mmu.set_ttbr0(ttbr0(empty, 0));
-    }
-    if let Some(asid) = asids.release(cpus, tag)
-        && !cfg!(feature = "break-aside")
-    {
-        mmu.invalidate_asid(tlbi_asid(asid));
-    }
+    leave_tables(root, empty, mmu);
+    retire_asid(asids, cpus, tag, mmu);
 }
 
 #[cfg(test)]

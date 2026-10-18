@@ -8,7 +8,9 @@
 //! quiescent points of a CPU are the top of the loop of the way out of the
 //! kernel (`sched::exit_loop`), where its kernel stack is empty and no
 //! pointer into a shared object is held, and its idle wait (`idle`,
-//! `awake`). On one CPU the period ends at the next of its own points. A CPU
+//! `awake`). On one CPU the period ends at the next of its own points. A
+//! point takes TTBR0 off the last thread's tables (`aspace::leave`), so that
+//! a retired address space is held by no CPU once its period passed. A CPU
 //! keeps the objects it retired in a list of its own (`Local::retired`),
 //! oldest first, and frees them itself (`quiesce`).
 
@@ -96,6 +98,10 @@ pub fn pending() -> bool {
 pub fn quiesce() {
     #[cfg(feature = "window-probe")]
     crate::cmd::window::lag();
+    // A retired address space waits for every CPU to leave its tables: the
+    // TTBR0 this CPU kept from its last thread goes before the mark
+    // (aspace::leave). The next thread activates its space again.
+    crate::mm::aspace::leave();
     GRACE.quiesce(cpu::this().index());
     poll();
 }

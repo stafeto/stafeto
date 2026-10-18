@@ -567,8 +567,13 @@ unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
     })
 }
 
-/// The stage Space: the first portion takes the space and retires it,
-/// each later one gives a table back. True once the root went.
+/// The stage Space: the first portion takes the space off this CPU's
+/// TTBR0 and retires it; its ASID goes, and with it the TLB entries of
+/// every CPU, once all CPUs passed a quiescent point, where each leaves the
+/// tables (qsbr::quiesce, aspace::leave): no walk of a CPU that kept the
+/// tables in TTBR0 may bring an entry back under a number that is issued
+/// again. The portions in between give nothing back and requeue; each later
+/// one then gives a table back. True once the root went.
 ///
 /// # Safety
 /// `p` is alive and on its stages.
@@ -577,7 +582,16 @@ unsafe fn release_space(p: *mut Process) -> bool {
     let (space, retired, quota) = unsafe { (&mut (*p).space, &mut (*p).retired, &mut (*p).quota) };
     let Some(release) = retired.as_mut() else {
         let space = space.take().expect("a space at the stage Space");
-        *retired = Some(space.retire());
+        let release = retired.insert(space.retire_quiet());
+        // With this CPU the only one up, the TTBR0 it just left is the only
+        // one that held the tables: no period to wait for.
+        if cfg!(feature = "break-asid-retire") || crate::smp::cpus() == 1 {
+            release.drop_asid();
+        } else {
+            // SAFETY: the node is in this process, which stays alive until
+            // its stage Space is done, and that waits for `reclaim`.
+            unsafe { crate::qsbr::retire(NonNull::from(&mut (*p).space_node), reclaim_asid) };
+        }
         return false;
     };
     let spent = release.step(quota);
@@ -585,6 +599,26 @@ unsafe fn release_space(p: *mut Process) -> bool {
         *retired = None;
     }
     spent
+}
+
+/// The period of a retired space passed (qsbr), in a section under `OBJ`:
+/// its ASID goes. The portions of the process run on this CPU, between the
+/// points where it frees what it retired, so none reads `retired` now.
+///
+/// # Safety
+/// `d` is the `space_node` of a process at its stage Space, which has a
+/// `retired` space.
+unsafe fn reclaim_asid(d: NonNull<crate::qsbr::Deferred>) {
+    let offset = core::mem::offset_of!(Process, space_node);
+    // SAFETY: the node is the field of a process that stays alive until its
+    // release took the ASID away.
+    unsafe {
+        let p = d.as_ptr().byte_sub(offset).cast::<Process>();
+        (*p).retired
+            .as_mut()
+            .expect("a retired space waits for its period")
+            .drop_asid();
+    }
 }
 
 /// The stage Buffers: the message buffers of the threads the end stopped

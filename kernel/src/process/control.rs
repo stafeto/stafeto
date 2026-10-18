@@ -93,8 +93,10 @@ pub fn control(process: NonNull<Process>, suspend: bool, cause: u8) -> Result<()
             if suspend {
                 return Ok(cancel(process));
             }
-            if (*p).parked.first().is_some() {
-                assert!((*p).resume_level == 0, "a continuation was queued twice");
+            // A continuation whose portion runs (`cancel` left it) reads the
+            // parked list and the gate in its next section: it needs no
+            // second item.
+            if (*p).parked.first().is_some() && (*p).resume_level == 0 {
                 (*p).resume_level = cause.max((*p).level);
                 retain(process);
                 let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
@@ -111,7 +113,9 @@ pub fn control(process: NonNull<Process>, suspend: bool, cause: u8) -> Result<()
 }
 
 /// Cancel a queued continuation, passing its reference back to the caller.
-/// Teardown reuses that reference and the cleanup item.
+/// Teardown reuses that reference and the cleanup item. False when the
+/// continuation is not queued any more: its portion took the item off the
+/// queue without `OBJ` and runs, and it releases its reference itself.
 ///
 /// # Safety
 /// The process is alive and none of its portions is active.
@@ -122,7 +126,9 @@ pub(super) unsafe fn cancel(process: NonNull<Process>) -> bool {
         if (*p).resume_level == 0 {
             return false;
         }
-        cleanup::remove(NonNull::new_unchecked(&raw mut (*p).cleanup));
+        if !cleanup::remove(NonNull::new_unchecked(&raw mut (*p).cleanup)) {
+            return false;
+        }
         (*p).resume_level = 0;
         true
     }
@@ -207,7 +213,15 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
                         sched::unpark(k, t);
                     }
                 }
-                !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some()
+                let left = !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some();
+                if !left {
+                    // The last look at the list and the end of the
+                    // continuation are one section: a resume after it
+                    // queues a continuation of its own, one before it is
+                    // seen here.
+                    (*p).resume_level = 0;
+                }
+                left
             }
         });
         if !left {
@@ -224,7 +238,6 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
                 level,
             );
         } else {
-            (*p).resume_level = 0;
             let _section = crate::obj::lock();
             release(process, level);
         }

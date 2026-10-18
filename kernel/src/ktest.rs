@@ -213,6 +213,10 @@ const TESTS: &[(&str, TestFn)] = &[
         last_reference_only_queues_the_object,
     ),
     (
+        "cleanup_remove_finds_an_item_a_portion_took",
+        cleanup_remove_finds_an_item_a_portion_took,
+    ),
+    (
         "teardown_resumes_where_it_stopped",
         teardown_resumes_where_it_stopped,
     ),
@@ -2231,6 +2235,40 @@ fn last_reference_only_queues_the_object(_: &Boot) -> Result<(), &'static str> {
 /// A thread holds the last reference to its process, and its own last
 /// one goes at `level`: the thread's portion lets the process go at the
 /// same level, which queues the process there.
+/// The item the test below queues and takes: a bare one, which stands for
+/// the continuation of a process whose portion took it off the queue.
+struct BareItem(core::cell::UnsafeCell<cleanup::Item>);
+
+// SAFETY: one test uses it, on one CPU.
+unsafe impl Sync for BareItem {}
+
+static BARE_ITEM: BareItem = BareItem(core::cell::UnsafeCell::new(cleanup::Item::new()));
+
+/// `cleanup::remove` of a queued item takes it out and says so; once a
+/// portion took the item off the queue (with no hold of `OBJ`, so that the
+/// cancel of a continuation on another CPU may see it so), it says false
+/// and leaves the queue alone, where it used to stop the kernel.
+fn cleanup_remove_finds_an_item_a_portion_took(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 3;
+    cleanup::drain();
+    let item = NonNull::new(BARE_ITEM.0.get()).ok_or("no item")?;
+    // SAFETY: the item is the test's own, in no queue, and stays in place.
+    unsafe {
+        cleanup::enqueue(item, cleanup::Work::Timers, LEVEL);
+        check(cleanup::remove(item), "a queued item was not removed")?;
+        check(cleanup::len() == 0, "the removal left the queue's count")?;
+        cleanup::enqueue(item, cleanup::Work::Timers, LEVEL);
+    }
+    cleanup::portion();
+    // SAFETY: as above.
+    let removed = unsafe { cleanup::remove(item) };
+    check(!removed, "an item a portion took was removed again")?;
+    check(
+        cleanup::len() == 0 && cleanup::top().is_none(),
+        "the second removal touched the queue",
+    )
+}
+
 fn thread_portion_keeps_its_level(level: u8) -> Result<(), &'static str> {
     let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
     let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo);

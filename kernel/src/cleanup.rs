@@ -191,11 +191,15 @@ pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
     unsafe { push(item, work.into(), level, true) }
 }
 
-/// Takes an item's work out of the queue in O(1).
+/// Takes an item's work out of the queue in O(1): true when it was queued.
+/// False when the owner's portion took it off the queue already, which
+/// happens with no hold of `OBJ` (`portion`): that portion runs the work
+/// and keeps the reference the item stood for.
 ///
 /// # Safety
-/// `item` is alive and queued; its owner takes responsibility for its work.
-pub unsafe fn remove(item: NonNull<Item>) {
+/// `item` is alive; its work belongs to the object, which is at its stage
+/// or in its continuation, and queued or in its portion.
+pub unsafe fn remove(item: NonNull<Item>) -> bool {
     // The item is queued on the CPU that pushed it, which may be another
     // CPU than this: its queue, under its lock.
     let mut q = loop {
@@ -205,12 +209,17 @@ pub unsafe fn remove(item: NonNull<Item>) {
             break q;
         }
     };
-    // SAFETY: the caller's promise.
+    // SAFETY: the caller's promise; the link is read under the queue's
+    // lock, which `portion` holds when it takes the item.
     unsafe {
+        if !(*item.as_ptr()).link.is_queued() {
+            return false;
+        }
         q.items.remove(item);
         (*item.as_ptr()).work = None;
     }
     q.len -= 1;
+    true
 }
 
 /// Moves a queued object to the head of `level`, unless it stands higher:
