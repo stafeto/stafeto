@@ -284,7 +284,65 @@ const SYSTEM_PATHS: [&str; 30] = [
 /// Whether the base system owns `path`: the paths above and the device
 /// nodes below /dev.
 fn is_system(path: &str) -> bool {
-    SYSTEM_PATHS.contains(&path) || path.starts_with("/dev/")
+    SYSTEM_PATHS.contains(&path)
+        || path.starts_with("/dev/")
+        || ZONES
+            .iter()
+            .any(|(zone, _)| path == format!("{ZONEINFO}/{zone}"))
+        || ZONE_DIRS.iter().any(|d| path == format!("{ZONEINFO}/{d}"))
+        || path == ZONEINFO
+}
+
+/// Where the image keeps its time zones: TZif files, which the C library reads
+/// for TZ=<name>. The set is UTC and ten common zones (docs/status.md); the
+/// files are `zic -b slim` output of tzdata 2026e (docs/zoneinfo.md).
+const ZONEINFO: &str = "/usr/share/zoneinfo";
+const ZONE_DIRS: [&str; 5] = ["Etc", "Europe", "America", "Asia", "Australia"];
+const ZONES: [(&str, &[u8]); 10] = [
+    ("Etc/UTC", include_bytes!("../zoneinfo/Etc/UTC")),
+    ("Europe/London", include_bytes!("../zoneinfo/Europe/London")),
+    ("Europe/Berlin", include_bytes!("../zoneinfo/Europe/Berlin")),
+    ("Europe/Moscow", include_bytes!("../zoneinfo/Europe/Moscow")),
+    (
+        "America/New_York",
+        include_bytes!("../zoneinfo/America/New_York"),
+    ),
+    (
+        "America/Chicago",
+        include_bytes!("../zoneinfo/America/Chicago"),
+    ),
+    (
+        "America/Los_Angeles",
+        include_bytes!("../zoneinfo/America/Los_Angeles"),
+    ),
+    ("Asia/Tokyo", include_bytes!("../zoneinfo/Asia/Tokyo")),
+    ("Asia/Kolkata", include_bytes!("../zoneinfo/Asia/Kolkata")),
+    (
+        "Australia/Sydney",
+        include_bytes!("../zoneinfo/Australia/Sydney"),
+    ),
+];
+
+/// The directories and files of the time zones of the image.
+fn zoneinfo() -> Vec<RootFile> {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let mut files = vec![dir(ZONEINFO)];
+    files.extend(
+        ZONE_DIRS
+            .iter()
+            .map(|d| dir(leak(format!("{ZONEINFO}/{d}")))),
+    );
+    files.extend(ZONES.iter().map(|&(zone, bytes)| {
+        of(
+            leak(format!("{ZONEINFO}/{zone}")),
+            0o644,
+            ROOT,
+            Source::Bytes(leak(format!("zoneinfo-{}", zone.replace('/', "-"))), bytes),
+        )
+    }));
+    files
 }
 
 /// The bytes of the files that packages name as `bytes:<name>`.
@@ -399,6 +457,7 @@ fn shell_files() -> Result<Vec<RootFile>, String> {
     files.extend(package_files(&crate::packages::of_image(
         "boot-ash-dialog.img",
     )?)?);
+    files.extend(zoneinfo());
     files.extend(devices());
     Ok(files)
 }

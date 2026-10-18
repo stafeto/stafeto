@@ -51,6 +51,26 @@ impl Default for Queued {
 }
 
 impl Queued {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once; `free` and
+        // `count` are zero in `new`.
+        unsafe {
+            let entries = addr_of_mut!((*at).entries).cast::<Entry>();
+            for i in 0..POOL {
+                let next = if i + 1 < POOL { (i + 1) as u16 } else { NONE };
+                entries.add(i).write(Entry { next, ..BLANK });
+            }
+            rt::bss::fill(addr_of_mut!((*at).head), NONE);
+            rt::bss::fill(addr_of_mut!((*at).tail), NONE);
+        }
+    }
+
     pub const fn new() -> Self {
         let mut entries = [BLANK; POOL];
         let mut i = 0;

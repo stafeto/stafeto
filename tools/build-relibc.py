@@ -96,7 +96,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Goal #415 (visible CPUs): sysconf gives the CPUs that are up, sched_getaffinity
 # and sched_setaffinity go to the layer, sched_getcpu, pthread_setaffinity_np and
 # pthread_getaffinity_np, CPU_COUNT counts the whole set; tagged pin-e4248533.
-COMMIT = "e42485337bf0086eba11ca5e903aa35334d27e7b"
+# Goal #430 (image size): localtime, mktime, tzset and TZ read the TZif files of
+# /usr/share/zoneinfo and POSIX rules, with no zone database in the program
+# (chrono-tz is gone, 1.2 MB of each program); tagged pin-bc88f7aa.
+COMMIT = "bc88f7aad4e4532209552b1d986321fd599184b8"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

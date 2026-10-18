@@ -68,6 +68,23 @@ impl Default for Terminals {
 }
 
 impl Terminals {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // The one copy of the constant is in `.rodata`.
+        const BLANK: Terminal = Terminal::new();
+        // SAFETY: each element is in bounds and written once.
+        unsafe {
+            let first = core::ptr::addr_of_mut!((*at).terminals).cast::<Terminal>();
+            for i in 0..TERMINALS {
+                first.add(i).write(BLANK);
+            }
+        }
+    }
+
     pub const fn new() -> Self {
         Self {
             terminals: [Terminal::new(); TERMINALS],

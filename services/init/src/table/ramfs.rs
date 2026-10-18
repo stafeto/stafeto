@@ -124,8 +124,8 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 ];
 
 /// The dialog: the console's driver, the RAM files, the process and clock
-/// services and the launcher (the program of `busybox-probe`, whose
-/// argument `ash-launch` makes it start `/bin/ash` from its file, 5d). The
+/// services and the launcher (the program `ash-launcher`, which starts
+/// `/bin/busybox` as the getty of `/bin/ash` from its file, 5d). The
 /// shell is a child, and so is each command it forks: the pool of the
 /// process service holds the processes of the shell, of a pipeline of
 /// three, of a nested shell's command and of the failed attempts of a
@@ -142,6 +142,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     CLOCK_RTC,
     PIPE,
     Record {
+        program: "ash-launcher",
         args: b"ash-launch\0",
         connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         quota: BUSYBOX_DIALOG_QUOTA,

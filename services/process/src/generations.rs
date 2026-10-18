@@ -26,10 +26,6 @@ pub struct Generations {
 }
 
 impl Generations {
-    pub const fn new() -> Self {
-        Self { object: None }
-    }
-
     /// Makes the object and maps it in `own`, the service's process.
     pub fn make(&mut self, own: &Handle<Process>) -> Result<(), Error> {
         const { assert!((GROUPS_AT + RECORDS * 8) as u64 <= PAGE) };

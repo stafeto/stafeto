@@ -13,9 +13,6 @@ pub struct Lifetimes {
     object: Option<Handle<Memory>>,
 }
 impl Lifetimes {
-    pub const fn new() -> Self {
-        Self { object: None }
-    }
     pub fn make(&mut self, own: &Handle<Process>) -> Result<(), Error> {
         const { assert!(core::mem::size_of::<Page>() <= BYTES as usize) };
         let object = sys::mem_create(BYTES)?;

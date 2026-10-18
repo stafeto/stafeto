@@ -140,6 +140,17 @@ impl<T> Default for Loaders<T> {
 }
 
 impl<T> Loaders<T> {
+    /// What `new` makes, in place in zeroed memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    #[cfg(target_os = "none")]
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the field is in bounds and written once; the others are
+        // zero in `new`.
+        unsafe { rt::bss::fill_none(core::ptr::addr_of_mut!((*at).places)) };
+    }
+
     pub const fn new() -> Self {
         Self {
             places: [const { None }; LOADERS],
