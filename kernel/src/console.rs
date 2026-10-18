@@ -13,8 +13,13 @@
 //! keeps what the kernel shows, for the port's driver. `kprintln!` writes
 //! to the port whoever has it: the boot report, the kernel tests and the
 //! reports that end in a panic, which take the port back first
-//! (`panicking::take_console`). One CPU and interrupts masked in the
-//! kernel: atomics with relaxed order stand for a lock.
+//! (`panicking::take_console`). Only CPU 0 writes to the port (SMP stage 3,
+//! decision on the console): what `kprintln!` says on another CPU goes
+//! into the kernel log of that CPU, which the console's driver shows with
+//! the rings of the other CPUs, and no lock is needed; a report that ends
+//! in a panic writes from whichever CPU it is on, once it took the port
+//! back (`take_back`). Interrupts are masked in the kernel: atomics with
+//! relaxed order stand for a lock.
 
 use crate::arch::{mmio, timer};
 use core::fmt::{self, Write};
@@ -39,6 +44,14 @@ static PORT_SIZE: AtomicU64 = AtomicU64::new(0);
 static WINDOWS: AtomicU32 = AtomicU32::new(0);
 /// The last such window went: the next write sets the port up again.
 static RETURNED: AtomicBool = AtomicBool::new(false);
+/// A report that ends in a panic took the port: its CPU writes to it.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether this CPU writes to the port: there is one, and this is CPU 0 or
+/// a report that ends in a panic has it.
+fn writes_to_port() -> bool {
+    port().size > 0 && (crate::arch::cpu::this().index() == 0 || TAKEN.load(Relaxed))
+}
 
 fn port() -> Region {
     Region {
@@ -119,6 +132,7 @@ fn set_up() {
 /// A report that ends in a panic takes the port, whoever has it (spec
 /// 16.1, panicking::take_console).
 pub fn take_back() {
+    TAKEN.store(true, Relaxed);
     RETURNED.store(false, Relaxed);
     set_up();
 }
@@ -160,7 +174,7 @@ impl Write for Console {
     /// To the port; with none, into the kernel log as text of the kernel
     /// (spec 3.2, 16.3).
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        if port().size > 0 {
+        if writes_to_port() {
             write_bytes(s.as_bytes());
         } else {
             crate::log::kernel(|w| {
@@ -179,7 +193,7 @@ pub fn writer() -> impl Write {
 /// `args` to the port; with none, into the kernel log as one text of the
 /// kernel, in as few records as it fills (spec 3.2, 16.3).
 pub fn print(args: fmt::Arguments<'_>) {
-    if port().size > 0 {
+    if writes_to_port() {
         let _ = Console.write_fmt(args);
     } else {
         crate::log::kernel(|w| {

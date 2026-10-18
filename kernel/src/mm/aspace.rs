@@ -334,10 +334,21 @@ impl AddressSpace {
     }
 
     /// Switches TTBR0 to this space, with a new ASID when its old one is of
-    /// an earlier generation (kcore::tlb::switch_to).
+    /// an earlier generation (kcore::tlb::switch_to). A new generation
+    /// reuses the ASIDs that spaces on other CPUs run with, which takes the
+    /// agreement of every CPU on the flush (SMP stage 5): with more than one
+    /// CPU up, the kernel stops instead, at the first space that finds no
+    /// ASID of this generation and none free.
     pub fn activate(&mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
-        with_asids(|a| tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu));
+        with_asids(|a| {
+            assert!(
+                crate::smp::cpus() < 2 || a.current(&self.tag).is_some() || a.free_asids() > 0,
+                "the ASIDs of a generation ran out with more than one CPU up: \
+                 a new generation needs the flush of every CPU (SMP stage 5)"
+            );
+            tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu)
+        });
     }
 
     /// Takes TTBR0 off the tables and drops their TLB entries with the
