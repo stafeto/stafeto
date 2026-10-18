@@ -266,7 +266,7 @@ pub fn stretch_ends(now: u64) {
             s.kind[k].store(kind, Relaxed);
         }
         // The most takes of a stretch of each kind, with its length.
-        let worst = &TAKES_BY_KIND[kind as usize];
+        let worst = &TAKES_BY_KIND[(kind as usize).min(KINDS - 1)];
         let packed = (k as u64) << 48 | took.min(0xffff_ffff_ffff);
         if packed > worst.load(Relaxed) {
             worst.store(packed, Relaxed);
