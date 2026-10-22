@@ -76,7 +76,8 @@ the instruction cache is made coherent for them outside any section before
 the poll. process_create makes the child, its start channel and its exit
 source in the first section and looks at its caller and at x3 and x5 again in
 the second; a thread that leaves the call or enters with another number gives
-the child up, silently, at its own priority. S5_N = S5 + (N - 1) *
+the child up, silently, at its own priority. `wcet bound` counts the takes on the paths no test reaches (k_static, docs/wcet.md) and
+refuses a kernel with a path that takes `OBJ` twice. S5_N = S5 + (N - 1) *
 `OBJ_HOLD_MAX`.
 
 A service on another CPU than its client runs at the client's level, a

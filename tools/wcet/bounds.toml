@@ -176,6 +176,22 @@ why = "the way out of the kernel: it ends a kernel entry after the interval a ca
 prefix = "kernel::sched::exit_loop"
 why = "the loop of the way out of the kernel that resume jumps to (a jump to the address of a function)"
 
+# Functions that begin a stretch of their own. The count of the takes of OBJ
+# (k_static) leaves them out of their callers, and a [[path]] of theirs counts
+# them.
+
+[[stretch]]
+function = "kernel::syscall::mem::portions"
+why = "the portions of mem_map, mem_unmap and mem_protect: the first entry calls it after the poll for an interrupt that follows its checks (syscall::mem::begin), and go_on after the entry that starts over"
+
+[[stretch]]
+function = "kernel::syscall::mem::make"
+why = "the portions of mem_create: the first entry calls it after the poll for an interrupt that follows its checks (syscall::mem::mem_create), and go_on after the entry that starts over"
+
+[[stretch]]
+function = "kernel::syscall::proc::process_create_second"
+why = "the second portion of process_create: the first entry calls it after the poll for an interrupt that follows its first section (syscall::proc::process_create), and go_on after the entry that starts over"
+
 # Bounds of loops. `at` is the offset of the loop's header block from the start of
 # its function, or `*` for every loop of the function. A bound is the most times the
 # header runs for one entry into the loop.
@@ -209,6 +225,12 @@ function = "kernel::syscall::mem::change_map"
 at = "*"
 bound = 128
 why = "a walk of the table of mappings: at most abi::MAX_MAPPINGS = 128 entries"
+
+[[loop]]
+function = "kernel::syscall::mem::portions"
+at = "0x54"
+bound = 1
+why = "the portion loop of a long call: it polls for a pending interrupt between two portions (run_portions, spec 7.7), so the longest path without a poll is one portion, which is what B bounds, and one take of OBJ"
 
 [[loop]]
 function = "kernel::syscall::mem::make"
@@ -439,126 +461,6 @@ bound = 15
 why = "the tail, or a copy below 16 bytes: at most 15 bytes"
 
 [[loop]]
-function = "kernel::process::maps::step_change"
-at = "0x2a4"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0x3e0"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0x48c"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0x6d4"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0x840"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xcc8"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xd5c"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xa88"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xb20"
-bound = 4
-why = "the levels of the page tables a page of the portion walks, a table taken for each level that lacks one: 4 levels"
-
-[[loop]]
-function = "kernel::process::maps::step_change::{closure#0}"
-at = "0x54"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change::{closure#0}"
-at = "0xb4"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change::{closure#0}"
-at = "0x160"
-bound = 16
-why = "the pages of one portion of a change of a mapping: PORTION = 16, EXEC_PORTION = 8 (kernel::process::maps)"
-
-[[loop]]
-function = "kernel::process::maps::step_change::{closure#0}"
-at = "0x78"
-bound = 64
-why = "the 64 cache lines of one page"
-
-[[loop]]
-function = "kernel::process::maps::step_change::{closure#0}"
-at = "0xd8"
-bound = 64
-why = "the 64 cache lines of one page"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x12c"
-bound = 8
-why = "the frames of one portion of mem_create: CREATE_PORTION = 8"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x324"
-bound = 8
-why = "the frames of one portion of mem_create: CREATE_PORTION = 8"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x278"
-bound = 512
-why = "the cache lines of the frames of a portion: 8 frames of 64 lines"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x2cc"
-bound = 64
-why = "zeroes one frame by cache lines"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x380"
-bound = 64
-why = "zeroes one frame by cache lines"
-
-[[loop]]
-function = "kernel::memory::fill"
-at = "0x398"
-bound = 64
-why = "zeroes one frame by cache lines"
-
-[[loop]]
 function = "kernel::cmd::flush"
 at = "0x98"
 bound = 96
@@ -591,24 +493,6 @@ bytes = 4096
 why = "no object the kernel moves or fills is larger than a frame"
 
 [[loop]]
-function = "kernel::mm::phys::alloc_zeroed"
-at = "0xb4"
-bound = 256
-why = "zeroes a 4096-byte frame 16 bytes at a time (stp of two zero registers)"
-
-[[loop]]
-function = "kernel::mm::phys::alloc_zeroed"
-at = "0xe8"
-bound = 64
-why = "zeroes a 4096-byte frame by blocks of `dc zva`, 64 bytes on the CPUs of the targets, fewer blocks when the block is larger"
-
-[[loop]]
-function = "kernel::mm::phys::alloc_zeroed"
-at = "0x134"
-bound = 256
-why = "the tail of a zeroing by blocks: at most 4096 bytes in steps of 16"
-
-[[loop]]
 function = "<kernel::mm::aspace::Charged as kcore::paging::TableMemory>::alloc_table"
 at = "0xcc"
 bound = 256
@@ -626,27 +510,9 @@ at = "0x13c"
 bound = 256
 why = "the tail of a zeroing by blocks: at most 4096 bytes in steps of 16"
 
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xbd4"
-bound = 256
-why = "zeroes a 4096-byte frame 16 bytes at a time (stp of two zero registers)"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xbfc"
-bound = 64
-why = "zeroes a 4096-byte frame by blocks of `dc zva`, 64 bytes on the CPUs of the targets, fewer blocks when the block is larger"
-
-[[loop]]
-function = "kernel::process::maps::step_change"
-at = "0xc48"
-bound = 256
-why = "the tail of a zeroing by blocks: at most 4096 bytes in steps of 16"
-
 [[indirect]]
 function = "kernel::syscall::mem::change"
-at = "0x78"
+at = "0x44"
 targets = ["kernel::syscall::mem::mem_unmap", "kernel::syscall::mem::mem_protect"]
 why = "change takes the step of the call as a function: mem_unmap or mem_protect"
 
@@ -656,26 +522,49 @@ why = "change takes the step of the call as a function: mem_unmap or mem_protect
 name = "timer expiry in the interrupt"
 symbol = "kernel::timer::expire"
 measured = ["timer portions ticks: interrupt"]
+complete = "yes"
 
 [[path]]
 name = "firing of a level's timers"
 symbol = "kernel::timer::fire_at"
 measured = ["timer portions ticks: fire"]
+complete = "yes"
 
 [[path]]
 name = "interrupt of a device, to its driver"
 symbol = "kernel::irq::deliver"
+plus = ["kernel::qsbr::reclaim"]
 measured = ["interrupt path ticks: driver", "interrupt path ticks: portion"]
+complete = "yes"
 
 [[path]]
 name = "portion of cleanup"
 symbol = "kernel::cleanup::portion"
 measured = ["teardown portions ticks: buffers", "teardown portions ticks: shell", "teardown portions ticks: end_call", "teardown portions ticks: teardown_threads", "teardown portions ticks: child_threads", "teardown portions ticks: session_buffers", "teardown portions ticks: session_handles", "teardown portions ticks: teardown_any"]
+complete = "yes"
 
 [[path]]
 name = "commands from other CPUs (SGI)"
 symbol = "kernel::smp::handle"
 measured = []
+
+[[path]]
+name = "portion of mem_map, mem_unmap, mem_protect"
+symbol = "kernel::syscall::mem::portions"
+measured = []
+complete = "yes"
+
+[[path]]
+name = "portion of mem_create"
+symbol = "kernel::syscall::mem::make"
+measured = []
+complete = "yes"
+
+[[path]]
+name = "second portion of process_create"
+symbol = "kernel::syscall::proc::process_create_second"
+measured = []
+complete = "yes"
 
 [[loop]]
 function = "kernel::timer::expire"
@@ -688,30 +577,6 @@ function = "kernel::timer::expire"
 at = "0xb0"
 bound = 63
 why = "one item of the cleanup queue for each level that expired: at most 63 (spec 10)"
-
-[[loop]]
-function = "kernel::timer::fire_at"
-at = "0x1e4"
-bound = 63
-why = "the levels 1-63 of the timers: at most 63 (spec 10)"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1044"
-bound = 512
-why = "the frames of one node of a page list that goes back to the allocator: at most 512 (kcore::pagelist)"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1dbc"
-bound = 1
-why = "a wait for another CPU (a command or an acknowledgement it owes), which its own hold bounds: not work of this CPU"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1df8"
-bound = 8
-why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::smp::handle"
@@ -750,22 +615,10 @@ bound = 8
 why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
 
 [[loop]]
-function = "kernel::syscall::mem::mem_create"
-at = "0x20c"
-bound = 64
-why = "the slots of one page of a pool of objects: a page holds at most 4096 / 64 of them"
-
-[[loop]]
 function = "kernel::syscall::mem::portions"
 at = "0x48"
 bound = 1
 why = "the portion loop of a long call: it polls for a pending interrupt between two portions (run_portions, spec 7.7), so the longest path without a poll is one portion, which is what B bounds"
-
-[[loop]]
-function = "kernel::timer::fire_at"
-at = "0x94"
-bound = 16
-why = "the timers of one portion of a level's firing: kcore::timer::FIRE_PORTION = 16"
 
 [[loop]]
 function = "kernel::cleanup::lift"
@@ -809,36 +662,330 @@ at = "0xbfc"
 bound = 8
 why = "one SGI for each CPU with a command: at most MAX_CPUS = 8"
 
+[[free]]
+prefix = "kernel::smp::lock_rounds"
+why = "the rounds of the lock probe, which the probe builds (smp-probe) run on request; the kernel that ships does not call them"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x10c"
+bound = 384
+why = "`dc civac` on the lines of the frames of one portion of a contiguous object: CREATE_PORTION = 6 frames of 64 lines (clean_invalidate_frames)"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x1b8"
+bound = 6
+why = "the frames of one portion of a contiguous object: CREATE_PORTION = 6"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x160"
+bound = 8
+why = "zeroes a frame by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x214"
+bound = 256
+why = "zeroes a frame 16 bytes at a time (stp of two zero registers): 4096 / 16"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x22c"
+bound = 64
+why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x380"
+bound = 8
+why = "the frames one portion of an object of pages takes: FRAMES_PER_SECTION = 6 pages and the 2 nodes of their list (memory::Taken)"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x330"
+bound = 8
+why = "zeroes a frame by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x3d8"
+bound = 256
+why = "zeroes a frame 16 bytes at a time (stp of two zero registers): 4096 / 16"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x3f0"
+bound = 64
+why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
+
+[[loop]]
+function = "kernel::memory::fill"
+at = "0x4bc"
+bound = 8
+why = "the pages and nodes one portion adds to a list: CREATE_PORTION = 6 pages and the 2 nodes (kcore::pagelist::PageList::fill)"
+
+[[loop]]
+function = "kernel::mm::phys::alloc_zeroed"
+at = "0xe4"
+bound = 256
+why = "zeroes a 4096-byte frame 16 bytes at a time (stp of two zero registers)"
+
+[[loop]]
+function = "kernel::mm::phys::alloc_zeroed"
+at = "0x114"
+bound = 8
+why = "zeroes a frame by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
+
+[[loop]]
+function = "kernel::mm::phys::alloc_zeroed"
+at = "0x160"
+bound = 64
+why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x1bc"
+bound = 16
+why = "the pages of one portion of a change of a mapping: PORTION = 16 (kernel::process::maps)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x294"
+bound = 16
+why = "the pages of one portion of a change of a mapping: PORTION = 16 (kernel::process::maps)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x488"
+bound = 16
+why = "the pages of one portion of a change of a mapping: PORTION = 16 (kernel::process::maps)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x58c"
+bound = 16
+why = "the pages of one portion of a change of a mapping: PORTION = 16 (kernel::process::maps)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x68c"
+bound = 16
+why = "the pages of one portion of a change of a mapping: PORTION = 16 (kernel::process::maps)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x720"
+bound = 4
+why = "the levels of the page tables a page of the portion walks, a table taken for each level that lacks one: 4 levels"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x7d8"
+bound = 256
+why = "zeroes a 4096-byte table 16 bytes at a time (stp of two zero registers)"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x800"
+bound = 8
+why = "zeroes a table by blocks of `dc zva`, eight a pass: 4096 bytes in blocks of at least 64 bytes make at most 8 passes"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x84c"
+bound = 64
+why = "the tail of a zeroing by blocks of `dc zva`: at most 64 blocks of 64 bytes"
+
+[[loop]]
+function = "kernel::process::maps::step_change"
+at = "0x95c"
+bound = 8
+why = "the frames of one executable portion that the test hook (testpoint::code_mapped) looks up: EXEC_PORTION = 8; the kernel that ships has no such loop"
+
+[[loop]]
+function = "kernel::process::maps::fill_frames"
+at = "0xa0"
+bound = 16
+why = "the frames of one portion of a change of a mapping, read from the leaves of a list: PORTION = 16 (kcore::pagelist::PageList::frames)"
+
+[[loop]]
+function = "kernel::process::maps::fill_frames"
+at = "0x12c"
+bound = 16
+why = "the frames of one portion of a change of a mapping: PORTION = 16 (an object over the boot image or a device window)"
+
+[[loop]]
+function = "kernel::process::maps::fill_frames"
+at = "0x164"
+bound = 16
+why = "the frames of one portion of a change of a mapping: PORTION = 16 (a contiguous object)"
+
+[[loop]]
+function = "kernel::arch::aarch64::cache::sync_icache_frames"
+at = "0x50"
+bound = 8
+why = "the frames of one executable portion: EXEC_PORTION = 8"
+
+[[loop]]
+function = "kernel::arch::aarch64::cache::sync_icache_frames"
+at = "0x74"
+bound = 64
+why = "the 64 cache lines of one page"
+
+[[loop]]
+function = "kernel::arch::aarch64::cache::sync_icache_frames"
+at = "0xb0"
+bound = 8
+why = "the frames of one executable portion: EXEC_PORTION = 8"
+
+[[loop]]
+function = "kernel::arch::aarch64::cache::sync_icache_frames"
+at = "0xd4"
+bound = 64
+why = "the 64 cache lines of one page"
+
+[[loop]]
+function = "kernel::syscall::mem::portions"
+at = "0x330"
+bound = 1
+why = "the halt after a call that never returns (wfe, b): a stop of the kernel, no path of the analysis"
+
+[[loop]]
+function = "kernel::timer::post_fired"
+at = "0x50"
+bound = 8
+why = "the timers of one portion of a level's firing: kcore::timer::FIRE_PORTION = 8"
+
+[[loop]]
+function = "kernel::timer::fire_at"
+at = "0x284"
+bound = 63
+why = "the levels 1-63 of the timers: at most 63 (spec 10)"
+
+[[loop]]
+function = "<kernel::mm::aspace::SpaceRelease>::collect"
+at = "0x94"
+bound = 512
+why = "one step reads at most 512 entries of a table (SpaceRelease::collect)"
+
+[[loop]]
+function = "<kcore::asid::AsidAllocator>::release"
+at = "0x3c"
+bound = 8
+why = "the ASIDs the CPUs reserved: one for each CPU, at most MAX_CPUS = 8"
+
+[[loop]]
+function = "kernel::qsbr::reclaim"
+at = "*"
+bound = 8
+why = "the loops of a turn of the way out that frees retired objects: the epochs of the CPUs, at most MAX_CPUS = 8 (qsbr::GRACE), and the objects of one turn, RECLAIM_BATCH = 8"
+
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x17d4"
-bound = 512
-why = "the frames of one node of a page list: at most 512 (kcore::pagelist)"
+at = "0x40c"
+bound = 9
+why = "the waiters of one portion of the stage Close of a channel: CLOSE_PORTION = 8 units, one for each head at least, and the look that ends the loop (channel::clean)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x610"
+bound = 4
+why = "the handles a message carries: abi::MESSAGE_HANDLES = 4"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x620"
+bound = 4
+why = "the handles a message carries: abi::MESSAGE_HANDLES = 4 (the walk over the empty places of the array)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0xa10"
+bound = 7
+why = "the frames one step of a page list gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (kcore::pagelist::PageList::release_collect)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0xab0"
+bound = 7
+why = "the pages one step of a page log gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (the stage Shell)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0xe4c"
+bound = 64
+why = "the entries of one chunk of the handle table that a step of the stage Handles looks at: CHUNK = 64"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x174c"
+bound = 1
+why = "the jump through the table of the match over the stages of a process after its section was taken: the table has no entry that leads back to it; the read of the table in the image puts one"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x1770"
+bound = 8
+why = "the epochs of the CPUs a retired object waits for: at most MAX_CPUS = 8 (qsbr::GRACE)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x17b0"
+bound = 8
+why = "one SGI for each CPU that has something to take: at most MAX_CPUS = 8"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x187c"
+bound = 7
+why = "the frames of one portion that go back to the allocator: FRAMES_PER_SECTION = 6 (memory::clean, the stage Shell)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x18e0"
+bound = 8
+why = "the units of one portion of the stage Buffers: BUFFERS_PORTION = 8 (a thread is two units at least)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x1978"
+bound = 8
+why = "looks again at the queue of the CPU that owns the item, which another CPU may have changed meanwhile: at most one change for each of the 8 CPUs (cleanup::lift, process::begin)"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x19e8"
+bound = 128
+why = "the entries of the table of mappings that the stage Mappings looks at in a portion: abi::MAX_MAPPINGS = 128"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x1a54"
+bound = 33
+why = "the clients of one portion of the stage Replies: REPLIES_PORTION = 32 and the look that ends the loop"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x1dc0"
+bound = 13
+why = "the units of one portion of the stage Threads: THREADS_PORTION = 12 and the look that ends the loop"
+
+[[loop]]
+function = "kernel::cleanup::portion"
+at = "0x1e84"
+bound = 33
+why = "the threads of one portion of the continuation of a suspended process: UNPARK_PORTION = 32 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
 at = "0x1c4c"
-bound = 32
-why = "the buffers of one portion of the stage Buffers: BUFFERS_PORTION = 32 (kernel::process::teardown)"
+bound = 128
+why = "the slots of one page of a pool that the stage Shell looks at before the page goes back: a page of 4096 bytes holds at most 128 slots of 32 bytes (kcore::slab)"
 
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1f1c"
-bound = 32
-why = "the handles of one portion of the stage Handles: HANDLES_PORTION = 32"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x24f0"
-bound = 32
-why = "the waiters of one portion of the stage Close or Replies: CLOSE_PORTION = REPLIES_PORTION = 32"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x2820"
-bound = 56
-why = "the threads of one portion of the stage Threads: THREADS_PORTION = 56"
-
-[[free]]
-prefix = "kernel::smp::lock_rounds"
-why = "the rounds of the lock probe, which the probe builds (smp-probe) run on request; the kernel that ships does not call them"
+[[indirect]]
+function = "kernel::qsbr::reclaim"
+at = "0x348"
+targets = ["kernel::irq::reclaim", "kernel::process::teardown::reclaim_asid", "kernel::smp::probe_reclaim"]
+why = "the function a retired object was given at qsbr::retire: the binding of an interrupt, the address space of an ended process, and the probe of the CPUs' quiescent points"

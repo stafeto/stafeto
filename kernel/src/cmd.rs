@@ -305,12 +305,20 @@ fn thread_cmds<'a>(t: NonNull<Thread>) -> &'a AtomicU8 {
 pub const DRAIN_BATCH: usize = 8;
 
 /// The owner's, where it handles the SGI: takes up to DRAIN_BATCH threads
-/// from the queues to this CPU, one from each queue in turn, and serves each
-/// thread's flags in one section, after the copies of the messages of the
-/// woken ones. What is left waits for the SGI this CPU sends itself, which
-/// the next poll for an interrupt takes. On the empty kernel stack, no lock
-/// held.
+/// from the queues to this CPU, one from each queue in turn (`take_batch`),
+/// and serves each thread's flags in one section, after the copies of the
+/// messages of the woken ones (`serve_batch`). What is left waits for the
+/// SGI this CPU sends itself, which the next poll for an interrupt takes. On
+/// the empty kernel stack, no lock held.
 pub fn drain() {
+    let (batch, n) = take_batch();
+    serve_batch(&batch[..n]);
+}
+
+/// The threads one SGI serves, with the flags they carried: up to
+/// DRAIN_BATCH of the queues to this CPU, one from each queue in turn. Reads
+/// the rings and the flags of the threads, takes no lock.
+fn take_batch() -> ([(NonNull<Thread>, u8); DRAIN_BATCH], usize) {
     let me = cpu::this().index();
     let cpus = crate::smp::cpus();
     let mut batch = [(NonNull::<Thread>::dangling(), 0u8); DRAIN_BATCH];
@@ -336,28 +344,46 @@ pub fn drain() {
             break;
         }
     }
+    (batch, n)
+}
+
+/// Serves the flags of the threads of `batch` in one section, with the
+/// dying timers that fill the rest of its places: one take of OBJ between
+/// two polls for an interrupt (decision 3 of the SMP design). Reads no ring:
+/// the kernel tests hand it a full batch of their own.
+pub fn serve_batch(batch: &[(NonNull<Thread>, u8)]) {
+    let me = cpu::this().index();
+    let cpus = crate::smp::cpus();
+    let n = batch.len();
     if n == 0 && !crate::timer::reaps_waiting() {
         return;
     }
     // A woken thread reads its message: the copy of the CPU that woke it
     // comes after the flag, takes the time of 960 bytes and needs no OBJ.
-    for &(t, flags) in &batch[..n] {
+    for &(t, flags) in batch {
         if flags & WAKE != 0 {
             thread::wait_copies(t);
         }
     }
-    let timers_left = {
-        let _section = crate::obj::lock();
-        for &(t, flags) in &batch[..n] {
-            serve(t, flags);
-        }
-        crate::timer::reap(DRAIN_BATCH - n)
-    };
+    let timers_left = serve_all(batch);
     // A batch that was not full left the queues empty, and each later push
     // comes with an SGI of its own.
     if timers_left || n == DRAIN_BATCH && (0..cpus).any(|f| f != me && !RINGS[me][f].is_empty()) {
         gic::send_sgi(me, SGI_CMD);
     }
+}
+
+/// The section of `serve_batch`: the flags of every thread of `batch`, and
+/// the dying timers that fill the rest of the places. True when timers are
+/// left.
+#[inline(never)]
+fn serve_all(batch: &[(NonNull<Thread>, u8)]) -> bool {
+    crate::obj::serving(crate::obj::ENTRY_DRAIN);
+    let _section = crate::obj::lock();
+    for &(t, flags) in batch {
+        serve(t, flags);
+    }
+    crate::timer::reap(DRAIN_BATCH - batch.len())
 }
 
 /// The flags of `t` in the order that keeps a thread consistent: start,

@@ -152,6 +152,21 @@ portions, so the estimate is the path of one portion, and the measure is the
 longest of the rows that measure a portion (`memory portions`). The rows of
 the interrupt paths name the test rows that measure them.
 
+Next to the estimate the row prints `takes`, k_static: the most calls of
+`kernel::obj::acquire`, the one function the kernel takes `OBJ` through (kept
+out of line for this), on any path of the entry, with the loops at their bounds.
+Every stretch between two polls for an interrupt takes `OBJ` once (docs/smp.md),
+so `wcet bound` refuses the kernel when k_static is above 1. A system call has
+the larger of the count of its handlers and that of `dispatch` (an arm of
+`dispatch` that takes `OBJ` hands its section to a handler that takes none, and
+a handler that takes it itself sits in an arm that does not); a long call also
+has the count of `go_on`, where its next entry starts. A function that begins a
+stretch of its own, which a poll for an interrupt precedes at each call
+(`portions`, `make`, `process_create_second`), is left out of the count of its
+callers and has a row of its own. A count with a plus sign is a lower bound: a
+loop or a call on the path could not be resolved. A loop that takes `OBJ` and has
+no bound is refused outright, since its count could be anything.
+
 The estimate is a bound on what the code can do with the loop bounds of the
 annotation file. The tests reach a small part of it: a call that posts one
 command measures a few hundred instructions where the frame holds the path of
@@ -179,9 +194,14 @@ their bounds, the bounds that no loop matched, and the longest functions.
 
 The kernel group of `ci` runs it as the step `wcet bound`. The step prints the
 table. It fails when the analysis breaks (an annotation names no function, a
-call of the kernel has no `[[call]]` entry, the file does not parse) and never
-on a number: an estimate below a measure, or a loop without a bound, is printed
-and leaves the step green.
+call of the kernel has no `[[call]]` entry, the file does not parse), when an
+entry takes `OBJ` more than once (k_static above 1, or a loop with no bound that
+takes it), and when a `[[path]]` marked `complete = "yes"` is not complete: a loop
+with no bound or a call through a register that nothing resolves lies on it, so
+the portions of cleanup, the firing of timers, the interrupt of a device and the
+portions of the long calls keep every bound. An estimate below a measure, and a
+loop without a bound on the path of a system call, are printed and leave the
+step green.
 
 ### The annotation file
 
@@ -193,7 +213,8 @@ reason (`why`):
 | `[calibration]` | `counter_read`: instructions added to every estimate |
 | `[dispatch]` | the function of the system call dispatch, and the one it restarts a long call in |
 | `[[call]]` | a call by its `abi::Call` name, the functions that carry it out, `long` for a call that works in portions, `portions` for the test rows that measure it |
-| `[[path]]` | a path no call starts (symbol, test rows that measure it) |
+| `[[path]]` | a path no call starts (symbol, test rows that measure it); `plus` names more functions that the path runs after the symbol, such as a turn of the way out of the kernel, whose bounds add to its own; `complete = "yes"` makes an incomplete path a refusal |
+| `[[stretch]]` | a function that begins a stretch of its own: the count of takes of `OBJ` leaves it out of its callers |
 | `[[loop]]` | `function`, `at` (the offset of the header block from the function's start, or `*` for every loop of it), `bound` |
 | `[atomic]` | the bound of a loop that is no more than a lock word's protocol or a compare-and-swap retry (at most six blocks, no call) |
 | `[[free]]` | a prefix of function names priced at nothing: code of the test builds, the way out of the kernel |
@@ -228,6 +249,9 @@ kernel the offsets move, and the report shows which annotations to renew.
   the queues of commands (`RING` = 1024 entries a queue) and the stages of the
   teardown. Their bounds multiply along the nesting, so these estimates are far
   above the tests.
+- The count of takes follows the control-flow graph. A take, a poll for an
+  interrupt and a second take in the same function count as two takes on one
+  path unless the second is a function marked `[[stretch]]`.
 - Time is the number of instructions. Memory, cache and lock waits of other
   CPUs add to it; B_N = B + (N - 1) * OBJ_HOLD_MAX (docs/smp.md) adds the holds
   of the others.

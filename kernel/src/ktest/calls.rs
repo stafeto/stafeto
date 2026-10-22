@@ -25,6 +25,7 @@ use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel, Via};
 use crate::cleanup;
+use crate::cmd;
 use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
@@ -4262,6 +4263,73 @@ pub fn killed_caller_lets_the_child_of_process_create_go(_: &Boot) -> Result<(),
         process::in_use() == processes,
         "the child did not go with the teardown of its maker",
     )
+}
+
+/// The service of the commands other CPUs posted, a full batch (spec 8.1,
+/// 10): cmd::DRAIN_BATCH threads that wait, each with its wake, a new level
+/// and its end asked, are served in one section by `serve_batch`, which
+/// reads no ring. The section is a stretch of its own for the hold and the
+/// takes of OBJ (`obj hold kind ticks: 55`, `obj takes of kind: 55`); every
+/// thread is ready at its new level and ended, and the kernel's references
+/// to them went with the end.
+pub fn drain_serves_a_full_batch_in_one_section(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let mut threads = [None; cmd::DRAIN_BATCH];
+    let mut made = Ok(());
+    for slot in &mut threads {
+        match thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+            Ok(t) => *slot = Some(t),
+            Err(_) => made = Err("no thread"),
+        }
+    }
+    let result = made.and_then(|()| {
+        for t in threads.into_iter().flatten() {
+            sched::start(t).map_err(|_| "a thread did not start")?;
+            // SAFETY: the scheduler's threads are alive.
+            let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+            check(
+                matches!(picked, kcore::sched::Decision::Run(r) if r == t),
+                "the thread did not run",
+            )?;
+            // SAFETY: as above; the running thread waits.
+            sched::locked(|k| unsafe { k.s.block(timer::now()) });
+            // The level word of `pack_level`: a new priority, FIFO.
+            cmd::ask_level(t, 1 << 15 | 20);
+            cmd::ask_exit(t, true, CAUSE);
+        }
+        let batch = threads.map(|t| (t.expect("a thread"), cmd::WAKE | cmd::LEVEL | cmd::EXIT));
+        let takes = obj::takes();
+        #[cfg(feature = "measure")]
+        obj::stretch_begins(timer::now());
+        let began = timer::now();
+        cmd::serve_batch(&batch);
+        let took = timer::now() - began;
+        #[cfg(feature = "measure")]
+        obj::stretch_ends(timer::now());
+        kprintln!("drain batch ticks: eight={took}");
+        check(
+            obj::takes().wrapping_sub(takes) == 1,
+            "a batch of commands did not take OBJ once",
+        )?;
+        for t in threads.into_iter().flatten() {
+            // SAFETY: the thread is alive: the test holds its reference.
+            let ended = unsafe { t.as_ref() }.sched.state();
+            check(
+                !matches!(
+                    ended,
+                    kcore::sched::State::Ready | kcore::sched::State::Waiting
+                ),
+                "a thread of the batch did not end",
+            )?;
+        }
+        Ok(())
+    });
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's reference goes; the kernel's went with the end.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    c.release();
+    result
 }
 
 /// Pages of the objects of the tests of long changes of a mapping: four

@@ -144,6 +144,7 @@ pub(super) fn mem_create(thread: NonNull<Thread>, a: &Args) {
 /// the process took the room meanwhile, the call fails with LIMIT_REACHED
 /// or NO_MEMORY, the only error that comes late, and the object goes at
 /// the caller's priority.
+#[inline(never)]
 fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
     // A portion fills the object (one section for its frames); once it is
     // whole, the stretch after the next poll puts its handle in the table.
@@ -389,6 +390,7 @@ fn sync_next(target: NonNull<crate::process::Process>, next: Option<Frames>) -> 
 /// (process::finish_change); a process that ended meanwhile ends it with
 /// BAD_STATE (process::abandon_change). Either way the call's reference to
 /// the process goes, at the caller's priority.
+#[inline(never)]
 fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64, mut ready: Option<Frames>) {
     let Some((_, start)) = run_portions(thread, entry, || {
         let section = crate::obj::lock();

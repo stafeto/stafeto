@@ -29,12 +29,15 @@ unsafe impl PageSource for KernelPages {
     }
 }
 
-/// Fills a page that goes back with POISON in a test build: a use after the
-/// release reads the poison until the frame is taken again. Outside any
-/// section, before `give_back`; the page is the caller's to the end.
+/// Fills a page that goes back with POISON in a test build that does not
+/// measure: a use after the release reads the poison until the frame is
+/// taken again. The images that measure (`measure`) leave it out, so that
+/// the rows of B are the cost of the code that ships and not of four
+/// thousand instructions of fill for each page. Outside any section, before
+/// `give_back`; the page is the caller's to the end.
 #[inline(always)]
 pub fn scrub(_page: NonNull<u8>) {
-    #[cfg(feature = "ktest")]
+    #[cfg(all(feature = "ktest", not(feature = "measure")))]
     // SAFETY: the page is the caller's: nothing uses it afterwards.
     unsafe {
         core::ptr::write_bytes(_page.as_ptr(), POISON, kcore::PAGE_SIZE as usize)

@@ -85,6 +85,7 @@ pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) {
 /// The second portion of process_create for `child` (`Long::Spawn`), from
 /// `entry`, the counter when the kernel took this entry: in one section,
 /// `link_child`, and the result.
+#[inline(never)]
 pub(super) fn process_create_second(thread: NonNull<Thread>, child: NonNull<Process>, entry: u64) {
     // SAFETY: the registers are the thread's own, and still hold the
     // arguments of the call: it started over at its `svc` as it was.

@@ -9086,7 +9086,7 @@ const PORTION_LINES: [&str; 7] = [
 /// (kernel/src/obj.rs): a call by its number below 40, then the entries
 /// and the cleanup of each kind of object.
 fn obj_kind_name(kind: usize) -> String {
-    const ENTRIES: [&str; 15] = [
+    const ENTRIES: [&str; 16] = [
         "interrupt",
         "cleanup",
         "fault",
@@ -9102,6 +9102,7 @@ fn obj_kind_name(kind: usize) -> String {
         "clean memory",
         "teardown stage",
         "reclaim",
+        "drain",
     ];
     match kind {
         0..40 => abi::Call::from_number(kind as u16)
@@ -9114,9 +9115,9 @@ fn obj_kind_name(kind: usize) -> String {
 
 /// The kinds of section of the entries other than a call and of the
 /// cleanup and the turn of the loop of the way out that frees retired objects
-/// (kernel/src/obj.rs, 41 to 54): each of their sections holds OBJ for at
+/// (kernel/src/obj.rs, 41 to 55): each of their sections holds OBJ for at
 /// most `CLEANUP_HOLD_MAX`.
-const CLEANUP_KINDS: std::ops::RangeInclusive<usize> = 41..=54;
+const CLEANUP_KINDS: std::ops::RangeInclusive<usize> = 41..=55;
 /// The most takes of OBJ in a stretch of any kind of section, the code of a
 /// test (kind 0) included: the portions of cleanup and of the long calls are
 /// "outside, one section, outside", and a call takes it once (spec 8.1).
@@ -9189,7 +9190,7 @@ fn check_cleanup_sections(name: &str, lines: &[String]) -> Result<(), String> {
     let most = CLEANUP_KINDS.map(|kind| holds[kind]).max().unwrap_or(0);
     let k = takes.iter().copied().max().unwrap_or(0);
     println!(
-        "OBJ in the sections on {name}: every kind takes it {k} times at most (of {SECTION_TAKES_MAX}), kinds 41-54 hold it {most} at most (of {CLEANUP_HOLD_MAX})"
+        "OBJ in the sections on {name}: every kind takes it {k} times at most (of {SECTION_TAKES_MAX}), kinds 41-55 hold it {most} at most (of {CLEANUP_HOLD_MAX})"
     );
     if problems.is_empty() {
         Ok(())
