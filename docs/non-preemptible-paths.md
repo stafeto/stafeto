@@ -949,7 +949,7 @@ two turns (spec 8.1). The sizes that follow from it:
 | the continuation of a suspended process | 32 threads | |
 | freeing of retired objects (`qsbr::reclaim`) | 8 (`RECLAIM_BATCH`) | |
 
-`cargo xtask kernel-test 512M icount` fails a kind of section from 41 to 53
+`cargo xtask kernel-test 512M icount` fails a kind of section from 41 to 54
 (`obj takes of kind`) that takes `OBJ` more than once in a stretch or holds it
 more than 3,800 instructions; the test builds with the checks stop at a
 portion of cleanup that took it twice.

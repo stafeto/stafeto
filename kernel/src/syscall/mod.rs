@@ -19,8 +19,8 @@
 //! registers keep the arguments. `receive` writes x10 and x11 as well when
 //! it takes something, and a thread that waits in it or in `send` gets its
 //! result when the wait ends: `send` waits for the reply, whose message
-//! comes in x0-x9 (spec 11). A long call, mem_create, mem_map, mem_unmap
-//! or mem_protect, goes in portions with interrupts polled between them:
+//! comes in x0-x9 (spec 11). A long call, mem_create, mem_map, mem_unmap,
+//! mem_protect or process_create, goes in portions with interrupts polled between them:
 //! it starts over at its `svc` when one is pending, with how far it came
 //! kept in the calling thread (thread::Long), and the next entry goes on
 //! from there (spec 7.7). Test builds also know numbers of their own, in
@@ -247,7 +247,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemMap) => return change_map(thread, &args),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
-        Some(Call::ProcessCreate) => process_create(thread, &args),
+        Some(Call::ProcessCreate) => return process_create(thread, &args),
         Some(Call::ProcessKill) => process_kill(thread, &args, crate::obj::lock()),
         Some(Call::ProcessControl) => return process_control_waited(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args, crate::obj::lock()),

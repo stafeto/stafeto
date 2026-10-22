@@ -5030,9 +5030,9 @@ const OBJ_HOLD_MAX: u64 = 4_000;
 /// section that begins a new generation is a section like the rest (stage 5).
 const B4_MAX: u64 = 32_000;
 /// Whether `kernel_tests` fails B_4 with the takes of OBJ in a stretch
-/// above B4_MAX: off while stretches of the cleanup of memory, channels and
-/// processes and of mem_create take OBJ once a frame or an item.
-const B4_TAKES_ENFORCED: bool = false;
+/// above B4_MAX: on, since every stretch between two polls for an interrupt
+/// takes OBJ once, whatever it serves.
+const B4_TAKES_ENFORCED: bool = true;
 /// The room above the longest hold that `check_obj_hold` leaves before it
 /// asks to lower `OBJ_HOLD_MAX` (rule 4 of the guards), and what a lowered
 /// limit keeps above the measure.
@@ -9086,7 +9086,7 @@ const PORTION_LINES: [&str; 7] = [
 /// (kernel/src/obj.rs): a call by its number below 40, then the entries
 /// and the cleanup of each kind of object.
 fn obj_kind_name(kind: usize) -> String {
-    const ENTRIES: [&str; 14] = [
+    const ENTRIES: [&str; 15] = [
         "interrupt",
         "cleanup",
         "fault",
@@ -9101,6 +9101,7 @@ fn obj_kind_name(kind: usize) -> String {
         "fire timers",
         "clean memory",
         "teardown stage",
+        "reclaim",
     ];
     match kind {
         0..40 => abi::Call::from_number(kind as u16)
@@ -9112,22 +9113,25 @@ fn obj_kind_name(kind: usize) -> String {
 }
 
 /// The kinds of section of the entries other than a call and of the
-/// cleanup (kernel/src/obj.rs, 41 to 53): each of their stretches between
-/// two polls takes OBJ once (`CLEANUP_TAKES_MAX`) and holds it for at most
-/// `CLEANUP_HOLD_MAX`.
-const CLEANUP_KINDS: std::ops::RangeInclusive<usize> = 41..=53;
-/// The most takes of OBJ in a stretch of a kind of `CLEANUP_KINDS`: the
-/// portions of cleanup are "outside, one section, outside" (spec 8.1).
-const CLEANUP_TAKES_MAX: u64 = 1;
+/// cleanup and the turn of the loop of the way out that frees retired objects
+/// (kernel/src/obj.rs, 41 to 54): each of their sections holds OBJ for at
+/// most `CLEANUP_HOLD_MAX`.
+const CLEANUP_KINDS: std::ops::RangeInclusive<usize> = 41..=54;
+/// The most takes of OBJ in a stretch of any kind of section, the code of a
+/// test (kind 0) included: the portions of cleanup and of the long calls are
+/// "outside, one section, outside", and a call takes it once (spec 8.1).
+const SECTION_TAKES_MAX: u64 = 1;
 /// The longest hold of OBJ of a kind of `CLEANUP_KINDS`, in instructions: a
 /// portion's section is sized to 3 500 in the worst case the tests build
 /// (spec 15.3), and the rest is room for the compiler.
 const CLEANUP_HOLD_MAX: u64 = 3_800;
 
-/// The kinds 41 to 53 of the lines `obj takes of kind: K k=N ticks=T` and
-/// `obj hold kind ticks: K=N` over both images: fails a kind whose stretch
-/// takes OBJ more than `CLEANUP_TAKES_MAX` times, or holds it longer than
-/// `CLEANUP_HOLD_MAX`, and names the kind.
+/// The lines `obj takes of kind: K k=N ticks=T` and `obj hold kind ticks:
+/// K=N` over both images: fails a kind of any section whose stretch takes OBJ
+/// more than `SECTION_TAKES_MAX` times (so that one section split in two,
+/// which B_4 allows when it is short, fails all the same), and a kind of
+/// `CLEANUP_KINDS` that holds it longer than `CLEANUP_HOLD_MAX`; it names
+/// the kind.
 fn check_cleanup_sections(name: &str, lines: &[String]) -> Result<(), String> {
     let mut takes = [0u64; 64];
     let mut holds = [0u64; 64];
@@ -9161,14 +9165,19 @@ fn check_cleanup_sections(name: &str, lines: &[String]) -> Result<(), String> {
         }
     }
     let mut problems = Vec::new();
-    for kind in CLEANUP_KINDS {
-        if takes[kind] > CLEANUP_TAKES_MAX {
+    for (kind, &k) in takes.iter().enumerate() {
+        if k > SECTION_TAKES_MAX {
+            let what = if kind == 0 {
+                "the code of a test".to_owned()
+            } else {
+                obj_kind_name(kind)
+            };
             problems.push(format!(
-                "{} (kind {kind}) takes OBJ {} times in a stretch, {CLEANUP_TAKES_MAX} allowed",
-                obj_kind_name(kind),
-                takes[kind]
+                "{what} (kind {kind}) takes OBJ {k} times in a stretch, {SECTION_TAKES_MAX} allowed"
             ));
         }
+    }
+    for kind in CLEANUP_KINDS {
         if holds[kind] > CLEANUP_HOLD_MAX {
             problems.push(format!(
                 "{} (kind {kind}) holds OBJ for {}, {CLEANUP_HOLD_MAX} allowed",
@@ -9178,15 +9187,15 @@ fn check_cleanup_sections(name: &str, lines: &[String]) -> Result<(), String> {
         }
     }
     let most = CLEANUP_KINDS.map(|kind| holds[kind]).max().unwrap_or(0);
-    let k = CLEANUP_KINDS.map(|kind| takes[kind]).max().unwrap_or(0);
+    let k = takes.iter().copied().max().unwrap_or(0);
     println!(
-        "OBJ in the cleanup on {name}: kinds 41-53 take it {k} times at most (of {CLEANUP_TAKES_MAX}) and hold it {most} at most (of {CLEANUP_HOLD_MAX})"
+        "OBJ in the sections on {name}: every kind takes it {k} times at most (of {SECTION_TAKES_MAX}), kinds 41-54 hold it {most} at most (of {CLEANUP_HOLD_MAX})"
     );
     if problems.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "OBJ in the cleanup on {name}: {}",
+            "OBJ in the sections on {name}: {}",
             problems.join("; ")
         ))
     }
@@ -9345,8 +9354,7 @@ fn b_margin(
             b4 - B4_MAX
         ));
     }
-    // With the takes: printed, and no error until every stretch takes OBJ
-    // at most once, or twice in a short one (B4_TAKES_ENFORCED).
+    // With the takes: an error past B4_MAX (B4_TAKES_ENFORCED).
     let (b4, k, c) = b_n(4, n, &stretches);
     println!(
         "B_4 with the takes on {name}: {b4} = {c} + {k} * 3 * OBJ_HOLD_MAX {OBJ_HOLD_MAX}, bound {B4_MAX}"
@@ -9563,10 +9571,13 @@ fn smp_window() -> Result<(), String> {
     smp_window_break(
         Variant::WindowNoAliveCheck,
         "the second look at the life of a process after the icache of a mem_map RX",
-        |_, r| {
+        |o, r| {
             r.failed
                 .iter()
                 .any(|(name, _)| name == "smp_exec_map_of_a_process_killed_meanwhile_fails")
+                || o.lines
+                    .iter()
+                    .any(|l| l.contains("a process is used after its address space went"))
         },
     )?;
     smp_window_break(
@@ -11916,11 +11927,12 @@ mod tests {
         assert_eq!(b_n(4, 7, &[(0, 9), (3, 1)]), (1 + 9 * OBJ_HOLD_MAX, 3, 1));
     }
 
-    /// A stretch of the cleanup (kinds 41 to 53) that takes OBJ twice, or a
-    /// section of one that holds it past CLEANUP_HOLD_MAX, fails and names
-    /// the kind; the calls (below 40) are not its business.
+    /// A stretch of any section (a call, the cleanup, the code of a test) that
+    /// takes OBJ twice, or a section of the cleanup (kinds 41 to 54) that
+    /// holds it past CLEANUP_HOLD_MAX, fails and names the kind; the hold of
+    /// a call is OBJ_HOLD_MAX's business.
     #[test]
-    fn a_portion_of_cleanup_takes_obj_once_and_holds_it_briefly() {
+    fn a_stretch_takes_obj_once_and_a_portion_of_cleanup_holds_it_briefly() {
         let check = |lines: &[&str]| {
             let lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
             check_cleanup_sections("t", &lines)
@@ -11928,7 +11940,7 @@ mod tests {
         assert!(
             check(&[
                 "obj takes of kind: 53 k=1 ticks=12138",
-                "obj takes of kind: 9 k=3 ticks=7936",
+                "obj takes of kind: 9 k=1 ticks=7936",
                 "obj hold kind ticks: 53=3800",
                 "obj hold kind ticks: 9=3900",
             ])
@@ -11939,11 +11951,19 @@ mod tests {
             err.contains("teardown stage") && err.contains("kind 53"),
             "{err}"
         );
+        let err = check(&["obj takes of kind: 10 k=2 ticks=3106"]).unwrap_err();
+        assert!(
+            err.contains("MemUnmap") && err.contains("kind 10") && err.contains("2 times"),
+            "{err}"
+        );
+        let err = check(&["obj takes of kind: 0 k=3 ticks=3860"]).unwrap_err();
+        assert!(err.contains("the code of a test"), "{err}");
         let err = check(&["obj hold kind ticks: 52=3801"]).unwrap_err();
         assert!(
             err.contains("clean memory") && err.contains("3801"),
             "{err}"
         );
+        assert!(check(&["obj hold kind ticks: 9=4000"]).is_ok());
         assert!(check(&["obj takes of kind: x k=1 ticks=1"]).is_err());
     }
 

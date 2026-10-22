@@ -28,6 +28,7 @@ use crate::cleanup;
 use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
+use crate::obj;
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
 use crate::session::{self, Session};
@@ -4111,6 +4112,158 @@ pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str>
     )
 }
 
+/// process_create is a long call of two portions (spec 7.7): with the
+/// kernel's timer pending, the first entry makes the child and stops, the
+/// registers as they were and ELR on the `svc`, with the child held by the
+/// thread's long call and no handle to it yet; the second entry puts the
+/// handle in the table and ends the call. The poll between them splits the
+/// stretches, so that each takes OBJ once.
+pub fn process_create_polls_between_its_portions(_: &Boot) -> Result<(), &'static str> {
+    let processes = process::in_use();
+    with_caller(|c| {
+        let base = process::in_use();
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        c.close(first)?;
+        let n = Call::ProcessCreate.number();
+        let args = [CHILD_QUOTA, 16, 20, 0, 0, 0];
+        // SAFETY: the thread is the test's and never runs.
+        let elr = || unsafe { c.thread.as_ref() }.regs.elr;
+        let at_svc = elr() - 4;
+        let (mut held, mut one_more, mut intact, mut got) = (false, false, false, [0; 10]);
+        let takes = obj::takes();
+        let mut taken = 0;
+        with_interrupt_pending(|| {
+            let after = c.call(n, &args);
+            taken = obj::takes().wrapping_sub(takes);
+            held = matches!(thread::long(c.thread), Some(Long::Spawn(_)));
+            one_more = process::in_use() == base + 1;
+            intact = after == with_marks(&args) && elr() == at_svc;
+            let before = obj::takes();
+            got = c.again(n);
+            taken += 2 * obj::takes().wrapping_sub(before);
+            Ok(())
+        })?;
+        check(held, "process_create did not stop between its portions")?;
+        check(one_more, "the first portion did not make the child")?;
+        check(
+            intact,
+            "a process_create that starts over changed its registers or left its svc",
+        )?;
+        check(
+            taken == 3,
+            "a portion of process_create did not take OBJ once",
+        )?;
+        let mut want = with_marks(&args);
+        want[0] = 0;
+        want[1] = got[1];
+        check(
+            thread::long(c.thread).is_none() && got == want && got[1] != 0,
+            "the second entry did not end the call with the child's handle",
+        )?;
+        let child = child_of(c, Handle(got[1]))?;
+        // SAFETY: the handle holds the child.
+        let ceiling = unsafe { child.as_ref() }.ceiling();
+        check(
+            ceiling == 20 && process::parent(child) == Some(c.process),
+            "the handle does not name the child the call made",
+        )?;
+        c.close(Handle(got[1]))?;
+        cleanup::drain();
+        Ok(())
+    })?;
+    check(
+        process::in_use() == processes,
+        "the child of the test stayed in its pool",
+    )
+}
+
+/// A thread whose next entry makes another call than process_create gives
+/// the child up (spec 7.7): the child, which only the thread's long call
+/// held, hears of nothing, goes at the thread's level, and the quota it
+/// took comes back to the caller. The exit channel of the call holds no
+/// slot of the child afterwards.
+pub fn another_call_gives_the_child_of_process_create_up(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let base = process::in_use();
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        c.close(first)?;
+        let n = Call::ProcessCreate.number();
+        let exit = c.created(Call::CreateChannel.number(), &[10])?;
+        let channel = channel_of(c, exit)?;
+        let (used, slots) = (
+            process::quota(c.process).used(),
+            channel::info(channel).sources,
+        );
+        let args = [CHILD_QUOTA, 16, 20, exit.0, 5, 0];
+        let (mut held, mut given_up) = (false, false);
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            held = matches!(thread::long(c.thread), Some(Long::Spawn(_)));
+            c.again(Call::HandleClose.number());
+            given_up = thread::long(c.thread).is_none();
+            Ok(())
+        })?;
+        let got = c.again(Call::HandleClose.number());
+        let queued = cleanup::top();
+        cleanup::drain();
+        let mut want = with_marks(&args);
+        want[0] = Error::BadHandle.code();
+        check(held, "process_create did not stop between its portions")?;
+        check(given_up, "another call did not give the long call up")?;
+        check(
+            got == want,
+            "the call that gave the child up did not run as itself",
+        )?;
+        check(
+            queued == Some(10),
+            "the child did not go at the thread's level",
+        )?;
+        check(
+            process::in_use() == base
+                && process::quota(c.process).used() == used + PAGE_SIZE
+                && channel::info(channel).sources == slots,
+            "the child kept its place, its quota or its slot of the exit channel",
+        )?;
+        check(
+            channel::info(channel).queued == 0,
+            "the exit channel heard of a child that was given up",
+        )?;
+        c.close(exit)
+    })
+}
+
+/// A process_create whose caller's process ends between its portions (spec
+/// 7.7): the child, which the thread's long call held, ends with its
+/// parent and goes with the thread's buffer, and its place comes back.
+pub fn killed_caller_lets_the_child_of_process_create_go(_: &Boot) -> Result<(), &'static str> {
+    let processes = process::in_use();
+    let c = Caller::new()?;
+    let first = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(first)?;
+    let mut stopped = false;
+    let pending = with_interrupt_pending(|| {
+        c.call(
+            Call::ProcessCreate.number(),
+            &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+        );
+        stopped = matches!(thread::long(c.thread), Some(Long::Spawn(_)));
+        Ok(())
+    });
+    // SAFETY: the test holds a reference to the process.
+    let ended = unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+    cleanup::drain();
+    c.release();
+    pending?;
+    check(
+        stopped && ended,
+        "process_create did not stop between its portions",
+    )?;
+    check(
+        process::in_use() == processes,
+        "the child did not go with the teardown of its maker",
+    )
+}
+
 /// Pages of the objects of the tests of long changes of a mapping: four
 /// portions of process::PORTION.
 const LONG_PAGES: u64 = 128;
@@ -4387,7 +4540,8 @@ fn abandoned_map(c: &Caller) -> Result<(), &'static str> {
 
 /// A mem_unmap whose caller's process ends between two portions keeps the
 /// pages it did not unmap (spec 7.7): with an interrupt pending all along,
-/// two entries unmap two portions of a mapping of LONG_PAGES pages; once
+/// three entries (the checks, then a portion each) unmap two portions of a
+/// mapping of LONG_PAGES pages; once
 /// the caller's process went, the mapping starts past them with the rest
 /// of the pages and their offset in the object, idle, and only those
 /// translate.
@@ -4406,8 +4560,11 @@ fn abandoned_unmap(c: &Caller) -> Result<(), &'static str> {
     let n = Call::MemUnmap.number();
     let args = [th.0, USER_VA as u64, LONG_PAGES * PAGE_SIZE];
     let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
+        // The first entry has the checks and polls; each of the next two
+        // takes a portion.
         with_interrupt_pending(|| {
             c.call(n, &args);
+            c.again(n);
             c.again(n);
             Ok(())
         })?;
@@ -4724,8 +4881,9 @@ fn cut_busy(c: &Caller) -> Result<(), &'static str> {
 
 /// A mem_unmap of a range whose caller's process ends between two portions
 /// leaves the edges whole and the rest of the range (spec 7.7): with an
-/// interrupt pending all along, two entries unmap two portions of the
-/// middle of a mapping of 6 portions, 4 of them; once the caller's process
+/// interrupt pending all along, three entries (the checks, then a portion
+/// each) unmap two portions of the middle of a mapping of 6 portions, 4 of
+/// them; once the caller's process
 /// went, the mapping starts at the pages after them, with their offset in
 /// the object, idle, the edges are idle entries as the cut made them, and
 /// only the pages after the unmapped ones translate.
@@ -4748,6 +4906,7 @@ fn abandoned_range(c: &Caller) -> Result<(), &'static str> {
     let result = map_whole(c, th, h, total, USER_VA, Access::ReadWrite).and_then(|()| {
         with_interrupt_pending(|| {
             c.call(n, &args);
+            c.again(n);
             c.again(n);
             Ok(())
         })?;
@@ -4860,8 +5019,8 @@ pub fn mapping_reference_goes_after_the_barrier(_: &Boot) -> Result<(), &'static
 }
 
 /// A mem_protect whose caller's process ends between two portions leaves
-/// its mapping idle (spec 7.7): with an interrupt pending all along, two
-/// entries give two portions of a mapping of LONG_PAGES pages, RW, access
+/// its mapping idle (spec 7.7): with an interrupt pending all along, three
+/// entries (the checks, then a portion each) give two portions of a mapping of LONG_PAGES pages, RW, access
 /// R; once the caller's process went, the mapping is whole and idle, and
 /// the pages of those portions show R and the rest RW.
 pub fn abandoned_protect_goes_idle(_: &Boot) -> Result<(), &'static str> {
@@ -4885,6 +5044,7 @@ fn abandoned_protect(c: &Caller) -> Result<(), &'static str> {
     let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
         with_interrupt_pending(|| {
             c.call(n, &args);
+            c.again(n);
             c.again(n);
             Ok(())
         })?;

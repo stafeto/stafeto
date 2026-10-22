@@ -54,18 +54,30 @@ stretch between two polls for an interrupt that runs C instructions and takes
 largest of these over the stretches, and B + (N - 1) * `OBJ_HOLD_MAX` for the
 rows of B. The measuring images count k from the tickets of the lock: `cargo
 xtask kernel-test 512M icount` prints the longest stretch for each k
-(`OBJ takes`), B_2, B_4, B_8, and fails B + 3 * `OBJ_HOLD_MAX` above
-`B4_MAX`. With `OBJ_HOLD_MAX` 4 000 a stretch fits `B4_MAX` with one take
-and C up to 20 000, or with two and C up to 8 000. A turn of the loop of the
-way out of the kernel takes `OBJ` once at most (the handling of an interrupt,
-the freeing of up to `RECLAIM_BATCH` = 8 retired objects, the park of a
-thread, or a portion of cleanup), and polls for an interrupt before the next.
-The portions of the cleanup of memory objects and of the stage Shell, and
-the entries of mem_create, take `OBJ` once for up to `FRAMES_PER_SECTION` = 6
-frames. The stretches of the cleanup of channels and processes, of the
-timers and of mem_map, mem_unmap, mem_protect and process_create still take
-it more than once, and B_4 with the takes is printed, without an error, until
-they take it once (`B4_TAKES_ENFORCED`). S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`.
+(`OBJ takes`) and for each kind of section (`obj takes of kind`), B_2, B_4,
+B_8, and fails B + 3 * `OBJ_HOLD_MAX` above `B4_MAX` and B_4 with the takes
+above it (`B4_TAKES_ENFORCED`, no exceptions). With `OBJ_HOLD_MAX` 4 000 a
+stretch fits `B4_MAX` with one take and C up to 20 000, or with two and C up
+to 8 000; every stretch takes it once. A turn of the loop of the way out of
+the kernel takes `OBJ` once at most (the handling of an interrupt, the
+freeing of up to `RECLAIM_BATCH` = 8 retired objects, the park of a thread
+(a turn that took `OBJ` for the park ends there even when the gate opened
+meanwhile), or a portion of cleanup), and polls for an interrupt before the
+next. The portions of the cleanup of memory objects and of the stage Shell,
+and the entries of mem_create, take `OBJ` once for up to
+`FRAMES_PER_SECTION` = 6 frames. The long calls mem_map, mem_unmap,
+mem_protect and process_create take it once in each stretch: the checks of
+the call are one section and the interrupt is polled before its first
+portion; the first portion of a mem_map pays for the tables; the last
+portion of a change ends the call in its section; a portion that makes pages
+executable finds their frames in the section of the portion before it
+(`Change` has no room for them, a thread is three to a page of the pool), and
+the instruction cache is made coherent for them outside any section before
+the poll. process_create makes the child, its start channel and its exit
+source in the first section and looks at its caller and at x3 and x5 again in
+the second; a thread that leaves the call or enters with another number gives
+the child up, silently, at its own priority. S5_N = S5 + (N - 1) *
+`OBJ_HOLD_MAX`.
 
 A service on another CPU than its client runs at the client's level, a
 distributed inheritance: the response time R of the client adds the

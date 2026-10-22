@@ -470,6 +470,30 @@ pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
     }
 }
 
+/// The frames of pages `first` to `first + out.len() - 1` of `m`, a whole
+/// object that the caller holds, as `frame` gives each (spec 7.4); a leaf of
+/// the list is read once for the run.
+pub fn frames(m: NonNull<Memory>, first: usize, out: &mut [u64]) {
+    // SAFETY: the caller holds a reference to the object; only the field
+    // is read.
+    let backing = unsafe { &(*m.as_ptr()).backing };
+    match backing {
+        Backing::Owned(list) => {
+            // SAFETY: the list reads only its own nodes, which the linear
+            // map covers.
+            let mem = unsafe { LinearMem::new() };
+            list.frames(&mem, first, out);
+        }
+        Backing::Boot { base, .. }
+        | Backing::Device { base, .. }
+        | Backing::Contiguous { base, .. } => {
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot = base + (first + k) as u64 * PAGE_SIZE;
+            }
+        }
+    }
+}
+
 /// object_info MEMORY of `m`, which the caller holds (spec 11): its size in
 /// bytes, the pages whose frames it owns, every page once it is whole and
 /// none over the boot image or of a device window, and its mappings.

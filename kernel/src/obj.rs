@@ -66,7 +66,7 @@ static BY_KIND: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 /// The kinds: calls by number (below 40), then the entries other than a
 /// call, as `serving` names them.
 #[cfg(feature = "measure")]
-pub const KINDS: usize = 54;
+pub const KINDS: usize = 55;
 pub const ENTRY_INTERRUPT: u64 = 40;
 pub const ENTRY_CLEANUP: u64 = 41;
 pub const ENTRY_FAULT: u64 = 42;
@@ -81,6 +81,9 @@ pub const CLEAN_IRQ: u64 = 50;
 pub const CLEAN_FIRE: u64 = 51;
 pub const CLEAN_MEMORY: u64 = 52;
 pub const CLEAN_PROCESS: u64 = 53;
+/// The turn of the loop of the way out of the kernel that frees retired
+/// objects (qsbr::reclaim).
+pub const ENTRY_RECLAIM: u64 = 54;
 
 /// Names what the section being entered serves, for the longest hold's
 /// report: only the images that measure keep it. A section that is not

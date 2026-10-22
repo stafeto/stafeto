@@ -9,7 +9,7 @@ use super::{
 use crate::arch::timer as clock;
 use crate::memory::{self, Memory};
 use crate::object::Object;
-use crate::process::{self, Change};
+use crate::process::{self, Change, Frames};
 use crate::thread::{self, Long, Thread};
 use crate::{arch, cleanup, sched};
 use abi::{DMA_MEMORY_RIGHTS, Error, Handle, MEMORY_RIGHTS, Rights};
@@ -49,7 +49,8 @@ pub(super) fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     }
     match long {
         Long::Create(m) => make(thread, m, entry),
-        Long::Change(on) => portions(thread, on, entry),
+        Long::Change(on) => portions(thread, on, entry, None),
+        Long::Spawn(child) => super::proc::process_create_second(thread, child, entry),
         Long::Quiet { epoch, limit } => quiet(thread, epoch, limit),
     }
 }
@@ -198,41 +199,26 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// the entry records the rights of x1 to map, which bound its mem_protect.
 pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
     let entry = clock::now();
-    // Two sections, and the range is taken with a busy entry in the first,
-    // which checks it: no mapping and no buffer of another call joins it
-    // after the checks, so they are made once (maps::reserve_mapping). The
-    // page of the table of a process that has none is made in the first,
-    // after the checks that need no table, and the tables the range may
-    // take are paid for in the second (maps::fund_mapping). The portions
-    // follow a poll for an interrupt, each a stretch with one take of OBJ.
+    // One section for the checks, and the range is taken with a busy entry
+    // in it: no mapping and no buffer of another call joins it after the
+    // checks, so they are made once (maps::reserve_mapping). The page of the
+    // table of a process that has none is made in it, after the checks that
+    // need no table (and no mapping stands in a process with no table, so
+    // the checks that come after it cannot fail). The tables the range may
+    // take are paid for by the first portion, which follows a poll for an
+    // interrupt (maps::step_change).
     #[cfg(feature = "window-probe")]
     crate::cmd::window::map_begins();
     let first = objects(|| {
-        if let Some(target) = map_table_needed(thread, a)? {
-            process::make_table(target)?;
-        }
-        map_reserve(thread, a)
-    })
-    .and_then(|on| {
-        #[cfg(feature = "window-probe")]
-        crate::cmd::window::map_gap();
-        objects(|| map_fund(thread, on))
+        let on = map_reserve(thread, a)?;
+        Ok((on, process::exec_frames(&on)))
     });
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::map_ends();
-    match first {
-        Ok(on) => {
-            thread::begin_long(thread, Long::Change(on));
-            cleanup::count_portion(entry);
-            sched::entry_polled();
-            if arch::irq_pending() {
-                return restart(thread);
-            }
-            sched::entry_started();
-            portions(thread, on, clock::now())
-        }
-        Err(e) => set_result(thread, Err(e)),
+    {
+        crate::cmd::window::map_gap();
+        crate::cmd::window::map_ends();
     }
+    begin(thread, entry, first)
 }
 
 /// What mem_map's first section looks up, before and after the table: the
@@ -271,23 +257,6 @@ fn map_lookups(
     Ok((target, m, rights, pages))
 }
 
-/// The start of the first section, for a process with no table of
-/// mappings: the checks up to the range touching no message buffer, in the
-/// order of spec 11, so that the page of the table is not asked of a quota
-/// before they pass; the process whose table the section then makes. None
-/// when there is a table, and `map_reserve` checks everything.
-fn map_table_needed(
-    thread: NonNull<Thread>,
-    a: &Args,
-) -> Result<Option<NonNull<crate::process::Process>>, Error> {
-    let (target, _, _, pages) = map_lookups(thread, a)?;
-    if process::has_table(target) {
-        return Ok(None);
-    }
-    process::check_buffers(target, a[4], pages)?;
-    Ok(Some(target))
-}
-
 /// The first section of mem_map: everything up to the range touching no
 /// mapping and no message buffer (INVALID_ARGS), then the entry, busy
 /// (LIMIT_REACHED).
@@ -301,25 +270,6 @@ fn map_reserve(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let on = process::reserve_mapping(target, mapping, access)?;
     process::retain(target);
     Ok(on)
-}
-
-/// The second section of mem_map: the tables the range may take are paid
-/// for (NO_MEMORY); a call that fails here gives its entry up, and its
-/// reference to the process goes.
-fn map_fund(thread: NonNull<Thread>, mut on: Change) -> Result<Change, Error> {
-    match process::fund_mapping(&mut on) {
-        Ok(()) => Ok(on),
-        Err(e) => {
-            let cause = cause(thread);
-            // SAFETY: nothing uses the change afterwards, and its reference
-            // to the process goes last.
-            unsafe {
-                process::abandon_change(on, cause);
-                process::release(on.target, cause);
-            }
-            Err(e)
-        }
-    }
 }
 
 /// mem_unmap(x0 process with MANAGE, x1 address, x2 length): the pages of
@@ -366,22 +316,61 @@ pub(super) fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Change, E
     Ok(on)
 }
 
-/// The first entry of mem_map, mem_unmap or mem_protect, whose checks and
-/// resources are `first`'s: a call that passed them begins its long call
-/// and its portions; one that failed writes the error.
+/// The first entry of mem_unmap or mem_protect, whose checks and resources
+/// are `first`'s, in one section: a call that passed them begins its long
+/// call, and one that failed writes the error.
 pub(super) fn change(
     thread: NonNull<Thread>,
     a: &Args,
     first: fn(NonNull<Thread>, &Args) -> Result<Change, Error>,
 ) {
     let entry = clock::now();
-    match objects(|| first(thread, a)) {
-        Ok(on) => {
+    begin(
+        thread,
+        entry,
+        objects(|| {
+            let on = first(thread, a)?;
+            Ok((on, process::exec_frames(&on)))
+        }),
+    )
+}
+
+/// What a change does after the section of its checks (`change`,
+/// `change_map`): the long call begins, the instruction cache is made
+/// coherent with the frames of the first portion if its pages become
+/// executable (`sync_next`), the interrupt is polled, and the first portion
+/// follows, which takes OBJ once. The checks were this entry's stretch.
+fn begin(thread: NonNull<Thread>, entry: u64, first: Result<(Change, Option<Frames>), Error>) {
+    match first {
+        Ok((on, next)) => {
             thread::begin_long(thread, Long::Change(on));
-            portions(thread, on, entry)
+            let ready = sync_next(on.target, next);
+            cleanup::count_portion(entry);
+            sched::entry_polled();
+            if arch::irq_pending() {
+                return restart(thread);
+            }
+            sched::entry_started();
+            portions(thread, on, clock::now(), ready)
         }
         Err(e) => set_result(thread, Err(e)),
     }
+}
+
+/// The instruction cache is made coherent with the frames of the next
+/// portion, `next`, read in the section before, outside any section (the
+/// frames are the object's, which no table maps yet, so cache maintenance
+/// on them changes no link; obj.rs, rule 3). They go on to the portion,
+/// which maps them in its section and looks at the life of the process
+/// there.
+fn sync_next(target: NonNull<crate::process::Process>, next: Option<Frames>) -> Option<Frames> {
+    let (n, frames) = next.as_ref()?;
+    arch::cache::sync_icache_frames(&frames[..*n]);
+    #[cfg(feature = "window-probe")]
+    crate::cmd::window::exec_gap(target);
+    #[cfg(not(feature = "window-probe"))]
+    let _ = target;
+    next
 }
 
 /// The portions of the change of a mapping `long` of `thread` (spec 7.7),
@@ -389,43 +378,43 @@ pub(super) fn change(
 /// execution, from `entry`, the counter when the kernel took the call.
 /// Each stretch between two polls for interrupts counts toward the longest
 /// portion (KERNEL_STATS x5): the first with the checks of its entry, the
-/// last with the end of the call. After a portion that leaves pages, with
-/// an interrupt pending the call starts over at its `svc` (`restart`), and
-/// its next entry comes back here; otherwise the next portion follows. The
-/// last one ends the call with 0 (process::finish_change); a process that
-/// ended meanwhile ends it with BAD_STATE (process::abandon_change). Either
-/// way the call's reference to the process goes, at the caller's priority.
-fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
-    let Some((result, start)) = run_portions(thread, entry, || {
-        // Pages that become executable have the instruction cache made
-        // coherent with their frames before the section that maps them:
-        // the frames are the object's, which no table maps yet.
-        let mut ready = None;
-        if on.executable() {
-            let (n, frames) = {
-                let _section = crate::obj::lock();
-                process::exec_frames(&on)?
-            };
-            if n > 0 {
-                arch::cache::sync_icache_frames(&frames[..n]);
-                #[cfg(feature = "window-probe")]
-                crate::cmd::window::exec_gap(on.target);
-                ready = Some(frames);
+/// last with the end of the call. A portion is one section: the life of the
+/// process is looked at, the pages are changed, and the section also reads
+/// the frames of the portion after it when those pages become executable;
+/// their instruction cache is made coherent outside it, before the poll.
+/// After a portion that leaves pages, with an interrupt pending the call
+/// starts over at its `svc` (`restart`), and its next entry comes back
+/// here with the frames read again in its section; otherwise the next
+/// portion follows. The last portion ends the call in its section with 0
+/// (process::finish_change); a process that ended meanwhile ends it with
+/// BAD_STATE (process::abandon_change). Either way the call's reference to
+/// the process goes, at the caller's priority.
+fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64, mut ready: Option<Frames>) {
+    let Some((_, start)) = run_portions(thread, entry, || {
+        let section = crate::obj::lock();
+        let step = process::step_change(&mut on, process::frames_of(&ready.take()));
+        match step {
+            Ok(false) => {
+                thread::update_long(thread, Long::Change(on));
+                let next = process::exec_frames(&on);
+                drop(section);
+                ready = sync_next(on.target, next);
             }
+            done => end_change(thread, on, done.map(|_| ())),
         }
-        let _section = crate::obj::lock();
-        let done = process::step_change(&mut on, ready.as_ref())?;
-        if !done {
-            thread::update_long(thread, Long::Change(on));
-        }
-        Ok(done)
+        step
     }) else {
         return;
     };
+    cleanup::count_portion(start);
+}
+
+/// The end of the call in the section of its last portion: the long call
+/// ends, the entry is finished or given up, the call's reference to the
+/// process goes, and the result is written.
+fn end_change(thread: NonNull<Thread>, on: Change, result: Result<(), Error>) {
     thread::end_long(thread);
-    let _section = crate::obj::lock();
-    // SAFETY: the call is over, and its reference to the process goes
-    // last.
+    // SAFETY: the call is over, and its reference to the process goes last.
     unsafe {
         match result {
             Ok(()) => process::finish_change(on, cause(thread)),
@@ -434,5 +423,4 @@ fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
         process::release(on.target, cause(thread));
     }
     set_result(thread, result.map(|()| Values::none()));
-    cleanup::count_portion(start);
 }

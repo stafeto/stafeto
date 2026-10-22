@@ -3,12 +3,15 @@
 
 //! The calls of processes and threads (spec 4, 8, 11).
 
-use super::{Args, Values, caller, caller_ceiling, cause, lookup, record_call};
+use super::{
+    Args, Values, caller, caller_ceiling, cause, lookup, objects, record_call, restart, set_result,
+};
+use crate::arch::timer as clock;
 use crate::obj::Section;
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::thread::{self, Thread};
-use crate::{channel, sched, session};
+use crate::thread::{self, Long, Thread};
+use crate::{arch, channel, cleanup, sched, session};
 use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::args::{
@@ -54,20 +57,45 @@ use kcore::args::{
 /// handle that went and BAD_STATE for a caller that ended, as a late
 /// LIMIT_REACHED or NO_MEMORY of the caller's table does, the child going
 /// again.
-pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    // Two sections, so that neither is longer than OBJ_HOLD_MAX. The child
-    // holds what the call took of x3 and x5 when the first ends (the
-    // channel of its exit notification and its entry 0), and is known to
-    // nothing but this call; the second looks at the caller's arguments
-    // again.
-    let child = {
-        let _section = crate::obj::lock();
-        make_child(thread, a)?
-    };
-    #[cfg(feature = "window-probe")]
-    crate::cmd::window::spawn_gap(thread, child);
+pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) {
+    let entry = clock::now();
+    // A long call of two portions, so that no stretch between two polls for
+    // an interrupt takes OBJ twice: the first section has the checks, the
+    // resources and the child, which is known to nothing but this call when
+    // it ends, and the poll follows. The child holds what the call took of
+    // x3 and x5 (the channel of its exit notification and its entry 0); the
+    // second portion looks at the caller's arguments again.
+    match objects(|| make_child(thread, a)) {
+        Ok(child) => {
+            thread::begin_long(thread, Long::Spawn(child));
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::spawn_gap(thread, child);
+            cleanup::count_portion(entry);
+            sched::entry_polled();
+            if arch::irq_pending() {
+                return restart(thread);
+            }
+            sched::entry_started();
+            process_create_second(thread, child, clock::now())
+        }
+        Err(e) => set_result(thread, Err(e)),
+    }
+}
+
+/// The second portion of process_create for `child` (`Long::Spawn`), from
+/// `entry`, the counter when the kernel took this entry: in one section,
+/// `link_child`, and the result.
+pub(super) fn process_create_second(thread: NonNull<Thread>, child: NonNull<Process>, entry: u64) {
+    // SAFETY: the registers are the thread's own, and still hold the
+    // arguments of the call: it started over at its `svc` as it was.
+    let regs = &unsafe { thread.as_ref() }.regs.x;
+    let a: Args = [
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8], regs[9],
+    ];
     let _section = crate::obj::lock();
-    link_child(thread, child, a)
+    thread::end_long(thread);
+    set_result(thread, link_child(thread, child, &a));
+    cleanup::count_portion(entry);
 }
 
 /// The first section of process_create: the checks, the resources the

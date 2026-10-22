@@ -872,9 +872,12 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
             s: &mut g.s,
             tokens: &mut tokens,
         };
-        if crate::process::park_selected(t, &mut k) {
-            return None;
-        }
+        crate::process::park_selected(t, &mut k);
+        // The turn ends with the section, whether the thread was parked or
+        // the gate opened between the hint and the lock: the next turn polls
+        // for an interrupt and decides again (a thread that was not parked
+        // is chosen again), so that the turn takes OBJ once.
+        return None;
     }
     if let Decision::Run(_) = decision
         && g.fired.0 != 0

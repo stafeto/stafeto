@@ -30,14 +30,14 @@ pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/memory.rs", 3),
     ("kernel/src/mm/aspace.rs", 1),
     ("kernel/src/process/control.rs", 2),
-    ("kernel/src/process/maps.rs", 3),
+    ("kernel/src/process/maps.rs", 2),
     ("kernel/src/process/teardown.rs", 1),
     ("kernel/src/qsbr.rs", 1),
     ("kernel/src/sched.rs", 1),
     ("kernel/src/smp.rs", 1),
-    ("kernel/src/syscall/mem.rs", 4),
+    ("kernel/src/syscall/mem.rs", 2),
     ("kernel/src/syscall/mod.rs", 5),
-    ("kernel/src/syscall/proc.rs", 2),
+    ("kernel/src/syscall/proc.rs", 1),
     ("kernel/src/timer.rs", 1),
 ];
 

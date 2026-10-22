@@ -71,9 +71,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, begin_protect, begin_unmap, check_buffers, device_windows, exec_frames,
-    finish_change, fund_mapping, has_table, in_mapping, make_table, map_whole, reserve_mapping,
-    step_change,
+    Change, Frames, abandon_change, begin_protect, begin_unmap, check_buffers, device_windows,
+    exec_frames, finish_change, frames_of, in_mapping, map_whole, reserve_mapping, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
