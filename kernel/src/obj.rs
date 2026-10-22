@@ -154,6 +154,49 @@ fn release() {
     OBJ.unlock_held();
 }
 
+/// The number of the section a code has looked at a queue in (`mark`), which
+/// the builds with `obj_checks` and the probe kernels of the window keep and
+/// nothing else does. The number of a section is the ticket the lock serves
+/// while it lasts (`Ticket::served`): each take adds one to it, under the
+/// lock, so the section needs no counter of its own.
+#[derive(Clone, Copy)]
+pub struct Mark(#[cfg(section_marks)] u16);
+
+/// Takes the number of the section now: `receive` and `send` do it at the
+/// first look at a queue (spec 6.1), and `Mark::same_section` checks it where
+/// the request is taken off.
+#[inline(always)]
+pub fn mark() -> Mark {
+    Mark(
+        #[cfg(section_marks)]
+        OBJ.served(),
+    )
+}
+
+impl Mark {
+    /// Stops a test build that gave `OBJ` back and took it again since the
+    /// mark: what was seen of the queue is no longer what it holds.
+    #[inline(always)]
+    #[track_caller]
+    pub fn same_section(self) {
+        #[cfg(section_marks)]
+        assert!(
+            self.0 == OBJ.served(),
+            "OBJ was given back between the look at a queue and the take of its request"
+        );
+    }
+}
+
+/// The probe `break-one-section`: gives `OBJ` back and takes it again inside
+/// the section of the caller's guard, as the second section of a receive
+/// that looked at the head of a queue in the first would.
+#[cfg(feature = "break-one-section")]
+pub fn split_section() {
+    assert!(held(), "no section to split");
+    release();
+    acquire(me());
+}
+
 /// Ends the section of a frame that is abandoned and never drops its
 /// guard: init's end in a test build, which never returns.
 #[cfg(feature = "ktest")]

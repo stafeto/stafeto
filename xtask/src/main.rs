@@ -1151,7 +1151,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 257;
+const INIT_TESTS: u32 = 256;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1236,10 +1236,11 @@ enum Variant {
     /// a thread inside it (`smp_window`).
     WindowProbe,
     /// The same without the look under OBJ at a request for the entry before
-    /// a receive or a send waits, and without the second look at the head of
-    /// a queue after the room for its handles (`smp_window`).
+    /// a receive or a send waits (`smp_window`), and with a receive that gives
+    /// OBJ back between its look at the head of a queue and the take of the
+    /// request.
     WindowNoBlockCheck,
-    WindowNoHeadCheck,
+    WindowBreakOneSection,
     /// The same without the second look at the life of the process after the
     /// portion of a mem_map RX gave OBJ back (`smp_window`).
     WindowNoAliveCheck,
@@ -1273,7 +1274,7 @@ impl Variant {
         Variant::CpuOnRefused,
         Variant::WindowProbe,
         Variant::WindowNoBlockCheck,
-        Variant::WindowNoHeadCheck,
+        Variant::WindowBreakOneSection,
         Variant::WindowNoAliveCheck,
         Variant::AsidProbe,
         Variant::AsidNoReserved,
@@ -1302,7 +1303,7 @@ impl Variant {
             Variant::CpuOnRefused => Some("cpu-on-refused"),
             Variant::WindowProbe => Some("window-probe"),
             Variant::WindowNoBlockCheck => Some("break-block-check"),
-            Variant::WindowNoHeadCheck => Some("break-head-check"),
+            Variant::WindowBreakOneSection => Some("break-one-section"),
             Variant::WindowNoAliveCheck => Some("break-alive-check"),
             Variant::AsidProbe => Some("asid-probe"),
             Variant::AsidNoReserved => Some("break-asid-reserved"),
@@ -1325,7 +1326,7 @@ impl Variant {
             | Variant::CpuOnRefused
             | Variant::WindowProbe
             | Variant::WindowNoBlockCheck
-            | Variant::WindowNoHeadCheck
+            | Variant::WindowBreakOneSection
             | Variant::WindowNoAliveCheck
             | Variant::AsidProbe
             | Variant::AsidNoReserved
@@ -1375,7 +1376,7 @@ impl Variant {
             Variant::CpuOnRefused => "stafeto-cpu-on",
             Variant::WindowProbe => "stafeto-window",
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
-            Variant::WindowNoHeadCheck => "stafeto-window-no-head",
+            Variant::WindowBreakOneSection => "stafeto-window-split",
             Variant::WindowNoAliveCheck => "stafeto-window-no-alive",
             Variant::AsidProbe => "stafeto-asid",
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
@@ -9331,7 +9332,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The lines the tests of SMP stage 4 print when they ran on every one of
 /// four CPUs (tests/init/src/smp.rs): each test that finds one CPU passes
 /// without them.
-const SMP_PROBE_LINES: [&str; 15] = [
+const SMP_PROBE_LINES: [&str; 14] = [
     "smp: 4 CPUs, threads ran together on every CPU",
     "smp: service on CPU 2 worked at 30 for a client on CPU 1, then at 10",
     "smp: suspend and kill stopped the threads of the child on 4 CPUs",
@@ -9342,8 +9343,7 @@ const SMP_PROBE_LINES: [&str; 15] = [
     "smp: a client on CPU 1 was raised while its service on CPU 2 ended, the kernel went on",
     "smp: a request after the first look of receive ended the call Interrupted, the entry came",
     "smp: a request after the first look of send ended the call Interrupted, the entry came",
-    "smp: a receiver that lost the head of the queue to a receiver on another CPU took the next request",
-    "smp: a receiver that lost the head of the queue to a recall of its sender took the next request",
+    "smp: a request with a handle was taken by a receiver on another CPU in one section",
     "smp: 88 processes on 4 CPUs read only their own pages, in waves of 16 and one by one",
     "smp: a page unmapped on CPU 0 faulted the thread that read it on CPU 1",
     "smp: 4 processes that ended on CPU 0 with a thread on CPU 1 left no entry under their ASIDs",
@@ -9426,12 +9426,12 @@ fn smp_window() -> Result<(), String> {
         },
     )?;
     smp_window_break(
-        Variant::WindowNoHeadCheck,
-        "the second look at the head of a queue",
+        Variant::WindowBreakOneSection,
+        "one section from the look at a queue to the take of its request (a receive that gives OBJ back between them)",
         |o, _| {
-            o.lines.iter().any(|l| {
-                l.contains("the head of a channel's queue moved while its receiver made room")
-            })
+            o.lines
+                .iter()
+                .any(|l| l.contains("OBJ was given back between the look at a queue and the take"))
         },
     )?;
     smp_window_break(
@@ -9676,10 +9676,6 @@ fn init_tests_in(
             qemu::expect_line(
                 &o,
                 "smp window  a thread ended on its CPU between the post of its command and the flush",
-            )?;
-            qemu::expect_line(
-                &o,
-                "smp window  the head of a queue moved while its receiver made room",
             )?;
             qemu::expect_line(
                 &o,

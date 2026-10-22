@@ -34,9 +34,10 @@ cpu-on-refused = []
 window-probe = []
 # The probe kernel with one deliberate break each (xtask smp-window): no look
 # at the request of the entry under OBJ before a receive or a send waits, and
-# no second look at the head of a queue after the room for its handles.
+# a receive that gives OBJ back between its look at the head of a queue and
+# the take of the request, which the number of the section must catch.
 break-block-check = ["window-probe"]
-break-head-check = ["window-probe"]
+break-one-section = ["window-probe"]
 # No second look at the life of the process after the portion of a mem_map RX
 # gave OBJ back for the instruction cache.
 break-alive-check = ["window-probe"]

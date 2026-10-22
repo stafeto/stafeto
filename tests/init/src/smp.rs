@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 23] = [
+pub(crate) const TESTS: [Test; 22] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -88,10 +88,9 @@ pub(crate) const TESTS: [Test; 23] = [
         request_before_send_waits,
     ),
     (
-        "smp_receiver_loses_the_head_to_another_receiver",
-        head_taken_by_another_receiver,
+        "smp_request_with_a_handle_is_taken_in_one_section",
+        request_with_a_handle_is_taken_in_one_section,
     ),
-    ("smp_receiver_loses_the_head_to_a_recall", head_recalled),
     ("smp_measures_of_stage_6", stage_6_measures),
     ("smp_litmus_tests_of_memory_order", litmus_tests),
 ];
@@ -1233,18 +1232,19 @@ fn boost_of_a_service_that_ended() -> Outcome {
 }
 
 /// The priority at which the kernel built with `window-probe` holds the
-/// receive or the send of a thread between its first look at a request for
-/// its entry, which no lock covers, and the look under OBJ before it waits
-/// (kernel cmd::window).
+/// receive or the send of a thread, before its section, until a request for
+/// its entry was made, so that the look under OBJ before it waits has to
+/// find the request (kernel cmd::window).
 const WAIT_LEVEL: u8 = 14;
-/// The priority of the receiver the kernel holds between the two sections of
-/// its receive, after the room for the handles of the request at the head.
+/// The priority of the receiver whose section the kernel built with
+/// `break-one-section` splits in two, after the room for the handles of the
+/// request at the head.
 const HEAD_LEVEL: u8 = 13;
 
 /// What the threads of the probes of the window say: [0] the thread that
-/// sends or waits is about to call, [1] its result, [2] and [3] the results
-/// of the two receivers, [4] the result of the late sender, [5] the entries
-/// of its handler that ran. 1 is the outcome the probe wants.
+/// sends or waits is about to call, [1] its result, [2] the result of the
+/// receiver, [5] the entries of its handler that ran. 1 is the outcome the
+/// probe wants.
 static STEPS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// The raw value of the handle the sender of the probe carries.
 static CARRIED: AtomicU64 = AtomicU64::new(0);
@@ -1390,140 +1390,38 @@ extern "C" fn takes_one(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// The request the receiver that lost its head waits for, from a thread of
-/// its own, since init spins while it waits.
-extern "C" fn sends_late(_: u64) -> ! {
-    let c = Handle::<Channel>::borrowed(abi::Handle(CHANNEL.load(Relaxed)));
-    STEPS[4].store(if sys::send(&c, &[2]).is_ok() { 1 } else { 2 }, SeqCst);
-    sys::thread_exit()
-}
-
-/// How the two probes of the head of a queue end: the three threads they
-/// leave and the handles they hold.
-struct Head {
-    c: Handle<Channel>,
-    spare: Handle<Channel>,
-    sender: Handle<Thread>,
-    first: Handle<Thread>,
-    /// Whether the kernel holds the first receiver at the point of the probe
-    /// (`window-probe`): the sender of the request is not answered yet when
-    /// the test comes to move the head.
-    held: bool,
-}
-
-impl Head {
-    /// A request with a handle waits at the head of a channel's queue, from
-    /// CPU 3. A receiver on CPU 1 finds it and makes room for its handle;
-    /// the kernel built with `window-probe` holds it there, out of OBJ,
-    /// until the head moved.
-    fn begin() -> Result<Head, &'static str> {
-        reset_steps();
-        let c = channel(QUIET)?;
-        let spare = channel(QUIET)?;
-        CHANNEL.store(c.raw().0, Relaxed);
-        CARRIED.store(copy_raw(&spare, Rights::TRANSFER)?.0, Relaxed);
-        let sender = spawn_on(0, 3, sends_a_handle, 0, TEST_PRIORITY)?;
-        check(wait_for(|| step(0) == 1), "the sender did not start")?;
-        // Its request is in the queue.
-        pause(20_000_000);
-        let first = spawn_on(1, 1, takes_one, 2, HEAD_LEVEL)?;
-        // The receiver is in the gap of the probe, or has taken the request.
-        pause(20_000_000);
-        let held = step(1) == 0 && step(2) == 0;
-        Ok(Head {
-            c,
-            spare,
-            sender,
-            first,
-            held,
-        })
-    }
-
-    /// The request that follows, from a thread on CPU 2, which the receiver
-    /// that lost the head takes once it waits again; then the threads go.
-    fn finish(self, extra: Handle<Thread>) -> Result<(), &'static str> {
-        let late = spawn_on(2, 2, sends_late, 0, LEVEL)?;
-        let got = wait_for(|| step(4) != 0);
-        let_run()?;
-        for t in [self.sender, self.first, late, extra] {
-            close(t)?;
-        }
-        close(self.spare)?;
-        close(self.c)?;
-        check(got && step(4) == 1, "the next request did not arrive")
-    }
-}
-
-/// The receiver on CPU 1 loses the head to a second receiver on CPU 2: it
-/// has to look again and, with the queue empty, wait: the next request
-/// reaches it. The kernel that does not look again stops in its `assert`.
-/// Where the kernel does not hold the receiver, it takes the request itself,
-/// and the second receiver takes the next.
-fn head_taken_by_another_receiver() -> Outcome {
+/// A request with a handle waits at the head of a channel's queue, from CPU
+/// 3. A receiver at HEAD_LEVEL on CPU 1 finds it, makes room for the handle
+/// and takes the request in the same section, and answers it: the sender
+/// gets its reply. A kernel built with `break-one-section` gives `OBJ` back
+/// between the look and the take, and stops at the number of the section
+/// (xtask smp-window).
+fn request_with_a_handle_is_taken_in_one_section() -> Outcome {
     let n = cpus()?;
     if n < 4 {
         return Ok(());
     }
-    let head = Head::begin()?;
-    let second = spawn_on(3, 2, takes_one, 3, LEVEL)?;
+    reset_steps();
+    let c = channel(QUIET)?;
+    let spare = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    CARRIED.store(copy_raw(&spare, Rights::TRANSFER)?.0, Relaxed);
+    let sender = spawn_on(0, 3, sends_a_handle, 0, TEST_PRIORITY)?;
+    check(wait_for(|| step(0) == 1), "the sender did not start")?;
+    // Its request is in the queue.
     pause(20_000_000);
-    let early = step(3);
-    let settled = wait_for(|| step(1) != 0);
-    let held = head.held;
-    head.finish(second)?;
-    let both = wait_for(|| step(2) == 1 && step(3) == 1);
-    check(
-        settled && step(1) == 1,
-        "the sender's request was not answered",
-    )?;
-    check(
-        !held || early == 1,
-        "the second receiver did not take the request the first one lost",
-    )?;
-    check(both, "a receiver did not take its request")?;
-    println!(
-        "smp: a receiver that lost the head of the queue to a receiver on another CPU took the next request"
-    );
-    Ok(())
-}
-
-/// The receiver on CPU 1 loses the head to the recall of its sender (a
-/// request for the entry of the sender, from this CPU): the same look, the
-/// same wait. A second receiver takes the request that the first one would
-/// have, where the kernel does not hold the first one.
-fn head_recalled() -> Outcome {
-    let n = cpus()?;
-    if n < 4 {
-        return Ok(());
+    let receiver = spawn_on(1, 1, takes_one, 2, HEAD_LEVEL)?;
+    let done = wait_for(|| step(1) != 0 && step(2) != 0);
+    let_run()?;
+    for t in [sender, receiver] {
+        close(t)?;
     }
-    let head = Head::begin()?;
-    let asked = sys::thread_upcall_request(&head.sender);
-    let held = head.held;
-    let settled = wait_for(|| step(1) != 0);
-    let second = spawn_on(3, 2, takes_one, 3, LEVEL)?;
-    pause(20_000_000);
-    head.finish(second)?;
-    // The requests taken: the sender's, unless it was recalled, and the late
-    // one.
-    let taken = wait_for(|| {
-        u64::from(step(2) == 1) + u64::from(step(3) == 1) == if step(1) == 1 { 2 } else { 1 }
-    });
-    check(
-        !held || asked.is_ok(),
-        "the recall of the sender, which waited in the queue, failed",
-    )?;
-    check(settled, "the sender's request did not end")?;
-    check(
-        step(1) == if held { 2 } else { 1 },
-        "the sender's request ended some other way",
-    )?;
-    check(
-        taken,
-        "the requests were not taken by the receivers, each once",
-    )?;
-    println!(
-        "smp: a receiver that lost the head of the queue to a recall of its sender took the next request"
-    );
+    close(spare)?;
+    close(c)?;
+    check(done, "the request was not taken and answered")?;
+    check(step(1) == 1, "the sender's request was not answered")?;
+    check(step(2) == 1, "the receiver did not take the request")?;
+    println!("smp: a request with a handle was taken by a receiver on another CPU in one section");
     Ok(())
 }
 

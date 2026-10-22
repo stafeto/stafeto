@@ -102,11 +102,24 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   are 0, and SB without dmb shows both threads reading 0 in 9 rounds of 10)
   and a lock torture of 250 ms (some 850 000 calls on HVF).
 - `cargo xtask smp-window`: the test init on 4 CPUs with a kernel that holds
-  a thread at a chosen point (`window-probe`): a receive or a send holds after
-  its first look at a request for its entry, until another CPU makes the
-  request, and a receive holds between its two sections, until the head of
-  the queue moves. Then the kernels without the look under `OBJ` before a wait
-  and without the second look at the head, each of which must fail.
+  a thread at a chosen point (`window-probe`): a receive or a send holds
+  before its section, until another CPU makes a request for its entry. A
+  receive and a send are one section from the first look at a queue to the
+  take of the request, so a head that moved or a receiver that left between
+  the two cannot happen and nothing starts the call over for it. A section
+  has a number, the ticket the lock serves while it lasts, and the test
+  builds and the window kernels check it: `receive` and `send` keep the
+  number at their first look (`obj::mark`) and check it in `take_request`
+  and `meet`.
+  Then the kernels that must fail: the one without the look under `OBJ`
+  before a wait, the one without the second look at the life of a process
+  after the instruction cache of a mem_map RX, and the one whose receive gives
+  `OBJ` back and takes it again between its look at the head and the take
+  (`break-one-section`), which stops at the number of the section.
+  The one repeat of a receive that remains is the one for a request whose
+  handles find no room: it fails that sender and takes one request off the
+  queue, so the repeats of a call are at most the requests with handles that
+  stood in the queue when it began (spec 6.1).
 - `ci` runs the test init, `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
   guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.

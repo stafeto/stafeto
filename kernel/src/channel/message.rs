@@ -120,16 +120,26 @@ fn drop_handles(t: NonNull<Thread>, values: &[u64]) {
 /// sender with that error, LIMIT_REACHED or NO_MEMORY, and its handles go at
 /// `t`'s priority; the call then starts over at its `svc` with its
 /// registers as they were (syscall::restart), and takes the next head
-/// (spec 6.1). With nothing queued, WOULD_BLOCK when `wait` is false;
+/// (spec 6.1). The repeats of a receive that finds no room for the handles
+/// of the head are at most the requests with handles that stood in the queue
+/// when the call began: each takes one off, and a request that comes later
+/// stands behind them (spec 6.1, one section and the limit of repeats).
+/// With nothing queued, WOULD_BLOCK when `wait` is false;
 /// otherwise `t` waits through its own slot at the tail of its level,
 /// holding a reference to `c`, and gets its result when the wait ends
-/// (`post`, `send`, `clean`). O(1).
+/// (`post`, `send`, `clean`). The look at the head, the room for its handles
+/// and the take of the request are one section: the head cannot move in
+/// between, and a test build checks the number of the section (`obj::mark`).
+/// O(1).
 pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<(), Error> {
     // SAFETY: the current thread is held; inspect its private delivery state.
     if wait && unsafe { t.as_ref() }.upcall.interrupt_wait() {
         return Err(Error::Interrupted);
     }
     let ceiling = ceiling(t);
+    // The look at the queue below, and the take of the request, are one
+    // section.
+    let mark = crate::obj::mark();
     let looked = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive; the sender of a queued request waits, so it is
@@ -147,7 +157,14 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                         // Its handles need room first, which may take a page.
                         return Ok(Looked::Handles(client));
                     }
-                    return Ok(Looked::Done(Some(take_request(k, t, c, client, Ok(())))));
+                    return Ok(Looked::Done(Some(take_request(
+                        k,
+                        t,
+                        c,
+                        client,
+                        Ok(()),
+                        mark,
+                    ))));
                 }
                 q.take_slot();
                 let (n, priority) = notice(slot);
@@ -183,19 +200,12 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             let n = unsafe { sent(client) }.handles;
             // SAFETY: the running thread is alive and holds its process.
             let fit = process::reserve_handles(unsafe { t.as_ref() }.process(), n);
-            // SAFETY: the room may have been made outside OBJ (`reserve_
-            // handles`), where another receiver can take the request, or a
-            // recall (`sched::request_upcall`) can withdraw its sender:
-            // `still_head` looks again under OBJ, and the call starts over
-            // when the head is not the request that was looked at.
-            sched::locked(|k| unsafe {
-                if still_head(k, c, client, n) {
-                    Some(take_request(k, t, c, client, fit))
-                } else {
-                    syscall::restart(t);
-                    None
-                }
-            })
+            #[cfg(feature = "break-one-section")]
+            crate::cmd::window::split_section(t);
+            // SAFETY: the call is still in the section of its look: the head
+            // is the request that was looked at, which `take_request` checks
+            // in a test build.
+            sched::locked(|k| unsafe { Some(take_request(k, t, c, client, fit, mark)) })
         }
     };
     // SAFETY: the running thread is alive; the reference of the slot or of
@@ -217,32 +227,6 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
     Ok(())
 }
 
-/// Whether the head of the queue of `c` is still the request of `client`,
-/// which waits in send with `handles` handles.
-///
-/// # Safety
-/// `c` is alive; `k` is the locked scheduler. `client` may have ended: only
-/// its slot's address is compared until the slot is found at the head, which
-/// only a thread that waits in the queue has.
-unsafe fn still_head(
-    k: &mut Locked<'_>,
-    c: NonNull<Channel>,
-    client: NonNull<Thread>,
-    handles: usize,
-) -> bool {
-    // The kernel of the probe that leaves the look out.
-    if cfg!(feature = "break-head-check") {
-        return true;
-    }
-    // SAFETY: the caller's promise; the thread whose slot is at the head
-    // waits in `send`, so it is alive.
-    unsafe {
-        queue(c, k.s).head() == Some(thread::slot(client))
-            && matches!((*client.as_ptr()).waits, Some(Wait::Send(_)))
-            && sent(client).handles == handles
-    }
-}
-
 /// The request of `client`, the head of the queue of `c`, leaves it for
 /// `t`'s receive (spec 6.1): with room for its handles (`fit`), `t` takes
 /// it (`accept`); otherwise its sender wakes with that error in x0 alone,
@@ -252,24 +236,25 @@ unsafe fn still_head(
 ///
 /// # Safety
 /// `t` runs; `c` is alive, and `client` waits in send at the head of its
-/// queue; `k` is the locked scheduler.
+/// queue; `k` is the locked scheduler; `mark` was taken at the look at the
+/// head, in the same section.
 unsafe fn take_request(
     k: &mut Locked<'_>,
     t: NonNull<Thread>,
     c: NonNull<Channel>,
     client: NonNull<Thread>,
     fit: Result<(), Error>,
+    mark: crate::obj::Mark,
 ) -> Taken {
+    mark.same_section();
     // SAFETY: the caller's promise; the client's wait holds what it went
     // through, and its handles lie in it.
     unsafe {
         let taken = queue(c, k.s).take_slot();
         assert!(
             taken == Some(thread::slot(client)),
-            "the head of a channel's queue moved while its receiver made room"
+            "the head of a channel's queue is not the request that was looked at"
         );
-        #[cfg(feature = "window-probe")]
-        crate::cmd::window::head_moved();
         let Some(Wait::Send(via)) = (*client.as_ptr()).waits else {
             unreachable!("a request whose thread does not send");
         };
@@ -311,6 +296,9 @@ pub fn send(
     values: &[u64],
 ) -> Result<Option<NonNull<Thread>>, Error> {
     let c = via.channel();
+    // The look at the queue and the meeting with the receiver are one
+    // section (spec 6.1).
+    let mark = crate::obj::mark();
     sched::locked(|k| k.tokens.check_count(thread::index(t)))?;
     if is_closed(c) {
         drop_handles(t, values);
@@ -324,7 +312,7 @@ pub fn send(
     }
     if desc.len <= INLINE_MAX
         && values.is_empty()
-        && let Some(r) = fast_send(t, via, desc)
+        && let Some(r) = fast_send(t, via, desc, mark)
     {
         return Ok(Some(r));
     }
@@ -340,14 +328,6 @@ pub fn send(
             drop_handles(t, values);
             return Err(e);
         }
-        // The room may have been made outside OBJ, where another sender can
-        // take the receiver, or a recall can withdraw it: the call starts
-        // over, with its handles in the table, when the top receiver is
-        // not the one whose table has the room.
-        if sched::locked(|k| receiver_of(c, k)) != receiver {
-            syscall::restart(t);
-            return Ok(None);
-        }
     }
     if !values.is_empty() {
         // SAFETY: the running thread holds its process, and its handles on
@@ -358,9 +338,9 @@ pub fn send(
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive; its handles are on their way, with room for
         // them in the table of the receiver's process; nothing changed the
-        // queue since it was looked at: OBJ was held since (`reserve_handles`
-        // is the one place that gives it back, and the receiver was looked
-        // at again after it). The receiver it returns is alive.
+        // queue since it was looked at: the call has held OBJ since (one
+        // section, which `meet` checks in a test build). The receiver it
+        // returns is alive.
         unsafe {
             // A request for the thread's entry that came while the call was
             // on its way found no wait to end (`sched::request_upcall`
@@ -370,7 +350,7 @@ pub fn send(
             if receiver.is_none() && t.as_ref().upcall.deliverable() {
                 return Err(Error::Interrupted);
             }
-            let r = meet(k, t, via, desc, crate::arch::timer::now());
+            let r = meet(k, t, via, desc, crate::arch::timer::now(), mark);
             assert!(r == receiver, "the receiver of a request changed");
             if let Some(r) = r {
                 sched::wake(k, r);
@@ -416,7 +396,12 @@ fn receiver_of(c: NonNull<Channel>, k: &mut Locked<'_>) -> Option<NonNull<Thread
 /// reference of the receiver's wait goes after OBJ.
 /// Returns the receiver, which the caller runs; None, with nothing changed,
 /// when a condition fails. O(1).
-fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>> {
+fn fast_send(
+    t: NonNull<Thread>,
+    via: Via,
+    desc: Desc,
+    mark: crate::obj::Mark,
+) -> Option<NonNull<Thread>> {
     let c = via.channel();
     // The hints are the CPU's own, read before the section.
     let cleanup = cleanup::top();
@@ -441,7 +426,7 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
             if !k.s.can_hand_off(level, cleanup) || arch::irq_pending() || !testpoint::fast_path() {
                 return None;
             }
-            let taken = meet(k, t, via, desc, now);
+            let taken = meet(k, t, via, desc, now, mark);
             assert!(taken == Some(r), "the receiver of a request changed");
             Some(r)
         }
@@ -464,7 +449,8 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
 /// Under OBJ `k`, at the counter value `now`: `t` runs and
 /// sends through `via`, whose channel is alive, with `desc`; its handles are
 /// on their way, and a receiver that waits has room for them in its
-/// process's table.
+/// process's table. `mark` was taken at the first look at the queue, in the
+/// same section.
 /// Inlined into both paths: a call of its own costs each of them about 30
 /// instructions.
 #[inline(always)]
@@ -474,7 +460,9 @@ unsafe fn meet(
     via: Via,
     desc: Desc,
     now: u64,
+    mark: crate::obj::Mark,
 ) -> Option<NonNull<Thread>> {
+    mark.same_section();
     // SAFETY: the caller's promise; a thread that waits in receive is
     // alive, and its slot lies in it.
     unsafe {

@@ -201,6 +201,14 @@ impl Ticket {
         self.next.load(Ordering::Relaxed)
     }
 
+    /// The ticket served now, modulo 2^16: while a CPU holds the lock it is
+    /// the holder's own, and it is another number for each holder after it,
+    /// so it names a section. Waiting CPUs do not change it.
+    #[inline(always)]
+    pub fn served(&self) -> u16 {
+        self.serving.load(Ordering::Relaxed)
+    }
+
     /// Whether no CPU holds or awaits the lock.
     pub fn is_free(&self) -> bool {
         self.next.load(Ordering::Relaxed) == self.serving.load(Ordering::Relaxed)
@@ -426,6 +434,24 @@ mod tests {
         // SAFETY: the threads are done.
         assert_eq!(unsafe { *shared.0.get() }, 16_000);
         assert!(lock.is_free());
+    }
+
+    /// The ticket served names the section of the holder: it stays while
+    /// others wait and changes with each hold.
+    #[test]
+    fn ticket_served_names_the_section() {
+        let lock = Ticket::new();
+        let a = lock.lock();
+        let first = lock.served();
+        let waiting = lock.next.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(lock.served(), first, "a waiting CPU changes the number");
+        lock.unlock(a);
+        assert_eq!(lock.served(), waiting, "the next holder has its own number");
+        lock.unlock(waiting);
+        let b = lock.lock();
+        assert_ne!(lock.served(), first);
+        assert_eq!(lock.served(), b);
+        lock.unlock(b);
     }
 
     /// The lock serves tickets in the order they were taken.

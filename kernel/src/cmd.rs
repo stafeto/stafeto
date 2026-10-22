@@ -534,10 +534,11 @@ pub mod window {
     }
 
     /// The priority of the thread whose receive or send the probe holds
-    /// after its look at the request of the entry that no lock covers.
+    /// before its section, until a request for its entry was made.
     pub const WAIT_LEVEL: u8 = 14;
-    /// The priority of the receiver the probe holds between the two sections
-    /// of its receive.
+    /// The priority of the receiver whose section `break-one-section` splits
+    /// in two.
+    #[cfg(feature = "break-one-section")]
     pub const HEAD_LEVEL: u8 = 13;
 
     /// In `dispatch` of send and receive, before the section: a thread at
@@ -557,12 +558,16 @@ pub mod window {
         }
     }
 
-    static MOVED: AtomicU32 = AtomicU32::new(0);
-
-    /// The head of a queue of requests left it (a receiver took it, or its
-    /// sender was recalled).
-    pub fn head_moved() {
-        MOVED.fetch_add(1, Ordering::Release);
+    /// In receive, after the room for the handles of the request at the
+    /// head was made (`break-one-section`): a receiver at HEAD_LEVEL gives
+    /// OBJ back and takes it again, which a receive in one section never
+    /// does. The number of the section catches it.
+    #[cfg(feature = "break-one-section")]
+    pub fn split_section(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.base_priority() == HEAD_LEVEL {
+            crate::obj::split_section();
+        }
     }
 
     /// The priority of the caller of a suspension that the probe holds a

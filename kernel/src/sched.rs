@@ -588,8 +588,6 @@ unsafe fn interrupt_if(
                 Some(Wait::Receive(_) | Wait::Send(_))
             ));
             let waited = channel::withdraw(t, k);
-            #[cfg(feature = "window-probe")]
-            crate::cmd::window::head_moved();
             syscall::set_result(t, Err(Error::Interrupted));
             wake(k, t);
             Ok::<_, Error>(Some(waited))
