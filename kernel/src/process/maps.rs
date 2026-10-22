@@ -453,10 +453,10 @@ pub unsafe fn finish_change(on: Change, cause: u8) {
 /// range checked against the mappings and the message buffers of the
 /// process (`check_free`), then its resources, its entry with a reference
 /// to the object and the rights of `access` alone, and every portion in a
-/// row, with interrupts masked, so that nothing ends the process
-/// meanwhile: only the kernel's loading of init at boot and the tests map
-/// this way. Executable pages have the instruction cache made coherent
-/// first. INVALID_ARGS, LIMIT_REACHED and NO_MEMORY as for mem_map, and
+/// row, each in a section of its own (the caller holds none): only the
+/// kernel's loading of init at boot and the tests map this way, with
+/// nothing to end the process meanwhile. Executable pages have the
+/// instruction cache made coherent first. INVALID_ARGS, LIMIT_REACHED and NO_MEMORY as for mem_map, and
 /// nothing is mapped then.
 pub fn map_whole(
     target: NonNull<Process>,
@@ -464,25 +464,31 @@ pub fn map_whole(
     va: usize,
     access: Access,
 ) -> Result<(), Error> {
-    crate::obj::assert_held();
     let pages = memory::pages(m) as u32;
-    check_free(target, va as u64, pages.into())?;
-    let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
-    let mut on = add_mapping(target, mapping, access)?;
+    let mut on = {
+        let _section = crate::obj::lock();
+        check_free(target, va as u64, pages.into())?;
+        let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
+        add_mapping(target, mapping, access)?
+    };
     loop {
-        let (n, frames) = exec_frames(&on).expect("a process that lives takes every portion");
+        let (n, frames) = {
+            let _section = crate::obj::lock();
+            exec_frames(&on).expect("a process that lives takes every portion")
+        };
         if n > 0 {
             cache::sync_icache_frames(&frames[..n]);
         }
         let ready = (n > 0).then_some(&frames);
+        let _section = crate::obj::lock();
         if step_change(&mut on, ready).expect("a process that lives takes every portion") {
-            break;
+            // SAFETY: the change ended with its last portion, the process
+            // lives, and a mem_map releases nothing at the end, whatever
+            // the level.
+            unsafe { finish_change(on, 1) };
+            return Ok(());
         }
     }
-    // SAFETY: the change ended with its last portion, the process lives,
-    // and a mem_map releases nothing at the end, whatever the level.
-    unsafe { finish_change(on, 1) };
-    Ok(())
 }
 
 /// `on` stops for good midway (spec 7.7): its thread ended with its

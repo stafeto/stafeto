@@ -41,8 +41,13 @@ const _: () = assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
 pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
     use crate::thread;
     use abi::Policy;
-    let p = process::create_init(kcore::handles::MAX_HANDLES, PRIORITY)
-        .unwrap_or_else(|e| panic!("init: no process: {e:?}"));
+    // The other CPUs are in their loop of the way out already: whatever
+    // here touches the frames, the ASIDs or the objects does it in a section.
+    let p = {
+        let _section = crate::obj::lock();
+        process::create_init(kcore::handles::MAX_HANDLES, PRIORITY)
+            .unwrap_or_else(|e| panic!("init: no process: {e:?}"))
+    };
     process::set_init(p);
     match load(p, program) {
         Ok(()) => {}
@@ -61,6 +66,7 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
         }
     }
     let pages = (image.size / PAGE_SIZE) as usize;
+    let section = crate::obj::lock();
     let boot = memory::create_boot(p, image.base, pages)
         .unwrap_or_else(|e| panic!("init: no memory object for the boot image: {e:?}"));
     let t = thread::create(
@@ -85,7 +91,7 @@ pub fn start(program: &Program<'_>, image: kcore::bootinfo::Region) -> ! {
         thread::release(t, PRIORITY);
         process::release(p, PRIORITY);
     }
-    crate::sched::resume()
+    crate::sched::resume_from(section)
 }
 
 /// What of a program did not load (`load`): its part, its size in bytes,
@@ -170,6 +176,7 @@ fn load_part(
         unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), at as *mut u8, chunk.len()) };
     }
     let mapped = process::map_whole(p, m, va as usize, access);
+    let _section = crate::obj::lock();
     // SAFETY: the reference `create_whole` handed out goes; the mapping,
     // if it went in, holds the object, and without it the object goes.
     unsafe { memory::release(m, PRIORITY) };

@@ -266,16 +266,20 @@ pub fn fill(m: NonNull<Memory>) -> bool {
 
 /// A whole object of `pages` pages that `payer` pays for, as `create` and
 /// every portion of `fill` in a row make it: the frames of all its pages
-/// are taken and zeroed before this returns, with interrupts masked, so
-/// only the kernel's loading of init at boot and the tests make one this
-/// way (spec 13.3). INVALID_ARGS for 0 pages or more than
+/// are taken and zeroed before this returns, with interrupts masked, each
+/// step in a section of its own (the caller holds none), so only the
+/// kernel's loading of init at boot and the tests make one this way (spec
+/// 13.3). INVALID_ARGS for 0 pages or more than
 /// kcore::pagelist::MAX_PAGES, NO_MEMORY as for `create`. The caller gets
 /// the only reference.
 pub fn create_whole(payer: NonNull<Process>, pages: usize) -> Result<NonNull<Memory>, Error> {
     if !(1..=pagelist::MAX_PAGES).contains(&pages) {
         return Err(Error::InvalidArgs);
     }
-    let m = create(payer, pages)?;
+    let m = {
+        let _section = crate::obj::lock();
+        create(payer, pages)?
+    };
     while !fill(m) {}
     Ok(m)
 }

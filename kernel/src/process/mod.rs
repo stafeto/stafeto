@@ -79,9 +79,11 @@ pub use maps::{
 pub use table::install_init_handles;
 pub use table::{
     close_handle, handle_counts, handle_room, insert_handle, move_start, put_handles,
-    reserve_handles, reserve_start, take_handles,
+    reserve_handles, reserve_start, start_channel, take_handles,
 };
-pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
+pub use teardown::{
+    Stage, clean, exit_channel, exit_label, hasten, raise_replies, set_exit, unset_exit,
+};
 use teardown::{begin, queue_shell};
 
 #[cfg(feature = "icount")]

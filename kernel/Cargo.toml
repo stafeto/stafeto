@@ -41,6 +41,8 @@ break-one-section = ["window-probe"]
 # No second look at the life of the process after the portion of a mem_map RX
 # gave OBJ back for the instruction cache.
 break-alive-check = ["window-probe"]
+# No second look at x3 and x5 of process_create after the gap between its sections.
+break-spawn-check = ["window-probe"]
 measure = []
 # The checks of OBJ (obj.rs) in an image that runs the test init on several
 # CPUs: the places that change a link outside a section stop the kernel

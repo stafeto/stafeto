@@ -635,6 +635,56 @@ pub mod window {
         }
     }
 
+    /// The priority of the caller of process_create that the probe holds
+    /// between its two sections (`spawn_gap`).
+    pub const SPAWN_LEVEL: u8 = 11;
+
+    /// The process whose caller of process_create waits in `spawn_gap`, as
+    /// an address, 0 for none, and how many handles of it were closed.
+    static WATCHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    static CLOSED: AtomicU32 = AtomicU32::new(0);
+
+    /// A handle_close of a thread of `process` succeeded.
+    pub fn closed(process: NonNull<crate::process::Process>) {
+        if WATCHED.load(Ordering::Acquire) == process.as_ptr() as usize {
+            CLOSED.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Between the two sections of process_create, no section held: a
+    /// caller at SPAWN_LEVEL waits up to 2 s until another thread of its
+    /// process closed a handle or the process ended, so that the second
+    /// section finds the arguments changed.
+    pub fn spawn_gap(t: NonNull<Thread>, _child: NonNull<crate::process::Process>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.priority() != SPAWN_LEVEL {
+            return;
+        }
+        // SAFETY: as above.
+        let process = unsafe { t.as_ref() }.process();
+        let seen = CLOSED.load(Ordering::Acquire);
+        WATCHED.store(process.as_ptr() as usize, Ordering::Release);
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+        while CLOSED.load(Ordering::Acquire) == seen
+            && crate::process::alive_unlocked(process)
+            && crate::arch::timer::now() < until
+        {
+            core::hint::spin_loop();
+        }
+        WATCHED.store(0, Ordering::Release);
+        if !crate::process::alive_unlocked(process) {
+            if !SAW_END.swap(true, Ordering::Relaxed) {
+                kprintln!("smp window  a process_create waited for the end of its caller");
+            }
+        } else if CLOSED.load(Ordering::Acquire) != seen && !SAW_CLOSE.swap(true, Ordering::Relaxed)
+        {
+            kprintln!("smp window  a process_create waited for a handle to be closed");
+        }
+    }
+
+    static SAW_END: AtomicBool = AtomicBool::new(false);
+    static SAW_CLOSE: AtomicBool = AtomicBool::new(false);
+
     /// A mem_map begins (syscall::mem::change_map).
     pub fn map_begins() {
         if watched() {

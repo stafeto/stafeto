@@ -9,8 +9,8 @@
 
 use crate::harness::*;
 use crate::processes::{
-    Gift, KID_PATIENCE_NS, KID_WAIT_NS, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, reset_kid_marks,
-    set_kid_mark,
+    Gift, KID_PATIENCE_NS, KID_WAIT_NS, Kid, LEAF_QUOTA, SPAWN_CPU, kid_mark, quota_of,
+    reset_kid_marks, set_kid_mark,
 };
 use crate::timers::timer_at;
 use crate::transfers::copy_raw;
@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 22] = [
+pub(crate) const TESTS: [Test; 25] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -62,6 +62,18 @@ pub(crate) const TESTS: [Test; 22] = [
     (
         "smp_exec_map_of_a_process_killed_meanwhile_fails",
         exec_map_of_a_killed_process,
+    ),
+    (
+        "smp_spawn_with_its_start_channel_closed_meanwhile_fails",
+        spawn_with_the_start_channel_closed,
+    ),
+    (
+        "smp_spawn_with_its_exit_channel_closed_meanwhile_fails",
+        spawn_with_the_exit_channel_closed,
+    ),
+    (
+        "smp_spawn_by_a_process_that_ends_meanwhile_leaves_nothing",
+        spawn_by_a_process_that_ends,
     ),
     (
         "smp_boost_leaves_a_service_that_ended_on_its_cpu_alone",
@@ -1084,6 +1096,177 @@ fn exec_map_of_a_killed_process() -> Outcome {
         }
     );
     Ok(())
+}
+
+/// The priority at which the kernel built with `window-probe` holds a
+/// process_create between its two sections, with no section held, until
+/// another thread closed a handle or the caller's process ended (kernel
+/// cmd::window).
+const SPAWN_LEVEL: u8 = 11;
+/// How long the closer of the spawn tests waits after init marked its call.
+const SPAWN_CLOSE_NS: u64 = 200_000_000;
+/// The handle the closer closes.
+static SPAWN_HANDLE: AtomicU64 = AtomicU64::new(0);
+
+/// Waits for mark 2, which init sets right before its process_create, then
+/// for SPAWN_CLOSE_NS, and closes SPAWN_HANDLE; mark 1 says whether it did
+/// (1) or the close failed (2).
+extern "C" fn close_later(_: u64) -> ! {
+    while MARKS[2].load(SeqCst) == 0 {
+        spin_loop();
+    }
+    pause(SPAWN_CLOSE_NS);
+    // The raw call: the typed one stops the program on BAD_HANDLE, which is
+    // the answer when the process_create took the handle first.
+    let mut x = marked();
+    x[0] = SPAWN_HANDLE.load(Relaxed);
+    // SAFETY: handle_close only reads its registers.
+    let closed = unsafe { sys::raw::<{ Call::HandleClose.number() }>(x) };
+    MARKS[1].store(if closed[0] == 0 { 1 } else { 2 }, SeqCst);
+    sys::thread_exit()
+}
+
+/// process_create with raw registers, for a call that may fail with
+/// BAD_HANDLE (the typed call stops the program on it): the child's handle,
+/// or why not.
+fn create_raw(x3: abi::Handle, x4: u64, x5: abi::Handle) -> Result<Handle<Process>, Error> {
+    let x = crate::channels::raw_create(crate::channels::create_regs(x3, x4, x5));
+    match Error::from_code(x[0]) {
+        Some(e) => Err(e),
+        None => Ok(Handle::from_raw(abi::Handle(x[1]))),
+    }
+}
+
+/// Ends a child a spawn test got, if it got one.
+fn end_child(made: Result<Handle<Process>, Error>) -> Outcome {
+    if let Ok(child) = made {
+        let killed = sys::process_kill(&child);
+        close(child)?;
+        check(killed.is_ok(), "the child of a spawn test did not end")?;
+    }
+    Ok(())
+}
+
+/// Init makes a process with a start channel (x5) while a thread on CPU 1
+/// closes that handle SPAWN_CLOSE_NS after init's mark: a call that lasted
+/// that long saw the close and fails with BAD_HANDLE, whether the child
+/// took the channel or not; a kernel that looked at x5 only in its first
+/// section would find its entry 0 without a handle to close behind it and
+/// stop. The kernel built with `window-probe` holds the call between its
+/// sections until the close; elsewhere the close comes after the call.
+fn spawn_with_the_start_channel_closed() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let start = channel(QUIET)?;
+    SPAWN_HANDLE.store(start.raw().0, Relaxed);
+    let closer = spawn_on(0, 1, close_later, 0, KILLER)?;
+    sys::thread_set_priority(&me(), SPAWN_LEVEL, Policy::Fifo)
+        .map_err(|_| "init lowered itself")?;
+    MARKS[2].store(1, SeqCst);
+    let began = now();
+    let made = create_raw(abi::Handle(0), 0, start.raw());
+    let closed_first = now() - began >= SPAWN_CLOSE_NS;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "init could not take its priority back")?;
+    let done = wait_for(|| mark(1) != 0);
+    let_run()?;
+    close(closer)?;
+    // The channel is the child's, or the closer closed it: init's handle
+    // is not to be closed again.
+    start.into_raw();
+    check(done, "the closer of the start channel did not run")?;
+    let error = made.as_ref().err().copied();
+    check(
+        !closed_first || error == Some(Error::BadHandle),
+        "process_create with a start channel closed meanwhile failed otherwise",
+    )?;
+    end_child(made)?;
+    println!("smp: process_create met the close of its start channel: {error:?}");
+    Ok(())
+}
+
+/// The same with the exit channel (x3): the call fails with BAD_HANDLE when
+/// the close came during it.
+fn spawn_with_the_exit_channel_closed() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let base = channel(QUIET)?;
+    let exit = session(&base, Rights::NOTIFY, CHILD, QUIET)?;
+    SPAWN_HANDLE.store(exit.raw().0, Relaxed);
+    let closer = spawn_on(0, 1, close_later, 0, KILLER)?;
+    sys::thread_set_priority(&me(), SPAWN_LEVEL, Policy::Fifo)
+        .map_err(|_| "init lowered itself")?;
+    MARKS[2].store(1, SeqCst);
+    let began = now();
+    let made = create_raw(exit.raw(), QUIET.into(), abi::Handle(0));
+    let closed_first = now() - began >= SPAWN_CLOSE_NS;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
+        .map_err(|_| "init could not take its priority back")?;
+    let done = wait_for(|| mark(1) != 0);
+    let_run()?;
+    close(closer)?;
+    // The closer closed this handle, whatever the call did.
+    exit.into_raw();
+    close(base)?;
+    let error = made.as_ref().err().copied();
+    check(done, "the closer of the exit channel did not run")?;
+    check(
+        !closed_first || error == Some(Error::BadHandle),
+        "process_create with an exit channel closed meanwhile failed otherwise",
+    )?;
+    end_child(made)?;
+    println!("smp: process_create met the close of its exit channel: {error:?}");
+    Ok(())
+}
+
+/// A child at SPAWN_LEVEL makes a child of its own (the loader's
+/// process_create) while a thread on CPU 1 kills it SPAWN_CLOSE_NS after
+/// init's mark: the kernel built with `window-probe` holds the call between
+/// its sections until the kill, which then finds the caller ended and lets
+/// its child go; the kernel stays up and the child ends killed.
+fn spawn_by_a_process_that_ends() -> Outcome {
+    let n = cpus()?;
+    if n < 3 {
+        return Ok(());
+    }
+    reset_marks();
+    reset_kid_marks();
+    // On CPU 2 (the value is the CPU plus one): init spins on CPU 0, and
+    // the killer is on CPU 1.
+    SPAWN_CPU.store(3, Relaxed);
+    let kid = Kid::load(quota_of(Role::Grandparent), 16, SPAWN_LEVEL);
+    SPAWN_CPU.store(0, Relaxed);
+    let kid = kid?;
+    kid.start()?;
+    VICTIM.store(kid.process.raw().0, Relaxed);
+    let killer = spawn_on(0, 1, kill_victim_later, 0, KILLER)?;
+    let args = [LEAF_QUOTA, LOW.into(), 1];
+    let gifts = [Gift::Own, Gift::Image, Gift::GrandchildExit, Gift::Marks];
+    let served = kid.serve(Role::Grandparent, &args, &gifts);
+    // The child is about to call process_create: the killer's clock starts.
+    let about = wait_for(|| kid_mark(child::SEEN) != 0);
+    MARKS[2].store(1, SeqCst);
+    let done = wait_for(|| mark(1) != 0);
+    // The kill returned after the teardown. A child that did not wait in the
+    // kernel for it may have got as far as its request to init, which its
+    // end cancels, so the state is read, and the ear is not waited on.
+    let state = sys::process_state(&kid.process);
+    let_run()?;
+    close(killer)?;
+    kid.close()?;
+    served?;
+    check(about, "the child did not come to its process_create")?;
+    check(done && mark(1) == 1, "process_kill of the child failed")?;
+    check(
+        state == Ok(ProcessState::Killed),
+        "the child that made a child did not end killed",
+    )
 }
 
 /// A thread on another CPU makes threads in init's process, each of which

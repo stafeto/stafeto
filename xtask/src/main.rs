@@ -1152,7 +1152,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 256;
+const INIT_TESTS: u32 = 259;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1245,6 +1245,9 @@ enum Variant {
     /// The same without the second look at the life of the process after the
     /// portion of a mem_map RX gave OBJ back (`smp_window`).
     WindowNoAliveCheck,
+    /// The same without the second look at x3 and x5 of process_create after
+    /// the gap between its sections (`smp_window`).
+    WindowNoSpawnCheck,
     /// ASIDs 4 bits wide, so that a generation begins every dozen switches of
     /// address space (`smp_asid`), and the same with one deliberate break
     /// each: no reserved ASIDs, no deferred flush, no `aside1is` at the end
@@ -1266,7 +1269,7 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 22] = [
+    const ALL: [Variant; 23] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1280,6 +1283,7 @@ impl Variant {
         Variant::WindowNoBlockCheck,
         Variant::WindowBreakOneSection,
         Variant::WindowNoAliveCheck,
+        Variant::WindowNoSpawnCheck,
         Variant::AsidProbe,
         Variant::AsidNoReserved,
         Variant::AsidNoFlush,
@@ -1310,6 +1314,7 @@ impl Variant {
             Variant::WindowNoBlockCheck => Some("break-block-check"),
             Variant::WindowBreakOneSection => Some("break-one-section"),
             Variant::WindowNoAliveCheck => Some("break-alive-check"),
+            Variant::WindowNoSpawnCheck => Some("break-spawn-check"),
             Variant::AsidProbe => Some("asid-probe"),
             Variant::AsidNoReserved => Some("break-asid-reserved"),
             Variant::AsidNoFlush => Some("break-asid-flush"),
@@ -1334,6 +1339,7 @@ impl Variant {
             | Variant::WindowNoBlockCheck
             | Variant::WindowBreakOneSection
             | Variant::WindowNoAliveCheck
+            | Variant::WindowNoSpawnCheck
             | Variant::AsidProbe
             | Variant::AsidNoReserved
             | Variant::AsidNoFlush
@@ -1385,6 +1391,7 @@ impl Variant {
             Variant::WindowNoBlockCheck => "stafeto-window-no-block",
             Variant::WindowBreakOneSection => "stafeto-window-split",
             Variant::WindowNoAliveCheck => "stafeto-window-no-alive",
+            Variant::WindowNoSpawnCheck => "stafeto-window-no-spawn",
             Variant::AsidProbe => "stafeto-asid",
             Variant::AsidNoReserved => "stafeto-asid-no-reserved",
             Variant::AsidNoFlush => "stafeto-asid-no-flush",
@@ -9561,6 +9568,18 @@ fn smp_window() -> Result<(), String> {
                 .iter()
                 .any(|(name, _)| name == "smp_exec_map_of_a_process_killed_meanwhile_fails")
         },
+    )?;
+    smp_window_break(
+        Variant::WindowNoSpawnCheck,
+        "the second look at x3, x5 and the life of the caller of a process_create after the gap between its sections",
+        |o, r| {
+            o.lines.iter().any(|l| {
+                l.contains("the start channel's handle went on the way")
+                    || l.contains("a handle went into the table of a process that ended")
+            }) || r.failed.iter().any(|(name, _)| {
+                name.starts_with("smp_spawn_") && name.ends_with("_meanwhile_fails")
+            })
+        },
     )
 }
 
@@ -9803,6 +9822,14 @@ fn init_tests_in(
             qemu::expect_line(
                 &o,
                 "smp window  20 mem_map calls, the most passes of the checks in one: 1",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  a process_create waited for a handle to be closed",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  a process_create waited for the end of its caller",
             )?;
         }
         if !o.lines.iter().any(|l| {

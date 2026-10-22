@@ -856,6 +856,37 @@ pub fn set_exit(child: NonNull<Process>, c: NonNull<Channel>, label: u64, priori
     }
 }
 
+/// The channel `child` tells of its end, if it has an exit source: the
+/// channel process_create's x3 named, which the source holds.
+pub fn exit_channel(child: NonNull<Process>) -> Option<NonNull<Channel>> {
+    crate::obj::assert_held();
+    // SAFETY: the caller holds a reference to the child; only the field is
+    // read.
+    unsafe { (*child.as_ptr()).exit.as_ref() }.map(|e| e.channel())
+}
+
+/// The exit source of `child`, which process_create made and did not hand
+/// out, goes unused: its slot of the channel and its reference to the
+/// channel go back at `level`, and the child's end tells nobody. Nothing
+/// happens to a child that ended meanwhile (its caller's end ended it): its
+/// teardown posts the notification as it does for any child.
+///
+/// # Safety
+/// The caller holds a reference to `child`.
+pub unsafe fn unset_exit(child: NonNull<Process>, level: u8) {
+    crate::obj::assert_held();
+    if super::check_alive(child).is_err() {
+        return;
+    }
+    // SAFETY: the caller's promise; the child lives, so its stage is Whole
+    // and its exit slot stands in no queue.
+    unsafe {
+        if let Some(mut exit) = (*child.as_ptr()).exit.take() {
+            exit.detach(level);
+        }
+    }
+}
+
 /// The label of the exit notification of `process`, which receive reports
 /// with its slot.
 pub fn exit_label(process: NonNull<Process>) -> u64 {
