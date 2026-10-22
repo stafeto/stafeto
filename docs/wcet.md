@@ -150,7 +150,14 @@ call. For a call that works in portions (`mem_create`, `mem_map`,
 `mem_unmap`, `mem_protect`) the kernel polls for an interrupt between two
 portions, so the estimate is the path of one portion, and the measure is the
 longest of the rows that measure a portion (`memory portions`). The rows of
-the interrupt paths name the test rows that measure them.
+the interrupt paths name the test rows that measure them. The estimate of
+the path from the interrupt of a device to its driver covers `irq::deliver` and
+one turn that frees retired objects (`qsbr::reclaim`); it leaves out what
+`sched::exit_loop` does on that path (`decide`, the acknowledge, `thread::run`,
+the entry and exit of the exception), since the loop is priced at nothing. It is
+above the measure because the worst batch of `reclaim` costs far more than the
+batch of the test, so `ok` there means no more than that. A full model of the
+path is a task of its own.
 
 Next to the estimate the row prints `takes`, k_static: the most calls of
 `kernel::obj::acquire`, the one function the kernel takes `OBJ` through (kept
@@ -163,8 +170,10 @@ a handler that takes it itself sits in an arm that does not); a long call also
 has the count of `go_on`, where its next entry starts. A function that begins a
 stretch of its own, which a poll for an interrupt precedes at each call
 (`portions`, `make`, `process_create_second`), is left out of the count of its
-callers and has a row of its own. A count with a plus sign is a lower bound: a
-loop or a call on the path could not be resolved. A loop that takes `OBJ` and has
+callers and has a row of its own. A plus sign follows the count when the path as a whole is incomplete (a loop
+without a bound or a call through a register on it, whether or not it takes
+`OBJ`); when no such loop takes `OBJ` and no call is unresolved, the count is
+exact all the same, and a loop that takes it is refused apart from the sign. A loop that takes `OBJ` and has
 no bound is refused outright, since its count could be anything.
 
 The estimate is a bound on what the code can do with the loop bounds of the

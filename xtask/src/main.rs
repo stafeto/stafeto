@@ -11929,7 +11929,7 @@ mod tests {
     }
 
     /// A stretch of any section (a call, the cleanup, the code of a test) that
-    /// takes OBJ twice, or a section of the cleanup (kinds 41 to 54) that
+    /// takes OBJ twice, or a section of the cleanup (kinds 41 to 55) that
     /// holds it past CLEANUP_HOLD_MAX, fails and names the kind; the hold of
     /// a call is OBJ_HOLD_MAX's business.
     #[test]

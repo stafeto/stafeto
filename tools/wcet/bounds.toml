@@ -530,6 +530,13 @@ symbol = "kernel::timer::fire_at"
 measured = ["timer portions ticks: fire"]
 complete = "yes"
 
+# The estimate covers `irq::deliver` and one turn that frees retired objects
+# (`qsbr::reclaim`, worst batch of 8). It leaves out the rest of the path the
+# measure covers: `decide`, the acknowledge, `thread::run` and the entry and
+# exit of the exception, which sit in `sched::exit_loop` and so in the [[free]]
+# above. It is above the measure because the worst batch of `reclaim` costs far
+# more than the small one of the test, and "ok" says no more than that. A full
+# model of the path is a task of its own.
 [[path]]
 name = "interrupt of a device, to its driver"
 symbol = "kernel::irq::deliver"

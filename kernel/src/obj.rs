@@ -368,7 +368,10 @@ pub fn holds_by_kind() -> [u64; KINDS] {
 }
 
 /// How many times `OBJ` was taken since the start, modulo 2^16, in every
-/// test build: the tests count the sections of a portion with it.
+/// test build: the tests count the sections of a portion with it. The count
+/// of tickets is the lock's, common to all CPUs, so it is right only in the
+/// images that run on one CPU; in the image `smp 4 checks` xtask reads the
+/// kind of a stretch from the build that measures.
 #[cfg(feature = "ktest")]
 pub fn takes() -> u16 {
     OBJ.tickets()
