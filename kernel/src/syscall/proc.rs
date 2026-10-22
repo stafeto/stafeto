@@ -261,6 +261,7 @@ pub(super) fn process_exit(thread: NonNull<Thread>, a: &Args, section: Section) 
 /// anything), then the target's quota (NO_MEMORY). With x7 the thread's
 /// end through thread_exit posts bit 0 at x8 with the label of the handle
 /// (source Exit), unless that exit ended the process (thread::exit).
+#[inline(never)]
 pub(super) fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     // The policy in bits 0-15 and the CPU plus one in bits 16-23, 0 for the
@@ -317,6 +318,7 @@ pub(super) fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values,
 /// at the tail of its level; above the caller, it runs before the call
 /// returns. BAD_STATE for a thread that started before or whose process
 /// has ended.
+#[inline(never)]
 pub(super) fn thread_start(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     thread::start(t)?;
@@ -341,6 +343,7 @@ pub(super) fn thread_exit(thread: NonNull<Thread>, section: Section) -> ! {
 /// that ended. The thread moves by the rules of `pthread_setschedprio`; a
 /// thread raised above the caller runs before the call returns, and so
 /// does a thread the caller lowered itself below.
+#[inline(never)]
 pub(super) fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[1])?;
     let (policy, tail) = policy_tail_arg(a[2])?;
@@ -357,6 +360,7 @@ pub(super) fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<V
 /// such a wait, a thread that waits for the reply to an accepted request
 /// included, whose reply comes once (spec 6.1). Stopped, runnable, ended
 /// and long-call threads are unaffected.
+#[inline(never)]
 pub(super) fn thread_interrupt(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     // SAFETY: the caller's handle holds the target through interruption.

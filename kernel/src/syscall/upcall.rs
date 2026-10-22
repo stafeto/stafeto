@@ -51,6 +51,7 @@ fn thread_upcall_control_more(mut thread: NonNull<Thread>, a: &Args) -> Result<V
     let reply = locked_control(upcall, operation, a[1], a[2])?;
     Ok(Values::of_five(reply.words(), reply.len()))
 }
+#[inline(never)]
 pub(super) fn thread_upcall_request(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     // SAFETY: the caller's handle holds the target through the request.

@@ -23,6 +23,7 @@ use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceiling
 /// (LIMIT_REACHED), then the caller's quota pays for a page of its pool of
 /// channels when the pool grows and for a block of its table (NO_MEMORY).
 /// A channel whose handle did not go in goes again.
+#[inline(never)]
 pub(super) fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[0])?;
     under_ceilings(priority, &[caller_ceiling(thread)])?;
@@ -43,6 +44,7 @@ pub(super) fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values
 /// received, and the slot to the top receiver that waits or into the
 /// queue of slots. A receiver woken above the caller runs before the call
 /// returns. No memory is taken, and nothing waits.
+#[inline(never)]
 pub(super) fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let bits = bits_arg(a[1])?;
     let (c, s) = lookup(thread, a[0], Rights::NOTIFY, |o| {
@@ -70,6 +72,7 @@ pub(super) fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error>
 /// notification, a request, or PEER_CLOSED in x0 alone once the last
 /// handle with RECEIVE went. The call writes its own result: x0-x11 are
 /// its (channel::receive).
+#[inline(never)]
 pub(super) fn receive(thread: NonNull<Thread>, a: &Args) {
     let taken = wait_arg(a[1]).and_then(|wait| {
         let c = lookup(thread, a[0], Rights::RECEIVE, Object::channel)?;
@@ -161,6 +164,7 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args, section: Section) {
 /// LIMIT_REACHED and NO_MEMORY, when they go. Otherwise x0 is 0, and the
 /// client gets the reply, bytes 64 up to its length through the message
 /// buffers and the handles in its table (spec 6.2; channel::reply).
+#[inline(never)]
 pub(super) fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let desc = Desc::from_reply(a[1])?;
     let values = message_handles(thread, desc, None)?;

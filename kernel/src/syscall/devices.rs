@@ -28,6 +28,7 @@ use kcore::args::{line_arg, priority_arg, trigger_arg, under_ceilings};
 /// whose handle did not go in goes again. A window over a page of the
 /// console's port takes the port from the kernel while it lives (spec
 /// 3.2, memory::create_window).
+#[inline(never)]
 pub(super) fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let (base, pages) = kcore::window::round_out(a[1], a[2])?;
     lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
@@ -60,6 +61,7 @@ pub(super) fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<
 /// (LIMIT_REACHED, spec 6.5), a page of the caller's pool of bindings and
 /// a block of its table (NO_MEMORY). A binding whose handle did not go in
 /// goes again, and its line with it.
+#[inline(never)]
 pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let line = line_arg(a[1], arch::gic::lines())?;
     let priority = priority_arg(a[3])?;
@@ -87,6 +89,7 @@ pub(super) fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
 /// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens
 /// again (spec 9); an open line stays open, 0 all the same. PEER_CLOSED once
 /// the binding's channel closed, and the line stays masked.
+#[inline(never)]
 pub(super) fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
     irq::ack(b)?;

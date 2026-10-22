@@ -519,10 +519,10 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
             true
         }
         Backing::Contiguous { base, order, .. } => {
+            let _section = crate::obj::lock();
             // SAFETY: nothing maps the block any more and its TLB entries
             // went with its mappings; it is the object's. No cache
             // maintenance: the next holder zeroes it through the cache.
-            let _section = crate::obj::lock();
             unsafe { phys::free(Frame::from_raw(*base, *order), budget) };
             true
         }

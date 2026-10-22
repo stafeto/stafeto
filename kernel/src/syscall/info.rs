@@ -54,6 +54,7 @@ const SELF_RIGHTS: Rights = abi::OWNER_RIGHTS;
 /// LOG takes the system resource with KSTATS, takes up to abi::LOG_BATCH
 /// records of the kernel log into the start of the caller's message buffer
 /// and returns abi::LogBatch in x1-x3 (spec 16.3, crate::log::take).
+#[inline(never)]
 pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     match a[1] {
         abi::INFO_PROCESS_STATE => process_state(thread, a),
@@ -269,6 +270,7 @@ fn kernel_stats() -> KernelStats {
 /// kernel log as one record, and while the kernel has the console's port
 /// writes them there at once, interrupts masked (spec 3.2, 16.3); returns
 /// their count in x1.
+#[inline(never)]
 pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let len = inline_len_arg(a[1])?;
     lookup(thread, a[0], Rights::DEBUG, Object::resource)?;

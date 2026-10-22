@@ -15,6 +15,7 @@ use kcore::args::{notify_priority_arg, rights_arg, under_ceilings};
 /// handle_close(x0 handle), no right needed: the handle's reference goes,
 /// and the last reference queues the object for cleanup at the caller's
 /// priority. Closing a handle to a thread or a process does not end it.
+#[inline(never)]
 pub(super) fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     process::close_handle(caller(thread), Handle(a[0]), cause(thread))?;
     Ok(Values::none())
@@ -38,6 +39,7 @@ pub(super) fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
 /// table (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED, spec 6.5),
 /// a page of the caller's pool of sessions and a block of its table
 /// (NO_MEMORY). A session whose handle did not go in goes again.
+#[inline(never)]
 pub(super) fn handle_duplicate(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let rights = rights_arg(a[1])?;
     let label = a[2];
