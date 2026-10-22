@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The rendezvous of shared memory (POSIX `mmap` with MAP_SHARED, `shm_open`;
-//! Ф8): the objects that processes map as the same pages, by the key of the
+//! The rendezvous of shared memory (POSIX `mmap` with MAP_SHARED, `shm_open`): the objects that processes map as the same pages, by the key of the
 //! file they show. The first process to ask makes the object and says so
 //! (Reserve); the others who ask meanwhile wait (Busy) and then get a
 //! handle of it. An entry lives as long as a process uses it: a process

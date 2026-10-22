@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""Build the ready-made utilities that BusyBox lacks (Ф10b, Ф10c) from their own
+"""Build the ready-made utilities that BusyBox lacks from their own
 sources, unchanged, against relibc's headers: getconf, join and pathchk from
 sbase (MIT), file and iconv from toybox (0BSD), compress from ncompress
 (public domain), csplit, gencat, m4 and write from chimerautils (BSD), pr

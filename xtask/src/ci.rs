@@ -346,6 +346,9 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         super::disasm::check_counter_read_sites(&super::root())
     }));
     steps.push(step("host", "layer C names", &[], super::layer_c_names));
+    steps.push(step("host", "no Cyrillic", &[], || {
+        super::cyrillic::check(&super::root())
+    }));
     steps.push(step("host", "fmt", &[], || {
         super::run_cmd(super::cargo().args(["fmt", "--all", "--check"]))
     }));

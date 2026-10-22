@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Sockets of the pipe service (Ф9). A socket is a description of the
+//! Sockets of the pipe service. A socket is a description of the
 //! service of a third kind, numbered `SOCK_END | slot`; the layer names it
 //! like a pipe end (`Target::Pipe`), so read, write, close, dup, fork, exec,
 //! fcntl and poll take the paths of the pipes. The calls only a socket has

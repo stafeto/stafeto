@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Message queues, semaphores and shared memory segments (Ф11b;
+//! Message queues, semaphores and shared memory segments (
 //! proto_pipe::ipc): the calls of POSIX (`mq_*`, `sem_open`) and of XSI
 //! (`msg*`, `sem*`, `shm*`) reach the pipe service through one request,
 //! whose words relibc fills. This layer adds what only the process knows

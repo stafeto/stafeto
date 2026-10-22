@@ -825,7 +825,7 @@ pub fn os_test_with_fixtures(
     files
 }
 
-/// The files of an image of the Open POSIX Test Suite (Ф12): the tests of
+/// The files of an image of the Open POSIX Test Suite: the tests of
 /// `os_test` (`/tmp` is the RAM service's own), and a list that runs each in the directory
 /// of its own file with its time limit in milliseconds (`limits`, one for
 /// each test).

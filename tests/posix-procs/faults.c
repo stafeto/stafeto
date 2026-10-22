@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
-/* Faults as signals, and the alternate signal stack (Ф7, К3).
+/* Faults as signals, and the alternate signal stack.
  *
  * The role "faults" forks one child per case and reaps it: an exit code
  * names the failed check (0 passes), a signal is the expected end.

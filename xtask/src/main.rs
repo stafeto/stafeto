@@ -31,6 +31,7 @@ mod bash_dialog;
 mod ci;
 mod clock_probe;
 mod cpus_dialog;
+mod cyrillic;
 mod disasm;
 mod entropy;
 mod htop_dialog;
@@ -6173,7 +6174,7 @@ const XCU_UTILITIES: [&str; 112] = [
     "zcat",
 ];
 
-/// The commands of the utilities' dialog (Ф10) and the lines each must print
+/// The commands of the utilities' dialog and the lines each must print
 /// (a whole line; "=" before a text: the line trimmed is it; "~": the line
 /// contains it). A command is shorter than the 255 characters of a line of
 /// the terminal.
@@ -6277,7 +6278,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"tty; stty -a >/dev/null; echo stty:$?"#,
         &[r#"/dev/console"#, r#"stty:0"#],
     ),
-    // The ready-made utilities BusyBox lacks (Ф10b): sbase's getconf, join
+    // The ready-made utilities BusyBox lacks: sbase's getconf, join
     // and pathchk, toybox's file and iconv, ncompress's compress.
     (
         r#"getconf PATH; getconf PAGESIZE"#,
@@ -6303,7 +6304,7 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z"#,
         &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
     ),
-    // The second wave (Ф10c): chimerautils' csplit, gencat, m4 and write,
+    // The second wave: chimerautils' csplit, gencat, m4 and write,
     // nbase's pr, paxmirabilis' pax, util-linux's newgrp and ncurses' tput
     // and tabs.
     (
@@ -6521,7 +6522,7 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     // uptime) once it ended.
     dialog_command(
         run,
-        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 1.5; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
+        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 2; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
         &["cpu-grew", "idle-grew"],
     )
 }
@@ -6940,7 +6941,7 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
-        // The utilities of XCU (Ф10): each of the 112 answers `command -v`,
+        // The utilities of XCU: each of the 112 answers `command -v`,
         // 28 names a line.
         for names in XCU_UTILITIES.chunks(28) {
             let command = format!(
@@ -6953,11 +6954,11 @@ fn ash_dialog() -> Result<(), String> {
             run.expect_line(&expected, |line| line == expected, DIALOG_STEP)?;
             run.expect("# ", DIALOG_STEP)?;
         }
-        // What the utilities do (Ф10).
+        // What the utilities do.
         for (command, lines) in UTILITY_DIALOG {
             dialog_command(&mut run, command, lines)?;
         }
-        // ps (Ф10): the process service lists a background sleep with its
+        // ps: the process service lists a background sleep with its
         // parent, the shell, and no longer once it is gone.
         run.send("/bin/sleep 100 & echo pids:$$:$!")?;
         let pids = run.expect_line("pids", |line| line.starts_with("pids:"), DIALOG_STEP)?;
@@ -7029,7 +7030,7 @@ fn ash_dialog() -> Result<(), String> {
         let applets = (101 - XCU_MISSING.len()).to_string();
         run.expect_line("applets", |line| line == applets, DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
-        // Time and sockets (Ф9): sleep and timeout, and nc over the
+        // Time and sockets: sleep and timeout, and nc over the
         // loopback of the socket service, a server in the background and a
         // client that sends it a line.
         run.send("sleep 1; echo slept $?")?;
