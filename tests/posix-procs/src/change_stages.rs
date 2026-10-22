@@ -95,6 +95,12 @@ pub fn release(files: &Files, key: OpenKey) -> Result<(), Status> {
     status_only(&reply[..length])
 }
 
+/// The code of a statvfs run that failed, after its `Status` is printed.
+fn statvfs_failed(status: Status) -> i32 {
+    rt::println!("posix-files: change statvfs failed: {status:?}");
+    201
+}
+
 /// Start, Second, Step until done, Release.
 pub fn run(
     files: &Files,
@@ -112,7 +118,10 @@ pub fn run(
             break;
         }
     }
-    let done = done.ok_or(Status::BadSize)?;
+    let Some(done) = done else {
+        rt::println!("posix-files: change run: 100000 steps without a result");
+        return Err(Status::BadSize);
+    };
     // The outcome stays until Release, for a Query as for a repeated Step.
     let again = step(files, req.key, true)?.ok_or(Status::BadSize)?;
     if again.result != done.result || again.length != done.length || again.restarts != done.restarts
@@ -616,11 +625,11 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
         if attempt > 0 {
             expect(run(files, &rmdir(4, next(), b"/tmp/cs3"), None), 0, 204)?;
         }
-        let mut before = run(files, &stat, None).map_err(|_| 201)?;
+        let mut before = run(files, &stat, None).map_err(statvfs_failed)?;
         let mut still = 0;
         for _ in 0..400 {
             stat.key = key(4, next());
-            let again = run(files, &stat, None).map_err(|_| 201)?;
+            let again = run(files, &stat, None).map_err(statvfs_failed)?;
             still = if word(&again.bytes, 6) == word(&before.bytes, 6) {
                 still + 1
             } else {

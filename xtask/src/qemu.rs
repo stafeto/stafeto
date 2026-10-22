@@ -741,6 +741,20 @@ pub fn expect_line(o: &Outcome, line: &str) -> Result<(), String> {
     }
 }
 
+/// Some line must end with `tail`, which is itself whole: the line of one
+/// debug_write call (up to 64 bytes) comes unbroken, but it can follow the
+/// head of a longer line that another process is still writing in pieces.
+pub fn expect_line_end(o: &Outcome, tail_text: &str) -> Result<(), String> {
+    if o.lines.iter().any(|l| l.ends_with(tail_text)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "no line ends with {tail_text:?}; last lines: {:?}",
+            tail(&o.lines)
+        ))
+    }
+}
+
 /// Some line must contain `marker`.
 pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     if o.lines.iter().any(|l| l.contains(marker)) {
