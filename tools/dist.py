@@ -151,6 +151,12 @@ def stage_licenses(stage: Path, version: str, cache: Path) -> None:
         # carries them in UTILITIES-LICENSE.
         if not texts and description.get("license_file") != "":
             raise SystemExit(f"dist: no licence text found in the source of {name}")
+    # The notices in the headers of the files of the ready-made utilities
+    # (paxmirabilis has no licence file), as the image carries them.
+    ready = ROOT / "target" / "ready-utils" / "notices"
+    if ready.exists():
+        shutil.copy(ready, out / "ready-utils-NOTICES")
+    index.append("ready-utils-NOTICES: the notices in the headers of the compiled files of the ready-made utilities")
     (out / "INDEX.txt").write_text("\n".join(index) + "\n")
 
 

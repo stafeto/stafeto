@@ -8,7 +8,7 @@
 name = "paxmirabilis"
 version = "20240817"
 kind = "base"
-url = "https://deb.debian.org/debian/pool/main/p/pax/pax_20240817.orig.tar.gz"
+url = "https://snapshot.debian.org/archive/debian/20240818T022821Z/pool/main/p/pax/pax_20240817.orig.tar.gz"
 sha256 = "c3afddd5c3df07859f6e4cfc16bbe8046ed08b862feaa1dbc345353086af8f4c"
 license = "BSD-3-Clause AND MirOS AND ISC"
 license_file = ""
