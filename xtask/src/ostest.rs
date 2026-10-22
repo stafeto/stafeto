@@ -718,7 +718,12 @@ fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
         return Ok(lost);
     }
     let kernel = build(Variant::Normal)?;
-    let (log, _) = boot(&kernel, "os-test-again.img", rootfs::os_test(&files), TIMEOUT)?;
+    let (log, _) = boot(
+        &kernel,
+        "os-test-again.img",
+        rootfs::os_test(&files),
+        TIMEOUT,
+    )?;
     let mut still = Vec::new();
     for name in lost {
         let passed = match again.iter().find(|t| t.name == name) {
