@@ -1150,7 +1150,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 256;
+const INIT_TESTS: u32 = 257;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -3404,15 +3404,16 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
-        // The failed assert and the panic of relibc write their line in
-        // pieces, and the other runs write theirs between the pieces, so the
-        // line may come apart: each piece is looked for alone.
-        "Assertion `how == NULL",
-        "` failed.",
         "RELIBC PANIC: ",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
+    // A failed assert writes its message with one write (#432): the line
+    // comes whole, whatever the other runs write meanwhile.
+    qemu::expect_line(
+        &outcome,
+        "end_badly: hello.c:454: Assertion `how == NULL` failed.",
+    )?;
     println!("relibc C-program guest probe passed");
     Ok(())
 }
@@ -9605,6 +9606,7 @@ fn init_tests_in(
         for line in SMP_PROBE_LINES {
             qemu::expect_line(&o, line)?;
         }
+        whole_lines_of_every_cpu(&o.lines, cpus)?;
         let waited = qemu::number_after(&o.lines, "smp: suspend waited ");
         let late = qemu::number_after(
             &o.lines,
@@ -9734,6 +9736,41 @@ fn init_tests_in(
     }
     measure::record_as(m, &o.lines, if icount { measure::ICOUNT } else { "" });
     Ok(r.passed.len())
+}
+
+/// Lines each CPU writes in the test init's `smp_lines_of_every_cpu_come_whole`.
+const WHOLE_LINES: usize = 40;
+
+/// The test init's `smp_lines_of_every_cpu_come_whole` (#432, #436): each of
+/// the `cpus` CPUs wrote WHOLE_LINES lines of 64 bytes at the same time, and
+/// every one of them came whole, on a line of its own: `smp whole line C NN `
+/// and `x` up to 63 bytes. Bytes of two CPUs that mixed would leave fewer.
+fn whole_lines_of_every_cpu(lines: &[String], cpus: usize) -> Result<(), String> {
+    let whole = |l: &&String| {
+        let b = l.as_bytes();
+        l.len() == 63
+            && l.starts_with("smp whole line ")
+            && b[15].is_ascii_digit()
+            && b[16] == b' '
+            && b[17].is_ascii_digit()
+            && b[18].is_ascii_digit()
+            && b[19] == b' '
+            && b[20..].iter().all(|&c| c == b'x')
+    };
+    let found = lines.iter().filter(whole).count();
+    let want = cpus.min(4) * WHOLE_LINES;
+    if found != want {
+        let torn: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("smp whole line") && !whole(l))
+            .take(3)
+            .collect();
+        return Err(format!(
+            "{found} whole lines of the CPUs, {want} written; torn: {torn:?}"
+        ));
+    }
+    println!("smp: {found} lines of {} CPUs came whole", cpus.min(4));
+    Ok(())
 }
 
 /// Spec 3.2: the line the test init writes behind a window over the
@@ -12032,13 +12069,18 @@ mod workspace_root_tests {
 
     struct Fixture(PathBuf);
     impl Fixture {
+        /// A directory of its own: the tests of one process run at the same
+        /// time, and the clock of macOS can give two of them one stamp
+        /// (#345); the counter tells them apart.
         fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let directory = std::env::temp_dir().join(format!(
-                "stafeto-xtask-roots-{}-{stamp}",
+                "stafeto-xtask-roots-{}-{n}-{stamp}",
                 std::process::id()
             ));
             std::fs::create_dir(&directory).unwrap();
