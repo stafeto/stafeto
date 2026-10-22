@@ -208,6 +208,15 @@ pub(super) fn run() -> bool {
             },
             Ok(Waited::Got(_))
         ) {
+            // The stage once failed on a slow runner and never since (#379):
+            // what the worker had reached goes to the log for the next time.
+            rt::println!(
+                "borrow-guard-probe: no end of the worker in 10 s: mode {mode}, entries {}, errors {}, result {}, worker {:?}",
+                COUNT.load(Ordering::SeqCst),
+                ERRORS.load(Ordering::SeqCst),
+                RESULT.load(Ordering::SeqCst),
+                sys::thread_info(&native()).map(|info| info.state)
+            );
             return failed(369);
         }
         if unsafe { ffi::pthread_join(id, &mut result) } != 0
