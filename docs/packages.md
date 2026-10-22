@@ -24,8 +24,8 @@ Unknown keys are refused.
 | `build` | The build script, from the workspace root. |
 | `program` | The image program its build links, if it has one of its own. |
 | `dirs` | Directories only this package needs. |
-| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or `link:<name>`, a symbolic link to a file of its own directory (`/bin/cat = link:busybox`: `ls -l` shows `cat -> busybox`). Several paths may name one program (hard links), and the links to one name share one file of the image. A link must name a file of the image that is no link itself. |
-| `license_file` | Optional: the licence file in the source tree, for tools that read it. |
+| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or `link:<name>`, a symbolic link to a file of its own directory (`/bin/cat = link:busybox`: `ls -l` shows `cat -> busybox`). Several paths may name one program (hard links), and the links to one name share one file of the image. A link must name a file of the image that is no link itself. The list may be empty for a package whose code another package links (musl-fts gives pax its `fts`); some package must then depend on it. |
+| `license_file` | Optional: the licence file in the source tree, for tools that read it; empty where the files of the source state their terms in their headers (paxmirabilis). |
 
 Example (`packages/nano.toml`):
 
@@ -64,8 +64,9 @@ them for the licence notes of the image.
 - `cargo xtask packages table` builds the image and prints a table with the
   name, version, licence, kind, number of files and bytes of each package.
   A program that several paths name counts once, for the first package that
-  names it, so the packages linked into BusyBox (sbase, toybox, ncompress)
-  show 0 bytes (their names are links to `busybox`). `cargo xtask ash-dialog` prints the same table.
+  names it, so the packages linked into BusyBox (sbase, toybox, ncompress, chimerautils,
+  nbase, paxmirabilis, util-linux) show 0 bytes (their names are links to `busybox`;
+  so are the `tput` and `tabs` of ncurses). `cargo xtask ash-dialog` prints the same table.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 

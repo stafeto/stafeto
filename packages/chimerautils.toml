@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# chimerautils applets linked into the BusyBox program (tools/build-ready-utils.py).
+# The SHA-256 is that of the tar stream after decompression.
+# Format: docs/packages.md.
+
+name = "chimerautils"
+version = "15.1.2"
+kind = "base"
+url = "https://github.com/chimera-linux/chimerautils/archive/refs/tags/v15.1.2.tar.gz"
+sha256 = "a9b676f2a75861dbe377401f237796d59b2efeb82c691870f00a88cf33ff156d"
+license = "BSD-2-Clause AND BSD-3-Clause AND ISC"
+license_file = "LICENSE"
+depends = ["busybox"]
+build = "tools/build-busybox.py"
+files = [
+  "/bin/csplit = link:busybox",
+  "/bin/gencat = link:busybox",
+  "/bin/m4 = link:busybox",
+  "/bin/write = link:busybox",
+]

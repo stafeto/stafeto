@@ -51,10 +51,11 @@ of `cargo xtask ash-shell` is an interactive BusyBox `ash` with line editing
 and the terminfo entries of `xterm`, `xterm-256color`, `vt100` and `linux`.
 The terminal service keeps the window size: the host sends it on the first
 prompt and on every resize, `TIOCGWINSZ` and `TIOCSWINSZ` work as on Linux, and
-the foreground group gets `SIGWINCH`. The shell image carries 94 of the 112
+the foreground group gets `SIGWINCH`. The shell image carries 103 of the 112
 utilities of POSIX.1-2024 XCU (each answers `command -v`): the ten built-ins of
-`ash`, `sh`, 77 BusyBox applets and six ready-made programs (`getconf`, `join`,
-`pathchk`, `file`, `iconv`, `compress`). `ps`, `top` and `df` read `/proc`,
+`ash`, `sh`, 77 BusyBox applets and 15 ready-made programs (`getconf`, `join`,
+`pathchk`, `file`, `iconv`, `compress`, `csplit`, `gencat`, `m4`, `write`, `pr`,
+`pax`, `newgrp`, `tput`, `tabs`). `ps`, `top` and `df` read `/proc`,
 which the layer serves. [docs/packages.md](packages.md) describes how every
 third-party program of the image is a package built from one description
 file. BusyBox

@@ -3132,16 +3132,20 @@ fn ready_terms() -> Result<(Vec<u8>, String), String> {
          sources by tools/build-ready-utils.py (UTILITIES-LICENSE has their licences):\n",
     );
     for line in manifest.lines() {
-        let [name, url, sha256, spdx, file, applets] = line.split('\t').collect::<Vec<_>>()[..]
+        let [name, url, sha256, spdx, file, applets, digest] =
+            line.split('\t').collect::<Vec<_>>()[..]
         else {
             return Err(format!("ready-utils/manifest: bad line {line:?}"));
         };
-        let text = std::fs::read(work.join(file)).map_err(|e| format!("{file}: {e}"))?;
-        licence.extend(format!("==== {name} ({spdx}): {applets} ====\n\n").into_bytes());
-        licence.extend(text);
-        licence.extend(b"\n\n");
+        // A source without a licence file has its terms in the notices.
+        if file != "-" {
+            let text = std::fs::read(work.join(file)).map_err(|e| format!("{file}: {e}"))?;
+            licence.extend(format!("==== {name} ({spdx}): {applets} ====\n\n").into_bytes());
+            licence.extend(text);
+            licence.extend(b"\n\n");
+        }
         note.push_str(&format!(
-            "{applets}: {name}, {spdx}, {url} (SHA-256 of the unpacked tar stream {sha256})\n"
+            "{applets}: {name}, {spdx}, {url} (SHA-256 of {digest} {sha256})\n"
         ));
     }
     // The notices of the files of sbase's libutil that carry their own.
@@ -6033,28 +6037,21 @@ fn expect_ash_names(lines: &[String]) -> Result<(), String> {
     }
 }
 
-/// The 18 of those 112 that neither BusyBox, nor the ready-made utilities of
-/// tools/build-ready-utils.py, nor the shell has. Nothing of our own stands in
-/// for them (the report names ready implementations).
-const XCU_MISSING: [&str; 18] = [
+/// The 9 of those 112 that neither BusyBox, nor the ready-made utilities of
+/// tools/build-ready-utils.py, nor the shell has: they wait for services (at,
+/// batch and lp for the daemons of scheduling and printing, mailx for mail, the
+/// locale and message tools for locales). Nothing of our own stands in for
+/// them (the report names ready implementations).
+const XCU_MISSING: [&str; 9] = [
     "at",
     "batch",
-    "csplit",
-    "gencat",
     "gettext",
     "locale",
     "localedef",
     "lp",
-    "m4",
     "mailx",
     "msgfmt",
-    "newgrp",
     "ngettext",
-    "pax",
-    "pr",
-    "tabs",
-    "tput",
-    "write",
 ];
 
 /// The 112 utilities POSIX.1-2024 XCU requires (the pages whose SYNOPSIS
@@ -6305,6 +6302,42 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z"#,
         &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
     ),
+    // The second wave (Ф10c): chimerautils' csplit, gencat, m4 and write,
+    // nbase's pr, paxmirabilis' pax, util-linux's newgrp and ncurses' tput
+    // and tabs.
+    (
+        r#"echo 'hello X, eval(6*7)' | m4 -DX=world"#,
+        &[r#"hello world, 42"#],
+    ),
+    (
+        r#"mkdir -p /tmp/px /tmp/px2; echo packed > /tmp/px/a; (cd /tmp/px; pax -w a > /tmp/px.tar); (cd /tmp/px2; pax -r -f /tmp/px.tar; cat a); pax -f /tmp/px.tar"#,
+        &[r#"packed"#, r#"a"#],
+    ),
+    (
+        r#"printf 'a\nb\nc\nd\n' > /tmp/cs; csplit -f /tmp/cs. /tmp/cs 3; cat /tmp/cs.01"#,
+        &[r#"4"#, r#"4"#, r#"c"#, r#"d"#],
+    ),
+    (
+        r#"printf 'one\ntwo\n' > /tmp/pr1; pr -t -n /tmp/pr1"#,
+        &["=1\tone", "=2\ttwo"],
+    ),
+    (
+        r#"printf '$set 1\n1 Hello catalog\n' > /tmp/m.msg; gencat /tmp/m.cat /tmp/m.msg; echo gencat:$?; od -An -tx1 /tmp/m.cat | head -1"#,
+        &[
+            r#"gencat:0"#,
+            r#"=ff 88 ff 89 00 00 00 01 00 00 00 26 00 00 00 0c"#,
+        ],
+    ),
+    (r#"id -g; newgrp -c 'id -g' user"#, &[r#"0"#, r#"100"#]),
+    (
+        r#"echo hello-write | write user; echo write:$?"#,
+        &[r#"~Message from user@"#, r#"~hello-write"#, r#"write:0"#],
+    ),
+    (
+        r#"tput colors; COLUMNS=100 tput cols; TERM=vt100 tput cols"#,
+        &[r#"256"#, r#"100"#, r#"80"#],
+    ),
+    (r#"COLUMNS=40 tabs -8 | wc -c"#, &[r#"=55"#]),
     (
         r#"logname; /libexec/login-probe login"#,
         &[
@@ -6984,7 +7017,7 @@ fn ash_dialog() -> Result<(), String> {
         )?;
         // Behind the names are the applets: of the 112 names, ten are
         // builtins of the shell and `sh` is the shell's second name, and the
-        // other 101 are applets BusyBox lists, less the 24 it lacks.
+        // other 101 are applets BusyBox lists, less the ones it lacks.
         run.send("busybox --list >/tmp/applets; : >/tmp/want")?;
         run.expect("# ", DIALOG_STEP)?;
         for names in XCU_UTILITIES.chunks(28) {
