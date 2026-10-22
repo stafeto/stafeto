@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
-/* The program's mappings (Ф8): mmap, munmap and mprotect over the layer's
+/* The program's mappings: mmap, munmap and mprotect over the layer's
  * memory map, faults on pages that lost their access, and the limits of the
  * map. */
 

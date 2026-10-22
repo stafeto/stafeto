@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Message queues, semaphores and shared memory segments of the pipe
-//! service (Ф11b): the POSIX message queues (`mq_*`) and named semaphores
+//! service: the POSIX message queues (`mq_*`) and named semaphores
 //! (`sem_open`), and the XSI message queues, semaphore sets and shared
 //! memory segments (`msg*`, `sem*`, `shm*`). Three methods carry them all.
 //!

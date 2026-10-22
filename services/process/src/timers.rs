@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The timers of processes (Ф7): the alarm of a process (`alarm`,
+//! The timers of processes: the alarm of a process (`alarm`,
 //! ITIMER_REAL) and the timers of `timer_create`, in one table of the
 //! service. All deadlines lie on the scale of the kernel's `clock_now`
 //! (nanoseconds); the layer turns a calendar time into that scale when it

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Sockets (Ф9; proto_pipe::sock): AF_UNIX and the loopback of AF_INET,
+//! Sockets (proto_pipe::sock): AF_UNIX and the loopback of AF_INET,
 //! streams and datagrams. A socket is a description of the pipe service
 //! that a descriptor names as a pipe end does (`Target::Pipe`, the number
 //! with `SOCK_END`), so read, write, close, dup, fork, exec, fcntl and poll

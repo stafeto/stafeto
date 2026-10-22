@@ -2999,7 +2999,7 @@ impl Processes {
         }
     }
 
-    /// List (Ф10): the first live record of the window of `LIST_WINDOW`
+    /// List (`ps`): the first live record of the window of `LIST_WINDOW`
     /// records from the cursor, and the cursor after it (or after the
     /// window, with `0` for no record). O(LIST_WINDOW).
     fn list(&mut self, r: &mut Request<'_>, mut body: proto_wire::Reader<'_>) -> Answer {

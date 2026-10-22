@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! POSIX timers and the alarm over the process service (Ф7): the service
+//! POSIX timers and the alarm over the process service: the service
 //! keeps the timers of the process (`Method::Timer`) and sends their
 //! signals the way `kill` does; the layer turns the calendar into the
 //! scale of the kernel's timers. A `timer_t` is the service's id in its

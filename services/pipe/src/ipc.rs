@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The message queues, semaphores and shared memory segments of the
-//! service (Ф11b; proto_pipe::ipc). The POSIX message queues are named
+//! service (proto_pipe::ipc). The POSIX message queues are named
 //! (`/name`) and opened for a description of the third kind (an `Sock`
 //! slot of kind MQ_KIND, so that fork, exec, dup, close and the limits of
 //! sessions are a socket's); the XSI queues and semaphore sets are found

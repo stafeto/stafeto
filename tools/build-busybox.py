@@ -90,7 +90,7 @@ BASE_OBJECTS = (
     "ask_confirmation.o", "make_directory.o", "copy_file.o", "inode_hash.o",
     "concat_subpath_file.o", "isdirectory.o", "recursive_action.o", "xgetcwd.o",
     "remove_file.o",
-    # nc: connections over the loopback of the socket service (Ф9).
+    # nc: connections over the loopback of the socket service.
     "xconnect.o", "inet_common.o", "executable.o", "bb_do_delay.o",
 )
 
@@ -102,7 +102,7 @@ DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps"
 
 
 # The CONFIG names of the XCU utilities BusyBox has and the shell does not
-# hold (Ф10), those of our own applets, and the features their pages ask for.
+# hold, those of our own applets, and the features their pages ask for.
 OWN_CONFIGS = tuple(sorted(
     line.rsplit(" ", 1)[-1].strip()
     for source in (ROOT / "tools" / "busybox" / "stafeto").rglob("*.c")
@@ -307,7 +307,7 @@ def build(utilities: bool) -> None:
         replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     replace(config, "# CONFIG_WC is not set", "CONFIG_WC=y")
     replace(config, "# CONFIG_SLEEP is not set", "CONFIG_SLEEP=y")
-    # timeout, and nc with its server and its -e (Ф9: sockets).
+    # timeout, and nc with its server and its -e.
     for name in ("TIMEOUT", "NC", "NC_SERVER", "NC_EXTRA"):
         replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
     # The applets that take bytes or names from the random devices (5e').
@@ -341,7 +341,7 @@ def build(utilities: bool) -> None:
         for name in ("FEATURE_REVERSE_SEARCH", "FEATURE_TAB_COMPLETION",
                      "FEATURE_EDITING_FANCY_PROMPT", "FEATURE_EDITING_WINCH"):
             replace(config, f"# CONFIG_{name} is not set", f"CONFIG_{name}=y")
-    # The utilities of XCU that BusyBox has (Ф10), with the features their
+    # The utilities of XCU that BusyBox has, with the features their
     # pages ask for; ps is the BusyBox one, over the /proc of the layer.
     for name in names:
         text = config.read_text()

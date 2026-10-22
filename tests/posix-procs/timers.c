@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
-/* Timers, the alarm, sigqueue and clock (Ф7, services).
+/* Timers, the alarm, sigqueue and clock.
  *
  * The role "timers" forks one child per case and reaps it: an exit code
  * names the failed check (0 passes). The process service keeps the timers

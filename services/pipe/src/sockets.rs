@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The sockets of the service (Ф9): AF_UNIX and the loopback of AF_INET,
+//! The sockets of the service: AF_UNIX and the loopback of AF_INET,
 //! streams and datagrams. A socket is a description of the third kind
 //! (`SOCK_END | slot`) with a buffer of RING bytes for what it receives.
 //! Two connected streams point at each other (a slot and its generation);

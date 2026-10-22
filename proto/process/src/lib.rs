@@ -499,7 +499,7 @@ pub enum Method {
     /// grant of an image that exec replaced is refused). Body pid u32, key
     /// u64, write u32, image u32.
     ShareGrant = 61,
-    /// The list of processes (Ф10, `ps`): a body of the cursor u32, a
+    /// The list of processes (`ps`): a body of the cursor u32, a
     /// record index; the reply is the status u32, the cursor to ask next
     /// u32 (`LIST_END` for no more), and, when the window of at most
     /// `LIST_WINDOW` records from the cursor holds a live one, `1` u32 and

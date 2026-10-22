@@ -809,7 +809,7 @@ are in [notes/m5e-pipes.md](../notes/m5e-pipes.md).
 
 ### The socket calls of the pipe service
 
-The sockets (Ф9) live in the pipe service, so their steps run at its level
+The sockets live in the pipe service, so their steps run at its level
 and are bounded by B like the pipes'. `cargo xtask posix-sock-steps` boots
 the service with the feature `steps` under -icount and runs the probe
 `posix-sock`, whose last section (`longest_steps`) makes the calls at their
