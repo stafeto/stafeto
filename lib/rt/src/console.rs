@@ -5,7 +5,9 @@
 //! the system resource with DEBUG once (`set`); `write`, `write_fmt`,
 //! `print!` and `println!` then send what they get in pieces of at most
 //! abi::INLINE_MAX bytes, one call per piece. A line of up to 64 bytes,
-//! its newline included, is one call, so lines of threads do not mix.
+//! its newline included, is never split between calls, whatever text
+//! comes with it in one `write`, so lines of threads do not mix. A longer
+//! line goes in pieces of 64 bytes.
 
 use crate::handle::{Handle, Resource};
 use crate::sys;
@@ -39,18 +41,38 @@ fn resource() -> Result<ManuallyDrop<Handle<Resource>>, Error> {
     }
 }
 
-/// Writes `bytes` in pieces of at most abi::INLINE_MAX; stops at the
-/// first call that fails.
-pub fn write(bytes: &[u8]) -> Result<(), Error> {
+/// The length of the piece that starts `bytes` (not empty): the lines
+/// that fit whole in abi::INLINE_MAX bytes, or the first abi::INLINE_MAX
+/// bytes of a first line that is longer.
+fn piece_len(bytes: &[u8]) -> usize {
+    let mut len = 0;
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        if len + line.len() > INLINE_MAX {
+            break;
+        }
+        len += line.len();
+    }
+    if len == 0 {
+        INLINE_MAX.min(bytes.len())
+    } else {
+        len
+    }
+}
+
+/// Writes `bytes` in pieces of at most abi::INLINE_MAX that cut no line
+/// of up to abi::INLINE_MAX bytes; stops at the first call that fails.
+pub fn write(mut bytes: &[u8]) -> Result<(), Error> {
     let resource = resource()?;
-    for piece in bytes.chunks(INLINE_MAX) {
+    while !bytes.is_empty() {
+        let (piece, rest) = bytes.split_at(piece_len(bytes));
         sys::debug_write(&resource, piece)?;
+        bytes = rest;
     }
     Ok(())
 }
 
 /// Formats `args` into pieces of at most abi::INLINE_MAX bytes and writes
-/// each as it fills; stops writing at the first call that fails.
+/// each as it fills or as a line ends; stops writing at the first call that fails.
 pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {
     let mut pieces = Pieces {
         resource: resource()?,
@@ -94,6 +116,9 @@ impl fmt::Write for Pieces {
             }
             self.buf[self.len] = b;
             self.len += 1;
+            if b == b'\n' {
+                self.flush();
+            }
         }
         if self.error.is_some() {
             Err(fmt::Error)

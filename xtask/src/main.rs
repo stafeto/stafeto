@@ -3415,9 +3415,12 @@ fn relibc_hello_probe() -> Result<(), String> {
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
-    // A failed assert writes its message with one write (#432): the line
-    // comes whole, whatever the other runs write meanwhile.
-    qemu::expect_line(
+    // A failed assert writes its message with one write (#432), and the
+    // console layer sends a line of up to 64 bytes in one call (#445): the
+    // line comes whole, whatever the other runs write meanwhile. The head
+    // of a longer line of the panic run, which goes out in two calls, can
+    // stand in front of it.
+    qemu::expect_line_end(
         &outcome,
         "end_badly: hello.c:454: Assertion `how == NULL` failed.",
     )?;
