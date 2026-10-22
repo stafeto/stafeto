@@ -386,7 +386,8 @@ fn with_scratch(s: &Start, then: impl FnOnce(&Handle<Process>, *mut u64) -> u64)
 }
 
 /// Role::Grandparent: the grandchild runs Spin below the child, which then
-/// waits in a request to its parent until it is killed.
+/// waits in a request to its parent until it is killed. Mark SEEN is 1
+/// right before the child makes the grandchild.
 fn grandparent(s: &Start) -> Result<u64, Error> {
     let [own, image, exit, marks] = s.handles;
     let own = Handle::<Process>::borrowed(own);
@@ -411,6 +412,9 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
         policy: Policy::Fifo,
         cpu: 0,
     };
+    // The next call is process_create: the parent's tests that hold or end
+    // the child at that call look at this mark.
+    mark(SEEN).store(1, Relaxed);
     // SAFETY: only the loader uses WINDOW.
     let g = unsafe { loader::load(&own, &program, WINDOW, params) }.map_err(|(e, _)| e)?;
     sys::mem_map(&g.process, &marks, 0, PAGE, MARKS, Access::ReadWrite)?;

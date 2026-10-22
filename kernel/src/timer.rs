@@ -433,21 +433,7 @@ pub fn fire_at(level: u8, now: u64) {
         n += 1;
     }
     if n > 0 {
-        crate::obj::serving(crate::obj::CLEAN_FIRE);
-        // One section for the posts of the portion.
-        let _section = crate::obj::lock();
-        for t in batch.into_iter().flatten() {
-            // SAFETY: a timer off its heap is alive until its portion, which
-            // runs on this CPU after this one and needs a reference gone and
-            // no queue; a timer that is not dying holds its channel and has
-            // a reference left. `dying` changes under OBJ.
-            unsafe {
-                if (*t.as_ptr()).dying {
-                    continue;
-                }
-                let _ = Source::post(source(t), TIMER_BITS, level);
-            }
-        }
+        post_fired(&batch, level);
     }
     let more = {
         let mut g = local().timers.lock();
@@ -460,6 +446,26 @@ pub fn fire_at(level: u8, now: u64) {
         // SAFETY: the level's item is in no queue, by the contract of
         // this function.
         unsafe { cleanup::requeue(firing(level), Work::Timers, level) };
+    }
+}
+
+/// The posts of a portion of firings in one section: bit 0 into the slot of
+/// each timer of `batch` that is not dying, at `level`.
+#[inline(never)]
+fn post_fired(batch: &[Option<NonNull<Timer>>; FIRE_PORTION], level: u8) {
+    crate::obj::serving(crate::obj::CLEAN_FIRE);
+    let _section = crate::obj::lock();
+    for t in batch.iter().flatten() {
+        // SAFETY: a timer off its heap is alive until its portion, which
+        // runs on this CPU after this one and needs a reference gone and
+        // no queue; a timer that is not dying holds its channel and has
+        // a reference left. `dying` changes under OBJ.
+        unsafe {
+            if (*t.as_ptr()).dying {
+                continue;
+            }
+            let _ = Source::post(source(*t), TIMER_BITS, level);
+        }
     }
 }
 

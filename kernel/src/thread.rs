@@ -171,6 +171,10 @@ pub enum Long {
     /// mem_map, mem_unmap or mem_protect: the busy entry it changes
     /// (process::maps).
     Change(Change),
+    /// process_create between its two sections (spec 7.7): the child it
+    /// made, whose reference the call holds until the second section, with
+    /// the exit source and the start channel the call took for it.
+    Spawn(NonNull<Process>),
     /// process_control, a suspension: the wait for every CPU to have been in
     /// the kernel since the gate went up, for `epoch` (qsbr::begin_wait), until
     /// `limit` on the counter. The call starts over between the looks, so
@@ -184,6 +188,7 @@ impl Long {
         match self {
             Long::Create(_) => Call::MemCreate,
             Long::Change(on) => on.call(),
+            Long::Spawn(_) => Call::ProcessCreate,
             Long::Quiet { .. } => Call::ProcessControl,
         }
     }
@@ -831,8 +836,8 @@ pub fn end_long(t: NonNull<Thread>) -> Option<Long> {
 /// The long call of `t` stops for good (spec 7.7): what it held goes at
 /// `cause`, the object of a mem_create, or what a change of a mapping did
 /// so far stays in its entry and the rest of its prepaid tables goes back
-/// (process::abandon_change), and then its reference to the target process.
-/// O(1).
+/// (process::abandon_change), and then its reference to the target process,
+/// or the child of a process_create that did not hand it out. O(1).
 ///
 /// # Safety
 /// `t` is alive, and nothing uses what its call held afterwards.
@@ -849,6 +854,15 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
             unsafe {
                 process::abandon_change(on, cause);
                 process::release(on.target, cause);
+            }
+        }
+        Some(Long::Spawn(child)) => {
+            // SAFETY: the call held the reference to the child, which was
+            // made for it and not handed out: it hears of nothing and goes,
+            // at the thread's level.
+            unsafe {
+                process::unset_exit(child, cause);
+                process::release(child, cause);
             }
         }
         Some(Long::Quiet { .. }) => crate::qsbr::end_wait(),

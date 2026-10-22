@@ -229,6 +229,13 @@ pub struct PathEntry {
     pub symbol: String,
     /// `<what> ticks: <row>` of the lines a kernel test prints: the longest.
     pub measured: Vec<String>,
+    /// More functions the path runs after `symbol`, such as a turn of the
+    /// loop of the way out of the kernel (which the analysis prices at
+    /// nothing): their bounds add to the path's.
+    pub plus: Vec<String>,
+    /// `complete = "yes"`: every loop and call on the path has a bound or a
+    /// target, and `wcet bound` refuses the kernel when one has not.
+    pub complete: bool,
 }
 
 #[derive(Default)]
@@ -255,6 +262,10 @@ pub struct Annotations {
     pub atomic: Option<(u64, String)>,
     /// Copies and fills of a size that the call site does not set to a constant.
     pub copies: Vec<Copy>,
+    /// Functions that begin a stretch of their own: a poll for an interrupt
+    /// comes before every call of them. The count of takes of OBJ leaves them
+    /// out of their callers (a [[path]] of theirs counts them).
+    pub stretches: Vec<String>,
 }
 
 pub struct Copy {
@@ -332,10 +343,16 @@ impl Annotations {
                     why()?;
                     a.free.push(text_of(&t, "prefix", &what)?);
                 }
+                "stretch" => {
+                    why()?;
+                    a.stretches.push(text_of(&t, "function", &what)?);
+                }
                 "path" => a.paths.push(PathEntry {
                     name: text_of(&t, "name", &what)?,
                     symbol: text_of(&t, "symbol", &what)?,
                     measured: list_of(&t, "measured"),
+                    plus: list_of(&t, "plus"),
+                    complete: matches!(t.get("complete"), Some(Value::Text(s)) if s == "yes"),
                 }),
                 other => return Err(format!("unknown table [{other}]")),
             }
@@ -818,6 +835,9 @@ pub struct Issues {
     /// and no annotation gives: the loops of the copy count at their bounds.
     pub unsized_copies: BTreeSet<usize>,
     pub open_jumps: BTreeSet<(usize, u64)>,
+    /// Counting the takes of OBJ: loops with no bound whose blocks take it,
+    /// so that the count of a path through them is a lower bound.
+    pub take_loops: BTreeSet<(usize, u64)>,
 }
 
 struct Window {
@@ -842,6 +862,10 @@ pub struct Analyzer<'a> {
     /// Every loop on the paths analysed: its bound (1 for none), the header of
     /// the loop it is in, and its blocks.
     pub seen: BTreeMap<(usize, u64), Seen>,
+    /// The function whose calls the analysis counts in place of instructions
+    /// (`Analyzer::counting`): the bound of a function is the most calls of
+    /// it on a path.
+    takes: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -874,7 +898,19 @@ impl<'a> Analyzer<'a> {
             used: BTreeSet::new(),
             bodies: BTreeMap::new(),
             seen: BTreeMap::new(),
+            takes: None,
         }
+    }
+
+    /// An analysis that counts the calls of `target` on the longest path in
+    /// place of instructions: the takes of OBJ (`kernel::obj::acquire`, which
+    /// the kernel keeps out of line for this). A loop costs its bound times
+    /// the calls in one pass, as it costs instructions; the copies and fills
+    /// of the builtins call it nowhere.
+    pub fn counting(image: &'a Image, ann: &'a Annotations, target: usize) -> Analyzer<'a> {
+        let mut a = Analyzer::new(image, ann);
+        a.takes = Some(target);
+        a
     }
 
     /// Prices the functions in `zero` at nothing and cuts `function` to the
@@ -992,6 +1028,13 @@ impl<'a> Analyzer<'a> {
     }
 
     fn call_cost(&mut self, f: usize, site: &CallSite, complete: &mut bool) -> u64 {
+        if self.takes.is_some() {
+            match site {
+                CallSite::Copy(..) => return 0,
+                CallSite::Direct(g) if Some(*g) == self.takes => return 1,
+                _ => {}
+            }
+        }
         match site {
             CallSite::Copy(g, size) => {
                 if let Some(n) = size {
@@ -1048,7 +1091,8 @@ impl<'a> Analyzer<'a> {
         let mut cost = vec![0u64; cfg_len];
         let mut dead = vec![false; cfg_len];
         let mut tails = vec![0u64; cfg_len];
-        let window = self.window.as_ref().is_some_and(|w| w.function == f);
+        let counting = self.takes.is_some();
+        let window = !counting && self.window.as_ref().is_some_and(|w| w.function == f);
         let reads = if window {
             counter_reads(function)
         } else {
@@ -1065,7 +1109,11 @@ impl<'a> Analyzer<'a> {
                 let blk = &self.cfg(f).blocks[b];
                 (blk.len as u64, blk.exits.clone())
             };
-            let mut own = cut.as_ref().map_or(len, |c| c[b]);
+            let mut own = if counting {
+                0
+            } else {
+                cut.as_ref().map_or(len, |c| c[b])
+            };
             if cut.as_ref().is_none_or(|c| c[b] > 0 || len == 0) {
                 for site in &calls {
                     own += self.call_cost(f, site, &mut complete);
@@ -1075,6 +1123,7 @@ impl<'a> Analyzer<'a> {
             dead[b] = self.calls_noreturn(&calls);
             for e in exits {
                 match e {
+                    Exit::Tail(g) if self.takes == Some(g) => tails[b] = tails[b].max(1),
                     Exit::Tail(g) if !self.noreturn.contains(&g) => {
                         let w = self.wcet(g);
                         complete &= w.complete;
@@ -1185,7 +1234,14 @@ impl<'a> Analyzer<'a> {
         let succ: Vec<Vec<usize>> = (0..self.cfg(ctx.f).blocks.len())
             .map(|b| self.cfg(ctx.f).blocks[b].succ.clone())
             .collect();
+        // A block that calls a function that never returns has no way on: the
+        // blocks the compiler put after the call (the landing pads of a panic
+        // that join the code again) make no loop.
+        let dead = ctx.dead;
         let inside = |b: usize| -> Vec<usize> {
+            if dead[b] {
+                return Vec::new();
+            }
             succ[b]
                 .iter()
                 .copied()
@@ -1332,6 +1388,9 @@ impl<'a> Analyzer<'a> {
             return found.unwrap_or(1);
         }
         self.issues.loops.insert((ctx.f, key));
+        if self.takes.is_some() && set.iter().any(|&b| ctx.cost[b] > 0) {
+            self.issues.take_loops.insert((ctx.f, key));
+        }
         if several {
             self.issues.irreducible.insert((ctx.f, key));
         }
@@ -1423,6 +1482,14 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+        seen
+    }
+
+    /// As `reach`, without the functions priced at nothing (their bodies are
+    /// not on the paths of this analysis), `f` itself excepted.
+    pub fn reach_counted(&mut self, f: usize) -> BTreeSet<usize> {
+        let mut seen = self.reach(f);
+        seen.retain(|g| *g == f || !self.zero.contains(g));
         seen
     }
 
@@ -1547,6 +1614,25 @@ struct Row {
     measured: Option<u64>,
     /// Loops without a bound in the functions the entry can run.
     open: usize,
+    /// Those loops: the function and the address of the header.
+    open_loops: Vec<(usize, u64)>,
+    /// The most takes of OBJ on a path of the entry (k_static): the count of
+    /// the calls of `kernel::obj::acquire`, with the loops at their bounds.
+    takes: Option<Wcet>,
+    /// Loops with no bound that take OBJ on the counted paths of the entry.
+    hidden: Vec<(usize, u64)>,
+}
+
+impl Row {
+    /// k_static for the report: the count, with a plus when a loop or a call
+    /// the count could not resolve may hide more.
+    fn takes_text(&self) -> String {
+        match self.takes {
+            Some(k) if k.complete => k.insns.to_string(),
+            Some(k) => format!("{}+", k.insns),
+            None => "-".to_owned(),
+        }
+    }
 }
 
 impl Row {
@@ -1565,7 +1651,18 @@ struct Report {
     text: String,
     summary: String,
     below: Vec<String>,
+    /// The entries whose path takes OBJ more than once, or through a loop with
+    /// no bound: the refusals of `wcet bound`.
+    refused: Vec<String>,
 }
+
+/// The most takes of OBJ on any path of an entry that `wcet bound` accepts:
+/// every stretch between two polls for an interrupt takes it once
+/// (docs/smp.md).
+const TAKES_MAX: u64 = 1;
+
+/// The name of the function the kernel takes OBJ through.
+const ACQUIRE: &str = "kernel::obj::acquire";
 
 fn locate(image: &Image, f: usize, addr: u64) -> String {
     format!(
@@ -1632,6 +1729,34 @@ fn analyse(
     plain.free_functions([dispatch]);
     plain.find_noreturn(&reach);
     let restart_cost = plain.wcet(restart);
+    // The same paths, counting the takes of OBJ.
+    let acquire = named(ACQUIRE)?;
+    let stretches: BTreeSet<usize> = ann
+        .stretches
+        .iter()
+        .map(|n| named(n))
+        .collect::<Result<_, _>>()?;
+    let mut frame_takes = Analyzer::counting(image, ann, acquire);
+    frame_takes.free_functions(
+        handlers
+            .values()
+            .flatten()
+            .copied()
+            .chain([restart])
+            .chain(stretches.iter().copied()),
+    );
+    frame_takes.find_noreturn(&reach);
+    let frame_k = frame_takes.wcet(dispatch);
+    // The handlers of the calls: a stretch function is left out, a poll
+    // comes before each call of it.
+    let mut plain_takes = Analyzer::counting(image, ann, acquire);
+    plain_takes.free_functions([dispatch].into_iter().chain(stretches.iter().copied()));
+    plain_takes.find_noreturn(&reach);
+    let restart_k = plain_takes.wcet(restart);
+    // The entries that are no call, and the stretch functions themselves.
+    let mut path_takes = Analyzer::counting(image, ann, acquire);
+    path_takes.free_functions([dispatch]);
+    path_takes.find_noreturn(&reach);
     let maxima = call_maxima(lines);
     let mut calls: Vec<Row> = Vec::new();
     let mut reaches: Vec<BTreeSet<usize>> = Vec::new();
@@ -1648,8 +1773,40 @@ fn analyse(
             complete: true,
         };
         let mut costs: Vec<Wcet> = list.iter().map(|&h| plain.wcet(h)).collect();
+        let mut takes: Vec<Wcet> = list.iter().map(|&h| plain_takes.wcet(h)).collect();
         if entry.is_some_and(|c| c.long) {
             costs.push(restart_cost);
+            takes.push(restart_k);
+        }
+        // An arm of `dispatch` that takes OBJ hands its section to a handler
+        // that takes none, and a handler that takes it itself sits in an arm
+        // that does not: the larger of the two is the call's count.
+        let k = takes.iter().fold(frame_k, |k, t| Wcet {
+            insns: k.insns.max(t.insns),
+            complete: k.complete && t.complete,
+        });
+        let mut hidden: BTreeSet<(usize, u64)> = BTreeSet::new();
+        let counted = frame_takes.reach_counted(dispatch);
+        hidden.extend(
+            frame_takes
+                .issues
+                .take_loops
+                .iter()
+                .filter(|(f, _)| counted.contains(f)),
+        );
+        let mut starts: Vec<usize> = list.clone();
+        if entry.is_some_and(|c| c.long) {
+            starts.push(restart);
+        }
+        for h in starts {
+            let counted = plain_takes.reach_counted(h);
+            hidden.extend(
+                plain_takes
+                    .issues
+                    .take_loops
+                    .iter()
+                    .filter(|(f, _)| counted.contains(f)),
+            );
         }
         for c in costs {
             longest.insns = longest.insns.max(c.insns);
@@ -1673,6 +1830,9 @@ fn analyse(
                 }
             },
             open: 0,
+            open_loops: Vec::new(),
+            takes: Some(k),
+            hidden: hidden.into_iter().collect(),
         });
         let mut reached = frame.reach(dispatch);
         for &h in list {
@@ -1691,7 +1851,12 @@ fn analyse(
     }
     let mut paths: Vec<Row> = Vec::new();
     for p in &ann.paths {
-        let w = plain.wcet(named(&p.symbol)?);
+        let mut w = plain.wcet(named(&p.symbol)?);
+        for more in &p.plus {
+            let m = plain.wcet(named(more)?);
+            w.insns += m.insns;
+            w.complete &= m.complete;
+        }
         paths.push(Row {
             name: p.name.clone(),
             estimate: Some(Wcet {
@@ -1700,12 +1865,29 @@ fn analyse(
             }),
             measured: p.measured.iter().filter_map(|r| row_ticks(lines, r)).max(),
             open: 0,
+            open_loops: Vec::new(),
+            takes: Some(path_takes.wcet(named(&p.symbol)?)),
+            hidden: {
+                let counted = path_takes.reach_counted(named(&p.symbol)?);
+                path_takes
+                    .issues
+                    .take_loops
+                    .iter()
+                    .filter(|(f, _)| counted.contains(f))
+                    .copied()
+                    .collect()
+            },
         });
-        path_reaches.push(plain.reach(named(&p.symbol)?));
+        let mut reached = plain.reach(named(&p.symbol)?);
+        for more in &p.plus {
+            reached.extend(plain.reach(named(more)?));
+        }
+        path_reaches.push(reached);
     }
     let mut text = String::new();
     let mut summary = String::new();
     let mut below = Vec::new();
+    let mut refused = Vec::new();
     for (row, reached) in calls
         .iter_mut()
         .zip(&reaches)
@@ -1717,6 +1899,28 @@ fn analyse(
             .filter(|(f, _)| reached.contains(f))
             .collect();
         row.open = open.len();
+        row.open_loops = open.into_iter().collect();
+        // A loop with no bound that takes OBJ hides more takes than the count
+        // shows: it is refused as a take more than once.
+        for &(f, at) in &row.hidden {
+            let body = [&frame_takes, &plain_takes, &path_takes]
+                .iter()
+                .find_map(|a| a.bodies.get(&(f, at)));
+            refused.push(format!(
+                "{stem}: {} runs a loop that takes OBJ and has no bound in tools/wcet/bounds.toml: {}{}",
+                row.name,
+                locate(image, f, at),
+                loop_hint(image, f, body)
+            ));
+        }
+    }
+    for (p, row) in ann.paths.iter().zip(&paths) {
+        if p.complete && row.estimate.is_some_and(|e| !e.complete) {
+            refused.push(format!(
+                "{stem}: {} is incomplete: {} loops without a bound or calls through a register nothing resolves lie on the path (tools/wcet/bounds.toml)",
+                row.name, row.open
+            ));
+        }
     }
     let _ = writeln!(text, "kernel {stem}");
     let _ = writeln!(
@@ -1753,11 +1957,19 @@ fn analyse(
             let meas = r.measured.map_or("-".to_owned(), |m| m.to_string());
             let _ = writeln!(
                 text,
-                "{:<34} estimate {est:>8}  measure {meas:>8}  margin {margin:>8}  open loops {:>3}  {}",
+                "{:<34} estimate {est:>8}  measure {meas:>8}  margin {margin:>8}  open loops {:>3}  takes {:>3}  {}",
                 r.name,
                 r.open,
+                r.takes_text(),
                 r.status()
             );
+            if r.takes.is_some_and(|k| k.insns > TAKES_MAX) {
+                refused.push(format!(
+                    "{stem}: {} takes OBJ {} times on a path, {TAKES_MAX} allowed (k_static)",
+                    r.name,
+                    r.takes_text()
+                ));
+            }
             if r.status() == "BELOW THE MEASURE" {
                 below.push(format!(
                     "{stem}: {} estimate {est} is below the measure {meas}: the analysis misses a path or the trace is incomplete",
@@ -1767,11 +1979,22 @@ fn analyse(
             if r.measured.is_some() || title != "system calls" {
                 let _ = writeln!(
                     summary,
-                    "      {:<30} {est:>8} {meas:>8} {margin:>8}  {}",
+                    "      {:<30} {est:>8} {meas:>8} {margin:>8}  k {:>2}  {}",
                     r.name,
+                    r.takes_text(),
                     r.status()
                 );
             }
+        }
+    }
+    // The loops that keep an interrupt path or a portion from being complete.
+    for r in &paths {
+        if r.open_loops.is_empty() {
+            continue;
+        }
+        let _ = writeln!(text, "\nopen loops of {}:", r.name);
+        for &(f, at) in &r.open_loops {
+            let _ = writeln!(text, "  {}", locate(image, f, at));
         }
     }
     // How far the calibration can move before an estimate is below its measure.
@@ -1980,6 +2203,7 @@ fn analyse(
         text,
         summary,
         below,
+        refused,
     })
 }
 
@@ -2012,8 +2236,25 @@ fn loop_hint(image: &Image, f: usize, body: Option<&BTreeSet<usize>>) -> String 
             }
         }
     }
+    let blocks = if std::env::var_os("WCET_BLOCKS").is_some() {
+        let starts: Vec<String> = body
+            .iter()
+            .filter_map(|&b| cfg.blocks.get(b))
+            .map(|blk| {
+                let to: Vec<String> = blk
+                    .succ
+                    .iter()
+                    .map(|&t| format!("{:#x}", cfg.blocks[t].start - function.start))
+                    .collect();
+                format!("+{:#x}->[{}]", blk.start - function.start, to.join(","))
+            })
+            .collect();
+        format!(" blocks {}", starts.join(" "))
+    } else {
+        String::new()
+    };
     format!(
-        "  [{} blocks, {insns} insns; compares {:?}; calls {:?}]",
+        "  [{} blocks, {insns} insns; compares {:?}; calls {:?}]{blocks}",
         body.len(),
         constants,
         callees
@@ -2114,6 +2355,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     text += &report.text;
     summary += &report.summary;
     below.extend(report.below);
+    let refused = report.refused;
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let file = out.join("bound.txt");
     std::fs::write(&file, &text).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -2122,7 +2364,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
         println!("WARNING {b}");
     }
     println!("the full report: {}", file.display());
-    Ok(())
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "wcet bound refuses the kernel:\n  {}",
+            refused.join("\n  ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -2228,6 +2477,97 @@ why = \"a test\"
         // its loop is no loop of the analysis. The other way counts.
         assert_eq!(a.wcet(stops).insns, 2);
         assert!(a.issues.loops.is_empty());
+    }
+
+    #[test]
+    fn the_blocks_after_a_call_that_never_returns_make_no_loop() {
+        // A landing pad of a panic that joins the code again: `pad` calls
+        // `halt`, and the compiler put a jump back to the top after the call.
+        let listing = "\
+ffffffffc0000000 <pad>:
+ffffffffc0000000:      \tcbz\tx0, 0xffffffffc0000010 <pad+0x10>
+ffffffffc0000004:      \tbl\t0xffffffffc0000020 <halt>
+ffffffffc0000008:      \tnop
+ffffffffc000000c:      \tb\t0xffffffffc0000000 <pad>
+ffffffffc0000010:      \tret
+ffffffffc0000020 <halt>:
+ffffffffc0000020:      \twfe
+ffffffffc0000024:      \tb\t0xffffffffc0000020 <halt>
+";
+        let image = Image::parse(listing).unwrap();
+        let ann =
+            Annotations::parse("[dispatch]\nfunction = \"pad\"\nrestart = \"pad\"\n").unwrap();
+        let mut a = Analyzer::new(&image, &ann);
+        let all: BTreeSet<usize> = (0..image.functions.len()).collect();
+        a.find_noreturn(&all);
+        let pad = image.by_name("pad").unwrap();
+        let w = a.wcet(pad);
+        assert!(w.complete, "no loop to bound");
+        assert!(a.issues.loops.is_empty());
+        assert_eq!(w.insns, 2);
+    }
+
+    /// A listing of `acquire`, a function that takes it twice in a row, one
+    /// that takes it in a loop of eight passes, and one that takes it in a
+    /// loop nobody bounded.
+    const TAKES: &str = "\
+ffffffffc0000000 <acquire>:
+ffffffffc0000000:      \tret
+ffffffffc0000010 <twice>:
+ffffffffc0000010:      \tstp\tx29, x30, [sp, #-16]!
+ffffffffc0000014:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc0000018:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc000001c:      \tldp\tx29, x30, [sp], #16
+ffffffffc0000020:      \tret
+ffffffffc0000030 <looped>:
+ffffffffc0000030:      \tstp\tx29, x30, [sp, #-16]!
+ffffffffc0000034:      \tmov\tx19, #0x0
+ffffffffc0000038:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc000003c:      \tadd\tx19, x19, #0x1
+ffffffffc0000040:      \tcmp\tx19, #0x8
+ffffffffc0000044:      \tb.lo\t0xffffffffc0000038 <looped+0x8>
+ffffffffc0000048:      \tldp\tx29, x30, [sp], #16
+ffffffffc000004c:      \tret
+ffffffffc0000050 <unbounded>:
+ffffffffc0000050:      \tstp\tx29, x30, [sp, #-16]!
+ffffffffc0000054:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc0000058:      \tcbnz\tx0, 0xffffffffc0000054 <unbounded+0x4>
+ffffffffc000005c:      \tldp\tx29, x30, [sp], #16
+ffffffffc0000060:      \tret
+ffffffffc0000070 <once>:
+ffffffffc0000070:      \tstp\tx29, x30, [sp, #-16]!
+ffffffffc0000074:      \tcbz\tx0, 0xffffffffc0000080 <once+0x10>
+ffffffffc0000078:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc000007c:      \tb\t0xffffffffc0000084 <once+0x14>
+ffffffffc0000080:      \tbl\t0xffffffffc0000000 <acquire>
+ffffffffc0000084:      \tldp\tx29, x30, [sp], #16
+ffffffffc0000088:      \tret
+";
+
+    #[test]
+    fn the_takes_of_a_path_count_the_calls_of_acquire_with_the_loops_at_their_bounds() {
+        let image = Image::parse(TAKES).unwrap();
+        let ann = Annotations::parse(
+            "[dispatch]\nfunction = \"once\"\nrestart = \"once\"\n\
+             [[loop]]\nfunction = \"looped\"\nat = \"+0x8\"\nbound = 8\nwhy = \"a test\"\n",
+        )
+        .unwrap();
+        let acquire = image.by_name("acquire").unwrap();
+        let count = |name: &str| {
+            let mut a = Analyzer::counting(&image, &ann, acquire);
+            let f = image.by_name(name).unwrap();
+            (a.wcet(f), a.issues.take_loops.len())
+        };
+        // Two takes in a row are two; a branch with a take on either side is
+        // one; a loop of eight passes that takes once a pass is eight.
+        assert_eq!(count("twice").0.insns, 2);
+        assert_eq!(count("once").0.insns, 1);
+        let (looped, open) = count("looped");
+        assert_eq!((looped.insns, looped.complete, open), (8, true, 0));
+        // A loop with no bound that takes counts one pass, is named, and
+        // makes the count a lower bound.
+        let (unbounded, open) = count("unbounded");
+        assert_eq!((unbounded.insns, unbounded.complete, open), (1, false, 1));
     }
 
     #[test]

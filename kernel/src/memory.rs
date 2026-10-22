@@ -266,16 +266,20 @@ pub fn fill(m: NonNull<Memory>) -> bool {
 
 /// A whole object of `pages` pages that `payer` pays for, as `create` and
 /// every portion of `fill` in a row make it: the frames of all its pages
-/// are taken and zeroed before this returns, with interrupts masked, so
-/// only the kernel's loading of init at boot and the tests make one this
-/// way (spec 13.3). INVALID_ARGS for 0 pages or more than
+/// are taken and zeroed before this returns, with interrupts masked, each
+/// step in a section of its own (the caller holds none), so only the
+/// kernel's loading of init at boot and the tests make one this way (spec
+/// 13.3). INVALID_ARGS for 0 pages or more than
 /// kcore::pagelist::MAX_PAGES, NO_MEMORY as for `create`. The caller gets
 /// the only reference.
 pub fn create_whole(payer: NonNull<Process>, pages: usize) -> Result<NonNull<Memory>, Error> {
     if !(1..=pagelist::MAX_PAGES).contains(&pages) {
         return Err(Error::InvalidArgs);
     }
-    let m = create(payer, pages)?;
+    let m = {
+        let _section = crate::obj::lock();
+        create(payer, pages)?
+    };
     while !fill(m) {}
     Ok(m)
 }
@@ -463,6 +467,30 @@ pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
         Backing::Boot { base, .. }
         | Backing::Device { base, .. }
         | Backing::Contiguous { base, .. } => base + i as u64 * PAGE_SIZE,
+    }
+}
+
+/// The frames of pages `first` to `first + out.len() - 1` of `m`, a whole
+/// object that the caller holds, as `frame` gives each (spec 7.4); a leaf of
+/// the list is read once for the run.
+pub fn frames(m: NonNull<Memory>, first: usize, out: &mut [u64]) {
+    // SAFETY: the caller holds a reference to the object; only the field
+    // is read.
+    let backing = unsafe { &(*m.as_ptr()).backing };
+    match backing {
+        Backing::Owned(list) => {
+            // SAFETY: the list reads only its own nodes, which the linear
+            // map covers.
+            let mem = unsafe { LinearMem::new() };
+            list.frames(&mem, first, out);
+        }
+        Backing::Boot { base, .. }
+        | Backing::Device { base, .. }
+        | Backing::Contiguous { base, .. } => {
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot = base + (first + k) as u64 * PAGE_SIZE;
+            }
+        }
     }
 }
 

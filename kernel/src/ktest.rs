@@ -528,6 +528,22 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::another_call_gives_the_long_call_up,
     ),
     (
+        "drain_serves_a_full_batch_in_one_section",
+        calls::drain_serves_a_full_batch_in_one_section,
+    ),
+    (
+        "process_create_polls_between_its_portions",
+        calls::process_create_polls_between_its_portions,
+    ),
+    (
+        "another_call_gives_the_child_of_process_create_up",
+        calls::another_call_gives_the_child_of_process_create_up,
+    ),
+    (
+        "killed_caller_lets_the_child_of_process_create_go",
+        calls::killed_caller_lets_the_child_of_process_create_go,
+    ),
+    (
         "map_that_does_not_fit_maps_nothing",
         calls::map_that_does_not_fit_maps_nothing,
     ),

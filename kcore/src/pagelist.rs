@@ -175,6 +175,32 @@ impl PageList {
         self.find(mem, i)
     }
 
+    /// The frames of pages `first` to `first + out.len() - 1` into `out`, as
+    /// `frame` gives each: a leaf is read once for the pages it holds, so a
+    /// few neighbours cost the reads of the leaf and of their words.
+    pub fn frames(&self, mem: &impl PhysMem, first: usize, out: &mut [u64]) {
+        assert!(!self.going, "a page list is read after its release began");
+        assert!(
+            first + out.len() <= self.filled,
+            "a page the list does not hold"
+        );
+        let deep = depth(self.pages);
+        let mut leaf = (usize::MAX, 0);
+        for (k, slot) in out.iter_mut().enumerate() {
+            let i = first + k;
+            *slot = match deep {
+                0 => self.root,
+                1 => mem.read(self.root + 8 * i as u64),
+                _ => {
+                    if leaf.0 != i / ENTRIES {
+                        leaf = (i / ENTRIES, mem.read(self.root + 8 * (i / ENTRIES) as u64));
+                    }
+                    mem.read(leaf.1 + 8 * (i % ENTRIES) as u64)
+                }
+            };
+        }
+    }
+
     fn find(&self, mem: &impl PhysMem, i: usize) -> u64 {
         match depth(self.pages) {
             0 => self.root,
@@ -498,6 +524,26 @@ mod tests {
             assert_eq!(freed, m.allocated, "{pages}, {filled}: each frame once");
             assert!(list.release_step(&mut m));
             assert_eq!(m.freed.len(), taken, "a step after the end freed a frame");
+        }
+    }
+
+    /// `frames` gives what `frame` gives, for runs inside a leaf and across
+    /// the edge of one.
+    #[test]
+    fn a_run_of_frames_is_what_each_frame_says() {
+        for pages in [1, 2, 9, 511, 512, 513, 1030] {
+            let mut m = Mem::new();
+            let mut list = PageList::new(pages);
+            assert!(list.fill(&mut m, pages));
+            for first in [0, pages / 2, pages.saturating_sub(8), pages - 1] {
+                let n = 8.min(pages - first);
+                let mut run = [0; 8];
+                list.frames(&m, first, &mut run[..n]);
+                for (k, &pa) in run[..n].iter().enumerate() {
+                    assert_eq!(pa, list.frame(&m, first + k), "{pages} pages, {first}+{k}");
+                }
+            }
+            release(&mut list, &mut m);
         }
     }
 

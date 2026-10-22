@@ -71,17 +71,18 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, begin_protect, begin_unmap, check_buffers, device_windows, exec_frames,
-    finish_change, fund_mapping, has_table, in_mapping, make_table, map_whole, reserve_mapping,
-    step_change,
+    Change, Frames, abandon_change, begin_protect, begin_unmap, check_buffers, device_windows,
+    exec_frames, finish_change, frames_of, in_mapping, map_whole, reserve_mapping, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
 pub use table::{
     close_handle, handle_counts, handle_room, insert_handle, move_start, put_handles,
-    reserve_handles, reserve_start, take_handles,
+    reserve_handles, reserve_start, start_channel, take_handles,
 };
-pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
+pub use teardown::{
+    Stage, clean, exit_channel, exit_label, hasten, raise_replies, set_exit, unset_exit,
+};
 use teardown::{begin, queue_shell};
 
 #[cfg(feature = "icount")]

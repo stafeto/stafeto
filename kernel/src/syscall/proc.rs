@@ -3,12 +3,15 @@
 
 //! The calls of processes and threads (spec 4, 8, 11).
 
-use super::{Args, Values, caller, caller_ceiling, cause, lookup, record_call};
+use super::{
+    Args, Values, caller, caller_ceiling, cause, lookup, objects, record_call, restart, set_result,
+};
+use crate::arch::timer as clock;
 use crate::obj::Section;
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::thread::{self, Thread};
-use crate::{channel, sched, session};
+use crate::thread::{self, Long, Thread};
+use crate::{arch, channel, cleanup, sched, session};
 use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::args::{
@@ -48,29 +51,61 @@ use kcore::args::{
 /// and torn down for it; a child that fails later goes again, hears of
 /// nothing and leaves x5 with the caller. The quota comes back to the
 /// caller in full once the child and whatever holds its shell went; the
-/// page of shells stays the caller's.
-pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    // Two sections, so that neither is longer than OBJ_HOLD_MAX: the child
-    // is known to nothing yet but this call when the first ends.
-    let (child, exit, start, notify) = {
-        let _section = crate::obj::lock();
-        make_child(thread, a)?
-    };
-    let _section = crate::obj::lock();
-    link_child(thread, child, exit, start, notify)
+/// page of shells stays the caller's. The call has two sections, and a
+/// thread of the caller may close x3 or x5, or end the process, between
+/// them: the second looks again, and the call fails with BAD_HANDLE for a
+/// handle that went and BAD_STATE for a caller that ended, as a late
+/// LIMIT_REACHED or NO_MEMORY of the caller's table does, the child going
+/// again.
+pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) {
+    let entry = clock::now();
+    // A long call of two portions, so that no stretch between two polls for
+    // an interrupt takes OBJ twice: the first section has the checks, the
+    // resources and the child, which is known to nothing but this call when
+    // it ends, and the poll follows. The child holds what the call took of
+    // x3 and x5 (the channel of its exit notification and its entry 0); the
+    // second portion looks at the caller's arguments again.
+    match objects(|| make_child(thread, a)) {
+        Ok(child) => {
+            thread::begin_long(thread, Long::Spawn(child));
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::spawn_gap(thread, child);
+            cleanup::count_portion(entry);
+            sched::entry_polled();
+            if arch::irq_pending() {
+                return restart(thread);
+            }
+            sched::entry_started();
+            process_create_second(thread, child, clock::now())
+        }
+        Err(e) => set_result(thread, Err(e)),
+    }
 }
 
-/// The channel of x3 of process_create with its label, and the channel of
-/// x5 with the object and rights it moves.
-type Exit = Option<(NonNull<channel::Channel>, u64)>;
-type Start = Option<(Handle, Object, Rights)>;
+/// The second portion of process_create for `child` (`Long::Spawn`), from
+/// `entry`, the counter when the kernel took this entry: in one section,
+/// `link_child`, and the result.
+#[inline(never)]
+pub(super) fn process_create_second(thread: NonNull<Thread>, child: NonNull<Process>, entry: u64) {
+    // SAFETY: the registers are the thread's own, and still hold the
+    // arguments of the call: it started over at its `svc` as it was.
+    let regs = &unsafe { thread.as_ref() }.regs.x;
+    let a: Args = [
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8], regs[9],
+    ];
+    let _section = crate::obj::lock();
+    thread::end_long(thread);
+    set_result(thread, link_child(thread, child, &a));
+    cleanup::count_portion(entry);
+}
 
 /// The first section of process_create: the checks, the resources the
-/// caller pays for, and the child itself.
-fn make_child(
-    thread: NonNull<Thread>,
-    a: &Args,
-) -> Result<(NonNull<Process>, Exit, Start, u8), Error> {
+/// caller pays for, the child itself, its start channel and its exit
+/// notification. The channels of x3 and x5 are the child's own references
+/// from here on (the source of the exit slot and entry 0 of the table), so
+/// whatever the caller's other threads do with the handles meanwhile, the
+/// objects stay.
+fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
@@ -88,7 +123,7 @@ fn make_child(
             let table = unsafe { caller(thread).as_ref() };
             let (object, rights) = table
                 .lookup_with_rights(Handle(h), Rights::TRANSFER, |o| o.channel().map(|_| *o))?;
-            Some((Handle(h), object, rights))
+            Some((object, rights))
         }
     };
     let own = caller_ceiling(thread);
@@ -105,59 +140,90 @@ fn make_child(
     if let Some((c, _)) = exit {
         channel::reserve_source(c)?;
     }
-    match process::create_child(caller(thread), quota, limit, ceiling) {
-        Ok(child) => Ok((child, exit, start, notify)),
+    let child = match process::create_child(caller(thread), quota, limit, ceiling) {
+        Ok(child) => child,
         Err(e) => {
             if let Some((c, _)) = exit {
                 channel::remove_source(c);
+            }
+            return Err(e);
+        }
+    };
+    match start {
+        Some((object, rights)) => process::move_start(child, object, rights),
+        None => process::reserve_start(child),
+    }
+    .inspect_err(|_| {
+        if let Some((c, _)) = exit {
+            channel::remove_source(c);
+        }
+        // SAFETY: the reference `create` handed out goes, and nothing else
+        // holds the child, which goes again.
+        unsafe { process::release(child, cause(thread)) }
+    })?;
+    if let Some((c, label)) = exit {
+        process::set_exit(child, c, label, notify);
+    }
+    Ok(child)
+}
+
+/// The second section of process_create: the caller lives, x3 and x5 still
+/// name the channels the child took, and the caller's handle to the child
+/// goes in; then the start channel's handle goes. A call that fails here
+/// lets the child go again, hears of nothing, and leaves x5 with the
+/// caller: BAD_STATE for a caller that ended meanwhile, BAD_HANDLE for an x3
+/// or x5 that another thread closed, LIMIT_REACHED or NO_MEMORY when the
+/// threads of the caller took the room of its table.
+fn link_child(thread: NonNull<Thread>, child: NonNull<Process>, a: &Args) -> Result<Values, Error> {
+    let made = look_again(thread, child, a).and_then(|()| {
+        process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
+    });
+    match made {
+        Ok(h) => {
+            if a[5] != 0 {
+                // The child holds the channel now; the caller's handle goes.
+                let closed = process::close_handle(caller(thread), Handle(a[5]), cause(thread));
+                assert!(closed.is_ok(), "the start channel's handle went on the way");
+            }
+            // SAFETY: the reference `create` handed out goes; the handle
+            // holds the child.
+            unsafe { process::release(child, cause(thread)) };
+            Ok(Values::new(&[h.0]))
+        }
+        Err(e) => {
+            // SAFETY: the reference `create` handed out goes, and nothing
+            // else holds the child, which goes again.
+            unsafe {
+                process::unset_exit(child, cause(thread));
+                process::release(child, cause(thread));
             }
             Err(e)
         }
     }
 }
 
-/// The second section of process_create: the start channel and the
-/// caller's handle to the child. A child that fails on the way goes again,
-/// and the caller keeps its handles.
-fn link_child(
-    thread: NonNull<Thread>,
-    child: NonNull<Process>,
-    exit: Exit,
-    start: Start,
-    notify: u8,
-) -> Result<Values, Error> {
-    let made = match start {
-        Some((_, object, rights)) => process::move_start(child, object, rights),
-        None => process::reserve_start(child),
+/// The looks of `link_child`: the caller lives, and its x3 and x5 name
+/// the channels that the child holds. A handle that went, or a name for
+/// another object, is BAD_HANDLE.
+fn look_again(thread: NonNull<Thread>, child: NonNull<Process>, a: &Args) -> Result<(), Error> {
+    process::check_alive(caller(thread))?;
+    // The probe kernel of `break-spawn-check` looks no further.
+    if cfg!(feature = "break-spawn-check") {
+        return Ok(());
     }
-    .and_then(|()| process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS))
-    .map(|h| (child, h))
-    .inspect_err(|_| {
-        // SAFETY: the reference `create` handed out goes, and nothing else
-        // holds the child, which goes again.
-        unsafe { process::release(child, cause(thread)) }
-    });
-    match made {
-        Ok((child, _)) => {
-            if let Some((c, label)) = exit {
-                process::set_exit(child, c, label, notify);
-            }
-            if let Some((moved, _, _)) = start {
-                // The child holds the channel now; the caller's handle goes.
-                let closed = process::close_handle(caller(thread), moved, cause(thread));
-                assert!(closed.is_ok(), "the start channel's handle went on the way");
-            }
-            // SAFETY: the reference `create` handed out goes; the handle
-            // holds the child.
-            unsafe { process::release(child, cause(thread)) };
-        }
-        Err(_) => {
-            if let Some((c, _)) = exit {
-                channel::remove_source(c);
-            }
+    if a[3] != 0 {
+        let c = lookup(thread, a[3], Rights::NOTIFY, Object::channel)?;
+        if process::exit_channel(child) != Some(c) {
+            return Err(Error::BadHandle);
         }
     }
-    Ok(Values::new(&[made?.1.0]))
+    if a[5] != 0 {
+        let c = lookup(thread, a[5], Rights::TRANSFER, Object::channel)?;
+        if process::start_channel(child) != Some(c) {
+            return Err(Error::BadHandle);
+        }
+    }
+    Ok(())
 }
 
 /// process_control(x0 process with MANAGE, x1 action, x2 level), spec 7.7.

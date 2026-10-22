@@ -71,7 +71,7 @@ pub struct Change {
 impl Change {
     /// Whether the pages get execute access (a device window excepted,
     /// which `exec_frames` finds out).
-    pub fn executable(&self) -> bool {
+    pub fn is_executable(&self) -> bool {
         matches!(
             self.op,
             Op::Map {
@@ -159,17 +159,9 @@ pub fn check_buffers(process: NonNull<Process>, va: u64, pages: u64) -> Result<(
     Ok(())
 }
 
-/// Whether `process` has its table of mappings: no mapping stands anywhere
-/// until it has.
-pub fn has_table(process: NonNull<Process>) -> bool {
-    // SAFETY: the caller holds a reference to the process; only the field
-    // is read.
-    unsafe { table(process) }.is_some()
-}
-
 /// The table of mappings of `target`, made when it has none: NO_MEMORY when
 /// its quota falls short for the page, which is the table's afterwards.
-pub fn make_table(target: NonNull<Process>) -> Result<(), Error> {
+fn make_table(target: NonNull<Process>) -> Result<(), Error> {
     crate::obj::assert_held();
     let p = target.as_ptr();
     // SAFETY: the caller's promise; only these fields are borrowed.
@@ -230,12 +222,11 @@ pub fn reserve_mapping(
 }
 
 /// The tables the range of the reserved entry `on` may take are charged to
-/// the quota of its process (spec 7.5): NO_MEMORY when it falls short, and
-/// BAD_STATE when the process ended since `reserve_mapping`. On an error the
-/// caller gives the change up (`abandon_change`).
-pub fn fund_mapping(on: &mut Change) -> Result<(), Error> {
+/// the quota of its process (spec 7.5): NO_MEMORY when it falls short. The
+/// process lives: the section looked at it (`step_change`, `add_mapping`).
+/// On an error the caller gives the change up (`abandon_change`).
+fn fund_mapping(on: &mut Change) -> Result<(), Error> {
     crate::obj::assert_held();
-    check_alive(on.target)?;
     // SAFETY: the process lives, and the entry is the call's.
     let m = unsafe { entry(on) };
     let prepaid = kcore::paging::tables_bound(m.start, m.pages.into()) * PAGE_SIZE;
@@ -328,32 +319,39 @@ fn cut(target: NonNull<Process>, va: u64, pages: u64, op: Op) -> Result<Change, 
 /// made coherent first ([G18], `exec_frames`, before the section of this
 /// portion); the TLB entries of pages unmapped or changed go before the
 /// portion ends ([G13]). True once every page of the entry is done.
-pub fn step_change(
-    on: &mut Change,
-    ready: Option<&[u64; PORTION as usize]>,
-) -> Result<bool, Error> {
+pub fn step_change(on: &mut Change, ready: Option<&[u64]>) -> Result<bool, Error> {
     crate::obj::assert_held();
     // A kill on another CPU may have begun the end of the process since the
-    // section of `exec_frames`, whose tables the portion leaves alone (obj.rs,
-    // rule 3).
+    // section that read the frames of this portion, whose tables the portion
+    // leaves alone (obj.rs, rule 3).
     #[cfg(not(feature = "break-alive-check"))]
     check_alive(on.target)?;
     #[cfg(feature = "break-alive-check")]
-    if !on.executable() {
+    if !on.is_executable() {
         check_alive(on.target)?;
+    }
+    // The tables the range may take are paid for by the first portion of a
+    // mem_map, after the poll that follows its checks.
+    if matches!(on.op, Op::Map { prepaid: 0, .. }) {
+        fund_mapping(on)?;
     }
     // SAFETY: the process lives, and the entry is the call's.
     let (m, space) = unsafe { (entry(on), space(on.target)) };
     let (n, exec) = portion_size(on, &m);
     let mut found = [0; PORTION as usize];
     let frames = match ready {
-        Some(ready) => ready,
+        Some(ready) => {
+            assert!(
+                ready.len() == n as usize,
+                "the frames are not this portion's"
+            );
+            ready
+        }
         None => {
             fill_frames(on, &m, &mut found[..n as usize]);
-            &found
+            &found[..n as usize]
         }
     };
-    let frames = &frames[..n as usize];
     let va = page_address(&m, on.done);
     // The caller made the instruction cache coherent for these frames
     // (`exec_frames`), since the pages become executable.
@@ -394,30 +392,42 @@ fn portion_size(on: &Change, m: &Mapping<NonNull<Memory>>) -> (u32, bool) {
 /// and the executable pages of mem_protect; nothing for the rest.
 fn fill_frames(on: &Change, m: &Mapping<NonNull<Memory>>, frames: &mut [u64]) {
     if matches!(on.op, Op::Map { .. }) || portion_size(on, m).1 {
-        for (i, f) in frames.iter_mut().enumerate() {
-            *f = memory::frame(m.object, (m.offset + on.done) as usize + i);
-        }
+        memory::frames(m.object, (m.offset + on.done) as usize, frames);
     }
+}
+
+/// The frames of a portion that becomes executable: their number, and the
+/// frames in the first words.
+pub type Frames = (usize, [u64; EXEC_PORTION as usize]);
+
+/// The frames of `ready` for `step_change`.
+pub fn frames_of(ready: &Option<Frames>) -> Option<&[u64]> {
+    ready.as_ref().map(|(n, frames)| &frames[..*n])
 }
 
 /// The frames of the next portion of `on` when its pages become executable,
 /// for the caller to make the instruction cache coherent with them: their
-/// number, 0 when the portion is not executable, and the frames.
-/// BAD_STATE when the process ended. The frames are the object's and no
-/// table maps them yet: cache maintenance on them is no change of a link,
-/// and goes outside any section (obj.rs, rule 3). The portion that maps
-/// them takes a section of its own and looks at the process again.
-pub fn exec_frames(on: &Change) -> Result<(usize, [u64; PORTION as usize]), Error> {
+/// number and the frames, or None when the portion is not executable.
+/// Called in the section that checked the life of the process (`reserve_mapping`,
+/// `cut` or `step_change` of the portion before), so the entry is there. The
+/// frames are the object's and no table maps them yet: cache maintenance on
+/// them is no change of a link, and goes outside any section (obj.rs, rule
+/// 3). The portion that maps them takes a section of its own and looks at
+/// the process again.
+pub fn exec_frames(on: &Change) -> Option<Frames> {
     crate::obj::assert_held();
-    check_alive(on.target)?;
+    if !on.is_executable() {
+        return None;
+    }
     // SAFETY: the process lives, and the entry is the call's.
     let m = unsafe { entry(on) };
     let (n, exec) = portion_size(on, &m);
-    let mut frames = [0; PORTION as usize];
-    if exec {
-        fill_frames(on, &m, &mut frames[..n as usize]);
+    if !exec {
+        return None;
     }
-    Ok((if exec { n as usize } else { 0 }, frames))
+    let mut frames = [0; EXEC_PORTION as usize];
+    fill_frames(on, &m, &mut frames[..n as usize]);
+    Some((n as usize, frames))
 }
 
 /// The end of `on` after its last portion (spec 7.4, 7.7): the entry of
@@ -453,10 +463,10 @@ pub unsafe fn finish_change(on: Change, cause: u8) {
 /// range checked against the mappings and the message buffers of the
 /// process (`check_free`), then its resources, its entry with a reference
 /// to the object and the rights of `access` alone, and every portion in a
-/// row, with interrupts masked, so that nothing ends the process
-/// meanwhile: only the kernel's loading of init at boot and the tests map
-/// this way. Executable pages have the instruction cache made coherent
-/// first. INVALID_ARGS, LIMIT_REACHED and NO_MEMORY as for mem_map, and
+/// row, each in a section of its own (the caller holds none): only the
+/// kernel's loading of init at boot and the tests map this way, with
+/// nothing to end the process meanwhile. Executable pages have the
+/// instruction cache made coherent first. INVALID_ARGS, LIMIT_REACHED and NO_MEMORY as for mem_map, and
 /// nothing is mapped then.
 pub fn map_whole(
     target: NonNull<Process>,
@@ -464,25 +474,30 @@ pub fn map_whole(
     va: usize,
     access: Access,
 ) -> Result<(), Error> {
-    crate::obj::assert_held();
     let pages = memory::pages(m) as u32;
-    check_free(target, va as u64, pages.into())?;
-    let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
-    let mut on = add_mapping(target, mapping, access)?;
+    let (mut on, mut ready) = {
+        let _section = crate::obj::lock();
+        check_free(target, va as u64, pages.into())?;
+        let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
+        let on = add_mapping(target, mapping, access)?;
+        (on, exec_frames(&on))
+    };
     loop {
-        let (n, frames) = exec_frames(&on).expect("a process that lives takes every portion");
-        if n > 0 {
-            cache::sync_icache_frames(&frames[..n]);
+        if let Some((n, frames)) = &ready {
+            cache::sync_icache_frames(&frames[..*n]);
         }
-        let ready = (n > 0).then_some(&frames);
-        if step_change(&mut on, ready).expect("a process that lives takes every portion") {
-            break;
+        let _section = crate::obj::lock();
+        let done = step_change(&mut on, frames_of(&ready))
+            .expect("a process that lives takes every portion");
+        if done {
+            // SAFETY: the change ended with its last portion, the process
+            // lives, and a mem_map releases nothing at the end, whatever
+            // the level.
+            unsafe { finish_change(on, 1) };
+            return Ok(());
         }
+        ready = exec_frames(&on);
     }
-    // SAFETY: the change ended with its last portion, the process lives,
-    // and a mem_map releases nothing at the end, whatever the level.
-    unsafe { finish_change(on, 1) };
-    Ok(())
 }
 
 /// `on` stops for good midway (spec 7.7): its thread ended with its

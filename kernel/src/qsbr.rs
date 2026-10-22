@@ -167,6 +167,7 @@ pub fn reclaim() -> bool {
         return false;
     }
     PENDING.fetch_sub(n as u32, Relaxed);
+    crate::obj::serving(crate::obj::ENTRY_RECLAIM);
     let _section = crate::obj::lock();
     for freed in batch.into_iter().flatten() {
         // SAFETY: the period passed, so no CPU reads the object any more;

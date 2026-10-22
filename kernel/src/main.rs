@@ -160,8 +160,11 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
     }
     let total: u64 = boot.usable.as_slice().iter().map(|r| r.size).sum();
     kprintln!("usable     {} MiB in total", total >> 20);
-    kprintln!(
-        "frames     {} MiB free",
-        (mm::phys::free_frames() * PAGE_SIZE) >> 20
-    );
+    // The other CPUs are up and may use the frames: the count is read in a
+    // section.
+    let free = {
+        let _section = obj::lock();
+        mm::phys::free_frames()
+    };
+    kprintln!("frames     {} MiB free", (free * PAGE_SIZE) >> 20);
 }

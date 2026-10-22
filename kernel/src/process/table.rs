@@ -235,6 +235,19 @@ pub fn move_start(child: NonNull<Process>, object: Object, rights: Rights) -> Re
     Ok(())
 }
 
+/// The channel in entry 0 of the table of `child`, the start channel that
+/// process_create moved there, if there is one.
+pub fn start_channel(child: NonNull<Process>) -> Option<NonNull<crate::channel::Channel>> {
+    crate::obj::assert_held();
+    // SAFETY: the caller holds a reference to the child; only the table is
+    // read.
+    let handles = unsafe { &(*child.as_ptr()).handles };
+    handles
+        .get(abi::START_CHANNEL)
+        .ok()
+        .and_then(|(object, _)| object.channel())
+}
+
 /// The handles of `process`, which the caller holds, for object_info's
 /// PROCESS_HANDLES: live, retired at their last generation, and the limit.
 /// A process whose stage Handles is over has an empty table.
