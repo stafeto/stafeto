@@ -88,7 +88,7 @@ pub fn measurement_stage(process: NonNull<Process>) -> Stage {
     unsafe { (*process.as_ptr()).stage }
 }
 
-#[cfg(feature = "icount")]
+#[cfg(feature = "ktest")]
 pub fn fill_measurement_pages(process: NonNull<Process>, count: usize) -> Result<(), Error> {
     use kcore::slab::PageSource;
 

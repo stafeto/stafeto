@@ -19,10 +19,14 @@ use crate::frames::PhysMem;
 pub const ENTRIES: usize = PAGE_SIZE as usize / 8;
 /// Pages a list holds at most: two levels of nodes, 1 GiB.
 pub const MAX_PAGES: usize = ENTRIES * ENTRIES;
-/// Frames, pages or nodes, one step of a release gives back at most; each
-/// may merge up to crate::frames::MAX_ORDER times in the frame allocator,
-/// two units of work of a portion (spec 7.7).
-pub const RELEASE_STEP: usize = 28;
+/// Frames the kernel takes from the frame allocator or gives back to it in
+/// one section under OBJ (spec 7.7, 8.1), and so the most a step of a list
+/// fills or releases: each may merge up to crate::frames::MAX_ORDER times in
+/// the allocator, about 550 instructions a frame in the worst case, which
+/// keeps a section within 3 500 instructions.
+pub const FRAMES_PER_SECTION: usize = 6;
+/// Frames, pages or nodes, one step of a release gives back at most.
+pub const RELEASE_STEP: usize = FRAMES_PER_SECTION;
 
 /// Frames for the pages and nodes of a list, whose words the list reads
 /// and writes through PhysMem. Reading a page's frame needs PhysMem alone
@@ -142,6 +146,28 @@ impl PageList {
         self.filled == self.pages
     }
 
+    /// The frames the next `fill` of up to `n` pages takes: those pages and
+    /// the nodes they need, at most `n` + 2. The kernel takes them from the
+    /// frame allocator in one section, before the fill (`fill` then takes
+    /// them from a store, outside any section).
+    pub fn fill_needs(&self, n: usize) -> usize {
+        let end = self.pages.min(self.filled + n);
+        let mut frames = end - self.filled;
+        if end > self.filled {
+            match depth(self.pages) {
+                0 => {}
+                1 => frames += usize::from(self.filled == 0),
+                _ => {
+                    // The root with the first page, and a node at each
+                    // multiple of ENTRIES from `filled` to `end`.
+                    frames += usize::from(self.filled == 0);
+                    frames += end.div_ceil(ENTRIES) - self.filled.div_ceil(ENTRIES);
+                }
+            }
+        }
+        frames
+    }
+
     /// The frame of page `i`, which the list holds: at most two reads.
     pub fn frame(&self, mem: &impl PhysMem, i: usize) -> u64 {
         assert!(!self.going, "a page list is read after its release began");
@@ -160,32 +186,54 @@ impl PageList {
         }
     }
 
-    /// One step of the release (spec 7.7): up to RELEASE_STEP frames go
-    /// back, the last page first; a node goes once its pages went, and the
-    /// root last. A list that filled only in part goes the same way. True
-    /// once the list holds no frame; every later step frees nothing.
-    pub fn release_step(&mut self, mem: &mut impl ListMemory) -> bool {
+    /// One step of the release (spec 7.7): writes the addresses of up to
+    /// `out.len()` frames into `out`, the last page first; a node comes once
+    /// its pages came, and the root last. A list that filled only in part
+    /// goes the same way. Returns how many it wrote; the list holds no frame
+    /// once that is the last, which `released` says. The frames are still
+    /// the list's: the caller gives them back after this returns, and every
+    /// word of a node is read here, while its frame is still held. Every
+    /// later step writes nothing.
+    pub fn release_collect(&mut self, mem: &impl PhysMem, out: &mut [u64]) -> usize {
         self.going = true;
-        for _ in 0..RELEASE_STEP {
+        let mut n = 0;
+        while n < out.len() {
             if self.leaves > self.filled.div_ceil(ENTRIES) {
                 self.leaves -= 1;
-                let leaf = mem.read(self.root + 8 * self.leaves as u64);
-                mem.free_frame(leaf);
+                out[n] = mem.read(self.root + 8 * self.leaves as u64);
             } else if self.filled > 0 {
-                let page = self.find(mem, self.filled - 1);
-                mem.free_frame(page);
+                out[n] = self.find(mem, self.filled - 1);
                 self.filled -= 1;
                 if depth(self.pages) == 0 {
                     self.root = 0;
                 }
             } else if self.root != 0 {
-                mem.free_frame(self.root);
+                out[n] = self.root;
                 self.root = 0;
             } else {
                 break;
             }
+            n += 1;
         }
+        n
+    }
+
+    /// Whether the list holds no frame any more: the last of them was
+    /// written by `release_collect`.
+    pub fn released(&self) -> bool {
         self.root == 0
+    }
+
+    /// `release_collect` and the gift of its frames to `mem`, up to
+    /// FRAMES_PER_SECTION a step. True once the list holds no frame; every
+    /// later step frees nothing.
+    pub fn release_step(&mut self, mem: &mut impl ListMemory) -> bool {
+        let mut out = [0; FRAMES_PER_SECTION];
+        let n = self.release_collect(mem, &mut out);
+        for &pa in &out[..n] {
+            mem.free_frame(pa);
+        }
+        self.released()
     }
 }
 
@@ -451,6 +499,49 @@ mod tests {
             assert!(list.release_step(&mut m));
             assert_eq!(m.freed.len(), taken, "a step after the end freed a frame");
         }
+    }
+
+    #[test]
+    fn a_fill_takes_the_frames_it_announced() {
+        for pages in [1, 2, 5, 6, 7, 511, 512, 513, 514, 1030, 2000] {
+            let mut m = Mem::new();
+            let mut list = PageList::new(pages);
+            loop {
+                let before = m.allocated.len();
+                let needs = list.fill_needs(FRAMES_PER_SECTION);
+                let full = list.fill(&mut m, FRAMES_PER_SECTION);
+                assert_eq!(m.allocated.len() - before, needs, "{pages} pages");
+                assert!(needs <= FRAMES_PER_SECTION + 2);
+                if full {
+                    break;
+                }
+            }
+            assert_eq!(list.fill_needs(FRAMES_PER_SECTION), 0);
+            release(&mut list, &mut m);
+        }
+    }
+
+    /// The kernel collects the addresses of a step outside its section and
+    /// gives them back inside it: nothing is read from a frame that went.
+    #[test]
+    fn a_release_collects_before_it_frees() {
+        let mut m = Mem::new();
+        let mut list = PageList::new(1030);
+        assert!(list.fill(&mut m, 1030));
+        let taken = m.allocated.len();
+        loop {
+            let mut out = [0; FRAMES_PER_SECTION];
+            let n = list.release_collect(&m, &mut out);
+            for &pa in &out[..n] {
+                m.free_frame(pa);
+            }
+            if list.released() {
+                break;
+            }
+        }
+        assert_eq!(m.freed.len(), taken);
+        let mut out = [0; FRAMES_PER_SECTION];
+        assert_eq!(list.release_collect(&m, &mut out), 0);
     }
 
     #[test]

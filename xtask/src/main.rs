@@ -4969,6 +4969,12 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// the kernel decides whether it stays; part 2 of the step makes the portion
 /// one take and sets the guard anew.
 ///
+/// `THREADS_READY_MAX` 13 243 -> 13 254 (OBJ step, part 2, task 2.1): the
+/// source of the path did not change; `cleanup::portion` now holds the new
+/// `memory::clean` and the compiler laid it out again, 11 instructions more
+/// on the portion of 64 threads (13 254 measured). Task 2.2 makes the portion
+/// one take and sets the guard anew.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5016,7 +5022,7 @@ const B4_TAKES_ENFORCED: bool = false;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_243;
+const THREADS_READY_MAX: u64 = 13_254;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),

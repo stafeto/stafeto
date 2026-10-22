@@ -362,6 +362,13 @@ pub fn holds_by_kind() -> [u64; KINDS] {
     core::array::from_fn(|i| BY_KIND[i].load(Relaxed))
 }
 
+/// How many times `OBJ` was taken since the start, modulo 2^16, in every
+/// test build: the tests count the sections of a portion with it.
+#[cfg(feature = "ktest")]
+pub fn takes() -> u16 {
+    OBJ.tickets()
+}
+
 /// Whether this CPU is inside a section under `OBJ`.
 #[inline(always)]
 pub fn held() -> bool {

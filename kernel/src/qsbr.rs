@@ -93,9 +93,12 @@ pub fn pending() -> bool {
     PENDING.load(Relaxed) != 0
 }
 
-/// This CPU is at a quiescent point: it frees what it retired whose period
-/// passed.
-pub fn quiesce() {
+/// The retired objects one section frees at most (`reclaim`): the way out of
+/// the kernel takes OBJ once between two polls for an interrupt.
+pub const RECLAIM_BATCH: usize = 8;
+
+/// This CPU is at a quiescent point: the mark, which takes no lock.
+pub fn mark() {
     #[cfg(feature = "window-probe")]
     crate::cmd::window::lag();
     // A retired address space waits for every CPU to leave its tables: the
@@ -103,13 +106,19 @@ pub fn quiesce() {
     // (aspace::leave). The next thread activates its space again.
     crate::mm::aspace::leave();
     GRACE.quiesce(cpu::this().index());
-    poll();
+}
+
+/// The mark, and the freeing of everything of this CPU whose period passed,
+/// a section for each `RECLAIM_BATCH` objects: the tests and the boot call it
+/// where no interrupt is polled between the sections.
+pub fn quiesce() {
+    mark();
+    while reclaim() {}
 }
 
 /// This CPU goes idle: it holds nothing until `awake`.
 pub fn idle() {
     GRACE.idle(cpu::this().index());
-    poll();
 }
 
 /// This CPU wakes from idle. The fence orders the store of its epoch
@@ -123,28 +132,43 @@ pub fn awake() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Frees the retired objects of this CPU whose period passed.
-fn poll() {
+/// Frees up to `RECLAIM_BATCH` of the retired objects of this CPU whose
+/// period passed, in one section under OBJ; true when it took the section,
+/// so that some may be left. The way out of the kernel calls it once a turn
+/// of its loop, with the poll for an interrupt between two turns. The list
+/// is this CPU's own: the nodes come off it outside the section.
+pub fn reclaim() -> bool {
+    if !pending() {
+        return false;
+    }
     let cpus = crate::smp::cpus();
-    loop {
-        let freed = {
-            let mut list = local().retired.lock();
+    let mut batch = [None; RECLAIM_BATCH];
+    let mut n = 0;
+    {
+        let mut list = local().retired.lock();
+        while n < RECLAIM_BATCH {
             let Some(d) = list.head else {
-                return;
+                break;
             };
             // SAFETY: a node in the list is alive.
             let (epoch, next) = unsafe { ((*d.as_ptr()).epoch, (*d.as_ptr()).next) };
             if !GRACE.passed(epoch, cpus) {
-                return;
+                break;
             }
             list.head = next;
             if next.is_none() {
                 list.tail = None;
             }
-            d
-        };
-        PENDING.fetch_sub(1, Relaxed);
-        let _section = crate::obj::lock();
+            batch[n] = Some(d);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return false;
+    }
+    PENDING.fetch_sub(n as u32, Relaxed);
+    let _section = crate::obj::lock();
+    for freed in batch.into_iter().flatten() {
         // SAFETY: the period passed, so no CPU reads the object any more;
         // `retire` set `reclaim`.
         unsafe {
@@ -152,6 +176,7 @@ fn poll() {
             reclaim(freed);
         }
     }
+    true
 }
 
 /// How long a CPU may take to reach a quiescent point once it was asked to,

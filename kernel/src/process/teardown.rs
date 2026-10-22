@@ -14,9 +14,9 @@ use super::{
 use crate::syscall;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7):
-/// each goes back to the frame allocator, FRAME_UNITS units of work, 64 in
-/// all.
-const SHELL_PORTION: usize = 8;
+/// each goes back to the frame allocator, FRAME_UNITS units of work, in one
+/// section under OBJ.
+const SHELL_PORTION: usize = kcore::pagelist::FRAMES_PER_SECTION;
 
 /// The work a portion of the stage Threads does, at most (spec 7.7): a
 /// thread that waits in send, in receive or for a reply leaves its queue
@@ -398,8 +398,14 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             // SAFETY: nothing refers to the shell, so nothing lives in its
             // pools; the shell stays in place until its last portion.
             unsafe {
-                if release_pages(p) {
-                    let _section = crate::obj::lock();
+                // The pages are collected, and scrubbed in a test build,
+                // outside the section, which takes OBJ once: it gives them
+                // back and, with the last, ends the shell.
+                let mut batch = [None; SHELL_PORTION];
+                let done = collect_pages(p, &mut batch);
+                let _section = crate::obj::lock();
+                give_back_pages(p, &batch);
+                if done {
                     free(process, level);
                 } else {
                     let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
@@ -735,22 +741,38 @@ unsafe fn notify_exit(process: NonNull<Process>, level: u8) -> bool {
     true
 }
 
-/// The stage Shell: up to SHELL_PORTION pages of the process's pools and
-/// of its page log go back to the frame allocator, each refunded to its
-/// quota (spec 7.8). True once none is left.
+/// The stage Shell: takes up to SHELL_PORTION pages of the process's pools
+/// and of its page log off the log into `batch`, newest first, for
+/// `give_back_pages`. True once none is left. Outside any section: the log
+/// and the pages are the shell's own.
 ///
 /// # Safety
 /// Nothing refers to the shell: no object lives in its pools.
-unsafe fn release_pages(p: *mut Process) -> bool {
-    // SAFETY: the caller's promise; only the fields are borrowed.
-    let (log, quota) = unsafe { (&mut (*p).pages, &mut (*p).quota) };
+unsafe fn collect_pages(p: *mut Process, batch: &mut [Option<NonNull<u8>>; SHELL_PORTION]) -> bool {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    let log = unsafe { &mut (*p).pages };
+    let mut n = 0;
     log.release_step(SHELL_PORTION, |page| {
-        let _section = crate::obj::lock();
+        pages::scrub(page);
+        batch[n] = Some(page);
+        n += 1;
+    })
+}
+
+/// Gives the pages `collect_pages` took back to the frame allocator, each
+/// refunded to the quota of the shell (spec 7.8), in the caller's section.
+///
+/// # Safety
+/// The pages came from `collect_pages` of this shell, and nothing uses them.
+unsafe fn give_back_pages(p: *mut Process, batch: &[Option<NonNull<u8>>; SHELL_PORTION]) {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    let quota = unsafe { &mut (*p).quota };
+    for &page in batch.iter().flatten() {
         // SAFETY: the page came from KernelPages through the pools, and no
         // object lives there any more.
         unsafe { pages::give_back(page) };
         quota.refund(PAGE_SIZE);
-    })
+    }
 }
 
 /// A shell's last portion, once its pages went: the exit channel gets its

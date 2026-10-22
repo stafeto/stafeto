@@ -29,18 +29,24 @@ unsafe impl PageSource for KernelPages {
     }
 }
 
+/// Fills a page that goes back with POISON in a test build: a use after the
+/// release reads the poison until the frame is taken again. Outside any
+/// section, before `give_back`; the page is the caller's to the end.
+#[inline(always)]
+pub fn scrub(_page: NonNull<u8>) {
+    #[cfg(feature = "ktest")]
+    // SAFETY: the page is the caller's: nothing uses it afterwards.
+    unsafe {
+        core::ptr::write_bytes(_page.as_ptr(), POISON, kcore::PAGE_SIZE as usize)
+    };
+}
+
 /// Gives a page of a payer's pools, mapping table or page log back to the frame
-/// allocator (the stage Shell). Test builds fill it with POISON first: a
-/// use after the release reads the poison until the frame is taken again.
+/// allocator (the stage Shell), in the caller's section; `scrub` ran before.
 ///
 /// # Safety
 /// `page` came from KernelPages, and nothing uses it afterwards.
 pub unsafe fn give_back(page: NonNull<u8>) {
-    #[cfg(feature = "ktest")]
-    // SAFETY: the caller's promise: the page is the caller's to the end.
-    unsafe {
-        core::ptr::write_bytes(page.as_ptr(), POISON, kcore::PAGE_SIZE as usize)
-    };
     let pa = (page.as_ptr() as usize - LINEAR_BASE) as u64;
     FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);
     TAKEN.fetch_sub(1, Ordering::Relaxed);

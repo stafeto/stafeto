@@ -512,6 +512,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::create_resumes_where_it_stopped,
     ),
     (
+        "memory_shell_and_create_portions_take_obj_once",
+        calls::memory_shell_and_create_portions_take_obj_once,
+    ),
+    (
         "killed_creator_lets_the_object_go",
         calls::killed_creator_lets_the_object_go,
     ),
@@ -1954,10 +1958,11 @@ fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
 /// The pages of a process's pools go back with its shell, a portion at a
 /// time (spec 7.7, 7.8): a root with 130 chunks of handles holds 66 pages
 /// of blocks and a list page. Its handles go at the stage Handles and
-/// leave the pages in the pool; the shell gives them back at most eight a
-/// portion, in nine portions, and the last one gives the slot back.
+/// leave the pages in the pool; the shell gives them back at most
+/// SHELL_PORTION a portion, and the last one gives the slot back.
 fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     const CHUNKS: usize = 130;
+    const PORTION: usize = kcore::pagelist::FRAMES_PER_SECTION;
     cleanup::drain();
     let processes = process::in_use();
     let p = process::create_root(QUOTA, (CHUNKS * CHUNK) as u32, 63).map_err(|_| "no process")?;
@@ -1968,7 +1973,7 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     // SAFETY: the test's reference, the last, goes; nothing uses it
     // afterwards.
     unsafe { process::release(p, CAUSE) };
-    let mut portions = [0; 12];
+    let mut portions = [0; 16];
     let mut n = 0;
     // Only the stage Shell gives pages of pools back.
     while cleanup::top().is_some() {
@@ -1986,10 +1991,10 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
         "the blocks of the table did not take a page for two of them and a list page",
     )?;
     check(
-        n == held.div_ceil(8)
-            && portions[..n - 1].iter().all(|&pages| pages == 8)
-            && portions[n - 1] == held - (n - 1) * 8,
-        "the pages of a shell did not go back eight a portion",
+        n == held.div_ceil(PORTION)
+            && portions[..n - 1].iter().all(|&pages| pages == PORTION)
+            && portions[n - 1] == held - (n - 1) * PORTION,
+        "the pages of a shell did not go back a portion at a time",
     )?;
     check(
         pages::taken() == taken && process::in_use() == processes,

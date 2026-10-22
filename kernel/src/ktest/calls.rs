@@ -3789,14 +3789,15 @@ pub fn contiguous_portions_are_timed(_: &Boot) -> Result<(), &'static str> {
 /// A contiguous mem_create goes in portions of memory::CREATE_PORTION
 /// pages, which zero and clean each page once (spec 7.3, 7.7): with the
 /// kernel's timer pending all along, each entry of a call for 32 pages
-/// takes one portion; a mark written after the first portion into page 0
-/// is still there once the call ended, and the object is whole.
+/// takes one portion, the first only the checks and the making of the
+/// object; a mark written after the first portion into page 0 is still
+/// there once the call ended, and the object is whole.
 pub fn contiguous_create_resumes_without_zeroing_again(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let n = Call::MemCreate.number();
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
         let args = [32 * PAGE_SIZE, abi::MEM_CONTIGUOUS, r.0];
-        let mut filled = [0; 4];
+        let mut filled = [0; 8];
         let mut got = [0; 10];
         let mut marked = None;
         with_interrupt_pending(|| {
@@ -3806,7 +3807,7 @@ pub fn contiguous_create_resumes_without_zeroing_again(_: &Boot) -> Result<(), &
                     break;
                 };
                 *f = memory::filled(m);
-                if marked.is_none() {
+                if marked.is_none() && *f > 0 {
                     let word = (LINEAR_BASE + memory::frame(m, 0) as usize) as *mut u64;
                     // SAFETY: the frame is the object's, which the test's
                     // thread holds, and the linear map reaches it.
@@ -3826,7 +3827,7 @@ pub fn contiguous_create_resumes_without_zeroing_again(_: &Boot) -> Result<(), &
         let whole = m.is_ok_and(|m| memory::info(m).pages == 32);
         c.close(h)?;
         check(
-            filled == [8, 16, 24, 0] && got[0] == 0,
+            filled == [0, 6, 12, 18, 24, 30, 32, 0] && got[0] == 0,
             "a contiguous object did not grow a portion an entry",
         )?;
         check(kept, "a later portion zeroed a page again")?;
@@ -3838,10 +3839,10 @@ pub fn contiguous_create_resumes_without_zeroing_again(_: &Boot) -> Result<(), &
 /// over at its `svc` when an interrupt is pending after a portion (spec
 /// 7.7): with the kernel's timer pending all along, each entry of a call
 /// for 20 pages takes one portion, leaves x0-x9 as they were and ELR on
-/// the `svc`, and the object the thread's long call holds has 8 and then
-/// 16 pages; the third entry takes the rest, ends the call and returns the
-/// handle of a whole object. The portions count toward the longest portion
-/// (KERNEL_STATS x5).
+/// the `svc`, and the object the thread's long call holds has none (the
+/// first entry made it), then 6, 12 and 18 pages; the fifth entry takes the
+/// rest, the sixth ends the call and returns the handle of a whole object.
+/// The portions count toward the longest portion (KERNEL_STATS x5).
 pub fn create_resumes_where_it_stopped(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| with_interrupt_pending(|| resumed_cases(c)))
 }
@@ -3854,7 +3855,7 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
     let at_svc = elr() - 4;
     cleanup::take_longest();
     let mut got = c.call(n, &args);
-    let mut filled = [0; 2];
+    let mut filled = [0; 5];
     for f in &mut filled {
         let Some(Long::Create(m)) = thread::long(c.thread) else {
             return Err("mem_create did not stop after a portion");
@@ -3867,7 +3868,7 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
         got = c.again(n);
     }
     check(
-        filled == [8, 16],
+        filled == [0, 6, 12, 18, 20],
         "the object did not grow a portion an entry",
     )?;
     let mut want = with_marks(&args);
@@ -3875,7 +3876,7 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
     want[1] = got[1];
     check(
         thread::long(c.thread).is_none() && got == want,
-        "the third entry did not end the call with the handle",
+        "the sixth entry did not end the call with the handle",
     )?;
     check(
         cleanup::longest() > 0,
@@ -3889,6 +3890,87 @@ fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
     check(whole, "the handle does not name a whole object of 20 pages")
 }
 
+/// Each portion of the cleanup of a memory object, of the stage Shell of a
+/// process and each entry of mem_create takes `OBJ` once, in every build
+/// (spec 8.1): the frames go back or come in one section, the zeroing, the
+/// links of the list and the scrub of the pages outside it. The count of the
+/// takes is the lock's tickets (`obj::takes`), which every test build keeps.
+pub fn memory_shell_and_create_portions_take_obj_once(_: &Boot) -> Result<(), &'static str> {
+    const ONCE: &str = "a portion took OBJ other than once";
+    let objects = memory::in_use();
+    cleanup::drain();
+    // The cleanup of an object of 20 pages: 21 frames with the node of
+    // their list, FRAMES_PER_SECTION a portion, the last with its place.
+    let mut portions = 0;
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 20)?;
+        c.close(h)?;
+        while cleanup::top().is_some() {
+            let before = crate::obj::takes();
+            cleanup::portion();
+            check(crate::obj::takes().wrapping_sub(before) == 1, ONCE)?;
+            portions += 1;
+        }
+        Ok(())
+    })?;
+    check(
+        portions == 4,
+        "the object of 20 pages did not go in four portions",
+    )?;
+    // The stage Shell of a process with 20 pages in its pools.
+    let processes = process::in_use();
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let filled = process::fill_measurement_pages(p, 20);
+    // SAFETY: the test's reference, the last, goes; nothing uses it afterwards.
+    unsafe { process::release(p, CAUSE) };
+    let mut shell_portions = 0;
+    let mut result = Ok(());
+    while cleanup::top().is_some() {
+        let (before, taken) = (crate::obj::takes(), pages::taken());
+        cleanup::portion();
+        if pages::taken() < taken {
+            shell_portions += 1;
+            if crate::obj::takes().wrapping_sub(before) != 1 {
+                result = Err(ONCE);
+            }
+        }
+    }
+    filled.map_err(|_| "no pool pages")?;
+    result?;
+    check(
+        shell_portions == 4 && process::in_use() == processes,
+        "the 20 pages of a shell did not go in four portions",
+    )?;
+    // The entries of mem_create of 20 pages with an interrupt pending all
+    // along: the checks, four portions, and the handle, a take each.
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let args = [20 * PAGE_SIZE, 0];
+        let mut entries = 0;
+        let mut got = [0; 10];
+        with_interrupt_pending(|| {
+            let mut again = false;
+            loop {
+                let before = crate::obj::takes();
+                got = if again { c.again(n) } else { c.call(n, &args) };
+                check(crate::obj::takes().wrapping_sub(before) == 1, ONCE)?;
+                entries += 1;
+                again = true;
+                if thread::long(c.thread).is_none() {
+                    return Ok(());
+                }
+            }
+        })?;
+        c.close(Handle(got[1]))?;
+        check(
+            entries == 6 && got[0] == 0,
+            "mem_create did not take six entries",
+        )
+    })?;
+    cleanup::drain();
+    check(memory::in_use() == objects, "an object stayed")
+}
+
 /// A mem_create whose caller's process ends between two portions (spec
 /// 7.7): the object, which only the thread's long call holds, goes with
 /// the thread's buffer at the stage Buffers, and its frames and its place
@@ -3900,7 +3982,8 @@ pub fn killed_creator_lets_the_object_go(_: &Boot) -> Result<(), &'static str> {
     let mut stopped = false;
     let pending = with_interrupt_pending(|| {
         c.call(Call::MemCreate.number(), &[64 * PAGE_SIZE, 0]);
-        stopped = matches!(thread::long(c.thread), Some(Long::Create(m)) if memory::filled(m) == 8);
+        c.again(Call::MemCreate.number());
+        stopped = matches!(thread::long(c.thread), Some(Long::Create(m)) if memory::filled(m) == 6);
         Ok(())
     });
     // SAFETY: the test holds a reference to the process.
@@ -6590,11 +6673,12 @@ const REGION: usize = 512 * GIB as usize;
 #[cfg(feature = "icount")]
 const BLOCK: u64 = PAGE_SIZE << kcore::frames::MAX_ORDER;
 
-/// The blocks `Apart` sets apart: one for each frame of the memory object
-/// whose last portion `release_ticks` measures, its pages and the node of
-/// their list.
+/// The blocks `Apart` sets apart: enough frames for the memory object whose
+/// last portion `release_ticks` measures (its pages and the node of their
+/// list, FRAMES_PER_SECTION in all) and for the buffers of the seven threads
+/// of `session_buffers_ticks` with the tables over them.
 #[cfg(feature = "icount")]
-const APART: usize = kcore::pagelist::RELEASE_STEP;
+const APART: usize = 28;
 
 /// The frame allocator taken apart for the costliest frees (spec 7.7):
 /// every free block goes to the test, in a chain through the first words
