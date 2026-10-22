@@ -1260,10 +1260,13 @@ enum Variant {
     AsidProbe3,
     /// The counters of kernel time and OBJ waits of each CPU (`smp_measure`).
     SmpMeasure,
+    /// The checks of OBJ (kernel feature `obj-checks`) in the kernel of the
+    /// test init on four CPUs (`smp_probes`).
+    SmpChecks,
 }
 
 impl Variant {
-    const ALL: [Variant; 21] = [
+    const ALL: [Variant; 22] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1285,6 +1288,7 @@ impl Variant {
         Variant::UnmapLocal,
         Variant::AsidProbe3,
         Variant::SmpMeasure,
+        Variant::SmpChecks,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1314,6 +1318,7 @@ impl Variant {
             Variant::UnmapLocal => Some("break-unmap-local"),
             Variant::AsidProbe3 => Some("asid-probe-3"),
             Variant::SmpMeasure => Some("smp-measure"),
+            Variant::SmpChecks => Some("obj-checks"),
         }
     }
 
@@ -1344,7 +1349,8 @@ impl Variant {
             | Variant::BaselineEl0
             | Variant::TraceEl0
             | Variant::TestIcountEl0
-            | Variant::SmpMeasure => (TEST_KERNEL_LIMIT, "test builds"),
+            | Variant::SmpMeasure
+            | Variant::SmpChecks => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -1387,6 +1393,7 @@ impl Variant {
             Variant::UnmapLocal => "stafeto-unmap-local",
             Variant::AsidProbe3 => "stafeto-asid-3",
             Variant::SmpMeasure => "stafeto-smp-measure",
+            Variant::SmpChecks => "stafeto-smp-checks",
         }
     }
 }
@@ -7706,6 +7713,13 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("smp 4 probes GICv3", || {
             init_tests_on(&qemu::VIRT_V3, false, SMP_CPUS).map(drop)
         }),
+        // The same with the checks of OBJ, which stop the kernel at a take
+        // inside a section and at a link changed outside one, on the paths
+        // that only several CPUs reach (commands between CPUs, the
+        // reclamation after a quiescent period, the slow change of an ASID).
+        job("smp 4 checks", || {
+            init_tests_in(Variant::SmpChecks, &qemu::VIRT_V3, false, SMP_CPUS).map(drop)
+        }),
         job("smp 4 probes EL2 GICv2", || {
             init_tests_on(&qemu::VIRT_EL2, false, SMP_CPUS).map(drop)
         }),
@@ -9352,10 +9366,16 @@ const SMP_PROBE_LINES: [&str; 14] = [
 
 /// `cargo xtask smp-probe [machine]`: the test init on `-smp 4` on the four TCG
 /// machines and, on Apple silicon, the two HVF ones: all its tests, and
-/// each test of SMP stage 4 on four CPUs.
+/// each test of SMP stage 4 on four CPUs. Then the same in the kernel with
+/// the checks of OBJ (`Variant::SmpChecks`); `checks` alone runs just that.
 fn smp_probes(only: Option<&String>) -> Result<(), String> {
+    if only.map(String::as_str) == Some("checks") {
+        return init_tests_in(Variant::SmpChecks, &qemu::VIRT_V3, false, SMP_CPUS).map(drop);
+    }
     if let Some(name) = only {
-        return init_tests_on(qemu::machine(Some(name))?, false, SMP_CPUS).map(drop);
+        let m = qemu::machine(Some(name))?;
+        init_tests_on(m, false, SMP_CPUS)?;
+        return init_tests_in(Variant::SmpChecks, m, false, SMP_CPUS).map(drop);
     }
     let mut machines = vec![
         &qemu::VIRT,
@@ -9370,6 +9390,7 @@ fn smp_probes(only: Option<&String>) -> Result<(), String> {
     for m in machines {
         init_tests_on(m, false, SMP_CPUS)?;
     }
+    init_tests_in(Variant::SmpChecks, &qemu::VIRT_V3, false, SMP_CPUS)?;
     Ok(())
 }
 

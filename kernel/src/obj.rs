@@ -112,6 +112,7 @@ fn me() -> usize {
 /// Enters a section under `OBJ`: waits for the lock. This CPU holds none
 /// (a test build stops otherwise).
 #[inline(always)]
+#[track_caller]
 pub fn lock() -> Section {
     #[cfg(obj_checks)]
     assert!(!held(), "OBJ taken inside a section");
@@ -158,7 +159,11 @@ fn release() {
 /// the builds with `obj_checks` and the probe kernels of the window keep and
 /// nothing else does. The number of a section is the ticket the lock serves
 /// while it lasts (`Ticket::served`): each take adds one to it, under the
-/// lock, so the section needs no counter of its own.
+/// lock, so the section needs no counter of its own. The ticket has 16 bits,
+/// which is enough: the lock is fair (first come, first served), so between
+/// the two looks of a code that gave the lock back, at most one take of each
+/// other CPU comes ahead of its new ticket, and the number moves on by at
+/// most the number of CPUs; a gap cannot bring it round to the same value.
 #[derive(Clone, Copy)]
 pub struct Mark(#[cfg(section_marks)] u16);
 
@@ -370,10 +375,7 @@ pub fn held() -> bool {
 #[track_caller]
 pub fn assert_held() {
     #[cfg(obj_checks)]
-    assert!(
-        held() || IN_TEST.load(Relaxed),
-        "a link of objects changes outside OBJ"
-    );
+    assert!(held() || in_test(), "a link of objects changes outside OBJ");
 }
 
 /// Stops a test build that works on what no link reaches while it holds
@@ -382,39 +384,55 @@ pub fn assert_held() {
 #[track_caller]
 pub fn assert_not_held() {
     #[cfg(obj_checks)]
-    assert!(
-        !held() || IN_TEST.load(Relaxed),
-        "work on unlinked data inside OBJ"
-    );
+    assert!(!held() || in_test(), "work on unlinked data inside OBJ");
 }
 
 /// The code of a test runs inside: it calls the kernel's functions without
 /// an entry.
-#[cfg(obj_checks)]
+#[cfg(all(obj_checks, feature = "ktest"))]
 pub struct TestScope(bool);
 
-#[cfg(obj_checks)]
+#[cfg(all(obj_checks, feature = "ktest"))]
 pub fn test_scope() -> TestScope {
-    TestScope(IN_TEST.swap(true, Relaxed))
+    TestScope(swap_in_test(true))
 }
 
 /// The way out of the kernel ends the code of a test that never returns.
 #[cfg(obj_checks)]
 pub fn end_test_scope() {
-    IN_TEST.store(false, Relaxed);
+    set_in_test(false);
 }
 
-#[cfg(obj_checks)]
+#[cfg(all(obj_checks, feature = "ktest"))]
 impl Drop for TestScope {
     fn drop(&mut self) {
-        IN_TEST.store(self.0, Relaxed);
+        set_in_test(self.0);
     }
 }
 
-/// Whether the code that runs is a test's or the boot's: the checks of
-/// `assert_held` leave it alone. True until the first entry of the kernel.
+/// Whether the code that runs on this CPU is a test's or the boot's: the
+/// checks of `assert_held` leave it alone. True until the CPU's first way out
+/// of the kernel. The flag lives in the CPU's block, so that a test scope on
+/// one CPU leaves the checks of the others on. The block keeps it inverted
+/// (`checked`), so that it starts as zero and the blocks stay in the bss.
 #[cfg(obj_checks)]
-static IN_TEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+#[inline(always)]
+fn in_test() -> bool {
+    !cpu::this().checked.load(Relaxed)
+}
+
+#[cfg(obj_checks)]
+#[inline(always)]
+fn set_in_test(now: bool) {
+    cpu::this().checked.store(!now, Relaxed);
+}
+
+/// Sets the flag and returns what it was.
+#[cfg(obj_checks)]
+#[inline(always)]
+fn swap_in_test(now: bool) -> bool {
+    !cpu::this().checked.swap(!now, Relaxed)
+}
 
 /// An entry of the kernel runs inside: the checks apply to it, whoever
 /// called it. The tests call `dispatch` with the checks on this way.
@@ -423,13 +441,13 @@ pub struct Production(bool);
 
 #[cfg(obj_checks)]
 pub fn production() -> Production {
-    Production(IN_TEST.swap(false, Relaxed))
+    Production(swap_in_test(false))
 }
 
 #[cfg(obj_checks)]
 impl Drop for Production {
     fn drop(&mut self) {
-        IN_TEST.store(self.0, Relaxed);
+        set_in_test(self.0);
     }
 }
 

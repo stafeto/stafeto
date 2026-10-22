@@ -393,7 +393,7 @@ fn receiver_of(c: NonNull<Channel>, k: &mut Locked<'_>) -> Option<NonNull<Thread
 /// is below the receiver's effective priority after the boost the request
 /// gives it, no interrupt is pending, and that priority is above every
 /// ready thread's. The state is the one the slow path leaves. The
-/// reference of the receiver's wait goes after OBJ.
+/// reference of the receiver's wait goes inside the section of the call.
 /// Returns the receiver, which the caller runs; None, with nothing changed,
 /// when a condition fails. O(1).
 fn fast_send(

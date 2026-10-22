@@ -217,7 +217,7 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 /// own and queues the process for its first stage: Threads at S for a
 /// process with threads in its list past `stopped`, the thread the call
 /// took off when it heads the list, Stop at S for one with children,
-/// Replies otherwise (`stage_level`). It takes OBJ.
+/// Replies otherwise (`stage_level`). Runs inside the caller's section.
 ///
 /// # Safety
 /// `process` is alive and whole; a continuation may own its cleanup item.
@@ -297,7 +297,7 @@ unsafe fn stage_level_outside(process: NonNull<Process>) -> u8 {
 /// thread_set_priority moved a client in the queue of accepted requests of
 /// `process` (channel::raise): at the stage Replies the process goes up in
 /// the cleanup queue to the level of its top client when that is higher
-/// (spec 7.7). Nothing at other stages. It takes OBJ.
+/// (spec 7.7). Nothing at other stages. Runs inside the caller's section.
 ///
 /// # Safety
 /// `process` is alive: a client waits for its reply.

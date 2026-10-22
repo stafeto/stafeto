@@ -750,6 +750,8 @@ pub fn timer_fired() {
 /// with a `Drop`: it is abandoned.
 pub fn resume() -> ! {
     crate::obj::end_test_scope();
+    // A section on the stack would stay open for good.
+    crate::obj::assert_not_held();
     // The copy of a message and the commands of the call go out here: every
     // exit of the kernel passes this point, a call that never returns
     // (thread_exit, process_exit, the end of a process by a fault) included.

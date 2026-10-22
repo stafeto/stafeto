@@ -1143,6 +1143,8 @@ pub fn run_from(section: crate::obj::Section, next: NonNull<Thread>) -> ! {
 /// entry, and no value on the caller's stack is ever dropped, so the caller
 /// holds none with a `Drop`: no lock guard, `AddressSpace` or the like.
 pub fn run(next: NonNull<Thread>) -> ! {
+    // A section on the stack would stay open for good.
+    crate::obj::assert_not_held();
     // SAFETY: `next` is alive and holds its process; only the field is read.
     let mut process = unsafe { next.as_ref().process };
     if process::park_if_suspended(next, process) {

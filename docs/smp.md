@@ -120,7 +120,8 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   handles find no room: it fails that sender and takes one request off the
   queue, so the repeats of a call are at most the requests with handles that
   stood in the queue when it began (spec 6.1).
-- `ci` runs the test init, `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
+- `ci` runs the test init (also in the kernel built with the checks of `OBJ`,
+  `smp 4 checks`), `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
   guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 

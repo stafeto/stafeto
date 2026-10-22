@@ -8,8 +8,9 @@ fn main() {
     // instructions: their cost would count in the limits of the others.
     println!("cargo:rustc-check-cfg=cfg(obj_checks)");
     println!("cargo:rustc-check-cfg=cfg(section_marks)");
-    if std::env::var_os("CARGO_FEATURE_KTEST").is_some()
-        && std::env::var_os("CARGO_FEATURE_MEASURE").is_none()
+    if std::env::var_os("CARGO_FEATURE_OBJ_CHECKS").is_some()
+        || std::env::var_os("CARGO_FEATURE_KTEST").is_some()
+            && std::env::var_os("CARGO_FEATURE_MEASURE").is_none()
     {
         println!("cargo:rustc-cfg=obj_checks");
         println!("cargo:rustc-cfg=section_marks");
