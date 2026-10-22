@@ -6522,7 +6522,7 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     // uptime) once it ended.
     dialog_command(
         run,
-        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 1.5; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
+        "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 2; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
         &["cpu-grew", "idle-grew"],
     )
 }
