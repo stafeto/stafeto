@@ -25,6 +25,7 @@
  * The check of the runner (cargo xtask os-test, before the suites) starts
  * two files that are the runner itself: named `hang` it never ends, named
  * `quick` it exits with 7. */
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <spawn.h>
@@ -54,15 +55,58 @@ static void nap(void) {
     nanosleep(&t, NULL);
 }
 
+/* The processes of group `group` that /proc lists (field 5 of
+ * /proc/PID/stat), or -1 when /proc does not read. */
+static int group_left(pid_t group) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return -1;
+    int left = 0;
+    struct dirent *entry;
+    while ((entry = readdir(proc))) {
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        char path[64];
+        snprintf(path, sizeof path, "/proc/%s/stat", entry->d_name);
+        FILE *stat = fopen(path, "r");
+        if (!stat) continue;
+        char line[512];
+        if (fgets(line, sizeof line, stat)) {
+            /* pid (comm) state ppid pgrp: the name may hold spaces, so
+             * the fields count from its last parenthesis. */
+            char *close = strrchr(line, ')');
+            int ppid = 0, pgrp = 0;
+            char state = 0;
+            if (close && sscanf(close + 1, " %c %d %d", &state, &ppid, &pgrp) == 3 &&
+                pgrp == group)
+                left++;
+        }
+        fclose(stat);
+    }
+    closedir(proc);
+    return left;
+}
+
 /* A test that forks and leaves its children behind (a stress test that forks
  * until the system is full, one that dies by a signal) leaves them to starve
  * the tests after it: each test runs in a process group of its own, and the
  * runner ends the group when the test is over and waits (3 s at most) until
- * it is empty. */
-static void end_group(pid_t group) {
+ * it is empty. A group that is not empty by then gives -1 or the number of
+ * its processes still there, which `report_group` prints after the test's
+ * end mark (#342): the tests after it may lose to them. */
+static int end_group(pid_t group) {
     kill(-group, SIGKILL);
     long long start = now_ms();
     while (kill(-group, 0) == 0 && now_ms() - start < 3000) nap();
+    if (kill(-group, 0) != 0) return 0;
+    int left = group_left(group);
+    return left == 0 ? -1 : left;
+}
+
+/* The line of a group that `end_group` left behind, if any. */
+static void report_group(const char *name, int left) {
+    if (left > 0)
+        printf("os-test-run: the group of %s is not empty after 3 s: %d processes left\n", name, left);
+    else if (left < 0)
+        printf("os-test-run: the group of %s is not empty after 3 s\n", name);
 }
 
 /* Runs the test `name` of the file `rel` in the directory `dir`. */
@@ -105,19 +149,21 @@ static void run_one(const char *name, const char *dir, const char *rel, const ch
         if (now_ms() - start > limit_ms) {
             kill(pid, SIGKILL);
             waitpid(pid, &status, 0);
-            end_group(pid);
+            int left = end_group(pid);
             printf("@@os-test end %s timeout\n", name);
+            report_group(name, left);
             return;
         }
         nap();
     }
-    end_group(pid);
+    int left = end_group(pid);
     if (WIFEXITED(status))
         printf("@@os-test end %s exit %d\n", name, WEXITSTATUS(status));
     else if (WIFSIGNALED(status))
         printf("@@os-test end %s signal %d\n", name, WTERMSIG(status));
     else
         printf("@@os-test end %s error status %#x\n", name, status);
+    report_group(name, left);
     fflush(stdout);
 }
 
