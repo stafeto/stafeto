@@ -665,7 +665,7 @@ pub fn finish(plan: Plan) -> Result<(), String> {
         None => list,
     };
     let (lost, new) = compare(&list, &rows);
-    let lost = retry_lost(lost)?;
+    let (lost, floated) = retry_lost(lost)?;
     let held = exceptions_not_held(&read_exceptions()?, &rows, plan.suite.as_deref());
     if !held.is_empty() {
         return Err(format!(
@@ -676,6 +676,10 @@ pub fn finish(plan: Plan) -> Result<(), String> {
     }
     for name in &new {
         println!("os-test {name} passes and is not in {PASSING}");
+    }
+    if let Some(text) = floats_summary(&floated) {
+        println!("{text}");
+        append_step_summary(&text);
     }
     if lost.is_empty() {
         Ok(())
@@ -688,6 +692,33 @@ pub fn finish(plan: Plan) -> Result<(), String> {
     }
 }
 
+/// The line that closes a run which had tests float (lost in the run, passed
+/// when it ran again): their number and names. None for no such test.
+fn floats_summary(floated: &[String]) -> Option<String> {
+    if floated.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "os-test floats: {}: {}",
+        floated.len(),
+        floated.join(", ")
+    ))
+}
+
+/// Adds `text` to the summary of the step in GitHub Actions, where
+/// GITHUB_STEP_SUMMARY names the file.
+fn append_step_summary(text: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+    {
+        let _ = writeln!(file, "### os-test\n{text}\n");
+    }
+}
+
 /// The most tests of the list that a run may lose and still have them run
 /// again: so many lost tell of a change that broke them.
 const RETRY_MAX: usize = 8;
@@ -695,10 +726,10 @@ const RETRY_MAX: usize = 8;
 /// The tests of the list that did not pass (#285), run once more in a boot
 /// of their own: a test that passes there is printed as one that floats
 /// and kept; the others are given back. Past RETRY_MAX lost, none runs
-/// again.
-fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
+/// again. The result is the tests still lost and the ones that floated.
+fn retry_lost(lost: Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
     if lost.is_empty() || lost.len() > RETRY_MAX {
-        return Ok(lost);
+        return Ok((lost, Vec::new()));
     }
     let work = target_dir().join("os-test");
     let elfs = work.join("elfs");
@@ -715,7 +746,7 @@ fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
         }
     }
     if files.is_empty() {
-        return Ok(lost);
+        return Ok((lost, Vec::new()));
     }
     let kernel = build(Variant::Normal)?;
     let (log, _) = boot(
@@ -725,6 +756,7 @@ fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
         TIMEOUT,
     )?;
     let mut still = Vec::new();
+    let mut floated = Vec::new();
     for name in lost {
         let passed = match again.iter().find(|t| t.name == name) {
             Some(test) => judge(&work, test, outcome(&log, &name))?.0 == Verdict::Pass,
@@ -732,11 +764,12 @@ fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
         };
         if passed {
             println!("os-test {name}: floats: lost in the run, passed when it ran again");
+            floated.push(name);
         } else {
             still.push(name);
         }
     }
-    Ok(still)
+    Ok((still, floated))
 }
 
 /// The exceptions (of `suite`, or of all) whose test has no row EXCEPTED:
@@ -1386,6 +1419,16 @@ fn write(rows: &[Row], suite: Option<&str>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floats_summary_is_one_line_with_count_and_names() {
+        assert_eq!(floats_summary(&[]), None);
+        let two = ["basic/a/x".to_owned(), "basic/b/y".to_owned()];
+        assert_eq!(
+            floats_summary(&two).as_deref(),
+            Some("os-test floats: 2: basic/a/x, basic/b/y")
+        );
+    }
 
     #[test]
     fn exported_plan_preserves_literal_arguments_and_exact_replacement_positions() {
