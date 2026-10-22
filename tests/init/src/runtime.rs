@@ -1527,7 +1527,12 @@ fn heartbeat_now(kid: &Kid) -> Result<Token, &'static str> {
 /// 1, below the child: when the host holds the run up and both deadlines
 /// pass at once, the child still sends first, so a late host fails
 /// nothing. A heartbeat armed from the reply (now + T) would come a
-/// quarter of a period after that check.
+/// quarter of a period after that check. A host that stops the machine
+/// after the child's deadline woke it and before it sent (#148) leaves
+/// the child ready or running at the check, with init's deadline passed
+/// as well: the child then runs and its HEARTBEAT must come
+/// (`held_heartbeat`). A child that armed its timer from the reply waits
+/// in receive at the check, and fails it.
 fn heartbeats_keep_their_absolute_period() -> Outcome {
     const BEATS: usize = 8;
     serving(Role::Server, PERIOD_NS, None, |kid, _| {
@@ -1545,10 +1550,42 @@ fn heartbeats_keep_their_absolute_period() -> Outcome {
             beat_back(token)?;
             let due = next_release(t0, PERIOD_NS, clock_now()?);
             wait_until(due + PERIOD_NS / 2)?;
-            token = heartbeat_now(kid)?;
+            token = match heartbeat_now(kid) {
+                Ok(token) => token,
+                Err(why) => held_heartbeat(kid, why)?,
+            };
         }
         beat_back(token)
     })
+}
+
+/// The HEARTBEAT of a child that the host held between its deadline and
+/// its send (#148): while the child is ready or runs (on this CPU or on
+/// another), init lets it run and looks again, for up to a period; a
+/// child that waits in receive at the check armed its timer late, and
+/// `why` stands. Each case says so on a line.
+fn held_heartbeat(kid: &Kid, why: &'static str) -> Result<Token, &'static str> {
+    let until = clock_now()? + PERIOD_NS;
+    loop {
+        let state = sys::thread_info(&kid.thread).map(|i| i.state);
+        let held = matches!(
+            state,
+            Ok(abi::ThreadState::Ready | abi::ThreadState::Running)
+        );
+        if let Ok(token) = heartbeat_now(kid) {
+            println!(
+                "heartbeat: the child sent past half a period after its deadline: the host held the run"
+            );
+            return Ok(token);
+        }
+        if !held || clock_now()? > until {
+            println!(
+                "heartbeat: no HEARTBEAT half a period past the deadline, the child {state:?}"
+            );
+            return Err(why);
+        }
+        let_run()?;
+    }
 }
 
 /// Whether the channel of `kid` holds nothing now but late expiries of

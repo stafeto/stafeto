@@ -604,41 +604,61 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
     };
     // statvfs: the numbers, and one directory less of free inodes.
     let mut stat = req(4, next(), ChangeOp::StatVfs, b"/tmp");
-    let mut before = run(files, &stat, None).map_err(|_| 201)?;
     // The files the earlier stages let go of are freed by the service a little
-    // after the last close; the count is read again until it stands still, so
-    // that the exit of a slower child does not fall between the two reads (eight
-    // equal reads in a row).
-    let mut still = 0;
-    for _ in 0..400 {
+    // after the last close; the count is read again until it stands still
+    // (eight equal reads in a row), and a count that never does fails the
+    // stage (#324). A file freed later still, between the read before the
+    // mkdir and the one after, adds to the count: the measure goes again,
+    // up to three times, and a mkdir that takes other than one inode is off
+    // every time.
+    let mut counted = false;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            expect(run(files, &rmdir(4, next(), b"/tmp/cs3"), None), 0, 204)?;
+        }
+        let mut before = run(files, &stat, None).map_err(|_| 201)?;
+        let mut still = 0;
+        for _ in 0..400 {
+            stat.key = key(4, next());
+            let again = run(files, &stat, None).map_err(|_| 201)?;
+            still = if word(&again.bytes, 6) == word(&before.bytes, 6) {
+                still + 1
+            } else {
+                0
+            };
+            before = again;
+            if still == 8 {
+                break;
+            }
+        }
+        if still < 8 {
+            rt::println!(
+                "posix-files: change statvfs: the free inodes did not stand still in 400 reads"
+            );
+            return Err(290);
+        }
+        if before.result != 0 || before.length != proto_fs::STATVFS_BYTES {
+            return Err(202);
+        }
+        if word(&before.bytes, 0) != 4096 || word(&before.bytes, 10) != 255 {
+            return Err(203);
+        }
+        expect(
+            run(files, &mkdir(4, next(), b"/tmp/cs3", 0o777), None),
+            0,
+            204,
+        )?;
         stat.key = key(4, next());
-        let again = run(files, &stat, None).map_err(|_| 201)?;
-        still = if word(&again.bytes, 6) == word(&before.bytes, 6) {
-            still + 1
-        } else {
-            0
-        };
-        before = again;
-        if still == 8 {
+        let after = run(files, &stat, None).map_err(|_| 205)?;
+        if word(&after.bytes, 6) + 1 == word(&before.bytes, 6)
+            && word(&after.bytes, 2) == word(&before.bytes, 2)
+        {
+            counted = true;
             break;
         }
+        stat.key = key(4, next());
     }
-    if before.result != 0 || before.length != proto_fs::STATVFS_BYTES {
-        return Err(202);
-    }
-    if word(&before.bytes, 0) != 4096 || word(&before.bytes, 10) != 255 {
-        return Err(203);
-    }
-    expect(
-        run(files, &mkdir(4, next(), b"/tmp/cs3", 0o777), None),
-        0,
-        204,
-    )?;
-    stat.key = key(4, next());
-    let after = run(files, &stat, None).map_err(|_| 205)?;
-    if word(&after.bytes, 6) + 1 != word(&before.bytes, 6)
-        || word(&after.bytes, 2) != word(&before.bytes, 2)
-    {
+    if !counted {
         return Err(206);
     }
     stat.key = key(4, next());

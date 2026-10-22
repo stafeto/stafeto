@@ -165,7 +165,9 @@ static FILL_RELEASE: AtomicU64 = AtomicU64::new(0);
 
 /// Inside the pin of `pthread_kill`: the target ends, the creator is asked
 /// to make a thread (the table is full and the only place to take is
-/// pinned), and the hook lets 3 ms pass.
+/// pinned), and the hook waits until the creation found the place pinned
+/// and waits for it, then 3 ms more (#379: a fixed 3 ms let a slow host
+/// release the pin before the creation came to it, with no wake to count).
 extern "C" fn window_create(_: u64) {
     // SAFETY: the pthread is live and pinned.
     let Ok(native) = (unsafe { threads::probe_native(TARGET.load(Ordering::SeqCst)) }) else {
@@ -191,6 +193,14 @@ extern "C" fn window_create(_: u64) {
     CREATE_STATE.store(0, Ordering::SeqCst);
     if sys::notify(&create_channel(&CREATE_GO), 1).is_err() {
         HOOK.store(4, Ordering::SeqCst);
+        return;
+    }
+    let start = now();
+    while !abi::relibc::probe_pin_waited() && now() - start < 10_000_000_000 {
+        let _ = sys::yield_now();
+    }
+    if !abi::relibc::probe_pin_waited() {
+        HOOK.store(7, Ordering::SeqCst);
         return;
     }
     let start = now();
@@ -263,7 +273,7 @@ fn reserve_waits(base: usize) -> Result<(), usize> {
         let status = ffi::pthread_kill(id, 0);
         if HOOK.load(Ordering::SeqCst) != 1 {
             rt::println!(
-                "kill-collect: reserve: hook {} (1 expected, 6 is a creation that returned inside the pin: state {})",
+                "kill-collect: reserve: hook {} (1 expected, 6 is a creation that returned inside the pin: state {}, 7 one that never waited for it)",
                 HOOK.load(Ordering::SeqCst),
                 CREATE_STATE.load(Ordering::SeqCst)
             );

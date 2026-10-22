@@ -367,8 +367,11 @@ static int t_c_none(void) {
     timer_t t;
     if (timer_create(CLOCK_MONOTONIC, &e, &t)) return 1;
     struct itimerspec its = t_its(20 * T_MS, 0), now;
+    long long set = t_now(CLOCK_MONOTONIC);
     if (timer_settime(t, 0, &its, NULL)) return 2;
-    if (timer_gettime(t, &now) || (!now.it_value.tv_sec && !now.it_value.tv_nsec)) return 3;
+    if (timer_gettime(t, &now)) return 3;
+    /* Still armed, unless the host held the probe past its 20 ms (#301). */
+    if (!now.it_value.tv_sec && !now.it_value.tv_nsec && t_now(CLOCK_MONOTONIC) - set < 20 * T_MS) return 7;
     t_nap(60);
     sigset_t pending;
     sigpending(&pending);
@@ -445,14 +448,18 @@ static int t_c_overrun(void) {
     t_nap(90);
     siginfo_t info;
     if (t_take(SIGUSR1, &info, 1000) != SIGUSR1) return 3;
+    long long taken = t_now(CLOCK_MONOTONIC);
     /* About 17 expirations met one waiting signal. */
     int first = timer_getoverrun(t);
     if (first < 8) return 10 + first % 80;
     if (timer_getoverrun(t) < first) return 4;
-    /* The next signal starts again: its overrun is what came meanwhile. */
+    /* The next signal starts again: its overrun is what came meanwhile, at
+     * most an expiration each 5 ms since the first was taken; a host that
+     * held the probe longer gives it more (#301). */
     if (t_take(SIGUSR1, &info, 1000) != SIGUSR1) return 5;
     int second = timer_getoverrun(t);
-    if (second >= first || second > 4) return 100 + second % 100;
+    long long since = t_now(CLOCK_MONOTONIC) - taken;
+    if (second > since / (5 * T_MS) + 1) return 100 + second % 100;
     /* Disarming and setting again forgets the old count. */
     t_nap(40);
     its = t_its(0, 0);

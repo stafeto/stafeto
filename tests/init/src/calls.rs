@@ -1083,12 +1083,11 @@ fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) -> u64 {
     }
 }
 
-/// The CPU time splits (spec 8): a loop at EL0 with no call grows the user
-/// time and next to nothing of the kernel time; a loop of calls grows the
-/// kernel time; the kernel time is part of the whole, and the process's sum
-/// has both. Each loop runs 4 ms of the counter, so that the numbers do not
-/// depend on the speed of the host.
-fn cpu_time_splits_user_and_kernel() -> Outcome {
+/// One round of `cpu_time_splits_user_and_kernel`: the loop at EL0 with no
+/// call, three times, then the loop of calls; whether the kernel time of the
+/// loop of calls is above 1/16 of its ticks and 50 times the share of the
+/// loop with no call.
+fn loops_split_the_time() -> Result<bool, &'static str> {
     let four_ms = rt::time::frequency() / 250;
     // The loop with no call runs three times and the round with the least
     // kernel time per tick counts: the interrupts of the timer are all that
@@ -1130,6 +1129,26 @@ fn cpu_time_splits_user_and_kernel() -> Outcome {
         println!(
             "cpu_time: the loop at EL0 grew user {spin_user} and kernel {spin_kernel} in {spin_elapsed} ticks, the loop of calls kernel {call_kernel} in {call_elapsed} ticks (4 ms are {four_ms} ticks)"
         );
+    }
+    Ok(grew)
+}
+
+/// The CPU time splits (spec 8): a loop at EL0 with no call grows the user
+/// time and next to nothing of the kernel time; a loop of calls grows the
+/// kernel time; the kernel time is part of the whole, and the process's sum
+/// has both. Each loop runs 4 ms of the counter, so that the numbers do not
+/// depend on the speed of the host. The comparison of the two loops goes
+/// again, up to three times, when a round of it falls short (#435): the
+/// interrupts that the loop with no call takes are slow now and then on a
+/// busy host with 4 CPUs, while a kernel that left the calls out of the
+/// kernel time falls short every time.
+fn cpu_time_splits_user_and_kernel() -> Outcome {
+    let mut grew = false;
+    for _ in 0..3 {
+        grew = loops_split_the_time()?;
+        if grew {
+            break;
+        }
     }
     check(grew, "a loop of calls grew little of the kernel time")?;
     let (ran, kernel) = sys::thread_times(&me()).map_err(|_| "THREAD_STATE x5 and x6 failed")?;

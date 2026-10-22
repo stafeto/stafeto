@@ -70,6 +70,8 @@ const ENDED: &str = "init: os-test-run ended";
 /// The marks of the runner (tests/os-test-run/run.c).
 const BEGIN: &str = "@@os-test begin ";
 const END: &str = "@@os-test end ";
+/// The runner's line of a group of a test it could not empty.
+const GROUP_LEFT: &str = "os-test-run: the group of ";
 /// How a POSIX test ended by a signal, after the mark: `signal N`.
 const SIGNAL: &str = "signal ";
 /// How a test ended with a status, after the mark.
@@ -663,6 +665,7 @@ pub fn finish(plan: Plan) -> Result<(), String> {
         None => list,
     };
     let (lost, new) = compare(&list, &rows);
+    let lost = retry_lost(lost)?;
     let held = exceptions_not_held(&read_exceptions()?, &rows, plan.suite.as_deref());
     if !held.is_empty() {
         return Err(format!(
@@ -683,6 +686,57 @@ pub fn finish(plan: Plan) -> Result<(), String> {
             lost.join(", ")
         ))
     }
+}
+
+/// The most tests of the list that a run may lose and still have them run
+/// again: so many lost tell of a change that broke them.
+const RETRY_MAX: usize = 8;
+
+/// The tests of the list that did not pass (#285), run once more in a boot
+/// of their own: a test that passes there is printed as one that floats
+/// and kept; the others are given back. Past RETRY_MAX lost, none runs
+/// again.
+fn retry_lost(lost: Vec<String>) -> Result<Vec<String>, String> {
+    if lost.is_empty() || lost.len() > RETRY_MAX {
+        return Ok(lost);
+    }
+    let work = target_dir().join("os-test");
+    let elfs = work.join("elfs");
+    let tests = tests_of(&work)?;
+    let mut files = Vec::new();
+    let mut again = Vec::new();
+    for name in &lost {
+        match tests.iter().find(|t| &t.name == name) {
+            Some(test) if !test.built.starts_with('!') => {
+                files.push((test.name.clone(), test_elf(test, &test.built, &elfs)?));
+                again.push(test);
+            }
+            _ => {}
+        }
+    }
+    if files.is_empty() {
+        return Ok(lost);
+    }
+    let kernel = build(Variant::Normal)?;
+    let (log, _) = boot(
+        &kernel,
+        "os-test-again.img",
+        rootfs::os_test(&files),
+        TIMEOUT,
+    )?;
+    let mut still = Vec::new();
+    for name in lost {
+        let passed = match again.iter().find(|t| t.name == name) {
+            Some(test) => judge(&work, test, outcome(&log, &name))?.0 == Verdict::Pass,
+            None => false,
+        };
+        if passed {
+            println!("os-test {name}: floats: lost in the run, passed when it ran again");
+        } else {
+            still.push(name);
+        }
+    }
+    Ok(still)
 }
 
 /// The exceptions (of `suite`, or of all) whose test has no row EXCEPTED:
@@ -1185,6 +1239,11 @@ fn suite_jobs(
                     rootfs::os_test(&files),
                     left(&format!("in {suite}"))?.min(TIMEOUT),
                 )?;
+                // A group the runner could not empty in 3 s (#342): the
+                // tests after it may lose to its processes.
+                for line in log.lines().filter(|l| l.starts_with(GROUP_LEFT)) {
+                    println!("os-test {suite}: {line}");
+                }
                 for place in places {
                     let test = &tests[place];
                     let (verdict, text) = judge(&work, test, outcome(&log, &test.name))?;

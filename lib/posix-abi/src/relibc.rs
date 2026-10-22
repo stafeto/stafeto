@@ -129,6 +129,13 @@ fn probe_now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
 
+/// Whether a `reserve` found a pinned place and waits for its release
+/// (probes: the wait is under way, so that a release now wakes it).
+#[cfg(feature = "thread-probe")]
+pub fn probe_pin_waited() -> bool {
+    PIN_WAIT.load(Ordering::SeqCst) != 0
+}
+
 /// How many times the release of a pin woke a waiting `reserve`.
 #[cfg(feature = "thread-probe")]
 pub fn probe_pin_wakes() -> usize {

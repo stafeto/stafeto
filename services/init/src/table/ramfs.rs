@@ -570,14 +570,20 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// leave 10.7%. Goal I (64 signals with their tables of claims, the queue
 /// of the library's timers, the claims of the memory limits) added 12: 494
 /// measured. The guard of a stack is a hole that takes no frame; each stack
-/// is an object of its own and the workload measured 496: 552 pages leave
-/// 10.1%.
-const STEPS_QUOTA: u64 = 552 * PAGE;
+/// is an object of its own and the workload measured 496: 552 pages left
+/// 10.1%, under one page to the probe's 90% (#300). With 576 pages and the
+/// relibc of #432 the workload measures 499: 13.4% left, 19 pages to 90%,
+/// near the cost of a thread of the volley (20 pages). The steps probe
+/// reserves 250 of them on the 2 GiB machine, 24 MiB more.
+const STEPS_QUOTA: u64 = 576 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
-/// allocator growth retains 572 charged pages. Up to four prepaid mapping
-/// tables make the transient bound 576 pages, leaving 18.2% reserve.
-const PROCS_QUOTA: u64 = 704 * PAGE;
+/// allocator growth retained 572 charged pages when it was set to 704. The
+/// layer and relibc grew since: main measured 633 pages of the slow growth
+/// and 631 of the forked child, under one page to the probe's 90% of 704,
+/// and the relibc of #432 (one write a message, pin-5f477a7f) 635 and 633
+/// with 736 pages: 13.7% left, 27 pages to 90%.
+const PROCS_QUOTA: u64 = 736 * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and

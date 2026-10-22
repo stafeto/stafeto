@@ -13,13 +13,16 @@ static long long cpu_ns(clockid_t clock) {
     return t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
-/* The role: computes until its process has run 50 ms (user and system time
- * together: the loop reads the clock of the process, a call, and on a fast
- * host most of the 50 ms is the kernel's). */
+/* The role: computes until its process has run 50 ms, nearly all of it in
+ * EL0 (#413): a loop of arithmetic with no call, and a look at the clock of
+ * the process between rounds of it, a call each 100 000 turns. */
 static int burn50_role(void) {
     long long began = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
-    while (cpu_ns(CLOCK_PROCESS_CPUTIME_ID) - began < 50000000LL) {}
-    return 0;
+    volatile unsigned long sink = 1;
+    while (cpu_ns(CLOCK_PROCESS_CPUTIME_ID) - began < 50000000LL) {
+        for (int i = 0; i < 100000; i++) sink = sink * 2862933555777941757UL + 3037000493UL;
+    }
+    return sink == 0;
 }
 
 /* The role: ends with its nice value + 20 as its status. */
@@ -148,18 +151,25 @@ static void accounts(void) {
     expect("getrusage RUSAGE_CHILDREN after", getrusage(RUSAGE_CHILDREN, &children), 0);
     long long children_after = children.ru_utime.tv_sec * 1000000LL + children.ru_utime.tv_usec
                                + children.ru_stime.tv_sec * 1000000LL + children.ru_stime.tv_usec;
-    if (children_after - children_before < 40000) {
-        printf("posix-procs: accounts: the child ran 50 ms and the parent's children's time grew %lld us\n",
-               children_after - children_before);
+    long long children_user = (children.ru_utime.tv_sec - none.ru_utime.tv_sec) * 1000000LL
+                              + children.ru_utime.tv_usec - none.ru_utime.tv_usec;
+    if (children_after - children_before < 40000 || children_user < 40000) {
+        printf("posix-procs: accounts: the child ran 50 ms and the parent's children's time grew %lld us, "
+               "%lld us of it user time\n",
+               children_after - children_before, children_user);
         failures++;
     }
     struct tms after;
     times(&after);
-    long grown = (long)(after.tms_cutime - before.tms_cutime) + (long)(after.tms_cstime - before.tms_cstime);
-    if (grown < 4)
-        printf("posix-procs: accounts: the child ran 50 ms: cutime and cstime grew %ld ticks of 10 ms together\n", grown);
-    expect("times() counts the child (cutime and cstime grew at least 4 ticks of 10 ms together)",
-           grown >= 4, 1);
+    /* The child ran in EL0: its user time alone is the 50 ms, and its
+     * system time is less. */
+    long user = (long)(after.tms_cutime - before.tms_cutime);
+    long system = (long)(after.tms_cstime - before.tms_cstime);
+    if (user < 4 || system >= user)
+        printf("posix-procs: accounts: the child ran 50 ms in EL0: cutime grew %ld ticks of 10 ms, cstime %ld\n",
+               user, system);
+    expect("times() counts the child's user time (cutime grew at least 4 ticks of 10 ms)", user >= 4, 1);
+    expect("times() counts the child's system time apart (cstime grew less than cutime)", system < user, 1);
 
     /* The nice value: set, read, inherited, shown by /proc. */
     errno = 0;

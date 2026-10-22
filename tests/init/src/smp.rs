@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 22] = [
+pub(crate) const TESTS: [Test; 23] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -42,6 +42,7 @@ pub(crate) const TESTS: [Test; 22] = [
         "smp_log_of_another_cpu_is_read_without_changing_it",
         log_across_cpus,
     ),
+    ("smp_lines_of_every_cpu_come_whole", whole_lines_across_cpus),
     (
         "smp_raise_of_a_client_reaches_its_service_on_another_cpu",
         raise_across_cpus,
@@ -149,28 +150,27 @@ fn spawn_on(
     Ok(t)
 }
 
-/// The number of CPUs, found by the highest CPU thread_create takes.
+/// The number of CPUs that are up, as object_info CPU gives it. A count by
+/// the highest CPU thread_create takes would read a message buffer page
+/// that a thread of the test before still holds, until its cleanup ran, as
+/// a CPU that is not there (INVALID_ARGS for both), and the tests of more
+/// than one CPU would pass without running (#436). thread_create still
+/// refuses the CPU past the last: the kernel checks the CPU before the
+/// buffer, so the answer does not depend on the page.
 fn cpus() -> Result<usize, &'static str> {
-    let mut found = 1;
-    for cpu in 1..8 {
-        let mut x = [0; 10];
-        x[0] = own().raw().0;
-        x[1] = 0x1000;
-        x[4] = LOW.into();
-        x[5] = Policy::Fifo as u64 | ((cpu as u64 + 1) << abi::THREAD_CPU_SHIFT);
-        x[6] = buffer(3) as u64;
-        // SAFETY: the thread never starts, so it runs nothing.
-        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
-        match Error::from_code(after[0]) {
-            None => {
-                close(Handle::<Thread>::from_raw(abi::Handle(after[1])))?;
-                found = cpu + 1;
-            }
-            Some(Error::InvalidArgs) => break,
-            Some(_) => return Err("thread_create failed while the CPUs were counted"),
-        }
+    let n = sys::cpu_info(0).map_err(|_| "object_info CPU failed")?.cpus as usize;
+    let mut x = [0; 10];
+    x[0] = own().raw().0;
+    x[1] = 0x1000;
+    x[4] = LOW.into();
+    x[5] = Policy::Fifo as u64 | ((n as u64 + 1) << abi::THREAD_CPU_SHIFT);
+    x[6] = buffer(3) as u64;
+    // SAFETY: the call fails before it makes a thread.
+    let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+    if Error::from_code(after[0]) != Some(Error::InvalidArgs) {
+        return Err("thread_create took a CPU past those that are up");
     }
-    Ok(found)
+    Ok(n)
 }
 
 static ARRIVED: AtomicU64 = AtomicU64::new(0);
@@ -718,6 +718,77 @@ fn log_across_cpus() -> Outcome {
         "a peek at a CPU that does not exist was not refused",
     )?;
     println!("smp: the line of a thread on CPU 2 is in the ring of CPU 2, read from CPU 0 twice");
+    Ok(())
+}
+
+/// Lines each CPU writes in `whole_lines_across_cpus`.
+const WHOLE_LINES: u64 = 40;
+
+/// Waits for mark 1, then writes WHOLE_LINES lines of 64 bytes, each with
+/// one debug_write, as `whole_line` makes them for CPU `cpu`; mark 0 counts
+/// the threads that wrote all.
+extern "C" fn write_whole_lines(cpu: u64) -> ! {
+    while mark(1) == 0 {
+        spin_loop();
+    }
+    for i in 0..WHOLE_LINES {
+        let _ = sys::debug_write(&resource(), &whole_line(cpu, i));
+    }
+    MARKS[0].fetch_add(1, Release);
+    sys::thread_exit()
+}
+
+/// `smp whole line C NN ` and `x` up to 63 bytes, then a newline: the line
+/// xtask counts (`init_tests_in`).
+fn whole_line(cpu: u64, i: u64) -> [u8; 64] {
+    let mut line = [b'x'; 64];
+    line[..15].copy_from_slice(b"smp whole line ");
+    line[15] = b'0' + cpu as u8;
+    line[16] = b' ';
+    line[17] = b'0' + (i / 10) as u8;
+    line[18] = b'0' + (i % 10) as u8;
+    line[19] = b' ';
+    line[63] = b'\n';
+    line
+}
+
+/// Lines of the CPUs do not mix (#432, #436): a thread on every other CPU
+/// and init on CPU 0 write WHOLE_LINES lines of 64 bytes each at the same
+/// time, one debug_write a line, while the kernel has the console's port and
+/// shows each record from the CPU that wrote it. xtask finds every line
+/// whole: debug_write writes its record under OBJ, one CPU at a time.
+fn whole_lines_across_cpus() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    reset_marks();
+    let mut threads = [const { None }; 3];
+    for cpu in 1..n.min(4) {
+        threads[cpu - 1] = Some(spawn_on(
+            cpu - 1,
+            cpu,
+            write_whole_lines,
+            cpu as u64,
+            TEST_PRIORITY,
+        )?);
+    }
+    let others = (n.min(4) - 1) as u64;
+    MARKS[1].store(1, Release);
+    for i in 0..WHOLE_LINES {
+        let _ = sys::debug_write(&resource(), &whole_line(0, i));
+    }
+    let wrote = wait_for(|| MARKS[0].load(Acquire) == others);
+    let_run()?;
+    for t in threads.into_iter().flatten() {
+        close(t)?;
+    }
+    check(wrote, "a thread on another CPU did not write its lines")?;
+    println!(
+        "smp: {} CPUs wrote {} lines of 64 bytes at the same time",
+        others + 1,
+        (others + 1) * WHOLE_LINES
+    );
     Ok(())
 }
 
