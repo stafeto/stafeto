@@ -62,6 +62,8 @@ mod maps;
 mod table;
 mod teardown;
 
+#[cfg(feature = "ktest")]
+pub(crate) use control::UNPARK_PORTION;
 pub(crate) use control::unlist as unlist_parked;
 pub use control::{control, gated_thread, park_if_suspended, park_selected};
 #[cfg(feature = "icount")]
@@ -88,7 +90,7 @@ pub fn measurement_stage(process: NonNull<Process>) -> Stage {
     unsafe { (*process.as_ptr()).stage }
 }
 
-#[cfg(feature = "icount")]
+#[cfg(feature = "ktest")]
 pub fn fill_measurement_pages(process: NonNull<Process>, count: usize) -> Result<(), Error> {
     use kcore::slab::PageSource;
 

@@ -37,6 +37,7 @@ use abi::{Error, MAX_SYSTEM_TIMERS};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use kcore::sync::Budget;
+use kcore::timer::FIRE_PORTION;
 pub(crate) use kcore::timer::LEVELS;
 use kcore::timer::{Firing, HeapLink, HeapNode, Levels};
 
@@ -412,7 +413,8 @@ pub fn fire(level: u8) {
 /// after `now` leave its heap, the earliest first; each that is not dying
 /// posts bit 0 into its slot at `level`, its slot's priority, which is the
 /// level of whatever the post lets go (spec 7.7); a dying one nothing. The
-/// lock of the levels goes before each post. With timers left that
+/// timers leave the heap first, outside any section, and one section posts
+/// them all. With timers left that
 /// expired by `now`, the item goes back to the head of the level, and the
 /// next portion takes them and those that expired meanwhile; otherwise the
 /// level settles, and its next top counts for the kernel's timer again.
@@ -422,22 +424,29 @@ pub fn fire(level: u8) {
 pub fn fire_at(level: u8, now: u64) {
     let start = clock::now();
     let mut step = Firing::new(level);
-    loop {
-        let next = step.next(&mut local().timers.lock().levels, now);
-        let Some(t) = next else {
-            break;
-        };
-        // SAFETY: a timer off its heap is alive until its portion, which
-        // needs a reference gone and no queue; a timer that is not dying
-        // holds its channel and has a reference left.
-        unsafe {
-            if (*t.as_ptr()).dying {
-                continue;
+    // The timers leave the heap, which is this CPU's own, outside any
+    // section.
+    let mut batch = [None; FIRE_PORTION];
+    let mut n = 0;
+    while let Some(t) = step.next(&mut local().timers.lock().levels, now) {
+        batch[n] = Some(t);
+        n += 1;
+    }
+    if n > 0 {
+        crate::obj::serving(crate::obj::CLEAN_FIRE);
+        // One section for the posts of the portion.
+        let _section = crate::obj::lock();
+        for t in batch.into_iter().flatten() {
+            // SAFETY: a timer off its heap is alive until its portion, which
+            // runs on this CPU after this one and needs a reference gone and
+            // no queue; a timer that is not dying holds its channel and has
+            // a reference left. `dying` changes under OBJ.
+            unsafe {
+                if (*t.as_ptr()).dying {
+                    continue;
+                }
+                let _ = Source::post(source(t), TIMER_BITS, level);
             }
-            // One section for each post: the heap is this CPU's own.
-            crate::obj::serving(crate::obj::CLEAN_FIRE);
-            let _section = crate::obj::lock();
-            let _ = Source::post(source(t), TIMER_BITS, level);
         }
     }
     let more = {

@@ -201,8 +201,8 @@ pub fn notify(c: NonNull<Channel>, bits: u64, cause: u8) -> Result<(), Error> {
 /// works at the slot's priority under its ceiling, it becomes ready at the
 /// tail of that level with a new quantum (spec 6.1), and the reference of
 /// its wait goes. Otherwise the slot goes to the tail of its level in the
-/// queue of slots and holds its owner there. It takes OBJ
-/// itself. O(1).
+/// queue of slots and holds its owner there. Runs inside the caller's
+/// section. O(1).
 ///
 /// # Safety
 /// The caller holds a reference to `c` and to the owner of `slot`, which

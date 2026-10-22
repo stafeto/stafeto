@@ -56,10 +56,16 @@ rows of B. The measuring images count k from the tickets of the lock: `cargo
 xtask kernel-test 512M icount` prints the longest stretch for each k
 (`OBJ takes`), B_2, B_4, B_8, and fails B + 3 * `OBJ_HOLD_MAX` above
 `B4_MAX`. With `OBJ_HOLD_MAX` 4 000 a stretch fits `B4_MAX` with one take
-and C up to 20 000, or with two and C up to 8 000; the stretches of mem_create
-and of the cleanup of memory, channels and processes take `OBJ` once a frame
-or an item, and B_4 with the takes is printed, without an error, until they
-take it once (`B4_TAKES_ENFORCED`). S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`.
+and C up to 20 000, or with two and C up to 8 000. A turn of the loop of the
+way out of the kernel takes `OBJ` once at most (the handling of an interrupt,
+the freeing of up to `RECLAIM_BATCH` = 8 retired objects, the park of a
+thread, or a portion of cleanup), and polls for an interrupt before the next.
+The portions of the cleanup of memory objects and of the stage Shell, and
+the entries of mem_create, take `OBJ` once for up to `FRAMES_PER_SECTION` = 6
+frames. The stretches of the cleanup of channels and processes, of the
+timers and of mem_map, mem_unmap, mem_protect and process_create still take
+it more than once, and B_4 with the takes is printed, without an error, until
+they take it once (`B4_TAKES_ENFORCED`). S5_N = S5 + (N - 1) * `OBJ_HOLD_MAX`.
 
 A service on another CPU than its client runs at the client's level, a
 distributed inheritance: the response time R of the client adds the
@@ -120,7 +126,8 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   handles find no room: it fails that sender and takes one request off the
   queue, so the repeats of a call are at most the requests with handles that
   stood in the queue when it began (spec 6.1).
-- `ci` runs the test init, `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
+- `ci` runs the test init (also in the kernel built with the checks of `OBJ`,
+  `smp 4 checks`), `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
   guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 

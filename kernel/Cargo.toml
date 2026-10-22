@@ -42,6 +42,10 @@ break-one-section = ["window-probe"]
 # gave OBJ back for the instruction cache.
 break-alive-check = ["window-probe"]
 measure = []
+# The checks of OBJ (obj.rs) in an image that runs the test init on several
+# CPUs: the places that change a link outside a section stop the kernel
+# (xtask smp-probe).
+obj-checks = []
 # The counters of SMP stage 6: kernel time and waits for OBJ of each CPU, printed on
 # request of the program (xtask smp-measure).
 smp-measure = ["measure"]

@@ -344,6 +344,22 @@ pub unsafe fn free(frame: Frame, quota: &mut Account) {
     core::mem::forget(frame);
 }
 
+/// Gives the single frames at `pas` back to the allocator and refunds each
+/// to `quota`, which paid for them (`alloc_zeroed`, spec 7.5, 7.8), in the
+/// caller's section: a step of a list of frames goes back this way, up to
+/// kcore::pagelist::FRAMES_PER_SECTION in one section.
+///
+/// # Safety
+/// As for `free`, for each frame; each is of order 0 and the caller's.
+pub unsafe fn free_singles(pas: &[u64], quota: &mut Account) {
+    let mut guard = FRAMES.lock();
+    let frames = guard.as_mut().expect("frame allocator");
+    for &pa in pas {
+        frames.free(pa, 0);
+        quota.refund(PAGE_SIZE);
+    }
+}
+
 /// The frames of memory, which `OBJ` guards (obj.rs).
 pub static FRAMES: Guarded<Option<Frames>> = Guarded::new(None);
 

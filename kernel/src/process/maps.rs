@@ -539,7 +539,7 @@ pub const MAPPINGS_PORTION: usize = 16;
 
 /// A portion of the stage Mappings (spec 7.7): up to MAPPINGS_PORTION
 /// entries of the table, busy or not, leave it, each letting its reference
-/// to the object go at `level`, in one section; true once the table is
+/// to the object go at `level`, inside the caller's section; true once the table is
 /// empty, which then leaves the process. Its paid page stays in the page log
 /// until shell cleanup. The stage Space took the ASID, so no TLB entry maps
 /// a frame of an object that goes. Each entry O(1), the table's scan
@@ -549,7 +549,7 @@ pub const MAPPINGS_PORTION: usize = 16;
 /// `process` is alive and on its stages.
 pub(super) unsafe fn release_all(process: NonNull<Process>, level: u8) -> bool {
     let p = process.as_ptr();
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; only the table and its references are
     // touched, and each entry's reference goes with the entry.
     unsafe {

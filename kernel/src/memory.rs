@@ -17,7 +17,7 @@
 //! and each of its mappings (process::maps), which shows its frames to a
 //! program and counts in object_info MEMORY. The last one queues it for
 //! cleanup, whose portions give its frames back, up to
-//! kcore::pagelist::RELEASE_STEP a portion, and then its place and its
+//! kcore::pagelist::FRAMES_PER_SECTION a portion, and then its place and its
 //! budget. The object over the boot image (`create_boot`, spec 13.1) owns
 //! no frame: it names the image's, which the frame allocator never gets,
 //! has a budget of 0, and gives back only its place. So does a device
@@ -47,14 +47,15 @@ use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::bootinfo::BootInfo;
 use kcore::frames::PhysMem;
-use kcore::pagelist::{self, ListMemory, PageList};
+use kcore::pagelist::{self, FRAMES_PER_SECTION, ListMemory, PageList};
 use kcore::paging::Attrs;
 use kcore::quota::Account;
 use kcore::sync::SetOnce;
 use kcore::window::{self, Forbidden};
 
-/// Pages one portion of mem_create takes and zeroes, at most (spec 7.7).
-pub const CREATE_PORTION: usize = 8;
+/// Pages one portion of mem_create takes and zeroes, at most (spec 7.7): the
+/// frames of one section under OBJ.
+pub const CREATE_PORTION: usize = FRAMES_PER_SECTION;
 
 /// A memory object (spec 7.3): pages whose frames it takes whole when it
 /// is made and gives back in portions once nothing refers to it (spec
@@ -111,36 +112,12 @@ static LIVE: Live = Live::new();
 /// the device tree, written once at boot (`forbid`).
 static FORBIDDEN: SetOnce<Forbidden> = SetOnce::new();
 
-/// Frames of a memory object from the frame allocator, each charged to the
-/// object's budget (phys::alloc_zeroed, phys::free), and the words of the
-/// nodes of its list through the linear map.
-struct Budget<'a>(&'a mut Account);
-
-// SAFETY: a frame comes zeroed from the allocator and is the list's until
-// `free_frame`, which gives it back once no table maps it: an object goes
-// only once nothing refers to it (spec 7.7).
-unsafe impl ListMemory for Budget<'_> {
-    fn alloc_frame(&mut self) -> u64 {
-        // The lists fill and empty in portions outside any section, a take
-        // for each frame (part 2 of the OBJ step makes it one for a portion).
-        let _section = crate::obj::lock();
-        let frame = phys::alloc_zeroed(0, self.0);
-        frame
-            .expect("the budget of a memory object covers its frames")
-            .into_raw()
-    }
-
-    fn free_frame(&mut self, pa: u64) {
-        let _section = crate::obj::lock();
-        // SAFETY: the list gives back a frame of order 0 that `alloc_frame`
-        // took.
-        unsafe { phys::free(Frame::from_raw(pa, 0), self.0) }
-    }
-}
+/// The words of the nodes of a list, through the linear map.
+struct Words;
 
 // SAFETY: words go through the linear map, which covers all RAM, and the
 // list touches only its own nodes.
-unsafe impl PhysMem for Budget<'_> {
+unsafe impl PhysMem for Words {
     fn read(&self, pa: u64) -> u64 {
         // SAFETY: the list reads its own nodes.
         unsafe { LinearMem::new() }.read(pa)
@@ -149,6 +126,68 @@ unsafe impl PhysMem for Budget<'_> {
     fn write(&mut self, pa: u64, value: u64) {
         // SAFETY: the list writes its own nodes.
         unsafe { LinearMem::new() }.write(pa, value)
+    }
+}
+
+/// The frames one step of a fill takes: `fill` takes them in a section
+/// under OBJ, charged to the object's budget (phys::alloc), the step zeroes
+/// them outside it, and the list takes them from here.
+struct Taken {
+    frames: [u64; FRAMES_PER_SECTION + 2],
+    len: usize,
+    next: usize,
+}
+
+impl Taken {
+    /// The frames for the next step of `list`.
+    fn for_step(list: &PageList, budget: &mut Account) -> Taken {
+        let need = list.fill_needs(CREATE_PORTION);
+        let mut taken = Taken {
+            frames: [0; FRAMES_PER_SECTION + 2],
+            len: need,
+            next: 0,
+        };
+        let _section = if need > 0 {
+            Some(crate::obj::lock())
+        } else {
+            None
+        };
+        for slot in &mut taken.frames[..need] {
+            let frame = phys::alloc(0, budget);
+            *slot = frame
+                .expect("the budget of a memory object covers its frames")
+                .into_raw();
+        }
+        taken
+    }
+}
+
+// SAFETY: `for_step` hands out distinct frames of order 0 from the
+// allocator, which the step zeroes before the list sees them (`fill`); the
+// list owns each from then on, and the fill gives none back.
+unsafe impl ListMemory for Taken {
+    fn alloc_frame(&mut self) -> u64 {
+        assert!(
+            self.next < self.len,
+            "a step takes more frames than announced"
+        );
+        self.next += 1;
+        self.frames[self.next - 1]
+    }
+
+    fn free_frame(&mut self, _: u64) {
+        unreachable!("a fill gives no frame back");
+    }
+}
+
+// SAFETY: as for `Words`.
+unsafe impl PhysMem for Taken {
+    fn read(&self, pa: u64) -> u64 {
+        Words.read(pa)
+    }
+
+    fn write(&mut self, pa: u64, value: u64) {
+        Words.write(pa, value)
     }
 }
 
@@ -190,7 +229,17 @@ pub fn fill(m: NonNull<Memory>) -> bool {
     // (thread::Long::Create); only the fields are borrowed.
     let (backing, budget) = unsafe { (&mut (*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
     match backing {
-        Backing::Owned(list) => list.fill(&mut Budget(budget), CREATE_PORTION),
+        Backing::Owned(list) => {
+            // The frames come in one section, the zeroing and the links of
+            // the list go outside it.
+            let mut taken = Taken::for_step(list, budget);
+            for &pa in &taken.frames[..taken.len] {
+                // SAFETY: the frame was just handed out, and nothing else
+                // reaches it.
+                unsafe { phys::zero(pa, 0) };
+            }
+            list.fill(&mut taken, CREATE_PORTION)
+        }
         Backing::Contiguous {
             base,
             order,
@@ -494,16 +543,18 @@ pub unsafe fn release(m: NonNull<Memory>, cause: u8) {
 }
 
 /// A portion of an object nobody refers to (cleanup::portion), at `level`
-/// (spec 7.7): up to kcore::pagelist::RELEASE_STEP of its frames, pages and
-/// then nodes, go back to the frame allocator, each refunded to its
-/// budget, and with frames left the object goes back to the head of
+/// (spec 7.7): up to kcore::pagelist::FRAMES_PER_SECTION of its frames,
+/// pages and then nodes, go back to the frame allocator, each refunded to
+/// its budget, and with frames left the object goes back to the head of
 /// `level`. Once none is left, at once over the boot image and for a
 /// device window, whose frames stay, its place goes back to the payer's
 /// pool, its budget to the payer's quota, and its reference to the
 /// payer's shell goes, which may queue the shell at `level`; a window
 /// over a page of the console's port gives the port back then, with no
 /// handle and no mapping of it left (console::window_gone, spec 3.2).
-/// O(1): at most RELEASE_STEP frames.
+/// The addresses of the frames are collected before the section, which
+/// takes OBJ once: it gives them back and, with the last, ends the object.
+/// O(1): at most FRAMES_PER_SECTION frames.
 ///
 /// # Safety
 /// Nothing refers to the object, and it is in no queue.
@@ -511,22 +562,29 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
     let p = m.as_ptr();
     // SAFETY: the caller's promise; only the fields are borrowed.
     let (backing, budget) = unsafe { (&mut (*p).backing, &mut (*p).budget) };
+    let mut batch = [0; FRAMES_PER_SECTION];
+    let mut collected = 0;
     let done = match backing {
-        Backing::Owned(list) => list.release_step(&mut Budget(budget)),
-        Backing::Boot { .. } => true,
+        Backing::Owned(list) => {
+            collected = list.release_collect(&Words, &mut batch);
+            list.released()
+        }
+        Backing::Boot { .. } | Backing::Contiguous { .. } => true,
         Backing::Device { base, pages } => {
             crate::console::window_gone(*base, *pages as u64);
             true
         }
-        Backing::Contiguous { base, order, .. } => {
-            let _section = crate::obj::lock();
-            // SAFETY: nothing maps the block any more and its TLB entries
-            // went with its mappings; it is the object's. No cache
-            // maintenance: the next holder zeroes it through the cache.
-            unsafe { phys::free(Frame::from_raw(*base, *order), budget) };
-            true
-        }
     };
+    let _section = crate::obj::lock();
+    // SAFETY: the list collected frames of order 0 that are the object's,
+    // and nothing maps them any more (nothing refers to the object).
+    unsafe { phys::free_singles(&batch[..collected], budget) };
+    if let Backing::Contiguous { base, order, .. } = backing {
+        // SAFETY: nothing maps the block any more and its TLB entries went
+        // with its mappings; it is the object's. No cache maintenance: the
+        // next holder zeroes it through the cache.
+        unsafe { phys::free(Frame::from_raw(*base, *order), budget) };
+    }
     if !done {
         // SAFETY: the object stays alive and in place until its next
         // portion.
@@ -542,7 +600,6 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
         paid.used() == 0,
         "a memory object goes with frames charged to it"
     );
-    let _section = crate::obj::lock();
     // SAFETY: nothing uses the object afterwards; the payer's pool is
     // there, since the object holds the payer's shell.
     unsafe {
@@ -552,6 +609,19 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
     process::refund(payer, paid.limit());
     // SAFETY: the object's reference to its payer's shell goes with it.
     unsafe { process::release_shell(payer, level) };
+}
+
+/// Whether `m`, which the caller holds, has every frame it will have: the
+/// making of it is over (`fill`). Always for an object over the boot image
+/// or a device window.
+pub fn is_whole(m: NonNull<Memory>) -> bool {
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // read.
+    match unsafe { &(*m.as_ptr()).backing } {
+        Backing::Owned(list) => list.filled() == list.pages(),
+        Backing::Contiguous { order, filled, .. } => *filled == 1 << *order,
+        Backing::Boot { .. } | Backing::Device { .. } => true,
+    }
 }
 
 // The poison of an object that went (Live::gone) reaches its count.

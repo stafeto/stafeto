@@ -202,16 +202,17 @@ pub(crate) unsafe fn unlist(t: NonNull<Thread>, _k: &mut Locked<'_>) {
     unsafe { (*t.as_ref().process().as_ptr()).parked.remove(t) };
 }
 
-/// Parked threads that continue under one hold of OBJ.
-const UNPARK_SECTION: usize = 16;
+/// Parked threads that continue in a portion, under one hold of OBJ.
+pub(crate) const UNPARK_PORTION: usize = 32;
 
-/// Up to 64 parked threads continue at their current levels with fresh
-/// quanta. A new suspension ends the work before any thread is released.
-/// A section that finds the process ended (`teardown::begin` found this
-/// portion running) queues the process for its first stage with the
-/// reference and the item of the continuation; a portion that leaves work
-/// queues the continuation again in its last section, so that no gap
-/// without `OBJ` lies between the last look and the queue.
+/// Up to UNPARK_PORTION parked threads continue at their current levels
+/// with fresh quanta, in one section. A new suspension ends the work before
+/// any thread is released. A section that finds the process ended
+/// (`teardown::begin` found this portion running) queues the process for its
+/// first stage with the reference and the item of the continuation; a
+/// portion that leaves work queues the continuation again in its section, so
+/// that no gap without `OBJ` lies between the last look and the queue. The
+/// last portion lets the queue's reference go in the same section.
 ///
 /// # Safety
 /// The cleanup queue just took the process, holding its reference.
@@ -228,67 +229,53 @@ pub(crate) unsafe fn portion(process: NonNull<Process>, level: u8) {
         /// The process ended: it stands in the queue for its teardown.
         Ended,
     }
-    // The 64 threads go in sections of UNPARK_SECTION: no other CPU waits
-    // for the whole portion.
-    let sections = 64 / UNPARK_SECTION;
-    let mut step = Step::Done;
-    for section in 0..sections {
-        let held = crate::obj::lock();
-        step = sched::locked(|k| {
-            // SAFETY: the queue holds the process and each parked thread is
-            // held by the scheduler; the lock guards their shared links.
-            unsafe {
-                let p = process.as_ptr();
-                let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-                if (*p).stage != Stage::Whole {
-                    // The teardown began while this portion ran and left
-                    // the item and the reference to it.
-                    return Step::Ended;
-                }
-                assert!((*p).resume_level != 0, "a continuation has no reference");
-                if !gated(p, Ordering::Relaxed) {
-                    for _ in 0..UNPARK_SECTION {
-                        let Some(t) = (*p).parked.first() else { break };
-                        (*p).parked.remove(t);
-                        sched::unpark(k, t);
-                    }
-                }
-                let left = !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some();
-                if !left {
-                    // The last look at the list and the end of the
-                    // continuation are one section: a resume after it
-                    // queues a continuation of its own, one before it is
-                    // seen here.
-                    (*p).resume_level = 0;
-                    return Step::Done;
-                }
-                if section + 1 == sections {
-                    // The last look and the queue are one section: a kill
-                    // after it cancels the item.
-                    cleanup::requeue(item, Object::Process(process), level);
-                }
-                Step::Left
+    let held = crate::obj::lock();
+    let step = sched::locked(|k| {
+        // SAFETY: the queue holds the process and each parked thread is
+        // held by the scheduler; the lock guards their shared links.
+        unsafe {
+            let p = process.as_ptr();
+            let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+            if (*p).stage != Stage::Whole {
+                // The teardown began while this portion ran and left
+                // the item and the reference to it.
+                return Step::Ended;
             }
-        });
-        if step == Step::Ended {
-            // SAFETY: the item is the process's own and in no queue.
-            unsafe {
-                let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
-                let at = super::teardown::stage_level(process);
-                cleanup::requeue(item, Object::Process(process), at);
+            assert!((*p).resume_level != 0, "a continuation has no reference");
+            if !gated(p, Ordering::Relaxed) {
+                for _ in 0..UNPARK_PORTION {
+                    let Some(t) = (*p).parked.first() else { break };
+                    (*p).parked.remove(t);
+                    sched::unpark(k, t);
+                }
             }
+            let left = !gated(p, Ordering::Relaxed) && (*p).parked.first().is_some();
+            if !left {
+                // The last look at the list and the end of the
+                // continuation are one section: a resume after it
+                // queues a continuation of its own, one before it is
+                // seen here.
+                (*p).resume_level = 0;
+                return Step::Done;
+            }
+            // The last look and the queue are one section: a kill after it
+            // cancels the item.
+            cleanup::requeue(item, Object::Process(process), level);
+            Step::Left
         }
-        drop(held);
-        crate::testpoint::section_done(section);
-        if step != Step::Left {
-            break;
+    });
+    if step == Step::Ended {
+        // SAFETY: the item is the process's own and in no queue.
+        unsafe {
+            let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
+            let at = super::teardown::stage_level(process);
+            cleanup::requeue(item, Object::Process(process), at);
         }
     }
     if step == Step::Done {
         // SAFETY: the queue's reference goes only after the work ends.
-        unsafe {
-            let _section = crate::obj::lock();
-            release(process, level);
-        }
+        unsafe { release(process, level) };
     }
+    drop(held);
+    crate::testpoint::section_done(0);
 }

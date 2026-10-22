@@ -750,6 +750,8 @@ pub fn timer_fired() {
 /// with a `Drop`: it is abandoned.
 pub fn resume() -> ! {
     crate::obj::end_test_scope();
+    // A section on the stack would stay open for good.
+    crate::obj::assert_not_held();
     // The copy of a message and the commands of the call go out here: every
     // exit of the kernel passes this point, a call that never returns
     // (thread_exit, process_exit, the end of a process by a fault) included.
@@ -771,25 +773,36 @@ pub fn resume_from(section: crate::obj::Section) -> ! {
 /// pending. TTBR0, TPIDR_EL1 and the FP registers keep
 /// the last thread's meanwhile, so going back to that thread costs
 /// nothing; the idle wait takes TTBR0 off it (`aspace::leave`). Leaves only through thread::run.
+/// A turn of the loop takes OBJ at most once, so that the poll for an
+/// interrupt between two takes keeps the wait for it short (spec 8.1): the
+/// handling of an interrupt, the freeing of up to qsbr::RECLAIM_BATCH retired
+/// objects, the park of a thread of a gated process, or a portion of cleanup,
+/// each ends its turn.
 extern "C" fn exit_loop() -> ! {
     loop {
-        let mut now = timer::now();
+        let now = timer::now();
         polled_at(now);
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {
             crate::interrupt::handle(ack);
-            // The commands the interrupt posted go out before the decision.
+            // The commands the interrupt posted go out before the next turn,
+            // which polls again first.
             crate::cmd::flush_posted();
-            now = timer::now();
+            continue;
         }
         match decide(now) {
             Some(Decision::Run(t)) => {
                 // The kernel stack is empty and a way to EL0 follows: a
                 // quiescent point for the objects other CPUs retire, and the
                 // end of a wait for every CPU to be in the kernel once (qsbr).
+                // What this CPU retired and whose period passed goes in a
+                // turn of its own, before the thread runs.
                 if crate::qsbr::pending() {
-                    crate::qsbr::quiesce();
+                    crate::qsbr::mark();
+                    if crate::qsbr::reclaim() {
+                        continue;
+                    }
                 }
                 thread::run(t)
             }
@@ -799,16 +812,29 @@ extern "C" fn exit_loop() -> ! {
             // to the head of its level already.
             Some(Decision::Clean) if arch::irq_pending() => {}
             Some(Decision::Clean) => {
+                // The kernel stack is empty: a quiescent point, where what
+                // this CPU retired and whose period passed goes in a turn of
+                // its own, before the portion (qsbr). The way to EL0 is one
+                // too, for the objects another CPU retires (stage 4).
+                if crate::qsbr::pending() {
+                    crate::qsbr::mark();
+                    if crate::qsbr::reclaim() {
+                        continue;
+                    }
+                }
                 cleanup::portion();
                 crate::cmd::flush_posted();
-                // The kernel stack is empty again: a quiescent point, where
-                // what the portion retired may go (qsbr). The way to EL0 is
-                // one too, for the objects another CPU retires (stage 4).
-                if crate::qsbr::pending() {
-                    crate::qsbr::quiesce();
-                }
             }
-            Some(Decision::Idle) => sleep(),
+            Some(Decision::Idle) => {
+                // Nothing runs: what this CPU retired goes before it sleeps.
+                if crate::qsbr::pending() {
+                    crate::qsbr::mark();
+                    if crate::qsbr::reclaim() {
+                        continue;
+                    }
+                }
+                sleep()
+            }
             None => {}
         }
     }

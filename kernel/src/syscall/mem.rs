@@ -115,7 +115,16 @@ pub(super) fn mem_create(thread: NonNull<Thread>, a: &Args) {
     match made {
         Ok(m) => {
             thread::begin_long(thread, Long::Create(m));
-            make(thread, m, entry)
+            // The checks and the making of the object were this entry's
+            // section: the interrupt is polled before the first portion, which
+            // takes OBJ again (one take between two polls).
+            cleanup::count_portion(entry);
+            sched::entry_polled();
+            if arch::irq_pending() {
+                return restart(thread);
+            }
+            sched::entry_started();
+            make(thread, m, clock::now())
         }
         Err(e) => set_result(thread, Err(e)),
     }
@@ -135,7 +144,16 @@ pub(super) fn mem_create(thread: NonNull<Thread>, a: &Args) {
 /// or NO_MEMORY, the only error that comes late, and the object goes at
 /// the caller's priority.
 fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
-    let Some((_, start)) = run_portions(thread, entry, || Ok(memory::fill(m))) else {
+    // A portion fills the object (one section for its frames); once it is
+    // whole, the stretch after the next poll puts its handle in the table.
+    let Some((_, start)) = run_portions(thread, entry, || {
+        if memory::is_whole(m) {
+            Ok(true)
+        } else {
+            memory::fill(m);
+            Ok(false)
+        }
+    }) else {
         return;
     };
     thread::end_long(thread);

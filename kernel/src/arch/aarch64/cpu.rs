@@ -47,6 +47,13 @@ pub struct CpuBlock {
     /// it). GICv3: the virtual address of its redistributor's RD_base
     /// frame.
     pub gic: AtomicUsize,
+    /// Whether the checks of `OBJ` apply on this CPU (`obj::assert_held`):
+    /// false while the code that runs is a test's or the boot's, until this
+    /// CPU first leaves the kernel. Each CPU has its own, so that a test
+    /// scope on one does not switch the checks off on the others. False
+    /// first, so that the block stays in the bss.
+    #[cfg(obj_checks)]
+    pub checked: core::sync::atomic::AtomicBool,
     /// What the CPU owns (local.rs), on cache lines of its own after the
     /// header: the CPU reaches it from TPIDR_EL1 with one load or store.
     pub local: crate::local::Local,
@@ -70,6 +77,8 @@ impl CpuBlock {
             level: AtomicU32::new(0),
             timer_ok: AtomicU32::new(0),
             gic: AtomicUsize::new(0),
+            #[cfg(obj_checks)]
+            checked: core::sync::atomic::AtomicBool::new(false),
             local: crate::local::Local::new(),
         }
     }

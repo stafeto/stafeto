@@ -57,8 +57,8 @@ pub use source::{Owner, Source, notify};
 /// The work a portion of the stage Close does, at most (spec 7.7): each
 /// head of one level, a thread that waits or a queued slot, is a unit, and
 /// each handle a sender's request carries one more; the head that reaches
-/// it is the portion's last.
-const CLOSE_PORTION: usize = 32;
+/// it is the portion's last. One section under OBJ.
+const CLOSE_PORTION: usize = 8;
 
 pub struct Channel {
     /// The slot of label 0.
@@ -305,7 +305,7 @@ fn ceiling(t: NonNull<Thread>) -> u8 {
 }
 
 /// What receive or the stage Close took from a channel's queue, which it
-/// lets go after OBJ.
+/// lets go.
 enum Taken {
     /// A notification slot, which held its owner.
     Slot(Owner),
@@ -324,8 +324,8 @@ enum Taken {
 /// its wait letting go what it held and a sender's handles going, up to
 /// abi::MESSAGE_HANDLES, at the cause of the close; or slots, emptied, each
 /// letting its owner go at that cause (a session whose copies went goes, as
-/// after receive); a head a time under OBJ, what it held
-/// after it. With heads left the channel goes back to the head of the
+/// after receive); the heads and what they held in one section under OBJ.
+/// With heads left the channel goes back to the head of the
 /// higher of the cause and their top level (spec 7.7), and otherwise the
 /// queue's reference goes, which queues the shell at the cause when it was
 /// the last. With no reference left, the shell's portion: the slot goes
@@ -334,27 +334,24 @@ enum Taken {
 /// # Safety
 /// The channel was just taken from the queue.
 pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
+    // The one section of the portion: the look at the top level, the heads,
+    // what they held, and the end.
+    let section = crate::obj::lock();
     // SAFETY: the caller's promise: the queue's reference keeps the channel
     // at its stage Close, and nothing refers to a shell.
     if unsafe { refs(c) }.get() == 0 {
-        let _section = crate::obj::lock();
         // SAFETY: as above.
         unsafe { free(c, level) };
         return;
     }
     // SAFETY: as above; only the field is read.
     let cause = unsafe { (*c.as_ptr()).cause };
-    let section = crate::obj::lock();
     // SAFETY: as above.
     let top = sched::locked(|k| unsafe { queue(c, k.s).top() });
-    drop(section);
     let mut woken = 0u32;
     let mut heads = 0;
     let mut work = 0;
     while work < CLOSE_PORTION {
-        // One section for each waiter woken: the stage is O(CLOSE_PORTION)
-        // of them, and no other CPU waits for more than one.
-        let _section = crate::obj::lock();
         let head = sched::locked(|k| {
             // SAFETY: the channel is alive; a thread that waits is alive,
             // and a queued slot holds its owner, in which it lies.
@@ -402,10 +399,8 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
         heads += 1;
         work += 1;
     }
-    let _section = crate::obj::lock();
     // SAFETY: as above.
     let left = sched::locked(|k| unsafe { queue(c, k.s).top() });
-    crate::testpoint::heads_taken(level, heads);
     // SAFETY: the references of the waits go; the queue's keeps the
     // channel, and then goes itself once nothing is left.
     unsafe {
@@ -418,6 +413,8 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
             None => release(c, Rights::NONE, cause),
         }
     }
+    drop(section);
+    crate::testpoint::heads_taken(level, heads);
 }
 
 /// A channel's shell portion: its slot goes back to the pool it came from,

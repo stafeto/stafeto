@@ -140,7 +140,7 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
 /// CLIENT_GONE, bit 63, into the session's slot (spec 5.3, 6.8), where it
 /// merges with the bits not yet received; a closed channel gets nothing
 /// (channel::post). Then the copy's reference goes (`unref`), and with
-/// nothing left the session goes. It takes OBJ. O(1).
+/// nothing left the session goes. Runs inside the caller's section. O(1).
 ///
 /// # Safety
 /// The copy was the caller's, and it is gone.

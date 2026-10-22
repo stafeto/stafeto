@@ -3043,8 +3043,8 @@ fn done_requeue(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// Threads of two processes wait in receive on one channel, a process
 /// full of them each, each process with a handle with RECEIVE. The closer
 /// below them closes both handles, and the last one closes the channel
-/// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 32 a
-/// portion, in CROWD.div_ceil(32) portions at their level, above the closer's (spec
+/// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 8 a
+/// portion, in CROWD.div_ceil(8) portions at their level, above the closer's (spec
 /// 7.7); an interrupt comes after every portion, and none begins while one
 /// is pending. The judge below the closer finds every waiter ended with
 /// PEER_CLOSED.
@@ -3116,7 +3116,7 @@ fn crowd_of(
 }
 
 fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    closed_crowd(f, t, (CROWD.div_ceil(32) as u32, 32, 1 << PRIORITY))
+    closed_crowd(f, t, (CROWD.div_ceil(8) as u32, 8, 1 << PRIORITY))
 }
 
 /// The closer in slot 0 closes the crowd's handles, the last ones with
@@ -3149,7 +3149,7 @@ fn closed_crowd_at(
     )?;
     check(
         f.taken == taken,
-        "the stage Close did not wake the waiters 32 of one level a portion at the level expected",
+        "the stage Close did not wake the waiters 8 of one level a portion at the level expected",
     )?;
     check(
         !cleanup::take_late() && f.interrupts >= taken.0,
@@ -3682,15 +3682,15 @@ fn done_kill_states(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// A portion of the stage Close takes heads of one level (spec 7.7): 48
 /// threads at 40 and 48 at 10 wait in receive on one channel, and the
 /// closer below them closes its last handles with RECEIVE. The stage runs
-/// at 40 while threads there wait, 32 and then 16 heads, and then at 10,
-/// 32 and 16 more: four portions; a portion that took heads of both levels
-/// would leave three.
+/// at 40 while threads there wait, six portions of 8 heads, and then at 10,
+/// six more: twelve portions; a portion that took heads of both levels
+/// would leave eleven.
 fn start_level_portions(f: &mut Fixture) -> Result<(), &'static str> {
     close_crowd(f, [(40, 48), (PRIORITY, 48)])
 }
 
 fn done_level_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    closed_crowd(f, t, (4, 32, 1 << 40 | 1 << PRIORITY))
+    closed_crowd(f, t, (12, 8, 1 << 40 | 1 << PRIORITY))
 }
 
 /// A thread whose priority rises while the channel it waits in closes
@@ -3795,15 +3795,15 @@ fn done_raised_replies(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// After a portion, the stage Close goes back to the head of the higher of
 /// its cause and the top level of its queue (spec 7.7): MAX_THREADS threads at 10
 /// wait in receive on one channel, and the closer closes its last handles
-/// with RECEIVE as a thread at 40 would. Both portions run at 40, 32 heads
-/// each; a stage that went back at its waiters' level would run the second
-/// at 10.
+/// with RECEIVE as a thread at 40 would. All eight portions run at 40, 8
+/// heads each; a stage that went back at its waiters' level would run the
+/// second at 10.
 fn start_close_above(f: &mut Fixture) -> Result<(), &'static str> {
     close_crowd(f, [(PRIORITY, 32), (PRIORITY, 32)])
 }
 
 fn done_close_above(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    closed_crowd_at(f, t, 40, (2, 32, 1 << 40))
+    closed_crowd_at(f, t, 40, (8, 8, 1 << 40))
 }
 
 /// thread_set_priority that leaves a waiter at its level leaves the stage
@@ -4129,9 +4129,9 @@ const CARRIERS: usize = 8;
 /// A portion of the stage Close counts the handles of the senders'
 /// requests as work (spec 7.7): CARRIERS threads at 10 of a process wait
 /// in send on one channel, each with four handles on their way, and the
-/// closer below them closes the last handle with RECEIVE. The stage takes 7
-/// heads in its first portion, whose 7 units of five reach its 32, and the
-/// last one in its second, both at the senders' level; the judge below the
+/// closer below them closes the last handle with RECEIVE. The stage takes 2
+/// heads in each portion, whose 2 units of five pass its 8, four portions
+/// in all, at the senders' level; the judge below the
 /// closer finds every sender ended with PEER_CLOSED.
 fn start_close_handles(f: &mut Fixture) -> Result<(), &'static str> {
     let own = new_process(f, 0)?;
@@ -4159,7 +4159,7 @@ fn start_close_handles(f: &mut Fixture) -> Result<(), &'static str> {
 }
 
 fn done_close_handles(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    closed_crowd(f, t, (2, 7, 1 << PRIORITY))
+    closed_crowd(f, t, (4, 2, 1 << PRIORITY))
 }
 
 // The fast path of send (spec 6.4): a request of registers alone goes to a
