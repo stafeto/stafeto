@@ -305,6 +305,7 @@ pub unsafe fn raise_replies(process: NonNull<Process>) {
 /// `process` ended; the caller holds a reference to it, or it is in its
 /// parent's list, and none of its portions runs now.
 pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; a process on its stages is queued
     // outside its own portions, since the queue holds it.
     unsafe {
@@ -337,8 +338,11 @@ pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
 /// the queue's reference, or a shell nobody refers to.
 pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     let p = process.as_ptr();
-    // SAFETY: the caller's promise; only the fields are read.
-    let (stage, r) = unsafe { ((*p).stage, (*p).level) };
+    // The stage changes only in this process's own portions (after Whole);
+    // R changes under OBJ, from any CPU (`hasten`), so it is read in the
+    // section.
+    // SAFETY: the caller's promise; only the field is read.
+    let stage = unsafe { (*p).stage };
     // What a stage takes from what no link reaches, before its section: the
     // entries of the handle table, the table of the space that went, and the
     // pages of the shell's log with their poison.
@@ -368,6 +372,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     // The one section of the portion: the step, the move to the next stage
     // and the queue (the level of the next stage is read here too).
     let section = crate::obj::lock();
+    // SAFETY: as above; only the field is read.
+    let r = unsafe { (*p).level };
     // The child that goes in front of the process at the stage Children.
     let mut first = None;
     let mut heads = None;
@@ -429,9 +435,15 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             cleanup::requeue(item, Object::Process(process), stage_level(process));
         }
     }
+    if let Some(child) = first {
+        // The child's turn in front of the parent changes its level and
+        // its place in the queue of its CPU, which the sections of every
+        // CPU change without that queue's lock: inside the section.
+        // SAFETY: the child is in its parent's list, so it is alive.
+        unsafe { wait_for_child(child, r) };
+    }
     drop(section);
-    // After the section: what the tests see of the portion, and the
-    // child's turn in front of the parent (queue operations only).
+    // After the section: what the tests see of the portion.
     if let Some(n) = heads.filter(|&n| n > 0) {
         crate::testpoint::heads_taken(level, n);
     }
@@ -440,10 +452,6 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         // The threads are gone and the stage is not Replies yet: the
         // clients of the process stay in their wait for a while.
         crate::cmd::window::hold_replies();
-    }
-    if let Some(child) = first {
-        // SAFETY: the child is in its parent's list, so it is alive.
-        unsafe { wait_for_child(child, r) };
     }
 }
 

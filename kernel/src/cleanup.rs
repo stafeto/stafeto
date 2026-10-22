@@ -248,6 +248,9 @@ pub unsafe fn raise_above(item: NonNull<Item>, level: u8) {
 /// # Safety
 /// As for `raise`.
 unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
+    // A section's push takes no lock of the queue (`push`), so a lift
+    // outside one would race with it.
+    crate::obj::assert_held();
     // The queue of the CPU that pushed the item, under its lock; a CPU
     // that owns another queue than this one raises the item there and asks
     // its owner to look again (its next way out of the kernel decides).
