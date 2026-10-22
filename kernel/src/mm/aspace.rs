@@ -172,25 +172,26 @@ fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -
     })
 }
 
-/// The tables of a space that went (`SpaceRelease::step`): read from the
-/// linear map, which needs no lock; given back one at a time, each under the
-/// lock of the frames, and refunded to `quota`.
-struct Releasing<'a> {
-    quota: &'a mut Account,
+/// The tables of a space that went (`SpaceRelease::collect`): read from the
+/// linear map, which needs no lock, and not given back: the one table a step
+/// frees is noted, for `SpaceRelease::free` in the section of the portion.
+struct Collecting {
+    pending: Option<u64>,
 }
 
-// SAFETY: a table is read through the linear map and given back once; the
-// space owns every table it reaches. Nothing is allocated or written.
-unsafe impl TableMemory for Releasing<'_> {
+// SAFETY: a table is read through the linear map and noted once; the space
+// owns every table it reaches. Nothing is allocated or written, and the
+// step reads nothing of a table after it names it as freed.
+unsafe impl TableMemory for Collecting {
     fn alloc_table(&mut self) -> Option<u64> {
         unreachable!("a space that went takes no table");
     }
 
     fn free_table(&mut self, pa: u64) {
-        // A portion of the stage Space holds no section: one for each table.
-        let _section = crate::obj::lock();
-        with_tables(|t| t.free_table(pa));
-        self.quota.refund(PAGE_SIZE);
+        assert!(
+            self.pending.replace(pa).is_none(),
+            "a step of a release frees one table"
+        );
     }
 
     fn read(&self, pa: u64) -> u64 {
@@ -520,17 +521,40 @@ impl SpaceRelease {
         self.asid_gone.store(true, Ordering::Release);
     }
 
-    /// One step: at most 512 entries read and at most one table back to
-    /// the allocator and refunded to `quota`, the root last. False while
-    /// the ASID has not gone (`drop_asid`): the tables stay as they are.
-    /// True once every table went, and on every step after that.
-    pub fn step(&mut self, quota: &mut Account) -> bool {
-        if !self.spent && self.asid_gone.load(Ordering::Acquire) {
-            // The entries of the tables are read with no lock, for nothing
-            // else reaches a space that went; the allocator is locked for
-            // the one table that goes back (`Releasing`).
-            self.spent = self.tables.step(&mut Releasing { quota });
+    /// One step, outside any section: at most 512 entries are read, and the
+    /// one table the step frees, the root last, is returned for `free`.
+    /// Nothing happens while the ASID has not gone (`drop_asid`): the tables
+    /// stay as they are. Every step after the last returns none.
+    pub fn collect(&mut self) -> Option<u64> {
+        if self.spent || !self.asid_gone.load(Ordering::Acquire) {
+            return None;
         }
+        // The entries of the tables are read with no lock, for nothing
+        // else reaches a space that went.
+        let mut tables = Collecting { pending: None };
+        self.spent = self.tables.step(&mut tables);
+        tables.pending
+    }
+
+    /// Gives the table `collect` returned back to the allocator and
+    /// refunds it to `quota`, in the caller's section.
+    pub fn free(&mut self, table: Option<u64>, quota: &mut Account) {
+        if let Some(pa) = table {
+            with_tables(|t| t.free_table(pa));
+            quota.refund(PAGE_SIZE);
+        }
+    }
+
+    /// Every table went back.
+    pub fn is_spent(&self) -> bool {
+        self.spent
+    }
+
+    /// `collect` and `free` in a row, in the caller's section: true once
+    /// every table went.
+    pub fn step(&mut self, quota: &mut Account) -> bool {
+        let table = self.collect();
+        self.free(table, quota);
         self.spent
     }
 }

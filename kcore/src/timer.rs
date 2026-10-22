@@ -364,7 +364,7 @@ impl<T: HeapNode> Default for Heap<T> {
 pub const LEVELS: usize = 63;
 
 /// Expired timers of one level a portion takes, at most (spec 7.7, 10).
-pub const FIRE_PORTION: usize = 16;
+pub const FIRE_PORTION: usize = 8;
 
 /// The bit of `level` in the masks of `Levels`.
 fn bit(level: u8) -> u64 {

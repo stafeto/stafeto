@@ -357,47 +357,76 @@ pub fn portion() {
     };
     crate::testpoint::portion_taken();
     crate::obj::serving(crate::obj::ENTRY_CLEANUP);
+    #[cfg(all(feature = "ktest", obj_checks))]
+    let takes = crate::obj::takes();
     // SAFETY: nothing refers to the object any more.
     unsafe {
         match work {
             Work::Object(Object::Process(p)) => {
                 crate::obj::serving(crate::obj::CLEAN_PROCESS);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_PROCESS);
                 process::clean(p, level)
             }
             Work::Object(Object::Thread(t)) => {
                 crate::obj::serving(crate::obj::CLEAN_THREAD);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_THREAD);
                 let _section = crate::obj::lock();
                 thread::clean(t, level)
             }
             Work::Object(Object::Channel(c)) => {
                 crate::obj::serving(crate::obj::CLEAN_CHANNEL);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_CHANNEL);
                 channel::clean(c, level)
             }
             Work::Object(Object::Session(s)) => {
                 crate::obj::serving(crate::obj::CLEAN_SESSION);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_SESSION);
                 let _section = crate::obj::lock();
                 session::clean(s, level)
             }
             Work::Object(Object::Timer(t)) => {
                 crate::obj::serving(crate::obj::CLEAN_TIMER);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_TIMER);
                 let _section = crate::obj::lock();
                 crate::timer::clean(t, level)
             }
             Work::Object(Object::Memory(m)) => {
                 crate::obj::serving(crate::obj::CLEAN_MEMORY);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_MEMORY);
                 crate::memory::clean(m, level)
             }
             Work::Object(Object::Irq(b)) => {
                 crate::obj::serving(crate::obj::CLEAN_IRQ);
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_IRQ);
                 let _section = crate::obj::lock();
                 crate::irq::clean(b, level)
             }
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")
             }
-            Work::Timers => crate::timer::fire(level),
+            Work::Timers => {
+                #[cfg(all(feature = "ktest", obj_checks))]
+                crate::obj::cleanup_seen(crate::obj::CLEAN_FIRE);
+                crate::timer::fire(level)
+            }
         }
     }
+    // A portion is "outside, one section, outside" (spec 8.1): the test
+    // builds with the checks stop at a portion of cleanup that took `OBJ`
+    // twice (the builds that count instructions leave this to xtask, which
+    // reads the takes of each kind).
+    #[cfg(all(feature = "ktest", obj_checks))]
+    assert!(
+        crate::obj::takes().wrapping_sub(takes) <= 1,
+        "a portion of cleanup took OBJ more than once"
+    );
     crate::obj::serving(0);
     let took = stretch(start, timer::now());
     crate::testpoint::portion_done();

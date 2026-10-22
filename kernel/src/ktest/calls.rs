@@ -5927,8 +5927,8 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 
 /// Measures the teardown portions with a process that has 11 message
 /// buffers, 42 handles in transit, and 32 charged pool pages. The buffer
-/// work, 64 units, takes three portions of the stage, the longest of them
-/// the result; the shell's 32 pages take four or more portions. The handles use the permanent system resource so
+/// work, 64 units, takes eleven portions of the stage, one thread each, the
+/// longest of them the result; the shell's 32 pages take six portions. The handles use the permanent system resource so
 /// they add no unrelated object cleanup. The rows after them
 /// (`threads_teardown`):
 /// - end_call: the part of an end in the call (process::end) of a process
@@ -6005,7 +6005,7 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
         "the teardown did not reach buffers",
     )?;
     let mut buffers = 0;
-    for _ in 0..4 {
+    for _ in 0..12 {
         if process::measurement_stage(p) != Stage::Buffers {
             break;
         }
@@ -6015,7 +6015,7 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     }
     check(
         process::measurement_stage(p) == Stage::Mappings,
-        "eleven buffers and 42 handles did not fit three portions",
+        "eleven buffers and 42 handles did not fit eleven portions",
     )?;
     for t in threads.into_iter().flatten() {
         // SAFETY: the measurement owns the thread reference; the process
@@ -6493,19 +6493,18 @@ impl Listeners {
 }
 
 /// session_buffers of `teardown_portions_are_measured`: the portion of the
-/// stage Buffers of a process with 7 stopped threads, five with four
-/// handles in transit and two with none: the six newest fill the portion's
-/// 32 units (BUFFERS_PORTION), five times a frame of two units and four
-/// handles, and the frame of the sixth, and the oldest waits for the next
-/// portion (`buffers_portion`), so that the measurement follows the
-/// constant. Every handle is the last copy of a session whose
+/// stage Buffers of a process with 3 stopped threads, one with four
+/// handles in transit and two with none: the two newest fill the portion's
+/// 8 units (BUFFERS_PORTION), a frame of two units and four handles, and
+/// the frame of the second, and the oldest waits for the next portion
+/// (`buffers_portion`), so that the measurement follows the constant. Every handle is the last copy of a session whose
 /// receiver waits (Listeners), and every buffer's frame is alone in a free
 /// block of the highest order (`Apart`), so that its free merges up to it.
 #[cfg(feature = "icount")]
 fn session_buffers_ticks() -> Result<u64, &'static str> {
     // The stage takes the newest thread first, so the oldest, the first,
     // is the one that waits for the second portion.
-    const MOVED: [usize; 7] = [0, 4, 4, 4, 4, 4, 0];
+    const MOVED: [usize; 3] = [0, 0, 4];
     let free = phys::free_frames() + pages::taken() as u64;
     let mut l = Listeners::new(20)?;
     let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
@@ -6604,7 +6603,8 @@ fn buffers_portion(p: NonNull<Process>) -> Result<u64, &'static str> {
 /// session_handles of `teardown_portions_are_measured`: the longest
 /// portion of the stage Handles of a process that ends with CHUNK handles
 /// in its table, each the last copy of a session whose receiver waits
-/// (Listeners): a portion takes HANDLES_PORTION entries, half of the chunk.
+/// (Listeners): a portion takes HANDLES_PORTION entries, an eighth of the
+/// chunk.
 #[cfg(feature = "icount")]
 fn session_handles_ticks() -> Result<u64, &'static str> {
     let mut l = Listeners::new(CHUNK)?;
@@ -6638,8 +6638,8 @@ fn session_handles_ticks() -> Result<u64, &'static str> {
             }
             check(longest > 0, "the teardown did not reach handles")?;
             check(
-                portions == 2,
-                "the chunk did not take two portions of half its entries",
+                portions == 8,
+                "the chunk did not take eight portions of an eighth of its entries",
             )?;
             check(
                 l.woken() == CHUNK,
@@ -6675,7 +6675,7 @@ const BLOCK: u64 = PAGE_SIZE << kcore::frames::MAX_ORDER;
 
 /// The blocks `Apart` sets apart: enough frames for the memory object whose
 /// last portion `release_ticks` measures (its pages and the node of their
-/// list, FRAMES_PER_SECTION in all) and for the buffers of the seven threads
+/// list, FRAMES_PER_SECTION in all) and for the buffers of the threads
 /// of `session_buffers_ticks` with the tables over them.
 #[cfg(feature = "icount")]
 const APART: usize = 28;
@@ -7450,6 +7450,8 @@ pub fn suspended_crowds_stop_again_and_die(_: &Boot) -> Result<(), &'static str>
 /// 128 threads, using every legal priority on the ready path. A timer wait
 /// is a receive: its channel and timer belong to that same process.
 fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str> {
+    /// Threads one portion of a continuation unparks.
+    const PORTION: usize = process::UNPARK_PORTION;
     let counts = (
         process::in_use(),
         thread::in_use(),
@@ -7521,10 +7523,15 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
         }
         let park = park_crowd(threads.len())?;
         if kind == 0 {
-            // Change levels after parking so the first continuation portion
-            // spans all 63 legal levels, with one repeated level.
+            // Change levels after parking so the continuation portions span
+            // all 63 legal levels, 31 of them odd ones in the first portion.
             for (i, t) in threads.iter().flatten().enumerate() {
-                sched::set_priority(*t, (i % 63 + 1) as u8, Policy::RoundRobin, false)
+                let level = if i < PORTION {
+                    2 * i % 63 + 1
+                } else {
+                    i % 63 + 1
+                };
+                sched::set_priority(*t, level as u8, Policy::RoundRobin, false)
                     .map_err(|_| "parked spread priority failed")?;
             }
         }
@@ -7577,15 +7584,9 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 .count()
         };
         check(
-            ready() == 64 && cleanup::len() == 1,
+            ready() == PORTION && cleanup::len() == 1,
             "continuation exceeded its portion or lost its rest",
         )?;
-        if kind == 0 {
-            check(
-                sched::locked(|k| (1..=63).all(|level| k.s.ready().first(level).is_some())),
-                "the measured continuation missed a legal priority level",
-            )?;
-        }
         let mut stop_cancel = 0;
         if stop_again {
             // The remaining portion holds one queued process reference.
@@ -7597,11 +7598,11 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 cleanup::len() == 0,
                 "second stop left a continuation queued",
             )?;
-            park_crowd(64)?;
+            park_crowd(PORTION)?;
             check(ready() == 0, "a thread ran after the second stop")?;
             process::control(p, false, CAUSE).map_err(|_| "second continue failed")?;
             cleanup::portion();
-            // Kill while 64 parked and 64 ready share a continuation item.
+            // Kill while 96 parked and PORTION ready share a continuation item.
             // SAFETY: The test retains p while ending its process and threads.
             unsafe {
                 process::end(p, ProcessState::Killed, CAUSE);
@@ -7620,11 +7621,16 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str
                 "kill left a parked thread",
             )?;
         } else {
-            cleanup::portion();
-            check(
-                ready() == 128 && cleanup::len() == 0,
-                "continuation failed to finish",
-            )?;
+            while cleanup::len() > 0 {
+                cleanup::portion();
+            }
+            check(ready() == 128, "continuation failed to finish")?;
+            if kind == 0 {
+                check(
+                    sched::locked(|k| (1..=63).all(|level| k.s.ready().first(level).is_some())),
+                    "the continuation missed a legal priority level",
+                )?;
+            }
             if kind != 0 {
                 for t in threads.iter().flatten() {
                     // SAFETY: The test retains each thread; these test threads never enter EL0.
@@ -7740,27 +7746,29 @@ pub fn section_done(number: usize) {
     kill_at(KillPoint::Section(number));
 }
 
-/// A process with 80 parked threads continues, so its continuation queues;
-/// the kill that ends it comes at `point` of the continuation's portion,
-/// as it does from another CPU: the item has left the queue, or the
-/// portion stands between two sections. The teardown takes over the
-/// continuation's reference and item: nothing stands in the queue twice,
-/// the stages run, and every object goes.
-fn continuation_ended_at(point: KillPoint) -> Result<(), &'static str> {
+/// A process with `crowd` parked threads continues, so its continuation
+/// queues; the kill that ends it comes at `point` of the continuation's
+/// portion, as it does from another CPU: the item has left the queue, or
+/// the portion's section is over, with work left (the item stands in the
+/// queue again) or none. The teardown takes over the continuation's
+/// reference and item: nothing stands in the queue twice, the stages run,
+/// and every object goes.
+fn continuation_ended_at(point: KillPoint, crowd: usize) -> Result<(), &'static str> {
     const CROWD: usize = 80;
+    let crowd = crowd.min(CROWD);
     let counts = (process::in_use(), thread::in_use());
     cleanup::drain();
     let p = process::create_root(QUOTA, 512, CEILING).map_err(|_| "no crowd process")?;
     let mut threads = [None; CROWD];
     let result = (|| {
-        for slot in threads.iter_mut() {
+        for slot in threads[..crowd].iter_mut() {
             let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::RoundRobin)
                 .map_err(|_| "no crowd thread")?;
             thread::start(t).map_err(|_| "crowd start failed")?;
             *slot = Some(t);
         }
         process::control(p, true, CAUSE).map_err(|_| "stop failed")?;
-        park_crowd(CROWD)?;
+        park_crowd(crowd)?;
         process::control(p, false, CAUSE).map_err(|_| "continue failed")?;
         check(cleanup::len() == 1, "the continuation was not queued")?;
         *KILL_AT_POINT.lock() = Some((p.as_ptr() as usize, point));
@@ -7808,19 +7816,20 @@ fn continuation_ended_at(point: KillPoint) -> Result<(), &'static str> {
 /// The kill comes after the portion took the continuation's item off the
 /// queue, before its work runs.
 pub fn continuation_ended_after_the_queue_gave_it_up(_: &Boot) -> Result<(), &'static str> {
-    continuation_ended_at(KillPoint::Taken)
+    continuation_ended_at(KillPoint::Taken, 80)
 }
 
-/// The kill comes between two sections of the continuation's portion, with
-/// work left.
+/// The kill comes after the section of the continuation's portion, which
+/// leaves work for the next portion: the process stands in the queue by
+/// then.
 pub fn continuation_ended_between_its_sections(_: &Boot) -> Result<(), &'static str> {
-    continuation_ended_at(KillPoint::Section(0))
+    continuation_ended_at(KillPoint::Section(0), 80)
 }
 
-/// The kill comes after the last section, which leaves work for the next
-/// portion: the process stands in the queue by then.
+/// The kill comes after the section of a portion that ended the
+/// continuation: the queue's reference went with it.
 pub fn continuation_ended_after_its_last_section(_: &Boot) -> Result<(), &'static str> {
-    continuation_ended_at(KillPoint::Section(3))
+    continuation_ended_at(KillPoint::Section(0), process::UNPARK_PORTION)
 }
 
 /// A thread of a process that ended and that the stage Threads has not taken
@@ -7904,7 +7913,7 @@ pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
 pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
     let [stop, park, continue_call, portion, stop_cancel, longest] = suspension_crowd(0, true)?;
     kprintln!(
-        "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_64={portion} longest_portion={longest}"
+        "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_portion={portion} longest_portion={longest}"
     );
     Ok(())
 }

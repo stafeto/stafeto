@@ -650,6 +650,10 @@ const TESTS: &[(&str, TestFn)] = &[
         "windows_of_the_running_process_are_counted",
         calls::windows_of_the_running_process_are_counted,
     ),
+    (
+        "every_kind_of_cleanup_took_obj_at_most_once",
+        every_kind_of_cleanup_took_obj_at_most_once,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -796,6 +800,43 @@ fn dispatch(t: NonNull<crate::thread::Thread>, number: u16) {
     crate::syscall::dispatch(t, number);
     #[cfg(feature = "measure")]
     crate::obj::stretch_ends(crate::arch::timer::now());
+}
+
+/// The portions of cleanup of every kind (spec 7.7) have run in the tests
+/// before this one, and `cleanup::portion` stops the kernel at one that
+/// took `OBJ` more than once: so each kind 46 to 53 takes it at most once
+/// in the builds with the checks (the others leave this to xtask). The bits
+/// are the kinds `obj::CLEAN_*`.
+fn every_kind_of_cleanup_took_obj_at_most_once(_: &Boot) -> Result<(), &'static str> {
+    #[cfg(not(obj_checks))]
+    return Ok(());
+    #[cfg(obj_checks)]
+    every_kind_seen()
+}
+
+#[cfg(obj_checks)]
+fn every_kind_seen() -> Result<(), &'static str> {
+    use crate::obj::{
+        CLEAN_CHANNEL, CLEAN_FIRE, CLEAN_IRQ, CLEAN_MEMORY, CLEAN_PROCESS, CLEAN_SESSION,
+        CLEAN_THREAD, CLEAN_TIMER,
+    };
+    let seen = crate::obj::cleanups_seen();
+    for kind in [
+        CLEAN_THREAD,
+        CLEAN_CHANNEL,
+        CLEAN_SESSION,
+        CLEAN_TIMER,
+        CLEAN_IRQ,
+        CLEAN_FIRE,
+        CLEAN_MEMORY,
+        CLEAN_PROCESS,
+    ] {
+        check(
+            seen & 1 << kind != 0,
+            "a kind of cleanup ran in none of the tests before this one",
+        )?;
+    }
+    Ok(())
 }
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
@@ -2346,8 +2387,9 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
         process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (2, Some(level)),
         "a portion did not queue the next process at its own level",
     )?;
-    // Each process takes a handful of portions: a guard against a loop.
-    for _ in 0..16 * chain {
+    // Each process takes a handful of portions (the table of handles eight
+    // entries a portion, a chunk of 64 in eight): a guard against a loop.
+    for _ in 0..32 * chain {
         let before = process::in_use();
         cleanup::portion();
         check(
@@ -2373,7 +2415,7 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
 /// the process at its ceiling, where the stage Threads stops its ready and
 /// its stopped thread in one portion; with no request taken and no
 /// children, the stages Replies and Children take a portion each;
-/// the table half a chunk a portion; the space first loses TTBR0 and its ASID,
+/// the table an eighth of a chunk a portion; the space first loses TTBR0 and its ASID,
 /// and no call reaches its tables from then on, then a table a portion; the
 /// buffers of the threads the end stopped in one portion, the process's
 /// frames and the stage Quota in one more each. Then the shell stays for
@@ -2406,15 +2448,15 @@ fn teardown_resumes_where_it_stopped(boot: &Boot) -> Result<(), &'static str> {
 }
 
 /// Threads of `buffers_stage_counts_the_handles`.
-const CARRIERS: usize = 16;
+const CARRIERS: usize = 5;
 
 /// The stage Buffers counts the handles of the threads' requests as work
 /// (spec 7.7): CARRIERS threads of a process that never ran, each with a
 /// buffer and four handles on their way (Thread::transit), as a request
-/// that waited in a queue leaves them. Each of the first three portions of
-/// the stage gives 5 buffers back, whose units of six, a frame two and a
-/// handle one, fill 30 of its 32, where the six of the next do not fit, and
-/// the fourth the last one; the handles go with them, and their channel
+/// that waited in a queue leaves them. Each of the first four portions of
+/// the stage gives 1 buffer back, whose units of six, a frame two and a
+/// handle one, fill 6 of its 8, where the six of the next do not fit, and
+/// the fifth the last one; the handles go with them, and their channel
 /// then too.
 fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
@@ -2456,15 +2498,15 @@ fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
 /// Threads with a buffer and no handle on their way, one more than a
 /// portion of the stage Buffers takes: two units of work each.
 const BARE: usize = BUFFERS_PER_PORTION + 1;
-const BUFFERS_PER_PORTION: usize = 16;
+const BUFFERS_PER_PORTION: usize = 4;
 /// Threads in the middle of a long call, with a buffer and no handle on
 /// their way, one more than a portion of the stage Buffers takes: three
 /// units of work each, the frame two and the call one.
 const CALLERS: usize = CALLERS_PER_PORTION + 1;
-const CALLERS_PER_PORTION: usize = 10;
+const CALLERS_PER_PORTION: usize = 2;
 
 /// The first portion of the stage Buffers of BARE threads with no handles
-/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 32,
+/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 8,
 /// and the second the last one (spec 7.7).
 fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
     buffers_in_two_portions(level, BARE, BUFFERS_PER_PORTION, false)
@@ -2472,7 +2514,7 @@ fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
 
 /// The first portion of the stage Buffers of CALLERS threads, each in the
 /// middle of a mem_create, gives back CALLERS_PER_PORTION buffers, a frame
-/// two units of its 32 and the call one, and the second the last one; the
+/// two units of its 8 and the call one, and the second the last one; the
 /// objects the calls held go with them (spec 7.7).
 fn long_calls_take_a_unit_more(level: u8) -> Result<(), &'static str> {
     let objects = memory::in_use();
@@ -2618,17 +2660,18 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
         cleanup::portion();
     }
     let frames = phys::free_frames();
-    for portion in 1..=3 {
+    for portion in 1..CARRIERS as u64 {
         cleanup::portion();
         check(
-            process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 5 * portion,
-            "a portion of the stage Buffers did not stop at 5 buffers",
+            process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + portion,
+            "a portion of the stage Buffers did not stop at 1 buffer",
         )?;
     }
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 16,
-        "the fourth portion of the stage Buffers did not give the last one back",
+        process::progress(p).0 == Stage::Mappings
+            && phys::free_frames() == frames + CARRIERS as u64,
+        "the last portion of the stage Buffers did not give the last one back",
     )
 }
 
@@ -2699,10 +2742,10 @@ fn check_stages(
         process::progress(p) == (Stage::Handles, 3 * CHUNK as u32, 0),
         "the stage Children of a process with no child took more than a portion",
     )?;
-    // Two portions a chunk, the table's own count of 32 entries each.
-    const HALF: u32 = 32;
-    assert!(HALF as usize * 2 == CHUNK);
-    for left in (0..3 * 2).rev() {
+    // Eight portions a chunk, the table's own count of 8 entries each.
+    const EIGHTH: u32 = 8;
+    assert!(EIGHTH as usize * 8 == CHUNK);
+    for left in (0..3 * 8).rev() {
         cleanup::portion();
         let stage = if left > 0 {
             Stage::Handles
@@ -2710,8 +2753,8 @@ fn check_stages(
             Stage::Space
         };
         check(
-            process::progress(p) == (stage, left * HALF, 0) && cleanup::len() == 1,
-            "a portion of the stage Handles did not take half a chunk",
+            process::progress(p) == (stage, left * EIGHTH, 0) && cleanup::len() == 1,
+            "a portion of the stage Handles did not take an eighth of a chunk",
         )?;
     }
     cleanup::portion();
@@ -2944,12 +2987,12 @@ fn hasten_reaches_the_children(_: &Boot) -> Result<(), &'static str> {
 
 /// Threads of the process of `threads_cursor_skips_a_thread_that_left`:
 /// one more than a portion of the stage Threads takes.
-const CURSOR_THREADS: usize = 65;
+const CURSOR_THREADS: usize = 13;
 
 /// The cursor of the stage Threads moves past a thread that leaves the
 /// list (spec 7.7): a process at ceiling 20 with CURSOR_THREADS stopped
 /// threads ends at 12, and the first portion of its stage Threads, at 20,
-/// stops the 64 newest. The oldest, at the cursor, which only the test's
+/// stops the 12 newest. The oldest, at the cursor, which only the test's
 /// reference holds, goes then at 30, above the stage, and its portion takes
 /// it out of the list before the next portion of the stage; that portion
 /// finds the cursor past the end, and the stage is over. A cursor left on
@@ -2971,11 +3014,11 @@ fn threads_cursor_skips_a_thread_that_left(_: &Boot) -> Result<(), &'static str>
         cleanup::portion();
         let oldest = made[0].take().expect("the oldest thread");
         // SAFETY: the test holds the thread; the stage stopped none but the
-        // 64 newest.
+        // 12 newest.
         let state = unsafe { oldest.as_ref() }.sched.state();
         check(
             state == State::Stopped && process::progress(p).0 == Stage::Threads,
-            "the first portion of the stage Threads stopped more than 64 threads",
+            "the first portion of the stage Threads stopped more than 12 threads",
         )?;
         // SAFETY: the test's reference goes, the last.
         unsafe { thread::release(oldest, 30) };

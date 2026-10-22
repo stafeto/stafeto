@@ -208,7 +208,7 @@ free blocks up to the highest order and costs about two releases of a
 handle: the Buffers stage gives back the buffers of 16 threads with no
 handles a chunk, and the Shell stage six pages; a thread goes into a chunk
 of the Buffers stage only when its units fit, so that a chunk does at
-most 32 units (64 until the cleanup of part E1-G1, below). The chunks
+most 8 units (32 until the OBJ step, part 2, 64 until the cleanup of part E1-G1, below). The chunks
 that give frames back are measured with each
 frame alone in its free block of 4 MiB, which it merges back up to. The
 Buffers chunk is measured with the threads whose units fill it with the
@@ -402,14 +402,14 @@ window that goes.
 | a chunk of the Notify stage (`process::clean`, `notify_exit`) | if the process has an exit channel, posts bit 0 into the slot in its shell as `notify` does: delivery to a waiting receiver, or enqueuing in the channel's queue, where the slot holds the shell; a closed channel gets nothing | constant: as `notify` |  |
 | a chunk of the Shell stage (`process::clean`) | `PageLog::release_step`: up to six pages of the process's pools and of its log are taken off the log and (in the test build) filled with poison outside any section, then go back to the allocator in one section of `OBJ`, each returned to the quota; the last chunk returns the shell's slot to the parent's pool, the slot in the exit channel's limit and the reference to that channel, and the rest of the quota to the parent (`Account::return_rest`), and releases the reference to the parent's shell (the last one enqueues it) | up to six frames, each through merging free blocks in `FRAMES` up to the highest order; in the test build, also writing 4096 bytes of poison per frame; the rest is constant | 11,388 (test build): six pages with poison (the hold of `OBJ` leaves the poison out); the former 32-page chunk took 58,634 |
 | the last channel handle with `RECEIVE` (`channel::release`: `handle_close`, the Handles stage) | marks the channel closed; if threads wait in it or slots stand in it, puts the channel at the tail of the cleanup queue at the higher of the level of the cause and the top level of its queue, with the queue's reference (the Close stage) | constant: checking the queue's mask and one enqueue |  |
-| a chunk of the Close stage (`channel::clean`) | heads of the top level of the channel's queue, 32 units of work (below), each under its own hold of the scheduler's lock: the threads waiting in `receive` or in `send`, each of which gets `PEER_CLOSED` in `x0`, goes to the tail of its level with a new quantum, and lets go of what its wait held, the channel or a copy of a session (the last copy posts `CLIENT_GONE`, which a closed channel refuses), and a sender of the handles of its request, up to 4, each released as `handle_close` does; or the slots, each emptied and letting go of its owner after the lock (a session with no copies goes on the cleanup queue); what the heads held goes at the level of the cause; with heads left, the channel goes to the head of the higher of the cause and their new top level, otherwise the queue's reference goes | 32 units of work: a head one, and each handle of a sender's request one more, no costlier than `notify`; up to 32 heads at O(1) each and 34 holds of the lock, or fewer heads with their handles, up to 36 units | 3,844 (test build): the first of the two chunks of a channel with 60 waiting receivers; 10,166 (test build): 8 senders with 32 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver; 5,581 when nobody waits, with the copies of the sessions the requests went through |
+| a chunk of the Close stage (`channel::clean`) | heads of the top level of the channel's queue, 8 units of work (below, in one section of `OBJ`; 32 units in a section for each head until the OBJ step, part 2): the threads waiting in `receive` or in `send`, each of which gets `PEER_CLOSED` in `x0`, goes to the tail of its level with a new quantum, and lets go of what its wait held, the channel or a copy of a session (the last copy posts `CLIENT_GONE`, which a closed channel refuses), and a sender of the handles of its request, up to 4, each released as `handle_close` does; or the slots, each emptied and letting go of its owner after the lock (a session with no copies goes on the cleanup queue); what the heads held goes at the level of the cause; with heads left, the channel goes to the head of the higher of the cause and their new top level, otherwise the queue's reference goes | 32 units of work: a head one, and each handle of a sender's request one more, no costlier than `notify`; up to 32 heads at O(1) each and 34 holds of the lock, or fewer heads with their handles, up to 36 units | 3,844 (test build): the first of the two chunks of a channel with 60 waiting receivers; 10,166 (test build): 8 senders with 32 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver; 5,581 when nobody waits, with the copies of the sessions the requests went through |
 | a chunk of the channel shell (`channel::clean`) | returns the channel's slot to the payer's pool of channels (nothing goes back to the quota) and releases the reference to the payer's shell | constant |  |
 | a thread-cleanup chunk (`thread::clean`) | unmaps the message-buffer page if it is still there, with the handles of a request the thread made, up to 4, released as `handle_close` does, and what a long call it was making held: the object of a `mem_create`, or, for a change of a mapping, the mapping keeps what the chunks did and the rest of the prepaid tables goes back (`process::abandon_change`); gives the number of a thread that never started back to the table of thread numbers (its count stays, and an entry at the end of its count retires), removes the thread from the process's list, returns the slot to the process's pool of threads (nothing goes back to the quota), and releases the reference to the process | constant: up to 4 handles, each no costlier than `notify` |  |
 | the kernel-exit loop (`sched::resume`) | on the empty kernel stack: polling `ISR_EL1.I`, acknowledging and handling an interrupt, a scheduling decision, then a thread, one cleanup chunk, or `wfi` | constant without a chunk; at most one chunk between two interrupt polls, and a chunk only starts with no interrupt pending, so the blocking time of any thread gains the longest chunk, of cleanup or of a long call (the kernel measures both and returns the longest in `x5` of the `KERNEL_STATS` kind from `object_info`) |  |
 | a scheduler decision (`sched::resume` and the events `sched::{start, exit, yield_running, set_priority, timer_fired}`) | `kcore::sched` operations: inserting at the head or tail of a level, removing from a ring, picking a level from the mask via `clz` with the cleanup queue's level at the top on entry, the timer deadline; `sched::exit` of a waiting thread first takes its slot off the channel's queue, or off the queue of accepted requests of the process that took its request and marks its entry of the table of thread numbers, gives the thread's number back, and lets go of what the wait held after the lock (the last copy of a session posts `CLIENT_GONE` as `notify` does); `set_priority` of a waiting thread moves its slot within that queue, and after the lock raises a channel at its Close stage or a process at its Replies stage to its new top waiter (`cleanup::raise`) | constant, independent of the number of threads; `sched::exit` with the last reference to a thread or to a channel puts it on the cleanup queue |  |
 | a timer write (`Armed::set`, `sched::timer_fired`) | `CNTV_CVAL_EL0` and `CNTV_CTL_EL0`, then `isb`, only when the needed deadline changed: the nearer of the end of the running round-robin thread's quantum and the nearest deadline of the levels of timers whose firing is not queued, which `sched::decide` reads in O(1) before it takes the scheduler's lock; returning to the same thread leaves the timer untouched; a timer interrupt disarms it until EOI | constant: three system-register writes and two `isb`s per deadline |  |
 | the timers' part of the timer interrupt (`timer::expire` in `sched::timer_fired`, before the EOI) | walks the levels that have timers and whose firing is not queued, marks those whose top expired as queued and finds the nearest deadline of the rest in the same walk, and puts the item of each expired level at the tail of its level of the cleanup queue; no timer leaves its heap | constant: a walk of up to 63 levels and 63 enqueues | 4,323 (test build): all 63 levels expired |
-| a chunk of firings (`timer::fire`) | reads the counter once; up to 16 timers of the item's level that expired by then leave its heap, the earliest first, each under its own hold of the lock of the timers; each that is not dying posts bit 0 into its slot at that level, as `notify` does: the top waiting receiver gets it, or the slot goes into the channel's queue and holds its timer; a dying timer posts nothing; with expired timers left the item goes back to the head of its level, otherwise the level settles and the nearest deadline is walked again; the chunk's time goes into `x8` of `KERNEL_STATS` | 16 steps of O(log n), 16 posts of O(1) and a walk of 63 levels | 13,276 (test build): 16 timers off a heap of 8,130, each waking a receiver of its own channel |
+| a chunk of firings (`timer::fire`) | reads the counter once; up to 8 timers of the item's level that expired by then leave its heap, the earliest first, outside any section (16 until the OBJ step, part 2); one section of `OBJ` then posts for them all: each that is not dying posts bit 0 into its slot at that level, as `notify` does: the top waiting receiver gets it, or the slot goes into the channel's queue and holds its timer; a dying timer posts nothing; with expired timers left the item goes back to the head of its level, otherwise the level settles and the nearest deadline is walked again; the chunk's time goes into `x8` of `KERNEL_STATS` | 16 steps of O(log n), 16 posts of O(1) and a walk of 63 levels | 13,276 (test build): 16 timers off a heap of 8,130, each waking a receiver of its own channel |
 | process termination (`process::end`: `process_kill`, `process_exit`, the last running thread exiting, a fault at EL0) | records the reason, after which `thread_start`, `thread_create` and `mem_map` of the process give `BAD_STATE`; removes the running thread from the scheduler when it is one of the process's (the kernel reference goes, and the thread may land on the cleanup queue); then puts the process at the tail of the cleanup queue with the queue's reference: at level S if it has threads (the Threads stage) or children (the Stop stage), otherwise at the level of the Replies stage, the higher of R and the top client of the requests its threads accepted; R is at least the cause and the priority of the exit notification (`x4` of `process_create`) | constant: one thread and one enqueue; the other threads, up to 128 (`abi::MAX_THREADS`), and the descendants go with the teardown stages; `process_kill` of a terminated process calls `process::hasten` instead | 335 (test build, `end_call`): a process with 128 threads, the running one, whose kernel reference is its last, and 127 waiting in `send` (174 with none running); 42,539 before stage 3, when the call stopped every thread |
 | `process_kill` (`syscall::process_kill`) | checks the level (0-63), the handle, and a level of 1-63 against the caller's effective priority; then process termination (the row above) with the level as its cause, or the caller's effective priority for level 0, so R = max(level, the exit notification's priority); below the caller's priority the call returns once the part in the call is done, and the teardown runs at R after it, except its Threads and Stop stages, which run at S, the higher of the victim's ceiling and R: when the victim's ceiling is above the caller, the caller waits for them (at most 4 Threads chunks and one Stop chunk for each child, on levels where the victim could run anyway) | constant: one comparison besides process termination | 427 (test build, `process kill ticks`): a child with a running thread killed at level 1 from a caller at 10, the part in the call; its teardown waits in the cleanup queue |
 | an SError at EL0 (`exceptions::system_error`) | counts the device windows among the running process's mappings, prints them and the program's registers, and stops the machine | up to 128 mappings, then the report; the machine does not go on |  |
@@ -482,7 +482,7 @@ process between (`maps::epoch`): 2 939; `process_create` gives the lock back
 between the child and its first entries: 2 957; the stage Space reads the
 entries of a table with no lock and takes it for each table that goes back,
 the continuation of a suspended process unparks its 64 threads in sections
-of 16. The longest hold is now 2 957 (`mem_unmap`); once in 65 535 switches
+of 16 (a portion of 32 threads in one section since the OBJ step, part 2). The longest hold is now 2 957 (`mem_unmap`); once in 65 535 switches
 of address space the new generation of ASIDs holds 13 417 up to stage 4, and
 2 387 from stage 5 (below). A channel's stage
 Close takes one section for each waiter it wakes.
@@ -535,14 +535,14 @@ passed a quiescent point (kernel/src/qsbr.rs).
 `process_control` (call 36, MANAGE) sets or clears the process flag in O(1).
 Every selected suspended thread parks before EL0, including fast `send`;
 the exit loop polls interrupts again after that single thread. A continuation
-uses the process's cleanup item and returns at most 64 parked threads to
+uses the process's cleanup item and returns at most 32 parked threads (64 until the OBJ step, part 2) to
 the tails of their current levels with fresh quanta. A new stop cancels the
 queued work, and process termination gives the same item to the Threads stage.
 The scheduler link holds the parked ring; priority changes and IPC inheritance
 change its level while it stays in that ring. No new object is allocated.
 
-The 128-thread measurement uses 64 threads per portion over all 63 legal
-levels, with one repeat. `kernel-test 512M icount` measures the scoped
+The 128-thread measurement uses 32 threads per portion; the portions
+together span all 63 legal levels, with one repeat. `kernel-test 512M icount` measures the scoped
 components below. The control scopes call `process::control` directly and
 exclude syscall validation, exception entry and EL0 return. The parking
 scope locks the scheduler, calls `pick` and then `park_selected`; the
@@ -926,3 +926,30 @@ deliberate break each must fail them: no reserved ASIDs, no deferred flush, no
 `aside1is` at the end of a process (HVF; TCG drops its TLB at every change of
 ASID and shows none of the three) and a `tlbi vale1` for an unmap (TCG; HVF
 broadcasts it).
+
+## Portions with one section of `OBJ` (OBJ step, part 2)
+
+A portion of cleanup, and each entry of `mem_create`, works on what no link
+reaches outside any section (the walk of its own list or table, the poison
+of a page, the zeroing of a frame, the heap of its own CPU) and takes `OBJ`
+once for the changes of links; a turn of the loop of the way out of the
+kernel takes it at most once, and the poll for an interrupt comes between
+two turns (spec 8.1). The sizes that follow from it:
+
+| portion | size | row (test build) |
+|---|---|---|
+| frames of a memory object, of a shell, of `mem_create` | 6 (`FRAMES_PER_SECTION`) | `release` 3,204; `shell` 11,388 with 6 poisoned pages; `create` 2,609 |
+| the stage Threads, with the check of the gate | 12 units | `threads_ready` 2,905 |
+| the stage Handles | 8 entries | `session_handles` 2,960 |
+| the stage Buffers | 8 units (a thread with no handle 2) | `buffers` 781, `session_buffers` 2,741 |
+| the stage Replies | 32 clients, the level of the next stage in the same section | |
+| the stages Space, Quota, Notify and the move to Shell | one section each | |
+| the stage Close of a channel | 8 units | |
+| firing of timers | 8 | `fire` 6,731 |
+| the continuation of a suspended process | 32 threads | |
+| freeing of retired objects (`qsbr::reclaim`) | 8 (`RECLAIM_BATCH`) | |
+
+`cargo xtask kernel-test 512M icount` fails a kind of section from 41 to 53
+(`obj takes of kind`) that takes `OBJ` more than once in a stretch or holds it
+more than 3,800 instructions; the test builds with the checks stop at a
+portion of cleanup that took it twice.

@@ -62,6 +62,8 @@ mod maps;
 mod table;
 mod teardown;
 
+#[cfg(feature = "ktest")]
+pub(crate) use control::UNPARK_PORTION;
 pub(crate) use control::unlist as unlist_parked;
 pub use control::{control, gated_thread, park_if_suspended, park_selected};
 #[cfg(feature = "icount")]

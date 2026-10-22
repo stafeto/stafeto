@@ -1006,7 +1006,7 @@ const SUSPENSION_ROWS: [&str; 6] = [
     "control_stop_cancel",
     "pick_park_selected",
     "control_continue",
-    "resume_64",
+    "resume_portion",
     "longest_portion",
 ];
 /// The rows of the line of the test init's `normal_build_costs`, in its
@@ -4975,6 +4975,12 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// on the portion of 64 threads (13 254 measured). Task 2.2 makes the portion
 /// one take and sets the guard anew.
 ///
+/// `THREADS_READY_MAX` 13 254 -> 2 909 (OBJ step, part 2, task 2.2): the
+/// portion of the stage Threads is 12 units (it was 56) and takes `OBJ`
+/// once, with the check of the gate; the row measures that portion of 64
+/// ready threads, 2 905 instructions, and the guard keeps the 4 of rule 4
+/// above it.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5022,7 +5028,7 @@ const B4_TAKES_ENFORCED: bool = false;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_254;
+const THREADS_READY_MAX: u64 = 2_909;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -9013,6 +9019,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             measured.push((what, rows, ticks));
         }
         check_obj_hold(m.name, &lines)?;
+        check_cleanup_sections(m.name, &lines)?;
         let (margin, to_term) = b_margin(m.name, &measured, &lines)?;
         println!(
             "B margin on {}: {margin} of {KERNEL_B_MAX}, {to_term} of TERM_B {TERM_B}",
@@ -9091,6 +9098,87 @@ fn obj_kind_name(kind: usize) -> String {
         _ => ENTRIES
             .get(kind - 40)
             .map_or_else(|| format!("kind {kind}"), |n| (*n).to_owned()),
+    }
+}
+
+/// The kinds of section of the entries other than a call and of the
+/// cleanup (kernel/src/obj.rs, 41 to 53): each of their stretches between
+/// two polls takes OBJ once (`CLEANUP_TAKES_MAX`) and holds it for at most
+/// `CLEANUP_HOLD_MAX`.
+const CLEANUP_KINDS: std::ops::RangeInclusive<usize> = 41..=53;
+/// The most takes of OBJ in a stretch of a kind of `CLEANUP_KINDS`: the
+/// portions of cleanup are "outside, one section, outside" (spec 8.1).
+const CLEANUP_TAKES_MAX: u64 = 1;
+/// The longest hold of OBJ of a kind of `CLEANUP_KINDS`, in instructions: a
+/// portion's section is sized to 3 500 in the worst case the tests build
+/// (spec 15.3), and the rest is room for the compiler.
+const CLEANUP_HOLD_MAX: u64 = 3_800;
+
+/// The kinds 41 to 53 of the lines `obj takes of kind: K k=N ticks=T` and
+/// `obj hold kind ticks: K=N` over both images: fails a kind whose stretch
+/// takes OBJ more than `CLEANUP_TAKES_MAX` times, or holds it longer than
+/// `CLEANUP_HOLD_MAX`, and names the kind.
+fn check_cleanup_sections(name: &str, lines: &[String]) -> Result<(), String> {
+    let mut takes = [0u64; 64];
+    let mut holds = [0u64; 64];
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("obj takes of kind: ") {
+            let mut fields = rest.split_whitespace();
+            let kind = fields.next().and_then(|k| k.parse::<usize>().ok());
+            let k = fields
+                .next()
+                .and_then(|k| k.strip_prefix("k="))
+                .and_then(|k| k.parse::<u64>().ok());
+            let (Some(kind), Some(k)) = (kind, k) else {
+                return Err(format!("the kernel printed {line:?} for OBJ"));
+            };
+            if kind < takes.len() {
+                takes[kind] = takes[kind].max(k);
+            }
+        } else if let Some(rest) = line.strip_prefix("obj hold kind ticks: ") {
+            let parsed = rest.split_once('=').and_then(|(k, n)| {
+                Some((
+                    k.trim().parse::<usize>().ok()?,
+                    n.trim().parse::<u64>().ok()?,
+                ))
+            });
+            let Some((kind, n)) = parsed else {
+                return Err(format!("the kernel printed {line:?} for OBJ"));
+            };
+            if kind < holds.len() {
+                holds[kind] = holds[kind].max(n);
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    for kind in CLEANUP_KINDS {
+        if takes[kind] > CLEANUP_TAKES_MAX {
+            problems.push(format!(
+                "{} (kind {kind}) takes OBJ {} times in a stretch, {CLEANUP_TAKES_MAX} allowed",
+                obj_kind_name(kind),
+                takes[kind]
+            ));
+        }
+        if holds[kind] > CLEANUP_HOLD_MAX {
+            problems.push(format!(
+                "{} (kind {kind}) holds OBJ for {}, {CLEANUP_HOLD_MAX} allowed",
+                obj_kind_name(kind),
+                holds[kind]
+            ));
+        }
+    }
+    let most = CLEANUP_KINDS.map(|kind| holds[kind]).max().unwrap_or(0);
+    let k = CLEANUP_KINDS.map(|kind| takes[kind]).max().unwrap_or(0);
+    println!(
+        "OBJ in the cleanup on {name}: kinds 41-53 take it {k} times at most (of {CLEANUP_TAKES_MAX}) and hold it {most} at most (of {CLEANUP_HOLD_MAX})"
+    );
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "OBJ in the cleanup on {name}: {}",
+            problems.join("; ")
+        ))
     }
 }
 
@@ -11744,7 +11832,7 @@ mod tests {
         let log = |n: u64| {
             vec![format!(
                 "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
-                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+                 pick_park_selected=80 control_continue=94 resume_portion=3731 longest_portion={n}"
             )]
         };
         let margin = |n| {
@@ -11771,7 +11859,7 @@ mod tests {
         let rows = |n: u64| {
             let log = vec![format!(
                 "suspension scopes ticks: control_stop_no_queue=33 control_stop_cancel=99 \
-                 pick_park_selected=80 control_continue=94 resume_64=3731 longest_portion={n}"
+                 pick_park_selected=80 control_continue=94 resume_portion=3731 longest_portion={n}"
             )];
             ticks_of(&log, "suspension scopes", &SUSPENSION_ROWS).unwrap()
         };
@@ -11796,6 +11884,37 @@ mod tests {
         }
         assert!(margin(&[]).unwrap_err().contains("no obj takes"));
         assert_eq!(b_n(4, 7, &[(0, 9), (3, 1)]), (1 + 9 * OBJ_HOLD_MAX, 3, 1));
+    }
+
+    /// A stretch of the cleanup (kinds 41 to 53) that takes OBJ twice, or a
+    /// section of one that holds it past CLEANUP_HOLD_MAX, fails and names
+    /// the kind; the calls (below 40) are not its business.
+    #[test]
+    fn a_portion_of_cleanup_takes_obj_once_and_holds_it_briefly() {
+        let check = |lines: &[&str]| {
+            let lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+            check_cleanup_sections("t", &lines)
+        };
+        assert!(
+            check(&[
+                "obj takes of kind: 53 k=1 ticks=12138",
+                "obj takes of kind: 9 k=3 ticks=7936",
+                "obj hold kind ticks: 53=3800",
+                "obj hold kind ticks: 9=3900",
+            ])
+            .is_ok()
+        );
+        let err = check(&["obj takes of kind: 53 k=2 ticks=6232"]).unwrap_err();
+        assert!(
+            err.contains("teardown stage") && err.contains("kind 53"),
+            "{err}"
+        );
+        let err = check(&["obj hold kind ticks: 52=3801"]).unwrap_err();
+        assert!(
+            err.contains("clean memory") && err.contains("3801"),
+            "{err}"
+        );
+        assert!(check(&["obj takes of kind: x k=1 ticks=1"]).is_err());
     }
 
     #[test]

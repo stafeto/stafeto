@@ -21,12 +21,10 @@ const SHELL_PORTION: usize = kcore::pagelist::FRAMES_PER_SECTION;
 /// The work a portion of the stage Threads does, at most (spec 7.7): a
 /// thread that waits in send, in receive or for a reply leaves its queue
 /// and lets go what its wait held, WAIT_UNITS units of work; any other
-/// thread leaves the scheduler in one unit. 32 senders or 64 ready threads
-/// take one portion.
-const THREADS_PORTION: usize = 56;
-
-/// Units of a chunk of the stage Threads that share a section under OBJ.
-const SECTION_UNITS: usize = 8;
+/// thread leaves the scheduler in one unit. 6 senders or 12 ready threads
+/// take one portion, which is one section under OBJ with the check of the
+/// gate.
+const THREADS_PORTION: usize = 12;
 
 /// The units of work of a thread that waits in IPC (channel::cancel).
 const WAIT_UNITS: usize = 2;
@@ -38,9 +36,9 @@ const REPLIES_PORTION: usize = 32;
 /// The work a portion of the stage Buffers does, at most (spec 7.7): the
 /// buffer of each thread is FRAME_UNITS units, and each handle of a request
 /// it made and the long call it was making one more (thread::held); a
-/// thread goes into the portion only when its units fit. The buffers of 16
-/// threads with no handles take one portion.
-const BUFFERS_PORTION: usize = 32;
+/// thread goes into the portion only when its units fit. The buffers of 4
+/// threads with no handles take one portion, one section under OBJ.
+const BUFFERS_PORTION: usize = 8;
 /// A thread goes into a portion only when its units fit, so the heaviest
 /// thread (its frame, the handles of its request and its long call) has to
 /// fit alone, or the stage would never end (the long call is one unit more,
@@ -48,9 +46,9 @@ const BUFFERS_PORTION: usize = 32;
 const _: () = assert!(FRAME_UNITS + abi::MESSAGE_HANDLES < BUFFERS_PORTION);
 
 /// Handle table entries a portion of the stage Handles releases, at most
-/// (spec 7.7): half a chunk, each last copy of a session telling its
-/// receiver the client is gone.
-const HANDLES_PORTION: usize = kcore::handles::CHUNK / 2;
+/// (spec 7.7): an eighth of a chunk, in one section under OBJ, each last
+/// copy of a session telling its receiver the client is gone.
+const HANDLES_PORTION: usize = 8;
 const _: () = assert!(kcore::handles::CHUNK.is_multiple_of(HANDLES_PORTION));
 
 /// The units of work of a frame that goes back to the frame allocator
@@ -108,7 +106,7 @@ pub enum Stage {
     /// list at its own stage Quota. Descendants go depth first, and the
     /// kernel stack does not grow with the depth of the tree (spec 4).
     Children,
-    /// Half a chunk of the handle table a portion, up to HANDLES_PORTION
+    /// An eighth of a chunk of the handle table a portion, up to HANDLES_PORTION
     /// handles, each releasing its object; the chunk directory with the
     /// last part of the last chunk (HandleTable::release_step).
     Handles,
@@ -277,23 +275,6 @@ pub(super) unsafe fn stage_level(process: NonNull<Process>) -> u8 {
     }
 }
 
-/// `stage_level` for a portion that holds no section: the stage Replies
-/// takes one for the look at its queue.
-///
-/// # Safety
-/// As for `stage_level`.
-unsafe fn stage_level_outside(process: NonNull<Process>) -> u8 {
-    // SAFETY: the caller's promise.
-    unsafe {
-        if (*process.as_ptr()).stage == Stage::Replies {
-            let _section = crate::obj::lock();
-            stage_level(process)
-        } else {
-            stage_level(process)
-        }
-    }
-}
-
 /// thread_set_priority moved a client in the queue of accepted requests of
 /// `process` (channel::raise): at the stage Replies the process goes up in
 /// the cleanup queue to the level of its top client when that is higher
@@ -358,61 +339,76 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     let p = process.as_ptr();
     // SAFETY: the caller's promise; only the fields are read.
     let (stage, r) = unsafe { ((*p).stage, (*p).level) };
+    // What a stage takes from what no link reaches, before its section: the
+    // entries of the handle table, the table of the space that went, and the
+    // pages of the shell's log with their poison.
+    let mut handles = [None; HANDLES_PORTION];
+    let mut table = None;
+    let mut pages_back = [None; SHELL_PORTION];
+    let mut handles_left = false;
+    let mut pages_left = false;
+    // SAFETY: the process is alive and on its stages, and nothing else
+    // reaches these fields while its portion runs.
+    unsafe {
+        match stage {
+            Stage::Whole => {
+                // The continuation owns the item and its reference.
+                control::portion(process, level);
+                return;
+            }
+            Stage::Handles => handles_left = !collect_handles(process, &mut handles),
+            Stage::Space => table = collect_table(p),
+            Stage::Shell => pages_left = !collect_pages(p, &mut pages_back),
+            Stage::Quota => crate::testpoint::quota_stage((*p).children.is_some()),
+            #[cfg(feature = "window-probe")]
+            Stage::Threads => crate::cmd::window::hold_until_replied((*p).threads_next),
+            _ => {}
+        }
+    }
+    // The one section of the portion: the step, the move to the next stage
+    // and the queue (the level of the next stage is read here too).
+    let section = crate::obj::lock();
     // The child that goes in front of the process at the stage Children.
     let mut first = None;
-    let done = match stage {
-        Stage::Whole => {
-            // SAFETY: the continuation owns the item and its reference.
-            unsafe { control::portion(process, level) };
-            return;
-        }
-        // SAFETY: the process is alive, and so are the threads in its list.
-        Stage::Threads => unsafe { stop_threads(process, r) },
-        // SAFETY: the process is alive, and its children in the list too.
-        Stage::Stop => unsafe { stop_child(process, r) },
-        // SAFETY: the process is alive; its clients wait.
-        Stage::Replies => unsafe { wake_clients(process, level) },
-        Stage::Children => {
-            // SAFETY: the process is alive; only the field is read.
-            first = unsafe { (*p).children };
-            first.is_none()
-        }
-        // SAFETY: the process is alive, and the step borrows only the
-        // field it works on.
-        Stage::Handles => unsafe { release_handles(process, r) },
-        // SAFETY: as above.
-        Stage::Space => unsafe { release_space(p) },
-        // SAFETY: as above.
-        Stage::Buffers => unsafe { release_buffers(process, r) },
-        // SAFETY: as above.
-        Stage::Mappings => unsafe { super::maps::release_all(process, r) },
-        // SAFETY: as above.
-        Stage::Quota => unsafe { leave_parent(process) },
-        // SAFETY: as above; the queue's reference keeps the shell.
-        Stage::Notify => {
-            let _section = crate::obj::lock();
-            // SAFETY: as the stages above.
-            unsafe { notify_exit(process, r) }
-        }
-        Stage::Shell => {
-            // SAFETY: nothing refers to the shell, so nothing lives in its
-            // pools; the shell stays in place until its last portion.
-            unsafe {
-                // The pages are collected, and scrubbed in a test build,
-                // outside the section, which takes OBJ once: it gives them
-                // back and, with the last, ends the shell.
-                let mut batch = [None; SHELL_PORTION];
-                let done = collect_pages(p, &mut batch);
-                let _section = crate::obj::lock();
-                give_back_pages(p, &batch);
-                if done {
+    let mut heads = None;
+    // SAFETY: the process is alive; the stage functions' own promises are
+    // those of the caller.
+    let done = unsafe {
+        match stage {
+            Stage::Whole => unreachable!("handled above"),
+            Stage::Threads => stop_threads(process, r),
+            Stage::Stop => stop_child(process, r),
+            Stage::Replies => {
+                let (done, n) = wake_clients(process);
+                heads = Some(n);
+                done
+            }
+            Stage::Children => {
+                first = (*p).children;
+                first.is_none()
+            }
+            Stage::Handles => {
+                release_handles(&handles, r);
+                !handles_left
+            }
+            Stage::Space => release_space(p, table),
+            Stage::Buffers => release_buffers(process, r),
+            Stage::Mappings => super::maps::release_all(process, r),
+            Stage::Quota => leave_parent(process),
+            Stage::Notify => notify_exit(process, r),
+            Stage::Shell => {
+                // Nothing refers to the shell, so nothing lives in its
+                // pools; it stays in place until its last portion.
+                give_back_pages(p, &pages_back);
+                if !pages_left {
                     free(process, level);
                 } else {
                     let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
                     cleanup::requeue(item, Object::Process(process), level);
                 }
+                drop(section);
+                return;
             }
-            return;
         }
     };
     let next = match (done, stage) {
@@ -427,15 +423,27 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     unsafe {
         (*p).stage = next;
         if next == Stage::Shell {
-            let _section = crate::obj::lock();
             release(process, r);
         } else {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-            cleanup::requeue(item, Object::Process(process), stage_level_outside(process));
+            cleanup::requeue(item, Object::Process(process), stage_level(process));
         }
-        if let Some(child) = first {
-            wait_for_child(child, r);
-        }
+    }
+    drop(section);
+    // After the section: what the tests see of the portion, and the
+    // child's turn in front of the parent (queue operations only).
+    if let Some(n) = heads.filter(|&n| n > 0) {
+        crate::testpoint::heads_taken(level, n);
+    }
+    #[cfg(feature = "window-probe")]
+    if stage == Stage::Threads && done {
+        // The threads are gone and the stage is not Replies yet: the
+        // clients of the process stay in their wait for a while.
+        crate::cmd::window::hold_replies();
+    }
+    if let Some(child) = first {
+        // SAFETY: the child is in its parent's list, so it is alive.
+        unsafe { wait_for_child(child, r) };
     }
 }
 
@@ -445,38 +453,26 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
 /// waits in IPC, which also leaves its queue and lets go what its wait
 /// held, one for any other, THREADS_PORTION units a portion; a thread goes
 /// into the portion only when its units fit. True once the cursor is past
-/// the last thread.
+/// the last thread. Runs inside the caller's section, the check of the gate
+/// and the threads in one.
 ///
 /// # Safety
 /// `process` is alive and at its stage Threads.
 unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
+    crate::obj::assert_held();
     let p = process.as_ptr();
     let mut work = 0;
-    let mut work_in_section = 0;
-    let mut section = None;
-    {
-        // Nothing leaves the scheduler while a thread of the process may
-        // still run at EL0 on another CPU (control::mark_ending).
-        let _section = crate::obj::lock();
-        // SAFETY: the caller's promise.
-        if unsafe { !super::control::gate_seen(process) } {
-            return false;
-        }
+    // Nothing leaves the scheduler while a thread of the process may
+    // still run at EL0 on another CPU (control::mark_ending).
+    // SAFETY: the caller's promise.
+    if unsafe { !super::control::gate_seen(process) } {
+        return false;
     }
-    #[cfg(feature = "window-probe")]
-    // SAFETY: the caller's promise; no section is held here.
-    unsafe {
-        crate::cmd::window::hold_until_replied((*p).threads_next)
-    };
     // SAFETY: the caller's promise; a thread in the list is alive, since a
     // release only queues it, and its portion takes it out of the list
     // first.
     unsafe {
         while let Some(t) = (*p).threads_next {
-            // A section for every few threads: the lock is no cost to each.
-            if work_in_section == 0 {
-                section.replace(crate::obj::lock());
-            }
             let units = if thread::waits(t) { WAIT_UNITS } else { 1 };
             if work + units > THREADS_PORTION {
                 break;
@@ -484,21 +480,8 @@ unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
             work += units;
             (*p).threads_next = (*t.as_ptr()).siblings.and_then(|s| s.next);
             sched::exit(t, level);
-            work_in_section += units;
-            if work_in_section >= SECTION_UNITS {
-                work_in_section = 0;
-                section.take();
-            }
         }
-        let done = (*p).threads_next.is_none();
-        #[cfg(feature = "window-probe")]
-        if done {
-            // The threads are gone and the stage is not Replies yet: the
-            // clients of the process stay in their wait for a while.
-            section.take();
-            crate::cmd::window::hold_replies();
-        }
-        done
+        (*p).threads_next.is_none()
     }
 }
 
@@ -506,17 +489,18 @@ unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
 /// it lives (`end`), and the cursor moves on. A child that ended before
 /// is on its own stages already and stops its own descendants. True once
 /// the cursor is past the last child. The child is used through `end`
-/// first, whose check stops test builds on a shell that went.
+/// first, whose check stops test builds on a shell that went. Runs inside
+/// the caller's section.
 ///
 /// # Safety
 /// `process` is alive and at its stage Stop.
 unsafe fn stop_child(process: NonNull<Process>, level: u8) -> bool {
+    crate::obj::assert_held();
     let p = process.as_ptr();
     // SAFETY: the caller's promise; the child at the cursor is in the
     // list, so it is alive as an object.
     unsafe {
         if let Some(child) = (*p).stop_next {
-            let _section = crate::obj::lock();
             end(child, ProcessState::Killed, level);
             (*p).stop_next = child_links(child).next;
         }
@@ -524,16 +508,16 @@ unsafe fn stop_child(process: NonNull<Process>, level: u8) -> bool {
     }
 }
 
-/// The stage Replies, taken at `level`: up to REPLIES_PORTION clients at
-/// the top level of the queue of accepted requests of `process` leave it,
-/// each woken with PEER_CLOSED in x0 alone at the tail of its level with a
-/// new quantum (spec 6.8), under one hold of OBJ. True
-/// once the queue is empty; a process that took no request passes at once.
+/// The stage Replies: up to REPLIES_PORTION clients at the top level of the
+/// queue of accepted requests of `process` leave it, each woken with
+/// PEER_CLOSED in x0 alone at the tail of its level with a new quantum (spec
+/// 6.8), inside the caller's section. True once the queue is empty; a
+/// process that took no request passes at once. Also how many clients woke.
 ///
 /// # Safety
 /// `process` is alive and at its stage Replies.
-unsafe fn wake_clients(process: NonNull<Process>, level: u8) -> bool {
-    let section = crate::obj::lock();
+unsafe fn wake_clients(process: NonNull<Process>) -> (bool, usize) {
+    crate::obj::assert_held();
     let taken = sched::locked(|k| {
         // SAFETY: the caller's promise; a client in the queue is alive.
         unsafe {
@@ -554,12 +538,10 @@ unsafe fn wake_clients(process: NonNull<Process>, level: u8) -> bool {
             Some((heads, !accepted(process, k.s).is_empty()))
         }
     });
-    drop(section);
-    let Some((heads, left)) = taken else {
-        return true;
-    };
-    crate::testpoint::heads_taken(level, heads);
-    !left
+    match taken {
+        None => (true, 0),
+        Some((heads, left)) => (!left, heads),
+    }
 }
 
 /// The stage Children, after the parent went back to the head of its level
@@ -580,21 +562,49 @@ unsafe fn wait_for_child(child: NonNull<Process>, level: u8) {
     unsafe { hasten(child, level) };
 }
 
-/// The stage Handles: one step of the table's release, HANDLES_PORTION
-/// entries, each handle's object released at `level`. True once the table
-/// holds nothing.
+/// The stage Handles, before its section: one step of the table's release,
+/// HANDLES_PORTION entries taken out of the table into `batch`, with the
+/// rights of their handles. True once the table holds nothing.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
-unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
-    // SAFETY: releasing its objects reaches no other field but `refs`,
-    // through raw pointers, since a release only counts and queues.
+unsafe fn collect_handles(
+    process: NonNull<Process>,
+    batch: &mut [Option<(Object, abi::Rights)>; HANDLES_PORTION],
+) -> bool {
+    // SAFETY: the table is the process's own, and nothing reaches it while
+    // its portion runs.
     let (handles, mut chunks) = unsafe { table(process) };
+    let mut n = 0;
     handles.release_step(&mut chunks, HANDLES_PORTION, |object, rights| {
-        let _section = crate::obj::lock();
-        // SAFETY: the table let the handle go, and its reference with it.
-        unsafe { object::release(object, rights, level) }
+        batch[n] = Some((object, rights));
+        n += 1;
     })
+}
+
+/// The stage Handles, in the caller's section: each handle of the step
+/// (`collect_handles`) lets its object go at `level`.
+///
+/// # Safety
+/// The entries left the table with their handles, and their references
+/// with them.
+unsafe fn release_handles(batch: &[Option<(Object, abi::Rights)>; HANDLES_PORTION], level: u8) {
+    crate::obj::assert_held();
+    for &(object, rights) in batch.iter().flatten() {
+        // SAFETY: the caller's promise.
+        unsafe { object::release(object, rights, level) }
+    }
+}
+
+/// The stage Space, before its section: the step of the retired space reads
+/// the entries of its tables, and notes the table it frees, for
+/// `release_space`. None for the first portion, which retires the space.
+///
+/// # Safety
+/// `p` is alive and on its stages.
+unsafe fn collect_table(p: *mut Process) -> Option<u64> {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    unsafe { (*p).retired.as_mut() }.and_then(|release| release.collect())
 }
 
 /// The stage Space: the first portion takes the space off this CPU's
@@ -603,11 +613,13 @@ unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
 /// tables (qsbr::quiesce, aspace::leave): no walk of a CPU that kept the
 /// tables in TTBR0 may bring an entry back under a number that is issued
 /// again. The portions in between give nothing back and requeue; each later
-/// one then gives a table back. True once the root went.
+/// one then gives the table `collect_table` named back. True once the root
+/// went. Runs inside the caller's section.
 ///
 /// # Safety
 /// `p` is alive and on its stages.
-unsafe fn release_space(p: *mut Process) -> bool {
+unsafe fn release_space(p: *mut Process, table: Option<u64>) -> bool {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; only the fields are borrowed.
     let (space, retired, quota) = unsafe { (&mut (*p).space, &mut (*p).retired, &mut (*p).quota) };
     let Some(release) = retired.as_mut() else {
@@ -616,7 +628,6 @@ unsafe fn release_space(p: *mut Process) -> bool {
         // With this CPU the only one up, the TTBR0 it just left is the only
         // one that held the tables: no period to wait for.
         if cfg!(feature = "break-asid-retire") || crate::smp::cpus() == 1 {
-            let _section = crate::obj::lock();
             release.drop_asid();
         } else {
             // SAFETY: the node is in this process, which stays alive until
@@ -625,7 +636,8 @@ unsafe fn release_space(p: *mut Process) -> bool {
         }
         return false;
     };
-    let spent = release.step(quota);
+    release.free(table, quota);
+    let spent = release.is_spent();
     if spent {
         *retired = None;
     }
@@ -657,11 +669,12 @@ unsafe fn reclaim_asid(d: NonNull<crate::qsbr::Deferred>) {
 /// calls held, released at `level` (R, thread::drop_buffer), and the
 /// threads leave the list, BUFFERS_PORTION units of work a portion. The
 /// ASID went at the stage Space, so the frames go back without unmapping.
-/// True once the list is empty.
+/// True once the list is empty. Runs inside the caller's section.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
 unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
+    crate::obj::assert_held();
     let mut work = 0;
     // SAFETY: the caller's promise; the threads of the list are alive,
     // since each is either held or queued for cleanup behind this portion,
@@ -673,7 +686,6 @@ unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
                 break;
             }
             work += units;
-            let _section = crate::obj::lock();
             thread::drop_buffer(t, level);
             remove_thread(process, t);
         }
@@ -689,12 +701,11 @@ unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
 /// # Safety
 /// `process` is alive and on its stages.
 unsafe fn leave_parent(process: NonNull<Process>) -> bool {
+    crate::obj::assert_held();
     let p = process.as_ptr();
     // SAFETY: the caller's promise; the parent's object is there, since the
     // process holds its shell, and so are the neighbours in its list.
     unsafe {
-        crate::testpoint::quota_stage((*p).children.is_some());
-        let _section = crate::obj::lock();
         let free = (*p).quota.return_free();
         let Some(parent) = (*p).parent else {
             return true;
@@ -724,11 +735,12 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
 /// `level` (R), unless there is none (spec 7.9); a channel that closed
 /// gets nothing (channel::post), and the notification is lost with it, as
 /// a notification to a parent that ends with its channel. True: one
-/// portion.
+/// portion. Runs inside the caller's section.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
 unsafe fn notify_exit(process: NonNull<Process>, level: u8) -> bool {
+    crate::obj::assert_held();
     // SAFETY: the caller's promise; the slot lives as long as the shell,
     // which the channel's queue holds while the slot stands there.
     unsafe {

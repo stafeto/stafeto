@@ -369,6 +369,24 @@ pub fn takes() -> u16 {
     OBJ.tickets()
 }
 
+/// The kinds of cleanup (`CLEAN_*`) whose portions ran in this image, one
+/// bit each: every portion of them took `OBJ` at most once, or the kernel
+/// stopped (`cleanup::portion`).
+#[cfg(all(feature = "ktest", obj_checks))]
+static CLEANUP_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// A portion of cleanup of `kind` ran and took `OBJ` at most once.
+#[cfg(all(feature = "ktest", obj_checks))]
+pub fn cleanup_seen(kind: u64) {
+    CLEANUP_SEEN.fetch_or(1 << kind, Relaxed);
+}
+
+/// The bits of the kinds of cleanup whose portions ran (`cleanup_seen`).
+#[cfg(all(feature = "ktest", obj_checks))]
+pub fn cleanups_seen() -> usize {
+    CLEANUP_SEEN.load(Relaxed)
+}
+
 /// Whether this CPU is inside a section under `OBJ`.
 #[inline(always)]
 pub fn held() -> bool {
