@@ -25,7 +25,7 @@ You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` a
 - **Several CPUs.** Up to 4 CPUs are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.
 - **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,183 of 1,187 tests and the Open POSIX Test Suite 1,985 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
-- **Programs.** relibc is the C library. BusyBox 1.37 gives 94 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
+- **Programs.** relibc is the C library. BusyBox 1.37 and the ready-made utilities linked into it give 103 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
 - **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, and Apple Virtualization.framework.
 
 The details of each part and the known limits are in [docs/status.md](docs/status.md).
@@ -110,10 +110,13 @@ licences (THIRD-PARTY-NOTICES, which `tools/check-licenses.py` writes to
 
 The shell image also holds ready-made utilities, built from their own
 sources unchanged by `tools/build-ready-utils.py`: `getconf`, `join` and
-`pathchk` of sbase (MIT), `file` and `iconv` of toybox (0BSD) and `compress`
-of ncompress (public domain). Their licence texts and the exact sources
-travel in the image next to BusyBox's (`BUSYBOX-LICENSE`, `BUSYBOX-SOURCE`,
-`UTILITIES-LICENSE`).
+`pathchk` of sbase (MIT), `file` and `iconv` of toybox (0BSD), `compress`
+of ncompress (public domain), `csplit`, `gencat`, `m4` and `write` of
+chimerautils (BSD), `pr` of nbase (BSD), `pax` of paxmirabilis (BSD, MirOS)
+with the `fts` of musl-fts (BSD), `newgrp` of util-linux (GPL-2.0-or-later)
+and `tput` and `tabs` of ncurses (MIT). Their licence texts and the exact
+sources travel in the image next to BusyBox's (`BUSYBOX-LICENSE`,
+`BUSYBOX-SOURCE`, `UTILITIES-LICENSE`).
 
 | `tools/` | relibc, BusyBox, ncurses, nano and bash builds, the VZ runner, licence check |
 

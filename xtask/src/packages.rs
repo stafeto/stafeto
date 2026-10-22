@@ -231,9 +231,6 @@ fn validate(p: &Package, origin: &str) -> Result<(), String> {
     if !p.url.starts_with("https://") {
         return fail("url is not an https URL");
     }
-    if p.files.is_empty() {
-        return fail("the package installs no file");
-    }
     for (path, from) in &p.files {
         if !path.starts_with('/') || path.ends_with('/') {
             return fail(&format!("{path:?} is not an absolute path of a file"));
@@ -286,6 +283,18 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
         }
     }
     for p in packages {
+        // A package that installs nothing is the source of another one (the
+        // fts of pax): some package depends on it.
+        if p.files.is_empty()
+            && p.dirs.is_empty()
+            && p.program.is_none()
+            && !packages.iter().any(|q| q.depends.contains(&p.name))
+        {
+            return Err(format!(
+                "{}: the package installs no file and no package depends on it",
+                p.name
+            ));
+        }
         for dep in &p.depends {
             let Some(d) = packages.iter().find(|d| d.name == *dep) else {
                 return Err(format!(
@@ -492,10 +501,21 @@ files = [
     }
 
     #[test]
-    fn a_package_without_files_is_refused() {
+    fn a_package_without_files_needs_a_package_that_depends_on_it() {
         let mut p = good();
         p.files.clear();
-        assert!(validate(&p, "x").unwrap_err().contains("no file"));
+        p.program = None;
+        assert!(
+            validate_set(std::slice::from_ref(&p), None)
+                .unwrap_err()
+                .contains("installs no file")
+        );
+        let mut user = good();
+        user.name = "user".into();
+        user.depends = vec![p.name.clone()];
+        user.program = None;
+        user.files = vec![("/bin/user".to_owned(), "link:demo".to_owned())];
+        assert!(validate_set(&[p, user], None).is_ok());
     }
 
     #[test]

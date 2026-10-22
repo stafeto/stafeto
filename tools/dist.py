@@ -12,6 +12,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import lzma
 import re
 import shutil
 import subprocess
@@ -45,8 +46,10 @@ def matches(path: Path, expected: str) -> bool:
     their descriptions pin the tar inside (tools/build-ready-utils.py)."""
     if sha256_file(path) == expected:
         return True
-    if path.name.removesuffix(".part").endswith(".gz"):
-        with gzip.open(path) as file:
+    name = path.name.removesuffix(".part")
+    opener = gzip.open if name.endswith((".gz", ".tgz")) else lzma.open if name.endswith(".xz") else None
+    if opener is not None:
+        with opener(path) as file:
             digest = hashlib.sha256()
             for block in iter(lambda: file.read(1 << 20), b""):
                 digest.update(block)
@@ -86,13 +89,16 @@ def fetch(description: dict, cache: Path) -> Path:
     return path
 
 
-def license_texts(archive: Path) -> dict[str, bytes]:
-    """The licence files in the top two directories of a source archive."""
+def license_texts(archive: Path, wanted: str = "") -> dict[str, bytes]:
+    """The licence files in the top two directories of a source archive, and
+    the file `wanted` (a path below the top directory) the description names."""
     found = {}
     with tarfile.open(archive) as tar:
         for member in tar:
             parts = member.name.split("/")
-            if member.isfile() and len(parts) <= 2 and LICENSE_NAMES.match(parts[-1]):
+            if member.isfile() and (
+                    len(parts) <= 2 and LICENSE_NAMES.match(parts[-1])
+                    or wanted and "/".join(parts[1:]) == wanted):
                 found[parts[-1]] = tar.extractfile(member).read()
     return found
 
@@ -132,15 +138,25 @@ def stage_licenses(stage: Path, version: str, cache: Path) -> None:
     for name in package_names():
         description = pkgdesc.load(name)
         index.append(f"{name} {description['version']}: {description['license']}")
-        texts = license_texts(fetch(description, cache))
-        if description.get("license_file"):
-            texts = {k: v for k, v in texts.items() if k == description["license_file"]} or texts
+        wanted = description.get("license_file", "")
+        texts = license_texts(fetch(description, cache), wanted)
+        if wanted:
+            texts = {k: v for k, v in texts.items() if k == Path(wanted).name} or texts
         target = out / "packages" / name
         target.mkdir(parents=True)
         for file_name, data in texts.items():
             (target / file_name).write_bytes(data)
-        if not texts:
+        # A description with an empty `license_file` (paxmirabilis) names a
+        # source whose files state the terms in their headers; the image
+        # carries them in UTILITIES-LICENSE.
+        if not texts and description.get("license_file") != "":
             raise SystemExit(f"dist: no licence text found in the source of {name}")
+    # The notices in the headers of the files of the ready-made utilities
+    # (paxmirabilis has no licence file), as the image carries them.
+    ready = ROOT / "target" / "ready-utils" / "notices"
+    if ready.exists():
+        shutil.copy(ready, out / "ready-utils-NOTICES")
+    index.append("ready-utils-NOTICES: the notices in the headers of the compiled files of the ready-made utilities")
     (out / "INDEX.txt").write_text("\n".join(index) + "\n")
 
 

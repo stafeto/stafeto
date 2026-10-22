@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 #
-# ncurses and the terminfo entries the image holds.
+# ncurses, the terminfo entries the image holds, and the tput and tabs applets
+# linked into the BusyBox program (tools/build-ready-utils.py).
 # Format: docs/packages.md.
 
 name = "ncurses"
@@ -10,6 +11,7 @@ kind = "addon"
 url = "https://ftp.gnu.org/gnu/ncurses/ncurses-6.6.tar.gz"
 sha256 = "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
 license = "MIT"
+license_file = "COPYING"
 depends = ["busybox"]
 build = "tools/build-ncurses.py"
 dirs = [
@@ -21,6 +23,8 @@ dirs = [
   "/usr/share/terminfo/x",
 ]
 files = [
+  "/bin/tabs = link:busybox",
+  "/bin/tput = link:busybox",
   "/usr/share/terminfo/l/linux = terminfo:linux",
   "/usr/share/terminfo/v/vt100 = terminfo:vt100",
   "/usr/share/terminfo/x/xterm = terminfo:xterm",

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# nbase applets linked into the BusyBox program (tools/build-ready-utils.py).
+# The SHA-256 is that of the tar stream after decompression.
+# Format: docs/packages.md.
+
+name = "nbase"
+version = "10.1.0.29"
+kind = "base"
+url = "https://github.com/cheusov/nbase/archive/refs/tags/10.1.0.29.tar.gz"
+sha256 = "00d086f5f882c7a0d7c25b2574972c65a8ec986b6b19893c864f7a7a1e4c510c"
+license = "BSD-3-Clause"
+license_file = "doc/LICENSE"
+depends = ["busybox"]
+build = "tools/build-busybox.py"
+files = [
+  "/bin/pr = link:busybox",
+]

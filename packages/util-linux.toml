@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# util-linux applets linked into the BusyBox program (tools/build-ready-utils.py).
+# The SHA-256 is that of the tar stream after decompression.
+# Format: docs/packages.md.
+
+name = "util-linux"
+version = "2.42.4"
+kind = "base"
+url = "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz"
+sha256 = "5eec78fac0908c1bc18dbe91478741115a3209156dc6105a78ec46dce0f590b3"
+license = "GPL-2.0-or-later"
+license_file = "Documentation/licenses/COPYING.GPL-2.0-or-later"
+depends = ["busybox"]
+build = "tools/build-busybox.py"
+files = [
+  "/bin/newgrp = link:busybox",
+]
