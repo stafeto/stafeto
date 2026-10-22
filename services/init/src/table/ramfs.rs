@@ -571,11 +571,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// of the library's timers, the claims of the memory limits) added 12: 494
 /// measured. The guard of a stack is a hole that takes no frame; each stack
 /// is an object of its own and the workload measured 496: 552 pages left
-/// 10.1%, under one page to the probe's 90% (#300). 576 pages leave 13.9%,
-/// 22 pages to 90%: room for a thread of the volley (20 pages) or for a
-/// change of the layer the size of the last four together, before the
-/// check fails. The steps probe reserves 250 of them on the 2 GiB machine,
-/// 24 MiB more.
+/// 10.1%, under one page to the probe's 90% (#300). With 576 pages and the
+/// relibc of #432 the workload measures 499: 13.4% left, 19 pages to 90%,
+/// near the cost of a thread of the volley (20 pages). The steps probe
+/// reserves 250 of them on the 2 GiB machine, 24 MiB more.
 const STEPS_QUOTA: u64 = 576 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
