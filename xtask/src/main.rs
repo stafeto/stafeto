@@ -43,6 +43,7 @@ mod native_scopes;
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
 mod native_stop_barrier_tests;
 mod ncdu_dialog;
+mod obj_sites;
 mod openposix;
 mod ostest;
 mod packages;
@@ -4952,6 +4953,13 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// longer than the swap, about one a thread of the portion. 13 193
 /// measured. The reviewer of the kernel decides whether it stays.
 ///
+/// `THREADS_READY_MAX` 13 197 -> 13 243 (OBJ step, part 1): `obj::acquire` is
+/// a function of its own (`#[inline(never)]`, so that `wcet bound` finds the
+/// takes), 4 to 5 instructions more on a take, and the portion of 64
+/// threads takes `OBJ` nine times; 13 239 measured, 42 over. The reviewer of
+/// the kernel decides whether it stays; part 2 of the step makes the portion
+/// one take and sets the guard anew.
+///
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -4999,7 +5007,7 @@ const B4_TAKES_ENFORCED: bool = false;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 13_197;
+const THREADS_READY_MAX: u64 = 13_243;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),

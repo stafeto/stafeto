@@ -13,7 +13,15 @@ bounded, and how to measure them.
 - The objects that CPUs share (channels, handle tables, mappings, processes,
   thread numbers, frames, ASIDs) are guarded by one ticket lock, `OBJ`, taken
   with interrupts masked for the links of the objects only. Copies of
-  messages and the teardown of detached objects run outside it. The second
+  messages and the teardown of detached objects run outside it. `obj::lock()`
+  is the one way to take it and it does not nest: the code that holds a
+  section hands no take to the code it calls, which asserts the section
+  (`obj::assert_held`), and a datum that `OBJ` guards (`obj::Guarded`) is lent
+  inside a section only. A call that never returns hands its section to
+  `sched::resume_from` or `thread::run_from`. A test build stops on a second
+  take and on a loan outside a section (`obj_checks`), and the step `obj lock
+  sites` of the kernel group of `ci` holds the files and counts of the takes
+  to a list in xtask, so that a take in a new place is a decision. The second
   lock CPUs share is the ticket lock of each CPU's cleanup queue
   (`queue_spin`): a section under `OBJ` may take it, and its holder takes
   nothing.

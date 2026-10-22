@@ -129,12 +129,6 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
     if wait && unsafe { t.as_ref() }.upcall.interrupt_wait() {
         return Err(Error::Interrupted);
     }
-    // The probe holds the thread here, out of OBJ, until a request for its
-    // entry came: the look under OBJ below has to find it.
-    #[cfg(feature = "window-probe")]
-    if wait {
-        crate::cmd::window::after_check(t);
-    }
     let ceiling = ceiling(t);
     let looked = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
@@ -189,8 +183,6 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             let n = unsafe { sent(client) }.handles;
             // SAFETY: the running thread is alive and holds its process.
             let fit = process::reserve_handles(unsafe { t.as_ref() }.process(), n);
-            #[cfg(feature = "window-probe")]
-            crate::cmd::window::in_gap(t);
             // SAFETY: the room may have been made outside OBJ (`reserve_
             // handles`), where another receiver can take the request, or a
             // recall (`sched::request_upcall`) can withdraw its sender:
@@ -330,10 +322,6 @@ pub fn send(
         drop_handles(t, values);
         return Err(Error::Interrupted);
     }
-    // The probe holds the thread here, out of OBJ, until a request for its
-    // entry came: the look under OBJ before the wait has to find it.
-    #[cfg(feature = "window-probe")]
-    crate::cmd::window::after_check(t);
     if desc.len <= INLINE_MAX
         && values.is_empty()
         && let Some(r) = fast_send(t, via, desc)

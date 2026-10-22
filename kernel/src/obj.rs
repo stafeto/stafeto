@@ -15,15 +15,21 @@
 //! lock, since nothing but that CPU reaches it, and a section under `OBJ`
 //! reaches it freely. The rules that keep it so:
 //!
-//! 1. `lock` takes `OBJ` unless this CPU holds it already, and a guard
-//!    that took it gives it back when it drops. A section nests, then, and
-//!    a call may lock as a whole and call code that locks too; the code
-//!    that shares a datum (`Guarded`, `sched::locked`) locks for itself.
-//! 2. A section waits for nothing but `OBJ` itself, and touches no datum
-//!    of another CPU (stage 4 reaches another CPU by a command).
-//! 3. Work on what no link reaches goes on outside the section: the bytes
+//! 1. `lock` is the one way to take `OBJ`, and the places that call it are
+//!    the takes of the kernel (xtask lists them). It does not nest: a CPU
+//!    that holds `OBJ` and calls it again stops a test build (`obj_checks`).
+//!    Code that runs inside a section asserts it (`assert_held`) and leaves
+//!    the take to its caller; the guard it returns ends the section when it
+//!    drops, or goes by value to the call that leaves the stack
+//!    (`sched::resume_from`, `thread::run_from`).
+//! 2. A datum that `OBJ` guards (`Guarded`) is lent inside a section only:
+//!    the loan asserts the section and never takes the lock. A section
+//!    waits for nothing but `OBJ` itself, and touches no datum of another
+//!    CPU (stage 4 reaches another CPU by a command).
+//! 3. Work on what no link reaches goes on outside any section: the bytes
 //!    of a message past the registers, up to 960 of them, the zeroing of
-//!    a frame, the teardown of a detached object (`outside`).
+//!    a frame, the teardown of a detached object. A call that has such work
+//!    between two steps takes a section for each step.
 //!
 //! Test builds check the places that change a link nobody else guards
 //! (`assert_held`): inside an entry of the kernel (`production`), such a
@@ -90,11 +96,9 @@ pub fn serving(_what: u64) {
     }
 }
 
-/// A section under `OBJ`: dropping the guard that took the lock gives it
-/// back.
+/// A section under `OBJ`: dropping the guard gives the lock back.
 #[must_use = "the section ends when the guard drops"]
 pub struct Section {
-    took: bool,
     /// Turns off `Send`: the CPU that took the lock gives it back.
     _cpu: PhantomData<*mut ()>,
 }
@@ -105,45 +109,17 @@ fn me() -> usize {
     cpu::this() as *const cpu::CpuBlock as usize
 }
 
-/// Enters a section under `OBJ` at an entry into the kernel, where this CPU
-/// holds none: waits for the lock.
-#[inline(always)]
-pub fn enter() -> Section {
-    #[cfg(obj_checks)]
-    assert!(!held(), "OBJ entered inside a section");
-    acquire(me());
-    Section {
-        took: true,
-        _cpu: PhantomData,
-    }
-}
-
-/// Runs `f` in a section entered at the entry of a call, and ends it.
-#[inline(always)]
-pub fn enter_with<R>(f: impl FnOnce() -> R) -> R {
-    let _section = enter();
-    f()
-}
-
-/// Enters a section under `OBJ`: waits for the lock, or joins the section
-/// this CPU holds.
+/// Enters a section under `OBJ`: waits for the lock. This CPU holds none
+/// (a test build stops otherwise).
 #[inline(always)]
 pub fn lock() -> Section {
-    let me = me();
-    if OWNER.load(Relaxed) == me {
-        return Section {
-            took: false,
-            _cpu: PhantomData,
-        };
-    }
-    acquire(me);
-    Section {
-        took: true,
-        _cpu: PhantomData,
-    }
+    #[cfg(obj_checks)]
+    assert!(!held(), "OBJ taken inside a section");
+    acquire(me());
+    Section { _cpu: PhantomData }
 }
 
-#[inline(always)]
+#[inline(never)]
 fn acquire(me: usize) {
     #[cfg(feature = "smp-measure")]
     let began = crate::arch::timer::now_unordered();
@@ -158,14 +134,11 @@ fn acquire(me: usize) {
 impl Drop for Section {
     #[inline(always)]
     fn drop(&mut self) {
-        if self.took {
-            release();
-        }
+        release();
     }
 }
 
-/// The end of the outermost section: the hold counts, and the next ticket
-/// is served.
+/// The end of a section: the hold counts, and the next ticket is served.
 #[inline(always)]
 fn release() {
     #[cfg(feature = "measure")]
@@ -181,32 +154,13 @@ fn release() {
     OBJ.unlock_held();
 }
 
-/// Ends the section the caller entered, for a call that never returns to
-/// drop its guard: the kernel call that leaves for another thread or for the
-/// way out (`sched::resume`, `thread::run`). The guard stays on the abandoned
-/// stack.
-#[inline(always)]
-pub fn leave() {
-    #[cfg(obj_checks)]
-    assert!(held(), "OBJ left outside a section");
-    release();
-}
-
-/// Runs `work` with `OBJ` given back, and takes it again: `work` touches
-/// only what no link reaches, such as the bytes of a message between two
-/// threads that do not run, or a frame no table maps. The caller's own
-/// guard stays, and so does the section it keeps.
-#[inline(always)]
-pub fn outside<R>(work: impl FnOnce() -> R) -> R {
-    let was = held();
-    if was {
+/// Ends the section of a frame that is abandoned and never drops its
+/// guard: init's end in a test build, which never returns.
+#[cfg(feature = "ktest")]
+pub fn abandon() {
+    if held() {
         release();
     }
-    let r = work();
-    if was {
-        acquire(me());
-    }
-    r
 }
 
 /// The takes of `OBJ` in a stretch of a CPU between two polls for an
@@ -458,8 +412,8 @@ pub fn test_scope() -> TestScope {
 pub fn end_test_scope() {}
 
 /// A datum that `OBJ` guards, such as the frames of memory: `lock` lends it
-/// inside a section of its own, or of the caller's. A test build stops on a
-/// second loan while the first lives.
+/// inside a section, which the caller holds. A test build stops on a loan
+/// outside a section and on a second loan while the first lives.
 pub struct Guarded<T> {
     value: UnsafeCell<T>,
     #[cfg(obj_checks)]
@@ -478,25 +432,21 @@ impl<T> Guarded<T> {
         }
     }
 
+    /// The loan of the datum, inside the caller's section.
     #[inline(always)]
+    #[track_caller]
     pub fn lock(&self) -> Loan<'_, T> {
-        let section = lock();
+        assert_held();
         #[cfg(obj_checks)]
         assert!(!self.lent.swap(true, Relaxed), "a datum of OBJ lent twice");
-        Loan {
-            from: self,
-            _section: section,
-        }
+        Loan { from: self }
     }
 }
 
 /// The loan of a `Guarded` datum.
 pub struct Loan<'a, T> {
     from: &'a Guarded<T>,
-    // Declared last: the datum goes back before the section ends.
-    _section: Section,
 }
-
 impl<T> Deref for Loan<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {

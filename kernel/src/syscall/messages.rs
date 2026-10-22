@@ -5,6 +5,7 @@
 
 use super::{Args, Values, caller, caller_ceiling, cause, lookup, set_result};
 use crate::channel::Via;
+use crate::obj::Section;
 use crate::object::Object;
 use crate::process;
 use crate::thread::{self, Thread};
@@ -126,7 +127,7 @@ fn check_handles(thread: NonNull<Thread>, values: &[u64]) -> Result<(), Error> {
 /// buffers, and the values and info words of the handles into them (spec
 /// 6.2; channel::send). A receiver that takes the request on the fast path
 /// runs at once (spec 6.4).
-pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
+pub(super) fn send(thread: NonNull<Thread>, a: &Args, section: Section) {
     let sent = Desc::from_send(a[1]).and_then(|desc| {
         let values = message_handles(thread, desc, Some(a[0]))?;
         let via = lookup(thread, a[0], Rights::SEND, |o| match *o {
@@ -139,11 +140,7 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
         channel::send(thread, via, desc, values)
     });
     match sent {
-        Ok(Some(receiver)) => {
-            crate::obj::leave();
-            thread::flush_copy();
-            thread::run(receiver)
-        }
+        Ok(Some(receiver)) => thread::run_from(section, receiver),
         Ok(None) => {}
         Err(e) => set_result(thread, Err(e)),
     }

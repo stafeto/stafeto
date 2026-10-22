@@ -379,8 +379,24 @@ pub(super) fn change(
 /// way the call's reference to the process goes, at the caller's priority.
 fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
     let Some((result, start)) = run_portions(thread, entry, || {
+        // Pages that become executable have the instruction cache made
+        // coherent with their frames before the section that maps them:
+        // the frames are the object's, which no table maps yet.
+        let mut ready = None;
+        if on.executable() {
+            let (n, frames) = {
+                let _section = crate::obj::lock();
+                process::exec_frames(&on)?
+            };
+            if n > 0 {
+                arch::cache::sync_icache_frames(&frames[..n]);
+                #[cfg(feature = "window-probe")]
+                crate::cmd::window::exec_gap(on.target);
+                ready = Some(frames);
+            }
+        }
         let _section = crate::obj::lock();
-        let done = process::step_change(&mut on)?;
+        let done = process::step_change(&mut on, ready.as_ref())?;
         if !done {
             thread::update_long(thread, Long::Change(on));
         }

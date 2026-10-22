@@ -69,6 +69,20 @@ pub struct Change {
 }
 
 impl Change {
+    /// Whether the pages get execute access (a device window excepted,
+    /// which `exec_frames` finds out).
+    pub fn executable(&self) -> bool {
+        matches!(
+            self.op,
+            Op::Map {
+                access: Access::ReadExec,
+                ..
+            } | Op::Protect {
+                access: Access::ReadExec
+            }
+        )
+    }
+
     /// The call that makes the change.
     pub fn call(&self) -> Call {
         match self.op {
@@ -311,45 +325,38 @@ fn cut(target: NonNull<Process>, va: u64, pages: u64, op: Op) -> Result<Change, 
 /// them; mem_protect gives them the new access, the attributes of the
 /// object's pages (memory::attrs: Device-nGnRE and never executable for a
 /// device window). Pages that become executable have the instruction cache
-/// made coherent first ([G18]); the TLB entries of pages unmapped or
-/// changed go before the portion ends ([G13]). True once every page of the
-/// entry is done.
-pub fn step_change(on: &mut Change) -> Result<bool, Error> {
+/// made coherent first ([G18], `exec_frames`, before the section of this
+/// portion); the TLB entries of pages unmapped or changed go before the
+/// portion ends ([G13]). True once every page of the entry is done.
+pub fn step_change(
+    on: &mut Change,
+    ready: Option<&[u64; PORTION as usize]>,
+) -> Result<bool, Error> {
     crate::obj::assert_held();
+    // A kill on another CPU may have begun the end of the process since the
+    // section of `exec_frames`, whose tables the portion leaves alone (obj.rs,
+    // rule 3).
+    #[cfg(not(feature = "break-alive-check"))]
     check_alive(on.target)?;
-    // SAFETY: the process lives, and the entry is the call's.
-    let (m, space) = unsafe { (entry(on), space(on.target)) };
-    let access = match on.op {
-        Op::Map { access, .. } | Op::Protect { access } => Some(access),
-        Op::Unmap => None,
-    };
-    // A device window carries no MAP_EXEC right (abi::WINDOW_RIGHTS, spec
-    // 5.2, 9), so this excludes it on its own; the check stands so that
-    // cache::sync_icache_frames never walks a page outside the linear map.
-    let exec = access == Some(Access::ReadExec) && !memory::is_window(m.object);
-    let n = if exec { EXEC_PORTION } else { PORTION }.min(m.pages - on.done);
-    let va = page_address(&m, on.done);
-    let mut frames = [0; PORTION as usize];
-    let frames = &mut frames[..n as usize];
-    if exec || matches!(on.op, Op::Map { .. }) {
-        for (i, f) in frames.iter_mut().enumerate() {
-            *f = memory::frame(m.object, (m.offset + on.done) as usize + i);
-        }
-    }
-    if exec {
-        // The frames are the object's, and no table maps them yet: cache
-        // maintenance on them is no change of a link.
-        crate::obj::outside(|| {
-            cache::sync_icache_frames(frames);
-            #[cfg(feature = "window-probe")]
-            crate::cmd::window::exec_gap(on.target);
-        });
-        // OBJ went back meanwhile, and a kill on another CPU may have begun
-        // the end of the process, whose tables the portion leaves alone
-        // (obj.rs, rule 3).
-        #[cfg(not(feature = "break-alive-check"))]
+    #[cfg(feature = "break-alive-check")]
+    if !on.executable() {
         check_alive(on.target)?;
     }
+    // SAFETY: the process lives, and the entry is the call's.
+    let (m, space) = unsafe { (entry(on), space(on.target)) };
+    let (n, exec) = portion_size(on, &m);
+    let mut found = [0; PORTION as usize];
+    let frames = match ready {
+        Some(ready) => ready,
+        None => {
+            fill_frames(on, &m, &mut found[..n as usize]);
+            &found
+        }
+    };
+    let frames = &frames[..n as usize];
+    let va = page_address(&m, on.done);
+    // The caller made the instruction cache coherent for these frames
+    // (`exec_frames`), since the pages become executable.
     match &mut on.op {
         Op::Map { access, prepaid } => {
             space.map_pages(va, frames, memory::attrs(m.object, *access), prepaid)
@@ -364,6 +371,53 @@ pub fn step_change(on: &mut Change) -> Result<bool, Error> {
         crate::testpoint::code_mapped(frames);
     }
     Ok(on.done == m.pages)
+}
+
+/// How many pages the next portion of `on` takes, and whether they become
+/// executable.
+fn portion_size(on: &Change, m: &Mapping<NonNull<Memory>>) -> (u32, bool) {
+    let access = match on.op {
+        Op::Map { access, .. } | Op::Protect { access } => Some(access),
+        Op::Unmap => None,
+    };
+    // A device window carries no MAP_EXEC right (abi::WINDOW_RIGHTS, spec
+    // 5.2, 9), so this excludes it on its own; the check stands so that
+    // cache::sync_icache_frames never walks a page outside the linear map.
+    let exec = access == Some(Access::ReadExec) && !memory::is_window(m.object);
+    (
+        if exec { EXEC_PORTION } else { PORTION }.min(m.pages - on.done),
+        exec,
+    )
+}
+
+/// The frames of the object that the next pages of `on` map to, for mem_map
+/// and the executable pages of mem_protect; nothing for the rest.
+fn fill_frames(on: &Change, m: &Mapping<NonNull<Memory>>, frames: &mut [u64]) {
+    if matches!(on.op, Op::Map { .. }) || portion_size(on, m).1 {
+        for (i, f) in frames.iter_mut().enumerate() {
+            *f = memory::frame(m.object, (m.offset + on.done) as usize + i);
+        }
+    }
+}
+
+/// The frames of the next portion of `on` when its pages become executable,
+/// for the caller to make the instruction cache coherent with them: their
+/// number, 0 when the portion is not executable, and the frames.
+/// BAD_STATE when the process ended. The frames are the object's and no
+/// table maps them yet: cache maintenance on them is no change of a link,
+/// and goes outside any section (obj.rs, rule 3). The portion that maps
+/// them takes a section of its own and looks at the process again.
+pub fn exec_frames(on: &Change) -> Result<(usize, [u64; PORTION as usize]), Error> {
+    crate::obj::assert_held();
+    check_alive(on.target)?;
+    // SAFETY: the process lives, and the entry is the call's.
+    let m = unsafe { entry(on) };
+    let (n, exec) = portion_size(on, &m);
+    let mut frames = [0; PORTION as usize];
+    if exec {
+        fill_frames(on, &m, &mut frames[..n as usize]);
+    }
+    Ok((if exec { n as usize } else { 0 }, frames))
 }
 
 /// The end of `on` after its last portion (spec 7.4, 7.7): the entry of
@@ -415,7 +469,16 @@ pub fn map_whole(
     check_free(target, va as u64, pages.into())?;
     let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
     let mut on = add_mapping(target, mapping, access)?;
-    while !step_change(&mut on).expect("a process that lives takes every portion") {}
+    loop {
+        let (n, frames) = exec_frames(&on).expect("a process that lives takes every portion");
+        if n > 0 {
+            cache::sync_icache_frames(&frames[..n]);
+        }
+        let ready = (n > 0).then_some(&frames);
+        if step_change(&mut on, ready).expect("a process that lives takes every portion") {
+            break;
+        }
+    }
     // SAFETY: the change ended with its last portion, the process lives,
     // and a mem_map releases nothing at the end, whatever the level.
     unsafe { finish_change(on, 1) };

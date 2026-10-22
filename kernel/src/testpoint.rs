@@ -176,10 +176,8 @@ mod points {
     /// returns.
     pub fn init_ended() {
         // Init ended in a section of the kernel, which the tests never
-        // return to.
-        if crate::obj::held() {
-            crate::obj::leave();
-        }
+        // return to: its guard stays on the abandoned stack.
+        crate::obj::abandon();
         let _test = crate::obj::test_scope();
         el0::init_ended()
     }

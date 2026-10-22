@@ -4,6 +4,7 @@
 //! The calls of processes and threads (spec 4, 8, 11).
 
 use super::{Args, Values, caller, caller_ceiling, cause, lookup, record_call};
+use crate::obj::Section;
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
@@ -49,6 +50,27 @@ use kcore::args::{
 /// caller in full once the child and whatever holds its shell went; the
 /// page of shells stays the caller's.
 pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    // Two sections, so that neither is longer than OBJ_HOLD_MAX: the child
+    // is known to nothing yet but this call when the first ends.
+    let (child, exit, start, notify) = {
+        let _section = crate::obj::lock();
+        make_child(thread, a)?
+    };
+    let _section = crate::obj::lock();
+    link_child(thread, child, exit, start, notify)
+}
+
+/// The channel of x3 of process_create with its label, and the channel of
+/// x5 with the object and rights it moves.
+type Exit = Option<(NonNull<channel::Channel>, u64)>;
+type Start = Option<(Handle, Object, Rights)>;
+
+/// The first section of process_create: the checks, the resources the
+/// caller pays for, and the child itself.
+fn make_child(
+    thread: NonNull<Thread>,
+    a: &Args,
+) -> Result<(NonNull<Process>, Exit, Start, u8), Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
@@ -83,7 +105,38 @@ pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values
     if let Some((c, _)) = exit {
         channel::reserve_source(c)?;
     }
-    let made = new_child(thread, quota, limit, ceiling, start.map(|(_, o, r)| (o, r)));
+    match process::create_child(caller(thread), quota, limit, ceiling) {
+        Ok(child) => Ok((child, exit, start, notify)),
+        Err(e) => {
+            if let Some((c, _)) = exit {
+                channel::remove_source(c);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The second section of process_create: the start channel and the
+/// caller's handle to the child. A child that fails on the way goes again,
+/// and the caller keeps its handles.
+fn link_child(
+    thread: NonNull<Thread>,
+    child: NonNull<Process>,
+    exit: Exit,
+    start: Start,
+    notify: u8,
+) -> Result<Values, Error> {
+    let made = match start {
+        Some((_, object, rights)) => process::move_start(child, object, rights),
+        None => process::reserve_start(child),
+    }
+    .and_then(|()| process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS))
+    .map(|h| (child, h))
+    .inspect_err(|_| {
+        // SAFETY: the reference `create` handed out goes, and nothing else
+        // holds the child, which goes again.
+        unsafe { process::release(child, cause(thread)) }
+    });
     match made {
         Ok((child, _)) => {
             if let Some((c, label)) = exit {
@@ -105,35 +158,6 @@ pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values
         }
     }
     Ok(Values::new(&[made?.1.0]))
-}
-
-/// A child of the caller's process for process_create, with entry 0 of its
-/// table, the start channel `start` or a stub, and a handle to it in the
-/// caller's table; the reference `create` handed out comes along. A child
-/// that fails on the way goes again, and the caller keeps its handles.
-fn new_child(
-    thread: NonNull<Thread>,
-    quota: u64,
-    limit: u32,
-    ceiling: u8,
-    start: Option<(Object, Rights)>,
-) -> Result<(NonNull<Process>, Handle), Error> {
-    let child = process::create_child(caller(thread), quota, limit, ceiling)?;
-    // The child is known to nothing yet but this call: the hold of the lock
-    // ends here and the rest of the call is a section of its own, so that
-    // neither is longer than OBJ_HOLD_MAX.
-    crate::obj::outside(|| {});
-    match start {
-        Some((object, rights)) => process::move_start(child, object, rights),
-        None => process::reserve_start(child),
-    }
-    .and_then(|()| process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS))
-    .map(|h| (child, h))
-    .inspect_err(|_| {
-        // SAFETY: the reference `create` handed out goes, and nothing else
-        // holds the child, which goes again.
-        unsafe { process::release(child, cause(thread)) }
-    })
 }
 
 /// process_control(x0 process with MANAGE, x1 action, x2 level), spec 7.7.
@@ -170,7 +194,11 @@ pub(super) fn process_control(thread: NonNull<Thread>, a: &Args) -> Result<Value
 /// checks in the order of spec 11: a level above 63 (INVALID_ARGS), the
 /// handle, then a level above the caller's effective priority
 /// (ACCESS_DENIED). O(1).
-pub(super) fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+pub(super) fn process_kill(
+    thread: NonNull<Thread>,
+    a: &Args,
+    section: Section,
+) -> Result<Values, Error> {
     let level = match a[1] {
         0 => None,
         l => Some(kcore::args::priority_arg(l)?),
@@ -190,8 +218,7 @@ pub(super) fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
     if own {
         // The caller ended with its process and may be gone.
         record_call(Call::ProcessKill.number());
-        crate::obj::leave();
-        sched::resume()
+        sched::resume_from(section)
     }
     if !ended {
         // SAFETY: the handle holds the process, which ended before; no
@@ -203,14 +230,13 @@ pub(super) fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
 
 /// process_exit(x0 code): the caller's process ends with `code`. Never
 /// returns.
-pub(super) fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
+pub(super) fn process_exit(thread: NonNull<Thread>, a: &Args, section: Section) -> ! {
     let exited = ProcessState::Exited { code: a[0] };
     // SAFETY: the calling thread holds its process until the end takes
     // its own reference.
     unsafe { process::end(caller(thread), exited, cause(thread)) };
     record_call(Call::ProcessExit.number());
-    crate::obj::leave();
-    sched::resume()
+    sched::resume_from(section)
 }
 
 /// thread_create(x0 process with MANAGE, x1 entry, x2 stack, x3 argument,
@@ -299,12 +325,11 @@ pub(super) fn thread_start(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
 
 /// thread_exit(): the caller ends; the last started thread of a process
 /// ends the process with code 0. Never returns.
-pub(super) fn thread_exit(thread: NonNull<Thread>) -> ! {
+pub(super) fn thread_exit(thread: NonNull<Thread>, section: Section) -> ! {
     // SAFETY: the running thread made the call and is not used afterwards.
     unsafe { thread::exit(thread) };
     record_call(Call::ThreadExit.number());
-    crate::obj::leave();
-    sched::resume()
+    sched::resume_from(section)
 }
 
 /// thread_set_priority(x0 thread with MANAGE, x1 priority 1-63, x2
