@@ -1339,8 +1339,15 @@ mod tests {
         let error = check_owners(image, &files, &lacking).unwrap_err();
         assert!(error.contains("/bin/ghost"), "{error}");
         // A package that installs nothing leaves nothing to own: its row
-        // has no files.
-        assert!(packages.iter().all(|p| !p.files.is_empty()));
+        // has no files, and some other package depends on it (the fts of
+        // pax).
+        for p in packages.iter().filter(|p| p.files.is_empty()) {
+            assert!(
+                packages.iter().any(|q| q.depends.contains(&p.name)),
+                "{} installs nothing and no package depends on it",
+                p.name
+            );
+        }
     }
 
     /// The table counts the BusyBox program once for its many names.
