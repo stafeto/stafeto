@@ -377,6 +377,10 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("kernel", "timing boots", &BOOT_NEEDS, || {
         jobs::run_all(super::timing_jobs(), 1)
     }));
+    // Every take of OBJ in the kernel is a place on the list (obj_sites.rs).
+    steps.push(step("kernel", "obj lock sites", &[], || {
+        super::obj_sites::check(&super::root())
+    }));
     steps.push(step(
         "kernel",
         "trace plugin",

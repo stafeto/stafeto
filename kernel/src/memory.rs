@@ -121,6 +121,9 @@ struct Budget<'a>(&'a mut Account);
 // only once nothing refers to it (spec 7.7).
 unsafe impl ListMemory for Budget<'_> {
     fn alloc_frame(&mut self) -> u64 {
+        // The lists fill and empty in portions outside any section, a take
+        // for each frame (part 2 of the OBJ step makes it one for a portion).
+        let _section = crate::obj::lock();
         let frame = phys::alloc_zeroed(0, self.0);
         frame
             .expect("the budget of a memory object covers its frames")
@@ -128,6 +131,7 @@ unsafe impl ListMemory for Budget<'_> {
     }
 
     fn free_frame(&mut self, pa: u64) {
+        let _section = crate::obj::lock();
         // SAFETY: the list gives back a frame of order 0 that `alloc_frame`
         // took.
         unsafe { phys::free(Frame::from_raw(pa, 0), self.0) }
@@ -515,6 +519,7 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
             true
         }
         Backing::Contiguous { base, order, .. } => {
+            let _section = crate::obj::lock();
             // SAFETY: nothing maps the block any more and its TLB entries
             // went with its mappings; it is the object's. No cache
             // maintenance: the next holder zeroes it through the cache.

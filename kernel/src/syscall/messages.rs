@@ -5,6 +5,7 @@
 
 use super::{Args, Values, caller, caller_ceiling, cause, lookup, set_result};
 use crate::channel::Via;
+use crate::obj::Section;
 use crate::object::Object;
 use crate::process;
 use crate::thread::{self, Thread};
@@ -22,6 +23,7 @@ use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceiling
 /// (LIMIT_REACHED), then the caller's quota pays for a page of its pool of
 /// channels when the pool grows and for a block of its table (NO_MEMORY).
 /// A channel whose handle did not go in goes again.
+#[inline(never)]
 pub(super) fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[0])?;
     under_ceilings(priority, &[caller_ceiling(thread)])?;
@@ -42,6 +44,7 @@ pub(super) fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values
 /// received, and the slot to the top receiver that waits or into the
 /// queue of slots. A receiver woken above the caller runs before the call
 /// returns. No memory is taken, and nothing waits.
+#[inline(never)]
 pub(super) fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let bits = bits_arg(a[1])?;
     let (c, s) = lookup(thread, a[0], Rights::NOTIFY, |o| {
@@ -69,6 +72,7 @@ pub(super) fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error>
 /// notification, a request, or PEER_CLOSED in x0 alone once the last
 /// handle with RECEIVE went. The call writes its own result: x0-x11 are
 /// its (channel::receive).
+#[inline(never)]
 pub(super) fn receive(thread: NonNull<Thread>, a: &Args) {
     let taken = wait_arg(a[1]).and_then(|wait| {
         let c = lookup(thread, a[0], Rights::RECEIVE, Object::channel)?;
@@ -126,7 +130,7 @@ fn check_handles(thread: NonNull<Thread>, values: &[u64]) -> Result<(), Error> {
 /// buffers, and the values and info words of the handles into them (spec
 /// 6.2; channel::send). A receiver that takes the request on the fast path
 /// runs at once (spec 6.4).
-pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
+pub(super) fn send(thread: NonNull<Thread>, a: &Args, section: Section) {
     let sent = Desc::from_send(a[1]).and_then(|desc| {
         let values = message_handles(thread, desc, Some(a[0]))?;
         let via = lookup(thread, a[0], Rights::SEND, |o| match *o {
@@ -139,11 +143,7 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
         channel::send(thread, via, desc, values)
     });
     match sent {
-        Ok(Some(receiver)) => {
-            crate::obj::leave();
-            thread::flush_copy();
-            thread::run(receiver)
-        }
+        Ok(Some(receiver)) => thread::run_from(section, receiver),
         Ok(None) => {}
         Err(e) => set_result(thread, Err(e)),
     }
@@ -164,6 +164,7 @@ pub(super) fn send(thread: NonNull<Thread>, a: &Args) {
 /// LIMIT_REACHED and NO_MEMORY, when they go. Otherwise x0 is 0, and the
 /// client gets the reply, bytes 64 up to its length through the message
 /// buffers and the handles in its table (spec 6.2; channel::reply).
+#[inline(never)]
 pub(super) fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let desc = Desc::from_reply(a[1])?;
     let values = message_handles(thread, desc, None)?;

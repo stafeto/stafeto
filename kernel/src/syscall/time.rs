@@ -34,6 +34,7 @@ pub(super) fn clock_now() -> Result<Values, Error> {
 /// spec 6.5), a page of the caller's pool of timers and a block of its
 /// table (NO_MEMORY). A channel with a handle with RECEIVE is open. A
 /// timer whose handle did not go in goes again.
+#[inline(never)]
 pub(super) fn timer_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[1])?;
     let (c, label) = lookup(thread, a[0], Rights::RECEIVE, |o| {
@@ -59,6 +60,7 @@ pub(super) fn timer_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, 
 /// a timer that another CPU armed: a timer belongs to the CPU that armed it
 /// first, whose heap holds it, and only that CPU arms or cancels it
 /// (SMP stage 4, a change of the ABI). No memory is taken.
+#[inline(never)]
 pub(super) fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     let deadline = clock::clock().ns_to_ticks(a[1]);
@@ -70,6 +72,7 @@ pub(super) fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Err
 /// posted stay in its slot until receive takes them (spec 10). A timer
 /// that is not armed is left as it is: 0. BAD_STATE for a timer that
 /// another CPU armed, as for timer_set.
+#[inline(never)]
 pub(super) fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     timer::cancel(t)?;

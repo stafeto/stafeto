@@ -1128,6 +1128,14 @@ fn prepare_entry(thread: &mut Thread) -> Option<(u64, u64)> {
         .map(|entry| (entry, thread.upcall.entry_sp(thread.regs.sp)))
 }
 
+/// `run` for a call that holds a section: the section ends, the bytes of the
+/// message the call delivered go between the buffers, and `next` runs.
+pub fn run_from(section: crate::obj::Section, next: NonNull<Thread>) -> ! {
+    drop(section);
+    flush_copy();
+    run(next)
+}
+
 /// Runs `next` at EL0. A switch from another thread saves that one's FP
 /// and SIMD registers and loads next's; TTBR0 goes to next's address space
 /// unless it holds it already; then the kernel returns to EL0 with next's

@@ -258,7 +258,7 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
 /// The level the stage of `process` runs at (spec 7.7): S, the higher of
 /// its ceiling and R, at the stages Threads and Stop; the higher of R and
 /// the top level of its accepted requests at the stage Replies, read under
-/// OBJ; R at the others. O(1).
+/// OBJ, which the caller holds; R at the others. O(1).
 ///
 /// # Safety
 /// `process` is alive; only the fields are read.
@@ -269,11 +269,27 @@ pub(super) unsafe fn stage_level(process: NonNull<Process>) -> u8 {
         match (*p).stage {
             Stage::Threads | Stage::Stop => (*p).ceiling.max((*p).level),
             Stage::Replies => {
-                let _section = crate::obj::lock();
                 let top = sched::locked(|k| accepted(process, k.s).top());
                 top.map_or((*p).level, |top| top.max((*p).level))
             }
             _ => (*p).level,
+        }
+    }
+}
+
+/// `stage_level` for a portion that holds no section: the stage Replies
+/// takes one for the look at its queue.
+///
+/// # Safety
+/// As for `stage_level`.
+unsafe fn stage_level_outside(process: NonNull<Process>) -> u8 {
+    // SAFETY: the caller's promise.
+    unsafe {
+        if (*process.as_ptr()).stage == Stage::Replies {
+            let _section = crate::obj::lock();
+            stage_level(process)
+        } else {
+            stage_level(process)
         }
     }
 }
@@ -409,7 +425,7 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             release(process, r);
         } else {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-            cleanup::requeue(item, Object::Process(process), stage_level(process));
+            cleanup::requeue(item, Object::Process(process), stage_level_outside(process));
         }
         if let Some(child) = first {
             wait_for_child(child, r);
@@ -594,6 +610,7 @@ unsafe fn release_space(p: *mut Process) -> bool {
         // With this CPU the only one up, the TTBR0 it just left is the only
         // one that held the tables: no period to wait for.
         if cfg!(feature = "break-asid-retire") || crate::smp::cpus() == 1 {
+            let _section = crate::obj::lock();
             release.drop_asid();
         } else {
             // SAFETY: the node is in this process, which stays alive until
@@ -728,6 +745,7 @@ unsafe fn release_pages(p: *mut Process) -> bool {
     // SAFETY: the caller's promise; only the fields are borrowed.
     let (log, quota) = unsafe { (&mut (*p).pages, &mut (*p).quota) };
     log.release_step(SHELL_PORTION, |page| {
+        let _section = crate::obj::lock();
         // SAFETY: the page came from KernelPages through the pools, and no
         // object lives there any more.
         unsafe { pages::give_back(page) };

@@ -29,7 +29,6 @@ use crate::local::local;
 use crate::thread::{self, THREADS, Thread};
 use crate::{cleanup, syscall};
 use abi::{Error, Policy};
-use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, Timer};
 use kcore::time::Clock;
@@ -168,15 +167,7 @@ pub fn set_entry_timing(timing: (u64, u64)) {
 /// The table of thread numbers, which OBJ guards: only
 /// `locked` reaches it, while it holds that lock. Zeroed at boot (spec
 /// 7.8).
-static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
-
-/// A value OBJ guards, which `locked` lends together with this CPU's
-/// scheduler.
-struct Guarded<T>(UnsafeCell<T>);
-
-// SAFETY: only `locked` reaches the value, inside a section under OBJ,
-// which makes the access exclusive.
-unsafe impl<T: Send> Sync for Guarded<T> {}
+static TOKENS: crate::obj::Guarded<Tokens> = crate::obj::Guarded::new(Table::new());
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.
 #[derive(Debug, Clone, Copy)]
@@ -250,7 +241,7 @@ pub fn cpu_time(index: usize) -> Option<(usize, [u64; 3])> {
 /// once it knows the thread's process lives.
 pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
     // The flag of START goes into the thread inside the section (cmd::post).
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     if !thread::mark_started(t) {
         return Err(Error::BadState);
     }
@@ -353,7 +344,7 @@ pub unsafe fn boost_in_place(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, 
 /// START, served by the CPU of the thread, unless the thread ended since:
 /// the kernel's reference goes with its EXIT.
 pub fn serve_start(t: NonNull<Thread>) {
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     if !thread::is_held(t) {
         return;
     }
@@ -363,7 +354,7 @@ pub fn serve_start(t: NonNull<Thread>) {
 
 /// UNPARK, served by the CPU of the thread, unless it ended since.
 pub fn serve_unpark(t: NonNull<Thread>) {
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     if !thread::is_held(t) {
         return;
     }
@@ -375,7 +366,7 @@ pub fn serve_unpark(t: NonNull<Thread>) {
 /// WAKE, served by the CPU of the thread, unless it ended since, once the
 /// copy of its message is made (cmd::drain waits for it).
 pub fn serve_wake(t: NonNull<Thread>) {
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     if !thread::is_held(t) {
         return;
     }
@@ -389,7 +380,7 @@ pub fn serve_wake(t: NonNull<Thread>) {
 /// level in its queue (`channel::requeue`), and the rise goes on along the
 /// chain of requests.
 pub fn serve_level(t: NonNull<Thread>) {
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     // What was asked goes whether or not the thread ended meanwhile: its
     // number is another thread's next, once it gives it back (EXIT).
     let (level, boost) = crate::cmd::take_level(t);
@@ -420,7 +411,7 @@ pub fn serve_level(t: NonNull<Thread>) {
 /// registers stop being the CPU's live ones, and the kernel's reference
 /// goes when the asker left it to this CPU.
 pub fn serve_exit(t: NonNull<Thread>) {
-    let _section = crate::obj::lock();
+    crate::obj::assert_held();
     // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
     let ask = crate::cmd::take_exit(t);
     // SAFETY: as above.
@@ -597,8 +588,6 @@ unsafe fn interrupt_if(
                 Some(Wait::Receive(_) | Wait::Send(_))
             ));
             let waited = channel::withdraw(t, k);
-            #[cfg(feature = "window-probe")]
-            crate::cmd::window::head_moved();
             syscall::set_result(t, Err(Error::Interrupted));
             wake(k, t);
             Ok::<_, Error>(Some(waited))
@@ -684,12 +673,10 @@ pub struct Locked<'a> {
 pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
     crate::obj::assert_held();
     let mut g = local().sched.lock();
-    // SAFETY: the guard of OBJ lives until `f` returns,
-    // so this is the only reference to the table (TOKENS).
-    let tokens = unsafe { &mut *TOKENS.0.get() };
+    let mut tokens = TOKENS.lock();
     f(&mut Locked {
         s: &mut g.s,
-        tokens,
+        tokens: &mut tokens,
     })
 }
 
@@ -716,12 +703,11 @@ pub fn hand_off(
     // no interrupt came since: its latency needs no more.
     #[cfg(feature = "ktest")]
     assert!(g.fired.0 == 0, "a fired deadline waits at the fast path");
-    // SAFETY: as in `locked`.
-    let tokens = unsafe { &mut *TOKENS.0.get() };
+    let mut tokens = TOKENS.lock();
     let r = meet(
         &mut Locked {
             s: &mut g.s,
-            tokens,
+            tokens: &mut tokens,
         },
         now,
     )?;
@@ -769,6 +755,13 @@ pub fn resume() -> ! {
     // (thread_exit, process_exit, the end of a process by a fault) included.
     crate::thread::flush_copy();
     arch::on_empty_stack(exit_loop)
+}
+
+/// `resume` for a call that holds a section: the section ends here, before
+/// the stack is abandoned.
+pub fn resume_from(section: crate::obj::Section) -> ! {
+    drop(section);
+    resume()
 }
 
 /// The loop every way out of the kernel takes: an interrupt that is
@@ -848,10 +841,10 @@ fn decide(now: u64) -> Option<Decision<Thread>> {
         // A gated process parks its thread: the parked list is a link.
         crate::obj::serving(crate::obj::ENTRY_PARK);
         let _obj = crate::obj::lock();
+        let mut tokens = TOKENS.lock();
         let mut k = Locked {
             s: &mut g.s,
-            // SAFETY: OBJ guards the table.
-            tokens: unsafe { &mut *TOKENS.0.get() },
+            tokens: &mut tokens,
         };
         if crate::process::park_selected(t, &mut k) {
             return None;

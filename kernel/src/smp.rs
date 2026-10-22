@@ -354,7 +354,7 @@ fn lock_rounds(me: usize) {
     let mut longest = 0;
     for _ in 0..LOCK_ROUNDS {
         let asked = timer::now();
-        let section = crate::obj::enter();
+        let section = crate::obj::lock();
         longest = longest.max(timer::now() - asked);
         // SAFETY: inside the section under OBJ.
         unsafe {

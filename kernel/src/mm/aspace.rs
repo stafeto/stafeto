@@ -187,6 +187,8 @@ unsafe impl TableMemory for Releasing<'_> {
     }
 
     fn free_table(&mut self, pa: u64) {
+        // A portion of the stage Space holds no section: one for each table.
+        let _section = crate::obj::lock();
         with_tables(|t| t.free_table(pa));
         self.quota.refund(PAGE_SIZE);
     }
@@ -422,6 +424,7 @@ impl AddressSpace {
             return;
         }
         crate::obj::serving(crate::obj::ENTRY_ASID);
+        let _section = crate::obj::lock();
         with_asids(|a| tlb::switch_slow(a, &CPUS, cpu, &self.tag, root, empty, &mut Cpu, zero_map));
         #[cfg(feature = "asid-probe")]
         probe_says_generations();
