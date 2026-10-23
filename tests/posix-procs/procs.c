@@ -889,6 +889,38 @@ static int steps_fork(void) {
     return 0;
 }
 
+/* The role stepforkmany: the map of the layer filled with 80 pages of one
+ * each, read-only and writable by turns so that no two join, and then three
+ * forks, each child ends. The loader meets as many regions as the map holds,
+ * and its step Regions admits each against all it holds. The child binds at
+ * most 96 objects (posix_map::MAX_OBJECTS), one for each region, so the map
+ * is not filled to its 128 places (abi::MAX_MAPPINGS): the pages that join
+ * no other and the program's own regions have to fit in 96. */
+#define STEPS_FORK_PAGES 80
+static int steps_fork_many(void) {
+    int mapped;
+    for (mapped = 0; mapped < STEPS_FORK_PAGES; mapped++) {
+        int prot = mapped % 2 ? PROT_READ | PROT_WRITE : PROT_READ;
+        void *page = mmap(NULL, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) {
+            printf("posix-procs: steps: mmap gave %s after %d pages\n", strerror(errno), mapped);
+            return 63;
+        }
+    }
+    printf("posix-procs: steps: fork with %d one page mappings\n", mapped);
+    for (int i = 0; i < 3; i++) {
+        pid_t pid = fork();
+        if (pid == 0) _exit(7);
+        if (pid < 0) {
+            printf("posix-procs: steps: fork of the full map gave %s\n", strerror(errno));
+            return 61;
+        }
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) return 62;
+    }
+    return 0;
+}
+
 /* The role steppipes: the longest steps of the pipe service, from forked
  * children, each of which clones a session of 28 ends. Eight children
  * wait at one read end, and each write of a message wakes all of them;
@@ -1539,6 +1571,10 @@ static int steps_run(void) {
     pid_t forker = -1;
     if (steps_spawn(&forker, "stepfork", "0") != 0) return 5;
     reap("a child that forks among the crowd", forker, 0, 0);
+    /* The same with the map full: the loader meets every region it can. */
+    pid_t filler = -1;
+    if (steps_spawn(&filler, "stepforkmany", "0") != 0) return 5;
+    reap("a child that forks with a full map", filler, 0, 0);
     /* Volleys: SIGUSR1 to the crowd arms every identity session. A change
      * of the credentials moves their generation, and the clock service
      * asks the process service who the caller is again (Vouch) when
@@ -2799,6 +2835,7 @@ static int role(const char *name) {
     if (strcmp(name, "names") == 0) return names_role();
 #endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
+    if (strcmp(name, "stepforkmany") == 0) return steps_fork_many();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
 #if FIFO_STEPS
     if (strcmp(name, "stepfifo") == 0) return steps_fifo();

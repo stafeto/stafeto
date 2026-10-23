@@ -75,11 +75,26 @@ mod steps {
     static LONGEST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     static DETAIL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
+    /// The kind whose report is its shortest step with a detail of at least
+    /// `FLOOR`, not its longest: the cost of the request `Regions` rises with
+    /// the regions held (its detail), and the loader runs at the level of
+    /// its client, where a pass of a service above it lands in the wall time
+    /// of one request in twenty and adds tens of thousands of ticks. The
+    /// shortest request at the most regions held has none of it.
+    pub const SHORTEST: usize = super::kind::REGIONS;
+    pub const FLOOR: u64 = 80;
+    static SHORTEST_TICKS: AtomicU64 = AtomicU64::new(u64::MAX);
+
     pub fn timed<T>(kind: usize, detail: u64, step: impl FnOnce() -> T) -> T {
         let began = rt::time::now();
         let out = step();
         let took = rt::time::now().saturating_sub(began);
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+        if kind == SHORTEST {
+            if detail >= FLOOR && took < SHORTEST_TICKS.fetch_min(took, Ordering::Relaxed) {
+                LONGEST[kind].store(took, Ordering::Relaxed);
+                DETAIL[kind].store(detail, Ordering::Relaxed);
+            }
+        } else if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAIL[kind].store(detail, Ordering::Relaxed);
         }
         out
@@ -493,7 +508,11 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     },
                     Some(Method::Regions) if !copied => match fork.as_mut() {
                         Some((_, scratch)) => {
-                            match steps::timed(kind::REGIONS, handles.len() as u64, || {
+                            // The detail of the step is the number of regions
+                            // held once the request is taken: the admission
+                            // of a region reads every one held.
+                            let held = (scratch.count + handles.len()) as u64;
+                            match steps::timed(kind::REGIONS, held, || {
                                 take_regions(r, &mut handles, scratch)
                             }) {
                                 Ok(()) => 0,

@@ -5284,6 +5284,114 @@ const LOADER_STEP_KINDS: [(usize, &str); 9] = [
     (9, "Go, the whole copy"),
 ];
 
+/// The reports of the loaders in `lines`, one list for each loader that
+/// copied a fork (feature `steps` of services/loader): (kind, ticks,
+/// detail) in the order of the kinds. A loader serves one fork and prints
+/// its kinds in rising order once the console is its client's, so a kind
+/// that does not rise starts the next report.
+fn loader_reports(lines: &[String]) -> Vec<Vec<(usize, u64, u64)>> {
+    let mut reports: Vec<Vec<(usize, u64, u64)>> = Vec::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix("loader step: kind ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [kind, ticks, "ticks", "detail", detail] = words.as_slice() else {
+            continue;
+        };
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
+        else {
+            continue;
+        };
+        match reports.last_mut() {
+            Some(last) if last.last().is_some_and(|&(k, ..)| k < kind) => {
+                last.push((kind, ticks, detail));
+            }
+            _ => reports.push(vec![(kind, ticks, detail)]),
+        }
+    }
+    reports
+}
+
+/// The steps of the loader that copies a fork, from the reports of its
+/// loaders. Kind 8, `Regions`, is a step of the loader as a service: one
+/// request that admits up to `MESSAGE_HANDLES` regions against those it
+/// already holds and takes their handles. The cost of a request rises with
+/// the regions held (the admission of a region reads every region held),
+/// and the loader reports its shortest request with at least
+/// `LOADER_REGIONS_MIN` regions held, the number in its detail: it runs at
+/// the level of its client, and a pass of a service above it (the audit of
+/// the RAM file service, a timer) lands in the wall time of one request in
+/// twenty and adds the interference of the others (term I of the response
+/// time) to the step. The parent of the role `stepforkmany` fills the map
+/// with pages that do not join, and that report has to exist. It stays
+/// under `TERM_B * 9 / 10` like the new methods of the services. Kinds 1 to
+/// 7 are kernel calls of the copy, whose portions the kernel's B bounds and
+/// whose wall time is the sum of the portions and of the processes above
+/// the child, and kind 9 is the whole copy: they are printed, the last with
+/// the regions it copied, and carry no limit here.
+fn check_loader_steps(lines: &[String]) -> Result<(), String> {
+    let reports = loader_reports(lines);
+    let of = |report: &[(usize, u64, u64)], kind: usize| {
+        report
+            .iter()
+            .find(|(k, ..)| *k == kind)
+            .map(|&(_, t, d)| (t, d))
+    };
+    let filled = qemu::number_after(lines, "posix-procs: steps: fork with ").unwrap_or(0);
+    if filled < LOADER_REGIONS_MIN {
+        return Err(format!(
+            "the fork with a full map had {filled} mappings, under {LOADER_REGIONS_MIN}, or did not run"
+        ));
+    }
+    if !reports.iter().any(|r| of(r, 9).is_some()) {
+        return Err("no loader step of a copy: the forks did not run".into());
+    }
+    for kind in 1..=7 {
+        let most = reports.iter().filter_map(|r| of(r, kind)).max();
+        println!(
+            "loader step {kind}, a kernel call: {} ticks at most",
+            most.map_or(0, |m| m.0)
+        );
+    }
+    let go = reports
+        .iter()
+        .filter_map(|r| of(r, 9))
+        .max()
+        .unwrap_or_default();
+    println!(
+        "loader step 9, the whole copy: {} ticks over {} regions at most",
+        go.0, go.1
+    );
+    let limit = TERM_B * 9 / 10;
+    let mut seen = 0;
+    for (ticks, held) in reports.iter().filter_map(|r| of(r, 8)) {
+        println!(
+            "loader step 8, Regions: {ticks} of {limit} (B {TERM_B} less 10 %) with {held} regions held"
+        );
+        seen += 1;
+        if held < LOADER_REGIONS_MIN || ticks == 0 || ticks > limit {
+            return Err(format!(
+                "the loader's step Regions took {ticks} ticks with {held} regions held, past {limit} (B {TERM_B} with a reserve of 10 %), none, or with under {LOADER_REGIONS_MIN} regions"
+            ));
+        }
+    }
+    if seen == 0 {
+        return Err(format!(
+            "no loader held {LOADER_REGIONS_MIN} regions: the fork with a full map did not copy"
+        ));
+    }
+    Ok(())
+}
+
+/// The regions a loader holds in the forks of the full map, the floor of the
+/// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
+/// the role has 80 one-page mappings (`STEPS_FORK_PAGES`) and its
+/// program's. A child binds at most 96 objects, `posix_map::MAX_OBJECTS`,
+/// one for each region that does not join, so a fork with the map full to
+/// its 128 places (abi::MAX_MAPPINGS) does not run.
+const LOADER_REGIONS_MIN: u64 = 80;
+
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
 /// last line of a kind being its longest, since each prints only when it
 /// grows.
@@ -5769,14 +5877,17 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");
-    // The loader's lines, as the services' with the tag 3.
-    let loader_lines: Vec<String> = outcome
-        .lines
-        .iter()
-        .filter_map(|l| l.strip_prefix("loader step: "))
-        .map(|l| format!("service step: 3 {l}"))
-        .collect();
-    let loader = longest_steps(&loader_lines, "3");
+    // The loader serves one fork and reports once: the longest of each kind
+    // over all the forks, with its detail.
+    let mut loader: Vec<(usize, u64, u64)> = Vec::new();
+    for (kind, ticks, detail) in loader_reports(&outcome.lines).into_iter().flatten() {
+        match loader.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) if row.1 >= ticks => {}
+            Some(row) => *row = (kind, ticks, detail),
+            None => loader.push((kind, ticks, detail)),
+        }
+    }
+    loader.sort();
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
@@ -5859,9 +5970,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the process service: kind {kind} took {ticks} ticks, past B {TERM_B}"
         ));
     }
-    if !loader.iter().any(|(k, ..)| *k == 9) {
-        return Err("no loader step of a copy: the forks did not run".into());
-    }
+    check_loader_steps(&outcome.lines)?;
     // The five methods of the change jobs (44 to 48) ran among the crowd, and
     // the longest of each stays under term B like every step of the service.
     for kind in 44..=48 {
@@ -11114,6 +11223,61 @@ mod tests {
                     .all(|program| !program.3.contains(&"signal-probe"))
             );
         }
+    }
+
+    fn loader_lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// A report of a loader that copied a small program, and one of the
+    /// full-map fork with the request `Regions` of `ticks` at 87 regions.
+    fn loaders(ticks: u64) -> Vec<String> {
+        let mut lines = loader_lines(
+            "boot\nloader step: kind 1 900 ticks detail 4096\nloader step: kind 4 5000 ticks detail 4096\nloader step: kind 9 70000 ticks detail 7",
+        );
+        lines.push("loader step: kind 1 950 ticks detail 4096".into());
+        lines.push("loader step: kind 4 5200 ticks detail 4096".into());
+        lines.push(format!("loader step: kind 8 {ticks} ticks detail 87"));
+        lines.push("loader step: kind 9 91000 ticks detail 87".into());
+        lines.push("posix-procs: steps: fork with 80 one page mappings".into());
+        lines
+    }
+
+    #[test]
+    fn the_loader_reports_split_where_the_kinds_stop_rising() {
+        let reports = loader_reports(&loaders(5000));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0], [(1, 900, 4096), (4, 5000, 4096), (9, 70000, 7)]);
+        assert_eq!(reports[1].len(), 4);
+        assert_eq!(reports[1][2], (8, 5000, 87));
+    }
+
+    #[test]
+    fn regions_of_the_full_map_stay_under_nine_tenths_of_b() {
+        check_loader_steps(&loaders(5000)).unwrap();
+        check_loader_steps(&loaders(TERM_B * 9 / 10)).unwrap();
+        let error = check_loader_steps(&loaders(TERM_B * 9 / 10 + 1)).unwrap_err();
+        assert!(error.contains("step Regions took 18370 ticks"), "{error}");
+        // The report of a fork with the map not full does not stand for it.
+        let mut few = loaders(5000);
+        few.retain(|l| !l.contains("kind 8"));
+        assert!(
+            check_loader_steps(&few)
+                .unwrap_err()
+                .contains("did not copy")
+        );
+        let mut short = loaders(5000);
+        short.retain(|l| !l.contains("fork with"));
+        assert!(
+            check_loader_steps(&short)
+                .unwrap_err()
+                .contains("did not run")
+        );
+        let mut low = loaders(5000);
+        for l in &mut low {
+            *l = l.replace("kind 8 5000 ticks detail 87", "kind 8 5000 ticks detail 20");
+        }
+        assert!(check_loader_steps(&low).unwrap_err().contains("under 80"));
     }
 
     #[test]
