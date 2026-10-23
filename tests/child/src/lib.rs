@@ -110,6 +110,13 @@ pub const SEEN: usize = 8;
 /// heartbeat counts its periods; and 1 added each time the handler of
 /// server::BUSY starts to spin.
 pub const SERVED_AT: usize = 9;
+/// The marks of the heartbeat of Role::Server and Role::Busy (rt
+/// `service::PROBE`): its t0, the deadline its timer was armed for last, in
+/// nanoseconds, and how many times it armed the timer. The tests read the
+/// deadline to see that it lies on the grid t0 + k * period.
+pub const HB_T0: usize = 30;
+pub const HB_ARMED: usize = 31;
+pub const HB_ARMS: usize = 32;
 pub const SPINS: usize = 10;
 /// The mark init sets to 1 to let the children of Role::AsidPage that wait
 /// for it begin their rounds.

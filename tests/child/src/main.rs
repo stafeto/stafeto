@@ -15,9 +15,9 @@
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, GO, HELPER, IMAGE, MADE, MARKS, MISMATCH,
-    MOST_USED, NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN,
-    SERVED_AT, SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, GO, HB_T0, HELPER, IMAGE, MADE, MARKS,
+    MISMATCH, MOST_USED, NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST,
+    SCRATCH_PAGES, SEEN, SERVED_AT, SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -1091,6 +1091,7 @@ fn serve_sessions(s: &Start, busy: bool) -> u64 {
         heartbeat,
     };
     mark(SERVED_AT).store(time::ticks_to_ns(time::now()), Relaxed);
+    service::PROBE.store((mark(HB_T0) as *const AtomicU64).cast_mut(), Relaxed);
     service::run::<_, { server::SESSIONS_MAX }, { server::HELD }>(&c, &mut server, config).code()
 }
 

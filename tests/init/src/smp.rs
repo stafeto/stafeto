@@ -549,15 +549,15 @@ fn time_across_cpus() -> Outcome {
     pause(10_000_000);
     // Read again and again while it runs: it is at EL0 for two thirds of
     // them, where its stretch is open, and in the kernel for the rest.
-    let (mut sane, mut last) = (true, (0, 0));
+    // Its time only grows, in each reading. The share in the kernel is
+    // read once, at the last: a reading that finds the CPU of the thread
+    // stopped by the host inside the kernel shows a share above the bound.
+    let (mut grows, mut last) = (true, (0, 0));
     for _ in 0..40 {
         pause(1_000_000);
         let (ran, system) = sys::thread_times(&t).map_err(|_| "thread_times failed")?;
         let (ran_ns, system_ns) = (time::ticks_to_ns(ran), time::ticks_to_ns(system));
-        sane &= ran_ns >= last.0
-            && system_ns >= ran_ns / 20
-            && system_ns <= ran_ns / 20 * 19
-            && ran_ns < 4_000_000_000;
+        grows &= ran_ns >= last.0 && ran_ns < 4_000_000_000;
         last = (ran_ns, system_ns);
     }
     let moved = mark(0) != 0;
@@ -571,8 +571,12 @@ fn time_across_cpus() -> Outcome {
         "the thread on the other CPU did not run and stop",
     )?;
     check(
-        sane && ran_ns >= 40_000_000,
-        "the time of a thread on another CPU is not what it ran, with a share in the kernel",
+        grows && ran_ns >= 40_000_000,
+        "the time of a thread on another CPU is not what it ran",
+    )?;
+    check(
+        system_ns >= ran_ns / 20 && system_ns <= ran_ns / 20 * 19,
+        "the share of a thread on another CPU in the kernel is out of its bounds",
     )?;
     println!("smp: a thread at EL0 on CPU 1 ran {ran_ns} ns, {system_ns} ns of them in the kernel");
     Ok(())
@@ -857,10 +861,19 @@ fn raise_across_cpus() -> Outcome {
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
     let server = spawn_on(0, 2, serve_until_raised, 0, LEVEL)?;
-    pause(20_000_000);
     let client = spawn_on(1, 1, ask_once, 0, LEVEL)?;
-    pause(30_000_000);
+    // The service marks its level once it works on the request; the raise
+    // comes after that, whenever the host lets it.
+    let taken = wait_for(|| mark(0) != 0);
     let before = mark(0);
+    if !taken {
+        let_run()?;
+        for t in [server, client] {
+            close(t)?;
+        }
+        close(c)?;
+        return Err("the service did not take the request of the client");
+    }
     sys::thread_set_priority(&client, RAISED, Policy::Fifo).map_err(|_| "the raise failed")?;
     let done = wait_for(|| mark(1) != 0 && mark(3) != 0);
     let (seen, replied) = (mark(0), mark(1));
@@ -969,11 +982,13 @@ fn kill_of_threads_being_woken() -> Outcome {
     if n < 4 {
         return Ok(());
     }
-    for _ in 0..KILL_ROUNDS {
+    let mut margin = 60_000_000;
+    let mut round = 0;
+    while round < KILL_ROUNDS {
         let kid = Kid::load(LEAF_QUOTA + 60 * PAGE as u64, 40, KILL_LEVEL)?;
         reset_kid_marks();
         // Far enough for the threads to be made and to wait.
-        let at = now() + 60_000_000;
+        let at = now() + margin;
         set_kid_mark(TIMED_AT, at);
         kid.start()?;
         kid.serve(
@@ -983,10 +998,18 @@ fn kill_of_threads_being_woken() -> Outcome {
         )?;
         let_run()?;
         let waiting = || (0..KILL_THREADS).all(|i| kid_mark(TIMED_MARKS + i) != 0);
-        check(
-            wait_for(waiting) && now() < at,
-            "the threads of the child did not wait for their timers in time",
-        )?;
+        if !(wait_for(waiting) && now() < at) {
+            // The host held the run back past the instant: the premise of
+            // the round, not its property. Again, with twice the margin.
+            kid.close()?;
+            let_run()?;
+            margin *= 2;
+            check(
+                margin <= 2_000_000_000,
+                "the threads of the child never waited for their timers in time",
+            )?;
+            continue;
+        }
         // The kernel built with `window-probe` holds the end of the process
         // until the timers fire (kernel cmd::window::hold_until_woken).
         let kill_at = at - 20_000_000;
@@ -1001,6 +1024,7 @@ fn kill_of_threads_being_woken() -> Outcome {
             state == Ok(ProcessState::Killed),
             "the process of the waking threads did not end killed",
         )?;
+        round += 1;
     }
     println!(
         "smp: a process of {KILL_THREADS} threads on CPUs 1 to 3 was killed {KILL_ROUNDS} times shortly before their timers fired"

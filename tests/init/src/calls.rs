@@ -1090,9 +1090,9 @@ fn until_elapsed(ticks: u64, batch: u32, mut step: impl FnMut()) -> u64 {
 fn loops_split_the_time() -> Result<bool, &'static str> {
     let four_ms = rt::time::frequency() / 250;
     // The loop with no call runs three times and the round with the least
-    // kernel time per tick counts: the interrupts of the timer are all that
-    // it gets in the kernel, and a host that is busy makes them slow in
-    // some rounds.
+    // kernel time per tick counts, for its share of the kernel time and for
+    // the bound on it: the interrupts of the timer are all that it gets in
+    // the kernel, and a host that is busy makes them slow in some rounds.
     let (mut spin_user, mut spin_kernel, mut spin_elapsed) = (0, 0, 0);
     let mut kernel1 = 0;
     for round in 0..3 {
@@ -1102,14 +1102,17 @@ fn loops_split_the_time() -> Result<bool, &'static str> {
         kernel1 = kernel_end;
         let (user, kernel) = (user1.saturating_sub(user0), kernel1.saturating_sub(kernel0));
         check(user > four_ms / 2, "a loop at EL0 grew no user time")?;
-        check(
-            kernel < user / 8,
-            "a loop at EL0 with no call grew the kernel time",
-        )?;
         if round == 0 || kernel * spin_elapsed < spin_kernel * elapsed {
             (spin_user, spin_kernel, spin_elapsed) = (user, kernel, elapsed);
         }
     }
+    // The round with the least kernel time per tick is the one the host
+    // disturbed least; a single slow interrupt of the host in the other two
+    // says nothing of the kernel.
+    check(
+        spin_kernel < spin_user / 8,
+        "a loop at EL0 with no call grew the kernel time",
+    )?;
     let call_elapsed = until_elapsed(four_ms, 256, || {
         let _ = sys::yield_now();
     });

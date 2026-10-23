@@ -1497,8 +1497,9 @@ fn beat_back(token: Token) -> Outcome {
 }
 
 /// The HEARTBEAT that waits on the channel of `kid` now, past the
-/// CLIENT_GONE of copies and the late expiries of its `Ear`: its token.
-fn heartbeat_now(kid: &Kid) -> Result<Token, &'static str> {
+/// CLIENT_GONE of copies and the late expiries of its `Ear`: its token, or
+/// None when the channel holds nothing else.
+fn heartbeat_waiting(kid: &Kid) -> Result<Option<Token>, &'static str> {
     let beat = Method::Heartbeat.header().bytes();
     loop {
         match kid.ear.now() {
@@ -1512,27 +1513,61 @@ fn heartbeat_now(kid: &Kid) -> Result<Token, &'static str> {
                 token,
                 words,
                 ..
-            }) if abi::inline_bytes(&words)[..len.min(64)] == beat[..] => return Ok(token),
-            _ => return Err("a heartbeat did not come by its absolute deadline"),
+            }) if abi::inline_bytes(&words)[..len.min(64)] == beat[..] => return Ok(Some(token)),
+            Err(Error::WouldBlock) => return Ok(None),
+            _ => return Err("the channel of the service held something but a heartbeat"),
         }
     }
 }
 
-/// Spec 10, 13.4: the heartbeat keeps its absolute period, t0 + k·T with
-/// t0 the clock the child marked before its loop, and the check goes by
-/// the order of events alone. Init answers each HEARTBEAT three quarters
-/// of a period past the last deadline, then waits until half a period
-/// past the deadline after its reply (next_release) and takes the next
-/// HEARTBEAT, which must be there. Init waits on a timer whose slot is at
-/// 1, below the child: when the host holds the run up and both deadlines
-/// pass at once, the child still sends first, so a late host fails
-/// nothing. A heartbeat armed from the reply (now + T) would come a
-/// quarter of a period after that check. A host that stops the machine
-/// after the child's deadline woke it and before it sent (#148) leaves
-/// the child ready or running at the check, with init's deadline passed
-/// as well: the child then runs and its HEARTBEAT must come
-/// (`held_heartbeat`). A child that armed its timer from the reply waits
-/// in receive at the check, and fails it.
+/// How long init waits for a HEARTBEAT that is due: a bound for a service
+/// that sends none, never a condition of the property.
+const HEARTBEAT_WAIT_NS: u64 = 3_000_000_000;
+
+/// The next HEARTBEAT of `kid`, which the host may hold up for as long as
+/// it likes.
+fn heartbeat_within(kid: &Kid) -> Result<Token, &'static str> {
+    let until = clock_now()? + HEARTBEAT_WAIT_NS;
+    loop {
+        if let Some(token) = heartbeat_waiting(kid)? {
+            return Ok(token);
+        }
+        if clock_now()? > until {
+            return Err("no HEARTBEAT came");
+        }
+        let_run()?;
+    }
+}
+
+/// How many times the heartbeat of the child armed its timer (rt
+/// `service::PROBE`).
+fn arms() -> u64 {
+    kid_mark(child::HB_ARMS)
+}
+
+/// The deadline the heartbeat armed its timer for after the arm number
+/// `before`: init waits for the event, up to `HEARTBEAT_WAIT_NS`. The arm
+/// is the last thing the loop does after the reply init gave, so a service
+/// the host holds on another CPU shows it when it runs.
+fn armed_after(before: u64) -> Result<u64, &'static str> {
+    let until = clock_now()? + HEARTBEAT_WAIT_NS;
+    while arms() <= before {
+        if clock_now()? > until {
+            return Err("the service did not arm its timer after the reply");
+        }
+        let_run()?;
+    }
+    Ok(kid_mark(child::HB_ARMED))
+}
+
+/// Spec 10, 13.4: the heartbeat keeps its absolute period, t0 + k·T, and
+/// the check goes by the value of the deadline the service armed its timer
+/// for, which it marks (rt `service::PROBE`), never by how long the host
+/// took. Init answers each HEARTBEAT three quarters of a period past the
+/// last deadline, waits for the service to arm its timer again, and the
+/// deadline it armed must lie on the grid and past the reply. A timer armed
+/// from the reply (now + T) lies off the grid. The HEARTBEAT of that
+/// deadline then comes (`heartbeat_within`).
 fn heartbeats_keep_their_absolute_period() -> Outcome {
     const BEATS: usize = 8;
     serving(Role::Server, PERIOD_NS, None, |kid, _| {
@@ -1543,63 +1578,22 @@ fn heartbeats_keep_their_absolute_period() -> Outcome {
             _ => Err("a pause of the test did not end at its deadline"),
         };
         let (_, mut token) = heartbeat(kid)?;
-        let t0 = kid_mark(child::SERVED_AT);
+        let t0 = kid_mark(child::HB_T0);
         for _ in 0..BEATS {
             let last = next_release(t0, PERIOD_NS, clock_now()?) - PERIOD_NS;
             wait_until(last + PERIOD_NS * 3 / 4)?;
+            let before = arms();
+            let replied = clock_now()?;
             beat_back(token)?;
-            let due = next_release(t0, PERIOD_NS, clock_now()?);
-            wait_until(due + PERIOD_NS / 2)?;
-            token = match heartbeat_now(kid) {
-                Ok(token) => token,
-                Err(why) => held_heartbeat(kid, why)?,
-            };
+            let armed = armed_after(before)?;
+            check(
+                armed > replied && (armed - t0).is_multiple_of(PERIOD_NS),
+                "the heartbeat armed its timer for a deadline off the grid t0 + k * period",
+            )?;
+            token = heartbeat_within(kid)?;
         }
         beat_back(token)
     })
-}
-
-/// The HEARTBEAT of a child that the host held between its deadline and
-/// its send (#148): while the child is ready or runs (on this CPU or on
-/// another), init lets it run and looks again, for up to a period; a
-/// child that waits in receive at the check armed its timer late, and
-/// `why` stands. Each case says so on a line.
-fn held_heartbeat(kid: &Kid, why: &'static str) -> Result<Token, &'static str> {
-    let until = clock_now()? + PERIOD_NS;
-    loop {
-        let state = sys::thread_info(&kid.thread).map(|i| i.state);
-        let held = matches!(
-            state,
-            Ok(abi::ThreadState::Ready | abi::ThreadState::Running)
-        );
-        if let Ok(token) = heartbeat_now(kid) {
-            println!(
-                "heartbeat: the child sent past half a period after its deadline: the host held the run"
-            );
-            return Ok(token);
-        }
-        if !held || clock_now()? > until {
-            println!(
-                "heartbeat: no HEARTBEAT half a period past the deadline, the child {state:?}"
-            );
-            return Err(why);
-        }
-        let_run()?;
-    }
-}
-
-/// Whether the channel of `kid` holds nothing now but late expiries of
-/// its `Ear`.
-fn kid_silent(kid: &Kid) -> bool {
-    loop {
-        match kid.ear.now() {
-            Ok(Received::Notification {
-                source: Source::Timer,
-                ..
-            }) => continue,
-            other => return other == Err(Error::WouldBlock),
-        }
-    }
 }
 
 /// Spec 10, 13.4: deadlines of the heartbeat that passed while the
@@ -1607,11 +1601,10 @@ fn kid_silent(kid: &Kid) -> bool {
 /// slot has the priority the heartbeat names. The child runs at LOW, its
 /// heartbeat's timer at LEVEL: while init holds a HEARTBEAT, the child
 /// waits in send at LEVEL, the boost its timer's expiry gave it. Init
-/// holds the reply two and a quarter periods past the last deadline,
-/// answers, and lets the child run until it waits again: a timer armed at
-/// a deadline that passed fires at once, and its HEARTBEAT would be there
-/// by then; the first deadline after now is three quarters of a period
-/// ahead, and its HEARTBEAT comes by half a period past it.
+/// holds the reply two and a quarter periods past the last deadline and
+/// answers: the service arms its timer once, for a deadline of the grid
+/// past the reply (one that passed would fire at once, and its HEARTBEAT
+/// would come in a burst). Its HEARTBEAT comes then.
 fn missed_heartbeats_are_not_made_up() -> Outcome {
     serving_at(LOW, Role::Server, PERIOD_NS, None, |kid, _| {
         let pause = channel(QUIET)?;
@@ -1622,21 +1615,26 @@ fn missed_heartbeats_are_not_made_up() -> Outcome {
         };
         let (_, token) = heartbeat(kid)?;
         let priority = sys::thread_info(&kid.thread).map(|i| i.priority);
-        let t0 = kid_mark(child::SERVED_AT);
+        let t0 = kid_mark(child::HB_T0);
         let last = next_release(t0, PERIOD_NS, clock_now()?) - PERIOD_NS;
         wait_until(last + 2 * PERIOD_NS + PERIOD_NS / 4)?;
+        let before = arms();
+        let replied = clock_now()?;
         beat_back(token)?;
-        let_run()?;
-        let silent = kid_silent(kid);
-        let due = next_release(t0, PERIOD_NS, clock_now()?);
-        wait_until(due + PERIOD_NS / 2)?;
-        let next = heartbeat_now(kid).and_then(beat_back);
+        let armed = armed_after(before)?;
         check(
             priority == Ok(LEVEL),
             "the timer of the heartbeat did not wake the loop at its priority",
         )?;
-        check(silent, "missed heartbeats were made up in a burst")?;
-        next
+        check(
+            armed > replied && (armed - t0).is_multiple_of(PERIOD_NS),
+            "the heartbeat armed its timer for a deadline that passed, or off the grid",
+        )?;
+        check(
+            arms() == before + 1,
+            "missed heartbeats were made up in a burst",
+        )?;
+        heartbeat_within(kid).and_then(beat_back)
     })
 }
 
