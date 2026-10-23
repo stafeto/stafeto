@@ -77,6 +77,7 @@ extern "C" fn receiver(_: u64) -> ! {
             ceiling: adoption.ceiling,
             priority: adoption.priority,
             root: adoption.root,
+            cpus: adoption.cpus,
             ticket: adoption.ticket,
         };
         let handed = (

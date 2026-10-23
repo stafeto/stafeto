@@ -77,6 +77,7 @@ fn create(
         ceiling: 30,
         priority: 30,
         root: true,
+        cpus: 0,
         ticket: 0,
     };
     if proto_process::Method::Create

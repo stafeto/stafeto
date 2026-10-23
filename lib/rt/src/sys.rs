@@ -200,6 +200,26 @@ pub fn handle_label(
     Ok(returned(&x))
 }
 
+/// The shares of a new process (process_create x6, x7, spec 7.5): its own
+/// count of thread numbers and of timer places, taken off the share of the
+/// caller's payer, or none, which makes the process pay from the share of
+/// that payer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shares {
+    /// Thread numbers, 1 up to the system's 1 024; 0 with no timers.
+    pub threads: u32,
+    /// Timer places, 1 up to the system's 8 192; 0 with no thread numbers.
+    pub timers: u32,
+}
+
+impl Shares {
+    /// No share of its own: the process pays from the caller's payer.
+    pub const CREATOR: Shares = Shares {
+        threads: 0,
+        timers: 0,
+    };
+}
+
 /// process_create with no exit channel and no start channel: a process
 /// with an empty address space, a memory quota of `quota` bytes (whole
 /// pages, counted from milestone 1.3), room for `handle_limit` handles and
@@ -211,7 +231,8 @@ pub fn process_create(
     handle_limit: u32,
     ceiling: u8,
 ) -> Result<Handle<Process>, Error> {
-    process_create_with(quota, handle_limit, ceiling, None, None).map_err(|(e, _)| e)
+    process_create_with(quota, handle_limit, ceiling, None, None, Shares::CREATOR, 0)
+        .map_err(|(e, _)| e)
 }
 
 /// process_create with channels (spec 7.9, 13.3). `exit`, a channel handle
@@ -220,17 +241,31 @@ pub fn process_create(
 /// a notification of that priority, bit 0, with the label of the handle.
 /// `start`, a channel handle with TRANSFER, moves into the child's entry 0
 /// (abi::START_CHANNEL) with its rights, label and all; when the call
-/// fails it stays the caller's and comes back with the error.
+/// fails it stays the caller's and comes back with the error. `shares` are
+/// x6 and x7 (spec 7.5) and `cpus` is x8, the CPUs of the process's
+/// threads, a subset of the caller's: 0 for the caller's own.
 pub fn process_create_with(
     quota: u64,
     handle_limit: u32,
     ceiling: u8,
     exit: Option<(&Handle<Channel>, u8)>,
     start: Option<Handle<Channel>>,
+    shares: Shares,
+    cpus: u8,
 ) -> Result<Handle<Process>, (Error, Option<Handle<Channel>>)> {
     let (x3, x4) = exit.map_or((0, 0), |(c, priority)| (c.raw().0, priority.into()));
     let x5 = start.as_ref().map_or(0, |c| c.raw().0);
-    let args = [quota, handle_limit.into(), ceiling.into(), x3, x4, x5];
+    let args = [
+        quota,
+        handle_limit.into(),
+        ceiling.into(),
+        x3,
+        x4,
+        x5,
+        shares.threads.into(),
+        shares.timers.into(),
+        cpus.into(),
+    ];
     match call::<{ Call::ProcessCreate.number() }>(&args) {
         Ok(x) => {
             if let Some(moved) = start {
@@ -464,6 +499,9 @@ pub struct CpuInfo {
     pub system: u64,
     /// The CPU of the caller.
     pub current: u64,
+    /// The CPU mask of the caller's process (process_create x8): the CPUs
+    /// its threads may run on.
+    pub allowed: u64,
 }
 
 /// object_info(CPU) of CPU `index`: no handle and no right needed.
@@ -477,6 +515,7 @@ pub fn cpu_info(index: u64) -> Result<CpuInfo, Error> {
         idle: x[3],
         system: x[4],
         current: x[5],
+        allowed: x[6],
     })
 }
 
@@ -516,6 +555,16 @@ pub fn process_memory(process: &Handle<Process>) -> Result<ProcessMemory, Error>
     let args = [process.raw().0, abi::INFO_PROCESS_MEMORY, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(ProcessMemory::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(PROCESS_SHARES): the process's shares of thread numbers and
+/// timer places (spec 7.5), and whether it pays from them.
+pub fn process_shares(process: &Handle<Process>) -> Result<abi::ProcessShares, Error> {
+    let args = [process.raw().0, abi::INFO_PROCESS_SHARES, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(abi::ProcessShares::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+    ]))
 }
 
 /// object_info(PROCESS_HANDLES): the process's live handles, its retired

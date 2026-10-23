@@ -3,13 +3,16 @@
 
 //! The dialog of the CPUs in the shell image: what a program sees of the
 //! machine's CPUs and how the process service spreads work over them. On N
-//! CPUs `nproc` and the CPU lines of `/proc/stat` and `/proc/cpuinfo` say N,
-//! the mask of `taskset -p` names N CPUs, N loops in the background land on N
-//! different CPUs (the `processor` field of `/proc/<pid>/stat`) and keep each
-//! CPU busy in its line of `/proc/stat`, a command under `taskset -c` runs on
-//! the CPU the mask names, and htop shows a meter for each CPU under that
-//! load. On one CPU everything is as before: `nproc` says 1 and every process
-//! is on CPU 0.
+//! CPUs the CPU lines of `/proc/stat` and `/proc/cpuinfo` and the listing of
+//! `/sys/devices/system/cpu` say N. The processes of the shell stand on the CPUs of the services,
+//! the first two (kernel spec 13.4, `GENERAL_CPUS`): with A = min(N, 2),
+//! `nproc` says A, the mask of `taskset -p` names A CPUs, A loops in the
+//! background land on A different CPUs (the `processor` field of
+//! `/proc/<pid>/stat`) and keep each of them busy in its line of
+//! `/proc/stat`, a command under `taskset -c` runs on the CPU the mask
+//! names, one under `taskset -c` on a CPU outside the first two is refused,
+//! and htop shows a meter for each of the N CPUs under that load. On one CPU
+//! everything is as before: `nproc` says 1 and every process is on CPU 0.
 
 use super::*;
 use std::cell::RefCell;
@@ -75,11 +78,15 @@ fn dialog(cpus: usize) -> Result<(), String> {
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = (|| {
         let n = cpus.to_string();
+        // The CPUs of the processes of the shell: the mask of the record of
+        // init's table, within the CPUs that are up.
+        let allowed = cpus.min(2);
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
         run.expect("# ", DIALOG_STEP)?;
-        // The count of CPUs, as BusyBox counts the mask of sched_getaffinity
-        // and as the files of /proc list them.
-        answers(&mut run, "nproc", "nproc", &n)?;
+        // The count of CPUs the shell may use, as BusyBox counts the mask of
+        // sched_getaffinity, and of those that are up, as the files of /proc
+        // list them.
+        answers(&mut run, "nproc", "nproc", &allowed.to_string())?;
         answers(
             &mut run,
             "grep -c '^cpu[0-9]' /proc/stat",
@@ -92,12 +99,18 @@ fn dialog(cpus: usize) -> Result<(), String> {
             "the records of /proc/cpuinfo",
             &n,
         )?;
-        // The listing of /sys/devices/system/cpu, which `nproc --all` and
-        // htop count.
+        // The listing of /sys/devices/system/cpu, which htop counts and
+        // BusyBox counts for `nproc --all` (the long options are off in this
+        // build of BusyBox, and `nproc --all` says what `nproc` does).
         run.send("ls /sys/devices/system/cpu")?;
         run.expect("# ", DIALOG_STEP)?;
-        answers(&mut run, "nproc --all", "nproc --all", &n)?;
-        let mask = format!("affinity mask: {:x}", (1u32 << cpus) - 1);
+        answers(
+            &mut run,
+            "ls /sys/devices/system/cpu | grep -c '^cpu[0-9]'",
+            "the CPUs of /sys/devices/system/cpu",
+            &n,
+        )?;
+        let mask = format!("affinity mask: {:x}", (1u32 << allowed) - 1);
         run.send("taskset -p $$")?;
         run.expect_line(
             "the mask of taskset",
@@ -110,7 +123,7 @@ fn dialog(cpus: usize) -> Result<(), String> {
         // nothing else is made in between (`nproc` runs before them).
         run.send("n=$(nproc); for i in 1 2 3 4 5 6 7 8; do [ $i -le $n ] && { while :; do :; done; } & [ $i -le $n ] && echo loop:$!; done")?;
         let mut pids = Vec::new();
-        for _ in 0..cpus {
+        for _ in 0..allowed {
             let line = run.expect_line("a loop", |l| l.starts_with("loop:"), DIALOG_STEP)?;
             pids.push(
                 numbers(&line, "loop:")
@@ -144,9 +157,9 @@ fn dialog(cpus: usize) -> Result<(), String> {
         distinct.sort_unstable();
         distinct.dedup();
         println!("the loops {pids:?} run on the CPUs {placed:?}");
-        if distinct.len() != cpus || distinct.iter().any(|&c| c >= cpus as u64) {
+        if distinct.len() != allowed || distinct.iter().any(|&c| c >= allowed as u64) {
             return Err(format!(
-                "{cpus} loops are on the CPUs {placed:?}, not on {cpus} different CPUs"
+                "{allowed} loops are on the CPUs {placed:?}: {allowed} different CPUs of the first {allowed} expected"
             ));
         }
         run.send(
@@ -168,7 +181,7 @@ fn dialog(cpus: usize) -> Result<(), String> {
             busy.borrow_mut().push(user + system);
         }
         run.expect("# ", DIALOG_STEP)?;
-        if let Some(lazy) = busy.borrow().iter().position(|&b| b < BUSY_MIN) {
+        if let Some(lazy) = busy.borrow()[..allowed].iter().position(|&b| b < BUSY_MIN) {
             return Err(format!(
                 "CPU {lazy} was busy {} hundredths of a second under a loop of its own: {:?}",
                 busy.borrow()[lazy],
@@ -201,7 +214,7 @@ fn dialog(cpus: usize) -> Result<(), String> {
         run.send(&format!("kill {}", all.join(" ")))?;
         run.expect("# ", DIALOG_STEP)?;
         // A command under a mask runs on the CPU the mask names.
-        let target = cpus - 1;
+        let target = allowed - 1;
         run.send(&format!("taskset -c {target} sleep 30 &"))?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("sleep 1; echo taskset:$!")?;
@@ -223,6 +236,19 @@ fn dialog(cpus: usize) -> Result<(), String> {
         )?;
         run.send(&format!("kill {pid}"))?;
         run.expect("# ", DIALOG_STEP)?;
+        // A CPU outside the mask of the kernel is refused (EINVAL), though
+        // it is up.
+        if cpus > allowed {
+            answers(
+                &mut run,
+                &format!(
+                    "if taskset -c {} true 2>/dev/null; then echo pinned:yes; else echo pinned:no; fi",
+                    cpus - 1
+                ),
+                "taskset on a CPU outside the mask",
+                "pinned:no",
+            )?;
+        }
         run.type_raw(b"\x04")?;
         run.expect(
             "init: busybox-probe ended: exit code 0, not restarted",

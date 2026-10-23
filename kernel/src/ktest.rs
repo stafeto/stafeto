@@ -286,6 +286,30 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::process_create_checks_the_callers_limits,
     ),
     (
+        "child_with_a_share_refuses_the_numbers_beyond_it",
+        calls::child_with_a_share_refuses_the_numbers_beyond_it,
+    ),
+    (
+        "child_without_a_share_pays_from_the_creators",
+        calls::child_without_a_share_pays_from_the_creators,
+    ),
+    (
+        "the_cpu_mask_of_a_child_is_a_subset_of_its_creators",
+        calls::the_cpu_mask_of_a_child_is_a_subset_of_its_creators,
+    ),
+    (
+        "thread_create_keeps_to_the_cpu_mask_of_the_target",
+        calls::thread_create_keeps_to_the_cpu_mask_of_the_target,
+    ),
+    (
+        "timer_places_come_off_the_share",
+        calls::timer_places_come_off_the_share,
+    ),
+    (
+        "process_create_takes_its_shares_before_the_quota",
+        calls::process_create_takes_its_shares_before_the_quota,
+    ),
+    (
         "entry_0_of_a_child_stays_bad",
         calls::entry_0_of_a_child_stays_bad,
     ),

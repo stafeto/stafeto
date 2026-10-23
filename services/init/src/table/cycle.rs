@@ -4,7 +4,7 @@
 //! A table init refuses (feature `table-cycle`, spec 15.2): two services
 //! that connect to each other.
 
-use super::{Kind, Record, Restart};
+use super::{GENERAL_CPUS, Kind, Record, Restart, Shares};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -32,6 +32,8 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     }
 }
 

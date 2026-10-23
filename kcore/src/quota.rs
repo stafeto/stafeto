@@ -95,6 +95,95 @@ impl Account {
     }
 }
 
+/// A share of a process (spec 7.5): a count of thread numbers or of timer
+/// places its creator gave it, what is charged to it, and what went back to
+/// the creator, in two parts as `Account` has them. A charge that does not
+/// fit is LIMIT_REACHED. The counts are kept in 16 bits, so that two shares
+/// fit what a process shell has left of its page; the limit may be up to
+/// `Share::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Share {
+    limit: u16,
+    used: u16,
+    returned: u16,
+    closed: bool,
+}
+
+impl Share {
+    /// The largest count a share holds.
+    pub const MAX: u32 = u16::MAX as u32;
+
+    /// A share of `limit`, at most `MAX`, with nothing charged.
+    pub const fn new(limit: u32) -> Share {
+        assert!(limit <= Self::MAX, "a share above what 16 bits hold");
+        Share {
+            limit: limit as u16,
+            used: 0,
+            returned: 0,
+            closed: false,
+        }
+    }
+
+    /// The count the creator gave.
+    pub fn limit(&self) -> u32 {
+        self.limit.into()
+    }
+
+    /// The count charged and not refunded.
+    pub fn used(&self) -> u32 {
+        self.used.into()
+    }
+
+    /// The count that went back to the creator.
+    pub fn returned(&self) -> u32 {
+        self.returned.into()
+    }
+
+    /// Charges `n`: LIMIT_REACHED when they do not fit in what is left of
+    /// the share, or once the free part went back.
+    pub fn charge(&mut self, n: u32) -> Result<(), Error> {
+        let used = u32::from(self.used) + n.min(Self::MAX + 1);
+        if !self.closed && used <= u32::from(self.limit - self.returned) {
+            self.used = used as u16;
+            Ok(())
+        } else {
+            Err(Error::LimitReached)
+        }
+    }
+
+    /// Gives back `n` that a charge took.
+    pub fn refund(&mut self, n: u32) {
+        self.used = u32::from(self.used)
+            .checked_sub(n)
+            .expect("a refund of more than the share holds") as u16;
+    }
+
+    /// The first part back to the creator, as `Account::return_free`.
+    pub fn return_free(&mut self) -> u32 {
+        if self.closed {
+            return 0;
+        }
+        let free = self.limit - self.returned - self.used;
+        self.returned += free;
+        self.closed = true;
+        free.into()
+    }
+
+    /// The rest back to the creator, as `Account::return_rest`: stops
+    /// while a number or a place is still charged.
+    pub fn return_rest(&mut self) -> u32 {
+        assert!(
+            self.used == 0,
+            "the rest of a share goes back while {} are charged",
+            self.used
+        );
+        let rest = self.limit - self.returned;
+        self.returned = self.limit;
+        self.closed = true;
+        rest.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +268,49 @@ mod tests {
         let mut a = Account::new(16 * KIB);
         a.charge(4 * KIB).unwrap();
         a.refund(4 * KIB + 1);
+    }
+
+    #[test]
+    fn share_charges_to_its_limit_with_limit_reached() {
+        let mut s = Share::new(4);
+        for _ in 0..4 {
+            assert_eq!(s.charge(1), Ok(()));
+        }
+        assert_eq!(s.charge(1), Err(Error::LimitReached));
+        assert_eq!(s.charge(u32::MAX), Err(Error::LimitReached));
+        s.refund(1);
+        assert_eq!(s.charge(1), Ok(()));
+        assert_eq!((s.limit(), s.used(), s.returned()), (4, 4, 0));
+    }
+
+    #[test]
+    fn share_comes_back_in_two_parts_and_adds_up() {
+        let mut s = Share::new(8);
+        s.charge(3).unwrap();
+        let first = s.return_free();
+        assert_eq!(first, 5);
+        assert_eq!(s.return_free(), 0);
+        assert_eq!(s.charge(1), Err(Error::LimitReached));
+        s.refund(3);
+        let rest = s.return_rest();
+        assert_eq!(rest, 3);
+        assert_eq!((s.used(), s.returned()), (0, 8));
+    }
+
+    #[test]
+    #[should_panic(expected = "while 1 are charged")]
+    fn share_rest_before_the_last_refund_stops() {
+        let mut s = Share::new(2);
+        s.charge(1).unwrap();
+        s.return_free();
+        s.return_rest();
+    }
+
+    #[test]
+    #[should_panic(expected = "a refund of more than the share holds")]
+    fn share_refund_of_more_than_was_charged_stops() {
+        let mut s = Share::new(2);
+        s.charge(1).unwrap();
+        s.refund(2);
     }
 }

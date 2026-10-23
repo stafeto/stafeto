@@ -259,6 +259,7 @@ fn run(s: &Start) -> u64 {
         Role::SmpSpin => smp_spin(s, a[0] as usize, a[1] as u8),
         Role::SmpTimers => smp_timers(),
         Role::SmpSpawners => smp_spawners(),
+        Role::Greedy => greedy(s, a[0], a[1], a[2], a[3] as usize),
         Role::SmpTimed => smp_timed(s, a[0] as usize, a[1] as u8, a[2] as usize),
         Role::AsidPage => asid_page(s, a[0], a[1], a[2] != 0),
         Role::UnmapAcross => unmap_across(s, a[0] as u8),
@@ -414,6 +415,8 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
         priority: level,
         policy: Policy::Fifo,
         cpu: 0,
+        shares: sys::Shares::CREATOR,
+        cpus: 0,
     };
     // The next call is process_create: the parent's tests that hold or end
     // the child at that call look at this mark.
@@ -598,6 +601,70 @@ fn smp_spawners() -> u64 {
             // The process ended under the call, or the quota is spent.
             Err(e) => return e.code(),
         }
+    }
+}
+
+/// Role::Greedy: `per` threads in each of `children` processes of `quota`
+/// bytes, or in its own process for 0 children, until one call fails; the
+/// marks from `at` say what came of it, and the process waits with all it
+/// took.
+fn greedy(s: &Start, quota: u64, per: u64, children: u64, at: usize) -> u64 {
+    const FIRST: u64 = 0x2000_0000;
+    let own = Handle::<Process>::borrowed(s.handles[0]);
+    let (mut threads, mut made) = (0, 0);
+    let mut error = 0;
+    'all: for _ in 0..children.max(1) {
+        let child;
+        let target: &Handle<Process> = if children == 0 {
+            &own
+        } else {
+            match sys::process_create(quota, 16, 1) {
+                Ok(c) => {
+                    made += 1;
+                    child = c;
+                    &child
+                }
+                Err(e) => {
+                    error = e.code();
+                    break 'all;
+                }
+            }
+        };
+        for i in 0..per {
+            let x = [
+                target.raw().0,
+                0x1000,
+                0x10_0000,
+                0,
+                1,
+                Policy::Fifo as u64,
+                FIRST + i * 0x1000,
+                0,
+                0,
+                0,
+            ];
+            // SAFETY: the thread is stopped and never started; it runs no
+            // code and uses no memory of this process.
+            let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+            if after[0] != 0 {
+                error = after[0];
+                break 'all;
+            }
+            threads += 1;
+        }
+    }
+    mark(at).store(threads, Relaxed);
+    mark(at + 1).store(error, Relaxed);
+    mark(at + 2).store(made, Relaxed);
+    mark(at + 3).store(1, Relaxed);
+    // Waits for good in a receive on a channel nobody sends to, so that
+    // the children below it run meanwhile.
+    match sys::channel_create(1) {
+        Ok(c) => {
+            let _ = sys::receive(&c);
+            FAILED
+        }
+        Err(_) => FAILED,
     }
 }
 
@@ -879,22 +946,22 @@ fn ceiling(s: &Start, checked: Checked) -> u64 {
             const N: u16 = Call::ProcessCreate.number();
             let over = abi::MAX_MEMORY;
             first_wrong(&[
-                x0_alone::<N>(&[PAGE, 16, above, closed, 5, 0], bad),
-                x0_alone::<N>(&[PAGE, 16, above, 0, 0, closed], bad),
-                x0_alone::<N>(&[PAGE, 16, above, 0, 0, 0], denied),
-                x0_alone::<N>(&[over, 16, above, 0, 0, 0], denied),
-                x0_alone::<N>(&[over, 16, at, 0, 0, 0], Error::NoMemory.code()),
+                x0_alone::<N>(&[PAGE, 16, above, closed, 5, 0, 0, 0, 0], bad),
+                x0_alone::<N>(&[PAGE, 16, above, 0, 0, closed, 0, 0, 0], bad),
+                x0_alone::<N>(&[PAGE, 16, above, 0, 0, 0, 0, 0, 0], denied),
+                x0_alone::<N>(&[over, 16, above, 0, 0, 0, 0, 0, 0], denied),
+                x0_alone::<N>(&[over, 16, at, 0, 0, 0, 0, 0, 0], Error::NoMemory.code()),
             ])
         }
         Checked::ExitChannel => {
             const N: u16 = Call::ProcessCreate.number();
             let q = 2 * PAGE;
             first_wrong(&[
-                x0_alone::<N>(&[q, 16, 20, closed, above, h], bad),
-                x0_alone::<N>(&[q, 16, 20, h, above, closed], bad),
-                x0_alone::<N>(&[q, 16, 20, h, above, 0], denied),
-                x0_alone::<N>(&[q, 16, 20, left, above, 0], denied),
-                x0_alone::<N>(&[q, 16, 20, left, at, 0], closed_channel),
+                x0_alone::<N>(&[q, 16, 20, closed, above, h, 0, 0, 0], bad),
+                x0_alone::<N>(&[q, 16, 20, h, above, closed, 0, 0, 0], bad),
+                x0_alone::<N>(&[q, 16, 20, h, above, 0, 0, 0, 0], denied),
+                x0_alone::<N>(&[q, 16, 20, left, above, 0, 0, 0, 0], denied),
+                x0_alone::<N>(&[q, 16, 20, left, at, 0, 0, 0, 0], closed_channel),
             ])
         }
         Checked::CreateChannel => {

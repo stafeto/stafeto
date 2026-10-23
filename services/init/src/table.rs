@@ -176,6 +176,54 @@ pub struct Gate {
     pub bits: u32,
 }
 
+/// The thread numbers and the timer places a record has of its own (spec
+/// 7.5, process_create x6 and x7), taken off init's: a record with none
+/// pays from init's own, which every record of the table shares. A share of
+/// either is a share of both, as the call has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shares {
+    pub threads: u32,
+    pub timers: u32,
+}
+
+impl Shares {
+    /// No share of its own.
+    pub const CREATOR: Shares = Shares {
+        threads: 0,
+        timers: 0,
+    };
+}
+
+/// The share of the process service: its POSIX processes pay from it, a
+/// child of the service draws on it and the processes of the table that
+/// are not the service's cannot run it dry. 768 thread numbers cover 248
+/// processes of one thread each and a process of 128 threads beside them.
+pub const POSIX_SHARES: Shares = Shares {
+    threads: 768,
+    timers: 6144,
+};
+/// The thread numbers and timer places init keeps for itself (its two
+/// threads and a timer for each record) and for the records with no share
+/// of their own: the shares of the table add up to the system's 1 024 and
+/// 8 192 less these.
+pub const INIT_KEEP_THREADS: u32 = 128;
+pub const INIT_KEEP_TIMERS: u32 = 1024;
+/// The system's thread numbers and timer places (abi::MAX_SYSTEM_TIMERS and
+/// the kernel's table of thread numbers), init's shares at its start.
+pub const SYSTEM_THREADS: u32 = 1024;
+pub const SYSTEM_TIMERS: u32 = abi::MAX_SYSTEM_TIMERS;
+
+/// The CPUs of the services, the drivers and the processes of the shell
+/// (SMP decision): the first two. The hard tasks of realtime get CPUs of
+/// their own (`RT_CPUS`, kernel spec 8), where no ordinary process runs.
+pub const GENERAL_CPUS: u8 = 0b0011;
+/// The CPUs of the tasks of realtime, away from the ordinary processes.
+pub const RT_CPUS: u8 = 0b1100;
+/// Every CPU that is up: a record with it is cut to the CPUs the machine
+/// has (the process service has them all, to give its processes the CPUs
+/// they may use).
+pub const ALL_CPUS: u8 = 0xff;
+
 /// A record of the table (spec 13.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -219,6 +267,22 @@ pub struct Record {
     /// process. The others init starts have none, and their children
     /// inherit by the rules of setuid.
     pub root: bool,
+    /// The thread numbers and timer places of its own (`Shares::CREATOR`
+    /// for none).
+    pub shares: Shares,
+    /// The CPUs its threads run on (process_create x8): init cuts it to
+    /// the CPUs that are up (`on_cpus`); the POSIX processes of a record
+    /// inherit it through the process service.
+    pub cpus: u8,
+}
+
+/// `cpus` cut to the CPUs that are up (the mask `up`): a record whose mask
+/// names none of them gets all that are up, and `false` says that was so.
+pub fn on_cpus(cpus: u8, up: u8) -> (u8, bool) {
+    match cpus & up {
+        0 => (up, false),
+        mask => (mask, true),
+    }
 }
 
 impl Record {
@@ -359,6 +423,17 @@ pub enum TableError<'a> {
     Root {
         record: &'static str,
     },
+    /// Explicit shares that add up to more than init can give, or a share
+    /// of one kind without the other.
+    Shares {
+        threads: u64,
+        timers: u64,
+    },
+    /// A record with an empty CPU mask, or a POSIX process with CPUs the
+    /// process service lacks.
+    Cpus {
+        record: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -452,6 +527,16 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has root: one POSIX process at most, which connects to {PROCESS_SERVICE}"
             ),
+            TableError::Shares { threads, timers } => write!(
+                f,
+                "the shares add up to {threads} thread numbers and {timers} timer places: at most {} and {}, one of either with the other",
+                SYSTEM_THREADS - INIT_KEEP_THREADS,
+                SYSTEM_TIMERS - INIT_KEEP_TIMERS
+            ),
+            TableError::Cpus { record } => write!(
+                f,
+                "{record} has no CPU, or a POSIX process has a CPU the process service lacks"
+            ),
         }
     }
 }
@@ -523,7 +608,46 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
             return Err(TableError::Root { record: r.name });
         }
     }
+    check_shares(table)?;
+    check_cpus(table)?;
     Ok(order(table))
+}
+
+/// The explicit shares of `table` (spec 13.4): each of both kinds or of
+/// neither, and their sums at most what init has left of the system's after
+/// it keeps INIT_KEEP_THREADS and INIT_KEEP_TIMERS for itself.
+fn check_shares(table: &[Record]) -> Result<(), TableError<'static>> {
+    let (mut threads, mut timers) = (0u64, 0u64);
+    for r in table {
+        threads += u64::from(r.shares.threads);
+        timers += u64::from(r.shares.timers);
+        if (r.shares.threads == 0) != (r.shares.timers == 0) {
+            return Err(TableError::Shares { threads, timers });
+        }
+    }
+    if threads > u64::from(SYSTEM_THREADS - INIT_KEEP_THREADS)
+        || timers > u64::from(SYSTEM_TIMERS - INIT_KEEP_TIMERS)
+    {
+        return Err(TableError::Shares { threads, timers });
+    }
+    Ok(())
+}
+
+/// The CPU masks of `table` (spec 13.4): none empty, and those of the POSIX
+/// processes within the mask of the process service they connect to.
+fn check_cpus(table: &[Record]) -> Result<(), TableError<'static>> {
+    for r in table {
+        if r.cpus == 0 {
+            return Err(TableError::Cpus { record: r.name });
+        }
+        if r.is_posix()
+            && let Some(service) = find(table, PROCESS_SERVICE.as_bytes())
+            && r.cpus & !table[service].cpus != 0
+        {
+            return Err(TableError::Cpus { record: r.name });
+        }
+    }
+    Ok(())
 }
 
 /// The checks of one record by itself, from its levels on (`check`).
@@ -751,6 +875,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-posix-procs") as usize
     + cfg!(feature = "table-posix-lock-ring") as usize
+    + cfg!(feature = "table-posix-shares") as usize
     + cfg!(feature = "table-posix-native-vz") as usize
     + cfg!(feature = "table-posix-files") as usize
     + cfg!(feature = "table-loader-channels") as usize
@@ -796,6 +921,7 @@ const _: () = assert!(
     feature = "table-relibc-threads",
     feature = "table-posix-procs",
     feature = "table-posix-lock-ring",
+    feature = "table-posix-shares",
     feature = "table-posix-native-vz",
     feature = "table-posix-files",
     feature = "table-loader-channels",
@@ -842,6 +968,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_PTY_TABLE;
 pub const TABLE: &[Record] = lock_ring::TABLE;
 #[cfg(feature = "table-posix-procs")]
 pub const TABLE: &[Record] = ramfs::POSIX_PROCS_TABLE;
+#[cfg(feature = "table-posix-shares")]
+pub const TABLE: &[Record] = ramfs::POSIX_SHARES_TABLE;
 #[cfg(feature = "table-posix-native-vz")]
 pub const TABLE: &[Record] = vz::POSIX_NATIVE_TABLE;
 #[cfg(feature = "table-posix-steps")]
@@ -925,6 +1053,8 @@ mod tests {
             quiesce: &[],
             trusted: false,
             root: false,
+            shares: Shares::CREATOR,
+            cpus: GENERAL_CPUS,
         }
     }
 
@@ -1934,5 +2064,118 @@ mod tests {
             TableError::Root { record: "plain" }.to_string(),
             "plain has root: one POSIX process at most, which connects to posix"
         );
+    }
+
+    #[test]
+    fn the_probe_of_shares_gives_the_service_a_small_share() {
+        let table = ramfs::POSIX_SHARES_TABLE;
+        assert!(check(table).is_ok());
+        let service = &table[find(table, PROCESS_SERVICE.as_bytes()).unwrap()];
+        assert_eq!(service.shares.threads, ramfs::SHARES_PROBE_THREADS);
+        assert_eq!(service.shares.timers, POSIX_SHARES.timers);
+        assert_eq!(table[4].args, b"posix-procs\0shares-main\0");
+    }
+
+    #[test]
+    fn shares_add_up_to_what_init_can_give() {
+        const MAX_T: u32 = SYSTEM_THREADS - INIT_KEEP_THREADS;
+        const MAX_M: u32 = SYSTEM_TIMERS - INIT_KEEP_TIMERS;
+        let shared = |name, threads, timers| Record {
+            shares: Shares { threads, timers },
+            ..service(name, 40, 40)
+        };
+        // The share of the process service and what is left of the limit.
+        assert_eq!(POSIX_SHARES.threads, 768);
+        assert!(check(&[shared("a", MAX_T, MAX_M)]).is_ok());
+        assert!(
+            check(&[
+                shared("a", POSIX_SHARES.threads, POSIX_SHARES.timers),
+                shared(
+                    "b",
+                    MAX_T - POSIX_SHARES.threads,
+                    MAX_M - POSIX_SHARES.timers
+                ),
+            ])
+            .is_ok()
+        );
+        let over = |threads, timers| {
+            check(Box::leak(Box::new([
+                shared("a", POSIX_SHARES.threads, POSIX_SHARES.timers),
+                shared("b", threads, timers),
+            ])))
+        };
+        let (rest_t, rest_m) = (MAX_T - POSIX_SHARES.threads, MAX_M - POSIX_SHARES.timers);
+        assert!(matches!(
+            over(rest_t + 1, 1),
+            Err(TableError::Shares { threads, .. }) if threads == u64::from(MAX_T) + 1
+        ));
+        assert!(matches!(
+            over(1, rest_m + 1),
+            Err(TableError::Shares { .. })
+        ));
+        // Both kinds or neither.
+        assert!(matches!(over(5, 0), Err(TableError::Shares { .. })));
+        assert!(matches!(over(0, 5), Err(TableError::Shares { .. })));
+        assert_eq!(
+            TableError::Shares {
+                threads: 897,
+                timers: 3
+            }
+            .to_string(),
+            "the shares add up to 897 thread numbers and 3 timer places: at most 896 and 7168, one of either with the other"
+        );
+    }
+
+    #[test]
+    fn cpu_masks_are_not_empty_and_posix_stays_within_its_service() {
+        const POSIX: &[&str] = &[PROCESS_SERVICE];
+        let process = Record {
+            cpus: ALL_CPUS,
+            ..service(PROCESS_SERVICE, 50, 50)
+        };
+        let at = |cpus| Record {
+            cpus,
+            ..client("app", 20, 20, POSIX)
+        };
+        assert!(check(&[process, at(GENERAL_CPUS)]).is_ok());
+        assert!(check(&[process, at(ALL_CPUS)]).is_ok());
+        assert_eq!(
+            check(&[process, at(0)]),
+            Err(TableError::Cpus { record: "app" })
+        );
+        // The process service on the CPUs of the services cannot give its
+        // POSIX processes the CPUs of realtime.
+        let narrow = Record {
+            cpus: GENERAL_CPUS,
+            ..process
+        };
+        assert_eq!(
+            check(&[narrow, at(RT_CPUS)]),
+            Err(TableError::Cpus { record: "app" })
+        );
+        assert_eq!(
+            check(&[narrow, at(ALL_CPUS)]),
+            Err(TableError::Cpus { record: "app" })
+        );
+        // A record that is no POSIX process may stand anywhere.
+        assert!(
+            check(&[
+                process,
+                Record {
+                    cpus: RT_CPUS,
+                    ..service("hard", 40, 40)
+                }
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_mask_is_cut_to_the_cpus_that_are_up() {
+        assert_eq!(on_cpus(GENERAL_CPUS, 0b1111), (0b0011, true));
+        assert_eq!(on_cpus(ALL_CPUS, 0b1111), (0b1111, true));
+        assert_eq!(on_cpus(GENERAL_CPUS, 0b0001), (0b0001, true));
+        // None of its CPUs is up: all that are, and the line says so.
+        assert_eq!(on_cpus(RT_CPUS, 0b0011), (0b0011, false));
     }
 }

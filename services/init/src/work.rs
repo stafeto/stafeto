@@ -177,7 +177,7 @@ pub fn worker_level(current: Option<Job>, queue: &Queue) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::{Kind, Restart};
+    use crate::table::{GENERAL_CPUS, Kind, Restart, Shares};
     use crate::watch::Watch;
 
     /// A service at `priority` under `ceiling`.
@@ -205,6 +205,8 @@ mod tests {
             quiesce: &[],
             trusted: false,
             root: false,
+            shares: Shares::CREATOR,
+            cpus: GENERAL_CPUS,
         }
     }
 

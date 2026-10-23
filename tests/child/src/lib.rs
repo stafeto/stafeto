@@ -356,10 +356,18 @@ pub enum Role {
     /// ever, adding 1 to mark 12 for each (it ends with the error of the
     /// first call that fails, the end of its own process).
     SmpSpawners = 40,
+    /// Takes thread numbers until the kernel refuses one (spec 7.5, #354),
+    /// holding every thread, which never starts: argument 0 is the quota
+    /// of each child it makes, argument 1 the threads to make in each,
+    /// argument 2 the children (0: the threads go into its own process,
+    /// handle 0, with MANAGE) and argument 3 the first of four marks: the
+    /// threads made, the code of the error that stopped it, the children
+    /// made, and 1 once it stopped. Then it waits for good.
+    Greedy = 41,
 }
 
 impl Role {
-    pub const ALL: [Role; 40] = [
+    pub const ALL: [Role; 41] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -400,6 +408,7 @@ impl Role {
         Role::SmpTimed,
         Role::SmpTimers,
         Role::SmpSpawners,
+        Role::Greedy,
     ];
 
     /// The role whose code is `code`.

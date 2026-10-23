@@ -1509,14 +1509,44 @@ fn process_create_checks_its_arguments() -> Outcome {
             .into_iter()
             .all(|[x3, x4, x5]| {
                 x0_alone::<N>(
-                    &[quota, limit, ceiling, x3, x4, x5],
+                    &[quota, limit, ceiling, x3, x4, x5, 0, 0, 0],
                     Error::InvalidArgs.code(),
                 )
             })
     });
-    let pairs = [[0, 5], [gone, 0]]
+    let pairs = [[0, 5], [gone, 0]].into_iter().all(|[x3, x4]| {
+        x0_alone::<N>(
+            &[page, 16, 20, x3, x4, 0, 0, 0, 0],
+            Error::InvalidArgs.code(),
+        )
+    });
+    // The shares and the CPU mask (x6-x8) are values too: one share alone
+    // or one above the system's, and a mask above the byte, fail with
+    // INVALID_ARGS alone; a mask with a CPU the caller lacks, ACCESS_DENIED.
+    let up = sys::cpu_info(0).map_err(|_| "CPU info failed")?;
+    check(
+        up.allowed == (1 << up.cpus) - 1,
+        "init is not on every CPU that is up",
+    )?;
+    let shares = [(1, 0), (0, 1), (1025, 1), (1, 8193)]
         .into_iter()
-        .all(|[x3, x4]| x0_alone::<N>(&[page, 16, 20, x3, x4, 0], Error::InvalidArgs.code()));
+        .all(|(x6, x7)| {
+            x0_alone::<N>(
+                &[page, 16, 20, 0, 0, 0, x6, x7, 0],
+                Error::InvalidArgs.code(),
+            )
+        });
+    let masks = x0_alone::<N>(
+        &[page, 16, 20, 0, 0, 0, 0, 0, 0x100],
+        Error::InvalidArgs.code(),
+    ) && x0_alone::<N>(
+        &[page, 16, 20, 0, 0, 0, 0, 0, 1 << up.cpus],
+        Error::AccessDenied.code(),
+    );
+    check(
+        shares && masks,
+        "a bad share or CPU mask did not fail with its error alone",
+    )?;
     check(
         values,
         "a bad quota, limit or ceiling did not fail with INVALID_ARGS alone before the handles",
@@ -1544,7 +1574,7 @@ fn quota_is_enforced() -> Outcome {
     let own = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let over = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
     let mut x = marked();
-    x[..6].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0]);
+    x[..9].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0, 0, 0, 0]);
     // SAFETY: process_create only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) };
     check(

@@ -631,6 +631,14 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs[0].3 = &["table-posix-lock-ring"];
     programs
 };
+/// The probe of the shares of the process service (#354): the image of the
+/// probe of POSIX processes with the table that gives the service a share
+/// of 24 thread numbers (`table-posix-shares`) and the role `shares`.
+const POSIX_SHARES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[0].3 = &["table-posix-shares"];
+    programs
+};
 const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[5].3 = &["spawn-churn"];
@@ -1165,7 +1173,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 262;
+const INIT_TESTS: u32 = 263;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1499,6 +1507,7 @@ commands:
   posix-fifo-steps measure named FIFO service dispatches under icount
   posix-sync verify RAM synchronization, descriptor types and cancellation
   posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
+  posix-shares verify that the share of thread numbers of the process service ends in EAGAIN
   posix-lock-pages measure a full inode spread over 64 paid physical pages
   posix-lock-queue-core measure 64 genuine waits together with 64 held regions
   posix-lock-core measure public locks at the full inode64 limit
@@ -1689,6 +1698,7 @@ fn main() {
         Some("posix-fifo") => posix_fifo_probe(),
         Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
+        Some("posix-shares") => posix_shares_probe(&qemu::VIRT),
         // STAFETO_MACHINE names the machine (qemu::MACHINES), for instance
         // `HVF GICv3`; STAFETO_SMP gives it CPUs.
         Some("posix-procs") => {
@@ -4663,6 +4673,39 @@ fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The share of thread numbers of the process service (kernel spec 7.5,
+/// #354): the probe of POSIX processes in its role `shares` makes threads
+/// until pthread_create says EAGAIN, finds fork and posix_spawn refused with
+/// EAGAIN meanwhile and a file still read through the RAM service, and finds
+/// fork working again once the threads ended.
+fn posix_shares_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-shares.img",
+        &POSIX_SHARES_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: shares: EAGAIN at the share, fork and spawn refused, a file read, fork again",
+    )?;
+    Ok(())
+}
+
 fn posix_procs_count(args: &[String]) -> Result<usize, String> {
     match args {
         [] => Ok(1),
@@ -5033,6 +5076,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// `teardown::begin`, in the call that ends the process (the row
 /// `end_call`), outside this portion. The path of a thread that is ready
 /// stays one take of `OBJ`.
+/// `THREADS_READY_MAX` 3 022 -> 3 115 (#354, thread number shares): the end
+/// of a thread gives its number back to the share of its process's payer
+/// (`give_number`: the process, the payer, one subtraction), 8 instructions
+/// a thread for the 12 of the portion; 3 111 measured, 96 over the 3 015
+/// before. The path of a thread that is ready stays one take of `OBJ`.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5080,7 +5128,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_022;
+const THREADS_READY_MAX: u64 = 3_115;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -6494,17 +6542,30 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
 
 /// Types `command` and waits for the lines `lines` and the prompt.
 fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<(), String> {
+    dialog_command_within(run, command, lines, DIALOG_STEP)
+}
+
+/// `dialog_command` with `wait` for each line the command answers with, for
+/// a command that computes for seconds: how long a loop of awk takes depends
+/// on the runner and on the layout of the program, which moves it by a fifth
+/// without a change of the loop.
+fn dialog_command_within(
+    run: &mut qemu::Run,
+    command: &str,
+    lines: &[&str],
+    wait: Duration,
+) -> Result<(), String> {
     run.send(command)?;
     for expected in lines {
         if let Some(text) = expected.strip_prefix('=') {
-            run.expect_line(expected, |line| line.trim() == text, DIALOG_STEP)?;
+            run.expect_line(expected, |line| line.trim() == text, wait)?;
         } else if let Some(text) = expected.strip_prefix('~') {
-            run.expect_line(expected, |line| line.contains(text), DIALOG_STEP)?;
+            run.expect_line(expected, |line| line.contains(text), wait)?;
         } else {
-            run.expect_line(expected, |line| line == *expected, DIALOG_STEP)?;
+            run.expect_line(expected, |line| line == *expected, wait)?;
         }
     }
-    run.expect("# ", DIALOG_STEP)?;
+    run.expect("# ", wait)?;
     Ok(())
 }
 
@@ -6600,10 +6661,11 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     // The counters only grow: the time of a child that ran, seen while it
     // lived, stays in the sum of the cpu line (and out of the idle time of
     // uptime) once it ended.
-    dialog_command(
+    dialog_command_within(
         run,
         "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 2; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
         &["cpu-grew", "idle-grew"],
+        Duration::from_secs(30),
     )
 }
 
@@ -7704,6 +7766,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             posix_interrupt_on(false, Some(&qemu::VIRT_EL2))
         }),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-shares", || posix_shares_probe(&qemu::VIRT)),
+        job("posix-shares smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || posix_shares_probe(&qemu::VIRT))
+        }),
         job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),

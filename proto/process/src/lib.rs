@@ -670,8 +670,12 @@ impl Change {
 /// | 12 | ceiling |
 /// | 13 | priority |
 /// | 14 | root: 0 or 1 |
-/// | 15 | zero |
+/// | 15 | CPU mask |
 /// | 16..24 | ticket |
+///
+/// The CPU mask is the CPUs the process's threads run on (kernel spec 8,
+/// `process_create` x8): the service passes it on to its children, fork,
+/// spawn and exec alike. 0 gives the process the service's own mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Create {
     pub quota: u64,
@@ -679,6 +683,7 @@ pub struct Create {
     pub ceiling: u8,
     pub priority: u8,
     pub root: bool,
+    pub cpus: u8,
     pub ticket: u64,
 }
 
@@ -686,7 +691,7 @@ impl Create {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
-        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
+        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), self.cpus])?;
         w.u64(self.ticket)
     }
 
@@ -699,7 +704,7 @@ impl Create {
         let ticket = r.u64()?;
         r.finish()?;
         let (ceiling, priority) = (b[0], b[1]);
-        if ceiling > 63 || priority == 0 || priority > ceiling || b[2] > 1 || b[3] != 0 {
+        if ceiling > 63 || priority == 0 || priority > ceiling || b[2] > 1 {
             return Err(Status::BadSize);
         }
         Ok(Self {
@@ -708,6 +713,7 @@ impl Create {
             ceiling,
             priority,
             root: b[2] == 1,
+            cpus: b[3],
             ticket,
         })
     }
@@ -1267,7 +1273,8 @@ pub struct Listing {
     pub tty: u32,
     /// The CPU the process's main thread runs on.
     pub cpu: u32,
-    /// The CPUs the process may use (`Page::cpus`, 0 for all).
+    /// The CPUs the process may use: the mask of its page (`Page::cpus`)
+    /// within the CPUs of its record, 0 for all.
     pub cpus: u64,
     /// The process's nice value, -20 to 19 (setpriority), which its
     /// children inherit.
@@ -1731,6 +1738,7 @@ mod tests {
             ceiling: 31,
             priority: 30,
             root: true,
+            cpus: 0b0011,
             ticket: 0x1234,
         };
         let mut w = Writer::new();

@@ -15,17 +15,24 @@ use crate::{arch, channel, cleanup, sched, session};
 use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::args::{
-    check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg, policy_tail_arg,
-    priority_arg, quota_arg, under_ceilings,
+    check_buffer, check_start, cpu_mask_arg, handle_limit_arg, notify_priority_arg, policy_arg,
+    policy_tail_arg, priority_arg, quota_arg, shares_arg, under_ceilings,
 };
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
-/// x3 exit channel, x4 notification priority, x5 start channel): a new
+/// x3 exit channel, x4 notification priority, x5 start channel, x6 thread
+/// numbers, x7 timer places, x8 CPU mask): a new
 /// process with an empty address space and handle table; x1 returns a
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
 /// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
-/// and no higher than the caller's (ACCESS_DENIED). x3, a channel handle
+/// and no higher than the caller's (ACCESS_DENIED). x6 and x7 are both 0,
+/// and the child pays for its thread numbers and timers from the shares of
+/// its creator's payer, or they are 1 up to the system's thread numbers and
+/// timer places, taken off that payer for the child's own shares (spec
+/// 7.5; INVALID_ARGS for one alone or a value above). x8, the CPUs of the
+/// child's threads, is 0 for the caller's own, or bits 0-7 (INVALID_ARGS
+/// above) that are a subset of the caller's (ACCESS_DENIED). x3, a channel handle
 /// with NOTIFY, with a label or none, or 0, hears of the child's end once
 /// the child gave its quota back (spec 7.9): a notification of priority
 /// x4, 1-63 and no higher than the caller's ceiling, exactly 0 without x3,
@@ -44,7 +51,8 @@ use kcore::args::{
 /// in the order the call occupies them, a limit that needs no allocation
 /// first: the caller's own table has room for the new handle
 /// (LIMIT_REACHED), the channel of x3 a slot for the exit notification
-/// (LIMIT_REACHED, spec 6.5), then the quota comes off the caller's
+/// (LIMIT_REACHED, spec 6.5), then the shares, thread numbers before
+/// timers (LIMIT_REACHED), then the quota comes off the caller's
 /// (spec 7.5), the child pays from it for its root table, the caller for a
 /// page of its pool of shells when the pool grows (spec 7.8), and the
 /// child for the page of its pool of blocks with the chunk of entry 0
@@ -112,6 +120,13 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
     let notify = notify_priority_arg(a[4], a[3] != 0)?;
+    let shares = shares_arg(
+        a[6],
+        a[7],
+        crate::thread::THREADS as u32,
+        abi::MAX_SYSTEM_TIMERS,
+    )?;
+    let mask = cpu_mask_arg(a[8])?;
     let exit = match a[3] {
         0 => None,
         h => Some(lookup(thread, h, Rights::NOTIFY, |o| {
@@ -131,6 +146,11 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
+    // The CPU mask is a ceiling too: the child runs on CPUs of its
+    // creator's only (spec 8).
+    if mask & !process::cpus(caller(thread)) != 0 {
+        return Err(Error::AccessDenied);
+    }
     if let Some((c, _)) = exit
         && channel::is_closed(c)
     {
@@ -145,15 +165,16 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
     if let Some((c, _)) = exit {
         channel::reserve_source(c)?;
     }
-    let child = match process::create_child(caller(thread), quota, limit, ceiling) {
-        Ok(child) => child,
-        Err(e) => {
-            if let Some((c, _)) = exit {
-                channel::remove_source(c);
+    let child =
+        match process::create_child_with(caller(thread), quota, limit, ceiling, shares, mask) {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some((c, _)) = exit {
+                    channel::remove_source(c);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     match start {
         Some((object, rights)) => process::move_start(child, object, rights),
         None => process::reserve_start(child),
@@ -357,6 +378,17 @@ pub(super) fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values,
     let target_ceiling = unsafe { target.as_ref() }.ceiling();
     under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
     under_ceilings(notice, &[caller_ceiling(thread)])?;
+    // The CPU: an explicit one outside the CPU mask of the target is a
+    // ceiling like the others; the default is the caller's CPU when the
+    // mask has it, otherwise the lowest CPU of the mask (spec 8). The
+    // mask never changes, so every thread of the process stays inside it.
+    let mask = process::cpus(target);
+    let cpu = match cpu {
+        Some(c) if mask & (1 << c) == 0 => return Err(Error::AccessDenied),
+        Some(c) => Some(c),
+        None if mask & (1 << crate::arch::cpu::this().index()) != 0 => None,
+        None => Some(mask.trailing_zeros() as usize),
+    };
     process::check_alive(target)?;
     if let Some((c, _)) = exit
         && channel::is_closed(c)

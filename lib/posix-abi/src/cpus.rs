@@ -6,14 +6,19 @@
 //! `sched_setaffinity`, `/proc/stat`, `/proc/cpuinfo`; spec 8, SMP).
 //!
 //! The kernel tells how many CPUs are up and what each has slept and spent
-//! in entries (object_info CPU, no handle needed). A process's threads run
-//! on its CPU: the process service puts the main thread of each new image
-//! on the least busy of the CPUs the process's page allows
-//! (`Page::cpus`, 0 for all) and a thread the process makes starts on the
-//! CPU of its creator. `sched_setaffinity` writes the process's mask
-//! to the page: the threads made after it and the image of the next exec go
-//! where the mask allows, and a thread that runs stays on its CPU (the
-//! kernel moves no thread).
+//! in entries (object_info CPU, no handle needed), and which of them the
+//! process may use at all: its CPU mask, set by its creator and never
+//! changed (kernel spec 8, process_create x8; the process service gives
+//! each process the mask of its record in init's table, and fork, spawn and
+//! exec keep it). A process's threads run on its CPU: the process service
+//! puts the main thread of each new image on the least busy of the CPUs the
+//! process's page allows (`Page::cpus`, 0 for all) within that mask and a
+//! thread the process makes starts on the CPU of its creator.
+//! `sched_setaffinity` writes the process's mask to the page, within the
+//! mask of the kernel: the threads made after it and the image of the next
+//! exec go where the mask allows, and a thread that runs stays on its CPU
+//! (the kernel moves no thread). `sched_getaffinity` and `nproc` show the
+//! mask of the page cut to the mask of the kernel.
 
 use crate::constants::*;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -23,6 +28,9 @@ use rt::sys;
 const WORD: usize = 64;
 /// 0 until the first call; then the CPUs up.
 static COUNT: AtomicU8 = AtomicU8::new(0);
+/// 0 until the first call; then the CPU mask of the kernel for this
+/// process, which never changes (fork keeps it, exec starts anew).
+static KERNEL: AtomicU8 = AtomicU8::new(0);
 
 /// The CPUs that are up, at least 1 and at most `WORD`.
 pub fn count() -> usize {
@@ -50,10 +58,26 @@ fn online() -> u64 {
     }
 }
 
-/// The CPUs the process may use: the mask of its page, or every CPU.
+/// The CPUs the kernel lets the process's threads run on (object_info CPU,
+/// x6) among those that are up; every CPU that is up where the kernel does
+/// not tell.
+pub fn permitted() -> u64 {
+    match KERNEL.load(Ordering::Relaxed) {
+        0 => {
+            let mask = sys::cpu_info(0).map_or(0, |info| info.allowed) & online();
+            let mask = if mask == 0 { online() } else { mask };
+            KERNEL.store(mask as u8, Ordering::Relaxed);
+            mask
+        }
+        mask => u64::from(mask),
+    }
+}
+
+/// The CPUs the process may use: the mask of its page within the mask of
+/// the kernel, or all of the kernel's.
 pub fn allowed() -> u64 {
-    match crate::process::page().cpus.load(Ordering::Acquire) & online() {
-        0 => online(),
+    match crate::process::page().cpus.load(Ordering::Acquire) & permitted() {
+        0 => permitted(),
         mask => mask,
     }
 }
@@ -99,8 +123,15 @@ fn mask_of(pid: i32) -> Result<u64, i32> {
         let (_, found, _) = crate::process::list(wanted % proto_process::RECORDS as u32)?;
         found.filter(|l| l.pid == wanted).ok_or(ESRCH)?.cpus
     };
-    Ok(match stored & online() {
-        0 => online(),
+    // The listing of the process service gives the mask of another process
+    // within its CPUs already; here it is shown within those that are up.
+    let within = if pid == 0 || pid == crate::process::getpid() {
+        permitted()
+    } else {
+        online()
+    };
+    Ok(match stored & within {
+        0 => within,
         mask => mask,
     })
 }
@@ -133,20 +164,22 @@ pub fn getaffinity(pid: i32, out: &mut [u8]) -> Result<(), i32> {
 }
 
 /// sched_setaffinity: the process's mask from `mask`, little-endian bytes.
-/// EINVAL when none of the CPUs it names is up; bits past the CPUs that are
-/// up are ignored. The threads made after the call and the image of the next
-/// exec go where the mask allows.
+/// EINVAL when none of the CPUs it names is up and allowed by the kernel;
+/// the bits past those are ignored, and the page keeps the rest. The threads
+/// made after the call and the image of the next exec go where the mask
+/// allows.
 pub fn setaffinity(pid: i32, mask: &[u8]) -> Result<(), i32> {
     own(pid)?;
     let mut word = [0u8; 8];
     let n = mask.len().min(word.len());
     word[..n].copy_from_slice(&mask[..n]);
-    let named = u64::from_le_bytes(word) & online();
+    let named = u64::from_le_bytes(word) & permitted();
     if named == 0 {
         return Err(EINVAL);
     }
-    // All CPUs named is the default, which a child leaves to the service.
-    let stored = if named == online() { 0 } else { named };
+    // All the kernel's CPUs named is the default, which a child leaves to
+    // the service.
+    let stored = if named == permitted() { 0 } else { named };
     crate::process::page().cpus.store(stored, Ordering::Release);
     Ok(())
 }
@@ -155,7 +188,7 @@ pub fn setaffinity(pid: i32, mask: &[u8]) -> Result<(), i32> {
 /// one; 0 for the caller's CPU): the caller's own when the mask allows it.
 pub fn new_thread_cpu() -> u8 {
     let mask = allowed();
-    if mask == online() {
+    if mask == permitted() {
         return 0;
     }
     if mask >> current() & 1 != 0 {

@@ -470,8 +470,15 @@ impl Init {
         let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p));
         let memory = sys::process_memory(&self.own);
         let free = memory.map_or(0, |m| m.quota.saturating_sub(m.used) / PAGE);
+        // The shares of the record come off init's own (spec 7.5): free
+        // is what init has of them, less what its children hold.
+        let shares = sys::process_shares(&self.own).map_or((0, 0), |s| {
+            let left = |k: abi::Share| k.limit.saturating_sub(k.returned + k.used);
+            (left(s.threads), left(s.timers))
+        });
+        let shares_ok = quota::shares_fit(shares, record.shares);
         let entry = &mut self.entries[place];
-        match quota::start(free, need, entry.waited) {
+        match quota::start(free, need, shares_ok, entry.waited) {
             Start::Now => {
                 entry.short = false;
                 true
@@ -479,8 +486,12 @@ impl Init {
             Start::Wait { pause_ns } => {
                 if !entry.short {
                     println!(
-                        "init: {} waits for quota: needs {need} pages, {free} free",
-                        record.name
+                        "init: {} waits for quota: needs {need} pages, {free} free; shares: needs {} and {}, {} and {} free",
+                        record.name,
+                        record.shares.threads,
+                        record.shares.timers,
+                        shares.0,
+                        shares.1
                     );
                 }
                 entry.short = true;
@@ -659,6 +670,7 @@ impl Init {
             ceiling: record.ceiling,
             priority: record.priority,
             root: record.root,
+            cpus: crate::worker::cpus_of(record),
             program: Name::new(record.program.as_bytes()).expect("a checked table has names"),
         };
         // The reply has room for the 48 bytes of an adoption.

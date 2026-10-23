@@ -184,7 +184,7 @@ impl Method {
 /// | 28 | ceiling |
 /// | 29 | priority of the first thread |
 /// | 30 | root: 0 or 1 |
-/// | 31 | zero |
+/// | 31 | CPU mask of the record |
 /// | 32..48 | the program's name in the boot image |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Adoption {
@@ -194,6 +194,9 @@ pub struct Adoption {
     pub ceiling: u8,
     pub priority: u8,
     pub root: bool,
+    /// The CPUs of the record (kernel spec 13.4): init has cut the mask of
+    /// the table to the CPUs that are up.
+    pub cpus: u8,
     pub program: Name,
 }
 
@@ -203,7 +206,7 @@ impl Adoption {
         w.u64(self.ticket)?;
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
-        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
+        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), self.cpus])?;
         w.name(Some(self.program))
     }
 
@@ -216,7 +219,7 @@ impl Adoption {
         }
         let (ticket, quota, handle_limit) = (r.u64()?, r.u64()?, r.u32()?);
         let b = r.bytes(4)?;
-        if b[2] > 1 || b[3] != 0 {
+        if b[2] > 1 {
             return Err(Status::BadSize);
         }
         let program = r.name()?.ok_or(Status::BadSize)?;
@@ -228,6 +231,7 @@ impl Adoption {
             ceiling: b[0],
             priority: b[1],
             root: b[2] == 1,
+            cpus: b[3],
             program,
         })
     }
@@ -738,6 +742,7 @@ mod tests {
             ceiling: 31,
             priority: 30,
             root: true,
+            cpus: 0b0011,
             program: name("posix-abi-probe").unwrap(),
         };
         let mut w = Writer::new();

@@ -139,14 +139,21 @@ pub fn create(
     priority: u8,
 ) -> Result<NonNull<Timer>, Error> {
     process::timer_room(payer)?;
+    // The place comes off the share of the payer's payer before the
+    // system's count (spec 7.5), and goes back with `CREATED.give()`.
+    process::charge_timer(payer)?;
     // The check and the count are one step (`Budget::take`), so cores that
     // race for the last place cannot both get it. The bound is shared by
     // all: 43 processes of 192 timers reach it. A refusal below gives the
     // place back.
     if !CREATED.take(MAX_SYSTEM_TIMERS) {
+        process::refund_timer(payer);
         return Err(Error::LimitReached);
     }
-    channel::reserve_source(c).inspect_err(|_| CREATED.give())?;
+    channel::reserve_source(c).inspect_err(|_| {
+        CREATED.give();
+        process::refund_timer(payer);
+    })?;
     let timer = Timer {
         node: HeapLink::new(),
         source: Source::new(c),
@@ -161,6 +168,7 @@ pub fn create(
     let t = process::paid_alloc(payer, timer).inspect_err(|_| {
         channel::remove_source(c);
         CREATED.give();
+        process::refund_timer(payer);
     })?;
     // SAFETY: the timer was just made, and nothing else refers to it.
     unsafe {
@@ -504,6 +512,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
         (*t.as_ptr()).source.detach(level);
         process::paid_free(payer, t);
         CREATED.give();
+        process::refund_timer(payer);
         LIVE.gone(t);
         process::release_shell(payer, level);
     }
