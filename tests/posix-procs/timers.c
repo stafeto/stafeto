@@ -23,6 +23,12 @@
  *   alarm and no timer survives exec, none is inherited by fork, and the
  *   table gives back the places of a process that ended.
  * - clock: grows with time, starts again in the child of fork.
+ * - a signal of pthread_kill is SI_TKILL (raise: SI_USER), and a real-time
+ *   signal raised twice is taken twice; a timer on processor time sends one
+ *   SI_TIMER occurrence with the overrun.
+ * - SIGQUEUE_MAX is counted at the sender: two senders put 32 each at one
+ *   receiver; one sender is refused the 33rd occurrence wherever it goes,
+ *   and a receiver that takes one gives the place back.
  */
 #include <sys/time.h>
 
@@ -154,6 +160,28 @@ static int steps_timers(void) {
         if (timer_gettime(own[i], &got) || timer_settime(own[i], 0, &none, NULL) || timer_delete(own[i])) return 9;
     }
     if (alarm(0) == 0) return 10;
+    /* The dearest sigqueue: its sender has 31 occurrences waiting on pages
+     * (the 30 real-time signals and SIGUSR2), which the service looks at
+     * before it takes the 32nd. */
+    int numbers[31];
+    for (int i = 0; i < 30; i++) numbers[i] = SIGRTMIN + i;
+    numbers[30] = SIGUSR2;
+    for (int i = 0; i < 31; i++)
+        if (t_block(numbers[i]) || sigqueue(getpid(), numbers[i], v)) return 11;
+    if (sigqueue(getpid(), SIGRTMIN, v)) return 12;
+    for (int i = 0; i < 31; i++)
+        if (t_take(numbers[i], &info, 1000) != numbers[i]) return 13;
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN) return 14;
+    /* A timer on processor time tells the service of its expiry (FIRE). */
+    struct sigevent cpu = t_event(SIGRTMIN, 5);
+    timer_t cpu_timer;
+    struct itimerspec cpu_its = t_its(T_MS, T_MS);
+    if (timer_create(CLOCK_PROCESS_CPUTIME_ID, &cpu, &cpu_timer)) return 15;
+    if (timer_settime(cpu_timer, 0, &cpu_its, NULL)) return 16;
+    long long began = t_now(CLOCK_PROCESS_CPUTIME_ID);
+    while (t_now(CLOCK_PROCESS_CPUTIME_ID) - began < 5 * T_MS) {}
+    if (t_take(SIGRTMIN, &info, 2000) != SIGRTMIN || info.si_code != SI_TIMER) return 17;
+    if (timer_delete(cpu_timer)) return 18;
     sigprocmask(SIG_SETMASK, &saved, NULL);
     return 0;
 }
@@ -781,6 +809,206 @@ static int t_c_wait_timer(void) {
     return timer_delete(t) ? 6 : 0;
 }
 
+
+/* #390: a signal that pthread_kill sends to a thread says SI_TKILL with the
+ * PID and UID of the process; raise says SI_USER. */
+static siginfo_t t_kill_info;
+static volatile int t_kill_got;
+static void *t_kill_waiter(void *arg) {
+    (void)arg;
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    t_kill_got = sigwaitinfo(&s, &t_kill_info);
+    return NULL;
+}
+static int t_c_thread_kill_code(void) {
+    /* The waiter inherits the blocked signal. */
+    if (t_block(SIGUSR1)) return 1;
+    pthread_t th;
+    t_kill_got = 0;
+    if (pthread_create(&th, NULL, t_kill_waiter, NULL)) return 2;
+    t_nap(30);
+    if (pthread_kill(th, SIGUSR1)) return 3;
+    if (pthread_join(th, NULL)) return 4;
+    if (t_kill_got != SIGUSR1) return 5;
+    if (t_kill_info.si_code != SI_TKILL) return 6;
+    if (t_kill_info.si_pid != getpid() || t_kill_info.si_uid != getuid()) return 7;
+    /* raise says SI_USER, which XSH 2.4.3 lets it (Open POSIX sigwaitinfo/6-1). */
+    siginfo_t info;
+    if (raise(SIGUSR1) || t_take(SIGUSR1, &info, 100) != SIGUSR1) return 8;
+    if (info.si_code != SI_USER || info.si_pid != getpid()) return 9;
+    /* The same in a handler. */
+    if (t_catch(SIGUSR2)) return 10;
+    t_got = 0;
+    if (pthread_kill(pthread_self(), SIGUSR2) || !t_got) return 11;
+    if (t_info.si_code != SI_TKILL || t_info.si_pid != getpid() || t_info.si_uid != getuid()) return 12;
+    t_got = 0;
+    if (raise(SIGUSR2) || !t_got) return 13;
+    return t_info.si_code == SI_USER ? 0 : 14;
+}
+
+/* A real-time signal that is raised twice while it is blocked is taken
+ * twice (Open POSIX sigwait/2-1 and sigwaitinfo/6-1 rely on it): the repeat
+ * waits in the queue of the process. */
+static int t_c_thread_rt_twice(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    if (raise(SIGRTMIN) || raise(SIGRTMIN)) return 2;
+    siginfo_t info;
+    if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) return 3;
+    if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) return 5;
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 6;
+    return 0;
+}
+
+/* #392: a timer on processor time sends SI_TIMER with the value of the event,
+ * its expiries while the signal waits are one occurrence and the overrun. */
+static int t_c_cpu_timer(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    struct sigevent e = t_event(SIGRTMIN, 77);
+    timer_t t;
+    if (timer_create(CLOCK_PROCESS_CPUTIME_ID, &e, &t)) return 2;
+    struct itimerspec its = t_its(T_MS, T_MS);
+    if (timer_settime(t, 0, &its, NULL)) return 3;
+    long long start = t_now(CLOCK_PROCESS_CPUTIME_ID);
+    while (t_now(CLOCK_PROCESS_CPUTIME_ID) - start < 20 * T_MS) {}
+    /* The helper of the timer looks at the clock once the thread sleeps. */
+    t_nap(10);
+    siginfo_t info;
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN) return 4;
+    if (info.si_code != SI_TIMER) return 5;
+    if (info.si_value.sival_int != 77) return 6;
+    /* Exactly one occurrence: the expiries that came while it waited are not
+     * a queue. */
+    if (t_take(SIGRTMIN, &info, 0) != -1 || errno != EAGAIN) return 8;
+    int overrun = timer_getoverrun(t);
+    if (overrun < 10) {
+        printf("posix-procs: timers: a timer on processor time counted an overrun of %d\n", overrun);
+        return 7;
+    }
+    return timer_delete(t) ? 9 : 0;
+}
+
+/* #391: SIGQUEUE_MAX is the sender's. */
+/* (a) Two senders put 32 each at one receiver that blocks the signal: all 64
+ * wait there (a limit at the receiver let the second sender fail). */
+static int t_c_senders_share_a_receiver(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    pid_t parent = getpid();
+    pid_t kid[2];
+    for (int i = 0; i < 2; i++) {
+        kid[i] = fork();
+        if (kid[i] < 0) return 2;
+        if (kid[i] == 0) {
+            union sigval v;
+            v.sival_int = i + 1;
+            int refused = 0;
+            for (int n = 0; n < 32; n++) refused += sigqueue(parent, SIGRTMIN, v) != 0;
+            _exit(refused ? 1 + (refused > 60 ? 60 : refused) : 0);
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        int status = -1;
+        if (waitpid(kid[i], &status, 0) != kid[i]) return 3;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            printf("posix-procs: timers: sender %d ended with status %#x\n", i, status);
+            return 4;
+        }
+    }
+    int by[3] = {0, 0, 0};
+    siginfo_t info;
+    for (int n = 0; n < 64; n++) {
+        if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_QUEUE) return 5;
+        int who = info.si_value.sival_int;
+        by[who >= 1 && who <= 2 ? who : 0]++;
+    }
+    if (by[1] != 32 || by[2] != 32) return 6;
+    return t_take(SIGRTMIN, &info, 20) == -1 && errno == EAGAIN ? 0 : 7;
+}
+
+/* (b) One sender puts 16 at each of two receivers: the 33rd occurrence is
+ * refused whoever it is for (a limit at the receiver passed it); (c) a
+ * receiver that takes one gives the sender a place again. */
+static int t_c_sender_limit(void) {
+    int cmd[2][2], ack[2][2];
+    pid_t kid[2];
+    for (int i = 0; i < 2; i++) {
+        if (pipe(cmd[i]) || pipe(ack[i])) return 1;
+        kid[i] = fork();
+        if (kid[i] < 0) return 2;
+        if (kid[i] == 0) {
+            t_block(SIGRTMIN);
+            char c = 'r';
+            if (write(ack[i][1], &c, 1) != 1) _exit(10);
+            for (;;) {
+                if (read(cmd[i][0], &c, 1) != 1 || c == 'q') _exit(0);
+                siginfo_t info;
+                c = t_take(SIGRTMIN, &info, 1000) == SIGRTMIN ? 'k' : 'x';
+                if (write(ack[i][1], &c, 1) != 1) _exit(11);
+            }
+        }
+    }
+    char c;
+    for (int i = 0; i < 2; i++)
+        if (read(ack[i][0], &c, 1) != 1 || c != 'r') return 3;
+    union sigval v;
+    v.sival_int = 1;
+    for (int i = 0; i < 2; i++)
+        for (int n = 0; n < 16; n++)
+            if (sigqueue(kid[i], SIGRTMIN, v)) return 4;
+    if (sigqueue(kid[0], SIGRTMIN, v) != -1 || errno != EAGAIN) return 5;
+    if (sigqueue(kid[1], SIGRTMIN, v) != -1 || errno != EAGAIN) return 6;
+    /* One receiver takes one: the sender has one place. */
+    if (write(cmd[0][1], "t", 1) != 1 || read(ack[0][0], &c, 1) != 1 || c != 'k') return 7;
+    if (sigqueue(kid[1], SIGRTMIN, v)) return 8;
+    if (sigqueue(kid[1], SIGRTMIN, v) != -1 || errno != EAGAIN) return 9;
+    for (int i = 0; i < 2; i++) {
+        if (write(cmd[i][1], "q", 1) != 1) return 10;
+        int status = -1;
+        if (waitpid(kid[i], &status, 0) != kid[i]) return 11;
+    }
+    return 0;
+}
+
+/* Two timers on one real-time signal each keep their own occurrence: the
+ * expiries of one never fall into the occurrence of the other, and an
+ * occurrence of sigqueue that waits first stays first. */
+static int t_c_two_timers_one_signal(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    struct sigevent ea = t_event(SIGRTMIN, 1), eb = t_event(SIGRTMIN, 2);
+    timer_t a, b;
+    if (timer_create(CLOCK_MONOTONIC, &ea, &a) || timer_create(CLOCK_MONOTONIC, &eb, &b)) return 2;
+    struct itimerspec its = t_its(2 * T_MS, 2 * T_MS), none = t_its(0, 0);
+    if (timer_settime(a, 0, &its, NULL) || timer_settime(b, 0, &its, NULL)) return 3;
+    t_nap(40);
+    if (timer_settime(a, 0, &none, NULL) || timer_settime(b, 0, &none, NULL)) return 4;
+    siginfo_t info;
+    int seen[3] = {0, 0, 0};
+    for (int n = 0; n < 2; n++) {
+        if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_TIMER) return 5;
+        int v = info.si_value.sival_int;
+        if (v < 1 || v > 2) return 6;
+        seen[v]++;
+    }
+    if (seen[1] != 1 || seen[2] != 1) {
+        printf("posix-procs: timers: occurrences of timer 1: %d, of timer 2: %d\n", seen[1], seen[2]);
+        return 7;
+    }
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 8;
+    /* sigqueue waits first, then an expiry: two occurrences, in this order. */
+    union sigval v;
+    v.sival_int = 9;
+    if (sigqueue(getpid(), SIGRTMIN, v)) return 10;
+    struct itimerspec once = t_its(2 * T_MS, 0);
+    if (timer_settime(a, 0, &once, NULL)) return 11;
+    t_nap(20);
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_QUEUE) return 12;
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_TIMER || info.si_value.sival_int != 1)
+        return 13;
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 14;
+    return timer_delete(a) || timer_delete(b) ? 15 : 0;
+}
+
 static void t_child(const char *what, int (*fn)(void), int code, int sig) {
     fflush(stdout);
     pid_t pid = fork();
@@ -822,6 +1050,12 @@ static int timers_role(void) {
     t_child("the end of a process gives its places back", t_c_exit_gives_back, 0, 0);
     t_child("clock", t_c_clock, 0, 0);
     t_child("sigwaitinfo and sigtimedwait take a timer", t_c_wait_timer, 0, 0);
+    t_child("pthread_kill says SI_TKILL, raise SI_USER", t_c_thread_kill_code, 0, 0);
+    t_child("a real-time signal raised twice is taken twice", t_c_thread_rt_twice, 0, 0);
+    t_child("a timer on processor time sends SI_TIMER and counts the overrun", t_c_cpu_timer, 0, 0);
+    t_child("two timers on one real-time signal keep their own occurrences", t_c_two_timers_one_signal, 0, 0);
+    t_child("two senders fill one receiver 32 each", t_c_senders_share_a_receiver, 0, 0);
+    t_child("SIGQUEUE_MAX is the sender's, a taken occurrence gives a place back", t_c_sender_limit, 0, 0);
     if (!failures) printf("posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok\n");
     return failures != 0;
 }

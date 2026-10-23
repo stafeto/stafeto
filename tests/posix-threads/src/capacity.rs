@@ -29,7 +29,7 @@ unsafe extern "C" fn live(argument: *mut c_void) -> *mut c_void {
     argument
 }
 
-fn receiving(native: &Handle<Thread>) -> bool {
+pub(super) fn receiving(native: &Handle<Thread>) -> bool {
     let wake = sys::channel_create(30).expect("capacity poll channel");
     let timer = sys::timer_create(&wake, 30).expect("capacity poll timer");
     for _ in 0..100 {

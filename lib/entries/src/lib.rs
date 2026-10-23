@@ -115,6 +115,57 @@ pub const fn call_frame(outer: u64, floor: u64, alt: Option<(u64, u64)>) -> Fram
     }
 }
 
+/// A handler without SA_ONSTACK that runs on the interrupted stack while the
+/// dispatcher's frame `frame` is live at the top of the alternate stack
+/// (`posix-abi`'s `altstack` keeps these in a chain, innermost first, each in
+/// a frame of the layer on the alternate stack).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Level {
+    /// The level below (the handler this one was called from), 0 for none.
+    pub prev: u64,
+    /// The stack pointer the handler started with.
+    pub floor: u64,
+    /// Where the range of the kernel ends while the handler runs.
+    pub cut: u64,
+    /// The dispatcher's frame of the entry that called the handler.
+    pub frame: u64,
+}
+
+/// The `floor` of the level in the chain `top` whose entry frame is `outer`
+/// (the handler of the live resident call), 0 when there is none: a resident
+/// call whose handler runs on the alternate stack has no floor.
+/// `level` reads the level named by an address.
+pub fn floor_of(top: u64, outer: u64, level: impl Fn(u64) -> Level) -> u64 {
+    let mut at = top;
+    while at != 0 {
+        let live = level(at);
+        if live.frame == outer {
+            return live.floor;
+        }
+        at = live.prev;
+    }
+    0
+}
+
+/// The chain after a long jump to `target`: the levels it leaves are taken
+/// off, innermost first, up to the first one the jump stays inside. A level
+/// is left by a jump to a target outside the alternate stack `alt` (low,
+/// high) and above the stack pointer its handler started with; a target on
+/// the alternate stack is a handler under the levels, whose address says
+/// nothing of `floor`. Returns the address of the new innermost level, 0
+/// for none.
+pub fn unwind(top: u64, alt: (u64, u64), target: u64, level: impl Fn(u64) -> Level) -> u64 {
+    let mut at = top;
+    while at != 0 {
+        let live = level(at);
+        if (alt.0..alt.1).contains(&target) || target <= live.floor {
+            break;
+        }
+        at = live.prev;
+    }
+    at
+}
+
 /// `jump_clears` for frames on two stacks: the word `outer` is cleared when
 /// the live resident call (its frame `call`) lies inside the frame of the
 /// jump target.
@@ -507,5 +558,53 @@ mod tests {
         assert!(jump_clears_frames(0x10_3000, call, frame_in(0x9000, alt)));
         // Without an alternate stack the order is the one of the main stack.
         assert_eq!(call_frame(0x9000, 0, None), Frame::main(0x9000));
+    }
+
+    /// Two levels: B started at 1000, E inside it at 900; the alternate
+    /// stack is 10 000 to 20 000. Levels are named by 1 and 2.
+    fn chain(at: u64) -> Level {
+        match at {
+            1 => Level {
+                prev: 0,
+                floor: 1000,
+                cut: 19_000,
+                frame: 20_000,
+            },
+            _ => Level {
+                prev: 1,
+                floor: 900,
+                cut: 18_000,
+                frame: 19_000,
+            },
+        }
+    }
+
+    #[test]
+    fn a_jump_takes_off_the_levels_it_leaves_and_no_more() {
+        let alt = (10_000, 20_000);
+        // From E into B: E is left, B is not.
+        assert_eq!(unwind(2, alt, 960, chain), 1);
+        // Into the main code above both: both are left.
+        assert_eq!(unwind(2, alt, 5000, chain), 0);
+        // Inside E's own frames, or inside B's below its start.
+        assert_eq!(unwind(2, alt, 800, chain), 2);
+        assert_eq!(unwind(2, alt, 900, chain), 2);
+        // A handler on the alternate stack under the levels.
+        assert_eq!(unwind(2, alt, 15_000, chain), 2);
+        assert_eq!(unwind(1, alt, 15_000, chain), 1);
+        assert_eq!(unwind(0, alt, 5000, chain), 0);
+    }
+
+    #[test]
+    fn the_floor_is_that_of_the_level_of_the_resident_call() {
+        assert_eq!(floor_of(2, 19_000, chain), 900);
+        assert_eq!(floor_of(2, 20_000, chain), 1000);
+        assert_eq!(floor_of(1, 19_000, chain), 0);
+        assert_eq!(floor_of(0, 20_000, chain), 0);
+        // After the jump from E into B only B's floor is left.
+        assert_eq!(
+            floor_of(unwind(2, (10_000, 20_000), 960, chain), 19_000, chain),
+            0
+        );
     }
 }
