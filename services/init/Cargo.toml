@@ -19,6 +19,11 @@ bench = false
 # The table init starts (init::table::TABLE): the one that ships without
 # a feature; each test image builds with one of these, never two.
 [features]
+# The longest step of init's loop for each method, printed when it grows
+# (rt feature step-stats; xtask process-steps, under -icount).
+# The heartbeats of all the services of the image start on one grid
+# (rt feature beat-grid): the worst phase of their wait for init.
+steps = ["rt/step-stats", "rt/beat-grid"]
 table-test = []
 table-cycle = []
 table-ceiling = []
