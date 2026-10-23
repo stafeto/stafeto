@@ -328,6 +328,9 @@ struct Processes {
     /// Gets that wait for an object may be answered: the loop's own step
     /// does it, a batch at a time (`share_step`).
     share_wake: bool,
+    /// The most asks that waited at once, for the steps run to print.
+    #[cfg(feature = "steps")]
+    waiters_peak: usize,
     /// The Create in its portions, and the place that tells the loop of the
     /// next one (CREATING).
     creating: Option<Creating>,
@@ -1333,6 +1336,7 @@ impl Processes {
     /// (the first of those whose maker went becomes the maker). More ready
     /// leaves the wake on for the next step.
     fn share_step(&mut self) {
+        rt::service::step_detail(self.shares.waiters() as u64);
         let mut batch = [const { None }; shares::BATCH];
         let (_, more) = self.shares.ready_batch(&mut batch);
         self.share_wake = more;
@@ -1398,7 +1402,19 @@ impl Processes {
                             return Answer::Status(Status::BadSize);
                         };
                         return match self.shares.wait(key, index, pending) {
-                            Ok(()) => Answer::Deferred,
+                            Ok(()) => {
+                                #[cfg(feature = "steps")]
+                                {
+                                    let waiting = self.shares.waiters();
+                                    if waiting > self.waiters_peak {
+                                        self.waiters_peak = waiting;
+                                        if waiting % 16 == 0 || waiting >= 60 {
+                                            rt::println!("posix-process: share waiters {waiting}");
+                                        }
+                                    }
+                                }
+                                Answer::Deferred
+                            }
                             // No place for one more: Busy at once.
                             Err(pending) => {
                                 let _ =

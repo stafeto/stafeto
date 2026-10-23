@@ -742,7 +742,13 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["change-steps", "fifo-steps", "procfs", "priority-steps"],
+        &[
+            "change-steps",
+            "fifo-steps",
+            "procfs",
+            "priority-steps",
+            "share-steps",
+        ],
     ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
@@ -5256,6 +5262,32 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (65, "own step: a description let go of, a session gone"),
 ];
 
+/// The asks for one shared object that wait at once in the run of the role
+/// `stepwaiters` (16 children of 4 threads), at least: the table has 64
+/// places and a process holds 4, so the round fills it but for the maker.
+const WAITERS_MIN: u64 = 60;
+
+/// The role `stepwaiters` filled the table of the waiting asks (the service
+/// prints each new peak), and the steps that answer them and let them go
+/// are the steps of kinds 60 (Share), 65 (the loop's own step, `share_step`)
+/// and 64/66 (ends of the processes), which `process-steps` holds under
+/// `TERM_B * 9 / 10` and B with the rest of the service.
+fn check_share_waiters(lines: &[String]) -> Result<(), String> {
+    let peak = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("posix-process: share waiters "))
+        .filter_map(|n| n.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    println!("shared object: {peak} asks waited at once");
+    if peak < WAITERS_MIN {
+        return Err(format!(
+            "the role stepwaiters had {peak} asks wait at once, under {WAITERS_MIN}: the table was not full"
+        ));
+    }
+    Ok(())
+}
+
 /// The kinds of the lines `service step: 6 kind K N ticks detail D` of init,
 /// by the numbers of proto_init::Method and the notifications (64 a timer or
 /// a notice of a worker, 65 own, 66 a session gone).
@@ -5987,6 +6019,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
     qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: shared waiters steps ok")?;
+    check_share_waiters(&outcome.lines)?;
     if grid {
         let wait = qemu::number_after(&outcome.lines, "posix-procs: getlimit wait max ")
             .ok_or("the priority probe printed no wait of GetLimit")?;

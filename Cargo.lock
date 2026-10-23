@@ -466,6 +466,7 @@ dependencies = [
  "posix-abi",
  "posix-crt",
  "posix-fs",
+ "posix-platform",
  "posix-sync",
  "proto-fs",
  "proto-init",

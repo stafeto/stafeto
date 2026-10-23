@@ -18,6 +18,8 @@ math-probe = []
 park-probe = []
 fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 # The client at level 30 against the spawner at level 10 (steps_priority).
+# 64 asks wait for one shared object (steps_waiters): the pause of the maker.
+share-steps = ["dep:posix-platform", "posix-platform/map-probe"]
 priority-steps = ["dep:posix-abi", "posix-abi/thread-probe", "dep:rt"]
 fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
 spawn-churn = []
@@ -55,6 +57,7 @@ rt = { path = "../../lib/rt", optional = true }
 proto-process = { path = "../../proto/process", optional = true }
 proto-loader = { path = "../../proto/loader", optional = true }
 posix-fs = { path = "../../lib/posix-fs", optional = true }
+posix-platform = { path = "../../lib/posix-platform", optional = true }
 
 posix-sync = { path = "../../lib/posix-sync", optional = true }
 entries = { path = "../../lib/entries", optional = true }
