@@ -418,6 +418,29 @@ pub mod window {
     /// The priority of the thread the probe watches: the client of the test.
     pub const LEVEL: u8 = 17;
 
+    /// The priority of the thread whose state the probe asks for while its
+    /// wake is on the way.
+    pub const INFO_LEVEL: u8 = 6;
+
+    static INFO_ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// In `flush`, the first command WAKE to a thread at INFO_LEVEL: the
+    /// section that posted it took the thread out of its wait queue, and its
+    /// CPU has not served the command, so the thread is Waiting with nothing
+    /// to wait for. object_info gives Ready for it (#438).
+    fn info_in_flight(t: NonNull<Thread>) {
+        // SAFETY: the kernel's reference keeps the thread.
+        if unsafe { t.as_ref() }.priority() != INFO_LEVEL
+            || INFO_ASKED.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let (info, _, _) = thread::info(t);
+        if info.state == abi::ThreadState::Ready {
+            kprintln!("smp window  thread_info of a thread with its wake on the way gave Ready");
+        }
+    }
+
     static OPENED: AtomicBool = AtomicBool::new(false);
     static HOLDING: AtomicBool = AtomicBool::new(false);
     static ENDED_INSIDE: AtomicBool = AtomicBool::new(false);
@@ -428,6 +451,9 @@ pub mod window {
     /// that is busy), then 20 ms more, in which that CPU ends the thread,
     /// and says whether it did.
     pub fn open(t: NonNull<Thread>, flag: u8) {
+        if flag == WAKE {
+            info_in_flight(t);
+        }
         if flag != WAKE || !HOLDING.load(Ordering::Acquire) {
             return;
         }
@@ -497,6 +523,52 @@ pub mod window {
                 }
             }
             next = after;
+        }
+    }
+
+    /// In the stage Threads of a process, before its threads end, outside
+    /// OBJ: while a thread at `kcore::sched::READY_GAP_LEVEL` waits for its
+    /// timer, the stage waits (2 s at most); once it wakes, 20 us more. Its
+    /// CPU takes the woken thread off its ready queue, where the build waits
+    /// inside the removal (`ready-gap`), as the stage reads the link of the
+    /// thread. This is a CPU that reads the link of a thread of another CPU
+    /// as it changes (#438).
+    ///
+    /// # Safety
+    /// `first` is the thread at the cursor of the stage, which is alive; no
+    /// section of OBJ is held.
+    pub unsafe fn hold_until_woken(first: Option<NonNull<Thread>>) {
+        let mut next = first;
+        let mut woke = false;
+        while let Some(t) = next {
+            // SAFETY: the caller's promise; the list is of live threads.
+            let (priority, after) = unsafe {
+                (
+                    t.as_ref().base_priority(),
+                    (*t.as_ptr()).siblings.and_then(|s| s.next),
+                )
+            };
+            if priority == kcore::sched::READY_GAP_LEVEL {
+                let until = crate::arch::timer::now() + crate::arch::timer::frequency() * 2;
+                loop {
+                    let waiting = {
+                        let _section = crate::obj::lock();
+                        thread::waits(t)
+                    };
+                    if !waiting || crate::arch::timer::now() > until {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                woke = true;
+            }
+            next = after;
+        }
+        if woke {
+            let later = crate::arch::timer::now() + crate::arch::timer::frequency() / 200_000;
+            while crate::arch::timer::now() < later {
+                core::hint::spin_loop();
+            }
         }
     }
 

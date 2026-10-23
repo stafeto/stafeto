@@ -1069,10 +1069,18 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             State::Stopped => ThreadState::Stopped,
             State::Ready => ThreadState::Ready,
             State::Running => ThreadState::Running,
-            State::Waiting => match t.waits.expect("a waiting thread waits for something") {
-                Wait::Receive(_) => ThreadState::Receiving,
-                Wait::Send(_) => ThreadState::Sending,
-                Wait::Reply(_) => ThreadState::AwaitingReply,
+            // A section on another CPU took the thread out of its queue
+            // (`waits` is empty) and sent the wake command; the state
+            // changes to Ready when the CPU of the thread serves it.
+            State::Waiting => match t.waits {
+                None => {
+                    #[cfg(feature = "ktest")]
+                    debug_assert!(crate::cmd::pending(thread));
+                    ThreadState::Ready
+                }
+                Some(Wait::Receive(_)) => ThreadState::Receiving,
+                Some(Wait::Send(_)) => ThreadState::Sending,
+                Some(Wait::Reply(_)) => ThreadState::AwaitingReply,
             },
             State::Dead => ThreadState::Ended,
             State::Parked => ThreadState::Parked,

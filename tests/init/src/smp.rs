@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 25] = [
+pub(crate) const TESTS: [Test; 27] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -90,6 +90,14 @@ pub(crate) const TESTS: [Test; 25] = [
     (
         "smp_asid_of_a_process_that_ended_is_clean_on_every_cpu",
         asid_after_end_across_cpus,
+    ),
+    (
+        "smp_process_of_threads_being_woken_is_killed_from_another_cpu",
+        kill_of_threads_being_woken,
+    ),
+    (
+        "smp_thread_info_of_a_client_with_its_wake_on_the_way",
+        info_of_a_client_being_woken,
     ),
     (
         "smp_request_before_a_receive_waits_ends_it",
@@ -928,6 +936,110 @@ fn timer_across_cpus() -> Outcome {
     check(ended, "the thread on CPU 1 did not stop")?;
     println!(
         "smp: a timer armed on CPU 1 was let go from CPU 0, its deadline passed, the kernel went on"
+    );
+    Ok(())
+}
+
+/// Threads of the process the test kills, and how many times it does.
+const KILL_THREADS: usize = 8;
+const KILL_ROUNDS: usize = 50;
+/// The level of those threads: the kernel built with `window-probe` waits
+/// inside the removal from a ready queue for the items of this level
+/// (kcore READY_GAP_LEVEL).
+const KILL_LEVEL: u8 = 9;
+/// The marks of Role::SmpTimed: the instant its timers fire, and the first
+/// of the marks of its threads.
+const TIMED_AT: usize = 20;
+const TIMED_MARKS: usize = 21;
+
+/// A process of eight threads on CPUs 1 to 3, all waiting for timers that
+/// fire at one instant, is killed from CPU 0 shortly before that instant,
+/// fifty times in a row. The timers wake the threads on
+/// their CPUs, which take them off their ready queues one after the other
+/// (and the kernel built with `window-probe` waits inside each removal),
+/// while the end of the process, on CPU 0, takes the threads out of the
+/// scheduler. A link read or written from the wrong CPU stops the kernel
+/// (#438).
+fn kill_of_threads_being_woken() -> Outcome {
+    let n = cpus()?;
+    if n < 4 {
+        return Ok(());
+    }
+    for _ in 0..KILL_ROUNDS {
+        let kid = Kid::load(LEAF_QUOTA + 60 * PAGE as u64, 40, KILL_LEVEL)?;
+        reset_kid_marks();
+        // Far enough for the threads to be made and to wait.
+        let at = now() + 60_000_000;
+        set_kid_mark(TIMED_AT, at);
+        kid.start()?;
+        kid.serve(
+            Role::SmpTimed,
+            &[KILL_THREADS as u64, KILL_LEVEL.into(), n as u64],
+            &[Gift::Own],
+        )?;
+        let_run()?;
+        let waiting = || (0..KILL_THREADS).all(|i| kid_mark(TIMED_MARKS + i) != 0);
+        check(
+            wait_for(waiting) && now() < at,
+            "the threads of the child did not wait for their timers in time",
+        )?;
+        // The kernel built with `window-probe` holds the end of the process
+        // until the timers fire (kernel cmd::window::hold_until_woken).
+        let kill_at = at - 20_000_000;
+        while now() < kill_at {
+            spin_loop();
+        }
+        sys::process_kill(&kid.process).map_err(|_| "process_kill failed")?;
+        let state = kid.end();
+        kid.close()?;
+        let_run()?;
+        check(
+            state == Ok(ProcessState::Killed),
+            "the process of the waking threads did not end killed",
+        )?;
+    }
+    println!(
+        "smp: a process of {KILL_THREADS} threads on CPUs 1 to 3 was killed {KILL_ROUNDS} times shortly before their timers fired"
+    );
+    Ok(())
+}
+
+/// The level of the client of the test of thread_info: the kernel built
+/// with `window-probe` asks for the state of a thread at it as the reply
+/// posts its wake (kernel cmd::window).
+const INFO_LEVEL: u8 = 6;
+
+/// A client on CPU 2 waits for the reply of init on CPU 0. The section of
+/// the reply takes it out of its wait and posts the wake for CPU 2; before
+/// that CPU serves it the thread is Waiting with nothing to wait for, which
+/// object_info reports as Ready (#438: it stopped the kernel). The kernel
+/// built with `window-probe` asks in that interval and prints the line xtask
+/// looks for; init also asks, from its own CPU, all the time.
+fn info_of_a_client_being_woken() -> Outcome {
+    let n = cpus()?;
+    if n < 3 {
+        return Ok(());
+    }
+    reset_marks();
+    let c = channel(QUIET)?;
+    CHANNEL.store(c.raw().0, Relaxed);
+    let client = spawn_on(0, 2, ask_once, 0, INFO_LEVEL)?;
+    let Ok(Received::Message { token, .. }) = sys::receive(&c) else {
+        return Err("the client's request did not come");
+    };
+    // The client waits for its reply on its CPU.
+    pause(20_000_000);
+    let _ = token.reply(&[]);
+    let done = wait_for(|| {
+        let state = sys::thread_info(&client).map(|i| i.state);
+        mark(1) != 0 && matches!(state, Ok(abi::ThreadState::Ended) | Err(_))
+    });
+    let_run()?;
+    close(client)?;
+    close(c)?;
+    check(done && mark(1) == 1, "the client did not get its reply")?;
+    println!(
+        "smp: the state of a client woken from another CPU was asked for all the time, none failed"
     );
     Ok(())
 }

@@ -334,10 +334,17 @@ pub enum Role {
     /// outlives the wait ends with NO_FAULT, one that never saw the reader
     /// with FAILED.
     UnmapAcross = 37,
+    /// Argument 0 threads (at most 8), thread i on CPU 1 + i % (argument 2
+    /// minus one), all at priority argument 1; handle 0 is the child's own
+    /// process. Each makes a channel and a timer, sets the timer to the
+    /// instant in mark 20, waits in receive for it, and once it came adds 1
+    /// to mark 21 + i for ever (the mark is 1 while it waits). The first
+    /// thread ends once they run.
+    SmpTimed = 38,
 }
 
 impl Role {
-    pub const ALL: [Role; 37] = [
+    pub const ALL: [Role; 38] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -375,6 +382,7 @@ impl Role {
         Role::TakeThenWait,
         Role::AsidPage,
         Role::UnmapAcross,
+        Role::SmpTimed,
     ];
 
     /// The role whose code is `code`.

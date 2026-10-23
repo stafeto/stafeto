@@ -1152,7 +1152,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 259;
+const INIT_TESTS: u32 = 261;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -1266,10 +1266,13 @@ enum Variant {
     /// The checks of OBJ (kernel feature `obj-checks`) in the kernel of the
     /// test init on four CPUs (`smp_probes`).
     SmpChecks,
+    /// A wait inside the removal of any thread from a ready queue
+    /// (kernel feature `ready-gap`; `posix-procs` with STAFETO_READY_GAP).
+    ReadyGap,
 }
 
 impl Variant {
-    const ALL: [Variant; 23] = [
+    const ALL: [Variant; 24] = [
         Variant::Normal,
         Variant::TraceNormal,
         Variant::Test,
@@ -1293,6 +1296,7 @@ impl Variant {
         Variant::AsidProbe3,
         Variant::SmpMeasure,
         Variant::SmpChecks,
+        Variant::ReadyGap,
     ];
 
     fn feature(self) -> Option<&'static str> {
@@ -1324,6 +1328,7 @@ impl Variant {
             Variant::AsidProbe3 => Some("asid-probe-3"),
             Variant::SmpMeasure => Some("smp-measure"),
             Variant::SmpChecks => Some("obj-checks"),
+            Variant::ReadyGap => Some("ready-gap"),
         }
     }
 
@@ -1346,6 +1351,7 @@ impl Variant {
             | Variant::AsidNoAside
             | Variant::AsidEarly
             | Variant::UnmapLocal
+            | Variant::ReadyGap
             | Variant::AsidProbe3 => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test
             | Variant::Baseline
@@ -1401,6 +1407,7 @@ impl Variant {
             Variant::AsidProbe3 => "stafeto-asid-3",
             Variant::SmpMeasure => "stafeto-smp-measure",
             Variant::SmpChecks => "stafeto-smp-checks",
+            Variant::ReadyGap => "stafeto-ready-gap",
         }
     }
 }
@@ -4673,7 +4680,14 @@ fn posix_procs_repeat(machine: &qemu::Machine, count: usize) -> Result<(), Strin
     relibc()?;
     // BusyBox is /bin/ls of the image's files (5c).
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
-    let kernel = build(Variant::Normal)?;
+    // STAFETO_READY_GAP: the kernel waits inside every removal of a thread
+    // from a ready queue, which widens the window of a CPU that reads the
+    // link of a thread of another CPU (#438).
+    let kernel = build(if std::env::var_os("STAFETO_READY_GAP").is_some() {
+        Variant::ReadyGap
+    } else {
+        Variant::Normal
+    })?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_NAMES_PROGRAMS, BOOT_PROFILE)?;
     let directory = if count > 1 {
         let stamp = std::time::SystemTime::now()
@@ -4991,6 +5005,13 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// ready threads, 2 905 instructions, and the guard keeps the 4 of rule 4
 /// above it.
 ///
+/// `THREADS_READY_MAX` 2 909 -> 3 019 (SMP step 3, #438): `sched::exit` takes
+/// a thread off the ring of the parked threads only when the thread runs on
+/// the CPU of the call, since the link of a thread belongs to its CPU; the
+/// test of where it runs, and the order of the two tests of
+/// `is_parked_listed`, make the compiler lay the function out anew: 3 015
+/// measured, 108 over the 2 907 before, under the 128 of one instruction a
+/// thread. The path of a thread that is ready stays one take of `OBJ`.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5038,7 +5059,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 2_909;
+const THREADS_READY_MAX: u64 = 3_019;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -9830,6 +9851,10 @@ fn init_tests_in(
             qemu::expect_line(
                 &o,
                 "smp window  a boost of a thread that ended on its CPU was left alone",
+            )?;
+            qemu::expect_line(
+                &o,
+                "smp window  thread_info of a thread with its wake on the way gave Ready",
             )?;
             qemu::expect_line(
                 &o,

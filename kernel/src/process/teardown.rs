@@ -365,7 +365,10 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             Stage::Shell => pages_left = !collect_pages(p, &mut pages_back),
             Stage::Quota => crate::testpoint::quota_stage((*p).children.is_some()),
             #[cfg(feature = "window-probe")]
-            Stage::Threads => crate::cmd::window::hold_until_replied((*p).threads_next),
+            Stage::Threads => {
+                crate::cmd::window::hold_until_replied((*p).threads_next);
+                crate::cmd::window::hold_until_woken((*p).threads_next);
+            }
             _ => {}
         }
     }
