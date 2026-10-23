@@ -166,7 +166,13 @@ fn spawn_on(
     // SAFETY: the stack of the slot is the thread's alone until it ends.
     let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
     if let Some(e) = Error::from_code(after[0]) {
-        println!("smp: thread_create on CPU {cpu} gave {e:?}");
+        // What could have refused it: the shares of init, its quota and
+        // the threads and mappings it holds.
+        println!(
+            "smp: thread_create on CPU {cpu} gave {e:?}; shares {:?}, memory {:?}",
+            sys::process_shares(&own()),
+            sys::process_memory(&own())
+        );
         return Err("thread_create on a CPU failed");
     }
     let t = Handle::<Thread>::from_raw(abi::Handle(after[1]));
