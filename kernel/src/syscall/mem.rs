@@ -209,15 +209,15 @@ pub(super) fn change_map(thread: NonNull<Thread>, a: &Args) {
     // take are paid for by the first portion, which follows a poll for an
     // interrupt (maps::step_change).
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::map_begins();
+    crate::window::map_begins();
     let first = objects(|| {
         let on = map_reserve(thread, a)?;
         Ok((on, process::exec_frames(&on)))
     });
     #[cfg(feature = "window-probe")]
     {
-        crate::cmd::window::map_gap();
-        crate::cmd::window::map_ends();
+        crate::window::map_gap();
+        crate::window::map_ends();
     }
     begin(thread, entry, first)
 }
@@ -368,7 +368,7 @@ fn sync_next(target: NonNull<crate::process::Process>, next: Option<Frames>) -> 
     let (n, frames) = next.as_ref()?;
     arch::cache::sync_icache_frames(&frames[..*n]);
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::exec_gap(target);
+    crate::window::exec_gap(target);
     #[cfg(not(feature = "window-probe"))]
     let _ = target;
     next

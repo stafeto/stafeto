@@ -415,7 +415,7 @@ fn suspend_and_kill() -> Outcome {
 
 /// The level init suspends at: the kernel built with `window-probe` holds
 /// CPU 2 back from a quiescent point for 20 ms once for a suspension made
-/// at it (kernel cmd::window).
+/// at it (kernel window).
 const LAG_LEVEL: u8 = 19;
 
 /// Waits for the timer's notification and marks when it came (mark 2).
@@ -1011,7 +1011,7 @@ fn kill_of_threads_being_woken() -> Outcome {
             continue;
         }
         // The kernel built with `window-probe` holds the end of the process
-        // until the timers fire (kernel cmd::window::hold_until_woken).
+        // until the timers fire (kernel window::hold_until_woken).
         let kill_at = at - 20_000_000;
         while now() < kill_at {
             spin_loop();
@@ -1034,7 +1034,7 @@ fn kill_of_threads_being_woken() -> Outcome {
 
 /// The level of the thread whose timer_create the kernel built with
 /// `window-probe` holds between its entry and its section, until its
-/// process ended (kernel cmd::window::entry_gap).
+/// process ended (kernel window::entry_gap).
 const ENTRY_LEVEL: u8 = 7;
 /// Processes the test ends, and the mark that counts the timers one makes.
 const ENTRY_ROUNDS: usize = 200;
@@ -1078,7 +1078,7 @@ fn calls_that_meet_the_end_of_their_process() -> Outcome {
 
 /// The level of the client of the test of thread_info: the kernel built
 /// with `window-probe` asks for the state of a thread at it as the reply
-/// posts its wake (kernel cmd::window).
+/// posts its wake (kernel window).
 const INFO_LEVEL: u8 = 6;
 
 /// A client on CPU 2 waits for the reply of init on CPU 0. The section of
@@ -1121,7 +1121,7 @@ static VICTIM: AtomicU64 = AtomicU64::new(0);
 
 /// The priority of the client of the reply test: the kernel built with
 /// `window-probe` holds the end of a thread at it until its reply was posted
-/// and widens the window between the post and the flush (kernel cmd::window).
+/// and widens the window between the post and the flush (kernel window).
 const WINDOW_LEVEL: u8 = 17;
 /// The killer's, above the client's.
 const KILLER: u8 = 18;
@@ -1207,14 +1207,14 @@ extern "C" fn make_threads(_: u64) -> ! {
 
 /// The priority at which the kernel built with `window-probe` takes 1 ms
 /// between the two sections of mem_map and counts the passes of its checks
-/// (kernel cmd::window).
+/// (kernel window).
 const GAP_LEVEL: u8 = 16;
 /// Calls of mem_map the kernel counts.
 const GAP_CALLS: u64 = 20;
 
 /// The priority at which the kernel built with `window-probe` holds the
 /// portion of a mem_map RX outside OBJ, after the instruction cache, until
-/// another CPU killed the process it maps into (kernel cmd::window).
+/// another CPU killed the process it maps into (kernel window).
 const EXEC_LEVEL: u8 = 12;
 /// How long the killer of the exec test waits after init marked its call.
 const EXEC_KILL_NS: u64 = 200_000_000;
@@ -1285,7 +1285,7 @@ fn exec_map_of_a_killed_process() -> Outcome {
 /// The priority at which the kernel built with `window-probe` holds a
 /// process_create between its two sections, with no section held, until
 /// another thread closed a handle or the caller's process ended (kernel
-/// cmd::window).
+/// window).
 const SPAWN_LEVEL: u8 = 11;
 /// How long the closer of the spawn tests waits after init marked its call.
 const SPAWN_CLOSE_NS: u64 = 200_000_000;
@@ -1502,7 +1502,7 @@ fn mapping_while_threads_join() -> Outcome {
 
 /// The priority of the service of the boost test: the kernel built with
 /// `window-probe` keeps the owner of a thread at it from serving the thread's
-/// end for 150 ms (kernel cmd::window).
+/// end for 150 ms (kernel window).
 const SERVICE_LEVEL: u8 = 15;
 
 /// The thread the raiser of the boost test raises.
@@ -1601,7 +1601,7 @@ fn boost_of_a_service_that_ended() -> Outcome {
 /// The priority at which the kernel built with `window-probe` holds the
 /// receive or the send of a thread, before its section, until a request for
 /// its entry was made, so that the look under OBJ before it waits has to
-/// find the request (kernel cmd::window).
+/// find the request (kernel window).
 const WAIT_LEVEL: u8 = 14;
 /// The priority of the receiver whose section the kernel built with
 /// `break-one-section` splits in two, after the room for the handles of the

@@ -201,7 +201,7 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             // SAFETY: the running thread is alive and holds its process.
             let fit = process::reserve_handles(unsafe { t.as_ref() }.process(), n);
             #[cfg(feature = "break-one-section")]
-            crate::cmd::window::split_section(t);
+            crate::window::split_section(t);
             // SAFETY: the call is still in the section of its look: the head
             // is the request that was looked at, which `take_request` checks
             // in a test build.

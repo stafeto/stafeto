@@ -323,7 +323,7 @@ pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: 
     // release of the kernel's reference.
     if !thread::is_held(t) {
         #[cfg(feature = "window-probe")]
-        crate::cmd::window::boost_left_alone(t);
+        crate::window::boost_left_alone(t);
         return false;
     }
     crate::cmd::ask_boost(t, level, ceiling);

@@ -69,7 +69,7 @@ pub(super) fn process_create(thread: NonNull<Thread>, a: &Args) {
         Ok(child) => {
             thread::begin_long(thread, Long::Spawn(child));
             #[cfg(feature = "window-probe")]
-            crate::cmd::window::spawn_gap(thread, child);
+            crate::window::spawn_gap(thread, child);
             cleanup::count_portion(entry);
             sched::entry_polled();
             if arch::irq_pending() {

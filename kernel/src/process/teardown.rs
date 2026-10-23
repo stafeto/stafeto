@@ -369,8 +369,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             Stage::Quota => crate::testpoint::quota_stage((*p).children.is_some()),
             #[cfg(feature = "window-probe")]
             Stage::Threads => {
-                crate::cmd::window::hold_until_replied((*p).threads_next);
-                crate::cmd::window::hold_until_woken((*p).threads_next);
+                crate::window::hold_until_replied((*p).threads_next);
+                crate::window::hold_until_woken((*p).threads_next);
             }
             _ => {}
         }
@@ -457,7 +457,7 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     if stage == Stage::Threads && done {
         // The threads are gone and the stage is not Replies yet: the
         // clients of the process stay in their wait for a while.
-        crate::cmd::window::hold_replies();
+        crate::window::hold_replies();
     }
 }
 

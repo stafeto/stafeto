@@ -792,7 +792,7 @@ pub fn check_alive(process: NonNull<Process>) -> Result<(), Error> {
 }
 
 /// Whether `process` lives, read without OBJ while another CPU may end it:
-/// the window probe waits on it (cmd::window::exec_gap).
+/// the window probe waits on it (window::exec_gap).
 #[cfg(feature = "window-probe")]
 pub fn alive_unlocked(process: NonNull<Process>) -> bool {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
