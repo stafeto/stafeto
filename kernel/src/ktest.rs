@@ -609,6 +609,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::abandoned_protect_goes_idle,
     ),
     (
+        "abandoned_map_releases_through_the_point",
+        calls::abandoned_map_releases_through_the_point,
+    ),
+    (
         "dying_target_ends_the_map",
         calls::dying_target_ends_the_map,
     ),
