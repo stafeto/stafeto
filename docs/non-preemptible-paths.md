@@ -641,11 +641,21 @@ up to more than the step, `rt` prints `service wait cut:` and `xtask` fails
 the run.
 
 `xtask` compares the own part of every kind of every service, heartbeats
-included, with term B. A wait has CALL_WAIT_MAX (120,000 ticks) in a call
-to a service and WAIT_MAX (500,000) in a heartbeat, where the wait covers
-the volleys of the crowd above the service's level. Ramfs FinishBinding and
-the heartbeats of the pipe service and of the terminal service must show a
-wait, or the accounting is gone. The departure of a session counts as kind
+included, with term B. A wait has CALL_WAIT_MAX (48,000 ticks) in a call
+to a service and in a heartbeat alike. The wait of a heartbeat is counted
+until init answers: init puts the counter of the clock at the moment of its
+answer into the reply (proto_init::heartbeat_reply), and `rt` counts the
+ticks up to that counter as the wait for init (the exchange, init's longest
+step and the HEARTBEATs of the other services ahead in its queue), and the
+ticks from it until the service runs again as `service preempt: T kind K P
+ticks of A`, the preemption by the levels above the service after the answer
+(term I of its response time), which `xtask` prints with no limit. Init's own
+steps (tag 6, feature `steps`) are compared with term B, and the services
+of the `process-steps` image start their heartbeats on one grid (rt feature
+`beat-grid`, turned on by init's `steps`), so that the run has the phase in
+which all of them knock at init at once. Ramfs FinishBinding and the
+heartbeat of every service must show a wait, and some heartbeat a
+preemption, or the accounting is gone. The departure of a session counts as kind
 66 in the process service, ramfs and the terminal service; the pipe service
 marks it as its own step (kind 65), and the other notifications stay in kind
 64. FinishBinding with 248 children took 18,306 ticks whole, 12,246 of them
@@ -675,10 +685,14 @@ and preempt its loop when it serves a client below that level). The term of
 the client is the largest own(S) + wait(S) of one step; the sum of the
 largest own part and the largest wait of two rows is an upper bound of it.
 The steps of T_i are bound by their own lines, so `xtask` bounds own(S) with
-B and each wait with CALL_WAIT_MAX or WAIT_MAX. For T the process service
-step_max is SpawnStart, 93,000 ticks today, so one send of the terminal or
-of ramfs to the process service waits about 100,000 ticks in the worst
-case until step 5z splits it.
+B and each wait with CALL_WAIT_MAX. The longest step of the process service
+is a portion of its loads, at most B, so one send of the terminal or of
+ramfs to the process service waits two steps and a round trip in the worst
+case. The heartbeat of a service to init (the wait for init, without the
+preemption after its answer) is bounded in the same way: C_ipc, init's
+longest step (at most 8,555 ticks in the steps run) and, for each of the
+other services, the heartbeat step of init and C_ipc, about 34,000 ticks
+for eight services.
 
 The own part is wall time at the service's level: a holder of a lock at a
 higher level that runs in the middle of a step adds its time to the step.
@@ -798,8 +812,9 @@ children), and `process-steps` compares the own part of each step with
 the numbers above are history. The
 heartbeat is the loop's wait for init's reply, in which processes of higher
 levels run (the volley of 248 children); that wait is counted apart (see
-"Own part and wait of a step"), the check bounds it at 500,000 ticks, and
-the heartbeat's own part goes against B like every other step. A thread below level 40
+"Own part and wait of a step"), the check bounds the part until init's
+answer by CALL_WAIT_MAX and prints the part after it, and the heartbeat's
+own part goes against B like every other step. A thread below level 40
 waits for at most one step of the service's own work that has begun; the
 wait for init's reply goes to threads above the client's level, so it adds
 nothing to the client's delay. No step allocates memory: the
