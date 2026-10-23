@@ -6167,10 +6167,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     }
     // The waits of all services stay under CALL_WAIT_MAX, the heartbeat's
     // included, so that a growth of a wait shows: its wait is counted until
-    // init answers, and the image's services send their heartbeats on one
-    // grid (rt feature beat-grid, which init's feature `steps` turns on), the
-    // worst phase of the queue of init, while the probe's spawns keep init
-    // busy. The wait of FinishBinding (ramfs asks the process service) and of
+    // init answers, and in the run `process-steps grid` the image's services
+    // send their heartbeats on one grid (rt feature beat-grid, which init's
+    // feature `steps-grid` turns on), the worst phase of the queue of init,
+    // while the probe's spawns keep init busy. The wait of FinishBinding (ramfs asks the process service) and of
     // the heartbeat of every service must have been counted: without them
     // the accounting of waits is lost and the own parts above would hold the
     // waits again.

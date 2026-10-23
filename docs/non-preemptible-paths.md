@@ -650,10 +650,12 @@ step and the HEARTBEATs of the other services ahead in its queue), and the
 ticks from it until the service runs again as `service preempt: T kind K P
 ticks of A`, the preemption by the levels above the service after the answer
 (term I of its response time), which `xtask` prints with no limit. Init's own
-steps (tag 6, feature `steps`) are compared with term B, and the services
-of the `process-steps` image start their heartbeats on one grid (rt feature
-`beat-grid`, turned on by init's `steps`), so that the run has the phase in
-which all of them knock at init at once. Ramfs FinishBinding and the
+steps (tag 6, feature `steps`) are compared with term B. The run
+`process-steps grid` starts the heartbeats of the services of the image on
+one grid (init's feature `steps-grid`, rt's `beat-grid`), so that it has the
+phase in which all of them knock at init at once; the client of GetLimit
+below them waits through their work (91,367 ticks in a run of four branches
+on the CI machine), so that run prints its wait with no limit. Ramfs FinishBinding and the
 heartbeat of every service must show a wait, and some heartbeat a
 preemption, or the accounting is gone. The departure of a session counts as kind
 66 in the process service, ramfs and the terminal service; the pipe service
