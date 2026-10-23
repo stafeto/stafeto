@@ -192,11 +192,11 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
         call(|| posix_abi::signals::sigtimedwait(set, Some(&mut taken), timeout)).map(i64::from),
     );
     if status > 0 && !info.is_null() {
-        // A thread's signal says SI_TKILL from this process; the process's
+        // A thread's signal says SI_USER from this process; the process's
         // carries what its sender gave: si_code, si_pid, si_uid, and
         // SIGCHLD's si_status.
         if taken.si_code == posix_types::constants::SI_THREAD {
-            taken.si_code = proto_process::SI_TKILL;
+            taken.si_code = 0;
             taken.si_pid = posix_abi::process::getpid();
             taken.si_uid = posix_abi::process::getuid();
         }

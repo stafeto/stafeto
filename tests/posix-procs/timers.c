@@ -23,9 +23,9 @@
  *   alarm and no timer survives exec, none is inherited by fork, and the
  *   table gives back the places of a process that ended.
  * - clock: grows with time, starts again in the child of fork.
- * - a signal to a thread (pthread_kill, raise) is SI_TKILL; a real-time
- *   signal that waits for the thread takes no second place; a timer on
- *   processor time sends one SI_TIMER occurrence with the overrun.
+ * - a signal of pthread_kill is SI_TKILL (raise: SI_USER), and a real-time
+ *   signal raised twice is taken twice; a timer on processor time sends one
+ *   SI_TIMER occurrence with the overrun.
  * - SIGQUEUE_MAX is counted at the sender: two senders put 32 each at one
  *   receiver; one sender is refused the 33rd occurrence wherever it goes,
  *   and a receiver that takes one gives the place back.
@@ -810,9 +810,8 @@ static int t_c_wait_timer(void) {
 }
 
 
-/* #390: a signal to one thread says SI_TKILL with the PID and UID of the
- * process, and a real-time signal that waits already for the calling thread
- * takes no second place. */
+/* #390: a signal that pthread_kill sends to a thread says SI_TKILL with the
+ * PID and UID of the process; raise says SI_USER. */
 static siginfo_t t_kill_info;
 static volatile int t_kill_got;
 static void *t_kill_waiter(void *arg) {
@@ -835,37 +834,30 @@ static int t_c_thread_kill_code(void) {
     if (t_kill_got != SIGUSR1) return 5;
     if (t_kill_info.si_code != SI_TKILL) return 6;
     if (t_kill_info.si_pid != getpid() || t_kill_info.si_uid != getuid()) return 7;
-    /* raise is a signal to the thread as well. */
+    /* raise says SI_USER, which XSH 2.4.3 lets it (Open POSIX sigwaitinfo/6-1). */
     siginfo_t info;
     if (raise(SIGUSR1) || t_take(SIGUSR1, &info, 100) != SIGUSR1) return 8;
-    return info.si_code == SI_TKILL ? 0 : 9;
+    if (info.si_code != SI_USER || info.si_pid != getpid()) return 9;
+    /* The same in a handler. */
+    if (t_catch(SIGUSR2)) return 10;
+    t_got = 0;
+    if (pthread_kill(pthread_self(), SIGUSR2) || !t_got) return 11;
+    if (t_info.si_code != SI_TKILL || t_info.si_pid != getpid() || t_info.si_uid != getuid()) return 12;
+    t_got = 0;
+    if (raise(SIGUSR2) || !t_got) return 13;
+    return t_info.si_code == SI_USER ? 0 : 14;
 }
 
-static volatile int t_other_got, t_other_errno;
-static void *t_rt_other(void *arg) {
-    (void)arg;
-    sigset_t s;
-    sigemptyset(&s);
-    sigaddset(&s, SIGRTMIN);
-    t_other_got = sigtimedwait(&s, NULL, &(struct timespec){.tv_nsec = 300 * T_MS});
-    t_other_errno = errno;
-    return NULL;
-}
-static int t_c_thread_rt_merge(void) {
-    /* The other thread has the mask open; this one blocks the signal. */
-    pthread_t th;
-    t_other_got = 0;
-    if (pthread_create(&th, NULL, t_rt_other, NULL)) return 1;
-    if (t_block(SIGRTMIN)) return 2;
-    t_nap(50);
-    if (raise(SIGRTMIN) || raise(SIGRTMIN)) return 3;
-    if (pthread_join(th, NULL)) return 4;
-    /* The second occurrence did not go to the process: the thread that waits
-     * for the signal with an open mask gets nothing. */
-    if (t_other_got != -1 || t_other_errno != EAGAIN) return 5;
-    /* This thread takes exactly one. */
-    if (t_take(SIGRTMIN, NULL, 100) != SIGRTMIN) return 6;
-    if (t_take(SIGRTMIN, NULL, 20) != -1 || errno != EAGAIN) return 7;
+/* A real-time signal that is raised twice while it is blocked is taken
+ * twice (Open POSIX sigwait/2-1 and sigwaitinfo/6-1 rely on it): the repeat
+ * waits in the queue of the process. */
+static int t_c_thread_rt_twice(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    if (raise(SIGRTMIN) || raise(SIGRTMIN)) return 2;
+    siginfo_t info;
+    if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) return 3;
+    if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) return 5;
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 6;
     return 0;
 }
 
@@ -1019,8 +1011,8 @@ static int timers_role(void) {
     t_child("the end of a process gives its places back", t_c_exit_gives_back, 0, 0);
     t_child("clock", t_c_clock, 0, 0);
     t_child("sigwaitinfo and sigtimedwait take a timer", t_c_wait_timer, 0, 0);
-    t_child("a signal to a thread says SI_TKILL", t_c_thread_kill_code, 0, 0);
-    t_child("a real-time signal that waits for the thread is not queued again", t_c_thread_rt_merge, 0, 0);
+    t_child("pthread_kill says SI_TKILL, raise SI_USER", t_c_thread_kill_code, 0, 0);
+    t_child("a real-time signal raised twice is taken twice", t_c_thread_rt_twice, 0, 0);
     t_child("a timer on processor time sends SI_TIMER and counts the overrun", t_c_cpu_timer, 0, 0);
     t_child("two senders fill one receiver 32 each", t_c_senders_share_a_receiver, 0, 0);
     t_child("SIGQUEUE_MAX is the sender's, a taken occurrence gives a place back", t_c_sender_limit, 0, 0);

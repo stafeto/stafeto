@@ -49,7 +49,8 @@ unsafe extern "C" fn handler(signal: i32, info: *mut LinuxSigInfo, context: *mut
     let (info, context) = unsafe { (&*info, &mut *context.cast::<LinuxContext>()) };
     let mut effective = 0;
     let mut valid = signal == SIGUSR1
-        && *info == LinuxSigInfo::thread(SIGUSR1)
+        && (*info == LinuxSigInfo::thread(SIGUSR1, 0)
+            || *info == LinuxSigInfo::thread(SIGUSR1, proto_process::SI_TKILL))
         && context.link.is_null()
         && context.stack_pointer.is_null()
         && context.stack_size == 0

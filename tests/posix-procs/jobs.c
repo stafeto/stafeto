@@ -99,7 +99,7 @@ static void *job_info_local_owner(void *unused) {
     struct timespec zero = {0, 0};
     siginfo_t info;
     if (raise(job_info_signal) != 0 || sigtimedwait(&jobs, &info, &zero) != job_info_signal
-        || info.si_code != SI_TKILL) return (void *)1;
+        || info.si_code != SI_USER) return (void *)1;
     return NULL;
 }
 
@@ -316,7 +316,7 @@ static int job_control(void) {
     struct timespec zero = {0, 0};
     siginfo_t info;
     expect("sigwait consumes blocked TSTP", sigtimedwait(&jobs, &info, &zero), SIGTSTP);
-    expect("TSTP thread information", info.si_code, SI_TKILL);
+    expect("TSTP thread information", info.si_code, SI_USER);
     expect("raise blocked CONT", raise(SIGCONT), 0);
     expect("raise cancels CONT", raise(SIGTTIN), 0);
     expect("pending after TTIN", sigpending(&pending), 0);
@@ -399,7 +399,7 @@ static int job_control(void) {
     struct timespec ignored_zero = {0, 0};
     siginfo_t ignored_info;
     expect("ignore origin consume fresh local", sigtimedwait(&ignored_set, &ignored_info, &ignored_zero), SIGUSR1);
-    expect("ignore origin local code", ignored_info.si_code, SI_TKILL);
+    expect("ignore origin local code", ignored_info.si_code, SI_USER);
     expect("ignore origin unblock", sigprocmask(SIG_UNBLOCK, &ignored_set, NULL), 0);
 
     for (int local = 0; local < 4; local++) {

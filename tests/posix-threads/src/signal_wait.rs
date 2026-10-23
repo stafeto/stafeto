@@ -56,6 +56,16 @@ struct Output {
     signal: i32,
     info: SigInfo,
 }
+/// What a signal of `pthread_kill` (every sender of this probe) gives to a
+/// wait: SI_TKILL with the process's PID and real user ID.
+fn killed(signal: i32) -> SigInfo {
+    SigInfo {
+        si_code: proto_process::SI_TKILL,
+        si_pid: abi::process::getpid(),
+        si_uid: abi::process::getuid(),
+        ..SigInfo::thread(signal)
+    }
+}
 fn sentinel() -> SigInfo {
     SigInfo {
         si_code: -999,
@@ -74,7 +84,7 @@ unsafe extern "C" fn cleanup(argument: *mut c_void) {
         || (INFO.load(Ordering::Acquire)
             && output.info
                 != if mode == 5 {
-                    SigInfo::thread(SIGUSR1)
+                    killed(SIGUSR1)
                 } else {
                     sentinel()
                 })
@@ -135,7 +145,14 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     let mut action = posix_signals::INITIAL;
     let passed = status == 0
         && output.signal == SIGUSR1
-        && (!with_info || output.info == SigInfo::thread(SIGUSR1))
+        && (!with_info
+            || output.info
+                == if mode == 0 {
+                    // The thread raised it itself.
+                    SigInfo::thread(SIGUSR1)
+                } else {
+                    killed(SIGUSR1)
+                })
         && mask() == BLOCKED
         && pending()
             == if mode == 1 && index == 1 {

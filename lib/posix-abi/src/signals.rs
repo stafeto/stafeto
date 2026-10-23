@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
-use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT, SA_ONSTACK};
+use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT, SA_ONSTACK, SI_USER};
 pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -161,6 +161,39 @@ const _: () = assert!(core::mem::size_of_val(&TAKEN) == 66_560);
 static CLAIMING: [AtomicU32; crate::relibc::PLACES + 1] =
     [const { AtomicU32::new(0) }; crate::relibc::PLACES + 1];
 const CLAIM_WAITING: u32 = 1 << 31;
+/// The signals of each thread place whose pending occurrence `pthread_kill`
+/// sent (bit n - 1 for signal n): they say SI_TKILL, the others of the
+/// thread (`raise`, `abort`) SI_USER (XSH 2.4.3 lets `raise` use it).
+static TKILLED: [AtomicU64; crate::relibc::PLACES + 1] =
+    [const { AtomicU64::new(0) }; crate::relibc::PLACES + 1];
+
+/// The code of the thread signal `signal` that the caller takes: SI_TKILL
+/// for one `pthread_kill` sent, else SI_USER. Read once per occurrence.
+fn thread_code(block: &Block, signal: i32) -> i32 {
+    let bit = posix_signals::bit(signal).unwrap_or(0);
+    let old = TKILLED[block.thread_id as usize].fetch_and(!bit, Ordering::SeqCst);
+    if old & bit != 0 {
+        proto_process::SI_TKILL
+    } else {
+        SI_USER
+    }
+}
+
+/// The information of the thread signal `signal` for the caller. A signal
+/// of `pthread_kill` says SI_TKILL with the process's own PID and real user
+/// ID; the others are `SigInfo::thread` (SI_THREAD, which the platform turns
+/// into SI_USER with the same PID and user ID).
+fn thread_info(block: &Block, signal: i32) -> SigInfo {
+    if thread_code(block, signal) == SI_USER {
+        return SigInfo::thread(signal);
+    }
+    SigInfo {
+        si_code: proto_process::SI_TKILL,
+        si_pid: crate::process::getpid(),
+        si_uid: crate::process::getuid(),
+        ..SigInfo::thread(signal)
+    }
+}
 /// The bit of the claim word a signal's bit (`posix_signals::bit`) takes: 31
 /// are there, so the signals past 31 share bits with the first ones, which
 /// only makes a claim wait for another of the same thread (none holds two).
@@ -211,6 +244,7 @@ pub(crate) fn reset_taken_before_live(id: u64) {
     let _guard = INFO_LOCK.lock();
     clear_taken(&TAKEN[id as usize]);
     CLAIMING[id as usize].store(0, Ordering::Relaxed);
+    TKILLED[id as usize].store(0, Ordering::Relaxed);
     crate::altstack::reset(id);
 }
 
@@ -995,6 +1029,8 @@ fn send(
     if ignored || block.end.load(Ordering::SeqCst) != 0 {
         return;
     }
+    // A thread's signal sent by another thread is pthread_kill's.
+    TKILLED[block.thread_id as usize].fetch_or(bit, Ordering::SeqCst);
     if !assign(block, bit.trailing_zeros() as i32 + 1, ticket, false) {
         return;
     }
@@ -1015,6 +1051,12 @@ fn send(
 /// return. Job-control generations and process-wide effects go through
 /// the process service. 0 or an error number.
 pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
+    send_to_thread(id, signal, true)
+}
+
+/// `kill_relibc_thread`; `tkill` says `pthread_kill` sends it (SI_TKILL),
+/// else it is the thread's own `raise` or `abort` (SI_USER).
+fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
     marks::mark(0);
     let bit = if signal == 0 {
         0
@@ -1028,6 +1070,12 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         let action = action(signal);
         (action, ignored(signal, &action))
     });
+    // A real-time signal that waits already for the calling thread is queued
+    // behind it as a signal of the process (a thread has one place for each).
+    // Open POSIX sigwait/2-1 and sigwaitinfo/6-1 raise a real-time signal
+    // twice and take two occurrences; the queue of the process holds the
+    // second (XSH 2.4.2 leaves queueing of such signals to the implementation).
+    let behind = core::cell::Cell::new(false);
     let deliver = crate::relibc::with_target(id, |block, native| {
         let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
             match crate::process::signal_generation(signal) {
@@ -1049,12 +1097,15 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         });
         if core::ptr::eq(block, own()) {
             if let Some((_, false)) = action {
-                // A real-time signal that waits already for the calling
-                // thread takes no second place: signals to a thread are not
-                // queued (XSH 2.4.2 requires the queue for sigqueue and the
-                // sources with a value), the repeat merges with the waiting one.
                 if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
+                    behind.set(true);
                     return Ok(false);
+                }
+                let mine = &TKILLED[block.thread_id as usize];
+                if tkill {
+                    mine.fetch_or(bit, Ordering::SeqCst);
+                } else {
+                    mine.fetch_and(!bit, Ordering::SeqCst);
                 }
                 assign(own(), signal, ticket, false);
                 return Ok(true);
@@ -1068,6 +1119,9 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         Err(code) | Ok(Err(code)) => return code,
         Ok(Ok(true)) => deliver_now(),
         Ok(Ok(false)) => {}
+    }
+    if behind.get() {
+        return crate::process::kill(crate::process::getpid(), signal).map_or_else(|e| e, |()| 0);
     }
     0
 }
@@ -1138,7 +1192,7 @@ pub fn suspend(mask: SigSet) -> i32 {
 }
 /// Sends `signal` to the calling thread.
 pub fn raise(signal: i32) -> Result<(), i32> {
-    match kill_relibc_thread(threads::thread_number(), signal) {
+    match send_to_thread(threads::thread_number(), signal, false) {
         0 => Ok(()),
         status => Err(status),
     }
@@ -1178,7 +1232,7 @@ fn wait(
         let bit = eligible.isolate_lowest_one();
         let signal = bit.trailing_zeros() as i32 + 1;
         if let Some((_, info)) = claim_thread_info(block, signal) {
-            return Some((signal, info.unwrap_or_else(|| SigInfo::thread(signal))));
+            return Some((signal, info.unwrap_or_else(|| thread_info(block, signal))));
         }
     };
     block.wait_set.store(set, Ordering::SeqCst);
@@ -2129,7 +2183,7 @@ unsafe fn deliver_signal(
             let mut info = match (fault, from_process) {
                 (Some(fault), _) => LinuxSigInfo::fault(&fault),
                 (None, Some(taken)) => LinuxSigInfo::process(&taken),
-                (None, None) => LinuxSigInfo::thread(signal),
+                (None, None) => LinuxSigInfo::thread(signal, thread_code(block, signal)),
             };
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
@@ -2244,14 +2298,14 @@ impl LinuxSigInfo {
         }
     }
 
-    /// The information of `signal` sent by pthread_kill, raise or abort:
-    /// SI_TKILL (Linux's code for a signal to one thread), with the process's
-    /// own PID and real user ID as the sender's.
-    pub fn thread(signal: i32) -> Self {
+    /// The information of `signal` sent by pthread_kill (`code` SI_TKILL,
+    /// Linux's code for a signal to one thread), raise or abort (SI_USER),
+    /// with the process's own PID and real user ID as the sender's.
+    pub fn thread(signal: i32, code: i32) -> Self {
         Self {
             signo: signal,
             errno: 0,
-            code: proto_process::SI_TKILL,
+            code,
             pad: 0,
             pid: crate::process::getpid(),
             uid: crate::process::getuid(),

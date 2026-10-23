@@ -346,7 +346,9 @@ unsafe extern "C" fn pressure_info_handler(
 ) {
     // SAFETY: SA_SIGINFO supplies live per-delivery snapshots.
     let (info, context) = unsafe { (&*info, &*raw.cast::<api::LinuxContext>()) };
-    if *info != api::LinuxSigInfo::thread(signal)
+    // raise says SI_USER, pthread_kill SI_TKILL.
+    if (*info != api::LinuxSigInfo::thread(signal, 0)
+        && *info != api::LinuxSigInfo::thread(signal, proto_process::SI_TKILL))
         || context.mask != 0
         || context.sp == 0
         || context.pc == 0
@@ -388,8 +390,15 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
         tv_sec: 3,
         tv_nsec: 0,
     };
+    // This one comes from another thread's pthread_kill: SI_TKILL.
+    let killed = api::SigInfo {
+        si_code: proto_process::SI_TKILL,
+        si_pid: abi::process::getpid(),
+        si_uid: abi::process::getuid(),
+        ..api::SigInfo::thread(SIGUSR1)
+    };
     passed &= unsafe { api::sigtimedwait(&bit(SIGUSR1), &mut info, &timeout) } == SIGUSR1
-        && info == api::SigInfo::thread(SIGUSR1)
+        && info == killed
         && pending() == 0
         && mask() == bit(SIGUSR1)
         && COUNT.load(Ordering::Acquire) == 1
