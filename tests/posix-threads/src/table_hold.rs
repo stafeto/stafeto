@@ -9,7 +9,7 @@
 //! and joins them, three rounds, and prints the longest hold the probe build
 //! of the layer noted (`probe_collect_hold`), in counter ticks: the least of
 //! the three rounds, so that a round which the host interrupted does not
-//! count. The limit is 2 000 ticks (spec 2, limits of E2 (g)); the probe fails above it and `xtask` reads the same line.
+//! count. The limit of the spec is 2 000 ticks (spec 2, E2 (g)), which `xtask` checks on the printed line; the probe fails above 10 000.
 use super::*;
 use crate::layer::signals::{self as api, SigAction};
 use ffi::pthread_join;
@@ -21,8 +21,10 @@ const CHILDREN: usize = PTHREAD_THREADS_MAX as usize - 1;
 const ROUNDS: usize = 3;
 /// Signals each thread sends to its process before it waits.
 const SIGNALS: usize = 4;
-/// The limit of one hold, in counter ticks.
-const HOLD_MAX_TICKS: u64 = 2_000;
+/// The probe's own bound of one hold, in counter ticks: five times the limit
+/// of the spec (2 000), since TCG on four CPUs showed 2 191 on a busy host;
+/// putting the closes back under the lock gives about 19 000.
+const HOLD_MAX_TICKS: u64 = 10_000;
 
 unsafe extern "C" fn handler(_: c_int) {
     HANDLED.fetch_add(1, Ordering::SeqCst);
