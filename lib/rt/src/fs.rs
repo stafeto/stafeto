@@ -475,7 +475,7 @@ impl Files {
             w.u32(Self::exact_description_word(*held)?)?;
             w.u64(held.generation)?;
         }
-        let mut reply = Self::send_on(channel, w.as_bytes())?;
+        let mut reply = Self::send_uninterrupted(channel, w.as_bytes())?;
         let code = Self::reply_code(&reply)?;
         if code != 0 {
             return match Self::open_reply(&reply, 4) {
@@ -746,8 +746,23 @@ impl Files {
             Self::finish_on(channel)?;
         }
     }
+    /// `send_on` for a request of a clone: the wake of the wait by a signal
+    /// of the process (a child that ended meanwhile) asks again, as
+    /// `service::clone_session` does, since a clone for a fork or a spawn
+    /// runs with every signal blocked and has no EINTR to give.
+    fn send_uninterrupted(
+        channel: &Handle<Channel>,
+        request: &[u8],
+    ) -> Result<crate::sys::Reply, Status> {
+        loop {
+            match Self::send_on(channel, request) {
+                Err(Status::Kernel(abi::Error::Interrupted)) => continue,
+                other => return other,
+            }
+        }
+    }
     pub fn clone_on(channel: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
-        let mut reply = Self::send_on(channel, request)?;
+        let mut reply = Self::send_uninterrupted(channel, request)?;
         match Status::from_code(Self::reply_code(&reply)?) {
             Status::Ok if reply.handles.len() == 1 => reply.handles.take(0).map_err(Status::Kernel),
             Status::Ok => Err(Status::BadSize),
