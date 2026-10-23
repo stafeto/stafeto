@@ -283,6 +283,13 @@ pub(crate) fn place(on_stack: bool, frame: u64, sp: u64) -> Place {
     let Some((low, high)) = range() else {
         return Place::Plain;
     };
+    // A handler of the stack is live and the caller lies below its range:
+    // the deliveries above it ran out of the stack, and whatever place the
+    // new handler would take lies on frames that are not its own. This holds
+    // for every place, an entry or not, with SA_ONSTACK or not.
+    if row().active.load(Ordering::Relaxed) && stack_pointer() < low {
+        crate::signals::sys_exit_signal(SIGSEGV)
+    }
     // An entry whose interrupted code ran out of the stack under a live
     // handler of it: the kernel put the frame at the top over the live frames
     // (the nested delivery that took the last bytes ran below the range).
@@ -339,11 +346,7 @@ fn run_placed(place: Place, body: impl FnOnce()) {
         }
         Place::Alternate { top } => {
             let (low, _) = range().expect("a range for an alternate place");
-            // A handler that is live on the stack has run out of it when the
-            // caller lies below the range: the top is no place for a new one.
-            if top.saturating_sub(low) < RESERVE
-                || (alt.active.load(Ordering::Relaxed) && stack_pointer() < low)
-            {
+            if top.saturating_sub(low) < RESERVE {
                 crate::signals::sys_exit_signal(SIGSEGV)
             }
             let before = alt.active.swap(true, Ordering::Relaxed);

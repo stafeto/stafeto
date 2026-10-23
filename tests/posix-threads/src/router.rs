@@ -499,7 +499,7 @@ extern "C" fn r9_exit() {
 extern "C" fn r9_last(_: u64) -> ! {
     let sleeper = Sleeper::new();
     tls::with_process(|| {
-        R9_NATIVE.store(ffi::pthread_self(), Ordering::SeqCst);
+        R9_NATIVE.store(abi::relibc::current(), Ordering::SeqCst);
         // SAFETY: as in `r9_exit`; the text stays in the buffer (no newline).
         unsafe {
             fputs(c"buffered-without-newline".as_ptr(), stdout);
@@ -526,12 +526,20 @@ fn r9_before(own: u64) {
     while R9_ARRIVALS.load(Ordering::SeqCst) < 2 && now() < limit {
         let _ = sys::yield_now();
     }
+    // The order is the point of the run: a wait that ran out ends the child
+    // with a code of its own.
+    if R9_ARRIVALS.load(Ordering::SeqCst) < 2 {
+        end_child(13);
+    }
     let limit = now() + 2_000_000_000;
     while own != R9_WINNER.load(Ordering::SeqCst)
         && R9_TOOK.load(Ordering::SeqCst) == 0
         && now() < limit
     {
         let _ = sys::yield_now();
+    }
+    if own != R9_WINNER.load(Ordering::SeqCst) && R9_TOOK.load(Ordering::SeqCst) == 0 {
+        end_child(14);
     }
 }
 

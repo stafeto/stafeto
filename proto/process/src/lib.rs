@@ -1182,8 +1182,8 @@ const _: () = assert!(core::mem::size_of::<Page>() <= 4096);
 
 /// si_code of a signal kill sent, and of SIGCHLD.
 pub const SI_USER: i32 = 0;
-/// The code of a signal sent to one thread (`pthread_kill`, `raise`,
-/// `abort`): Linux's SI_TKILL (SI_TKILL of relibc's signal.h on stafeto).
+/// The code of a signal `pthread_kill` sent to a thread: Linux's SI_TKILL
+/// (SI_TKILL of relibc's signal.h on stafeto). `raise` and `abort` say SI_USER.
 pub const SI_TKILL: i32 = -6;
 /// The code of a signal sigqueue sent (SI_QUEUE of relibc's signal.h).
 pub const SI_QUEUE: i32 = -1;

@@ -1072,9 +1072,11 @@ fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
     });
     // A real-time signal that waits already for the calling thread is queued
     // behind it as a signal of the process (a thread has one place for each).
-    // Open POSIX sigwait/2-1 and sigwaitinfo/6-1 raise a real-time signal
-    // twice and take two occurrences; the queue of the process holds the
-    // second (XSH 2.4.2 leaves queueing of such signals to the implementation).
+    // Open POSIX sigwait/2-1 raises a real-time signal twice and takes two
+    // occurrences; the queue of the process holds the second (XSH 2.4.2
+    // leaves queueing of such signals to the implementation). The second
+    // comes with SI_USER, and another thread may take it. (SI_USER of
+    // `raise` is what sigwaitinfo/6-1 expects.)
     let behind = core::cell::Cell::new(false);
     let deliver = crate::relibc::with_target(id, |block, native| {
         let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {

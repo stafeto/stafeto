@@ -90,6 +90,9 @@ pub struct Queued {
     others: [u8; RECORDS],
     /// What each process sent (index: the record, `pid % RECORDS`).
     sent: [Sent; RECORDS],
+    /// The mark (id of a timer with its generation) of the timer whose
+    /// occurrence waits in the pool, by the place of the timer; 0 for none.
+    timer_mark: [u32; 256],
 }
 
 impl Default for Queued {
@@ -134,6 +137,7 @@ impl Queued {
             count: [0; RECORDS],
             others: [0; RECORDS],
             sent: [NO_SENT; RECORDS],
+            timer_mark: [0; 256],
         }
     }
 
@@ -171,7 +175,15 @@ impl Queued {
         } else {
             self.others[record] += 1;
         }
+        if info.code == proto_process::SI_TIMER {
+            self.timer_mark[(info.status as u32 & 0xFF) as usize] = info.status as u32;
+        }
         true
+    }
+
+    /// Whether the occurrence of the timer with `mark` waits in the pool.
+    pub fn timer_queued(&self, mark: u32) -> bool {
+        mark != 0 && self.timer_mark[(mark & 0xFF) as usize] == mark
     }
 
     /// The row of the sender `pid`, new when the record has another process.
@@ -269,6 +281,12 @@ impl Queued {
             }
         } else {
             self.others[record] -= 1;
+        }
+        if info.code == proto_process::SI_TIMER {
+            let slot = &mut self.timer_mark[(info.status as u32 & 0xFF) as usize];
+            if *slot == info.status as u32 {
+                *slot = 0;
+            }
         }
         self.entries[usize::from(at)].next = self.free;
         self.free = at;
@@ -419,5 +437,27 @@ mod tests {
         assert_eq!(q.take(2, 36).map(|i| i.value), Some(2));
         assert_eq!(q.take(2, 37).map(|i| i.value), Some(4));
         assert_eq!(q.outstanding(7, |_| true), 0);
+    }
+
+    #[test]
+    fn the_occurrence_of_a_timer_is_known_while_it_waits_in_the_pool() {
+        let mut q = Queued::new();
+        let timer = |mark: i32| Info {
+            code: proto_process::SI_TIMER,
+            pid: 0,
+            uid: 0,
+            status: mark,
+            value: 7,
+        };
+        let (a, b): (i32, i32) = (1 << 8 | 3, 2 << 8 | 4);
+        assert!(!q.timer_queued(a as u32));
+        assert!(q.push(2, 36, timer(a)));
+        assert!(q.push(2, 36, timer(b)));
+        assert!(q.timer_queued(a as u32) && q.timer_queued(b as u32));
+        assert_eq!(q.take(2, 36).map(|i| i.status), Some(a));
+        assert!(!q.timer_queued(a as u32) && q.timer_queued(b as u32));
+        q.clear(2);
+        assert!(!q.timer_queued(b as u32));
+        assert!(!q.timer_queued(0));
     }
 }

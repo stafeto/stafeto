@@ -970,6 +970,45 @@ static int t_c_sender_limit(void) {
     return 0;
 }
 
+/* Two timers on one real-time signal each keep their own occurrence: the
+ * expiries of one never fall into the occurrence of the other, and an
+ * occurrence of sigqueue that waits first stays first. */
+static int t_c_two_timers_one_signal(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    struct sigevent ea = t_event(SIGRTMIN, 1), eb = t_event(SIGRTMIN, 2);
+    timer_t a, b;
+    if (timer_create(CLOCK_MONOTONIC, &ea, &a) || timer_create(CLOCK_MONOTONIC, &eb, &b)) return 2;
+    struct itimerspec its = t_its(2 * T_MS, 2 * T_MS), none = t_its(0, 0);
+    if (timer_settime(a, 0, &its, NULL) || timer_settime(b, 0, &its, NULL)) return 3;
+    t_nap(40);
+    if (timer_settime(a, 0, &none, NULL) || timer_settime(b, 0, &none, NULL)) return 4;
+    siginfo_t info;
+    int seen[3] = {0, 0, 0};
+    for (int n = 0; n < 2; n++) {
+        if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_TIMER) return 5;
+        int v = info.si_value.sival_int;
+        if (v < 1 || v > 2) return 6;
+        seen[v]++;
+    }
+    if (seen[1] != 1 || seen[2] != 1) {
+        printf("posix-procs: timers: occurrences of timer 1: %d, of timer 2: %d\n", seen[1], seen[2]);
+        return 7;
+    }
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 8;
+    /* sigqueue waits first, then an expiry: two occurrences, in this order. */
+    union sigval v;
+    v.sival_int = 9;
+    if (sigqueue(getpid(), SIGRTMIN, v)) return 10;
+    struct itimerspec once = t_its(2 * T_MS, 0);
+    if (timer_settime(a, 0, &once, NULL)) return 11;
+    t_nap(20);
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_QUEUE) return 12;
+    if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN || info.si_code != SI_TIMER || info.si_value.sival_int != 1)
+        return 13;
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 14;
+    return timer_delete(a) || timer_delete(b) ? 15 : 0;
+}
+
 static void t_child(const char *what, int (*fn)(void), int code, int sig) {
     fflush(stdout);
     pid_t pid = fork();
@@ -1014,6 +1053,7 @@ static int timers_role(void) {
     t_child("pthread_kill says SI_TKILL, raise SI_USER", t_c_thread_kill_code, 0, 0);
     t_child("a real-time signal raised twice is taken twice", t_c_thread_rt_twice, 0, 0);
     t_child("a timer on processor time sends SI_TIMER and counts the overrun", t_c_cpu_timer, 0, 0);
+    t_child("two timers on one real-time signal keep their own occurrences", t_c_two_timers_one_signal, 0, 0);
     t_child("two senders fill one receiver 32 each", t_c_senders_share_a_receiver, 0, 0);
     t_child("SIGQUEUE_MAX is the sender's, a taken occurrence gives a place back", t_c_sender_limit, 0, 0);
     if (!failures) printf("posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok\n");

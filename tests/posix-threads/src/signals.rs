@@ -346,9 +346,8 @@ unsafe extern "C" fn pressure_info_handler(
 ) {
     // SAFETY: SA_SIGINFO supplies live per-delivery snapshots.
     let (info, context) = unsafe { (&*info, &*raw.cast::<api::LinuxContext>()) };
-    // raise says SI_USER, pthread_kill SI_TKILL.
-    if (*info != api::LinuxSigInfo::thread(signal, 0)
-        && *info != api::LinuxSigInfo::thread(signal, proto_process::SI_TKILL))
+    // The signal comes from the thread's own raise: SI_USER.
+    if *info != api::LinuxSigInfo::thread(signal, 0)
         || context.mask != 0
         || context.sp == 0
         || context.pc == 0

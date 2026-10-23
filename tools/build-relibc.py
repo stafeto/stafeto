@@ -104,8 +104,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # Step 5 (layer, #390, #392): SI_TKILL for a signal to one thread, one SI_TIMER
 # in signal.h, and the timers on processor time keep a place in the process
 # service (SI_TIMER, merged signals, the overrun), platform interface 22;
-# tagged pin-5b150246.
-COMMIT = "5b150246d7b587d7cc57f01f04a743c05e4d4a35"
+# tagged pin-5b150246; its comment of SI_TKILL mended (pthread_kill only):
+# pin-1cd3d139.
+COMMIT = "1cd3d13968b7953cb8296edb06dc46aa7018c22c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

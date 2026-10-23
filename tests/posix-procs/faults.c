@@ -429,6 +429,39 @@ static int f_nested_28k_plain(void) {
     raise(SIGUSR1);
     return f_stage == 2 ? 0 : 20 + f_stage % 70;
 }
+/* A plain handler without SA_ONSTACK inside the handler on a stack that is
+ * too small: the delivery is below the range and ends the process as well. */
+static void f_h_ret_plain(int sig) {
+    (void)sig;
+    /* Reached only when the delivery did not end the process. */
+    _exit(77);
+}
+static int f_nested_off_run(char *area, size_t size) {
+    stack_t ss = {.ss_sp = area, .ss_size = size, .ss_flags = 0};
+    struct sigaction sa;
+    if (sigaltstack(&ss, NULL)) return 1;
+    if (f_catch(SIGUSR1, f_h_b2, 0) || f_catch(SIGUSR2, f_h_a4, SA_ONSTACK)) return 2;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = f_h_ret_plain;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGALRM, &sa, NULL)) return 3;
+    f_mode = 0;
+    f_stage = 0;
+    raise(SIGUSR1);
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+static int f_nested_off_20k(void) {
+    char area[20480] __attribute__((aligned(16)));
+    return f_nested_off_run(area, sizeof(area));
+}
+static int f_nested_off_24k(void) {
+    char area[24576] __attribute__((aligned(16)));
+    return f_nested_off_run(area, sizeof(area));
+}
+static int f_nested_off_28k(void) {
+    char area[28672] __attribute__((aligned(16)));
+    return f_nested_off_run(area, sizeof(area));
+}
 static int f_nested_36k(void) {
     char area[36864] __attribute__((aligned(16)));
     return f_nested_run(area, sizeof(area));
@@ -600,11 +633,12 @@ static void f_h_sp(int sig, siginfo_t *info, void *ctx) {
     f_sp_addr = (unsigned long)info->si_addr;
     siglongjmp(f_env, 1);
 }
+static volatile unsigned long f_sp_saved;
 static void f_sp_load(void) __attribute__((noinline));
 static void f_sp_load(void) {
     unsigned long v;
-    __asm__ volatile("sub sp, sp, #8\n\tmov %0, sp\n\tldr x0, [sp]\n\tadd sp, sp, #8"
-                     : "=r"(v) :: "x0", "memory");
+    __asm__ volatile("mov x9, sp\n\tstr x9, [%1]\n\tsub sp, sp, #8\n\tmov %0, sp\n\tldr x0, [sp]\n\tadd sp, sp, #8"
+                     : "=r"(v) : "r"(&f_sp_saved) : "x0", "x9", "memory");
     f_sp_value = v;
 }
 static int f_misaligned_sp(void) {
@@ -620,9 +654,8 @@ static int f_misaligned_sp(void) {
     }
     if (f_sp_signo != SIGBUS) return 3;
     if (f_sp_code != BUS_ADRALN) return 4;
-    /* The pointer the instruction ran with is not at hand after the jump:
-     * it is 8 below a 16-aligned address. */
-    if ((f_sp_addr & 15) != 8) return 5;
+    /* The address is the pointer the load ran with: 8 below the saved one. */
+    if (f_sp_addr != f_sp_saved - 8) return 5;
     return 0;
 }
 
@@ -824,6 +857,9 @@ static int faults_role(void) {
     f_child("nested handlers on 36 KiB of the alternate stack", f_nested_36k, 0, 0);
     f_child("nested handlers on 20 KiB of the alternate stack end the process", f_nested_20k, 0, SIGSEGV);
     f_child("nested handlers on 28 KiB end the process before C can tread", f_nested_28k_plain, 0, SIGSEGV);
+    f_child("a plain handler off the stack inside, 20 KiB", f_nested_off_20k, 0, SIGSEGV);
+    f_child("a plain handler off the stack inside, 24 KiB", f_nested_off_24k, 0, SIGSEGV);
+    f_child("a plain handler off the stack inside, 28 KiB still fits", f_nested_off_28k, 77, 0);
     f_child("a jump from a handler into the handler it was called in", f_levels_into_b, 0, 0);
     f_child("a jump from a handler into the main code takes both levels off", f_levels_to_main, 0, 0);
     f_child("fork in a handler off the alternate stack", f_fork_in_handler, 0, 0);

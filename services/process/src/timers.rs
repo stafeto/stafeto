@@ -452,6 +452,13 @@ impl Timers {
         (found, count)
     }
 
+    /// The mark of the timer in `slot`: its id with the generation. It rides
+    /// in the `status` of the information of each occurrence the timer sends,
+    /// so that the service can tell its own occurrence from another's.
+    pub fn mark(&self, slot: usize) -> u32 {
+        if slot < SLOTS { self.id(slot) } else { 0 }
+    }
+
     /// The signal the timer in `slot` sends (0: none).
     pub fn signal_of(&self, slot: usize) -> u8 {
         self.slots[slot].signal

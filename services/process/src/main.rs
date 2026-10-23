@@ -38,7 +38,7 @@ use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
     SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId,
     SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
@@ -1483,11 +1483,17 @@ impl Processes {
         };
         let bit = signals::bit(signal);
         // Occurrences of sigqueue, and of a real-time signal however it was
-        // sent, wait in the queue behind the one on the page; a timer has at
-        // most one signal waiting, its other expiries are overrun
-        // (XSH timer_settime).
-        let by_sigqueue = (info.code == SI_QUEUE
-            || (signal >= REALTIME_MIN && info.code != SI_TIMER))
+        // sent, wait in the queue behind the one on the page. A timer has at
+        // most one signal waiting (XSH timer_settime): its other expiries are
+        // overrun, and only its own waiting occurrence takes them, never
+        // that of another source of the same number.
+        if info.code == SI_TIMER
+            && signal >= REALTIME_MIN
+            && self.timer_waiting(page, signal, info.status as u32)
+        {
+            return Posted::Merged;
+        }
+        let by_sigqueue = (info.code == SI_QUEUE || signal >= REALTIME_MIN)
             && proto_process::job::class(signal).is_none();
         // Older occurrences of the signal wait in the queue and none on the
         // page: the new one goes behind them, the oldest to the page.
@@ -1542,6 +1548,17 @@ impl Processes {
             && slot.code.load(Ordering::Acquire) == SI_QUEUE
             && slot.pid.load(Ordering::Acquire) == sender
             && slot.status.load(Ordering::Acquire) as u32 == held.serial
+    }
+
+    /// Whether the occurrence of the timer with `mark` waits for the process
+    /// of `page`: on the page (the bit is set and the information is that of
+    /// the timer) or queued behind.
+    fn timer_waiting(&self, page: &Page, signal: u8, mark: u32) -> bool {
+        let slot = &page.info[usize::from(signal - 1)];
+        (page.pending.load(Ordering::Acquire) & signals::bit(signal) != 0
+            && slot.code.load(Ordering::Acquire) == SI_TIMER
+            && slot.status.load(Ordering::Acquire) as u32 == mark)
+            || self.queued.timer_queued(mark)
     }
 
     /// The occurrence `info` of sigqueue is on the page of the record
@@ -1970,7 +1987,11 @@ impl Processes {
             code: if due.alarm { SI_KERNEL } else { SI_TIMER },
             pid: 0,
             uid: 0,
-            status: 0,
+            status: if due.alarm {
+                0
+            } else {
+                self.timers.mark(due.slot) as i32
+            },
             value: due.value,
         };
         let posted = self.timer_signal(usize::from(due.owner), due.signal, info);

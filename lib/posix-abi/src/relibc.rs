@@ -663,6 +663,10 @@ fn collect_pass() -> Collected {
 /// What an ended thread of relibc owned, taken out of its place by the
 /// collector that claimed the place.
 struct Taken {
+    /// The caller stays in a critical section at the ceiling from the claim
+    /// until `publish_free`, so that no handler jumps out of the window and a
+    /// preempted collector does not hold up a creator of a higher level.
+    _raised: posix_sync::Raised,
     handles: [u64; 4],
     stack: usize,
     stack_len: usize,
@@ -703,6 +707,7 @@ fn claim_ended(index: usize, place: &Place, pinned_any: &mut bool) -> Option<Tak
     // SAFETY: the TCB is mapped until the caller's unmap.
     let block = unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) };
     Some(Taken {
+        _raised: posix_sync::raise_section(),
         handles: [
             block.timer.swap(0, Ordering::Relaxed),
             block.channel.swap(0, Ordering::Relaxed),
@@ -1307,7 +1312,7 @@ fn successor(own: u64) -> Option<usize> {
 /// The exit hook of a native thread (`rt::upcall::set_exit_hook`), run by
 /// `rt::sys::thread_exit` before its call: the way out of `leaving`, steps
 /// 1 to 4, for a thread that ends past the library. When no other thread
-/// lives the kernel ends the process with the thread.
+/// lives the process ends as `exit(0)` ends it (atexit handlers, stdio).
 pub(crate) fn exit_hook() {
     crate::tls::with_process(|| {
         let block = crate::threads::own_block();
