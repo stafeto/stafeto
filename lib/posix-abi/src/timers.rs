@@ -69,17 +69,44 @@ fn check_clock(clock: i32) -> Result<(), i32> {
 /// the value `value` (the bytes of sigval; with `own_id` the number of the
 /// timer): its `timer_t`. EAGAIN when the
 /// process holds its share of timers or the service has no place.
-pub fn create(clock: i32, signal: i32, value: u64, own_id: bool) -> Result<usize, i32> {
-    check_clock(clock)?;
+///
+/// With `external` the timer is on the processor time of the process: it
+/// has a place in the service and no deadline there. The library keeps the
+/// deadline and tells the service of each expiry (`fire`); `clock` says
+/// nothing then.
+pub fn create(
+    clock: i32,
+    signal: i32,
+    value: u64,
+    own_id: bool,
+    external: bool,
+) -> Result<usize, i32> {
+    if !external {
+        check_clock(clock)?;
+    }
     if !(0..=64).contains(&signal) {
         return Err(EINVAL);
     }
-    // Bit 8 of the signal: the value the signal carries is the timer's id.
-    let signal = signal as u32 | if own_id { 0x100 } else { 0 };
+    // Bit 8 of the signal: the value the signal carries is the timer's id;
+    // bit 9: the library keeps the deadline.
+    let signal = signal as u32
+        | if own_id { 0x100 } else { 0 }
+        | if external { op::CREATE_EXTERNAL } else { 0 };
     let mut w = request(proto_process::Method::Timer, &[op::CREATE, signal])?;
     w.u64(value).map_err(|_| EIO)?;
     let id = ask(&w)?;
     Ok(id as usize | (clock as usize) << 32)
+}
+
+/// The timer on processor time `timer` expired `count` times since the last
+/// word (the expiries missed plus one): the service sends its signal as it
+/// does for a timer it keeps (SI_TIMER, merged with one that waits, counted
+/// in the overrun). EINVAL for a timer that is none of the process's or not
+/// of this kind.
+pub fn fire(timer: usize, count: u64) -> Result<(), i32> {
+    let mut w = request(proto_process::Method::Timer, &[op::FIRE, id_of(timer)])?;
+    w.u64(count).map_err(|_| EIO)?;
+    ask(&w).map(drop)
 }
 
 /// Deletes the timer; EINVAL for one that is none of the process's.

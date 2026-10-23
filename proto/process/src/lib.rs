@@ -1143,6 +1143,16 @@ pub mod timer_op {
     /// timers armed with an absolute time of that clock move their deadlines
     /// `delta` earlier (they may be due now). Only the superuser may tell.
     pub const CLOCK_STEP: u32 = 8;
+    /// id u32, count u64: the helper of the library tells that the timer
+    /// `id`, a place made with `CREATE_EXTERNAL`, expired `count` times
+    /// (the expiries it missed plus one). The service sends the signal as
+    /// for a timer it keeps: code SI_TIMER, merged with one that waits, the
+    /// overrun count of `OVERRUN`.
+    pub const FIRE: u32 = 9;
+    /// Bit 9 of the signal u32 of CREATE: the timer is on the processor
+    /// time of the process and the library keeps its deadline; the place
+    /// counts in the timers of the process.
+    pub const CREATE_EXTERNAL: u32 = 0x200;
     /// Bit of `armed` in SET: the deadline is an absolute time of
     /// CLOCK_REALTIME and follows the steps of the calendar.
     pub const ARMED_REALTIME: u32 = 2;
@@ -1172,6 +1182,9 @@ const _: () = assert!(core::mem::size_of::<Page>() <= 4096);
 
 /// si_code of a signal kill sent, and of SIGCHLD.
 pub const SI_USER: i32 = 0;
+/// The code of a signal sent to one thread (`pthread_kill`, `raise`,
+/// `abort`): Linux's SI_TKILL (SI_TKILL of relibc's signal.h on stafeto).
+pub const SI_TKILL: i32 = -6;
 /// The code of a signal sigqueue sent (SI_QUEUE of relibc's signal.h).
 pub const SI_QUEUE: i32 = -1;
 /// The code of a signal a timer sent (SI_TIMER of relibc's signal.h on

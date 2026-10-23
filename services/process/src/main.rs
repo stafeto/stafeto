@@ -28,7 +28,7 @@ use core::sync::atomic::Ordering;
 use posix_process_service::image_probe::{self, Terminal};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
-use posix_process_service::queued::Queued;
+use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::shares::{Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
@@ -38,7 +38,7 @@ use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
-    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Page, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_KERNEL, SI_QUEUE, SI_TIMER,
     SI_USER, SIGCHLD, SIGCONT, SIGKILL, SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId,
     SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
@@ -289,6 +289,9 @@ struct Processes {
     pages: pages::Pages,
     /// The occurrences of signals queued behind the one on a page.
     queued: Queued,
+    /// The serial number of the last occurrence of sigqueue (the `status` of
+    /// its information on a page, where `Queued::outstanding` finds it).
+    sigqueue_serial: u32,
     /// The page of the credentials generations.
     generations: generations::Generations,
     /// Complete PID life stays independent of credentials and image changes.
@@ -1362,12 +1365,12 @@ impl Processes {
         };
         let bit = signals::bit(signal);
         // Occurrences of sigqueue, and of a real-time signal however it was
-        // sent, wait in the queue behind the one on the page.
-        let by_sigqueue = (info.code == SI_QUEUE || signal >= REALTIME_MIN)
+        // sent, wait in the queue behind the one on the page; a timer has at
+        // most one signal waiting, its other expiries are overrun
+        // (XSH timer_settime).
+        let by_sigqueue = (info.code == SI_QUEUE
+            || (signal >= REALTIME_MIN && info.code != SI_TIMER))
             && proto_process::job::class(signal).is_none();
-        if info.code == SI_QUEUE && !self.has_place_for_queued(target, page) {
-            return Posted::Full;
-        }
         // Older occurrences of the signal wait in the queue and none on the
         // page: the new one goes behind them, the oldest to the page.
         if by_sigqueue
@@ -1406,18 +1409,35 @@ impl Processes {
         posted
     }
 
-    /// Whether the process of the record in `target` may have one more
-    /// occurrence of sigqueue wait: SIGQUEUE_MAX at a time, those on the page
-    /// and those queued behind.
-    fn has_place_for_queued(&self, target: usize, page: &Page) -> bool {
-        let mut waiting = self.queued.sent_by_sigqueue(target);
-        let mut pending = page.pending.load(Ordering::Acquire);
-        while pending != 0 {
-            let signal = pending.trailing_zeros() as usize;
-            pending &= pending - 1;
-            waiting += usize::from(page.info[signal].code.load(Ordering::Relaxed) == SI_QUEUE);
+    /// Whether the occurrence `held` of the process `sender` is still on the
+    /// page of its receiver: the bit is set and the information is that
+    /// occurrence's (a sigqueue of that sender with that serial number).
+    fn still_waiting(pages: &pages::Pages, sender: u32, held: Waiting) -> bool {
+        let Some(page) = pages.page(usize::from(held.receiver)) else {
+            return false;
+        };
+        if !(1..=SIGNAL_MAX).contains(&held.signal) {
+            return false;
         }
-        waiting < proto_process::SIGQUEUE_MAX
+        let slot = &page.info[usize::from(held.signal - 1)];
+        page.pending.load(Ordering::Acquire) & signals::bit(held.signal) != 0
+            && slot.code.load(Ordering::Acquire) == SI_QUEUE
+            && slot.pid.load(Ordering::Acquire) == sender
+            && slot.status.load(Ordering::Acquire) as u32 == held.serial
+    }
+
+    /// The occurrence `info` of sigqueue is on the page of the record
+    /// `target`: its sender counts it until a thread takes it.
+    fn hold_on_page(&mut self, target: usize, signal: u8, info: Info) {
+        let held = Waiting {
+            receiver: target as u8,
+            signal,
+            serial: info.status as u32,
+        };
+        let sender = info.pid;
+        let pages = &self.pages;
+        self.queued
+            .hold(sender, held, |h| Self::still_waiting(pages, sender, h));
     }
 
     /// Puts the oldest queued occurrence of `signal` on the page of the
@@ -1434,6 +1454,11 @@ impl Processes {
             && let Some(info) = self.queued.take(target, signal)
             && signals::post(page, signal, info) == Posted::Pending
         {
+            if info.code == SI_QUEUE {
+                // It moved from the queue to the page: still waiting for its
+                // sender.
+                self.hold_on_page(target, signal, info);
+            }
             self.request_router(target);
         }
         page.more
@@ -1487,17 +1512,32 @@ impl Processes {
         if signals::refused(signal, page) || !self.can_generate_job(target, signal) {
             return Delivery::Refused;
         }
-        let info = Info {
+        let mut info = Info {
             code,
             pid: from_pid,
             uid: creds.uid,
             status: 0,
             value,
         };
-        // Only sigqueue answers EAGAIN for a full queue; kill drops the
-        // occurrence of a real-time signal that finds none.
-        if self.signal(target, signal, info) == Posted::Full && code == SI_QUEUE {
-            return Delivery::Again;
+        // SIGQUEUE_MAX is the sender's: the occurrences it sent that wait
+        // still, on pages and queued. Only sigqueue answers EAGAIN for a full
+        // queue (or the pool of the system); kill drops the occurrence of a
+        // real-time signal that finds none.
+        if code == SI_QUEUE {
+            let pages = &self.pages;
+            let waiting = self
+                .queued
+                .outstanding(from_pid, |held| Self::still_waiting(pages, from_pid, held));
+            if waiting >= proto_process::SIGQUEUE_MAX {
+                return Delivery::Again;
+            }
+            self.sigqueue_serial = self.sigqueue_serial.wrapping_add(1);
+            info.status = self.sigqueue_serial as i32;
+        }
+        match self.signal(target, signal, info) {
+            Posted::Full if code == SI_QUEUE => return Delivery::Again,
+            Posted::Pending if code == SI_QUEUE => self.hold_on_page(target, signal, info),
+            _ => {}
         }
         Delivery::Done
     }
@@ -1801,6 +1841,32 @@ impl Processes {
         self.signal(owner, signal, info)
     }
 
+    /// Sends the signal of an expiration `due` (a timer the service keeps,
+    /// or a timer on processor time that the library told of), and records
+    /// what became of it for the overrun count.
+    fn timer_post(&mut self, due: timers::Expired) {
+        if due.signal == 0 {
+            return;
+        }
+        let info = Info {
+            code: if due.alarm { SI_KERNEL } else { SI_TIMER },
+            pid: 0,
+            uid: 0,
+            status: 0,
+            value: due.value,
+        };
+        let posted = self.timer_signal(usize::from(due.owner), due.signal, info);
+        // A signal that is ignored by default and has no handler never
+        // gets taken as a signal: its expirations join the overrun.
+        let unseen = matches!(due.signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+            && self
+                .pages
+                .page(usize::from(due.owner))
+                .is_some_and(|p| p.caught.load(Ordering::Acquire) & signals::bit(due.signal) == 0);
+        self.timers
+            .account(due.slot, due.count, posted == Posted::Merged, unseen);
+    }
+
     /// The notice of the kernel's timer: a budget (EXPIRY_BUDGET) of due
     /// timers send their signals, and the timer is armed again for the
     /// nearest of the rest. A step takes constant time however many are due.
@@ -1826,25 +1892,7 @@ impl Processes {
             }
             budget -= cost;
             let due = self.timers.expire(slot, now);
-            if due.signal == 0 {
-                continue;
-            }
-            let info = Info {
-                code: if due.alarm { SI_KERNEL } else { SI_TIMER },
-                pid: 0,
-                uid: 0,
-                status: 0,
-                value: due.value,
-            };
-            let posted = self.timer_signal(usize::from(due.owner), due.signal, info);
-            // A signal that is ignored by default and has no handler never
-            // gets taken as a signal: its expirations join the overrun.
-            let unseen = matches!(due.signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
-                && self.pages.page(usize::from(due.owner)).is_some_and(|p| {
-                    p.caught.load(Ordering::Acquire) & signals::bit(due.signal) == 0
-                });
-            self.timers
-                .account(due.slot, due.count, posted == Posted::Merged, unseen);
+            self.timer_post(due);
         }
         let nearest = self.timers.earliest();
         self.timer_arm(nearest);
@@ -1884,15 +1932,23 @@ impl Processes {
                 else {
                     return Answer::Status(Status::BadSize);
                 };
-                // Bit 8 of the signal says the value is the timer's own id.
+                // Bit 8 of the signal says the value is the timer's own id,
+                // bit 9 that the timer is on processor time: the library
+                // keeps its deadline and tells the service of each expiry.
                 let own_id = signal & 0x100 != 0;
+                let external = signal & op::CREATE_EXTERNAL != 0;
                 let Some(signal) = u8::try_from(signal & 0xFF)
                     .ok()
                     .filter(|&s| s <= SIGNAL_MAX)
                 else {
                     return refuse(proto_process::INVALID);
                 };
-                match self.timers.create(owner, signal, value, own_id) {
+                let made = if external {
+                    self.timers.create_external(owner, signal, value)
+                } else {
+                    self.timers.create(owner, signal, value, own_id)
+                };
+                match made {
                     Ok(id) => number(r, id),
                     Err(fail) => failed(fail),
                 }
@@ -1950,6 +2006,18 @@ impl Processes {
                 let nearest = self.timers.earliest();
                 self.timer_arm(nearest);
                 Answer::Status(Status::Ok)
+            }
+            op::FIRE => {
+                let (Ok(id), Ok(count), Ok(())) = (body.u32(), body.u64(), body.finish()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.timers.fire(owner, id, count) {
+                    Ok(due) => {
+                        self.timer_post(due);
+                        Answer::Status(Status::Ok)
+                    }
+                    Err(fail) => failed(fail),
+                }
             }
             op::GET => {
                 let (Ok(id), Ok(())) = (body.u32(), body.finish()) else {

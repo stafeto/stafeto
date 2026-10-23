@@ -192,11 +192,11 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
         call(|| posix_abi::signals::sigtimedwait(set, Some(&mut taken), timeout)).map(i64::from),
     );
     if status > 0 && !info.is_null() {
-        // A thread's signal says SI_USER from this process; the process's
+        // A thread's signal says SI_TKILL from this process; the process's
         // carries what its sender gave: si_code, si_pid, si_uid, and
         // SIGCHLD's si_status.
         if taken.si_code == posix_types::constants::SI_THREAD {
-            taken.si_code = 0;
+            taken.si_code = proto_process::SI_TKILL;
             taken.si_pid = posix_abi::process::getpid();
             taken.si_uid = posix_abi::process::getuid();
         }
@@ -374,8 +374,9 @@ fn linux_spec(spec: posix_abi::timers::Spec) -> LinuxItimerspec {
 }
 
 /// timer_create through the process service: `notify` is SIGEV_SIGNAL (0)
-/// or SIGEV_NONE (1) of relibc's signal.h, `sigval` the bytes of the
-/// event's value; the timer_t goes to `out`. 0 or the negated errno.
+/// or SIGEV_NONE (1) of relibc's signal.h, with bit 8 for a value that is the
+/// timer's number and bit 9 for a timer on processor time; `sigval` the bytes
+/// of the event's value; the timer_t goes to `out`. 0 or the negated errno.
 ///
 /// # Safety
 /// `out` is writable.
@@ -389,12 +390,14 @@ pub unsafe extern "C" fn stafeto_timer_create(
 ) -> c_int {
     // Bit 8 of the type (relibc's default event): the value is the timer's number.
     let own_id = notify & 0x100 != 0;
+    // Bit 9: a timer on processor time, whose deadline relibc keeps.
+    let external = notify & proto_process::timer_op::CREATE_EXTERNAL as c_int != 0;
     let signal = match notify & 0xFF {
         posix_abi::timers::SIGEV_SIGNAL if signal != 0 => signal,
         posix_abi::timers::SIGEV_NONE => 0,
         _ => return -EINVAL,
     };
-    match call(|| posix_abi::timers::create(clock, signal, sigval, own_id)) {
+    match call(|| posix_abi::timers::create(clock, signal, sigval, own_id, external)) {
         Ok(timer) => {
             // SAFETY: the caller's promise.
             unsafe { out.write(timer) };
@@ -402,6 +405,14 @@ pub unsafe extern "C" fn stafeto_timer_create(
         }
         Err(errno) => -errno,
     }
+}
+
+/// A timer on processor time (made with bit 9 of the type) expired `count`
+/// times since the last word: the process service sends its signal. 0 or the
+/// negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_timer_fire(timer: usize, count: u64) -> c_int {
+    value(call(|| posix_abi::timers::fire(timer, count).map(|()| 0))) as c_int
 }
 
 #[unsafe(no_mangle)]

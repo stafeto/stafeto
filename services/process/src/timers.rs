@@ -11,6 +11,13 @@
 //! step stays bounded however many are due. Every operation is a scan of
 //! the table (SLOTS places), constant in time and with no call of the
 //! kernel.
+//!
+//! A timer on the processor time of its process has a place here as well
+//! (`create_external`): the helper of the library keeps its deadline, tells
+//! the service of each expiry (`fire`), and the service sends the signal
+//! the way it does for the timers it keeps (code SI_TIMER, merging with a
+//! signal that waits, the overrun count of `account`). The place counts in
+//! the timers of the process.
 
 /// The places of the table, for the timers of all processes.
 pub const SLOTS: usize = 192;
@@ -75,6 +82,9 @@ struct Slot {
     /// The deadline is an absolute time of CLOCK_REALTIME: a step of the
     /// calendar moves it (`step`).
     real: bool,
+    /// The library keeps the deadline (a timer on processor time): the place
+    /// is never armed here and `fire` tells of an expiry.
+    external: bool,
     deadline: u64,
     interval: u64,
     /// The service does not look at the timer before this time: a periodic
@@ -94,6 +104,7 @@ const FREE: Slot = Slot {
     last: 0,
     unseen: false,
     real: false,
+    external: false,
     deadline: 0,
     interval: 0,
     not_before: 0,
@@ -193,6 +204,23 @@ impl Timers {
     /// with its own id as the value when `own_id`; its id. Again past
     /// PER_PROCESS timers of the owner or with the table full.
     pub fn create(&mut self, owner: u8, signal: u8, value: u64, own_id: bool) -> Result<u32, Fail> {
+        self.make(owner, signal, value, own_id, false)
+    }
+
+    /// A place for a timer on processor time of `owner` that sends `signal`
+    /// with `value`, whose expiries the library tells (`fire`); its id.
+    pub fn create_external(&mut self, owner: u8, signal: u8, value: u64) -> Result<u32, Fail> {
+        self.make(owner, signal, value, false, true)
+    }
+
+    fn make(
+        &mut self,
+        owner: u8,
+        signal: u8,
+        value: u64,
+        own_id: bool,
+        external: bool,
+    ) -> Result<u32, Fail> {
         let held = self
             .slots
             .iter()
@@ -204,8 +232,29 @@ impl Timers {
         let slot = self.take(owner, false)?;
         let id = self.id(slot);
         self.slots[slot].signal = signal;
+        self.slots[slot].external = external;
         self.slots[slot].value = if own_id { u64::from(id) } else { value };
         Ok(id)
+    }
+
+    /// The library tells that the timer `id` of `owner`, a place made with
+    /// `create_external`, expired `count` times (at least 1) since its last
+    /// word: what `expire` gives for a timer the service keeps. Invalid for
+    /// any other timer.
+    pub fn fire(&self, owner: u8, id: u32, count: u64) -> Result<Expired, Fail> {
+        let slot = self.find(owner, id).ok_or(Fail::Invalid)?;
+        let s = &self.slots[slot];
+        if !s.external || count == 0 {
+            return Err(Fail::Invalid);
+        }
+        Ok(Expired {
+            signal: s.signal,
+            value: s.value,
+            alarm: false,
+            owner: s.owner,
+            count,
+            slot,
+        })
     }
 
     /// Deletes the timer `id` of `owner`.
@@ -701,5 +750,46 @@ mod tests {
         assert_eq!(values, [1, 5, 3, 4]);
         assert_eq!(t.due(5).1, 0);
         assert_eq!(t.due(15).1, 1);
+    }
+
+    #[test]
+    fn a_timer_on_processor_time_is_told_of_and_counts_its_overrun() {
+        let mut t = Timers::new();
+        let id = t.create_external(2, 36, 0x55).unwrap();
+        // It never arms here: a setting only starts a new signal.
+        t.set(2, id, None, 0, 0).unwrap();
+        assert_eq!(t.earliest(), None);
+        let e = t.fire(2, id, 1).unwrap();
+        assert_eq!(
+            (e.signal, e.value, e.count, e.alarm, e.owner),
+            (36, 0x55, 1, false, 2)
+        );
+        t.account(e.slot, e.count, false, false);
+        // Nine more expiries find the signal waiting: all join.
+        for _ in 0..9 {
+            let e = t.fire(2, id, 1).unwrap();
+            t.account(e.slot, e.count, true, false);
+        }
+        assert_eq!(t.overrun(2, id, false).unwrap(), 9);
+        let e = t.fire(2, id, 4).unwrap();
+        t.account(e.slot, e.count, true, false);
+        assert_eq!(t.overrun(2, id, false).unwrap(), 13);
+        // Another process, a timer the service keeps and a count of 0 are none of it.
+        assert_eq!(t.fire(3, id, 1), Err(Fail::Invalid));
+        assert_eq!(t.fire(2, id, 0), Err(Fail::Invalid));
+        let own = t.create(2, 36, 0, false).unwrap();
+        assert_eq!(t.fire(2, own, 1), Err(Fail::Invalid));
+        t.delete(2, id).unwrap();
+        assert_eq!(t.fire(2, id, 1), Err(Fail::Invalid));
+    }
+
+    #[test]
+    fn a_place_of_a_timer_on_processor_time_counts_in_the_timers_of_the_process() {
+        let mut t = Timers::new();
+        for _ in 0..PER_PROCESS {
+            t.create_external(1, 36, 0).unwrap();
+        }
+        assert_eq!(t.create_external(1, 36, 0), Err(Fail::Again));
+        assert_eq!(t.create(1, 36, 0, false), Err(Fail::Again));
     }
 }

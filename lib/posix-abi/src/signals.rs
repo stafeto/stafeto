@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
-use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT, SA_ONSTACK, SI_USER};
+use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT, SA_ONSTACK};
 pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -1028,9 +1028,6 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         let action = action(signal);
         (action, ignored(signal, &action))
     });
-    // A real-time signal that waits already for the calling thread is queued
-    // behind it as a signal of the process (a thread has one place for each).
-    let behind = core::cell::Cell::new(false);
     let deliver = crate::relibc::with_target(id, |block, native| {
         let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
             match crate::process::signal_generation(signal) {
@@ -1052,8 +1049,11 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         });
         if core::ptr::eq(block, own()) {
             if let Some((_, false)) = action {
+                // A real-time signal that waits already for the calling
+                // thread takes no second place: signals to a thread are not
+                // queued (XSH 2.4.2 requires the queue for sigqueue and the
+                // sources with a value), the repeat merges with the waiting one.
                 if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
-                    behind.set(true);
                     return Ok(false);
                 }
                 assign(own(), signal, ticket, false);
@@ -1068,9 +1068,6 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         Err(code) | Ok(Err(code)) => return code,
         Ok(Ok(true)) => deliver_now(),
         Ok(Ok(false)) => {}
-    }
-    if behind.get() {
-        return crate::process::kill(crate::process::getpid(), signal).map_or_else(|e| e, |()| 0);
     }
     0
 }
@@ -2247,13 +2244,14 @@ impl LinuxSigInfo {
         }
     }
 
-    /// The information of `signal` sent by pthread_kill or raise: SI_USER,
-    /// with the process's own PID and real user ID as the sender's.
+    /// The information of `signal` sent by pthread_kill, raise or abort:
+    /// SI_TKILL (Linux's code for a signal to one thread), with the process's
+    /// own PID and real user ID as the sender's.
     pub fn thread(signal: i32) -> Self {
         Self {
             signo: signal,
             errno: 0,
-            code: SI_USER,
+            code: proto_process::SI_TKILL,
             pad: 0,
             pid: crate::process::getpid(),
             uid: crate::process::getuid(),
