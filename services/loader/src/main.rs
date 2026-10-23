@@ -75,10 +75,45 @@ mod steps {
     static LONGEST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     static DETAIL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
+    /// The kind whose step is the CPU time of the loader's thread, not the
+    /// clock, and counts only with a detail of at least `FLOOR`: the cost of
+    /// the request `Regions` rises with the regions held (its detail), and the
+    /// loader runs at the level of its client, where a pass of a service
+    /// above it adds tens of thousands of ticks to the clock of one request
+    /// in twenty. The time the thread ran has none of it, and the longest of
+    /// the requests at the most regions held is what is reported.
+    pub const RAN: usize = super::kind::REGIONS;
+    pub const FLOOR: u64 = 80;
+    /// The handle of the loader's own thread, made at the first step.
+    static SELF: AtomicU64 = AtomicU64::new(0);
+
+    /// The CPU ticks the thread has run (object_info THREAD_STATE x5).
+    fn ran() -> u64 {
+        let mut handle = SELF.load(Ordering::Relaxed);
+        if handle == 0 {
+            match rt::sys::self_thread() {
+                Ok(own) => {
+                    handle = own.into_raw().0;
+                    SELF.store(handle, Ordering::Relaxed);
+                }
+                Err(_) => return 0,
+            }
+        }
+        let own = rt::handle::Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(handle));
+        rt::sys::thread_ran(&own).unwrap_or(0)
+    }
+
     pub fn timed<T>(kind: usize, detail: u64, step: impl FnOnce() -> T) -> T {
-        let began = rt::time::now();
+        let (began, ran_began) = (rt::time::now(), if kind == RAN { ran() } else { 0 });
         let out = step();
-        let took = rt::time::now().saturating_sub(began);
+        let took = if kind == RAN {
+            ran().saturating_sub(ran_began)
+        } else {
+            rt::time::now().saturating_sub(began)
+        };
+        if kind == RAN && detail < FLOOR {
+            return out;
+        }
         if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
             DETAIL[kind].store(detail, Ordering::Relaxed);
         }
@@ -493,7 +528,11 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     },
                     Some(Method::Regions) if !copied => match fork.as_mut() {
                         Some((_, scratch)) => {
-                            match steps::timed(kind::REGIONS, handles.len() as u64, || {
+                            // The detail of the step is the number of regions
+                            // held once the request is taken: the admission
+                            // of a region reads every one held.
+                            let held = (scratch.count + handles.len()) as u64;
+                            match steps::timed(kind::REGIONS, held, || {
                                 take_regions(r, &mut handles, scratch)
                             }) {
                                 Ok(()) => 0,

@@ -1185,7 +1185,10 @@ fn send_with(
     let sent = call::<{ Call::Send.number() }>(&args);
     #[cfg(feature = "step-stats")]
     crate::service::waited(crate::time::now().saturating_sub(began));
-    let x = sent?;
+    reply_of(sent?)
+}
+
+fn reply_of(x: Regs) -> Result<Reply, Error> {
     let mut words = [0; 11];
     words[..9].copy_from_slice(&x[1..]);
     let m = Message::from_words(words);
@@ -1195,6 +1198,46 @@ fn send_with(
         handles: Incoming::from_buffer(m.handles),
         words: m.words,
     })
+}
+
+/// The HEARTBEAT of a service to init (`service::Beat`): a `send` whose wait
+/// under step-stats is told in two. Init answers with its counter
+/// (proto_init::heartbeat_reply); until it the wait is the service's wait for
+/// init, which `service::waited` counts and `xtask` holds under
+/// CALL_WAIT_MAX, and from it the service waits to run again, preempted by
+/// the levels above its own (`service::preempted`: term I of its response
+/// time, no limit). A reply with no counter, or one out of the span of the
+/// send, counts whole as the wait for init.
+pub(crate) fn send_beat(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
+    let args = message_regs(channel.raw().0, bytes, &[], 0)?;
+    #[cfg(feature = "step-stats")]
+    let began = crate::time::now();
+    let sent = call::<{ Call::Send.number() }>(&args);
+    #[cfg(feature = "step-stats")]
+    let ended = crate::time::now();
+    let reply = match sent.and_then(reply_of) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The wait is the wait for init whatever came back.
+            #[cfg(feature = "step-stats")]
+            crate::service::waited(ended.saturating_sub(began));
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "step-stats")]
+    {
+        let mut buffer = [0; MESSAGE_MAX];
+        let at = match proto_init::heartbeat_counter(reply.bytes(&mut buffer)) {
+            Some(at) if (began..=ended).contains(&at) => {
+                crate::service::divided();
+                at
+            }
+            _ => ended,
+        };
+        crate::service::waited(at - began);
+        crate::service::preempted(ended - at);
+    }
+    Ok(reply)
 }
 
 /// receive: waits until the channel has something and takes it. The caller

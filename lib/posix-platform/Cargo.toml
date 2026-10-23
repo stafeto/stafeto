@@ -27,3 +27,6 @@ proto-tty = { path = "../../proto/tty" }
 
 [features]
 procfs = ["posix-abi/procfs"]
+# The probes of shared mappings pause the maker of an object
+# (`stafeto_probe_fill_pause`).
+map-probe = []

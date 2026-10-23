@@ -26,6 +26,11 @@ step-stats = []
 # The heartbeat of a service writes its t0, the deadline of its timer and the
 # number of its arms into three words a test child gave (`service::PROBE`).
 armed-probe = []
+# The heartbeats of the services start on a grid: t0 is the start of the
+# period the service registered in, so that every service with the same
+# period sends its HEARTBEAT at the same instants (the worst phase of the
+# wait for init, xtask process-steps). Off in every other image.
+beat-grid = []
 
 [dependencies]
 abi = { path = "../abi" }

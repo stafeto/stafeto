@@ -528,6 +528,7 @@ pub unsafe fn abandon_change(on: Change, cause: u8) {
             }
         };
         if let Some(object) = gone {
+            crate::testpoint::mapping_released();
             // SAFETY: the entry went, and its reference with it.
             unsafe { memory::release_mapping(object, cause) };
         }

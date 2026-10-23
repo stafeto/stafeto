@@ -92,6 +92,8 @@ fn main(_: u64) -> u64 {
         programs,
     );
     service.start(&channel, &order);
+    #[cfg(feature = "steps")]
+    rt::service::report_steps(6);
     let config = Config {
         issued: 0,
         heartbeat: None,

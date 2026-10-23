@@ -642,7 +642,7 @@ fn probes(skip: &[String], all: bool, traces: &Path) -> Vec<jobs::Job> {
     wanted.extend(EXTRA_PROBES.map(str::to_owned));
     let mut list = crate::boot_jobs(Vec::new());
     list.push(jobs::job("process-steps", || {
-        crate::process_steps(&crate::qemu::VIRT_2G, 7)
+        crate::process_steps(&crate::qemu::VIRT_2G, 7, false)
     }));
     list.push(jobs::job("kernel tests icount", || {
         let machine = crate::qemu::machine(Some(&"512M".to_owned()))?;

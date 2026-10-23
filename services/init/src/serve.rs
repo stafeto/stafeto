@@ -1277,10 +1277,12 @@ impl Init {
         Answer::Deferred
     }
 
-    /// HEARTBEAT from the instance at `place`: 0 for a service that
-    /// registered, its watchdog deadline moving to now plus its record's
-    /// deadline; BAD_STATE for any other (spec 13.4).
-    fn heartbeat(&mut self, place: usize, r: &Request<'_>) -> Answer {
+    /// HEARTBEAT from the instance at `place`: 0 and the counter of the clock
+    /// for a service that registered, its watchdog deadline moving to now
+    /// plus its record's deadline; BAD_STATE for any other (spec 13.4). The
+    /// service tells the wait for init from the preemption after the answer
+    /// by the counter.
+    fn heartbeat(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
@@ -1292,7 +1294,11 @@ impl Init {
         if let Some(at) = entry.watch.as_mut().map(|w| w.beat(now())) {
             self.set_deadline(place, at);
         }
-        Answer::Status(Status::Ok)
+        let reply = proto_init::heartbeat_reply(time::now());
+        if r.reply().bytes(&reply[..]).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// LIST (spec 13.4): BAD_SIZE for a request out of its layout; the

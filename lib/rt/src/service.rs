@@ -537,7 +537,11 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// T); K is the method, or `NOTICE` (`OWN` for a notification `step_own`
 /// marked, `GONE` for the departure of a session). A new longest wait of a
 /// kind goes out as `service wait: T kind K W ticks of A`, W the wait and A
-/// the whole step in which it happened.
+/// the whole step in which it happened. The HEARTBEAT of a service splits
+/// its wait in two at the counter init answers with: the first part is that
+/// wait, and the longest of the second, the preemption of the service by the
+/// levels above it after the answer, goes out as `service preempt: T kind K
+/// P ticks of A`.
 #[cfg(feature = "step-stats")]
 mod steps {
     use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -555,6 +559,11 @@ mod steps {
     static DEPARTED: AtomicBool = AtomicBool::new(false);
     /// The ticks the step in progress has waited in `sys::send`.
     static WAITED: AtomicU64 = AtomicU64::new(0);
+    /// The ticks the step in progress has waited, after the answer of init to
+    /// its HEARTBEAT came, for the levels above the service to let it run.
+    static PREEMPTED: AtomicU64 = AtomicU64::new(0);
+    static BEATS: AtomicU64 = AtomicU64::new(0);
+    static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The message buffer of the thread that leads the step in progress
     /// (`msgbuf::address`, one per thread): only its sends count as the
     /// step's waits. The other threads of a service (the adoption thread of
@@ -645,6 +654,7 @@ mod steps {
     pub fn restart() {
         RAN_BEGIN.store(own_ran(), Ordering::Relaxed);
         WAITED.store(0, Ordering::Relaxed);
+        PREEMPTED.store(0, Ordering::Relaxed);
         LEADER.store(crate::msgbuf::address(), Ordering::Relaxed);
         DEPARTED.store(false, Ordering::Relaxed);
     }
@@ -659,9 +669,27 @@ mod steps {
         }
     }
 
+    /// A reply of init with a counter inside the span of its send was
+    /// divided: the count goes out as `service beats: T N` at each power of
+    /// two, for `xtask` to see that the division works in every service.
+    pub fn divided() {
+        let n = BEATS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tag = REPORT.load(Ordering::Relaxed);
+        if n.is_power_of_two() && tag != 0 && !QUIET.load(Ordering::Relaxed) {
+            crate::println!("service beats: {tag} {n}");
+        }
+    }
+
+    pub fn preempted(ticks: u64) {
+        if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
+            PREEMPTED.fetch_add(ticks, Ordering::Relaxed);
+        }
+    }
+
     pub fn end(began: u64, kind: usize) -> super::StepSample {
         let whole = super::time::now().saturating_sub(began);
         let counted = WAITED.swap(0, Ordering::Relaxed);
+        let preempted = PREEMPTED.swap(0, Ordering::Relaxed);
 
         let kind = if OWNED.swap(false, Ordering::Relaxed) {
             OWN
@@ -702,6 +730,9 @@ mod steps {
         }
         if waited > WAITS[kind].fetch_max(waited, Ordering::Relaxed) && printing {
             crate::println!("service wait: {tag} kind {kind} {waited} ticks of {whole}");
+        }
+        if preempted > PREEMPTS[kind].fetch_max(preempted, Ordering::Relaxed) && printing {
+            crate::println!("service preempt: {tag} kind {kind} {preempted} ticks of {whole}");
         }
         sample
     }
@@ -780,6 +811,23 @@ pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
 #[cfg(feature = "step-stats")]
 pub(crate) fn waited(ticks: u64) {
     steps::waited(ticks);
+}
+
+/// Adds the ticks a HEARTBEAT waited after init answered it, for the levels
+/// above the service to let it run, to the step in progress (feature
+/// `step-stats`; `sys::send_beat` calls it): neither the step's own part nor
+/// its wait for init holds them. The line `service preempt` shows the
+/// longest of a kind, for the term I of the service's response time.
+#[cfg(feature = "step-stats")]
+pub(crate) fn preempted(ticks: u64) {
+    steps::preempted(ticks);
+}
+
+/// Counts a HEARTBEAT whose reply carried a counter inside the span of the
+/// send (feature `step-stats`; `sys::send_beat` calls it).
+#[cfg(feature = "step-stats")]
+pub(crate) fn divided() {
+    steps::divided();
 }
 
 /// Counts the notification step in progress apart from the others (feature
@@ -961,13 +1009,28 @@ struct Beat<'a> {
     deadline: u64,
 }
 
+/// The t0 of a heartbeat of `period` registered at `now`: now, or with
+/// the feature beat-grid the start of the period `now` is in, so that the
+/// services of one period send their HEARTBEATs at the same instants.
+fn grid_start(now: u64, period: u64) -> u64 {
+    start_on(cfg!(feature = "beat-grid"), now, period)
+}
+
+fn start_on(grid: bool, now: u64, period: u64) -> u64 {
+    if grid && period != 0 {
+        now - now % period
+    } else {
+        now
+    }
+}
+
 impl<'a> Beat<'a> {
     /// The timer on `channel`, armed at t0 + period, t0 now.
     fn start(channel: &Handle<Channel>, h: Heartbeat<'a>) -> Result<Beat<'a>, Error> {
         if h.period_ns == 0 {
             return Err(Error::InvalidArgs);
         }
-        let t0 = time::ticks_to_ns(time::now());
+        let t0 = grid_start(time::ticks_to_ns(time::now()), h.period_ns);
         let timer = sys::timer_create(channel, h.priority)?;
         let mut beat = Beat {
             to: h.to,
@@ -998,7 +1061,7 @@ impl<'a> Beat<'a> {
         if !time::reached(self.deadline) {
             return;
         }
-        let _ = sys::send(self.to, &Method::Heartbeat.header().bytes());
+        let _ = sys::send_beat(self.to, &Method::Heartbeat.header().bytes());
         // The loop's own timer: timer_set has no error to give.
         let _ = self.arm();
     }
@@ -1315,6 +1378,30 @@ impl<const N: usize> LongOps<N> {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod beat_tests {
+    use super::{next_release, start_on};
+
+    /// On the grid two services of one period that register at different
+    /// instants send at the same ones; off it each keeps its own phase.
+    #[test]
+    fn the_grid_puts_services_of_one_period_on_the_same_instants() {
+        let period = 20_000_000;
+        let (a, b) = (
+            start_on(true, 3_017_000_123, period),
+            start_on(true, 3_031_999_999, period),
+        );
+        assert_eq!(a, 3_000_000_000);
+        assert_eq!(b, 3_020_000_000);
+        assert_eq!(a % period, 0);
+        assert_eq!(b % period, 0);
+        let now = 3_040_000_001;
+        assert_eq!(next_release(a, period, now), next_release(b, period, now));
+        assert_eq!(start_on(false, 3_017_000_123, period), 3_017_000_123);
+        assert_eq!(start_on(true, 5, 0), 5, "no period, no grid");
     }
 }
 

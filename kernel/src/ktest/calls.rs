@@ -5086,6 +5086,9 @@ pub fn mapping_released() {
         } else {
             w.before_barrier += 1;
         }
+        // The barrier belongs to the release it preceded: the next release
+        // needs the barrier of its own TLBIs.
+        w.barrier_done = false;
     }
 }
 
@@ -5130,6 +5133,74 @@ pub fn mapping_reference_goes_after_the_barrier(_: &Boot) -> Result<(), &'static
             "a mapping's reference went before the barrier of its last TLBIs",
         )
     })
+}
+
+/// A mem_map whose caller's process ends before its first portion takes its
+/// entry out of the table again, and the entry's reference to the object
+/// goes through the same observation point as that of a finished mem_unmap
+/// (process::abandon_change, `gone`): with an interrupt pending the first
+/// entry makes the entry and stops at the poll, the process ends, and the
+/// target's table is empty again, the object holds no mapping, and exactly
+/// one reference was released. No TLBI is pending then, so the release
+/// counts on either side of the barrier; the count is what the test reads.
+/// Taking the point out of the branch leaves the count at 0.
+pub fn abandoned_map_releases_through_the_point(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let c = Caller::new()?;
+    let result = abandoned_first_map(&c);
+    c.release();
+    result?;
+    check(
+        memory::in_use() == objects,
+        "the object stayed after its mapping and its handle went",
+    )
+}
+
+fn abandoned_first_map(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let n = Call::MemMap.number();
+    let args = [
+        th.0,
+        h.0,
+        0,
+        LONG_PAGES * PAGE_SIZE,
+        USER_VA as u64,
+        Access::ReadWrite.raw(),
+    ];
+    *RELEASES.lock() = ReleaseWatch {
+        on: true,
+        barrier_done: false,
+        after_barrier: 0,
+        before_barrier: 0,
+    };
+    let result = with_interrupt_pending(|| {
+        c.call(n, &args);
+        check(
+            thread::long(c.thread).is_some() && memory::info(m).mappings == 1,
+            "the first entry of mem_map did not make its entry",
+        )
+    })
+    .and_then(|()| {
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        check(
+            process::mappings(t) == 0,
+            "the abandoned mem_map left its entry in the table",
+        )
+    });
+    let released = {
+        let mut w = RELEASES.lock();
+        w.on = false;
+        w.after_barrier + w.before_barrier
+    };
+    release_target(t);
+    result?;
+    check(
+        released == 1,
+        "the reference of an abandoned mem_map did not go through the point",
+    )
 }
 
 /// A mem_protect whose caller's process ends between two portions leaves

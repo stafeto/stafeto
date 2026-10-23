@@ -723,7 +723,12 @@ const POSIX_VZ_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 12] = {
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
 const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-steps", "steps"],
+    ),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &["steps"]),
     (
@@ -737,12 +742,31 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
         "posix-procs",
         "posix-procs",
         POSIX_STACK_SIZE,
-        &["change-steps", "fifo-steps", "procfs", "priority-steps"],
+        &[
+            "change-steps",
+            "fifo-steps",
+            "procfs",
+            "priority-steps",
+            "share-steps",
+        ],
     ),
     ("loader", "loader", 0, &["steps"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
+/// The same image with the heartbeats of its services on one grid (init's
+/// feature `steps-grid`): the worst phase of their wait for init
+/// (`process-steps grid`).
+const POSIX_STEPS_GRID_PROGRAMS: [ImageProgram; 9] = {
+    let mut programs = POSIX_STEPS_PROGRAMS;
+    programs[0] = (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-steps", "steps-grid"],
+    );
+    programs
+};
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
@@ -1516,7 +1540,8 @@ commands:
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
-  process-steps [branches [machine]] measure process service steps (2G by default)
+  process-steps [grid | branches [machine]] measure process service steps (2G by default);
+            with grid, the heartbeats of the services on one grid, the worst phase of their wait for init
   wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR] [--out DIR]
             run the kernel probes under QEMU's trace plugin and list the
             blocks of the entry paths that none ran (docs/wcet.md); --all runs
@@ -1726,7 +1751,8 @@ fn main() {
         Some("posix-pty-steps") => posix_pty_probe_in(true),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
-            [] => process_steps(&qemu::VIRT_2G, 7),
+            [] => process_steps(&qemu::VIRT_2G, 7, false),
+            [grid] if grid == "grid" => process_steps(&qemu::VIRT_2G, 7, true),
             [n, machine @ ..] if machine.len() <= 1 => n
                 .parse()
                 .ok()
@@ -1737,9 +1763,9 @@ fn main() {
                         Some(name) => qemu::machine(Some(name))?,
                         None => &qemu::VIRT_2G,
                     };
-                    process_steps(machine, n)
+                    process_steps(machine, n, false)
                 }),
-            _ => Err("process-steps [branches [machine]]".to_owned()),
+            _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
@@ -4565,7 +4591,7 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let outcome = run_until(
         cmd,
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         Some("init: posix-procs ended:"),
         &kernel.elf,
     )?;
@@ -5197,17 +5223,13 @@ const RAM_STEP_KINDS: [(usize, &str); 22] = [
 ];
 
 /// The most a step of a service may wait in `send` for the answer of
-/// another, in ticks under -icount. The wait measures other services' work
-/// (their own steps carry their own limits, each against term B) and
-/// the processes of higher levels that run in the middle of it: a send to
-/// init (level 63) in a heartbeat and its reply, 200,000 seen once in a
-/// volley of the steps probe's crowd. For the response-time analysis the
-/// wait of a client is a blocking term: C_ipc, the longest step of the
-/// callee and the step of the request itself.
-const WAIT_MAX: u64 = 500_000;
-
-/// The most a step may wait for the answer of a service in a call that is
-/// no heartbeat, in ticks under -icount: one round trip (C_ipc about
+/// another, in ticks under -icount, the heartbeat to init included (its wait
+/// is counted until init answers, the counter in the reply: what passes
+/// after that, until the service runs again, is the preemption by the levels
+/// above it, term I of its response time, printed with no limit). For the
+/// response-time analysis the wait of a client is a blocking term: C_ipc,
+/// the longest step of the callee and the step of the request itself. For
+/// a call that is no heartbeat: one round trip (C_ipc about
 /// 2,000), the longest step of the callee that may be running (term B: the
 /// portions of the process service stay under 0.8 B), and the step of the
 /// request itself (term B), with a room of 10 %: 2 * 20,410 + 2,034 =
@@ -5239,6 +5261,133 @@ const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (64, "heartbeat: its own part, the send to init is the wait"),
     (65, "own step: a description let go of, a session gone"),
 ];
+
+/// The asks for one shared object that wait at once in the run of the role
+/// `stepwaiters` (16 children of 4 threads), at least: the table has 64
+/// places and a process holds 4, so the round fills it but for the maker.
+const WAITERS_MIN: u64 = 60;
+
+/// The role `stepwaiters` filled the table of the waiting asks (the service
+/// prints each new peak), and the steps that answer them and let them go
+/// are the steps of kinds 60 (Share), 65 (the loop's own step, `share_step`)
+/// and 64/66 (ends of the processes), which `process-steps` holds under
+/// `TERM_B * 9 / 10` and B with the rest of the service.
+fn check_share_waiters(lines: &[String]) -> Result<(), String> {
+    let peak = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("posix-process: share waiters "))
+        .filter_map(|n| n.trim().parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    println!("shared object: {peak} asks waited at once");
+    if peak < WAITERS_MIN {
+        return Err(format!(
+            "the role stepwaiters had {peak} asks wait at once, under {WAITERS_MIN}: the table was not full"
+        ));
+    }
+    Ok(())
+}
+
+/// The kinds of the lines `service step: 6 kind K N ticks detail D` of init,
+/// by the numbers of proto_init::Method and the notifications (64 a timer or
+/// a notice of a worker, 65 own, 66 a session gone).
+const INIT_STEP_KINDS: [(usize, &str); 13] = [
+    (1, "Start"),
+    (2, "Register"),
+    (3, "Connect"),
+    (4, "Heartbeat"),
+    (5, "List"),
+    (6, "Stats"),
+    (7, "Ping"),
+    (8, "Adopt"),
+    (9, "Adopted"),
+    (11, "Replaced"),
+    (64, "notification"),
+    (65, "own"),
+    (66, "session gone"),
+];
+
+/// The methods of init the steps probe makes every service and its crowd
+/// use: they have to have run, or the measure of init's steps holds nothing.
+const INIT_STEPS_SEEN: [usize; 4] = [1, 2, 3, 4];
+
+/// The steps of init (tag 6, feature `steps` of init), each under term B:
+/// the member of the wait of every service for init that is init's longest
+/// step (the response time of a service counts it in its blocking term
+/// beside the exchange and the HEARTBEATs of the others in the queue).
+fn check_init_steps(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
+    let init = longest_steps(lines, "6");
+    for kind in INIT_STEPS_SEEN {
+        if !init.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!("init printed no step of kind {kind}: {init:?}"));
+        }
+    }
+    if let Some((kind, ticks, _)) = init.iter().find(|(_, ticks, _)| *ticks > TERM_B) {
+        return Err(format!(
+            "init: a step of kind {kind} took {ticks} ticks, past B {TERM_B}"
+        ));
+    }
+    let longest = init.iter().map(|r| r.1).max().unwrap_or(0);
+    println!("init steps: the longest {longest} of B {TERM_B}");
+    Ok(init)
+}
+
+/// The shortest time init lets pass from a heartbeat to the next before it
+/// kills the service, less the period: init's watchdog is `deadline_ns` of
+/// the record (1,000 ms in the table of the run, at least three periods of
+/// 250 ms), and a heartbeat sent at the period of the timer must have been
+/// answered, and the service run again, within the deadline less the period.
+/// The counter of the image is 62.5 MHz (QEMU's virt), a tick 16 ns.
+const WATCH_LEFT_TICKS: u64 = (1_000 - 250) * 62_500;
+
+/// The heartbeats of the services (tags 1, 2, 4, 10, 11): each has a wait
+/// until init answered it, under CALL_WAIT_MAX with the other waits
+/// (`check_waits`), and the preemption after the answer, which is printed
+/// without a limit (term I of the response time of the service, set by the
+/// load above it). The whole answer of a heartbeat, its own part, the wait
+/// and the preemption, stays under WATCH_LEFT_TICKS, the requirement of the
+/// watchdog. Every service has divided a wait: `rt` counts the replies whose
+/// counter falls in the span of the send (`service beats: T N`), at least
+/// one in each service, or the reply of init carries no counter or the
+/// division is gone.
+fn check_heartbeats(lines: &[String]) -> Result<(), String> {
+    for tag in ["1", "2", "4", "10", "11"] {
+        let waits = longest_waits(lines, tag);
+        let wait = wait_of(&waits, 64);
+        if wait == 0 {
+            return Err(format!(
+                "the service of tag {tag}: no wait of the heartbeat counted: {waits:?}"
+            ));
+        }
+        let preempt = wait_of(&longest_preempts(lines, tag), 64);
+        let own = longest_steps(lines, tag)
+            .iter()
+            .find(|r| r.0 == 64)
+            .map_or(0, |r| r.1);
+        let whole = own + wait + preempt;
+        let prefix = format!("service beats: {tag} ");
+        let divided = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .filter_map(|n| n.trim().parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        println!(
+            "heartbeat of service {tag}: waited {wait} of {CALL_WAIT_MAX} for init, preempted {preempt} after its answer (term I, no limit), own {own}, whole {whole} of {WATCH_LEFT_TICKS} the watchdog leaves, {divided} replies divided"
+        );
+        if divided == 0 {
+            return Err(format!(
+                "the service of tag {tag} divided no wait of a heartbeat: the reply of init carries no counter, or the wait is not divided"
+            ));
+        }
+        if whole > WATCH_LEFT_TICKS {
+            return Err(format!(
+                "the heartbeat of the service of tag {tag} took {whole} ticks, past the {WATCH_LEFT_TICKS} the watchdog leaves"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
@@ -5284,6 +5433,115 @@ const LOADER_STEP_KINDS: [(usize, &str); 9] = [
     (9, "Go, the whole copy"),
 ];
 
+/// The reports of the loaders in `lines`, one list for each loader that
+/// copied a fork (feature `steps` of services/loader): (kind, ticks,
+/// detail) in the order of the kinds. A loader serves one fork and prints
+/// its kinds in rising order once the console is its client's, so a kind
+/// that does not rise starts the next report.
+fn loader_reports(lines: &[String]) -> Vec<Vec<(usize, u64, u64)>> {
+    let mut reports: Vec<Vec<(usize, u64, u64)>> = Vec::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix("loader step: kind ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [kind, ticks, "ticks", "detail", detail] = words.as_slice() else {
+            continue;
+        };
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
+        else {
+            continue;
+        };
+        match reports.last_mut() {
+            Some(last) if last.last().is_some_and(|&(k, ..)| k < kind) => {
+                last.push((kind, ticks, detail));
+            }
+            _ => reports.push(vec![(kind, ticks, detail)]),
+        }
+    }
+    reports
+}
+
+/// The steps of the loader that copies a fork, from the reports of its
+/// loaders. Kind 8, `Regions`, is a step of the loader as a service: one
+/// request that admits up to `MESSAGE_HANDLES` regions against those it
+/// already holds and takes their handles. The cost of a request rises with
+/// the regions held (the admission of a region reads every region held),
+/// and the loader reports its longest request with at least
+/// `LOADER_REGIONS_MIN` regions held, the number in its detail, in the CPU
+/// time of its thread: it runs at the level of its client, and a pass of a
+/// service above it (the audit of the RAM file service, a timer) adds
+/// tens of thousands of ticks to the clock of one request in twenty, the
+/// interference of the others (term I of the response time) and no step of
+/// the loader. The parent of the role `stepforkmany` fills the map with
+/// pages that do not join, and that report has to exist. It stays
+/// under `TERM_B * 9 / 10` like the new methods of the services. Kinds 1 to
+/// 7 are kernel calls of the copy, whose portions the kernel's B bounds and
+/// whose wall time is the sum of the portions and of the processes above
+/// the child, and kind 9 is the whole copy: they are printed, the last with
+/// the regions it copied, and carry no limit here.
+fn check_loader_steps(lines: &[String]) -> Result<(), String> {
+    let reports = loader_reports(lines);
+    let of = |report: &[(usize, u64, u64)], kind: usize| {
+        report
+            .iter()
+            .find(|(k, ..)| *k == kind)
+            .map(|&(_, t, d)| (t, d))
+    };
+    let filled = qemu::number_after(lines, "posix-procs: steps: fork with ").unwrap_or(0);
+    if filled < LOADER_REGIONS_MIN {
+        return Err(format!(
+            "the fork with a full map had {filled} mappings, under {LOADER_REGIONS_MIN}, or did not run"
+        ));
+    }
+    if !reports.iter().any(|r| of(r, 9).is_some()) {
+        return Err("no loader step of a copy: the forks did not run".into());
+    }
+    for kind in 1..=7 {
+        let most = reports.iter().filter_map(|r| of(r, kind)).max();
+        println!(
+            "loader step {kind}, a kernel call: {} ticks at most",
+            most.map_or(0, |m| m.0)
+        );
+    }
+    let go = reports
+        .iter()
+        .filter_map(|r| of(r, 9))
+        .max()
+        .unwrap_or_default();
+    println!(
+        "loader step 9, the whole copy: {} ticks over {} regions at most",
+        go.0, go.1
+    );
+    let limit = TERM_B * 9 / 10;
+    let mut seen = 0;
+    for (ticks, held) in reports.iter().filter_map(|r| of(r, 8)) {
+        println!(
+            "loader step 8, Regions: {ticks} of {limit} (B {TERM_B} less 10 %) with {held} regions held"
+        );
+        seen += 1;
+        if held < LOADER_REGIONS_MIN || ticks == 0 || ticks > limit {
+            return Err(format!(
+                "the loader's step Regions took {ticks} ticks with {held} regions held, past {limit} (B {TERM_B} with a reserve of 10 %), none, or with under {LOADER_REGIONS_MIN} regions"
+            ));
+        }
+    }
+    if seen == 0 {
+        return Err(format!(
+            "no loader held {LOADER_REGIONS_MIN} regions: the fork with a full map did not copy"
+        ));
+    }
+    Ok(())
+}
+
+/// The regions a loader holds in the forks of the full map, the floor of the
+/// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
+/// the role has 80 one-page mappings (`STEPS_FORK_PAGES`) and its
+/// program's. A child binds at most 96 objects, `posix_map::MAX_OBJECTS`,
+/// one for each region that does not join, so a fork with the map full to
+/// its 128 places (abi::MAX_MAPPINGS) does not run.
+const LOADER_REGIONS_MIN: u64 = 80;
+
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
 /// last line of a kind being its longest, since each prints only when it
 /// grows.
@@ -5326,12 +5584,23 @@ fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
 /// is its longest. W is the time the step spent in `send` waiting for
 /// another service, A the whole step of that case.
 fn longest_waits(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+    longest_of(lines, "wait:", tag)
+}
+
+/// The longest preemption of each kind of the service `tag`, after the
+/// answer of init to its HEARTBEAT: (kind, ticks, step), from the lines
+/// `service preempt: T kind K P ticks of A`.
+fn longest_preempts(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+    longest_of(lines, "preempt:", tag)
+}
+
+fn longest_of(lines: &[String], word: &str, tag: &str) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for line in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
         let [
             "service",
-            "wait:",
+            line_word,
             line_tag,
             "kind",
             kind,
@@ -5343,7 +5612,7 @@ fn longest_waits(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
         else {
             continue;
         };
-        if *line_tag != tag {
+        if *line_tag != tag || *line_word != word {
             continue;
         }
         let (Ok(kind), Ok(wait), Ok(whole)) = (kind.parse(), wait.parse(), whole.parse()) else {
@@ -5362,19 +5631,18 @@ fn wait_of(waits: &[(usize, u64, u64)], kind: usize) -> u64 {
     waits.iter().find(|r| r.0 == kind).map_or(0, |r| r.1)
 }
 
-/// Fails when a wait in the lines of the services `tags` passes its limit
-/// (WAIT_MAX for the heartbeat, kind 64; CALL_WAIT_MAX for the others), or
-/// when `rt` cut an accounting that added up to more than its step.
+/// Fails when a wait in the lines of the services `tags` passes
+/// CALL_WAIT_MAX (the heartbeat, kind 64, included), or when `rt` cut an
+/// accounting that added up to more than its step.
 fn check_waits(lines: &[String], tags: &[&str], who: &str) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| l.starts_with("service wait cut:")) {
         return Err(format!("{who}: the accounting of a wait was cut: {line}"));
     }
     for tag in tags {
         for (kind, wait, whole) in longest_waits(lines, tag) {
-            let limit = if kind == 64 { WAIT_MAX } else { CALL_WAIT_MAX };
-            if wait > limit {
+            if wait > CALL_WAIT_MAX {
                 return Err(format!(
-                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {limit}"
+                    "{who} (tag {tag}): kind {kind} waited {wait} ticks of a step of {whole}, past {CALL_WAIT_MAX}"
                 ));
             }
         }
@@ -5679,37 +5947,95 @@ fn check_process_memory_reserve(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The services above the level 30 of the GetLimit client that print their
+/// steps in the run, by tag: the process service, the RAM files, the pipes,
+/// the entropy driver and the entropy service.
+const GETLIMIT_ABOVE: [&str; 5] = ["1", "2", "4", "10", "11"];
+
+/// The bound of the GetLimit ask of a client at level 30, from the lines of
+/// the same run: (the member of blocking, the member of interference). The
+/// member of blocking is CALL_WAIT_MAX: one round trip, the longest step of
+/// the process service, the step of the ask itself, with a room of 10 %. The
+/// client is the lowest level of the image, so every service above it, init
+/// among them, runs in the middle of its wait; each of them does so once,
+/// because the period of the heartbeat (250 ms) is far over the wait
+/// (ceil(R/T) is 1). The member of interference is the longest whole step of
+/// kind 64 of each such service (its own part and its wait, the heartbeat
+/// and the notices) and of init, and for each service the longest step of
+/// init that answers its heartbeat (kind 4).
+fn getlimit_bound(lines: &[String]) -> Result<(u64, u64), String> {
+    let mut interference = 0;
+    for tag in GETLIMIT_ABOVE {
+        let own = longest_steps(lines, tag)
+            .iter()
+            .find(|r| r.0 == 64)
+            .map_or(0, |r| r.1);
+        let wait = wait_of(&longest_waits(lines, tag), 64);
+        if own == 0 {
+            return Err(format!(
+                "the service of tag {tag} printed no step of kind 64"
+            ));
+        }
+        interference += own + wait;
+    }
+    let init = longest_steps(lines, "6");
+    let init_notice = init.iter().find(|r| r.0 == 64).map_or(0, |r| r.1);
+    let init_beat = init.iter().find(|r| r.0 == 4).map_or(0, |r| r.1);
+    if init_beat == 0 {
+        return Err("init printed no step of kind 4".into());
+    }
+    interference += init_notice + GETLIMIT_ABOVE.len() as u64 * init_beat;
+    Ok((CALL_WAIT_MAX, interference))
+}
+
 /// The wait of a client at level 30 for GetLimit while two threads at level
-/// 10 make loads (`steps_priority` of tests/posix-procs): the longest ask
-/// stays under CALL_WAIT_MAX, two steps of B and a round trip. The ask is
-/// timed from the moment the client sends it. The service runs above every
-/// client and keeps the CPU while its queue holds work, so the client sends
-/// only between its busy periods, and the ask waits in the queue behind at
-/// most the step that runs. (The level the portions of a load stand at is
-/// held by the unit tests of the service, `portion_level` and
-/// `portion_slot`.)
+/// 10 make loads (`steps_priority` of tests/posix-procs), against the bound
+/// of `getlimit_bound` from the lines of the same run, in the run with the
+/// phases of the heartbeats as they fall and in the run `grid`, where they
+/// all fall together: the clock of the client holds what the services above
+/// it do in the middle, so the member of blocking alone is no bound of it.
+/// The ask is timed from the moment the client sends it. The service runs
+/// above every client and keeps the CPU while its queue holds work, so the
+/// client sends only between its busy periods, and the ask waits in the
+/// queue behind at most the step that runs. (The level the portions of a
+/// load stand at is held by the unit tests of the service, `portion_level`
+/// and `portion_slot`.)
 fn check_getlimit_wait(lines: &[String]) -> Result<(), String> {
     let wait = qemu::number_after(lines, "posix-procs: getlimit wait max ")
         .ok_or("the priority probe printed no wait of GetLimit")?;
+    let (blocking, interference) = getlimit_bound(lines)?;
+    let bound = blocking + interference;
     println!(
-        "GetLimit at level 30 against SpawnStart at level 10: {wait} ticks of {CALL_WAIT_MAX}"
+        "GetLimit at level 30 against SpawnStart at level 10: {wait} ticks of {bound} (blocking {blocking} + interference {interference})"
     );
-    if wait > CALL_WAIT_MAX {
+    if wait > bound {
         return Err(format!(
-            "GetLimit at level 30 waited {wait} ticks against a spawn at level 10, past {CALL_WAIT_MAX}"
+            "GetLimit at level 30 waited {wait} ticks against a spawn at level 10, past {bound} (blocking {blocking} + interference {interference})"
         ));
     }
     Ok(())
 }
 
-fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
+/// The steps probe on `machine` with `branches` branches of children. With
+/// `grid` the services of the image send their heartbeats at the same
+/// instants (the queue of init at its longest); the GetLimit client at level
+/// 30 below them waits through their work, and its wait is held against the
+/// bound of `getlimit_bound` in both runs.
+fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
     let kernel = build(Variant::Normal)?;
+    // The files of the image go by its name (rootfs::files_of), so the grid
+    // image keeps it.
+    let programs = if grid {
+        &POSIX_STEPS_GRID_PROGRAMS
+    } else {
+        &POSIX_STEPS_PROGRAMS
+    };
     let image = write_boot_image_with(
         "boot-posix-steps.img",
-        &POSIX_STEPS_PROGRAMS,
+        programs,
         BOOT_PROFILE,
         &[("STEPS_BRANCHES", &branches.to_string())],
     )?;
@@ -5733,7 +6059,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let log = dir.join("process-steps.log");
+    let log = dir.join(if grid {
+        "process-steps-grid.log"
+    } else {
+        "process-steps.log"
+    });
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     if outcome
@@ -5760,6 +6090,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
     qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: shared waiters steps ok")?;
+    check_share_waiters(&outcome.lines)?;
     check_getlimit_wait(&outcome.lines)?;
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
@@ -5769,14 +6101,17 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
     let pipe = longest_steps(&outcome.lines, "4");
-    // The loader's lines, as the services' with the tag 3.
-    let loader_lines: Vec<String> = outcome
-        .lines
-        .iter()
-        .filter_map(|l| l.strip_prefix("loader step: "))
-        .map(|l| format!("service step: 3 {l}"))
-        .collect();
-    let loader = longest_steps(&loader_lines, "3");
+    // The loader serves one fork and reports once: the longest of each kind
+    // over all the forks, with its detail.
+    let mut loader: Vec<(usize, u64, u64)> = Vec::new();
+    for (kind, ticks, detail) in loader_reports(&outcome.lines).into_iter().flatten() {
+        match loader.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) if row.1 >= ticks => {}
+            Some(row) => *row = (kind, ticks, detail),
+            None => loader.push((kind, ticks, detail)),
+        }
+    }
+    loader.sort();
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
@@ -5859,9 +6194,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the process service: kind {kind} took {ticks} ticks, past B {TERM_B}"
         ));
     }
-    if !loader.iter().any(|(k, ..)| *k == 9) {
-        return Err("no loader step of a copy: the forks did not run".into());
-    }
+    check_loader_steps(&outcome.lines)?;
     // The five methods of the change jobs (44 to 48) ran among the crowd, and
     // the longest of each stays under term B like every step of the service.
     for kind in 44..=48 {
@@ -5931,17 +6264,21 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if let Some(row) = entropy.iter().find(|r| r.1 > RAM_STEP_MAX) {
         return Err(format!("the entropy service: a step past term B: {row:?}"));
     }
-    // The waits of all services stay under CALL_WAIT_MAX (the heartbeat's
-    // under WAIT_MAX), so that a growth of a wait shows. The wait of
-    // FinishBinding (ramfs asks the process service) and of the heartbeat
-    // of the pipe service must have been counted: without them the
-    // accounting of waits is lost and the own parts above would hold the
+    // The waits of all services stay under CALL_WAIT_MAX, the heartbeat's
+    // included, so that a growth of a wait shows: its wait is counted until
+    // init answers, and in the run `process-steps grid` the image's services
+    // send their heartbeats on one grid (rt feature beat-grid, which init's
+    // feature `steps-grid` turns on), the worst phase of the queue of init,
+    // while the probe's spawns keep init busy. The wait of FinishBinding (ramfs asks the process service) and of
+    // the heartbeat of every service must have been counted: without them
+    // the accounting of waits is lost and the own parts above would hold the
     // waits again.
     check_waits(
         &outcome.lines,
-        &["1", "2", "4", "10", "11"],
+        &["1", "2", "4", "6", "10", "11"],
         "process-steps",
     )?;
+    check_heartbeats(&outcome.lines)?;
     let ram_waits = longest_waits(&outcome.lines, "2");
     let pipe_waits = longest_waits(&outcome.lines, "4");
     if wait_of(&ram_waits, 25) == 0 {
@@ -5954,6 +6291,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the pipe service: no wait of the heartbeat counted: {pipe_waits:?}"
         ));
     }
+    let init = check_init_steps(&outcome.lines)?;
     let rows_waits = longest_waits(&outcome.lines, "1");
     let mut text = String::from("kind method ticks(own) detail wait\n");
     for (kind, ticks, detail) in &loader {
@@ -5981,6 +6319,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         let wait = wait_of(&pipe_waits, *kind);
         text += &format!("pipe {kind} {name} {ticks} {detail} {wait}\n");
     }
+    for (kind, ticks, detail) in &init {
+        let name = INIT_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("init {kind} {name} {ticks} {detail} 0\n");
+    }
     for (kind, ticks, detail) in &rows {
         let name = STEP_KINDS
             .iter()
@@ -5989,7 +6334,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         let wait = wait_of(&rows_waits, *kind);
         text += &format!("{kind} {name} {ticks} {detail} {wait}\n");
     }
-    let path = dir.join("process-steps.txt");
+    let path = dir.join(if grid {
+        "process-steps-grid.txt"
+    } else {
+        "process-steps.txt"
+    });
     std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
     print!(
         "process steps under icount on {}, {live} children live:\n{text}",
@@ -7714,8 +8063,17 @@ fn timing_jobs() -> Vec<jobs::Job> {
         // External virtio interrupts shift heartbeat release phase under
         // concurrent TCG load. Preserve both measured crowds without competing
         // QEMU instances; the service budgets and wait limits stay unchanged.
-        job("process-steps 4", || process_steps(&qemu::VIRT_2G, 4)),
-        job("process-steps 7", || process_steps(&qemu::VIRT_2G, 7)),
+        job("process-steps 4", || {
+            process_steps(&qemu::VIRT_2G, 4, false)
+        }),
+        job("process-steps 7", || {
+            process_steps(&qemu::VIRT_2G, 7, false)
+        }),
+        // The heartbeats of the services on one grid: the worst phase of
+        // their wait for init (the GetLimit client's wait has no limit in it).
+        job("process-steps grid", || {
+            process_steps(&qemu::VIRT_2G, 7, true)
+        }),
         // A hung test is killed after a second of the host's time.
         ostest::runner_check_job(),
         job(
@@ -7866,6 +8224,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // overruns.
         job("posix-threads smp 4", || {
             qemu::on_cpus(SMP_CPUS, || posix_thread_probe(false))
+        }),
+        job("posix-map smp 4", || {
+            qemu::on_cpus(SMP_CPUS, posix_map_probe)
         }),
         job("posix-procs smp 4", || {
             qemu::on_cpus(SMP_CPUS, || posix_procs_probe(&qemu::VIRT))
@@ -11116,6 +11477,61 @@ mod tests {
         }
     }
 
+    fn loader_lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// A report of a loader that copied a small program, and one of the
+    /// full-map fork with the request `Regions` of `ticks` at 87 regions.
+    fn loaders(ticks: u64) -> Vec<String> {
+        let mut lines = loader_lines(
+            "boot\nloader step: kind 1 900 ticks detail 4096\nloader step: kind 4 5000 ticks detail 4096\nloader step: kind 9 70000 ticks detail 7",
+        );
+        lines.push("loader step: kind 1 950 ticks detail 4096".into());
+        lines.push("loader step: kind 4 5200 ticks detail 4096".into());
+        lines.push(format!("loader step: kind 8 {ticks} ticks detail 87"));
+        lines.push("loader step: kind 9 91000 ticks detail 87".into());
+        lines.push("posix-procs: steps: fork with 80 one page mappings".into());
+        lines
+    }
+
+    #[test]
+    fn the_loader_reports_split_where_the_kinds_stop_rising() {
+        let reports = loader_reports(&loaders(5000));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0], [(1, 900, 4096), (4, 5000, 4096), (9, 70000, 7)]);
+        assert_eq!(reports[1].len(), 4);
+        assert_eq!(reports[1][2], (8, 5000, 87));
+    }
+
+    #[test]
+    fn regions_of_the_full_map_stay_under_nine_tenths_of_b() {
+        check_loader_steps(&loaders(5000)).unwrap();
+        check_loader_steps(&loaders(TERM_B * 9 / 10)).unwrap();
+        let error = check_loader_steps(&loaders(TERM_B * 9 / 10 + 1)).unwrap_err();
+        assert!(error.contains("step Regions took 18370 ticks"), "{error}");
+        // The report of a fork with the map not full does not stand for it.
+        let mut few = loaders(5000);
+        few.retain(|l| !l.contains("kind 8"));
+        assert!(
+            check_loader_steps(&few)
+                .unwrap_err()
+                .contains("did not copy")
+        );
+        let mut short = loaders(5000);
+        short.retain(|l| !l.contains("fork with"));
+        assert!(
+            check_loader_steps(&short)
+                .unwrap_err()
+                .contains("did not run")
+        );
+        let mut low = loaders(5000);
+        for l in &mut low {
+            *l = l.replace("kind 8 5000 ticks detail 87", "kind 8 5000 ticks detail 20");
+        }
+        assert!(check_loader_steps(&low).unwrap_err().contains("under 80"));
+    }
+
     #[test]
     fn lifetime_probe_has_its_own_process_and_program_features() {
         let manifest = include_str!("../../tests/posix-procs/Cargo.toml");
@@ -11245,22 +11661,136 @@ mod tests {
 
     #[test]
     fn a_wait_past_the_limit_fails() {
-        // A call has CALL_WAIT_MAX, the heartbeat WAIT_MAX, and a cut line fails.
+        // A call and the heartbeat have CALL_WAIT_MAX, and a cut line fails.
         let call = |w: u64| vec![format!("service wait: 2 kind 25 {w} ticks of {w}")];
         assert!(check_waits(&call(CALL_WAIT_MAX), &["2"], "t").is_ok());
         assert!(check_waits(&call(CALL_WAIT_MAX + 1), &["2"], "t").is_err());
         let cut = vec!["service wait cut: 2 kind 25 9000 ticks of 8000".to_owned()];
         assert!(check_waits(&cut, &["5"], "t").is_err());
         let ok = vec![format!(
-            "service wait: 4 kind 64 {WAIT_MAX} ticks of 600000"
+            "service wait: 4 kind 64 {CALL_WAIT_MAX} ticks of 600000"
         )];
         assert!(check_waits(&ok, &["4"], "t").is_ok());
         let bad = vec![format!(
             "service wait: 4 kind 64 {} ticks of 600000",
-            WAIT_MAX + 1
+            CALL_WAIT_MAX + 1
         )];
         assert!(check_waits(&bad, &["4"], "t").is_err());
         assert!(check_waits(&bad, &["5"], "t").is_ok());
+        // The preemption after init's answer has no limit.
+        let preempted = vec!["service preempt: 4 kind 64 900000 ticks of 950000".to_owned()];
+        assert!(check_waits(&preempted, &["4"], "t").is_ok());
+    }
+
+    /// The lines of a run for `getlimit_bound`: five services above the
+    /// client with a step of kind 64 of 10,000 and a wait of 4,000, init with
+    /// a notice of 8,000 and a heartbeat of 3,000.
+    fn getlimit_lines(wait: u64) -> Vec<String> {
+        let mut lines = vec![format!(
+            "posix-procs: getlimit wait max {wait} ticks in 110 asks"
+        )];
+        for tag in GETLIMIT_ABOVE {
+            lines.push(format!("service step: {tag} kind 64 10000 ticks detail 0"));
+            lines.push(format!("service wait: {tag} kind 64 4000 ticks of 14000"));
+        }
+        lines.push("service step: 6 kind 64 8000 ticks detail 0".to_owned());
+        lines.push("service step: 6 kind 4 3000 ticks detail 0".to_owned());
+        lines
+    }
+
+    /// The GetLimit ask is held against CALL_WAIT_MAX and the steps of the
+    /// services above the client in the same run: 48,000 + 5 * 14,000 +
+    /// 8,000 + 5 * 3,000 = 141,000.
+    #[test]
+    fn getlimit_is_judged_by_blocking_plus_interference() {
+        assert_eq!(
+            getlimit_bound(&getlimit_lines(1)),
+            Ok((CALL_WAIT_MAX, 5 * 14_000 + 8_000 + 5 * 3_000))
+        );
+        assert!(check_getlimit_wait(&getlimit_lines(141_000)).is_ok());
+        assert!(check_getlimit_wait(&getlimit_lines(141_001)).is_err());
+        // A service that printed no step of kind 64 or an init with no
+        // heartbeat step: the bound is not made.
+        let mut lines = getlimit_lines(1);
+        lines.retain(|l| !l.starts_with("service step: 10 "));
+        assert!(getlimit_bound(&lines).unwrap_err().contains("tag 10"));
+        let mut lines = getlimit_lines(1);
+        lines.retain(|l| !l.starts_with("service step: 6 kind 4 "));
+        assert!(getlimit_bound(&lines).is_err());
+    }
+
+    fn beats(wait: u64, preempt: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        for tag in ["1", "2", "4", "10", "11"] {
+            lines.push(format!("service step: {tag} kind 64 3000 ticks detail 0"));
+            lines.push(format!(
+                "service wait: {tag} kind 64 {wait} ticks of 900000"
+            ));
+            lines.push(format!(
+                "service preempt: {tag} kind 64 {preempt} ticks of 900000"
+            ));
+            lines.push(format!("service beats: {tag} 128"));
+        }
+        lines
+    }
+
+    /// The heartbeat of every service has a wait under CALL_WAIT_MAX; the
+    /// preemption after init's answer is printed and has no limit.
+    #[test]
+    fn heartbeats_are_judged_by_the_wait_until_the_answer() {
+        assert!(check_heartbeats(&beats(4_000, 800_000)).is_ok());
+        // A quiet run has no preemption and still divides: not a failure.
+        assert!(check_heartbeats(&beats(4_000, 0)).is_ok());
+        // No reply divided in a service: the division is gone.
+        let mut undivided = beats(4_000, 100);
+        undivided.retain(|l| !l.starts_with("service beats: 4 "));
+        assert!(
+            check_heartbeats(&undivided)
+                .unwrap_err()
+                .contains("divided no wait")
+        );
+        // The whole heartbeat past what the watchdog leaves.
+        assert!(
+            check_heartbeats(&beats(4_000, WATCH_LEFT_TICKS))
+                .unwrap_err()
+                .contains("watchdog")
+        );
+        assert!(check_waits(&beats(4_000, 800_000), &["1", "2", "4", "10", "11"], "t").is_ok());
+        // A wait of 60,000 ticks before init's answer (init spins before it
+        // replies) fails the run.
+        let spinning = beats(60_000, 100);
+        assert!(check_heartbeats(&spinning).is_ok());
+        assert!(check_waits(&spinning, &["1", "2", "4", "10", "11"], "t").is_err());
+        // A service whose heartbeat was not counted fails.
+        let mut missing = beats(4_000, 100);
+        missing.retain(|l| !l.starts_with("service wait: 10 "));
+        assert!(
+            check_heartbeats(&missing)
+                .unwrap_err()
+                .contains("service of tag 10")
+        );
+        assert_eq!(
+            longest_preempts(&beats(1, 77), "2"),
+            vec![(64, 77, 900_000)]
+        );
+        assert_eq!(longest_waits(&beats(1, 77), "2"), vec![(64, 1, 900_000)]);
+    }
+
+    /// The steps of init are measured and none passes B.
+    #[test]
+    fn init_steps_are_measured_and_under_b() {
+        let steps = |ticks: u64| -> Vec<String> {
+            [1, 2, 3, 4]
+                .iter()
+                .map(|k| format!("service step: 6 kind {k} {ticks} ticks detail 0"))
+                .collect()
+        };
+        assert!(check_init_steps(&steps(TERM_B)).is_ok());
+        assert!(check_init_steps(&steps(TERM_B + 1)).is_err());
+        let mut few = steps(100);
+        few.pop();
+        assert!(check_init_steps(&few).unwrap_err().contains("kind 4"));
+        assert!(check_init_steps(&[]).is_err());
     }
 
     #[test]
