@@ -655,7 +655,13 @@ steps (tag 6, feature `steps`) are compared with term B. The run
 one grid (init's feature `steps-grid`, rt's `beat-grid`), so that it has the
 phase in which all of them knock at init at once; the client of GetLimit
 below them waits through their work (91,367 ticks in a run of four branches
-on the CI machine), so that run prints its wait with no limit. Ramfs FinishBinding and the
+on the CI machine). The wait of that client is held, in the run as it falls
+and in the run `grid`, against CALL_WAIT_MAX plus the longest whole step of
+kind 64 of each service above its level and of init, plus a heartbeat step
+of init for each service, all from the lines of the same run (the heartbeat
+period of 250 ms is far over that bound, so each service counts once). The
+whole heartbeat of a service (own part, wait for init, preemption after the
+answer) is held against the deadline of the watchdog less one period. Ramfs FinishBinding and the
 heartbeat of every service must show a wait, and some heartbeat a
 preemption, or the accounting is gone. The departure of a session counts as kind
 66 in the process service, ramfs and the terminal service; the pipe service
