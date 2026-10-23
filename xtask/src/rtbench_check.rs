@@ -20,8 +20,8 @@
 //!   of the difference of the p50s (head minus base of the same session) at
 //!   most `S5_P50_DELTA_MAX_TICKS`, which catches the growth from one
 //!   change; the median over the sessions of the difference of the p99s
-//!   (head minus base of the same session) at most `P99_SLACK_NS`, two ticks
-//!   of the counter;
+//!   (head minus base of the same session, each p99 first turned into whole
+//!   ticks of the counter of its own session) at most `P99_DELTA_MAX_TICKS`;
 //! - the two rows `s10_*`: the median over the sessions of the ratio of the
 //!   p50 of the head to the p50 of the base at most `S10_P50_PERCENT` over
 //!   100.
@@ -35,7 +35,7 @@
 //! The median of the paired differences takes out the drift of the host
 //! between sessions and the lone tails of a cell: the p99 of 11 900 samples
 //! is its 119th from the top, and the same commit moves it by up to 96 ns
-//! from one session to the next, more than the slack. Rows of S15 and S28
+//! (two to three ticks) from one session to the next. Rows of S15 and S28
 //! are printed without a limit. The table goes to the output; the error
 //! names every row that is over.
 
@@ -54,9 +54,12 @@ pub const S5_P50_MAX_TICKS: u64 = 14;
 /// The most the median over the sessions of the p50 of the head minus the
 /// p50 of the base of the same session may be, in ticks (7.7 % of 13).
 pub const S5_P50_DELTA_MAX_TICKS: i64 = 1;
-/// Two ticks of the counter (83 ns at 24 MHz): the most the median of the
-/// differences of the p99 may be.
-pub const P99_SLACK_NS: u64 = 83;
+/// The most the median of the differences of the p99, head minus base, may be,
+/// in ticks of the counter (83 ns at 24 MHz). Each p99 is turned into whole
+/// ticks by the frequency of its own session before the subtraction, as the
+/// p50 is, so that the limit is the number of the acceptance and does not
+/// depend on the rounding of a conversion to nanoseconds.
+pub const P99_DELTA_MAX_TICKS: i64 = 2;
 /// The median ratio of the p50 of a signal of the process to the base's may
 /// be this many percent.
 pub const S10_P50_PERCENT: u64 = 110;
@@ -322,7 +325,7 @@ fn compare(
             let head_ticks = ticks(h.p50, head.hz);
             head_p50.push(head_ticks);
             p50_deltas.push(head_ticks - ticks(b.p50, base.hz));
-            deltas.push(h.p99 as i64 - b.p99 as i64);
+            deltas.push(ticks(h.p99, head.hz) - ticks(b.p99, base.hz));
         }
         let median = median_x2(&deltas);
         let p50_median = median_x2(&p50_deltas);
@@ -341,9 +344,9 @@ fn compare(
                 show_x2(p50_median)
             ));
         }
-        if median > 2 * P99_SLACK_NS as i64 {
+        if median > 2 * P99_DELTA_MAX_TICKS {
             broken.push(format!(
-                "median p99 difference {} over {P99_SLACK_NS}",
+                "median p99 difference {} ticks over {P99_DELTA_MAX_TICKS}",
                 show_x2(median)
             ));
         }
@@ -351,7 +354,7 @@ fn compare(
             over.push(format!("{machine} {name}: {}", broken.join(", ")));
         }
         table += &format!(
-            "{name:<28} head p50 {} ticks, minus base [{}] median {}  p99 head minus base [{}] median {}  limit: p50 <= {S5_P50_MAX_TICKS}, p50 median <= {S5_P50_DELTA_MAX_TICKS}, p99 median <= {P99_SLACK_NS}\n",
+            "{name:<28} head p50 {} ticks, minus base [{}] median {}  p99 head minus base [{}] median {}  limit: p50 <= {S5_P50_MAX_TICKS}, p50 median <= {S5_P50_DELTA_MAX_TICKS}, p99 median <= {P99_DELTA_MAX_TICKS}\n",
             list(&head_p50).replace('+', ""),
             list(&p50_deltas),
             show_x2(p50_median),
@@ -511,21 +514,27 @@ mod tests {
         file(
             "4f3c7d0",
             600,
-            [(503, 1000), (503, 800), (503, 700)],
+            [(503, tick_ns(24)), (503, tick_ns(19)), (503, tick_ns(17))],
             [(1983, 7000), (1695, 7000)],
         )
     }
 
-    /// A head with the figures of the base plus `delta` on every p99 of S5
+    /// Nanoseconds of a whole number of ticks of the 24 MHz counter, which
+    /// `ticks` turns back into the same number.
+    fn tick_ns(ticks: u64) -> u64 {
+        (ticks * 1_000_000_000 + 12_000_000) / 24_000_000
+    }
+
+    /// A head with the figures of the base plus `delta` ticks on every p99 of S5
     /// and `p50` on every p50 of S5, S10 as the base times `ratio` percent.
     fn head(delta: [u64; 3], p50: u64, ratio: u64) -> String {
         file(
             "abc",
             600,
             [
-                (p50, 1000 + delta[0]),
-                (p50, 800 + delta[1]),
-                (p50, 700 + delta[2]),
+                (p50, tick_ns(24 + delta[0])),
+                (p50, tick_ns(19 + delta[1])),
+                (p50, tick_ns(17 + delta[2])),
             ],
             [(1983 * ratio / 100, 7000), (1695 * ratio / 100, 7000)],
         )
@@ -577,48 +586,56 @@ mod tests {
 
     #[test]
     fn a_head_within_the_limits_passes() {
-        let ok = head([83, 83, 83], 543, 110);
+        let ok = head([2, 2, 2], 543, 110);
         let report = check(&[ok.clone(), ok.clone(), ok.clone(), ok]).unwrap();
         assert!(report.contains("s5_kill_busy_25"), "{report}");
         assert!(report.contains("s15_fork_heap_8m"), "{report}");
     }
 
-    /// One noisy cell and the median passes: the differences 176, 32, 48, 48
-    /// of the review (HVF `reading`) have the median 48.
+    /// One noisy cell and the median passes: the differences 4, 1, 1, 1 ticks
+    /// (HVF `reading`) have the median 1.
     #[test]
     fn a_noisy_cell_with_a_passing_median_passes() {
         let heads = [
-            head([0, 176, 0], 503, 100),
-            head([0, 32, 0], 503, 100),
-            head([0, 48, 0], 503, 100),
-            head([0, 48, 0], 503, 100),
+            head([0, 4, 0], 503, 100),
+            head([0, 1, 0], 503, 100),
+            head([0, 1, 0], 503, 100),
+            head([0, 1, 0], 503, 100),
         ];
         let report = check(&heads).unwrap();
-        assert!(report.contains("[+176 +32 +48 +48] median 48"), "{report}");
+        assert!(report.contains("[+4 +1 +1 +1] median 1"), "{report}");
     }
 
     /// A shift in three of four sessions fails whatever the fourth does.
     #[test]
     fn a_median_over_the_slack_fails() {
         let heads = [
-            head([0, 90, 0], 503, 100),
-            head([0, 90, 0], 503, 100),
-            head([0, 90, 0], 503, 100),
+            head([0, 3, 0], 503, 100),
+            head([0, 3, 0], 503, 100),
+            head([0, 3, 0], 503, 100),
             head([0, 0, 0], 503, 100),
         ];
         let error = check(&heads).unwrap_err();
         assert!(
-            error.contains("s5_kill_reading: median p99 difference 90 over 83"),
+            error.contains("s5_kill_reading: median p99 difference 3 ticks over 2"),
             "{error}"
         );
-        // The middle of an even count: 84 and 83 give 83.5.
+        // The middle of an even count: 3 and 2 give 2.5.
         let heads = [
-            head([0, 84, 0], 503, 100),
-            head([0, 83, 0], 503, 100),
-            head([0, 200, 0], 503, 100),
+            head([0, 3, 0], 503, 100),
+            head([0, 2, 0], 503, 100),
+            head([0, 8, 0], 503, 100),
             head([0, 0, 0], 503, 100),
         ];
-        assert!(check(&heads).unwrap_err().contains("83.5 over 83"));
+        assert!(check(&heads).unwrap_err().contains("2.5 ticks over 2"));
+        // Two ticks in every session stay within the limit.
+        let heads = [
+            head([0, 2, 0], 503, 100),
+            head([0, 2, 0], 503, 100),
+            head([0, 2, 0], 503, 100),
+            head([0, 2, 0], 503, 100),
+        ];
+        check(&heads).unwrap();
     }
 
     /// Sessions with the given orders, the uptimes following the orders.
@@ -770,12 +787,12 @@ mod tests {
             (
                 "p99 of s5",
                 [
-                    head([0, 0, 90], 503, 100),
-                    head([0, 0, 90], 503, 100),
-                    head([0, 0, 90], 503, 100),
-                    head([0, 0, 90], 503, 100),
+                    head([0, 0, 3], 503, 100),
+                    head([0, 0, 3], 503, 100),
+                    head([0, 0, 3], 503, 100),
+                    head([0, 0, 3], 503, 100),
                 ],
-                "s5_kill_busy_25: median p99 difference 90",
+                "s5_kill_busy_25: median p99 difference 3 ticks",
             ),
             (
                 "p50 of s10",
@@ -831,7 +848,7 @@ mod tests {
     fn the_limits_are_those_of_the_acceptance() {
         assert_eq!(S5_P50_MAX_TICKS, 14);
         assert_eq!(S5_P50_DELTA_MAX_TICKS, 1);
-        assert_eq!(P99_SLACK_NS, 83);
+        assert_eq!(P99_DELTA_MAX_TICKS, 2);
         assert_eq!(S10_P50_PERCENT, 110);
         assert_eq!(MIN_SESSIONS, 4);
     }

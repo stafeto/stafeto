@@ -90,7 +90,21 @@
 //!
 //! HEARTBEAT: a service tells init that it lives (spec 13.4); PING: a round
 //! trip to init, for bench (spec 13.6). The request of each is the header
-//! alone, the reply its status alone.
+//! alone. The reply to PING is its status alone. The reply to HEARTBEAT that
+//! is no refusal (`heartbeat_reply`) is its status 0 and the counter of the
+//! clock at the moment init answered, 12 bytes:
+//!
+//! | Bytes | Field |
+//! |---|---|
+//! | 0..4 | status 0 |
+//! | 4..12 | the counter (`time::now()`) when init answered |
+//!
+//! The service divides its wait for the answer there: what passed until the
+//! counter is the wait for init (the exchange, init's longest step, the
+//! queue of other services' HEARTBEATs), and what passed from it until the
+//! service ran again is the preemption by levels above the service. A
+//! refusal is its status alone, and a client of this protocol that finds
+//! no counter takes the whole wait for the first part.
 //!
 //! ADOPT and ADOPTED come only from the POSIX process service (spec 2,
 //! section 3.1), which creates and loads every POSIX process itself: the
@@ -719,8 +733,41 @@ impl<'a> ServiceArgs<'a> {
     }
 }
 
+/// The length of the reply to HEARTBEAT that is no refusal.
+pub const HEARTBEAT_REPLY_LEN: usize = 12;
+
+/// The reply to HEARTBEAT: status 0 and `counter`, the clock at the moment
+/// init answered.
+pub fn heartbeat_reply(counter: u64) -> [u8; HEARTBEAT_REPLY_LEN] {
+    let mut bytes = [0; HEARTBEAT_REPLY_LEN];
+    bytes[4..].copy_from_slice(&counter.to_le_bytes());
+    bytes
+}
+
+/// The counter in a reply to HEARTBEAT: None for a refusal and for a reply
+/// without one.
+pub fn heartbeat_counter(reply: &[u8]) -> Option<u64> {
+    let status = u32::from_le_bytes(reply.get(..4)?.try_into().ok()?);
+    let counter = reply.get(4..HEARTBEAT_REPLY_LEN)?;
+    (status == 0).then(|| u64::from_le_bytes(counter.try_into().expect("8 bytes")))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_reply_to_heartbeat_carries_the_counter_after_a_status_of_zero() {
+        let reply = heartbeat_reply(0x1122_3344_5566_7788);
+        assert_eq!(reply.len(), HEARTBEAT_REPLY_LEN);
+        assert_eq!(heartbeat_counter(&reply), Some(0x1122_3344_5566_7788));
+        // A refusal, a reply of the status alone and a short one have none.
+        assert_eq!(heartbeat_counter(&proto_wire::reply(Status::Ok)), None);
+        let mut refused = reply;
+        refused[..4].copy_from_slice(&Status::BadSize.code().to_le_bytes());
+        assert_eq!(heartbeat_counter(&refused), None);
+        assert_eq!(heartbeat_counter(&reply[..11]), None);
+        assert_eq!(heartbeat_counter(&[]), None);
+    }
+
     use super::*;
 
     fn name(s: &str) -> Option<Name> {

@@ -130,6 +130,10 @@ fn main() {
             u8::from(env::var_os("CARGO_FEATURE_CHANGE_STEPS").is_some())
         ))
         .arg(format!(
+            "-DSHARE_STEPS={}",
+            u8::from(env::var_os("CARGO_FEATURE_SHARE_STEPS").is_some())
+        ))
+        .arg(format!(
             "-DPRIORITY_STEPS={}",
             u8::from(env::var_os("CARGO_FEATURE_PRIORITY_STEPS").is_some())
         ))

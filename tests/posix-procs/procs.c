@@ -889,6 +889,141 @@ static int steps_fork(void) {
     return 0;
 }
 
+/* The role stepforkmany: the map of the layer filled with 80 pages of one
+ * each, read-only and writable by turns so that no two join, and then three
+ * forks, each child ends. The loader meets as many regions as the map holds,
+ * and its step Regions admits each against all it holds. The child binds at
+ * most 96 objects (posix_map::MAX_OBJECTS), one for each region, so the map
+ * is not filled to its 128 places (abi::MAX_MAPPINGS): the pages that join
+ * no other and the program's own regions have to fit in 96. */
+#define STEPS_FORK_PAGES 80
+static int steps_fork_many(void) {
+    int mapped;
+    for (mapped = 0; mapped < STEPS_FORK_PAGES; mapped++) {
+        int prot = mapped % 2 ? PROT_READ | PROT_WRITE : PROT_READ;
+        void *page = mmap(NULL, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) {
+            printf("posix-procs: steps: mmap gave %s after %d pages\n", strerror(errno), mapped);
+            return 63;
+        }
+    }
+    printf("posix-procs: steps: fork with %d one page mappings\n", mapped);
+    for (int i = 0; i < 3; i++) {
+        pid_t pid = fork();
+        if (pid == 0) _exit(7);
+        if (pid < 0) {
+            printf("posix-procs: steps: fork of the full map gave %s\n", strerror(errno));
+            return 61;
+        }
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) return 62;
+    }
+    return 0;
+}
+
+#if SHARE_STEPS
+/* The role stepwaiters: the table of the asks that wait for a shared object
+ * full. The pause of the maker (stafeto_probe_fill_pause) holds the entry
+ * reserved while 16 children of 4 threads each ask for the same file:
+ * 64 places wait in the process service, and the Put wakes them in batches.
+ * Then the same with the entry reserved for good: the 16 children are killed
+ * while their threads wait, and so is the maker, and the service lets go of
+ * the places of the ends. */
+extern void stafeto_probe_fill_pause(unsigned milliseconds);
+
+#define WAITERS_CHILDREN 16
+#define WAITERS_THREADS 4
+static const char *waiters_file = "/tmp/steps-waiters";
+
+static void *waiters_thread(void *arg) {
+    (void)arg;
+    int fd = open(waiters_file, O_RDWR);
+    if (fd < 0) return (void *)1;
+    char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return (void *)2;
+    return p[100] == 'w' ? NULL : (void *)3;
+}
+
+/* A child: waits for the flag the parent shares with it, then four threads
+ * ask at once. */
+static void waiters_child(volatile int *start) {
+    while (!*start) sched_yield();
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32768);
+    pthread_t threads[WAITERS_THREADS];
+    int bad = 0;
+    for (int i = 0; i < WAITERS_THREADS; i++)
+        bad |= pthread_create(&threads[i], &attr, waiters_thread, NULL) != 0;
+    for (int i = 0; i < WAITERS_THREADS; i++) {
+        void *got = NULL;
+        if (pthread_join(threads[i], &got) != 0 || got) bad |= 2;
+    }
+    _exit(bad);
+}
+
+static int waiters_round(unsigned pause, int kill_them) {
+    int fd = open(waiters_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    static char block[4096];
+    memset(block, 'w', sizeof block);
+    if (fd < 0 || write(fd, block, sizeof block) != (ssize_t)sizeof block) return 1;
+    close(fd);
+    volatile int *start = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (start == MAP_FAILED) return 2;
+    *start = 0;
+    stafeto_probe_fill_pause(pause);
+    pid_t maker = -1;
+    if (kill_them) {
+        /* The maker is a process of its own, asleep with the entry. */
+        maker = fork();
+        if (maker == 0) {
+            int mfd = open(waiters_file, O_RDWR);
+            mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+            _exit(0);
+        }
+        if (maker < 0) return 3;
+        pause_ms(100);
+    }
+    pid_t children[WAITERS_CHILDREN];
+    for (int i = 0; i < WAITERS_CHILDREN; i++) {
+        children[i] = fork();
+        if (children[i] == 0) waiters_child(start);
+        if (children[i] < 0) { printf("posix-procs: steps: waiters fork %d gave %s\n", i, strerror(errno)); return 4; }
+    }
+    *start = 1;
+    int bad = 0;
+    if (!kill_them) {
+        /* The first child to ask makes the object (pause), 63 asks wait. */
+        for (int i = 0; i < WAITERS_CHILDREN; i++) {
+            int status = 0;
+            if (waitpid(children[i], &status, 0) != children[i] || !WIFEXITED(status) || WEXITSTATUS(status)) {
+                printf("posix-procs: steps: waiter %d ended with %#x\n", i, status);
+                bad = 6;
+            }
+        }
+    } else {
+        pause_ms(300);
+        for (int i = 0; i < WAITERS_CHILDREN; i++) kill(children[i], SIGKILL);
+        for (int i = 0; i < WAITERS_CHILDREN; i++) waitpid(children[i], NULL, 0);
+        kill(maker, SIGKILL);
+        waitpid(maker, NULL, 0);
+    }
+    stafeto_probe_fill_pause(0);
+    munmap((void *)start, 4096);
+    unlink(waiters_file);
+    return bad;
+}
+
+static int steps_waiters(void) {
+    int bad = waiters_round(400, 0);
+    if (bad) return 70 + bad;
+    bad = waiters_round(60000, 1);
+    if (bad) return 80 + bad;
+    return 0;
+}
+#endif
+
 /* The role steppipes: the longest steps of the pipe service, from forked
  * children, each of which clones a session of 28 ends. Eight children
  * wait at one read end, and each write of a message wakes all of them;
@@ -1214,6 +1349,12 @@ static int steps_share(void) {
         fds[i] = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fds[i] < 0 || ftruncate(fds[i], 4096) != 0) return 1;
         maps[i] = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fds[i], 0);
+        /* The table has 16 entries: the 17th writable mapping fails with
+         * ENOMEM, since a private copy would hide its writes. */
+        if (i == OBJECTS - 1 && maps[i] == MAP_FAILED && errno == ENOMEM) {
+            close(fds[i]);
+            continue;
+        }
         if (maps[i] == MAP_FAILED) {
             printf("posix-procs: steps: shared mapping %d gave %d\n", i, errno);
             return 2;
@@ -1234,7 +1375,7 @@ static int steps_share(void) {
         || WEXITSTATUS(status) != 0) return 4;
     munmap(again, 4096);
     for (int i = 0; i < OBJECTS; i++) {
-        if (munmap(maps[i], 4096) != 0) return 5;
+        if (maps[i] != MAP_FAILED && munmap(maps[i], 4096) != 0) return 5;
         snprintf(name, sizeof name, "/steps-share-%d", i);
         shm_unlink(name);
     }
@@ -1539,6 +1680,10 @@ static int steps_run(void) {
     pid_t forker = -1;
     if (steps_spawn(&forker, "stepfork", "0") != 0) return 5;
     reap("a child that forks among the crowd", forker, 0, 0);
+    /* The same with the map full: the loader meets every region it can. */
+    pid_t filler = -1;
+    if (steps_spawn(&filler, "stepforkmany", "0") != 0) return 5;
+    reap("a child that forks with a full map", filler, 0, 0);
     /* Volleys: SIGUSR1 to the crowd arms every identity session. A change
      * of the credentials moves their generation, and the clock service
      * asks the process service who the caller is again (Vouch) when
@@ -1567,6 +1712,14 @@ static int steps_run(void) {
     pid_t piper = -1;
     if (steps_spawn(&piper, "steppipes", "0") != 0) return 8;
     reap("a child of pipes", piper, 0, 0);
+#if SHARE_STEPS
+    /* 64 asks for one shared object wait in the process service, are
+     * answered by the Put in batches, and are let go with their ends. */
+    pid_t waiters = -1;
+    if (steps_spawn(&waiters, "stepwaiters", "0") != 0) return 9;
+    reap("a child of waiters", waiters, 0, 0);
+    printf("posix-procs: shared waiters steps ok\n");
+#endif
     pause_ms(300);
     failed += failures;
     printf("posix-procs: steps %s\n", failed ? "failed" : "done");
@@ -2799,7 +2952,11 @@ static int role(const char *name) {
     if (strcmp(name, "names") == 0) return names_role();
 #endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
+    if (strcmp(name, "stepforkmany") == 0) return steps_fork_many();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
+#if SHARE_STEPS
+    if (strcmp(name, "stepwaiters") == 0) return steps_waiters();
+#endif
 #if FIFO_STEPS
     if (strcmp(name, "stepfifo") == 0) return steps_fifo();
 #endif

@@ -400,6 +400,7 @@ name = "posix-map-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+ "posix-platform",
 ]
 
 [[package]]
@@ -465,6 +466,7 @@ dependencies = [
  "posix-abi",
  "posix-crt",
  "posix-fs",
+ "posix-platform",
  "posix-sync",
  "proto-fs",
  "proto-init",

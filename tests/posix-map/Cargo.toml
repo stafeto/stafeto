@@ -14,3 +14,4 @@ bench = false
 
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt" }
+posix-platform = { path = "../../lib/posix-platform", features = ["map-probe"] }
