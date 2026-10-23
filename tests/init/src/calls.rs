@@ -1520,6 +1520,33 @@ fn process_create_checks_its_arguments() -> Outcome {
             Error::InvalidArgs.code(),
         )
     });
+    // The shares and the CPU mask (x6-x8) are values too: one share alone
+    // or one above the system's, and a mask above the byte, fail with
+    // INVALID_ARGS alone; a mask with a CPU the caller lacks, ACCESS_DENIED.
+    let up = sys::cpu_info(0).map_err(|_| "CPU info failed")?;
+    check(
+        up.allowed == (1 << up.cpus) - 1,
+        "init is not on every CPU that is up",
+    )?;
+    let shares = [(1, 0), (0, 1), (1025, 1), (1, 8193)]
+        .into_iter()
+        .all(|(x6, x7)| {
+            x0_alone::<N>(
+                &[page, 16, 20, 0, 0, 0, x6, x7, 0],
+                Error::InvalidArgs.code(),
+            )
+        });
+    let masks = x0_alone::<N>(
+        &[page, 16, 20, 0, 0, 0, 0, 0, 0x100],
+        Error::InvalidArgs.code(),
+    ) && x0_alone::<N>(
+        &[page, 16, 20, 0, 0, 0, 0, 0, 1 << up.cpus],
+        Error::AccessDenied.code(),
+    );
+    check(
+        shares && masks,
+        "a bad share or CPU mask did not fail with its error alone",
+    )?;
     check(
         values,
         "a bad quota, limit or ceiling did not fail with INVALID_ARGS alone before the handles",

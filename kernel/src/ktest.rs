@@ -294,6 +294,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::child_without_a_share_pays_from_the_creators,
     ),
     (
+        "the_cpu_mask_of_a_child_is_a_subset_of_its_creators",
+        calls::the_cpu_mask_of_a_child_is_a_subset_of_its_creators,
+    ),
+    (
+        "thread_create_keeps_to_the_cpu_mask_of_the_target",
+        calls::thread_create_keeps_to_the_cpu_mask_of_the_target,
+    ),
+    (
         "timer_places_come_off_the_share",
         calls::timer_places_come_off_the_share,
     ),

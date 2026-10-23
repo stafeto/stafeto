@@ -8429,3 +8429,138 @@ pub fn process_create_takes_its_shares_before_the_quota(_: &Boot) -> Result<(), 
         )
     })
 }
+
+/// A caller whose process is a child of `c`'s on the CPUs of `mask`, with a
+/// quota of 1 MiB; its thread is FIFO at 10 and never runs.
+fn masked_child(c: &Caller, mask: u8) -> Result<Caller, &'static str> {
+    let process = process::create_child_with(c.process, 1 << 20, LIMIT, CEILING, (0, 0), mask)
+        .map_err(|_| "no child on those CPUs")?;
+    match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+        Ok(thread) => Ok(Caller { process, thread }),
+        Err(_) => {
+            // SAFETY: the reference is the test's, and nothing uses it
+            // afterwards.
+            unsafe { process::release(process, CAUSE) };
+            cleanup::drain();
+            Err("no thread")
+        }
+    }
+}
+
+/// The CPU mask of a process (spec 8, 11): x8 of process_create is 0 for
+/// the caller's own, or a subset of it, else ACCESS_DENIED, with a bit above
+/// the byte INVALID_ARGS first; a child inherits the mask of its creator
+/// when x8 is 0, and a grandchild of a process on two CPUs cannot take a
+/// third.
+pub fn the_cpu_mask_of_a_child_is_a_subset_of_its_creators(_: &Boot) -> Result<(), &'static str> {
+    let up = crate::smp::cpus();
+    let all = ((1u32 << up) - 1) as u8;
+    with_caller(|c| {
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        c.close(first)?;
+        let n = Call::ProcessCreate.number();
+        check(
+            process::cpus(c.process) == all,
+            "a root is not on every CPU that is up",
+        )?;
+        let args = |mask| [CHILD_QUOTA, 16, 30, 0, 0, 0, 0, 0, mask];
+        c.fails(n, &args(0x100), Error::InvalidArgs)?;
+        c.fails(n, &args(u64::MAX), Error::InvalidArgs)?;
+        if up < 8 {
+            c.fails(n, &args(1 << up), Error::AccessDenied)?;
+        }
+        let h = c.created(n, &args(0))?;
+        let same = process::cpus(child_of(c, h)?) == all;
+        c.close(h)?;
+        cleanup::drain();
+        check(same, "a child with x8 = 0 is not on its creator's CPUs")?;
+        if up < 4 {
+            return Ok(());
+        }
+        let k = masked_child(c, 0b0011)?;
+        let result = (|| {
+            let n = Call::ProcessCreate.number();
+            let args = |mask| [CHILD_QUOTA / 2, 16, 30, 0, 0, 0, 0, 0, mask];
+            k.fails(n, &args(0b0100), Error::AccessDenied)?;
+            k.fails(n, &args(0b0110), Error::AccessDenied)?;
+            k.fails(n, &args(0x100), Error::InvalidArgs)?;
+            let inherited = k.created(n, &args(0))?;
+            let narrower = k.created(n, &args(0b0010))?;
+            let masks = (
+                process::cpus(child_of(&k, inherited)?),
+                process::cpus(child_of(&k, narrower)?),
+            );
+            k.close(inherited)?;
+            k.close(narrower)?;
+            cleanup::drain();
+            check(
+                masks == (0b0011, 0b0010),
+                "a grandchild did not take its creator's mask or the subset it asked for",
+            )
+        })();
+        k.release();
+        result
+    })
+}
+
+/// thread_create against the CPU mask of the target (spec 8, 11): an
+/// explicit CPU outside it is ACCESS_DENIED, one inside it is where the
+/// thread goes; with no CPU asked, the thread goes to the caller's CPU
+/// (CPU 0 here) when the mask has it, and otherwise to the lowest CPU of
+/// the mask. Needs four CPUs.
+pub fn thread_create_keeps_to_the_cpu_mask_of_the_target(_: &Boot) -> Result<(), &'static str> {
+    if crate::smp::cpus() < 4 {
+        return Ok(());
+    }
+    with_caller(|c| {
+        let low = masked_child(c, 0b0011)?;
+        let high = masked_child(c, 0b1100)?;
+        let result = (|| {
+            let n = Call::ThreadCreate.number();
+            let mut buffer = BUFFER;
+            let mut ask = |target: &Caller, cpu: u64| {
+                let h = c.insert(Object::Process(target.process), Rights::MANAGE)?;
+                buffer += PAGE as u64;
+                let args =
+                    thread_args(h.0, USER_VA as u64, 0x80_1000, 10, FIFO | cpu << 16, buffer);
+                let made = c.call(n, &args);
+                c.close(h)?;
+                Ok::<_, &'static str>((made, args))
+            };
+            let cpu_of = |made: [u64; 10]| -> Result<usize, &'static str> {
+                // SAFETY: the caller's process is the test's.
+                let t = unsafe { c.process.as_ref() }
+                    .lookup(Handle(made[1]), Rights::NONE, Object::thread)
+                    .map_err(|_| "the handle does not name a thread")?;
+                Ok(thread::cpu_of(t))
+            };
+            let denied = Error::AccessDenied.code();
+            let mut cpus = [usize::MAX; 4];
+            for (cpu, why) in [(3, "CPU 3"), (4, "CPU 4")] {
+                let (made, _) = ask(&low, cpu)?;
+                check(made[0] == denied, why)?;
+            }
+            let (made, _) = ask(&low, 2)?;
+            check(made[0] == 0, "CPU 1 is in the mask 0b0011")?;
+            cpus[0] = cpu_of(made)?;
+            let (made, _) = ask(&low, 0)?;
+            check(made[0] == 0, "no CPU is always allowed")?;
+            cpus[1] = cpu_of(made)?;
+            let (made, _) = ask(&high, 1)?;
+            check(made[0] == denied, "CPU 0 is outside the mask 0b1100")?;
+            let (made, _) = ask(&high, 0)?;
+            check(made[0] == 0, "no CPU is always allowed")?;
+            cpus[2] = cpu_of(made)?;
+            let (made, _) = ask(&high, 4)?;
+            check(made[0] == 0, "CPU 3 is in the mask 0b1100")?;
+            cpus[3] = cpu_of(made)?;
+            check(
+                cpus == [1, 0, 2, 3],
+                "a thread is not on the CPU the mask and the call give it",
+            )
+        })();
+        low.release();
+        high.release();
+        result
+    })
+}
