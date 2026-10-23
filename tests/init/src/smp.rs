@@ -147,6 +147,18 @@ fn pause(ns: u64) {
     }
 }
 
+/// Closes the handle of a thread of the tests once the thread has ended
+/// (`ThreadState::Ended`): its message buffer goes with its end, on its own
+/// CPU, and the next test takes the same slot and page again, which a thread
+/// that has not got there yet would make thread_create refuse with
+/// INVALID_ARGS. A thread that does not end within WAIT_NS is closed all the
+/// same.
+fn close_ended(t: Handle<Thread>) -> Outcome {
+    wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
+    let_run()?;
+    close(t)
+}
+
 /// A stopped thread of init's process on CPU `cpu`, started.
 fn spawn_on(
     slot: usize,
@@ -245,7 +257,7 @@ fn threads_together() -> Outcome {
     WANT.store(0, SeqCst);
     let_run()?;
     for t in kept.into_iter().flatten() {
-        close(t)?;
+        close_ended(t)?;
     }
     check(
         met && all,
@@ -297,7 +309,7 @@ fn service_across_cpus() -> Outcome {
     let (during, replied, after) = (mark(0), mark(1), mark(2));
     let_run()?;
     for t in [server, client] {
-        close(t)?;
+        close_ended(t)?;
     }
     close(c)?;
     check(done && replied == 1, "the client did not get its reply")?;
@@ -392,7 +404,7 @@ fn suspend_and_kill() -> Outcome {
     MARKS[3].store(1, Relaxed);
     let ended =
         wait_for(|| sys::thread_info(&low).is_ok_and(|i| i.state == abi::ThreadState::Ended));
-    close(low)?;
+    close_ended(low)?;
     check(ended, "the thread of init on CPU 1 did not stop")?;
     let gone = snapshot();
     pause(30_000_000);
@@ -406,7 +418,7 @@ fn suspend_and_kill() -> Outcome {
     if let Some((c, t, l)) = hear {
         let heard = wait_for(|| mark(2) != 0);
         let late = mark(2).saturating_sub(deadline);
-        close(l)?;
+        close_ended(l)?;
         close(t)?;
         close(c)?;
         check(heard, "the thread that waits for the timer did not run")?;
@@ -508,7 +520,7 @@ fn lock_under_load() -> Outcome {
     }
     let_run()?;
     for t in kept.into_iter().flatten() {
-        close(t)?;
+        close_ended(t)?;
     }
     let after = sys::process_handles(&own()).map_err(|_| "PROCESS_HANDLES failed")?;
     close(c)?;
@@ -571,7 +583,7 @@ fn time_across_cpus() -> Outcome {
     MARKS[3].store(1, Relaxed);
     let ended = wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
-    close(t)?;
+    close_ended(t)?;
     let (ran_ns, system_ns) = last;
     check(
         moved && ended,
@@ -643,7 +655,7 @@ fn signal_across_cpus() -> Outcome {
     MARKS[3].store(1, Relaxed);
     let ended = wait_for(|| sys::thread_info(&t).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
-    close(t)?;
+    close_ended(t)?;
     check(
         ready && all && ended,
         "a request did not reach the thread at EL0 on the other CPU",
@@ -712,7 +724,7 @@ fn log_across_cpus() -> Outcome {
     let t = spawn_on(0, 2, write_marker, 0, TEST_PRIORITY)?;
     let wrote = wait_for(|| mark(0) == 1);
     let_run()?;
-    close(t)?;
+    close_ended(t)?;
     check(wrote, "the thread on CPU 2 did not write")?;
     let mut records: [[u8; abi::LOG_RECORD]; abi::LOG_BATCH] =
         [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
@@ -815,7 +827,7 @@ fn whole_lines_across_cpus() -> Outcome {
     let wrote = wait_for(|| MARKS[0].load(Acquire) == others);
     let_run()?;
     for t in threads.into_iter().flatten() {
-        close(t)?;
+        close_ended(t)?;
     }
     check(wrote, "a thread on another CPU did not write its lines")?;
     println!(
@@ -876,7 +888,7 @@ fn raise_across_cpus() -> Outcome {
     if !taken {
         let_run()?;
         for t in [server, client] {
-            close(t)?;
+            close_ended(t)?;
         }
         close(c)?;
         return Err("the service did not take the request of the client");
@@ -886,7 +898,7 @@ fn raise_across_cpus() -> Outcome {
     let (seen, replied) = (mark(0), mark(1));
     let_run()?;
     for t in [server, client] {
-        close(t)?;
+        close_ended(t)?;
     }
     close(c)?;
     check(done && replied == 1, "the client did not get its reply")?;
@@ -952,7 +964,7 @@ fn timer_across_cpus() -> Outcome {
     let ended =
         wait_for(|| sys::thread_info(&thread).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
-    close(thread)?;
+    close_ended(thread)?;
     check(
         cancelled == Err(Error::BadState) && rearmed == Err(Error::BadState),
         "a timer armed on another CPU was cancelled or armed again from this one",
@@ -1120,7 +1132,7 @@ fn info_of_a_client_being_woken() -> Outcome {
         mark(1) != 0 && matches!(state, Ok(abi::ThreadState::Ended) | Err(_))
     });
     let_run()?;
-    close(client)?;
+    close_ended(client)?;
     close(c)?;
     check(done && mark(1) == 1, "the client did not get its reply")?;
     println!(
@@ -1183,7 +1195,7 @@ fn client_ends_with_reply_on_its_way() -> Outcome {
     let done = wait_for(|| mark(1) != 0);
     let state = kid.end();
     let_run()?;
-    close(killer)?;
+    close_ended(killer)?;
     kid.close()?;
     close(c)?;
     check(done && mark(1) == 1, "process_kill of the client failed")?;
@@ -1272,7 +1284,7 @@ fn exec_map_of_a_killed_process() -> Outcome {
     let done = wait_for(|| mark(1) != 0);
     let state = kid.end();
     let_run()?;
-    close(killer)?;
+    close_ended(killer)?;
     close(m)?;
     kid.close()?;
     check(done && mark(1) == 1, "process_kill of the child failed")?;
@@ -1370,7 +1382,7 @@ fn spawn_with_the_start_channel_closed() -> Outcome {
         .map_err(|_| "init could not take its priority back")?;
     let done = wait_for(|| mark(1) != 0);
     let_run()?;
-    close(closer)?;
+    close_ended(closer)?;
     // The channel is the child's, or the closer closed it: init's handle
     // is not to be closed again.
     start.into_raw();
@@ -1407,7 +1419,7 @@ fn spawn_with_the_exit_channel_closed() -> Outcome {
         .map_err(|_| "init could not take its priority back")?;
     let done = wait_for(|| mark(1) != 0);
     let_run()?;
-    close(closer)?;
+    close_ended(closer)?;
     // The closer closed this handle, whatever the call did.
     exit.into_raw();
     close(base)?;
@@ -1455,7 +1467,7 @@ fn spawn_by_a_process_that_ends() -> Outcome {
     // end cancels, so the state is read, and the ear is not waited on.
     let state = sys::process_state(&kid.process);
     let_run()?;
-    close(killer)?;
+    close_ended(killer)?;
     kid.close()?;
     served?;
     check(about, "the child did not come to its process_create")?;
@@ -1502,7 +1514,7 @@ fn mapping_while_threads_join() -> Outcome {
         wait_for(|| sys::thread_info(&maker).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let made = mark(0);
     let_run()?;
-    close(maker)?;
+    close_ended(maker)?;
     close(m)?;
     check(ended, "the thread on CPU 1 did not stop")?;
     check(mapped == GAP_CALLS, "a mem_map failed while threads joined")?;
@@ -1583,8 +1595,8 @@ fn boost_of_a_service_that_ended() -> Outcome {
     let state = kid.end();
     let raised = wait_for(|| mark(2) != 0);
     let_run()?;
-    close(raiser)?;
-    close(client)?;
+    close_ended(raiser)?;
+    close_ended(client)?;
     kid.close()?;
     close(c)?;
     check(raised, "the raiser did not end")?;
@@ -1709,7 +1721,7 @@ fn request_ends_the_call(
     }
     let entered = wait_for(|| step(5) != 0);
     let_run()?;
-    close(t)?;
+    close_ended(t)?;
     close(c)?;
     check(ready, "the thread did not reach its call")?;
     check(asked.is_ok(), "thread_upcall_request failed")?;
@@ -1794,7 +1806,7 @@ fn request_with_a_handle_is_taken_in_one_section() -> Outcome {
     let done = wait_for(|| step(1) != 0 && step(2) != 0);
     let_run()?;
     for t in [sender, receiver] {
-        close(t)?;
+        close_ended(t)?;
     }
     close(spare)?;
     close(c)?;
@@ -2153,7 +2165,7 @@ fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'stati
     let ended =
         wait_for(|| sys::thread_info(&server).is_ok_and(|i| i.state == abi::ThreadState::Ended));
     let_run()?;
-    close(server)?;
+    close_ended(server)?;
     close(c)?;
     check(done && ended, "a call to the service failed")?;
     Ok(rows)
@@ -2200,9 +2212,9 @@ fn target_rows(
             .all(|t| sys::thread_info(t).is_ok_and(|i| i.state == abi::ThreadState::Ended))
     });
     let_run()?;
-    close(target)?;
+    close_ended(target)?;
     if let Some(t) = spinner {
-        close(t)?;
+        close_ended(t)?;
     }
     close(c)?;
     check(ended, "the target did not end")?;
@@ -2245,7 +2257,7 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     });
     let_run()?;
     for t in kept.into_iter().flatten() {
-        close(t)?;
+        close_ended(t)?;
     }
     close(c)?;
     close(m)?;
@@ -2478,8 +2490,8 @@ fn litmus_run(pattern: Pattern, a: usize, b: usize) -> Result<(u64, u64, u64), &
             && sys::thread_info(&t1).is_ok_and(|i| i.state == abi::ThreadState::Ended)
     });
     let_run()?;
-    close(t0)?;
-    close(t1)?;
+    close_ended(t0)?;
+    close_ended(t1)?;
     check(ok, "a litmus thread did not finish its round")?;
     Ok((rounds, seen, weak))
 }
