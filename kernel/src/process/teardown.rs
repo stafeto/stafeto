@@ -238,6 +238,9 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
             (*p).threads_next = (*t.as_ptr()).siblings.and_then(|s| s.next);
         }
         (*p).stage = with_work(p, Stage::Threads);
+        if (*p).stage != Stage::Threads {
+            control::drop_wait(process);
+        }
         let continued = control::cancel(process);
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).

@@ -217,6 +217,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("kernel tests 2G", 1),
     ("kernel tests GICv3", 1),
     ("kernel tests EL2", 1),
+    ("kernel tests smp 4", 2),
     ("kernel tests 512M icount", 1),
     ("kernel tests 2G icount", 1),
     ("tty", 10),

@@ -5005,13 +5005,14 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// ready threads, 2 905 instructions, and the guard keeps the 4 of rule 4
 /// above it.
 ///
-/// `THREADS_READY_MAX` 2 909 -> 3 019 (SMP step 3, #438): `sched::exit` takes
+/// `THREADS_READY_MAX` 2 909 -> 3 022 (SMP step 3, #438): `sched::exit` takes
 /// a thread off the ring of the parked threads only when the thread runs on
 /// the CPU of the call, since the link of a thread belongs to its CPU; the
 /// test of where it runs, and the order of the two tests of
-/// `is_parked_listed`, make the compiler lay the function out anew: 3 015
-/// measured, 108 over the 2 907 before, under the 128 of one instruction a
-/// thread. The path of a thread that is ready stays one take of `OBJ`.
+/// `is_parked_listed`, make the compiler lay the function out anew, and the
+/// end of a process that has no thread to stop closes the wait its gate
+/// opened (`control::drop_wait`): 3 018 measured, 111 over the 2 907
+/// before, under the 128 of one instruction a thread. The path of a thread that is ready stays one take of `OBJ`.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5059,7 +5060,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_019;
+const THREADS_READY_MAX: u64 = 3_022;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),
@@ -7778,9 +7779,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // which takes 60 s on the runners of ci with four CPUs, its limit;
         // posix-threads,
         // whose 2 x 10^5 handoffs outrun the limit on TCG with CPUs beyond
-        // one; the kernel tests, whose harness runs the code of the tests
-        // on CPU 0 with the others outside the scheduler, and waits for
-        // them at the first retired ASID.
+        // one.
         job("relibc-hello smp 4", || {
             qemu::on_cpus(SMP_CPUS, relibc_hello_probe)
         }),
@@ -7832,6 +7831,13 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("kernel tests GICv3", || {
             kernel_tests(&qemu::VIRT_V3, Variant::Test).map(drop)
+        }),
+        // The same tests on four CPUs: the harness runs their code on CPU 0
+        // and the others schedule and pass their quiescent points.
+        job("kernel tests smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || {
+                kernel_tests(&qemu::VIRT_2G, Variant::Test).map(drop)
+            })
         }),
         job("kernel tests EL2", || {
             kernel_tests(&qemu::VIRT_EL2, Variant::Test).map(drop)
@@ -9002,7 +9008,13 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         if icount {
             cmd.args(qemu::ICOUNT);
         }
-        let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
+        // TCG with several CPUs takes half as long again.
+        let limit = if qemu::cpus() > 1 {
+            TEST_TIMEOUT * 3 / 2
+        } else {
+            TEST_TIMEOUT
+        };
+        let o = run_until(cmd, limit, None, &a.elf)?;
         let r = qemu::parse_report(&o.lines);
         qemu::counted_verdict(&o, &r, None)?;
         qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
