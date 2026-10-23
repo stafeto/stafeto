@@ -75,8 +75,11 @@ pub fn handle_room(process: NonNull<Process>) -> Result<(), Error> {
 /// handle holds a reference to it. A new chunk or directory of the table
 /// comes from the pool of blocks of `process`, whose quota pays for a page
 /// when the pool grows, whoever the handle comes from. LIMIT_REACHED at
-/// the table's limit, NO_MEMORY when the quota falls short for a page.
-/// The process lives: only a message to a thread of one that ended, at its
+/// the table's limit, NO_MEMORY when the quota falls short for a page,
+/// BAD_STATE when the process ended: a thread of it on another CPU may have
+/// entered the kernel before the end and take its section after it, and
+/// the call it makes does not return to EL0 (the gate of the process
+/// stops it). Only a message to a thread of a process that ended, at its
 /// stage Threads, puts handles there (`put_handles`).
 pub fn insert_handle(
     process: NonNull<Process>,
@@ -84,10 +87,7 @@ pub fn insert_handle(
     rights: Rights,
 ) -> Result<Handle, Error> {
     crate::obj::assert_held();
-    assert!(
-        check_alive(process).is_ok(),
-        "a handle went into the table of a process that ended"
-    );
+    check_alive(process)?;
     // SAFETY: the caller holds a reference to the process.
     let (handles, mut chunks) = unsafe { table(process) };
     let h = handles.insert(&mut chunks, object, rights)?;

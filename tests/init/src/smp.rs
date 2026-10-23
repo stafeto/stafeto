@@ -19,7 +19,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 use rt::sys::Received;
 
-pub(crate) const TESTS: [Test; 27] = [
+pub(crate) const TESTS: [Test; 28] = [
     ("smp_threads_run_together_on_every_cpu", threads_together),
     (
         "smp_service_works_at_its_clients_level_across_cpus",
@@ -94,6 +94,10 @@ pub(crate) const TESTS: [Test; 27] = [
     (
         "smp_process_of_threads_being_woken_is_killed_from_another_cpu",
         kill_of_threads_being_woken,
+    ),
+    (
+        "smp_calls_that_make_handles_meet_the_end_of_their_process",
+        calls_that_meet_the_end_of_their_process,
     ),
     (
         "smp_thread_info_of_a_client_with_its_wake_on_the_way",
@@ -1001,6 +1005,50 @@ fn kill_of_threads_being_woken() -> Outcome {
     println!(
         "smp: a process of {KILL_THREADS} threads on CPUs 1 to 3 was killed {KILL_ROUNDS} times shortly before their timers fired"
     );
+    Ok(())
+}
+
+/// The level of the thread whose timer_create the kernel built with
+/// `window-probe` holds between its entry and its section, until its
+/// process ended (kernel cmd::window::entry_gap).
+const ENTRY_LEVEL: u8 = 7;
+/// Processes the test ends, and the mark that counts the timers one makes.
+const ENTRY_ROUNDS: usize = 200;
+const TIMERS_MARK: usize = 12;
+
+/// A thread on CPU 1 makes timers and closes them; init on CPU 0 ends its
+/// process, 200 times. A call that entered the kernel before the end takes
+/// its section after it, and the handle it makes has no table to go to: the
+/// call fails with BAD_STATE (#438: the kernel stopped on an assertion that
+/// the process of the caller lives).
+fn calls_that_meet_the_end_of_their_process() -> Outcome {
+    let n = cpus()?;
+    if n < 2 {
+        return Ok(());
+    }
+    for _ in 0..ENTRY_ROUNDS {
+        // SPAWN_CPU counts from 1.
+        SPAWN_CPU.store(2, Relaxed);
+        let kid = Kid::load(LEAF_QUOTA + 4 * PAGE as u64, 16, ENTRY_LEVEL);
+        SPAWN_CPU.store(0, Relaxed);
+        let kid = kid?;
+        reset_kid_marks();
+        kid.start()?;
+        kid.serve(Role::SmpTimers, &[], &[])?;
+        check(
+            wait_for(|| kid_mark(TIMERS_MARK) > 2),
+            "the thread on CPU 1 made no timers",
+        )?;
+        sys::process_kill(&kid.process).map_err(|_| "process_kill failed")?;
+        let state = kid.end();
+        kid.close()?;
+        let_run()?;
+        check(
+            state == Ok(ProcessState::Killed),
+            "the process that made timers did not end killed",
+        )?;
+    }
+    println!("smp: {ENTRY_ROUNDS} processes that made timers on CPU 1 were killed from CPU 0");
     Ok(())
 }
 

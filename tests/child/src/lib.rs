@@ -341,10 +341,14 @@ pub enum Role {
     /// to mark 21 + i for ever (the mark is 1 while it waits). The first
     /// thread ends once they run.
     SmpTimed = 38,
+    /// Makes a channel and then, for ever, a timer on it and closes the
+    /// timer, adding 1 to mark 12 for each pair (the calls end with the
+    /// error of the first that fails, the end of its process).
+    SmpTimers = 39,
 }
 
 impl Role {
-    pub const ALL: [Role; 38] = [
+    pub const ALL: [Role; 39] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -383,6 +387,7 @@ impl Role {
         Role::AsidPage,
         Role::UnmapAcross,
         Role::SmpTimed,
+        Role::SmpTimers,
     ];
 
     /// The role whose code is `code`.

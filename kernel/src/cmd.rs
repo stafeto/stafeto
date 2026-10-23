@@ -572,6 +572,28 @@ pub mod window {
         }
     }
 
+    /// The priority of the thread whose timer_create the probe holds
+    /// between its entry and its section.
+    pub const ENTRY_LEVEL: u8 = 7;
+
+    /// In `dispatch`, before the section of a timer_create: a caller at
+    /// ENTRY_LEVEL waits, with no section, up to 200 us for its process to
+    /// end, so that the call takes `OBJ` after the end of the process it
+    /// writes into (#438). The wait is short for the calls of the thread
+    /// that come before the end.
+    pub fn entry_gap(t: NonNull<Thread>) {
+        // SAFETY: the caller is the running thread.
+        if unsafe { t.as_ref() }.priority() != ENTRY_LEVEL {
+            return;
+        }
+        // SAFETY: as above.
+        let process = unsafe { t.as_ref() }.process();
+        let until = crate::arch::timer::now() + crate::arch::timer::frequency() / 5_000;
+        while crate::process::alive_unlocked(process) && crate::arch::timer::now() < until {
+            core::hint::spin_loop();
+        }
+    }
+
     /// The priority of the service the boost probe watches: the process of
     /// the test's service.
     pub const SERVICE_LEVEL: u8 = 15;

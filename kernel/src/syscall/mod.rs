@@ -265,7 +265,13 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::IrqBind) => objects(|| irq_bind(thread, &args)),
         Some(Call::IrqAck) => objects(|| irq_ack(thread, &args)),
         Some(Call::ClockNow) => clock_now(),
-        Some(Call::TimerCreate) => objects(|| timer_create(thread, &args)),
+        Some(Call::TimerCreate) => {
+            // The probe holds the thread here, with no section, until its
+            // process ended: the call takes its section after the end.
+            #[cfg(feature = "window-probe")]
+            crate::cmd::window::entry_gap(thread);
+            objects(|| timer_create(thread, &args))
+        }
         Some(Call::TimerSet) => objects(|| timer_set(thread, &args)),
         Some(Call::TimerCancel) => objects(|| timer_cancel(thread, &args)),
         Some(Call::ObjectInfo) => objects(|| object_info(thread, &args)),

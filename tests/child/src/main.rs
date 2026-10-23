@@ -257,6 +257,7 @@ fn run(s: &Start) -> u64 {
         }
         Role::Churn => churn(s, a[0]),
         Role::SmpSpin => smp_spin(s, a[0] as usize, a[1] as u8),
+        Role::SmpTimers => smp_timers(),
         Role::SmpTimed => smp_timed(s, a[0] as usize, a[1] as u8, a[2] as usize),
         Role::AsidPage => asid_page(s, a[0], a[1], a[2] != 0),
         Role::UnmapAcross => unmap_across(s, a[0] as u8),
@@ -581,6 +582,25 @@ fn smp_spin(s: &Start, cpus: usize, priority: u8) -> u64 {
     }
     // The first thread ends; the process lives while the others do.
     sys::thread_exit()
+}
+
+/// Role::SmpTimers.
+fn smp_timers() -> u64 {
+    let Ok(channel) = sys::channel_create(1) else {
+        return FAILED;
+    };
+    loop {
+        match sys::timer_create(&channel, 1) {
+            Ok(timer) => {
+                if timer.close().is_err() {
+                    return FAILED;
+                }
+                mark(12).fetch_add(1, Relaxed);
+            }
+            // The process ended under the call, or the table is full.
+            Err(e) => return e.code(),
+        }
+    }
 }
 
 /// The mark that holds the deadline of Role::SmpTimed, and the first of
