@@ -37,10 +37,45 @@ const BUFFERS: usize = 0x200_0000;
 static FREE_EPOCH: AtomicU32 = AtomicU32::new(0);
 
 /// The caller holds TABLE_LOCK after completing exact detach and resource cleanup.
+/// The places a pass of `collect` took out of the table and is still
+/// freeing (outside the lock).
+static FREEING: AtomicU64 = AtomicU64::new(0);
+
+/// The longest time the collector held TABLE_LOCK in one section, in
+/// counter ticks (probes).
+#[cfg(feature = "thread-probe")]
+static COLLECT_HOLD_MAX: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "thread-probe")]
+struct HoldTimer(u64);
+
+#[cfg(feature = "thread-probe")]
+impl HoldTimer {
+    fn new() -> Self {
+        HoldTimer(rt::time::now())
+    }
+}
+
+#[cfg(feature = "thread-probe")]
+impl Drop for HoldTimer {
+    fn drop(&mut self) {
+        let held = rt::time::now().saturating_sub(self.0);
+        COLLECT_HOLD_MAX.fetch_max(held, Ordering::Relaxed);
+    }
+}
+
+/// The longest hold of TABLE_LOCK by one section of `collect` since the
+/// last call, in counter ticks (probes); the maximum starts again.
+#[cfg(feature = "thread-probe")]
+pub fn probe_collect_hold() -> u64 {
+    COLLECT_HOLD_MAX.swap(0, Ordering::Relaxed)
+}
+
 fn publish_free(place: &Place) {
     let index =
         (place as *const Place as usize - TABLE.as_ptr() as usize) / core::mem::size_of::<Place>();
     LEFT.fetch_and(!(1 << index), Ordering::SeqCst);
+    FREEING.fetch_and(!(1 << index), Ordering::SeqCst);
     place.state.free();
     FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
     posix_sync::futex_wake(&FREE_EPOCH, u32::MAX);
@@ -593,54 +628,92 @@ fn collect_pass() -> Collected {
     for (index, place) in TABLE.iter().enumerate().skip(1) {
         if place.stack.load(Ordering::Acquire) == 1 {
             let _guard = TABLE_LOCK.lock();
+            #[cfg(feature = "thread-probe")]
+            let _held = HoldTimer::new();
             pinned_any |= native::collect_row(index, place) == native::Row::Pinned;
             continue;
         }
         if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
             continue;
         }
-        let _guard = TABLE_LOCK.lock();
-        if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
+        let Some(taken) = claim_ended(index, place, &mut pinned_any) else {
             continue;
+        };
+        for raw in taken.handles {
+            close_raw(raw);
         }
-        let native = place.native.load(Ordering::Relaxed);
-        let ended = sys::thread_info(&borrowed::<Thread>(native))
-            .is_ok_and(|info| info.state == ThreadState::Ended);
-        if !ended {
-            continue;
-        }
-        // A sender that pinned the place keeps it until its release.
-        match place.state.claim_collect_unpinned(|| pinned(index)) {
-            Claim::Taken => {}
-            Claim::Unready => continue,
-            Claim::Pinned => {
-                pinned_any = true;
-                continue;
-            }
-        }
-        // SAFETY: the TCB is mapped until the unmap below.
-        let block = unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) };
-        close_raw(block.timer.swap(0, Ordering::Relaxed));
-        close_raw(block.channel.swap(0, Ordering::Relaxed));
-        close_raw(block.thread.swap(0, Ordering::Relaxed));
-        close_raw(native);
-        unmap(
-            place.stack.swap(0, Ordering::Relaxed),
-            place.stack_len.swap(0, Ordering::Relaxed),
-        );
-        let (tcb, tcb_len) = (
-            place.tcb.swap(0, Ordering::Relaxed),
-            place.tcb_len.swap(0, Ordering::Relaxed),
-        );
+        unmap(taken.stack, taken.stack_len);
         // SAFETY: relibc released the ended thread; no reader uses its TCB.
-        unsafe { core::ptr::write_bytes(tcb as *mut u8, 0xA5, tcb_len) };
-        unmap(tcb, tcb_len);
+        unsafe { core::ptr::write_bytes(taken.tcb as *mut u8, 0xA5, taken.tcb_len) };
+        unmap(taken.tcb, taken.tcb_len);
+        let _guard = TABLE_LOCK.lock();
+        #[cfg(feature = "thread-probe")]
+        let _held = HoldTimer::new();
         publish_free(place);
     }
+    // A place that another pass is freeing now comes free soon: the wait of
+    // `reserve` for the epoch covers it.
+    pinned_any |= FREEING.load(Ordering::SeqCst) != 0;
     Collected {
         deferred,
         pinned: pinned_any,
     }
+}
+
+/// What an ended thread of relibc owned, taken out of its place by the
+/// collector that claimed the place.
+struct Taken {
+    handles: [u64; 4],
+    stack: usize,
+    stack_len: usize,
+    tcb: usize,
+    tcb_len: usize,
+}
+
+/// The claim of the collector on the place of an ended, released thread of
+/// relibc, under TABLE_LOCK: the read of the word, `thread_info`, the claim
+/// and the take of the place's fields, a few hundred ticks. The claimed
+/// place is MAKING | DETACHED without LIVE: `each_live`, `each_block` and
+/// `try_pin` do not read it and no other pass takes it, so that the caller
+/// closes and unmaps what it took after the lock went (each is a call of the
+/// kernel) and frees the place with `publish_free`, again under the lock.
+fn claim_ended(index: usize, place: &Place, pinned_any: &mut bool) -> Option<Taken> {
+    let _guard = TABLE_LOCK.lock();
+    #[cfg(feature = "thread-probe")]
+    let _held = HoldTimer::new();
+    if place.state.flags() != LIVE | EXITED | RELEASED | DETACHED {
+        return None;
+    }
+    let native = place.native.load(Ordering::Relaxed);
+    let ended = sys::thread_info(&borrowed::<Thread>(native))
+        .is_ok_and(|info| info.state == ThreadState::Ended);
+    if !ended {
+        return None;
+    }
+    // A sender that pinned the place keeps it until its release.
+    match place.state.claim_collect_unpinned(|| pinned(index)) {
+        Claim::Taken => {}
+        Claim::Unready => return None,
+        Claim::Pinned => {
+            *pinned_any = true;
+            return None;
+        }
+    }
+    FREEING.fetch_or(1 << index, Ordering::SeqCst);
+    // SAFETY: the TCB is mapped until the caller's unmap.
+    let block = unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) };
+    Some(Taken {
+        handles: [
+            block.timer.swap(0, Ordering::Relaxed),
+            block.channel.swap(0, Ordering::Relaxed),
+            block.thread.swap(0, Ordering::Relaxed),
+            native,
+        ],
+        stack: place.stack.swap(0, Ordering::Relaxed),
+        stack_len: place.stack_len.swap(0, Ordering::Relaxed),
+        tcb: place.tcb.swap(0, Ordering::Relaxed),
+        tcb_len: place.tcb_len.swap(0, Ordering::Relaxed),
+    })
 }
 
 /// Whether some place holds a thread relibc released (joined, or detached):
@@ -878,7 +951,7 @@ pub unsafe fn create(
             "start hook leaves the target never started"
         );
     }
-    if sys::thread_start(&native).is_err() {
+    if start_fails() || sys::thread_start(&native).is_err() {
         // A hook must not independently start this target. An unproved state
         // ends the process before relibc can reclaim a potentially live TCB.
         if !sys::thread_info(&native).is_ok_and(|info| info.state == ThreadState::Stopped) {
@@ -886,7 +959,15 @@ pub unsafe fn create(
         }
         // SAFETY: the block is the new thread's, which never ran.
         let block = unsafe { &*block };
-        place.state.rollback();
+        // The place was LIVE: a sender may have pinned it and a walk of the
+        // table may be reading its block. The rollback goes under the lock
+        // (a walk in progress ends first, none starts after it sees LIVE),
+        // then the pins drain, as the collector does, before the TCB goes.
+        {
+            let _guard = TABLE_LOCK.lock();
+            place.state.rollback();
+        }
+        wait_unpinned(index);
         undo(
             native.into_raw().0,
             block.channel.swap(0, Ordering::Relaxed),
@@ -897,6 +978,49 @@ pub unsafe fn create(
     }
     core::mem::forget(native);
     Ok(id)
+}
+
+/// Waits until no sender holds place `index` pinned: the last release wakes
+/// this wait through `FREE_EPOCH`, a short deadline backs it. The wait is
+/// bounded by one section of a sender (`with_target` runs in a critical
+/// section that no handler leaves); it belongs to the failure path of
+/// `pthread_create`, which is no path of a real-time thread.
+fn wait_unpinned(index: usize) {
+    loop {
+        let snapshot = FREE_EPOCH.load(Ordering::SeqCst);
+        if !pinned(index) {
+            return;
+        }
+        let Some(deadline) = rt::time::ticks_to_ns(rt::time::now()).checked_add(1_000_000) else {
+            return;
+        };
+        let _ = posix_sync::futex_wait(
+            &FREE_EPOCH,
+            snapshot,
+            posix_sync::CLOCK_MONOTONIC,
+            Some(deadline),
+        );
+    }
+}
+
+#[cfg(feature = "thread-probe")]
+static FAIL_START: AtomicUsize = AtomicUsize::new(0);
+
+/// Probes: the next `pthread_create` that reaches the start of its thread
+/// finds the start refused.
+#[cfg(feature = "thread-probe")]
+pub fn probe_fail_start() {
+    FAIL_START.store(1, Ordering::Release);
+}
+
+#[cfg(feature = "thread-probe")]
+fn start_fails() -> bool {
+    FAIL_START.swap(0, Ordering::AcqRel) != 0
+}
+
+#[cfg(not(feature = "thread-probe"))]
+fn start_fails() -> bool {
+    false
 }
 
 static START_WINDOW: AtomicUsize = AtomicUsize::new(0);
@@ -990,11 +1114,16 @@ pub fn leaving() {
         // No other thread lives: the process ends as exit(0) ends it
         // (POSIX: the last thread's pthread_exit), atexit handlers and
         // stdio included.
-        #[cfg(feature = "thread-probe")]
-        EXIT_CALLS.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: relibc's exit, with its atexit handlers and stdio.
-        unsafe { exit(0) }
+        end_process();
     }
+}
+
+/// The end of the process by relibc's `exit(0)`.
+fn end_process() -> ! {
+    #[cfg(feature = "thread-probe")]
+    EXIT_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: relibc's exit, with its atexit handlers and stdio.
+    unsafe { exit(0) }
 }
 
 /// Step 1 of the way out: every signal that can be blocked, and
@@ -1188,7 +1317,14 @@ pub(crate) fn exit_hook() {
         }
         block_signals(block);
         crate::signals::leaving();
-        leave_table(own);
+        if !leave_table(own) {
+            // The last thread of the process ends it as `exit(0)` does
+            // (POSIX: the last thread's pthread_exit), atexit handlers and
+            // stdio included. The mark EXITING keeps this hook from
+            // running again when `exit` ends the thread.
+            rt::upcall::set_exit_hook(None);
+            end_process();
+        }
     });
 }
 

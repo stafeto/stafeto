@@ -18,6 +18,15 @@
 //! 3 ms, that it succeeds after the pin goes, that the release woke it
 //! (`probe_pin_wakes`) and how long the wait of `reserve` took to return
 //! after it.
+//!
+//! The fourth case is the rollback of `pthread_create`: the start of the new
+//! thread is refused after its place went LIVE (`probe_fail_start`). A
+//! sender pins the place in that window (`pthread_kill` of the number the
+//! start hook learned) and holds the pin until the creation waits for it
+//! (`probe_pin_waited`); the creation must wait, return EAGAIN with the
+//! process alive, and the sender must come out with 0 or ESRCH. A rollback
+//! that does not wait unmaps the TCB under the sender, which faults in the
+//! layer.
 use super::*;
 use rt::Stack;
 use rt::abi::Policy;
@@ -326,6 +335,131 @@ fn reserve_waits(base: usize) -> Result<(), usize> {
     Ok(())
 }
 
+static RB_GO: AtomicU64 = AtomicU64::new(0);
+static RB_PINNED: AtomicU64 = AtomicU64::new(0);
+static RB_DONE: AtomicU64 = AtomicU64::new(0);
+static RB_ID: AtomicU64 = AtomicU64::new(0);
+static RB_STOP: AtomicU64 = AtomicU64::new(0);
+/// 0 not run, 1 the creation waited for the pin, 2 it did not within 2 s.
+static RB_HOOK: AtomicUsize = AtomicUsize::new(0);
+static RB_STATUS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// In the pin of the sender: tells the creator, then holds the pin until the
+/// creation waits for it (or 2 s pass, which a rollback without the wait
+/// spends after its unmap).
+extern "C" fn rollback_window(_: u64) {
+    sys::notify(&create_channel(&RB_PINNED), 1).expect("kill-collect rollback pinned");
+    let start = now();
+    while !abi::relibc::probe_pin_waited() && now() - start < 2_000_000_000 {
+        let _ = sys::yield_now();
+    }
+    RB_HOOK.store(
+        if abi::relibc::probe_pin_waited() {
+            1
+        } else {
+            2
+        },
+        Ordering::SeqCst,
+    );
+}
+
+/// The start hook of the creator, the new place LIVE and its thread not
+/// started: lets the sender in and waits until it holds the pin.
+extern "C" fn rollback_start(id: u64) {
+    RB_ID.store(id, Ordering::SeqCst);
+    sys::notify(&create_channel(&RB_GO), 1).expect("kill-collect rollback go");
+    receive_through_interrupts(&create_channel(&RB_PINNED));
+}
+
+/// The sender: the layer's `pthread_kill` of the number the start hook named, with the
+/// pin held by `rollback_window`.
+unsafe extern "C" fn rollback_sender(_: *mut c_void) -> *mut c_void {
+    sys::notify(&ready(), 1).expect("kill-collect sender ready");
+    loop {
+        receive_through_interrupts(&create_channel(&RB_GO));
+        if RB_STOP.load(Ordering::Acquire) != 0 {
+            return ptr::null_mut();
+        }
+        abi::relibc::probe_target_pin_window(Some(rollback_window));
+        let status = abi::signals::kill_relibc_thread(RB_ID.load(Ordering::SeqCst), SIGUSR1);
+        RB_STATUS.store(status as usize, Ordering::SeqCst);
+        sys::notify(&create_channel(&RB_DONE), 1).expect("kill-collect sender done");
+    }
+}
+
+/// The rollback of a refused start waits for the pin of a sender. Fails
+/// with the stage.
+fn rollback_waits(base: usize) -> Result<(), usize> {
+    let ready_channel = ready();
+    let go = sys::channel_create(30).expect("kill-collect rollback go channel");
+    let pinned = sys::channel_create(30).expect("kill-collect rollback pinned channel");
+    let done = sys::channel_create(30).expect("kill-collect rollback done channel");
+    RB_GO.store(go.raw().0, Ordering::Release);
+    RB_PINNED.store(pinned.raw().0, Ordering::Release);
+    RB_DONE.store(done.raw().0, Ordering::Release);
+    RB_STOP.store(0, Ordering::Release);
+    let mut sender = 0;
+    if unsafe {
+        ffi::pthread_create(
+            &mut sender,
+            ptr::null(),
+            Some(rollback_sender),
+            ptr::null_mut(),
+        )
+    } != 0
+        || sys::receive(&ready_channel).is_err()
+    {
+        return Err(1830);
+    }
+    for _ in 0..3 {
+        RB_HOOK.store(0, Ordering::SeqCst);
+        RB_STATUS.store(usize::MAX, Ordering::SeqCst);
+        abi::relibc::probe_fail_start();
+        abi::relibc::probe_start_window(Some(rollback_start));
+        let mut made = 0;
+        let status =
+            unsafe { ffi::pthread_create(&mut made, ptr::null(), Some(quick), ptr::null_mut()) };
+        abi::relibc::probe_start_window(None);
+        sys::receive(&done).expect("kill-collect rollback done");
+        if status != EAGAIN {
+            rt::println!("kill-collect: rollback: pthread_create gave {status} (EAGAIN expected)");
+            return Err(1831);
+        }
+        if RB_HOOK.load(Ordering::SeqCst) != 1 {
+            rt::println!(
+                "kill-collect: rollback: the creation did not wait for the pinned place ({})",
+                RB_HOOK.load(Ordering::SeqCst)
+            );
+            return Err(1832);
+        }
+        let sent = RB_STATUS.load(Ordering::SeqCst);
+        if sent != 0 && sent != ESRCH as usize {
+            rt::println!("kill-collect: rollback: pthread_kill gave {sent}");
+            return Err(1833);
+        }
+        // The place went back: a thread can be made and joined again.
+        let mut again = 0;
+        let mut value = ptr::null_mut();
+        if unsafe { ffi::pthread_create(&mut again, ptr::null(), Some(quick), ptr::null_mut()) }
+            != 0
+            || unsafe { ffi::pthread_join(again, &mut value) } != 0
+            || !crate::settled(base + 1)
+        {
+            return Err(1834);
+        }
+    }
+    RB_STOP.store(1, Ordering::Release);
+    sys::notify(&go, 1).expect("kill-collect stop the sender");
+    let mut value = ptr::null_mut();
+    if unsafe { ffi::pthread_join(sender, &mut value) } != 0 || !crate::settled(base) {
+        return Err(1835);
+    }
+    rt::println!(
+        "kill-collect: a refused start rolled back after waiting for the sender that pinned the place (3 rounds)"
+    );
+    Ok(())
+}
+
 pub(super) fn run() -> bool {
     let gate_channel = sys::channel_create(30).expect("kill-collect gate");
     let ready_channel = sys::channel_create(30).expect("kill-collect ready channel");
@@ -410,6 +544,9 @@ pub(super) fn run() -> bool {
         "kill-collect: a thread that ended inside pthread_kill kept its place until the call returned (relibc and native rows)"
     );
     if let Err(stage) = reserve_waits(base) {
+        return failed(stage);
+    }
+    if let Err(stage) = rollback_waits(base) {
         return failed(stage);
     }
     true

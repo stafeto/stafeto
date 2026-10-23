@@ -21,6 +21,12 @@
 //! - R3: the main thread holds its entries deferred and, while it is leaving
 //!   after its last routing, the signal comes; the signal waits on the page
 //!   and reaches the native thread after the handoff.
+//! - R9: the last thread of the process is a native thread of the program
+//!   that ends through `rt::sys::thread_exit` after the main thread left
+//!   (the process ends as `exit(0)` ends it: the handler of `atexit` runs and
+//!   the buffered stdio is written). Three runs: the main thread leaves
+//!   first; both leave at once with the main thread taking the table first;
+//!   both leave at once with the native thread first.
 //! - R4: a thread B marked itself as leaving and is held there; the main
 //!   thread leaves meanwhile; a third thread C becomes the router and gets
 //!   the signal.
@@ -47,6 +53,8 @@ static MAKE: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn atexit(function: extern "C" fn()) -> c_int;
+    fn fputs(text: *const c_char, stream: *mut c_void) -> c_int;
+    static mut stdout: *mut c_void;
 }
 
 /// The buffers of the native threads of the variants.
@@ -476,6 +484,147 @@ fn child(variant: usize, fd: c_int) -> ! {
     unsafe { ffi::pthread_exit(ptr::null_mut()) }
 }
 
+static R9_NATIVE: AtomicU64 = AtomicU64::new(0);
+static R9_WINNER: AtomicU64 = AtomicU64::new(0);
+static R9_ARRIVALS: AtomicUsize = AtomicUsize::new(0);
+static R9_TOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// R9: the handler of `atexit` of the last thread.
+extern "C" fn r9_exit() {
+    // SAFETY: relibc's stdout is a live stream; the text is a C string.
+    unsafe { fputs(c"atexit-ran\n".as_ptr(), stdout) };
+}
+
+/// R9: the native thread that is the last to leave.
+extern "C" fn r9_last(_: u64) -> ! {
+    let sleeper = Sleeper::new();
+    tls::with_process(|| {
+        R9_NATIVE.store(ffi::pthread_self(), Ordering::SeqCst);
+        // SAFETY: as in `r9_exit`; the text stays in the buffer (no newline).
+        unsafe {
+            fputs(c"buffered-without-newline".as_ptr(), stdout);
+            atexit(r9_exit);
+        }
+        ATTACHED.fetch_add(1, Ordering::SeqCst);
+        let waited = if VARIANT.load(Ordering::SeqCst) == 90 {
+            sleeper.until(3000, main_ended)
+        } else {
+            sleeper.until(3000, || LEAVE.load(Ordering::SeqCst) != 0)
+        };
+        if !waited {
+            end_child(12);
+        }
+    });
+    sys::thread_exit()
+}
+
+/// R9: before the table; both threads arrive, the one that is not to win
+/// waits until the winner left the table.
+fn r9_before(own: u64) {
+    R9_ARRIVALS.fetch_add(1, Ordering::SeqCst);
+    let limit = now() + 3_000_000_000;
+    while R9_ARRIVALS.load(Ordering::SeqCst) < 2 && now() < limit {
+        let _ = sys::yield_now();
+    }
+    let limit = now() + 2_000_000_000;
+    while own != R9_WINNER.load(Ordering::SeqCst)
+        && R9_TOOK.load(Ordering::SeqCst) == 0
+        && now() < limit
+    {
+        let _ = sys::yield_now();
+    }
+}
+
+/// R9: the winner is out of the table.
+fn r9_marked(own: u64) {
+    if own == R9_WINNER.load(Ordering::SeqCst) {
+        R9_TOOK.store(1, Ordering::SeqCst);
+    }
+}
+
+/// R9: the child. `kind` 0: the main thread leaves first; 1: both leave at
+/// once, the main thread takes the table first; 2: the native thread does.
+fn r9_child(kind: usize, out: c_int) -> ! {
+    VARIANT.store(90 + kind, Ordering::SeqCst);
+    if abi::dup2(out, 1) != Ok(1) {
+        end_child(10);
+    }
+    let level = sys::thread_info(&threads::main_handle())
+        .expect("router probe main level")
+        .base;
+    LEVEL.store(level.into(), Ordering::SeqCst);
+    let sleeper = Sleeper::new();
+    let _ = spawn(r9_last, &STACK_A, 0);
+    if !sleeper.until(2000, || ATTACHED.load(Ordering::SeqCst) == 1) {
+        end_child(11);
+    }
+    if kind != 0 {
+        R9_WINNER.store(
+            if kind == 1 {
+                1
+            } else {
+                R9_NATIVE.load(Ordering::SeqCst)
+            },
+            Ordering::SeqCst,
+        );
+        abi::relibc::probe_before_table_hook(Some(r9_before));
+        abi::relibc::probe_marked_hook(Some(r9_marked));
+        LEAVE.store(1, Ordering::SeqCst);
+    }
+    // SAFETY: the main thread of the child ends; the native thread is the
+    // last and ends the process.
+    unsafe { ffi::pthread_exit(ptr::null_mut()) }
+}
+
+/// R9: the last thread's end is `exit(0)`.
+fn r9(kind: usize) -> bool {
+    let number = 9;
+    let Ok([read, write]) = abi::pipe2(0) else {
+        return failed(1660 + kind);
+    };
+    let pid = match abi::fork::fork(None) {
+        Ok(0) => r9_child(kind, write),
+        Ok(pid) => pid,
+        Err(_) => return failed(1670 + kind),
+    };
+    let _ = abi::close(write);
+    let waited = abi::process::wait(
+        proto_process::Selector::Pid(pid as u32),
+        proto_process::WEXITED,
+    );
+    let mut text = [0u8; 128];
+    let mut length = 0;
+    while length < text.len() {
+        match abi::read(read, &mut text[length..]) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => length += count,
+        }
+    }
+    let _ = abi::close(read);
+    let text = &text[..length];
+    let has = |needle: &[u8]| text.windows(needle.len()).any(|window| window == needle);
+    match waited {
+        Ok(waited)
+            if waited.end == Some(proto_process::End::exited(0))
+                && has(b"buffered-without-newline")
+                && has(b"atexit-ran") =>
+        {
+            true
+        }
+        Ok(waited) => {
+            rt::println!(
+                "router: R{number} kind {kind} ended with status {} and {length} bytes of output",
+                waited.end.map_or(-1, |end| end.wait_status())
+            );
+            failed(1680 + kind)
+        }
+        Err(errno) => {
+            rt::println!("router: R{number} wait failed {errno}");
+            failed(1690 + kind)
+        }
+    }
+}
+
 fn variant(number: usize) -> bool {
     let Ok([read, write]) = abi::pipe2(0) else {
         return failed(1600 + number);
@@ -533,11 +682,11 @@ pub(super) fn run() -> bool {
     if unsafe { api::sigaction(SIGUSR2, &action, &mut old) } != 0 {
         return failed(1600);
     }
-    let passed = (1..=8).all(variant);
+    let passed = (1..=8).all(variant) && (0..=2).all(r9);
     let _ = unsafe { api::sigaction(SIGUSR2, &old, ptr::null_mut()) };
     if passed {
         rt::println!(
-            "router: the signal of the process reaches the next router (main exits, rt exit, deferred entries, a router held while leaving)"
+            "router: the signal of the process reaches the next router (main exits, rt exit, deferred entries, a router held while leaving); the last native thread ends the process as exit(0) does, in three orders"
         );
     }
     passed

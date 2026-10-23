@@ -88,6 +88,8 @@ mod sleep;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
+mod table_hold;
+#[cfg(not(feature = "cancel-input"))]
 mod tcb;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
@@ -540,6 +542,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !native_jump::run()
         || !entry_calls::run()
         || !kill_collect::run()
+        || !table_hold::run()
         || !signal_wait::run()
         || !cancellation::run()
     {
