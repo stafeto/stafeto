@@ -193,6 +193,16 @@ pub fn stats() -> Stats {
     }
 }
 
+/// Turns the timer of this CPU off and makes the scheduler forget what it
+/// armed, so that a deadline a test left does not come meanwhile: the next
+/// decision arms the timer anew (kernel tests, between tests).
+#[cfg(feature = "ktest")]
+pub fn forget_deadline() {
+    let mut g = local().sched.lock();
+    VirtualTimer.disarm();
+    g.armed = Armed::new();
+}
+
 /// The EL1 virtual timer as the scheduler writes it.
 struct VirtualTimer;
 

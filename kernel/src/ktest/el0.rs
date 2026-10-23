@@ -197,7 +197,16 @@ const BATCHED: usize = 100;
 /// 50 ms past the deadline, five quanta of a busy host's scheduler. The
 /// deadline leaves room to arm the last timer.
 const FIRING_DEADLINE_NS: u64 = 5_000_000;
-const FIRING_SPIN_NS: u64 = FIRING_DEADLINE_NS + 50_000_000;
+/// The deadline is made later, up to twice (the margin doubles), when the
+/// host held QEMU's thread off its CPU while the timers were armed, and the
+/// spinner outlasts the latest of them.
+const FIRING_TRIES: u32 = 3;
+/// How long the judge of `descendants` waits for the exit notification of
+/// the child: a bound for a host that stalls, never a condition.
+const JUDGE_WAIT_NS: u64 = 2_000_000_000;
+const FIRING_SPIN_NS: u64 = (FIRING_DEADLINE_NS << (FIRING_TRIES - 1)) + 50_000_000;
+/// Timer interrupts a test records (`Fixture::interrupt_log`).
+const INTERRUPT_LOG: usize = 4;
 /// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
 const BIG_OBJECT: usize = 16384;
 /// Pages of the memory object of `long_call_yields_to_a_pending_interrupt`,
@@ -674,6 +683,9 @@ struct Fixture {
     /// Timer interrupts taken at EL0, and whether one of them moved the
     /// thread past its wait loop.
     interrupts: u32,
+    /// The compare value and the counter at each of the first INTERRUPT_LOG
+    /// timer interrupts, for a test that counts them and says which came.
+    interrupt_log: [(u64, u64); INTERRUPT_LOG],
     left_loop: bool,
     /// A process that the first timer interrupt ends, as process_exit from
     /// a thread of it at the level given would, and what the thread in
@@ -770,6 +782,7 @@ impl Fixture {
             stack: None,
             stack_moved: false,
             interrupts: 0,
+            interrupt_log: [(0, 0); INTERRUPT_LOG],
             left_loop: false,
             exit_at_interrupt: None,
             count_at_exit: None,
@@ -834,6 +847,9 @@ pub fn count() -> usize {
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
         cleanup::drain();
+        // A deadline the test before left in the timer would come as an
+        // interrupt of this one while the host holds QEMU back.
+        sched::forget_deadline();
         FAST_PATH_OFF.store(false, Relaxed);
         FAST_PATH_HITS.store(0, Relaxed);
         let started = {
@@ -1044,6 +1060,10 @@ pub fn timer_fired() {
     }
     let mut f = FIXTURE.lock();
     f.interrupts += 1;
+    let n = f.interrupts as usize - 1;
+    if let Some(entry) = f.interrupt_log.get_mut(n) {
+        *entry = (timer::cval(), timer::now());
+    }
     if f.interrupts == 1 {
         f.interrupted = thread::current();
     }
@@ -2769,14 +2789,22 @@ fn descendants(
     // Each thread of the crowd takes a third of a page of the grandchild's
     // pool.
     let crowd_quota = (crowd as u64).div_ceil(3) * PAGE_SIZE;
-    let judge = spawn(f, 0, &raw const el0_alarm_then, 0)?;
+    let judge = spawn(f, 0, &raw const el0_receive, 0)?;
     sched::set_priority(judge, PRIORITY + 10, FIFO, false).map_err(|_| "no judge")?;
     let parent = f.processes[0].expect("the judge's process");
-    let quanta = 3 * abi::RR_QUANTUM_NS;
-    let wake = timer::clock().deadline_after(timer::now(), quanta);
-    let a = alarm(f, parent, Some(wake))?;
     let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
     let h = give(parent, Object::Channel(c), Rights::RECEIVE);
+    // The judge waits in receive for the child's exit notification. A
+    // timer on the same channel ends the wait after the time a host gives
+    // up at, with a notification of its own and a failure that says so.
+    let watchdog = timers::create(parent, c, 0, PRIORITY).and_then(|t| {
+        f.alarm = Some(t);
+        timers::set(
+            t,
+            timer::clock().deadline_after(timer::now(), JUDGE_WAIT_NS),
+            CAUSE,
+        )
+    });
     let child = process::create_child(parent, 2 * CHILD_QUOTA + crowd_quota, HANDLE_LIMIT, CEILING);
     let heard = child.and_then(|child| {
         channel::reserve_source(c)?;
@@ -2786,8 +2814,8 @@ fn descendants(
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the channel, and so does the child's exit.
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    let receive = user_address(&raw const el0_receive) as u64;
-    set_args(judge, &[a, 0, receive, h?, NO_WAIT]);
+    set_args(judge, &[h?, 0]);
+    watchdog.map_err(|_| "no timer on the exit channel")?;
     let child = heard.map_err(|_| "no child")?;
     f.processes[2] = Some(child);
     let low = PRIORITY - 5;
@@ -2832,10 +2860,13 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         f.slot(t) == 0,
         "the grandchild's thread ran to its end after its parent ended",
     )?;
-    check(t.regs.x[23] == 0, "the judge did not wake at its alarm")?;
     check(
-        t.regs.x[0] == 0 && t.regs.x[1..12] == exit_notice(EXIT_LABEL),
-        "the child's exit notification did not wait in its parent's channel",
+        t.regs.x[0] == 0 && t.regs.x[1..12] != timer_notice(),
+        "no exit notification in 2 s",
+    )?;
+    check(
+        t.regs.x[1..12] == exit_notice(EXIT_LABEL),
+        "the child's exit notification did not come to its parent's channel",
     )?;
     check(
         f.count_at_exit.is_some_and(|n| n > 0),
@@ -2850,11 +2881,18 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
             && state(f, 2) == ProcessState::Exited { code: EXIT_CODE },
         "the child did not end with its thread's exit, or the grandchild's thread did not stop",
     )?;
-    let shell =
-        |slot: usize| process::progress(f.processes[slot].expect("a process")).0 == Stage::Shell;
+    // The notification comes at the stage Notify of the child, after the
+    // grandchild gave back what it could; the rest of the teardown follows
+    // the judge, and `el0_tests_return_their_objects` sees that it ended.
+    let past_quota = |slot: usize| {
+        matches!(
+            process::progress(f.processes[slot].expect("a process")).0,
+            Stage::Notify | Stage::Shell
+        )
+    };
     check(
-        cleanup::len() == 0 && shell(1) && shell(2),
-        "the teardown of the child and the grandchild did not go to its end",
+        past_quota(1) && past_quota(2),
+        "the child or the grandchild had not come to the end of its quota when the child's end was heard",
     )
 }
 
@@ -3268,27 +3306,74 @@ fn start_firing(f: &mut Fixture) -> Result<(), &'static str> {
     let payers = [own, f.processes[1].expect("the judge's process")];
     let c = channel::create(own, PRIORITY).map_err(|_| "no channel")?;
     let h = give(own, Object::Channel(c), Rights::RECEIVE);
-    let made = (0..BATCHED).try_for_each(|i| {
-        f.timers[i] = Some(timers::create(payers[i % 2], c, 0, PRIORITY)?);
-        Ok(())
-    });
-    // The deadline comes once every timer is made, so that it is still
-    // ahead when the last one is armed.
-    let at = timer::clock().deadline_after(timer::now(), FIRING_DEADLINE_NS);
-    let made = made.and_then(|()| {
-        f.timers
-            .iter()
-            .flatten()
-            .try_for_each(|&t| timers::set(t, at, CAUSE))
-    });
+    let mut margin = FIRING_DEADLINE_NS;
+    let mut made = Ok(());
+    for attempt in 0..FIRING_TRIES {
+        made = (0..BATCHED).try_for_each(|i| {
+            f.timers[i] = Some(timers::create(payers[i % 2], c, 0, PRIORITY)?);
+            Ok(())
+        });
+        // The deadline comes once every timer is made, so that it is still
+        // ahead when the last one is armed.
+        let at = timer::clock().deadline_after(timer::now(), margin);
+        made = made.and_then(|()| {
+            f.timers
+                .iter()
+                .flatten()
+                .try_for_each(|&t| timers::set(t, at, CAUSE))
+        });
+        f.kept[0] = at;
+        // The property is one interrupt for the deadline, and its premise
+        // that every timer was armed ahead of it. A host that held QEMU
+        // back meanwhile broke the premise, not the property: the timers
+        // go, and the test arms them again with twice the margin.
+        if made.is_err() || timer::now() < at {
+            break;
+        }
+        if attempt + 1 < FIRING_TRIES {
+            kprintln!(
+                "firing: the timers were armed {} ticks past the deadline, again with {} ns",
+                timer::now() - at,
+                margin * 2
+            );
+            for t in core::mem::replace(&mut f.timers, [None; BATCHED])
+                .into_iter()
+                .flatten()
+            {
+                // SAFETY: the test's reference goes, and nothing uses it
+                // afterwards.
+                unsafe { timers::release(t, CAUSE) };
+            }
+            cleanup::drain();
+            f.portions = 0;
+            margin *= 2;
+        }
+    }
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the channel, and so do the timers.
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
     h?;
     made.map_err(|_| "a timer was not made or armed")?;
+    check(
+        timer::now() < f.kept[0],
+        "the host held the timers back past their deadline three times",
+    )?;
     cleanup::take_late();
     timers::reset_longest_firing();
     Ok(())
+}
+
+/// The record of the timer interrupts of the test, for a failure that says
+/// which interrupt came.
+fn print_interrupts(f: &Fixture) {
+    kprintln!(
+        "firing: deadline {}, {} interrupts, the first ones (compare value, counter):",
+        f.kept[0],
+        f.interrupts
+    );
+    for &(cval, now) in f.interrupt_log.iter().take(f.interrupts as usize) {
+        kprintln!("firing:   {cval} {now}");
+    }
 }
 
 fn done_firing(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -3298,6 +3383,21 @@ fn done_firing(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         f.timers.iter().flatten().all(|&t| timers::posted(t)),
         "an expired timer did not post into its slot",
+    )?;
+    // An interrupt for another deadline (the scheduler's, a test's before)
+    // is no part of the property and says so by its own failure.
+    let deadline = f.kept[0];
+    let strangers = f
+        .interrupt_log
+        .iter()
+        .take(f.interrupts as usize)
+        .any(|&(cval, _)| cval != deadline);
+    if f.interrupts != 1 || strangers {
+        print_interrupts(f);
+    }
+    check(
+        !strangers,
+        "a timer interrupt came for another deadline than the timers'",
     )?;
     check(
         f.interrupts == 1,
