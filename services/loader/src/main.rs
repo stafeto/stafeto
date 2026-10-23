@@ -75,12 +75,13 @@ mod steps {
     static LONGEST: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
     static DETAIL: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 
-    /// The kind whose report is its shortest step with a detail of at least
-    /// `FLOOR`, not its longest: the cost of the request `Regions` rises with
-    /// the regions held (its detail), and the loader runs at the level of
-    /// its client, where a pass of a service above it lands in the wall time
-    /// of one request in twenty and adds tens of thousands of ticks. The
-    /// shortest request at the most regions held has none of it.
+    /// The kind that reports its shortest step with a detail of at least
+    /// `FLOOR`, where the others report the longest: the cost of the request
+    /// `Regions` rises with the regions held (its detail), and the loader
+    /// runs at the level of its client, where a pass of a service above it
+    /// lands in the wall time of one request in twenty and adds tens of
+    /// thousands of ticks. The shortest request at the most regions held has
+    /// none of it.
     pub const SHORTEST: usize = super::kind::REGIONS;
     pub const FLOOR: u64 = 80;
     static SHORTEST_TICKS: AtomicU64 = AtomicU64::new(u64::MAX);

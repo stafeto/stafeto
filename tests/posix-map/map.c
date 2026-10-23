@@ -460,8 +460,8 @@ static void pause_ms(long ms) {
 
 /* A process asks for the shared object of a file while another is making
  * it (the maker pauses 300 ms with the entry reserved): it waits for the
- * maker, whatever the levels of the two, and gets the same pages, not a
- * copy of its own. A write of either shows in the other. */
+ * maker, whatever the levels of the two, and gets the same pages as the
+ * maker. A write of either shows in the other. */
 static void shared_while_made(void) {
     int ready[2], done[2], go[2];
     int fd = make_race_file();
