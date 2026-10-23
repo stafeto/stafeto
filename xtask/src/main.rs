@@ -7970,6 +7970,11 @@ fn timing_jobs() -> Vec<jobs::Job> {
         job("process-steps 7", || {
             process_steps(&qemu::VIRT_2G, 7, false)
         }),
+        // The heartbeats of the services on one grid: the worst phase of
+        // their wait for init (the GetLimit client's wait has no limit in it).
+        job("process-steps grid", || {
+            process_steps(&qemu::VIRT_2G, 7, true)
+        }),
         // A hung test is killed after a second of the host's time.
         ostest::runner_check_job(),
         job(
