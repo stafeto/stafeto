@@ -352,10 +352,14 @@ pub enum Role {
     /// timer, adding 1 to mark 12 for each pair (the calls end with the
     /// error of the first that fails, the end of its process).
     SmpTimers = 39,
+    /// Makes a child process of the least quota and closes its handle, for
+    /// ever, adding 1 to mark 12 for each (it ends with the error of the
+    /// first call that fails, the end of its own process).
+    SmpSpawners = 40,
 }
 
 impl Role {
-    pub const ALL: [Role; 39] = [
+    pub const ALL: [Role; 40] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -395,6 +399,7 @@ impl Role {
         Role::UnmapAcross,
         Role::SmpTimed,
         Role::SmpTimers,
+        Role::SmpSpawners,
     ];
 
     /// The role whose code is `code`.

@@ -1070,14 +1070,14 @@ pub fn info(thread: NonNull<Thread>) -> (ThreadInfo, u64, u64) {
             State::Ready => ThreadState::Ready,
             State::Running => ThreadState::Running,
             // A section on another CPU took the thread out of its queue
-            // (`waits` is empty) and sent the wake command; the state
-            // changes to Ready when the CPU of the thread serves it.
+            // (`waits` is empty) and posted the wake command; the state
+            // changes to Ready when the CPU of the thread serves it. Two
+            // windows show this: before the CPU of the thread took the
+            // command, and after (`take_batch` clears the flags with no
+            // OBJ and `serve_all` takes OBJ only once the copies of the
+            // messages are made), when no command is pending any more.
             State::Waiting => match t.waits {
-                None => {
-                    #[cfg(feature = "ktest")]
-                    debug_assert!(crate::cmd::pending(thread));
-                    ThreadState::Ready
-                }
+                None => ThreadState::Ready,
                 Some(Wait::Receive(_)) => ThreadState::Receiving,
                 Some(Wait::Send(_)) => ThreadState::Sending,
                 Some(Wait::Reply(_)) => ThreadState::AwaitingReply,

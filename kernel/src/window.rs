@@ -174,7 +174,7 @@ pub unsafe fn hold_until_woken(first: Option<NonNull<Thread>>) {
 /// between its entry and its section.
 pub const ENTRY_LEVEL: u8 = 7;
 
-/// In `dispatch`, before the section of a timer_create: a caller at
+/// In `dispatch`, before the section of a timer_create or a process_create: a caller at
 /// ENTRY_LEVEL waits, with no section, up to 200 us for its process to
 /// end, so that the call takes `OBJ` after the end of the process it
 /// writes into (#438). The wait is short for the calls of the thread

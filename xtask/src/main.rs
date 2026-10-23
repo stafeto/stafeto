@@ -5022,14 +5022,17 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// ready threads, 2 905 instructions, and the guard keeps the 4 of rule 4
 /// above it.
 ///
-/// `THREADS_READY_MAX` 2 909 -> 3 022 (SMP step 3, #438): `sched::exit` takes
-/// a thread off the ring of the parked threads only when the thread runs on
-/// the CPU of the call, since the link of a thread belongs to its CPU; the
-/// test of where it runs, and the order of the two tests of
-/// `is_parked_listed`, make the compiler lay the function out anew, and the
-/// end of a process that has no thread to stop closes the wait its gate
-/// opened (`control::drop_wait`): 3 018 measured, 111 over the 2 907
-/// before, under the 128 of one instruction a thread. The path of a thread that is ready stays one take of `OBJ`.
+/// `THREADS_READY_MAX` 2 909 -> 3 022 (SMP step 3, #438): the row measures
+/// one portion of the stage Threads, `sched::exit` for 12 ready threads.
+/// `sched::exit` takes a thread off the ring of the parked threads only
+/// when the thread belongs to the CPU of the call, since the link of a
+/// thread belongs to its CPU; the test of where it runs, and the order of
+/// the two tests of `is_parked_listed`, make the compiler lay the function
+/// out anew: 3 015 measured, 108 over the 2 907 before, about 9
+/// instructions a thread. The wait that `control::drop_wait` closes lies in
+/// `teardown::begin`, in the call that ends the process (the row
+/// `end_call`), outside this portion. The path of a thread that is ready
+/// stays one take of `OBJ`.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the

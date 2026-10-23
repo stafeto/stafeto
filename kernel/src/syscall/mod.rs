@@ -247,7 +247,11 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemMap) => return change_map(thread, &args),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
-        Some(Call::ProcessCreate) => return process_create(thread, &args),
+        Some(Call::ProcessCreate) => {
+            #[cfg(feature = "window-probe")]
+            crate::window::entry_gap(thread);
+            return process_create(thread, &args);
+        }
         Some(Call::ProcessKill) => process_kill(thread, &args, crate::obj::lock()),
         Some(Call::ProcessControl) => return process_control_waited(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args, crate::obj::lock()),

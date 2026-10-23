@@ -38,7 +38,9 @@ use kcore::args::{
 /// read before the move. The child is the caller's process's (spec 4): it
 /// ends when its parent does. The checks in the order of spec 11: the
 /// values; x3, then x5 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED); the
-/// ceilings; x3 on a channel that closed (PEER_CLOSED); then the resources
+/// ceilings; x3 on a channel that closed (PEER_CLOSED); the caller's process
+/// lives (BAD_STATE: a thread of it that entered before another CPU ended
+/// it takes its section after); then the resources
 /// in the order the call occupies them, a limit that needs no allocation
 /// first: the caller's own table has room for the new handle
 /// (LIMIT_REACHED), the channel of x3 a slot for the exit notification
@@ -136,6 +138,9 @@ fn make_child(thread: NonNull<Thread>, a: &Args) -> Result<NonNull<Process>, Err
     }
     // The caller's table first: it needs no allocation, and the call would
     // insert the child's handle there last (spec 11).
+    // A thread of a process that another CPU ended since this call began
+    // finds it ended here: nothing is made for it.
+    process::check_alive(caller(thread))?;
     process::handle_room(caller(thread))?;
     if let Some((c, _)) = exit {
         channel::reserve_source(c)?;

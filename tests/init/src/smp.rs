@@ -1050,18 +1050,21 @@ fn calls_that_meet_the_end_of_their_process() -> Outcome {
     if n < 2 {
         return Ok(());
     }
-    for _ in 0..ENTRY_ROUNDS {
+    // Two roles make objects for ever, a timer and a child process, in a
+    // process that is ended meanwhile. Without the kernel built with
+    // `window-probe` the test only loads the CPUs and the window is narrow.
+    for role in (0..2 * ENTRY_ROUNDS).map(|r| [Role::SmpTimers, Role::SmpSpawners][r % 2]) {
         // SPAWN_CPU counts from 1.
         SPAWN_CPU.store(2, Relaxed);
-        let kid = Kid::load(LEAF_QUOTA + 4 * PAGE as u64, 16, ENTRY_LEVEL);
+        let kid = Kid::load(LEAF_QUOTA + 12 * PAGE as u64, 16, ENTRY_LEVEL);
         SPAWN_CPU.store(0, Relaxed);
         let kid = kid?;
         reset_kid_marks();
         kid.start()?;
-        kid.serve(Role::SmpTimers, &[], &[])?;
+        kid.serve(role, &[], &[])?;
         check(
             wait_for(|| kid_mark(TIMERS_MARK) > 2),
-            "the thread on CPU 1 made no timers",
+            "the thread on CPU 1 made no objects",
         )?;
         sys::process_kill(&kid.process).map_err(|_| "process_kill failed")?;
         let state = kid.end();
@@ -1069,10 +1072,13 @@ fn calls_that_meet_the_end_of_their_process() -> Outcome {
         let_run()?;
         check(
             state == Ok(ProcessState::Killed),
-            "the process that made timers did not end killed",
+            "the process that made objects did not end killed",
         )?;
     }
-    println!("smp: {ENTRY_ROUNDS} processes that made timers on CPU 1 were killed from CPU 0");
+    println!(
+        "smp: {} processes that made timers or children on CPU 1 were killed from CPU 0",
+        2 * ENTRY_ROUNDS
+    );
     Ok(())
 }
 

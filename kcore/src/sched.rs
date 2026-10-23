@@ -203,6 +203,8 @@ impl<T: Linked> ParkedList<T> {
         // SAFETY: the caller's promise; each link borrow ends before the next.
         unsafe {
             let l = link(t);
+            // Checked in the host tests of kcore only: the kernel is built
+            // without debug assertions.
             debug_assert!(!l.is_queued(), "a parked link is in a ready queue");
             let prev = l.prev.take().expect("a parked ring");
             let next = l.next.take().expect("a parked ring");

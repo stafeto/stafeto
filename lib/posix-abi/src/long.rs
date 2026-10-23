@@ -495,11 +495,15 @@ fn run_in(
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::WAIT, _, key)) => break key,
             Err(ADMISSION_LIMIT) => admission_pause()?,
-            // The kernel took the request back from the queue before any
-            // service saw it (only a send that waits for a place is ended),
-            // and no handler that ends the operation ran: an entry for a
-            // signal whose action ignores it, or a handler with SA_RESTART.
-            // The start goes again.
+            // The kernel ends only a send whose request stands in the queue
+            // of the channel and no service has taken (the wait for the
+            // reply to a taken request is never ended), so the start can
+            // go again whatever it asks. No handler that ends the operation
+            // ran: an entry for a signal whose action ignores it, or a
+            // handler with SA_RESTART. The caller holds no deferral of
+            // entries around the operation: with one, the kernel would end
+            // every wait and no handler would run, and the start would go
+            // on for ever.
             Err(EINTR) if !ending(&block.flags, point) => {}
             Err(error) => return Err(error),
             Ok(_) => return Err(EIO),
