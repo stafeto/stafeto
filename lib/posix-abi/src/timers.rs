@@ -106,7 +106,14 @@ pub fn create(
 pub fn fire(timer: usize, count: u64) -> Result<(), i32> {
     let mut w = request(proto_process::Method::Timer, &[op::FIRE, id_of(timer)])?;
     w.u64(count).map_err(|_| EIO)?;
-    ask(&w).map(drop)
+    ask(&w)?;
+    // The signal is on the page of this process: route it from here, as
+    // `sigqueue` to one's own process does, so that it reaches a thread of
+    // the highest level and not only the router, which a spinning thread of
+    // a higher level than the router's keeps from running.
+    crate::signals::route();
+    crate::signals::deliver_now();
+    Ok(())
 }
 
 /// Deletes the timer; EINVAL for one that is none of the process's.
