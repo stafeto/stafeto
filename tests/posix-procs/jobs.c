@@ -564,7 +564,7 @@ static int job_control(void) {
         if (killed) {
             expect("KILL aborts Loading", child < 0, 1);
             expect("KILL frees loader places", stafeto_probe_loads(), 2);
-            unsigned long long after = stafeto_probe_pool();
+            unsigned long long after = pool_back(before, 32 * 4096);
             expect("KILL frees loading quota", after + 32 * 4096 >= before, 1);
         } else {
             expect("STOP permits loader Commit", child, loading_pid);

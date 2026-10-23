@@ -37,6 +37,24 @@ pub(super) unsafe fn mark_ending(process: NonNull<Process>) {
     }
 }
 
+/// The wait `mark_ending` began is over without the stage Threads asking
+/// for it: the process has no thread left to stop (its running thread left
+/// in the call that ended it), so the stage was skipped. Without this the
+/// wait would stay open for good.
+///
+/// # Safety
+/// `process` is alive; OBJ is held.
+pub(super) unsafe fn drop_wait(process: NonNull<Process>) {
+    // SAFETY: the caller's promise; OBJ guards the field.
+    unsafe {
+        let p = process.as_ptr();
+        if (*p).stop_epoch != 0 {
+            crate::qsbr::end_wait();
+            (*p).stop_epoch = 0;
+        }
+    }
+}
+
 /// Whether the CPUs have seen the gate of an ending process: true at once
 /// when nothing waits. Otherwise asks the laggards again and says no.
 ///

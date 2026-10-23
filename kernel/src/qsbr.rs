@@ -100,7 +100,7 @@ pub const RECLAIM_BATCH: usize = 8;
 /// This CPU is at a quiescent point: the mark, which takes no lock.
 pub fn mark() {
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::lag();
+    crate::window::lag();
     // A retired address space waits for every CPU to leave its tables: the
     // TTBR0 this CPU kept from its last thread goes before the mark
     // (aspace::leave). The next thread activates its space again.

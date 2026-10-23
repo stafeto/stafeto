@@ -15,9 +15,9 @@
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, GO, HELPER, IMAGE, MADE, MARKS, MISMATCH,
-    MOST_USED, NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN,
-    SERVED_AT, SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, GO, HB_T0, HELPER, IMAGE, MADE, MARKS,
+    MISMATCH, MOST_USED, NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST,
+    SCRATCH_PAGES, SEEN, SERVED_AT, SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -257,6 +257,9 @@ fn run(s: &Start) -> u64 {
         }
         Role::Churn => churn(s, a[0]),
         Role::SmpSpin => smp_spin(s, a[0] as usize, a[1] as u8),
+        Role::SmpTimers => smp_timers(),
+        Role::SmpSpawners => smp_spawners(),
+        Role::SmpTimed => smp_timed(s, a[0] as usize, a[1] as u8, a[2] as usize),
         Role::AsidPage => asid_page(s, a[0], a[1], a[2] != 0),
         Role::UnmapAcross => unmap_across(s, a[0] as u8),
         Role::Wfi => {
@@ -580,6 +583,107 @@ fn smp_spin(s: &Start, cpus: usize, priority: u8) -> u64 {
     }
     // The first thread ends; the process lives while the others do.
     sys::thread_exit()
+}
+
+/// Role::SmpSpawners.
+fn smp_spawners() -> u64 {
+    loop {
+        match sys::process_create(2 * PAGE, 16, 1) {
+            Ok(child) => {
+                if child.close().is_err() {
+                    return FAILED;
+                }
+                mark(12).fetch_add(1, Relaxed);
+            }
+            // The process ended under the call, or the quota is spent.
+            Err(e) => return e.code(),
+        }
+    }
+}
+
+/// Role::SmpTimers.
+fn smp_timers() -> u64 {
+    let Ok(channel) = sys::channel_create(1) else {
+        return FAILED;
+    };
+    loop {
+        match sys::timer_create(&channel, 1) {
+            Ok(timer) => {
+                if timer.close().is_err() {
+                    return FAILED;
+                }
+                mark(12).fetch_add(1, Relaxed);
+            }
+            // The process ended under the call, or the table is full.
+            Err(e) => return e.code(),
+        }
+    }
+}
+
+/// The mark that holds the deadline of Role::SmpTimed, and the first of
+/// those that count its threads, one each.
+const TIMED_AT: usize = 20;
+const TIMED_MARKS: usize = 21;
+/// The size of the stack of a thread of Role::SmpTimed, in the pages the
+/// role maps at SCRATCH.
+const TIMED_STACK: usize = 2 * PAGE as usize;
+
+/// Role::SmpTimed.
+fn smp_timed(s: &Start, threads: usize, priority: u8, cpus: usize) -> u64 {
+    let own = Handle::<Process>::borrowed(s.handles[0]);
+    if threads > 8 || !(2..=4).contains(&cpus) {
+        return FAILED;
+    }
+    let Ok(stacks) = sys::mem_create(threads as u64 * TIMED_STACK as u64) else {
+        return FAILED;
+    };
+    let size = threads as u64 * TIMED_STACK as u64;
+    if sys::mem_map(&own, &stacks, 0, size, SCRATCH, Access::ReadWrite).is_err() {
+        return FAILED;
+    }
+    for i in 0..threads {
+        let cpu = 1 + i % (cpus - 1);
+        let mut x = [0; 10];
+        x[0] = own.raw().0;
+        x[1] = timed_waiter as *const () as u64;
+        x[2] = (SCRATCH + (i + 1) * TIMED_STACK) as u64;
+        x[3] = i as u64;
+        x[4] = priority.into();
+        x[5] = Policy::Fifo as u64 | ((cpu as u64 + 1) << abi::THREAD_CPU_SHIFT);
+        x[6] = buffer(i + 1) as u64;
+        // SAFETY: each thread has a stack of its own, which nothing else uses.
+        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+        if Error::from_code(after[0]).is_some() {
+            return FAILED;
+        }
+        let t = Handle::<Thread>::from_raw(abi::Handle(after[1]));
+        if sys::thread_start(&t).is_err() {
+            return FAILED;
+        }
+        core::mem::forget(t);
+    }
+    sys::thread_exit()
+}
+
+/// Waits in receive for its timer, which fires at the instant in mark
+/// TIMED_AT, and spins once it came.
+extern "C" fn timed_waiter(i: u64) -> ! {
+    let count = mark(TIMED_MARKS + i as usize);
+    let (Ok(channel), at) = (sys::channel_create(1), mark(TIMED_AT).load(Relaxed)) else {
+        sys::thread_exit()
+    };
+    let Ok(timer) = sys::timer_create(&channel, 1) else {
+        sys::thread_exit()
+    };
+    if sys::timer_set(&timer, at).is_err() {
+        sys::thread_exit();
+    }
+    // Armed: the thread waits.
+    count.store(1, Relaxed);
+    let _ = sys::receive(&channel);
+    loop {
+        count.fetch_add(1, Relaxed);
+    }
 }
 
 extern "C" fn spinner(cpu: u64) -> ! {
@@ -1004,6 +1108,7 @@ fn serve_sessions(s: &Start, busy: bool) -> u64 {
         heartbeat,
     };
     mark(SERVED_AT).store(time::ticks_to_ns(time::now()), Relaxed);
+    service::PROBE.store((mark(HB_T0) as *const AtomicU64).cast_mut(), Relaxed);
     service::run::<_, { server::SESSIONS_MAX }, { server::HELD }>(&c, &mut server, config).code()
 }
 

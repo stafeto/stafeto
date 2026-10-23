@@ -206,7 +206,7 @@ pub fn reserve_mapping(
 ) -> Result<Change, Error> {
     crate::obj::assert_held();
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::map_checked();
+    crate::window::map_checked();
     make_table(target)?;
     // SAFETY: as above; the table was just made.
     let table = unsafe { table(target) }.expect("the table was just made");

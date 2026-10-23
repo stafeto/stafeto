@@ -193,6 +193,16 @@ pub fn stats() -> Stats {
     }
 }
 
+/// Turns the timer of this CPU off and makes the scheduler forget what it
+/// armed, so that a deadline a test left does not come meanwhile: the next
+/// decision arms the timer anew (kernel tests, between tests).
+#[cfg(feature = "ktest")]
+pub fn forget_deadline() {
+    let mut g = local().sched.lock();
+    VirtualTimer.disarm();
+    g.armed = Armed::new();
+}
+
 /// The EL1 virtual timer as the scheduler writes it.
 struct VirtualTimer;
 
@@ -313,7 +323,7 @@ pub unsafe fn boost(k: &mut Locked<'_>, t: NonNull<Thread>, level: u8, ceiling: 
     // release of the kernel's reference.
     if !thread::is_held(t) {
         #[cfg(feature = "window-probe")]
-        crate::cmd::window::boost_left_alone(t);
+        crate::window::boost_left_alone(t);
         return false;
     }
     crate::cmd::ask_boost(t, level, ceiling);
@@ -414,12 +424,19 @@ pub fn serve_exit(t: NonNull<Thread>) {
     crate::obj::assert_held();
     // The cause, a priority, in bits 0-7; bit 8 hands the reference over.
     let ask = crate::cmd::take_exit(t);
-    // SAFETY: as above.
-    unsafe { local().sched.lock().s.exit(t, timer::now()) };
-    if thread::current() == Some(t) {
-        arch::user::clear_current();
-    }
     locked(|k| {
+        // SAFETY: the thread is alive and of this CPU, so its link is read
+        // safely; a thread parked after the asker sent EXIT stands in the
+        // ring of its process still, and leaves it before it ends.
+        if unsafe { t.as_ref() }.sched.is_parked_listed() {
+            // SAFETY: a parked thread belongs to its process list.
+            unsafe { crate::process::unlist_parked(t, k) };
+        }
+        // SAFETY: as above.
+        unsafe { k.s.exit(t, timer::now()) };
+        if thread::current() == Some(t) {
+            arch::user::clear_current();
+        }
         // SAFETY: the thread is alive; its number goes back with its end.
         unsafe { thread::give_number(t, k.tokens) }
     });
@@ -472,9 +489,11 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     let remote = started && !is_local(t);
     let (held, waited) = locked(|k| {
         let deferred = remote || (started && crate::cmd::pending(t));
-        // SAFETY: `t` is alive; the list of a process's parked threads is
-        // under OBJ.
-        if unsafe { t.as_ref() }.sched.is_parked_listed() {
+        // SAFETY: `t` is alive. Its link belongs to its own CPU (a ready
+        // queue changes it with no OBJ), so only a thread of this CPU is
+        // taken off the ring of parked threads here; the CPU of another
+        // thread does it in `serve_exit`.
+        if !remote && unsafe { t.as_ref() }.sched.is_parked_listed() {
             // SAFETY: a parked thread belongs to its process list.
             unsafe { crate::process::unlist_parked(t, k) };
         }

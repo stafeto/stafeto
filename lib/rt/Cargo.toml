@@ -23,6 +23,9 @@ count-calls = []
 # that asks (`service::report_steps`) prints when it grows; off in every
 # image but the process service's measurement (xtask process-steps).
 step-stats = []
+# The heartbeat of a service writes its t0, the deadline of its timer and the
+# number of its arms into three words a test child gave (`service::PROBE`).
+armed-probe = []
 
 [dependencies]
 abi = { path = "../abi" }

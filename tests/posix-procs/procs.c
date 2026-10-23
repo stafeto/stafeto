@@ -261,6 +261,22 @@ static int spawn(pid_t *pid, const char *role, const posix_spawn_file_actions_t 
     return posix_spawn(pid, "/bin/procs-child", actions, attr, argv, envp);
 }
 
+static void pause_ms(long ms);
+
+/* The bytes of the service's pool once its ends settled: what a child gives
+ * back goes in the portions of the service's own cleanup, which on several
+ * CPUs may run after the wait of the parent returned. The pool is read again
+ * every 5 ms, up to 2 s, until it is back within `slack` of `before`: the
+ * wait is a bound for a service that keeps it, never a condition. */
+static unsigned long long pool_back(unsigned long long before, unsigned long long slack) {
+    unsigned long long after = stafeto_probe_pool();
+    for (int n = 0; n < 400 && after + slack < before; n++) {
+        pause_ms(5);
+        after = stafeto_probe_pool();
+    }
+    return after;
+}
+
 static void pause_ms(long ms) {
     struct timespec t = {ms / 1000, (ms % 1000) * 1000000L};
     while (nanosleep(&t, &t) != 0) {
@@ -2256,7 +2272,7 @@ static int fork_many(void) {
     expect("20 bare children", live, 20);
     for (int i = 0; i < live; i++) kill(pids[i], SIGKILL);
     for (int i = 0; i < live; i++) reap("one of 20 bare children", pids[i], 0, SIGKILL);
-    expect("the pool after 20 children of fork", stafeto_probe_pool() == before, 1);
+    expect("the pool after 20 children of fork", pool_back(before, 0) >= before, 1);
     return failures;
 }
 
@@ -3360,7 +3376,7 @@ static void windows(void) {
                0);
         reap("an exec while another thread spawns", pid, 7, 0);
     }
-    unsigned long long after = stafeto_probe_pool();
+    unsigned long long after = pool_back(before, 32 * 4096);
     printf("posix-procs: pool %llu before the window, %llu after\n", before, after);
     if (after + 32 * 4096 < before) {
         printf("posix-procs: the window kept %llu bytes of the pool\n", before - after);
@@ -3467,12 +3483,11 @@ static void forks(void) {
         pid_t pid = -1;
         expect(dying[i], posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, env), 0);
         reap(dying[i], pid, 0, SIGKILL);
-        unsigned long long after = stafeto_probe_pool();
-        for (int n = 0; n < 100 && after != before; n++) {
-            pause_ms(5);
-            after = stafeto_probe_pool();
-        }
-        if (after != before) {
+        /* What the children before gave back may still be on its way when
+         * `before` is read, so the pool may end above it; it may not end
+         * below. */
+        unsigned long long after = pool_back(before, 0);
+        if (after < before) {
             printf("posix-procs: the pool after %s: %llu before, %llu after\n", dying[i], before, after);
             failures++;
         }

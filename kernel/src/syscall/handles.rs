@@ -19,7 +19,7 @@ use kcore::args::{notify_priority_arg, rights_arg, under_ceilings};
 pub(super) fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     process::close_handle(caller(thread), Handle(a[0]), cause(thread))?;
     #[cfg(feature = "window-probe")]
-    crate::cmd::window::closed(caller(thread));
+    crate::window::closed(caller(thread));
     Ok(Values::none())
 }
 

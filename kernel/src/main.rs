@@ -46,6 +46,8 @@ mod syscall;
 mod testpoint;
 mod thread;
 mod timer;
+#[cfg(feature = "window-probe")]
+mod window;
 
 use boot::Boot;
 use bootimg::Program;

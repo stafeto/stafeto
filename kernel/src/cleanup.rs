@@ -359,6 +359,22 @@ pub fn portion() {
         (work.expect("queued work"), level)
     };
     crate::testpoint::portion_taken();
+    // The way out of the kernel marks its CPU at a quiescent point before
+    // each portion while a wait for the CPUs is open, and frees what the
+    // period let go. The stages Threads and Space of a process wait for the
+    // CPUs when there are several; the tests call portions in loops of
+    // their own, which would wait for themselves.
+    #[cfg(all(feature = "ktest", not(feature = "icount")))]
+    if let Work::Object(Object::Process(p)) = &work
+        && matches!(
+            process::progress(*p).0,
+            process::Stage::Threads | process::Stage::Space
+        )
+        && crate::smp::cpus() > 1
+        && crate::qsbr::pending()
+    {
+        crate::qsbr::quiesce();
+    }
     crate::obj::serving(crate::obj::ENTRY_CLEANUP);
     #[cfg(all(feature = "ktest", obj_checks))]
     let takes = crate::obj::takes();

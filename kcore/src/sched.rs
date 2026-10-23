@@ -63,6 +63,12 @@ pub enum State {
 /// neighbours, and the level changes only while the item is in no list.
 const QUEUED: u8 = 1;
 
+///
+/// Ownership: the CPU of the thread reads and changes the link, a ready
+/// queue changes it with no lock of the objects, and a `ParkedList` changes
+/// it under OBJ. A CPU other than the thread's touches the link only under
+/// OBJ and only for a thread that stands in no ready queue and does not
+/// run (Parked, Waiting).
 pub struct Link<T> {
     level: u8,
     /// Bit 0: the item stands in a queue. Bits 1-7: a tag the owner of the
@@ -122,6 +128,27 @@ impl<T> Link<T> {
     }
 }
 
+/// The level whose items the probe build (`ready-gap`) holds inside the
+/// removal from a ready queue (every level with `ready-gap-all`).
+pub const READY_GAP_LEVEL: u8 = 9;
+
+/// The probe build waits here, between the steps of a removal of an item at
+/// READY_GAP_LEVEL from a ready queue, so that a CPU that reads the link of
+/// the item in that time shows.
+#[cfg(feature = "ready-gap")]
+#[inline(never)]
+fn gap(level: usize) {
+    if cfg!(feature = "ready-gap-all") || level == usize::from(READY_GAP_LEVEL) {
+        for _ in 0..5000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(not(feature = "ready-gap"))]
+#[inline(always)]
+fn gap(_: usize) {}
+
 /// An item a `ReadyQueue` can hold.
 ///
 /// # Safety
@@ -176,6 +203,9 @@ impl<T: Linked> ParkedList<T> {
         // SAFETY: the caller's promise; each link borrow ends before the next.
         unsafe {
             let l = link(t);
+            // Checked in the host tests of kcore only: the kernel is built
+            // without debug assertions.
+            debug_assert!(!l.is_queued(), "a parked link is in a ready queue");
             let prev = l.prev.take().expect("a parked ring");
             let next = l.next.take().expect("a parked ring");
             if next == t {
@@ -290,11 +320,11 @@ impl<T> Node<T> {
     }
 
     /// Whether the node stands in a `ParkedList`: linked, in no ready
-    /// queue. Unlike `state`, which the CPU of the thread changes, a list
-    /// changes under the lock of the objects, so this one is true for every
-    /// CPU that holds it.
+    /// queue. The link belongs to the CPU of the thread (see `Link`), so
+    /// only that CPU, or a CPU under OBJ for a thread outside every ready
+    /// queue that does not run, may ask.
     pub fn is_parked_listed(&self) -> bool {
-        self.link.next.is_some() && !self.link.is_queued()
+        !self.link.is_queued() && self.link.next.is_some()
     }
 
     /// Ticks left of the quantum of a ready round-robin thread.
@@ -475,7 +505,9 @@ impl<T: Linked> ReadyQueue<T> {
             let l = link(t);
             assert!(l.is_queued(), "an item leaves a queue it is not in");
             l.queued &= !QUEUED;
+            gap(level);
             let prev = l.prev.take().expect("a ring");
+            gap(level);
             let next = l.next.take().expect("a ring");
             if next == t {
                 self.heads[level] = None;

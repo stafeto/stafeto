@@ -929,6 +929,29 @@ fn reply(token: Token, bytes: &[u8], handles: Outgoing) -> Result<(), Refused> {
     })
 }
 
+/// Three words of memory the test child of the heartbeat tests gives
+/// (feature `armed-probe`), which the heartbeat fills: its t0, the deadline
+/// its timer was armed for last, and how many times it armed it. A test
+/// reads the deadline and compares it with the grid t0 + k * period.
+#[cfg(feature = "armed-probe")]
+pub static PROBE: core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(feature = "armed-probe")]
+fn probe(t0: u64, deadline: u64) {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    let words = PROBE.load(Relaxed);
+    if !words.is_null() {
+        // SAFETY: the test child set the pointer to three words of its
+        // marks, which stay mapped for the life of the child.
+        unsafe {
+            (*words).store(t0, Relaxed);
+            (*words.add(1)).store(deadline, Relaxed);
+            (*words.add(2)).fetch_add(1, Release);
+        }
+    }
+}
+
 /// The heartbeat's timer and its deadlines, t0 + k * period.
 struct Beat<'a> {
     to: &'a Handle<Channel>,
@@ -962,7 +985,10 @@ impl<'a> Beat<'a> {
     fn arm(&mut self) -> Result<(), Error> {
         let now = time::ticks_to_ns(time::now());
         self.deadline = next_release(self.t0, self.period, now);
-        sys::timer_set(&self.timer, self.deadline)
+        let armed = sys::timer_set(&self.timer, self.deadline);
+        #[cfg(feature = "armed-probe")]
+        probe(self.t0, self.deadline);
+        armed
     }
 
     /// An expiry of the timer: a stale one, before the deadline, changes

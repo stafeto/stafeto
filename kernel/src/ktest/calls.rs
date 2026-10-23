@@ -156,6 +156,33 @@ impl Caller {
         self.expect(number, args, want)
     }
 
+    /// As `succeeds` for a call that waits for the other CPUs in a long call
+    /// (process_control with several CPUs): the call goes on until the
+    /// thread has no long call left, and the last answer is judged.
+    fn succeeds_waiting(
+        &self,
+        number: u16,
+        args: &[u64],
+        values: &[u64],
+    ) -> Result<(), &'static str> {
+        let until = timer::now() + 2 * timer::frequency();
+        let mut want = with_marks(args);
+        want[0] = 0;
+        want[1..=values.len()].copy_from_slice(values);
+        let mut got = self.call(number, args);
+        while got != want && thread::long(self.thread).is_some() && timer::now() < until {
+            // The wait is for every CPU to have passed a quiescent point
+            // since the call began: this one too, as the way out of the
+            // kernel would pass it.
+            crate::qsbr::mark();
+            got = self.again(number);
+        }
+        if got == want {
+            return Ok(());
+        }
+        self.expect(number, args, want)
+    }
+
     /// The call succeeds with a new handle in x1 and changes nothing else.
     fn created(&self, number: u16, args: &[u64]) -> Result<Handle, &'static str> {
         let got = self.call(number, args);
@@ -5755,7 +5782,7 @@ pub fn unbound_binding_waits_for_a_quiescent_period(_: &Boot) -> Result<(), &'st
             irq::in_use() == bindings,
             "the binding went before a quiescent point",
         )?;
-        crate::qsbr::quiesce();
+        quiesce_every_cpu()?;
         check(
             irq::in_use() == bindings - 1 && !crate::qsbr::pending(),
             "the quiescent point did not free the binding",
@@ -5763,11 +5790,43 @@ pub fn unbound_binding_waits_for_a_quiescent_period(_: &Boot) -> Result<(), &'st
     })
 }
 
+/// Quiescent points of this CPU until the others have passed one too (they
+/// pass at their next way out of the kernel, which the retirement asked
+/// for): the period of what was retired ends. 2 s at most.
+fn quiesce_every_cpu() -> Result<(), &'static str> {
+    let until = timer::now() + 2 * timer::frequency();
+    loop {
+        crate::qsbr::quiesce();
+        if !crate::qsbr::pending() {
+            return Ok(());
+        }
+        if timer::now() > until {
+            return Err("the other CPUs did not reach a quiescent point");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// The tests that look at the order of a portion and a quiescent point of
+/// the one CPU skip when there are several: the stages of a process wait
+/// for the other CPUs, so the portions of the test would wait for
+/// themselves.
+fn only_one_cpu(name: &str) -> bool {
+    let several = crate::smp::cpus() > 1;
+    if several {
+        kprintln!("skipped on several CPUs: {name}");
+    }
+    several
+}
+
 /// A binding keeps the shell of the process that pays for it until its
 /// place goes back (spec 7.7): with the process gone to its last stage while
 /// the quiescent period of its binding runs, the reclaim gives the last
 /// reference to the shell, queues it, and the cleanup frees it.
 pub fn last_shell_reference_comes_with_the_binding_reclaim(_: &Boot) -> Result<(), &'static str> {
+    if only_one_cpu("last_shell_reference_comes_with_the_binding_reclaim") {
+        return Ok(());
+    }
     let processes = process::in_use();
     let bindings = irq::in_use();
     let c = Caller::new()?;
@@ -7621,7 +7680,7 @@ pub fn process_control_checks_its_arguments(_: &Boot) -> Result<(), &'static str
             c.fails(n, &[denied.0, 0, 11], Error::AccessDenied)?;
             c.fails(n, &[h.0, 0, 11], Error::AccessDenied)?;
             for action in [0, 0, 1, 1] {
-                c.succeeds(n, &[h.0, action, 0], &[])?;
+                c.succeeds_waiting(n, &[h.0, action, 0], &[])?;
             }
             // SAFETY: the handle and test hold the target.
             unsafe {

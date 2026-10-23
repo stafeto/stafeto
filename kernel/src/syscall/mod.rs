@@ -71,7 +71,7 @@ fn process_control_waited(thread: NonNull<Thread>, args: &Args) {
     let r = objects(|| process_control(thread, args));
     if r.is_ok() && args[1] == 0 && crate::smp::cpus() > 1 {
         #[cfg(feature = "window-probe")]
-        crate::cmd::window::arm_lag(thread);
+        crate::window::arm_lag(thread);
         let epoch = crate::qsbr::begin_wait();
         thread::begin_long(
             thread,
@@ -231,13 +231,13 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
             // request for its entry came: the look under OBJ before the
             // wait has to find it.
             #[cfg(feature = "window-probe")]
-            crate::cmd::window::after_check(thread);
+            crate::window::after_check(thread);
             return send(thread, &args, crate::obj::lock());
         }
         Some(Call::Receive) => {
             #[cfg(feature = "window-probe")]
             if matches!(kcore::args::wait_arg(args[1]), Ok(true)) {
-                crate::cmd::window::after_check(thread);
+                crate::window::after_check(thread);
             }
             return objects(|| receive(thread, &args));
         }
@@ -247,7 +247,11 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemMap) => return change_map(thread, &args),
         Some(Call::MemUnmap) => return change(thread, &args, mem_unmap),
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
-        Some(Call::ProcessCreate) => return process_create(thread, &args),
+        Some(Call::ProcessCreate) => {
+            #[cfg(feature = "window-probe")]
+            crate::window::entry_gap(thread);
+            return process_create(thread, &args);
+        }
         Some(Call::ProcessKill) => process_kill(thread, &args, crate::obj::lock()),
         Some(Call::ProcessControl) => return process_control_waited(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args, crate::obj::lock()),
@@ -265,7 +269,13 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::IrqBind) => objects(|| irq_bind(thread, &args)),
         Some(Call::IrqAck) => objects(|| irq_ack(thread, &args)),
         Some(Call::ClockNow) => clock_now(),
-        Some(Call::TimerCreate) => objects(|| timer_create(thread, &args)),
+        Some(Call::TimerCreate) => {
+            // The probe holds the thread here, with no section, until its
+            // process ended: the call takes its section after the end.
+            #[cfg(feature = "window-probe")]
+            crate::window::entry_gap(thread);
+            objects(|| timer_create(thread, &args))
+        }
         Some(Call::TimerSet) => objects(|| timer_set(thread, &args)),
         Some(Call::TimerCancel) => objects(|| timer_cancel(thread, &args)),
         Some(Call::ObjectInfo) => objects(|| object_info(thread, &args)),

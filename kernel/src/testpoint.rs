@@ -148,12 +148,21 @@ mod points {
         el0::heads_taken(level, heads);
     }
 
+    /// The fixture of the EL0 tests belongs to CPU 0, which runs their
+    /// threads: the interrupts and the idle waits of the other CPUs leave
+    /// it alone (its lock admits one holder).
     pub fn timer_fired() {
+        if crate::arch::cpu::this().index() != 0 {
+            return;
+        }
         let _test = crate::obj::test_scope();
         el0::timer_fired();
     }
 
     pub fn idle() {
+        if crate::arch::cpu::this().index() != 0 {
+            return;
+        }
         let _test = crate::obj::test_scope();
         el0::note_idle_stack();
     }

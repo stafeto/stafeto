@@ -110,6 +110,13 @@ pub const SEEN: usize = 8;
 /// heartbeat counts its periods; and 1 added each time the handler of
 /// server::BUSY starts to spin.
 pub const SERVED_AT: usize = 9;
+/// The marks of the heartbeat of Role::Server and Role::Busy (rt
+/// `service::PROBE`): its t0, the deadline its timer was armed for last, in
+/// nanoseconds, and how many times it armed the timer. The tests read the
+/// deadline to see that it lies on the grid t0 + k * period.
+pub const HB_T0: usize = 30;
+pub const HB_ARMED: usize = 31;
+pub const HB_ARMS: usize = 32;
 pub const SPINS: usize = 10;
 /// The mark init sets to 1 to let the children of Role::AsidPage that wait
 /// for it begin their rounds.
@@ -334,10 +341,25 @@ pub enum Role {
     /// outlives the wait ends with NO_FAULT, one that never saw the reader
     /// with FAILED.
     UnmapAcross = 37,
+    /// Argument 0 threads (at most 8), thread i on CPU 1 + i % (argument 2
+    /// minus one), all at priority argument 1; handle 0 is the child's own
+    /// process. Each makes a channel and a timer, sets the timer to the
+    /// instant in mark 20, waits in receive for it, and once it came adds 1
+    /// to mark 21 + i for ever (the mark is 1 while it waits). The first
+    /// thread ends once they run.
+    SmpTimed = 38,
+    /// Makes a channel and then, for ever, a timer on it and closes the
+    /// timer, adding 1 to mark 12 for each pair (the calls end with the
+    /// error of the first that fails, the end of its process).
+    SmpTimers = 39,
+    /// Makes a child process of the least quota and closes its handle, for
+    /// ever, adding 1 to mark 12 for each (it ends with the error of the
+    /// first call that fails, the end of its own process).
+    SmpSpawners = 40,
 }
 
 impl Role {
-    pub const ALL: [Role; 37] = [
+    pub const ALL: [Role; 40] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -375,6 +397,9 @@ impl Role {
         Role::TakeThenWait,
         Role::AsidPage,
         Role::UnmapAcross,
+        Role::SmpTimed,
+        Role::SmpTimers,
+        Role::SmpSpawners,
     ];
 
     /// The role whose code is `code`.
