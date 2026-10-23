@@ -3075,6 +3075,7 @@ static int role(const char *name) {
          * the process whose heap other stages measure. */
         spawn_names();
         dup3_across_fork();
+        if (failures != 0) printf("posix-procs: spawnnames: %d checks failed; exit 1\n", failures);
         return failures != 0;
     }
     if (strcmp(name, "writefd6") == 0) {
@@ -5188,7 +5189,10 @@ int main(int argc, char **argv) {
 #endif
     printf("posix-procs: stage spawn_names\n");
     run_with("/bin/procs-child", "spawnnames", NULL, NULL);
-    if (failures != 0) return 1;
+    if (failures != 0) {
+        printf("posix-procs: %d checks failed above; exit 1\n", failures);
+        return 1;
+    }
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line
      * init reads from the new image: an exec of a child's role that exits
