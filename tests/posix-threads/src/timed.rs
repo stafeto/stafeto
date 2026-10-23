@@ -17,10 +17,13 @@ static SECONDS: AtomicU64 = AtomicU64::new(0);
 static NANOS: AtomicU64 = AtomicU64::new(0);
 static RESULT: AtomicUsize = AtomicUsize::new(0);
 static ELAPSED: AtomicU64 = AtomicU64::new(0);
+/// The calendar when the timed lock of the thread returned.
+static ENDED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// A deadline on the calendar taken when the check starts, the result and
-/// the least time it takes.
-type Check = (fn() -> Timespec, i32, u64);
+/// whether the call may return before the deadline (a passed or a bad one
+/// returns at once; a future one waits for it).
+type Check = (fn() -> Timespec, i32, bool);
 
 const BAD: Timespec = Timespec {
     tv_sec: 0,
@@ -66,6 +69,7 @@ unsafe extern "C" fn timed(_: *mut c_void) -> *mut c_void {
     };
     let result = unsafe { pthread_mutex_timedlock(lock(), &at) };
     ELAPSED.store(now() - start, Ordering::SeqCst);
+    ENDED_AT.store(realtime(), Ordering::SeqCst);
     RESULT.store(result as usize, Ordering::SeqCst);
     if result == 0 && unsafe { pthread_mutex_unlock(lock()) } != 0 {
         RESULT.store(usize::MAX, Ordering::SeqCst);
@@ -97,13 +101,21 @@ pub(super) fn run() -> bool {
     }
     // Each deadline is taken when its check starts.
     let checks: [Check; 3] = [
-        (|| spec(realtime() - 1), ETIMEDOUT, 0),
-        (|| BAD, EINVAL, 0),
-        (|| spec(realtime() + 20_000_000), ETIMEDOUT, 15_000_000),
+        (|| spec(realtime() - 1), ETIMEDOUT, true),
+        (|| BAD, EINVAL, true),
+        (|| spec(realtime() + 20_000_000), ETIMEDOUT, false),
     ];
-    for (index, (at, expected, at_least)) in checks.into_iter().enumerate() {
-        let (result, elapsed) = outcome(start(at()));
-        if result != expected || elapsed < at_least {
+    for (index, (at, expected, early)) in checks.into_iter().enumerate() {
+        // The lock must not return before its deadline, whenever the
+        // thread started: the calendar at its return is compared with the
+        // deadline, never the time it took.
+        let deadline = at();
+        let (result, elapsed) = outcome(start(Timespec {
+            tv_sec: deadline.tv_sec,
+            tv_nsec: deadline.tv_nsec,
+        }));
+        let deadline_ns = deadline.tv_sec as u64 * 1_000_000_000 + deadline.tv_nsec as u64;
+        if result != expected || (!early && ENDED_AT.load(Ordering::SeqCst) < deadline_ns) {
             rt::println!(
                 "posix-timed-mutex-probe: check {} gave {} after {} ns",
                 index,
