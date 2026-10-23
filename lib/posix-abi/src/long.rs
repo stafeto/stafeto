@@ -495,7 +495,12 @@ fn run_in(
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::WAIT, _, key)) => break key,
             Err(ADMISSION_LIMIT) => admission_pause()?,
-            Err(EINTR) if admission && !ending(&block.flags, point) => {}
+            // The kernel took the request back from the queue before any
+            // service saw it (only a send that waits for a place is ended),
+            // and no handler that ends the operation ran: an entry for a
+            // signal whose action ignores it, or a handler with SA_RESTART.
+            // The start goes again.
+            Err(EINTR) if !ending(&block.flags, point) => {}
             Err(error) => return Err(error),
             Ok(_) => return Err(EIO),
         }
