@@ -2939,7 +2939,11 @@ impl Processes {
         if !self.records.may_spawn(index) || !self.loaders.room_for(index) {
             rt::println!(
                 "posix-process: start refused: {} (children below the limit {}, loader places of the parent below the limit {}, room {})",
-                if self.records.may_spawn(index) { "loaders" } else { "children" },
+                if self.records.may_spawn(index) {
+                    "loaders"
+                } else {
+                    "children"
+                },
                 self.records.may_spawn(index),
                 self.loaders.room_for(index),
                 self.loaders.room()
@@ -3012,7 +3016,10 @@ impl Processes {
         let process = match made {
             Ok(process) => process,
             Err(e) => {
-                rt::println!("posix-process: start refused: kernel {:?} at process_create", e);
+                rt::println!(
+                    "posix-process: start refused: kernel {:?} at process_create",
+                    e
+                );
                 return kernel(e);
             }
         };
