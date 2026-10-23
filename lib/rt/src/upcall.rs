@@ -472,7 +472,12 @@ unsafe extern "C" fn entry() {
         "mov x0, sp", "mov x1, x23", "blr x21",
         "6:",
         "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
-        "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
+        // The frame says the buffer of the thread that returns: a child of
+        // `fork` made in a handler of a thread other than the main one has
+        // `INIT_MSGBUF`, its parent's thread another, and the kernel's
+        // return checks the word against the thread's own register.
+        "mrs x9, tpidrro_el0", "str x9, [sp, #280]",
+        "add x10, sp, #816", "mov x11, #1088",
         "3:", "ldp x12, x13, [x10], #16", "stp x12, x13, [x9], #16",
         "subs x11, x11, #16", "b.ne 3b",
         "mrs x9, tpidrro_el0", "add x9, x9, #{offset}",

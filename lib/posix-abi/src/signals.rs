@@ -1847,7 +1847,7 @@ unsafe fn fault_entry(native: *mut upcall::Context) {
     };
     // SAFETY: the entry's frame.
     let (sp, pc) = unsafe { ((*native).sp, (*native).pc) };
-    let fault = posix_signals::fault(cause.esr, cause.far, pc);
+    let fault = posix_signals::fault(cause.esr, cause.far, pc, sp);
     let block = own();
     let bit = posix_signals::bit(fault.signal).expect("a signal of the table");
     if crate::altstack::overflowed(sp)

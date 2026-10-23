@@ -25,8 +25,11 @@
  *   leaves B's frames whole for the next SA_ONSTACK signal; a jump from E
  *   into the main code leaves the whole stack to the next one.
  * - A child of fork made in a handler off the stack takes SA_ONSTACK signals
- *   under the live frames (#286).
+ *   under the live frames (#286); a child of fork made in a handler of a
+ *   thread other than the main one returns from it (#291).
  * - A stack of MINSIGSTKSZ bytes serves a handler with a 2 KiB array (#289).
+ * - A misaligned stack pointer is SIGBUS with BUS_ADRALN and si_addr equal to
+ *   it (#292).
  * - The classes of the syndrome: an undefined instruction is SIGILL, a
  *   breakpoint SIGTRAP, a misaligned exclusive SIGBUS, a load from an
  *   unmapped address SIGSEGV with SEGV_MAPERR and its address, a write to
@@ -529,6 +532,36 @@ static int f_fork_in_handler(void) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
 }
 
+/* #291: a child of fork made in a handler of a thread other than the main
+ * one returns from the handler into the function of its parent's thread. */
+static volatile int f_t_ready;
+static void f_h_tfork(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    f_fork_pid = fork();
+}
+static void *f_t_main(void *arg) {
+    (void)arg;
+    f_t_ready = 1;
+    while (f_fork_pid == -2) sched_yield();
+    if (f_fork_pid == 0) _exit(7);
+    return NULL;
+}
+static int f_thread_fork(void) {
+    pthread_t t;
+    if (f_catch(SIGUSR1, f_h_tfork, 0)) return 1;
+    f_fork_pid = -2;
+    f_t_ready = 0;
+    if (pthread_create(&t, NULL, f_t_main, NULL)) return 2;
+    while (!f_t_ready) sched_yield();
+    if (pthread_kill(t, SIGUSR1)) return 3;
+    pthread_join(t, NULL);
+    if (f_fork_pid < 0) return 4;
+    int status = -1;
+    if (waitpid(f_fork_pid, &status, 0) != f_fork_pid) return 5;
+    if (!WIFEXITED(status)) return 100 + WTERMSIG(status);
+    return WEXITSTATUS(status) == 7 ? 0 : 6;
+}
+
 /* #289: a stack of MINSIGSTKSZ bytes with a hole below it serves a handler
  * with a 2 KiB array, and at least 2 KiB of it stay untouched. */
 static volatile int f_array_ok;
@@ -554,6 +587,43 @@ static int f_minimum_stack(void) {
     while (untouched < MINSIGSTKSZ && low[untouched] == 0xA5) untouched++;
     printf("posix-procs: faults: a stack of MINSIGSTKSZ leaves %u bytes untouched under a 2 KiB handler\n", untouched);
     return untouched >= 2048 ? 0 : 6;
+}
+
+/* #292: a misaligned stack pointer is SIGBUS at the pointer. */
+static volatile unsigned long f_sp_value;
+static volatile int f_sp_signo, f_sp_code;
+static volatile unsigned long f_sp_addr;
+static void f_h_sp(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    f_sp_signo = sig;
+    f_sp_code = info->si_code;
+    f_sp_addr = (unsigned long)info->si_addr;
+    siglongjmp(f_env, 1);
+}
+static void f_sp_load(void) __attribute__((noinline));
+static void f_sp_load(void) {
+    unsigned long v;
+    __asm__ volatile("sub sp, sp, #8\n\tmov %0, sp\n\tldr x0, [sp]\n\tadd sp, sp, #8"
+                     : "=r"(v) :: "x0", "memory");
+    f_sp_value = v;
+}
+static int f_misaligned_sp(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGBUS, f_h_sp, SA_ONSTACK)) return 2;
+    f_sp_signo = 0;
+    if (sigsetjmp(f_env, 1) == 0) {
+        /* The model may not trap the alignment of SP (the instruction then
+         * returns): a value of the pointer is all it leaves. */
+        f_sp_load();
+        printf("posix-procs: faults: the model did not trap a misaligned SP (checked on the host's processor)\n");
+        return 0;
+    }
+    if (f_sp_signo != SIGBUS) return 3;
+    if (f_sp_code != BUS_ADRALN) return 4;
+    /* The pointer the instruction ran with is not at hand after the jump:
+     * it is 8 below a 16-aligned address. */
+    if ((f_sp_addr & 15) != 8) return 5;
+    return 0;
 }
 
 static volatile int f_code, f_signo;
@@ -757,7 +827,9 @@ static int faults_role(void) {
     f_child("a jump from a handler into the handler it was called in", f_levels_into_b, 0, 0);
     f_child("a jump from a handler into the main code takes both levels off", f_levels_to_main, 0, 0);
     f_child("fork in a handler off the alternate stack", f_fork_in_handler, 0, 0);
+    f_child("fork in a handler of a thread that is not the main one", f_thread_fork, 0, 0);
     f_child("a handler with a 2 KiB array on MINSIGSTKSZ", f_minimum_stack, 0, 0);
+    f_child("a misaligned stack pointer is SIGBUS at the pointer", f_misaligned_sp, 0, 0);
     f_child("classes of faults reach handlers", f_classes, 0, 0);
     f_child("undefined instruction without a handler", f_default_udf, 0, SIGILL);
     f_child("breakpoint without a handler", f_default_brk, 0, SIGTRAP);
