@@ -23,7 +23,7 @@ pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/arch/aarch64/exceptions.rs", 1),
     ("kernel/src/channel/mod.rs", 1),
     ("kernel/src/cleanup.rs", 4),
-    ("kernel/src/cmd.rs", 2),
+    ("kernel/src/cmd.rs", 1),
     ("kernel/src/init.rs", 3),
     ("kernel/src/irq.rs", 1),
     ("kernel/src/main.rs", 1),
@@ -39,6 +39,10 @@ pub const OBJ_LOCK_SITES: &[(&str, usize)] = &[
     ("kernel/src/syscall/mod.rs", 5),
     ("kernel/src/syscall/proc.rs", 1),
     ("kernel/src/timer.rs", 1),
+    // The probes of the windows (feature window-probe): the stages of a
+    // process look at its threads outside OBJ, a section a look, in the
+    // image of the probes only; the shipping kernel has none.
+    ("kernel/src/window.rs", 2),
 ];
 
 /// The counts of `obj::lock()` per file of `kernel/src`, with the line
