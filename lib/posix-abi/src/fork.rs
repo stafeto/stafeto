@@ -25,7 +25,7 @@
 use crate::constants::*;
 use crate::process::{ask, ask_loader, client, load_errno, request, start_errno};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use proto_loader::{Fork, Method, REGIONS_MAX, Region, TRANSFER_SIZE};
 use proto_wire::{Status, Writer};
 use rt::abi::{Access, Rights};
@@ -370,6 +370,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
             return Err(errno);
         }
     };
+    step(4);
     let level = crate::threads::own_block()
         .base_level
         .load(Ordering::Relaxed) as u8;
@@ -404,6 +405,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
     let c = match (status, c) {
         (Status::Ok, Ok(c)) => c,
         (status, _) => {
+            REFUSED.store(status.code(), Ordering::Relaxed);
             sessions.close();
             return Err(if status == Status::Ok {
                 EIO
@@ -414,6 +416,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
     };
     PROBE_LOADING_PID.store(pid, Ordering::Release);
     let made = make(&c, regions, sessions, window);
+    step(9);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
         Err(_) => proto_process::Method::ForkAbort,
@@ -443,11 +446,14 @@ fn make(
     let mut w = Writer::new();
     Method::Fork.header().write(&mut w).map_err(|_| EIO)?;
     fork.write(&mut w).map_err(|_| EIO)?;
+    step(5);
     if ask_loader(c, &w, None) != 0 {
         sessions.close();
         return Err(EIO);
     }
+    step(6);
     give(c, sessions)?;
+    step(7);
     let Regions { count, regions } = regions;
     let mut list = regions.into_iter().take(count).flatten().peekable();
     while list.peek().is_some() {
@@ -468,6 +474,7 @@ fn make(
             early();
         }
     }
+    step(8);
     let mut w = Writer::new();
     Method::Go.header().write(&mut w).map_err(|_| EIO)?;
     match ask_loader(c, &w, None) {
@@ -602,9 +609,16 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
     }
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
+    step(1);
     let result = crate::signals::stop_others()
-        .and_then(|()| sessions())
-        .and_then(|sessions| copy(window, sessions));
+        .and_then(|()| {
+            step(2);
+            sessions()
+        })
+        .and_then(|sessions| {
+            step(3);
+            copy(window, sessions)
+        });
     if result == Ok(Forked::Child) {
         if let Err(why) = child() {
             rt::println!("posix-abi: a forked child could not bind {}", why);
@@ -612,6 +626,15 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
         }
     } else {
         crate::signals::resume_others();
+    }
+    if let Err(errno) = result {
+        rt::println!(
+            "posix-abi: fork refused at step {} ({}) with errno {}, start status {}",
+            STEP.load(Ordering::Relaxed),
+            step_name(STEP.load(Ordering::Relaxed)),
+            errno,
+            REFUSED.load(Ordering::Relaxed)
+        );
     }
     block.mask.store(mask, Ordering::SeqCst);
     // fork's errors are EAGAIN and ENOMEM (and ENOSYS above): a refusal
@@ -625,6 +648,29 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
             ENOMEM | ENOSYS => errno,
             _ => EAGAIN,
         })
+}
+
+/// The step of the fork the parent has reached, for the line a refusal prints.
+static REFUSED: AtomicU32 = AtomicU32::new(0);
+static STEP: AtomicU32 = AtomicU32::new(0);
+
+fn step(n: u32) {
+    STEP.store(n, Ordering::Relaxed);
+}
+
+fn step_name(n: u32) -> &'static str {
+    match n {
+        1 => "stop the other threads",
+        2 => "clone the sessions",
+        3 => "copy: regions",
+        4 => "ForkStart",
+        5 => "Fork",
+        6 => "give the sessions",
+        7 => "Regions",
+        8 => "Go",
+        9 => "ForkCommit",
+        _ => "unknown",
+    }
 }
 
 /// Clones of the process's sessions for a child (Clone): the RAM files'

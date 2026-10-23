@@ -2848,12 +2848,21 @@ impl Processes {
             return refuse(proto_process::NOT_FOUND);
         }
         if !self.records.may_spawn(index) || !self.loaders.room_for(index) {
+            rt::println!(
+                "posix-process: start refused: {} (children below the limit {}, loader places of the parent below the limit {}, room {})",
+                if self.records.may_spawn(index) { "loaders" } else { "children" },
+                self.records.may_spawn(index),
+                self.loaders.room_for(index),
+                self.loaders.room()
+            );
             return refuse(proto_process::AGAIN);
         }
         let Some(label) = self.records.next_label() else {
+            rt::println!("posix-process: start refused: no label");
             return refuse(proto_process::AGAIN);
         };
         if !self.generations.room(usize::from(label.index), 4) {
+            rt::println!("posix-process: start refused: generations of the label");
             self.records.retire_next(label);
             return refuse(proto_process::AGAIN);
         }
@@ -2885,6 +2894,11 @@ impl Processes {
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
         if !loaders::pool_allows(free_quota(), create.quota) {
+            rt::println!(
+                "posix-process: start refused: pool free {} quota {}",
+                free_quota(),
+                create.quota
+            );
             return kernel(abi::Error::NoMemory);
         }
         let place = records::exit_place(label, &create, self.level);
@@ -2908,7 +2922,10 @@ impl Processes {
         );
         let process = match made {
             Ok(process) => process,
-            Err(e) => return kernel(e),
+            Err(e) => {
+                rt::println!("posix-process: start refused: kernel {:?} at process_create", e);
+                return kernel(e);
+            }
         };
         // From here on the record is in the table, and only the end of its
         // process takes it out.
@@ -3013,7 +3030,14 @@ impl Processes {
         let (child, parent) = (place.record, place.parent);
         let outcome = self.make_piece(slot, child, parent, &making);
         match outcome {
-            Err(e) => self.abort_load(child, Status::Kernel(e)),
+            Err(e) => {
+                rt::println!(
+                    "posix-process: load piece {:?} refused: {:?}",
+                    making.work,
+                    e
+                );
+                self.abort_load(child, Status::Kernel(e))
+            }
             Ok(None) => {}
             Ok(Some(work)) => {
                 if let Some(place) = self.loaders.get_mut(slot) {
