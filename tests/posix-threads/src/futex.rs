@@ -28,7 +28,20 @@ static COUNT: AtomicU64 = AtomicU64::new(0);
 static LAYER: LayerLock = LayerLock::new();
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 static IN_SECTION: AtomicUsize = AtomicUsize::new(0);
-const HANDOFFS: u64 = 100_000;
+/// Handoffs of the shared mutex each of the two threads makes: 10^5 on one
+/// CPU, 2 x 10^4 with several, where TCG makes each yield and wake a
+/// crossing between vCPUs and 2 x 10^5 outrun the limit of the probe. The
+/// property (no handoff is lost, the count is exact) does not depend on the
+/// number.
+const HANDOFFS_ONE_CPU: u64 = 100_000;
+const HANDOFFS_SEVERAL: u64 = 20_000;
+
+fn handoffs() -> u64 {
+    match sys::cpu_info(0) {
+        Ok(info) if info.cpus > 1 => HANDOFFS_SEVERAL,
+        _ => HANDOFFS_ONE_CPU,
+    }
+}
 
 fn error() {
     ERRORS.fetch_add(1, Ordering::SeqCst);
@@ -69,11 +82,11 @@ unsafe extern "C" fn ordered(argument: *mut c_void) -> *mut c_void {
     ptr::null_mut()
 }
 
-/// Takes and gives back the shared mutex HANDOFFS times, the other thread
+/// Takes and gives back the shared mutex `handoffs()` times, the other thread
 /// waiting in between.
 unsafe extern "C" fn handoff(_: *mut c_void) -> *mut c_void {
     let mutex = ptr::from_ref(&SHARED).cast_mut();
-    for _ in 0..HANDOFFS {
+    for _ in 0..handoffs() {
         if unsafe { pthread_mutex_lock(mutex) } != 0 {
             error();
         }
@@ -289,7 +302,7 @@ pub(super) fn run() -> bool {
         }
     }
     pair.into_iter().for_each(join);
-    if COUNT.load(Ordering::Relaxed) != 2 * HANDOFFS || ERRORS.load(Ordering::SeqCst) != 0 {
+    if COUNT.load(Ordering::Relaxed) != 2 * handoffs() || ERRORS.load(Ordering::SeqCst) != 0 {
         return failed(626);
     }
     // A higher thread that the holder's wake preempts at once.

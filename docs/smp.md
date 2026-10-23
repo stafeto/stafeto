@@ -140,8 +140,10 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
   queue, so the repeats of a call are at most the requests with handles that
   stood in the queue when it began (spec 6.1).
 - `ci` runs the test init (also in the kernel built with the checks of `OBJ`,
-  `smp 4 checks`), `smp 4 window` and `smp 4 asid` on 4 CPUs, and five
-  guests on 4 CPUs beside their runs on one. `STAFETO_SMP=N` runs any probe on N
+  `smp 4 checks`), `smp 4 window` and `smp 4 asid` on 4 CPUs, the kernel tests
+  (`kernel tests smp 4`), and seven guests on 4 CPUs beside their runs on one
+  (`posix-threads` with 2 x 10^4 handoffs instead of 2 x 10^5, and `posix-procs`,
+  with a limit of 180 s). `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 
 ## What programs see of the CPUs
@@ -178,14 +180,11 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
 
 ## Not on several CPUs
 
-- The kernel tests: their harness runs the tests on CPU 0 with the other CPUs
-  outside the scheduler, and the first test that retires an ASID waits for them.
-  The kernel on 4 CPUs is covered by the test init.
+- One kernel test, `last_shell_reference_comes_with_the_binding_reclaim`, looks
+  at a portion without a quiescent point of its own CPU and skips on several
+  CPUs, with a line: the stages of a process wait for the other CPUs. The measures under `-icount`
+  are of one CPU.
 - The probes of the shell, `posix-sock`, `posix-ipc`, `posix-poll`, `posix-pty`
   steps and `posix-tty-control-steps`: with TCG on 4 CPUs the boot of `posix-sock` takes
   17 times as long (every invalidation of the TLB reaches all vCPUs), and the
   watchdogs of the services fire.
-- `posix-procs`: 46 s on a quiet Mac and over its 60 s limit on the runners of ci with 4 CPUs
-  (it passes on 4 CPUs under HVF and TCG when the limit is not reached).
-- `posix-threads`: 2 x 10^5 handoffs outrun the time limit on TCG with more
-  than one CPU.

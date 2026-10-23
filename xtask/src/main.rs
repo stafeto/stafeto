@@ -918,6 +918,19 @@ const KERNEL_LIMIT: u64 = 200 * 1024;
 /// limit of their own still catches a runaway growth.
 const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The limit of a probe that runs on several CPUs: TCG makes each crossing
+/// between vCPUs dear. posix-procs takes 40 s on a quiet Mac with four CPUs
+/// and the runners of ci take twice that, with 1.6 in hand: 180 s; the
+/// pthread probe takes 11 s an image, and gets three times its limit on one.
+const PROCS_SMP_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn boot_timeout() -> Duration {
+    if qemu::cpus() > 1 {
+        BOOT_TIMEOUT * 3
+    } else {
+        BOOT_TIMEOUT
+    }
+}
 /// The crowd of the steps probe under -icount, on the host's clock.
 const STEPS_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2681,7 +2694,7 @@ fn stock_thread_probe(vz: bool) -> Result<(), String> {
     };
     let (cmd, kernel) = probe_command(&image, vz)?;
     const ENDED: &str = "init: posix-abi-probe ended: exit code 0, not restarted";
-    let checked = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf).and_then(|output| {
+    let checked = run_until(cmd, boot_timeout(), Some(ENDED), &kernel.elf).and_then(|output| {
         qemu::expect_stopped_on(&output, ENDED)
             .map_err(|e| format!("{e}; last lines: {:?}", output.lines.last()))?;
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
@@ -2720,7 +2733,7 @@ fn native_scope_probe(vz: bool) -> Result<(), String> {
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let (cmd, kernel) = probe_command(&image, vz)?;
     const ENDED: &str = "init: posix-procs ended: exit code 0, not restarted";
-    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    let output = run_until(cmd, boot_timeout(), Some(ENDED), &kernel.elf)?;
     let checked = qemu::expect_stopped_on(&output, ENDED)
         .and_then(|()| native_scopes::check_markers(&output.lines))
         .and_then(|()| native_scopes::check_ended_routers(&output.lines, 1));
@@ -4757,7 +4770,11 @@ fn posix_procs_prebuilt(
         .expect_line(
             "the POSIX process probe to exit",
             |line| line.starts_with("init: posix-procs ended:"),
-            Duration::from_secs(60),
+            if qemu::cpus() > 1 {
+                PROCS_SMP_TIMEOUT
+            } else {
+                Duration::from_secs(60)
+            },
         )
         .and_then(|line| {
             if line == "init: posix-procs ended: exit code 42, not restarted" {
@@ -7771,15 +7788,19 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             init_tests_on(&qemu::VIRT_EL2_V3, false, SMP_CPUS).map(drop)
         }),
         // Guests that run on several CPUs at once, on four beside their runs
-        // on one: the threads of relibc, the locks of the layer and the RAM
-        // file system. Not here, each for its reason (docs/smp.md): the
-        // probes of the shell and of the services whose watchdogs a boot
-        // that TCG makes slow on four CPUs (the invalidations of the TLB
-        // reach every CPU, each one stops them all) overruns; posix-procs,
-        // which takes 60 s on the runners of ci with four CPUs, its limit;
-        // posix-threads,
-        // whose 2 x 10^5 handoffs outrun the limit on TCG with CPUs beyond
-        // one.
+        // on one: the threads of the pthread probe (2 x 10^4 handoffs on
+        // several CPUs), the processes (limit 180 s), the threads of relibc,
+        // the locks of the layer and the RAM file system. Not here
+        // (docs/smp.md): the probes of the shell and of the services whose
+        // watchdogs a boot that TCG makes slow on four CPUs (the
+        // invalidations of the TLB reach every CPU, each one stops them all)
+        // overruns.
+        job("posix-threads smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || posix_thread_probe(false))
+        }),
+        job("posix-procs smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || posix_procs_probe(&qemu::VIRT))
+        }),
         job("relibc-hello smp 4", || {
             qemu::on_cpus(SMP_CPUS, relibc_hello_probe)
         }),
