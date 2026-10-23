@@ -6542,17 +6542,30 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
 
 /// Types `command` and waits for the lines `lines` and the prompt.
 fn dialog_command(run: &mut qemu::Run, command: &str, lines: &[&str]) -> Result<(), String> {
+    dialog_command_within(run, command, lines, DIALOG_STEP)
+}
+
+/// `dialog_command` with `wait` for each line the command answers with, for
+/// a command that computes for seconds: how long a loop of awk takes depends
+/// on the runner and on the layout of the program, which moves it by a fifth
+/// without a change of the loop.
+fn dialog_command_within(
+    run: &mut qemu::Run,
+    command: &str,
+    lines: &[&str],
+    wait: Duration,
+) -> Result<(), String> {
     run.send(command)?;
     for expected in lines {
         if let Some(text) = expected.strip_prefix('=') {
-            run.expect_line(expected, |line| line.trim() == text, DIALOG_STEP)?;
+            run.expect_line(expected, |line| line.trim() == text, wait)?;
         } else if let Some(text) = expected.strip_prefix('~') {
-            run.expect_line(expected, |line| line.contains(text), DIALOG_STEP)?;
+            run.expect_line(expected, |line| line.contains(text), wait)?;
         } else {
-            run.expect_line(expected, |line| line == *expected, DIALOG_STEP)?;
+            run.expect_line(expected, |line| line == *expected, wait)?;
         }
     }
-    run.expect("# ", DIALOG_STEP)?;
+    run.expect("# ", wait)?;
     Ok(())
 }
 
@@ -6648,10 +6661,11 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     // The counters only grow: the time of a child that ran, seen while it
     // lived, stays in the sum of the cpu line (and out of the idle time of
     // uptime) once it ended.
-    dialog_command(
+    dialog_command_within(
         run,
         "awk 'BEGIN {for (i = 0; i < 1000000; i++) x += i}' & p=$!; sleep 2; a=$(awk '/^cpu / {print $2}' /proc/stat); u=$(cat /proc/uptime); wait $p; b=$(awk '/^cpu / {print $2}' /proc/stat); v=$(cat /proc/uptime); [ $b -ge $a ] && echo cpu-grew; echo \"$u $v\" | awk '{print ($4 >= $2) ? \"idle-grew\" : \"idle-fell\"}'",
         &["cpu-grew", "idle-grew"],
+        Duration::from_secs(30),
     )
 }
 
