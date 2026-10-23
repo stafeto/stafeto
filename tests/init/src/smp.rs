@@ -165,7 +165,8 @@ fn spawn_on(
     x[6] = buffer(slot) as u64;
     // SAFETY: the stack of the slot is the thread's alone until it ends.
     let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
-    if Error::from_code(after[0]).is_some() {
+    if let Some(e) = Error::from_code(after[0]) {
+        println!("smp: thread_create on CPU {cpu} gave {e:?}");
         return Err("thread_create on a CPU failed");
     }
     let t = Handle::<Thread>::from_raw(abi::Handle(after[1]));
