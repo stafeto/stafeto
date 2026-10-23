@@ -748,6 +748,19 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
+/// The same image with the heartbeats of its services on one grid (init's
+/// feature `steps-grid`): the worst phase of their wait for init
+/// (`process-steps grid`).
+const POSIX_STEPS_GRID_PROGRAMS: [ImageProgram; 9] = {
+    let mut programs = POSIX_STEPS_PROGRAMS;
+    programs[0] = (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-posix-steps", "steps-grid"],
+    );
+    programs
+};
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
@@ -1521,7 +1534,8 @@ commands:
             boot image and from files through the process service
   posix-jobs  check STOP/CONT wait reports, masks, directed signals and orphans
   loader-channels verify ordinary loader channel provenance and descriptor transfer
-  process-steps [branches [machine]] measure process service steps (2G by default)
+  process-steps [grid | branches [machine]] measure process service steps (2G by default);
+            with grid, the heartbeats of the services on one grid, the worst phase of their wait for init
   wcet coverage [--jobs N] [--all] [--skip PROBE]... [--from DIR] [--out DIR]
             run the kernel probes under QEMU's trace plugin and list the
             blocks of the entry paths that none ran (docs/wcet.md); --all runs
@@ -1731,7 +1745,8 @@ fn main() {
         Some("posix-pty-steps") => posix_pty_probe_in(true),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
-            [] => process_steps(&qemu::VIRT_2G, 7),
+            [] => process_steps(&qemu::VIRT_2G, 7, false),
+            [grid] if grid == "grid" => process_steps(&qemu::VIRT_2G, 7, true),
             [n, machine @ ..] if machine.len() <= 1 => n
                 .parse()
                 .ok()
@@ -1742,9 +1757,9 @@ fn main() {
                         Some(name) => qemu::machine(Some(name))?,
                         None => &qemu::VIRT_2G,
                     };
-                    process_steps(machine, n)
+                    process_steps(machine, n, false)
                 }),
-            _ => Err("process-steps [branches [machine]]".to_owned()),
+            _ => Err("process-steps [grid | branches [machine]]".to_owned()),
         },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
@@ -5897,14 +5912,27 @@ fn check_getlimit_wait(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
+/// The steps probe on `machine` with `branches` branches of children. With
+/// `grid` the services of the image send their heartbeats at the same
+/// instants (the queue of init at its longest), and the wait of the probe's
+/// GetLimit client is printed with no limit: it is a client of the process
+/// service at level 30 below the storm of six services, and what it waits
+/// holds their work above it, which is no step of the process service.
+fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
     let kernel = build(Variant::Normal)?;
+    // The files of the image go by its name (rootfs::files_of), so the grid
+    // image keeps it.
+    let programs = if grid {
+        &POSIX_STEPS_GRID_PROGRAMS
+    } else {
+        &POSIX_STEPS_PROGRAMS
+    };
     let image = write_boot_image_with(
         "boot-posix-steps.img",
-        &POSIX_STEPS_PROGRAMS,
+        programs,
         BOOT_PROFILE,
         &[("STEPS_BRANCHES", &branches.to_string())],
     )?;
@@ -5928,7 +5956,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let log = dir.join("process-steps.log");
+    let log = dir.join(if grid {
+        "process-steps-grid.log"
+    } else {
+        "process-steps.log"
+    });
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     if outcome
@@ -5955,7 +5987,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     )?;
     qemu::expect_marker(&outcome, "posix-procs: timer steps ok")?;
     qemu::expect_marker(&outcome, "posix-procs: shared memory steps ok")?;
-    check_getlimit_wait(&outcome.lines)?;
+    if grid {
+        let wait = qemu::number_after(&outcome.lines, "posix-procs: getlimit wait max ")
+            .ok_or("the priority probe printed no wait of GetLimit")?;
+        println!("GetLimit at level 30 under the storm of the heartbeats: {wait} ticks, no limit");
+    } else {
+        check_getlimit_wait(&outcome.lines)?;
+    }
     check_process_memory_reserve(&outcome.lines)?;
     for line in names_lines(&outcome.lines)? {
         println!("{line}");
@@ -6197,7 +6235,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         let wait = wait_of(&rows_waits, *kind);
         text += &format!("{kind} {name} {ticks} {detail} {wait}\n");
     }
-    let path = dir.join("process-steps.txt");
+    let path = dir.join(if grid {
+        "process-steps-grid.txt"
+    } else {
+        "process-steps.txt"
+    });
     std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
     print!(
         "process steps under icount on {}, {live} children live:\n{text}",
@@ -7922,8 +7964,12 @@ fn timing_jobs() -> Vec<jobs::Job> {
         // External virtio interrupts shift heartbeat release phase under
         // concurrent TCG load. Preserve both measured crowds without competing
         // QEMU instances; the service budgets and wait limits stay unchanged.
-        job("process-steps 4", || process_steps(&qemu::VIRT_2G, 4)),
-        job("process-steps 7", || process_steps(&qemu::VIRT_2G, 7)),
+        job("process-steps 4", || {
+            process_steps(&qemu::VIRT_2G, 4, false)
+        }),
+        job("process-steps 7", || {
+            process_steps(&qemu::VIRT_2G, 7, false)
+        }),
         // A hung test is killed after a second of the host's time.
         ostest::runner_check_job(),
         job(

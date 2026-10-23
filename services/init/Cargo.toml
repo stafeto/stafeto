@@ -21,9 +21,11 @@ bench = false
 [features]
 # The longest step of init's loop for each method, printed when it grows
 # (rt feature step-stats; xtask process-steps, under -icount).
+steps = ["rt/step-stats"]
 # The heartbeats of all the services of the image start on one grid
-# (rt feature beat-grid): the worst phase of their wait for init.
-steps = ["rt/step-stats", "rt/beat-grid"]
+# (rt feature beat-grid): the worst phase of their wait for init, which
+# xtask process-steps grid measures apart from the other steps.
+steps-grid = ["steps", "rt/beat-grid"]
 table-test = []
 table-cycle = []
 table-ceiling = []
