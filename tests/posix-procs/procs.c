@@ -2336,7 +2336,11 @@ static int fork_threads(void) {
         fork_trace("pair-b-fork-before", i, 0);
         pid_t b = fork();
         if (b == 0) _exit(0);
-        fork_trace("pair-b-fork-return", i, b);
+        {
+            int err = errno;
+            fork_trace("pair-b-fork-return", i, b);
+            if (a < 0 || b < 0) printf("posix-procs: pair %d forks gave %d and %d, errno %d\n", i, (int)a, (int)b, err);
+        }
         fork_trace("pair-a-wait-before", i, a);
         reap("the first of a pair of forks", a, 0, 0);
         fork_trace("pair-a-wait-done", i, failures);
