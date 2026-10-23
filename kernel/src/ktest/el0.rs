@@ -3325,7 +3325,7 @@ fn start_firing(f: &mut Fixture) -> Result<(), &'static str> {
         f.kept[0] = at;
         // The property is one interrupt for the deadline, and its premise
         // that every timer was armed ahead of it. A host that held QEMU
-        // back meanwhile broke the premise, not the property: the timers
+        // back meanwhile broke the premise of the test: the timers
         // go, and the test arms them again with twice the margin.
         if made.is_err() || timer::now() < at {
             break;

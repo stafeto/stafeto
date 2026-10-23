@@ -142,8 +142,8 @@ preempted spent holding or waiting for the lock, so the board (stage 7) decides.
 - `ci` runs the test init (also in the kernel built with the checks of `OBJ`,
   `smp 4 checks`), `smp 4 window` and `smp 4 asid` on 4 CPUs, the kernel tests
   (`kernel tests smp 4`), and seven guests on 4 CPUs beside their runs on one
-  (`posix-threads` with 2 x 10^4 handoffs instead of 2 x 10^5, and `posix-procs`,
-  with a limit of 180 s). `STAFETO_SMP=N` runs any probe on N
+  (`posix-threads` with 2 x 10^4 handoffs on several CPUs and 2 x 10^5 on one, and
+  `posix-procs` with a limit of 180 s). `STAFETO_SMP=N` runs any probe on N
   CPUs; `STAFETO_MACHINE` names the machine of `posix-procs`.
 
 ## The probes and the deliberate breaks

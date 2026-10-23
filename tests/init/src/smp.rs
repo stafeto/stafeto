@@ -1000,7 +1000,7 @@ fn kill_of_threads_being_woken() -> Outcome {
         let waiting = || (0..KILL_THREADS).all(|i| kid_mark(TIMED_MARKS + i) != 0);
         if !(wait_for(waiting) && now() < at) {
             // The host held the run back past the instant: the premise of
-            // the round, not its property. Again, with twice the margin.
+            // the round. Again, with twice the margin.
             kid.close()?;
             let_run()?;
             margin *= 2;
