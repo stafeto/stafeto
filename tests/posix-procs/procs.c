@@ -2336,7 +2336,11 @@ static int fork_threads(void) {
         fork_trace("pair-b-fork-before", i, 0);
         pid_t b = fork();
         if (b == 0) _exit(0);
-        fork_trace("pair-b-fork-return", i, b);
+        {
+            int err = errno;
+            fork_trace("pair-b-fork-return", i, b);
+            if (a < 0 || b < 0) printf("posix-procs: pair %d forks gave %d and %d, errno %d\n", i, (int)a, (int)b, err);
+        }
         fork_trace("pair-a-wait-before", i, a);
         reap("the first of a pair of forks", a, 0, 0);
         fork_trace("pair-a-wait-done", i, failures);
@@ -3071,6 +3075,7 @@ static int role(const char *name) {
          * the process whose heap other stages measure. */
         spawn_names();
         dup3_across_fork();
+        if (failures != 0) printf("posix-procs: spawnnames: %d checks failed; exit 1\n", failures);
         return failures != 0;
     }
     if (strcmp(name, "writefd6") == 0) {
@@ -3159,6 +3164,10 @@ static int role(const char *name) {
         return 3;
     }
     if (strcmp(name, "exit7") == 0) return 7;
+    if (strcmp(name, "late7") == 0) {
+        pause_ms(100);
+        return 7;
+    }
     if (strcmp(name, "segv") == 0) {
         volatile int *zero = NULL;
         return *zero;
@@ -4658,7 +4667,9 @@ static void shell_signals(void) {
      * waitpid with EINTR, and the waitpid repeated takes its child. */
     chld_action(on_chld, 0);
     pid_t nap = start("nap");
-    pid_t quick = start("exit7");
+    /* The other child ends 100 ms in, after the wait has begun: one that
+     * ended at once could have its SIGCHLD run before the wait. */
+    pid_t quick = start("late7");
     int status = -1;
     pid_t gotpid = waitpid(nap, &status, 0);
     expect("waitpid in another child's SIGCHLD", gotpid == -1 ? errno : 0, EINTR);
@@ -5184,7 +5195,10 @@ int main(int argc, char **argv) {
 #endif
     printf("posix-procs: stage spawn_names\n");
     run_with("/bin/procs-child", "spawnnames", NULL, NULL);
-    if (failures != 0) return 1;
+    if (failures != 0) {
+        printf("posix-procs: %d checks failed above; exit 1\n", failures);
+        return 1;
+    }
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line
      * init reads from the new image: an exec of a child's role that exits
