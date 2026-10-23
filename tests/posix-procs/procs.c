@@ -3164,6 +3164,10 @@ static int role(const char *name) {
         return 3;
     }
     if (strcmp(name, "exit7") == 0) return 7;
+    if (strcmp(name, "late7") == 0) {
+        pause_ms(100);
+        return 7;
+    }
     if (strcmp(name, "segv") == 0) {
         volatile int *zero = NULL;
         return *zero;
@@ -4663,7 +4667,9 @@ static void shell_signals(void) {
      * waitpid with EINTR, and the waitpid repeated takes its child. */
     chld_action(on_chld, 0);
     pid_t nap = start("nap");
-    pid_t quick = start("exit7");
+    /* The other child ends 100 ms in, after the wait has begun: one that
+     * ended at once could have its SIGCHLD run before the wait. */
+    pid_t quick = start("late7");
     int status = -1;
     pid_t gotpid = waitpid(nap, &status, 0);
     expect("waitpid in another child's SIGCHLD", gotpid == -1 ? errno : 0, EINTR);
