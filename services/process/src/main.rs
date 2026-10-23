@@ -1408,7 +1408,7 @@ impl Processes {
                                     let waiting = self.shares.waiters();
                                     if waiting > self.waiters_peak {
                                         self.waiters_peak = waiting;
-                                        if waiting % 16 == 0 || waiting >= 60 {
+                                        if waiting.is_multiple_of(16) || waiting >= 60 {
                                             rt::println!("posix-process: share waiters {waiting}");
                                         }
                                     }
