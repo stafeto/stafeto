@@ -30,7 +30,7 @@ use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::Queued;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
-use posix_process_service::shares::{Got, Shares};
+use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::terminals::Terminals;
 use posix_process_service::timers::{self, Timers};
@@ -325,6 +325,9 @@ struct Processes {
     /// (STEP), and whether a step was told and not taken.
     step: Option<Handle<Channel>>,
     step_told: bool,
+    /// Gets that wait for an object may be answered: the loop's own step
+    /// does it, a batch at a time (`share_step`).
+    share_wake: bool,
     /// The Create in its portions, and the place that tells the loop of the
     /// next one (CREATING).
     creating: Option<Creating>,
@@ -1315,15 +1318,29 @@ impl Processes {
         Ok(())
     }
 
-    /// Answers the Gets that waited for an object whose maker made it or
-    /// went: each asks the table again, the oldest first, and the first of
-    /// those whose maker went becomes the maker. O(WAITING * (WAITING +
-    /// SHARES)), at most WAITING answers; the table, a process that ended
-    /// and the Put and Detach call it.
+    /// Tells the loop that Gets which waited for an object whose maker made
+    /// it or went may be answered. The answers are the loop's own steps of
+    /// `shares::BATCH` each (`share_step`), so that a Put with all the
+    /// places of the table waiting is no step of 64 answers; the table, a
+    /// process that ended and the Put and Detach call it.
     fn wake_sharers(&mut self) {
-        while let Some((record, key, pending)) = self.shares.ready() {
-            // The grant stands until the answer; a caller whose grant is gone
-            // (it was replaced by newer ones) is refused as at the first ask.
+        self.share_wake = true;
+        self.kick();
+    }
+
+    /// One step of the answers to the waiting Gets: the oldest `BATCH` that
+    /// nobody makes the object for any more, each asking the table again
+    /// (the first of those whose maker went becomes the maker). More ready
+    /// leaves the wake on for the next step.
+    fn share_step(&mut self) {
+        let mut batch = [const { None }; shares::BATCH];
+        let (_, more) = self.shares.ready_batch(&mut batch);
+        self.share_wake = more;
+        for ready in batch.into_iter().flatten() {
+            let (record, key, pending) = ready;
+            // The grant stands until the answer and a pair with a waiting
+            // request keeps it; a caller with none is refused as at its
+            // first ask.
             let Some(write) = self.shares.granted(record, key) else {
                 let _ = pending.answer(
                     &proto_wire::reply(Status::from_code(proto_process::PERMISSION)),
@@ -1338,7 +1355,7 @@ impl Processes {
                 Taken::Failed(e) => {
                     let _ = pending.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new());
                 }
-                // `ready` leaves nothing that is made now.
+                // `ready_batch` leaves nothing that is made now.
                 Taken::Busy => {
                     let _ = Self::share_reply(pending, proto_process::SHARED_BUSY, None);
                 }
@@ -2136,7 +2153,10 @@ impl Processes {
     /// never comes.
     fn kick(&mut self) {
         if !self.step_told
-            && (self.tty_walk.is_some() || self.orphan_walk.is_some() || self.records.has_orphans())
+            && (self.tty_walk.is_some()
+                || self.orphan_walk.is_some()
+                || self.records.has_orphans()
+                || self.share_wake)
         {
             if self
                 .step
@@ -2149,6 +2169,11 @@ impl Processes {
                 let _ = w
                     .pending
                     .answer(&proto_wire::reply(status), Outgoing::new());
+            } else if self.share_wake {
+                // No step can be told: the answers go now, a batch at a time.
+                while self.share_wake {
+                    self.share_step();
+                }
             }
         }
         while !self.step_told && !self.walking.is_empty() {
@@ -2191,6 +2216,12 @@ impl Processes {
         if self.orphan_walk.is_some() || self.records.has_orphans() {
             rt::service::step_own();
             self.orphan_step();
+            self.kick();
+            return;
+        }
+        if self.share_wake {
+            rt::service::step_own();
+            self.share_step();
             self.kick();
             return;
         }

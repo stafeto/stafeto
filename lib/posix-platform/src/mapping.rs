@@ -10,6 +10,7 @@
 
 use super::call;
 use core::ffi::{c_int, c_void};
+#[cfg(feature = "map-probe")]
 use core::sync::atomic::{AtomicU32, Ordering};
 use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM};
 use posix_abi::mmap::{
@@ -21,18 +22,38 @@ const PAGE: usize = 4096;
 /// The pause in milliseconds a probe asks of the maker of a shared object
 /// between its mapping and its reading of the file (`stafeto_probe_fill_pause`),
 /// to hold the entry reserved while another process asks for it. 0 in a
-/// program.
+/// program. The hook is in the probes' builds alone (feature `map-probe`).
+#[cfg(feature = "map-probe")]
 static FILL_PAUSE_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Sets the pause of the maker of the next shared objects of this process.
+#[cfg(feature = "map-probe")]
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_fill_pause(milliseconds: u32) {
     FILL_PAUSE_MS.store(milliseconds, Ordering::Relaxed);
 }
 
-/// The probe's pause, if any.
+/// The pause in milliseconds between the vouching and the ask for the
+/// object, which opens the window of a second thread's vouching.
+#[cfg(feature = "map-probe")]
+static GRANT_PAUSE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the pause between the vouching and the ask of this process.
+#[cfg(feature = "map-probe")]
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_grant_pause(milliseconds: u32) {
+    GRANT_PAUSE_MS.store(milliseconds, Ordering::Relaxed);
+}
+
+/// The probe's pause before the file is read, if any.
+#[cfg(feature = "map-probe")]
 fn pause_before_fill() {
-    let ms = i64::from(FILL_PAUSE_MS.load(Ordering::Relaxed));
+    pause_ms(&FILL_PAUSE_MS);
+}
+
+#[cfg(feature = "map-probe")]
+fn pause_ms(pause: &AtomicU32) {
+    let ms = i64::from(pause.load(Ordering::Relaxed));
     if ms != 0 {
         let request = posix_types::Timespec {
             tv_sec: ms / 1000,
@@ -42,7 +63,19 @@ fn pause_before_fill() {
     }
 }
 
+#[cfg(not(feature = "map-probe"))]
+fn pause_before_fill() {}
+
+#[cfg(not(feature = "map-probe"))]
+fn pause_after_grant() {}
+
+#[cfg(feature = "map-probe")]
+fn pause_after_grant() {
+    pause_ms(&GRANT_PAUSE_MS);
+}
+
 /// relibc's CLOCK_MONOTONIC.
+#[cfg(feature = "map-probe")]
 const CLOCK_MONOTONIC: c_int = 1;
 /// The lowest number the layer's descriptors of mapped files take: near the
 /// top of the table, away from the numbers a program picks.
@@ -361,11 +394,24 @@ fn shared_file(
     // starts.
     posix_sync::enter();
     let _critical = Critical;
+    pause_after_grant();
+    // A writable mapping that is shared has one object: where the service
+    // cannot give it (no place to wait, no place for the entry, the grant
+    // gone) the mapping fails, since a private copy would hide the writes of
+    // the others. A mapping that only reads goes on with its own object.
+    let writable = prot & PROT_WRITE != 0;
     let got = if granted {
-        posix_abi::shares::get(key).ok()
+        match posix_abi::shares::get(key) {
+            Ok(got) => Some(got),
+            Err(_) if writable => return Err(ENOMEM),
+            Err(_) => None,
+        }
     } else {
         None
     };
+    if writable && matches!(got, Some(Got::Busy) | Some(Got::Full)) {
+        return Err(ENOMEM);
+    }
     let address = match got {
         Some(Got::Found(memory, covers)) if covers >= first + pages => {
             let address = mmap::mmap(addr, len, prot, flags, Some(source(Some(memory), true)))?;

@@ -400,6 +400,7 @@ name = "posix-map-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+ "posix-platform",
 ]
 
 [[package]]

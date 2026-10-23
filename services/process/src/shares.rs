@@ -56,12 +56,15 @@ pub const GRANTS: usize = 64;
 pub const GRANTS_PER_PROCESS: usize = 2;
 
 /// What a file service said of a process: it may map the shared memory of
-/// the file of `key`, for writing when `write`. Used once.
+/// the file of `key`, for writing when `write`. Used once for each vouching.
 #[derive(Clone, Copy)]
 struct Grant {
     record: u16,
     key: u64,
     write: bool,
+    /// The vouchings not used yet: the threads of a process that map one
+    /// file together vouch once each, and each answered Get uses one up.
+    count: u8,
     /// When it came, to find a process's oldest.
     age: u32,
 }
@@ -83,6 +86,11 @@ struct Waiting<W> {
 /// together (they share a grant), which take places of their own. No more
 /// than `WAITING` wait; the rest are answered Busy at once.
 pub const WAITING: usize = GRANTS;
+/// The places one process may hold: the threads that map one file together
+/// need a few, and one process cannot take the places of all the others.
+pub const WAITING_PER_PROCESS: usize = 4;
+/// The requests `ready_batch` gives at once.
+pub const BATCH: usize = 2;
 
 pub struct Shares<T, W> {
     entries: [Option<Entry<T>>; SHARES],
@@ -125,23 +133,41 @@ impl<T, W> Shares<T, W> {
     pub fn grant(&mut self, record: usize, key: u64, write: bool) -> bool {
         let record = record as u16;
         self.ages = self.ages.wrapping_add(1);
-        let own = |g: &Option<Grant>| g.is_some_and(|g| g.record == record);
-        let place = self
+        // A second vouching of the same pair (another thread of the process
+        // maps the file at once) counts up: the first answer must not take
+        // the other thread's grant with it.
+        if let Some(g) = self
             .grants
-            .iter()
-            .position(|g| g.is_some_and(|g| g.record == record && g.key == key))
-            .or_else(|| {
-                (self.grants.iter().filter(|g| own(g)).count() >= GRANTS_PER_PROCESS).then(|| {
-                    self.grants
+            .iter_mut()
+            .flatten()
+            .find(|g| g.record == record && g.key == key)
+        {
+            g.count = g.count.saturating_add(1);
+            g.write |= write;
+            g.age = self.ages;
+            return true;
+        }
+        let own = |g: &Option<Grant>| g.is_some_and(|g| g.record == record);
+        let full = self.grants.iter().filter(|g| own(g)).count() >= GRANTS_PER_PROCESS;
+        let place = if full {
+            // The oldest of its own that no request waits for.
+            self.grants
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| own(g))
+                .filter(|(_, g)| {
+                    let g = g.expect("own");
+                    !self
+                        .waiting
                         .iter()
-                        .enumerate()
-                        .filter(|(_, g)| own(g))
-                        .max_by_key(|(_, g)| self.ages.wrapping_sub(g.expect("own").age))
-                        .map(|(i, _)| i)
-                        .expect("two own grants")
+                        .flatten()
+                        .any(|w| w.record == g.record && w.key == g.key)
                 })
-            })
-            .or_else(|| self.grants.iter().position(Option::is_none));
+                .max_by_key(|(_, g)| self.ages.wrapping_sub(g.expect("own").age))
+                .map(|(i, _)| i)
+        } else {
+            self.grants.iter().position(Option::is_none)
+        };
         let Some(place) = place else {
             return false;
         };
@@ -149,16 +175,23 @@ impl<T, W> Shares<T, W> {
             record,
             key,
             write,
+            count: 1,
             age: self.ages,
         });
         true
     }
 
-    /// The grant is used: it is gone.
+    /// One vouching is used; the grant is gone with the last.
     pub fn revoke(&mut self, record: usize, key: u64) {
         for grant in &mut self.grants {
-            if grant.is_some_and(|g| usize::from(g.record) == record && g.key == key) {
-                *grant = None;
+            if let Some(g) = grant
+                && usize::from(g.record) == record
+                && g.key == key
+            {
+                g.count = g.count.saturating_sub(1);
+                if g.count == 0 {
+                    *grant = None;
+                }
             }
         }
     }
@@ -225,6 +258,15 @@ impl<T, W> Shares<T, W> {
     /// `key` waits for it (after a Get that said Busy). With no place left
     /// it comes back, and the caller answers Busy.
     pub fn wait(&mut self, key: u64, record: usize, data: W) -> Result<(), W> {
+        let held = self
+            .waiting
+            .iter()
+            .flatten()
+            .filter(|w| usize::from(w.record) == record)
+            .count();
+        if held >= WAITING_PER_PROCESS {
+            return Err(data);
+        }
         self.ages = self.ages.wrapping_add(1);
         let age = self.ages;
         match self.waiting.iter_mut().find(|w| w.is_none()) {
@@ -241,29 +283,75 @@ impl<T, W> Shares<T, W> {
         }
     }
 
-    /// The oldest waiting request that nobody makes the object for any more:
-    /// its entry is Ready, or gone with its maker. It leaves the table with
-    /// its record, key and `data`, and the caller asks `get` for it again:
-    /// the first of the requests of a key whose maker went gets the right to
-    /// make, and the others wait on. O(WAITING + SHARES).
-    pub fn ready(&mut self) -> Option<(usize, u64, W)> {
+    /// Up to N of the oldest waiting requests that nobody makes the object for
+    /// any more: their entry is Ready, or gone with its maker. They leave the
+    /// table into `out` with their record, key and `data`, and the caller
+    /// asks `get` for each again. Of the requests of a key whose maker went
+    /// only the oldest comes (it becomes the maker, `get` gives it Reserved),
+    /// the others wait on. Gives the count taken and whether more are ready.
+    /// One pass over the places and the entries, O(WAITING + SHARES) with
+    /// the few entries in use, and N picks over the places.
+    pub fn ready_batch<const N: usize>(
+        &mut self,
+        out: &mut [Option<(usize, u64, W)>; N],
+    ) -> (usize, bool) {
+        // The entries in use: key and whether it is made now.
+        let mut known = [(0u64, false); SHARES];
+        let mut count = 0;
+        for e in self.entries.iter().flatten() {
+            known[count] = (e.key, matches!(e.state, State::Making(_)));
+            count += 1;
+        }
+        // 0 closed, 1 the object is there, 2 its maker went.
+        let mut status = [0u8; WAITING];
+        for (state, w) in status.iter_mut().zip(&self.waiting) {
+            if let Some(w) = w {
+                *state = match known[..count].iter().find(|(k, _)| *k == w.key) {
+                    None => 2,
+                    Some((_, false)) => 1,
+                    Some((_, true)) => 0,
+                };
+            }
+        }
         let ages = self.ages;
-        let open = |entries: &[Option<Entry<T>>; SHARES], key: u64| {
-            !entries
-                .iter()
-                .flatten()
-                .any(|e| e.key == key && matches!(e.state, State::Making(_)))
-        };
-        let place = self
-            .waiting
-            .iter()
-            .enumerate()
-            .filter_map(|(i, w)| w.as_ref().map(|w| (i, w)))
-            .filter(|(_, w)| open(&self.entries, w.key))
-            .max_by_key(|(_, w)| ages.wrapping_sub(w.age))
-            .map(|(i, _)| i)?;
-        let w = self.waiting[place].take().expect("a waiting request");
-        Some((usize::from(w.record), w.key, w.data))
+        let mut claimed = [0u64; N];
+        let mut taken = 0;
+        while taken < N {
+            let mut best: Option<(usize, u32)> = None;
+            for (i, state) in status.iter().enumerate() {
+                let Some(w) = self.waiting[i].as_ref() else {
+                    continue;
+                };
+                let open = *state == 1 || (*state == 2 && !claimed[..taken].contains(&w.key));
+                let older = best.is_none_or(|(_, b)| ages.wrapping_sub(w.age) > b);
+                if open && older {
+                    best = Some((i, ages.wrapping_sub(w.age)));
+                }
+            }
+            let Some((i, _)) = best else {
+                break;
+            };
+            let w = self.waiting[i].take().expect("a waiting request");
+            if status[i] == 2 {
+                claimed[taken] = w.key;
+            }
+            out[taken] = Some((usize::from(w.record), w.key, w.data));
+            status[i] = 0;
+            taken += 1;
+        }
+        let more = status.iter().enumerate().any(|(i, state)| {
+            self.waiting[i]
+                .as_ref()
+                .is_some_and(|w| *state == 1 || (*state == 2 && !claimed[..taken].contains(&w.key)))
+        });
+        (taken, more)
+    }
+
+    /// The oldest ready request, as `ready_batch` gives it.
+    pub fn ready(&mut self) -> Option<(usize, u64, W)> {
+        let mut out = [None];
+        self.ready_batch::<1>(&mut out);
+        out[0].take()
     }
 
     /// The requests waiting.
@@ -515,28 +603,92 @@ mod tests {
         assert_eq!(t.get(7, 4, true), Got::Found(2, &9));
     }
 
-    /// The end of a process takes its waiting requests away, and the table
-    /// has WAITING places: the next request comes back unplaced.
+    /// The end of a process takes its waiting requests away; a process holds
+    /// WAITING_PER_PROCESS places and the table WAITING.
     #[test]
     fn a_waiter_that_ends_leaves_and_the_places_are_few() {
         let mut t = Shares::<u32, u32>::new();
         assert_eq!(t.get(7, 1, true), Got::Reserved);
         for i in 0..WAITING {
-            assert_eq!(t.wait(7, 2 + i % 3, i as u32), Ok(()));
+            assert_eq!(t.wait(7, 2 + i / WAITING_PER_PROCESS, i as u32), Ok(()));
         }
-        assert_eq!(t.wait(7, 9, 999), Err(999), "no place");
+        assert_eq!(t.wait(7, 2, 999), Err(999), "a process holds four");
+        assert_eq!(t.wait(7, 99, 999), Err(999), "no place left");
         t.drop_user(2);
-        assert_eq!(t.waiters(), WAITING - WAITING.div_ceil(3));
-        assert_eq!(t.wait(7, 9, 999), Ok(()));
-        t.drop_user(3);
-        t.drop_user(4);
-        t.drop_user(9);
+        assert_eq!(t.waiters(), WAITING - WAITING_PER_PROCESS);
+        assert_eq!(t.wait(7, 99, 999), Ok(()));
+        assert_eq!(t.wait(7, 99, 998), Ok(()));
+        for record in 3..2 + WAITING / WAITING_PER_PROCESS {
+            t.drop_user(record);
+        }
+        t.drop_user(99);
         assert_eq!(t.waiters(), 0);
         // A reader waits too, and gets the answer Full when the maker went.
         assert_eq!(t.wait(7, 5, 5), Ok(()));
         t.detach(7, 1);
         assert_eq!(t.ready(), Some((5, 7, 5)));
         assert_eq!(t.get(7, 5, false), Got::Full);
+    }
+
+    /// The threads of a process that map one file vouch once each, and the
+    /// answer to the first does not take the grant of the second; the grant
+    /// of a request that waits is not pushed out by newer ones.
+    #[test]
+    fn a_grant_counts_the_vouchings_of_a_pair() {
+        let mut t = Shares::<u32, u32>::new();
+        assert!(t.grant(1, 9, true));
+        assert!(t.grant(1, 9, false));
+        assert_eq!(t.granted(1, 9), Some(true));
+        assert_eq!(t.get(9, 1, true), Got::Reserved);
+        t.revoke(1, 9);
+        assert_eq!(t.granted(1, 9), Some(true), "the second thread's grant");
+        assert_eq!(t.get(9, 1, true), Got::Busy);
+        assert_eq!(t.wait(9, 1, 1), Ok(()));
+        // Two more keys: the table of the process is full, the pair with a
+        // waiting request is not the one that goes.
+        assert!(t.grant(1, 10, true));
+        assert!(t.grant(1, 11, true));
+        assert_eq!(t.granted(1, 9), Some(true));
+        assert_eq!(t.granted(1, 10), None, "the oldest without a waiter");
+        assert_eq!(t.granted(1, 11), Some(true));
+        // Every pair of the process with a waiter: no place.
+        assert_eq!(t.get(11, 1, true), Got::Reserved);
+        assert_eq!(t.get(11, 2, true), Got::Busy);
+        assert_eq!(t.wait(11, 1, 2), Ok(()));
+        assert!(!t.grant(1, 12, true));
+        t.revoke(1, 9);
+        assert_eq!(t.granted(1, 9), None);
+    }
+
+    /// A batch gives the oldest ready requests, at most N, one request of a
+    /// key whose maker went, and says whether more are ready.
+    #[test]
+    fn a_batch_gives_the_oldest_and_one_maker_a_key() {
+        let mut t = Shares::<u32, u32>::new();
+        assert_eq!(t.get(7, 1, true), Got::Reserved);
+        for (record, data) in [(2, 20), (3, 30), (4, 40), (5, 50)] {
+            assert_eq!(t.get(7, record, true), Got::Busy);
+            assert_eq!(t.wait(7, record, data), Ok(()));
+        }
+        let mut out = [None, None];
+        assert_eq!(t.ready_batch(&mut out), (0, false));
+        assert_eq!(t.put(7, 1, 3, 77), Ok(()));
+        assert_eq!(t.ready_batch(&mut out), (2, true));
+        assert_eq!(out, [Some((2, 7, 20)), Some((3, 7, 30))]);
+        let mut out = [None, None];
+        assert_eq!(t.ready_batch(&mut out), (2, false));
+        assert_eq!(out, [Some((4, 7, 40)), Some((5, 7, 50))]);
+        // The maker goes: of three waiters of one key only the oldest comes.
+        let mut t = Shares::<u32, u32>::new();
+        assert_eq!(t.get(8, 1, true), Got::Reserved);
+        for (record, data) in [(2, 20), (3, 30), (4, 40)] {
+            assert_eq!(t.get(8, record, true), Got::Busy);
+            assert_eq!(t.wait(8, record, data), Ok(()));
+        }
+        t.detach(8, 1);
+        let mut out = [None, None];
+        assert_eq!(t.ready_batch(&mut out), (1, false));
+        assert_eq!(out[0], Some((2, 8, 20)));
     }
 
     /// A full table makes the caller go without registering; an attach of a

@@ -4585,7 +4585,7 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let outcome = run_until(
         cmd,
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         Some("init: posix-procs ended:"),
         &kernel.elf,
     )?;
@@ -8125,6 +8125,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // overruns.
         job("posix-threads smp 4", || {
             qemu::on_cpus(SMP_CPUS, || posix_thread_probe(false))
+        }),
+        job("posix-map smp 4", || {
+            qemu::on_cpus(SMP_CPUS, posix_map_probe)
         }),
         job("posix-procs smp 4", || {
             qemu::on_cpus(SMP_CPUS, || posix_procs_probe(&qemu::VIRT))
