@@ -891,103 +891,97 @@ why = "the loops of a turn of the way out that frees retired objects: the epochs
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x40c"
+at = "0x428"
 bound = 9
 why = "the waiters of one portion of the stage Close of a channel: CLOSE_PORTION = 8 units, one for each head at least, and the look that ends the loop (channel::clean)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x610"
+at = "0x62c"
 bound = 4
 why = "the handles a message carries: abi::MESSAGE_HANDLES = 4"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x620"
+at = "0x63c"
 bound = 4
 why = "the handles a message carries: abi::MESSAGE_HANDLES = 4 (the walk over the empty places of the array)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xa10"
+at = "0xa4c"
 bound = 7
 why = "the frames one step of a page list gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (kcore::pagelist::PageList::release_collect)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xab0"
+at = "0xaec"
 bound = 7
 why = "the pages one step of a page log gives back: FRAMES_PER_SECTION = 6 and the look that ends the loop (the stage Shell)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0xe4c"
+at = "0xe8c"
 bound = 64
 why = "the entries of one chunk of the handle table that a step of the stage Handles looks at: CHUNK = 64"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x174c"
-bound = 1
-why = "the jump through the table of the match over the stages of a process after its section was taken: the table has no entry that leads back to it; the read of the table in the image puts one"
-
-[[loop]]
-function = "kernel::cleanup::portion"
-at = "0x1770"
+at = "0x1854"
 bound = 8
 why = "the epochs of the CPUs a retired object waits for: at most MAX_CPUS = 8 (qsbr::GRACE)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x17b0"
+at = "0x18a0"
 bound = 8
 why = "one SGI for each CPU that has something to take: at most MAX_CPUS = 8"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x187c"
+at = "0x1960"
 bound = 7
 why = "the frames of one portion that go back to the allocator: FRAMES_PER_SECTION = 6 (memory::clean, the stage Shell)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x18e0"
+at = "0x19c4"
 bound = 8
 why = "the units of one portion of the stage Buffers: BUFFERS_PORTION = 8 (a thread is two units at least)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1978"
+at = "0x1a68"
 bound = 8
 why = "looks again at the queue of the CPU that owns the item, which another CPU may have changed meanwhile: at most one change for each of the 8 CPUs (cleanup::lift, process::begin)"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x19e8"
+at = "0x1ad4"
 bound = 128
 why = "the entries of the table of mappings that the stage Mappings looks at in a portion: abi::MAX_MAPPINGS = 128"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1a54"
+at = "0x1b40"
 bound = 33
 why = "the clients of one portion of the stage Replies: REPLIES_PORTION = 32 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1dc0"
+at = "0x1ef0"
 bound = 13
 why = "the units of one portion of the stage Threads: THREADS_PORTION = 12 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1e84"
+at = "0x1fb4"
 bound = 33
 why = "the threads of one portion of the continuation of a suspended process: UNPARK_PORTION = 32 and the look that ends the loop"
 
 [[loop]]
 function = "kernel::cleanup::portion"
-at = "0x1c4c"
+at = "0x1d30"
 bound = 128
 why = "the slots of one page of a pool that the stage Shell looks at before the page goes back: a page of 4096 bytes holds at most 128 slots of 32 bytes (kcore::slab)"
 

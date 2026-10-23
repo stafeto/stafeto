@@ -1401,7 +1401,10 @@ pub const POLICY_TAIL: u64 = 1 << 8;
 /// `thread_create` x5: the policy in bits 0-7 and, in bits 16-23, the CPU
 /// the thread runs on, plus one. Zero is the CPU of the creating thread; a
 /// number past the CPUs that are up is INVALID_ARGS. The thread stays on that
-/// CPU: the kernel never moves a thread by itself.
+/// CPU: the kernel never moves a thread by itself. A CPU outside the CPU mask
+/// of the target process (`process_create` x8) is ACCESS_DENIED; with no CPU
+/// asked, the thread goes to the creator's CPU when the mask has it and to
+/// the lowest CPU of the mask otherwise (spec 8).
 pub const THREAD_CPU_SHIFT: u32 = 16;
 
 /// Errors of system calls (spec 12), each with its code in x0; zero means

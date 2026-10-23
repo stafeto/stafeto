@@ -2656,6 +2656,76 @@ static int setid_spawn(void) {
     return bad;
 }
 
+/* The share of thread numbers of the process service (kernel spec 7.5,
+ * #354, role `shares`; the table gives the service 24 of them, and its own
+ * threads and this program's main thread take some). The program makes
+ * threads, each holding its number and a timer, until pthread_create says
+ * EAGAIN, as {PTHREAD_THREADS_MAX} lets it; while it holds them fork and
+ * posix_spawn, whose child needs a thread of its own, say EAGAIN too, and a
+ * file of the RAM service, which the share of the process service does not
+ * pay for, is read. Once the threads ended their numbers are back and fork
+ * works again. */
+static volatile int shares_stop;
+
+/* The program started with the role `shares-main` (the table of the probe
+ * of shares) runs the role `shares` as a child from its file, where fork is
+ * the layer's. */
+static int shares_main(void) {
+    pid_t child = -1;
+    expect("spawn of the role shares", spawn(&child, "shares", NULL, NULL), 0);
+    if (child > 0) reap("the role shares", child, 0, 0);
+    return failures != 0;
+}
+
+static void *shares_holder(void *arg) {
+    (void)arg;
+    while (!shares_stop) pause_ms(2);
+    return NULL;
+}
+
+static int shares_role(void) {
+    enum { MAX = 100 };
+    pthread_t threads[MAX];
+    int made = 0, e = 0;
+    while (made < MAX) {
+        e = pthread_create(&threads[made], NULL, shares_holder, NULL);
+        if (e != 0) break;
+        made++;
+    }
+    expect("pthread_create at the end of the share", e, EAGAIN);
+    /* The share is 24 (the layer's own bound is 32 threads): the service's
+     * own threads and the main thread of this program are in it, so there
+     * are fewer, and more than a few. */
+    expect("the threads made fit the share", made >= 8 && made < 24, 1);
+    pid_t pid = -1;
+    errno = 0;
+    pid = fork();
+    if (pid == 0) _exit(1);
+    expect("fork past the share", pid < 0 ? errno : 0, EAGAIN);
+    if (pid > 0) waitpid(pid, NULL, 0);
+    pid = -1;
+    expect("posix_spawn past the share", spawn(&pid, "exit7", NULL, NULL), EAGAIN);
+    int file = open("/bin/procs-child", O_RDONLY);
+    char byte = 0;
+    expect("a file of the RAM service opens past the share", file >= 0, 1);
+    expect("a file of the RAM service reads past the share", file >= 0 && read(file, &byte, 1) == 1, 1);
+    if (file >= 0) close(file);
+    shares_stop = 1;
+    for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+    /* The numbers of the threads that ended come back with the threads. */
+    errno = 0;
+    pid = fork();
+    if (pid == 0) _exit(0);
+    expect("fork after the threads ended", pid > 0, 1);
+    if (pid > 0) {
+        int status = 0;
+        expect("the wait for the child of fork", waitpid(pid, &status, 0) == pid && status == 0, 1);
+    }
+    if (!failures)
+        printf("posix-procs: shares: EAGAIN at the share, fork and spawn refused, a file read, fork again\n");
+    return failures != 0;
+}
+
 #include "faults.c"
 #include "timers.c"
 #if !CHANGE_STEPS
@@ -2673,6 +2743,8 @@ static int role(const char *name) {
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
     if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
 #endif
+    if (strcmp(name, "shares") == 0) return shares_role();
+    if (strcmp(name, "shares-main") == 0) return shares_main();
     if (strcmp(name, "faults") == 0) return faults_role();
 #if !CHANGE_STEPS
     if (strcmp(name, "timers") == 0) return timers_role();

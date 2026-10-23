@@ -684,9 +684,25 @@ fn decode_jumps(image: &Image, f: usize) -> BTreeMap<u64, Jump> {
             jumps.insert(insn.addr, Jump::Function(g));
         }
     }
-    let mut starts: Vec<u64> = specs.iter().map(|(_, s)| s.table).collect();
-    starts.sort_unstable();
-    starts.dedup();
+    // A table of this function ends where the next table of the image
+    // begins, a table of another function included: the entries that follow
+    // the last one are another table's, which only read as targets of this
+    // function by the luck of the layout of the data.
+    let starts = image.table_starts.get_or_init(|| {
+        let mut starts: Vec<u64> = Vec::new();
+        for function in &image.functions {
+            for (i, insn) in function.insns.iter().enumerate() {
+                if insn.flow() == Flow::IndirectJump
+                    && let Some(spec) = table_spec(&function.insns, i)
+                {
+                    starts.push(spec.table);
+                }
+            }
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        starts
+    });
     for (at, spec) in specs {
         let limit = starts
             .iter()
@@ -2412,6 +2428,62 @@ at = \"+0x4\"
 bound = 8
 why = \"a test\"
 ";
+
+    /// Two functions that jump through a table each, the tables one after
+    /// the other in the data: the first ends where the second begins. The
+    /// entries of the second, read as offsets from the base of the first,
+    /// land on instructions of its function as well, so a table that ran on
+    /// until an entry did not (the way a table ended before) would take them.
+    const TWO_TABLES: &str = "\
+ffffffffc0000000 <f>:
+ffffffffc0000000:      \tadr\tx9, 0xffffffffc0001000 <tf>
+ffffffffc0000004:      \tadr\tx10, 0xffffffffc0000004 <f+0x4>
+ffffffffc0000008:      \tldrsw\tx11, [x9, x15, lsl #2]
+ffffffffc000000c:      \tadd\tx10, x10, x11
+ffffffffc0000010:      \tbr\tx10
+ffffffffc0000014:      \tret
+ffffffffc0000018:      \tret
+ffffffffc000001c:      \tret
+ffffffffc0000030 <g>:
+ffffffffc0000030:      \tadr\tx9, 0xffffffffc0001008 <tg>
+ffffffffc0000034:      \tadr\tx10, 0xffffffffc0000034 <g+0x4>
+ffffffffc0000038:      \tldrsw\tx11, [x9, x15, lsl #2]
+ffffffffc000003c:      \tadd\tx10, x10, x11
+ffffffffc0000040:      \tbr\tx10
+ffffffffc0000044:      \tret
+ffffffffc0000048:      \tret
+ffffffffc000004c:      \tret
+";
+
+    #[test]
+    fn a_table_ends_where_the_next_table_of_the_image_begins() {
+        let mut image = Image::parse(TWO_TABLES).unwrap();
+        // The table of f: offsets 0x10 and 0x14 from 0x4, the targets 0x14
+        // and 0x18. The table of g follows: offsets 0xc and 0x18 from 0x34,
+        // the targets 0x40 and 0x4c of g; read from the base of f they are
+        // 0x10 and 0x1c, which are instructions of f.
+        let words: [i32; 4] = [0x10, 0x14, 0x0c, 0x18];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        image.sections = vec![(0xffff_ffff_c000_1000, bytes)];
+        let f = image.by_name("f").unwrap();
+        let jumps = decode_jumps(&image, f);
+        let tables: Vec<&Vec<u64>> = jumps
+            .values()
+            .filter_map(|j| match j {
+                Jump::Table(targets) => Some(targets),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tables,
+            [&vec![0xffff_ffff_c000_0014, 0xffff_ffff_c000_0018]]
+        );
+        let g = image.by_name("g").unwrap();
+        let jumps = decode_jumps(&image, g);
+        assert!(jumps.values().any(
+            |j| matches!(j, Jump::Table(targets) if *targets == [0xffff_ffff_c000_0040, 0xffff_ffff_c000_004c])
+        ));
+    }
 
     #[test]
     fn annotations_parse_the_subset_of_toml() {

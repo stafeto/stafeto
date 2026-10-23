@@ -24,7 +24,7 @@
 //! the reset is done; on VZ the Virtio reset and the command word 0, as
 //! for the console (vz.rs).
 
-use super::{Binding, Dma, Gate, Kind, Record, Restart, Window, Write};
+use super::{Binding, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Window, Write};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -97,6 +97,8 @@ pub const RNG: Record = Record {
     }],
     trusted: true,
     root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
 };
 
 /// The driver on VZ.
@@ -173,6 +175,8 @@ pub const ENTROPY: Record = Record {
     quiesce: &[],
     trusted: false,
     root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
 };
 
 /// The probe: seeds that wait for the first bytes, a seed and the seeds at
@@ -198,6 +202,8 @@ const PROBE: Record = Record {
     quiesce: &[],
     trusted: false,
     root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
 };
 
 /// A second client of the service: its key differs from the first's; on

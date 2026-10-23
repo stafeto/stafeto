@@ -138,6 +138,11 @@ pub struct Record<P> {
     pub sample_asleep: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
+    /// The CPUs its process runs on (kernel spec 8, process_create x8):
+    /// the record of init's table for a process init knows, and the
+    /// parent's for a child of fork or spawn; exec keeps it. Every process
+    /// the service makes gets it explicitly, so that it stays inside it.
+    pub cpus: u8,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -491,6 +496,7 @@ impl<P> Records<P> {
             sample_at: 0,
             sample_asleep: false,
             cpu: 0,
+            cpus: parent.map_or(0, |p| self.records[p].as_ref().unwrap().cpus),
             children_ticks: 0,
             carried_kernel: 0,
             children_kernel: 0,
@@ -1382,6 +1388,7 @@ mod tests {
                 ceiling,
                 priority: ceiling,
                 root: false,
+                cpus: 0,
                 ticket: 0,
             };
             let place = exit_place(label, &create, loop_level);

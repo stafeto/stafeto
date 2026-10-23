@@ -4,7 +4,7 @@
 //! A table init refuses (feature `table-ceiling`, spec 15.2): a client
 //! whose ceiling, 50, is above the service it connects to, at 40.
 
-use super::{Kind, Record, Restart};
+use super::{GENERAL_CPUS, Kind, Record, Restart, Shares};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -32,6 +32,8 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     },
     Record {
         name: "high",
@@ -53,5 +55,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     },
 ];

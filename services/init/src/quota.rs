@@ -12,6 +12,7 @@
 
 use crate::PAGE;
 use crate::restart::{PAUSE_FIRST_NS, PAUSE_MAX_NS};
+use crate::table::Shares;
 use bootimg::Program;
 
 /// The pages of init's pools an instance takes: its shell, the memory
@@ -40,6 +41,15 @@ pub fn fits(free: u64, need: u64) -> bool {
     free >= need
 }
 
+/// Whether the free part of init's own shares, `free` thread numbers and
+/// timer places (object_info PROCESS_SHARES of init's process), covers the
+/// `shares` an instance takes of them (spec 7.5): the rest of the shares
+/// of an instance that ended comes back only when its clients let go of it,
+/// as its quota does.
+pub fn shares_fit(free: (u64, u64), shares: Shares) -> bool {
+    free.0 >= u64::from(shares.threads) && free.1 >= u64::from(shares.timers)
+}
+
 /// When an instance starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
@@ -51,11 +61,13 @@ pub enum Start {
 }
 
 /// Whether an instance that needs `need` pages starts with `free` pages of
-/// init's quota free: now, when they fit; otherwise after twice the pause
-/// its record waited before this look, `pause_ns` (0 before a first
-/// start), from PAUSE_FIRST_NS up to PAUSE_MAX_NS.
-pub fn start(free: u64, need: u64, pause_ns: u64) -> Start {
-    if fits(free, need) {
+/// init's quota free and, when `shares_ok`, with its shares of thread
+/// numbers and timer places free (`shares_fit`): now, when they fit;
+/// otherwise after twice the pause its record waited before this look,
+/// `pause_ns` (0 before a first start), from PAUSE_FIRST_NS up to
+/// PAUSE_MAX_NS.
+pub fn start(free: u64, need: u64, shares_ok: bool, pause_ns: u64) -> Start {
+    if shares_ok && fits(free, need) {
         Start::Now
     } else {
         Start::Wait {
@@ -116,14 +128,14 @@ mod tests {
         let need = need_pages(20 * PAGE, &program());
         assert!(fits(need, need));
         assert!(!fits(need - 1, need));
-        assert_eq!(start(need, need, 0), Start::Now);
-        assert_eq!(start(u64::MAX, need, 800 * MS), Start::Now);
+        assert_eq!(start(need, need, true, 0), Start::Now);
+        assert_eq!(start(u64::MAX, need, true, 800 * MS), Start::Now);
         // Short: the pause doubles from 100 ms up to 5 s, from a first
         // start and from the pause of a restart.
         let mut pause = 0;
         let mut waits = Vec::new();
         for _ in 0..8 {
-            let Start::Wait { pause_ns } = start(need - 1, need, pause) else {
+            let Start::Wait { pause_ns } = start(need - 1, need, true, pause) else {
                 panic!("a start that falls short went on");
             };
             waits.push(pause_ns / MS);
@@ -131,10 +143,29 @@ mod tests {
         }
         assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 5000, 5000]);
         assert_eq!(
-            start(0, need, 800 * MS),
+            start(0, need, true, 800 * MS),
             Start::Wait {
                 pause_ns: 1600 * MS
             }
         );
+        // Shares that fall short make a start wait however much quota is
+        // free, and shares of none always fit.
+        assert_eq!(
+            start(u64::MAX, need, false, 0),
+            Start::Wait { pause_ns: 100 * MS }
+        );
+    }
+
+    #[test]
+    fn shares_fit_while_init_has_them_free() {
+        let own = Shares {
+            threads: 768,
+            timers: 6144,
+        };
+        assert!(shares_fit((768, 6144), own));
+        assert!(!shares_fit((767, 6144), own));
+        assert!(!shares_fit((768, 6143), own));
+        assert!(shares_fit((0, 0), Shares::CREATOR));
+        assert!(shares_fit((896, 7168), own));
     }
 }

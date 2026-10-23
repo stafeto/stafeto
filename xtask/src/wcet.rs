@@ -132,6 +132,11 @@ struct Image {
     /// The bytes of the sections that load: address and contents, for the
     /// tables of a `match` that the code jumps through.
     sections: Vec<(u64, Vec<u8>)>,
+    /// The address of every table of a `match` that some jump of the image
+    /// goes through, sorted: a table ends where the next one begins, in
+    /// whatever function that one is (`bound::decode_jumps`). Found when
+    /// first asked for.
+    table_starts: std::sync::OnceLock<Vec<u64>>,
 }
 
 /// The sections of a 64-bit little-endian ELF file that take memory and have
@@ -235,6 +240,7 @@ impl Image {
             landings: vec![BTreeSet::new(); functions.len()],
             functions,
             sections: Vec::new(),
+            table_starts: std::sync::OnceLock::new(),
         };
         for (f, function) in image.functions.iter().enumerate() {
             for insn in &function.insns {

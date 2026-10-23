@@ -5,7 +5,7 @@
 //! PL011, the console's port (services/uart), and the shell (apps/shell),
 //! its one client.
 
-use super::{Binding, Kind, Record, Restart, Window};
+use super::{Binding, GENERAL_CPUS, Kind, Record, Restart, Shares, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -49,6 +49,8 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     },
     // No heartbeat: it waits for input and has no periodic work (spec
     // 13.6); the console only for the message of its panic.
@@ -72,5 +74,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     },
 ];

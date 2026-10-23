@@ -3,7 +3,7 @@
 
 //! RAM file service and its guest probe in a dedicated boot image.
 
-use super::{Kind, Record, Restart, Window};
+use super::{ALL_CPUS, GENERAL_CPUS, Kind, POSIX_SHARES, Record, Restart, Shares, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -47,6 +47,8 @@ const RAM_BASE: Record = Record {
     quiesce: &[],
     trusted: false,
     root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
 };
 
 /// Standalone RAM probes use an explicit deterministic source.
@@ -90,6 +92,8 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     },
 ];
 
@@ -103,6 +107,11 @@ pub const TABLE: &[Record] = &[
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     handle_limit: 512,
+    // The images of these tables have no tasks of realtime: the four CPUs
+    // are the load of the tests, which would lose CPUs 2 and 3 with the
+    // CPUs of the services. The images of the shell keep GENERAL_CPUS
+    // (BUSYBOX_DIALOG_TABLE).
+    cpus: ALL_CPUS,
     ..TABLE[1]
 };
 
@@ -146,6 +155,8 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
         args: b"ash-launch\0",
         connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         quota: BUSYBOX_DIALOG_QUOTA,
+        // The shell and its commands run on the CPUs of the services.
+        cpus: GENERAL_CPUS,
         ..BUSYBOX_TABLE[3]
     },
     TTY,
@@ -377,6 +388,11 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         restart: Restart::Never,
         // Loader roots, obtained at startup and narrowed for each loader.
         connects: &["ramfs", "clock"],
+        // Every POSIX process pays from its share and runs on its CPUs
+        // (kernel spec 7.5, 8): all of them, so that it can give a process
+        // the CPUs of its record.
+        shares: POSIX_SHARES,
+        cpus: ALL_CPUS,
         ..RAM_BASE
     },
     Record {
@@ -507,6 +523,35 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     },
     super::entropy::RNG,
     super::entropy::ENTROPY,
+];
+
+/// The share of thread numbers the process service has in the probe of
+/// shares: few enough for a probe to use up in a moment (kernel spec 7.5).
+pub const SHARES_PROBE_THREADS: u32 = 24;
+
+/// The probe of the shares of the process service (tests/posix-procs, the
+/// role `shares`, #354): the table of POSIX_PROCS_TABLE with a share of
+/// SHARES_PROBE_THREADS thread numbers for the service. The probe makes
+/// threads until pthread_create says EAGAIN, finds fork and posix_spawn
+/// refused with EAGAIN while it holds them and a file of the RAM service
+/// still read, and finds fork working after its threads ended.
+pub const POSIX_SHARES_TABLE: &[Record] = &[
+    POSIX_PROCS_TABLE[0],
+    Record {
+        shares: Shares {
+            threads: SHARES_PROBE_THREADS,
+            timers: POSIX_SHARES.timers,
+        },
+        ..POSIX_PROCS_TABLE[1]
+    },
+    POSIX_PROCS_TABLE[2],
+    POSIX_PROCS_TABLE[3],
+    Record {
+        args: b"posix-procs\0shares-main\0",
+        ..POSIX_PROCS_TABLE[4]
+    },
+    POSIX_PROCS_TABLE[5],
+    POSIX_PROCS_TABLE[6],
 ];
 
 /// The probe of the longest step of the process service (tests/posix-procs

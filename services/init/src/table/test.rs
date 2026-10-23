@@ -10,7 +10,7 @@
 //! Services send a heartbeat every 20 ms; the client `checker` runs the
 //! tests, prints their lines, and ends: its policy is never.
 
-use super::{Binding, Kind, Record, Restart, Window};
+use super::{Binding, GENERAL_CPUS, Kind, Record, Restart, Shares, Window};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -44,6 +44,8 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         quiesce: &[],
         trusted: false,
         root: false,
+        shares: Shares::CREATOR,
+        cpus: GENERAL_CPUS,
     }
 }
 

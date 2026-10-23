@@ -181,19 +181,23 @@ thread whose wake is on its way (`info_in_flight`).
 
 - `object_info` CPU (kind 15, no handle and no lock) gives the CPUs up, the
   ticks of one CPU since it started, those it slept in `wfi` and those its
-  entries from EL0 spent in the kernel, and the caller's CPU. The owner of
+  entries from EL0 spent in the kernel, the caller's CPU and, in x6, the CPU
+  mask of the caller's process (below). The owner of
   a CPU counts the ticks of its entries when the entry polls (`Local::time`,
   3 instructions on the path of the null call) and its sleeps in `sleep`;
   the other CPUs read the words with one load each.
-- `sysconf(_SC_NPROCESSORS_CONF)` and `_SC_NPROCESSORS_ONLN`, `sched_getaffinity`
-  and the listing of `/sys/devices/system/cpu` (which BusyBox `nproc --all`
-  and htop count) give the CPUs that are up. `/proc/stat` has a line `cpuN`
+- `sysconf(_SC_NPROCESSORS_CONF)` and `_SC_NPROCESSORS_ONLN` and the listing
+  of `/sys/devices/system/cpu` (which htop counts) give the CPUs that are up;
+  `sched_getaffinity` (and so BusyBox `nproc`) gives the CPUs the process may
+  use, its mask in the kernel (below) cut by the mask of its page.
+  `/proc/stat` has a line `cpuN`
   for each CPU (user, system and idle from that call) and `/proc/cpuinfo` a
   record for each; the field `processor` of `/proc/<pid>/stat` is the CPU of
   the process's main thread.
 - The process service puts the main thread of every new image (spawn, fork
   and exec) on the least busy CPU of the mask its page allows
-  (`Page::cpus`, 0 for all). A CPU is busy when it was awake a quarter of
+  (`Page::cpus`, 0 for all) within the CPUs of its record in the service
+  (`Record::cpus`, below). A CPU is busy when it was awake a quarter of
   the last window of 10 ms (the time asleep from `object_info` CPU, read once
   per CPU when a window closes) and each image put on it in the last two
   windows counts as one more; among equals the CPU after the last choice wins,
@@ -201,13 +205,48 @@ thread whose wake is on its way (`info_in_flight`).
   record, so it costs the same with a hundred processes (`process-steps`
   places on one CPU too, with 248 children live). A thread starts on the CPU of its creator or, when
   the mask does not allow that, on the lowest CPU it names.
-  `sched_setaffinity` writes the mask of its process: the kernel moves no
-  thread, so the mask works for the threads made later and for the next exec
-  (`taskset -c N command`).
-- `cargo xtask cpus-dialog [N]` runs the dialog on N CPUs: `nproc`, the CPU
-  lines, `taskset -p`, one loop per CPU on different CPUs, the busy time of
-  each CPU, a command under `taskset -c` and htop with a meter for each CPU.
-  `ci` runs it on 1 and on 4 CPUs.
+  `sched_setaffinity` writes the mask of its process to its page, within the
+  mask the kernel gave the process (EINVAL for a mask with none of those
+  CPUs): the kernel moves no thread, so the mask works for the threads made
+  later and for the next exec (`taskset -c N command`).
+- **The CPU mask of a process (#419).** A process has a mask of the CPUs
+  its threads run on, set by its creator (`process_create` x8: 0 is the
+  creator's own, otherwise a subset of it, ACCESS_DENIED for more) and never
+  changed. `thread_create` refuses an explicit CPU outside it with
+  ACCESS_DENIED, and a thread with no CPU asked goes to the CPU of the
+  caller when the mask has it, otherwise to the lowest CPU of the mask, so
+  that every thread of a process stays inside it (nothing moves a thread
+  after it started). `init` gives each record the mask of the table
+  (`Record::cpus`) cut to the CPUs that are up: the services, the drivers and
+  the processes of the shell stand on `GENERAL_CPUS`, CPUs 0 and 1, and the
+  CPUs 2 and 3 are left for the hard tasks of realtime (`RT_CPUS`, records
+  that the tables do not have yet), where no ordinary process runs. The
+  process service has every CPU, so that it can give a POSIX process the CPUs
+  of its record: `init` passes the mask in ADOPT, and the service passes
+  it explicitly to each child of fork, spawn and exec (an `x8` of 0 would give
+  the child the service's own, every CPU). The test images that need the
+  four CPUs for their load give their POSIX records `ALL_CPUS`. On four
+  CPUs `nproc` in the shell says 2, and `taskset -c 3` is refused.
+- **The shares of thread numbers and timers (#354).** The 1,024 thread
+  numbers of the system and its 8,192 timers are shared out like the memory
+  quota (kernel spec 7.5): a process created with `x6` and `x7` has counts of
+  its own, taken off those of its creator's payer, and a process without
+  them pays from the counts of its creator's payer. `init` has all of them;
+  the process service has 768 numbers and 6,144 timers, so the POSIX
+  processes, which the service makes without shares, cannot take a number or
+  a timer from a driver, a service or a hard task, and the table checks that
+  the shares add up to the system's less 128 numbers and 1,024 timers for
+  `init`. A thread or a timer past the share is LIMIT_REACHED, which the
+  POSIX layer shows as EAGAIN (`pthread_create`, `fork`, `posix_spawn`).
+  `cargo xtask posix-shares` gives the service 24 numbers and finds
+  `pthread_create`, `fork` and `posix_spawn` refused with EAGAIN at the end of
+  them, a file of the RAM service still read, and `fork` working again once
+  the threads ended.
+- `cargo xtask cpus-dialog [N]` runs the dialog on N CPUs: `nproc` (the
+  first two CPUs, or one), the CPU lines, `taskset -p`, one loop per CPU of
+  the mask on different CPUs, the busy time of each, a command under
+  `taskset -c` on the last CPU of the mask, `taskset -c 3` refused and htop
+  with a meter for each CPU. `ci` runs it on 1 and on 4 CPUs.
 
 ## Not on several CPUs
 

@@ -322,6 +322,21 @@ extern "C" fn work(_: u64) -> ! {
 }
 
 /// Loads an instance of `record` from `program` with the label `label` on
+/// The CPU mask of an instance of `record` (process_create x8, kernel spec
+/// 13.4): the mask of the record cut to the CPUs that are up. A record none
+/// of whose CPUs is up gets all that are, and a line says so.
+pub fn cpus_of(record: &Record) -> u8 {
+    let up = sys::cpu_info(0).map_or(1, |info| (1u32 << info.cpus.clamp(1, 8)) - 1);
+    let (mask, kept) = init::table::on_cpus(record.cpus, up as u8);
+    if !kept {
+        rt::println!(
+            "init: {} names no CPU that is up: it runs on all of them",
+            record.name
+        );
+    }
+    mask
+}
+
 /// init's channel (rt::loader::spawn): `quota` (the record's, and more for
 /// the process service, serve.rs), room for handles, ceiling and priority
 /// from the record, the notification of its end at its base priority
@@ -343,8 +358,11 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
         // the shell on CPU 0 across CPUs (SMP stage 4); with one CPU the
         // loader leaves it on CPU 0.
         cpu: if record.log { 2 } else { 0 },
-        shares: sys::Shares::CREATOR,
-        cpus: 0,
+        shares: sys::Shares {
+            threads: record.shares.threads,
+            timers: record.shares.timers,
+        },
+        cpus: cpus_of(record),
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;

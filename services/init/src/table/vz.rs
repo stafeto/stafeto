@@ -17,7 +17,7 @@
 //! trusted, and init resets the device and clears its command word before
 //! the DMA object of an instance that ended goes.
 
-use super::{Binding, Dma, Gate, Kind, Record, Restart, Window, Write};
+use super::{Binding, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Window, Write};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -109,6 +109,8 @@ pub const CONSOLE: Record = Record {
     ],
     trusted: true,
     root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
 };
 
 pub const TABLE: &[Record] = &[

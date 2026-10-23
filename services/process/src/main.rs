@@ -532,6 +532,16 @@ fn cpu_ticks(record: &Record<Handle<Process>>) -> (u64, u64) {
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
+/// The CPUs a process may use: the mask of its page (`Page::cpus`, 0 for
+/// all) within the mask of its record (`Record::cpus`, 0 where none is
+/// known), and the record's when the page names none of them.
+fn allowed_cpus(page: u64, record: u64) -> u64 {
+    match page & if record == 0 { u64::MAX } else { record } {
+        0 => record,
+        mask => mask,
+    }
+}
+
 /// The status of a failed call of groups and sessions.
 const fn group_error(e: GroupError) -> u32 {
     match e {
@@ -572,6 +582,12 @@ impl Processes {
         else {
             return Answer::Status(Status::BadSize);
         };
+        // A mask of 0 is the service's own: every CPU it may use.
+        let cpus = if create.cpus == 0 {
+            sys::cpu_info(0).map_or(1, |info| info.allowed as u8)
+        } else {
+            create.cpus
+        };
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
         };
@@ -589,7 +605,7 @@ impl Processes {
                     Some((&exit, place.notice)),
                     Some(start),
                     sys::Shares::CREATOR,
-                    0,
+                    cpus,
                 )
                 .map_err(|(e, _)| e)
             });
@@ -622,6 +638,7 @@ impl Processes {
                 record.groups.ids[0] = 0;
             }
             record.handle_limit = create.handle_limit;
+            record.cpus = cpus;
         }
         self.witnesses[index] = Some(witness);
         self.tickets[index] = create.ticket;
@@ -2730,6 +2747,7 @@ impl Processes {
             ceiling: parent.ceiling,
             priority: birth.level.clamp(1, parent.ceiling),
             root: false,
+            cpus: parent.cpus,
             ticket: 0,
         };
         // The child's quota comes from the service's: the pool, past which
@@ -2751,7 +2769,7 @@ impl Processes {
                     Some((&exit, place.notice)),
                     Some(session),
                     sys::Shares::CREATOR,
-                    0,
+                    create.cpus,
                 )
                 .map_err(|(e, _)| e)
             },
@@ -2876,10 +2894,12 @@ impl Processes {
 
     /// The CPU for the main thread of the image of the record `child`
     /// (spawn, fork and exec): the least busy of the CPUs its page allows
-    /// (`Page::cpus`, all when 0), the next after the last placement among
+    /// (`Page::cpus`, all when 0) among those of its record (`Record::cpus`,
+    /// the CPUs the kernel lets its threads run on; when the page names
+    /// none of them, the record's), the next after the last placement among
     /// equals. One CPU, or a machine whose CPUs the kernel does not tell, is
     /// CPU 0. The step costs the same however many processes live: it reads
-    /// no record. A CPU is busy when it was awake a quarter of the last
+    /// the one record. A CPU is busy when it was awake a quarter of the last
     /// window of LOAD_WINDOW_NS (the time it slept, from object_info CPU,
     /// which one call per CPU reads at the close of a window), and each image
     /// put on it in this window and the one before counts as one more, since
@@ -2894,9 +2914,14 @@ impl Processes {
         if cpus == 1 && !cfg!(feature = "steps") {
             return 0;
         }
-        let allowed = self.pages.page(child).map_or(0, |page| {
+        let page = self.pages.page(child).map_or(0, |page| {
             page.cpus.load(core::sync::atomic::Ordering::Acquire)
         });
+        let record = self
+            .records
+            .get(child)
+            .map_or(0, |record| u64::from(record.cpus));
+        let allowed = allowed_cpus(page, record);
         let now = Self::timer_now();
         if self.window_at == 0 || now.saturating_sub(self.window_at) >= LOAD_WINDOW_NS {
             self.close_window(cpus, now);
@@ -3093,9 +3118,12 @@ impl Processes {
                             },
                             tty: record.ctty.map_or(0, |(terminal, _)| terminal + 1),
                             cpu: u32::from(record.cpu),
-                            cpus: self.pages.page(i).map_or(0, |page| {
-                                page.cpus.load(core::sync::atomic::Ordering::Acquire)
-                            }),
+                            cpus: allowed_cpus(
+                                self.pages.page(i).map_or(0, |page| {
+                                    page.cpus.load(core::sync::atomic::Ordering::Acquire)
+                                }),
+                                u64::from(record.cpus),
+                            ),
                             nice: i32::from(record.nice),
                             ticks: record
                                 .carried_ticks
@@ -3145,7 +3173,7 @@ impl Processes {
             return kernel(abi::Error::NoMemory);
         }
         let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
-        let (quota, handle_limit) = (record.quota, record.handle_limit);
+        let (quota, handle_limit, cpus) = (record.quota, record.handle_limit, record.cpus);
         // The number goes to this attempt whatever comes of it.
         {
             let record = self.records.get_mut(index).expect("the caller");
@@ -3169,7 +3197,7 @@ impl Processes {
                     Some((&exit, ceiling)),
                     Some(session),
                     sys::Shares::CREATOR,
-                    0,
+                    cpus,
                 )
                 .map_err(|(e, _)| e)
             });

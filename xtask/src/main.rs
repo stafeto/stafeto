@@ -631,6 +631,14 @@ const POSIX_LOCK_RING_PROGRAMS: [ImageProgram; 10] = {
     programs[0].3 = &["table-posix-lock-ring"];
     programs
 };
+/// The probe of the shares of the process service (#354): the image of the
+/// probe of POSIX processes with the table that gives the service a share
+/// of 24 thread numbers (`table-posix-shares`) and the role `shares`.
+const POSIX_SHARES_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[0].3 = &["table-posix-shares"];
+    programs
+};
 const POSIX_SPAWN_CHURN_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[5].3 = &["spawn-churn"];
@@ -1499,6 +1507,7 @@ commands:
   posix-fifo-steps measure named FIFO service dispatches under icount
   posix-sync verify RAM synchronization, descriptor types and cancellation
   posix-spawn-churn verify 1100 consecutive spawn/reap operations in a small image
+  posix-shares verify that the share of thread numbers of the process service ends in EAGAIN
   posix-lock-pages measure a full inode spread over 64 paid physical pages
   posix-lock-queue-core measure 64 genuine waits together with 64 held regions
   posix-lock-core measure public locks at the full inode64 limit
@@ -1689,6 +1698,7 @@ fn main() {
         Some("posix-fifo") => posix_fifo_probe(),
         Some("posix-fifo-steps") => posix_fifo_run(true),
         Some("posix-spawn-churn") => posix_spawn_churn_probe(&qemu::VIRT),
+        Some("posix-shares") => posix_shares_probe(&qemu::VIRT),
         // STAFETO_MACHINE names the machine (qemu::MACHINES), for instance
         // `HVF GICv3`; STAFETO_SMP gives it CPUs.
         Some("posix-procs") => {
@@ -4659,6 +4669,39 @@ fn posix_spawn_churn_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(
         &outcome,
         "posix-procs: spawn churn: 1100 children reaped with fresh full PIDs",
+    )?;
+    Ok(())
+}
+
+/// The share of thread numbers of the process service (kernel spec 7.5,
+/// #354): the probe of POSIX processes in its role `shares` makes threads
+/// until pthread_create says EAGAIN, finds fork and posix_spawn refused with
+/// EAGAIN meanwhile and a file still read through the RAM service, and finds
+/// fork working again once the threads ended.
+fn posix_shares_probe(machine: &qemu::Machine) -> Result<(), String> {
+    relibc()?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-shares.img",
+        &POSIX_SHARES_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(60),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "posix-procs: shares: EAGAIN at the share, fork and spawn refused, a file read, fork again",
     )?;
     Ok(())
 }
@@ -7709,6 +7752,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             posix_interrupt_on(false, Some(&qemu::VIRT_EL2))
         }),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
+        job("posix-shares", || posix_shares_probe(&qemu::VIRT)),
+        job("posix-shares smp 4", || {
+            qemu::on_cpus(SMP_CPUS, || posix_shares_probe(&qemu::VIRT))
+        }),
         job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
