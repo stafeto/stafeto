@@ -17,6 +17,16 @@
  * - A handler without SA_ONSTACK entered at the top of the alternate stack
  *   runs on the interrupted stack, and a signal with SA_ONSTACK inside it
  *   neither treads on the frame of the dispatcher nor on the outer handler.
+ * - Nested handlers on the alternate stack (#293): a stack of 36 KiB holds
+ *   handler B off the stack, A on it and C on it that jumps into A; one of
+ *   20 KiB ends the process by SIGSEGV as soon as the delivery would leave
+ *   less than 4 KiB, with nothing trodden on.
+ * - Levels of handlers off the stack (#287): a jump from E, inside B, into B
+ *   leaves B's frames whole for the next SA_ONSTACK signal; a jump from E
+ *   into the main code leaves the whole stack to the next one.
+ * - A child of fork made in a handler off the stack takes SA_ONSTACK signals
+ *   under the live frames (#286).
+ * - A stack of MINSIGSTKSZ bytes serves a handler with a 2 KiB array (#289).
  * - The classes of the syndrome: an undefined instruction is SIGILL, a
  *   breakpoint SIGTRAP, a misaligned exclusive SIGBUS, a load from an
  *   unmapped address SIGSEGV with SEGV_MAPERR and its address, a write to
@@ -376,6 +386,176 @@ static int f_high_alt_0(void) { f_mode = 0; return f_high_alt(); }
 static int f_high_alt_1(void) { f_mode = 1; return f_high_alt(); }
 static int f_high_alt_2(void) { f_mode = 2; return f_high_alt(); }
 
+
+/* #293: B (SA_SIGINFO, no SA_ONSTACK) raises A (SA_ONSTACK) that sets a jump
+ * point and raises C (SA_ONSTACK), and C jumps into A. Every level costs
+ * about 13 KiB of the alternate stack. */
+static void f_h_a3(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    if (sigsetjmp(f_env2, 1) == 0) raise(SIGALRM);
+    f_stage++;
+}
+static int f_nested_run(char *area, size_t size) {
+    stack_t ss = {.ss_sp = area, .ss_size = size, .ss_flags = 0};
+    if (sigaltstack(&ss, NULL)) return 1;
+    if (f_catch(SIGUSR1, f_h_b2, 0) || f_catch(SIGUSR2, f_h_a3, SA_ONSTACK)
+        || f_catch(SIGALRM, f_h_c, SA_ONSTACK)) return 2;
+    f_mode = 0;
+    f_stage = 0;
+    raise(SIGUSR1);
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+/* Without the jump: C returns. */
+static void f_h_ret(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    f_where[2] = 1;
+}
+static void f_h_a4(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    raise(SIGALRM);
+    f_stage++;
+}
+static int f_nested_28k_plain(void) {
+    char area[28672] __attribute__((aligned(16)));
+    stack_t ss = {.ss_sp = area, .ss_size = sizeof(area), .ss_flags = 0};
+    if (sigaltstack(&ss, NULL)) return 1;
+    if (f_catch(SIGUSR1, f_h_b2, 0) || f_catch(SIGUSR2, f_h_a4, SA_ONSTACK)
+        || f_catch(SIGALRM, f_h_ret, SA_ONSTACK)) return 2;
+    f_mode = 0;
+    f_stage = 0;
+    raise(SIGUSR1);
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+static int f_nested_36k(void) {
+    char area[36864] __attribute__((aligned(16)));
+    return f_nested_run(area, sizeof(area));
+}
+static int f_nested_20k(void) {
+    char area[20480] __attribute__((aligned(16)));
+    return f_nested_run(area, sizeof(area));
+}
+
+/* #287: levels. B (SA_SIGINFO, off the stack) sets a jump point and raises E
+ * (off the stack), which jumps into B; B then raises H (on the stack) that
+ * treads 3 KiB, and B returns. With one pair of fields for the levels the
+ * jump from E took B's level with it, H started at the top over B's frame and
+ * B's return was corrupted. */
+static sigjmp_buf f_env_b;
+static volatile unsigned long f_h_at;
+static void f_h_e(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    siglongjmp(f_env_b, 1);
+}
+static void f_h_tread(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile unsigned char junk[3072];
+    for (unsigned i = 0; i < sizeof(junk); i++) junk[i] = 0xEE;
+    f_h_at = (unsigned long)&junk[0];
+    f_stage++;
+}
+static void f_h_lb(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile unsigned char sentinel[128];
+    for (unsigned i = 0; i < sizeof(sentinel); i++) sentinel[i] = 0x66;
+    if (sigsetjmp(f_env_b, 1) == 0) {
+        raise(SIGUSR2);
+        f_stage = 80;
+    }
+    f_stage++;
+    raise(SIGALRM);
+    for (unsigned i = 0; i < sizeof(sentinel); i++)
+        if (sentinel[i] != 0x66) f_stage = 99;
+}
+static int f_levels_into_b(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGUSR1, f_h_lb, 0) || f_catch(SIGUSR2, f_h_e, 0)
+        || f_catch(SIGALRM, f_h_tread, SA_ONSTACK)) return 2;
+    f_stage = 0;
+    raise(SIGUSR1);
+    /* B after the jump (1), H (2). */
+    return f_stage == 2 ? 0 : 20 + f_stage % 70;
+}
+
+/* The same with a jump from E into the main code: both levels go, and the next
+ * SA_ONSTACK signal starts at the top of the alternate stack. */
+static void f_h_lb2(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    raise(SIGUSR2);
+    f_stage = 80;
+}
+static void f_h_e2(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    siglongjmp(f_env, 1);
+}
+static int f_levels_to_main(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGUSR1, f_h_lb2, 0) || f_catch(SIGUSR2, f_h_e2, 0)
+        || f_catch(SIGALRM, f_h_tread, SA_ONSTACK)) return 2;
+    /* Where the handler of an SA_ONSTACK signal of the main code starts. */
+    f_stage = 0;
+    raise(SIGALRM);
+    unsigned long first = f_h_at;
+    if (f_stage != 1 || !f_in_alt((void *)first)) return 5;
+    f_stage = 0;
+    f_h_at = 0;
+    if (sigsetjmp(f_env, 1) == 0) {
+        raise(SIGUSR1);
+        return 3;
+    }
+    if (f_on_alt() != 0) return 4;
+    raise(SIGALRM);
+    if (f_stage != 1) return 20 + f_stage % 70;
+    /* The same place: no level of the jump's two is left to cut the range. */
+    return f_h_at == first ? 0 : 6;
+}
+
+/* #286: a child of fork made in a handler off the stack. */
+static volatile pid_t f_fork_pid;
+static void f_h_fork(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    f_fork_pid = fork();
+    if (f_fork_pid == 0) raise(SIGALRM);
+}
+static int f_fork_in_handler(void) {
+    if (f_set_alt()) return 1;
+    if (f_catch(SIGUSR1, f_h_fork, 0) || f_catch(SIGALRM, f_h_d, SA_ONSTACK)) return 2;
+    f_stage = 0;
+    f_fork_pid = -2;
+    raise(SIGUSR1);
+    if (f_fork_pid == 0) _exit(f_stage == 1 ? 0 : 10 + f_stage % 70);
+    if (f_fork_pid < 0) return 3;
+    int status = -1;
+    if (waitpid(f_fork_pid, &status, 0) != f_fork_pid) return 4;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
+}
+
+/* #289: a stack of MINSIGSTKSZ bytes with a hole below it serves a handler
+ * with a 2 KiB array, and at least 2 KiB of it stay untouched. */
+static volatile int f_array_ok;
+static void f_h_array(int sig, siginfo_t *info, void *ctx) {
+    (void)sig; (void)info; (void)ctx;
+    volatile unsigned char array[2048];
+    for (unsigned i = 0; i < sizeof(array); i++) array[i] = (unsigned char)i;
+    f_array_ok = array[2047] == (unsigned char)2047;
+}
+static int f_minimum_stack(void) {
+    char *region = mmap(NULL, MINSIGSTKSZ + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) return 1;
+    if (mprotect(region, 4096, PROT_NONE)) return 2;
+    unsigned char *low = (unsigned char *)region + 4096;
+    memset(low, 0xA5, MINSIGSTKSZ);
+    stack_t ss = {.ss_sp = low, .ss_size = MINSIGSTKSZ, .ss_flags = 0};
+    if (sigaltstack(&ss, NULL)) return 3;
+    if (f_catch(SIGUSR1, f_h_array, SA_ONSTACK)) return 4;
+    f_array_ok = 0;
+    raise(SIGUSR1);
+    if (!f_array_ok) return 5;
+    unsigned untouched = 0;
+    while (untouched < MINSIGSTKSZ && low[untouched] == 0xA5) untouched++;
+    printf("posix-procs: faults: a stack of MINSIGSTKSZ leaves %u bytes untouched under a 2 KiB handler\n", untouched);
+    return untouched >= 2048 ? 0 : 6;
+}
+
 static volatile int f_code, f_signo;
 static volatile unsigned long f_addr, f_pc;
 static void f_h_class(int sig, siginfo_t *info, void *ctx) {
@@ -571,6 +751,13 @@ static int faults_role(void) {
     f_child("a handler off the alternate stack", f_off_stack_plain, 0, 0);
     f_child("a handler off the alternate stack with a signal off it", f_off_stack_both, 0, 0);
     f_child("a handler off the alternate stack with a signal on it", f_off_stack_on, 0, 0);
+    f_child("nested handlers on 36 KiB of the alternate stack", f_nested_36k, 0, 0);
+    f_child("nested handlers on 20 KiB of the alternate stack end the process", f_nested_20k, 0, SIGSEGV);
+    f_child("nested handlers on 28 KiB end the process before C can tread", f_nested_28k_plain, 0, SIGSEGV);
+    f_child("a jump from a handler into the handler it was called in", f_levels_into_b, 0, 0);
+    f_child("a jump from a handler into the main code takes both levels off", f_levels_to_main, 0, 0);
+    f_child("fork in a handler off the alternate stack", f_fork_in_handler, 0, 0);
+    f_child("a handler with a 2 KiB array on MINSIGSTKSZ", f_minimum_stack, 0, 0);
     f_child("classes of faults reach handlers", f_classes, 0, 0);
     f_child("undefined instruction without a handler", f_default_udf, 0, SIGILL);
     f_child("breakpoint without a handler", f_default_brk, 0, SIGTRAP);

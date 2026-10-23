@@ -2349,7 +2349,7 @@ impl LinuxContext {
 /// The death of the process by `signal`: the code `0x100 | signal`, which
 /// `_exit` never gives (it keeps 8 bits), so that the process service reads
 /// WIFSIGNALED from the kernel's reason (proto_process::End).
-fn sys_exit_signal(signal: i32) -> ! {
+pub(crate) fn sys_exit_signal(signal: i32) -> ! {
     rt::sys::process_exit(0x100 | signal as u64)
 }
 

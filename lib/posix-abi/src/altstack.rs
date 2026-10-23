@@ -17,7 +17,10 @@
 //! the dispatcher's frame stays live there: the kernel's range is cut to end
 //! below that frame while the handler runs, so that a nested entry of the
 //! handler (with SA_ONSTACK) starts under the frame and does not tread
-//! on it.
+//! on it. Each such handler is a level of a chain (`Level`) that lives in the
+//! frame of `run_placed` on the alternate stack; a long jump takes off the
+//! levels it leaves and the range of the kernel ends where the level below
+//! says.
 
 use crate::constants::*;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +33,12 @@ pub const MINSIGSTKSZ: u64 = 12_288;
 
 const _: () = assert!(MINSIGSTKSZ >= rt::upcall::FRAME_SIZE as u64 + 8192);
 
+/// What a delivery on the alternate stack leaves below it at the least: a
+/// handler that starts closer to the bottom than this, and every call it
+/// makes, would run out of the stack over the frames of the callers (a nested
+/// level costs about 13 KiB, spec 11); the process ends by SIGSEGV instead.
+pub const RESERVE: u64 = 4096;
+
 /// The alternate stack of one thread place.
 struct Alt {
     /// What the program gave: base and size.
@@ -41,12 +50,25 @@ struct Alt {
     high: AtomicU64,
     /// A handler that started on the alternate stack is running.
     active: AtomicBool,
-    /// The stack pointer a handler without SA_ONSTACK started with while
-    /// the dispatcher's frame is at the top of the alternate stack, else 0.
-    floor: AtomicU64,
-    /// Where the kernel's range ends while a handler off the stack runs
-    /// (below the live frame); 0 when it ends at `high`.
-    cut: AtomicU64,
+    /// The innermost `Level` (its address), 0 when no handler off the stack
+    /// runs under a live frame at the top of the alternate stack. A level
+    /// lies in the frame of `run_placed` (above its `cut`, so that a nested
+    /// entry, which starts under `cut`, does not reach it) and stays in the
+    /// chain until the handler returns or a long jump leaves it.
+    top: AtomicU64,
+}
+
+use entries::Level;
+
+/// The level at address `at` of a chain.
+///
+/// # Safety
+/// `at` is the address of a live `Level`: the chain of a thread holds
+/// addresses of frames of `run_placed` that are alive until their level is
+/// taken off.
+unsafe fn level_at(at: u64) -> Level {
+    // SAFETY: the caller's promise.
+    unsafe { *(at as *const Level) }
 }
 
 impl Alt {
@@ -57,18 +79,26 @@ impl Alt {
             low: AtomicU64::new(0),
             high: AtomicU64::new(0),
             active: AtomicBool::new(false),
-            floor: AtomicU64::new(0),
-            cut: AtomicU64::new(0),
+            top: AtomicU64::new(0),
         }
     }
     fn clear(&self) {
-        self.cut.store(0, Ordering::Relaxed);
+        self.top.store(0, Ordering::Relaxed);
         self.base.store(0, Ordering::Relaxed);
         self.size.store(0, Ordering::Relaxed);
         self.low.store(0, Ordering::Relaxed);
         self.high.store(0, Ordering::Relaxed);
         self.active.store(false, Ordering::Relaxed);
-        self.floor.store(0, Ordering::Relaxed);
+    }
+
+    /// Where the kernel's range ends: under the live frames of the innermost
+    /// level, else at the top.
+    fn end(&self) -> u64 {
+        match self.top.load(Ordering::Relaxed) {
+            0 => self.high.load(Ordering::Relaxed),
+            // SAFETY: `top` is the address of a live level.
+            top => unsafe { level_at(top) }.cut,
+        }
     }
 }
 
@@ -164,10 +194,14 @@ fn state_on_stack() -> (u64, u64, i32) {
 }
 
 /// Gives the kernel the range of the calling thread, if it has one: after a
-/// new binding of the entry (a child of `fork`).
+/// new binding of the entry (a child of `fork`). The range ends where the
+/// live levels leave room: a child of `fork` made in a handler off the stack
+/// has the dispatcher's frames of the copy on the alternate stack.
 pub(crate) fn reinstate() -> Result<(), i32> {
     match range() {
-        Some((low, high)) => rt::upcall::set_stack(low, high - low).map_err(|_| EIO),
+        Some((low, _)) => {
+            rt::upcall::set_stack(low, row().end().saturating_sub(low)).map_err(|_| EIO)
+        }
         None => Ok(()),
     }
 }
@@ -249,16 +283,20 @@ pub(crate) fn place(on_stack: bool, frame: u64, sp: u64) -> Place {
     let Some((low, high)) = range() else {
         return Place::Plain;
     };
+    // An entry whose interrupted code ran out of the stack under a live
+    // handler of it: the kernel put the frame at the top over the live frames
+    // (the nested delivery that took the last bytes ran below the range).
+    if frame != 0 && overflowed(sp) {
+        crate::signals::sys_exit_signal(SIGSEGV)
+    }
     let here = on_alternate();
     if on_stack {
         if here {
             Place::Here
         } else {
             // Under the live frames while a handler off the stack runs.
-            let cut = row().cut.load(Ordering::Relaxed);
-            Place::Alternate {
-                top: if cut != 0 { cut } else { high },
-            }
+            let _ = high;
+            Place::Alternate { top: row().end() }
         }
     } else if frame != 0 && here && !(low..=high).contains(&sp) {
         // The dispatcher's frame is at the top and the interrupted code is
@@ -288,6 +326,10 @@ fn run_placed(place: Place, body: impl FnOnce()) {
         Place::Plain => body(),
         Place::Here => {
             if on_alternate() {
+                let (low, _) = range().expect("a range on the alternate stack");
+                if stack_pointer() - low < RESERVE {
+                    crate::signals::sys_exit_signal(SIGSEGV)
+                }
                 let before = alt.active.swap(true, Ordering::Relaxed);
                 body();
                 alt.active.store(before, Ordering::Relaxed);
@@ -296,56 +338,65 @@ fn run_placed(place: Place, body: impl FnOnce()) {
             }
         }
         Place::Alternate { top } => {
+            let (low, _) = range().expect("a range for an alternate place");
+            // A handler that is live on the stack has run out of it when the
+            // caller lies below the range: the top is no place for a new one.
+            if top.saturating_sub(low) < RESERVE
+                || (alt.active.load(Ordering::Relaxed) && stack_pointer() < low)
+            {
+                crate::signals::sys_exit_signal(SIGSEGV)
+            }
             let before = alt.active.swap(true, Ordering::Relaxed);
             on_stack(top, body);
             alt.active.store(before, Ordering::Relaxed);
         }
         Place::Interrupted { sp, frame } => {
-            let (low, high) = range().expect("a range for an interrupted place");
+            let (low, _) = range().expect("a range for an interrupted place");
             // The range ends below everything live on the alternate stack
             // while the handler runs: the dispatcher's frame at the top and
-            // the delivery of the layer under it, down to this frame.
-            let _ = frame;
-            // The frames of `on_stack` and of the switch lie under this frame: 512
-            // bytes keep a nested entry off them.
+            // the delivery of the layer under it, down to this frame and the
+            // level in it. The frames of `on_stack` and of the switch lie
+            // under this frame: 512 bytes keep a nested entry off them.
             let end = (stack_pointer() & !15).saturating_sub(512);
-            let cut = alt.cut.swap(end, Ordering::Relaxed);
+            let level = Level {
+                prev: alt.top.load(Ordering::Relaxed),
+                floor: sp,
+                cut: end,
+                frame,
+            };
+            alt.top.store(&raw const level as u64, Ordering::Relaxed);
             let _ = rt::upcall::set_stack(low, end.saturating_sub(low));
-            let before = alt.floor.swap(sp, Ordering::Relaxed);
             on_stack(sp, body);
-            alt.floor.store(before, Ordering::Relaxed);
-            alt.cut.store(cut, Ordering::Relaxed);
-            let back = if cut == 0 { high } else { cut };
-            let _ = rt::upcall::set_stack(low, back - low);
+            alt.top.store(level.prev, Ordering::Relaxed);
+            let _ = rt::upcall::set_stack(low, alt.end().saturating_sub(low));
         }
     }
 }
 
-/// The stack pointer a handler without SA_ONSTACK started with, 0 when none.
-pub(crate) fn floor() -> u64 {
-    row().floor.load(Ordering::Relaxed)
-}
-
 /// A long jump to the stack pointer `target`: the frame of the live resident
 /// call whose entry frame is `outer`, and whether the jump leaves it. The
-/// bookkeeping the jump ends goes with it: the cut range comes back and the
-/// account of a handler on the alternate stack ends when the target lies
-/// outside the stack.
+/// bookkeeping the jump ends goes with it: the levels it leaves are taken
+/// off, the kernel's range ends where the level below says, and the account
+/// of a handler on the alternate stack ends when the target lies outside the
+/// stack.
 pub(crate) fn jump(outer: u64, target: u64) -> bool {
     let alt = row();
     let range = range();
-    let call = entries::call_frame(outer, floor(), range);
+    // SAFETY: the chain of this thread is live frames, see `Alt::top`.
+    let floor = entries::floor_of(alt.top.load(Ordering::Relaxed), outer, |at| unsafe {
+        level_at(at)
+    });
+    let call = entries::call_frame(outer, floor, range);
     let leaves = entries::jump_clears_frames(outer, call, entries::frame_in(target, range));
     if let Some((low, high)) = range {
-        // A handler off the stack is left by a jump to a target outside the
-        // range and above its start (a target on the alternate stack is a
-        // handler under it, whose address says nothing of `floor`); relibc's threads keep `outer` at 0, so
-        // this does not depend on `leaves`.
-        let floor = alt.floor.load(Ordering::Relaxed);
-        if floor != 0 && !(low..high).contains(&target) && target > floor {
-            alt.floor.store(0, Ordering::Relaxed);
-            alt.cut.store(0, Ordering::Relaxed);
-            let _ = rt::upcall::set_stack(low, high - low);
+        // relibc's threads keep `outer` at 0, so this does not depend on
+        // `leaves`.
+        let before = alt.top.load(Ordering::Relaxed);
+        // SAFETY: the chain of this thread is live frames, see `Alt::top`.
+        let top = entries::unwind(before, (low, high), target, |at| unsafe { level_at(at) });
+        if top != before {
+            alt.top.store(top, Ordering::Relaxed);
+            let _ = rt::upcall::set_stack(low, alt.end().saturating_sub(low));
         }
         if !(low..high).contains(&target) {
             alt.active.store(false, Ordering::Relaxed);
