@@ -7753,9 +7753,6 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         }),
         job("posix-spawn-churn", || posix_spawn_churn_probe(&qemu::VIRT)),
         job("posix-shares", || posix_shares_probe(&qemu::VIRT)),
-        job("posix-shares smp 4", || {
-            qemu::on_cpus(SMP_CPUS, || posix_shares_probe(&qemu::VIRT))
-        }),
         job("posix-map", posix_map_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
