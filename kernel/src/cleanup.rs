@@ -364,7 +364,7 @@ pub fn portion() {
     // period let go. The stages Threads and Space of a process wait for the
     // CPUs when there are several; the tests call portions in loops of
     // their own, which would wait for themselves.
-    #[cfg(feature = "ktest")]
+    #[cfg(all(feature = "ktest", not(feature = "icount")))]
     if let Work::Object(Object::Process(p)) = &work
         && matches!(
             process::progress(*p).0,

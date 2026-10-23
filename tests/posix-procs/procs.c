@@ -3483,12 +3483,11 @@ static void forks(void) {
         pid_t pid = -1;
         expect(dying[i], posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, env), 0);
         reap(dying[i], pid, 0, SIGKILL);
-        unsigned long long after = stafeto_probe_pool();
-        for (int n = 0; n < 100 && after != before; n++) {
-            pause_ms(5);
-            after = stafeto_probe_pool();
-        }
-        if (after != before) {
+        /* What the children before gave back may still be on its way when
+         * `before` is read, so the pool may end above it; it may not end
+         * below. */
+        unsigned long long after = pool_back(before, 0);
+        if (after < before) {
             printf("posix-procs: the pool after %s: %llu before, %llu after\n", dying[i], before, after);
             failures++;
         }
