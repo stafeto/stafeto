@@ -3,8 +3,10 @@
 
 //! The rendezvous of shared memory (POSIX `mmap` with MAP_SHARED, `shm_open`): the objects that processes map as the same pages, by the key of the
 //! file they show. The first process to ask makes the object and says so
-//! (Reserve); the others who ask meanwhile wait (Busy) and then get a
-//! handle of it. An entry lives as long as a process uses it: a process
+//! (Reserve); the others who ask meanwhile, a thread of the same process
+//! among them, wait (Busy: the service holds their requests, `wait`, and
+//! answers each when the object is there or the maker is gone, `ready`) and
+//! then get a handle of it. An entry lives as long as a process uses it: a process
 //! that unmaps its last piece detaches, and the end of a process (or the
 //! exec of a new image in it) detaches it from every entry; the last to go
 //! frees the entry and the service's handle, so the object goes with the
@@ -27,7 +29,8 @@ pub enum Got<'a, T> {
     /// There is none and the table has no place: the caller makes an object
     /// that is not registered.
     Full,
-    /// Another process makes it now.
+    /// A process makes it now: the caller waits (`Shares::wait`), whichever
+    /// process that is, its own included.
     Busy,
 }
 
@@ -63,13 +66,32 @@ struct Grant {
     age: u32,
 }
 
-pub struct Shares<T> {
+/// A request of Get that waits for the object of a key, with what the
+/// service answers it by (`W`: the deferred reply).
+struct Waiting<W> {
+    record: u16,
+    key: u64,
+    data: W,
+    /// When it came, to answer the oldest first.
+    age: u32,
+}
+
+/// The places for the requests that wait, one for each place of a grant: a
+/// request waits after the grant of its process and key, and the grant
+/// stays until the request is answered, so these are the requests that the
+/// grants hold, but for the threads of a process that ask for one key
+/// together (they share a grant), which take places of their own. No more
+/// than `WAITING` wait; the rest are answered Busy at once.
+pub const WAITING: usize = GRANTS;
+
+pub struct Shares<T, W> {
     entries: [Option<Entry<T>>; SHARES],
     grants: [Option<Grant>; GRANTS],
+    waiting: [Option<Waiting<W>>; WAITING],
     ages: u32,
 }
 
-impl<T> Shares<T> {
+impl<T, W> Shares<T, W> {
     /// What `new` makes, in place in zeroed memory (the service's `.bss`).
     ///
     /// # Safety
@@ -82,6 +104,7 @@ impl<T> Shares<T> {
         unsafe {
             rt::bss::fill_none(addr_of_mut!((*at).entries));
             rt::bss::fill_none(addr_of_mut!((*at).grants));
+            rt::bss::fill_none(addr_of_mut!((*at).waiting));
         }
     }
 
@@ -89,6 +112,7 @@ impl<T> Shares<T> {
         Shares {
             entries: [const { None }; SHARES],
             grants: [const { None }; GRANTS],
+            waiting: [const { None }; WAITING],
             ages: 0,
         }
     }
@@ -165,8 +189,10 @@ impl<T> Shares<T> {
             Some(i) => {
                 let entry = self.entries[i].as_mut().expect("an entry");
                 match &entry.state {
-                    State::Making(owner) if *owner != record => Got::Busy,
-                    State::Making(_) => Got::Reserved,
+                    // The maker's own process waits too, for another of its
+                    // threads: two threads that map one file together make
+                    // one object.
+                    State::Making(_) => Got::Busy,
                     State::Ready { .. } => {
                         Self::add_user(entry, record);
                         let State::Ready { pages, memory } = &entry.state else {
@@ -193,6 +219,56 @@ impl<T> Shares<T> {
                 Got::Reserved
             }
         }
+    }
+
+    /// The request `data` of the process in `record` for the object of
+    /// `key` waits for it (after a Get that said Busy). With no place left
+    /// it comes back, and the caller answers Busy.
+    pub fn wait(&mut self, key: u64, record: usize, data: W) -> Result<(), W> {
+        self.ages = self.ages.wrapping_add(1);
+        let age = self.ages;
+        match self.waiting.iter_mut().find(|w| w.is_none()) {
+            Some(place) => {
+                *place = Some(Waiting {
+                    record: record as u16,
+                    key,
+                    data,
+                    age,
+                });
+                Ok(())
+            }
+            None => Err(data),
+        }
+    }
+
+    /// The oldest waiting request that nobody makes the object for any more:
+    /// its entry is Ready, or gone with its maker. It leaves the table with
+    /// its record, key and `data`, and the caller asks `get` for it again:
+    /// the first of the requests of a key whose maker went gets the right to
+    /// make, and the others wait on. O(WAITING + SHARES).
+    pub fn ready(&mut self) -> Option<(usize, u64, W)> {
+        let ages = self.ages;
+        let open = |entries: &[Option<Entry<T>>; SHARES], key: u64| {
+            !entries
+                .iter()
+                .flatten()
+                .any(|e| e.key == key && matches!(e.state, State::Making(_)))
+        };
+        let place = self
+            .waiting
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| w.as_ref().map(|w| (i, w)))
+            .filter(|(_, w)| open(&self.entries, w.key))
+            .max_by_key(|(_, w)| ages.wrapping_sub(w.age))
+            .map(|(i, _)| i)?;
+        let w = self.waiting[place].take().expect("a waiting request");
+        Some((usize::from(w.record), w.key, w.data))
+    }
+
+    /// The requests waiting.
+    pub fn waiters(&self) -> usize {
+        self.waiting.iter().flatten().count()
     }
 
     /// The caller made the object of the entry it reserved: false when it
@@ -257,8 +333,17 @@ impl<T> Shares<T> {
         }
     }
 
-    /// The process in `record` is gone (or its image is): it uses nothing.
+    /// The process in `record` is gone (or its image is): it uses nothing,
+    /// and its requests that wait go (their replies with them).
     pub fn drop_user(&mut self, record: usize) {
+        for request in &mut self.waiting {
+            if request
+                .as_ref()
+                .is_some_and(|w| usize::from(w.record) == record)
+            {
+                *request = None;
+            }
+        }
         for grant in &mut self.grants {
             if grant.is_some_and(|g| usize::from(g.record) == record) {
                 *grant = None;
@@ -282,7 +367,7 @@ impl<T> Shares<T> {
     }
 }
 
-impl<T> Default for Shares<T> {
+impl<T, W> Default for Shares<T, W> {
     fn default() -> Self {
         Self::new()
     }
@@ -296,7 +381,7 @@ mod tests {
     /// then gets it; the entry goes with its last user.
     #[test]
     fn the_first_makes_the_object_and_the_rest_wait_then_share() {
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         assert_eq!(t.get(7, 1, true), Got::Reserved);
         assert_eq!(t.get(7, 2, true), Got::Busy);
         assert_eq!(t.put(7, 2, 4, 99), Err(99), "not the maker");
@@ -317,7 +402,7 @@ mod tests {
     /// ended stops using every entry.
     #[test]
     fn the_end_of_a_process_frees_what_only_it_used() {
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         assert_eq!(t.get(1, 5, true), Got::Reserved);
         assert_eq!(t.get(2, 5, true), Got::Reserved);
         assert_eq!(t.put(2, 5, 1, 20), Ok(()));
@@ -333,7 +418,7 @@ mod tests {
     /// a reader makes no entry.
     #[test]
     fn grants_belong_to_a_process_and_a_file() {
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         assert_eq!(t.granted(1, 9), None);
         assert!(t.grant(1, 9, false));
         assert!(t.grant(2, 9, true));
@@ -359,7 +444,7 @@ mod tests {
         assert_eq!(t.granted(5, 1001), None);
         // The table full of other processes' grants refuses a new process
         // and takes nothing of theirs.
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         for record in 0..GRANTS / GRANTS_PER_PROCESS {
             for k in 0..GRANTS_PER_PROCESS as u64 {
                 assert!(t.grant(record, 500 + k, true));
@@ -371,18 +456,94 @@ mod tests {
             assert_eq!(t.granted(record, 501), Some(true));
         }
         // A reader's attach makes no entry; a writer's does.
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         t.attach(7, 1, 1, 70, false);
         assert!(t.is_empty());
         t.attach(7, 1, 1, 70, true);
         assert_eq!(t.len(), 1);
     }
 
+    /// A request that gets Busy waits, and the Put of the maker lets it go
+    /// to Get again, the oldest first; the maker's own process waits too,
+    /// for another thread.
+    #[test]
+    fn requests_wait_for_the_maker_and_go_oldest_first() {
+        let mut t = Shares::<u32, u32>::new();
+        assert_eq!(t.get(7, 1, true), Got::Reserved);
+        assert_eq!(t.get(7, 1, true), Got::Busy, "a second thread of the maker");
+        assert_eq!(t.wait(7, 1, 100), Ok(()));
+        assert_eq!(t.get(7, 2, true), Got::Busy);
+        assert_eq!(t.wait(7, 2, 200), Ok(()));
+        assert_eq!(t.get(8, 3, true), Got::Reserved);
+        assert_eq!(t.get(8, 4, true), Got::Busy);
+        assert_eq!(t.wait(8, 4, 400), Ok(()));
+        assert_eq!(t.waiters(), 3);
+        assert_eq!(t.ready(), None, "both keys have a maker");
+        assert_eq!(t.put(7, 1, 4, 55), Ok(()));
+        assert_eq!(t.ready(), Some((1, 7, 100)), "the oldest first");
+        assert_eq!(t.get(7, 1, true), Got::Found(4, &55));
+        assert_eq!(t.ready(), Some((2, 7, 200)));
+        assert_eq!(t.get(7, 2, true), Got::Found(4, &55));
+        assert_eq!(t.ready(), None, "the key 8 is still made");
+        assert_eq!(t.waiters(), 1);
+    }
+
+    /// A maker that goes (it detaches, or its process ends) hands the right
+    /// to make to the first request that waits; the others wait on.
+    #[test]
+    fn the_right_to_make_passes_to_the_first_waiter() {
+        let mut t = Shares::<u32, u32>::new();
+        assert_eq!(t.get(7, 1, true), Got::Reserved);
+        for (record, data) in [(2, 20), (3, 30), (4, 40)] {
+            assert_eq!(t.get(7, record, true), Got::Busy);
+            assert_eq!(t.wait(7, record, data), Ok(()));
+        }
+        t.detach(7, 1);
+        assert_eq!(t.ready(), Some((2, 7, 20)));
+        assert_eq!(
+            t.get(7, 2, true),
+            Got::Reserved,
+            "the first becomes the maker"
+        );
+        assert_eq!(t.ready(), None, "the others wait for it");
+        // It ends before its Put: the next one makes.
+        t.drop_user(2);
+        assert_eq!(t.ready(), Some((3, 7, 30)));
+        assert_eq!(t.get(7, 3, true), Got::Reserved);
+        assert_eq!(t.put(7, 3, 2, 9), Ok(()));
+        assert_eq!(t.ready(), Some((4, 7, 40)));
+        assert_eq!(t.get(7, 4, true), Got::Found(2, &9));
+    }
+
+    /// The end of a process takes its waiting requests away, and the table
+    /// has WAITING places: the next request comes back unplaced.
+    #[test]
+    fn a_waiter_that_ends_leaves_and_the_places_are_few() {
+        let mut t = Shares::<u32, u32>::new();
+        assert_eq!(t.get(7, 1, true), Got::Reserved);
+        for i in 0..WAITING {
+            assert_eq!(t.wait(7, 2 + i % 3, i as u32), Ok(()));
+        }
+        assert_eq!(t.wait(7, 9, 999), Err(999), "no place");
+        t.drop_user(2);
+        assert_eq!(t.waiters(), WAITING - WAITING.div_ceil(3));
+        assert_eq!(t.wait(7, 9, 999), Ok(()));
+        t.drop_user(3);
+        t.drop_user(4);
+        t.drop_user(9);
+        assert_eq!(t.waiters(), 0);
+        // A reader waits too, and gets the answer Full when the maker went.
+        assert_eq!(t.wait(7, 5, 5), Ok(()));
+        t.detach(7, 1);
+        assert_eq!(t.ready(), Some((5, 7, 5)));
+        assert_eq!(t.get(7, 5, false), Got::Full);
+    }
+
     /// A full table makes the caller go without registering; an attach of a
     /// forked child makes the entry that went.
     #[test]
     fn a_full_table_and_an_attach() {
-        let mut t = Shares::<u32>::new();
+        let mut t = Shares::<u32, u32>::new();
         for key in 0..SHARES as u64 {
             assert_eq!(t.get(key + 100, 1, true), Got::Reserved);
         }

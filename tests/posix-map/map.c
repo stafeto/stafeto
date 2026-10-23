@@ -8,6 +8,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <spawn.h>
@@ -426,6 +428,131 @@ static void files(void) {
     if (dirfd >= 0) close(dirfd);
     close(fd);
     unlink(scratch);
+}
+
+/* The maker of a shared object holds the entry reserved for a while
+ * (stafeto_probe_fill_pause of the layer); the pause is in milliseconds. */
+extern void stafeto_probe_fill_pause(unsigned milliseconds);
+
+static const char *racing = "/tmp/posix-map-race";
+#define RACE_PAGES 128
+
+static int make_race_file(void) {
+    int fd = open(racing, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    static char block[PAGE];
+    for (size_t at = 0; at < RACE_PAGES * PAGE; at += PAGE) {
+        for (size_t i = 0; i < PAGE; i++) block[i] = (char)('a' + (at / PAGE + i) % 26);
+        if (pwrite(fd, block, PAGE, (off_t)at) != (ssize_t)PAGE) { close(fd); return -1; }
+    }
+    return fd;
+}
+
+/* The page `page` of the race file reads as its maker filled it. */
+static int race_page_ok(const char *p, size_t page) {
+    return p[page * PAGE + 3] == (char)('a' + (page + 3) % 26);
+}
+
+static void pause_ms(long ms) {
+    struct timespec t = {ms / 1000, ms % 1000 * 1000000L};
+    nanosleep(&t, NULL);
+}
+
+/* A process asks for the shared object of a file while another is making
+ * it (the maker pauses 300 ms with the entry reserved): it waits for the
+ * maker, whatever the levels of the two, and gets the same pages, not a
+ * copy of its own. A write of either shows in the other. */
+static void shared_while_made(void) {
+    int ready[2], done[2], go[2];
+    int fd = make_race_file();
+    check("race: the file", fd >= 0);
+    check("race: pipes", pipe(ready) == 0 && pipe(done) == 0 && pipe(go) == 0);
+    if (fd < 0) return;
+    pid_t maker = fork();
+    if (maker < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; return; }
+    if (maker == 0) {
+        int bad = 0;
+        char c = 'r';
+        stafeto_probe_fill_pause(300);
+        if (write(ready[1], &c, 1) != 1) _exit(1);
+        char *a = mmap(NULL, RACE_PAGES * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (a == MAP_FAILED) _exit(2);
+        if (!race_page_ok(a, 100)) bad |= 4;
+        a[1] = 'R';
+        c = 'd';
+        if (write(done[1], &c, 1) != 1) _exit(3);
+        if (read(go[0], &c, 1) != 1) _exit(5);
+        if (a[0] != 'Q') bad |= 8;
+        _exit(bad);
+    }
+    char c = 0;
+    check("race: the maker is on its way", read(ready[0], &c, 1) == 1);
+    /* The maker has the entry reserved and sleeps. */
+    pause_ms(100);
+    char *p = mmap(NULL, RACE_PAGES * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("race: mmap while another makes the object", p != MAP_FAILED);
+    if (p != MAP_FAILED) {
+        check("race: the file is in the pages", race_page_ok(p, 100) && race_page_ok(p, 0));
+        check("race: the maker is done", read(done[0], &c, 1) == 1);
+        check("race: the maker's write shows", p[1] == 'R');
+        p[0] = 'Q';
+        check("race: tell the maker", write(go[1], &c, 1) == 1);
+    } else {
+        write(go[1], &c, 1);
+    }
+    int status = 0;
+    check("race: waitpid", waitpid(maker, &status, 0) == maker);
+    check("race: our write shows in the maker", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: race: the maker ended with %d\n", WEXITSTATUS(status));
+    if (p != MAP_FAILED) munmap(p, RACE_PAGES * PAGE);
+    close(fd);
+    unlink(racing);
+    close(ready[0]); close(ready[1]); close(done[0]); close(done[1]); close(go[0]); close(go[1]);
+}
+
+/* Two threads of one process map one file at once: one object, so the
+ * first thread's write shows in the second thread's mapping. */
+static volatile int race_start;
+static char *volatile race_maps[2];
+
+static void *race_thread(void *arg) {
+    long which = (long)arg;
+    int fd = open(racing, O_RDWR);
+    while (!race_start) sched_yield();
+    char *p = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    race_maps[which] = p == MAP_FAILED ? NULL : p;
+    close(fd);
+    return NULL;
+}
+
+static void shared_by_two_threads(void) {
+    int fd = make_race_file();
+    check("threads: the file", fd >= 0);
+    if (fd < 0) return;
+    close(fd);
+    stafeto_probe_fill_pause(50);
+    pthread_t threads[2];
+    race_start = 0;
+    race_maps[0] = race_maps[1] = NULL;
+    int made = 1;
+    for (long i = 0; i < 2; i++) made &= pthread_create(&threads[i], NULL, race_thread, (void *)i) == 0;
+    check("threads: create", made);
+    race_start = 1;
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], NULL);
+    stafeto_probe_fill_pause(0);
+    char *a = race_maps[0], *b = race_maps[1];
+    check("threads: both mapped", a && b);
+    if (a && b) {
+        check("threads: the file is in the pages", race_page_ok(a, 2) && race_page_ok(b, 2));
+        a[7] = 'Z';
+        check("threads: one object, a write shows", b[7] == 'Z');
+        b[9] = 'Y';
+        check("threads: and back", a[9] == 'Y');
+    }
+    if (a) munmap(a, 4 * PAGE);
+    if (b) munmap(b, 4 * PAGE);
+    unlink(racing);
 }
 
 /* shm_open: a name for a shared object, the pages the same in a child,
@@ -975,6 +1102,8 @@ int main(int argc, char **argv) {
     shared_anonymous();
     files();
     shared_names();
+    shared_while_made();
+    shared_by_two_threads();
     review();
     leaving();
     unrelated_processes();

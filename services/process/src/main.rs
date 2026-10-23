@@ -297,7 +297,7 @@ struct Processes {
     /// for once it set a signal on the page (Router).
     routers: [Option<Handle<Thread>>; RECORDS],
     /// The objects of shared memory the processes map as the same pages.
-    shares: Shares<Handle<Memory>>,
+    shares: Shares<Handle<Memory>, Pending>,
     /// The witness of each record's process, which init gave with ADOPT:
     /// it closes once the process ended, and init hears of the end.
     witnesses: [Option<Handle<Channel>>; RECORDS],
@@ -529,6 +529,16 @@ fn cpu_ticks(record: &Record<Handle<Process>>) -> (u64, u64) {
             .saturating_add(record.children_kernel),
     )
 }
+/// What the rendezvous answers to a Get of the shared memory of a file.
+enum Taken {
+    /// The kind of the reply (`proto_process::SHARED_*`) and the object.
+    Reply(u32, Option<(u32, Handle<Memory>)>),
+    /// The copy of the object's handle failed.
+    Failed(abi::Error),
+    /// The object is made now.
+    Busy,
+}
+
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
@@ -1263,6 +1273,79 @@ impl Processes {
         Answer::Status(Status::Ok)
     }
 
+    /// The answer to a Get of `key` by the process in `index`, which may write
+    /// the file when `write`: the object (a copy of its handle), the right to
+    /// make it, no place for it, or Busy (it is made now). The grant of the
+    /// caller is used up by every answer but Busy.
+    fn share_take(&mut self, index: usize, key: u64, write: bool) -> Taken {
+        let (kind, found) = match self.shares.get(key, index, write) {
+            Got::Found(pages, memory) => {
+                let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                if write {
+                    rights = rights | Rights::MAP_WRITE;
+                }
+                match sys::handle_duplicate(memory, rights) {
+                    Ok(copy) => (proto_process::SHARED_FOUND, Some((pages, copy))),
+                    Err(e) => return Taken::Failed(e),
+                }
+            }
+            Got::Reserved => (proto_process::SHARED_RESERVED, None),
+            Got::Full => (proto_process::SHARED_FULL, None),
+            Got::Busy => return Taken::Busy,
+        };
+        self.shares.revoke(index, key);
+        Taken::Reply(kind, found)
+    }
+
+    /// Answers the waiting Get `pending` with `kind` and the object.
+    fn share_reply(
+        pending: Pending,
+        kind: u32,
+        found: Option<(u32, Handle<Memory>)>,
+    ) -> Result<(), Status> {
+        let mut w = Writer::new();
+        w.u32(0)?;
+        w.u32(kind)?;
+        w.u32(found.as_ref().map_or(0, |(pages, _)| *pages))?;
+        let handles = match found {
+            Some((_, copy)) => Outgoing::from([copy.erase()]),
+            None => Outgoing::new(),
+        };
+        let _ = pending.answer(w.as_bytes(), handles);
+        Ok(())
+    }
+
+    /// Answers the Gets that waited for an object whose maker made it or
+    /// went: each asks the table again, the oldest first, and the first of
+    /// those whose maker went becomes the maker. O(WAITING * (WAITING +
+    /// SHARES)), at most WAITING answers; the table, a process that ended
+    /// and the Put and Detach call it.
+    fn wake_sharers(&mut self) {
+        while let Some((record, key, pending)) = self.shares.ready() {
+            // The grant stands until the answer; a caller whose grant is gone
+            // (it was replaced by newer ones) is refused as at the first ask.
+            let Some(write) = self.shares.granted(record, key) else {
+                let _ = pending.answer(
+                    &proto_wire::reply(Status::from_code(proto_process::PERMISSION)),
+                    Outgoing::new(),
+                );
+                continue;
+            };
+            match self.share_take(record, key, write) {
+                Taken::Reply(kind, found) => {
+                    let _ = Self::share_reply(pending, kind, found);
+                }
+                Taken::Failed(e) => {
+                    let _ = pending.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new());
+                }
+                // `ready` leaves nothing that is made now.
+                Taken::Busy => {
+                    let _ = Self::share_reply(pending, proto_process::SHARED_BUSY, None);
+                }
+            }
+        }
+    }
+
     /// Share: the rendezvous of shared memory (`Method::Share`). Put and
     /// Attach take the object, Get answers with a copy of it; the table
     /// is searched through, 16 entries.
@@ -1288,26 +1371,26 @@ impl Processes {
         };
         match operation {
             proto_process::SHARE_GET if r.handles.is_empty() => {
-                let result = self.shares.get(key, index, write);
-                let busy = matches!(result, Got::Busy);
-                let (kind, found) = match result {
-                    Got::Found(pages, memory) => {
-                        let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
-                        if write {
-                            rights = rights | Rights::MAP_WRITE;
-                        }
-                        match sys::handle_duplicate(memory, rights) {
-                            Ok(copy) => (proto_process::SHARED_FOUND, Some((pages, copy))),
-                            Err(e) => return kernel(e),
-                        }
+                let (kind, found) = match self.share_take(index, key, write) {
+                    Taken::Reply(kind, found) => (kind, found),
+                    Taken::Failed(e) => return kernel(e),
+                    // Another thread or process makes the object: the reply
+                    // waits for it, or for the maker's end (`wake_sharers`).
+                    Taken::Busy => {
+                        let Some(pending) = r.defer() else {
+                            return Answer::Status(Status::BadSize);
+                        };
+                        return match self.shares.wait(key, index, pending) {
+                            Ok(()) => Answer::Deferred,
+                            // No place for one more: Busy at once.
+                            Err(pending) => {
+                                let _ =
+                                    Self::share_reply(pending, proto_process::SHARED_BUSY, None);
+                                Answer::Deferred
+                            }
+                        };
                     }
-                    Got::Reserved => (proto_process::SHARED_RESERVED, None),
-                    Got::Full => (proto_process::SHARED_FULL, None),
-                    Got::Busy => (proto_process::SHARED_BUSY, None),
                 };
-                if !busy {
-                    self.shares.revoke(index, key);
-                }
                 let pages = found.as_ref().map_or(0, |(pages, _)| *pages);
                 if r.reply().u32(0).is_err()
                     || r.reply().u32(kind).is_err()
@@ -1337,10 +1420,12 @@ impl Processes {
                     self.shares.attach(key, index, pages, memory, write);
                     self.shares.revoke(index, key);
                 }
+                self.wake_sharers();
                 Answer::Status(Status::Ok)
             }
             proto_process::SHARE_DETACH if r.handles.is_empty() => {
                 self.shares.detach(key, index);
+                self.wake_sharers();
                 Answer::Status(Status::Ok)
             }
             _ => refuse(proto_process::INVALID),
@@ -3302,6 +3387,7 @@ impl Processes {
         // The timers of timer_create go with the old image; the alarm goes on.
         // So do its mappings: it uses no shared memory any more.
         self.shares.drop_user(index);
+        self.wake_sharers();
         self.timers.clear(index as u8, false);
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
@@ -4200,6 +4286,7 @@ impl Service<0> for Processes {
         self.routers[index] = None;
         self.queued.clear(index);
         self.shares.drop_user(index);
+        self.wake_sharers();
         self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {
             self.child_ended(parent, index, end);
