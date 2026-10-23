@@ -149,6 +149,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-lifetimes", 41),
     ("posix-lock-ring", 26),
     ("posix-shares", 12),
+    ("posix-shares smp 4", 12),
     ("posix-lock-core", 11),
     ("posix-lock-pages", 25),
     ("posix-lock-queue-core", 24),

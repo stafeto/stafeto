@@ -548,6 +548,9 @@ pub const POSIX_SHARES_TABLE: &[Record] = &[
     POSIX_PROCS_TABLE[3],
     Record {
         args: b"posix-procs\0shares-main\0",
+        // The CPUs of the services: the probe finds that its children of
+        // fork keep them though the process service has every CPU.
+        cpus: GENERAL_CPUS,
         ..POSIX_PROCS_TABLE[4]
     },
     POSIX_PROCS_TABLE[5],

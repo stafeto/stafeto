@@ -2683,6 +2683,32 @@ static void *shares_holder(void *arg) {
     return NULL;
 }
 
+/* The CPU mask the layer shows for this process, as one word. */
+static unsigned long cpu_word(void) {
+    cpu_set_t set;
+    unsigned long word = 0;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return ~0ul;
+    memcpy(&word, &set, sizeof word);
+    return word;
+}
+
+/* The child of fork with no exec (kernel spec 8, #419): it has the mask of
+ * its parent, which is the record's in init's table (the CPUs 0 and 1 where
+ * the machine has them), though the process service itself may use every
+ * CPU, and a CPU outside the mask is refused to it with EINVAL. A child that
+ * the service made with the mask of the service would show every CPU. */
+static int mask_child(unsigned long parent, long online) {
+    if (cpu_word() != parent) return 11;
+    if (online < 3) return 0;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(online - 1, &set);
+    errno = 0;
+    if (sched_setaffinity(0, sizeof set, &set) == 0 || errno != EINVAL) return 12;
+    return 0;
+}
+
 static int shares_role(void) {
     enum { MAX = 100 };
     pthread_t threads[MAX];
@@ -2713,9 +2739,12 @@ static int shares_role(void) {
     shares_stop = 1;
     for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
     /* The numbers of the threads that ended come back with the threads. */
+    long online = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned long mine = cpu_word();
+    expect("the mask of the record", mine, online >= 2 ? 3ul : 1ul);
     errno = 0;
     pid = fork();
-    if (pid == 0) _exit(0);
+    if (pid == 0) _exit(mask_child(mine, online));
     expect("fork after the threads ended", pid > 0, 1);
     if (pid > 0) {
         int status = 0;

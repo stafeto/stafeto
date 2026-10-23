@@ -321,7 +321,6 @@ extern "C" fn work(_: u64) -> ! {
     }
 }
 
-/// Loads an instance of `record` from `program` with the label `label` on
 /// The CPU mask of an instance of `record` (process_create x8, kernel spec
 /// 13.4): the mask of the record cut to the CPUs that are up. A record none
 /// of whose CPUs is up gets all that are, and a line says so.
@@ -337,6 +336,7 @@ pub fn cpus_of(record: &Record) -> u8 {
     mask
 }
 
+/// Loads an instance of `record` from `program` with the label `label` on
 /// init's channel (rt::loader::spawn): `quota` (the record's, and more for
 /// the process service, serve.rs), room for handles, ceiling and priority
 /// from the record, the notification of its end at its base priority
