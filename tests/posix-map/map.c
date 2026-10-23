@@ -58,6 +58,77 @@ static char *anon(size_t len, int prot) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+/* What the handler with SA_SIGINFO saw of the last fault. */
+static volatile int seen_signal, seen_code;
+static void *volatile seen_addr;
+
+static void on_fault_info(int signal, siginfo_t *info, void *context) {
+    (void)context;
+    seen_signal = signal;
+    seen_code = info->si_code;
+    seen_addr = info->si_addr;
+    faults++;
+    siglongjmp(jump, 1);
+}
+
+static int fault_seen(int code, const void *addr) {
+    return seen_signal == SIGSEGV && seen_code == code && seen_addr == addr;
+}
+
+static void forget_fault(void) {
+    seen_signal = seen_code = 0;
+    seen_addr = NULL;
+}
+
+/* 1 when a jump to `at` raises SIGSEGV with SEGV_ACCERR and `at` itself as
+ * the address (an instruction abort), 0 when it runs or says anything else. */
+static int jump_faults(char *at) {
+    void (*target)(void) = (void (*)(void))(void *)at;
+    forget_fault();
+    if (sigsetjmp(jump, 1)) return fault_seen(SEGV_ACCERR, at);
+    target();
+    return 0;
+}
+
+/* A page without access stops a read and a write with SIGSEGV, SEGV_ACCERR
+ * and the faulting address; an unmapped page says SEGV_MAPERR. A jump to a
+ * page of data is a fault too, whatever its access (PROT_EXEC is refused,
+ * so no page of the map is executable), at the address jumped to. */
+static void none_page_faults(void) {
+    struct sigaction info = {.sa_sigaction = on_fault_info, .sa_flags = SA_SIGINFO}, old;
+    check("none: sigaction", sigaction(SIGSEGV, &info, &old) == 0);
+    char *p = anon(3 * PAGE, PROT_READ | PROT_WRITE);
+    check("none: mmap", p != NULL);
+    if (!p) return;
+    p[0] = 1;
+    check("none: mprotect", mprotect(p + PAGE, PAGE, PROT_NONE) == 0);
+    forget_fault();
+    check("none: a read faults", read_faults(p + PAGE + 24));
+    check("none: the read says ACCERR and its address", fault_seen(SEGV_ACCERR, p + PAGE + 24));
+    forget_fault();
+    check("none: a write faults", write_faults(p + PAGE + 40));
+    check("none: the write says ACCERR and its address", fault_seen(SEGV_ACCERR, p + PAGE + 40));
+    check("none: the neighbours are fine", !write_faults(p) && !write_faults(p + 2 * PAGE));
+    check("none: munmap the page", munmap(p + PAGE, PAGE) == 0);
+    check("none: an unmapped page of the map faults", read_faults(p + PAGE + 8));
+    /* An address the layer never gave out: the walk finds no descriptor. */
+    forget_fault();
+    char *never = (char *)0x70000000UL;
+    check("none: a never mapped address faults", read_faults(never + 8));
+    check("none: the never mapped address says MAPERR", fault_seen(SEGV_MAPERR, never + 8));
+    /* A jump to a page of data, writable and read-only: the page is not
+     * executable, whatever else it allows. */
+    check("none: mprotect read", mprotect(p + 2 * PAGE, PAGE, PROT_READ) == 0);
+    check("none: a jump to a read-only page says ACCERR at its address",
+          jump_faults(p + 2 * PAGE + 16));
+    check("none: mprotect write", mprotect(p + 2 * PAGE, PAGE, PROT_READ | PROT_WRITE) == 0);
+    check("none: a jump to a writable page says ACCERR at its address",
+          jump_faults(p + 2 * PAGE + 32));
+    check("none: restore the handler", sigaction(SIGSEGV, &old, NULL) == 0);
+    munmap(p, PAGE);
+    munmap(p + 2 * PAGE, PAGE);
+}
+
 /* mprotect on a whole mapping: read-only stops the write, none stops the
  * read, and the access comes back. */
 static void protect_whole(size_t len, const char *who) {
@@ -896,6 +967,7 @@ int main(int argc, char **argv) {
     unmap_part(4, "small");
     unmap_part(40, "large");
     protect_across();
+    none_page_faults();
     errors();
     forked();
     churn();
