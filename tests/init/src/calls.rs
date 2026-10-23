@@ -1509,14 +1509,17 @@ fn process_create_checks_its_arguments() -> Outcome {
             .into_iter()
             .all(|[x3, x4, x5]| {
                 x0_alone::<N>(
-                    &[quota, limit, ceiling, x3, x4, x5],
+                    &[quota, limit, ceiling, x3, x4, x5, 0, 0, 0],
                     Error::InvalidArgs.code(),
                 )
             })
     });
-    let pairs = [[0, 5], [gone, 0]]
-        .into_iter()
-        .all(|[x3, x4]| x0_alone::<N>(&[page, 16, 20, x3, x4, 0], Error::InvalidArgs.code()));
+    let pairs = [[0, 5], [gone, 0]].into_iter().all(|[x3, x4]| {
+        x0_alone::<N>(
+            &[page, 16, 20, x3, x4, 0, 0, 0, 0],
+            Error::InvalidArgs.code(),
+        )
+    });
     check(
         values,
         "a bad quota, limit or ceiling did not fail with INVALID_ARGS alone before the handles",
@@ -1544,7 +1547,7 @@ fn quota_is_enforced() -> Outcome {
     let own = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let over = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
     let mut x = marked();
-    x[..6].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0]);
+    x[..9].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0, 0, 0, 0]);
     // SAFETY: process_create only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) };
     check(

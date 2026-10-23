@@ -369,11 +369,16 @@ pub fn create_with_exit(
         "a thread above the ceiling of its process; the call checks it first"
     );
     process::thread_room(process)?;
+    // The number comes off the share of the process's payer before the
+    // table is asked (spec 7.5), and goes back with the number
+    // (`give_number`) or when the thread is not made.
+    process::charge_thread(process)?;
     if sched::locked(|k| k.tokens.available()) == 0 {
+        process::refund_thread(process);
         return Err(Error::LimitReached);
     }
     if let Some((c, _, _)) = exit {
-        channel::reserve_source(c)?;
+        channel::reserve_source(c).inspect_err(|_| process::refund_thread(process))?;
     }
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
@@ -406,6 +411,7 @@ pub fn create_with_exit(
         if let Some((c, _, _)) = exit {
             channel::remove_source(c);
         }
+        process::refund_thread(process);
     })?;
     let index = sched::locked(|k| k.tokens.alloc(thread)).expect("a free thread number went");
     // SAFETY: the thread was just made, nothing else refers to it, and its
@@ -484,6 +490,11 @@ pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
         // SAFETY: the caller's promise; only the field is written.
         unsafe { (*t.as_ptr()).numbers.index = NONE };
         tokens.free(index);
+        // The number came off the share of the payer of the thread's
+        // process, which the thread's reference to the process keeps
+        // (spec 7.5).
+        // SAFETY: the thread is alive and holds its process.
+        process::refund_thread(unsafe { (*t.as_ptr()).process });
     }
 }
 

@@ -1165,7 +1165,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 262;
+const INIT_TESTS: u32 = 263;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -5033,6 +5033,11 @@ const _: () = assert!(KERNEL_B_MAX < TERM_B);
 /// `teardown::begin`, in the call that ends the process (the row
 /// `end_call`), outside this portion. The path of a thread that is ready
 /// stays one take of `OBJ`.
+/// `THREADS_READY_MAX` 3 022 -> 3 115 (#354, thread number shares): the end
+/// of a thread gives its number back to the share of its process's payer
+/// (`give_number`: the process, the payer, one subtraction), 8 instructions
+/// a thread for the 12 of the portion; 3 111 measured, 96 over the 3 015
+/// before. The path of a thread that is ready stays one take of `OBJ`.
 /// `NULL_MAX` 266 -> 271 (SMP stage 1): the gate of a process, the atomic
 /// reads of the scheduler's decision and the upcall state under the
 /// scheduler lock moved the null call from 263 to 267 instructions (the
@@ -5080,7 +5085,7 @@ const B4_TAKES_ENFORCED: bool = true;
 /// limit keeps above the measure.
 const OBJ_HOLD_SLACK: u64 = 500;
 const OBJ_HOLD_KEEP: u64 = 250;
-const THREADS_READY_MAX: u64 = 3_022;
+const THREADS_READY_MAX: u64 = 3_115;
 const S5_ICOUNT_MAX: u64 = 3_063;
 /// S5x on the real processor (SMP stage 6): the median of 200 requests for
 /// the handler of a thread on another CPU, in ticks of the counter (16 ns),

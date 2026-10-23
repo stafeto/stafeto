@@ -807,7 +807,7 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     let first = c.insert(Object::Resource, Rights::NONE)?;
     c.close(first)?;
     quota_cases(c, n)?;
-    let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
+    let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
     let found = unsafe { c.process.as_ref() }.lookup(child, OWNER_RIGHTS, Object::process);
     // SAFETY: the handle holds the child.
@@ -837,15 +837,15 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     let page = PAGE_SIZE;
     let q = process::quota(c.process);
     let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
-    c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
+    c.fails(n, &[over, 16, 30, 0, 0, 0, 0, 0, 0], Error::NoMemory)?;
     let before = q.used();
-    c.fails(n, &[page, 16, 30, 0, 0, 0], Error::NoMemory)?;
+    c.fails(n, &[page, 16, 30, 0, 0, 0, 0, 0, 0], Error::NoMemory)?;
     cleanup::drain();
     check(
         process::quota(c.process).used() == before + page,
         "a child that was not made kept the caller's quota beyond the page of its shells",
     )?;
-    let least = c.created(n, &[2 * page, 16, 30, 0, 0, 0])?;
+    let least = c.created(n, &[2 * page, 16, 30, 0, 0, 0, 0, 0, 0])?;
     let result = full_child_cases(c, least).and_then(|()| full_table_thread_quota_cases(c, least));
     c.close(least)?;
     cleanup::drain();
@@ -865,7 +865,7 @@ fn exit_and_start_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
     let q = CHILD_QUOTA;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
-    let result = with_full_table(c, n, &[q, 16, 20, h.0, 5, 0])
+    let result = with_full_table(c, n, &[q, 16, 20, h.0, 5, 0, 0, 0, 0])
         .and_then(|()| channel_of(c, h))
         .and_then(|ch| moved_start(c, h, ch));
     c.close(h)?;
@@ -879,7 +879,7 @@ fn moved_start(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'stat
     let rights = Rights::NOTIFY | Rights::TRANSFER;
     let start = c.insert(Object::Channel(ch), rights)?;
     let n = Call::ProcessCreate.number();
-    let child = c.created(n, &[CHILD_QUOTA, 16, 20, h.0, 5, start.0])?;
+    let child = c.created(n, &[CHILD_QUOTA, 16, 20, h.0, 5, start.0, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
     let table = unsafe { c.process.as_ref() };
     let gone = table.lookup(start, Rights::NONE, Object::channel);
@@ -936,7 +936,7 @@ pub fn table_chunks_are_paid_by_the_owner(_: &Boot) -> Result<(), &'static str> 
         let first = c.insert(Object::Resource, Rights::NONE)?;
         let before = process::quota(c.process).used();
         let n = Call::ProcessCreate.number();
-        let child = c.created(n, &[CHILD_QUOTA, 2 * CHUNK as u64, 20, 0, 0, 0])?;
+        let child = c.created(n, &[CHILD_QUOTA, 2 * CHUNK as u64, 20, 0, 0, 0, 0, 0, 0])?;
         let result = owner_pays(c, child, before);
         c.close(child)?;
         cleanup::drain();
@@ -988,7 +988,7 @@ pub fn child_shell_is_paid_by_the_parent(_: &Boot) -> Result<(), &'static str> {
         let first = c.insert(Object::Resource, Rights::NONE)?;
         c.close(first)?;
         let before = process::quota(c.process).used();
-        let children = [0, 1].map(|_| c.created(n, &[least, 16, 20, 0, 0, 0]));
+        let children = [0, 1].map(|_| c.created(n, &[least, 16, 20, 0, 0, 0, 0, 0, 0]));
         let result = match children {
             [Ok(a), Ok(b)] => shells_cases(c, [a, b], before),
             _ => Err("a child with the least quota was not made"),
@@ -1028,7 +1028,7 @@ fn shells_cases(c: &Caller, children: [Handle; 2], before: u64) -> Result<(), &'
 pub fn entry_0_of_a_child_stays_bad(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let n = Call::ProcessCreate.number();
-        let child = c.created(n, &[CHILD_QUOTA, 16, 20, 0, 0, 0])?;
+        let child = c.created(n, &[CHILD_QUOTA, 16, 20, 0, 0, 0, 0, 0, 0])?;
         let result = start_entry_cases(c, child);
         c.close(child)?;
         result
@@ -1057,10 +1057,10 @@ fn start_entry_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     cleanup::drain();
     let processes = process::in_use();
-    with_full_table(c, n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
+    with_full_table(c, n, &[CHILD_QUOTA, 16, 30, 0, 0, 0, 0, 0, 0])?;
     let q = process::quota(c.process);
     let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(PAGE_SIZE);
-    with_full_table(c, n, &[over, 16, 30, 0, 0, 0])?;
+    with_full_table(c, n, &[over, 16, 30, 0, 0, 0, 0, 0, 0])?;
     cleanup::drain();
     check(
         process::in_use() == processes,
@@ -1255,7 +1255,7 @@ pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static
 fn kill_cases(c: &Caller) -> Result<(), &'static str> {
     let child = c.created(
         Call::ProcessCreate.number(),
-        &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+        &[CHILD_QUOTA, 16, 20, 0, 0, 0, 0, 0, 0],
     )?;
     let make = |buffer| {
         let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
@@ -1605,7 +1605,7 @@ pub fn kill_hastens_a_dying_process(_: &Boot) -> Result<(), &'static str> {
         sched::set_priority(c.thread, 20, Policy::Fifo, false).map_err(|_| "no priority 20")?;
         let child = c.created(
             Call::ProcessCreate.number(),
-            &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+            &[CHILD_QUOTA, 16, 20, 0, 0, 0, 0, 0, 0],
         )?;
         let ready = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
             .map_err(|_| "no thread")?;
@@ -2190,7 +2190,7 @@ pub fn teardown_level_is_at_least_the_notice(_: &Boot) -> Result<(), &'static st
         let result = c
             .created(
                 Call::ProcessCreate.number(),
-                &[CHILD_QUOTA, 16, 20, h.0, 20, 0],
+                &[CHILD_QUOTA, 16, 20, h.0, 20, 0, 0, 0, 0],
             )
             .and_then(|child| {
                 let level = child_of(c, child).map(|p| {
@@ -2222,7 +2222,7 @@ pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
         let result = c
             .created(
                 Call::ProcessCreate.number(),
-                &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
+                &[CHILD_QUOTA, 16, 20, h.0, 10, 0, 0, 0, 0],
             )
             .and_then(|child| {
                 c.succeeds(Call::ProcessKill.number(), &[child.0, 0], &[])?;
@@ -2259,7 +2259,7 @@ pub fn notices_to_a_dying_parent_go_with_its_channel(_: &Boot) -> Result<(), &'s
         .and_then(|h| {
             parent.created(
                 Call::ProcessCreate.number(),
-                &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
+                &[CHILD_QUOTA, 16, 20, h.0, 10, 0, 0, 0, 0],
             )
         });
     // SAFETY: the parent's process is the test's.
@@ -4153,7 +4153,10 @@ pub fn process_create_polls_between_its_portions(_: &Boot) -> Result<(), &'stati
         let first = c.insert(Object::Resource, Rights::NONE)?;
         c.close(first)?;
         let n = Call::ProcessCreate.number();
-        let args = [CHILD_QUOTA, 16, 20, 0, 0, 0];
+        // A share of 4 thread numbers and 8 timers: the first portion
+        // takes them off the caller, and they come back with the child.
+        let args = [CHILD_QUOTA, 16, 20, 0, 0, 0, 4, 8, 0];
+        let shares = process::shares(c.process);
         // SAFETY: the thread is the test's and never runs.
         let elr = || unsafe { c.thread.as_ref() }.regs.elr;
         let at_svc = elr() - 4;
@@ -4195,8 +4198,19 @@ pub fn process_create_polls_between_its_portions(_: &Boot) -> Result<(), &'stati
             ceiling == 20 && process::parent(child) == Some(c.process),
             "the handle does not name the child the call made",
         )?;
+        let held = process::shares(c.process);
+        check(
+            (held.threads.used, held.timers.used)
+                == (shares.threads.used + 4, shares.timers.used + 8)
+                && process::shares(child).own,
+            "the child did not take its share off the caller",
+        )?;
         c.close(Handle(got[1]))?;
         cleanup::drain();
+        check(
+            process::shares(c.process) == shares,
+            "the shares of the child did not come back to the caller",
+        )?;
         Ok(())
     })?;
     check(
@@ -4222,7 +4236,8 @@ pub fn another_call_gives_the_child_of_process_create_up(_: &Boot) -> Result<(),
             process::quota(c.process).used(),
             channel::info(channel).sources,
         );
-        let args = [CHILD_QUOTA, 16, 20, exit.0, 5, 0];
+        let args = [CHILD_QUOTA, 16, 20, exit.0, 5, 0, 4, 8, 0];
+        let shares = process::shares(c.process);
         let (mut held, mut given_up) = (false, false);
         with_interrupt_pending(|| {
             c.call(n, &args);
@@ -4256,6 +4271,10 @@ pub fn another_call_gives_the_child_of_process_create_up(_: &Boot) -> Result<(),
             channel::info(channel).queued == 0,
             "the exit channel heard of a child that was given up",
         )?;
+        check(
+            process::shares(c.process) == shares,
+            "the shares of a child that was given up did not come back",
+        )?;
         c.close(exit)
     })
 }
@@ -4272,7 +4291,7 @@ pub fn killed_caller_lets_the_child_of_process_create_go(_: &Boot) -> Result<(),
     let pending = with_interrupt_pending(|| {
         c.call(
             Call::ProcessCreate.number(),
-            &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+            &[CHILD_QUOTA, 16, 20, 0, 0, 0, 4, 8, 0],
         );
         stopped = matches!(thread::long(c.thread), Some(Long::Spawn(_)));
         Ok(())
@@ -8203,4 +8222,210 @@ pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
         "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_portion={portion} longest_portion={longest}"
     );
     Ok(())
+}
+
+/// Ends `child`, drops the test's reference and lets the teardown run.
+fn end_child(child: NonNull<Process>) {
+    // SAFETY: the reference `create_child_with` handed out is the test's,
+    // and nothing uses the child afterwards.
+    unsafe {
+        process::end(child, ProcessState::Killed, CAUSE);
+        process::release(child, CAUSE);
+    }
+    cleanup::drain();
+}
+
+/// A thread of `p` that never runs, or the error of its creation.
+fn bare_thread(p: NonNull<Process>) -> Result<NonNull<Thread>, Error> {
+    thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+}
+
+/// A child with a share of 4 thread numbers has 4 threads and refuses the
+/// fifth with LIMIT_REACHED (spec 7.5, 8); the creator's count is up by the
+/// whole share while the child lives, and the two parts of the return, the
+/// free part at the stage Quota and the rest with the shell, give back
+/// exactly 4 (the shell's `return_rest` stops on a count left charged).
+pub fn child_with_a_share_refuses_the_numbers_beyond_it(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let before = process::shares(c.process);
+        let child = process::create_child_with(c.process, CHILD_QUOTA, 16, 20, (4, 8), 0)
+            .map_err(|_| "no child")?;
+        let mut made = [None; 4];
+        let mut result = Ok(());
+        for slot in &mut made {
+            match bare_thread(child) {
+                Ok(t) => *slot = Some(t),
+                Err(_) => result = Err("a thread within the share was refused"),
+            }
+        }
+        let fifth = bare_thread(child);
+        let taken = process::shares(c.process);
+        let own = process::shares(child);
+        for t in made.into_iter().flatten() {
+            // SAFETY: the reference `create` handed out is the test's.
+            unsafe { thread::release(t, CAUSE) };
+        }
+        end_child(child);
+        let after = process::shares(c.process);
+        result?;
+        check(
+            fifth.err() == Some(Error::LimitReached),
+            "a fifth thread of a share of four was not refused with LIMIT_REACHED",
+        )?;
+        check(
+            taken.threads.used == before.threads.used + 4
+                && taken.timers.used == before.timers.used + 8,
+            "the share did not come off the creator's whole",
+        )?;
+        check(
+            own.own && (own.threads.limit, own.threads.used) == (4, 4),
+            "the child does not hold its share",
+        )?;
+        check(
+            after == before,
+            "the two parts of the return did not give back the share",
+        )
+    })
+}
+
+/// A child with no share of its own pays from the share of its creator's
+/// payer: its threads count there, and the number goes back as soon as the
+/// thread goes. A grandchild with a share of its own takes it off the same
+/// payer of the child (spec 7.5).
+pub fn child_without_a_share_pays_from_the_creators(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let before = process::shares(c.process);
+        let child = process::create_child_with(c.process, CHILD_QUOTA, 16, 20, (0, 0), 0)
+            .map_err(|_| "no child")?;
+        let own = process::shares(child);
+        check(
+            !own.own && own.threads.limit == 0 && own.timers.limit == 0,
+            "a child with no share has one",
+        )?;
+        let [a, b] = [0, 1].map(|_| bare_thread(child));
+        let (a, b) = (a.map_err(|_| "no thread")?, b.map_err(|_| "no thread")?);
+        check(
+            process::shares(c.process).threads.used == before.threads.used + 2,
+            "the threads of a child with no share did not count against its creator",
+        )?;
+        // SAFETY: the reference `create` handed out is the test's.
+        unsafe { thread::release(a, CAUSE) };
+        cleanup::drain();
+        check(
+            process::shares(c.process).threads.used == before.threads.used + 1,
+            "the number of a thread that went did not come back at once",
+        )?;
+        let grandchild = process::create_child_with(child, CHILD_QUOTA / 4, 16, 20, (3, 5), 0);
+        let taken = process::shares(c.process);
+        let held = grandchild.map_err(|_| "no grandchild")?;
+        // SAFETY: as above.
+        unsafe { thread::release(b, CAUSE) };
+        end_child(held);
+        end_child(child);
+        check(
+            taken.threads.used == before.threads.used + 1 + 3 && taken.timers.used == 5,
+            "a grandchild's share did not come off the payer of the child",
+        )?;
+        check(
+            process::shares(c.process) == before,
+            "the shares did not all come back",
+        )
+    })
+}
+
+/// Timers count as thread numbers do (spec 7.5, 10): a child with a share of
+/// 2 timer places refuses the third with LIMIT_REACHED, the system's count
+/// stays below the bound, and the places go back with the timers.
+pub fn timer_places_come_off_the_share(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let before = process::shares(c.process);
+        let system = timers::in_use();
+        let ch = channel::create(c.process, 10).map_err(|_| "no channel")?;
+        // SAFETY: the reference `create` handed out is the test's, and the
+        // timers hold the channel meanwhile.
+        let child = process::create_child_with(c.process, CHILD_QUOTA, 16, 20, (4, 2), 0)
+            .map_err(|_| "no child");
+        let result = child.and_then(|child| {
+            let first = timers::create(child, ch, 0, 10).map_err(|_| "no timer");
+            let second = timers::create(child, ch, 0, 10).map_err(|_| "no timer");
+            let third = timers::create(child, ch, 0, 10);
+            let taken = process::shares(child).timers.used;
+            for t in [first, second].into_iter().flatten() {
+                // SAFETY: the reference `create` handed out is the test's.
+                unsafe { timers::release(t, CAUSE) };
+            }
+            cleanup::drain();
+            let back = process::shares(child).timers.used;
+            end_child(child);
+            first?;
+            second?;
+            check(
+                third.err() == Some(Error::LimitReached) && taken == 2,
+                "a third timer of a share of two was not refused",
+            )?;
+            check(back == 0, "the places did not go back with the timers")
+        });
+        // SAFETY: the test's reference goes, the last one.
+        unsafe { channel::release(ch, Rights::NONE, CAUSE) };
+        cleanup::drain();
+        result?;
+        check(
+            process::shares(c.process) == before && timers::in_use() == system,
+            "a timer or its place stayed after the test",
+        )
+    })
+}
+
+/// process_create with shares (spec 11): a share above what the creator's
+/// payer has left is LIMIT_REACHED, with nothing taken, and before the
+/// quota's NO_MEMORY; a share with the quota too big for the creator fails
+/// with NO_MEMORY and gives the share back; one of the two alone, or a
+/// value above the system's, is INVALID_ARGS.
+pub fn process_create_takes_its_shares_before_the_quota(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        c.close(first)?;
+        let n = Call::ProcessCreate.number();
+        let before = process::shares(c.process);
+        let over = process::quota(c.process).limit() + PAGE_SIZE;
+        let all = THREADS as u64;
+        c.fails(
+            n,
+            &[CHILD_QUOTA, 16, 30, 0, 0, 0, all, 8, 0],
+            Error::LimitReached,
+        )?;
+        c.fails(n, &[over, 16, 30, 0, 0, 0, all, 8, 0], Error::LimitReached)?;
+        c.fails(n, &[over, 16, 30, 0, 0, 0, 4, 8, 0], Error::NoMemory)?;
+        check(
+            process::shares(c.process) == before,
+            "a process_create that failed kept a share",
+        )?;
+        for (x6, x7) in [
+            (4, 0),
+            (0, 8),
+            (all + 1, 8),
+            (4, abi::MAX_SYSTEM_TIMERS as u64 + 1),
+        ] {
+            c.fails(
+                n,
+                &[CHILD_QUOTA, 16, 30, 0, 0, 0, x6, x7, 0],
+                Error::InvalidArgs,
+            )?;
+        }
+        let h = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0, 4, 8, 0])?;
+        let held = process::shares(c.process);
+        let child = child_of(c, h)?;
+        check(
+            process::shares(child).own
+                && held.threads.used == before.threads.used + 4
+                && held.timers.used == before.timers.used + 8,
+            "a child made with shares did not take them",
+        )?;
+        c.close(h)?;
+        cleanup::drain();
+        check(
+            process::shares(c.process) == before,
+            "the shares did not come back with the child",
+        )
+    })
 }

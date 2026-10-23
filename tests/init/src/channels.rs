@@ -806,7 +806,15 @@ fn sources_give_their_slots_back() -> Outcome {
         close(session(&c, Rights::NONE, label, QUIET)?)?;
         let gone = sys::try_receive(&c);
         close(timer(&c)?)?;
-        let child = sys::process_create_with(LEAST_QUOTA, 16, LOW, Some((&c, QUIET)), None);
+        let child = sys::process_create_with(
+            LEAST_QUOTA,
+            16,
+            LOW,
+            Some((&c, QUIET)),
+            None,
+            sys::Shares::CREATOR,
+            0,
+        );
         close(child.map_err(|_| "process_create with an exit channel failed")?)?;
         let ended = sys::try_receive(&c);
         check(
@@ -848,8 +856,16 @@ pub(crate) fn heard_child(
     priority: u8,
     ceiling: u8,
 ) -> Result<Handle<Process>, &'static str> {
-    sys::process_create_with(CHILD_QUOTA, 16, ceiling, Some((name, priority)), None)
-        .map_err(|_| "process_create with an exit channel failed")
+    sys::process_create_with(
+        CHILD_QUOTA,
+        16,
+        ceiling,
+        Some((name, priority)),
+        None,
+        sys::Shares::CREATOR,
+        0,
+    )
+    .map_err(|_| "process_create with an exit channel failed")
 }
 
 /// The exit notification of a child whose exit channel carried `label`:
@@ -880,10 +896,11 @@ pub(crate) fn wait_exit(exits: &Handle<Channel>, label: u64) -> Outcome {
 }
 
 /// x0-x9 for process_create of a child with CHILD_QUOTA, 16 handles and
-/// ceiling LOW, and `x3`, `x4` and `x5`, the rest marked.
+/// ceiling LOW, and `x3`, `x4` and `x5`, no shares and the caller's CPU
+/// mask (x6-x8 zero), the rest marked.
 pub(crate) fn create_regs(x3: abi::Handle, x4: u64, x5: abi::Handle) -> Regs {
     let mut x = marked();
-    x[..6].copy_from_slice(&[CHILD_QUOTA, 16, LOW.into(), x3.0, x4, x5.0]);
+    x[..9].copy_from_slice(&[CHILD_QUOTA, 16, LOW.into(), x3.0, x4, x5.0, 0, 0, 0]);
     x
 }
 
@@ -1068,7 +1085,15 @@ fn start_channel_moves_into_the_child() -> Outcome {
     let moved = c.raw();
     let used = || sys::process_memory(&own()).map(|m| m.used);
     let before = used();
-    let made = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(c));
+    let made = sys::process_create_with(
+        CHILD_QUOTA,
+        16,
+        LOW,
+        Some((&name, QUIET)),
+        Some(c),
+        sys::Shares::CREATOR,
+        0,
+    );
     let Ok(child) = made else {
         close(n)?;
         close(exits)?;

@@ -17,7 +17,7 @@ use proto_init::Method;
 use rt::startup::{Answered, Giver};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 27] = [
+pub(crate) const TESTS: [Test; 28] = [
     (
         "child_with_code_runs_and_exits",
         child_with_code_runs_and_exits,
@@ -103,6 +103,10 @@ pub(crate) const TESTS: [Test; 27] = [
     (
         "reply_to_a_dead_client_is_peer_closed",
         reply_to_a_dead_client_is_peer_closed,
+    ),
+    (
+        "a_greedy_child_cannot_take_the_numbers_of_a_neighbour",
+        a_greedy_child_cannot_take_the_numbers_of_a_neighbour,
     ),
     (
         "a_call_cycle_ends_with_the_kill",
@@ -405,6 +409,26 @@ pub(crate) fn spawn_under(
     ceiling: u8,
     priority: u8,
 ) -> Result<Result<loader::Spawned, Error>, &'static str> {
+    spawn_shared(
+        channel,
+        quota,
+        limit,
+        ceiling,
+        priority,
+        sys::Shares::CREATOR,
+    )
+}
+
+/// `spawn_under` for a child with `shares` of thread numbers and timer
+/// places of its own (process_create x6, x7, spec 7.5).
+pub(crate) fn spawn_shared(
+    channel: &Handle<Channel>,
+    quota: u64,
+    limit: u32,
+    ceiling: u8,
+    priority: u8,
+    shares: sys::Shares,
+) -> Result<Result<loader::Spawned, Error>, &'static str> {
     let program = child_program()?;
     let params = loader::SpawnParams {
         channel,
@@ -416,6 +440,8 @@ pub(crate) fn spawn_under(
         priority,
         policy: Policy::Fifo,
         cpu: SPAWN_CPU.load(Relaxed),
+        shares,
+        cpus: 0,
     };
     // SAFETY: only the loader maps and uses LOADER_WINDOW.
     Ok(unsafe { loader::spawn(&own(), &program, LOADER_WINDOW, params) })
@@ -449,12 +475,24 @@ impl Kid {
         ceiling: u8,
         priority: u8,
     ) -> Result<Kid, &'static str> {
+        Kid::load_shared(quota, limit, ceiling, priority, sys::Shares::CREATOR)
+    }
+
+    /// `load_under` with `shares` of thread numbers and timer places of
+    /// the child's own (process_create x6, x7, spec 7.5).
+    pub(crate) fn load_shared(
+        quota: u64,
+        limit: u32,
+        ceiling: u8,
+        priority: u8,
+        shares: sys::Shares,
+    ) -> Result<Kid, &'static str> {
         let short = |e| match e {
             Error::NoMemory => KID_NO_MEMORY,
             _ => "the child program did not load",
         };
         let ear = Ear::new()?;
-        let spawned = match spawn_under(&ear.channel, quota, limit, ceiling, priority)? {
+        let spawned = match spawn_shared(&ear.channel, quota, limit, ceiling, priority, shares)? {
             Ok(spawned) => spawned,
             Err(e) => {
                 ear.close()?;
@@ -1441,3 +1479,95 @@ fn a_call_cycle_ends_with_the_kill() -> Outcome {
 
 // Requests and replies (spec 6.1, 6.6): init and threads of its own
 // process are clients and services of one another.
+
+/// #354, spec 7.5: a child with a share of 256 thread numbers makes
+/// children that have no share of their own and fills them with 128
+/// threads each, until the kernel refuses a number: that is the 256th,
+/// LIMIT_REACHED, long before the system's table of 1 024 is full. A
+/// neighbour with a share of 16 still gets its 16 threads while the greedy
+/// child holds all it took, init's count is up by both shares, and killing
+/// the greedy child gives its whole share back to init.
+fn a_greedy_child_cannot_take_the_numbers_of_a_neighbour() -> Outcome {
+    const GREEDY: u32 = 256;
+    const NEIGHBOUR: u32 = 16;
+    // The marks of the two children: threads made, the error that stopped
+    // them, children made, and 1 once they stopped.
+    const AT_GREEDY: usize = 13;
+    const AT_NEIGHBOUR: usize = 17;
+    // A grandchild with 128 threads: a message buffer and a part of a page
+    // of the pool for each, tables and its own objects; and the child that
+    // holds two of them with 255 handles of threads and three of children.
+    let grandchild = 300 * PAGE as u64;
+    let greedy_quota = 2 * grandchild + 200 * PAGE as u64;
+    let share = |n: u32| sys::Shares {
+        threads: n,
+        timers: n,
+    };
+    reset_kid_marks();
+    let own = own();
+    let before = sys::process_shares(&own).map_err(|_| "PROCESS_SHARES of init failed")?;
+    let greedy = Kid::load_shared(greedy_quota, 512, LEVEL, LEVEL, share(GREEDY))?;
+    let neighbour = Kid::load_shared(100 * PAGE as u64, 64, LEVEL, LEVEL, share(NEIGHBOUR))?;
+    let shares = sys::process_shares(&own).map_err(|_| "PROCESS_SHARES of init failed")?;
+    check(
+        shares.threads.used == before.threads.used + u64::from(GREEDY + NEIGHBOUR)
+            // The timers of the two `Ear`s are init's too.
+            && shares.timers.used >= before.timers.used + u64::from(GREEDY + NEIGHBOUR),
+        "init was not charged the shares of its two children",
+    )?;
+    let filled = |kid: &Kid, at: usize| -> Outcome {
+        for _ in 0..5000 {
+            if kid_mark(at + 3) == 1 {
+                return Ok(());
+            }
+            if let Ok(state) = sys::process_state(&kid.process)
+                && state != ProcessState::Alive
+            {
+                return Err("a child ended before it stopped at its share");
+            }
+            sleep(PAUSE_NS)?;
+        }
+        Err("a child did not stop at the end of its share")
+    };
+    greedy.start()?;
+    greedy.serve(Role::Greedy, &[grandchild, 128, 4, AT_GREEDY as u64], &[])?;
+    let first = filled(&greedy, AT_GREEDY);
+    neighbour.start()?;
+    neighbour.serve(
+        Role::Greedy,
+        &[0, 100, 0, AT_NEIGHBOUR as u64],
+        &[Gift::Own],
+    )?;
+    let second = filled(&neighbour, AT_NEIGHBOUR);
+    let limit = Error::LimitReached.code();
+    let [took, why, children] = [AT_GREEDY, AT_GREEDY + 1, AT_GREEDY + 2].map(kid_mark);
+    let [own_took, own_why] = [AT_NEIGHBOUR, AT_NEIGHBOUR + 1].map(kid_mark);
+    let held = sys::process_shares(&greedy.process);
+    first?;
+    second?;
+    check(
+        why == limit && took == u64::from(GREEDY) - 1 && children >= 2,
+        "the greedy child did not stop at its share with LIMIT_REACHED",
+    )?;
+    check(
+        own_why == limit && own_took == u64::from(NEIGHBOUR) - 1,
+        "the neighbour did not get all of its share",
+    )?;
+    check(
+        held.is_ok_and(|s| {
+            s.own && s.threads.limit == u64::from(GREEDY) && s.threads.used == u64::from(GREEDY)
+        }),
+        "the greedy child's share is not all used",
+    )?;
+    greedy.close()?;
+    let_run()?;
+    let freed = sys::process_shares(&own).map_err(|_| "PROCESS_SHARES of init failed")?;
+    check(
+        freed.threads.used == before.threads.used + u64::from(NEIGHBOUR),
+        "the share of the greedy child did not come back to init in full",
+    )?;
+    neighbour.close()?;
+    let_run()?;
+    let after = sys::process_shares(&own).map_err(|_| "PROCESS_SHARES of init failed")?;
+    check(after == before, "the shares did not come back to init")
+}

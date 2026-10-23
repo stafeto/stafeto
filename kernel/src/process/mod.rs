@@ -53,7 +53,7 @@ use kcore::PAGE_SIZE;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
-use kcore::quota::Account;
+use kcore::quota::{Account, Share};
 use kcore::sched::{ParkedList, ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
 
@@ -140,6 +140,22 @@ pub struct Process {
     /// Its memory quota: the limit its parent gave, what is charged to
     /// it, and what went back to the parent (spec 7.5).
     quota: Account,
+    /// Its share of thread numbers and of timer places: the counts its
+    /// creator gave it with `process_create` x6 and x7, what is charged to
+    /// them and what went back (spec 7.5). Both at limit 0 for a process
+    /// that pays from the share of its creator.
+    thread_share: Share,
+    timer_share: Share,
+    /// The process whose shares its thread numbers and its timers come off:
+    /// None for itself, which the processes with a share of their own and
+    /// the roots have; otherwise the payer of its creator. Unchanged for
+    /// life, and the payer's shell stays while this process's shell does
+    /// (each shell holds its parent's), so a number or a place that comes
+    /// back late finds it.
+    share_payer: Option<NonNull<Process>>,
+    /// The CPUs its threads run on (`process_create` x8), a subset of its
+    /// creator's, unchanged for life (spec 8).
+    cpus: u8,
     /// The pages of `pools` and the list pages that name them, each
     /// charged to `quota`: they go back at the stage Shell (spec 7.8).
     pages: PageLog,
@@ -324,6 +340,33 @@ impl Process {
     }
 }
 
+/// What `create` gives a process besides its quota (spec 7.5, 8): the
+/// counts of its shares of thread numbers and timer places, the payer of
+/// those it spends (None: itself), and its CPU mask.
+#[derive(Clone, Copy)]
+struct Grant {
+    threads: u32,
+    timers: u32,
+    payer: Option<NonNull<Process>>,
+    cpus: u8,
+}
+
+/// The mask of the CPUs that are up.
+fn all_cpus() -> u8 {
+    ((1u32 << crate::smp::cpus()) - 1) as u8
+}
+
+/// The grant of a root: every thread number and every timer place of the
+/// system, paid by itself, and every CPU that is up.
+fn root_grant() -> Grant {
+    Grant {
+        threads: thread::THREADS as u32,
+        timers: abi::MAX_SYSTEM_TIMERS,
+        payer: None,
+        cpus: all_cpus(),
+    }
+}
+
 /// A process with a quota of `quota` bytes, an empty address space, an
 /// empty handle table for up to `handle_limit` handles and priority
 /// ceiling `ceiling`, and no parent yet; the caller gets its first
@@ -340,6 +383,7 @@ fn create(
     handle_limit: u32,
     ceiling: u8,
     payer: Option<NonNull<Process>>,
+    grant: Grant,
 ) -> Result<NonNull<Process>, Error> {
     let ceiling = kcore::args::priority_arg(u64::from(ceiling))?;
     kcore::args::handle_limit_arg(u64::from(handle_limit))?;
@@ -355,6 +399,10 @@ fn create(
         refs: Refs::one(),
         shell_refs: 0,
         quota,
+        thread_share: Share::new(grant.threads),
+        timer_share: Share::new(grant.timers),
+        share_payer: grant.payer,
+        cpus: grant.cpus,
         pages: PageLog::new(),
         pools: Pools {
             threads: Pool::new(),
@@ -503,7 +551,7 @@ pub fn create_init(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, E
         return Err(Error::NoMemory);
     }
     let quota = crate::mm::phys::free_frames() * PAGE_SIZE;
-    create(quota, handle_limit, ceiling, None)
+    create(quota, handle_limit, ceiling, None, root_grant())
 }
 
 /// A process with no parent for the kernel tests, as `create` makes one:
@@ -511,7 +559,7 @@ pub fn create_init(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, E
 /// checked all the same when its shell goes (Account::return_rest).
 #[cfg(feature = "ktest")]
 pub fn create_root(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
-    create(quota, handle_limit, ceiling, None)
+    create(quota, handle_limit, ceiling, None, root_grant())
 }
 
 /// A child of `parent`, which lives (spec 4, 7.5): `quota` comes off the
@@ -521,17 +569,136 @@ pub fn create_root(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull
 /// the parent in two parts: at once when the child is not made, and
 /// otherwise what is free at the child's stage Quota and the rest when
 /// its shell goes. The page of the pool stays the parent's.
+#[cfg(feature = "ktest")]
 pub fn create_child(
     parent: NonNull<Process>,
     quota: u64,
     handle_limit: u32,
     ceiling: u8,
 ) -> Result<NonNull<Process>, Error> {
-    charge(parent, quota)?;
-    let child = create(quota, handle_limit, ceiling, Some(parent))
-        .inspect_err(|_| refund(parent, quota))?;
+    create_child_with(parent, quota, handle_limit, ceiling, (0, 0), 0)
+}
+
+/// `create_child` with shares and a CPU mask, as process_create checked
+/// them (x6-x8): `shares` the thread numbers and timer places the child
+/// gets off the payer of `parent`, both 0 for a child that pays from that
+/// payer's shares, and `cpus` a subset of the parent's mask, 0 for the
+/// parent's. LIMIT_REACHED when the payer's shares fall short, thread
+/// numbers first, and then NO_MEMORY for the quota; whatever was taken
+/// goes back when the child is not made.
+pub fn create_child_with(
+    parent: NonNull<Process>,
+    quota: u64,
+    handle_limit: u32,
+    ceiling: u8,
+    shares: (u32, u32),
+    cpus: u8,
+) -> Result<NonNull<Process>, Error> {
+    let cpus = if cpus == 0 { self::cpus(parent) } else { cpus };
+    assert!(
+        cpus & !self::cpus(parent) == 0,
+        "a child on CPUs its parent lacks; the call checks it first"
+    );
+    // SAFETY: the caller holds a reference to the parent, and so its payer
+    // lives (`share_payer`).
+    let payer = unsafe { payer_of(parent) };
+    let (threads, timers) = shares;
+    // SAFETY: as above; only the fields are borrowed.
+    unsafe {
+        let p = payer.as_ptr();
+        (*p).thread_share.charge(threads)?;
+        if let Err(e) = (*p).timer_share.charge(timers) {
+            (*p).thread_share.refund(threads);
+            return Err(e);
+        }
+    }
+    let give_back = || {
+        // SAFETY: as above.
+        unsafe {
+            (*payer.as_ptr()).thread_share.refund(threads);
+            (*payer.as_ptr()).timer_share.refund(timers);
+        }
+    };
+    charge(parent, quota).inspect_err(|_| give_back())?;
+    let grant = Grant {
+        threads,
+        timers,
+        payer: if threads == 0 { Some(payer) } else { None },
+        cpus,
+    };
+    let child = create(quota, handle_limit, ceiling, Some(parent), grant).inspect_err(|_| {
+        refund(parent, quota);
+        give_back();
+    })?;
     adopt(parent, child);
     Ok(child)
+}
+
+/// The process whose shares `process` spends (`Process::share_payer`).
+///
+/// # Safety
+/// `process` is alive.
+unsafe fn payer_of(process: NonNull<Process>) -> NonNull<Process> {
+    // SAFETY: the caller's promise; only the field is read.
+    unsafe { (*process.as_ptr()).share_payer }.unwrap_or(process)
+}
+
+/// Charges one thread number to the payer of `process` (spec 7.5, 8):
+/// LIMIT_REACHED when its share has none left. thread::create asks after
+/// the bound of the process and before the table.
+pub fn charge_thread(process: NonNull<Process>) -> Result<(), Error> {
+    crate::obj::assert_held();
+    // SAFETY: the caller holds a reference to the process, whose shell
+    // holds its payer's; only the field is borrowed.
+    unsafe { (*payer_of(process).as_ptr()).thread_share.charge(1) }
+}
+
+/// Gives a thread number back to the payer of `process`.
+pub fn refund_thread(process: NonNull<Process>) {
+    crate::obj::assert_held();
+    // SAFETY: as in `charge_thread`.
+    unsafe { (*payer_of(process).as_ptr()).thread_share.refund(1) }
+}
+
+/// Charges one timer place to the payer of `process`, as `charge_thread`;
+/// timer::create asks after the bound of the process and before the
+/// system's.
+pub fn charge_timer(process: NonNull<Process>) -> Result<(), Error> {
+    crate::obj::assert_held();
+    // SAFETY: as in `charge_thread`.
+    unsafe { (*payer_of(process).as_ptr()).timer_share.charge(1) }
+}
+
+/// Gives a timer place back to the payer of `process`.
+pub fn refund_timer(process: NonNull<Process>) {
+    crate::obj::assert_held();
+    // SAFETY: as in `charge_thread`.
+    unsafe { (*payer_of(process).as_ptr()).timer_share.refund(1) }
+}
+
+/// The shares of `process`, as PROCESS_SHARES reports them.
+pub fn shares(process: NonNull<Process>) -> abi::ProcessShares {
+    // SAFETY: the caller holds a reference to the process; only the fields
+    // are read.
+    let p = unsafe { &*process.as_ptr() };
+    let share = |a: &Share| abi::Share {
+        limit: a.limit().into(),
+        used: a.used().into(),
+        returned: a.returned().into(),
+    };
+    abi::ProcessShares {
+        threads: share(&p.thread_share),
+        timers: share(&p.timer_share),
+        own: p.share_payer.is_none(),
+    }
+}
+
+/// The CPUs the threads of `process` run on (spec 8): unchanged for life,
+/// read without a lock.
+pub fn cpus(process: NonNull<Process>) -> u8 {
+    // SAFETY: the caller holds a reference to the process; the field never
+    // changes.
+    unsafe { (*process.as_ptr()).cpus }
 }
 
 /// Charges `bytes` to the quota of `process`: NO_MEMORY when they do not

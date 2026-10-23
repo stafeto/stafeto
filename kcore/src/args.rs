@@ -73,6 +73,27 @@ pub fn notify_priority_arg(raw: u64, channel: bool) -> Result<u8, Error> {
     }
 }
 
+/// The shares of `process_create` from x6 and x7 (spec 7.5, 11): both 0,
+/// the child pays from its creator's shares, or x6 the thread numbers
+/// (1 up to `threads`, the system table) and x7 the timers (1 up to
+/// `timers`, the system bound) it gets of them. INVALID_ARGS for one of
+/// the two alone, and for a value above its bound.
+pub fn shares_arg(x6: u64, x7: u64, threads: u32, timers: u32) -> Result<(u32, u32), Error> {
+    match (x6, x7) {
+        (0, 0) => Ok((0, 0)),
+        (n, t) if (1..=u64::from(threads)).contains(&n) && (1..=u64::from(timers)).contains(&t) => {
+            Ok((n as u32, t as u32))
+        }
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// The CPU mask of `process_create` from x8 (spec 11): bits 0-7, 0 for the
+/// caller's own mask. INVALID_ARGS for a bit above them.
+pub fn cpu_mask_arg(raw: u64) -> Result<u8, Error> {
+    u8::try_from(raw).map_err(|_| Error::InvalidArgs)
+}
+
 /// ACCESS_DENIED when `priority` is above any of `ceilings` (spec 8):
 /// for `thread_create` and `thread_set_priority` the ceilings of the
 /// thread's process and of the caller's, for the ceiling of a child and a
@@ -693,5 +714,30 @@ mod tests {
         for va in [0, 8, 0x100_0800, TOP, TOP + PAGE_SIZE, !(PAGE_SIZE - 1)] {
             assert_eq!(check_buffer(va), Err(Error::InvalidArgs));
         }
+    }
+
+    #[test]
+    fn shares_come_in_pairs_within_their_bounds() {
+        assert_eq!(shares_arg(0, 0, 1024, 8192), Ok((0, 0)));
+        assert_eq!(shares_arg(1, 1, 1024, 8192), Ok((1, 1)));
+        assert_eq!(shares_arg(1024, 8192, 1024, 8192), Ok((1024, 8192)));
+        for (n, t) in [
+            (1, 0),
+            (0, 1),
+            (1025, 1),
+            (1, 8193),
+            (u64::MAX, 1),
+            (1 << 32 | 1, 1),
+        ] {
+            assert_eq!(shares_arg(n, t, 1024, 8192), Err(Error::InvalidArgs));
+        }
+    }
+
+    #[test]
+    fn cpu_mask_is_a_byte() {
+        assert_eq!(cpu_mask_arg(0), Ok(0));
+        assert_eq!(cpu_mask_arg(0xff), Ok(0xff));
+        assert_eq!(cpu_mask_arg(0x100), Err(Error::InvalidArgs));
+        assert_eq!(cpu_mask_arg(1 << 32), Err(Error::InvalidArgs));
     }
 }

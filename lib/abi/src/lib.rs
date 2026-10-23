@@ -154,16 +154,20 @@ pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 pub const START_CHANNEL: Handle = Handle::new(0, 1);
 
 /// Threads of one process that have not ended, at most (spec 8):
-/// `thread_create` past it fails with LIMIT_REACHED.
+/// `thread_create` past it fails with LIMIT_REACHED. The number of each
+/// also comes off the share of thread numbers of the process's payer
+/// (`process_create` x6, spec 7.5), after this bound and before the table.
 pub const MAX_THREADS: u32 = 128;
 
 /// Timers one process pays for, at most (spec 10): `timer_create` past it
-/// fails with LIMIT_REACHED.
+/// fails with LIMIT_REACHED. Each also comes off the share of timers of the
+/// payer's share payer (`process_create` x7, spec 7.5), after this bound.
 pub const MAX_TIMERS: u32 = 192;
 
 /// Timers the whole system holds, at most (spec 10): `timer_create` past it
-/// fails with LIMIT_REACHED after the bound of the process; arming never
-/// fails. The heap of a level is then at most 13 deep.
+/// fails with LIMIT_REACHED after the bound of the process and its share;
+/// arming never fails. The heap of a level is then at most 13 deep. The
+/// shares of timers (spec 7.5) divide it: init holds all of it.
 pub const MAX_SYSTEM_TIMERS: u32 = 8192;
 
 /// Mappings of one process, at most (spec 7.4): `mem_map` past it fails
@@ -805,8 +809,15 @@ pub const INFO_PROCESS_TIME: u64 = 14;
 /// from EL0 spent in the kernel (system time; the rest of the ticks since
 /// the start is user time and the kernel's other work) and in x5 the number
 /// of the CPU the caller runs on. INVALID_ARGS for a CPU past those that
-/// are up or a handle in x0.
+/// are up or a handle in x0. x6 is the CPU mask of the caller's process
+/// (`process_create` x8): the CPUs its threads may run on.
 pub const INFO_CPU: u64 = 15;
+/// PROCESS_SHARES takes a process, no rights, and x2 zero. In x1-x3 the limit,
+/// what is charged and what went back to the creator for the thread numbers
+/// of the process (`ProcessShares::threads`), in x4-x6 the same for its
+/// timers, and in x7 1 when the process pays from a share of its own, 0
+/// when it pays from the share of its creator (spec 7.5, #354).
+pub const INFO_PROCESS_SHARES: u64 = 16;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -899,6 +910,58 @@ impl ProcessMemory {
             quota: words[0],
             used: words[1],
             returned: words[2],
+        }
+    }
+}
+
+/// A share of a process (spec 7.5): a count of thread numbers or of timer
+/// places, the limit its creator gave it, what is charged to it now, and
+/// what went back to the creator, as `ProcessMemory` has them in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Share {
+    pub limit: u64,
+    pub used: u64,
+    pub returned: u64,
+}
+
+/// The shares of a process (object_info PROCESS_SHARES): its thread
+/// numbers and its timer places, and whether it pays from them. A process
+/// that pays from the share of its creator has both at limit 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessShares {
+    pub threads: Share,
+    pub timers: Share,
+    pub own: bool,
+}
+
+impl ProcessShares {
+    /// The words `object_info` returns in x1-x7.
+    pub const fn to_words(self) -> [u64; 7] {
+        [
+            self.threads.limit,
+            self.threads.used,
+            self.threads.returned,
+            self.timers.limit,
+            self.timers.used,
+            self.timers.returned,
+            self.own as u64,
+        ]
+    }
+
+    /// The shares from x1-x7 of `object_info`.
+    pub const fn from_words(w: [u64; 7]) -> ProcessShares {
+        ProcessShares {
+            threads: Share {
+                limit: w[0],
+                used: w[1],
+                returned: w[2],
+            },
+            timers: Share {
+                limit: w[3],
+                used: w[4],
+                returned: w[5],
+            },
+            own: w[6] != 0,
         }
     }
 }
@@ -1795,6 +1858,20 @@ mod tests {
         };
         assert_eq!(memory.to_words(), [64 << 10, 1536, (64 << 10) - 1536]);
         assert_eq!(ProcessMemory::from_words(memory.to_words()), memory);
+        let shares = ProcessShares {
+            threads: Share {
+                limit: 4,
+                used: 2,
+                returned: 1,
+            },
+            timers: Share {
+                limit: 8,
+                used: 3,
+                returned: 0,
+            },
+            own: true,
+        };
+        assert_eq!(ProcessShares::from_words(shares.to_words()), shares);
     }
 
     #[test]
@@ -1843,6 +1920,7 @@ mod tests {
     fn thread_info_round_trips() {
         assert_eq!(INFO_THREAD_STATE, 6);
         assert_eq!(INFO_CPU, 15);
+        assert_eq!(INFO_PROCESS_SHARES, 16);
         let states = [
             ThreadState::Stopped,
             ThreadState::Ready,

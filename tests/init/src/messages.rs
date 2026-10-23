@@ -833,8 +833,16 @@ fn close_round(sender: bool) -> Outcome {
     let c = channel(QUIET)?;
     let moved = copy(&c, Rights::RECEIVE | Rights::TRANSFER)?;
     let (exits, name) = exit_channel()?;
-    let child = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(moved))
-        .map_err(|_| "process_create with a start channel failed")?;
+    let child = sys::process_create_with(
+        CHILD_QUOTA,
+        16,
+        LOW,
+        Some((&name, QUIET)),
+        Some(moved),
+        sys::Shares::CREATOR,
+        0,
+    )
+    .map_err(|_| "process_create with a start channel failed")?;
     let send = copy(&c, Rights::SEND)?;
     let waits = if sender { &send } else { &c };
     HANDLES[0].store(waits.raw().0, Relaxed);

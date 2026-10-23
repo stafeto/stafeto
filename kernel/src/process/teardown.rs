@@ -9,7 +9,7 @@ use super::table::table;
 use super::{
     Channel, ChildLinks, Error, LIVE, NonNull, Object, Owner, PAGE_SIZE, Process, ProcessState,
     ROOTS, Source, Thread, accepted, child_links, cleanup, control, end, object, pages, paid_free,
-    refs, refund, release, release_shell, remove_thread, sched, thread,
+    payer_of, refs, refund, release, release_shell, remove_thread, sched, thread,
 };
 use crate::syscall;
 
@@ -707,6 +707,22 @@ unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
     }
 }
 
+/// Gives back to the payer of `parent` the thread numbers and timer places
+/// `shares` a child got off it (spec 7.5): the child's own shares, a part
+/// at its stage Quota and the rest with its shell. A child with no share of
+/// its own has nothing to give back.
+///
+/// # Safety
+/// `parent` is alive, and so is its payer.
+unsafe fn give_back_shares(parent: NonNull<Process>, shares: (u32, u32)) {
+    // SAFETY: the caller's promise; only the fields are touched.
+    unsafe {
+        let payer = payer_of(parent).as_ptr();
+        (*payer).thread_share.refund(shares.0);
+        (*payer).timer_share.refund(shares.1);
+    }
+}
+
 /// The stage Quota: the free part of the quota goes back to the parent
 /// (Account::return_free), and nothing is charged to the process from
 /// then on; then the process leaves its parent's list of children. The
@@ -721,10 +737,15 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
     // process holds its shell, and so are the neighbours in its list.
     unsafe {
         let free = (*p).quota.return_free();
+        let shares = (
+            (*p).thread_share.return_free(),
+            (*p).timer_share.return_free(),
+        );
         let Some(parent) = (*p).parent else {
             return true;
         };
         refund(parent, free);
+        give_back_shares(parent, shares);
         let ChildLinks { prev, next } = (*p)
             .child_siblings
             .take()
@@ -813,7 +834,7 @@ unsafe fn give_back_pages(p: *mut Process, batch: &[Option<NonNull<u8>>; SHELL_P
 unsafe fn free(process: NonNull<Process>, level: u8) {
     // SAFETY: the caller's promise; only the fields are touched, and the
     // exit source goes with the shell.
-    let (parent, rest) = unsafe {
+    let (parent, rest, shares) = unsafe {
         let p = process.as_ptr();
         assert!(
             (*p).accepted.is_empty(),
@@ -822,7 +843,14 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
         if let Some(e) = (*p).exit.as_mut() {
             e.detach(level);
         }
-        ((*p).parent, (*p).quota.return_rest())
+        (
+            (*p).parent,
+            (*p).quota.return_rest(),
+            (
+                (*p).thread_share.return_rest(),
+                (*p).timer_share.return_rest(),
+            ),
+        )
     };
     // SAFETY: the caller's promise; every stage gave its memory back, and
     // the parent's pool is there, since the shell holds the parent's.
@@ -835,6 +863,8 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
     }
     if let Some(parent) = parent {
         refund(parent, rest);
+        // SAFETY: the shell holds the parent's, and so its payer's.
+        unsafe { give_back_shares(parent, shares) };
         // SAFETY: the shell's reference to its parent goes with it.
         unsafe { release_shell(parent, level) };
     }
