@@ -562,6 +562,7 @@ mod steps {
     /// The ticks the step in progress has waited, after the answer of init to
     /// its HEARTBEAT came, for the levels above the service to let it run.
     static PREEMPTED: AtomicU64 = AtomicU64::new(0);
+    static BEATS: AtomicU64 = AtomicU64::new(0);
     static PREEMPTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
     /// The message buffer of the thread that leads the step in progress
     /// (`msgbuf::address`, one per thread): only its sends count as the
@@ -665,6 +666,17 @@ mod steps {
     pub fn waited(ticks: u64) {
         if crate::msgbuf::address() == LEADER.load(Ordering::Relaxed) {
             WAITED.fetch_add(ticks, Ordering::Relaxed);
+        }
+    }
+
+    /// A reply of init with a counter inside the span of its send was
+    /// divided: the count goes out as `service beats: T N` at each power of
+    /// two, for `xtask` to see that the division works in every service.
+    pub fn divided() {
+        let n = BEATS.fetch_add(1, Ordering::Relaxed) + 1;
+        let tag = REPORT.load(Ordering::Relaxed);
+        if n.is_power_of_two() && tag != 0 && !QUIET.load(Ordering::Relaxed) {
+            crate::println!("service beats: {tag} {n}");
         }
     }
 
@@ -809,6 +821,13 @@ pub(crate) fn waited(ticks: u64) {
 #[cfg(feature = "step-stats")]
 pub(crate) fn preempted(ticks: u64) {
     steps::preempted(ticks);
+}
+
+/// Counts a HEARTBEAT whose reply carried a counter inside the span of the
+/// send (feature `step-stats`; `sys::send_beat` calls it).
+#[cfg(feature = "step-stats")]
+pub(crate) fn divided() {
+    steps::divided();
 }
 
 /// Counts the notification step in progress apart from the others (feature

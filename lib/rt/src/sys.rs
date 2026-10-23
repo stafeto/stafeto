@@ -1215,16 +1215,25 @@ pub(crate) fn send_beat(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply
     let sent = call::<{ Call::Send.number() }>(&args);
     #[cfg(feature = "step-stats")]
     let ended = crate::time::now();
-    let reply = reply_of(sent.inspect_err(|_| {
-        #[cfg(feature = "step-stats")]
-        crate::service::waited(ended.saturating_sub(began));
-    })?)?;
+    let reply = match sent.and_then(reply_of) {
+        Ok(reply) => reply,
+        Err(error) => {
+            // The wait is the wait for init whatever came back.
+            #[cfg(feature = "step-stats")]
+            crate::service::waited(ended.saturating_sub(began));
+            return Err(error);
+        }
+    };
     #[cfg(feature = "step-stats")]
     {
         let mut buffer = [0; MESSAGE_MAX];
-        let at = proto_init::heartbeat_counter(reply.bytes(&mut buffer))
-            .filter(|at| (began..=ended).contains(at))
-            .unwrap_or(ended);
+        let at = match proto_init::heartbeat_counter(reply.bytes(&mut buffer)) {
+            Some(at) if (began..=ended).contains(&at) => {
+                crate::service::divided();
+                at
+            }
+            _ => ended,
+        };
         crate::service::waited(at - began);
         crate::service::preempted(ended - at);
     }

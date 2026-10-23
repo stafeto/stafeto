@@ -3,7 +3,7 @@
 # and the head each run `cargo xtask rtbench --minutes 10 --serial`, in the
 # order given, and the figures land in a directory that `cargo xtask
 # rtbench-check` reads (`order`, `base/`, `head/`, rtbench-hvf.txt and
-# rtbench-vz.txt). Before each run the script waits until the one-minute load
+# rtbench-vz.txt). Before each run the script builds, and then waits until the one-minute load
 # average of the host is under LOAD_MAX (4 by default) and writes the load it
 # found to `load.log` in the session directory, so that a session started on
 # a busy host shows it. It gives up on a busy host after WAIT_MAX_MINUTES
@@ -69,6 +69,10 @@ wait_quiet() {
 run_one() {
     which=$1
     tree=$2
+    # The build raises the load of the host itself: it goes first (one short
+    # round, which builds the images of the run), and the wait for a quiet
+    # host comes after it.
+    (cd "$tree" && cargo xtask rtbench --short >/dev/null 2>&1) || return 4
     wait_quiet "$which before" || return 3
     (cd "$tree" && cargo xtask rtbench --minutes 10 --serial)
     cp "$tree/target/measure/rtbench-hvf.txt" "$tree/target/measure/rtbench-vz.txt" "$session/$which/"
