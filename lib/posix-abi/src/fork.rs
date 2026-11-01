@@ -319,6 +319,7 @@ fn regions() -> Result<Regions, i32> {
             access: Access::Read,
             offset: 0,
             shared: false,
+            image: false,
         },
         0u64,
     ); REGIONS_MAX];
@@ -333,6 +334,8 @@ fn regions() -> Result<Regions, i32> {
                     access: piece.access(),
                     offset: u32::try_from(piece.offset()).map_err(|_| ENOMEM)?,
                     shared: object.shared,
+                    image: object.image
+                        && matches!(piece.access(), Access::Read | Access::ReadExec),
                 },
                 object.handle.raw().0,
             );
@@ -344,7 +347,19 @@ fn regions() -> Result<Regions, i32> {
     for (region, raw) in &seen[..count] {
         code |= region.access == Access::ReadExec && region.holds(at);
         let held = Handle::<Memory>::borrowed(rt::abi::Handle(*raw));
-        let copy = if region.shared {
+        let copy = if region.image {
+            // The image goes on to the child as the same object: the code
+            // with the right to execute, never to write.
+            let exec = if region.access == Access::ReadExec {
+                Rights::MAP_EXEC
+            } else {
+                Rights::NONE
+            };
+            rt::sys::handle_duplicate(
+                &*held,
+                Rights::MAP_READ | exec | Rights::DUPLICATE | Rights::TRANSFER,
+            )
+        } else if region.shared {
             // A shared object goes on to the child with the right to write
             // it when the parent's handle has it, and to be copied again.
             rt::sys::handle_duplicate(
@@ -565,15 +580,42 @@ pub fn probe_shared_objects() -> u64 {
 }
 
 /// The most mappings an object of the memory map has, for the probe that
-/// a child's loader leaves no mapping of the parent's objects behind.
+/// a child's loader leaves no mapping of the parent's objects behind. The
+/// objects of the image are left out: the child maps them too (3.12.1).
 pub fn probe_mappings() -> u64 {
     crate::allocation::regions(|map| {
         map.objects()
+            .filter(|(_, o)| !o.image)
             .filter_map(|(_, o)| rt::sys::memory_info(&o.handle).ok())
             .map(|info| info.mappings)
             .max()
             .unwrap_or(0)
     })
+}
+
+/// What the probe of the shared image asks about the object that holds
+/// `address`, for the probes: the mappings of the object now, the bytes of
+/// the process's own quota in use, whether a copy of the object's handle
+/// with MAP_WRITE is granted (1) or refused (0), the pages of the piece
+/// and whether the layer marks the object as image (1 or 0); None when no
+/// piece holds `address`.
+pub fn probe_image(address: usize) -> Option<[u64; 5]> {
+    let (handle, pages, image) = crate::allocation::regions(|map| {
+        let piece = map.piece(map.find(address)?);
+        let object = map.object(piece.object());
+        Some((
+            Handle::<Memory>::borrowed(object.handle.raw()),
+            piece.pages() as u64,
+            u64::from(object.image),
+        ))
+    })?;
+    let mappings = rt::sys::memory_info(&handle).ok()?.mappings;
+    let used = rt::sys::process_memory(crate::allocation::process())
+        .ok()?
+        .used;
+    let writable =
+        rt::sys::handle_duplicate(&*handle, Rights::MAP_READ | Rights::MAP_WRITE).is_ok();
+    Some([mappings, used, u64::from(writable), pages, image])
 }
 
 /// fork ([P24-FORK]; spec 2, 3.2): the calling thread holds every signal
@@ -866,6 +908,7 @@ fn child() -> Result<(), &'static str> {
         offset: entry.offset as usize,
         handle: (!entry.continues).then(|| Handle::from_raw(rt::abi::Handle(entry.handle))),
         shared: entry.shared,
+        image: entry.image,
     });
     // SAFETY: the child's only thread, before anything else of the layer.
     unsafe {

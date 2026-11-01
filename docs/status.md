@@ -123,8 +123,10 @@ thread's level and with no change to the kernel. The parent's other
 threads stop first and the child has one thread; descriptions, offsets
 and the mask carry over, pending signals do not, and a signal sent to the
 group during the copy reaches both. `vfork` is `fork`, and `pthread_atfork`
-handlers run in POSIX's order. There is no copy on write: the child pays
-for every page, so the cost grows with the parent's memory. On HVF (10
+handlers run in POSIX's order. The code and the read-only data of the
+program are the one exception: the child maps the parent's objects, with
+no copy, and pays nothing for them. There is no copy on write: the child
+pays for every other page, so the cost grows with the parent's memory. On HVF (10
 minutes, p50) `fork` to the child's first statement takes 102 us for a
 small parent, 172 us with 1 MiB of heap and 623 us with 8 MiB (rows S15);
 `fork`, `exec` of a small file and `waitpid` take 246 us (S16); each other
