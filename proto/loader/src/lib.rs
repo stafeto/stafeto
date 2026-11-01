@@ -874,8 +874,9 @@ pub const MAP_ENTRY: usize = 24;
 /// One mapped memory object the loader hands the program (spec 2, 3.2):
 /// `pages` whole pages at `address` mapped with `access`, and the value of
 /// a handle to the object that holds MAP_READ, DUPLICATE and TRANSFER
-/// (and MAP_WRITE for a writable part) for the layer's map (posix-map). A
-/// handle never has MAP_EXEC.
+/// (and MAP_WRITE for a writable part) for the layer's map (posix-map). The
+/// handle of the code has MAP_EXEC too, so a forked child maps the same
+/// object; no handle of the code or read-only data has MAP_WRITE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapEntry {
     pub address: u64,
@@ -1028,7 +1029,7 @@ impl Start {
 pub const REGIONS_MAX: usize = abi::MAX_MAPPINGS as usize;
 /// The bytes of an entry of Regions: the address u64, the pages u32, the
 /// access u32 (abi::Access), the first page of the object the region shows
-/// u32 and the flags u32 (`REGION_SHARED`).
+/// u32 and the flags u32 (`REGION_SHARED`, `REGION_IMAGE`).
 pub const REGION: usize = 24;
 /// The heap of the POSIX layer, where the chunks of its map lie.
 pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x2000_0000;
@@ -1055,10 +1056,17 @@ pub struct Region {
     /// The region is shared (MAP_SHARED): the child maps the object itself
     /// and copies nothing.
     pub shared: bool,
+    /// The region is the program's image (code or read-only data): the
+    /// child maps the same object and copies nothing. Only with the access
+    /// Read or ReadExec and not shared.
+    pub image: bool,
 }
 
 /// Flag of an entry of Regions: the object is shared with the child.
 pub const REGION_SHARED: u32 = 1;
+/// Flag of an entry of Regions: the object is the program's image, shared
+/// with the child without a copy.
+pub const REGION_IMAGE: u32 = 2;
 
 impl Region {
     /// The first address past the region.
@@ -1071,15 +1079,25 @@ impl Region {
         w.u32(self.pages)?;
         w.u32(self.access.raw() as u32)?;
         w.u32(self.offset)?;
-        w.u32(if self.shared { REGION_SHARED } else { 0 })
+        w.u32(
+            if self.shared { REGION_SHARED } else { 0 } | if self.image { REGION_IMAGE } else { 0 },
+        )
     }
 
-    /// BAD_SIZE out of the layout, for no pages or an unknown flag.
+    /// BAD_SIZE out of the layout, for no pages, an unknown flag, or an
+    /// image that is shared or writable.
     pub fn read(r: &mut Reader<'_>) -> Result<Region, Status> {
         let (address, pages, access) = (r.u64()?, r.u32()?, r.u32()?);
         let (offset, flags) = (r.u32()?, r.u32()?);
         let access = abi::Access::from_raw(access.into()).ok_or(Status::BadSize)?;
-        if pages == 0 || flags & !REGION_SHARED != 0 {
+        if pages == 0 || flags & !(REGION_SHARED | REGION_IMAGE) != 0 {
+            return Err(Status::BadSize);
+        }
+        let image = flags & REGION_IMAGE != 0;
+        if image
+            && (flags & REGION_SHARED != 0
+                || !matches!(access, abi::Access::Read | abi::Access::ReadExec))
+        {
             return Err(Status::BadSize);
         }
         Ok(Region {
@@ -1088,6 +1106,7 @@ impl Region {
             access,
             offset,
             shared: flags & REGION_SHARED != 0,
+            image,
         })
     }
 
@@ -1210,7 +1229,9 @@ pub fn check_fork(fork: &Fork, held: &[Region]) -> Result<(), Status> {
 /// Whether a private region joins a group: writable, or without access
 /// (copied writable, protected once filled).
 pub fn groupable(region: &Region) -> bool {
-    !region.shared && matches!(region.access, abi::Access::ReadWrite | abi::Access::None)
+    !region.shared
+        && !region.image
+        && matches!(region.access, abi::Access::ReadWrite | abi::Access::None)
 }
 
 /// The objects of a copy of `sorted`, regions sorted by address: the
@@ -1245,13 +1266,16 @@ pub const TRANSFER_SIZE: usize = 8 + 8 * SLOTS + 8 + REGIONS_MAX * FORK_ENTRY;
 /// The bytes of an entry of a transfer: the address u64, the pages u32, the
 /// access u32 (abi::Access), the handle's value u64, the first page of
 /// the object the entry shows u32 and the flags u32 (`ENTRY_CONTINUES`,
-/// `ENTRY_SHARED`).
+/// `ENTRY_SHARED`, `ENTRY_IMAGE`).
 pub const FORK_ENTRY: usize = 32;
 /// Flag of a `ForkEntry`: the entry shows the object of the entry before it
 /// (the handle is 0 and the offset counts in that object).
 pub const ENTRY_CONTINUES: u32 = 1;
 /// Flag of a `ForkEntry`: the object is shared with other processes.
 pub const ENTRY_SHARED: u32 = 2;
+/// Flag of a `ForkEntry`: the object is the program's image (code or
+/// read-only data), the same object the parent maps.
+pub const ENTRY_IMAGE: u32 = 4;
 
 /// One entry (one kernel mapping) of a copy's memory map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1263,6 +1287,7 @@ pub struct ForkEntry {
     pub offset: u32,
     pub continues: bool,
     pub shared: bool,
+    pub image: bool,
 }
 
 impl ForkEntry {
@@ -1273,8 +1298,9 @@ impl ForkEntry {
         out[12..16].copy_from_slice(&(self.access.raw() as u32).to_le_bytes());
         out[16..24].copy_from_slice(&self.handle.to_le_bytes());
         out[24..28].copy_from_slice(&self.offset.to_le_bytes());
-        let flags =
-            (u32::from(self.continues) * ENTRY_CONTINUES) | (u32::from(self.shared) * ENTRY_SHARED);
+        let flags = (u32::from(self.continues) * ENTRY_CONTINUES)
+            | (u32::from(self.shared) * ENTRY_SHARED)
+            | (u32::from(self.image) * ENTRY_IMAGE);
         out[28..].copy_from_slice(&flags.to_le_bytes());
         out
     }
@@ -1285,7 +1311,13 @@ impl ForkEntry {
         let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let access = abi::Access::from_raw(word(12).into())?;
         let flags = word(28);
-        (word(8) > 0 && flags & !(ENTRY_CONTINUES | ENTRY_SHARED) == 0).then_some(ForkEntry {
+        let known = ENTRY_CONTINUES | ENTRY_SHARED | ENTRY_IMAGE;
+        // As Region::read: an image is read-only and not shared.
+        let image = flags & ENTRY_IMAGE != 0;
+        let allowed = !image
+            || (flags & ENTRY_SHARED == 0
+                && matches!(access, abi::Access::Read | abi::Access::ReadExec));
+        (word(8) > 0 && flags & !known == 0 && allowed).then_some(ForkEntry {
             address: long(0),
             pages: word(8),
             access,
@@ -1293,6 +1325,7 @@ impl ForkEntry {
             offset: word(24),
             continues: flags & ENTRY_CONTINUES != 0,
             shared: flags & ENTRY_SHARED != 0,
+            image: flags & ENTRY_IMAGE != 0,
         })
     }
 }
@@ -1856,6 +1889,7 @@ mod tests {
             access,
             offset: 0,
             shared: false,
+            image: false,
         }
     }
 
@@ -2123,6 +2157,7 @@ mod tests {
                 offset: i as u32,
                 continues: i % 2 == 1,
                 shared: i % 5 == 0,
+                image: false,
             })
             .collect();
         let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
@@ -2141,6 +2176,35 @@ mod tests {
         assert_eq!(Transfer::read(&out), None);
     }
 
+    /// An entry of a transfer with the image flag comes with Read or
+    /// ReadExec and not shared; anything else is refused as for a region.
+    #[test]
+    fn an_image_entry_is_read_only_and_not_shared() {
+        let entry = |access, shared| ForkEntry {
+            address: 0x20_0000,
+            pages: 2,
+            access,
+            handle: 9,
+            offset: 0,
+            continues: false,
+            shared,
+            image: true,
+        };
+        for ok in [
+            entry(abi::Access::Read, false),
+            entry(abi::Access::ReadExec, false),
+        ] {
+            assert_eq!(ForkEntry::read(&ok.to_bytes()), Some(ok));
+        }
+        for bad in [
+            entry(abi::Access::ReadWrite, false),
+            entry(abi::Access::None, false),
+            entry(abi::Access::Read, true),
+        ] {
+            assert_eq!(ForkEntry::read(&bad.to_bytes()), None);
+        }
+    }
+
     /// A region of Regions carries its offset and whether it is shared; an
     /// unknown flag is refused.
     #[test]
@@ -2151,6 +2215,7 @@ mod tests {
             access: abi::Access::None,
             offset: 5,
             shared: true,
+            image: false,
         };
         let mut w = Writer::new();
         r.write(&mut w).unwrap();
@@ -2158,8 +2223,37 @@ mod tests {
         assert_eq!(bytes.len(), REGION);
         assert_eq!(Region::read(&mut Reader::new(&bytes)), Ok(r));
         let mut bad = bytes.clone();
-        bad[20] = 2;
+        bad[20] = 8;
         assert!(Region::read(&mut Reader::new(&bad)).is_err());
+        // An image comes with Read or ReadExec and not shared.
+        let image = |access, shared| Region {
+            access,
+            shared,
+            image: true,
+            ..r
+        };
+        for ok in [
+            image(abi::Access::Read, false),
+            image(abi::Access::ReadExec, false),
+        ] {
+            let mut w = Writer::new();
+            ok.write(&mut w).unwrap();
+            assert_eq!(Region::read(&mut Reader::new(w.as_bytes())), Ok(ok));
+        }
+        for bad in [
+            image(abi::Access::ReadWrite, false),
+            image(abi::Access::None, false),
+            image(abi::Access::Read, true),
+        ] {
+            let mut w = Writer::new();
+            bad.write(&mut w).unwrap();
+            assert_eq!(
+                Region::read(&mut Reader::new(w.as_bytes())),
+                Err(Status::BadSize)
+            );
+        }
+        // An image never joins a group.
+        assert!(!groupable(&image(abi::Access::Read, false)));
         // Shared and no-access regions group as the table says.
         let held = [
             region(0x1000, 1, abi::Access::ReadWrite),

@@ -210,10 +210,14 @@ pub unsafe fn adopt(
 ) -> Result<(), Refused> {
     // SAFETY: the caller's promise gives this borrow alone.
     let state = unsafe { &mut *HEAP.0.get() };
-    state
-        .map
-        .push(address, pages, access, 0, Object::new(handle, false, None))
-        .map(drop)
+    // The loader's code and read-only data are the image: immutable, and a
+    // forked child maps the same object (spec 2, 3.12.1).
+    let mut object = Object::new(handle, false, None);
+    if matches!(access, Access::Read | Access::ReadExec) {
+        object.image = true;
+        object.may_write = false;
+    }
+    state.map.push(address, pages, access, 0, object).map(drop)
 }
 
 /// Where a mapping of its own gets its object: a handle the process service
@@ -251,6 +255,8 @@ pub struct ChildEntry {
     pub offset: usize,
     pub handle: Option<Handle<Memory>>,
     pub shared: bool,
+    /// The entry shows an object of the program's image.
+    pub image: bool,
 }
 
 /// The heap of a forked child (spec 2, 3.2): its own process `process`,
@@ -304,6 +310,10 @@ pub unsafe fn after_fork(
                             if let Some(&(_, _, may_write, dirty, _)) = inherited {
                                 object.may_write = may_write;
                                 object.dirty = dirty;
+                            }
+                            if entry.image {
+                                object.image = true;
+                                object.may_write = false;
                             }
                             object
                         })?;

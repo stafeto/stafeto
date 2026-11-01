@@ -245,8 +245,9 @@ struct Loaded {
 /// One object `load` mapped, which the program's memory map keeps (spec 2,
 /// 3.2): where it lies, how many pages, with what access, and a handle
 /// narrowed to MAP_READ, DUPLICATE and TRANSFER, with MAP_WRITE for a
-/// writable part. The handle never carries MAP_EXEC, so the layer cannot
-/// map the code writable or the data executable through it.
+/// writable part and MAP_EXEC for the code. The handle of the code and of
+/// the read-only data never carries MAP_WRITE, so no one can write the
+/// object a forked child shares (spec 2, 3.12.1).
 struct Kept {
     address: u64,
     pages: u32,
@@ -272,6 +273,9 @@ fn keep_region(
     let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
     if access == Access::ReadWrite {
         rights = rights | Rights::MAP_WRITE;
+    }
+    if access == Access::ReadExec {
+        rights = rights | Rights::MAP_EXEC;
     }
     let place = maps.iter_mut().find(|place| place.is_none());
     let (Some(place), Ok(pages)) = (place, u32::try_from(len / PAGE)) else {
@@ -995,9 +999,11 @@ fn take_regions(
     let mut regions = [None; abi::MESSAGE_HANDLES];
     for (i, region) in regions.iter_mut().enumerate().take(count) {
         let read = Region::read(&mut r)?;
-        let reads = handles
-            .info(i)
-            .is_some_and(|(kind, rights)| pl::region_object(kind, rights));
+        // The handle of an image region never writes the object: the
+        // immutability of the image holds here, in the trusted base.
+        let reads = handles.info(i).is_some_and(|(kind, rights)| {
+            pl::region_object(kind, rights) && !(read.image && rights.contains(Rights::MAP_WRITE))
+        });
         if !reads {
             return Err(Status::BadSize);
         }
@@ -1064,7 +1070,7 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
             scratch.regions()[group.start],
             scratch.regions()[group.end - 1],
         );
-        if first.shared {
+        if first.shared || first.image {
             share(own, scratch, group.start)?;
             continue;
         }
@@ -1140,6 +1146,7 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
                 offset: done,
                 continues: done != 0,
                 shared: false,
+                image: false,
             });
             scratch.kept += 1;
             done += pages;
@@ -1152,9 +1159,9 @@ fn copy(own: &Own, fork: &Fork, scratch: &mut Scratch) -> Result<(), u32> {
     Ok(())
 }
 
-/// A shared region: the child maps the parent's object itself at the
-/// parent's address, from the region's offset, and keeps the handle in its
-/// map.
+/// A shared region or an image region (code, read-only data): the child
+/// maps the parent's object itself at the parent's address, from the
+/// region's offset, and keeps the handle in its map.
 fn share(own: &Own, scratch: &mut Scratch, index: usize) -> Result<(), u32> {
     let region = scratch.regions()[index];
     let handle =
@@ -1190,7 +1197,8 @@ fn share(own: &Own, scratch: &mut Scratch, index: usize) -> Result<(), u32> {
         handle: handle.into_raw().0,
         offset: region.offset,
         continues: false,
-        shared: true,
+        shared: region.shared,
+        image: region.image,
     });
     scratch.kept += 1;
     Ok(())
