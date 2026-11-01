@@ -11550,16 +11550,16 @@ mod tests {
     }
 
     /// A report of a loader that copied a small program, and one of the
-    /// full-map fork with the request `Regions` of `ticks` at 87 regions.
+    /// full-map fork with the request `Regions` of `ticks` at 116 regions.
     fn loaders(ticks: u64) -> Vec<String> {
         let mut lines = loader_lines(
             "boot\nloader step: kind 1 900 ticks detail 4096\nloader step: kind 4 5000 ticks detail 4096\nloader step: kind 9 70000 ticks detail 7",
         );
         lines.push("loader step: kind 1 950 ticks detail 4096".into());
         lines.push("loader step: kind 4 5200 ticks detail 4096".into());
-        lines.push(format!("loader step: kind 8 {ticks} ticks detail 87"));
-        lines.push("loader step: kind 9 91000 ticks detail 87".into());
-        lines.push("posix-procs: steps: fork with 80 one page mappings".into());
+        lines.push(format!("loader step: kind 8 {ticks} ticks detail 116"));
+        lines.push("loader step: kind 9 91000 ticks detail 116".into());
+        lines.push("posix-procs: steps: fork with 112 one page mappings".into());
         lines
     }
 
@@ -11569,7 +11569,7 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0], [(1, 900, 4096), (4, 5000, 4096), (9, 70000, 7)]);
         assert_eq!(reports[1].len(), 4);
-        assert_eq!(reports[1][2], (8, 5000, 87));
+        assert_eq!(reports[1][2], (8, 5000, 116));
     }
 
     #[test]
@@ -11595,9 +11595,12 @@ mod tests {
         );
         let mut low = loaders(5000);
         for l in &mut low {
-            *l = l.replace("kind 8 5000 ticks detail 87", "kind 8 5000 ticks detail 20");
+            *l = l.replace(
+                "kind 8 5000 ticks detail 116",
+                "kind 8 5000 ticks detail 20",
+            );
         }
-        assert!(check_loader_steps(&low).unwrap_err().contains("under 80"));
+        assert!(check_loader_steps(&low).unwrap_err().contains("under 100"));
     }
 
     #[test]
