@@ -11621,7 +11621,15 @@ mod tests {
                 "kind 8 5000 ticks detail 20",
             );
         }
-        assert!(check_loader_steps(&low).unwrap_err().contains("under 100"));
+        assert!(
+            check_loader_steps(&low)
+                .unwrap_err()
+                .contains("did not copy")
+        );
+        // A loader that copied a smaller map reports fewer regions held.
+        let mut smaller = loaders(5000);
+        smaller.push("loader step: kind 8 9000 ticks detail 92".into());
+        check_loader_steps(&smaller).unwrap();
     }
 
     #[test]
