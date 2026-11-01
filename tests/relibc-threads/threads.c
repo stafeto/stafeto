@@ -1257,7 +1257,7 @@ static void timed_waits_across_a_second(void) {
  * (#370: a thread that the creator's registration woke runs on the level it
  * waited at until it blocks again, which must end with the move). `low`
  * moves itself under `mid` and spins; `mid` is below main (SCHED_OTHER) and
- * above `low`, and must get the processor while `low` spins. */
+ * above `low`, and must get the processor, when its sleep ends, while `low` spins. */
 #define LOWERING_TURNS_MS 100
 static volatile int lowering_stop, lowering_mid_ran, lowering_failed;
 static void lower_self(int priority) {
@@ -1273,6 +1273,8 @@ static void *lowering_low(void *arg) {
 static void *lowering_mid(void *arg) {
     (void)arg;
     lower_self(22);
+    /* Blocks and wakes at its own level while `low` spins. */
+    sleep_ms(10);
     lowering_mid_ran = 1;
     return NULL;
 }

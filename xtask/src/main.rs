@@ -6219,9 +6219,16 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     // (5d); the copy of a fork has run, in steps of the loader.
     let longest = |kind: usize| rows.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
     let (spawn, fork_start, fork_commit) = (longest(22), longest(34), longest(35));
-    // A few per cent over: both are the longest of several runs of the same
-    // work in different processes, and the order of the two flips by tens of
-    // ticks (11624 against 11583) with the layout of the images.
+    // The two numbers are each the longest of several steps of one run, in
+    // different processes, and each moves from run to run by the noise of one
+    // measurement: SpawnStart was seen between 11583 and 11978 ticks,
+    // ForkStart between 10761 and 11624. Usually ForkStart is the lower, by
+    // some 6 per cent (main on the runner: 11269 against 11945; here: 10761
+    // against 11752); once the runner gave 11624 against 11583, 41 ticks over,
+    // with no change in the work of either. The tolerance is a twentieth of
+    // SpawnStart, some 580 ticks at these numbers; ForkStart is not found
+    // systematically above SpawnStart after the loader began to share the
+    // code of the image on fork.
     if fork_start == 0 || fork_commit == 0 || fork_start > spawn + spawn / 20 {
         return Err(format!(
             "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
