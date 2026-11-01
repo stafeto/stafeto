@@ -734,12 +734,10 @@ static int shm_processes(void) {
 }
 
 
-#ifdef STAFETO_SEGMENT_FILES_FOLLOW
 /* IPC_SET of a segment is the pipe service's: the library changes no file (#344).
  * An unprivileged owner hands a segment to another user, who removes it; a
  * creator removes a segment after the superuser gave it to someone else. Runs
- * once the services give the file of the segment its new owner (part 3 of step
- * 6); with the old services the library's chown was the check. */
+ * The services give the file of the segment its new owner. */
 static int shm_hand_over(void) {
     long page = sysconf(_SC_PAGESIZE);
     int id = shmget(IPC_PRIVATE, page, 0666);
@@ -773,7 +771,6 @@ static int shm_hand_over(void) {
     CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
     return 0;
 }
-#endif
 
 /* Who a caller is comes from the process service, not from the request: the
  * same call changes its answer when the process gives up its rights, and the
@@ -965,8 +962,8 @@ static int shm_names(void) {
     CHECK(stat(first, &st) == 0 && st.st_uid == 1234 && st.st_gid == 1234 && (st.st_mode & 0777) == 0640);
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == 1234 && (ds.shm_perm.mode & 0777) == 0640);
     CHECK(shmctl(id, IPC_RMID, NULL) == 0);
-    /* An owner that is no superuser cannot give the segment away: the file
-     * could not follow, so the segment stays as it is. */
+    /* An owner that is no superuser changes the mode of its segment, and the
+     * file follows (giving the segment away is shm_hand_over's). */
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -976,12 +973,7 @@ static int shm_names(void) {
         if (mine < 0 || sysv_files(path, sizeof path) != before + 1) _exit(3);
         struct shmid_ds d;
         if (shmctl(mine, IPC_STAT, &d) != 0) _exit(4);
-        d.shm_perm.uid = 4321;
-        errno = 0;
-        if (shmctl(mine, IPC_SET, &d) != -1 || errno != EPERM) _exit(5);
-        if (shmctl(mine, IPC_STAT, &d) != 0 || d.shm_perm.uid != 1234) _exit(6);
         struct stat s2;
-        if (stat(path, &s2) != 0 || s2.st_uid != 1234) _exit(7);
         /* A mode it may give, the file follows. */
         d.shm_perm.uid = 1234;
         d.shm_perm.mode = 0640;
@@ -1539,9 +1531,7 @@ int main(int argc, char **argv) {
     RUN(shm_basics);
     RUN(shm_processes);
     RUN(identity);
-#ifdef STAFETO_SEGMENT_FILES_FOLLOW
     RUN(shm_hand_over);
-#endif
     RUN(shm_pages);
     RUN(shm_names);
     RUN(pool_waits);
