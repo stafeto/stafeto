@@ -655,6 +655,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
+            record.process_quota = create.quota;
             record.limits = proto_process::ResourceLimits::initial(create.quota);
             if create.root {
                 record.groups.count = 1;
@@ -3116,9 +3117,15 @@ impl Processes {
         // the record less those pages (the record keeps the whole quota for
         // the children and the execs it makes; spec 2, 3.12.2).
         let fork = matches!(birth.page, PageStart::Fork { .. });
-        let image_pages = if fork { parent.image_pages } else { 0 };
         let process_quota = if fork {
-            loaders::fork_quota(create.quota, image_pages)
+            // A record no Create or exec set the quota of its process for
+            // has the whole.
+            let own = if parent.process_quota == 0 {
+                parent.quota
+            } else {
+                parent.process_quota
+            };
+            loaders::fork_quota(own, parent.image_pages)
         } else {
             create.quota
         };
@@ -3166,7 +3173,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
-            record.image_pages = image_pages;
+            record.process_quota = process_quota;
             record.handle_limit = create.handle_limit;
             record.ctty = inherited_ctty;
             // A child of a file shows its program's name; a child of fork
@@ -3668,6 +3675,7 @@ impl Processes {
         let ceiling = record.ceiling;
         record.image = image;
         record.image_pages = image_pages;
+        record.process_quota = record.quota;
         record.committed_loader_ticket = committed_ticket;
         record.execed = true;
         if record.next_name[0] != 0 {

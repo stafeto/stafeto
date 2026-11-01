@@ -102,8 +102,11 @@ pub struct Record<P> {
     /// it spawns from a file gets too (5c).
     pub quota: u64,
     pub handle_limit: u32,
-    /// The pages of the code and the read-only data of its image, which a
-    /// child of fork shares and does not pay for (spec 2, 3.12.2).
+    /// The quota of its process, which is `quota` unless it is a child of
+    /// fork that does not pay for the image of its parent (spec 2, 3.12.2).
+    pub process_quota: u64,
+    /// The pages of the code and the read-only data of its image that its
+    /// process pays for, which a child of fork shares and does not pay for.
     pub image_pages: u32,
     /// The image number of its process: IMAGE, then that of each exec
     /// that committed (5c). Its session, exit place and identity carry it.
@@ -486,6 +489,7 @@ impl<P> Records<P> {
             ceiling,
             quota: 0,
             handle_limit: 0,
+            process_quota: 0,
             image_pages: 0,
             image: proto_process::IMAGE,
             tried: proto_process::IMAGE,

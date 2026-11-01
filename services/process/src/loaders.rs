@@ -31,11 +31,13 @@ pub const fn pool_allows(free: u64, quota: u64) -> bool {
     }
 }
 
-/// The quota of the process of a child of fork whose parent has a record
-/// quota of `nominal` bytes and shares `image_pages` pages of code and
-/// read-only data with it (spec 2, 3.12.2): the child pays for none of
-/// those, so it needs what is left, and at least a quarter of the quota
-/// for what the parent's data, heap and stacks grow to.
+/// The quota of the process of a child of fork whose parent's process has
+/// `nominal` bytes of quota and pays for `image_pages` pages of code and
+/// read-only data that the child shares (spec 2, 3.12.2): the child pays
+/// for none of those, so it needs what is left, and at least a quarter of
+/// the quota for what the parent's data, heap and stacks grow to. A parent
+/// that did not pay for its image (it joined an object another process
+/// made) has `image_pages` 0 and the child gets the whole.
 pub const fn fork_quota(nominal: u64, image_pages: u32) -> u64 {
     const PAGE: u64 = 4096;
     let floor = (nominal / 4).next_multiple_of(PAGE);

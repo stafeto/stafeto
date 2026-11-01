@@ -468,6 +468,52 @@ static int image_exit(pid_t pid) {
     return WEXITSTATUS(status);
 }
 
+/* Two threads spawn one file that no process runs yet, all at once (a parent
+ * has two loads at most): one loader makes the objects and the other waits
+ * for them, so both share. */
+struct racer {
+    const char *path;
+    int ready, go;
+    pid_t pid;
+    int error;
+};
+
+static void *race_spawn(void *arg) {
+    struct racer *racer = arg;
+    racer->error = spawn_image(racer->path, racer->ready, racer->go, 1, &racer->pid);
+    return NULL;
+}
+
+static void image_race(void) {
+    int ready[2], go[2];
+    check("race image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    const char *copy = "/tmp/image-race";
+    unlink(copy);
+    check("race image: copy", copy_file("/bin/procs-child", copy) == 0);
+    struct racer racers[2];
+    pthread_t threads[2];
+    for (int i = 0; i < 2; i++) {
+        racers[i] = (struct racer){copy, ready[1], go[0], -1, -1};
+        check("race image: thread", pthread_create(&threads[i], NULL, race_spawn, &racers[i]) == 0);
+    }
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], NULL);
+    unsigned char byte;
+    int spawned = racers[0].error == 0 && racers[1].error == 0;
+    check("race image: both spawned", spawned);
+    if (!spawned) return;
+    check("race image: both loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
+    int saw = -1;
+    check("race image: look", image_look(ready[0], go[1], 2, &saw));
+    check("race image: two spawns at once share one object", saw == 0);
+    if (saw) printf("posix-map: race image bits %d\n", saw);
+    check("race image: exit", image_exit(racers[0].pid) == 0 && image_exit(racers[1].pid) == 0);
+    unlink(copy);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+}
+
 static void image_spawned(void) {
     int ready[2], go[2];
     check("spawned image: pipes", pipe(ready) == 0 && pipe(go) == 0);
@@ -1848,6 +1894,7 @@ int main(int argc, char **argv) {
     foreign_processes();
     rights();
     limits();
+    image_race();
     if (failures) {
         printf("posix-map: %d failures\n", failures);
         return 1;

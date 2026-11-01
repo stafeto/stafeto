@@ -253,6 +253,9 @@ struct Kept {
     pages: u32,
     access: Access,
     handle: Handle<Memory>,
+    /// The object came from the table of images: another process paid for
+    /// it.
+    joined: bool,
 }
 
 /// The program's segments, stack and start area, in the order `load`
@@ -287,6 +290,7 @@ fn keep_region(
         pages,
         access,
         handle,
+        joined: false,
     });
     Ok(())
 }
@@ -1571,7 +1575,11 @@ fn segment(
             }
             loader::map_narrowed(&own.process, &memory, 0, len, pages.start as usize, access(part))
                 .map_err(code)?;
-            keep_region(maps, &memory, pages.start, len, access(part))
+            keep_region(maps, &memory, pages.start, len, access(part))?;
+            if let Some(kept) = maps.iter_mut().flatten().last() {
+                kept.joined = true;
+            }
+            Ok(())
         }
         Table::Reserved => {
             if let Err(e) = build(own, image, load, part, maps) {
@@ -1685,12 +1693,12 @@ fn image_get(key: &proto_process::ImageKey) -> Result<Table, u32> {
     })
 }
 
-/// The pages of the code and the read-only data in `maps`: what a child of
-/// fork shares and does not pay for.
+/// The pages of the code and the read-only data in `maps` that this
+/// process pays for: what a child of fork shares and does not pay for.
 fn image_pages(maps: &Maps) -> u32 {
     maps.iter()
         .flatten()
-        .filter(|kept| kept.access != Access::ReadWrite)
+        .filter(|kept| kept.access != Access::ReadWrite && !kept.joined)
         .map(|kept| kept.pages)
         .sum()
 }
