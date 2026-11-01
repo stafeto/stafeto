@@ -69,6 +69,10 @@ use proto_fs::{
 use tree::Tree;
 
 const FILE_CAPACITY: usize = 1024;
+/// The places of one session. A Clone carries at most as many descriptions
+/// as a session holds. A description the layer pins for a shared mapping
+/// keeps one of these places after its numbers close, so the list of a
+/// Clone never exceeds them.
 const OPEN_MAX: usize = 32;
 /// The open descriptions of the service at most, which the sessions share
 /// (spec 2, 3.7; 5c): past them, open is TOO_MANY_OPEN_FILES.

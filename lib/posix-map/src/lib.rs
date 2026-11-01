@@ -123,12 +123,14 @@ impl Piece {
 /// back (`msync`, unmapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Back {
-    /// The descriptor the layer holds for it.
-    pub fd: i32,
+    /// The place of the pin the layer holds for the file's description: a
+    /// place of the table of descriptors outside the numbers, which no
+    /// descriptor of the program names or replaces.
+    pub pin: i32,
+    /// The generation of the place: the pin is the one the mapping took.
+    pub pin_generation: u64,
     page: u32,
-    /// The identity of the file (device and inode, never 0): the layer
-    /// checks it before it writes through `fd` or closes it, because a
-    /// program may have put another file on that number.
+    /// The identity of the file (device and inode, never 0).
     pub key: u64,
     /// The object is registered at the process service's rendezvous of
     /// shared memory under `key`.
@@ -138,9 +140,10 @@ pub struct Back {
 impl Back {
     /// `offset` is the byte of the file the object's first byte shows, a
     /// multiple of the page.
-    pub fn new(fd: i32, offset: u64, key: u64, registered: bool) -> Back {
+    pub fn new(pin: i32, pin_generation: u64, offset: u64, key: u64, registered: bool) -> Back {
         Back {
-            fd,
+            pin,
+            pin_generation,
             page: u32::try_from(offset / PAGE as u64).expect("offset of a mapped file"),
             key,
             registered,

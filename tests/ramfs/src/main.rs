@@ -63,6 +63,21 @@ impl Drop for NativeFiles {
     }
 }
 
+/// The list of the descriptions a child shares, in a frame of its own: the
+/// probe runs on a small stack.
+#[inline(never)]
+fn alias_clone_list(
+    native: &mut NativeFiles,
+    held: rt::fs::PreparedOpen,
+    exact: posix_fs::RamTarget,
+) -> Result<rt::fs::PreparedOpen, &'static str> {
+    let mut kept = [held; posix_fs::KEPT_BY_FORK_MAX];
+    if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
+        return Err("exact alias clone list");
+    }
+    Ok(kept[0])
+}
+
 // Startup capabilities stay live through initialization checks alone.
 #[inline(never)]
 fn probe_parent() -> Option<(rt::Handle<rt::handle::Channel>, Result<(), &'static str>)> {
@@ -299,11 +314,8 @@ fn check_exact_imports(
     if native.target(4) != Ok(Target::Ram(exact)) || native.target(7) != Ok(Target::Ram(exact)) {
         return Err("alias import token");
     }
-    let mut kept = [held; OPEN_MAX];
-    if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
-        return Err("exact alias clone list");
-    }
-    let child = Files::clone_exact_on(native.sessions().0, &kept[..1])
+    let listed = alias_clone_list(&mut native, held, exact)?;
+    let child = Files::clone_exact_on(native.sessions().0, &[listed])
         .map_err(|_| "normalized exact clone")?;
     let child = Files::from_sessions(child, None);
     if child

@@ -16,7 +16,7 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
 };
-use posix_fs::{Inherited, PosixFs, Resolved, StartupFiles, Target, Transport};
+use posix_fs::{Inherited, PinRef, PosixFs, Resolved, StartupFiles, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
@@ -143,7 +143,9 @@ pub unsafe fn after_fork(
 
 /// The descriptions of the RAM file service a forked child's session
 /// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
-pub fn kept_by_fork(out: &mut [rt::fs::PreparedOpen; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+pub fn kept_by_fork(
+    out: &mut [rt::fs::PreparedOpen; posix_fs::KEPT_BY_FORK_MAX],
+) -> Result<usize, i32> {
     process_state(|files| Ok(files.kept_by_fork(out)))
 }
 
@@ -232,6 +234,52 @@ pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -
         let _ = transport.release(release);
     }
     result
+}
+
+/// A reference to the pin of the shared mapping of the file `key`, kept
+/// without a number (posix_fs::PosixFs::pin_for_map), and whether the pin is
+/// new. ENOMEM when the process has `posix_fs::MAP_PINS` pins of other
+/// files.
+pub fn pin_for_map(fd: u32, key: u64, writes: bool) -> Result<(PinRef, bool), i32> {
+    with_fd(fd, |files| {
+        files
+            .pin_for_map(fd, key, writes)
+            .map_err(|error| match error {
+                posix_fs::FsError::TooManyOpenFiles => ENOMEM,
+                error => crate::error(error),
+            })
+    })
+}
+
+/// Gives back a reference of a pin; the service closes the description
+/// when nothing else keeps it. A reference to a pin that went does nothing.
+pub fn release_pin(pin: PinRef) -> Result<(), i32> {
+    let release = process_state(|files| Ok(files.release_pin(pin)))?;
+    match release {
+        Some(target) => release_target(target),
+        None => Ok(()),
+    }
+}
+
+/// As `held` for the description the pin keeps.
+pub fn held_pin<R>(
+    pin: PinRef,
+    run: impl FnOnce(Transport, Target) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let (transport, target) = process_state(|files| {
+        let target = files.hold_pin(pin).map_err(crate::error)?;
+        Ok((files.transport(), target))
+    })?;
+    window();
+    let result = run(transport, target);
+    let release = process_state(|files| Ok(files.unhold(target)))?;
+    let _ = transport.release(release);
+    result
+}
+
+/// The information of the file a pin keeps.
+pub fn pin_information(pin: PinRef) -> Result<proto_fs::NodeInfo, i32> {
+    held_pin(pin, descriptor_information)
 }
 
 /// The information of what a descriptor names.

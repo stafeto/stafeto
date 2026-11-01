@@ -146,8 +146,9 @@ pub(crate) fn set_limit(resource: i32, soft: u64) {
     cell.store(soft, Ordering::Relaxed);
 }
 
-/// What a mapping of a file keeps to write its pages back: the descriptor
-/// the layer holds for it and the byte of the file the object starts at.
+/// What a mapping of a file keeps to write its pages back: the pin of the
+/// file's description the layer holds for it and the byte of the file the
+/// object starts at.
 pub use posix_map::Back;
 
 /// The object of a shared mapping of a file: one the process service gave
@@ -289,9 +290,9 @@ fn mmap0(
     })
 }
 
-/// The key, the pages, a copy of the object and the descriptor of a shared
-/// object a forked child joins.
-type Attach = (u64, usize, rt::handle::Handle<rt::handle::Memory>, i32);
+/// The key, the pages, a copy of the object and the pin (place and
+/// generation) of a shared object a forked child joins.
+type Attach = (u64, usize, rt::handle::Handle<rt::handle::Memory>, i32, u64);
 
 /// A forked child joins the process service's entries of the shared objects
 /// it inherited, so that they live as long as it maps them.
@@ -317,28 +318,28 @@ pub(crate) fn attach_shared() {
             if let Ok(copy) = rt::sys::handle_duplicate(&*held, rights | rt::abi::Rights::MAP_WRITE)
                 .or_else(|_| rt::sys::handle_duplicate(&*held, rights))
             {
-                found[n] = Some((back.key, pages, copy, back.fd));
+                found[n] = Some((back.key, pages, copy, back.pin, back.pin_generation));
                 n += 1;
             }
         }
     });
-    for (key, pages, copy, fd) in found.iter().flatten() {
-        if crate::shares::grant(*fd).is_ok() {
+    for (key, pages, copy, pin, generation) in found.iter().flatten() {
+        let pin = posix_fs::PinRef::new(*pin as usize, *generation);
+        if crate::shares::grant_pin(pin).is_ok() {
             let _ = crate::shares::attach(*key, *pages, copy);
         }
     }
 }
 
 /// A piece of a shared mapping of a file in a range: its address, its
-/// pages, the descriptor the layer holds and the byte of the file it starts
-/// at.
+/// pages, the pin the layer holds and the byte of the file it starts at.
 #[derive(Clone, Copy)]
 pub struct FilePiece {
     pub address: usize,
     pub pages: usize,
-    pub fd: i32,
+    pub pin: posix_fs::PinRef,
     pub offset: u64,
-    /// The identity of the file the descriptor must still show.
+    /// The identity of the file the pin keeps.
     pub key: u64,
     /// The access of the piece now.
     pub access: Access,
@@ -349,7 +350,7 @@ impl Default for FilePiece {
         FilePiece {
             address: 0,
             pages: 0,
-            fd: -1,
+            pin: posix_fs::PinRef::default(),
             offset: 0,
             key: 0,
             access: Access::Read,
@@ -391,7 +392,7 @@ fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> u
                 out[n] = FilePiece {
                     address: from,
                     pages: count,
-                    fd: back.fd,
+                    pin: posix_fs::PinRef::new(back.pin as usize, back.pin_generation),
                     offset: back.offset()
                         + ((piece.offset() + (from - piece.address) / PAGE) * PAGE) as u64,
                     key: back.key,
@@ -404,15 +405,13 @@ fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> u
     })
 }
 
-/// The descriptor the layer already holds for the file of `key`.
-pub fn fd_of_key(key: u64) -> Option<i32> {
-    heap(|state| state.fd_of_key(key))
-}
-
-/// The descriptors and keys of the files whose last mapping `munmap` took since
-/// the last call, up to `out.len()`: how many. The caller closes the
-/// descriptors and tells the process service of the keys.
-pub fn closed_files(out: &mut [(i32, u64, bool)]) -> usize {
+/// The pins and keys of the files whose shared mappings `munmap` took since
+/// the last call, up to `out.len()`: how many. The caller gives back the
+/// pins and tells the process service of the keys.
+pub fn closed_files(out: &mut [crate::allocation::Closed]) -> usize {
+    if !crate::allocation::closed_pending() {
+        return 0;
+    }
     heap(|state| state.take_closed(out))
 }
 

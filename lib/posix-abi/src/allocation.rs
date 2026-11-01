@@ -68,10 +68,30 @@ pub(crate) struct State {
     /// started by init maps its own segments, every program the clock's
     /// page and its record's. A guess that the kernel's refusals raise.
     hidden: usize,
-    /// The descriptors of files whose last shared mapping went, until the
-    /// caller closes them (`take_closed`).
-    closed: [(i32, u64, bool); 16],
+    /// The pins of files whose last shared mapping went, until the caller
+    /// lets go of them (`take_closed`).
+    closed: [Closed; CLOSED_MAX],
     closed_len: usize,
+}
+
+/// A shared mapping of a file that went: its pin (place and generation),
+/// the key of its file, and whether the layer tells the process service
+/// that the process maps the file's object no more.
+pub type Closed = (i32, u64, u64, bool);
+
+/// The places of the list of `Closed`: twice the objects of a map. Every
+/// call that unmaps empties the list before it returns (`take_closed`), so
+/// the list holds the objects one call unmapped, and a second call that
+/// runs in another thread meanwhile has the same bound.
+const CLOSED_MAX: usize = 2 * posix_map::MAX_OBJECTS;
+
+/// How many entries the list of `Closed` holds, for a look without the
+/// heap's lock: nearly every `mmap` finds none.
+static CLOSED_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a shared mapping went and its pin has not been given back.
+pub fn closed_pending() -> bool {
+    CLOSED_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0
 }
 
 /// RLIMIT_AS and RLIMIT_DATA, soft, in bytes (u64::MAX for none): the
@@ -95,7 +115,7 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     map: Map::new(),
     chunk: 0,
     hidden: HIDDEN,
-    closed: [(0, 0, false); 16],
+    closed: [(0, 0, 0, false); CLOSED_MAX],
     closed_len: 0,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
@@ -251,8 +271,8 @@ pub unsafe fn after_fork(
     if let Some(parent) = config.replace(Config { process }) {
         core::mem::forget(parent);
     }
-    // The files the parent's shared mappings write to: the child's
-    // descriptors are the parent's numbers.
+    // The files the parent's shared mappings write to: the child's pins
+    // are the parent's places.
     let mut backs = [(0usize, None::<posix_map::Back>, true, false, 0usize); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
         let object = state.map.object(piece.object());
@@ -485,24 +505,24 @@ impl State {
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
             if let Some(back) = gone.and_then(|object| object.back) {
-                // The descriptor and the key go with the last object that
-                // has them.
-                let fd_used = self
-                    .map
-                    .objects()
-                    .any(|(_, o)| o.back.is_some_and(|b| b.fd == back.fd));
+                // Each object holds one reference of its pin, and gives it
+                // back with its last piece. The key is told to the process
+                // service with the last object that has it registered. The
+                // list holds an entry for every object of the map at most,
+                // since the caller empties it after each call.
                 let key_used = self
                     .map
                     .objects()
                     .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key && b.registered));
-                let entry = (
-                    if fd_used { -1 } else { back.fd },
-                    back.key,
-                    back.registered && !key_used,
-                );
-                if (entry.0 >= 0 || entry.2) && self.closed_len < self.closed.len() {
-                    self.closed[self.closed_len] = entry;
+                if self.closed_len < self.closed.len() {
+                    self.closed[self.closed_len] = (
+                        back.pin,
+                        back.pin_generation,
+                        back.key,
+                        back.registered && !key_used,
+                    );
                     self.closed_len += 1;
+                    CLOSED_PENDING.store(self.closed_len, core::sync::atomic::Ordering::Release);
                 }
             }
             at = to;
@@ -510,20 +530,13 @@ impl State {
         Ok(())
     }
 
-    /// The descriptor the layer holds for the shared mapping of the file of
-    /// `key`, if this process maps it.
-    pub(crate) fn fd_of_key(&self, key: u64) -> Option<i32> {
-        self.map
-            .objects()
-            .find_map(|(_, o)| o.back.filter(|b| b.key == key).map(|b| b.fd))
-    }
-
-    /// The descriptors of `closed`, moved to `out`: how many.
-    pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64, bool)]) -> usize {
+    /// The pins of `closed`, moved to `out`: how many.
+    pub(crate) fn take_closed(&mut self, out: &mut [Closed]) -> usize {
         let n = self.closed_len.min(out.len());
         out[..n].copy_from_slice(&self.closed[..n]);
         self.closed.copy_within(n..self.closed_len, 0);
         self.closed_len -= n;
+        CLOSED_PENDING.store(self.closed_len, core::sync::atomic::Ordering::Release);
         n
     }
 

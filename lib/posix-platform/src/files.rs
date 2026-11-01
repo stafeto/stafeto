@@ -229,23 +229,33 @@ pub unsafe extern "C" fn stafeto_getdents(
     }
 }
 
+/// What a read or a write at an offset goes to: the descriptor of a number,
+/// or the pin of a shared mapping, which has no number.
+#[derive(Clone, Copy)]
+pub(crate) enum Place {
+    Fd(c_int),
+    Pin(posix_fs::PinRef),
+}
+
 /// pread and pwrite: at `offset`, the description's own offset as it
 /// was (READ_AT and WRITE_AT of the service), outside the lock.
 fn at_offset(
-    fd: c_int,
+    place: Place,
     offset: i64,
     run: impl FnOnce(Transport, u32, u64) -> Result<usize, posix_fs::FsError>,
 ) -> isize {
-    let result = number(fd).and_then(|fd| {
-        posix_abi::shared::held(fd, |transport, target| {
-            // The console has no offset: ESPIPE.
-            let Target::Ram(fd) = target else {
-                return Err(ESPIPE);
-            };
-            let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
-            run(transport, fd.fd(), offset).map_err(posix_abi::error)
-        })
-    });
+    let body = |transport, target| {
+        // The console has no offset: ESPIPE.
+        let Target::Ram(fd) = target else {
+            return Err(ESPIPE);
+        };
+        let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
+        run(transport, fd.fd(), offset).map_err(posix_abi::error)
+    };
+    let result = match place {
+        Place::Fd(fd) => number(fd).and_then(|fd| posix_abi::shared::held(fd, body)),
+        Place::Pin(pin) => posix_abi::shared::held_pin(pin, body),
+    };
     match posix_abi::finish_file_size(result) {
         Ok(count) => count as isize,
         Err(errno) => -(errno as isize),
@@ -267,6 +277,13 @@ pub(crate) fn is_file(fd: c_int) -> bool {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
+    unsafe { read_at(Place::Fd(fd), buf, len, offset) }
+}
+
+/// # Safety
+/// `buf` is writable for `len` bytes.
+pub(crate) unsafe fn read_at(place: Place, buf: *mut u8, len: usize, offset: i64) -> isize {
+    // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     // One message of the service holds MAX_READ bytes; a longer read gets
     // the rest after it, up to the end of the file.
@@ -275,7 +292,7 @@ pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offs
         let size = out.len() - done;
         let at = offset.saturating_add(done as i64);
         let rest = &mut out[done..];
-        let got = at_offset(fd, at, |files, fd, at| files.read_at(fd, at, rest));
+        let got = at_offset(place, at, |files, fd, at| files.read_at(fd, at, rest));
         if got == posix_request::MAX_READ as isize && size > posix_request::MAX_READ {
             done += posix_request::MAX_READ;
             continue;
@@ -300,6 +317,13 @@ pub unsafe extern "C" fn stafeto_pwrite(
     offset: i64,
 ) -> isize {
     // SAFETY: the caller's promise.
+    unsafe { write_at(Place::Fd(fd), buf, len, offset) }
+}
+
+/// # Safety
+/// `buf` is readable for `len` bytes.
+pub(crate) unsafe fn write_at(place: Place, buf: *const u8, len: usize, offset: i64) -> isize {
+    // SAFETY: the caller's promise.
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
     // One message of the service holds MAX_WRITE less 8 bytes; the rest of a
     // longer write goes after it (a failure after a part is its count).
@@ -308,7 +332,7 @@ pub unsafe extern "C" fn stafeto_pwrite(
     loop {
         let rest = &bytes[done..];
         let at = offset.saturating_add(done as i64);
-        let got = at_offset(fd, at, |files, fd, at| files.write_at(fd, at, rest));
+        let got = at_offset(place, at, |files, fd, at| files.write_at(fd, at, rest));
         if got == extent as isize && rest.len() > extent {
             done += extent;
             continue;
