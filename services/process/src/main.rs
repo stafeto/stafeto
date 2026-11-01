@@ -1341,6 +1341,14 @@ impl Processes {
         self.kick();
     }
 
+    /// Tells the loop of the Gets of the table of images that wait, if
+    /// any do: a load that finds none waiting costs the loop no step.
+    fn wake_loaders(&mut self) {
+        if self.images.waiters() > 0 {
+            self.wake_sharers();
+        }
+    }
+
     /// One step of the answers to the waiting Gets: the oldest `BATCH` that
     /// nobody makes the object for any more, each asking the table again
     /// (the first of those whose maker went becomes the maker). More ready
@@ -1492,12 +1500,12 @@ impl Processes {
                 if self.images.put(&key, child, pages, memory).is_err() {
                     return refuse(proto_process::PERMISSION);
                 }
-                self.wake_sharers();
+                self.wake_loaders();
                 Answer::Status(Status::Ok)
             }
             proto_process::IMAGE_DETACH if r.handles.is_empty() => {
                 self.images.detach(&key, child);
-                self.wake_sharers();
+                self.wake_loaders();
                 Answer::Status(Status::Ok)
             }
             _ => refuse(proto_process::INVALID),
@@ -3850,7 +3858,7 @@ impl Processes {
         // What the load joined in the table of images, and the object it
         // made, go with it.
         self.images.abort(child);
-        self.wake_sharers();
+        self.wake_loaders();
         #[cfg(feature = "image-probe")]
         let place = self.free_observed_loader(child, Terminal::Aborted);
         #[cfg(not(feature = "image-probe"))]
@@ -4118,8 +4126,10 @@ impl Processes {
             .loaders
             .get(committed_slot)
             .map_or(0, |place| place.image_pages);
-        self.images.commit(child);
-        self.wake_sharers();
+        if !fork {
+            self.images.commit(child);
+            self.wake_loaders();
+        }
         let record = self.records.get_mut(child).expect("a loading record");
         if !fork {
             record.image_pages = image_pages;
