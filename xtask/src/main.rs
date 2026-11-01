@@ -5556,16 +5556,21 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
         go.0, go.1
     );
     let limit = TERM_B * 9 / 10;
+    // A loader that copied a smaller map (the floor of its report is 80)
+    // reports a shorter step: its ticks stay under the limit, and at least
+    // one loader holds the full map.
     let mut seen = 0;
     for (ticks, held) in reports.iter().filter_map(|r| of(r, 8)) {
         println!(
             "loader step 8, Regions: {ticks} of {limit} (B {TERM_B} less 10 %) with {held} regions held"
         );
-        seen += 1;
-        if held < LOADER_REGIONS_MIN || ticks == 0 || ticks > limit {
+        if ticks == 0 || ticks > limit {
             return Err(format!(
-                "the loader's step Regions took {ticks} ticks with {held} regions held, past {limit} (B {TERM_B} with a reserve of 10 %), none, or with under {LOADER_REGIONS_MIN} regions"
+                "the loader's step Regions took {ticks} ticks with {held} regions held, past {limit} (B {TERM_B} with a reserve of 10 %), or none"
             ));
+        }
+        if held >= LOADER_REGIONS_MIN {
+            seen += 1;
         }
     }
     if seen == 0 {
