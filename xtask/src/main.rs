@@ -3066,8 +3066,8 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             .iter()
             .find(|row| row.0 == 65)
             .map_or(0, |row| row.1);
-        // The step does up to 16 deliveries: it is held under the 0.9 B
-        // of the services, not the whole of B.
+        // The step does up to 16 deliveries: it is held under B with a
+        // reserve of 10 % (0.9 B).
         let walk_bound = TERM_B * 9 / 10;
         if walk == 0 || walk > walk_bound {
             return Err(format!(
