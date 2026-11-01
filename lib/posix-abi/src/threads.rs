@@ -220,12 +220,7 @@ pub fn set_level(level: u8) -> Result<(), i32> {
 /// false, since it runs on that level now and the tests of Open POSIX
 /// (`mmap/10-1`) rely on it until the lent level of the main thread is
 /// understood (stafeto-design, the main thread's boost).
-pub(crate) fn move_to(
-    level: u8,
-    policy: Policy,
-    tail: bool,
-    shed: bool,
-) -> Result<(), i32> {
+pub(crate) fn move_to(level: u8, policy: Policy, tail: bool, shed: bool) -> Result<(), i32> {
     use posix_thread::flag;
     let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
