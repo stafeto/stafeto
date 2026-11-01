@@ -1584,6 +1584,16 @@ pub(crate) unsafe fn after_fork() -> Result<(), i32> {
     for word in &CLAIMING {
         word.store(0, Ordering::Relaxed);
     }
+    // The child has no pending signal of the parent's (XSH fork): not the
+    // repeats of real-time signals either, nor the codes that went with them.
+    for word in &TKILLED {
+        word.store(0, Ordering::Relaxed);
+    }
+    for row in &REPEATS {
+        for repeats in row {
+            repeats.store(0, Ordering::Relaxed);
+        }
+    }
     if crate::relibc::native::is_resident(own()) {
         attach_native(posix_thread::thread_pointer() as *mut u8)
     } else {

@@ -917,6 +917,38 @@ static int t_c_thread_rt_repeats(void) {
     return 0;
 }
 
+/* #467, fork: the repeats of a real-time signal that wait for the parent are
+ * not the child's. The parent blocks SIGRTMIN and raises it three times (one
+ * pending occurrence and two repeats), then forks; the child has nothing
+ * pending, raises it once and takes one occurrence, not three. */
+static int t_c_fork_drops_repeats(void) {
+    if (t_block(SIGRTMIN)) return 1;
+    if (raise(SIGRTMIN) || raise(SIGRTMIN) || raise(SIGRTMIN)) return 2;
+    pid_t child = fork();
+    if (child < 0) return 3;
+    if (child == 0) {
+        sigset_t pending;
+        sigemptyset(&pending);
+        if (sigpending(&pending) || sigismember(&pending, SIGRTMIN)) _exit(1);
+        if (raise(SIGRTMIN)) _exit(2);
+        siginfo_t info;
+        if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) _exit(3);
+        if (t_take(SIGRTMIN, &info, 0) != -1 || errno != EAGAIN) _exit(4);
+        _exit(0);
+    }
+    int status = -1;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 4;
+    if (WEXITSTATUS(status) != 0) {
+        printf("posix-procs: timers: the child of fork saw the repeats of its parent (%d)\n", WEXITSTATUS(status));
+        return 5;
+    }
+    /* The parent still has its three. */
+    siginfo_t info;
+    for (int n = 0; n < 3; n++)
+        if (t_take(SIGRTMIN, &info, 100) != SIGRTMIN) return 6;
+    return t_take(SIGRTMIN, &info, 0) == -1 && errno == EAGAIN ? 0 : 7;
+}
+
 /* #392: a timer on processor time sends SI_TIMER with the value of the event,
  * its expiries while the signal waits are one occurrence and the overrun. */
 static int t_c_cpu_timer(void) {
@@ -1109,6 +1141,7 @@ static int timers_role(void) {
     t_child("pthread_kill says SI_TKILL, raise SI_USER", t_c_thread_kill_code, 0, 0);
     t_child("a real-time signal raised twice is taken twice", t_c_thread_rt_twice, 0, 0);
     t_child("a real-time signal sent to a thread repeatedly stays in the thread", t_c_thread_rt_repeats, 0, 0);
+    t_child("a child of fork has none of the repeats of its parent", t_c_fork_drops_repeats, 0, 0);
     t_child("a timer on processor time sends SI_TIMER and counts the overrun", t_c_cpu_timer, 0, 0);
     t_child("two timers on one real-time signal keep their own occurrences", t_c_two_timers_one_signal, 0, 0);
     t_child("two senders fill one receiver 32 each", t_c_senders_share_a_receiver, 0, 0);
