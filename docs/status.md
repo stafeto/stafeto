@@ -98,7 +98,12 @@ the RAM file service: a loader in the new process opens the file through
 a session that only `init` and the process service hand out, maps its
 segments and jumps; an error before the image is ready comes back from
 `posix_spawn`, a set-ID file sets the new process's IDs, and the parent
-holds no handle of the child. A spawned child shares the open
+holds no handle of the child. Processes that exec or spawn one file run the
+same code and read-only data: the process service keeps a table of 32 image
+parts, named by the part and the file's device, inode, size and times; the
+loader that finds none makes the object and the others wait for it, and an
+entry goes with its last user. Nobody holds a writable handle of a shared
+object. A spawned child shares the open
 descriptions its parent keeps; `exec` keeps the PID, the open files and
 the mask, and an `exec` that fails leaves the old image whole.
 `posix_spawn` takes `POSIX_SPAWN_SETPGROUP`, `SETSID`, `SETSIGMASK`,
@@ -125,7 +130,8 @@ and the mask carry over, pending signals do not, and a signal sent to the
 group during the copy reaches both. `vfork` is `fork`, and `pthread_atfork`
 handlers run in POSIX's order. The code and the read-only data of the
 program are the one exception: the child maps the parent's objects, with
-no copy, and pays nothing for them. There is no copy on write: the child
+no copy, and pays nothing for them (its process gets the parent's quota
+less the image pages the parent paid for). There is no copy on write: the child
 pays for every other page, so the cost grows with the parent's memory. On HVF (10
 minutes, p50) `fork` to the child's first statement takes 102 us for a
 small parent, 172 us with 1 MiB of heap and 623 us with 8 MiB (rows S15);
