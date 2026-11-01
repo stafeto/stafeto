@@ -1033,9 +1033,12 @@ impl PipeService {
                         Method::SockConnect => {
                             let addr = Addr::read(&mut body).map_err(Answer::Status)?;
                             body.finish().map_err(Answer::Status)?;
-                            self.pipes
-                                .sock_connect(held, end, addr, &mut wakes)
-                                .map(|()| None)
+                            match self.pipes.sock_connect(held, end, addr, &mut wakes) {
+                                Ok(None) => Ok(None),
+                                // The layer connects again as a long operation.
+                                Ok(Some(_)) => Err(proto_pipe::sock::CONNECT_WAIT),
+                                Err(code) => Err(code),
+                            }
                         }
                         Method::SockShutdown => {
                             let how = body.u32().map_err(Answer::Status)?;
@@ -1136,9 +1139,11 @@ impl PipeService {
             return status(proto_pipe::MFILE);
         }
         let (label, root) = (r.label(), s.data.root);
+        let mut wakes = Wakes::default();
         let got = self
             .pipes
-            .sock_accept(&mut s.data.held, endpoint, label, root);
+            .sock_accept(&mut s.data.held, endpoint, label, root, &mut wakes);
+        self.tell(&wakes);
         match got {
             Ok(Some((id, addr))) => {
                 self.finish(s, key, endpoint.id);
@@ -1153,6 +1158,52 @@ impl PipeService {
                 status(code)
             }
             Ok(None) => self.wait(s, r, key, endpoint, notify, None),
+        }
+    }
+
+    /// SOCK_CONNECT_WAIT (`take` false) or SOCK_CONNECT_TAKE: a connect to a
+    /// listener whose queue is full waits at the listener's list until an
+    /// accept makes room.
+    fn sock_connect_wait(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        take: bool,
+    ) -> Answer {
+        let mut body = r.body();
+        let (key, endpoint) = match self.sock_key(s, &mut body, take) {
+            Ok(v) => v,
+            Err(a) => return a,
+        };
+        let addr = match Addr::read(&mut body) {
+            Ok(addr) => addr,
+            Err(status) => return Answer::Status(status),
+        };
+        if body.finish().is_err() || !endpoint.is_sock() {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let mut wakes = Wakes::default();
+        let got = self
+            .pipes
+            .sock_connect(&s.data.held, endpoint, addr, &mut wakes);
+        self.tell(&wakes);
+        match got {
+            Ok(None) => {
+                self.finish(s, key, endpoint.id);
+                long_answer(r, long::Reply::Ready(&[]))
+            }
+            Err(code) => {
+                self.finish(s, key, endpoint.id);
+                status(code)
+            }
+            Ok(Some(queue)) => self.wait(s, r, key, endpoint, notify, Some(queue)),
         }
     }
 
@@ -1351,7 +1402,7 @@ impl Service<0> for PipeService {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -1457,6 +1508,8 @@ impl Service<0> for PipeService {
                 | Method::SockName
                 | Method::SockOpt),
             ) => self.sock_call(s, r, m),
+            Some(Method::SockConnectWait) => self.sock_connect_wait(s, r, false),
+            Some(Method::SockConnectTake) => self.sock_connect_wait(s, r, true),
             Some(Method::SockAccept) => self.sock_accept(s, r, false),
             Some(Method::SockAcceptTake) => self.sock_accept(s, r, true),
             Some(Method::SockSend) => self.sock_send(s, r, false),

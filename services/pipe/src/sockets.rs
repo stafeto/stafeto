@@ -645,30 +645,42 @@ impl Pipes {
         Err(REFUSED)
     }
 
+    /// CONNECT: Ok(None) when connected; Ok(Some(queue)) when the listener's
+    /// queue is full and the socket blocks: the connect waits at that wait
+    /// queue (the listener's) for an accept to make room. A socket with
+    /// NONBLOCK gets AGAIN then.
     pub fn sock_connect(
         &mut self,
         held: &Held,
         endpoint: Endpoint,
         addr: Addr,
         wakes: &mut Wakes,
-    ) -> Result<(), u32> {
+    ) -> Result<Option<u32>, u32> {
         let i = self.sock_slot(held, endpoint)?;
         if self.sockets.s[i].kind == DGRAM {
-            return self.dgram_connect(i, addr);
+            return self.dgram_connect(i, addr).map(|()| None);
         }
         let s = &self.sockets.s[i];
         if s.connected {
             return Err(CONNECTED);
         }
+        // XSH connect: the socket is listening and cannot be connected.
         if s.listening {
-            return Err(INVALID);
+            return Err(NOT_SUPPORTED);
         }
         if !self.family_ok(i, &addr) {
             return Err(NO_FAMILY);
         }
         let l = self.find(i, &addr)?;
-        if !self.sockets.s[l].listening || self.sockets.s[l].queued >= self.sockets.s[l].backlog {
+        if !self.sockets.s[l].listening {
             return Err(REFUSED);
+        }
+        if self.sockets.s[l].queued >= self.sockets.s[l].backlog {
+            return if self.sockets.s[i].nonblock {
+                Err(AGAIN)
+            } else {
+                Ok(Some(DESCRIPTIONS as u32 + l as u32))
+            };
         }
         self.autobind(i)?;
         let (domain, root) = (self.sockets.s[i].domain, self.sockets.s[i].root);
@@ -688,7 +700,7 @@ impl Pipes {
         self.sockets.s[l].queue[n] = server as u8;
         self.sockets.s[l].queued += 1;
         wakes.add(self.sockets.s[l].waiters.waiters);
-        Ok(())
+        Ok(None)
     }
 
     fn dgram_connect(&mut self, i: usize, addr: Addr) -> Result<(), u32> {
@@ -717,6 +729,7 @@ impl Pipes {
         endpoint: Endpoint,
         creator: u64,
         root: u64,
+        wakes: &mut Wakes,
     ) -> Result<Option<(u32, Addr)>, u32> {
         let i = self.sock_slot(held, endpoint)?;
         let s = &self.sockets.s[i];
@@ -732,11 +745,19 @@ impl Pipes {
             return Err(MFILE);
         }
         let t = usize::from(s.queue[0]);
+        // The connection joins the tree of the accepting process, which
+        // may hold ROOT_SOCKS sockets at most; one of the same tree is
+        // counted already.
+        if self.sockets.s[t].root != root && self.live_socks(|o| o.root == root) >= ROOT_SOCKS {
+            return Err(NFILE);
+        }
         let s = &mut self.sockets.s[i];
         s.queue.copy_within(1.., 0);
         s.queued -= 1;
         let n = usize::from(s.queued);
         s.queue[n] = 0;
+        // A connect that waited for room in the queue asks again.
+        wakes.add(s.waiters.waiters);
         let peer_addr = {
             let t = &mut self.sockets.s[t];
             t.creator = creator;
@@ -1035,6 +1056,16 @@ impl Pipes {
         if self.sockets.s[i].wr_shut {
             return Err(BROKEN);
         }
+        // A datagram socket with a default destination takes datagrams of
+        // that peer only (XSH connect): from another sender they are lost on
+        // the loopback of INET, and refused for a file node.
+        if self.sockets.s[t].connected && self.sockets.peer_of(t) != Some(i) {
+            return if self.sockets.s[i].domain == INET {
+                Ok(Some(bytes.len()))
+            } else {
+                Err(REFUSED)
+            };
+        }
         self.autobind(i)?;
         let from = self.sockets.s[i].local;
         let mut header = Writer::new();
@@ -1213,8 +1244,17 @@ impl Pipes {
                 wakes.add(self.sockets.s[p].waiters.waiters);
             }
             if self.sockets.s[i].kind == DGRAM {
-                // Senders that wait for room in this buffer wait here.
+                // Senders that wait for room in this buffer wait here, and
+                // so do the polls of the sockets connected to this one,
+                // which watch their own lists.
                 wakes.add(self.sockets.s[i].waiters.waiters);
+                let era = self.sockets.s[i].era;
+                for j in 0..SOCKETS {
+                    let o = &self.sockets.s[j];
+                    if j != i && o.live && o.kind == DGRAM && o.peer == Some((i as u8, era)) {
+                        wakes.add(o.waiters.waiters);
+                    }
+                }
             }
         }
         result.fds = deliver;
@@ -1293,7 +1333,18 @@ impl Pipes {
             ready |= watch::HUP;
         }
         if s.kind == DGRAM {
-            ready |= watch::WRITE;
+            // A send of a datagram to a socket of the file namespace waits
+            // while the buffer of the receiver lacks room for the largest
+            // one; on the loopback of INET a send never waits.
+            let full = s.domain == UNIX
+                && s.connected
+                && self
+                    .sockets
+                    .peer_of(i)
+                    .is_some_and(|p| self.sockets.room(p) < MIN_BUF);
+            if !full {
+                ready |= watch::WRITE;
+            }
         } else if s.connected {
             if !(s.wr_shut || s.tx_broken)
                 && self
@@ -1433,7 +1484,10 @@ mod tests {
         p.sock_listen(held, l, 1).unwrap();
         let c = make(p, held, INET, STREAM);
         p.sock_connect(held, c, inet(port), &mut w).unwrap();
-        let (s, _) = p.sock_accept(held, l, 1, 1).unwrap().unwrap();
+        let (s, _) = p
+            .sock_accept(held, l, 1, 1, &mut Wakes::default())
+            .unwrap()
+            .unwrap();
         (l, c, sock(s))
     }
 
@@ -1547,7 +1601,10 @@ mod tests {
         let l = make(&mut p, &mut held, INET, STREAM);
         p.sock_bind(&held, l, inet(5003)).unwrap();
         assert_eq!(p.sock_listen(&held, sock(l.id), 0), Ok(()));
-        assert_eq!(p.sock_accept(&mut held, l, 1, 1), Ok(None));
+        assert_eq!(
+            p.sock_accept(&mut held, l, 1, 1, &mut Wakes::default()),
+            Ok(None)
+        );
         p.wait_new(DESCRIPTIONS as u32 + l.slot() as u32, (7, 1), |_| true)
             .unwrap();
         let c = make(&mut p, &mut held, INET, STREAM);
@@ -1558,11 +1615,30 @@ mod tests {
             watch::READ,
             "a listener with a connection is readable"
         );
-        // The backlog is one: a second connection is refused.
+        // The backlog is one: a second connection of a blocking socket waits
+        // at the listener's list, one of a socket with NONBLOCK is EAGAIN;
+        // a port nobody listens at refuses.
         let c2 = make(&mut p, &mut held, INET, STREAM);
-        assert_eq!(p.sock_connect(&held, c2, inet(5003), &mut w), Err(REFUSED));
+        let queue = DESCRIPTIONS as u32 + l.slot() as u32;
+        assert_eq!(
+            p.sock_connect(&held, c2, inet(5003), &mut w),
+            Ok(Some(queue))
+        );
         assert_eq!(p.sock_connect(&held, c2, inet(5999), &mut w), Err(REFUSED));
-        let (s, from) = p.sock_accept(&mut held, l, 1, 1).unwrap().unwrap();
+        p.sock_set_flags(&held, c2, NONBLOCK).unwrap();
+        assert_eq!(p.sock_connect(&held, c2, inet(5003), &mut w), Err(AGAIN));
+        p.sock_set_flags(&held, c2, 0).unwrap();
+        p.wait_new(queue, (7, 2), |_| true).unwrap();
+        let mut accepted = Wakes::default();
+        let (s, from) = p
+            .sock_accept(&mut held, l, 1, 1, &mut accepted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            woke(&accepted),
+            [(7, 1), (7, 2)],
+            "the accept wakes the waiting connect and the other waiters"
+        );
         assert_eq!(from, p.sock_name(&held, c, false).unwrap());
         assert_eq!(p.sock_write(&held, sock(s), b"k", &mut w), Ok(Some(1)));
         // Closing a listener sends its unaccepted connections away.
@@ -1573,6 +1649,131 @@ mod tests {
         }
         let mut out = [0; 2];
         assert_eq!(p.sock_read(&held, c2, &mut out, &mut w), Ok(Some(0)));
+    }
+
+    #[test]
+    fn a_listening_socket_cannot_connect() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let l = make(&mut p, &mut held, INET, STREAM);
+        p.sock_bind(&held, l, inet(5004)).unwrap();
+        p.sock_listen(&held, l, 1).unwrap();
+        let other = make(&mut p, &mut held, INET, STREAM);
+        p.sock_bind(&held, other, inet(5005)).unwrap();
+        p.sock_listen(&held, other, 1).unwrap();
+        assert_eq!(
+            p.sock_connect(&held, l, inet(5005), &mut w),
+            Err(NOT_SUPPORTED)
+        );
+    }
+
+    #[test]
+    fn a_connected_datagram_socket_takes_datagrams_of_its_peer_only() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let a = make(&mut p, &mut held, UNIX, DGRAM);
+        let b = make(&mut p, &mut held, UNIX, DGRAM);
+        let c = make(&mut p, &mut held, UNIX, DGRAM);
+        let name = |node: u64| Addr::unix(node, b"/d").unwrap();
+        p.sock_bind(&held, a, name(51)).unwrap();
+        p.sock_bind(&held, b, Addr::unix(52, b"/e").unwrap())
+            .unwrap();
+        p.sock_bind(&held, c, Addr::unix(53, b"/f").unwrap())
+            .unwrap();
+        // b is connected to a; c is not connected.
+        p.sock_connect(&held, b, name(51), &mut w).unwrap();
+        let x = make(&mut p, &mut held, INET, DGRAM);
+        let y = make(&mut p, &mut held, INET, DGRAM);
+        let z = make(&mut p, &mut held, INET, DGRAM);
+        let send = |p: &mut Pipes, from: Endpoint, to: Addr, w: &mut Wakes| {
+            p.sock_send(&held, from, 0, &[], &to, b"x", w)
+        };
+        // a is not connected: it takes a datagram of anyone; b takes from a only.
+        assert_eq!(send(&mut p, c, name(51), &mut w), Ok(Some(1)));
+        assert_eq!(
+            send(&mut p, a, Addr::unix(52, b"/e").unwrap(), &mut w),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            send(&mut p, c, Addr::unix(52, b"/e").unwrap(), &mut w),
+            Err(REFUSED),
+            "c is not b's peer"
+        );
+        // On the loopback of INET the datagram of a stranger is lost, not refused.
+        p.sock_bind(&held, y, inet(5010)).unwrap();
+        p.sock_bind(&held, z, inet(5011)).unwrap();
+        p.sock_connect(&held, y, inet(5011), &mut w).unwrap();
+        assert_eq!(send(&mut p, x, inet(5010), &mut w), Ok(Some(1)));
+        let mut out = [0u8; 8];
+        let mut r = Wakes::default();
+        assert_eq!(
+            p.sock_recv(&mut held.clone(), y, DONTWAIT, &mut out, 0, &mut r)
+                .map(|o| o.map(|o| o.n)),
+            Err(AGAIN),
+            "nothing came to y"
+        );
+    }
+
+    #[test]
+    fn a_connected_datagram_socket_is_writable_while_its_peer_has_room() {
+        use proto_wire::watch;
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let (a, b) = {
+            let (x, y) = p.sock_pair(&mut held, 1, 1, UNIX, DGRAM, 0).unwrap();
+            (sock(x), sock(y))
+        };
+        assert_eq!(p.readiness_endpoint(&held, a) & watch::WRITE, watch::WRITE);
+        // Two datagrams of the largest size fill the buffer of b.
+        let big = [7u8; SEND_MAX];
+        for _ in 0..2 {
+            assert_eq!(
+                p.sock_send(&held, a, DONTWAIT, &[], &Addr::NONE, &big, &mut w),
+                Ok(Some(SEND_MAX))
+            );
+        }
+        assert_eq!(p.readiness_endpoint(&held, a) & watch::WRITE, 0);
+        // A read of b tells the polls of a, which watch a's own list.
+        p.wait_new(DESCRIPTIONS as u32 + a.slot() as u32, (9, 1), |_| true)
+            .unwrap();
+        let mut out = [0u8; SEND_MAX];
+        let mut w = Wakes::default();
+        p.sock_recv(&mut held, b, 0, &mut out, 0, &mut w).unwrap();
+        assert!(woke(&w).contains(&(9, 1)));
+        assert_eq!(p.readiness_endpoint(&held, a) & watch::WRITE, watch::WRITE);
+    }
+
+    #[test]
+    fn an_accept_counts_the_connection_in_the_tree_of_the_acceptor() {
+        let mut p = pipes();
+        let mut server = Held::default();
+        let mut w = Wakes::default();
+        let l = make(&mut p, &mut server, INET, STREAM);
+        p.sock_bind(&server, l, inet(5006)).unwrap();
+        p.sock_listen(&server, l, 1).unwrap();
+        // The acceptor's tree (root 2) holds all but one of its sockets.
+        let mut mine = Held::default();
+        for n in 0..ROOT_SOCKS - 1 {
+            p.sock_create(&mut mine, 10 + n as u64 / 8, 2, INET, STREAM, 0)
+                .unwrap();
+        }
+        // The listener belongs to root 1, as does the connector.
+        let mut client = Held::default();
+        let c = make(&mut p, &mut client, INET, STREAM);
+        p.sock_connect(&client, c, inet(5006), &mut w).unwrap();
+        // Root 2 has room for one: the accept of its first connection passes
+        // and makes the 28th; the next connection finds the tree full.
+        let got = p.sock_accept(&mut server, l, 77, 2, &mut Wakes::default());
+        assert!(matches!(got, Ok(Some(_))), "{got:?}");
+        let c2 = make(&mut p, &mut client, INET, STREAM);
+        p.sock_connect(&client, c2, inet(5006), &mut w).unwrap();
+        assert_eq!(
+            p.sock_accept(&mut server, l, 78, 2, &mut Wakes::default()),
+            Err(NFILE)
+        );
     }
 
     #[test]
@@ -1719,7 +1920,10 @@ mod tests {
         p.sock_listen(&held, l, 2).unwrap();
         let c = make(&mut p, &mut held, UNIX, STREAM);
         p.sock_connect(&held, c, name, &mut w).unwrap();
-        let (s, from) = p.sock_accept(&mut held, l, 1, 1).unwrap().unwrap();
+        let (s, from) = p
+            .sock_accept(&mut held, l, 1, 1, &mut Wakes::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(from, Addr::NONE);
         assert_eq!(p.sock_name(&held, sock(s), false), Ok(name));
         assert_eq!(p.sock_name(&held, c, true), Ok(name));

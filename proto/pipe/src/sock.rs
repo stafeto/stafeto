@@ -16,6 +16,11 @@
 //!   which u32 (0 own, 1 peer); reply status and the address. SOCK_OPT: the
 //!   socket, the option u32, set u32 (0 get, 1 set), the value u32; reply
 //!   status and the value.
+//!   SOCK_CONNECT to a listener whose queue is full is EAGAIN for a socket
+//!   with NONBLOCK, and CONNECT_WAIT for any other: the layer then makes the
+//!   connect again as the long operation SOCK_CONNECT_WAIT, SOCK_CONNECT_TAKE
+//!   (body k u64 first, then the body of SOCK_CONNECT), which waits until the
+//!   listener has room, or the connect is made. READY with nothing.
 //! - SOCK_ACCEPT, SOCK_ACCEPT_TAKE (body k u64 first): the listening
 //!   socket. A long operation (proto_wire::long); READY with the new socket
 //!   u32 and the peer's address.
@@ -103,6 +108,10 @@ pub const UNREACHABLE: u32 = 720;
 pub const NO_FAMILY: u32 = 721;
 /// ETOOMANYREFS: a send that would make a cycle of descriptions in flight.
 pub const TOO_MANY_REFS: u32 = 722;
+/// The answer of SOCK_CONNECT to a blocking socket whose listener has no
+/// room in its queue: the connect is made again as SOCK_CONNECT_WAIT, which
+/// waits for the listener to accept.
+pub const CONNECT_WAIT: u32 = 723;
 
 pub const ADDR_NONE: u32 = 0;
 pub const ADDR_INET: u32 = 1;

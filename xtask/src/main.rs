@@ -3550,7 +3550,7 @@ fn posix_sock_steps() -> Result<(), String> {
     let mut text = String::new();
     for (kind, ticks, detail) in &rows {
         let name = match kind {
-            26..=39 => format!("socket call {kind}"),
+            26..=39 | 43 | 44 => format!("socket call {kind}"),
             64 => "heartbeat".to_owned(),
             65 => "own step".to_owned(),
             _ => format!("method {kind}"),
@@ -3558,7 +3558,7 @@ fn posix_sock_steps() -> Result<(), String> {
         text += &format!("pipe {kind} {name} {ticks} {detail}\n");
         println!("pipe service {name}: {ticks} ticks, detail {detail}, B {TERM_B}");
     }
-    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0)).count();
+    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0) || (43..=44).contains(&r.0)).count();
     if sockets < 8 {
         return Err(format!("the socket calls ran too few kinds: {rows:?}"));
     }

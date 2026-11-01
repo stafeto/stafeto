@@ -168,10 +168,12 @@ pub enum Method {
     Ipc = 40,
     IpcTake = 41,
     IpcCancel = 42,
+    SockConnectWait = 43,
+    SockConnectTake = 44,
 }
 
 impl Method {
-    pub const ALL: [Method; 41] = [
+    pub const ALL: [Method; 43] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -213,6 +215,8 @@ impl Method {
         Method::Ipc,
         Method::IpcTake,
         Method::IpcCancel,
+        Method::SockConnectWait,
+        Method::SockConnectTake,
     ];
 
     pub const fn number(self) -> u16 {
@@ -230,7 +234,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
 ];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
