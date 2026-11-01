@@ -548,6 +548,36 @@ pub fn futex_wake(word: *const AtomicU32, count: u32) -> u32 {
     woken
 }
 
+/// Wakes the first thread that waits on `word` (the highest level, the
+/// oldest among equals) and returns its thread number (`Block::thread_id`);
+/// `None` when nobody waits.
+pub fn futex_wake_first(word: *const AtomicU32) -> Option<u64> {
+    let address = word as usize;
+    let bucket = bucket(address);
+    if bucket.waiters.load(Ordering::SeqCst) == 0 {
+        return None;
+    }
+    let held = lock(bucket);
+    let mut cursor = held.bucket.head.load(Ordering::Relaxed);
+    let mut first = None;
+    // SAFETY: the nodes of a held bucket are blocks of waiting threads.
+    while let Some(block) = unsafe { cursor.as_ref() } {
+        cursor = block.next.load(Ordering::Relaxed) as *mut Block;
+        if block.address.load(Ordering::Relaxed) != address {
+            continue;
+        }
+        remove(&held, block);
+        // Under the lock, as in `futex_wake`.
+        let channel =
+            Handle::<Channel>::borrowed(abi::Handle(block.channel.load(Ordering::Relaxed)));
+        let _ = sys::notify(&channel, bit::WAKE);
+        first = Some(block.thread_id);
+        break;
+    }
+    drop(held);
+    first
+}
+
 /// Whether the thread of `block` waits by address now (its node is linked).
 pub fn waiting(block: &Block) -> bool {
     block.address.load(Ordering::Acquire) != 0
@@ -565,6 +595,14 @@ pub fn bucket_of(word: *const AtomicU32) -> usize {
 /// The waiters counted in the bucket of `word`, for tests.
 pub fn bucket_waiters(word: *const AtomicU32) -> u32 {
     bucket(word as usize).waiters.load(Ordering::SeqCst)
+}
+
+/// The waiters counted in all the buckets, for tests.
+pub fn waiters_total() -> u32 {
+    TABLE
+        .iter()
+        .map(|bucket| bucket.waiters.load(Ordering::SeqCst))
+        .sum()
 }
 
 /// The lock of the layer (spec 2, 3.4): a word 0 (free), 1 (held), 2 (held,

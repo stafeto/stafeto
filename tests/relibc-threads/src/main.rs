@@ -81,3 +81,9 @@ unsafe extern "C" fn relibc_threads_realtime(seconds: *mut i64, nanos: *mut i64)
 extern "C" fn relibc_threads_calls() -> u64 {
     rt::sys::calls()
 }
+
+/// How many threads wait by address now, in all the buckets.
+#[unsafe(no_mangle)]
+extern "C" fn relibc_threads_waiting() -> u32 {
+    posix_sync::waiters_total()
+}

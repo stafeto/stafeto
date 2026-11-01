@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <stdint.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
@@ -31,6 +32,7 @@ long relibc_threads_realtime(long *seconds, long *nanos);
 unsigned long relibc_threads_calls(void);
 unsigned long relibc_threads_cancel_window(void);
 int relibc_threads_ended(pthread_t thread);
+unsigned relibc_threads_waiting(void);
 
 #define FAIL(...) do { printf("relibc-threads: " __VA_ARGS__); printf("\n"); exit(10 + __LINE__ % 80); } while (0)
 #define CHECK(cond) do { if (!(cond)) FAIL("check failed at line %d: %s", __LINE__, #cond); } while (0)
@@ -1001,6 +1003,40 @@ static void without_privilege(void) {
     printf("relibc-threads: without privilege: ESRCH for a process that is none, EPERM for a negative nice and a rise by posix_spawn\n");
 }
 
+/* An unlock of a PRIO_INHERIT mutex wakes one waiter (#350): the first of the
+ * queue, the one of the highest level. Three waiters of priorities 5, 10 and
+ * 20 queue on the mutex that main holds; at the unlock two of them still
+ * wait (the main thread, the highest level, keeps the processor, so none
+ * has run yet), and the mutex goes to them by level: 20, 10, 5. */
+static pthread_mutex_t pi_mutex;
+static volatile int pi_order[3];
+static volatile int pi_taken;
+static void *pi_waiter(void *arg) {
+    CHECK(pthread_mutex_lock(&pi_mutex) == 0);
+    pi_order[pi_taken++] = (int)(long)arg;
+    CHECK(pthread_mutex_unlock(&pi_mutex) == 0);
+    return NULL;
+}
+static void pi_wakes_one(void) {
+    relibc_threads_collect();
+    static const int levels[3] = {5, 10, 20};
+    pthread_t waiter[3];
+    pi_taken = 0;
+    make_mutex(&pi_mutex, PTHREAD_PRIO_INHERIT, 0);
+    CHECK(pthread_mutex_lock(&pi_mutex) == 0);
+    for (int i = 0; i < 3; i++) waiter[i] = spawn_at(levels[i], pi_waiter, (void *)(long)levels[i]);
+    for (int i = 0; i < 2000 && relibc_threads_waiting() != 3; i++) sleep_ms(1);
+    CHECK(relibc_threads_waiting() == 3);
+    CHECK(pthread_mutex_unlock(&pi_mutex) == 0);
+    unsigned left = relibc_threads_waiting();
+    for (int i = 0; i < 3; i++) CHECK(pthread_join(waiter[i], NULL) == 0);
+    CHECK(pthread_mutex_destroy(&pi_mutex) == 0);
+    if (left != 2) FAIL("an unlock of a PRIO_INHERIT mutex left %u waiters, expected 2", left);
+    if (pi_order[0] != 20 || pi_order[1] != 10 || pi_order[2] != 5)
+        FAIL("the mutex went to %d, %d, %d", pi_order[0], pi_order[1], pi_order[2]);
+    printf("relibc-threads: an unlock of a PRIO_INHERIT mutex wakes one waiter, the mutex goes by level ok\n");
+}
+
 static void priorities(void) {
     sched_calls();
     tail_of_the_list();
@@ -1011,6 +1047,7 @@ static void priorities(void) {
            pi / 1000, none / 1000);
     CHECK(pi < 15000000LL);
     CHECK(none > 25000000LL);
+    pi_wakes_one();
     CHECK(ceiling_held(PTHREAD_PRIO_PROTECT) == 0);
     CHECK(ceiling_held(PTHREAD_PRIO_NONE) == 1);
     printf("relibc-threads: a thread holding a mutex of ceiling 25 is not preempted by priority 15\n");
