@@ -580,6 +580,42 @@ mod tests {
         assert_eq!((ring.creator, ring.root), (50, 60));
     }
 
+    /// A ring with a description granted but not yet attached (the open of
+    /// a FIFO that waits for its counterpart) is not given to another FIFO
+    /// when the attached end closes: the granted description still names it.
+    #[test]
+    fn ring_with_an_unfinished_open_is_not_reused_by_another_fifo() {
+        let mut p = Box::new(Pipes::new());
+        let mut held = Held::default();
+        let mut wakes = Wakes::default();
+        let writer = p.reserve_named(key(), 1, 1, WRITE_END).unwrap();
+        p.attach_named(writer, &mut wakes).unwrap();
+        p.take_named(&mut held, writer).unwrap();
+        // The reader of the same FIFO is granted and has not attached yet.
+        let reader = p.reserve_named(key(), 1, 1, 0).unwrap();
+        let ring = p.named_description(reader).unwrap().ring;
+        p.close_endpoint(&mut held, writer, &mut wakes).unwrap();
+        assert_eq!(p.live(), 1, "the ring stays for the granted reader");
+        // Another FIFO gets a ring of its own.
+        let other_key = NamedInode {
+            broker: 7,
+            inode: NamedTicket {
+                slot: 5,
+                generation: 0x1_0000_0002,
+            },
+        };
+        let other = p.reserve_named(other_key, 2, 2, 0).unwrap();
+        assert_ne!(p.named_description(other).unwrap().ring, ring);
+        assert_eq!(p.live(), 2);
+        // The reader attaches to its own ring, with no data of the other.
+        p.attach_named(reader, &mut wakes).unwrap();
+        p.take_named(&mut held, reader).unwrap();
+        assert_eq!(p.named_description(reader).unwrap().ring, ring);
+        p.close_endpoint(&mut held, reader, &mut wakes).unwrap();
+        p.cancel_named(other, &mut wakes).unwrap();
+        assert_eq!(p.live(), 0);
+    }
+
     #[test]
     fn named_atomic_write_refusal_preserves_data_and_other_writer_reference() {
         let mut p = Box::new(Pipes::new());

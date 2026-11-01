@@ -76,6 +76,10 @@ const EISCONN: i32 = 106;
 const ENOTCONN: i32 = 107;
 const ECONNREFUSED: i32 = 111;
 
+/// What `refusal` says for the answer that tells a blocking connect to wait
+/// (proto_pipe::sock::CONNECT_WAIT): never an errno of a call.
+const CONNECT_WAITS: i32 = 10_723;
+
 /// The size of a `cmsghdr` (len, level, type) and of the alignment of data.
 const CMSG_HEADER: usize = 16;
 
@@ -103,6 +107,7 @@ pub(crate) fn refusal(status: Status) -> Option<i32> {
         proto_pipe::sock::UNREACHABLE => ENETUNREACH,
         proto_pipe::sock::NO_FAMILY => EAFNOSUPPORT,
         proto_pipe::sock::TOO_MANY_REFS => ETOOMANYREFS,
+        proto_pipe::sock::CONNECT_WAIT => CONNECT_WAITS,
         _ => return None,
     })
 }
@@ -425,10 +430,60 @@ pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
             .map_err(|_| EIO)?;
         endpoint(end).write(&mut w).map_err(|_| EIO)?;
         addr.write(&mut w).map_err(|_| EIO)?;
-        rpc(transport, w.as_bytes(), &mut [0; MESSAGE_MAX]).map(drop)
+        match rpc(transport, w.as_bytes(), &mut [0; MESSAGE_MAX]) {
+            // The listener's queue is full: wait for it to accept.
+            Err(CONNECT_WAITS) => connect_wait(transport, end, &addr),
+            other => other.map(drop),
+        }
     });
     finish(point, &result);
     result
+}
+
+/// A connect of a blocking socket to a listener with no room in its queue,
+/// a long operation like an accept: it asks again whenever the listener
+/// accepts, until it is connected, refused or interrupted.
+fn connect_wait(transport: Transport, end: u32, addr: &Addr) -> Result<(), i32> {
+    // The listener's list of waiting operations has eight places: where they
+    // are taken the start is refused (EAGAIN), and it is made again every
+    // 2 ms until it is taken, a signal ends the wait (EINTR) or the connect
+    // is made or refused.
+    loop {
+        match connect_wait_once(transport, end, addr) {
+            Err(EAGAIN) => crate::threads::sleep::pause(2_000_000)?,
+            other => return other,
+        }
+    }
+}
+
+fn connect_wait_once(transport: Transport, end: u32, addr: &Addr) -> Result<(), i32> {
+    let pipes = transport.pipes().map_err(crate::error)?;
+    let e = endpoint(end);
+    let mut start = Writer::new();
+    Method::SockConnectWait
+        .header()
+        .write(&mut start)
+        .map_err(|_| EIO)?;
+    e.write(&mut start).map_err(|_| EIO)?;
+    addr.write(&mut start).map_err(|_| EIO)?;
+    let mut reply = [0u8; MESSAGE_MAX];
+    long::run_with(
+        &pipes,
+        start.as_bytes(),
+        |cancel, key, w| {
+            if cancel {
+                cancel_request(Method::ReadCancel, key, e, w)
+            } else {
+                Method::SockConnectTake.header().write(w)?;
+                w.u64(key)?;
+                e.write(w)?;
+                addr.write(w)
+            }
+        },
+        &mut reply,
+        &refusal,
+    )
+    .map(drop)
 }
 
 fn finish<T>(point: crate::threads::cancel::Point, result: &Result<T, i32>) {

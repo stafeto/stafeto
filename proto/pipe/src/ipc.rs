@@ -129,7 +129,10 @@ pub mod op {
     pub const NSEM_UNLINK: u32 = 33;
     /// sem_close: w0 id.
     pub const NSEM_CLOSE: u32 = 34;
-    /// sem_wait (long): w0 id, w1 nowait.
+    /// sem_wait (long): w0 id, w1 nowait, cred, w3 the level of the waiting
+    /// thread (the layer adds it; 0 when it is not there). The service keeps
+    /// the waiters in the order of their levels, the greater first, the
+    /// older first among equals, and a post wakes one.
     pub const NSEM_WAIT: u32 = 35;
     /// sem_post: w0 id.
     pub const NSEM_POST: u32 = 36;

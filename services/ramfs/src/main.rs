@@ -47,7 +47,7 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc,
     0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
@@ -120,6 +120,9 @@ const WAIT_TIMER_LABEL: u64 = 0x5741_4954;
 const WAIT_TIMER_PERIOD_NS: u64 = 250_000_000;
 const PACE_TIMER_LABEL: u64 = 0x5041_4345;
 const AUDIT_TIMER_LABEL: u64 = 0x4155_4454;
+/// The label of the notification the pipe service sends when a job for the
+/// file of a segment is there that nobody asked it for.
+const IPC_JOBS_LABEL: u64 = 0x4950_434a;
 /// The time between two steps of the audit. The audit runs on a timer
 /// between them, so that the clients below the service keep their time while
 /// it goes round: a turn after turn of the whole round held them back for as
@@ -253,6 +256,14 @@ fn main(_: u64) -> u64 {
     let Ok(audit_timer) = sys::timer_create(&audit_view, level) else {
         return 3;
     };
+    let Ok(ipc_notify) = sys::handle_label(
+        &channel,
+        Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
+        IPC_JOBS_LABEL,
+        level,
+    ) else {
+        return 3;
+    };
     let heartbeat = Heartbeat {
         to: &start.parent,
         period_ns,
@@ -298,6 +309,12 @@ fn main(_: u64) -> u64 {
         lock_share: ramfs::maintenance::Share::new(LOCK_WINDOW_NS, LOCK_BUDGET_NS),
         lock_paused: false,
         lock_sweep: SweepCursor::default(),
+        ipc_notify,
+        ipc_armed: false,
+        ipc_arm_tries: 0,
+        ipc_jobs_pending: false,
+        segment_unlink: None,
+        segment_refusals: 0,
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
         lock_maintenance_work: 0,
@@ -393,6 +410,18 @@ struct Fs {
     notary: Option<Handle<Channel>>,
     /// Init authorizes this service alone to prepare exact named pipe grants.
     pipe_broker: Option<Handle<Channel>>,
+    /// The copy of the service's channel that the pipe service is given (with
+    /// NOTIFY alone) to tell of jobs nobody asked for, whether it has been
+    /// given, the tries to give it, and whether such a notice came.
+    ipc_notify: Handle<Channel>,
+    ipc_armed: bool,
+    ipc_arm_tries: u8,
+    ipc_jobs_pending: bool,
+    /// The removal of the file of a segment under way, a portion to a call of
+    /// IPC_JOBS or a turn of maintenance.
+    segment_unlink: Option<ramfs::namespace::StagedUnlink>,
+    /// The cleanups of such removals the storage refused.
+    segment_refusals: u32,
     /// The sessions the service gave itself so far.
     given: u64,
     level: u8,
@@ -1670,6 +1699,13 @@ impl Service<0> for Fs {
             self.notify_maintenance();
             return;
         }
+        if notice.label == IPC_JOBS_LABEL {
+            self.ipc_jobs_pending = true;
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
         if notice.source != rt::abi::Source::Unlabeled || notice.label != 0 {
             self.maintenance_burst.restart();
             self.legacy_pending = true;
@@ -1677,6 +1713,17 @@ impl Service<0> for Fs {
             return;
         }
         rt::service::step_own();
+        // The pipe service is given the channel it tells of jobs with, once
+        // (a few tries), and the jobs it told of are taken, four to a turn.
+        if self.pipe_broker.is_some()
+            && (self.ipc_jobs_pending || (!self.ipc_armed && self.ipc_arm_tries < 3))
+        {
+            self.ipc_arm_tries = self.ipc_arm_tries.saturating_add(1);
+            self.ipc_jobs_pending = self.ipc_jobs_round().unwrap_or(false);
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
         if self.ram.cancel_refusals != self.cancel_reported {
             self.cancel_reported = self.ram.cancel_refusals;
             rt::println!(
@@ -2628,6 +2675,22 @@ impl Service<0> for Fs {
                 }
                 Answer::Reply(Outgoing::new())
             }
+            Some(Method::IpcJobs) => {
+                if body.finish().is_err() || !r.handles.is_empty() {
+                    return Answer::Status(Status::BadSize);
+                }
+                match self.ipc_jobs_round() {
+                    Ok(more) => {
+                        self.ipc_jobs_pending = more;
+                        let w = r.reply();
+                        if w.u32(0).is_err() || w.u32(u32::from(more)).is_err() {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::ShareGrant) => {
                 let Ok(fd) = body.u32() else {
                     return Answer::Status(Status::BadSize);
@@ -3206,6 +3269,85 @@ impl Fs {
                 births[i - SESSIONS].is_none()
             }
     }
+    /// One call of BROKER_JOBS: the jobs for the files of XSI segments the
+    /// pipe service holds, one a call, run; whether work is left. The first
+    /// call brings the copy of the channel the pipe service tells of jobs with.
+    /// The wait in `send` is the pipe service's longest step, as for the
+    /// broker's other calls; the pipe service never calls this one.
+    fn ipc_jobs_round(&mut self) -> Result<bool, u32> {
+        // A removal under way goes on by a portion, with no call.
+        if let Some(unlink) = self.segment_unlink.as_mut() {
+            match unlink.advance(&mut self.ram.storage) {
+                ramfs::namespace::UnlinkStep::More => {}
+                ramfs::namespace::UnlinkStep::Done => self.segment_unlink = None,
+                ramfs::namespace::UnlinkStep::Refused => {
+                    self.segment_unlink = None;
+                    self.segment_refusals += 1;
+                    rt::println!(
+                        "ramfs: {} cleanups of a segment's file were refused",
+                        self.segment_refusals
+                    );
+                }
+            }
+            return Ok(true);
+        }
+        let Some(broker) = self.pipe_broker.as_ref() else {
+            return Err(proto_fs::RESOLVING);
+        };
+        let arm = !self.ipc_armed;
+        let mut request = proto_wire::Writer::new();
+        let flags = if arm {
+            proto_pipe::jobs::BRINGS_NOTIFY
+        } else {
+            0
+        };
+        proto_pipe::jobs::write_request(flags, &mut request).map_err(|_| proto_wire::BAD_SIZE)?;
+        let reply = if arm {
+            let copy = sys::handle_duplicate(&self.ipc_notify, Rights::NOTIFY | Rights::TRANSFER)
+                .map_err(|_| proto_fs::RESOLVING)?;
+            sys::send_handles(broker, request.as_bytes(), [copy.erase()]).map_err(|_| ())
+        } else {
+            sys::send(broker, request.as_bytes()).map_err(|_| ())
+        }
+        .map_err(|()| proto_fs::RESOLVING)?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+        if r.u32().map_err(|e| e.code())? != 0 || !reply.handles.is_empty() {
+            return Err(proto_fs::RESOLVING);
+        }
+        let (more, jobs) = proto_pipe::jobs::read_reply(r).map_err(|e| e.code())?;
+        self.ipc_armed = true;
+        let mut staged = false;
+        for job in jobs.into_iter().flatten() {
+            staged |= self.run_segment_job(job);
+        }
+        Ok(more || staged)
+    }
+
+    /// A job for the file of a segment (`ramfs::segments`). A file that is
+    /// not there (the segment's maker has not made it yet, or went before it
+    /// did) is no error. Whether a removal is under way.
+    fn run_segment_job(&mut self, job: proto_pipe::jobs::Job) -> bool {
+        use proto_pipe::jobs::Job;
+        match job {
+            Job::Own {
+                serial,
+                uid,
+                gid,
+                mode,
+            } => {
+                ramfs::segments::change(&mut self.ram.storage, serial, uid, gid, mode);
+                false
+            }
+            Job::Remove { serial } => {
+                // The removal takes its portions in the calls and turns after
+                // this one.
+                self.segment_unlink = ramfs::segments::begin_remove(&mut self.ram.storage, serial);
+                self.segment_unlink.is_some()
+            }
+        }
+    }
+
     fn notify_maintenance(&self) {
         if self.legacy_pending || self.lock_work_pending() {
             let _ = sys::notify(&self.channel, 1);
