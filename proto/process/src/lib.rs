@@ -204,7 +204,7 @@ pub const NAME_LEN: usize = 16;
 
 mod limits;
 mod retained;
-pub use limits::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
+pub use limits::{AS, CORE, DATA, FSIZE, MEMLOCK, NOFILE, STACK};
 pub use limits::{ExpenditureRoot, Groups, Limit, ResourceLimits, SUPPLEMENTARY_MAX};
 pub use retained::{RetainedLoader, RetainedLoaderReply, RetainedLoaderState};
 pub const INVALID: u32 = 500;

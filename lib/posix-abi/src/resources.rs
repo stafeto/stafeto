@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 //! Public resource limits and supplementary groups of the authenticated process.
 use crate::constants::{EAGAIN, EINVAL, EIO, ENOSYS, EPERM};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 pub use proto_process::Limit;
 use proto_process::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
 static SETTER: AtomicU32 = AtomicU32::new(0);
@@ -50,18 +50,17 @@ fn resource(value: i32) -> Result<usize, i32> {
             3 => Ok(STACK),
             4 => Ok(CORE),
             7 => Ok(NOFILE),
+            8 => Ok(proto_process::MEMLOCK),
             9 => Ok(AS),
             _ => Err(ENOSYS),
         },
         _ => Err(EINVAL),
     }
 }
-/// RLIMIT_MEMLOCK (Linux's 8), kept by the layer apart from the service's
-/// limits: the memory of a process is resident, so the limit only decides
-/// who may lock (`lock_check`). A child of `fork` has the same.
-const MEMLOCK: i32 = 8;
-static MEMLOCK_SOFT: AtomicU64 = AtomicU64::new(u64::MAX);
-static MEMLOCK_HARD: AtomicU64 = AtomicU64::new(u64::MAX);
+/// RLIMIT_MEMLOCK (Linux's 8): the process service keeps it with the other
+/// limits (`proto_process::MEMLOCK`), so that it passes `fork`, `posix_spawn`
+/// and `exec`. The memory of a process is resident, so the limit only decides
+/// who may lock (`lock_check`).
 /// `mlockall(MCL_FUTURE)` is on: what is mapped from now on is to be locked.
 static LOCK_FUTURE: AtomicBool = AtomicBool::new(false);
 static LOCKED_ALL: AtomicBool = AtomicBool::new(false);
@@ -73,7 +72,14 @@ pub fn lock_check(bytes: u64) -> Result<(), i32> {
     if crate::process::geteuid() == 0 {
         return Ok(());
     }
-    match MEMLOCK_SOFT.load(Ordering::Relaxed) {
+    let soft = {
+        let _guard = Guard::lock();
+        crate::process::client()
+            .limit(proto_process::MEMLOCK)
+            .map_err(errno)?
+            .soft
+    };
+    match soft {
         0 => Err(EPERM),
         soft if bytes > soft => Err(crate::constants::ENOMEM),
         _ => Ok(()),
@@ -118,12 +124,6 @@ pub fn future_check(bytes: u64) -> Result<(), i32> {
 }
 
 pub fn get(value: i32) -> Result<Limit, i32> {
-    if value == MEMLOCK {
-        return Ok(Limit {
-            soft: MEMLOCK_SOFT.load(Ordering::Relaxed),
-            hard: MEMLOCK_HARD.load(Ordering::Relaxed),
-        });
-    }
     let _guard = Guard::lock();
     match resource(value) {
         Ok(index) => crate::process::client().limit(index).map_err(errno),
@@ -135,18 +135,6 @@ pub fn get(value: i32) -> Result<Limit, i32> {
     }
 }
 pub fn set(value: i32, limit: Limit) -> Result<(), i32> {
-    if value == MEMLOCK {
-        if limit.soft > limit.hard {
-            return Err(EINVAL);
-        }
-        // The hard limit goes up only for the superuser.
-        if limit.hard > MEMLOCK_HARD.load(Ordering::Relaxed) && crate::process::geteuid() != 0 {
-            return Err(EPERM);
-        }
-        MEMLOCK_SOFT.store(limit.soft, Ordering::Relaxed);
-        MEMLOCK_HARD.store(limit.hard, Ordering::Relaxed);
-        return Ok(());
-    }
     let index = resource(value)?;
     let _guard = Guard::lock();
     crate::process::client()

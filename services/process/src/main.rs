@@ -4183,15 +4183,13 @@ impl Service<0> for Processes {
                 let (Ok(resource), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                let Some(value) = self
-                    .records
-                    .get(index)
-                    .expect("limit caller")
-                    .limits
-                    .values
-                    .get(resource as usize)
-                    .copied()
-                else {
+                let caller = self.records.get(index).expect("limit caller");
+                let value = if resource as usize == proto_process::MEMLOCK {
+                    Some(caller.memlock)
+                } else {
+                    caller.limits.values.get(resource as usize).copied()
+                };
+                let Some(value) = value else {
                     return refuse(proto_process::INVALID);
                 };
                 if r.reply()

@@ -573,7 +573,52 @@ static void fexec_checks(void) {
     close(file);
     if (failures == before) puts("posix-resources: fexecve exact inode offset and CLOEXEC ok");
 }
+/* RLIMIT_MEMLOCK lives in the process service: fork, posix_spawn and exec
+ * keep it, and a process that is not privileged cannot raise the hard
+ * limit. */
+static void memlock(void) {
+    int before = failures;
+    struct rlimit lock = {111, 222};
+    check("set MEMLOCK", setrlimit(RLIMIT_MEMLOCK, &lock) == 0 && same_limit(RLIMIT_MEMLOCK, &lock));
+    pid_t forked = fork();
+    if (forked == 0) {
+        if (!same_limit(RLIMIT_MEMLOCK, &lock)) _exit(1);
+        if (setuid(65534)) _exit(2);
+        struct rlimit raised = {111, 223};
+        errno = 0;
+        if (setrlimit(RLIMIT_MEMLOCK, &raised) != -1 || errno != EPERM
+            || !same_limit(RLIMIT_MEMLOCK, &lock)) _exit(3);
+        struct rlimit lower = {50, 222};
+        if (setrlimit(RLIMIT_MEMLOCK, &lower) || !same_limit(RLIMIT_MEMLOCK, &lower)) _exit(4);
+        _exit(0);
+    }
+    check("fork inherits MEMLOCK, the hard limit needs privilege", forked > 0 && reaped(forked, 0));
+    check("the parent's MEMLOCK stays", same_limit(RLIMIT_MEMLOCK, &lock));
+    char *spawn_args[] = {"resources", "memlock-child", NULL};
+    pid_t spawned;
+    check("posix_spawn gives MEMLOCK", posix_spawn(&spawned, "/bin/procs-child", NULL, NULL, spawn_args, environ) == 0
+        && reaped(spawned, 0));
+    pid_t execed = fork();
+    if (execed == 0) {
+        struct rlimit other = {333, 444};
+        if (setrlimit(RLIMIT_MEMLOCK, &other)) _exit(1);
+        char *exec_args[] = {"resources", "memlock-exec", NULL};
+        execv("/bin/procs-child", exec_args);
+        _exit(2);
+    }
+    check("exec keeps the MEMLOCK set before it", execed > 0 && reaped(execed, 0));
+    check("restore MEMLOCK", setrlimit(RLIMIT_MEMLOCK, &(struct rlimit){RLIM_INFINITY, RLIM_INFINITY}) == 0);
+    if (failures == before) puts("posix-resources: MEMLOCK through fork, spawn and exec ok");
+}
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "memlock-child") == 0) {
+        struct rlimit lock = {111, 222};
+        return same_limit(RLIMIT_MEMLOCK, &lock) ? 0 : 30;
+    }
+    if (argc == 2 && strcmp(argv[1], "memlock-exec") == 0) {
+        struct rlimit lock = {333, 444};
+        return same_limit(RLIMIT_MEMLOCK, &lock) ? 0 : 31;
+    }
     if (argc == 1) {
         char *args[] = {"resources", "run", NULL};
         pid_t child;
@@ -607,6 +652,7 @@ int main(int argc, char **argv) {
     accounts();
     nofile();
     fsize();
+    memlock();
     fexec_checks();
     return failures ? 1 : 0;
 }

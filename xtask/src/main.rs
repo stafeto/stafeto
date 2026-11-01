@@ -4633,6 +4633,7 @@ fn posix_resources_probe() -> Result<(), String> {
         "posix-resources: accounts and supplementary groups ok",
         "posix-resources: NOFILE allocation and inherited limits ok",
         "posix-resources: FSIZE writes append and SIGXFSZ ok",
+        "posix-resources: MEMLOCK through fork, spawn and exec ok",
         "posix-resources: fexecve exact inode offset and CLOEXEC ok",
         "posix-resources: F6 link limit and integer base ok",
         "posix-resources: F6 metadata statvfs and PATH ok",
