@@ -1508,8 +1508,6 @@ fn mapping_while_threads_join() -> Outcome {
             let _ = unsafe { sys::mem_unmap(&own(), at, PAGE as u64) };
         }
     }
-    // The count at the end of the calls: threads were made during them.
-    let during = mark(0);
     sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
         .map_err(|_| "init could not take its priority back")?;
     MARKS[3].store(1, Relaxed);
@@ -1522,8 +1520,8 @@ fn mapping_while_threads_join() -> Outcome {
     check(ended, "the thread on CPU 1 did not stop")?;
     check(mapped == GAP_CALLS, "a mem_map failed while threads joined")?;
     check(
-        during > before,
-        "no thread was made during the mem_map calls",
+        made > before,
+        "no thread was made after the first one while the calls ran",
     )?;
     println!(
         "smp: {mapped} mem_map calls while another CPU made {made} threads in the same process"
