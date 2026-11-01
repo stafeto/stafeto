@@ -1021,7 +1021,7 @@ static int byte_at(const char *path, off_t at) {
 
 /* Makes the file i of PAGE bytes of 'a' and maps it shared and writable;
  * the descriptor is closed at once, so the mapping alone keeps the file. */
-static char *pin_map(int i) {
+static char *pin_map_prot(int i, int prot) {
     char path[48];
     pin_path(path, sizeof path, i);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -1034,11 +1034,15 @@ static char *pin_map(int i) {
             return NULL;
         }
     }
-    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    char *p = mmap(NULL, PAGE, prot, MAP_SHARED, fd, 0);
     int saved = errno;
     close(fd);
     errno = saved;
     return p == MAP_FAILED ? NULL : p;
+}
+
+static char *pin_map(int i) {
+    return pin_map_prot(i, PROT_READ | PROT_WRITE);
 }
 
 /* The numbers open now, 0 to 63. */
@@ -1092,7 +1096,8 @@ static void pins(void) {
     check("pins: the writes are in the files", stored == PINS);
     /* A 17th file is refused with ENOMEM, and a free place takes it. */
     errno = 0;
-    char *extra = pin_map(PINS);
+    /* (read only: the process service keeps 16 objects of writable ones) */
+    char *extra = pin_map_prot(PINS, PROT_READ);
     check("pins: the 17th file is ENOMEM", extra == NULL && errno == ENOMEM);
     pin_path(path, sizeof path, 0);
     int again_fd = open(path, O_RDWR);
@@ -1133,7 +1138,7 @@ static void pins(void) {
     /* The last munmap gives the place back. */
     check("pins: munmap", munmap(maps[0], PAGE) == 0);
     maps[0] = NULL;
-    extra = pin_map(PINS);
+    extra = pin_map_prot(PINS, PROT_READ);
     check("pins: a place freed takes the 17th file", extra != NULL);
     maps[PINS] = extra;
 out:

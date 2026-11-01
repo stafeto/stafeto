@@ -372,6 +372,22 @@ mod tests {
         }
     }
     #[test]
+    fn the_last_number_of_a_pinned_description_is_no_last_alias() {
+        let mut table = TestTable::default();
+        table.place(0, 100, Flags::default()).unwrap();
+        let place = table.pin(0).unwrap();
+        let CloseAdmission::Started { token, snapshot } = table.begin_close_unowned(0, 42).unwrap()
+        else {
+            panic!()
+        };
+        // The service keeps the description for the pin.
+        assert!(!snapshot.last_alias);
+        assert_eq!(table.finish_close(token), Ok(None));
+        table.ack_close(token, None).unwrap();
+        assert_eq!(table.unpin(place), Some(100));
+    }
+
+    #[test]
     fn unregistered_cleanup_has_its_own_receipt_through_full_io_and_control_tables() {
         let mut table = TestTable::default();
         for fd in 0..32 {
