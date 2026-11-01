@@ -101,6 +101,10 @@ struct Walking {
     refused: bool,
     denied: bool,
 }
+/// The most deliveries and the most looks at places one step of the walk of
+/// a TtySignal makes (`tty_walk_step`).
+const TTY_DELIVERIES: usize = 16;
+const TTY_LOOKS: usize = RECORDS;
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
@@ -2648,32 +2652,42 @@ impl Processes {
         Delivery::Done
     }
 
-    /// One step of the walk of a TtySignal; its reply at its end.
+    /// One step of the walk of a TtySignal; its reply at its end. The
+    /// terminal service waits for the reply and the levels above it keep
+    /// the processor until the walk is done, so a step does more than one
+    /// of the walk's moves: up to `TTY_DELIVERIES` deliveries or `TTY_LOOKS`
+    /// looks, however many that is of the moves of `Walk::step`.
     fn tty_walk_step(&mut self) {
         let Some(mut w) = self.tty_walk.take() else {
             return;
         };
-        match w.walk.step(&self.records) {
-            Step::Found(target) => match self.deliver_terminal(target, w.signal) {
-                Delivery::Done | Delivery::Again => w.delivered = true,
-                Delivery::Denied => w.denied = true,
-                Delivery::Refused => w.refused = true,
-            },
-            Step::Looked => {}
-            Step::Done => {
-                let code = walk::outcome(w.delivered, w.refused, w.denied);
-                #[cfg(feature = "tty-probe")]
-                if let Some((_, count)) = self.tty_probe.take() {
-                    let mut reply = Writer::new();
-                    let _ = reply.u32(code);
-                    let _ = reply.u32(count);
-                    let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
+        let (mut delivered, mut looked) = (0, 0);
+        while delivered < TTY_DELIVERIES && looked < TTY_LOOKS {
+            match w.walk.step(&self.records) {
+                Step::Found(target) => {
+                    delivered += 1;
+                    match self.deliver_terminal(target, w.signal) {
+                        Delivery::Done | Delivery::Again => w.delivered = true,
+                        Delivery::Denied => w.denied = true,
+                        Delivery::Refused => w.refused = true,
+                    }
+                }
+                Step::Looked => looked += walk::LOOKS,
+                Step::Done => {
+                    let code = walk::outcome(w.delivered, w.refused, w.denied);
+                    #[cfg(feature = "tty-probe")]
+                    if let Some((_, count)) = self.tty_probe.take() {
+                        let mut reply = Writer::new();
+                        let _ = reply.u32(code);
+                        let _ = reply.u32(count);
+                        let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
+                        return;
+                    }
+                    let _ = w
+                        .pending
+                        .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
                     return;
                 }
-                let _ = w
-                    .pending
-                    .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
-                return;
             }
         }
         self.tty_walk = Some(w);

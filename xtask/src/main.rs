@@ -8111,6 +8111,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-interrupt", || posix_interrupt_probe(false)),
         job("posix-tty", || posix_tty_probe(false, false)),
         job("posix-tty-control-steps", posix_tty_control_steps),
+        job("posix-tty-steps", || posix_tty_probe(false, true)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-files", posix_files_probe),
