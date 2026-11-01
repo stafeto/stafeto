@@ -123,7 +123,10 @@
 //!
 //! Pool, through a session, no body: status u32 and the bytes u64 of the
 //! service's quota left for the children past its reserve, what a probe
-//! reads to see that ended loads gave their quota back.
+//! reads to see that ended loads gave their quota back; then REFUSALS u64,
+//! the counts of the starts a child the service refused, by reason
+//! (REFUSED_*), for the probe that tells which limit a refused fork or
+//! spawn met.
 //!
 //! Replace, through the channel with no label, from the service's own
 //! thread that tells init of an exec (replace.rs): body the session label
@@ -1306,6 +1309,18 @@ pub struct Listing {
     pub memory: u64,
     pub name: [u8; NAME_LEN],
 }
+
+/// The reasons a start of a child is refused, the indices of the counts
+/// that follow the pool in the reply of Pool.
+pub const REFUSED_CHILDREN: usize = 0;
+pub const REFUSED_LOADERS: usize = 1;
+pub const REFUSED_LABEL: usize = 2;
+pub const REFUSED_GENERATIONS: usize = 3;
+pub const REFUSED_POOL: usize = 4;
+pub const REFUSED_CREATE: usize = 5;
+pub const REFUSED_PIECE: usize = 6;
+/// The number of reasons.
+pub const REFUSALS: usize = 7;
 
 /// The memory the process service has to give to processes: its quota, and
 /// the part of it that no process holds. The tail of a List reply.

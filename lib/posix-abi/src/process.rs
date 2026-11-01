@@ -94,6 +94,18 @@ pub(crate) fn ask_setting(w: &Writer) -> Result<[u64; 2], i32> {
     ask_pair(w)
 }
 
+/// The send of `w` to the process service, again while a signal wakes the
+/// wait: a request the kernel interrupts was not taken, so asking again
+/// repeats nothing.
+pub(crate) fn send_again(w: &Writer) -> Result<rt::sys::Reply, rt::abi::Error> {
+    loop {
+        match rt::sys::send(client().session(), w.as_bytes()) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// `ask` for a reply of two u64 after the status.
 pub(crate) fn ask_pair(w: &Writer) -> Result<[u64; 2], i32> {
     answer(w, |bytes| match (bytes.u64(), bytes.u64()) {
@@ -2126,7 +2138,7 @@ fn start_bare() -> Result<(u32, Handle<Channel>), i32> {
     Method::SpawnStart.header().write(&mut w).map_err(|_| EIO)?;
     start.write(&mut w).map_err(|_| EIO)?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let mut reply = rt::sys::send(client().session(), w.as_bytes()).map_err(|_| EIO)?;
+    let mut reply = send_again(&w).map_err(|_| EIO)?;
     let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
     let status = Status::from_code(r.u32().map_err(|_| EIO)?);
     if status != Status::Ok {
@@ -2222,18 +2234,36 @@ pub fn probe_tty_signal(pgid: u32, signal: u32) -> i32 {
 }
 
 pub fn probe_pool() -> u64 {
-    let Ok(w) = request(proto_process::Method::Pool, &[]) else {
+    pool_reply().map_or(0, |(pool, _)| pool)
+}
+
+/// How many starts of a child the process service refused, by reason (the
+/// indices `proto_process::REFUSED_*`), into `out`; the number of counts
+/// written, 0 on an error.
+pub fn probe_start_refusals(out: &mut [u64]) -> usize {
+    let Some((_, counts)) = pool_reply() else {
         return 0;
     };
+    let n = out.len().min(counts.len());
+    out[..n].copy_from_slice(&counts[..n]);
+    n
+}
+
+/// The reply of Pool: the pool and the counts of refused starts.
+fn pool_reply() -> Option<(u64, [u64; proto_process::REFUSALS])> {
+    let w = request(proto_process::Method::Pool, &[]).ok()?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let Ok(reply) = rt::sys::send(client().session(), w.as_bytes()) else {
-        return 0;
-    };
+    let reply = send_again(&w).ok()?;
     let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
-    match (r.u32(), r.u64()) {
-        (Ok(0), Ok(pool)) => pool,
-        _ => 0,
+    if r.u32() != Ok(0) {
+        return None;
     }
+    let pool = r.u64().ok()?;
+    let mut counts = [0; proto_process::REFUSALS];
+    for count in &mut counts {
+        *count = r.u64().ok()?;
+    }
+    Some((pool, counts))
 }
 
 /// The probe of `addopen`: the descriptor an open action makes in the

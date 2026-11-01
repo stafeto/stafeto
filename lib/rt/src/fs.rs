@@ -475,7 +475,7 @@ impl Files {
             w.u32(Self::exact_description_word(*held)?)?;
             w.u64(held.generation)?;
         }
-        let mut reply = Self::send_on(channel, w.as_bytes())?;
+        let mut reply = Self::send_on_with(channel, w.as_bytes(), true)?;
         let code = Self::reply_code(&reply)?;
         if code != 0 {
             return match Self::open_reply(&reply, 4) {
@@ -732,8 +732,34 @@ impl Files {
     /// AUTHENTICATING guarantees no file effect. Complete the retained
     /// refresh before retrying the exact original handle-free request.
     pub fn send_on(channel: &Handle<Channel>, request: &[u8]) -> Result<crate::sys::Reply, Status> {
+        Self::send_on_with(channel, request, false)
+    }
+    /// `send_on` that asks again when a signal of the process wakes the wait
+    /// (`restart`): for the clone of a fork, an exec or a spawn, which have
+    /// no EINTR to give. The kernel interrupts a request only while the
+    /// service has not taken it, so asking again cannot clone twice. If an
+    /// entry is open, its handler runs on the return to EL0 before the
+    /// request is asked again, which restarts the call whatever SA_RESTART
+    /// says. Only the interruption of the send itself asks again: a status
+    /// the service answers with is the answer. The retry needs the entries
+    /// open to the kernel's interruption: under `defer_entries` the wait
+    /// would end at once, again and again.
+    fn send_on_with(
+        channel: &Handle<Channel>,
+        request: &[u8],
+        restart: bool,
+    ) -> Result<crate::sys::Reply, Status> {
         loop {
-            let reply = sys::send(channel, request).map_err(Status::Kernel)?;
+            let reply = match sys::send(channel, request) {
+                Err(Error::Interrupted) if restart => {
+                    debug_assert!(
+                        !crate::upcall::entries_deferred(),
+                        "a request asked again under deferred entries never waits"
+                    );
+                    continue;
+                }
+                result => result.map_err(Status::Kernel)?,
+            };
             if Self::reply_code(&reply)? != proto_fs::AUTHENTICATING {
                 return Ok(reply);
             }
@@ -747,7 +773,7 @@ impl Files {
         }
     }
     pub fn clone_on(channel: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
-        let mut reply = Self::send_on(channel, request)?;
+        let mut reply = Self::send_on_with(channel, request, true)?;
         match Status::from_code(Self::reply_code(&reply)?) {
             Status::Ok if reply.handles.len() == 1 => reply.handles.take(0).map_err(Status::Kernel),
             Status::Ok => Err(Status::BadSize),

@@ -895,6 +895,28 @@ pub extern "C" fn stafeto_probe_pool() -> u64 {
     posix_abi::process::probe_pool()
 }
 
+/// The counts of the starts of a child the process service refused, by
+/// reason, into `out` of `n` places (proto_process REFUSED_*): the number
+/// written.
+///
+/// # Safety
+/// `out` is valid for `n` writes of a u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_start_refusals(out: *mut u64, n: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's contract.
+    posix_abi::process::probe_start_refusals(unsafe { core::slice::from_raw_parts_mut(out, n) })
+}
+
+/// Where the last fork of the process was refused (posix_abi::fork::
+/// probe_refusal): `step | sub << 8 | status << 16`.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_fork_refusal() -> u64 {
+    posix_abi::fork::probe_refusal()
+}
+
 /// The probe of `addopen` (posix_abi::process::probe_addopen_cloexec):
 /// 1 when the caller's own descriptor of an open action has FD_CLOEXEC.
 ///
