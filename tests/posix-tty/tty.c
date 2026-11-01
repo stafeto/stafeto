@@ -615,6 +615,9 @@ static int output(void) {
     /* STOP and START go out as they are, between the bytes written. */
     CHECK(PUT(1, "<") && tcflow(1, TCIOFF) == 0 && PUT(1, ">"));
     CHECK(PUT(1, "(") && tcflow(1, TCION) == 0 && PUT(1, ")\n"));
+    /* The bytes still in the discipline are dropped by the flush below;
+     * the marker leaves first. */
+    CHECK(tcdrain(1) == 0);
 
     /* The output the driver did not take is dropped: stopped, written,
      * flushed, started. */
