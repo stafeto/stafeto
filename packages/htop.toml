@@ -13,6 +13,11 @@ license = "GPL-2.0-or-later"
 depends = ["busybox", "ncurses"]
 build = "tools/build-htop.py"
 program = "htop"
+dirs = ["/usr/local", "/usr/local/etc"]
 files = [
   "/bin/htop = elf:htop",
+  # The settings htop reads when the home has none (SYSCONFDIR): no row for
+  # the threads of a process, whose numbers /proc/<pid>/task makes from the
+  # PID and may meet the PID of another process.
+  "/usr/local/etc/htoprc = bytes:htoprc",
 ]

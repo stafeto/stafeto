@@ -104,6 +104,20 @@ static void cancellations(int file) {
     if (!failed) puts("posix-sync: deferred cancellation points ok");
 }
 
+/* The main stack is what the file asks for: 900 KiB of locals, written page
+ * by page and read back, where 64 KiB was all there was. Not inlined: the
+ * launcher that init starts has the 64 KiB the boot image gives. */
+__attribute__((noinline)) static int big_stack(void) {
+    volatile char big[900 * 1024];
+    unsigned long sum = 0, want = 0;
+    for (size_t i = 0; i < sizeof big; i += 4096) {
+        big[i] = (char)(i / 4096 + 1);
+        want += (unsigned char)(i / 4096 + 1);
+    }
+    for (size_t i = 0; i < sizeof big; i += 4096) sum += (unsigned char)big[i];
+    return sum == want;
+}
+
 int main(int argc, char **argv) {
     if (argc == 1) {
         char *args[] = {"posix-procs", "run", NULL};
@@ -117,6 +131,8 @@ int main(int argc, char **argv) {
         int file = atoi(argv[2]), directory = atoi(argv[3]);
         return fsync(file) || fdatasync(file) || fsync(directory) || fdatasync(directory) ? 8 : 9;
     }
+    check("main stack of 900 KiB", big_stack());
+    if (!failures) puts("posix-sync: the main stack of 900 KiB ok");
     check("FSYNC option is claimed with aio_fsync", sysconf(_SC_FSYNC) == _POSIX_FSYNC);
     int writable = open("/tmp/sync-probe", O_CREAT | O_TRUNC | O_RDWR, 0600);
     check("create regular RAM file", writable >= 0);

@@ -349,6 +349,7 @@ fn zoneinfo() -> Vec<RootFile> {
 fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
         "inputrc" => Ok(INPUTRC),
+        "htoprc" => Ok(b"hide_userland_threads=1\n"),
         other => Err(format!("no bytes are named {other}")),
     }
 }

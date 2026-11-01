@@ -892,20 +892,21 @@ static int steps_fork(void) {
     return 0;
 }
 
-/* The role stepforkmany: the map of the layer filled with 80 pages of one
- * each, read-only and writable by turns so that no two join, and then three
- * forks, each child ends. The loader meets as many regions as the map holds,
- * and its step Regions admits each against all it holds. The child binds at
- * most 96 objects (posix_map::MAX_OBJECTS), one for each region, so the map
- * is not filled to its 128 places (abi::MAX_MAPPINGS): the pages that join
- * no other and the program's own regions have to fit in 96. */
-#define STEPS_FORK_PAGES 80
+/* The role stepforkmany: the map of the layer filled with pages of one
+ * each, read-only and writable by turns so that no two join, until the map
+ * is full (the 128 places of abi::MAX_MAPPINGS, less the program's own
+ * regions: some 110 pages), and then three forks, each child ends. The
+ * loader meets as many regions as the map holds, and its step Regions
+ * admits each against all it holds. The child binds one object for each
+ * group of regions, and the table of objects holds 128 (posix_map). */
+#define STEPS_FORK_PAGES 100
 static int steps_fork_many(void) {
     int mapped;
-    for (mapped = 0; mapped < STEPS_FORK_PAGES; mapped++) {
+    for (mapped = 0; mapped < 128; mapped++) {
         int prot = mapped % 2 ? PROT_READ | PROT_WRITE : PROT_READ;
         void *page = mmap(NULL, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (page == MAP_FAILED) {
+            if (errno == ENOMEM && mapped >= STEPS_FORK_PAGES) break;
             printf("posix-procs: steps: mmap gave %s after %d pages\n", strerror(errno), mapped);
             return 63;
         }
@@ -2937,12 +2938,21 @@ static int sched_role(void);
 /* The files and directories of /proc are descriptions of the layer: no pipe,
  * no table of remembered directories. */
 static volatile sig_atomic_t proc_signals;
+static volatile long proc_handler_ns;
+static long proc_now_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
+}
 static void proc_handler(int signal) {
     (void)signal;
+    long began = proc_now_ns();
     char path[32];
     snprintf(path, sizeof path, "/proc/%d/stat", (int)getpid());
     int fd = open(path, O_RDONLY);
     if (fd >= 0) close(fd);
+    long took = proc_now_ns() - began;
+    if (took > proc_handler_ns) proc_handler_ns = took;
     proc_signals++;
 }
 
@@ -3022,10 +3032,9 @@ static void proc_threads(void) {
 
 static int proc_fd_role(void) {
     int fd = atoi(argv_seen[2]);
-    char text[64] = {0};
-    ssize_t n = read(fd, text, sizeof text - 1);
+    char text[8] = {0};
     /* The text is the new image's, read from the offset the old one left. */
-    return n > 0 ? 0 : 41;
+    return read(fd, text, 5) == 5 && !memcmp(text, "/ ram", 5) ? 0 : 41;
 }
 
 static int proc_descriptions(void) {
@@ -3069,7 +3078,7 @@ static int proc_descriptions(void) {
     for (int i = 0; i < 9; i++) if (dirs[i] >= 0) close(dirs[i]);
 
     printf("posix-procs: proc stage handler\n");
-    /* A handler that opens /proc/self while the code it interrupted opens
+    /* A handler that opens /proc/<pid> while the code it interrupted opens
      * directories of processes does not hang. */
     struct sigaction action = {.sa_handler = proc_handler}, old;
     sigemptyset(&action.sa_mask);
@@ -3081,7 +3090,10 @@ static int proc_descriptions(void) {
     struct itimerspec every = {{0, 100000000}, {0, 100000000}};
     expect("timer for the handler", timer_create(CLOCK_MONOTONIC, &event, &timer_id), 0);
     timer_settime(timer_id, 0, &every, NULL);
-    for (int i = 0; i < 4000 && proc_signals < 3; i++) {
+    /* Until three signals came or three seconds went, whatever the speed of
+     * the machine. */
+    long limit = proc_now_ns() + 3000000000L;
+    while (proc_signals < 3 && proc_now_ns() < limit) {
         char path[32];
         snprintf(path, sizeof path, "/proc/%d", (int)getpid());
         int dir = open(path, O_RDONLY | O_DIRECTORY);
@@ -3090,19 +3102,24 @@ static int proc_descriptions(void) {
     timer_delete(timer_id);
     sigaction(SIGALRM, &old, NULL);
     expect("the handler ran while directories opened", proc_signals > 0, 1);
+    printf("posix-procs: proc handler ran %d times, the longest took %ld us\n",
+           (int)proc_signals, proc_handler_ns / 1000);
 
     printf("posix-procs: proc stage fork\n");
     /* The description crosses fork (its own offset in the child) and exec
      * (the node and the offset, a text of the new image). */
-    int up = open("/proc/uptime", O_RDONLY);
-    char three[4] = {0};
-    expect("three bytes of uptime", up >= 0 && read(up, three, 3) == 3, 1);
+    int up = open("/proc/mounts", O_RDONLY);
+    char head[8] = {0}, again[8] = {0};
+    expect("six bytes of mounts", up >= 0 && read(up, head, 6) == 6 && !memcmp(head, "ramfs ", 6), 1);
     pid_t forked = fork();
     if (forked == 0) {
-        char more[32] = {0};
-        _exit(read(up, more, sizeof more - 1) > 0 ? 0 : 1);
+        char more[8] = {0};
+        _exit(read(up, more, 5) == 5 && !memcmp(more, "/ ram", 5) ? 0 : 1);
     }
-    reap("a forked child reads the description", forked, 0, 0);
+    reap("a forked child reads the text from its own offset", forked, 0, 0);
+    /* The child's read moved the child's offset: the parent's is where it was. */
+    expect("the parent's offset stays", read(up, again, 5) == 5 && !memcmp(again, "/ ram", 5), 1);
+    expect("back to six", lseek(up, 6, SEEK_SET), 6);
     pid_t execed = fork();
     if (execed == 0) {
         char number[16];

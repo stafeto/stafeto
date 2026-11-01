@@ -3066,9 +3066,12 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             .iter()
             .find(|row| row.0 == 65)
             .map_or(0, |row| row.1);
-        if walk == 0 || walk > RAM_STEP_MAX {
+        // The step does up to 16 deliveries: it is held under the 0.9 B
+        // of the services, not the whole of B.
+        let walk_bound = TERM_B * 9 / 10;
+        if walk == 0 || walk > walk_bound {
             return Err(format!(
-                "terminal group walk step took {walk} ticks, bound {RAM_STEP_MAX}"
+                "terminal group walk step took {walk} ticks, bound {walk_bound}"
             ));
         }
     }
@@ -4694,6 +4697,7 @@ fn posix_sync_probe() -> Result<(), String> {
         "posix-sync: 32 held I/O loans preserve sync success",
     )?;
     qemu::expect_marker(&outcome, "posix-sync: deferred cancellation points ok")?;
+    qemu::expect_marker(&outcome, "posix-sync: the main stack of 900 KiB ok")?;
     Ok(())
 }
 
@@ -5562,11 +5566,11 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
 
 /// The regions a loader holds in the forks of the full map, the floor of the
 /// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
-/// the role has 80 one-page mappings (`STEPS_FORK_PAGES`) and its
-/// program's. A child binds at most 96 objects, `posix_map::MAX_OBJECTS`,
-/// one for each region that does not join, so a fork with the map full to
-/// its 128 places (abi::MAX_MAPPINGS) does not run.
-const LOADER_REGIONS_MIN: u64 = 80;
+/// the role fills the map with one-page mappings until it is full
+/// (`STEPS_FORK_PAGES` at least, the 128 places less the program's own).
+/// A child binds one object for each group of regions and the table of
+/// objects holds 128, so the fork with the map full runs.
+const LOADER_REGIONS_MIN: u64 = 100;
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
 /// last line of a kind being its longest, since each prints only when it
