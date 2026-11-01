@@ -38,7 +38,7 @@ use bootimg::elf::{self, Load};
 use core::mem::MaybeUninit;
 use proto_loader::{
     self as pl, AREA_MAX, BLOCK_MAX, Block, BlockError, Fork, LOADER_BASE, MAP_ENTRIES, MapEntry,
-    Method, PROGRAM_ROOM, REGIONS_MAX, Region, SLOTS, STACK_SIZE, START_AREA, Slot, TRANSFER_SIZE,
+    Method, PROGRAM_ROOM, REGIONS_MAX, Region, SLOTS, START_AREA, Slot, TRANSFER_SIZE,
 };
 use proto_wire::{Header, Reader, Status, Writer};
 use rt::abi::{Access, Error};
@@ -1370,18 +1370,20 @@ fn load(
             segment(own, &image, load, part, &mut maps)?;
         }
     }
-    let stack = sys::mem_create(STACK_SIZE).map_err(code)?;
-    let stack_at = INIT_STACK_TOP - STACK_SIZE;
+    // The stack the file asks for (PT_GNU_STACK), at least 64 KiB.
+    let stack_size = pl::stack_size(layout.stack);
+    let stack = sys::mem_create(stack_size).map_err(code)?;
+    let stack_at = INIT_STACK_TOP - stack_size;
     loader::map_narrowed(
         &own.process,
         &stack,
         0,
-        STACK_SIZE,
+        stack_size,
         stack_at as usize,
         Access::ReadWrite,
     )
     .map_err(code)?;
-    keep_region(&mut maps, &stack, stack_at, STACK_SIZE, Access::ReadWrite)?;
+    keep_region(&mut maps, &stack, stack_at, stack_size, Access::ReadWrite)?;
     let area = (pl::area_len(block) as u64).next_multiple_of(PAGE);
     if area > AREA_MAX {
         return Err(pl::TOO_BIG);

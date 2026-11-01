@@ -134,6 +134,17 @@ pub unsafe extern "C" fn stafeto_fstatat(
     }
 }
 
+/// The PID of the directory of a process `number` names, if it is one.
+#[cfg(feature = "procfs")]
+fn proc_directory(number: u32) -> Option<posix_abi::procfs::Dir> {
+    posix_abi::shared::held(number, |_, target| match target {
+        Target::Proc(id) => Ok(posix_abi::procfs::directory_of(id)),
+        _ => Ok(None),
+    })
+    .ok()
+    .flatten()
+}
+
 fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Result<usize, c_int> {
     let error = posix_abi::error;
     if files.fstat(fd).map_err(error)?.kind != FileKind::Directory {
@@ -191,6 +202,12 @@ pub unsafe extern "C" fn stafeto_getdents(
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let result = number(fd).and_then(|number| {
+        // The directory of a process under /proc is a description of the
+        // layer (procfs).
+        #[cfg(feature = "procfs")]
+        if let Some(dir) = proc_directory(number) {
+            return posix_abi::procfs::entries(out, position, Some(dir));
+        }
         // The directory /proc lists the live processes (procfs).
         #[cfg(feature = "procfs")]
         if let Ok(info) = posix_abi::names::fstatat(fd, None, 0) {
@@ -199,18 +216,7 @@ pub unsafe extern "C" fn stafeto_getdents(
                 return posix_abi::cpus::entries(out, position);
             }
             if posix_abi::procfs::is_directory(&info) {
-                let pid = posix_abi::shared::held(number, |_, target| {
-                    Ok(match target {
-                        Target::Ram(ram) => posix_abi::procfs::directory_pid(
-                            ram.description_slot(),
-                            ram.generation(),
-                        ),
-                        _ => None,
-                    })
-                })
-                .ok()
-                .flatten();
-                return posix_abi::procfs::entries(out, position, pid);
+                return posix_abi::procfs::entries(out, position, None);
             }
         }
         posix_abi::shared::held(number, |transport, target| {
@@ -1016,6 +1022,15 @@ pub unsafe extern "C" fn stafeto_posix_getdents(fd: c_int, buf: *mut u8, len: us
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
     let result = number(fd).and_then(|fd| {
         posix_abi::shared::held(fd, |transport, target| {
+            #[cfg(feature = "procfs")]
+            if let Target::Proc(id) = target {
+                let dir = posix_abi::procfs::directory_of(id)
+                    .ok_or(posix_abi::error(posix_fs::FsError::NotDirectory))?;
+                let position = posix_abi::procfs::directory_offset(id, None)?;
+                let (used, next) = posix_abi::procfs::entries_from(out, position, Some(dir))?;
+                posix_abi::procfs::directory_offset(id, Some(next))?;
+                return Ok(used);
+            }
             let position = transport
                 .lseek(target, 0, SeekFrom::Current)
                 .map_err(posix_abi::error)?;

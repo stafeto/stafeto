@@ -279,6 +279,15 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
                 fd: n,
                 random_hint: true,
             },
+            #[cfg(feature = "procfs")]
+            Names::Proc { node, pid, offset } => {
+                match posix_abi::procfs::inherit(node, pid, offset) {
+                    Some(id) => InheritedTarget::Ready(Target::Proc(id)),
+                    None => continue,
+                }
+            }
+            #[cfg(not(feature = "procfs"))]
+            Names::Proc { .. } => continue,
             Names::PendingTerminal(_) => continue,
         };
         *place = Inherited { fd: d.fd, target };

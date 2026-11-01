@@ -1009,6 +1009,13 @@ impl Shadow {
                     },
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
                     posix_fs::Target::Random(n) => Names::Random(n.fd()),
+                    #[cfg(feature = "procfs")]
+                    posix_fs::Target::Proc(id) => match crate::procfs::carried(id) {
+                        Some((node, pid, offset)) => Names::Proc { node, pid, offset },
+                        None => continue,
+                    },
+                    #[cfg(not(feature = "procfs"))]
+                    posix_fs::Target::Proc(_) => continue,
                 }
             };
             out[count] = Descriptor {

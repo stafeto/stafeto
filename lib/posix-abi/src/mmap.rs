@@ -519,6 +519,19 @@ pub fn check_range(addr: usize, len: usize) -> Result<(), i32> {
     })
 }
 
+/// Whether the page of `address` in the layer's room is no mapping of the
+/// program: one `munmap` gave back (the layer keeps it without access),
+/// one never mapped, or a hole. A page outside the room (the program's
+/// segments, the stack) is none of these.
+pub(crate) fn is_unmapped(address: usize) -> bool {
+    heap(|state| {
+        matches!(
+            state.space.get(address & !(PAGE - 1)),
+            Some(Page::Free | Page::Unbacked)
+        )
+    })
+}
+
 /// Whether `address` lies in a mapping other processes share (MAP_SHARED):
 /// a wait there cannot be woken from another process, so it polls
 /// (`posix_sync::set_shared`).

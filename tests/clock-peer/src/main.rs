@@ -79,6 +79,7 @@ fn create(
         root: true,
         cpus: 0,
         ticket: 0,
+        name: [0; proto_process::NAME_LEN],
     };
     if proto_process::Method::Create
         .header()

@@ -27,8 +27,9 @@ pub const MAX_PIECES: usize = MAX_MAPPINGS as usize;
 
 /// The objects of a map at most. Few pieces show an object of their own: the
 /// heap's chunks, the loader's segments, the large, shared and file
-/// mappings, and the stack of each thread (64 threads at most).
-pub const MAX_OBJECTS: usize = 96;
+/// mappings, and the stack of each thread (64 threads at most). As many as
+/// the pieces: a map of 128 pieces may hold an object in each.
+pub const MAX_OBJECTS: usize = MAX_PIECES;
 
 /// The page of the map.
 pub const PAGE: usize = 4096;
@@ -629,7 +630,7 @@ mod tests {
     /// object is refused too.
     #[test]
     fn a_map_holds_128_pieces_and_96_objects() {
-        assert_eq!((MAX_PIECES, MAX_OBJECTS), (128, 96));
+        assert_eq!((MAX_PIECES, MAX_OBJECTS), (128, 128));
         let mut map = Map::new();
         let one = map
             .push(0x1000_0000, 1, Access::ReadWrite, 0, object(0, 1))

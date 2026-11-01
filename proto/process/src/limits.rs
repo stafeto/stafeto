@@ -13,6 +13,9 @@ pub const FSIZE: usize = 2;
 pub const NOFILE: usize = 3;
 pub const STACK: usize = 4;
 pub const AS: usize = 5;
+/// RLIMIT_MEMLOCK: kept in the record apart from `ResourceLimits`, which the
+/// services that ask `Who` read; Get and SetLimit take this number.
+pub const MEMLOCK: usize = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

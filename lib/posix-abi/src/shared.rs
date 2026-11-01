@@ -119,6 +119,11 @@ pub unsafe fn after_fork(
 ) {
     // SAFETY: fork has one surviving thread; discard the copied parent mutex.
     unsafe { crate::resources::after_fork() };
+    // SAFETY: the same.
+    #[cfg(feature = "procfs")]
+    unsafe {
+        crate::procfs::after_fork()
+    };
     if !READY.load(Ordering::Acquire) {
         return;
     }
@@ -227,6 +232,20 @@ pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -
         let _ = transport.release(release);
     }
     result
+}
+
+/// The information of what a descriptor names.
+pub(crate) fn descriptor_information(
+    transport: Transport,
+    target: Target,
+) -> Result<proto_fs::NodeInfo, i32> {
+    #[cfg(feature = "procfs")]
+    if let Target::Proc(id) = target {
+        return crate::procfs::description_stat(id);
+    }
+    transport
+        .descriptor_information(target)
+        .map_err(crate::error)
 }
 
 /// Runs `run` with the transports and `path` resolved against the
@@ -407,6 +426,13 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
         }
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
+        #[cfg(feature = "procfs")]
+        Target::Proc(id) => {
+            let mut bytes = [0; posix_fs::MAX_READ];
+            let extent = (count as usize).min(bytes.len());
+            let n = crate::procfs::read(id, &mut bytes[..extent])?;
+            Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+        }
         target => file_reply(transport, target, count, &mut *out),
     })
 }
@@ -599,6 +625,16 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             }
         }),
         Seek { fd, offset, origin } => held(fd, |transport, target| {
+            #[cfg(feature = "procfs")]
+            if let Target::Proc(id) = target {
+                let whence = match origin {
+                    posix_fs::SeekFrom::Start => 0,
+                    posix_fs::SeekFrom::Current => 1,
+                    posix_fs::SeekFrom::End => 2,
+                    _ => return Err(EINVAL),
+                };
+                return crate::procfs::seek(id, offset, whence).map(|value| value as u64);
+            }
             transport
                 .lseek(target, offset, origin)
                 .map(|value| value as u64)
@@ -669,9 +705,7 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
         ),
         Fstat { fd } => write(
             Reply::Info(held(fd, |transport, target| {
-                transport
-                    .descriptor_information(target)
-                    .map_err(crate::error)
+                descriptor_information(transport, target)
             })?),
             out,
         ),

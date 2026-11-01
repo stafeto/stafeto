@@ -1978,7 +1978,7 @@ unsafe fn fault_entry(native: *mut upcall::Context) {
     };
     // SAFETY: the entry's frame.
     let (sp, pc) = unsafe { ((*native).sp, (*native).pc) };
-    let fault = posix_signals::fault(cause.esr, cause.far, pc, sp);
+    let mut fault = posix_signals::fault(cause.esr, cause.far, pc, sp);
     let block = own();
     let bit = posix_signals::bit(fault.signal).expect("a signal of the table");
     if crate::altstack::overflowed(sp)
@@ -1986,6 +1986,15 @@ unsafe fn fault_entry(native: *mut upcall::Context) {
         || block.mask.load(Ordering::SeqCst) & bit != 0
     {
         sys_exit_signal(fault.signal)
+    }
+    // The layer keeps the pages `munmap` gave back without access: the
+    // hardware says permission for them, the map says they are no mapping
+    // (SEGV_MAPERR, as for a page never mapped).
+    if fault.signal == SIGSEGV
+        && fault.code == posix_types::constants::SEGV_ACCERR
+        && crate::mmap::is_unmapped(fault.address as usize)
+    {
+        fault.code = posix_types::constants::SEGV_MAPERR;
     }
     let action = action(fault.signal);
     if action.handler == DEFAULT || ignored(fault.signal, &action) {

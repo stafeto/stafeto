@@ -1497,6 +1497,7 @@ fn mapping_while_threads_join() -> Outcome {
         wait_for(|| mark(0) > 0),
         "the thread on CPU 1 made no thread",
     )?;
+    let before = mark(0);
     sys::thread_set_priority(&me(), GAP_LEVEL, Policy::Fifo).map_err(|_| "init lowered itself")?;
     let mut mapped = 0;
     for i in 0..GAP_CALLS as usize {
@@ -1518,7 +1519,10 @@ fn mapping_while_threads_join() -> Outcome {
     close(m)?;
     check(ended, "the thread on CPU 1 did not stop")?;
     check(mapped == GAP_CALLS, "a mem_map failed while threads joined")?;
-    check(made > 0, "no thread was made meanwhile")?;
+    check(
+        made > before,
+        "no thread was made after the first one while the calls ran",
+    )?;
     println!(
         "smp: {mapped} mem_map calls while another CPU made {made} threads in the same process"
     );

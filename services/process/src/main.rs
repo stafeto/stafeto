@@ -101,6 +101,10 @@ struct Walking {
     refused: bool,
     denied: bool,
 }
+/// The most deliveries and the most looks at places one step of the walk of
+/// a TtySignal makes (`tty_walk_step`).
+const TTY_DELIVERIES: usize = 16;
+const TTY_LOOKS: usize = RECORDS;
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
@@ -151,14 +155,6 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     methods
 };
-/// How long after a sample a listing judges a process again (`list`): a
-/// listing sooner repeats the last verdict.
-const SLEEP_AFTER_NS: u64 = 2_000_000;
-/// The share of the time since the last sample that a process may have run
-/// and still be called asleep, as 1 in this many: a thread that waits on a
-/// word of a shared mapping looks at it every millisecond (lib/posix-sync),
-/// which costs it a few percent of the time, and it sleeps all the same.
-const ASLEEP_SHARE: u64 = 4;
 /// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
 /// runs at most this many).
 const MAX_CPUS: usize = 8;
@@ -661,6 +657,8 @@ impl Processes {
             }
             record.handle_limit = create.handle_limit;
             record.cpus = cpus;
+            // A process of init's table shows the program init named.
+            record.name = create.name;
         }
         self.witnesses[index] = Some(witness);
         self.tickets[index] = create.ticket;
@@ -2651,32 +2649,42 @@ impl Processes {
         Delivery::Done
     }
 
-    /// One step of the walk of a TtySignal; its reply at its end.
+    /// One step of the walk of a TtySignal; its reply at its end. The
+    /// terminal service waits for the reply and the levels above it keep
+    /// the processor until the walk is done, so a step does more than one
+    /// of the walk's moves: up to `TTY_DELIVERIES` deliveries or `TTY_LOOKS`
+    /// looks, however many that is of the moves of `Walk::step`.
     fn tty_walk_step(&mut self) {
         let Some(mut w) = self.tty_walk.take() else {
             return;
         };
-        match w.walk.step(&self.records) {
-            Step::Found(target) => match self.deliver_terminal(target, w.signal) {
-                Delivery::Done | Delivery::Again => w.delivered = true,
-                Delivery::Denied => w.denied = true,
-                Delivery::Refused => w.refused = true,
-            },
-            Step::Looked => {}
-            Step::Done => {
-                let code = walk::outcome(w.delivered, w.refused, w.denied);
-                #[cfg(feature = "tty-probe")]
-                if let Some((_, count)) = self.tty_probe.take() {
-                    let mut reply = Writer::new();
-                    let _ = reply.u32(code);
-                    let _ = reply.u32(count);
-                    let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
+        let (mut delivered, mut looked) = (0, 0);
+        while delivered < TTY_DELIVERIES && looked < TTY_LOOKS {
+            match w.walk.step(&self.records) {
+                Step::Found(target) => {
+                    delivered += 1;
+                    match self.deliver_terminal(target, w.signal) {
+                        Delivery::Done | Delivery::Again => w.delivered = true,
+                        Delivery::Denied => w.denied = true,
+                        Delivery::Refused => w.refused = true,
+                    }
+                }
+                Step::Looked => looked += walk::LOOKS,
+                Step::Done => {
+                    let code = walk::outcome(w.delivered, w.refused, w.denied);
+                    #[cfg(feature = "tty-probe")]
+                    if let Some((_, count)) = self.tty_probe.take() {
+                        let mut reply = Writer::new();
+                        let _ = reply.u32(code);
+                        let _ = reply.u32(count);
+                        let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
+                        return;
+                    }
+                    let _ = w
+                        .pending
+                        .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
                     return;
                 }
-                let _ = w
-                    .pending
-                    .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
-                return;
             }
         }
         self.tty_walk = Some(w);
@@ -2980,6 +2988,7 @@ impl Processes {
             root: false,
             cpus: parent.cpus,
             ticket: 0,
+            name: [0; proto_process::NAME_LEN],
         };
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
@@ -3266,6 +3275,22 @@ impl Processes {
         }
     }
 
+    /// Whether the main thread of the record in `index` waits: in `receive`
+    /// or `send`, for a reply, or parked (kernel `ThreadState`).
+    fn main_thread_waits(&self, index: usize) -> bool {
+        let Some(thread) = self.routers.get(index).and_then(Option::as_ref) else {
+            return false;
+        };
+        matches!(
+            sys::thread_info(thread).map(|info| info.state),
+            Ok(abi::ThreadState::Receiving
+                | abi::ThreadState::Sending
+                | abi::ThreadState::AwaitingReply
+                | abi::ThreadState::Parked
+                | abi::ThreadState::Ended)
+        )
+    }
+
     /// List (`ps`): the first live record of the window of `LIST_WINDOW`
     /// records from the cursor, and the cursor after it (or after the
     /// window, with `0` for no record). O(LIST_WINDOW).
@@ -3298,32 +3323,11 @@ impl Processes {
                 break;
             }
         }
-        // A process that ran at most a quarter of the time since the last
-        // sample, some 2 ms before or more, sleeps (state 3); the first
-        // sample, or a process that ran more, is running. A listing sooner
-        // than that repeats the verdict of the sample.
-        let sleeping = found.is_some_and(|i| {
-            let now = Self::timer_now();
-            let Some(record) = self.records.get_mut(i) else {
-                return false;
-            };
-            let ticks = record
-                .carried_ticks
-                .saturating_add(sys::process_time(&record.process).unwrap_or(0));
-            if record.sample_at == 0 {
-                record.sample_ticks = ticks;
-                record.sample_at = now;
-                return false;
-            }
-            let elapsed = now.saturating_sub(record.sample_at);
-            if elapsed >= SLEEP_AFTER_NS {
-                let ran = rt::time::ticks_to_ns(ticks.saturating_sub(record.sample_ticks));
-                record.sample_asleep = ran.saturating_mul(ASLEEP_SHARE) <= elapsed;
-                record.sample_ticks = ticks;
-                record.sample_at = now;
-            }
-            record.sample_asleep
-        });
+        // The state of a process is that of its first thread (the router
+        // of its signals, which is the main thread until it ends): waiting
+        // for a message, for a reply or parked is asleep (state 3), ready
+        // or on a CPU is running.
+        let sleeping = found.is_some_and(|i| self.main_thread_waits(i));
         let next = found.map_or(window_end, |i| i + 1);
         let next = if next >= RECORDS {
             proto_process::LIST_END
@@ -3367,6 +3371,9 @@ impl Processes {
                                 .carried_ticks
                                 .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
                             memory: sys::process_memory(&record.process).map_or(0, |m| m.used),
+                            threads: self.pages.page(i).map_or(0, |page| {
+                                page.threads.load(core::sync::atomic::Ordering::Acquire)
+                            }),
                             name: record.name,
                         }
                         .write(w)
@@ -4196,15 +4203,13 @@ impl Service<0> for Processes {
                 let (Ok(resource), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
                 };
-                let Some(value) = self
-                    .records
-                    .get(index)
-                    .expect("limit caller")
-                    .limits
-                    .values
-                    .get(resource as usize)
-                    .copied()
-                else {
+                let caller = self.records.get(index).expect("limit caller");
+                let value = if resource as usize == proto_process::MEMLOCK {
+                    Some(caller.memlock)
+                } else {
+                    caller.limits.values.get(resource as usize).copied()
+                };
+                let Some(value) = value else {
                     return refuse(proto_process::INVALID);
                 };
                 if r.reply()

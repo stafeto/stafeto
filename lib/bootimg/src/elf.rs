@@ -18,6 +18,7 @@ use core::fmt;
 const ET_EXEC: u16 = 2;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
+const PT_GNU_STACK: u32 = 0x6474_e551;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_TLS: u32 = 7;
@@ -154,6 +155,9 @@ impl Load {
 pub struct Layout {
     pub entry: u64,
     pub segments: [Load; 3],
+    /// The size of the main stack the file asks for (`PT_GNU_STACK`, which
+    /// `-z stack-size` sets), 0 when it asks for none.
+    pub stack: u64,
 }
 
 /// The program whose ELF file is `file_len` bytes long and starts with
@@ -235,6 +239,7 @@ fn headers(head: &[u8], file_len: u64) -> Result<Layout, ElfError> {
     let mut segments = [Load::EMPTY; 3];
     let mut seen = [false; 3];
     let mut tls = None;
+    let mut stack = 0;
     for i in 0..u64::from(u16_at(elf, 56)) {
         let h = usize::try_from(headers.saturating_add(i * PHDR_SIZE as u64))
             .ok()
@@ -243,6 +248,10 @@ fn headers(head: &[u8], file_len: u64) -> Result<Layout, ElfError> {
         match u32_at(h, 0) {
             PT_LOAD => {}
             PT_DYNAMIC | PT_INTERP => return Err(ElfError::NotStatic),
+            PT_GNU_STACK => {
+                stack = u64_at(h, 40);
+                continue;
+            }
             PT_TLS => {
                 if tls.replace((u64_at(h, 16), u64_at(h, 32))).is_some() {
                     return Err(ElfError::TlsTwice);
@@ -282,7 +291,11 @@ fn headers(head: &[u8], file_len: u64) -> Result<Layout, ElfError> {
             return Err(ElfError::TlsOutside);
         }
     }
-    Ok(Layout { entry, segments })
+    Ok(Layout {
+        entry,
+        segments,
+        stack,
+    })
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -340,6 +353,18 @@ mod tests {
             (RX, 0x20_1000, 0x2000, &[0xAA; 0x20], 0xA80),
             (RW, 0x20_2000, 0x3000, b"data", 0x1F48),
         ])
+    }
+
+    #[test]
+    fn the_stack_a_file_asks_for_is_pt_gnu_stack() {
+        let mut f = layout();
+        let room = 0x20_0000..0x40_0000;
+        let read = super::layout(&f, f.len() as u64, room.clone()).unwrap();
+        assert_eq!(read.stack, 0, "no size asked");
+        let header = 64 + PHDR_SIZE * 3;
+        put(&mut f, header + 40, &(1u64 << 20).to_le_bytes());
+        let read = super::layout(&f, f.len() as u64, room).unwrap();
+        assert_eq!(read.stack, 1 << 20);
     }
 
     #[test]

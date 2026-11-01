@@ -689,6 +689,8 @@ const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
+    // /proc in the layer: the probe opens its files and directories.
+    programs[5].3 = &["pending-open", "names-probe", "procfs"];
     programs
 };
 const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {
@@ -3070,9 +3072,12 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             .iter()
             .find(|row| row.0 == 65)
             .map_or(0, |row| row.1);
-        if walk == 0 || walk > RAM_STEP_MAX {
+        // The step does up to 16 deliveries: it is held under B with a
+        // reserve of 10 % (0.9 B).
+        let walk_bound = TERM_B * 9 / 10;
+        if walk == 0 || walk > walk_bound {
             return Err(format!(
-                "terminal group walk step took {walk} ticks, bound {RAM_STEP_MAX}"
+                "terminal group walk step took {walk} ticks, bound {walk_bound}"
             ));
         }
     }
@@ -4664,6 +4669,7 @@ fn posix_resources_probe() -> Result<(), String> {
         "posix-resources: accounts and supplementary groups ok",
         "posix-resources: NOFILE allocation and inherited limits ok",
         "posix-resources: FSIZE writes append and SIGXFSZ ok",
+        "posix-resources: MEMLOCK through fork, spawn and exec ok",
         "posix-resources: fexecve exact inode offset and CLOEXEC ok",
         "posix-resources: F6 link limit and integer base ok",
         "posix-resources: F6 metadata statvfs and PATH ok",
@@ -4699,6 +4705,7 @@ fn posix_sync_probe() -> Result<(), String> {
         "posix-sync: 32 held I/O loans preserve sync success",
     )?;
     qemu::expect_marker(&outcome, "posix-sync: deferred cancellation points ok")?;
+    qemu::expect_marker(&outcome, "posix-sync: the main stack of 900 KiB ok")?;
     Ok(())
 }
 
@@ -5571,11 +5578,11 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
 
 /// The regions a loader holds in the forks of the full map, the floor of the
 /// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
-/// the role has 80 one-page mappings (`STEPS_FORK_PAGES`) and its
-/// program's. A child binds at most 96 objects, `posix_map::MAX_OBJECTS`,
-/// one for each region that does not join, so a fork with the map full to
-/// its 128 places (abi::MAX_MAPPINGS) does not run.
-const LOADER_REGIONS_MIN: u64 = 80;
+/// the role fills the map with one-page mappings until it is full
+/// (`STEPS_FORK_PAGES` at least, the 128 places less the program's own).
+/// A child binds one object for each group of regions and the table of
+/// objects holds 128, so the fork with the map full runs.
+const LOADER_REGIONS_MIN: u64 = 100;
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
 /// last line of a kind being its longest, since each prints only when it
@@ -6817,8 +6824,8 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         &[r#"=63 61 66 e9 0a"#],
     ),
     (
-        r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z"#,
-        &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
+        r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z; zcat /tmp/cz.Z"#,
+        &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#, r#"hello"#],
     ),
     // The second wave: chimerautils' csplit, gencat, m4 and write,
     // nbase's pr, paxmirabilis' pax, util-linux's newgrp and ncurses' tput
@@ -7034,12 +7041,29 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     dialog_command(run, "awk '{print NF}' /proc/$$/statm", &["7"])?;
     dialog_command(run, "awk '{print ($1>0 && $1==$2)}' /proc/$$/statm", &["1"])?;
     dialog_command(run, "grep -c '^Name:.ash$' /proc/$$/status", &["1"])?;
-    // The shell waits for awk: asleep, or running when its sample says it
-    // ran more than a quarter of the time since the last (process service).
+    // The shell waits for awk, so its main thread waits for a reply: S. The
+    // state comes from the main thread (process service, ThreadState). A
+    // loop of awk that runs all the time is R, a sleeping `sleep` is S, each
+    // read from the status of the process while it lives.
     dialog_command(
         run,
-        "awk '$1==\"State:\" {print ($2==\"R\" || $2==\"S\")}' /proc/$$/status",
-        &["1"],
+        "awk '$1==\"State:\" {print $2, $3}' /proc/$$/status",
+        &["S (sleeping)"],
+    )?;
+    dialog_command(
+        run,
+        "awk 'BEGIN {for (;;) x++}' & p=$!; sleep 1; awk '$1==\"State:\" {print $2, $3}' /proc/$p/status; kill $p; wait $p 2>/dev/null; echo busy-done",
+        &["R (running)", "busy-done"],
+    )?;
+    dialog_command(
+        run,
+        "sleep 30 & p=$!; sleep 1; awk '$1==\"State:\" {print $2, $3}' /proc/$p/status; kill $p; wait $p 2>/dev/null; echo idle-done",
+        &["S (sleeping)", "idle-done"],
+    )?;
+    dialog_command(
+        run,
+        "for f in /proc/[0-9]*; do n=$(awk '$1==\"Name:\" {print $2}' $f/status); c=$(tr '\\0' ' ' < $f/cmdline); echo \"name:$n cmdline:$c\"; done | grep -c -e '^name:? ' -e '^name: ' -e 'cmdline:$'; echo names-done",
+        &["0", "names-done"],
     )?;
     dialog_command(
         run,
@@ -7540,7 +7564,14 @@ fn ash_dialog() -> Result<(), String> {
         dialog_command(
             &mut run,
             "ls -1 /proc/$$ | sort | tr '\\n' ' '; echo",
-            &["~cmdline stat statm status"],
+            &["~cmdline stat statm status task"],
+        )?;
+        // The threads of a process: its main thread is the one entry of
+        // task, whose number is the PID, and its status counts it.
+        dialog_command(
+            &mut run,
+            "ls -1 /proc/$$/task | grep -cx $$; awk '$1==\"Threads:\" {print $2}' /proc/$$/status; awk '{print $1}' /proc/$$/task/$$/stat | grep -cx $$",
+            &["1", "1", "1"],
         )?;
         dialog_command(
             &mut run,
@@ -8163,6 +8194,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-interrupt", || posix_interrupt_probe(false)),
         job("posix-tty", || posix_tty_probe(false, false)),
         job("posix-tty-control-steps", posix_tty_control_steps),
+        job("posix-tty-steps", || posix_tty_probe(false, true)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-files", posix_files_probe),
@@ -11534,16 +11566,16 @@ mod tests {
     }
 
     /// A report of a loader that copied a small program, and one of the
-    /// full-map fork with the request `Regions` of `ticks` at 87 regions.
+    /// full-map fork with the request `Regions` of `ticks` at 116 regions.
     fn loaders(ticks: u64) -> Vec<String> {
         let mut lines = loader_lines(
             "boot\nloader step: kind 1 900 ticks detail 4096\nloader step: kind 4 5000 ticks detail 4096\nloader step: kind 9 70000 ticks detail 7",
         );
         lines.push("loader step: kind 1 950 ticks detail 4096".into());
         lines.push("loader step: kind 4 5200 ticks detail 4096".into());
-        lines.push(format!("loader step: kind 8 {ticks} ticks detail 87"));
-        lines.push("loader step: kind 9 91000 ticks detail 87".into());
-        lines.push("posix-procs: steps: fork with 80 one page mappings".into());
+        lines.push(format!("loader step: kind 8 {ticks} ticks detail 116"));
+        lines.push("loader step: kind 9 91000 ticks detail 116".into());
+        lines.push("posix-procs: steps: fork with 112 one page mappings".into());
         lines
     }
 
@@ -11553,7 +11585,7 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0], [(1, 900, 4096), (4, 5000, 4096), (9, 70000, 7)]);
         assert_eq!(reports[1].len(), 4);
-        assert_eq!(reports[1][2], (8, 5000, 87));
+        assert_eq!(reports[1][2], (8, 5000, 116));
     }
 
     #[test]
@@ -11579,9 +11611,12 @@ mod tests {
         );
         let mut low = loaders(5000);
         for l in &mut low {
-            *l = l.replace("kind 8 5000 ticks detail 87", "kind 8 5000 ticks detail 20");
+            *l = l.replace(
+                "kind 8 5000 ticks detail 116",
+                "kind 8 5000 ticks detail 20",
+            );
         }
-        assert!(check_loader_steps(&low).unwrap_err().contains("under 80"));
+        assert!(check_loader_steps(&low).unwrap_err().contains("under 100"));
     }
 
     #[test]

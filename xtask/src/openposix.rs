@@ -235,6 +235,18 @@ fn write_rows(rows: &[Row]) -> Result<(), String> {
     std::fs::write(dir.join("open-posix.tsv"), text).map_err(|e| e.to_string())
 }
 
+/// Tests that keep an array of more than 64 KiB on the stack of `main`
+/// (1,024 `struct aiocb`, about 170 KiB): their file asks for a stack of
+/// 1 MiB, which the loader gives (`PT_GNU_STACK`).
+fn stack_arguments(name: &str) -> &'static [&'static str] {
+    match name {
+        "conformance/interfaces/aio_read/9-1" | "conformance/interfaces/aio_write/7-1" => {
+            &["-z", "stack-size=1048576"]
+        }
+        _ => &[],
+    }
+}
+
 /// A test linked into an ELF file, or the row that says why not.
 type Linked = Result<Vec<u8>, Row>;
 
@@ -260,7 +272,12 @@ fn link_all(
                     let one = || -> Result<Linked, String> {
                         let scratch = link_dir.join(format!("test-{at}"));
                         let elf = link_dir.join(format!("test-{at}.elf"));
-                        let linked = link.link_objects(&[&test.object, common], &scratch, &elf);
+                        let linked = link.link_objects_with(
+                            &[&test.object, common],
+                            &scratch,
+                            &elf,
+                            stack_arguments(&test.name),
+                        );
                         let _ = std::fs::remove_dir_all(&scratch);
                         if let Err(error) = linked {
                             if error.starts_with("native linker exited ") {

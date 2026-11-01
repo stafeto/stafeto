@@ -183,6 +183,7 @@
  *
  * The first argument picks the role: none for the parent, else that of
  * a child (`role`). */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -891,20 +892,21 @@ static int steps_fork(void) {
     return 0;
 }
 
-/* The role stepforkmany: the map of the layer filled with 80 pages of one
- * each, read-only and writable by turns so that no two join, and then three
- * forks, each child ends. The loader meets as many regions as the map holds,
- * and its step Regions admits each against all it holds. The child binds at
- * most 96 objects (posix_map::MAX_OBJECTS), one for each region, so the map
- * is not filled to its 128 places (abi::MAX_MAPPINGS): the pages that join
- * no other and the program's own regions have to fit in 96. */
-#define STEPS_FORK_PAGES 80
+/* The role stepforkmany: the map of the layer filled with pages of one
+ * each, read-only and writable by turns so that no two join, until the map
+ * is full (the 128 places of abi::MAX_MAPPINGS, less the program's own
+ * regions: some 110 pages), and then three forks, each child ends. The
+ * loader meets as many regions as the map holds, and its step Regions
+ * admits each against all it holds. The child binds one object for each
+ * group of regions, and the table of objects holds 128 (posix_map). */
+#define STEPS_FORK_PAGES 100
 static int steps_fork_many(void) {
     int mapped;
-    for (mapped = 0; mapped < STEPS_FORK_PAGES; mapped++) {
+    for (mapped = 0; mapped < 128; mapped++) {
         int prot = mapped % 2 ? PROT_READ | PROT_WRITE : PROT_READ;
         void *page = mmap(NULL, 4096, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (page == MAP_FAILED) {
+            if (errno == ENOMEM && mapped >= STEPS_FORK_PAGES) break;
             printf("posix-procs: steps: mmap gave %s after %d pages\n", strerror(errno), mapped);
             return 63;
         }
@@ -2933,7 +2935,212 @@ static int nice_role(void);
 static int sched_role(void);
 #endif
 
+#if PROCFS
+/* The files and directories of /proc are descriptions of the layer: no pipe,
+ * no table of remembered directories. */
+static volatile sig_atomic_t proc_signals;
+static volatile long proc_handler_ns;
+static long proc_now_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000000000L + now.tv_nsec;
+}
+static void proc_handler(int signal) {
+    (void)signal;
+    long began = proc_now_ns();
+    char path[32];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)getpid());
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) close(fd);
+    long took = proc_now_ns() - began;
+    if (took > proc_handler_ns) proc_handler_ns = took;
+    proc_signals++;
+}
+
+/* The text of /proc/<pid>/<name> through the directory descriptor `dir`. */
+static int proc_first_number(int dir, const char *name) {
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) return -1;
+    char text[64] = {0};
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    return n > 0 ? atoi(text) : -2;
+}
+
+static int proc_has_entry(int dir, const char *name) {
+    int found = 0;
+    lseek(dir, 0, SEEK_SET);
+    DIR *stream = fdopendir(dup(dir));
+    if (!stream) return 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) found |= strcmp(entry->d_name, name) == 0;
+    closedir(stream);
+    return found;
+}
+
+static volatile int proc_threads_stop;
+static void *proc_idle(void *argument) {
+    (void)argument;
+    while (!proc_threads_stop) {
+        struct timespec pause = {0, 1000000};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+/* How many entries /proc/<pid>/task lists. */
+static int proc_task_entries(void) {
+    char path[48];
+    snprintf(path, sizeof path, "/proc/%d/task", (int)getpid());
+    DIR *stream = opendir(path);
+    if (!stream) return -1;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL)
+        if (entry->d_name[0] != '.') count++;
+    closedir(stream);
+    return count;
+}
+
+/* /proc/<pid>/task lists a thread each, and the status counts them. */
+static void proc_threads(void) {
+    pthread_t threads[4];
+    expect("one thread lists one entry", proc_task_entries(), 1);
+    proc_threads_stop = 0;
+    int made = 0;
+    for (int i = 0; i < 4; i++)
+        if (pthread_create(&threads[i], NULL, proc_idle, NULL) == 0) made++;
+    expect("four threads", made, 4);
+    expect("five entries of task", proc_task_entries(), 5);
+    char path[64], text[512] = {0};
+    snprintf(path, sizeof path, "/proc/%d/status", (int)getpid());
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    const char *threads_line = n > 0 ? strstr(text, "Threads:") : NULL;
+    expect("status counts five", threads_line != NULL && atoi(threads_line + 8) == 5, 1);
+    /* The file of a thread that is not the main one names it. */
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)getpid(), (int)getpid() + 1);
+    fd = open(path, O_RDONLY);
+    memset(text, 0, sizeof text);
+    n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    expect("the stat of the second thread", n > 0 && atoi(text) == (int)getpid() + 1, 1);
+    proc_threads_stop = 1;
+    for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+    expect("one entry again after the joins", proc_task_entries(), 1);
+}
+
+static int proc_fd_role(void) {
+    int fd = atoi(argv_seen[2]);
+    char text[8] = {0};
+    /* The text is the new image's, read from the offset the old one left. */
+    return read(fd, text, 5) == 5 && !memcmp(text, "/ ram", 5) ? 0 : 41;
+}
+
+static int proc_descriptions(void) {
+    pid_t other = getppid();
+    int before = failures;
+    /* One descriptor free: the open of a file of /proc takes it, and no
+     * second one for a pipe. */
+    int held[80], count = 0;
+    for (; count < 80; count++) {
+        held[count] = open("/dev/null", O_RDONLY);
+        if (held[count] < 0) break;
+    }
+    expect("the table fills", errno == EMFILE, 1);
+    if (count > 0) close(held[--count]);
+    char stat_path[32];
+    snprintf(stat_path, sizeof stat_path, "/proc/%d/stat", (int)getpid());
+    int fd = open(stat_path, O_RDONLY);
+    expect("the open of /proc/<pid>/stat on the last free descriptor", fd >= 0, 1);
+    char text[128] = {0};
+    expect("it reads", fd >= 0 && read(fd, text, sizeof text - 1) > 0 && atoi(text) == (int)getpid(), 1);
+    if (fd >= 0) close(fd);
+    while (count > 0) close(held[--count]);
+
+    printf("posix-procs: proc stage nine\n");
+    /* Nine directories of processes open together, each lists and reads the
+     * files of its own process. */
+    pid_t pids[2] = {getpid(), other};
+    int dirs[9], opened = 0;
+    for (int i = 0; i < 9; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "/proc/%d", (int)pids[i % 2]);
+        dirs[i] = open(path, O_RDONLY | O_DIRECTORY);
+        if (dirs[i] >= 0) opened++;
+    }
+    expect("nine directories of processes", opened, 9);
+    int right = 0;
+    for (int i = 0; i < 9; i++)
+        if (dirs[i] >= 0 && proc_has_entry(dirs[i], "status")
+            && proc_first_number(dirs[i], "stat") == (int)pids[i % 2]) right++;
+    expect("each of the nine lists and reads its own process", right, 9);
+    for (int i = 0; i < 9; i++) if (dirs[i] >= 0) close(dirs[i]);
+
+    printf("posix-procs: proc stage handler\n");
+    /* A handler that opens /proc/<pid> while the code it interrupted opens
+     * directories of processes does not hang. */
+    struct sigaction action = {.sa_handler = proc_handler}, old;
+    sigemptyset(&action.sa_mask);
+    expect("handler for the timer", sigaction(SIGALRM, &action, &old), 0);
+    timer_t timer_id;
+    struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM};
+    /* A period well past the time the handler takes (it asks the process
+     * service), so that the main code makes progress between signals. */
+    struct itimerspec every = {{0, 100000000}, {0, 100000000}};
+    expect("timer for the handler", timer_create(CLOCK_MONOTONIC, &event, &timer_id), 0);
+    timer_settime(timer_id, 0, &every, NULL);
+    /* Until three signals came or three seconds went, whatever the speed of
+     * the machine. */
+    long limit = proc_now_ns() + 3000000000L;
+    while (proc_signals < 3 && proc_now_ns() < limit) {
+        char path[32];
+        snprintf(path, sizeof path, "/proc/%d", (int)getpid());
+        int dir = open(path, O_RDONLY | O_DIRECTORY);
+        if (dir >= 0) close(dir);
+    }
+    timer_delete(timer_id);
+    sigaction(SIGALRM, &old, NULL);
+    expect("the handler ran while directories opened", proc_signals > 0, 1);
+    printf("posix-procs: proc handler ran %d times, the longest took %ld us\n",
+           (int)proc_signals, proc_handler_ns / 1000);
+
+    printf("posix-procs: proc stage fork\n");
+    /* The description crosses fork (its own offset in the child) and exec
+     * (the node and the offset, a text of the new image). */
+    int up = open("/proc/mounts", O_RDONLY);
+    char head[8] = {0}, again[8] = {0};
+    expect("six bytes of mounts", up >= 0 && read(up, head, 6) == 6 && !memcmp(head, "ramfs ", 6), 1);
+    pid_t forked = fork();
+    if (forked == 0) {
+        char more[8] = {0};
+        _exit(read(up, more, 5) == 5 && !memcmp(more, "/ ram", 5) ? 0 : 1);
+    }
+    reap("a forked child reads the text from its own offset", forked, 0, 0);
+    /* The child's read moved the child's offset: the parent's is where it was. */
+    expect("the parent's offset stays", read(up, again, 5) == 5 && !memcmp(again, "/ ram", 5), 1);
+    expect("back to six", lseek(up, 6, SEEK_SET), 6);
+    pid_t execed = fork();
+    if (execed == 0) {
+        char number[16];
+        snprintf(number, sizeof number, "%d", up);
+        execl("/bin/procs-child", "procs-child", "proc-fd", number, (char *)NULL);
+        _exit(42);
+    }
+    reap("an exec keeps the description", execed, 0, 0);
+    if (up >= 0) close(up);
+    proc_threads();
+    if (failures == before) printf("posix-procs: proc descriptions ok\n");
+    return failures != before;
+}
+#endif
+
 static int role(const char *name) {
+#if PROCFS
+    if (strcmp(name, "proc-fd") == 0) return proc_fd_role();
+    if (strcmp(name, "procdesc") == 0) return proc_descriptions();
+#endif
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
 #endif
@@ -5214,6 +5421,14 @@ int main(int argc, char **argv) {
     printf("posix-procs: stage sched\n");
     spawned_scheduling();
     printf("posix-procs: sched ok\n");
+#if PROCFS
+    {
+        /* A child that was spawned from a file has code in its map to fork. */
+        pid_t describer = -1;
+        expect("spawn of the /proc probe", spawn(&describer, "procdesc", NULL, NULL), 0);
+        if (describer > 0) reap("the /proc probe", describer, 0, 0);
+    }
+#endif
 #endif
     printf("posix-procs: stage waits\n");
     waits(child);
