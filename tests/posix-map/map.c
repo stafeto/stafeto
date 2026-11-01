@@ -1207,6 +1207,38 @@ static void pins_modes(void) {
     }
 }
 
+/* A shared mapping replaced by MAP_FIXED gives its place back at once: 16
+ * files replaced, 16 others fit. */
+static void pins_fixed(void) {
+    char *first[PINS] = {0}, *second[PINS] = {0};
+    char path[48];
+    int mapped = 0, again = 0, replaced = 0;
+    for (int i = 0; i < PINS; i++) {
+        first[i] = pin_map(40 + i);
+        mapped += first[i] != NULL;
+    }
+    check("fixed: 16 files mapped", mapped == PINS);
+    for (int i = 0; i < PINS && first[i]; i++) {
+        void *over = mmap(first[i], PAGE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        replaced += over == first[i];
+    }
+    check("fixed: 16 mappings replaced", replaced == mapped);
+    for (int i = 0; i < PINS; i++) {
+        second[i] = pin_map(60 + i);
+        again += second[i] != NULL;
+    }
+    check("fixed: the places came back", again == PINS);
+    for (int i = 0; i < PINS; i++) {
+        if (first[i]) munmap(first[i], PAGE);
+        if (second[i]) munmap(second[i], PAGE);
+        pin_path(path, sizeof path, 40 + i);
+        unlink(path);
+        pin_path(path, sizeof path, 60 + i);
+        unlink(path);
+    }
+}
+
 /* Two threads map and unmap two files for a while: a place of the pins
  * that one thread gave back and the other took for its file never makes a
  * mapping read, write or give back the other's file. */
@@ -1598,6 +1630,7 @@ int main(int argc, char **argv) {
     review();
     pins();
     pins_modes();
+    pins_fixed();
     pins_race();
     pins_lock();
     pins_close_on_fork();
