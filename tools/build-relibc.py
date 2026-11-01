@@ -106,7 +106,17 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # service (SI_TIMER, merged signals, the overrun), platform interface 22;
 # tagged pin-5b150246; its comment of SI_TKILL mended (pthread_kill only):
 # pin-1cd3d139.
-COMMIT = "1cd3d13968b7953cb8296edb06dc46aa7018c22c"
+# Step 6, part 1 (relibc and the threads of the layer): exit flushes the
+# streams under their locks and before it ends the other threads, fclose marks
+# its stream closed, streams over memory keep their content in the process (no
+# descriptor, no file), getlogin_r reads utmpx by itself, syslog with no
+# journal loses the message unless LOG_CONS, execvp, execlp and posix_spawnp
+# run a file that is no program with /bin/sh, fork takes the locks of aio and
+# of the timers, stdatomic.h has a branch for Clang, PRIO_INHERIT unlock asks
+# for one wake, getnameinfo says EAI_OVERFLOW and getaddrinfo reads
+# /etc/services by itself (getservbyname_r), shmctl IPC_SET changes no file;
+# tagged pin-ae35f55a.
+COMMIT = "ae35f55aa72dbf8a6c1f6cdf2f7a1c593918bf6e"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

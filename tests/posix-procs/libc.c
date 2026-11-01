@@ -47,7 +47,7 @@ static long lc_slurp(const char *path, char *out, size_t size) {
 }
 
 /* A child that must end within `ms` milliseconds: waits for it with WNOHANG
- * and kills it when the time is up (a hang is a failure, not a stuck probe).
+ * and kills it when the time is up (a hang is a failure that the probe reports).
  * Returns its exit status, or -1 for a kill or a status that is no exit. */
 static int lc_wait(pid_t pid, long ms) {
     int status = 0;
