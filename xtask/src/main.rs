@@ -2942,6 +2942,12 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
     const ENDED: &str = "init: posix-tty ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
+        run.expect(
+            "posix-tty: getlogin_r leaves the walk of getutxent where it stood ok",
+            BOOT_TIMEOUT,
+        )?;
+        // LOG_CONS sent the message to /dev/console (no journal file there).
+        run.expect("tty: console-line 3", BOOT_TIMEOUT)?;
         run.expect("posix-tty: settings ok", BOOT_TIMEOUT)?;
         for (i, byte) in b"xyz".iter().copied().enumerate() {
             run.expect(&format!("posix-tty: raw read {i} waits"), DIALOG_STEP)?;
@@ -3528,6 +3534,7 @@ fn posix_poll_probe() -> Result<(), String> {
         Some("init: posix-poll ended: "),
         &kernel.elf,
     )?;
+    qemu::expect_marker(&output, "posix-poll: poll and select of 64 descriptions ok")?;
     qemu::expect_marker(&output, "posix-poll: ok")?;
     qemu::expect_stopped_on(
         &output,
@@ -4437,6 +4444,7 @@ fn posix_math_probe() -> Result<(), String> {
     )?;
     for marker in [
         "posix-math: float double and binary128 long double ok",
+        "posix-math: long double constants of binary128 ok",
         "posix-math: NaN and signed zero ok",
         "posix-math: rounding and exceptions ok",
         "posix-math: thread floating-point isolation ok",
@@ -4868,6 +4876,10 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
     qemu::expect_marker(
         outcome,
         "posix-procs: timers: sigqueue, timers, alarm, itimer, clock ok",
+    )?;
+    qemu::expect_marker(
+        outcome,
+        "posix-procs: libc: exit, fclose, exec of scripts, fork locks, atomics, memory streams ok",
     )?;
     qemu::expect_marker(outcome, "posix-procs: ok")?;
     qemu::expect_marker(outcome, "posix-procs: the last image ran")?;
@@ -6423,6 +6435,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(
         &output,
         "relibc-threads: timed waits across a second end at their deadline ok",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: an unlock of a PRIO_INHERIT mutex wakes one waiter, the mutex goes by level ok",
     )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");
