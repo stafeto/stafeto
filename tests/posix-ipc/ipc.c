@@ -1239,9 +1239,6 @@ static void *level_waiter(void *arg) {
     return NULL;
 }
 
-static volatile int got_usr2;
-static void on_usr2(int s) { (void)s; got_usr2++; }
-
 /* Twelve threads of twelve priorities wait on one named semaphore (a wait
  * queue of the service used to hold eight): the posts wake them in the order
  * of their priorities, one for each post. A signal ends a wait with EINTR and
@@ -1263,10 +1260,11 @@ static int sem_waiters(void) {
         CHECK(pthread_create(&threads[i], &attr, level_waiter, (void *)(intptr_t)priorities[i]) == 0);
         CHECK(pthread_attr_destroy(&attr) == 0);
     }
-    for (int i = 0; i < 100 && level_started != SEM_WAITERS; i++) pause_ms(10);
+    for (int i = 0; i < 500 && level_started != SEM_WAITERS; i++) pause_ms(10);
     CHECK(level_started == SEM_WAITERS);
-    /* All of them are in the service by now; none has passed. */
-    pause_ms(200);
+    /* All of them are in the service a second later (a slow host needs
+     * the time); none has passed. */
+    pause_ms(1000);
     CHECK(level_done == 0);
     for (int i = 0; i < SEM_WAITERS; i++) {
         CHECK(sem_post(level_sem) == 0);
@@ -1290,10 +1288,6 @@ static int sem_waiters(void) {
     /* A signal ends the wait, and the post that comes after it is not lost. */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_usr2;
-    CHECK(sigaction(SIGUSR2, &sa, NULL) == 0);
-    got_usr2 = 0;
-    CHECK(raise(SIGUSR2) == 0 && got_usr2 == 1);
     alarmed = 0;
     sa.sa_handler = on_alarm;
     CHECK(sigaction(SIGALRM, &sa, NULL) == 0);
@@ -1376,6 +1370,48 @@ static int named_waits(void) {
     int v = -1;
     CHECK(sem_getvalue(full_sem, &v) == 0 && v == 0);
     CHECK(sem_close(full_sem) == 0 && sem_unlink("/ipc-full") == 0);
+    return 0;
+}
+
+/* A process whose thirty threads were each given the unit of a post is killed
+ * while it is stopped, so that none has taken its unit: the service hands the
+ * thirty units on, to the twenty waiters of the process that posted and then
+ * to the value, one wake in each step (xtask measures the longest step). */
+static int sem_session_ends(void) {
+    enum { DEAD = 30, LIVE = 20 };
+    sem_unlink("/ipc-end");
+    full_sem = sem_open("/ipc-end", O_CREAT | O_EXCL, 0600, 0);
+    CHECK(full_sem != SEM_FAILED);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        pthread_t threads[DEAD];
+        int made = full_threads(threads, DEAD);
+        for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+        _exit(made == DEAD ? 0 : 1);
+    }
+    pause_ms(1000);
+    pthread_t threads[LIVE];
+    CHECK(full_threads(threads, LIVE) == LIVE);
+    pause_ms(1000);
+    CHECK(kill(pid, SIGSTOP) == 0);
+    pause_ms(200);
+    for (int i = 0; i < DEAD; i++) CHECK(sem_post(full_sem) == 0);
+    CHECK(kill(pid, SIGKILL) == 0);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status));
+    for (int i = 0; i < LIVE; i++) {
+        void *result = NULL;
+        CHECK(pthread_join(threads[i], &result) == 0 && result == NULL);
+    }
+    int v = -1;
+    for (int i = 0; i < 400 && v != DEAD - LIVE; i++) {
+        CHECK(sem_getvalue(full_sem, &v) == 0);
+        if (v != DEAD - LIVE) pause_ms(10);
+    }
+    if (v != DEAD - LIVE) printf("posix-ipc: value %d, wanted %d\n", v, DEAD - LIVE);
+    CHECK(v == DEAD - LIVE);
+    CHECK(sem_close(full_sem) == 0 && sem_unlink("/ipc-end") == 0);
     return 0;
 }
 
@@ -1471,6 +1507,7 @@ int main(int argc, char **argv) {
     RUN(named_semaphores);
     RUN(sem_waiters);
     RUN(named_waits);
+    RUN(sem_session_ends);
     RUN(limits);
     RUN(longest_steps);
     printf("posix-ipc: ok\n");

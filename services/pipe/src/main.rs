@@ -399,14 +399,22 @@ impl PipeService {
         }
         let named_due = self.named_cleanup();
         let more = self.pipes.step(wakes) || self.watches.cleanup_due() || named_due;
-        // A segment freed by the end of its last holder has a job nobody
-        // asked the file service for: it is told (no wait, no deadlock).
-        if self.pipes.ipc_notify_due()
-            && let Some(files) = &self.files_notify
-        {
-            let _ = sys::notify(files, proto_pipe::jobs::NOTIFY_BIT);
-        }
+        self.tell_files();
         more
+    }
+
+    /// Tells the file service there are jobs for the files of segments, whoever
+    /// made them (a call of the library is the fast way, this is the sure one):
+    /// by a notification, which never waits, so the pipe service waits for no
+    /// call of the file service. The mark stays where the notification could
+    /// not be sent.
+    fn tell_files(&mut self) {
+        if self.pipes.ipc_notify_pending()
+            && let Some(files) = &self.files_notify
+            && sys::notify(files, proto_pipe::jobs::NOTIFY_BIT).is_ok()
+        {
+            self.pipes.ipc_notify_done();
+        }
     }
 
     /// BROKER_JOBS: the jobs for the files of segments, to the file service
@@ -430,6 +438,9 @@ impl PipeService {
             }
         }
         let (jobs, more) = self.pipes.ipc_take_jobs();
+        if !more {
+            self.pipes.ipc_notify_done();
+        }
         let w = r.reply();
         if w.u32(0).is_err() || proto_pipe::jobs::write_reply(more, &jobs, w).is_err() {
             return Answer::Status(Status::BadSize);
@@ -457,9 +468,7 @@ impl PipeService {
             self.kick();
         }
         self.ops.gone(&mut s.data.long);
-        let mut wakes = Wakes::default();
-        self.pipes.ipc_forget(s.label(), &mut wakes);
-        self.tell(&wakes);
+        self.pipes.ipc_forget(s.label());
         self.roots
             .give(s.data.root, core::mem::take(&mut s.data.waiting));
     }
@@ -885,6 +894,7 @@ impl PipeService {
             &mut wakes,
         );
         self.tell(&wakes);
+        self.tell_files();
         match flow {
             Ok(Flow::Done) => {
                 if long {
@@ -974,7 +984,6 @@ impl PipeService {
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
-                self.pipes.ipc_wait_again(label, key);
                 match notify {
                     Some(handle) => {
                         if let Err(e) = self.ops.arm(label, key, handle) {
@@ -1597,8 +1606,8 @@ impl Service<0> for PipeService {
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
         self.abandon(s);
-        self.pipes.ipc_gone(s.label());
-        if self.pipes.gone(&mut s.data.held) {
+        let ipc = self.pipes.ipc_gone(s.label());
+        if self.pipes.gone(&mut s.data.held) || ipc {
             self.kick();
         }
     }

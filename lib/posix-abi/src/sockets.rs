@@ -444,6 +444,19 @@ pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
 /// a long operation like an accept: it asks again whenever the listener
 /// accepts, until it is connected, refused or interrupted.
 fn connect_wait(transport: Transport, end: u32, addr: &Addr) -> Result<(), i32> {
+    // The listener's list of waiting operations has eight places: where they
+    // are taken the start is refused (EAGAIN), and it is made again every
+    // 2 ms until it is taken, a signal ends the wait (EINTR) or the connect
+    // is made or refused.
+    loop {
+        match connect_wait_once(transport, end, addr) {
+            Err(EAGAIN) => crate::threads::sleep::pause(2_000_000)?,
+            other => return other,
+        }
+    }
+}
+
+fn connect_wait_once(transport: Transport, end: u32, addr: &Addr) -> Result<(), i32> {
     let pipes = transport.pipes().map_err(crate::error)?;
     let e = endpoint(end);
     let mut start = Writer::new();

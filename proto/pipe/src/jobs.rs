@@ -16,6 +16,11 @@
 //!   job: kind u32, serial u64, uid u32, gid u32, mode u32.
 //!
 //! Only the file service's broker session (label RAM_BROKER) may call it.
+//!
+//! The pipe service makes no call that waits to the file service, now or
+//! later: the two would wait for each other (the file service calls the pipe
+//! service for named pipes and for these jobs). It tells the file service of
+//! a job with a notification, which never waits.
 
 use crate::Method;
 use proto_wire::{Reader, Status, Writer};

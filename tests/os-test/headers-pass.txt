@@ -1,4 +1,5 @@
 # Tests of os-test include and namespace with outcome good in cargo xtask os-test-headers; STAFETO_BLESS=1 cargo xtask os-test-headers rewrites it
+# clang: Homebrew clang version 23.1.3
 include/aio/AIO_ALLDONE.c
 include/aio/AIO_CANCELED.c
 include/aio/AIO_NOTCANCELED.c

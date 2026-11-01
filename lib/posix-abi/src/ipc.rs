@@ -247,8 +247,8 @@ fn makes_file_jobs(operation: u32, words: &[u64], reply: &Reply) -> bool {
 }
 
 /// Has the file service take the jobs for the files of segments now, so that
-/// the file is as the segment is when the call returns: its pieces of four
-/// at most (a failure leaves the jobs to the notice and the next call).
+/// the file is as the segment is when the call returns: a call for each job
+/// and each portion of a removal (a failure leaves the jobs to the notice and the next call).
 fn take_file_jobs(transport: Transport) {
     for _ in 0..32 {
         match transport.files().ipc_jobs() {

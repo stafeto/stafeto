@@ -314,6 +314,7 @@ fn main(_: u64) -> u64 {
         ipc_arm_tries: 0,
         ipc_jobs_pending: false,
         segment_unlink: None,
+        segment_refusals: 0,
         lock_sweep_pending: false,
         lock_maintenance_turn: false,
         lock_maintenance_work: 0,
@@ -419,6 +420,8 @@ struct Fs {
     /// The removal of the file of a segment under way, a portion to a call of
     /// IPC_JOBS or a turn of maintenance.
     segment_unlink: Option<ramfs::namespace::StagedUnlink>,
+    /// The cleanups of such removals the storage refused.
+    segment_refusals: u32,
     /// The sessions the service gave itself so far.
     given: u64,
     level: u8,
@@ -3267,15 +3270,24 @@ impl Fs {
             }
     }
     /// One call of BROKER_JOBS: the jobs for the files of XSI segments the
-    /// pipe service holds, at most four, run; whether jobs are left. The first
+    /// pipe service holds, one a call, run; whether work is left. The first
     /// call brings the copy of the channel the pipe service tells of jobs with.
     /// The wait in `send` is the pipe service's longest step, as for the
     /// broker's other calls; the pipe service never calls this one.
     fn ipc_jobs_round(&mut self) -> Result<bool, u32> {
         // A removal under way goes on by a portion, with no call.
         if let Some(unlink) = self.segment_unlink.as_mut() {
-            if unlink.advance(&mut self.ram.storage) {
-                self.segment_unlink = None;
+            match unlink.advance(&mut self.ram.storage) {
+                ramfs::namespace::UnlinkStep::More => {}
+                ramfs::namespace::UnlinkStep::Done => self.segment_unlink = None,
+                ramfs::namespace::UnlinkStep::Refused => {
+                    self.segment_unlink = None;
+                    self.segment_refusals += 1;
+                    rt::println!(
+                        "ramfs: {} cleanups of a segment's file were refused",
+                        self.segment_refusals
+                    );
+                }
             }
             return Ok(true);
         }
@@ -3312,48 +3324,25 @@ impl Fs {
         Ok(more || staged)
     }
 
-    /// A job for the file of a segment: in `/dev/shm`, named by its serial. A
-    /// file that is not there (the segment's maker has not made it yet, or
-    /// went before it did) is no error.
+    /// A job for the file of a segment (`ramfs::segments`). A file that is
+    /// not there (the segment's maker has not made it yet, or went before it
+    /// did) is no error. Whether a removal is under way.
     fn run_segment_job(&mut self, job: proto_pipe::jobs::Job) -> bool {
         use proto_pipe::jobs::Job;
-        let mut name = *b".sysv0000000000000000";
-        let mut serial = job.serial();
-        for byte in name[5..].iter_mut().rev() {
-            *byte = b"0123456789abcdef"[(serial & 15) as usize];
-            serial >>= 4;
-        }
-        let storage = &mut self.ram.storage;
-        let Ok(dir) = storage.resolve(b"/dev/shm") else {
-            return false;
-        };
         match job {
-            Job::Own { uid, gid, mode, .. } => {
-                let Ok(token) = storage.lookup(dir, &name) else {
-                    return false;
-                };
-                let Ok(node) = storage.node(token) else {
-                    return false;
-                };
-                let mut bits = (node.mode & !0o777) | (mode & 0o777);
-                if node.uid != uid || node.gid != gid {
-                    // As `chown` of a file (a conformance departure of the
-                    // layer): the set-ID bits go.
-                    bits &= !(SET_UID | SET_GID);
-                }
-                let _ = storage.set_attributes(token, bits, uid, gid);
+            Job::Own {
+                serial,
+                uid,
+                gid,
+                mode,
+            } => {
+                ramfs::segments::change(&mut self.ram.storage, serial, uid, gid, mode);
                 false
             }
-            Job::Remove { .. } => {
+            Job::Remove { serial } => {
                 // The removal takes its portions in the calls and turns after
                 // this one.
-                self.segment_unlink = ramfs::namespace::StagedUnlink::begin(
-                    storage,
-                    dir,
-                    &name,
-                    ramfs::storage::BOOT_ROOT,
-                )
-                .ok();
+                self.segment_unlink = ramfs::segments::begin_remove(&mut self.ram.storage, serial);
                 self.segment_unlink.is_some()
             }
         }

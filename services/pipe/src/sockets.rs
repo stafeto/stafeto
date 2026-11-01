@@ -168,6 +168,11 @@ pub struct Sockets {
     limbo_len: usize,
     inflight: usize,
     port: u32,
+    /// For each datagram socket that was read, the sockets connected to it
+    /// whose lists are to be told (they watch their own lists for POLLOUT),
+    /// and the sockets that have some: `sock_step` tells one in each step.
+    owed: [u64; SOCKETS],
+    owed_any: u64,
 }
 
 impl Sockets {
@@ -190,12 +195,14 @@ impl Sockets {
             limbo_len: 0,
             inflight: 0,
             port: 0,
+            owed: [0; SOCKETS],
+            owed_any: 0,
         }
     }
 
     /// Whether `step` has work.
     pub fn due(&self) -> bool {
-        self.dirty != 0 || self.limbo_len != 0
+        self.dirty != 0 || self.limbo_len != 0 || self.owed_any != 0
     }
 
     /// The operations that wait at the queue `queue` (DESCRIPTIONS + slot).
@@ -1244,16 +1251,22 @@ impl Pipes {
                 wakes.add(self.sockets.s[p].waiters.waiters);
             }
             if self.sockets.s[i].kind == DGRAM {
-                // Senders that wait for room in this buffer wait here, and
-                // so do the polls of the sockets connected to this one,
-                // which watch their own lists.
+                // Senders that wait for room in this buffer wait here. The polls
+                // of the sockets connected to this one watch their own lists:
+                // they are told one in each step (`sock_step`), so that a read
+                // wakes no more than two lists.
                 wakes.add(self.sockets.s[i].waiters.waiters);
                 let era = self.sockets.s[i].era;
+                let mut owed = 0u64;
                 for j in 0..SOCKETS {
                     let o = &self.sockets.s[j];
                     if j != i && o.live && o.kind == DGRAM && o.peer == Some((i as u8, era)) {
-                        wakes.add(o.waiters.waiters);
+                        owed |= 1 << j;
                     }
+                }
+                if owed != 0 {
+                    self.sockets.owed[i] |= owed;
+                    self.sockets.owed_any |= 1 << i;
                 }
             }
         }
@@ -1427,7 +1440,15 @@ impl Pipes {
     /// One step of what sessions that went left: a socket they held, or a
     /// description a message held.
     pub(super) fn sock_step(&mut self, wakes: &mut Wakes) {
-        if self.sockets.dirty != 0 {
+        if self.sockets.owed_any != 0 {
+            let i = self.sockets.owed_any.trailing_zeros() as usize;
+            let j = self.sockets.owed[i].trailing_zeros() as usize;
+            self.sockets.owed[i] &= !(1 << j);
+            if self.sockets.owed[i] == 0 {
+                self.sockets.owed_any &= !(1 << i);
+            }
+            wakes.add(self.sockets.s[j].waiters.waiters);
+        } else if self.sockets.dirty != 0 {
             let i = self.sockets.dirty.trailing_zeros() as usize;
             self.sockets.dirty &= !(1 << i);
             let count = core::mem::take(&mut self.sockets.dropping[i]);
@@ -1701,7 +1722,7 @@ mod tests {
             Err(REFUSED),
             "c is not b's peer"
         );
-        // On the loopback of INET the datagram of a stranger is lost, not refused.
+        // On the loopback of INET the datagram of a stranger is dropped.
         p.sock_bind(&held, y, inet(5010)).unwrap();
         p.sock_bind(&held, z, inet(5011)).unwrap();
         p.sock_connect(&held, y, inet(5011), &mut w).unwrap();
@@ -1744,6 +1765,60 @@ mod tests {
         p.sock_recv(&mut held, b, 0, &mut out, 0, &mut w).unwrap();
         assert!(woke(&w).contains(&(9, 1)));
         assert_eq!(p.readiness_endpoint(&held, a) & watch::WRITE, watch::WRITE);
+    }
+
+    #[test]
+    fn three_connected_senders_all_get_the_pollout_wake_one_in_each_step() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let mut w = Wakes::default();
+        let r = make(&mut p, &mut held, UNIX, DGRAM);
+        p.sock_bind(&held, r, Addr::unix(60, b"/r").unwrap())
+            .unwrap();
+        let mut senders = Vec::new();
+        for _ in 0..3u64 {
+            let s = make(&mut p, &mut held, UNIX, DGRAM);
+            p.sock_connect(&held, s, Addr::unix(60, b"/r").unwrap(), &mut w)
+                .unwrap();
+            senders.push(s);
+        }
+        let big = [7u8; SEND_MAX];
+        for _ in 0..2 {
+            p.sock_send(&held, senders[0], DONTWAIT, &[], &Addr::NONE, &big, &mut w)
+                .unwrap();
+        }
+        for (n, s) in senders.iter().enumerate() {
+            p.wait_new(
+                DESCRIPTIONS as u32 + s.slot() as u32,
+                (20 + n as u64, 1),
+                |_| true,
+            )
+            .unwrap();
+        }
+        p.wait_new(DESCRIPTIONS as u32 + r.slot() as u32, (30, 1), |_| true)
+            .unwrap();
+        let mut out = [0u8; SEND_MAX];
+        let mut w = Wakes::default();
+        p.sock_recv(&mut held, r, 0, &mut out, 0, &mut w).unwrap();
+        let mut got = woke(&w);
+        // The read tells the list of the socket; the polls of the connected
+        // sockets are told in steps of one list each.
+        for _ in 0..10 {
+            let mut step = Wakes::default();
+            let more = p.step(&mut step);
+            assert!(
+                woke(&step).len() <= 1,
+                "a step tells one list of one waiter"
+            );
+            got.extend(woke(&step));
+            if !more {
+                break;
+            }
+        }
+        assert!(got.contains(&(30, 1)));
+        for n in 0..3u64 {
+            assert!(got.contains(&(20 + n, 1)), "sender {n} not woken: {got:?}");
+        }
     }
 
     #[test]

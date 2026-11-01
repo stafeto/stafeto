@@ -17,6 +17,26 @@ fn names_of(text: &str) -> BTreeSet<&str> {
         .collect()
 }
 
+/// The first line of `clang --version`: the compiler decides what a header
+/// test comes to, so a list names the one that made it.
+fn clang_version() -> Option<String> {
+    // The compiler the scripts use (tools/build-os-test.py `clang`): the
+    // Homebrew LLVM where there is one, else the one on the path.
+    let brew = std::path::Path::new("/opt/homebrew/opt/llvm/bin/clang");
+    let out = std::process::Command::new(if brew.exists() {
+        brew.as_os_str()
+    } else {
+        std::ffi::OsStr::new("clang")
+    })
+    .arg("--version")
+    .output()
+    .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(str::to_owned)
+}
+
 /// Checks `passed` against the list at `list`; `what` names the measure in
 /// the messages. With `STAFETO_BLESS` set the list becomes `passed`, headed
 /// by `header`.
@@ -28,6 +48,9 @@ pub(crate) fn check(
 ) -> Result<(), String> {
     if std::env::var_os("STAFETO_BLESS").is_some() {
         let mut text = format!("# {header}\n");
+        if let Some(version) = clang_version() {
+            text.push_str(&format!("# clang: {version}\n"));
+        }
         for name in passed {
             text.push_str(name);
             text.push('\n');
@@ -41,6 +64,15 @@ pub(crate) fn check(
         return Ok(());
     }
     let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+    // A compiler other than the one that made the list is told, so that a
+    // name lost with a new version is read as that.
+    if let (Some(made), Some(now)) = (
+        text.lines().find_map(|l| l.strip_prefix("# clang: ")),
+        clang_version(),
+    ) && made != now
+    {
+        println!("{what}: the list was made with `{made}`, this run has `{now}`");
+    }
     verdict(what, passed, &text, &list.display().to_string())
 }
 

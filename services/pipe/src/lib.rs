@@ -130,18 +130,11 @@ pub struct Wakes {
     list: [Option<Waiter>; WAITERS],
     /// A second list: a socket's change wakes its peer and itself.
     extra: [Option<Waiter>; WAITERS],
-    /// A third: the datagram sockets connected to a socket that was read.
-    more: [Option<Waiter>; WAITERS],
 }
 
 impl Wakes {
     pub fn iter(&self) -> impl Iterator<Item = Waiter> + '_ {
-        self.list
-            .iter()
-            .chain(self.extra.iter())
-            .chain(self.more.iter())
-            .flatten()
-            .copied()
+        self.list.iter().chain(self.extra.iter()).flatten().copied()
     }
 
     /// Adds the operations of `list` to the first of the two lists that is
@@ -152,10 +145,8 @@ impl Wakes {
         }
         if self.list[0].is_none() {
             self.list = list;
-        } else if self.extra[0].is_none() {
-            self.extra = list;
         } else {
-            self.more = list;
+            self.extra = list;
         }
     }
 
@@ -166,7 +157,6 @@ impl Wakes {
             .list
             .iter_mut()
             .chain(self.extra.iter_mut())
-            .chain(self.more.iter_mut())
             .find(|place| place.is_none())
         {
             Some(place) => {
@@ -180,7 +170,6 @@ impl Wakes {
     fn merge(&mut self, other: &Wakes) {
         self.add(other.list);
         self.add(other.extra);
-        self.add(other.more);
     }
 }
 

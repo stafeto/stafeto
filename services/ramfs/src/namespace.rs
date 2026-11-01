@@ -921,6 +921,15 @@ pub(super) fn model_unlink(
         }
     }
 }
+/// What a portion of a staged removal came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlinkStep {
+    More,
+    Done,
+    /// The cleanup was refused: the removal is over, what it held is let go
+    /// of as far as the service can, and the service counts it.
+    Refused,
+}
 /// The removal of a name by the service itself (the file of an XSI segment),
 /// done a portion at a time: the same steps `model_unlink` takes together, so
 /// that no step of the service holds all of them. The caller asks again
@@ -973,9 +982,10 @@ impl StagedUnlink {
         }
     }
 
-    /// One portion of the removal; whether it is over (a refusal ends it as
-    /// well: nothing is left held).
-    pub fn advance(&mut self, storage: &mut Storage<'_>) -> bool {
+    /// One portion of the removal. A refusal of a step or of the commit ends
+    /// it as well (after the cleanup, with nothing left held); a refusal of
+    /// the cleanup itself releases the charge and says so.
+    pub fn advance(&mut self, storage: &mut Storage<'_>) -> UnlinkStep {
         match self.stage {
             Stage::Steps => match self.prep.step(storage, model_identity()) {
                 Ok(false) => {}
@@ -988,18 +998,19 @@ impl StagedUnlink {
                         .commit(storage, model_identity(), proto_fs::Timestamp::legacy_ns(0));
                 self.stage = Stage::Cleanup;
             }
-            Stage::Cleanup => {
-                if self
-                    .prep
-                    .cancel_step(storage)
-                    .expect("namespace cleanup of the service's own removal")
-                {
+            Stage::Cleanup => match self.prep.cancel_step(storage) {
+                Ok(false) => {}
+                Ok(true) => {
                     storage.release_preparation(self.charge);
-                    return true;
+                    return UnlinkStep::Done;
                 }
-            }
+                Err(_) => {
+                    storage.release_preparation(self.charge);
+                    return UnlinkStep::Refused;
+                }
+            },
         }
-        false
+        UnlinkStep::More
     }
 }
 pub(super) fn model_link(

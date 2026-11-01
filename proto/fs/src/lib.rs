@@ -383,8 +383,8 @@ pub enum Method {
     /// it is open for writing and not for appending. Reply: status.
     ShareGrant = 62,
     /// No body. The file service takes the jobs for the files of XSI shared
-    /// memory segments from the pipe service (one call of BROKER_JOBS, at most
-    /// four jobs) and runs them: a new owner, group and mode of the file
+    /// memory segments from the pipe service (one call of BROKER_JOBS gives one
+    /// job: the removal of a file takes a step of the service) and runs them: a new owner, group and mode of the file
     /// `/dev/shm/.sysvN`, or its removal. Reply: status, more u32 (1 when jobs
     /// are left, to be asked again). Any session may ask: it carries no
     /// authority, the jobs come from the pipe service alone.

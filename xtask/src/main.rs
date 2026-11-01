@@ -3662,7 +3662,7 @@ fn posix_ipc_steps() -> Result<(), String> {
         .unwrap_or(0);
     // The file service takes the jobs for the files of segments (IPC_JOBS, kind
     // 63): its step waits in `send` for the pipe service's BROKER_JOBS (kind 45,
-    // in the rows above) and runs four jobs at most.
+    // in the rows above) and runs one job or one portion of a removal.
     check_waits(&lines, &["2", "4"], "IPC job steps")?;
     let files = longest_steps(&lines, "2");
     let Some(jobs) = files.iter().find(|row| row.0 == 63 && row.1 != 0) else {

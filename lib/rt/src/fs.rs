@@ -623,7 +623,8 @@ impl Files {
     }
 
     /// IPC_JOBS: the file service takes and runs the jobs for the files of XSI
-    /// segments the pipe service holds (four at most); whether jobs are left.
+    /// segments the pipe service holds (one job a call, or one portion of a
+    /// removal); whether work is left.
     pub fn ipc_jobs(&self) -> Result<bool, Status> {
         let request = Method::IpcJobs.header().bytes();
         let reply = sys::send(&self.channel, &request).map_err(Status::Kernel)?;
