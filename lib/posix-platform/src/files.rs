@@ -136,9 +136,9 @@ pub unsafe extern "C" fn stafeto_fstatat(
 
 /// The PID of the directory of a process `number` names, if it is one.
 #[cfg(feature = "procfs")]
-fn proc_directory(number: u32) -> Option<u32> {
+fn proc_directory(number: u32) -> Option<posix_abi::procfs::Dir> {
     posix_abi::shared::held(number, |_, target| match target {
-        Target::Proc(id) => Ok(posix_abi::procfs::directory_pid(id)),
+        Target::Proc(id) => Ok(posix_abi::procfs::directory_of(id)),
         _ => Ok(None),
     })
     .ok()
@@ -205,8 +205,8 @@ pub unsafe extern "C" fn stafeto_getdents(
         // The directory of a process under /proc is a description of the
         // layer (procfs).
         #[cfg(feature = "procfs")]
-        if let Some(pid) = proc_directory(number) {
-            return posix_abi::procfs::entries(out, position, Some(pid));
+        if let Some(dir) = proc_directory(number) {
+            return posix_abi::procfs::entries(out, position, Some(dir));
         }
         // The directory /proc lists the live processes (procfs).
         #[cfg(feature = "procfs")]
@@ -1024,10 +1024,10 @@ pub unsafe extern "C" fn stafeto_posix_getdents(fd: c_int, buf: *mut u8, len: us
         posix_abi::shared::held(fd, |transport, target| {
             #[cfg(feature = "procfs")]
             if let Target::Proc(id) = target {
-                let pid = posix_abi::procfs::directory_pid(id)
+                let dir = posix_abi::procfs::directory_of(id)
                     .ok_or(posix_abi::error(posix_fs::FsError::NotDirectory))?;
                 let position = posix_abi::procfs::directory_offset(id, None)?;
-                let (used, next) = posix_abi::procfs::entries_from(out, position, Some(pid))?;
+                let (used, next) = posix_abi::procfs::entries_from(out, position, Some(dir))?;
                 posix_abi::procfs::directory_offset(id, Some(next))?;
                 return Ok(used);
             }

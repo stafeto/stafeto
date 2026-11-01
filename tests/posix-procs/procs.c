@@ -2967,6 +2967,59 @@ static int proc_has_entry(int dir, const char *name) {
     return found;
 }
 
+static volatile int proc_threads_stop;
+static void *proc_idle(void *argument) {
+    (void)argument;
+    while (!proc_threads_stop) {
+        struct timespec pause = {0, 1000000};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+
+/* How many entries /proc/<pid>/task lists. */
+static int proc_task_entries(void) {
+    char path[48];
+    snprintf(path, sizeof path, "/proc/%d/task", (int)getpid());
+    DIR *stream = opendir(path);
+    if (!stream) return -1;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL)
+        if (entry->d_name[0] != '.') count++;
+    closedir(stream);
+    return count;
+}
+
+/* /proc/<pid>/task lists a thread each, and the status counts them. */
+static void proc_threads(void) {
+    pthread_t threads[4];
+    expect("one thread lists one entry", proc_task_entries(), 1);
+    proc_threads_stop = 0;
+    int made = 0;
+    for (int i = 0; i < 4; i++)
+        if (pthread_create(&threads[i], NULL, proc_idle, NULL) == 0) made++;
+    expect("four threads", made, 4);
+    expect("five entries of task", proc_task_entries(), 5);
+    char path[64], text[512] = {0};
+    snprintf(path, sizeof path, "/proc/%d/status", (int)getpid());
+    int fd = open(path, O_RDONLY);
+    ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    const char *threads_line = n > 0 ? strstr(text, "Threads:") : NULL;
+    expect("status counts five", threads_line != NULL && atoi(threads_line + 8) == 5, 1);
+    /* The file of a thread that is not the main one names it. */
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)getpid(), (int)getpid() + 1);
+    fd = open(path, O_RDONLY);
+    memset(text, 0, sizeof text);
+    n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+    if (fd >= 0) close(fd);
+    expect("the stat of the second thread", n > 0 && atoi(text) == (int)getpid() + 1, 1);
+    proc_threads_stop = 1;
+    for (int i = 0; i < made; i++) pthread_join(threads[i], NULL);
+    expect("one entry again after the joins", proc_task_entries(), 1);
+}
+
 static int proc_fd_role(void) {
     int fd = atoi(argv_seen[2]);
     char text[64] = {0};
@@ -3023,10 +3076,10 @@ static int proc_descriptions(void) {
     expect("handler for the timer", sigaction(SIGALRM, &action, &old), 0);
     timer_t timer_id;
     struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM};
-    struct itimerspec every = {{0, 1000000}, {0, 1000000}};
+    struct itimerspec every = {{0, 10000000}, {0, 10000000}};
     expect("timer for the handler", timer_create(CLOCK_MONOTONIC, &event, &timer_id), 0);
     timer_settime(timer_id, 0, &every, NULL);
-    for (int i = 0; i < 400; i++) {
+    for (int i = 0; i < 4000 && proc_signals < 5; i++) {
         char path[32];
         snprintf(path, sizeof path, "/proc/%d", (int)getpid());
         int dir = open(path, O_RDONLY | O_DIRECTORY);
@@ -3057,6 +3110,7 @@ static int proc_descriptions(void) {
     }
     reap("an exec keeps the description", execed, 0, 0);
     if (up >= 0) close(up);
+    proc_threads();
     if (failures == before) printf("posix-procs: proc descriptions ok\n");
     return failures != before;
 }

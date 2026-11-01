@@ -7521,7 +7521,14 @@ fn ash_dialog() -> Result<(), String> {
         dialog_command(
             &mut run,
             "ls -1 /proc/$$ | sort | tr '\\n' ' '; echo",
-            &["~cmdline stat statm status"],
+            &["~cmdline stat statm status task"],
+        )?;
+        // The threads of a process: its main thread is the one entry of
+        // task, whose number is the PID, and its status counts it.
+        dialog_command(
+            &mut run,
+            "ls -1 /proc/$$/task | grep -cx $$; awk '$1==\"Threads:\" {print $2}' /proc/$$/status; awk '{print $1}' /proc/$$/task/$$/stat | grep -cx $$",
+            &["1", "1", "1"],
         )?;
         dialog_command(
             &mut run,

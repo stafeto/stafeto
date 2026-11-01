@@ -1118,6 +1118,11 @@ pub struct Page {
     /// and an exec keeps it, and the service puts the main thread of a new
     /// image on one of these.
     pub cpus: AtomicU64,
+    /// The places of the process's live threads, bit n for the thread of
+    /// place n (the layer's table of threads; the main thread is place 0):
+    /// the layer sets and clears the bits, and `/proc/<pid>/task` lists
+    /// them. 0 for a process whose layer has not set it yet.
+    pub threads: AtomicU64,
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
@@ -1307,6 +1312,8 @@ pub struct Listing {
     pub ticks: u64,
     /// The bytes of memory charged to the process now (its quota's `used`).
     pub memory: u64,
+    /// The places of its live threads (`Page::threads`).
+    pub threads: u64,
     pub name: [u8; NAME_LEN],
 }
 
@@ -1370,6 +1377,7 @@ impl Listing {
         w.u64(self.ticks)?;
         w.u64(self.memory)?;
         w.u64(self.cpus)?;
+        w.u64(self.threads)?;
         w.bytes(&self.name)
     }
 
@@ -1382,6 +1390,7 @@ impl Listing {
         let ticks = r.u64()?;
         let memory = r.u64()?;
         let cpus = r.u64()?;
+        let threads = r.u64()?;
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         Ok(Self {
@@ -1400,6 +1409,7 @@ impl Listing {
             nice,
             ticks,
             memory,
+            threads,
             name,
         })
     }
@@ -1969,6 +1979,7 @@ mod tests {
             nice: -5,
             ticks: 1 << 40,
             memory: 3 << 20,
+            threads: 0b101,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();

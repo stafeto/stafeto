@@ -3371,6 +3371,9 @@ impl Processes {
                                 .carried_ticks
                                 .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
                             memory: sys::process_memory(&record.process).map_or(0, |m| m.used),
+                            threads: self.pages.page(i).map_or(0, |page| {
+                                page.threads.load(core::sync::atomic::Ordering::Acquire)
+                            }),
                             name: record.name,
                         }
                         .write(w)

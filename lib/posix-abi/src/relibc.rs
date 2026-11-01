@@ -410,6 +410,9 @@ pub unsafe fn attach_main(block: *mut Block) {
     crate::signals::reset_taken_before_live(1);
     place.block.store(block as usize, Ordering::Relaxed);
     place.state.main();
+    // The page's mask of live threads: the main thread alone (an exec
+    // starts it again).
+    crate::process::page().threads.store(1, Ordering::Release);
 }
 
 /// The table of a forked child (spec 2, 3.2): its only thread, number
@@ -446,6 +449,10 @@ pub unsafe fn after_fork(id: u64, native: u64) {
         place.state.after_fork(false);
     }
     EXITS.store(0, Ordering::Release);
+    // The child's page is its own: its one thread's place.
+    if let Some(bit) = 1u64.checked_shl((id as u32).wrapping_sub(1)) {
+        crate::process::page().threads.store(bit, Ordering::Release);
+    }
     // The child has no other thread: the pins of the parent's senders mean
     // nothing in it.
     for pins in &PINS {
@@ -944,6 +951,9 @@ pub unsafe fn create(
     place.floating.store(floating(), Ordering::Relaxed);
     crate::signals::reset_taken_before_live(id);
     place.state.set_flags(LIVE);
+    crate::process::page()
+        .threads
+        .fetch_or(1 << index, Ordering::AcqRel);
     let hook = START_WINDOW.swap(0, Ordering::AcqRel);
     if hook != 0 {
         // SAFETY: only probe_start_window stores a C function with this signature.
@@ -972,6 +982,9 @@ pub unsafe fn create(
             let _guard = TABLE_LOCK.lock();
             place.state.rollback();
         }
+        crate::process::page()
+            .threads
+            .fetch_and(!(1 << index), Ordering::AcqRel);
         wait_unpinned(index);
         undo(
             native.into_raw().0,
@@ -1111,6 +1124,14 @@ pub fn leaving() {
     #[cfg(feature = "thread-probe")]
     crate::signals::probe_queue_native_primary_after_intent(block);
     let own = current();
+    // The thread no longer counts among the live ones of /proc/<pid>/task.
+    if let Some(index) = usize::try_from(own).ok().and_then(|id| id.checked_sub(1))
+        && index < PLACES
+    {
+        crate::process::page()
+            .threads
+            .fetch_and(!(1 << index), Ordering::AcqRel);
+    }
     if let Some(owner) = owner_token(own) {
         detach_open_owner(owner);
     }
