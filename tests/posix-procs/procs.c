@@ -227,6 +227,8 @@ int stafeto_probe_commit_early(int *pid);
 int stafeto_probe_loads(void);
 int stafeto_probe_fork_bare(int (*child)(void *), void *arg, void (*window)(void));
 unsigned long long stafeto_probe_page(int word);
+unsigned long long stafeto_probe_fork_refusal(void);
+unsigned long stafeto_probe_start_refusals(unsigned long long *out, unsigned long n);
 void stafeto_probe_yield(void);
 void stafeto_probe_park(void);
 int stafeto_probe_fork_abort(int *pid);
@@ -2336,7 +2338,21 @@ static int fork_threads(void) {
         fork_trace("pair-b-fork-before", i, 0);
         pid_t b = fork();
         if (b == 0) _exit(0);
-        fork_trace("pair-b-fork-return", i, b);
+        {
+            int err = errno;
+            fork_trace("pair-b-fork-return", i, b);
+            if (a < 0 || b < 0) {
+                /* Where the refused fork stopped, and the process service's
+                 * counts of refused starts by reason. */
+                unsigned long long where = stafeto_probe_fork_refusal();
+                unsigned long long refused[7] = {0};
+                unsigned long counted = stafeto_probe_start_refusals(refused, 7);
+                printf("posix-procs: pair %d forks gave %d and %d, errno %d; step %llu, clone step %llu, status %llu; refused starts (children, loaders, label, generations, pool, create, piece) of %lu:",
+                       i, (int)a, (int)b, err, where & 0xff, (where >> 8) & 0xff, where >> 16, counted);
+                for (unsigned long k = 0; k < counted; k++) printf(" %llu", refused[k]);
+                printf("\n");
+            }
+        }
         fork_trace("pair-a-wait-before", i, a);
         reap("the first of a pair of forks", a, 0, 0);
         fork_trace("pair-a-wait-done", i, failures);
@@ -3071,6 +3087,7 @@ static int role(const char *name) {
          * the process whose heap other stages measure. */
         spawn_names();
         dup3_across_fork();
+        if (failures != 0) printf("posix-procs: spawnnames: %d checks failed; exit 1\n", failures);
         return failures != 0;
     }
     if (strcmp(name, "writefd6") == 0) {
@@ -3159,6 +3176,13 @@ static int role(const char *name) {
         return 3;
     }
     if (strcmp(name, "exit7") == 0) return 7;
+    if (strcmp(name, "gate3") == 0 || strcmp(name, "gate7") == 0) {
+        /* Ends once the parent writes a byte to the pipe at 6. */
+        char byte;
+        while (read(6, &byte, 1) < 0 && errno == EINTR) {
+        }
+        return name[4] - '0';
+    }
     if (strcmp(name, "segv") == 0) {
         volatile int *zero = NULL;
         return *zero;
@@ -4609,6 +4633,28 @@ static void chld_action(void (*handler)(int), int flags) {
     chld_handled = 0;
 }
 
+/* The pipes of the two children of the SIGCHLD wait test, and the flags
+ * of its helper thread. */
+struct gate_helper {
+    int slow[2];
+    int quick[2];
+    volatile int entering;
+    volatile int done;
+};
+
+/* Writes the byte that ends the quick child once the main thread is about
+ * to enter waitpid (its flag) and had 150 ms to be inside; after 3 s
+ * without the end of the wait, the byte of the slow one as well. */
+static void *gate_writer(void *arg) {
+    struct gate_helper *gate = arg;
+    while (!gate->entering) pause_ms(1);
+    pause_ms(150);
+    write(gate->quick[1], "x", 1);
+    for (int n = 0; n < 600 && !gate->done; n++) pause_ms(5);
+    if (!gate->done) write(gate->slow[1], "x", 1);
+    return NULL;
+}
+
 static void shell_signals(void) {
     sigset_t chld, pending;
     sigemptyset(&chld);
@@ -4657,14 +4703,43 @@ static void shell_signals(void) {
     /* ash: SIGCHLD caught without SA_RESTART; another child's end ends a
      * waitpid with EINTR, and the waitpid repeated takes its child. */
     chld_action(on_chld, 0);
-    pid_t nap = start("nap");
-    pid_t quick = start("exit7");
+    /* Both children wait for a byte of a pipe. A helper thread writes the
+     * byte of `quick` once the main thread has set its flag and had time
+     * to enter waitpid; the byte of `nap` comes after the interrupted wait
+     * (and from the helper after 3 s, so a SIGCHLD that never comes ends
+     * the test with a failure). Nothing here depends on how long a child
+     * takes to start. */
+    struct gate_helper gate;
+    expect("pipes of the gated children", pipe(gate.slow) | pipe(gate.quick), 0);
+    posix_spawn_file_actions_t gate_actions;
+    pid_t nap = -1, quick = -1;
+    posix_spawn_file_actions_init(&gate_actions);
+    posix_spawn_file_actions_adddup2(&gate_actions, gate.slow[0], 6);
+    expect("spawn of the child waitpid waits for", spawn(&nap, "gate3", &gate_actions, NULL), 0);
+    posix_spawn_file_actions_destroy(&gate_actions);
+    posix_spawn_file_actions_init(&gate_actions);
+    posix_spawn_file_actions_adddup2(&gate_actions, gate.quick[0], 6);
+    expect("spawn of the other child", spawn(&quick, "gate7", &gate_actions, NULL), 0);
+    posix_spawn_file_actions_destroy(&gate_actions);
+    gate.entering = 0;
+    gate.done = 0;
+    pthread_t gate_thread;
+    pthread_create(&gate_thread, NULL, gate_writer, &gate);
     int status = -1;
+    gate.entering = 1;
     pid_t gotpid = waitpid(nap, &status, 0);
-    expect("waitpid in another child's SIGCHLD", gotpid == -1 ? errno : 0, EINTR);
+    int wait_errno = errno;
+    gate.done = 1;
+    write(gate.slow[1], "x", 1);
+    pthread_join(gate_thread, NULL);
+    expect("waitpid in another child's SIGCHLD", gotpid == -1 ? wait_errno : 0, EINTR);
     expect("the SIGCHLD handler ran", chld_handled >= 1, 1);
     reap("the child that waitpid waited for", nap, 3, 0);
     reap("the child whose end interrupted it", quick, 7, 0);
+    close(gate.slow[0]);
+    close(gate.slow[1]);
+    close(gate.quick[0]);
+    close(gate.quick[1]);
 
     /* sigsuspend: SIGCHLD blocked until the wait, a child's end wakes it. */
     sigprocmask(SIG_BLOCK, &chld, NULL);
@@ -5184,7 +5259,10 @@ int main(int argc, char **argv) {
 #endif
     printf("posix-procs: stage spawn_names\n");
     run_with("/bin/procs-child", "spawnnames", NULL, NULL);
-    if (failures != 0) return 1;
+    if (failures != 0) {
+        printf("posix-procs: %d checks failed above; exit 1\n", failures);
+        return 1;
+    }
     printf("posix-procs: ok\n");
     /* Stage 10: this process is a record of init's table, whose end line
      * init reads from the new image: an exec of a child's role that exits

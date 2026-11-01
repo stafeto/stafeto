@@ -152,6 +152,12 @@ pub fn query() -> Result<Query, Error> {
     })
 }
 
+/// Whether this thread's entries are deferred (`defer_entries`), for the
+/// checks of code that asks a request again after a signal woke its wait.
+pub fn entries_deferred() -> bool {
+    query().is_ok_and(|q| q.deferred != 0)
+}
+
 /// `Adopt`: a thread that never entered takes the nesting `Query` gave for
 /// the thread it copies (a child of `fork` inside a handler).
 pub fn adopt(depth: u64, deferred: u64) -> Result<(), Error> {
