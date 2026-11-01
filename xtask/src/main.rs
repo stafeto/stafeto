@@ -34,6 +34,7 @@ mod cpus_dialog;
 mod cyrillic;
 mod disasm;
 mod entropy;
+mod guards;
 mod htop_dialog;
 mod image;
 mod jobs;
@@ -3558,7 +3559,10 @@ fn posix_sock_steps() -> Result<(), String> {
         text += &format!("pipe {kind} {name} {ticks} {detail}\n");
         println!("pipe service {name}: {ticks} ticks, detail {detail}, B {TERM_B}");
     }
-    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0) || (43..=44).contains(&r.0)).count();
+    let sockets = rows
+        .iter()
+        .filter(|r| (26..=39).contains(&r.0) || (43..=44).contains(&r.0))
+        .count();
     if sockets < 8 {
         return Err(format!("the socket calls ran too few kinds: {rows:?}"));
     }
@@ -7998,7 +8002,20 @@ fn os_test_headers(args: &[String]) -> Result<(), String> {
             .arg("--link-plan")
             .arg(plan)
             .args(args),
-    )
+    )?;
+    // A whole run is checked against the tests that were good before.
+    if args.is_empty() {
+        let table = target_dir().join("measure/os-test-headers.tsv");
+        let text =
+            std::fs::read_to_string(&table).map_err(|e| format!("{}: {e}", table.display()))?;
+        guards::check(
+            "os-test headers",
+            "Tests of os-test include and namespace with outcome good in cargo xtask os-test-headers; STAFETO_BLESS=1 cargo xtask os-test-headers rewrites it",
+            &guards::headers_passed(&text),
+            &root().join("tests/os-test/headers-pass.txt"),
+        )?;
+    }
+    Ok(())
 }
 
 fn ls_probe() -> Result<(), String> {
