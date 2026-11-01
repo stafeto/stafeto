@@ -382,6 +382,13 @@ pub enum Method {
     /// reading when the description is open for reading, and for writing when
     /// it is open for writing and not for appending. Reply: status.
     ShareGrant = 62,
+    /// No body. The file service takes the jobs for the files of XSI shared
+    /// memory segments from the pipe service (one call of BROKER_JOBS gives one
+    /// job: the removal of a file takes a step of the service) and runs them: a new owner, group and mode of the file
+    /// `/dev/shm/.sysvN`, or its removal. Reply: status, more u32 (1 when jobs
+    /// are left, to be asked again). Any session may ask: it carries no
+    /// authority, the jobs come from the pipe service alone.
+    IpcJobs = 63,
 }
 
 impl Method {
@@ -449,6 +456,7 @@ impl Method {
             60 => Some(Self::OpenFifoGrant),
             61 => Some(Self::OpenFifoAck),
             62 => Some(Self::ShareGrant),
+            63 => Some(Self::IpcJobs),
             _ => None,
         }
     }
@@ -457,7 +465,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 54,
-    55, 56, 57, 58, 59, 60, 61, 62,
+    55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {

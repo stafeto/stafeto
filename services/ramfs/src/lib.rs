@@ -45,6 +45,7 @@ pub mod places;
 pub mod resolve;
 #[cfg(test)]
 mod resolve_tests;
+pub mod segments;
 pub mod storage;
 #[cfg(test)]
 mod storage_tests;
