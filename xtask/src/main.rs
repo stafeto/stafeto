@@ -34,6 +34,7 @@ mod cpus_dialog;
 mod cyrillic;
 mod disasm;
 mod entropy;
+mod guards;
 mod htop_dialog;
 mod image;
 mod jobs;
@@ -3550,7 +3551,7 @@ fn posix_sock_steps() -> Result<(), String> {
     let mut text = String::new();
     for (kind, ticks, detail) in &rows {
         let name = match kind {
-            26..=39 => format!("socket call {kind}"),
+            26..=39 | 43 | 44 => format!("socket call {kind}"),
             64 => "heartbeat".to_owned(),
             65 => "own step".to_owned(),
             _ => format!("method {kind}"),
@@ -3558,7 +3559,10 @@ fn posix_sock_steps() -> Result<(), String> {
         text += &format!("pipe {kind} {name} {ticks} {detail}\n");
         println!("pipe service {name}: {ticks} ticks, detail {detail}, B {TERM_B}");
     }
-    let sockets = rows.iter().filter(|r| (26..=39).contains(&r.0)).count();
+    let sockets = rows
+        .iter()
+        .filter(|r| (26..=39).contains(&r.0) || (43..=44).contains(&r.0))
+        .count();
     if sockets < 8 {
         return Err(format!("the socket calls ran too few kinds: {rows:?}"));
     }
@@ -3656,6 +3660,25 @@ fn posix_ipc_steps() -> Result<(), String> {
         .map(|r| r.1)
         .max()
         .unwrap_or(0);
+    // The file service takes the jobs for the files of segments (IPC_JOBS, kind
+    // 63): its step waits in `send` for the pipe service's BROKER_JOBS (kind 45,
+    // in the rows above) and runs one job or one portion of a removal.
+    check_waits(&lines, &["2", "4"], "IPC job steps")?;
+    let files = longest_steps(&lines, "2");
+    let Some(jobs) = files.iter().find(|row| row.0 == 63 && row.1 != 0) else {
+        return Err(format!("the file service ran no IPC_JOBS step: {files:?}"));
+    };
+    let waits = longest_waits(&lines, "2")
+        .into_iter()
+        .find(|row| row.0 == 63)
+        .map_or(0, |row| row.1);
+    println!(
+        "file service IPC_JOBS: {} ticks, wait in send {waits} ticks (of CALL_WAIT_MAX {CALL_WAIT_MAX})",
+        jobs.1
+    );
+    if let Some(row) = files.iter().find(|r| r.0 != 64 && r.1 > TERM_B * 9 / 10) {
+        return Err(format!("the file service: a step past 0.9 of B: {row:?}"));
+    }
     println!("posix-ipc-steps: the worst step {worst} of B {TERM_B}");
     Ok(())
 }
@@ -3665,7 +3688,7 @@ const fn ipc_programs(steps: &'static [&'static str]) -> [ImageProgram; 11] {
         ("init", "init", INIT_STACK_SIZE, &["table-posix-ipc"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
-        POSIX_PROCS_PROGRAMS[1],
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, steps),
         ("pipe", "pipe", PIPE_STACK_SIZE, steps),
         POSIX_PROCS_PROGRAMS[3],
         POSIX_PROCS_PROGRAMS[4],
@@ -7998,7 +8021,20 @@ fn os_test_headers(args: &[String]) -> Result<(), String> {
             .arg("--link-plan")
             .arg(plan)
             .args(args),
-    )
+    )?;
+    // A whole run is checked against the tests that were good before.
+    if args.is_empty() {
+        let table = target_dir().join("measure/os-test-headers.tsv");
+        let text =
+            std::fs::read_to_string(&table).map_err(|e| format!("{}: {e}", table.display()))?;
+        guards::check(
+            "os-test headers",
+            "Tests of os-test include and namespace with outcome good in cargo xtask os-test-headers; STAFETO_BLESS=1 cargo xtask os-test-headers rewrites it",
+            &guards::headers_passed(&text),
+            &root().join("tests/os-test/headers-pass.txt"),
+        )?;
+    }
+    Ok(())
 }
 
 fn ls_probe() -> Result<(), String> {

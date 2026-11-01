@@ -161,6 +161,11 @@ pub enum Block {
     Recv,
     /// A `semop` on a semaphore (and whether for it to be zero).
     Sem(u8, bool),
+    /// A `sem_wait` on a named semaphore, at the level of the thread that
+    /// waits (the greater the more urgent). It is kept in `blocked` only:
+    /// no place of the eight of a wait queue is taken, and a post wakes the
+    /// one that is first by level, then by age (`named_balance`).
+    Named(u8),
 }
 
 /// What a call came to: done, or to wait at a queue.
@@ -441,6 +446,27 @@ struct Blocked {
     /// The wait queue it waits at.
     queue: u32,
     block: Block,
+    /// The order of a named semaphore's waiters: when it began to wait.
+    seq: u64,
+    /// What a named semaphore's waiter has had of the semaphore.
+    state: Wait,
+}
+
+/// The state of a waiter for a named semaphore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// In the queue.
+    Waiting,
+    /// A post gave it the unit directly: its take returns without waiting and
+    /// the value is not touched. A waiter that leaves holding the unit
+    /// passes it on.
+    Granted,
+    /// Its take took the unit.
+    Taken,
+    /// The semaphore went under it; it is to be told (one in each step), and
+    /// whether it was told.
+    Gone,
+    GoneTold,
 }
 
 pub struct Ipc {
@@ -453,11 +479,27 @@ pub struct Ipc {
     blocked: [Blocked; BLOCKED_MAX],
     /// The places of `blocked` in use: the common case, none, costs nothing.
     counted: u8,
+    /// The age the next waiter of a named semaphore gets.
+    wait_seq: u64,
+    /// The units of a named semaphore to hand to a waiter (or to the value)
+    /// that the end of a granted waiter left, and the semaphores that have
+    /// waiters to tell they went: `step` does one of them in each step, so
+    /// that no step wakes many.
+    owed: [u8; SEMSETS],
+    gone_sets: u8,
+    /// The places of segments whose file's removal the file service has not
+    /// taken: a new segment does not get them.
+    busy_segs: u8,
     /// The senders that wait for the pool of messages.
     pool: End,
-    /// The serial and the creator's uid of freed segments whose file is left.
-    reap: [(u64, u32); REAP_MAX],
-    reaped: u8,
+    /// The jobs of the files of segments (module `proto_pipe::jobs`): the
+    /// owner, group and mode a file is to get, one for each file, and the
+    /// files to remove.
+    own: [Option<(u64, u32, u32, u32)>; SEGS],
+    removals: [(u64, u8); REAP_MAX],
+    removals_len: u8,
+    /// A job was made with nobody to call the file service for it.
+    notify_due: bool,
     dying: u16,
 }
 
@@ -485,6 +527,8 @@ const BLOCKED_FREE: Blocked = Blocked {
     key: 0,
     queue: 0,
     block: Block::Plain,
+    seq: 0,
+    state: Wait::Waiting,
 };
 
 fn id_of(slot: usize, era: u32) -> u64 {
@@ -532,9 +576,15 @@ impl Ipc {
             holds: [HOLD_FREE; HOLD_MAX],
             blocked: [BLOCKED_FREE; BLOCKED_MAX],
             counted: 0,
+            wait_seq: 0,
+            owed: [0; SEMSETS],
+            gone_sets: 0,
+            busy_segs: 0,
             pool: End::NONE,
-            reap: [(0, 0); REAP_MAX],
-            reaped: 0,
+            own: [None; SEGS],
+            removals: [(0, 0); REAP_MAX],
+            removals_len: 0,
+            notify_due: false,
             dying: 0,
         }
     }
@@ -603,30 +653,85 @@ impl Ipc {
         Self::wake(self.pool.waiters, wakes);
     }
 
-    /// The freed segment `serial`, of the creator `uid`, has its file left.
-    fn reap_push(&mut self, serial: u64, uid: u32) {
-        if usize::from(self.reaped) == REAP_MAX {
-            self.reap.copy_within(1.., 0);
-            self.reaped -= 1;
-        }
-        self.reap[usize::from(self.reaped)] = (serial, uid);
-        self.reaped += 1;
+    /// The file of the segment `serial` is to get this owner, group and
+    /// mode; a later job of the file replaces the earlier.
+    fn job_own(&mut self, serial: u64, uid: u32, gid: u32, mode: u32) {
+        let job = Some((serial, uid, gid, mode));
+        let at = self
+            .own
+            .iter()
+            .position(|j| j.is_some_and(|j| j.0 == serial))
+            .or_else(|| self.own.iter().position(Option::is_none))
+            .unwrap_or(0);
+        self.own[at] = job;
+        self.notify_due = true;
     }
 
-    /// The serial of a freed segment the caller may remove the file of (its
-    /// creator, or the superuser), or 0.
-    fn reap_take(&mut self, c: &Cred) -> u64 {
-        let n = usize::from(self.reaped);
-        let Some(at) = self.reap[..n]
-            .iter()
-            .position(|&(_, uid)| c.uid == 0 || c.uid == uid)
-        else {
-            return 0;
-        };
-        let (serial, _) = self.reap[at];
-        self.reap.copy_within(at + 1..n, at);
-        self.reaped -= 1;
-        serial
+    /// The segment `serial` in place `slot` is freed: its file is to be
+    /// removed (the jobs that change it go). The place is not given to
+    /// another segment until the file service has taken the job, so the jobs
+    /// of removal are never more than the places and none is dropped.
+    fn job_remove(&mut self, slot: usize, serial: u64) {
+        for j in &mut self.own {
+            if j.is_some_and(|j| j.0 == serial) {
+                *j = None;
+            }
+        }
+        debug_assert!(usize::from(self.removals_len) < REAP_MAX);
+        self.removals[usize::from(self.removals_len)] = (serial, slot as u8);
+        self.removals_len += 1;
+        self.busy_segs |= 1 << slot;
+        self.notify_due = true;
+    }
+
+    /// Whether jobs are waiting for the file service.
+    pub fn jobs_left(&self) -> bool {
+        self.removals_len != 0 || self.own.iter().any(Option::is_some)
+    }
+
+    /// Up to JOBS_MAX jobs, the changes first, and whether jobs are left.
+    pub fn take_jobs(
+        &mut self,
+    ) -> (
+        [Option<proto_pipe::jobs::Job>; proto_pipe::jobs::JOBS_MAX],
+        bool,
+    ) {
+        use proto_pipe::jobs::{JOBS_MAX, Job};
+        let mut out = [None; JOBS_MAX];
+        let mut n = 0;
+        for j in &mut self.own {
+            if n == JOBS_MAX {
+                break;
+            }
+            if let Some((serial, uid, gid, mode)) = j.take() {
+                out[n] = Some(Job::Own {
+                    serial,
+                    uid,
+                    gid,
+                    mode,
+                });
+                n += 1;
+            }
+        }
+        while n < JOBS_MAX && self.removals_len != 0 {
+            let (serial, slot) = self.removals[0];
+            out[n] = Some(Job::Remove { serial });
+            self.busy_segs &= !(1 << slot);
+            n += 1;
+            self.removals.copy_within(1.., 0);
+            self.removals_len -= 1;
+        }
+        (out, self.jobs_left())
+    }
+
+    /// Whether the file service is to be told of jobs.
+    pub fn notify_pending(&self) -> bool {
+        self.notify_due
+    }
+
+    /// The file service was told.
+    pub fn notify_done(&mut self) {
+        self.notify_due = false;
     }
 
     /// Puts a message at the end of the list of queue `q`, or before the
@@ -941,32 +1046,155 @@ impl Ipc {
                 key,
                 queue,
                 block,
+                seq: self.wait_seq,
+                state: Wait::Waiting,
             };
+            self.wait_seq += 1;
         }
     }
 
-    /// The operation (`label`, `key`) waits no more.
-    pub fn wait_done(&mut self, label: u64, key: u64) {
+    /// The operation (`label`, `key`) waits no more. A waiter for a named
+    /// semaphore that leaves holding the unit a post gave it hands the unit on
+    /// (one scan, one wake).
+    pub fn wait_done(&mut self, label: u64, key: u64, wakes: &mut Wakes) {
         if let Some(at) = Self::blocked_place(key) {
             let b = &mut self.blocked[at];
             if b.used && b.label == label && b.key == key {
+                let (queue, block, state) = (b.queue, b.block, b.state);
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
+                if matches!(block, Block::Named(_))
+                    && state == Wait::Granted
+                    && let Some(s) = Self::set_of(queue)
+                {
+                    self.pass_on(s, wakes);
+                }
             }
         }
     }
 
-    /// Every operation of the session waits no more.
+    /// Every operation of the session waits no more. The units its granted
+    /// waiters held are owed to the others: `step` hands them on.
     pub fn forget(&mut self, label: u64) {
         if self.counted == 0 {
             return;
         }
         for b in &mut self.blocked {
             if b.used && b.label == label {
+                if let Block::Named(_) = b.block
+                    && b.state == Wait::Granted
+                    && let Some(s) = Self::set_of(b.queue)
+                {
+                    self.owed[s] += 1;
+                }
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
             }
         }
+    }
+
+    /// The slot of the named semaphore the wait queue `queue` is of.
+    fn set_of(queue: u32) -> Option<usize> {
+        queue
+            .checked_sub(Self::set_number(0))
+            .map(|d| d as usize)
+            .filter(|&s| s < SEMSETS)
+    }
+
+    /// The waiter of the named semaphore in slot `s` that comes first: the
+    /// greater level, the older among equals. O(BLOCKED_MAX).
+    fn first_waiter(&self, s: usize) -> Option<usize> {
+        let queue = Self::set_number(s);
+        let mut best: Option<(usize, u8, u64)> = None;
+        for (at, b) in self.blocked.iter().enumerate() {
+            let Block::Named(level) = b.block else {
+                continue;
+            };
+            if !b.used || b.queue != queue || b.state != Wait::Waiting {
+                continue;
+            }
+            if best.is_none_or(|(_, l, q)| level > l || (level == l && b.seq < q)) {
+                best = Some((at, level, b.seq));
+            }
+        }
+        best.map(|(at, ..)| at)
+    }
+
+    /// One unit of the named semaphore in slot `s` goes to the waiter that
+    /// comes first, who is told, or to the value when none waits. Whether it
+    /// went (`wakes` had no place: no).
+    fn hand_unit(&mut self, s: usize, wakes: &mut Wakes) -> bool {
+        match self.first_waiter(s) {
+            Some(at) => {
+                let b = &mut self.blocked[at];
+                if !wakes.push((b.label, b.key)) {
+                    return false;
+                }
+                b.state = Wait::Granted;
+            }
+            None => {
+                let v = &mut self.sems[s].vals[0];
+                *v = (u32::from(*v) + 1).min(SEM_VALUE_MAX) as u16;
+            }
+        }
+        true
+    }
+
+    /// A unit that a granted waiter left: handed on now, or owed to a step.
+    fn pass_on(&mut self, s: usize, wakes: &mut Wakes) {
+        if !self.hand_unit(s, wakes) {
+            self.owed[s] += 1;
+        }
+    }
+
+    /// The named semaphore in slot `s` goes (unlinked and closed by all):
+    /// its waiters, which only a close made under their feet can leave, are
+    /// marked and told one in each step; none of them is picked again by a
+    /// semaphore of the same slot.
+    fn named_gone(&mut self, s: usize) {
+        if self.counted == 0 {
+            return;
+        }
+        let queue = Self::set_number(s);
+        let mut any = false;
+        for b in &mut self.blocked {
+            if b.used && b.queue == queue && matches!(b.block, Block::Named(_)) {
+                b.state = Wait::Gone;
+                any = true;
+            }
+        }
+        self.owed[s] = 0;
+        if any {
+            self.gone_sets |= 1 << s;
+        }
+    }
+
+    /// One of the hand-overs and the tellings that calls left, if any.
+    fn named_step(&mut self, wakes: &mut Wakes) -> bool {
+        if let Some(s) = self.owed.iter().position(|&n| n != 0) {
+            if self.hand_unit(s, wakes) {
+                self.owed[s] -= 1;
+            }
+            return true;
+        }
+        if self.gone_sets != 0 {
+            let s = self.gone_sets.trailing_zeros() as usize;
+            let queue = Self::set_number(s);
+            match self
+                .blocked
+                .iter_mut()
+                .find(|b| b.used && b.queue == queue && b.state == Wait::Gone)
+            {
+                Some(b) => {
+                    if wakes.push((b.label, b.key)) {
+                        b.state = Wait::GoneTold;
+                    }
+                }
+                None => self.gone_sets &= !(1 << s),
+            }
+            return true;
+        }
+        false
     }
 
     /// Wakes the list of a queue or set when the object is gone or changed.
@@ -991,17 +1219,18 @@ impl Ipc {
                 self.dying += 1;
             }
         }
-        self.dying != 0
+        self.due()
     }
 
     pub fn due(&self) -> bool {
-        self.dying != 0
+        self.dying != 0 || self.gone_sets != 0 || self.owed.iter().any(|&n| n != 0)
     }
 
     /// One adjustment or hold of a session that went is let go of. Whether
     /// another step is due.
     pub fn step(&mut self, wakes: &mut Wakes) -> bool {
-        if let Some(at) = self.undo.iter().position(|u| u.used && u.dying) {
+        if self.named_step(wakes) {
+        } else if let Some(at) = self.undo.iter().position(|u| u.used && u.dying) {
             let u = self.undo[at];
             self.undo[at] = UNDO_FREE;
             self.dying -= 1;
@@ -1022,10 +1251,10 @@ impl Ipc {
                 if set.live && set.era == h.era {
                     set.opens = set.opens.saturating_sub(h.count);
                     if set.unlinked && set.opens == 0 {
-                        Self::wake(set.waiters.waiters, wakes);
                         let era = set.era;
                         *set = SemSet::FREE;
                         set.era = era;
+                        self.named_gone(o);
                     }
                 }
             } else {
@@ -1033,15 +1262,15 @@ impl Ipc {
                 if seg.live && seg.era == h.era {
                     seg.nattch = seg.nattch.saturating_sub(h.count);
                     if seg.removed && seg.nattch == 0 {
-                        let (era, serial, uid) = (seg.era, seg.serial, seg.perm.cuid);
+                        let (era, serial) = (seg.era, seg.serial);
                         *seg = Seg::FREE;
                         seg.era = era;
-                        self.reap_push(serial, uid);
+                        self.job_remove(o, serial);
                     }
                 }
             }
         }
-        self.dying != 0
+        self.due()
     }
 
     /// The holds of `parent` the child `child` gets at fork (shared segments
@@ -1595,8 +1824,7 @@ impl Ipc {
             out.word(id_of(g, self.segs[g].era));
             out.word(self.segs[g].serial);
             out.word(0);
-            let reap = self.reap_take(c);
-            out.word(reap);
+            out.word(0);
             return Ok(());
         }
         if key != 0 && flags & IPC_CREAT == 0 {
@@ -1623,7 +1851,9 @@ impl Ipc {
         if self.segs.iter().any(|g| g.live && g.serial == nonce) {
             return Err(fail(EEXIST));
         }
-        let g = self.segs.iter().position(|g| !g.live).ok_or(fail(ENOSPC))?;
+        let g = (0..SEGS)
+            .find(|&g| !self.segs[g].live && self.busy_segs & 1 << g == 0)
+            .ok_or(fail(ENOSPC))?;
         let era = self.segs[g].era.wrapping_add(1);
         self.segs[g] = Seg {
             live: true,
@@ -1639,8 +1869,7 @@ impl Ipc {
         out.word(id_of(g, era));
         out.word(nonce);
         out.word(1);
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1663,8 +1892,7 @@ impl Ipc {
         out.word(seg.size);
         out.word(u64::from(seg.perm.uid));
         out.word(u64::from(seg.perm.cuid));
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1679,21 +1907,19 @@ impl Ipc {
             seg.lpid = c.pid;
         }
         if seg.removed && seg.nattch == 0 {
-            let (serial, creator) = (seg.serial, seg.perm.cuid);
+            let serial = seg.serial;
             out.word(1);
-            out.word(serial);
+            // The file is the file service's to remove (a job): the library
+            // is given no number to remove.
+            out.word(0);
             *seg = Seg::FREE;
             seg.era = era;
-            // The caller removes the file; another user's, left to its creator.
-            if c.uid != creator && c.uid != 0 {
-                self.reap_push(serial, creator);
-            }
+            self.job_remove(g, serial);
         } else {
             out.word(0);
             out.word(seg.serial);
         }
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1718,8 +1944,7 @@ impl Ipc {
                 ] {
                     out.word(v);
                 }
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(0);
                 Ok(())
             }
             IPC_SET => {
@@ -1731,10 +1956,16 @@ impl Ipc {
                 seg.perm.gid = w[6] as u32;
                 seg.perm.mode = (w[7] & 0o777) as u16;
                 seg.ctime = c.now;
+                let (serial, uid, gid, mode) = (
+                    seg.serial,
+                    seg.perm.uid,
+                    seg.perm.gid,
+                    u32::from(seg.perm.mode),
+                );
                 out.word(0);
-                out.word(seg.serial);
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(serial);
+                self.job_own(serial, uid, gid, mode);
+                out.word(0);
                 Ok(())
             }
             IPC_RMID => {
@@ -1743,14 +1974,12 @@ impl Ipc {
                     return Err(fail(EPERM));
                 }
                 if seg.nattch == 0 {
-                    let (serial, era, creator) = (seg.serial, seg.era, seg.perm.cuid);
+                    let (serial, era) = (seg.serial, seg.era);
                     *seg = Seg::FREE;
                     seg.era = era;
                     out.word(1);
-                    out.word(serial);
-                    if c.uid != creator && c.uid != 0 {
-                        self.reap_push(serial, creator);
-                    }
+                    out.word(0);
+                    self.job_remove(g, serial);
                 } else {
                     // The key goes now; the segment goes with its last detach.
                     seg.removed = true;
@@ -1758,8 +1987,7 @@ impl Ipc {
                     out.word(0);
                     out.word(seg.serial);
                 }
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(0);
                 Ok(())
             }
             _ => Err(fail(EINVAL)),
@@ -1826,7 +2054,7 @@ impl Ipc {
         Ok(id_of(s, era))
     }
 
-    fn nsem_unlink(&mut self, name: &[u8], c: &Cred, wakes: &mut Wakes) -> Result<(), u32> {
+    fn nsem_unlink(&mut self, name: &[u8], c: &Cred) -> Result<(), u32> {
         let s = self
             .sems
             .iter()
@@ -1840,57 +2068,76 @@ impl Ipc {
         }
         set.unlinked = true;
         if set.opens == 0 {
-            Self::wake(set.waiters.waiters, wakes);
             let era = set.era;
             *set = SemSet::FREE;
             set.era = era;
+            self.named_gone(s);
         }
         Ok(())
     }
 
-    fn nsem_close(&mut self, label: u64, w: &[u64], wakes: &mut Wakes) -> Result<(), u32> {
+    fn nsem_close(&mut self, label: u64, w: &[u64]) -> Result<(), u32> {
         let s = self.sem_set(w[0], false)?;
         let era = self.sems[s].era;
         if self.hold_drop(label, true, s, era) {
             let set = &mut self.sems[s];
             set.opens = set.opens.saturating_sub(1);
             if set.unlinked && set.opens == 0 {
-                Self::wake(set.waiters.waiters, wakes);
                 *set = SemSet {
                     era,
                     ..SemSet::FREE
                 };
+                self.named_gone(s);
             }
         }
         Ok(())
     }
 
+    /// `sem_wait` (`w[1]` 0) and `sem_trywait`. A semaphore with a positive
+    /// value has no waiter (a post gives its unit to the first waiter, and the
+    /// value stays), so a caller that finds a value takes it; a waiter that
+    /// was given the unit takes it by its next take, and the value is not
+    /// touched.
     fn nsem_wait(
         &mut self,
         label: u64,
+        key: Option<u64>,
         w: &[u64],
         c: &Cred,
         retry: bool,
-        wakes: &mut Wakes,
     ) -> Result<Flow, u32> {
         let s = self.sem_set(w[0], retry)?;
-        let set = &mut self.sems[s];
-        if !set.named {
+        if !self.sems[s].named {
             return Err(fail(EINVAL));
         }
-        let _ = label;
+        if let Some(at) = key.and_then(Self::blocked_place) {
+            let b = &mut self.blocked[at];
+            if b.used
+                && b.label == label
+                && Some(b.key) == key
+                && b.queue == Self::set_number(s)
+                && b.state == Wait::Granted
+            {
+                b.state = Wait::Taken;
+                self.sems[s].pids[0] = c.pid;
+                return Ok(Flow::Done);
+            }
+        }
+        let set = &mut self.sems[s];
         if set.vals[0] > 0 {
             set.vals[0] -= 1;
             set.pids[0] = c.pid;
             return Ok(Flow::Done);
         }
-        let _ = wakes;
         if w[1] != 0 {
             return Err(fail(EAGAIN));
         }
+        // The level of the waiter follows the credentials, when the layer
+        // sent one (a request without it waits at the level 0).
+        let level = w.get(2 + Cred::WORDS).copied().unwrap_or(0).min(255) as u8;
         Ok(Flow::Wait {
             queue: Self::set_number(s),
-            block: Block::Plain,
+            block: Block::Named(level),
         })
     }
 
@@ -1903,9 +2150,8 @@ impl Ipc {
         if u32::from(set.vals[0]) >= SEM_VALUE_MAX {
             return Err(fail(EOVERFLOW));
         }
-        set.vals[0] += 1;
         set.pids[0] = c.pid;
-        Self::wake(set.waiters.waiters, wakes);
+        self.pass_on(s, wakes);
         Ok(())
     }
 
@@ -2171,18 +2417,18 @@ impl Pipes {
                 need(Cred::WORDS)?;
                 let c = cred(0)?;
                 let name = Ipc::name_ok(call.bytes)?;
-                self.ipc.nsem_unlink(name, &c, wakes)?;
+                self.ipc.nsem_unlink(name, &c)?;
                 Ok(Flow::Done)
             }
             op::NSEM_CLOSE => {
                 need(1)?;
-                self.ipc.nsem_close(label, w, wakes)?;
+                self.ipc.nsem_close(label, w)?;
                 Ok(Flow::Done)
             }
             op::NSEM_WAIT => {
                 need(2 + Cred::WORDS)?;
                 let c = cred(2)?;
-                self.ipc.nsem_wait(label, w, &c, retry, wakes)
+                self.ipc.nsem_wait(label, call.key, w, &c, retry)
             }
             op::NSEM_POST => {
                 need(1 + Cred::WORDS)?;
@@ -2376,8 +2622,8 @@ impl Pipes {
     }
 
     /// An operation that waited is over.
-    pub fn ipc_wait_done(&mut self, label: u64, key: u64) {
-        self.ipc.wait_done(label, key);
+    pub fn ipc_wait_done(&mut self, label: u64, key: u64, wakes: &mut Wakes) {
+        self.ipc.wait_done(label, key, wakes);
     }
 
     /// An operation starts to wait.
@@ -2413,6 +2659,26 @@ impl Pipes {
     pub fn ipc_due(&self) -> bool {
         self.ipc.due()
     }
+
+    /// The jobs for the files of segments (see [Ipc::take_jobs]).
+    pub fn ipc_take_jobs(
+        &mut self,
+    ) -> (
+        [Option<proto_pipe::jobs::Job>; proto_pipe::jobs::JOBS_MAX],
+        bool,
+    ) {
+        self.ipc.take_jobs()
+    }
+
+    /// Whether the file service is to be told of jobs nobody asked it for.
+    pub fn ipc_notify_pending(&self) -> bool {
+        self.ipc.notify_pending()
+    }
+
+    /// The file service was told.
+    pub fn ipc_notify_done(&mut self) {
+        self.ipc.notify_done();
+    }
 }
 
 /// The slot of the description a word names (`SOCK_END | slot`).
@@ -2426,6 +2692,7 @@ const _: () = assert!(MQ_KIND != proto_pipe::sock::STREAM && MQ_KIND != proto_pi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_pipe::jobs::Job;
 
     const WHO: Who = Who {
         uid: 1000,
@@ -2961,7 +3228,7 @@ mod tests {
         );
         r.ok(&mut p, op::SEM_OP, &sem_words(id, &[(0, 1, 0)]), b"");
         assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(3, 3)]);
-        p.ipc_wait_done(1, 3);
+        p.ipc_wait_done(1, 3, &mut Wakes::default());
         p.unwait(queue, (3, 3));
         assert_eq!(
             r.ok(&mut p, op::SEM_CTL, &semctl(id, 0, GETNCNT, 0), b"")
@@ -3147,7 +3414,16 @@ mod tests {
         assert_eq!(rm.words[0], 0, "attached: it stays");
         assert_eq!(r.err(&mut p, op::SHM_AT, &with_cred(&[id, 0]), b""), 43);
         let dt = r.ok(&mut p, op::SHM_DT, &with_cred(&[id]), b"");
-        assert_eq!((dt.words[0], dt.words[1]), (1, serial));
+        assert_eq!(
+            (dt.words[0], dt.words[1]),
+            (1, 0),
+            "gone; the library is given no file to remove"
+        );
+        assert_eq!(
+            p.ipc_take_jobs().0[0],
+            Some(Job::Remove { serial }),
+            "the file service is given the job"
+        );
         assert_eq!(
             r.err(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b""),
             22
@@ -3218,14 +3494,18 @@ mod tests {
         );
         r.ok(&mut p, op::NSEM_WAIT, &with_cred(&[id, 0]), b"");
         let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &with_cred(&[id, 0]), b"", None);
-        let Ok(Flow::Wait { queue, .. }) = flow else {
+        let Ok(Flow::Wait { queue, block }) = flow else {
             panic!()
         };
-        p.wait(queue, (2, 2), |_| true).unwrap();
+        p.ipc_note_wait(1, 2, queue, block);
         assert_eq!(r.err(&mut p, op::NSEM_WAIT, &with_cred(&[id, 1]), b""), 11);
         r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
-        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(2, 2)]);
-        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 1);
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 2)]);
+        assert_eq!(
+            r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0],
+            0,
+            "the post gave its unit to the waiter"
+        );
         r.ok(&mut p, op::NSEM_UNLINK, &cred(), b"/s");
         assert_eq!(
             r.err(&mut p, op::NSEM_OPEN, &with_cred(&[0, 0, 0]), b"/s"),
@@ -3250,6 +3530,242 @@ mod tests {
         let mut w = Wakes::default();
         while p.ipc_step(&mut w) {}
         let _ = id;
+        assert!(!p.ipc.sems.iter().any(|s| s.live));
+    }
+
+    /// Starts the wait of the operation `n` (place `n`) of the session `label`
+    /// on the named semaphore `id` at `level`; whether it waits.
+    fn nsem_wait_at(r: &mut Run, p: &mut Pipes, label: u64, n: u64, id: u64, level: u64) {
+        let words = [id, 0, NOW, level];
+        let (flow, _) = r.call(p, label, op::NSEM_WAIT, &words, b"", None);
+        let Ok(Flow::Wait { queue, block }) = flow else {
+            panic!("the wait {n} did not wait: {flow:?}")
+        };
+        assert_eq!(block, Block::Named(level as u8));
+        p.ipc_note_wait(label, n, queue, block);
+    }
+
+    /// The take of the operation `n` that was given the unit: whether it got
+    /// the semaphore.
+    fn nsem_take(r: &mut Run, p: &mut Pipes, label: u64, n: u64, id: u64) -> bool {
+        let words = [id, 0, NOW];
+        let (flow, _) = r.call(p, label, op::NSEM_WAIT, &words, b"", Some(n));
+        match flow {
+            Ok(Flow::Done) => {
+                p.ipc_wait_done(label, n, &mut r.wakes);
+                true
+            }
+            Ok(Flow::Wait { .. }) => false,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The steps the service takes until none is due, one wake at most in
+    /// each: the operations they told.
+    fn drain(p: &mut Pipes) -> Vec<Waiter> {
+        let mut told = Vec::new();
+        for _ in 0..1000 {
+            let mut w = Wakes::default();
+            let more = p.ipc_step(&mut w);
+            let got: Vec<_> = w.iter().collect();
+            assert!(got.len() <= 1, "a step wakes at most one: {got:?}");
+            told.extend(got);
+            if !more {
+                return told;
+            }
+        }
+        panic!("steps never end");
+    }
+
+    #[test]
+    fn a_named_semaphore_wakes_one_waiter_by_level_then_age() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let w = with_cred(&[O_CREAT, 0o600, 0]);
+        let id = r.ok(&mut p, op::NSEM_OPEN, &w, b"/q").words[0];
+        // Twelve waiters, more than a wait queue holds (eight): levels in
+        // an order that is neither rising nor falling, two of them equal.
+        let levels = [5u64, 9, 1, 20, 7, 20, 3, 12, 9, 2, 15, 8];
+        for (i, level) in levels.iter().enumerate() {
+            nsem_wait_at(&mut r, &mut p, 1, i as u64 + 1, id, *level);
+        }
+        let mut order = Vec::new();
+        for _ in 0..levels.len() {
+            r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+            let woken: Vec<_> = r.wakes.iter().collect();
+            assert_eq!(woken.len(), 1, "a post wakes one waiter");
+            let n = woken[0].1;
+            order.push(levels[n as usize - 1]);
+            assert!(nsem_take(&mut r, &mut p, 1, n, id));
+        }
+        assert_eq!(order, vec![20, 20, 15, 12, 9, 9, 8, 7, 5, 3, 2, 1]);
+        assert_eq!(p.ipc.counted, 0);
+        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 0);
+    }
+
+    #[test]
+    fn equal_levels_wake_in_the_order_of_arrival() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/e",
+            )
+            .words[0];
+        // Places in the table do not follow the arrival: 3, 1, 2.
+        for n in [3u64, 1, 2] {
+            nsem_wait_at(&mut r, &mut p, 1, n, id, 4);
+        }
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+            let n = r.wakes.iter().next().unwrap().1;
+            order.push(n);
+            assert!(nsem_take(&mut r, &mut p, 1, n, id));
+        }
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn a_post_hands_its_unit_to_the_first_waiter_and_nobody_overtakes_it() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/p",
+            )
+            .words[0];
+        nsem_wait_at(&mut r, &mut p, 1, 1, id, 10);
+        nsem_wait_at(&mut r, &mut p, 1, 2, id, 5);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 1)]);
+        // The unit is the waiter's, not the value's: `sem_getvalue` says 0,
+        // a `sem_trywait` and a new `sem_wait` do not get it, the other
+        // waiter's take waits on.
+        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 0);
+        assert_eq!(r.err(&mut p, op::NSEM_WAIT, &with_cred(&[id, 1]), b""), 11);
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &[id, 0, NOW, 30], b"", None);
+        assert!(matches!(flow, Ok(Flow::Wait { .. })));
+        assert!(!nsem_take(&mut r, &mut p, 1, 2, id));
+        // The waiter that was given it leaves (a signal, a deadline): the next
+        // waiter gets the unit.
+        let mut wakes = Wakes::default();
+        p.ipc_wait_done(1, 1, &mut wakes);
+        assert_eq!(wakes.iter().collect::<Vec<_>>(), vec![(1, 2)]);
+        assert!(nsem_take(&mut r, &mut p, 1, 2, id));
+        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 0);
+        // With nobody else waiting the unit goes back to the value.
+        nsem_wait_at(&mut r, &mut p, 1, 4, id, 1);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        let mut wakes = Wakes::default();
+        p.ipc_wait_done(1, 4, &mut wakes);
+        assert_eq!(wakes.iter().count(), 0);
+        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 1);
+        r.ok(&mut p, op::NSEM_WAIT, &with_cred(&[id, 0]), b"");
+        // A session that goes with a granted waiter owes its unit to the
+        // others, handed on by a step.
+        nsem_wait_at(&mut r, &mut p, 7, 5, id, 9);
+        nsem_wait_at(&mut r, &mut p, 8, 6, id, 3);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(7, 5)]);
+        p.ipc_forget(7);
+        assert!(p.ipc_due());
+        assert_eq!(drain(&mut p), vec![(8, 6)]);
+    }
+
+    #[test]
+    fn a_session_that_goes_with_many_granted_waiters_hands_their_units_on_one_step_each() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/m",
+            )
+            .words[0];
+        // Twenty-four waiters of one session, and thirty of others.
+        for n in 1..=24u64 {
+            nsem_wait_at(&mut r, &mut p, 1, n, id, 4);
+        }
+        for n in 25..=54u64 {
+            nsem_wait_at(&mut r, &mut p, 2, n, id, 3);
+        }
+        for _ in 0..24 {
+            r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        }
+        // The session that held the units goes: no wake in the call, and the
+        // units reach the others in steps of one wake.
+        p.ipc_forget(1);
+        let told = drain(&mut p);
+        assert_eq!(told.len(), 24);
+        assert!(told.iter().all(|&(label, _)| label == 2));
+        assert_eq!(p.ipc.counted, 30);
+    }
+
+    #[test]
+    fn the_last_close_tells_every_waiter_one_in_each_step() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/z",
+            )
+            .words[0];
+        for n in 1..=30u64 {
+            nsem_wait_at(&mut r, &mut p, 1, n, id, 4);
+        }
+        r.ok(&mut p, op::NSEM_UNLINK, &cred(), b"/z");
+        r.ok(&mut p, op::NSEM_CLOSE, &[id], b"");
+        let mut told = drain(&mut p);
+        told.sort();
+        assert_eq!(told, (1..=30u64).map(|n| (1, n)).collect::<Vec<_>>());
+        // They find it gone; a semaphore made in the same place is not theirs.
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &[id, 0, NOW], b"", Some(1));
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + 43));
+        let next = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/y",
+            )
+            .words[0];
+        assert_eq!((next - 1) & 31, (id - 1) & 31);
+        nsem_wait_at(&mut r, &mut p, 2, 40, next, 4);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[next]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(2, 40)]);
+    }
+
+    #[test]
+    fn the_death_of_the_last_holder_tells_a_waiter_that_closed_before() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let w = with_cred(&[O_CREAT, 0o600, 0]);
+        let (flow, out) = r.call(&mut p, 1, op::NSEM_OPEN, &w, b"/h", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        let id = out.words[0];
+        let (flow, _) = r.call(
+            &mut p,
+            2,
+            op::NSEM_OPEN,
+            &with_cred(&[0, 0, 0]),
+            b"/h",
+            None,
+        );
+        assert_eq!(flow, Ok(Flow::Done));
+        // A thread of the process 1 waits while another thread closes.
+        nsem_wait_at(&mut r, &mut p, 1, 7, id, 4);
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_CLOSE, &[id], b"", None);
+        assert_eq!(flow, Ok(Flow::Done));
+        r.ok(&mut p, op::NSEM_UNLINK, &cred(), b"/h");
+        assert!(p.ipc.sems[0].live, "the process 2 holds it");
+        assert!(p.ipc_gone(2));
+        assert_eq!(drain(&mut p), vec![(1, 7)]);
         assert!(!p.ipc.sems.iter().any(|s| s.live));
     }
 
@@ -3427,7 +3943,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_segment_names_its_file_to_its_creator_until_it_is_removed() {
+    fn a_segment_freed_by_the_end_of_its_holder_leaves_a_job_and_a_notice() {
         let (mut p, mut r) = (pipes(), Run::new());
         let out = r.ok(
             &mut p,
@@ -3439,16 +3955,27 @@ mod tests {
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
         let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
-        assert_eq!(
-            (rm.words[0], rm.words[2]),
-            (0, 0),
-            "attached: nothing to remove yet"
-        );
-        // The attaching process is killed: its hold goes in a step.
+        assert_eq!((rm.words[0], rm.words[2]), (0, 0), "attached: it stays");
+        assert!(!p.ipc.jobs_left() && !p.ipc_notify_pending());
+        // The attaching process is killed: its hold goes in a step, and the
+        // file of the segment is to go whoever asks next.
         assert!(p.ipc_gone(77));
         let mut w = Wakes::default();
         while p.ipc_step(&mut w) {}
-        // Another user is not told of the file; its creator is, once.
+        assert!(p.ipc.jobs_left());
+        assert!(
+            p.ipc_notify_pending(),
+            "nobody called: the file service is to be told"
+        );
+        // The place of the freed segment is not given to a new one until the
+        // file service has taken the job of its file.
+        let busy = (0..SEGS).filter(|&g| p.ipc.busy_segs & 1 << g != 0).count();
+        assert_eq!(busy, 1);
+        let (jobs, more) = p.ipc_take_jobs();
+        assert_eq!(jobs, [Some(Job::Remove { serial })]);
+        assert!(!more);
+        assert_eq!(p.ipc.busy_segs, 0);
+        // No other caller, whatever its uid, is told of a file to remove.
         r.who.uid = 2000;
         let other = r.ok(
             &mut p,
@@ -3457,21 +3984,95 @@ mod tests {
             b"",
         );
         assert_eq!(other.words[3], 0);
+    }
+
+    #[test]
+    fn a_new_owner_of_a_segment_is_a_job_for_its_file_and_the_last_job_of_a_file_stands() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let out = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
+        let (id, serial) = (out.words[0], out.words[1]);
+        let set = |uid: u64, mode: u64| with_cred(&[id, IPC_SET, 0, uid, 200, mode]);
+        r.ok(&mut p, op::SHM_CTL, &set(2000, 0o640), b"");
+        r.ok(&mut p, op::SHM_CTL, &set(3000, 0o660), b"");
+        let (jobs, more) = p.ipc_take_jobs();
+        assert_eq!(
+            jobs,
+            [Some(Job::Own {
+                serial,
+                uid: 3000,
+                gid: 200,
+                mode: 0o660
+            })]
+        );
+        assert!(!more);
+        // A refused change makes no job.
+        r.who.uid = 4000;
+        assert_eq!(r.err(&mut p, op::SHM_CTL, &set(4000, 0o666), b""), 1);
+        assert!(!p.ipc.jobs_left());
+        // Removed, the segment's file is removed and a change before it goes.
         r.who = WHO;
-        let again = r.ok(
-            &mut p,
-            op::SHM_GET,
-            &with_cred(&[0, 4096, 0o600, nonce()]),
-            b"",
-        );
-        assert_eq!(again.words[3], serial);
-        let third = r.ok(
-            &mut p,
-            op::SHM_GET,
-            &with_cred(&[0, 4096, 0o600, nonce()]),
-            b"",
-        );
-        assert_eq!(third.words[3], 0);
+        r.ok(&mut p, op::SHM_CTL, &set(2000, 0o600), b"");
+        let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
+        assert_eq!((rm.words[0], rm.words[1]), (1, 0));
+        let (jobs, _) = p.ipc_take_jobs();
+        assert_eq!(jobs, [Some(Job::Remove { serial })]);
+    }
+
+    #[test]
+    fn a_place_of_a_segment_waits_for_the_removal_of_its_file_to_be_taken() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let mut ids = Vec::new();
+        for _ in 0..SEGS {
+            let out = r.ok(
+                &mut p,
+                op::SHM_GET,
+                &with_cred(&[0, 4096, 0o600, nonce()]),
+                b"",
+            );
+            ids.push(out.words[0]);
+        }
+        for id in &ids {
+            r.ok(&mut p, op::SHM_CTL, &with_cred(&[*id, IPC_RMID]), b"");
+        }
+        // Nothing lives, but every place has a file to go: no new segment
+        // (and no job is dropped).
+        let new = with_cred(&[0, 4096, 0o600, nonce()]);
+        assert_eq!(r.err(&mut p, op::SHM_GET, &new, b""), 28);
+        let (jobs, more) = p.ipc_take_jobs();
+        assert!(jobs[0].is_some() && more);
+        let new = with_cred(&[0, 4096, 0o600, nonce()]);
+        r.ok(&mut p, op::SHM_GET, &new, b"");
+    }
+
+    #[test]
+    fn jobs_come_a_few_at_a_call_and_the_queue_is_bounded() {
+        let mut ipc = Box::new(Ipc::new());
+        for n in 1..=SEGS as u64 {
+            ipc.job_own(n, 1, 1, 0o600);
+        }
+        // Changes first; a removal of a file takes its change away.
+        ipc.job_remove(2, 3);
+        for slot in [0, 1, 3, 4, 5, 6, 7] {
+            ipc.job_remove(slot, 100 + slot as u64);
+        }
+        let mut seen = 0;
+        let mut calls = 0;
+        loop {
+            let (jobs, more) = ipc.take_jobs();
+            seen += jobs.iter().flatten().count();
+            calls += 1;
+            if !more {
+                break;
+            }
+        }
+        // 7 changes (the file 3 went), and the 8 removals: none is dropped.
+        assert_eq!(seen, SEGS - 1 + SEGS);
+        assert_eq!(calls, seen.div_ceil(proto_pipe::jobs::JOBS_MAX));
     }
 
     #[test]
@@ -3481,9 +4082,10 @@ mod tests {
         ipc.note_wait(3, key, QUEUE_BASE, Block::Recv);
         assert_eq!(ipc.counted, 1);
         // Another label with the same place finds nothing to take away.
-        ipc.wait_done(4, key);
+        let mut wakes = Wakes::default();
+        ipc.wait_done(4, key, &mut wakes);
         assert_eq!(ipc.counted, 1);
-        ipc.wait_done(3, key);
+        ipc.wait_done(3, key, &mut wakes);
         assert_eq!(ipc.counted, 0);
         ipc.note_wait(3, (1 << 32) | 9, QUEUE_BASE, Block::Recv);
         ipc.note_wait(3, (1 << 32) | 10, QUEUE_BASE, Block::Recv);

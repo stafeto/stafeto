@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -166,15 +167,28 @@ static int inet_stream(void) {
     int c2 = socket(AF_INET, SOCK_STREAM, 0), c3 = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(connect(c2, (struct sockaddr *)&addr, sizeof addr) == 0);
     CHECK(connect(c3, (struct sockaddr *)&addr, sizeof addr) == 0);
-    CHECK(connect(d, (struct sockaddr *)&addr, sizeof addr) == -1 && errno == ECONNREFUSED);
+    /* The queue is full: a socket with O_NONBLOCK is told EAGAIN, a blocking one waits for an accept. */
+    CHECK(fcntl(d, F_SETFL, O_NONBLOCK) == 0);
+    CHECK(connect(d, (struct sockaddr *)&addr, sizeof addr) == -1 && errno == EAGAIN);
+    CHECK(fcntl(d, F_SETFL, 0) == 0);
+    pid_t waiter = fork();
+    CHECK(waiter >= 0);
+    if (waiter == 0) _exit(connect(d, (struct sockaddr *)&addr, sizeof addr) == 0 ? 0 : 1);
+    pause_ms(100);
+    int status;
+    CHECK(waitpid(waiter, &status, WNOHANG) == 0);
     int flags = fcntl(l, F_GETFL);
     CHECK(fcntl(l, F_SETFL, flags | O_NONBLOCK) == 0);
-    int s2 = accept(l, NULL, NULL), s3 = accept(l, NULL, NULL);
-    CHECK(s2 >= 0 && s3 >= 0);
+    int s2 = accept(l, NULL, NULL);
+    CHECK(s2 >= 0);
+    CHECK(waitpid(waiter, &status, 0) == waiter && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    int s3 = accept(l, NULL, NULL), sd = accept(l, NULL, NULL);
+    CHECK(s3 >= 0 && sd >= 0);
     CHECK(accept(l, NULL, NULL) == -1 && errno == EAGAIN);
     int value = -1;
     socklen_t len = sizeof value;
     CHECK(getsockopt(l, SOL_SOCKET, SO_ACCEPTCONN, &value, &len) == 0 && value == 1);
+    CHECK(connect(l, (struct sockaddr *)&addr, sizeof addr) == -1 && errno == EOPNOTSUPP);
     CHECK(getsockopt(c, SOL_SOCKET, SO_ERROR, &value, &len) == 0 && value == 0);
     value = 1;
     CHECK(setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &value, sizeof value) == 0);
@@ -193,7 +207,7 @@ static int inet_stream(void) {
     int s4 = accept4(l, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     CHECK(s4 >= 0 && (fcntl(s4, F_GETFL) & O_NONBLOCK) && (fcntl(s4, F_GETFD) & FD_CLOEXEC));
     CHECK(sockatmark(s4) == 0 && sockatmark(0) == -1 && errno == ENOTSOCK);
-    int fds[] = {l, c, s, d, c2, c3, s2, s3, c4, s4};
+    int fds[] = {l, c, s, d, c2, c3, s2, s3, sd, c4, s4};
     for (unsigned i = 0; i < sizeof fds / sizeof *fds; i++) close(fds[i]);
     /* The port is free once the listener went. */
     int again = listener(ntohs(addr.sin_port), SOCK_STREAM, &name);
@@ -243,6 +257,43 @@ static int inet_dgram(void) {
     memset(big, 'q', sizeof big);
     CHECK(sendto(x, big, sizeof big, 0, (struct sockaddr *)&b, sizeof b) == -1 && errno == EMSGSIZE);
     close(x); close(y); close(c); close(t);
+    return 0;
+}
+
+/* A socket with a default destination takes datagrams of that peer only; one of the
+ * file namespace is writable while the buffer of its peer has room. */
+static int dgram_peers(void) {
+    struct sockaddr_in xa, ya, za;
+    int x = listener(0, SOCK_DGRAM, &xa), y = listener(0, SOCK_DGRAM, &ya), z = listener(0, SOCK_DGRAM, &za);
+    CHECK(x >= 0 && y >= 0 && z >= 0);
+    CHECK(connect(y, (struct sockaddr *)&za, sizeof za) == 0);
+    char buf[16];
+    CHECK(sendto(x, "no", 2, 0, (struct sockaddr *)&ya, sizeof ya) == 2);
+    CHECK(sendto(z, "yes", 3, 0, (struct sockaddr *)&ya, sizeof ya) == 3);
+    CHECK(recv(y, buf, sizeof buf, MSG_DONTWAIT) == 3 && memcmp(buf, "yes", 3) == 0);
+    CHECK(recv(y, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(x); close(y); close(z);
+    int sv[2];
+    static char block[800];
+    memset(block, 'p', sizeof block);
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    struct pollfd p = {sv[0], POLLOUT, 0};
+    CHECK(poll(&p, 1, 0) == 1 && p.revents == POLLOUT);
+    CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == (ssize_t)sizeof block);
+    CHECK(send(sv[0], block, sizeof block, MSG_DONTWAIT) == (ssize_t)sizeof block);
+    p.revents = 0;
+    CHECK(poll(&p, 1, 0) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        char back[800];
+        pause_ms(30);
+        _exit(read(sv[1], back, sizeof back) == 800 ? 0 : 1);
+    }
+    CHECK(poll(&p, 1, 5000) == 1 && p.revents == POLLOUT);
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(sv[0]); close(sv[1]);
     return 0;
 }
 
@@ -692,6 +743,58 @@ static int longest_steps(void) {
     return 0;
 }
 
+static void *socket_reader(void *arg) {
+    char c;
+    return read(*(int *)arg, &c, 1) == 1 ? NULL : (void *)1;
+}
+
+/* Eight operations wait at one socket (the most a wait queue holds) and a send wakes them,
+ * then a tree of processes holds the most sockets it may (28 of the 40): the steps of the
+ * service are measured by xtask posix-sock-steps. */
+static int socket_waiters(void) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pthread_t threads[8];
+    for (int i = 0; i < 8; i++) CHECK(pthread_create(&threads[i], NULL, socket_reader, &sv[1]) == 0);
+    pause_ms(300);
+    for (int i = 0; i < 8; i++) {
+        CHECK(write(sv[0], "w", 1) == 1);
+        pause_ms(10);
+    }
+    for (int i = 0; i < 8; i++) {
+        void *result = NULL;
+        CHECK(pthread_join(threads[i], &result) == 0 && result == NULL);
+    }
+    close(sv[0]); close(sv[1]);
+    int mine[32], n = 0;
+    for (;;) {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s < 0) break;
+        CHECK(n < 32);
+        mine[n++] = s;
+    }
+    CHECK(errno == EMFILE && n >= 10);
+    int room = 28 - n;
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        int extra = 0;
+        struct pollfd p[32];
+        for (;;) {
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s < 0) break;
+            if (extra < 32) { p[extra].fd = s; p[extra].events = POLLIN | POLLOUT; p[extra].revents = 0; }
+            extra++;
+        }
+        /* The tree holds 28 at most: those of both processes and the one the probe keeps. */
+        _exit(extra >= room - 2 && extra <= room && errno == ENFILE && poll(p, extra, 0) == extra ? 0 : 1);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    for (int i = 0; i < n; i++) close(mine[i]);
+    return 0;
+}
+
 /* The name databases of the image, and a connection to what they name. */
 static int names_of_the_net(void) {
     struct addrinfo hints, *list = NULL;
@@ -847,6 +950,7 @@ int main(int argc, char **argv) {
     RUN(unix_shutdown);
     RUN(inet_stream);
     RUN(inet_dgram);
+    RUN(dgram_peers);
     RUN(unix_names);
     RUN(readiness);
     RUN(scm_rights);
@@ -854,6 +958,7 @@ int main(int argc, char **argv) {
     RUN(rights_cycle);
     RUN(blocking_waits);
     RUN(names_of_the_net);
+    RUN(socket_waiters);
     RUN(longest_steps);
     printf("posix-sock: ok\n");
     fflush(stdout);
