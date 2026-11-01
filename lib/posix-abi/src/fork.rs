@@ -293,6 +293,9 @@ struct Regions {
     regions: [Option<(Region, Handle<Memory>)>; REGIONS_MAX],
 }
 
+/// The objects a forked child binds beyond the parent's.
+const CHILD_OBJECTS: usize = 8;
+
 /// The map's regions, under the heap's lock; ENOSYS when no code region
 /// holds `resume` (a program init started), ENOMEM when a copy of a handle
 /// fails.
@@ -315,6 +318,12 @@ fn regions() -> Result<Regions, i32> {
         0u64,
     ); REGIONS_MAX];
     let count = crate::allocation::regions(|map| {
+        // The child binds the parent's objects and a few of its own (its
+        // thread's); a map that leaves it no room is the parent's ENOMEM
+        // (XSH fork), not a child that ends alone.
+        if map.objects().count() + CHILD_OBJECTS > posix_map::MAX_OBJECTS {
+            return Err(ENOMEM);
+        }
         let mut count = 0;
         for (place, piece) in seen.iter_mut().zip(map.iter()) {
             let object = map.object(piece.object());

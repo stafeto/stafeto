@@ -112,7 +112,10 @@ static void none_page_faults(void) {
     check("none: the write says ACCERR and its address", fault_seen(SEGV_ACCERR, p + PAGE + 40));
     check("none: the neighbours are fine", !write_faults(p) && !write_faults(p + 2 * PAGE));
     check("none: munmap the page", munmap(p + PAGE, PAGE) == 0);
+    forget_fault();
     check("none: an unmapped page of the map faults", read_faults(p + PAGE + 8));
+    check("none: a page munmap gave back says MAPERR and its address",
+          fault_seen(SEGV_MAPERR, p + PAGE + 8));
     /* An address the layer never gave out: the walk finds no descriptor. */
     forget_fault();
     char *never = (char *)0x70000000UL;
@@ -294,6 +297,33 @@ static void forked(void) {
     check("fork: the parent's page is still none", read_faults(p + PAGE));
     munmap(p, PAGE);
     munmap(p + 3 * PAGE, PAGE);
+}
+
+/* A fork of a map with a hundred pieces: the child holds the map, or the
+ * parent is refused with ENOMEM when the child would have no room for
+ * the objects; the child never dies alone. */
+static void forked_many(void) {
+    size_t pages = 100;
+    char *p = anon(pages * PAGE, PROT_READ | PROT_WRITE);
+    check("many: mmap", p != NULL);
+    if (!p) return;
+    size_t cut = 0;
+    for (size_t i = 1; i < pages; i += 2)
+        if (mprotect(p + i * PAGE, PAGE, PROT_NONE) == 0) cut++;
+    check("many: more than 90 pieces", cut >= 45);
+    p[0] = 5;
+    pid_t child = fork();
+    if (child < 0) {
+        check("many: a refused fork says ENOMEM", errno == ENOMEM);
+    } else if (child == 0) {
+        _exit(read_faults(p) || p[0] != 5 || !read_faults(p + PAGE) ? 1 : 0);
+    } else {
+        int status = 0;
+        check("many: waitpid", waitpid(child, &status, 0) == child);
+        check("many: the child binds all the pieces and exits 0",
+              WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    munmap(p, pages * PAGE);
 }
 
 /* Many small mappings and unmappings reuse the pages and never run the
@@ -1174,6 +1204,7 @@ int main(int argc, char **argv) {
     none_page_faults();
     errors();
     forked();
+    forked_many();
     churn();
     fragmentation();
     shared_anonymous();
