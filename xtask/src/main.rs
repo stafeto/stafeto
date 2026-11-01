@@ -6995,12 +6995,29 @@ fn window_and_top(run: &mut qemu::Run) -> Result<(), String> {
     dialog_command(run, "awk '{print NF}' /proc/$$/statm", &["7"])?;
     dialog_command(run, "awk '{print ($1>0 && $1==$2)}' /proc/$$/statm", &["1"])?;
     dialog_command(run, "grep -c '^Name:.ash$' /proc/$$/status", &["1"])?;
-    // The shell waits for awk: asleep, or running when its sample says it
-    // ran more than a quarter of the time since the last (process service).
+    // The shell waits for awk, so its main thread waits for a reply: S. The
+    // state comes from the main thread (process service, ThreadState). A
+    // loop of awk that runs all the time is R, a sleeping `sleep` is S, each
+    // read from the status of the process while it lives.
     dialog_command(
         run,
-        "awk '$1==\"State:\" {print ($2==\"R\" || $2==\"S\")}' /proc/$$/status",
-        &["1"],
+        "awk '$1==\"State:\" {print $2, $3}' /proc/$$/status",
+        &["S (sleeping)"],
+    )?;
+    dialog_command(
+        run,
+        "awk 'BEGIN {for (;;) x++}' & p=$!; sleep 1; awk '$1==\"State:\" {print $2, $3}' /proc/$p/status; kill $p; wait $p 2>/dev/null; echo busy-done",
+        &["R (running)", "busy-done"],
+    )?;
+    dialog_command(
+        run,
+        "sleep 30 & p=$!; sleep 1; awk '$1==\"State:\" {print $2, $3}' /proc/$p/status; kill $p; wait $p 2>/dev/null; echo idle-done",
+        &["S (sleeping)", "idle-done"],
+    )?;
+    dialog_command(
+        run,
+        "for f in /proc/[0-9]*; do n=$(awk '$1==\"Name:\" {print $2}' $f/status); c=$(tr '\\0' ' ' < $f/cmdline); echo \"name:$n cmdline:$c\"; done | grep -c -e '^name:? ' -e '^name: ' -e 'cmdline:$'; echo names-done",
+        &["0", "names-done"],
     )?;
     dialog_command(
         run,

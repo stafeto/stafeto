@@ -155,14 +155,6 @@ const PROBE_METHODS: [u16; proto_process::METHODS.len()
     }
     methods
 };
-/// How long after a sample a listing judges a process again (`list`): a
-/// listing sooner repeats the last verdict.
-const SLEEP_AFTER_NS: u64 = 2_000_000;
-/// The share of the time since the last sample that a process may have run
-/// and still be called asleep, as 1 in this many: a thread that waits on a
-/// word of a shared mapping looks at it every millisecond (lib/posix-sync),
-/// which costs it a few percent of the time, and it sleeps all the same.
-const ASLEEP_SHARE: u64 = 4;
 /// The CPUs a placement tells apart (`Page::cpus` has 64 bits; the kernel
 /// runs at most this many).
 const MAX_CPUS: usize = 8;
@@ -662,6 +654,8 @@ impl Processes {
             }
             record.handle_limit = create.handle_limit;
             record.cpus = cpus;
+            // A process of init's table shows the program init named.
+            record.name = create.name;
         }
         self.witnesses[index] = Some(witness);
         self.tickets[index] = create.ticket;
@@ -2984,6 +2978,7 @@ impl Processes {
             root: false,
             cpus: parent.cpus,
             ticket: 0,
+            name: [0; proto_process::NAME_LEN],
         };
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
@@ -3263,6 +3258,22 @@ impl Processes {
         }
     }
 
+    /// Whether the main thread of the record in `index` waits: in `receive`
+    /// or `send`, for a reply, or parked (kernel `ThreadState`).
+    fn main_thread_waits(&self, index: usize) -> bool {
+        let Some(thread) = self.routers.get(index).and_then(Option::as_ref) else {
+            return false;
+        };
+        matches!(
+            sys::thread_info(thread).map(|info| info.state),
+            Ok(abi::ThreadState::Receiving
+                | abi::ThreadState::Sending
+                | abi::ThreadState::AwaitingReply
+                | abi::ThreadState::Parked
+                | abi::ThreadState::Ended)
+        )
+    }
+
     /// List (`ps`): the first live record of the window of `LIST_WINDOW`
     /// records from the cursor, and the cursor after it (or after the
     /// window, with `0` for no record). O(LIST_WINDOW).
@@ -3295,32 +3306,11 @@ impl Processes {
                 break;
             }
         }
-        // A process that ran at most a quarter of the time since the last
-        // sample, some 2 ms before or more, sleeps (state 3); the first
-        // sample, or a process that ran more, is running. A listing sooner
-        // than that repeats the verdict of the sample.
-        let sleeping = found.is_some_and(|i| {
-            let now = Self::timer_now();
-            let Some(record) = self.records.get_mut(i) else {
-                return false;
-            };
-            let ticks = record
-                .carried_ticks
-                .saturating_add(sys::process_time(&record.process).unwrap_or(0));
-            if record.sample_at == 0 {
-                record.sample_ticks = ticks;
-                record.sample_at = now;
-                return false;
-            }
-            let elapsed = now.saturating_sub(record.sample_at);
-            if elapsed >= SLEEP_AFTER_NS {
-                let ran = rt::time::ticks_to_ns(ticks.saturating_sub(record.sample_ticks));
-                record.sample_asleep = ran.saturating_mul(ASLEEP_SHARE) <= elapsed;
-                record.sample_ticks = ticks;
-                record.sample_at = now;
-            }
-            record.sample_asleep
-        });
+        // The state of a process is that of its first thread (the router
+        // of its signals, which is the main thread until it ends): waiting
+        // for a message, for a reply or parked is asleep (state 3), ready
+        // or on a CPU is running.
+        let sleeping = found.is_some_and(|i| self.main_thread_waits(i));
         let next = found.map_or(window_end, |i| i + 1);
         let next = if next >= RECORDS {
             proto_process::LIST_END

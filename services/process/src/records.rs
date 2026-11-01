@@ -129,13 +129,6 @@ pub struct Record<P> {
     /// (system time; the rest of each is user time).
     pub carried_kernel: u64,
     pub children_kernel: u64,
-    /// The ticks its process had run at the last listing that sampled it,
-    /// the time of that sample (the scale of the kernel's timers) and what
-    /// the sample said: a process that ran only a small share of the time
-    /// since a sample some time ago is asleep (`sleeping`).
-    pub sample_ticks: u64,
-    pub sample_at: u64,
-    pub sample_asleep: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
     /// The CPUs its process runs on (kernel spec 8, process_create x8):
@@ -492,9 +485,6 @@ impl<P> Records<P> {
             next_name: [0; proto_process::NAME_LEN],
             nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
             carried_ticks: 0,
-            sample_ticks: 0,
-            sample_at: 0,
-            sample_asleep: false,
             cpu: 0,
             cpus: parent.map_or(0, |p| self.records[p].as_ref().unwrap().cpus),
             children_ticks: 0,
@@ -1390,6 +1380,7 @@ mod tests {
                 root: false,
                 cpus: 0,
                 ticket: 0,
+                name: [0; proto_process::NAME_LEN],
             };
             let place = exit_place(label, &create, loop_level);
             assert_eq!(place.label, label.exit());

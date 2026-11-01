@@ -79,6 +79,7 @@ extern "C" fn receiver(_: u64) -> ! {
             root: adoption.root,
             cpus: adoption.cpus,
             ticket: adoption.ticket,
+            name: proto_process::name_of(adoption.program.as_bytes()),
         };
         let handed = (
             reply.handles.take::<Channel>(0),
