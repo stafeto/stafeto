@@ -735,8 +735,9 @@ static int shm_processes(void) {
 
 
 /* IPC_SET of a segment is the pipe service's: the library changes no file (#344).
- * An unprivileged owner hands a segment to another user, who removes it; a
- * creator removes a segment after the superuser gave it to someone else. Runs
+ * An unprivileged owner hands a segment to another user, whose uid the file of
+ * the segment has when shmctl returns, and who removes it. (The creator that
+ * removes a segment after the superuser gave it away is shm_files_of_the_dead.)
  * The services give the file of the segment its new owner. */
 static int shm_hand_over(void) {
     long page = sysconf(_SC_PAGESIZE);
@@ -758,6 +759,19 @@ static int shm_hand_over(void) {
         _exit(0);
     }
     CHECK(wait_ok(pid));
+    /* The file of the segment follows the segment when shmctl returns. */
+    int owned = 0;
+    DIR *dir = opendir("/dev/shm");
+    CHECK(dir != NULL);
+    for (struct dirent *e; (e = readdir(dir)) != NULL;) {
+        char path[96];
+        struct stat st;
+        if (strncmp(e->d_name, ".sysv", 5) != 0) continue;
+        snprintf(path, sizeof path, "/dev/shm/%s", e->d_name);
+        if (stat(path, &st) == 0 && st.st_uid == 4321) owned++;
+    }
+    closedir(dir);
+    CHECK(owned == 1);
     /* The new owner removes it. */
     pid = fork();
     CHECK(pid >= 0);

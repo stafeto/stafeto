@@ -109,6 +109,15 @@ static int service_watches(void) {
     return 0;
 }
 
+struct writer { int fd; int signal; pthread_t target; int close_fd; };
+static void *wake_writer(void *arg) {
+    struct writer *w = arg;
+    struct timespec pause = {0, 2000000};
+    if (nanosleep(&pause, NULL) != 0) return (void *)1;
+    if (w->close_fd >= 0 && close(w->close_fd) != 0) return (void *)1;
+    if (w->signal) return (void *)(intptr_t)pthread_kill(w->target, w->signal);
+    return write(w->fd, "p", 1) == 1 ? NULL : (void *)1;
+}
 /* A poll and a select of 64 descriptions (#371): the library splits them into
  * Watches of the pipe service of 32. A session has 32 ends of pipes, so sixteen
  * pipes are made and their ends copied onto the other numbers of the table
@@ -138,6 +147,21 @@ static int wide_sets(void) {
     CHECK(write(ends[15][1], "w", 1) == 1);
     CHECK(poll(items, 64, 3) == 1);
     for (int i = 0; i < 64; i++) CHECK(items[i].revents == (i == 63 ? POLLIN : 0));
+    /* A wakeup of the second Watch (label 4): the poll waits with a long
+     * timeout, a thread writes to the last pipe 20 ms later, and the poll
+     * comes back long before the timeout. */
+    char byte;
+    CHECK(read(ends[15][0], &byte, 1) == 1);
+    struct writer late = {ends[15][1], 0, 0, -1};
+    struct timespec t0, t1;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
+    pthread_t pusher;
+    CHECK(pthread_create(&pusher, NULL, wake_writer, &late) == 0);
+    CHECK(poll(items, 64, 2000) == 1);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
+    CHECK(pthread_join(pusher, NULL) == 0);
+    for (int i = 0; i < 64; i++) CHECK(items[i].revents == (i == 63 ? POLLIN : 0));
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 1000);
     fd_set reads, writes;
     FD_ZERO(&reads); FD_ZERO(&writes);
     for (int i = 0; i < 15; i++) FD_SET(ends[i][1], &writes);
@@ -200,15 +224,6 @@ static int tty_distinct_watches(void) {
     return 0;
 }
 
-struct writer { int fd; int signal; pthread_t target; int close_fd; };
-static void *wake_writer(void *arg) {
-    struct writer *w = arg;
-    struct timespec pause = {0, 2000000};
-    if (nanosleep(&pause, NULL) != 0) return (void *)1;
-    if (w->close_fd >= 0 && close(w->close_fd) != 0) return (void *)1;
-    if (w->signal) return (void *)(intptr_t)pthread_kill(w->target, w->signal);
-    return write(w->fd, "p", 1) == 1 ? NULL : (void *)1;
-}
 static void *blocking_wait(void *arg) {
     struct pollfd *fds = arg;
     return (void *)(intptr_t)poll(fds, 2, -1);

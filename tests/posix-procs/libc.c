@@ -352,6 +352,110 @@ end:
     return result;
 }
 
+/* ---- #376 again: the handlers of the program run before and after the locks
+ * of the library: a prepare handler may call timer_gettime and aio_error. ---- */
+static timer_t lc_hook_timer;
+static void lc_prepare_calls(void) {
+    struct itimerspec left;
+    timer_gettime(lc_hook_timer, &left);
+    aio_cancel(0, NULL);
+}
+static int lc_prepare_handler(void) {
+    struct sigevent event;
+    memset(&event, 0, sizeof event);
+    event.sigev_notify = SIGEV_THREAD;
+    event.sigev_notify_function = lc_timer_fired;
+    if (timer_create(CLOCK_MONOTONIC, &event, &lc_hook_timer)) return 1;
+    if (pthread_atfork(lc_prepare_calls, lc_prepare_calls, lc_prepare_calls)) return 2;
+    for (int round = 0; round < 20; round++) {
+        pid_t child = fork();
+        if (child < 0) return 3;
+        if (child == 0) _exit(0);
+        if (lc_wait(child, 5000) != 0) {
+            printf("posix-procs: libc: fork %d with timer_gettime in its prepare handler did not end\n", round);
+            return 4;
+        }
+    }
+    return 0;
+}
+
+/* ---- #320 again: a thread that waits in a read of a stream for reading and
+ * writing does not hold the exit. ---- */
+static FILE *lc_wait_stream;
+static void *lc_waits_in_fgets(void *arg) {
+    (void)arg;
+    char line[16];
+    fgets(line, sizeof line, lc_wait_stream);
+    return NULL;
+}
+static int lc_exit_with_reader(void) {
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (child == 0) {
+        FILE *out = fopen("/tmp/lc-reader-out", "w");
+        int p[2];
+        if (out == NULL || pipe(p)) _exit(2);
+        lc_wait_stream = fdopen(p[0], "r+");
+        pthread_t reader;
+        if (lc_wait_stream == NULL || pthread_create(&reader, NULL, lc_waits_in_fgets, NULL)) _exit(3);
+        lc_nap(30);
+        fputs("whole line\n", out);
+        exit(0);
+    }
+    if (lc_wait(child, 3000) != 0) {
+        printf("posix-procs: libc: the exit of a process whose thread waits in fgets did not end\n");
+        return 2;
+    }
+    char text[32];
+    long got = lc_slurp("/tmp/lc-reader-out", text, sizeof text - 1);
+    return got == 11 && memcmp(text, "whole line\n", 11) == 0 ? 0 : 3;
+}
+
+/* ---- the child of fork may exit when a thread of its parent held a lock of
+ * a stream, of the list of streams or of the memory streams. ---- */
+static FILE *lc_fork_file, *lc_fork_memory;
+static char *lc_fork_text;
+static size_t lc_fork_size;
+static volatile int lc_fork_stop;
+static void *lc_fork_writer(void *arg) {
+    (void)arg;
+    while (!lc_fork_stop) {
+        flockfile(lc_fork_file);
+        for (int i = 0; i < 20; i++) fputs("0123456789abcdefghij\n", lc_fork_file);
+        funlockfile(lc_fork_file);
+        fprintf(lc_fork_memory, "memory %d\n", 1);
+        FILE *other = fopen("/tmp/lc-fork-other", "w");
+        if (other) fclose(other);
+        fflush(NULL);
+    }
+    return NULL;
+}
+static int lc_fork_exit(void) {
+    lc_fork_file = fopen("/tmp/lc-fork-file", "w");
+    lc_fork_memory = open_memstream(&lc_fork_text, &lc_fork_size);
+    if (lc_fork_file == NULL || lc_fork_memory == NULL) return 1;
+    pthread_t writer[2];
+    for (int i = 0; i < 2; i++)
+        if (pthread_create(&writer[i], NULL, lc_fork_writer, NULL)) return 2;
+    for (int round = 0; round < 40; round++) {
+        pid_t child = fork();
+        if (child < 0) return 3;
+        if (child == 0) {
+            FILE *mine = open_memstream(&lc_fork_text, &lc_fork_size);
+            if (mine) fputs("child", mine);
+            exit(0);
+        }
+        if (lc_wait(child, 5000) != 0) {
+            printf("posix-procs: libc: the child %d of a threaded parent did not exit\n", round);
+            lc_fork_stop = 1;
+            return 4;
+        }
+    }
+    lc_fork_stop = 1;
+    for (int i = 0; i < 2; i++) pthread_join(writer[i], NULL);
+    return 0;
+}
+
 static void lc_child(const char *what, int (*fn)(void)) {
     fflush(stdout);
     pid_t pid = fork();
@@ -379,10 +483,16 @@ static int libc_role(void) {
     lc_child("posix_spawnp runs a file that is no program with the shell", lc_spawnp_script);
     lc_child("execv of a file that is no program stays ENOEXEC", lc_execv_script);
     lc_child("a child of fork does not wait for the locks of aio and of timers", lc_fork_locks);
+    lc_child("a prepare handler of the program calls timer_gettime and aio_error", lc_prepare_handler);
+    lc_child("exit does not wait for a thread that reads a stream for reading and writing", lc_exit_with_reader);
+    lc_child("the child of a threaded parent exits after locks of streams were held", lc_fork_exit);
     lc_child("stdatomic.h in Clang", lc_atomics);
     lc_child("streams over memory use no descriptor", lc_memory_streams);
     /* The shell the exec cases made is not left for the stages after them. */
-    unlink("/bin/sh");
+    if (access("/tmp/lc-shell-made", F_OK) == 0) {
+        unlink("/bin/sh");
+        unlink("/tmp/lc-shell-made");
+    }
     if (!failures) printf("posix-procs: libc: exit, fclose, exec of scripts, fork locks, atomics, memory streams ok\n");
     return failures != 0;
 }

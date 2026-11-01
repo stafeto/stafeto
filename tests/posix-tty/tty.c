@@ -149,10 +149,14 @@ static int getlogin_leaves_the_walk(void) {
     CHECK(got > 0);
     text[got] = 0;
     CHECK(strstr(text, "tty: shown 2") != NULL);
-    CHECK(dup2(saved, 2) == 2 && close(saved) == 0 && close(err) == 0);
+    /* LOG_CONS: the standard error is still the file, and stays empty (the
+     * old library wrote to it); the line goes to the console. */
+    CHECK(ftruncate(err, 0) == 0 && lseek(err, 0, SEEK_SET) == 0);
     openlog("tty", LOG_CONS, LOG_USER);
     syslog(LOG_ERR, "console-line %d", 3);
     closelog();
+    CHECK(lseek(err, 0, SEEK_END) == 0);
+    CHECK(dup2(saved, 2) == 2 && close(saved) == 0 && close(err) == 0);
     return 0;
 }
 

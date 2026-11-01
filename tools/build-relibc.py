@@ -115,8 +115,14 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # of the timers, stdatomic.h has a branch for Clang, PRIO_INHERIT unlock asks
 # for one wake, getnameinfo says EAI_OVERFLOW and getaddrinfo reads
 # /etc/services by itself (getservbyname_r), shmctl IPC_SET changes no file;
-# tagged pin-00a82696.
-COMMIT = "00a82696724cb1e49766176205263e194de092bf"
+# tagged pin-00a82696. Review of step 6, part 1: the platform's fork handlers
+# take the locks of aio, the timers, the open streams and the memory streams
+# after the handlers of the program (and the child frees the locks of its open
+# streams), exit leaves a stream with an empty write buffer alone, fdopen of a
+# negative number is EBADF, execvp stops its search after the shell, posix_spawnp
+# with a slash runs a script, a damaged line of /etc/services is passed over;
+# tagged pin-2688672c.
+COMMIT = "2688672cfd78688491ddd8dfd03dfadf277f46c3"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
