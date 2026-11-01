@@ -409,6 +409,9 @@ fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> u
 /// the last call, up to `out.len()`: how many. The caller gives back the
 /// pins and tells the process service of the keys.
 pub fn closed_files(out: &mut [crate::allocation::Closed]) -> usize {
+    if !crate::allocation::closed_pending() {
+        return 0;
+    }
     heap(|state| state.take_closed(out))
 }
 

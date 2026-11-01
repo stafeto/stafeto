@@ -85,6 +85,15 @@ pub type Closed = (i32, u64, u64, bool);
 /// runs in another thread meanwhile has the same bound.
 const CLOSED_MAX: usize = 2 * posix_map::MAX_OBJECTS;
 
+/// How many entries the list of `Closed` holds, for a look without the
+/// heap's lock: nearly every `mmap` finds none.
+static CLOSED_PENDING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a shared mapping went and its pin has not been given back.
+pub fn closed_pending() -> bool {
+    CLOSED_PENDING.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 /// RLIMIT_AS and RLIMIT_DATA, soft, in bytes (u64::MAX for none): the
 /// layer reads them from the process service at its first mapping and
 /// `setrlimit` keeps them (`resources::set`), so that the heap's lock never
@@ -513,6 +522,7 @@ impl State {
                         back.registered && !key_used,
                     );
                     self.closed_len += 1;
+                    CLOSED_PENDING.store(self.closed_len, core::sync::atomic::Ordering::Release);
                 }
             }
             at = to;
@@ -526,6 +536,7 @@ impl State {
         out[..n].copy_from_slice(&self.closed[..n]);
         self.closed.copy_within(n..self.closed_len, 0);
         self.closed_len -= n;
+        CLOSED_PENDING.store(self.closed_len, core::sync::atomic::Ordering::Release);
         n
     }
 

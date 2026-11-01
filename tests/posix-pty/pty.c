@@ -520,5 +520,9 @@ int main(int argc, char **argv) {
     CHECK(pty_ash_dialog(1) == 0);
     CHECK(pty_ash_dialog(0) == 0);
     printf("posix-pty: ok\n");
+    /* The line reaches the console before the process ends: the harness
+     * stops on the end of the process. */
+    fflush(stdout);
+    CHECK(pause_ms(20) == 0);
     return 0;
 }
