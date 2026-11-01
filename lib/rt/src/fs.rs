@@ -622,6 +622,21 @@ impl Files {
         Self::open_reply(&reply, 8).map(|()| false)
     }
 
+    /// IPC_JOBS: the file service takes and runs the jobs for the files of XSI
+    /// segments the pipe service holds (four at most); whether jobs are left.
+    pub fn ipc_jobs(&self) -> Result<bool, Status> {
+        let request = Method::IpcJobs.header().bytes();
+        let reply = sys::send(&self.channel, &request).map_err(Status::Kernel)?;
+        if Self::reply_code(&reply)? == 0
+            && reply.len == 8
+            && reply.handles.is_empty()
+            && reply.words[0] >> 32 <= 1
+        {
+            return Ok(reply.words[0] >> 32 == 1);
+        }
+        Err(Status::BadSize)
+    }
+
     /// Renew an unpublished path proof using the same paid operation.
     /// Every retry sends one bounded request without a numeric reservation.
     pub fn open_prepare_recover(&self, id: u64) -> Result<(), Status> {

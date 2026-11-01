@@ -921,6 +921,87 @@ pub(super) fn model_unlink(
         }
     }
 }
+/// The removal of a name by the service itself (the file of an XSI segment),
+/// done a portion at a time: the same steps `model_unlink` takes together, so
+/// that no step of the service holds all of them. The caller asks again
+/// until `advance` says it is over.
+pub struct StagedUnlink {
+    prep: Preparation,
+    charge: u16,
+    stage: Stage,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Steps,
+    Commit,
+    Cleanup,
+}
+impl StagedUnlink {
+    /// The name `name` of the directory `parent`, paid by the account `root`.
+    pub fn begin(
+        storage: &mut Storage<'_>,
+        parent: Token,
+        name: &[u8],
+        root: Root,
+    ) -> Result<Self, u32> {
+        let charge = storage.charge_preparation(root)?;
+        let prepared = (|| {
+            let proof = model_edge(storage, parent, name, NamespacePath::Victim)?;
+            let token = proof.edge.target.ok_or(NO_ENTRY)?;
+            if storage.node(token)?.kind == crate::DIR {
+                return Err(IS_DIRECTORY);
+            }
+            storage.prepare_namespace_paid(
+                root,
+                charge,
+                NamespaceIntent::Unlink,
+                proof,
+                None,
+                model_identity(),
+            )
+        })();
+        match prepared {
+            Ok(prep) => Ok(Self {
+                prep,
+                charge,
+                stage: Stage::Steps,
+            }),
+            Err(code) => {
+                storage.release_preparation(charge);
+                Err(code)
+            }
+        }
+    }
+
+    /// One portion of the removal; whether it is over (a refusal ends it as
+    /// well: nothing is left held).
+    pub fn advance(&mut self, storage: &mut Storage<'_>) -> bool {
+        match self.stage {
+            Stage::Steps => match self.prep.step(storage, model_identity()) {
+                Ok(false) => {}
+                Ok(true) => self.stage = Stage::Commit,
+                Err(_) => self.stage = Stage::Cleanup,
+            },
+            Stage::Commit => {
+                let _ =
+                    self.prep
+                        .commit(storage, model_identity(), proto_fs::Timestamp::legacy_ns(0));
+                self.stage = Stage::Cleanup;
+            }
+            Stage::Cleanup => {
+                if self
+                    .prep
+                    .cancel_step(storage)
+                    .expect("namespace cleanup of the service's own removal")
+                {
+                    storage.release_preparation(self.charge);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
 pub(super) fn model_link(
     storage: &mut Storage<'_>,
     root: Root,

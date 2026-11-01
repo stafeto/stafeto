@@ -466,9 +466,14 @@ pub struct Ipc {
     wait_seq: u64,
     /// The senders that wait for the pool of messages.
     pool: End,
-    /// The serial and the creator's uid of freed segments whose file is left.
-    reap: [(u64, u32); REAP_MAX],
-    reaped: u8,
+    /// The jobs of the files of segments (module `proto_pipe::jobs`): the
+    /// owner, group and mode a file is to get, one for each file, and the
+    /// files to remove.
+    own: [Option<(u64, u32, u32, u32)>; SEGS],
+    removals: [u64; REAP_MAX],
+    removals_len: u8,
+    /// A job was made with nobody to call the file service for it.
+    notify_due: bool,
     dying: u16,
 }
 
@@ -547,8 +552,10 @@ impl Ipc {
             counted: 0,
             wait_seq: 0,
             pool: End::NONE,
-            reap: [(0, 0); REAP_MAX],
-            reaped: 0,
+            own: [None; SEGS],
+            removals: [0; REAP_MAX],
+            removals_len: 0,
+            notify_due: false,
             dying: 0,
         }
     }
@@ -617,30 +624,79 @@ impl Ipc {
         Self::wake(self.pool.waiters, wakes);
     }
 
-    /// The freed segment `serial`, of the creator `uid`, has its file left.
-    fn reap_push(&mut self, serial: u64, uid: u32) {
-        if usize::from(self.reaped) == REAP_MAX {
-            self.reap.copy_within(1.., 0);
-            self.reaped -= 1;
-        }
-        self.reap[usize::from(self.reaped)] = (serial, uid);
-        self.reaped += 1;
+    /// The file of the segment `serial` is to get this owner, group and
+    /// mode; a later job of the file replaces the earlier.
+    fn job_own(&mut self, serial: u64, uid: u32, gid: u32, mode: u32) {
+        let job = Some((serial, uid, gid, mode));
+        let at = self
+            .own
+            .iter()
+            .position(|j| j.is_some_and(|j| j.0 == serial))
+            .or_else(|| self.own.iter().position(Option::is_none))
+            .unwrap_or(0);
+        self.own[at] = job;
     }
 
-    /// The serial of a freed segment the caller may remove the file of (its
-    /// creator, or the superuser), or 0.
-    fn reap_take(&mut self, c: &Cred) -> u64 {
-        let n = usize::from(self.reaped);
-        let Some(at) = self.reap[..n]
-            .iter()
-            .position(|&(_, uid)| c.uid == 0 || c.uid == uid)
-        else {
-            return 0;
-        };
-        let (serial, _) = self.reap[at];
-        self.reap.copy_within(at + 1..n, at);
-        self.reaped -= 1;
-        serial
+    /// The segment `serial` is freed: its file is to be removed (the jobs
+    /// that change it go). Where the sixteen places are full the oldest goes.
+    fn job_remove(&mut self, serial: u64) {
+        for j in &mut self.own {
+            if j.is_some_and(|j| j.0 == serial) {
+                *j = None;
+            }
+        }
+        if usize::from(self.removals_len) == REAP_MAX {
+            self.removals.copy_within(1.., 0);
+            self.removals_len -= 1;
+        }
+        self.removals[usize::from(self.removals_len)] = serial;
+        self.removals_len += 1;
+    }
+
+    /// Whether jobs are waiting for the file service.
+    pub fn jobs_left(&self) -> bool {
+        self.removals_len != 0 || self.own.iter().any(Option::is_some)
+    }
+
+    /// Up to JOBS_MAX jobs, the changes first, and whether jobs are left.
+    pub fn take_jobs(
+        &mut self,
+    ) -> (
+        [Option<proto_pipe::jobs::Job>; proto_pipe::jobs::JOBS_MAX],
+        bool,
+    ) {
+        use proto_pipe::jobs::{JOBS_MAX, Job};
+        let mut out = [None; JOBS_MAX];
+        let mut n = 0;
+        for j in &mut self.own {
+            if n == JOBS_MAX {
+                break;
+            }
+            if let Some((serial, uid, gid, mode)) = j.take() {
+                out[n] = Some(Job::Own {
+                    serial,
+                    uid,
+                    gid,
+                    mode,
+                });
+                n += 1;
+            }
+        }
+        while n < JOBS_MAX && self.removals_len != 0 {
+            out[n] = Some(Job::Remove {
+                serial: self.removals[0],
+            });
+            n += 1;
+            self.removals.copy_within(1.., 0);
+            self.removals_len -= 1;
+        }
+        (out, self.jobs_left())
+    }
+
+    /// Whether the file service is to be told of jobs nobody asked it for,
+    /// once.
+    pub fn notify_due(&mut self) -> bool {
+        core::mem::take(&mut self.notify_due)
     }
 
     /// Puts a message at the end of the list of queue `q`, or before the
@@ -1154,10 +1210,11 @@ impl Ipc {
                 if seg.live && seg.era == h.era {
                     seg.nattch = seg.nattch.saturating_sub(h.count);
                     if seg.removed && seg.nattch == 0 {
-                        let (era, serial, uid) = (seg.era, seg.serial, seg.perm.cuid);
+                        let (era, serial) = (seg.era, seg.serial);
                         *seg = Seg::FREE;
                         seg.era = era;
-                        self.reap_push(serial, uid);
+                        self.job_remove(serial);
+                        self.notify_due = true;
                     }
                 }
             }
@@ -1716,8 +1773,7 @@ impl Ipc {
             out.word(id_of(g, self.segs[g].era));
             out.word(self.segs[g].serial);
             out.word(0);
-            let reap = self.reap_take(c);
-            out.word(reap);
+            out.word(0);
             return Ok(());
         }
         if key != 0 && flags & IPC_CREAT == 0 {
@@ -1760,8 +1816,7 @@ impl Ipc {
         out.word(id_of(g, era));
         out.word(nonce);
         out.word(1);
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1784,8 +1839,7 @@ impl Ipc {
         out.word(seg.size);
         out.word(u64::from(seg.perm.uid));
         out.word(u64::from(seg.perm.cuid));
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1800,21 +1854,19 @@ impl Ipc {
             seg.lpid = c.pid;
         }
         if seg.removed && seg.nattch == 0 {
-            let (serial, creator) = (seg.serial, seg.perm.cuid);
+            let serial = seg.serial;
             out.word(1);
-            out.word(serial);
+            // The file is the file service's to remove (a job): the library
+            // is given no number to remove.
+            out.word(0);
             *seg = Seg::FREE;
             seg.era = era;
-            // The caller removes the file; another user's, left to its creator.
-            if c.uid != creator && c.uid != 0 {
-                self.reap_push(serial, creator);
-            }
+            self.job_remove(serial);
         } else {
             out.word(0);
             out.word(seg.serial);
         }
-        let reap = self.reap_take(c);
-        out.word(reap);
+        out.word(0);
         Ok(())
     }
 
@@ -1839,8 +1891,7 @@ impl Ipc {
                 ] {
                     out.word(v);
                 }
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(0);
                 Ok(())
             }
             IPC_SET => {
@@ -1852,10 +1903,16 @@ impl Ipc {
                 seg.perm.gid = w[6] as u32;
                 seg.perm.mode = (w[7] & 0o777) as u16;
                 seg.ctime = c.now;
+                let (serial, uid, gid, mode) = (
+                    seg.serial,
+                    seg.perm.uid,
+                    seg.perm.gid,
+                    u32::from(seg.perm.mode),
+                );
                 out.word(0);
-                out.word(seg.serial);
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(serial);
+                self.job_own(serial, uid, gid, mode);
+                out.word(0);
                 Ok(())
             }
             IPC_RMID => {
@@ -1864,14 +1921,12 @@ impl Ipc {
                     return Err(fail(EPERM));
                 }
                 if seg.nattch == 0 {
-                    let (serial, era, creator) = (seg.serial, seg.era, seg.perm.cuid);
+                    let (serial, era) = (seg.serial, seg.era);
                     *seg = Seg::FREE;
                     seg.era = era;
                     out.word(1);
-                    out.word(serial);
-                    if c.uid != creator && c.uid != 0 {
-                        self.reap_push(serial, creator);
-                    }
+                    out.word(0);
+                    self.job_remove(serial);
                 } else {
                     // The key goes now; the segment goes with its last detach.
                     seg.removed = true;
@@ -1879,8 +1934,7 @@ impl Ipc {
                     out.word(0);
                     out.word(seg.serial);
                 }
-                let reap = self.reap_take(c);
-                out.word(reap);
+                out.word(0);
                 Ok(())
             }
             _ => Err(fail(EINVAL)),
@@ -2566,6 +2620,21 @@ impl Pipes {
     pub fn ipc_due(&self) -> bool {
         self.ipc.due()
     }
+
+    /// The jobs for the files of segments (see [Ipc::take_jobs]).
+    pub fn ipc_take_jobs(
+        &mut self,
+    ) -> (
+        [Option<proto_pipe::jobs::Job>; proto_pipe::jobs::JOBS_MAX],
+        bool,
+    ) {
+        self.ipc.take_jobs()
+    }
+
+    /// Whether the file service is to be told of jobs nobody asked it for.
+    pub fn ipc_notify_due(&mut self) -> bool {
+        self.ipc.notify_due()
+    }
 }
 
 /// The slot of the description a word names (`SOCK_END | slot`).
@@ -2579,6 +2648,7 @@ const _: () = assert!(MQ_KIND != proto_pipe::sock::STREAM && MQ_KIND != proto_pi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_pipe::jobs::Job;
 
     const WHO: Who = Who {
         uid: 1000,
@@ -3300,7 +3370,16 @@ mod tests {
         assert_eq!(rm.words[0], 0, "attached: it stays");
         assert_eq!(r.err(&mut p, op::SHM_AT, &with_cred(&[id, 0]), b""), 43);
         let dt = r.ok(&mut p, op::SHM_DT, &with_cred(&[id]), b"");
-        assert_eq!((dt.words[0], dt.words[1]), (1, serial));
+        assert_eq!(
+            (dt.words[0], dt.words[1]),
+            (1, 0),
+            "gone; the library is given no file to remove"
+        );
+        assert_eq!(
+            p.ipc_take_jobs().0[0],
+            Some(Job::Remove { serial }),
+            "the file service is given the job"
+        );
         assert_eq!(
             r.err(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_STAT]), b""),
             22
@@ -3740,7 +3819,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_segment_names_its_file_to_its_creator_until_it_is_removed() {
+    fn a_segment_freed_by_the_end_of_its_holder_leaves_a_job_and_a_notice() {
         let (mut p, mut r) = (pipes(), Run::new());
         let out = r.ok(
             &mut p,
@@ -3752,16 +3831,23 @@ mod tests {
         let (flow, _) = r.call(&mut p, 77, op::SHM_AT, &with_cred(&[id, 0]), b"", None);
         assert_eq!(flow, Ok(Flow::Done));
         let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
-        assert_eq!(
-            (rm.words[0], rm.words[2]),
-            (0, 0),
-            "attached: nothing to remove yet"
-        );
-        // The attaching process is killed: its hold goes in a step.
+        assert_eq!((rm.words[0], rm.words[2]), (0, 0), "attached: it stays");
+        assert!(!p.ipc.jobs_left() && !p.ipc.notify_due());
+        // The attaching process is killed: its hold goes in a step, and the
+        // file of the segment is to go whoever asks next.
         assert!(p.ipc_gone(77));
         let mut w = Wakes::default();
         while p.ipc_step(&mut w) {}
-        // Another user is not told of the file; its creator is, once.
+        assert!(p.ipc.jobs_left());
+        assert!(
+            p.ipc_notify_due(),
+            "nobody called: the file service is told"
+        );
+        assert!(!p.ipc_notify_due(), "once");
+        let (jobs, more) = p.ipc_take_jobs();
+        assert_eq!(jobs, [Some(Job::Remove { serial })]);
+        assert!(!more);
+        // No other caller, whatever its uid, is told of a file to remove.
         r.who.uid = 2000;
         let other = r.ok(
             &mut p,
@@ -3770,21 +3856,70 @@ mod tests {
             b"",
         );
         assert_eq!(other.words[3], 0);
+    }
+
+    #[test]
+    fn a_new_owner_of_a_segment_is_a_job_for_its_file_and_the_last_job_of_a_file_stands() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let out = r.ok(
+            &mut p,
+            op::SHM_GET,
+            &with_cred(&[0, 4096, 0o600, nonce()]),
+            b"",
+        );
+        let (id, serial) = (out.words[0], out.words[1]);
+        let set = |uid: u64, mode: u64| with_cred(&[id, IPC_SET, 0, uid, 200, mode]);
+        r.ok(&mut p, op::SHM_CTL, &set(2000, 0o640), b"");
+        r.ok(&mut p, op::SHM_CTL, &set(3000, 0o660), b"");
+        let (jobs, more) = p.ipc_take_jobs();
+        assert_eq!(
+            jobs,
+            [Some(Job::Own {
+                serial,
+                uid: 3000,
+                gid: 200,
+                mode: 0o660
+            })]
+        );
+        assert!(!more);
+        // A refused change makes no job.
+        r.who.uid = 4000;
+        assert_eq!(r.err(&mut p, op::SHM_CTL, &set(4000, 0o666), b""), 1);
+        assert!(!p.ipc.jobs_left());
+        // Removed, the segment's file is removed and a change before it goes.
         r.who = WHO;
-        let again = r.ok(
-            &mut p,
-            op::SHM_GET,
-            &with_cred(&[0, 4096, 0o600, nonce()]),
-            b"",
-        );
-        assert_eq!(again.words[3], serial);
-        let third = r.ok(
-            &mut p,
-            op::SHM_GET,
-            &with_cred(&[0, 4096, 0o600, nonce()]),
-            b"",
-        );
-        assert_eq!(third.words[3], 0);
+        r.ok(&mut p, op::SHM_CTL, &set(2000, 0o600), b"");
+        let rm = r.ok(&mut p, op::SHM_CTL, &with_cred(&[id, IPC_RMID]), b"");
+        assert_eq!((rm.words[0], rm.words[1]), (1, 0));
+        let (jobs, _) = p.ipc_take_jobs();
+        assert_eq!(jobs, [Some(Job::Remove { serial })]);
+    }
+
+    #[test]
+    fn jobs_come_a_few_at_a_call_and_the_queue_is_bounded() {
+        let mut ipc = Box::new(Ipc::new());
+        for n in 1..=SEGS as u64 {
+            ipc.job_own(n, 1, 1, 0o600);
+        }
+        for n in 1..=REAP_MAX as u64 + 3 {
+            ipc.job_remove(100 + n);
+        }
+        // Changes first; a removal of a file takes its change away.
+        ipc.job_remove(3);
+        let mut seen = 0;
+        let mut calls = 0;
+        loop {
+            let (jobs, more) = ipc.take_jobs();
+            seen += jobs.iter().flatten().count();
+            calls += 1;
+            if !more {
+                break;
+            }
+        }
+        // 7 changes (the file 3 went), the sixteen newest removals of 103 and
+        // the removal of the file 3.
+        assert_eq!(seen, SEGS - 1 + REAP_MAX);
+        assert_eq!(calls, seen.div_ceil(proto_pipe::jobs::JOBS_MAX));
     }
 
     #[test]

@@ -994,6 +994,61 @@ static int pool_waits(void) {
 
 /* A segment attached before fork stays attached in the child: the count
  * grows, and falls when the child goes. */
+/* The files of segments whose makers went: twenty creators in a row each make a
+ * segment, attach it, remove it and go without detaching, so the service frees
+ * it when their session ends and nobody calls it again; no file is left in
+ * /dev/shm. A creator that is given away to another owner by the superuser
+ * still removes its segment, and the file with it. */
+static int shm_files_of_the_dead(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    int before = sysv_files(NULL, 0);
+    CHECK(before >= 0);
+    for (int i = 0; i < 20; i++) {
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            int id = shmget(IPC_PRIVATE, page, 0600);
+            if (id < 0 || shmat(id, NULL, 0) == (void *)-1) _exit(2);
+            _exit(shmctl(id, IPC_RMID, NULL) == 0 ? 0 : 3);
+        }
+        CHECK(wait_ok(pid));
+    }
+    int left = -1;
+    for (int i = 0; i < 200; i++) {
+        left = sysv_files(NULL, 0);
+        if (left == before) break;
+        pause_ms(10);
+    }
+    if (left != before) printf("posix-ipc: %d files left of %d\n", left - before, 20);
+    CHECK(left == before);
+    /* The creator removes what the superuser gave away. */
+    int up[2], down[2];
+    CHECK(pipe(up) == 0 && pipe(down) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(1234) != 0 || setuid(1234) != 0) _exit(2);
+        int id = shmget(IPC_PRIVATE, page, 0600);
+        char c;
+        if (id < 0 || write(up[1], &id, sizeof id) != sizeof id) _exit(3);
+        if (read(down[0], &c, 1) != 1) _exit(4);
+        _exit(shmctl(id, IPC_RMID, NULL) == 0 ? 0 : 5);
+    }
+    int id = -1;
+    CHECK(read(up[0], &id, sizeof id) == sizeof id);
+    struct shmid_ds ds;
+    CHECK(shmctl(id, IPC_STAT, &ds) == 0);
+    ds.shm_perm.uid = 77;
+    ds.shm_perm.gid = 77;
+    CHECK(shmctl(id, IPC_SET, &ds) == 0);
+    CHECK(sysv_files(NULL, 0) == before + 1);
+    CHECK(write(down[1], "g", 1) == 1);
+    CHECK(wait_ok(pid));
+    CHECK(sysv_files(NULL, 0) == before);
+    close(up[0]); close(up[1]); close(down[0]); close(down[1]);
+    return 0;
+}
+
 static int shm_fork(void) {
     long page = sysconf(_SC_PAGESIZE);
     int id = shmget(IPC_PRIVATE, page, 0600);
@@ -1411,6 +1466,7 @@ int main(int argc, char **argv) {
     RUN(shm_names);
     RUN(pool_waits);
     RUN(shm_fork);
+    RUN(shm_files_of_the_dead);
     RUN(many_waits);
     RUN(named_semaphores);
     RUN(sem_waiters);

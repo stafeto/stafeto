@@ -3660,6 +3660,25 @@ fn posix_ipc_steps() -> Result<(), String> {
         .map(|r| r.1)
         .max()
         .unwrap_or(0);
+    // The file service takes the jobs for the files of segments (IPC_JOBS, kind
+    // 63): its step waits in `send` for the pipe service's BROKER_JOBS (kind 45,
+    // in the rows above) and runs four jobs at most.
+    check_waits(&lines, &["2", "4"], "IPC job steps")?;
+    let files = longest_steps(&lines, "2");
+    let Some(jobs) = files.iter().find(|row| row.0 == 63 && row.1 != 0) else {
+        return Err(format!("the file service ran no IPC_JOBS step: {files:?}"));
+    };
+    let waits = longest_waits(&lines, "2")
+        .into_iter()
+        .find(|row| row.0 == 63)
+        .map_or(0, |row| row.1);
+    println!(
+        "file service IPC_JOBS: {} ticks, wait in send {waits} ticks (of CALL_WAIT_MAX {CALL_WAIT_MAX})",
+        jobs.1
+    );
+    if let Some(row) = files.iter().find(|r| r.0 != 64 && r.1 > TERM_B * 9 / 10) {
+        return Err(format!("the file service: a step past 0.9 of B: {row:?}"));
+    }
     println!("posix-ipc-steps: the worst step {worst} of B {TERM_B}");
     Ok(())
 }
@@ -3669,7 +3688,7 @@ const fn ipc_programs(steps: &'static [&'static str]) -> [ImageProgram; 11] {
         ("init", "init", INIT_STACK_SIZE, &["table-posix-ipc"]),
         ("uart", "uart", UART_STACK_SIZE, &[]),
         ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
-        POSIX_PROCS_PROGRAMS[1],
+        ("ramfs", "ramfs", RAMFS_STACK_SIZE, steps),
         ("pipe", "pipe", PIPE_STACK_SIZE, steps),
         POSIX_PROCS_PROGRAMS[3],
         POSIX_PROCS_PROGRAMS[4],

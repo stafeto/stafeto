@@ -214,7 +214,15 @@ pub fn call(
     deadline: u64,
 ) -> Result<Reply, i32> {
     let point = op::is_long(operation).then(crate::threads::cancel::Point::begin);
-    let result = transport().and_then(|t| run(t, operation, words, cred_at, bytes, out, deadline));
+    let result = transport().and_then(|t| {
+        let result = run(t, operation, words, cred_at, bytes, out, deadline);
+        if let Ok(reply) = &result
+            && makes_file_jobs(operation, words, reply)
+        {
+            take_file_jobs(t);
+        }
+        result
+    });
     if let Some(point) = point {
         if result.is_ok() {
             point.end();
@@ -223,6 +231,31 @@ pub fn call(
         }
     }
     result
+}
+
+/// Whether the call left a job for the file of a segment in the pipe service:
+/// `IPC_SET` and `IPC_RMID` of a segment (the rights of its file follow
+/// `shm_perm`, the file goes with the segment), and a `shmdt` that freed it.
+fn makes_file_jobs(operation: u32, words: &[u64], reply: &Reply) -> bool {
+    const IPC_RMID: u64 = 0;
+    const IPC_SET: u64 = 1;
+    match operation {
+        op::SHM_CTL => words.get(1).is_some_and(|&c| c == IPC_SET || c == IPC_RMID),
+        op::SHM_DT => reply.words[0] == 1,
+        _ => false,
+    }
+}
+
+/// Has the file service take the jobs for the files of segments now, so that
+/// the file is as the segment is when the call returns: its pieces of four
+/// at most (a failure leaves the jobs to the notice and the next call).
+fn take_file_jobs(transport: Transport) {
+    for _ in 0..32 {
+        match transport.files().ipc_jobs() {
+            Ok(true) => {}
+            _ => break,
+        }
+    }
 }
 
 /// `call` on the message queue the descriptor `fd` names: the first word

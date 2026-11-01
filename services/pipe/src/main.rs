@@ -191,6 +191,7 @@ fn main(_: u64) -> u64 {
         generations: None,
         step_told: false,
         step_due: false,
+        files_notify: None,
     };
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
@@ -233,6 +234,9 @@ struct PipeService {
     /// A step is due that no notification told: the next request or
     /// notification makes it and tries to tell again.
     step_due: bool,
+    /// A copy of the file service's channel with NOTIFY alone, which its
+    /// first BROKER_JOBS brought: told of a job nobody asked it for.
+    files_notify: Option<Handle<Channel>>,
 }
 
 /// Where the service maps the process service's page of the credentials
@@ -394,7 +398,43 @@ impl PipeService {
             self.pipes.unwait(end, (label, key));
         }
         let named_due = self.named_cleanup();
-        self.pipes.step(wakes) || self.watches.cleanup_due() || named_due
+        let more = self.pipes.step(wakes) || self.watches.cleanup_due() || named_due;
+        // A segment freed by the end of its last holder has a job nobody
+        // asked the file service for: it is told (no wait, no deadlock).
+        if self.pipes.ipc_notify_due()
+            && let Some(files) = &self.files_notify
+        {
+            let _ = sys::notify(files, proto_pipe::jobs::NOTIFY_BIT);
+        }
+        more
+    }
+
+    /// BROKER_JOBS: the jobs for the files of segments, to the file service
+    /// on its broker session alone.
+    fn broker_jobs(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.label() & (proto_pipe::RAM_BROKER | OWN) != proto_pipe::RAM_BROKER {
+            return status(proto_pipe::BAD_FD);
+        }
+        let flags = match proto_pipe::jobs::parse_request(r.body()) {
+            Ok(flags) => flags,
+            Err(status) => return Answer::Status(status),
+        };
+        let brings = flags & proto_pipe::jobs::BRINGS_NOTIFY != 0;
+        if r.handles.len() != usize::from(brings) {
+            return Answer::Status(Status::BadSize);
+        }
+        if brings {
+            match r.handles.take::<Channel>(0) {
+                Ok(handle) => self.files_notify = Some(handle),
+                Err(e) => return Answer::Status(Status::Kernel(e)),
+            }
+        }
+        let (jobs, more) = self.pipes.ipc_take_jobs();
+        let w = r.reply();
+        if w.u32(0).is_err() || proto_pipe::jobs::write_reply(more, &jobs, w).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// One operation of the session `s` is over (`finished`): it waits no
@@ -1403,6 +1443,7 @@ impl Service<0> for PipeService {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
                 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+                45,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -1530,6 +1571,7 @@ impl Service<0> for PipeService {
                 }
                 Answer::Status(Status::Ok)
             }
+            Some(Method::BrokerJobs) => self.broker_jobs(r),
             Some(
                 method @ (Method::PayerWitness
                 | Method::BrokerPrepare

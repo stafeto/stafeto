@@ -47,6 +47,9 @@
 //! - ABANDON: no body: the session's long operations that wait go, as when
 //!   the session goes (the threads of an old image at exec). Reply: status.
 //!
+//! BROKER_JOBS: the file service takes the jobs for the files of XSI
+//! segments (module `jobs`).
+//!
 //! IPC, IPC_TAKE and IPC_CANCEL: the message queues, semaphores and shared
 //! memory segments of POSIX and XSI (module `ipc`).
 //!
@@ -64,6 +67,7 @@ use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
 pub mod ipc;
+pub mod jobs;
 pub mod named;
 pub mod sock;
 pub use named::{
@@ -170,10 +174,11 @@ pub enum Method {
     IpcCancel = 42,
     SockConnectWait = 43,
     SockConnectTake = 44,
+    BrokerJobs = 45,
 }
 
 impl Method {
-    pub const ALL: [Method; 43] = [
+    pub const ALL: [Method; 44] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -217,6 +222,7 @@ impl Method {
         Method::IpcCancel,
         Method::SockConnectWait,
         Method::SockConnectTake,
+        Method::BrokerJobs,
     ];
 
     pub const fn number(self) -> u16 {
@@ -234,7 +240,7 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+    28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
 ];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
@@ -412,7 +418,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=40u16 {
+        for number in 0..=48u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {
