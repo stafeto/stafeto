@@ -6778,8 +6778,8 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
         &[r#"=63 61 66 e9 0a"#],
     ),
     (
-        r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z"#,
-        &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#],
+        r#"echo hello > /tmp/cz; compress -f /tmp/cz; ls /tmp/cz.Z; head -c3 /tmp/cz.Z | od -An -tx1; compress -dc /tmp/cz.Z; zcat /tmp/cz.Z"#,
+        &[r#"/tmp/cz.Z"#, r#"=1f 9d 8e"#, r#"hello"#, r#"hello"#],
     ),
     // The second wave: chimerautils' csplit, gencat, m4 and write,
     // nbase's pr, paxmirabilis' pax, util-linux's newgrp and ncurses' tput
