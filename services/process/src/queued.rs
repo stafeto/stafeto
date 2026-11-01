@@ -54,10 +54,24 @@ pub struct Waiting {
     pub serial: u32,
 }
 
-const NO_WAITING: Waiting = Waiting {
+/// What the table keeps of a `Waiting`: the low 16 bits of the serial number
+/// (4 bytes in place of 8). The serial numbers come one by one, so the whole
+/// number of an occurrence is the one with these low bits that lies at most
+/// 65 535 behind the newest (`Queued::newest`); an occurrence older than that
+/// is no longer found on its page (`outstanding` forgets it, which gives its
+/// sender one place more, and only after 65 536 occurrences of sigqueue came
+/// after it).
+#[derive(Clone, Copy)]
+struct Held {
+    receiver: u8,
+    signal: u8,
+    low: u16,
+}
+
+const NO_HELD: Held = Held {
     receiver: 0,
     signal: 0,
-    serial: 0,
+    low: 0,
 };
 
 /// What the process with `pid` (the sender) has waiting.
@@ -67,14 +81,14 @@ struct Sent {
     /// Occurrences queued in the pool.
     queued: u16,
     held: u8,
-    list: [Waiting; SIGQUEUE_MAX],
+    list: [Held; SIGQUEUE_MAX],
 }
 
 const NO_SENT: Sent = Sent {
     pid: 0,
     queued: 0,
     held: 0,
-    list: [NO_WAITING; SIGQUEUE_MAX],
+    list: [NO_HELD; SIGQUEUE_MAX],
 };
 
 pub struct Queued {
@@ -90,6 +104,8 @@ pub struct Queued {
     others: [u8; RECORDS],
     /// What each process sent (index: the record, `pid % RECORDS`).
     sent: [Sent; RECORDS],
+    /// The newest serial number `hold` was given (see `Held`).
+    newest: u32,
     /// The mark (id of a timer with its generation) of the timer whose
     /// occurrence waits in the pool, by the place of the timer; 0 for none.
     timer_mark: [u32; 256],
@@ -137,6 +153,7 @@ impl Queued {
             count: [0; RECORDS],
             others: [0; RECORDS],
             sent: [NO_SENT; RECORDS],
+            newest: 0,
             timer_mark: [0; 256],
         }
     }
@@ -199,11 +216,19 @@ impl Queued {
     /// queued, and those on pages that `alive` still finds there. The
     /// occurrences `alive` does not find are forgotten. O(SIGQUEUE_MAX).
     pub fn outstanding(&mut self, pid: u32, alive: impl Fn(Waiting) -> bool) -> usize {
+        let newest = self.newest;
         let row = self.sent_of(pid);
+        let list = row.list;
         let mut kept = 0;
-        for i in 0..usize::from(row.held) {
-            if alive(row.list[i]) {
-                row.list[kept] = row.list[i];
+        for held in &list[..usize::from(row.held)] {
+            let behind = newest.wrapping_sub(u32::from(held.low)) & 0xFFFF;
+            let whole = Waiting {
+                receiver: held.receiver,
+                signal: held.signal,
+                serial: newest.wrapping_sub(behind),
+            };
+            if alive(whole) {
+                row.list[kept] = *held;
                 kept += 1;
             }
         }
@@ -215,12 +240,21 @@ impl Queued {
     /// there when `outstanding` said the process had a place; a list that is
     /// full of dead places is swept by `alive` first.
     pub fn hold(&mut self, pid: u32, held: Waiting, alive: impl Fn(Waiting) -> bool) {
+        // The serial numbers come in order: this one is the newest unless it
+        // is one that wrapped behind.
+        if held.serial.wrapping_sub(self.newest) as i32 > 0 {
+            self.newest = held.serial;
+        }
         if usize::from(self.sent_of(pid).held) >= SIGQUEUE_MAX {
             self.outstanding(pid, alive);
         }
         let row = self.sent_of(pid);
         if usize::from(row.held) < SIGQUEUE_MAX {
-            row.list[usize::from(row.held)] = held;
+            row.list[usize::from(row.held)] = Held {
+                receiver: held.receiver,
+                signal: held.signal,
+                low: held.serial as u16,
+            };
             row.held += 1;
         }
     }
@@ -423,6 +457,49 @@ mod tests {
         assert_eq!(q.outstanding(7, |_| true), SIGQUEUE_MAX);
         q.hold(7, held(99), |h| h.serial >= 30);
         assert_eq!(q.outstanding(7, |_| true), 3);
+    }
+
+    #[test]
+    fn the_table_of_senders_is_half_of_what_whole_serial_numbers_take() {
+        // A held place is 4 bytes (receiver, signal, 16 bits of the serial).
+        assert_eq!(core::mem::size_of::<Held>(), 4);
+        assert_eq!(core::mem::size_of::<Sent>(), 8 + 4 * SIGQUEUE_MAX);
+        assert!(core::mem::size_of::<[Sent; RECORDS]>() <= 40 * 1024);
+    }
+
+    #[test]
+    fn serial_numbers_that_pass_65535_are_still_told_apart() {
+        let held = |n: u32| Waiting {
+            receiver: 3,
+            signal: 41,
+            serial: n,
+        };
+        // Serials across the wrap of the 16 bits kept in the table, and
+        // across the wrap of the 32 bits of the counter.
+        for start in [0xFFFCu32, 0xFFFF_FFFC] {
+            let mut q = Queued::new();
+            q.newest = start.wrapping_sub(1);
+            for n in 0..8u32 {
+                q.hold(7, held(start.wrapping_add(n)), |_| true);
+            }
+            let seen = core::cell::RefCell::new(std::vec::Vec::new());
+            assert_eq!(
+                q.outstanding(7, |h| {
+                    seen.borrow_mut().push(h.serial);
+                    true
+                }),
+                8
+            );
+            // The serials come back whole, oldest first.
+            let expected: std::vec::Vec<u32> = (0..8u32).map(|n| start.wrapping_add(n)).collect();
+            assert_eq!(*seen.borrow(), expected);
+            // The receiver took the ones with an odd offset: the others are
+            // found by their whole serial numbers.
+            assert_eq!(
+                q.outstanding(7, |h| h.serial.wrapping_sub(start) % 2 == 0),
+                4
+            );
+        }
     }
 
     #[test]
