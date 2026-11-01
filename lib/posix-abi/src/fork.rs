@@ -526,7 +526,7 @@ pub fn probe_abort(pid: &mut i32) -> i32 {
         return EIO;
     }
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let Ok(mut reply) = rt::sys::send(client().session(), w.as_bytes()) else {
+    let Ok(mut reply) = crate::process::send_again(&w) else {
         return EIO;
     };
     let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
@@ -629,16 +629,6 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
     } else {
         crate::signals::resume_others();
     }
-    if let Err(errno) = result {
-        rt::println!(
-            "posix-abi: fork refused at step {} ({}) with errno {}, status {}, clone step {}",
-            STEP.load(Ordering::Relaxed),
-            step_name(STEP.load(Ordering::Relaxed)),
-            errno,
-            REFUSED.load(Ordering::Relaxed),
-            SUB.load(Ordering::Relaxed)
-        );
-    }
     block.mask.store(mask, Ordering::SeqCst);
     // fork's errors are EAGAIN and ENOMEM (and ENOSYS above): a refusal
     // of the loader or of a service is a limit of the moment.
@@ -653,33 +643,43 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
         })
 }
 
-/// The step of the fork the parent has reached, for the line a refusal prints.
+// Where the last fork of the process was refused, for `probe_refusal`. The
+// statics are the process's: forks from two threads at once overwrite each
+// other's values, which a probe of one fork at a time does not meet.
+
+/// The step of the clone of the sessions the parent has reached.
 static SUB: AtomicU32 = AtomicU32::new(0);
 
 fn sub(n: u32) {
     SUB.store(n, Ordering::Relaxed);
 }
 
+/// The status of the service that refused, 0 for none.
 static REFUSED: AtomicU32 = AtomicU32::new(0);
+/// The step of the fork the parent has reached: 1 the other threads
+/// stopped, 2 the sessions cloned, 3 the regions copied, 4 ForkStart, 5
+/// Fork, 6 the sessions given, 7 Regions, 8 Go, 9 ForkCommit.
 static STEP: AtomicU32 = AtomicU32::new(0);
 
 fn step(n: u32) {
     STEP.store(n, Ordering::Relaxed);
 }
 
-fn step_name(n: u32) -> &'static str {
-    match n {
-        1 => "stop the other threads",
-        2 => "clone the sessions",
-        3 => "copy: regions",
-        4 => "ForkStart",
-        5 => "Fork",
-        6 => "give the sessions",
-        7 => "Regions",
-        8 => "Go",
-        9 => "ForkCommit",
-        _ => "unknown",
-    }
+/// Where the last fork of the process went as far as it did, for the test
+/// that finds a fork refused: the step, the step of the clone of the
+/// sessions and the status of the service that refused (0 for none), as
+/// `step | sub << 8 | status << 16`.
+pub fn probe_refusal() -> u64 {
+    u64::from(STEP.load(Ordering::Relaxed))
+        | u64::from(SUB.load(Ordering::Relaxed)) << 8
+        | u64::from(REFUSED.load(Ordering::Relaxed)) << 16
+}
+
+/// `process::clone_errno` that keeps the status of the refusal for
+/// `probe_refusal`.
+pub(crate) fn clone_errno(status: Status) -> i32 {
+    REFUSED.store(status.code(), Ordering::Relaxed);
+    crate::process::clone_errno(status)
 }
 
 /// Clones of the process's sessions for a child (Clone): the RAM files'
@@ -688,10 +688,6 @@ fn step_name(n: u32) -> &'static str {
 /// descriptors without FD_CLOFORK, and the entropy service's, each the
 /// process has.
 fn sessions() -> Result<Sessions, i32> {
-    let clone_errno = |status: Status| {
-        REFUSED.store(status.code(), Ordering::Relaxed);
-        crate::process::clone_errno(status)
-    };
     sub(1);
     crate::close_driver::settle_all()?;
     let mut out = Sessions::default();
@@ -787,7 +783,6 @@ pub(crate) fn pipes_clone(
     pipes: rt::abi::Handle,
     ends: &[proto_pipe::Endpoint],
 ) -> Result<Handle<Channel>, i32> {
-    use crate::process::clone_errno;
     let mut w = Writer::new();
     proto_pipe::Method::Clone
         .header()

@@ -352,6 +352,9 @@ struct Processes {
     timers: Timers,
     timer: Option<Handle<Timer>>,
     timer_armed: u64,
+    /// How many starts of a child were refused, by reason (`REFUSED_*`),
+    /// for the Pool probe.
+    refused: [u64; proto_process::REFUSALS],
 }
 impl Processes {
     /// What `new` makes, in place in zeroed memory: the records of the
@@ -2936,26 +2939,20 @@ impl Processes {
         if self.loader.is_none() || self.files.is_none() {
             return refuse(proto_process::NOT_FOUND);
         }
-        if !self.records.may_spawn(index) || !self.loaders.room_for(index) {
-            rt::println!(
-                "posix-process: start refused: {} (children below the limit {}, loader places of the parent below the limit {}, room {})",
-                if self.records.may_spawn(index) {
-                    "loaders"
-                } else {
-                    "children"
-                },
-                self.records.may_spawn(index),
-                self.loaders.room_for(index),
-                self.loaders.room()
-            );
+        if !self.records.may_spawn(index) {
+            self.refused[proto_process::REFUSED_CHILDREN] += 1;
+            return refuse(proto_process::AGAIN);
+        }
+        if !self.loaders.room_for(index) {
+            self.refused[proto_process::REFUSED_LOADERS] += 1;
             return refuse(proto_process::AGAIN);
         }
         let Some(label) = self.records.next_label() else {
-            rt::println!("posix-process: start refused: no label");
+            self.refused[proto_process::REFUSED_LABEL] += 1;
             return refuse(proto_process::AGAIN);
         };
         if !self.generations.room(usize::from(label.index), 4) {
-            rt::println!("posix-process: start refused: generations of the label");
+            self.refused[proto_process::REFUSED_GENERATIONS] += 1;
             self.records.retire_next(label);
             return refuse(proto_process::AGAIN);
         }
@@ -2987,11 +2984,7 @@ impl Processes {
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
         if !loaders::pool_allows(free_quota(), create.quota) {
-            rt::println!(
-                "posix-process: start refused: pool free {} quota {}",
-                free_quota(),
-                create.quota
-            );
+            self.refused[proto_process::REFUSED_POOL] += 1;
             return kernel(abi::Error::NoMemory);
         }
         let place = records::exit_place(label, &create, self.level);
@@ -3016,10 +3009,7 @@ impl Processes {
         let process = match made {
             Ok(process) => process,
             Err(e) => {
-                rt::println!(
-                    "posix-process: start refused: kernel {:?} at process_create",
-                    e
-                );
+                self.refused[proto_process::REFUSED_CREATE] += 1;
                 return kernel(e);
             }
         };
@@ -3127,11 +3117,7 @@ impl Processes {
         let outcome = self.make_piece(slot, child, parent, &making);
         match outcome {
             Err(e) => {
-                rt::println!(
-                    "posix-process: load piece {:?} refused: {:?}",
-                    making.work,
-                    e
-                );
+                self.refused[proto_process::REFUSED_PIECE] += 1;
                 self.abort_load(child, Status::Kernel(e))
             }
             Ok(None) => {}
@@ -4327,7 +4313,11 @@ impl Service<0> for Processes {
                 }
                 let pool = free_quota().saturating_sub(loaders::RESERVE);
                 let w = r.reply();
-                if w.u32(0).and_then(|()| w.u64(pool)).is_err() {
+                let written = w
+                    .u32(0)
+                    .and_then(|()| w.u64(pool))
+                    .and_then(|()| self.refused.iter().try_for_each(|&n| w.u64(n)));
+                if written.is_err() {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())

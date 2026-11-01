@@ -126,7 +126,7 @@ pub(crate) fn clone_kept(
         }
     }
     rt::service::clone_session(&Handle::<Channel>::borrowed(terminal), request.as_bytes())
-        .map_err(crate::process::clone_errno)
+        .map_err(crate::fork::clone_errno)
 }
 
 // Internal retry result: the service posted TTIN/TTOU before any effect.
