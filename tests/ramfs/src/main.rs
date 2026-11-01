@@ -63,8 +63,6 @@ impl Drop for NativeFiles {
     }
 }
 
-// Startup capabilities stay live through initialization checks alone.
-#[inline(never)]
 /// The list of the descriptions a child shares, in a frame of its own: the
 /// probe runs on a small stack.
 #[inline(never)]
@@ -80,6 +78,8 @@ fn alias_clone_list(
     Ok(())
 }
 
+// Startup capabilities stay live through initialization checks alone.
+#[inline(never)]
 fn probe_parent() -> Option<(rt::Handle<rt::handle::Channel>, Result<(), &'static str>)> {
     let mut start = rt::startup().ok()?;
     if let Ok(console) = start.take::<Resource>("console") {
