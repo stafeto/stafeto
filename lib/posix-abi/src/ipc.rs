@@ -166,14 +166,22 @@ fn run(
     }
     let mut all = [0u64; WORDS_MAX];
     all[..words.len()].copy_from_slice(words);
+    let mut count = words.len();
     if let Some(at) = cred_at {
         all[at] = now();
+    }
+    // The wait on a named semaphore goes in the order of the waiters'
+    // levels: the service learns the level of the thread from the layer
+    // (relibc's words end with the credentials).
+    if operation == op::NSEM_WAIT && count == 3 && count < WORDS_MAX {
+        all[count] = u64::from(posix_thread::effective_level(crate::threads::own_block()));
+        count += 1;
     }
     // The identity session goes with the first request, and again where the
     // service says it has none (the session of a child of fork).
     let mut send_identity = !IDENTITY_SENT.load(Ordering::Acquire);
     loop {
-        let mut call = Call::new(operation, &all[..words.len()], bytes);
+        let mut call = Call::new(operation, &all[..count], bytes);
         call.id = send_identity;
         let result = if op::is_long(operation) {
             long_call(transport, &call, out, deadline)

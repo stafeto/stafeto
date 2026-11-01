@@ -161,6 +161,11 @@ pub enum Block {
     Recv,
     /// A `semop` on a semaphore (and whether for it to be zero).
     Sem(u8, bool),
+    /// A `sem_wait` on a named semaphore, at the level of the thread that
+    /// waits (the greater the more urgent). It is kept in `blocked` only:
+    /// no place of the eight of a wait queue is taken, and a post wakes the
+    /// one that is first by level, then by age (`named_balance`).
+    Named(u8),
 }
 
 /// What a call came to: done, or to wait at a queue.
@@ -441,6 +446,10 @@ struct Blocked {
     /// The wait queue it waits at.
     queue: u32,
     block: Block,
+    /// The order of a named semaphore's waiters: when it began to wait.
+    seq: u64,
+    /// A post woke it and its take has not come yet.
+    woken: bool,
 }
 
 pub struct Ipc {
@@ -453,6 +462,8 @@ pub struct Ipc {
     blocked: [Blocked; BLOCKED_MAX],
     /// The places of `blocked` in use: the common case, none, costs nothing.
     counted: u8,
+    /// The age the next waiter of a named semaphore gets.
+    wait_seq: u64,
     /// The senders that wait for the pool of messages.
     pool: End,
     /// The serial and the creator's uid of freed segments whose file is left.
@@ -485,6 +496,8 @@ const BLOCKED_FREE: Blocked = Blocked {
     key: 0,
     queue: 0,
     block: Block::Plain,
+    seq: 0,
+    woken: false,
 };
 
 fn id_of(slot: usize, era: u32) -> u64 {
@@ -532,6 +545,7 @@ impl Ipc {
             holds: [HOLD_FREE; HOLD_MAX],
             blocked: [BLOCKED_FREE; BLOCKED_MAX],
             counted: 0,
+            wait_seq: 0,
             pool: End::NONE,
             reap: [(0, 0); REAP_MAX],
             reaped: 0,
@@ -941,30 +955,137 @@ impl Ipc {
                 key,
                 queue,
                 block,
+                seq: self.wait_seq,
+                woken: false,
             };
+            self.wait_seq += 1;
         }
     }
 
-    /// The operation (`label`, `key`) waits no more.
-    pub fn wait_done(&mut self, label: u64, key: u64) {
+    /// The operation (`label`, `key`) waits no more. When it was a waiter of
+    /// a named semaphore the wake it had is passed on (`named_balance`).
+    pub fn wait_done(&mut self, label: u64, key: u64, wakes: &mut Wakes) {
         if let Some(at) = Self::blocked_place(key) {
             let b = &mut self.blocked[at];
             if b.used && b.label == label && b.key == key {
+                let (queue, block) = (b.queue, b.block);
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
+                if matches!(block, Block::Named(_)) {
+                    self.named_balance_queue(queue, wakes);
+                }
+            }
+        }
+    }
+
+    /// The take of the waiting operation (`label`, `key`) asked again and
+    /// found it must wait on: it is no longer a woken one, and keeps its age.
+    pub fn wait_again(&mut self, label: u64, key: u64) {
+        if let Some(at) = Self::blocked_place(key) {
+            let b = &mut self.blocked[at];
+            if b.used && b.label == label && b.key == key {
+                b.woken = false;
             }
         }
     }
 
     /// Every operation of the session waits no more.
-    pub fn forget(&mut self, label: u64) {
+    pub fn forget(&mut self, label: u64, wakes: &mut Wakes) {
         if self.counted == 0 {
             return;
         }
+        let mut sets = 0u32;
         for b in &mut self.blocked {
             if b.used && b.label == label {
+                if let Block::Named(_) = b.block {
+                    sets |= 1 << (b.queue - Self::set_number(0));
+                }
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
+            }
+        }
+        for s in 0..SEMSETS {
+            if sets & 1 << s != 0 {
+                self.named_balance(s, wakes);
+            }
+        }
+    }
+
+    /// The waiters of the named semaphore in slot `s` that no post has woken
+    /// yet, and how many have been woken and not yet asked again.
+    fn named_balance_queue(&mut self, queue: u32, wakes: &mut Wakes) {
+        if let Some(s) = queue
+            .checked_sub(Self::set_number(0))
+            .map(|d| d as usize)
+            .filter(|&s| s < SEMSETS)
+        {
+            self.named_balance(s, wakes);
+        }
+    }
+
+    /// Wakes the waiters of the named semaphore in slot `s` so that as many
+    /// are woken as the value allows (a post gives one value and wakes one;
+    /// a woken waiter that left, by a signal, a deadline or the end of its
+    /// session, passes its wake on): the first by level, the oldest among
+    /// equals. A waiter wakes once until its take asks again. O(BLOCKED_MAX).
+    fn named_balance(&mut self, s: usize, wakes: &mut Wakes) {
+        if self.counted == 0 || !self.sems[s].live || !self.sems[s].named {
+            return;
+        }
+        let queue = Self::set_number(s);
+        let value = usize::from(self.sems[s].vals[0]);
+        let mut pending = self
+            .blocked
+            .iter()
+            .filter(|b| b.used && b.queue == queue && matches!(b.block, Block::Named(_)) && b.woken)
+            .count();
+        while value > pending {
+            let mut best: Option<usize> = None;
+            for (at, b) in self.blocked.iter().enumerate() {
+                let Block::Named(level) = b.block else {
+                    continue;
+                };
+                if !b.used || b.queue != queue || b.woken {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some(c) => {
+                        let Block::Named(held) = self.blocked[c].block else {
+                            continue;
+                        };
+                        level > held || (level == held && b.seq < self.blocked[c].seq)
+                    }
+                };
+                if better {
+                    best = Some(at);
+                }
+            }
+            let Some(at) = best else {
+                return;
+            };
+            let b = &mut self.blocked[at];
+            if !wakes.push((b.label, b.key)) {
+                return;
+            }
+            b.woken = true;
+            pending += 1;
+        }
+    }
+
+    /// The named semaphore in slot `s` goes (unlinked and closed by all):
+    /// the waiters left, which only a close made under their feet can
+    /// leave, are woken to find it gone, at most as many as `wakes` holds;
+    /// none of them is picked again by a semaphore of the same slot.
+    fn named_gone(&mut self, s: usize, wakes: &mut Wakes) {
+        if self.counted == 0 {
+            return;
+        }
+        let queue = Self::set_number(s);
+        for b in &mut self.blocked {
+            if b.used && b.queue == queue && matches!(b.block, Block::Named(_)) && !b.woken {
+                b.woken = true;
+                let _ = wakes.push((b.label, b.key));
             }
         }
     }
@@ -1840,10 +1961,10 @@ impl Ipc {
         }
         set.unlinked = true;
         if set.opens == 0 {
-            Self::wake(set.waiters.waiters, wakes);
             let era = set.era;
             *set = SemSet::FREE;
             set.era = era;
+            self.named_gone(s, wakes);
         }
         Ok(())
     }
@@ -1855,42 +1976,69 @@ impl Ipc {
             let set = &mut self.sems[s];
             set.opens = set.opens.saturating_sub(1);
             if set.unlinked && set.opens == 0 {
-                Self::wake(set.waiters.waiters, wakes);
                 *set = SemSet {
                     era,
                     ..SemSet::FREE
                 };
+                self.named_gone(s, wakes);
             }
         }
         Ok(())
     }
 
+    /// The woken waiters of the named semaphore in slot `s` other than the
+    /// operation (`label`, `key`): the values they were woken for are theirs.
+    fn named_reserved(&self, s: usize, mine: Option<(u64, u64)>) -> usize {
+        if self.counted == 0 {
+            return 0;
+        }
+        let queue = Self::set_number(s);
+        self.blocked
+            .iter()
+            .filter(|b| {
+                b.used
+                    && b.woken
+                    && b.queue == queue
+                    && matches!(b.block, Block::Named(_))
+                    && Some((b.label, b.key)) != mine
+            })
+            .count()
+    }
+
     fn nsem_wait(
         &mut self,
         label: u64,
+        key: Option<u64>,
         w: &[u64],
         c: &Cred,
         retry: bool,
-        wakes: &mut Wakes,
     ) -> Result<Flow, u32> {
         let s = self.sem_set(w[0], retry)?;
-        let set = &mut self.sems[s];
-        if !set.named {
+        if !self.sems[s].named {
             return Err(fail(EINVAL));
         }
-        let _ = label;
-        if set.vals[0] > 0 {
+        // A caller that waits (not `sem_trywait`) leaves the values that
+        // posts woke other waiters for to those waiters.
+        let reserved = if w[1] != 0 {
+            0
+        } else {
+            self.named_reserved(s, key.map(|k| (label, k)))
+        };
+        let set = &mut self.sems[s];
+        if usize::from(set.vals[0]) > reserved {
             set.vals[0] -= 1;
             set.pids[0] = c.pid;
             return Ok(Flow::Done);
         }
-        let _ = wakes;
         if w[1] != 0 {
             return Err(fail(EAGAIN));
         }
+        // The level of the waiter follows the credentials, when the layer
+        // sent one (a request without it waits at the level 0).
+        let level = w.get(2 + Cred::WORDS).copied().unwrap_or(0).min(255) as u8;
         Ok(Flow::Wait {
             queue: Self::set_number(s),
-            block: Block::Plain,
+            block: Block::Named(level),
         })
     }
 
@@ -1905,7 +2053,7 @@ impl Ipc {
         }
         set.vals[0] += 1;
         set.pids[0] = c.pid;
-        Self::wake(set.waiters.waiters, wakes);
+        self.named_balance(s, wakes);
         Ok(())
     }
 
@@ -2182,7 +2330,7 @@ impl Pipes {
             op::NSEM_WAIT => {
                 need(2 + Cred::WORDS)?;
                 let c = cred(2)?;
-                self.ipc.nsem_wait(label, w, &c, retry, wakes)
+                self.ipc.nsem_wait(label, call.key, w, &c, retry)
             }
             op::NSEM_POST => {
                 need(1 + Cred::WORDS)?;
@@ -2376,8 +2524,13 @@ impl Pipes {
     }
 
     /// An operation that waited is over.
-    pub fn ipc_wait_done(&mut self, label: u64, key: u64) {
-        self.ipc.wait_done(label, key);
+    pub fn ipc_wait_done(&mut self, label: u64, key: u64, wakes: &mut Wakes) {
+        self.ipc.wait_done(label, key, wakes);
+    }
+
+    /// The take of a waiting operation asked again and waits on.
+    pub fn ipc_wait_again(&mut self, label: u64, key: u64) {
+        self.ipc.wait_again(label, key);
     }
 
     /// An operation starts to wait.
@@ -2386,8 +2539,8 @@ impl Pipes {
     }
 
     /// The operations of the session wait no more.
-    pub fn ipc_forget(&mut self, label: u64) {
-        self.ipc.forget(label);
+    pub fn ipc_forget(&mut self, label: u64, wakes: &mut Wakes) {
+        self.ipc.forget(label, wakes);
     }
 
     /// Whether a child of `parent` can get the holds of `parent`.
@@ -2961,7 +3114,7 @@ mod tests {
         );
         r.ok(&mut p, op::SEM_OP, &sem_words(id, &[(0, 1, 0)]), b"");
         assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(3, 3)]);
-        p.ipc_wait_done(1, 3);
+        p.ipc_wait_done(1, 3, &mut Wakes::default());
         p.unwait(queue, (3, 3));
         assert_eq!(
             r.ok(&mut p, op::SEM_CTL, &semctl(id, 0, GETNCNT, 0), b"")
@@ -3218,13 +3371,13 @@ mod tests {
         );
         r.ok(&mut p, op::NSEM_WAIT, &with_cred(&[id, 0]), b"");
         let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &with_cred(&[id, 0]), b"", None);
-        let Ok(Flow::Wait { queue, .. }) = flow else {
+        let Ok(Flow::Wait { queue, block }) = flow else {
             panic!()
         };
-        p.wait(queue, (2, 2), |_| true).unwrap();
+        p.ipc_note_wait(1, 2, queue, block);
         assert_eq!(r.err(&mut p, op::NSEM_WAIT, &with_cred(&[id, 1]), b""), 11);
         r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
-        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(2, 2)]);
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 2)]);
         assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 1);
         r.ok(&mut p, op::NSEM_UNLINK, &cred(), b"/s");
         assert_eq!(
@@ -3251,6 +3404,166 @@ mod tests {
         while p.ipc_step(&mut w) {}
         let _ = id;
         assert!(!p.ipc.sems.iter().any(|s| s.live));
+    }
+
+    /// Starts the wait of the operation `n` (place `n`) of the session `label`
+    /// on the named semaphore `id` at `level`; whether it waits.
+    fn nsem_wait_at(r: &mut Run, p: &mut Pipes, label: u64, n: u64, id: u64, level: u64) {
+        let words = [id, 0, NOW, level];
+        let (flow, _) = r.call(p, label, op::NSEM_WAIT, &words, b"", None);
+        let Ok(Flow::Wait { queue, block }) = flow else {
+            panic!("the wait {n} did not wait: {flow:?}")
+        };
+        assert_eq!(block, Block::Named(level as u8));
+        p.ipc_note_wait(label, n, queue, block);
+    }
+
+    /// The take of the woken operation `n`: whether it got the semaphore.
+    fn nsem_take(r: &mut Run, p: &mut Pipes, label: u64, n: u64, id: u64) -> bool {
+        let words = [id, 0, NOW];
+        let (flow, _) = r.call(p, label, op::NSEM_WAIT, &words, b"", Some(n));
+        match flow {
+            Ok(Flow::Done) => {
+                p.ipc_wait_done(label, n, &mut r.wakes);
+                true
+            }
+            Ok(Flow::Wait { .. }) => {
+                p.ipc_wait_again(label, n);
+                false
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_named_semaphore_wakes_one_waiter_by_level_then_age() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let w = with_cred(&[O_CREAT, 0o600, 0]);
+        let id = r.ok(&mut p, op::NSEM_OPEN, &w, b"/q").words[0];
+        // Twelve waiters, more than a wait queue holds (eight): levels in
+        // an order that is neither rising nor falling, two of them equal.
+        let levels = [5u64, 9, 1, 20, 7, 20, 3, 12, 9, 2, 15, 8];
+        for (i, level) in levels.iter().enumerate() {
+            nsem_wait_at(&mut r, &mut p, 1, i as u64 + 1, id, *level);
+        }
+        let mut order = Vec::new();
+        for _ in 0..levels.len() {
+            r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+            let woken: Vec<_> = r.wakes.iter().collect();
+            assert_eq!(woken.len(), 1, "a post wakes one waiter");
+            let n = woken[0].1;
+            order.push(levels[n as usize - 1]);
+            assert!(nsem_take(&mut r, &mut p, 1, n, id));
+        }
+        assert_eq!(order, vec![20, 20, 15, 12, 9, 9, 8, 7, 5, 3, 2, 1]);
+        // The two of level 20 and the two of level 9 came in the order of
+        // their start: the places 4 then 6, then 2 then 9.
+        assert_eq!(p.ipc.counted, 0);
+    }
+
+    #[test]
+    fn equal_levels_wake_in_the_order_of_arrival() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/e",
+            )
+            .words[0];
+        // Places in the table do not follow the arrival: 3, 1, 2.
+        for n in [3u64, 1, 2] {
+            nsem_wait_at(&mut r, &mut p, 1, n, id, 4);
+        }
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+            let n = r.wakes.iter().next().unwrap().1;
+            order.push(n);
+            assert!(nsem_take(&mut r, &mut p, 1, n, id));
+        }
+        assert_eq!(order, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn a_woken_waiter_that_leaves_passes_the_wake_on_and_a_late_caller_does_not_overtake() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/p",
+            )
+            .words[0];
+        nsem_wait_at(&mut r, &mut p, 1, 1, id, 10);
+        nsem_wait_at(&mut r, &mut p, 1, 2, id, 5);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 1)]);
+        // The unit is the woken waiter's: the other waiter's take and a new
+        // caller both find none (a trywait would find the value).
+        assert!(!nsem_take(&mut r, &mut p, 1, 2, id));
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &[id, 0, NOW, 30], b"", None);
+        assert!(matches!(flow, Ok(Flow::Wait { .. })));
+        // The woken waiter is cancelled (a signal, a deadline): the next
+        // waiter gets the wake.
+        let mut wakes = Wakes::default();
+        p.ipc_wait_done(1, 1, &mut wakes);
+        assert_eq!(wakes.iter().collect::<Vec<_>>(), vec![(1, 2)]);
+        assert!(nsem_take(&mut r, &mut p, 1, 2, id));
+        assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 0);
+        // A woken waiter that finds the value gone (taken by a trywait) waits on
+        // and is woken again by the next post.
+        nsem_wait_at(&mut r, &mut p, 1, 4, id, 1);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 4)]);
+        r.ok(&mut p, op::NSEM_WAIT, &with_cred(&[id, 1]), b"");
+        assert!(!nsem_take(&mut r, &mut p, 1, 4, id));
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 4)]);
+        assert!(nsem_take(&mut r, &mut p, 1, 4, id));
+        // A session that goes passes its woken waiter's wake on as well.
+        nsem_wait_at(&mut r, &mut p, 7, 5, id, 9);
+        nsem_wait_at(&mut r, &mut p, 8, 6, id, 3);
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[id]), b"");
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(7, 5)]);
+        let mut wakes = Wakes::default();
+        p.ipc_forget(7, &mut wakes);
+        assert_eq!(wakes.iter().collect::<Vec<_>>(), vec![(8, 6)]);
+    }
+
+    #[test]
+    fn the_last_close_wakes_the_waiters_left_and_no_later_semaphore_picks_them() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let id = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/g",
+            )
+            .words[0];
+        nsem_wait_at(&mut r, &mut p, 1, 1, id, 4);
+        nsem_wait_at(&mut r, &mut p, 1, 2, id, 4);
+        r.ok(&mut p, op::NSEM_UNLINK, &cred(), b"/g");
+        r.ok(&mut p, op::NSEM_CLOSE, &[id], b"");
+        let mut woken: Vec<_> = r.wakes.iter().collect();
+        woken.sort();
+        assert_eq!(woken, vec![(1, 1), (1, 2)]);
+        // They find it gone; a semaphore made in the same slot is not theirs.
+        let (flow, _) = r.call(&mut p, 1, op::NSEM_WAIT, &[id, 0, NOW], b"", Some(1));
+        assert_eq!(flow, Err(proto_pipe::ipc::ERRNO + 43));
+        let next = r
+            .ok(
+                &mut p,
+                op::NSEM_OPEN,
+                &with_cred(&[O_CREAT, 0o600, 0]),
+                b"/h",
+            )
+            .words[0];
+        r.ok(&mut p, op::NSEM_POST, &with_cred(&[next]), b"");
+        assert_eq!(r.wakes.iter().count(), 0);
     }
 
     #[test]
@@ -3481,14 +3794,15 @@ mod tests {
         ipc.note_wait(3, key, QUEUE_BASE, Block::Recv);
         assert_eq!(ipc.counted, 1);
         // Another label with the same place finds nothing to take away.
-        ipc.wait_done(4, key);
+        let mut wakes = Wakes::default();
+        ipc.wait_done(4, key, &mut wakes);
         assert_eq!(ipc.counted, 1);
-        ipc.wait_done(3, key);
+        ipc.wait_done(3, key, &mut wakes);
         assert_eq!(ipc.counted, 0);
         ipc.note_wait(3, (1 << 32) | 9, QUEUE_BASE, Block::Recv);
         ipc.note_wait(3, (1 << 32) | 10, QUEUE_BASE, Block::Recv);
         ipc.note_wait(8, (1 << 32) | 11, QUEUE_BASE, Block::Recv);
-        ipc.forget(3);
+        ipc.forget(3, &mut wakes);
         assert_eq!(ipc.counted, 1);
         // A key that names no place is ignored.
         ipc.note_wait(3, 0, QUEUE_BASE, Block::Recv);

@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <mqueue.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <stdint.h>
@@ -1169,6 +1170,90 @@ static int named_semaphores(void) {
     return 0;
 }
 
+#define SEM_WAITERS 12
+static sem_t *level_sem;
+static volatile int level_started, level_done;
+static int level_log[SEM_WAITERS];
+
+static void *level_waiter(void *arg) {
+    int priority = (int)(intptr_t)arg;
+    level_started++;
+    if (sem_wait(level_sem) != 0) return (void *)1;
+    int at = __atomic_fetch_add(&level_done, 1, __ATOMIC_SEQ_CST);
+    level_log[at] = priority;
+    return NULL;
+}
+
+static volatile int got_usr2;
+static void on_usr2(int s) { (void)s; got_usr2++; }
+
+/* Twelve threads of twelve priorities wait on one named semaphore (a wait
+ * queue of the service used to hold eight): the posts wake them in the order
+ * of their priorities, one for each post. A signal ends a wait with EINTR and
+ * leaves nothing behind. */
+static int sem_waiters(void) {
+    static const int priorities[SEM_WAITERS] = {15, 28, 9, 22, 31, 12, 25, 18, 6, 30, 20, 3};
+    sem_unlink("/ipc-levels");
+    level_sem = sem_open("/ipc-levels", O_CREAT | O_EXCL, 0600, 0);
+    CHECK(level_sem != SEM_FAILED);
+    pthread_t threads[SEM_WAITERS];
+    for (int i = 0; i < SEM_WAITERS; i++) {
+        pthread_attr_t attr;
+        struct sched_param param = {priorities[i]};
+        CHECK(pthread_attr_init(&attr) == 0);
+        CHECK(pthread_attr_setstacksize(&attr, 65536) == 0);
+        CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
+        CHECK(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0);
+        CHECK(pthread_attr_setschedparam(&attr, &param) == 0);
+        CHECK(pthread_create(&threads[i], &attr, level_waiter, (void *)(intptr_t)priorities[i]) == 0);
+        CHECK(pthread_attr_destroy(&attr) == 0);
+    }
+    for (int i = 0; i < 100 && level_started != SEM_WAITERS; i++) pause_ms(10);
+    CHECK(level_started == SEM_WAITERS);
+    /* All of them are in the service by now; none has passed. */
+    pause_ms(200);
+    CHECK(level_done == 0);
+    for (int i = 0; i < SEM_WAITERS; i++) {
+        CHECK(sem_post(level_sem) == 0);
+        for (int k = 0; k < 200 && level_done != i + 1; k++) pause_ms(5);
+        CHECK(level_done == i + 1);
+    }
+    for (int i = 0; i < SEM_WAITERS; i++) {
+        void *result = NULL;
+        CHECK(pthread_join(threads[i], &result) == 0 && result == NULL);
+    }
+    for (int i = 0; i < SEM_WAITERS; i++) {
+        int want = 0;
+        for (int j = 0; j < SEM_WAITERS; j++) {
+            int greater = 0;
+            for (int k = 0; k < SEM_WAITERS; k++) greater += priorities[k] > priorities[j];
+            if (greater == i) want = priorities[j];
+        }
+        if (level_log[i] != want) printf("posix-ipc: woke %d at place %d, wanted %d\n", level_log[i], i, want);
+        CHECK(level_log[i] == want);
+    }
+    /* A signal ends the wait, and the post that comes after it is not lost. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr2;
+    CHECK(sigaction(SIGUSR2, &sa, NULL) == 0);
+    got_usr2 = 0;
+    CHECK(raise(SIGUSR2) == 0 && got_usr2 == 1);
+    alarmed = 0;
+    sa.sa_handler = on_alarm;
+    CHECK(sigaction(SIGALRM, &sa, NULL) == 0);
+    alarm(1);
+    errno = 0;
+    CHECK(sem_wait(level_sem) == -1 && errno == EINTR && alarmed == 1);
+    CHECK(sem_post(level_sem) == 0);
+    struct timespec until = after_ms(2000);
+    CHECK(sem_timedwait(level_sem, &until) == 0);
+    int v = -1;
+    CHECK(sem_getvalue(level_sem, &v) == 0 && v == 0);
+    CHECK(sem_close(level_sem) == 0 && sem_unlink("/ipc-levels") == 0);
+    return 0;
+}
+
 /* The tables have room for what a root may have, and no more. */
 static int limits(void) {
     int ids[16], n = 0;
@@ -1258,6 +1343,7 @@ int main(int argc, char **argv) {
     RUN(shm_fork);
     RUN(many_waits);
     RUN(named_semaphores);
+    RUN(sem_waiters);
     RUN(limits);
     RUN(longest_steps);
     printf("posix-ipc: ok\n");

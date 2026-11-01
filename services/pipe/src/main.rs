@@ -417,7 +417,9 @@ impl PipeService {
             self.kick();
         }
         self.ops.gone(&mut s.data.long);
-        self.pipes.ipc_forget(s.label());
+        let mut wakes = Wakes::default();
+        self.pipes.ipc_forget(s.label(), &mut wakes);
+        self.tell(&wakes);
         self.roots
             .give(s.data.root, core::mem::take(&mut s.data.waiting));
     }
@@ -433,13 +435,21 @@ impl PipeService {
             .map_err(|e| Answer::Status(Status::Kernel(e)))
     }
 
+    /// The IPC operation `key` of `label` waits no more; a wake a named
+    /// semaphore gave it goes on to the next waiter.
+    fn ipc_done(&mut self, label: u64, key: u64) {
+        let mut wakes = Wakes::default();
+        self.pipes.ipc_wait_done(label, key, &mut wakes);
+        self.tell(&wakes);
+    }
+
     /// The operation `key` of `label` at `end` is over.
     fn finish(&mut self, s: &mut Session<Client, 0>, key: Option<u64>, end: u32) {
         if let Some(key) = key {
             let label = s.label();
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
-            self.pipes.ipc_wait_done(label, key);
+            self.ipc_done(label, key);
             let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
             let queue = if capture.key == key {
                 let queue = capture.queue;
@@ -605,7 +615,7 @@ impl PipeService {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         self.over(s, true);
-        self.pipes.ipc_wait_done(label, cancel.key);
+        self.ipc_done(label, cancel.key);
         // The end the operation waits at is the one its start named; a
         // cancel that names the other leaves no waiter behind either.
         let capture = &mut self.io[((cancel.key & 0xffff_ffff) - 1) as usize];
@@ -905,9 +915,16 @@ impl PipeService {
                 };
                 let ops = &self.ops;
                 let named = &self.named;
-                if let Err(code) = self.pipes.wait(queue, (label, key), |(l, k)| {
-                    ops.waits(l, k) || named.alive(l, k)
-                }) {
+                // A waiter for a named semaphore stands in the table of the
+                // counted waits alone (`Ipc::named_balance`).
+                let listed = if matches!(block, Block::Named(_)) {
+                    Ok(())
+                } else {
+                    self.pipes.wait(queue, (label, key), |(l, k)| {
+                        ops.waits(l, k) || named.alive(l, k)
+                    })
+                };
+                if let Err(code) = listed {
                     self.io[((key & 0xffff_ffff) - 1) as usize] = IoCapture::EMPTY;
                     let finished = self.ops.finish(&mut s.data.long, label, key);
                     self.over(s, finished);
@@ -917,6 +934,7 @@ impl PipeService {
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
+                self.pipes.ipc_wait_again(label, key);
                 match notify {
                     Some(handle) => {
                         if let Err(e) = self.ops.arm(label, key, handle) {
@@ -944,7 +962,7 @@ impl PipeService {
             return long_answer(r, long::Reply::Cancelled);
         }
         self.over(s, true);
-        self.pipes.ipc_wait_done(label, key);
+        self.ipc_done(label, key);
         let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
         if capture.key == key {
             let queue = capture.queue;

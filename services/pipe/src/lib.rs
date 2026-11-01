@@ -150,6 +150,23 @@ impl Wakes {
         }
     }
 
+    /// Adds one operation to the first free place of the two lists; whether
+    /// there was one.
+    fn push(&mut self, waiter: Waiter) -> bool {
+        match self
+            .list
+            .iter_mut()
+            .chain(self.extra.iter_mut())
+            .find(|place| place.is_none())
+        {
+            Some(place) => {
+                *place = Some(waiter);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn merge(&mut self, other: &Wakes) {
         self.add(other.list);
         self.add(other.extra);
