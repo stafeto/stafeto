@@ -293,6 +293,14 @@ struct Regions {
     regions: [Option<(Region, Handle<Memory>)>; REGIONS_MAX],
 }
 
+/// The child binds one object for each run of adjoining regions of one
+/// object of the parent's (and for each shared region), so at most one for
+/// each piece of the parent's map, and the table of objects holds as many
+/// as the table of pieces: a map of the parent fits the child's. `child()`
+/// adds nothing to the map (the page of the clock and the buffers of the
+/// threads lie outside it).
+const _: () = assert!(posix_map::MAX_OBJECTS >= posix_map::MAX_PIECES);
+
 /// The map's regions, under the heap's lock; ENOSYS when no code region
 /// holds `resume` (a program init started), ENOMEM when a copy of a handle
 /// fails.

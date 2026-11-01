@@ -81,6 +81,9 @@ pub struct Record<P> {
     pub credentials: Credentials,
     pub groups: proto_process::Groups,
     pub limits: proto_process::ResourceLimits,
+    /// RLIMIT_MEMLOCK (`proto_process::MEMLOCK`): its parent's at birth, kept
+    /// through exec.
+    pub memlock: proto_process::Limit,
     pub root: proto_process::ExpenditureRoot,
     pub state: State,
     /// Suspension is independent of image loading and process lifetime.
@@ -129,13 +132,6 @@ pub struct Record<P> {
     /// (system time; the rest of each is user time).
     pub carried_kernel: u64,
     pub children_kernel: u64,
-    /// The ticks its process had run at the last listing that sampled it,
-    /// the time of that sample (the scale of the kernel's timers) and what
-    /// the sample said: a process that ran only a small share of the time
-    /// since a sample some time ago is asleep (`sleeping`).
-    pub sample_ticks: u64,
-    pub sample_at: u64,
-    pub sample_asleep: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
     /// The CPUs its process runs on (kernel spec 8, process_create x8):
@@ -259,6 +255,7 @@ impl<P> Records<P> {
                 | proto_process::NOFILE
                 | proto_process::STACK
                 | proto_process::AS
+                | proto_process::MEMLOCK
         ) || value.soft > value.hard
         {
             return Err(proto_process::INVALID);
@@ -267,6 +264,14 @@ impl<P> Records<P> {
             return Err(proto_process::NO_PROCESS);
         }
         let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        if resource == proto_process::MEMLOCK {
+            // No service reads it from the generation: only the layer asks.
+            if value.hard > record.memlock.hard && record.credentials.euid != 0 {
+                return Err(proto_process::PERMISSION);
+            }
+            record.memlock = value;
+            return Ok(false);
+        }
         let old = record.limits.values[resource];
         if value.hard > old.hard && record.credentials.euid != 0 {
             return Err(proto_process::PERMISSION);
@@ -490,11 +495,15 @@ impl<P> Records<P> {
                 self.records[p].as_ref().unwrap().name
             }),
             next_name: [0; proto_process::NAME_LEN],
+            memlock: parent.map_or(
+                proto_process::Limit {
+                    soft: u64::MAX,
+                    hard: u64::MAX,
+                },
+                |p| self.records[p].as_ref().unwrap().memlock,
+            ),
             nice: parent.map_or(0, |p| self.records[p].as_ref().unwrap().nice),
             carried_ticks: 0,
-            sample_ticks: 0,
-            sample_at: 0,
-            sample_asleep: false,
             cpu: 0,
             cpus: parent.map_or(0, |p| self.records[p].as_ref().unwrap().cpus),
             children_ticks: 0,
@@ -1390,6 +1399,7 @@ mod tests {
                 root: false,
                 cpus: 0,
                 ticket: 0,
+                name: [0; proto_process::NAME_LEN],
             };
             let place = exit_place(label, &create, loop_level);
             assert_eq!(place.label, label.exit());
@@ -1923,6 +1933,34 @@ mod tests {
             .set_limit(ci, NOFILE, Limit { soft: 16, hard: 16 }, 1)
             .unwrap();
         assert_eq!(records.get(i).unwrap().limits, inherited);
+    }
+    #[test]
+    fn memlock_is_the_records_own_and_a_child_takes_it() {
+        use proto_process::{Limit, MEMLOCK};
+        let mut records = Records::<u32>::new();
+        let parent = add(&mut records).unwrap();
+        let i = parent.index as usize;
+        let limits = records.get(i).unwrap().limits;
+        let set = Limit { soft: 10, hard: 20 };
+        records.get_mut(i).unwrap().credentials.euid = 1000;
+        // Lowering the hard limit is every process's; raising it is the
+        // superuser's.
+        assert_eq!(records.set_limit(i, MEMLOCK, set, 1), Ok(false));
+        assert_eq!(records.get(i).unwrap().memlock, set);
+        assert_eq!(
+            records.set_limit(i, MEMLOCK, Limit { soft: 5, hard: 21 }, 1),
+            Err(proto_process::PERMISSION)
+        );
+        assert_eq!(records.get(i).unwrap().memlock, set);
+        // The other limits, which services read, stay as they were.
+        assert_eq!(records.get(i).unwrap().limits, limits);
+        let child = child(&mut records, parent);
+        assert_eq!(records.get(child.index as usize).unwrap().memlock, set);
+        records.get_mut(i).unwrap().credentials.euid = 0;
+        let raised = Limit { soft: 5, hard: 21 };
+        assert_eq!(records.set_limit(i, MEMLOCK, raised, 1), Ok(false));
+        assert_eq!(records.get(i).unwrap().memlock, raised);
+        assert_eq!(records.get(child.index as usize).unwrap().memlock, set);
     }
     #[test]
     fn child_inherits_groups_finite_limits_and_the_original_expenditure_root() {

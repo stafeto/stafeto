@@ -696,7 +696,21 @@ The steps of T_i are bound by their own lines, so `xtask` bounds own(S) with
 B and each wait with CALL_WAIT_MAX. The longest step of the process service
 is a portion of its loads, at most B, so one send of the terminal or of
 ramfs to the process service waits two steps and a round trip in the worst
-case. The heartbeat of a service to init (the wait for init, without the
+case. The send of a TtySignal is the exception: the process service
+answers it at the end of the walk of the group, a step makes up to 16
+deliveries (or a look at all 256 places), and the terminal waits a round
+trip and ceil(G / 16) steps of kind 65, where G is the number of processes
+of the group, with the preemptions between them. A step of kind 65 took
+11,833 ticks in the steps run (held under 0.9 B, 18,369, by
+`posix-tty-steps`) and the longest wait of the terminal 38,009, with the
+group of 17 processes of the probe. The limit of 48,000 holds for G up to
+32; each further 16 processes add a step of about 12,000 ticks, so a group
+of 33 passes it and one of 256 waits about 200,000. The bound holds because of
+the size of the probe and is no proof, and the delivery of SIGCONT to a stopped process
+(several kernel calls and replies for each) has not been measured at 16 to
+a step. The fix is to answer the terminal when the request is taken and to
+walk in steps of the service's own (a task of the Tracker); #362 stays open
+until then. The heartbeat of a service to init (the wait for init, without the
 preemption after its answer) is bounded in the same way: C_ipc, init's
 longest step (at most 8,555 ticks in the steps run) and, for each of the
 other services, the heartbeat step of init and C_ipc, about 34,000 ticks

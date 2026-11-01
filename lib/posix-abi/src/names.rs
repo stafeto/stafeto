@@ -520,7 +520,7 @@ pub fn fstatat(
     }
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
     crate::shared::held(fd, |transport, target| {
-        transport.descriptor_information(target).map_err(error)
+        crate::shared::descriptor_information(transport, target)
     })
 }
 

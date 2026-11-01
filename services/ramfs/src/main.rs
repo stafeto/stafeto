@@ -1732,7 +1732,10 @@ impl Service<0> for Fs {
             );
         }
         let now = rt::time::ticks_to_ns(rt::time::now());
-        self.lock_maintenance_turn = !self.lock_maintenance_turn && !self.lock_paused;
+        // A turn of the work of locks only while it has work (and is not
+        // paused): a round of the circle of the sessions has no turn of
+        // an empty sweep or of waits that wait for nothing.
+        self.lock_maintenance_turn = !self.lock_maintenance_turn && self.lock_work_pending();
         if self.lock_maintenance_turn {
             let began = rt::time::ticks_to_ns(rt::time::now());
             self.lock_maintenance_work = (self.lock_maintenance_work + 1) % 2;
@@ -1827,12 +1830,19 @@ impl Service<0> for Fs {
                     work = self.ram.storage.reclaim_step();
                 }
             }
-            self.legacy_pending = self.maintenance_burst.again(
-                work,
-                work || self.departures.pending() || self.audit_pending() || self.orphan_count != 0,
-            );
-            self.notify_maintenance();
-            return;
+            // A turn of jobs that found no work and has no orphan to wait
+            // for goes on to the departures and the audit in the same
+            // step: it is no step of its own.
+            if work || self.orphan_count != 0 {
+                self.legacy_pending = self.maintenance_burst.again(
+                    work,
+                    work || self.departures.pending()
+                        || self.audit_pending()
+                        || self.orphan_count != 0,
+                );
+                self.notify_maintenance();
+                return;
+            }
         }
         self.departure_turn = !self.departure_turn;
         if self.departure_turn

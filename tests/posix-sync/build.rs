@@ -12,6 +12,9 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=sync.c");
+    // The program asks for a main stack of 1 MiB (PT_GNU_STACK): the loader
+    // gives it (the default is 64 KiB).
+    println!("cargo:rustc-link-arg-bins=-zstack-size=1048576");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     let manifest =

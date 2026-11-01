@@ -80,6 +80,21 @@ pub const PROGRAM_ROOM: Range<u64> = 0x1000..0x0200_0000;
 /// The program's main stack: right under abi::INIT_STACK_TOP, with the
 /// guard page below it unmapped.
 pub const STACK_SIZE: u64 = 64 * 1024;
+/// The most a program may ask for its main stack (`PT_GNU_STACK`).
+pub const STACK_MAX: u64 = 8 * 1024 * 1024;
+
+/// The size of the main stack of a program whose file asks for `asked`
+/// bytes (0 for none): STACK_SIZE or more, whole pages, at most STACK_MAX.
+pub const fn stack_size(asked: u64) -> u64 {
+    let asked = asked.next_multiple_of(4096);
+    if asked < STACK_SIZE {
+        STACK_SIZE
+    } else if asked > STACK_MAX {
+        STACK_MAX
+    } else {
+        asked
+    }
+}
 /// The start area (`Start`), which the loader makes and fills.
 pub const START_AREA: u64 = 0xF000_0000;
 /// The most bytes of the start area: the area itself and the copy of the
@@ -128,6 +143,14 @@ pub enum Names {
         ram_generation: u64,
         pipe_generation: u64,
     },
+    /// A file or directory of `/proc` (the layer's `procfs`): the number of
+    /// its node, the PID the node belongs to and the offset; the new image
+    /// makes the description again, with the text of the moment.
+    Proc {
+        node: u32,
+        pid: u32,
+        offset: u32,
+    },
 }
 
 /// A descriptor the child starts with.
@@ -153,6 +176,9 @@ impl Descriptor {
                 ram_generation,
                 pipe_generation,
             } => (8, packed, ram_generation, pipe_generation),
+            Names::Proc { node, pid, offset } => {
+                (9, node, u64::from(pid) | u64::from(offset) << 32, 0)
+            }
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -172,7 +198,10 @@ impl Descriptor {
         let fd = word(0);
         let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if word(1) != 8 && (ram_generation != 0 || pipe_generation != 0) {
+        if word(1) != 8 && word(1) != 9 && (ram_generation != 0 || pipe_generation != 0) {
+            return None;
+        }
+        if word(1) == 9 && pipe_generation != 0 {
             return None;
         }
         let names = match (word(1), word(2)) {
@@ -196,6 +225,11 @@ impl Descriptor {
                     pipe_generation,
                 }
             }
+            (9, node) if (1..=11).contains(&node) => Names::Proc {
+                node,
+                pid: ram_generation as u32,
+                offset: (ram_generation >> 32) as u32,
+            },
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -1006,7 +1040,7 @@ pub const ROOMS: [Range<u64>; 4] = [
     PROGRAM_ROOM,
     HEAP_ROOM,
     START_AREA..START_AREA + AREA_MAX,
-    abi::INIT_STACK_TOP - STACK_SIZE..abi::INIT_STACK_TOP,
+    abi::INIT_STACK_TOP - STACK_MAX..abi::INIT_STACK_TOP,
 ];
 
 /// One region of the parent's memory a copy takes: `pages` whole pages
@@ -1550,6 +1584,17 @@ mod tests {
         assert!(copy_block(|i| good[i], len, &mut [0; 8]).is_err());
     }
 
+    /// The main stack is 64 KiB unless the file asks for more, in whole
+    /// pages, and 8 MiB at most.
+    #[test]
+    fn the_main_stack_follows_the_file_within_limits() {
+        assert_eq!(stack_size(0), STACK_SIZE);
+        assert_eq!(stack_size(8192), STACK_SIZE);
+        assert_eq!(stack_size(1 << 20), 1 << 20);
+        assert_eq!(stack_size((1 << 20) + 1), (1 << 20) + 4096);
+        assert_eq!(stack_size(1 << 40), STACK_MAX);
+    }
+
     /// The room of a program's segments leaves out the loader's region, the
     /// layer's fixed pages, the start area and the stack.
     #[test]
@@ -1570,7 +1615,7 @@ mod tests {
             PROGRAM_ROOM.contains(&0x20_0000),
             "where lld puts a program"
         );
-        const { assert!(START_AREA + AREA_MAX <= abi::INIT_STACK_TOP - STACK_SIZE - 4096) };
+        const { assert!(START_AREA + AREA_MAX <= abi::INIT_STACK_TOP - STACK_MAX - 4096) };
     }
 
     /// The start area: the header names the stack, whose pointers name

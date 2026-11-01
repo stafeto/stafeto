@@ -207,6 +207,11 @@ pub enum Target {
     /// open description of this number takes the writes, the closes and
     /// the `fstat`, and the layer serves the reads from its generator.
     Random(RamTarget),
+    /// A file or a directory of `/proc` (the layer's `procfs`): the text
+    /// the layer made at the open, or the process whose directory it is,
+    /// in the description of this number in the layer's own table. No
+    /// service holds it, so a close of it asks no one.
+    Proc(u32),
 }
 
 impl Target {
@@ -225,6 +230,25 @@ impl Target {
             Self::Fifo(target) => Some(target.endpoint()),
             _ => None,
         }
+    }
+}
+
+/// The function that frees the layer's description of a `Target::Proc`
+/// when its last descriptor closes (0 until `set_proc_release`).
+static PROC_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Names the function that frees the layer's description `id` of a
+/// `Target::Proc`: a close of the last descriptor of it asks no service.
+pub fn set_proc_release(release: fn(u32)) {
+    PROC_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn release_proc(id: u32) {
+    let hook = PROC_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_proc_release` stores a value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(id);
     }
 }
 
@@ -411,6 +435,10 @@ impl Transport {
                 self.close_file(pair.ram())
             }
             Some(Target::Tty(id)) => self.close_terminal(id),
+            Some(Target::Proc(id)) => {
+                release_proc(id);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1119,8 +1147,8 @@ impl PosixFs {
             closing[fd as usize] = flags.close_on_fork;
         }
         for (fd, close) in closing.iter().enumerate() {
-            if *close {
-                let _ = self.descriptors.close(fd as u32);
+            if *close && let Ok(Some(Target::Proc(id))) = self.descriptors.close(fd as u32) {
+                release_proc(id);
             }
         }
     }
@@ -1324,6 +1352,15 @@ impl PosixFs {
                 Err(error.into())
             }
         }
+    }
+
+    /// The lowest free descriptor for the layer's description `id` of a
+    /// file or directory of `/proc` (`Target::Proc`); the caller frees the
+    /// description on an error.
+    pub fn insert_proc(&mut self, id: u32, flags: DescriptorFlags) -> Result<u32, FsError> {
+        self.descriptors
+            .insert(Target::Proc(id), flags)
+            .map_err(FsError::from)
     }
 
     /// Close: the descriptor goes; what to release outside the lock.

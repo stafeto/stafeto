@@ -1092,12 +1092,25 @@ mod tests {
         let (mut turns, mut visited, mut removed) = (0, 0, 0);
         while cursor.pending() {
             let before = cursor.inode;
+            let held: std::vec::Vec<usize> = [a, b]
+                .into_iter()
+                .filter(|file| table.count(*file) != 0)
+                .map(|file| usize::from(file.slot))
+                .collect();
             let result = table.sweep_run(&mut ram.storage, &mut cursor, 64, |_| false);
             assert!(result.visited >= 1 && result.visited <= 64);
-            if table.count(a) + table.count(b) != 0 || result.removed != 0 {
-                // A turn that met a held inode ends on it.
-                assert!(result.visited <= 64, "{before}");
-            }
+            // A turn that met a held inode ends on it: it is the last the
+            // turn visited.
+            let last = (before + result.visited - 1) % storage::NODES;
+            let met: std::vec::Vec<usize> = (0..result.visited)
+                .map(|k| (before + k) % storage::NODES)
+                .filter(|inode| held.contains(inode))
+                .collect();
+            assert!(
+                met.is_empty() || met == [last],
+                "turn from {before} visited {}, met {met:?}",
+                result.visited
+            );
             turns += 1;
             visited += result.visited;
             removed += result.removed;

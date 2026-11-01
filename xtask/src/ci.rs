@@ -130,6 +130,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-interrupt", 14),
     ("posix-tty", 22),
     ("posix-tty-control-steps", 29),
+    ("posix-tty-steps", 30),
     ("relibc-hello", 23),
     ("relibc-threads", 23),
     ("posix-files", 29),

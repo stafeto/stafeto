@@ -207,7 +207,7 @@ pub const NAME_LEN: usize = 16;
 
 mod limits;
 mod retained;
-pub use limits::{AS, CORE, DATA, FSIZE, NOFILE, STACK};
+pub use limits::{AS, CORE, DATA, FSIZE, MEMLOCK, NOFILE, STACK};
 pub use limits::{ExpenditureRoot, Groups, Limit, ResourceLimits, SUPPLEMENTARY_MAX};
 pub use retained::{RetainedLoader, RetainedLoaderReply, RetainedLoaderState};
 pub const INVALID: u32 = 500;
@@ -688,6 +688,9 @@ pub struct Create {
     pub root: bool,
     pub cpus: u8,
     pub ticket: u64,
+    /// The name the record shows (`name_of` of its program), zeros for
+    /// none.
+    pub name: [u8; NAME_LEN],
 }
 
 impl Create {
@@ -695,7 +698,8 @@ impl Create {
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
         w.bytes(&[self.ceiling, self.priority, u8::from(self.root), self.cpus])?;
-        w.u64(self.ticket)
+        w.u64(self.ticket)?;
+        w.bytes(&self.name)
     }
 
     /// BAD_SIZE out of the layout; a ceiling or priority past 63, a
@@ -705,6 +709,8 @@ impl Create {
         let handle_limit = r.u32()?;
         let b = r.bytes(4)?;
         let ticket = r.u64()?;
+        let mut name = [0; NAME_LEN];
+        name.copy_from_slice(r.bytes(NAME_LEN)?);
         r.finish()?;
         let (ceiling, priority) = (b[0], b[1]);
         if ceiling > 63 || priority == 0 || priority > ceiling || b[2] > 1 {
@@ -718,6 +724,7 @@ impl Create {
             root: b[2] == 1,
             cpus: b[3],
             ticket,
+            name,
         })
     }
 }
@@ -1111,6 +1118,11 @@ pub struct Page {
     /// and an exec keeps it, and the service puts the main thread of a new
     /// image on one of these.
     pub cpus: AtomicU64,
+    /// The places of the process's live threads, bit n for the thread of
+    /// place n (the layer's table of threads; the main thread is place 0):
+    /// the layer sets and clears the bits, and `/proc/<pid>/task` lists
+    /// them. 0 for a process whose layer has not set it yet.
+    pub threads: AtomicU64,
     /// Epoch and pending bits for maskable job stops and SIGCONT.
     pub stop_word: AtomicU64,
     pub cont_word: AtomicU64,
@@ -1282,8 +1294,8 @@ pub struct Listing {
     pub euid: u32,
     pub gid: u32,
     pub egid: u32,
-    /// 0 running, 1 stopped, 2 a zombie, 3 asleep (it ran no ticks since a sample
-    /// taken some milliseconds before).
+    /// 0 running, 1 stopped, 2 a zombie, 3 asleep (its main thread waits for
+    /// a message or a reply, or is parked).
     pub state: u32,
     /// The terminal plus one (0 for none): the console is 1.
     pub tty: u32,
@@ -1300,6 +1312,8 @@ pub struct Listing {
     pub ticks: u64,
     /// The bytes of memory charged to the process now (its quota's `used`).
     pub memory: u64,
+    /// The places of its live threads (`Page::threads`).
+    pub threads: u64,
     pub name: [u8; NAME_LEN],
 }
 
@@ -1363,6 +1377,7 @@ impl Listing {
         w.u64(self.ticks)?;
         w.u64(self.memory)?;
         w.u64(self.cpus)?;
+        w.u64(self.threads)?;
         w.bytes(&self.name)
     }
 
@@ -1375,6 +1390,7 @@ impl Listing {
         let ticks = r.u64()?;
         let memory = r.u64()?;
         let cpus = r.u64()?;
+        let threads = r.u64()?;
         let mut name = [0; NAME_LEN];
         name.copy_from_slice(r.bytes(NAME_LEN)?);
         Ok(Self {
@@ -1393,6 +1409,7 @@ impl Listing {
             nice,
             ticks,
             memory,
+            threads,
             name,
         })
     }
@@ -1768,10 +1785,11 @@ mod tests {
             root: true,
             cpus: 0b0011,
             ticket: 0x1234,
+            name: name_of(b"/bin/busybox-probe"),
         };
         let mut w = Writer::new();
         create.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 24);
+        assert_eq!(w.as_bytes().len(), 40);
         assert_eq!(Create::read(Reader::new(w.as_bytes())), Ok(create));
         for (ceiling, priority, root) in [(64, 30, 0), (31, 32, 0), (31, 0, 0), (31, 30, 2)] {
             let mut w = Writer::new();
@@ -1779,6 +1797,7 @@ mod tests {
             w.u32(16).unwrap();
             w.bytes(&[ceiling, priority, root, 0]).unwrap();
             w.u64(0).unwrap();
+            w.bytes(&[0; NAME_LEN]).unwrap();
             assert_eq!(
                 Create::read(Reader::new(w.as_bytes())),
                 Err(Status::BadSize),
@@ -1960,6 +1979,7 @@ mod tests {
             nice: -5,
             ticks: 1 << 40,
             memory: 3 << 20,
+            threads: 0b101,
             name: name_of(b"/bin/sleep"),
         };
         let mut w = Writer::new();

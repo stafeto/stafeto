@@ -1053,6 +1053,18 @@ impl ProbeLink {
         dir: &Path,
         elf: &Path,
     ) -> Result<(), String> {
+        self.link_objects_with(objects, dir, elf, &[])
+    }
+
+    /// `link_objects` with `extra` arguments for the linker after the
+    /// template's (a stack size, `-z stack-size=N`).
+    pub(crate) fn link_objects_with(
+        &self,
+        objects: &[&str],
+        dir: &Path,
+        elf: &Path,
+        extra: &[&str],
+    ) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let archive = dir.join("libostest.a");
         let _ = std::fs::remove_file(&archive);
@@ -1062,6 +1074,7 @@ impl ProbeLink {
         let mut args = self.args.clone();
         args[self.search] = dir.display().to_string();
         args[self.output] = elf.display().to_string();
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
         let mut lld = Command::new(&self.lld);
         if args.first().is_none_or(|arg| arg != "-flavor") {
             lld.args(["-flavor", "gnu"]);
