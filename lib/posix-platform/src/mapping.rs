@@ -5,10 +5,12 @@
 //! `mlock` for relibc's stafeto platform. The pages and the memory map are
 //! the layer's (posix_abi::mmap); a file is read into a mapping with
 //! `pread` and a shared mapping of a file is written back with `pwrite`
-//! through a descriptor the layer keeps for it (`msync`, `munmap`), outside
-//! the layer's locks.
+//! through a pin the layer keeps for the file's description, a place of the
+//! table of descriptors outside the numbers (`msync`, `munmap`), outside the
+//! layer's locks.
 
 use super::call;
+use super::files::{Place, read_at, write_at};
 use core::ffi::{c_int, c_void};
 #[cfg(feature = "map-probe")]
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -77,13 +79,8 @@ fn pause_after_grant() {
 /// relibc's CLOCK_MONOTONIC.
 #[cfg(feature = "map-probe")]
 const CLOCK_MONOTONIC: c_int = 1;
-/// The lowest number the layer's descriptors of mapped files take: near the
-/// top of the table, away from the numbers a program picks.
-const KEEP_FROM: u32 = posix_fs::OPEN_MAX as u32 / 2;
 /// The flag of O_APPEND in the flags of a description (proto_fs::APPEND).
 const APPEND: u32 = 128;
-/// relibc's F_DUPFD_CLOEXEC.
-const F_DUPFD_CLOEXEC: c_int = 1030;
 /// relibc's MS_ASYNC, MS_INVALIDATE and MS_SYNC.
 const MS_ASYNC: c_int = 1;
 const MS_INVALIDATE: c_int = 2;
@@ -95,7 +92,15 @@ const PIECES: usize = 32;
 /// of the process service's rendezvous of shared memory); ENODEV for any
 /// other kind: only files are mapped.
 fn file_info(fd: c_int) -> Result<(u64, u64), c_int> {
-    let info = call(|| posix_abi::names::fstatat(fd, None, 0))?;
+    regular(call(|| posix_abi::names::fstatat(fd, None, 0))?)
+}
+
+/// As `file_info` for the file the pin at `pin` keeps.
+fn pin_info(pin: c_int) -> Result<(u64, u64), c_int> {
+    regular(call(|| posix_abi::shared::pin_information(pin))?)
+}
+
+fn regular(info: proto_fs::NodeInfo) -> Result<(u64, u64), c_int> {
     if info.kind != 2 {
         return Err(ENODEV);
     }
@@ -123,23 +128,16 @@ fn open_flags(fd: c_int) -> Result<u32, c_int> {
     })
 }
 
-/// Whether `fd` still shows the file of identity `key`: a program may have
-/// closed the number the layer keeps for a mapping, or put another file
-/// there (`dup2`).
-fn still(fd: c_int, key: u64) -> bool {
-    file_info(fd).is_ok_and(|(_, now)| now == key)
-}
-
 /// Reads the file from `offset` into `address`, `len` bytes at most, up
 /// to its end: what lies past it stays zero.
-fn fill(fd: c_int, address: usize, len: usize, offset: u64) {
+fn fill(place: Place, address: usize, len: usize, offset: u64) {
     let mut done = 0;
     while done < len {
         // SAFETY: the mapping is writable for `len` bytes and no one else
         // has its address yet (or the caller refills it on MS_INVALIDATE).
         let got = unsafe {
-            super::files::stafeto_pread(
-                fd,
+            read_at(
+                place,
                 (address + done) as *mut u8,
                 len - done,
                 (offset + done as u64) as i64,
@@ -154,8 +152,14 @@ fn fill(fd: c_int, address: usize, len: usize, offset: u64) {
 
 /// The pages of a mapping of a file that lie wholly past its end get no
 /// access, and a reference to them is SIGBUS.
-fn cut_past_end(fd: c_int, address: usize, len: usize, offset: u64, prot: c_int) {
-    let Ok((size, _)) = file_info(fd) else {
+fn cut_past_end(
+    info: Result<(u64, u64), c_int>,
+    address: usize,
+    len: usize,
+    offset: u64,
+    prot: c_int,
+) {
+    let Ok((size, _)) = info else {
         return;
     };
     let in_file = size
@@ -172,12 +176,12 @@ fn cut_past_end(fd: c_int, address: usize, len: usize, offset: u64, prot: c_int)
 }
 
 /// Writes the pieces back to their files, up to each file's end, those
-/// whose descriptor still shows the file only. The first error of a write
+/// whose pin still keeps the file only. The first error of a write
 /// comes back after all the pieces were tried.
 fn write_back(pieces: &[FilePiece]) -> Result<(), c_int> {
     let mut first = Ok(());
     for piece in pieces {
-        let Ok((size, key)) = file_info(piece.fd) else {
+        let Ok((size, key)) = pin_info(piece.pin) else {
             continue;
         };
         if key != piece.key {
@@ -192,8 +196,8 @@ fn write_back(pieces: &[FilePiece]) -> Result<(), c_int> {
         while done < len {
             // SAFETY: the pages are mapped readable at `address`.
             let put = unsafe {
-                super::files::stafeto_pwrite(
-                    piece.fd,
+                write_at(
+                    Place::Pin(piece.pin),
                     (piece.address + done) as *const u8,
                     len - done,
                     (piece.offset + done as u64) as i64,
@@ -227,15 +231,14 @@ pub(crate) fn flush_all() {
     }
 }
 
-/// Closes the descriptors of the files whose last mapping went (those that
-/// still show the file), and tells the process service that this process
-/// maps their objects no more.
+/// Lets go of the pins of the files whose last mapping went, and tells the
+/// process service that this process maps their objects no more.
 fn close_released() {
     let mut files = [(0, 0, false); 16];
     let n = mmap::closed_files(&mut files);
-    for &(fd, key, registered) in &files[..n] {
-        if fd >= 0 && still(fd, key) {
-            super::stafeto_close(fd);
+    for &(pin, key, registered) in &files[..n] {
+        if pin >= 0 {
+            let _ = posix_abi::shared::unpin(pin);
         }
         if registered {
             posix_abi::shares::detach(key);
@@ -298,24 +301,20 @@ fn file_mapping(
     if flags & MAP_SHARED == 0 {
         return private_file(addr, len, prot, flags, fd, offset);
     }
-    // A shared mapping writes through a descriptor of its own, which stays
-    // when the program closes `fd`; mappings of one file share it.
-    let (kept, new) = match mmap::fd_of_key(key).filter(|&kept| still(kept, key)) {
-        Some(kept) => (kept, false),
+    // A shared mapping writes through a pin of the file's description, which
+    // has no number and stays when the program closes `fd`; mappings of one
+    // file share it. A process has `posix_fs::MAP_PINS` of them: one more
+    // file is ENOMEM.
+    let (pin, new) = match mmap::pin_of_key(key) {
+        Some(pin) => (pin, false),
         None => {
-            let mut kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, u64::from(KEEP_FROM));
-            if kept < 0 {
-                kept = super::files::stafeto_fcntl(fd, F_DUPFD_CLOEXEC, 3);
-            }
-            if kept < 0 {
-                return Err(-kept);
-            }
-            (kept, true)
+            let number = u32::try_from(fd).map_err(|_| EBADF)?;
+            (call(|| posix_abi::shared::pin_for_map(number))?, true)
         }
     };
-    let result = shared_file(addr, len, prot, flags, fd, kept, offset, key, writing);
+    let result = shared_file(addr, len, prot, flags, fd, pin, offset, key, writing);
     if result.is_err() && new {
-        super::stafeto_close(kept);
+        let _ = posix_abi::shared::unpin(pin);
     }
     result
 }
@@ -331,14 +330,14 @@ fn private_file(
 ) -> Result<usize, c_int> {
     let address = mmap::mmap(addr, len, prot | PROT_WRITE, flags, None)?;
     // The whole of the last page too: the file shows through it up to its end.
-    fill(fd, address, len.div_ceil(PAGE) * PAGE, offset);
+    fill(Place::Fd(fd), address, len.div_ceil(PAGE) * PAGE, offset);
     if prot & PROT_WRITE == 0
         && let Err(errno) = mmap::mprotect(address, len, prot)
     {
         let _ = mmap::munmap(address, len);
         return Err(errno);
     }
-    cut_past_end(fd, address, len, offset, prot);
+    cut_past_end(file_info(fd), address, len, offset, prot);
     Ok(address)
 }
 
@@ -361,7 +360,7 @@ fn shared_file(
     prot: c_int,
     flags: c_int,
     fd: c_int,
-    kept: c_int,
+    pin: c_int,
     offset: u64,
     key: u64,
     may_write: bool,
@@ -372,7 +371,7 @@ fn shared_file(
     let source = |existing, registered| mmap::FileSource {
         existing,
         offset_pages: first,
-        back: Back::new(kept, 0, key, registered),
+        back: Back::new(pin, 0, key, registered),
         may_write,
         writable: prot & PROT_WRITE != 0,
     };
@@ -446,7 +445,7 @@ fn shared_file(
     if matches!(got, Some(Got::Reserved)) {
         pause_before_fill();
     }
-    fill(kept, address, len.div_ceil(PAGE) * PAGE, offset);
+    fill(Place::Pin(pin), address, len.div_ceil(PAGE) * PAGE, offset);
     if matches!(got, Some(Got::Reserved)) {
         // The file is read: the others may map the object.
         let handed = mmap::object_at(address)
@@ -462,7 +461,7 @@ fn shared_file(
         close_released();
         return Err(errno);
     }
-    cut_past_end(kept, address, len, offset, prot);
+    cut_past_end(pin_info(pin), address, len, offset, prot);
     Ok(address)
 }
 
@@ -595,7 +594,7 @@ pub(crate) fn flush_files() {
 /// Reads the pages of a piece again from the file; a piece that cannot be
 /// written is made writable for that and back.
 fn refresh(piece: &FilePiece) {
-    let Ok((size, key)) = file_info(piece.fd) else {
+    let Ok((size, key)) = pin_info(piece.pin) else {
         return;
     };
     if key != piece.key {
@@ -608,7 +607,7 @@ fn refresh(piece: &FilePiece) {
     if !writable && mmap::mprotect(piece.address, span, PROT_READ | PROT_WRITE).is_err() {
         return;
     }
-    fill(piece.fd, piece.address, room, piece.offset);
+    fill(Place::Pin(piece.pin), piece.address, room, piece.offset);
     if !writable {
         let back = if piece.access == rt::abi::Access::None {
             0

@@ -354,6 +354,10 @@ impl<T, R, S, C> HoldSlot<T, R, S, C> {
 /// the service holds 16 for a session, whatever their kind.
 pub const JOBS_MAX: usize = 16;
 
+/// The most descriptions a process pins for its shared mappings of files,
+/// apart from its numbers (`Table::pin`).
+pub const MAP_PINS: usize = 16;
+
 /// Whether the table has a place for one more job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobPlace {
@@ -374,6 +378,10 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Co
     residents: [HoldSlot<T, R, S, C>; JOBS_MAX],
     closings: [closing::CloseSlot<T, C>; JOBS_MAX],
     release_early: fn(T) -> bool,
+    /// Descriptions kept alive for the shared mappings of files without a
+    /// number: no descriptor shows them, `fcntl`, `closefrom` and the
+    /// numbers a program picks never meet them.
+    pins: [Option<T>; MAP_PINS],
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
     jobs: AtomicU32,
@@ -409,6 +417,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
                 }
             }; JOBS_MAX],
             release_early: |_| false,
+            pins: [None; MAP_PINS],
             jobs: AtomicU32::new(0),
             allocation_limit: N as u32,
         }
@@ -487,6 +496,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         // SAFETY: exclusive startup ownership permits initializing this field.
         unsafe {
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
+            core::ptr::addr_of_mut!((*destination).pins).write([None; MAP_PINS]);
             core::ptr::addr_of_mut!((*destination).jobs).write(AtomicU32::new(0));
             core::ptr::addr_of_mut!((*destination).allocation_limit).write(N as u32);
         }
@@ -646,7 +656,44 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         self.entries
             .iter()
             .any(|slot| matches!(slot.state, EntryState::Open(e) if e.backend == backend))
+            || self.pins.contains(&Some(backend))
             || self.closing_references(backend, true)
+    }
+
+    /// Pins the description `fd` names without a number of its own: it
+    /// stays alive after every descriptor of it closed, until `unpin`.
+    /// The place of the pin, or TooManyOpenFiles when all `MAP_PINS` are
+    /// taken.
+    pub fn pin(&mut self, fd: u32) -> Result<usize, Error> {
+        let backend = self.get(fd)?;
+        let place = self
+            .pins
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::TooManyOpenFiles)?;
+        self.pins[place] = Some(backend);
+        Ok(place)
+    }
+
+    /// What the pin at `place` keeps.
+    pub fn pinned(&self, place: usize) -> Result<T, Error> {
+        self.pins
+            .get(place)
+            .copied()
+            .flatten()
+            .ok_or(Error::BadFileDescriptor)
+    }
+
+    /// The descriptions the pins keep, for a child of `fork`.
+    pub fn pinned_all(&self) -> impl Iterator<Item = T> + '_ {
+        self.pins.iter().flatten().copied()
+    }
+
+    /// Lets go of the pin at `place`: the description to release, when
+    /// nothing else keeps it.
+    pub fn unpin(&mut self, place: usize) -> Option<T> {
+        let backend = self.pins.get_mut(place)?.take()?;
+        self.left(backend)
     }
 
     fn left(&mut self, backend: T) -> Option<T> {
@@ -673,6 +720,16 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn hold(&mut self, fd: u32) -> Result<T, Error> {
         let backend = self.get(fd)?;
+        self.hold_backend(backend)
+    }
+
+    /// As `hold` for the description a pin keeps.
+    pub fn hold_pin(&mut self, place: usize) -> Result<T, Error> {
+        let backend = self.pinned(place)?;
+        self.hold_backend(backend)
+    }
+
+    fn hold_backend(&mut self, backend: T) -> Result<T, Error> {
         if let Some(hold) = self.holds.iter_mut().find_map(|slot| match &mut slot.held {
             Held::Io(h) if h.backend == backend => Some(h),
             _ => None,
@@ -1400,6 +1457,44 @@ mod tests {
         table.hold(ram).unwrap();
         assert_eq!(table.close(ram), Ok(None));
         assert_eq!(table.unhold(7), Some(7));
+    }
+
+    #[test]
+    fn a_pin_keeps_a_description_without_a_number() {
+        let mut table = Table::<u32, 4>::default();
+        let fd = table.insert(7, Flags::default()).unwrap();
+        let place = table.pin(fd).unwrap();
+        // The number goes, the pin keeps the description alive.
+        assert_eq!(table.close(fd), Ok(None));
+        assert_eq!(table.pinned(place), Ok(7));
+        assert_eq!(table.insert(8, Flags::default()), Ok(fd));
+        assert_eq!(table.pinned_all().next(), Some(7));
+        // A request holds it while the pin goes: the release waits for it.
+        assert_eq!(table.hold_pin(place), Ok(7));
+        assert_eq!(table.unpin(place), None);
+        assert_eq!(table.pinned(place), Err(Error::BadFileDescriptor));
+        assert_eq!(table.unhold(7), Some(7));
+        // Without a hold, the last pin returns the description.
+        let again = table.insert(9, Flags::default()).unwrap();
+        let place = table.pin(again).unwrap();
+        assert_eq!(table.unpin(place), None);
+        let place = table.pin(again).unwrap();
+        assert_eq!(table.close(again), Ok(None));
+        assert_eq!(table.unpin(place), Some(9));
+    }
+
+    #[test]
+    fn the_pins_are_sixteen() {
+        let mut table = Table::<u32, 32>::default();
+        let mut places = [0; MAP_PINS];
+        for (index, place) in places.iter_mut().enumerate() {
+            let fd = table.insert(100 + index as u32, Flags::default()).unwrap();
+            *place = table.pin(fd).unwrap();
+        }
+        let fd = table.insert(200, Flags::default()).unwrap();
+        assert_eq!(table.pin(fd), Err(Error::TooManyOpenFiles));
+        assert_eq!(table.unpin(places[3]), None);
+        assert_eq!(table.pin(fd), Ok(places[3]));
     }
 
     #[test]

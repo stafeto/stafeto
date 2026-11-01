@@ -143,7 +143,9 @@ pub unsafe fn after_fork(
 
 /// The descriptions of the RAM file service a forked child's session
 /// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
-pub fn kept_by_fork(out: &mut [rt::fs::PreparedOpen; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+pub fn kept_by_fork(
+    out: &mut [rt::fs::PreparedOpen; posix_fs::KEPT_BY_FORK_MAX],
+) -> Result<usize, i32> {
     process_state(|files| Ok(files.kept_by_fork(out)))
 }
 
@@ -232,6 +234,54 @@ pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -
         let _ = transport.release(release);
     }
     result
+}
+
+/// The pin of a shared mapping: the description the descriptor `fd` names,
+/// kept without a number. Its place, or ENOMEM when the process has
+/// `posix_fs::MAP_PINS` of them.
+pub fn pin_for_map(fd: u32) -> Result<i32, i32> {
+    with_fd(fd, |files| {
+        files
+            .pin_for_map(fd)
+            .map(|place| place as i32)
+            .map_err(|error| match error {
+                posix_fs::FsError::TooManyOpenFiles => ENOMEM,
+                error => crate::error(error),
+            })
+    })
+}
+
+/// Lets go of the pin at `place`; the service closes the description when
+/// nothing else keeps it.
+pub fn unpin(place: i32) -> Result<(), i32> {
+    let place = usize::try_from(place).map_err(|_| EBADF)?;
+    let release = process_state(|files| Ok(files.unpin(place)))?;
+    match release {
+        Some(target) => release_target(target),
+        None => Ok(()),
+    }
+}
+
+/// As `held` for the description the pin at `place` keeps.
+pub fn held_pin<R>(
+    place: i32,
+    run: impl FnOnce(Transport, Target) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let place = usize::try_from(place).map_err(|_| EBADF)?;
+    let (transport, target) = process_state(|files| {
+        let target = files.hold_pin(place).map_err(crate::error)?;
+        Ok((files.transport(), target))
+    })?;
+    window();
+    let result = run(transport, target);
+    let release = process_state(|files| Ok(files.unhold(target)))?;
+    let _ = transport.release(release);
+    result
+}
+
+/// The information of the file a pin keeps.
+pub fn pin_information(place: i32) -> Result<proto_fs::NodeInfo, i32> {
+    held_pin(place, descriptor_information)
 }
 
 /// The information of what a descriptor names.

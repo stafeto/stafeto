@@ -299,7 +299,7 @@ fn check_exact_imports(
     if native.target(4) != Ok(Target::Ram(exact)) || native.target(7) != Ok(Target::Ram(exact)) {
         return Err("alias import token");
     }
-    let mut kept = [held; OPEN_MAX];
+    let mut kept = [held; posix_fs::KEPT_BY_FORK_MAX];
     if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
         return Err("exact alias clone list");
     }

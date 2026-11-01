@@ -909,25 +909,35 @@ static void review(void) {
             check("review: and it stays read-only", write_faults(ro) && mprotect(ro, PAGE, PROT_READ | PROT_WRITE) == 0);
             munmap(ro, PAGE);
         }
-        /* The descriptor the layer keeps: another file put on its number is
-         * not written to and not closed. */
+        /* The layer keeps no number for the mapping: another file put on any
+         * free number, the high ones included, is not written to and not
+         * closed, and the mapping still writes its own file. */
         int other = open("/tmp/posix-map-other", O_RDWR | O_CREAT | O_TRUNC, 0600);
         check("review: another file", other >= 0 && ftruncate(other, PAGE) == 0);
-        int kept = -1;
-        for (int n = 3; n < 64; n++) {
-            if (n != fd && n != other && fcntl(n, F_GETFD) >= 0 && (fcntl(n, F_GETFD) & FD_CLOEXEC)) kept = n;
+        int put = 0;
+        if (other >= 0) {
+            for (int n = 3; n < 64; n++) {
+                if (n != fd && n != other && fcntl(n, F_GETFD) < 0 && dup2(other, n) == n) put++;
+            }
         }
-        check("review: the layer keeps a descriptor", kept > 2);
-        if (kept > 2 && other >= 0) {
-            check("review: dup2 over it", dup2(other, kept) == kept);
+        check("review: every free number took another file", other >= 0 && put > 30);
+        if (other >= 0) {
             w[5] = 'S';
-            msync(w, PAGE, MS_SYNC);
+            check("review: msync", msync(w, PAGE, MS_SYNC) == 0);
             char c = 0;
             check("review: msync does not write to the other file", pread(other, &c, 1, 5) == 1 && c == 0);
-            check("review: and the file is not written either", file_byte(5) != 'S');
-            munmap(w, PAGE);
-            check("review: munmap does not close the program's descriptor", fcntl(kept, F_GETFD) >= 0);
+            c = 0;
+            check("review: and the file is written", pread(fd, &c, 1, 5) == 1 && c == 'S');
+            check("review: munmap", munmap(w, PAGE) == 0);
             w = MAP_FAILED;
+            int alive = 0;
+            for (int n = 3; n < 64; n++) {
+                if (n != fd && n != other && fcntl(n, F_GETFD) >= 0) alive++;
+            }
+            check("review: munmap does not close the program's descriptors", alive == put);
+            for (int n = 3; n < 64; n++) {
+                if (n != fd && n != other) close(n);
+            }
         }
         if (w != MAP_FAILED) munmap(w, PAGE);
         if (other >= 0) close(other);
@@ -993,6 +1003,198 @@ static void review(void) {
     }
     close(fd);
     unlink(scratch);
+}
+
+#define PINS 16
+
+static void pin_path(char *out, size_t size, int i) {
+    snprintf(out, size, "/tmp/posix-map-pin-%d", i);
+}
+
+static int byte_at(const char *path, off_t at) {
+    int fd = open(path, O_RDONLY);
+    char c = 0;
+    int got = fd >= 0 && pread(fd, &c, 1, at) == 1;
+    if (fd >= 0) close(fd);
+    return got ? c : -1;
+}
+
+/* Makes the file i of PAGE bytes of 'a' and maps it shared and writable;
+ * the descriptor is closed at once, so the mapping alone keeps the file. */
+static char *pin_map(int i) {
+    char path[48];
+    pin_path(path, sizeof path, i);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return NULL;
+    char text[16];
+    memset(text, 'a', sizeof text);
+    for (size_t at = 0; at < PAGE; at += sizeof text) {
+        if (write(fd, text, sizeof text) != (ssize_t)sizeof text) {
+            close(fd);
+            return NULL;
+        }
+    }
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return p == MAP_FAILED ? NULL : p;
+}
+
+/* The numbers open now, 0 to 63. */
+static int numbers_open(void) {
+    int open_now = 0;
+    for (int n = 0; n < 64; n++) {
+        if (fcntl(n, F_GETFD) >= 0) open_now++;
+    }
+    return open_now;
+}
+
+static void pin_unlink_all(void) {
+    char path[48];
+    for (int i = 0; i <= PINS; i++) {
+        pin_path(path, sizeof path, i);
+        unlink(path);
+    }
+}
+
+/* The description of a shared mapping of a file has no number: the mapping
+ * works after the program closed every descriptor, the program keeps all 64
+ * numbers, a forked child keeps the mapping, and a process has 16 files
+ * mapped shared at once. */
+static void pins(void) {
+    char *maps[PINS + 1] = {0};
+    char path[48];
+    pin_unlink_all();
+    int before = numbers_open();
+    for (int i = 0; i < PINS; i++) {
+        maps[i] = pin_map(i);
+        if (!maps[i]) printf("posix-map: pins: file %d: errno %d\n", i, errno);
+    }
+    int mapped = 0;
+    for (int i = 0; i < PINS; i++) mapped += maps[i] != NULL;
+    check("pins: 16 files mapped shared", mapped == PINS);
+    if (mapped != PINS) goto out;
+    check("pins: the mappings took no number", numbers_open() == before);
+    /* Not a number is found by a search, and a close of every number from
+     * 3 leaves the mappings alone. */
+    for (int n = 3; n < 64; n++) close(n);
+    check("pins: the mappings survive the close of every number", numbers_open() == 3);
+    for (int i = 0; i < PINS; i++) maps[i][i] = 'P';
+    int written = 0;
+    for (int i = 0; i < PINS; i++) written += msync(maps[i], PAGE, MS_SYNC) == 0;
+    check("pins: msync of all", written == PINS);
+    int stored = 0;
+    for (int i = 0; i < PINS; i++) {
+        pin_path(path, sizeof path, i);
+        stored += byte_at(path, i) == 'P' && byte_at(path, PINS) == 'a';
+    }
+    check("pins: the writes are in the files", stored == PINS);
+    /* A 17th file is refused with ENOMEM, and a free place takes it. */
+    errno = 0;
+    char *extra = pin_map(PINS);
+    check("pins: the 17th file is ENOMEM", extra == NULL && errno == ENOMEM);
+    pin_path(path, sizeof path, 0);
+    int again_fd = open(path, O_RDWR);
+    char *again = again_fd < 0 ? MAP_FAILED : mmap(NULL, PAGE, PROT_READ, MAP_SHARED, again_fd, 0);
+    check("pins: another mapping of a mapped file needs no place", again != MAP_FAILED && again[0] == 'P');
+    if (again != MAP_FAILED) munmap(again, PAGE);
+    if (again_fd >= 0) close(again_fd);
+    /* The program keeps all its numbers: a file and its copies fill the
+     * table to the end while 16 mappings exist. */
+    pin_path(path, sizeof path, 0);
+    int fd = open(path, O_RDONLY);
+    int copies = 0;
+    while (fd >= 0 && dup(fd) >= 0) copies++;
+    check("pins: all 64 numbers are free to use", fd >= 0 && fd + copies == 63 && errno == EMFILE);
+    check("pins: and the table is full", numbers_open() == 64);
+    for (int n = 3; n < 64; n++) close(n);
+    /* A forked child has the mappings and writes through them. */
+    pid_t child = fork();
+    if (child == 0) {
+        int bad = 0;
+        for (int i = 0; i < PINS; i++) {
+            if (maps[i][i] != 'P') bad |= 1;
+            maps[i][i + 100] = 'C';
+            if (msync(maps[i], PAGE, MS_SYNC)) bad |= 2;
+        }
+        if (numbers_open() != 3) bad |= 4;
+        _exit(bad);
+    }
+    int status = 0;
+    check("pins: fork", child > 0 && waitpid(child, &status, 0) == child);
+    check("pins: the child keeps the mappings", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    int kept = 0;
+    for (int i = 0; i < PINS; i++) {
+        pin_path(path, sizeof path, i);
+        kept += byte_at(path, i + 100) == 'C';
+    }
+    check("pins: the child's msync wrote the files", kept == PINS);
+    /* The last munmap gives the place back. */
+    check("pins: munmap", munmap(maps[0], PAGE) == 0);
+    maps[0] = NULL;
+    extra = pin_map(PINS);
+    check("pins: a place freed takes the 17th file", extra != NULL);
+    maps[PINS] = extra;
+out:
+    for (int i = 0; i <= PINS; i++) {
+        if (maps[i]) munmap(maps[i], PAGE);
+    }
+    /* All the descriptions went with the mappings: 32 files open at once. */
+    pin_path(path, sizeof path, 1);
+    int opened = 0;
+    int fds[40];
+    while (opened < 40 && (fds[opened] = open(path, O_RDONLY)) >= 0) opened++;
+    check("pins: the descriptions are given back", opened >= 32);
+    while (opened > 0) close(fds[--opened]);
+    pin_unlink_all();
+}
+
+/* A process maps 16 files shared, closes them and starts the program
+ * `after`, which finds the 32 places of its session free. */
+static int pins_exec(const char *how) {
+    pin_unlink_all();
+    for (int i = 0; i < PINS; i++) {
+        if (!pin_map(i)) return 1;
+    }
+    char *args[] = {"map", "pinsafter", NULL};
+    char *env[] = {NULL};
+    if (strcmp(how, "exec") == 0) {
+        execve("/bin/procs-child", args, env);
+        return 2;
+    }
+    return 3;
+}
+
+static int pins_after(void) {
+    char path[48];
+    pin_path(path, sizeof path, 1);
+    int fds[40];
+    int opened = 0;
+    while (opened < 40 && (fds[opened] = open(path, O_RDWR | O_CREAT, 0600)) >= 0) opened++;
+    int count = opened;
+    while (opened > 0) close(fds[--opened]);
+    pin_unlink_all();
+    return count >= 32 ? 0 : 1;
+}
+
+/* The places a new process has for files: what `pinsafter` opens. */
+static int spawn_status(char **args) {
+    pid_t child;
+    int status = 0;
+    int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+    if (!error) waitpid(child, &status, 0);
+    return !error && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void pins_through_exec(void) {
+    char *plain[] = {"map", "pinsafter", NULL};
+    char *args[] = {"map", "pinexec", "exec", NULL};
+    int free_places = spawn_status(plain);
+    check("pins: a new process has the 32 places", free_places == 0);
+    int after = spawn_status(args);
+    check("pins: exec drops the pins", after == 0);
+    pin_unlink_all();
 }
 
 unsigned long long stafeto_probe_share_key(unsigned long long device, unsigned long long inode);
@@ -1201,6 +1403,8 @@ int main(int argc, char **argv) {
         return role(argv[2], argv[3], atoi(argv[4]), atoi(argv[5]));
     if (argc == 3 && strcmp(argv[1], "intruder") == 0) return intruder(argv[2]);
     if (argc == 3 && strcmp(argv[1], "leave") == 0) return leaver(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "pinexec") == 0) return pins_exec(argv[2]);
+    if (argc == 2 && strcmp(argv[1], "pinsafter") == 0) return pins_after();
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
         /* fork needs a program the process service started. */
@@ -1237,6 +1441,8 @@ int main(int argc, char **argv) {
     shared_by_two_threads();
     shared_when_the_maker_goes();
     review();
+    pins();
+    pins_through_exec();
     leaving();
     unrelated_processes();
     foreign_processes();

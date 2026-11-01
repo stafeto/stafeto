@@ -68,8 +68,8 @@ pub(crate) struct State {
     /// started by init maps its own segments, every program the clock's
     /// page and its record's. A guess that the kernel's refusals raise.
     hidden: usize,
-    /// The descriptors of files whose last shared mapping went, until the
-    /// caller closes them (`take_closed`).
+    /// The pins of files whose last shared mapping went, until the caller
+    /// lets go of them (`take_closed`).
     closed: [(i32, u64, bool); 16],
     closed_len: usize,
 }
@@ -251,8 +251,8 @@ pub unsafe fn after_fork(
     if let Some(parent) = config.replace(Config { process }) {
         core::mem::forget(parent);
     }
-    // The files the parent's shared mappings write to: the child's
-    // descriptors are the parent's numbers.
+    // The files the parent's shared mappings write to: the child's pins
+    // are the parent's places.
     let mut backs = [(0usize, None::<posix_map::Back>, true, false, 0usize); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
         let object = state.map.object(piece.object());
@@ -485,18 +485,18 @@ impl State {
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
             if let Some(back) = gone.and_then(|object| object.back) {
-                // The descriptor and the key go with the last object that
-                // has them.
-                let fd_used = self
+                // The pin and the key go with the last object that has
+                // them.
+                let pin_used = self
                     .map
                     .objects()
-                    .any(|(_, o)| o.back.is_some_and(|b| b.fd == back.fd));
+                    .any(|(_, o)| o.back.is_some_and(|b| b.pin == back.pin));
                 let key_used = self
                     .map
                     .objects()
                     .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key && b.registered));
                 let entry = (
-                    if fd_used { -1 } else { back.fd },
+                    if pin_used { -1 } else { back.pin },
                     back.key,
                     back.registered && !key_used,
                 );
@@ -510,15 +510,15 @@ impl State {
         Ok(())
     }
 
-    /// The descriptor the layer holds for the shared mapping of the file of
+    /// The pin the layer holds for the shared mapping of the file of
     /// `key`, if this process maps it.
-    pub(crate) fn fd_of_key(&self, key: u64) -> Option<i32> {
+    pub(crate) fn pin_of_key(&self, key: u64) -> Option<i32> {
         self.map
             .objects()
-            .find_map(|(_, o)| o.back.filter(|b| b.key == key).map(|b| b.fd))
+            .find_map(|(_, o)| o.back.filter(|b| b.key == key).map(|b| b.pin))
     }
 
-    /// The descriptors of `closed`, moved to `out`: how many.
+    /// The pins of `closed`, moved to `out`: how many.
     pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64, bool)]) -> usize {
         let n = self.closed_len.min(out.len());
         out[..n].copy_from_slice(&self.closed[..n]);

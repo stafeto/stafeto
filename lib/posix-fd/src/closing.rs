@@ -268,10 +268,12 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             generation: slot.generation,
         };
         self.entries[fd as usize].state = EntryState::Closing(token);
-        let last_alias =
-            !self.entries.iter().any(
+        let last_alias = !self.entries.iter().any(
                 |slot| matches!(slot.state, EntryState::Open(open) if open.backend == backend),
             ) && !self.closing_references(backend, false)
+                // A pinned description outlives its last number: the
+                // service keeps it for the mapping.
+                && !self.pins.contains(&Some(backend))
                 && !replacement.is_some_and(|(next, _)| next == backend);
         let snapshot = CloseSnapshot {
             owner,
