@@ -191,6 +191,7 @@ fn main(_: u64) -> u64 {
         generations: None,
         step_told: false,
         step_due: false,
+        files_notify: None,
     };
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
@@ -233,6 +234,9 @@ struct PipeService {
     /// A step is due that no notification told: the next request or
     /// notification makes it and tries to tell again.
     step_due: bool,
+    /// A copy of the file service's channel with NOTIFY alone, which its
+    /// first BROKER_JOBS brought: told of a job nobody asked it for.
+    files_notify: Option<Handle<Channel>>,
 }
 
 /// Where the service maps the process service's page of the credentials
@@ -394,7 +398,54 @@ impl PipeService {
             self.pipes.unwait(end, (label, key));
         }
         let named_due = self.named_cleanup();
-        self.pipes.step(wakes) || self.watches.cleanup_due() || named_due
+        let more = self.pipes.step(wakes) || self.watches.cleanup_due() || named_due;
+        self.tell_files();
+        more
+    }
+
+    /// Tells the file service there are jobs for the files of segments, whoever
+    /// made them (a call of the library is the fast way, this is the sure one):
+    /// by a notification, which never waits, so the pipe service waits for no
+    /// call of the file service. The mark stays where the notification could
+    /// not be sent.
+    fn tell_files(&mut self) {
+        if self.pipes.ipc_notify_pending()
+            && let Some(files) = &self.files_notify
+            && sys::notify(files, proto_pipe::jobs::NOTIFY_BIT).is_ok()
+        {
+            self.pipes.ipc_notify_done();
+        }
+    }
+
+    /// BROKER_JOBS: the jobs for the files of segments, to the file service
+    /// on its broker session alone.
+    fn broker_jobs(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.label() & (proto_pipe::RAM_BROKER | OWN) != proto_pipe::RAM_BROKER {
+            return status(proto_pipe::BAD_FD);
+        }
+        let flags = match proto_pipe::jobs::parse_request(r.body()) {
+            Ok(flags) => flags,
+            Err(status) => return Answer::Status(status),
+        };
+        let brings = flags & proto_pipe::jobs::BRINGS_NOTIFY != 0;
+        if r.handles.len() != usize::from(brings) {
+            return Answer::Status(Status::BadSize);
+        }
+        if brings {
+            match r.handles.take::<Channel>(0) {
+                Ok(handle) => self.files_notify = Some(handle),
+                Err(e) => return Answer::Status(Status::Kernel(e)),
+            }
+        }
+        let (jobs, more) = self.pipes.ipc_take_jobs();
+        if !more {
+            self.pipes.ipc_notify_done();
+        }
+        let w = r.reply();
+        if w.u32(0).is_err() || proto_pipe::jobs::write_reply(more, &jobs, w).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
     }
 
     /// One operation of the session `s` is over (`finished`): it waits no
@@ -433,13 +484,21 @@ impl PipeService {
             .map_err(|e| Answer::Status(Status::Kernel(e)))
     }
 
+    /// The IPC operation `key` of `label` waits no more; a wake a named
+    /// semaphore gave it goes on to the next waiter.
+    fn ipc_done(&mut self, label: u64, key: u64) {
+        let mut wakes = Wakes::default();
+        self.pipes.ipc_wait_done(label, key, &mut wakes);
+        self.tell(&wakes);
+    }
+
     /// The operation `key` of `label` at `end` is over.
     fn finish(&mut self, s: &mut Session<Client, 0>, key: Option<u64>, end: u32) {
         if let Some(key) = key {
             let label = s.label();
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
-            self.pipes.ipc_wait_done(label, key);
+            self.ipc_done(label, key);
             let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
             let queue = if capture.key == key {
                 let queue = capture.queue;
@@ -605,7 +664,7 @@ impl PipeService {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         self.over(s, true);
-        self.pipes.ipc_wait_done(label, cancel.key);
+        self.ipc_done(label, cancel.key);
         // The end the operation waits at is the one its start named; a
         // cancel that names the other leaves no waiter behind either.
         let capture = &mut self.io[((cancel.key & 0xffff_ffff) - 1) as usize];
@@ -835,6 +894,7 @@ impl PipeService {
             &mut wakes,
         );
         self.tell(&wakes);
+        self.tell_files();
         match flow {
             Ok(Flow::Done) => {
                 if long {
@@ -905,9 +965,16 @@ impl PipeService {
                 };
                 let ops = &self.ops;
                 let named = &self.named;
-                if let Err(code) = self.pipes.wait(queue, (label, key), |(l, k)| {
-                    ops.waits(l, k) || named.alive(l, k)
-                }) {
+                // A waiter for a named semaphore stands in the table of the
+                // counted waits alone (`Ipc::named_balance`).
+                let listed = if matches!(block, Block::Named(_)) {
+                    Ok(())
+                } else {
+                    self.pipes.wait(queue, (label, key), |(l, k)| {
+                        ops.waits(l, k) || named.alive(l, k)
+                    })
+                };
+                if let Err(code) = listed {
                     self.io[((key & 0xffff_ffff) - 1) as usize] = IoCapture::EMPTY;
                     let finished = self.ops.finish(&mut s.data.long, label, key);
                     self.over(s, finished);
@@ -944,7 +1011,7 @@ impl PipeService {
             return long_answer(r, long::Reply::Cancelled);
         }
         self.over(s, true);
-        self.pipes.ipc_wait_done(label, key);
+        self.ipc_done(label, key);
         let capture = &mut self.io[((key & 0xffff_ffff) - 1) as usize];
         if capture.key == key {
             let queue = capture.queue;
@@ -1015,9 +1082,12 @@ impl PipeService {
                         Method::SockConnect => {
                             let addr = Addr::read(&mut body).map_err(Answer::Status)?;
                             body.finish().map_err(Answer::Status)?;
-                            self.pipes
-                                .sock_connect(held, end, addr, &mut wakes)
-                                .map(|()| None)
+                            match self.pipes.sock_connect(held, end, addr, &mut wakes) {
+                                Ok(None) => Ok(None),
+                                // The layer connects again as a long operation.
+                                Ok(Some(_)) => Err(proto_pipe::sock::CONNECT_WAIT),
+                                Err(code) => Err(code),
+                            }
                         }
                         Method::SockShutdown => {
                             let how = body.u32().map_err(Answer::Status)?;
@@ -1118,9 +1188,11 @@ impl PipeService {
             return status(proto_pipe::MFILE);
         }
         let (label, root) = (r.label(), s.data.root);
+        let mut wakes = Wakes::default();
         let got = self
             .pipes
-            .sock_accept(&mut s.data.held, endpoint, label, root);
+            .sock_accept(&mut s.data.held, endpoint, label, root, &mut wakes);
+        self.tell(&wakes);
         match got {
             Ok(Some((id, addr))) => {
                 self.finish(s, key, endpoint.id);
@@ -1135,6 +1207,52 @@ impl PipeService {
                 status(code)
             }
             Ok(None) => self.wait(s, r, key, endpoint, notify, None),
+        }
+    }
+
+    /// SOCK_CONNECT_WAIT (`take` false) or SOCK_CONNECT_TAKE: a connect to a
+    /// listener whose queue is full waits at the listener's list until an
+    /// accept makes room.
+    fn sock_connect_wait(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        take: bool,
+    ) -> Answer {
+        let mut body = r.body();
+        let (key, endpoint) = match self.sock_key(s, &mut body, take) {
+            Ok(v) => v,
+            Err(a) => return a,
+        };
+        let addr = match Addr::read(&mut body) {
+            Ok(addr) => addr,
+            Err(status) => return Answer::Status(status),
+        };
+        if body.finish().is_err() || !endpoint.is_sock() {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if !self.take_ok(s, key, endpoint) {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let mut wakes = Wakes::default();
+        let got = self
+            .pipes
+            .sock_connect(&s.data.held, endpoint, addr, &mut wakes);
+        self.tell(&wakes);
+        match got {
+            Ok(None) => {
+                self.finish(s, key, endpoint.id);
+                long_answer(r, long::Reply::Ready(&[]))
+            }
+            Err(code) => {
+                self.finish(s, key, endpoint.id);
+                status(code)
+            }
+            Ok(Some(queue)) => self.wait(s, r, key, endpoint, notify, Some(queue)),
         }
     }
 
@@ -1333,7 +1451,8 @@ impl Service<0> for PipeService {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+                24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+                45,
             ]
         }
         #[cfg(not(feature = "steps"))]
@@ -1439,6 +1558,8 @@ impl Service<0> for PipeService {
                 | Method::SockName
                 | Method::SockOpt),
             ) => self.sock_call(s, r, m),
+            Some(Method::SockConnectWait) => self.sock_connect_wait(s, r, false),
+            Some(Method::SockConnectTake) => self.sock_connect_wait(s, r, true),
             Some(Method::SockAccept) => self.sock_accept(s, r, false),
             Some(Method::SockAcceptTake) => self.sock_accept(s, r, true),
             Some(Method::SockSend) => self.sock_send(s, r, false),
@@ -1459,6 +1580,7 @@ impl Service<0> for PipeService {
                 }
                 Answer::Status(Status::Ok)
             }
+            Some(Method::BrokerJobs) => self.broker_jobs(r),
             Some(
                 method @ (Method::PayerWitness
                 | Method::BrokerPrepare
@@ -1484,8 +1606,8 @@ impl Service<0> for PipeService {
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
         self.abandon(s);
-        self.pipes.ipc_gone(s.label());
-        if self.pipes.gone(&mut s.data.held) {
+        let ipc = self.pipes.ipc_gone(s.label());
+        if self.pipes.gone(&mut s.data.held) || ipc {
             self.kick();
         }
     }

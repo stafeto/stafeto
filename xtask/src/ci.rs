@@ -361,6 +361,16 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     }));
     steps.push(step("host", "clippy", &[], super::ci_lints));
     steps.push(step("host", "host tests", &[], super::host_tests));
+    // The headers of os-test (include, namespace) compile and link against
+    // the sysroot, and the interfaces of POSIX.1-2024 are in the archives:
+    // what passed once passes (tests/os-test/headers-pass.txt,
+    // tests/posix/coverage-pass.txt). Builds on the host only.
+    steps.push(step("host", "os-test headers", &[RELIBC], || {
+        super::os_test_headers(&[])
+    }));
+    steps.push(step("host", "POSIX coverage", &[RELIBC], || {
+        super::coverage::run(&[])
+    }));
     steps.push(step("host", "kernel stack depth", &[], || {
         super::wcet::run(&["stack".to_owned()])
     }));

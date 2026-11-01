@@ -396,6 +396,19 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         println!("Headers requiring review: {}", scan.failed.join(", "));
     }
     println!("Guest tests establish runtime behavior and identify platform stubs.");
+    // The build the numbers come from is the one the checked-in list guards.
+    if args.is_empty() {
+        let passed = crate::guards::coverage_passed(
+            &std::fs::read_to_string(&path).map_err(|e| e.to_string())?,
+            &std::fs::read_to_string(&header_path).map_err(|e| e.to_string())?,
+        );
+        crate::guards::check(
+            "POSIX coverage",
+            "Interfaces (xsh) with a symbol or a macro, and headers (xbd) present, in cargo xtask coverage; STAFETO_BLESS=1 cargo xtask coverage rewrites it",
+            &passed,
+            &crate::root().join("tests/posix/coverage-pass.txt"),
+        )?;
+    }
     Ok(())
 }
 
