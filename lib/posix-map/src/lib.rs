@@ -168,6 +168,10 @@ pub struct Object<H> {
     /// A piece of the object was writable: only then are its pages written
     /// back to the file.
     pub dirty: bool,
+    /// An object of the program's image (code or read-only data) the loader
+    /// filled: immutable, without a file, and shared with a forked child
+    /// without a copy.
+    pub image: bool,
 }
 
 impl<H> Object<H> {
@@ -178,6 +182,7 @@ impl<H> Object<H> {
             back,
             may_write: true,
             dirty: false,
+            image: false,
         }
     }
 }
@@ -720,6 +725,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map.len(), 1);
+    }
+
+    /// The image mark belongs to the object: a new object has none, and the
+    /// mark stays through a cut of the object's piece and through a forget
+    /// and a rebuild of the map.
+    #[test]
+    fn the_image_mark_stays_with_the_object() {
+        assert!(!object(1, 1).image);
+        let mut map = Map::new();
+        let mut code = object(1, 4);
+        code.image = true;
+        code.may_write = false;
+        let index = map.push(0x20_0000, 4, Access::ReadExec, 0, code).unwrap();
+        map.push(0x30_0000, 1, Access::ReadWrite, 0, object(2, 1))
+            .unwrap();
+        map.unmap_keep(index, 0x20_1000, 1).unwrap();
+        assert!(map.object(index).image && !map.object(index).may_write);
+        assert!(!map.iter().all(|p| map.object(p.object()).image));
+        map.forget();
+        let mut again = object(1, 4);
+        again.image = true;
+        let index = map.push(0x20_0000, 4, Access::ReadExec, 0, again).unwrap();
+        assert!(map.object(index).image);
     }
 
     #[test]

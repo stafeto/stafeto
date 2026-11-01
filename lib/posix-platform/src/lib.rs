@@ -1231,6 +1231,26 @@ pub extern "C" fn stafeto_probe_shared_objects() -> u64 {
     posix_abi::fork::probe_shared_objects()
 }
 
+/// The object of the layer's map that holds `address` (posix_abi::fork::
+/// probe_image): into `out` the mappings it has, the bytes of the process's
+/// own quota in use, 1 when a copy of its handle may write, its pages in the
+/// piece and 1 when the layer marks it as image; 0 for an address in no
+/// piece, 1 otherwise.
+///
+/// # Safety
+/// `out` has room for 5 words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_image(address: usize, out: *mut u64) -> c_int {
+    match posix_abi::fork::probe_image(address) {
+        Some(words) => {
+            // SAFETY: the caller gives room for 5 words.
+            unsafe { out.copy_from_nonoverlapping(words.as_ptr(), 5) };
+            1
+        }
+        None => 0,
+    }
+}
+
 /// The most mappings an object of the layer's map has
 /// (posix_abi::fork::probe_mappings).
 #[unsafe(no_mangle)]
