@@ -1312,7 +1312,12 @@ impl ForkEntry {
         let access = abi::Access::from_raw(word(12).into())?;
         let flags = word(28);
         let known = ENTRY_CONTINUES | ENTRY_SHARED | ENTRY_IMAGE;
-        (word(8) > 0 && flags & !known == 0).then_some(ForkEntry {
+        // As Region::read: an image is read-only and not shared.
+        let image = flags & ENTRY_IMAGE != 0;
+        let allowed = !image
+            || (flags & ENTRY_SHARED == 0
+                && matches!(access, abi::Access::Read | abi::Access::ReadExec));
+        (word(8) > 0 && flags & !known == 0 && allowed).then_some(ForkEntry {
             address: long(0),
             pages: word(8),
             access,
@@ -2152,7 +2157,7 @@ mod tests {
                 offset: i as u32,
                 continues: i % 2 == 1,
                 shared: i % 5 == 0,
-                image: i % 7 == 6,
+                image: false,
             })
             .collect();
         let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
@@ -2169,6 +2174,35 @@ mod tests {
         assert_eq!(Transfer::read(&out).unwrap().map().count(), 2);
         out[0] = b'x';
         assert_eq!(Transfer::read(&out), None);
+    }
+
+    /// An entry of a transfer with the image flag comes with Read or
+    /// ReadExec and not shared; anything else is refused as for a region.
+    #[test]
+    fn an_image_entry_is_read_only_and_not_shared() {
+        let entry = |access, shared| ForkEntry {
+            address: 0x20_0000,
+            pages: 2,
+            access,
+            handle: 9,
+            offset: 0,
+            continues: false,
+            shared,
+            image: true,
+        };
+        for ok in [
+            entry(abi::Access::Read, false),
+            entry(abi::Access::ReadExec, false),
+        ] {
+            assert_eq!(ForkEntry::read(&ok.to_bytes()), Some(ok));
+        }
+        for bad in [
+            entry(abi::Access::ReadWrite, false),
+            entry(abi::Access::None, false),
+            entry(abi::Access::Read, true),
+        ] {
+            assert_eq!(ForkEntry::read(&bad.to_bytes()), None);
+        }
     }
 
     /// A region of Regions carries its offset and whether it is shared; an

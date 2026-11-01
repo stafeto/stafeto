@@ -299,6 +299,92 @@ static void forked(void) {
     munmap(p + 3 * PAGE, PAGE);
 }
 
+/* The child of a fork maps the parent's code and read-only data objects:
+ * no copy of them, no write through the code object, the code runs in the
+ * child, and in a grandchild that outlives its parent. */
+extern int stafeto_probe_image(uintptr_t address, uint64_t *out);
+
+static int image_answer(void) { return 4242; }
+
+/* Read-only data of a few pages, an object of its own. */
+static const unsigned char image_table[3 * PAGE] = {1, 2, 3};
+
+static int image_state(const void *at, uint64_t *words) {
+    return stafeto_probe_image((uintptr_t)at, words);
+}
+
+/* What the code and the read-only data show in a process that shares them
+ * with a live parent: bits of what is wrong. */
+static int image_bits(void) {
+    uint64_t code[5] = {0}, data[5] = {0};
+    int bad = 0;
+    if (image_state((const void *)&image_answer, code) != 1 ||
+        image_state((const void *)image_table, data) != 1)
+        return 1;
+    if (code[0] < 2 || data[0] < 2) bad |= 1;
+    if (code[2] != 0 || data[2] != 0 || code[4] != 1 || data[4] != 1) bad |= 4;
+    uintptr_t page = (uintptr_t)&image_answer & ~(PAGE - 1);
+    /* The segments lie outside the room mprotect works in; writing the
+     * code is refused for good. */
+    errno = 0;
+    if (mprotect((void *)page, PAGE, PROT_READ | PROT_WRITE) == 0 || errno != EACCES) bad |= 8;
+    int (*volatile call)(void) = image_answer;
+    if (call() != 4242) bad |= 16;
+    if (((const volatile unsigned char *)image_table)[2] != 3) bad |= 32;
+    return bad;
+}
+
+static void image_shared(void) {
+    uint64_t before[5] = {0}, rodata[5] = {0};
+    check("image: the code is in the map", image_state((const void *)&image_answer, before) == 1);
+    check("image: the layer marks the code", before[4] == 1);
+    check("image: the code has no writable handle", before[2] == 0);
+    check("image: one mapping before the fork", before[0] == 1);
+    check("image: the read-only data is in the map", image_state((const void *)image_table, rodata) == 1);
+    check("image: the read-only data is an image", rodata[4] == 1 && rodata[2] == 0);
+    int fds[2];
+    check("image: pipe", pipe(fds) == 0);
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; return; }
+    if (child == 0) {
+        close(fds[0]);
+        uint64_t mine[5] = {0};
+        int bad = image_bits();
+        if (image_state((const void *)&image_answer, mine) != 1) _exit(1);
+        /* The child did not pay for the code and the read-only data. */
+        if (mine[1] + (mine[3] + rodata[3]) * PAGE > before[1]) bad |= 2;
+        /* A grandchild outlives the child and still runs the shared code. */
+        pid_t middle = getpid();
+        pid_t grandchild = fork();
+        if (grandchild < 0) _exit(bad | 64);
+        if (grandchild == 0) {
+            for (int i = 0; i < 2000 && getppid() == middle; i++) {
+                const struct timespec ms = {0, 1000000};
+                nanosleep(&ms, NULL);
+            }
+            int late = getppid() == middle ? 128 : image_bits();
+            unsigned char byte = (unsigned char)late;
+            _exit(write(fds[1], &byte, 1) == 1 ? 0 : 1);
+        }
+        (void)parent;
+        _exit(bad);
+    }
+    close(fds[1]);
+    int status = 0;
+    check("image: waitpid", waitpid(child, &status, 0) == child);
+    check("image: the child saw the shared code", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: image child bits %d\n", WEXITSTATUS(status));
+    unsigned char late = 255;
+    check("image: the grandchild answered", read(fds[0], &late, 1) == 1);
+    check("image: the grandchild ran the shared code after its parent left", late == 0);
+    if (late) printf("posix-map: image grandchild bits %d\n", late);
+    close(fds[0]);
+    uint64_t after[5] = {0};
+    check("image: one mapping after the children", image_state((const void *)&image_answer, after) == 1 && after[0] == 1);
+}
+
 /* A fork of a map with 97 groups of regions that do not adjoin (the table of
  * pieces holds 128, the program's own take some 30): four objects of 64
  * pages, of which every second page is given back (the last object keeps
@@ -309,55 +395,6 @@ static void forked(void) {
  * the memory held small. */
 #define BLOCKS 4
 #define BLOCK_PAGES 64
-/* The child of a fork maps the parent's code object: no copy of the code,
- * no write through the object, and the code runs. */
-extern int stafeto_probe_image(uintptr_t address, uint64_t *out);
-
-static int image_answer(void) { return 4242; }
-
-static int image_state(uint64_t *words) {
-    return stafeto_probe_image((uintptr_t)&image_answer, words);
-}
-
-static void image_shared(void) {
-    uint64_t before[5] = {0};
-    check("image: the code is in the map", image_state(before) == 1);
-    check("image: the layer marks the code", before[4] == 1);
-    check("image: the code has no writable handle", before[2] == 0);
-    check("image: one mapping before the fork", before[0] == 1);
-    pid_t child = fork();
-    if (child < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; return; }
-    if (child == 0) {
-        uint64_t mine[5] = {0};
-        int bad = 0;
-        if (image_state(mine) != 1) _exit(1);
-        /* The parent maps the object too. */
-        if (mine[0] < 2) bad |= 1;
-        printf("posix-map: image fork: quota in use %llu pages in the parent, %llu in the child, code piece %llu pages\n",
-               (unsigned long long)(before[1] / PAGE), (unsigned long long)(mine[1] / PAGE),
-               (unsigned long long)mine[3]);
-        /* The child did not pay for the code. */
-        if (mine[1] + mine[3] * PAGE > before[1]) bad |= 2;
-        if (mine[2] != 0 || mine[4] != 1) bad |= 4;
-        uintptr_t page = (uintptr_t)&image_answer & ~(PAGE - 1);
-        errno = 0;
-        /* The segments lie outside the room mprotect works in: ENOMEM,
-         * and EACCES if the room ever takes them. */
-        int denied = mprotect((void *)page, PAGE, PROT_READ | PROT_WRITE);
-        int why = errno;
-        if (denied == 0 || (why != ENOMEM && why != EACCES)) bad |= 8;
-        if (image_answer() != 4242) bad |= 16;
-        _exit(bad);
-    }
-    int status = 0;
-    check("image: waitpid", waitpid(child, &status, 0) == child);
-    check("image: the child saw the shared code", WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    if (WIFEXITED(status) && WEXITSTATUS(status))
-        printf("posix-map: image child bits %d\n", WEXITSTATUS(status));
-    uint64_t after[5] = {0};
-    check("image: one mapping after the child", image_state(after) == 1 && after[0] == 1);
-}
-
 static void forked_many(void) {
     char *block[BLOCKS];
     size_t kept = 0;

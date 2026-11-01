@@ -999,9 +999,11 @@ fn take_regions(
     let mut regions = [None; abi::MESSAGE_HANDLES];
     for (i, region) in regions.iter_mut().enumerate().take(count) {
         let read = Region::read(&mut r)?;
-        let reads = handles
-            .info(i)
-            .is_some_and(|(kind, rights)| pl::region_object(kind, rights));
+        // The handle of an image region never writes the object: the
+        // immutability of the image holds here, in the trusted base.
+        let reads = handles.info(i).is_some_and(|(kind, rights)| {
+            pl::region_object(kind, rights) && !(read.image && rights.contains(Rights::MAP_WRITE))
+        });
         if !reads {
             return Err(Status::BadSize);
         }

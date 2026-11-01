@@ -483,9 +483,9 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
     let pages = whole_pages(len)?;
     addr.checked_add(pages * PAGE).ok_or(ENOMEM)?;
     heap(|state| {
-        if !mapped(state, addr, pages) {
-            return Err(ENOMEM);
-        }
+        // The map holds the program's segments too, which lie outside the
+        // room `mapped` checks: write access to an object that may not be
+        // written is refused first.
         if access == Access::ReadWrite
             && state
                 .map
@@ -493,6 +493,9 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
                 .any(|(i, ..)| !state.map.object(state.map.piece(i).object()).may_write)
         {
             return Err(EACCES);
+        }
+        if !mapped(state, addr, pages) {
+            return Err(ENOMEM);
         }
         state.protect(addr, pages, access)
     })
