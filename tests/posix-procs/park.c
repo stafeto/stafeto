@@ -211,6 +211,8 @@ static int park_wait_role(int site, long deadline_ms, const char *what) {
     }
     __atomic_store_n(&pw_posted, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&pw_handled, 0, __ATOMIC_RELEASE);
+    /* Arming site 0 clears the flag of an earlier case, whatever ended it. */
+    stafeto_probe_window(0);
     pthread_create(&pw_waiter, NULL, pw_wait, NULL);
     for (int i = 0; i < 5000 && !stafeto_probe_window_reached(); i++) pause_ms(1);
     expect("the wait reached its site", stafeto_probe_window_reached(), 1);

@@ -5556,27 +5556,27 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
         go.0, go.1
     );
     let limit = TERM_B * 9 / 10;
-    // A loader that copied a smaller map (the floor of its report is 80)
-    // reports a shorter step: its ticks stay under the limit, and at least
-    // one loader holds the full map.
+    // The full map is proved by the line "fork with N one page mappings"
+    // above. A report of Regions comes from any copy of 80 regions or more
+    // (the floor of the loader's report), and the longest request of a full
+    // copy can fall short of the full number (108, 112 and 92 were seen), so
+    // the reports have to exist and stay under the limit, and no more.
     let mut seen = 0;
     for (ticks, held) in reports.iter().filter_map(|r| of(r, 8)) {
         println!(
             "loader step 8, Regions: {ticks} of {limit} (B {TERM_B} less 10 %) with {held} regions held"
         );
+        seen += 1;
         if ticks == 0 || ticks > limit {
             return Err(format!(
                 "the loader's step Regions took {ticks} ticks with {held} regions held, past {limit} (B {TERM_B} with a reserve of 10 %), or none"
             ));
         }
-        if held >= LOADER_REGIONS_MIN {
-            seen += 1;
-        }
     }
     if seen == 0 {
-        return Err(format!(
-            "no loader held {LOADER_REGIONS_MIN} regions: the fork with a full map did not copy"
-        ));
+        return Err(
+            "no loader reported the step Regions: the fork with a full map did not copy".into(),
+        );
     }
     Ok(())
 }
@@ -11614,22 +11614,29 @@ mod tests {
                 .unwrap_err()
                 .contains("did not run")
         );
-        let mut low = loaders(5000);
-        for l in &mut low {
+        // The longest request of a full copy may come before the last
+        // regions: a report with fewer held stands, under the limit.
+        let mut shorter = loaders(5000);
+        for l in &mut shorter {
             *l = l.replace(
                 "kind 8 5000 ticks detail 116",
-                "kind 8 5000 ticks detail 20",
+                "kind 8 5000 ticks detail 92",
+            );
+        }
+        check_loader_steps(&shorter).unwrap();
+        // A map that was not full does not stand for the copy.
+        let mut partial = loaders(5000);
+        for l in &mut partial {
+            *l = l.replace(
+                "fork with 112 one page mappings",
+                "fork with 60 one page mappings",
             );
         }
         assert!(
-            check_loader_steps(&low)
+            check_loader_steps(&partial)
                 .unwrap_err()
-                .contains("did not copy")
+                .contains("full map had 60")
         );
-        // A loader that copied a smaller map reports fewer regions held.
-        let mut smaller = loaders(5000);
-        smaller.push("loader step: kind 8 9000 ticks detail 92".into());
-        check_loader_steps(&smaller).unwrap();
     }
 
     #[test]

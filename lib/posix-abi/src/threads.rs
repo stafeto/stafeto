@@ -206,9 +206,7 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     // asked for FIFO.
     let policy =
         Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
-    move_to(level, policy, false)?;
-    shed_lent_level(own_block().channel.load(Ordering::SeqCst));
-    Ok(())
+    move_to(level, policy, false, true)
 }
 
 /// Moves the calling thread to base level `level` with `policy` (the level
@@ -216,8 +214,18 @@ pub fn set_level(level: u8) -> Result<(), i32> {
 /// a mutex it holds has a ceiling above it; in a section of the layer the
 /// end of the section sets it), and swaps the channel and the timer of its
 /// waits for ones at the new level, so that a wake does not lend it the old.
-/// `tail` puts it at the tail of the level (XSH 2.8.4).
-pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> {
+/// `tail` puts it at the tail of the level (XSH 2.8.4). `shed` ends, on a
+/// move to a lower level, the level that the last wake lent (it holds until
+/// the thread's next receive): the main thread of a new process image passes
+/// false, since it runs on that level now and the tests of Open POSIX
+/// (`mmap/10-1`) rely on it until the lent level of the main thread is
+/// understood (stafeto-design, the main thread's boost).
+pub(crate) fn move_to(
+    level: u8,
+    policy: Policy,
+    tail: bool,
+    shed: bool,
+) -> Result<(), i32> {
     use posix_thread::flag;
     let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
@@ -242,7 +250,11 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
     let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
     let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
     close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
-    close_raw(block.channel.swap(channel.into_raw().0, Ordering::SeqCst));
+    let raw = channel.into_raw().0;
+    close_raw(block.channel.swap(raw, Ordering::SeqCst));
+    if shed && u32::from(level) < old {
+        shed_lent_level(raw);
+    }
     Ok(())
 }
 
@@ -251,10 +263,8 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
 /// that was woken at 30 and moved to 20 would otherwise run at 30 until it
 /// blocks): a notification to the new channel and a receive of it, which
 /// takes no time. Any other bit that the receive took (a cancellation that
-/// reached the new channel meanwhile) is sent back. For `set_level` only: a
-/// process's main thread starts at the top level and moves itself down
-/// through `move_to`, which keeps the level it was started with.
-#[cfg(any(feature = "rtbench", feature = "thread-probe"))]
+/// reached the new channel meanwhile) is sent back. `raw` is the channel just
+/// swapped in, which holds no wake of the thread's own yet.
 fn shed_lent_level(raw: u64) {
     let channel = Handle::<rt::handle::Channel>::borrowed(rt::abi::Handle(raw));
     if sys::notify(&channel, posix_sync::bit::WAKE).is_err() {

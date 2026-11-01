@@ -24,7 +24,7 @@ You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` a
 - **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (15,492 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
 - **Several CPUs.** Up to 4 CPUs are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.
-- **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,183 of 1,187 tests and the Open POSIX Test Suite 1,985 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
+- **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,184 of 1,187 tests and the Open POSIX Test Suite 1,985 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
 - **Programs.** relibc is the C library. BusyBox 1.37 and the ready-made utilities linked into it give 103 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
 - **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, and Apple Virtualization.framework.
 
