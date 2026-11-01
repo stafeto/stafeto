@@ -1155,6 +1155,164 @@ out:
     pin_unlink_all();
 }
 
+/* The places a new process has for files: what `pinsafter` opens. */
+static int spawn_status(char **args) {
+    pid_t child;
+    int status = 0;
+    int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
+    if (!error) waitpid(child, &status, 0);
+    return !error && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* The pin of a shared mapping serves the writes of a description open for
+ * writing only: a file mapped for reading from a read-only descriptor and
+ * then for writing from another reaches the file, in both orders. */
+static void pins_modes(void) {
+    const char *path = "/tmp/posix-map-modes";
+    for (int order = 0; order < 2; order++) {
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        char text[64];
+        memset(text, 'm', sizeof text);
+        check("modes: file", fd >= 0 && write(fd, text, sizeof text) == (ssize_t)sizeof text);
+        close(fd);
+        char *reader = NULL, *writer = NULL;
+        for (int step = 0; step < 2; step++) {
+            if ((step == 0) == (order == 0)) {
+                int r = open(path, O_RDONLY);
+                reader = r < 0 ? NULL : mmap(NULL, PAGE, PROT_READ, MAP_SHARED, r, 0);
+                if (reader == MAP_FAILED) reader = NULL;
+                if (r >= 0) close(r);
+            } else {
+                int w = open(path, O_RDWR);
+                writer = w < 0 ? NULL : mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, w, 0);
+                if (writer == MAP_FAILED) writer = NULL;
+                if (w >= 0) close(w);
+            }
+        }
+        check(order ? "modes: write then read: both mapped" : "modes: read then write: both mapped",
+              reader && writer);
+        if (reader && writer) {
+            writer[5] = 'W';
+            check("modes: msync of the writer", msync(writer, PAGE, MS_SYNC) == 0);
+            check("modes: the byte is in the file", byte_at(path, 5) == 'W');
+            writer[6] = 'V';
+            check("modes: munmap of the writer", munmap(writer, PAGE) == 0);
+            check("modes: and its last byte is in the file", byte_at(path, 6) == 'V');
+            munmap(reader, PAGE);
+        } else {
+            if (reader) munmap(reader, PAGE);
+            if (writer) munmap(writer, PAGE);
+        }
+        unlink(path);
+    }
+}
+
+/* Two threads map and unmap two files for a while: a place of the pins
+ * that one thread gave back and the other took for its file never makes a
+ * mapping read, write or give back the other's file. */
+static volatile int pin_race_failed;
+static const char *pin_race_path[2] = {"/tmp/posix-map-race-a", "/tmp/posix-map-race-b"};
+
+static void *pin_race_thread(void *arg) {
+    long which = (long)arg;
+    const char *path = pin_race_path[which];
+    char mine = which ? 'B' : 'A';
+    for (int round = 0; round < 60 && !pin_race_failed; round++) {
+        int fd = open(path, O_RDWR);
+        char *p = fd < 0 ? MAP_FAILED : mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (fd >= 0) close(fd);
+        if (p == MAP_FAILED) { pin_race_failed = 1; break; }
+        if (p[100] != (which ? 'b' : 'a')) pin_race_failed = 2;
+        p[round] = mine;
+        /* Half of the rounds write back with msync, the others by munmap. */
+        if (round % 2 && msync(p, PAGE, MS_SYNC)) pin_race_failed = 3;
+        if (munmap(p, PAGE)) pin_race_failed = 4;
+        if (byte_at(path, round) != mine) pin_race_failed = 5;
+    }
+    return NULL;
+}
+
+static void pins_race(void) {
+    for (int i = 0; i < 2; i++) {
+        int fd = open(pin_race_path[i], O_RDWR | O_CREAT | O_TRUNC, 0600);
+        char text[256];
+        memset(text, i ? 'b' : 'a', sizeof text);
+        check("pin race: file", fd >= 0 && write(fd, text, sizeof text) == (ssize_t)sizeof text);
+        if (fd >= 0) close(fd);
+    }
+    pin_race_failed = 0;
+    /* The grant pause opens the window between the vouching and the ask. */
+    stafeto_probe_grant_pause(2);
+    pthread_t threads[2];
+    int made = 1;
+    for (long i = 0; i < 2; i++) made &= pthread_create(&threads[i], NULL, pin_race_thread, (void *)i) == 0;
+    check("pin race: threads", made);
+    if (made) for (int i = 0; i < 2; i++) pthread_join(threads[i], NULL);
+    stafeto_probe_grant_pause(0);
+    if (pin_race_failed) printf("posix-map: pin race: step %d\n", pin_race_failed);
+    check("pin race: every mapping shows and writes its own file", !pin_race_failed);
+    for (int i = 0; i < 2; i++) unlink(pin_race_path[i]);
+}
+
+/* A record lock goes with the close of the last number of a description
+ * that a mapping pins, as with the close of any descriptor (POSIX); the
+ * child's F_GETLK shows it. */
+static int lock_get(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return 2;
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+    int got = fcntl(fd, F_GETLK, &fl);
+    return got == 0 && fl.l_type == F_UNLCK ? 0 : 1;
+}
+
+static void pins_lock(void) {
+    const char *path = "/tmp/posix-map-lock";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    check("lock: file", fd >= 0 && ftruncate(fd, PAGE) == 0);
+    if (fd < 0) return;
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0};
+    check("lock: mapped and locked", p != MAP_FAILED && fcntl(fd, F_SETLK, &fl) == 0);
+    char *args[] = {"map", "lockget", (char *)path, NULL};
+    check("lock: another process sees the lock", spawn_status(args) == 1);
+    check("lock: close", close(fd) == 0);
+    check("lock: the close of the last number released it", spawn_status(args) == 0);
+    if (p != MAP_FAILED) {
+        p[3] = 'K';
+        check("lock: the mapping writes on", msync(p, PAGE, MS_SYNC) == 0 && byte_at(path, 3) == 'K');
+        munmap(p, PAGE);
+    }
+    unlink(path);
+}
+
+/* A descriptor closed on fork does not carry the description to the child,
+ * the pin does: the child writes through the mapping. */
+static void pins_close_on_fork(void) {
+    const char *path = "/tmp/posix-map-clofork";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    check("clofork: file", fd >= 0 && ftruncate(fd, PAGE) == 0);
+    if (fd < 0) return;
+    char *p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check("clofork: mapped", p != MAP_FAILED);
+    check("clofork: flag", fcntl(fd, F_SETFD, FD_CLOFORK) == 0);
+    if (p == MAP_FAILED) { close(fd); return; }
+    pid_t child = fork();
+    if (child == 0) {
+        int bad = fcntl(fd, F_GETFD) >= 0 ? 1 : 0;
+        p[9] = 'F';
+        if (msync(p, PAGE, MS_SYNC)) bad |= 2;
+        _exit(bad);
+    }
+    int status = 0;
+    check("clofork: fork", child > 0 && waitpid(child, &status, 0) == child);
+    check("clofork: the number is closed in the child and the mapping writes",
+          WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check("clofork: the file has the child's byte", byte_at(path, 9) == 'F');
+    munmap(p, PAGE);
+    close(fd);
+    unlink(path);
+}
+
 /* A process maps 16 files shared, closes them and starts the program
  * `after`, which finds the 32 places of its session free. */
 static int pins_exec(const char *how) {
@@ -1181,15 +1339,6 @@ static int pins_after(void) {
     while (opened > 0) close(fds[--opened]);
     pin_unlink_all();
     return count >= 32 ? 0 : 1;
-}
-
-/* The places a new process has for files: what `pinsafter` opens. */
-static int spawn_status(char **args) {
-    pid_t child;
-    int status = 0;
-    int error = posix_spawn(&child, "/bin/procs-child", NULL, NULL, args, environ);
-    if (!error) waitpid(child, &status, 0);
-    return !error && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static void pins_through_exec(void) {
@@ -1410,6 +1559,7 @@ int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "leave") == 0) return leaver(argv[2]);
     if (argc == 3 && strcmp(argv[1], "pinexec") == 0) return pins_exec(argv[2]);
     if (argc == 2 && strcmp(argv[1], "pinsafter") == 0) return pins_after();
+    if (argc == 3 && strcmp(argv[1], "lockget") == 0) return lock_get(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
     if (argc == 1) {
         /* fork needs a program the process service started. */
@@ -1447,6 +1597,10 @@ int main(int argc, char **argv) {
     shared_when_the_maker_goes();
     review();
     pins();
+    pins_modes();
+    pins_race();
+    pins_lock();
+    pins_close_on_fork();
     pins_through_exec();
     leaving();
     unrelated_processes();

@@ -70,9 +70,20 @@ pub(crate) struct State {
     hidden: usize,
     /// The pins of files whose last shared mapping went, until the caller
     /// lets go of them (`take_closed`).
-    closed: [(i32, u64, bool); 16],
+    closed: [Closed; CLOSED_MAX],
     closed_len: usize,
 }
+
+/// A shared mapping of a file that went: its pin (place and generation),
+/// the key of its file, and whether the layer tells the process service
+/// that the process maps the file's object no more.
+pub type Closed = (i32, u64, u64, bool);
+
+/// The places of the list of `Closed`: twice the objects of a map. Every
+/// call that unmaps empties the list before it returns (`take_closed`), so
+/// the list holds the objects one call unmapped, and a second call that
+/// runs in another thread meanwhile has the same bound.
+const CLOSED_MAX: usize = 2 * posix_map::MAX_OBJECTS;
 
 /// RLIMIT_AS and RLIMIT_DATA, soft, in bytes (u64::MAX for none): the
 /// layer reads them from the process service at its first mapping and
@@ -95,7 +106,7 @@ static HEAP: Heap = Heap(UnsafeCell::new(State {
     map: Map::new(),
     chunk: 0,
     hidden: HIDDEN,
-    closed: [(0, 0, false); 16],
+    closed: [(0, 0, 0, false); CLOSED_MAX],
     closed_len: 0,
 }));
 static HEAP_LOCK: LayerLock = LayerLock::raising();
@@ -485,23 +496,22 @@ impl State {
                 .unmap(index, at, (to - at) / PAGE)
                 .map_err(|_| ENOMEM)?;
             if let Some(back) = gone.and_then(|object| object.back) {
-                // The pin and the key go with the last object that has
-                // them.
-                let pin_used = self
-                    .map
-                    .objects()
-                    .any(|(_, o)| o.back.is_some_and(|b| b.pin == back.pin));
+                // Each object holds one reference of its pin, and gives it
+                // back with its last piece. The key is told to the process
+                // service with the last object that has it registered. The
+                // list holds an entry for every object of the map at most,
+                // since the caller empties it after each call.
                 let key_used = self
                     .map
                     .objects()
                     .any(|(_, o)| o.back.is_some_and(|b| b.key == back.key && b.registered));
-                let entry = (
-                    if pin_used { -1 } else { back.pin },
-                    back.key,
-                    back.registered && !key_used,
-                );
-                if (entry.0 >= 0 || entry.2) && self.closed_len < self.closed.len() {
-                    self.closed[self.closed_len] = entry;
+                if self.closed_len < self.closed.len() {
+                    self.closed[self.closed_len] = (
+                        back.pin,
+                        back.pin_generation,
+                        back.key,
+                        back.registered && !key_used,
+                    );
                     self.closed_len += 1;
                 }
             }
@@ -510,16 +520,8 @@ impl State {
         Ok(())
     }
 
-    /// The pin the layer holds for the shared mapping of the file of
-    /// `key`, if this process maps it.
-    pub(crate) fn pin_of_key(&self, key: u64) -> Option<i32> {
-        self.map
-            .objects()
-            .find_map(|(_, o)| o.back.filter(|b| b.key == key).map(|b| b.pin))
-    }
-
     /// The pins of `closed`, moved to `out`: how many.
-    pub(crate) fn take_closed(&mut self, out: &mut [(i32, u64, bool)]) -> usize {
+    pub(crate) fn take_closed(&mut self, out: &mut [Closed]) -> usize {
         let n = self.closed_len.min(out.len());
         out[..n].copy_from_slice(&self.closed[..n]);
         self.closed.copy_within(n..self.closed_len, 0);

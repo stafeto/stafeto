@@ -16,7 +16,7 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
 };
-use posix_fs::{Inherited, PosixFs, Resolved, StartupFiles, Target, Transport};
+use posix_fs::{Inherited, PinRef, PosixFs, Resolved, StartupFiles, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
@@ -236,14 +236,14 @@ pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -
     result
 }
 
-/// The pin of a shared mapping: the description the descriptor `fd` names,
-/// kept without a number. Its place, or ENOMEM when the process has
-/// `posix_fs::MAP_PINS` of them.
-pub fn pin_for_map(fd: u32) -> Result<i32, i32> {
+/// A reference to the pin of the shared mapping of the file `key`, kept
+/// without a number (posix_fs::PosixFs::pin_for_map), and whether the pin is
+/// new. ENOMEM when the process has `posix_fs::MAP_PINS` pins of other
+/// files.
+pub fn pin_for_map(fd: u32, key: u64, writes: bool) -> Result<(PinRef, bool), i32> {
     with_fd(fd, |files| {
         files
-            .pin_for_map(fd)
-            .map(|place| place as i32)
+            .pin_for_map(fd, key, writes)
             .map_err(|error| match error {
                 posix_fs::FsError::TooManyOpenFiles => ENOMEM,
                 error => crate::error(error),
@@ -251,25 +251,23 @@ pub fn pin_for_map(fd: u32) -> Result<i32, i32> {
     })
 }
 
-/// Lets go of the pin at `place`; the service closes the description when
-/// nothing else keeps it.
-pub fn unpin(place: i32) -> Result<(), i32> {
-    let place = usize::try_from(place).map_err(|_| EBADF)?;
-    let release = process_state(|files| Ok(files.unpin(place)))?;
+/// Gives back a reference of a pin; the service closes the description
+/// when nothing else keeps it. A reference to a pin that went does nothing.
+pub fn release_pin(pin: PinRef) -> Result<(), i32> {
+    let release = process_state(|files| Ok(files.release_pin(pin)))?;
     match release {
         Some(target) => release_target(target),
         None => Ok(()),
     }
 }
 
-/// As `held` for the description the pin at `place` keeps.
+/// As `held` for the description the pin keeps.
 pub fn held_pin<R>(
-    place: i32,
+    pin: PinRef,
     run: impl FnOnce(Transport, Target) -> Result<R, i32>,
 ) -> Result<R, i32> {
-    let place = usize::try_from(place).map_err(|_| EBADF)?;
     let (transport, target) = process_state(|files| {
-        let target = files.hold_pin(place).map_err(crate::error)?;
+        let target = files.hold_pin(pin).map_err(crate::error)?;
         Ok((files.transport(), target))
     })?;
     window();
@@ -280,8 +278,8 @@ pub fn held_pin<R>(
 }
 
 /// The information of the file a pin keeps.
-pub fn pin_information(place: i32) -> Result<proto_fs::NodeInfo, i32> {
-    held_pin(place, descriptor_information)
+pub fn pin_information(pin: PinRef) -> Result<proto_fs::NodeInfo, i32> {
+    held_pin(pin, descriptor_information)
 }
 
 /// The information of what a descriptor names.

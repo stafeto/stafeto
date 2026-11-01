@@ -273,7 +273,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             ) && !self.closing_references(backend, false)
                 // A pinned description outlives its last number: the
                 // service keeps it for the mapping.
-                && !self.pins.contains(&Some(backend))
+                && !self.pinned_backend(backend)
                 && !replacement.is_some_and(|(next, _)| next == backend);
         let snapshot = CloseSnapshot {
             owner,
@@ -375,7 +375,7 @@ mod tests {
     fn the_last_number_of_a_pinned_description_is_no_last_alias() {
         let mut table = TestTable::default();
         table.place(0, 100, Flags::default()).unwrap();
-        let place = table.pin(0).unwrap();
+        let (pin, _) = table.pin_or_retain(0, 500, false).unwrap();
         let CloseAdmission::Started { token, snapshot } = table.begin_close_unowned(0, 42).unwrap()
         else {
             panic!()
@@ -384,7 +384,7 @@ mod tests {
         assert!(!snapshot.last_alias);
         assert_eq!(table.finish_close(token), Ok(None));
         table.ack_close(token, None).unwrap();
-        assert_eq!(table.unpin(place), Some(100));
+        assert_eq!(table.release_pin(pin), Some(100));
     }
 
     #[test]

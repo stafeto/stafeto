@@ -234,7 +234,7 @@ pub unsafe extern "C" fn stafeto_getdents(
 #[derive(Clone, Copy)]
 pub(crate) enum Place {
     Fd(c_int),
-    Pin(c_int),
+    Pin(posix_fs::PinRef),
 }
 
 /// pread and pwrite: at `offset`, the description's own offset as it

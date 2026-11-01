@@ -83,8 +83,8 @@ pub fn grant(fd: i32) -> Result<(), i32> {
     crate::shared::held(number, grant_with)
 }
 
-/// As `grant` for the file the pin at `pin` keeps (a shared mapping).
-pub fn grant_pin(pin: i32) -> Result<(), i32> {
+/// As `grant` for the file the pin keeps (a shared mapping).
+pub fn grant_pin(pin: posix_fs::PinRef) -> Result<(), i32> {
     crate::shared::held_pin(pin, grant_with)
 }
 

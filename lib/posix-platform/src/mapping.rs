@@ -18,6 +18,7 @@ use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM};
 use posix_abi::mmap::{
     self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
 };
+use posix_fs::PinRef;
 
 const PAGE: usize = 4096;
 
@@ -96,7 +97,7 @@ fn file_info(fd: c_int) -> Result<(u64, u64), c_int> {
 }
 
 /// As `file_info` for the file the pin at `pin` keeps.
-fn pin_info(pin: c_int) -> Result<(u64, u64), c_int> {
+fn pin_info(pin: PinRef) -> Result<(u64, u64), c_int> {
     regular(call(|| posix_abi::shared::pin_information(pin))?)
 }
 
@@ -126,6 +127,28 @@ fn open_flags(fd: c_int) -> Result<u32, c_int> {
                 .map_err(|_| EIO)
         })
     })
+}
+
+/// The flags the description the pin keeps was opened with.
+fn pin_flags(pin: PinRef) -> Result<u32, c_int> {
+    call(|| {
+        posix_abi::shared::held_pin(pin, |transport, target| {
+            let posix_fs::Target::Ram(ram) = target else {
+                return Err(ENODEV);
+            };
+            transport
+                .files()
+                .capture_description(ram.fd())
+                .map(|captured| captured.flags)
+                .map_err(|_| EIO)
+        })
+    })
+}
+
+/// Whether a description opened with `flags` lets a shared mapping write
+/// the file back.
+fn writes_back(flags: u32) -> bool {
+    flags & 3 == 2 && flags & APPEND == 0
 }
 
 /// Reads the file from `offset` into `address`, `len` bytes at most, up
@@ -234,14 +257,19 @@ pub(crate) fn flush_all() {
 /// Lets go of the pins of the files whose last mapping went, and tells the
 /// process service that this process maps their objects no more.
 fn close_released() {
-    let mut files = [(0, 0, false); 16];
-    let n = mmap::closed_files(&mut files);
-    for &(pin, key, registered) in &files[..n] {
-        if pin >= 0 {
-            let _ = posix_abi::shared::unpin(pin);
+    loop {
+        let mut files = [(0, 0, 0, false); 16];
+        let n = mmap::closed_files(&mut files);
+        for &(pin, generation, key, registered) in &files[..n] {
+            if pin >= 0 {
+                let _ = posix_abi::shared::release_pin(PinRef::new(pin as usize, generation));
+            }
+            if registered {
+                posix_abi::shares::detach(key);
+            }
         }
-        if registered {
-            posix_abi::shares::detach(key);
+        if n < files.len() {
+            return;
         }
     }
 }
@@ -261,6 +289,9 @@ pub extern "C" fn stafeto_mmap(
     } else {
         file_mapping(addr as usize, len, prot, flags, fd, offset)
     };
+    // Whatever the call replaced (MAP_FIXED over a shared mapping) or
+    // unmapped on an error gives its pins back here.
+    close_released();
     match result {
         Ok(address) => address as isize,
         Err(errno) => -(errno as isize),
@@ -290,11 +321,10 @@ fn file_mapping(
     // protection; a shared mapping that can be written needs it open for
     // writing, and not for appending.
     let opened = open_flags(fd)?;
-    let (mode, append) = (opened & 3, opened & APPEND != 0);
-    if mode == 1 {
+    if opened & 3 == 1 {
         return Err(EACCES);
     }
-    let writing = mode == 2 && !append;
+    let writing = writes_back(opened);
     if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && !writing {
         return Err(EACCES);
     }
@@ -302,21 +332,36 @@ fn file_mapping(
         return private_file(addr, len, prot, flags, fd, offset);
     }
     // A shared mapping writes through a pin of the file's description, which
-    // has no number and stays when the program closes `fd`; mappings of one
-    // file share it. A process has `posix_fs::MAP_PINS` of them: one more
-    // file is ENOMEM.
-    let (pin, new) = match mmap::pin_of_key(key) {
-        Some(pin) => (pin, false),
-        None => {
-            let number = u32::try_from(fd).map_err(|_| EBADF)?;
-            (call(|| posix_abi::shared::pin_for_map(number))?, true)
-        }
-    };
-    let result = shared_file(addr, len, prot, flags, fd, pin, offset, key, writing);
-    if result.is_err() && new {
-        let _ = posix_abi::shared::unpin(pin);
+    // has no number and stays when the program closes `fd`; the mappings of
+    // one file share it. A process has `posix_fs::MAP_PINS` of them: one
+    // more file is ENOMEM. The key, the access and the vouching all come
+    // from the pin from here on, so a `dup2` of another thread cannot put
+    // another file under them.
+    let pin = acquire_pin(fd, key, writing)?;
+    let mut held = false;
+    let result = shared_file(addr, len, prot, flags, pin, offset, key, writing, &mut held);
+    if result.is_err() && !held {
+        let _ = posix_abi::shared::release_pin(pin);
     }
     result
+}
+
+/// A reference to the pin of the shared mappings of the file of `fd`, whose
+/// identity is `key`; a writing mapping gets a pin of a description open
+/// for writing. A pin of a description another thread put on `fd`
+/// meanwhile is given back and asked again.
+fn acquire_pin(fd: c_int, key: u64, writing: bool) -> Result<PinRef, c_int> {
+    let number = u32::try_from(fd).map_err(|_| EBADF)?;
+    for _ in 0..3 {
+        let (pin, new) = call(|| posix_abi::shared::pin_for_map(number, key, writing))?;
+        let shows_file = pin_info(pin).is_ok_and(|(_, now)| now == key);
+        let may_write = !new || !writing || pin_flags(pin).is_ok_and(writes_back);
+        if shows_file && may_write {
+            return Ok(pin);
+        }
+        let _ = posix_abi::shared::release_pin(pin);
+    }
+    Err(EBADF)
 }
 
 /// A private mapping of a file: pages of the layer's own, read from the file.
@@ -359,11 +404,11 @@ fn shared_file(
     len: usize,
     prot: c_int,
     flags: c_int,
-    fd: c_int,
-    pin: c_int,
+    pin: PinRef,
     offset: u64,
     key: u64,
     may_write: bool,
+    held: &mut bool,
 ) -> Result<usize, c_int> {
     use posix_abi::shares::Got;
     let first = (offset / PAGE as u64) as usize;
@@ -371,13 +416,13 @@ fn shared_file(
     let source = |existing, registered| mmap::FileSource {
         existing,
         offset_pages: first,
-        back: Back::new(pin, 0, key, registered),
+        back: Back::new(pin.place() as i32, pin.generation(), 0, key, registered),
         may_write,
         writable: prot & PROT_WRITE != 0,
     };
     // The file service vouches first that this process has the file open;
     // without that the object is this mapping's alone.
-    let granted = match posix_abi::shares::grant(fd) {
+    let granted = match posix_abi::shares::grant_pin(pin) {
         Ok(()) => true,
         // The service has no place for one more vouching of this process.
         Err(errno) if errno == ENOMEM => return Err(ENOMEM),
@@ -414,18 +459,23 @@ fn shared_file(
     let address = match got {
         Some(Got::Found(memory, covers)) if covers >= first + pages => {
             let address = mmap::mmap(addr, len, prot, flags, Some(source(Some(memory), true)))?;
+            *held = true;
             return Ok(address);
         }
         // An object too short for the mapping (the file grew) is not used:
         // this mapping makes its own, apart from the others. So is the
         // answer Busy of a service with no place for one more waiting ask.
-        Some(Got::Found(..)) | Some(Got::Full) | Some(Got::Busy) | None => mmap::mmap(
-            addr,
-            len,
-            prot | PROT_WRITE,
-            flags,
-            Some(source(None, false)),
-        )?,
+        Some(Got::Found(..)) | Some(Got::Full) | Some(Got::Busy) | None => {
+            let address = mmap::mmap(
+                addr,
+                len,
+                prot | PROT_WRITE,
+                flags,
+                Some(source(None, false)),
+            )?;
+            *held = true;
+            address
+        }
         Some(Got::Reserved) => {
             match mmap::mmap(
                 addr,
@@ -434,7 +484,10 @@ fn shared_file(
                 flags,
                 Some(source(None, true)),
             ) {
-                Ok(address) => address,
+                Ok(address) => {
+                    *held = true;
+                    address
+                }
                 Err(errno) => {
                     posix_abi::shares::detach(key);
                     return Err(errno);
@@ -457,8 +510,8 @@ fn shared_file(
     if prot & PROT_WRITE == 0
         && let Err(errno) = mmap::mprotect(address, len, prot)
     {
+        // The pin goes back with the object, in `stafeto_mmap`.
         let _ = mmap::munmap(address, len);
-        close_released();
         return Err(errno);
     }
     cut_past_end(pin_info(pin), address, len, offset, prot);

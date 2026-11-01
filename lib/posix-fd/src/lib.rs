@@ -358,6 +358,52 @@ pub const JOBS_MAX: usize = 16;
 /// apart from its numbers (`Table::pin`).
 pub const MAP_PINS: usize = 16;
 
+/// What a place of the pins keeps.
+#[derive(Clone, Copy)]
+struct PinSlot<T> {
+    backend: T,
+    /// The identity of the file the mappings through it show.
+    key: u64,
+    /// The description was open for writing: mappings that write back go
+    /// through a pin of this kind only.
+    writes: bool,
+    /// The shared mappings that hold the pin.
+    refs: u32,
+}
+
+/// A reference to a pin: its place and the generation of the place, so
+/// that a reference to a pin that went never names the pin that took its
+/// place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinRef {
+    place: usize,
+    generation: u64,
+}
+
+impl PinRef {
+    pub fn new(place: usize, generation: u64) -> Self {
+        PinRef { place, generation }
+    }
+
+    pub fn place(self) -> usize {
+        self.place
+    }
+
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+impl Default for PinRef {
+    /// A reference that names no pin.
+    fn default() -> Self {
+        PinRef {
+            place: usize::MAX,
+            generation: 0,
+        }
+    }
+}
+
 /// Whether the table has a place for one more job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobPlace {
@@ -381,7 +427,10 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Co
     /// Descriptions kept alive for the shared mappings of files without a
     /// number: no descriptor shows them, `fcntl`, `closefrom` and the
     /// numbers a program picks never meet them.
-    pins: [Option<T>; MAP_PINS],
+    pins: [Option<PinSlot<T>>; MAP_PINS],
+    /// The generation of each place: it grows when the place takes a new
+    /// pin, so a stale `PinRef` names nothing.
+    pin_generations: [u64; MAP_PINS],
     /// Counts the records of jobs that went; a thread that waits for a place
     /// waits on it. The caller wakes it after unlocking.
     jobs: AtomicU32,
@@ -418,6 +467,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
             }; JOBS_MAX],
             release_early: |_| false,
             pins: [None; MAP_PINS],
+            pin_generations: [0; MAP_PINS],
             jobs: AtomicU32::new(0),
             allocation_limit: N as u32,
         }
@@ -497,6 +547,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         unsafe {
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
             core::ptr::addr_of_mut!((*destination).pins).write([None; MAP_PINS]);
+            core::ptr::addr_of_mut!((*destination).pin_generations).write([0; MAP_PINS]);
             core::ptr::addr_of_mut!((*destination).jobs).write(AtomicU32::new(0));
             core::ptr::addr_of_mut!((*destination).allocation_limit).write(N as u32);
         }
@@ -656,43 +707,94 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         self.entries
             .iter()
             .any(|slot| matches!(slot.state, EntryState::Open(e) if e.backend == backend))
-            || self.pins.contains(&Some(backend))
+            || self.pinned_backend(backend)
             || self.closing_references(backend, true)
     }
 
-    /// Pins the description `fd` names without a number of its own: it
-    /// stays alive after every descriptor of it closed, until `unpin`.
-    /// The place of the pin, or TooManyOpenFiles when all `MAP_PINS` are
-    /// taken.
-    pub fn pin(&mut self, fd: u32) -> Result<usize, Error> {
+    /// Whether a pin keeps `backend`.
+    pub(crate) fn pinned_backend(&self, backend: T) -> bool {
+        self.pins
+            .iter()
+            .flatten()
+            .any(|slot| slot.backend == backend)
+    }
+
+    /// A reference to a pin of the shared mapping of the file `key`, kept
+    /// without a number: the live pin of the file when it serves (it
+    /// writes if `writes` asks for that), else a new pin of the description
+    /// `fd` names, which stays alive after every number of it closed. Each
+    /// call counts one reference; `release_pin` gives it back. The flag
+    /// says that the pin is new. TooManyOpenFiles when all `MAP_PINS`
+    /// places are taken.
+    pub fn pin_or_retain(
+        &mut self,
+        fd: u32,
+        key: u64,
+        writes: bool,
+    ) -> Result<(PinRef, bool), Error> {
+        let found = self.pins.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| slot.key == key && (slot.writes || !writes))
+        });
+        if let Some(place) = found {
+            let slot = self.pins[place].as_mut().expect("a live pin");
+            slot.refs = slot.refs.checked_add(1).ok_or(Error::TooManyOpenFiles)?;
+            return Ok((self.pin_ref(place), false));
+        }
         let backend = self.get(fd)?;
         let place = self
             .pins
             .iter()
             .position(Option::is_none)
             .ok_or(Error::TooManyOpenFiles)?;
-        self.pins[place] = Some(backend);
-        Ok(place)
+        self.pin_generations[place] = self.pin_generations[place]
+            .checked_add(1)
+            .ok_or(Error::Io)?;
+        self.pins[place] = Some(PinSlot {
+            backend,
+            key,
+            writes,
+            refs: 1,
+        });
+        Ok((self.pin_ref(place), true))
     }
 
-    /// What the pin at `place` keeps.
-    pub fn pinned(&self, place: usize) -> Result<T, Error> {
-        self.pins
-            .get(place)
-            .copied()
-            .flatten()
+    fn pin_ref(&self, place: usize) -> PinRef {
+        PinRef {
+            place,
+            generation: self.pin_generations[place],
+        }
+    }
+
+    fn pin_slot(&self, pin: PinRef) -> Option<&PinSlot<T>> {
+        let slot = self.pins.get(pin.place)?.as_ref()?;
+        (self.pin_generations[pin.place] == pin.generation).then_some(slot)
+    }
+
+    /// What the pin keeps; BadFileDescriptor for a pin that went.
+    pub fn pinned(&self, pin: PinRef) -> Result<T, Error> {
+        self.pin_slot(pin)
+            .map(|slot| slot.backend)
             .ok_or(Error::BadFileDescriptor)
     }
 
     /// The descriptions the pins keep, for a child of `fork`.
     pub fn pinned_all(&self) -> impl Iterator<Item = T> + '_ {
-        self.pins.iter().flatten().copied()
+        self.pins.iter().flatten().map(|slot| slot.backend)
     }
 
-    /// Lets go of the pin at `place`: the description to release, when
-    /// nothing else keeps it.
-    pub fn unpin(&mut self, place: usize) -> Option<T> {
-        let backend = self.pins.get_mut(place)?.take()?;
+    /// Gives back one reference of the pin: the description to release,
+    /// when it was the last and nothing else keeps the description. A
+    /// reference to a pin that went does nothing.
+    pub fn release_pin(&mut self, pin: PinRef) -> Option<T> {
+        self.pin_slot(pin)?;
+        let slot = self.pins[pin.place].as_mut()?;
+        slot.refs -= 1;
+        if slot.refs > 0 {
+            return None;
+        }
+        let backend = slot.backend;
+        self.pins[pin.place] = None;
         self.left(backend)
     }
 
@@ -724,8 +826,8 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     /// As `hold` for the description a pin keeps.
-    pub fn hold_pin(&mut self, place: usize) -> Result<T, Error> {
-        let backend = self.pinned(place)?;
+    pub fn hold_pin(&mut self, pin: PinRef) -> Result<T, Error> {
+        let backend = self.pinned(pin)?;
         self.hold_backend(backend)
     }
 
@@ -1463,38 +1565,104 @@ mod tests {
     fn a_pin_keeps_a_description_without_a_number() {
         let mut table = Table::<u32, 4>::default();
         let fd = table.insert(7, Flags::default()).unwrap();
-        let place = table.pin(fd).unwrap();
+        let (pin, new) = table.pin_or_retain(fd, 500, false).unwrap();
+        assert!(new);
         // The number goes, the pin keeps the description alive.
         assert_eq!(table.close(fd), Ok(None));
-        assert_eq!(table.pinned(place), Ok(7));
+        assert_eq!(table.pinned(pin), Ok(7));
         assert_eq!(table.insert(8, Flags::default()), Ok(fd));
         assert_eq!(table.pinned_all().next(), Some(7));
         // A request holds it while the pin goes: the release waits for it.
-        assert_eq!(table.hold_pin(place), Ok(7));
-        assert_eq!(table.unpin(place), None);
-        assert_eq!(table.pinned(place), Err(Error::BadFileDescriptor));
+        assert_eq!(table.hold_pin(pin), Ok(7));
+        assert_eq!(table.release_pin(pin), None);
+        assert_eq!(table.pinned(pin), Err(Error::BadFileDescriptor));
         assert_eq!(table.unhold(7), Some(7));
-        // Without a hold, the last pin returns the description.
+        // Without a hold, the last reference returns the description.
         let again = table.insert(9, Flags::default()).unwrap();
-        let place = table.pin(again).unwrap();
-        assert_eq!(table.unpin(place), None);
-        let place = table.pin(again).unwrap();
+        let (pin, _) = table.pin_or_retain(again, 501, false).unwrap();
+        assert_eq!(table.release_pin(pin), None);
+        let (pin, _) = table.pin_or_retain(again, 501, false).unwrap();
         assert_eq!(table.close(again), Ok(None));
-        assert_eq!(table.unpin(place), Some(9));
+        assert_eq!(table.release_pin(pin), Some(9));
+    }
+
+    #[test]
+    fn a_pin_counts_the_mappings_that_hold_it() {
+        let mut table = Table::<u32, 4>::default();
+        let fd = table.insert(7, Flags::default()).unwrap();
+        let (first, new) = table.pin_or_retain(fd, 500, true).unwrap();
+        assert!(new);
+        // Another description of the file finds the live pin.
+        let other = table.insert(8, Flags::default()).unwrap();
+        let (second, new) = table.pin_or_retain(other, 500, true).unwrap();
+        assert!(!new);
+        assert_eq!(second, first);
+        assert_eq!(table.pinned(first), Ok(7));
+        assert_eq!(table.close(fd), Ok(None));
+        assert_eq!(table.release_pin(first), None);
+        assert_eq!(table.pinned(first), Ok(7));
+        assert_eq!(table.release_pin(second), Some(7));
+        assert_eq!(table.pinned(first), Err(Error::BadFileDescriptor));
+    }
+
+    #[test]
+    fn a_stale_reference_does_nothing() {
+        let mut table = Table::<u32, 4>::default();
+        let a = table.insert(7, Flags::default()).unwrap();
+        let (old, _) = table.pin_or_retain(a, 500, false).unwrap();
+        assert_eq!(table.release_pin(old), None);
+        // Another file takes the place of the pin that went.
+        let b = table.insert(8, Flags::default()).unwrap();
+        let (new, fresh) = table.pin_or_retain(b, 600, false).unwrap();
+        assert!(fresh);
+        assert_eq!(new.place(), old.place());
+        assert_ne!(new.generation(), old.generation());
+        // The second release of the old reference leaves the new pin alone.
+        assert_eq!(table.release_pin(old), None);
+        assert_eq!(table.pinned(old), Err(Error::BadFileDescriptor));
+        assert_eq!(table.pinned(new), Ok(8));
+        assert_eq!(table.close(b), Ok(None));
+        assert_eq!(table.release_pin(new), Some(8));
+    }
+
+    #[test]
+    fn a_read_only_pin_does_not_serve_a_writing_mapping() {
+        let mut table = Table::<u32, 4>::default();
+        let read = table.insert(7, Flags::default()).unwrap();
+        let write = table.insert(8, Flags::default()).unwrap();
+        let (a, _) = table.pin_or_retain(read, 500, false).unwrap();
+        // A mapping that reads takes the pin that is there.
+        let (again, new) = table.pin_or_retain(write, 500, false).unwrap();
+        assert!(!new && again == a);
+        // One that writes gets a pin of its own description.
+        let (b, new) = table.pin_or_retain(write, 500, true).unwrap();
+        assert!(new);
+        assert_ne!(a.place(), b.place());
+        assert_eq!(table.pinned(b), Ok(8));
+        // And a later reader takes the first pin of the file that serves.
+        let (c, new) = table.pin_or_retain(read, 500, false).unwrap();
+        assert!(!new);
+        assert_eq!(c, a);
     }
 
     #[test]
     fn the_pins_are_sixteen() {
         let mut table = Table::<u32, 32>::default();
-        let mut places = [0; MAP_PINS];
-        for (index, place) in places.iter_mut().enumerate() {
+        let mut pins = [PinRef::default(); MAP_PINS];
+        for (index, pin) in pins.iter_mut().enumerate() {
             let fd = table.insert(100 + index as u32, Flags::default()).unwrap();
-            *place = table.pin(fd).unwrap();
+            *pin = table
+                .pin_or_retain(fd, 1000 + index as u64, false)
+                .unwrap()
+                .0;
         }
         let fd = table.insert(200, Flags::default()).unwrap();
-        assert_eq!(table.pin(fd), Err(Error::TooManyOpenFiles));
-        assert_eq!(table.unpin(places[3]), None);
-        assert_eq!(table.pin(fd), Ok(places[3]));
+        assert_eq!(
+            table.pin_or_retain(fd, 2000, false),
+            Err(Error::TooManyOpenFiles)
+        );
+        assert_eq!(table.release_pin(pins[3]), None);
+        assert_eq!(table.pin_or_retain(fd, 2000, false).unwrap().0.place(), 3);
     }
 
     #[test]

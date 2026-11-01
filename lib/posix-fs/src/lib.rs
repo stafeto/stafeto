@@ -187,7 +187,7 @@ pub struct DirEntry {
 pub const OPEN_MAX: usize = 64;
 /// The shared mappings of files a process pins besides its descriptors
 /// (`pin_for_map`).
-pub use posix_fd::MAP_PINS;
+pub use posix_fd::{MAP_PINS, PinRef};
 /// The descriptions a forked child of the process can share at most: those
 /// of its descriptors and its pins. A file service session holds fewer
 /// (the RAM service's 32 places), so the list is never full.
@@ -1192,29 +1192,41 @@ impl PosixFs {
         count
     }
 
-    /// Pins the file description `fd` names for a shared mapping, outside
-    /// the numbers: its place, or TooManyOpenFiles when all `MAP_PINS` are
-    /// taken.
-    pub fn pin_for_map(&mut self, fd: u32) -> Result<usize, FsError> {
+    /// A reference to the pin of the shared mapping of the file `key`, kept
+    /// outside the numbers (see `Table::pin_or_retain`): the live pin of
+    /// the file, or a new one of the description `fd` names. TooManyOpenFiles
+    /// when all `MAP_PINS` are taken.
+    pub fn pin_for_map(
+        &mut self,
+        fd: u32,
+        key: u64,
+        writes: bool,
+    ) -> Result<(PinRef, bool), FsError> {
         match self.descriptors.get(fd)? {
-            Target::Ram(_) => self.descriptors.pin(fd).map_err(FsError::from),
+            Target::Ram(_) => self
+                .descriptors
+                .pin_or_retain(fd, key, writes)
+                .map_err(FsError::from),
             _ => Err(FsError::NotSupported),
         }
     }
 
-    /// The pinned description at `place`, held for a request outside the
-    /// owner's lock (as `hold`).
-    pub fn hold_pin(&mut self, place: usize) -> Result<Target, FsError> {
-        self.descriptors.hold_pin(place).map_err(FsError::from)
+    /// The pinned description, held for a request outside the owner's lock
+    /// (as `hold`).
+    pub fn hold_pin(&mut self, pin: PinRef) -> Result<Target, FsError> {
+        self.descriptors.hold_pin(pin).map_err(FsError::from)
     }
 
-    /// Lets go of the pin at `place`: the description to release when no
-    /// descriptor, no request and no other pin keeps it.
-    pub fn unpin(&mut self, place: usize) -> Option<Target> {
-        self.descriptors.unpin(place)
+    /// Gives back a reference of a pin: the description to release when
+    /// it was the last and no descriptor, request or other pin keeps it. A
+    /// reference to a pin that went does nothing.
+    pub fn release_pin(&mut self, pin: PinRef) -> Option<Target> {
+        self.descriptors.release_pin(pin)
     }
 
-    /// Every RAM description retained by exec, including FD_CLOFORK.
+    /// Every RAM description retained by exec, including FD_CLOFORK. The
+    /// pins of shared mappings are not among them: the new image has no
+    /// mappings.
     pub fn kept_by_exec(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, _) in self.descriptors.open() {

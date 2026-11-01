@@ -290,9 +290,9 @@ fn mmap0(
     })
 }
 
-/// The key, the pages, a copy of the object and the pin of a shared object
-/// a forked child joins.
-type Attach = (u64, usize, rt::handle::Handle<rt::handle::Memory>, i32);
+/// The key, the pages, a copy of the object and the pin (place and
+/// generation) of a shared object a forked child joins.
+type Attach = (u64, usize, rt::handle::Handle<rt::handle::Memory>, i32, u64);
 
 /// A forked child joins the process service's entries of the shared objects
 /// it inherited, so that they live as long as it maps them.
@@ -318,13 +318,14 @@ pub(crate) fn attach_shared() {
             if let Ok(copy) = rt::sys::handle_duplicate(&*held, rights | rt::abi::Rights::MAP_WRITE)
                 .or_else(|_| rt::sys::handle_duplicate(&*held, rights))
             {
-                found[n] = Some((back.key, pages, copy, back.pin));
+                found[n] = Some((back.key, pages, copy, back.pin, back.pin_generation));
                 n += 1;
             }
         }
     });
-    for (key, pages, copy, pin) in found.iter().flatten() {
-        if crate::shares::grant_pin(*pin).is_ok() {
+    for (key, pages, copy, pin, generation) in found.iter().flatten() {
+        let pin = posix_fs::PinRef::new(*pin as usize, *generation);
+        if crate::shares::grant_pin(pin).is_ok() {
             let _ = crate::shares::attach(*key, *pages, copy);
         }
     }
@@ -336,7 +337,7 @@ pub(crate) fn attach_shared() {
 pub struct FilePiece {
     pub address: usize,
     pub pages: usize,
-    pub pin: i32,
+    pub pin: posix_fs::PinRef,
     pub offset: u64,
     /// The identity of the file the pin keeps.
     pub key: u64,
@@ -349,7 +350,7 @@ impl Default for FilePiece {
         FilePiece {
             address: 0,
             pages: 0,
-            pin: -1,
+            pin: posix_fs::PinRef::default(),
             offset: 0,
             key: 0,
             access: Access::Read,
@@ -391,7 +392,7 @@ fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> u
                 out[n] = FilePiece {
                     address: from,
                     pages: count,
-                    pin: back.pin,
+                    pin: posix_fs::PinRef::new(back.pin as usize, back.pin_generation),
                     offset: back.offset()
                         + ((piece.offset() + (from - piece.address) / PAGE) * PAGE) as u64,
                     key: back.key,
@@ -404,15 +405,10 @@ fn pieces_in(addr: usize, pages: usize, dirty: bool, out: &mut [FilePiece]) -> u
     })
 }
 
-/// The pin the layer already holds for the file of `key`.
-pub fn pin_of_key(key: u64) -> Option<i32> {
-    heap(|state| state.pin_of_key(key))
-}
-
-/// The pins and keys of the files whose last mapping `munmap` took since
-/// the last call, up to `out.len()`: how many. The caller lets go of the
+/// The pins and keys of the files whose shared mappings `munmap` took since
+/// the last call, up to `out.len()`: how many. The caller gives back the
 /// pins and tells the process service of the keys.
-pub fn closed_files(out: &mut [(i32, u64, bool)]) -> usize {
+pub fn closed_files(out: &mut [crate::allocation::Closed]) -> usize {
     heap(|state| state.take_closed(out))
 }
 
