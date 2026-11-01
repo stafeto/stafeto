@@ -580,10 +580,12 @@ pub fn probe_shared_objects() -> u64 {
 }
 
 /// The most mappings an object of the memory map has, for the probe that
-/// a child's loader leaves no mapping of the parent's objects behind.
+/// a child's loader leaves no mapping of the parent's objects behind. The
+/// objects of the image are left out: the child maps them too (3.12.1).
 pub fn probe_mappings() -> u64 {
     crate::allocation::regions(|map| {
         map.objects()
+            .filter(|(_, o)| !o.image)
             .filter_map(|(_, o)| rt::sys::memory_info(&o.handle).ok())
             .map(|info| info.mappings)
             .max()
