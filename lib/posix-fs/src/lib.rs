@@ -1147,10 +1147,8 @@ impl PosixFs {
             closing[fd as usize] = flags.close_on_fork;
         }
         for (fd, close) in closing.iter().enumerate() {
-            if *close {
-                if let Ok(Some(Target::Proc(id))) = self.descriptors.close(fd as u32) {
-                    release_proc(id);
-                }
+            if *close && let Ok(Some(Target::Proc(id))) = self.descriptors.close(fd as u32) {
+                release_proc(id);
             }
         }
     }
