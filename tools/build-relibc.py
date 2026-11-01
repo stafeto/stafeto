@@ -115,8 +115,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # of the timers, stdatomic.h has a branch for Clang, PRIO_INHERIT unlock asks
 # for one wake, getnameinfo says EAI_OVERFLOW and getaddrinfo reads
 # /etc/services by itself (getservbyname_r), shmctl IPC_SET changes no file;
-# tagged pin-ae35f55a.
-COMMIT = "ae35f55aa72dbf8a6c1f6cdf2f7a1c593918bf6e"
+# tagged pin-00a82696.
+COMMIT = "00a82696724cb1e49766176205263e194de092bf"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

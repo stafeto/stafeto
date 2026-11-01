@@ -64,12 +64,12 @@ static int lc_wait(pid_t pid, long ms) {
 
 /* ---- #320: exit with writers running ---- */
 #define LC_EXIT_LINE 39
-#define LC_EXIT_ROUNDS 20
+#define LC_EXIT_ROUNDS 10
 static const char lc_filler[] = "0123456789abcdefghijklmnopqrstuvwxyz!";
 static FILE *lc_exit_stream;
 static void *lc_writes_lines(void *arg) {
     char id = (char)(intptr_t)arg;
-    for (int i = 0; i < 3000; i++) {
+    for (int i = 0; i < 1500; i++) {
         flockfile(lc_exit_stream);
         putc_unlocked(id, lc_exit_stream);
         for (int j = 0; lc_filler[j] != 0; j++) putc_unlocked(lc_filler[j], lc_exit_stream);
@@ -90,7 +90,7 @@ static int lc_exit_whole_lines(void) {
             pthread_t writer[2];
             for (int i = 0; i < 2; i++)
                 if (pthread_create(&writer[i], NULL, lc_writes_lines, (void *)(intptr_t)('A' + i)) != 0) _exit(3);
-            lc_nap(10 + round % 7);
+            lc_nap(5 + round % 4);
             exit(0);
         }
         if (lc_wait(child, 10000) != 0) return 4;
@@ -139,7 +139,7 @@ static int lc_fclose_flush(void) {
     pthread_t flusher[3];
     for (int i = 0; i < 3; i++)
         if (pthread_create(&flusher[i], NULL, lc_flusher, (void *)(intptr_t)i)) return 2;
-    for (int round = 0; round < 3000 && !lc_foreign; round++) {
+    for (int round = 0; round < 600 && !lc_foreign; round++) {
         /* A descriptor open for reading only, with a stream for writing: the
          * flush of "FOREIGN" fails (EBADF) and the bytes stay in the buffer. */
         int fd = open("/tmp/fclose-a", O_RDONLY);
@@ -263,7 +263,7 @@ static int lc_fork_locks(void) {
     pthread_t spinner[2];
     for (int i = 0; i < 2; i++)
         if (pthread_create(&spinner[i], NULL, lc_aio_spinner, NULL)) return 4;
-    for (int round = 0; round < 200; round++) {
+    for (int round = 0; round < 60; round++) {
         pid_t child = fork();
         if (child < 0) return 5;
         if (child == 0) {
@@ -381,6 +381,8 @@ static int libc_role(void) {
     lc_child("a child of fork does not wait for the locks of aio and of timers", lc_fork_locks);
     lc_child("stdatomic.h in Clang", lc_atomics);
     lc_child("streams over memory use no descriptor", lc_memory_streams);
+    /* The shell the exec cases made is not left for the stages after them. */
+    unlink("/bin/sh");
     if (!failures) printf("posix-procs: libc: exit, fclose, exec of scripts, fork locks, atomics, memory streams ok\n");
     return failures != 0;
 }

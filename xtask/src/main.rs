@@ -3477,7 +3477,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: monotonic ",
         "relibc-hello: gettimeofday, putenv after clearenv, mkstemp errno",
         "relibc-hello: directories, stat, descriptors, mmap, math",
-        "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec",
+        "relibc-hello: memory streams: short write ENOSPC, seek EINVAL, no descriptor",
         "relibc-hello: long transfers, O_SYNC, aio on threads",
         "relibc-hello: timers with a function in a thread",
         &format!(
