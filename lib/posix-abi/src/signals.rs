@@ -176,15 +176,15 @@ static TKILLED: [AtomicU64; crate::relibc::PLACES + 1] =
 static REPEATS: [[AtomicU8; REALTIME_COUNT]; crate::relibc::PLACES + 1] =
     [const { [const { AtomicU8::new(0) }; REALTIME_COUNT] }; crate::relibc::PLACES + 1];
 const REALTIME_COUNT: usize = 64 - REALTIME_MIN as usize + 1;
+/// The bits of the real-time signals in a signal set.
+const REALTIME_BITS: u64 = !0 << (REALTIME_MIN - 1);
 
 /// Queues the signal `signal` for the thread of `block` as a repeat, when an
 /// occurrence of it is pending there already (a real-time signal); false when
 /// there is none, and the caller sends it as a pending occurrence. More
 /// than 255 repeats merge.
+#[inline(never)]
 fn repeat_queued(block: &Block, signal: i32) -> bool {
-    if signal < REALTIME_MIN {
-        return false;
-    }
     let bit = posix_signals::bit(signal).unwrap_or(0);
     if thread_pending(block) & bit == 0 {
         return false;
@@ -211,6 +211,7 @@ fn repeat_queued(block: &Block, signal: i32) -> bool {
 
 /// A pending occurrence of `signal` was taken: the next repeat, if any,
 /// becomes the pending occurrence.
+#[inline(never)]
 fn next_repeat(block: &Block, signal: i32, bit: u64) {
     let counter = &REPEATS[block.thread_id as usize][(signal - REALTIME_MIN) as usize];
     if counter
@@ -227,7 +228,7 @@ fn next_repeat(block: &Block, signal: i32, bit: u64) {
 fn thread_code(block: &Block, signal: i32) -> i32 {
     let bit = posix_signals::bit(signal).unwrap_or(0);
     let word = &TKILLED[block.thread_id as usize];
-    let old = if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
+    let old = if bit & REALTIME_BITS != 0 && thread_pending(block) & bit != 0 {
         word.load(Ordering::SeqCst)
     } else {
         word.fetch_and(!bit, Ordering::SeqCst)
@@ -435,7 +436,7 @@ fn claim_thread(block: &Block, signal: i32) -> Option<u64> {
     } else {
         let bit = posix_signals::bit(signal).ok()?;
         let had = block.pending.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
-        if had && signal >= REALTIME_MIN {
+        if had && bit & REALTIME_BITS != 0 {
             next_repeat(block, signal, bit);
         }
         had.then_some(0)
@@ -1101,8 +1102,7 @@ fn send(
         return;
     }
     // A real-time signal that waits for the thread already queues behind it.
-    let signal = bit.trailing_zeros() as i32 + 1;
-    if repeat_queued(block, signal) {
+    if bit & REALTIME_BITS != 0 && repeat_queued(block, bit.trailing_zeros() as i32 + 1) {
         return;
     }
     // A thread's signal sent by another thread is pthread_kill's.
@@ -1171,7 +1171,7 @@ fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
         });
         if core::ptr::eq(block, own()) {
             if let Some((_, false)) = action {
-                if repeat_queued(block, signal) {
+                if bit & REALTIME_BITS != 0 && repeat_queued(block, signal) {
                     return Ok(false);
                 }
                 let mine = &TKILLED[block.thread_id as usize];
