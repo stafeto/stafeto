@@ -20,15 +20,14 @@
 //! path are applied first (`absolute`), so `./proc/1` from `/` and
 //! `/etc/../proc/1` name the same node as `/proc/1`.
 
-use crate::constants::{
-    EINVAL, EIO, EMFILE, ENOENT, O_ACCMODE, O_CLOEXEC, O_CLOFORK, O_CREAT, O_DIRECTORY, O_TRUNC,
-};
+use crate::constants::{EINVAL, EIO, EMFILE, ENOENT, O_ACCMODE, O_CREAT, O_DIRECTORY, O_TRUNC};
 use core::fmt::Write;
 use proto_fs::{NodeInfo, Timestamp};
 use proto_process::Listing;
 
 const EROFS: i32 = 30;
 const ENOTDIR: i32 = 20;
+const EISDIR: i32 = 21;
 /// Processes the service lists, at most.
 const PROCESSES: usize = proto_process::RECORDS;
 /// The device number `stat` gives for the nodes of `/proc` (the ASCII of
@@ -36,6 +35,7 @@ const PROCESSES: usize = proto_process::RECORDS;
 const DEVICE: u64 = 0x7072_6f63;
 
 /// What a path under `/proc` names.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Node {
     /// `/proc/<pid>`.
     Process(u32),
@@ -55,13 +55,47 @@ enum Node {
     Mounts,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum File {
     Stat,
     Cmdline,
     Status,
     Statm,
+}
+
+impl Node {
+    /// The node as a number and a PID (`from_code` is the inverse), for the
+    /// descriptor an exec carries.
+    fn code(&self) -> (u32, u32) {
+        match *self {
+            Node::Process(pid) => (1, pid),
+            Node::Uptime => (2, 0),
+            Node::SystemStat => (3, 0),
+            Node::Cpuinfo => (4, 0),
+            Node::Meminfo => (5, 0),
+            Node::Loadavg => (6, 0),
+            Node::Mounts => (7, 0),
+            Node::File(pid, file) => (8 + file as u32, pid),
+        }
+    }
+
+    fn from_code(code: u32, pid: u32) -> Option<Node> {
+        Some(match code {
+            1 => Node::Process(pid),
+            2 => Node::Uptime,
+            3 => Node::SystemStat,
+            4 => Node::Cpuinfo,
+            5 => Node::Meminfo,
+            6 => Node::Loadavg,
+            7 => Node::Mounts,
+            8 => Node::File(pid, File::Stat),
+            9 => Node::File(pid, File::Cmdline),
+            10 => Node::File(pid, File::Status),
+            11 => Node::File(pid, File::Statm),
+            _ => return None,
+        })
+    }
 }
 
 /// The node a path under `/proc` names, if it is one of these. The path is
@@ -517,142 +551,317 @@ fn content(node: &Node) -> Result<Text, i32> {
     Ok(text)
 }
 
-/// Opens a path under `/proc`: the read end of a pipe holding the text.
-/// ENOENT for a name that is none of those above or a process that is gone,
-/// EROFS to write or create, ENOTDIR for a directory flag on a file.
+/// The descriptions of the open files and directories of `/proc` (the
+/// `Target::Proc` of a descriptor): one for each descriptor that `open`
+/// made, shared by the duplicates of it. A file keeps the text made at its
+/// open in pages of the heap, which the last `close` gives back; a directory
+/// of a process keeps the PID. Nothing is held by a service. `fork` copies
+/// the table with the memory (the child's offsets are its own from then);
+/// `exec` carries the node and the offset (`inherit`), and the new image
+/// makes the text again at its first read.
+const DESCRIPTIONS: usize = posix_fs::OPEN_MAX;
+
+#[derive(Clone, Copy)]
+struct Description {
+    node: Node,
+    /// Where the next read starts; for a directory, where the next
+    /// `posix_getdents` does.
+    offset: u64,
+    /// The text: its page in the heap (0 until it is made) and its length.
+    page: usize,
+    len: usize,
+}
+
+struct Table {
+    lock: core::sync::atomic::AtomicU32,
+    slots: core::cell::UnsafeCell<[Option<Description>; DESCRIPTIONS]>,
+}
+
+// SAFETY: `lock` guards `slots`.
+unsafe impl Sync for Table {}
+
+static TABLE: Table = Table {
+    lock: core::sync::atomic::AtomicU32::new(0),
+    slots: core::cell::UnsafeCell::new([None; DESCRIPTIONS]),
+};
+
+/// The table of descriptions held, in a section of the layer (a handler of
+/// a signal runs after it, never inside it, so that it can open a file of
+/// `/proc` while the code it interrupted opened another).
+fn with_table<R>(run: impl FnOnce(&mut [Option<Description>; DESCRIPTIONS]) -> R) -> R {
+    use core::sync::atomic::Ordering;
+    posix_sync::enter();
+    while TABLE
+        .lock
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        if posix_sync::futex_wait(&TABLE.lock, 1, posix_sync::CLOCK_MONOTONIC, None) == Err(EINVAL)
+        {
+            let _ = rt::sys::yield_now();
+        }
+    }
+    // SAFETY: the lock gives this borrow alone.
+    let result = run(unsafe { &mut *TABLE.slots.get() });
+    TABLE.lock.store(0, Ordering::Release);
+    posix_sync::futex_wake(&TABLE.lock, u32::MAX);
+    posix_sync::leave();
+    result
+}
+
+/// # Safety
+/// The fork child's sole thread, before any use of `/proc`.
+pub unsafe fn after_fork() {
+    TABLE.lock.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// A free description for `description`: its number.
+fn take(description: Description) -> Result<u32, i32> {
+    posix_fs::set_proc_release(release);
+    with_table(|slots| {
+        let at = slots.iter().position(Option::is_none).ok_or(EMFILE)?;
+        slots[at] = Some(description);
+        Ok(at as u32)
+    })
+}
+
+/// The last descriptor of description `id` closed: its page goes back.
+fn release(id: u32) {
+    let gone = with_table(|slots| slots.get_mut(id as usize).and_then(Option::take));
+    if let Some(description) = gone
+        && description.page != 0
+    {
+        free_text(description.page);
+    }
+}
+
+/// The text of `node` in pages of the heap: the page and the length.
+fn make_text(node: &Node) -> Result<(usize, usize), i32> {
+    let text = content(node)?;
+    let page = crate::allocation::map_pages(PAGE as usize).map_err(|_| crate::constants::ENOMEM)?;
+    // SAFETY: the pages are the heap's, given to this caller alone, and the
+    // text fits in one (TEXT is smaller than a page).
+    unsafe {
+        core::ptr::copy_nonoverlapping(text.bytes.as_ptr(), page.as_ptr(), text.len);
+    }
+    Ok((page.as_ptr() as usize, text.len))
+}
+
+fn free_text(page: usize) {
+    if let Some(pointer) = core::ptr::NonNull::new(page as *mut u8) {
+        // SAFETY: the page came from `map_pages` and nothing reads it now.
+        unsafe { crate::allocation::unmap_pages(pointer, PAGE as usize) };
+    }
+}
+
+/// Description `id` with the text of its file made (a file of the exec made
+/// has none until now).
+fn text_of(id: u32) -> Result<(), i32> {
+    let node = with_table(|slots| {
+        slots
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|d| (d.node, d.page != 0))
+    })
+    .ok_or(crate::constants::EBADF)?;
+    if node.1 {
+        return Ok(());
+    }
+    if matches!(node.0, Node::Process(_)) {
+        return Err(EISDIR);
+    }
+    let (page, len) = make_text(&node.0)?;
+    let kept = with_table(|slots| match slots.get_mut(id as usize) {
+        Some(Some(d)) if d.page == 0 => {
+            d.page = page;
+            d.len = len;
+            true
+        }
+        _ => false,
+    });
+    if !kept {
+        free_text(page);
+    }
+    Ok(())
+}
+
+/// A read of description `id`: up to `out.len()` bytes from its offset;
+/// EISDIR for a directory.
+pub fn read(id: u32, out: &mut [u8]) -> Result<usize, i32> {
+    text_of(id)?;
+    with_table(|slots| {
+        let d = slots
+            .get_mut(id as usize)
+            .and_then(Option::as_mut)
+            .ok_or(crate::constants::EBADF)?;
+        let start = usize::try_from(d.offset).unwrap_or(usize::MAX).min(d.len);
+        let n = out.len().min(d.len - start);
+        // SAFETY: the page holds `len` bytes and stays until the last close.
+        let text = unsafe { core::slice::from_raw_parts(d.page as *const u8, d.len) };
+        out[..n].copy_from_slice(&text[start..start + n]);
+        d.offset += n as u64;
+        Ok(n)
+    })
+}
+
+/// lseek of description `id` (`whence` 0, 1 or 2); EINVAL for a negative
+/// result. A directory has no end to measure from.
+pub fn seek(id: u32, offset: i64, whence: i32) -> Result<i64, i32> {
+    let directory = with_table(|slots| {
+        slots
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .map(|d| matches!(d.node, Node::Process(_)))
+    })
+    .ok_or(crate::constants::EBADF)?;
+    if !directory {
+        text_of(id)?;
+    }
+    with_table(|slots| {
+        let d = slots
+            .get_mut(id as usize)
+            .and_then(Option::as_mut)
+            .ok_or(crate::constants::EBADF)?;
+        let base = match whence {
+            0 => 0,
+            1 => i64::try_from(d.offset).map_err(|_| EINVAL)?,
+            2 if !directory => d.len as i64,
+            _ => return Err(EINVAL),
+        };
+        let at = base
+            .checked_add(offset)
+            .filter(|at| *at >= 0)
+            .ok_or(EINVAL)?;
+        d.offset = at as u64;
+        Ok(at)
+    })
+}
+
+/// The information `fstat` gives of description `id`.
+pub fn description_stat(id: u32) -> Result<NodeInfo, i32> {
+    let node = with_table(|slots| slots.get(id as usize).copied().flatten().map(|d| d.node))
+        .ok_or(crate::constants::EBADF)?;
+    stat_node(&node)
+}
+
+/// The PID whose directory description `id` is, if it is one.
+pub fn directory_pid(id: u32) -> Option<u32> {
+    with_table(|slots| match slots.get(id as usize).copied().flatten() {
+        Some(Description {
+            node: Node::Process(pid),
+            ..
+        }) => Some(pid),
+        _ => None,
+    })
+}
+
+/// The offset of directory description `id`, and its set (`posix_getdents`).
+pub fn directory_offset(id: u32, set: Option<u64>) -> Result<u64, i32> {
+    with_table(|slots| {
+        let d = slots
+            .get_mut(id as usize)
+            .and_then(Option::as_mut)
+            .ok_or(crate::constants::EBADF)?;
+        if let Some(offset) = set {
+            d.offset = offset;
+        }
+        Ok(d.offset)
+    })
+}
+
+/// What an exec carries of a description: the node as a number of the
+/// node, the PID and the offset; `inherit` makes it again.
+pub fn carried(id: u32) -> Option<(u32, u32, u32)> {
+    with_table(|slots| {
+        let d = slots.get(id as usize).copied().flatten()?;
+        let (code, pid) = d.node.code();
+        Some((code, pid, u32::try_from(d.offset).unwrap_or(u32::MAX)))
+    })
+}
+
+/// A description of what `carried` gave, in the new image: its number.
+pub fn inherit(code: u32, pid: u32, offset: u32) -> Option<u32> {
+    let node = Node::from_code(code, pid)?;
+    take(Description {
+        node,
+        offset: u64::from(offset),
+        page: 0,
+        len: 0,
+    })
+    .ok()
+}
+
+/// Opens a path under `/proc`: a description of the layer holding the text
+/// of the file, or the PID of a directory of a process, and the lowest free
+/// descriptor for it. ENOENT for a name that is none of those above or a
+/// process that is gone, EROFS to write or create, ENOTDIR for a directory
+/// flag on a file.
 pub fn open(path: &[u8], flags: i32) -> Result<i32, i32> {
     let node = parse(path).ok_or(ENOENT)?;
     if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
         return Err(EROFS);
     }
-    if let Node::Process(pid) = node {
-        // The directory of a process: a descriptor of the image's /proc
-        // that remembers whose files `getdents` lists.
-        find(pid)?;
-        return open_directory(pid, flags);
-    }
-    if flags & O_DIRECTORY != 0 {
-        return Err(ENOTDIR);
-    }
-    let text = content(&node)?;
-    let ends = crate::pipe2(flags & (O_CLOEXEC | O_CLOFORK))?;
-    let written = crate::write(ends[1], &text.bytes[..text.len]);
-    let _ = crate::close(ends[1]);
-    match written {
-        Ok(n) if n == text.len => Ok(ends[0]),
-        Ok(_) => {
-            let _ = crate::close(ends[0]);
-            Err(EIO)
+    let (page, len) = match node {
+        Node::Process(pid) => {
+            // The directory of a process: only its PID is kept.
+            find(pid)?;
+            (0, 0)
         }
+        _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+        _ => make_text(&node)?,
+    };
+    let id = match take(Description {
+        node,
+        offset: 0,
+        page,
+        len,
+    }) {
+        Ok(id) => id,
         Err(errno) => {
-            let _ = crate::close(ends[0]);
-            Err(if errno == EMFILE { EMFILE } else { errno })
+            if page != 0 {
+                free_text(page);
+            }
+            return Err(errno);
         }
-    }
-}
-
-/// A descriptor of the directory `/proc` of the image, which `getdents`
-/// lists as the directory of `pid` (see `directory_pid`).
-fn open_directory(pid: u32, flags: i32) -> Result<i32, i32> {
-    use posix_fs::Target;
-    let fd = crate::open_image(b"/proc", flags | O_DIRECTORY, 0, 0)?;
-    let named = crate::shared::held(fd as u32, |_, target| match target {
-        Target::Ram(ram) => Ok((ram.description_slot(), ram.generation())),
-        _ => Err(EIO),
+    };
+    let inserted = crate::shared::with_files(|files| {
+        files
+            .insert_proc(id, crate::descriptor_flags(flags))
+            .map_err(crate::error)
     });
-    match named {
-        Ok((slot, generation)) => {
-            remember(slot, generation, pid);
-            Ok(fd)
-        }
+    match inserted {
+        Ok(fd) => Ok(fd as i32),
         Err(errno) => {
-            let _ = crate::close(fd);
+            release(id);
             Err(errno)
         }
     }
 }
 
-/// How many directories of processes stay open at once with their PID; an
-/// older one beyond that lists `/proc` itself.
-const DIRECTORIES: usize = 8;
-/// The directories of processes that are open: the description of the
-/// image's `/proc` (its slot and generation in the file service) and the
-/// PID, `0` for a free place. A spin flag guards the places.
-static DIRECTORY_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static DIRECTORY_SLOT: [core::sync::atomic::AtomicU32; DIRECTORIES] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; DIRECTORIES];
-static DIRECTORY_GENERATION: [core::sync::atomic::AtomicU64; DIRECTORIES] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; DIRECTORIES];
-static DIRECTORY_PID: [core::sync::atomic::AtomicU32; DIRECTORIES] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; DIRECTORIES];
-static DIRECTORY_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-fn directories<R>(run: impl FnOnce() -> R) -> R {
-    use core::sync::atomic::Ordering;
-    while DIRECTORY_BUSY
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    let result = run();
-    DIRECTORY_BUSY.store(false, Ordering::Release);
-    result
-}
-
-fn remember(slot: u32, generation: u64, pid: u32) {
-    use core::sync::atomic::Ordering::Relaxed;
-    directories(|| {
-        let place = (0..DIRECTORIES)
-            .find(|&i| {
-                DIRECTORY_PID[i].load(Relaxed) != 0
-                    && DIRECTORY_SLOT[i].load(Relaxed) == slot
-                    && DIRECTORY_GENERATION[i].load(Relaxed) == generation
-            })
-            .or_else(|| (0..DIRECTORIES).find(|&i| DIRECTORY_PID[i].load(Relaxed) == 0))
-            .unwrap_or_else(|| DIRECTORY_NEXT.fetch_add(1, Relaxed) % DIRECTORIES);
-        DIRECTORY_SLOT[place].store(slot, Relaxed);
-        DIRECTORY_GENERATION[place].store(generation, Relaxed);
-        DIRECTORY_PID[place].store(pid, Relaxed);
-    });
-}
-
-/// The PID whose directory the description of the image's `/proc` with this
-/// slot and generation was opened for, if it was opened for one.
-pub fn directory_pid(slot: u32, generation: u64) -> Option<u32> {
-    use core::sync::atomic::Ordering::Relaxed;
-    directories(|| {
-        (0..DIRECTORIES)
-            .find(|&i| {
-                DIRECTORY_PID[i].load(Relaxed) != 0
-                    && DIRECTORY_SLOT[i].load(Relaxed) == slot
-                    && DIRECTORY_GENERATION[i].load(Relaxed) == generation
-            })
-            .map(|i| DIRECTORY_PID[i].load(Relaxed))
-    })
-}
-
 /// The path of `name` read against the directory descriptor `dirfd`, when the
-/// descriptor is one of `/proc` of the image (`open_directory` marks the
-/// directories of processes; the directory `/proc` itself is the node that
-/// `stat` of `/proc` names): `/proc/<pid>/<name>` for the first and
-/// `/proc/<name>` for the second. The programs that walk `/proc` with
-/// `openat` (htop) open a process's files this way. `None` for an absolute
-/// name, any other descriptor and a path too long.
+/// descriptor is one of `/proc`: the description of a directory of a process
+/// (`open`) gives `/proc/<pid>/<name>`, and the directory `/proc` itself (a
+/// directory of the image: the node that `stat` of `/proc` names) gives
+/// `/proc/<name>`. The programs that walk `/proc` with `openat` (htop) open
+/// a process's files this way. `None` for an absolute name, any other
+/// descriptor and a path too long.
 pub fn relative(dirfd: i32, name: &[u8]) -> Option<Absolute> {
     use posix_fs::Target;
     if name.is_empty() || name[0] == b'/' {
         return None;
     }
     let fd = u32::try_from(dirfd).ok()?;
-    let (slot, generation) = crate::shared::held(fd, |_, target| match target {
-        Target::Ram(ram) => Ok((ram.description_slot(), ram.generation())),
+    let proc_directory = crate::shared::held(fd, |_, target| match target {
+        Target::Proc(id) => Ok(Some(id)),
+        Target::Ram(_) => Ok(None),
         _ => Err(EIO),
     })
     .ok()?;
     let mut text = Text::new();
-    match directory_pid(slot, generation) {
-        Some(pid) => write!(text, "/proc/{pid}/").ok()?,
+    match proc_directory {
+        Some(id) => write!(text, "/proc/{}/", directory_pid(id)?).ok()?,
         None => {
             let this = crate::names::fstatat(dirfd, None, 0).ok()?;
             let proc = crate::names::fstatat(crate::names::AT_FDCWD, Some(b"/proc"), 0).ok()?;
@@ -675,7 +884,11 @@ pub fn relative(dirfd: i32, name: &[u8]) -> Option<Absolute> {
 /// of its files and of `/proc/uptime` (regular files of root and the user).
 pub fn stat(path: &[u8]) -> Result<NodeInfo, i32> {
     let node = parse(path).ok_or(ENOENT)?;
-    let (kind, permissions, uid, gid, inode) = match node {
+    stat_node(&node)
+}
+
+fn stat_node(node: &Node) -> Result<NodeInfo, i32> {
+    let (kind, permissions, uid, gid, inode) = match *node {
         Node::Process(pid) => {
             let l = find(pid)?;
             (1, 0o555, l.euid, l.egid, u64::from(pid) << 4)
@@ -744,6 +957,11 @@ pub fn is_directory(info: &NodeInfo) -> bool {
 /// 1 to 4), so a listing that goes on in several calls, while processes
 /// start and end, takes each process that lives throughout once.
 pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize, i32> {
+    entries_from(out, position, pid).map(|(used, _)| used)
+}
+
+/// `entries`, and the position after the last entry it gave.
+pub fn entries_from(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<(usize, u64), i32> {
     /// The entries before the PIDs of `/proc`.
     const FIXED: u64 = 8;
     let mut list = [0u32; PROCESSES];
@@ -754,7 +972,7 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
     list[..count].sort_unstable();
     let list = &list[..count];
     let at = core::cell::Cell::new(position);
-    posix_change::dirent::fill(
+    let used = posix_change::dirent::fill(
         out,
         |name| {
             let here = at.get();
@@ -824,5 +1042,6 @@ pub fn entries(out: &mut [u8], position: u64, pid: Option<u32>) -> Result<usize,
             at.set(u64::try_from(offset).map_err(|_| EINVAL)?);
             Ok(())
         },
-    )
+    )?;
+    Ok((used, at.get()))
 }

@@ -517,6 +517,8 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             };
             Ok(Some((flags & 3) as c_int | append))
         }
+        // A file or directory of /proc is read only.
+        posix_fs::Target::Proc(_) => Ok(Some(0)),
         _ => Ok(None),
     })
 }

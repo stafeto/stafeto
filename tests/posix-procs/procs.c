@@ -183,6 +183,7 @@
  *
  * The first argument picks the role: none for the parent, else that of
  * a child (`role`). */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -2916,7 +2917,140 @@ static int nice_role(void);
 static int sched_role(void);
 #endif
 
+#if PROCFS
+/* The files and directories of /proc are descriptions of the layer: no pipe,
+ * no table of remembered directories. */
+static volatile sig_atomic_t proc_signals;
+static void proc_handler(int signal) {
+    (void)signal;
+    char path[32];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)getpid());
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) close(fd);
+    proc_signals++;
+}
+
+/* The text of /proc/<pid>/<name> through the directory descriptor `dir`. */
+static int proc_first_number(int dir, const char *name) {
+    int fd = openat(dir, name, O_RDONLY);
+    if (fd < 0) return -1;
+    char text[64] = {0};
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    return n > 0 ? atoi(text) : -2;
+}
+
+static int proc_has_entry(int dir, const char *name) {
+    int found = 0;
+    lseek(dir, 0, SEEK_SET);
+    DIR *stream = fdopendir(dup(dir));
+    if (!stream) return 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) found |= strcmp(entry->d_name, name) == 0;
+    closedir(stream);
+    return found;
+}
+
+static int proc_fd_role(void) {
+    int fd = atoi(argv_seen[2]);
+    char text[64] = {0};
+    ssize_t n = read(fd, text, sizeof text - 1);
+    /* The text is the new image's, read from the offset the old one left. */
+    return n > 0 ? 0 : 41;
+}
+
+static int proc_descriptions(void) {
+    pid_t other = getppid();
+    int before = failures;
+    /* One descriptor free: the open of a file of /proc takes it, and no
+     * second one for a pipe. */
+    int held[80], count = 0;
+    for (; count < 80; count++) {
+        held[count] = open("/dev/null", O_RDONLY);
+        if (held[count] < 0) break;
+    }
+    expect("the table fills", errno == EMFILE, 1);
+    if (count > 0) close(held[--count]);
+    char stat_path[32];
+    snprintf(stat_path, sizeof stat_path, "/proc/%d/stat", (int)getpid());
+    int fd = open(stat_path, O_RDONLY);
+    expect("the open of /proc/<pid>/stat on the last free descriptor", fd >= 0, 1);
+    char text[128] = {0};
+    expect("it reads", fd >= 0 && read(fd, text, sizeof text - 1) > 0 && atoi(text) == (int)getpid(), 1);
+    if (fd >= 0) close(fd);
+    while (count > 0) close(held[--count]);
+
+    printf("posix-procs: proc stage nine\n");
+    /* Nine directories of processes open together, each lists and reads the
+     * files of its own process. */
+    pid_t pids[2] = {getpid(), other};
+    int dirs[9], opened = 0;
+    for (int i = 0; i < 9; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "/proc/%d", (int)pids[i % 2]);
+        dirs[i] = open(path, O_RDONLY | O_DIRECTORY);
+        if (dirs[i] >= 0) opened++;
+    }
+    expect("nine directories of processes", opened, 9);
+    int right = 0;
+    for (int i = 0; i < 9; i++)
+        if (dirs[i] >= 0 && proc_has_entry(dirs[i], "status")
+            && proc_first_number(dirs[i], "stat") == (int)pids[i % 2]) right++;
+    expect("each of the nine lists and reads its own process", right, 9);
+    for (int i = 0; i < 9; i++) if (dirs[i] >= 0) close(dirs[i]);
+
+    printf("posix-procs: proc stage handler\n");
+    /* A handler that opens /proc/self while the code it interrupted opens
+     * directories of processes does not hang. */
+    struct sigaction action = {.sa_handler = proc_handler}, old;
+    sigemptyset(&action.sa_mask);
+    expect("handler for the timer", sigaction(SIGALRM, &action, &old), 0);
+    timer_t timer_id;
+    struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM};
+    struct itimerspec every = {{0, 1000000}, {0, 1000000}};
+    expect("timer for the handler", timer_create(CLOCK_MONOTONIC, &event, &timer_id), 0);
+    timer_settime(timer_id, 0, &every, NULL);
+    for (int i = 0; i < 400; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "/proc/%d", (int)getpid());
+        int dir = open(path, O_RDONLY | O_DIRECTORY);
+        if (dir >= 0) close(dir);
+    }
+    timer_delete(timer_id);
+    sigaction(SIGALRM, &old, NULL);
+    expect("the handler ran while directories opened", proc_signals > 0, 1);
+
+    printf("posix-procs: proc stage fork\n");
+    /* The description crosses fork (its own offset in the child) and exec
+     * (the node and the offset, a text of the new image). */
+    int up = open("/proc/uptime", O_RDONLY);
+    char three[4] = {0};
+    expect("three bytes of uptime", up >= 0 && read(up, three, 3) == 3, 1);
+    pid_t forked = fork();
+    if (forked == 0) {
+        char more[32] = {0};
+        _exit(read(up, more, sizeof more - 1) > 0 ? 0 : 1);
+    }
+    reap("a forked child reads the description", forked, 0, 0);
+    pid_t execed = fork();
+    if (execed == 0) {
+        char number[16];
+        snprintf(number, sizeof number, "%d", up);
+        execl("/bin/procs-child", "procs-child", "proc-fd", number, (char *)NULL);
+        _exit(42);
+    }
+    reap("an exec keeps the description", execed, 0, 0);
+    if (up >= 0) close(up);
+    if (failures == before) printf("posix-procs: proc descriptions ok\n");
+    return failures != before;
+}
+#endif
+
 static int role(const char *name) {
+#if PROCFS
+    if (strcmp(name, "proc-fd") == 0) return proc_fd_role();
+    if (strcmp(name, "procdesc") == 0) return proc_descriptions();
+#endif
 #if PENDING_OPEN_PROBE
     if (strcmp(name, "pendingfork") == 0) return check_pending_fork();
 #endif
@@ -5137,6 +5271,14 @@ int main(int argc, char **argv) {
     printf("posix-procs: stage sched\n");
     spawned_scheduling();
     printf("posix-procs: sched ok\n");
+#if PROCFS
+    {
+        /* A child that was spawned from a file has code in its map to fork. */
+        pid_t describer = -1;
+        expect("spawn of the /proc probe", spawn(&describer, "procdesc", NULL, NULL), 0);
+        if (describer > 0) reap("the /proc probe", describer, 0, 0);
+    }
+#endif
 #endif
     printf("posix-procs: stage waits\n");
     waits(child);

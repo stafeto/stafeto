@@ -688,6 +688,8 @@ const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
+    // /proc in the layer: the probe opens its files and directories.
+    programs[5].3 = &["pending-open", "names-probe", "procfs"];
     programs
 };
 const POSIX_NATIVE_SCOPE_PROGRAMS: [ImageProgram; 11] = {

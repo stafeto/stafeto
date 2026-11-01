@@ -128,6 +128,14 @@ pub enum Names {
         ram_generation: u64,
         pipe_generation: u64,
     },
+    /// A file or directory of `/proc` (the layer's `procfs`): the number of
+    /// its node, the PID the node belongs to and the offset; the new image
+    /// makes the description again, with the text of the moment.
+    Proc {
+        node: u32,
+        pid: u32,
+        offset: u32,
+    },
 }
 
 /// A descriptor the child starts with.
@@ -153,6 +161,9 @@ impl Descriptor {
                 ram_generation,
                 pipe_generation,
             } => (8, packed, ram_generation, pipe_generation),
+            Names::Proc { node, pid, offset } => {
+                (9, node, u64::from(pid) | u64::from(offset) << 32, 0)
+            }
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -172,7 +183,10 @@ impl Descriptor {
         let fd = word(0);
         let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if word(1) != 8 && (ram_generation != 0 || pipe_generation != 0) {
+        if word(1) != 8 && word(1) != 9 && (ram_generation != 0 || pipe_generation != 0) {
+            return None;
+        }
+        if word(1) == 9 && pipe_generation != 0 {
             return None;
         }
         let names = match (word(1), word(2)) {
@@ -196,6 +210,11 @@ impl Descriptor {
                     pipe_generation,
                 }
             }
+            (9, node) if (1..=11).contains(&node) => Names::Proc {
+                node,
+                pid: ram_generation as u32,
+                offset: (ram_generation >> 32) as u32,
+            },
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
