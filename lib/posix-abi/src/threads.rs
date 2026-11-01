@@ -206,7 +206,9 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     // asked for FIFO.
     let policy =
         Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
-    move_to(level, policy, false)
+    move_to(level, policy, false)?;
+    shed_lent_level(own_block().channel.load(Ordering::SeqCst));
+    Ok(())
 }
 
 /// Moves the calling thread to base level `level` with `policy` (the level
@@ -240,11 +242,7 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
     let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
     let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
     close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
-    let raw = channel.into_raw().0;
-    close_raw(block.channel.swap(raw, Ordering::SeqCst));
-    if u32::from(level) < old {
-        shed_lent_level(raw);
-    }
+    close_raw(block.channel.swap(channel.into_raw().0, Ordering::SeqCst));
     Ok(())
 }
 
@@ -253,7 +251,10 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
 /// that was woken at 30 and moved to 20 would otherwise run at 30 until it
 /// blocks): a notification to the new channel and a receive of it, which
 /// takes no time. Any other bit that the receive took (a cancellation that
-/// reached the new channel meanwhile) is sent back.
+/// reached the new channel meanwhile) is sent back. For `set_level` only: a
+/// process's main thread starts at the top level and moves itself down
+/// through `move_to`, which keeps the level it was started with.
+#[cfg(any(feature = "rtbench", feature = "thread-probe"))]
 fn shed_lent_level(raw: u64) {
     let channel = Handle::<rt::handle::Channel>::borrowed(rt::abi::Handle(raw));
     if sys::notify(&channel, posix_sync::bit::WAKE).is_err() {
