@@ -80,6 +80,21 @@ pub const PROGRAM_ROOM: Range<u64> = 0x1000..0x0200_0000;
 /// The program's main stack: right under abi::INIT_STACK_TOP, with the
 /// guard page below it unmapped.
 pub const STACK_SIZE: u64 = 64 * 1024;
+/// The most a program may ask for its main stack (`PT_GNU_STACK`).
+pub const STACK_MAX: u64 = 8 * 1024 * 1024;
+
+/// The size of the main stack of a program whose file asks for `asked`
+/// bytes (0 for none): STACK_SIZE or more, whole pages, at most STACK_MAX.
+pub const fn stack_size(asked: u64) -> u64 {
+    let asked = asked.next_multiple_of(4096);
+    if asked < STACK_SIZE {
+        STACK_SIZE
+    } else if asked > STACK_MAX {
+        STACK_MAX
+    } else {
+        asked
+    }
+}
 /// The start area (`Start`), which the loader makes and fills.
 pub const START_AREA: u64 = 0xF000_0000;
 /// The most bytes of the start area: the area itself and the copy of the
@@ -1025,7 +1040,7 @@ pub const ROOMS: [Range<u64>; 4] = [
     PROGRAM_ROOM,
     HEAP_ROOM,
     START_AREA..START_AREA + AREA_MAX,
-    abi::INIT_STACK_TOP - STACK_SIZE..abi::INIT_STACK_TOP,
+    abi::INIT_STACK_TOP - STACK_MAX..abi::INIT_STACK_TOP,
 ];
 
 /// One region of the parent's memory a copy takes: `pages` whole pages
@@ -1569,6 +1584,17 @@ mod tests {
         assert!(copy_block(|i| good[i], len, &mut [0; 8]).is_err());
     }
 
+    /// The main stack is 64 KiB unless the file asks for more, in whole
+    /// pages, and 8 MiB at most.
+    #[test]
+    fn the_main_stack_follows_the_file_within_limits() {
+        assert_eq!(stack_size(0), STACK_SIZE);
+        assert_eq!(stack_size(8192), STACK_SIZE);
+        assert_eq!(stack_size(1 << 20), 1 << 20);
+        assert_eq!(stack_size((1 << 20) + 1), (1 << 20) + 4096);
+        assert_eq!(stack_size(1 << 40), STACK_MAX);
+    }
+
     /// The room of a program's segments leaves out the loader's region, the
     /// layer's fixed pages, the start area and the stack.
     #[test]
@@ -1589,7 +1615,7 @@ mod tests {
             PROGRAM_ROOM.contains(&0x20_0000),
             "where lld puts a program"
         );
-        const { assert!(START_AREA + AREA_MAX <= abi::INIT_STACK_TOP - STACK_SIZE - 4096) };
+        const { assert!(START_AREA + AREA_MAX <= abi::INIT_STACK_TOP - STACK_MAX - 4096) };
     }
 
     /// The start area: the header names the stack, whose pointers name
