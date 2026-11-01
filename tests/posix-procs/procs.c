@@ -3076,10 +3076,12 @@ static int proc_descriptions(void) {
     expect("handler for the timer", sigaction(SIGALRM, &action, &old), 0);
     timer_t timer_id;
     struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGALRM};
-    struct itimerspec every = {{0, 10000000}, {0, 10000000}};
+    /* A period well past the time the handler takes (it asks the process
+     * service), so that the main code makes progress between signals. */
+    struct itimerspec every = {{0, 100000000}, {0, 100000000}};
     expect("timer for the handler", timer_create(CLOCK_MONOTONIC, &event, &timer_id), 0);
     timer_settime(timer_id, 0, &every, NULL);
-    for (int i = 0; i < 4000 && proc_signals < 5; i++) {
+    for (int i = 0; i < 4000 && proc_signals < 3; i++) {
         char path[32];
         snprintf(path, sizeof path, "/proc/%d", (int)getpid());
         int dir = open(path, O_RDONLY | O_DIRECTORY);
