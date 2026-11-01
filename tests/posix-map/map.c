@@ -299,31 +299,54 @@ static void forked(void) {
     munmap(p + 3 * PAGE, PAGE);
 }
 
-/* A fork of a map with a hundred pieces: the child holds the map, or the
- * parent is refused with ENOMEM when the child would have no room for
- * the objects; the child never dies alone. */
+/* A fork of a map with 97 groups of regions that do not adjoin (the table of
+ * pieces holds 128, the program's own take some 30): four objects of 64
+ * pages, of which every second page is given back (the last object keeps
+ * one page and loses the rest in one run). The child binds an
+ * object for each group (the loader joins adjoining regions of one object),
+ * and the table of objects holds as many as the table of pieces, 128: the
+ * fork has to succeed, and the child has the map. Blocks of 64 pages keep
+ * the memory held small. */
+#define BLOCKS 4
+#define BLOCK_PAGES 64
 static void forked_many(void) {
-    size_t pages = 100;
-    char *p = anon(pages * PAGE, PROT_READ | PROT_WRITE);
-    check("many: mmap", p != NULL);
-    if (!p) return;
-    size_t cut = 0;
-    for (size_t i = 1; i < pages; i += 2)
-        if (mprotect(p + i * PAGE, PAGE, PROT_NONE) == 0) cut++;
-    check("many: more than 90 pieces", cut >= 45);
-    p[0] = 5;
+    char *block[BLOCKS];
+    size_t kept = 0;
+    for (int b = 0; b < BLOCKS; b++) {
+        block[b] = anon(BLOCK_PAGES * PAGE, PROT_READ | PROT_WRITE);
+        check("many: mmap", block[b] != NULL);
+        if (!block[b]) return;
+        for (size_t i = 0; i < BLOCK_PAGES; i += 2) block[b][i * PAGE] = (char)(b * 40 + i / 2 + 1);
+        size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+        for (size_t i = 1; i < limit; i += 2) check("many: hole", munmap(block[b] + i * PAGE, PAGE) == 0);
+        if (b == BLOCKS - 1)
+            check("many: the run of holes", munmap(block[b] + limit * PAGE, (BLOCK_PAGES - limit) * PAGE) == 0);
+        kept += limit / 2;
+    }
+    check("many: 97 groups", kept == 3 * 32 + 1);
     pid_t child = fork();
     if (child < 0) {
-        check("many: a refused fork says ENOMEM", errno == ENOMEM);
+        printf("posix-map: many: fork gave errno %d\n", errno);
+        failures++;
     } else if (child == 0) {
-        _exit(read_faults(p) || p[0] != 5 || !read_faults(p + PAGE) ? 1 : 0);
+        int bad = 0;
+        for (int b = 0; b < BLOCKS; b++) {
+            size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+            for (size_t i = 0; i < limit; i += 2)
+                if (block[b][i * PAGE] != (char)(b * 40 + i / 2 + 1)) bad = 1;
+            if (!read_faults(block[b] + PAGE)) bad |= 2;
+        }
+        _exit(bad);
     } else {
         int status = 0;
         check("many: waitpid", waitpid(child, &status, 0) == child);
-        check("many: the child binds all the pieces and exits 0",
+        check("many: the child binds all the groups and exits 0",
               WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
-    munmap(p, pages * PAGE);
+    for (int b = 0; b < BLOCKS; b++) {
+        size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+        for (size_t i = 0; i < limit; i += 2) munmap(block[b] + i * PAGE, PAGE);
+    }
 }
 
 /* Many small mappings and unmappings reuse the pages and never run the
