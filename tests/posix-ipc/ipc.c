@@ -733,6 +733,47 @@ static int shm_processes(void) {
 }
 
 
+#ifdef STAFETO_SEGMENT_FILES_FOLLOW
+/* IPC_SET of a segment is the pipe service's: the library changes no file (#344).
+ * An unprivileged owner hands a segment to another user, who removes it; a
+ * creator removes a segment after the superuser gave it to someone else. Runs
+ * once the services give the file of the segment its new owner (part 3 of step
+ * 6); with the old services the library's chown was the check. */
+static int shm_hand_over(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, page, 0666);
+    CHECK(id > 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        /* The owner (1234) gives the segment to 4321 and cannot remove it. */
+        struct shmid_ds ds;
+        if (shmctl(id, IPC_STAT, &ds) != 0) _exit(1);
+        ds.shm_perm.uid = 1234;
+        if (shmctl(id, IPC_SET, &ds) != 0) _exit(2);
+        if (setgid(1234) != 0 || setuid(1234) != 0) _exit(3);
+        ds.shm_perm.uid = 4321;
+        if (shmctl(id, IPC_SET, &ds) != 0) _exit(4);
+        errno = 0;
+        if (shmctl(id, IPC_RMID, NULL) != -1 || errno != EPERM) _exit(5);
+        _exit(0);
+    }
+    CHECK(wait_ok(pid));
+    /* The new owner removes it. */
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(4321) != 0 || setuid(4321) != 0) _exit(1);
+        _exit(shmctl(id, IPC_RMID, NULL) == 0 ? 0 : 2);
+    }
+    CHECK(wait_ok(pid));
+    struct shmid_ds ds;
+    errno = 0;
+    CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
+    return 0;
+}
+#endif
+
 /* Who a caller is comes from the process service, not from the request: the
  * same call changes its answer when the process gives up its rights, and the
  * names of queues and semaphores are the owner's to take away. */
@@ -1252,6 +1293,9 @@ int main(int argc, char **argv) {
     RUN(shm_basics);
     RUN(shm_processes);
     RUN(identity);
+#ifdef STAFETO_SEGMENT_FILES_FOLLOW
+    RUN(shm_hand_over);
+#endif
     RUN(shm_pages);
     RUN(shm_names);
     RUN(pool_waits);

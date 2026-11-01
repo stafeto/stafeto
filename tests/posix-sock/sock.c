@@ -702,12 +702,34 @@ static int names_of_the_net(void) {
     struct sockaddr_in *sin = (struct sockaddr_in *)list->ai_addr;
     CHECK(list->ai_family == AF_INET && sin->sin_port == htons(80) && sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     freeaddrinfo(list);
+    /* getaddrinfo reads /etc/services by itself: the walk of the caller with
+     * getservent goes on from where it stood (#304); a lookup that rewound the
+     * shared file would give the first entry again. */
+    char first_name[64];
+    setservent(0);
+    struct servent *walk = getservent();
+    CHECK(walk != NULL);
+    snprintf(first_name, sizeof first_name, "%s/%s", walk->s_name, walk->s_proto);
+    CHECK(getaddrinfo("localhost", "https", &hints, &list) == 0 && list != NULL);
+    freeaddrinfo(list);
+    walk = getservent();
+    char second_name[64];
+    CHECK(walk != NULL);
+    snprintf(second_name, sizeof second_name, "%s/%s", walk->s_name, walk->s_proto);
+    CHECK(strcmp(second_name, first_name) != 0);
+    endservent();
     char host[64], service[32];
     struct sockaddr_in a = loop(443);
     CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, sizeof service, 0) == 0);
     CHECK(strcmp(host, "localhost") == 0 && strcmp(service, "https") == 0);
     CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, sizeof service, NI_NUMERICHOST | NI_NUMERICSERV) == 0);
     CHECK(strcmp(host, "127.0.0.1") == 0 && strcmp(service, "443") == 0);
+    /* A buffer that is too small is EAI_OVERFLOW, for the number, the name
+     * of a host and the name of a service. */
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, 5, service, sizeof service, NI_NUMERICHOST) == EAI_OVERFLOW);
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, 4, service, sizeof service, 0) == EAI_OVERFLOW);
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, 2, 0) == EAI_OVERFLOW);
+    CHECK(getnameinfo((struct sockaddr *)&a, sizeof a, host, sizeof host, service, 3, NI_NUMERICSERV) == EAI_OVERFLOW);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     struct hostent *h = gethostbyname("localhost");
