@@ -304,6 +304,7 @@ static void forked(void) {
  * child, and in a grandchild that outlives its parent. */
 extern char **environ;
 extern int stafeto_probe_image(uintptr_t address, uint64_t *out);
+extern uint64_t stafeto_probe_memory_quota(void);
 
 static int image_answer(void) { return 4242; }
 
@@ -346,6 +347,7 @@ static void image_shared(void) {
     check("image: the read-only data is an image", rodata[4] == 1 && rodata[2] == 0);
     int fds[2];
     check("image: pipe", pipe(fds) == 0);
+    uint64_t parent_quota = stafeto_probe_memory_quota();
     pid_t parent = getpid();
     pid_t child = fork();
     if (child < 0) { printf("posix-map: fork failed with %d\n", errno); failures++; return; }
@@ -356,6 +358,8 @@ static void image_shared(void) {
         if (image_state((const void *)&image_answer, mine) != 1) _exit(1);
         /* The child did not pay for the code and the read-only data. */
         if (mine[1] + (mine[3] + rodata[3]) * PAGE > before[1]) bad |= 2;
+        /* Nor was it given the quota for them. */
+        if (stafeto_probe_memory_quota() + (before[3] + rodata[3]) * PAGE > parent_quota) bad |= 128;
         /* A grandchild outlives the child and still runs the shared code. */
         pid_t middle = getpid();
         pid_t grandchild = fork();
