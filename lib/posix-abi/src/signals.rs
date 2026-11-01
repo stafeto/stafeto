@@ -161,6 +161,39 @@ const _: () = assert!(core::mem::size_of_val(&TAKEN) == 66_560);
 static CLAIMING: [AtomicU32; crate::relibc::PLACES + 1] =
     [const { AtomicU32::new(0) }; crate::relibc::PLACES + 1];
 const CLAIM_WAITING: u32 = 1 << 31;
+/// The signals of each thread place whose pending occurrence `pthread_kill`
+/// sent (bit n - 1 for signal n): they say SI_TKILL, the others of the
+/// thread (`raise`, `abort`) SI_USER (XSH 2.4.3 lets `raise` use it).
+static TKILLED: [AtomicU64; crate::relibc::PLACES + 1] =
+    [const { AtomicU64::new(0) }; crate::relibc::PLACES + 1];
+
+/// The code of the thread signal `signal` that the caller takes: SI_TKILL
+/// for one `pthread_kill` sent, else SI_USER. Read once per occurrence.
+fn thread_code(block: &Block, signal: i32) -> i32 {
+    let bit = posix_signals::bit(signal).unwrap_or(0);
+    let old = TKILLED[block.thread_id as usize].fetch_and(!bit, Ordering::SeqCst);
+    if old & bit != 0 {
+        proto_process::SI_TKILL
+    } else {
+        SI_USER
+    }
+}
+
+/// The information of the thread signal `signal` for the caller. A signal
+/// of `pthread_kill` says SI_TKILL with the process's own PID and real user
+/// ID; the others are `SigInfo::thread` (SI_THREAD, which the platform turns
+/// into SI_USER with the same PID and user ID).
+fn thread_info(block: &Block, signal: i32) -> SigInfo {
+    if thread_code(block, signal) == SI_USER {
+        return SigInfo::thread(signal);
+    }
+    SigInfo {
+        si_code: proto_process::SI_TKILL,
+        si_pid: crate::process::getpid(),
+        si_uid: crate::process::getuid(),
+        ..SigInfo::thread(signal)
+    }
+}
 /// The bit of the claim word a signal's bit (`posix_signals::bit`) takes: 31
 /// are there, so the signals past 31 share bits with the first ones, which
 /// only makes a claim wait for another of the same thread (none holds two).
@@ -211,6 +244,7 @@ pub(crate) fn reset_taken_before_live(id: u64) {
     let _guard = INFO_LOCK.lock();
     clear_taken(&TAKEN[id as usize]);
     CLAIMING[id as usize].store(0, Ordering::Relaxed);
+    TKILLED[id as usize].store(0, Ordering::Relaxed);
     crate::altstack::reset(id);
 }
 
@@ -995,6 +1029,8 @@ fn send(
     if ignored || block.end.load(Ordering::SeqCst) != 0 {
         return;
     }
+    // A thread's signal sent by another thread is pthread_kill's.
+    TKILLED[block.thread_id as usize].fetch_or(bit, Ordering::SeqCst);
     if !assign(block, bit.trailing_zeros() as i32 + 1, ticket, false) {
         return;
     }
@@ -1015,6 +1051,12 @@ fn send(
 /// return. Job-control generations and process-wide effects go through
 /// the process service. 0 or an error number.
 pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
+    send_to_thread(id, signal, true)
+}
+
+/// `kill_relibc_thread`; `tkill` says `pthread_kill` sends it (SI_TKILL),
+/// else it is the thread's own `raise` or `abort` (SI_USER).
+fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
     marks::mark(0);
     let bit = if signal == 0 {
         0
@@ -1030,6 +1072,11 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
     });
     // A real-time signal that waits already for the calling thread is queued
     // behind it as a signal of the process (a thread has one place for each).
+    // Open POSIX sigwait/2-1 raises a real-time signal twice and takes two
+    // occurrences; the queue of the process holds the second (XSH 2.4.2
+    // leaves queueing of such signals to the implementation). The second
+    // comes with SI_USER, and another thread may take it. (SI_USER of
+    // `raise` is what sigwaitinfo/6-1 expects.)
     let behind = core::cell::Cell::new(false);
     let deliver = crate::relibc::with_target(id, |block, native| {
         let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
@@ -1055,6 +1102,12 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
                 if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
                     behind.set(true);
                     return Ok(false);
+                }
+                let mine = &TKILLED[block.thread_id as usize];
+                if tkill {
+                    mine.fetch_or(bit, Ordering::SeqCst);
+                } else {
+                    mine.fetch_and(!bit, Ordering::SeqCst);
                 }
                 assign(own(), signal, ticket, false);
                 return Ok(true);
@@ -1141,7 +1194,7 @@ pub fn suspend(mask: SigSet) -> i32 {
 }
 /// Sends `signal` to the calling thread.
 pub fn raise(signal: i32) -> Result<(), i32> {
-    match kill_relibc_thread(threads::thread_number(), signal) {
+    match send_to_thread(threads::thread_number(), signal, false) {
         0 => Ok(()),
         status => Err(status),
     }
@@ -1181,7 +1234,7 @@ fn wait(
         let bit = eligible.isolate_lowest_one();
         let signal = bit.trailing_zeros() as i32 + 1;
         if let Some((_, info)) = claim_thread_info(block, signal) {
-            return Some((signal, info.unwrap_or_else(|| SigInfo::thread(signal))));
+            return Some((signal, info.unwrap_or_else(|| thread_info(block, signal))));
         }
     };
     block.wait_set.store(set, Ordering::SeqCst);
@@ -1847,7 +1900,7 @@ unsafe fn fault_entry(native: *mut upcall::Context) {
     };
     // SAFETY: the entry's frame.
     let (sp, pc) = unsafe { ((*native).sp, (*native).pc) };
-    let fault = posix_signals::fault(cause.esr, cause.far, pc);
+    let fault = posix_signals::fault(cause.esr, cause.far, pc, sp);
     let block = own();
     let bit = posix_signals::bit(fault.signal).expect("a signal of the table");
     if crate::altstack::overflowed(sp)
@@ -2132,7 +2185,7 @@ unsafe fn deliver_signal(
             let mut info = match (fault, from_process) {
                 (Some(fault), _) => LinuxSigInfo::fault(&fault),
                 (None, Some(taken)) => LinuxSigInfo::process(&taken),
-                (None, None) => LinuxSigInfo::thread(signal),
+                (None, None) => LinuxSigInfo::thread(signal, thread_code(block, signal)),
             };
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
@@ -2247,13 +2300,14 @@ impl LinuxSigInfo {
         }
     }
 
-    /// The information of `signal` sent by pthread_kill or raise: SI_USER,
+    /// The information of `signal` sent by pthread_kill (`code` SI_TKILL,
+    /// Linux's code for a signal to one thread), raise or abort (SI_USER),
     /// with the process's own PID and real user ID as the sender's.
-    pub fn thread(signal: i32) -> Self {
+    pub fn thread(signal: i32, code: i32) -> Self {
         Self {
             signo: signal,
             errno: 0,
-            code: SI_USER,
+            code,
             pad: 0,
             pid: crate::process::getpid(),
             uid: crate::process::getuid(),
@@ -2349,7 +2403,7 @@ impl LinuxContext {
 /// The death of the process by `signal`: the code `0x100 | signal`, which
 /// `_exit` never gives (it keeps 8 bits), so that the process service reads
 /// WIFSIGNALED from the kernel's reason (proto_process::End).
-fn sys_exit_signal(signal: i32) -> ! {
+pub(crate) fn sys_exit_signal(signal: i32) -> ! {
     rt::sys::process_exit(0x100 | signal as u64)
 }
 

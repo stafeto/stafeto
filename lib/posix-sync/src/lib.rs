@@ -634,6 +634,31 @@ impl LayerLock {
     }
 }
 
+/// A critical section at the ceiling of the process with no word of a lock:
+/// what a holder of a raising lock has, for a stretch of work that other
+/// threads do not wait for but that must neither be left by a jump out of a
+/// handler nor be delayed by threads of a lower level than its waiters.
+pub struct Raised {
+    raised: bool,
+}
+
+/// Enters a critical section at the ceiling; it ends when the guard drops.
+/// Nests with raising locks (no call of the kernel for a thread already
+/// raised).
+pub fn raise_section() -> Raised {
+    enter();
+    Raised { raised: raise() }
+}
+
+impl Drop for Raised {
+    fn drop(&mut self) {
+        if self.raised {
+            lower();
+        }
+        leave();
+    }
+}
+
 /// The calling thread enters a raising lock: at the ceiling from the first.
 fn raise() -> bool {
     let Some(block) = current() else {

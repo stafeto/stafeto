@@ -49,7 +49,13 @@ unsafe extern "C" fn handler(signal: i32, info: *mut LinuxSigInfo, context: *mut
     let (info, context) = unsafe { (&*info, &mut *context.cast::<LinuxContext>()) };
     let mut effective = 0;
     let mut valid = signal == SIGUSR1
-        && *info == LinuxSigInfo::thread(SIGUSR1)
+        // The outer entry is main's pthread_kill, the nested one (mode 2) the
+        // handler's own raise.
+        && *info
+            == LinuxSigInfo::thread(
+                SIGUSR1,
+                if depth == 2 { 0 } else { proto_process::SI_TKILL },
+            )
         && context.link.is_null()
         && context.stack_pointer.is_null()
         && context.stack_size == 0

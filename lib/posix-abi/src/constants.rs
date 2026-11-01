@@ -20,7 +20,6 @@ pub const PTHREAD_CREATE_DETACHED: i32 = 1;
 pub const PTHREAD_THREADS_MAX: u32 = 64;
 pub const PTHREAD_KEYS_MAX: u32 = 128;
 pub const PTHREAD_DESTRUCTOR_ITERATIONS: u32 = 4;
-pub const PTHREAD_STACK_MIN: u32 = 16384;
 pub const ENOENT: i32 = 2;
 pub const E2BIG: i32 = 7;
 pub const ENOEXEC: i32 = 8;

@@ -101,7 +101,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (chrono-tz is gone, 1.2 MB of each program); tagged pin-bc88f7aa.
 # #432 (ci stability): assert, perror, a panic and printf on stderr write a
 # message with one write; tagged pin-5f477a7f.
-COMMIT = "5f477a7f21b7960040a3cb74c47d0a400ed6d1a5"
+# Step 5 (layer, #390, #392): SI_TKILL for a signal to one thread, one SI_TIMER
+# in signal.h, and the timers on processor time keep a place in the process
+# service (SI_TIMER, merged signals, the overrun), platform interface 22;
+# tagged pin-5b150246; its comment of SI_TKILL mended (pthread_kill only):
+# pin-1cd3d139.
+COMMIT = "1cd3d13968b7953cb8296edb06dc46aa7018c22c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
