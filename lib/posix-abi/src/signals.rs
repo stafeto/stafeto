@@ -36,7 +36,7 @@ pub use native_stop_probe::{
 
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
@@ -167,11 +167,71 @@ const CLAIM_WAITING: u32 = 1 << 31;
 static TKILLED: [AtomicU64; crate::relibc::PLACES + 1] =
     [const { AtomicU64::new(0) }; crate::relibc::PLACES + 1];
 
+/// The occurrences of a real-time signal that a thread sent to a thread
+/// (`raise`, `pthread_kill`) while one waited for it: for each place and each
+/// number from REALTIME_MIN to 64, how many come after the pending one.
+/// These occurrences carry no value, so a counter is their whole queue; the
+/// taker of the pending occurrence puts the next in its place. They keep the
+/// code of the first (SI_TKILL or SI_USER).
+static REPEATS: [[AtomicU8; REALTIME_COUNT]; crate::relibc::PLACES + 1] =
+    [const { [const { AtomicU8::new(0) }; REALTIME_COUNT] }; crate::relibc::PLACES + 1];
+const REALTIME_COUNT: usize = 64 - REALTIME_MIN as usize + 1;
+
+/// Queues the signal `signal` for the thread of `block` as a repeat, when an
+/// occurrence of it is pending there already (a real-time signal); false when
+/// there is none, and the caller sends it as a pending occurrence. More
+/// than 255 repeats merge.
+fn repeat_queued(block: &Block, signal: i32) -> bool {
+    if signal < REALTIME_MIN {
+        return false;
+    }
+    let bit = posix_signals::bit(signal).unwrap_or(0);
+    if thread_pending(block) & bit == 0 {
+        return false;
+    }
+    let counter = &REPEATS[block.thread_id as usize][(signal - REALTIME_MIN) as usize];
+    if counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+        .is_err()
+    {
+        return true;
+    }
+    // The occurrence may have been taken (by a taker that saw no repeat)
+    // before the counter grew: then this one is the pending occurrence, if the
+    // counter gives it back.
+    if thread_pending(block) & bit == 0
+        && counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    {
+        return false;
+    }
+    true
+}
+
+/// A pending occurrence of `signal` was taken: the next repeat, if any,
+/// becomes the pending occurrence.
+fn next_repeat(block: &Block, signal: i32, bit: u64) {
+    let counter = &REPEATS[block.thread_id as usize][(signal - REALTIME_MIN) as usize];
+    if counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        block.pending.fetch_or(bit, Ordering::SeqCst);
+    }
+}
+
 /// The code of the thread signal `signal` that the caller takes: SI_TKILL
-/// for one `pthread_kill` sent, else SI_USER. Read once per occurrence.
+/// for one `pthread_kill` sent, else SI_USER. Read once per occurrence; the
+/// code stays for the repeats of a real-time signal that wait behind it.
 fn thread_code(block: &Block, signal: i32) -> i32 {
     let bit = posix_signals::bit(signal).unwrap_or(0);
-    let old = TKILLED[block.thread_id as usize].fetch_and(!bit, Ordering::SeqCst);
+    let word = &TKILLED[block.thread_id as usize];
+    let old = if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
+        word.load(Ordering::SeqCst)
+    } else {
+        word.fetch_and(!bit, Ordering::SeqCst)
+    };
     if old & bit != 0 {
         proto_process::SI_TKILL
     } else {
@@ -245,6 +305,9 @@ pub(crate) fn reset_taken_before_live(id: u64) {
     clear_taken(&TAKEN[id as usize]);
     CLAIMING[id as usize].store(0, Ordering::Relaxed);
     TKILLED[id as usize].store(0, Ordering::Relaxed);
+    for repeats in &REPEATS[id as usize] {
+        repeats.store(0, Ordering::Relaxed);
+    }
     crate::altstack::reset(id);
 }
 
@@ -371,7 +434,11 @@ fn claim_thread(block: &Block, signal: i32) -> Option<u64> {
         proto_process::job::take(job_word(block, signal), page_word(signal), signal as u8)
     } else {
         let bit = posix_signals::bit(signal).ok()?;
-        (block.pending.fetch_and(!bit, Ordering::SeqCst) & bit != 0).then_some(0)
+        let had = block.pending.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
+        if had && signal >= REALTIME_MIN {
+            next_repeat(block, signal, bit);
+        }
+        had.then_some(0)
     }
 }
 // SAFETY: this executable .text section remains in the native RX segment.
@@ -955,6 +1022,10 @@ pub fn sigaction(signal: i32, act: Option<SigAction>) -> Result<SigAction, i32> 
                     } else {
                         block.pending.fetch_and(!bit, Ordering::SeqCst);
                         block.process.fetch_and(!bit, Ordering::SeqCst);
+                        if signal >= REALTIME_MIN {
+                            REPEATS[block.thread_id as usize][(signal - REALTIME_MIN) as usize]
+                                .store(0, Ordering::SeqCst);
+                        }
                     }
                 });
                 let _guard = INFO_LOCK.lock();
@@ -1029,6 +1100,11 @@ fn send(
     if ignored || block.end.load(Ordering::SeqCst) != 0 {
         return;
     }
+    // A real-time signal that waits for the thread already queues behind it.
+    let signal = bit.trailing_zeros() as i32 + 1;
+    if repeat_queued(block, signal) {
+        return;
+    }
     // A thread's signal sent by another thread is pthread_kill's.
     TKILLED[block.thread_id as usize].fetch_or(bit, Ordering::SeqCst);
     if !assign(block, bit.trailing_zeros() as i32 + 1, ticket, false) {
@@ -1070,14 +1146,10 @@ fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
         let action = action(signal);
         (action, ignored(signal, &action))
     });
-    // A real-time signal that waits already for the calling thread is queued
-    // behind it as a signal of the process (a thread has one place for each).
-    // Open POSIX sigwait/2-1 raises a real-time signal twice and takes two
-    // occurrences; the queue of the process holds the second (XSH 2.4.2
-    // leaves queueing of such signals to the implementation). The second
-    // comes with SI_USER, and another thread may take it. (SI_USER of
-    // `raise` is what sigwaitinfo/6-1 expects.)
-    let behind = core::cell::Cell::new(false);
+    // A real-time signal that waits already for the target thread queues behind
+    // it, as a counter of the thread (`repeat_queued`): Open POSIX sigwait/2-1
+    // raises one twice and takes two occurrences, and sigwaitinfo/6-1 wants
+    // SI_USER from `raise`.
     let deliver = crate::relibc::with_target(id, |block, native| {
         let ticket = if signal == SIGSTOP || proto_process::job::class(signal as u8).is_some() {
             match crate::process::signal_generation(signal) {
@@ -1099,8 +1171,7 @@ fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
         });
         if core::ptr::eq(block, own()) {
             if let Some((_, false)) = action {
-                if signal >= REALTIME_MIN && thread_pending(block) & bit != 0 {
-                    behind.set(true);
+                if repeat_queued(block, signal) {
                     return Ok(false);
                 }
                 let mine = &TKILLED[block.thread_id as usize];
@@ -1121,9 +1192,6 @@ fn send_to_thread(id: u64, signal: i32, tkill: bool) -> i32 {
         Err(code) | Ok(Err(code)) => return code,
         Ok(Ok(true)) => deliver_now(),
         Ok(Ok(false)) => {}
-    }
-    if behind.get() {
-        return crate::process::kill(crate::process::getpid(), signal).map_or_else(|e| e, |()| 0);
     }
     0
 }

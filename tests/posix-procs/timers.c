@@ -861,6 +861,62 @@ static int t_c_thread_rt_twice(void) {
     return 0;
 }
 
+/* #467: a real-time signal that threads send to one thread stays in that
+ * thread, however often. Thread A blocks SIGRTMIN, thread B leaves it open
+ * with a handler. A sends it to itself twice with pthread_kill, B sends it to
+ * A twice: A takes four occurrences, each with SI_TKILL, and B's handler never
+ * runs (the repeats do not go to the queue of the process, where B could take
+ * one, and the repeats to another thread do not merge). */
+static pthread_t t_rt_a;
+static volatile int t_rt_phase, t_rt_b_got;
+static void t_rt_handler(int sig) {
+    (void)sig;
+    t_rt_b_got++;
+}
+static void *t_rt_b(void *arg) {
+    (void)arg;
+    sigset_t open;
+    sigemptyset(&open);
+    sigaddset(&open, SIGRTMIN);
+    if (pthread_sigmask(SIG_UNBLOCK, &open, NULL)) return (void *)1;
+    while (t_rt_phase < 1) t_nap(2);
+    if (pthread_kill(t_rt_a, SIGRTMIN) || pthread_kill(t_rt_a, SIGRTMIN)) return (void *)2;
+    t_rt_phase = 2;
+    while (t_rt_phase < 3) t_nap(2);
+    return NULL;
+}
+static int t_c_thread_rt_repeats(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = t_rt_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGRTMIN, &sa, NULL)) return 1;
+    if (t_block(SIGRTMIN)) return 2;
+    t_rt_a = pthread_self();
+    pthread_t b;
+    if (pthread_create(&b, NULL, t_rt_b, NULL)) return 3;
+    siginfo_t info;
+    if (pthread_kill(t_rt_a, SIGRTMIN) || pthread_kill(t_rt_a, SIGRTMIN)) return 4;
+    t_rt_phase = 1;
+    while (t_rt_phase < 2) t_nap(2);
+    for (int n = 0; n < 4; n++) {
+        if (t_take(SIGRTMIN, &info, 200) != SIGRTMIN) {
+            printf("posix-procs: timers: the thread took %d of 4 occurrences\n", n);
+            t_rt_phase = 3;
+            return 5;
+        }
+        if (info.si_code != SI_TKILL) return 6;
+    }
+    if (t_take(SIGRTMIN, &info, 20) != -1 || errno != EAGAIN) return 7;
+    t_rt_phase = 3;
+    if (pthread_join(b, NULL)) return 8;
+    if (t_rt_b_got != 0) {
+        printf("posix-procs: timers: the other thread's handler ran %d times\n", t_rt_b_got);
+        return 9;
+    }
+    return 0;
+}
+
 /* #392: a timer on processor time sends SI_TIMER with the value of the event,
  * its expiries while the signal waits are one occurrence and the overrun. */
 static int t_c_cpu_timer(void) {
@@ -1052,6 +1108,7 @@ static int timers_role(void) {
     t_child("sigwaitinfo and sigtimedwait take a timer", t_c_wait_timer, 0, 0);
     t_child("pthread_kill says SI_TKILL, raise SI_USER", t_c_thread_kill_code, 0, 0);
     t_child("a real-time signal raised twice is taken twice", t_c_thread_rt_twice, 0, 0);
+    t_child("a real-time signal sent to a thread repeatedly stays in the thread", t_c_thread_rt_repeats, 0, 0);
     t_child("a timer on processor time sends SI_TIMER and counts the overrun", t_c_cpu_timer, 0, 0);
     t_child("two timers on one real-time signal keep their own occurrences", t_c_two_timers_one_signal, 0, 0);
     t_child("two senders fill one receiver 32 each", t_c_senders_share_a_receiver, 0, 0);
