@@ -1150,7 +1150,13 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
 pub fn clone_session(session: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
     let mut reply = loop {
         match sys::send(session, request) {
-            Err(Error::Interrupted) => continue,
+            Err(Error::Interrupted) => {
+                debug_assert!(
+                    !crate::upcall::entries_deferred(),
+                    "a request asked again under deferred entries never waits"
+                );
+                continue;
+            }
             other => break other?,
         }
     };

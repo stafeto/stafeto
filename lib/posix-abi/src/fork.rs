@@ -25,7 +25,7 @@
 use crate::constants::*;
 use crate::process::{ask, ask_loader, client, load_errno, request, start_errno};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use proto_loader::{Fork, Method, REGIONS_MAX, Region, TRANSFER_SIZE};
 use proto_wire::{Status, Writer};
 use rt::abi::{Access, Rights};
@@ -370,6 +370,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
             return Err(errno);
         }
     };
+    step(4);
     let level = crate::threads::own_block()
         .base_level
         .load(Ordering::Relaxed) as u8;
@@ -404,6 +405,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
     let c = match (status, c) {
         (Status::Ok, Ok(c)) => c,
         (status, _) => {
+            REFUSED.store(status.code(), Ordering::Relaxed);
             sessions.close();
             return Err(if status == Status::Ok {
                 EIO
@@ -414,6 +416,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
     };
     PROBE_LOADING_PID.store(pid, Ordering::Release);
     let made = make(&c, regions, sessions, window);
+    step(9);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
         Err(_) => proto_process::Method::ForkAbort,
@@ -443,11 +446,14 @@ fn make(
     let mut w = Writer::new();
     Method::Fork.header().write(&mut w).map_err(|_| EIO)?;
     fork.write(&mut w).map_err(|_| EIO)?;
+    step(5);
     if ask_loader(c, &w, None) != 0 {
         sessions.close();
         return Err(EIO);
     }
+    step(6);
     give(c, sessions)?;
+    step(7);
     let Regions { count, regions } = regions;
     let mut list = regions.into_iter().take(count).flatten().peekable();
     while list.peek().is_some() {
@@ -468,6 +474,7 @@ fn make(
             early();
         }
     }
+    step(8);
     let mut w = Writer::new();
     Method::Go.header().write(&mut w).map_err(|_| EIO)?;
     match ask_loader(c, &w, None) {
@@ -519,7 +526,7 @@ pub fn probe_abort(pid: &mut i32) -> i32 {
         return EIO;
     }
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let Ok(mut reply) = rt::sys::send(client().session(), w.as_bytes()) else {
+    let Ok(mut reply) = crate::process::send_again(&w) else {
         return EIO;
     };
     let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
@@ -602,9 +609,18 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
     }
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
+    step(1);
+    REFUSED.store(0, Ordering::Relaxed);
+    sub(0);
     let result = crate::signals::stop_others()
-        .and_then(|()| sessions())
-        .and_then(|sessions| copy(window, sessions));
+        .and_then(|()| {
+            step(2);
+            sessions()
+        })
+        .and_then(|sessions| {
+            step(3);
+            copy(window, sessions)
+        });
     if result == Ok(Forked::Child) {
         if let Err(why) = child() {
             rt::println!("posix-abi: a forked child could not bind {}", why);
@@ -627,16 +643,56 @@ pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
         })
 }
 
+// Where the last fork of the process was refused, for `probe_refusal`. The
+// statics are the process's: forks from two threads at once overwrite each
+// other's values, which a probe of one fork at a time does not meet.
+
+/// The step of the clone of the sessions the parent has reached.
+static SUB: AtomicU32 = AtomicU32::new(0);
+
+fn sub(n: u32) {
+    SUB.store(n, Ordering::Relaxed);
+}
+
+/// The status of the service that refused, 0 for none.
+static REFUSED: AtomicU32 = AtomicU32::new(0);
+/// The step of the fork the parent has reached: 1 the other threads
+/// stopped, 2 the sessions cloned, 3 the regions copied, 4 ForkStart, 5
+/// Fork, 6 the sessions given, 7 Regions, 8 Go, 9 ForkCommit.
+static STEP: AtomicU32 = AtomicU32::new(0);
+
+fn step(n: u32) {
+    STEP.store(n, Ordering::Relaxed);
+}
+
+/// Where the last fork of the process went as far as it did, for the test
+/// that finds a fork refused: the step, the step of the clone of the
+/// sessions and the status of the service that refused (0 for none), as
+/// `step | sub << 8 | status << 16`.
+pub fn probe_refusal() -> u64 {
+    u64::from(STEP.load(Ordering::Relaxed))
+        | u64::from(SUB.load(Ordering::Relaxed)) << 8
+        | u64::from(REFUSED.load(Ordering::Relaxed)) << 16
+}
+
+/// `process::clone_errno` that keeps the status of the refusal for
+/// `probe_refusal`.
+pub(crate) fn clone_errno(status: Status) -> i32 {
+    REFUSED.store(status.code(), Ordering::Relaxed);
+    crate::process::clone_errno(status)
+}
+
 /// Clones of the process's sessions for a child (Clone): the RAM files'
 /// with the descriptions of the descriptors without FD_CLOFORK, the
 /// clock's, the console input's, the pipe service's with the ends of the
 /// descriptors without FD_CLOFORK, and the entropy service's, each the
 /// process has.
 fn sessions() -> Result<Sessions, i32> {
-    use crate::process::clone_errno;
+    sub(1);
     crate::close_driver::settle_all()?;
     let mut out = Sessions::default();
     let made = (|| {
+        sub(2);
         if let Some(clock) = crate::clock::session() {
             let clone =
                 rt::service::clone_session(clock, &proto_clock::Method::Clone.header().bytes())
@@ -649,16 +705,19 @@ fn sessions() -> Result<Sessions, i32> {
             generation: 0,
             random: false,
         }; posix_fs::OPEN_MAX];
+        sub(3);
         let count = crate::shared::kept_by_fork(&mut kept)?;
         let (files, uart) = crate::shared::with_files(|fs| {
             let (files, uart) = fs.sessions();
             Ok((files.raw(), uart.map(Handle::raw)))
         })?;
+        sub(4);
         // The complete captured list is validated before child references exist.
         let clone =
             rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
                 .map_err(clone_errno)?;
         out.files = clone.into_raw().0;
+        sub(5);
         if let Some(uart) = uart {
             let clone = rt::service::clone_session(
                 &Handle::<Channel>::borrowed(uart),
@@ -667,12 +726,14 @@ fn sessions() -> Result<Sessions, i32> {
             .map_err(clone_errno)?;
             out.uart = clone.into_raw().0;
         }
+        sub(6);
         let mut ends = [proto_pipe::Endpoint::anonymous(0); posix_fs::OPEN_MAX];
         let count = crate::shared::pipes_kept_by_fork(&mut ends)?;
         if let Some(pipes) = crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
             let clone = pipes_clone(pipes, &ends[..count])?;
             out.pipes = clone.into_raw().0;
         }
+        sub(7);
         if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
         {
             let mut ends = [0; posix_fs::OPEN_MAX];
@@ -681,6 +742,7 @@ fn sessions() -> Result<Sessions, i32> {
                 .into_raw()
                 .0;
         }
+        sub(8);
         if let Some(clone) = entropy_clone() {
             out.entropy = clone.into_raw().0;
         }
@@ -721,7 +783,6 @@ pub(crate) fn pipes_clone(
     pipes: rt::abi::Handle,
     ends: &[proto_pipe::Endpoint],
 ) -> Result<Handle<Channel>, i32> {
-    use crate::process::clone_errno;
     let mut w = Writer::new();
     proto_pipe::Method::Clone
         .header()
