@@ -694,8 +694,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 return None;
                             }
                             if (loaded.is_some() || copied)
-                                && let Err(code) =
-                                    tell_ready(session, loaded.as_ref().map_or(0, |l| image_pages(&l.2)))
+                                && let Err(code) = tell_ready(
+                                    session,
+                                    loaded.as_ref().map_or(0, |l| image_pages(&l.2)),
+                                )
                             {
                                 reply(token, code);
                                 return None;
@@ -1573,8 +1575,15 @@ fn segment(
             if u64::from(count) * PAGE != len {
                 return Err(pl::IO);
             }
-            loader::map_narrowed(&own.process, &memory, 0, len, pages.start as usize, access(part))
-                .map_err(code)?;
+            loader::map_narrowed(
+                &own.process,
+                &memory,
+                0,
+                len,
+                pages.start as usize,
+                access(part),
+            )
+            .map_err(code)?;
             keep_region(maps, &memory, pages.start, len, access(part))?;
             if let Some(kept) = maps.iter_mut().flatten().last() {
                 kept.joined = true;
@@ -1595,8 +1604,14 @@ fn segment(
                 }
                 sys::handle_duplicate(&kept.handle, rights).ok()
             });
-            let put = handed
-                .map(|copy| image_request(proto_process::IMAGE_PUT, key, (len / PAGE) as u32, Some(copy)));
+            let put = handed.map(|copy| {
+                image_request(
+                    proto_process::IMAGE_PUT,
+                    key,
+                    (len / PAGE) as u32,
+                    Some(copy),
+                )
+            });
             if !matches!(put, Some(Ok(_))) {
                 let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
             }
@@ -1686,11 +1701,13 @@ fn image_request(
 /// Get of the table of images. An answer the loader does not know makes an
 /// object of its own, as a table with no place does.
 fn image_get(key: &proto_process::ImageKey) -> Result<Table, u32> {
-    Ok(match image_request(proto_process::IMAGE_GET, key, 0, None)? {
-        (proto_process::IMAGE_FOUND, pages, Some(memory)) => Table::Found(pages, memory),
-        (proto_process::IMAGE_RESERVED, _, None) => Table::Reserved,
-        _ => Table::Full,
-    })
+    Ok(
+        match image_request(proto_process::IMAGE_GET, key, 0, None)? {
+            (proto_process::IMAGE_FOUND, pages, Some(memory)) => Table::Found(pages, memory),
+            (proto_process::IMAGE_RESERVED, _, None) => Table::Reserved,
+            _ => Table::Full,
+        },
+    )
 }
 
 /// The pages of the code and the read-only data in `maps` that this

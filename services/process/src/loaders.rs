@@ -379,7 +379,11 @@ mod tests {
         const PAGE: u64 = 4096;
         assert_eq!(fork_quota(1160 * PAGE, 0), 1160 * PAGE);
         assert_eq!(fork_quota(1160 * PAGE, 650), 510 * PAGE);
-        assert_eq!(fork_quota(1160 * PAGE, 1000), 290 * PAGE, "a quarter at least");
+        assert_eq!(
+            fork_quota(1160 * PAGE, 1000),
+            290 * PAGE,
+            "a quarter at least"
+        );
         assert_eq!(fork_quota(1160 * PAGE, 5000), 290 * PAGE);
         assert_eq!(fork_quota(3 * PAGE, 1), 2 * PAGE);
         assert_eq!(fork_quota(PAGE, 0), PAGE, "never above the record's");

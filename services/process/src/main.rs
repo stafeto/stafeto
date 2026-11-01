@@ -26,11 +26,11 @@ mod image_probe_main;
 use core::sync::atomic::Ordering;
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
+use posix_process_service::images::{self, Images};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
-use posix_process_service::images::{self, Images};
 use posix_process_service::shares::{self, Got, Shares};
 use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::terminals::Terminals;
@@ -1348,9 +1348,20 @@ impl Processes {
     fn share_step(&mut self) {
         rt::service::step_detail((self.shares.waiters() + self.images.waiters()) as u64);
         let mut batch = [const { None }; shares::BATCH];
-        let (_, more) = self.shares.ready_batch(&mut batch);
+        let (taken, more) = self.shares.ready_batch(&mut batch);
+        // The answers of the two tables share one batch, so that a step
+        // answers `BATCH` Gets at most.
         let mut images = [const { None }; images::BATCH];
-        let (_, more_images) = self.images.ready_batch(&mut images);
+        let mut more_images = false;
+        for (place, _) in images.iter_mut().zip(taken..images::BATCH) {
+            let mut one = [const { None }; 1];
+            let (_, more_left) = self.images.ready_batch(&mut one);
+            *place = one[0].take();
+            more_images = more_left;
+        }
+        if taken >= images::BATCH {
+            more_images = self.images.waiters() > 0;
+        }
         self.share_wake = more || more_images;
         for (record, key, pending) in images.into_iter().flatten() {
             match self.image_take(record, &key) {

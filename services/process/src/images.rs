@@ -262,13 +262,7 @@ impl<T, W> Images<T, W> {
 
     /// The loader of `record` made the object of the entry it reserved: Err
     /// when it reserved none (the object is not kept then).
-    pub fn put(
-        &mut self,
-        key: &ImageKey,
-        record: usize,
-        pages: u32,
-        memory: T,
-    ) -> Result<(), T> {
+    pub fn put(&mut self, key: &ImageKey, record: usize, pages: u32, memory: T) -> Result<(), T> {
         let Some(i) = self.find(key) else {
             return Err(memory);
         };
@@ -281,9 +275,10 @@ impl<T, W> Images<T, W> {
     }
 
     fn settle(&mut self, i: usize) {
-        if self.entries[i].as_ref().is_some_and(|e| {
-            e.unused() && matches!(e.state, State::Ready { .. })
-        }) {
+        if self.entries[i]
+            .as_ref()
+            .is_some_and(|e| e.unused() && matches!(e.state, State::Ready { .. }))
+        {
             self.entries[i] = None;
         }
     }
@@ -408,7 +403,10 @@ mod tests {
         assert!(!fits(IMAGE_CODE, base), "the code runs");
         assert!(fits(IMAGE_CODE, base | Rights::MAP_EXEC));
         assert!(!fits(IMAGE_RODATA, base | Rights::MAP_WRITE));
-        assert!(!fits(IMAGE_CODE, base | Rights::MAP_EXEC | Rights::MAP_WRITE));
+        assert!(!fits(
+            IMAGE_CODE,
+            base | Rights::MAP_EXEC | Rights::MAP_WRITE
+        ));
         assert!(!fits(IMAGE_RODATA, Rights::MAP_READ | Rights::TRANSFER));
     }
 
@@ -435,14 +433,29 @@ mod tests {
         assert_eq!(t.get(&base, 1), Got::Reserved);
         t.put(&base, 1, 1, 1).unwrap();
         for other in [
-            ImageKey { part: IMAGE_RODATA, ..base },
+            ImageKey {
+                part: IMAGE_RODATA,
+                ..base
+            },
             ImageKey { device: 2, ..base },
             ImageKey { inode: 8, ..base },
             ImageKey { size: 4097, ..base },
-            ImageKey { modify: (10, 6), ..base },
-            ImageKey { modify: (11, 5), ..base },
-            ImageKey { change: (11, 7), ..base },
-            ImageKey { change: (12, 6), ..base },
+            ImageKey {
+                modify: (10, 6),
+                ..base
+            },
+            ImageKey {
+                modify: (11, 5),
+                ..base
+            },
+            ImageKey {
+                change: (11, 7),
+                ..base
+            },
+            ImageKey {
+                change: (12, 6),
+                ..base
+            },
         ] {
             assert_eq!(t.get(&other, 2), Got::Reserved, "{other:?}");
             t.detach(&other, 2);
