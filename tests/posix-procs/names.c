@@ -741,6 +741,18 @@ static int names_directories(void) {
     FAILS(fchdir(filefd), ENOTDIR);
     CHECK(close(filefd) == 0);
     FAILS(fchdir(1), ENOTDIR);
+    /* A directory that was removed: a new one of the name is not entered by
+     * the old descriptor (the file service says ENOENT of the removed node;
+     * Linux enters the removed directory). */
+    OK(mkdir(NAMES_ROOT "/w/gone", 0755));
+    dirfd = open(NAMES_ROOT "/w/gone", O_RDONLY | O_DIRECTORY);
+    CHECK(dirfd >= 0);
+    OK(rmdir(NAMES_ROOT "/w/gone"));
+    OK(mkdir(NAMES_ROOT "/w/gone", 0755));
+    FAILS(fchdir(dirfd), ENOENT);
+    CHECK(getcwd(cwd, sizeof cwd) && !strcmp(cwd, "/"));
+    CHECK(close(dirfd) == 0);
+    OK(rmdir(NAMES_ROOT "/w/gone"));
     /* A directory without the right of search. */
     OK(mkdir(NAMES_ROOT "/w/closed", 0700));
     dirfd = open(NAMES_ROOT "/w/closed", O_RDONLY | O_DIRECTORY);
