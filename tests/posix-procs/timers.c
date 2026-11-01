@@ -920,7 +920,7 @@ static int t_c_thread_rt_repeats(void) {
 /* #467, fork: the repeats of a real-time signal that wait for the parent are
  * not the child's. The parent blocks SIGRTMIN and raises it three times (one
  * pending occurrence and two repeats), then forks; the child has nothing
- * pending, raises it once and takes one occurrence, not three. */
+ * pending, raises it once and takes the one occurrence it raised. */
 static int t_c_fork_drops_repeats(void) {
     if (t_block(SIGRTMIN)) return 1;
     if (raise(SIGRTMIN) || raise(SIGRTMIN) || raise(SIGRTMIN)) return 2;
