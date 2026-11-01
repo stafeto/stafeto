@@ -630,8 +630,11 @@ const STEPS_QUOTA: u64 = 576 * PAGE;
 /// layer and relibc grew since: main measured 633 pages of the slow growth
 /// and 631 of the forked child, under one page to the probe's 90% of 704,
 /// and the relibc of #432 (one write a message, pin-5f477a7f) 635 and 633
-/// with 736 pages: 13.7% left, 27 pages to 90%.
-const PROCS_QUOTA: u64 = 736 * PAGE;
+/// with 736 pages: 13.7% left, 27 pages to 90%. Step 6, part 1 (the memory
+/// streams without a file, the probes of relibc in the image, 64 descriptions
+/// of poll) measured 651 and 649 pages: 11 to 90% of 736. With 768 pages 90% is
+/// 691, 40 pages away, about two threads of a volley.
+const PROCS_QUOTA: u64 = 768 * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and

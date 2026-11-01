@@ -2928,6 +2928,7 @@ static int shares_role(void) {
 
 #include "faults.c"
 #include "timers.c"
+#include "libc.c"
 #if !CHANGE_STEPS
 static int burn50_role(void);
 static int nice_role(void);
@@ -3154,6 +3155,7 @@ static int role(const char *name) {
 #if !CHANGE_STEPS
     if (strcmp(name, "timers") == 0) return timers_role();
     if (strcmp(name, "timers-exec") == 0) return timers_exec_role();
+    if (strcmp(name, "libc") == 0) return libc_role();
 #endif
 #if !CHANGE_STEPS
     if (strcmp(name, "burn50") == 0) return burn50_role();
@@ -5436,6 +5438,10 @@ int main(int argc, char **argv) {
     groups();
     printf("posix-procs: stage churn\n");
     churn(16);
+#if !CHANGE_STEPS
+    printf("posix-procs: stage libc\n");
+    run_role("/bin/procs-child", "libc", NULL);
+#endif
     printf("posix-procs: stage files\n");
     files();
     printf("posix-procs: stage descriptors\n");

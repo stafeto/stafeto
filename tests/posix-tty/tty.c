@@ -46,6 +46,8 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <syslog.h>
+#include <utmpx.h>
 
 /* The numbers and structures relibc gives C are those of AArch64 Linux,
  * which the terminal service's proto_tty and the layer's posix-platform
@@ -95,6 +97,69 @@ static void pause_ms(long ms) {
     nanosleep(&t, NULL);
 }
 
+/* getlogin_r reads /var/run/utmpx by itself: the walk of the caller with
+ * getutxent goes on from where it stood (#321), and the buffer sizes decide
+ * ERANGE. The record of the terminal's line (console) names the user. */
+static int getlogin_leaves_the_walk(void) {
+    mkdir("/var", 0755);
+    mkdir("/var/run", 0755);
+    struct utmpx record[2];
+    memset(record, 0, sizeof record);
+    record[0].ut_type = USER_PROCESS;
+    strcpy(record[0].ut_user, "bob");
+    strcpy(record[0].ut_line, "elsewhere");
+    record[1].ut_type = USER_PROCESS;
+    strcpy(record[1].ut_user, "alice");
+    strcpy(record[1].ut_line, "console");
+    int file = open("/var/run/utmpx", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(file >= 0 && write(file, record, sizeof record) == (ssize_t)sizeof record);
+    CHECK(close(file) == 0);
+    setutxent();
+    struct utmpx *first = getutxent();
+    CHECK(first != NULL && strcmp(first->ut_user, "bob") == 0);
+    char name[64];
+    CHECK(getlogin_r(name, sizeof name) == 0 && strcmp(name, "alice") == 0);
+    struct utmpx *second = getutxent();
+    CHECK(second != NULL && strcmp(second->ut_user, "alice") == 0);
+    char big[33], six[6], five[5], two[2];
+    CHECK(getlogin_r(big, sizeof big) == 0 && strcmp(big, "alice") == 0);
+    CHECK(getlogin_r(six, sizeof six) == 0 && strcmp(six, "alice") == 0);
+    CHECK(getlogin_r(five, sizeof five) == ERANGE);
+    CHECK(getlogin_r(two, sizeof two) == ERANGE);
+    endutxent();
+    CHECK(unlink("/var/run/utmpx") == 0);
+    say("posix-tty: getlogin_r leaves the walk of getutxent where it stood ok\n");
+    /* syslog (#322): with no journal file the message is lost, and the standard
+     * error stays empty; LOG_PERROR shows it there; LOG_CONS sends it to the
+     * console. */
+    unlink("/var/log/messages");
+    int saved = dup(2);
+    int err = open("/tmp/syslog-err", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(saved >= 0 && err >= 0 && dup2(err, 2) == 2);
+    openlog("tty", LOG_PID, LOG_USER);
+    syslog(LOG_ERR, "lost %d", 1);
+    closelog();
+    CHECK(lseek(err, 0, SEEK_END) == 0);
+    openlog("tty", LOG_PERROR, LOG_USER);
+    syslog(LOG_ERR, "shown %d", 2);
+    closelog();
+    char text[64];
+    CHECK(lseek(err, 0, SEEK_SET) == 0);
+    ssize_t got = read(err, text, sizeof text - 1);
+    CHECK(got > 0);
+    text[got] = 0;
+    CHECK(strstr(text, "tty: shown 2") != NULL);
+    /* LOG_CONS: the standard error is still the file, and stays empty (the
+     * old library wrote to it); the line goes to the console. */
+    CHECK(ftruncate(err, 0) == 0 && lseek(err, 0, SEEK_SET) == 0);
+    openlog("tty", LOG_CONS, LOG_USER);
+    syslog(LOG_ERR, "console-line %d", 3);
+    closelog();
+    CHECK(lseek(err, 0, SEEK_END) == 0);
+    CHECK(dup2(saved, 2) == 2 && close(saved) == 0 && close(err) == 0);
+    return 0;
+}
+
 /* Identity: isatty, ttyname, ttyname_r. */
 static int identity(void) {
     int p[2];
@@ -125,6 +190,7 @@ static int identity(void) {
     CHECK(ttyname_r(99, buffer, sizeof buffer) == EBADF);
     CHECK(close(p[0]) == 0 && close(p[1]) == 0);
     say("posix-tty: identity ok\n");
+    if (getlogin_leaves_the_walk() != 0) return 1;
     return 0;
 }
 

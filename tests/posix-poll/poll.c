@@ -109,16 +109,87 @@ static int service_watches(void) {
     return 0;
 }
 
+struct writer { int fd; int signal; pthread_t target; int close_fd; };
+static void *wake_writer(void *arg) {
+    struct writer *w = arg;
+    struct timespec pause = {0, 2000000};
+    if (nanosleep(&pause, NULL) != 0) return (void *)1;
+    if (w->close_fd >= 0 && close(w->close_fd) != 0) return (void *)1;
+    if (w->signal) return (void *)(intptr_t)pthread_kill(w->target, w->signal);
+    return write(w->fd, "p", 1) == 1 ? NULL : (void *)1;
+}
+/* A poll and a select of 64 descriptions (#371): the library splits them into
+ * Watches of the pipe service of 32. A session has 32 ends of pipes, so sixteen
+ * pipes are made and their ends copied onto the other numbers of the table
+ * (copies cost no share): 61 descriptors name 32 ends. The poll has 64
+ * elements, the last of which is the read end of the only pipe with data; a
+ * select names 59 descriptors and finds the same one. Sixty-five elements are
+ * refused. */
+static int wide_sets(void) {
+    for (int fd = 3; fd < 64; fd++) close(fd);
+    int ends[16][2];
+    for (int i = 0; i < 16; i++) CHECK(pipe(ends[i]) == 0);
+    /* Copies of the read ends of the pipes without data, on 35 to 62; the
+     * copy of the read end of the last pipe is 63. */
+    int silent[64], count = 0;
+    for (int i = 0; i < 15; i++) { silent[count++] = ends[i][0]; silent[count++] = ends[i][1]; }
+    for (int fd = 35; fd < 63; fd++) {
+        CHECK(dup2(ends[fd % 15][0], fd) == fd);
+        silent[count++] = fd;
+    }
+    int last = 63;
+    CHECK(dup2(ends[15][0], last) == last);
+    struct pollfd items[65];
+    for (int i = 0; i < 63; i++) items[i] = (struct pollfd){silent[i % count], POLLIN, 77};
+    items[63] = (struct pollfd){last, POLLIN, 77};
+    CHECK(poll(items, 64, 3) == 0);
+    for (int i = 0; i < 64; i++) CHECK(items[i].revents == 0);
+    CHECK(write(ends[15][1], "w", 1) == 1);
+    CHECK(poll(items, 64, 3) == 1);
+    for (int i = 0; i < 64; i++) CHECK(items[i].revents == (i == 63 ? POLLIN : 0));
+    /* A wakeup of the second Watch (label 4): the poll waits with a long
+     * timeout, a thread writes to the last pipe 20 ms later, and the poll
+     * comes back long before the timeout. */
+    char byte;
+    CHECK(read(ends[15][0], &byte, 1) == 1);
+    struct writer late = {ends[15][1], 0, 0, -1};
+    struct timespec t0, t1;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &t0) == 0);
+    pthread_t pusher;
+    CHECK(pthread_create(&pusher, NULL, wake_writer, &late) == 0);
+    CHECK(poll(items, 64, 2000) == 1);
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &t1) == 0);
+    CHECK(pthread_join(pusher, NULL) == 0);
+    for (int i = 0; i < 64; i++) CHECK(items[i].revents == (i == 63 ? POLLIN : 0));
+    CHECK((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 1000);
+    fd_set reads, writes;
+    FD_ZERO(&reads); FD_ZERO(&writes);
+    for (int i = 0; i < 15; i++) FD_SET(ends[i][1], &writes);
+    for (int fd = 35; fd < 63; fd++) FD_SET(fd, &reads);
+    for (int i = 0; i < 15; i++) FD_SET(ends[i][0], &reads);
+    FD_SET(last, &reads);
+    struct timeval none = {0, 0};
+    /* The 15 write ends are ready for writing; of the reads, the last. */
+    CHECK(select(64, &reads, &writes, NULL, &none) == 16);
+    CHECK(FD_ISSET(last, &reads));
+    for (int i = 0; i < 15; i++) CHECK(!FD_ISSET(ends[i][0], &reads) && FD_ISSET(ends[i][1], &writes));
+    for (int i = 0; i < 65; i++) items[i] = (struct pollfd){last, POLLIN, 77};
+    CHECK(poll(items, 65, 0) < 0 && errno == EINVAL);
+    for (int fd = 3; fd < 64; fd++) close(fd);
+    printf("posix-poll: poll and select of 64 descriptions ok\n");
+    return 0;
+}
+
 /* The worst Watch of the terminal: 32 different open descriptions of the
  * console in one poll, which the library splits into two Watches of 16.
- * The file table holds 32 descriptors, so all are closed and the console
+ * The first 32 descriptors are closed and the console
  * is opened on each of them (0, 1 and 2 are then descriptions of their
  * own). The first poll waits and pins them all; the second answers by
- * position. A 33rd element is refused. */
+ * position. A 65th element is refused. */
 static int tty_distinct_watches(void) {
     fflush(stdout);
     for (int fd = 0; fd < 32; fd++) close(fd);
-    struct pollfd p[33];
+    struct pollfd p[65];
     for (int i = 0; i < 32; i++) {
         int fd = open("/dev/console", O_RDWR | O_NOCTTY);
         CHECK(fd == i);
@@ -142,22 +213,17 @@ static int tty_distinct_watches(void) {
     p[3].events = POLLOUT; p[20].events = POLLOUT;
     CHECK(poll(p, 32, 3) == 2);
     for (int i = 0; i < 32; i++) CHECK(p[i].revents == (i == 3 || i == 20 ? POLLOUT : 0));
+    /* Three Watches of 16 (33 elements) answer, and 65 are refused. */
+    p[3].events = POLLIN; p[20].events = POLLIN;
     p[32] = p[0];
-    CHECK(poll(p, 33, 0) < 0 && errno == EINVAL);
+    CHECK(poll(p, 33, 3) == 0);
+    for (int i = 33; i < 65; i++) p[i] = p[0];
+    CHECK(poll(p, 65, 0) < 0 && errno == EINVAL);
     CHECK(tcsetattr(0, TCSANOW, &old) == 0);
     for (int fd = 3; fd < 32; fd++) CHECK(close(fd) == 0);
     return 0;
 }
 
-struct writer { int fd; int signal; pthread_t target; int close_fd; };
-static void *wake_writer(void *arg) {
-    struct writer *w = arg;
-    struct timespec pause = {0, 2000000};
-    if (nanosleep(&pause, NULL) != 0) return (void *)1;
-    if (w->close_fd >= 0 && close(w->close_fd) != 0) return (void *)1;
-    if (w->signal) return (void *)(intptr_t)pthread_kill(w->target, w->signal);
-    return write(w->fd, "p", 1) == 1 ? NULL : (void *)1;
-}
 static void *blocking_wait(void *arg) {
     struct pollfd *fds = arg;
     return (void *)(intptr_t)poll(fds, 2, -1);
@@ -491,6 +557,8 @@ int main(int argc, char **argv) {
     int result = frontends();
     if (result != 0) return result;
     result = service_watches();
+    if (result != 0) return result;
+    result = wide_sets();
     if (result != 0) return result;
     result = tty_distinct_watches();
     if (result != 0) return result;

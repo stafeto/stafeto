@@ -434,26 +434,40 @@ pub fn futex_wait_pi(
     waited
 }
 
-/// The holder of a mutex of PTHREAD_PRIO_INHERIT unlocked `word`: the
-/// levels its waiters lent it go off it at once, so that the highest of
-/// them runs when it wakes; wakes up to `count`.
+/// The holder of a mutex of PTHREAD_PRIO_INHERIT unlocked `word`: wakes one
+/// waiter, the first of the queue (the highest level, the oldest among equals),
+/// whatever `count` says. The levels its waiters lent the holder go off it at
+/// once, and the waiters that stay wait for the one that woke and lend it
+/// their levels, so that it runs at the highest of them when it takes the
+/// mutex. Returns how many woke.
 pub fn futex_wake_pi(word: *const AtomicU32, count: u32) -> u32 {
+    let _ = count;
     let own = crate::threads::thread_number();
     // The lock keeps the caller at the ceiling of the process until its end,
     // so the wake comes first and the caller's level falls after it: the
     // waiter it wakes runs at once, before anything of a level between.
     let _lock = PI_LOCK.lock();
+    let first = posix_sync::futex_wake_first(word);
     let mut any = false;
-    crate::relibc::each_live(|_, _, waiter| {
+    crate::relibc::each_live(|index, _, waiter| {
         if u64::from(waiter.pi_owner.load(Ordering::SeqCst)) == own
             && waiter.pi_addr.load(Ordering::SeqCst) == word as usize
         {
-            waiter.pi_owner.store(0, Ordering::SeqCst);
+            // The woken one waits for no holder; the others for the woken.
+            let id = index as u64 + 1;
+            let lent_to = match first {
+                Some(first) if id != first => first as u32,
+                _ => 0,
+            };
+            waiter.pi_owner.store(lent_to, Ordering::SeqCst);
             any = true;
         }
     });
     if any {
         let _ = propagate(0, own);
+        if let Some(first) = first {
+            let _ = propagate(0, first);
+        }
     }
-    posix_sync::futex_wake(word, count)
+    u32::from(first.is_some())
 }

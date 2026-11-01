@@ -734,6 +734,58 @@ static int shm_processes(void) {
 }
 
 
+/* IPC_SET of a segment is the pipe service's: the library changes no file (#344).
+ * An unprivileged owner hands a segment to another user, whose uid the file of
+ * the segment has when shmctl returns, and who removes it. (The creator that
+ * removes a segment after the superuser gave it away is shm_files_of_the_dead.)
+ * The services give the file of the segment its new owner. */
+static int shm_hand_over(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    int id = shmget(IPC_PRIVATE, page, 0666);
+    CHECK(id > 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        /* The owner (1234) gives the segment to 4321 and cannot remove it. */
+        struct shmid_ds ds;
+        if (shmctl(id, IPC_STAT, &ds) != 0) _exit(1);
+        ds.shm_perm.uid = 1234;
+        if (shmctl(id, IPC_SET, &ds) != 0) _exit(2);
+        if (setgid(1234) != 0 || setuid(1234) != 0) _exit(3);
+        ds.shm_perm.uid = 4321;
+        if (shmctl(id, IPC_SET, &ds) != 0) _exit(4);
+        errno = 0;
+        if (shmctl(id, IPC_RMID, NULL) != -1 || errno != EPERM) _exit(5);
+        _exit(0);
+    }
+    CHECK(wait_ok(pid));
+    /* The file of the segment follows the segment when shmctl returns. */
+    int owned = 0;
+    DIR *dir = opendir("/dev/shm");
+    CHECK(dir != NULL);
+    for (struct dirent *e; (e = readdir(dir)) != NULL;) {
+        char path[96];
+        struct stat st;
+        if (strncmp(e->d_name, ".sysv", 5) != 0) continue;
+        snprintf(path, sizeof path, "/dev/shm/%s", e->d_name);
+        if (stat(path, &st) == 0 && st.st_uid == 4321) owned++;
+    }
+    closedir(dir);
+    CHECK(owned == 1);
+    /* The new owner removes it. */
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setgid(4321) != 0 || setuid(4321) != 0) _exit(1);
+        _exit(shmctl(id, IPC_RMID, NULL) == 0 ? 0 : 2);
+    }
+    CHECK(wait_ok(pid));
+    struct shmid_ds ds;
+    errno = 0;
+    CHECK(shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
+    return 0;
+}
+
 /* Who a caller is comes from the process service, not from the request: the
  * same call changes its answer when the process gives up its rights, and the
  * names of queues and semaphores are the owner's to take away. */
@@ -924,8 +976,8 @@ static int shm_names(void) {
     CHECK(stat(first, &st) == 0 && st.st_uid == 1234 && st.st_gid == 1234 && (st.st_mode & 0777) == 0640);
     CHECK(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == 1234 && (ds.shm_perm.mode & 0777) == 0640);
     CHECK(shmctl(id, IPC_RMID, NULL) == 0);
-    /* An owner that is no superuser cannot give the segment away: the file
-     * could not follow, so the segment stays as it is. */
+    /* An owner that is no superuser changes the mode of its segment, and the
+     * file follows (giving the segment away is shm_hand_over's). */
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -935,12 +987,7 @@ static int shm_names(void) {
         if (mine < 0 || sysv_files(path, sizeof path) != before + 1) _exit(3);
         struct shmid_ds d;
         if (shmctl(mine, IPC_STAT, &d) != 0) _exit(4);
-        d.shm_perm.uid = 4321;
-        errno = 0;
-        if (shmctl(mine, IPC_SET, &d) != -1 || errno != EPERM) _exit(5);
-        if (shmctl(mine, IPC_STAT, &d) != 0 || d.shm_perm.uid != 1234) _exit(6);
         struct stat s2;
-        if (stat(path, &s2) != 0 || s2.st_uid != 1234) _exit(7);
         /* A mode it may give, the file follows. */
         d.shm_perm.uid = 1234;
         d.shm_perm.mode = 0640;
@@ -1498,6 +1545,7 @@ int main(int argc, char **argv) {
     RUN(shm_basics);
     RUN(shm_processes);
     RUN(identity);
+    RUN(shm_hand_over);
     RUN(shm_pages);
     RUN(shm_names);
     RUN(pool_waits);

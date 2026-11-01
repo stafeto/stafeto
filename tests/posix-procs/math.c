@@ -14,6 +14,13 @@
 
 _Static_assert(sizeof(long double) == 16, "AArch64 long double uses binary128");
 _Static_assert(LDBL_MANT_DIG == 113, "long double header must describe binary128");
+_Static_assert(LDBL_DIG == __LDBL_DIG__, "LDBL_DIG of binary128");
+_Static_assert(DECIMAL_DIG == __DECIMAL_DIG__, "DECIMAL_DIG of binary128");
+_Static_assert(LDBL_DECIMAL_DIG == __LDBL_DECIMAL_DIG__, "LDBL_DECIMAL_DIG of binary128");
+_Static_assert(LDBL_MAX_10_EXP == __LDBL_MAX_10_EXP__, "LDBL_MAX_10_EXP of binary128");
+_Static_assert(LDBL_MIN_10_EXP == __LDBL_MIN_10_EXP__, "LDBL_MIN_10_EXP of binary128");
+_Static_assert(LDBL_MAX_EXP == __LDBL_MAX_EXP__, "LDBL_MAX_EXP of binary128");
+_Static_assert(LDBL_MIN_EXP == __LDBL_MIN_EXP__, "LDBL_MIN_EXP of binary128");
 
 #define CHECK(test) do { if (!(test)) { \
     printf("posix-math: FAIL line %d: %s errno %d\n", __LINE__, #test, errno); \
@@ -42,6 +49,20 @@ static void scalar(void) {
     CHECK(fma(ad, bd, -1.0) == -0x1p-54);
     CHECK(fmal(al, bl, -1.0L) == -0x1p-114L);
     puts("posix-math: float double and binary128 long double ok");
+}
+
+/* The limits of long double in float.h are the compiler's own for binary128
+ * (an x87 value would differ): the constants, and what they mean. */
+static void long_double_limits(void) {
+    volatile long double one = 1.0L, half = LDBL_EPSILON / 2, max = LDBL_MAX, min = LDBL_MIN;
+    CHECK(LDBL_EPSILON == __LDBL_EPSILON__ && LDBL_MAX == __LDBL_MAX__ && LDBL_MIN == __LDBL_MIN__);
+    CHECK(LDBL_TRUE_MIN == __LDBL_DENORM_MIN__);
+    CHECK(one + LDBL_EPSILON != one);
+    CHECK(one + half == one);
+    CHECK(max > 1.0e4900L && max * 2.0L == INFINITY);
+    CHECK(min < 1.0e-4900L && min > 0.0L && min / 2 > 0.0L);
+    CHECK(feclearexcept(FE_ALL_EXCEPT) == 0);
+    puts("posix-math: long double constants of binary128 ok");
 }
 
 static void special(void) {
@@ -179,6 +200,7 @@ static void threads(void) {
 int main(void) {
     CHECK(fesetenv(FE_DFL_ENV) == 0);
     scalar();
+    long_double_limits();
     special();
     environment();
     threads();

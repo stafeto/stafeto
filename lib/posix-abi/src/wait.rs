@@ -13,7 +13,12 @@ use rt::abi::{Error, Rights};
 use rt::handle::{Channel, Handle, Timer};
 use rt::sys;
 
-pub const MAX: usize = watch::MAX;
+/// The descriptions one poll or select takes: the whole table of descriptors.
+/// A Watch of a service takes `watch::MAX` of them at most, so a poll splits its
+/// set into several Watches of the same service (as it does for the terminal).
+pub const MAX: usize = posix_fs::OPEN_MAX;
+const LIMIT: usize = MAX;
+const _: () = assert!(LIMIT >= watch::MAX);
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 const TAG: u64 = 1 << 63;
@@ -29,18 +34,18 @@ pub fn now() -> u64 {
 }
 
 struct Pins {
-    targets: [Option<Target>; watch::MAX],
-    loans: [Option<(posix_fd::IoToken, posix_fd::OwnerToken)>; watch::MAX],
+    targets: [Option<Target>; LIMIT],
+    loans: [Option<(posix_fd::IoToken, posix_fd::OwnerToken)>; LIMIT],
     transport: Option<Transport>,
 }
 impl Pins {
-    fn snapshot(items: &[PollFd], ready: &mut [u32; watch::MAX]) -> Result<Self, i32> {
+    fn snapshot(items: &[PollFd], ready: &mut [u32; LIMIT]) -> Result<Self, i32> {
         let mut pins = Self {
-            targets: [None; watch::MAX],
-            loans: [None; watch::MAX],
+            targets: [None; LIMIT],
+            loans: [None; LIMIT],
             transport: None,
         };
-        let mut numbers = [u32::MAX; watch::MAX];
+        let mut numbers = [u32::MAX; LIMIT];
         for (number, item) in numbers.iter_mut().zip(items) {
             if item.fd >= 0 {
                 *number = item.fd as u32;
@@ -158,7 +163,7 @@ impl Subscription {
         };
         self.set.len += 1;
     }
-    fn merge(&self, incoming: watch::Ready, ready: &mut [u32; watch::MAX]) -> Result<(), i32> {
+    fn merge(&self, incoming: watch::Ready, ready: &mut [u32; LIMIT]) -> Result<(), i32> {
         if incoming.len != self.set.len {
             return Err(EIO);
         }
@@ -189,7 +194,7 @@ impl Subscription {
             _ => Err(EIO),
         }
     }
-    fn start(&mut self, ready: &mut [u32; watch::MAX]) -> Result<(), i32> {
+    fn start(&mut self, ready: &mut [u32; LIMIT]) -> Result<(), i32> {
         if self.set.len == 0 {
             return Ok(());
         }
@@ -226,7 +231,7 @@ impl Subscription {
         &mut self,
         channel: &Handle<Channel>,
         level: u8,
-        ready: &mut [u32; watch::MAX],
+        ready: &mut [u32; LIMIT],
     ) -> Result<(), i32> {
         if self.key == 0 {
             return Ok(());
@@ -259,7 +264,7 @@ impl Subscription {
             _ => Err(EIO),
         }
     }
-    fn cancel(&mut self, ready: &mut [u32; watch::MAX]) -> Result<(), i32> {
+    fn cancel(&mut self, ready: &mut [u32; LIMIT]) -> Result<(), i32> {
         if self.key == 0 {
             return Ok(());
         }
@@ -280,7 +285,7 @@ impl Subscription {
 }
 impl Drop for Subscription {
     fn drop(&mut self) {
-        if self.key != 0 && self.cancel(&mut [0; watch::MAX]).is_err() {
+        if self.key != 0 && self.cancel(&mut [0; LIMIT]).is_err() {
             // No owner/key is discarded after an unconfirmed cleanup.
             // A fatal protocol failure closes this process's sessions.
             panic!("readiness watch cleanup was not confirmed");
@@ -300,6 +305,11 @@ fn kernel_error(error: Error) -> i32 {
     }
 }
 
+/// The terminal descriptions placed in the Watches so far.
+fn terminals_placed(subscriptions: &[Subscription]) -> usize {
+    subscriptions[2..].iter().map(|s| s.set.len).sum()
+}
+
 fn ready_count(ready: &[u32]) -> usize {
     ready.iter().filter(|&&events| events != 0).count()
 }
@@ -312,7 +322,7 @@ fn run(
     handled: u64,
     selecting: bool,
 ) -> Result<usize, i32> {
-    if items.len() > watch::MAX {
+    if items.len() > LIMIT {
         return Err(EINVAL);
     }
     let block = threads::own_block();
@@ -321,18 +331,25 @@ fn run(
             n.checked_add(1).filter(|next| *next < TAG >> 3)
         })
         .map_err(|_| EAGAIN)?;
-    let mut ready = [0; watch::MAX];
+    let mut ready = [0; LIMIT];
     let pins = Pins::snapshot(items, &mut ready)?;
     let transport = pins.transport.ok_or(EIO)?;
-    // The pipes' Watch, then the terminal's Watches of WATCH_MAX elements
-    // each (`proto_tty::watch_group`), every one with a label of its own.
-    // The low three bits of a label: 0 the pipes, 1 and 3 the terminal's
-    // Watches, 2 the timer.
-    const _: () = assert!(proto_tty::WATCH_GROUPS == 2);
+    // The Watches of the pipe service take `watch::MAX` elements each, those of
+    // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`);
+    // every one has a label of its own. The low three bits of a label: 0 and 4
+    // the pipes, 1, 3, 5 and 7 the terminal's, 2 the timer.
+    const PIPE_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
+    const TERMINAL_WATCHES: usize = LIMIT.div_ceil(proto_tty::WATCH_MAX);
+    const _: () = assert!(PIPE_WATCHES == 2 && TERMINAL_WATCHES == 4);
+    const PIPE_LABELS: [u64; PIPE_WATCHES] = [0, 4];
+    const TERMINAL_LABELS: [u64; TERMINAL_WATCHES] = [1, 3, 5, 7];
     let mut subscriptions = [
-        Subscription::new(Service::Pipe, TAG | id << 3),
-        Subscription::new(Service::Terminal, TAG | id << 3 | 1),
-        Subscription::new(Service::Terminal, TAG | id << 3 | 3),
+        Subscription::new(Service::Pipe, TAG | id << 3 | PIPE_LABELS[0]),
+        Subscription::new(Service::Pipe, TAG | id << 3 | PIPE_LABELS[1]),
+        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[0]),
+        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[1]),
+        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[2]),
+        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[3]),
     ];
     for (index, (item, target)) in items.iter().zip(&pins.targets).enumerate() {
         let requested = (item.events as u16 as u32) & watch::EVENTS;
@@ -352,28 +369,28 @@ fn run(
         }
         match target {
             Some(Target::Pipe(end)) => {
-                subscriptions[0].owner = transport.pipes().map_err(crate::error)?.raw().0;
-                subscriptions[0].add(*end, requested, index);
+                let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
+                subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
+                subscriptions[at].add(*end, requested, index);
             }
             Some(Target::Fifo(target)) => {
-                subscriptions[0].owner = transport.pipes().map_err(crate::error)?.raw().0;
-                subscriptions[0].add_endpoint(target.endpoint(), requested, index);
+                let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
+                subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
+                subscriptions[at].add_endpoint(target.endpoint(), requested, index);
             }
             Some(Target::Tty(terminal)) => {
-                let group =
-                    proto_tty::watch_group(subscriptions[1].set.len + subscriptions[2].set.len);
+                let group = proto_tty::watch_group(terminals_placed(&subscriptions));
                 let owner = transport.terminal().ok_or(EBADF)?.raw().0;
-                subscriptions[1 + group].owner = owner;
-                subscriptions[1 + group].add(*terminal, requested, index);
+                subscriptions[2 + group].owner = owner;
+                subscriptions[2 + group].add(*terminal, requested, index);
             }
             Some(Target::Input | Target::Output | Target::Error)
                 if transport.terminal().is_some() =>
             {
-                let group =
-                    proto_tty::watch_group(subscriptions[1].set.len + subscriptions[2].set.len);
+                let group = proto_tty::watch_group(terminals_placed(&subscriptions));
                 let owner = transport.terminal().ok_or(EIO)?.raw().0;
-                subscriptions[1 + group].owner = owner;
-                subscriptions[1 + group].add(proto_tty::CONSOLE, requested, index);
+                subscriptions[2 + group].owner = owner;
+                subscriptions[2 + group].add(proto_tty::CONSOLE, requested, index);
             }
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}
@@ -541,7 +558,7 @@ pub fn select(
         if !(0..=posix_types::FD_SETSIZE as i32).contains(&nfds) {
             return Err(EINVAL);
         }
-        let mut items = [PollFd::default(); watch::MAX];
+        let mut items = [PollFd::default(); LIMIT];
         let mut count = 0;
         for fd in 0..nfds as usize {
             let bits = [has(&sets[0], fd), has(&sets[1], fd), has(&sets[2], fd)];
@@ -549,7 +566,7 @@ pub fn select(
                 if fd >= posix_fs::OPEN_MAX {
                     return Err(EBADF);
                 }
-                if count == watch::MAX {
+                if count == LIMIT {
                     // More descriptors than a watch takes: EBADF for one that
                     // is no descriptor, else EINVAL.
                     for other in 0..nfds as usize {

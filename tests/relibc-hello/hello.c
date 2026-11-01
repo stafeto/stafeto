@@ -245,11 +245,11 @@ static int memory_streams(void) {
     FILE *growing = open_memstream(&text, &length);
     CHECK(growing != NULL && fprintf(growing, "grown %d", 7) > 0 && fflush(growing) == 0);
     CHECK(length == 7 && strcmp(text, "grown 7") == 0);
-    int behind = fileno(growing);
-    CHECK(behind >= 0 && (fcntl(behind, F_GETFD) & FD_CLOEXEC) != 0);
+    errno = 0;
+    CHECK(fileno(growing) == -1 && errno == EBADF); /* it has no descriptor */
     CHECK(fclose(growing) == 0);
     free(text);
-    printf("relibc-hello: memory streams: short write ENOSPC, seek EINVAL, close-on-exec\n");
+    printf("relibc-hello: memory streams: short write ENOSPC, seek EINVAL, no descriptor\n");
     return 0;
 }
 
