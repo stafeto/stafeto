@@ -320,7 +320,7 @@ fn regions() -> Result<Regions, i32> {
     let count = crate::allocation::regions(|map| {
         // The child binds the parent's objects and a few of its own (its
         // thread's); a map that leaves it no room is the parent's ENOMEM
-        // (XSH fork), not a child that ends alone.
+        // (XSH fork), so that no child ends alone.
         if map.objects().count() + CHILD_OBJECTS > posix_map::MAX_OBJECTS {
             return Err(ENOMEM);
         }
