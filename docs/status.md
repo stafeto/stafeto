@@ -163,8 +163,8 @@ the services and the limits.
 
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
-os-test's `basic` suite passes 1,183 of its 1,187 tests (the three `dlfcn`
-tests need a dynamic loader and `pthread_setcanceltype` is open), with no
+os-test's `basic` suite passes 1,184 of its 1,187 tests (the three `dlfcn`
+tests need a dynamic loader), with no
 listed exception; its io, malloc, process and signal suites, `basic/spawn`,
 `basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
 `ci` from files, one boot a suite. `ci` fails when a test that passed stops

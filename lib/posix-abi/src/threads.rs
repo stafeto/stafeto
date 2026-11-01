@@ -240,8 +240,31 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
     let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
     let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
     close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
-    close_raw(block.channel.swap(channel.into_raw().0, Ordering::SeqCst));
+    let raw = channel.into_raw().0;
+    close_raw(block.channel.swap(raw, Ordering::SeqCst));
+    if u32::from(level) < old {
+        shed_lent_level(raw);
+    }
     Ok(())
+}
+
+/// Ends the level that the last wake through the old channel lent to the
+/// calling thread (it holds until the thread's next receive, and a thread
+/// that was woken at 30 and moved to 20 would otherwise run at 30 until it
+/// blocks): a notification to the new channel and a receive of it, which
+/// takes no time. Any other bit that the receive took (a cancellation that
+/// reached the new channel meanwhile) is sent back.
+fn shed_lent_level(raw: u64) {
+    let channel = Handle::<rt::handle::Channel>::borrowed(rt::abi::Handle(raw));
+    if sys::notify(&channel, posix_sync::bit::WAKE).is_err() {
+        return;
+    }
+    if let Ok(sys::Received::Notification { bits, .. }) = sys::receive(&channel) {
+        let others = bits & !posix_sync::bit::WAKE;
+        if others != 0 {
+            let _ = sys::notify(&channel, others);
+        }
+    }
 }
 
 /// Closes the handle `raw`, unless it is 0.

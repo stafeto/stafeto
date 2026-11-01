@@ -159,6 +159,8 @@ static void *pw_wait(void *arg) {
     return NULL;
 }
 
+static int pw_fifo_errno;
+
 static void pw_window(void) {
     switch (pw_site) {
     case PARK_POLL: {
@@ -170,7 +172,9 @@ static void pw_window(void) {
         int fd = open(pw_fifo, O_WRONLY | O_NONBLOCK);
         pw_writer = fd;
         if (fd < 0) {
-            printf("posix-park: the writer of the FIFO: errno %d\n", errno);
+            /* No printf here: the window is inside fork, under the lock of
+             * the allocator. The error is reported after the fork. */
+            pw_fifo_errno = errno;
             failures++;
         }
         break;
@@ -215,6 +219,10 @@ static int park_wait_role(int site, long deadline_ms, const char *what) {
     pid_t pid = fork();
     if (pid == 0) _exit(0);
     stafeto_probe_fork_window(NULL);
+    if (pw_fifo_errno) {
+        printf("posix-park: the writer of the FIFO: errno %d\n", pw_fifo_errno);
+        pw_fifo_errno = 0;
+    }
     int status = -1;
     expect("the fork", waitpid(pid, &status, 0), pid);
     expect("the child of the fork", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
