@@ -1254,6 +1254,76 @@ static int sem_waiters(void) {
     return 0;
 }
 
+#define FULL_CHILDREN 5
+#define FULL_CHILD 10
+#define FULL_PARENT 16
+static sem_t *full_sem;
+
+static void *full_waiter(void *arg) {
+    (void)arg;
+    return sem_wait(full_sem) == 0 ? NULL : (void *)1;
+}
+
+static int full_threads(pthread_t *threads, int n) {
+    int made = 0;
+    for (int i = 0; i < n; i++) {
+        pthread_attr_t attr;
+        CHECK(pthread_attr_init(&attr) == 0 && pthread_attr_setstacksize(&attr, 65536) == 0);
+        int created = pthread_create(&threads[i], &attr, full_waiter, NULL);
+        pthread_attr_destroy(&attr);
+        if (created != 0) break;
+        made++;
+    }
+    return made;
+}
+
+/* As many threads as a tree of processes may have wait on one named
+ * semaphore (sixty-six: a tree has room for about as many threads; the
+ * table of the service holds 128 waiting operations, 96 for a tree): the
+ * other calls go on, and the posts wake them one for each (xtask measures
+ * the longest step of the service). */
+static int named_waits(void) {
+    sem_unlink("/ipc-full");
+    full_sem = sem_open("/ipc-full", O_CREAT | O_EXCL, 0600, 0);
+    CHECK(full_sem != SEM_FAILED);
+    pid_t pids[FULL_CHILDREN];
+    for (int c = 0; c < FULL_CHILDREN; c++) {
+        pids[c] = fork();
+        CHECK(pids[c] >= 0);
+        if (pids[c] == 0) {
+            pthread_t threads[FULL_CHILD];
+            int made = full_threads(threads, FULL_CHILD);
+            int bad = made != FULL_CHILD;
+            for (int i = 0; i < made; i++) {
+                void *result = NULL;
+                if (pthread_join(threads[i], &result) != 0 || result != NULL) bad = 1;
+            }
+            _exit(bad);
+        }
+    }
+    pthread_t threads[FULL_PARENT];
+    CHECK(full_threads(threads, FULL_PARENT) == FULL_PARENT);
+    pause_ms(600);
+    int fds[2], sv[2];
+    char buf[64];
+    CHECK(pipe(fds) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    for (int i = 0; i < 20; i++) {
+        CHECK(write(fds[1], "pipe", 4) == 4 && read(fds[0], buf, sizeof buf) == 4);
+        CHECK(send(sv[0], "sock", 4, 0) == 4 && recv(sv[1], buf, sizeof buf, 0) == 4);
+    }
+    close(fds[0]); close(fds[1]); close(sv[0]); close(sv[1]);
+    for (int i = 0; i < FULL_PARENT + FULL_CHILDREN * FULL_CHILD; i++) CHECK(sem_post(full_sem) == 0);
+    for (int i = 0; i < FULL_PARENT; i++) {
+        void *result = NULL;
+        CHECK(pthread_join(threads[i], &result) == 0 && result == NULL);
+    }
+    for (int c = 0; c < FULL_CHILDREN; c++) CHECK(wait_ok(pids[c]));
+    int v = -1;
+    CHECK(sem_getvalue(full_sem, &v) == 0 && v == 0);
+    CHECK(sem_close(full_sem) == 0 && sem_unlink("/ipc-full") == 0);
+    return 0;
+}
+
 /* The tables have room for what a root may have, and no more. */
 static int limits(void) {
     int ids[16], n = 0;
@@ -1344,6 +1414,7 @@ int main(int argc, char **argv) {
     RUN(many_waits);
     RUN(named_semaphores);
     RUN(sem_waiters);
+    RUN(named_waits);
     RUN(limits);
     RUN(longest_steps);
     printf("posix-ipc: ok\n");
