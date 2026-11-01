@@ -302,6 +302,7 @@ static void forked(void) {
 /* The child of a fork maps the parent's code and read-only data objects:
  * no copy of them, no write through the code object, the code runs in the
  * child, and in a grandchild that outlives its parent. */
+extern char **environ;
 extern int stafeto_probe_image(uintptr_t address, uint64_t *out);
 
 static int image_answer(void) { return 4242; }
@@ -314,14 +315,15 @@ static int image_state(const void *at, uint64_t *words) {
 }
 
 /* What the code and the read-only data show in a process that shares them
- * with a live parent: bits of what is wrong. */
-static int image_bits(void) {
+ * with a live parent: bits of what is wrong. `code_base` and `data_base` are
+ * the mappings the parent's objects had before the fork. */
+static int image_bits(uint64_t code_base, uint64_t data_base) {
     uint64_t code[5] = {0}, data[5] = {0};
     int bad = 0;
     if (image_state((const void *)&image_answer, code) != 1 ||
         image_state((const void *)image_table, data) != 1)
         return 1;
-    if (code[0] < 2 || data[0] < 2) bad |= 1;
+    if (code[0] < code_base + 1 || data[0] < data_base + 1) bad |= 1;
     if (code[2] != 0 || data[2] != 0 || code[4] != 1 || data[4] != 1) bad |= 4;
     uintptr_t page = (uintptr_t)&image_answer & ~(PAGE - 1);
     /* The segments lie outside the room mprotect works in; writing the
@@ -350,7 +352,7 @@ static void image_shared(void) {
     if (child == 0) {
         close(fds[0]);
         uint64_t mine[5] = {0};
-        int bad = image_bits();
+        int bad = image_bits(before[0], rodata[0]);
         if (image_state((const void *)&image_answer, mine) != 1) _exit(1);
         /* The child did not pay for the code and the read-only data. */
         if (mine[1] + (mine[3] + rodata[3]) * PAGE > before[1]) bad |= 2;
@@ -363,7 +365,7 @@ static void image_shared(void) {
                 const struct timespec ms = {0, 1000000};
                 nanosleep(&ms, NULL);
             }
-            int late = getppid() == middle ? 128 : image_bits();
+            int late = getppid() == middle ? 128 : image_bits(before[0], rodata[0]);
             unsigned char byte = (unsigned char)late;
             _exit(write(fds[1], &byte, 1) == 1 ? 0 : 1);
         }
@@ -383,6 +385,119 @@ static void image_shared(void) {
     close(fds[0]);
     uint64_t after[5] = {0};
     check("image: one mapping after the children", image_state((const void *)&image_answer, after) == 1 && after[0] == 1);
+}
+
+/* Processes spawned from one file run the same code and read-only data
+ * (the table of images); a file of another inode, though it holds the same
+ * bytes, is another image. The role asks `expect` 1 for shared and 0 for
+ * alone. */
+static int image_role(int ready, int go, int expect) {
+    unsigned char byte = 1;
+    if (write(ready, &byte, 1) != 1) return 1;
+    if (read(go, &byte, 1) != 1) return 2;
+    uint64_t code[5] = {0}, data[5] = {0};
+    if (image_state((const void *)&image_answer, code) != 1 ||
+        image_state((const void *)image_table, data) != 1)
+        return 3;
+    int bad = 0;
+    if (expect) {
+        if (code[0] < 2) bad |= 4;
+        if (data[0] < 2) bad |= 8;
+    } else {
+        if (code[0] != 1) bad |= 16;
+        if (data[0] != 1) bad |= 32;
+    }
+    if (code[2] != 0 || data[2] != 0) bad |= 64;
+    int (*volatile call)(void) = image_answer;
+    if (call() != 4242) bad |= 64;
+    if (((const volatile unsigned char *)image_table)[2] != 3) bad |= 64;
+    /* Every process keeps its image until all have looked at theirs. */
+    byte = (unsigned char)bad;
+    if (write(ready, &byte, 1) != 1) return 4;
+    if (read(go, &byte, 1) != 1) return 5;
+    return 0;
+}
+
+/* The `count` processes loaded wrote a byte each to `ready`; release them,
+ * collect what each saw (bits of what is wrong, ORed) and let them go. */
+static int image_look(int ready, int go, int count, int *saw) {
+    unsigned char bytes[4] = {0};
+    int ok = write(go, "xxxx", (size_t)count) == count;
+    *saw = 0;
+    for (int i = 0; i < count; i++) {
+        if (read(ready, bytes, 1) != 1) { ok = 0; continue; }
+        *saw |= bytes[0];
+    }
+    return ok && write(go, "xxxx", (size_t)count) == count;
+}
+
+static int spawn_image(const char *path, int ready, int go, int expect, pid_t *pid) {
+    char r[16], g[16];
+    snprintf(r, sizeof r, "%d", ready);
+    snprintf(g, sizeof g, "%d", go);
+    char *args[] = {"map", "image", r, g, expect ? "1" : "0", NULL};
+    return posix_spawn(pid, path, NULL, NULL, args, environ);
+}
+
+static int copy_file(const char *from, const char *to) {
+    int in = open(from, O_RDONLY);
+    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (in < 0 || out < 0) {
+        if (in >= 0) close(in);
+        if (out >= 0) close(out);
+        return -1;
+    }
+    static char buffer[16384];
+    ssize_t n;
+    int ok = 1;
+    while ((n = read(in, buffer, sizeof buffer)) > 0)
+        if (write(out, buffer, (size_t)n) != n) { ok = 0; break; }
+    if (n < 0) ok = 0;
+    close(in);
+    close(out);
+    return ok ? 0 : -1;
+}
+
+static int image_exit(pid_t pid) {
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+static void image_spawned(void) {
+    int ready[2], go[2];
+    check("spawned image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    pid_t a, b;
+    check("spawned image: first spawn", spawn_image("/bin/procs-child", ready[1], go[0], 1, &a) == 0);
+    check("spawned image: second spawn", spawn_image("/bin/procs-child", ready[1], go[0], 1, &b) == 0);
+    unsigned char byte;
+    check("spawned image: both loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
+    int saw = -1;
+    check("spawned image: look", image_look(ready[0], go[1], 2, &saw));
+    check("spawned image: two spawns of one file share the code and the read-only data", saw == 0);
+    if (saw) printf("posix-map: spawned image bits %d\n", saw);
+    check("spawned image: exit", image_exit(a) == 0 && image_exit(b) == 0);
+    /* The same bytes in a file of another inode are another image, though
+     * the first one is still run. */
+    const char *copy = "/tmp/image-copy";
+    unlink(copy);
+    check("spawned image: copy", copy_file("/bin/procs-child", copy) == 0);
+    pid_t c1, c1b, c2;
+    check("spawned image: copy spawn", spawn_image(copy, ready[1], go[0], 1, &c1) == 0);
+    check("spawned image: copy spawn again", spawn_image(copy, ready[1], go[0], 1, &c1b) == 0);
+    check("spawned image: copies loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
+    check("spawned image: replace", unlink(copy) == 0 && copy_file("/bin/procs-child", copy) == 0);
+    check("spawned image: replaced spawn", spawn_image(copy, ready[1], go[0], 0, &c2) == 0);
+    check("spawned image: replaced loaded", read(ready[0], &byte, 1) == 1);
+    check("spawned image: look at the copies", image_look(ready[0], go[1], 3, &saw));
+    check("spawned image: one inode shares, the replacement is alone", saw == 0);
+    if (saw) printf("posix-map: spawned image copy bits %d\n", saw);
+    check("spawned image: copies exit", image_exit(c1) == 0 && image_exit(c1b) == 0 && image_exit(c2) == 0);
+    unlink(copy);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
 }
 
 /* A fork of a map with 97 groups of regions that do not adjoin (the table of
@@ -807,7 +922,6 @@ static void shared_names(void) {
     check("shm: shm_open of the gone name is ENOENT", shm_open(name, O_RDWR, 0) == -1 && errno == ENOENT);
 }
 
-extern char **environ;
 
 /* RLIMIT_DATA and RLIMIT_AS count the program's mappings; RLIMIT_STACK is
  * kept. */
@@ -1679,6 +1793,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "pinsafter") == 0) return pins_after();
     if (argc == 3 && strcmp(argv[1], "lockget") == 0) return lock_get(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
+    if (argc == 5 && strcmp(argv[1], "image") == 0)
+        return image_role(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
     if (argc == 1) {
         /* fork needs a program the process service started. */
         char *args[] = {"map", "run", NULL};
@@ -1705,6 +1821,7 @@ int main(int argc, char **argv) {
     errors();
     forked();
     image_shared();
+    image_spawned();
     forked_many();
     churn();
     fragmentation();

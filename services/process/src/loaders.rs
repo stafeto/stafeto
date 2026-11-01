@@ -31,6 +31,19 @@ pub const fn pool_allows(free: u64, quota: u64) -> bool {
     }
 }
 
+/// The quota of the process of a child of fork whose parent has a record
+/// quota of `nominal` bytes and shares `image_pages` pages of code and
+/// read-only data with it (spec 2, 3.12.2): the child pays for none of
+/// those, so it needs what is left, and at least a quarter of the quota
+/// for what the parent's data, heap and stacks grow to.
+pub const fn fork_quota(nominal: u64, image_pages: u32) -> u64 {
+    const PAGE: u64 = 4096;
+    let floor = (nominal / 4).next_multiple_of(PAGE);
+    let need = nominal.saturating_sub(image_pages as u64 * PAGE);
+    let quota = if need > floor { need } else { floor };
+    if quota > nominal { nominal } else { quota }
+}
+
 /// The credentials a child of `parent` starts with: those of an exec, the
 /// saved IDs taken from the effective ones, and the effective ones reset
 /// to the real ones for POSIX_SPAWN_RESETIDS ([P24-SPAWN], [P24-EXEC]).
@@ -117,6 +130,9 @@ pub struct Place<T> {
     pub set_id: Option<(u32, u32)>,
     #[cfg(feature = "image-probe")]
     pub image_probe_counts: crate::image_probe::Counts,
+    /// The pages of the code and the read-only data the loader mapped, as
+    /// it said in Ready: the record's `image_pages` once it commits.
+    pub image_pages: u32,
     /// What the service holds for the loader.
     pub held: T,
 }
@@ -201,6 +217,7 @@ impl<T> Loaders<T> {
             set_id: None,
             #[cfg(feature = "image-probe")]
             image_probe_counts: crate::image_probe::Counts::default(),
+            image_pages: 0,
             held,
         });
         self.of_record[record] = Some(index as u8);
@@ -354,6 +371,17 @@ impl<T> Loaders<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forked_child_pays_for_what_it_does_not_share() {
+        const PAGE: u64 = 4096;
+        assert_eq!(fork_quota(1160 * PAGE, 0), 1160 * PAGE);
+        assert_eq!(fork_quota(1160 * PAGE, 650), 510 * PAGE);
+        assert_eq!(fork_quota(1160 * PAGE, 1000), 290 * PAGE, "a quarter at least");
+        assert_eq!(fork_quota(1160 * PAGE, 5000), 290 * PAGE);
+        assert_eq!(fork_quota(3 * PAGE, 1), 2 * PAGE);
+        assert_eq!(fork_quota(PAGE, 0), PAGE, "never above the record's");
+    }
 
     #[test]
     fn retained_loader_distinguishes_loading_handoff_and_retired_attempts() {
