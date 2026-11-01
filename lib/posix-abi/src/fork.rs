@@ -712,7 +712,7 @@ fn sessions() -> Result<Sessions, i32> {
             slot: 0,
             generation: 0,
             random: false,
-        }; posix_fs::OPEN_MAX];
+        }; posix_fs::KEPT_BY_FORK_MAX];
         sub(3);
         let count = crate::shared::kept_by_fork(&mut kept)?;
         let (files, uart) = crate::shared::with_files(|fs| {

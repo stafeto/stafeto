@@ -185,6 +185,13 @@ pub struct DirEntry {
 
 /// Local descriptor bound. The RAM service separately bounds open descriptions.
 pub const OPEN_MAX: usize = 64;
+/// The shared mappings of files a process pins besides its descriptors
+/// (`pin_for_map`).
+pub use posix_fd::{MAP_PINS, PinRef};
+/// The descriptions a forked child of the process can share at most: those
+/// of its descriptors and its pins. A file service session holds fewer
+/// (the RAM service's 32 places), so the list is never full.
+pub const KEPT_BY_FORK_MAX: usize = OPEN_MAX + MAP_PINS;
 /// The longest current directory, in bytes.
 pub const MAX_CWD: usize = MAX_PATH;
 
@@ -1161,7 +1168,7 @@ impl PosixFs {
         self.descriptors.set_allocation_limit(limit);
     }
 
-    pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
+    pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; KEPT_BY_FORK_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
             if let Some(n) = target.ram_target()
@@ -1172,10 +1179,54 @@ impl PosixFs {
                 count += 1;
             }
         }
+        // The pins of shared mappings go with the memory, whatever the
+        // flags of the descriptors that named them.
+        for target in self.descriptors.pinned_all() {
+            if let Some(n) = target.ram_target()
+                && !out[..count].contains(&n.prepared())
+            {
+                out[count] = n.prepared();
+                count += 1;
+            }
+        }
         count
     }
 
-    /// Every RAM description retained by exec, including FD_CLOFORK.
+    /// A reference to the pin of the shared mapping of the file `key`, kept
+    /// outside the numbers (see `Table::pin_or_retain`): the live pin of
+    /// the file, or a new one of the description `fd` names. TooManyOpenFiles
+    /// when all `MAP_PINS` are taken.
+    pub fn pin_for_map(
+        &mut self,
+        fd: u32,
+        key: u64,
+        writes: bool,
+    ) -> Result<(PinRef, bool), FsError> {
+        match self.descriptors.get(fd)? {
+            Target::Ram(_) => self
+                .descriptors
+                .pin_or_retain(fd, key, writes)
+                .map_err(FsError::from),
+            _ => Err(FsError::NotSupported),
+        }
+    }
+
+    /// The pinned description, held for a request outside the owner's lock
+    /// (as `hold`).
+    pub fn hold_pin(&mut self, pin: PinRef) -> Result<Target, FsError> {
+        self.descriptors.hold_pin(pin).map_err(FsError::from)
+    }
+
+    /// Gives back a reference of a pin: the description to release when
+    /// it was the last and no descriptor, request or other pin keeps it. A
+    /// reference to a pin that went does nothing.
+    pub fn release_pin(&mut self, pin: PinRef) -> Option<Target> {
+        self.descriptors.release_pin(pin)
+    }
+
+    /// Every RAM description retained by exec, including FD_CLOFORK. The
+    /// pins of shared mappings are not among them: the new image has no
+    /// mappings.
     pub fn kept_by_exec(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, _) in self.descriptors.open() {

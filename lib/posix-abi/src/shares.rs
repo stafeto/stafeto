@@ -80,19 +80,26 @@ fn status_errno(status: u32) -> i32 {
 /// the file of `fd` open (ShareGrant): it comes before Get, Put and Attach.
 pub fn grant(fd: i32) -> Result<(), i32> {
     let number = u32::try_from(fd).map_err(|_| EBADF)?;
-    crate::shared::held(number, |transport, target| {
-        let posix_fs::Target::Ram(ram) = target else {
-            return Err(ENODEV);
-        };
-        transport
-            .files()
-            .share_grant(ram.fd())
-            .map_err(|status| match status.code() {
-                proto_fs::ACCESS_DENIED => EACCES,
-                proto_fs::NO_SPACE => ENOMEM,
-                _ => EIO,
-            })
-    })
+    crate::shared::held(number, grant_with)
+}
+
+/// As `grant` for the file the pin keeps (a shared mapping).
+pub fn grant_pin(pin: posix_fs::PinRef) -> Result<(), i32> {
+    crate::shared::held_pin(pin, grant_with)
+}
+
+fn grant_with(transport: posix_fs::Transport, target: posix_fs::Target) -> Result<(), i32> {
+    let posix_fs::Target::Ram(ram) = target else {
+        return Err(ENODEV);
+    };
+    transport
+        .files()
+        .share_grant(ram.fd())
+        .map_err(|status| match status.code() {
+            proto_fs::ACCESS_DENIED => EACCES,
+            proto_fs::NO_SPACE => ENOMEM,
+            _ => EIO,
+        })
 }
 
 /// The object of `key`, or the right to make it.
