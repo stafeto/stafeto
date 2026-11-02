@@ -35,6 +35,17 @@ extern "C" fn relibc_threads_places() -> c_int {
     posix_abi::relibc::occupied() as c_int
 }
 
+/// Fills `out` with index, flags and kernel state of each occupied place.
+///
+/// # Safety
+/// `out` has room for `len` triples.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn relibc_threads_report(out: *mut u64, len: c_int) -> c_int {
+    // SAFETY: the caller's promise.
+    let slice = unsafe { core::slice::from_raw_parts_mut(out.cast::<[u64; 3]>(), len as usize) };
+    posix_abi::relibc::occupied_report(slice) as c_int
+}
+
 /// Frees what the ended and released threads held.
 #[unsafe(no_mangle)]
 extern "C" fn relibc_threads_collect() {

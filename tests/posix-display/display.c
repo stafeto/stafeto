@@ -50,11 +50,23 @@ extern uint64_t dp_ns(void);
 #define PAGES 250
 #define BYTES (PAGES * 4096UL)
 
-static int run(const char *role, int *status) {
+static int run_file(const char *path, const char *role, int *status) {
     char *argv[] = {"posix-display", (char *)role, NULL};
     pid_t pid = 0;
-    if (posix_spawn(&pid, "/bin/posix-display", NULL, NULL, argv, environ) != 0) return -1;
+    if (posix_spawn(&pid, path, NULL, NULL, argv, environ) != 0) return -1;
     if (waitpid(pid, status, 0) != pid) return -1;
+    return 0;
+}
+
+static int run(const char *role, int *status) {
+    return run_file("/bin/posix-display", role, status);
+}
+
+/* A set-ID program has no session, whatever its caller put in the place. */
+static int no_session(void) {
+    CHECK(dp_session() == 0);
+    CHECK(dp_clone_ok() != 0);
+    CHECK(dp_buffer() == 0);
     return 0;
 }
 
@@ -119,6 +131,10 @@ static int piece_checks(void) {
     CHECK(run("spawned", &status) == 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     printf("posix-display: a spawned program has a session of its own\n");
+
+    CHECK(run_file("/bin/posix-display-suid", "setid", &status) == 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    printf("posix-display: a set-ID program gets no session\n");
 
     pid = fork();
     CHECK(pid >= 0);
@@ -209,6 +225,7 @@ static int first(void) {
 int main(int argc, char **argv) {
     int status;
     if (argc > 1 && strcmp(argv[1], "spawned") == 0) return session_without_piece();
+    if (argc > 1 && strcmp(argv[1], "setid") == 0) return no_session();
     if (argc > 1 && strcmp(argv[1], "execd") == 0) return session_without_piece();
     status = argc > 1 && strcmp(argv[1], "fork") == 0 ? forker() : first();
     if (status == 0 && argc == 1) printf("posix-display: ok\n");

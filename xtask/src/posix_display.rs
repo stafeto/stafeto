@@ -43,13 +43,14 @@ pub const PROGRAMS: [ImageProgram; 8] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const LINES: [&str; 8] = [
+const LINES: [&str; 9] = [
     "posix-display: the start gave a session that answers a CLONE",
     "posix-display: the buffer is the display piece, one for a process",
     "posix-display: munmap, mprotect and MAP_FIXED over the piece are EINVAL, the piece is as it was",
     "posix-display: a forked child has a session of its own that answers a CLONE, and no piece",
     "posix-display: the child's read at the parent's buffer is SIGSEGV, the parent's pieces are intact",
     "posix-display: a spawned program has a session of its own",
+    "posix-display: a set-ID program gets no session",
     "posix-display: exec takes the child's piece away and keeps its session",
     "posix-display: the piece goes with its unmap, a second one can be mapped",
 ];
