@@ -57,6 +57,13 @@ const MMIO_AT: usize = 0x10_1000_0000;
 const SESSIONS: usize = 16;
 /// The device's one queue that carries events, `eventq`.
 const EVENTQ: u16 = 0;
+/// The most events one step takes from the queue: the rest wait for the
+/// driver's notification to itself, between which the requests of the
+/// clients are served. A step of 16 stays under 0.9 of term B (xtask).
+const PER_STEP: u64 = 16;
+/// The bit of the driver's notification to its own channel: more events
+/// wait in the queue.
+const MORE: u64 = 1;
 
 /// The codes of a start that failed: the start data or `dma`; REGISTER, the
 /// window or the binding; a map; the loop; no input device at the
@@ -179,12 +186,16 @@ fn main(_: u64) -> u64 {
     else {
         return NOT_STARTED;
     };
+    let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
+        return NOT_REGISTERED;
+    };
     let mut driver = Driver {
         transport,
         queue,
         irq,
         channel: Handle::borrowed(channel.raw()),
         level,
+        notify,
         focus: Focus::new(),
         slot_of: [0; QUEUE_SIZE],
         _maps: (dma, window),
@@ -226,6 +237,8 @@ struct Driver {
     irq: Handle<Interrupt>,
     /// The loop's channel, to make sessions of focus from.
     channel: ManuallyDrop<Handle<Channel>>,
+    /// A copy of the channel with NOTIFY, for the notifications to itself.
+    notify: Handle<Channel>,
     level: u8,
     focus: Focus,
     /// The buffer each token of the queue stands for.
@@ -262,7 +275,10 @@ impl Driver {
     fn describe(&mut self) {
         let mut name = [0u8; config::DATA_MAX];
         let n = selected(&mut self.transport, config::ID_NAME, 0, &mut name);
-        let name = core::str::from_utf8(&name[..n]).unwrap_or("?");
+        // The device may count the string's end among its bytes.
+        let name = core::str::from_utf8(&name[..n])
+            .unwrap_or("?")
+            .trim_end_matches('\0');
         let mut keys = [0u8; config::DATA_MAX];
         let n = selected(
             &mut self.transport,
@@ -276,26 +292,46 @@ impl Driver {
 
     /// An interrupt of the line (spec 9): the kernel masked it at
     /// delivery. Reading the ISR drops the level; the events the device
-    /// wrote are taken, their buffers go back to it; the line opens again
-    /// (irq_ack), source cleared first [G26].
+    /// wrote are taken, their buffers go back to it (`drain`).
     fn interrupt(&mut self) {
         // The driver's own work, measured apart from the heartbeat.
         rt::service::step_own();
         let isr = Isr::read(&mut self.transport);
         if isr.queue() {
-            self.reap();
+            self.drain();
+        } else {
+            virtio_mmio::reopen(&self.irq);
+        }
+    }
+
+    /// Takes up to PER_STEP events; when the queue holds more, the driver
+    /// notifies itself for the next step and the line stays closed. With
+    /// the queue empty the line opens again (irq_ack), source cleared
+    /// first [G26].
+    fn drain(&mut self) {
+        let (taken, sound) = self.reap(PER_STEP);
+        // The events of the step, for the line of the longest.
+        rt::service::step_detail(taken);
+        // A buffer that could not be taken back stays in the ring: no step
+        // is asked for it again and again.
+        if sound && self.queue.peek_used().is_some() && sys::notify(&self.notify, MORE).is_ok() {
+            return;
         }
         virtio_mmio::reopen(&self.irq);
     }
 
-    /// Takes every event the device returned to the focus, and gives the
-    /// buffers back.
-    fn reap(&mut self) {
-        let mut returned = false;
-        while let Some(token) = self.queue.peek_used() {
+    /// Takes up to `most` events the device returned to the focus, and
+    /// gives their buffers back; how many, and whether no buffer failed.
+    fn reap(&mut self, most: u64) -> (u64, bool) {
+        let mut taken = 0u64;
+        let mut sound = true;
+        while taken < most
+            && let Some(token) = self.queue.peek_used()
+        {
             let Some(&slot) = self.slot_of.get(usize::from(token)) else {
                 rt::println!("virtio-input: a used buffer {token} out of the queue");
-                return;
+                sound = false;
+                break;
             };
             let slot = usize::from(slot);
             // SAFETY: the same buffer `offer` added with this token; the
@@ -306,7 +342,8 @@ impl Driver {
             };
             let Ok(len) = popped else {
                 rt::println!("virtio-input: the used buffer {token} could not be taken back");
-                return;
+                sound = false;
+                break;
             };
             if len as usize >= EVENT_LEN {
                 // SAFETY: as above; read before the buffer goes back.
@@ -315,13 +352,15 @@ impl Driver {
             }
             if !self.offer(slot) {
                 rt::println!("virtio-input: buffer {slot} could not go back to the queue");
-                return;
+                sound = false;
+                break;
             }
-            returned = true;
+            taken += 1;
         }
-        if returned && self.queue.should_notify() {
+        if taken > 0 && self.queue.should_notify() {
             virtio_mmio::ring(&mut self.transport, EVENTQ);
         }
+        (taken, sound)
     }
 
     /// GRANT: a new session of focus, which revokes the one before.
@@ -410,8 +449,13 @@ impl Service<1> for Driver {
     }
 
     fn notification(&mut self, n: Notice) {
-        if n.source == Source::Interrupt {
-            self.interrupt();
+        match n.source {
+            Source::Interrupt => self.interrupt(),
+            Source::Unlabeled if n.bits & MORE != 0 => {
+                rt::service::step_own();
+                self.drain();
+            }
+            _ => {}
         }
     }
 }

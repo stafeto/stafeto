@@ -18,7 +18,9 @@
 //!
 //! A second run, under -icount (QEMU's own emulation), measures the steps
 //! of the service: the probe in its `quick` build asks for the focus and
-//! polls READ until the key `z`, while xtask sends `a` twenty times and `z`.
+//! polls READ until the key `z`, while xtask sends three combinations of 16
+//! keys, 32 events each, and `z`, so that the guest takes several events at
+//! one interrupt.
 //! Every step stays under 0.9 of term B.
 
 use std::path::PathBuf;
@@ -61,7 +63,6 @@ pub const SERVICE_LINE: &str = "virtio-input: virtio-mmio at 0xa001e00, line 63,
 const DEVICE_LINE: &str = "input: QEMU Virtio Keyboard, keys 0x";
 const MARKER: &str = "input-probe: send ";
 const ENDED: &str = "init: input-probe ended: exit code 0, not restarted";
-const ENDED_X: &str = "init: input-probe-x ended: exit code 0, not restarted";
 
 /// The lines the probe prints once per check that passed.
 const CHECKS: [&str; 12] = [
@@ -222,8 +223,9 @@ fn drive(run: &mut Run, scratch: &Scratch) -> Result<(), String> {
         let hold = if what == "burst" { 1 } else { 100 };
         press(&mut monitor, &keys, hold)?;
     }
+    // The stranger ended at the start, before the first request of the
+    // other; its lines are in the verdict's.
     run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
-    run.expect_line(ENDED_X, |l| l == ENDED_X, WITHIN)?;
     Ok(())
 }
 
@@ -264,10 +266,14 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
         let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
         let wanted = format!("{MARKER}keys");
         run.expect_line(&wanted, |l| l == wanted, WITHIN)?;
-        press(&mut monitor, &["a"; 20], 1)?;
+        // A combination is one command: its 16 presses and their SYN
+        // events reach the device at once, 32 events, which the guest takes
+        // in more than one step.
+        for _ in 0..3 {
+            monitor.sendkey("a-b-d-e-f-g-h-i-j-k-l-m-n-o-p-q", Some(1))?;
+        }
         press(&mut monitor, &["z"], 1)?;
-        run.expect_line(ENDED, |l| l == ENDED, WITHIN)?;
-        run.expect_line(ENDED_X, |l| l == ENDED_X, WITHIN)
+        run.expect_line(ENDED, |l| l == ENDED, WITHIN).map(|_| ())
     })();
     let outcome = run.stop();
     driven.map_err(|e| format!("input-probe under -icount: {e}"))?;
