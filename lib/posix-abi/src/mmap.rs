@@ -75,6 +75,11 @@ fn whole_pages(len: usize) -> Result<usize, i32> {
 /// the heap lose their access, those of an object of their own are
 /// unmapped. Pages in no mapping are left alone.
 fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
+    // The buffer of the screen goes with the screen's owner only (spec 3,
+    // 7.3).
+    if state.map.meets_display(address, pages) {
+        return Err(EINVAL);
+    }
     // The holes the range touches go first: they are no mapping, and the
     // runs below must not see them.
     state.map.trim_holes(address, pages, |at, count| {
@@ -500,6 +505,9 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
                 .any(|(i, ..)| !state.map.object(state.map.piece(i).object()).may_write)
         {
             return Err(EACCES);
+        }
+        if state.map.meets_display(addr, pages) {
+            return Err(EINVAL);
         }
         if !mapped(state, addr, pages) {
             return Err(ENOMEM);

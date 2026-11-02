@@ -301,7 +301,13 @@ pub unsafe fn after_fork(
             object.wait_key,
         );
     }
+    // The parent's display piece is no mapping of the child's: its pages
+    // of the room are free again.
+    let display = state.map.display_piece();
     state.map.forget();
+    if let Some((address, pages)) = display {
+        state.space.set(address, pages, Page::Unbacked);
+    }
     let mut last = None;
     for entry in map {
         if entry.shared {
@@ -548,6 +554,44 @@ impl State {
             }
             at = to;
         }
+        Ok(())
+    }
+
+    /// The buffer of the screen `handle` (`pages` pages, MAP_READ and
+    /// MAP_WRITE) becomes the display piece of the map, in an object of its
+    /// own at an address of the room (spec 3, 7.3); the address. EBUSY when
+    /// the map has one already, ENOMEM past the room, the limits or the
+    /// table. The handle goes if the map refuses it.
+    pub(crate) fn map_display(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+    ) -> Result<usize, i32> {
+        if self.map.display_piece().is_some() {
+            return Err(EBUSY);
+        }
+        self.within_data(pages)?;
+        let source = Source {
+            existing: Some(handle),
+            ..Source::anonymous()
+        };
+        let (index, address) = self.make_own(None, pages, Access::ReadWrite, false, source, 0)?;
+        self.map.object_mut(index).display = true;
+        Ok(address)
+    }
+
+    /// The display piece leaves the process (`mem_unmap`) and its object
+    /// closes; Ok when there is none.
+    pub(crate) fn unmap_display(&mut self) -> Result<(), i32> {
+        let Some((address, pages)) = self.map.display_piece() else {
+            return Ok(());
+        };
+        // SAFETY: the pages are the layer's own display piece, which the
+        // caller gives up.
+        unsafe { sys::mem_unmap(&config().process, address, (pages * PAGE) as u64) }
+            .map_err(|e| self.refused(e))?;
+        self.map.unmap_display();
+        self.space.set(address, pages, Page::Unbacked);
         Ok(())
     }
 

@@ -1938,6 +1938,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Pipes, moved(pipes)),
             (Slot::Terminal, moved(terminal)),
             (Slot::Entropy, moved(crate::random::session())),
+            (Slot::Display, moved(crate::display::session())),
         ],
     ) == 0
 }
@@ -2050,6 +2051,7 @@ fn commit(
         terminal
     };
     let entropy = crate::fork::entropy_clone();
+    let display = crate::display::clone_session();
     let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
@@ -2057,6 +2059,7 @@ fn commit(
         (Slot::Pipes, pipes),
         (Slot::Terminal, terminal),
         (Slot::Entropy, entropy),
+        (Slot::Display, display),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

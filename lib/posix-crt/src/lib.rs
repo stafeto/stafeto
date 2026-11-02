@@ -230,6 +230,9 @@ pub unsafe fn posix_init_process(
     // The entropy service, when the record names it; none otherwise, and
     // getentropy gives ENOSYS. SAFETY: startup, on the only thread.
     unsafe { posix_abi::random::init(rt::service::connect(parent, "entropy").ok()) };
+    // The display service, when the record names it ("gpu"); none otherwise,
+    // and the screen calls give ENODEV. SAFETY: as above.
+    unsafe { posix_abi::display::init(rt::service::connect(parent, "gpu").ok()) };
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
     // CLOCK_REALTIME without IPC; a clock service without its page leaves
@@ -378,6 +381,12 @@ fn loaded_main() -> u64 {
     // the program's life, its header first.
     let header = unsafe { core::slice::from_raw_parts(START_AREA as *const u8, START_SIZE) };
     let Some(area) = Start::read(header) else {
+        // A program built for another layout of the area (an older image):
+        // the code stays 125.
+        rt::println!(
+            "POSIX startup: the start area is not of version {} (rebuild the program)",
+            proto_loader::START_VERSION
+        );
         return 125;
     };
     // A library without a loader's vector cannot start a program.
@@ -458,6 +467,16 @@ fn loaded_main() -> u64 {
     }
     // SAFETY: still single-threaded.
     unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
+    // A set-ID program takes no display session from its caller, who could
+    // put a channel of its own there: the handle closes and the screen
+    // calls give ENODEV. SAFETY: as above.
+    unsafe {
+        posix_abi::display::init(
+            one(Slot::Display)
+                .map(Handle::from_raw)
+                .filter(|_| area.flags & SECURE == 0),
+        )
+    };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

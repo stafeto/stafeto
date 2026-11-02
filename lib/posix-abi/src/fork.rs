@@ -169,7 +169,7 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal and Entropy; 0 for
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy and Display; 0 for
 /// none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
@@ -179,6 +179,7 @@ pub struct Sessions {
     pub pipes: u64,
     pub terminal: u64,
     pub entropy: u64,
+    pub display: u64,
 }
 
 impl Sessions {
@@ -194,6 +195,7 @@ impl Sessions {
             (Slot::Pipes, self.pipes),
             (Slot::Terminal, self.terminal),
             (Slot::Entropy, self.entropy),
+            (Slot::Display, self.display),
         ] {
             if raw != 0 {
                 mask |= slot.bit();
@@ -215,6 +217,7 @@ impl Sessions {
             self.pipes,
             self.terminal,
             self.entropy,
+            self.display,
         ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -267,8 +270,8 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
 }
 
 /// Handles: the sessions for the child to its loader `c`, each that is
-/// there; they move whatever comes of it. Four go in one message, the
-/// entropy service's in a second.
+/// there; they move whatever comes of it. Four go in one message, the rest
+/// (the entropy and display services') in a second.
 fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
     use proto_loader::Slot;
     let session = |raw: u64| (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -279,6 +282,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Pipes, session(sessions.pipes)),
         (Slot::Terminal, session(sessions.terminal)),
         (Slot::Entropy, session(sessions.entropy)),
+        (Slot::Display, session(sessions.display)),
     ];
     match crate::process::give_sessions(c, given) {
         0 => Ok(()),
@@ -325,7 +329,7 @@ fn regions() -> Result<Regions, i32> {
     ); REGIONS_MAX];
     let count = crate::allocation::regions(|map| {
         let mut count = 0;
-        for (place, piece) in seen.iter_mut().zip(map.iter()) {
+        for (place, piece) in seen.iter_mut().zip(map.inherited()) {
             let object = map.object(piece.object());
             *place = (
                 Region {
@@ -796,6 +800,10 @@ fn sessions() -> Result<Sessions, i32> {
         if let Some(clone) = entropy_clone() {
             out.entropy = clone.into_raw().0;
         }
+        sub(9);
+        if let Some(clone) = crate::display::clone_session() {
+            out.display = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -929,6 +937,9 @@ fn child() -> Result<(), &'static str> {
         // The parent's key and buffer go: the child asks for a key of its
         // own at its first use.
         crate::random::after_fork(handle(raw(Slot::Entropy)));
+        // The child's session with the display service is the clone the
+        // parent made; it has no owner session and no display piece.
+        crate::display::after_fork(handle(raw(Slot::Display)));
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();
