@@ -172,6 +172,10 @@ pub struct Object<H> {
     /// filled: immutable, without a file, and shared with a forked child
     /// without a copy.
     pub image: bool,
+    /// The key of an anonymous shared object for waits by address between
+    /// processes (0: none). A forked child shows the same object with the
+    /// same key.
+    pub wait_key: u64,
 }
 
 impl<H> Object<H> {
@@ -183,6 +187,7 @@ impl<H> Object<H> {
             may_write: true,
             dirty: false,
             image: false,
+            wait_key: 0,
         }
     }
 }

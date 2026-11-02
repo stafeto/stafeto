@@ -119,6 +119,7 @@ fn long_call(
     call: &Call<'_>,
     out: &mut [u8],
     deadline: u64,
+    check: Option<&dyn Fn() -> bool>,
 ) -> Result<Reply, i32> {
     let pipes = transport.pipes().map_err(crate::error)?;
     let mut start = Writer::new();
@@ -134,7 +135,18 @@ fn long_call(
             again.write(w)
         }
     };
-    let n = if deadline == NO_DEADLINE && call.id {
+    let n = if let Some(check) = check {
+        long::run_checked(
+            &pipes,
+            start.as_bytes(),
+            keyed,
+            &mut buffer,
+            &refusal,
+            (deadline != NO_DEADLINE).then_some(deadline),
+            call.id,
+            check,
+        )?
+    } else if deadline == NO_DEADLINE && call.id {
         long::run_with_duplicable_identity(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal)?
     } else if deadline == NO_DEADLINE {
         long::run_with(&pipes, start.as_bytes(), keyed, &mut buffer, &refusal)?
@@ -160,6 +172,7 @@ fn run(
     bytes: &[u8],
     out: &mut [u8],
     deadline: u64,
+    check: Option<&dyn Fn() -> bool>,
 ) -> Result<Reply, i32> {
     if words.len() > WORDS_MAX || cred_at.is_some_and(|at| at + Cred::WORDS > words.len()) {
         return Err(EINVAL);
@@ -184,7 +197,7 @@ fn run(
         let mut call = Call::new(operation, &all[..count], bytes);
         call.id = send_identity;
         let result = if op::is_long(operation) {
-            long_call(transport, &call, out, deadline)
+            long_call(transport, &call, out, deadline, check)
         } else {
             short(transport, &call, out)
         };
@@ -215,7 +228,7 @@ pub fn call(
 ) -> Result<Reply, i32> {
     let point = op::is_long(operation).then(crate::threads::cancel::Point::begin);
     let result = transport().and_then(|t| {
-        let result = run(t, operation, words, cred_at, bytes, out, deadline);
+        let result = run(t, operation, words, cred_at, bytes, out, deadline, None);
         if let Ok(reply) = &result
             && makes_file_jobs(operation, words, reply)
         {
@@ -231,6 +244,61 @@ pub fn call(
         }
     }
     result
+}
+
+/// A wait by address on the word (`kind`, `key`, `offset`) of shared memory:
+/// the service has the waiter, then `still` says whether the word is still
+/// the one waited on (false: EAGAIN). Ok when a wake came; ETIMEDOUT at
+/// `deadline` (ns of the monotonic clock, `NO_DEADLINE` for none), EINTR for
+/// an entry or a request of cancellation, EAGAIN also when the service has no
+/// room for another waiter.
+pub fn wait_address(
+    word: (u64, u64, u64),
+    deadline: u64,
+    still: &dyn Fn() -> bool,
+) -> Result<(), i32> {
+    let level = u64::from(posix_thread::effective_level(crate::threads::own_block()));
+    let words = [word.0, word.1, word.2, level];
+    let point = crate::threads::cancel::Point::begin();
+    let mut out = [0u8; 16];
+    let result = transport().and_then(|t| {
+        run(
+            t,
+            op::ADDR_WAIT,
+            &words,
+            None,
+            b"",
+            &mut out,
+            deadline,
+            Some(still),
+        )
+    });
+    if result.is_ok() {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result.map(drop)
+}
+
+/// A wake by address on the word: up to `count` waiters, the highest level
+/// first. How many woke (0 when the service cannot be asked).
+pub fn wake_address(word: (u64, u64, u64), count: u32) -> u32 {
+    let mut total = 0u32;
+    while total < count {
+        let words = [word.0, word.1, word.2, u64::from(count - total)];
+        let mut out = [0u8; 16];
+        let Ok(reply) = call(op::ADDR_WAKE, &words, None, b"", &mut out, NO_DEADLINE) else {
+            break;
+        };
+        let woken = reply.words[0] as u32;
+        total += woken;
+        // The service wakes at most a list of waiters in a call.
+        if woken < 16 {
+            break;
+        }
+    }
+    total
 }
 
 /// Whether the call left a job for the file of a segment in the pipe service:
@@ -289,6 +357,7 @@ pub fn call_fd(
             bytes,
             out,
             deadline,
+            None,
         )
     });
     if let Some(point) = point {
@@ -332,6 +401,7 @@ pub fn mq_open(
         name,
         &mut out,
         NO_DEADLINE,
+        None,
     )?;
     let id = u32::try_from(reply.words[0]).map_err(|_| EIO)?;
     let flags = DescriptorFlags {

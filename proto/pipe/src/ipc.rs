@@ -139,12 +139,26 @@ pub mod op {
     /// sem_getvalue: w0 id. => the value.
     pub const NSEM_VALUE: u32 = 37;
 
+    /// A wait by address on a word of memory several processes share (long):
+    /// w0 the kind of the key (0 a file, 1 anonymous memory), w1 the key,
+    /// w2 the offset of the word in the object, w3 the level of the waiting
+    /// thread. The start puts the waiter in the table of waiting operations
+    /// and answers at once (WAIT); the layer then reads the word, and either
+    /// takes (the answer is ready when a wake came since the start, else it
+    /// comes with the wake) or cancels (the word changed).
+    pub const ADDR_WAIT: u32 = 38;
+    /// A wake by address: w0 kind, w1 key, w2 offset, w3 how many to wake at
+    /// most. The waiters of the word wake in the order of their levels, the
+    /// older first among equals. => w0 how many were woken (at most the
+    /// size of a list of wakes: the caller asks again when it got that many).
+    pub const ADDR_WAKE: u32 = 39;
+
     /// Whether the operation is a long one: a start that may answer WAIT
     /// and the takes that follow.
     pub const fn is_long(op: u32) -> bool {
         matches!(
             op,
-            MQ_SEND | MQ_RECV | MQ_NOTIFY_WAIT | MSG_SND | MSG_RCV | SEM_OP | NSEM_WAIT
+            MQ_SEND | MQ_RECV | MQ_NOTIFY_WAIT | MSG_SND | MSG_RCV | SEM_OP | NSEM_WAIT | ADDR_WAIT
         )
     }
 }

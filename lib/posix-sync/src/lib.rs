@@ -33,7 +33,7 @@
 
 use abi::{Error, Policy, Source};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use posix_thread::{Block, flag};
 use rt::handle::{Channel, Handle, Thread, Timer};
 use rt::sys;
@@ -312,16 +312,25 @@ fn probe() {
     }
 }
 
-/// How long a wait on a word of a shared mapping lasts at most, in ns: no
-/// waker in another process can reach the bucket of this one, so such a
-/// wait looks at its word again every millisecond (`set_shared`).
+/// How long a wait on a word of a shared mapping lasts at most when the
+/// service cannot take it, in ns: no waker in another process can reach the
+/// bucket of this one, so such a wait looks at its word again every
+/// millisecond (`set_shared`).
 const SHARED_POLL_NS: u64 = 1_000_000;
 static SHARED: AtomicUsize = AtomicUsize::new(0);
+/// Set when the process has made a shared mapping: only then does a wake
+/// look at whether its word lies in one.
+static SHARED_EVER: AtomicBool = AtomicBool::new(false);
 
 /// The function that says whether an address lies in a mapping other
 /// processes share (MAP_SHARED). Called once at the start of the process.
 pub fn set_shared(hook: fn(usize) -> bool) {
     SHARED.store(hook as usize, Ordering::Release);
+}
+
+/// The process has a shared mapping (a wake by address then asks the layer).
+pub fn note_shared() {
+    SHARED_EVER.store(true, Ordering::Relaxed);
 }
 
 fn shared(address: usize) -> bool {
@@ -332,6 +341,47 @@ fn shared(address: usize) -> bool {
     // SAFETY: only `set_shared` stores a value, a `fn(usize) -> bool`.
     let hook: fn(usize) -> bool = unsafe { core::mem::transmute::<usize, fn(usize) -> bool>(hook) };
     hook(address)
+}
+
+/// How a wait through the service ended.
+pub enum Remote {
+    /// The service woke the wait.
+    Woken,
+    /// The word differs from the value (the `still` function said so).
+    Changed,
+    /// An entry of signals or a request of cancellation came.
+    Entry,
+    /// The deadline passed.
+    TimedOut,
+    /// The service cannot take this wait (the word has no key, or the table
+    /// of waiters is full): the wait polls.
+    Unavailable,
+}
+
+type RemoteWait = fn(usize, &dyn Fn() -> bool, Option<u64>) -> Remote;
+type RemoteWake = fn(usize, u32) -> Option<u32>;
+static REMOTE_WAIT: AtomicUsize = AtomicUsize::new(0);
+static REMOTE_WAKE: AtomicUsize = AtomicUsize::new(0);
+
+/// The functions that wait and wake by address through the service for words
+/// of shared mappings: `wait(address, still, deadline)` and `wake(address,
+/// count)`, which says None when the word has no key. Called once at the
+/// start of the process.
+pub fn set_remote(wait: RemoteWait, wake: RemoteWake) {
+    REMOTE_WAKE.store(wake as usize, Ordering::Release);
+    REMOTE_WAIT.store(wait as usize, Ordering::Release);
+}
+
+fn remote_wait() -> Option<RemoteWait> {
+    let hook = REMOTE_WAIT.load(Ordering::Acquire);
+    // SAFETY: only `set_remote` stores a value, a `RemoteWait`.
+    (hook != 0).then(|| unsafe { core::mem::transmute::<usize, RemoteWait>(hook) })
+}
+
+fn remote_wake() -> Option<RemoteWake> {
+    let hook = REMOTE_WAKE.load(Ordering::Acquire);
+    // SAFETY: only `set_remote` stores a value, a `RemoteWake`.
+    (hook != 0).then(|| unsafe { core::mem::transmute::<usize, RemoteWake>(hook) })
 }
 
 /// Clears the NO_RESTART mark of the calling thread (a handler without
@@ -427,8 +477,30 @@ pub fn futex_wait(
         return Err(EINVAL);
     }
     let address = ptr::from_ref(word) as usize;
-    // A word in a mapping other processes share: the wait polls.
-    let poll = (timer != 0 && shared(address))
+    // A word in a mapping other processes share: the service holds the wait,
+    // so that a waker in any process reaches it, in the order of levels.
+    let in_shared = SHARED_EVER.load(Ordering::Relaxed) && shared(address);
+    if in_shared && let Some(wait) = remote_wait() {
+        if word.load(Ordering::SeqCst) != value {
+            return Err(EAGAIN);
+        }
+        let changed = core::cell::Cell::new(false);
+        let still = || {
+            let same = word.load(Ordering::SeqCst) == value;
+            changed.set(!same);
+            same
+        };
+        match wait(address, &still, deadline) {
+            Remote::Woken => return Ok(Woken::Woken),
+            Remote::Changed => return Err(EAGAIN),
+            Remote::Entry => return Ok(Woken::Entry),
+            Remote::TimedOut => return Err(ETIMEDOUT),
+            Remote::Unavailable if changed.get() => return Err(EAGAIN),
+            Remote::Unavailable => {}
+        }
+    }
+    // A word in a mapping the service cannot hold a wait for: the wait polls.
+    let poll = (timer != 0 && in_shared)
         .then(|| rt::time::ticks_to_ns(rt::time::now()) + SHARED_POLL_NS);
     let wake_at = match (deadline, poll) {
         (Some(d), Some(p)) => Some(d.min(p)),
@@ -558,6 +630,20 @@ pub fn resume_wait(abandoned: bool) {
 /// first; returns how many. Never fails (relibc unwraps its result). With
 /// no waiter in the bucket it makes no call of the kernel.
 pub fn futex_wake(word: *const AtomicU32, count: u32) -> u32 {
+    let local = wake_local(word, count);
+    // The waiters of the word in other processes wait in the service.
+    if local < count
+        && SHARED_EVER.load(Ordering::Relaxed)
+        && shared(word as usize)
+        && let Some(wake) = remote_wake()
+        && let Some(woken) = wake(word as usize, count - local)
+    {
+        return local + woken;
+    }
+    local
+}
+
+fn wake_local(word: *const AtomicU32, count: u32) -> u32 {
     let address = word as usize;
     let bucket = bucket(address);
     if bucket.waiters.load(Ordering::SeqCst) == 0 || count == 0 {
