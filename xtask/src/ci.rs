@@ -235,6 +235,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("tty", 10),
     ("entropy", 6),
     ("gpu-probe", 8),
+    ("input-probe", 10),
     ("posix-random", 19),
 ];
 const DEFAULT_WEIGHT: u32 = 20;
