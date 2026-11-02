@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# Doomgeneric (ozkl/doomgeneric): the source port of Doom with a small
+# platform interface, pinned to one commit.
+# Format: docs/packages.md.
+
+name = "doomgeneric"
+version = "e257a09527062bfb986b6e5e0780839b6cbd5b71"
+kind = "game"
+url = "https://github.com/ozkl/doomgeneric/archive/e257a09527062bfb986b6e5e0780839b6cbd5b71.tar.gz"
+sha256 = "26f8f60daa6c6e4d3c01e5eac9fb700d592dede803d13ac848154ff356b2a2e7"
+license = "GPL-2.0-or-later"
+depends = ["busybox"]
+build = "tools/build-doomgeneric.py"
+program = "doom"
+files = [
+  "/bin/doom = elf:doom",
+]

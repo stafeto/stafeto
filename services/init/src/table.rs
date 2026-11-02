@@ -135,12 +135,16 @@ pub struct Binding {
 /// its physical address first in the own arguments: `size` bytes, a power
 /// of two of pages up to abi::MAX_CONTIGUOUS_PAGES, uncached in every
 /// mapping when `uncached`. Init keeps a handle of its own until the
-/// instance ended and its device stopped (`quiesce`).
+/// instance ended and its device stopped (`quiesce`). The instance's copy
+/// has MAP_READ, MAP_WRITE and TRANSFER, and DUPLICATE as well when
+/// `duplicate`: the display service hands copies of its buffer with fewer
+/// rights to the owner of the screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dma {
     pub name: &'static str,
     pub size: u64,
     pub uncached: bool,
+    pub duplicate: bool,
 }
 
 /// A write of `bits` bits, 8 or 32, init makes through a window of its own
@@ -852,7 +856,9 @@ fn order(table: &[Record]) -> Order {
 
 pub mod ceiling;
 pub mod cycle;
+pub mod doom;
 pub mod entropy;
+pub mod gpu;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
 pub mod normal;
@@ -868,6 +874,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-ramfs") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
+    + cfg!(feature = "table-doom") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
     + cfg!(feature = "table-posix-abi") as usize
@@ -897,6 +904,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-tty-vz") as usize
     + cfg!(feature = "table-entropy") as usize
     + cfg!(feature = "table-entropy-vz") as usize
+    + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-posix-random") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
@@ -914,6 +922,7 @@ const _: () = assert!(
     feature = "table-ramfs",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
+    feature = "table-doom",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
     feature = "table-posix-abi",
@@ -943,6 +952,7 @@ const _: () = assert!(
     feature = "table-posix-tty-vz",
     feature = "table-entropy",
     feature = "table-entropy-vz",
+    feature = "table-gpu",
     feature = "table-posix-random"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
@@ -982,6 +992,8 @@ pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
+#[cfg(feature = "table-doom")]
+pub const TABLE: &[Record] = doom::TABLE;
 #[cfg(feature = "table-posix-dialog")]
 pub const TABLE: &[Record] = ramfs::POSIX_DIALOG_TABLE;
 #[cfg(feature = "table-posix-dialog-vz")]
@@ -1018,6 +1030,8 @@ pub const TABLE: &[Record] = vz::POSIX_TTY_TABLE;
 pub const TABLE: &[Record] = entropy::TABLE;
 #[cfg(feature = "table-entropy-vz")]
 pub const TABLE: &[Record] = entropy::VZ_TABLE;
+#[cfg(feature = "table-gpu")]
+pub const TABLE: &[Record] = gpu::TABLE;
 #[cfg(feature = "table-posix-random")]
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 
@@ -1604,6 +1618,7 @@ mod tests {
             name: "dma",
             size: 16 * PAGE,
             uncached: true,
+            duplicate: false,
         };
         const STOP: Write = Write {
             window: "rtc",
@@ -1751,6 +1766,7 @@ mod tests {
         for table in [
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
+            doom::TABLE,
             ramfs::POSIX_TTY_TABLE,
             ramfs::POSIX_DIALOG_TABLE,
             ramfs::POSIX_FILES_TABLE,
@@ -1968,6 +1984,7 @@ mod tests {
             order_of(entropy::VZ_TABLE),
             ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
+        assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
         assert_eq!(
             refused(cycle::TABLE),
             "the connections make a cycle: a -> b -> a"
@@ -1978,6 +1995,24 @@ mod tests {
         );
     }
 
+    /// The games image is the shell's dialog with the launcher's quota of
+    /// 3 072 pages and a pool of four and a half such quotas.
+    #[test]
+    fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
+        assert!(check(doom::TABLE).is_ok());
+        assert_eq!(order_of(doom::TABLE), order_of(ramfs::BUSYBOX_DIALOG_TABLE));
+        let launcher = doom::TABLE
+            .iter()
+            .find(|r| r.program == "ash-launcher")
+            .unwrap();
+        let posix = doom::TABLE
+            .iter()
+            .find(|r| r.name == PROCESS_SERVICE)
+            .unwrap();
+        assert_eq!(launcher.quota, 3072 * PAGE);
+        assert_eq!(posix.quota, ramfs::POSIX_ABI_TABLE[1].quota + 13_824 * PAGE);
+    }
+
     /// Every POSIX process leaves one level above main for its thread
     /// owner, heap and file workers and sleep timer, and its table passes.
     #[test]
@@ -1985,6 +2020,7 @@ mod tests {
         let tables = [
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
+            doom::TABLE,
             ramfs::POSIX_DIALOG_TABLE,
             vz::POSIX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,

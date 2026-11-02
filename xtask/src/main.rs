@@ -33,12 +33,15 @@ mod clock_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
+mod doom;
 mod entropy;
+mod gpu_probe;
 mod guards;
 mod htop_dialog;
 mod image;
 mod jobs;
 mod measure;
+mod monitor;
 mod nano_dialog;
 mod native_scopes;
 #[cfg(test)]
@@ -869,7 +872,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 6] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -880,6 +883,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
     ("htop", "htop", 0, &["dynamic"]),
     ("nano", "nano", 0, &["dynamic"]),
     ("ncdu", "ncdu", 0, &["dynamic"]),
+    ("doom", "doom", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -1597,6 +1601,8 @@ commands:
             the spread of loops over the CPUs, taskset, htop
   ncdu-dialog  check ncdu in an ash dialog in QEMU: directory sizes, hard links counted once, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
+  doom-headless [MACHINE]  check Doom in the games image (boot-doom.img): from ash, without a
+            screen, it plays the demo of Freedoom (-timedemo demo1 -nodraw) and ash prompts again
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
   ls        run BusyBox ls against the RAM file service in QEMU
@@ -1630,6 +1636,10 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
+            shown, the screen compared with QEMU's screenshot by CRC-32, one
+            owner, the screen's return, a restart of the service, and its
+            steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
@@ -1847,6 +1857,7 @@ fn main() {
             })
             .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
+        Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -1862,6 +1873,14 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("gpu-probe") => match args.get(1).map(String::as_str) {
+            None => gpu_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                gpu_probe::probe(&qemu::HVF_V3)?;
+                gpu_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("gpu-probe [--hvf]".to_owned()),
+        },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -2350,6 +2369,21 @@ fn write_elf_image(
     if let Some((licence, source)) = &ncdu_files {
         list.push((NCDU_LICENSE, licence.as_slice()));
         list.push((NCDU_SOURCE, source.as_bytes()));
+    }
+    // An image with Doom (GPL-2.0-or-later) carries its licence, Freedoom's
+    // (BSD-3-Clause) and where the exact sources are.
+    let doom_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "doom"))
+    {
+        Some(doom::terms_files()?)
+    } else {
+        None
+    };
+    if let Some(files) = &doom_files {
+        for (name, bytes) in files {
+            list.push((name, bytes.as_slice()));
+        }
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3467,6 +3501,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("htop", _) => "htop",
         ("nano", _) => "nano",
         ("ncdu", _) => "ncdu",
+        ("doom", _) => "doom",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -8545,6 +8580,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("cpus-dialog smp 1", || cpus_dialog::cpus_dialog(1)),
         job("cpus-dialog smp 4", || cpus_dialog::cpus_dialog(SMP_CPUS)),
         job("ncdu-dialog", ncdu_dialog::ncdu_dialog),
+        job("doom-headless", || doom::doom_headless(&qemu::VIRT)),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
         job("bash-dialog", bash_dialog::bash_dialog),
@@ -8684,6 +8720,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
+        // The display service on virtio-gpu: the screen against QEMU's
+        // screenshot, then its steps under -icount.
+        job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -8795,6 +8834,12 @@ fn host_tests() -> Result<(), String> {
         "posix-random",
         "--package",
         "entropy",
+        "--package",
+        "proto-gpu",
+        "--package",
+        "virtio-mmio",
+        "--package",
+        "virtio-gpu",
     ]))
 }
 
@@ -11034,6 +11079,9 @@ fn hvf() -> Result<(), String> {
         // and the layer's generator across fork.
         entropy::probe(m)?;
         entropy::random_probe(m)?;
+        // The display service: the buffer through the real processor's
+        // caches, shown without a clean (spec 3, 3.4).
+        gpu_probe::probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -11338,6 +11386,10 @@ fn ci_lints() -> Result<(), String> {
         "proto-entropy",
         "--package",
         "posix-random",
+        "--package",
+        "proto-gpu",
+        "--package",
+        "virtio-mmio",
         "--all-targets",
         "--",
         "-D",
@@ -11367,6 +11419,8 @@ fn ci_lints() -> Result<(), String> {
         "virtio-rng",
         "--package",
         "entropy",
+        "--package",
+        "virtio-gpu",
         "--lib",
         "--tests",
         "--",
@@ -11492,8 +11546,12 @@ fn ci_lints() -> Result<(), String> {
         "entropy-probe",
         "--package",
         "entropy",
+        "--package",
+        "virtio-gpu",
+        "--package",
+        "gpu-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps",
         "--target",
         PROGRAM_TARGET,
         "--",

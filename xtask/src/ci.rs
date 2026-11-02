@@ -40,6 +40,7 @@ const RELIBC: &str = "relibc";
 const LIBC_SO: &str = "libc.so";
 const BASE: &str = "BusyBox and base packages";
 const ADDONS: &str = "add-on packages";
+const GAMES: &str = "game packages";
 const KERNELS: &str = "kernel images";
 const IMAGES: &str = "boot images";
 const OS_TEST_OBJECTS: &str = "os-test objects";
@@ -176,6 +177,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("cpus-dialog smp 1", 20),
     ("cpus-dialog smp 4", 30),
     ("ncdu-dialog", 3),
+    ("doom-headless", 20),
     ("ash-shell-exit", 1),
     ("bash-shell-exit", 5),
     ("bash-dialog", 41),
@@ -232,6 +234,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("kernel tests 2G icount", 1),
     ("tty", 10),
     ("entropy", 6),
+    ("gpu-probe", 8),
     ("posix-random", 19),
 ];
 const DEFAULT_WEIGHT: u32 = 20;
@@ -314,6 +317,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("build", LIBC_SO, &[RELIBC], super::libc_so));
     steps.push(step("build", BASE, &[RELIBC], super::busybox_build));
     steps.push(step("build", ADDONS, &[RELIBC, BASE], super::nano_build));
+    steps.push(step(
+        "build",
+        GAMES,
+        &[RELIBC, BASE, ADDONS],
+        super::doom::build_games,
+    ));
     steps.push(step("build", KERNELS, &[], || {
         for variant in [
             Variant::Normal,

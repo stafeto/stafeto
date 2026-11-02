@@ -65,6 +65,8 @@ table-posix-steps = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []
+# The games image: the dialog with the quota of Doom (xtask doom-headless).
+table-doom = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
 # The probe of the terminal service (xtask tty, tty-vz).
@@ -77,6 +79,8 @@ table-posix-tty-vz = []
 # The probes of the entropy device's driver (xtask entropy, entropy-vz).
 table-entropy = []
 table-entropy-vz = []
+# The probe of the display service (xtask gpu-probe).
+table-gpu = []
 # The C probe of getentropy and getrandom (xtask posix-random).
 table-posix-random = []
 
