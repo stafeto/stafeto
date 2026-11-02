@@ -25,6 +25,7 @@ initial-exec` (-fPIC for the C). Options of build: --relibc-source DIR
 uses a checkout of relibc (with local changes) in place of the pinned
 fetch."""
 
+import hashlib
 import importlib.util
 import os
 import re
@@ -39,6 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "target" / "libc-so"
 SYSROOT = OUT / "sysroot"
 PROBES = OUT / "probes"
+STAMP = OUT / "stamp"
+PROBES_STAMP = OUT / "probes-stamp"
 SOURCES = ROOT / "tests" / "posix-so" / "dyn"
 
 LIBRARY_BASE = 0x0400_0000
@@ -473,11 +476,33 @@ def check_library(path: Path, names: dict, layer_a: Path, libc_a: Path) -> list:
 # ------------------------------------------------------------------- build
 
 
+def digest(*parts) -> str:
+    sha = hashlib.sha256()
+    for part in parts:
+        sha.update(part if isinstance(part, bytes) else Path(part).read_bytes())
+    return sha.hexdigest()
+
+
+def build_stamp(libc_a: Path, layer_a: Path) -> str:
+    """The inputs of libc.so: both archives, this script, the programs' recipe
+    (the same script), and the tools that link."""
+    tools = run(lld(), "--version", capture=True).stdout
+    return "\n".join((digest(libc_a), digest(layer_a), digest(Path(__file__)), tools.strip(),
+                      TOOLCHAIN)) + "\n"
+
+
 def build(source: Path | None) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     sysroot = build_relibc(source)
     libc_a = sysroot / "lib" / "libc.a"
     layer_a = build_layer()
+    # What libc.so is made of: a change of any of it builds it again.
+    wanted = build_stamp(libc_a, layer_a)
+    if (STAMP.exists() and STAMP.read_text() == wanted and (OUT / "libc.so").exists()
+            and (SYSROOT / "lib" / "libc.so").exists() and (SYSROOT / "lib" / "crt1.o").exists()):
+        print(f"libc.so is up to date: {SYSROOT / 'lib' / 'libc.so'}")
+        return
+    STAMP.unlink(missing_ok=True)
     layer_a, raised = raise_visibility(libc_a, layer_a)
     print(f"layer archive: {raised} names shared with relibc raised to default visibility")
 
@@ -506,6 +531,7 @@ def build(source: Path | None) -> None:
     crt1 = OUT / "crt1.S"
     crt1.write_text(CRT1)
     run(llvm("clang"), "--target=aarch64-linux-gnu", "-c", crt1, "-o", SYSROOT / "lib" / "crt1.o")
+    STAMP.write_text(wanted)
     print(f"libc.so ready: {SYSROOT / 'lib' / 'libc.so'}")
 
 
@@ -530,6 +556,8 @@ def compile_c(source: Path, output: Path, *flags, fpic=True) -> None:
 # ------------------------------------------------------------------- probes
 
 GOOD = ["so-hello", "so-image"]
+BAD = ["bad-interp", "bad-copy", "bad-tls", "bad-needed", "bad-symbol", "bad-ifunc", "bad-pie"]
+PROBE_FILES = GOOD + BAD
 # bad program: (source, what makes it bad, check)
 
 
@@ -569,9 +597,21 @@ def good_checks(name: str, elf: Elf) -> str | None:
     return None
 
 
+def probes_stamp() -> str:
+    sources = sorted(SOURCES.glob("*.c"))
+    return "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
+                      digest(Path(__file__)), *(digest(p) for p in sources))) + "\n"
+
+
 def build_probes() -> list:
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
+    wanted = probes_stamp()
+    if (PROBES_STAMP.exists() and PROBES_STAMP.read_text() == wanted
+            and all((PROBES / n).exists() for n in PROBE_FILES)):
+        print("probes are up to date")
+        return sorted(PROBE_FILES)
+    PROBES_STAMP.unlink(missing_ok=True)
     shutil.rmtree(PROBES, ignore_errors=True)
     PROBES.mkdir(parents=True)
     work = PROBES / "obj"
@@ -622,6 +662,7 @@ def build_probes() -> list:
         why = (good_checks if kind == "good" else program_checks)(name, elf)
         if why:
             fail(f"probe {name}: {why}")
+    PROBES_STAMP.write_text(wanted)
     return sorted(made)
 
 
