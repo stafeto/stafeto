@@ -228,7 +228,11 @@ impl<T, W> Images<T, W> {
         let mut status = [0u8; WAITING];
         for (state, w) in status.iter_mut().zip(&self.waiting) {
             if let Some(w) = w {
-                *state = match self.entries.get(usize::from(w.entry)).and_then(Option::as_ref) {
+                *state = match self
+                    .entries
+                    .get(usize::from(w.entry))
+                    .and_then(Option::as_ref)
+                {
                     None => 2,
                     Some(e) => u8::from(!matches!(e.state, State::Making(_))),
                 };
@@ -569,7 +573,11 @@ mod tests {
         assert_eq!(t.get(&key(1), 4), Got::Found(1, &1));
         t.commit(4);
         assert_eq!(t.len(), 1, "the entry lives while its user does");
-        assert_eq!(t.get(&key(1), 5), Got::Found(1, &1), "the next exec shares it");
+        assert_eq!(
+            t.get(&key(1), 5),
+            Got::Found(1, &1),
+            "the next exec shares it"
+        );
         // An exec of the same file that aborts keeps the old registration.
         assert_eq!(t.get(&key(1), 4), Got::Found(1, &1));
         t.abort(4);
@@ -592,7 +600,11 @@ mod tests {
         assert_eq!(t.ready_batch(&mut one).0, 1);
         let (record, k, _) = one[0].take().unwrap();
         assert_eq!(record, 1);
-        assert_eq!(t.get(&k, record), Got::Reserved, "the oldest becomes the maker");
+        assert_eq!(
+            t.get(&k, record),
+            Got::Reserved,
+            "the oldest becomes the maker"
+        );
         let mut one = [None];
         assert_eq!(t.ready_batch(&mut one).0, 0, "the other waits for it");
     }
