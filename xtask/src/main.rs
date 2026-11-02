@@ -145,7 +145,7 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 14] = [
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
-    ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("busybox-probe", "busybox-probe", 0, &["dynamic"]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
@@ -167,7 +167,7 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 14] = [
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
-    ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("busybox-probe", "busybox-probe", 0, &["dynamic"]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
@@ -595,7 +595,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ),
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
-    ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("busybox-probe", "busybox-probe", 0, &["dynamic"]),
     ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
     ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
@@ -868,16 +868,11 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
 const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
-    (
-        "busybox-probe",
-        "busybox-probe",
-        0,
-        &["ash-interactive", "utilities"],
-    ),
-    ("bash", "bash", 0, &["interactive"]),
-    ("htop", "htop", 0, &["interactive", "procfs"]),
-    ("nano", "nano", 0, &["interactive"]),
-    ("ncdu", "ncdu", 0, &["interactive"]),
+    ("busybox-probe", "busybox-probe", 0, &["dynamic", "utilities"]),
+    ("bash", "bash", 0, &["dynamic"]),
+    ("htop", "htop", 0, &["dynamic"]),
+    ("nano", "nano", 0, &["dynamic"]),
+    ("ncdu", "ncdu", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -2134,6 +2129,9 @@ fn write_boot_image_files(
     cmd.arg("build").args(profile.args());
     cmd.args(["--target", PROGRAM_TARGET]);
     for (_, package, _, features) in programs {
+        if is_dynamic(features) {
+            continue;
+        }
         cmd.args(["--package", package]);
         for feature in *features {
             cmd.args(["--features", &format!("{package}/{feature}")]);
@@ -2144,8 +2142,18 @@ fn write_boot_image_files(
     {
         let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         run_cmd(&mut cmd)?;
-        for &(file, package, stack, _) in programs {
-            let built = cargo_output(&target, PROGRAM_TARGET, profile, package);
+        if programs.iter().any(|p| is_dynamic(p.3)) {
+            dynamic_programs()?;
+        }
+        for &(file, package, stack, features) in programs {
+            let built = if is_dynamic(features) {
+                target
+                    .join("libc-so")
+                    .join("programs")
+                    .join(dynamic_name(package, features))
+            } else {
+                cargo_output(&target, PROGRAM_TARGET, profile, package)
+            };
             let elf = image_elf(&target, name, package);
             let why = |e: String| format!("{}: {e}", elf.display());
             if let Some(dir) = elf.parent() {
@@ -3400,6 +3408,7 @@ fn image_has_bash_terms(path: &Path) -> Result<(), String> {
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static DYNAMIC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static NANO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
@@ -3423,6 +3432,42 @@ fn libc_so() -> Result<(), String> {
             )?;
         }
         Ok(())
+    })
+}
+
+/// Whether an entry of an image's program list is a dynamically linked
+/// program: the feature `dynamic` is no feature of a crate. The program is
+/// linked against libc.so by `tools/build-libc-so.py programs` from the objects
+/// of its package, and its ELF file goes into the image alone (stack 0).
+fn is_dynamic(features: &[&str]) -> bool {
+    features.contains(&"dynamic")
+}
+
+/// The name of the dynamic program of `package` under target/libc-so/programs:
+/// the small BusyBox of the probes, the one with the utilities of the shell
+/// image, or the package's own.
+fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
+    match (package, features.contains(&"utilities")) {
+        ("busybox-probe", false) => "busybox",
+        ("busybox-probe", true) => "busybox-utils",
+        ("bash", _) => "bash",
+        ("htop", _) => "htop",
+        ("nano", _) => "nano",
+        ("ncdu", _) => "ncdu",
+        _ => panic!("no dynamic build of the program {package}"),
+    }
+}
+
+/// libc.so and the dynamic programs linked (after the scripts of their
+/// packages left the objects), once in a run of xtask.
+fn dynamic_programs() -> Result<(), String> {
+    once(&DYNAMIC_BUILT, (), || {
+        libc_so()?;
+        run_cmd(
+            Command::new("python3")
+                .arg(root().join("tools/build-libc-so.py"))
+                .arg("programs"),
+        )
     })
 }
 

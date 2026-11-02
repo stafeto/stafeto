@@ -47,6 +47,10 @@ A53_ERRATA = "-mfix-cortex-a53-835769"
 # Keep compiler-generated async rows for C frames; outlining is reserved
 # for the native Rust policy, whose helper rows the linker validates.
 UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outliner=never")
+# Every object is position independent: the dynamic program of the images
+# (tools/build-libc-so.py programs, spec 2, 3.12.3) links them against
+# libc.so, and the static probes link the same objects.
+PIC = "-fPIC"
 # BusyBox's main becomes applets_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
 PATCH = "utilities echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769 sockets nc timeout"
@@ -187,7 +191,7 @@ def ready_utilities() -> None:
         "build_ready_utils", ROOT / "tools" / "build-ready-utils.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.build(WORK_READY, WORK_READY / "ready.a", [A53_ERRATA, *UNWIND_CFLAGS],
+    module.build(WORK_READY, WORK_READY / "ready.a", [A53_ERRATA, PIC, *UNWIND_CFLAGS],
                  RELIBC / "include", f"relibc {relibc_commit()}")
 
 
@@ -208,7 +212,7 @@ def build(utilities: bool) -> None:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
     own = sorted(OWN.rglob("*.c")) if utilities else []
     own_sources = sha256(b"".join(path.read_bytes() for path in own)).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + BASE_OBJECTS + DIRECTORIES + names).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)}\n"
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {sha256(" ".join(EXCLUDED_OBJECTS + BASE_OBJECTS + DIRECTORIES + names).encode()).hexdigest()} {compatibility} {own_sources} {script} relibc {relibc_commit()} unwind {" ".join(UNWIND_CFLAGS)} {PIC}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and all((SOURCE / d / "lib.a").exists() for d in DIRECTORIES)):
         print(f"BusyBox objects ready: {SOURCE}")
@@ -366,7 +370,7 @@ def build(utilities: bool) -> None:
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
             f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
-            "-ffunction-sections", "-fdata-sections", "-Dmain=applets_main",
+            "-ffunction-sections", "-fdata-sections", "-Dmain=applets_main", PIC,
             A53_ERRATA, *UNWIND_CFLAGS,
             # clang reads a global that is const only once, before BusyBox sets
             # ptr_to_globals (awk, among others, then ran with a null pointer).
