@@ -176,9 +176,13 @@
 //! u32 and the signal u32: the signal goes to every member of the group,
 //! with no check of permission (XBD 11.1.9), when the group lies in the
 //! session of the terminal; PERMISSION when it does not, NO_PROCESS for a
-//! group nobody is in, INVALID for a signal the members refuse (the stop
-//! signals until stops come); the reply comes once the walk of the group
-//! is over, as for Kill.
+//! group nobody is in, INVALID for a signal the service does not take
+//! (the stop signals until stops come); the reply comes when the request is taken,
+//! once the checks pass and the walk has a place among the four the
+//! service queues (AGAIN when none is free), and the service walks the
+//! group afterwards in the order of the requests, at a level below the
+//! terminal service's, so that the wait of the terminal service does not
+//! grow with the size of the group.
 //!
 //! The second half of the page of the generations (from GROUPS_AT) holds a
 //! word for each record index: its group in the high half and its session
@@ -239,6 +243,10 @@ pub const SPAWN_FLAGS: u32 =
 
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
+/// How far below the process service's level its loop works while walks of
+/// the terminal are queued (TtySignal). The init table checks that the
+/// level so reached lies below the terminal service's.
+pub const TTY_STEP_BELOW: u8 = 3;
 /// Generations of a record run from 1 to this. Exhausted indices retire,
 /// so a PID stays a positive i32 and an old endpoint never names a new record.
 pub const GENERATION_MAX: u32 = (1 << 23) - 1;
