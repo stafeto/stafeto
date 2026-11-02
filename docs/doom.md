@@ -40,3 +40,14 @@ runs it as the job `doom-probe` next to the groups of `cargo xtask ci`.
 
 `cargo xtask doom-headless` plays the demo without looking at the screen
 (`-timedemo demo1 -nodraw`).
+
+## Numbers
+
+`cargo xtask doom-measure [MACHINE]` prints them. On an Apple silicon Mac
+(`-timedemo demo1` with the screen, 7 117 game tics): about 2 400 frames a
+second under HVF and about 350 to 420 under QEMU's emulation (the game is
+limited to 35 a second). The process has 8 552 kB of address space (2 138
+pages: the zone of 6 MiB and the program), unchanged between the title and
+the first level. Under `-icount` the longest step of the display service is
+7 182 ticks (the interrupt) and of the input service 3 979 ticks, against
+the bound of 18 369.
