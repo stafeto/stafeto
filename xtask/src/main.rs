@@ -4556,6 +4556,7 @@ fn posix_fifo_run(steps: bool) -> Result<(), String> {
         "posix-fifo: independent opens, atomic data, EOF and SIGPIPE ok",
         "posix-fifo: poll and select readiness ok",
         "posix-fifo: blocking rendezvous and cancellation ok",
+        "posix-fifo: 80 opens under signals ok",
         "posix-fifo: unlink generation and fork exec custody ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;

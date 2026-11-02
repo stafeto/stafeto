@@ -624,6 +624,9 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
     for attempt in 0..3 {
         if attempt > 0 {
             expect(run(files, &rmdir(4, next(), b"/tmp/cs3"), None), 0, 204)?;
+            // The key of the reads comes after the key of the rmdir: a key
+            // below the mark that the rmdir raised is retired.
+            stat.key = key(4, next());
         }
         let mut before = run(files, &stat, None).map_err(statvfs_failed)?;
         let mut still = 0;
@@ -665,7 +668,6 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
             counted = true;
             break;
         }
-        stat.key = key(4, next());
     }
     if !counted {
         return Err(206);
