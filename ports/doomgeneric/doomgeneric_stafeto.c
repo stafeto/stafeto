@@ -14,7 +14,8 @@
 //
 // Two lines on stderr let a probe follow the game: `doom: title crc32 X`
 // at the first frame of the title screen and `doom: level E M` at the first
-// frame of a level. The CRC-32 is taken over the red, green and blue bytes
+// frame of a level the player plays (the demos that follow the title run
+// levels too). The CRC-32 is taken over the red, green and blue bytes
 // of the frame, as the probe takes it over the screen QEMU photographs.
 
 #include <errno.h>
@@ -104,7 +105,7 @@ void DG_DrawFrame(void)
     if (gamestate == GS_DEMOSCREEN && !title_said) {
         title_said = 1;
         fprintf(stderr, "doom: title crc32 %08x\n", crc32_of_frame(DG_ScreenBuffer));
-    } else if (gamestate == GS_LEVEL && !level_said) {
+    } else if (gamestate == GS_LEVEL && !demoplayback && !level_said) {
         level_said = 1;
         fprintf(stderr, "doom: level %d %d\n", gameepisode, gamemap);
     }

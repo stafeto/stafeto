@@ -43,6 +43,13 @@ pub fn programs() -> &'static [ImageProgram] {
     LIST.get_or_init(|| image_programs(&[]))
 }
 
+/// The programs of the image of the measures (`boot-doom-steps.img`): the
+/// games image whose services of the screen and the keys count their steps.
+pub fn steps_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| image_programs(&["steps"]))
+}
+
 /// The programs of the games image, the services of the screen and the keys
 /// built with `features` besides (the image of the measures counts their
 /// steps).
@@ -382,7 +389,7 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     let menu = Instant::now();
     std::thread::sleep(KEY_PAUSE);
     monitor.sendkeys(&["ret", "ret", "ret", "ret"], KEY_PAUSE)?;
-    run.expect_line("the first level", |l| l == LEVEL, LEVEL_WITHIN)?;
+    run.expect_line("the first level", |l| l.contains(LEVEL), LEVEL_WITHIN)?;
     let level = menu.elapsed().as_secs_f64();
     std::thread::sleep(Duration::from_secs(2));
     let before = monitor.screendump(&picture)?;
@@ -527,6 +534,146 @@ pub fn doom_window(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The tags of the lines of steps of the display and the input service.
+const GPU_TAG: &str = "12";
+const INPUT_TAG: &str = "13";
+
+/// The frames a second of a timed demo: its game tics over its real tics
+/// (35 a second).
+fn frames_per_second(tics: u64, real: u64) -> f64 {
+    if real == 0 {
+        return 0.0;
+    }
+    tics as f64 * 35.0 / real as f64
+}
+
+/// `cargo xtask doom-measure [MACHINE]` (part 5 of the stage): the numbers
+/// of Doom with the screen. A run with the screen shows how much memory the
+/// process has at the title and on the first level (`/proc/PID/status`), and
+/// plays the demo with the screen, `-timedemo demo1`, for its frames a
+/// second. On a machine under emulation a second run, under -icount with
+/// the services counting their steps, measures the longest steps of the
+/// display and the input service while Doom plays the same keys as the
+/// probe; they are held to 0.9 of term B.
+pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
+    build_games()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
+    let scratch = Scratch::new()?;
+    let cmd = probe_command(machine, &kernel.image, &image, &scratch);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let measured = (|| {
+        let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+        run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // In the background, so that ash answers while Doom runs.
+        run.send(&format!("{LAUNCH} &"))?;
+        run.send("P=$!")?;
+        run.expect_line("the title", |l| l.contains(TITLE), TITLE_WITHIN)?;
+        let mut memory = Vec::new();
+        let mut read = |run: &mut qemu::Run, when: &str| -> Result<(), String> {
+            run.send(
+                "echo mem $(awk '$1==\"VmSize:\"||$1==\"VmRSS:\"{printf \"%s \",$2}' /proc/$P/status) $(cat /proc/$P/statm)",
+            )?;
+            let line = run.expect_line("the memory", |l| l.starts_with("mem "), DIALOG_STEP)?;
+            memory.push(format!("{when}: {}", line.trim_start_matches("mem ")));
+            Ok(())
+        };
+        read(&mut run, "title")?;
+        std::thread::sleep(KEY_PAUSE);
+        monitor.sendkeys(&["ret", "ret", "ret", "ret"], KEY_PAUSE)?;
+        run.expect_line("the first level", |l| l.contains(LEVEL), LEVEL_WITHIN)?;
+        std::thread::sleep(Duration::from_secs(2));
+        read(&mut run, "E1M1")?;
+        run.send("kill $P")?;
+        run.expect(gpu_probe::RELEASED, DIALOG_STEP * 3)?;
+        // The demo with the screen.
+        run.send(&format!("{LAUNCH} -timedemo demo1"))?;
+        let report = run.expect_line(
+            "the report of the demo",
+            |l| report_numbers(l).is_some(),
+            TIMEDEMO,
+        )?;
+        let (tics, real) = report_numbers(&report).unwrap_or_default();
+        Ok::<_, String>((memory, tics, real))
+    })();
+    let output = run.stop();
+    symbolize::backtrace(&output.lines, &kernel.elf);
+    let (memory, tics, real) = measured.map_err(|e| format!("doom-measure on {}: {e}", machine.name))?;
+    println!(
+        "doom-measure on {}: {:.1} frames a second ({tics} game tics in {real} real tics of 1/35 s); memory of the process (VmSize kB, VmRSS kB, statm pages): {}",
+        machine.name,
+        frames_per_second(tics, real),
+        memory.join("; ")
+    );
+    if machine.is_hvf() {
+        return Ok(());
+    }
+    steps(machine)
+}
+
+/// The keys of the probe for a machine that runs at the pace of its
+/// instruction count (-icount): no screenshots, long waits, the same keys.
+fn drive_slowly(run: &mut qemu::Run, scratch: &Scratch) -> Result<(), String> {
+    const SLOW: Duration = Duration::from_secs(900);
+    const PAUSE: Duration = Duration::from_secs(3);
+    let mut monitor = Monitor::connect(&scratch.socket(), Duration::from_secs(20))?;
+    run.expect(SERVICES_STARTED, SLOW)?;
+    run.expect("# ", SLOW)?;
+    run.send(LAUNCH)?;
+    run.expect_line("the title screen", |l| l.contains(TITLE), SLOW)?;
+    std::thread::sleep(PAUSE);
+    monitor.sendkeys(&["ret", "ret", "ret", "ret"], PAUSE)?;
+    run.expect_line("the first level", |l| l.contains(LEVEL), SLOW)?;
+    std::thread::sleep(PAUSE);
+    monitor.sendkey("left", Some(1000))?;
+    std::thread::sleep(PAUSE);
+    monitor.sendkey("esc", None)?;
+    std::thread::sleep(PAUSE);
+    monitor.sendkeys(&["up", "ret", "y"], PAUSE)?;
+    run.expect(gpu_probe::RELEASED, SLOW)?;
+    Ok(())
+}
+
+/// The run under -icount that counts the steps of the two services.
+fn steps(machine: &'static qemu::Machine) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let programs = steps_programs();
+    let image = build_boot_image("boot-doom-steps.img", programs, BOOT_PROFILE)?;
+    let scratch = Scratch::new()?;
+    let mut cmd = probe_command(machine, &kernel.image, &image, &scratch);
+    cmd.args(qemu::ICOUNT);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let driven = drive_slowly(&mut run, &scratch);
+    let output = run.stop();
+    driven.map_err(|e| format!("doom steps under -icount: {e}"))?;
+    let mut text = Vec::new();
+    for (name, tag) in [("display", GPU_TAG), ("input", INPUT_TAG)] {
+        let rows = longest_steps(&output.lines, tag);
+        if rows.is_empty() {
+            return Err(format!("doom steps: no step of the {name} service"));
+        }
+        if let Some(row) = rows.iter().find(|r| r.1 > gpu_probe::STEP_MAX) {
+            return Err(format!(
+                "doom steps: a step of the {name} service past 0.9 of term B ({}): {row:?}",
+                gpu_probe::STEP_MAX
+            ));
+        }
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|(kind, ticks, detail)| format!("kind {kind} {ticks} (detail {detail})"))
+            .collect();
+        text.push(format!("{name}: {}", rows.join(", ")));
+    }
+    println!(
+        "doom steps on {}: the longest steps under -icount, ticks (0.9 of term B {}): {}",
+        machine.name,
+        gpu_probe::STEP_MAX,
+        text.join("; ")
+    );
+    Ok(())
+}
+
 /// The size of the WAD in the image.
 fn freedoom_size() -> Result<u64, String> {
     let version = packages::value("freedoom", "version")?;
@@ -619,6 +766,13 @@ mod tests {
         };
         assert!(check_turn(&before, &share(29)).is_err());
         assert_eq!(check_turn(&before, &share(30)), Ok(300));
+    }
+
+    #[test]
+    fn the_frames_a_second_come_from_the_tics_of_the_demo() {
+        assert_eq!(frames_per_second(2154, 2154), 35.0);
+        assert_eq!(frames_per_second(350, 700), 17.5);
+        assert_eq!(frames_per_second(10, 0), 0.0);
     }
 
     #[test]

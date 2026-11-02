@@ -969,6 +969,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-doom.img",
+    "boot-doom-steps.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1037,7 +1038,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 },
             ),
         ],
-        "boot-ash-dialog.img" | "boot-doom.img" => dialog(name),
+        "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
             let mut files = procs();
             files.push(file(
@@ -1499,6 +1500,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
+                "boot-doom-steps.img" => crate::doom::steps_programs(),
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,
@@ -1616,6 +1618,7 @@ mod tests {
         for name in [
             "boot-ash-dialog.img",
             "boot-doom.img",
+            "boot-doom-steps.img",
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
             "boot-posix-lock-rules.img",

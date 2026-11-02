@@ -1609,6 +1609,8 @@ commands:
   doom-probe [MACHINE]  the goal: from ash, `doom -iwad /games/freedoom1.wad` shows the title screen (QEMU's
             screenshot has the CRC of the guest's frame), the keys of the menu lead to the first level, a
             turn changes the view, the menu leaves with code 0 and the prompt of ash; Ctrl-C leaves too
+  doom-measure [MACHINE]  the numbers of Doom with the screen: frames a second of the demo, the memory of the
+            process, and on a machine under emulation the longest steps of the display and input services
   doom [--machine hvf]  play by hand: QEMU with a window (cocoa on a Mac) and the console on the terminal;
             at the prompt type `doom -iwad /games/freedoom1.wad` (Ctrl-A X quits QEMU)
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
@@ -1872,6 +1874,7 @@ fn main() {
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
         Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
         Some("doom-probe") => qemu::machine(args.get(1)).and_then(doom::doom_probe),
+        Some("doom-measure") => qemu::machine(args.get(1)).and_then(doom::doom_measure),
         Some("doom") => doom::doom_window(&args[1..]),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
