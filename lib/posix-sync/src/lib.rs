@@ -367,11 +367,6 @@ pub enum Woken {
     Entry,
 }
 
-/// Waits while `*word == value`, until `futex_wake`, an entry of signals or
-/// the absolute deadline on `clock` (ns of CLOCK_MONOTONIC). EAGAIN when the
-/// word differs, ETIMEDOUT when the deadline passed, EINVAL for another
-/// clock or a thread without its channel. Spurious wakeups come back as
-/// `Woken::Woken`.
 /// The raw handle of the calling thread's timer for the deadline of a wait
 /// it starts: the timer fires at the level it was made at (the level of its
 /// slot), and a thread whose base level changed since, by itself or by
@@ -382,7 +377,9 @@ pub enum Woken {
 /// priority. Only the thread itself calls this, so nothing races it; a
 /// wait that is started after another thread raised this one runs on the
 /// new level, while one begun before keeps the old (stafeto-design, the
-/// remainder of the wait channel).
+/// remainder of the wait channel). A handler that runs during a wait may
+/// call this and close the number the wait holds, so a wait that a handler
+/// can interrupt reads `block.timer` at each use.
 pub fn wait_timer(block: &Block) -> u64 {
     let timer = block.timer.load(Ordering::Relaxed);
     let want = block.base_level.load(Ordering::Relaxed);
@@ -403,6 +400,11 @@ pub fn wait_timer(block: &Block) -> u64 {
     raw
 }
 
+/// Waits while `*word == value`, until `futex_wake`, an entry of signals or
+/// the absolute deadline on `clock` (ns of CLOCK_MONOTONIC). EAGAIN when the
+/// word differs, ETIMEDOUT when the deadline passed, EINVAL for another
+/// clock or a thread without its channel. Spurious wakeups come back as
+/// `Woken::Woken`.
 pub fn futex_wait(
     word: &AtomicU32,
     value: u32,
@@ -416,7 +418,11 @@ pub fn futex_wait(
         return Err(EINVAL);
     };
     let channel = block.channel.load(Ordering::Relaxed);
-    let timer = wait_timer(block);
+    let timer = if deadline.is_some() {
+        wait_timer(block)
+    } else {
+        block.timer.load(Ordering::Relaxed)
+    };
     if channel == 0 || (deadline.is_some() && timer == 0) {
         return Err(EINVAL);
     }
@@ -481,7 +487,9 @@ pub fn futex_wait(
         }
     };
     if wake_at.is_some() {
-        let _ = sys::timer_cancel(&timer);
+        // A handler may have made the timer again meanwhile.
+        let current = Handle::<Timer>::borrowed(abi::Handle(block.timer.load(Ordering::Relaxed)));
+        let _ = sys::timer_cancel(&current);
     }
     let held = lock(bucket);
     block.flags.fetch_and(!flag::WAITING, Ordering::SeqCst);

@@ -6504,6 +6504,10 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     )?;
     qemu::expect_marker(
         &output,
+        "relibc-threads: a handler that sleeps leaves the deadline of the wait it interrupted",
+    )?;
+    qemu::expect_marker(
+        &output,
         "relibc-threads: the main thread works at its base level",
     )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;

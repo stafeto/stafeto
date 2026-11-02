@@ -51,12 +51,19 @@ impl Mode<'_> {
 }
 
 /// The thread's timer, set for a deadline and cancelled when the wait is over.
-struct Alarm(core::mem::ManuallyDrop<Handle<Timer>>, bool);
+struct Alarm<'a>(&'a posix_thread::Block, bool);
 
-impl Drop for Alarm {
+impl Alarm<'_> {
+    /// The timer now: a handler may have made it again (posix_sync::wait_timer).
+    fn timer(&self) -> core::mem::ManuallyDrop<Handle<Timer>> {
+        Handle::<Timer>::borrowed(rt::abi::Handle(self.0.timer.load(Ordering::Relaxed)))
+    }
+}
+
+impl Drop for Alarm<'_> {
     fn drop(&mut self) {
         if self.1 {
-            let _ = sys::timer_cancel(&self.0);
+            let _ = sys::timer_cancel(&self.timer());
         }
     }
 }
@@ -405,7 +412,8 @@ pub(crate) fn admission_pause() -> Result<(), i32> {
     let block = crate::threads::own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block)));
+    posix_sync::wait_timer(block);
+    let timer = || Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
     let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
     let result = loop {
         let guard = match rt::upcall::defer_entries() {
@@ -420,7 +428,7 @@ pub(crate) fn admission_pause() -> Result<(), i32> {
             drop(guard);
             break Ok(());
         }
-        if sys::timer_set(&timer, deadline).is_err() {
+        if sys::timer_set(&timer(), deadline).is_err() {
             drop(guard);
             break Err(EIO);
         }
@@ -431,7 +439,7 @@ pub(crate) fn admission_pause() -> Result<(), i32> {
             Err(_) => break Err(EIO),
         }
     };
-    let _ = sys::timer_cancel(&timer);
+    let _ = sys::timer_cancel(&timer());
     result
 }
 
@@ -516,10 +524,8 @@ fn run_in(
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
-    let mut alarm = Alarm(
-        Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block))),
-        false,
-    );
+    posix_sync::wait_timer(block);
+    let mut alarm = Alarm(block, false);
     // The first take brings the labelled copy: the service keeps it while
     // the operation waits. A take the kernel took back left the service
     // without it, and the next one brings a new copy.
@@ -612,7 +618,7 @@ fn run_in(
                 drop(guard);
                 break 'wait Some(ETIMEDOUT);
             }
-            alarm.1 = sys::timer_set(&alarm.0, deadline).is_ok();
+            alarm.1 = sys::timer_set(&alarm.timer(), deadline).is_ok();
         }
         let got = sys::receive(&channel);
         drop(guard);

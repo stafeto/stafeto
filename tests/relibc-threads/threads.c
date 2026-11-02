@@ -1404,6 +1404,46 @@ static void timer_follows_the_level(void) {
     printf("relibc-threads: the timer of a thread that another thread raised fires at its new level\n");
 }
 
+/* L: a handler that sleeps while a thread waits for a signal with a deadline
+ * must not take the deadline away. `waiter` sits in sigtimedwait (300 ms) on
+ * SIGUSR2 at level 12; main moves it to level 14, so that its timer is made
+ * again by the next wait of its own, and sends it SIGUSR1, whose handler
+ * sleeps. The wait goes on with its deadline and ends with EAGAIN. */
+static volatile int deadline_done, deadline_result, deadline_handled;
+static void deadline_handler(int sig) {
+    (void)sig;
+    sleep_ms(1);
+    deadline_handled = 1;
+}
+static void *deadline_waiter(void *arg) {
+    (void)arg;
+    sigset_t set;
+    struct timespec limit = {0, 300000000L};
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    CHECK(pthread_sigmask(SIG_BLOCK, &set, NULL) == 0);
+    deadline_result = sigtimedwait(&set, NULL, &limit) < 0 ? errno : 0;
+    deadline_done = 1;
+    return NULL;
+}
+static void handler_keeps_the_deadline(void) {
+    struct sigaction action;
+    struct sched_param param = {14};
+    memset(&action, 0, sizeof action);
+    action.sa_handler = deadline_handler;
+    CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+    deadline_done = deadline_result = deadline_handled = 0;
+    pthread_t waiter = spawn_at(12, deadline_waiter, NULL);
+    sleep_ms(30);
+    CHECK(pthread_setschedparam(waiter, SCHED_RR, &param) == 0);
+    CHECK(pthread_kill(waiter, SIGUSR1) == 0);
+    sleep_ms(1500);
+    if (!deadline_done) FAIL("a wait with a deadline lost it when a handler slept");
+    CHECK(pthread_join(waiter, NULL) == 0);
+    CHECK(deadline_handled == 1 && deadline_result == EAGAIN);
+    printf("relibc-threads: a handler that sleeps leaves the deadline of the wait it interrupted\n");
+}
+
 int main(void) {
     main_thread_at_its_base();
     stack_address();
@@ -1429,6 +1469,7 @@ int main(void) {
     lowered_thread();
     lowered_by_another_thread();
     timer_follows_the_level();
+    handler_keeps_the_deadline();
     stage = 8;
     leave_sigwait();
     stage = 9;

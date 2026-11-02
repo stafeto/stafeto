@@ -101,7 +101,10 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
     let block = own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block)));
+    // A handler that sleeps itself may make the timer again
+    // (posix_sync::wait_timer): the number is read at each use.
+    posix_sync::wait_timer(block);
+    let timer = || Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
     let mut at = target(deadline)?;
     // An absolute time of CLOCK_REALTIME follows a set of the calendar, ahead
     // or back, by a look at the anchor every CALENDAR_LOOK.
@@ -124,11 +127,11 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
             at
         };
         // An entry between the timer and `receive` stays pending and makes
-        // `receive` return at once; a handler that sleeps itself cannot
-        // take this wait's timer meanwhile.
+        // `receive` return at once; a handler runs outside this section, and
+        // the timer it may have made again is read here.
         let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sleep entry deferral");
-        let _ = sys::timer_set(&timer, wake);
+        let _ = sys::timer_set(&timer(), wake);
         let got = sys::receive(&channel);
         drop(guard);
         match got {
@@ -149,7 +152,7 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
             Err(error) => panic!("sleep receive: {error:?}"),
         }
     };
-    let _ = sys::timer_cancel(&timer);
+    let _ = sys::timer_cancel(&timer());
     result
 }
 
