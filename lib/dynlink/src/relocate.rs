@@ -219,6 +219,13 @@ fn relr_place<M: Memory + ?Sized>(
         return Err(Refusal::Limit(Limit::Relocs));
     }
     check_place(map, place)?;
+    // At bias 0 (both modules of part 3) the word holds its final value, the
+    // file having been linked at the address it is loaded at (spec 2, 3.12.3):
+    // the place is checked and counted, and nothing is read or written.
+    if map.bias == 0 {
+        kinds.relr += 1;
+        return Ok(());
+    }
     let at = map.absolute(place)?;
     let mut bytes = [0u8; 8];
     mem.read(at, &mut bytes)?;

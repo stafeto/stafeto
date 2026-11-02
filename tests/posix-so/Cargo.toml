@@ -1,0 +1,21 @@
+[package]
+name = "posix-so-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Dynamically linked C programs on libc.so, started by a static one"
+build = "build.rs"
+
+[[bin]]
+name = "posix-so-probe"
+test = false
+bench = false
+
+[features]
+# /proc in the layer: the probe reads the pool of pages from /proc/meminfo.
+procfs = ["posix-crt/procfs"]
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

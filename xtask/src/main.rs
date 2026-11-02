@@ -686,6 +686,27 @@ const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
     programs[5] = ("posix-procs", "posix-map-probe", POSIX_STACK_SIZE, &[]);
     programs
 };
+/// The probe of dynamic programs on libc.so (tests/posix-so): the image of the
+/// probe of POSIX processes with the library and the dynamic programs in its
+/// table of files (rootfs.rs, `shared_files`) and the probe as its program.
+const POSIX_SO_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_PROCS_PROGRAMS;
+    programs[5] = (
+        "posix-procs",
+        "posix-so-probe",
+        POSIX_STACK_SIZE,
+        &["procfs"],
+    );
+    programs[6].3 = &["small-pieces", "stack-depth"];
+    programs
+};
+/// The probe of dynamic programs with the steps of the loader (under -icount):
+/// `cargo xtask posix-so steps`.
+const POSIX_SO_STEPS_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_SO_PROGRAMS;
+    programs[6].3 = &["small-pieces", "stack-depth", "steps"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -753,7 +774,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
             "share-steps",
         ],
     ),
-    ("loader", "loader", 0, &["steps"]),
+    ("loader", "loader", 0, &["steps", "stack-depth"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
@@ -1529,6 +1550,9 @@ commands:
             over the Rust POSIX layer
   posix-el2  run the probes of POSIX processes, mprotect and interrupted IPC on the
             Cortex-A53 with the kernel entered at EL2 (as ci does)
+  libc-so    build libc.so and the dynamic programs of its probe
+            (tools/build-libc-so.py) into target/libc-so
+  posix-so   run the dynamic programs of tests/posix-so on libc.so
   posix-map  verify mmap, munmap, mprotect, madvise and the faults of unmapped pages
   posix-resources verify account files, limits, groups and descriptor exec
   posix-math   verify scalar math, binary128 and thread floating-point state
@@ -1707,6 +1731,14 @@ fn main() {
             jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
         }
         Some("posix-map") => posix_map_probe(),
+        Some("libc-so") => libc_so(),
+        Some("posix-so") => match args.get(1).map(String::as_str) {
+            None => posix_so_run(false, false),
+            // Instructions count as time, so the times of the spawns repeat.
+            Some("icount") => posix_so_run(true, false),
+            Some("steps") => posix_so_run(true, true),
+            Some(other) => Err(format!("posix-so [icount], not {other}")),
+        },
         Some("posix-el2") => posix_el2_probes(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
@@ -2122,6 +2154,30 @@ fn write_boot_image_files(
             std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
             sources.push((file, elf, stack));
         }
+        // The library and the dynamic programs of the image come from the
+        // build of libc.so, as files of stack 0: their ELF files go into the
+        // image alone, with the checks and the stripping of the others.
+        let shared: Vec<&'static str> = rootfs::sources(&rootfs::files_of(name))
+            .iter()
+            .chain(rootfs::sources(&extra).iter())
+            .filter_map(rootfs::Source::program)
+            .filter(|program| rootfs::shared_path(program).is_some())
+            .collect();
+        if !shared.is_empty() {
+            libc_so()?;
+        }
+        for program in shared {
+            let from = target
+                .join("libc-so")
+                .join(rootfs::shared_path(program).unwrap_or(program));
+            let elf = image_elf(&target, name, program);
+            let why = |e: String| format!("{}: {e}", elf.display());
+            if let Some(dir) = elf.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| why(e.to_string()))?;
+            }
+            std::fs::copy(&from, &elf).map_err(|e| format!("{}: {e}", from.display()))?;
+            sources.push((program, elf, 0));
+        }
     }
     write_elf_image(name, &sources, extra)
 }
@@ -2144,6 +2200,7 @@ fn write_elf_image(
     // information (the checks below read the linker's file with them): the
     // loader and exec read the loadable segments alone.
     let mut relibc = false;
+    let mut dynamic = false;
     let mut ready = false;
     let mut files = Vec::new();
     for (file, elf, _) in sources {
@@ -2154,6 +2211,7 @@ fn write_elf_image(
             disasm::ram_main_frame(elf, &objdump)?;
         }
         relibc |= links_relibc(&std::fs::read(elf).map_err(|e| why(e.to_string()))?);
+        dynamic |= names_interpreter(&std::fs::read(elf).map_err(|e| why(e.to_string()))?);
         ready |= std::fs::read(elf)
             .map_err(|e| why(e.to_string()))?
             .windows(READY_MARK.len())
@@ -2173,6 +2231,7 @@ fn write_elf_image(
         files.push((*file, written, elf.clone()));
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+
     // An image with a program on relibc carries relibc's licence notices.
     let notices = if relibc {
         Some(
@@ -2290,6 +2349,14 @@ fn write_elf_image(
     // then the table (rootfs.rs).
     let mut listed = rootfs::files_of(name);
     listed.extend(extra);
+    // A program that asks for the dynamic linker needs the library the loader
+    // opens for it (spec 2, 3.12.4).
+    if dynamic && !listed.iter().any(|f| f.path == rootfs::LIBRARY) {
+        return Err(format!(
+            "{name}: a program has a PT_INTERP and the image has no {}",
+            rootfs::LIBRARY
+        ));
+    }
     let wanted = rootfs::sources(&listed);
     let read_elf = |program: &str| -> Result<Vec<u8>, String> {
         let (_, elf, _) = sources
@@ -3332,6 +3399,7 @@ fn image_has_bash_terms(path: &Path) -> Result<(), String> {
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static NANO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
@@ -3339,6 +3407,23 @@ static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 /// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
     once(&RELIBC_BUILT, (), build_relibc)
+}
+
+/// libc.so and the programs of its probe built (tools/build-libc-so.py,
+/// which stamps both), once in a run of xtask, after relibc: the library is
+/// built from the commit of relibc that `relibc()` fetched.
+fn libc_so() -> Result<(), String> {
+    once(&LIBC_SO_BUILT, (), || {
+        relibc()?;
+        for subcommand in ["build", "probes"] {
+            run_cmd(
+                Command::new("python3")
+                    .arg(root().join("tools/build-libc-so.py"))
+                    .arg(subcommand),
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// The scripts of the packages of `kind` run, each once in a run of xtask
@@ -3385,6 +3470,21 @@ fn build_relibc() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+/// Whether the ELF `bytes` has a `PT_INTERP` program header.
+fn names_interpreter(bytes: &[u8]) -> bool {
+    let word = |at: usize, len: usize| -> Option<u64> {
+        let field = bytes.get(at..at + len)?;
+        Some(field.iter().rev().fold(0, |n, b| n << 8 | u64::from(*b)))
+    };
+    if bytes.get(..4) != Some(b"\x7fELF".as_slice()) {
+        return false;
+    }
+    let (Some(table), Some(size), Some(count)) = (word(32, 8), word(54, 2), word(56, 2)) else {
+        return false;
+    };
+    (0..count).any(|i| word((table + i * size) as usize, 4) == Some(3))
 }
 
 /// Whether the ELF `bytes` links relibc: its start's symbol is there.
@@ -4653,6 +4753,53 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The dynamic programs of tests/posix-so on libc.so, started by a static
+/// one: the library from the table of images, the vector, the constructors
+/// and destructors, `fork` and `exec`, the programs the loader refuses.
+fn posix_so_probe() -> Result<(), String> {
+    posix_so_run(false, false)
+}
+
+fn posix_so_run(icount: bool, steps: bool) -> Result<(), String> {
+    libc_so()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-so.img",
+        if steps {
+            &POSIX_SO_STEPS_PROGRAMS
+        } else {
+            &POSIX_SO_PROGRAMS
+        },
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    if icount {
+        cmd.args(qemu::ICOUNT);
+    }
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(if icount { 600 } else { 180 }),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(&outcome, "posix-so: dynamic programs on libc.so ok")?;
+    check_loader_stack(&outcome.lines)?;
+    for line in outcome
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawn to main") || l.starts_with("loader dynamic:"))
+    {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn posix_resources_probe() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -5591,6 +5738,41 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The stack of the loaders (feature `stack-depth` of services/loader): each
+/// reports how deep it went, and the deepest keeps `LOADER_STACK_MARGIN` bytes
+/// of the stack free, because a stack that overflows writes the loader's data
+/// below it. At least one report has to exist.
+const LOADER_STACK_MARGIN: u64 = 2048;
+
+fn check_loader_stack(lines: &[String]) -> Result<(), String> {
+    let mut deepest = 0;
+    let mut size = 0;
+    let mut reports = 0;
+    for line in lines {
+        let Some(rest) = line.strip_prefix("loader stack: used ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [used, "of", total] = words.as_slice() else {
+            continue;
+        };
+        let (Ok(used), Ok(total)) = (used.parse::<u64>(), total.parse::<u64>()) else {
+            continue;
+        };
+        (deepest, size, reports) = (deepest.max(used), total, reports + 1);
+    }
+    if reports == 0 {
+        return Err("no loader reported the depth of its stack".into());
+    }
+    println!("loader stack: {deepest} of {size} bytes at most over {reports} loaders");
+    if deepest + LOADER_STACK_MARGIN > size {
+        return Err(format!(
+            "a loader's stack went {deepest} of {size} bytes deep, less than {LOADER_STACK_MARGIN} free"
+        ));
+    }
+    Ok(())
+}
+
 /// The regions a loader holds in the forks of the full map, the floor of the
 /// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
 /// the role fills the map with one-page mappings until it is full
@@ -5910,17 +6092,21 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 
 /// Published concurrent snapshots must preserve the part's memory reserve.
 /// The console takes a line of more than 64 bytes in several writes, and a
-/// line of the services' timing (`service wait:` and the like, lib/rt)
-/// that another CPU writes meanwhile may land inside it: such a line goes
-/// back where it came from, and the rest of the split line, the next line,
-/// joins its start.
+/// line that another CPU writes meanwhile may land inside it: a line of the
+/// services' timing (`service wait:` and the like, lib/rt) or the audit
+/// line of ramfs (`ramfs: audit round`). Such a line goes back where it
+/// came from, and the rest of the split line, the next line, joins its
+/// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
+    const INTRUDERS: [&str; 2] = ["service ", "ramfs: "];
     let mut out = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = &lines[i];
-        let cut = line
-            .find("service ")
+        let cut = INTRUDERS
+            .iter()
+            .filter_map(|tag| line.find(tag))
+            .min()
             .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
         match (cut, lines.get(i + 1)) {
             (Some(at), Some(rest)) => {
@@ -6267,6 +6453,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
         ));
     }
     check_loader_steps(&outcome.lines)?;
+    check_loader_stack(&outcome.lines)?;
     // The five methods of the change jobs (44 to 48) ran among the crowd, and
     // the longest of each stays under term B like every step of the service.
     for kind in 44..=48 {
@@ -8263,6 +8450,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             qemu::on_cpus(SMP_CPUS, || posix_shares_probe(&qemu::VIRT))
         }),
         job("posix-map", posix_map_probe),
+        job("posix-so", posix_so_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
         job("posix-math", posix_math_probe),
@@ -8450,6 +8638,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
 }
 
 fn host_tests() -> Result<(), String> {
+    // The tests of lib/dynlink read the real libc.so and the programs of
+    // its probe: here their absence is a failure, not a skip.
+    libc_so()?;
     for script in [
         "tools/test_os_test_build.py",
         "tools/test_open_posix_build.py",
@@ -8457,7 +8648,7 @@ fn host_tests() -> Result<(), String> {
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
     }
-    run_cmd(cargo().args([
+    run_cmd(cargo().env("STAFETO_REQUIRE_LIBC_SO", "1").args([
         "test",
         "--package",
         "abi",
@@ -12963,6 +13154,26 @@ mod tests {
                 "service wait: 10 kind 64 29846 ticks of 31452",
                 "posix-procs: names quota: process 1, quota 552 pages, used 513 pages, remaining 39",
                 "posix-procs: steps done",
+            ]
+        );
+    }
+
+    /// The audit line of ramfs inside a long line of posix-procs goes out
+    /// of it as well (ci run 41463516603).
+    #[test]
+    fn an_audit_line_of_ramfs_inside_a_split_line_goes_back_out() {
+        let lines: Vec<String> = [
+            "posix-procs: names quota: process 8, quota 576 pages, used 294 pramfs: audit round 67",
+            "ages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "ramfs: audit round 67",
+                "posix-procs: names quota: process 8, quota 576 pages, used 294 pages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
             ]
         );
     }

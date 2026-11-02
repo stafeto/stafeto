@@ -60,7 +60,6 @@ impl Source {
     }
 
     /// The image program whose ELF file it takes, if any.
-    #[cfg(test)]
     pub fn program(&self) -> Option<&'static str> {
         match *self {
             Source::Elf(program) | Source::Variant { program, .. } => Some(program),
@@ -322,6 +321,51 @@ const ZONES: [(&str, &[u8]); 10] = [
         include_bytes!("../zoneinfo/Australia/Sydney"),
     ),
 ];
+
+/// The programs of the images that the build of libc.so makes (`cargo xtask
+/// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
+/// shared library itself, the good dynamic programs of tests/posix-so and the
+/// bad ones the loader refuses.
+pub const SHARED: [(&str, &str); 10] = [
+    ("libc.so", "libc.so"),
+    ("so-hello", "probes/so-hello"),
+    ("so-image", "probes/so-image"),
+    ("bad-interp", "probes/bad-interp"),
+    ("bad-copy", "probes/bad-copy"),
+    ("bad-tls", "probes/bad-tls"),
+    ("bad-needed", "probes/bad-needed"),
+    ("bad-symbol", "probes/bad-symbol"),
+    ("bad-ifunc", "probes/bad-ifunc"),
+    ("bad-pie", "probes/bad-pie"),
+];
+
+/// The path of the library in the images, which the loader opens.
+pub const LIBRARY: &str = "/lib/libc.so";
+
+/// The file of `program` the build of libc.so wrote, if it is one of its.
+pub fn shared_path(program: &str) -> Option<&'static str> {
+    SHARED.iter().find(|(n, _)| *n == program).map(|(_, p)| *p)
+}
+
+/// The library and the dynamic programs of the probe of tests/posix-so.
+fn shared_files() -> Vec<RootFile> {
+    let mut files = vec![dir("/lib"), file(LIBRARY, 0o755, ROOT, "libc.so")];
+    for (name, _) in &SHARED[1..] {
+        let path: &'static str = match *name {
+            "so-hello" => "/bin/so-hello",
+            "so-image" => "/bin/so-image",
+            "bad-interp" => "/bin/bad-interp",
+            "bad-copy" => "/bin/bad-copy",
+            "bad-tls" => "/bin/bad-tls",
+            "bad-needed" => "/bin/bad-needed",
+            "bad-symbol" => "/bin/bad-symbol",
+            "bad-ifunc" => "/bin/bad-ifunc",
+            _ => "/bin/bad-pie",
+        };
+        files.push(file(path, 0o755, ROOT, name));
+    }
+    files
+}
 
 /// The directories and files of the time zones of the image.
 fn zoneinfo() -> Vec<RootFile> {
@@ -911,6 +955,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
     "boot-posix-map.img",
+    "boot-posix-so.img",
     "boot-posix-lock-ring.img",
     "boot-posix-shares.img",
     "boot-posix-native-scopes.img",
@@ -973,6 +1018,11 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 ROOT,
                 "posix-thread-probe",
             ));
+            files
+        }
+        "boot-posix-so.img" => {
+            let mut files = procs();
+            files.extend(shared_files());
             files
         }
         "boot-posix-procs.img"
@@ -1306,6 +1356,7 @@ mod tests {
             "boot-posix-sync.img",
             "boot-posix-resources.img",
             "boot-posix-map.img",
+            "boot-posix-so.img",
         ] {
             let files = files_of(image);
             assert!(
@@ -1400,6 +1451,7 @@ mod tests {
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
                 "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
                 "boot-posix-map.img" => &crate::POSIX_MAP_PROGRAMS,
+                "boot-posix-so.img" => &crate::POSIX_SO_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-shares.img" => &crate::POSIX_SHARES_PROGRAMS,
                 "boot-posix-native-scopes.img" => &crate::POSIX_NATIVE_SCOPE_PROGRAMS,
@@ -1419,7 +1471,10 @@ mod tests {
             let files = files_of(image);
             let have = programs_of(image);
             for program in programs(&files) {
-                assert!(have.contains(&program), "{image}: {program}");
+                assert!(
+                    have.contains(&program) || shared_path(program).is_some(),
+                    "{image}: {program}"
+                );
             }
             // Build and parse each image's real file table, including devices.
             let total = sources(&files).len() as u32;
@@ -1508,6 +1563,7 @@ mod tests {
             "boot-posix-sync.img",
             "boot-posix-resources.img",
             "boot-posix-map.img",
+            "boot-posix-so.img",
             "boot-posix-lock-ring.img",
             "boot-posix-shares.img",
             "boot-posix-random.img",

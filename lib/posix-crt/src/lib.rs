@@ -12,6 +12,12 @@
 //! `relibc_start_v1` with a Linux initial stack and `TPIDR_EL0` at 0;
 //! relibc builds the TCB and its platform attaches the thread to the layer
 //! (posix-platform `stafeto_init`).
+//!
+//! With the feature `shared` the crate is part of libc.so, the C library
+//! that dynamically linked programs share (spec 2, 3.12.3). The program's
+//! `crt1.o` calls `stafeto_start(area, main)`; the loader wrote the start
+//! area and the auxiliary vector, and the library names no symbol of the
+//! program.
 
 #![no_std]
 
@@ -27,8 +33,17 @@ extern crate posix_platform;
 
 type Main = unsafe extern "C" fn(isize, *mut *mut c_char, *mut *mut c_char) -> c_int;
 
+#[cfg(not(feature = "shared"))]
 unsafe extern "C" {
     fn main(argc: isize, argv: *mut *mut c_char, envp: *mut *mut c_char) -> c_int;
+}
+
+/// The program's `main`, which `stafeto_start` was given (the library
+/// itself refers to no `main`).
+#[cfg(feature = "shared")]
+static PROGRAM_MAIN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" {
     fn relibc_start_v1(stack: *const usize, main: Main) -> !;
     /// The offset of the entry record in the thread's message buffer and
     /// the offsets of its words `outer`, `owed` and `thread`, as relibc's
@@ -38,10 +53,35 @@ unsafe extern "C" {
     /// The process's umask (posix-platform).
     fn stafeto_umask(mask: u32) -> u32;
     /// The ELF header, which lld maps with the read-only data.
+    #[cfg(not(feature = "shared"))]
     static __ehdr_start: [u8; 64];
 }
 
+#[cfg(feature = "shared")]
+unsafe extern "C" {
+    /// The entry of `rt`: it clears the frame and link registers and goes
+    /// to `start` (the clock's scale, `__rt_main`, the end of the process),
+    /// x0 passing on.
+    fn _start(area: u64) -> !;
+}
+
+/// The entry of a dynamically linked program: `crt1.o` calls it with the
+/// start area in `area` and the program's `main`. It goes the way `_start`
+/// of `rt` goes.
+///
+/// # Safety
+/// Called once, as the first code of the process's first thread, with x0
+/// of the start (`proto_loader::START_AREA`) and the program's `main`.
+#[cfg(feature = "shared")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_start(area: u64, main: Main) -> ! {
+    PROGRAM_MAIN.store(main as usize, Ordering::Release);
+    // SAFETY: the caller's promise; `_start` does not return.
+    unsafe { _start(area) }
+}
+
 /// Linux auxiliary vector keys relibc's start reads.
+#[cfg(not(feature = "shared"))]
 mod auxv {
     pub const AT_NULL: usize = 0;
     pub const AT_PHDR: usize = 3;
@@ -54,6 +94,7 @@ mod auxv {
 /// The auxiliary vector into `out`, pairs of words: the program headers
 /// (relibc builds the static TLS from `PT_TLS`), the page size and, for
 /// a set-ID program, AT_SECURE; then AT_NULL. Six pairs.
+#[cfg(not(feature = "shared"))]
 fn auxiliary(out: &mut [usize], secure: bool) {
     use auxv::*;
     let header = ptr::addr_of!(__ehdr_start).cast::<u8>();
@@ -83,6 +124,7 @@ fn auxiliary(out: &mut [usize], secure: bool) {
 /// Linux process: argc, the `count` arguments, NULL, an empty environment
 /// (until 5c), the auxiliary vector with the program headers (relibc
 /// builds the static TLS from `PT_TLS`) and the page size.
+#[cfg(not(feature = "shared"))]
 fn start_relibc(arguments: &[*mut c_char]) -> ! {
     let mut stack = [0usize; 42];
     stack[0] = arguments.len();
@@ -94,15 +136,16 @@ fn start_relibc(arguments: &[*mut c_char]) -> ! {
     auxiliary(&mut stack[auxv..], false);
     // SAFETY: the stack follows the Linux start contract, and it lives on:
     // relibc's start does not return.
-    unsafe { enter_relibc(stack.as_ptr()) }
+    unsafe { enter_relibc(stack.as_ptr(), main) }
 }
 
 /// relibc's start with the initial stack at `stack`.
 ///
 /// # Safety
 /// `stack` holds a Linux initial stack (argc, argv, NULL, envp, NULL, the
-/// auxiliary vector) that lives for the program's life.
-unsafe fn enter_relibc(stack: *const usize) -> ! {
+/// auxiliary vector) that lives for the program's life; `main` is the
+/// program's.
+unsafe fn enter_relibc(stack: *const usize, main: Main) -> ! {
     // relibc's long jump and rt's entry distributor share the entry record
     // of the thread; a relibc that places it elsewhere would leave a dead
     // resident call marked live, so the process ends before `main`.
@@ -337,6 +380,11 @@ fn loaded_main() -> u64 {
     let Some(area) = Start::read(header) else {
         return 125;
     };
+    // A library without a loader's vector cannot start a program.
+    #[cfg(feature = "shared")]
+    if area.flags & proto_loader::DYNAMIC == 0 {
+        return 125;
+    }
     let value = |slot: Slot| rt::abi::Handle(area.handles[slot as usize]);
     let named = (area.handles.iter().filter(|&&h| h != 0).count() + area.map_count as usize) as u64;
     let one = |slot: Slot| (value(slot) != rt::abi::Handle::INVALID).then(|| value(slot));
@@ -413,14 +461,45 @@ fn loaded_main() -> u64 {
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };
-    // The auxiliary vector's pairs lie in the area, after the NULL of envp.
-    // SAFETY: the loader left proto_loader::AUXV_PAIRS pairs of words there.
-    let auxv = unsafe {
-        core::slice::from_raw_parts_mut(area.auxv as *mut usize, 2 * proto_loader::AUXV_PAIRS)
+    // The library's variant: the loader wrote the vector (a dynamic program
+    // has no `__ehdr_start` of its own to read it from), and the program's
+    // `main` came with the call of `stafeto_start`.
+    #[cfg(feature = "shared")]
+    let main: Main = {
+        // AT_SECURE comes from the loader and the layer took SECURE from the
+        // start area; where they differ the secure value stands.
+        if area.flags & SECURE != 0 {
+            // SAFETY: the loader left proto_loader::AUXV_PAIRS pairs there.
+            let auxv = unsafe {
+                core::slice::from_raw_parts_mut(
+                    area.auxv as *mut usize,
+                    2 * proto_loader::AUXV_PAIRS,
+                )
+            };
+            for pair in auxv.chunks_exact_mut(2) {
+                if pair[0] == proto_loader::auxv::AT_SECURE as usize {
+                    pair[1] = 1;
+                }
+            }
+        }
+        let word = PROGRAM_MAIN.load(Ordering::Acquire);
+        if word == 0 {
+            return 125;
+        }
+        // SAFETY: `stafeto_start` stored a function of this type.
+        unsafe { core::mem::transmute::<usize, Main>(word) }
     };
-    auxiliary(auxv, area.flags & SECURE != 0);
+    #[cfg(not(feature = "shared"))]
+    {
+        // The auxiliary vector's pairs lie in the area, after the NULL of envp.
+        // SAFETY: the loader left proto_loader::AUXV_PAIRS pairs of words there.
+        let auxv = unsafe {
+            core::slice::from_raw_parts_mut(area.auxv as *mut usize, 2 * proto_loader::AUXV_PAIRS)
+        };
+        auxiliary(auxv, area.flags & SECURE != 0);
+    }
     // SAFETY: the area holds the initial stack and lives for good.
-    unsafe { enter_relibc(area.stack as *const usize) }
+    unsafe { enter_relibc(area.stack as *const usize, main) }
 }
 
 #[unsafe(export_name = "__rt_main")]
@@ -428,6 +507,21 @@ pub extern "C" fn crt_main(arg: u64) -> u64 {
     if arg == proto_loader::START_AREA {
         return loaded_main();
     }
+    // A program that init starts from the boot image is linked statically.
+    init_main()
+}
+
+/// The start of a program that init started from the boot image; it is
+/// linked statically, and libc.so does not start one.
+#[cfg(feature = "shared")]
+fn init_main() -> u64 {
+    125
+}
+
+/// The start of a program that init started: its arguments and handles
+/// come from its start data.
+#[cfg(not(feature = "shared"))]
+fn init_main() -> u64 {
     let Ok(mut start) = rt::startup() else {
         return 125;
     };

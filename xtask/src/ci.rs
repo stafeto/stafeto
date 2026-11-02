@@ -37,6 +37,7 @@ pub fn groups() -> Vec<String> {
 }
 
 const RELIBC: &str = "relibc";
+const LIBC_SO: &str = "libc.so";
 const BASE: &str = "BusyBox and base packages";
 const ADDONS: &str = "add-on packages";
 const KERNELS: &str = "kernel images";
@@ -46,6 +47,9 @@ const OPEN_POSIX_OBJECTS: &str = "Open POSIX objects";
 
 /// What every boot needs built.
 const BOOT_NEEDS: [&str; 5] = [RELIBC, BASE, ADDONS, KERNELS, IMAGES];
+/// What a guest probe needs: the dynamic programs of tests/posix-so run in
+/// the groups of the guests.
+const GUEST_NEEDS: [&str; 6] = [RELIBC, BASE, ADDONS, KERNELS, IMAGES, LIBC_SO];
 
 struct Step {
     name: String,
@@ -141,6 +145,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("posix-interrupt EL2", 10),
     ("posix-spawn-churn", 43),
     ("posix-map", 10),
+    ("posix-so", 20),
     ("posix-resources", 14),
     ("posix-sync", 10),
     ("posix-math", 10),
@@ -306,6 +311,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     let mut steps = Vec::new();
     // What the other groups need, built once.
     steps.push(step("build", RELIBC, &[], super::relibc));
+    steps.push(step("build", LIBC_SO, &[RELIBC], super::libc_so));
     steps.push(step("build", BASE, &[RELIBC], super::busybox_build));
     steps.push(step("build", ADDONS, &[RELIBC, BASE], super::nano_build));
     steps.push(step("build", KERNELS, &[], || {
@@ -360,7 +366,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         super::run_cmd(super::cargo().args(["fmt", "--all", "--check"]))
     }));
     steps.push(step("host", "clippy", &[], super::ci_lints));
-    steps.push(step("host", "host tests", &[], super::host_tests));
+    steps.push(step("host", "host tests", &[LIBC_SO], super::host_tests));
     // The headers of os-test (include, namespace) compile and link against
     // the sysroot, and the interfaces of POSIX.1-2024 are in the archives:
     // what passed once passes (tests/os-test/headers-pass.txt,
@@ -419,7 +425,7 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     for (n, names) in guests.into_iter().enumerate() {
         let group = format!("guests-{}", n + 1);
         let probes = format!("guest probes {}", n + 1);
-        steps.push(step(&group, &probes, &BOOT_NEEDS, move || {
+        steps.push(step(&group, &probes, &GUEST_NEEDS, move || {
             jobs::run_all(only(super::boot_jobs(Vec::new()), &names), njobs)
         }));
         steps.push(step(&group, "measures", &BOOT_NEEDS, super::write_measures));

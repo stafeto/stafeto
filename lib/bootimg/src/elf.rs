@@ -1463,6 +1463,12 @@ mod tests {
         match std::fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(_) => {
+                // The build that fills target/libc-so requires the files.
+                assert!(
+                    std::env::var_os("STAFETO_REQUIRE_LIBC_SO").is_none(),
+                    "no {}",
+                    path.display()
+                );
                 eprintln!("skipped: no {}", path.display());
                 None
             }
@@ -1495,7 +1501,7 @@ mod tests {
 
     #[test]
     fn the_real_dynamic_programs_are_dynamic() {
-        for name in ["hello", "hello-big"] {
+        for name in ["probes/so-hello", "probes/so-image"] {
             let Some(f) = real(name) else { return };
             let l = super::layout(&f[..0x1000], f.len() as u64, PROGRAM_ROOM).unwrap();
             assert_eq!(l.kind, Kind::Dynamic, "{name}");

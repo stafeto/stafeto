@@ -187,6 +187,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "dynlink",
  "proto-clock",
  "proto-fs",
  "proto-loader",
@@ -546,6 +547,13 @@ name = "posix-signals"
 version = "0.1.0"
 dependencies = [
  "posix-types",
+]
+
+[[package]]
+name = "posix-so-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ use proto_process::{Credentials, NO_ID, RECORDS, SPAWN_RESETIDS};
 
 /// The service's own pages it keeps out of the pool of the children's
 /// quotas (5c): the objects of the pages of its records (8 of 32 pages),
-/// the data and stacks of its loaders (16 of 5 pages) and room for the
+/// the data and stacks of its loaders (16 of 6 pages) and room for the
 /// tables of its mappings.
 pub const RESERVE: u64 = 384 * 4096;
 
@@ -94,7 +94,7 @@ pub const fn portion_level(requester: u8, service: u8) -> u8 {
 }
 
 /// The loaders that run at most: the service pays for their data and
-/// stack (five pages each) and holds a place of its channel for each.
+/// stack (six pages each) and holds a place of its channel for each.
 pub const LOADERS: usize = 16;
 /// The loaders of one parent at once (5c, decision 7): a process that
 /// starts spawns and never finishes them holds no more places than these.
