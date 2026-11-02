@@ -5416,3 +5416,4 @@ impl Fs {
         Ok((j.path().resolver.proof(&self.ram.storage, identity)?, None))
     }
 }
+#[used] static BIS_PAD: [u8; 6300] = [1; 6300];
