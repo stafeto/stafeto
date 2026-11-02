@@ -2834,8 +2834,8 @@ impl Tty {
 
     /// The signal `number` of INTR, QUIT or SUSP to the foreground group
     /// `group` (XBD 11.1.9): the process service walks the group
-    /// (TtySignal) and answers at the walk's end. A group of a session
-    /// the console is no longer the controlling terminal of gets none.
+    /// (TtySignal) and answers when it has queued the walk. A group of a
+    /// session the console is no longer the controlling terminal of gets none.
     fn signal_group(&mut self, group: u32, number: u32) {
         let _ = self.try_signal_group(group, number);
     }
