@@ -514,6 +514,45 @@ static void image_race(void) {
     close(go[1]);
 }
 
+/* A process execs the file it runs (`exec sh` from `sh`): the entry of the
+ * image stays registered to it, so the next process that runs the file
+ * shares the object. The first one is spawned from a fresh copy, execs the
+ * copy itself and then is the role `image`; the second is spawned after it
+ * has loaded, and both have to see the code and the data mapped twice. */
+static int exec_self(char **argv) {
+    char *args[] = {"map", "image", argv[2], argv[3], "1", NULL};
+    execve(argv[4], args, environ);
+    return 9;
+}
+
+static void image_exec_self(void) {
+    int ready[2], go[2];
+    check("exec image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    const char *copy = "/tmp/image-exec";
+    unlink(copy);
+    check("exec image: copy", copy_file("/bin/procs-child", copy) == 0);
+    char r[16], g[16];
+    snprintf(r, sizeof r, "%d", ready[1]);
+    snprintf(g, sizeof g, "%d", go[0]);
+    char *args[] = {"map", "execself", r, g, (char *)copy, NULL};
+    pid_t a, b;
+    check("exec image: spawn", posix_spawn(&a, copy, NULL, NULL, args, environ) == 0);
+    unsigned char byte;
+    check("exec image: the exec loaded", read(ready[0], &byte, 1) == 1);
+    check("exec image: second spawn", spawn_image(copy, ready[1], go[0], 1, &b) == 0);
+    check("exec image: second loaded", read(ready[0], &byte, 1) == 1);
+    int saw = -1;
+    check("exec image: look", image_look(ready[0], go[1], 2, &saw));
+    check("exec image: a process that execs its own file keeps the image for the next one", saw == 0);
+    if (saw) printf("posix-map: exec image bits %d\n", saw);
+    check("exec image: exit", image_exit(a) == 0 && image_exit(b) == 0);
+    unlink(copy);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+}
+
 static void image_spawned(void) {
     int ready[2], go[2];
     check("spawned image: pipes", pipe(ready) == 0 && pipe(go) == 0);
@@ -1843,6 +1882,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "pinsafter") == 0) return pins_after();
     if (argc == 3 && strcmp(argv[1], "lockget") == 0) return lock_get(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
+    if (argc == 5 && strcmp(argv[1], "execself") == 0) return exec_self(argv);
     if (argc == 5 && strcmp(argv[1], "image") == 0)
         return image_role(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
     if (argc == 1) {
@@ -1872,6 +1912,7 @@ int main(int argc, char **argv) {
     forked();
     image_shared();
     image_spawned();
+    image_exec_self();
     forked_many();
     churn();
     fragmentation();

@@ -123,9 +123,10 @@ impl<T, W> Images<T, W> {
     }
 
     fn join(entry: &mut Entry<T>, record: usize) {
-        if !Entry::<T>::has(&entry.users, record) {
-            entry.joining[record / 64] |= 1 << (record % 64);
-        }
+        // Always: a record that uses the entry already (the exec of the
+        // file it runs) joins again, so that commit, which lets go of what
+        // the replaced image used, finds it joined and keeps it.
+        entry.joining[record / 64] |= 1 << (record % 64);
     }
 
     /// The loader of the record in `record` asks for the object of `key`;
@@ -542,6 +543,44 @@ mod tests {
         t.abort(2);
         t.drop_user(1);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn an_exec_of_the_file_a_record_runs_keeps_the_entry() {
+        let mut t = Images::<u32, u32>::new();
+        assert_eq!(t.get(&key(1), 4), Got::Reserved);
+        t.put(&key(1), 4, 1, 1).unwrap();
+        t.commit(4);
+        // The record runs key 1 and execs the same file.
+        assert_eq!(t.get(&key(1), 4), Got::Found(1, &1));
+        t.commit(4);
+        assert_eq!(t.len(), 1, "the entry lives while its user does");
+        assert_eq!(t.get(&key(1), 5), Got::Found(1, &1), "the next exec shares it");
+        // An exec of the same file that aborts keeps the old registration.
+        assert_eq!(t.get(&key(1), 4), Got::Found(1, &1));
+        t.abort(4);
+        t.abort(5);
+        assert_eq!(t.len(), 1);
+        t.drop_user(4);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn the_waiters_of_a_gone_maker_leave_one_at_a_time_when_taken_between() {
+        let mut t = Images::<u32, u32>::new();
+        assert_eq!(t.get(&key(1), 0), Got::Reserved);
+        for r in 1..=2 {
+            assert_eq!(t.get(&key(1), r), Got::Busy);
+            t.wait(key(1), r, r as u32).unwrap();
+        }
+        t.abort(0);
+        let mut one = [None];
+        assert_eq!(t.ready_batch(&mut one).0, 1);
+        let (record, k, _) = one[0].take().unwrap();
+        assert_eq!(record, 1);
+        assert_eq!(t.get(&k, record), Got::Reserved, "the oldest becomes the maker");
+        let mut one = [None];
+        assert_eq!(t.ready_batch(&mut one).0, 0, "the other waits for it");
     }
 
     #[test]

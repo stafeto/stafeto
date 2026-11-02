@@ -1364,15 +1364,20 @@ impl Processes {
         for (place, _) in images.iter_mut().zip(taken..images::BATCH) {
             let mut one = [const { None }; 1];
             let (_, more_left) = self.images.ready_batch(&mut one);
-            *place = one[0].take();
             more_images = more_left;
+            // The table is asked again at once: of the requests of a key
+            // whose maker went, the next `ready_batch` must see this one
+            // as the new maker.
+            if let Some((record, key, pending)) = one[0].take() {
+                *place = Some((pending, self.image_take(record, &key)));
+            }
         }
         if taken >= images::BATCH {
             more_images = self.images.waiters() > 0;
         }
         self.share_wake = more || more_images;
-        for (record, key, pending) in images.into_iter().flatten() {
-            match self.image_take(record, &key) {
+        for (pending, taken) in images.into_iter().flatten() {
+            match taken {
                 Taken::Reply(kind, found) => {
                     let _ = Self::share_reply(pending, kind, found);
                 }
