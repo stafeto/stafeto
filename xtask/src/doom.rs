@@ -411,7 +411,11 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     // screen back.
     run.expect("# ", DIALOG_STEP)?;
     run.send(LAUNCH)?;
-    run.expect_line("the title screen again", |l| l.contains(TITLE), TITLE_WITHIN)?;
+    run.expect_line(
+        "the title screen again",
+        |l| l.contains(TITLE),
+        TITLE_WITHIN,
+    )?;
     run.type_raw(b"\x03")?;
     run.expect(gpu_probe::RELEASED, DIALOG_STEP * 3)?;
     run.send("echo ash-is-back")?;
@@ -445,7 +449,10 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
     symbolize::backtrace(&output.lines, &kernel.elf);
     let seen = driven.map_err(|e| format!("doom-probe on {}: {e}", machine.name))?;
     if let Some(line) = faulted(&output.lines) {
-        return Err(format!("doom-probe on {}: the games image faulted: {line}", machine.name));
+        return Err(format!(
+            "doom-probe on {}: the games image faulted: {line}",
+            machine.name
+        ));
     }
     let released = output
         .lines
@@ -494,7 +501,9 @@ pub fn doom_window(args: &[String]) -> Result<(), String> {
     let machine = player_machine(args)?;
     if machine.is_hvf() {
         hvf_host().map_err(|why| {
-            format!("--machine hvf needs macOS on Apple Silicon with the Hypervisor framework: {why}")
+            format!(
+                "--machine hvf needs macOS on Apple Silicon with the Hypervisor framework: {why}"
+            )
         })?;
     }
     build_games()?;
@@ -599,7 +608,8 @@ pub fn doom_measure(machine: &'static qemu::Machine) -> Result<(), String> {
     })();
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
-    let (memory, tics, real) = measured.map_err(|e| format!("doom-measure on {}: {e}", machine.name))?;
+    let (memory, tics, real) =
+        measured.map_err(|e| format!("doom-measure on {}: {e}", machine.name))?;
     println!(
         "doom-measure on {}: {:.1} frames a second ({tics} game tics in {real} real tics of 1/35 s); memory of the process (VmSize kB, VmRSS kB, statm pages): {}",
         machine.name,
@@ -752,7 +762,11 @@ mod tests {
         let before = picture(640, 400, |i| [(i % 256) as u8, 1, 1]);
         let turned = picture(640, 400, |i| [(i % 256) as u8, 2, 1]);
         assert_eq!(check_turn(&before, &turned), Ok(1000));
-        assert!(check_turn(&before, &before).unwrap_err().contains("0 thousandths"));
+        assert!(
+            check_turn(&before, &before)
+                .unwrap_err()
+                .contains("0 thousandths")
+        );
         // An animation of the floors: 5 % of the points.
         let floors = picture(640, 400, |i| {
             [(i % 256) as u8, if i % 20 == 0 { 2 } else { 1 }, 1]
