@@ -1,0 +1,20 @@
+[package]
+name = "posix-display-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the display service's place in a process: fork, spawn, exec and the display piece"
+build = "build.rs"
+
+[[bin]]
+name = "posix-display-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
+proto-gpu = { path = "../../proto/gpu" }
+rt = { path = "../../lib/rt", features = ["count-calls"] }

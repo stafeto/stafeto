@@ -10,9 +10,13 @@
 //! the kernel has entries, at most `MAX_PIECES` (abi::MAX_MAPPINGS), and a
 //! range across several pieces is walked one piece at a time, as the
 //! kernel's calls take a range inside one entry. `Space` records what each
-//! page of the layer's room is for. No device window and no DMA object is
-//! ever in the map: a POSIX process has no device resource. The handle type
-//! is a parameter, so that the host tests use plain numbers.
+//! page of the layer's room is for. No device window is ever in the map: a
+//! POSIX process has no device resource. The one DMA object that can be is
+//! the buffer of the screen, the *display piece* (spec 3, 7.3): `fork` does
+//! not copy it into the child (`Map::inherited` leaves it out, so the child
+//! has a hole there), `munmap` and `mprotect` refuse it (`Refused::Display`,
+//! EINVAL), and only `unmap_display` takes it out. The handle type is a
+//! parameter, so that the host tests use plain numbers.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -172,6 +176,9 @@ pub struct Object<H> {
     /// filled: immutable, without a file, and shared with a forked child
     /// without a copy.
     pub image: bool,
+    /// The buffer of the screen (spec 3, 7.3): not copied by `fork`, not
+    /// changed by `munmap` or `mprotect`, taken out by `unmap_display`.
+    pub display: bool,
 }
 
 impl<H> Object<H> {
@@ -183,6 +190,15 @@ impl<H> Object<H> {
             may_write: true,
             dirty: false,
             image: false,
+            display: false,
+        }
+    }
+
+    /// The buffer of the screen: writable, never shared with a child.
+    pub fn display(handle: H) -> Self {
+        Object {
+            display: true,
+            ..Object::new(handle, false, None)
         }
     }
 }
@@ -197,6 +213,9 @@ pub enum Refused {
     Malformed,
     /// The range meets a piece the map holds.
     Overlap,
+    /// The range meets the display piece, which only `unmap_display`
+    /// changes.
+    Display,
 }
 
 /// The pieces of a process, sorted by address, and its objects. An empty
@@ -426,6 +445,37 @@ impl<H> Map<H> {
         at == address.saturating_add(pages.saturating_mul(PAGE))
     }
 
+    /// Whether some page of the range lies in the display piece.
+    pub fn meets_display(&self, address: usize, pages: usize) -> bool {
+        self.walk(address, pages)
+            .any(|(i, ..)| self.object(self.piece(i).object()).display)
+    }
+
+    /// The pieces a forked child gets: all but the display piece.
+    pub fn inherited(&self) -> impl Iterator<Item = &Piece> {
+        self.iter()
+            .filter(|piece| !self.object(piece.object()).display)
+    }
+
+    /// The display piece's first address and pages, when the map has one.
+    pub fn display_piece(&self) -> Option<(usize, usize)> {
+        self.iter()
+            .find(|piece| self.object(piece.object()).display)
+            .map(|piece| (piece.address, piece.pages()))
+    }
+
+    /// The display piece leaves the map (the kernel's `mem_unmap` of it
+    /// succeeded): its address, its pages and the object, which the caller
+    /// closes. None without one.
+    pub fn unmap_display(&mut self) -> Option<(usize, usize, Object<H>)> {
+        let (address, pages) = self.display_piece()?;
+        let at = self.find(address)?;
+        let object = self.piece(at).object();
+        self.remove_piece(at);
+        let object = self.objects[object].take()?;
+        Some((address, pages, object))
+    }
+
     /// Cuts the piece at `index` so that exactly the `pages` pages from
     /// `address` are a piece of their own, as the kernel does (`split`);
     /// returns the index of that piece. The range must lie inside the
@@ -532,6 +582,9 @@ impl<H> Map<H> {
         pages: usize,
         access: Access,
     ) -> Result<(), Refused> {
+        if self.object(self.piece(index).object()).display {
+            return Err(Refused::Display);
+        }
         let at = self.cut(index, address, pages)?;
         let cut = *self.piece(at);
         *self.piece_mut(at) = cut.with_access(access);
@@ -547,6 +600,9 @@ impl<H> Map<H> {
         address: usize,
         pages: usize,
     ) -> Result<Option<Object<H>>, Refused> {
+        if self.object(self.piece(index).object()).display {
+            return Err(Refused::Display);
+        }
         let at = self.cut(index, address, pages)?;
         let object = self.piece(at).object();
         self.remove_piece(at);
@@ -565,6 +621,9 @@ impl<H> Map<H> {
         address: usize,
         pages: usize,
     ) -> Result<(), Refused> {
+        if self.object(self.piece(index).object()).display {
+            return Err(Refused::Display);
+        }
         let at = self.cut(index, address, pages)?;
         self.remove_piece(at);
         Ok(())
@@ -594,6 +653,10 @@ mod tests {
     use super::*;
 
     fn object(handle: u32, _pages: usize) -> Object<u32> {
+        Object::new(handle, false, None)
+    }
+
+    fn object_plain(handle: u32) -> Object<u32> {
         Object::new(handle, false, None)
     }
 
@@ -920,5 +983,91 @@ mod tests {
         // A range that ends inside the hole frees what lies below its end.
         assert_eq!(run(&mut make(), 0x1C000, 2), (vec![(0x1D000, 1)], 2));
         assert_eq!(run(&mut make(), 0x1E000, 1), (vec![(0x1D000, 2)], 1));
+    }
+
+    /// A map with the heap's chunk, the display piece (250 pages) and a
+    /// file mapping, as a process that owns the screen has.
+    fn with_screen() -> Map<u32> {
+        let mut map = Map::new();
+        map.push(0x1000_0000, 16, Access::ReadWrite, 0, object(1, 16))
+            .unwrap();
+        map.push(0x2000_0000, 250, Access::ReadWrite, 0, Object::display(7))
+            .unwrap();
+        map.push(0x3000_0000, 4, Access::Read, 0, object(3, 4))
+            .unwrap();
+        map
+    }
+
+    /// `fork` copies the pieces `inherited` names: the display piece is not
+    /// among them, so the child has a hole there.
+    #[test]
+    fn fork_leaves_the_display_piece_out() {
+        let map = with_screen();
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+        assert_eq!(map.len(), 3);
+        let plain = Map::<u32>::new();
+        assert_eq!(
+            (plain.display_piece(), plain.inherited().count()),
+            (None, 0)
+        );
+    }
+
+    /// `munmap` and `mprotect` on any part of the display piece are refused
+    /// (EINVAL), whole or cut, and nothing changes.
+    #[test]
+    fn munmap_and_mprotect_refuse_the_display_piece() {
+        let mut map = with_screen();
+        let before = held(&map);
+        let at = map.find(0x2000_0000).unwrap();
+        for (address, pages) in [
+            (0x2000_0000, 250),
+            (0x2000_0000, 1),
+            (0x2000_0000 + 100 * PAGE, 3),
+        ] {
+            assert!(map.meets_display(address, pages));
+            assert_eq!(map.unmap(at, address, pages), Err(Refused::Display));
+            assert_eq!(map.unmap_keep(at, address, pages), Err(Refused::Display));
+            assert_eq!(
+                map.protect(at, address, pages, Access::Read),
+                Err(Refused::Display)
+            );
+        }
+        // A range that reaches the piece from a neighbour meets it too.
+        assert!(map.meets_display(0x2000_0000 - PAGE, 2));
+        assert!(!map.meets_display(0x1000_0000, 16));
+        assert!(!map.meets_display(0x3000_0000, 4));
+        assert_eq!(held(&map), before);
+        // The other pieces still change.
+        let heap = map.find(0x1000_0000).unwrap();
+        map.protect(heap, 0x1000_0000, 4, Access::Read).unwrap();
+        assert_eq!(map.len(), 4);
+    }
+
+    /// The close, the exit and `exec` take the piece out whole and give the
+    /// object back for its handle to close; a second call finds none.
+    #[test]
+    fn unmap_display_gives_the_object_back() {
+        let mut map = with_screen();
+        let (address, pages, object) = map.unmap_display().unwrap();
+        assert_eq!(
+            (address, pages, object.handle, object.display),
+            (0x2000_0000, 250, 7, true)
+        );
+        assert_eq!(map.len(), 2);
+        assert!(!map.meets_display(0x2000_0000, 250));
+        assert!(map.unmap_display().is_none());
+        // The pages are free for another mapping, which `munmap` may take.
+        let again = map
+            .push(0x2000_0000, 250, Access::ReadWrite, 0, object_plain(9))
+            .unwrap();
+        assert_eq!(
+            map.unmap(map.find(0x2000_0000).unwrap(), 0x2000_0000, 250)
+                .unwrap()
+                .map(|o| o.handle),
+            Some(9)
+        );
+        let _ = again;
     }
 }

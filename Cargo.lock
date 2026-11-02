@@ -261,6 +261,7 @@ dependencies = [
  "proto-clock",
  "proto-entropy",
  "proto-fs",
+ "proto-gpu",
  "proto-loader",
  "proto-pipe",
  "proto-process",
@@ -343,6 +344,16 @@ dependencies = [
  "posix-thread",
  "proto-init",
  "proto-loader",
+ "rt",
+]
+
+[[package]]
+name = "posix-display-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-gpu",
  "rt",
 ]
 

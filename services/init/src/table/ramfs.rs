@@ -886,6 +886,32 @@ pub const POSIX_RANDOM_TABLE: &[Record] = &[
     },
 ];
 
+/// The probe of the display service's place in a process (tests/
+/// posix-display, sub-project 3 part 3a): the RAM files, the process and
+/// clock services, the pipe service and the display service (level 33,
+/// above the processes of POSIX; QEMU has its device on, and the probe never
+/// opens the screen: it asks for sessions only). The probe
+/// starts its own file once, whose copy forks, spawns and execs.
+pub const POSIX_DISPLAY_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::gpu::GPU,
+    Record {
+        name: "posix-display",
+        program: "posix-display",
+        args: b"posix-display\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "gpu"],
+        root: true,
+        quota: PROCS_QUOTA,
+        ..POSIX
+    },
+];
+
 /// Functional loader channel probe with the process probe's ordinary image.
 pub const LOADER_CHANNELS_TABLE: &[Record] = &[
     super::normal::TABLE[0],

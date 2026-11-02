@@ -406,7 +406,8 @@ impl TerminalPlan {
 
 /// The handles of the start area, by their place in `Start::handles`; the
 /// sessions the parent gives with Handles are Files, Clock, Driver (the
-/// console's driver), Pipes (5e) Terminal (the terminal service, 5f), and Entropy (5e').
+/// console's driver), Pipes (5e) Terminal (the terminal service, 5f), Entropy (5e')
+/// and Display (the display service, `proto_gpu`; sub-project 3, part 3a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Slot {
@@ -421,20 +422,25 @@ pub enum Slot {
     Pipes = 8,
     Terminal = 9,
     Entropy = 10,
+    /// The process's session with the display service, a `Display` session
+    /// (`proto_gpu`): fork and spawn give the child a CLONE of it, exec moves
+    /// it. Empty in an image without the display service.
+    Display = 11,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 11;
+pub const SLOTS: usize = 12;
 
 impl Slot {
     /// The sessions Handles brings, in their order.
-    pub const GIVEN: [Slot; 6] = [
+    pub const GIVEN: [Slot; 7] = [
         Slot::Files,
         Slot::Clock,
         Slot::Driver,
         Slot::Pipes,
         Slot::Terminal,
         Slot::Entropy,
+        Slot::Display,
     ];
 
     /// The bit of this slot in Fork's required session mask.
@@ -454,7 +460,7 @@ impl Slot {
     };
 
     /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
-    /// Terminal or Entropy.
+    /// Terminal, Entropy or Display.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
@@ -463,6 +469,7 @@ impl Slot {
             8 => Some(Slot::Pipes),
             9 => Some(Slot::Terminal),
             10 => Some(Slot::Entropy),
+            11 => Some(Slot::Display),
             _ => None,
         }
     }
@@ -864,12 +871,10 @@ pub struct Start {
     pub timers: u64,
     pub alarm: u64,
     pub map: u64,
-    /// Zero: the initial stack after the header stays on 16 bytes.
-    pub reserved: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 5;
+pub const START_VERSION: u32 = 6;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
@@ -1021,7 +1026,6 @@ pub fn write_area(
         timers: block.carried.timers,
         alarm: block.carried.alarm,
         map: at + maps_at as u64,
-        reserved: 0,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -1629,8 +1633,14 @@ mod tests {
             handle_slots(Reader::new(w.as_bytes()), 1),
             Ok([Some(Slot::Entropy), None, None, None])
         );
+        let w = body(&[11]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 1),
+            Ok([Some(Slot::Display), None, None, None])
+        );
         for (slots, count) in [
-            (&[11][..], 1),
+            (&[12][..], 1),
+            (&[11, 11][..], 2),
             (&[10, 10][..], 2),
             (&[4, 5, 6, 8, 5][..], 5),
             (&[8, 8][..], 2),
@@ -1724,7 +1734,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -2100,7 +2110,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (5, 8, 8));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (6, 8, 8));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];
@@ -2314,7 +2324,7 @@ mod tests {
                 image: false,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();

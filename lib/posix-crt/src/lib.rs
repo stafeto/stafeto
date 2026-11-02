@@ -230,6 +230,9 @@ pub unsafe fn posix_init_process(
     // The entropy service, when the record names it; none otherwise, and
     // getentropy gives ENOSYS. SAFETY: startup, on the only thread.
     unsafe { posix_abi::random::init(rt::service::connect(parent, "entropy").ok()) };
+    // The display service, when the record names it ("gpu"); none otherwise,
+    // and the screen calls give ENODEV. SAFETY: as above.
+    unsafe { posix_abi::display::init(rt::service::connect(parent, "gpu").ok()) };
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
     // CLOCK_REALTIME without IPC; a clock service without its page leaves
@@ -458,6 +461,8 @@ fn loaded_main() -> u64 {
     }
     // SAFETY: still single-threaded.
     unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
+    // SAFETY: as above.
+    unsafe { posix_abi::display::init(one(Slot::Display).map(Handle::from_raw)) };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

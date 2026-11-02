@@ -53,6 +53,7 @@ mod obj_sites;
 mod openposix;
 mod ostest;
 mod packages;
+mod posix_display;
 mod qemu;
 mod ring;
 mod rootfs;
@@ -1645,6 +1646,7 @@ commands:
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
+  posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
@@ -1894,6 +1896,7 @@ fn main() {
             Some(_) => Err("input-probe [--hvf]".to_owned()),
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
+        Some("posix-display") => posix_display::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -8732,6 +8735,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
+        job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
@@ -11627,6 +11631,8 @@ fn ci_lints() -> Result<(), String> {
         "os-test-run",
         "--package",
         "posix-random-probe",
+        "--package",
+        "posix-display-probe",
         "--package",
         "posix-pty",
         "--package",
