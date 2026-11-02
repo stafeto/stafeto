@@ -33,6 +33,7 @@ mod clock_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
+mod doom;
 mod entropy;
 mod gpu_probe;
 mod guards;
@@ -871,7 +872,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 6] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -882,6 +883,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
     ("htop", "htop", 0, &["dynamic"]),
     ("nano", "nano", 0, &["dynamic"]),
     ("ncdu", "ncdu", 0, &["dynamic"]),
+    ("doom", "doom", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -1599,6 +1601,8 @@ commands:
             the spread of loops over the CPUs, taskset, htop
   ncdu-dialog  check ncdu in an ash dialog in QEMU: directory sizes, hard links counted once, quit
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
+  doom-headless [MACHINE]  check Doom in the games image (boot-doom.img): from ash, without a
+            screen, it plays the demo of Freedoom (-timedemo demo1 -nodraw) and ash prompts again
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
   ls        run BusyBox ls against the RAM file service in QEMU
@@ -1853,6 +1857,7 @@ fn main() {
             })
             .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
+        Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -2364,6 +2369,21 @@ fn write_elf_image(
     if let Some((licence, source)) = &ncdu_files {
         list.push((NCDU_LICENSE, licence.as_slice()));
         list.push((NCDU_SOURCE, source.as_bytes()));
+    }
+    // An image with Doom (GPL-2.0-or-later) carries its licence, Freedoom's
+    // (BSD-3-Clause) and where the exact sources are.
+    let doom_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "doom"))
+    {
+        Some(doom::terms_files()?)
+    } else {
+        None
+    };
+    if let Some(files) = &doom_files {
+        for (name, bytes) in files {
+            list.push((name, bytes.as_slice()));
+        }
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3481,6 +3501,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("htop", _) => "htop",
         ("nano", _) => "nano",
         ("ncdu", _) => "ncdu",
+        ("doom", _) => "doom",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -8559,6 +8580,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("cpus-dialog smp 1", || cpus_dialog::cpus_dialog(1)),
         job("cpus-dialog smp 4", || cpus_dialog::cpus_dialog(SMP_CPUS)),
         job("ncdu-dialog", ncdu_dialog::ncdu_dialog),
+        job("doom-headless", || doom::doom_headless(&qemu::VIRT)),
         job("ash-shell-exit", ash_shell_exit),
         job("bash-shell-exit", bash_dialog::bash_shell_exit),
         job("bash-dialog", bash_dialog::bash_dialog),

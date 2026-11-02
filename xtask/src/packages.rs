@@ -11,11 +11,24 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Whether a package is part of the base set of the system or an add-on.
+/// Whether a package is part of the base set of the system, an add-on of
+/// the shell image or a game (the games image only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Base,
     Addon,
+    Game,
+}
+
+impl Kind {
+    /// The word of the description and of the table.
+    pub fn word(self) -> &'static str {
+        match self {
+            Kind::Base => "base",
+            Kind::Addon => "addon",
+            Kind::Game => "game",
+        }
+    }
 }
 
 /// A package: the content of its description.
@@ -169,9 +182,10 @@ pub fn parse(text: &str, origin: &str) -> Result<Package, String> {
     let kind = match required(text_of(take("kind"), "kind")?, "kind")?.as_str() {
         "base" => Kind::Base,
         "addon" => Kind::Addon,
+        "game" => Kind::Game,
         other => {
             return Err(format!(
-                "{origin}: kind {other:?} is neither base nor addon"
+                "{origin}: kind {other:?} is none of base, addon, game"
             ));
         }
     };
@@ -308,6 +322,12 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
                     p.name
                 ));
             }
+            if p.kind != Kind::Game && d.kind == Kind::Game {
+                return Err(format!(
+                    "{}: a package of the shell image depends on the game {dep}",
+                    p.name
+                ));
+            }
         }
         // The programs a file takes its bytes from are those of the package
         // and of its dependencies.
@@ -384,13 +404,16 @@ pub fn load() -> Result<Vec<Package>, String> {
 /// that holds packages belongs to exactly one of them or to the base system.
 pub fn check() -> Result<(), String> {
     let packages = load()?;
-    let image = "boot-ash-dialog.img";
-    crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
-    let (base, addons) = (
-        packages.iter().filter(|p| p.kind == Kind::Base).count(),
-        packages.iter().filter(|p| p.kind == Kind::Addon).count(),
+    for image in ["boot-ash-dialog.img", "boot-doom.img"] {
+        crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
+    }
+    let count = |kind| packages.iter().filter(|p| p.kind == kind).count();
+    println!(
+        "packages ok: {} base, {} add-on, {} game",
+        count(Kind::Base),
+        count(Kind::Addon),
+        count(Kind::Game)
     );
-    println!("packages ok: {base} base, {addons} add-on");
     Ok(())
 }
 
@@ -435,12 +458,16 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
     }
 }
 
-/// The packages the image `name` holds: the shell image holds every one of
-/// them, base and add-ons. The other images are probes that list the few
-/// files they use and hold no package.
+/// The packages the image `name` holds: the shell image holds the base ones
+/// and the add-ons, the games image every one of them. The other images are
+/// probes that list the few files they use and hold no package.
 pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
     match name {
-        "boot-ash-dialog.img" => load(),
+        "boot-ash-dialog.img" => Ok(load()?
+            .into_iter()
+            .filter(|p| p.kind != Kind::Game)
+            .collect()),
+        "boot-doom.img" => load(),
         _ => Ok(Vec::new()),
     }
 }
@@ -563,6 +590,33 @@ files = [
         b.files = vec![("/bin/other".into(), "elf:other".into())];
         b.program = Some("other".into());
         assert!(validate_set(&[a, b], None).unwrap_err().contains("add-on"));
+    }
+
+    #[test]
+    fn a_package_of_the_shell_image_cannot_depend_on_a_game() {
+        let mut shell = good();
+        shell.depends = vec!["game".into()];
+        let mut game = good();
+        game.name = "game".into();
+        game.kind = Kind::Game;
+        game.files = vec![("/bin/game".into(), "elf:game".into())];
+        game.program = Some("game".into());
+        assert!(
+            validate_set(&[shell, game.clone()], None)
+                .unwrap_err()
+                .contains("game")
+        );
+        game.depends = vec![];
+        assert!(validate_set(&[game], None).is_ok());
+    }
+
+    #[test]
+    fn the_games_stay_out_of_the_shell_image() {
+        let shell = of_image("boot-ash-dialog.img").unwrap();
+        assert!(shell.iter().all(|p| p.kind != Kind::Game));
+        let doom = of_image("boot-doom.img").unwrap();
+        assert!(doom.len() > shell.len());
+        assert!(doom.iter().any(|p| p.name == "freedoom"));
     }
 
     #[test]
