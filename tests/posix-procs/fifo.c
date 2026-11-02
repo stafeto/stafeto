@@ -376,6 +376,65 @@ static void crowd(void) {
     puts("posix-fifo: twelve blocked opens of one end ok");
 }
 
+#define STORM_ROUNDS 40
+static volatile sig_atomic_t storm_signals;
+static int storm_done[2];
+static int storm_failed;
+static void storm_handler(int signal) {
+    (void)signal;
+    ++storm_signals;
+}
+
+static void *storm_opener(void *index) {
+    int side = (int)(intptr_t)index;
+    for (int round = 0; round < STORM_ROUNDS; round++) {
+        int fd;
+        do {
+            fd = open("/tmp/fifo-d", side == 0 ? O_RDONLY : O_WRONLY);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0) {
+            __atomic_store_n(&storm_failed, errno ? errno : -1, __ATOMIC_RELEASE);
+            break;
+        }
+        close(fd);
+    }
+    __atomic_store_n(&storm_done[side], 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* A signal that arrives while a blocking open takes and acknowledges its
+ * rendezvous must wait for the end of the short custody: the open ends. */
+static void storm(void) {
+    struct sigaction action = {0};
+    action.sa_handler = storm_handler;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    CHECK(sigaction(SIGUSR2, &action, NULL) == 0);
+    CHECK(mkfifo("/tmp/fifo-d", 0600) == 0);
+    pthread_t threads[2];
+    for (int i = 0; i < 2; i++)
+        CHECK(pthread_create(&threads[i], NULL, storm_opener, (void *)(intptr_t)i) == 0);
+    struct timespec start, now;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    while (!__atomic_load_n(&storm_done[0], __ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&storm_done[1], __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 2; i++) pthread_kill(threads[i], SIGUSR2);
+        struct timespec delay = {0, 300000};
+        nanosleep(&delay, NULL);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        if (now.tv_sec - start.tv_sec >= 30) {
+            printf("posix-fifo: FAIL opens under signals do not end (%d, %d, %d signals)\n",
+                   storm_done[0], storm_done[1], (int)storm_signals);
+            fflush(stdout);
+            _exit(1);
+        }
+    }
+    for (int i = 0; i < 2; i++) CHECK(pthread_join(threads[i], NULL) == 0);
+    CHECK(storm_failed == 0);
+    CHECK(unlink("/tmp/fifo-d") == 0);
+    printf("posix-fifo: %d opens under signals ok\n", 2 * STORM_ROUNDS);
+}
+
 static void custody(void) {
     int r = reader("/tmp/fifo-a");
     int w = writer("/tmp/fifo-a");
@@ -429,6 +488,7 @@ int main(int argc, char **argv) {
     readiness();
     rendezvous();
     crowd();
+    storm();
     custody();
     memory("complete");
     printf("posix-fifo: done failures %d\n", failures);

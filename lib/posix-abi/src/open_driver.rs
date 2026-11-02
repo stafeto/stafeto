@@ -664,8 +664,35 @@ fn fifo_open(
     }
     // Take and both acknowledgements remain recoverable in the same local record.
     let _short = crate::long::ShortScope::enter(true)?;
+    // A deferral leaves the waits of IPC interruptible, and a request of an
+    // entry that is pending (a stopper or a signal) interrupts each send of
+    // the repeating requests below at once, as the entry cannot run under
+    // the deferral (`interrupt_wait` in the kernel). With the entries
+    // masked the sends block, and the request enters when the deferral ends.
+    let was_masked = rt::upcall::mask().unwrap_or(true);
+    let result = fifo_take_and_ack(transport, token, claim, metadata, recovery, &session);
+    if !was_masked {
+        // SAFETY: the entries were open when the call began; with the
+        // deferral still held a pending request enters when it ends.
+        let _ = unsafe { rt::upcall::enable() };
+    }
+    result
+}
+
+/// The Take and both acknowledgements of an open FIFO, repeated after an
+/// interrupted send, under the short custody and the masked entries of
+/// the caller.
+fn fifo_take_and_ack(
+    transport: Transport,
+    token: OpenToken,
+    claim: ClaimToken,
+    metadata: posix_fs::RamTarget,
+    recovery: &mut Recovery,
+    session: &rt::handle::Handle<rt::handle::Channel>,
+) -> Result<posix_fs::FifoTarget, i32> {
+    use proto_pipe::{Method, NamedPhase};
     let taken = loop {
-        match rt::pipe::request(&session, Method::NamedTake, fifo_ticket(*recovery), None) {
+        match rt::pipe::request(session, Method::NamedTake, fifo_ticket(*recovery), None) {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
             other => break other.map_err(protocol)?.state,
         }
@@ -694,7 +721,7 @@ fn fifo_open(
     recovery.fifo_stage = 5;
     save(claim, *recovery)?;
     loop {
-        match rt::pipe::request(&session, Method::NamedAck, fifo_ticket(*recovery), None) {
+        match rt::pipe::request(session, Method::NamedAck, fifo_ticket(*recovery), None) {
             Err(Status::Kernel(rt::abi::Error::Interrupted)) => continue,
             other => {
                 other.map_err(protocol)?;
