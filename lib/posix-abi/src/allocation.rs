@@ -301,7 +301,13 @@ pub unsafe fn after_fork(
             object.wait_key,
         );
     }
+    // The parent's display piece is no mapping of the child's: its pages
+    // of the room are free again.
+    let display = state.map.display_piece();
     state.map.forget();
+    if let Some((address, pages)) = display {
+        state.space.set(address, pages, Page::Unbacked);
+    }
     let mut last = None;
     for entry in map {
         if entry.shared {

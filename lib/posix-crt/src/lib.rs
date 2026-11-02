@@ -381,6 +381,12 @@ fn loaded_main() -> u64 {
     // the program's life, its header first.
     let header = unsafe { core::slice::from_raw_parts(START_AREA as *const u8, START_SIZE) };
     let Some(area) = Start::read(header) else {
+        // A program built for another layout of the area (an older image):
+        // the code stays 125.
+        rt::println!(
+            "POSIX startup: the start area is not of version {} (rebuild the program)",
+            proto_loader::START_VERSION
+        );
         return 125;
     };
     // A library without a loader's vector cannot start a program.
@@ -461,8 +467,16 @@ fn loaded_main() -> u64 {
     }
     // SAFETY: still single-threaded.
     unsafe { posix_abi::random::init(one(Slot::Entropy).map(Handle::from_raw)) };
-    // SAFETY: as above.
-    unsafe { posix_abi::display::init(one(Slot::Display).map(Handle::from_raw)) };
+    // A set-ID program takes no display session from its caller, who could
+    // put a channel of its own there: the handle closes and the screen
+    // calls give ENODEV. SAFETY: as above.
+    unsafe {
+        posix_abi::display::init(
+            one(Slot::Display)
+                .map(Handle::from_raw)
+                .filter(|_| area.flags & SECURE == 0),
+        )
+    };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

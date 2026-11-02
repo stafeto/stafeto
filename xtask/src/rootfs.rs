@@ -1111,6 +1111,19 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             let mut files = vec![
                 dir("/bin"),
                 file("/bin/posix-display", 0o755, ROOT, "posix-display"),
+                // Owned by another user: a spawn of it runs with a real ID
+                // that differs from the effective one (AT_SECURE).
+                of(
+                    "/bin/posix-display-suid",
+                    0o4755,
+                    (1000, 100),
+                    Source::Variant {
+                        program: "posix-display",
+                        tag: "setid",
+                        // A file of its own: equal bytes would be one file.
+                        extra: 4096,
+                    },
+                ),
                 dir("/dev"),
             ];
             files.extend(devices());
@@ -1662,7 +1675,8 @@ mod tests {
         let big = Source::Variant {
             program: "p",
             tag: "big",
-            extra: 0x1000,
+            // A file of its own: equal bytes would be one file.
+            extra: 4096x1000,
         };
         let grown = big.bytes(|_| Ok(elf.clone())).unwrap();
         assert_eq!(

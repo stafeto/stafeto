@@ -18,8 +18,8 @@
 //!   already, ENOMEM past the limits); `unmap_buffer()` takes it out
 //!   (CLOSE, `exec`, exit), with the object's handle.
 //! * A forked child gets a session of its own (a CLONE the parent made,
-//!   `clone_session`), no owner session and no display piece: the hole
-//!   where the parent's buffer is faults on any touch. `munmap` and
+//!   `clone_session`), no owner session and no display piece: the
+//!   parent's address faults until something maps it. `munmap` and
 //!   `mprotect` on the piece give EINVAL.
 //!
 //! The session is cloned for every `fork` and spawn that has one: one
@@ -69,9 +69,10 @@ pub fn probe_swap_session(raw: u64) -> u64 {
 }
 
 /// A clone of the process's session for a child (proto_gpu CLONE), when it
-/// has one. A refusal (a service that ended or restarts, or is at its
-/// limit) fails no fork or spawn: the child gets no session; the line says
-/// so.
+/// has one. A refusal fails no fork or spawn: the child gets no session. A
+/// service that ended (PEER_CLOSED) closes the process's session, so that
+/// no later fork asks again and none writes a line; another refusal (the
+/// service at its limit) writes one.
 pub(crate) fn clone_session() -> Option<Handle<Channel>> {
     let display = session()?;
     match rt::service::clone_session(
@@ -79,6 +80,15 @@ pub(crate) fn clone_session() -> Option<Handle<Channel>> {
         &proto_gpu::Method::Clone.header().bytes(),
     ) {
         Ok(clone) => Some(clone),
+        Err(proto_wire::Status::Kernel(rt::abi::Error::PeerClosed)) => {
+            // The service ended (spec 3, 5.1): every session of it is dead
+            // until a new shell. This one closes and no fork asks again.
+            let raw = SESSION.swap(0, Ordering::AcqRel);
+            if raw != 0 {
+                drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+            }
+            None
+        }
         Err(status) => {
             rt::println!(
                 "posix: the display service refused a session for a child ({status:?}); the child has none"
