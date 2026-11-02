@@ -7,6 +7,7 @@
  * undefined symbol. "wait" waits for a byte on its input; "fork" and "exec"
  * go through fork and execv of itself. The output is one line per mode. */
 #include <errno.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +75,12 @@ int main(int argc, char **argv) {
         printf("so-hello: waiting\n");
         fflush(stdout);
         return read(0, &byte, 1) == 1 ? 0 : 1;
+    }
+    if (strcmp(mode, "quick") == 0) {
+        /* The counter at main, for the timing of the leader. */
+        uint64_t at;
+        __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(at)::"memory");
+        return write(1, &at, sizeof at) == (ssize_t)sizeof at ? 0 : 1;
     }
     if (strcmp(mode, "fork") == 0) {
         fflush(stdout);

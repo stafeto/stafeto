@@ -8,6 +8,8 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdint.h>
+#include <time.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -203,13 +205,94 @@ static void set_id(void) {
     check(64, "so-hello works again", error == 0 && exited_with(status, 0));
 }
 
-int main(void) {
+/* The time from posix_spawn to the main of the child, for a static child (this
+ * program in the role "quick") and a dynamic one (so-hello quick), the first
+ * run with no live process of the file (cold) and 20 more with one alive
+ * (warm). The child writes its counter at main to its output. */
+static uint64_t ticks(void) {
+    uint64_t value;
+    __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(value)::"memory");
+    return value;
+}
+
+static uint64_t tick_ns(uint64_t t) {
+    uint64_t hz;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+    return t / hz * 1000000000ULL + t % hz * 1000000000ULL / hz;
+}
+
+static uint64_t sample(const char *path, int *bad) {
+    char *argv[] = {(char *)path, (char *)"quick", NULL};
+    struct child c;
+    uint64_t t0 = ticks();
+    if (start(&c, argv) != 0) {
+        *bad = 1;
+        return 0;
+    }
+    uint64_t at = 0;
+    size_t have = 0;
+    while (have < sizeof at) {
+        ssize_t n = read(c.out, (char *)&at + have, sizeof at - have);
+        if (n <= 0) break;
+        have += (size_t)n;
+    }
+    char rest[16] = "";
+    int status = finish(&c, rest, sizeof rest);
+    if (have != sizeof at || !exited_with(status, 0) || at < t0) {
+        *bad = 1;
+        return 0;
+    }
+    return tick_ns(at - t0);
+}
+
+static int by_ns(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void spawn_times(void) {
+    static const char *const paths[2] = {"/bin/procs-child", "/bin/so-hello"};
+    static const char *const names[2] = {"static", "dynamic"};
+    int bad = 0;
+    for (int k = 0; k < 2; k++) {
+        uint64_t cold = sample(paths[k], &bad);
+        struct child holder;
+        char *wait_argv[] = {(char *)paths[k], (char *)"wait", NULL};
+        char line[64];
+        uint64_t warm[20];
+        if (start(&holder, wait_argv) != 0) {
+            bad = 1;
+            continue;
+        }
+        slurp(&holder, line, sizeof line, '\n');
+        for (int i = 0; i < 20; i++) warm[i] = sample(paths[k], &bad);
+        qsort(warm, 20, sizeof warm[0], by_ns);
+        printf("posix-so: spawn to main, %s: cold %llu ns, warm p50 %llu ns min %llu ns\n", names[k],
+               (unsigned long long)cold, (unsigned long long)warm[10], (unsigned long long)warm[0]);
+        if (write(holder.in, "x", 1) != 1) bad = 1;
+        finish(&holder, line, sizeof line);
+    }
+    check(128, "the spawn timing runs", !bad);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "quick") == 0) {
+        uint64_t at = ticks();
+        return write(1, &at, sizeof at) == (ssize_t)sizeof at ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "wait") == 0) {
+        char byte;
+        printf("posix-so: waiting\n");
+        fflush(stdout);
+        return read(0, &byte, 1) == 1 ? 0 : 1;
+    }
     signal(SIGPIPE, SIG_IGN);
     hello();
     shared();
     fork_and_exec();
     bad();
     set_id();
+    spawn_times();
     if (bits) {
         printf("posix-so: failed checks, bits %d\n", bits);
         return 1;

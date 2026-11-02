@@ -1719,7 +1719,12 @@ fn main() {
         }
         Some("posix-map") => posix_map_probe(),
         Some("libc-so") => libc_so(),
-        Some("posix-so") => posix_so_probe(),
+        Some("posix-so") => match args.get(1).map(String::as_str) {
+            None => posix_so_run(false),
+            // Instructions count as time, so the times of the spawns repeat.
+            Some("icount") => posix_so_run(true),
+            Some(other) => Err(format!("posix-so [icount], not {other}")),
+        },
         Some("posix-el2") => posix_el2_probes(),
         Some("posix-resources") => posix_resources_probe(),
         Some("posix-sync") => posix_sync_probe(),
@@ -4738,15 +4743,22 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
 /// one: the library from the table of images, the vector, the constructors
 /// and destructors, `fork` and `exec`, the programs the loader refuses.
 fn posix_so_probe() -> Result<(), String> {
+    posix_so_run(false)
+}
+
+fn posix_so_run(icount: bool) -> Result<(), String> {
     libc_so()?;
     busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-so.img", &POSIX_SO_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
+    if icount {
+        cmd.args(qemu::ICOUNT);
+    }
     let outcome = run_until(
         cmd,
-        Duration::from_secs(180),
+        Duration::from_secs(if icount { 600 } else { 180 }),
         Some("init: posix-procs ended:"),
         &kernel.elf,
     )?;
@@ -4755,6 +4767,9 @@ fn posix_so_probe() -> Result<(), String> {
         "init: posix-procs ended: exit code 0, not restarted",
     )?;
     qemu::expect_marker(&outcome, "posix-so: dynamic programs on libc.so ok")?;
+    for line in outcome.lines.iter().filter(|l| l.contains("spawn to main")) {
+        println!("{line}");
+    }
     Ok(())
 }
 
