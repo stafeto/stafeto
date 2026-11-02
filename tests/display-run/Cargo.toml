@@ -1,0 +1,20 @@
+[package]
+name = "display-run"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The program that starts the C probe of the screen and the keys (xtask display-probe) and the helper that ends the display service"
+build = "build.rs"
+
+[[bin]]
+name = "display-run"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt" }
+proto-gpu = { path = "../../proto/gpu" }
+rt = { path = "../../lib/rt" }

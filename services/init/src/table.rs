@@ -908,7 +908,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
-    + cfg!(feature = "table-posix-display") as usize;
+    + cfg!(feature = "table-posix-display") as usize
+    + cfg!(feature = "table-display") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -958,7 +959,8 @@ const _: () = assert!(
     feature = "table-gpu",
     feature = "table-input",
     feature = "table-posix-random",
-    feature = "table-posix-display"
+    feature = "table-posix-display",
+    feature = "table-display"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1043,6 +1045,8 @@ pub const TABLE: &[Record] = input::TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
+#[cfg(feature = "table-display")]
+pub const TABLE: &[Record] = ramfs::DISPLAY_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1788,6 +1792,7 @@ mod tests {
             ramfs::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,
             ramfs::POSIX_POLL_TABLE,
             ramfs::POSIX_SOCK_TABLE,
@@ -2050,6 +2055,7 @@ mod tests {
             vz::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());
@@ -2066,6 +2072,7 @@ mod tests {
                     "rtbench-posix",
                     "posix-random",
                     "posix-display",
+                    "display-run",
                     "posix-pty",
                 ]
                 .contains(&r.program)

@@ -1883,6 +1883,8 @@ fn move_files(c: &Handle<Channel>) -> bool {
     if !crate::shared::abandon_holds() {
         return false;
     }
+    // The screen goes back with the old image (spec 3, 3.5).
+    crate::display::release_for_exec();
     let mut kept = [rt::fs::PreparedOpen {
         fd: 0,
         slot: 0,

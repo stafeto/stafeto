@@ -912,6 +912,43 @@ pub const POSIX_DISPLAY_TABLE: &[Record] = &[
     },
 ];
 
+/// The probe of the screen and the keys on libc.so (tests/display-run and
+/// tests/posix-so/dyn/display-probe.c, sub-project 3 part 3b): the RAM
+/// files, the process and clock services, the pipe service, the input
+/// service and the display service (which may grant the focus). The first
+/// launcher has a session with the display service and runs the C probe's
+/// whole sequence; the second has none (its `connects` lack `gpu`) and runs
+/// the role of an image without a display service.
+pub const DISPLAY_TABLE: &[Record] = &[
+    RAM_FIFO_CLOCKED,
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 5 * PROCS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    super::input::INPUT,
+    super::input::GPU,
+    Record {
+        name: "display-run",
+        program: "display-run",
+        args: b"display-run\0run\0",
+        connects: &["ramfs", "pipe", "clock", "posix", "gpu"],
+        root: true,
+        quota: PROCS_QUOTA,
+        ..POSIX
+    },
+    Record {
+        name: "display-run-b",
+        program: "display-run",
+        args: b"display-run\0nogpu\0",
+        connects: &["ramfs", "pipe", "clock", "posix"],
+        root: false,
+        quota: PROCS_QUOTA,
+        ..POSIX
+    },
+];
+
 /// Functional loader channel probe with the process probe's ordinary image.
 pub const LOADER_CHANNELS_TABLE: &[Record] = &[
     super::normal::TABLE[0],
