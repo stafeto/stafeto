@@ -29,14 +29,19 @@ pub const MAP_PRIVATE: i32 = 2;
 pub const MAP_FIXED: i32 = 0x10;
 pub const MAP_ANONYMOUS: i32 = 0x20;
 
-/// The access `prot` asks for: write means read too, and code is not
-/// allowed (EACCES: the layer's objects carry no MAP_EXEC).
+/// The access `prot` asks for: write means read too, and code means read
+/// too. Write together with code is ENOTSUP: no page is writable and
+/// executable at once (the kernel has no such access, and SCTLR_EL1.WXN
+/// forbids it).
 fn access_of(prot: i32) -> Result<Access, i32> {
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return Err(EINVAL);
     }
     if prot & PROT_EXEC != 0 {
-        return Err(EACCES);
+        if prot & PROT_WRITE != 0 {
+            return Err(ENOTSUP);
+        }
+        return Ok(Access::ReadExec);
     }
     Ok(match prot & (PROT_READ | PROT_WRITE) {
         0 => Access::None,
@@ -228,6 +233,10 @@ fn mmap0(
         return Err(EINVAL);
     }
     let shared = kind == MAP_SHARED;
+    // Code in a shared mapping waits for a consumer (spec 2, 3.4).
+    if shared && access == Access::ReadExec {
+        return Err(ENOTSUP);
+    }
     let pages = whole_pages(len)?;
     // Under mlockall(MCL_FUTURE) a mapping is to be locked (EAGAIN past
     // the limit of locked memory).
@@ -258,6 +267,9 @@ fn mmap0(
     };
     // An object that is there already is mapped as asked at once; a new one
     // is written first (zeros, or the file) and gets its access after.
+    // Pages of code have an object of their own, so that they do not cut the
+    // heap into pieces of writable and executable pages.
+    let code = access == Access::ReadExec;
     let first = if source.existing.is_some() {
         access
     } else {
@@ -271,7 +283,7 @@ fn mmap0(
                 return Err(ENOMEM);
             }
             release(state, addr, pages)?;
-            if !shared && state.space.all(addr, pages, Page::Free) {
+            if !shared && !code && state.space.all(addr, pages, Page::Free) {
                 state.take_at(addr, pages).map(|()| {
                     // SAFETY: the heap gave these pages to this caller alone.
                     unsafe { core::ptr::write_bytes(addr as *mut u8, 0, pages * PAGE) };
@@ -282,7 +294,7 @@ fn mmap0(
                     .make_own(Some(addr), pages, first, shared, source, 0)
                     .map(|(_, at)| at)
             }
-        } else if shared || pages >= OWN_FROM {
+        } else if shared || code || pages >= OWN_FROM {
             state
                 .make_own(None, pages, first, shared, source, 0)
                 .map(|(_, at)| at)
@@ -505,6 +517,15 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
                 .any(|(i, ..)| !state.map.object(state.map.piece(i).object()).may_write)
         {
             return Err(EACCES);
+        }
+        // Code in a shared mapping waits for a consumer (spec 2, 3.4).
+        if access == Access::ReadExec
+            && state
+                .map
+                .walk(addr, pages)
+                .any(|(i, ..)| state.map.object(state.map.piece(i).object()).shared)
+        {
+            return Err(ENOTSUP);
         }
         if state.map.meets_display(addr, pages) {
             return Err(EINVAL);

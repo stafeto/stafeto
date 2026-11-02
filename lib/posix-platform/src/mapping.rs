@@ -14,9 +14,9 @@ use super::files::{Place, read_at, write_at};
 use core::ffi::{c_int, c_void};
 #[cfg(feature = "map-probe")]
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM};
+use posix_abi::constants::{EACCES, EBADF, EBUSY, EINVAL, EIO, ENODEV, ENOMEM, ENOTSUP};
 use posix_abi::mmap::{
-    self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
+    self, Back, FilePiece, MAP_ANONYMOUS, MAP_SHARED, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE,
 };
 use posix_fs::PinRef;
 
@@ -328,6 +328,11 @@ fn file_mapping(
     if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 && !writing {
         return Err(EACCES);
     }
+    // Code in a shared mapping waits for a consumer (spec 2, 3.4); the
+    // refusal comes before the pin is taken.
+    if flags & MAP_SHARED != 0 && prot & PROT_EXEC != 0 {
+        return Err(ENOTSUP);
+    }
     if flags & MAP_SHARED == 0 {
         return private_file(addr, len, prot, flags, fd, offset);
     }
@@ -373,7 +378,11 @@ fn private_file(
     fd: c_int,
     offset: u64,
 ) -> Result<usize, c_int> {
-    let address = mmap::mmap(addr, len, prot | PROT_WRITE, flags, None)?;
+    // Written first, then given its access: code is not writable.
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return Err(ENOTSUP);
+    }
+    let address = mmap::mmap(addr, len, (prot & !PROT_EXEC) | PROT_WRITE, flags, None)?;
     // The whole of the last page too: the file shows through it up to its end.
     fill(Place::Fd(fd), address, len.div_ceil(PAGE) * PAGE, offset);
     if prot & PROT_WRITE == 0

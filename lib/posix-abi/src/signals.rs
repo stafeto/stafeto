@@ -1995,6 +1995,17 @@ unsafe fn fault_entry(native: *mut upcall::Context) {
     // SAFETY: the entry's frame.
     let (sp, pc) = unsafe { ((*native).sp, (*native).pc) };
     let mut fault = posix_signals::fault(cause.esr, cause.far, pc, sp);
+    // A data access to a whole page past the end of a mapped file is SIGBUS
+    // (XSH mmap): the layer keeps such pages without access, so the
+    // hardware says permission. Bit 6 of the syndrome is the write bit.
+    if fault.signal == SIGSEGV
+        && fault.code == posix_types::constants::SEGV_ACCERR
+        && (cause.esr >> 26) & 0x3f == 0x24
+        && crate::mmap::is_past_end(fault.address as usize, cause.esr & (1 << 6) != 0)
+    {
+        fault.signal = SIGBUS;
+        fault.code = posix_types::constants::BUS_ADRERR;
+    }
     let block = own();
     let bit = posix_signals::bit(fault.signal).expect("a signal of the table");
     if crate::altstack::overflowed(sp)
