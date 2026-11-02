@@ -197,10 +197,13 @@ const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 /// (forty searches with three misses each run in the dialog) and the reserve
 /// of the loaders. The bash dialog holds a shell, its pipelines of three
 /// stages (each stage a copy of bash until it execs) and a command
-/// substitution, each with the quota above: with 1 160 pages of quota it
-/// passes with 9 500 pages and fails with 9 000 (bisected on bash-dialog);
-/// 10 450 pages leave 10.0%.
-const BUSYBOX_DIALOG_POOL: u64 = 10450 * PAGE;
+/// substitution, each with the quota above, less the pages of bash's code
+/// and read-only data for a copy of the shell (a child of fork shares them
+/// with its parent and does not pay for them, spec 2, 3.12.2): with 1 160
+/// pages of quota it passes with 8 750 pages and fails with 8 625 (bisected
+/// on bash-dialog; before the table of images 9 375 passed and 9 250 did
+/// not); 9 625 pages leave 10.0%.
+const BUSYBOX_DIALOG_POOL: u64 = 9625 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,

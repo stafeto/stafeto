@@ -5442,7 +5442,7 @@ fn check_heartbeats(lines: &[String]) -> Result<(), String> {
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 24] = [
+const STEP_KINDS: [(usize, &str); 25] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -5457,6 +5457,7 @@ const STEP_KINDS: [(usize, &str); 24] = [
     (23, "Boot"),
     (24, "Take"),
     (25, "SpawnCommit"),
+    (46, "Image"),
     (28, "ExecStart"),
     (29, "ExecCommit"),
     (31, "Replace"),
@@ -6191,12 +6192,12 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     // The resource and descriptor-exec exercise runs while the crowd is live.
     // Every newly introduced dispatch is measured, with the part's 10% reserve.
     for (service, measured, kinds) in [
-        // 58 Timer, 59 Queue, 60 Share, 61 ShareGrant, 62 List and 65, the
-        // expiry of timers (a notice the service counts apart).
+        // 46 Image, 58 Timer, 59 Queue, 60 Share, 61 ShareGrant, 62 List and
+        // 65, the expiry of timers (a notice the service counts apart).
         (
             "process",
             &rows,
-            &[55usize, 56, 57, 58, 59, 60, 61, 62, 65][..],
+            &[46usize, 55, 56, 57, 58, 59, 60, 61, 62, 65][..],
         ),
         ("RAM", &ram, &[3usize, 59, 62][..]),
     ] {
