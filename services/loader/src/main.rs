@@ -1400,10 +1400,7 @@ fn load(
     };
     let info = file_info(own, &image)?;
     let size = info.size;
-    let mut head = [0; PAGE as usize];
-    let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
-    let layout =
-        elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)?;
+    let layout = program_layout(&image, size)?;
     // A dynamic program brings libc.so, checked before anything is mapped.
     let library = match layout.kind {
         elf::Kind::Static => None,
@@ -1479,6 +1476,21 @@ fn map_segments(
     Ok(())
 }
 
+/// The layout of the program in `image`, read from the first page of the
+/// file (the page is on this call's stack alone, not the caller's).
+fn program_layout(image: &Handle<Channel>, size: u64) -> Result<elf::Layout, u32> {
+    let mut head = [0; PAGE as usize];
+    let read = read_at(image, 0, &mut head[..size.min(PAGE) as usize])?;
+    elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)
+}
+
+/// The layout of libc.so in `session`, as `program_layout`.
+fn library_layout(session: &Handle<Channel>, size: u64) -> Result<elf::Library, u32> {
+    let mut head = [0; PAGE as usize];
+    let read = read_at(session, 0, &mut head[..size.min(PAGE) as usize])?;
+    elf::library(&head[..read], size, pl::LIBRARY_ROOM.clone()).map_err(|_| pl::NOT_EXEC)
+}
+
 /// libc.so as `load` needs it: its image session, the metadata the table
 /// of images names its objects by, and its layout.
 struct Library {
@@ -1500,10 +1512,7 @@ fn open_library(own: &Own) -> Result<Library, u32> {
     if info.permissions & 0o6000 != 0 {
         return Err(pl::NOT_EXEC);
     }
-    let mut head = [0; PAGE as usize];
-    let read = read_at(&session, 0, &mut head[..info.size.min(PAGE) as usize])?;
-    let layout = elf::library(&head[..read], info.size, pl::LIBRARY_ROOM.clone())
-        .map_err(|_| pl::NOT_EXEC)?;
+    let layout = library_layout(&session, info.size)?;
     // Every TLS relocation of the program and of libc.so lands in the one
     // template of libc.so.
     if layout.tls.is_none() {
@@ -1534,16 +1543,14 @@ impl dynlink::Memory for Space {
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), dynlink::Fault> {
         // SAFETY: see Space: the range is inside a mapped segment of
         // read-write data, which is the process's own.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
-        };
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
         Ok(())
     }
 }
 
-/// The largest `PT_DYNAMIC` the loader reads: 256 entries (a program of
-/// the toolchain has about 25).
-const DYNAMIC_MAX: usize = 4096;
+/// The largest `PT_DYNAMIC` the loader reads: 64 entries (libc.so and a
+/// program of the toolchain have about 30), on a stack of four pages.
+const DYNAMIC_MAX: usize = 1024;
 
 /// The module of a file mapped by `load`: its segments, its `PT_DYNAMIC`
 /// parsed and every table it names checked.
@@ -1993,8 +2000,8 @@ fn finish(
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
     let secure = c.uid != c.euid || c.gid != c.egid;
-    let flags = if secure { pl::SECURE } else { 0 }
-        | if dynamic.is_some() { pl::DYNAMIC } else { 0 };
+    let flags =
+        if secure { pl::SECURE } else { 0 } | if dynamic.is_some() { pl::DYNAMIC } else { 0 };
     let process = own.process.raw().0;
     let mut handles = [0; SLOTS];
     handles[Slot::Process as usize] = keep(own.process);
@@ -2042,7 +2049,7 @@ fn finish(
             let Some(room) = area.get_mut(at..at + 16 * pairs.len()) else {
                 return GAVE_UP;
             };
-            for (slot, (key, value)) in room.chunks_exact_mut(16).zip(pairs) {
+            for (slot, (key, value)) in room.as_chunks_mut::<16>().0.iter_mut().zip(pairs) {
                 slot[..8].copy_from_slice(&key.to_le_bytes());
                 slot[8..].copy_from_slice(&value.to_le_bytes());
             }
@@ -2050,7 +2057,15 @@ fn finish(
         }
     };
     let staging = (block_len as u64).next_multiple_of(PAGE);
-    drop((image, library, own.files, own.clock, own.identity, start, session));
+    drop((
+        image,
+        library,
+        own.files,
+        own.clock,
+        own.identity,
+        start,
+        session,
+    ));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {
         sys::mem_unmap(
