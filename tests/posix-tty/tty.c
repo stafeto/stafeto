@@ -774,7 +774,8 @@ static int catch_winch(void) {
 /* Live members have distinct signal pages and routers. A walk delivers to
  * several members per step and scans at most 256 slots. The terminal waits
  * for the process service's answer to the request alone, so the size of the
- * group does not lengthen the wait: 16 members make one step, 64 make four.
+ * group does not lengthen the wait: 16 members make two steps of the walk,
+ * 64 make eight.
  * A record has at most 32 children, so a crowd of 64 grows in branches of
  * 16: a branch is a child of the caller with 15 children of its own. */
 static void crowd_member(int ready_fd) {
@@ -787,7 +788,9 @@ static void crowd_member(int ready_fd) {
     /* The last member of 64 is forked long after the first, and a timeout of
      * sleeps runs out at once while the machine is idle: wait for the signal
      * itself, with the signal blocked until the wait. */
+    alarm(300);
     while (winches == 0) sigsuspend(&old);
+    alarm(0);
     sigprocmask(SIG_SETMASK, &old, NULL);
     if (winches != 1) say("posix-tty: crowd handler count %d\n", (int)winches);
     if (winches != 1) _exit(121);
@@ -851,6 +854,53 @@ static int terminal_crowd(int members) {
 
 static volatile sig_atomic_t hups;
 static void on_hup(int signal) { if (signal == SIGHUP) ++hups; }
+
+static volatile sig_atomic_t burst[3];
+static void on_burst(int signal) {
+    ++burst[signal == SIGINT ? 0 : signal == SIGQUIT ? 1 : 2];
+}
+
+static int job_foreground(int fd, pid_t group);
+
+/* Three signals of the terminal typed at once reach the foreground group,
+ * each once. The process service of this image queues one walk of the
+ * terminal, so the second and third are refused with AGAIN until the first
+ * walk is over, and the terminal service sends them again. */
+static int terminal_burst(int tty) {
+    int ready[2];
+    if (pipe(ready) != 0) return 140;
+    pid_t child = fork();
+    if (child < 0) return 141;
+    if (child == 0) {
+        sigset_t block, old;
+        sigemptyset(&block);
+        sigaddset(&block, SIGINT);
+        sigaddset(&block, SIGQUIT);
+        sigaddset(&block, SIGTSTP);
+        struct sigaction action = {0};
+        action.sa_handler = on_burst;
+        sigemptyset(&action.sa_mask);
+        if (setpgid(0, 0) != 0 || sigprocmask(SIG_BLOCK, &block, &old) != 0) _exit(142);
+        if (sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGQUIT, &action, NULL) != 0 ||
+            sigaction(SIGTSTP, &action, NULL) != 0 || write(ready[1], "r", 1) != 1) _exit(143);
+        alarm(300);
+        while (burst[0] == 0 || burst[1] == 0 || burst[2] == 0) sigsuspend(&old);
+        _exit(burst[0] == 1 && burst[1] == 1 && burst[2] == 1 ? 0 : 144);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 145;
+    if (job_foreground(tty, child) != 0) return 146;
+    say("posix-tty: type three signals\n");
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        say("posix-tty: burst status %d\n", status);
+        return 147;
+    }
+    if (job_foreground(tty, getpgrp()) != 0) return 148;
+    if (close(ready[0]) != 0 || close(ready[1]) != 0) return 149;
+    say("posix-tty: three signals in a row ok\n");
+    return 0;
+}
 
 static int job_foreground(int fd, pid_t group) {
     sigset_t block, old;
@@ -1125,7 +1175,7 @@ static int leader(pid_t other_group) {
     if (crowd_error != 0) return crowd_error;
     crowd_error = terminal_crowd(64);
     if (crowd_error != 0) return crowd_error;
-    return 0;
+    return terminal_burst(tty);
 }
 
 /* Sessions and the controlling terminal: "run" has none, its child A

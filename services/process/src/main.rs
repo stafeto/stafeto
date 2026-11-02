@@ -101,10 +101,11 @@ struct Walking {
     refused: bool,
     denied: bool,
 }
-/// What one step of the walk of a TtySignal may spend (`tty_walk_step`): 16
+/// What one step of the walk of a TtySignal may spend (`tty_walk_step`): 8
 /// units, a delivery costing one and the delivery of SIGCONT to a stopped
 /// process (a process control, a report to the parent, an answer to its
-/// wait and a SIGCHLD) four; or looks at all the places of the table.
+/// wait and a SIGCHLD) two; or looks at all the places of the table. With
+/// 16 units a crowd of 64 made a step of 19,735 ticks, past 0.9 B of 18,369.
 const TTY_UNITS: usize = 8;
 const TTY_CONTINUE: usize = 2;
 const TTY_LOOKS: usize = RECORDS;
@@ -112,10 +113,18 @@ const TTY_LOOKS: usize = RECORDS;
 /// terminal service is answered when its request is taken, and its next
 /// request (SIGCONT after SIGHUP of a session's end) queues behind.
 const TTY_QUEUE: usize = 4;
+/// The places in use: the image of the terminal probe queues one walk, so
+/// that the refusal with AGAIN and the terminal service's second try run.
+const TTY_PLACES: usize = if cfg!(feature = "tty-probe") {
+    1
+} else {
+    TTY_QUEUE
+};
 /// The walk of a TtySignal. Its request was answered when it was taken;
 /// only the probe of a newborn (`probe_newborn`) waits for the end.
 struct TtyWalking {
     walk: Walk,
+    pgid: u32,
     pending: Option<Pending>,
     signal: u8,
     delivered: bool,
@@ -194,7 +203,7 @@ const TTY_STEP: u64 = 1 << 63 | 0xFFFC;
 /// runs: the service is at 52 and the terminal service at 50, so the step is
 /// at 49, and the terminal service, once its request is answered, runs ahead
 /// of the walk and does not wait for all of it.
-const TTY_STEP_BELOW: u8 = 3;
+const TTY_STEP_BELOW: u8 = proto_process::TTY_STEP_BELOW;
 /// The label of the service's timer of the processes' timers (`timers`),
 /// a service label no record has. The heartbeat's timer has label 0.
 const TIMERS: u64 = 1 << 63 | 0xFFFE;
@@ -528,7 +537,19 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     owner.tty_step = Some(tty_step);
-    owner.loop_thread = sys::self_thread_shared().ok();
+    // The loop's thread must be able to take the lower level for the walks
+    // of the terminal: without it the terminal would wait for the whole of
+    // each walk, so the service does not start.
+    let Ok(me) = sys::self_thread_shared() else {
+        return 7;
+    };
+    let low = level.saturating_sub(TTY_STEP_BELOW);
+    if sys::thread_set_priority(&me, low, abi::Policy::Fifo).is_err()
+        || sys::thread_set_priority(&me, level, abi::Policy::Fifo).is_err()
+    {
+        return 7;
+    }
+    owner.loop_thread = Some(me);
     // The notice of the second portion of a Create, at the loop's level
     // (the receiving thread that asks works there).
     let Ok(creating) = sys::handle_label(&channel, Rights::NOTIFY, CREATING, level) else {
@@ -2681,11 +2702,25 @@ impl Processes {
         {
             return refuse(proto_process::ORPHAN);
         }
-        let Some(place) = self.tty_walks.iter().position(Option::is_none) else {
+        // A walk that waits for its turn and has the group and the signal
+        // of this one delivers it already: they merge (a signal that waits
+        // does not pile up, as for a process).
+        if self.tty_walks[1..]
+            .iter()
+            .flatten()
+            .any(|w| w.pgid == pgid && w.signal == signal)
+        {
+            return Answer::Status(Status::Ok);
+        }
+        let Some(place) = self.tty_walks[..TTY_PLACES]
+            .iter()
+            .position(Option::is_none)
+        else {
             return refuse(proto_process::AGAIN);
         };
         self.tty_walks[place] = Some(TtyWalking {
             walk: Walk::new(Target::Group(pgid), RECORDS),
+            pgid,
             pending: None,
             signal,
             delivered: false,
@@ -2811,6 +2846,7 @@ impl Processes {
         self.tty_level(true);
         self.tty_walks[0] = Some(TtyWalking {
             walk: Walk::passed(Target::Group(pgid), index),
+            pgid,
             pending: Some(pending),
             signal: 28,
             delivered: false,

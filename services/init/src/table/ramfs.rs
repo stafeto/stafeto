@@ -812,6 +812,11 @@ pub const TTY: Record = Record {
     ..RAM_BASE
 };
 
+// The loop of the process service works at this level while walks of the
+// terminal are queued (TtySignal): below the terminal service, so that the
+// terminal runs ahead of the walk. Spec 2, 2.
+const _: () = assert!(PROCESS_LEVEL - proto_process::TTY_STEP_BELOW < TTY.priority);
+
 /// The probe of the terminal service (tests/tty, xtask tty): the console's
 /// driver, the service and the probe, a client of it.
 pub const TTY_TABLE: &[Record] = &[

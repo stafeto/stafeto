@@ -9,8 +9,9 @@
 //! so nothing there has a meaning: the thread takes it and drops it, one
 //! receive at a time, each a call of the kernel bounded on its own. No
 //! step of the loop empties the channel, and none grows with the number
-//! of processes. The thread works at the loop's level and runs whenever
-//! the loop waits; its stack and message buffer are its own.
+//! of processes. The thread works at the service's level, also while the
+//! loop's thread is at the lower level of the walks of the terminal, and
+//! runs whenever the loop waits; its stack and message buffer are its own.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use rt::handle::{Channel, Handle, Process, Thread};

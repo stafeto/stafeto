@@ -696,7 +696,35 @@ The steps of T_i are bound by their own lines, so `xtask` bounds own(S) with
 B and each wait with CALL_WAIT_MAX. The longest step of the process service
 is a portion of its loads, at most B, so one send of the terminal or of
 ramfs to the process service waits two steps and a round trip in the worst
-case. The send of a TtySignal is no exception: the process service answers it when the request is taken, once its checks pass and the walk has a place among the four it queues, and walks the group afterwards, in the order of the requests, a step at a time. A step of the walk spends 16 units: a delivery costs one, the delivery of SIGCONT to a stopped process (a process control, a report to the parent, an answer to its wait and a SIGCHLD) four, a look at a place its share of the 256. While walks are queued the loop's thread works at a level below the terminal service's (49, back to 52 when the last walk ends), so the next request of the terminal goes before the next step and the terminal, once answered, runs ahead of the walk. The terminal waits a round trip and, when a step is on, the rest of that step, whatever the number G of processes of the group; the probes of `posix-tty-steps` hold a group of 64 and a departed session with 16 stopped members under 48,000, and a step of kind 65 of the process service under 0.9 B, 18,369. The heartbeat of a service to init (the wait for init, without the
+case. The send of a TtySignal is no exception: the process service
+answers it when the request is taken, once its checks pass and the walk
+has a place among the four it queues (a walk with the group and the
+signal of one that waits merges with it; with no place free the answer
+is AGAIN, and the terminal service sends the signal again after 2 ms),
+and walks the group afterwards, in the order of the requests, a step at
+a time. A step of the walk spends 8 units: a delivery costs one, the
+delivery of SIGCONT to a stopped process (a process control, a report to
+the parent, an answer to its wait and a SIGCHLD) two, a look at a place
+its share of the 256. With 16 units a crowd of 64 made a step of 19,735
+ticks, past 0.9 B of 18,369; with 8 it stays under. While walks are
+queued the loop's thread works at a level below the terminal service's
+(49, back to 52 when the last walk ends), so the next request of the
+terminal goes before the next step and the terminal, once answered, runs
+ahead of the walk. The terminal waits a round trip and, when a step is
+on, the rest of that step, whatever the number G of processes of the
+group; the probes of `posix-tty-steps` hold a group of 64 and a departed
+session with 16 stopped members under 48,000, and a step of kind 65 of
+the process service under 0.9 B, 18,369. The worst step is not measured:
+a full table of 256 places with up to 8 deliveries in one step (4 when
+they are SIGCONT to stopped processes) has no probe, and the bound of
+0.9 B rests on the crowds of the probes. Two assumptions carry the wait:
+the thread at 49 is not raised for the requests that stand in the queue
+(the kernel raises a thread by the client only when it receives the
+request), so the terminal waits for the rest of a step, and nothing else
+runs at 50 or 51 (no service of any table does; the probe thread `long`
+of the kernel tests is the one exception). The init table checks that
+the level of the walk lies below the terminal service's.
+The heartbeat of a service to init (the wait for init, without the
 preemption after its answer) is bounded in the same way: C_ipc, init's
 longest step (at most 8,555 ticks in the steps run) and, for each of the
 other services, the heartbeat step of init and C_ipc, about 34,000 ticks
