@@ -14,8 +14,7 @@ results from the cache variables below, each the answer of the layer. htop
 reads the process list, the CPU times and the memory from /proc, which the
 process service provides. The result is one relocatable object,
 target/htop/htop.o, that exports `main` alone: the names of htop's own
-helpers cannot meet relibc's or the program's. tests/htop links it with
-relibc's libc.a and posix-crt.
+helpers cannot meet relibc's or the program's. tools/build-libc-so.py programs links it against libc.so.
 
 htop is GPL-2.0-or-later: the archive is fetched at build time with its
 SHA-256 checked, as BusyBox is, and the image's licence notices name it."""

@@ -11,8 +11,8 @@ readline and termcap library that come with bash, and no message catalogs. The
 tests of `configure` that would run a program on the target take their results
 from the cache variables below, each the answer of the layer. The result is
 one relocatable object, target/bash/bash.o, that exports `main` alone: the
-names of bash's own helpers cannot meet relibc's or the program's. tests/bash
-links it with relibc's libc.a and posix-crt.
+names of bash's own helpers cannot meet relibc's or the program's. tools/build-libc-so.py programs
+links it against libc.so.
 
 bash is GPL-3.0-or-later: the archive is fetched at build time with its
 SHA-256 checked, as BusyBox is, and the image's licence notices name it."""

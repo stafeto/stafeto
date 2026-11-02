@@ -13,7 +13,7 @@ several hard links once by its device and inode, and reads the type of the
 file system with statfs when the `-x` or `--exclude-kernfs` option asks. The
 result is one relocatable object, target/ncdu/ncdu.o, that exports `main`
 alone: the names of ncdu's own helpers cannot meet relibc's or the program's.
-tests/ncdu links it with relibc's libc.a and posix-crt.
+tools/build-libc-so.py programs links it against libc.so.
 
 ncdu is MIT: the archive is fetched at build time with its SHA-256 checked,
 as BusyBox is, and the image's licence notices name it."""
