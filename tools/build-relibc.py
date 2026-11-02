@@ -121,8 +121,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # streams), exit leaves a stream with an empty write buffer alone, fdopen of a
 # negative number is EBADF, execvp stops its search after the shell, posix_spawnp
 # with a slash runs a script, a damaged line of /etc/services is passed over;
-# tagged pin-2688672c.
-COMMIT = "2688672cfd78688491ddd8dfd03dfadf277f46c3"
+# tagged pin-2688672c. A new thread waits for the creator to register it, so
+# pthread_create returns in the creator first; tagged pin-c5be8d7c.
+COMMIT = "c5be8d7c812a7541436b54f7da0ef851f43bc65c"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

@@ -164,7 +164,18 @@ pub unsafe fn cleanup_pop(_node: *mut Cleanup, execute: c_int) {
     unsafe { __relibc_internal_pthread_cleanup_pop(execute) }
 }
 
+/// `struct sched_param`.
+#[repr(C)]
+pub struct SchedParam {
+    pub sched_priority: c_int,
+}
+
 unsafe extern "C" {
+    pub fn pthread_setschedparam(
+        thread: pthread_t,
+        policy: c_int,
+        param: *const SchedParam,
+    ) -> c_int;
     pub fn pthread_create(
         thread: *mut pthread_t,
         attr: *const Attr,

@@ -1703,6 +1703,8 @@ pub(crate) fn probe_window(site: u32) {
     while parks() == before && !rt::time::reached(end) {
         let _ = sys::yield_now();
     }
+    // The creator has seen the flag and forked: the next case starts clear.
+    WINDOW_REACHED.store(0, Ordering::SeqCst);
 }
 
 /// The probe of a park with a request pending: the calling thread defers

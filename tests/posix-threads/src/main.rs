@@ -114,6 +114,29 @@ static CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(feature = "cancel-input"))]
 const VALUE: usize = 0x5678;
 
+/// The level of SCHED_OTHER and of the main thread in these guests.
+#[cfg(not(feature = "cancel-input"))]
+const TOP_LEVEL: u8 = 30;
+
+/// Moves the calling thread to kernel level `level` (below the top) the way
+/// a program does, with pthread_setschedparam and SCHED_RR; true when the
+/// thread's base is that level afterwards.
+#[cfg(not(feature = "cancel-input"))]
+fn lower_to(level: u8) -> bool {
+    let priority = i32::from(level) + 32 - i32::from(TOP_LEVEL);
+    let param = ffi::SchedParam {
+        sched_priority: priority,
+    };
+    let me = ffi::pthread_self();
+    if unsafe { ffi::pthread_setschedparam(me, 2, &param) } != 0 {
+        return false;
+    }
+    let Ok(native) = (unsafe { threads::probe_native(me) }) else {
+        return false;
+    };
+    sys::thread_info(&native).is_ok_and(|info| info.base == level)
+}
+
 /// Ends its thread with thread_exit, past the library: no EXIT reaches the
 /// owner, only the kernel's notification of the thread's end.
 #[cfg(not(feature = "cancel-input"))]
