@@ -49,6 +49,8 @@ use rt::{loader, msgbuf};
 rt::entry!(main);
 
 const PAGE: u64 = 4096;
+/// The bytes of a program header (AT_PHENT).
+const PHDR_SIZE: u64 = 56;
 /// Where the loader keeps its copy of the block, in its own region.
 const STAGING: u64 = LOADER_BASE + (4 << 20);
 /// Where it maps the parent's block to copy it.
@@ -239,7 +241,20 @@ struct Loaded {
     entry: u64,
     image: Handle<Channel>,
     maps: Maps,
+    /// libc.so and the vector of a dynamic program.
+    dynamic: Option<Dynamic>,
     given: [Option<Handle<Channel>>; SLOTS],
+}
+
+/// What a dynamic program adds to a loaded one: the image session of
+/// libc.so, which closes with the program's, and the values of the
+/// auxiliary vector that the loader knows once the program is linked
+/// (spec 2, 3.12.3, 3.12.4).
+struct Dynamic {
+    library: Handle<Channel>,
+    phdr: u64,
+    phnum: u64,
+    tls_header: u64,
 }
 
 /// One object `load` mapped, which the program's memory map keeps (spec 2,
@@ -377,7 +392,7 @@ mod auth_probe;
 fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Done> {
     let mut block_len = None;
     let mut exec_source: Option<(Handle<Channel>, rt::fs::PreparedOpen)> = None;
-    let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
+    let mut loaded: Option<(u64, Handle<Channel>, Maps, Option<Dynamic>)> = None;
     let mut fork: Option<(Fork, &'static mut Scratch)> = None;
     let mut copied = false;
     // The sessions the block's descriptors need (Block::needs).
@@ -394,12 +409,13 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
         if ready && (!completed || (0..SLOTS).any(|i| needed[i] && given[i].is_none())) {
             return None;
         }
-        if ready && let Some((entry, image, maps)) = loaded.take() {
+        if ready && let Some((entry, image, maps, dynamic)) = loaded.take() {
             return Some(Done::Loaded(Loaded {
                 block_len: block_len?,
                 entry,
                 image,
                 maps,
+                dynamic,
                 given,
             }));
         }
@@ -1365,7 +1381,7 @@ fn load(
     own: &Own,
     block: &Block<'_>,
     source: Option<(Handle<Channel>, rt::fs::PreparedOpen)>,
-) -> Result<(u64, Handle<Channel>, Maps), u32> {
+) -> Result<(u64, Handle<Channel>, Maps, Option<Dynamic>), u32> {
     let image = if let Some((source, held)) = source {
         let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
             Handle::from_raw(own.files.raw()),
@@ -1388,24 +1404,26 @@ fn load(
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
         elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)?;
-    // Dynamic programs wait for their own loading path.
-    if layout.kind != elf::Kind::Static {
-        return Err(pl::NOT_EXEC);
-    }
+    // A dynamic program brings libc.so, checked before anything is mapped.
+    let library = match layout.kind {
+        elf::Kind::Static => None,
+        elf::Kind::Dynamic => Some(open_library(own)?),
+    };
     let mut maps = Maps::default();
-    for part in Part::ALL {
-        let load = &layout.segments[part as usize];
-        if !load.is_empty() {
-            // The code and the read-only data of a file are one object for
-            // all the processes that run it (spec 2, 3.12.2).
-            let key = match part {
-                Part::Code => Some(image_key(&info, proto_process::IMAGE_CODE)),
-                Part::Rodata => Some(image_key(&info, proto_process::IMAGE_RODATA)),
-                Part::Data => None,
-            };
-            segment(own, &image, load, part, &mut maps, key.as_ref())?;
+    map_segments(own, &image, &info, &layout.segments, &mut maps)?;
+    let dynamic = match library {
+        None => None,
+        Some(library) => {
+            map_segments(
+                own,
+                &library.session,
+                &library.info,
+                &library.layout.segments,
+                &mut maps,
+            )?;
+            Some(link(&layout, library)?)
         }
-    }
+    };
     // The stack the file asks for (PT_GNU_STACK), at least 64 KiB.
     let stack_size = pl::stack_size(layout.stack);
     let stack = sys::mem_create(stack_size).map_err(code)?;
@@ -1435,7 +1453,158 @@ fn load(
     )
     .map_err(code)?;
     keep_region(&mut maps, &start, START_AREA, area, Access::ReadWrite)?;
-    Ok((layout.entry, image, maps))
+    Ok((layout.entry, image, maps, dynamic))
+}
+
+/// The segments of a file, the code and the read-only data of one object
+/// for all the processes that run it (spec 2, 3.12.2), the data its own.
+fn map_segments(
+    own: &Own,
+    image: &Handle<Channel>,
+    info: &proto_fs::NodeInfo,
+    segments: &[Load; 3],
+    maps: &mut Maps,
+) -> Result<(), u32> {
+    for part in Part::ALL {
+        let load = &segments[part as usize];
+        if !load.is_empty() {
+            let key = match part {
+                Part::Code => Some(image_key(info, proto_process::IMAGE_CODE)),
+                Part::Rodata => Some(image_key(info, proto_process::IMAGE_RODATA)),
+                Part::Data => None,
+            };
+            segment(own, image, load, part, maps, key.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+/// libc.so as `load` needs it: its image session, the metadata the table
+/// of images names its objects by, and its layout.
+struct Library {
+    session: Handle<Channel>,
+    info: proto_fs::NodeInfo,
+    layout: elf::Library,
+}
+
+/// OpenExec of libc.so with the caller's identity (the right to execute it
+/// is the caller's), and its layout. A refusal to open that is EACCES stays
+/// so, any other is NOT_EXEC; a file with a set-ID bit is NOT_EXEC, because
+/// the open would have vouched for a set-ID image (spec 2, 3.12.4).
+fn open_library(own: &Own) -> Result<Library, u32> {
+    let session = open(own, pl::LIBRARY_PATH).map_err(|code| match code {
+        pl::ACCESS => pl::ACCESS,
+        _ => pl::NOT_EXEC,
+    })?;
+    let info = file_info(own, &session)?;
+    if info.permissions & 0o6000 != 0 {
+        return Err(pl::NOT_EXEC);
+    }
+    let mut head = [0; PAGE as usize];
+    let read = read_at(&session, 0, &mut head[..info.size.min(PAGE) as usize])?;
+    let layout = elf::library(&head[..read], info.size, pl::LIBRARY_ROOM.clone())
+        .map_err(|_| pl::NOT_EXEC)?;
+    // Every TLS relocation of the program and of libc.so lands in the one
+    // template of libc.so.
+    if layout.tls.is_none() {
+        return Err(pl::NOT_EXEC);
+    }
+    Ok(Library {
+        session,
+        info,
+        layout,
+    })
+}
+
+/// The memory of this process for `dynlink`: the loader runs in the process
+/// it loads, so an address of a mapped segment is a pointer. `dynlink`
+/// reads and writes only inside the segments of the two modules (each
+/// access is checked against them), and `load` mapped every page of them.
+struct Space;
+
+impl dynlink::Memory for Space {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), dynlink::Fault> {
+        // SAFETY: see Space: the range is inside a mapped segment.
+        unsafe {
+            core::ptr::copy_nonoverlapping(address as *const u8, out.as_mut_ptr(), out.len())
+        };
+        Ok(())
+    }
+
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), dynlink::Fault> {
+        // SAFETY: see Space: the range is inside a mapped segment of
+        // read-write data, which is the process's own.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
+        };
+        Ok(())
+    }
+}
+
+/// The largest `PT_DYNAMIC` the loader reads: 256 entries (a program of
+/// the toolchain has about 25).
+const DYNAMIC_MAX: usize = 4096;
+
+/// The module of a file mapped by `load`: its segments, its `PT_DYNAMIC`
+/// parsed and every table it names checked.
+fn module(
+    role: dynlink::Role,
+    segments: &[Load; 3],
+    dynamic: elf::Extent,
+    tls_align: u64,
+) -> Result<dynlink::Module, u32> {
+    let mut parts = [dynlink::Segment {
+        vaddr: 0,
+        memsz: 0,
+        access: dynlink::Access::Read,
+    }; 3];
+    for part in Part::ALL {
+        let load = &segments[part as usize];
+        parts[part as usize] = dynlink::Segment {
+            vaddr: load.vaddr,
+            memsz: load.mem_size,
+            access: match part {
+                Part::Code => dynlink::Access::ReadExec,
+                Part::Rodata => dynlink::Access::Read,
+                Part::Data => dynlink::Access::ReadWrite,
+            },
+        };
+    }
+    let size = usize::try_from(dynamic.size).map_err(|_| pl::NOT_EXEC)?;
+    if size == 0 || size > DYNAMIC_MAX {
+        return Err(pl::NOT_EXEC);
+    }
+    let mut bytes = [0; DYNAMIC_MAX];
+    let bytes = &mut bytes[..size];
+    // The layout put `PT_DYNAMIC` inside the file bytes of the data segment.
+    dynlink::Memory::read(&Space, dynamic.vaddr, bytes).map_err(|_| pl::NOT_EXEC)?;
+    let parsed = dynlink::parse(role, &parts, 0, bytes, &Space).map_err(|_| pl::NOT_EXEC)?;
+    Ok(dynlink::Module {
+        segments: parts,
+        bias: 0,
+        tls_align,
+        dynamic: parsed,
+    })
+}
+
+/// The relocations of libc.so and of the program, in that order, in the
+/// memory `load` mapped: the program is ready to jump to when this is Ok.
+fn link(layout: &elf::Layout, library: Library) -> Result<Dynamic, u32> {
+    let tls = library.layout.tls.ok_or(pl::NOT_EXEC)?;
+    let lib = module(
+        dynlink::Role::Library,
+        &library.layout.segments,
+        library.layout.dynamic,
+        tls.align,
+    )?;
+    let program = module(dynlink::Role::Program, &layout.segments, layout.dynamic, 0)?;
+    dynlink::relocate(&lib, &program, &mut Space).map_err(|_| pl::NOT_EXEC)?;
+    Ok(Dynamic {
+        library: library.session,
+        phdr: layout.phdr,
+        phnum: u64::from(layout.phnum),
+        tls_header: library.layout.tls_header,
+    })
 }
 
 /// OpenExec of `path`: the image session, or the code of the refusal.
@@ -1815,6 +1984,7 @@ fn finish(
         entry,
         image,
         mut maps,
+        dynamic,
         mut given,
     } = loaded;
     let Ok(block) = Block::read(staged(block_len)) else {
@@ -1822,11 +1992,9 @@ fn finish(
     };
     let c = taken.credentials;
     // A set-ID program starts in the secure mode (AT_SECURE).
-    let flags = if c.uid != c.euid || c.gid != c.egid {
-        pl::SECURE
-    } else {
-        0
-    };
+    let secure = c.uid != c.euid || c.gid != c.egid;
+    let flags = if secure { pl::SECURE } else { 0 }
+        | if dynamic.is_some() { pl::DYNAMIC } else { 0 };
     let process = own.process.raw().0;
     let mut handles = [0; SLOTS];
     handles[Slot::Process as usize] = keep(own.process);
@@ -1860,8 +2028,29 @@ fn finish(
     if pl::write_area(area, START_AREA, &block, flags, handles, &entries[..count]).is_err() {
         return GAVE_UP;
     }
+    let library = match dynamic {
+        None => None,
+        Some(d) => {
+            // The vector the start of libc.so reads (spec 2, 3.12.3): the
+            // pairs lie at Start.auxv, after the strings of the stack.
+            let Some(at) = pl::Start::read(area)
+                .and_then(|start| usize::try_from(start.auxv.checked_sub(START_AREA)?).ok())
+            else {
+                return GAVE_UP;
+            };
+            let pairs = pl::dynamic_auxv(d.phdr, PHDR_SIZE, d.phnum, secure, d.tls_header);
+            let Some(room) = area.get_mut(at..at + 16 * pairs.len()) else {
+                return GAVE_UP;
+            };
+            for (slot, (key, value)) in room.chunks_exact_mut(16).zip(pairs) {
+                slot[..8].copy_from_slice(&key.to_le_bytes());
+                slot[8..].copy_from_slice(&value.to_le_bytes());
+            }
+            Some(d.library)
+        }
+    };
     let staging = (block_len as u64).next_multiple_of(PAGE);
-    drop((image, own.files, own.clock, own.identity, start, session));
+    drop((image, library, own.files, own.clock, own.identity, start, session));
     // SAFETY: the copy of the block is read no more.
     let _ = unsafe {
         sys::mem_unmap(

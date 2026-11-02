@@ -33,6 +33,7 @@ steps = []
 proto-clock = { path = "../../proto/clock" }
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
+dynlink = { path = "../../lib/dynlink" }
 proto-fs = { path = "../../proto/fs" }
 proto-loader = { path = "../../proto/loader" }
 proto-process = { path = "../../proto/process" }
