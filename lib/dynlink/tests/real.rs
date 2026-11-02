@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The real files of `target/libc-so` (`libc.so` and the programs linked
-//! against it by the build of the shared library). The tests skip, with a
+//! The real files of `target/libc-so` (`libc.so` and the programs of the probe
+//! linked against it by the build of the shared library). The tests skip, with a
 //! message, when the directory is absent; `cargo xtask libc-so` fills it.
 
 mod common;
@@ -11,6 +11,10 @@ use dynlink::{Access, Module, NAME_MAX, Refusal, Role, lookup, parse, relocate};
 use std::path::PathBuf;
 
 const R_JUMP_SLOT_KIND: u32 = 1026;
+/// The programs of the probe `cargo xtask libc-so` builds, under
+/// target/libc-so.
+const HELLO: &str = "probes/so-hello";
+const IMAGE: &str = "probes/so-image";
 
 /// What the section headers of a file say it needs: the records of its
 /// RELA sections by kind, the places of its RELR sections, and how many
@@ -141,7 +145,7 @@ fn without_main(w: &mut World) -> bool {
 
 #[test]
 fn libc_so_parses_and_has_what_programs_need() {
-    let Some(w) = world("hello") else { return };
+    let Some(w) = world(HELLO) else { return };
     let d = w.library.dynamic;
     assert!(d.nsyms > 1_000 && d.nsyms < 10_000, "{}", d.nsyms);
     assert_eq!(
@@ -181,10 +185,10 @@ fn libc_so_parses_and_has_what_programs_need() {
 
 #[test]
 fn libc_so_and_hello_are_relocated() {
-    let Some(mut w) = world("hello") else { return };
+    let Some(mut w) = world(HELLO) else { return };
     let had_main = without_main(&mut w);
     let counts = relocate(&w.library, &w.program, &mut w.space).unwrap();
-    let (lib_want, prog_want) = (expected(&bytes("libc.so")), expected(&bytes("hello")));
+    let (lib_want, prog_want) = (expected(&bytes("libc.so")), expected(&bytes(HELLO)));
     let k = |e: &Expected, kind| e.kinds.get(&kind).copied().unwrap_or(0);
     // Every record and place, less NONE and the GLOB_DAT of `main` that a
     // probe build has and the test turned into NONE.
@@ -219,17 +223,17 @@ fn libc_so_and_hello_are_relocated() {
 
 #[test]
 fn a_bigger_program_is_relocated() {
-    let Some(mut w) = world("hello-big") else {
+    let Some(mut w) = world(IMAGE) else {
         return;
     };
     without_main(&mut w);
     let counts = relocate(&w.library, &w.program, &mut w.space).unwrap();
-    let want = expected(&bytes("hello-big"));
+    let want = expected(&bytes(IMAGE));
     let k = |kind| want.kinds.get(&kind).copied().unwrap_or(0);
     assert_eq!(counts.program.jump_slot, k(1026));
     assert_eq!(counts.program.glob_dat, k(1025));
     assert_eq!(counts.program.total(), k(1026) + k(1025));
-    assert!(k(1026) > 50, "hello-big has many imports");
+    assert!(k(1026) >= 2, "so-image imports printf and the probe hook");
     check_slots(&w);
 }
 
@@ -251,18 +255,22 @@ fn check_slots(w: &World) {
             let symbol = p.symbol(&w.space, index).unwrap();
             let mut name = [0; NAME_MAX];
             let n = p.name_of(&w.space, &symbol, &mut name).unwrap();
-            let found = lookup(&w.library, &w.space, &name[..n]).unwrap().unwrap();
-            assert_eq!(
-                w.space.word(place),
-                found.value,
-                "{}",
-                String::from_utf8_lossy(&name[..n])
-            );
-            assert_ne!(found.value, 0);
+            let text = String::from_utf8_lossy(&name[..n]).into_owned();
+            match lookup(&w.library, &w.space, &name[..n]).unwrap() {
+                Some(found) => {
+                    assert_eq!(w.space.word(place), found.value, "{text}");
+                    assert_ne!(found.value, 0);
+                }
+                None => {
+                    // The weak reference nothing defines (so_absent) is 0.
+                    assert_eq!(symbol.bind, 2, "{text} is not weak");
+                    assert_eq!(w.space.word(place), 0, "{text}");
+                }
+            }
             seen += 1;
         }
     }
-    assert!(seen >= 8, "{seen}");
+    assert!(seen >= 4, "{seen}");
     let l = &w.library;
     let base = 16u64.next_multiple_of(l.tls_align);
     let ld = l.dynamic;
@@ -291,9 +299,9 @@ fn check_slots(w: &World) {
 
 #[test]
 fn damage_to_the_real_files_is_refused() {
-    let Some(w) = world("hello") else { return };
+    let Some(w) = world(HELLO) else { return };
     let l = load_elf(&std::fs::read(dir().join("libc.so")).unwrap());
-    let p = load_elf(&std::fs::read(dir().join("hello")).unwrap());
+    let p = load_elf(&std::fs::read(dir().join(HELLO)).unwrap());
     let with_tag = |dynamic: &[u8], tag: i64, value: u64| {
         // Before DT_NULL: the section is the entries up to the first NULL.
         let mut out = vec![];
