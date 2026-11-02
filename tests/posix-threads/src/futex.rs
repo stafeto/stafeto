@@ -128,7 +128,7 @@ unsafe extern "C" fn holder(_: *mut c_void) -> *mut c_void {
 /// At level 30, sleeps 50 us and takes the mutex, VISITS_WANTED times: it
 /// often finds the holder inside, and the holder's wake preempts it.
 unsafe extern "C" fn visitor(_: *mut c_void) -> *mut c_void {
-    if threads::set_level(30).is_err() {
+    if !lower_to(30) {
         error();
     }
     let mutex = ptr::from_ref(&SHARED).cast_mut();

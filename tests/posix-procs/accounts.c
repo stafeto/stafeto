@@ -44,8 +44,17 @@ static int nice_role(void) {
 }
 
 /* The role: ends with its scheduling as its status, policy * 64 + priority. */
+extern int stafeto_procs_lent(void);
+
 static int sched_role(void) {
     struct sched_param param;
+    /* The first thing the main thread of an image does is to move to the
+     * level its parent chose; the level it started at is not its own then. */
+    int lent = stafeto_procs_lent();
+    if (lent != 0) {
+        printf("posix-procs: schedchild works %d levels above its base\n", lent);
+        return 3;
+    }
     if (sched_getparam(0, &param) != 0) return 1;
     int policy = sched_getscheduler(0);
     if (policy < 0) return 2;

@@ -914,6 +914,15 @@ pub fn channel_create(priority: u8) -> Result<Handle<Channel>, Error> {
     Ok(returned(&x))
 }
 
+/// channel_create with the flag `abi::CHANNEL_WAIT`: a wait channel (spec
+/// 6.5). Its slots order the queue of the channel and give a timer its
+/// level, and never lend their priority to the receiver (spec 6.6). Every
+/// channel a POSIX thread waits on is made this way.
+pub fn channel_create_wait(priority: u8) -> Result<Handle<Channel>, Error> {
+    let x = call::<{ Call::CreateChannel.number() }>(&[priority.into(), abi::CHANNEL_WAIT])?;
+    Ok(returned(&x))
+}
+
 /// notify: `bits` go into the channel's slot of label 0 (spec 6.5), ORed
 /// with those not yet received; a receiver that waits above the caller
 /// runs before the call returns. Bit 63 is the kernel's (INVALID_ARGS);

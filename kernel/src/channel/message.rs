@@ -169,7 +169,9 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
                 q.take_slot();
                 let (n, priority) = notice(slot);
                 syscall::set_notification(t, n);
-                sched::boost_in_place(k, t, priority, ceiling);
+                if lends(c) {
+                    sched::boost_in_place(k, t, priority, ceiling);
+                }
                 return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {

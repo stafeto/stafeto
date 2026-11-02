@@ -405,7 +405,7 @@ pub(crate) fn admission_pause() -> Result<(), i32> {
     let block = crate::threads::own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block)));
     let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(1_000_000);
     let result = loop {
         let guard = match rt::upcall::defer_entries() {
@@ -517,7 +517,7 @@ fn run_in(
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
     let mut alarm = Alarm(
-        Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed))),
+        Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block))),
         false,
     );
     // The first take brings the labelled copy: the service keeps it while

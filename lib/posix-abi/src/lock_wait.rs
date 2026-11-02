@@ -250,7 +250,7 @@ fn run(transport: Transport, description: DataDescription, input: Input, outer: 
         .base_level
         .load(Ordering::Relaxed) as u8)
         .max(1);
-    let channel = match sys::channel_create(level) {
+    let channel = match sys::channel_create_wait(level) {
         Ok(channel) => channel,
         Err(Error::NoMemory | Error::LimitReached) => return Ended::Done(Err(ENOLCK)),
         Err(_) => return Ended::Done(Err(EIO)),

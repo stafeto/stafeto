@@ -158,6 +158,10 @@ pub struct Block {
     /// level it lends that thread.
     pub pi_owner: AtomicU32,
     pub pi_level: AtomicU32,
+    /// The level the thread's timer was made at: a wait whose deadline
+    /// uses the timer makes it again at `base_level` when they differ
+    /// (posix-sync `wait_timer`).
+    pub timer_level: AtomicU32,
     pub pi_addr: AtomicUsize,
 }
 
@@ -283,6 +287,7 @@ impl Block {
             inherited: AtomicU32::new(0),
             pi_owner: AtomicU32::new(0),
             pi_level: AtomicU32::new(0),
+            timer_level: AtomicU32::new(0),
             pi_addr: AtomicUsize::new(0),
         }
     }

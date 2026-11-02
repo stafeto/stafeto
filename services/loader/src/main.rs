@@ -174,7 +174,7 @@ fn main(level: u64) -> u64 {
     // SAFETY: entry 0 is the loader's session with the service, which the
     // service put there (process_create x5) and nothing else holds.
     let session = Handle::<Channel>::from_raw(START_CHANNEL);
-    let Ok(start) = sys::channel_create(level) else {
+    let Ok(start) = sys::channel_create_wait(level) else {
         return GAVE_UP;
     };
     let Ok(own) = boot(&session, &start, level) else {

@@ -95,7 +95,7 @@ fn populate(place: &Place, index: usize) -> Result<*mut u8, i32> {
     let raw = native.into_raw().0;
     place.native.store(raw, Ordering::Release);
     let info = sys::thread_info(&borrowed::<Thread>(raw)).map_err(|_| EIO)?;
-    let channel = sys::channel_create(info.base).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(info.base).map_err(|_| EAGAIN)?;
     let channel_raw = channel.into_raw().0;
     place.floating.store(channel_raw, Ordering::Release);
     let timer =
@@ -121,6 +121,9 @@ fn populate(place: &Place, index: usize) -> Result<*mut u8, i32> {
         block.timer.store(timer_raw, Ordering::Relaxed);
         block
             .base_level
+            .store(u32::from(info.base), Ordering::Relaxed);
+        block
+            .timer_level
             .store(u32::from(info.base), Ordering::Relaxed);
         block.policy.store(
             info.policy.map_or(u64::MAX, |policy| policy as u64),

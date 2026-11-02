@@ -101,7 +101,7 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
     let block = own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block)));
     let mut at = target(deadline)?;
     // An absolute time of CLOCK_REALTIME follows a set of the calendar, ahead
     // or back, by a look at the anchor every CALENDAR_LOOK.

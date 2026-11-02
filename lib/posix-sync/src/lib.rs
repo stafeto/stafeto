@@ -372,6 +372,37 @@ pub enum Woken {
 /// word differs, ETIMEDOUT when the deadline passed, EINVAL for another
 /// clock or a thread without its channel. Spurious wakeups come back as
 /// `Woken::Woken`.
+/// The raw handle of the calling thread's timer for the deadline of a wait
+/// it starts: the timer fires at the level it was made at (the level of its
+/// slot), and a thread whose base level changed since, by itself or by
+/// another thread (pthread_setschedparam), would have its deadline served
+/// at the old one. The timer is made again, on the same channel, at the
+/// base level when they differ, and the old one closes; a refusal (quota,
+/// table) leaves the old timer, whose firing is only late or early in
+/// priority. Only the thread itself calls this, so nothing races it; a
+/// wait that is started after another thread raised this one runs on the
+/// new level, while one begun before keeps the old (stafeto-design, the
+/// remainder of the wait channel).
+pub fn wait_timer(block: &Block) -> u64 {
+    let timer = block.timer.load(Ordering::Relaxed);
+    let want = block.base_level.load(Ordering::Relaxed);
+    if timer == 0 || want == 0 || block.timer_level.load(Ordering::Relaxed) == want {
+        return timer;
+    }
+    let channel = Handle::<Channel>::borrowed(abi::Handle(block.channel.load(Ordering::Relaxed)));
+    let Ok(made) = sys::timer_create(&channel, want as u8) else {
+        return timer;
+    };
+    let Ok(_guard) = rt::upcall::defer_entries() else {
+        return timer;
+    };
+    let raw = made.into_raw().0;
+    let old = block.timer.swap(raw, Ordering::SeqCst);
+    block.timer_level.store(want, Ordering::Relaxed);
+    drop(Handle::<rt::handle::Any>::from_raw(abi::Handle(old)));
+    raw
+}
+
 pub fn futex_wait(
     word: &AtomicU32,
     value: u32,
@@ -385,7 +416,7 @@ pub fn futex_wait(
         return Err(EINVAL);
     };
     let channel = block.channel.load(Ordering::Relaxed);
-    let timer = block.timer.load(Ordering::Relaxed);
+    let timer = wait_timer(block);
     if channel == 0 || (deadline.is_some() && timer == 0) {
         return Err(EINVAL);
     }

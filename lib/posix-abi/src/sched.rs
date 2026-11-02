@@ -194,9 +194,7 @@ pub fn thread_set(id: u64, policy: i32, priority: i32, tail: bool) -> Result<i32
         block.sched.store(pack(policy, priority), Ordering::Relaxed);
         block.policy.store(kernel as u64, Ordering::Relaxed);
         if own {
-            // A thread that moves itself swaps its channel and its timer for
-            // ones at the new level, as set_level does.
-            crate::threads::move_to(level, kernel, tail, true)?;
+            crate::threads::move_to(level, kernel, tail)?;
         } else {
             block.base_level.store(u32::from(level), Ordering::Relaxed);
             apply(block, native, tail);
@@ -246,7 +244,7 @@ pub(crate) fn start_apply(word: u64) {
     block.sched.store(pack(policy, priority), Ordering::Relaxed);
     block.policy.store(kernel as u64, Ordering::Relaxed);
     if level != block.base_level.load(Ordering::Relaxed) as u8 || kernel != Policy::RoundRobin {
-        let _ = crate::threads::move_to(level, kernel, false, false);
+        let _ = crate::threads::move_to(level, kernel, false);
     }
 }
 

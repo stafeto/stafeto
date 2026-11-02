@@ -1344,7 +1344,7 @@ fn wait(
     };
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(posix_sync::wait_timer(block)));
     let result = loop {
         if let Some(signal) = take() {
             break Ok(signal);
@@ -1464,7 +1464,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     use rt::abi::ThreadState;
     let level = own().base_level.load(Ordering::Relaxed) as u8;
     let me = own() as *const Block as usize;
-    let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(level.max(1)).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
     while !STOP.try_begin(me, channel.raw().0) {
         STOP.wait_for_claim(

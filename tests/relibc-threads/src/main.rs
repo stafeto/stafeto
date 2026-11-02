@@ -87,3 +87,29 @@ extern "C" fn relibc_threads_calls() -> u64 {
 extern "C" fn relibc_threads_waiting() -> u32 {
     posix_sync::waiters_total()
 }
+
+/// The base level and the level the kernel has the thread work at now of
+/// the thread whose relibc `pthread_t` is `thread`; 0 or an errno.
+///
+/// # Safety
+/// `base` and `priority` are writable; the thread keeps its place.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn relibc_threads_info(
+    thread: u64,
+    base: *mut c_int,
+    priority: *mut c_int,
+) -> c_int {
+    // SAFETY: the thread keeps its place while this reads it.
+    let Ok(native) = (unsafe { posix_abi::threads::probe_native(thread) }) else {
+        return 3;
+    };
+    let Ok(info) = rt::sys::thread_info(&native) else {
+        return 5;
+    };
+    // SAFETY: the caller's promise.
+    unsafe {
+        base.write(c_int::from(info.base));
+        priority.write(c_int::from(info.priority));
+    }
+    0
+}

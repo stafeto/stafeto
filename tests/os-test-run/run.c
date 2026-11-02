@@ -24,9 +24,14 @@
  *
  * The check of the runner (cargo xtask os-test, before the suites) starts
  * two files that are the runner itself: named `hang` it never ends, named
- * `quick` it exits with 7. */
+ * `quick` it exits with 7.
+ *
+ * The runner puts itself at SCHED_FIFO 32 (the top of the levels it may
+ * take) and starts every test in SCHED_OTHER, below it, so that its poll
+ * and its limit run however long a test computes. */
 #include <dirent.h>
 #include <errno.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -123,8 +128,11 @@ static void run_one(const char *name, const char *dir, const char *rel, const ch
     pid_t pid;
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    struct sched_param other = {0};
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSCHEDULER);
     posix_spawnattr_setpgroup(&attr, 0);
+    posix_spawnattr_setschedpolicy(&attr, SCHED_OTHER);
+    posix_spawnattr_setschedparam(&attr, &other);
     int e = posix_spawn(&pid, path, NULL, &attr, argv, environ);
     if (e == ENOEXEC) {
         /* A shell script of the suite: the shell of the image runs it, as
@@ -175,6 +183,9 @@ int main(int argc, char **argv) {
         for (;;) pause();
     }
     if (strcmp(self, "quick") == 0) return 7;
+    struct sched_param top = {32};
+    if (sched_setscheduler(0, SCHED_FIFO, &top) != 0)
+        printf("os-test-run: SCHED_FIFO 32 for the runner failed: %s\n", strerror(errno));
     FILE *list = fopen("/os-test/list", "r");
     if (!list) {
         printf("os-test-run: no list: %s\n", strerror(errno));

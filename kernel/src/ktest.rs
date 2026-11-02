@@ -390,6 +390,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::boost_is_capped_by_the_ceiling,
     ),
     (
+        "wait_channel_lends_nothing",
+        calls::wait_channel_lends_nothing,
+    ),
+    (
         "handle_duplicate_checks_the_callers_limits",
         calls::handle_duplicate_checks_the_callers_limits,
     ),

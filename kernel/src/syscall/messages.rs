@@ -14,10 +14,12 @@ use abi::{CHANNEL_RIGHTS, Error, Rights};
 use core::ptr::NonNull;
 use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceilings, wait_arg};
 
-/// channel_create(x0 priority): a channel whose slot of label 0 has the
-/// priority (spec 6.5); x1 returns a handle to it with SEND, NOTIFY,
-/// RECEIVE, DUPLICATE and TRANSFER (abi::CHANNEL_RIGHTS). The priority is
-/// 1-63 (INVALID_ARGS) and no higher than the caller's ceiling
+/// channel_create(x0 priority, x1 flags): a channel whose slot of label 0
+/// has the priority (spec 6.5); x1 returns a handle to it with SEND,
+/// NOTIFY, RECEIVE, DUPLICATE and TRANSFER (abi::CHANNEL_RIGHTS). The
+/// priority is 1-63 and the flags 0 or abi::CHANNEL_WAIT, a wait channel
+/// whose slots lend no priority to the receiver (INVALID_ARGS for any
+/// other); the priority is no higher than the caller's ceiling
 /// (ACCESS_DENIED). Resources come last, in the order the call occupies
 /// them (spec 11): the caller's table has room for the handle
 /// (LIMIT_REACHED), then the caller's quota pays for a page of its pool of
@@ -26,9 +28,14 @@ use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceiling
 #[inline(never)]
 pub(super) fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[0])?;
+    let lends = match a[1] {
+        0 => true,
+        abi::CHANNEL_WAIT => false,
+        _ => return Err(Error::InvalidArgs),
+    };
     under_ceilings(priority, &[caller_ceiling(thread)])?;
     process::handle_room(caller(thread))?;
-    let c = channel::create(caller(thread), priority)?;
+    let c = channel::create_with(caller(thread), priority, lends)?;
     let h = process::insert_handle(caller(thread), Object::Channel(c), CHANNEL_RIGHTS);
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the channel.
