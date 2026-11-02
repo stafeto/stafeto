@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <poll.h>
 #include <setjmp.h>
 #include <spawn.h>
 #include <stdarg.h>
@@ -336,6 +337,14 @@ static int raw_and_canonical(const struct termios *saved) {
 /* Input typed and not read goes with tcflush and with TCSAFLUSH. The bytes
  * wait in the line (canonical) or in the queue (VMIN 0 with VTIME 1 lets
  * a read give them): a read that gives none shows the flush. */
+/* Waits until the byte typed is in the queue. A fixed pause is no wait: under
+ * a virtual clock that runs ahead while the guest sleeps, it ends before the
+ * host has typed anything. */
+static int wait_for_input(void) {
+    struct pollfd in = {.fd = 0, .events = POLLIN};
+    return poll(&in, 1, -1) == 1 && (in.revents & POLLIN) ? 0 : -1;
+}
+
 static int flushing(const struct termios *saved) {
     struct termios timed = *saved, back;
     timed.c_lflag &= ~(tcflag_t)ICANON;
@@ -343,15 +352,15 @@ static int flushing(const struct termios *saved) {
     timed.c_cc[VTIME] = 1;
     char c[16];
 
-    say("posix-tty: type junk\n");
-    pause_ms(300);
-    CHECK(tcflush(0, TCIFLUSH) == 0);
     CHECK(tcsetattr(0, TCSANOW, &timed) == 0);
+    say("posix-tty: type junk\n");
+    CHECK(wait_for_input() == 0);
+    CHECK(tcflush(0, TCIFLUSH) == 0);
     CHECK(read(0, c, sizeof c) == 0);
     say("posix-tty: tcflush dropped the input\n");
 
     say("posix-tty: type more junk\n");
-    pause_ms(300);
+    CHECK(wait_for_input() == 0);
     CHECK(tcsetattr(0, TCSAFLUSH, &timed) == 0);
     CHECK(read(0, c, sizeof c) == 0);
     say("posix-tty: TCSAFLUSH dropped the input\n");
