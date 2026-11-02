@@ -1863,6 +1863,46 @@ static int shared_many(void) {
     return 0;
 }
 
+/* An error-checking and a recursive mutex of a shared page belong to one
+ * thread of one process: a thread of another process, with the same number
+ * in its own, does not own it. */
+static int shared_owner(int named) {
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    pthread_mutexattr_t ma;
+    CHECK(pthread_mutexattr_init(&ma) == 0 && pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_ERRORCHECK) == 0);
+    CHECK(pthread_mutex_init(&s->mutex, &ma) == 0);
+    CHECK(pthread_mutex_lock(&s->mutex) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (pthread_mutex_unlock(&s->mutex) != EPERM) _exit(1);
+        if (pthread_mutex_trylock(&s->mutex) != EBUSY) _exit(2);
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 30 * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_nsec -= 1000000000L;
+            until.tv_sec++;
+        }
+        if (pthread_mutex_timedlock(&s->mutex, &until) != ETIMEDOUT) _exit(3);
+        __atomic_store_n(&s->flag, 1, __ATOMIC_SEQ_CST);
+        if (pthread_mutex_lock(&s->mutex) != 0) _exit(4);
+        if (pthread_mutex_unlock(&s->mutex) != 0) _exit(5);
+        _exit(0);
+    }
+    for (int i = 0; i < 400 && !s->flag; i++) pause_ms(5);
+    CHECK(s->flag == 1);
+    CHECK(pthread_mutex_lock(&s->mutex) == EDEADLK);
+    CHECK(pthread_mutex_unlock(&s->mutex) == 0);
+    CHECK(wait_ok(pid));
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+static int shared_anonymous_owner(void) { return shared_owner(0); }
+static int shared_named_owner(void) { return shared_owner(1); }
+
 static int shared_anonymous_order(void) { return shared_order(0); }
 static int shared_named_order(void) { return shared_order(1); }
 static int shared_anonymous_latency(void) { return shared_latency(0); }
@@ -1916,6 +1956,8 @@ int main(int argc, char **argv) {
     RUN(shared_anonymous_ends);
     RUN(shared_named_ends);
     RUN(shared_anonymous_idle);
+    RUN(shared_anonymous_owner);
+    RUN(shared_named_owner);
     RUN(shared_many);
     RUN(shared_named_idle);
     RUN(limits);
