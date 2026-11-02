@@ -64,3 +64,4 @@ proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
 posix-random = { path = "../posix-random" }
 proto-entropy = { path = "../../proto/entropy" }
+proto-gpu = { path = "../../proto/gpu" }

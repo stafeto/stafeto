@@ -85,6 +85,8 @@ table-gpu = []
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).
 table-posix-random = []
+# The C probe of the display service's place in a process (xtask posix-display).
+table-posix-display = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

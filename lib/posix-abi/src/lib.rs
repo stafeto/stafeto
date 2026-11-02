@@ -35,6 +35,7 @@ pub use lock_wait::{Probe as WaitProbe, probe_hook as probe_wait_hook};
 pub fn record_locks_none() -> bool {
     shared::with_files(|files| Ok(files.knows_no_record_lock())).unwrap_or(false)
 }
+pub mod display;
 pub mod ipc;
 pub mod lock_fields;
 pub mod long;

@@ -1107,6 +1107,28 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.extend(devices());
             files
         }
+        "boot-posix-display.img" => {
+            let mut files = vec![
+                dir("/bin"),
+                file("/bin/posix-display", 0o755, ROOT, "posix-display"),
+                // Owned by another user: a spawn of it runs with a real ID
+                // that differs from the effective one (AT_SECURE).
+                of(
+                    "/bin/posix-display-suid",
+                    0o4755,
+                    (1000, 100),
+                    Source::Variant {
+                        program: "posix-display",
+                        tag: "setid",
+                        // A file of its own: equal bytes would be one file.
+                        extra: 4096,
+                    },
+                ),
+                dir("/dev"),
+            ];
+            files.extend(devices());
+            files
+        }
         "boot-posix-random.img" => {
             let mut files = vec![
                 dir("/bin"),
@@ -1595,6 +1617,7 @@ mod tests {
             "boot-posix-lock-ring.img",
             "boot-posix-shares.img",
             "boot-posix-random.img",
+            "boot-posix-display.img",
             "boot-posix-pty.img",
             "boot-posix-steps.img",
             "rtbench-posix.img",
