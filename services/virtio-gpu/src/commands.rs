@@ -129,9 +129,16 @@ pub fn answer_type(answer: &[u8]) -> u32 {
         .map_or(0, u32::from_le_bytes)
 }
 
-/// Whether the answer is a success.
-pub fn succeeded(kind: u32) -> bool {
-    kind == OK_NODATA || kind == OK_DISPLAY_INFO
+/// Whether an answer of type `kind` and `len` bytes (as far as the device
+/// wrote) is the success of its command: OK_DISPLAY_INFO with the first
+/// mode for GET_DISPLAY_INFO (`info`), OK_NODATA with a whole header for
+/// any other.
+pub fn succeeded(kind: u32, len: usize, info: bool) -> bool {
+    if info {
+        kind == OK_DISPLAY_INFO && len >= HEADER + 24
+    } else {
+        kind == OK_NODATA && len >= HEADER
+    }
 }
 
 /// The mode of the first scanout of an answer to GET_DISPLAY_INFO: its
@@ -319,8 +326,15 @@ mod tests {
 
     #[test]
     fn answers_are_judged_by_their_type() {
-        assert!(succeeded(OK_NODATA) && succeeded(OK_DISPLAY_INFO));
-        assert!(!succeeded(0) && !succeeded(ERR_FROM) && !succeeded(0x1203));
+        assert!(succeeded(OK_NODATA, HEADER, false));
+        assert!(succeeded(OK_DISPLAY_INFO, INFO_REPLY, true));
+        assert!(!succeeded(0, HEADER, false) && !succeeded(ERR_FROM, HEADER, false));
+        assert!(!succeeded(0x1203, HEADER, false));
+        // The type must be the command's, and the answer long enough.
+        assert!(!succeeded(OK_DISPLAY_INFO, INFO_REPLY, false));
+        assert!(!succeeded(OK_NODATA, HEADER, true));
+        assert!(!succeeded(OK_NODATA, HEADER - 1, false));
+        assert!(!succeeded(OK_DISPLAY_INFO, HEADER + 23, true));
         assert_eq!(answer_type(&OK_NODATA.to_le_bytes()), OK_NODATA);
         assert_eq!(answer_type(&[1, 2]), 0);
     }

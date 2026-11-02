@@ -6,6 +6,8 @@
 //! (`check`, `transport`), the device's crate over the DMA object of a
 //! driver (`DmaHal`), the start of a device that offers `VIRTIO_F_VERSION_1`
 //! and nothing else (`start`), and the interrupt (`Isr`, `reopen`).
+//! The state of `DmaHal` (the arena) is one per process: a driver serves
+//! one device, and a second device would need a process of its own.
 //! Everything that needs no call of the kernel builds for the host too,
 //! where `cargo test -p virtio-mmio` exercises it.
 //!

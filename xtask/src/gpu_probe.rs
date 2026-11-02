@@ -69,7 +69,8 @@ const B_ENDS: &str = "init: gpu-probe-b ended: ";
 
 /// The lines each client prints once per check that passed, and how many
 /// times a run has each.
-const CHECKS: [(&str, usize); 10] = [
+const CHECKS: [(&str, usize); 11] = [
+    ("gpu-probe: the owner's handles cannot be duplicated", 1),
     (
         "gpu-probe: screen 640x400, stride 2560, a cleared buffer",
         1,
