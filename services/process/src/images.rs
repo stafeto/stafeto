@@ -69,9 +69,6 @@ struct Entry<T> {
 }
 
 impl<T> Entry<T> {
-    fn has(words: &[u64; WORDS], record: usize) -> bool {
-        words[record / 64] & (1 << (record % 64)) != 0
-    }
     fn unused(&self) -> bool {
         self.users.iter().chain(&self.joining).all(|w| *w == 0)
     }
@@ -84,7 +81,13 @@ struct Waiting<W> {
     key: ImageKey,
     data: W,
     age: u32,
+    /// The place of the entry of `key`, GONE when its maker went and none
+    /// has made it again (kept at each change of the entries, so that a
+    /// pass over the waiting requests reads their state in O(1) each).
+    entry: u8,
 }
+
+const GONE: u8 = u8::MAX;
 
 pub struct Images<T, W> {
     entries: [Option<Entry<T>>; IMAGES],
@@ -120,6 +123,16 @@ impl<T, W> Images<T, W> {
         self.entries
             .iter()
             .position(|e| e.as_ref().is_some_and(|e| e.key == *key))
+    }
+
+    /// The entry in `i` goes; the requests that wait for it lose their entry.
+    fn free(&mut self, i: usize) {
+        self.entries[i] = None;
+        for w in self.waiting.iter_mut().flatten() {
+            if usize::from(w.entry) == i {
+                w.entry = GONE;
+            }
+        }
     }
 
     fn join(entry: &mut Entry<T>, record: usize) {
@@ -158,6 +171,12 @@ impl<T, W> Images<T, W> {
                 };
                 Self::join(&mut entry, record);
                 self.entries[place] = Some(entry);
+                // The waiters of a key whose maker went wait for this one.
+                for w in self.waiting.iter_mut().flatten() {
+                    if w.key == *key {
+                        w.entry = place as u8;
+                    }
+                }
                 Got::Reserved
             }
         }
@@ -177,6 +196,7 @@ impl<T, W> Images<T, W> {
         }
         self.ages = self.ages.wrapping_add(1);
         let age = self.ages;
+        let entry = self.find(&key).map_or(GONE, |i| i as u8);
         match self.waiting.iter_mut().find(|w| w.is_none()) {
             Some(place) => {
                 *place = Some(Waiting {
@@ -184,6 +204,7 @@ impl<T, W> Images<T, W> {
                     key,
                     data,
                     age,
+                    entry,
                 });
                 Ok(())
             }
@@ -197,8 +218,8 @@ impl<T, W> Images<T, W> {
     /// caller asks `get` for each again. Of the requests of a key whose
     /// maker went only the oldest comes (`get` gives it Reserved); the
     /// others wait on. Gives the count taken and whether more are ready.
-    /// One pass over the places and the entries, O(WAITING + IMAGES), and N
-    /// picks over the places.
+    /// One pass over the places, O(WAITING) (each request keeps the place of
+    /// its entry), and N picks over the places.
     pub fn ready_batch<const N: usize>(
         &mut self,
         out: &mut [Option<(usize, ImageKey, W)>; N],
@@ -207,16 +228,9 @@ impl<T, W> Images<T, W> {
         let mut status = [0u8; WAITING];
         for (state, w) in status.iter_mut().zip(&self.waiting) {
             if let Some(w) = w {
-                *state = match self
-                    .entries
-                    .iter()
-                    .flatten()
-                    .find(|e| e.key == w.key)
-                    .map(|e| matches!(e.state, State::Making(_)))
-                {
+                *state = match self.entries.get(usize::from(w.entry)).and_then(Option::as_ref) {
                     None => 2,
-                    Some(false) => 1,
-                    Some(true) => 0,
+                    Some(e) => u8::from(!matches!(e.state, State::Making(_))),
                 };
             }
         }
@@ -280,7 +294,7 @@ impl<T, W> Images<T, W> {
             .as_ref()
             .is_some_and(|e| e.unused() && matches!(e.state, State::Ready { .. }))
         {
-            self.entries[i] = None;
+            self.free(i);
         }
     }
 
@@ -293,7 +307,7 @@ impl<T, W> Images<T, W> {
         };
         let entry = self.entries[i].as_mut().expect("an entry");
         if matches!(entry.state, State::Making(owner) if owner == record) {
-            self.entries[i] = None;
+            self.free(i);
             return;
         }
         entry.joining[record / 64] &= !(1 << (record % 64));
@@ -311,7 +325,7 @@ impl<T, W> Images<T, W> {
             };
             if matches!(entry.state, State::Making(owner) if owner == record) {
                 // An object nobody Put: the load went on without it.
-                self.entries[i] = None;
+                self.free(i);
                 continue;
             }
             entry.users[word] &= !bit;
@@ -353,7 +367,7 @@ impl<T, W> Images<T, W> {
                 continue;
             };
             if matches!(entry.state, State::Making(owner) if owner == record) {
-                self.entries[i] = None;
+                self.free(i);
                 continue;
             }
             entry.joining[word] &= !bit;
