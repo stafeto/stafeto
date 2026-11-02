@@ -1253,6 +1253,46 @@ static void timed_waits_across_a_second(void) {
     printf("relibc-threads: timed waits across a second end at their deadline ok\n");
 }
 
+/* H: a thread that lowers itself first thing really runs below its creator
+ * (#370: a thread that the creator's registration woke runs on the level it
+ * waited at until it blocks again, which must end with the move). `low`
+ * moves itself under `mid` and spins; `mid` is below main (SCHED_OTHER) and
+ * above `low`, and must get the processor, when its sleep ends, while `low` spins. */
+#define LOWERING_TURNS_MS 100
+static volatile int lowering_stop, lowering_mid_ran, lowering_failed;
+static void lower_self(int priority) {
+    struct sched_param param = {priority};
+    if (pthread_setschedparam(pthread_self(), SCHED_RR, &param) != 0) lowering_failed = 1;
+}
+static void *lowering_low(void *arg) {
+    (void)arg;
+    lower_self(12);
+    while (!lowering_stop) {}
+    return NULL;
+}
+static void *lowering_mid(void *arg) {
+    (void)arg;
+    lower_self(22);
+    /* Blocks and wakes at its own level while `low` spins. */
+    sleep_ms(10);
+    lowering_mid_ran = 1;
+    return NULL;
+}
+static void lowered_thread(void) {
+    pthread_t low, mid;
+    lowering_stop = lowering_mid_ran = lowering_failed = 0;
+    CHECK(pthread_create(&low, &small, lowering_low, NULL) == 0);
+    CHECK(pthread_create(&mid, &small, lowering_mid, NULL) == 0);
+    sleep_ms(LOWERING_TURNS_MS);
+    int ran = lowering_mid_ran;
+    lowering_stop = 1;
+    CHECK(pthread_join(low, NULL) == 0);
+    CHECK(pthread_join(mid, NULL) == 0);
+    if (lowering_failed) FAIL("pthread_setschedparam of the thread itself failed");
+    if (!ran) FAIL("a thread between main and a spinning thread that lowered itself did not run");
+    printf("relibc-threads: a thread that lowers itself first thing runs below its creator\n");
+}
+
 int main(void) {
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
@@ -1274,6 +1314,7 @@ int main(void) {
     long_jump();
     stage = 7;
     clock_page();
+    lowered_thread();
     stage = 8;
     leave_sigwait();
     stage = 9;

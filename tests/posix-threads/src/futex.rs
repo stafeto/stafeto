@@ -108,7 +108,7 @@ const VISITS_WANTED: u64 = 2000;
 
 /// At level 20, holds the shared mutex 20 us at a time until STOP.
 unsafe extern "C" fn holder(_: *mut c_void) -> *mut c_void {
-    if threads::set_level(20).is_err() {
+    if !lower_to(20) {
         error();
     }
     let mutex = ptr::from_ref(&SHARED).cast_mut();

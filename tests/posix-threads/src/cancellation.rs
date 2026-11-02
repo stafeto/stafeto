@@ -50,6 +50,8 @@ unsafe extern "C" fn before_wait(argument: *mut c_void) -> *mut c_void {
     let gate = Handle::<Channel>::borrowed(rt::abi::Handle(RACE_GATE.load(Ordering::Acquire)));
     let native = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("self handle");
     RACE_NATIVE.store(native.raw().0, Ordering::Release);
+    // The layer's move first: it ends the level that the start lent the thread.
+    threads::set_level(10).expect("race target level");
     sys::thread_set_priority(&native, 10, rt::abi::Policy::Fifo).expect("race target priority");
     let mut cleanup = Cleanup::new();
     unsafe { ffi::cleanup_push(&mut cleanup, Some(race_cleanup), ptr::null_mut()) };
