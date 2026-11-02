@@ -13,6 +13,7 @@ its own release profile (level 3): a program's size has no bound, its
 speed counts (rtbench). A stamp of the commit, the toolchain, the flags,
 clang and the cbindgen version makes a second run do nothing."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -160,6 +161,8 @@ MATH_BUILD = "openlibm-0.8.0-linux-aarch64-strict-v2"
 HEADER_NAMES = {"nl_types": "nl_types.h"}
 HEADER_POLICY = "limits-link-max-from-rust-v1"
 ROOT = Path(__file__).resolve().parents[1]
+# Headers of the functions libc.so adds to relibc's (<stafeto/display.h>).
+OWN_HEADERS = ROOT / "lib" / "posix-crt" / "include"
 WORK = ROOT / "target" / "relibc"
 SOURCE = WORK / "source"
 BUILD = WORK / "build"
@@ -252,13 +255,23 @@ def remap(env: dict) -> tuple[str, str]:
     return f"{RUSTFLAGS} {rust}", f"{CFLAGS} {c}"
 
 
+def own_headers_digest() -> str:
+    """The digest of the headers that stafeto adds: a change of one builds
+    the sysroot again."""
+    digest = hashlib.sha256()
+    for header in sorted(OWN_HEADERS.rglob("*.h")):
+        digest.update(header.relative_to(OWN_HEADERS).as_posix().encode())
+        digest.update(header.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def config(env: dict) -> str:
     """What the stamp holds: a change of any of it builds relibc again."""
     rustflags, cflags = remap(env)
     clang = output(llvm("clang"), "--version", env=env).splitlines()[0]
     return (f"{COMMIT} {TOOLCHAIN} {TARGET} {rustflags} {cflags} build-std={BUILD_STD}"
             f" features={FEATURES} math={MATH_BUILD} cbindgen {CBINDGEN}"
-            f" headers={HEADER_POLICY} {clang}\n")
+            f" headers={HEADER_POLICY} own={own_headers_digest()} {clang}\n")
 
 
 def stafeto_link_max() -> int:
@@ -319,10 +332,12 @@ def build(env: dict) -> None:
 
 
 def headers(env: dict, generator: Path) -> None:
-    """The headers as relibc's Makefile writes them without USE_RUST_LIBM."""
+    """The headers as relibc's Makefile writes them without USE_RUST_LIBM,
+    and the headers of stafeto's own functions of libc.so."""
     include = SYSROOT / "include"
     shutil.rmtree(include, ignore_errors=True)
     shutil.copytree(SOURCE / "include", include)
+    shutil.copytree(OWN_HEADERS, include, dirs_exist_ok=True)
     for directory in (SOURCE / "openlibm" / "include", SOURCE / "openlibm" / "src"):
         for header in directory.glob("*.h"):
             shutil.copyfile(header, include / header.name)

@@ -87,6 +87,8 @@ table-input = []
 table-posix-random = []
 # The C probe of the display service's place in a process (xtask posix-display).
 table-posix-display = []
+# The C probe of the screen and the keys on libc.so (xtask display-probe).
+table-display = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }
