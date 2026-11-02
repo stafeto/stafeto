@@ -1371,6 +1371,10 @@ fn load(
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
         elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)?;
+    // Dynamic programs wait for their own loading path.
+    if layout.kind != elf::Kind::Static {
+        return Err(pl::NOT_EXEC);
+    }
     let mut maps = Maps::default();
     for part in Part::ALL {
         let load = &layout.segments[part as usize];

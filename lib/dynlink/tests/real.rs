@@ -11,11 +11,62 @@ use dynlink::{Access, Module, NAME_MAX, Refusal, Role, lookup, parse, relocate};
 use std::path::PathBuf;
 
 const R_JUMP_SLOT_KIND: u32 = 1026;
-/// What the build of libc.so has to give (spec 2, 3.12.4): the relocations
-/// of libc.so (the places of RELATIVE and TLS_TPREL64) and of `hello`.
-const LIBC_RELOCATIONS: u32 = 1_983;
-const HELLO_RELOCATIONS: u32 = 8;
-const HELLO_BIG_RELOCATIONS: u32 = 89;
+
+/// What the section headers of a file say it needs: the records of its
+/// RELA sections by kind, the places of its RELR sections, and how many
+/// records name a symbol. Counted from the file, apart from the code that
+/// is tested.
+#[derive(Default, Debug)]
+struct Expected {
+    kinds: std::collections::BTreeMap<u32, u32>,
+    relr: u32,
+    with_symbol: u32,
+}
+
+fn expected(file: &[u8]) -> Expected {
+    let u16_at = |at: usize| u16::from_le_bytes(file[at..at + 2].try_into().unwrap()) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+    let (shoff, shentsize, shnum) = (u64_at(40) as usize, u16_at(58), u16_at(60));
+    let mut out = Expected::default();
+    for i in 0..shnum {
+        let h = shoff + i * shentsize;
+        let (kind, offset, size) = (
+            u32_at(h + 4),
+            u64_at(h + 24) as usize,
+            u64_at(h + 32) as usize,
+        );
+        match kind {
+            4 => {
+                // SHT_RELA
+                for r in file[offset..offset + size].as_chunks::<24>().0.iter() {
+                    let info = u64::from_le_bytes(r[8..16].try_into().unwrap());
+                    *out.kinds.entry(info as u32).or_default() += 1;
+                    out.with_symbol += u32::from(info >> 32 != 0);
+                }
+            }
+            19 => {
+                // SHT_RELR: an even word is a place, an odd one a bitmap.
+                for w in file[offset..offset + size].as_chunks::<8>().0.iter() {
+                    let w = u64::from_le_bytes(*w);
+                    out.relr += if w & 1 == 0 { 1 } else { (w >> 1).count_ones() };
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn bytes(name: &str) -> Vec<u8> {
+    std::fs::read(dir().join(name)).unwrap()
+}
+
+/// In the build that fills `target/libc-so` the files are required: the
+/// variable makes a missing one a failure instead of a skip.
+fn required() -> bool {
+    std::env::var_os("STAFETO_REQUIRE_LIBC_SO").is_some()
+}
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/libc-so")
@@ -34,6 +85,11 @@ fn world(program: &str) -> Option<World> {
     ) {
         (Ok(l), Ok(p)) => (l, p),
         _ => {
+            assert!(
+                !required(),
+                "{} has no libc.so and {program}",
+                dir().display()
+            );
             eprintln!("skipped: {} has no libc.so and {program}", dir().display());
             return None;
         }
@@ -64,7 +120,8 @@ fn world(program: &str) -> Option<World> {
 /// A libc.so from the probe has one undefined name, `main` (a GLOB_DAT of
 /// the layer); the library of the build has none. The record is turned
 /// into NONE so the rest is relocated the same.
-fn without_main(w: &mut World) {
+fn without_main(w: &mut World) -> bool {
+    let mut found = false;
     let d = w.library.dynamic;
     for i in 0..d.relasz / 24 {
         let at = d.rela + 24 * i;
@@ -75,9 +132,11 @@ fn without_main(w: &mut World) {
             let n = w.library.name_of(&w.space, &symbol, &mut name).unwrap();
             if &name[..n] == b"main" {
                 w.space.set_u64(at + 8, 0);
+                found = true;
             }
         }
     }
+    found
 }
 
 #[test]
@@ -123,28 +182,38 @@ fn libc_so_parses_and_has_what_programs_need() {
 #[test]
 fn libc_so_and_hello_are_relocated() {
     let Some(mut w) = world("hello") else { return };
-    without_main(&mut w);
+    let had_main = without_main(&mut w);
     let counts = relocate(&w.library, &w.program, &mut w.space).unwrap();
+    let (lib_want, prog_want) = (expected(&bytes("libc.so")), expected(&bytes("hello")));
+    let k = |e: &Expected, kind| e.kinds.get(&kind).copied().unwrap_or(0);
+    // Every record and place, less NONE and the GLOB_DAT of `main` that a
+    // probe build has and the test turned into NONE.
+    let all: u32 = lib_want
+        .kinds
+        .iter()
+        .filter(|(kind, _)| **kind != 0)
+        .map(|(_, n)| n)
+        .sum();
     assert_eq!(
         counts.library.total(),
-        LIBC_RELOCATIONS,
+        all + lib_want.relr - u32::from(had_main),
         "{:?}",
         counts.library
     );
+    assert_eq!(counts.library.relr, lib_want.relr);
+    assert_eq!(counts.library.relative, k(&lib_want, 1027));
+    assert_eq!(counts.library.tpoff, k(&lib_want, 1030));
     assert_eq!(
         counts.library.glob_dat + counts.library.jump_slot + counts.library.abs64,
         0
     );
-    assert!(counts.library.none <= 1, "at most the patched main");
+    assert_eq!(counts.program.jump_slot, k(&prog_want, 1026));
+    assert_eq!(counts.program.glob_dat, k(&prog_want, 1025));
     assert_eq!(
         counts.program.total(),
-        HELLO_RELOCATIONS,
-        "{:?}",
-        counts.program
+        k(&prog_want, 1026) + k(&prog_want, 1025)
     );
-    assert_eq!(counts.program.jump_slot, 6);
-    assert_eq!(counts.program.glob_dat, 2);
-    assert_eq!(counts.lookups, 8);
+    assert_eq!(counts.lookups, prog_want.with_symbol);
     check_slots(&w);
 }
 
@@ -155,13 +224,12 @@ fn a_bigger_program_is_relocated() {
     };
     without_main(&mut w);
     let counts = relocate(&w.library, &w.program, &mut w.space).unwrap();
-    assert_eq!(
-        counts.program.total(),
-        HELLO_BIG_RELOCATIONS,
-        "{:?}",
-        counts.program
-    );
-    assert_eq!(counts.program.jump_slot, 88);
+    let want = expected(&bytes("hello-big"));
+    let k = |kind| want.kinds.get(&kind).copied().unwrap_or(0);
+    assert_eq!(counts.program.jump_slot, k(1026));
+    assert_eq!(counts.program.glob_dat, k(1025));
+    assert_eq!(counts.program.total(), k(1026) + k(1025));
+    assert!(k(1026) > 50, "hello-big has many imports");
     check_slots(&w);
 }
 

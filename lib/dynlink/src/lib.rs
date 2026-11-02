@@ -176,8 +176,9 @@ pub enum Refusal {
     /// The name of a symbol is outside the string table, not ended, or
     /// longer than NAME_MAX.
     Name,
-    /// A symbol of the wrong type for the relocation (TLS and not, a
-    /// section symbol, `SHN_COMMON`).
+    /// A symbol whose type does not fit the relocation: an address needs an
+    /// object, a function or an untyped symbol, `TLS_TPREL64` needs a TLS
+    /// symbol, and section symbols and `SHN_COMMON` fit none.
     SymbolType(u32),
     /// A strong reference nothing defines, or a library reference to a name
     /// it does not define.

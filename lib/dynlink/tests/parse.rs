@@ -76,11 +76,10 @@ fn the_tags_that_are_skipped_pass() {
 }
 
 #[test]
-fn the_version_tags_pass_in_the_library_alone() {
-    for tag in [DT_VERSYM, DT_VERDEF, 0x6fff_fffd] {
-        let (b, s) = with(&lib(), tag, 0x1000);
-        assert!(b.parse(&s).is_ok(), "{tag:#x}");
-        assert_eq!(refused(&prog(), tag, 0x1000), Refusal::Tag(tag));
+fn the_version_tags_are_refused_in_both_modules() {
+    for tag in [DT_VERSYM, DT_VERDEF, 0x6fff_fffd, DT_VERNEED, 0x6fff_ffff] {
+        assert_eq!(refused(&lib(), tag, 0x1000), Refusal::Tag(tag), "{tag:#x}");
+        assert_eq!(refused(&prog(), tag, 0x1000), Refusal::Tag(tag), "{tag:#x}");
     }
 }
 

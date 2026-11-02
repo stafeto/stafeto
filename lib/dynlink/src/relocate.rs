@@ -109,8 +109,13 @@ fn resolve<M: Memory + ?Sized>(
 ) -> Result<u64, Refusal> {
     let tls = record.kind == R_AARCH64_TLS_TPREL64;
     if record.symbol == 0 {
-        // Without a symbol: the base of the block (TLS) or 0.
-        return if tls { tls_base(library) } else { Ok(0) };
+        // Without a symbol: the base of the block of libc.so (TLS, which only
+        // libc.so itself may ask for) or 0.
+        return match (tls, this.dynamic.role) {
+            (true, Role::Program) => Err(Refusal::Symbol(0)),
+            (true, Role::Library) => tls_base(library),
+            (false, _) => Ok(0),
+        };
     }
     let symbol = this.symbol(mem, record.symbol)?;
     let is_library = this.dynamic.role == Role::Library;
@@ -164,7 +169,7 @@ fn module<M: Memory + ?Sized>(
     let d = &this.dynamic;
     let map = this.map();
     let mut kinds = Kinds::default();
-    let records = (d.relasz + d.pltrelsz) / RELA_SIZE;
+    let records = d.relasz.checked_add(d.pltrelsz).ok_or(Refusal::Overflow)? / RELA_SIZE;
     if records > RELOCS_MAX as u64 {
         return Err(Refusal::Limit(Limit::Relocs));
     }
@@ -180,6 +185,11 @@ fn module<M: Memory + ?Sized>(
     let mut next = 0u64;
     for i in 0..d.relrsz / 8 {
         let word = map.u64(mem, d.relr + 8 * i, 36)?;
+        // Every word of the table counts, those without a bit too.
+        done += 1;
+        if done > RELOCS_MAX {
+            return Err(Refusal::Limit(Limit::Relocs));
+        }
         if word & 1 == 0 {
             relr_place(&map, mem, word, &mut kinds, &mut done)?;
             next = word.checked_add(8).ok_or(Refusal::Overflow)?;

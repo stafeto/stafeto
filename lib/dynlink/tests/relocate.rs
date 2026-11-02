@@ -378,6 +378,21 @@ fn tls_offsets_follow_the_block_of_the_library() {
 }
 
 #[test]
+fn a_program_asks_for_tls_through_a_symbol_alone() {
+    let mut l = lib().sym("tv", GLOBAL, TLS, 1, 0x20);
+    l.tls_align = 16;
+    let p = prog();
+    let p = p.clone().rel(p.rw(), R_TLS_TPREL64, None, 8);
+    assert_eq!(run(&l, &p).0, Err(Refusal::Symbol(0)));
+    let p = prog();
+    let p = p.clone().slot(p.rw(), R_TLS_TPREL64, None, 8);
+    assert_eq!(run(&l, &p).0, Err(Refusal::Symbol(0)));
+    // The library itself may.
+    let l2 = l.clone().rel(l.rw(), R_TLS_TPREL64, None, 8);
+    assert!(run(&l2, &prog()).0.is_ok());
+}
+
+#[test]
 fn tls_relocations_need_a_block_and_a_tls_symbol() {
     let tls_lib = |align| {
         let mut l = lib().sym("tv", GLOBAL, TLS, 1, 0x20);
@@ -628,29 +643,47 @@ fn the_limits_of_the_records_the_places_and_the_searches() {
         q = q.rel(p.rw(), R_RELATIVE, None, 0);
     }
     assert_eq!(run(&lib(), &q).0, Err(Refusal::Limit(Limit::Relocs)));
-    // RELR: each place the table applies counts as one record.
+    // RELR: every word of the table and every place it applies count as
+    // one record each.
     let mut l = lib();
     l.rw_size = 0x10_0000;
     let rw = l.rw();
-    for (bitmaps, ok) in [(1040usize, true), (1041, false)] {
+    for (bitmaps, ok) in [(1023usize, true), (1024, false)] {
         let mut l = l.clone();
         l.relr = vec![rw];
         l.relr.extend(std::iter::repeat_n(u64::MAX, bitmaps));
         let (result, ..) = run(&l, &prog());
         if ok {
-            assert_eq!(result.unwrap().library.relr, 1 + 63 * 1040);
+            assert_eq!(result.unwrap().library.relr as usize, 1 + 63 * bitmaps);
+        } else {
+            assert_eq!(result, Err(Refusal::Limit(Limit::Relocs)));
+        }
+    }
+    // A table of words without a bit does no work and still counts.
+    for (words, ok) in [
+        (RELOCS_MAX as usize - 1, true),
+        (RELOCS_MAX as usize, false),
+    ] {
+        let mut l = lib();
+        l.r_size = 0x10_0000;
+        let rw = l.rw();
+        l.relr = vec![rw];
+        l.relr.extend(std::iter::repeat_n(1u64, words - 1));
+        let (result, ..) = run(&l, &prog());
+        if ok {
+            assert_eq!(result.unwrap().library.relr, 1);
         } else {
             assert_eq!(result, Err(Refusal::Limit(Limit::Relocs)));
         }
     }
     // The records and the places add up.
     let mut l = lib();
-    for _ in 0..16 {
+    for _ in 0..100 {
         l = l.rel(rw, R_RELATIVE, None, 0);
     }
     l.rw_size = 0x10_0000;
     l.relr = vec![rw];
-    l.relr.extend(std::iter::repeat_n(u64::MAX, 1040));
+    l.relr.extend(std::iter::repeat_n(u64::MAX, 1023));
     assert_eq!(run(&l, &prog()).0, Err(Refusal::Limit(Limit::Relocs)));
     // LOOKUPS_MAX searches pass, one more is refused.
     let mut p = prog().undef("f", GLOBAL);

@@ -40,11 +40,8 @@ const DT_RELRSZ: i64 = 35;
 const DT_RELR: i64 = 36;
 const DT_RELRENT: i64 = 37;
 const DT_GNU_HASH: i64 = 0x6fff_fef5;
-const DT_VERSYM: i64 = 0x6fff_fff0;
 const DT_RELACOUNT: i64 = 0x6fff_fff9;
 const DT_FLAGS_1: i64 = 0x6fff_fffb;
-const DT_VERDEF: i64 = 0x6fff_fffc;
-const DT_VERDEFNUM: i64 = 0x6fff_fffd;
 /// The tags of the AArch64 psABI (BTI, PAC, variant PCS, memory tagging).
 const DT_AARCH64: core::ops::RangeInclusive<i64> = 0x7000_0000..=0x7000_000f;
 
@@ -182,7 +179,6 @@ pub fn parse<M: Memory + ?Sized>(
             // the relocations, the others the loader never reads.
             DT_BIND_NOW | DT_SYMBOLIC | DT_PLTGOT | DT_RELACOUNT | DT_DEBUG | DT_SONAME
             | DT_HASH | DT_RPATH | DT_RUNPATH => {}
-            DT_VERSYM | DT_VERDEF | DT_VERDEFNUM if role == Role::Library => {}
             t if DT_AARCH64.contains(&t) => {}
             // DT_TEXTREL, DT_INIT, DT_FINI, DT_VERNEED, DT_REL*, anything else.
             _ => return Err(Refusal::Tag(tag)),
@@ -307,8 +303,11 @@ fn hash_geometry<M: Memory + ?Sized>(
     if nbuckets > SYMBOLS_MAX || bloom_size > SYMBOLS_MAX || symoffset > SYMBOLS_MAX {
         return Err(Refusal::Limit(Limit::Symbols));
     }
-    let buckets = at + 16 + 8 * bloom_size as u64;
-    let chains = buckets + 4 * nbuckets as u64;
+    let buckets = at.checked_add(16 + 8 * bloom_size as u64);
+    let chains = buckets.and_then(|b| b.checked_add(4 * nbuckets as u64));
+    let (Some(buckets), Some(chains)) = (buckets, chains) else {
+        return Err(Refusal::Table(TAG));
+    };
     if !map.contains(at, chains - at) {
         return Err(Refusal::Table(TAG));
     }
