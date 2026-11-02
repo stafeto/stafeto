@@ -39,6 +39,7 @@ mod gpu_probe;
 mod guards;
 mod htop_dialog;
 mod image;
+mod input_probe;
 mod jobs;
 mod measure;
 mod monitor;
@@ -1640,6 +1641,9 @@ commands:
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
             steps under -icount; with --hvf under HVF
+  input-probe [--hvf] run the probe of the input service in QEMU: keys sent
+            by the monitor reach the focus, the owner of the screen has it,
+            and the service's steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
@@ -1880,6 +1884,14 @@ fn main() {
                 gpu_probe::probe(&qemu::HVF_V2)
             }),
             Some(_) => Err("gpu-probe [--hvf]".to_owned()),
+        },
+        Some("input-probe") => match args.get(1).map(String::as_str) {
+            None => input_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                input_probe::probe(&qemu::HVF_V3)?;
+                input_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("input-probe [--hvf]".to_owned()),
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("help") | None => {
@@ -8723,6 +8735,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
+        // The input service on virtio-input: keys from the monitor reach
+        // the focus, then its steps under -icount.
+        job("input-probe", || input_probe::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -8840,6 +8855,10 @@ fn host_tests() -> Result<(), String> {
         "virtio-mmio",
         "--package",
         "virtio-gpu",
+        "--package",
+        "proto-input",
+        "--package",
+        "virtio-input",
     ]))
 }
 
@@ -11082,6 +11101,9 @@ fn hvf() -> Result<(), String> {
         // The display service: the buffer through the real processor's
         // caches, shown without a clean (spec 3, 3.4).
         gpu_probe::probe(m)?;
+        // The input service on the real processor, and its focus with the
+        // display service.
+        input_probe::probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -11389,6 +11411,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-gpu",
         "--package",
+        "proto-input",
+        "--package",
         "virtio-mmio",
         "--all-targets",
         "--",
@@ -11421,6 +11445,8 @@ fn ci_lints() -> Result<(), String> {
         "entropy",
         "--package",
         "virtio-gpu",
+        "--package",
+        "virtio-input",
         "--lib",
         "--tests",
         "--",
@@ -11550,8 +11576,12 @@ fn ci_lints() -> Result<(), String> {
         "virtio-gpu",
         "--package",
         "gpu-probe",
+        "--package",
+        "virtio-input",
+        "--package",
+        "input-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick",
         "--target",
         PROGRAM_TARGET,
         "--",
