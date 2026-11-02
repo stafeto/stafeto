@@ -2965,8 +2965,8 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
         run.send("hi")?;
         run.expect("posix-tty: canonical read gave 3 bytes", DIALOG_STEP)?;
         for (ask, typed, done) in [
-            ("type junk", &b"junk"[..], "tcflush dropped the input"),
-            ("type more junk", b"more", "TCSAFLUSH dropped the input"),
+            ("type junk", &b"j"[..], "tcflush dropped the input"),
+            ("type more junk", b"m", "TCSAFLUSH dropped the input"),
             ("type k", b"k", "input after a flush is read"),
         ] {
             run.expect(&format!("posix-tty: {ask}"), DIALOG_STEP)?;
