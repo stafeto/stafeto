@@ -397,7 +397,10 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     let mut kept: Kept = [const { None }; MAX_DMA];
     for (i, d) in record.dma.iter().enumerate() {
         let (object, pa) = sys::mem_create_contiguous(d.size, d.uncached, &resource)?;
-        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let mut rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        if d.duplicate {
+            rights = rights | Rights::DUPLICATE;
+        }
         let copy = sys::handle_duplicate(&object, rights)?;
         // The checks of the table keep the names apart from the others of
         // the start data, and MAX_DMA keeps them within its room.

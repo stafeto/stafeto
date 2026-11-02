@@ -1,0 +1,38 @@
+[package]
+name = "virtio-gpu"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The driver of the Virtio GPU in 2D mode on virtio-mmio: the display service of stafeto, one screen, one owner"
+
+# What the driver decides, apart from the device and the calls: tested on
+# the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "virtio-gpu"
+test = false
+bench = false
+
+# `crash`: the method CRASH of proto_gpu, for the restart probe.
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount.
+[features]
+crash = []
+steps = ["rt/step-stats"]
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+virtio-mmio = { path = "../../lib/virtio-mmio" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt and without the device's crate beyond virtio-mmio.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
