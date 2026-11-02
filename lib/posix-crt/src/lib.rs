@@ -471,6 +471,22 @@ fn loaded_main() -> u64 {
     // `main` came with the call of `stafeto_start`.
     #[cfg(feature = "shared")]
     let main: Main = {
+        // AT_SECURE comes from the loader and the layer took SECURE from the
+        // start area; where they differ the secure value stands.
+        if area.flags & SECURE != 0 {
+            // SAFETY: the loader left proto_loader::AUXV_PAIRS pairs there.
+            let auxv = unsafe {
+                core::slice::from_raw_parts_mut(
+                    area.auxv as *mut usize,
+                    2 * proto_loader::AUXV_PAIRS,
+                )
+            };
+            for pair in auxv.chunks_exact_mut(2) {
+                if pair[0] == 23 {
+                    pair[1] = 1;
+                }
+            }
+        }
         let word = PROGRAM_MAIN.load(Ordering::Acquire);
         if word == 0 {
             return 125;

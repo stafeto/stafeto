@@ -122,12 +122,15 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # negative number is EBADF, execvp stops its search after the shell, posix_spawnp
 # with a slash runs a script, a damaged line of /etc/services is passed over;
 # tagged pin-2688672c. A new thread waits for the creator to register it, so
-# pthread_create returns in the creator first; tagged pin-c5be8d7c. Shared C library (#433): with AT_STAFETO_TLS in the
-# auxiliary vector the TLS image comes from the PT_TLS header of libc.so, and
-# the start runs the constructor arrays of a dynamically linked program (its
-# preinit array, the library's arrays, its init array); without the key the
-# start is as before; tagged pin-1e13c063.
-COMMIT = "1e13c06356a738aa6ce0a2f78728cb8da7c1261a"
+# pthread_create returns in the creator first; tagged pin-c5be8d7c.
+# Shared C library (#433): with AT_STAFETO_TLS in the auxiliary vector the TLS
+# image comes from the PT_TLS header of libc.so, and the start runs the
+# constructor arrays of a dynamically linked program (its preinit array, the
+# library's arrays, its init array) while exit runs its DT_FINI_ARRAY
+# backwards after the atexit functions; a header the loader named wrongly
+# ends the start with 125; without the key the start is as before; tagged
+# pin-70c35b46.
+COMMIT = "70c35b4641e6459b399ba674c605b3965660e738"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

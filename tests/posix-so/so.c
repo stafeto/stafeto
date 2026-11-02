@@ -117,6 +117,8 @@ static void hello(void) {
     check(1, "so-hello starts", error == 0 && exited_with(status, 0));
     check(1, "so-hello sees arguments, environment, stdout, errno and the constructors",
           strstr(buf, "so-hello: argc=1 order=123 bits=0\n") != NULL);
+    check(1, "the destructor of the program runs after main",
+          strstr(buf, "so-hello: argc=1 order=123 bits=0\nso-hello: destructor\n") != NULL);
     if (bits & 1) printf("posix-so: so-hello said: %s", buf);
 }
 

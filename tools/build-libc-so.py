@@ -125,7 +125,7 @@ def run(*args, cwd=None, env=None, capture=False, check=True):
 
 # ---------------------------------------------------------------- ELF reader
 
-PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_TLS = 1, 2, 3, 7
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_PHDR, PT_TLS = 1, 2, 3, 6, 7
 PF_X, PF_W, PF_R = 1, 2, 4
 DT = {"NULL": 0, "NEEDED": 1, "PLTRELSZ": 2, "HASH": 4, "STRTAB": 5, "SYMTAB": 6, "RELA": 7,
       "RELASZ": 8, "INIT": 12, "FINI": 13, "SONAME": 14, "SYMBOLIC": 16, "REL": 17,
@@ -308,7 +308,13 @@ def build_layer() -> Path:
     env = dict(os.environ)
     for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
-    env["RUSTFLAGS"] = LAYER_RUSTFLAGS
+    # No path of this machine in libc.so: the workspace, the toolchain's
+    # library sources and CARGO_HOME get fixed names (as tools/build-relibc.py).
+    sysroot = run("rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot", capture=True).stdout.strip()
+    cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+    remap = " ".join(f"--remap-path-prefix={path}={name}" for path, name in
+                     ((ROOT, "/stafeto"), (sysroot, "/rust"), (cargo_home, "/cargo")))
+    env["RUSTFLAGS"] = f"{LAYER_RUSTFLAGS} {remap}"
     env["CARGO_TARGET_DIR"] = str(OUT / "layer")
     # The precompiled core of the stable toolchain is static (ABS64 against
     # local symbols in .rodata), which ld.lld refuses in a shared object:
@@ -385,7 +391,7 @@ def segment_pages(s: dict) -> range:
     return range(s["vaddr"] // PAGE, -(-(s["vaddr"] + s["memsz"]) // PAGE))
 
 
-def check_library(path: Path, names: dict, layer_a: Path) -> list:
+def check_library(path: Path, names: dict, layer_a: Path, libc_a: Path) -> list:
     """The checks of 3.12.3; any violation is a Failure. Returns the lines
     of what was checked, for the report."""
     elf = Elf(path)
@@ -410,6 +416,16 @@ def check_library(path: Path, names: dict, layer_a: Path) -> list:
     rw = loads[2]
     need(rw["vaddr"] <= tls[0]["vaddr"] and tls[0]["vaddr"] + tls[0]["filesz"] <= rw["vaddr"] + rw["filesz"],
          "PT_TLS lies outside the file bytes of the RW segment")
+    need(tls[0]["align"] > 0 and tls[0]["vaddr"] % tls[0]["align"] == 0,
+         "PT_TLS.p_vaddr is not a multiple of its alignment")
+    for s in elf.segments:
+        if s["type"] == PT_PHDR:
+            need(loads[0]["vaddr"] <= s["vaddr"]
+                 and s["vaddr"] + s["filesz"] <= loads[0]["vaddr"] + loads[0]["filesz"],
+                 "PT_PHDR lies outside the R segment")
+    # The loader hands out the address of the PT_TLS header: it lies in R.
+    need(loads[0]["offset"] == 0 and elf.phoff + elf.phnum * 56 <= loads[0]["filesz"],
+         "the program headers lie outside the R segment")
     dyn = [s for s in elf.segments if s["type"] == PT_DYNAMIC]
     need(len(dyn) == 1 and rw["vaddr"] <= dyn[0]["vaddr"]
          and dyn[0]["vaddr"] + dyn[0]["filesz"] <= rw["vaddr"] + rw["filesz"],
@@ -433,7 +449,7 @@ def check_library(path: Path, names: dict, layer_a: Path) -> list:
     need(not undefined, f"undefined symbols: {' '.join(undefined)}")
     # `main` and `__ehdr_start` are named by nothing in the library, in the
     # archive of the layer either.
-    for archive in (layer_a,):
+    for archive in (layer_a, libc_a):
         refs = archive_names(archive, "--undefined-only") & {"main", "__ehdr_start"}
         need(not refs, f"{archive.name} refers to {' '.join(sorted(refs))}")
     exported = {n for n, is_def, bind, vis, _ in symbols if is_def and n and vis == 0}
@@ -442,6 +458,8 @@ def check_library(path: Path, names: dict, layer_a: Path) -> list:
          f"{' '.join(hidden[:20])}")
     extra = sorted(exported - set(names))
     need(not extra, f"{len(extra)} names are exported that the list lacks: {' '.join(extra[:20])}")
+    for marker in (str(Path.home()), ".rustup", ".cargo"):
+        need(marker.encode() not in elf.data, f"a path of this machine ({marker}) is in the file")
     chains = elf.chain_lengths()
     need(max(chains) <= CHAIN_LIMIT, f"the longest GNU hash chain has {max(chains)} entries "
          f"(at most {CHAIN_LIMIT})")
@@ -468,13 +486,15 @@ def build(source: Path | None) -> None:
     script = OUT / "libc.map"
     script.write_text("{ global:\n" + "".join(f"  {n};\n" for n in sorted(names))
                       + " local: *; };\n")
-    final = OUT / "libc.so"
+    final = OUT / "libc.so.new"
     link_so(final, libc_a, layer_a,
             ["-z", "pack-relative-relocs", f"--version-script={script}"])
     run(llvm("llvm-objcopy"), "--strip-debug", final)
-    notes = check_library(final, names, layer_a)
+    notes = check_library(final, names, layer_a, libc_a)
     for line in notes:
         print("check:", line)
+    os.replace(final, OUT / "libc.so")
+    final = OUT / "libc.so"
 
     # The sysroot: the headers of the static one, libc.so, crt1.o.
     shutil.rmtree(SYSROOT, ignore_errors=True)

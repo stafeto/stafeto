@@ -27,6 +27,12 @@ __attribute__((section(".preinit_array"), used)) static void (*const pre_entry)(
 __attribute__((constructor(101))) static void first(void) { order[ran++ & 3] = 2; }
 __attribute__((constructor)) static void second(void) { order[ran++ & 3] = 3; }
 
+/* A destructor prints when the program ends through exit. */
+__attribute__((destructor)) static void last(void) {
+    printf("so-hello: destructor\n");
+    fflush(stdout);
+}
+
 static void *errno_thread(void *arg) {
     int mine = 100 + (int)(long)arg;
     int bad = 0;
