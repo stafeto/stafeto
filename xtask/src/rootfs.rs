@@ -758,6 +758,8 @@ fn rtbench() -> Vec<RootFile> {
         file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
+        file("/bin/ls-dyn", 0o755, ROOT, "busybox-dyn"),
+        file("/bin/cat-dyn", 0o755, ROOT, "busybox-dyn"),
         dir("/dev"),
     ]);
     files.extend(devices());

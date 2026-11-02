@@ -14,9 +14,9 @@ Subcommands:
   link -o OUT OBJECT_OR_ARCHIVE...
           link a dynamic program against that sysroot (the recipe of
           3.12.3; the programs of the images use it).
-  programs
-          link the dynamic programs of the images (BusyBox, bash, nano, htop,
-          ncdu) from the objects their build scripts left, into
+  programs [NAME...]
+          link the dynamic programs of the images (busybox, busybox-utils,
+          bash, nano, htop, ncdu; all by default) from the objects their build scripts left, into
           target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the
@@ -73,10 +73,10 @@ ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image"]
 # of AArch64, binary128 long double, 128-bit integers.
 HELPER = re.compile(r"^(__aarch64_\w+|__[a-z]+(tf|ti)[0-9]|__(fix|float|extend|trunc)\w*(tf|ti)\w*)$")
 
-# Helpers (the binary128 and 128-bit integer ones of compiler_builtins) that
-# no object of libc.so refers to and the objects of programs do: the link
-# keeps them (`-u`) and the export list names them (HELPER). Filled from
-# relibc's archive by `build`.
+# Helpers (the binary128 and 128-bit integer ones of compiler_builtins):
+# programs call them, and libc.so's own objects mostly do not. The link keeps
+# every one that relibc's archive defines (`-u`, 52 of them) and the export
+# list names them (HELPER). Filled from relibc's archive by `build`.
 HELPER_KEEP: dict = {}
 CLANG_FLAGS = ["--target=aarch64-linux-gnu", "-mfix-cortex-a53-835769", "-nostdinc",
                "-fno-stack-protector", "-fno-builtin", "-std=c11", "-O2", "-Wall", "-Wextra",
@@ -732,20 +732,25 @@ def program_inputs() -> dict:
     }
 
 
-def build_programs() -> list:
-    """Links each program whose objects exist; returns the names built."""
+def build_programs(wanted_names: list) -> list:
+    """Links the programs `wanted_names` (all when empty); each needs its
+    objects, built by the script of its package. Returns the names built."""
+    known = program_inputs()
+    unknown = [n for n in wanted_names if n not in known]
+    if unknown:
+        fail(f"unknown program {unknown[0]}")
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
     PROGRAMS.mkdir(parents=True, exist_ok=True)
     work = PROGRAMS / "obj"
     work.mkdir(exist_ok=True)
     built, lines = [], []
-    for name, inputs in program_inputs().items():
-        missing = [p for p in inputs if not p.exists()]
-        if len(missing) == len(inputs):
+    for name, inputs in known.items():
+        if wanted_names and name not in wanted_names:
             continue
+        missing = [p for p in inputs if not p.exists()]
         if missing:
-            fail(f"{name}: missing {missing[0]}")
+            fail(f"{name}: missing {missing[0]}: build its package first")
         stamp = PROGRAMS / f"{name}.stamp"
         wanted = "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
                             digest(Path(__file__)),
@@ -758,7 +763,7 @@ def build_programs() -> list:
         stamp.unlink(missing_ok=True)
         objects = list(inputs)
         if name.startswith("busybox"):
-            compile_c(BUSYBOX_MAIN, work / f"{name}-main.o", "-Dmain=main")
+            compile_c(BUSYBOX_MAIN, work / f"{name}-main.o")
             objects.insert(0, work / f"{name}-main.o")
         result = link_program(output, objects, ["--gc-sections"], capture=True)
         if result.returncode != 0:
@@ -830,7 +835,7 @@ def main(argv: list) -> None:
                 sys.exit("usage: build-libc-so.py link -o OUT OBJECT_OR_ARCHIVE...")
             link_program(Path(rest[1]), rest[2:])
         elif command == "programs":
-            print("programs:", " ".join(build_programs()))
+            print("programs:", " ".join(build_programs(rest)))
             print((PROGRAMS / "report.txt").read_text(), end="")
         elif command == "probes":
             print("probes:", " ".join(build_probes()))
