@@ -544,6 +544,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-so-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-sock"
 version = "0.1.0"
 dependencies = [
