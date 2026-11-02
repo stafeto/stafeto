@@ -69,6 +69,11 @@ pub const IPC_TAG: u32 = 1 << 29;
 /// The operations that wait the service counts: receivers (a notification
 /// of a queue is not sent while one waits) and `semop`s (GETNCNT, GETZCNT).
 pub const BLOCKED_MAX: usize = 128;
+/// The wakes of departed waiters by address that wait for a step.
+const ORPHANS_MAX: usize = 32;
+/// The highest level a waiter by address may have: the ceiling of the
+/// processes of POSIX; the service does not know the level of a client.
+const ADDR_LEVEL_MAX: u8 = 36;
 
 // Linux's numbers, relibc's.
 const EPERM: u32 = 1;
@@ -179,6 +184,14 @@ pub struct Word {
     kind: u64,
     key: u64,
     off: u64,
+}
+
+impl Word {
+    const ZERO: Word = Word {
+        kind: 0,
+        key: 0,
+        off: 0,
+    };
 }
 
 /// What a call came to: done, or to wait at a queue.
@@ -483,9 +496,6 @@ enum Wait {
     /// (A wait by address.) The wake of a waiter that left was passed to
     /// it, and a step is to tell it: its take returns without waiting.
     Handed,
-    /// (A wait by address.) The session of a waiter that was woken went: the
-    /// slot stays until a step has passed the wake on.
-    Orphan,
 }
 
 pub struct Ipc {
@@ -512,6 +522,11 @@ pub struct Ipc {
     /// `blocked`; the word of the start that `note_wait` is to place.
     words: [Word; BLOCKED_MAX],
     start_word: Word,
+    /// The words whose wake a session that went held: a step passes each on
+    /// (one search in a step), `ORPHANS_MAX` at most; past that the search
+    /// is made at once.
+    orphans: [Word; ORPHANS_MAX],
+    orphans_len: u8,
     /// The places of segments whose file's removal the file service has not
     /// taken: a new segment does not get them.
     busy_segs: u8,
@@ -610,11 +625,9 @@ impl Ipc {
                 key: 0,
                 off: 0,
             }; BLOCKED_MAX],
-            start_word: Word {
-                kind: 0,
-                key: 0,
-                off: 0,
-            },
+            start_word: Word::ZERO,
+            orphans: [Word::ZERO; ORPHANS_MAX],
+            orphans_len: 0,
             busy_segs: 0,
             pool: End::NONE,
             own: [None; SEGS],
@@ -1128,41 +1141,34 @@ impl Ipc {
         if self.counted == 0 {
             return;
         }
-        let mut orphans = false;
-        for b in &mut self.blocked {
-            if b.used && b.label == label {
-                if let Block::Named(_) = b.block
-                    && b.state == Wait::Granted
-                    && let Some(s) = Self::set_of(b.queue)
-                {
-                    self.owed[s] += 1;
-                }
-                if let Block::Addr(_) = b.block
-                    && matches!(b.state, Wait::Granted | Wait::Handed)
-                {
-                    // Freed below, once the session's other waiters are gone
-                    // too, so that the wake goes to one of another session.
-                    if b.state == Wait::Handed {
-                        self.addr_pending -= 1;
-                    }
-                    b.state = Wait::Orphan;
-                    orphans = true;
-                    continue;
-                }
-                *b = BLOCKED_FREE;
-                self.counted -= 1;
-            }
-        }
-        if !orphans {
-            return;
-        }
         for at in 0..BLOCKED_MAX {
-            let b = &self.blocked[at];
-            if b.used && b.label == label && b.state == Wait::Orphan {
-                self.blocked[at] = BLOCKED_FREE;
-                self.counted -= 1;
-                self.hand_addr(self.words[at], None);
+            let b = &mut self.blocked[at];
+            if !(b.used && b.label == label) {
+                continue;
             }
+            if let Block::Named(_) = b.block
+                && b.state == Wait::Granted
+                && let Some(s) = Self::set_of(b.queue)
+            {
+                self.owed[s] += 1;
+            }
+            if let Block::Addr(_) = b.block
+                && matches!(b.state, Wait::Granted | Wait::Handed)
+            {
+                // The wake it held goes on in a step, the search there.
+                if b.state == Wait::Handed {
+                    self.addr_pending -= 1;
+                }
+                let word = self.words[at];
+                if usize::from(self.orphans_len) < ORPHANS_MAX {
+                    self.orphans[usize::from(self.orphans_len)] = word;
+                    self.orphans_len += 1;
+                } else {
+                    self.hand_addr(word, None);
+                }
+            }
+            self.blocked[at] = BLOCKED_FREE;
+            self.counted -= 1;
         }
     }
 
@@ -1347,6 +1353,12 @@ impl Ipc {
 
     /// One of the waiters by address that a step is to tell, if any.
     fn addr_step(&mut self, wakes: &mut Wakes) -> bool {
+        if self.orphans_len != 0 {
+            self.orphans_len -= 1;
+            let word = self.orphans[usize::from(self.orphans_len)];
+            self.hand_addr(word, Some(wakes));
+            return true;
+        }
         if self.addr_pending == 0 {
             return false;
         }
@@ -1389,7 +1401,7 @@ impl Ipc {
         self.start_word = word;
         Flow::Wait {
             queue: Self::set_number(0),
-            block: Block::Addr(w[3].min(255) as u8),
+            block: Block::Addr(w[3].min(u64::from(ADDR_LEVEL_MAX)) as u8),
         }
     }
 
@@ -1422,6 +1434,7 @@ impl Ipc {
         self.dying != 0
             || self.gone_sets != 0
             || self.addr_pending != 0
+            || self.orphans_len != 0
             || self.owed.iter().any(|&n| n != 0)
     }
 
@@ -3902,7 +3915,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!((total, calls), (40, 6));
+        assert_eq!((total, calls), (40, 11));
         for n in 1..=40u64 {
             assert!(addr_take(&mut r, &mut p, 1, n, 5, 0));
         }

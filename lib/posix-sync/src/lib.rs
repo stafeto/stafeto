@@ -343,6 +343,15 @@ fn shared(address: usize) -> bool {
     hook(address)
 }
 
+/// The waits on words of shared mappings that went to the poll at 1 ms
+/// because the service could not hold them (no key, or its table full).
+static POLLED: AtomicU32 = AtomicU32::new(0);
+
+/// How many waits on shared words fell back to the poll (for probes).
+pub fn polled() -> u32 {
+    POLLED.load(Ordering::Relaxed)
+}
+
 /// How a wait through the service ended.
 pub enum Remote {
     /// The service woke the wait.
@@ -496,7 +505,9 @@ pub fn futex_wait(
             Remote::Entry => return Ok(Woken::Entry),
             Remote::TimedOut => return Err(ETIMEDOUT),
             Remote::Unavailable if changed.get() => return Err(EAGAIN),
-            Remote::Unavailable => {}
+            Remote::Unavailable => {
+                POLLED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     // A word in a mapping the service cannot hold a wait for: the wait polls.
@@ -629,6 +640,10 @@ pub fn resume_wait(abandoned: bool) {
 /// Wakes up to `count` threads that wait on `word`, the highest level
 /// first; returns how many. Never fails (relibc unwraps its result). With
 /// no waiter in the bucket it makes no call of the kernel.
+///
+/// For a word of a shared mapping it asks the layer for the key of the word,
+/// which takes the heap's lock (`mmap::wait_word`): it is never called with
+/// that lock held (the allocation's own code does not wake by address).
 pub fn futex_wake(word: *const AtomicU32, count: u32) -> u32 {
     let local = wake_local(word, count);
     // The waiters of the word in other processes wait in the service.

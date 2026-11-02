@@ -1784,6 +1784,8 @@ static int shared_idle(int named) {
     return 0;
 }
 
+extern unsigned stafeto_shared_polls(void);
+
 static struct shared *many_page;
 
 static void *many_waiter(void *arg) {
@@ -1806,7 +1808,7 @@ static void *many_waiter(void *arg) {
  * wakes all (the service wakes a list at a time; xtask measures its longest
  * step). */
 static int shared_many(void) {
-    enum { EACH = 12, CHILDREN = 2, ALL = EACH * (CHILDREN + 1) };
+    enum { EACH = 20, CHILDREN = 2, ALL = EACH * (CHILDREN + 1) };
     many_page = shared_page(0);
     struct shared *s = many_page;
     CHECK(s != NULL);
@@ -1859,6 +1861,7 @@ static int shared_many(void) {
     }
     for (int c = 0; c < CHILDREN; c++) CHECK(wait_ok(pids[c]));
     CHECK(s->turn == ALL);
+    printf("posix-ipc: shared_many: %u waits fell back to the poll\n", stafeto_shared_polls());
     CHECK(munmap(s, 4096) == 0);
     return 0;
 }
@@ -1902,6 +1905,68 @@ static int shared_owner(int named) {
 }
 static int shared_anonymous_owner(void) { return shared_owner(0); }
 static int shared_named_owner(void) { return shared_owner(1); }
+
+static sem_t *pass_sem;
+static volatile int pass_result[2], pass_errno[2], pass_ready;
+
+static void on_pass(int sig) { (void)sig; }
+
+static void *pass_waiter(void *arg) {
+    int i = (int)(intptr_t)arg;
+    __atomic_fetch_add(&pass_ready, 1, __ATOMIC_SEQ_CST);
+    errno = 0;
+    pass_result[i] = sem_wait(pass_sem) == 0 ? 1 : -1;
+    pass_errno[i] = errno;
+    return NULL;
+}
+
+/* A post gives its unit to the first waiter; when a signal ends that waiter's
+ * wait before it took the unit, the unit goes to the other one. */
+static int sem_signal_pass(int shared) {
+    struct shared *page = shared ? shared_page(0) : NULL;
+    static sem_t own;
+    pass_sem = shared ? &page->sem : &own;
+    CHECK(sem_init(pass_sem, shared, 0) == 0);
+    pass_result[0] = pass_result[1] = 0;
+    pass_ready = 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_pass;
+    CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
+    set_priority(30);
+    pthread_t t[2];
+    static const int levels[2] = {20, 10};
+    for (int i = 0; i < 2; i++) {
+        pthread_attr_t attr;
+        struct sched_param param = {levels[i]};
+        CHECK(pthread_attr_init(&attr) == 0);
+        CHECK(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0);
+        CHECK(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0);
+        CHECK(pthread_attr_setschedparam(&attr, &param) == 0);
+        CHECK(pthread_create(&t[i], &attr, pass_waiter, (void *)(intptr_t)i) == 0);
+        CHECK(pthread_attr_destroy(&attr) == 0);
+    }
+    for (int i = 0; i < 500 && pass_ready != 2; i++) pause_ms(10);
+    CHECK(pass_ready == 2);
+    pause_ms(300);
+    CHECK(sem_post(pass_sem) == 0);
+    CHECK(pthread_kill(t[0], SIGUSR1) == 0);
+    for (int i = 0; i < 400 && !(pass_result[0] && pass_result[1]); i++) pause_ms(5);
+    /* The first ended with EINTR, or took the unit before the signal; in
+     * either case the unit is not left with nobody to take it. */
+    CHECK(pass_result[0] != 0);
+    if (pass_result[0] < 0) {
+        CHECK(pass_errno[0] == EINTR);
+        CHECK(pass_result[1] == 1);
+    } else {
+        CHECK(pass_result[1] == 0);
+        CHECK(sem_post(pass_sem) == 0);
+    }
+    for (int i = 0; i < 2; i++) CHECK(pthread_join(t[i], NULL) == 0);
+    return 0;
+}
+static int sem_signal_pass_private(void) { return sem_signal_pass(0); }
+static int sem_signal_pass_shared(void) { return sem_signal_pass(1); }
 
 static int shared_anonymous_order(void) { return shared_order(0); }
 static int shared_named_order(void) { return shared_order(1); }
@@ -1947,6 +2012,8 @@ int main(int argc, char **argv) {
     RUN(sem_waiters);
     RUN(named_waits);
     RUN(sem_session_ends);
+    RUN(sem_signal_pass_private);
+    RUN(sem_signal_pass_shared);
     RUN(shared_anonymous_order);
     RUN(shared_named_order);
     RUN(shared_anonymous_latency);

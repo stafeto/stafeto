@@ -155,7 +155,7 @@ pub mod op {
     /// The most waiters one `ADDR_WAKE` wakes: a notification for each, and a
     /// step of the service stays under term B. The caller asks again when
     /// it got that many.
-    pub const ADDR_WAKE_MAX: usize = 8;
+    pub const ADDR_WAKE_MAX: usize = 4;
 
     /// Whether the operation is a long one: a start that may answer WAIT
     /// and the takes that follow.
