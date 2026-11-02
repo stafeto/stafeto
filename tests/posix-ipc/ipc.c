@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
+#include <sys/resource.h>
+#include <sys/mman.h>
 #include <sys/msg.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
@@ -1523,6 +1525,276 @@ static int longest_steps(void) {
     return 0;
 }
 
+/* ---- Waits by address between processes (pshared words in MAP_SHARED) ---- */
+
+#define SH_KIDS 6
+struct shared {
+    sem_t sem;
+    sem_t ping, pong;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    volatile int started, done, flag, count, turn;
+    int log[SH_KIDS];
+};
+
+/* The shared page: anonymous (after fork the child shares it), or a shared
+ * memory object that every process maps by its name. */
+static struct shared *shared_page(int named) {
+    void *p;
+    if (named) {
+        shm_unlink("/ipc-shared");
+        int fd = shm_open("/ipc-shared", O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0 || ftruncate(fd, 4096) != 0) return NULL;
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        shm_unlink("/ipc-shared");
+    } else {
+        p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    }
+    if (p == MAP_FAILED) return NULL;
+    memset(p, 0, 4096);
+    return p;
+}
+
+static void set_priority(int priority) {
+    struct sched_param param = {priority};
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+}
+
+/* Six processes of six priorities wait on one semaphore of a shared page: the
+ * posts wake them in the order of the priorities, one for each post. */
+static int shared_order(int named) {
+    static const int priorities[SH_KIDS] = {9, 21, 14, 27, 5, 18};
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    CHECK(sem_init(&s->sem, 1, 0) == 0);
+    pid_t pids[SH_KIDS];
+    for (int i = 0; i < SH_KIDS; i++) {
+        pids[i] = fork();
+        CHECK(pids[i] >= 0);
+        if (pids[i] == 0) {
+            set_priority(priorities[i]);
+            __atomic_fetch_add(&s->started, 1, __ATOMIC_SEQ_CST);
+            if (sem_wait(&s->sem) != 0) _exit(1);
+            int at = __atomic_fetch_add(&s->done, 1, __ATOMIC_SEQ_CST);
+            s->log[at] = priorities[i];
+            _exit(0);
+        }
+    }
+    for (int i = 0; i < 500 && s->started != SH_KIDS; i++) pause_ms(10);
+    CHECK(s->started == SH_KIDS);
+    pause_ms(500);
+    CHECK(s->done == 0);
+    for (int i = 0; i < SH_KIDS; i++) {
+        CHECK(sem_post(&s->sem) == 0);
+        for (int k = 0; k < 400 && s->done != i + 1; k++) pause_ms(5);
+        CHECK(s->done == i + 1);
+        pause_ms(20);
+    }
+    for (int i = 0; i < SH_KIDS; i++) CHECK(wait_ok(pids[i]));
+    for (int i = 0; i < SH_KIDS; i++) {
+        int want = 0;
+        for (int j = 0; j < SH_KIDS; j++) {
+            int greater = 0;
+            for (int k = 0; k < SH_KIDS; k++) greater += priorities[k] > priorities[j];
+            if (greater == i) want = priorities[j];
+        }
+        if (s->log[i] != want) printf("posix-ipc: shared woke %d at place %d, wanted %d\n", s->log[i], i, want);
+        CHECK(s->log[i] == want);
+    }
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
+/* The words are handed to and fro between a parent and a child, 100 round
+ * trips (the times go to the log). */
+static int shared_latency(int named) {
+    enum { ROUNDS = 100 };
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    CHECK(sem_init(&s->ping, 1, 0) == 0 && sem_init(&s->pong, 1, 0) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        for (int i = 0; i < ROUNDS; i++) {
+            if (sem_wait(&s->ping) != 0) _exit(1);
+            if (sem_post(&s->pong) != 0) _exit(2);
+        }
+        _exit(0);
+    }
+    pause_ms(50);
+    long long from = now_ms();
+    long long worst = 0, best = 1000000000LL;
+    for (int i = 0; i < ROUNDS; i++) {
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        CHECK(sem_post(&s->ping) == 0);
+        CHECK(sem_wait(&s->pong) == 0);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        long long us = ((long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec)) / 1000;
+        if (us > worst) worst = us;
+        if (us < best) best = us;
+    }
+    long long took = now_ms() - from;
+    printf("posix-ipc: shared round trip best %lld us, worst %lld us\n", best, worst);
+    CHECK(wait_ok(pid));
+    printf("posix-ipc: shared %d round trips in %lld ms\n", ROUNDS, took);
+    CHECK(took < 1000);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
+/* A mutex and a condition of a shared page between a parent and four
+ * children: they count under the mutex, wait on the condition for the turn
+ * and the parent's broadcast ends their wait. */
+static int shared_mutex_cond(int named) {
+    enum { KIDS = 4, TURNS = 25 };
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    CHECK(pthread_mutexattr_init(&ma) == 0 && pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_condattr_init(&ca) == 0 && pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutex_init(&s->mutex, &ma) == 0 && pthread_cond_init(&s->cond, &ca) == 0);
+    pid_t pids[KIDS];
+    for (int i = 0; i < KIDS; i++) {
+        pids[i] = fork();
+        CHECK(pids[i] >= 0);
+        if (pids[i] == 0) {
+            for (int k = 0; k < TURNS; k++) {
+                if (pthread_mutex_lock(&s->mutex) != 0) _exit(1);
+                s->count++;
+                s->started++;
+                while (s->turn <= k)
+                    if (pthread_cond_wait(&s->cond, &s->mutex) != 0) _exit(2);
+                if (pthread_mutex_unlock(&s->mutex) != 0) _exit(3);
+            }
+            _exit(0);
+        }
+    }
+    for (int k = 0; k < TURNS; k++) {
+        /* All the children counted in turn k and wait on the condition. */
+        for (int i = 0; i < 2000; i++) {
+            CHECK(pthread_mutex_lock(&s->mutex) == 0);
+            int ready = s->started == (k + 1) * KIDS;
+            CHECK(pthread_mutex_unlock(&s->mutex) == 0);
+            if (ready) break;
+            pause_ms(2);
+        }
+        CHECK(pthread_mutex_lock(&s->mutex) == 0);
+        CHECK(s->started == (k + 1) * KIDS);
+        s->turn = k + 1;
+        CHECK(pthread_cond_broadcast(&s->cond) == 0);
+        CHECK(pthread_mutex_unlock(&s->mutex) == 0);
+    }
+    for (int i = 0; i < KIDS; i++) CHECK(wait_ok(pids[i]));
+    CHECK(s->count == KIDS * TURNS);
+    /* A timed wait on a condition nobody signals ends at its time. */
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += 30 * 1000000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_nsec -= 1000000000L;
+        until.tv_sec++;
+    }
+    CHECK(pthread_mutex_lock(&s->mutex) == 0);
+    CHECK(pthread_cond_timedwait(&s->cond, &s->mutex, &until) == ETIMEDOUT);
+    CHECK(pthread_mutex_unlock(&s->mutex) == 0);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
+static void on_shared_alarm(int sig) { (void)sig; }
+
+/* A timed wait ends at its time, a signal ends a wait with EINTR, and a
+ * waiter that is killed after a post gave it the unit leaves that unit to
+ * the next one. */
+static int shared_ends(int named) {
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    CHECK(sem_init(&s->sem, 1, 0) == 0);
+    struct timespec until = after_ms(40);
+    errno = 0;
+    long long from = now_ms();
+    CHECK(sem_timedwait(&s->sem, &until) == -1 && errno == ETIMEDOUT);
+    long long took = now_ms() - from;
+    CHECK(took >= 30 && took < 400);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_shared_alarm;
+    CHECK(sigaction(SIGALRM, &sa, NULL) == 0);
+    alarm(1);
+    errno = 0;
+    CHECK(sem_wait(&s->sem) == -1 && errno == EINTR);
+    /* The parent runs above its children: a post does not let the waiter
+     * run before the parent has killed it. */
+    set_priority(30);
+    pid_t pids[2];
+    for (int i = 0; i < 2; i++) {
+        pids[i] = fork();
+        CHECK(pids[i] >= 0);
+        if (pids[i] == 0) {
+            set_priority(i == 0 ? 20 : 10);
+            __atomic_fetch_add(&s->started, 1, __ATOMIC_SEQ_CST);
+            if (sem_wait(&s->sem) != 0) _exit(1);
+            __atomic_fetch_add(&s->done, 1, __ATOMIC_SEQ_CST);
+            _exit(0);
+        }
+    }
+    for (int i = 0; i < 500 && s->started != 2; i++) pause_ms(10);
+    CHECK(s->started == 2);
+    pause_ms(300);
+    CHECK(sem_post(&s->sem) == 0);
+    CHECK(kill(pids[0], SIGKILL) == 0);
+    int status = 0;
+    CHECK(waitpid(pids[0], &status, 0) == pids[0] && WIFSIGNALED(status));
+    if (s->done == 0) {
+        /* The first was killed before it took the unit: the second gets it. */
+        for (int k = 0; k < 400 && s->done == 0; k++) pause_ms(5);
+    }
+    CHECK(s->done == 1);
+    CHECK(wait_ok(pids[1]));
+    int v = -1;
+    CHECK(sem_getvalue(&s->sem, &v) == 0 && v == 0);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
+/* A waiter on a word nobody changes uses next to no CPU while it waits. */
+static int shared_idle(int named) {
+    struct shared *s = shared_page(named);
+    CHECK(s != NULL);
+    CHECK(sem_init(&s->sem, 1, 0) == 0);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct rusage a, b;
+        getrusage(RUSAGE_SELF, &a);
+        struct timespec until = after_ms(300);
+        if (sem_timedwait(&s->sem, &until) != -1 || errno != ETIMEDOUT) _exit(1);
+        getrusage(RUSAGE_SELF, &b);
+        s->count = (int)((b.ru_utime.tv_sec - a.ru_utime.tv_sec + b.ru_stime.tv_sec - a.ru_stime.tv_sec) * 1000000 +
+                         (b.ru_utime.tv_usec - a.ru_utime.tv_usec) + (b.ru_stime.tv_usec - a.ru_stime.tv_usec));
+        _exit(0);
+    }
+    CHECK(wait_ok(pid));
+    printf("posix-ipc: shared waiter used %d us of CPU in 300 ms\n", s->count);
+    CHECK(s->count < 1500);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
+static int shared_anonymous_order(void) { return shared_order(0); }
+static int shared_named_order(void) { return shared_order(1); }
+static int shared_anonymous_latency(void) { return shared_latency(0); }
+static int shared_named_latency(void) { return shared_latency(1); }
+static int shared_anonymous_mutex_cond(void) { return shared_mutex_cond(0); }
+static int shared_named_mutex_cond(void) { return shared_mutex_cond(1); }
+static int shared_anonymous_ends(void) { return shared_ends(0); }
+static int shared_named_ends(void) { return shared_ends(1); }
+static int shared_anonymous_idle(void) { return shared_idle(0); }
+static int shared_named_idle(void) { return shared_idle(1); }
+
 int main(int argc, char **argv) {
     (void)argv;
     /* A file-loaded image supplies the region map required by fork. */
@@ -1556,6 +1828,16 @@ int main(int argc, char **argv) {
     RUN(sem_waiters);
     RUN(named_waits);
     RUN(sem_session_ends);
+    RUN(shared_anonymous_order);
+    RUN(shared_named_order);
+    RUN(shared_anonymous_latency);
+    RUN(shared_named_latency);
+    RUN(shared_anonymous_mutex_cond);
+    RUN(shared_named_mutex_cond);
+    RUN(shared_anonymous_ends);
+    RUN(shared_named_ends);
+    RUN(shared_anonymous_idle);
+    RUN(shared_named_idle);
     RUN(limits);
     RUN(longest_steps);
     printf("posix-ipc: ok\n");
