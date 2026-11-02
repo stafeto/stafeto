@@ -824,6 +824,11 @@ impl<const N: usize> Roots<N> {
 mod tests {
     use super::*;
 
+    /// What `new` makes, as a constant evaluated at build time: its bytes of
+    /// padding come from the image and are the same in each run, which a
+    /// value copied through the stack does not give.
+    static MADE: Pipes = Pipes::new();
+
     /// The tables written in place into zeroed memory (the service's
     /// `.bss`) hold the bytes `new` makes.
     #[test]
@@ -836,13 +841,13 @@ mod tests {
             .cast::<Pipes>();
         // SAFETY: the place is zeroed, aligned and `size` bytes long.
         unsafe { Pipes::initialize_at(at) };
-        let made = Box::new(Pipes::new());
-        // SAFETY: both are `size` bytes of one object each; padding bytes are
-        // zero in both (a zeroed place, a constant).
+        // SAFETY: both are `size` bytes of one object each; the bytes of
+        // padding in the place stay zero and those of `MADE` are zero in the
+        // image.
         let (a, b) = unsafe {
             (
                 core::slice::from_raw_parts(at.cast::<u8>(), size),
-                core::slice::from_raw_parts(core::ptr::from_ref(&*made).cast::<u8>(), size),
+                core::slice::from_raw_parts(core::ptr::from_ref(&MADE).cast::<u8>(), size),
             )
         };
         let differs = a.iter().zip(b).filter(|(x, y)| x != y).count();
