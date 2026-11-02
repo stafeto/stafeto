@@ -771,45 +771,136 @@ static int catch_winch(void) {
     return sigaction(SIGWINCH, &action, NULL);
 }
 
-/* Sixteen live members have distinct signal pages and routers. A walk
- * delivers to one member per step and scans at most sixteen empty slots. */
-static int terminal_crowd(void) {
-    enum { MEMBERS = 16 };
+/* Live members have distinct signal pages and routers. A walk delivers to
+ * several members per step and scans at most 256 slots. The terminal waits
+ * for the process service's answer to the request alone, so the size of the
+ * group does not lengthen the wait: 16 members make two steps of the walk,
+ * 64 make eight.
+ * A record has at most 32 children, so a crowd of 64 grows in branches of
+ * 16: a branch is a child of the caller with 15 children of its own. */
+static void crowd_member(int ready_fd) {
+    winches = 0;
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGWINCH);
+    if (sigprocmask(SIG_BLOCK, &block, &old) != 0) _exit(119);
+    if (catch_winch() != 0 || write(ready_fd, "r", 1) != 1) _exit(119);
+    /* The last member of 64 is forked long after the first, and a timeout of
+     * sleeps runs out at once while the machine is idle: wait for the signal
+     * itself, with the signal blocked until the wait. */
+    alarm(300);
+    while (winches == 0) sigsuspend(&old);
+    alarm(0);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    if (winches != 1) say("posix-tty: crowd handler count %d\n", (int)winches);
+    if (winches != 1) _exit(121);
+}
+
+static int terminal_crowd(int members) {
+    enum { BRANCH = 16, BRANCHES_MAX = 4 };
+    int branches = members / BRANCH;
     int ready[2];
-    if (pipe(ready) != 0) return 117;
-    pid_t children[MEMBERS];
-    for (int i = 0; i < MEMBERS; ++i) {
+    if (branches > BRANCHES_MAX || pipe(ready) != 0) return 117;
+    pid_t children[BRANCHES_MAX];
+    for (int i = 0; i < branches; ++i) {
         children[i] = fork();
-        if (children[i] < 0) return 118;
+        if (children[i] < 0) {
+            say("posix-tty: crowd branch fork failed, errno %d\n", errno);
+            return 118;
+        }
         if (children[i] == 0) {
-            winches = 0;
-            if (catch_winch() != 0 || write(ready[1], "r", 1) != 1) _exit(119);
-            for (int waited = 0; winches == 0 && waited < 2000; ++waited) pause_ms(1);
-            if (winches != 1) say("posix-tty: crowd handler count %d\n", (int)winches);
-            _exit(winches == 1 ? 0 : 121);
+            pid_t own[BRANCH - 1];
+            for (int j = 0; j < BRANCH - 1; ++j) {
+                own[j] = fork();
+                if (own[j] < 0) {
+                    say("posix-tty: crowd fork %d failed, errno %d\n", j, errno);
+                    _exit(120);
+                }
+                if (own[j] == 0) {
+                    crowd_member(ready[1]);
+                    _exit(0);
+                }
+            }
+            crowd_member(ready[1]);
+            for (int j = 0; j < BRANCH - 1; ++j) {
+                int status = 0;
+                if (waitpid(own[j], &status, 0) != own[j] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) _exit(124);
+            }
+            _exit(0);
         }
     }
+    /* With its own end closed, members that end early show as end of file. */
+    if (close(ready[1]) != 0) return 126;
     char byte;
-    for (int i = 0; i < MEMBERS; ++i)
-        if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 122;
+    for (int i = 0; i < branches * BRANCH; ++i)
+        if (read(ready[0], &byte, 1) != 1 || byte != 'r') {
+            say("posix-tty: crowd member %d of %d did not get ready\n", i, branches * BRANCH);
+            return 122;
+        }
     if (stafeto_probe_trusted_terminal(getpgrp(), 0) != 0) return 123;
-    for (int i = 0; i < MEMBERS; ++i) {
+    for (int i = 0; i < branches; ++i) {
         int status = 0;
         if (waitpid(children[i], &status, 0) != children[i] ||
             !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            say("posix-tty: crowd child %d status %d\n", i, status);
+            say("posix-tty: crowd branch %d status %d\n", i, status);
             return 125;
         }
     }
-    for (int i = 0; i < 2; ++i)
-        if (close(ready[i]) != 0) return 126;
-    say("posix-tty: terminal signal reached sixteen members\n");
+    if (close(ready[0]) != 0) return 126;
+    say("posix-tty: terminal signal reached %d members\n", branches * BRANCH);
     return 0;
 }
 
 
 static volatile sig_atomic_t hups;
 static void on_hup(int signal) { if (signal == SIGHUP) ++hups; }
+
+static volatile sig_atomic_t burst[3];
+static void on_burst(int signal) {
+    ++burst[signal == SIGINT ? 0 : signal == SIGQUIT ? 1 : 2];
+}
+
+static int job_foreground(int fd, pid_t group);
+
+/* Three signals of the terminal typed at once reach the foreground group,
+ * each once. The process service of this image queues one walk of the
+ * terminal, so the second and third are refused with AGAIN until the first
+ * walk is over, and the terminal service sends them again. */
+static int terminal_burst(int tty) {
+    int ready[2];
+    if (pipe(ready) != 0) return 140;
+    pid_t child = fork();
+    if (child < 0) return 141;
+    if (child == 0) {
+        sigset_t block, old;
+        sigemptyset(&block);
+        sigaddset(&block, SIGINT);
+        sigaddset(&block, SIGQUIT);
+        sigaddset(&block, SIGTSTP);
+        struct sigaction action = {0};
+        action.sa_handler = on_burst;
+        sigemptyset(&action.sa_mask);
+        if (setpgid(0, 0) != 0 || sigprocmask(SIG_BLOCK, &block, &old) != 0) _exit(142);
+        if (sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGQUIT, &action, NULL) != 0 ||
+            sigaction(SIGTSTP, &action, NULL) != 0 || write(ready[1], "r", 1) != 1) _exit(143);
+        alarm(300);
+        while (burst[0] == 0 || burst[1] == 0 || burst[2] == 0) sigsuspend(&old);
+        _exit(burst[0] == 1 && burst[1] == 1 && burst[2] == 1 ? 0 : 144);
+    }
+    char byte;
+    if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 145;
+    if (job_foreground(tty, child) != 0) return 146;
+    say("posix-tty: type three signals\n");
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        say("posix-tty: burst status %d\n", status);
+        return 147;
+    }
+    if (job_foreground(tty, getpgrp()) != 0) return 148;
+    if (close(ready[0]) != 0 || close(ready[1]) != 0) return 149;
+    say("posix-tty: three signals in a row ok\n");
+    return 0;
+}
 
 static int job_foreground(int fd, pid_t group) {
     sigset_t block, old;
@@ -1080,9 +1171,11 @@ static int leader(pid_t other_group) {
     if (job_error != 0) return job_error;
     int detach_error = terminal_detach(tty);
     if (detach_error != 0) return detach_error;
-    int crowd_error = terminal_crowd();
+    int crowd_error = terminal_crowd(16);
     if (crowd_error != 0) return crowd_error;
-    return 0;
+    crowd_error = terminal_crowd(64);
+    if (crowd_error != 0) return crowd_error;
+    return terminal_burst(tty);
 }
 
 /* Sessions and the controlling terminal: "run" has none, its child A
@@ -1262,6 +1355,52 @@ static int departed_leader(void) {
     return 0;
 }
 
+/* A session whose leader ends while sixteen members of its foreground group
+ * are stopped: the terminal sends SIGHUP and then SIGCONT to the group, and
+ * the process service continues every stopped member (a process control, a
+ * report to the parent and a SIGCHLD each). Each member catches SIGHUP,
+ * stops itself and, once continued, finds the SIGHUP it was sent. */
+static int departed_stopped(void) {
+    enum { MEMBERS = 16 };
+    int result[2];
+    CHECK(pipe(result) == 0);
+    pid_t leader_pid = fork();
+    CHECK(leader_pid >= 0);
+    if (leader_pid == 0) {
+        if (setsid() != getpid()) _exit(161);
+        if (open("/dev/console", O_RDWR) < 0 || open("/dev/tty", O_RDWR) < 0) _exit(162);
+        pid_t members[MEMBERS];
+        for (int i = 0; i < MEMBERS; ++i) {
+            members[i] = fork();
+            if (members[i] < 0) _exit(163);
+            if (members[i] == 0) {
+                hups = 0;
+                if (signal(SIGHUP, on_hup) == SIG_ERR) _exit(164);
+                if (kill(getpid(), SIGSTOP) != 0) _exit(165);
+                for (int waited = 0; hups == 0 && waited < 2000; ++waited) pause_ms(1);
+                if (write(result[1], hups == 1 ? "y" : "n", 1) != 1) _exit(166);
+                _exit(0);
+            }
+        }
+        for (int i = 0; i < MEMBERS; ++i) {
+            int status;
+            if (waitpid(members[i], &status, WUNTRACED) != members[i] || !WIFSTOPPED(status)) _exit(167);
+        }
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(leader_pid, &status, 0) == leader_pid && WIFEXITED(status));
+    if (WEXITSTATUS(status) != 0) say("posix-tty: stopped group leader status %d\n", WEXITSTATUS(status));
+    CHECK(WEXITSTATUS(status) == 0);
+    for (int i = 0; i < MEMBERS; ++i) {
+        char byte;
+        CHECK(read(result[0], &byte, 1) == 1 && byte == 'y');
+    }
+    CHECK(close(result[0]) == 0 && close(result[1]) == 0);
+    say("posix-tty: departed stopped group ok\n");
+    return 0;
+}
+
 /* The role "spawned": `first` is the descriptor the parent left open,
  * `second` the one a file action opened; both are the terminal. */
 static int spawned(int first, int second) {
@@ -1294,6 +1433,7 @@ static int run(void) {
     if ((status = spawn_terminal_actions()) != 0) return status;
     if ((status = sessions()) != 0) return status;
     if ((status = departed_leader()) != 0) return status;
+    if ((status = departed_stopped()) != 0) return status;
     say("posix-tty: ok\n");
     return 0;
 }

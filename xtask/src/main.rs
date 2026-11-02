@@ -1099,6 +1099,9 @@ const TYPED_AHEAD: usize = 400;
 /// How long a step of the console dialog waits for its answer; its first,
 /// the driver's line, waits BOOT_TIMEOUT.
 const DIALOG_STEP: Duration = Duration::from_secs(10);
+/// The crowds of the terminal probe, 16 and 64 live members forked one by
+/// one under -icount.
+const CROWD_STEP: Duration = Duration::from_secs(20);
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
 const TEST_TABLE_NAMES: [&str; 11] = [
@@ -3007,6 +3010,11 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             "posix-tty: personal detach and fresh attachment ok",
             DIALOG_STEP,
         )?;
+        // The crowd of 64 members forks them one by one, and under -icount
+        // that takes longer than a dialog step.
+        run.expect("posix-tty: type three signals", CROWD_STEP)?;
+        run.type_raw(b"\x03\x1c\x1a")?;
+        run.expect("posix-tty: three signals in a row ok", DIALOG_STEP)?;
         run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
         run.expect("posix-tty: ok", DIALOG_STEP)?;
         run.expect(ENDED, DIALOG_STEP)
