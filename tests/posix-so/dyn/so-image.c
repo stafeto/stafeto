@@ -14,8 +14,8 @@ extern int stafeto_probe_image(uintptr_t address, uint64_t *out);
 
 int main(void) {
     uint64_t code[5] = {0}, data[5] = {0};
-    /* strerror gives a string of libc.so's read-only data. */
-    const char *text = strerror(ENOENT);
+    /* strsignal gives a string of libc.so's read-only data. */
+    const char *text = strsignal(2);
     int code_found = stafeto_probe_image((uintptr_t)&printf, code);
     int data_found = stafeto_probe_image((uintptr_t)text, data);
     printf("so-image: found=%d%d code=%llu data=%llu write=%llu%llu image=%llu%llu\n", code_found,

@@ -17,10 +17,11 @@
 extern char **environ;
 extern int so_absent __attribute__((weak));
 
-/* The order the arrays ran in: preinit 1, constructor with a priority 2,
+/* The order the arrays ran in (volatile: otherwise the compiler runs the
+ * constructors itself and the program has none): preinit 1, constructor with a priority 2,
  * constructor 3. */
-static int order[4];
-static int ran;
+static volatile int order[4];
+static volatile int ran;
 
 static void pre(void) { order[ran++ & 3] = 1; }
 __attribute__((section(".preinit_array"), used)) static void (*const pre_entry)(void) = pre;

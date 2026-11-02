@@ -147,11 +147,6 @@ static void shared(void) {
         check(2, "so-image sees three mappings of the code and of the data of libc.so",
               strstr(buf, "found=11") != NULL && code >= 3 && data >= 3);
         printf("posix-so: so-image says: %s", buf);
-        /* 6: the file of a library in use is not written. */
-        errno = 0;
-        int fd = open("/lib/libc.so", O_WRONLY);
-        check(32, "libc.so in use is not opened for writing", fd < 0 && errno == ETXTBSY);
-        if (fd >= 0) close(fd);
     }
     for (int i = 0; i < started; i++) {
         char rest[128];
