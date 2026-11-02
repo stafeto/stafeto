@@ -77,6 +77,16 @@ pub const LOADER_END: u64 = 1 << 48;
 /// the POSIX layer (its buffers of the threads from 0x200_0000, the page of
 /// the record, the clock's pages, the heap), the start area and the stack.
 pub const PROGRAM_ROOM: Range<u64> = 0x1000..0x0200_0000;
+/// Where libc.so lies, always (spec 2, 3.12.3): one build for one address,
+/// so that its relocations are the same in every process.
+pub const LIBRARY_BASE: u64 = 0x0400_0000;
+/// The pages the three segments of libc.so may take.
+pub const LIBRARY_ROOM: Range<u64> = 0x0400_0000..0x0800_0000;
+/// The file the loader maps as the library of a dynamic program.
+pub const LIBRARY_PATH: &[u8] = b"/lib/libc.so";
+/// The only interpreter a dynamic program names (`PT_INTERP`, without its
+/// NUL); the loader itself plays it.
+pub const INTERP: &[u8] = b"/lib/ld.so";
 /// The program's main stack: right under abi::INIT_STACK_TOP, with the
 /// guard page below it unmapped.
 pub const STACK_SIZE: u64 = 64 * 1024;
@@ -856,8 +866,12 @@ pub struct Start {
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 4;
+pub const START_VERSION: u32 = 5;
 pub const SECURE: u32 = 1;
+/// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
+/// and the libc.so is in the space, so the start takes the vector as it is
+/// and builds none.
+pub const DYNAMIC: u32 = 2;
 /// The pairs of the auxiliary vector the start may fill.
 pub const AUXV_PAIRS: usize = 8;
 /// The bytes of the header.
@@ -865,8 +879,9 @@ pub const START_SIZE: usize = core::mem::size_of::<Start>();
 const _: () = assert!(START_SIZE == 192);
 
 /// The entries of the memory map the loader hands over at most: the three
-/// segments of a program, its stack and the start area itself.
-pub const MAP_ENTRIES: usize = 5;
+/// segments of a program, the three of libc.so, its stack and the start area
+/// itself.
+pub const MAP_ENTRIES: usize = 8;
 /// The bytes of an entry: the address u64, the pages u32, the access u32
 /// (abi::Access) and the handle's value u64.
 pub const MAP_ENTRY: usize = 24;
@@ -1024,6 +1039,45 @@ impl Start {
     }
 }
 
+/// The auxiliary vector of a dynamic program, which the loader fills
+/// (spec 2, 3.12.3): the C library's start reads these keys at `Start.auxv`.
+pub mod auxv {
+    pub const AT_NULL: u64 = 0;
+    pub const AT_PHDR: u64 = 3;
+    pub const AT_PHENT: u64 = 4;
+    pub const AT_PHNUM: u64 = 5;
+    pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
+    pub const AT_SECURE: u64 = 23;
+    /// The address of the `PT_TLS` header of libc.so in its space (the one
+    /// static TLS module); the number is the C library's too.
+    pub const AT_STAFETO_TLS: u64 = 0x7374_0001;
+}
+
+/// The pairs of the auxiliary vector of a dynamic program, in the order
+/// PHDR, PHENT, PHNUM, PAGESZ, SECURE, BASE, STAFETO_TLS, NULL: the program
+/// headers in memory (`phdr`), the bytes of one (`phent`), their count, the
+/// secure mode (0 or 1), libc.so's base address and the address of its TLS
+/// header. AT_ENTRY is not passed: the start jumps to the program itself.
+pub const fn dynamic_auxv(
+    phdr: u64,
+    phent: u64,
+    phnum: u64,
+    secure: bool,
+    tls_header: u64,
+) -> [(u64, u64); AUXV_PAIRS] {
+    [
+        (auxv::AT_PHDR, phdr),
+        (auxv::AT_PHENT, phent),
+        (auxv::AT_PHNUM, phnum),
+        (auxv::AT_PAGESZ, PAGE),
+        (auxv::AT_SECURE, secure as u64),
+        (auxv::AT_BASE, LIBRARY_BASE),
+        (auxv::AT_STAFETO_TLS, tls_header),
+        (auxv::AT_NULL, 0),
+    ]
+}
+
 /// The regions a copy takes at most: the kernel's mappings of a process
 /// (abi::MAX_MAPPINGS), which the layer's map holds at most (posix-map).
 pub const REGIONS_MAX: usize = abi::MAX_MAPPINGS as usize;
@@ -1034,11 +1088,12 @@ pub const REGION: usize = 24;
 /// The heap of the POSIX layer, where the chunks of its map lie.
 pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x2000_0000;
 /// The rooms of a program's layout a region of a copy lies in, each whole
-/// in one: the segments, the layer's heap, the start area and the main
+/// in one: the segments, libc.so, the layer's heap, the start area and the main
 /// stack. The loader's region, the page of the record, the clock's page
 /// and the buffers of the threads lie in none.
-pub const ROOMS: [Range<u64>; 4] = [
+pub const ROOMS: [Range<u64>; 5] = [
     PROGRAM_ROOM,
+    LIBRARY_ROOM,
     HEAP_ROOM,
     START_AREA..START_AREA + AREA_MAX,
     abi::INIT_STACK_TOP - STACK_MAX..abi::INIT_STACK_TOP,
@@ -1851,6 +1906,9 @@ mod tests {
             entry(2, Access::ReadWrite),
             entry(3, Access::ReadWrite),
             entry(4, Access::ReadWrite),
+            entry(5, Access::ReadExec),
+            entry(6, Access::Read),
+            entry(7, Access::ReadWrite),
         ];
         let mut area = vec![0xAA; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &list).unwrap();
@@ -1869,7 +1927,7 @@ mod tests {
         write_area(&mut few, START_AREA, &read, 0, [0; SLOTS], &list[..3]).unwrap();
         assert_eq!(Start::read(&few).unwrap().map_count, 3);
         let mut too_many = list.to_vec();
-        too_many.push(entry(5, Access::Read));
+        too_many.push(entry(8, Access::Read));
         assert_eq!(
             write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &too_many),
             Err(BlockError::Malformed)
@@ -1994,6 +2052,99 @@ mod tests {
             .unwrap();
             assert_eq!(Fork::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
         }
+    }
+
+    /// libc.so has its own room beside the program's, whole in the edge of
+    /// neither and apart from the heap.
+    #[test]
+    fn the_library_room_is_its_own() {
+        use abi::Access::{Read, ReadExec, ReadWrite};
+        assert_eq!(LIBRARY_BASE, LIBRARY_ROOM.start);
+        const { assert!(PROGRAM_ROOM.end <= LIBRARY_ROOM.start && LIBRARY_ROOM.end <= HEAP_ROOM.start) };
+        assert!(!PROGRAM_ROOM.contains(&LIBRARY_BASE));
+        assert_eq!(room_of(&region(0x0400_0000, 4, ReadExec)), Some(1));
+        assert_eq!(room_of(&region(0x0430_0000, 4, Read)), Some(1));
+        assert_eq!(room_of(&region(0x07FF_F000, 1, ReadWrite)), Some(1));
+        assert_eq!(
+            room_of(&region(0x07FF_F000, 2, ReadWrite)),
+            None,
+            "past the room"
+        );
+        assert_eq!(
+            room_of(&region(0x03FF_F000, 2, ReadWrite)),
+            None,
+            "across the low edge"
+        );
+        assert_eq!(
+            room_of(&region(0x0800_0000, 1, ReadWrite)),
+            None,
+            "right after"
+        );
+        let mut held = Vec::new();
+        for r in [
+            region(0x0400_0000, 4, ReadExec),
+            region(0x0410_0000, 2, Read),
+            region(0x0420_0000, 3, ReadWrite),
+        ] {
+            assert_eq!(admit(&held, &r), Ok(()), "{r:?}");
+            held.push(r);
+        }
+        assert_eq!(LIBRARY_PATH, b"/lib/libc.so");
+        assert_eq!(INTERP, b"/lib/ld.so");
+    }
+
+    /// The map has room for the three segments of the program, those of
+    /// libc.so, the stack and the area; the dynamic flag is its own bit.
+    #[test]
+    fn the_start_constants_of_a_dynamic_program() {
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (5, 8, 8));
+        assert_eq!(SECURE & DYNAMIC, 0);
+        assert_eq!(DYNAMIC, 2);
+        let mut out = vec![0; BLOCK_MAX];
+        let len = block(&mut out, &[b"a"], &[]);
+        let read = Block::read(&out[..len]).unwrap();
+        assert!(area_len(&read) as u64 <= AREA_MAX);
+        let mut area = vec![0; area_len(&read)];
+        write_area(
+            &mut area,
+            START_AREA,
+            &read,
+            SECURE | DYNAMIC,
+            [0; SLOTS],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(Start::read(&area).unwrap().flags, 3);
+        // The area of the old version does not read.
+        area[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert!(Start::read(&area).is_none());
+    }
+
+    /// The vector of a dynamic program: the keys in the order the start
+    /// reads them, the last pair AT_NULL, as many pairs as the area holds.
+    #[test]
+    fn the_dynamic_vector_is_in_order() {
+        let pairs = dynamic_auxv(0x20_0040, 56, 7, true, 0x0440_0000);
+        let keys: Vec<u64> = pairs.iter().map(|p| p.0).collect();
+        assert_eq!(keys, [3, 4, 5, 6, 23, 7, 0x7374_0001, 0]);
+        assert_eq!(pairs.last(), Some(&(auxv::AT_NULL, 0)));
+        assert_eq!(pairs[0].1, 0x20_0040);
+        assert_eq!((pairs[1].1, pairs[2].1, pairs[3].1), (56, 7, 4096));
+        assert_eq!(
+            (pairs[4].1, pairs[5].1, pairs[6].1),
+            (1, LIBRARY_BASE, 0x0440_0000)
+        );
+        assert_eq!(dynamic_auxv(0, 56, 1, false, 0)[4], (auxv::AT_SECURE, 0));
+        assert_eq!(pairs.len(), AUXV_PAIRS);
+        // The vector fits the words the area reserves for it.
+        let mut out = vec![0; BLOCK_MAX];
+        let len = block(&mut out, &[b"a"], &[b"B=c"]);
+        let read = Block::read(&out[..len]).unwrap();
+        let mut area = vec![0; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, DYNAMIC, [0; SLOTS], &[]).unwrap();
+        let start = Start::read(&area).unwrap();
+        let end = (start.auxv - START_AREA) as usize + 16 * AUXV_PAIRS;
+        assert!(end <= (start.map - START_AREA) as usize);
     }
 
     /// A copy takes regions inside the rooms of a program alone, each apart

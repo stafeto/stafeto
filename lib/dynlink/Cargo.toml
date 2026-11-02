@@ -1,0 +1,11 @@
+[package]
+name = "dynlink"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Relocations and symbol lookup of the stafeto shared library and its programs: no_std, no alloc, every read of the untrusted tables checked"
+
+[lib]
+bench = false
