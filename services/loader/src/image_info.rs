@@ -8,6 +8,14 @@ use proto_wire::{Reader, Status};
 /// The caller retains the reply handles until this validation completes.
 #[inline]
 pub fn image_reply_size(bytes: &[u8], handle_count: usize) -> Result<u64, Status> {
+    image_reply_info(bytes, handle_count).map(|info| info.size)
+}
+
+/// The metadata of a retained regular image: its identity (device, inode,
+/// size and the two times) is what the table of images names its objects
+/// by. Validated as `image_reply_size` does.
+#[inline]
+pub fn image_reply_info(bytes: &[u8], handle_count: usize) -> Result<proto_fs::NodeInfo, Status> {
     if handle_count != 0 {
         return Err(Status::BadSize);
     }
@@ -25,7 +33,7 @@ pub fn image_reply_size(bytes: &[u8], handle_count: usize) -> Result<u64, Status
     if info.kind != 2 {
         return Err(Status::BadSize);
     }
-    Ok(info.size)
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -45,6 +53,15 @@ mod tests {
     fn exact_regular_metadata_returns_its_size() {
         assert_eq!(image_reply_size(&regular(), 0), Ok(8177));
     }
+    #[test]
+    fn the_identity_of_the_file_comes_with_its_size() {
+        let mut bytes = regular();
+        bytes[12..20].copy_from_slice(&5u64.to_le_bytes());
+        bytes[28..36].copy_from_slice(&9u64.to_le_bytes());
+        let info = image_reply_info(&bytes, 0).unwrap();
+        assert_eq!((info.device, info.inode, info.size), (5, 9, 8177));
+    }
+
     #[test]
     fn reply_extent_and_caps_are_checked_before_size() {
         let bytes = regular();

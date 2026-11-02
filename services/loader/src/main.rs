@@ -253,6 +253,9 @@ struct Kept {
     pages: u32,
     access: Access,
     handle: Handle<Memory>,
+    /// The object came from the table of images: another process paid for
+    /// it.
+    joined: bool,
 }
 
 /// The program's segments, stack and start area, in the order `load`
@@ -287,6 +290,7 @@ fn keep_region(
         pages,
         access,
         handle,
+        joined: false,
     });
     Ok(())
 }
@@ -562,7 +566,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         match steps::timed(kind::GO, regions, || copy(own, body, scratch)).and_then(
                             |()| {
                                 if completed {
-                                    tell_ready(session)
+                                    tell_ready(session, 0)
                                 } else {
                                     Ok(())
                                 }
@@ -617,7 +621,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                         match load(own, &block, exec_source.take()).and_then(|done| {
                             if completed {
-                                tell_ready(session)?;
+                                tell_ready(session, image_pages(&done.2))?;
                             }
                             Ok(done)
                         }) {
@@ -692,7 +696,10 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 return None;
                             }
                             if (loaded.is_some() || copied)
-                                && let Err(code) = tell_ready(session)
+                                && let Err(code) = tell_ready(
+                                    session,
+                                    loaded.as_ref().map_or(0, |l| image_pages(&l.2)),
+                                )
                             {
                                 reply(token, code);
                                 return None;
@@ -1246,11 +1253,18 @@ fn fill(own: &Own, parent: &Handle<Memory>, from: u64, bytes: u64, at: u64) -> R
 }
 
 /// Ready: the service hears the image is loaded before the parent does,
-/// and takes a commit of the place only from then on.
-fn tell_ready(session: &Handle<Channel>) -> Result<(), u32> {
-    let request = proto_process::Method::Ready.header().bytes();
+/// and takes a commit of the place only from then on. `image_pages` is the
+/// pages of the code and the read-only data the image maps (0 for a copy of
+/// fork).
+fn tell_ready(session: &Handle<Channel>, image_pages: u32) -> Result<(), u32> {
+    let mut w = Writer::new();
+    proto_process::Method::Ready
+        .header()
+        .write(&mut w)
+        .and_then(|()| w.u32(image_pages))
+        .map_err(|_| pl::IO)?;
     let mut buffer = [0; MESSAGE_MAX];
-    match sys::send(session, &request) {
+    match sys::send(session, w.as_bytes()) {
         Ok(reply) if Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0) => Ok(()),
         _ => Err(pl::IO),
     }
@@ -1368,7 +1382,8 @@ fn load(
         })?;
         open(own, path)?
     };
-    let size = file_size(own, &image)?;
+    let info = file_info(own, &image)?;
+    let size = info.size;
     let mut head = [0; PAGE as usize];
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
@@ -1381,7 +1396,14 @@ fn load(
     for part in Part::ALL {
         let load = &layout.segments[part as usize];
         if !load.is_empty() {
-            segment(own, &image, load, part, &mut maps)?;
+            // The code and the read-only data of a file are one object for
+            // all the processes that run it (spec 2, 3.12.2).
+            let key = match part {
+                Part::Code => Some(image_key(&info, proto_process::IMAGE_CODE)),
+                Part::Rodata => Some(image_key(&info, proto_process::IMAGE_RODATA)),
+                Part::Data => None,
+            };
+            segment(own, &image, load, part, &mut maps, key.as_ref())?;
         }
     }
     // The stack the file asks for (PT_GNU_STACK), at least 64 KiB.
@@ -1436,8 +1458,10 @@ fn exec_status(s: Status) -> u32 {
     }
 }
 
-/// The size of the file of the image session.
-fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
+/// The metadata of the file of the image session: its size, and with the
+/// device, inode and times the identity the table of images names its
+/// objects by.
+fn file_info(_own: &Own, image: &Handle<Channel>) -> Result<proto_fs::NodeInfo, u32> {
     let mut w = Writer::new();
     proto_fs::Method::InfoFd
         .header()
@@ -1460,7 +1484,7 @@ fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
         || (handles == 1
             && reply.handles.info(0)
                 == Some((abi::ObjectKind::Memory, Rights::MAP_READ | Rights::TRANSFER)));
-    let size = loader_image::image_reply_size(reply.bytes(&mut buffer), handles);
+    let info = loader_image::image_reply_info(reply.bytes(&mut buffer), handles);
     drop(reply);
     #[cfg(feature = "image-info-probe")]
     {
@@ -1476,7 +1500,7 @@ fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
         }
         let balanced = before == after && received == before + handles as u64;
         let flags = 0x80
-            | u64::from(size.is_err())
+            | u64::from(info.is_err())
             | (u64::from(valid_caps) << 1)
             | (u64::from(balanced) << 2);
         let bits =
@@ -1489,7 +1513,7 @@ fn file_size(_own: &Own, image: &Handle<Channel>) -> Result<u64, u32> {
             return Err(pl::IO);
         }
     }
-    size.map_err(|_| pl::IO)
+    info.map_err(|_| pl::IO)
 }
 
 /// ReadAt of the image session into `out` from `offset`, as many requests
@@ -1532,11 +1556,79 @@ const fn access(part: Part) -> Access {
     }
 }
 
-/// A segment of the program: a new object of its pages, which the new
-/// process pays for, filled by the file service READ_INTO_MAX bytes a
-/// request (READ_INTO) and mapped at its address with its access; its
-/// narrowed handle goes into `maps`.
+/// A segment of the program: an object of its pages, mapped at its address
+/// with its access, whose narrowed handle goes into `maps`. A segment with
+/// a `key` (code, read-only data) comes from the table of images when
+/// another process has made it, and otherwise is made and handed to the
+/// table; one with none, or when the table has no place, is a new object
+/// that the new process pays for, filled by the file service READ_INTO_MAX
+/// bytes a request (READ_INTO).
 fn segment(
+    own: &Own,
+    image: &Handle<Channel>,
+    load: &Load,
+    part: Part,
+    maps: &mut Maps,
+    key: Option<&proto_process::ImageKey>,
+) -> Result<(), u32> {
+    let pages = load.pages();
+    let len = pages.end - pages.start;
+    let Some(key) = key else {
+        return build(own, image, load, part, maps);
+    };
+    match image_get(key)? {
+        Table::Found(count, memory) => {
+            if u64::from(count) * PAGE != len {
+                return Err(pl::IO);
+            }
+            loader::map_narrowed(
+                &own.process,
+                &memory,
+                0,
+                len,
+                pages.start as usize,
+                access(part),
+            )
+            .map_err(code)?;
+            keep_region(maps, &memory, pages.start, len, access(part))?;
+            if let Some(kept) = maps.iter_mut().flatten().last() {
+                kept.joined = true;
+            }
+            Ok(())
+        }
+        Table::Reserved => {
+            if let Err(e) = build(own, image, load, part, maps) {
+                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
+                return Err(e);
+            }
+            // The creator's handle with the right to write is closed; the
+            // table gets a copy of the narrowed one, which has none.
+            let handed = maps.iter().flatten().last().and_then(|kept| {
+                let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                if key.part == proto_process::IMAGE_CODE {
+                    rights = rights | Rights::MAP_EXEC;
+                }
+                sys::handle_duplicate(&kept.handle, rights).ok()
+            });
+            let put = handed.map(|copy| {
+                image_request(
+                    proto_process::IMAGE_PUT,
+                    key,
+                    (len / PAGE) as u32,
+                    Some(copy),
+                )
+            });
+            if !matches!(put, Some(Ok(_))) {
+                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
+            }
+            Ok(())
+        }
+        Table::Full => build(own, image, load, part, maps),
+    }
+}
+
+/// A new object for the segment, filled from the file and mapped.
+fn build(
     own: &Own,
     image: &Handle<Channel>,
     load: &Load,
@@ -1557,6 +1649,81 @@ fn segment(
     loader::map_narrowed(&own.process, &m, 0, len, pages.start as usize, access(part))
         .map_err(code)?;
     keep_region(maps, &m, pages.start, len, access(part))
+}
+
+/// What the table of images answers a Get.
+enum Table {
+    Found(u32, Handle<Memory>),
+    Reserved,
+    Full,
+}
+
+/// The key of a part of the file `info` shows.
+fn image_key(info: &proto_fs::NodeInfo, part: u32) -> proto_process::ImageKey {
+    proto_process::ImageKey {
+        part,
+        device: info.device,
+        inode: info.inode,
+        size: info.size,
+        modify: (info.modify_time.seconds, info.modify_time.nanos),
+        change: (info.change_time.seconds, info.change_time.nanos),
+    }
+}
+
+/// A request of the table of images through the session with the service:
+/// the answer's kind and pages, and the object a Get found.
+fn image_request(
+    operation: u32,
+    key: &proto_process::ImageKey,
+    pages: u32,
+    object: Option<Handle<Memory>>,
+) -> Result<(u32, u32, Option<Handle<Memory>>), u32> {
+    let session = core::mem::ManuallyDrop::new(Handle::<Channel>::from_raw(START_CHANNEL));
+    let mut w = Writer::new();
+    proto_process::Method::Image
+        .header()
+        .write(&mut w)
+        .and_then(|()| w.u32(operation))
+        .and_then(|()| key.write(&mut w))
+        .and_then(|()| w.u32(pages))
+        .map_err(|_| pl::IO)?;
+    let mut reply = match object {
+        Some(object) => sys::send_handles(&session, w.as_bytes(), [object.erase()])
+            .map_err(|refused| code(refused.error))?,
+        None => sys::send(&session, w.as_bytes()).map_err(code)?,
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut r = Reader::new(reply.bytes(&mut buffer));
+    if r.u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    if operation != proto_process::IMAGE_GET {
+        return Ok((0, 0, None));
+    }
+    let (kind, pages) = (r.u32().map_err(|_| pl::IO)?, r.u32().map_err(|_| pl::IO)?);
+    Ok((kind, pages, reply.handles.take(0).ok()))
+}
+
+/// Get of the table of images. An answer the loader does not know makes an
+/// object of its own, as a table with no place does.
+fn image_get(key: &proto_process::ImageKey) -> Result<Table, u32> {
+    Ok(
+        match image_request(proto_process::IMAGE_GET, key, 0, None)? {
+            (proto_process::IMAGE_FOUND, pages, Some(memory)) => Table::Found(pages, memory),
+            (proto_process::IMAGE_RESERVED, _, None) => Table::Reserved,
+            _ => Table::Full,
+        },
+    )
+}
+
+/// The pages of the code and the read-only data in `maps` that this
+/// process pays for: what a child of fork shares and does not pay for.
+fn image_pages(maps: &Maps) -> u32 {
+    maps.iter()
+        .flatten()
+        .filter(|kept| kept.access != Access::ReadWrite && !kept.joined)
+        .map(|kept| kept.pages)
+        .sum()
 }
 
 /// READ_INTO of the image session: `count` bytes of the file from

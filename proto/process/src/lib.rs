@@ -467,6 +467,14 @@ pub enum Method {
     /// Empty body and no handles, through an active loader session before Ready.
     /// Reply: status and the trusted Clock endpoint with SEND|TRANSFER.
     LoaderClock = 45,
+    /// The table of images (spec 2, 3.12.2), through the session of a loader
+    /// that loads: a body of the operation u32 (`IMAGE_GET`, `IMAGE_PUT`,
+    /// `IMAGE_DETACH`), an `ImageKey` and the pages u32. Put carries the
+    /// memory object (MAP_READ, DUPLICATE, TRANSFER, MAP_EXEC for the code,
+    /// never MAP_WRITE); a Get that finds the object answers with a copy of
+    /// it. The reply to Get: status, the kind u32 (`IMAGE_FOUND` ...) and
+    /// the pages u32.
+    Image = 46,
     /// Generate a directed job signal and return its epoch ticket.
     SignalGeneration = 48,
     /// Apply a delivered default stop with its epoch ticket.
@@ -572,6 +580,72 @@ pub const SHARED_RESERVED: u32 = 1;
 pub const SHARED_FULL: u32 = 2;
 /// Reply to Get: another process is making the object; ask again.
 pub const SHARED_BUSY: u32 = 3;
+/// The entries of the table of images (spec 2, 3.12.2): two for a program
+/// (its code and its read-only data).
+pub const IMAGES: usize = 32;
+/// Image: the object of a key, or the right to make it (Get).
+pub const IMAGE_GET: u32 = 1;
+/// Image: the maker of an object hands it over (Put).
+pub const IMAGE_PUT: u32 = 2;
+/// Image: the caller made nothing of the entry it reserved (Detach).
+pub const IMAGE_DETACH: u32 = 3;
+/// Reply to Get: the object comes with the reply.
+pub const IMAGE_FOUND: u32 = 0;
+/// Reply to Get: the caller makes the object and then Puts it.
+pub const IMAGE_RESERVED: u32 = 1;
+/// Reply to Get: the table has no place; the caller makes an object that
+/// is not registered.
+pub const IMAGE_FULL: u32 = 2;
+/// The parts of a program's image that processes share.
+pub const IMAGE_CODE: u32 = 0;
+pub const IMAGE_RODATA: u32 = 1;
+
+/// What names an image part in the table: the part and the identity of the
+/// file the loader's image session shows (spec 2, 3.12.2). The table
+/// compares all of it, with no hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageKey {
+    pub part: u32,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub modify: (i64, u32),
+    pub change: (i64, u32),
+}
+
+impl ImageKey {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.part)?;
+        w.u64(self.device)?;
+        w.u64(self.inode)?;
+        w.u64(self.size)?;
+        w.u64(self.modify.0 as u64)?;
+        w.u32(self.modify.1)?;
+        w.u64(self.change.0 as u64)?;
+        w.u32(self.change.1)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<ImageKey, Status> {
+        let part = r.u32()?;
+        let device = r.u64()?;
+        let inode = r.u64()?;
+        let size = r.u64()?;
+        let modify = (r.u64()? as i64, r.u32()?);
+        let change = (r.u64()? as i64, r.u32()?);
+        if part > IMAGE_RODATA || modify.1 > 999_999_999 || change.1 > 999_999_999 {
+            return Err(Status::BadSize);
+        }
+        Ok(ImageKey {
+            part,
+            device,
+            inode,
+            size,
+            modify,
+            change,
+        })
+    }
+}
+
 impl Method {
     pub const fn header(self) -> Header {
         Header {
@@ -582,8 +656,8 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58,
-    59, 60, 61, 62, 63,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+    58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1700,6 +1774,7 @@ mod tests {
             Method::AckCtty,
             Method::LoaderTerminal,
             Method::LoaderClock,
+            Method::Image,
             Method::SignalGeneration,
             Method::StopSelf,
             Method::DetachCtty,
@@ -1728,6 +1803,36 @@ mod tests {
         assert_eq!(Change::from_number(0), None);
         assert_eq!(Change::from_number(5), None);
         assert_eq!(Credentials::NOBODY.words(), [65534; 6]);
+    }
+
+    #[test]
+    fn an_image_key_roundtrips_and_refuses_bad_fields() {
+        let key = ImageKey {
+            part: IMAGE_RODATA,
+            device: 1 << 40,
+            inode: 7,
+            size: 3 << 20,
+            modify: (-5, 999_999_999),
+            change: (9, 1),
+        };
+        let mut w = Writer::new();
+        key.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 52);
+        assert_eq!(ImageKey::read(&mut Reader::new(w.as_bytes())), Ok(key));
+        for end in 0..w.as_bytes().len() {
+            assert!(ImageKey::read(&mut Reader::new(&w.as_bytes()[..end])).is_err());
+        }
+        for bad in [
+            ImageKey { part: 2, ..key },
+            ImageKey {
+                change: (0, 1_000_000_000),
+                ..key
+            },
+        ] {
+            let mut w = Writer::new();
+            bad.write(&mut w).unwrap();
+            assert!(ImageKey::read(&mut Reader::new(w.as_bytes())).is_err());
+        }
     }
 
     #[test]

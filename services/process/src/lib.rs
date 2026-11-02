@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! What the POSIX process service decides apart from the calls it makes:
-//! the table of its records (`records`), the queue of the spawns that
+//! the table of its records (`records`), the table of images (`images`), the queue of the spawns that
 //! wait (`queue`), the waits that wait (`waits`) and the rules of
 //! signals (`signals`), the steps of the walks over the records
 //! (`walk`), the controlling terminals of the sessions (`terminals`) and the timers
@@ -14,6 +14,7 @@
 
 #[cfg(feature = "image-probe")]
 pub mod image_probe;
+pub mod images;
 pub mod loaders;
 pub mod queue;
 pub mod queued;
