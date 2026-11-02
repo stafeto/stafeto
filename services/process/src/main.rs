@@ -105,8 +105,8 @@ struct Walking {
 /// units, a delivery costing one and the delivery of SIGCONT to a stopped
 /// process (a process control, a report to the parent, an answer to its
 /// wait and a SIGCHLD) four; or looks at all the places of the table.
-const TTY_UNITS: usize = 16;
-const TTY_CONTINUE: usize = 4;
+const TTY_UNITS: usize = 8;
+const TTY_CONTINUE: usize = 2;
 const TTY_LOOKS: usize = RECORDS;
 /// The walks of the terminal that wait for the one before them: the
 /// terminal service is answered when its request is taken, and its next
@@ -357,6 +357,8 @@ struct Processes {
     /// The loop's own thread, which lowers its level for a step of the
     /// walks of the terminal (`tty_step`).
     loop_thread: Option<Handle<Thread>>,
+    /// Whether the loop's thread is at the lower level (`tty_level`).
+    tty_low: bool,
     /// Gets that wait for an object may be answered: the loop's own step
     /// does it, a batch at a time (`share_step`).
     share_wake: bool,
@@ -2313,6 +2315,7 @@ impl Processes {
             } else {
                 // No step can be told: the walks of the terminal are over,
                 // those that were answered already, the probe's with AGAIN.
+                self.tty_level(false);
                 for next in self.tty_walks.iter_mut() {
                     if let Some(Some(pending)) = next.take().map(|w| w.pending) {
                         let status = Status::from_code(proto_process::AGAIN);
@@ -2416,24 +2419,39 @@ impl Processes {
         self.kick();
     }
 
+    /// The loop's thread works at the service's level, above the terminal
+    /// service, which would wait for every step of a long walk. While walks
+    /// of the terminal are queued it works at the lower level (`low`): the
+    /// next request of the terminal service goes before the next step, and
+    /// the service runs ahead of the walk. It takes its own level back when
+    /// the last walk ends. Without its handle it stays where it is.
+    fn tty_level(&mut self, low: bool) {
+        if self.tty_low == low {
+            return;
+        }
+        let level = if low {
+            self.level.saturating_sub(TTY_STEP_BELOW)
+        } else {
+            self.level
+        };
+        if self
+            .loop_thread
+            .as_ref()
+            .is_some_and(|t| sys::thread_set_priority(t, level, abi::Policy::Fifo).is_ok())
+        {
+            self.tty_low = low;
+        }
+    }
+
     /// One step of the first walk of the terminal (`tty_walk_step`), at the
-    /// level below the terminal service's.
+    /// lower level when the loop's thread could take it.
     fn tty_step(&mut self) {
         self.tty_step_told = false;
         if self.tty_walks[0].is_some() {
             rt::service::step_own();
-            // The loop's thread works at the service's level, above the
-            // terminal service, which would wait for every step of a
-            // long walk; it takes the lower level for this one step and
-            // gives it back. Without its handle the step runs where it is.
-            let low = self.level.saturating_sub(TTY_STEP_BELOW);
-            let lowered = self
-                .loop_thread
-                .as_ref()
-                .is_some_and(|t| sys::thread_set_priority(t, low, abi::Policy::Fifo).is_ok());
             self.tty_walk_step();
-            if lowered && let Some(t) = self.loop_thread.as_ref() {
-                let _ = sys::thread_set_priority(t, self.level, abi::Policy::Fifo);
+            if self.tty_walks[0].is_none() {
+                self.tty_level(false);
             }
         }
         self.kick();
@@ -2674,6 +2692,7 @@ impl Processes {
             refused: false,
             denied: false,
         });
+        self.tty_level(true);
         self.kick();
         // The call that tells the loop of the step failed: kick dropped it.
         if self.tty_walks[place].is_none() {
@@ -2789,6 +2808,7 @@ impl Processes {
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::BadSize);
         };
+        self.tty_level(true);
         self.tty_walks[0] = Some(TtyWalking {
             walk: Walk::passed(Target::Group(pgid), index),
             pending: Some(pending),
