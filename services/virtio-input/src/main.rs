@@ -74,6 +74,9 @@ const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
 const NO_INPUT: u64 = 6;
 const NOT_STARTED: u64 = 7;
+/// The device broke the protocol while the keyboard was in use: init stops
+/// it and starts the driver again.
+const DEVICE_FAILED: u64 = 8;
 
 /// The heap the device's crate may ask for: none (the queue has no
 /// indirect entries, the only thing of the crate that allocates).
@@ -309,29 +312,26 @@ impl Driver {
     /// the queue empty the line opens again (irq_ack), source cleared
     /// first [G26].
     fn drain(&mut self) {
-        let (taken, sound) = self.reap(PER_STEP);
+        let taken = self.reap(PER_STEP);
         // The events of the step, for the line of the longest.
         rt::service::step_detail(taken);
-        // A buffer that could not be taken back stays in the ring: no step
-        // is asked for it again and again.
-        if sound && self.queue.peek_used().is_some() && sys::notify(&self.notify, MORE).is_ok() {
+        if self.queue.peek_used().is_some() && sys::notify(&self.notify, MORE).is_ok() {
             return;
         }
         virtio_mmio::reopen(&self.irq);
     }
 
     /// Takes up to `most` events the device returned to the focus, and
-    /// gives their buffers back; how many, and whether no buffer failed.
-    fn reap(&mut self, most: u64) -> (u64, bool) {
+    /// gives their buffers back; how many. A buffer that cannot be taken back or given back ends the
+    /// driver (DEVICE_FAILED).
+    fn reap(&mut self, most: u64) -> u64 {
         let mut taken = 0u64;
-        let mut sound = true;
         while taken < most
             && let Some(token) = self.queue.peek_used()
         {
             let Some(&slot) = self.slot_of.get(usize::from(token)) else {
                 rt::println!("virtio-input: a used buffer {token} out of the queue");
-                sound = false;
-                break;
+                sys::process_exit(DEVICE_FAILED);
             };
             let slot = usize::from(slot);
             // SAFETY: the same buffer `offer` added with this token; the
@@ -342,8 +342,7 @@ impl Driver {
             };
             let Ok(len) = popped else {
                 rt::println!("virtio-input: the used buffer {token} could not be taken back");
-                sound = false;
-                break;
+                sys::process_exit(DEVICE_FAILED);
             };
             if len as usize >= EVENT_LEN {
                 // SAFETY: as above; read before the buffer goes back.
@@ -352,15 +351,14 @@ impl Driver {
             }
             if !self.offer(slot) {
                 rt::println!("virtio-input: buffer {slot} could not go back to the queue");
-                sound = false;
-                break;
+                sys::process_exit(DEVICE_FAILED);
             }
             taken += 1;
         }
         if taken > 0 && self.queue.should_notify() {
             virtio_mmio::ring(&mut self.transport, EVENTQ);
         }
-        (taken, sound)
+        taken
     }
 
     /// GRANT: a new session of focus, which revokes the one before.
