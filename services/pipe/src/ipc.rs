@@ -167,13 +167,14 @@ pub enum Block {
     /// one that is first by level, then by age (`named_balance`).
     Named(u8),
     /// A wait by address on a word of shared memory, at the level of the
-    /// waiting thread. It is kept in `blocked` only, like `Named`.
-    Addr(u8, Word),
+    /// waiting thread. It is kept in `blocked` only, like `Named`; the word
+    /// is in `Ipc::words` at the place of the operation.
+    Addr(u8),
 }
 
 /// A word of memory several processes share: the kind of its object's key
 /// (0 a file, 1 anonymous memory), the key and the offset in the object.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Word {
     kind: u64,
     key: u64,
@@ -505,8 +506,12 @@ pub struct Ipc {
     /// that no step wakes many.
     owed: [u8; SEMSETS],
     gone_sets: u8,
-    /// The waiters by address in the states Handed and Orphan: steps are due.
+    /// The waiters by address in the state Handed: steps are due.
     addr_pending: u16,
+    /// The words the waiters by address wait on, at their places in
+    /// `blocked`; the word of the start that `note_wait` is to place.
+    words: [Word; BLOCKED_MAX],
+    start_word: Word,
     /// The places of segments whose file's removal the file service has not
     /// taken: a new segment does not get them.
     busy_segs: u8,
@@ -600,6 +605,16 @@ impl Ipc {
             owed: [0; SEMSETS],
             gone_sets: 0,
             addr_pending: 0,
+            words: [Word {
+                kind: 0,
+                key: 0,
+                off: 0,
+            }; BLOCKED_MAX],
+            start_word: Word {
+                kind: 0,
+                key: 0,
+                off: 0,
+            },
             busy_segs: 0,
             pool: End::NONE,
             own: [None; SEGS],
@@ -1070,6 +1085,9 @@ impl Ipc {
                 seq: self.wait_seq,
                 state: Wait::Waiting,
             };
+            if let Block::Addr(_) = block {
+                self.words[at] = self.start_word;
+            }
             self.wait_seq += 1;
         }
     }
@@ -1084,8 +1102,9 @@ impl Ipc {
                 let (queue, block, state) = (b.queue, b.block, b.state);
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
-                if let Block::Addr(_, word) = block {
+                if let Block::Addr(_) = block {
                     // A waiter that leaves holding the wake hands it on.
+                    let word = self.words[at];
                     if state == Wait::Handed {
                         self.addr_pending -= 1;
                     }
@@ -1109,6 +1128,7 @@ impl Ipc {
         if self.counted == 0 {
             return;
         }
+        let mut orphans = false;
         for b in &mut self.blocked {
             if b.used && b.label == label {
                 if let Block::Named(_) = b.block
@@ -1117,7 +1137,7 @@ impl Ipc {
                 {
                     self.owed[s] += 1;
                 }
-                if let Block::Addr(..) = b.block
+                if let Block::Addr(_) = b.block
                     && matches!(b.state, Wait::Granted | Wait::Handed)
                 {
                     // Freed below, once the session's other waiters are gone
@@ -1126,20 +1146,22 @@ impl Ipc {
                         self.addr_pending -= 1;
                     }
                     b.state = Wait::Orphan;
+                    orphans = true;
                     continue;
                 }
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
             }
         }
+        if !orphans {
+            return;
+        }
         for at in 0..BLOCKED_MAX {
-            let b = self.blocked[at];
+            let b = &self.blocked[at];
             if b.used && b.label == label && b.state == Wait::Orphan {
                 self.blocked[at] = BLOCKED_FREE;
                 self.counted -= 1;
-                if let Block::Addr(_, word) = b.block {
-                    self.hand_addr(word, None);
-                }
+                self.hand_addr(self.words[at], None);
             }
         }
     }
@@ -1256,10 +1278,10 @@ impl Ipc {
     fn addr_first(&self, word: Word, out: &mut [(u8, u64, usize)]) -> usize {
         let mut n = 0;
         for (at, b) in self.blocked.iter().enumerate() {
-            let Block::Addr(level, w) = b.block else {
+            let Block::Addr(level) = b.block else {
                 continue;
             };
-            if !b.used || w != word || b.state != Wait::Waiting {
+            if !b.used || b.state != Wait::Waiting || self.words[at] != word {
                 continue;
             }
             let mut i = n;
@@ -1286,10 +1308,11 @@ impl Ipc {
         n
     }
 
-    /// `ADDR_WAKE`: wakes up to `count` waiters on `word` (no more than a
-    /// list of wakes holds); how many.
+    /// `ADDR_WAKE`: wakes up to `count` waiters on `word`, no more than
+    /// `proto_pipe::ipc::op::ADDR_WAKE_MAX` (each costs a notification, and a
+    /// step stays under term B); how many.
     fn addr_wake(&mut self, word: Word, count: u64, wakes: &mut Wakes) -> u64 {
-        let mut first = [(0u8, 0u64, 0usize); 16];
+        let mut first = [(0u8, 0u64, 0usize); proto_pipe::ipc::op::ADDR_WAKE_MAX];
         let want = count.min(first.len() as u64) as usize;
         let found = self.addr_first(word, &mut first[..want]);
         let mut woken = 0;
@@ -1330,7 +1353,7 @@ impl Ipc {
         if let Some(b) = self
             .blocked
             .iter_mut()
-            .find(|b| b.used && matches!(b.block, Block::Addr(..)) && b.state == Wait::Handed)
+            .find(|b| b.used && matches!(b.block, Block::Addr(_)) && b.state == Wait::Handed)
             && wakes.push((b.label, b.key))
         {
             b.state = Wait::Granted;
@@ -1352,7 +1375,8 @@ impl Ipc {
             if b.used
                 && b.label == label
                 && Some(b.key) == key
-                && matches!(b.block, Block::Addr(_, x) if x == word)
+                && matches!(b.block, Block::Addr(_))
+                && self.words[at] == word
                 && matches!(b.state, Wait::Granted | Wait::Handed)
             {
                 if b.state == Wait::Handed {
@@ -1362,9 +1386,10 @@ impl Ipc {
                 return Flow::Done;
             }
         }
+        self.start_word = word;
         Flow::Wait {
             queue: Self::set_number(0),
-            block: Block::Addr(w[3].min(255) as u8, word),
+            block: Block::Addr(w[3].min(255) as u8),
         }
     }
 
@@ -3792,7 +3817,15 @@ mod tests {
 
     /// Starts the wait by address of the operation `n` of the session `label`
     /// on the word (kind 1, key `key`, offset `off`) at `level`.
-    fn addr_wait_at(r: &mut Run, p: &mut Pipes, label: u64, n: u64, key: u64, off: u64, level: u64) {
+    fn addr_wait_at(
+        r: &mut Run,
+        p: &mut Pipes,
+        label: u64,
+        n: u64,
+        key: u64,
+        off: u64,
+        level: u64,
+    ) {
         let (flow, _) = r.call(p, label, op::ADDR_WAIT, &[1, key, off, level], b"", None);
         let Ok(Flow::Wait { queue, block }) = flow else {
             panic!("the wait {n} did not wait: {flow:?}")
@@ -3824,7 +3857,15 @@ mod tests {
         for (i, level) in levels.iter().enumerate() {
             // Two sessions; the word is the same, another offset and another
             // key have waiters of their own.
-            addr_wait_at(&mut r, &mut p, 1 + i as u64 % 2, i as u64 + 1, 77, 64, *level);
+            addr_wait_at(
+                &mut r,
+                &mut p,
+                1 + i as u64 % 2,
+                i as u64 + 1,
+                77,
+                64,
+                *level,
+            );
         }
         addr_wait_at(&mut r, &mut p, 1, 20, 77, 68, 30);
         addr_wait_at(&mut r, &mut p, 1, 21, 78, 64, 30);
@@ -3857,11 +3898,11 @@ mod tests {
             let woken = addr_wake_all(&mut r, &mut p, 5, 0, i32::MAX as u64);
             total += woken;
             calls += 1;
-            if woken < 16 {
+            if woken < proto_pipe::ipc::op::ADDR_WAKE_MAX as u64 {
                 break;
             }
         }
-        assert_eq!((total, calls), (40, 3));
+        assert_eq!((total, calls), (40, 6));
         for n in 1..=40u64 {
             assert!(addr_take(&mut r, &mut p, 1, n, 5, 0));
         }

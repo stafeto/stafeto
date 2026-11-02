@@ -250,6 +250,11 @@ impl Source {
     }
 }
 
+/// What a forked child takes from the parent's object that starts at an
+/// address: the address, the file, the access it may get, whether it is
+/// dirty, the guard pages, the key for waits by address.
+type Inherited = (usize, Option<posix_map::Back>, bool, bool, usize, u64);
+
 /// One entry of a forked child's memory map (the loader's `ForkEntry`): the
 /// handle is None for an entry that shows the object of the one before.
 pub struct ChildEntry {
@@ -283,7 +288,7 @@ pub unsafe fn after_fork(
     }
     // The files the parent's shared mappings write to: the child's pins
     // are the parent's places.
-    let mut backs =
+    let mut backs: [Inherited; posix_map::MAX_PIECES] =
         [(0usize, None::<posix_map::Back>, true, false, 0usize, 0u64); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
         let object = state.map.object(piece.object());
@@ -348,11 +353,7 @@ pub unsafe fn after_fork(
 
 /// The piece the child's loader mapped at `address` has the hole the
 /// parent's piece there had (the room's use is copied whole).
-fn restore_hole(
-    state: &mut State,
-    backs: &[(usize, Option<posix_map::Back>, bool, bool, usize, u64)],
-    address: usize,
-) {
+fn restore_hole(state: &mut State, backs: &[Inherited], address: usize) {
     let guard = backs
         .iter()
         .find(|entry| entry.0 == address)

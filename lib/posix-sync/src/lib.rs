@@ -500,8 +500,8 @@ pub fn futex_wait(
         }
     }
     // A word in a mapping the service cannot hold a wait for: the wait polls.
-    let poll = (timer != 0 && in_shared)
-        .then(|| rt::time::ticks_to_ns(rt::time::now()) + SHARED_POLL_NS);
+    let poll =
+        (timer != 0 && in_shared).then(|| rt::time::ticks_to_ns(rt::time::now()) + SHARED_POLL_NS);
     let wake_at = match (deadline, poll) {
         (Some(d), Some(p)) => Some(d.min(p)),
         (d, p) => d.or(p),

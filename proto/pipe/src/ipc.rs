@@ -149,9 +149,13 @@ pub mod op {
     pub const ADDR_WAIT: u32 = 38;
     /// A wake by address: w0 kind, w1 key, w2 offset, w3 how many to wake at
     /// most. The waiters of the word wake in the order of their levels, the
-    /// older first among equals. => w0 how many were woken (at most the
-    /// size of a list of wakes: the caller asks again when it got that many).
+    /// older first among equals. => w0 how many were woken (at most
+    /// `ADDR_WAKE_MAX`).
     pub const ADDR_WAKE: u32 = 39;
+    /// The most waiters one `ADDR_WAKE` wakes: a notification for each, and a
+    /// step of the service stays under term B. The caller asks again when
+    /// it got that many.
+    pub const ADDR_WAKE_MAX: usize = 8;
 
     /// Whether the operation is a long one: a start that may answer WAIT
     /// and the takes that follow.

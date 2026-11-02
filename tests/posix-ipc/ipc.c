@@ -1784,6 +1784,85 @@ static int shared_idle(int named) {
     return 0;
 }
 
+static struct shared *many_page;
+
+static void *many_waiter(void *arg) {
+    struct shared *s = many_page;
+    (void)arg;
+    __atomic_fetch_add(&s->started, 1, __ATOMIC_SEQ_CST);
+    if (sem_wait(&s->sem) != 0) return (void *)1;
+    __atomic_fetch_add(&s->done, 1, __ATOMIC_SEQ_CST);
+    if (pthread_mutex_lock(&s->mutex) != 0) return (void *)2;
+    s->count++;
+    while (!s->flag)
+        if (pthread_cond_wait(&s->cond, &s->mutex) != 0) return (void *)3;
+    if (pthread_mutex_unlock(&s->mutex) != 0) return (void *)4;
+    __atomic_fetch_add(&s->turn, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+/* Thirty-six threads of three processes wait on a semaphore of a shared page;
+ * a post wakes one of them. Then they wait on a condition, and a broadcast
+ * wakes all (the service wakes a list at a time; xtask measures its longest
+ * step). */
+static int shared_many(void) {
+    enum { EACH = 12, CHILDREN = 2, ALL = EACH * (CHILDREN + 1) };
+    many_page = shared_page(0);
+    struct shared *s = many_page;
+    CHECK(s != NULL);
+    pthread_mutexattr_t ma;
+    pthread_condattr_t ca;
+    CHECK(pthread_mutexattr_init(&ma) == 0 && pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_condattr_init(&ca) == 0 && pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED) == 0);
+    CHECK(pthread_mutex_init(&s->mutex, &ma) == 0 && pthread_cond_init(&s->cond, &ca) == 0);
+    CHECK(sem_init(&s->sem, 1, 0) == 0);
+    pid_t pids[CHILDREN];
+    for (int c = 0; c < CHILDREN; c++) {
+        pids[c] = fork();
+        CHECK(pids[c] >= 0);
+        if (pids[c] == 0) {
+            pthread_t threads[EACH];
+            int made = 0;
+            for (int i = 0; i < EACH; i++)
+                if (pthread_create(&threads[i], NULL, many_waiter, NULL) == 0) made++;
+            int bad = made != EACH;
+            for (int i = 0; i < made; i++) {
+                void *result = NULL;
+                if (pthread_join(threads[i], &result) != 0 || result != NULL) bad = 1;
+            }
+            _exit(bad);
+        }
+    }
+    pthread_t threads[EACH];
+    for (int i = 0; i < EACH; i++) CHECK(pthread_create(&threads[i], NULL, many_waiter, NULL) == 0);
+    for (int i = 0; i < 1000 && s->started != ALL; i++) pause_ms(10);
+    CHECK(s->started == ALL);
+    pause_ms(300);
+    CHECK(s->done == 0);
+    /* A post wakes one. */
+    CHECK(sem_post(&s->sem) == 0);
+    for (int i = 0; i < 400 && s->done == 0; i++) pause_ms(5);
+    pause_ms(100);
+    CHECK(s->done == 1);
+    for (int i = 1; i < ALL; i++) CHECK(sem_post(&s->sem) == 0);
+    for (int i = 0; i < 2000 && s->count != ALL; i++) pause_ms(5);
+    CHECK(s->done == ALL && s->count == ALL);
+    pause_ms(300);
+    CHECK(s->turn == 0);
+    CHECK(pthread_mutex_lock(&s->mutex) == 0);
+    s->flag = 1;
+    CHECK(pthread_cond_broadcast(&s->cond) == 0);
+    CHECK(pthread_mutex_unlock(&s->mutex) == 0);
+    for (int i = 0; i < EACH; i++) {
+        void *result = NULL;
+        CHECK(pthread_join(threads[i], &result) == 0 && result == NULL);
+    }
+    for (int c = 0; c < CHILDREN; c++) CHECK(wait_ok(pids[c]));
+    CHECK(s->turn == ALL);
+    CHECK(munmap(s, 4096) == 0);
+    return 0;
+}
+
 static int shared_anonymous_order(void) { return shared_order(0); }
 static int shared_named_order(void) { return shared_order(1); }
 static int shared_anonymous_latency(void) { return shared_latency(0); }
@@ -1837,6 +1916,7 @@ int main(int argc, char **argv) {
     RUN(shared_anonymous_ends);
     RUN(shared_named_ends);
     RUN(shared_anonymous_idle);
+    RUN(shared_many);
     RUN(shared_named_idle);
     RUN(limits);
     RUN(longest_steps);

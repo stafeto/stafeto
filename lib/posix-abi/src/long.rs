@@ -296,6 +296,7 @@ pub fn run_until(
 /// has the waiter: `check` says whether to go on (false ends the operation
 /// with EAGAIN, and the service passes a wake it had given the waiter on).
 /// `deadline` ends the wait with ETIMEDOUT.
+#[allow(clippy::too_many_arguments)]
 pub fn run_checked(
     service: &Handle<Channel>,
     start: &[u8],

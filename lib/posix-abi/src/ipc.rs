@@ -164,6 +164,7 @@ fn long_call(
     parse(&buffer[..n], out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     transport: Transport,
     operation: u32,
@@ -293,8 +294,8 @@ pub fn wake_address(word: (u64, u64, u64), count: u32) -> u32 {
         };
         let woken = reply.words[0] as u32;
         total += woken;
-        // The service wakes at most a list of waiters in a call.
-        if woken < 16 {
+        // The service wakes a few waiters in a call.
+        if woken < proto_pipe::ipc::op::ADDR_WAKE_MAX as u32 {
             break;
         }
     }
