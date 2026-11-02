@@ -130,7 +130,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # backwards after the atexit functions; a header the loader named wrongly
 # ends the start with 125; without the key the start is as before; tagged
 # pin-70c35b46.
-COMMIT = "70c35b4641e6459b399ba674c605b3965660e738"
+# dlsym of a dynamically linked program searches the program and libc.so
+# through the layer's stafeto_dlsym (relibc's own linker is never built, so
+# the environment of a set-ID program stays unread), dl_iterate_phdr lists
+# the program and libc.so, dlopen of a path says it loads no new library;
+# platform interface 23; tagged pin-99bb153a.
+COMMIT = "99bb153ae9e3888574e0ba288208cd5330638b9d"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

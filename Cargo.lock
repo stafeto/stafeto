@@ -423,6 +423,7 @@ dependencies = [
 name = "posix-platform"
 version = "0.2.0-pre.1"
 dependencies = [
+ "dynlink",
  "posix-abi",
  "posix-change",
  "posix-fs",

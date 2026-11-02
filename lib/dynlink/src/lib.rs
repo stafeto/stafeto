@@ -23,7 +23,7 @@ mod parse;
 mod relocate;
 mod symbol;
 
-pub use parse::parse;
+pub use parse::{DYNAMIC_MAX, PHDR_SIZE, module, parse};
 pub use relocate::{Counts, Kinds, relocate};
 pub use symbol::{Symbol, gnu_hash, lookup};
 

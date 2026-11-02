@@ -657,7 +657,9 @@ def build_probes() -> list:
     made = {}
     for name in GOOD:
         compile_c(SOURCES / f"{name}.c", work / f"{name}.o")
-        link_program(PROBES / name, [work / f"{name}.o"])
+        # so-hello exports so_exported, which its dl mode looks up by name.
+        link_program(PROBES / name, [work / f"{name}.o"],
+                     ["--export-dynamic-symbol=so_exported"] if name == "so-hello" else None)
         made[name] = "good"
     # bad-interp: another dynamic linker.
     compile_c(SOURCES / "bad-interp.c", work / "bad-interp.o")
