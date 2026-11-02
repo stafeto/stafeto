@@ -276,6 +276,8 @@ fn main(_: u64) -> u64 {
         input: Input::Idle,
         report: tty::window::Reader::new(),
         report_due: None,
+        again: [None; AGAIN_MAX],
+        again_due: None,
         timer,
         _view: view,
         armed: None,
@@ -382,6 +384,10 @@ struct Tty {
     report: tty::window::Reader,
     /// When the bytes the reader holds go on as input, if it holds any.
     report_due: Option<u64>,
+    /// What the process service refused with AGAIN (its queue of walks
+    /// was full), to send again at `again_due`.
+    again: [Option<Again>; AGAIN_MAX],
+    again_due: Option<u64>,
     input: Input,
     /// The timer of VTIME and the deadline it is armed for.
     timer: Handle<Timer>,
@@ -957,6 +963,13 @@ impl Tty {
 
     /// Complete the exact old connection even if an earlier departure remains.
     fn finish_departure(&mut self, generation: u64) {
+        self.finish_departure_from(generation, 0);
+    }
+
+    /// The departure of `generation` from its signal number `first` of the
+    /// two (SIGHUP, SIGCONT). A signal the process service refuses with AGAIN
+    /// is sent again later, with the ones after it and the acknowledgement.
+    fn finish_departure_from(&mut self, generation: u64, first: usize) {
         let Some(notary) = self.notary.as_ref() else {
             return;
         };
@@ -965,7 +978,11 @@ impl Tty {
         if let Some(old) = old
             && let Some(group) = old.foreground
         {
-            for signal in [proto_process::SIGHUP, proto_process::SIGCONT] {
+            for (n, signal) in [proto_process::SIGHUP, proto_process::SIGCONT]
+                .into_iter()
+                .enumerate()
+                .skip(first)
+            {
                 let mut w = Writer::new();
                 let _ = proto_process::Method::TtySignal.header().write(&mut w);
                 let _ = w.u32(self.active as u32);
@@ -976,6 +993,15 @@ impl Tty {
                     return;
                 };
                 let code = proto_wire::Reader::new(reply.bytes(&mut buffer)).u32();
+                if code == Ok(proto_process::AGAIN) {
+                    let device = self.active;
+                    self.again_later(Again::Departure {
+                        device,
+                        generation,
+                        next: n,
+                    });
+                    return;
+                }
                 if !matches!(code, Ok(0 | proto_process::NO_PROCESS)) {
                     return;
                 }
@@ -1503,6 +1529,7 @@ impl Tty {
             .iter()
             .filter_map(|d| d.readers.deadline())
             .chain(self.report_due)
+            .chain(self.again_due)
             .min();
         if deadline == self.armed {
             return;
@@ -2350,7 +2377,11 @@ impl Tty {
                 && let Err(code) = self.try_signal_group(group, 28)
             {
                 self.devices[self.active].winsize = before;
-                return Err(code);
+                return Err(if code == proto_process::AGAIN {
+                    proto_tty::IO_ERROR
+                } else {
+                    code
+                });
             }
         }
         Ok(())
@@ -2827,17 +2858,70 @@ impl Tty {
         };
         let mut buffer = [0; MESSAGE_MAX];
         match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
-            Ok(0) => Err(proto_tty::RESTART),
+            Ok(0 | proto_process::AGAIN) => Err(proto_tty::RESTART),
             _ => Err(proto_tty::IO_ERROR),
         }
     }
 
     /// The signal `number` of INTR, QUIT or SUSP to the foreground group
     /// `group` (XBD 11.1.9): the process service walks the group
-    /// (TtySignal) and answers at the walk's end. A group of a session
-    /// the console is no longer the controlling terminal of gets none.
+    /// (TtySignal) and answers when it has queued the walk. A group of a
+    /// session the console is no longer the controlling terminal of gets none.
     fn signal_group(&mut self, group: u32, number: u32) {
-        let _ = self.try_signal_group(group, number);
+        if self.try_signal_group(group, number) == Err(proto_process::AGAIN) {
+            let device = self.active;
+            self.again_later(Again::Signal {
+                device,
+                group,
+                number,
+            });
+        }
+    }
+
+    /// Keeps a refused signal to send again in `AGAIN_NS`; when no place is
+    /// free the oldest goes (a signal that waits, as for a process).
+    fn again_later(&mut self, again: Again) {
+        if !self.again.iter().flatten().any(|a| *a == again) {
+            match self.again.iter().position(Option::is_none) {
+                Some(place) => self.again[place] = Some(again),
+                None => {
+                    self.again.rotate_left(1);
+                    self.again[AGAIN_MAX - 1] = Some(again);
+                }
+            }
+        }
+        if self.again_due.is_none() {
+            self.again_due = Some(now() + AGAIN_NS);
+        }
+        self.arm_timer();
+    }
+
+    /// The timer of the refused signals: each is sent again, in the order
+    /// it was refused, and the ones refused once more wait for the next.
+    fn send_again(&mut self) {
+        let kept = self.active;
+        let list = core::mem::replace(&mut self.again, [None; AGAIN_MAX]);
+        for again in list.into_iter().flatten() {
+            match again {
+                Again::Signal {
+                    device,
+                    group,
+                    number,
+                } => {
+                    self.select(device);
+                    self.signal_group(group, number);
+                }
+                Again::Departure {
+                    device,
+                    generation,
+                    next,
+                } => {
+                    self.select(device);
+                    self.finish_departure_from(generation, next);
+                }
+            }
+        }
+        self.select(kept);
     }
 
     fn try_signal_group(&mut self, group: u32, number: u32) -> Result<(), u32> {
@@ -2867,10 +2951,30 @@ impl Tty {
         let mut buffer = [0; MESSAGE_MAX];
         match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
             Ok(0 | proto_process::NO_PROCESS) => Ok(()),
+            Ok(proto_process::AGAIN) => Err(proto_process::AGAIN),
             _ => Err(proto_tty::IO_ERROR),
         }
     }
 }
+
+/// What the process service refused with AGAIN, to send again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Again {
+    Signal {
+        device: usize,
+        group: u32,
+        number: u32,
+    },
+    Departure {
+        device: usize,
+        generation: u64,
+        next: usize,
+    },
+}
+/// How many refusals the terminal service keeps, and how long it waits to
+/// send them again (the process service walks a step in that time).
+const AGAIN_MAX: usize = 4;
+const AGAIN_NS: u64 = 2_000_000;
 
 impl Tty {
     fn retire_holds(&mut self, slot: usize) {
@@ -3122,6 +3226,10 @@ impl Service<0> for Tty {
                 let ops = &mut *self.ops;
                 for device in self.devices.iter_mut() {
                     device.readers.expire(now(), |w| ops.tell(w.label, w.key));
+                }
+                if self.again_due.is_some_and(|due| due <= now()) {
+                    self.again_due = None;
+                    self.send_again();
                 }
                 if self.report_due.is_some_and(|due| due <= now()) {
                     // No rest of a report came: the held bytes are input.

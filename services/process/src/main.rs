@@ -102,10 +102,36 @@ struct Walking {
     refused: bool,
     denied: bool,
 }
-/// The most deliveries and the most looks at places one step of the walk of
-/// a TtySignal makes (`tty_walk_step`).
-const TTY_DELIVERIES: usize = 16;
+/// What one step of the walk of a TtySignal may spend (`tty_walk_step`): 8
+/// units, a delivery costing one and the delivery of SIGCONT to a stopped
+/// process (a process control, a report to the parent, an answer to its
+/// wait and a SIGCHLD) two; or looks at all the places of the table. With
+/// 16 units a crowd of 64 made a step of 19,735 ticks, past 0.9 B of 18,369.
+const TTY_UNITS: usize = 8;
+const TTY_CONTINUE: usize = 2;
 const TTY_LOOKS: usize = RECORDS;
+/// The walks of the terminal that wait for the one before them: the
+/// terminal service is answered when its request is taken, and its next
+/// request (SIGCONT after SIGHUP of a session's end) queues behind.
+const TTY_QUEUE: usize = 4;
+/// The places in use: the image of the terminal probe queues one walk, so
+/// that the refusal with AGAIN and the terminal service's second try run.
+const TTY_PLACES: usize = if cfg!(feature = "tty-probe") {
+    1
+} else {
+    TTY_QUEUE
+};
+/// The walk of a TtySignal. Its request was answered when it was taken;
+/// only the probe of a newborn (`probe_newborn`) waits for the end.
+struct TtyWalking {
+    walk: Walk,
+    pgid: u32,
+    pending: Option<Pending>,
+    signal: u8,
+    delivered: bool,
+    refused: bool,
+    denied: bool,
+}
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
@@ -171,6 +197,14 @@ const SIGWINCH: u8 = 28;
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
 const STEP: u64 = 1 << 63 | 0xFFFF;
+/// The label of the notice that makes the next step of a walk of the
+/// terminal (`tty_step`).
+const TTY_STEP: u64 = 1 << 63 | 0xFFFC;
+/// How far below the service's level a step of the walks of the terminal
+/// runs: the service is at 52 and the terminal service at 50, so the step is
+/// at 49, and the terminal service, once its request is answered, runs ahead
+/// of the walk and does not wait for all of it.
+const TTY_STEP_BELOW: u8 = proto_process::TTY_STEP_BELOW;
 /// The label of the service's timer of the processes' timers (`timers`),
 /// a service label no record has. The heartbeat's timer has label 0.
 const TIMERS: u64 = 1 << 63 | 0xFFFE;
@@ -314,9 +348,10 @@ struct Processes {
     /// The walks that wait for an earlier walk of their sender, with the
     /// sender's index.
     later: [Option<(usize, Walking)>; LATER],
-    /// The walk of a TtySignal, one at a time: the terminal service waits
-    /// for its reply (5f).
-    tty_walk: Option<Walking>,
+    /// The walks of TtySignal in the order they came, the first on: the
+    /// terminal service is answered at the request, so that its wait does
+    /// not grow with the size of the group (5f). Full places lie first.
+    tty_walks: [Option<TtyWalking>; TTY_QUEUE],
     orphan_walk: Option<(u32, Walk, bool)>,
     #[cfg(feature = "tty-probe")]
     tty_probe: Option<(usize, u32)>,
@@ -328,6 +363,15 @@ struct Processes {
     /// (STEP), and whether a step was told and not taken.
     step: Option<Handle<Channel>>,
     step_told: bool,
+    /// The same for the steps of the walks of the terminal (TTY_STEP), at
+    /// the lower level.
+    tty_step: Option<Handle<Channel>>,
+    tty_step_told: bool,
+    /// The loop's own thread, which lowers its level for a step of the
+    /// walks of the terminal (`tty_step`).
+    loop_thread: Option<Handle<Thread>>,
+    /// Whether the loop's thread is at the lower level (`tty_level`).
+    tty_low: bool,
     /// Gets that wait for an object may be answered: the loop's own step
     /// does it, a batch at a time (`share_step`).
     share_wake: bool,
@@ -377,7 +421,7 @@ impl Processes {
             Waits::initialize_at(addr_of_mut!((*at).waits));
             rt::bss::fill_none(addr_of_mut!((*at).walks));
             rt::bss::fill_none(addr_of_mut!((*at).later));
-            addr_of_mut!((*at).tty_walk).write(None);
+            rt::bss::fill_none(addr_of_mut!((*at).tty_walks));
             addr_of_mut!((*at).orphan_walk).write(None);
             addr_of_mut!((*at).creating).write(None);
             Shares::initialize_at(addr_of_mut!((*at).shares));
@@ -487,6 +531,30 @@ fn main(_: u64) -> u64 {
         return 7;
     };
     owner.step = Some(step);
+    // Its place is at the lower level too: a notice lifts the receiver to the
+    // level of its place until the next receive.
+    let Ok(tty_step) = sys::handle_label(
+        &channel,
+        Rights::NOTIFY,
+        TTY_STEP,
+        level.saturating_sub(TTY_STEP_BELOW),
+    ) else {
+        return 7;
+    };
+    owner.tty_step = Some(tty_step);
+    // The loop's thread must be able to take the lower level for the walks
+    // of the terminal: without it the terminal would wait for the whole of
+    // each walk, so the service does not start.
+    let Ok(me) = sys::self_thread_shared() else {
+        return 7;
+    };
+    let low = level.saturating_sub(TTY_STEP_BELOW);
+    if sys::thread_set_priority(&me, low, abi::Policy::Fifo).is_err()
+        || sys::thread_set_priority(&me, level, abi::Policy::Fifo).is_err()
+    {
+        return 7;
+    }
+    owner.loop_thread = Some(me);
     // The notice of the second portion of a Create, at the loop's level
     // (the receiving thread that asks works there).
     let Ok(creating) = sys::handle_label(&channel, Rights::NOTIFY, CREATING, level) else {
@@ -2404,11 +2472,27 @@ impl Processes {
     /// that wait are answered AGAIN, none is left waiting for a step that
     /// never comes.
     fn kick(&mut self) {
+        if !self.tty_step_told && self.tty_walks[0].is_some() {
+            if self
+                .tty_step
+                .as_ref()
+                .is_some_and(|s| sys::notify(s, 1).is_ok())
+            {
+                self.tty_step_told = true;
+            } else {
+                // No step can be told: the walks of the terminal are over,
+                // those that were answered already, the probe's with AGAIN.
+                self.tty_level(false);
+                for next in self.tty_walks.iter_mut() {
+                    if let Some(Some(pending)) = next.take().map(|w| w.pending) {
+                        let status = Status::from_code(proto_process::AGAIN);
+                        let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
+                    }
+                }
+            }
+        }
         if !self.step_told
-            && (self.tty_walk.is_some()
-                || self.orphan_walk.is_some()
-                || self.records.has_orphans()
-                || self.share_wake)
+            && (self.orphan_walk.is_some() || self.records.has_orphans() || self.share_wake)
         {
             if self
                 .step
@@ -2416,11 +2500,6 @@ impl Processes {
                 .is_some_and(|s| sys::notify(s, 1).is_ok())
             {
                 self.step_told = true;
-            } else if let Some(w) = self.tty_walk.take() {
-                let status = Status::from_code(proto_process::AGAIN);
-                let _ = w
-                    .pending
-                    .answer(&proto_wire::reply(status), Outgoing::new());
             } else if self.share_wake {
                 // No step can be told: the answers go now, a batch at a time.
                 while self.share_wake {
@@ -2457,14 +2536,6 @@ impl Processes {
     /// and none could be signalled, NO_PROCESS for none.
     fn walk_step(&mut self) {
         self.step_told = false;
-        // A walk of the terminal goes first: the terminal service waits
-        // for it, and its input with it.
-        if self.tty_walk.is_some() {
-            rt::service::step_own();
-            self.tty_walk_step();
-            self.kick();
-            return;
-        }
         if self.orphan_walk.is_some() || self.records.has_orphans() {
             rt::service::step_own();
             self.orphan_step();
@@ -2515,18 +2586,56 @@ impl Processes {
         self.kick();
     }
 
+    /// The loop's thread works at the service's level, above the terminal
+    /// service, which would wait for every step of a long walk. While walks
+    /// of the terminal are queued it works at the lower level (`low`): the
+    /// next request of the terminal service goes before the next step, and
+    /// the service runs ahead of the walk. It takes its own level back when
+    /// the last walk ends. Without its handle it stays where it is.
+    fn tty_level(&mut self, low: bool) {
+        if self.tty_low == low {
+            return;
+        }
+        let level = if low {
+            self.level.saturating_sub(TTY_STEP_BELOW)
+        } else {
+            self.level
+        };
+        if self
+            .loop_thread
+            .as_ref()
+            .is_some_and(|t| sys::thread_set_priority(t, level, abi::Policy::Fifo).is_ok())
+        {
+            self.tty_low = low;
+        }
+    }
+
+    /// One step of the first walk of the terminal (`tty_walk_step`), at the
+    /// lower level when the loop's thread could take it.
+    fn tty_step(&mut self) {
+        self.tty_step_told = false;
+        if self.tty_walks[0].is_some() {
+            rt::service::step_own();
+            self.tty_walk_step();
+            if self.tty_walks[0].is_none() {
+                self.tty_level(false);
+            }
+        }
+        self.kick();
+    }
+
     /// A child just made in `index` whose group a walk passed already gets
     /// that walk's signal at its birth (walk.rs `takes_newborn`): a member
     /// that spawns while kill(-pgid) or kill(-1) is on leaves no child
     /// behind the cursor. Only while walks are on: RECORDS looks then.
     fn signal_newborn(&mut self, index: usize) {
         let pgid = self.records.get(index).map_or(0, |r| r.pgid);
-        if let Some(w) = self.tty_walk.as_ref()
+        if let Some(w) = self.tty_walks[0].as_ref()
             && w.walk.takes_newborn(index, pgid)
         {
             let signal = w.signal;
             let delivery = self.deliver_terminal(index, signal);
-            if let Some(w) = self.tty_walk.as_mut() {
+            if let Some(w) = self.tty_walks[0].as_mut() {
                 match delivery {
                     Delivery::Done | Delivery::Again => w.delivered = true,
                     Delivery::Denied => w.denied = true,
@@ -2710,19 +2819,15 @@ impl Processes {
         else {
             return Answer::Status(Status::BadSize);
         };
-        self.tty_signal(terminal, pgid, signal, generation, r)
+        self.tty_signal(terminal, pgid, signal, generation)
     }
 
     /// TtySignal: the walk of group `pgid` with `signal`, from the terminal
-    /// whose session the group lies in, with no check of permission.
-    fn tty_signal(
-        &mut self,
-        terminal: usize,
-        pgid: u32,
-        signal: u32,
-        generation: u64,
-        r: &mut Request<'_>,
-    ) -> Answer {
+    /// whose session the group lies in, with no check of permission. The
+    /// request is answered at once, once the checks pass and the walk has a
+    /// place in the queue of `TTY_QUEUE`; the steps of the service walk the
+    /// group in their turn, one walk at a time in the order of the requests.
+    fn tty_signal(&mut self, terminal: usize, pgid: u32, signal: u32, generation: u64) -> Answer {
         let Ok(signal) = u8::try_from(signal) else {
             return refuse(proto_process::INVALID);
         };
@@ -2743,22 +2848,38 @@ impl Processes {
         {
             return refuse(proto_process::ORPHAN);
         }
-        if self.tty_walk.is_some() {
-            return refuse(proto_process::AGAIN);
+        // A walk that waits for its turn and has the group and the signal
+        // of this one delivers it already: they merge (a signal that waits
+        // does not pile up, as for a process).
+        if self.tty_walks[1..]
+            .iter()
+            .flatten()
+            .any(|w| w.pgid == pgid && w.signal == signal)
+        {
+            return Answer::Status(Status::Ok);
         }
-        let Some(pending) = r.defer() else {
-            return Answer::Status(Status::BadSize);
+        let Some(place) = self.tty_walks[..TTY_PLACES]
+            .iter()
+            .position(Option::is_none)
+        else {
+            return refuse(proto_process::AGAIN);
         };
-        self.tty_walk = Some(Walking {
+        self.tty_walks[place] = Some(TtyWalking {
             walk: Walk::new(Target::Group(pgid), RECORDS),
-            pending,
+            pgid,
+            pending: None,
             signal,
             delivered: false,
             refused: false,
             denied: false,
         });
+        self.tty_level(true);
         self.kick();
-        Answer::Deferred
+        // The call that tells the loop of the step failed: kick dropped it.
+        if self.tty_walks[place].is_none() {
+            return refuse(proto_process::AGAIN);
+        }
+        Answer::Status(Status::Ok)
     }
 
     /// A signal of the terminal to the record in `target` (XBD 11.1.9):
@@ -2795,20 +2916,30 @@ impl Processes {
         Delivery::Done
     }
 
-    /// One step of the walk of a TtySignal; its reply at its end. The
-    /// terminal service waits for the reply and the levels above it keep
-    /// the processor until the walk is done, so a step does more than one
-    /// of the walk's moves: up to `TTY_DELIVERIES` deliveries or `TTY_LOOKS`
-    /// looks, however many that is of the moves of `Walk::step`.
+    /// One step of the first walk of the terminal. The levels above the
+    /// service keep the processor until the step is done, so a step does
+    /// more than one of the walk's moves: up to `TTY_UNITS` units of
+    /// deliveries (`TTY_CONTINUE` for the one that continues a stopped
+    /// process) or `TTY_LOOKS` looks, however many that is of the moves of
+    /// `Walk::step`. The terminal waits for none of it: its request was
+    /// answered when it came. The next walk begins when this one is over.
     fn tty_walk_step(&mut self) {
-        let Some(mut w) = self.tty_walk.take() else {
+        let Some(mut w) = self.tty_walks[0].take() else {
             return;
         };
-        let (mut delivered, mut looked) = (0, 0);
-        while delivered < TTY_DELIVERIES && looked < TTY_LOOKS {
+        let (mut spent, mut looked) = (0, 0);
+        while spent < TTY_UNITS && looked < TTY_LOOKS {
             match w.walk.step(&self.records) {
                 Step::Found(target) => {
-                    delivered += 1;
+                    let stopped = self
+                        .records
+                        .get(target)
+                        .is_some_and(|r| r.stopped.is_some());
+                    spent += if w.signal == proto_process::SIGCONT && stopped {
+                        TTY_CONTINUE
+                    } else {
+                        1
+                    };
                     match self.deliver_terminal(target, w.signal) {
                         Delivery::Done | Delivery::Again => w.delivered = true,
                         Delivery::Denied => w.denied = true,
@@ -2817,23 +2948,23 @@ impl Processes {
                 }
                 Step::Looked => looked += walk::LOOKS,
                 Step::Done => {
-                    let code = walk::outcome(w.delivered, w.refused, w.denied);
+                    // The walk is over: the next one comes to the front.
+                    self.tty_walks.rotate_left(1);
                     #[cfg(feature = "tty-probe")]
-                    if let Some((_, count)) = self.tty_probe.take() {
+                    if let Some(pending) = w.pending.take()
+                        && let Some((_, count)) = self.tty_probe.take()
+                    {
+                        let code = walk::outcome(w.delivered, w.refused, w.denied);
                         let mut reply = Writer::new();
                         let _ = reply.u32(code);
                         let _ = reply.u32(count);
-                        let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
-                        return;
+                        let _ = pending.answer(reply.as_bytes(), Outgoing::new());
                     }
-                    let _ = w
-                        .pending
-                        .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
                     return;
                 }
             }
         }
-        self.tty_walk = Some(w);
+        self.tty_walks[0] = Some(w);
     }
 
     #[cfg(feature = "tty-probe")]
@@ -2850,15 +2981,19 @@ impl Processes {
         if self.terminals.session(0) != Some(record.sid) {
             return refuse(proto_process::PERMISSION);
         }
-        if self.tty_walk.is_some() {
+        // The probe's walk is the first and only one: the newborn is met by
+        // the walk on, whose cursor the probe sets.
+        if self.tty_walks[0].is_some() {
             return refuse(proto_process::AGAIN);
         }
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::BadSize);
         };
-        self.tty_walk = Some(Walking {
+        self.tty_level(true);
+        self.tty_walks[0] = Some(TtyWalking {
             walk: Walk::passed(Target::Group(pgid), index),
-            pending,
+            pgid,
+            pending: Some(pending),
             signal: 28,
             delivered: false,
             refused: false,
@@ -4543,6 +4678,10 @@ impl Service<0> for Processes {
     fn notification(&mut self, n: Notice) {
         if n.source == Source::Session && n.label == STEP {
             self.walk_step();
+            return;
+        }
+        if n.source == Source::Session && n.label == TTY_STEP {
+            self.tty_step();
             return;
         }
         if n.source == Source::Session && n.label == CREATING {
