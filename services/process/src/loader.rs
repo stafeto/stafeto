@@ -21,10 +21,12 @@ use rt::{loader, sys};
 /// The name of the loader's file in the boot image.
 pub const FILE: &str = "loader.elf";
 /// The stack of the loader, in pages, above its data.
-const STACK_PAGES: u64 = 4;
+const STACK_PAGES: u64 = 5;
 /// The pages of the loader's data and stack at most: the service pays for
-/// five pages a loader, LOADERS of them.
-pub const DATA_PAGES: u64 = 5;
+/// six pages a loader, LOADERS of them. The stack is five pages since the
+/// dynamic path (spec 2, 3.12.4): the deepest chain of the loader used 15 376
+/// of 16 384 bytes before it and 15 856 with it.
+pub const DATA_PAGES: u64 = 6;
 /// Where the loop maps the objects it fills, in its own space.
 const WINDOW: usize = 0x63_0000_0000;
 
