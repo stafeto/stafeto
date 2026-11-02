@@ -879,13 +879,13 @@ pub fn start(
             return Err(PERMISSION);
         };
         if job.abandoned {
-            return Err(OPEN_RETIRED + 1000);
+            return Err(OPEN_RETIRED);
         }
         if !change.same_start(req) {
             return Err(PERMISSION);
         }
         if !fds.resolvers.contains(&job.id) || !same_image(job, fds) {
-            return Err(OPEN_RETIRED + 2000);
+            return Err(OPEN_RETIRED);
         }
         return proto_fs::write_start_reply(out, change.phase()).map_err(|e| e.code());
     }
@@ -898,7 +898,7 @@ pub fn start(
         return Err(TOO_MANY_OPEN_FILES);
     }
     if key.generation <= fds.open_watermarks[key.slot as usize] {
-        return Err(OPEN_RETIRED + 3000);
+        return Err(OPEN_RETIRED);
     }
     for id in &mut fds.resolvers {
         if *id != 0
@@ -996,7 +996,7 @@ pub fn second(
     let Some(i) = find(ctx.jobs, owner, req.key) else {
         return Err(
             if req.key.generation <= fds.open_watermarks[req.key.slot as usize] {
-                OPEN_RETIRED + 4000
+                OPEN_RETIRED
             } else {
                 proto_fs::NO_ENTRY
             },
@@ -1004,7 +1004,7 @@ pub fn second(
     };
     let job = ctx.jobs[i].as_mut().expect("found");
     if job.abandoned || !fds.resolvers.contains(&job.id) || !same_image(job, fds) {
-        return Err(OPEN_RETIRED + 5000);
+        return Err(OPEN_RETIRED);
     }
     let real = job.real;
     let JobOperation::Change(change) = &mut job.operation else {
@@ -1041,7 +1041,7 @@ pub fn step(
     let Some(i) = find(ctx.jobs, owner, key) else {
         return Err(
             if key.generation <= fds.open_watermarks[key.slot as usize] {
-                OPEN_RETIRED + 6000
+                OPEN_RETIRED
             } else {
                 proto_fs::NO_ENTRY
             },
@@ -1049,7 +1049,7 @@ pub fn step(
     };
     let job = ctx.jobs[i].as_mut().expect("found");
     if job.abandoned || !fds.resolvers.contains(&job.id) || !same_image(job, fds) {
-        return Err(OPEN_RETIRED + 7000);
+        return Err(OPEN_RETIRED);
     }
     let stamp = fds.binding.stamp();
     let new_authority = job.authority != stamp;
