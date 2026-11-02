@@ -16,8 +16,8 @@
 //! `pthread_create` inside the pin window of a `pthread_kill` of a thread
 //! that ended, and the probe notes that the call has not returned after
 //! 3 ms, that it succeeds after the pin goes, that the release woke it
-//! (`probe_pin_wakes`) and how long the wait of `reserve` took to return
-//! after it.
+//! (`probe_pin_wakes`) and that the wait of `reserve` did not end by its
+//! deadline after the wake (`probe_pin_wake_missed`).
 //!
 //! The fourth case is the rollback of `pthread_create`: the start of the new
 //! thread is refused after its place went LIVE (`probe_fail_start`). A
@@ -226,14 +226,13 @@ extern "C" fn window_create(_: u64) {
     );
 }
 
-/// Rounds of the third case, and the delay after the return of
-/// `pthread_kill` that a wake keeps the creation under (the deadline that
-/// backs the wait is 1 ms: without the wake the delay is spread over
-/// 0 to 1 ms and most rounds are over this).
+/// Rounds of the third case. The wake is judged by what happened to the
+/// wait and not by the time it took: a wait that the release woke does not
+/// end by its deadline (1 ms, which backs the wait), so a wait that ended by
+/// a deadline later than the return of the wake call was not woken
+/// (`probe_pin_wake_missed`). A host that stalls the guest for a while makes
+/// the return late and changes neither.
 const ROUNDS: usize = 12;
-const WOKEN_WITHIN_NS: u64 = 400_000;
-/// Rounds that may be over the delay (a host that was busy for a moment).
-const SLOW_ROUNDS_MAX: usize = 2;
 
 /// The wait of `reserve` for a pinned place. Fails with the stage.
 fn reserve_waits(base: usize) -> Result<(), usize> {
@@ -261,8 +260,6 @@ fn reserve_waits(base: usize) -> Result<(), usize> {
             return Err(1813);
         }
     }
-    let mut slow = 0;
-    let mut longest = 0;
     for _ in 0..ROUNDS {
         // The target takes the last place: the table is full.
         HOOK.store(0, Ordering::SeqCst);
@@ -302,20 +299,15 @@ fn reserve_waits(base: usize) -> Result<(), usize> {
             );
             return Err(1819);
         }
-        let delay = abi::relibc::probe_pin_wake_delay();
-        longest = longest.max(delay);
-        if delay > WOKEN_WITHIN_NS {
-            slow += 1;
+        if abi::relibc::probe_pin_wake_missed() {
+            rt::println!(
+                "kill-collect: reserve: the release of the pin did not wake the creation: it ended by its deadline"
+            );
+            return Err(1820);
         }
     }
-    if slow > SLOW_ROUNDS_MAX {
-        rt::println!(
-            "kill-collect: reserve: {slow} of {ROUNDS} creations came more than {WOKEN_WITHIN_NS} ns after the pin went (longest {longest} ns)"
-        );
-        return Err(1820);
-    }
     rt::println!(
-        "kill-collect: a pthread_create on a full table waited for the pinned place and woke at its release ({slow} of {ROUNDS} rounds over {WOKEN_WITHIN_NS} ns, longest {longest} ns)"
+        "kill-collect: a pthread_create on a full table waited for the pinned place and woke at its release ({ROUNDS} of {ROUNDS} rounds)"
     );
     for _ in &fillers {
         sys::notify(&fill_release, 1).expect("kill-collect release a filler");
