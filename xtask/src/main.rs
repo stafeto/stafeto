@@ -6219,16 +6219,21 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
     // (5d); the copy of a fork has run, in steps of the loader.
     let longest = |kind: usize| rows.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
     let (spawn, fork_start, fork_commit) = (longest(22), longest(34), longest(35));
-    // The two numbers are each the longest of several steps of one run, in
-    // different processes, and each moves from run to run by the noise of one
-    // measurement: SpawnStart was seen between 11583 and 11978 ticks,
-    // ForkStart between 10761 and 11624. Usually ForkStart is the lower, by
-    // some 6 per cent (main on the runner: 11269 against 11945; here: 10761
-    // against 11752); once the runner gave 11624 against 11583, 41 ticks over,
-    // with no change in the work of either. The tolerance is a twentieth of
-    // SpawnStart, some 580 ticks at these numbers; ForkStart is not found
-    // systematically above SpawnStart after the loader began to share the
-    // code of the image on fork.
+    // Both numbers are the longest of several steps of one run, in different
+    // processes, charged as the CPU time of the service thread in ticks; the
+    // two make a process by the same code, so they are of one size, and ForkStart
+    // has the fewer steps because the loader shares the code of the image on
+    // fork. Under icount a given image gives the same pair every run (ten runs
+    // here: SpawnStart 11699, ForkStart 10737, no spread, ForkStart 8 per cent
+    // lower), and the pair moves from one build or runner to another by the
+    // order of a few per cent (CI logs of this branch: SpawnStart 10889 to
+    // 11716, ForkStart 10686 to 11696), once to ForkStart 11624 against
+    // SpawnStart 11583, 41 ticks (0.35 per cent) over, with no change in the
+    // work of either. The tolerance is a twentieth of SpawnStart, some 580
+    // ticks, fourteen times that excess. It hides no defect: a ForkStart that
+    // lost the sharing or copied pages would be tens of thousands of ticks
+    // (about 50600 before the loader copied), and every step stays under term
+    // B less 10 per cent in the checks above.
     if fork_start == 0 || fork_commit == 0 || fork_start > spawn + spawn / 20 {
         return Err(format!(
             "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
