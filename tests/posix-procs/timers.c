@@ -966,10 +966,21 @@ static int t_c_cpu_timer(void) {
     if (t_take(SIGRTMIN, &info, 1000) != SIGRTMIN) return 4;
     if (info.si_code != SI_TIMER) return 5;
     if (info.si_value.sival_int != 77) return 6;
-    /* Exactly one occurrence: the expiries that came while it waited are not
-     * a queue. */
-    if (t_take(SIGRTMIN, &info, 0) != -1 || errno != EAGAIN) return 8;
+    /* The overrun of the signal just taken, before a later expiry can change
+     * what the timer reports. */
     int overrun = timer_getoverrun(t);
+    /* The expiries that came while the signal waited are one occurrence, not a
+     * queue. The timer is periodic, and on a machine that stalls (a loaded
+     * host) a further period of processor time can pass between the take and
+     * the look, which POSIX counts as a new expiry: so the timer is taken off
+     * and, once the helper has settled, at most one more signal may wait
+     * (never the twenty of the spin). */
+    struct itimerspec off = t_its(0, 0);
+    if (timer_settime(t, 0, &off, NULL)) return 10;
+    t_nap(10);
+    int more = 0;
+    while (t_take(SIGRTMIN, &info, 0) == SIGRTMIN) more++;
+    if (more > 1 || errno != EAGAIN) return 8;
     if (overrun < 10) {
         printf("posix-procs: timers: a timer on processor time counted an overrun of %d\n", overrun);
         return 7;
