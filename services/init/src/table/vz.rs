@@ -78,6 +78,7 @@ pub const CONSOLE: Record = Record {
         name: "dma",
         size: 16 * PAGE,
         uncached: true,
+        duplicate: false,
     }],
     // A Virtio reset through `device_status`, which reads 0 once done,
     // while the function decodes its BARs (Write::only_if), then the

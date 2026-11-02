@@ -125,6 +125,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-gpu",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "init"
 version = "0.1.0"
 dependencies = [
@@ -654,6 +665,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-gpu"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-init"
 version = "0.1.0"
 dependencies = [
@@ -1002,6 +1021,27 @@ dependencies = [
  "safe-mmio",
  "thiserror",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio-gpu"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-gpu",
+ "proto-init",
+ "proto-wire",
+ "rt",
+ "virtio-drivers",
+ "virtio-mmio",
+]
+
+[[package]]
+name = "virtio-mmio"
+version = "0.1.0"
+dependencies = [
+ "rt",
+ "virtio-drivers",
 ]
 
 [[package]]
