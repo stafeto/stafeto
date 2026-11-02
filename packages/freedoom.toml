@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# Freedoom: the free game data for Doom engines (the Phase 1 WAD).
+# Format: docs/packages.md.
+
+name = "freedoom"
+version = "0.13.0"
+kind = "game"
+url = "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip"
+sha256 = "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59"
+license = "BSD-3-Clause"
+depends = ["busybox"]
+build = "tools/build-freedoom.py"
+dirs = ["/games"]
+files = [
+  "/games/freedoom1.wad = bytes:freedoom1.wad",
+]

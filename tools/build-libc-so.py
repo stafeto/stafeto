@@ -729,6 +729,7 @@ def program_inputs() -> dict:
         "nano": [ROOT / "target" / "nano" / "nano.o"],
         "htop": [ROOT / "target" / "htop" / "htop.o"],
         "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
+        "doom": [ROOT / "target" / "doomgeneric" / "doom.o"],
     }
 
 
