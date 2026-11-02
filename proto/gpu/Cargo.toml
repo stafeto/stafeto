@@ -1,0 +1,15 @@
+[package]
+name = "proto-gpu"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the display service of stafeto (services/virtio-gpu): its method numbers, its codes and the bodies of its requests"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

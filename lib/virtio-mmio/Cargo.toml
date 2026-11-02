@@ -1,0 +1,20 @@
+[package]
+name = "virtio-mmio"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The virtio-mmio setup the drivers of stafeto share: the check of a transport, the DMA of the device's crate over a driver's object, the interrupt"
+
+# What the setup decides, apart from the device and the calls: tested on
+# the host.
+[lib]
+bench = false
+
+[dependencies]
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
+
+# The calls of the driver's process exist on stafeto alone.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../rt" }
