@@ -404,7 +404,7 @@ static void image_shared(void) {
  * (the table of images); a file of another inode, though it holds the same
  * bytes, is another image. The role asks `expect` 1 for shared and 0 for
  * alone. */
-static int image_role(int ready, int go, int expect) {
+static int image_role(int ready, int go, int done, int expect) {
     unsigned char byte = 1;
     if (write(ready, &byte, 1) != 1) return 1;
     if (read(go, &byte, 1) != 1) return 2;
@@ -427,13 +427,13 @@ static int image_role(int ready, int go, int expect) {
     /* Every process keeps its image until all have looked at theirs. */
     byte = (unsigned char)bad;
     if (write(ready, &byte, 1) != 1) return 4;
-    if (read(go, &byte, 1) != 1) return 5;
+    if (read(done, &byte, 1) != 1) return 5;
     return 0;
 }
 
 /* The `count` processes loaded wrote a byte each to `ready`; release them,
  * collect what each saw (bits of what is wrong, ORed) and let them go. */
-static int image_look(int ready, int go, int count, int *saw) {
+static int image_look(int ready, int go, int done, int count, int *saw) {
     unsigned char bytes[4] = {0};
     int ok = write(go, "xxxx", (size_t)count) == count;
     *saw = 0;
@@ -441,14 +441,15 @@ static int image_look(int ready, int go, int count, int *saw) {
         if (read(ready, bytes, 1) != 1) { ok = 0; continue; }
         *saw |= bytes[0];
     }
-    return ok && write(go, "xxxx", (size_t)count) == count;
+    return ok && write(done, "xxxx", (size_t)count) == count;
 }
 
-static int spawn_image(const char *path, int ready, int go, int expect, pid_t *pid) {
-    char r[16], g[16];
+static int spawn_image(const char *path, int ready, int go, int done, int expect, pid_t *pid) {
+    char r[16], g[16], d[16];
     snprintf(r, sizeof r, "%d", ready);
     snprintf(g, sizeof g, "%d", go);
-    char *args[] = {"map", "image", r, g, expect ? "1" : "0", NULL};
+    snprintf(d, sizeof d, "%d", done);
+    char *args[] = {"map", "image", r, g, d, expect ? "1" : "0", NULL};
     return posix_spawn(pid, path, NULL, NULL, args, environ);
 }
 
@@ -482,27 +483,27 @@ static int image_exit(pid_t pid) {
  * for them, so both share. */
 struct racer {
     const char *path;
-    int ready, go;
+    int ready, go, done;
     pid_t pid;
     int error;
 };
 
 static void *race_spawn(void *arg) {
     struct racer *racer = arg;
-    racer->error = spawn_image(racer->path, racer->ready, racer->go, 1, &racer->pid);
+    racer->error = spawn_image(racer->path, racer->ready, racer->go, racer->done, 1, &racer->pid);
     return NULL;
 }
 
 static void image_race(void) {
-    int ready[2], go[2];
-    check("race image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    int ready[2], go[2], done[2];
+    check("race image: pipes", pipe(ready) == 0 && pipe(go) == 0 && pipe(done) == 0);
     const char *copy = "/tmp/image-race";
     unlink(copy);
     check("race image: copy", copy_file("/bin/procs-child", copy) == 0);
     struct racer racers[2];
     pthread_t threads[2];
     for (int i = 0; i < 2; i++) {
-        racers[i] = (struct racer){copy, ready[1], go[0], -1, -1};
+        racers[i] = (struct racer){copy, ready[1], go[0], done[0], -1, -1};
         check("race image: thread", pthread_create(&threads[i], NULL, race_spawn, &racers[i]) == 0);
     }
     for (int i = 0; i < 2; i++) pthread_join(threads[i], NULL);
@@ -512,7 +513,7 @@ static void image_race(void) {
     if (!spawned) return;
     check("race image: both loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
     int saw = -1;
-    check("race image: look", image_look(ready[0], go[1], 2, &saw));
+    check("race image: look", image_look(ready[0], go[1], done[1], 2, &saw));
     check("race image: two spawns at once share one object", saw == 0);
     if (saw) printf("posix-map: race image bits %d\n", saw);
     check("race image: exit", image_exit(racers[0].pid) == 0 && image_exit(racers[1].pid) == 0);
@@ -521,6 +522,8 @@ static void image_race(void) {
     close(ready[1]);
     close(go[0]);
     close(go[1]);
+    close(done[0]);
+    close(done[1]);
 }
 
 /* A process execs the file it runs (`exec sh` from `sh`): the entry of the
@@ -529,29 +532,30 @@ static void image_race(void) {
  * copy itself and then is the role `image`; the second is spawned after it
  * has loaded, and both have to see the code and the data mapped twice. */
 static int exec_self(char **argv) {
-    char *args[] = {"map", "image", argv[2], argv[3], "1", NULL};
-    execve(argv[4], args, environ);
+    char *args[] = {"map", "image", argv[2], argv[3], argv[4], "1", NULL};
+    execve(argv[5], args, environ);
     return 9;
 }
 
 static void image_exec_self(void) {
-    int ready[2], go[2];
-    check("exec image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    int ready[2], go[2], done[2];
+    check("exec image: pipes", pipe(ready) == 0 && pipe(go) == 0 && pipe(done) == 0);
     const char *copy = "/tmp/image-exec";
     unlink(copy);
     check("exec image: copy", copy_file("/bin/procs-child", copy) == 0);
-    char r[16], g[16];
+    char r[16], g[16], d[16];
     snprintf(r, sizeof r, "%d", ready[1]);
     snprintf(g, sizeof g, "%d", go[0]);
-    char *args[] = {"map", "execself", r, g, (char *)copy, NULL};
+    snprintf(d, sizeof d, "%d", done[0]);
+    char *args[] = {"map", "execself", r, g, d, (char *)copy, NULL};
     pid_t a, b;
     check("exec image: spawn", posix_spawn(&a, copy, NULL, NULL, args, environ) == 0);
     unsigned char byte;
     check("exec image: the exec loaded", read(ready[0], &byte, 1) == 1);
-    check("exec image: second spawn", spawn_image(copy, ready[1], go[0], 1, &b) == 0);
+    check("exec image: second spawn", spawn_image(copy, ready[1], go[0], done[0], 1, &b) == 0);
     check("exec image: second loaded", read(ready[0], &byte, 1) == 1);
     int saw = -1;
-    check("exec image: look", image_look(ready[0], go[1], 2, &saw));
+    check("exec image: look", image_look(ready[0], go[1], done[1], 2, &saw));
     check("exec image: a process that execs its own file keeps the image for the next one", saw == 0);
     if (saw) printf("posix-map: exec image bits %d\n", saw);
     check("exec image: exit", image_exit(a) == 0 && image_exit(b) == 0);
@@ -560,18 +564,20 @@ static void image_exec_self(void) {
     close(ready[1]);
     close(go[0]);
     close(go[1]);
+    close(done[0]);
+    close(done[1]);
 }
 
 static void image_spawned(void) {
-    int ready[2], go[2];
-    check("spawned image: pipes", pipe(ready) == 0 && pipe(go) == 0);
+    int ready[2], go[2], done[2];
+    check("spawned image: pipes", pipe(ready) == 0 && pipe(go) == 0 && pipe(done) == 0);
     pid_t a, b;
-    check("spawned image: first spawn", spawn_image("/bin/procs-child", ready[1], go[0], 1, &a) == 0);
-    check("spawned image: second spawn", spawn_image("/bin/procs-child", ready[1], go[0], 1, &b) == 0);
+    check("spawned image: first spawn", spawn_image("/bin/procs-child", ready[1], go[0], done[0], 1, &a) == 0);
+    check("spawned image: second spawn", spawn_image("/bin/procs-child", ready[1], go[0], done[0], 1, &b) == 0);
     unsigned char byte;
     check("spawned image: both loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
     int saw = -1;
-    check("spawned image: look", image_look(ready[0], go[1], 2, &saw));
+    check("spawned image: look", image_look(ready[0], go[1], done[1], 2, &saw));
     check("spawned image: two spawns of one file share the code and the read-only data", saw == 0);
     if (saw) printf("posix-map: spawned image bits %d\n", saw);
     check("spawned image: exit", image_exit(a) == 0 && image_exit(b) == 0);
@@ -581,13 +587,13 @@ static void image_spawned(void) {
     unlink(copy);
     check("spawned image: copy", copy_file("/bin/procs-child", copy) == 0);
     pid_t c1, c1b, c2;
-    check("spawned image: copy spawn", spawn_image(copy, ready[1], go[0], 1, &c1) == 0);
-    check("spawned image: copy spawn again", spawn_image(copy, ready[1], go[0], 1, &c1b) == 0);
+    check("spawned image: copy spawn", spawn_image(copy, ready[1], go[0], done[0], 1, &c1) == 0);
+    check("spawned image: copy spawn again", spawn_image(copy, ready[1], go[0], done[0], 1, &c1b) == 0);
     check("spawned image: copies loaded", read(ready[0], &byte, 1) == 1 && read(ready[0], &byte, 1) == 1);
     check("spawned image: replace", unlink(copy) == 0 && copy_file("/bin/procs-child", copy) == 0);
-    check("spawned image: replaced spawn", spawn_image(copy, ready[1], go[0], 0, &c2) == 0);
+    check("spawned image: replaced spawn", spawn_image(copy, ready[1], go[0], done[0], 0, &c2) == 0);
     check("spawned image: replaced loaded", read(ready[0], &byte, 1) == 1);
-    check("spawned image: look at the copies", image_look(ready[0], go[1], 3, &saw));
+    check("spawned image: look at the copies", image_look(ready[0], go[1], done[1], 3, &saw));
     check("spawned image: one inode shares, the replacement is alone", saw == 0);
     if (saw) printf("posix-map: spawned image copy bits %d\n", saw);
     check("spawned image: copies exit", image_exit(c1) == 0 && image_exit(c1b) == 0 && image_exit(c2) == 0);
@@ -596,6 +602,8 @@ static void image_spawned(void) {
     close(ready[1]);
     close(go[0]);
     close(go[1]);
+    close(done[0]);
+    close(done[1]);
 }
 
 /* A fork of a map with 97 groups of regions that do not adjoin (the table of
@@ -1891,9 +1899,9 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "pinsafter") == 0) return pins_after();
     if (argc == 3 && strcmp(argv[1], "lockget") == 0) return lock_get(argv[2]);
     if (argc == 3 && strcmp(argv[1], "peer") == 0) return peer(argv[2]);
-    if (argc == 5 && strcmp(argv[1], "execself") == 0) return exec_self(argv);
-    if (argc == 5 && strcmp(argv[1], "image") == 0)
-        return image_role(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]));
+    if (argc == 6 && strcmp(argv[1], "execself") == 0) return exec_self(argv);
+    if (argc == 6 && strcmp(argv[1], "image") == 0)
+        return image_role(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
     if (argc == 1) {
         /* fork needs a program the process service started. */
         char *args[] = {"map", "run", NULL};
