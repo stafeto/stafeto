@@ -2948,8 +2948,16 @@ static long proc_now_ns(void) {
 static void proc_handler(int signal) {
     (void)signal;
     long began = proc_now_ns();
-    char path[32];
-    snprintf(path, sizeof path, "/proc/%d/stat", (int)getpid());
+    /* No snprintf here: it is not async-signal-safe, and a signal that
+     * interrupts the formatting of the main code in the same library would
+     * wait for a lock that the interrupted code holds (#491). The path is
+     * made by hand. */
+    char path[32] = "/proc/";
+    char digits[12];
+    int count = 0, at = 6;
+    for (unsigned pid = (unsigned)getpid(); pid > 0; pid /= 10) digits[count++] = (char)('0' + pid % 10);
+    while (count > 0) path[at++] = digits[--count];
+    memcpy(path + at, "/stat", 6);
     int fd = open(path, O_RDONLY);
     if (fd >= 0) close(fd);
     long took = proc_now_ns() - began;
