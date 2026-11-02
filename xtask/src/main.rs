@@ -868,7 +868,12 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
 const PACKAGE_PROGRAMS: [ImageProgram; 5] = [
-    ("busybox-probe", "busybox-probe", 0, &["dynamic", "utilities"]),
+    (
+        "busybox-probe",
+        "busybox-probe",
+        0,
+        &["dynamic", "utilities"],
+    ),
     ("bash", "bash", 0, &["dynamic"]),
     ("htop", "htop", 0, &["dynamic"]),
     ("nano", "nano", 0, &["dynamic"]),

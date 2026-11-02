@@ -19,7 +19,9 @@ struct Own;
 impl Memory for Own {
     fn read(&self, address: u64, out: &mut [u8]) -> Result<(), Fault> {
         // SAFETY: see Own.
-        unsafe { core::ptr::copy_nonoverlapping(address as *const u8, out.as_mut_ptr(), out.len()) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(address as *const u8, out.as_mut_ptr(), out.len())
+        };
         Ok(())
     }
 

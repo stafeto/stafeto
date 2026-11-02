@@ -5,8 +5,8 @@
 //! checks of every table they name.
 
 use crate::{
-    Access, Array, Dynamic, Module, Limit, Map, Memory, NEEDED, RELA_SIZE, Refusal, Role, SYM_SIZE, SYMBOLS_MAX,
-    Segment,
+    Access, Array, Dynamic, Limit, Map, Memory, Module, NEEDED, RELA_SIZE, Refusal, Role, SYM_SIZE,
+    SYMBOLS_MAX, Segment,
 };
 
 const DT_NULL: i64 = 0;
@@ -374,7 +374,7 @@ pub fn module<M: Memory + ?Sized>(
     let mut parts: [Option<Segment>; 3] = [None; 3];
     let mut dynamic: Option<(u64, u64)> = None;
     let mut tls_align = 0;
-    for h in headers.chunks_exact(PHDR_SIZE) {
+    for h in headers.as_chunks::<PHDR_SIZE>().0 {
         let kind = u32::from_le_bytes(h[0..4].try_into().unwrap());
         let flags = u32::from_le_bytes(h[4..8].try_into().unwrap());
         let (vaddr, filesz, memsz, align) = (word(h, 16), word(h, 32), word(h, 40), word(h, 48));
@@ -386,7 +386,14 @@ pub fn module<M: Memory + ?Sized>(
                     6 => (2, Access::ReadWrite),
                     _ => return Err(Refusal::Section),
                 };
-                if parts[slot].replace(Segment { vaddr, memsz, access }).is_some() {
+                if parts[slot]
+                    .replace(Segment {
+                        vaddr,
+                        memsz,
+                        access,
+                    })
+                    .is_some()
+                {
                     return Err(Refusal::Section);
                 }
             }
