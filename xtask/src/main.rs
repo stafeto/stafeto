@@ -6092,17 +6092,21 @@ fn names_lines(lines: &[String]) -> Result<Vec<String>, String> {
 
 /// Published concurrent snapshots must preserve the part's memory reserve.
 /// The console takes a line of more than 64 bytes in several writes, and a
-/// line of the services' timing (`service wait:` and the like, lib/rt)
-/// that another CPU writes meanwhile may land inside it: such a line goes
-/// back where it came from, and the rest of the split line, the next line,
-/// joins its start.
+/// line that another CPU writes meanwhile may land inside it: a line of the
+/// services' timing (`service wait:` and the like, lib/rt) or the audit
+/// line of ramfs (`ramfs: audit round`). Such a line goes back where it
+/// came from, and the rest of the split line, the next line, joins its
+/// start.
 fn rejoin_split_lines(lines: &[String]) -> Vec<String> {
+    const INTRUDERS: [&str; 2] = ["service ", "ramfs: "];
     let mut out = Vec::with_capacity(lines.len());
     let mut i = 0;
     while i < lines.len() {
         let line = &lines[i];
-        let cut = line
-            .find("service ")
+        let cut = INTRUDERS
+            .iter()
+            .filter_map(|tag| line.find(tag))
+            .min()
             .filter(|&at| at > 0 && line.starts_with("posix-procs: "));
         match (cut, lines.get(i + 1)) {
             (Some(at), Some(rest)) => {
@@ -13150,6 +13154,26 @@ mod tests {
                 "service wait: 10 kind 64 29846 ticks of 31452",
                 "posix-procs: names quota: process 1, quota 552 pages, used 513 pages, remaining 39",
                 "posix-procs: steps done",
+            ]
+        );
+    }
+
+    /// The audit line of ramfs inside a long line of posix-procs goes out
+    /// of it as well (ci run 41463516603).
+    #[test]
+    fn an_audit_line_of_ramfs_inside_a_split_line_goes_back_out() {
+        let lines: Vec<String> = [
+            "posix-procs: names quota: process 8, quota 576 pages, used 294 pramfs: audit round 67",
+            "ages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(
+            rejoin_split_lines(&lines),
+            [
+                "ramfs: audit round 67",
+                "posix-procs: names quota: process 8, quota 576 pages, used 294 pages, remaining 282 pages, refused stack 1159168 bytes, eighth ordinary stack 65536 bytes",
             ]
         );
     }
