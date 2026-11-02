@@ -20,11 +20,11 @@ You get a BusyBox `ash` shell with line editing. `bash`, `nano`, `htop`, `top` a
 
 ## What works today
 
-- **Kernel.** A capability microkernel of about 160 KiB with 34 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
-- **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (15,492 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
+- **Kernel.** A capability microkernel of about 190 KiB with 34 system calls over handles with rights: processes, threads, channels, timers, memory objects, device windows and interrupts. Synchronous messages with priority inheritance, fixed-priority scheduling with 64 levels, per-process quotas for kernel memory, memory that is never writable and executable at once.
+- **Bounded timing.** The longest stretch the kernel runs with interrupts off is measured and enforced in CI (8,870 of a limit of 18,000 instructions); long operations run in bounded portions. `cargo xtask wcet` adds kernel block coverage, stack depth and a static bound per system call.
 - **Several CPUs.** Up to 4 CPUs are tested: per-CPU kernel data, one short object lock, commands between CPUs and partitioned scheduling, so a real-time task keeps its CPU and its bounds.
 - **Services in user space.** `init` starts and supervises services and restarts a crashed one: console and Virtio drivers, a RAM file system, pipes, a terminal with pseudo-terminals, processes, clock and entropy.
-- **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,184 of 1,187 tests and the Open POSIX Test Suite 1,985 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
+- **POSIX.** All 1,035 interfaces that POSIX.1-2024 requires are present. os-test `basic` passes 1,184 of 1,187 tests and the Open POSIX Test Suite 1,983 of 2,036. `fork`, `exec`, signals, threads, timers, `mmap`, file locks, local sockets, `/proc`.
 - **Programs.** relibc is the C library. BusyBox 1.37 and the ready-made utilities linked into it give 103 of the 112 POSIX utilities, and GNU bash 5.3, GNU nano, htop and ncdu run on it. Every third-party program is a package with one description file.
 - **Machines.** QEMU `virt` with emulation (GICv2 and GICv3), QEMU with HVF on Apple silicon, and Apple Virtualization.framework.
 
@@ -32,18 +32,18 @@ The details of each part and the known limits are in [docs/status.md](docs/statu
 
 ## Where it is going
 
-The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) is done; subproject 2 (POSIX and services) is nearly done and ends with release 0.2.0.
+The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) is done; subproject 2 (POSIX and services) ends with release 0.2.0.
 
 **Next**
 
-- Finish subproject 2: the remaining kernel debts from the audits, the last 18 POSIX utilities, more stable tests on several CPUs.
-- Shared libraries: `libc.so` and a dynamic loader, with the code pages of a library shared between processes. This makes the image and the memory of a running system much smaller.
+- Shared libraries: `libc.so` and a dynamic loader are in; next come `dlopen` of new libraries and more sharing of data pages between processes.
+- The nine POSIX utilities that need services of their own: `at`, `batch`, `lp`, `mailx`, `locale`, `localedef`, `gettext`, `ngettext` and `msgfmt`.
 - System integrity: every program carries an Ed25519 signature from the release key or from an approved developer. A program with a broken or foreign signature does not start, and a manual scan checks the whole system against a signed manifest, in the spirit of `sfc /scannow`.
 - Hardware: Allwinner A64 boards (the PinePhone and the PINE A64-LTS) with U-Boot, the 16550 UART and real-time measurements on the board; then the STM32MP2.
 
 **Later subprojects**
 
-- Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target.
+- Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way).
 - Network: virtio-net, a TCP/IP stack and IPv4 sockets.
 - Packages and apps: a package format, signed packages, an app sandbox.
 
