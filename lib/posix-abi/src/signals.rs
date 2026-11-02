@@ -758,6 +758,12 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
         RETURNING.fetch_or(returning, Ordering::SeqCst);
         guard
     });
+    // A deferral leaves the waits of IPC interruptible, and a request of an
+    // entry that is pending (a stopper asks for one) interrupts the send of
+    // each return again for good, as the entry cannot run under the
+    // deferral. With the entries masked the send blocks, and the request
+    // waits for the end of the deferral.
+    let was_masked = guard.as_ref().map(|_| rt::upcall::mask().unwrap_or(true));
     while back != 0 {
         let bit = back.isolate_lowest_one();
         back &= !bit;
@@ -785,6 +791,11 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
     route();
     if guard.is_some() {
         RETURNING.fetch_and(!returning, Ordering::SeqCst);
+    }
+    if was_masked == Some(false) {
+        // SAFETY: the entries were open when the call began; with the
+        // deferral still held a pending request enters when it ends.
+        let _ = unsafe { rt::upcall::enable() };
     }
     drop(guard);
     failure.map_or(Ok(()), Err)
