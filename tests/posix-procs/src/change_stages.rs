@@ -96,8 +96,12 @@ pub fn release(files: &Files, key: OpenKey) -> Result<(), Status> {
 }
 
 /// The code of a statvfs run that failed, after its `Status` is printed.
-fn statvfs_failed(status: Status) -> i32 {
-    rt::println!("posix-files: change statvfs failed: {status:?}");
+fn statvfs_failed(status: Status, key: OpenKey, round: u32) -> i32 {
+    rt::println!(
+        "posix-files: change statvfs failed: {status:?} slot {} generation {} round {round}",
+        key.slot,
+        key.generation
+    );
     201
 }
 
@@ -625,11 +629,11 @@ fn volume_and_paths(files: &Files) -> Result<(), i32> {
         if attempt > 0 {
             expect(run(files, &rmdir(4, next(), b"/tmp/cs3"), None), 0, 204)?;
         }
-        let mut before = run(files, &stat, None).map_err(statvfs_failed)?;
+        let mut before = run(files, &stat, None).map_err(|e| statvfs_failed(e, stat.key, 0))?;
         let mut still = 0;
-        for _ in 0..400 {
+        for round in 1..=400 {
             stat.key = key(4, next());
-            let again = run(files, &stat, None).map_err(statvfs_failed)?;
+            let again = run(files, &stat, None).map_err(|e| statvfs_failed(e, stat.key, round))?;
             still = if word(&again.bytes, 6) == word(&before.bytes, 6) {
                 still + 1
             } else {
