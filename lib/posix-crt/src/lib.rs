@@ -65,11 +65,6 @@ unsafe extern "C" {
     fn _start(area: u64) -> !;
 }
 
-/// The loader's mark in the flags of the start area: it wrote the
-/// auxiliary vector of the program (proto_loader::DYNAMIC).
-#[cfg(feature = "shared")]
-const DYNAMIC: u32 = 2;
-
 /// The entry of a dynamically linked program: `crt1.o` calls it with the
 /// start area in `area` and the program's `main`. It goes the way `_start`
 /// of `rt` goes.
@@ -387,7 +382,7 @@ fn loaded_main() -> u64 {
     };
     // A library without a loader's vector cannot start a program.
     #[cfg(feature = "shared")]
-    if area.flags & DYNAMIC == 0 {
+    if area.flags & proto_loader::DYNAMIC == 0 {
         return 125;
     }
     let value = |slot: Slot| rt::abi::Handle(area.handles[slot as usize]);
@@ -482,7 +477,7 @@ fn loaded_main() -> u64 {
                 )
             };
             for pair in auxv.chunks_exact_mut(2) {
-                if pair[0] == 23 {
+                if pair[0] == proto_loader::auxv::AT_SECURE as usize {
                     pair[1] = 1;
                 }
             }

@@ -1986,7 +1986,6 @@ functional/timers/timers/twoptimers
 stress/mqueues/multi_send_rev_1
 stress/mqueues/multi_send_rev_2
 stress/signals/sigismember_stress_1
-stress/threads/fork/s-c1
 stress/threads/pthread_create/s-c1
 stress/threads/pthread_mutex_lock/s-c1
 stress/threads/pthread_mutex_lock/s-c2

@@ -26,6 +26,7 @@ mod image_probe_main;
 use core::sync::atomic::Ordering;
 #[cfg(feature = "image-probe")]
 use posix_process_service::image_probe::{self, Terminal};
+use posix_process_service::images::{self, Images};
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::queued::{Queued, Waiting};
@@ -297,6 +298,9 @@ struct Processes {
     routers: [Option<Handle<Thread>>; RECORDS],
     /// The objects of shared memory the processes map as the same pages.
     shares: Shares<Handle<Memory>, Pending>,
+    /// The objects of the code and the read-only data of programs, which
+    /// the processes of one file map as the same pages (spec 2, 3.12.2).
+    images: Images<Handle<Memory>, Pending>,
     /// The witness of each record's process, which init gave with ADOPT:
     /// it closes once the process ended, and init hears of the end.
     witnesses: [Option<Handle<Channel>>; RECORDS],
@@ -377,6 +381,7 @@ impl Processes {
             addr_of_mut!((*at).orphan_walk).write(None);
             addr_of_mut!((*at).creating).write(None);
             Shares::initialize_at(addr_of_mut!((*at).shares));
+            Images::initialize_at(addr_of_mut!((*at).images));
             Loaders::initialize_at(addr_of_mut!((*at).loaders));
             Terminals::initialize_at(addr_of_mut!((*at).terminals));
             addr_of_mut!((*at).timer_armed).write(u64::MAX);
@@ -650,6 +655,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
+            record.process_quota = create.quota;
             record.limits = proto_process::ResourceLimits::initial(create.quota);
             if create.root {
                 record.groups.count = 1;
@@ -1335,15 +1341,55 @@ impl Processes {
         self.kick();
     }
 
+    /// Tells the loop of the Gets of the table of images that wait, if
+    /// any do: a load that finds none waiting costs the loop no step.
+    fn wake_loaders(&mut self) {
+        if self.images.waiters() > 0 {
+            self.wake_sharers();
+        }
+    }
+
     /// One step of the answers to the waiting Gets: the oldest `BATCH` that
     /// nobody makes the object for any more, each asking the table again
     /// (the first of those whose maker went becomes the maker). More ready
     /// leaves the wake on for the next step.
     fn share_step(&mut self) {
-        rt::service::step_detail(self.shares.waiters() as u64);
+        rt::service::step_detail((self.shares.waiters() + self.images.waiters()) as u64);
         let mut batch = [const { None }; shares::BATCH];
-        let (_, more) = self.shares.ready_batch(&mut batch);
-        self.share_wake = more;
+        let (taken, more) = self.shares.ready_batch(&mut batch);
+        // The answers of the two tables share one batch, so that a step
+        // answers `BATCH` Gets at most.
+        let mut images = [const { None }; images::BATCH];
+        let mut more_images = false;
+        for (place, _) in images.iter_mut().zip(taken..images::BATCH) {
+            let mut one = [const { None }; 1];
+            let (_, more_left) = self.images.ready_batch(&mut one);
+            more_images = more_left;
+            // The table is asked again at once: of the requests of a key
+            // whose maker went, the next `ready_batch` must see this one
+            // as the new maker.
+            if let Some((record, key, pending)) = one[0].take() {
+                *place = Some((pending, self.image_take(record, &key)));
+            }
+        }
+        if taken >= images::BATCH {
+            more_images = self.images.waiters() > 0;
+        }
+        self.share_wake = more || more_images;
+        for (pending, taken) in images.into_iter().flatten() {
+            match taken {
+                Taken::Reply(kind, found) => {
+                    let _ = Self::share_reply(pending, kind, found);
+                }
+                Taken::Failed(e) => {
+                    let _ = pending.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new());
+                }
+                // `ready_batch` leaves nothing that is made now.
+                Taken::Busy => {
+                    let _ = Self::share_reply(pending, proto_process::IMAGE_FULL, None);
+                }
+            }
+        }
         for ready in batch.into_iter().flatten() {
             let (record, key, pending) = ready;
             // The grant stands until the answer and a pair with a waiting
@@ -1368,6 +1414,106 @@ impl Processes {
                     let _ = Self::share_reply(pending, proto_process::SHARED_BUSY, None);
                 }
             }
+        }
+    }
+
+    /// The answer to a Get of `key` by the loader of the record in `record`:
+    /// the object (a copy of its handle, without the right to write), the
+    /// right to make it, no place for it, or Busy (it is made now).
+    fn image_take(&mut self, record: usize, key: &proto_process::ImageKey) -> Taken {
+        let (kind, found) = match self.images.get(key, record) {
+            images::Got::Found(pages, memory) => {
+                let mut rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER;
+                if key.part == proto_process::IMAGE_CODE {
+                    rights = rights | Rights::MAP_EXEC;
+                }
+                match sys::handle_duplicate(memory, rights) {
+                    Ok(copy) => (proto_process::IMAGE_FOUND, Some((pages, copy))),
+                    Err(e) => return Taken::Failed(e),
+                }
+            }
+            images::Got::Reserved => (proto_process::IMAGE_RESERVED, None),
+            images::Got::Full => (proto_process::IMAGE_FULL, None),
+            images::Got::Busy => return Taken::Busy,
+        };
+        Taken::Reply(kind, found)
+    }
+
+    /// Image: the table of images (`Method::Image`), through the session of
+    /// the loader of the record in `child` while it loads. Get answers with
+    /// the object, the right to make it or Full; Put takes the object, which
+    /// must not carry the right to write; Detach gives up an entry the loader
+    /// reserved. O(IMAGES).
+    fn image(&mut self, child: usize, slot: usize, r: &mut Request<'_>) -> Answer {
+        if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading) {
+            return refuse(proto_process::PERMISSION);
+        }
+        let mut body = r.body();
+        let (Ok(operation), Ok(key), Ok(pages), Ok(())) = (
+            body.u32(),
+            proto_process::ImageKey::read(&mut body),
+            body.u32(),
+            body.finish(),
+        ) else {
+            return Answer::Status(Status::BadSize);
+        };
+        match operation {
+            proto_process::IMAGE_GET if r.handles.is_empty() => {
+                let (kind, found) = match self.image_take(child, &key) {
+                    Taken::Reply(kind, found) => (kind, found),
+                    Taken::Failed(e) => return kernel(e),
+                    // Another loader makes the object: the reply waits for
+                    // it, or for the maker's end (`wake_sharers`).
+                    Taken::Busy => {
+                        let Some(pending) = r.defer() else {
+                            return Answer::Status(Status::BadSize);
+                        };
+                        return match self.images.wait(key, child, pending) {
+                            Ok(()) => Answer::Deferred,
+                            // No place for one more: the loader makes an
+                            // object of its own.
+                            Err(pending) => {
+                                let _ = Self::share_reply(pending, proto_process::IMAGE_FULL, None);
+                                Answer::Deferred
+                            }
+                        };
+                    }
+                };
+                let pages = found.as_ref().map_or(0, |(pages, _)| *pages);
+                if r.reply().u32(0).is_err()
+                    || r.reply().u32(kind).is_err()
+                    || r.reply().u32(pages).is_err()
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                match found {
+                    Some((_, copy)) => Answer::Reply([copy.erase()].into()),
+                    None => Answer::Reply(Outgoing::new()),
+                }
+            }
+            proto_process::IMAGE_PUT if r.handles.len() == 1 => {
+                // Nobody may write the object a table shares: a handle that
+                // can is refused, and the code must carry the right to run.
+                let fit = matches!(r.handles.info(0), Some((ObjectKind::Memory, rights))
+                    if images::fits(key.part, rights));
+                if !fit {
+                    return refuse(proto_process::PERMISSION);
+                }
+                let Ok(memory) = r.handles.take::<Memory>(0) else {
+                    return refuse(proto_process::PERMISSION);
+                };
+                if self.images.put(&key, child, pages, memory).is_err() {
+                    return refuse(proto_process::PERMISSION);
+                }
+                self.wake_loaders();
+                Answer::Status(Status::Ok)
+            }
+            proto_process::IMAGE_DETACH if r.handles.is_empty() => {
+                self.images.detach(&key, child);
+                self.wake_loaders();
+                Answer::Status(Status::Ok)
+            }
+            _ => refuse(proto_process::INVALID),
         }
     }
 
@@ -2990,9 +3136,26 @@ impl Processes {
             ticket: 0,
             name: [0; proto_process::NAME_LEN],
         };
+        // A child of fork shares the code and the read-only data of its
+        // parent and pays for none of them: its process needs the quota of
+        // the record less those pages (the record keeps the whole quota for
+        // the children and the execs it makes; spec 2, 3.12.2).
+        let fork = matches!(birth.page, PageStart::Fork { .. });
+        let process_quota = if fork {
+            // A record no Create or exec set the quota of its process for
+            // has the whole.
+            let own = if parent.process_quota == 0 {
+                parent.quota
+            } else {
+                parent.process_quota
+            };
+            loaders::fork_quota(own, parent.image_pages)
+        } else {
+            create.quota
+        };
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
-        if !loaders::pool_allows(free_quota(), create.quota) {
+        if !loaders::pool_allows(free_quota(), process_quota) {
             self.refused[proto_process::REFUSED_POOL] += 1;
             return kernel(abi::Error::NoMemory);
         }
@@ -3004,7 +3167,7 @@ impl Processes {
                 let exit =
                     sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)?;
                 sys::process_create_with(
-                    create.quota,
+                    process_quota,
                     create.handle_limit,
                     create.ceiling,
                     Some((&exit, place.notice)),
@@ -3034,6 +3197,7 @@ impl Processes {
         );
         if let Some(record) = self.records.get_mut(child) {
             record.quota = create.quota;
+            record.process_quota = process_quota;
             record.handle_limit = create.handle_limit;
             record.ctty = inherited_ctty;
             // A child of a file shows its program's name; a child of fork
@@ -3518,6 +3682,7 @@ impl Processes {
         let committed_ticket = self.loaders.ticket(slot);
         let place = self.loaders.get_mut(slot).expect("a place");
         let image = place.image;
+        let image_pages = place.image_pages;
         let incoming = place.held.incoming.take().expect("the new process");
         self.routers[index] = place.held.thread.take();
         let ready = place.held.ready.take();
@@ -3533,6 +3698,8 @@ impl Processes {
         record.carried_kernel = record.carried_kernel.saturating_add(kernel);
         let ceiling = record.ceiling;
         record.image = image;
+        record.image_pages = image_pages;
+        record.process_quota = record.quota;
         record.committed_loader_ticket = committed_ticket;
         record.execed = true;
         if record.next_name[0] != 0 {
@@ -3547,6 +3714,9 @@ impl Processes {
         // The timers of timer_create go with the old image; the alarm goes on.
         // So do its mappings: it uses no shared memory any more.
         self.shares.drop_user(index);
+        // The entries of the image it replaced it uses no more; those of
+        // the new image it joined are its own now.
+        self.images.commit(index);
         self.wake_sharers();
         self.timers.clear(index as u8, false);
         if let Some(page) = self.pages.page(index) {
@@ -3690,6 +3860,10 @@ impl Processes {
     /// loader's place and SetId go, and a SpawnStart that waits gets
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
+        // What the load joined in the table of images, and the object it
+        // made, go with it.
+        self.images.abort(child);
+        self.wake_loaders();
         #[cfg(feature = "image-probe")]
         let place = self.free_observed_loader(child, Terminal::Aborted);
         #[cfg(not(feature = "image-probe"))]
@@ -3716,12 +3890,18 @@ impl Processes {
     /// A request through the session of the loader of the record in
     /// `child`: startup, readiness, final transfer and the trusted loader roots.
     fn loader_request(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() {
-            return Answer::Status(Status::BadSize);
-        }
         let Some(slot) = self.loaders.of(child) else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
+        if r.method() == Method::Image as u16 {
+            return self.image(child, slot, r);
+        }
+        if r.method() == Method::Ready as u16 {
+            return self.ready(child, r);
+        }
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
         match r.method() {
             m if m == Method::LoaderTerminal as u16 || m == Method::LoaderClock as u16 => {
                 if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading)
@@ -3747,7 +3927,6 @@ impl Processes {
                 Answer::Reply([copy.erase()].into())
             }
             m if m == Method::Boot as u16 => self.boot(child, slot, r),
-            m if m == Method::Ready as u16 => self.ready(child, r),
             m if m == Method::Take as u16 => self.take(child, slot, r),
             _ => refuse(proto_process::PERMISSION),
         }
@@ -3834,9 +4013,14 @@ impl Processes {
         Answer::Reply(handles.into())
     }
 
-    /// Ready of the loader of the record in `child`: its image is loaded,
-    /// and the parent may commit the place from now on.
+    /// Ready of the loader of the record in `child`, with the pages of the
+    /// code and the read-only data it mapped (u32): its image is loaded, and
+    /// the parent may commit the place from now on.
     fn ready(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(pages), Ok(())) = (body.u32(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
@@ -3845,6 +4029,9 @@ impl Processes {
         }
         match self.loaders.loaded(child) {
             Ok(()) => {
+                if let Some(place) = self.loaders.of(child).and_then(|s| self.loaders.get_mut(s)) {
+                    place.image_pages = pages;
+                }
                 self.generations.invalidate(child);
                 Answer::Status(Status::Ok)
             }
@@ -3940,7 +4127,18 @@ impl Processes {
         };
         let committed_slot = self.loaders.of(child).expect("a committed place");
         let committed_ticket = self.loaders.ticket(committed_slot);
+        let image_pages = self
+            .loaders
+            .get(committed_slot)
+            .map_or(0, |place| place.image_pages);
+        if !fork {
+            self.images.commit(child);
+            self.wake_loaders();
+        }
         let record = self.records.get_mut(child).expect("a loading record");
+        if !fork {
+            record.image_pages = image_pages;
+        }
         record.state = State::Alive;
         self.lifetimes.publish(record.label.pid());
         record.committed_loader_ticket = committed_ticket;
@@ -4448,6 +4646,7 @@ impl Service<0> for Processes {
         self.routers[index] = None;
         self.queued.clear(index);
         self.shares.drop_user(index);
+        self.images.drop_user(index);
         self.wake_sharers();
         self.timers.clear(index as u8, true);
         if let Exit::Zombie { parent } = exit {
