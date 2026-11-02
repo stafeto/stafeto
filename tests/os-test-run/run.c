@@ -207,6 +207,31 @@ int main(int argc, char **argv) {
         run_one(name, dir, rel, arg);
     }
     fclose(list);
+    /* The pool of quotas the process service gives to children comes back
+     * full after the tests: 20 children at once (the process-shared tests of
+     * Open POSIX make as many) can be forked and are reaped. */
+    {
+        enum { POOL_CHILDREN = 20 };
+        int gate[2], made = 0;
+        pid_t kids[POOL_CHILDREN];
+        if (pipe(gate) == 0) {
+            for (int i = 0; i < POOL_CHILDREN; i++) {
+                kids[made] = fork();
+                if (kids[made] == 0) {
+                    char c;
+                    close(gate[1]);
+                    (void)read(gate[0], &c, 1);
+                    _exit(0);
+                }
+                if (kids[made] < 0) break;
+                made++;
+            }
+            close(gate[1]);
+            close(gate[0]);
+            for (int i = 0; i < made; i++) waitpid(kids[i], NULL, 0);
+        }
+        printf("os-test-run: pool %d of %d\n", made, POOL_CHILDREN);
+    }
     printf("os-test-run: done\n");
     /* The console may still hold the end of the last test's output when the
      * runner ends, and init's line about the runner's end overtakes it:

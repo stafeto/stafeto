@@ -37,6 +37,9 @@ struct Mode<'a> {
     custody: Option<&'a dyn Custody>,
     /// The monotonic time in ns at which the wait ends with ETIMEDOUT.
     deadline: Option<u64>,
+    /// Asked once after the start has answered WAIT and before the first
+    /// take: false ends the operation with EAGAIN (a cancel).
+    check: Option<&'a dyn Fn() -> bool>,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
@@ -46,6 +49,7 @@ impl Mode<'_> {
             duplicable: false,
             custody: None,
             deadline: None,
+            check: None,
         }
     }
 }
@@ -288,6 +292,36 @@ pub fn run_until(
     )
 }
 
+/// A wait of a service the word of which the caller looks at once the service
+/// has the waiter: `check` says whether to go on (false ends the operation
+/// with EAGAIN, and the service passes a wake it had given the waiter on).
+/// `deadline` ends the wait with ETIMEDOUT.
+#[allow(clippy::too_many_arguments)]
+pub fn run_checked(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+    deadline: Option<u64>,
+    authenticated: bool,
+    check: &dyn Fn() -> bool,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            deadline,
+            duplicable: true,
+            check: Some(check),
+            ..Mode::plain(true, authenticated)
+        },
+    )
+}
+
 /// `run_with` for an operation that is no point of cancellation
 /// (getentropy, getrandom, arc4random; XSH 2.9.5 allows no new points): a
 /// request of cancellation leaves the wait alone and stays for the next
@@ -401,6 +435,7 @@ pub(crate) fn run_drain(
             duplicable: false,
             custody,
             deadline: None,
+            check: None,
         },
     )
     .map(drop)
@@ -457,6 +492,7 @@ fn run_in(
         duplicable,
         custody,
         deadline,
+        check,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -538,7 +574,14 @@ fn run_in(
     // The same for a park of a stop (exec, fork), which receives from the
     // channel too and takes a notification without running a handler.
     let mut parked = crate::signals::parks();
+    let mut checked = check.is_none();
     let cancel = 'wait: loop {
+        if !checked {
+            checked = true;
+            if check.is_some_and(|check| !check()) {
+                break 'wait Some(EAGAIN);
+            }
+        }
         if armed
             && (block.handled.load(Ordering::SeqCst) != handled
                 || crate::signals::parks() != parked)

@@ -179,6 +179,10 @@ pub struct Object<H> {
     /// The buffer of the screen (spec 3, 7.3): not copied by `fork`, not
     /// changed by `munmap` or `mprotect`, taken out by `unmap_display`.
     pub display: bool,
+    /// The key of an anonymous shared object for waits by address between
+    /// processes (0: none). A forked child shows the same object with the
+    /// same key.
+    pub wait_key: u64,
 }
 
 impl<H> Object<H> {
@@ -191,6 +195,7 @@ impl<H> Object<H> {
             dirty: false,
             image: false,
             display: false,
+            wait_key: 0,
         }
     }
 

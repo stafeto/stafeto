@@ -1328,6 +1328,12 @@ pub unsafe extern "C" fn stafeto_thread_create(stack: *mut usize, block: *mut c_
     }
 }
 
+/// The waits on shared words that fell back to the poll (probes).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_shared_polls() -> u32 {
+    posix_sync::polled()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_thread_id() -> c_int {
     posix_abi::relibc::current() as c_int
