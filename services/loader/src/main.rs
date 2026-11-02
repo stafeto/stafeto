@@ -301,6 +301,8 @@ fn staged(len: usize) -> &'static [u8] {
 
 /// What the parent's requests came to: a program loaded from its file
 /// (Start), or a copy of the parent's memory (Fork).
+// The map of a loaded program holds MAP_ENTRIES entries; one value lives at a time.
+#[allow(clippy::large_enum_variant)]
 enum Done {
     Loaded(Loaded),
     Copied(Copied),

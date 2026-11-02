@@ -258,16 +258,14 @@ pub struct Layout {
     /// `PT_DYNAMIC`, inside the bytes of the data segment: empty for a
     /// static program.
     pub dynamic: Extent,
-    /// `PT_INTERP` (the path with its NUL), inside the bytes of the
-    /// read-only segment: empty for a static program.
-    pub interp: Extent,
+    /// The address of `PT_INTERP` (the path `INTERP_PATH`, checked), inside
+    /// the bytes of the read-only segment: 0 for a static program.
+    pub interp: u64,
     /// Where the program headers lie in memory (`PT_PHDR`, or the offset of
     /// the table in the file from the start of the read-only segment), and
     /// how many there are; 0 for a static program, which has no use for them.
     pub phdr: u64,
     pub phnum: u16,
-    /// The template of thread-local storage; none for a dynamic program.
-    pub tls: Option<Tls>,
 }
 
 /// A shared object read from the head of its ELF file (`library`): the
@@ -309,10 +307,9 @@ pub fn layout(head: &[u8], file_len: u64, room: core::ops::Range<u64>) -> Result
         stack: read.stack,
         kind: Kind::Static,
         dynamic: Extent { vaddr: 0, size: 0 },
-        interp: Extent { vaddr: 0, size: 0 },
+        interp: 0,
         phdr: 0,
         phnum: 0,
-        tls: read.tls.map(|(_, tls)| tls),
     };
     let (interp, dynamic) = match (read.interp, read.dynamic) {
         (None, None) => return Ok(layout),
@@ -320,7 +317,7 @@ pub fn layout(head: &[u8], file_len: u64, room: core::ops::Range<u64>) -> Result
         (None, Some(_)) => return Err(ElfError::DynamicWithoutInterp),
         (Some(i), Some(d)) => (i, d),
     };
-    if layout.tls.is_some() {
+    if read.tls.is_some() {
         return Err(ElfError::DynamicTls);
     }
     // The interpreter: its path, in the head, inside the bytes of the
@@ -354,10 +351,7 @@ pub fn layout(head: &[u8], file_len: u64, room: core::ops::Range<u64>) -> Result
         vaddr: dvaddr,
         size: dsize,
     };
-    layout.interp = Extent {
-        vaddr: ivaddr,
-        size: isize,
-    };
+    layout.interp = ivaddr;
     Ok(layout)
 }
 
@@ -1011,14 +1005,8 @@ mod tests {
         let none = Extent { vaddr: 0, size: 0 };
         assert_eq!(
             (read.dynamic, read.interp, read.phdr, read.phnum),
-            (none, none, 0, 0)
+            (none, 0, 0, 0)
         );
-        assert_eq!(read.tls, None);
-        let f = with_tls(&[(0x20_2000, 4)]);
-        let read = super::layout(&f, f.len() as u64, 0x1000..0x100_0000).unwrap();
-        assert_eq!(read.kind, Kind::Static);
-        let tls = read.tls.unwrap();
-        assert_eq!((tls.vaddr, tls.file_size, tls.mem_size), (0x20_2000, 4, 20));
     }
 
     #[test]
@@ -1033,14 +1021,8 @@ mod tests {
                 size: 0x60
             }
         );
-        assert_eq!(
-            read.interp,
-            Extent {
-                vaddr: 0x20_0200,
-                size: 11
-            }
-        );
-        assert_eq!((read.phdr, read.phnum, read.tls), (0x20_0040, 7, None));
+        assert_eq!(read.interp, 0x20_0200);
+        assert_eq!((read.phdr, read.phnum), (0x20_0040, 7));
         assert_eq!(read.segments[Part::Rodata as usize].vaddr, 0x20_0000);
         // `program` is for the boot image: static files only.
         let f = dynamic_file(&dynamic_headers());
@@ -1517,8 +1499,7 @@ mod tests {
             let Some(f) = real(name) else { return };
             let l = super::layout(&f[..0x1000], f.len() as u64, PROGRAM_ROOM).unwrap();
             assert_eq!(l.kind, Kind::Dynamic, "{name}");
-            assert_eq!(l.interp.size, 11);
-            assert_eq!(l.tls, None);
+            assert_ne!(l.interp, 0);
             let rodata = &l.segments[Part::Rodata as usize];
             assert!(rodata.holds(l.phdr, 56 * u64::from(l.phnum)));
             assert!(l.segments[Part::Data as usize].holds(l.dynamic.vaddr, l.dynamic.size));

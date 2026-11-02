@@ -2060,7 +2060,7 @@ mod tests {
     fn the_library_room_is_its_own() {
         use abi::Access::{Read, ReadExec, ReadWrite};
         assert_eq!(LIBRARY_BASE, LIBRARY_ROOM.start);
-        assert!(PROGRAM_ROOM.end <= LIBRARY_ROOM.start && LIBRARY_ROOM.end <= HEAP_ROOM.start);
+        const { assert!(PROGRAM_ROOM.end <= LIBRARY_ROOM.start && LIBRARY_ROOM.end <= HEAP_ROOM.start) };
         assert!(!PROGRAM_ROOM.contains(&LIBRARY_BASE));
         assert_eq!(room_of(&region(0x0400_0000, 4, ReadExec)), Some(1));
         assert_eq!(room_of(&region(0x0430_0000, 4, Read)), Some(1));
