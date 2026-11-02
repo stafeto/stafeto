@@ -160,7 +160,17 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
     let mut run = Run::start(cmd, Input::Null)?;
     let driven = drive(&mut run, &scratch);
     let outcome = run.stop();
-    driven.map_err(|e| format!("display-probe on {}: {e}", machine.name))?;
+    if let Err(e) = driven {
+        // A probe that failed says so before the run times out.
+        let said = outcome.lines.iter().find(|l| {
+            l.starts_with("display-probe: check failed") || l.starts_with("display-probe: failed")
+        });
+        return Err(format!(
+            "display-probe on {}: {}",
+            machine.name,
+            said.map_or(e, Clone::clone)
+        ));
+    }
     verdict(&outcome.lines).map_err(|e| format!("display-probe on {}: {e}", machine.name))?;
     println!(
         "display-probe on {}: the screen and the keys of libc.so: the description, two frames that matched QEMU's screenshots, the keys, the refusals, fork, exec, the end of the owner, a restart of the display service, an image without one",
