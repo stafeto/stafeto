@@ -3007,7 +3007,9 @@ fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
             "posix-tty: personal detach and fresh attachment ok",
             DIALOG_STEP,
         )?;
-        run.expect("posix-tty: sessions ok", DIALOG_STEP)?;
+        // The crowd of 64 members forks them one by one, and under -icount
+        // that takes longer than a dialog step.
+        run.expect("posix-tty: sessions ok", BOOT_TIMEOUT)?;
         run.expect("posix-tty: ok", DIALOG_STEP)?;
         run.expect(ENDED, DIALOG_STEP)
     })();

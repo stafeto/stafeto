@@ -205,13 +205,14 @@ const BUSYBOX_DIALOG_POOL: u64 = 10450 * PAGE;
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,
 /// clock and pipe services, and the probe, which forks a child of its own
-/// size. Eighteen child quotas hold run, the session leader and sixteen
-/// live members for the terminal-signal walk. Spawn and exec run separately.
+/// size. Seventy-two child quotas hold run, the session leader and the
+/// sixty-four live members of the largest crowd for the terminal-signal walk.
+/// Spawn and exec run separately.
 pub const POSIX_TTY_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     RAM_FIFO_CLOCKED,
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 18 * DIALOG_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 72 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
