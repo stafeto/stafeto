@@ -52,6 +52,7 @@ const DMA: &[Dma] = &[Dma {
     name: "dma",
     size: 4 * PAGE,
     uncached: true,
+    duplicate: false,
 }];
 
 /// The driver on QEMU: level 37, above the entropy service, its client.

@@ -179,6 +179,16 @@ pub const ENTROPY: &[&str] = &[
     "virtio-rng-device,bus=virtio-mmio-bus.31",
 ];
 
+/// The Virtio GPU of the display service (services/virtio-gpu), on the
+/// transport init's table names, 23 (`table/gpu.rs`): address 0xa002e00,
+/// INTID 71. Its page 0xa002000 also covers the empty transports 16 to 22, which no other device may take. 640 by 400 is the screen's size;
+/// the device has no other. The images that run the service add these
+/// arguments (the display probes), the other runs have no GPU.
+pub const GPU: &[&str] = &[
+    "-device",
+    "virtio-gpu-device,bus=virtio-mmio-bus.23,xres=640,yres=400",
+];
+
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory,
@@ -1408,6 +1418,19 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ],
         );
         assert!(overflow_report_names(&l, RECURSE).is_err());
+    }
+
+    #[test]
+    fn the_gpu_sits_on_the_transport_init_names() {
+        // Transport i of `virt` is at 0xa000000 + 0x200 * i, SPI 16 + i
+        // (INTID 48 + i): 23 is 0xa002e00 and INTID 71 (its page also covers the empty transports 16 to 22).
+        assert!(GPU.contains(&"virtio-gpu-device,bus=virtio-mmio-bus.23,xres=640,yres=400"));
+        assert_eq!(0x0a00_0000 + 0x200 * 23, 0x0a00_2e00);
+        assert_eq!(48 + 23, 71);
+        // The entropy device keeps the last transport, on another page.
+        assert_ne!((0x0a00_0000 + 0x200 * 31) / 0x1000, 0x0a00_2e00 / 0x1000);
+        // The device goes on a modern transport, as every run has it.
+        assert!(ENTROPY.contains(&"virtio-mmio.force-legacy=false"));
     }
 
     #[test]
