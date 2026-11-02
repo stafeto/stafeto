@@ -69,6 +69,11 @@ pub const IPC_TAG: u32 = 1 << 29;
 /// The operations that wait the service counts: receivers (a notification
 /// of a queue is not sent while one waits) and `semop`s (GETNCNT, GETZCNT).
 pub const BLOCKED_MAX: usize = 128;
+/// The wakes of departed waiters by address that wait for a step.
+const ORPHANS_MAX: usize = 32;
+/// The highest level a waiter by address may have: the ceiling of the
+/// processes of POSIX; the service does not know the level of a client.
+const ADDR_LEVEL_MAX: u8 = 36;
 
 // Linux's numbers, relibc's.
 const EPERM: u32 = 1;
@@ -166,6 +171,27 @@ pub enum Block {
     /// no place of the eight of a wait queue is taken, and a post wakes the
     /// one that is first by level, then by age (`named_balance`).
     Named(u8),
+    /// A wait by address on a word of shared memory, at the level of the
+    /// waiting thread. It is kept in `blocked` only, like `Named`; the word
+    /// is in `Ipc::words` at the place of the operation.
+    Addr(u8),
+}
+
+/// A word of memory several processes share: the kind of its object's key
+/// (0 a file, 1 anonymous memory), the key and the offset in the object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Word {
+    kind: u64,
+    key: u64,
+    off: u64,
+}
+
+impl Word {
+    const ZERO: Word = Word {
+        kind: 0,
+        key: 0,
+        off: 0,
+    };
 }
 
 /// What a call came to: done, or to wait at a queue.
@@ -467,6 +493,9 @@ enum Wait {
     /// whether it was told.
     Gone,
     GoneTold,
+    /// (A wait by address.) The wake of a waiter that left was passed to
+    /// it, and a step is to tell it: its take returns without waiting.
+    Handed,
 }
 
 pub struct Ipc {
@@ -487,6 +516,17 @@ pub struct Ipc {
     /// that no step wakes many.
     owed: [u8; SEMSETS],
     gone_sets: u8,
+    /// The waiters by address in the state Handed: steps are due.
+    addr_pending: u16,
+    /// The words the waiters by address wait on, at their places in
+    /// `blocked`; the word of the start that `note_wait` is to place.
+    words: [Word; BLOCKED_MAX],
+    start_word: Word,
+    /// The words whose wake a session that went held: a step passes each on
+    /// (one search in a step), `ORPHANS_MAX` at most; past that the search
+    /// is made at once.
+    orphans: [Word; ORPHANS_MAX],
+    orphans_len: u8,
     /// The places of segments whose file's removal the file service has not
     /// taken: a new segment does not get them.
     busy_segs: u8,
@@ -579,6 +619,15 @@ impl Ipc {
             wait_seq: 0,
             owed: [0; SEMSETS],
             gone_sets: 0,
+            addr_pending: 0,
+            words: [Word {
+                kind: 0,
+                key: 0,
+                off: 0,
+            }; BLOCKED_MAX],
+            start_word: Word::ZERO,
+            orphans: [Word::ZERO; ORPHANS_MAX],
+            orphans_len: 0,
             busy_segs: 0,
             pool: End::NONE,
             own: [None; SEGS],
@@ -1049,6 +1098,9 @@ impl Ipc {
                 seq: self.wait_seq,
                 state: Wait::Waiting,
             };
+            if let Block::Addr(_) = block {
+                self.words[at] = self.start_word;
+            }
             self.wait_seq += 1;
         }
     }
@@ -1063,6 +1115,16 @@ impl Ipc {
                 let (queue, block, state) = (b.queue, b.block, b.state);
                 *b = BLOCKED_FREE;
                 self.counted -= 1;
+                if let Block::Addr(_) = block {
+                    // A waiter that leaves holding the wake hands it on.
+                    let word = self.words[at];
+                    if state == Wait::Handed {
+                        self.addr_pending -= 1;
+                    }
+                    if matches!(state, Wait::Granted | Wait::Handed) {
+                        self.hand_addr(word, Some(wakes));
+                    }
+                }
                 if matches!(block, Block::Named(_))
                     && state == Wait::Granted
                     && let Some(s) = Self::set_of(queue)
@@ -1079,17 +1141,34 @@ impl Ipc {
         if self.counted == 0 {
             return;
         }
-        for b in &mut self.blocked {
-            if b.used && b.label == label {
-                if let Block::Named(_) = b.block
-                    && b.state == Wait::Granted
-                    && let Some(s) = Self::set_of(b.queue)
-                {
-                    self.owed[s] += 1;
-                }
-                *b = BLOCKED_FREE;
-                self.counted -= 1;
+        for at in 0..BLOCKED_MAX {
+            let b = &mut self.blocked[at];
+            if !(b.used && b.label == label) {
+                continue;
             }
+            if let Block::Named(_) = b.block
+                && b.state == Wait::Granted
+                && let Some(s) = Self::set_of(b.queue)
+            {
+                self.owed[s] += 1;
+            }
+            if let Block::Addr(_) = b.block
+                && matches!(b.state, Wait::Granted | Wait::Handed)
+            {
+                // The wake it held goes on in a step, the search there.
+                if b.state == Wait::Handed {
+                    self.addr_pending -= 1;
+                }
+                let word = self.words[at];
+                if usize::from(self.orphans_len) < ORPHANS_MAX {
+                    self.orphans[usize::from(self.orphans_len)] = word;
+                    self.orphans_len += 1;
+                } else {
+                    self.hand_addr(word, None);
+                }
+            }
+            self.blocked[at] = BLOCKED_FREE;
+            self.counted -= 1;
         }
     }
 
@@ -1197,6 +1276,135 @@ impl Ipc {
         false
     }
 
+    // ---- waits by address ----
+
+    /// The waiters on `word` that wait for a wake, in the order they wake
+    /// (the greater level first, the older first among equals): the places in
+    /// `blocked` of the first `out.len()` of them; how many there are.
+    fn addr_first(&self, word: Word, out: &mut [(u8, u64, usize)]) -> usize {
+        let mut n = 0;
+        for (at, b) in self.blocked.iter().enumerate() {
+            let Block::Addr(level) = b.block else {
+                continue;
+            };
+            if !b.used || b.state != Wait::Waiting || self.words[at] != word {
+                continue;
+            }
+            let mut i = n;
+            while i > 0 && (out[i - 1].0 < level || (out[i - 1].0 == level && out[i - 1].1 > b.seq))
+            {
+                i -= 1;
+            }
+            if i >= out.len() {
+                continue;
+            }
+            let end = if n < out.len() {
+                n += 1;
+                n - 1
+            } else {
+                out.len() - 1
+            };
+            let mut j = end;
+            while j > i {
+                out[j] = out[j - 1];
+                j -= 1;
+            }
+            out[i] = (level, b.seq, at);
+        }
+        n
+    }
+
+    /// `ADDR_WAKE`: wakes up to `count` waiters on `word`, no more than
+    /// `proto_pipe::ipc::op::ADDR_WAKE_MAX` (each costs a notification, and a
+    /// step stays under term B); how many.
+    fn addr_wake(&mut self, word: Word, count: u64, wakes: &mut Wakes) -> u64 {
+        let mut first = [(0u8, 0u64, 0usize); proto_pipe::ipc::op::ADDR_WAKE_MAX];
+        let want = count.min(first.len() as u64) as usize;
+        let found = self.addr_first(word, &mut first[..want]);
+        let mut woken = 0;
+        for &(.., at) in &first[..found] {
+            let b = &mut self.blocked[at];
+            if !wakes.push((b.label, b.key)) {
+                break;
+            }
+            b.state = Wait::Granted;
+            woken += 1;
+        }
+        woken
+    }
+
+    /// A wake that a waiter on `word` gave up goes to the next one: told
+    /// now when `wakes` has the room, else by a step (Handed).
+    fn hand_addr(&mut self, word: Word, wakes: Option<&mut Wakes>) {
+        let mut first = [(0u8, 0u64, 0usize); 1];
+        if self.addr_first(word, &mut first) == 0 {
+            return;
+        }
+        let b = &mut self.blocked[first[0].2];
+        if let Some(wakes) = wakes
+            && wakes.push((b.label, b.key))
+        {
+            b.state = Wait::Granted;
+        } else {
+            b.state = Wait::Handed;
+            self.addr_pending += 1;
+        }
+    }
+
+    /// One of the waiters by address that a step is to tell, if any.
+    fn addr_step(&mut self, wakes: &mut Wakes) -> bool {
+        if self.orphans_len != 0 {
+            self.orphans_len -= 1;
+            let word = self.orphans[usize::from(self.orphans_len)];
+            self.hand_addr(word, Some(wakes));
+            return true;
+        }
+        if self.addr_pending == 0 {
+            return false;
+        }
+        if let Some(b) = self
+            .blocked
+            .iter_mut()
+            .find(|b| b.used && matches!(b.block, Block::Addr(_)) && b.state == Wait::Handed)
+            && wakes.push((b.label, b.key))
+        {
+            b.state = Wait::Granted;
+            self.addr_pending -= 1;
+        }
+        true
+    }
+
+    /// `ADDR_WAIT`: the start puts the waiter in the table; its take returns
+    /// at once once a wake has come.
+    fn addr_wait(&mut self, label: u64, key: Option<u64>, w: &[u64]) -> Flow {
+        let word = Word {
+            kind: w[0],
+            key: w[1],
+            off: w[2],
+        };
+        if let Some(at) = key.and_then(Self::blocked_place) {
+            let b = &mut self.blocked[at];
+            if b.used
+                && b.label == label
+                && Some(b.key) == key
+                && matches!(b.block, Block::Addr(_))
+                && self.words[at] == word
+                && matches!(b.state, Wait::Granted | Wait::Handed)
+            {
+                if b.state == Wait::Handed {
+                    self.addr_pending -= 1;
+                }
+                b.state = Wait::Taken;
+                return Flow::Done;
+            }
+        }
+        self.start_word = word;
+        Flow::Wait {
+            queue: Self::set_number(0),
+            block: Block::Addr(w[3].min(u64::from(ADDR_LEVEL_MAX)) as u8),
+        }
+    }
+
     /// Wakes the list of a queue or set when the object is gone or changed.
     fn wake(waiters: [Option<Waiter>; WAITERS], wakes: &mut Wakes) {
         wakes.add(waiters);
@@ -1223,13 +1431,17 @@ impl Ipc {
     }
 
     pub fn due(&self) -> bool {
-        self.dying != 0 || self.gone_sets != 0 || self.owed.iter().any(|&n| n != 0)
+        self.dying != 0
+            || self.gone_sets != 0
+            || self.addr_pending != 0
+            || self.orphans_len != 0
+            || self.owed.iter().any(|&n| n != 0)
     }
 
     /// One adjustment or hold of a session that went is let go of. Whether
     /// another step is due.
     pub fn step(&mut self, wakes: &mut Wakes) -> bool {
-        if self.named_step(wakes) {
+        if self.named_step(wakes) || self.addr_step(wakes) {
         } else if let Some(at) = self.undo.iter().position(|u| u.used && u.dying) {
             let u = self.undo[at];
             self.undo[at] = UNDO_FREE;
@@ -2436,6 +2648,20 @@ impl Pipes {
                 self.ipc.nsem_post(w, &c, wakes)?;
                 Ok(Flow::Done)
             }
+            op::ADDR_WAIT => {
+                need(4)?;
+                Ok(self.ipc.addr_wait(label, call.key, w))
+            }
+            op::ADDR_WAKE => {
+                need(4)?;
+                let word = Word {
+                    kind: w[0],
+                    key: w[1],
+                    off: w[2],
+                };
+                out.word(self.ipc.addr_wake(word, w[3], wakes));
+                Ok(Flow::Done)
+            }
             op::NSEM_VALUE => {
                 need(1)?;
                 let s = self.ipc.sem_set(w[0], false)?;
@@ -3600,6 +3826,151 @@ mod tests {
         assert_eq!(order, vec![20, 20, 15, 12, 9, 9, 8, 7, 5, 3, 2, 1]);
         assert_eq!(p.ipc.counted, 0);
         assert_eq!(r.ok(&mut p, op::NSEM_VALUE, &[id], b"").words[0], 0);
+    }
+
+    /// Starts the wait by address of the operation `n` of the session `label`
+    /// on the word (kind 1, key `key`, offset `off`) at `level`.
+    fn addr_wait_at(
+        r: &mut Run,
+        p: &mut Pipes,
+        label: u64,
+        n: u64,
+        key: u64,
+        off: u64,
+        level: u64,
+    ) {
+        let (flow, _) = r.call(p, label, op::ADDR_WAIT, &[1, key, off, level], b"", None);
+        let Ok(Flow::Wait { queue, block }) = flow else {
+            panic!("the wait {n} did not wait: {flow:?}")
+        };
+        p.ipc_note_wait(label, n, queue, block);
+    }
+
+    /// The take of the operation `n`: whether it got its wake.
+    fn addr_take(r: &mut Run, p: &mut Pipes, label: u64, n: u64, key: u64, off: u64) -> bool {
+        let (flow, _) = r.call(p, label, op::ADDR_WAIT, &[1, key, off, 0], b"", Some(n));
+        match flow {
+            Ok(Flow::Done) => {
+                p.ipc_wait_done(label, n, &mut r.wakes);
+                true
+            }
+            Ok(Flow::Wait { .. }) => false,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn addr_wake_all(r: &mut Run, p: &mut Pipes, key: u64, off: u64, count: u64) -> u64 {
+        r.ok(p, op::ADDR_WAKE, &[1, key, off, count], b"").words[0]
+    }
+
+    #[test]
+    fn a_wake_by_address_wakes_the_waiters_of_that_word_by_level_then_age() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        let levels = [5u64, 9, 1, 20, 7, 20];
+        for (i, level) in levels.iter().enumerate() {
+            // Two sessions; the word is the same, another offset and another
+            // key have waiters of their own.
+            addr_wait_at(
+                &mut r,
+                &mut p,
+                1 + i as u64 % 2,
+                i as u64 + 1,
+                77,
+                64,
+                *level,
+            );
+        }
+        addr_wait_at(&mut r, &mut p, 1, 20, 77, 68, 30);
+        addr_wait_at(&mut r, &mut p, 1, 21, 78, 64, 30);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 77, 64, 0), 0);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 99, 64, 3), 0);
+        let mut order = Vec::new();
+        for _ in 0..levels.len() {
+            assert_eq!(addr_wake_all(&mut r, &mut p, 77, 64, 1), 1);
+            let woken: Vec<_> = r.wakes.iter().collect();
+            assert_eq!(woken.len(), 1);
+            let n = woken[0].1;
+            order.push(levels[n as usize - 1]);
+            assert!(addr_take(&mut r, &mut p, woken[0].0, n, 77, 64));
+        }
+        assert_eq!(order, vec![20, 20, 9, 7, 5, 1]);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 77, 64, 5), 0);
+        // The two other words still wait.
+        assert_eq!(p.ipc.counted, 2);
+    }
+
+    #[test]
+    fn a_broadcast_by_address_wakes_a_list_at_a_time() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        for n in 1..=40u64 {
+            addr_wait_at(&mut r, &mut p, 1, n, 5, 0, n % 7);
+        }
+        let mut total = 0;
+        let mut calls = 0;
+        loop {
+            let woken = addr_wake_all(&mut r, &mut p, 5, 0, i32::MAX as u64);
+            total += woken;
+            calls += 1;
+            if woken < proto_pipe::ipc::op::ADDR_WAKE_MAX as u64 {
+                break;
+            }
+        }
+        assert_eq!((total, calls), (40, 11));
+        for n in 1..=40u64 {
+            assert!(addr_take(&mut r, &mut p, 1, n, 5, 0));
+        }
+        assert_eq!(p.ipc.counted, 0);
+    }
+
+    #[test]
+    fn a_waiter_by_address_that_leaves_with_the_wake_hands_it_on() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        addr_wait_at(&mut r, &mut p, 1, 1, 5, 0, 10);
+        addr_wait_at(&mut r, &mut p, 2, 2, 5, 0, 4);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 5, 0, 1), 1);
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(1, 1)]);
+        // The wake is the first one's: the second is not woken by the next
+        // wake before the first has left, and its take waits.
+        assert!(!addr_take(&mut r, &mut p, 2, 2, 5, 0));
+        // The first leaves (a signal, a deadline): the second gets the wake.
+        let mut wakes = Wakes::default();
+        p.ipc_wait_done(1, 1, &mut wakes);
+        assert_eq!(wakes.iter().collect::<Vec<_>>(), vec![(2, 2)]);
+        assert!(addr_take(&mut r, &mut p, 2, 2, 5, 0));
+        // With nobody else waiting the wake goes nowhere.
+        addr_wait_at(&mut r, &mut p, 1, 3, 5, 0, 1);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 5, 0, 1), 1);
+        let mut wakes = Wakes::default();
+        p.ipc_wait_done(1, 3, &mut wakes);
+        assert_eq!(wakes.iter().count(), 0);
+        assert_eq!(p.ipc.counted, 0);
+        // A session that goes holding a wake: a step tells the next waiter.
+        addr_wait_at(&mut r, &mut p, 7, 5, 6, 8, 9);
+        addr_wait_at(&mut r, &mut p, 8, 6, 6, 8, 3);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 6, 8, 1), 1);
+        assert_eq!(r.wakes.iter().collect::<Vec<_>>(), vec![(7, 5)]);
+        p.ipc_forget(7);
+        assert!(p.ipc_due());
+        assert_eq!(drain(&mut p), vec![(8, 6)]);
+        assert!(!p.ipc_due());
+        assert!(addr_take(&mut r, &mut p, 8, 6, 6, 8));
+        assert_eq!(p.ipc.counted, 0);
+    }
+
+    #[test]
+    fn a_wake_that_a_cancel_passes_on_with_no_room_is_told_by_a_step() {
+        let (mut p, mut r) = (pipes(), Run::new());
+        addr_wait_at(&mut r, &mut p, 1, 1, 5, 0, 9);
+        addr_wait_at(&mut r, &mut p, 1, 2, 5, 0, 3);
+        assert_eq!(addr_wake_all(&mut r, &mut p, 5, 0, 1), 1);
+        // The lists of wakes are full when the first leaves.
+        let mut wakes = Wakes::default();
+        while wakes.push((9, 9)) {}
+        p.ipc_wait_done(1, 1, &mut wakes);
+        assert!(p.ipc_due());
+        // The second's take gets it before the step does.
+        assert!(addr_take(&mut r, &mut p, 1, 2, 5, 0));
+        assert!(!p.ipc_due());
     }
 
     #[test]

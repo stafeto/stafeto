@@ -656,7 +656,7 @@ pub const OS_TEST_TABLE: &[Record] = &[
     TTY,
     RAM_FIFO_CLOCKED,
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 32 * OS_TEST_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],

@@ -231,6 +231,9 @@ pub(crate) struct Source {
     pub may_write: bool,
     /// The mapping asked for write access: its pages go back to the file.
     pub dirty: bool,
+    /// The key of a new anonymous shared object for waits by address (0:
+    /// none).
+    pub wait_key: u64,
 }
 
 impl Source {
@@ -242,9 +245,15 @@ impl Source {
             back: None,
             may_write: true,
             dirty: false,
+            wait_key: 0,
         }
     }
 }
+
+/// What a forked child takes from the parent's object that starts at an
+/// address: the address, the file, the access it may get, whether it is
+/// dirty, the guard pages, the key for waits by address.
+type Inherited = (usize, Option<posix_map::Back>, bool, bool, usize, u64);
 
 /// One entry of a forked child's memory map (the loader's `ForkEntry`): the
 /// handle is None for an entry that shows the object of the one before.
@@ -279,7 +288,8 @@ pub unsafe fn after_fork(
     }
     // The files the parent's shared mappings write to: the child's pins
     // are the parent's places.
-    let mut backs = [(0usize, None::<posix_map::Back>, true, false, 0usize); posix_map::MAX_PIECES];
+    let mut backs: [Inherited; posix_map::MAX_PIECES] =
+        [(0usize, None::<posix_map::Back>, true, false, 0usize, 0u64); posix_map::MAX_PIECES];
     for (slot, piece) in backs.iter_mut().zip(state.map.iter()) {
         let object = state.map.object(piece.object());
         *slot = (
@@ -288,11 +298,15 @@ pub unsafe fn after_fork(
             object.may_write,
             object.dirty,
             piece.guard(),
+            object.wait_key,
         );
     }
     state.map.forget();
     let mut last = None;
     for entry in map {
+        if entry.shared {
+            posix_sync::note_shared();
+        }
         let object = match (entry.handle, last) {
             (Some(handle), _) => {
                 let object =
@@ -307,9 +321,10 @@ pub unsafe fn after_fork(
                                 entry.shared,
                                 inherited.and_then(|(_, back, ..)| *back),
                             );
-                            if let Some(&(_, _, may_write, dirty, _)) = inherited {
+                            if let Some(&(_, _, may_write, dirty, _, wait_key)) = inherited {
                                 object.may_write = may_write;
                                 object.dirty = dirty;
+                                object.wait_key = wait_key;
                             }
                             if entry.image {
                                 object.image = true;
@@ -338,11 +353,7 @@ pub unsafe fn after_fork(
 
 /// The piece the child's loader mapped at `address` has the hole the
 /// parent's piece there had (the room's use is copied whole).
-fn restore_hole(
-    state: &mut State,
-    backs: &[(usize, Option<posix_map::Back>, bool, bool, usize)],
-    address: usize,
-) {
+fn restore_hole(state: &mut State, backs: &[Inherited], address: usize) {
     let guard = backs
         .iter()
         .find(|entry| entry.0 == address)
@@ -703,6 +714,7 @@ impl State {
             back,
             may_write,
             dirty,
+            wait_key,
         } = source;
         let kept = match existing {
             Some(kept) => kept,
@@ -729,12 +741,16 @@ impl State {
             first,
         )
         .map_err(|e| self.refused(e))?;
+        if shared {
+            posix_sync::note_shared();
+        }
         let index = self
             .map
             .push(address, pages, first, offset, {
                 let mut object = Object::new(kept, shared, back);
                 object.may_write = may_write;
                 object.dirty = dirty;
+                object.wait_key = wait_key;
                 object
             })
             .map_err(|_| ENOMEM)?;

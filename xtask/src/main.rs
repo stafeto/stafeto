@@ -3704,7 +3704,7 @@ fn relibc_hello_probe() -> Result<(), String> {
             "relibc-hello: cpus conf={0} online={0} mask={0} on=1",
             qemu::cpus()
         ),
-        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 27 options claimed, timers 202405",
+        "relibc-hello: constants: _POSIX_VERSION 202405, _POSIX_SUBPROFILE 1, 28 options claimed, timers 202405",
         "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "RELIBC PANIC: ",

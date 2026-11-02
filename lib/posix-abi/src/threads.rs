@@ -62,6 +62,7 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     }
     posix_sync::configure(ceiling, crate::signals::deliver_deferred);
     posix_sync::set_shared(crate::mmap::is_shared);
+    posix_sync::set_remote(crate::mmap::wait_remote, crate::mmap::wake_remote);
     MAIN_SELF.store(main.into_raw().0, Ordering::Release);
     READY.store(true, Ordering::Release);
     Ok(())
