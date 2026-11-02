@@ -243,7 +243,10 @@ Actions.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 - Shared C library (in progress): `tools/build-libc-so.py` builds `libc.so`
-  (relibc, openlibm and the layer, 2.6 MB, about 2,000 relocations) and
-  the probe programs of `tests/posix-so`; the loader that runs dynamic
-  programs and the image that carries `/lib/libc.so` follow, so no program
-  is linked dynamically yet.
+  (relibc, openlibm and the layer, 2.6 MB with symbols, 2.0 MB in an image,
+  about 2,000 relocations) and the probe programs of `tests/posix-so`
+  (`cargo xtask libc-so`). The loader runs a dynamic program: it opens
+  `/lib/libc.so`, shares its code and read-only data through the table of
+  images, relocates it and the program, and fills the auxiliary vector;
+  `cargo xtask posix-so` boots the image with `/lib/libc.so` and the probe.
+  No program of the images is linked dynamically yet.
