@@ -28,7 +28,7 @@
 #![no_std]
 #![no_main]
 
-use abi::{Access, Error, MESSAGE_MAX};
+use abi::{Access, Error, MESSAGE_MAX, Rights};
 use proto_gpu::{
     BUFFER_BYTES, BUSY, CLEARING, HEIGHT, INVALID, Method, NO_INPUT, NOT_ALLOWED, REVOKED, Rect,
     STRIDE, Screen, WIDTH, code,
@@ -313,6 +313,15 @@ impl Probe<'_> {
         if opened.status != code(NO_INPUT) {
             return Err("a session of focus without a service of input");
         }
+        // The owner can neither copy the buffer nor its session (no
+        // DUPLICATE), only pass them on whole.
+        if sys::handle_duplicate(&opened.buffer, Rights::MAP_READ).err()
+            != Some(Error::AccessDenied)
+            || sys::handle_duplicate(&opened.owner, Rights::SEND).err() != Some(Error::AccessDenied)
+        {
+            return Err("the owner could duplicate its buffer or its session");
+        }
+        rt::println!("gpu-probe: the owner's handles cannot be duplicated");
         let points = self.map(&opened)?;
         if points.iter().any(|&p| p != 0) {
             return Err("the buffer of a new screen is not zero");

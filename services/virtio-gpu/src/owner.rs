@@ -220,6 +220,17 @@ mod tests {
     }
 
     #[test]
+    fn an_owned_screen_is_busy_whatever_the_device_does() {
+        // OPEN of an owned screen is BUSY, never CLEARING: the service
+        // asks the machine first (the owner may have a FLUSH with the device).
+        let mut o = Owner::new();
+        o.open().expect("open");
+        for _ in 0..3 {
+            assert_eq!(o.open(), Err(Refusal::Busy));
+        }
+    }
+
+    #[test]
     fn labels_are_never_given_twice_and_carry_the_tag() {
         let mut o = Owner::new();
         let mut seen = Vec::new();

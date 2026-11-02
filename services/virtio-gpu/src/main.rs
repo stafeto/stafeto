@@ -100,6 +100,8 @@ const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
 const NO_GPU: u64 = 6;
 const NOT_STARTED: u64 = 7;
+/// The device broke the protocol while the screen was in use.
+const DEVICE_FAILED: u64 = 8;
 
 /// The heap the device's crate may ask for: none (the queue has no
 /// indirect entries, the only thing of the crate that allocates).
@@ -195,13 +197,7 @@ fn main(_: u64) -> u64 {
     transport.finish_init();
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
     rt::println!("virtio-gpu: virtio-mmio at {at:#x}, line {line}, status {status:#x}");
-    let (Ok(notify), Ok(copy)) = (
-        sys::handle_duplicate(&channel, Rights::NOTIFY),
-        sys::handle_duplicate(
-            &fb,
-            Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER | Rights::DUPLICATE,
-        ),
-    ) else {
+    let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
         return NOT_REGISTERED;
     };
     let mut driver = Driver {
@@ -222,8 +218,8 @@ fn main(_: u64) -> u64 {
         focus_on: false,
         showing: None,
         queued: None,
-        fb: copy,
-        _maps: (dma, fb, window),
+        fb,
+        _maps: (dma, window),
     };
     driver.input = driver.connect_input();
     // The line opens once the queue is up, and the setup commands begin.
@@ -340,10 +336,11 @@ struct Driver {
     /// The FLUSH with the device, and the one that waits for it.
     showing: Option<Pending>,
     queued: Option<(Pending, Rect)>,
-    /// A copy of the buffer's object that the owners' copies come from, and
-    /// the objects and the window, mapped for the driver's life.
+    /// The buffer's object that the owners' copies come from (init gave it
+    /// DUPLICATE), and the DMA object and the window, mapped for the
+    /// driver's life.
     fb: Handle<Memory>,
-    _maps: (Handle<Memory>, Handle<Memory>, Handle<Memory>),
+    _maps: (Handle<Memory>, Handle<Memory>),
 }
 
 impl Driver {
@@ -543,6 +540,15 @@ impl Driver {
         rt::println!("virtio-gpu: the display changed ({events:#x}); the screen stays 640 by 400");
     }
 
+    /// The device misbehaves while the screen is in use: the driver ends
+    /// with a code of its own, and init stops the device and starts it again.
+    /// Whoever waits for a reply (OPEN, FLUSH) gets PEER_CLOSED from the
+    /// kernel; none hangs.
+    fn give_up(&mut self) -> ! {
+        self.setup = Setup::Failed;
+        rt::sys::process_exit(DEVICE_FAILED)
+    }
+
     /// Takes back every chain the device returned, and finishes the job
     /// when its last chain is back.
     fn reap(&mut self) {
@@ -557,8 +563,7 @@ impl Driver {
                 // did not ask. Left in the ring it would repeat forever, so
                 // the screen is given up.
                 rt::println!("virtio-gpu: a used chain {token} with no job");
-                self.setup = Setup::Failed;
-                return;
+                self.give_up();
             };
             // SAFETY: the same command and answer `submit` added with this
             // token; the device is done with them.
@@ -572,11 +577,11 @@ impl Driver {
             };
             if popped.is_err() {
                 rt::println!("virtio-gpu: the used chain {token} could not be taken back");
-                self.setup = Setup::Failed;
-                return;
+                self.give_up();
             }
+            let len = popped.unwrap_or(0) as usize;
             if let Some(flight) = self.flight.as_mut() {
-                if !commands::succeeded(kind) {
+                if !commands::succeeded(kind, len, chain.answer_len == INFO_REPLY) {
                     flight.bad = true;
                     rt::println!("virtio-gpu: {:?} answered {kind:#x}", flight.job);
                 }
@@ -773,16 +778,14 @@ impl Driver {
             // The device is being set up: ask again.
             _ => return Answer::Status(code(CLEARING)),
         }
-        // A free screen has no job with the device; one that does is not
-        // ready to be given.
-        if self.flight.is_some() {
-            return Answer::Status(code(CLEARING));
-        }
         let label = match self.owner.open() {
             Ok(label) => label,
             Err(Refusal::Busy) => return Answer::Status(code(BUSY)),
             Err(Refusal::Clearing) => return Answer::Status(code(CLEARING)),
         };
+        // A free screen has no job with the device: the owner's FLUSH, the
+        // scanout off and the setup all end before the machine frees it.
+        debug_assert!(self.flight.is_none());
         // A handle in a reply must carry TRANSFER (spec 6.1), so the owner
         // gets TRANSFER on both, and no DUPLICATE.
         let rights = Rights::SEND | Rights::TRANSFER;
