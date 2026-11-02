@@ -171,6 +171,18 @@ extern "C" fn files_full_sessions() -> i32 {
     }
 }
 
+/// How far above its base level the kernel has the calling thread work: 0
+/// for a thread that nothing lends a level, -1 when it cannot be read. The
+/// main thread of a new image moves to the level its parent chose, and
+/// must not keep the level it started at.
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_procs_lent() -> i32 {
+    let Ok(me) = rt::sys::self_thread() else {
+        return -1;
+    };
+    rt::sys::thread_info(&me).map_or(-1, |info| i32::from(info.priority) - i32::from(info.base))
+}
+
 /// The level of the calling thread, for the priority probe of the steps
 /// (the layer's `set_level`): 0 or a negated errno.
 #[cfg(feature = "priority-steps")]

@@ -560,7 +560,7 @@ fn reserved_x2_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
     let thread = made.created(c, n, &[0, abi::INFO_THREAD_SELF, 0])?;
     let (memory, _) = make_memory(c, 1)?;
     let memory = made.keep(memory)?;
-    let channel = made.created(c, Call::CreateChannel.number(), &[10])?;
+    let channel = made.created(c, Call::CreateChannel.number(), &[10, 0])?;
     for (kind, name, handle) in [
         (abi::INFO_PROCESS_STATE, "PROCESS_STATE", process),
         (INFO_PROCESS_MEMORY, "PROCESS_MEMORY", process),
@@ -587,8 +587,8 @@ fn reserved_x2_cases(c: &Caller, made: &Made) -> Result<(), &'static str> {
 pub fn object_info_label_answers_the_channels_owner(_: &Boot) -> Result<(), &'static str> {
     let (sessions, channels) = (session::in_use(), channel::in_use());
     with_caller(|c| {
-        let own = c.created(Call::CreateChannel.number(), &[10])?;
-        let other = c.created(Call::CreateChannel.number(), &[10])?;
+        let own = c.created(Call::CreateChannel.number(), &[10, 0])?;
+        let other = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let result = label_cases(c, own, other);
         c.close(own)?;
         c.close(other)?;
@@ -864,7 +864,7 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
 fn exit_and_start_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
     let q = CHILD_QUOTA;
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let result = with_full_table(c, n, &[q, 16, 20, h.0, 5, 0, 0, 0, 0])
         .and_then(|()| channel_of(c, h))
         .and_then(|ch| moved_start(c, h, ch));
@@ -1733,15 +1733,15 @@ fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
     let resource = c.insert(Object::Resource, Rights::NONE)?;
     let channels = channel::in_use();
     with_used_quota(c, || {
-        c.fails(n, &[30], Error::NoMemory)?;
-        with_full_table(c, n, &[30])
+        c.fails(n, &[30, 0], Error::NoMemory)?;
+        with_full_table(c, n, &[30, 0])
     })?;
     cleanup::drain();
     check(
         channel::in_use() == channels,
         "a channel that did not fit stayed",
     )?;
-    let h = c.created(n, &[30])?;
+    let h = c.created(n, &[30, 0])?;
     let result = channel_of(c, h).and_then(|ch| {
         // SAFETY: the caller's process is the test's.
         let rights = unsafe { c.process.as_ref() }.lookup(h, CHANNEL_RIGHTS, Object::channel);
@@ -1780,7 +1780,7 @@ pub fn boost_is_capped_by_the_ceiling(_: &Boot) -> Result<(), &'static str> {
 }
 
 fn boost_cases(owner: &Caller, low: &Caller) -> Result<(), &'static str> {
-    let h = owner.created(Call::CreateChannel.number(), &[40])?;
+    let h = owner.created(Call::CreateChannel.number(), &[40, 0])?;
     let result = channel_of(owner, h).and_then(|ch| {
         let r = low.insert(Object::Channel(ch), Rights::RECEIVE)?;
         let result = boost_levels(owner, low, h, r);
@@ -1789,6 +1789,42 @@ fn boost_cases(owner: &Caller, low: &Caller) -> Result<(), &'static str> {
     });
     owner.close(h)?;
     result
+}
+
+/// The slots of a wait channel lend nothing (spec 6.5, 6.6): channel_create
+/// takes only the flags 0 and abi::CHANNEL_WAIT (INVALID_ARGS for any
+/// other bit, x0 alone changed). A receiver at base 10 takes a slot of
+/// priority 40 from the queue of a wait channel and stays at 10; the same
+/// from an ordinary channel lifts it to 40.
+pub fn wait_channel_lends_nothing(_: &Boot) -> Result<(), &'static str> {
+    let caller = Caller::with_ceiling(63)?;
+    let result = wait_channel_cases(&caller);
+    caller.release();
+    result
+}
+
+fn wait_channel_cases(c: &Caller) -> Result<(), &'static str> {
+    let (create, notify, receive) = (
+        Call::CreateChannel.number(),
+        Call::Notify.number(),
+        Call::Receive.number(),
+    );
+    for flags in [2, 3, 1 << 32, 1 << 63] {
+        c.fails(create, &[40, flags], Error::InvalidArgs)?;
+    }
+    for (flags, level) in [(abi::CHANNEL_WAIT, 10), (0, 40)] {
+        let h = c.created(create, &[40, flags])?;
+        c.succeeds(notify, &[h.0, 1], &[])?;
+        c.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(1, 1))?;
+        let seen = priorities(c.thread);
+        c.fails(receive, &[h.0, NO_WAIT], Error::WouldBlock)?;
+        c.close(h)?;
+        check(
+            seen == (10, level),
+            "the slot of a channel lent the wrong priority to its receiver",
+        )?;
+    }
+    Ok(())
 }
 
 fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<(), &'static str> {
@@ -1868,7 +1904,7 @@ pub fn handle_duplicate_checks_the_callers_limits(_: &Boot) -> Result<(), &'stat
 }
 
 fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let result = (|| {
         let resource = c.insert(Object::Resource, Rights::DEBUG | Rights::DUPLICATE)?;
         let result = duplicate_resources(c, h)
@@ -1962,7 +1998,7 @@ fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static st
 /// the caller's quota used up. The channel is a new one: the first closed.
 fn slots_come_before_the_quota(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     let n = Call::HandleDuplicate.number();
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let result = channel_of(c, h).and_then(|ch| {
         let d = other.insert(Object::Channel(ch), Rights::DUPLICATE)?;
         let mut made = 0;
@@ -2015,7 +2051,7 @@ pub fn session_is_paid_by_the_caller(_: &Boot) -> Result<(), &'static str> {
 
 fn paid_sessions(owner: &Caller, client: &Caller) -> Result<(), &'static str> {
     let n = Call::HandleDuplicate.number();
-    let h = owner.created(Call::CreateChannel.number(), &[10])?;
+    let h = owner.created(Call::CreateChannel.number(), &[10, 0])?;
     let result = channel_of(owner, h).and_then(|ch| {
         // The client's table has its first page of blocks: the page below
         // is the pool's.
@@ -2071,7 +2107,7 @@ pub fn sessions_of_a_closed_channel_go(_: &Boot) -> Result<(), &'static str> {
 
 fn closed_sessions(c: &Caller, sessions: usize) -> Result<(), &'static str> {
     let n = Call::HandleDuplicate.number();
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let notify = u64::from(Rights::NOTIFY.0);
     let [idle, gone, posted] = [1, 2, 3].map(|label| c.created(n, &[h.0, notify, label, 10]));
     let (idle, gone, posted) = (idle?, gone?, posted?);
@@ -2110,7 +2146,7 @@ fn closed_sessions(c: &Caller, sessions: usize) -> Result<(), &'static str> {
 pub fn client_gone_when_the_holder_dies(_: &Boot) -> Result<(), &'static str> {
     let (sessions, processes) = (session::in_use(), process::in_use());
     with_caller(|c| {
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let result = channel_of(c, h).and_then(|ch| holder_dies(c, h, ch));
         c.close(h)?;
         result
@@ -2186,7 +2222,7 @@ fn child_of(c: &Caller, h: Handle) -> Result<NonNull<Process>, &'static str> {
 /// above a thread at 10 that is ready. The notification comes after it.
 pub fn teardown_level_is_at_least_the_notice(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let result = c
             .created(
                 Call::ProcessCreate.number(),
@@ -2218,7 +2254,7 @@ pub fn teardown_level_is_at_least_the_notice(_: &Boot) -> Result<(), &'static st
 pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     with_caller(|c| {
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let result = c
             .created(
                 Call::ProcessCreate.number(),
@@ -2255,7 +2291,7 @@ pub fn notices_to_a_dying_parent_go_with_its_channel(_: &Boot) -> Result<(), &'s
     let (processes, channels) = (process::in_use(), channel::in_use());
     let parent = Caller::new()?;
     let made = parent
-        .created(Call::CreateChannel.number(), &[10])
+        .created(Call::CreateChannel.number(), &[10, 0])
         .and_then(|h| {
             parent.created(
                 Call::ProcessCreate.number(),
@@ -2304,7 +2340,7 @@ fn with_timer(
     c: &Caller,
     body: impl FnOnce(Handle, Handle, NonNull<Timer>) -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let t = c.created(Call::TimerCreate.number(), &[h.0, 10]);
     let result = t.and_then(|t| {
         let result = timer_of(c, t).and_then(|tm| body(h, t, tm));
@@ -2341,13 +2377,13 @@ pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static s
 fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
     // First, while the caller's pool of timers has no page.
-    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let full = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let refused = fill_slots(c, full)
         .and_then(|()| with_used_quota(c, || c.fails(n, &[full.0, 30], Error::LimitReached)));
     c.close(full)?;
     cleanup::drain();
     refused?;
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let result = (|| {
         let timers = timers::in_use();
         with_used_quota(c, || {
@@ -2506,7 +2542,7 @@ const FIRST_FIRINGS: usize = 40;
 pub fn a_level_finishes_its_firing_first(_: &Boot) -> Result<(), &'static str> {
     let counts = (timers::in_use(), channel::in_use());
     with_caller(|c| {
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let mut made = [None; FIRST_FIRINGS];
         let result = channel_of(c, h).and_then(|ch| {
             let at = timer::now() + timer::clock().ns_to_ticks(1_000_000_000);
@@ -2560,7 +2596,7 @@ fn posted_of(made: &[Option<NonNull<Timer>>]) -> usize {
 /// changes, and nothing waits.
 pub fn call_counter_runs_out_as_bad_state(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let copies = channel_of(c, h).and_then(|ch| {
             Ok([
                 c.insert(Object::Channel(ch), Rights::SEND)?,
@@ -4230,7 +4266,7 @@ pub fn another_call_gives_the_child_of_process_create_up(_: &Boot) -> Result<(),
         let first = c.insert(Object::Resource, Rights::NONE)?;
         c.close(first)?;
         let n = Call::ProcessCreate.number();
-        let exit = c.created(Call::CreateChannel.number(), &[10])?;
+        let exit = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let channel = channel_of(c, exit)?;
         let (used, slots) = (
             process::quota(c.process).used(),
@@ -5683,7 +5719,7 @@ fn with_binding(
     let bindings = irq::in_use();
     with_caller(|c| {
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let copy = c.created(
             Call::HandleDuplicate.number(),
             &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
@@ -5922,7 +5958,7 @@ pub fn last_shell_reference_comes_with_the_binding_reclaim(_: &Boot) -> Result<(
     let c = Caller::new()?;
     let made = (|| {
         let r = c.insert(Object::Resource, Rights::DEVICE)?;
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
         let copy = c.created(
             Call::HandleDuplicate.number(),
             &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
@@ -6108,7 +6144,7 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::IrqBind.number();
     let r = c.insert(Object::Resource, Rights::DEVICE)?;
     // First, while the caller's pool of bindings has no page.
-    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let full = c.created(Call::CreateChannel.number(), &[10, 0])?;
     let refused = fill_slots(c, full).and_then(|()| {
         with_used_quota(c, || {
             c.fails(n, &[r.0, LINE.into(), full.0, 20, 0], Error::LimitReached)
@@ -6119,7 +6155,7 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
     refused?;
     let owner = Caller::new()?;
     let result = (|| {
-        let theirs = owner.created(Call::CreateChannel.number(), &[10])?;
+        let theirs = owner.created(Call::CreateChannel.number(), &[10, 0])?;
         let ch = channel_of(&owner, theirs)?;
         let h = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
         let args = [r.0, LINE.into(), h.0, 20, 0];
@@ -6172,7 +6208,7 @@ pub fn irq_bind_refuses_lines_past_the_distributor(_: &Boot) -> Result<(), &'sta
 /// chunk of the caller's table with no quota left for its page.
 fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {
     let r = c.insert(Object::Resource, Rights::DEVICE)?;
-    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let h = c.created(Call::CreateChannel.number(), &[10, 0])?;
     // The first chunk of the table fills: the next handle takes a page.
     for _ in 2..CHUNK {
         c.insert(Object::Resource, Rights::NONE)?;

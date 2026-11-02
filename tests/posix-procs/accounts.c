@@ -13,13 +13,23 @@ static long long cpu_ns(clockid_t clock) {
     return t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
-/* The role: computes until its process has run 50 ms, nearly all of it in
- * EL0 (#413): a loop of arithmetic with no call, and a look at the clock of
- * the process between rounds of it, a call each 100 000 turns. */
+static long long user_ns(void) {
+    struct rusage self;
+    if (getrusage(RUSAGE_SELF, &self) != 0) return -1;
+    return self.ru_utime.tv_sec * 1000000000LL + self.ru_utime.tv_usec * 1000LL;
+}
+
+/* The role: computes until its process has spent 50 ms in user mode (#413,
+ * #492): a loop of arithmetic with no call, and a look at the user time of
+ * the process between rounds of it, a call each 100 000 turns. Its start
+ * (the load of the program, its page faults) costs system time that grows
+ * with the slowness of the host (42 ms of 51 on a quiet Mac, more on a
+ * runner of ci), so the loop counts user time alone: a count of the whole
+ * CPU time would leave the user time the host's share of 50 ms. */
 static int burn50_role(void) {
-    long long began = cpu_ns(CLOCK_PROCESS_CPUTIME_ID);
+    long long began = user_ns();
     volatile unsigned long sink = 1;
-    while (cpu_ns(CLOCK_PROCESS_CPUTIME_ID) - began < 50000000LL) {
+    while (user_ns() - began < 50000000LL) {
         for (int i = 0; i < 100000; i++) sink = sink * 2862933555777941757UL + 3037000493UL;
     }
     return sink == 0;
@@ -34,8 +44,17 @@ static int nice_role(void) {
 }
 
 /* The role: ends with its scheduling as its status, policy * 64 + priority. */
+extern int stafeto_procs_lent(void);
+
 static int sched_role(void) {
     struct sched_param param;
+    /* The first thing the main thread of an image does is to move to the
+     * level its parent chose; the level it started at is not its own then. */
+    int lent = stafeto_procs_lent();
+    if (lent != 0) {
+        printf("posix-procs: schedchild works %d levels above its base\n", lent);
+        return 3;
+    }
     if (sched_getparam(0, &param) != 0) return 1;
     int policy = sched_getscheduler(0);
     if (policy < 0) return 2;
@@ -161,15 +180,20 @@ static void accounts(void) {
     }
     struct tms after;
     times(&after);
-    /* The child ran in EL0: its user time alone is the 50 ms, and its
-     * system time is less. */
+    /* The child computed 50 ms in EL0, and started and ended in the kernel:
+     * its user time is at least the 50 ms, and its system time (how much,
+     * the host decides) is counted apart from it, so that the two add up
+     * to the time of the children (a tick of 10 ms each way). */
     long user = (long)(after.tms_cutime - before.tms_cutime);
     long system = (long)(after.tms_cstime - before.tms_cstime);
-    if (user < 4 || system >= user)
+    if (user < 4 || system < 1)
         printf("posix-procs: accounts: the child ran 50 ms in EL0: cutime grew %ld ticks of 10 ms, cstime %ld\n",
                user, system);
     expect("times() counts the child's user time (cutime grew at least 4 ticks of 10 ms)", user >= 4, 1);
-    expect("times() counts the child's system time apart (cstime grew less than cutime)", system < user, 1);
+    expect("times() counts the child's system time apart (cstime grew)", system >= 1, 1);
+    long long counted = (long long)(user + system) * 10000;
+    expect("times() splits the time of the children as getrusage counts it (within 3 ticks)",
+           counted + 30000 >= children_after - children_before && counted <= children_after - children_before + 30000, 1);
 
     /* The nice value: set, read, inherited, shown by /proc. */
     errno = 0;

@@ -87,7 +87,7 @@ pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
     if let Some(rt::abi::Policy::Fifo) = policy {
         let _ = sys::thread_set_priority(&own, base, rt::abi::Policy::Fifo);
     }
-    let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(base).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
     let id = block.thread_id;
     let native = own.into_raw().0;
@@ -107,6 +107,7 @@ pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
     };
     block.thread.store(thread, Ordering::Relaxed);
     block.base_level.store(u32::from(base), Ordering::Relaxed);
+    block.timer_level.store(u32::from(base), Ordering::Relaxed);
     block.timer.store(timer.into_raw().0, Ordering::Relaxed);
     block.channel.store(channel.into_raw().0, Ordering::Relaxed);
     block.waker.store(0, Ordering::Relaxed);
@@ -151,10 +152,11 @@ fn attach_resources(own: u64) -> Result<(), i32> {
     let base = sys::thread_info(&thread).map_err(|_| EIO)?.base;
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync).
-    let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(base).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
     block.thread.store(own, Ordering::Relaxed);
     block.base_level.store(u32::from(base), Ordering::Relaxed);
+    block.timer_level.store(u32::from(base), Ordering::Relaxed);
     block.timer.store(timer.into_raw().0, Ordering::Relaxed);
     block.channel.store(channel.into_raw().0, Ordering::Release);
     crate::signals::attach()
@@ -192,8 +194,7 @@ pub unsafe fn attach_installed(tcb: *mut posix_thread::Tcb, id: u64) -> Result<(
 /// below the process's ceiling; EINVAL otherwise) through its own handle in
 /// its block, and makes it the thread's base level, which the lock of a
 /// bucket returns to. A Rust call for the measurements of rtbench 2
-/// (feature `rtbench`); the guest probes have it too. Not from a signal
-/// handler: a wait it interrupted keeps the old channel, which this closes.
+/// (feature `rtbench`); the guest probes have it too.
 #[cfg(any(feature = "rtbench", feature = "thread-probe"))]
 pub fn set_level(level: u8) -> Result<(), i32> {
     let block = own_block();
@@ -212,14 +213,15 @@ pub fn set_level(level: u8) -> Result<(), i32> {
 /// Moves the calling thread to base level `level` with `policy` (the level
 /// it runs at is its effective level: higher while waiters lend it theirs or
 /// a mutex it holds has a ceiling above it; in a section of the layer the
-/// end of the section sets it), and swaps the channel and the timer of its
-/// waits for ones at the new level, so that a wake does not lend it the old.
-/// `tail` puts it at the tail of the level (XSH 2.8.4).
+/// end of the section sets it). `tail` puts it at the tail of the level
+/// (XSH 2.8.4). Its channel is a wait channel, whose slots lend no level, so
+/// a wake leaves nothing of the old level behind; its timer follows the
+/// level at the next wait with a deadline (`posix_sync::wait_timer`).
 pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> {
     use posix_thread::flag;
     let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
-    let old = block.base_level.swap(u32::from(level), Ordering::Relaxed);
+    block.base_level.store(u32::from(level), Ordering::Relaxed);
     block.policy.store(policy as u64, Ordering::Relaxed);
     if block.flags.load(Ordering::SeqCst) & (flag::BUCKET | flag::RAISED_MASK) == 0 {
         let level = posix_thread::effective_level(block);
@@ -230,25 +232,7 @@ pub(crate) fn move_to(level: u8, policy: Policy, tail: bool) -> Result<(), i32> 
         };
         moved.map_err(|_| EINVAL)?;
     }
-    if old == u32::from(level) {
-        return Ok(());
-    }
-    // A wakeup through the channel or the timer works at their level until
-    // the next receive: they follow the thread's. Cancellation reaches the
-    // channel only through the block, which the swap keeps whole.
-    let channel = sys::channel_create(level).map_err(|_| EAGAIN)?;
-    let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
-    let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-    close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
-    close_raw(block.channel.swap(channel.into_raw().0, Ordering::SeqCst));
     Ok(())
-}
-
-/// Closes the handle `raw`, unless it is 0.
-fn close_raw(raw: u64) {
-    if raw != 0 {
-        drop(Handle::<rt::handle::Any>::from_raw(rt::abi::Handle(raw)));
-    }
 }
 
 /// Runs `f` on the block of every thread (crate::relibc's table).

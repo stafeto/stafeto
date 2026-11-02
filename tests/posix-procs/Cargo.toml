@@ -16,12 +16,12 @@ bench = false
 [features]
 math-probe = []
 park-probe = []
-fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
+fifo-probe = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire"]
 # The client at level 30 against the spawner at level 10 (steps_priority).
 # 64 asks wait for one shared object (steps_waiters): the pause of the maker.
 share-steps = ["dep:posix-platform", "posix-platform/map-probe"]
-priority-steps = ["dep:posix-abi", "posix-abi/thread-probe", "dep:rt"]
-fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire", "dep:rt"]
+priority-steps = ["dep:posix-abi", "posix-abi/thread-probe"]
+fifo-steps = ["dep:posix-abi", "posix-abi/fifo-probe", "dep:proto-init", "dep:proto-wire"]
 spawn-churn = []
 lifetime-rules = ["lifetime-probe"]
 lock-core-probe = ["lifetime-probe"]
@@ -39,7 +39,7 @@ stages = ["pending-open"]
 change-steps = ["stages", "posix-abi/change-probe"]
 names-probe = ["stages", "posix-abi/change-probe"]
 names-loss = ["stages", "posix-abi/change-probe"]
-pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:rt", "dep:posix-fs", "dep:posix-sync", "dep:entries"]
+pending-open = ["dep:posix-abi", "dep:proto-fs", "dep:proto-wire", "dep:posix-fs", "dep:posix-sync", "dep:entries"]
 loader-abort = ["files", "dep:proto-process", "dep:proto-loader", "dep:posix-fs"]
 image-gates = ["loader-abort"]
 image-info-probe = ["loader-abort"]
@@ -53,7 +53,7 @@ posix-abi = { path = "../../lib/posix-abi", optional = true }
 proto-fs = { path = "../../proto/fs", optional = true }
 proto-init = { path = "../../proto/init", optional = true }
 proto-wire = { path = "../../proto/wire", optional = true }
-rt = { path = "../../lib/rt", optional = true }
+rt = { path = "../../lib/rt" }
 proto-process = { path = "../../proto/process", optional = true }
 proto-loader = { path = "../../proto/loader", optional = true }
 posix-fs = { path = "../../lib/posix-fs", optional = true }

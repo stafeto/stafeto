@@ -31,7 +31,7 @@ unsafe extern "C" fn churner(argument: *mut c_void) -> *mut c_void {
     let seed = argument as usize;
     let fd = FD.load(Ordering::SeqCst) as i32;
     // Below main, which wakes to signal them while they churn.
-    if threads::set_level(20).is_err() {
+    if !lower_to(20) {
         ERRORS.fetch_add(1, Ordering::SeqCst);
     }
     for round in 0..ROUNDS {

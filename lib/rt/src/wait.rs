@@ -21,9 +21,11 @@ use abi::{Error, Source};
 /// The timer's slot has the base priority of the waiting thread: an
 /// expiry then wakes the thread at its own level, ahead of the threads
 /// below it, and lifts it no higher until its next receive (spec 6.6). A
-/// thread that changes its base priority makes a new `Waiter`; one that
-/// lowers itself after a notification lifted it first ends the lift with
-/// a receive that does not wait (sys::try_receive).
+/// thread that changes its base priority makes a new `Waiter`. A service
+/// that lowers itself after a notification lifted it first ends the lift
+/// with a receive that does not wait (sys::try_receive); a thread that
+/// waits on a wait channel (`sys::channel_create_wait`) is never lifted,
+/// and has nothing to end.
 ///
 /// After any end of a wait, Expired or Got, a bit of this timer may still
 /// come: the kernel no longer arms the timer, but its expiry may lie in

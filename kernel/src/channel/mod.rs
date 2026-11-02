@@ -61,6 +61,9 @@ pub use source::{Owner, Source, notify};
 const CLOSE_PORTION: usize = 8;
 
 pub struct Channel {
+    /// Its slots lend their priority to the receiver (spec 6.6); false in
+    /// a wait channel (spec 6.5). Fixed at its creation.
+    lends: bool,
     /// The slot of label 0.
     slot: Slot<Owner>,
     /// Slots with something posted and requests, or receivers that wait;
@@ -99,14 +102,27 @@ const _: () = assert!(core::mem::size_of::<Channel>() <= 1024);
 /// Channels whose slots have not gone back.
 static LIVE: Live = Live::new();
 
+/// A channel of `payer` whose slots lend their priority (the tests').
+#[cfg(feature = "ktest")]
+pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>, Error> {
+    create_with(payer, priority, true)
+}
+
 /// A channel of `payer`, the process of the thread that makes it, whose
 /// slot of label 0 has `priority`: 1-63 and no higher than the payer's
-/// ceiling, as the call checked. The caller gets the first reference. The
-/// channel takes a slot in the payer's pool of channels, whose quota pays
-/// for a page when the pool grows (spec 7.8), and holds the payer's shell.
-/// NO_MEMORY when the quota falls short.
-pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>, Error> {
+/// ceiling, as the call checked. Its slots lend their priority to the
+/// receiver (spec 6.6) when `lends`, and do not in a wait channel (spec
+/// 6.5). The caller gets the first reference. The channel takes a slot in
+/// the payer's pool of channels, whose quota pays for a page when the pool
+/// grows (spec 7.8), and holds the payer's shell. NO_MEMORY when the quota
+/// falls short.
+pub fn create_with(
+    payer: NonNull<Process>,
+    priority: u8,
+    lends: bool,
+) -> Result<NonNull<Channel>, Error> {
     let channel = Channel {
+        lends,
         slot: Slot::new(priority, Owner::Channel),
         queue: Queue::new(),
         receivers: 0,
@@ -197,6 +213,14 @@ pub fn is_closed(c: NonNull<Channel>) -> bool {
     // SAFETY: the caller holds a reference to the channel; only the field
     // is read.
     unsafe { (*c.as_ptr()).closed }
+}
+
+/// Whether the slots of `c`, which the caller holds, lend their priority
+/// to the receiver (spec 6.6): false in a wait channel (spec 6.5).
+fn lends(c: NonNull<Channel>) -> bool {
+    // SAFETY: the caller holds a reference to the channel; only the field
+    // is read, and it never changes.
+    unsafe { (*c.as_ptr()).lends }
 }
 
 /// object_info CHANNEL of `c`, which the caller holds (spec 11): the slots

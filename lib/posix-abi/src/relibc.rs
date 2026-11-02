@@ -152,12 +152,12 @@ fn pinned(index: usize) -> bool {
 #[cfg(feature = "thread-probe")]
 static PIN_WAKES: AtomicUsize = AtomicUsize::new(0);
 
-/// When the last of those releases woke, and when a wait of `reserve` for
-/// a free place last returned, in nanoseconds.
+/// When the wake of the last of those releases returned, in nanoseconds.
 #[cfg(feature = "thread-probe")]
 static PIN_RELEASED_AT: AtomicU64 = AtomicU64::new(0);
+/// The deadline of the last wait of `reserve` that ended by its deadline.
 #[cfg(feature = "thread-probe")]
-static RESERVE_WOKE_AT: AtomicU64 = AtomicU64::new(0);
+static TIMED_OUT_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "thread-probe")]
 fn probe_now() -> u64 {
@@ -177,14 +177,16 @@ pub fn probe_pin_wakes() -> usize {
     PIN_WAKES.load(Ordering::Relaxed)
 }
 
-/// Nanoseconds from the last wake of `pin_released` to the next return of
-/// the wait of `reserve` (0 when that wait did not return after the wake:
-/// `reserve` found the place without waiting again).
+/// Whether the last release of a pin met a wait of `reserve` that then
+/// ended by its deadline: a wait whose deadline lay after the wake call
+/// returned was not woken by it. A wait that timed out before the wake
+/// call has an earlier deadline and does not count. When the host delays
+/// the releasing thread between `futex_wake` and `probe_now` for longer than
+/// the deadline `D`, a wake lost in that round is not noticed; a wake that
+/// is lost every time is caught by the other rounds.
 #[cfg(feature = "thread-probe")]
-pub fn probe_pin_wake_delay() -> u64 {
-    let released = PIN_RELEASED_AT.load(Ordering::SeqCst);
-    let woke = RESERVE_WOKE_AT.load(Ordering::SeqCst);
-    woke.saturating_sub(released)
+pub fn probe_pin_wake_missed() -> bool {
+    TIMED_OUT_DEADLINE.load(Ordering::SeqCst) > PIN_RELEASED_AT.load(Ordering::SeqCst)
 }
 
 /// The release of the last pin of place `index`: wakes `reserve` when the
@@ -196,10 +198,11 @@ fn pin_released(index: usize) {
         #[cfg(feature = "thread-probe")]
         {
             PIN_WAKES.fetch_add(1, Ordering::Relaxed);
-            PIN_RELEASED_AT.store(probe_now(), Ordering::SeqCst);
         }
         FREE_EPOCH.fetch_add(1, Ordering::SeqCst);
         posix_sync::futex_wake(&FREE_EPOCH, u32::MAX);
+        #[cfg(feature = "thread-probe")]
+        PIN_RELEASED_AT.store(probe_now(), Ordering::SeqCst);
     }
 }
 
@@ -754,7 +757,7 @@ fn exits() -> Result<u64, i32> {
         return Ok(known);
     }
     let ceiling = crate::ceiling().map_err(|_| EIO)?;
-    let channel = sys::channel_create(ceiling).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(ceiling).map_err(|_| EAGAIN)?;
     let raw = channel.raw().0;
     match EXITS.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
@@ -808,11 +811,13 @@ fn reserve() -> Result<usize, i32> {
             posix_sync::CLOCK_MONOTONIC,
             Some(deadline),
         ) {
-            Ok(_) | Err(EAGAIN | ETIMEDOUT) => {}
+            Ok(_) | Err(EAGAIN) => {}
+            Err(ETIMEDOUT) => {
+                #[cfg(feature = "thread-probe")]
+                TIMED_OUT_DEADLINE.fetch_max(deadline, Ordering::SeqCst);
+            }
             Err(_) => return Err(EAGAIN),
         }
-        #[cfg(feature = "thread-probe")]
-        RESERVE_WOKE_AT.store(probe_now(), Ordering::SeqCst);
     }
 }
 
@@ -891,7 +896,7 @@ pub unsafe fn create(
     let policy_raw = policy as u64;
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
-    let Ok(channel) = sys::channel_create(base) else {
+    let Ok(channel) = sys::channel_create_wait(base) else {
         undo(0, 0, 0, 0);
         return Err(EAGAIN);
     };
@@ -934,6 +939,7 @@ pub unsafe fn create(
             .mask
             .store(me.mask.load(Ordering::SeqCst), Ordering::Relaxed);
         block.base_level.store(u32::from(base), Ordering::Relaxed);
+        block.timer_level.store(u32::from(base), Ordering::Relaxed);
         block.thread.store(own.into_raw().0, Ordering::Relaxed);
         block.timer.store(timer.into_raw().0, Ordering::Relaxed);
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);

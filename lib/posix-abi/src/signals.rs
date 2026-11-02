@@ -758,6 +758,12 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
         RETURNING.fetch_or(returning, Ordering::SeqCst);
         guard
     });
+    // A deferral leaves the waits of IPC interruptible, and a request of an
+    // entry that is pending (a stopper asks for one) interrupts the send of
+    // each return again for good, as the entry cannot run under the
+    // deferral. With the entries masked the send blocks, and the request
+    // waits for the end of the deferral.
+    let was_masked = guard.as_ref().map(|_| rt::upcall::mask().unwrap_or(true));
     while back != 0 {
         let bit = back.isolate_lowest_one();
         back &= !bit;
@@ -785,6 +791,11 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
     route();
     if guard.is_some() {
         RETURNING.fetch_and(!returning, Ordering::SeqCst);
+    }
+    if was_masked == Some(false) {
+        // SAFETY: the entries were open when the call began; with the
+        // deferral still held a pending request enters when it ends.
+        let _ = unsafe { rt::upcall::enable() };
     }
     drop(guard);
     failure.map_or(Ok(()), Err)
@@ -1333,7 +1344,10 @@ fn wait(
     };
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    // A handler that ran in the loop may have made the timer again
+    // (posix_sync::wait_timer): the number is read at each use.
+    posix_sync::wait_timer(block);
+    let timer = || Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
     let result = loop {
         if let Some(signal) = take() {
             break Ok(signal);
@@ -1347,7 +1361,7 @@ fn wait(
                 drop(guard);
                 break Err(EAGAIN);
             }
-            let _ = sys::timer_set(&timer, deadline);
+            let _ = sys::timer_set(&timer(), deadline);
         }
         let got = sys::receive(&channel);
         drop(guard);
@@ -1366,7 +1380,7 @@ fn wait(
         }
     };
     if deadline.is_some() {
-        let _ = sys::timer_cancel(&timer);
+        let _ = sys::timer_cancel(&timer());
     }
     leave();
     result
@@ -1453,7 +1467,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     use rt::abi::ThreadState;
     let level = own().base_level.load(Ordering::Relaxed) as u8;
     let me = own() as *const Block as usize;
-    let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(level.max(1)).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
     while !STOP.try_begin(me, channel.raw().0) {
         STOP.wait_for_claim(
@@ -1692,6 +1706,8 @@ pub(crate) fn probe_window(site: u32) {
     while parks() == before && !rt::time::reached(end) {
         let _ = sys::yield_now();
     }
+    // The creator has seen the flag and forked: the next case starts clear.
+    WINDOW_REACHED.store(0, Ordering::SeqCst);
 }
 
 /// The probe of a park with a request pending: the calling thread defers
