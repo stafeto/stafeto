@@ -697,6 +697,7 @@ const POSIX_SO_PROGRAMS: [ImageProgram; 10] = {
         POSIX_STACK_SIZE,
         &["procfs"],
     );
+    programs[6].3 = &["small-pieces", "stack-depth"];
     programs
 };
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
@@ -766,7 +767,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
             "share-steps",
         ],
     ),
-    ("loader", "loader", 0, &["steps"]),
+    ("loader", "loader", 0, &["steps", "stack-depth"]),
     ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
     ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
@@ -4772,6 +4773,7 @@ fn posix_so_run(icount: bool) -> Result<(), String> {
         "init: posix-procs ended: exit code 0, not restarted",
     )?;
     qemu::expect_marker(&outcome, "posix-so: dynamic programs on libc.so ok")?;
+    check_loader_stack(&outcome.lines)?;
     for line in outcome.lines.iter().filter(|l| l.contains("spawn to main")) {
         println!("{line}");
     }
@@ -5716,6 +5718,41 @@ fn check_loader_steps(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The stack of the loaders (feature `stack-depth` of services/loader): each
+/// reports how deep it went, and the deepest keeps `LOADER_STACK_MARGIN` bytes
+/// of the stack free, because a stack that overflows writes the loader's data
+/// below it. At least one report has to exist.
+const LOADER_STACK_MARGIN: u64 = 2048;
+
+fn check_loader_stack(lines: &[String]) -> Result<(), String> {
+    let mut deepest = 0;
+    let mut size = 0;
+    let mut reports = 0;
+    for line in lines {
+        let Some(rest) = line.strip_prefix("loader stack: used ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [used, "of", total] = words.as_slice() else {
+            continue;
+        };
+        let (Ok(used), Ok(total)) = (used.parse::<u64>(), total.parse::<u64>()) else {
+            continue;
+        };
+        (deepest, size, reports) = (deepest.max(used), total, reports + 1);
+    }
+    if reports == 0 {
+        return Err("no loader reported the depth of its stack".into());
+    }
+    println!("loader stack: {deepest} of {size} bytes at most over {reports} loaders");
+    if deepest + LOADER_STACK_MARGIN > size {
+        return Err(format!(
+            "a loader's stack went {deepest} of {size} bytes deep, less than {LOADER_STACK_MARGIN} free"
+        ));
+    }
+    Ok(())
+}
+
 /// The regions a loader holds in the forks of the full map, the floor of the
 /// report of `Regions` (`steps::FLOOR` of services/loader): the parent of
 /// the role fills the map with one-page mappings until it is full
@@ -6392,6 +6429,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
         ));
     }
     check_loader_steps(&outcome.lines)?;
+    check_loader_stack(&outcome.lines)?;
     // The five methods of the change jobs (44 to 48) ran among the crowd, and
     // the longest of each stays under term B like every step of the service.
     for kind in 44..=48 {

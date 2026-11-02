@@ -13,7 +13,7 @@
 use bootimg::BootImage;
 use bootimg::elf::{self, Layout};
 use bootimg::{PAGE_SIZE, Part};
-use proto_loader::{LOADER_BASE, LOADER_END};
+use proto_loader::{LOADER_BASE, LOADER_END, LOADER_STACK_PAGES};
 use rt::abi::{Access, Error, Policy};
 use rt::handle::{Handle, Memory, Process, Thread};
 use rt::{loader, sys};
@@ -21,7 +21,7 @@ use rt::{loader, sys};
 /// The name of the loader's file in the boot image.
 pub const FILE: &str = "loader.elf";
 /// The stack of the loader, in pages, above its data.
-const STACK_PAGES: u64 = 5;
+const STACK_PAGES: u64 = LOADER_STACK_PAGES;
 /// The pages of the loader's data and stack at most: the service pays for
 /// six pages a loader, LOADERS of them. The stack is five pages since the
 /// dynamic path (spec 2, 3.12.4): the deepest chain of the loader used 15 376

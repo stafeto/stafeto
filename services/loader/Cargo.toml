@@ -28,6 +28,9 @@ small-pieces = []
 # The steps of a copy with their ticks (rt::println; xtask process-steps,
 # under -icount).
 steps = []
+# The deepest the loader's stack went, printed at the jump (xtask process-steps
+# and posix-so check it).
+stack-depth = []
 
 [dependencies]
 proto-clock = { path = "../../proto/clock" }

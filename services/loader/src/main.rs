@@ -145,6 +145,30 @@ mod steps {
     }
 }
 
+/// The bytes of the loader's stack that were ever written, printed on the
+/// console of the program it starts (feature `stack-depth`): the stack lies
+/// above the loader's data, `data_len` bytes from `data` all told, and starts
+/// zero.
+#[cfg(feature = "stack-depth")]
+fn report_stack_depth(data: u64, data_len: u64, console: u64) {
+    let top = data + data_len;
+    let mut at = top - pl::LOADER_STACK_PAGES * PAGE;
+    // SAFETY: the stack pages are mapped for the loader's life.
+    while at < top && unsafe { (at as *const u64).read_volatile() } == 0 {
+        at += 8;
+    }
+    if console != 0 {
+        rt::console::set(core::mem::ManuallyDrop::into_inner(
+            rt::handle::Handle::borrowed(abi::Handle(console)),
+        ));
+        rt::println!(
+            "loader stack: used {} of {}",
+            top - at,
+            pl::LOADER_STACK_PAGES * PAGE
+        );
+    }
+}
+
 /// The kinds of the steps of a copy.
 mod kind {
     pub const MEM_CREATE: usize = 1;
@@ -1479,7 +1503,6 @@ fn map_segments(
 
 /// The layout of the program in `image`, read from the first page of the
 /// file (the page is on this call's stack alone, not the caller's).
-#[inline(never)]
 fn program_layout(image: &Handle<Channel>, size: u64) -> Result<elf::Layout, u32> {
     let mut head = [0; PAGE as usize];
     let read = read_at(image, 0, &mut head[..size.min(PAGE) as usize])?;
@@ -1487,7 +1510,6 @@ fn program_layout(image: &Handle<Channel>, size: u64) -> Result<elf::Layout, u32
 }
 
 /// The layout of libc.so in `session`, as `program_layout`.
-#[inline(never)]
 fn library_layout(session: &Handle<Channel>, size: u64) -> Result<elf::Library, u32> {
     let mut head = [0; PAGE as usize];
     let read = read_at(session, 0, &mut head[..size.min(PAGE) as usize])?;
@@ -1557,7 +1579,6 @@ const DYNAMIC_MAX: usize = 1024;
 
 /// The module of a file mapped by `load`: its segments, its `PT_DYNAMIC`
 /// parsed and every table it names checked.
-#[inline(never)]
 fn module(
     role: dynlink::Role,
     segments: &[Load; 3],
@@ -2080,6 +2101,8 @@ fn finish(
             Some(d.library)
         }
     };
+    #[cfg(feature = "stack-depth")]
+    report_stack_depth(own.data.0, own.data.1, handles[Slot::Console as usize]);
     let staging = (block_len as u64).next_multiple_of(PAGE);
     drop((
         image,
@@ -2138,6 +2161,8 @@ fn finish_fork(
     if pl::write_transfer(out, handles, scratch.map()).is_err() {
         return GAVE_UP;
     }
+    #[cfg(feature = "stack-depth")]
+    report_stack_depth(own.data.0, own.data.1, handles[Slot::Console as usize]);
     drop((own.files, own.clock, own.identity, start, session));
     // SAFETY: the scratch is read no more.
     let _ = unsafe {
