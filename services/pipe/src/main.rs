@@ -967,7 +967,7 @@ impl PipeService {
                 let named = &self.named;
                 // A waiter for a named semaphore stands in the table of the
                 // counted waits alone (`Ipc::named_balance`).
-                let listed = if matches!(block, Block::Named(_)) {
+                let listed = if matches!(block, Block::Named(_) | Block::Addr(_)) {
                     Ok(())
                 } else {
                     self.pipes.wait(queue, (label, key), |(l, k)| {

@@ -241,8 +241,15 @@ fn mmap0(
             back: Some(file.back),
             may_write: file.may_write,
             dirty: file.writable,
+            wait_key: 0,
         },
-        None => Source::anonymous(),
+        None => Source {
+            // An anonymous shared object is named for waits by address
+            // between the processes that show it: the PID of its maker and
+            // a count of that process's (PIDs are not used again).
+            wait_key: if shared { next_wait_key() } else { 0 },
+            ..Source::anonymous()
+        },
     };
     // An object that is there already is mapped as asked at once; a new one
     // is written first (zeros, or the file) and gets its access after.
@@ -532,6 +539,61 @@ pub(crate) fn is_unmapped(address: usize) -> bool {
             Some(Page::Free | Page::Unbacked)
         )
     })
+}
+
+/// The key of the next anonymous shared object of this process.
+fn next_wait_key() -> u64 {
+    static COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed);
+    (u64::from(crate::process::getpid() as u32) << 32) | u64::from(count)
+}
+
+/// The word of shared memory at `address` as the service names it for waits
+/// by address: the kind of the key (0 a file, 1 anonymous memory), the key
+/// and the offset of the word in the object. None for an address in no
+/// shared mapping, and for an object without a key.
+pub(crate) fn wait_word(address: usize) -> Option<(u64, u64, u64)> {
+    heap(|state| {
+        let index = state.map.find(address)?;
+        let piece = state.map.piece(index);
+        let object = state.map.object(piece.object());
+        if !object.shared {
+            return None;
+        }
+        let in_object = (piece.offset() * PAGE + (address - piece.address)) as u64;
+        match object.back {
+            Some(back) => Some((0, back.key, back.offset() + in_object)),
+            None => (object.wait_key != 0).then_some((1, object.wait_key, in_object)),
+        }
+    })
+}
+
+/// A wait by address on a word of shared memory through the pipe service
+/// (`posix_sync::set_remote`).
+pub(crate) fn wait_remote(
+    address: usize,
+    still: &dyn Fn() -> bool,
+    deadline: Option<u64>,
+) -> posix_sync::Remote {
+    use posix_sync::Remote;
+    let Some(word) = wait_word(address) else {
+        return Remote::Unavailable;
+    };
+    match crate::ipc::wait_address(word, deadline.unwrap_or(crate::ipc::NO_DEADLINE), still) {
+        Ok(()) => Remote::Woken,
+        Err(EINTR) => Remote::Entry,
+        Err(ETIMEDOUT) => Remote::TimedOut,
+        // The word changed (the caller knows), or the table of waiters of
+        // the service is full.
+        Err(_) => Remote::Unavailable,
+    }
+}
+
+/// A wake by address on a word of shared memory; None for a word without
+/// a key (`posix_sync::set_remote`).
+pub(crate) fn wake_remote(address: usize, count: u32) -> Option<u32> {
+    let word = wait_word(address)?;
+    Some(crate::ipc::wake_address(word, count))
 }
 
 /// Whether `address` lies in a mapping other processes share (MAP_SHARED):

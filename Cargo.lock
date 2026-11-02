@@ -151,6 +151,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-gpu",
+ "proto-init",
+ "proto-input",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
@@ -681,6 +693,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-input"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-loader"
 version = "0.1.0"
 dependencies = [
@@ -1030,6 +1050,20 @@ dependencies = [
  "abi",
  "proto-gpu",
  "proto-init",
+ "proto-input",
+ "proto-wire",
+ "rt",
+ "virtio-drivers",
+ "virtio-mmio",
+]
+
+[[package]]
+name = "virtio-input"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-input",
  "proto-wire",
  "rt",
  "virtio-drivers",

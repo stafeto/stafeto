@@ -28,6 +28,7 @@ steps = ["rt/step-stats"]
 abi = { path = "../../lib/abi" }
 proto-gpu = { path = "../../proto/gpu" }
 proto-init = { path = "../../proto/init" }
+proto-input = { path = "../../proto/input" }
 proto-wire = { path = "../../proto/wire" }
 virtio-mmio = { path = "../../lib/virtio-mmio" }
 

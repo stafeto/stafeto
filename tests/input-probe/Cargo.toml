@@ -1,0 +1,28 @@
+[package]
+name = "input-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the input service"
+
+[[bin]]
+name = "input-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-gpu = { path = "../../proto/gpu" }
+proto-input = { path = "../../proto/input" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }
+
+# `quick`: the run under -icount, whose virtual time passes at once and
+# whose keys the host sends while the probe polls: the probe checks
+# nothing that depends on timing, and the host measures the service's
+# steps.
+[features]
+quick = []

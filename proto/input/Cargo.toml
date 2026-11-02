@@ -1,0 +1,17 @@
+[package]
+name = "proto-input"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the input service of stafeto (services/virtio-input): its method numbers, its codes and the events of the keyboard"
+
+[lib]
+bench = false
+
+[dependencies]
+proto-wire = { path = "../wire" }
+
+[dev-dependencies]
+abi = { path = "../../lib/abi" }

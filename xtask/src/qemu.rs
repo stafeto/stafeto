@@ -189,6 +189,13 @@ pub const GPU: &[&str] = &[
     "virtio-gpu-device,bus=virtio-mmio-bus.23,xres=640,yres=400",
 ];
 
+/// The Virtio keyboard of the input service (services/virtio-input), on
+/// the transport init's table names, 15 (`table/input.rs`): address
+/// 0xa001e00, INTID 63, on the page 0xa001000 with the empty transports 8 to
+/// 14. The monitor's `sendkey` reaches it when no other device takes keys
+/// (`-display none`). The images that run the service add these arguments.
+pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mmio-bus.15"];
+
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory,
@@ -1431,6 +1438,18 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert_ne!((0x0a00_0000 + 0x200 * 31) / 0x1000, 0x0a00_2e00 / 0x1000);
         // The device goes on a modern transport, as every run has it.
         assert!(ENTROPY.contains(&"virtio-mmio.force-legacy=false"));
+    }
+
+    #[test]
+    fn the_keyboard_sits_on_the_transport_init_names() {
+        // Transport 15 is 0xa001e00 and INTID 63, on a page of its own
+        // among the tables' windows: not the display service's (23), not
+        // the entropy driver's (31).
+        assert!(KEYBOARD.contains(&"virtio-keyboard-device,bus=virtio-mmio-bus.15"));
+        assert_eq!(0x0a00_0000 + 0x200 * 15, 0x0a00_1e00);
+        assert_eq!(48 + 15, 63);
+        assert_ne!(0x0a00_1e00 / 0x1000, 0x0a00_2e00 / 0x1000);
+        assert_ne!(0x0a00_1e00 / 0x1000, (0x0a00_0000 + 0x200 * 31) / 0x1000);
     }
 
     #[test]
