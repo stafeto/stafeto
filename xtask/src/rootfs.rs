@@ -1675,8 +1675,7 @@ mod tests {
         let big = Source::Variant {
             program: "p",
             tag: "big",
-            // A file of its own: equal bytes would be one file.
-            extra: 4096x1000,
+            extra: 0x1000,
         };
         let grown = big.bytes(|_| Ok(elf.clone())).unwrap();
         assert_eq!(
