@@ -25,6 +25,8 @@
 #include <unistd.h>
 
 #define PAGE 4096UL
+static const char *scratch = "/tmp/posix-map-file";
+static int fill_file(size_t len);
 static int failures;
 static sigjmp_buf jump;
 static volatile sig_atomic_t faults;
@@ -94,8 +96,8 @@ static int jump_faults(char *at) {
 
 /* A page without access stops a read and a write with SIGSEGV, SEGV_ACCERR
  * and the faulting address; an unmapped page says SEGV_MAPERR. A jump to a
- * page of data is a fault too, whatever its access (PROT_EXEC is refused,
- * so no page of the map is executable), at the address jumped to. */
+ * page of data is a fault too, whatever its access (a page is executable
+ * only after mprotect to PROT_EXEC), at the address jumped to. */
 static void none_page_faults(void) {
     struct sigaction info = {.sa_sigaction = on_fault_info, .sa_flags = SA_SIGINFO}, old;
     check("none: sigaction", sigaction(SIGSEGV, &info, &old) == 0);
@@ -218,15 +220,16 @@ static void errors(void) {
     errno = 0;
     check("mprotect off a page is EINVAL", p && mprotect(p + 1, PAGE, PROT_READ) == -1 && errno == EINVAL);
     errno = 0;
-    check("mprotect with PROT_EXEC is EACCES",
-          p && mprotect(p, PAGE, PROT_READ | PROT_EXEC) == -1 && errno == EACCES);
+    check("mprotect with write and exec is ENOTSUP",
+          p && mprotect(p, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC) == -1 && errno == ENOTSUP);
     errno = 0;
     check("mprotect past the mapping is ENOMEM",
           p && mprotect(p, 64 * PAGE, PROT_READ) == -1 && errno == ENOMEM);
     check("the mapping is unchanged", p && !write_faults(p));
     errno = 0;
-    check("mmap with PROT_EXEC is EACCES",
-          mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EACCES);
+    check("mmap with write and exec is ENOTSUP",
+          mmap(NULL, PAGE, PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+              && errno == ENOTSUP);
     errno = 0;
     check("mmap with no kind is EINVAL",
           mmap(NULL, PAGE, PROT_READ, MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == EINVAL);
@@ -234,6 +237,156 @@ static void errors(void) {
     check("munmap off a page is EINVAL", p && munmap(p + 1, PAGE) == -1 && errno == EINVAL);
     check("munmap of nothing is fine", munmap((void *)0x70000000UL, PAGE) == 0);
     if (p) munmap(p, 2 * PAGE);
+}
+
+/* Executable memory (#384): code written through a writable page and run
+ * after mprotect to PROT_READ | PROT_EXEC, the cycle again with other code,
+ * code in a private mapping of a file, a forked child, the refusals
+ * (ENOTSUP for write and exec, and for a shared mapping with exec), and a
+ * write to an executable page. */
+#define CODE_42 0x52800540u /* mov w0, #42 */
+#define CODE_7 0x528000e0u  /* mov w0, #7 */
+#define CODE_RET 0xd65f03c0u /* ret */
+
+typedef int (*code_fn)(void);
+
+static void put_code(char *at, uint32_t first) {
+    uint32_t words[2] = {first, CODE_RET};
+    memcpy(at, words, sizeof words);
+}
+
+static volatile int bus_signal, bus_code;
+static void *volatile bus_addr;
+
+static void on_bus(int signal, siginfo_t *info, void *context) {
+    (void)context;
+    bus_signal = signal;
+    bus_code = info->si_code;
+    bus_addr = info->si_addr;
+    siglongjmp(jump, 1);
+}
+
+static void forget_bus(void) {
+    bus_signal = bus_code = 0;
+    bus_addr = NULL;
+}
+
+/* 1 when the read (or the write) of the byte raises SIGBUS with BUS_ADRERR
+ * and `at` as the address. */
+static int bus_faults(volatile char *at, int write) {
+    forget_bus();
+    if (sigsetjmp(jump, 1)) return bus_signal == SIGBUS && bus_code == BUS_ADRERR && bus_addr == (void *)at;
+    if (write) *at = 1;
+    else (void)*at;
+    return 0;
+}
+
+static void exec_memory(void) {
+    struct sigaction info = {.sa_sigaction = on_fault_info, .sa_flags = SA_SIGINFO}, old;
+    check("exec: sigaction", sigaction(SIGSEGV, &info, &old) == 0);
+    char *p = anon(2 * PAGE, PROT_READ | PROT_WRITE);
+    check("exec: mmap", p != NULL);
+    if (!p) return;
+    put_code(p, CODE_42);
+    check("exec: mprotect to read and exec", mprotect(p, PAGE, PROT_READ | PROT_EXEC) == 0);
+    check("exec: the code runs", ((code_fn)(void *)p)() == 42);
+    forget_fault();
+    check("exec: a write to the code faults", write_faults(p + 64));
+    check("exec: the write says ACCERR and its address", fault_seen(SEGV_ACCERR, p + 64));
+    check("exec: the code can be read", !read_faults(p));
+    /* Again: back to writable, other code, executable. */
+    check("exec: mprotect to writable", mprotect(p, PAGE, PROT_READ | PROT_WRITE) == 0);
+    put_code(p, CODE_7);
+    check("exec: mprotect to exec again", mprotect(p, PAGE, PROT_EXEC) == 0);
+    check("exec: the new code runs", ((code_fn)(void *)p)() == 7);
+    /* A child runs the same code at the same address. */
+    pid_t child = fork();
+    if (child == 0) {
+        int bad = 0;
+        if (((code_fn)(void *)p)() != 7) bad |= 1;
+        /* The copy of a code page is mapped without write: back to
+         * writable is refused in a child (a deviation, posix-coverage.md). */
+        if (mprotect(p, PAGE, PROT_READ | PROT_WRITE) != -1 || errno != EACCES) bad |= 2;
+        _exit(bad);
+    }
+    int status = 0;
+    check("exec: fork", child > 0 && waitpid(child, &status, 0) == child);
+    check("exec: the child ran the code", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status))
+        printf("posix-map: exec child bits %d\n", WEXITSTATUS(status));
+    /* The refusals. */
+    errno = 0;
+    check("exec: write and exec to mprotect is ENOTSUP",
+          mprotect(p + PAGE, PAGE, PROT_WRITE | PROT_EXEC) == -1 && errno == ENOTSUP);
+    errno = 0;
+    check("exec: read, write and exec to mprotect is ENOTSUP",
+          mprotect(p + PAGE, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC) == -1 && errno == ENOTSUP);
+    errno = 0;
+    check("exec: write and exec to mmap is ENOTSUP",
+          mmap(NULL, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+              && errno == ENOTSUP);
+    errno = 0;
+    check("exec: a shared mapping with exec is ENOTSUP",
+          mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED
+              && errno == ENOTSUP);
+    check("exec: the refusals changed nothing", ((code_fn)(void *)p)() == 7);
+    /* Executable at once: success and readable (zeros are not code). */
+    char *q = mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check("exec: mmap read and exec at once", q != MAP_FAILED);
+    if (q != MAP_FAILED) {
+        check("exec: and it reads zeros", !read_faults(q) && q[0] == 0);
+        munmap(q, PAGE);
+    }
+    check("exec: restore the handler", sigaction(SIGSEGV, &old, NULL) == 0);
+    munmap(p, 2 * PAGE);
+
+    /* A private mapping of a file (mode 0600, no x) with code in it. */
+    int fd = open(scratch, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    check("exec: create the file", fd >= 0);
+    if (fd < 0) return;
+    char page[PAGE] = {0};
+    put_code(page, CODE_42);
+    check("exec: write the file", write(fd, page, PAGE) == (ssize_t)PAGE);
+    char *f = mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+    check("exec: mmap the file with exec", f != MAP_FAILED);
+    if (f != MAP_FAILED) {
+        check("exec: the code of the file runs", ((code_fn)(void *)f)() == 42);
+        munmap(f, PAGE);
+    }
+    errno = 0;
+    check("exec: a shared mapping of the file with exec is ENOTSUP",
+          mmap(NULL, PAGE, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0) == MAP_FAILED && errno == ENOTSUP);
+    close(fd);
+    unlink(scratch);
+}
+
+/* A reference to a whole page past the end of a mapped file is SIGBUS with
+ * BUS_ADRERR (XSH mmap); the tail of the last page reads zeros. */
+static void past_end(void) {
+    struct sigaction bus = {.sa_sigaction = on_bus, .sa_flags = SA_SIGINFO}, old;
+    check("bus: sigaction", sigaction(SIGBUS, &bus, &old) == 0);
+    int fd = fill_file(PAGE / 2);
+    check("bus: create", fd >= 0);
+    if (fd < 0) return;
+    for (int kind = 0; kind < 2; kind++) {
+        const char *what = kind ? "shared" : "private";
+        char *f = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE, kind ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+        check("bus: mmap", f != MAP_FAILED);
+        if (f == MAP_FAILED) continue;
+        char text[64];
+        snprintf(text, sizeof text, "bus: %s: the file reads", what);
+        check(text, f[0] == 'a' && f[PAGE / 2 - 1] == (char)('a' + (PAGE / 2 - 1) % 26));
+        snprintf(text, sizeof text, "bus: %s: the tail of the page is zeros", what);
+        check(text, f[PAGE / 2] == 0 && f[PAGE - 1] == 0);
+        snprintf(text, sizeof text, "bus: %s: a read past the end is SIGBUS", what);
+        check(text, bus_faults(f + PAGE + 8, 0));
+        snprintf(text, sizeof text, "bus: %s: a write past the end is SIGBUS", what);
+        check(text, bus_faults(f + PAGE + 16, 1));
+        munmap(f, 2 * PAGE);
+    }
+    close(fd);
+    unlink(scratch);
+    check("bus: restore the handler", sigaction(SIGBUS, &old, NULL) == 0);
 }
 
 /* Every other page of a mapping cut off: the map fills, mprotect says
@@ -696,8 +849,6 @@ static void shared_anonymous(void) {
     check("shared: mprotect read", mprotect(p, 3 * PAGE, PROT_READ) == 0 && write_faults(p));
     check("shared: munmap", munmap(p, 3 * PAGE) == 0 && read_faults(p));
 }
-
-static const char *scratch = "/tmp/posix-map-file";
 
 static int fill_file(size_t len) {
     int fd = open(scratch, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -1926,6 +2077,8 @@ int main(int argc, char **argv) {
     protect_across();
     none_page_faults();
     errors();
+    exec_memory();
+    past_end();
     forked();
     image_shared();
     image_spawned();
