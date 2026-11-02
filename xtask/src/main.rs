@@ -33,6 +33,7 @@ mod clock_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
+mod display_probe;
 mod doom;
 mod entropy;
 mod gpu_probe;
@@ -1647,6 +1648,7 @@ commands:
             and the service's steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
@@ -1897,6 +1899,7 @@ fn main() {
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -8736,6 +8739,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        // The screen and the keys of libc.so against QEMU's screenshots and
+        // the keys of its monitor.
+        job("display-probe", || display_probe::probe(&qemu::VIRT)),
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
@@ -11633,6 +11639,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-display-probe",
+        "--package",
+        "display-run",
         "--package",
         "posix-pty",
         "--package",
