@@ -5,7 +5,8 @@
 
 #define LINUX_KEYS 128
 
-// Indexed by the Linux key code. Letters are lower case, as Doom's menus and
+// Indexed by the Linux key code. The keypad has Enter, minus and plus (the
+// size of the view: Doom's minus and equals). Letters are lower case, as Doom's menus and
 // bindings have them; both Ctrl, Shift and Alt keys are Doom's right ones,
 // the keys of fire, run and strafe.
 static const unsigned char doom_keys[LINUX_KEYS] = {
@@ -26,6 +27,7 @@ static const unsigned char doom_keys[LINUX_KEYS] = {
     [63] = SK_F1 + 4, [64] = SK_F1 + 5, [65] = SK_F1 + 6, [66] = SK_F1 + 7,
     [67] = SK_F1 + 8, [68] = SK_F10,
     [87] = SK_F11, [88] = SK_F12,
+    [74] = '-', [78] = '=', [96] = SK_ENTER,
     [97] = SK_RCTRL, [100] = SK_RALT,
     [102] = SK_HOME, [103] = SK_UPARROW, [104] = SK_PGUP,
     [105] = SK_LEFTARROW, [106] = SK_RIGHTARROW, [107] = SK_END,

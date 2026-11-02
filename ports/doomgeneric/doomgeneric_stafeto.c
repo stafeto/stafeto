@@ -9,8 +9,9 @@
 // (DOOMGENERIC_RESX by RESY, the engine scales its 320 by 200 by two), so
 // DG_ScreenBuffer points at the buffer of the screen and a frame is shown
 // without a copy. Where the screen does not open (an image without a
-// display service, a screen that another process holds), the frames go
-// nowhere and no key is ever pressed; that is all `-timedemo -nodraw` needs.
+// display service: ENODEV), the frames go nowhere and no key is ever
+// pressed; that is all `-timedemo -nodraw` needs. Any other failure to open
+// the screen ends the program with code 1.
 //
 // Two lines on stderr let a probe follow the game: `doom: title crc32 X`
 // at the first frame of the title screen and `doom: level E M` at the first
@@ -63,17 +64,24 @@ void DG_Init(void)
     struct stafeto_display d;
 
     if (stafeto_display_open(&d) != 0) {
-        fprintf(stderr, "doom: no display (%s), frames are dropped\n",
-                strerror(errno));
-        return;
+        // No display service in the image (ENODEV): the engine runs without a
+        // screen, as `-timedemo -nodraw` wants. Any other refusal (the screen
+        // is busy, no memory) would leave a game that nobody can see or leave.
+        if (errno == ENODEV) {
+            fprintf(stderr, "doom: no display (%s), frames are dropped\n",
+                    strerror(errno));
+            return;
+        }
+        fprintf(stderr, "doom: cannot open the screen: %s\n", strerror(errno));
+        exit(1);
     }
     if (d.width != DOOMGENERIC_RESX || d.height != DOOMGENERIC_RESY ||
         d.stride != DOOMGENERIC_RESX * 4 ||
         d.format != STAFETO_FORMAT_XRGB8888) {
-        fprintf(stderr, "doom: the screen is %ux%u, format %u: frames are dropped\n",
-                d.width, d.height, d.format);
+        fprintf(stderr, "doom: the screen is %ux%u, format %u, stride %u: 640x400 XRGB8888 expected\n",
+                d.width, d.height, d.format, d.stride);
         stafeto_display_close();
-        return;
+        exit(1);
     }
     free(DG_ScreenBuffer);
     DG_ScreenBuffer = d.pixels;

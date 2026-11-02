@@ -22,11 +22,13 @@ in the terminal, where ash prompts. Type
 doom -iwad /games/freedoom1.wad
 ```
 
-and the game opens in the window, which takes the keys: arrows move and
+and the game opens in the window, which takes the keys while it is in focus
+(click the window): arrows move and
 turn, Ctrl fires, Space opens doors, Shift runs, Alt strafes, Esc opens the
 menu (Quit Game and `y` leave Doom with code 0). Ctrl-C in the terminal
-ends Doom too. The screen goes back when Doom ends and `doom` can run
-again. Ctrl-A X in the terminal quits QEMU. There is no sound, network or
+ends Doom too. The screen is free again when Doom ends and `doom` can run
+again; a second `doom` while the first has the screen says so and exits with
+code 1. Ctrl-A X in the terminal quits QEMU, and so does closing the window. There is no sound, network or
 saved game.
 
 ## The probe of the goal
@@ -35,7 +37,7 @@ saved game.
 the title screen on the screen has the CRC-32 the game printed
 (`doom: title crc32 X`), the keys of the menu (`sendkey` of QEMU's
 monitor) lead to the first level (`doom: level 1 1`), a turn changes the
-view, the menu leaves with code 0, and a second run ends by Ctrl-C. GitHub
+view, the menu leaves with code 0, a second Doom while one has the screen exits with code 1, and a run ends by Ctrl-C. GitHub
 runs it as the job `doom-probe` next to the groups of `cargo xtask ci`.
 
 `cargo xtask doom-headless` plays the demo without looking at the screen

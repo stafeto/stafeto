@@ -284,7 +284,10 @@ const LAUNCH: &str = "doom -iwad /games/freedoom1.wad";
 const KEY_PAUSE: Duration = Duration::from_millis(500);
 /// How long the title may take to come after the command: Doom reads the
 /// WAD's directory and the lumps it needs, on a slow runner.
-const TITLE_WITHIN: Duration = Duration::from_secs(90);
+const TITLE_WITHIN: Duration = Duration::from_secs(45);
+/// The whole probe may take this long (spec 3, 9.2); a slow runner that
+/// takes more fails the probe instead of eating the reserve of the job.
+const PROBE_WITHIN: Duration = Duration::from_secs(180);
 /// How long the first level may take to come after the last key of the menu.
 const LEVEL_WITHIN: Duration = Duration::from_secs(30);
 /// The colours a level's picture has at least (a blank or banded screen
@@ -331,6 +334,18 @@ fn check_turn(before: &Ppm, after: &Ppm) -> Result<usize, String> {
         ));
     }
     Ok(differs)
+}
+
+/// The whole probe within PROBE_WITHIN.
+fn check_time(took: Duration, machine: &str) -> Result<(), String> {
+    if took > PROBE_WITHIN {
+        return Err(format!(
+            "doom-probe on {machine}: {:.0} s, {} s expected at most",
+            took.as_secs_f64(),
+            PROBE_WITHIN.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 /// The lines of a finished run that say the image faulted.
@@ -407,8 +422,27 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
     run.expect(gpu_probe::RELEASED, DIALOG_STEP * 3)?;
     run.send("echo rc=$?")?;
     run.expect_line("the exit code of Doom", |l| l == "rc=0", DIALOG_STEP)?;
-    // 6: Doom again, and Ctrl-C into the terminal gives the prompt and the
-    // screen back.
+    // 6: Doom again in the background holds the screen: a second one cannot
+    // open it, says so and leaves with code 1. Then Doom in the foreground,
+    // and Ctrl-C into the terminal gives the prompt and the screen back.
+    run.expect("# ", DIALOG_STEP)?;
+    run.send(&format!("{LAUNCH} &"))?;
+    run.send("P=$!")?;
+    run.expect_line(
+        "the title screen of the first",
+        |l| l.contains(TITLE),
+        TITLE_WITHIN,
+    )?;
+    run.send(&format!("{LAUNCH}; echo busy=$?"))?;
+    run.expect_line(
+        "the refusal of a second Doom",
+        |l| l == "busy=1",
+        DIALOG_STEP * 3,
+    )?;
+    run.send("kill $P")?;
+    run.expect(gpu_probe::RELEASED, DIALOG_STEP * 3)?;
+    run.send("echo again")?;
+    run.expect_line("ash after the kill", |l| l == "again", DIALOG_STEP)?;
     run.expect("# ", DIALOG_STEP)?;
     run.send(LAUNCH)?;
     run.expect_line(
@@ -435,7 +469,6 @@ fn drive(run: &mut qemu::Run, scratch: &Scratch) -> Result<Seen, String> {
 /// code 0 and the prompt of ash; a second run ends by Ctrl-C and ash
 /// prompts again.
 pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
-    let began = Instant::now();
     build_games()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
@@ -443,11 +476,14 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
     packages::check()?;
     let scratch = Scratch::new()?;
     let cmd = probe_command(machine, &kernel.image, &image, &scratch);
+    // The time of the probe is that of the machine, not of the build.
+    let began = Instant::now();
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let driven = drive(&mut run, &scratch);
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
     let seen = driven.map_err(|e| format!("doom-probe on {}: {e}", machine.name))?;
+    check_time(began.elapsed(), machine.name)?;
     if let Some(line) = faulted(&output.lines) {
         return Err(format!(
             "doom-probe on {}: the games image faulted: {line}",
@@ -459,14 +495,14 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
         .iter()
         .filter(|l| l.as_str() == gpu_probe::RELEASED)
         .count();
-    if released != 2 {
+    if released != 3 {
         return Err(format!(
-            "doom-probe on {}: the screen went back {released} times, 2 expected",
+            "doom-probe on {}: the screen went back {released} times, 3 expected",
             machine.name
         ));
     }
     println!(
-        "doom-probe on {}: the title screen matched QEMU's screenshot ({:.1} s), the menu led to E1M1 in {:.1} s ({} colours), a turn changed {:.1} % of the points, the menu left with code 0, Ctrl-C left too; {:.0} s in all",
+        "doom-probe on {}: the title screen matched QEMU's screenshot ({:.1} s), the menu led to E1M1 in {:.1} s ({} colours), a turn changed {:.1} % of the points, the menu left with code 0, a second Doom was refused with 1, Ctrl-C left too; {:.0} s in all",
         machine.name,
         seen.title,
         seen.level,
@@ -790,6 +826,16 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_past_its_time_fails() {
+        assert!(check_time(Duration::from_secs(180), "m").is_ok());
+        assert!(
+            check_time(Duration::from_secs(181), "m")
+                .unwrap_err()
+                .contains("181 s")
+        );
+    }
+
+    #[test]
     fn a_fault_in_the_output_is_found() {
         let ok = vec!["doom: level 1 1".to_owned()];
         assert!(faulted(&ok).is_none());
@@ -819,14 +865,17 @@ mod tests {
     fn the_table_of_keys_passes_its_c_tests() {
         let dir = root().join("ports/doomgeneric");
         let out = std::env::temp_dir().join(format!("stafeto-keys-test-{}", std::process::id()));
-        let mut cc = Command::new("cc");
+        let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+        let mut cc = Command::new(&compiler);
         cc.args(["-std=c11", "-Wall", "-Werror", "-I"])
             .arg(&dir)
             .arg("-o")
             .arg(&out)
             .arg(dir.join("keys.c"))
             .arg(dir.join("keys_test.c"));
-        let built = cc.output().expect("cc");
+        let built = cc.output().unwrap_or_else(|e| {
+            panic!("the C compiler {compiler:?} (CC, cc by default) does not run: {e}; install one to test the table of keys")
+        });
         assert!(
             built.status.success(),
             "{}",

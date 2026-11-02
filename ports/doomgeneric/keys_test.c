@@ -36,11 +36,18 @@ int main(void)
     expect("right shift", stafeto_doom_key(54), SK_RSHIFT);
     expect("left alt", stafeto_doom_key(56), SK_RALT);
     expect("right alt", stafeto_doom_key(100), SK_RALT);
+    // The keypad: Enter, minus and plus.
+    expect("keypad enter", stafeto_doom_key(96), SK_ENTER);
+    expect("keypad minus", stafeto_doom_key(74), '-');
+    expect("keypad plus", stafeto_doom_key(78), '=');
     // Letters, digits and signs.
     expect("a", stafeto_doom_key(30), 'a');
     expect("m", stafeto_doom_key(50), 'm');
     expect("q", stafeto_doom_key(16), 'q');
     expect("1", stafeto_doom_key(2), '1');
+    expect("2", stafeto_doom_key(3), '2');
+    expect("5", stafeto_doom_key(6), '5');
+    expect("7", stafeto_doom_key(8), '7');
     expect("0", stafeto_doom_key(11), '0');
     expect("minus", stafeto_doom_key(12), '-');
     expect("equals", stafeto_doom_key(13), '=');
