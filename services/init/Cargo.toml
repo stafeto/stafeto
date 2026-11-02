@@ -81,6 +81,8 @@ table-entropy = []
 table-entropy-vz = []
 # The probe of the display service (xtask gpu-probe).
 table-gpu = []
+# The probe of the input service (xtask input-probe).
+table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).
 table-posix-random = []
 
