@@ -621,7 +621,7 @@ pub fn occupied_report(out: &mut [[u64; 3]]) -> usize {
                     _ => 4,
                 })
             };
-            out[n] = [index as u64, flags as u64, kernel];
+            out[n] = [index as u64, flags, kernel];
             n += 1;
         }
     }
