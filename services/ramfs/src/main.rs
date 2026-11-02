@@ -4639,7 +4639,32 @@ impl Fs {
                 *r.reply() = out;
                 Answer::Reply(Outgoing::new())
             }
-            Err(code) => status(code),
+            Err(code) => {
+                if code == proto_fs::OPEN_RETIRED {
+                    let key = match method {
+                        Method::ChangeStart => proto_fs::ChangeStart::read(r.body()).ok().map(|q| q.key),
+                        Method::ChangeSecond => proto_fs::ChangeSecond::read(r.body()).ok().map(|q| q.key),
+                        _ => proto_fs::read_key_body(r.body()).ok(),
+                    };
+                    if let Some(key) = key {
+                        let job = self.jobs.iter().flatten().find(|j| j.owner == owner && j.open_key == Some(key));
+                        rt::println!(
+                            "ramfs: change {:?} retired: slot {} generation {} mark {} job {} abandoned {:?} resolver {:?} image_job {:?} image_now {:?} binding_prep {}",
+                            method,
+                            key.slot,
+                            key.generation,
+                            fds.open_watermarks[key.slot as usize],
+                            job.is_some(),
+                            job.map(|j| j.abandoned),
+                            job.map(|j| fds.resolvers.contains(&j.id)),
+                            job.map(|j| j.authority.map(|s| s.image)),
+                            fds.binding.stamp().map(|s| s.image),
+                            fds.binding_preparation.is_some()
+                        );
+                    }
+                }
+                status(code)
+            }
         }
     }
     fn job_slot(&self, id: u64, owner: u64) -> Result<usize, u32> {
