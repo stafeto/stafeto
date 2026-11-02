@@ -180,7 +180,10 @@ pub fn probe_pin_wakes() -> usize {
 /// Whether the last release of a pin met a wait of `reserve` that then
 /// ended by its deadline: a wait whose deadline lay after the wake call
 /// returned was not woken by it. A wait that timed out before the wake
-/// call has an earlier deadline and does not count.
+/// call has an earlier deadline and does not count. When the host delays
+/// the releasing thread between `futex_wake` and `probe_now` for longer than
+/// the deadline `D`, a wake lost in that round is not noticed; a wake that
+/// is lost every time is caught by the other rounds.
 #[cfg(feature = "thread-probe")]
 pub fn probe_pin_wake_missed() -> bool {
     TIMED_OUT_DEADLINE.load(Ordering::SeqCst) > PIN_RELEASED_AT.load(Ordering::SeqCst)
@@ -811,7 +814,7 @@ fn reserve() -> Result<usize, i32> {
             Ok(_) | Err(EAGAIN) => {}
             Err(ETIMEDOUT) => {
                 #[cfg(feature = "thread-probe")]
-                TIMED_OUT_DEADLINE.store(deadline, Ordering::SeqCst);
+                TIMED_OUT_DEADLINE.fetch_max(deadline, Ordering::SeqCst);
             }
             Err(_) => return Err(EAGAIN),
         }

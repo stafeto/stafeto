@@ -227,7 +227,7 @@ extern "C" fn window_create(_: u64) {
 }
 
 /// Rounds of the third case. The wake is judged by what happened to the
-/// wait and not by the time it took: a wait that the release woke does not
+/// wait: a wait that the release woke does not
 /// end by its deadline (1 ms, which backs the wait), so a wait that ended by
 /// a deadline later than the return of the wake call was not woken
 /// (`probe_pin_wake_missed`). A host that stalls the guest for a while makes

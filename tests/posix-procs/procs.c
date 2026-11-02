@@ -2955,7 +2955,8 @@ static void proc_handler(int signal) {
     char path[32] = "/proc/";
     char digits[12];
     int count = 0, at = 6;
-    for (unsigned pid = (unsigned)getpid(); pid > 0; pid /= 10) digits[count++] = (char)('0' + pid % 10);
+    for (unsigned pid = (unsigned)getpid(); pid > 0; pid /= 10)
+        digits[count++] = (char)('0' + pid % 10);
     while (count > 0) path[at++] = digits[--count];
     memcpy(path + at, "/stat", 6);
     int fd = open(path, O_RDONLY);
