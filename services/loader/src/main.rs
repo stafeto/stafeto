@@ -305,6 +305,8 @@ fn staged(len: usize) -> &'static [u8] {
 
 /// What the parent's requests came to: a program loaded from its file
 /// (Start), or a copy of the parent's memory (Fork).
+// The map of a loaded program holds MAP_ENTRIES entries; one value lives at a time.
+#[allow(clippy::large_enum_variant)]
 enum Done {
     Loaded(Loaded),
     Copied(Copied),
@@ -1386,6 +1388,10 @@ fn load(
     let read = read_at(&image, 0, &mut head[..size.min(PAGE) as usize])?;
     let layout =
         elf::layout(&head[..read], size, PROGRAM_ROOM.clone()).map_err(|_| pl::NOT_EXEC)?;
+    // Dynamic programs wait for their own loading path.
+    if layout.kind != elf::Kind::Static {
+        return Err(pl::NOT_EXEC);
+    }
     let mut maps = Maps::default();
     for part in Part::ALL {
         let load = &layout.segments[part as usize];
