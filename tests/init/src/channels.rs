@@ -6,10 +6,11 @@
 
 use crate::harness::*;
 use crate::processes::caller_ceiling;
+use crate::timers::timer_at;
 use crate::transfers::close_raw;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 26] = [
+pub(crate) const TESTS: [Test; 31] = [
     (
         "channel_create_checks_its_priority",
         channel_create_checks_its_priority,
@@ -34,6 +35,26 @@ pub(crate) const TESTS: [Test; 26] = [
     (
         "boost_ends_at_the_next_receive",
         boost_ends_at_the_next_receive,
+    ),
+    (
+        "channel_create_checks_its_flags",
+        channel_create_checks_its_flags,
+    ),
+    (
+        "wait_channel_wakes_without_a_boost",
+        wait_channel_wakes_without_a_boost,
+    ),
+    (
+        "wait_channel_queue_gives_no_boost",
+        wait_channel_queue_gives_no_boost,
+    ),
+    (
+        "wait_channel_timer_fires_at_its_level",
+        wait_channel_timer_fires_at_its_level,
+    ),
+    (
+        "wait_channel_keeps_the_boost_of_a_request",
+        wait_channel_keeps_the_boost_of_a_request,
     ),
     (
         "waiting_receiver_gets_peer_closed",
@@ -409,6 +430,173 @@ fn boost_ends_at_the_next_receive() -> Outcome {
     check(
         later == 1,
         "the receiver's second receive did not find the channel empty",
+    )
+}
+
+/// A receiver of init that takes one notification from the channel `h` and
+/// leaves in mark 1 whether it came from a wait, in mark 2 the priority it
+/// works at then and in mark 3 its base; then mark 0 is 1. Ends afterwards.
+extern "C" fn receive_then_info(h: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(h));
+    if sys::receive(&c).is_ok()
+        && let Ok(me) = sys::self_thread()
+        && let Ok(info) = sys::thread_info(&me)
+    {
+        MARKS[2].store(info.priority.into(), Relaxed);
+        MARKS[3].store(info.base.into(), Relaxed);
+        MARKS[0].store(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// A service of init that takes one request from the channel `h` and
+/// leaves in mark 2 the priority it works at then and in mark 3 its base;
+/// mark 0 is 1 afterwards. It answers the request and ends.
+extern "C" fn serve_once_info(h: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(h));
+    if let Ok(Received::Message { token, .. }) = sys::receive(&c)
+        && let Ok(me) = sys::self_thread()
+        && let Ok(info) = sys::thread_info(&me)
+    {
+        MARKS[2].store(info.priority.into(), Relaxed);
+        MARKS[3].store(info.base.into(), Relaxed);
+        MARKS[0].store(1, Relaxed);
+        let _ = token.reply(&[]);
+    }
+    sys::thread_exit()
+}
+
+/// channel_create takes flags in x1 (spec 6.5, 11): 0 and WAIT, and any
+/// other bit fails with INVALID_ARGS alone, checked with the priority and
+/// before the ceiling. A wait channel carries a notification like any
+/// other.
+fn channel_create_checks_its_flags() -> Outcome {
+    for flags in [2, 3, 1 << 32, 1 << 63] {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[LEVEL.into(), flags]);
+        // SAFETY: channel_create only reads its registers.
+        let after = unsafe { sys::raw::<{ Call::CreateChannel.number() }>(x) };
+        check(
+            after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+            "a flag other than WAIT did not fail with INVALID_ARGS alone",
+        )?;
+    }
+    let c = wait_channel(QUIET)?;
+    let posted = sys::notify(&c, 1);
+    let got = take_one(&c);
+    close(c)?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "a wait channel did not carry a notification",
+    )
+}
+
+/// The slot of a wait channel does not lend its priority (spec 6.5, 6.6):
+/// a receiver at base 5 waits on one whose slot has 25. A notification
+/// wakes it, but it does not run before notify returns, as the receiver of
+/// `notification_runs_at_its_priority` does; once init lets it run, it
+/// works at its base.
+fn wait_channel_wakes_without_a_boost() -> Outcome {
+    reset_marks();
+    let c = wait_channel(NOTICE)?;
+    let r = spawn(0, receive_then_info, c.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let waited = mark(0);
+    let posted = sys::notify(&c, 1);
+    let at_once = mark(0);
+    let_run()?;
+    let (done, level, base) = (mark(0), mark(2), mark(3));
+    close(r)?;
+    close(c)?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        posted.is_ok() && at_once == 0,
+        "the receiver of a wait channel ran above init at the slot's priority",
+    )?;
+    check(
+        done == 1 && base == LOW.into() && level == LOW.into(),
+        "the receiver of a wait channel did not work at its base after its wake",
+    )
+}
+
+/// The same for a slot that waited in the queue (spec 6.5, 6.6): the
+/// notification came before the receiver, and receive took the slot from
+/// the queue; the receiver works at its base.
+fn wait_channel_queue_gives_no_boost() -> Outcome {
+    reset_marks();
+    let c = wait_channel(NOTICE)?;
+    let posted = sys::notify(&c, 1);
+    let r = spawn(0, receive_then_info, c.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let (done, level, base) = (mark(0), mark(2), mark(3));
+    close(r)?;
+    close(c)?;
+    check(
+        posted.is_ok() && done == 1,
+        "the receiver did not take the queued slot",
+    )?;
+    check(
+        base == LOW.into() && level == LOW.into(),
+        "the receiver of a wait channel got a boost from a slot in the queue",
+    )
+}
+
+/// A timer on a wait channel fires at its own level (spec 6.5, 10): the
+/// receiver at base 5 waits on a channel whose slot and timer have HIGH.
+/// Init, at 20, spins past the deadline with a margin; the firing at 30
+/// comes ahead of it and wakes the receiver, which is not waiting any more
+/// and does not run. Then init lets it run: it works at its base.
+fn wait_channel_timer_fires_at_its_level() -> Outcome {
+    const AHEAD_NS: u64 = 20_000_000;
+    const MARGIN_NS: u64 = 30_000_000;
+    reset_marks();
+    let c = wait_channel(HIGH)?;
+    let t = timer_at(&c, HIGH)?;
+    let r = spawn(0, receive_then_info, c.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let waited = mark(0);
+    let now = clock_now()?;
+    arm(&t, now + AHEAD_NS)?;
+    while time::ticks_to_ns(time::now()) <= now + AHEAD_NS + MARGIN_NS {}
+    let state = sys::thread_info(&r).map(|i| i.state);
+    let_run()?;
+    let (done, level, base) = (mark(0), mark(2), mark(3));
+    close(r)?;
+    close(t)?;
+    close(c)?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        state.is_ok_and(|s| s != abi::ThreadState::Receiving),
+        "the timer of a wait channel did not fire above init",
+    )?;
+    check(
+        done == 1 && base == LOW.into() && level == LOW.into(),
+        "the receiver woken by the timer of a wait channel did not work at its base",
+    )
+}
+
+/// A request through a wait channel lends the client's priority as through
+/// any channel (spec 6.6): a service at base 5 waits in receive on a wait
+/// channel, a client at 20 sends; the service works at the client's 20.
+fn wait_channel_keeps_the_boost_of_a_request() -> Outcome {
+    reset_marks();
+    let c = wait_channel(QUIET)?;
+    let r = spawn(0, serve_once_info, c.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let waited = mark(0);
+    let sent = sys::send(&c, &[0; 8]);
+    let (took, level, base) = (mark(0), mark(2), mark(3));
+    let_run()?;
+    close(r)?;
+    close(c)?;
+    check(waited == 0, "the service did not wait")?;
+    check(
+        sent.is_ok() && took == 1 && base == LOW.into(),
+        "the service did not take the request",
+    )?;
+    check(
+        level == TEST_PRIORITY.into(),
+        "a request through a wait channel did not lend the client's priority",
     )
 }
 

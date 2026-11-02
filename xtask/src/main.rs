@@ -1200,7 +1200,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 263;
+const INIT_TESTS: u32 = 268;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -6490,6 +6490,26 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     qemu::expect_marker(
         &output,
         "relibc-threads: an unlock of a PRIO_INHERIT mutex wakes one waiter, the mutex goes by level ok",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: a thread that lowers itself first thing runs below its creator",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: a thread lowered by another thread runs at its new level when woken",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: the timer of a thread that another thread raised fires at its new level",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: a handler that sleeps leaves the deadline of the wait it interrupted",
+    )?;
+    qemu::expect_marker(
+        &output,
+        "relibc-threads: the main thread works at its base level",
     )?;
     qemu::expect_marker(&output, "relibc-threads: ok")?;
     println!("relibc pthread guest probe passed");

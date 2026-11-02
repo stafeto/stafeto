@@ -33,6 +33,7 @@ unsigned long relibc_threads_calls(void);
 unsigned long relibc_threads_cancel_window(void);
 int relibc_threads_ended(pthread_t thread);
 unsigned relibc_threads_waiting(void);
+int relibc_threads_info(pthread_t thread, int *base, int *priority);
 
 #define FAIL(...) do { printf("relibc-threads: " __VA_ARGS__); printf("\n"); exit(10 + __LINE__ % 80); } while (0)
 #define CHECK(cond) do { if (!(cond)) FAIL("check failed at line %d: %s", __LINE__, #cond); } while (0)
@@ -1293,7 +1294,158 @@ static void lowered_thread(void) {
     printf("relibc-threads: a thread that lowers itself first thing runs below its creator\n");
 }
 
+
+/* I: the main thread works at its base level. Nothing the process did before
+ * main may have lent it a higher one (the loader's and the layer's startup
+ * waits ran at the level the process starts at, and the main thread would
+ * keep the level of the last wake until its first receive). */
+static void main_thread_at_its_base(void) {
+    int base = -1, priority = -1;
+    CHECK(relibc_threads_info(pthread_self(), &base, &priority) == 0);
+    if (priority != base) FAIL("the main thread works at level %d, above its base %d", priority, base);
+    printf("relibc-threads: the main thread works at its base level %d\n", base);
+}
+
+/* J: a thread lowered by another thread while it waits runs at its new
+ * level when woken. `waiter` starts high and waits on a condition variable;
+ * main lowers it under `mid` and wakes it; `mid`, which sleeps meanwhile,
+ * must get the processor when its sleep ends while `waiter` spins, and the
+ * kernel's view of `waiter` is its base level, with nothing lent by the
+ * wake. */
+static pthread_mutex_t other_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t other_cond = PTHREAD_COND_INITIALIZER;
+static volatile int other_waiting, other_go, other_stop, other_mid_ran, other_failed;
+static volatile int other_base, other_priority;
+static void *other_waiter(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&other_mutex) == 0);
+    other_waiting = 1;
+    while (!other_go) pthread_cond_wait(&other_cond, &other_mutex);
+    CHECK(pthread_mutex_unlock(&other_mutex) == 0);
+    int base = -1, priority = -1;
+    if (relibc_threads_info(pthread_self(), &base, &priority) != 0) other_failed = 1;
+    other_base = base;
+    other_priority = priority;
+    while (!other_stop) {}
+    return NULL;
+}
+static void *other_mid(void *arg) {
+    (void)arg;
+    lower_self(22);
+    sleep_ms(10);
+    other_mid_ran = 1;
+    return NULL;
+}
+static void lowered_by_another_thread(void) {
+    pthread_t waiter, mid;
+    struct sched_param param = {12};
+    other_waiting = other_go = other_stop = other_mid_ran = other_failed = 0;
+    other_base = other_priority = -1;
+    waiter = spawn_at(25, other_waiter, NULL);
+    while (!other_waiting) sleep_ms(1);
+    sleep_ms(5);
+    CHECK(pthread_create(&mid, &small, other_mid, NULL) == 0);
+    CHECK(pthread_setschedparam(waiter, SCHED_RR, &param) == 0);
+    CHECK(pthread_mutex_lock(&other_mutex) == 0);
+    other_go = 1;
+    CHECK(pthread_cond_signal(&other_cond) == 0);
+    CHECK(pthread_mutex_unlock(&other_mutex) == 0);
+    sleep_ms(LOWERING_TURNS_MS);
+    int ran = other_mid_ran, base = other_base, priority = other_priority;
+    other_stop = 1;
+    CHECK(pthread_join(waiter, NULL) == 0);
+    CHECK(pthread_join(mid, NULL) == 0);
+    if (other_failed) FAIL("the kernel's view of a lowered thread could not be read");
+    if (!ran) FAIL("a thread between main and a spinning thread that another thread lowered did not run");
+    if (priority != base) FAIL("a thread lowered by another thread works at level %d after its wake, above its base %d", priority, base);
+    printf("relibc-threads: a thread lowered by another thread runs at its new level when woken\n");
+}
+
+/* K: the timer of a thread follows its level. `sleeper` starts at 12 and
+ * waits on a condition variable; main raises it to 28 and wakes it; it
+ * sleeps 2 ms while `spinner` (20) spins. Its timer fires at the level of
+ * its slot: made at 12, it would wait for the spinner for good. */
+static pthread_mutex_t follow_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t follow_cond = PTHREAD_COND_INITIALIZER;
+static volatile int follow_waiting, follow_go, follow_stop, follow_done;
+static void *follow_sleeper(void *arg) {
+    (void)arg;
+    CHECK(pthread_mutex_lock(&follow_mutex) == 0);
+    follow_waiting = 1;
+    while (!follow_go) pthread_cond_wait(&follow_cond, &follow_mutex);
+    CHECK(pthread_mutex_unlock(&follow_mutex) == 0);
+    sleep_ms(2);
+    follow_done = 1;
+    return NULL;
+}
+static void *follow_spinner(void *arg) {
+    (void)arg;
+    while (!follow_stop) {}
+    return NULL;
+}
+static void timer_follows_the_level(void) {
+    struct sched_param param = {28};
+    follow_waiting = follow_go = follow_stop = follow_done = 0;
+    pthread_t sleeper = spawn_at(12, follow_sleeper, NULL);
+    while (!follow_waiting) sleep_ms(1);
+    sleep_ms(5);
+    CHECK(pthread_setschedparam(sleeper, SCHED_RR, &param) == 0);
+    pthread_t spinner = spawn_at(20, follow_spinner, NULL);
+    CHECK(pthread_mutex_lock(&follow_mutex) == 0);
+    follow_go = 1;
+    CHECK(pthread_cond_signal(&follow_cond) == 0);
+    CHECK(pthread_mutex_unlock(&follow_mutex) == 0);
+    sleep_ms(LOWERING_TURNS_MS);
+    int done = follow_done;
+    follow_stop = 1;
+    CHECK(pthread_join(spinner, NULL) == 0);
+    CHECK(pthread_join(sleeper, NULL) == 0);
+    if (!done) FAIL("a sleep of a thread that another thread raised did not end while a thread below it spun");
+    printf("relibc-threads: the timer of a thread that another thread raised fires at its new level\n");
+}
+
+/* L: a handler that sleeps while a thread waits for a signal with a deadline
+ * must not take the deadline away. `waiter` sits in sigtimedwait (300 ms) on
+ * SIGUSR2 at level 12; main moves it to level 14, so that its timer is made
+ * again by the next wait of its own, and sends it SIGUSR1, whose handler
+ * sleeps. The wait goes on with its deadline and ends with EAGAIN. */
+static volatile int deadline_done, deadline_result, deadline_handled;
+static void deadline_handler(int sig) {
+    (void)sig;
+    sleep_ms(1);
+    deadline_handled = 1;
+}
+static void *deadline_waiter(void *arg) {
+    (void)arg;
+    sigset_t set;
+    struct timespec limit = {0, 300000000L};
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    CHECK(pthread_sigmask(SIG_BLOCK, &set, NULL) == 0);
+    deadline_result = sigtimedwait(&set, NULL, &limit) < 0 ? errno : 0;
+    deadline_done = 1;
+    return NULL;
+}
+static void handler_keeps_the_deadline(void) {
+    struct sigaction action;
+    struct sched_param param = {14};
+    memset(&action, 0, sizeof action);
+    action.sa_handler = deadline_handler;
+    CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+    deadline_done = deadline_result = deadline_handled = 0;
+    pthread_t waiter = spawn_at(12, deadline_waiter, NULL);
+    sleep_ms(30);
+    CHECK(pthread_setschedparam(waiter, SCHED_RR, &param) == 0);
+    CHECK(pthread_kill(waiter, SIGUSR1) == 0);
+    sleep_ms(1500);
+    if (!deadline_done) FAIL("a wait with a deadline lost it when a handler slept");
+    CHECK(pthread_join(waiter, NULL) == 0);
+    CHECK(deadline_handled == 1 && deadline_result == EAGAIN);
+    printf("relibc-threads: a handler that sleeps leaves the deadline of the wait it interrupted\n");
+}
+
 int main(void) {
+    main_thread_at_its_base();
     stack_address();
     CHECK(pthread_attr_init(&small) == 0);
     CHECK(pthread_attr_setstacksize(&small, 65536) == 0);
@@ -1315,6 +1467,9 @@ int main(void) {
     stage = 7;
     clock_page();
     lowered_thread();
+    lowered_by_another_thread();
+    timer_follows_the_level();
+    handler_keeps_the_deadline();
     stage = 8;
     leave_sigwait();
     stage = 9;

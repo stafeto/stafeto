@@ -283,6 +283,11 @@ pub(crate) fn channel(priority: u8) -> Result<Handle<Channel>, &'static str> {
     sys::channel_create(priority).map_err(|_| "channel_create failed")
 }
 
+/// A wait channel (spec 6.5) with its slot of label 0 at `priority`.
+pub(crate) fn wait_channel(priority: u8) -> Result<Handle<Channel>, &'static str> {
+    sys::channel_create_wait(priority).map_err(|_| "channel_create with WAIT failed")
+}
+
 /// A copy of `h` with `rights` and no new label.
 pub(crate) fn copy<K>(h: &Handle<K>, rights: Rights) -> Result<Handle<K>, &'static str> {
     sys::handle_duplicate(h, rights).map_err(|_| "handle_duplicate failed")

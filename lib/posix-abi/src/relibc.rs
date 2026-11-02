@@ -757,7 +757,7 @@ fn exits() -> Result<u64, i32> {
         return Ok(known);
     }
     let ceiling = crate::ceiling().map_err(|_| EIO)?;
-    let channel = sys::channel_create(ceiling).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(ceiling).map_err(|_| EAGAIN)?;
     let raw = channel.raw().0;
     match EXITS.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
@@ -896,7 +896,7 @@ pub unsafe fn create(
     let policy_raw = policy as u64;
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
-    let Ok(channel) = sys::channel_create(base) else {
+    let Ok(channel) = sys::channel_create_wait(base) else {
         undo(0, 0, 0, 0);
         return Err(EAGAIN);
     };
@@ -939,6 +939,7 @@ pub unsafe fn create(
             .mask
             .store(me.mask.load(Ordering::SeqCst), Ordering::Relaxed);
         block.base_level.store(u32::from(base), Ordering::Relaxed);
+        block.timer_level.store(u32::from(base), Ordering::Relaxed);
         block.thread.store(own.into_raw().0, Ordering::Relaxed);
         block.timer.store(timer.into_raw().0, Ordering::Relaxed);
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);

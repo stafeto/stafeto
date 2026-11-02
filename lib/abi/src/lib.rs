@@ -881,6 +881,11 @@ impl LogBatch {
     }
 }
 
+/// Bit 0 of the flags of `channel_create` (spec 6.5, 11): a wait channel.
+/// The slots of a wait channel do not lend their priority to the receiver
+/// (spec 6.6); the other bits are reserved.
+pub const CHANNEL_WAIT: u64 = 1;
+
 /// Bit 0 of the flags of `irq_bind` (spec 9, 11): the line is
 /// edge-triggered; without it, level-triggered. The other bits are
 /// reserved.

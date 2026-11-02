@@ -966,7 +966,7 @@ fn ceiling(s: &Start, checked: Checked) -> u64 {
         }
         Checked::CreateChannel => {
             const N: u16 = Call::CreateChannel.number();
-            first_wrong(&[x0_alone::<N>(&[above], denied)])
+            first_wrong(&[x0_alone::<N>(&[above, 0], denied)])
         }
         Checked::Label => {
             const N: u16 = Call::HandleDuplicate.number();

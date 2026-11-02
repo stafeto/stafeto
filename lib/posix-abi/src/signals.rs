@@ -1344,7 +1344,10 @@ fn wait(
     };
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let timer = Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
+    // A handler that ran in the loop may have made the timer again
+    // (posix_sync::wait_timer): the number is read at each use.
+    posix_sync::wait_timer(block);
+    let timer = || Handle::<Timer>::borrowed(rt::abi::Handle(block.timer.load(Ordering::Relaxed)));
     let result = loop {
         if let Some(signal) = take() {
             break Ok(signal);
@@ -1358,7 +1361,7 @@ fn wait(
                 drop(guard);
                 break Err(EAGAIN);
             }
-            let _ = sys::timer_set(&timer, deadline);
+            let _ = sys::timer_set(&timer(), deadline);
         }
         let got = sys::receive(&channel);
         drop(guard);
@@ -1377,7 +1380,7 @@ fn wait(
         }
     };
     if deadline.is_some() {
-        let _ = sys::timer_cancel(&timer);
+        let _ = sys::timer_cancel(&timer());
     }
     leave();
     result
@@ -1464,7 +1467,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     use rt::abi::ThreadState;
     let level = own().base_level.load(Ordering::Relaxed) as u8;
     let me = own() as *const Block as usize;
-    let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
+    let channel = sys::channel_create_wait(level.max(1)).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
     while !STOP.try_begin(me, channel.raw().0) {
         STOP.wait_for_claim(
