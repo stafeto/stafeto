@@ -387,8 +387,17 @@ static void image_shared(void) {
     check("image: the grandchild ran the shared code after its parent left", late == 0);
     if (late) printf("posix-map: image grandchild bits %d\n", late);
     close(fds[0]);
+    /* The grandchild wrote its byte before its exit: its mapping goes when the
+     * process service has torn its space down, a moment after the read here
+     * returned (on several CPUs the other CPU is still at it). Wait for it. */
     uint64_t after[5] = {0};
-    check("image: one mapping after the children", image_state((const void *)&image_answer, after) == 1 && after[0] == 1);
+    int found = image_state((const void *)&image_answer, after);
+    for (int i = 0; i < 2000 && found == 1 && after[0] != 1; i++) {
+        const struct timespec ms = {0, 1000000};
+        nanosleep(&ms, NULL);
+        found = image_state((const void *)&image_answer, after);
+    }
+    check("image: one mapping after the children", found == 1 && after[0] == 1);
 }
 
 /* Processes spawned from one file run the same code and read-only data
