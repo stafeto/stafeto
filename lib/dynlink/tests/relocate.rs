@@ -628,7 +628,7 @@ fn the_limits_of_the_records_the_places_and_the_searches() {
         q = q.rel(p.rw(), R_RELATIVE, None, 0);
     }
     assert_eq!(run(&lib(), &q).0, Err(Refusal::Limit(Limit::Relocs)));
-    // RELR: the places count, not the words.
+    // RELR: each place the table applies counts as one record.
     let mut l = lib();
     l.rw_size = 0x10_0000;
     let rw = l.rw();
