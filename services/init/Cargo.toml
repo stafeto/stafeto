@@ -65,6 +65,8 @@ table-posix-steps = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []
+# The games image: the dialog with the quota of Doom (xtask doom-headless).
+table-doom = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
 # The probe of the terminal service (xtask tty, tty-vz).

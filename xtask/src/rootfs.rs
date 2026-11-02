@@ -398,11 +398,25 @@ fn zoneinfo() -> Vec<RootFile> {
     files
 }
 
+/// The WAD of Freedoom as `tools/build-freedoom.py` unpacked it, read once
+/// in a run of xtask. Where the script has not run (the check of the
+/// descriptions needs the paths of an image only) the file is empty, and
+/// the build of the games image refuses an image that carries it so.
+fn freedoom_wad() -> &'static [u8] {
+    static WAD: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    WAD.get_or_init(|| {
+        let version = crate::packages::value("freedoom", "version").unwrap_or_default();
+        let path = crate::target_dir().join(format!("freedoom/freedoom-{version}/freedoom1.wad"));
+        std::fs::read(path).unwrap_or_default()
+    })
+}
+
 /// The bytes of the files that packages name as `bytes:<name>`.
 fn named_bytes(name: &str) -> Result<&'static [u8], String> {
     match name {
         "inputrc" => Ok(INPUTRC),
         "htoprc" => Ok(b"hide_userland_threads=1\n"),
+        "freedoom1.wad" => Ok(freedoom_wad()),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -456,11 +470,14 @@ pub fn utilities() -> usize {
 /// files) and the files of the packages in `packages/`: BusyBox with its
 /// applet names (the shell, `ash`, among them) as symbolic links, and the
 /// add-ons. The service is a set-user-ID file of another owner.
-fn dialog() -> Vec<RootFile> {
-    shell_files().unwrap_or_else(|e| panic!("the shell image: {e}"))
+fn dialog(image: &str) -> Vec<RootFile> {
+    shell_files(image).unwrap_or_else(|e| panic!("the shell image: {e}"))
 }
 
-fn shell_files() -> Result<Vec<RootFile>, String> {
+/// The files of the shell image `image`: the same base system, and the
+/// packages the image holds (`packages::of_image`), the games with them in
+/// the games image.
+fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     let mut files = library();
     files.extend([
         dir("/bin"),
@@ -509,9 +526,7 @@ fn shell_files() -> Result<Vec<RootFile>, String> {
             Source::Bytes("utmpx", &UTMPX),
         ),
     ]);
-    files.extend(package_files(&crate::packages::of_image(
-        "boot-ash-dialog.img",
-    )?)?);
+    files.extend(package_files(&crate::packages::of_image(image)?)?);
     files.extend(zoneinfo());
     files.extend(devices());
     Ok(files)
@@ -600,11 +615,7 @@ pub fn package_table(
         let owns =
             |path: &str| p.files.iter().any(|(f, _)| f == path) || p.dirs.iter().any(|d| d == path);
         let (count, bytes) = tally(&owns)?;
-        let kind = if p.kind == crate::packages::Kind::Base {
-            "base"
-        } else {
-            "addon"
-        };
+        let kind = p.kind.word();
         rows.push((
             p.name.clone(),
             p.version.clone(),
@@ -955,6 +966,7 @@ pub fn runner_check() -> Vec<RootFile> {
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
+    "boot-doom.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1023,7 +1035,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 },
             ),
         ],
-        "boot-ash-dialog.img" => dialog(),
+        "boot-ash-dialog.img" | "boot-doom.img" => dialog(name),
         "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
             let mut files = procs();
             files.push(file(
@@ -1451,6 +1463,7 @@ mod tests {
             let list: &[crate::ImageProgram] = match image {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => shell,
+                "boot-doom.img" => crate::doom::programs(),
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,
@@ -1567,6 +1580,7 @@ mod tests {
     fn the_images_of_posix_programs_have_the_device_nodes() {
         for name in [
             "boot-ash-dialog.img",
+            "boot-doom.img",
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
             "boot-posix-lock-rules.img",
