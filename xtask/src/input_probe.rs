@@ -29,13 +29,15 @@ use std::time::Duration;
 use crate::monitor::Monitor;
 use crate::qemu::{Input, Run};
 use crate::{
-    BOOT_PROFILE, CHILD_STACK_SIZE, INIT_STACK_SIZE, ImageProgram, TERM_B, Variant, build,
-    build_boot_image, longest_steps, qemu,
+    BOOT_PROFILE, INIT_STACK_SIZE, ImageProgram, TERM_B, Variant, build, build_boot_image,
+    longest_steps, qemu,
 };
 
 /// The stack of the input service: its loop's table of 16 sessions and the
 /// 120 events of a reply.
 pub const INPUT_STACK_SIZE: u32 = 32 * 1024;
+/// The stack of the probe: the replies of READ and the twenty foci it keeps.
+const PROBE_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of the display service, as in the display probe.
 const GPU_STACK_SIZE: u32 = crate::gpu_probe::GPU_STACK_SIZE;
 
@@ -44,7 +46,7 @@ pub const PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-input"]),
     ("virtio-input", "virtio-input", INPUT_STACK_SIZE, &[]),
     ("virtio-gpu", "virtio-gpu", GPU_STACK_SIZE, &["crash"]),
-    ("input-probe", "input-probe", CHILD_STACK_SIZE, &[]),
+    ("input-probe", "input-probe", PROBE_STACK_SIZE, &[]),
 ];
 
 /// The image of the run under -icount: the service counts its steps, the
@@ -53,7 +55,7 @@ pub const STEPS_PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-input"]),
     ("virtio-input", "virtio-input", INPUT_STACK_SIZE, &["steps"]),
     ("virtio-gpu", "virtio-gpu", GPU_STACK_SIZE, &[]),
-    ("input-probe", "input-probe", CHILD_STACK_SIZE, &["quick"]),
+    ("input-probe", "input-probe", PROBE_STACK_SIZE, &["quick"]),
 ];
 
 /// The service's line at each start: the transport, its line and the
