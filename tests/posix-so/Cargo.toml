@@ -13,5 +13,9 @@ name = "posix-so-probe"
 test = false
 bench = false
 
+[features]
+# /proc in the layer: the probe reads the pool of pages from /proc/meminfo.
+procfs = ["posix-crt/procfs"]
+
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt" }

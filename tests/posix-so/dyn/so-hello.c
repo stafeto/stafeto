@@ -7,6 +7,7 @@
  * undefined symbol. "wait" waits for a byte on its input; "fork" and "exec"
  * go through fork and execv of itself. The output is one line per mode. */
 #include <errno.h>
+#include <sys/auxv.h>
 #include <stdint.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -75,6 +76,12 @@ int main(int argc, char **argv) {
         printf("so-hello: waiting\n");
         fflush(stdout);
         return read(0, &byte, 1) == 1 ? 0 : 1;
+    }
+    if (strcmp(mode, "secure") == 0) {
+        /* AT_SECURE as the program sees it, with the environment untouched:
+         * the loader never reads LD_PRELOAD, whatever the mode. The exit
+         * code is 40 + 2 * AT_SECURE + (LD_PRELOAD is set). */
+        return 40 + 2 * (int)getauxval(23) + (getenv("LD_PRELOAD") != NULL);
     }
     if (strcmp(mode, "quick") == 0) {
         /* The counter at main, for the timing of the leader. */

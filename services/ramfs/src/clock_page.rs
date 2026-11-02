@@ -14,6 +14,8 @@ const ADDRESS: usize = 0x5c_0000_0000;
 pub struct TimeSource {
     memory: Option<Handle<Memory>>,
     calendar: Calendar,
+    /// The last time `now` gave, in nanoseconds.
+    last: core::cell::Cell<i128>,
 }
 
 impl TimeSource {
@@ -41,6 +43,7 @@ impl TimeSource {
         Ok(Self {
             memory,
             calendar: Calendar::default(),
+            last: core::cell::Cell::new(i128::MIN),
         })
     }
 
@@ -62,12 +65,22 @@ impl TimeSource {
     /// the last validated anchor, preserving the calendar epoch without yields.
     pub fn now(&self) -> Timestamp {
         let now = rt::time::ticks_to_ns(rt::time::now());
-        if self.memory.is_none() {
-            return Timestamp::legacy_ns(now);
-        }
-        self.calendar
-            .now(Self::load, now)
-            .expect("clocked startup validates an anchor before Ready")
+        let read = if self.memory.is_none() {
+            Timestamp::legacy_ns(now)
+        } else {
+            self.calendar
+                .now(Self::load, now)
+                .expect("clocked startup validates an anchor before Ready")
+        };
+        // Each answer is later than the one before by at least a nanosecond,
+        // so the change time of a node grows with every change (the table of
+        // images names a file by it, spec 2, 3.12.2).
+        let wanted = read
+            .value()
+            .unwrap_or(0)
+            .max(self.last.get().saturating_add(1));
+        self.last.set(wanted);
+        Timestamp::from_ns(wanted).unwrap_or(read)
     }
 
     /// Each unstable startup attempt yields before reading again; Ready follows

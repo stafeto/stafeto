@@ -275,6 +275,94 @@ static void spawn_times(void) {
     check(128, "the spawn timing runs", !bad);
 }
 
+/* The pool of pages the process service has left, from /proc/meminfo (kB);
+ * 0 when it cannot be read. */
+static long pool_free(void) {
+    char text[512];
+    int fd = open("/proc/meminfo", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    text[n] = 0;
+    const char *at = strstr(text, "MemFree:");
+    return at != NULL ? strtol(at + 8, NULL, 10) : 0;
+}
+
+/* 8: a libc.so that is replaced by rename gives the next program an object of
+ * its own, while a live program keeps the old one; the next one shares again. */
+static void rewrite(void) {
+    if (getuid() != 0) return;
+    struct child holder;
+    char line[128], buf[512];
+    int status = -1;
+    char *wait_argv[] = {(char *)"/bin/so-hello", (char *)"wait", NULL};
+    char *image[] = {(char *)"/bin/so-image", NULL};
+    int copied = 0;
+    if (start(&holder, wait_argv) != 0) {
+        bits |= 256;
+        return;
+    }
+    slurp(&holder, line, sizeof line, '\n');
+    int from = open("/lib/libc.so", O_RDONLY);
+    int to = open("/lib/libc.new", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (from >= 0 && to >= 0) {
+        static char chunk[16384];
+        ssize_t n;
+        copied = 1;
+        while ((n = read(from, chunk, sizeof chunk)) > 0)
+            if (write(to, chunk, (size_t)n) != n) copied = 0;
+    }
+    if (from >= 0) close(from);
+    if (to >= 0) close(to);
+    check(256, "libc.so is copied", copied);
+    check(256, "libc.new is renamed over libc.so", copied && rename("/lib/libc.new", "/lib/libc.so") == 0);
+    int error = run(image, buf, sizeof buf, &status);
+    check(256, "so-image with a replaced libc.so has an object of its own",
+          error == 0 && exited_with(status, 0) && strstr(buf, "code=1 data=1") != NULL);
+    char *hello[] = {(char *)"/bin/so-hello", NULL};
+    error = run(hello, buf, sizeof buf, &status);
+    check(256, "so-hello runs on the new libc.so", error == 0 && exited_with(status, 0));
+    if (write(holder.in, "x", 1) != 1) bits |= 256;
+    check(256, "the old so-hello wait ends with 0", exited_with(finish(&holder, line, sizeof line), 0));
+}
+
+/* 9: a libc.so nobody may execute is EACCES; the same file with 0755 works. */
+static void no_exec(void) {
+    if (getuid() != 0) return;
+    char buf[256];
+    int status = -1;
+    char *argv[] = {(char *)"/bin/so-hello", NULL};
+    check(512, "chmod 0600 libc.so", chmod("/lib/libc.so", 0600) == 0);
+    int error = run(argv, buf, sizeof buf, &status);
+    check(512, "so-hello with a libc.so without x is refused with EACCES", error == EACCES);
+    check(512, "chmod 0755 libc.so", chmod("/lib/libc.so", 0755) == 0);
+}
+
+/* 10: a set-ID dynamic program sees AT_SECURE with LD_PRELOAD in its
+ * environment; the loader does not read the variable. */
+static void secure(void) {
+    if (getuid() != 0) return;
+    check(1024, "chmod 04755 so-hello", chmod("/bin/so-hello", 04755) == 0);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = {(char *)"/bin/so-hello", (char *)"secure", NULL};
+        char *env[] = {(char *)"LD_PRELOAD=/nonexistent.so", (char *)"PATH=/bin", NULL};
+        pid_t child;
+        if (setgid(1000) != 0 || setuid(1000) != 0) _exit(2);
+        if (posix_spawn(&child, argv[0], NULL, NULL, argv, env) != 0) _exit(3);
+        int status = 0;
+        waitpid(child, &status, 0);
+        /* 40 + 2 * AT_SECURE + 1 for LD_PRELOAD set. */
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 43) printf("posix-so: set-ID so-hello status %#x\n", status);
+        _exit(WIFEXITED(status) && WEXITSTATUS(status) == 43 ? 0 : 4);
+    }
+    int status = 0;
+    check(1024, "a set-ID so-hello sees AT_SECURE with LD_PRELOAD set", waitpid(pid, &status, 0) == pid && exited_with(status, 0));
+    check(1024, "chmod 0755 so-hello", chmod("/bin/so-hello", 0755) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "quick") == 0) {
         uint64_t at = ticks();
@@ -290,8 +378,16 @@ int main(int argc, char **argv) {
     hello();
     shared();
     fork_and_exec();
+    long before = pool_free();
     bad();
+    nanosleep(&(struct timespec){0, 100000000}, NULL);
+    long after = pool_free();
+    printf("posix-so: pool %ld kB before the bad programs, %ld kB after\n", before, after);
+    check(2048, "the bad programs leak no pages", before == 0 || after + 128 >= before);
     set_id();
+    no_exec();
+    secure();
+    rewrite();
     spawn_times();
     if (bits) {
         printf("posix-so: failed checks, bits %d\n", bits);

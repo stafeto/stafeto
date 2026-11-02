@@ -1418,6 +1418,7 @@ fn load(
                 &library.layout.segments,
                 &mut maps,
             )?;
+            unchanged(own, &library.session, &library.info)?;
             Some(link(&layout, library)?)
         }
     };
@@ -1470,7 +1471,7 @@ fn map_segments(
                 Part::Rodata => Some(image_key(info, proto_process::IMAGE_RODATA)),
                 Part::Data => None,
             };
-            segment(own, image, load, part, maps, key.as_ref())?;
+            segment(own, image, info, load, part, maps, key.as_ref())?;
         }
     }
     Ok(())
@@ -1478,6 +1479,7 @@ fn map_segments(
 
 /// The layout of the program in `image`, read from the first page of the
 /// file (the page is on this call's stack alone, not the caller's).
+#[inline(never)]
 fn program_layout(image: &Handle<Channel>, size: u64) -> Result<elf::Layout, u32> {
     let mut head = [0; PAGE as usize];
     let read = read_at(image, 0, &mut head[..size.min(PAGE) as usize])?;
@@ -1485,6 +1487,7 @@ fn program_layout(image: &Handle<Channel>, size: u64) -> Result<elf::Layout, u32
 }
 
 /// The layout of libc.so in `session`, as `program_layout`.
+#[inline(never)]
 fn library_layout(session: &Handle<Channel>, size: u64) -> Result<elf::Library, u32> {
     let mut head = [0; PAGE as usize];
     let read = read_at(session, 0, &mut head[..size.min(PAGE) as usize])?;
@@ -1549,11 +1552,12 @@ impl dynlink::Memory for Space {
 }
 
 /// The largest `PT_DYNAMIC` the loader reads: 64 entries (libc.so and a
-/// program of the toolchain have about 30), on a stack of four pages.
+/// program of the toolchain have about 30), on a stack of five pages.
 const DYNAMIC_MAX: usize = 1024;
 
 /// The module of a file mapped by `load`: its segments, its `PT_DYNAMIC`
 /// parsed and every table it names checked.
+#[inline(never)]
 fn module(
     role: dynlink::Role,
     segments: &[Load; 3],
@@ -1742,6 +1746,7 @@ const fn access(part: Part) -> Access {
 fn segment(
     own: &Own,
     image: &Handle<Channel>,
+    info: &proto_fs::NodeInfo,
     load: &Load,
     part: Part,
     maps: &mut Maps,
@@ -1773,7 +1778,12 @@ fn segment(
             Ok(())
         }
         Table::Reserved => {
-            if let Err(e) = build(own, image, load, part, maps) {
+            // The object goes to the table under the key read before the
+            // file was copied: a file changed meanwhile has another key and
+            // its mixed object stays out.
+            if let Err(e) =
+                build(own, image, load, part, maps).and_then(|()| unchanged(own, image, info))
+            {
                 let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
                 return Err(e);
             }
@@ -1800,6 +1810,20 @@ fn segment(
             Ok(())
         }
         Table::Full => build(own, image, load, part, maps),
+    }
+}
+
+/// The file of the image session still has the identity `info` shows (the
+/// key of the table of images): the service gives a node a later change time
+/// at every change, so a file written since is another file. NOT_EXEC when it
+/// is.
+fn unchanged(own: &Own, image: &Handle<Channel>, info: &proto_fs::NodeInfo) -> Result<(), u32> {
+    let now = file_info(own, image)?;
+    let same = |part| image_key(&now, part) == image_key(info, part);
+    if same(proto_process::IMAGE_CODE) && same(proto_process::IMAGE_RODATA) {
+        Ok(())
+    } else {
+        Err(pl::NOT_EXEC)
     }
 }
 

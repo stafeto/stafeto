@@ -691,7 +691,12 @@ const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
 /// table of files (rootfs.rs, `shared_files`) and the probe as its program.
 const POSIX_SO_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
-    programs[5] = ("posix-procs", "posix-so-probe", POSIX_STACK_SIZE, &[]);
+    programs[5] = (
+        "posix-procs",
+        "posix-so-probe",
+        POSIX_STACK_SIZE,
+        &["procfs"],
+    );
     programs
 };
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
