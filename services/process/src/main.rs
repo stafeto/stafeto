@@ -2634,7 +2634,7 @@ impl Processes {
         else {
             return Answer::Status(Status::BadSize);
         };
-        self.tty_signal(terminal, pgid, signal, generation, r)
+        self.tty_signal(terminal, pgid, signal, generation)
     }
 
     /// TtySignal: the walk of group `pgid` with `signal`, from the terminal
@@ -2642,14 +2642,7 @@ impl Processes {
     /// request is answered at once, once the checks pass and the walk has a
     /// place in the queue of `TTY_QUEUE`; the steps of the service walk the
     /// group in their turn, one walk at a time in the order of the requests.
-    fn tty_signal(
-        &mut self,
-        terminal: usize,
-        pgid: u32,
-        signal: u32,
-        generation: u64,
-        r: &mut Request<'_>,
-    ) -> Answer {
+    fn tty_signal(&mut self, terminal: usize, pgid: u32, signal: u32, generation: u64) -> Answer {
         let Ok(signal) = u8::try_from(signal) else {
             return refuse(proto_process::INVALID);
         };
