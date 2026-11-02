@@ -18,3 +18,8 @@ proto-gpu = { path = "../../proto/gpu" }
 proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }
+
+# `quick`: no pause after a frame for the host to photograph it (the run
+# under -icount, whose virtual time passes at once).
+[features]
+quick = []

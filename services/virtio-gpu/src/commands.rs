@@ -147,7 +147,11 @@ pub fn first_mode(answer: &[u8]) -> Option<(u32, u32, bool)> {
             .and_then(|b| b.try_into().ok())
             .map(u32::from_le_bytes)
     };
-    Some((word(HEADER + 8)?, word(HEADER + 12)?, word(HEADER + 16)? != 0))
+    Some((
+        word(HEADER + 8)?,
+        word(HEADER + 12)?,
+        word(HEADER + 16)? != 0,
+    ))
 }
 
 #[cfg(test)]
@@ -226,11 +230,51 @@ mod tests {
         let mut b = [0xFF; COMMAND_MAX];
         let corners_and_middle = [
             (Rect::SCREEN, 0),
-            (Rect { x: 639, y: 0, w: 1, h: 1 }, 2556),
-            (Rect { x: 0, y: 399, w: 1, h: 1 }, 399 * 2560),
-            (Rect { x: 639, y: 399, w: 1, h: 1 }, 1_024_000 - 4),
-            (Rect { x: 320, y: 200, w: 10, h: 10 }, 200 * 2560 + 320 * 4),
-            (Rect { x: 100, y: 50, w: 200, h: 100 }, 50 * 2560 + 400),
+            (
+                Rect {
+                    x: 639,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                },
+                2556,
+            ),
+            (
+                Rect {
+                    x: 0,
+                    y: 399,
+                    w: 1,
+                    h: 1,
+                },
+                399 * 2560,
+            ),
+            (
+                Rect {
+                    x: 639,
+                    y: 399,
+                    w: 1,
+                    h: 1,
+                },
+                1_024_000 - 4,
+            ),
+            (
+                Rect {
+                    x: 320,
+                    y: 200,
+                    w: 10,
+                    h: 10,
+                },
+                200 * 2560 + 320 * 4,
+            ),
+            (
+                Rect {
+                    x: 100,
+                    y: 50,
+                    w: 200,
+                    h: 100,
+                },
+                50 * 2560 + 400,
+            ),
         ];
         for (r, offset) in corners_and_middle {
             assert_eq!(transfer_to_host_2d(&mut b, &r, RESOURCE), 56);
@@ -248,7 +292,12 @@ mod tests {
     #[test]
     fn flush_names_the_rectangle_and_the_resource() {
         let mut b = [0xFF; COMMAND_MAX];
-        let r = Rect { x: 1, y: 2, w: 3, h: 4 };
+        let r = Rect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+        };
         assert_eq!(resource_flush(&mut b, &r, RESOURCE), 48);
         assert_eq!(word(&b, 0), 0x0104);
         assert_eq!(

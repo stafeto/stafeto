@@ -34,11 +34,13 @@ mod cpus_dialog;
 mod cyrillic;
 mod disasm;
 mod entropy;
+mod gpu_probe;
 mod guards;
 mod htop_dialog;
 mod image;
 mod jobs;
 mod measure;
+mod monitor;
 mod nano_dialog;
 mod native_scopes;
 #[cfg(test)]
@@ -1630,6 +1632,10 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
+            shown, the screen compared with QEMU's screenshot by CRC-32, one
+            owner, the screen's return, a restart of the service, and its
+            steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
@@ -1862,6 +1868,14 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("gpu-probe") => match args.get(1).map(String::as_str) {
+            None => gpu_probe::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                gpu_probe::probe(&qemu::HVF_V3)?;
+                gpu_probe::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("gpu-probe [--hvf]".to_owned()),
+        },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
@@ -8684,6 +8698,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
+        // The display service on virtio-gpu: the screen against QEMU's
+        // screenshot, then its steps under -icount.
+        job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -8795,6 +8812,12 @@ fn host_tests() -> Result<(), String> {
         "posix-random",
         "--package",
         "entropy",
+        "--package",
+        "proto-gpu",
+        "--package",
+        "virtio-mmio",
+        "--package",
+        "virtio-gpu",
     ]))
 }
 
@@ -11034,6 +11057,9 @@ fn hvf() -> Result<(), String> {
         // and the layer's generator across fork.
         entropy::probe(m)?;
         entropy::random_probe(m)?;
+        // The display service: the buffer through the real processor's
+        // caches, shown without a clean (spec 3, 3.4).
+        gpu_probe::probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -11338,6 +11364,10 @@ fn ci_lints() -> Result<(), String> {
         "proto-entropy",
         "--package",
         "posix-random",
+        "--package",
+        "proto-gpu",
+        "--package",
+        "virtio-mmio",
         "--all-targets",
         "--",
         "-D",
@@ -11367,6 +11397,8 @@ fn ci_lints() -> Result<(), String> {
         "virtio-rng",
         "--package",
         "entropy",
+        "--package",
+        "virtio-gpu",
         "--lib",
         "--tests",
         "--",
@@ -11492,8 +11524,12 @@ fn ci_lints() -> Result<(), String> {
         "entropy-probe",
         "--package",
         "entropy",
+        "--package",
+        "virtio-gpu",
+        "--package",
+        "gpu-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps",
         "--target",
         PROGRAM_TARGET,
         "--",

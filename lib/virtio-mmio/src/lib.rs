@@ -117,7 +117,11 @@ impl Arena {
     /// queues. None for no pages, more queue pages than pages, or an
     /// address that is no multiple of a page.
     pub const fn new(va: usize, pa: u64, pages: usize, queue_pages: usize) -> Option<Arena> {
-        if pages == 0 || queue_pages > pages || !va.is_multiple_of(PAGE) || !pa.is_multiple_of(PAGE as u64) {
+        if pages == 0
+            || queue_pages > pages
+            || !va.is_multiple_of(PAGE)
+            || !pa.is_multiple_of(PAGE as u64)
+        {
             return None;
         }
         Some(Arena {
@@ -213,7 +217,9 @@ pub fn attach(va: usize, pa: u64, pages: usize, queue_pages: usize) -> bool {
     GLOBAL.va.store(arena.va, Ordering::Relaxed);
     GLOBAL.pa.store(arena.pa as usize, Ordering::Relaxed);
     GLOBAL.pages.store(arena.pages, Ordering::Relaxed);
-    GLOBAL.queue_pages.store(arena.queue_pages, Ordering::Relaxed);
+    GLOBAL
+        .queue_pages
+        .store(arena.queue_pages, Ordering::Relaxed);
     GLOBAL.taken.store(0, Ordering::Relaxed);
     true
 }

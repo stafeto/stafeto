@@ -9,7 +9,7 @@
 //!
 //! | Method | Session | Request | Reply | Refusals |
 //! |---|---|---|---|---|
-//! | OPEN (1) | `Display` | the header alone | status, `width`, `height`, `stride`, `format`, `flags` (u32 each); handles: the screen's buffer (MAP_READ, MAP_WRITE), the owner's session (SEND), and the focus session (SEND) when the service has one | BUSY, CLEARING, NO_DEVICE |
+//! | OPEN (1) | `Display` | the header alone | status, `width`, `height`, `stride`, `format`, `flags` (u32 each); handles: the screen's buffer (MAP_READ, MAP_WRITE, TRANSFER), the owner's session (SEND, TRANSFER), and the focus session when the service has one | BUSY, CLEARING, NO_DEVICE |
 //! | FLUSH (2) | the owner's | `x`, `y`, `w`, `h` (u32) | the status alone, once the device returned both commands | INVALID, REVOKED, IO, LIMIT_REACHED |
 //! | CLOSE (3) | the owner's | the header alone | the status alone | none |
 //! | CRASH (4) | `Display` | the header alone | none: the service ends with a fault | only a service built with the feature `crash` has it |
@@ -57,6 +57,8 @@ pub const STRIDE: u32 = WIDTH * 4;
 pub const SCREEN_BYTES: u32 = STRIDE * HEIGHT;
 /// The bytes of the buffer's object: a megabyte, a block of 256 pages.
 pub const BUFFER_BYTES: u32 = 1 << 20;
+
+const _: () = assert!(SCREEN_BYTES <= BUFFER_BYTES);
 
 /// The format of a point (OPEN's `format`): B, G, R, X in memory, the word
 /// 0x00RRGGBB.
@@ -254,7 +256,6 @@ mod tests {
     #[test]
     fn the_screen_fits_its_object() {
         assert_eq!(SCREEN_BYTES, 1_024_000);
-        assert!(SCREEN_BYTES <= BUFFER_BYTES);
         assert!(Screen::FIXED.fits());
         assert_eq!(BUFFER_BYTES / 4096, 256);
     }
@@ -273,7 +274,14 @@ mod tests {
     #[test]
     fn the_codes_are_apart_from_the_kernels_and_the_wires() {
         let codes = [
-            BUSY, CLEARING, REVOKED, NO_DEVICE, NO_INPUT, INVALID, IO, NOT_ALLOWED,
+            BUSY,
+            CLEARING,
+            REVOKED,
+            NO_DEVICE,
+            NO_INPUT,
+            INVALID,
+            IO,
+            NOT_ALLOWED,
         ];
         for (i, c) in codes.iter().enumerate() {
             assert!(*c > 512, "above the codes of the wire");
@@ -340,9 +348,7 @@ mod tests {
 
     #[test]
     fn the_offset_is_y_stride_plus_x_4() {
-        let at = |x, y| {
-            Rect { x, y, w: 1, h: 1 }.offset()
-        };
+        let at = |x, y| Rect { x, y, w: 1, h: 1 }.offset();
         assert_eq!(at(0, 0), 0);
         assert_eq!(at(1, 0), 4);
         assert_eq!(at(0, 1), 2560);

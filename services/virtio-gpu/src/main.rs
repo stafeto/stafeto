@@ -41,7 +41,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::ManuallyDrop;
 use core::slice;
 use proto_gpu::{
-    BUSY, CLEARING, IO, Method, NOT_ALLOWED, NO_DEVICE, NO_INPUT, REVOKED, Rect, STRIDE, Screen,
+    BUSY, CLEARING, IO, Method, NO_DEVICE, NO_INPUT, NOT_ALLOWED, REVOKED, Rect, STRIDE, Screen,
     VERSION, code,
 };
 use proto_init::ServiceArgs;
@@ -188,7 +188,10 @@ fn main(_: u64) -> u64 {
     rt::println!("virtio-gpu: virtio-mmio at {at:#x}, line {line}, status {status:#x}");
     let (Ok(notify), Ok(copy)) = (
         sys::handle_duplicate(&channel, Rights::NOTIFY),
-        sys::handle_duplicate(&fb, Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE),
+        sys::handle_duplicate(
+            &fb,
+            Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER | Rights::DUPLICATE,
+        ),
     ) else {
         return NOT_REGISTERED;
     };
@@ -623,7 +626,9 @@ impl Driver {
             self.release(opening.label);
             return;
         }
-        let _ = opening.pending.answer(w.as_bytes(), opening.handles);
+        if let Err(refused) = opening.pending.answer(w.as_bytes(), opening.handles) {
+            rt::println!("virtio-gpu: OPEN's reply refused: {:?}", refused.error);
+        }
     }
 
     /// The screen's owner `label` is gone, or closed it: the screen starts
@@ -682,11 +687,21 @@ impl Driver {
             Err(Refusal::Busy) => return Answer::Status(code(BUSY)),
             Err(Refusal::Clearing) => return Answer::Status(code(CLEARING)),
         };
-        let session = sys::handle_label(&self.channel, Rights::SEND, label, self.level);
-        let buffer = sys::handle_duplicate(&self.fb, Rights::MAP_READ | Rights::MAP_WRITE);
-        let (Ok(session), Ok(buffer), Some(pending)) = (session, buffer, r.defer()) else {
+        // A handle in a reply must carry TRANSFER (spec 6.1), so the owner
+        // gets TRANSFER on both, and no DUPLICATE.
+        let rights = Rights::SEND | Rights::TRANSFER;
+        let session = sys::handle_label(&self.channel, rights, label, self.level);
+        let buffer = sys::handle_duplicate(
+            &self.fb,
+            Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
+        );
+        let (Ok(session), Ok(buffer)) = (session, buffer) else {
             self.release(label);
             return Answer::Status(Status::Kernel(Error::NoMemory));
+        };
+        let Some(pending) = r.defer() else {
+            self.release(label);
+            return Answer::Status(Status::Kernel(Error::BadState));
         };
         self.opening = Some(Opening {
             pending,

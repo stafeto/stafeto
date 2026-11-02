@@ -232,6 +232,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("kernel tests 2G icount", 1),
     ("tty", 10),
     ("entropy", 6),
+    ("gpu-probe", 8),
     ("posix-random", 19),
 ];
 const DEFAULT_WEIGHT: u32 = 20;

@@ -1978,10 +1978,7 @@ mod tests {
             order_of(entropy::VZ_TABLE),
             ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
-        assert_eq!(
-            order_of(gpu::TABLE),
-            ["gpu", "gpu-probe", "gpu-probe-b"]
-        );
+        assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
         assert_eq!(
             refused(cycle::TABLE),
             "the connections make a cycle: a -> b -> a"
