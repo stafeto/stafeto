@@ -134,8 +134,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # through the layer's stafeto_dlsym (relibc's own linker is never built, so
 # the environment of a set-ID program stays unread), dl_iterate_phdr lists
 # the program and libc.so, dlopen of a path says it loads no new library;
-# platform interface 23; tagged pin-99bb153a.
-COMMIT = "99bb153ae9e3888574e0ba288208cd5330638b9d"
+# platform interface 23, the layer's function declared in the platform
+# module so that dlfcn.h stays what POSIX has; tagged pin-ae24b98a.
+COMMIT = "ae24b98a96fdb71b6d06ebdbf561cb7dffbfb670"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
