@@ -20,6 +20,10 @@ bench = false
 uart-input = []
 # /proc in the layer, for the shell image of the utilities.
 procfs = ["posix-abi/procfs", "posix-platform/procfs"]
+# Part of libc.so, the C library that dynamically linked programs share:
+# `stafeto_start(area, main)` replaces the program's `main` symbol and
+# `__ehdr_start`; the loader writes the auxiliary vector (spec 2, 3.12.3).
+shared = []
 
 [dependencies]
 entries = { path = "../entries" }
