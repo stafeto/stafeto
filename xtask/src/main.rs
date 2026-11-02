@@ -700,6 +700,13 @@ const POSIX_SO_PROGRAMS: [ImageProgram; 10] = {
     programs[6].3 = &["small-pieces", "stack-depth"];
     programs
 };
+/// The probe of dynamic programs with the steps of the loader (under -icount):
+/// `cargo xtask posix-so steps`.
+const POSIX_SO_STEPS_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_SO_PROGRAMS;
+    programs[6].3 = &["small-pieces", "stack-depth", "steps"];
+    programs
+};
 const POSIX_NAMES_PROGRAMS: [ImageProgram; 10] = {
     let mut programs = POSIX_PROCS_PROGRAMS;
     programs[1].3 = &["signal-probe"];
@@ -1726,9 +1733,10 @@ fn main() {
         Some("posix-map") => posix_map_probe(),
         Some("libc-so") => libc_so(),
         Some("posix-so") => match args.get(1).map(String::as_str) {
-            None => posix_so_run(false),
+            None => posix_so_run(false, false),
             // Instructions count as time, so the times of the spawns repeat.
-            Some("icount") => posix_so_run(true),
+            Some("icount") => posix_so_run(true, false),
+            Some("steps") => posix_so_run(true, true),
             Some(other) => Err(format!("posix-so [icount], not {other}")),
         },
         Some("posix-el2") => posix_el2_probes(),
@@ -4749,14 +4757,22 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
 /// one: the library from the table of images, the vector, the constructors
 /// and destructors, `fork` and `exec`, the programs the loader refuses.
 fn posix_so_probe() -> Result<(), String> {
-    posix_so_run(false)
+    posix_so_run(false, false)
 }
 
-fn posix_so_run(icount: bool) -> Result<(), String> {
+fn posix_so_run(icount: bool, steps: bool) -> Result<(), String> {
     libc_so()?;
     busybox_build()?;
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-posix-so.img", &POSIX_SO_PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image(
+        "boot-posix-so.img",
+        if steps {
+            &POSIX_SO_STEPS_PROGRAMS
+        } else {
+            &POSIX_SO_PROGRAMS
+        },
+        BOOT_PROFILE,
+    )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     if icount {
@@ -4774,7 +4790,11 @@ fn posix_so_run(icount: bool) -> Result<(), String> {
     )?;
     qemu::expect_marker(&outcome, "posix-so: dynamic programs on libc.so ok")?;
     check_loader_stack(&outcome.lines)?;
-    for line in outcome.lines.iter().filter(|l| l.contains("spawn to main")) {
+    for line in outcome
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawn to main") || l.starts_with("loader dynamic:"))
+    {
         println!("{line}");
     }
     Ok(())

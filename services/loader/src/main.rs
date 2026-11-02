@@ -116,10 +116,31 @@ mod steps {
         if kind == RAN && detail < FLOOR {
             return out;
         }
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && detail != 0 {
             DETAIL[kind].store(detail, Ordering::Relaxed);
         }
         out
+    }
+
+    /// The detail of a kind, set by the step itself once it knows it.
+    pub fn note(kind: usize, detail: u64) {
+        DETAIL[kind].store(detail, Ordering::Relaxed);
+    }
+
+    /// The lines of the dynamic path only (kinds from OPEN_LIBRARY), for a
+    /// loader that starts a program; the detail of LINK holds the records
+    /// applied in its high bits and the names searched in its low 16.
+    pub fn report_dynamic(console: u64) {
+        rt::console::set(core::mem::ManuallyDrop::into_inner(
+            rt::handle::Handle::borrowed(rt::abi::Handle(console)),
+        ));
+        for kind in super::kind::OPEN_LIBRARY..=super::kind::LINK {
+            let took = LONGEST[kind].load(Ordering::Relaxed);
+            if took != 0 {
+                let detail = DETAIL[kind].load(Ordering::Relaxed);
+                rt::println!("loader dynamic: kind {kind} {took} ticks detail {detail}");
+            }
+        }
     }
 
     /// One line for each kind that ran, through a copy of `console`.
@@ -143,6 +164,8 @@ mod steps {
     pub fn timed<T>(_: usize, _: u64, step: impl FnOnce() -> T) -> T {
         step()
     }
+
+    pub fn note(_: usize, _: u64) {}
 }
 
 /// The bytes of the loader's stack that were ever written, printed on the
@@ -180,6 +203,13 @@ mod kind {
     pub const DUPLICATE: usize = 7;
     pub const REGIONS: usize = 8;
     pub const GO: usize = 9;
+    /// The dynamic path: the open of libc.so, the segments of the program and
+    /// of libc.so, the second look at libc.so's key, the relocations.
+    pub const OPEN_LIBRARY: usize = 10;
+    pub const PROGRAM_SEGMENTS: usize = 11;
+    pub const LIBRARY_SEGMENTS: usize = 12;
+    pub const RECHECK: usize = 13;
+    pub const LINK: usize = 14;
 }
 
 /// What Boot brought: the loader's own handles from the service.
@@ -1428,22 +1458,28 @@ fn load(
     // A dynamic program brings libc.so, checked before anything is mapped.
     let library = match layout.kind {
         elf::Kind::Static => None,
-        elf::Kind::Dynamic => Some(open_library(own)?),
+        elf::Kind::Dynamic => Some(steps::timed(kind::OPEN_LIBRARY, 0, || open_library(own))?),
     };
     let mut maps = Maps::default();
-    map_segments(own, &image, &info, &layout.segments, &mut maps)?;
+    steps::timed(kind::PROGRAM_SEGMENTS, 0, || {
+        map_segments(own, &image, &info, &layout.segments, &mut maps)
+    })?;
     let dynamic = match library {
         None => None,
         Some(library) => {
-            map_segments(
-                own,
-                &library.session,
-                &library.info,
-                &library.layout.segments,
-                &mut maps,
-            )?;
-            unchanged(own, &library.session, &library.info)?;
-            Some(link(&layout, library)?)
+            steps::timed(kind::LIBRARY_SEGMENTS, 0, || {
+                map_segments(
+                    own,
+                    &library.session,
+                    &library.info,
+                    &library.layout.segments,
+                    &mut maps,
+                )
+            })?;
+            steps::timed(kind::RECHECK, 0, || {
+                unchanged(own, &library.session, &library.info)
+            })?;
+            Some(steps::timed(kind::LINK, 0, || link(&layout, library))?)
         }
     };
     // The stack the file asks for (PT_GNU_STACK), at least 64 KiB.
@@ -1630,7 +1666,13 @@ fn link(layout: &elf::Layout, library: Library) -> Result<Dynamic, u32> {
         tls.align,
     )?;
     let program = module(dynlink::Role::Program, &layout.segments, layout.dynamic, 0)?;
-    dynlink::relocate(&lib, &program, &mut Space).map_err(|_| pl::NOT_EXEC)?;
+    let counts = dynlink::relocate(&lib, &program, &mut Space).map_err(|_| pl::NOT_EXEC)?;
+    // The records applied: libc.so's, the program's and the names searched.
+    steps::note(
+        kind::LINK,
+        u64::from(counts.library.total() + counts.program.total()) << 16
+            | u64::from(counts.lookups),
+    );
     Ok(Dynamic {
         library: library.session,
         phdr: layout.phdr,
@@ -2103,6 +2145,10 @@ fn finish(
     };
     #[cfg(feature = "stack-depth")]
     report_stack_depth(own.data.0, own.data.1, handles[Slot::Console as usize]);
+    #[cfg(feature = "steps")]
+    if flags & pl::DYNAMIC != 0 && handles[Slot::Console as usize] != 0 {
+        steps::report_dynamic(handles[Slot::Console as usize]);
+    }
     let staging = (block_len as u64).next_multiple_of(PAGE);
     drop((
         image,

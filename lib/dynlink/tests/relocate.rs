@@ -272,18 +272,12 @@ fn relr_has_addresses_and_bitmaps() {
     let before = space.clone();
     let counts = relocate(&l2, &pm, &mut space).unwrap();
     assert_eq!(counts.library.relr, 1 + 2 + 1 + 1);
-    let next = rw + 8; // after the address word
-    let touched = [rw, next, next + 16, next + 63 * 8, rw + 0x1000];
     for a in (rw..rw + 0x1008).step_by(8) {
         let expected = word(&before, a);
         assert_eq!(word(&space, a), expected, "bias 0 changes no value: {a:#x}");
     }
-    // The places the table named were written, no others.
-    let mut written = space.writes.clone();
-    written.sort();
-    let mut want = touched.to_vec();
-    want.sort();
-    assert_eq!(written, want);
+    // At bias 0 the places are checked and counted, and nothing is written.
+    assert!(space.writes.is_empty(), "{:?}", space.writes);
 }
 
 #[test]
@@ -773,7 +767,8 @@ fn only_the_data_segments_are_written() {
             "{w:#x}"
         );
     }
-    assert_eq!(space.writes.len(), 3 + 2);
+    // The RELR word of the program (bias 0) is checked and not written.
+    assert_eq!(space.writes.len(), 3 + 1);
 }
 
 /// The library goes first: its words are written when the program is
