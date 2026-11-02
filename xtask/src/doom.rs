@@ -30,8 +30,7 @@ const REPORT: &str = "timed ";
 pub fn programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
-        let packages =
-            packages::of_image(IMAGE).unwrap_or_else(|e| panic!("the games image: {e}"));
+        let packages = packages::of_image(IMAGE).unwrap_or_else(|e| panic!("the games image: {e}"));
         let mut programs = SHELL_SERVICES.to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-doom"]);
         for program in packages.iter().filter_map(|p| p.program.as_deref()) {
@@ -67,7 +66,8 @@ pub fn doom_terms() -> Result<(Vec<u8>, String, Vec<u8>, String), String> {
     let freedoom_url = packages::value("freedoom", "url")?;
     let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
     let doom_licence = read(target_dir().join(format!("doomgeneric/doomgeneric-{doom}/LICENSE")))?;
-    let freedoom_licence = read(target_dir().join(format!("freedoom/freedoom-{freedoom}/COPYING.txt")))?;
+    let freedoom_licence =
+        read(target_dir().join(format!("freedoom/freedoom-{freedoom}/COPYING.txt")))?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let doom_note = format!(
         "doom holds Doomgeneric, commit {doom} of https://github.com/ozkl/doomgeneric,\n\
@@ -125,8 +125,12 @@ fn image_has_doom_terms(path: &Path) -> Result<(), String> {
     if !wad.is_empty()
         && carries(WAD, &|data| data == wad.as_slice())
         && carries(DOOM_LICENSE, &|data| data == licence.as_slice())
-        && carries(DOOM_SOURCE, &|data| mentions(data, &doom) && mentions(data, "GPLv2"))
-        && carries(FREEDOOM_LICENSE, &|data| data == freedoom_licence.as_slice())
+        && carries(DOOM_SOURCE, &|data| {
+            mentions(data, &doom) && mentions(data, "GPLv2")
+        })
+        && carries(FREEDOOM_LICENSE, &|data| {
+            data == freedoom_licence.as_slice()
+        })
         && carries(FREEDOOM_SOURCE, &|data| mentions(data, &version))
     {
         Ok(())
@@ -170,9 +174,7 @@ pub fn doom_headless(machine: &'static qemu::Machine) -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
-        run.send(&format!(
-            "doom -iwad /games/{WAD} -timedemo demo1 -nodraw"
-        ))?;
+        run.send(&format!("doom -iwad /games/{WAD} -timedemo demo1 -nodraw"))?;
         run.expect("W_Init: Init WADfiles.", DIALOG_STEP)?;
         run.expect("ST_Init", TIMEDEMO)?;
         let report = run.expect_line(
@@ -184,7 +186,10 @@ pub fn doom_headless(machine: &'static qemu::Machine) -> Result<(), String> {
         if tics == 0 {
             return Err(format!("the demo played no tics: {report}"));
         }
-        // Doom left, and ash prompts again.
+        // Doom left through I_Error with 255, and ash prompts again.
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo rc=$?")?;
+        run.expect_line("the exit code of Doom", |l| l == "rc=255", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("echo ash-is-back")?;
         run.expect_line("ash after Doom", |l| l == "ash-is-back", DIALOG_STEP)?;
@@ -248,7 +253,10 @@ mod tests {
             report_numbers("Error: timed 2154 gametics in 612 realtics"),
             Some((2154, 612))
         );
-        assert_eq!(report_numbers("timed 0 gametics in 0 realtics"), Some((0, 0)));
+        assert_eq!(
+            report_numbers("timed 0 gametics in 0 realtics"),
+            Some((0, 0))
+        );
         assert_eq!(report_numbers("W_Init: Init WADfiles."), None);
         assert_eq!(report_numbers("timed N gametics in M realtics"), None);
     }
@@ -257,7 +265,11 @@ mod tests {
     fn the_games_image_runs_doom_on_the_table_of_its_quota() {
         let doom = programs().iter().find(|p| p.0 == "init").unwrap();
         assert_eq!(doom.3, &["table-doom"]);
-        assert!(programs().iter().any(|p| p.0 == "doom" && p.3.contains(&"dynamic")));
+        assert!(
+            programs()
+                .iter()
+                .any(|p| p.0 == "doom" && p.3.contains(&"dynamic"))
+        );
         assert!(shell_programs().iter().all(|p| p.0 != "doom"));
     }
 }

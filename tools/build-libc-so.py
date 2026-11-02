@@ -16,7 +16,7 @@ Subcommands:
           3.12.3; the programs of the images use it).
   programs [NAME...]
           link the dynamic programs of the images (busybox, busybox-utils,
-          bash, nano, htop, ncdu; all by default) from the objects their build scripts left, into
+          bash, nano, htop, ncdu, doom; all by default) from the objects their build scripts left, into
           target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the

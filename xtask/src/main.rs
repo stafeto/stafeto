@@ -1851,9 +1851,7 @@ fn main() {
             })
             .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
-        Some("doom-headless") => {
-            qemu::machine(args.get(1)).and_then(doom::doom_headless)
-        }
+        Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),

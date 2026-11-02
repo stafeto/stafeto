@@ -316,7 +316,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("build", LIBC_SO, &[RELIBC], super::libc_so));
     steps.push(step("build", BASE, &[RELIBC], super::busybox_build));
     steps.push(step("build", ADDONS, &[RELIBC, BASE], super::nano_build));
-    steps.push(step("build", GAMES, &[RELIBC, BASE, ADDONS], super::doom::build_games));
+    steps.push(step(
+        "build",
+        GAMES,
+        &[RELIBC, BASE, ADDONS],
+        super::doom::build_games,
+    ));
     steps.push(step("build", KERNELS, &[], || {
         for variant in [
             Variant::Normal,

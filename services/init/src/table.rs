@@ -1985,20 +1985,21 @@ mod tests {
     }
 
     /// The games image is the shell's dialog with the launcher's quota of
-    /// 3 072 pages and the difference in the process service's pool.
+    /// 3 072 pages and a pool of four and a half such quotas.
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
         assert_eq!(order_of(doom::TABLE), order_of(ramfs::BUSYBOX_DIALOG_TABLE));
-        let launcher = |table: &'static [Record]| {
-            table.iter().find(|r| r.program == "ash-launcher").unwrap()
-        };
-        let posix = |table: &'static [Record]| table.iter().find(|r| r.name == PROCESS_SERVICE).unwrap();
-        assert_eq!(launcher(doom::TABLE).quota, 3072 * PAGE);
-        assert_eq!(
-            posix(doom::TABLE).quota - posix(ramfs::BUSYBOX_DIALOG_TABLE).quota,
-            launcher(doom::TABLE).quota - launcher(ramfs::BUSYBOX_DIALOG_TABLE).quota
-        );
+        let launcher = doom::TABLE
+            .iter()
+            .find(|r| r.program == "ash-launcher")
+            .unwrap();
+        let posix = doom::TABLE
+            .iter()
+            .find(|r| r.name == PROCESS_SERVICE)
+            .unwrap();
+        assert_eq!(launcher.quota, 3072 * PAGE);
+        assert_eq!(posix.quota, ramfs::POSIX_ABI_TABLE[1].quota + 13_824 * PAGE);
     }
 
     /// Every POSIX process leaves one level above main for its thread

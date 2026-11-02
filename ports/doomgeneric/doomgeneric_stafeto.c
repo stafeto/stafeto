@@ -33,7 +33,7 @@ void DG_Init(void)
 {
     have_display = stafeto_display_open() == 0;
     if (!have_display)
-        fprintf(stderr, "doom: no display (%s), frames are dropped\n", "ENODEV");
+        fprintf(stderr, "doom: no display (ENODEV), frames are dropped\n");
 }
 
 void DG_DrawFrame(void)
