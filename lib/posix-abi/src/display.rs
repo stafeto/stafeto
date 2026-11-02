@@ -165,10 +165,14 @@ pub struct Opened {
 }
 
 /// The errno of a refusal of the channel: the service is gone (ENODEV),
-/// the kernel is out of memory (ENOMEM), anything else EIO.
+/// the kernel is out of memory (ENOMEM), the session was closed under the
+/// call by a `close` in another thread (EBADF; the handle's number carries
+/// a generation, so no other channel receives the request), anything else
+/// EIO.
 fn channel_errno(error: Error) -> i32 {
     match error {
         Error::PeerClosed => ENODEV,
+        Error::BadHandle => EBADF,
         Error::NoMemory => ENOMEM,
         _ => EIO,
     }
@@ -321,7 +325,11 @@ pub fn flush(x: u32, y: u32, w: u32, h: u32) -> Result<(), i32> {
     }
     if SCREEN[4].load(Ordering::Acquire) & proto_gpu::CLEAN_BEFORE_FLUSH != 0 {
         // The device does not see the cache of the processor: the lines
-        // of the rectangle are written back first.
+        // of the rectangle are written back first, while the display piece
+        // is there (a `close` in another thread takes it away: then the
+        // call is EBADF, and the result of a flush against a close is
+        // undefined all the same).
+        let screen = described().ok_or(EBADF)?;
         for row in y..y + h {
             let at = screen.pixels + row as usize * screen.stride as usize + x as usize * 4;
             rt::dma::clean(at, w as usize * 4);

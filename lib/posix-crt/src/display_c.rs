@@ -29,6 +29,15 @@ pub struct Description {
     pixels: *mut c_void,
 }
 
+const _: () = {
+    // The layouts of `struct stafeto_display` and `struct stafeto_key` of
+    // the header.
+    assert!(core::mem::size_of::<Description>() == 24);
+    assert!(core::mem::align_of::<Description>() == 8);
+    assert!(core::mem::size_of::<display::Key>() == 8);
+    assert!(core::mem::align_of::<display::Key>() == 4);
+};
+
 /// Opens the screen of the process and describes it. A process that has
 /// it gets the same description again.
 ///
