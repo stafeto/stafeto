@@ -25,6 +25,7 @@
 
 /* From the program's Rust side (src/main.rs). */
 int relibc_threads_places(void);
+int relibc_threads_report(unsigned long *out, int len);
 void relibc_threads_collect(void);
 unsigned long relibc_threads_heap(void);
 int relibc_threads_set_level(int level);
@@ -81,8 +82,23 @@ static void table_rounds(void) {
             CHECK(pthread_join(threads[i], &value) == 0);
             CHECK(value == (void *)(long)(i + 1));
         }
-        sleep_ms(20);
-        relibc_threads_collect();
+        /* A join returns once relibc has the value; the thread may still be
+         * between its last words and its end for the kernel, or another
+         * thread's collect may be freeing its place, and POSIX promises
+         * nothing about when the resources of a joined thread go. The
+         * places come free soon, within a bound. */
+        for (int i = 0; i < 1000; i++) {
+            relibc_threads_collect();
+            if (relibc_threads_places() == 2) break;
+            sleep_ms(5);
+        }
+        if (relibc_threads_places() != 2) {
+            unsigned long rep[12][3];
+            int n = relibc_threads_report(&rep[0][0], 12);
+            for (int k = 0; k < n; k++)
+                printf("relibc-threads: place %lu flags %#lx kernel state %lu (1 ended, 2 ready, 3 running)\n",
+                       rep[k][0], rep[k][1], rep[k][2]);
+        }
         CHECK(relibc_threads_places() == 2);
         if (round == 0) heap = relibc_threads_heap();
         else CHECK(relibc_threads_heap() == heap);
