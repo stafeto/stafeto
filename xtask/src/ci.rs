@@ -177,7 +177,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("cpus-dialog smp 1", 20),
     ("cpus-dialog smp 4", 30),
     ("ncdu-dialog", 3),
-    ("doom-headless", 60),
+    ("doom-headless", 20),
     ("ash-shell-exit", 1),
     ("bash-shell-exit", 5),
     ("bash-dialog", 41),
