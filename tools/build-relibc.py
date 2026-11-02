@@ -136,7 +136,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # the program and libc.so, dlopen of a path says it loads no new library;
 # platform interface 23, the layer's function declared in the platform
 # module so that dlfcn.h stays what POSIX has; tagged pin-ae24b98a.
-COMMIT = "ae24b98a96fdb71b6d06ebdbf561cb7dffbfb670"
+# Waits by address between processes (stafeto-design#317): a semaphore post
+# wakes one waiter, and none when nobody waits, the option
+# _POSIX_THREAD_PROCESS_SHARED is claimed, and the owner word of a mutex
+# carries the PID, and a semaphore wait that ends with an error passes its
+# wake on; tagged pin-db34fecb.
+COMMIT = "db34fecb1fd776aee3ce2ec021aaec8589d52ee1"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

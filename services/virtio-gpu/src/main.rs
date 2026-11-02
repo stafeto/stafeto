@@ -23,6 +23,14 @@
 //! KiB cleared, each one a step) is driven by the owner's machine
 //! (`owner`) and the driver's notifications to its own channel.
 //!
+//! The input service (spec 3, 3.6) is the driver's own client: an OPEN asks
+//! it for a session of focus (GRANT) and passes it on to the owner with
+//! the buffer and the owner's session; the screen's return asks it to end
+//! the focus (REVOKE). The driver connects to it by init's table
+//! (`connects`) when it starts. An image with no input service in the
+//! table is refused the connection, and OPEN's status is NO_INPUT, the
+//! screen the client's all the same; so it is when GRANT fails.
+//!
 //! Init gives the driver `dma` (16 pages, contiguous and uncached: the
 //! queue, then the commands and their answers) and `fb` (256 pages,
 //! contiguous and cached) with their physical addresses first in the own
@@ -45,6 +53,7 @@ use proto_gpu::{
     VERSION, code,
 };
 use proto_init::ServiceArgs;
+use proto_input::{self, Method as InputMethod};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, Writer};
 use rt::handle::{Any, Channel, Interrupt, Memory, Outgoing, Resource};
@@ -204,11 +213,15 @@ fn main(_: u64) -> u64 {
         setup: Setup::Info,
         flight: None,
         opening: None,
+        parent: Handle::borrowed(s.parent.raw()),
+        input: Link::Absent,
+        focus_on: false,
         showing: None,
         queued: None,
         fb,
         _maps: (dma, window),
     };
+    driver.input = driver.connect_input();
     // The line opens once the queue is up, and the setup commands begin.
     virtio_mmio::reopen(&driver.irq);
     driver.pump();
@@ -273,12 +286,25 @@ struct Flight {
     bad: bool,
 }
 
-/// An OPEN waiting for its SET_SCANOUT: the reply, the owner's label, and
-/// the handles the reply carries.
+/// An OPEN waiting for its SET_SCANOUT: the reply, the owner's label, the
+/// handles the reply carries (the buffer, the owner's session, and the
+/// focus when the input service gave one).
 struct Opening {
     pending: Pending,
     label: u64,
-    handles: [Handle<Any>; 2],
+    handles: Outgoing,
+    focus: bool,
+}
+
+/// The driver's link to the input service.
+enum Link {
+    /// The image has none: init's table gives the driver no connection.
+    Absent,
+    /// A session of the service.
+    Linked(Handle<Channel>),
+    /// The service ended or could not be reached: connect again at the
+    /// next OPEN.
+    Lost,
 }
 
 /// The driver: the device and its queue, the binding of its line, the
@@ -300,6 +326,13 @@ struct Driver {
     setup: Setup,
     flight: Option<Flight>,
     opening: Option<Opening>,
+    /// Init's channel, to connect to the input service by, and the link to
+    /// that service.
+    parent: ManuallyDrop<Handle<Channel>>,
+    input: Link,
+    /// Whether the focus of the screen's owner was granted and not yet
+    /// revoked.
+    focus_on: bool,
     /// The FLUSH with the device, and the one that waits for it.
     showing: Option<Pending>,
     queued: Option<(Pending, Rect)>,
@@ -624,10 +657,15 @@ impl Driver {
             self.release(opening.label);
             return;
         }
-        // No service of input to give a session of focus yet: the screen is
-        // the client's all the same (proto_gpu, NO_INPUT).
+        // With a session of focus the status is 0, without one NO_INPUT:
+        // the screen is the client's all the same (proto_gpu).
+        let status = if opening.focus {
+            Status::Ok
+        } else {
+            code(NO_INPUT)
+        };
         let mut w = Writer::new();
-        if Screen::FIXED.write(code(NO_INPUT), &mut w).is_err() {
+        if Screen::FIXED.write(status, &mut w).is_err() {
             self.release(opening.label);
             return;
         }
@@ -642,6 +680,7 @@ impl Driver {
         if !self.owner.release(label) {
             return;
         }
+        self.revoke_focus();
         if let Some((pending, _)) = self.queued.take() {
             let _ = pending.answer(&proto_wire::reply(code(REVOKED)), Outgoing::new());
         }
@@ -668,6 +707,65 @@ impl Driver {
             rt::println!("gpu: screen released");
         } else {
             let _ = sys::notify(&self.notify, CLEAR);
+        }
+    }
+
+    /// The session with the input service, from init's table: Absent when
+    /// the table gives none, Lost when the service is not there.
+    fn connect_input(&self) -> Link {
+        match rt::service::connect(&self.parent, "input") {
+            Ok(session) => Link::Linked(session),
+            Err(Status::Kernel(Error::AccessDenied)) => Link::Absent,
+            Err(_) => Link::Lost,
+        }
+    }
+
+    /// GRANT: the session of focus for the owner just made, or None (the
+    /// OPEN's status is NO_INPUT). A service that ended since the last
+    /// call (PEER_CLOSED) is connected to again once.
+    fn grant_focus(&mut self) -> Option<Handle<Any>> {
+        for _ in 0..2 {
+            if matches!(self.input, Link::Lost) {
+                self.input = self.connect_input();
+            }
+            let Link::Linked(session) = &self.input else {
+                return None;
+            };
+            match sys::send(session, &InputMethod::Grant.header().bytes()) {
+                Ok(mut reply) => {
+                    let mut buffer = [0; abi::MESSAGE_MAX];
+                    let status = reply
+                        .bytes(&mut buffer)
+                        .get(..4)
+                        .map(|b| Status::from_code(u32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+                    if status != Some(Status::Ok) || reply.handles.len() != 1 {
+                        rt::println!("virtio-gpu: GRANT refused: {status:?}");
+                        return None;
+                    }
+                    let focus = reply.handles.take::<Any>(0).ok()?;
+                    self.focus_on = true;
+                    return Some(focus);
+                }
+                Err(Error::PeerClosed) => self.input = Link::Lost,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// REVOKE: the focus of the owner that left ends. Nothing when none
+    /// was granted; a service that cannot be reached has lost it anyway.
+    fn revoke_focus(&mut self) {
+        if !core::mem::take(&mut self.focus_on) {
+            return;
+        }
+        let Link::Linked(session) = &self.input else {
+            return;
+        };
+        match sys::send(session, &InputMethod::Revoke.header().bytes()) {
+            Ok(_) => {}
+            Err(Error::PeerClosed) => self.input = Link::Lost,
+            Err(error) => rt::println!("virtio-gpu: REVOKE failed: {error:?}"),
         }
     }
 
@@ -702,6 +800,14 @@ impl Driver {
             self.release(label);
             return Answer::Status(Status::Kernel(Error::NoMemory));
         };
+        let mut handles: Outgoing = [buffer.erase(), session.erase()].into();
+        let focus = self.grant_focus();
+        let focused = focus.is_some();
+        if let Some(focus) = focus {
+            // Room for three handles: the buffer and the owner's session
+            // are two.
+            let _ = handles.push(focus);
+        }
         let Some(pending) = r.defer() else {
             self.release(label);
             return Answer::Status(Status::Kernel(Error::BadState));
@@ -709,7 +815,8 @@ impl Driver {
         self.opening = Some(Opening {
             pending,
             label,
-            handles: [buffer.erase(), session.erase()],
+            handles,
+            focus: focused,
         });
         if !self.issue_scanout(Job::ScanoutOn) {
             self.opened(false);

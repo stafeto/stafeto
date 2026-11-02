@@ -859,6 +859,7 @@ pub mod cycle;
 pub mod doom;
 pub mod entropy;
 pub mod gpu;
+pub mod input;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
 pub mod normal;
@@ -905,6 +906,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-entropy") as usize
     + cfg!(feature = "table-entropy-vz") as usize
     + cfg!(feature = "table-gpu") as usize
+    + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
@@ -953,6 +955,7 @@ const _: () = assert!(
     feature = "table-entropy",
     feature = "table-entropy-vz",
     feature = "table-gpu",
+    feature = "table-input",
     feature = "table-posix-random"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
@@ -1032,6 +1035,8 @@ pub const TABLE: &[Record] = entropy::TABLE;
 pub const TABLE: &[Record] = entropy::VZ_TABLE;
 #[cfg(feature = "table-gpu")]
 pub const TABLE: &[Record] = gpu::TABLE;
+#[cfg(feature = "table-input")]
+pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 
@@ -1985,6 +1990,10 @@ mod tests {
             ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
         assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
+        assert_eq!(
+            order_of(input::TABLE),
+            ["input", "gpu", "input-probe", "input-probe-x"]
+        );
         assert_eq!(
             refused(cycle::TABLE),
             "the connections make a cycle: a -> b -> a"

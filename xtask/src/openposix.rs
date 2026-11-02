@@ -211,7 +211,9 @@ fn fits(names: &[&str], bytes: usize, name: &str, size: usize) -> bool {
 /// Whether the runner went through its whole list: a test that ends the
 /// runner early (by a signal to its group, say) leaves the rest unstarted.
 fn batch_finished(log: &str) -> bool {
-    log.lines().any(|l| l == "os-test-run: done")
+    // The pool of the process service is full again: 20 children at once.
+    log.lines().any(|l| l == "os-test-run: pool 20 of 20")
+        && log.lines().any(|l| l == "os-test-run: done")
         && log
             .lines()
             .any(|l| l == "init: os-test-run ended: exit code 0, not restarted")
