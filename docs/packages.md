@@ -16,7 +16,7 @@ Unknown keys are refused.
 | --- | --- |
 | `name` | The package name; equals the file name. |
 | `version` | The pinned version of the source. |
-| `kind` | `base` for the base set of the system, `addon` for the rest. A base package depends on base packages only. |
+| `kind` | `base` for the base set of the system, `addon` for the rest of the shell image, `game` for the games image only. A base package depends on base packages only, and no package of the shell image depends on a game. |
 | `url` | The https URL of the source archive. |
 | `sha256` | SHA-256 of the archive, 64 lowercase hex digits. |
 | `license` | SPDX expression of the licence. |
@@ -67,6 +67,15 @@ them for the licence notes of the image.
   names it, so the packages linked into BusyBox (sbase, toybox, ncompress, chimerautils,
   nbase, paxmirabilis, util-linux) show 0 bytes (their names are links to `busybox`;
   so are the `tput` and `tabs` of ncurses). `cargo xtask ash-dialog` prints the same table.
+- The games image (`boot-doom.img`) holds the shell image's packages and the
+  games: Doomgeneric (`/bin/doom`, GPL-2.0-or-later) and the Freedoom data
+  (`/games/freedoom1.wad`, BSD-3-Clause). The shell image holds no game.
+  `cargo xtask doom-headless [MACHINE]` builds the games image and plays the
+  demo of Freedoom from ash without a screen (`doom -iwad /games/freedoom1.wad
+  -timedemo demo1 -nodraw`). The image carries the licence texts and the notes
+  of the sources (`DOOM-LICENSE`, `DOOM-SOURCE`, `FREEDOOM-LICENSE`,
+  `FREEDOOM-SOURCE`), and the check of the image compares the WAD with the
+  one the build script unpacked.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 
