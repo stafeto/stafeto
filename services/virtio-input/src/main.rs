@@ -315,6 +315,9 @@ impl Driver {
         let taken = self.reap(PER_STEP);
         // The events of the step, for the line of the longest.
         rt::service::step_detail(taken);
+        // When the notification to itself fails the line opens with events
+        // left in the queue and the status already cleared: they wait for
+        // the next key's interrupt, which takes them with its own.
         if self.queue.peek_used().is_some() && sys::notify(&self.notify, MORE).is_ok() {
             return;
         }
@@ -322,8 +325,8 @@ impl Driver {
     }
 
     /// Takes up to `most` events the device returned to the focus, and
-    /// gives their buffers back; how many. A buffer that cannot be taken back or given back ends the
-    /// driver (DEVICE_FAILED).
+    /// gives their buffers back; how many. A buffer that cannot be taken
+    /// back or given back ends the driver (DEVICE_FAILED).
     fn reap(&mut self, most: u64) -> u64 {
         let mut taken = 0u64;
         while taken < most
@@ -418,12 +421,21 @@ impl Driver {
 
 impl Service<1> for Driver {
     const VERSION: u16 = VERSION;
+    /// Place 0 of the table is every session of focus's: only the current
+    /// one may read, and a revoked one that reads is refused (REVOKED)
+    /// whatever session holds the place, so the old foci an owner keeps
+    /// never fill the table.
+    const PLACED: usize = 1;
     const METHODS: &'static [u16] = &[
         Method::Grant.number(),
         Method::Revoke.number(),
         Method::Read.number(),
     ];
     type Data = ();
+
+    fn place(&self, label: u64) -> Option<usize> {
+        focus::is_focus_label(label).then_some(0)
+    }
 
     fn request(&mut self, _: &mut Session<(), 1>, r: &mut Request<'_>) -> Answer {
         let Some(method) = Method::from_number(r.method()) else {
@@ -441,7 +453,9 @@ impl Service<1> for Driver {
         }
     }
 
-    /// The last copy of a session went: the focus's ends the focus.
+    /// The last copy of a session went: the focus's ends the focus, and so
+    /// does the display service's (it ended, and its owner's focus with
+    /// it).
     fn closed(&mut self, label: u64) {
         self.focus.closed(label);
     }

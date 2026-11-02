@@ -105,7 +105,7 @@ const PROBE: Record = Record {
     priority: 30,
     ceiling: 30,
     quota: 96 * PAGE,
-    handle_limit: 32,
+    handle_limit: 48,
     restart: Restart::Never,
     console: true,
     log: false,

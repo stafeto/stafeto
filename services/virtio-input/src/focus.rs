@@ -87,9 +87,12 @@ impl Focus {
     }
 
     /// The last copy of the session `label` went: it was the focus, or it
-    /// was a revoked one that is none now.
+    /// was a revoked one that is none now, or it was the display service's
+    /// (a label without the tag): the service ended, and the focus it
+    /// granted ends with it, so that no process reads keys of a screen
+    /// that has no service.
     pub fn closed(&mut self, label: u64) {
-        if self.current == Some(label) {
+        if self.current == Some(label) || !is_focus_label(label) {
             self.revoke();
         }
     }
@@ -232,6 +235,18 @@ mod tests {
         assert_eq!(f.holder(), Some(new));
         f.closed(new);
         assert_eq!(f.holder(), None);
+    }
+
+    #[test]
+    fn the_end_of_the_display_service_ends_the_focus() {
+        let mut f = Focus::new();
+        let label = f.grant();
+        f.event(Event::key(1, true));
+        // A session init gave: the label has no tag.
+        f.closed(5);
+        assert_eq!(f.holder(), None);
+        let mut out = [Event::default(); 4];
+        assert_eq!(f.read(label, &mut out), Err(Refusal::Revoked));
     }
 
     #[test]

@@ -43,7 +43,7 @@ const GPU_STACK_SIZE: u32 = crate::gpu_probe::GPU_STACK_SIZE;
 pub const PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-input"]),
     ("virtio-input", "virtio-input", INPUT_STACK_SIZE, &[]),
-    ("virtio-gpu", "virtio-gpu", GPU_STACK_SIZE, &[]),
+    ("virtio-gpu", "virtio-gpu", GPU_STACK_SIZE, &["crash"]),
     ("input-probe", "input-probe", CHILD_STACK_SIZE, &[]),
 ];
 
@@ -65,7 +65,7 @@ const MARKER: &str = "input-probe: send ";
 const ENDED: &str = "init: input-probe ended: exit code 0, not restarted";
 
 /// The lines the probe prints once per check that passed.
-const CHECKS: [&str; 12] = [
+const CHECKS: [&str; 14] = [
     "input-probe: a key with no focus is dropped",
     "input-probe: key 1 30 1",
     "input-probe: key 1 30 0",
@@ -76,6 +76,8 @@ const CHECKS: [&str; 12] = [
     "input-probe: OPEN gave the owner a session of focus",
     "input-probe: the key reaches the owner of the screen",
     "input-probe: with no owner a key goes nowhere, the next owner has the focus",
+    "input-probe: 20 owners in turn keep their foci, the next owner reads",
+    "input-probe: the end of the display service revokes the focus",
     "input-probe: a program init gave no session is refused",
     "input-probe: ok",
 ];
@@ -161,6 +163,51 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
         ));
     }
     Ok(rows)
+}
+
+/// The events one step of the service takes at most (PER_STEP of
+/// services/virtio-input).
+const PER_STEP: u64 = 16;
+
+/// The lines of the interrupt step (kind 65): (ticks, events), each a new
+/// longest, so the first is the shortest.
+fn interrupt_steps(lines: &[String]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let [
+            "service",
+            "step:",
+            tag,
+            "kind",
+            "65",
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+        ] = words.as_slice()
+            && *tag == INPUT_TAG
+            && let (Ok(ticks), Ok(detail)) = (ticks.parse(), detail.parse())
+        {
+            out.push((ticks, detail));
+        }
+    }
+    out
+}
+
+/// The step of PER_STEP events from the lines of the interrupt step: the
+/// shortest line is the base, the steepest rise over it per event is the
+/// cost of an event; (base, ticks an event, projected step). None without
+/// a line that carries events.
+pub fn projection(lines: &[String]) -> Option<(u64, u64, u64)> {
+    let steps = interrupt_steps(lines);
+    let base = steps.iter().map(|s| s.0).min()?;
+    let per_event = steps
+        .iter()
+        .filter(|s| s.1 > 0)
+        .map(|&(ticks, events)| (ticks - base).div_ceil(events))
+        .max()?;
+    Some((base, per_event, base + PER_STEP * per_event))
 }
 
 /// Where the run keeps its monitor's socket.
@@ -286,6 +333,17 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     }
     let rows = steps_verdict(&outcome.lines)?;
     crate::check_waits(&outcome.lines, &[INPUT_TAG], "input-probe")?;
+    let (base, per_event, projected) = projection(&outcome.lines)
+        .ok_or_else(|| "input-probe: no interrupt step carried events".to_owned())?;
+    if projected > STEP_MAX {
+        return Err(format!(
+            "input-probe: a step of {PER_STEP} events projects to {projected} ticks ({base} and {per_event} an event), past {STEP_MAX}: lower PER_STEP"
+        ));
+    }
+    println!(
+        "input-probe on {}: a step of {PER_STEP} events projects to {projected} ticks ({base} and {per_event} an event)",
+        machine.name
+    );
     let text: Vec<_> = rows
         .iter()
         .map(|(kind, ticks, detail)| format!("kind {kind} {ticks} (detail {detail})"))
@@ -386,6 +444,21 @@ mod tests {
                 .contains("Read")
         );
         assert!(steps_verdict(&make(Some((65, STEP_MAX)), None)).is_ok());
+    }
+
+    #[test]
+    fn a_step_of_sixteen_events_is_projected_from_the_slope() {
+        let lines: Vec<String> = [(951, 0), (1500, 2), (2034, 4)]
+            .iter()
+            .map(|&(t, d)| format!("service step: {INPUT_TAG} kind 65 {t} ticks detail {d}"))
+            .collect();
+        // Base 951, the steepest rise is 1083 over 4 events: 271 an event.
+        assert_eq!(projection(&lines), Some((951, 275, 951 + 16 * 275)));
+        assert_eq!(projection(&[]), None);
+        let none: Vec<String> = vec![format!(
+            "service step: {INPUT_TAG} kind 65 951 ticks detail 0"
+        )];
+        assert_eq!(projection(&none), None);
     }
 
     #[test]

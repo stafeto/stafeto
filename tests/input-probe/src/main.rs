@@ -388,6 +388,28 @@ impl Probe<'_> {
         }
     }
 
+    /// Twenty owners in turn, each keeping every focus it had: the old
+    /// foci read REVOKED and do not fill the service's table, so the next
+    /// owner's READ still passes.
+    fn many_owners(&self, gpu: &Handle<Channel>) -> Result<(), &'static str> {
+        const OWNERS: usize = 20;
+        let mut kept: [Option<Handle<Channel>>; OWNERS] = [const { None }; OWNERS];
+        for i in 0..OWNERS {
+            let (screen, focus) = self.open(gpu)?;
+            plain_gpu(&screen).map_err(|_| "CLOSE of the screen")?;
+            kept[i] = Some(focus);
+            for old in kept[..=i].iter().flatten() {
+                if read(old, 1).err() != Some(Fail::Status(code(REVOKED))) {
+                    return Err("an old focus was not REVOKED");
+                }
+            }
+        }
+        let (_screen, last) = self.open(gpu)?;
+        read(&last, 1).map_err(|_| "READ of the next owner after many foci")?;
+        rt::println!("input-probe: 20 owners in turn keep their foci, the next owner reads");
+        Ok(())
+    }
+
     /// The display service's part: the focus follows the owner of the
     /// screen. `stale` is a focus of the grantor's own, revoked by the
     /// screen's first OPEN.
@@ -427,6 +449,26 @@ impl Probe<'_> {
             return Err("the first owner's focus reads again");
         }
         rt::println!("input-probe: with no owner a key goes nowhere, the next owner has the focus");
+        drop(screen);
+        self.many_owners(&gpu)?;
+        // The display service ends: the focus of its last owner ends with
+        // it. Its CRASH is never answered; init starts it again.
+        let (screen, focus) = self.open(&gpu)?;
+        if sys::send(&gpu, &proto_gpu::Method::Crash.header().bytes()).is_ok() {
+            return Err("CRASH of the display service was answered");
+        }
+        let mut revoked = false;
+        for _ in 0..50 {
+            if read(&focus, 1).err() == Some(Fail::Status(code(REVOKED))) {
+                revoked = true;
+                break;
+            }
+            self.sleep(10_000_000);
+        }
+        if !revoked {
+            return Err("the focus outlived the display service");
+        }
+        rt::println!("input-probe: the end of the display service revokes the focus");
         drop(screen);
         Ok(())
     }

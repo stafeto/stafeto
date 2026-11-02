@@ -762,8 +762,10 @@ impl Driver {
         let Link::Linked(session) = &self.input else {
             return;
         };
-        if let Err(Error::PeerClosed) = sys::send(session, &InputMethod::Revoke.header().bytes()) {
-            self.input = Link::Lost;
+        match sys::send(session, &InputMethod::Revoke.header().bytes()) {
+            Ok(_) => {}
+            Err(Error::PeerClosed) => self.input = Link::Lost,
+            Err(error) => rt::println!("virtio-gpu: REVOKE failed: {error:?}"),
         }
     }
 
