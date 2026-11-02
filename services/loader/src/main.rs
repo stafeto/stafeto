@@ -177,7 +177,11 @@ fn report_stack_depth(data: u64, data_len: u64, console: u64) {
     let top = data + data_len;
     let mut at = top - pl::LOADER_STACK_PAGES * PAGE;
     // SAFETY: the stack pages are mapped for the loader's life.
-    while at < top && unsafe { (at as *const u64).read_volatile() } == 0 {
+    while at < top
+        && unsafe { core::sync::atomic::AtomicU64::from_ptr(at as *mut u64) }
+            .load(core::sync::atomic::Ordering::Relaxed)
+            == 0
+    {
         at += 8;
     }
     if console != 0 {
