@@ -603,6 +603,31 @@ pub fn occupied() -> usize {
         .count()
 }
 
+/// The places that hold a thread: index, flags and the kernel state of
+/// the thread (a number), for a probe's report.
+pub fn occupied_report(out: &mut [[u64; 3]]) -> usize {
+    let mut n = 0;
+    for (index, place) in TABLE.iter().enumerate() {
+        let flags = place.state.flags();
+        if flags != FREE && n < out.len() {
+            let native = place.native.load(Ordering::Relaxed);
+            let kernel = if native == 0 {
+                99
+            } else {
+                sys::thread_info(&borrowed::<Thread>(native)).map_or(98, |i| match i.state {
+                    ThreadState::Ended => 1,
+                    ThreadState::Ready => 2,
+                    ThreadState::Running => 3,
+                    _ => 4,
+                })
+            };
+            out[n] = [index as u64, flags as u64, kernel];
+            n += 1;
+        }
+    }
+    n
+}
+
 /// What a pass of `collect` left: `deferred` when an owner's recovery waits
 /// for a detach, `pinned` when a place was passed over because a sender
 /// pins it (the next pass frees it).
