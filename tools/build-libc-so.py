@@ -14,6 +14,10 @@ Subcommands:
   link -o OUT OBJECT_OR_ARCHIVE...
           link a dynamic program against that sysroot (the recipe of
           3.12.3; the programs of the images use it).
+  programs [NAME...]
+          link the dynamic programs of the images (busybox, busybox-utils,
+          bash, nano, htop, ncdu; all by default) from the objects their build scripts left, into
+          target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the
           property that makes it bad.
@@ -42,11 +46,14 @@ SYSROOT = OUT / "sysroot"
 PROBES = OUT / "probes"
 STAMP = OUT / "stamp"
 PROBES_STAMP = OUT / "probes-stamp"
+PROGRAMS = OUT / "programs"
 SOURCES = ROOT / "tests" / "posix-so" / "dyn"
 
 LIBRARY_BASE = 0x0400_0000
 LIBRARY_ROOM = range(0x0400_0000, 0x0800_0000)
 PROGRAM_BASE = 0x20_0000
+LOOKUPS_MAX = 8_192
+RELOCS_MAX = 65_536
 PAGE = 4096
 CHAIN_LIMIT = 32
 LAYER_TARGET = "aarch64-unknown-none"
@@ -66,6 +73,11 @@ ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image"]
 # of AArch64, binary128 long double, 128-bit integers.
 HELPER = re.compile(r"^(__aarch64_\w+|__[a-z]+(tf|ti)[0-9]|__(fix|float|extend|trunc)\w*(tf|ti)\w*)$")
 
+# Helpers (the binary128 and 128-bit integer ones of compiler_builtins):
+# programs call them, and libc.so's own objects mostly do not. The link keeps
+# every one that relibc's archive defines (`-u`, 52 of them) and the export
+# list names them (HELPER). Filled from relibc's archive by `build`.
+HELPER_KEEP: dict = {}
 CLANG_FLAGS = ["--target=aarch64-linux-gnu", "-mfix-cortex-a53-835769", "-nostdinc",
                "-fno-stack-protector", "-fno-builtin", "-std=c11", "-O2", "-Wall", "-Wextra",
                "-Werror"]
@@ -362,7 +374,8 @@ def link_so(output: Path, libc_a: Path, layer_a: Path, extra: list) -> Path:
     run(lld(), "-shared", "-soname", "libc.so", f"--image-base={LIBRARY_BASE:#x}", "-Bsymbolic",
         "-z", "now", "-z", "defs", "-z", "norelro", "-z", "separate-loadable-segments",
         "-z", "max-page-size=4096", "--hash-style=gnu", "--gc-sections",
-        "--fix-cortex-a53-843419", *extra, "-o", output, "--whole-archive", libc_a, layer_a,
+        "--fix-cortex-a53-843419", *extra, *(f"--undefined={n}" for n in HELPER_KEEP),
+        "-o", output, "--whole-archive", libc_a, layer_a,
         "--no-whole-archive")
     return output
 
@@ -491,6 +504,30 @@ def build_stamp(libc_a: Path, layer_a: Path) -> str:
                       TOOLCHAIN)) + "\n"
 
 
+def raise_helpers(libc_a: Path) -> Path:
+    """A copy of relibc's archive whose members that define a name of
+    HELPER_KEEP have default visibility for it (compiler_builtins hides
+    them, and a hidden definition cannot be exported)."""
+    for name in archive_names(libc_a, "--defined-only", "--extern-only"):
+        if HELPER.match(name) and not name.startswith("__aarch64_"):
+            HELPER_KEEP[name] = "compiler helper of programs"
+    work = OUT / "libc-vis"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir()
+    result = work / "libc.a"
+    shutil.copyfile(libc_a, result)
+    listing = work / "names.txt"
+    listing.write_text("".join(f"{n}\n" for n in HELPER_KEEP))
+    out = run(llvm("llvm-nm"), "-A", "--defined-only", "--extern-only", libc_a, capture=True).stdout
+    members = sorted({line.split(":")[1] for line in out.splitlines()
+                      if line.split()[-1] in HELPER_KEEP})
+    for member in members:
+        run(llvm("llvm-ar"), "x", libc_a, member, cwd=work)
+        run(llvm("llvm-objcopy"), f"--set-symbols-visibility={listing}=default", work / member)
+        run(llvm("llvm-ar"), "r", result, work / member)
+    return result
+
+
 def build(source: Path | None) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     sysroot = build_relibc(source)
@@ -504,6 +541,7 @@ def build(source: Path | None) -> None:
         return
     STAMP.unlink(missing_ok=True)
     layer_a, raised = raise_visibility(libc_a, layer_a)
+    libc_a = raise_helpers(libc_a)
     print(f"layer archive: {raised} names shared with relibc raised to default visibility")
 
     plain = Elf(link_so(OUT / "libc-all.so", libc_a, layer_a, []))
@@ -619,7 +657,9 @@ def build_probes() -> list:
     made = {}
     for name in GOOD:
         compile_c(SOURCES / f"{name}.c", work / f"{name}.o")
-        link_program(PROBES / name, [work / f"{name}.o"])
+        # so-hello exports so_exported, which its dl mode looks up by name.
+        link_program(PROBES / name, [work / f"{name}.o"],
+                     ["--export-dynamic-symbol=so_exported"] if name == "so-hello" else None)
         made[name] = "good"
     # bad-interp: another dynamic linker.
     compile_c(SOURCES / "bad-interp.c", work / "bad-interp.o")
@@ -664,6 +704,87 @@ def build_probes() -> list:
             fail(f"probe {name}: {why}")
     PROBES_STAMP.write_text(wanted)
     return sorted(made)
+
+
+# ----------------------------------------------------------------- programs
+
+# The directories of BusyBox's archives (tests/busybox/build.rs lists the same).
+BUSYBOX_DIRECTORIES = ("libbb", "coreutils", "coreutils/libcoreutils", "shell", "procps",
+                       "networking", "archival", "archival/libarchive", "editors", "findutils",
+                       "miscutils", "util-linux", "sysklogd", "libpwdgrp", "console-tools")
+BUSYBOX_MAIN = ROOT / "tools" / "busybox" / "dynamic-main.c"
+
+
+def program_inputs() -> dict:
+    """Name of the program: the files it is linked from."""
+    def busybox(tree: str, ready: bool) -> list:
+        inputs = [ROOT / "target" / tree / "source" / d / "lib.a" for d in BUSYBOX_DIRECTORIES]
+        if ready:
+            inputs.append(ROOT / "target" / "ready-utils" / "ready.a")
+        return inputs
+    return {
+        "busybox": busybox("busybox", False),
+        "busybox-utils": busybox("busybox-utils", True),
+        "bash": [ROOT / "target" / "bash" / "bash.o"],
+        "nano": [ROOT / "target" / "nano" / "nano.o"],
+        "htop": [ROOT / "target" / "htop" / "htop.o"],
+        "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
+    }
+
+
+def build_programs(wanted_names: list) -> list:
+    """Links the programs `wanted_names` (all when empty); each needs its
+    objects, built by the script of its package. Returns the names built."""
+    known = program_inputs()
+    unknown = [n for n in wanted_names if n not in known]
+    if unknown:
+        fail(f"unknown program {unknown[0]}")
+    if not (SYSROOT / "lib" / "libc.so").exists():
+        fail("build libc.so first: tools/build-libc-so.py build")
+    PROGRAMS.mkdir(parents=True, exist_ok=True)
+    work = PROGRAMS / "obj"
+    work.mkdir(exist_ok=True)
+    built, lines = [], []
+    for name, inputs in known.items():
+        if wanted_names and name not in wanted_names:
+            continue
+        missing = [p for p in inputs if not p.exists()]
+        if missing:
+            fail(f"{name}: missing {missing[0]}: build its package first")
+        stamp = PROGRAMS / f"{name}.stamp"
+        wanted = "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
+                            digest(Path(__file__)),
+                            *((digest(BUSYBOX_MAIN),) if name.startswith("busybox") else ()),
+                            *(digest(p) for p in inputs))) + "\n"
+        output = PROGRAMS / name
+        if stamp.exists() and stamp.read_text() == wanted and output.exists():
+            built.append(name)
+            continue
+        stamp.unlink(missing_ok=True)
+        objects = list(inputs)
+        if name.startswith("busybox"):
+            compile_c(BUSYBOX_MAIN, work / f"{name}-main.o")
+            objects.insert(0, work / f"{name}-main.o")
+        result = link_program(output, objects, ["--gc-sections"], capture=True)
+        if result.returncode != 0:
+            names = sorted(set(re.findall(r"undefined symbol: (\S+)", result.stderr)))
+            fail(f"{name}: link failed; undefined: {' '.join(names) or result.stderr[-2000:]}")
+        elf = Elf(output)
+        why = good_checks(name, elf)
+        if why:
+            fail(f"program {name}: {why}")
+        stamp.write_text(wanted)
+        built.append(name)
+    for name in built:
+        elf = Elf(PROGRAMS / name)
+        kinds = Counter(k for _, k, _ in elf.relocations())
+        lookups = kinds["GLOB_DAT"] + kinds["JUMP_SLOT"]
+        lines.append(f"{name}: {(PROGRAMS / name).stat().st_size} bytes, relocations "
+                     f"{dict(kinds)}, symbol lookups {lookups} (limit {LOOKUPS_MAX})")
+        if lookups >= LOOKUPS_MAX or sum(kinds.values()) >= RELOCS_MAX:
+            fail(f"{name}: over the limits of the loader: {lines[-1]}")
+    (PROGRAMS / "report.txt").write_text("\n".join(lines) + "\n")
+    return built
 
 
 # ------------------------------------------------------------------- report
@@ -713,6 +834,9 @@ def main(argv: list) -> None:
             if len(rest) < 3 or rest[0] != "-o":
                 sys.exit("usage: build-libc-so.py link -o OUT OBJECT_OR_ARCHIVE...")
             link_program(Path(rest[1]), rest[2:])
+        elif command == "programs":
+            print("programs:", " ".join(build_programs(rest)))
+            print((PROGRAMS / "report.txt").read_text(), end="")
         elif command == "probes":
             print("probes:", " ".join(build_probes()))
         elif command == "report":

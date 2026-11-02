@@ -15,6 +15,7 @@
 
 #![no_std]
 
+mod dl;
 mod files;
 mod ipc;
 mod mapping;
@@ -31,7 +32,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 22;
+pub const PLATFORM_INTERFACE: u64 = 23;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32

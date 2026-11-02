@@ -247,8 +247,10 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 30] = [
+const SYSTEM_PATHS: [&str; 32] = [
     "/bin",
+    "/lib",
+    "/lib/libc.so",
     "/libexec",
     "/libexec/ramfs",
     "/dev",
@@ -347,9 +349,16 @@ pub fn shared_path(program: &str) -> Option<&'static str> {
     SHARED.iter().find(|(n, _)| *n == program).map(|(_, p)| *p)
 }
 
-/// The library and the dynamic programs of the probe of tests/posix-so.
+/// The directory of the library and the library, for an image that has a
+/// dynamic program (the loader opens it for every one of them).
+fn library() -> Vec<RootFile> {
+    vec![dir("/lib"), file(LIBRARY, 0o755, ROOT, "libc.so")]
+}
+
+/// The dynamic programs of the probe of tests/posix-so (the library comes
+/// with `procs`).
 fn shared_files() -> Vec<RootFile> {
-    let mut files = vec![dir("/lib"), file(LIBRARY, 0o755, ROOT, "libc.so")];
+    let mut files = Vec::new();
     for (name, _) in &SHARED[1..] {
         let path: &'static str = match *name {
             "so-hello" => "/bin/so-hello",
@@ -452,7 +461,8 @@ fn dialog() -> Vec<RootFile> {
 }
 
 fn shell_files() -> Result<Vec<RootFile>, String> {
-    let mut files = vec![
+    let mut files = library();
+    files.extend([
         dir("/bin"),
         dir("/libexec"),
         file("/libexec/ramfs", 0o4750, USER, "ramfs"),
@@ -498,7 +508,7 @@ fn shell_files() -> Result<Vec<RootFile>, String> {
             ROOT,
             Source::Bytes("utmpx", &UTMPX),
         ),
-    ];
+    ]);
     files.extend(package_files(&crate::packages::of_image(
         "boot-ash-dialog.img",
     )?)?);
@@ -650,7 +660,8 @@ const INPUTRC: &[u8] = b"\"\\e[1~\": beginning-of-line\n\
 /// a directory only root may search.
 fn procs() -> Vec<RootFile> {
     const NOBODY_DIR: u32 = 0o700;
-    let mut files = vec![
+    let mut files = library();
+    files.extend([
         dir("/bin"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
@@ -694,7 +705,7 @@ fn procs() -> Vec<RootFile> {
             ..dir("/sbin")
         },
         file("/sbin/procs-child", 0o755, ROOT, "posix-procs"),
-    ];
+    ]);
     files.extend(devices());
     files
 }
@@ -741,13 +752,16 @@ fn steps() -> Vec<RootFile> {
 /// itself under a role its first argument names; BusyBox gives the `ls` and
 /// the `cat` of the pipeline of S22 (5e).
 fn rtbench() -> Vec<RootFile> {
-    let mut files = vec![
+    let mut files = library();
+    files.extend([
         dir("/bin"),
         file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
         file("/bin/cat", 0o755, ROOT, "busybox-probe"),
+        file("/bin/ls-dyn", 0o755, ROOT, "busybox-dyn"),
+        file("/bin/cat-dyn", 0o755, ROOT, "busybox-dyn"),
         dir("/dev"),
-    ];
+    ]);
     files.extend(devices());
     files
 }

@@ -62,7 +62,8 @@
  * stamp at the end of the file, in nanoseconds a MiB; S22 a forker's
  * `ls /etc | cat` (fork, exec of /bin/ls and /bin/cat, two pipes, the read
  * to the end and two waitpid), from before the first pipe to the last
- * waitpid. The time from a write into an empty pipe to the return of the
+ * waitpid; S22d the same with the dynamically linked BusyBox (/bin/ls-dyn,
+ * /bin/cat-dyn), S22 with the static one. The time from a write into an empty pipe to the return of the
  * waiting read is half of a round trip of S19 and has no row of its own.
  * The scenarios of 5e' (the generator of the layer, which serves these with
  * no request to a service; the rows count the kernel calls): S23 and S24
@@ -1070,7 +1071,7 @@ static void number_text(char *out, uint64_t value) {
 /* `ls /etc | cat` as a shell does it: two pipes, a fork and an exec for
  * each stage, the output read to its end here, both stages waited for.
  * FORK_SAMPLES times; the ticks and the kernel calls into /tmp/probe. */
-static int pipeline(int fd) {
+static int pipeline(int fd, const char *ls_path, const char *cat_path) {
     for (int i = 0; i < FORK_SAMPLES; i++) {
         uint64_t calls = rtbench_calls();
         uint64_t t0 = ticks();
@@ -1081,14 +1082,14 @@ static int pipeline(int fd) {
         if (lister == 0) {
             char *ls[] = { "ls", "/etc", NULL };
             if (dup2(up[1], 1) != 1) _exit(11);
-            execve("/bin/ls", ls, envp);
+            execve(ls_path, ls, envp);
             _exit(12);
         }
         pid_t copier = lister < 0 ? -1 : fork();
         if (copier == 0) {
             char *cat[] = { "cat", NULL };
             if (dup2(up[0], 0) != 0 || dup2(down[1], 1) != 1) _exit(13);
-            execve("/bin/cat", cat, envp);
+            execve(cat_path, cat, envp);
             _exit(14);
         }
         if (lister < 0 || copier < 0) return 15;
@@ -1151,7 +1152,8 @@ static int forker(uint64_t entered, char **argv) {
         execve("/bin/rtbench-posix", quick, envp);
         return 5;
     }
-    if (mode == 3) return pipeline(fd);
+    if (mode == 3) return pipeline(fd, "/bin/ls", "/bin/cat");
+    if (mode == 4) return pipeline(fd, "/bin/ls-dyn", "/bin/cat-dyn");
     for (int i = 0; i < FORK_SAMPLES; i++) {
         uint64_t calls = rtbench_calls();
         uint64_t t0 = ticks();
@@ -1244,7 +1246,7 @@ static int forks(void) {
 #define PIPE_SIZES 2
 
 static const size_t pipe_chunks[PIPE_SIZES] = { 512, 4096 };
-static struct histogram s19, s20[PIPE_SIZES], s22;
+static struct histogram s19, s20[PIPE_SIZES], s22, s22d;
 static char pipe_data[4096];
 
 /* Spawns /bin/rtbench-posix in `role` with `in` as its standard input and,
@@ -1347,7 +1349,8 @@ static int pipes(void) {
     for (int i = 0; i < PIPE_SIZES; i++)
         if (pipe_throughput(&s20[i], pipe_chunks[i])) return 1;
     /* S22 is made by a forker (role forker, mode 3), as S16 is. */
-    return run_forker(&s22, 3, 0, 0, 0);
+    if (run_forker(&s22, 3, 0, 0, 0)) return 1;
+    return run_forker(&s22d, 4, 0, 0, 0);
 }
 
 /* --- S23, S24, S25: the generator ---------------------------------------- */
@@ -1781,6 +1784,7 @@ static void report(void) {
     row("s20_pipe_1m_w512", &s20[0], 0);
     row("s20_pipe_1m_w4k", &s20[1], 0);
     row("s22_ls_etc_cat", &s22, 1);
+    row("s22d_ls_etc_cat", &s22d, 1);
     row("s23_getentropy_32", &s23, 1);
     row("s24_getentropy_256", &s24, 1);
     row("s25_urandom_4k", &s25, 1);

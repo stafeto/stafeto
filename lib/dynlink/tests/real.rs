@@ -340,3 +340,28 @@ fn damage_to_the_real_files_is_refused() {
         Err(Refusal::Needed)
     );
 }
+
+#[test]
+fn a_module_from_its_program_headers_is_the_one_parse_builds() {
+    let Some(w) = world(HELLO) else { return };
+    for (name, role, parsed) in [
+        ("libc.so", Role::Library, &w.library),
+        (HELLO, Role::Program, &w.program),
+    ] {
+        let file = bytes(name);
+        let phoff = u64::from_le_bytes(file[32..40].try_into().unwrap()) as usize;
+        let phnum = u16::from_le_bytes(file[56..58].try_into().unwrap()) as usize;
+        let headers = &file[phoff..phoff + phnum * dynlink::PHDR_SIZE];
+        let found = dynlink::module(role, headers, 0, &w.space).unwrap();
+        assert_eq!(&found, parsed, "{name}");
+        // Headers cut in the middle of a record, or without a segment.
+        assert_eq!(
+            dynlink::module(role, &headers[..headers.len() - 1], 0, &w.space),
+            Err(Refusal::Section)
+        );
+        assert_eq!(
+            dynlink::module(role, &headers[..dynlink::PHDR_SIZE], 0, &w.space),
+            Err(Refusal::Section)
+        );
+    }
+}

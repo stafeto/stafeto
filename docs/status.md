@@ -249,4 +249,10 @@ Actions.
   `/lib/libc.so`, shares its code and read-only data through the table of
   images, relocates it and the program, and fills the auxiliary vector;
   `cargo xtask posix-so` boots the image with `/lib/libc.so` and the probe.
-  No program of the images is linked dynamically yet.
+  BusyBox (the programs started from files of the images), bash, nano, htop
+  and ncdu are linked dynamically (`tools/build-libc-so.py programs`, ncurses
+  stays inside the programs): the shell image is 7.0 MB where it was 9.6 MB.
+  `dlopen(NULL)`, `dlsym` of the global scope (the program, then libc.so) and
+  `dl_iterate_phdr` work in a dynamic program; `dlopen` of a path says it
+  loads no new library. `ash-launcher`, the real-time programs, the probes
+  of os-test and Open POSIX and the BusyBox that `init` starts stay static.

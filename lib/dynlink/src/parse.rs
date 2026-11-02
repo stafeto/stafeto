@@ -5,8 +5,8 @@
 //! checks of every table they name.
 
 use crate::{
-    Array, Dynamic, Limit, Map, Memory, NEEDED, RELA_SIZE, Refusal, Role, SYM_SIZE, SYMBOLS_MAX,
-    Segment,
+    Access, Array, Dynamic, Limit, Map, Memory, Module, NEEDED, RELA_SIZE, Refusal, Role, SYM_SIZE,
+    SYMBOLS_MAX, Segment,
 };
 
 const DT_NULL: i64 = 0;
@@ -343,4 +343,87 @@ fn hash_geometry<M: Memory + ?Sized>(
     d.bloom_shift = bloom_shift;
     d.nsyms = nsyms;
     Ok(())
+}
+
+/// The bytes of a `PT_DYNAMIC` the layer reads for `dlsym` (the loader's
+/// limit, 64 entries).
+pub const DYNAMIC_MAX: usize = 1024;
+
+const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_TLS: u32 = 7;
+/// The bytes of an `Elf64_Phdr`.
+pub const PHDR_SIZE: usize = 56;
+
+/// The module of an object that is already in memory, from the bytes of its
+/// program headers (`headers`, whole `Elf64_Phdr` records): one `PT_LOAD`
+/// each of read-only, read-execute and read-write, a `PT_DYNAMIC` that fits
+/// `DYNAMIC_MAX`, and the bias `bias`. The tables the dynamic section names
+/// are checked as `parse` checks them. The layer's `dlsym` uses it on the
+/// program and on libc.so, which the loader has already linked.
+pub fn module<M: Memory + ?Sized>(
+    role: Role,
+    headers: &[u8],
+    bias: u64,
+    mem: &M,
+) -> Result<Module, Refusal> {
+    if !headers.len().is_multiple_of(PHDR_SIZE) {
+        return Err(Refusal::Section);
+    }
+    let word = |h: &[u8], at: usize| u64::from_le_bytes(h[at..at + 8].try_into().unwrap());
+    let mut parts: [Option<Segment>; 3] = [None; 3];
+    let mut dynamic: Option<(u64, u64)> = None;
+    let mut tls_align = 0;
+    for h in headers.as_chunks::<PHDR_SIZE>().0 {
+        let kind = u32::from_le_bytes(h[0..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(h[4..8].try_into().unwrap());
+        let (vaddr, filesz, memsz, align) = (word(h, 16), word(h, 32), word(h, 40), word(h, 48));
+        match kind {
+            PT_LOAD => {
+                let (slot, access) = match flags & 7 {
+                    4 => (0, Access::Read),
+                    5 => (1, Access::ReadExec),
+                    6 => (2, Access::ReadWrite),
+                    _ => return Err(Refusal::Section),
+                };
+                if parts[slot]
+                    .replace(Segment {
+                        vaddr,
+                        memsz,
+                        access,
+                    })
+                    .is_some()
+                {
+                    return Err(Refusal::Section);
+                }
+            }
+            PT_DYNAMIC => {
+                if dynamic.replace((vaddr, filesz)).is_some() {
+                    return Err(Refusal::Section);
+                }
+            }
+            PT_TLS => tls_align = align,
+            _ => (),
+        }
+    }
+    let [Some(a), Some(b), Some(c)] = parts else {
+        return Err(Refusal::Section);
+    };
+    let segments = [a, b, c];
+    let (at, size) = dynamic.ok_or(Refusal::Section)?;
+    let size = usize::try_from(size).map_err(|_| Refusal::Section)?;
+    if size == 0 || size > DYNAMIC_MAX {
+        return Err(Refusal::Section);
+    }
+    let mut bytes = [0u8; DYNAMIC_MAX];
+    let bytes = &mut bytes[..size];
+    let from = at.checked_add(bias).ok_or(Refusal::Overflow)?;
+    mem.read(from, bytes)?;
+    let dynamic = parse(role, &segments, bias, bytes, mem)?;
+    Ok(Module {
+        segments,
+        bias,
+        tls_align,
+        dynamic,
+    })
 }

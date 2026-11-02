@@ -172,7 +172,7 @@ def main() -> None:
     cc = " ".join((str(clang), "--target=aarch64-linux-gnu", "-nostdinc",
                    f"-isystem {RELIBC / 'include'}", "-mno-outline-atomics",
                    "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
-                   A53_ERRATA, "-fno-pic", *UNWIND_CFLAGS))
+                   A53_ERRATA, "-fPIC", *UNWIND_CFLAGS))
     env = dict(os.environ, CC=cc, CFLAGS="-Os -w",
                LDFLAGS=f"-static -nostdlib --ld-path={lld} -L{RELIBC / 'lib'} {stub}",
                LIBS="-lc", AR=str(ar), RANLIB=str(ranlib))

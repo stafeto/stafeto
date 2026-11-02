@@ -6,7 +6,11 @@
  * stdout, errno in two threads, the order of the constructors, a weak
  * undefined symbol. "wait" waits for a byte on its input; "fork" and "exec"
  * go through fork and execv of itself. The output is one line per mode. */
+#include <stdint.h>
+#include <dlfcn.h>
+#include <elf.h>
 #include <errno.h>
+#include <link.h>
 #include <sys/auxv.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -69,6 +73,52 @@ static int hello(int argc, char **argv) {
     return bits;
 }
 
+/* A symbol of the program that the link exports (--export-dynamic-symbol),
+ * which dlsym finds in the program before it looks in libc.so. */
+int so_exported(void) { return 42; }
+
+struct walk {
+    int modules;
+    int bad;
+    char names[2][32];
+};
+
+static int visit(struct dl_phdr_info *info, size_t size, void *data) {
+    struct walk *w = data;
+    int loads = 0;
+    if (size < sizeof *info || info->dlpi_phdr == NULL || info->dlpi_phnum == 0) w->bad |= 1;
+    for (int i = 0; i < info->dlpi_phnum && info->dlpi_phdr != NULL; i++)
+        if (info->dlpi_phdr[i].p_type == PT_LOAD) loads++;
+    if (loads != 3) w->bad |= 2;
+    if (info->dlpi_addr != 0 || info->dlpi_adds != 2 || info->dlpi_subs != 0) w->bad |= 4;
+    if (w->modules < 2) {
+        strncpy(w->names[w->modules], info->dlpi_name, sizeof w->names[0] - 1);
+    }
+    w->modules++;
+    return 0;
+}
+
+/* dlopen(NULL), dlsym of the global scope, dl_iterate_phdr (spec 2, 3.12.5). */
+static int dl(void) {
+    int bits = 0;
+    void *global = dlopen(NULL, RTLD_NOW);
+    if (global == NULL) return 1;
+    if (dlsym(global, "printf") != (void *)printf) bits |= 2;
+    if (dlsym(RTLD_DEFAULT, "printf") != (void *)printf) bits |= 4;
+    if (dlsym(global, "so_exported") != (void *)so_exported) bits |= 8;
+    if (dlsym(global, "so_exported_not") != NULL || dlerror() == NULL) bits |= 16;
+    if (dlerror() != NULL) bits |= 32;
+    if (dlopen("/lib/libx.so", RTLD_NOW) != NULL || dlerror() == NULL) bits |= 64;
+    if (dlclose(global) != 0) bits |= 128;
+    struct walk w = {0};
+    int stopped = dl_iterate_phdr(visit, &w);
+    if (stopped != 0 || w.modules != 2 || w.bad != 0) bits |= 256;
+    if (w.names[0][0] != 0 || strcmp(w.names[1], "/lib/libc.so") != 0) bits |= 512;
+    printf("so-hello: dl bits=%d modules=%d walk=%d\n", bits, w.modules, w.bad);
+    fflush(stdout);
+    return bits;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "hello";
     if (strcmp(mode, "wait") == 0) {
@@ -77,6 +127,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         return read(0, &byte, 1) == 1 ? 0 : 1;
     }
+    if (strcmp(mode, "dl") == 0) return dl();
     if (strcmp(mode, "secure") == 0) {
         /* AT_SECURE as the program sees it, with the environment untouched:
          * the loader never reads LD_PRELOAD, whatever the mode. The exit

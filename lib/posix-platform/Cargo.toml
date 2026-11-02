@@ -12,6 +12,7 @@ test = false
 bench = false
 
 [dependencies]
+dynlink = { path = "../dynlink" }
 posix-abi = { path = "../posix-abi" }
 posix-change = { path = "../posix-change" }
 posix-thread = { path = "../posix-thread" }

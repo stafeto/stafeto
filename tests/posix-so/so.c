@@ -363,6 +363,18 @@ static void secure(void) {
     check(1024, "chmod 0755 so-hello", chmod("/bin/so-hello", 0755) == 0);
 }
 
+/* 12: dlopen(NULL), dlsym and dl_iterate_phdr in a dynamic program. */
+static void dl(void) {
+    char buf[512];
+    int status = -1;
+    char *argv[] = {(char *)"/bin/so-hello", (char *)"dl", NULL};
+    int error = run(argv, buf, sizeof buf, &status);
+    check(4096, "so-hello dl: dlsym of the global scope and dl_iterate_phdr",
+          error == 0 && exited_with(status, 0) &&
+              strstr(buf, "so-hello: dl bits=0 modules=2 walk=0\n") != NULL);
+    if (bits & 4096) printf("posix-so: so-hello dl said: %s", buf);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "quick") == 0) {
         uint64_t at = ticks();
@@ -387,6 +399,7 @@ int main(int argc, char **argv) {
     set_id();
     no_exec();
     secure();
+    dl();
     rewrite();
     spawn_times();
     if (bits) {
