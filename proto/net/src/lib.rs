@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(UNREACHABLE, sock::UNREACHABLE);
         assert_eq!(NO_FAMILY, sock::NO_FAMILY);
         // The new codes follow the pipe service's last one.
-        assert!(NOT_ALLOWED > sock::CONNECT_WAIT);
+        const { assert!(NOT_ALLOWED > sock::CONNECT_WAIT) };
         for (i, c) in CODES.iter().enumerate() {
             assert!(*c > 512, "above the codes of the wire");
             assert_eq!(code(*c).code(), *c);
