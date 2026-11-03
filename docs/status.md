@@ -177,7 +177,7 @@ listed exception; its io, malloc, process and signal suites, `basic/spawn`,
 `basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
 `ci` from files, one boot a suite. `ci` fails when a test that passed stops
 passing. The Open POSIX Test Suite (LTP 20260930) runs on relibc in `ci` and
-passes 1,983 of its 2,036 tests; the map of the rest is in
+passes 1,986 of its 2,036 tests; the map of the rest is in
 [docs/open-posix-map.md](open-posix-map.md). The PTY and termios suites
 exercise the terminal APIs, and readiness tests cover all four waiting
 interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
