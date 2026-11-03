@@ -52,6 +52,12 @@ pub const BOOT_IMAGE: &str = "bootimage";
 pub const RAM_SERVICE: &str = "ramfs";
 pub const CLOCK_SERVICE: &str = "clock";
 pub const PIPE_SERVICE: &str = "pipe";
+/// The network service's name.
+pub const NET_SERVICE: &str = "net";
+/// The clients init gives the RAM file service's boot profile
+/// (proto_fs::BOOT_PROFILE): the diagnostic client of the RAM service and
+/// the network service, which reads `/etc/netd.conf` as the boot root.
+pub const BOOT_PROFILE_CLIENTS: &[&str] = &["ramfs-probe", NET_SERVICE];
 
 /// Only the RAM service receives the named-pipe broker authority.
 pub fn fifo_broker_grant(client: &Record, service: &[u8]) -> bool {
@@ -221,6 +227,10 @@ pub const SYSTEM_TIMERS: u32 = abi::MAX_SYSTEM_TIMERS;
 /// (SMP decision): the first two. The hard tasks of realtime get CPUs of
 /// their own (`RT_CPUS`, kernel spec 8), where no ordinary process runs.
 pub const GENERAL_CPUS: u8 = 0b0011;
+/// The CPU of the network service: the boot CPU, where every shared
+/// interrupt line is delivered, so that the line of its device and the
+/// service meet on one CPU.
+pub const NETD_CPUS: u8 = 0b0001;
 /// The CPUs of the tasks of realtime, away from the ordinary processes.
 pub const RT_CPUS: u8 = 0b1100;
 /// Every CPU that is up: a record with it is cut to the CPUs the machine
@@ -862,6 +872,7 @@ pub mod gpu;
 pub mod input;
 #[cfg(any(feature = "table-posix-lock-ring", test))]
 pub mod lock_ring;
+pub mod net;
 pub mod normal;
 pub mod ramfs;
 pub mod test;
@@ -906,6 +917,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-entropy") as usize
     + cfg!(feature = "table-entropy-vz") as usize
     + cfg!(feature = "table-gpu") as usize
+    + cfg!(feature = "table-net") as usize
+    + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-display") as usize
@@ -957,6 +970,8 @@ const _: () = assert!(
     feature = "table-entropy",
     feature = "table-entropy-vz",
     feature = "table-gpu",
+    feature = "table-net",
+    feature = "table-net-probe",
     feature = "table-input",
     feature = "table-posix-random",
     feature = "table-posix-display",
@@ -1039,6 +1054,10 @@ pub const TABLE: &[Record] = entropy::TABLE;
 pub const TABLE: &[Record] = entropy::VZ_TABLE;
 #[cfg(feature = "table-gpu")]
 pub const TABLE: &[Record] = gpu::TABLE;
+#[cfg(feature = "table-net")]
+pub const TABLE: &[Record] = net::NET_TABLE;
+#[cfg(feature = "table-net-probe")]
+pub const TABLE: &[Record] = net::NET_PROBE_TABLE;
 #[cfg(feature = "table-input")]
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
@@ -1756,6 +1775,48 @@ mod tests {
         }
     }
 
+    /// No two records of a table hold windows on one page: a device window
+    /// is a page, and a second device on it would share the registers of
+    /// the first (spec 9). The page of the transports 0 to 6 and the
+    /// network device is 0xa000000; the keyboard has 0xa001000 and the
+    /// display device 0xa002000.
+    #[test]
+    fn no_two_records_of_a_table_share_a_device_page() {
+        for table in [
+            net::NET_TABLE,
+            net::NET_PROBE_TABLE,
+            doom::TABLE,
+            gpu::TABLE,
+            input::TABLE,
+            entropy::TABLE,
+            normal::TABLE,
+        ] {
+            let mut pages: Vec<(u64, &str)> = Vec::new();
+            for r in table {
+                for w in r.windows {
+                    for page in (w.base / PAGE..(w.base + w.len) / PAGE).map(|p| p * PAGE) {
+                        if let Some((_, other)) = pages.iter().find(|(p, _)| *p == page) {
+                            panic!("{} and {other} share the page {page:#x}", r.name);
+                        }
+                        pages.push((page, r.name));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_network_service_is_given_the_boot_profile_and_the_probe_is_not() {
+        assert!(BOOT_PROFILE_CLIENTS.contains(&net::NETD.name));
+        assert!(BOOT_PROFILE_CLIENTS.contains(&"ramfs-probe"));
+        assert!(!BOOT_PROFILE_CLIENTS.contains(&net::PROBE.name));
+        let ram = net::NET_PROBE_TABLE
+            .iter()
+            .find(|r| r.name == RAM_SERVICE)
+            .unwrap();
+        assert!(net::NETD.connects.contains(&ram.name));
+    }
+
     #[test]
     fn fifo_broker_authority_is_limited_to_the_ram_service() {
         let ram = ramfs::POSIX_PROCS_TABLE[0];
@@ -2000,6 +2061,12 @@ mod tests {
             ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
         assert_eq!(order_of(gpu::TABLE), ["gpu", "gpu-probe", "gpu-probe-b"]);
+        assert_eq!(
+            order_of(net::NET_PROBE_TABLE),
+            ["ramfs", "rng", "entropy", "net", "net-probe"]
+        );
+        let shell = order_of(net::NET_TABLE);
+        assert!(shell.contains(&NET_SERVICE));
         assert_eq!(
             order_of(input::TABLE),
             ["input", "gpu", "input-probe", "input-probe-x"]
