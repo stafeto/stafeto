@@ -1,6 +1,6 @@
 # Status details
 
-The README gives the short picture; this page keeps the details of each part of the system and its known limits. Numbers are from `main` after #165, unless a section names its own step.
+The README gives the short picture; this page keeps the details of each part of the system and its known limits. Numbers are from `main` after #225, unless a section names its own step.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -24,7 +24,7 @@ is never writable and executable at once, and long operations run in
 bounded portions. Device interrupts reach drivers as notifications, and
 a driver gets contiguous, optionally uncached memory for DMA. The kernel
 drives no device with DMA. A fault ends only its own process. The kernel
-image is 162,880 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
+image is 193,216 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
 The longest stretch the kernel runs without taking an interrupt (term B of the
 kernel) stays below the limit of 18,000 ticks that `xtask` enforces under
 `-icount`; teardown of a session and its message buffers runs in
@@ -177,7 +177,7 @@ listed exception; its io, malloc, process and signal suites, `basic/spawn`,
 `basic/unistd` `exec*` and the `basic` tests that call `fork` run on it in
 `ci` from files, one boot a suite. `ci` fails when a test that passed stops
 passing. The Open POSIX Test Suite (LTP 20260930) runs on relibc in `ci` and
-passes 1,985 of its 2,036 tests; the map of the rest is in
+passes 1,986 of its 2,036 tests; the map of the rest is in
 [docs/open-posix-map.md](open-posix-map.md). The PTY and termios suites
 exercise the terminal APIs, and readiness tests cover all four waiting
 interfaces. `cargo xtask coverage` counts all 1,035 required XSH interfaces
