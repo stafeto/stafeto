@@ -5,7 +5,8 @@
 //! 1.2, 4.2): the check of a transport before the driver writes to it
 //! (`check`, `transport`), the device's crate over the DMA object of a
 //! driver (`DmaHal`), the start of a device that offers `VIRTIO_F_VERSION_1`
-//! and nothing else (`start`), and the interrupt (`Isr`, `reopen`).
+//! and nothing else (`start`) or with the features the driver names
+//! (`start_with`), and the interrupt (`Isr`, `reopen`).
 //! The state of `DmaHal` (the arena) is one per process: a driver serves
 //! one device, and a second device would need a process of its own.
 //! Everything that needs no call of the kernel builds for the host too,
@@ -47,6 +48,7 @@ pub const PAGE: usize = 4096;
 
 /// The Virtio device IDs the drivers of stafeto check for (Virtio 1.2, 5).
 pub mod device {
+    pub const NET: u32 = 1;
     pub const ENTROPY: u32 = 4;
     pub const GPU: u32 = 16;
     pub const INPUT: u32 = 18;
@@ -292,26 +294,65 @@ pub const RESET_READS: u32 = 1_000_000;
 pub enum StartError {
     /// The device's status never read 0 after the reset.
     Reset,
-    /// The device does not offer `VIRTIO_F_VERSION_1`; it has FAILED set.
+    /// The device does not offer `VIRTIO_F_VERSION_1`, or did not keep
+    /// `FEATURES_OK` (Virtio 1.2, 3.1.1, step 6); it has FAILED set.
     Features,
 }
 
-/// Resets the device and negotiates its features: `VIRTIO_F_VERSION_1`
-/// alone, whatever else the device offers. The device forgets every queue
-/// before it may master the bus again (Virtio 1.2, 2.4.1), which also
-/// covers an instance whose stop by init did not run. The driver makes its
-/// queues next and then calls `finish_init`.
-pub fn start<T: Transport>(transport: &mut T) -> Result<(), StartError> {
+bitflags::bitflags! {
+    /// All 64 feature bits. The device's crate truncates the bits the
+    /// device offers to the bits of the type it is given, so a type that
+    /// names every bit loses none of the device-specific ones (the bits
+    /// below 24 and above 38 belong to the device's class).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Bits: u64 {
+        const _ = !0;
+    }
+}
+
+/// The features a driver ends up with, from the bits the device `offered`
+/// and the bits the driver `wanted`: the bits both have. Without
+/// `VIRTIO_F_VERSION_1` among them there is no modern device (Virtio 1.2,
+/// 6: a driver MUST accept it when it is offered).
+pub fn negotiate(offered: u64, wanted: u64) -> Result<u64, StartError> {
+    let version_1 = Feature::VERSION_1.bits();
+    let got = offered & wanted;
+    if got & version_1 == 0 {
+        return Err(StartError::Features);
+    }
+    Ok(got)
+}
+
+/// Resets the device and negotiates its features: the `wanted` bits that
+/// the device offers, `VIRTIO_F_VERSION_1` among them. The result is the
+/// bits both have. The device forgets every queue before it may master the
+/// bus again (Virtio 1.2, 2.4.1), which also covers an instance whose stop
+/// by init did not run. The driver makes its queues next and then calls
+/// `finish_init`. The device must keep `FEATURES_OK` (Virtio 1.2, 3.1.1,
+/// step 6); a device that clears it refused the set.
+pub fn start_with<T: Transport>(transport: &mut T, wanted: u64) -> Result<u64, StartError> {
     transport.set_status(DeviceStatus::empty());
     if !(0..RESET_READS).any(|_| transport.get_status().is_empty()) {
         return Err(StartError::Reset);
     }
-    let negotiated: Feature = transport.begin_init(Feature::VERSION_1);
-    if negotiated != Feature::VERSION_1 {
-        transport.set_status(DeviceStatus::FAILED);
-        return Err(StartError::Features);
+    let negotiated: Bits =
+        transport.begin_init(Bits::from_bits_retain(wanted | Feature::VERSION_1.bits()));
+    // The device's own answer to the set it was offered is its status.
+    let kept = transport.get_status().contains(DeviceStatus::FEATURES_OK);
+    // `begin_init` already wrote the driver's bits; the offered ones are
+    // the intersection it returned.
+    match negotiate(negotiated.bits(), wanted | Feature::VERSION_1.bits()) {
+        Ok(bits) if kept => Ok(bits),
+        _ => {
+            transport.set_status(DeviceStatus::FAILED);
+            Err(StartError::Features)
+        }
     }
-    Ok(())
+}
+
+/// `start_with` for a device whose only feature is `VIRTIO_F_VERSION_1`.
+pub fn start<T: Transport>(transport: &mut T) -> Result<(), StartError> {
+    start_with(transport, Feature::VERSION_1.bits()).map(drop)
 }
 
 /// What the interrupt status of a transport said (Virtio 1.2, 4.2.2).
@@ -497,6 +538,146 @@ mod tests {
         assert_eq!(a.phys(0x10_0000_FFF8, 16), None);
         assert_eq!(a.phys(0x10_0000_4000, 0), None);
         assert_eq!(a.phys(0x10_0000_4000, usize::MAX), None);
+    }
+
+    const MAC: u64 = 1 << 5;
+    const STATUS: u64 = 1 << 16;
+    const CSUM: u64 = 1;
+    const VERSION_1: u64 = 1 << 32;
+
+    #[test]
+    fn the_device_class_bits_reach_the_result() {
+        // The bits below 24 belong to the class of the device; a type that
+        // knows the common bits alone would truncate them.
+        let got = negotiate(VERSION_1 | MAC | STATUS | CSUM, VERSION_1 | MAC | STATUS);
+        assert_eq!(got, Ok(VERSION_1 | MAC | STATUS));
+        let bits = Bits::from_bits_truncate(VERSION_1 | MAC | STATUS);
+        assert_eq!(bits.bits(), VERSION_1 | MAC | STATUS);
+    }
+
+    /// A transport that stands for a device: it offers `offered`, keeps
+    /// what the driver writes, and clears `FEATURES_OK` when `refuses`.
+    struct Fake {
+        offered: u64,
+        refuses: bool,
+        status: DeviceStatus,
+        driver_features: u64,
+    }
+
+    impl Fake {
+        fn new(offered: u64) -> Fake {
+            Fake {
+                offered,
+                refuses: false,
+                status: DeviceStatus::empty(),
+                driver_features: 0,
+            }
+        }
+    }
+
+    impl Transport for Fake {
+        fn device_type(&self) -> virtio_drivers::transport::DeviceType {
+            virtio_drivers::transport::DeviceType::Network
+        }
+        fn read_device_features(&mut self) -> u64 {
+            self.offered
+        }
+        fn write_driver_features(&mut self, features: u64) {
+            self.driver_features = features;
+        }
+        fn max_queue_size(&mut self, _: u16) -> u32 {
+            256
+        }
+        fn notify(&mut self, _: u16) {}
+        fn get_status(&self) -> DeviceStatus {
+            self.status
+        }
+        fn set_status(&mut self, status: DeviceStatus) {
+            self.status = if self.refuses {
+                status - DeviceStatus::FEATURES_OK
+            } else {
+                status
+            };
+        }
+        fn set_guest_page_size(&mut self, _: u32) {}
+        fn requires_legacy_layout(&self) -> bool {
+            false
+        }
+        fn queue_set(&mut self, _: u16, _: u32, _: PhysAddr, _: PhysAddr, _: PhysAddr) {}
+        fn queue_unset(&mut self, _: u16) {}
+        fn queue_used(&mut self, _: u16) -> bool {
+            false
+        }
+        fn ack_interrupt(&mut self) -> InterruptStatus {
+            InterruptStatus::empty()
+        }
+        fn read_config_generation(&self) -> u32 {
+            0
+        }
+        fn read_config_space<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
+            &self,
+            _: usize,
+        ) -> virtio_drivers::Result<T> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+        fn write_config_space<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+            &mut self,
+            _: usize,
+            _: T,
+        ) -> virtio_drivers::Result<()> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+    }
+
+    #[test]
+    fn start_with_gives_the_device_the_class_bits_it_offers() {
+        // The test that catches `begin_init` on the crate's common feature
+        // type: MAC (5) and STATUS (16) would be cut from the set written to
+        // the device and from the result.
+        let mut device = Fake::new(VERSION_1 | MAC | STATUS | CSUM | (1 << 15));
+        let got = start_with(&mut device, MAC | STATUS);
+        assert_eq!(got, Ok(VERSION_1 | MAC | STATUS));
+        assert_eq!(device.driver_features, VERSION_1 | MAC | STATUS);
+        assert!(device.status.contains(DeviceStatus::FEATURES_OK));
+        assert!(!device.status.contains(DeviceStatus::FAILED));
+        // A device that lacks MAC gives a result without it; the caller
+        // decides.
+        let mut bare = Fake::new(VERSION_1 | STATUS);
+        assert_eq!(start_with(&mut bare, MAC | STATUS), Ok(VERSION_1 | STATUS));
+    }
+
+    #[test]
+    fn start_with_fails_when_the_device_keeps_no_features_ok() {
+        let mut device = Fake::new(VERSION_1 | MAC);
+        device.refuses = true;
+        assert_eq!(start_with(&mut device, MAC), Err(StartError::Features));
+        assert!(device.status.contains(DeviceStatus::FAILED));
+    }
+
+    #[test]
+    fn start_asks_for_version_1_alone() {
+        let mut device = Fake::new(VERSION_1 | MAC | STATUS);
+        assert_eq!(start(&mut device), Ok(()));
+        assert_eq!(device.driver_features, VERSION_1);
+        let mut old = Fake::new(MAC);
+        assert_eq!(start(&mut old), Err(StartError::Features));
+    }
+
+    #[test]
+    fn a_device_without_version_1_is_refused() {
+        assert_eq!(
+            negotiate(MAC | STATUS, VERSION_1 | MAC),
+            Err(StartError::Features)
+        );
+        assert_eq!(negotiate(VERSION_1, MAC), Err(StartError::Features));
+    }
+
+    #[test]
+    fn bits_the_device_offers_and_the_driver_did_not_ask_for_stay_out() {
+        let got = negotiate(u64::MAX, VERSION_1 | MAC);
+        assert_eq!(got, Ok(VERSION_1 | MAC));
+        // A wanted bit the device lacks is not in the result.
+        assert_eq!(negotiate(VERSION_1, VERSION_1 | MAC), Ok(VERSION_1));
     }
 
     #[test]

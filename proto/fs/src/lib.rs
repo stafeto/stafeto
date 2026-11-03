@@ -236,7 +236,9 @@ impl OpenKey {
 }
 pub const BOOT_PROFILE: u64 = 1 << 61;
 
-/// Init issues this profile exclusively to the named diagnostic client.
+/// Init issues this profile only to the clients of its list
+/// (`BOOT_PROFILE_CLIENTS` in the table of init): the diagnostic client of
+/// the RAM service and the network service.
 pub const fn is_boot_profile(label: u64) -> bool {
     label & (OWN | LOADERS) == 0 && label & BOOT_PROFILE != 0
 }

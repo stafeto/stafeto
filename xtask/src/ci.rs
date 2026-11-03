@@ -33,6 +33,7 @@ pub fn groups() -> Vec<String> {
         .to_vec();
     all.extend((1..=OPEN_POSIX_PARTS).map(|n| format!("open-posix-{n}")));
     all.extend((1..=GUEST_GROUPS).map(|n| format!("guests-{n}")));
+    all.push("net".to_owned());
     all
 }
 
@@ -119,7 +120,13 @@ impl Lints {
 struct Split {
     kernel: Vec<String>,
     guests: Vec<Vec<String>>,
+    /// The probes of the network (`NET_PREFIX`), which have a group of
+    /// their own and no weight.
+    net: Vec<String>,
 }
+
+/// The probes with this start of their name run in the group `net`.
+const NET_PREFIX: &str = "net-";
 
 /// Expected seconds of the probes, from a run on the CI machine. A probe
 /// not in the table counts as `DEFAULT_WEIGHT`.
@@ -273,8 +280,10 @@ fn weight(name: &str) -> u32 {
 /// The names of the boots of `ci` outside os-test, in their order, split:
 /// longest first into the group with the least expected time.
 fn split(names: &[String]) -> Split {
-    let (kernel, rest): (Vec<&String>, Vec<&String>) = names
-        .iter()
+    let (net, others): (Vec<&String>, Vec<&String>) =
+        names.iter().partition(|n| n.starts_with(NET_PREFIX));
+    let (kernel, rest): (Vec<&String>, Vec<&String>) = others
+        .into_iter()
         .partition(|n| KERNEL_PREFIXES.iter().any(|p| n.starts_with(p)));
     let mut by_weight = rest.clone();
     by_weight.sort_by_key(|n| (std::cmp::Reverse(weight(n)), (*n).clone()));
@@ -292,6 +301,7 @@ fn split(names: &[String]) -> Split {
     Split {
         kernel: kernel.into_iter().cloned().collect(),
         guests,
+        net: net.into_iter().cloned().collect(),
     }
 }
 
@@ -401,7 +411,11 @@ fn all_steps(njobs: usize) -> Vec<Step> {
 
     // Boots.
     let names = all_boot_names();
-    let Split { kernel, guests } = split(&names);
+    let Split {
+        kernel,
+        guests,
+        net,
+    } = split(&names);
     steps.push(step(
         "kernel",
         "kernel and image boots",
@@ -442,6 +456,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         }));
         steps.push(step(&group, "measures", &BOOT_NEEDS, super::write_measures));
     }
+
+    // The network probes run on QEMU's user-mode networking (slirp), apart
+    // from the weighted split of the guest probes: every boot named `net-`.
+    steps.push(step("net", "network probes", &BOOT_NEEDS, move || {
+        jobs::run_all(only(super::boot_jobs(Vec::new()), &net), njobs)
+    }));
 
     // os-test: a boot a suite, and the complete basic suite.
     let os_needs = [RELIBC, BASE, ADDONS, KERNELS, IMAGES, OS_TEST_OBJECTS];
@@ -697,10 +717,15 @@ mod tests {
         let names = all_boot_names();
         let unique: std::collections::BTreeSet<&String> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "a probe is named twice");
-        let Split { kernel, guests } = split(&names);
+        let Split {
+            kernel,
+            guests,
+            net,
+        } = split(&names);
         assert!(!kernel.is_empty());
+        assert_eq!(net, ["net-probe"]);
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for name in kernel.iter().chain(guests.iter().flatten()) {
+        for name in kernel.iter().chain(guests.iter().flatten()).chain(&net) {
             *seen.entry(name.clone()).or_default() += 1;
         }
         for name in &names {
@@ -714,7 +739,8 @@ mod tests {
         let built: usize = (0..guests.len())
             .map(|n| only(super::super::boot_jobs(Vec::new()), &guests[n]).len())
             .sum::<usize>()
-            + only(super::super::boot_jobs(Vec::new()), &kernel).len();
+            + only(super::super::boot_jobs(Vec::new()), &kernel).len()
+            + only(super::super::boot_jobs(Vec::new()), &net).len();
         assert_eq!(built, names.len());
     }
 

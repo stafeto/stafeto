@@ -1230,7 +1230,7 @@ impl Init {
                 duplicate: true,
             }
         } else if name.as_bytes() == table::RAM_SERVICE.as_bytes()
-            && client.name == "ramfs-probe"
+            && table::BOOT_PROFILE_CLIENTS.contains(&client.name)
             && !client.is_posix()
         {
             Grant {

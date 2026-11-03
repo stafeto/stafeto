@@ -49,7 +49,7 @@ EXCEPTION_SHA256 = "7103d4f7f7e2f8ce10d282a05e0689637f8d6d9ef7b399d808d1da313e69
 # Licences GPL-2.0-only takes (items 5 and 6). Apache-2.0 alone does not;
 # with the LLVM exception it does, the exception says so for GPLv2. SunPro
 # is FDLIBM's notice: use with the notice kept, nothing more.
-GPL2_COMPATIBLE = {"MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unlicense",
+GPL2_COMPATIBLE = {"MIT", "0BSD", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unlicense",
                    "Unicode-3.0", "LicenseRef-public-domain", "SunPro",
                    "Apache-2.0 WITH LLVM-exception"}
 
@@ -77,7 +77,7 @@ OPENLIBM = ("openlibm/LICENSE.md",
 RUST_COPYRIGHT = ("COPYRIGHT", "Copyright (c) The Rust Project Contributors")
 
 # Licences a GPL-3.0-or-later program may link from crates.io (drivers).
-PERMISSIVE = {"MIT", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT",
+PERMISSIVE = {"MIT", "0BSD", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT",
               "Zlib OR Apache-2.0 OR MIT", "BSD-2-Clause OR Apache-2.0 OR MIT"}
 
 
@@ -250,6 +250,19 @@ def drivers(data: dict, packages: dict, named: dict) -> None:
         fail("virtio-console no longer links virtio-drivers")
     print("kernel links no outside crate; virtio-console links "
           + ", ".join(sorted(outside)) + " under permissive licences")
+    # The network service links smoltcp (0BSD) and its crates; an `OR`
+    # needs one side the GPL takes (byteorder is `Unlicense OR MIT`).
+    network = []
+    for package_id in closure(data, [named["netd"]["id"]]):
+        package = packages[package_id]
+        if package["source"] is None:
+            continue
+        if not allowed(package["license"] or ""):
+            fail(f"netd links {package['name']} under {package['license']}")
+        network.append(package["name"])
+    if "smoltcp" not in network:
+        fail("netd no longer links smoltcp")
+    print("netd links " + ", ".join(sorted(network)) + " under permissive licences")
 
 
 def licence_files(directory: Path) -> list[Path]:

@@ -1,0 +1,21 @@
+[package]
+name = "net-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the network service"
+
+[[bin]]
+name = "net-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+netd = { path = "../../services/netd" }
+proto-init = { path = "../../proto/init" }
+proto-net = { path = "../../proto/net" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

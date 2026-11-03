@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 32] = [
+const SYSTEM_PATHS: [&str; 33] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -280,6 +280,7 @@ const SYSTEM_PATHS: [&str; 32] = [
     "/etc/mtab",
     "/etc/passwd",
     "/etc/group",
+    "/etc/resolv.conf",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -963,10 +964,24 @@ pub fn runner_check() -> Vec<RootFile> {
     ]
 }
 
+/// `/etc/netd.conf` of the image of the probe with a static address: the
+/// QEMU user network's own settings, so that no DHCP frame is needed.
+const NETD_CONF_STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10.0.2.3\n";
+
+/// `/etc/resolv.conf` of the shell image with the network service: the
+/// name server of QEMU's user network. The service does not write it yet
+/// (the lease's name server goes there in the stage of the resolver); on
+/// another network this file is wrong.
+const RESOLV_CONF: &[u8] = b"nameserver 10.0.2.3\n";
+
 /// The names of the images that carry a table, which `files_of` lists.
 #[cfg(test)]
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
+    "boot-net.img",
+    "boot-net-probe.img",
+    "boot-net-probe-static.img",
+    "boot-net-steps.img",
     "boot-ash-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
@@ -1039,6 +1054,22 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        "boot-net.img" => {
+            let mut files = dialog(name);
+            files.push(of(
+                "/etc/resolv.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("resolv.conf", RESOLV_CONF),
+            ));
+            files
+        }
+        "boot-net-probe-static.img" => vec![of(
+            "/etc/netd.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("netd.conf", NETD_CONF_STATIC),
+        )],
         "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
             let mut files = procs();
             files.push(file(
@@ -1501,6 +1532,9 @@ mod tests {
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
+                "boot-net.img" => crate::net::programs(),
+                "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
+                "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,

@@ -1,0 +1,60 @@
+[package]
+name = "netd"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The network service of stafeto: its own virtio-net driver on virtio-mmio and the smoltcp stack, DHCP, ARP and ICMP echo"
+
+# What the service decides, apart from the device and the calls: tested on
+# the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "netd"
+test = false
+bench = false
+
+# `probe`: the methods PING and CRASH of proto_net and the counters line
+# of CONFIG, for the network probe.
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount.
+[features]
+probe = []
+steps = ["rt/step-stats"]
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-net = { path = "../../proto/net" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+proto-entropy = { path = "../../proto/entropy" }
+virtio-mmio = { path = "../../lib/virtio-mmio" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt, the device's crate and the stack.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }
+posix-fs = { path = "../../lib/posix-fs" }
+proto-fs = { path = "../../proto/fs" }
+posix-random = { path = "../../lib/posix-random" }
+# `alloc` as the other drivers take it: one build of the boot image unifies
+# the crate's features, and the service never allocates.
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
+# The stack: IPv4 over Ethernet with DHCP, ICMP echo, UDP and TCP (the
+# sockets of the next stage, built in from the first so that the build of
+# the stack without std is settled once). `auto-icmp-echo-reply` answers
+# ping; without it the stack stays silent (a test of xtask reads this line).
+smoltcp = { version = "0.14.0", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "socket-dhcpv4",
+    "auto-icmp-echo-reply",
+    "iface-neighbor-cache-count-16",
+] }

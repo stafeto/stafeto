@@ -50,6 +50,8 @@ mod native_scopes;
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
 mod native_stop_barrier_tests;
 mod ncdu_dialog;
+mod net;
+mod net_probe;
 mod obj_sites;
 mod openposix;
 mod ostest;
@@ -1653,6 +1655,12 @@ commands:
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
+  net-probe [MACHINE] run the probe of the network service in QEMU on the user
+            network (MACHINE is tcg or hvf): the address by DHCP and by file,
+            300 pings of the gateway, a restart of the service, and its
+            steps under -icount (TCG only)
+  net [--machine hvf] run the shell with the network service on the terminal;
+            ports 8080 and 2222 of the host are forwarded to 80 and 22
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
@@ -1899,6 +1907,8 @@ fn main() {
             }),
             Some(_) => Err("gpu-probe [--hvf]".to_owned()),
         },
+        Some("net") => net::run(&args[1..]),
+        Some("net-probe") => net_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -8758,6 +8768,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The input service on virtio-input: keys from the monitor reach
         // the focus, then its steps under -icount.
         job("input-probe", || input_probe::probe(&qemu::VIRT)),
+        // The network service on virtio-net and QEMU's user network: the
+        // address by DHCP and by file, 300 pings of the gateway, a restart,
+        // then its steps under -icount. A boot named `net-` runs in the
+        // group `net` of ci.
+        job("net-probe", || net_probe::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -8879,6 +8894,10 @@ fn host_tests() -> Result<(), String> {
         "proto-input",
         "--package",
         "virtio-input",
+        "--package",
+        "proto-net",
+        "--package",
+        "netd",
     ]))
 }
 
@@ -11433,6 +11452,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-input",
         "--package",
+        "proto-net",
+        "--package",
         "virtio-mmio",
         "--all-targets",
         "--",
@@ -11467,6 +11488,8 @@ fn ci_lints() -> Result<(), String> {
         "virtio-gpu",
         "--package",
         "virtio-input",
+        "--package",
+        "netd",
         "--lib",
         "--tests",
         "--",
@@ -11600,8 +11623,12 @@ fn ci_lints() -> Result<(), String> {
         "virtio-input",
         "--package",
         "input-probe",
+        "--package",
+        "netd",
+        "--package",
+        "net-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps",
         "--target",
         PROGRAM_TARGET,
         "--",

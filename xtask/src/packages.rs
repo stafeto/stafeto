@@ -404,7 +404,7 @@ pub fn load() -> Result<Vec<Package>, String> {
 /// that holds packages belongs to exactly one of them or to the base system.
 pub fn check() -> Result<(), String> {
     let packages = load()?;
-    for image in ["boot-ash-dialog.img", "boot-doom.img"] {
+    for image in ["boot-ash-dialog.img", "boot-doom.img", "boot-net.img"] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
     let count = |kind| packages.iter().filter(|p| p.kind == kind).count();
@@ -463,7 +463,7 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
 /// probes that list the few files they use and hold no package.
 pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
     match name {
-        "boot-ash-dialog.img" => Ok(load()?
+        "boot-ash-dialog.img" | "boot-net.img" => Ok(load()?
             .into_iter()
             .filter(|p| p.kind != Kind::Game)
             .collect()),

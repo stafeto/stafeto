@@ -23,7 +23,7 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION" make python3 git curl \
-          ca-certificates bzip2 xz-utils patch ninja-build pkg-config libglib2.0-dev libpixman-1-dev python3-venv flex bison
+          ca-certificates bzip2 xz-utils patch ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
         echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
         "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version | head -1
 
@@ -33,7 +33,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/qemu
-        key: qemu-${{ runner.arch }}-${{ env.QEMU_VERSION }}-2
+        key: qemu-${{ runner.arch }}-${{ env.QEMU_VERSION }}-3
         fail-on-cache-miss: ${{ inputs.build-qemu != 'true' }}
 
     - name: Build QEMU
@@ -45,8 +45,10 @@ runs:
         tar -xJf "$RUNNER_TEMP/qemu.tar.xz" -C "$RUNNER_TEMP/qemu-src" --strip-components=1
         cd "$RUNNER_TEMP/qemu-src"
         # The plugin API (include/qemu-plugin.h is installed with QEMU) is what
-        # `cargo xtask wcet coverage` builds its trace plugin against.
-        ./configure --prefix="$HOME/qemu" --target-list=aarch64-softmmu --disable-docs --disable-werror --disable-guest-agent --disable-user --enable-plugins
+        # `cargo xtask wcet coverage` builds its trace plugin against. User-mode
+        # networking (slirp) is what the network probes run on; without the
+        # library the configure step fails at once.
+        ./configure --prefix="$HOME/qemu" --target-list=aarch64-softmmu --disable-docs --disable-werror --disable-guest-agent --disable-user --enable-plugins --enable-slirp
         make -j"$(nproc)"
         make install
 
