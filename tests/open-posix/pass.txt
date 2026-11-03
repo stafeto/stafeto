@@ -464,6 +464,8 @@ conformance/interfaces/mlockall/speculative/15-1
 conformance/interfaces/mmap/1-1
 conformance/interfaces/mmap/1-2
 conformance/interfaces/mmap/11-1
+conformance/interfaces/mmap/11-2
+conformance/interfaces/mmap/11-3
 conformance/interfaces/mmap/11-4
 conformance/interfaces/mmap/11-5
 conformance/interfaces/mmap/11-6
@@ -482,6 +484,7 @@ conformance/interfaces/mmap/24-2
 conformance/interfaces/mmap/27-1
 conformance/interfaces/mmap/3-1
 conformance/interfaces/mmap/32-1
+conformance/interfaces/mmap/5-1
 conformance/interfaces/mmap/6-1
 conformance/interfaces/mmap/6-2
 conformance/interfaces/mmap/6-3
