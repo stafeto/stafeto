@@ -35,7 +35,11 @@ URL = PACKAGE["url"]
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "doomgeneric"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
-PORT = ROOT / "ports" / "doomgeneric" / "doomgeneric_stafeto.c"
+PORT_DIR = ROOT / "ports" / "doomgeneric"
+# The platform's files: the functions the engine asks of its host, and the
+# table of keys (which the host tests too).
+PORT = [PORT_DIR / "doomgeneric_stafeto.c", PORT_DIR / "keys.c"]
+PORT_HEADERS = [PORT_DIR / "keys.h"]
 OUTPUT = WORK / "doom.o"
 # Cortex-A53 erratum 835769 (the PinePhone's A64), as BusyBox's objects.
 A53_ERRATA = "-mfix-cortex-a53-835769"
@@ -81,7 +85,7 @@ def engine_files(source: Path) -> list[str]:
 
 def main() -> None:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
-    port = sha256(PORT.read_bytes()).hexdigest()
+    port = sha256(b"".join(p.read_bytes() for p in PORT + PORT_HEADERS)).hexdigest()
     libc = RELIBC / "lib" / "libc.a"
     if not (RELIBC / "include" / "stdio.h").exists() or not libc.exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
@@ -109,10 +113,10 @@ def main() -> None:
           "-isystem", str(RELIBC / "include"), "-mno-outline-atomics",
           "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
           A53_ERRATA, "-fPIC", "-O2", *UNWIND_CFLAGS, *ENGINE_CFLAGS,
-          f"-I{source}")
+          f"-I{source}", f"-I{PORT_DIR}")
     objects = []
     (WORK / "obj").mkdir()
-    for path in [source / name for name in engine_files(source)] + [PORT]:
+    for path in [source / name for name in engine_files(source)] + PORT:
         obj = WORK / "obj" / (path.stem + ".o")
         run(log, *cc, "-c", path, "-o", obj)
         objects.append(obj)

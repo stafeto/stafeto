@@ -105,7 +105,6 @@ impl Monitor {
     /// `sendkey KEY`, the key held for `hold` when there is one (QEMU's
     /// milliseconds, 100 by default). A QEMU key name: `ret`, `esc`, `up`,
     /// `left`, `ctrl`, `a`, or a combination with `-`.
-    #[allow(dead_code)] // the probes of the keyboard and of Doom press keys
     pub fn sendkey(&mut self, key: &str, hold: Option<u32>) -> Result<(), String> {
         let line = match hold {
             Some(ms) => format!("sendkey {key} {ms}"),
@@ -120,7 +119,6 @@ impl Monitor {
 
     /// Several `sendkey`, `pause` apart (a guest that draws a menu on the
     /// emulated processor needs time between the keys).
-    #[allow(dead_code)] // as `sendkey`
     pub fn sendkeys(&mut self, keys: &[&str], pause: Duration) -> Result<(), String> {
         for (i, key) in keys.iter().enumerate() {
             if i > 0 {
@@ -228,7 +226,6 @@ impl Ppm {
 
     /// The share of points, in thousandths, in which this picture differs
     /// from `other`'s; all of them when the sizes differ.
-    #[allow(dead_code)] // the probe of Doom compares two screens
     pub fn differs_from(&self, other: &Ppm) -> usize {
         if self.width != other.width || self.height != other.height {
             return 1000;

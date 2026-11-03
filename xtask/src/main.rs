@@ -33,6 +33,7 @@ mod clock_probe;
 mod cpus_dialog;
 mod cyrillic;
 mod disasm;
+mod display_probe;
 mod doom;
 mod entropy;
 mod gpu_probe;
@@ -1605,6 +1606,13 @@ commands:
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   doom-headless [MACHINE]  check Doom in the games image (boot-doom.img): from ash, without a
             screen, it plays the demo of Freedoom (-timedemo demo1 -nodraw) and ash prompts again
+  doom-probe [MACHINE]  the goal: from ash, `doom -iwad /games/freedoom1.wad` shows the title screen (QEMU's
+            screenshot has the CRC of the guest's frame), the keys of the menu lead to the first level, a
+            turn changes the view, the menu leaves with code 0 and the prompt of ash; Ctrl-C leaves too
+  doom-measure [MACHINE]  the numbers of Doom with the screen: frames a second of the demo, the memory of the
+            process, and on a machine under emulation the longest steps of the display and input services
+  doom [--machine hvf]  play by hand: QEMU with a window (cocoa on a Mac) and the console on the terminal;
+            at the prompt type `doom -iwad /games/freedoom1.wad` (Ctrl-A X quits QEMU)
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
   ls        run BusyBox ls against the RAM file service in QEMU
@@ -1647,6 +1655,7 @@ commands:
             and the service's steps under -icount; with --hvf under HVF
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
+  display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
@@ -1864,6 +1873,9 @@ fn main() {
             .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
         Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
+        Some("doom-probe") => qemu::machine(args.get(1)).and_then(doom::doom_probe),
+        Some("doom-measure") => qemu::machine(args.get(1)).and_then(doom::doom_measure),
+        Some("doom") => doom::doom_window(&args[1..]),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),
@@ -1897,6 +1909,7 @@ fn main() {
         },
         Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("posix-display") => posix_display::probe(&qemu::VIRT),
+        Some("display-probe") => display_probe::probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -8736,6 +8749,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("entropy", || entropy::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
+        // The screen and the keys of libc.so against QEMU's screenshots and
+        // the keys of its monitor.
+        job("display-probe", || display_probe::probe(&qemu::VIRT)),
         // The display service on virtio-gpu: the screen against QEMU's
         // screenshot, then its steps under -icount.
         job("gpu-probe", || gpu_probe::probe(&qemu::VIRT)),
@@ -11633,6 +11649,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-display-probe",
+        "--package",
+        "display-run",
         "--package",
         "posix-pty",
         "--package",

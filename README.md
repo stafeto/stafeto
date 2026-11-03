@@ -55,6 +55,7 @@ You need rustup, QEMU and dtc (on macOS: `brew install qemu dtc`); rustup instal
 cargo xtask ash-shell    # build the shell image and boot it in QEMU (Ctrl-A X quits)
 cargo xtask run          # the native shell; --hvf on Apple silicon
 cargo xtask vz           # the shell through Apple Virtualization.framework
+cargo xtask doom         # play Doom in a QEMU window (--machine hvf on a Mac; docs/doom.md)
 cargo xtask test         # host tests, kernel tests, guest probes
 cargo xtask ci           # everything CI runs: formatting, lints, licences, tests
 cargo xtask dist         # the release files in target/dist

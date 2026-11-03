@@ -353,6 +353,20 @@ pub(super) fn run() -> bool {
         if unsafe { ffi::pthread_join(id, &mut result) } != 0 {
             return failed(234);
         }
+        // The join returns once the thread has posted its value, which is
+        // before its last call (`thread_exit`): on another CPU the native
+        // thread is still held for a moment and takes a request. Once it has
+        // ended the request is refused. The wait sleeps 1 ms, which lets
+        // every level run.
+        let limit = now() + 2_000_000_000;
+        while sys::thread_info(&retained).is_ok_and(|info| info.state != ThreadState::Ended)
+            && now() < limit
+        {
+            let _ = abi::threads::sleep::nanosleep(abi::metadata::Timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000,
+            });
+        }
         if sys::thread_upcall_request(&retained) != Err(rt::abi::Error::BadState) {
             return failed(237);
         }
