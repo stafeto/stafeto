@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 import urllib.request
 from pathlib import Path
 
@@ -93,13 +94,24 @@ def license_texts(archive: Path, wanted: str = "") -> dict[str, bytes]:
     """The licence files in the top two directories of a source archive, and
     the file `wanted` (a path below the top directory) the description names."""
     found = {}
+
+    def take(name: str, read) -> None:
+        parts = name.split("/")
+        if (len(parts) <= 2 and LICENSE_NAMES.match(parts[-1])
+                or wanted and "/".join(parts[1:]) == wanted):
+            found[parts[-1]] = read()
+
+    # Most sources come as tarballs; a release such as Freedoom comes as a zip.
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as zip_file:
+            for info in zip_file.infolist():
+                if not info.is_dir():
+                    take(info.filename, lambda info=info: zip_file.read(info))
+        return found
     with tarfile.open(archive) as tar:
         for member in tar:
-            parts = member.name.split("/")
-            if member.isfile() and (
-                    len(parts) <= 2 and LICENSE_NAMES.match(parts[-1])
-                    or wanted and "/".join(parts[1:]) == wanted):
-                found[parts[-1]] = tar.extractfile(member).read()
+            if member.isfile():
+                take(member.name, lambda member=member: tar.extractfile(member).read())
     return found
 
 
