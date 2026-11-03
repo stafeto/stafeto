@@ -467,7 +467,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
             .into_iter()
             .filter(|p| p.kind != Kind::Game)
             .collect()),
-        "boot-doom.img" => load(),
+        "boot-doom.img" | "boot-doom-steps.img" => load(),
         _ => Ok(Vec::new()),
     }
 }

@@ -1606,6 +1606,13 @@ commands:
   nano-dialog  check GNU nano in an ash dialog in QEMU: typing, arrow keys, save, exit
   doom-headless [MACHINE]  check Doom in the games image (boot-doom.img): from ash, without a
             screen, it plays the demo of Freedoom (-timedemo demo1 -nodraw) and ash prompts again
+  doom-probe [MACHINE]  the goal: from ash, `doom -iwad /games/freedoom1.wad` shows the title screen (QEMU's
+            screenshot has the CRC of the guest's frame), the keys of the menu lead to the first level, a
+            turn changes the view, the menu leaves with code 0 and the prompt of ash; Ctrl-C leaves too
+  doom-measure [MACHINE]  the numbers of Doom with the screen: frames a second of the demo, the memory of the
+            process, and on a machine under emulation the longest steps of the display and input services
+  doom [--machine hvf]  play by hand: QEMU with a window (cocoa on a Mac) and the console on the terminal;
+            at the prompt type `doom -iwad /games/freedoom1.wad` (Ctrl-A X quits QEMU)
   bash-shell-exit  check that `exit 3` of bash (`exec bash`) ends the machine and gives 3
   bash-dialog  check an interactive GNU bash dialog in QEMU (bash started from ash)
   ls        run BusyBox ls against the RAM file service in QEMU
@@ -1866,6 +1873,9 @@ fn main() {
             .and_then(cpus_dialog::cpus_dialog),
         Some("ncdu-dialog") => ncdu_dialog::ncdu_dialog(),
         Some("doom-headless") => qemu::machine(args.get(1)).and_then(doom::doom_headless),
+        Some("doom-probe") => qemu::machine(args.get(1)).and_then(doom::doom_probe),
+        Some("doom-measure") => qemu::machine(args.get(1)).and_then(doom::doom_measure),
+        Some("doom") => doom::doom_window(&args[1..]),
         Some("ls") => ls_probe(),
         Some("posix-tty") => posix_tty_probe(false, false),
         Some("posix-tty-vz") => posix_tty_probe(true, false),

@@ -2015,11 +2015,22 @@ mod tests {
     }
 
     /// The games image is the shell's dialog with the launcher's quota of
-    /// 3 072 pages and a pool of four and a half such quotas.
+    /// 3 072 pages and a pool of four and a half such quotas, and the
+    /// input and display services, which the launcher (and so the shell and
+    /// Doom) reaches by a session with the display service.
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
-        assert_eq!(order_of(doom::TABLE), order_of(ramfs::BUSYBOX_DIALOG_TABLE));
+        let games = order_of(doom::TABLE);
+        let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
+        assert!(at("input") < at("gpu"));
+        assert!(at("gpu") < at("busybox-probe"));
+        let mut names = games.clone();
+        names.retain(|&n| n != "input" && n != "gpu");
+        let mut dialog = order_of(ramfs::BUSYBOX_DIALOG_TABLE);
+        names.sort_unstable();
+        dialog.sort_unstable();
+        assert_eq!(names, dialog);
         let launcher = doom::TABLE
             .iter()
             .find(|r| r.program == "ash-launcher")
@@ -2029,6 +2040,14 @@ mod tests {
             .find(|r| r.name == PROCESS_SERVICE)
             .unwrap();
         assert_eq!(launcher.quota, 3072 * PAGE);
+        assert!(launcher.connects.contains(&"gpu"));
+        // The display service is the only one that names the input service.
+        let named: Vec<_> = doom::TABLE
+            .iter()
+            .filter(|r| r.connects.contains(&"input"))
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(named, ["gpu"]);
         assert_eq!(posix.quota, ramfs::POSIX_ABI_TABLE[1].quota + 13_824 * PAGE);
     }
 
