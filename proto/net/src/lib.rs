@@ -220,9 +220,9 @@ impl Address {
     }
 
     /// The address from `r`: BAD_SIZE when the bytes end, NO_FAMILY for a
-    /// family that is neither 0 nor INET, and BAD_SIZE for an address
-    /// that is none but not all zero, or an IPv4 address with bytes after
-    /// its fourth.
+    /// family that is neither 0 nor INET, and BAD_SIZE for an address of
+    /// the family 0 with any byte or port set, or an IPv4 address with bytes
+    /// after its fourth.
     pub fn read(r: &mut Reader<'_>) -> Result<Address, Status> {
         let family = r.u32()?;
         let port = r.u32()?;

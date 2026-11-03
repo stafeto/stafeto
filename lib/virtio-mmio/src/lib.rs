@@ -350,7 +350,7 @@ pub fn start_with<T: Transport>(transport: &mut T, wanted: u64) -> Result<u64, S
     }
 }
 
-/// `start_with` for a device that has no feature but `VIRTIO_F_VERSION_1`.
+/// `start_with` for a device whose only feature is `VIRTIO_F_VERSION_1`.
 pub fn start<T: Transport>(transport: &mut T) -> Result<(), StartError> {
     start_with(transport, Feature::VERSION_1.bits()).map(drop)
 }

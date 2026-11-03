@@ -127,8 +127,8 @@ pub const PROBE: Record = Record {
     cpus: super::GENERAL_CPUS,
 };
 
-/// The image of the shell with the network service, which no client but
-/// the shell's programs reaches yet.
+/// The image of the shell with the network service. The shell's programs
+/// have no session with it yet (the place `Net` of a later stage).
 pub const NET_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[0],
     super::ramfs::BUSYBOX_DIALOG_TABLE[1],

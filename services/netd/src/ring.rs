@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn a_receive_token_leads_to_its_buffer_once() {
         let mut book = RxBook::new();
-        // The queue hands out its own numbers, not the buffers'.
+        // The queue hands out numbers of its own.
         assert!(book.put(7, 0));
         assert!(book.put(0, 255));
         assert_eq!(book.outstanding(), 2);

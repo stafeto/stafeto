@@ -270,7 +270,7 @@ impl phy::TxToken for TxToken<'_> {
             let len = len.min(MAX_FRAME);
             return f(&mut ring.scratch[..len]);
         };
-        // SAFETY: the buffer is the pool's, not with the device.
+        // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer(n) };
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
         let Some(total) = frames::tx_prepare(slice, len) else {
