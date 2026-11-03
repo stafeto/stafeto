@@ -623,25 +623,43 @@ static int names_truncate(void) {
     return 0;
 }
 
-static int names_statvfs(void) {
-    OK(mkdir(NAMES_ROOT "/v", 0777));
-    struct statvfs before, after, file;
-    /* The service gives the nodes of earlier sections back in the background:
-     * the count of free nodes is read until it stands still. */
-    OK(statvfs(NAMES_ROOT "/v", &before));
+/* The count of free nodes of `path`, read until it stands still: the service
+ * gives the nodes of earlier sections back in the background. */
+static int names_settled_statvfs(const char *path, struct statvfs *out) {
+    struct statvfs before;
+    if (statvfs(path, &before)) return -1;
     for (int steady = 0; steady < 5;) {
         names_pause();
-        OK(statvfs(NAMES_ROOT "/v", &after));
-        steady = after.f_ffree == before.f_ffree ? steady + 1 : 0;
-        before = after;
+        if (statvfs(path, out)) return -1;
+        steady = out->f_ffree == before.f_ffree ? steady + 1 : 0;
+        before = *out;
     }
-    CHECK(before.f_namemax == 255 && before.f_bsize > 0 && before.f_files > 0);
-    OK(mkdir(NAMES_ROOT "/v/d", 0755));
-    OK(statvfs(NAMES_ROOT "/v", &after));
-    CHECK(after.f_ffree + 1 == before.f_ffree);
+    return 0;
+}
+
+static int names_statvfs(void) {
+    OK(mkdir(NAMES_ROOT "/v", 0777));
+    struct statvfs before, after, again, file;
     int fd = open(NAMES_ROOT "/v", O_RDONLY | O_DIRECTORY);
     CHECK(fd >= 0);
-    OK(fstatvfs(fd, &file));
+    /* A node given back late, between two of the reads, moves the count
+     * under them. A pass is taken when the two reads by name around the read
+     * by descriptor agree and the directory took one node; otherwise the
+     * measure goes again, up to five times. A directory that took another
+     * count, or a descriptor that answers otherwise, fails every time. */
+    int measured = 0;
+    for (int attempt = 0; attempt < 5 && !measured; attempt++) {
+        OK(names_settled_statvfs(NAMES_ROOT "/v", &before));
+        CHECK(before.f_namemax == 255 && before.f_bsize > 0 && before.f_files > 0);
+        OK(mkdir(NAMES_ROOT "/v/d", 0755));
+        OK(statvfs(NAMES_ROOT "/v", &after));
+        OK(fstatvfs(fd, &file));
+        OK(statvfs(NAMES_ROOT "/v", &again));
+        measured = after.f_ffree + 1 == before.f_ffree
+            && again.f_ffree == after.f_ffree && again.f_blocks == after.f_blocks;
+        if (!measured) OK(rmdir(NAMES_ROOT "/v/d"));
+    }
+    CHECK(measured);
     CHECK(file.f_ffree == after.f_ffree && file.f_blocks == after.f_blocks);
     CHECK(close(fd) == 0);
     CHECK(fstatvfs(fd, &file) == -1 && errno == EBADF);

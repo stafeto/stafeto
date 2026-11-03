@@ -59,8 +59,8 @@ pub const STEPS_PROGRAMS: [ImageProgram; 3] = [
 /// device's status as the driver found it, before its own reset: 0 at the
 /// machine's start and after init stopped the device.
 pub const SERVICE_LINE: &str = "virtio-gpu: virtio-mmio at 0xa002e00, line 71, status 0x0";
-const READY: &str = "virtio-gpu: screen ready, 640x400, stride 2560";
-const RELEASED: &str = "gpu: screen released";
+pub const READY: &str = "virtio-gpu: screen ready, 640x400, stride 2560";
+pub const RELEASED: &str = "gpu: screen released";
 const PATTERN: &str = "gpu-probe: pattern crc ";
 const PARTIAL: &str = "gpu-probe: partial crc ";
 const ENDED: &str = "init: gpu-probe ended: exit code 0, not restarted";
@@ -112,7 +112,7 @@ const STEP_KINDS: [(usize, &str); 5] = [
 pub const STEP_MAX: u64 = TERM_B * 9 / 10;
 
 /// The CRC after `prefix` in the line of the guest, eight hex digits.
-fn crc_of(line: &str, prefix: &str) -> Result<u32, String> {
+pub fn crc_of(line: &str, prefix: &str) -> Result<u32, String> {
     let digits = line
         .split_once(prefix)
         .map(|(_, rest)| rest.trim())
@@ -172,20 +172,20 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
 }
 
 /// Where the run keeps its monitor's socket and the screenshots.
-struct Scratch(PathBuf);
+pub struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Scratch, String> {
+    pub fn new() -> Result<Scratch, String> {
         let dir = std::env::temp_dir().join(format!("stafeto-gpu-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Scratch(dir))
     }
 
-    fn socket(&self) -> PathBuf {
+    pub fn socket(&self) -> PathBuf {
         self.0.join("monitor.sock")
     }
 
-    fn picture(&self) -> PathBuf {
+    pub fn picture(&self) -> PathBuf {
         self.0.join("screen.ppm")
     }
 }
@@ -197,7 +197,12 @@ impl Drop for Scratch {
 }
 
 /// A screenshot of the monitor, 640 by 400, whose CRC is the guest's.
-fn compare(monitor: &mut Monitor, picture: &Path, line: &str, prefix: &str) -> Result<(), String> {
+pub fn compare(
+    monitor: &mut Monitor,
+    picture: &Path,
+    line: &str,
+    prefix: &str,
+) -> Result<(), String> {
     let wanted = crc_of(line, prefix)?;
     let shot = monitor.screendump(picture)?;
     if (shot.width, shot.height) != (640, 400) {

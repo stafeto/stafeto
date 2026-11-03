@@ -51,6 +51,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "display-run"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-gpu",
+ "rt",
+]
+
+[[package]]
 name = "dynlink"
 version = "0.1.0"
 
@@ -262,6 +272,7 @@ dependencies = [
  "proto-entropy",
  "proto-fs",
  "proto-gpu",
+ "proto-input",
  "proto-loader",
  "proto-pipe",
  "proto-process",

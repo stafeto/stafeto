@@ -908,7 +908,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-gpu") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
-    + cfg!(feature = "table-posix-display") as usize;
+    + cfg!(feature = "table-posix-display") as usize
+    + cfg!(feature = "table-display") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -958,7 +959,8 @@ const _: () = assert!(
     feature = "table-gpu",
     feature = "table-input",
     feature = "table-posix-random",
-    feature = "table-posix-display"
+    feature = "table-posix-display",
+    feature = "table-display"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1043,6 +1045,8 @@ pub const TABLE: &[Record] = input::TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 #[cfg(feature = "table-posix-display")]
 pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
+#[cfg(feature = "table-display")]
+pub const TABLE: &[Record] = ramfs::DISPLAY_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1788,6 +1792,7 @@ mod tests {
             ramfs::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
             ramfs::LOADER_CHANNELS_TABLE,
             ramfs::POSIX_POLL_TABLE,
             ramfs::POSIX_SOCK_TABLE,
@@ -2010,11 +2015,22 @@ mod tests {
     }
 
     /// The games image is the shell's dialog with the launcher's quota of
-    /// 3 072 pages and a pool of four and a half such quotas.
+    /// 3 072 pages and a pool of four and a half such quotas, and the
+    /// input and display services, which the launcher (and so the shell and
+    /// Doom) reaches by a session with the display service.
     #[test]
     fn the_games_table_is_the_dialog_with_the_quota_of_doom() {
         assert!(check(doom::TABLE).is_ok());
-        assert_eq!(order_of(doom::TABLE), order_of(ramfs::BUSYBOX_DIALOG_TABLE));
+        let games = order_of(doom::TABLE);
+        let at = |name: &str| games.iter().position(|&n| n == name).unwrap();
+        assert!(at("input") < at("gpu"));
+        assert!(at("gpu") < at("busybox-probe"));
+        let mut names = games.clone();
+        names.retain(|&n| n != "input" && n != "gpu");
+        let mut dialog = order_of(ramfs::BUSYBOX_DIALOG_TABLE);
+        names.sort_unstable();
+        dialog.sort_unstable();
+        assert_eq!(names, dialog);
         let launcher = doom::TABLE
             .iter()
             .find(|r| r.program == "ash-launcher")
@@ -2024,6 +2040,14 @@ mod tests {
             .find(|r| r.name == PROCESS_SERVICE)
             .unwrap();
         assert_eq!(launcher.quota, 3072 * PAGE);
+        assert!(launcher.connects.contains(&"gpu"));
+        // The display service is the only one that names the input service.
+        let named: Vec<_> = doom::TABLE
+            .iter()
+            .filter(|r| r.connects.contains(&"input"))
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(named, ["gpu"]);
         assert_eq!(posix.quota, ramfs::POSIX_ABI_TABLE[1].quota + 13_824 * PAGE);
     }
 
@@ -2050,6 +2074,7 @@ mod tests {
             vz::RTBENCH_POSIX_TABLE,
             ramfs::POSIX_RANDOM_TABLE,
             ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());
@@ -2066,6 +2091,7 @@ mod tests {
                     "rtbench-posix",
                     "posix-random",
                     "posix-display",
+                    "display-run",
                     "posix-pty",
                 ]
                 .contains(&r.program)

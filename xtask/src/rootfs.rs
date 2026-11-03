@@ -328,7 +328,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 10] = [
+pub const SHARED: [(&str, &str); 11] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -339,6 +339,7 @@ pub const SHARED: [(&str, &str); 10] = [
     ("bad-symbol", "probes/bad-symbol"),
     ("bad-ifunc", "probes/bad-ifunc"),
     ("bad-pie", "probes/bad-pie"),
+    ("display-probe", "probes/display-probe"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -369,6 +370,7 @@ fn shared_files() -> Vec<RootFile> {
             "bad-needed" => "/bin/bad-needed",
             "bad-symbol" => "/bin/bad-symbol",
             "bad-ifunc" => "/bin/bad-ifunc",
+            "display-probe" => "/bin/display-probe",
             _ => "/bin/bad-pie",
         };
         files.push(file(path, 0o755, ROOT, name));
@@ -967,6 +969,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-doom.img",
+    "boot-doom-steps.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1035,7 +1038,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 },
             ),
         ],
-        "boot-ash-dialog.img" | "boot-doom.img" => dialog(name),
+        "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-posix-native-scopes.img" | "boot-posix-native-scopes-vz.img" => {
             let mut files = procs();
             files.push(file(
@@ -1126,6 +1129,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 ),
                 dir("/dev"),
             ];
+            files.extend(devices());
+            files
+        }
+        "boot-display.img" => {
+            let mut files = library();
+            files.extend([
+                dir("/bin"),
+                file("/bin/display-run", 0o755, ROOT, "display-run"),
+                file("/bin/display-probe", 0o755, ROOT, "display-probe"),
+                dir("/dev"),
+            ]);
             files.extend(devices());
             files
         }
@@ -1486,6 +1500,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
+                "boot-doom-steps.img" => crate::doom::steps_programs(),
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-math.img" => &crate::POSIX_MATH_PROGRAMS,
                 "boot-posix-park.img" => &crate::POSIX_PARK_PROGRAMS,
@@ -1603,6 +1618,7 @@ mod tests {
         for name in [
             "boot-ash-dialog.img",
             "boot-doom.img",
+            "boot-doom-steps.img",
             "boot-posix-procs.img",
             "boot-posix-lifetimes.img",
             "boot-posix-lock-rules.img",
@@ -1618,6 +1634,7 @@ mod tests {
             "boot-posix-shares.img",
             "boot-posix-random.img",
             "boot-posix-display.img",
+            "boot-display.img",
             "boot-posix-pty.img",
             "boot-posix-steps.img",
             "rtbench-posix.img",

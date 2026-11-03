@@ -139,11 +139,13 @@ pub unsafe fn init(process: Handle<Process>) -> Result<(), rt::abi::Error> {
     Ok(())
 }
 
-/// What the map's handle of an object holds: MAP_READ, MAP_WRITE, and
-/// DUPLICATE and TRANSFER for the copy a `fork` hands its loader. No
-/// MANAGE or MAP_EXEC.
+/// What the map's handle of an object holds: MAP_READ, MAP_WRITE and
+/// MAP_EXEC (code is written through a writable mapping and then made
+/// executable by `mprotect`), and DUPLICATE and TRANSFER for the copy a
+/// `fork` hands its loader. No MANAGE.
 const KEPT: Rights = Rights::MAP_READ
     .union(Rights::MAP_WRITE)
+    .union(Rights::MAP_EXEC)
     .union(Rights::DUPLICATE)
     .union(Rights::TRANSFER);
 
