@@ -107,6 +107,7 @@ jobs:
           - guests-1
           - guests-2
           - guests-3
+          - net
     steps:
       - uses: actions/checkout@v4
 

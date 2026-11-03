@@ -179,6 +179,12 @@ pub const ENTROPY: &[&str] = &[
     "virtio-rng-device,bus=virtio-mmio-bus.31",
 ];
 
+/// No default network card. QEMU built with slirp gives the `virt` machine a
+/// `virtio-net-pci` on user-mode networking when the command line names no
+/// network option; every run drops it, and the network probes add their own
+/// device on a virtio-mmio transport (`net`).
+pub const NO_NIC: &[&str] = &["-nic", "none"];
+
 /// The Virtio GPU of the display service (services/virtio-gpu), on the
 /// transport init's table names, 23 (`table/gpu.rs`): address 0xa002e00,
 /// INTID 71. Its page 0xa002000 also covers the empty transports 16 to 22, which no other device may take. 640 by 400 is the screen's size;
@@ -202,6 +208,7 @@ pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String
     ]
     .iter()
     .chain(ENTROPY)
+    .chain(NO_NIC)
     .chain(&["-kernel"])
     .map(|s| s.to_string())
     .collect();
@@ -1127,6 +1134,7 @@ mod tests {
         assert!(
             joined.contains("-global virtio-mmio.force-legacy=false -device virtio-rng-device,bus=virtio-mmio-bus.31")
         );
+        assert!(joined.contains("-nic none"), "no default network card");
         assert!(
             !args(&VIRT, Path::new("k.elf"), None)
                 .join(" ")

@@ -33,6 +33,7 @@ pub fn groups() -> Vec<String> {
         .to_vec();
     all.extend((1..=OPEN_POSIX_PARTS).map(|n| format!("open-posix-{n}")));
     all.extend((1..=GUEST_GROUPS).map(|n| format!("guests-{n}")));
+    all.push("net".to_owned());
     all
 }
 
@@ -442,6 +443,10 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         }));
         steps.push(step(&group, "measures", &BOOT_NEEDS, super::write_measures));
     }
+
+    // The network probes run on QEMU's user-mode networking (slirp), apart
+    // from the weighted split of the guest probes: every boot named `net-`.
+    steps.push(step("net", "network probes", &BOOT_NEEDS, || Ok(())));
 
     // os-test: a boot a suite, and the complete basic suite.
     let os_needs = [RELIBC, BASE, ADDONS, KERNELS, IMAGES, OS_TEST_OBJECTS];
