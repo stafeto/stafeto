@@ -83,6 +83,7 @@ const PINGS_AFTER: &str = "net-probe: after restart ping 10.0.2.2 ok 10";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
+const ENDED_PREFIX: &str = "init: net-probe ended: ";
 const RTT: &str = "net-probe: ping rtt max ";
 const FRAMES: &str = "net: frames rx ";
 const SERVICE_ENDED: &str = "init: net ended: fault";
@@ -239,7 +240,11 @@ fn run(
     let result = run
         .expect_line(first, |l| l == first, within)
         .map(|_| began.elapsed())
-        .and_then(|took| run.expect_line(ENDED, |l| l == ENDED, within).map(|_| took));
+        .and_then(|took| {
+            // The client ends with any code: a failure is read from its lines.
+            run.expect_line(ENDED, |l| l.starts_with(ENDED_PREFIX), within)
+                .map(|_| took)
+        });
     let outcome = run.stop();
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     verdict(&outcome.lines, mode)
@@ -265,8 +270,12 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
     cmd.args(qemu::ICOUNT);
-    let output = run_until(cmd, crate::BOOT_TIMEOUT * 4, Some(ENDED), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ENDED)?;
+    let output = run_until(
+        cmd,
+        crate::BOOT_TIMEOUT * 4,
+        Some(ENDED_PREFIX),
+        &kernel.elf,
+    )?;
     verdict(&output.lines, Mode::Dhcp)
         .map_err(|e| format!("net-probe under -icount on {}: {e}", machine.name))?;
     let rows = steps_verdict(&output.lines)?;
