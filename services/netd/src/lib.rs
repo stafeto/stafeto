@@ -4,11 +4,12 @@
 //! What the network service decides (Virtio 1.2, 5.1; RFC 2131 for the
 //! lease), apart from the device and the calls it makes: the header of a
 //! frame (`frames`), the books of the two rings (`ring`) and the file
-//! `/etc/netd.conf` (`config`). Everything here builds for the host too,
+//! `/etc/netd.conf` (`config`), and the text it prints (`lines`). Everything here builds for the host too,
 //! where `cargo test -p netd` exercises it.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod config;
 pub mod frames;
+pub mod lines;
 pub mod ring;

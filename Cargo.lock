@@ -271,6 +271,7 @@ dependencies = [
  "posix-fs",
  "posix-random",
  "proto-entropy",
+ "proto-fs",
  "proto-init",
  "proto-net",
  "proto-wire",
