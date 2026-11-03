@@ -66,7 +66,10 @@ pub const NETD: Record = Record {
     }),
     priority: 35,
     ceiling: 35,
-    quota: 192 * PAGE,
+    // Measured: the probe's runs pass with 24 pages and fail with 16 (the
+    // pages the service touches: the stack, the table of the files read at
+    // the start, the data); 64 leave the code paths of this stage room.
+    quota: 64 * PAGE,
     handle_limit: 64,
     restart: Restart::Always,
     console: true,
