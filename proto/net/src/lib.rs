@@ -14,7 +14,7 @@
 //! | Method | Request | Reply | Refusals |
 //! |---|---|---|---|
 //! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes | NET_DOWN while there is no address |
-//! | PING (62) | an `Address` of port 0 | status, the round-trip time (u64, nanoseconds) | NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
+//! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds) | NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
 //! | CRASH (63) | the header alone | none: the service ends with a fault | only a service built with the feature `probe` has it |
 //!
 //! An address on the wire is the family (u32, INET = 2 for IPv4; 0 for
@@ -125,7 +125,7 @@ pub const NO_FAMILY: u32 = 721;
 pub const NOT_ALLOWED: u32 = 724;
 pub const RESET: u32 = 725;
 pub const PIPE: u32 = 726;
-/// The interface has no address (no lease yet, or the link is down).
+/// The interface has no address (no lease yet, or the lease was lost).
 pub const NET_DOWN: u32 = 727;
 pub const TIMEOUT: u32 = 728;
 pub const ALREADY: u32 = 729;

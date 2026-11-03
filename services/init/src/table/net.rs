@@ -130,6 +130,10 @@ pub const PROBE: Record = Record {
     cpus: super::GENERAL_CPUS,
 };
 
+// NET_TABLE copies the records of the shell's table by number: a table that
+// grows would lose its new record in the image with the network.
+const _: () = assert!(super::ramfs::BUSYBOX_DIALOG_TABLE.len() == 9);
+
 /// The image of the shell with the network service. The shell's programs
 /// have no session with it yet (the place `Net` of a later stage).
 pub const NET_TABLE: &[Record] = &[

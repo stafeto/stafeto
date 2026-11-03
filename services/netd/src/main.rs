@@ -75,10 +75,9 @@ const TRANSMITQ: u16 = 1;
 /// queue (Virtio 1.2, 5.1.3).
 const MAC: u64 = 1 << 5;
 const STATUS: u64 = 1 << 16;
-/// The registers of the device's configuration space (Virtio 1.2, 4.2.2
-/// and 5.1.4): the generation, then the MAC and the status.
-const CONFIG_GENERATION: usize = 0xfc;
-const CONFIG_SPACE: usize = 0x100;
+/// The offset of the link status in the configuration space (Virtio 1.2,
+/// 5.1.4), after the six bytes of the MAC.
+const STATUS_AT: usize = 6;
 const LINK_UP: u32 = 1;
 
 /// The codes of a start that failed: the start data or an object; the
@@ -123,27 +122,20 @@ fn now_ns() -> u64 {
 }
 
 /// The MAC address and the link status the configuration space of the
-/// device at `base` holds, read between two equal generations (Virtio 1.2,
-/// 2.5.1).
-fn read_config(base: usize) -> ([u8; 6], bool) {
-    loop {
-        // SAFETY: the registers lie within the transport the window maps
-        // at `base`, as device memory, aligned to 4 bytes.
-        let (before, low, high, after) = unsafe {
-            (
-                rt::mmio::read32(base + CONFIG_GENERATION),
-                rt::mmio::read32(base + CONFIG_SPACE),
-                rt::mmio::read32(base + CONFIG_SPACE + 4),
-                rt::mmio::read32(base + CONFIG_GENERATION),
-            )
-        };
-        if before == after {
-            let [m0, m1, m2, m3] = low.to_le_bytes();
-            let [m4, m5, s0, s1] = high.to_le_bytes();
-            let status = u32::from(u16::from_le_bytes([s0, s1]));
-            return ([m0, m1, m2, m3, m4, m5], status & LINK_UP != 0);
-        }
-    }
+/// device holds, read at the width of each field (Virtio 1.2, 4.2.2.2: the
+/// bytes of the MAC one at a time, the status as 16 bits) between two equal
+/// generations (Virtio 1.2, 2.5.1).
+fn read_config(transport: &MmioTransport<'static>) -> Result<([u8; 6], bool), ()> {
+    transport
+        .read_consistent(|| {
+            let mut mac = [0u8; 6];
+            for (at, byte) in mac.iter_mut().enumerate() {
+                *byte = transport.read_config_space::<u8>(at)?;
+            }
+            let status = transport.read_config_space::<u16>(STATUS_AT)?;
+            Ok((mac, u32::from(status) & LINK_UP != 0))
+        })
+        .map_err(|_| ())
 }
 
 fn main(_: u64) -> u64 {
@@ -256,7 +248,9 @@ fn main(_: u64) -> u64 {
         rt::println!("virtio-net: the device offers no MAC address");
         return NO_DEVICE;
     }
-    let (mac, link) = read_config(base);
+    let Ok((mac, link)) = read_config(&transport) else {
+        return NOT_STARTED;
+    };
     let link = link || features & STATUS == 0;
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
     let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
@@ -311,7 +305,6 @@ fn main(_: u64) -> u64 {
         timer,
         _view: view,
         ping: None,
-        base,
         mac,
         link,
         line_closed: false,
@@ -323,7 +316,7 @@ fn main(_: u64) -> u64 {
     virtio_mmio::reopen(&driver.irq);
     driver.step(false);
     #[cfg(feature = "steps")]
-    rt::service::report_steps(13);
+    rt::service::report_steps(14);
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -359,8 +352,6 @@ struct Driver<'a> {
     timer: Handle<Timer>,
     _view: Handle<Channel>,
     ping: Option<Pending>,
-    /// The transport's registers.
-    base: usize,
     mac: [u8; 6],
     link: bool,
     /// The line is closed (the kernel masked it at delivery and the step
@@ -372,11 +363,14 @@ struct Driver<'a> {
 }
 
 impl Driver<'_> {
-    /// Asks the loop for a step, unless one is asked for.
-    fn want_step(&mut self) {
-        if !self.step_told && sys::notify(&self.notify, STEP).is_ok() {
-            self.step_told = true;
+    /// Asks the loop for a step, unless one is asked for; false when the
+    /// notification was refused and no step is on its way.
+    fn want_step(&mut self) -> bool {
+        if self.step_told {
+            return true;
         }
+        self.step_told = sys::notify(&self.notify, STEP).is_ok();
+        self.step_told
     }
 
     /// One step of the service: from the interrupt (`interrupt`: read the
@@ -400,9 +394,10 @@ impl Driver<'_> {
         rt::service::step_detail(self.device.step_frames() as u64);
         // Frames the share of the step left in the queue: another step,
         // with the line closed.
-        if self.device.rx.queue.can_pop() {
-            self.want_step();
-        } else if core::mem::take(&mut self.line_closed) {
+        // A refused notification opens the line instead: the level brings the
+        // interrupt back for the frames still in the queue.
+        let continued = self.device.rx.queue.can_pop() && self.want_step();
+        if !continued && core::mem::take(&mut self.line_closed) {
             virtio_mmio::reopen(&self.irq);
         }
         self.arm(now);
@@ -410,7 +405,9 @@ impl Driver<'_> {
 
     /// The change of the link (the interrupt's configuration bit).
     fn link_changed(&mut self) {
-        let (_, up) = read_config(self.base);
+        let Ok((_, up)) = read_config(&self.transport) else {
+            return;
+        };
         if up != self.link {
             self.link = up;
             rt::println!("virtio-net: link {}", if up { "up" } else { "down" });

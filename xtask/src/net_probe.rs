@@ -89,7 +89,7 @@ const FRAMES: &str = "net: frames rx ";
 const SERVICE_ENDED: &str = "init: net ended: fault";
 
 /// The tag of the service's lines of steps (rt::service::report_steps).
-const NET_TAG: &str = "13";
+const NET_TAG: &str = "14";
 /// The kinds of steps that must come: CONFIG (21), PING (62) and the
 /// service's own steps (65: the interrupt, the continuation and the
 /// deadline).

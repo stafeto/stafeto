@@ -555,6 +555,114 @@ mod tests {
         assert_eq!(bits.bits(), VERSION_1 | MAC | STATUS);
     }
 
+    /// A transport that stands for a device: it offers `offered`, keeps
+    /// what the driver writes, and clears `FEATURES_OK` when `refuses`.
+    struct Fake {
+        offered: u64,
+        refuses: bool,
+        status: DeviceStatus,
+        driver_features: u64,
+    }
+
+    impl Fake {
+        fn new(offered: u64) -> Fake {
+            Fake {
+                offered,
+                refuses: false,
+                status: DeviceStatus::empty(),
+                driver_features: 0,
+            }
+        }
+    }
+
+    impl Transport for Fake {
+        fn device_type(&self) -> virtio_drivers::transport::DeviceType {
+            virtio_drivers::transport::DeviceType::Network
+        }
+        fn read_device_features(&mut self) -> u64 {
+            self.offered
+        }
+        fn write_driver_features(&mut self, features: u64) {
+            self.driver_features = features;
+        }
+        fn max_queue_size(&mut self, _: u16) -> u32 {
+            256
+        }
+        fn notify(&mut self, _: u16) {}
+        fn get_status(&self) -> DeviceStatus {
+            self.status
+        }
+        fn set_status(&mut self, status: DeviceStatus) {
+            self.status = if self.refuses {
+                status - DeviceStatus::FEATURES_OK
+            } else {
+                status
+            };
+        }
+        fn set_guest_page_size(&mut self, _: u32) {}
+        fn requires_legacy_layout(&self) -> bool {
+            false
+        }
+        fn queue_set(&mut self, _: u16, _: u32, _: PhysAddr, _: PhysAddr, _: PhysAddr) {}
+        fn queue_unset(&mut self, _: u16) {}
+        fn queue_used(&mut self, _: u16) -> bool {
+            false
+        }
+        fn ack_interrupt(&mut self) -> InterruptStatus {
+            InterruptStatus::empty()
+        }
+        fn read_config_generation(&self) -> u32 {
+            0
+        }
+        fn read_config_space<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
+            &self,
+            _: usize,
+        ) -> virtio_drivers::Result<T> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+        fn write_config_space<T: zerocopy::IntoBytes + zerocopy::Immutable>(
+            &mut self,
+            _: usize,
+            _: T,
+        ) -> virtio_drivers::Result<()> {
+            Err(virtio_drivers::Error::ConfigSpaceTooSmall)
+        }
+    }
+
+    #[test]
+    fn start_with_gives_the_device_the_class_bits_it_offers() {
+        // The test that catches `begin_init` on the crate's common feature
+        // type: MAC (5) and STATUS (16) would be cut from the set written to
+        // the device and from the result.
+        let mut device = Fake::new(VERSION_1 | MAC | STATUS | CSUM | (1 << 15));
+        let got = start_with(&mut device, MAC | STATUS);
+        assert_eq!(got, Ok(VERSION_1 | MAC | STATUS));
+        assert_eq!(device.driver_features, VERSION_1 | MAC | STATUS);
+        assert!(device.status.contains(DeviceStatus::FEATURES_OK));
+        assert!(!device.status.contains(DeviceStatus::FAILED));
+        // A device that lacks MAC gives a result without it; the caller
+        // decides.
+        let mut bare = Fake::new(VERSION_1 | STATUS);
+        assert_eq!(start_with(&mut bare, MAC | STATUS), Ok(VERSION_1 | STATUS));
+    }
+
+    #[test]
+    fn start_with_fails_when_the_device_keeps_no_features_ok() {
+        let mut device = Fake::new(VERSION_1 | MAC);
+        device.refuses = true;
+        assert_eq!(start_with(&mut device, MAC), Err(StartError::Features));
+        assert!(device.status.contains(DeviceStatus::FAILED));
+    }
+
+    #[test]
+    fn start_asks_for_version_1_alone() {
+        let mut device = Fake::new(VERSION_1 | MAC | STATUS);
+        assert_eq!(start(&mut device), Ok(()));
+        assert_eq!(device.driver_features, VERSION_1);
+        let mut old = Fake::new(MAC);
+        assert_eq!(start(&mut old), Err(StartError::Features));
+    }
+
     #[test]
     fn a_device_without_version_1_is_refused() {
         assert_eq!(

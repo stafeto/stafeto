@@ -55,6 +55,8 @@ pub enum Reason {
     BadHandover,
     NeedsAddress,
     GatewayOutside,
+    NotUnicast,
+    GatewayIsAddress,
 }
 
 impl Reason {
@@ -72,6 +74,8 @@ impl Reason {
             Reason::BadHandover => "handover is 0 or 1",
             Reason::NeedsAddress => "gateway and dns need an address line",
             Reason::GatewayOutside => "the gateway is outside the network of the address",
+            Reason::NotUnicast => "not a unicast address (0.x.x.x, multicast or broadcast)",
+            Reason::GatewayIsAddress => "the gateway is the interface's own address",
         }
     }
 }
@@ -143,6 +147,23 @@ pub fn same_network(a: &Cidr, b: [u8; 4]) -> bool {
     (u32::from_be_bytes(a.address) ^ u32::from_be_bytes(b)) & mask == 0
 }
 
+/// Whether `ip` can be the address of a host: not in 0.0.0.0/8 (this
+/// network, 0.0.0.0 among it), and below the multicast range 224.0.0.0/4,
+/// which holds the reserved block and the broadcast address 255.255.255.255
+/// above it. The stack panics on an address that fails this.
+pub fn unicast(ip: [u8; 4]) -> bool {
+    ip[0] != 0 && ip[0] < 224
+}
+
+fn unicast_ip(text: &[u8]) -> Result<[u8; 4], Reason> {
+    let ip = parse_ipv4(text).ok_or(Reason::BadAddress)?;
+    if unicast(ip) {
+        Ok(ip)
+    } else {
+        Err(Reason::NotUnicast)
+    }
+}
+
 fn set<T>(slot: &mut Option<T>, value: T) -> Result<(), Reason> {
     if slot.is_some() {
         return Err(Reason::KeyTwice);
@@ -173,15 +194,15 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
         return Err(Reason::ExtraWord);
     }
     match key {
-        b"address" => set(&mut settings.address, parse_cidr(value)?),
-        b"gateway" => set(
-            &mut settings.gateway,
-            parse_ipv4(value).ok_or(Reason::BadAddress)?,
-        ),
-        b"dns" => set(
-            &mut settings.dns,
-            parse_ipv4(value).ok_or(Reason::BadAddress)?,
-        ),
+        b"address" => {
+            let cidr = parse_cidr(value)?;
+            if !unicast(cidr.address) {
+                return Err(Reason::NotUnicast);
+            }
+            set(&mut settings.address, cidr)
+        }
+        b"gateway" => set(&mut settings.gateway, unicast_ip(value)?),
+        b"dns" => set(&mut settings.dns, unicast_ip(value)?),
         _ => {
             let on = match value {
                 b"0" => false,
@@ -222,16 +243,18 @@ pub fn parse(file: &[u8]) -> Result<Settings, Error> {
                 reason: Reason::NeedsAddress,
             });
         }
-        (Some(a), Some(g), _) if !same_network(&a, g) => {
+        (Some(a), Some(g), _) if g == a.address || !same_network(&a, g) => {
             // The line of the gateway, for the message.
             let at = file
                 .split(|&b| b == b'\n')
                 .position(|l| trim(l).starts_with(b"gateway"))
                 .map_or(0, |n| n + 1);
-            return Err(Error {
-                line: at,
-                reason: Reason::GatewayOutside,
-            });
+            let reason = if g == a.address {
+                Reason::GatewayIsAddress
+            } else {
+                Reason::GatewayOutside
+            };
+            return Err(Error { line: at, reason });
         }
         _ => {}
     }
@@ -348,7 +371,7 @@ mod tests {
             (3, Reason::GatewayOutside)
         );
         assert!(parse(b"address 10.0.2.15/16\ngateway 10.0.3.2").is_ok());
-        assert!(parse(b"address 10.0.2.15/32\ngateway 10.0.2.15").is_ok());
+        assert!(parse(b"address 10.0.2.15/32\ngateway 10.0.2.16").is_err());
         assert!(!same_network(
             &Cidr {
                 address: [10, 0, 2, 15],
@@ -356,6 +379,43 @@ mod tests {
             },
             [10, 0, 2, 16]
         ));
+    }
+
+    #[test]
+    fn addresses_the_stack_would_panic_on_are_refused() {
+        for bad in [
+            "224.0.0.1/24",
+            "239.255.255.255/8",
+            "255.255.255.255/32",
+            "240.0.0.1/8",
+            "0.0.0.0/8",
+            "0.1.2.3/24",
+        ] {
+            let file = format!("address {bad}");
+            assert_eq!(fault(file.as_bytes()), (1, Reason::NotUnicast), "{bad}");
+        }
+        assert_eq!(
+            fault(b"address 10.0.2.15/24\ngateway 0.0.0.0"),
+            (2, Reason::NotUnicast)
+        );
+        assert_eq!(
+            fault(b"address 10.0.2.15/24\ndns 224.0.0.251"),
+            (2, Reason::NotUnicast)
+        );
+        assert_eq!(
+            fault(b"address 10.0.2.15/24\ndns 255.255.255.255"),
+            (2, Reason::NotUnicast)
+        );
+        assert!(parse(b"address 127.0.0.1/8").is_ok());
+        assert!(parse(b"address 223.255.255.254/24").is_ok());
+    }
+
+    #[test]
+    fn the_gateway_is_not_the_address_itself() {
+        assert_eq!(
+            fault(b"address 10.0.2.15/24\n\ngateway 10.0.2.15"),
+            (3, Reason::GatewayIsAddress)
+        );
     }
 
     #[test]
