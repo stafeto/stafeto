@@ -169,8 +169,8 @@ impl Probe<'_> {
     }
 
     fn print_config(&self, prefix: &str, c: &Config) {
-        let gateway = c.gateway.map_or([0; 4], |g| g);
-        let dns = c.dns.map_or([0; 4], |d| d);
+        let gateway = c.gateway.unwrap_or([0; 4]);
+        let dns = c.dns.unwrap_or([0; 4]);
         rt::println!(
             "net-probe: {prefix}config {}/{} gw {} dns {} mac {}",
             Ip(c.address),
