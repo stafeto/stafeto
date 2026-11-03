@@ -259,11 +259,10 @@ fn main(_: u64) -> u64 {
     let (mac, link) = read_config(base);
     let link = link || features & STATUS == 0;
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
-    let queues = (
-        Q::new(&mut transport, RECEIVEQ, false, false),
-        Q::new(&mut transport, TRANSMITQ, false, false),
-    );
-    let (Ok(rx_queue), Ok(tx_queue)) = queues else {
+    let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
+        return NOT_STARTED;
+    };
+    let Ok(tx_queue) = Q::new(&mut transport, TRANSMITQ, false, false) else {
         return NOT_STARTED;
     };
     let mut device = NetDevice {

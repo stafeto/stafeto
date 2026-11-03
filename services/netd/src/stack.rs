@@ -239,8 +239,11 @@ impl<'a> Stack<'a> {
                 Some(Event::Leased(lease))
             }
             dhcpv4::Event::Deconfigured => {
+                // The client reports "no configuration" once at its start,
+                // before there was any to lose.
+                let had = self.lease.is_some();
                 self.remove();
-                Some(Event::Lost)
+                had.then_some(Event::Lost)
             }
         }
     }

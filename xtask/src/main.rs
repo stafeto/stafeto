@@ -50,6 +50,8 @@ mod native_scopes;
 #[path = "../../lib/posix-thread/tests/native_stop_barrier.rs"]
 mod native_stop_barrier_tests;
 mod ncdu_dialog;
+mod net;
+mod net_probe;
 mod obj_sites;
 mod openposix;
 mod ostest;
@@ -1899,6 +1901,8 @@ fn main() {
             }),
             Some(_) => Err("gpu-probe [--hvf]".to_owned()),
         },
+        Some("net") => net::run(&args[1..]),
+        Some("net-probe") => net_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {

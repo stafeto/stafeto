@@ -195,6 +195,46 @@ pub const GPU: &[&str] = &[
     "virtio-gpu-device,bus=virtio-mmio-bus.23,xres=640,yres=400",
 ];
 
+/// A port of the host forwarded to a port of the guest (user-mode
+/// networking: the only way in).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub host: u16,
+    pub guest: u16,
+}
+
+/// The MAC address of the guest's network device.
+pub const NET_MAC: &str = "52:54:00:12:34:56";
+
+/// The Virtio network device of the network service (services/netd), on the
+/// transport init's table names, 7 (`table/net.rs`): address 0xa000e00,
+/// INTID 55, on the page 0xa000000 with the empty transports 0 to 6. It
+/// sits on QEMU's user-mode networking (slirp: the guest 10.0.2.15, the
+/// gateway 10.0.2.2, the name server 10.0.2.3; only the echo to the
+/// gateway answers a ping), with `forwards` from 127.0.0.1 of the host. The
+/// variable STAFETO_PCAP names a file for a capture of every frame of the
+/// guest's device. The images that run the service add these arguments.
+pub fn net(forwards: &[Forward]) -> Vec<String> {
+    let mut netdev = String::from("user,id=n0");
+    for f in forwards {
+        netdev += &format!(",hostfwd=tcp:127.0.0.1:{}-:{}", f.host, f.guest);
+    }
+    let mut a = vec![
+        "-netdev".to_owned(),
+        netdev,
+        "-device".to_owned(),
+        format!("virtio-net-device,netdev=n0,bus=virtio-mmio-bus.7,mac={NET_MAC}"),
+    ];
+    if let Some(file) = std::env::var_os("STAFETO_PCAP").filter(|f| !f.is_empty()) {
+        a.push("-object".to_owned());
+        a.push(format!(
+            "filter-dump,id=f0,netdev=n0,file={}",
+            file.to_string_lossy()
+        ));
+    }
+    a
+}
+
 /// The Virtio keyboard of the input service (services/virtio-input), on
 /// the transport init's table names, 15 (`table/input.rs`): address
 /// 0xa001e00, INTID 63, on the page 0xa001000 with the empty transports 8 to
@@ -1139,6 +1179,31 @@ mod tests {
             !args(&VIRT, Path::new("k.elf"), None)
                 .join(" ")
                 .contains("-initrd")
+        );
+    }
+
+    #[test]
+    fn the_network_device_sits_on_transport_7_with_the_forwards() {
+        let none = net(&[]).join(" ");
+        assert!(none.contains("-netdev user,id=n0 "), "{none}");
+        assert!(none.contains(
+            "-device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.7,mac=52:54:00:12:34:56"
+        ));
+        let two = net(&[
+            Forward {
+                host: 8080,
+                guest: 80,
+            },
+            Forward {
+                host: 2222,
+                guest: 22,
+            },
+        ])
+        .join(" ");
+        assert!(
+            two.contains(
+                "user,id=n0,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:2222-:22"
+            )
         );
     }
 
