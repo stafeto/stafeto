@@ -731,6 +731,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-net"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-pipe",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-pipe"
 version = "0.1.0"
 dependencies = [
