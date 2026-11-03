@@ -13,6 +13,7 @@ description = "The virtio-mmio setup the drivers of stafeto share: the check of 
 bench = false
 
 [dependencies]
+bitflags = { version = "2", default-features = false }
 virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
 
 # The calls of the driver's process exist on stafeto alone.

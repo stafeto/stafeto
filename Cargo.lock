@@ -1096,6 +1096,7 @@ dependencies = [
 name = "virtio-mmio"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "rt",
  "virtio-drivers",
 ]
