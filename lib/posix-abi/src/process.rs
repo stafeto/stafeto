@@ -777,12 +777,11 @@ impl Shadow {
             terminal_open_count: 0,
             real_ids: false,
         };
-        let numbers = core::array::from_fn::<_, { posix_fs::OPEN_MAX }, _>(|fd| fd as u32);
         let owner = crate::relibc::open_owner()
             .ok()
             .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
         let frame = crate::change::frame();
-        let captured = crate::shared::with_descriptors(&numbers, |files| {
+        let captured = crate::shared::with_every_descriptor(|files| {
             // The snapshot goes into the shadow itself, and the loop below
             // holds each of its targets (no second table on the stack).
             for (fd, target, flags) in files.descriptors() {
@@ -841,14 +840,6 @@ impl Shadow {
         Ok(self.slots[at]
             .as_mut()
             .expect("the slot was just found or made"))
-    }
-
-    /// What `fd` names for the child now, and the token of a terminal an
-    /// action opens there.
-    fn entry(&self, fd: u32) -> Option<(posix_fs::Target, bool)> {
-        self.find(fd)
-            .and_then(|at| self.slots[at])
-            .and_then(|slot| slot.entry)
     }
 
     fn pending_of(&self, fd: u32) -> Option<u32> {

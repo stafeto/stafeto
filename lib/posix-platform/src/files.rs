@@ -435,22 +435,31 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             Err(errno) => return -errno,
         }
     }
+    // A copy at the lowest free number from the argument may need a page of
+    // the table of descriptors: the call grows the table and asks again.
+    if matches!(command, F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_CLOFORK) {
+        let made = call(|| {
+            let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
+            let flags = DescriptorFlags {
+                close_on_exec: command == F_DUPFD_CLOEXEC,
+                close_on_fork: command == F_DUPFD_CLOFORK,
+            };
+            number(fd).and_then(|fd| {
+                posix_abi::shared::growing_in(&[fd], |files| {
+                    files
+                        .dup_from(fd, minimum, flags)
+                        .map(|new| new as c_int)
+                        .map_err(posix_abi::shared::page_error)
+                })
+            })
+        });
+        return made.unwrap_or_else(|errno| -errno);
+    }
     let result = call(|| {
         number(fd).and_then(|fd| {
             posix_abi::shared::with_fd(fd, |files| {
                 let error = posix_abi::error;
                 match command {
-                    F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_CLOFORK => {
-                        let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
-                        let flags = DescriptorFlags {
-                            close_on_exec: command == F_DUPFD_CLOEXEC,
-                            close_on_fork: command == F_DUPFD_CLOFORK,
-                        };
-                        files
-                            .dup_from(fd, minimum, flags)
-                            .map(|new| new as c_int)
-                            .map_err(error)
-                    }
                     F_GETFD => {
                         let flags = files.descriptor_flags(fd).map_err(error)?;
                         let exec = if flags.close_on_exec { FD_CLOEXEC } else { 0 };

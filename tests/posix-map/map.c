@@ -1502,10 +1502,10 @@ static char *pin_map(int i) {
     return pin_map_prot(i, PROT_READ | PROT_WRITE);
 }
 
-/* The numbers open now, 0 to 63. */
+/* The numbers open now, 0 to 1 023. */
 static int numbers_open(void) {
     int open_now = 0;
-    for (int n = 0; n < 64; n++) {
+    for (int n = 0; n < 1024; n++) {
         if (fcntl(n, F_GETFD) >= 0) open_now++;
     }
     return open_now;
@@ -1539,7 +1539,7 @@ static void pins(void) {
     check("pins: the mappings took no number", numbers_open() == before);
     /* Not a number is found by a search, and a close of every number from
      * 3 leaves the mappings alone. */
-    for (int n = 3; n < 64; n++) close(n);
+    for (int n = 3; n < 1024; n++) close(n);
     check("pins: the mappings survive the close of every number", numbers_open() == 3);
     for (int i = 0; i < PINS; i++) maps[i][i] = 'P';
     int written = 0;
@@ -1568,9 +1568,9 @@ static void pins(void) {
     int fd = open(path, O_RDONLY);
     int copies = 0;
     while (fd >= 0 && dup(fd) >= 0) copies++;
-    check("pins: all 64 numbers are free to use", fd >= 0 && fd + copies == 63 && errno == EMFILE);
-    check("pins: and the table is full", numbers_open() == 64);
-    for (int n = 3; n < 64; n++) close(n);
+    check("pins: all 1 024 numbers are free to use", fd >= 0 && fd + copies == 1023 && errno == EMFILE);
+    check("pins: and the table is full", numbers_open() == 1024);
+    for (int n = 3; n < 1024; n++) close(n);
     /* A forked child has the mappings and writes through them. */
     pid_t child = fork();
     if (child == 0) {

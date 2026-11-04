@@ -1604,6 +1604,18 @@ impl PosixFs {
         }
     }
 
+    /// A close in flight of any descriptor, for the walks that wait for them.
+    pub fn any_closing(&self) -> Option<closing::CloseToken> {
+        let mut from = 0;
+        while let Some(fd) = self.descriptors.next_used(from) {
+            if let Some(token) = self.closing(fd) {
+                return Some(token);
+            }
+            from = fd + 1;
+        }
+        None
+    }
+
     /// The page of the table that the descriptor `fd` lies in, when the
     /// table does not have it yet (a `dup2` onto it needs it first).
     pub fn page_of(&self, fd: u32) -> Option<usize> {

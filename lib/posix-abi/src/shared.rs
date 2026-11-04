@@ -833,6 +833,19 @@ pub fn with_descriptors<R>(
     fds: &[u32],
     f: impl FnOnce(&mut PosixFs) -> Result<R, i32>,
 ) -> Result<R, i32> {
+    waiting_for(|files| fds.iter().find_map(|&fd| files.closing(fd)), f)
+}
+
+/// `with_descriptors` for an operation on every descriptor: it waits for the
+/// closes in flight of any of them.
+pub fn with_every_descriptor<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    waiting_for(|files| files.any_closing(), f)
+}
+
+fn waiting_for<R>(
+    closing: impl Fn(&PosixFs) -> Option<posix_fs::closing::CloseToken>,
+    f: impl FnOnce(&mut PosixFs) -> Result<R, i32>,
+) -> Result<R, i32> {
     enum Step<R> {
         Close(posix_fs::closing::CloseToken),
         Done(Result<R, i32>),
@@ -840,7 +853,7 @@ pub fn with_descriptors<R>(
     let mut f = Some(f);
     loop {
         let step = process_state(|files| {
-            if let Some(token) = fds.iter().find_map(|&fd| files.closing(fd)) {
+            if let Some(token) = closing(files) {
                 return Ok(Step::Close(token));
             }
             Ok(Step::Done(f.take().expect("one fd operation")(files)))

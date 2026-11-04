@@ -229,7 +229,7 @@ pub(crate) fn abandon() {
     let Ok(service) = channel() else { return };
     let request = proto_net::Method::Abandon.header().bytes();
     loop {
-        let mut reply = match rt::sys::send(&service, &request) {
+        let reply = match rt::sys::send(&service, &request) {
             Err(Error::Interrupted) => continue,
             Ok(reply) => reply,
             Err(_) => return,

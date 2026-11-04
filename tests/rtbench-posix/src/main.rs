@@ -237,7 +237,17 @@ pub extern "C" fn rtbench_io_init() -> c_int {
     // SAFETY: the once guard provides exclusive uninitialized static storage.
     // initialize_at consumes startup and leaves the destination untouched on error.
     let destination = unsafe { (*IO_STAGING.0.get()).as_mut_ptr() };
-    if unsafe { posix_fs::PosixFs::initialize_at(destination, startup, b"/", None, false) }.is_err()
+    if unsafe {
+        posix_fs::PosixFs::initialize_at(
+            destination,
+            startup,
+            b"/",
+            None,
+            false,
+            &mut posix_fs::Late::new(),
+        )
+    }
+    .is_err()
     {
         return -1;
     }

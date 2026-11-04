@@ -158,14 +158,17 @@ static int files(void) {
     CHECK(unlink(temp) == 0 && close(made) == 0 && close(shared) == 0);
     CHECK(close(appended) == 0 && close(readwrite) == 0 && unlink("/tmp/probe-flags") == 0);
 
-    /* The table holds 64 descriptors: numbers up to 63 are taken by dup2,
-     * dup3 and F_DUPFD, and 64 is EBADF (EINVAL for the minimum of F_DUPFD). */
+    /* The table holds 1 024 descriptors: numbers up to 1 023 are taken by
+     * dup2, dup3 and F_DUPFD (those past 63 lie in pages of the table), and
+     * 1 024 is EBADF (EINVAL for the minimum of F_DUPFD). */
     CHECK(dup2(2, 42) == 42 && (fcntl(42, F_GETFL) & O_ACCMODE) == O_WRONLY);
-    CHECK(dup3(1, 63, O_CLOEXEC) == 63 && fcntl(63, F_GETFD) == FD_CLOEXEC);
-    CHECK(dup2(2, 64) == -1 && errno == EBADF && dup3(1, 64, 0) == -1 && errno == EBADF);
-    CHECK(fcntl(2, F_DUPFD, 64) == -1 && errno == EINVAL);
+    CHECK(dup3(1, 1023, O_CLOEXEC) == 1023 && fcntl(1023, F_GETFD) == FD_CLOEXEC);
+    CHECK(dup2(2, 1024) == -1 && errno == EBADF && dup3(1, 1024, 0) == -1 && errno == EBADF);
+    CHECK(fcntl(2, F_DUPFD, 1024) == -1 && errno == EINVAL);
     int far = fcntl(2, F_DUPFD, 50);
-    CHECK(far == 50 && close(far) == 0 && close(42) == 0 && close(63) == 0);
+    CHECK(far == 50 && close(far) == 0 && close(42) == 0 && close(1023) == 0);
+    far = fcntl(2, F_DUPFD, 300);
+    CHECK(far == 300 && close(far) == 0);
 
     /* writev keeps the bytes of the parts before one that fails; a count
      * of parts outside 1 to IOV_MAX is EINVAL. */

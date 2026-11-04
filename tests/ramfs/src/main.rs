@@ -95,7 +95,7 @@ fn alias_clone_list(
     exact: posix_fs::RamTarget,
 ) -> Result<rt::fs::PreparedOpen, &'static str> {
     let mut kept = [held; posix_fs::KEPT_BY_FORK_MAX];
-    if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
+    if native.kept_by_fork(&mut kept) != Ok(1) || kept[0] != exact.prepared() {
         return Err("exact alias clone list");
     }
     Ok(kept[0])
@@ -212,8 +212,16 @@ fn check_initialization(
         let startup =
             StartupFiles::connect(parent, false).map_err(|_| "error fixture transports")?;
         // SAFETY: the startup-only allocation is aligned, exclusive and uninitialized.
-        if unsafe { PosixFs::initialize_at(destination, startup, cwd, list, false) }
-            != Err(expected)
+        if unsafe {
+            PosixFs::initialize_at(
+                destination,
+                startup,
+                cwd,
+                list,
+                false,
+                &mut posix_fs::Late::new(),
+            )
+        } != Err(expected)
         {
             return Err("initialization error result");
         }
@@ -293,8 +301,16 @@ fn check_exact_imports(
                 .write_bytes(0xa5, core::mem::size_of::<PosixFs>())
         };
         // SAFETY: the allocation is aligned, exclusive and retains no initialized fields.
-        if unsafe { PosixFs::initialize_at(destination, startup, b"/", Some(&list), false) }
-            != Err(expected)
+        if unsafe {
+            PosixFs::initialize_at(
+                destination,
+                startup,
+                b"/",
+                Some(&list),
+                false,
+                &mut posix_fs::Late::new(),
+            )
+        } != Err(expected)
         {
             return Err("last import failure");
         }
@@ -328,6 +344,7 @@ fn check_exact_imports(
             b"/",
             Some(&list),
             false,
+            &mut posix_fs::Late::new(),
         )
     }
     .map_err(|_| "alias import initialization")?;
