@@ -266,7 +266,15 @@ impl Net {
         if let Some(place) = touched {
             self.touch(place);
         }
+        #[cfg(feature = "probe")]
+        {
+            self.in_request = true;
+        }
         let answer = self.dispatch(stack, s, r, call, now);
+        #[cfg(feature = "probe")]
+        {
+            self.in_request = false;
+        }
         // A request that changed a place with records brings what the service
         // knows of its events up to date: a read that took the last byte must
         // not leave the place reported readable.
@@ -1554,7 +1562,15 @@ impl Net {
         self.interest.take(set, most, &mut ready);
         rt::service::step_detail(ready.len as u64);
         if ready.len == 0 && (key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0) {
-            return self.wait(s, r, key, Kind::Epoll, set, notify);
+            let answer = self.wait(s, r, key, Kind::Epoll, set, notify);
+            // The look at the list was cut short (it is longer than the window
+            // and the records seen reported nothing): records are left, and
+            // nothing else would wake the wait for them.
+            if self.interest.has_ready(set) {
+                self.interest.due |= 1 << set;
+                self.wake_wanted = true;
+            }
+            return answer;
         }
         let mut w = Writer::new();
         let answer = match ready.write(&mut w) {

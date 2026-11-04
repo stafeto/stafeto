@@ -367,6 +367,10 @@ pub struct Net {
     /// A step of the stack is due (a request changed a socket): the loop
     /// tells itself.
     pub step_due: bool,
+    /// A request is being handled (builds with the feature `probe`: the step of
+    /// waking is the one that tells the waits of a set, never a request).
+    #[cfg(feature = "probe")]
+    pub in_request: bool,
     pub counters: Counters,
     /// The listening description a SYN was just routed to.
     syn_listener: Option<usize>,
@@ -1360,6 +1364,10 @@ impl Net {
                     return;
                 }
                 self.told |= bit;
+                #[cfg(feature = "probe")]
+                if self.in_request {
+                    rt::println!("net: tell from a request");
+                }
                 self.ops.tell(info.label, info.key);
             }
             self.interest.due &= !(1 << k);

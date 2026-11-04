@@ -204,7 +204,7 @@ fn set_by_fd(inst: &mut Instance, fd: usize, idx: Option<usize>) {
 fn by_label(inst: &mut Instance, label: u32) -> Option<&mut Entry> {
     let idx = (label & 0xffff) as usize;
     let egen = (label >> 16) as u16;
-    entry(inst, idx).filter(|e| e.egen == egen && e.flags & PENDING_ADD == 0)
+    entry(inst, idx).filter(|e| e.egen == egen)
 }
 
 fn label_of(idx: usize, egen: u16) -> u32 {
@@ -448,11 +448,25 @@ pub fn ctl(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<(),
     let event = match op {
         CTL_ADD | CTL_MOD => {
             let event = event.ok_or(EFAULT)?;
-            if event.events & bits::EXCLUSIVE != 0 {
+            // EPOLLEXCLUSIVE is accepted by ADD with the bits Linux allows with
+            // it and is then a plain record (every waiting set may be woken,
+            // which Linux's "one or more" allows); MOD and the rest are EINVAL.
+            if event.events & bits::EXCLUSIVE != 0
+                && (op == CTL_MOD
+                    || event.events
+                        & !(bits::IN
+                            | bits::OUT
+                            | bits::ERR
+                            | bits::HUP
+                            | EPOLL_WAKEUP
+                            | bits::ET
+                            | bits::EXCLUSIVE)
+                        != 0)
+            {
                 return Err(EINVAL);
             }
             Some(EpollEvent {
-                events: event.events & !EPOLL_WAKEUP,
+                events: event.events & !(EPOLL_WAKEUP | bits::EXCLUSIVE),
                 data: event.data,
             })
         }
@@ -769,7 +783,13 @@ fn round(
         // descriptors when there are any, so that sockets never crowd them out.
         let reserve = usize::from(g.len > 0 && out.len() > 1);
         let most = (out.len() - reserve).min(wire::EPOLL_MOST);
-        let mut net = (g.nets && g.set != 0).then(|| wait::NetWait::new(g.set, most as u32));
+        // The wait holds the service's set even when no socket is in it yet:
+        // a socket another thread adds meanwhile wakes it (a service that
+        // is not there leaves the set 0 and the wait to the other descriptors).
+        if g.set == 0 {
+            g.set = ensure_set(id).unwrap_or(0);
+        }
+        let mut net = (g.set != 0).then(|| wait::NetWait::new(g.set, most as u32));
         let len = g.len;
         let ran = wait::run_net(&mut g.items[..len], net.as_mut(), until, handled);
         // What the service gave is kept for the error exits, which put it back.
@@ -900,13 +920,14 @@ fn deliver_others(id: u32, g: &Gathered, out: &mut [EpollEvent]) -> Result<usize
                 }
                 continue;
             }
+            let asked = u32::from(g.items[k].events as u16);
             let edge = e.events & bits::ET != 0;
             let mask = (e.events & bits::EVENTS) | bits::ERR | bits::HUP;
             let mut deliver = revents & mask;
             if edge {
                 deliver &= !e.aux;
                 // What the snapshot lacks is not "last" any more.
-                e.aux &= revents;
+                e.aux &= revents | !asked;
             }
             if deliver == 0 || filled >= out.len() {
                 continue;
@@ -1032,11 +1053,10 @@ pub fn would_block(fd: i32, write: bool) {
 }
 
 /// The descriptor number `fd` closed (or was given another descriptor by
-/// `dup2`): its records of pipes, FIFOs and terminals go from every instance.
-/// A record of a socket of the service stays until the number is looked at
-/// again: its generation says it is dead (`live_entry`, and the pairs of the
-/// service for it are dropped), so it costs one record of the instance for the
-/// number, and the description it names is taken out of the service's set then.
+/// `dup2`): its records go from every instance, and the description of a
+/// socket's record goes to the descriptions to take out of the service's set
+/// (a copy of the description may live on in another number, which can then
+/// be added).
 #[inline(always)]
 pub fn closed(fd: u32) {
     if LIVE.load(Ordering::Relaxed) != 0 {
@@ -1050,21 +1070,22 @@ fn closed_of_instances(fd: u32) {
     if !marked(&WATCHED, fd) {
         return;
     }
-    let kept = locked(|table| {
-        let mut kept = false;
-        for inst in table.iter_mut().filter(|i| i.used && !i.after_fork) {
-            if let Some(idx) = by_fd(inst, fd) {
-                if entry(inst, idx).is_some_and(|e| e.flags & NET != 0) {
-                    kept = true;
-                } else {
-                    free_entry(inst, idx, false);
-                }
+    let mut flush_ids = [None; INSTANCES];
+    locked(|table| {
+        for (k, inst) in table.iter_mut().enumerate().filter(|(_, i)| i.used) {
+            if inst.after_fork {
+                continue;
+            }
+            if let Some(idx) = by_fd(inst, fd)
+                && free_entry(inst, idx, true)
+            {
+                flush_ids[k] = Some(k as u32 | inst.generation << 8);
             }
         }
-        kept
     });
-    if !kept {
-        mark(&WATCHED, fd, false);
-    }
+    mark(&WATCHED, fd, false);
     mark(&EDGE_FDS, fd, false);
+    for id in flush_ids.into_iter().flatten() {
+        let _ = flush(id);
+    }
 }

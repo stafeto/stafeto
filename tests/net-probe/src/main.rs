@@ -2156,6 +2156,44 @@ impl Probe<'_> {
             }
         }
         rt::println!("net-probe: epoll wake ok {WATCHERS}");
+        // RECV and SEND on places that have sixteen records: every request that
+        // touches a place with records works out its events and looks at them.
+        {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records.iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    places[i],
+                    proto_net::sockets::epoll::IN,
+                    i as u32,
+                );
+            }
+            let set = self.epoll_set(&root, 0, &records)?;
+            for i in 0..PLACES {
+                let take = Request::Recv {
+                    key: None,
+                    description: places[i],
+                    flags: sockets::DONTWAIT,
+                    most: PIECE as u32,
+                };
+                self.plain(&root, take).map_err(|_| "RECV failed")?;
+                let send = Request::Send {
+                    key: None,
+                    description: places[i],
+                    flags: 0,
+                    address: Address::v4([127, 0, 0, 1], 9390),
+                    data: b"q",
+                };
+                self.plain(&root, send).map_err(|_| "SEND failed")?;
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            rt::println!("net-probe: epoll requests ok");
+        }
         // A wait of 64 pairs behind 64 records that report nothing now: 128
         // records looked at.
         let stale: [u32; 64] = core::array::from_fn(|_| 0);

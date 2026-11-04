@@ -599,7 +599,9 @@ fn run(
                 subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
                 subscriptions[at].add(description.description, requested, index);
             }
-            // An epoll descriptor reports an error to a poll, as Linux's does.
+            // A poll of an epoll descriptor reports POLLERR: a departure from
+            // Linux, which reports POLLIN when records are ready (nesting is not
+            // supported).
             Some(Target::Epoll(_)) => ready[index] = watch::ERR,
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}
@@ -836,6 +838,14 @@ struct Work {
     first: [u16; MAX_LARGE],
     asked: [u16; MAX_LARGE],
     got: [u16; MAX_LARGE],
+    /// For a descriptor number that names a socket the description of which
+    /// an earlier number has, that number plus one: the service keeps one
+    /// record for a description, and the events of the record are the
+    /// numbers' alike.
+    alias: [u16; MAX_LARGE],
+    /// For each place of the service's table, the first number that names a
+    /// description there, plus one.
+    owner_of_place: [u16; 1 << proto_net::sockets::SLOT_BITS],
 }
 const WORK_PAGES: usize = core::mem::size_of::<Work>().div_ceil(4096) * 4096;
 
@@ -941,6 +951,28 @@ fn large_in(
                     work.got[fd] |= watch::NVAL as u16;
                 }
                 Some(Target::Net(n)) if session.is_some() => {
+                    let place = wire::slot(n.description);
+                    let owner = usize::from(work.owner_of_place[place]);
+                    if owner != 0 {
+                        // Another number of the same description: its events
+                        // join the record of that number (a MOD).
+                        work.alias[fd] = owner as u16;
+                        let first = usize::from(work.first[owner - 1]) - 1;
+                        work.asked[owner - 1] |= work.asked[fd];
+                        records[count] = EpollRecord {
+                            action: wire::EPOLL_MOD,
+                            description: n.description,
+                            events: u32::from(work.asked[owner - 1]),
+                            label: first as u32,
+                        };
+                        count += 1;
+                        if count == records.len() {
+                            send(&records[..count], net)?;
+                            count = 0;
+                        }
+                        continue;
+                    }
+                    work.owner_of_place[place] = fd as u16 + 1;
                     records[count] = EpollRecord {
                         action: wire::EPOLL_ADD,
                         description: n.description,
@@ -998,6 +1030,13 @@ fn large_in(
         }
         if net.more()? == 0 {
             break;
+        }
+    }
+    for item in items.iter() {
+        let fd = item.fd;
+        if fd >= 0 && (fd as usize) < MAX_LARGE && work.alias[fd as usize] != 0 {
+            let owner = usize::from(work.alias[fd as usize]) - 1;
+            work.got[fd as usize] |= work.got[owner];
         }
     }
     let mut total = 0;

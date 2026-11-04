@@ -947,7 +947,6 @@ pub fn set_nonblock(description: u32, on: bool) -> Result<(), i32> {
     })
 }
 
-/// FIONBIO of the descriptor `fd`.
 /// FIONREAD of a socket: the bytes of a stream waiting to be read, or the
 /// length of the next datagram (0 with none).
 pub fn readable(fd: i32) -> Result<u32, i32> {
@@ -959,6 +958,7 @@ pub fn readable(fd: i32) -> Result<u32, i32> {
     })
 }
 
+/// FIONBIO of the descriptor `fd`.
 pub fn nonblocking(fd: i32, on: bool) -> Result<(), i32> {
     with_socket(fd, |description| set_nonblock(description, on))
 }

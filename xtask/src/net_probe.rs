@@ -231,6 +231,7 @@ const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
 const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
 const EPOLL_OK: &str = "net-probe: epoll ok";
 const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
+const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
 const EPOLL_WAIT_OK: &str = "net-probe: epoll wait ok 64 after 64 stale";
 const KILLED: &str = "net-probe: the service was killed";
@@ -455,6 +456,9 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if let Some(failed) = lines.iter().find(|l| l.starts_with("net-probe: failed")) {
         return Err(failed.clone());
     }
+    if lines.iter().any(|l| l == "net: tell from a request") {
+        return Err("a request told a wait of an interest set itself".to_owned());
+    }
     let (addressed, other) = match mode {
         Mode::Dhcp => (LEASE, "net: static"),
         Mode::Static => (STATIC, "net: lease"),
@@ -506,6 +510,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
         once.push((EPOLL_WAKE, 1));
         once.push((EPOLL_WAIT_OK, 1));
         once.push((EPOLL_CLOSE, 1));
+        once.push((EPOLL_REQUESTS, 1));
         once.push((EPOLL_OK, 1));
     }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
@@ -1154,7 +1159,9 @@ fn acceptance(
         proto_net::sockets::EPOLL_BATCH
     );
     println!(
-        "net-probe: the step of waking with records on its places {}, the step of departure of sets {} (bound {STEP_MAX})",
+        "net-probe: RECV {} and SEND {} on places with 16 records, the step of waking with records on its places {}, the step of departure of sets {} (bound {STEP_MAX})",
+        kind("E", 10),
+        kind("E", 8),
         longest_named(&epoll_run, "wake"),
         longest_named(&epoll_run, "cleanup")
     );
