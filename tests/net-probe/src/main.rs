@@ -22,8 +22,8 @@
 #![no_main]
 
 use abi::{Error, MESSAGE_MAX};
-use netd::lines::{Ip, Mac};
 use proto_init::ServiceArgs;
+use proto_net::text::{Ip, Mac};
 use proto_net::{Address, Config, Method, NET_DOWN, code};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Resource};

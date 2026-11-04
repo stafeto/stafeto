@@ -491,6 +491,27 @@ mod tests {
         );
     }
 
+    /// The probe is a client of the protocol alone: the graph of its build
+    /// for the guest has neither the package of the service nor the stack
+    /// and the driver the service builds on.
+    #[test]
+    fn the_probe_does_not_build_the_service() {
+        let output = std::process::Command::new(env!("CARGO"))
+            .args(["tree", "-p", "net-probe", "--target", "aarch64-unknown-none"])
+            .current_dir(crate::root())
+            .output()
+            .expect("cargo tree");
+        assert!(output.status.success(), "{output:?}");
+        let tree = String::from_utf8_lossy(&output.stdout);
+        for package in ["netd ", "smoltcp ", "virtio-drivers ", "posix-fs "] {
+            assert!(
+                !tree.lines().any(|l| l.contains(package)),
+                "the probe's graph holds {package}"
+            );
+        }
+        assert!(tree.contains("proto-net "));
+    }
+
     /// The image of the shell holds the service built without PING and
     /// CRASH; only the probe's images have them.
     #[test]
