@@ -1710,7 +1710,11 @@ mod net_tests {
         );
         set_net_release(closed);
         files.close(a).unwrap();
-        assert_eq!(CLOSED.load(Ordering::SeqCst), 0, "another descriptor holds it");
+        assert_eq!(
+            CLOSED.load(Ordering::SeqCst),
+            0,
+            "another descriptor holds it"
+        );
         files.close(b).unwrap();
         assert_eq!(CLOSED.load(Ordering::SeqCst), 0x1005);
         let _ = c;
