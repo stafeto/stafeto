@@ -2227,6 +2227,85 @@ impl Probe<'_> {
             return Err("the wait did not give 64 pairs");
         }
         rt::println!("net-probe: epoll wait ok 64 after 64 stale");
+        // A request that changes a place with records brings what the service
+        // knows of its events up to date: a datagram taken while the steps of
+        // the stack are held (no step of waking follows) leaves no stale report.
+        {
+            let d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, d, [127, 0, 0, 1], 9700)
+                .map_err(|_| "BIND failed")?;
+            let set = self.epoll_set(
+                &root,
+                0,
+                &[rec(sockets::EPOLL_ADD, d, proto_net::sockets::epoll::IN, 1)],
+            )?;
+            let request = Request::Send {
+                key: None,
+                description: sender,
+                flags: 0,
+                address: Address::v4([127, 0, 0, 1], 9700),
+                data: b"r",
+            };
+            self.plain(&root, request).map_err(|_| "SEND failed")?;
+            self.sleep(100_000_000);
+            self.hold(&root, proto_net::HOLD_ON)?;
+            let take = Request::Recv {
+                key: None,
+                description: d,
+                flags: sockets::DONTWAIT,
+                most: PIECE as u32,
+            };
+            self.plain(&root, take).map_err(|_| "RECV failed")?;
+            let pairs = self.epoll_wait_now(&root, set, 64);
+            self.hold(&root, proto_net::HOLD_OFF)?;
+            if pairs?.len != 0 {
+                return Err("a place that was read was still reported");
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        // A session that lets go of a description takes its records off the
+        // place, which another session still holds: 17 rounds of 64 places
+        // through one set (it takes 1 024 records) never fill it.
+        {
+            let set = self.epoll_set(&root, 0, &[])?;
+            for _ in 0..17 {
+                let mut group = [0u32; 64];
+                for d in group.iter_mut() {
+                    *d = self
+                        .new_socket(&root, sockets::DGRAM)
+                        .map_err(|_| "SOCKET failed")?;
+                }
+                let holder = self
+                    .clone_with(&root, &group)
+                    .map_err(|_| "CLONE failed")?;
+                for chunk in group.chunks(PLACES) {
+                    let mut records = [EpollRecord::default(); PLACES];
+                    for (r, &d) in records.iter_mut().zip(chunk) {
+                        *r = rec(sockets::EPOLL_ADD, d, proto_net::sockets::epoll::IN, 0);
+                    }
+                    self.epoll_set(&root, set, &records[..chunk.len()])?;
+                }
+                for &d in &group {
+                    self.close(&root, d).map_err(|_| "CLOSE failed")?;
+                }
+                drop(holder);
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            rt::println!("net-probe: epoll close ok");
+        }
         // A set of 800 records dropped, then the sessions that watch.
         let mut big = [0u32; 800];
         let mut made = 0;
