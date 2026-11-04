@@ -118,13 +118,18 @@ fn free_udp_port() -> Result<u16, String> {
 /// One HTTP/1.0 GET of `/index.html`: the body and the time it took, or why
 /// not.
 fn get(port: u16) -> Result<(Vec<u8>, Duration), String> {
+    get_within(port, READ_WITHIN)
+}
+
+/// `get`, giving up after `within` on each step.
+fn get_within(port: u16, within: Duration) -> Result<(Vec<u8>, Duration), String> {
     let started = Instant::now();
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
     let mut stream =
-        TcpStream::connect_timeout(&address, READ_WITHIN).map_err(|e| format!("connect: {e}"))?;
+        TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
     stream
-        .set_read_timeout(Some(READ_WITHIN))
-        .and_then(|()| stream.set_write_timeout(Some(READ_WITHIN)))
+        .set_read_timeout(Some(within))
+        .and_then(|()| stream.set_write_timeout(Some(within)))
         .map_err(|e| format!("timeouts: {e}"))?;
     stream
         .write_all(b"GET /index.html HTTP/1.0\r\nHost: localhost\r\nUser-Agent: net-curl\r\n\r\n")
@@ -177,10 +182,12 @@ fn summary(times: &mut [Duration]) -> (u128, u128) {
 
 /// The requests of the run: twenty in a row, eight at once.
 fn requests(port: u16, started: Instant) -> Result<(u128, u128), String> {
-    // The first request waits for `httpd` to listen: until then the host's
-    // forward answers with a reset.
+    // The first request waits for `httpd` to listen. A SYN that comes before
+    // the server listens gets no RST that arrives (the stack's answer is
+    // dropped while it asks for the gateway's address), and QEMU sends the
+    // SYN again after seconds: the request starts again after two.
     let first = loop {
-        match get(port) {
+        match get_within(port, Duration::from_secs(2)) {
             Ok(answer) => break answer,
             Err(why) if started.elapsed() < LISTEN_WITHIN => {
                 let _ = why;
@@ -207,7 +214,28 @@ fn requests(port: u16, started: Instant) -> Result<(u128, u128), String> {
         check_body(&body).map_err(|e| format!("concurrent request {}: {e}", n + 1))?;
         times.push(time);
     }
+    let millis: Vec<_> = times.iter().map(|t| t.as_millis()).collect();
+    println!("net-curl: times of the requests in ms: {millis:?}");
     Ok(summary(&mut times))
+}
+
+/// The page through the host's `curl -s`, the program the criterion of the
+/// stage names; not run on a host without it.
+fn curl(port: u16) -> Result<bool, String> {
+    let output = match std::process::Command::new("curl")
+        .args(["-s", "--max-time", "30"])
+        .arg(format!("http://127.0.0.1:{port}/index.html"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("curl: {e}")),
+    };
+    if !output.status.success() {
+        return Err(format!("curl ended with {}", output.status));
+    }
+    check_body(&output.stdout).map_err(|e| format!("curl: {e}"))?;
+    Ok(true)
 }
 
 /// UDP with the guest: the echo through the forwarded port, and a datagram
@@ -239,11 +267,7 @@ fn udp(run: &mut qemu::Run, address: &str, forward: u16) -> Result<(), String> {
             String::from_utf8_lossy(&echoed)
         ));
     }
-    run.expect_line(
-        "the end of the echo",
-        |l| l == "net-sock: udp echo ok",
-        DIALOG_STEP,
-    )?;
+    run.expect("net-sock: udp echo ok", DIALOG_STEP)?;
     let listener = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("udp socket: {e}"))?;
     listener
         .set_read_timeout(Some(Duration::from_secs(20)))
@@ -264,12 +288,14 @@ fn udp(run: &mut qemu::Run, address: &str, forward: u16) -> Result<(), String> {
             String::from_utf8_lossy(&buf[..n])
         ));
     }
-    run.expect_line(
-        "the end of the send",
-        |l| l == "net-sock: udp send ok",
-        DIALOG_STEP,
-    )?;
+    run.expect("net-sock: udp send ok", DIALOG_STEP)?;
     run.expect("# ", DIALOG_STEP)
+}
+
+/// What a line says after `net-sock: `; the first line may follow the
+/// prompt on the same line.
+fn net_sock_text(line: &str) -> Option<&str> {
+    line.split_once("net-sock: ").map(|(_, text)| text)
 }
 
 /// `net-sock` for all its checks: a line for each, then the count.
@@ -281,16 +307,14 @@ fn checks(run: &mut qemu::Run, address: &str) -> Result<(), String> {
         let left = deadline.saturating_duration_since(Instant::now());
         let line = run.expect_line(
             "a line of net-sock",
-            |l| l.starts_with("net-sock: ") && !l.starts_with("net-sock: udp"),
+            |l| net_sock_text(l).is_some_and(|t| t != "udp echo ok" && t != "udp send ok"),
             left,
         )?;
+        let line = net_sock_text(&line).unwrap_or_default().to_owned();
         if line.contains(" failed: ") {
-            return Err(line);
+            return Err(format!("net-sock: {line}"));
         }
-        if let Some(count) = line
-            .strip_prefix("net-sock: ")
-            .and_then(|r| r.strip_suffix(" checks ok"))
-        {
+        if let Some(count) = line.strip_suffix(" checks ok") {
             let count: usize = count.parse().map_err(|_| format!("{line:?}"))?;
             if count != CHECKS.len() || seen != count {
                 return Err(format!(
@@ -301,8 +325,7 @@ fn checks(run: &mut qemu::Run, address: &str) -> Result<(), String> {
             return Ok(());
         }
         let name = line
-            .strip_prefix("net-sock: ")
-            .and_then(|r| r.strip_suffix(" ok"))
+            .strip_suffix(" ok")
             .ok_or_else(|| format!("an unknown line of net-sock: {line:?}"))?;
         if CHECKS.get(seen) != Some(&name) {
             return Err(format!(
@@ -389,6 +412,9 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             "net-curl: {} requests in a row and {} at once ok, {} ms median, {} ms the longest",
             SEQUENTIAL, CONCURRENT, timing.0, timing.1
         );
+        if curl(tcp)? {
+            println!("net-curl: curl -s http://127.0.0.1:{tcp}/index.html gives the page");
+        }
         udp(&mut run, &address, udp_port)?;
         checks(&mut run, &address)?;
         run.expect("# ", DIALOG_STEP)?;
@@ -424,10 +450,15 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         return Err("the network image faulted".into());
     }
     if steps {
-        let rows = crate::net_probe::steps_verdict(&output.lines)?;
-        for (kind, ticks, detail) in &rows {
-            println!("net-curl steps: kind {kind} {ticks} ticks detail {detail}");
-        }
+        let rows = crate::net_probe::traffic_verdict(&output.lines)?;
+        let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
+        println!(
+            "net-curl steps: the longest step is kind {} with {} ticks and detail {} (the bound is {}); every kind: {rows:?}",
+            worst.0,
+            worst.1,
+            worst.2,
+            crate::net_probe::STEP_MAX
+        );
     }
     let elapsed = started.elapsed();
     if elapsed > RUN_WITHIN {

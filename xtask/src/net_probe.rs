@@ -486,6 +486,38 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
     Ok(rows)
 }
 
+/// The steps of the service under real traffic (`cargo xtask net-curl
+/// steps`): the kinds the traffic makes came (the service's own steps, ACCEPT,
+/// SEND, RECV, CLONE, WATCH_TAKE), and every row stays under STEP_MAX, a CLONE
+/// under PORTION_MAX.
+pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
+    const KINDS: [(usize, &str); 6] = [
+        (65, "the own steps"),
+        (6, "Accept"),
+        (8, "Send"),
+        (10, "Recv"),
+        (19, "Clone"),
+        (28, "WatchTake"),
+    ];
+    let rows = longest_over_starts(lines);
+    for (kind, name) in KINDS {
+        if !rows.iter().any(|(k, ..)| *k == kind) {
+            return Err(format!("the network service: no step {name}: {rows:?}"));
+        }
+    }
+    if let Some(row) = rows.iter().find(|r| r.1 > STEP_MAX) {
+        return Err(format!(
+            "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
+        ));
+    }
+    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+        return Err(format!(
+            "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
+        ));
+    }
+    Ok(rows)
+}
+
 /// A run on `machine` of the image `name` with `programs`: the machine
 /// starts, and the lines are read until the client ends. The time to the
 /// first address is the host's wall time.

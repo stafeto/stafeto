@@ -609,6 +609,10 @@ impl Net {
                     tcp::State::Closed | tcp::State::Listen | tcp::State::SynSent
                 ) {
                     self.release_place(stack, i);
+                } else if t.recv_queue() > 0 {
+                    // A close with bytes nobody read resets the connection
+                    // (RFC 1122, 4.2.2.13): the peer's next send fails.
+                    self.abort_place(stack, i);
                 } else {
                     t.close();
                     self.places.set_state(i, State::Orphan);

@@ -546,6 +546,10 @@ static void epipe(void)
 	REQUIRE(sigaction(SIGPIPE, &sa, NULL) == 0);
 	int c, s;
 	pair(LOOPBACK, &c, &s);
+	/* The server closes with a byte nobody read: it resets the connection. */
+	REQUIRE(send(c, "u", 1, 0) == 1);
+	struct pollfd unread = { s, POLLIN, 0 };
+	REQUIRE(poll(&unread, 1, 5000) == 1);
 	close(s);
 	int resets = 0, broken = 0;
 	for (int i = 0; i < 200 && broken < 2; i++) {
