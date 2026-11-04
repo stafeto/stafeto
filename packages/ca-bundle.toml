@@ -3,7 +3,8 @@
 #
 # The root certificates of Mozilla in one PEM file, as curl.se publishes
 # them, put in the image unchanged. The source is that one file; its header
-# states its terms (MPL-2.0).
+# names its origin, Mozilla's certdata.txt, and https://curl.se/docs/caextract.html
+# gives its licence: "the same license as the Mozilla source file: MPL 2.0".
 # Format: docs/packages.md.
 
 name = "ca-bundle"

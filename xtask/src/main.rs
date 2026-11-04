@@ -2515,9 +2515,7 @@ fn write_elf_image(
     let tls_files = net_tls::terms_files(
         has("openssl"),
         has("curl"),
-        rootfs::files_of(name)
-            .iter()
-            .any(|f| f.path == net_tls::CA_BUNDLE),
+        net_tls::ca_file_of(name, &rootfs::files_of(name))?,
     )?;
     for (name, bytes) in &tls_files {
         list.push((name, bytes.as_slice()));

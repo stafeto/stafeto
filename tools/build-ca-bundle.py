@@ -9,8 +9,10 @@ service carry as /etc/ssl/certs/ca-certificates.crt.
 
 The file is checked by its SHA-256, by the date in its header against the
 version of the description, and by the number of certificates (at least
-MIN_CERTIFICATES). Its header states its terms, MPL-2.0; the text of the
-licence is tools/ca-bundle/MPL-2.0.txt."""
+MIN_CERTIFICATES). Its header names its origin, Mozilla's certdata.txt, and
+no licence; https://curl.se/docs/caextract.html says the file is "licensed
+under the same license as the Mozilla source file: MPL 2.0". The text of
+the licence is tools/ca-bundle/MPL-2.0.txt."""
 
 from hashlib import sha256
 from pathlib import Path

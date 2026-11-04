@@ -214,12 +214,12 @@ pub fn ensure(renew: bool) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The bytes of `bundle-with-ca.crt`, read once in a run of xtask; empty
-/// where the CA has not been made (the check of the descriptions needs the
-/// paths of an image only).
+/// The bytes of `bundle-with-ca.crt`; empty while the CA has not been made
+/// (the check of the descriptions needs the paths of an image only, and the
+/// build of an image refuses an empty CA file).
 pub fn bundle_with_ca() -> &'static [u8] {
-    static BUNDLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    BUNDLE.get_or_init(|| std::fs::read(dir().join("bundle-with-ca.crt")).unwrap_or_default())
+    static BUNDLE: std::sync::Mutex<Option<&'static [u8]>> = std::sync::Mutex::new(None);
+    crate::net_tls::file_once_made(&BUNDLE, &dir().join("bundle-with-ca.crt"))
 }
 
 /// `cargo xtask probe-ca [--renew]`.

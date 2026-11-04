@@ -473,7 +473,7 @@ const NET_LAUNCHER: Record = Record {
 
 /// The quota of the launcher of the shell with the network, which the shell
 /// and its commands get too. curl and openssl link OpenSSL statically (3.2
-/// MB programs) and read the 119 root certificates of the CA file into
+/// MB programs) and read the 118 root certificates of the CA file (119 with the probe CA) into
 /// their heap: `net-tls` passes with 1 325 pages and fails with 1 250 at the
 /// first load of the file (bisected; the shell's 1 160 pages fail at about
 /// 90 certificates), and 1 472 pages leave 11%.

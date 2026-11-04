@@ -16,10 +16,13 @@
 //! 1. curl of the page from A: the chain is checked, the body is the page.
 //! 2. The same with `--tlsv1.3`: the handshake says TLSv1.3.
 //! 3. A by the name of its certificate (`--connect-to`): exit 0.
-//! 4. A by a name its certificate does not hold: exit 60.
-//! 5. B: exit 60 (no CA knows it); with `-k`: exit 0 and the page.
-//! 6. `openssl s_client` to A: `Verification: OK` and TLSv1.3; to B with
-//!    `-verify_return_error`: a failure.
+//! 4. A by a name its certificate does not hold: exit 60 and curl's message
+//!    of a name that matches no subject.
+//! 5. B: exit 60 and the message of a self-signed certificate (no CA knows
+//!    it); with `-k`: exit 0 and the page.
+//! 6. `openssl s_client` to A with `-verify_hostname host.stafeto.test`:
+//!    `Verification: OK` and TLSv1.3; to A as `wrong.test`: a hostname
+//!    mismatch; to B: a failure. All with `-verify_return_error`.
 //! 7. The file of 256 KiB from A: full TLS records.
 //! 8. curl to a port without a listener: exit 7 within the 5 s of `-m`.
 //! 9. `openssl speed -evp aes-128-gcm -seconds 1 -bytes 16384`: a number.
@@ -79,13 +82,53 @@ pub enum Mode {
 }
 
 /// The bytes of the root certificates as tools/build-ca-bundle.py left
-/// them, read once in a run of xtask; empty where the script has not run
-/// (the check of the descriptions needs the paths of an image only).
+/// them; empty while the script has not run (the check of the descriptions
+/// needs the paths of an image only, and the build of an image refuses an
+/// empty CA file: `ca_file_of`).
 pub fn ca_bundle() -> &'static [u8] {
-    static BUNDLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    BUNDLE.get_or_init(|| {
-        std::fs::read(crate::target_dir().join("ca-bundle/ca-certificates.crt")).unwrap_or_default()
-    })
+    static BUNDLE: std::sync::Mutex<Option<&'static [u8]>> = std::sync::Mutex::new(None);
+    file_once_made(
+        &BUNDLE,
+        &crate::target_dir().join("ca-bundle/ca-certificates.crt"),
+    )
+}
+
+/// The bytes of the file at `path`, kept in `cell` once the file exists and
+/// is not empty: a file that a script of the same run of xtask makes later
+/// is read then, so no run keeps an empty file.
+pub fn file_once_made(
+    cell: &std::sync::Mutex<Option<&'static [u8]>>,
+    path: &Path,
+) -> &'static [u8] {
+    let mut kept = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(bytes) = *kept {
+        return bytes;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+            *kept = Some(bytes);
+            bytes
+        }
+        _ => &[],
+    }
+}
+
+/// Whether the list of the image `name` has the CA file; an error when it
+/// has one whose bytes are empty (the root certificates or the probe CA not
+/// made yet).
+pub fn ca_file_of(name: &str, files: &[rootfs::RootFile]) -> Result<bool, String> {
+    let Some(file) = files.iter().find(|f| f.path == CA_BUNDLE) else {
+        return Ok(false);
+    };
+    match file.source {
+        Some(rootfs::Source::Bytes(_, bytes)) if !bytes.is_empty() => Ok(true),
+        _ => Err(format!(
+            "{name}: {CA_BUNDLE} is empty: run tools/build-ca-bundle.py (and cargo xtask probe-ca for the probe's images)"
+        )),
+    }
 }
 
 /// The bytes of `/www/256k.bin`: 256 KiB from a generator with a fixed
@@ -191,7 +234,9 @@ pub fn terms_files(
             format!(
                 "{CA_BUNDLE} holds the root certificates of Mozilla of {version}\n\
                  ({count} certificates), made from Mozilla's certdata.txt, which is\n\
-                 under the Mozilla Public License 2.0 (CA-BUNDLE-LICENSE).\n\n\
+                 under the Mozilla Public License 2.0 (CA-BUNDLE-LICENSE). The page of\n\
+                 the file, https://curl.se/docs/caextract.html, says it is \"licensed\n\
+                 under the same license as the Mozilla source file: MPL 2.0\".\n\n\
                  Its source: {url}\n\
                  (SHA-256 {sha256}), put in the image unchanged by\n\
                  tools/build-ca-bundle.py.\n"
@@ -315,22 +360,31 @@ fn coded(
     Ok((code, lines))
 }
 
-/// Runs `command`, which must end with exit code `wanted`.
+/// Runs `command`, which must end with exit code `wanted` and, with
+/// `said`, print a line that holds it (curl ends with 60 for every failed
+/// check of a certificate; the message tells which check it was).
 fn expect_code(
     run: &mut qemu::Run,
     command: &str,
     marker: &str,
     wanted: i32,
+    said: Option<&str>,
 ) -> Result<Duration, String> {
     let began = Instant::now();
-    let (code, lines) = coded(run, command, marker, FETCH_WITHIN)?;
-    if code != wanted {
+    let (code, lines) = coded(run, &format!("{command} 2>&1"), marker, FETCH_WITHIN)?;
+    if code != wanted || said.is_some_and(|text| !lines.iter().any(|l| l.contains(text))) {
         return Err(format!(
-            "{marker}: `{command}` ended with {code}, wanted {wanted}: {lines:?}"
+            "{marker}: `{command}` ended with {code}, wanted {wanted}{}: {lines:?}",
+            said.map(|t| format!(" and {t:?}")).unwrap_or_default()
         ));
     }
     Ok(began.elapsed())
 }
+
+/// What curl prints when the name is not in the certificate, and when no
+/// CA of the file signed it (server B is self-signed).
+const WRONG_NAME: &str = "no alternative certificate subject name matches";
+const UNKNOWN_CA: &str = "self-signed certificate";
 
 /// Whether a line of `curl -v` or `openssl s_client` names TLS 1.3 as the
 /// version of the connection made (the lines of the handshake name the
@@ -509,6 +563,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
             ),
             "san",
             0,
+            None,
         )?;
         times.push(("by name".into(), t));
         // 4. A name the certificate does not hold.
@@ -519,6 +574,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
             ),
             "wrong-name",
             60,
+            Some(WRONG_NAME),
         )?;
         // 5. A CA nobody knows, and the same without the check.
         expect_code(
@@ -526,6 +582,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
             &format!("curl -sS -o /dev/null https://10.0.2.2:{b}/index.html"),
             "unknown-ca",
             60,
+            Some(UNKNOWN_CA),
         )?;
         step(
             &mut run,
@@ -539,7 +596,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
         let (code, lines) = coded(
             &mut run,
             &format!(
-                "openssl s_client -connect 10.0.2.2:{a} -servername host.stafeto.test -CAfile {CA_BUNDLE} -verify_return_error </dev/null 2>&1"
+                "openssl s_client -connect 10.0.2.2:{a} -servername host.stafeto.test -verify_hostname host.stafeto.test -CAfile {CA_BUNDLE} -verify_return_error </dev/null 2>&1"
             ),
             "s-client-a",
             FETCH_WITHIN,
@@ -553,12 +610,25 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
         let (code, lines) = coded(
             &mut run,
             &format!(
+                "openssl s_client -connect 10.0.2.2:{a} -verify_hostname wrong.test -CAfile {CA_BUNDLE} -verify_return_error </dev/null 2>&1"
+            ),
+            "s-client-name",
+            FETCH_WITHIN,
+        )?;
+        if code == 0 || !lines.iter().any(|l| l.contains("hostname mismatch")) {
+            return Err(format!(
+                "s_client to A as wrong.test ended with {code}: {lines:?}"
+            ));
+        }
+        let (code, lines) = coded(
+            &mut run,
+            &format!(
                 "openssl s_client -connect 10.0.2.2:{b} -CAfile {CA_BUNDLE} -verify_return_error </dev/null 2>&1"
             ),
             "s-client-b",
             FETCH_WITHIN,
         )?;
-        if code == 0 {
+        if code == 0 || !lines.iter().any(|l| l.contains(UNKNOWN_CA)) {
             return Err(format!("s_client to B passed the check: {lines:?}"));
         }
         // 7. Full records.
@@ -570,6 +640,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
             &format!("curl -sS -m {REFUSED_LIMIT_S} https://10.0.2.2:{c}/"),
             "refused",
             7,
+            None,
         )?;
         if t > Duration::from_secs(REFUSED_LIMIT_S) {
             return Err(format!(
@@ -675,6 +746,37 @@ fn image_has_tls_files(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file missing at the first read is read again later, and an empty
+    /// CA file stops the build of an image.
+    #[test]
+    fn net_tls_ca_file_is_never_kept_empty() {
+        static CELL: std::sync::Mutex<Option<&'static [u8]>> = std::sync::Mutex::new(None);
+        let path = std::env::temp_dir().join(format!("stafeto-net-tls-{}.pem", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(file_once_made(&CELL, &path).is_empty());
+        std::fs::write(&path, b"roots").unwrap();
+        assert_eq!(file_once_made(&CELL, &path), b"roots");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file_once_made(&CELL, &path), b"roots");
+        let mut files = rootfs::files_of(net::IMAGE);
+        let at = files.iter().position(|f| f.path == CA_BUNDLE).unwrap();
+        files[at].source = Some(rootfs::Source::Bytes("ca-certificates.crt", b""));
+        assert!(
+            ca_file_of(net::IMAGE, &files)
+                .unwrap_err()
+                .contains("is empty")
+        );
+        files[at].source = Some(rootfs::Source::Bytes("ca-certificates.crt", b"x"));
+        assert_eq!(ca_file_of(net::IMAGE, &files), Ok(true));
+        assert_eq!(
+            ca_file_of(
+                "boot-ash-dialog.img",
+                &rootfs::files_of("boot-ash-dialog.img")
+            ),
+            Ok(false)
+        );
+    }
 
     #[test]
     fn net_tls_large_file_is_fixed() {

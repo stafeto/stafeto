@@ -14,8 +14,8 @@ runs on a thread: a time limit (`-m`, `--connect-timeout`) then needs no
 SIGALRM and long jump out of the resolver of the C library. There is no
 IPv6 (the network service has none) and no HTTP/2 (no nghttp2). The tests of
 `configure` that would run a program on the target take their defaults for
-a cross build; the cache variables below hold the few the layer answers
-otherwise. The result is one relocatable object, target/curl/curl.o, that
+a cross build; none needed another answer, so the dictionary of cache
+variables below is empty and stays for checks a later version may add. The result is one relocatable object, target/curl/curl.o, that
 exports `main` alone; tools/build-libc-so.py programs links it against
 libc.so.
 
