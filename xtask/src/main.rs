@@ -1668,7 +1668,7 @@ commands:
             of the service, and its steps under -icount (TCG only); on hvf the
             rates of the loopback; with `steps` the measurement that chooses
             the frames of a step and the limit of the sockets (TCG only)
-  net-vz [--net 2] [--static1] run the shell with the network service on
+  net-vz [--net 2] [--static1] [--steps] run the shell with the network service on
             Apple VZ: the lease, HTTP and the Mac's ping of the guest; with
             --net 2 the second device too (--static1: its static address)
   net-curl [steps] [MACHINE] run the sockets of the network service from the

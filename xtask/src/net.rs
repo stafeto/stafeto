@@ -160,10 +160,29 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The image on VZ whose service counts its steps (`cargo xtask net-vz
+/// --steps`), with one device or two.
+pub fn vz_steps_programs(two: bool) -> &'static [ImageProgram] {
+    static ONE: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    static TWO: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    let list = if two { &TWO } else { &ONE };
+    list.get_or_init(|| {
+        let mut programs = vz_programs(two).to_vec();
+        for program in &mut programs {
+            if program.0 == "netd" {
+                program.3 = &["steps"];
+            }
+        }
+        programs
+    })
+}
+
 /// The names of the images on VZ: one device, two.
 pub const VZ_IMAGE: &str = "boot-net-vz.img";
 pub const VZ2_IMAGE: &str = "boot-net-vz2.img";
 pub const VZ2_STATIC_IMAGE: &str = "boot-net-vz2-static.img";
+pub const VZ_STEPS_IMAGE: &str = "boot-net-vz-steps.img";
+pub const VZ2_STEPS_IMAGE: &str = "boot-net-vz2-steps.img";
 
 /// The shell with the network on Apple VZ on the terminal.
 fn run_vz(devices: usize) -> Result<(), String> {

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use crate::net_curl;
 use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, Variant, build, build_boot_image,
-    busybox_build, nano_build, net, qemu, relibc, rootfs, vz,
+    busybox_build, nano_build, net, net_probe, qemu, relibc, rootfs, vz,
 };
 
 /// The lease within this long after the services started.
@@ -154,19 +154,24 @@ fn line_where(
 struct Options {
     devices: usize,
     static1: bool,
+    /// The service counts its steps (`netd` built with `steps`), and the
+    /// longest of each kind is judged by 0.9 of term B.
+    steps: bool,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
-    let usage = "usage: cargo xtask net-vz [--net 2] [--static1]";
+    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps]";
     let mut found = Options {
         devices: 1,
         static1: false,
+        steps: false,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
         match flag.as_str() {
             "--net" if rest.next().map(String::as_str) == Some("2") => found.devices = 2,
             "--static1" => found.static1 = true,
+            "--steps" => found.steps = true,
             _ => return Err(usage.to_owned()),
         }
     }
@@ -272,12 +277,19 @@ pub fn command(args: &[String]) -> Result<(), String> {
     nano_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let (name, two) = match (options.devices, options.static1) {
-        (1, _) => (net::VZ_IMAGE, false),
-        (_, false) => (net::VZ2_IMAGE, true),
-        (_, true) => (net::VZ2_STATIC_IMAGE, true),
+    let (name, two) = match (options.devices, options.static1, options.steps) {
+        (1, _, false) => (net::VZ_IMAGE, false),
+        (1, _, true) => (net::VZ_STEPS_IMAGE, false),
+        (_, false, false) => (net::VZ2_IMAGE, true),
+        (_, true, false) => (net::VZ2_STATIC_IMAGE, true),
+        (_, _, true) => (net::VZ2_STEPS_IMAGE, true),
     };
-    let image = build_boot_image(name, net::vz_programs(two), BOOT_PROFILE)?;
+    let programs = if options.steps {
+        net::vz_steps_programs(two)
+    } else {
+        net::vz_programs(two)
+    };
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let machine = vz::Machine {
         net: options.devices,
         ..vz::Machine::default()
@@ -351,6 +363,22 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "the run took {:.0} s",
             started.elapsed().as_secs_f64()
         ));
+    }
+    if options.steps {
+        let rows = net_probe::longest_over_starts(&output.lines);
+        if rows.is_empty() {
+            return Err("the service printed no line of steps".into());
+        }
+        let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
+        println!(
+            "net-vz steps: the longest step is kind {} with {} ticks (the bound is {}); every kind: {rows:?}",
+            worst.0,
+            worst.1,
+            net_probe::STEP_MAX
+        );
+        if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+            return Err(format!("a step past 0.9 of term B: {row:?}"));
+        }
     }
     println!(
         "net-vz passed in {:.0} s with {} network device(s); page of {} bytes",

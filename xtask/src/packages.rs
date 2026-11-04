@@ -476,7 +476,9 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-net-curl-steps.img"
         | "boot-net-vz.img"
         | "boot-net-vz2.img"
-        | "boot-net-vz2-static.img" => Ok(load()?
+        | "boot-net-vz2-static.img"
+        | "boot-net-vz-steps.img"
+        | "boot-net-vz2-steps.img" => Ok(load()?
             .into_iter()
             .filter(|p| p.kind != Kind::Game)
             .collect()),
