@@ -656,7 +656,7 @@ static void epoll_lt(void)
 	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
 }
 
-/* By edge a report comes with new bytes only, not with what is left. */
+/* By edge a report comes with new bytes, and the bytes left bring none. */
 static void epoll_et(void)
 {
 	int port, lis = listener(4, &port);

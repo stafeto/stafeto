@@ -112,6 +112,8 @@ pub struct Interests<const PLACES: usize> {
     changes: [u16; PLACES],
     /// The events of each place as the service worked them out last.
     cache: [u32; PLACES],
+    /// The records in use in all the sets.
+    live: u16,
     /// The sets with ready records and operations that wait: the step of
     /// waking tells them.
     pub due: u64,
@@ -172,6 +174,7 @@ impl<const PLACES: usize> Interests<PLACES> {
         self.heads.fill(NONE);
         self.changes.fill(0);
         self.cache.fill(0);
+        self.live = 0;
         self.due = 0;
         self.departing = 0;
     }
@@ -307,6 +310,12 @@ impl<const PLACES: usize> Interests<PLACES> {
 
     // ----- the records -----
 
+    /// Whether no record is in use: the frames of a service nobody uses epoll
+    /// on look at nothing.
+    pub fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
     pub fn head(&self, place: usize) -> Option<usize> {
         let h = self.heads[place];
         (h != NONE).then_some(usize::from(h))
@@ -387,6 +396,7 @@ impl<const PLACES: usize> Interests<PLACES> {
         }
         self.sets[k].first = idx as u16;
         self.sets[k].entries += 1;
+        self.live += 1;
         self.cache[place] = ev;
         self.consider(idx, ev, false);
         Ok(idx)
@@ -443,6 +453,7 @@ impl<const PLACES: usize> Interests<PLACES> {
             self.entries[usize::from(e.next_set)].prev_set = e.prev_set;
         }
         self.sets[set].entries -= 1;
+        self.live -= 1;
         if e.flags & READY != 0 {
             self.unlink_ready(idx);
         }
@@ -654,7 +665,7 @@ mod tests {
         let mut t = table();
         let k = t.new_set(7).unwrap();
         t.add(k, 1, IN, 11, IN).unwrap();
-        // One record, room for four pairs: one pair, not four.
+        // One record, room for four pairs: the record is reported once.
         assert_eq!(pairs(&mut t, k, 4), [(11, IN)]);
     }
 
@@ -858,8 +869,10 @@ mod tests {
         t.drop_set(k);
         assert!(!t.is_live(k));
         assert_eq!(t.find_set(1, wire), None);
+        assert!(!t.is_empty());
         while t.depart_step() {}
         assert!(!t.has_ready(k));
         assert!(!t.watched(1));
+        assert!(t.is_empty());
     }
 }

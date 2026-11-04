@@ -1369,6 +1369,9 @@ impl Net {
     /// Whether the records of the interest sets look at place `i` or at the
     /// listening description a socket of its queue belongs to.
     pub fn watched_by_frames(&self, i: usize) -> bool {
+        if self.interest.is_empty() {
+            return false;
+        }
         let listener = usize::from(self.socks[i].listener);
         self.interest.watched(i)
             || (listener != usize::from(NO_PLACE) && self.interest.watched(listener))

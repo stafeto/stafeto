@@ -75,11 +75,6 @@ fn took_ms(lines: &[String], name: &str) -> Option<u64> {
     })
 }
 
-/// The time `fork-900` printed, in milliseconds.
-fn fork_ms(lines: &[String]) -> Option<u64> {
-    took_ms(lines, "fork-900")
-}
-
 /// `posix-net` for all its checks: a line for each, then the count.
 fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), String> {
     run.send(&format!("posix-net {address}"))?;
@@ -265,8 +260,9 @@ mod tests {
         assert_eq!(text_of("/ # posix-net: limits ok"), Some("limits ok"));
         assert_eq!(text_of("net-sock: limits ok"), None);
         let lines = vec!["posix-net: fork-900 took 37 ms".to_owned()];
-        assert_eq!(fork_ms(&lines), Some(37));
-        assert_eq!(fork_ms(&[]), None);
+        assert_eq!(took_ms(&lines, "fork-900"), Some(37));
+        assert_eq!(took_ms(&lines, "epoll-1000"), None);
+        assert_eq!(took_ms(&[], "fork-900"), None);
     }
 
     #[test]

@@ -332,6 +332,9 @@ pub struct NetWait {
     pub ready: proto_net::sockets::EpollReady,
 }
 
+// The pairs of a READY are the one large variant, and a reply lives on the stack
+// for the length of one call.
+#[allow(clippy::large_enum_variant)]
 enum NetReply {
     Wait(u64),
     Armed,
@@ -731,7 +734,7 @@ fn run(
             cleanup_error.get_or_insert(error);
         }
     }
-    if let Some(net) = net.as_deref_mut()
+    if let Some(net) = net
         && let Err(error) = net.cancel()
     {
         cleanup_error.get_or_insert(error);

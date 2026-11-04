@@ -174,7 +174,9 @@ static int wide_sets(void) {
     CHECK(FD_ISSET(last, &reads));
     for (int i = 0; i < 15; i++) CHECK(!FD_ISSET(ends[i][0], &reads) && FD_ISSET(ends[i][1], &writes));
     for (int i = 0; i < 65; i++) items[i] = (struct pollfd){last, POLLIN, 77};
-    CHECK(poll(items, 65, 0) < 0 && errno == EINVAL);
+    /* More than 64 entries go through the engine of epoll: all are answered. */
+    CHECK(poll(items, 65, 0) == 65);
+    for (int i = 0; i < 65; i++) CHECK(items[i].revents == POLLIN);
     for (int fd = 3; fd < 64; fd++) close(fd);
     printf("posix-poll: poll and select of 64 descriptions ok\n");
     return 0;
@@ -185,7 +187,7 @@ static int wide_sets(void) {
  * The first 32 descriptors are closed and the console
  * is opened on each of them (0, 1 and 2 are then descriptions of their
  * own). The first poll waits and pins them all; the second answers by
- * position. A 65th element is refused. */
+ * position. A 65th element is answered. */
 static int tty_distinct_watches(void) {
     fflush(stdout);
     for (int fd = 0; fd < 32; fd++) close(fd);
@@ -213,12 +215,14 @@ static int tty_distinct_watches(void) {
     p[3].events = POLLOUT; p[20].events = POLLOUT;
     CHECK(poll(p, 32, 3) == 2);
     for (int i = 0; i < 32; i++) CHECK(p[i].revents == (i == 3 || i == 20 ? POLLOUT : 0));
-    /* Three Watches of 16 (33 elements) answer, and 65 are refused. */
+    /* Three Watches of 16 (33 elements) answer, and so do 65 (the engine of
+     * epoll takes the 32 descriptions of the console once each). */
     p[3].events = POLLIN; p[20].events = POLLIN;
     p[32] = p[0];
     CHECK(poll(p, 33, 3) == 0);
     for (int i = 33; i < 65; i++) p[i] = p[0];
-    CHECK(poll(p, 65, 0) < 0 && errno == EINVAL);
+    CHECK(poll(p, 65, 0) == 0);
+    for (int i = 0; i < 65; i++) CHECK(p[i].revents == 0);
     CHECK(tcsetattr(0, TCSANOW, &old) == 0);
     for (int fd = 3; fd < 32; fd++) CHECK(close(fd) == 0);
     return 0;

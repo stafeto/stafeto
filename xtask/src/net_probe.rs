@@ -229,6 +229,9 @@ const WIRE_ECHO_READY: &str = "net-probe: wire echo ready 7000";
 const WIRE_ECHO_OK: &str = "net-probe: wire echo ok 2000";
 const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
 const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
+const EPOLL_OK: &str = "net-probe: epoll ok";
+const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
+const EPOLL_WAIT_OK: &str = "net-probe: epoll wait ok 64 after 64 stale";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -252,6 +255,9 @@ pub const PORTION_MAX: u64 = TERM_B * 8 / 10;
 const CLONE_KIND: usize = 19;
 const CLONE_MORE_KIND: usize = 20;
 const ABANDON_KIND: usize = 18;
+const EPOLL_SET_KIND: usize = 22;
+const EPOLL_DROP_KIND: usize = 32;
+const EPOLL_WAIT_KIND: usize = 33;
 const OWN_KIND: usize = 65;
 
 /// How the interface got its address.
@@ -277,6 +283,7 @@ pub struct Roles {
     pub wire_echo: bool,
     pub clone_many: bool,
     pub abandon_many: bool,
+    pub epoll_sets: bool,
 }
 
 impl Roles {
@@ -293,6 +300,7 @@ impl Roles {
         wire_echo: false,
         clone_many: false,
         abandon_many: false,
+        epoll_sets: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -348,6 +356,10 @@ impl Roles {
     };
     pub const ABANDON_MANY: Roles = Roles {
         abandon_many: true,
+        ..Roles::NONE
+    };
+    pub const EPOLL_SETS: Roles = Roles {
+        epoll_sets: true,
         ..Roles::NONE
     };
 }
@@ -489,6 +501,11 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.abandon_many {
         once.push((ABANDON_OK, 1));
     }
+    if roles.epoll_sets {
+        once.push((EPOLL_WAKE, 1));
+        once.push((EPOLL_WAIT_OK, 1));
+        once.push((EPOLL_OK, 1));
+    }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
     }
@@ -592,6 +609,55 @@ pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
         }
     }
     out
+}
+
+/// The longest step of EPOLL_SET for each number of records (the detail of
+/// its lines), the numbers 4, 8 and 16 the batch is chosen from.
+fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
+    let mut out: Vec<(usize, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "step:",
+            NET_TAG,
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+        ] = words.as_slice()
+        else {
+            continue;
+        };
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (
+            kind.parse::<usize>(),
+            ticks.parse::<u64>(),
+            detail.parse::<usize>(),
+        ) else {
+            continue;
+        };
+        if kind != EPOLL_SET_KIND || ![4, 8, 16].contains(&detail) {
+            continue;
+        }
+        match out.iter_mut().find(|(d, _)| *d == detail) {
+            Some(row) if row.1 >= ticks => {}
+            Some(row) => row.1 = ticks,
+            None => out.push((detail, ticks)),
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The batch of EPOLL_SET: the largest of 16, 8 and 4 records whose step on
+/// places that hold fifteen records stays within the budget of a step.
+fn epoll_batch_choice(rows: &[(usize, u64)]) -> Option<usize> {
+    [16, 8, 4].into_iter().find(|&size| {
+        rows.iter()
+            .any(|&(d, ticks)| d == size && ticks <= netd::choose::BUDGET)
+    })
 }
 
 /// The steps of the service: every kind came and every row stays under
@@ -873,6 +939,11 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             measured_programs(Some("net-abandon"), netd),
             Roles::ABANDON_MANY,
         ),
+        (
+            "E",
+            measured_programs(Some("net-epoll"), netd),
+            Roles::EPOLL_SETS,
+        ),
     ]
 }
 
@@ -978,14 +1049,19 @@ fn acceptance(
     strict: bool,
 ) -> Result<Vec<Rows>, String> {
     let mut all = Vec::new();
+    let mut epoll_run = Vec::new();
     for (what, programs, roles) in acceptance_runs(netd) {
-        let rows = steps_run(
+        let lines = steps_lines(
             machine,
             measured_name(&format!("{tag}-{what}")),
             programs,
             roles,
             strict,
         )?;
+        let rows = longest_over_starts(&lines);
+        if what == "E" {
+            epoll_run = lines;
+        }
         let rows = if strict {
             steps_verdict_rows(&rows).map_err(|e| format!("run {what}: {e}"))?
         } else {
@@ -1024,7 +1100,7 @@ fn acceptance(
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {}, E {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
         own("s1280"),
         own("f"),
@@ -1037,6 +1113,7 @@ fn acceptance(
         own("W"),
         own("C"),
         own("A"),
+        own("E"),
         netd::choose::FLATNESS
     );
     let kind = |run: &str, kind: usize| {
@@ -1051,6 +1128,23 @@ fn acceptance(
         kind("C", CLONE_MORE_KIND),
         kind("A", ABANDON_KIND)
     );
+    let by_batch = epoll_set_by_batch(&epoll_run);
+    println!(
+        "net-probe: EPOLL_SET by batch {by_batch:?}, EPOLL_WAIT of 64 pairs {}, EPOLL_DROP {} (chosen batch {})",
+        kind("E", EPOLL_WAIT_KIND),
+        kind("E", EPOLL_DROP_KIND),
+        proto_net::sockets::EPOLL_BATCH
+    );
+    if strict {
+        let chosen = epoll_batch_choice(&by_batch);
+        if chosen != Some(proto_net::sockets::EPOLL_BATCH) {
+            return Err(format!(
+                "EPOLL_BATCH is {} but the steps {by_batch:?} choose {chosen:?} (budget {})",
+                proto_net::sockets::EPOLL_BATCH,
+                netd::choose::BUDGET
+            ));
+        }
+    }
     Ok(all)
 }
 

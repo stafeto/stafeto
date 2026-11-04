@@ -1038,10 +1038,10 @@ pub fn closed(fd: u32) {
             if inst.after_fork {
                 continue;
             }
-            if let Some(idx) = by_fd(inst, fd) {
-                if free_entry(inst, idx, true) {
-                    flush_ids[k] = Some(k as u32 | inst.generation << 8);
-                }
+            if let Some(idx) = by_fd(inst, fd)
+                && free_entry(inst, idx, true)
+            {
+                flush_ids[k] = Some(k as u32 | inst.generation << 8);
             }
         }
     });
