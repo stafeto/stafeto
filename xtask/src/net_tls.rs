@@ -332,6 +332,15 @@ fn expect_code(
     Ok(began.elapsed())
 }
 
+/// Whether a line of `curl -v` or `openssl s_client` names TLS 1.3 as the
+/// version of the connection made (the lines of the handshake name the
+/// versions offered).
+fn negotiated_tls13(line: &str) -> bool {
+    let line = line.trim();
+    (line.contains("SSL connection using TLSv1.3") || line.starts_with("Protocol"))
+        && line.contains("TLSv1.3")
+}
+
 /// What `openssl speed` printed: the line of its table for AES-128-GCM.
 fn speed_line(lines: &[String]) -> Option<String> {
     lines
@@ -481,14 +490,16 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
             return Ok(());
         }
         // 2. TLS 1.3.
-        let shown = capture(
+        let (code, shown) = coded(
             &mut run,
             &format!("curl -sSv --tlsv1.3 -o /dev/null https://10.0.2.2:{a}/index.html 2>&1"),
             "v13",
             FETCH_WITHIN,
         )?;
-        if !shown.iter().any(|l| l.contains("TLSv1.3")) {
-            return Err(format!("curl --tlsv1.3 said no TLSv1.3: {shown:?}"));
+        if code != 0 || !shown.iter().any(|l| negotiated_tls13(l)) {
+            return Err(format!(
+                "curl --tlsv1.3 ended with {code} with no connection of TLSv1.3: {shown:?}"
+            ));
         }
         // 3. The name of the certificate.
         let t = expect_code(
@@ -535,7 +546,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
         )?;
         if code != 0
             || !lines.iter().any(|l| l.contains("Verification: OK"))
-            || !lines.iter().any(|l| l.contains("TLSv1.3"))
+            || !lines.iter().any(|l| negotiated_tls13(l))
         {
             return Err(format!("s_client to A ended with {code}: {lines:?}"));
         }
@@ -669,6 +680,19 @@ mod tests {
     fn net_tls_large_file_is_fixed() {
         assert_eq!(big_file().len(), BIG_LEN);
         assert_ne!(&big_file()[..8], &big_file()[8..16]);
+    }
+
+    #[test]
+    fn net_tls_version_of_the_connection() {
+        assert!(negotiated_tls13(
+            "* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519MLKEM768 / id-ecPublicKey"
+        ));
+        assert!(negotiated_tls13("Protocol: TLSv1.3"));
+        assert!(negotiated_tls13("    Protocol  : TLSv1.3"));
+        assert!(!negotiated_tls13(
+            "* TLSv1.3 (OUT), TLS handshake, Client hello (1):"
+        ));
+        assert!(!negotiated_tls13("Protocol: TLSv1.2"));
     }
 
     #[test]
