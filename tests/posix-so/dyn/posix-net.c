@@ -68,14 +68,12 @@ static long now_ms(void)
 	return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
 }
 
-/* A listener on the loopback and the port `want`. The ports are named, not
- * chosen by the service: its choice tries 64 ports in a row, which hundreds
- * of connections made in a row can all have taken. */
-static int listener(int backlog, int want, int *port)
+/* A listener on the loopback and a port of the service's choosing. */
+static int listener(int backlog, int *port)
 {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	REQUIRE(fd >= 0);
-	struct sockaddr_in a = at(LOOPBACK, want);
+	struct sockaddr_in a = at(LOOPBACK, 0);
 	REQUIRE(bind(fd, (struct sockaddr *)&a, sizeof a) == 0);
 	REQUIRE(listen(fd, backlog) == 0);
 	socklen_t len = sizeof a;
@@ -84,14 +82,11 @@ static int listener(int backlog, int want, int *port)
 	return fd;
 }
 
-/* One connection on the loopback through `lis` from the port `from`: the
- * two ends. */
-static void pair(int lis, int port, int from, int *client, int *server)
+/* One connection on the loopback through `lis`: the two ends. */
+static void pair(int lis, int port, int *client, int *server)
 {
 	int c = socket(AF_INET, SOCK_STREAM, 0);
 	REQUIRE(c >= 0);
-	struct sockaddr_in me = at(LOOPBACK, from);
-	REQUIRE(bind(c, (struct sockaddr *)&me, sizeof me) == 0);
 	struct sockaddr_in a = at(LOOPBACK, port);
 	REQUIRE(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
 	int s = accept(lis, NULL, NULL);
@@ -198,10 +193,10 @@ static void fds_1000(void)
 static void sockets_1000(void)
 {
 	int port;
-	int lis = listener(8, 20500, &port);
+	int lis = listener(8, &port);
 	static int client[500], server[500];
 	for (int i = 0; i < 500; i++)
-		pair(lis, port, 21000 + i, &client[i], &server[i]);
+		pair(lis, port, &client[i], &server[i]);
 	for (int i = 0; i < 500; i++)
 		exchange(client[i], server[i], (char)('a' + i % 26));
 	/* All of them are alive after the traffic of the others. */
@@ -219,10 +214,10 @@ static void sockets_1000(void)
 static void fork_900(void)
 {
 	int port;
-	int lis = listener(8, 20400, &port);
+	int lis = listener(8, &port);
 	static int client[100], server[100];
 	for (int i = 0; i < 100; i++)
-		pair(lis, port, 20700 + i, &client[i], &server[i]);
+		pair(lis, port, &client[i], &server[i]);
 	int used = 3 + 1 + 200;
 	int copies = 900 - used;
 	for (int i = 0; i < copies; i++)
@@ -245,8 +240,8 @@ static void fork_900(void)
 		}
 		_exit(0);
 	}
-	/* The child ends first: a child that lacks the descriptors fails here, not
-	 * in a wait for bytes it never wrote. */
+	/* The child ends first, so a child that lacks the descriptors fails at its
+	 * exit status. */
 	REQUIRE(wait_exit(child) == 0);
 	long took = now_ms() - began;
 	for (int i = 90; i < 100; i++) {
@@ -394,6 +389,38 @@ static void rcvbuf_tiers(void)
 		REQUIRE(close(fds[i]) == 0);
 }
 
+/* 700 datagram sockets bound to port 0 take 700 ports in a row; then 100
+ * binds of port 0 and 100 connects to other ports (each end has its own place
+ * in the range) all find a free port, though the service tries 64 candidates
+ * of its own before it looks for a free one. */
+static void ephemeral_block(void)
+{
+	static int held[700];
+	for (int i = 0; i < 700; i++) {
+		held[i] = socket(AF_INET, SOCK_DGRAM, 0);
+		REQUIRE(held[i] >= 0);
+		struct sockaddr_in a = at(LOOPBACK, 0);
+		REQUIRE(bind(held[i], (struct sockaddr *)&a, sizeof a) == 0);
+	}
+	static int more[200];
+	for (int i = 0; i < 100; i++) {
+		more[i] = socket(AF_INET, SOCK_DGRAM, 0);
+		REQUIRE(more[i] >= 0);
+		struct sockaddr_in a = at(LOOPBACK, 0);
+		REQUIRE(bind(more[i], (struct sockaddr *)&a, sizeof a) == 0);
+	}
+	for (int i = 100; i < 200; i++) {
+		more[i] = socket(AF_INET, SOCK_DGRAM, 0);
+		REQUIRE(more[i] >= 0);
+		struct sockaddr_in a = at(LOOPBACK, 9000 + 7 * i);
+		REQUIRE(connect(more[i], (struct sockaddr *)&a, sizeof a) == 0);
+	}
+	for (int i = 0; i < 200; i++)
+		REQUIRE(close(more[i]) == 0);
+	for (int i = 0; i < 700; i++)
+		REQUIRE(close(held[i]) == 0);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -407,6 +434,7 @@ static const struct {
 	{ "exec-64", exec_64 },
 	{ "spawn-high", spawn_high },
 	{ "sockets-1000", sockets_1000 },
+	{ "ephemeral-block", ephemeral_block },
 };
 
 int main(int argc, char **argv)

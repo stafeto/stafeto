@@ -599,7 +599,7 @@ impl Net {
             Proto::Tcp => &self.tcp_ports,
             Proto::Udp => &self.udp_ports,
         };
-        let port = netd::ports::ephemeral(offset, counter, |p| !map.held(p))?;
+        let port = netd::ports::ephemeral(offset, counter, map)?;
         self.ports(proto).hold(port);
         Some(port)
     }
