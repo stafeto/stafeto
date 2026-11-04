@@ -23,13 +23,14 @@
 
 use crate::constants::*;
 use crate::long;
+use crate::netbuf::{self, Cell};
 use crate::shared;
 use crate::sockets::{
     AF_INET, IPPROTO_TCP, IPPROTO_UDP, KEPT_FLAGS, MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL,
     MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN,
     SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
-    SO_SNDBUF, SO_SNDTIMEO, SO_TYPE, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET,
-    TCP_NODELAY,
+    SO_SNDBUF, SO_SNDTIMEO, SO_STAFETO_BUFFERED, SO_STAFETO_BUFFERS, SO_TYPE, SOCK_DGRAM,
+    SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +82,8 @@ pub unsafe fn init(session: Option<Handle<Channel>>) {
 /// The child's only thread, before anything else of the layer runs.
 pub unsafe fn after_fork(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
+    // The clone has no shared buffer: the child asks for its own.
+    netbuf::after_fork();
 }
 
 /// The session with the network service, for the requests and for the
@@ -688,6 +691,8 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
         SO_KEEPALIVE => (opt::KEEPALIVE, true),
         SO_ACCEPTCONN => (opt::ACCEPTCONN, false),
         SO_DOMAIN => (opt::DOMAIN, false),
+        SO_STAFETO_BUFFERS => (opt::BUFFERS, false),
+        SO_STAFETO_BUFFERED => (opt::BUFFERED, false),
         _ => return Err(ENOPROTOOPT),
     })
 }
@@ -881,9 +886,86 @@ fn send_once(description: u32, flags: u32, address: Address, bytes: &[u8]) -> Re
     Ok(sent)
 }
 
+/// One SEND of the first `len` bytes of `cell`: how many the service took.
+#[inline(never)]
+fn send_cell(description: u32, flags: u32, cell: &Cell, len: usize) -> Result<usize, i32> {
+    let mut result = [0; 4];
+    let offset = cell.offset();
+    let n = run(
+        true,
+        |key| Request::SendCell {
+            key,
+            description,
+            flags,
+            address: Address::NONE,
+            offset,
+            len: len as u32,
+        },
+        &mut result,
+    )?;
+    let sent = wire::read_sent(&result[..n]).map_err(|_| EIO)? as usize;
+    if sent > len {
+        return Err(EIO);
+    }
+    Ok(sent)
+}
+
+/// The bytes of `iov` from `done` on through `cell`, all of them unless a
+/// signal or a non-blocking description stops it after some: their count,
+/// `done` among them. Each request carries what the cell holds, and the
+/// rest of the cell goes again after the bytes the service took.
+fn send_through(
+    description: u32,
+    flags: u32,
+    iov: &[&[u8]],
+    size: usize,
+    mut cell: Cell,
+) -> Result<usize, i32> {
+    let mut done = 0;
+    while done < size {
+        let len = crate::sockets::gather(iov, done, cell.bytes());
+        match send_cell(description, flags, &cell, len) {
+            Ok(sent) => done += sent,
+            Err(_) if done > 0 => break,
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(done)
+}
+
+/// One RECV of up to `most` bytes into `cell`: the flags, the sender and
+/// the count.
+#[inline(never)]
+fn recv_cell(
+    description: u32,
+    flags: u32,
+    cell: &Cell,
+    most: usize,
+) -> Result<(u32, Address, usize), i32> {
+    let mut reply = [0u8; MESSAGE_MAX];
+    let offset = cell.offset();
+    let most = most.min(proto_net::SLOT) as u32;
+    let n = run(
+        true,
+        |key| Request::RecvCell {
+            key,
+            description,
+            flags,
+            most,
+            offset,
+        },
+        &mut reply,
+    )?;
+    let (got_flags, from, count) = wire::read_received_count(&reply[..n], most).map_err(|_| EIO)?;
+    Ok((got_flags, from, count as usize))
+}
+
 /// `bytes` to the connection of `description`, all of them unless a
 /// signal or a non-blocking description stops it after some: their count.
 fn send_all(description: u32, flags: u32, address: Address, bytes: &[u8]) -> Result<usize, i32> {
+    if let Some(cell) = netbuf::cell(bytes.len()) {
+        return send_through(description, flags, &[bytes], bytes.len(), cell);
+    }
     let mut done = 0;
     loop {
         let piece = &bytes[done..bytes.len().min(done + DATA_MAX)];
@@ -931,6 +1013,9 @@ pub fn send(
                 let mut piece = [0u8; DATA_MAX];
                 crate::sockets::gather(iov, 0, &mut piece[..size]);
                 return send_once(description, wire_flags, to, &piece[..size]);
+            }
+            if let Some(cell) = netbuf::cell(size) {
+                return send_through(description, wire_flags, iov, size, cell);
             }
             let mut done = 0;
             let mut piece = [0u8; DATA_MAX];
@@ -985,7 +1070,33 @@ pub fn recv(
             }
             let mut total = 0;
             let mut name = name;
+            let mut cell = if stream { netbuf::cell(size) } else { None };
             loop {
+                if let Some(cell) = cell.as_mut() {
+                    let got = recv_cell(description, wire_flags, cell, size - total);
+                    let (got_flags, from, count) = match got {
+                        Ok(got) => got,
+                        Err(_) if total > 0 => break,
+                        Err(errno) => return Err(errno),
+                    };
+                    crate::sockets::scatter(iov, total, &cell.bytes()[..count]);
+                    if total == 0 {
+                        if let Some(out) = name.as_deref_mut() {
+                            message.name_len = c_address(&from, out);
+                        }
+                        if got_flags & wire::OUT_TRUNC != 0 {
+                            message.flags |= MSG_TRUNC;
+                        }
+                    }
+                    total += count;
+                    if count == 0
+                        || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL
+                        || total >= size
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 let most = (size - total).clamp(1, DATA_MAX) as u32;
                 let mut reply = [0u8; MESSAGE_MAX];
                 let n = run(
@@ -1055,6 +1166,45 @@ pub fn read(description: u32, out: &mut [u8]) -> Result<usize, i32> {
     let n = bytes.len().min(out.len());
     out[..n].copy_from_slice(&bytes[..n]);
     Ok(n)
+}
+
+/// A read of a stream socket `fd` of more than DATA_MAX bytes through a cell
+/// of the shared buffer (`read` on the descriptor): None when `fd` is no
+/// stream of the service, or no cell is to be had; the read then goes by
+/// messages.
+pub fn read_large(fd: i32, out: &mut [u8]) -> Option<Result<usize, i32>> {
+    if out.len() <= DATA_MAX || !is_net(fd) {
+        return None;
+    }
+    let read = with_net(fd, |net| {
+        if !net.stream {
+            return Ok(None);
+        }
+        let Some(mut cell) = netbuf::cell(out.len()) else {
+            return Ok(None);
+        };
+        let (_, _, count) = recv_cell(net.description, 0, &cell, out.len())?;
+        out[..count].copy_from_slice(&cell.bytes()[..count]);
+        Ok(Some(count))
+    });
+    match read {
+        Ok(None) => None,
+        Ok(Some(n)) => Some(Ok(n)),
+        Err(errno) => Some(Err(errno)),
+    }
+}
+
+/// writev of a stream socket `fd` as one send (relibc's writev asks first):
+/// None for any other descriptor.
+pub fn writev(fd: i32, iov: &[&[u8]]) -> Option<Result<usize, i32>> {
+    if !is_net(fd) {
+        return None;
+    }
+    let stream = with_net(fd, |net| Ok(net.stream)).ok()?;
+    if !stream {
+        return None;
+    }
+    Some(send(fd, 0, None, iov, &[]))
 }
 
 /// A write of `bytes` to the description (`write` on the descriptor): all of
