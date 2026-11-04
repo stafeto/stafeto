@@ -589,6 +589,11 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
             break;
         }
         first = false;
+        // The records of epoll by edge see the frames that bring bytes or a
+        // new state; the marks cost only for a place somebody watches.
+        let mark = place
+            .filter(|&p| net.watched_by_frames(p))
+            .map(|p| net.frame_mark(stack, p));
         let set = match place {
             Some(place) => {
                 net.touch(place);
@@ -607,6 +612,10 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         if let Some(place) = place {
             net.adopt(stack);
             net.reset_data_after_close(stack, place);
+            if let Some(before) = mark {
+                let after = net.frame_mark(stack, place);
+                net.arrived(place, before, after);
+            }
         }
         let spent = split::now() - began;
         split::record(

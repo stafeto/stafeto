@@ -17,6 +17,7 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
+use netd::interest::Interests;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
 use netd::ports::{Binding, PortMap, Proto};
 use netd::ring::{OrphanQueue, WakeBudget};
@@ -200,6 +201,8 @@ pub enum Kind {
     Send,
     Recv,
     Watch,
+    /// A wait on an interest set: `OpInfo::place` is the index of the set.
+    Epoll,
 }
 
 /// Where an operation waits: its key, its client, its kind and the place of
@@ -226,6 +229,10 @@ impl OpInfo {
 pub fn op_index(key: u64) -> Option<usize> {
     netd::ring::op_index(key, OPERATIONS)
 }
+
+/// The event RDHUP of epoll: the peer closed its sending side. The watches
+/// never ask for it (their events stop at `watch::EVENTS`).
+pub const RDHUP: u32 = proto_net::sockets::epoll::RDHUP;
 
 /// The place that means no place in `Sock::listener`.
 pub const NO_PLACE: u16 = u16::MAX;
@@ -298,6 +305,8 @@ pub struct Net {
     pub info: [OpInfo; OPERATIONS],
     pub watches: [watch::Set; OPERATIONS],
     pub clones: Clones<SESSIONS>,
+    /// The interest sets of epoll and the records of the places.
+    pub interest: Interests<SOCKETS_MAX>,
     pub births: [Option<Birth>; SESSIONS],
     departing: [Held; DEPARTING],
     /// The operations of each departing session that wait still: a step of
@@ -320,7 +329,7 @@ pub struct Net {
     release_queue: Mask,
     /// The operations whose description closed, which the step of waking
     /// tells.
-    closed_ops: u128,
+    pub closed_ops: u128,
     /// The table that steers a frame to its socket.
     pub demux: Demux,
     /// The groups with work for the pass of sending, and those the step
@@ -396,6 +405,7 @@ impl Net {
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
+            Interests::initialize_at(addr_of_mut!((*at).interest));
             rt::bss::fill(addr_of_mut!((*at).departing_long), LongSession::default());
             addr_of_mut!((*at).key).write(key);
             Demux::initialize_at(addr_of_mut!((*at).demux), &demux_key);
@@ -558,6 +568,7 @@ impl Net {
         if let Some(key) = sock.key {
             self.demux.remove(&key);
         }
+        self.interest.drop_place(i, None);
         self.rst_wait.clear(i);
         self.wake_due.clear(i);
         self.attention.clear(i);
@@ -901,8 +912,10 @@ impl Net {
         if left < GONE_PORTION {
             self.step_due = true;
         }
+        let sets_left = self.interest.depart_step();
         self.departing_used.iter().any(|&w| w != 0)
             || self.release_queue.next(0).is_some()
+            || sets_left
             || !finished
     }
 
@@ -932,6 +945,18 @@ impl Net {
                 | tcp::State::TimeWait
         ) {
             self.socks[i].saw_fin = true;
+        }
+        // A stream that was open and closed with no FIN of the peer and no
+        // shutdown of ours was reset: a deferred error, once (`SO_ERROR`).
+        let s = &mut self.socks[i];
+        if s.conn == Conn::Done
+            && state == tcp::State::Closed
+            && !s.saw_fin
+            && !s.shut_wr
+            && s.error == 0
+        {
+            s.error = proto_net::RESET;
+            self.interest.changed(i);
         }
         if let Conn::Connecting(since) = self.socks[i].conn {
             match state {
@@ -988,6 +1013,9 @@ impl Net {
                     if t.state() == tcp::State::Closed || (s.shut_wr && !t.may_recv()) {
                         ev |= watch::HUP;
                     }
+                    if !t.may_recv() {
+                        ev |= RDHUP;
+                    }
                 } else if !matches!(s.conn, Conn::Connecting(_)) {
                     // Never connected, or the connect failed.
                     ev |= watch::OUT | watch::HUP;
@@ -1028,7 +1056,9 @@ impl Net {
         let info = self.info[idx];
         let bit = 1u128 << idx;
         self.told &= !bit;
-        if info.kind == Kind::Watch {
+        if info.kind == Kind::Epoll {
+            self.interest.remove_waiter(usize::from(info.place), idx);
+        } else if info.kind == Kind::Watch {
             let set = self.watches[idx];
             for item in &set.items[..set.len] {
                 if let Some(i) = self.places.find(item.description) {
@@ -1217,7 +1247,7 @@ impl Net {
 
     /// Whether the step of waking has places or operations left.
     pub fn wake_pending(&self) -> bool {
-        self.wake_due.next(0).is_some() || self.closed_ops != 0
+        self.wake_due.next(0).is_some() || self.closed_ops != 0 || self.interest.due != 0
     }
 
     /// The step of waking: for the places in `wake_due`, in turn, the
@@ -1243,6 +1273,14 @@ impl Net {
                 break;
             }
             let ev = self.events(stack, i, now);
+            if self.interest.watched(i) {
+                // Each record on the place is a check of the step.
+                if !budget.take_checks(self.interest.on_place(i)) {
+                    self.wake_cursor = i;
+                    break;
+                }
+                self.interest.scan(i, ev);
+            }
             let mut mask = self.socks[i].waiters;
             while mask != 0 {
                 let idx = mask.trailing_zeros() as usize;
@@ -1265,6 +1303,7 @@ impl Net {
                 let ready = match info.kind {
                     Kind::Connect => !matches!(self.socks[i].conn, Conn::Connecting(_)),
                     Kind::Accept => ev & (watch::IN | watch::ERR) != 0,
+                    Kind::Epoll => false,
                     Kind::Send => ev & (watch::OUT | watch::ERR | watch::HUP) != 0,
                     Kind::Recv => ev & (watch::IN | watch::ERR | watch::HUP) != 0,
                     Kind::Watch => {
@@ -1286,7 +1325,7 @@ impl Net {
                     self.ops.tell(info.label, info.key);
                 }
             }
-            if self.socks[i].waiters == 0 {
+            if self.socks[i].waiters == 0 && !self.interest.watched(i) {
                 self.attention.clear(i);
             }
             self.wake_due.clear(i);
@@ -1294,7 +1333,72 @@ impl Net {
                 at = 0;
             }
         }
+        self.tell_sets(&mut budget);
         self.wake_pending()
+    }
+
+    /// The sets with ready records whose waiting operations are told, within
+    /// the notifications the step has left. A set whose operations are all
+    /// told (or that has none) is not due any more.
+    fn tell_sets(&mut self, budget: &mut WakeBudget) {
+        while self.interest.due != 0 {
+            let k = self.interest.due.trailing_zeros() as usize;
+            let mut mask = self.interest.waiters(k);
+            while mask != 0 {
+                let idx = mask.trailing_zeros() as usize;
+                let bit = 1u128 << idx;
+                mask &= mask - 1;
+                if self.told & bit != 0 {
+                    continue;
+                }
+                let info = self.info[idx];
+                if !self.ops.waits(info.label, info.key) {
+                    self.interest.remove_waiter(k, idx);
+                    continue;
+                }
+                if !budget.take_tell() {
+                    return;
+                }
+                self.told |= bit;
+                self.ops.tell(info.label, info.key);
+            }
+            self.interest.due &= !(1 << k);
+        }
+    }
+
+    /// Whether the records of the interest sets look at place `i` or at the
+    /// listening description a socket of its queue belongs to.
+    pub fn watched_by_frames(&self, i: usize) -> bool {
+        let listener = usize::from(self.socks[i].listener);
+        self.interest.watched(i)
+            || (listener != usize::from(NO_PLACE) && self.interest.watched(listener))
+    }
+
+    /// What a frame may change in place `i` for the records by edge: the
+    /// state of a stream and the bytes it holds for reading.
+    pub fn frame_mark(&self, stack: &mut Stack<'static>, i: usize) -> (u8, usize) {
+        match (self.socks[i].proto, self.socks[i].handle) {
+            (Proto::Tcp, Some(h)) => {
+                let t = stack.tcp(h);
+                (t.state() as u8, t.recv_queue())
+            }
+            _ => (0, 0),
+        }
+    }
+
+    /// A frame came for place `i` that held `before` and holds `after`: new
+    /// bytes or a new state are a change for the records of the place and of
+    /// the listening description a socket of its queue belongs to. A frame
+    /// of acknowledgements alone changes nothing: a datagram always does.
+    pub fn arrived(&mut self, i: usize, before: (u8, usize), after: (u8, usize)) {
+        if self.socks[i].proto == Proto::Tcp && before.0 == after.0 && after.1 <= before.1 {
+            return;
+        }
+        self.interest.changed(i);
+        let listener = usize::from(self.socks[i].listener);
+        if listener != usize::from(NO_PLACE) {
+            self.interest.changed(listener);
+        }
     }
 
     /// Whether an item of the watch with index `idx` that names place `i`
