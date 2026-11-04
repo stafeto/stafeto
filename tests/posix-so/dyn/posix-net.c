@@ -121,13 +121,14 @@ static void close_from(int first)
 		close(fd);
 }
 
-/* The limit, and a hard limit that only the privileged may raise. (sysconf of
- * the pinned relibc caps its answer at 64: its own check is in relibc-hello.) */
+/* The limit as getrlimit and sysconf say it, and a hard limit that only the
+ * privileged may raise. */
 static void limits(void)
 {
 	struct rlimit r;
 	REQUIRE(getrlimit(RLIMIT_NOFILE, &r) == 0);
 	REQUIRE(r.rlim_cur == 1024 && r.rlim_max == 1024);
+	REQUIRE(sysconf(_SC_OPEN_MAX) == (long)r.rlim_cur);
 	pid_t child = fork();
 	REQUIRE(child >= 0);
 	if (child == 0) {

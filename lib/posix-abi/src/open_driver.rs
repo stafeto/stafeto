@@ -97,17 +97,28 @@ pub(crate) fn open(
             // Binding and preparation retries run without a numeric reservation or defer.
             files.open_prepare_recover(recovery.job).map_err(protocol)?;
             // The page of the table for the number the open will take is there
-            // before the reservation, which cannot be asked again.
+            // before the reservation. Another thread may take that number
+            // meanwhile; the reservation then changes nothing, and the loop goes
+            // round to ask for the next page.
             crate::shared::ensure_vacant_page();
             let defer = Defer::enter();
             let final_result = (|| {
-                let (entry, context) = crate::shared::with_files(|files| {
-                    let entry = files.reserve_open_record(claim).map_err(crate::error)?;
+                let reserved = crate::shared::with_files(|files| {
+                    let entry = files
+                        .reserve_open_record(claim)
+                        .map_err(crate::shared::page_error)?;
                     let context = files
                         .begin_open_finalize(claim, entry)
                         .map_err(crate::error)?;
                     Ok((entry, context))
-                })?;
+                });
+                let (entry, context) = match reserved {
+                    Err(code) if crate::shared::is_page_code(code) => {
+                        recovery.phase = Phase::Preparing;
+                        return Ok(FinalPhase::Prepared(Status::Ok));
+                    }
+                    other => other?,
+                };
                 recovery.phase = Phase::Committing;
                 let finished = match context.send_once() {
                     FinalizeResult::Finished(held) => Ok(held),

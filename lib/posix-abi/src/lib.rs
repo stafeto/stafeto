@@ -172,7 +172,8 @@ pub fn error(error: FsError) -> c_int {
         FsError::FileSizeLimit => FILE_SIZE_REFUSAL,
         FsError::TooManyOpenFiles => EMFILE,
         // A call that can allocate a number asks for the page first
-        // (`shared::page_error`); a page that is gone again by then is EMFILE.
+        // (`shared::page_error`) and goes again when the page is wanted; a
+        // call that does not is told EMFILE.
         FsError::NeedPage(_) => EMFILE,
         FsError::NotSeekable => ESPIPE,
         FsError::OffsetOverflow => EOVERFLOW,

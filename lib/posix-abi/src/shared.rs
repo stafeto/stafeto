@@ -898,6 +898,11 @@ pub fn page_error(error: posix_fs::FsError) -> i32 {
     }
 }
 
+/// Whether `code` is one `page_error` made for a page that is wanted.
+pub fn is_page_code(code: i32) -> bool {
+    code >= NEED_PAGE
+}
+
 /// The base of the codes `page_error` makes: no errno comes near it.
 const NEED_PAGE: i32 = 0x4000_0000;
 
