@@ -852,7 +852,10 @@ impl Driver<'_> {
     /// Groups with work left want a step of sending; when no step follows,
     /// the timer is set for the next deadline.
     fn next_steps(&mut self, now: u64, receiving: bool) {
-        let sending = self.net.due != 0 && self.tell(TX);
+        // The DHCP client's set has a message to send after a frame of the
+        // server (a request after an offer) that only a pass of sending
+        // makes; without this step it would wait for the client's retry.
+        let sending = (self.net.due != 0 || self.stack.service_due) && self.tell(TX);
         if !receiving && !sending {
             self.arm(now);
         }
