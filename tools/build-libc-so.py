@@ -629,7 +629,10 @@ def good_checks(name: str, elf: Elf) -> str | None:
         return f"needed {elf.needed()}"
     if any(s["type"] == PT_TLS for s in elf.segments):
         return "has a PT_TLS"
-    bad = {k for _, k, _ in elf.relocations()} - {"RELATIVE", "GLOB_DAT", "JUMP_SLOT"}
+    # The address of a function of libc.so in the writable data of the
+    # program (curl keeps malloc and free so) is an ABS64 against the name,
+    # which the loader resolves in both modules.
+    bad = {k for _, k, _ in elf.relocations()} - {"RELATIVE", "GLOB_DAT", "JUMP_SLOT", "ABS64"}
     if bad:
         return f"relocation kinds {sorted(bad)}"
     return None
@@ -731,6 +734,8 @@ def program_inputs() -> dict:
         "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
         "doom": [ROOT / "target" / "doomgeneric" / "doom.o"],
         "fstack-probe": [ROOT / "target" / "f-stack" / "fstack-probe.o"],
+        "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
+        "curl": [ROOT / "target" / "curl" / "curl.o"],
     }
 
 
@@ -787,7 +792,7 @@ def build_programs(wanted_names: list) -> list:
     for name in built:
         elf = Elf(PROGRAMS / name)
         kinds = Counter(k for _, k, _ in elf.relocations())
-        lookups = kinds["GLOB_DAT"] + kinds["JUMP_SLOT"]
+        lookups = kinds["GLOB_DAT"] + kinds["JUMP_SLOT"] + kinds["ABS64"]
         lines.append(f"{name}: {(PROGRAMS / name).stat().st_size} bytes, relocations "
                      f"{dict(kinds)}, symbol lookups {lookups} (limit {LOOKUPS_MAX})")
         if lookups >= LOOKUPS_MAX or sum(kinds.values()) >= RELOCS_MAX:

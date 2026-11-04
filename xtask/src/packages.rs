@@ -12,12 +12,14 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Whether a package is part of the base set of the system, an add-on of
-/// the shell image or a game (the games image only).
+/// the shell image, a game (the games image only) or a program of the
+/// network (the images with the network service only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Base,
     Addon,
     Game,
+    Net,
 }
 
 impl Kind {
@@ -27,6 +29,7 @@ impl Kind {
             Kind::Base => "base",
             Kind::Addon => "addon",
             Kind::Game => "game",
+            Kind::Net => "net",
         }
     }
 }
@@ -183,9 +186,10 @@ pub fn parse(text: &str, origin: &str) -> Result<Package, String> {
         "base" => Kind::Base,
         "addon" => Kind::Addon,
         "game" => Kind::Game,
+        "net" => Kind::Net,
         other => {
             return Err(format!(
-                "{origin}: kind {other:?} is none of base, addon, game"
+                "{origin}: kind {other:?} is none of base, addon, game, net"
             ));
         }
     };
@@ -328,6 +332,12 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
                     p.name
                 ));
             }
+            if matches!(p.kind, Kind::Base | Kind::Addon | Kind::Game) && d.kind == Kind::Net {
+                return Err(format!(
+                    "{}: a package of an image without the network depends on the network package {dep}",
+                    p.name
+                ));
+            }
         }
         // The programs a file takes its bytes from are those of the package
         // and of its dependencies.
@@ -413,15 +423,18 @@ pub fn check() -> Result<(), String> {
         "boot-net-vz2.img",
         "boot-net-vz2-static.img",
         "boot-fstack-probe.img",
+        "boot-net-tls.img",
+        "boot-net-tls-steps.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
     let count = |kind| packages.iter().filter(|p| p.kind == kind).count();
     println!(
-        "packages ok: {} base, {} add-on, {} game",
+        "packages ok: {} base, {} add-on, {} game, {} net",
         count(Kind::Base),
         count(Kind::Addon),
-        count(Kind::Game)
+        count(Kind::Game),
+        count(Kind::Net)
     );
     Ok(())
 }
@@ -468,24 +481,32 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
 }
 
 /// The packages the image `name` holds: the shell image holds the base ones
-/// and the add-ons, the games image every one of them. The other images are
-/// probes that list the few files they use and hold no package.
+/// and the add-ons, the images with the network service the network
+/// packages too, the games image the games with the shell's. The other
+/// images are probes that list the few files they use and hold no package.
 pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
+    let of = |kinds: &[Kind]| -> Result<Vec<Package>, String> {
+        Ok(load()?
+            .into_iter()
+            .filter(|p| kinds.contains(&p.kind))
+            .collect())
+    };
     match name {
-        "boot-ash-dialog.img"
-        | "boot-net.img"
+        "boot-ash-dialog.img" => of(&[Kind::Base, Kind::Addon]),
+        "boot-net.img"
         | "boot-net-curl-steps.img"
+        | "boot-net-tls.img"
+        | "boot-net-tls-steps.img"
         | "boot-posix-net-steps.img"
         | "boot-net-vz.img"
         | "boot-net-vz2.img"
         | "boot-net-vz2-static.img"
         | "boot-net-vz-steps.img"
-        | "boot-net-vz2-steps.img"
-        | "boot-fstack-probe.img" => Ok(load()?
-            .into_iter()
-            .filter(|p| p.kind != Kind::Game)
-            .collect()),
-        "boot-doom.img" | "boot-doom-steps.img" => load(),
+        | "boot-net-vz2-steps.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
+        // The shell's image with the probe of F-Stack runs no network
+        // service.
+        "boot-fstack-probe.img" => of(&[Kind::Base, Kind::Addon]),
+        "boot-doom.img" | "boot-doom-steps.img" => of(&[Kind::Base, Kind::Addon, Kind::Game]),
         _ => Ok(Vec::new()),
     }
 }
@@ -635,6 +656,39 @@ files = [
         let doom = of_image("boot-doom.img").unwrap();
         assert!(doom.len() > shell.len());
         assert!(doom.iter().any(|p| p.name == "freedoom"));
+    }
+
+    #[test]
+    fn the_network_packages_stay_in_the_images_with_the_network() {
+        let shell = of_image("boot-ash-dialog.img").unwrap();
+        assert!(shell.iter().all(|p| p.kind != Kind::Net));
+        let doom = of_image("boot-doom.img").unwrap();
+        assert!(doom.iter().all(|p| p.kind != Kind::Net));
+        let net = of_image("boot-net.img").unwrap();
+        for name in ["openssl", "curl", "ca-bundle"] {
+            assert!(
+                net.iter().any(|p| p.name == name && p.kind == Kind::Net),
+                "{name}"
+            );
+        }
+        let mut addon = good();
+        addon.depends = vec!["tls".into()];
+        let mut tls = good();
+        tls.name = "tls".into();
+        tls.kind = Kind::Net;
+        tls.files = vec![("/bin/tls".into(), "elf:tls".into())];
+        tls.program = Some("tls".into());
+        assert!(
+            validate_set(&[addon, tls.clone()], None)
+                .unwrap_err()
+                .contains("network package")
+        );
+        let mut user = tls.clone();
+        user.name = "user".into();
+        user.files = vec![("/bin/user".into(), "elf:user".into())];
+        user.program = Some("user".into());
+        user.depends = vec!["tls".into()];
+        assert!(validate_set(&[tls, user], None).is_ok());
     }
 
     #[test]
