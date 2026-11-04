@@ -31,8 +31,13 @@ pub const HANDLE_LIMIT_MAX: u32 = 16_384;
 /// The least quota of a record: a program that owns no object loads and
 /// runs with 15 pages (spec 7.5).
 pub const MIN_QUOTA: u64 = 15 * PAGE;
-/// The DMA objects of a record at most.
-pub const MAX_DMA: usize = 2;
+/// The DMA objects of a record at most: the network service with two
+/// devices has seven (table/net.rs).
+pub const MAX_DMA: usize = 8;
+/// The names of the start data of an instance at most, besides `process`
+/// and `thread`: those of rt::startup (NAMES_MAX), which the worker's giver
+/// holds (worker.rs).
+pub const START_DATA_MAX: usize = 8;
 /// The names init gives in start data besides the DMA objects (worker.rs):
 /// no window, binding or DMA object takes one.
 pub const START_DATA_NAMES: [&str; 6] = [
@@ -125,11 +130,16 @@ pub enum Restart {
 
 /// A device window init makes for a service and gives it in the reply to
 /// its REGISTER, under `name`: `len` bytes of physical memory from `base`.
+/// The service's copy has MAP_READ, MAP_WRITE and TRANSFER, and DUPLICATE
+/// as well when `duplicate`: the network service hands copies of the
+/// window of its second device to the program that claims it, one after
+/// another, and keeps its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     pub name: &'static str,
     pub base: u64,
     pub len: u64,
+    pub duplicate: bool,
 }
 
 /// An interrupt binding init makes for a service through its registered
@@ -403,6 +413,11 @@ pub enum TableError<'a> {
         record: &'static str,
         count: usize,
     },
+    /// More names in the start data than START_DATA_MAX.
+    StartNames {
+        record: &'static str,
+        count: usize,
+    },
     ObjectName {
         record: &'static str,
         name: &'static str,
@@ -508,6 +523,10 @@ impl fmt::Display for TableError<'_> {
             TableError::Objects { record, count } => write!(
                 f,
                 "{record} has {count} windows and bindings, at most {START_NAMES}"
+            ),
+            TableError::StartNames { record, count } => write!(
+                f,
+                "{record} has {count} names in its start data, at most {START_DATA_MAX}"
             ),
             TableError::ObjectName { record, name } => write!(
                 f,
@@ -670,6 +689,27 @@ fn check_cpus(table: &[Record]) -> Result<(), TableError<'static>> {
     Ok(())
 }
 
+/// The names init gives an instance of `r` in its start data besides
+/// `process` and `thread` (worker.rs, `start_data`; serve.rs,
+/// `posix_instance`): the resources of `console`, `log` and `trace`, the
+/// boot image of the services that read it, the DMA objects, and for a
+/// POSIX process its sessions with the process service (the identity
+/// session counted whether or not the instance gets one).
+pub fn start_data_names(r: &Record) -> usize {
+    let resources = usize::from(r.console) + usize::from(r.log) + usize::from(r.trace);
+    let image = [PROCESS_SERVICE, RAM_SERVICE, CLOCK_SERVICE].contains(&r.name);
+    let posix = if r.is_posix() { 2 } else { 0 };
+    resources + usize::from(image) + r.dma.len() + posix
+}
+
+/// The label init binds line `i` of `r` through (serve.rs, `objects`):
+/// `proto_init::binding_label(i)` for a record with more than one binding,
+/// so that the service tells its lines apart; none for a record with one,
+/// whose interrupts come through the registered channel itself.
+pub fn binding_label(r: &Record, i: usize) -> Option<u64> {
+    (r.bindings.len() > 1 && i < r.bindings.len()).then(|| proto_init::binding_label(i))
+}
+
 /// The checks of one record by itself, from its levels on (`check`).
 fn check_record(r: &Record) -> Result<(), TableError<'static>> {
     let record = r.name;
@@ -695,6 +735,10 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
     let count = r.windows.len() + r.bindings.len();
     if count > START_NAMES {
         return Err(TableError::Objects { record, count });
+    }
+    let count = start_data_names(r);
+    if count > START_DATA_MAX {
+        return Err(TableError::StartNames { record, count });
     }
     // The names of the reply to REGISTER and those of the start data
     // init gives (START_DATA_NAMES and the DMA objects): each once, so no
@@ -1151,6 +1195,7 @@ mod tests {
         name: "rtc",
         base: 0x0901_0000,
         len: PAGE,
+        duplicate: false,
     };
     const RTC_IRQ: Binding = Binding {
         name: "rtc-irq",
@@ -1498,11 +1543,13 @@ mod tests {
             name: "rtc2",
             base: 0x0902_0000,
             len: PAGE,
+            duplicate: false,
         };
         const W3: Window = Window {
             name: "rtc3",
             base: 0x0903_0000,
             len: PAGE,
+            duplicate: false,
         };
         const B2: Binding = Binding {
             name: "irq2",
@@ -1570,6 +1617,7 @@ mod tests {
                 name: "rtc",
                 base,
                 len,
+                duplicate: false,
             }];
             check_one(Record {
                 windows: Box::leak(Box::new(w)),
@@ -1886,10 +1934,43 @@ mod tests {
         for record in [net::NETD_VZ2, net::NETD_TWO] {
             assert_eq!(record.windows.len() + record.bindings.len(), 4);
             assert_eq!(record.args.len(), 16);
-            assert_eq!(record.dma.len(), 2);
-            assert_eq!(record.dma[0].size, 16 * PAGE);
-            assert_eq!(record.dma[1].size, 512 * PAGE);
-            assert!(record.dma[1].size <= 4 * 1024 * 1024);
+            // The first device's objects as in the record of one device,
+            // the second device's own: its queues and four objects of 4 MiB,
+            // which the service hands on (DUPLICATE).
+            assert_eq!(record.dma[..2], net::NETD.dma[..]);
+            let names: Vec<_> = record.dma.iter().map(|d| d.name).collect();
+            assert_eq!(
+                names,
+                ["dma", "net", "dma1", "net1a", "net1b", "net1c", "net1d"]
+            );
+            assert_eq!(
+                (record.dma[2].size, record.dma[2].uncached),
+                (8 * PAGE, true)
+            );
+            for d in &record.dma[3..] {
+                assert_eq!((d.size, d.uncached), (4 * 1024 * 1024, false), "{}", d.name);
+                assert_eq!(d.size / PAGE, abi::MAX_CONTIGUOUS_PAGES);
+            }
+            assert!(record.dma[2..].iter().all(|d| d.duplicate));
+            assert!(!record.dma[..2].iter().any(|d| d.duplicate));
+            // `console` and the seven objects: all the names start data has.
+            assert_eq!(start_data_names(&record), START_DATA_MAX);
+            // The window of the second device can be copied; the first's
+            // window on QEMU cannot.
+            assert!(record.windows[record.windows.len() - 1].duplicate);
+            // Each line has its own label, in the order of the bindings.
+            assert_eq!(binding_label(&record, 0), Some(proto_init::BINDING_LABEL));
+            assert_eq!(
+                binding_label(&record, 1),
+                Some(proto_init::BINDING_LABEL | 1)
+            );
+            assert_eq!(binding_label(&record, 2), None);
+        }
+        assert!(!net::NETD_TWO.windows[0].duplicate);
+        // The records of one device bind their line through the channel.
+        for record in [net::NETD, net::NETD_VZ] {
+            assert_eq!(binding_label(&record, 0), None);
+            assert!(record.windows.iter().all(|w| !w.duplicate));
         }
         let vz = net::NETD_VZ2;
         let (ecam, ecam_len) = netd::pci::ecam_window(2);
@@ -1923,6 +2004,56 @@ mod tests {
         assert_eq!(qemu.bindings[1].line, 62);
         assert_eq!(qemu.args[8..], 0x0a00_1c00u64.to_le_bytes());
         assert_eq!(qemu.quiesce[1].offset, 0xc70);
+    }
+
+    #[test]
+    fn the_names_of_the_start_data_fit_the_giver() {
+        static OBJECTS: [Dma; 8] = [Dma {
+            name: "o",
+            size: PAGE,
+            uncached: false,
+            duplicate: false,
+        }; 8];
+        let objects = &OBJECTS;
+        let names = ["o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7"];
+        let with = |count: usize, log: bool| {
+            let dma: Vec<Dma> = (0..count)
+                .map(|i| Dma {
+                    name: names[i],
+                    ..objects[i]
+                })
+                .collect();
+            check_one(Record {
+                dma: Box::leak(dma.into_boxed_slice()),
+                console: true,
+                log,
+                trusted: true,
+                ..service("driver", 40, 40)
+            })
+        };
+        let record = |count, log| Record {
+            dma: &objects[..count],
+            console: true,
+            log,
+            ..service("driver", 40, 40)
+        };
+        assert_eq!(start_data_names(&record(7, false)), 8, "console and 7");
+        assert!(with(7, false).is_ok());
+        assert_eq!(
+            with(7, true),
+            Err(TableError::StartNames {
+                record: "driver",
+                count: 9
+            })
+        );
+        assert_eq!(
+            with(8, false),
+            Err(TableError::StartNames {
+                record: "driver",
+                count: 9
+            })
+        );
+        assert!(with(6, true).is_ok());
     }
 
     #[test]

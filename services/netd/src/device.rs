@@ -10,16 +10,18 @@
 //!
 //! A buffer is the device's from `add` to `pop_used`, and the service
 //! touches it only outside that time. The memory is cached and the device
-//! coherent (dma.rs); the barriers are `virtio_mmio::ring` before the
-//! doorbell and `rt::dma::rmb` after the used index is seen.
+//! coherent (virtio_net::host); the books and the barriers are the
+//! library's rings (`virtio_net::rings`), and this module adds the share of
+//! a step, the counters and the loopback.
 
 use crate::dma::{Host, net_at};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::{is_dhcp_client_frame, second_device_takes};
-use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
+use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
+use virtio_net::rings::Sent;
 
 /// The device that serves the sockets and the loopback; the second device
 /// (`D` = 1) only runs DHCP.
@@ -58,13 +60,11 @@ unsafe fn buffer_at<'a, const D: usize>(n: u16) -> &'a mut [u8] {
     unsafe { core::slice::from_raw_parts_mut((net_at(D) + offset(n)) as *mut u8, BUFFER_LEN) }
 }
 
-/// The ring of receiving.
+/// The ring of receiving (`virtio_net::RxRing`) with the share of the step
+/// and the counters of the service.
 pub struct RxRing<const D: usize = 0> {
-    pub queue: Queue<D>,
-    book: RxBook,
+    pub ring: virtio_net::RxRing<Host<D>>,
     budget: Budget,
-    /// Buffers went back in since the last doorbell.
-    pub dirty: bool,
     dropped: u64,
     frames: u64,
     /// Frames of 127.0.0.0/8 that came from the device.
@@ -74,10 +74,8 @@ pub struct RxRing<const D: usize = 0> {
 impl<const D: usize> RxRing<D> {
     pub fn new(queue: Queue<D>) -> RxRing<D> {
         RxRing {
-            queue,
-            book: RxBook::new(),
+            ring: virtio_net::RxRing::new(queue, net_at(D)),
             budget: Budget::new(),
-            dirty: false,
             dropped: 0,
             frames: 0,
             martian: 0,
@@ -86,22 +84,15 @@ impl<const D: usize> RxRing<D> {
 
     /// Puts buffer `n` in the queue.
     pub(crate) fn give(&mut self, n: u16) {
-        // SAFETY: the device does not hold the buffer (the books say so:
-        // it is new or was popped), and nothing else refers to it until
-        // `pop_used` returns it.
-        let slice = unsafe { buffer_at::<D>(n) };
-        // SAFETY: the buffer stays untouched until `take` pops it.
-        let token = unsafe { self.queue.add(&[], &mut [slice]) };
-        match token {
-            Ok(token) if self.book.put(token, n) => self.dirty = true,
-            _ => fail("the ring of receiving refused a buffer"),
+        if let Err(broken) = self.ring.give(n) {
+            fail(broken.text(false));
         }
     }
 
     /// Fills the queue with every receive buffer, at the start.
     pub fn fill(&mut self) {
-        for n in 0..RX_BUFFERS as u16 {
-            self.give(n);
+        if let Err(broken) = self.ring.fill(RX_BUFFERS) {
+            fail(broken.text(false));
         }
     }
 
@@ -131,24 +122,18 @@ impl<const D: usize> RxRing<D> {
     /// that are dropped cannot hold a step.
     pub(crate) fn pop(&mut self) -> Option<(u16, usize)> {
         loop {
-            if self.budget.rx_left() == 0 || !self.queue.can_pop() {
+            if self.budget.rx_left() == 0 {
                 return None;
             }
-            // The device wrote the used index after the buffer.
-            rt::dma::rmb();
-            let token = self.queue.peek_used()?;
-            let Some(n) = self.book.take(token) else {
-                fail("a used buffer the ring of receiving does not hold");
-            };
-            // SAFETY: the device returned the buffer (it is used).
-            let slice = unsafe { buffer_at::<D>(n) };
-            // SAFETY: the same buffer `give` added with this token.
-            let popped = unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) };
-            let Ok(used) = popped else {
-                fail("a used buffer could not be taken back");
+            let (n, used) = match self.ring.pop() {
+                Ok(Some(popped)) => popped,
+                Ok(None) => return None,
+                Err(broken) => fail(broken.text(false)),
             };
             self.budget.take_rx();
-            match frames::classify(slice, used as usize) {
+            // SAFETY: the device returned the buffer (it is used).
+            let slice = unsafe { buffer_at::<D>(n) };
+            match frames::classify(slice, used) {
                 // A frame of the loopback network on the wire never reaches
                 // the stack (RFC 1122, 3.2.1.3).
                 frames::RxFrame::Martian => {
@@ -168,12 +153,11 @@ impl<const D: usize> RxRing<D> {
     }
 }
 
-/// The ring of sending.
+/// The ring of sending (`virtio_net::TxRing`, with its pool of buffers) with
+/// the share of the step and the counters of the service.
 pub struct TxRing<const D: usize = 0> {
-    pub queue: Queue<D>,
-    book: TxBook,
+    pub ring: virtio_net::TxRing<Host<D>>,
     budget: Budget,
-    pub dirty: bool,
     counters: Counters,
     /// The probe's test of the timers: the next frames of the loopback that
     /// go nowhere (the build with the feature `probe` only sets it).
@@ -183,15 +167,10 @@ pub struct TxRing<const D: usize = 0> {
 }
 
 impl<const D: usize> TxRing<D> {
-    pub fn new(mut queue: Queue<D>) -> TxRing<D> {
-        // No interrupt for sent buffers: the step takes them back
-        // (Virtio 1.2, 5.1.6.2.3).
-        queue.set_dev_notify(false);
+    pub fn new(queue: Queue<D>) -> TxRing<D> {
         TxRing {
-            queue,
-            book: TxBook::new(),
+            ring: virtio_net::TxRing::new(queue, net_at(D)),
             budget: Budget::new(),
-            dirty: false,
             counters: Counters::default(),
             drop_loop: 0,
             scratch: [0; MAX_FRAME],
@@ -206,7 +185,7 @@ impl<const D: usize> TxRing<D> {
     /// Whether the step may still send a frame: its share is not spent and a
     /// buffer is free.
     pub fn can_send(&self) -> bool {
-        self.budget.tx_left() > 0 && self.book.free() > 0
+        self.budget.tx_left() > 0 && self.ring.book.free() > 0
     }
 
     /// The frames the step sent.
@@ -224,49 +203,23 @@ impl<const D: usize> TxRing<D> {
     fn submit(&mut self, n: u16, len: usize) {
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer_at::<D>(n) };
-        frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
-        let Some(total) = frames::tx_prepare(slice, len) else {
-            self.book.release(n);
-            self.counters.dropped += 1;
-            return;
-        };
-        let dhcp = is_dhcp_client_frame(&slice[HDR_LEN..total]);
-        let shared: &[u8] = &slice[..total];
-        // SAFETY: the buffer is untouched until `reclaim` pops it.
-        let sent = unsafe { self.queue.add(&[shared], &mut []) };
-        match sent {
-            Ok(token) if self.book.sent(token, n) => {
+        let frame = &mut slice[HDR_LEN..HDR_LEN + len];
+        frames::fill_sums(frame);
+        let dhcp = is_dhcp_client_frame(frame);
+        match self.ring.submit(n, len) {
+            Ok(Sent::Queued) => {
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);
-                self.dirty = true;
             }
-            Ok(_) => fail("the ring of sending gave a token twice"),
-            Err(_) => {
-                self.book.release(n);
-                self.counters.dropped += 1;
-            }
+            Ok(Sent::Dropped) => self.counters.dropped += 1,
+            Err(broken) => fail(broken.text(true)),
         }
     }
 
     /// Takes back the buffers the device sent.
     pub fn reclaim(&mut self) {
-        while self.queue.can_pop() {
-            rt::dma::rmb();
-            let Some(token) = self.queue.peek_used() else {
-                break;
-            };
-            let Some(n) = self.book.reclaim(token) else {
-                fail("a used buffer the ring of sending does not hold");
-            };
-            // SAFETY: the device returned the buffer; the book gave it back
-            // to the pool just now and nothing uses it before this ends.
-            let slice = unsafe { buffer_at::<D>(n) };
-            // SAFETY: the buffer `consume` added with this token; only the
-            // number of descriptors of the chain matters to the crate.
-            let popped = unsafe { self.queue.pop_used(token, &[&slice[..HDR_LEN]], &mut []) };
-            if popped.is_err() {
-                fail("a sent buffer could not be taken back");
-            }
+        if let Err(broken) = self.ring.reclaim() {
+            fail(broken.text(true));
         }
     }
 }
@@ -469,14 +422,14 @@ impl<const D: usize> NetDevice<D> {
             f[28..32].copy_from_slice(&ip);
             f[32..38].copy_from_slice(&mac);
             f[38..42].copy_from_slice(&ip);
-            let Some(n) = self.tx.book.alloc() else {
+            let Some(n) = self.tx.ring.book.alloc() else {
                 continue;
             };
             // SAFETY: the buffer is the pool's and the device does not hold it.
             let slice = unsafe { buffer_at::<D>(n) };
             slice[HDR_LEN..HDR_LEN + f.len()].copy_from_slice(&f);
             if !self.looped.push(n, f.len()) {
-                self.tx.book.release(n);
+                self.tx.ring.book.release(n);
             }
         }
     }
@@ -494,7 +447,7 @@ impl<const D: usize> NetDevice<D> {
             if !self.tx.can_send() || !self.tx.budget.take_tx() {
                 break;
             }
-            let Some(n) = self.tx.book.alloc() else {
+            let Some(n) = self.tx.ring.book.alloc() else {
                 break;
             };
             let request = frames::arp_request(self.mac, sender, target);
@@ -514,7 +467,7 @@ impl<const D: usize> NetDevice<D> {
             fail("the list of returned buffers of the loop overflowed");
         }
         while let Some(n) = self.looped.take_returned() {
-            self.tx.book.release(n);
+            self.tx.ring.book.release(n);
         }
     }
 
@@ -614,10 +567,10 @@ impl<const D: usize> TxToken<'_, D> {
     {
         let ring = self.ring;
         while let Some(n) = self.looped.take_returned() {
-            ring.book.release(n);
+            ring.ring.book.release(n);
         }
         let spare = len <= MAX_FRAME && ring.budget.take_tx();
-        let n = if spare { ring.book.alloc() } else { None };
+        let n = if spare { ring.ring.book.alloc() } else { None };
         let Some(n) = n else {
             // No buffer or no share of the step left: the stack builds the
             // frame where it harms nothing, and the protocol repeats it
@@ -634,17 +587,17 @@ impl<const D: usize> TxToken<'_, D> {
             // The frame stays inside, in its buffer, for the next reception.
             if ring.drop_loop > 0 {
                 ring.drop_loop -= 1;
-                ring.book.release(n);
+                ring.ring.book.release(n);
                 return (result, false);
             }
             if !self.looped.push(n, len) {
                 ring.counters.dropped += 1;
-                ring.book.release(n);
+                ring.ring.book.release(n);
             }
             return (result, false);
         }
         if frames::martian(frame) {
-            ring.book.release(n);
+            ring.ring.book.release(n);
             ring.counters.martian += 1;
             return (result, false);
         }
@@ -692,7 +645,9 @@ impl<const D: usize> phy::Device for NetDevice<D> {
         // A frame of the loop that finds no place is lost, and a lost segment
         // of TCP costs a second of the retransmission timer: the frame of
         // sending waits for the step in which the loop has room.
-        if self.tx.budget.tx_left() == 0 || self.tx.book.free() == 0 || !self.looped.room_to_send()
+        if self.tx.budget.tx_left() == 0
+            || self.tx.ring.book.free() == 0
+            || !self.looped.room_to_send()
         {
             return None;
         }

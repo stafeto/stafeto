@@ -170,6 +170,7 @@ const RTC: Window = Window {
     name: "rtc",
     base: 0x0901_0000,
     len: PAGE,
+    duplicate: false,
 };
 
 /// The clock service with the window over the PL031, for the machines that

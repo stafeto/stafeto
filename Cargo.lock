@@ -295,6 +295,7 @@ dependencies = [
  "virtio-console",
  "virtio-drivers",
  "virtio-mmio",
+ "virtio-net",
  "virtio-pci",
  "virtio-rng",
 ]

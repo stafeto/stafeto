@@ -5,73 +5,19 @@
 //! of 12 bytes that a device with `VIRTIO_F_VERSION_1` puts before every
 //! frame it receives and wants before every frame it sends, then the
 //! Ethernet frame itself.
+//!
+//! The header and the checksums are the library's (`virtio_net::frames`);
+//! this module holds what the service decides from a frame: whom it is
+//! for, where a frame of the stack goes, and what never reaches the wire.
 
-/// The bytes of `struct virtio_net_hdr` under `VIRTIO_F_VERSION_1`: flags,
-/// gso_type, hdr_len, gso_size, csum_start, csum_offset and num_buffers
-/// (Virtio 1.2, 5.1.6). The field num_buffers is there without
-/// `VIRTIO_NET_F_MRG_RXBUF` too (the device sets it to 1). A header taken
-/// for 10 bytes, the legacy layout, shifts every frame by two bytes.
-pub const HDR_LEN: usize = 12;
-/// The offset of num_buffers in the header.
-pub const NUM_BUFFERS_AT: usize = 10;
-/// The most an Ethernet frame holds without a VLAN tag: 14 bytes of header
-/// and 1500 of payload.
-pub const MAX_FRAME: usize = 1514;
-/// The bytes of one buffer of a ring: the header and a frame, up to the
-/// next power of two (Virtio 1.2, 5.1.6.3 asks for at least 1526).
-pub const BUFFER_LEN: usize = 2048;
+pub use virtio_net::frames::{
+    BUFFER_LEN, HDR_LEN, Header, MAX_FRAME, NUM_BUFFERS_AT, checksum, fill_sums, ipv4_ends,
+    parse_header, rx_frame, tx_prepare, verify_sums,
+};
+use virtio_net::frames::{
+    ETHERNET_HEADER, ETHERTYPE_ARP, IPV4_PROTO_ICMP, IPV4_PROTO_TCP, IPV4_PROTO_UDP, packet,
+};
 
-const _: () = assert!(HDR_LEN + MAX_FRAME <= BUFFER_LEN);
-const _: () = assert!(NUM_BUFFERS_AT + 2 == HDR_LEN);
-
-/// The fields of the header of a received frame that the service looks at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Header {
-    pub flags: u8,
-    pub gso_type: u8,
-    pub num_buffers: u16,
-}
-
-/// The header at the start of `buffer`; None when fewer than HDR_LEN bytes.
-pub fn parse_header(buffer: &[u8]) -> Option<Header> {
-    let head = buffer.get(..HDR_LEN)?;
-    Some(Header {
-        flags: head[0],
-        gso_type: head[1],
-        num_buffers: u16::from_le_bytes([head[NUM_BUFFERS_AT], head[NUM_BUFFERS_AT + 1]]),
-    })
-}
-
-/// The Ethernet frame in a buffer the device filled with `used` bytes (the
-/// length the used ring reports): None for a buffer that holds no frame,
-/// is shorter than a header, or longer than the buffer or than a frame
-/// may be. The device sets num_buffers to 1 without MRG_RXBUF, and a frame
-/// with a header that says otherwise is dropped.
-pub fn rx_frame(buffer: &[u8], used: usize) -> Option<&[u8]> {
-    let whole = buffer.get(..used)?;
-    let header = parse_header(whole)?;
-    let frame = whole.get(HDR_LEN..)?;
-    if header.num_buffers > 1 || frame.is_empty() || frame.len() > MAX_FRAME {
-        return None;
-    }
-    Some(frame)
-}
-
-/// Writes the header of a frame to send into `buffer` (all of it zero: no
-/// checksum offload, no segmentation) and returns the bytes to give the
-/// device, header and frame. None for a frame past MAX_FRAME, an empty one,
-/// or a buffer too short.
-pub fn tx_prepare(buffer: &mut [u8], frame_len: usize) -> Option<usize> {
-    if frame_len == 0 || frame_len > MAX_FRAME || buffer.len() < HDR_LEN + frame_len {
-        return None;
-    }
-    buffer[..HDR_LEN].fill(0);
-    Some(HDR_LEN + frame_len)
-}
-
-const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
-const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
-const ETHERNET_HEADER: usize = 14;
 /// Where an ARP request's target protocol address is in the frame (RFC 826:
 /// the Ethernet header, 8 bytes of fixed fields, two addresses of hardware
 /// and one of protocol).
@@ -79,15 +25,6 @@ const ARP_TARGET: usize = ETHERNET_HEADER + 24;
 /// Where the sender protocol address of an ARP frame is.
 const ARP_SENDER: usize = ETHERNET_HEADER + 14;
 const ARP_REQUEST: u16 = 1;
-
-/// The source and destination of an Ethernet frame that carries IPv4.
-pub fn ipv4_ends(frame: &[u8]) -> Option<([u8; 4], [u8; 4])> {
-    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
-        return None;
-    }
-    let ip = &frame[ETHERNET_HEADER..];
-    Some((ip[12..16].try_into().ok()?, ip[16..20].try_into().ok()?))
-}
 
 /// Whether an IPv4 address is of the loopback network, 127.0.0.0/8 (RFC
 /// 1122, 3.2.1.3).
@@ -181,159 +118,6 @@ pub fn route(frame: &[u8], mac: [u8; 6], own: &[[u8; 4]]) -> Route {
         return Route::Loop;
     }
     Route::Wire
-}
-
-// ----- the checksums (RFC 1071) -----
-//
-// The interface tells smoltcp it need not compute or check any checksum
-// (`ChecksumCapabilities::ignored`), because the frames of the loopback never
-// leave the service. The frames of the wire get theirs here: `fill_sums` on
-// the way out, `verify_sums` on the way in.
-
-/// Adds `data` to the ones' complement sum `acc`, eight bytes at a time. The
-/// words are read big-endian, so the sum of 64-bit words is the sum of the
-/// 16-bit words of RFC 1071 (2^16 is 1 modulo 0xFFFF). A tail shorter than
-/// eight bytes is padded with zeros, which only the last piece may have.
-fn add(mut acc: u64, data: &[u8]) -> u64 {
-    let (words, tail) = data.as_chunks::<8>();
-    for chunk in words {
-        let (sum, carry) = acc.overflowing_add(u64::from_be_bytes(*chunk));
-        acc = sum + u64::from(carry);
-    }
-    if !tail.is_empty() {
-        let mut last = [0u8; 8];
-        last[..tail.len()].copy_from_slice(tail);
-        let (sum, carry) = acc.overflowing_add(u64::from_be_bytes(last));
-        acc = sum + u64::from(carry);
-    }
-    acc
-}
-
-/// The sum folded to 16 bits.
-fn fold(acc: u64) -> u16 {
-    let mut sum = (acc & 0xFFFF_FFFF) + (acc >> 32);
-    sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum as u16
-}
-
-/// The Internet checksum of `data`: the complement of the folded sum.
-pub fn checksum(data: &[u8]) -> u16 {
-    !fold(add(0, data))
-}
-
-const IPV4_PROTO_ICMP: u8 = 1;
-const IPV4_PROTO_TCP: u8 = 6;
-const IPV4_PROTO_UDP: u8 = 17;
-
-/// Where the parts of the IPv4 packet in an Ethernet frame are: the header
-/// length, the protocol and the length of the transport part. None for a frame
-/// that is no IPv4, or whose lengths do not fit it, or a fragment after the
-/// first (it has no transport header).
-struct Packet {
-    header: usize,
-    protocol: u8,
-    end: usize,
-    first_fragment: bool,
-}
-
-fn packet(frame: &[u8]) -> Option<Packet> {
-    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
-        return None;
-    }
-    let ip = &frame[ETHERNET_HEADER..];
-    let header = usize::from(ip[0] & 0x0f) * 4;
-    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-    if ip[0] >> 4 != 4 || header < 20 || total < header || total > ip.len() {
-        return None;
-    }
-    let fragment = u16::from_be_bytes([ip[6], ip[7]]);
-    Some(Packet {
-        header,
-        protocol: ip[9],
-        end: total,
-        first_fragment: fragment & 0x1fff == 0 && fragment & 0x2000 == 0,
-    })
-}
-
-/// The offset in the transport part of the checksum field, and whether the
-/// checksum covers the pseudo-header (RFC 793, 3.1; RFC 768; RFC 792).
-fn transport_sum(protocol: u8) -> Option<(usize, bool)> {
-    match protocol {
-        IPV4_PROTO_TCP => Some((16, true)),
-        IPV4_PROTO_UDP => Some((6, true)),
-        IPV4_PROTO_ICMP => Some((2, false)),
-        _ => None,
-    }
-}
-
-/// The sum of the transport part of the packet, with the pseudo-header when
-/// the protocol has one.
-fn transport_total(ip: &[u8], p: &Packet, pseudo: bool) -> u64 {
-    let part = &ip[p.header..p.end];
-    let mut acc = 0;
-    if pseudo {
-        let mut head = [0u8; 12];
-        head[..4].copy_from_slice(&ip[12..16]);
-        head[4..8].copy_from_slice(&ip[16..20]);
-        head[9] = p.protocol;
-        head[10..12].copy_from_slice(&(part.len() as u16).to_be_bytes());
-        acc = add(acc, &head);
-    }
-    add(acc, part)
-}
-
-/// Writes the checksums of the frame in place: the IPv4 header's and the
-/// transport's (TCP, UDP, ICMP). A UDP sum that comes out 0 goes as 0xFFFF
-/// (RFC 768). A frame that is no IPv4 stays as it is.
-pub fn fill_sums(frame: &mut [u8]) {
-    let Some(p) = packet(frame) else { return };
-    let ip = &mut frame[ETHERNET_HEADER..];
-    ip[10] = 0;
-    ip[11] = 0;
-    let header = checksum(&ip[..p.header]);
-    ip[10..12].copy_from_slice(&header.to_be_bytes());
-    let Some((at, pseudo)) = transport_sum(p.protocol) else {
-        return;
-    };
-    if !p.first_fragment || p.end < p.header + at + 2 {
-        return;
-    }
-    let field = p.header + at;
-    ip[field] = 0;
-    ip[field + 1] = 0;
-    let mut sum = !fold(transport_total(ip, &p, pseudo));
-    if sum == 0 && p.protocol == IPV4_PROTO_UDP {
-        sum = 0xFFFF;
-    }
-    ip[field..field + 2].copy_from_slice(&sum.to_be_bytes());
-}
-
-/// Whether the checksums of the frame hold: the IPv4 header's and the
-/// transport's. A UDP datagram with the sum 0 has none (RFC 768). A frame that
-/// is no IPv4, or whose lengths do not fit it, is not checked here (smoltcp
-/// refuses the second kind itself); an IPv4 frame with a wrong total length
-/// does not hold.
-pub fn verify_sums(frame: &[u8]) -> bool {
-    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
-        return true;
-    }
-    let Some(p) = packet(frame) else { return false };
-    let ip = &frame[ETHERNET_HEADER..];
-    if fold(add(0, &ip[..p.header])) != 0xFFFF {
-        return false;
-    }
-    let Some((at, pseudo)) = transport_sum(p.protocol) else {
-        return true;
-    };
-    if !p.first_fragment || p.end < p.header + at + 2 {
-        return true;
-    }
-    if p.protocol == IPV4_PROTO_UDP && ip[p.header + at..p.header + at + 2] == [0, 0] {
-        return true;
-    }
-    fold(transport_total(ip, &p, pseudo)) == 0xFFFF
 }
 
 /// Whom a received frame is for, as far as the headers say.
@@ -448,6 +232,7 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 
 #[cfg(test)]
 mod tests {
+
     #[test]
     fn an_arp_request_is_a_broadcast_who_has() {
         let f = super::arp_request([2, 0, 0, 0, 0, 1], [10, 0, 2, 15], [10, 0, 2, 2]);
@@ -459,61 +244,6 @@ mod tests {
     }
 
     use super::*;
-
-    fn frame_buffer(num_buffers: u16, frame: &[u8]) -> Vec<u8> {
-        let mut b = vec![0; HDR_LEN];
-        b[NUM_BUFFERS_AT..].copy_from_slice(&num_buffers.to_le_bytes());
-        b.extend_from_slice(frame);
-        b
-    }
-
-    #[test]
-    fn the_header_is_twelve_bytes_with_num_buffers_at_ten() {
-        assert_eq!(HDR_LEN, 12);
-        let b = frame_buffer(1, &[0xAA; 60]);
-        assert_eq!(parse_header(&b).map(|h| h.num_buffers), Some(1));
-        // The legacy 10-byte layout would put the frame's first bytes
-        // where num_buffers is.
-        assert_eq!(parse_header(&b[..HDR_LEN - 1]), None);
-    }
-
-    #[test]
-    fn a_frame_starts_after_the_header() {
-        let frame: Vec<u8> = (0..60).collect();
-        let b = frame_buffer(1, &frame);
-        assert_eq!(rx_frame(&b, b.len()), Some(&frame[..]));
-        // The buffer is bigger than the used length.
-        let mut big = b.clone();
-        big.resize(BUFFER_LEN, 0xEE);
-        assert_eq!(rx_frame(&big, b.len()), Some(&frame[..]));
-    }
-
-    #[test]
-    fn a_buffer_without_a_frame_is_dropped() {
-        let b = frame_buffer(1, &[1; 60]);
-        assert_eq!(rx_frame(&b, 0), None);
-        assert_eq!(rx_frame(&b, HDR_LEN), None, "a header and no frame");
-        assert_eq!(rx_frame(&b, HDR_LEN - 1), None);
-        assert_eq!(rx_frame(&b, b.len() + 1), None, "longer than the buffer");
-        let long = frame_buffer(1, &vec![1; MAX_FRAME + 1]);
-        assert_eq!(rx_frame(&long, long.len()), None);
-        let exact = frame_buffer(1, &vec![1; MAX_FRAME]);
-        assert!(rx_frame(&exact, exact.len()).is_some());
-        let merged = frame_buffer(2, &[1; 60]);
-        assert_eq!(rx_frame(&merged, merged.len()), None);
-    }
-
-    #[test]
-    fn a_frame_to_send_gets_a_zero_header() {
-        let mut b = vec![0xFF; BUFFER_LEN];
-        assert_eq!(tx_prepare(&mut b, 42), Some(HDR_LEN + 42));
-        assert!(b[..HDR_LEN].iter().all(|&x| x == 0));
-        assert_eq!(b[HDR_LEN], 0xFF, "the frame is the caller's");
-        assert_eq!(tx_prepare(&mut b, 0), None);
-        assert_eq!(tx_prepare(&mut b, MAX_FRAME + 1), None);
-        assert_eq!(tx_prepare(&mut b[..HDR_LEN + 41], 42), None);
-        assert_eq!(tx_prepare(&mut b, MAX_FRAME), Some(HDR_LEN + MAX_FRAME));
-    }
 
     fn ipv4_frame(src: [u8; 4], dst: [u8; 4], mac: [u8; 6]) -> Vec<u8> {
         let mut f = vec![0; 14 + 20 + 8];
@@ -560,45 +290,6 @@ mod tests {
         assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &own), Route::Wire);
         assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &[]), Route::Wire);
         assert_eq!(route(&[0; 5], mac, &own), Route::Wire);
-    }
-
-    /// The sum by the plain rule of RFC 1071: 16-bit words, one at a time.
-    fn plain(data: &[u8]) -> u16 {
-        let mut sum: u32 = 0;
-        for pair in data.chunks(2) {
-            let word = if pair.len() == 2 {
-                u16::from_be_bytes([pair[0], pair[1]])
-            } else {
-                u16::from_be_bytes([pair[0], 0])
-            };
-            sum += u32::from(word);
-        }
-        while sum > 0xFFFF {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        !(sum as u16)
-    }
-
-    #[test]
-    fn the_sum_agrees_with_the_plain_rule_on_every_length() {
-        // A small generator of bytes, fixed so that the test repeats.
-        let mut x: u32 = 0x1234_5678;
-        let mut data = Vec::new();
-        for _ in 0..1514 {
-            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            data.push((x >> 24) as u8);
-        }
-        for len in 0..=1514 {
-            assert_eq!(checksum(&data[..len]), plain(&data[..len]), "length {len}");
-        }
-        // All ones and all zeros.
-        assert_eq!(checksum(&[0xFF; 1500]), plain(&[0xFF; 1500]));
-        assert_eq!(checksum(&[0; 64]), 0xFFFF);
-        // The example of RFC 1071, section 3.
-        assert_eq!(
-            checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
-            !0xddf2u16
-        );
     }
 
     fn udp_frame(payload: &[u8]) -> Vec<u8> {
@@ -699,68 +390,6 @@ mod tests {
         assert!(!answered(Dest::Service, false, &more));
         assert!(!answered(Dest::Service, false, &[0; 10]));
         assert!(!answered(Dest::Service, false, &[]));
-    }
-
-    #[test]
-    fn a_frame_with_filled_sums_verifies() {
-        for len in [0usize, 1, 7, 8, 9, 300, 1460] {
-            let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
-            for mut frame in [udp_frame(&payload), tcp_frame(&payload)] {
-                fill_sums(&mut frame);
-                assert!(verify_sums(&frame), "length {len}");
-            }
-        }
-        // The header's sum of a known packet (RFC 1071 style check: the sum
-        // of the filled header is 0xFFFF).
-        let mut f = udp_frame(b"hello");
-        fill_sums(&mut f);
-        assert_eq!(fold(add(0, &f[14..34])), 0xFFFF);
-    }
-
-    #[test]
-    fn a_frame_with_a_bad_tcp_sum_is_dropped() {
-        let mut frame = tcp_frame(b"some bytes of data");
-        fill_sums(&mut frame);
-        assert!(verify_sums(&frame));
-        let last = frame.len() - 1;
-        frame[last] ^= 1;
-        assert!(!verify_sums(&frame), "a flipped bit in the data");
-        fill_sums(&mut frame);
-        frame[14 + 12] ^= 0x10;
-        assert!(
-            !verify_sums(&frame),
-            "a changed address breaks the header's sum"
-        );
-    }
-
-    #[test]
-    fn a_udp_datagram_without_a_sum_passes_and_a_zero_sum_goes_as_ones() {
-        let mut frame = udp_frame(b"abc");
-        fill_sums(&mut frame);
-        // The sum of the datagram is cleared by the sender: no sum.
-        frame[40] = 0;
-        frame[41] = 0;
-        assert!(verify_sums(&frame));
-        // A payload that makes the sum 0 is written as 0xFFFF.
-        let mut x = udp_frame(&[0, 0]);
-        for a in 0..=255u8 {
-            for b in 0..=255u8 {
-                x[42] = a;
-                x[43] = b;
-                fill_sums(&mut x);
-                assert_ne!(x[40..42], [0, 0], "{a} {b}");
-                assert!(verify_sums(&x));
-            }
-        }
-    }
-
-    #[test]
-    fn frames_that_are_no_ipv4_are_not_checked_and_a_wrong_length_does_not_hold() {
-        assert!(verify_sums(&arp_request([10, 0, 2, 2])));
-        let mut f = udp_frame(b"abc");
-        fill_sums(&mut f);
-        f[16] = 0xFF;
-        assert!(!verify_sums(&f));
     }
 
     #[test]

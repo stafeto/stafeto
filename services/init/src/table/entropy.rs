@@ -78,6 +78,7 @@ pub const RNG: Record = Record {
         name: "mmio",
         base: TRANSPORT & !(PAGE - 1),
         len: PAGE,
+        duplicate: false,
     }],
     bindings: &[Binding {
         name: "irq",
@@ -109,11 +110,13 @@ pub const RNG_VZ: Record = Record {
             name: "ecam",
             base: FUNCTION,
             len: PAGE,
+            duplicate: false,
         },
         Window {
             name: "bar",
             base: BAR,
             len: 8 * PAGE,
+            duplicate: false,
         },
     ],
     bindings: &[Binding {

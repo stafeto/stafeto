@@ -1145,10 +1145,12 @@ impl Init {
     /// The windows and the bindings of `record`, the windows first, for the
     /// service whose registered channel is `channel`: their names in
     /// `reply` and their handles in `handles`, in one order (spec 13.4). A
-    /// binding goes through `channel` with a slot at the service's base
-    /// priority. A window carries MAP_READ, MAP_WRITE and TRANSFER, a
-    /// binding MANAGE and TRANSFER: init keeps no copy, and each lives as
-    /// long as its one handle. The errors are those of the calls.
+    /// binding goes through `channel` (or a session of it with the label of
+    /// the binding, for a record with more than one) with a slot at the
+    /// service's base priority. A window carries MAP_READ, MAP_WRITE and
+    /// TRANSFER (and DUPLICATE when `Window::duplicate`), a binding MANAGE
+    /// and TRANSFER: init keeps no copy, and each lives as long as its one
+    /// handle. The errors are those of the calls.
     fn objects(
         &self,
         record: &Record,
@@ -1164,13 +1166,33 @@ impl Init {
         // The checks of the table keep them within one reply.
         for w in record.windows {
             let window = sys::device_window_create(&self.resource, w.base, w.len)?;
-            let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+            let mut rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+            if w.duplicate {
+                rights = rights | Rights::DUPLICATE;
+            }
             let only = sys::handle_duplicate(&window, rights)?;
             drop(window);
             let _ = handles.push(only.erase());
         }
-        for b in record.bindings {
-            let bound = sys::irq_bind(&self.resource, b.line, channel, record.priority, b.edge)?;
+        // The bindings of a record with more than one are made through a
+        // session of the channel with the label of each
+        // (table::binding_label): the kernel gives the interrupts of a
+        // line the label of the handle it was bound through, and the service
+        // tells its lines apart. The session goes right after; the binding
+        // keeps its label.
+        for (i, b) in record.bindings.iter().enumerate() {
+            let session = match table::binding_label(record, i) {
+                Some(label) => Some(sys::handle_label(
+                    channel,
+                    Rights::NOTIFY,
+                    label,
+                    record.priority,
+                )?),
+                None => None,
+            };
+            let through = session.as_ref().unwrap_or(channel);
+            let bound = sys::irq_bind(&self.resource, b.line, through, record.priority, b.edge)?;
+            drop(session);
             let only = sys::handle_duplicate(&bound, Rights::MANAGE | Rights::TRANSFER)?;
             drop(bound);
             let _ = handles.push(only.erase());

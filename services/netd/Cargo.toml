@@ -57,6 +57,8 @@ proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }
 proto-entropy = { path = "../../proto/entropy" }
 virtio-mmio = { path = "../../lib/virtio-mmio" }
+# The driver of the two devices: frames, books, rings, DMA, transports.
+virtio-net = { path = "../../lib/virtio-net" }
 virtio-pci = { path = "../../lib/virtio-pci" }
 
 # The numbers of the neighbours on VZ's bus that the BARs of `pci` go past.
