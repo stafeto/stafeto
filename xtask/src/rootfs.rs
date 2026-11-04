@@ -281,6 +281,8 @@ const SYSTEM_PATHS: [&str; 37] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/resolv.conf",
+    // The image on VZ with a static address for its second device.
+    "/etc/netd.conf",
     // The image with the network service: the page `httpd` serves and the
     // probe of the sockets.
     "/www",
