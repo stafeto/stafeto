@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 33] = [
+const SYSTEM_PATHS: [&str; 36] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -281,6 +281,11 @@ const SYSTEM_PATHS: [&str; 33] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/resolv.conf",
+    // The image with the network service: the page `httpd` serves and the
+    // probe of the sockets.
+    "/www",
+    "/www/index.html",
+    "/bin/net-sock",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
