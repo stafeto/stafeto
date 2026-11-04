@@ -4598,6 +4598,27 @@ impl Service<0> for Processes {
                     Err(code) => refuse(code),
                 }
             }
+            n if n == Method::SetGroups as u16 => {
+                let (Ok(groups), Ok(())) = (proto_process::Groups::read(&mut body), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self
+                    .records
+                    .set_groups(index, groups, self.generations.get(index))
+                {
+                    Ok(changed) => {
+                        // As for Change: the services that remember the
+                        // credentials see the generation move before the
+                        // caller's reply.
+                        if changed {
+                            self.generations.raise(index);
+                        }
+                        Answer::Status(Status::Ok)
+                    }
+                    Err(code) => refuse(code),
+                }
+            }
             n if n == Method::Change as u16 => {
                 let (Ok(operation), Ok(id)) = (body.u32(), body.u32()) else {
                     return Answer::Status(Status::BadSize);

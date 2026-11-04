@@ -154,7 +154,10 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # F_SETOWN and F_GETOWN, TCP_CORK, POLLRDHUP, writev of a stream socket asks
 # the layer's stafeto_writev_socket first (one send for all the parts); tagged
 # pin-0ea4997a.
-COMMIT = "0ea4997ab8d8ecdb6e004e13f6c15fd4f98cb165"
+# setgroups goes to the layer, which has the process service keep the list
+# (nginx's workers drop root's groups by initgroups); the head of the branch
+# net-p4b2 of the fork until it merges.
+COMMIT = "936c777262f50acad1b56d2cf1aebbc3c9c334c0"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

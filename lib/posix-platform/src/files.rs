@@ -1040,6 +1040,29 @@ pub unsafe extern "C" fn stafeto_getgroups(size: c_int, out: *mut u32) -> c_int 
     })) as c_int
 }
 
+/// setgroups: the process service keeps the list (EPERM for a caller that
+/// is not the superuser, EINVAL above 16 groups).
+///
+/// # Safety
+/// `list` holds `size` readable gid_t values when size is positive.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_setgroups(size: usize, list: *const u32) -> c_int {
+    value(call(|| {
+        if size > proto_process::SUPPLEMENTARY_MAX {
+            return Err(EINVAL);
+        }
+        if size != 0 && list.is_null() {
+            return Err(EFAULT);
+        }
+        let list = if size == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(list, size) }
+        };
+        posix_abi::resources::set_groups(list).map(|()| 0)
+    })) as c_int
+}
+
 /// relibc's struct utsname: six fields of 65 bytes.
 const UTS: usize = 65;
 

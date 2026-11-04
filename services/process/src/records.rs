@@ -291,6 +291,34 @@ impl<P> Records<P> {
         record.limits.values[resource] = value;
         Ok(true)
     }
+    /// setgroups: the superuser's (effective user ID 0) only, and a valid
+    /// list. Whether the list changed (the generation of the credentials
+    /// moves then).
+    pub fn set_groups(
+        &mut self,
+        index: usize,
+        groups: proto_process::Groups,
+        generation: u64,
+    ) -> Result<bool, u32> {
+        if !groups.valid() {
+            return Err(proto_process::INVALID);
+        }
+        if generation & proto_process::GENERATION_DEAD != 0 {
+            return Err(proto_process::NO_PROCESS);
+        }
+        let record = self.get_mut(index).ok_or(proto_process::NO_PROCESS)?;
+        if record.credentials.euid != 0 {
+            return Err(proto_process::PERMISSION);
+        }
+        if record.groups == groups {
+            return Ok(false);
+        }
+        if !proto_process::generation_room(generation, 1) {
+            return Err(proto_process::AGAIN);
+        }
+        record.groups = groups;
+        Ok(true)
+    }
     /// What `new` makes, in place in zeroed memory (the service's `.bss`).
     ///
     /// # Safety
@@ -1952,6 +1980,39 @@ mod tests {
             .set_limit(ci, NOFILE, Limit { soft: 16, hard: 16 }, 1)
             .unwrap();
         assert_eq!(records.get(i).unwrap().limits, inherited);
+    }
+    #[test]
+    fn groups_are_the_superusers_to_set_and_a_child_takes_them() {
+        use proto_process::Groups;
+        let mut records = Records::<u32>::new();
+        let parent = add(&mut records).unwrap();
+        let i = parent.index as usize;
+        let mut nobody = Groups::EMPTY;
+        nobody.count = 1;
+        nobody.ids[0] = 65534;
+        let before = records.get(i).unwrap().groups;
+        records.get_mut(i).unwrap().credentials.euid = 1000;
+        assert_eq!(
+            records.set_groups(i, nobody, 1),
+            Err(proto_process::PERMISSION)
+        );
+        assert_eq!(records.get(i).unwrap().groups, before);
+        records.get_mut(i).unwrap().credentials.euid = 0;
+        let mut bad = nobody;
+        bad.ids[1] = 7;
+        assert_eq!(records.set_groups(i, bad, 1), Err(proto_process::INVALID));
+        assert_eq!(
+            records.set_groups(i, nobody, proto_process::GENERATION_DEAD - 1),
+            Err(proto_process::AGAIN)
+        );
+        assert_eq!(records.get(i).unwrap().groups, before);
+        assert_eq!(records.set_groups(i, nobody, 1), Ok(true));
+        assert_eq!(records.get(i).unwrap().groups, nobody);
+        assert_eq!(records.set_groups(i, nobody, 1), Ok(false));
+        let child = child(&mut records, parent);
+        assert_eq!(records.get(child.index as usize).unwrap().groups, nobody);
+        assert_eq!(records.set_groups(i, Groups::EMPTY, 1), Ok(true));
+        assert_eq!(records.get(i).unwrap().groups, Groups::EMPTY);
     }
     #[test]
     fn memlock_is_the_records_own_and_a_child_takes_it() {
