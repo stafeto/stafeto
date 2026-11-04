@@ -56,7 +56,8 @@ pub const DMA: &[Dma] = &[
     },
 ];
 
-/// The network service.
+/// The network service (the same record in the image of the shell and in the
+/// images of the probe: its `.bss` is the same in both).
 pub const NETD: Record = Record {
     name: NET_SERVICE,
     program: "netd",
@@ -66,11 +67,18 @@ pub const NETD: Record = Record {
     }),
     priority: 35,
     ceiling: 35,
-    // Measured: the probe's runs pass with 24 pages and fail with 16 (the
-    // pages the service touches: the stack, the table of the files read at
-    // the start, the data); 64 leave the code paths of this stage room.
-    quota: 64 * PAGE,
-    handle_limit: 64,
+    // The worst case, by the formula of the stage (reports/2026-11-04-net-p1a):
+    // the pages of `.data` and `.bss` of the release build (the pool of
+    // buffers is 2 048 of them), the whole stack of 32 pages and 16 for the
+    // rest. `.bss` 8 922 225 bytes = 2 178 pages, `.data` none: 2 178 + 32 +
+    // 16. The kernel does not charge the pages of `.bss` to the quota in the
+    // probe's runs (the table filled to 256 places passes with 32 pages and
+    // fails to start with 24, where the page tables of the mappings do not
+    // fit), so the number is a bound that the measurement does not reach.
+    quota: 2226 * PAGE,
+    // 128 operations' handles of notification, the notary session, the page
+    // of generations, and a reserve.
+    handle_limit: 192,
     restart: Restart::Always,
     console: true,
     log: false,
@@ -103,17 +111,53 @@ pub const NETD: Record = Record {
     cpus: NETD_CPUS,
 };
 
-/// The probe (tests/net-probe, roles `c` and `k`): the interface's address
-/// and 300 pings of the gateway, then CRASH of the service and the same
-/// again through a new session.
+/// The roles of the probe (tests/net-probe): `c` the interface's address and
+/// 300 pings of the gateway, `b` the registry of ports and the sessions, `sN`
+/// N places of the table at once (the digits are N) and 50 pings, `e` the
+/// rates of the loopback, `f` the full batch of a step after a hold of the
+/// service, `a` every group of sockets with work at once, `w` sixteen and
+/// then 128 operations told by one datagram, `i` 150 s of idle, `l` a queue of
+/// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
+/// fill a frame, `k` CRASH of the service and the same as `c` through a new
+/// session. The images of the measurement of the steps (`net-sockets-N`) run
+/// `s` at 8, 64 and 256 places; the others at the limit of the sockets the
+/// service serves (netd::places::SOCKETS_LIMIT, which a test of xtask
+/// compares with the number here).
+pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
+    b"cs8k"
+} else if cfg!(feature = "net-sockets-64") {
+    b"cs64k"
+} else if cfg!(feature = "net-sockets-256") {
+    b"cs256k"
+} else if cfg!(feature = "net-echo") {
+    b"cek"
+} else if cfg!(feature = "net-full-batch") {
+    b"cfk"
+} else if cfg!(feature = "net-all-groups") {
+    b"cak"
+} else if cfg!(feature = "net-wakes") {
+    b"cwk"
+} else if cfg!(feature = "net-wire") {
+    b"cuk"
+} else if cfg!(feature = "net-idle") {
+    b"cik"
+} else if cfg!(feature = "net-listen") {
+    b"clk"
+} else if cfg!(feature = "net-timers") {
+    b"crk"
+} else {
+    b"cbs256k"
+};
+
+/// The probe (tests/net-probe).
 pub const PROBE: Record = Record {
     name: "net-probe",
     program: "net-probe",
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 32 * PAGE,
-    handle_limit: 32,
+    quota: 64 * PAGE,
+    handle_limit: 64,
     restart: Restart::Never,
     console: true,
     log: false,
@@ -121,7 +165,7 @@ pub const PROBE: Record = Record {
     windows: &[],
     bindings: &[],
     connects: &[NET_SERVICE],
-    args: b"ck",
+    args: ROLES,
     dma: &[],
     quiesce: &[],
     trusted: false,
@@ -149,16 +193,38 @@ pub const NET_TABLE: &[Record] = &[
     NETD,
 ];
 
+/// The CPUs of the services and the probe in the images of the measurement of
+/// the steps (`net-alone`): the network service has CPU 0 to itself, so that
+/// the longest step it measures holds no time of another process (the
+/// preemption of a service by others belongs to the analysis of response
+/// time). The image runs on two CPUs. The measurement does not use it: under
+/// -icount the counter holds the instructions of all the CPUs.
+const OTHERS_CPUS: u8 = 0b0010;
+
+const fn on(r: Record, cpus: u8) -> Record {
+    Record { cpus, ..r }
+}
+
 /// The images of the probe, which differ in the files of the RAM service
 /// and in the features of the service: the RAM files, the entropy device's
 /// driver and service, the network service and the probe.
-pub const NET_PROBE_TABLE: &[Record] = &[
-    super::ramfs::RAM_LEGACY,
-    super::entropy::RNG,
-    super::entropy::ENTROPY,
-    NETD,
-    PROBE,
-];
+pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-alone") {
+    &[
+        super::ramfs::RAM_LEGACY,
+        on(super::entropy::RNG, OTHERS_CPUS),
+        on(super::entropy::ENTROPY, OTHERS_CPUS),
+        NETD,
+        on(PROBE, OTHERS_CPUS),
+    ]
+} else {
+    &[
+        super::ramfs::RAM_LEGACY,
+        super::entropy::RNG,
+        super::entropy::ENTROPY,
+        NETD,
+        PROBE,
+    ]
+};
 
 // The profile of the boot files goes to the network service.
 const _: () = {

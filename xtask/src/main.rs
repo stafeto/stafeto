@@ -1655,10 +1655,13 @@ commands:
   input-probe [--hvf] run the probe of the input service in QEMU: keys sent
             by the monitor reach the focus, the owner of the screen has it,
             and the service's steps under -icount; with --hvf under HVF
-  net-probe [MACHINE] run the probe of the network service in QEMU on the user
-            network (MACHINE is tcg or hvf): the address by DHCP and by file,
-            300 pings of the gateway, a restart of the service, and its
-            steps under -icount (TCG only)
+  net-probe [steps] [MACHINE] run the probe of the network service in QEMU on
+            the user network (MACHINE is tcg or hvf): the address by DHCP and
+            by file, 300 pings of the gateway, the registry of ports, the table
+            of sockets filled to its limit with data on the loopback, a restart
+            of the service, and its steps under -icount (TCG only); on hvf the
+            rates of the loopback; with `steps` the measurement that chooses
+            the frames of a step and the limit of the sockets (TCG only)
   net [--machine hvf] run the shell with the network service on the terminal;
             ports 8080 and 2222 of the host are forwarded to 80 and 22
   posix-random run the C probe of getentropy, getrandom and fork in QEMU

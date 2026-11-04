@@ -14,7 +14,6 @@ bench = false
 
 [dependencies]
 abi = { path = "../../lib/abi" }
-netd = { path = "../../services/netd" }
 proto-init = { path = "../../proto/init" }
 proto-net = { path = "../../proto/net" }
 proto-wire = { path = "../../proto/wire" }

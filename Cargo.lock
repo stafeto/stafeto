@@ -268,7 +268,6 @@ name = "net-probe"
 version = "0.1.0"
 dependencies = [
  "abi",
- "netd",
  "proto-init",
  "proto-net",
  "proto-wire",
@@ -286,6 +285,8 @@ dependencies = [
  "proto-fs",
  "proto-init",
  "proto-net",
+ "proto-pipe",
+ "proto-process",
  "proto-wire",
  "rt",
  "smoltcp",
@@ -1229,6 +1230,7 @@ dependencies = [
  "bootimg",
  "entries",
  "kcore",
+ "netd",
  "posix-fd",
  "posix-types",
  "proto-fs",

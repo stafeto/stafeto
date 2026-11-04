@@ -6,25 +6,7 @@
 
 use core::fmt;
 
-/// An IPv4 address in decimal with dots.
-pub struct Ip(pub [u8; 4]);
-
-impl fmt::Display for Ip {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [a, b, c, d] = self.0;
-        write!(f, "{a}.{b}.{c}.{d}")
-    }
-}
-
-/// A MAC address as six pairs of hex digits.
-pub struct Mac(pub [u8; 6]);
-
-impl fmt::Display for Mac {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [a, b, c, d, e, g] = self.0;
-        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
-    }
-}
+pub use proto_net::text::{Ip, Mac};
 
 /// What a lease or a static address says, as one line follows its word:
 /// `10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3`; an absent field is `none`.

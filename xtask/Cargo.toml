@@ -11,6 +11,7 @@ publish = false
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 kcore = { path = "../kcore" }
+netd = { path = "../services/netd" }
 rtc = { path = "../lib/rtc" }
 
 [dev-dependencies]

@@ -5,17 +5,44 @@
 //! numbers of its methods, which never change once given, its codes and the
 //! bodies of its requests. Every number goes low byte first.
 //!
-//! The numbers of all the methods of the service are fixed here at once;
-//! the first stage of the service answers CONFIG, and PING and CRASH in a
-//! build with the feature `probe`. A method of a later stage takes the
-//! next free number between 27 and 61. All the numbers are below 64: the
-//! steps of the service loop count the methods up to the notice at 64.
+//! The numbers of all the methods of the service are fixed here at once.
+//! The first stage answers CONFIG, and PING and CRASH in a build with the
+//! feature `probe`; the second answers the sockets' methods of TCP and UDP
+//! over IPv4, with a loopback. A method of a later stage takes the next free
+//! number between 32 and 61. All the numbers are below 64: the steps of the
+//! service loop count the methods up to the notice at 64.
 //!
-//! | Method | Request | Reply | Refusals |
-//! |---|---|---|---|
-//! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes | NET_DOWN while there is no address |
-//! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds) | NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
-//! | CRASH (63) | the header alone | none: the service ends with a fault | only a service built with the feature `probe` has it |
+//! A socket is a description, one u32 on the wire: the place in the
+//! service's table (bits 0-11) and the generation of the place (bits 12-31,
+//! never 0). A long operation (CONNECT, ACCEPT, SEND, RECV, WATCH) is in two
+//! steps as `proto_wire::long` has it: the start answers READY with the
+//! result, or WAIT k; `*_TAKE` repeats the operation by its key k and answers
+//! READY, or ARMED. `[k]` below is that u64 key, in a `*_TAKE` alone.
+//!
+//! | Method | Request | Reply |
+//! |---|---|---|
+//! | SOCKET (1) | family (u32, INET), kind (u32, STREAM 1 or DGRAM 2), flags (u32, NONBLOCK 1) | status, description |
+//! | BIND (2) | description, `Address`; a handle (a copy of the identity session) for a port below 1024 | status |
+//! | LISTEN (3) | description, backlog (u32, held to 1..=16) | status |
+//! | CONNECT (4), CONNECT_TAKE (5) | [k], description, `Address` | long: READY with no data |
+//! | ACCEPT (6), ACCEPT_TAKE (7) | [k], description, flags (u32, NONBLOCK for the new one) | long: READY description, `Address` of the peer |
+//! | SEND (8), SEND_TAKE (9) | [k], description, flags (u32, DONTWAIT 2), `Address` (family 0 when connected), then 0..=800 bytes | long: READY bytes taken (u32) |
+//! | RECV (10), RECV_TAKE (11) | [k], description, flags (u32, PEEK 1, DONTWAIT 2), most (u32, 1..=800) | long: READY flags (u32, OUT_TRUNC 1), `Address` of the sender, bytes |
+//! | SHUTDOWN (12) | description, how (u32: 0 read, 1 write, 2 both) | status |
+//! | CLOSE (13) | description, linger (u32, 0 alone) | status |
+//! | GETOPT (14) | description, name (u32) | status, value (u32) |
+//! | SETOPT (15) | description, name, value (u32 each) | status |
+//! | NAME (16) | description, whose (u32: 0 own, 1 the peer's) | status, `Address` |
+//! | WATCH (17), WATCH_TAKE (28), WATCH_CANCEL (29) | `proto_wire::watch` | as the terminal service's |
+//! | ABANDON (18) | the header alone | status |
+//! | CLONE (19) | count (u32, 0..=64), descriptions | status, one handle: the new session |
+//! | CLONE_MORE (20) | taken, its body is a later stage's | UNKNOWN_METHOD |
+//! | CANCEL (27) | k (u64) | long: CANCELLED |
+//! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
+//! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
+//! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address), 3 drops the next frame the stack sends to itself (a test of the timers); only a service built with the feature `probe` has it | status |
+//! | PING_WIRE (31) | as PING; the echo request carries 1 472 bytes, a frame of 1 514; only a service built with the feature `probe` has it | as PING |
+//! | CRASH (63) | the header alone | none: the service ends with a fault; only a service built with the feature `probe` has it |
 //!
 //! An address on the wire is the family (u32, INET = 2 for IPv4; 0 for
 //! none), the port (u32) and 16 bytes of address, the IPv4 address in the
@@ -23,14 +50,16 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod sockets;
+pub mod text;
+
 use abi::Error;
 use proto_wire::{Header, Reader, Status, Writer};
 
 /// The version of the protocol, in the header of each request.
 pub const VERSION: u16 = 1;
 
-/// The methods with their numbers. The names of the sockets' methods are
-/// those of the service's design; the first stage answers three of them.
+/// The methods with their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Socket = 1,
@@ -59,12 +88,17 @@ pub enum Method {
     Adopt = 24,
     Buffer = 25,
     Claim = 26,
+    Cancel = 27,
+    WatchTake = 28,
+    WatchCancel = 29,
+    Hold = 30,
+    PingWire = 31,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 28] = [
+    pub const ALL: [Method; 33] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -91,6 +125,11 @@ impl Method {
         Method::Adopt,
         Method::Buffer,
         Method::Claim,
+        Method::Cancel,
+        Method::WatchTake,
+        Method::WatchCancel,
+        Method::Hold,
+        Method::PingWire,
         Method::Ping,
         Method::Crash,
     ];
@@ -112,10 +151,17 @@ impl Method {
 /// The codes of the service. Those that mean what a code of the pipe
 /// service's sockets means (proto_pipe) have its number; the others follow
 /// 723, the last of the sockets' codes, and are free in every protocol.
+pub const BAD_FD: u32 = 701;
+pub const AGAIN: u32 = 702;
 pub const MFILE: u32 = 705;
+pub const INVALID: u32 = 706;
 pub const IN_USE: u32 = 708;
 pub const NOT_CONNECTED: u32 = 709;
+pub const CONNECTED: u32 = 710;
 pub const REFUSED: u32 = 711;
+pub const BAD_TYPE: u32 = 713;
+pub const NOT_SUPPORTED: u32 = 714;
+pub const NO_ADDRESS: u32 = 715;
 pub const TOO_BIG: u32 = 716;
 pub const NO_BUFFERS: u32 = 717;
 pub const NO_OPTION: u32 = 718;
@@ -133,11 +179,18 @@ pub const IN_PROGRESS: u32 = 730;
 
 /// Every code of the service, for the checks that none repeats and none
 /// is a code of the wire (below 512).
-pub const CODES: [u32; 17] = [
+pub const CODES: [u32; 24] = [
+    BAD_FD,
+    AGAIN,
     MFILE,
+    INVALID,
     IN_USE,
     NOT_CONNECTED,
+    CONNECTED,
     REFUSED,
+    BAD_TYPE,
+    NOT_SUPPORTED,
+    NO_ADDRESS,
     TOO_BIG,
     NO_BUFFERS,
     NO_OPTION,
@@ -166,6 +219,35 @@ pub fn check_version(header: Header) -> Result<(), Status> {
         Ok(())
     } else {
         Err(Status::BadVersion)
+    }
+}
+
+/// The bytes of data one SEND or RECV carries at most: the longest body
+/// (SEND_TAKE: header 8, key 8, description 4, flags 4, address 24, data)
+/// and the longest reply (RECV: status 4, READY 4, flags 4, address 24,
+/// data) stay below MESSAGE_MAX.
+pub const DATA_MAX: usize = 800;
+
+/// The values of HOLD's argument.
+pub const HOLD_OFF: u32 = 0;
+pub const HOLD_ON: u32 = 1;
+pub const HOLD_ADDRESS: u32 = 2;
+/// The next frame the stack sends to itself goes nowhere (a test of the timers).
+pub const HOLD_DROP: u32 = 3;
+
+/// The request HOLD with its argument.
+pub fn write_hold(value: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Hold.header().write(w)?;
+    w.u32(value)
+}
+
+/// The argument of HOLD from `body`: BAD_SIZE unless it is one of the three.
+pub fn read_hold(mut body: Reader<'_>) -> Result<u32, Status> {
+    let value = body.u32()?;
+    body.finish()?;
+    match value {
+        HOLD_OFF | HOLD_ON | HOLD_ADDRESS | HOLD_DROP => Ok(value),
+        _ => Err(Status::BadSize),
     }
 }
 
@@ -247,6 +329,18 @@ impl Address {
 /// The request PING: the header and the address to ping, port 0.
 pub fn write_ping(address: &Address, w: &mut Writer) -> Result<(), Status> {
     Method::Ping.header().write(w)?;
+    address.write(w)
+}
+
+/// The data of the echo request of PING_WIRE: a full frame of Ethernet (the
+/// IPv4 packet of 1 500 bytes holds 20 of header, 8 of ICMP and this).
+pub const PING_WIRE_DATA: usize = 1472;
+
+/// The request PING_WIRE (builds with the feature `probe` only): as PING, with
+/// an echo request that fills a frame of 1 514 bytes, to measure the cost of
+/// a frame of the wire.
+pub fn write_ping_wire(address: &Address, w: &mut Writer) -> Result<(), Status> {
+    Method::PingWire.header().write(w)?;
     address.write(w)
 }
 
@@ -372,14 +466,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=26).collect();
+        let mut expected: Vec<u16> = (1..=31).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(27), None);
+        assert_eq!(Method::from_number(32), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
@@ -389,6 +483,13 @@ mod tests {
     fn the_codes_agree_with_the_pipe_service_and_are_apart_from_the_wire() {
         use proto_pipe::sock;
         assert_eq!(MFILE, proto_pipe::MFILE);
+        assert_eq!(BAD_FD, proto_pipe::BAD_FD);
+        assert_eq!(AGAIN, proto_pipe::AGAIN);
+        assert_eq!(INVALID, proto_pipe::INVALID);
+        assert_eq!(CONNECTED, sock::CONNECTED);
+        assert_eq!(BAD_TYPE, sock::BAD_TYPE);
+        assert_eq!(NOT_SUPPORTED, sock::NOT_SUPPORTED);
+        assert_eq!(NO_ADDRESS, sock::NO_ADDRESS);
         assert_eq!(IN_USE, sock::IN_USE);
         assert_eq!(NOT_CONNECTED, sock::NOT_CONNECTED);
         assert_eq!(REFUSED, sock::REFUSED);
@@ -513,6 +614,22 @@ mod tests {
         let mut wide = body;
         wide[8 + 4] = 1;
         assert_eq!(read_ping(Reader::new(&wide)), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn hold_round_trips_and_takes_four_values() {
+        for value in [HOLD_OFF, HOLD_ON, HOLD_ADDRESS, HOLD_DROP] {
+            let mut w = Writer::new();
+            write_hold(value, &mut w).unwrap();
+            let mut r = Reader::new(w.as_bytes());
+            assert_eq!(Header::read(&mut r).unwrap(), Method::Hold.header());
+            assert_eq!(read_hold(r), Ok(value));
+        }
+        assert_eq!(
+            read_hold(Reader::new(&4u32.to_le_bytes())),
+            Err(Status::BadSize)
+        );
+        assert_eq!(read_hold(Reader::new(&[1, 0])), Err(Status::BadSize));
     }
 
     #[test]
