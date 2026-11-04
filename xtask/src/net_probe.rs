@@ -230,6 +230,7 @@ const WIRE_ECHO_OK: &str = "net-probe: wire echo ok 2000";
 const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
 const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
 const EPOLL_OK: &str = "net-probe: epoll ok";
+const PASSES_OK: &str = "net-probe: passes ok";
 const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
 const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
@@ -258,9 +259,12 @@ const CLONE_KIND: usize = 19;
 const CLONE_MORE_KIND: usize = 20;
 const ABANDON_KIND: usize = 18;
 const EPOLL_SET_KIND: usize = 22;
+const EXPORT_KIND: usize = 23;
+const ADOPT_KIND: usize = 24;
 const EPOLL_DROP_KIND: usize = 32;
 const EPOLL_WAIT_KIND: usize = 33;
 const OWN_KIND: usize = 65;
+const BIND_KIND: usize = 2;
 
 /// How the interface got its address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +290,7 @@ pub struct Roles {
     pub clone_many: bool,
     pub abandon_many: bool,
     pub epoll_sets: bool,
+    pub passes: bool,
 }
 
 impl Roles {
@@ -303,6 +308,7 @@ impl Roles {
         clone_many: false,
         abandon_many: false,
         epoll_sets: false,
+        passes: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -364,6 +370,10 @@ impl Roles {
         epoll_sets: true,
         ..Roles::NONE
     };
+    pub const PASSES: Roles = Roles {
+        passes: true,
+        ..Roles::NONE
+    };
 }
 
 /// The sockets the service serves at once (the limit of its table).
@@ -380,13 +390,16 @@ fn rtts(line: &str) -> Option<(u64, u64)> {
 }
 
 /// The counters of a line `net: frames rx R tx T dhcp D dropped X martian M
-/// listen_short S bad_sum B demux_probe P`.
+/// listen_short S syn_dropped D bad_sum B demux_probe P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frames {
     dropped: u64,
     dhcp: u64,
     martian: u64,
     listen_short: u64,
+    /// The SYNs a full queue dropped: not a fault.
+    #[allow(dead_code)]
+    syn_dropped: u64,
     bad_sum: u64,
     demux_probe: u64,
 }
@@ -406,6 +419,8 @@ fn frames(line: &str) -> Option<Frames> {
         martian,
         "listen_short",
         listen_short,
+        "syn_dropped",
+        syn_dropped,
         "bad_sum",
         bad_sum,
         "demux_probe",
@@ -421,6 +436,7 @@ fn frames(line: &str) -> Option<Frames> {
         dhcp: dhcp.parse().ok()?,
         martian: martian.parse().ok()?,
         listen_short: listen_short.parse().ok()?,
+        syn_dropped: syn_dropped.parse().ok()?,
         bad_sum: bad_sum.parse().ok()?,
         demux_probe: demux_probe.parse().ok()?,
     })
@@ -505,6 +521,9 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     }
     if roles.abandon_many {
         once.push((ABANDON_OK, 1));
+    }
+    if roles.passes {
+        once.push((PASSES_OK, 1));
     }
     if roles.epoll_sets {
         once.push((EPOLL_WAKE, 1));
@@ -967,6 +986,11 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             measured_programs(Some("net-epoll"), netd),
             Roles::EPOLL_SETS,
         ),
+        (
+            "x",
+            measured_programs(Some("net-passes"), netd),
+            Roles::PASSES,
+        ),
     ]
 }
 
@@ -1073,6 +1097,7 @@ fn acceptance(
 ) -> Result<Vec<Rows>, String> {
     let mut all = Vec::new();
     let mut epoll_run = Vec::new();
+    let mut pass_run = Vec::new();
     for (what, programs, roles) in acceptance_runs(netd) {
         let lines = steps_lines(
             machine,
@@ -1084,6 +1109,8 @@ fn acceptance(
         let rows = longest_over_starts(&lines);
         if what == "E" {
             epoll_run = lines;
+        } else if what == "x" {
+            pass_run = lines;
         }
         let rows = if strict {
             steps_verdict_rows(&rows).map_err(|e| format!("run {what}: {e}"))?
@@ -1123,7 +1150,7 @@ fn acceptance(
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {}, E {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {}, E {}, x {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
         own("s1280"),
         own("f"),
@@ -1137,6 +1164,7 @@ fn acceptance(
         own("C"),
         own("A"),
         own("E"),
+        own("x"),
         netd::choose::FLATNESS
     );
     let kind = |run: &str, kind: usize| {
@@ -1150,6 +1178,14 @@ fn acceptance(
         kind("C", CLONE_KIND),
         kind("C", CLONE_MORE_KIND),
         kind("A", ABANDON_KIND)
+    );
+    println!(
+        "net-probe: EXPORT {}, ADOPT {}, BIND {}, the longest own step with the passes that went {}, the step of waking after the time limits {} (bound {STEP_MAX})",
+        kind("x", EXPORT_KIND),
+        kind("x", ADOPT_KIND),
+        kind("x", BIND_KIND),
+        kind("x", OWN_KIND),
+        longest_named(&pass_run, "wake"),
     );
     let by_batch = epoll_set_by_batch(&epoll_run);
     println!(
@@ -1579,7 +1615,7 @@ fn rates(machine: &qemu::Machine) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const COUNTERS: &str = "martian 0 listen_short 0 bad_sum 0 demux_probe 2";
+    const COUNTERS: &str = "martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 2";
 
     fn good_run(mode: Mode) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
@@ -1735,7 +1771,7 @@ mod tests {
         let mut lines = good_run(Mode::Dhcp);
         let at = lines.iter().position(|l| l.starts_with(FRAMES)).unwrap();
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 bad_sum 1 demux_probe 2"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 bad_sum 1 demux_probe 2"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -1743,7 +1779,7 @@ mod tests {
                 .contains("counted")
         );
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 bad_sum 0 demux_probe 9"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 9"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -1776,7 +1812,7 @@ mod tests {
         let mut lines = good_run(Mode::Dhcp);
         let at = lines.iter().position(|l| l.starts_with(FRAMES)).unwrap();
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 bad_sum 0 demux_probe 2"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 2"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -1858,7 +1894,7 @@ mod tests {
         assert_eq!(rtts("net-probe: ping rtt max x us median 300 us"), None);
         assert_eq!(
             dhcp_count(
-                "net: frames rx 12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 bad_sum 0 demux_probe 1"
+                "net: frames rx 12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 1"
             ),
             Some(3)
         );

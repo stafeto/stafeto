@@ -122,6 +122,7 @@ fn main(_: u64) -> u64 {
             b'C' => probe.clone_many(&mut session),
             b'A' => probe.abandon_many(&mut session),
             b'E' => probe.epoll_sets(&mut session),
+            b'x' => probe.passes(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -1975,6 +1976,204 @@ impl Probe<'_> {
         }
         config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: abandon ok {WAITING} in {asked} asks");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// EXPORT of `d`: the pass.
+    fn export(&self, net: &Handle<Channel>, d: u32) -> Result<Handle<Channel>, Fail> {
+        let mut w = Writer::new();
+        Request::Export { description: d }
+            .write(&mut w)
+            .map_err(Fail::Status)?;
+        let mut reply = sys::send(net, w.as_bytes()).map_err(Fail::Kernel)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        match bytes.get(..4) {
+            Some(word) if word == [0; 4] => {}
+            Some(word) => {
+                return Err(Fail::Status(Status::from_code(u32::from_le_bytes([
+                    word[0], word[1], word[2], word[3],
+                ]))));
+            }
+            None => return Err(Fail::Bad("a short reply")),
+        }
+        reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| Fail::Bad("EXPORT gave no pass"))
+    }
+
+    /// ADOPT of `pass` by the session `net`: the description and its kind.
+    fn adopt(&self, net: &Handle<Channel>, pass: Handle<Channel>) -> Result<(u32, u32), Fail> {
+        let mut w = Writer::new();
+        Request::Adopt.write(&mut w).map_err(Fail::Status)?;
+        let reply = sys::send_handles(net, w.as_bytes(), [pass.erase()])
+            .map_err(|refused| Fail::Kernel(refused.error))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        sockets::read_adopted(bytes).map_err(Fail::Status)
+    }
+
+    /// Role `x`: passes (EXPORT, ADOPT, the last copy of a pass going, the
+    /// limit of a session), BIND with SO_REUSEPORT without the identity
+    /// session, and sixteen operations that wait with a time limit.
+    fn passes(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let other = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+        // A pass moves a description to another session.
+        let d = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.bind(&root, d, [127, 0, 0, 1], 9400)
+            .map_err(|_| "BIND failed")?;
+        let pass = self.export(&root, d).map_err(|_| "EXPORT failed")?;
+        let (adopted, kind) = self.adopt(&other, pass).map_err(|_| "ADOPT failed")?;
+        if kind != sockets::DGRAM {
+            return Err("ADOPT gave the wrong kind");
+        }
+        let mut buffer = [0; MESSAGE_MAX];
+        let request = Request::GetOpt {
+            description: adopted,
+            name: sockets::opt::TYPE,
+        };
+        let value = socket_call(&other, &request, &mut buffer).map_err(|_| "GETOPT failed")?;
+        if sockets::read_word(value) != Ok(sockets::DGRAM) {
+            return Err("the adopted description is not the socket");
+        }
+        // A pass that was spent names nothing: a copy of it is refused.
+        let again = self.export(&root, d).map_err(|_| "EXPORT failed")?;
+        let copy = sys::handle_duplicate(&again, abi::Rights::TRANSFER | abi::Rights::DUPLICATE)
+            .map_err(|_| "handle_duplicate of the pass failed")?;
+        self.adopt(&other, again).map_err(|_| "ADOPT failed")?;
+        match self.adopt(&other, copy) {
+            Err(fail) if is(&fail, proto_net::BAD_FD) => {}
+            _ => return Err("a spent pass was adopted again"),
+        }
+        // A handle that is no pass of the service is NOT_SOCKET: a session's own
+        // channel, and a channel of the probe's.
+        let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+        match self.adopt(&other, session) {
+            Err(fail) if is(&fail, proto_net::NOT_SOCKET) => {}
+            _ => return Err("a session's handle was taken for a pass"),
+        }
+        let foreign = sys::channel_create(self.level).map_err(|_| "channel_create failed")?;
+        let foreign_copy =
+            sys::handle_duplicate(&foreign, abi::Rights::SEND | abi::Rights::TRANSFER)
+                .map_err(|_| "handle_duplicate of the channel failed")?;
+        match self.adopt(&other, foreign_copy) {
+            Err(fail) if is(&fail, proto_net::NOT_SOCKET) => {}
+            _ => return Err("a foreign channel was taken for a pass"),
+        }
+        // A session holds sixteen passes: the seventeenth is refused.
+        let mut held: [Option<Handle<Channel>>; proto_net::sockets::SESSION_PASSES] =
+            Default::default();
+        for slot in held.iter_mut() {
+            *slot = Some(self.export(&root, d).map_err(|_| "EXPORT failed")?);
+        }
+        match self.export(&root, d) {
+            Err(Fail::Status(status)) if status == Status::Kernel(Error::LimitReached) => {}
+            _ => return Err("the seventeenth pass of a session was not refused"),
+        }
+        drop(held);
+        // The last copy of a pass that nobody adopted lets the description go:
+        // the port it held is free once its owner has closed it too.
+        let lost = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.bind(&root, lost, [127, 0, 0, 1], 9401)
+            .map_err(|_| "BIND failed")?;
+        let pass = self.export(&root, lost).map_err(|_| "EXPORT failed")?;
+        self.close(&root, lost).map_err(|_| "CLOSE failed")?;
+        let again = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        match self.bind(&root, again, [127, 0, 0, 1], 9401) {
+            Err(fail) if is(&fail, proto_net::IN_USE) => {}
+            _ => return Err("the pass did not keep the description"),
+        }
+        drop(pass);
+        self.sleep(100_000_000);
+        self.bind(&root, again, [127, 0, 0, 1], 9401)
+            .map_err(|_| "the description of a lost pass did not go")?;
+        // SO_REUSEPORT with no identity session to vouch for the user: refused.
+        let shared = self
+            .new_socket(&root, sockets::STREAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.plain(
+            &root,
+            Request::SetOpt {
+                description: shared,
+                name: sockets::opt::REUSEPORT,
+                value: 1,
+            },
+        )
+        .map_err(|_| "SETOPT REUSEPORT failed")?;
+        match self.bind(&root, shared, [0; 4], 9402) {
+            Err(fail) if is(&fail, proto_net::NOT_ALLOWED) => {}
+            _ => return Err("a shared port without a vouched user was not refused"),
+        }
+        // Sixteen receives that wait with a time limit end together.
+        const WAITING: usize = 16;
+        const BASE: u64 = TOLD_BASE + 0x40;
+        let timed = self.new_blocking(&root, sockets::DGRAM)?;
+        self.bind(&root, timed, [127, 0, 0, 1], 9403)
+            .map_err(|_| "BIND failed")?;
+        self.plain(
+            &root,
+            Request::SetOpt {
+                description: timed,
+                name: sockets::opt::RCVTIMEO,
+                value: 30,
+            },
+        )
+        .map_err(|_| "SETOPT RCVTIMEO failed")?;
+        let mut keys = [0u64; WAITING];
+        for (i, key) in keys.iter_mut().enumerate() {
+            let start = Request::Recv {
+                key: None,
+                description: timed,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            *key = self.start_wait(&root, &start)?;
+            let take = Request::Recv {
+                key: Some(*key),
+                description: timed,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            if !self.take_armed(&root, &take, BASE + i as u64)? {
+                return Err("a RECV with a time limit was ready");
+            }
+        }
+        self.sleep(300_000_000);
+        for (i, key) in keys.iter().enumerate() {
+            if self.told.get() >> (BASE + i as u64 - TOLD_BASE) & 1 == 0 {
+                return Err("an operation whose time ran out was not told");
+            }
+            let take = Request::Recv {
+                key: Some(*key),
+                description: timed,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            match socket_call(&root, &take, &mut buffer) {
+                Err(fail) if is(&fail, proto_net::AGAIN) => {}
+                _ => return Err("a RECV whose time ran out did not end with AGAIN"),
+            }
+        }
+        drop(other);
+        for d in [d, again, shared, timed] {
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: passes ok");
         *keep = Some(root);
         Ok(())
     }

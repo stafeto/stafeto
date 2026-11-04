@@ -1147,13 +1147,14 @@ impl Driver<'_> {
         let (rx, rx_dropped, rx_martian) = self.device.rx.counters();
         let tx = self.device.tx.counters();
         rt::println!(
-            "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {} bad_sum {} demux_probe {}",
+            "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {} syn_dropped {} bad_sum {} demux_probe {}",
             rx,
             tx.tx,
             tx.dhcp,
             rx_dropped + tx.dropped + self.device.looped.dropped(),
             rx_martian + tx.martian,
             self.net.counters.listen_short,
+            self.net.counters.syn_dropped,
             self.device.bad_sum,
             self.net.demux.probe_max
         );
