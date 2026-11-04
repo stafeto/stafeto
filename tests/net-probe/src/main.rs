@@ -2306,6 +2306,62 @@ impl Probe<'_> {
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
             rt::println!("net-probe: epoll close ok");
         }
+        // A request that makes a set ready wakes nobody itself: sixteen waits
+        // of one set are told by the step of waking, eight at a time, and the
+        // EPOLL_SET step stays short.
+        {
+            let u = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            let session = self.clone_with(&root, &[u]).map_err(|_| "CLONE failed")?;
+            let set = self.epoll_set(&session, 0, &[])?;
+            let mut keys = [0u64; 16];
+            for (k, key) in keys.iter_mut().enumerate() {
+                let start = Request::EpollWait {
+                    key: None,
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                *key = self.start_wait(&session, &start)?;
+                let take = Request::EpollWait {
+                    key: Some(*key),
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                if !self.take_armed(&session, &take, 900 + k as u64)? {
+                    return Err("a wait of an empty set was ready");
+                }
+            }
+            self.epoll_set(
+                &session,
+                set,
+                &[rec(sockets::EPOLL_ADD, u, proto_net::sockets::epoll::OUT, 5)],
+            )?;
+            self.sleep(100_000_000);
+            for (k, key) in keys.iter().enumerate() {
+                let take = Request::EpollWait {
+                    key: Some(*key),
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                let mut buffer = [0; MESSAGE_MAX];
+                let reply =
+                    socket_call(&session, &take, &mut buffer).map_err(|_| "a take failed")?;
+                let ready = EpollReady::parse(ready(reply).map_err(|_| "a take was not ready")?)
+                    .map_err(|_| "a take's pairs")?;
+                // The first take has the record; the others find it listed
+                // again (by level) and report it as well.
+                if ready.len == 0 {
+                    rt::println!("net-probe: wait {k} of the set was told and found nothing");
+                    return Err("a wait of a ready set found nothing");
+                }
+            }
+            drop(session);
+            self.close(&root, u).map_err(|_| "CLOSE failed")?;
+        }
         // A set of 800 records dropped, then the sessions that watch.
         let mut big = [0u32; 800];
         let mut made = 0;
