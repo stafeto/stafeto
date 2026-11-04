@@ -903,6 +903,13 @@ fn provide_page(k: usize) -> Result<(), i32> {
     Ok(())
 }
 
+/// Before a `dup2` or `dup3` onto the number `fd`: its page is there.
+pub fn ensure_page_for(fd: u32) {
+    if let Ok(Some(k)) = process_state(|files| Ok(files.page_of(fd))) {
+        let _ = provide_page(k);
+    }
+}
+
 /// Before an operation that opens a descriptor in a way that cannot be run
 /// again (the deferred open): the page of the lowest free number is there.
 pub fn ensure_vacant_page() {

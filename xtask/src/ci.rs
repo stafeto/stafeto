@@ -127,6 +127,8 @@ struct Split {
 
 /// The probes with this start of their name run in the group `net`.
 const NET_PREFIX: &str = "net-";
+/// The probes of the group `net` that do not start with the prefix.
+const NET_NAMED: [&str; 1] = ["posix-net"];
 
 /// Expected seconds of the probes, from a run on the CI machine. A probe
 /// not in the table counts as `DEFAULT_WEIGHT`.
@@ -280,8 +282,9 @@ fn weight(name: &str) -> u32 {
 /// The names of the boots of `ci` outside os-test, in their order, split:
 /// longest first into the group with the least expected time.
 fn split(names: &[String]) -> Split {
-    let (net, others): (Vec<&String>, Vec<&String>) =
-        names.iter().partition(|n| n.starts_with(NET_PREFIX));
+    let (net, others): (Vec<&String>, Vec<&String>) = names
+        .iter()
+        .partition(|n| n.starts_with(NET_PREFIX) || NET_NAMED.contains(&n.as_str()));
     let (kernel, rest): (Vec<&String>, Vec<&String>) = others
         .into_iter()
         .partition(|n| KERNEL_PREFIXES.iter().any(|p| n.starts_with(p)));
@@ -723,7 +726,7 @@ mod tests {
             net,
         } = split(&names);
         assert!(!kernel.is_empty());
-        assert_eq!(net, ["net-probe", "net-curl", "net-wget"]);
+        assert_eq!(net, ["net-probe", "net-curl", "net-wget", "posix-net"]);
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         for name in kernel.iter().chain(guests.iter().flatten()).chain(&net) {
             *seen.entry(name.clone()).or_default() += 1;

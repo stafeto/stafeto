@@ -61,6 +61,7 @@ mod ostest;
 mod packages;
 mod pci_walk;
 mod posix_display;
+mod posix_net;
 mod qemu;
 mod ring;
 mod rootfs;
@@ -1676,6 +1677,9 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
+            descriptors, 1 000 sockets, a fork and an exec with many
+            descriptors; with `steps` the service counts its steps (TCG only)
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -1940,6 +1944,7 @@ fn main() {
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
+        Some("posix-net") => posix_net::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -8814,6 +8819,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-wget", || {
             net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
         }),
+        // The descriptors and sockets of a process that serves many: 1 024
+        // descriptors, 1 000 sockets, a fork and an exec with many of them.
+        // Also in the group `net`.
+        job("posix-net", || posix_net::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

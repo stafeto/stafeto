@@ -912,10 +912,10 @@ pub fn open(path: &[u8], flags: i32) -> Result<i32, i32> {
             return Err(errno);
         }
     };
-    let inserted = crate::shared::with_files(|files| {
+    let inserted = crate::shared::growing(|files| {
         files
             .insert_proc(id, crate::descriptor_flags(flags))
-            .map_err(crate::error)
+            .map_err(crate::shared::page_error)
     });
     match inserted {
         Ok(fd) => Ok(fd as i32),

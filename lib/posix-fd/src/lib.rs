@@ -697,6 +697,16 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         }
     }
 
+    /// The page of entries that the number `fd` lies in when the table does
+    /// not have it yet; None when the number is in place, its page is there,
+    /// or no page could hold it.
+    pub fn missing_page(&self, fd: u32) -> Option<usize> {
+        match self.need_page(fd) {
+            Err(Error::NeedPage(k)) => Some(k),
+            _ => None,
+        }
+    }
+
     /// The lowest number at or above `from` that is in use (open, being
     /// opened or being closed), a word of the bitmap at a time.
     pub fn next_used(&self, from: u32) -> Option<u32> {

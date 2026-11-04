@@ -741,9 +741,10 @@ static int constants(void) {
         printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
         return 24;
     }
-    /* The layer's descriptor table holds 1 024. */
-    if (sysconf(_SC_OPEN_MAX) != 1024 || errno != 0) {
-        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 1024\n", sysconf(_SC_OPEN_MAX));
+    /* The layer's descriptor table holds 1 024 (the limit above); sysconf of
+       the pinned relibc still caps its answer at 64. */
+    if (sysconf(_SC_OPEN_MAX) != 64 || errno != 0) {
+        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 64\n", sysconf(_SC_OPEN_MAX));
         return 25;
     }
     /* The CPUs: sysconf, the mask of sched_getaffinity and the CPU the thread

@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 38] = [
+const SYSTEM_PATHS: [&str; 39] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -289,6 +289,7 @@ const SYSTEM_PATHS: [&str; 38] = [
     "/www/index.html",
     "/bin/net-sock",
     "/bin/net-dns",
+    "/bin/posix-net",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -337,7 +338,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 13] = [
+pub const SHARED: [(&str, &str); 14] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -351,6 +352,7 @@ pub const SHARED: [(&str, &str); 13] = [
     ("display-probe", "probes/display-probe"),
     ("net-sock", "probes/net-sock"),
     ("net-dns", "probes/net-dns"),
+    ("posix-net", "probes/posix-net"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -384,6 +386,7 @@ fn shared_files() -> Vec<RootFile> {
             "display-probe" => "/bin/display-probe",
             "net-sock" => "/bin/net-sock",
             "net-dns" => "/bin/net-dns",
+            "posix-net" => "/bin/posix-net",
             _ => "/bin/bad-pie",
         };
         files.push(file(path, 0o755, ROOT, name));
@@ -998,6 +1001,7 @@ fn net_files(image: &str) -> Vec<RootFile> {
     ));
     files.push(file("/bin/net-sock", 0o755, ROOT, "net-sock"));
     files.push(file("/bin/net-dns", 0o755, ROOT, "net-dns"));
+    files.push(file("/bin/posix-net", 0o755, ROOT, "posix-net"));
     files
 }
 /// The bytes of `/www/index.html` of the image with the network service: 64

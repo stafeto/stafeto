@@ -383,7 +383,7 @@ fn publish(description: u32, stream: bool, cloexec: bool) -> Result<i32, i32> {
         files
             .insert(target, descriptor_flags(cloexec))
             .map(|fd| fd as i32)
-            .map_err(crate::error)
+            .map_err(shared::page_error)
     });
     if inserted.is_err() {
         close_description(description);

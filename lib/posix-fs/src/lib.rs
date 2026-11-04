@@ -1604,6 +1604,12 @@ impl PosixFs {
         }
     }
 
+    /// The page of the table that the descriptor `fd` lies in, when the
+    /// table does not have it yet (a `dup2` onto it needs it first).
+    pub fn page_of(&self, fd: u32) -> Option<usize> {
+        self.descriptors.missing_page(fd)
+    }
+
     /// The descriptor `fd` named by a startup list whose number lies in a page
     /// (`Late`), once the page is there.
     pub fn place_late(&mut self, fd: u32, target: Target) -> Result<(), FsError> {

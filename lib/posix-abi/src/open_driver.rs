@@ -96,6 +96,9 @@ pub(crate) fn open(
         loop {
             // Binding and preparation retries run without a numeric reservation or defer.
             files.open_prepare_recover(recovery.job).map_err(protocol)?;
+            // The page of the table for the number the open will take is there
+            // before the reservation, which cannot be asked again.
+            crate::shared::ensure_vacant_page();
             let defer = Defer::enter();
             let final_result = (|| {
                 let (entry, context) = crate::shared::with_files(|files| {

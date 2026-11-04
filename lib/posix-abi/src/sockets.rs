@@ -247,11 +247,11 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
 /// A descriptor for the socket `id`; the socket goes again on an error.
 fn publish(transport: Transport, id: u32, cloexec: bool) -> Result<i32, i32> {
     let flags = descriptor_flags(if cloexec { SOCK_CLOEXEC } else { 0 });
-    let inserted = shared::with_files(|files| {
+    let inserted = shared::growing(|files| {
         files
             .insert(Target::Pipe(id), flags)
             .map(|fd| fd as i32)
-            .map_err(crate::error)
+            .map_err(shared::page_error)
     });
     if inserted.is_err() {
         let _ = transport.release(Some(Target::Pipe(id)));
@@ -997,14 +997,14 @@ fn install(
     let mut made = [0i32; FDS_MAX];
     let mut count = 0;
     for &id in ids {
-        let inserted = shared::with_files(|files| {
+        let inserted = shared::growing(|files| {
             files
                 .insert(
                     Target::Pipe(id),
                     descriptor_flags(if cloexec { SOCK_CLOEXEC } else { 0 }),
                 )
                 .map(|fd| (fd as i32, ()))
-                .map_err(crate::error)
+                .map_err(shared::page_error)
         });
         match inserted {
             Ok((fd, _)) => {

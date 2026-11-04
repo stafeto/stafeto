@@ -70,6 +70,7 @@ pub(crate) fn replace(
     target: u32,
     flags: Option<DescriptorFlags>,
 ) -> Result<u32, i32> {
+    crate::shared::ensure_page_for(target);
     operation(target, Some((source, flags)), false)
 }
 /// An implementation-owned descriptor must publish cleanup before its caller

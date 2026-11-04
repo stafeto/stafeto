@@ -5,8 +5,11 @@
 //! bind (`ports::conflicts`) looks at the places of that port alone, not at
 //! every place of the table, so BIND costs the same at 8 places and at 1 280.
 //! The head of the chain of a port is in a table of 65 536 entries; each
-//! place has its next in the chain. A place is 1 more than its index in the
-//! tables (0 means none), so that the table is all zeros at the start.
+//! place has its next and its previous in the chain, so a place goes out in
+//! O(1) (the accepted sockets of a server all share its port, and 500 of them
+//! made a walk of the chain cost 3 000 ticks). A place is 1 more than its
+//! index in the tables (0 means none), so that the table is all zeros at the
+//! start.
 
 /// The ports.
 const PORTS: usize = 65_536;
@@ -17,6 +20,7 @@ const WORDS: usize = 64;
 pub struct PortChains<const N: usize> {
     heads: [u16; PORTS],
     next: [u16; N],
+    previous: [u16; N],
     port: [u16; N],
     linked: [u64; WORDS],
 }
@@ -27,6 +31,7 @@ impl<const N: usize> PortChains<N> {
         PortChains {
             heads: [0; PORTS],
             next: [0; N],
+            previous: [0; N],
             port: [0; N],
             linked: [0; WORDS],
         }
@@ -45,33 +50,32 @@ impl<const N: usize> PortChains<N> {
         }
         self.linked[i / 64] |= 1 << (i % 64);
         self.port[i] = port;
-        self.next[i] = self.heads[usize::from(port)];
+        let head = self.heads[usize::from(port)];
+        self.next[i] = head;
+        self.previous[i] = 0;
+        if head != 0 {
+            self.previous[usize::from(head) - 1] = i as u16 + 1;
+        }
         self.heads[usize::from(port)] = i as u16 + 1;
     }
 
-    /// Takes place `i` out of its chain (O(the chain)); nothing when it is in
-    /// none.
+    /// Takes place `i` out of its chain in O(1); nothing when it is in none.
     pub fn unlink(&mut self, i: usize) {
         if !self.is_linked(i) {
             return;
         }
         self.linked[i / 64] &= !(1 << (i % 64));
-        let port = usize::from(self.port[i]);
-        let mine = i as u16 + 1;
-        if self.heads[port] == mine {
-            self.heads[port] = self.next[i];
+        let (before, after) = (self.previous[i], self.next[i]);
+        if before == 0 {
+            self.heads[usize::from(self.port[i])] = after;
         } else {
-            let mut at = self.heads[port];
-            while at != 0 {
-                let place = usize::from(at) - 1;
-                if self.next[place] == mine {
-                    self.next[place] = self.next[i];
-                    break;
-                }
-                at = self.next[place];
-            }
+            self.next[usize::from(before) - 1] = after;
+        }
+        if after != 0 {
+            self.previous[usize::from(after) - 1] = before;
         }
         self.next[i] = 0;
+        self.previous[i] = 0;
     }
 
     /// The places in the chain of `port`.
