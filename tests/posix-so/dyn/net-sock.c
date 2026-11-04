@@ -898,6 +898,26 @@ static int accept_child(int port, int fd)
 	return 0;
 }
 
+/* A write and a send of a blocking socket take all their bytes, 800 at a
+ * time inside. */
+static void write_whole(void)
+{
+	enum { N = 5000 };
+	int c, s;
+	pair(LOOPBACK, &c, &s);
+	static char out[N], in[N];
+	fill(out, N, 2);
+	REQUIRE(write(c, out, N) == N);
+	REQUIRE(read_all(s, in, N) == N);
+	REQUIRE(memcmp(out, in, N) == 0);
+	fill(out, N, 4);
+	REQUIRE(send(s, out, N, 0) == N);
+	REQUIRE(read_all(c, in, N) == N);
+	REQUIRE(memcmp(out, in, N) == 0);
+	close(c);
+	close(s);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -931,6 +951,7 @@ static const struct {
 	{ "epipe-unread", epipe_unread },
 	{ "peek-waitall", peek_waitall },
 	{ "exec-blocked", exec_blocked },
+	{ "write-whole", write_whole },
 };
 
 static int udp_echo(int port)
