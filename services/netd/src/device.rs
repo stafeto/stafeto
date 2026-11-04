@@ -104,8 +104,8 @@ impl RxRing {
         }
     }
 
-    pub fn begin_step(&mut self) {
-        self.budget = Budget::new();
+    pub fn begin_step(&mut self, budget: Budget) {
+        self.budget = budget;
     }
 
     /// The frames the step received and dropped.
@@ -185,8 +185,8 @@ impl TxRing {
         }
     }
 
-    pub fn begin_step(&mut self) {
-        self.budget = Budget::new();
+    pub fn begin_step(&mut self, budget: Budget) {
+        self.budget = budget;
         self.reclaim();
     }
 
@@ -230,24 +230,30 @@ impl TxRing {
 }
 
 /// The frames of the loopback (spec 6, 3.3): what the stack sends to its own
-/// MAC waits here for the next reception. Both tokens of a pair reach the
-/// ring, so its parts have interior mutability; the book keeps the place of
-/// the frame being read apart from the one a reply goes to.
+/// MAC waits here for the next reception. The frame stays in the buffer of
+/// sending it was built in (no copy): the ring holds the number of the buffer
+/// and the buffer is not in the pool until the stack is done with the frame.
+/// Both tokens of a pair reach the ring, so its parts have interior
+/// mutability; the book keeps the place of the frame being read apart from the
+/// one a reply goes to.
 pub struct LoopRing {
     book: RefCell<LoopBook>,
-    frames: *mut [u8; MAX_FRAME],
+    buffers: [Cell<u16>; LOOP_FRAMES],
     lengths: [Cell<usize>; LOOP_FRAMES],
+    /// The buffers the stack is done with, which the pool of sending takes
+    /// back at its next use.
+    returned: RefCell<([u16; LOOP_FRAMES], usize)>,
     /// The frames that found no place.
     dropped: Cell<u64>,
 }
 
 impl LoopRing {
-    /// A ring over `frames`, the table of LOOP_FRAMES frames.
-    pub fn new(frames: &'static mut [[u8; MAX_FRAME]; LOOP_FRAMES]) -> LoopRing {
+    pub fn new() -> LoopRing {
         LoopRing {
             book: RefCell::new(LoopBook::new()),
-            frames: frames.as_mut_ptr(),
+            buffers: core::array::from_fn(|_| Cell::new(0)),
             lengths: core::array::from_fn(|_| Cell::new(0)),
+            returned: RefCell::new(([0; LOOP_FRAMES], 0)),
             dropped: Cell::new(0),
         }
     }
@@ -256,23 +262,47 @@ impl LoopRing {
         self.book.borrow().waiting()
     }
 
-    /// Keeps `frame`; false (counted) when the ring is full.
-    fn push(&self, frame: &[u8]) -> bool {
+    /// Keeps the frame of `length` bytes in buffer `n`; false (counted, and
+    /// the buffer stays the caller's) when the ring is full.
+    fn push(&self, n: u16, length: usize) -> bool {
         let Some(place) = self.book.borrow_mut().push() else {
             self.dropped.set(self.dropped.get() + 1);
             return false;
         };
-        // SAFETY: the place is free (the book gave it) and no token holds it.
-        let slot = unsafe { &mut *self.frames.add(place) };
-        slot[..frame.len()].copy_from_slice(frame);
-        self.lengths[place].set(frame.len());
+        self.buffers[place].set(n);
+        self.lengths[place].set(length);
         true
     }
 
-    /// The oldest frame: its place and length.
-    fn pop(&self) -> Option<(usize, usize)> {
+    /// The oldest frame: its place, its buffer and its length.
+    fn pop(&self) -> Option<(usize, u16, usize)> {
         let place = self.book.borrow_mut().pop()?;
-        Some((place, self.lengths[place].get()))
+        Some((place, self.buffers[place].get(), self.lengths[place].get()))
+    }
+
+    /// The oldest frame read is done with: its buffer waits to go back to the
+    /// pool.
+    fn done(&self) {
+        let Some(place) = self.book.borrow_mut().done() else {
+            return;
+        };
+        let mut returned = self.returned.borrow_mut();
+        let at = returned.1;
+        returned.0[at] = self.buffers[place].get();
+        returned.1 += 1;
+    }
+
+    /// A buffer the stack is done with.
+    fn take_returned(&self) -> Option<u16> {
+        let mut returned = self.returned.borrow_mut();
+        returned.1 = returned.1.checked_sub(1)?;
+        Some(returned.0[returned.1])
+    }
+}
+
+impl Default for LoopRing {
+    fn default() -> LoopRing {
+        LoopRing::new()
     }
 }
 
@@ -295,15 +325,15 @@ pub struct NetDevice {
 #[derive(Clone, Copy)]
 enum Held {
     Wire { buffer: u16, length: usize },
-    Loop { place: usize, length: usize },
+    Loop { buffer: u16, length: usize },
 }
 
 impl NetDevice {
-    pub fn new(rx: RxRing, tx: TxRing, looped: LoopRing, mac: [u8; 6]) -> NetDevice {
+    pub fn new(rx: RxRing, tx: TxRing, mac: [u8; 6]) -> NetDevice {
         NetDevice {
             rx,
             tx,
-            looped,
+            looped: LoopRing::new(),
             mac,
             own: [[0; 4]; 2],
             own_len: 0,
@@ -326,12 +356,12 @@ impl NetDevice {
             if self.rx.budget.rx_left() == 0 {
                 return None;
             }
-            if let Some((place, length)) = self.looped.pop() {
+            if let Some((_, buffer, length)) = self.looped.pop() {
                 self.rx.budget.take_rx();
-                // SAFETY: the book keeps the place until the token drops.
-                let slot = unsafe { &*self.looped.frames.add(place) };
-                let dest = frames::target(&slot[..length]);
-                self.held = Some(Held::Loop { place, length });
+                // SAFETY: the ring holds the buffer until the token drops.
+                let slice = unsafe { buffer_at(buffer) };
+                let dest = frames::target(&slice[HDR_LEN..HDR_LEN + length]);
+                self.held = Some(Held::Loop { buffer, length });
                 return Some(dest);
             }
             let (buffer, length) = self.rx.pop()?;
@@ -368,7 +398,23 @@ impl NetDevice {
             f[28..32].copy_from_slice(&ip);
             f[32..38].copy_from_slice(&mac);
             f[38..42].copy_from_slice(&ip);
-            self.looped.push(&f);
+            let Some(n) = self.tx.book.alloc() else {
+                continue;
+            };
+            // SAFETY: the buffer is the pool's and the device does not hold it.
+            let slice = unsafe { buffer_at(n) };
+            slice[HDR_LEN..HDR_LEN + f.len()].copy_from_slice(&f);
+            if !self.looped.push(n, f.len()) {
+                self.tx.book.release(n);
+            }
+        }
+    }
+
+    /// The buffers of the loopback the stack is done with go back to the pool
+    /// of sending.
+    fn reclaim_loop(&mut self) {
+        while let Some(n) = self.looped.take_returned() {
+            self.tx.book.release(n);
         }
     }
 
@@ -392,7 +438,7 @@ pub enum RxToken<'a> {
     },
     Loop {
         ring: &'a LoopRing,
-        place: usize,
+        buffer: u16,
         length: usize,
     },
 }
@@ -412,14 +458,11 @@ impl phy::RxToken for RxToken<'_> {
                 f(&slice[HDR_LEN..HDR_LEN + length])
             }
             RxToken::Loop {
-                ring,
-                place,
-                length,
+                buffer: n, length, ..
             } => {
-                // SAFETY: the book keeps the place from new frames until
-                // the token drops.
-                let slot = unsafe { &*ring.frames.add(*place) };
-                f(&slot[..*length])
+                // SAFETY: the ring holds the buffer until the token drops.
+                let slice = unsafe { buffer_at(*n) };
+                f(&slice[HDR_LEN..HDR_LEN + length])
             }
         }
     }
@@ -431,7 +474,7 @@ impl Drop for RxToken<'_> {
     fn drop(&mut self) {
         match self {
             RxToken::Wire { ring, buffer, .. } => ring.give(*buffer),
-            RxToken::Loop { ring, .. } => ring.book.borrow_mut().done(),
+            RxToken::Loop { ring, .. } => ring.done(),
         }
     }
 }
@@ -464,6 +507,9 @@ impl TxToken<'_> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let ring = self.ring;
+        while let Some(n) = self.looped.take_returned() {
+            ring.book.release(n);
+        }
         let spare = len <= MAX_FRAME && ring.budget.take_tx();
         let n = if spare { ring.book.alloc() } else { None };
         let Some(n) = n else {
@@ -479,11 +525,11 @@ impl TxToken<'_> {
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
-            // The frame stays inside: a copy for the next reception.
-            if !self.looped.push(frame) {
+            // The frame stays inside, in its buffer, for the next reception.
+            if !self.looped.push(n, len) {
                 ring.counters.dropped += 1;
+                ring.book.release(n);
             }
-            ring.book.release(n);
             return result;
         }
         if frames::martian(frame) {
@@ -537,9 +583,9 @@ impl phy::Device for NetDevice {
             own_len: self.own_len,
         };
         let rx = match held {
-            Held::Loop { place, length } => RxToken::Loop {
+            Held::Loop { buffer, length } => RxToken::Loop {
                 ring: &self.looped,
-                place,
+                buffer,
                 length,
             },
             Held::Wire { buffer, length } => RxToken::Wire {
@@ -552,6 +598,7 @@ impl phy::Device for NetDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_>> {
+        self.reclaim_loop();
         if self.tx.budget.tx_left() == 0 || self.tx.book.free() == 0 {
             return None;
         }

@@ -92,6 +92,8 @@ net-sockets-8 = []
 net-sockets-64 = []
 net-sockets-256 = []
 net-echo = []
+# The network service alone on CPU 0 (the image runs on two CPUs).
+net-alone = []
 net-full-batch = []
 net-all-groups = []
 net-wakes = []

@@ -183,16 +183,37 @@ pub const NET_TABLE: &[Record] = &[
     NETD,
 ];
 
+/// The CPUs of the services and the probe in the images of the measurement of
+/// the steps (`net-alone`): the network service has CPU 0 to itself, so that
+/// the longest step it measures holds no time of another process (the
+/// preemption of a service by others is a term of the analysis of response
+/// time, not of its step). The image runs on two CPUs.
+const OTHERS_CPUS: u8 = 0b0010;
+
+const fn on(r: Record, cpus: u8) -> Record {
+    Record { cpus, ..r }
+}
+
 /// The images of the probe, which differ in the files of the RAM service
 /// and in the features of the service: the RAM files, the entropy device's
 /// driver and service, the network service and the probe.
-pub const NET_PROBE_TABLE: &[Record] = &[
-    super::ramfs::RAM_LEGACY,
-    super::entropy::RNG,
-    super::entropy::ENTROPY,
-    NETD,
-    PROBE,
-];
+pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-alone") {
+    &[
+        super::ramfs::RAM_LEGACY,
+        on(super::entropy::RNG, OTHERS_CPUS),
+        on(super::entropy::ENTROPY, OTHERS_CPUS),
+        NETD,
+        on(PROBE, OTHERS_CPUS),
+    ]
+} else {
+    &[
+        super::ramfs::RAM_LEGACY,
+        super::entropy::RNG,
+        super::entropy::ENTROPY,
+        NETD,
+        PROBE,
+    ]
+};
 
 // The profile of the boot files goes to the network service.
 const _: () = {

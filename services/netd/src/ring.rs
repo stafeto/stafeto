@@ -21,21 +21,53 @@ pub const TX_BUFFERS: usize = QUEUE_SIZE;
 pub const BUFFERS: usize = RX_BUFFERS + TX_BUFFERS;
 /// The pages of the network object: 512 buffers of BUFFER_LEN bytes.
 pub const NET_PAGES: usize = BUFFERS * BUFFER_LEN / 4096;
-/// The frames one step receives and the frames it sends at most (the
-/// bound of a step, so that a flood leaves the loop its other work). The
-/// features `batch-8`, `batch-4` and `batch-2` are for the measurement that
-/// chose them (reports/2026-11-04-net-p1a): the build of the service has
-/// one value.
-#[cfg(not(any(feature = "batch-8", feature = "batch-4", feature = "batch-2")))]
-pub const BATCH: usize = 16;
-#[cfg(feature = "batch-8")]
-pub const BATCH: usize = 8;
-#[cfg(feature = "batch-4")]
-pub const BATCH: usize = 4;
-#[cfg(feature = "batch-2")]
-pub const BATCH: usize = 2;
-pub const STEP_RX: usize = BATCH;
-pub const STEP_TX: usize = BATCH;
+/// The frames a step of receiving takes and the frames a step of sending
+/// sends at most (the bound of a step, so that a flood leaves the loop its
+/// other work): by the measurement of stage P1a, reports/2026-11-04-net-p1a.
+/// The features `batch-N` (receiving) and `send-N` (sending) build the other
+/// values, for the measurement that chose these.
+#[cfg(feature = "batch-16")]
+pub const STEP_RX: usize = 16;
+#[cfg(all(feature = "batch-8", not(feature = "batch-16")))]
+pub const STEP_RX: usize = 8;
+#[cfg(all(
+    feature = "batch-2",
+    not(any(feature = "batch-16", feature = "batch-8"))
+))]
+pub const STEP_RX: usize = 2;
+#[cfg(all(
+    feature = "batch-1",
+    not(any(feature = "batch-16", feature = "batch-8", feature = "batch-2"))
+))]
+pub const STEP_RX: usize = 1;
+#[cfg(not(any(
+    feature = "batch-16",
+    feature = "batch-8",
+    feature = "batch-2",
+    feature = "batch-1"
+)))]
+pub const STEP_RX: usize = 4;
+#[cfg(feature = "send-16")]
+pub const STEP_TX: usize = 16;
+#[cfg(all(feature = "send-8", not(feature = "send-16")))]
+pub const STEP_TX: usize = 8;
+#[cfg(all(feature = "send-2", not(any(feature = "send-16", feature = "send-8"))))]
+pub const STEP_TX: usize = 2;
+#[cfg(all(
+    feature = "send-1",
+    not(any(feature = "send-16", feature = "send-8", feature = "send-2"))
+))]
+pub const STEP_TX: usize = 1;
+#[cfg(not(any(
+    feature = "send-16",
+    feature = "send-8",
+    feature = "send-2",
+    feature = "send-1"
+)))]
+pub const STEP_TX: usize = 4;
+/// The frames the loopback keeps for the next reception: two steps of
+/// sending, or of the answers to receiving.
+pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
 /// The groups of sockets the pass of sending visits in one step. The
 /// features `egress-1` and `egress-4` are for the measurement that chose it.
 #[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
@@ -48,9 +80,6 @@ pub const EGRESS_GROUPS: usize = 4;
 /// waking does at most (the pipe service wakes eight at most).
 pub const WAKE_TELLS: usize = 8;
 pub const WAKE_CHECKS: usize = 32;
-/// The frames the loopback keeps for the next step: two steps of sending.
-pub const LOOP_FRAMES: usize = 2 * STEP_TX;
-
 const _: () = assert!(NET_PAGES == 256);
 
 /// The offset in the network object of buffer `n`.
@@ -238,10 +267,14 @@ impl LoopBook {
         Some(place)
     }
 
-    /// The oldest frame read is done with, its place is free.
-    pub fn done(&mut self) {
+    /// The oldest frame read is done with, its place is free: the place.
+    pub fn done(&mut self) -> Option<usize> {
         if self.done < self.read {
+            let place = self.done % LOOP_FRAMES;
             self.done += 1;
+            Some(place)
+        } else {
+            None
         }
     }
 
@@ -305,14 +338,33 @@ impl Default for WakeBudget {
 pub struct Budget {
     rx: usize,
     tx: usize,
+    rx_start: usize,
+    tx_start: usize,
 }
 
 impl Budget {
     pub const fn new() -> Budget {
+        Budget::with(STEP_RX, STEP_TX)
+    }
+
+    pub const fn with(rx: usize, tx: usize) -> Budget {
         Budget {
-            rx: STEP_RX,
-            tx: STEP_TX,
+            rx,
+            tx,
+            rx_start: rx,
+            tx_start: tx,
         }
+    }
+
+    /// A step of receiving: STEP_RX frames in, and as many of the stack's
+    /// answers to them out.
+    pub const fn receiving() -> Budget {
+        Budget::with(STEP_RX, STEP_RX)
+    }
+
+    /// A step of sending: STEP_TX frames out, none in.
+    pub const fn sending() -> Budget {
+        Budget::with(0, STEP_TX)
     }
 
     /// Spends one reception; false when the step has had its share.
@@ -343,7 +395,7 @@ impl Budget {
 
     /// The frames received and sent so far in the step.
     pub fn spent(&self) -> (usize, usize) {
-        (STEP_RX - self.rx, STEP_TX - self.tx)
+        (self.rx_start - self.rx, self.tx_start - self.tx)
     }
 }
 
@@ -458,7 +510,7 @@ mod tests {
         assert_eq!(book.push(), None);
         assert!(book.pop().is_some());
         assert_eq!(book.push(), None, "a place is free after done alone");
-        book.done();
+        assert_eq!(book.done(), Some(0));
         assert!(book.push().is_some());
         assert_eq!(book.waiting(), LOOP_FRAMES);
     }
@@ -490,5 +542,22 @@ mod tests {
         assert!(!budget.take_tx());
         assert_eq!(budget.spent(), (STEP_RX, STEP_TX));
         assert_eq!(budget.rx_left(), 0);
+    }
+
+    #[test]
+    fn a_step_of_receiving_answers_as_many_frames_and_a_step_of_sending_receives_none() {
+        let mut receiving = Budget::receiving();
+        assert_eq!(receiving.rx_left(), STEP_RX);
+        assert_eq!(receiving.tx_left(), STEP_RX);
+        assert!(receiving.take_rx());
+        let mut sending = Budget::sending();
+        assert!(!sending.take_rx());
+        assert_eq!(sending.tx_left(), STEP_TX);
+        assert_eq!(Budget::with(3, 5).spent(), (0, 0));
+    }
+
+    #[test]
+    fn the_loop_holds_the_frames_of_two_steps() {
+        const { assert!(LOOP_FRAMES >= 2 * STEP_TX && LOOP_FRAMES >= 2 * STEP_RX) };
     }
 }

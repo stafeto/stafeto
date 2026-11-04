@@ -56,8 +56,8 @@ pub const ORPHAN_NS: u64 = 60_000_000_000;
 pub const CONNECT_NS: u64 = 75_000_000_000;
 /// The interval of the probes of KEEPALIVE (RFC 1122, 4.2.3.6).
 const KEEPALIVE_NS: u64 = 7_200_000_000_000;
-/// The orphans one step of the deadline looks at.
-const SWEEP: usize = 8;
+/// The orphans one step of the sweep looks at.
+const SWEEP: usize = 4;
 /// The sessions that went and still hold descriptions at most; a session
 /// past that lets go of its descriptions at once.
 pub const DEPARTING: usize = 8;
@@ -532,30 +532,29 @@ impl Net {
     }
 
     /// The streams no session holds, a few at a time: one that is closed is
-    /// free, one past ORPHAN_NS is aborted.
-    pub fn sweep(&mut self, stack: &mut Stack<'static>, now: u64) {
+    /// free, one past ORPHAN_NS is aborted. A step looks at SWEEP of them
+    /// and goes on from there; true when streams are left to look at in this
+    /// round.
+    pub fn sweep(&mut self, stack: &mut Stack<'static>, now: u64) -> bool {
         let mut seen = 0;
         let mut at = self.sweep_at;
-        for _ in 0..2 {
-            while seen < SWEEP {
-                let Some(i) = self.orphans.next(at) else {
-                    break;
-                };
-                at = i + 1;
-                seen += 1;
-                let closed = self.socks[i]
-                    .handle
-                    .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed);
-                if closed || now.saturating_sub(self.socks[i].orphan_at) >= ORPHAN_NS {
-                    self.release_place(stack, i);
-                }
+        while seen < SWEEP {
+            let Some(i) = self.orphans.next(at) else {
+                // The round is over.
+                self.sweep_at = 0;
+                return false;
+            };
+            at = i + 1;
+            seen += 1;
+            let closed = self.socks[i]
+                .handle
+                .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed);
+            if closed || now.saturating_sub(self.socks[i].orphan_at) >= ORPHAN_NS {
+                self.release_place(stack, i);
             }
-            if seen >= SWEEP {
-                break;
-            }
-            at = 0;
         }
         self.sweep_at = at;
+        true
     }
 
     /// Whether streams wait for the sweep.

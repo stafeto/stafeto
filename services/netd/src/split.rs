@@ -4,8 +4,8 @@
 //! The breakdown of the step of the stack by parts (the feature `split`,
 //! which only the images of the measurement turn on): the marks of the
 //! counter at the borders of the parts, a histogram of 64 buckets of 256
-//! ticks for each part, and the lines `net: split <part> p50 <..> p90 <..>
-//! max <..>` that CONFIG of the probe prints. The preemption of the service
+//! ticks for each part, and the lines `net: split <part> n <..> p50 <..>
+//! p90 <..> max <..>` that CONFIG of the probe prints. The preemption of the service
 //! by others only adds time, so p50 and p90 say more than the maximum.
 //!
 //! The parts: `fixed` what a step costs besides the frames and the passes of
@@ -18,17 +18,20 @@
 mod on {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-    pub const FIXED: usize = 0;
+    pub const FIXED_RX: usize = 0;
+    pub const FIXED_TX: usize = 5;
     pub const FRAME_RX: usize = 1;
     pub const FRAME_TX: usize = 2;
     pub const GROUP: usize = 3;
     pub const KERNEL: usize = 4;
-    const NAMES: [&str; 5] = ["fixed", "frame_rx", "frame_tx", "group", "kernel"];
+    const NAMES: [&str; 6] = [
+        "fixed_rx", "frame_rx", "frame_tx", "group", "kernel", "fixed_tx",
+    ];
     const BUCKETS: usize = 64;
     const WIDTH: u64 = 256;
 
-    static HIST: [[AtomicU64; BUCKETS]; 5] = [const { [const { AtomicU64::new(0) }; BUCKETS] }; 5];
-    static MAX: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static HIST: [[AtomicU64; BUCKETS]; 6] = [const { [const { AtomicU64::new(0) }; BUCKETS] }; 6];
+    static MAX: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
     /// The ticks of the frames sent in the step so far, of the frames
     /// received (the whole turn of the loop) and of the passes of groups
     /// (the whole pass).
@@ -60,8 +63,12 @@ mod on {
         counter.load(Relaxed)
     }
 
+    fn total(part: usize) -> u64 {
+        HIST[part].iter().map(|b| b.load(Relaxed)).sum()
+    }
+
     fn percentile(part: usize, percent: u64) -> u64 {
-        let total: u64 = HIST[part].iter().map(|b| b.load(Relaxed)).sum();
+        let total = total(part);
         if total == 0 {
             return 0;
         }
@@ -79,8 +86,9 @@ mod on {
     pub fn report() {
         for (part, name) in NAMES.iter().enumerate() {
             rt::println!(
-                "net: split {} p50 {} p90 {} max {}",
+                "net: split {} n {} p50 {} p90 {} max {}",
                 name,
+                total(part),
                 percentile(part, 50),
                 percentile(part, 90),
                 MAX[part].load(Relaxed)
@@ -96,7 +104,8 @@ pub use on::*;
 mod off {
     use core::sync::atomic::AtomicU64;
 
-    pub const FIXED: usize = 0;
+    pub const FIXED_RX: usize = 0;
+    pub const FIXED_TX: usize = 5;
     pub const FRAME_RX: usize = 1;
     pub const FRAME_TX: usize = 2;
     pub const GROUP: usize = 3;

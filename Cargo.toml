@@ -28,6 +28,16 @@ opt-level = 2
 [profile.release.package.kcore]
 opt-level = 2
 
+# The network service and its stack build at opt-level 2 as well: smoltcp is
+# many small functions, closures and chains of Option, which "s" does not
+# inline (reports/2026-11-04-net-p1a). With full LTO the package of the
+# program decides the last optimization, so `netd` is named too.
+[profile.release.package.netd]
+opt-level = 2
+
+[profile.release.package.smoltcp]
+opt-level = 2
+
 # Spec 5.4, 15.2: the programs of the test images build in the strict
 # build of rt, release with debug assertions, where BAD_HANDLE from a
 # typed call or a drop panics; the boot image that ships builds with

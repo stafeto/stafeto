@@ -50,12 +50,11 @@ mod stack;
 use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use device::{DEVICE, LoopRing, NetDevice, RxRing, TxRing};
+use device::{DEVICE, NetDevice, RxRing, TxRing};
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
-use netd::frames::MAX_FRAME;
 use netd::lines::Mac;
-use netd::ring::{LOOP_FRAMES, NET_PAGES, QUEUE_SIZE};
+use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
 use proto_net::sockets;
 use proto_net::{Method, VERSION, code};
@@ -71,12 +70,15 @@ use virtio_mmio::{Isr, OpenError, PAGE, StartError};
 
 rt::entry!(main);
 
-/// The bits of the service's notification to itself: a step of the stack is
-/// due, and a step of the departure of a session is due.
-const STEP: u64 = 1;
+/// The bits of the service's notification to itself, each a step of its own:
+/// receiving, sending (also asked by a request), the departure of a session,
+/// the waking of operations, and the sweep of the streams that close.
+const RX: u64 = 16;
+const TX: u64 = 1;
 const CLEANUP: u64 = 2;
-/// The step of waking the operations that wait.
 const WAKE: u64 = 4;
+const SWEEP: u64 = 8;
+const STEP_BITS: u64 = RX | TX | CLEANUP | WAKE | SWEEP;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
@@ -115,7 +117,6 @@ struct Tables {
     net: Net,
     storage: Storage<'static>,
     sessions: [Option<Session<Client, 0>>; SESSIONS],
-    loop_frames: [[u8; MAX_FRAME]; LOOP_FRAMES],
 }
 struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -346,14 +347,8 @@ fn main(_: u64) -> u64 {
         net,
         storage,
         sessions,
-        loop_frames,
     } = tables;
-    let mut device = NetDevice::new(
-        RxRing::new(rx_queue),
-        TxRing::new(tx_queue),
-        LoopRing::new(loop_frames),
-        mac,
-    );
+    let mut device = NetDevice::new(RxRing::new(rx_queue), TxRing::new(tx_queue), mac);
     device.rx.fill();
     transport.finish_init();
     virtio_mmio::ring(&mut transport, RECEIVEQ);
@@ -402,12 +397,17 @@ fn main(_: u64) -> u64 {
         hold: false,
         #[cfg(feature = "probe")]
         held_irq: false,
+        #[cfg(feature = "probe")]
+        held_rx: false,
+        #[cfg(feature = "probe")]
+        held_tx: false,
         _maps: (dma_object, net_object, window),
     };
     // The line opens once the queues are up; the first step starts the
     // DHCP client.
     virtio_mmio::reopen(&driver.irq);
-    driver.step(false, false);
+    driver.rx_step(false);
+    driver.tx_step(false);
     #[cfg(feature = "steps")]
     rt::service::report_steps(14);
     let config = Config {
@@ -496,6 +496,11 @@ struct Driver<'a> {
     hold: bool,
     #[cfg(feature = "probe")]
     held_irq: bool,
+    /// A step of each kind was asked for while the steps were held.
+    #[cfg(feature = "probe")]
+    held_rx: bool,
+    #[cfg(feature = "probe")]
+    held_tx: bool,
     _maps: (Handle<Memory>, Handle<Memory>, Handle<Memory>),
 }
 
@@ -515,7 +520,7 @@ impl Driver<'_> {
 
     /// Asks the loop for a step of the stack.
     fn want_step(&mut self) -> bool {
-        self.tell(STEP)
+        self.tell(TX)
     }
 
     /// The requests made while a step or a departure was wanted: the loop
@@ -536,14 +541,16 @@ impl Driver<'_> {
         }
     }
 
-    /// One step of the service: from the interrupt (`interrupt`: read the
-    /// status first), the service's own notification, or the timer
-    /// (`deadline`).
-    fn step(&mut self, interrupt: bool, deadline: bool) {
+    /// The step of receiving: from the interrupt (`interrupt`: read the
+    /// status first) or the service's own notification. It takes up to
+    /// STEP_RX frames, with the stack's answers to them, and asks for the
+    /// steps that follow.
+    fn rx_step(&mut self, interrupt: bool) {
         rt::service::step_own();
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_irq |= interrupt;
+            self.held_rx = true;
             return;
         }
         let began = split::now();
@@ -556,9 +563,44 @@ impl Driver<'_> {
             }
         }
         let now = now_ns();
-        self.device.rx.begin_step();
-        self.device.tx.begin_step();
+        self.device.rx.begin_step(Budget::receiving());
+        self.device.tx.begin_step(Budget::receiving());
         stack::ingress(&mut self.stack, &mut self.device, self.net, now);
+        self.events(now);
+        self.finish_step(now);
+        rt::service::step_detail(self.device.step_frames() as u64);
+        // Frames the share of the step left in the queue or in the loop:
+        // another step of receiving, with the line closed. A refused
+        // notification opens the line instead: the level brings the
+        // interrupt back for the frames still in the queue.
+        let kernel = split::now();
+        let more = self.device.rx.queue.can_pop() || self.device.looped.waiting() > 0;
+        let continued = more && self.tell(RX);
+        if !continued && core::mem::take(&mut self.line_closed) {
+            virtio_mmio::reopen(&self.irq);
+        }
+        self.next_steps(now, continued);
+        let end = split::now();
+        split::record(split::KERNEL, end - kernel);
+        let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
+        split::record(split::FIXED_RX, (end - began).saturating_sub(counted));
+    }
+
+    /// The step of sending: the service's set when it has work and up to
+    /// EGRESS_GROUPS groups of those that have, at most STEP_TX frames. From
+    /// the timer (`deadline`) or the service's own notification.
+    fn tx_step(&mut self, deadline: bool) {
+        rt::service::step_own();
+        #[cfg(feature = "probe")]
+        if self.hold {
+            self.held_tx = true;
+            return;
+        }
+        let began = split::now();
+        split::begin_step();
+        let now = now_ns();
+        self.device.rx.begin_step(Budget::sending());
+        self.device.tx.begin_step(Budget::sending());
         self.stack.egress(
             now,
             &mut self.device,
@@ -569,33 +611,37 @@ impl Driver<'_> {
         if now >= self.neighbours_at {
             self.addresses();
         }
-        if deadline {
-            self.net.sweep(&mut self.stack, now);
+        if deadline && self.net.orphans_wait() {
+            self.tell(SWEEP);
         }
-        // The operations that wait are looked at by a step of their own.
+        self.finish_step(now);
+        rt::service::step_detail(self.device.step_frames() as u64);
+        let kernel = split::now();
+        let continued = self.device.looped.waiting() > 0 && self.tell(RX);
+        self.next_steps(now, continued);
+        let end = split::now();
+        split::record(split::KERNEL, end - kernel);
+        let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
+        split::record(split::FIXED_TX, (end - began).saturating_sub(counted));
+    }
+
+    /// What every step ends with: the operations that wait are looked at by a
+    /// step of their own, and the doorbells ring.
+    fn finish_step(&mut self, _now: u64) {
         self.net.schedule_wake();
         if self.net.wake_due.next(0).is_some() {
             self.tell(WAKE);
         }
         self.doorbells();
-        let frames = self.device.step_frames();
-        rt::service::step_detail(frames as u64);
-        // Frames the share of the step left in the queue or in the loop, or
-        // groups with work left: another step, with the line closed. A
-        // refused notification opens the line instead: the level brings the
-        // interrupt back for the frames still in the queue.
-        let more =
-            self.device.rx.queue.can_pop() || self.device.looped.waiting() > 0 || self.net.due != 0;
-        let kernel = split::now();
-        let continued = more && self.want_step();
-        if !continued && core::mem::take(&mut self.line_closed) {
-            virtio_mmio::reopen(&self.irq);
+    }
+
+    /// Groups with work left want a step of sending; when no step follows,
+    /// the timer is set for the next deadline.
+    fn next_steps(&mut self, now: u64, receiving: bool) {
+        let sending = self.net.due != 0 && self.tell(TX);
+        if !receiving && !sending {
+            self.arm(now);
         }
-        self.arm(now);
-        let end = split::now();
-        split::record(split::KERNEL, end - kernel);
-        let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
-        split::record(split::FIXED, (end - began).saturating_sub(counted));
     }
 
     /// The change of the link (the interrupt's configuration bit).
@@ -611,7 +657,12 @@ impl Driver<'_> {
 
     /// What the DHCP client and the PING made of the step.
     fn events(&mut self, now: u64) {
-        match self.stack.dhcp_event() {
+        let dhcp = if self.stack.take_service_ran() {
+            self.stack.dhcp_event()
+        } else {
+            None
+        };
+        match dhcp {
             Some(Event::Leased(lease)) => {
                 self.net.external = Some(lease.address);
                 self.addresses();
@@ -749,7 +800,10 @@ impl Driver<'_> {
             proto_net::HOLD_ON => self.hold = true,
             proto_net::HOLD_OFF => {
                 self.hold = false;
+                self.held_rx = false;
+                self.held_tx = false;
                 self.net.step_due = true;
+                self.tell(RX);
             }
             _ => {
                 self.net.touch_all();
@@ -864,35 +918,55 @@ impl Service<0> for Driver<'_> {
 
     fn notification(&mut self, n: Notice) {
         match n.source {
-            Source::Interrupt => self.step(true, false),
-            Source::Unlabeled if n.bits & (STEP | CLEANUP | WAKE) != 0 => {
-                self.told &= !n.bits;
-                if n.bits & WAKE != 0 {
-                    rt::service::step_own();
-                    let now = now_ns();
-                    if self.net.wake(&mut self.stack, now) {
-                        self.tell(WAKE);
-                    }
+            Source::Interrupt => self.rx_step(true),
+            Source::Unlabeled if n.bits & STEP_BITS != 0 => {
+                // One step at a time: the first bit in this order, and the
+                // others are told again, so that a request waits for the
+                // step that is on and not for all of them.
+                let bit = [RX, TX, WAKE, CLEANUP, SWEEP]
+                    .into_iter()
+                    .find(|b| n.bits & b != 0)
+                    .unwrap_or(0);
+                let rest = n.bits & STEP_BITS & !bit;
+                self.told &= !bit;
+                if rest != 0 && sys::notify(&self.notify, rest).is_err() {
+                    self.told &= !rest;
+                    self.cleanup_due |= rest & CLEANUP != 0;
                 }
-                if n.bits & CLEANUP != 0 {
-                    rt::service::step_own();
-                    if self.net.depart_step(&mut self.stack) {
-                        self.cleanup();
+                match bit {
+                    RX => {
+                        #[cfg(feature = "probe")]
+                        let irq = core::mem::take(&mut self.held_irq);
+                        #[cfg(not(feature = "probe"))]
+                        let irq = false;
+                        self.rx_step(irq)
                     }
-                    self.net.step_due = true;
-                }
-                if n.bits & STEP != 0 {
-                    #[cfg(feature = "probe")]
-                    let irq = core::mem::take(&mut self.held_irq);
-                    #[cfg(not(feature = "probe"))]
-                    let irq = false;
-                    self.step(irq, false);
+                    TX => self.tx_step(false),
+                    WAKE => {
+                        rt::service::step_own();
+                        if self.net.wake(&mut self.stack, now_ns()) {
+                            self.tell(WAKE);
+                        }
+                    }
+                    CLEANUP => {
+                        rt::service::step_own();
+                        if self.net.depart_step(&mut self.stack) {
+                            self.cleanup();
+                        }
+                        self.net.step_due = true;
+                    }
+                    _ => {
+                        rt::service::step_own();
+                        if self.net.sweep(&mut self.stack, now_ns()) {
+                            self.tell(SWEEP);
+                        }
+                    }
                 }
                 self.after_request();
             }
             Source::Timer if n.label == TIMER_LABEL => {
                 self.armed = None;
-                self.step(false, true)
+                self.tx_step(true)
             }
             _ => {}
         }

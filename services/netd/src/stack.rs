@@ -146,6 +146,13 @@ pub struct Stack<'a> {
     group_at: [Option<u64>; GROUPS + 1],
     /// Where the pass of sending goes on.
     cursor: usize,
+    /// The least of the deadlines of the groups (u64::MAX for none): the walk
+    /// over them is made only once it has come.
+    earliest: u64,
+    /// The service's set has work: a frame for it, a PING, a new address.
+    pub service_due: bool,
+    /// The service's set was passed or took a frame since `take_service_ran`.
+    service_ran: bool,
     pub lease: Option<Lease>,
     pub ping: Option<Ping>,
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
@@ -219,6 +226,9 @@ impl<'a> Stack<'a> {
             icmp,
             group_at: [None; GROUPS + 1],
             cursor: 0,
+            earliest: u64::MAX,
+            service_due: true,
+            service_ran: false,
             lease: None,
             ping: None,
             seq: 0,
@@ -249,6 +259,7 @@ impl<'a> Stack<'a> {
             let _ = routes.add_default_ipv4_route(ipv4(gateway));
         }
         self.lease = Some(*lease);
+        self.service_due = true;
     }
 
     fn remove(&mut self) {
@@ -274,13 +285,28 @@ impl<'a> Stack<'a> {
         touched: &mut u64,
     ) {
         let now = instant(now_ns);
-        self.iface.poll_maintenance(now);
-        let _ = self.iface.poll_egress(now, device, &mut self.service);
-        self.group_at[GROUPS] = Self::deadline(self.iface.poll_at(now, &self.service));
-        for (g, at) in self.group_at[..GROUPS].iter().enumerate() {
-            if at.is_some_and(|at| at <= now_ns) {
-                *due |= 1 << g;
+        // The service's set only when it has work.
+        if self.service_due || self.group_at[GROUPS].is_some_and(|at| at <= now_ns) {
+            self.service_due = false;
+            self.service_ran = true;
+            self.iface.poll_maintenance(now);
+            let _ = self.iface.poll_egress(now, device, &mut self.service);
+            self.group_at[GROUPS] = Self::deadline(self.iface.poll_at(now, &self.service));
+        }
+        // The walk over the deadlines of the groups only when one has come.
+        if now_ns >= self.earliest {
+            let mut earliest = u64::MAX;
+            for (g, at) in self.group_at[..GROUPS].iter_mut().enumerate() {
+                match *at {
+                    Some(t) if t <= now_ns => {
+                        *due |= 1 << g;
+                        *at = None;
+                    }
+                    Some(t) => earliest = earliest.min(t),
+                    None => {}
+                }
             }
+            self.earliest = earliest;
         }
         let mut ran = 0;
         let mut seen = 0;
@@ -320,7 +346,16 @@ impl<'a> Stack<'a> {
                 }
                 other => other,
             };
+            if let Some(t) = self.group_at[g] {
+                self.earliest = self.earliest.min(t);
+            }
         }
+    }
+
+    /// Whether the service's set was passed or took a frame since the last
+    /// call: the DHCP client may have something to say.
+    pub fn take_service_ran(&mut self) -> bool {
+        core::mem::take(&mut self.service_ran)
     }
 
     /// A deadline of smoltcp, in nanoseconds of the counter.
@@ -406,13 +441,8 @@ impl<'a> Stack<'a> {
     /// counter's scale, or None when it waits for a frame: the earliest of
     /// the sets'.
     pub fn next_deadline(&self) -> Option<u64> {
-        self.group_at.iter().flatten().copied().min()
-    }
-
-    /// Whether a set has a deadline already passed.
-    #[allow(dead_code)]
-    pub fn has_due(&self, now_ns: u64) -> bool {
-        self.group_at.iter().flatten().any(|&at| at <= now_ns)
+        let groups = (self.earliest != u64::MAX).then_some(self.earliest);
+        [groups, self.group_at[GROUPS]].into_iter().flatten().min()
     }
 
     /// The change of the DHCP client since the last call, applied to the
@@ -458,6 +488,7 @@ impl<'a> Stack<'a> {
         };
         let mut packet = Icmpv4Packet::new_unchecked(bytes);
         repr.emit(&mut packet, &smoltcp::phy::ChecksumCapabilities::default());
+        self.service_due = true;
         self.ping = Some(Ping {
             seq: self.seq,
             started_ns: now_ns,
@@ -523,6 +554,8 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
                 if dest == Dest::Arp {
                     net.touch_all();
                 }
+                stack.service_ran = true;
+                stack.service_due = true;
                 &mut stack.service
             }
         };

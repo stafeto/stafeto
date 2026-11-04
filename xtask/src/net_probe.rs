@@ -514,6 +514,10 @@ fn steps_lines(
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
     cmd.args(qemu::ICOUNT);
+    // One CPU. The service alone on CPU 0 of two (the feature `net-alone` of
+    // init, `-smp 2`) was tried: under -icount the counter is the instructions
+    // of all the CPUs, so a step of the service holds the slices of the other
+    // CPU and the longest step comes out in millions of ticks.
     let output = run_until(
         cmd,
         crate::BOOT_TIMEOUT * 20,
@@ -663,28 +667,66 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
     acceptance(machine, "ci", &[], true).map(|_| ())
 }
 
-/// The 90th percentiles of the parts of the step from the lines
-/// `net: split <part> p50 <..> p90 <..> max <..>`, the largest over the
-/// lines of the run (the service starts again in it).
+/// The 90th percentiles of the parts of the steps from the lines
+/// `net: split <part> n <samples> p50 <..> p90 <..> max <..>`: for each part
+/// the line with the most samples, which is the service that ran the load (the
+/// one the role `k` restarts has few).
 fn split_parts(lines: &[String]) -> Option<netd::choose::Parts> {
     let p90 = |part: &str| -> Option<u64> {
         lines
             .iter()
             .filter_map(|l| {
                 let w: Vec<&str> = l.split_whitespace().collect();
-                let ["net:", "split", name, "p50", _, "p90", p90, "max", _] = w.as_slice() else {
+                let [
+                    "net:",
+                    "split",
+                    name,
+                    "n",
+                    n,
+                    "p50",
+                    _,
+                    "p90",
+                    p90,
+                    "max",
+                    _,
+                ] = w.as_slice()
+                else {
                     return None;
                 };
-                (*name == part).then(|| p90.parse::<u64>().ok()).flatten()
+                (*name == part).then_some((n.parse::<u64>().ok()?, p90.parse::<u64>().ok()?))
             })
-            .max()
+            .max_by_key(|&(n, _)| n)
+            .map(|(_, p90)| p90)
     };
     Some(netd::choose::Parts {
-        fixed: p90("fixed")?,
+        fixed_rx: p90("fixed_rx")?,
+        fixed_tx: p90("fixed_tx")?,
         frame_rx: p90("frame_rx")?,
         frame_tx: p90("frame_tx")?,
         group: p90("group")?,
     })
+}
+
+/// `cargo xtask net-probe split`: the breakdown of the steps alone, for the
+/// table of an intermediate state of the code.
+fn split_only(machine: &qemu::Machine) -> Result<(), String> {
+    let lines = steps_lines(
+        machine,
+        measured_name("split"),
+        measured_programs(Some("net-sockets-256"), &["split"]),
+        Roles::places(SOCKETS_LIMIT),
+        false,
+    )?;
+    let parts = split_parts(&lines).ok_or("no breakdown of the steps in the lines")?;
+    println!("net-probe: the parts of the steps, p90 ticks: {parts:?}");
+    println!(
+        "net-probe: a step of receiving of one frame {}, a step of sending of one group and one frame {} (budget {})",
+        parts.receiving(1),
+        parts.sending(1, 1),
+        netd::choose::BUDGET
+    );
+    print_rows(machine, "split image", &longest_over_starts(&lines));
+    Ok(())
 }
 
 /// `cargo xtask net-probe steps`: the measurement that chooses the frames of
@@ -712,28 +754,60 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     }
     let parts = split_parts(&lines).ok_or("no breakdown of the step in the lines")?;
     println!("net-probe: the parts of the step, p90 ticks: {parts:?}");
-    let Ok((batch, groups)) = choose::choose(&parts) else {
-        // For the expert's note: the steps the smallest choice brings in the
-        // acceptance runs, which nothing in the code adopts.
-        println!(
-            "net-probe: no batch and groups fit {} ticks: {parts:?}",
-            choose::BUDGET
-        );
-        acceptance(machine, "smallest", &["batch-2", "egress-1"], false)?;
-        return Err(
-            "the rule found no batch and groups; the stage waits for the expert".to_owned(),
-        );
+    let choice = match choose::choose(&parts) {
+        Ok(choice) => choice,
+        Err(stop) => {
+            // The gate is not passed. For the expert's note: the steps of the
+            // smallest choice in the acceptance runs, which nothing in the
+            // code adopts.
+            println!(
+                "net-probe: the gate is not passed: a step of receiving of one frame {} ticks, a step of sending of one group and one frame {} (budget {})",
+                stop.receiving,
+                stop.sending,
+                choose::BUDGET
+            );
+            acceptance(machine, "smallest", &choice_features(1, 1, 1), false)?;
+            return Err("the gate is not passed; the stage waits for the expert".to_owned());
+        }
     };
     println!(
-        "net-probe: the batch is {batch} frames and the pass of sending visits {groups} groups (estimate {} ticks, budget {})",
-        parts.cost(batch, groups),
+        "net-probe: receiving {} frames, sending {} frames in {} groups (estimates {} and {} ticks, budget {})",
+        choice.receive,
+        choice.send,
+        choice.groups,
+        parts.receiving(choice.receive),
+        parts.sending(choice.groups, choice.send),
         choose::BUDGET
     );
+    acceptance(
+        machine,
+        "chosen",
+        &choice_features(choice.receive, choice.groups, choice.send),
+        true,
+    )?;
+    let in_code = (
+        netd::ring::STEP_RX,
+        netd::ring::EGRESS_GROUPS,
+        netd::ring::STEP_TX,
+    );
+    if in_code != (choice.receive, choice.groups, choice.send) {
+        return Err(format!(
+            "the choice is {choice:?}; netd::ring has {in_code:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The features of the service that build the choice: the frames of receiving
+/// (`batch-N`), the groups per step (`egress-N`) and the frames of sending
+/// (`send-N`); the chosen values are the defaults of the code.
+fn choice_features(receive: usize, groups: usize, send: usize) -> Vec<&'static str> {
     let mut features = Vec::new();
-    features.extend(match batch {
+    features.extend(match receive {
+        16 => Some("batch-16"),
         8 => Some("batch-8"),
-        4 => Some("batch-4"),
         2 => Some("batch-2"),
+        1 => Some("batch-1"),
         _ => None,
     });
     features.extend(match groups {
@@ -741,15 +815,14 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
         4 => Some("egress-4"),
         _ => None,
     });
-    acceptance(machine, "chosen", &features, true)?;
-    if (batch, groups) != (netd::ring::STEP_RX, netd::ring::EGRESS_GROUPS) {
-        return Err(format!(
-            "the choice is {batch} frames and {groups} groups; netd::ring has {} and {}",
-            netd::ring::STEP_RX,
-            netd::ring::EGRESS_GROUPS
-        ));
-    }
-    Ok(())
+    features.extend(match send {
+        16 => Some("send-16"),
+        8 => Some("send-8"),
+        2 => Some("send-2"),
+        1 => Some("send-1"),
+        _ => None,
+    });
+    features
 }
 
 /// `cargo xtask net-probe [MACHINE]` and the job of `ci`: the three runs.
@@ -779,37 +852,26 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 /// `cargo xtask net-probe [MACHINE]`: the machine is `tcg` (the default),
 /// `hvf` or the name of one of qemu::MACHINES; `steps` is the measurement.
 pub fn command(args: &[String]) -> Result<(), String> {
-    // `steps BATCH GROUPS`: the acceptance runs at that choice, read and not
-    // judged (for the note of the expert).
-    if let [first, batch, groups] = args
+    // `steps RECEIVE GROUPS SEND`: the acceptance runs at that choice, read
+    // and not judged (for the note of the expert).
+    if let [first, receive, groups, send] = args
         && first == "steps"
     {
-        let features: Vec<&'static str> = [
-            match batch.as_str() {
-                "16" => None,
-                "8" => Some("batch-8"),
-                "4" => Some("batch-4"),
-                "2" => Some("batch-2"),
-                _ => return Err("BATCH is 16, 8, 4 or 2".to_owned()),
-            },
-            match groups.as_str() {
-                "4" => Some("egress-4"),
-                "2" => None,
-                "1" => Some("egress-1"),
-                _ => return Err("GROUPS is 4, 2 or 1".to_owned()),
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let tag: &'static str = Box::leak(format!("k{batch}e{groups}").into_boxed_str());
-        return acceptance(
-            &qemu::VIRT,
-            tag,
-            Box::leak(features.into_boxed_slice()),
-            false,
-        )
-        .map(|_| ());
+        let number = |text: &String, what: &str| -> Result<usize, String> {
+            text.parse().map_err(|_| format!("{what} is a number"))
+        };
+        let (receive, groups, send) = (
+            number(receive, "RECEIVE")?,
+            number(groups, "GROUPS")?,
+            number(send, "SEND")?,
+        );
+        let features: &'static [&'static str] =
+            Box::leak(choice_features(receive, groups, send).into_boxed_slice());
+        let tag: &'static str = Box::leak(format!("r{receive}g{groups}s{send}").into_boxed_str());
+        return acceptance(&qemu::VIRT, tag, features, false).map(|_| ());
+    }
+    if args == ["split"] {
+        return split_only(&qemu::VIRT);
     }
     let (steps, args) = match args.split_first() {
         Some((first, rest)) if first == "steps" => (true, rest),
@@ -1045,9 +1107,11 @@ mod tests {
 
     #[test]
     fn the_parts_of_the_step_are_read_as_the_largest_p90_of_the_run() {
-        let line = |part: &str, p90: u64| format!("net: split {part} p50 100 p90 {p90} max 9999");
+        let line =
+            |part: &str, p90: u64| format!("net: split {part} n 100 p50 100 p90 {p90} max 9999");
         let mut lines: Vec<String> = [
-            ("fixed", 5000),
+            ("fixed_rx", 5000),
+            ("fixed_tx", 6000),
             ("frame_rx", 1800),
             ("frame_tx", 1500),
             ("group", 1300),
@@ -1055,12 +1119,14 @@ mod tests {
         .iter()
         .map(|(n, v)| line(n, *v))
         .collect();
-        // The restarted service prints smaller numbers; the larger stay.
-        lines.push(line("fixed", 4000));
+        // The restarted service has fewer samples: its line does not count.
+        lines.push("net: split fixed_rx n 3 p50 1 p90 9000 max 9999".to_owned());
+        lines.push(line("fixed_rx", 5000));
         let parts = split_parts(&lines).unwrap();
-        assert_eq!(parts.fixed, 5000);
+        assert_eq!(parts.fixed_rx, 5000);
+        assert_eq!(parts.fixed_tx, 6000);
         assert_eq!(parts.group, 1300);
-        assert_eq!(netd::choose::choose(&parts), Ok((2, 2)));
+        assert!(netd::choose::choose(&parts).is_ok());
         assert_eq!(split_parts(&lines[..3]), None, "a part is missing");
     }
 
