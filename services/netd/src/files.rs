@@ -9,6 +9,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use netd::config::{self, FILE_MAX, Settings};
 use posix_fs::{DescriptorFlags, FsError, PosixFs, StartupFiles};
 use rt::Handle;
@@ -42,6 +43,11 @@ pub fn read(parent: &Handle<Channel>) -> Result<Settings, Failure> {
     // SAFETY: initialize_at succeeded, and no reference to the table
     // outlives a call of this module.
     let files = unsafe { (*FILES.0.get()).assume_init_mut() };
+    // A file that cannot be opened for writing leaves the addresses and
+    // /etc/hosts to live without it.
+    if let Err(error) = open_resolv(files) {
+        rt::println!("net: resolv.conf unwritable: {error:?}");
+    }
     let mut text = [0u8; FILE_MAX + 1];
     let outcome = match files.open(b"/etc/netd.conf", proto_fs::READ_ONLY) {
         Err(FsError::NoEntry) => Ok(None),
@@ -61,14 +67,17 @@ pub fn read(parent: &Handle<Channel>) -> Result<Settings, Failure> {
     }
 }
 
-/// Replaces `/etc/resolv.conf` with `text`: root's file of mode 644, made
-/// when it is not there. There is no rename in the service's own file calls,
-/// so the file is truncated and written whole; the short time it is empty
-/// falls on a change of the servers only.
-pub fn write_resolv(text: &[u8]) -> Result<(), FsError> {
-    // SAFETY: `read` initialized the table (the service does not start
-    // without it), and the one thread of the service is the only one here.
-    let files = unsafe { (*FILES.0.get()).assume_init_mut() };
+/// The descriptor of `/etc/resolv.conf`, opened at the start (u32::MAX: none),
+/// and the length of the file as the service left it.
+static RESOLV_FD: AtomicU32 = AtomicU32::new(u32::MAX);
+static RESOLV_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Opens `/etc/resolv.conf` for writing, made root's with mode 644 when it is
+/// not there, and emptied, in the start of the service: the open walks the
+/// path with several calls to the file service, more than a step of the loop
+/// may wait for (the waits of a step stay under CALL_WAIT_MAX). The file
+/// stays open; `write_resolv` rewrites it from its start.
+fn open_resolv(files: &mut PosixFs) -> Result<(), FsError> {
     let flags = proto_fs::WRITE_ONLY | proto_fs::CREATE | proto_fs::TRUNCATE;
     let fd = files.open_policy(
         b"/etc/resolv.conf",
@@ -77,10 +86,29 @@ pub fn write_resolv(text: &[u8]) -> Result<(), FsError> {
         0,
         DescriptorFlags::default(),
     )?;
-    let written = files.write(fd, text);
-    let closed = files.close(fd);
-    match written? {
-        n if n == text.len() => closed,
-        _ => Err(FsError::NoSpace),
+    RESOLV_FD.store(fd, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Writes `text` to `/etc/resolv.conf` from its start. The file service has
+/// no truncate here, so a text shorter than the last is followed by empty
+/// lines to the old end, which the resolver skips.
+pub fn write_resolv(text: &[u8]) -> Result<(), FsError> {
+    let fd = RESOLV_FD.load(Ordering::Relaxed);
+    if fd == u32::MAX {
+        return Err(FsError::BadFileDescriptor);
     }
+    let old = RESOLV_LEN.load(Ordering::Relaxed);
+    let mut padded = [b'\n'; netd::resolv::TEXT_MAX];
+    let total = text.len().max(old).min(padded.len());
+    padded[..text.len()].copy_from_slice(text);
+    // SAFETY: the table is initialized by `read`, which opened the file, and
+    // the one thread of the service is the only one here.
+    let files = unsafe { (*FILES.0.get()).assume_init_mut() };
+    files.lseek(fd, 0, posix_fs::SeekFrom::Start)?;
+    if files.write(fd, &padded[..total])? != total {
+        return Err(FsError::NoSpace);
+    }
+    RESOLV_LEN.store(total, Ordering::Relaxed);
+    Ok(())
 }
