@@ -141,6 +141,22 @@ pub fn arp_claims(frame: &[u8], own: &[[u8; 4]]) -> bool {
             .any(|a| a[..] == frame[ARP_SENDER..ARP_SENDER + 4])
 }
 
+/// An ARP request (RFC 826) from `mac` at `sender` for the hardware address of
+/// `target`, to the broadcast address: the 42 bytes of the frame. smoltcp
+/// learns the sender of an ARP frame aimed at its own address, request or
+/// reply, so the answer fills its neighbour cache.
+pub fn arp_request(mac: [u8; 6], sender: [u8; 4], target: [u8; 4]) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    f[..6].copy_from_slice(&[0xFF; 6]);
+    f[6..12].copy_from_slice(&mac);
+    f[12..14].copy_from_slice(&ETHERTYPE_ARP);
+    f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    f[22..28].copy_from_slice(&mac);
+    f[28..32].copy_from_slice(&sender);
+    f[38..42].copy_from_slice(&target);
+    f
+}
+
 /// Where a frame the stack sends goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -390,6 +406,16 @@ pub fn target(frame: &[u8]) -> Dest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_arp_request_is_a_broadcast_who_has() {
+        let f = super::arp_request([2, 0, 0, 0, 0, 1], [10, 0, 2, 15], [10, 0, 2, 2]);
+        let want: [u8; 42] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 2, 0, 0, 0, 0, 1, 0x08, 0x06, 0, 1, 8, 0, 6, 4, 0,
+            1, 2, 0, 0, 0, 0, 1, 10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 10, 0, 2, 2,
+        ];
+        assert_eq!(f, want);
+    }
+
     use super::*;
 
     fn frame_buffer(num_buffers: u16, frame: &[u8]) -> Vec<u8> {

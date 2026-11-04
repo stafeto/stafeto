@@ -212,6 +212,35 @@ impl TxRing {
         self.counters
     }
 
+    /// Puts the frame of `len` bytes in buffer `n` (the pool's, after its
+    /// header) on the wire: its sums, its header, the queue.
+    fn submit(&mut self, n: u16, len: usize) {
+        // SAFETY: the buffer is the pool's and the device does not hold it.
+        let slice = unsafe { buffer_at(n) };
+        frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
+        let Some(total) = frames::tx_prepare(slice, len) else {
+            self.book.release(n);
+            self.counters.dropped += 1;
+            return;
+        };
+        let dhcp = is_dhcp_client_frame(&slice[HDR_LEN..total]);
+        let shared: &[u8] = &slice[..total];
+        // SAFETY: the buffer is untouched until `reclaim` pops it.
+        let sent = unsafe { self.queue.add(&[shared], &mut []) };
+        match sent {
+            Ok(token) if self.book.sent(token, n) => {
+                self.counters.tx += 1;
+                self.counters.dhcp += u64::from(dhcp);
+                self.dirty = true;
+            }
+            Ok(_) => fail("the ring of sending gave a token twice"),
+            Err(_) => {
+                self.book.release(n);
+                self.counters.dropped += 1;
+            }
+        }
+    }
+
     /// Takes back the buffers the device sent.
     pub fn reclaim(&mut self) {
         while self.queue.can_pop() {
@@ -351,6 +380,32 @@ impl NetDevice {
         }
     }
 
+    /// Queues an ARP request on the wire for the first of `targets` that the
+    /// share of the step and the pool of buffers allow, from the first address
+    /// of the interface (`sender`): the answers fill the stack's neighbour
+    /// cache, so that the first datagram or SYN to the gateway or a name
+    /// server does not wait for smoltcp's one request a second. Gives the
+    /// number of requests queued; a step of sending has a share of
+    /// `STEP_TX` frames, so the caller goes on with the rest in the next step.
+    pub fn ask_neighbours(&mut self, sender: [u8; 4], targets: &[[u8; 4]]) -> usize {
+        let mut queued = 0;
+        for &target in targets {
+            if !self.tx.can_send() || !self.tx.budget.take_tx() {
+                break;
+            }
+            let Some(n) = self.tx.book.alloc() else {
+                break;
+            };
+            let request = frames::arp_request(self.mac, sender, target);
+            // SAFETY: the buffer is the pool's and the device does not hold it.
+            let slice = unsafe { buffer_at(n) };
+            slice[HDR_LEN..HDR_LEN + request.len()].copy_from_slice(&request);
+            self.tx.submit(n, request.len());
+            queued += 1;
+        }
+        queued
+    }
+
     /// The buffers of the loopback the stack is done with go back to the pool
     /// of sending.
     fn reclaim_loop(&mut self) {
@@ -486,28 +541,7 @@ impl TxToken<'_> {
             ring.counters.martian += 1;
             return result;
         }
-        frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
-        let Some(total) = frames::tx_prepare(slice, len) else {
-            ring.book.release(n);
-            ring.counters.dropped += 1;
-            return result;
-        };
-        let dhcp = is_dhcp_client_frame(&slice[HDR_LEN..total]);
-        let shared: &[u8] = &slice[..total];
-        // SAFETY: the buffer is untouched until `reclaim` pops it.
-        let sent = unsafe { ring.queue.add(&[shared], &mut []) };
-        match sent {
-            Ok(token) if ring.book.sent(token, n) => {
-                ring.counters.tx += 1;
-                ring.counters.dhcp += u64::from(dhcp);
-                ring.dirty = true;
-            }
-            Ok(_) => fail("the ring of sending gave a token twice"),
-            Err(_) => {
-                ring.book.release(n);
-                ring.counters.dropped += 1;
-            }
-        }
+        ring.submit(n, len);
         result
     }
 }

@@ -918,6 +918,33 @@ static void write_whole(void)
 	close(s);
 }
 
+/* A bound datagram socket connects to a peer, as nslookup does, then sends
+ * and receives without addresses. */
+static void udp_connect(void)
+{
+	int s = datagram(), c = datagram();
+	struct sockaddr_in a = at(LOOPBACK, 0), from;
+	socklen_t len = sizeof from;
+	char buf[16];
+	REQUIRE(bind(s, (struct sockaddr *)&a, sizeof a) == 0);
+	a = at(LOOPBACK, port_of(s));
+	struct sockaddr_in any = at(0, 0);
+	REQUIRE(bind(c, (struct sockaddr *)&any, sizeof any) == 0);
+	REQUIRE(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(send(c, "ping", 4, 0) == 4);
+	struct pollfd p = { s, POLLIN, 0 };
+	REQUIRE(poll(&p, 1, 10000) == 1);
+	memset(&from, 0, sizeof from);
+	REQUIRE(recvfrom(s, buf, sizeof buf, 0, (struct sockaddr *)&from, &len) == 4);
+	REQUIRE(sendto(s, "pong", 4, 0, (struct sockaddr *)&from, len) == 4);
+	p.fd = c;
+	REQUIRE(poll(&p, 1, 10000) == 1);
+	REQUIRE(recv(c, buf, sizeof buf, 0) == 4);
+	REQUIRE(memcmp(buf, "pong", 4) == 0);
+	close(s);
+	close(c);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -952,6 +979,7 @@ static const struct {
 	{ "peek-waitall", peek_waitall },
 	{ "exec-blocked", exec_blocked },
 	{ "write-whole", write_whole },
+	{ "udp-connect", udp_connect },
 };
 
 static int udp_echo(int port)

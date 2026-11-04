@@ -607,7 +607,7 @@ impl Net {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         if self.socks[place].proto == Proto::Udp {
-            return self.udp_connect(stack, s, place, address, key);
+            return self.udp_connect(stack, s, r, place, address, key);
         }
         self.sync(stack, place, now);
         let sock = self.socks[place];
@@ -743,6 +743,7 @@ impl Net {
         &mut self,
         stack: &mut Stack<'static>,
         s: &mut Sess,
+        r: &mut Request<'_>,
         place: usize,
         address: Address,
         key: Option<u64>,
@@ -761,8 +762,9 @@ impl Net {
             self.socks[place].peer = Some(remote);
             Ok(())
         })();
+        // The caller of a long operation reads its end as a reply of `long`.
         let answer = match result {
-            Ok(()) => ok(),
+            Ok(()) => long_answer(r, long::Reply::Ready(&[])),
             Err(c) => refuse(c),
         };
         self.done(s, key, answer)

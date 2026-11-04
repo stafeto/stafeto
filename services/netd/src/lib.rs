@@ -17,4 +17,5 @@ pub mod frames;
 pub mod lines;
 pub mod places;
 pub mod ports;
+pub mod resolv;
 pub mod ring;

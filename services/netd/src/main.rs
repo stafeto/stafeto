@@ -39,9 +39,9 @@
 #![no_main]
 
 mod calls;
-mod conf;
 mod device;
 mod dma;
+mod files;
 mod net;
 mod seed;
 mod split;
@@ -54,6 +54,7 @@ use device::{DEVICE, NetDevice, RxRing, TxRing};
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
 use netd::lines::Mac;
+use netd::resolv::Text;
 use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
 use proto_net::sockets;
@@ -72,13 +73,15 @@ rt::entry!(main);
 
 /// The bits of the service's notification to itself, each a step of its own:
 /// receiving, sending (also asked by a request), the departure of a session,
-/// the waking of operations, and the sweep of the streams that close.
+/// the waking of operations, the sweep of the streams that close, and the
+/// write of `/etc/resolv.conf`.
 const RX: u64 = 16;
 const TX: u64 = 1;
 const CLEANUP: u64 = 2;
 const WAKE: u64 = 4;
 const SWEEP: u64 = 8;
-const STEP_BITS: u64 = RX | TX | CLEANUP | WAKE | SWEEP;
+const RESOLV: u64 = 32;
+const STEP_BITS: u64 = RX | TX | CLEANUP | WAKE | SWEEP | RESOLV;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
@@ -250,9 +253,9 @@ fn main(_: u64) -> u64 {
     posix_random::erase(&mut key);
     drop(entropy);
 
-    let settings = match conf::read(&s.parent) {
+    let settings = match files::read(&s.parent) {
         Ok(settings) => settings,
-        Err(conf::Failure::Refused(error)) => {
+        Err(files::Failure::Refused(error)) => {
             rt::println!(
                 "net: netd.conf line {}: {}",
                 error.line,
@@ -260,7 +263,7 @@ fn main(_: u64) -> u64 {
             );
             return NO_CONFIG;
         }
-        Err(conf::Failure::Unreadable(error)) => {
+        Err(files::Failure::Unreadable(error)) => {
             rt::println!("net: netd.conf unreadable: {error:?}");
             return NO_CONFIG;
         }
@@ -394,6 +397,9 @@ fn main(_: u64) -> u64 {
         armed: None,
         last_step: 0,
         neighbours_at: 0,
+        ask_due: false,
+        asked: 0,
+        resolv: None,
         #[cfg(feature = "probe")]
         hold: false,
         #[cfg(feature = "probe")]
@@ -404,6 +410,10 @@ fn main(_: u64) -> u64 {
         held_tx: false,
         _maps: (dma_object, net_object, window),
     };
+    // The static address names its servers at once; a lease does in its event.
+    if driver.stack.lease.is_some() {
+        driver.tell(RESOLV);
+    }
     // The line opens once the queues are up; the first step starts the
     // DHCP client.
     virtio_mmio::reopen(&driver.irq);
@@ -493,6 +503,13 @@ struct Driver<'a> {
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
     neighbours_at: u64,
+    /// The gateway and the name servers are to be asked for their hardware
+    /// addresses (a lease came, or the renewal is due).
+    ask_due: bool,
+    /// How many of the targets of the round the requests went out for.
+    asked: usize,
+    /// The text of `/etc/resolv.conf` as the service wrote it last.
+    resolv: Option<Text>,
     /// The probe holds the steps of the stack (HOLD), and an interrupt came
     /// meanwhile.
     #[cfg(feature = "probe")]
@@ -621,6 +638,9 @@ impl Driver<'_> {
         if now >= self.neighbours_at {
             self.addresses();
         }
+        if self.ask_due {
+            self.ask_neighbours();
+        }
         if deadline && self.net.orphans_wait() {
             self.tell(SWEEP);
         }
@@ -680,6 +700,7 @@ impl Driver<'_> {
                 self.net.external = Some(lease.address);
                 self.addresses();
                 self.net.touch_all();
+                self.tell(RESOLV);
                 rt::println!("net: lease {}", lease.summary())
             }
             Some(Event::Lost) => {
@@ -703,7 +724,60 @@ impl Driver<'_> {
         self.device.set_addresses(&own[..count]);
         self.device.seed_neighbours();
         self.neighbours_at = now_ns() + NEIGHBOURS_NS;
+        self.ask_due = true;
+        self.asked = 0;
         self.net.step_due = true;
+    }
+
+    /// Asks the gateway and the name servers on the link for their hardware
+    /// addresses, so that the first datagram or SYN to them finds the entry
+    /// in the neighbour cache: smoltcp sends one request a second for the
+    /// whole interface (`SILENT_TIME` of its neighbour cache), and a lookup
+    /// of a name followed at once by a connection to the gateway would wait
+    /// for the second.
+    fn ask_neighbours(&mut self) {
+        let Some(lease) = self.stack.lease else {
+            self.ask_due = false;
+            return;
+        };
+        let (targets, count) =
+            netd::resolv::neighbours(lease.address, lease.prefix, lease.gateway, &lease.servers);
+        let sent = self
+            .device
+            .ask_neighbours(lease.address, &targets[self.asked.min(count)..count]);
+        self.asked += sent;
+        if self.asked >= count {
+            self.asked = 0;
+            self.ask_due = false;
+        } else {
+            self.net.step_due = true;
+        }
+    }
+
+    /// The step of RESOLV: `/etc/resolv.conf` gets the lease's name servers
+    /// when they differ from what the service wrote last. A lease without
+    /// servers leaves the file as it is.
+    fn resolv_step(&mut self) {
+        rt::service::step_own();
+        let Some(lease) = self.stack.lease else {
+            return;
+        };
+        let text = Text::new(&lease.servers);
+        if text.is_empty() {
+            rt::println!("net: resolv.conf no server");
+            return;
+        }
+        if self.resolv == Some(text) {
+            return;
+        }
+        match files::write_resolv(text.as_bytes()) {
+            Ok(()) => {
+                self.resolv = Some(text);
+                let mut line = [0u8; netd::resolv::TEXT_MAX];
+                rt::println!("net: resolv.conf {}", servers_line(&text, &mut line));
+            }
+            Err(error) => rt::println!("net: resolv.conf unwritable: {error:?}"),
+        }
     }
 
     fn finish_ping(&mut self, end: PingEnd) {
@@ -865,6 +939,26 @@ impl Driver<'_> {
 /// MAC: half the life of an entry of the neighbour cache (60 s).
 const NEIGHBOURS_NS: u64 = 30_000_000_000;
 
+/// The servers of `text` on one line, separated by spaces: the words after
+/// each `nameserver` (the text is the service's own, made by `Text::new`).
+fn servers_line<'a>(text: &Text, out: &'a mut [u8; netd::resolv::TEXT_MAX]) -> &'a str {
+    let mut len = 0;
+    for line in text
+        .as_bytes()
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+    {
+        let server = &line[b"nameserver ".len()..];
+        if len > 0 {
+            out[len] = b' ';
+            len += 1;
+        }
+        out[len..len + server.len()].copy_from_slice(server);
+        len += server.len();
+    }
+    core::str::from_utf8(&out[..len]).unwrap_or("")
+}
+
 /// How long after a step the streams that close are looked at again.
 const SWEEP_NS: u64 = 1_000_000_000;
 
@@ -940,7 +1034,7 @@ impl Service<0> for Driver<'_> {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, TX, WAKE, CLEANUP, SWEEP];
+                let order = [RX, TX, WAKE, CLEANUP, SWEEP, RESOLV];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -973,6 +1067,7 @@ impl Service<0> for Driver<'_> {
                             self.cleanup();
                         }
                     }
+                    RESOLV => self.resolv_step(),
                     _ => {
                         rt::service::step_own();
                         if self.net.sweep(&mut self.stack, now_ns()) {

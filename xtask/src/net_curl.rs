@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// The checks of `net-sock`, in the order the program runs them.
-pub const CHECKS: [&str; 30] = [
+pub const CHECKS: [&str; 31] = [
     "tcp-loop",
     "tcp-own",
     "udp-loop",
@@ -72,6 +72,7 @@ pub const CHECKS: [&str; 30] = [
     "peek-waitall",
     "exec-blocked",
     "write-whole",
+    "udp-connect",
 ];
 
 /// The requests one after the other and those at once.
