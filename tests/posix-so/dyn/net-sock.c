@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <signal.h>
 #include <stdint.h>
@@ -842,6 +843,61 @@ static void peek_waitall(void)
 	close(s);
 }
 
+static void *blocked_accept(void *arg)
+{
+	accept(*(int *)arg, NULL, NULL);
+	return NULL;
+}
+
+/* The threads of the old image that wait in accept do not outlive the exec:
+ * the new image's own accept on the same descriptor gets its operation
+ * (a session holds 16 waiting operations at most). */
+static void exec_blocked(void)
+{
+	int port;
+	int l = listener(LOOPBACK, &port);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		static int fd;
+		pthread_t threads[16];
+		fd = l;
+		for (int i = 0; i < 16; i++)
+			if (pthread_create(&threads[i], NULL, blocked_accept, &fd) != 0)
+				_exit(2);
+		pause_ms(500);
+		char number[16], text[16], address[32];
+		snprintf(number, sizeof number, "%d", l);
+		snprintf(text, sizeof text, "%d", port);
+		snprintf(address, sizeof address, "%u.%u.%u.%u", own >> 24, (own >> 16) & 255,
+			 (own >> 8) & 255, own & 255);
+		char *args[] = { "net-sock", address, "accept-child", text, number, NULL };
+		execv("/bin/net-sock", args);
+		_exit(3);
+	}
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	REQUIRE(WIFEXITED(status));
+	errno = WEXITSTATUS(status);
+	REQUIRE(WEXITSTATUS(status) == 0);
+	close(l);
+}
+
+/* The new image of exec_blocked: connect to the inherited listener and
+ * accept the connection. */
+static int accept_child(int port, int fd)
+{
+	check = "accept-child";
+	int c = connect_to(LOOPBACK, port);
+	struct pollfd p = { fd, POLLIN, 0 };
+	REQUIRE(poll(&p, 1, 5000) == 1);
+	int s = accept(fd, NULL, NULL);
+	REQUIRE(s >= 0);
+	close(s);
+	close(c);
+	return 0;
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -874,6 +930,7 @@ static const struct {
 	{ "clofork", clofork },
 	{ "epipe-unread", epipe_unread },
 	{ "peek-waitall", peek_waitall },
+	{ "exec-blocked", exec_blocked },
 };
 
 static int udp_echo(int port)
@@ -912,6 +969,8 @@ int main(int argc, char **argv)
 		return udp_echo(atoi(argv[3]));
 	if (argc >= 3 && strcmp(argv[2], "udp-send") == 0 && argc == 6)
 		return udp_send(argv[3], atoi(argv[4]), argv[5]);
+	if (argc >= 3 && strcmp(argv[2], "accept-child") == 0 && argc == 5)
+		return accept_child(atoi(argv[3]), atoi(argv[4]));
 	if (argc >= 3 && strcmp(argv[2], "bind-child") == 0 && argc == 5)
 		return bind_child(atoi(argv[3]), atoi(argv[4]));
 	if (argc >= 3 && strcmp(argv[2], "exec-child") == 0 && argc == 4) {
