@@ -81,6 +81,7 @@ fn main(_: u64) -> u64 {
         waiter,
         level,
         told: core::cell::Cell::new(0),
+        crowd: core::cell::Cell::new(0),
     };
     let mut result = Ok(());
     let mut session = None;
@@ -133,6 +134,8 @@ struct Probe<'a> {
     level: u8,
     /// The labels (from TOLD_BASE) of the operations the service told.
     told: core::cell::Cell<u128>,
+    /// The same for the crowd of role `w`.
+    crowd: core::cell::Cell<u128>,
 }
 
 /// What a request to the service came to.
@@ -227,6 +230,10 @@ struct Pairs {
 
 /// The first label of the handles that tell this probe of an operation.
 const TOLD_BASE: u64 = 0x100;
+/// The first label of the 128 operations that wait on one socket (role `w`).
+const CROWD_BASE: u64 = 0x400;
+/// The operations the crowd has: the whole table of the service.
+const CROWD: usize = 128;
 
 /// The most places the role `s` fills, in the pairs of 4 places.
 const PAIRS_MAX: usize = 64;
@@ -282,6 +289,17 @@ impl Probe<'_> {
             && (TOLD_BASE..TOLD_BASE + 128).contains(label)
         {
             self.told.set(self.told.get() | 1 << (label - TOLD_BASE));
+        }
+        if let sys::Received::Notification {
+            source: abi::Source::Session,
+            label,
+            bits,
+            ..
+        } = got
+            && bits & 1 != 0
+            && (CROWD_BASE..CROWD_BASE + CROWD as u64).contains(label)
+        {
+            self.crowd.set(self.crowd.get() | 1 << (label - CROWD_BASE));
         }
     }
 
@@ -1004,18 +1022,19 @@ impl Probe<'_> {
             let mut buffer = [0; MESSAGE_MAX];
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "CANCEL failed")?;
         }
-        // 64 operations wait on one socket (four sessions of 16): one datagram
-        // tells them all, eight at most in a step.
+        // 128 operations wait on one socket (eight sessions of 16, the whole
+        // table of the service): one datagram tells them all, eight at most in
+        // a step.
         let crowd = self.new_blocking(&root, sockets::DGRAM)?;
         self.bind(&root, crowd, [127, 0, 0, 1], 9203)
             .map_err(|_| "BIND failed")?;
-        let mut crowd_sessions: [Option<Handle<Channel>>; 4] = [const { None }; 4];
+        let mut crowd_sessions: [Option<Handle<Channel>>; 8] = [const { None }; 8];
         for (n, slot) in crowd_sessions.iter_mut().enumerate() {
             let session = self
                 .clone_with(&root, &[crowd])
                 .map_err(|_| "CLONE failed")?;
             for k in 0..16u64 {
-                let label = TOLD_BASE + 0x40 + n as u64 * 16 + k;
+                let label = CROWD_BASE + n as u64 * 16 + k;
                 let start = Request::Recv {
                     key: None,
                     description: crowd,
@@ -1042,9 +1061,11 @@ impl Probe<'_> {
         };
         let mut buffer = [0; MESSAGE_MAX];
         socket_call(&root, &to_crowd, &mut buffer).map_err(|_| "SEND failed")?;
-        for label in TOLD_BASE + 0x40..TOLD_BASE + 0x80 {
-            if !self.told_within(label, 5) {
-                return Err("not all 64 operations on one socket were told");
+        let end = self.now() + 10_000_000_000;
+        while self.crowd.get() != u128::MAX {
+            match self.waiter.receive_until(&self.channel, end) {
+                Ok(rt::wait::Waited::Got(got)) => self.note(&got),
+                _ => return Err("not all 128 operations on one socket were told"),
             }
         }
         drop(crowd_sessions);
@@ -1130,7 +1151,7 @@ impl Probe<'_> {
         self.close(&root, sender).map_err(|_| "CLOSE failed")?;
         self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
         config(&root).map_err(|_| "CONFIG refused")?;
-        rt::println!("net-probe: wakes ok {WAITING} and 64");
+        rt::println!("net-probe: wakes ok {WAITING} and {CROWD}");
         *keep = Some(root);
         Ok(())
     }

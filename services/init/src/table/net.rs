@@ -116,7 +116,7 @@ pub const NETD: Record = Record {
 /// N places of the table at once (the digits are N) and 50 pings, `e` the
 /// rates of the loopback, `f` the full batch of a step after a hold of the
 /// service, `a` every group of sockets with work at once, `w` sixteen and
-/// then 64 operations told by one datagram, `i` 150 s of idle, `l` a queue of
+/// then 128 operations told by one datagram, `i` 150 s of idle, `l` a queue of
 /// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
 /// fill a frame, `k` CRASH of the service and the same as `c` through a new
 /// session. The images of the measurement of the steps (`net-sockets-N`) run

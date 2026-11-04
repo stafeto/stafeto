@@ -367,11 +367,12 @@ impl<const N: usize> OrphanQueue<N> {
         for k in 0..self.len {
             let (place, at) = self.entries[(self.head + k) % N];
             if live(usize::from(place), at) {
-                self.entries[kept] = (place, at);
+                // The write trails the read, so no entry is written over
+                // before it is read.
+                self.entries[(self.head + kept) % N] = (place, at);
                 kept += 1;
             }
         }
-        self.head = 0;
         self.len = kept;
     }
 
@@ -573,6 +574,34 @@ impl WakeBudget {
 impl Default for WakeBudget {
     fn default() -> WakeBudget {
         WakeBudget::new()
+    }
+}
+
+/// A walk over the marked places of a set, in order from `cursor` to the
+/// end, at most `checks` places in a call; the next call resumes at `cursor`,
+/// and a call that reaches the end starts the next walk at 0. `next(from)` is
+/// the lowest marked place at or after `from`. `visit(place)` returns false
+/// to leave the place (and the rest) for the next call. True when the end was
+/// reached: the places marked behind the cursor meanwhile ask for a walk of
+/// their own.
+pub fn walk_round(
+    cursor: &mut usize,
+    checks: usize,
+    next: impl Fn(usize) -> Option<usize>,
+    mut visit: impl FnMut(usize) -> bool,
+) -> bool {
+    let mut left = checks;
+    loop {
+        let Some(m) = next(*cursor) else {
+            *cursor = 0;
+            return true;
+        };
+        if left == 0 || !visit(m) {
+            *cursor = m;
+            return false;
+        }
+        left -= 1;
+        *cursor = m + 1;
     }
 }
 
@@ -859,7 +888,7 @@ mod tests {
             q.push(k, 2 * k as u64, live);
         }
         assert_eq!(q.len(), 8);
-        // A new live stream: the stale ones are dropped, not the head.
+        // A new live stream: the stale ones are dropped and the head stays.
         q.push(9, 21, live);
         assert_eq!(q.len(), 2);
         assert_eq!(q.get(0), Some((0, 1)));
@@ -870,6 +899,67 @@ mod tests {
         q.pop();
         assert_eq!(q.front(live), None);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn compacting_a_wrapped_queue_keeps_every_live_entry() {
+        // The head is in the middle of the array and the entries run over
+        // its end; the live ones are the odd times.
+        let live = |_place: usize, at: u64| at % 2 == 1;
+        let mut q = OrphanQueue::<8>::new();
+        for k in 0..6u64 {
+            q.push(k as usize, 100 + k, |_, _| true);
+        }
+        for _ in 0..6 {
+            q.pop();
+        }
+        // Head at 6: eight entries wrap to 0..6.
+        let times = [3u64, 5, 7, 8, 10, 12, 14, 16];
+        for (k, at) in times.into_iter().enumerate() {
+            q.push(10 + k, at, |_, _| true);
+        }
+        assert_eq!(q.len(), 8);
+        q.push(30, 31, live);
+        assert_eq!(q.len(), 4);
+        let got: Vec<_> = (0..q.len()).map(|k| q.get(k).unwrap()).collect();
+        assert_eq!(got, vec![(10, 3), (11, 5), (12, 7), (30, 31)]);
+    }
+
+    #[test]
+    fn a_walk_round_visits_each_place_once_and_resumes() {
+        let marked = [true, false, true, true, false, true, true, false];
+        let next = |from: usize| (from..marked.len()).find(|&i| marked[i]);
+        // Two places a call: 0 2 | 3 5 | 6, and the third call reaches the end.
+        let mut cursor = 0;
+        let mut seen = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            assert!(calls < 10, "the walk must end");
+            let done = walk_round(&mut cursor, 2, next, |m| {
+                seen.push(m);
+                true
+            });
+            if done {
+                break;
+            }
+        }
+        assert_eq!(seen, vec![0, 2, 3, 5, 6]);
+        assert_eq!(calls, 3);
+        assert_eq!(cursor, 0, "the next walk starts at the beginning");
+        // A visit that leaves the place keeps the cursor on it.
+        let mut cursor = 0;
+        assert!(!walk_round(&mut cursor, 16, next, |m| m != 3));
+        assert_eq!(cursor, 3);
+        // Many marked places: a call looks at CHECKS of them at most.
+        let all = |from: usize| (from < 100).then_some(from);
+        let mut cursor = 0;
+        let mut count = 0;
+        assert!(!walk_round(&mut cursor, 32, all, |_| {
+            count += 1;
+            true
+        }));
+        assert_eq!((count, cursor), (32, 32));
     }
 
     #[test]

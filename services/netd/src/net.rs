@@ -69,6 +69,8 @@ const EVICT: usize = 8;
 pub const DEPARTING: usize = SESSIONS;
 /// The descriptions the steps of departure let go of in one step.
 pub const GONE_PORTION: usize = 8;
+/// The aborted streams one step of departure looks at.
+const RST_CHECKS: usize = 4 * GONE_PORTION;
 
 /// The label tag of the sessions Clone makes: none of init's labels.
 pub const OWN: u64 = proto_pipe::OWN;
@@ -305,6 +307,8 @@ pub struct Net {
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
     wake_cursor: usize,
+    /// Where the walk over the aborted streams resumes.
+    rst_cursor: usize,
     /// The operations (by index) that were told and have not taken since:
     /// telling again costs a call of the kernel and tells nothing.
     pub told: u128,
@@ -671,10 +675,9 @@ impl Net {
             return;
         }
         stack.tcp(handle).abort();
-        let sock = &mut self.socks[i];
-        sock.rst_pending = true;
         self.rst_wait.set(i);
         let sock = &mut self.socks[i];
+        sock.rst_pending = true;
         sock.orphan_at = now_ns();
         sock.waiters = 0;
         sock.listener = NO_PLACE;
@@ -746,31 +749,46 @@ impl Net {
             self.abort_place(stack, m);
             left -= 1;
         }
-        // The aborted streams whose RST has gone out. One whose RST has not
-        // gone is marked for the next pass of its group, and its place stays.
-        let mut at = 0;
-        while let Some(m) = self.rst_wait.next(at) {
-            at = m + 1;
-            // A RST that cannot go for a second (no neighbour, no buffer) is
-            // given up: the place is not held for ever.
-            let sent = self.socks[m]
-                .handle
-                .is_none_or(|h| stack.tcp(h).remote_endpoint().is_none())
-                || now_ns().saturating_sub(self.socks[m].orphan_at) > RST_NS;
-            if sent {
+        // The aborted streams whose RST has gone out, a share of them in a
+        // step. One whose RST has not gone stays: the pass of its group asks
+        // for the next step, and the time limit does when no pass comes.
+        let marks = self.rst_wait;
+        let mut cursor = self.rst_cursor;
+        let finished = netd::ring::walk_round(
+            &mut cursor,
+            RST_CHECKS,
+            |from| marks.next(from),
+            |m| {
+                // A RST that cannot go for a second (no neighbour, no buffer)
+                // is given up: the place is not held for ever.
+                let sent = self.socks[m]
+                    .handle
+                    .is_none_or(|h| stack.tcp(h).remote_endpoint().is_none())
+                    || now_ns().saturating_sub(self.socks[m].orphan_at) > RST_NS;
+                if !sent {
+                    return true;
+                }
                 if left == 0 {
-                    break;
+                    return false;
                 }
                 self.socks[m].rst_pending = false;
                 self.release_place(stack, m);
                 left -= 1;
-            } else {
-                self.touch(m);
-            }
+                true
+            },
+        );
+        self.rst_cursor = cursor;
+        if left < GONE_PORTION {
+            self.step_due = true;
         }
         self.departing_used.iter().any(|&w| w != 0)
             || self.release_queue.next(0).is_some()
-            || (left == 0 && self.rst_wait.next(0).is_some())
+            || !finished
+    }
+
+    /// Whether aborted streams wait for their RST.
+    pub fn rst_waiting(&self) -> bool {
+        self.rst_wait.next(0).is_some()
     }
 
     // ----- what a socket is ready for -----

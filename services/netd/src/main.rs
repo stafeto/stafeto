@@ -624,6 +624,9 @@ impl Driver<'_> {
         if deadline && self.net.orphans_wait() {
             self.tell(SWEEP);
         }
+        if deadline && self.net.rst_waiting() {
+            self.net.cleanup_wanted = true;
+        }
         self.finish_step(now);
         rt::service::step_detail(self.device.step_frames() as u64);
         let kernel = split::now();
@@ -734,7 +737,7 @@ impl Driver<'_> {
     /// Sets the timer for the stack's next work (`next`), the PING's
     /// deadline or the sweep of the streams that close, never in the past.
     fn arm(&mut self, now: u64) {
-        let sweep = self.net.orphans_wait().then(|| now + SWEEP_NS);
+        let sweep = (self.net.orphans_wait() || self.net.rst_waiting()).then(|| now + SWEEP_NS);
         let at = [
             self.stack.next_deadline(),
             self.stack.ping.as_ref().map(|p| p.deadline_ns),
@@ -969,7 +972,6 @@ impl Service<0> for Driver<'_> {
                         if self.net.depart_step(&mut self.stack) {
                             self.cleanup();
                         }
-                        self.net.step_due = true;
                     }
                     _ => {
                         rt::service::step_own();
@@ -982,7 +984,8 @@ impl Service<0> for Driver<'_> {
             }
             Source::Timer if n.label == TIMER_LABEL => {
                 self.armed = None;
-                self.tx_step(true)
+                self.tx_step(true);
+                self.after_request();
             }
             _ => {}
         }

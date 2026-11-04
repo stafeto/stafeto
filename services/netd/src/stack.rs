@@ -50,15 +50,19 @@ pub struct Sh {
     pub handle: SocketHandle,
 }
 
+/// The bytes of each ICMP buffer: the echo requests that fill a frame are a
+/// method of the probe.
+const ICMP_BYTES: usize = if cfg!(feature = "probe") { 2048 } else { 1024 };
+
 /// The storage of the sockets and the ICMP socket's buffers, which the
 /// stack borrows; it lives in the service's `.bss`.
 pub struct Storage<'a> {
     sockets: [SocketStorage<'a>; netd::places::SOCKETS_LIMIT],
     service: [SocketStorage<'a>; SERVICE_SLOTS],
     rx_meta: [icmp::PacketMetadata; 4],
-    rx_data: [u8; 2048],
+    rx_data: [u8; ICMP_BYTES],
     tx_meta: [icmp::PacketMetadata; 4],
-    tx_data: [u8; 2048],
+    tx_data: [u8; ICMP_BYTES],
 }
 
 impl Storage<'_> {
