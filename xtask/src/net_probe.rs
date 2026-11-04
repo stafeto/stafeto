@@ -334,8 +334,8 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail). The
 /// service starts again in the run (the role `k` kills it), and each start
-/// counts from nothing, so the longest is taken over all the lines, not the
-/// last of a kind.
+/// counts from nothing, so the longest is taken over all the lines of a
+/// kind.
 fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for line in lines {
