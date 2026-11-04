@@ -6,7 +6,7 @@
 //! `Request::parse` the service's; a body that is short, long or has a
 //! field out of its range is BAD_SIZE.
 
-use crate::{Address, DATA_MAX, Method};
+use crate::{Address, DATA_MAX, Method, SLOT};
 use proto_wire::{Reader, Status, Writer, watch};
 
 /// The most descriptions one CLONE carries.
@@ -21,6 +21,10 @@ pub const NONBLOCK: u32 = 1;
 /// The flags of SEND and RECV.
 pub const PEEK: u32 = 1;
 pub const DONTWAIT: u32 = 2;
+/// The bytes are in a cell of the session's shared buffer (BUFFER): SEND
+/// names the cell and the length, RECV the cell, and no byte travels in the
+/// message.
+pub const BUF: u32 = 4;
 /// The flag of RECV's reply: the datagram was longer than the bytes asked.
 pub const OUT_TRUNC: u32 = 1;
 
@@ -58,6 +62,12 @@ pub mod opt {
     /// SO_RCVTIMEO and SO_SNDTIMEO in milliseconds, 0 for none.
     pub const RCVTIMEO: u32 = 37;
     pub const SNDTIMEO: u32 = 38;
+    /// GETOPT on any description of the session: the sessions that hold a
+    /// shared buffer now (bits 0-15) and the limit of them (bits 16-31).
+    pub const BUFFERS: u32 = 39;
+    /// GETOPT on any description of the session: the KiB that went through
+    /// the shared buffers since the service started (wrapping).
+    pub const BUFFERED: u32 = 40;
     /// The bit of the value of LINGER that says it is on.
     pub const LINGER_ON: u32 = 0x8000_0000;
 }
@@ -294,6 +304,25 @@ pub enum Request<'a> {
         flags: u32,
         most: u32,
     },
+    /// SEND with `BUF`: `len` bytes (1..=`SLOT`) of the cell at `offset` of
+    /// the session's shared buffer.
+    SendCell {
+        key: Option<u64>,
+        description: u32,
+        flags: u32,
+        address: Address,
+        offset: u32,
+        len: u32,
+    },
+    /// RECV with `BUF`: up to `most` bytes (1..=`SLOT`) into the cell at
+    /// `offset`.
+    RecvCell {
+        key: Option<u64>,
+        description: u32,
+        flags: u32,
+        most: u32,
+        offset: u32,
+    },
     Shutdown {
         description: u32,
         how: u32,
@@ -366,6 +395,10 @@ impl<'a> Request<'a> {
             Request::Send { .. } => Method::SendTake,
             Request::Recv { key: None, .. } => Method::Recv,
             Request::Recv { .. } => Method::RecvTake,
+            Request::SendCell { key: None, .. } => Method::Send,
+            Request::SendCell { .. } => Method::SendTake,
+            Request::RecvCell { key: None, .. } => Method::Recv,
+            Request::RecvCell { .. } => Method::RecvTake,
             Request::Shutdown { .. } => Method::Shutdown,
             Request::Close { .. } => Method::Close,
             Request::CloseTake(_) => Method::CloseTake,
@@ -456,6 +489,34 @@ impl<'a> Request<'a> {
                 w.u32(description)?;
                 w.u32(flags)?;
                 w.u32(most)
+            }
+            Request::SendCell {
+                key,
+                description,
+                flags,
+                address,
+                offset,
+                len,
+            } => {
+                put_key(w, key)?;
+                w.u32(description)?;
+                w.u32(flags | BUF)?;
+                address.write(w)?;
+                w.u32(offset)?;
+                w.u32(len)
+            }
+            Request::RecvCell {
+                key,
+                description,
+                flags,
+                most,
+                offset,
+            } => {
+                put_key(w, key)?;
+                w.u32(description)?;
+                w.u32(flags | BUF)?;
+                w.u32(most)?;
+                w.u32(offset)
             }
             Request::Shutdown { description, how } => {
                 w.u32(description)?;
@@ -581,6 +642,21 @@ impl<'a> Request<'a> {
                 let description = b.u32()?;
                 let flags = b.u32()?;
                 let address = Address::read(b)?;
+                if flags & BUF != 0 {
+                    let offset = b.u32()?;
+                    let len = b.u32()?;
+                    if !(1..=SLOT as u32).contains(&len) {
+                        return Err(Status::BadSize);
+                    }
+                    return Ok(Request::SendCell {
+                        key,
+                        description,
+                        flags: flags & !BUF,
+                        address,
+                        offset,
+                        len,
+                    });
+                }
                 let left = b.left();
                 if left > DATA_MAX {
                     return Err(Status::BadSize);
@@ -598,6 +674,19 @@ impl<'a> Request<'a> {
                 let description = b.u32()?;
                 let flags = b.u32()?;
                 let most = b.u32()?;
+                if flags & BUF != 0 {
+                    let offset = b.u32()?;
+                    if !(1..=SLOT as u32).contains(&most) {
+                        return Err(Status::BadSize);
+                    }
+                    return Ok(Request::RecvCell {
+                        key,
+                        description,
+                        flags: flags & !BUF,
+                        most,
+                        offset,
+                    });
+                }
                 if !(1..=DATA_MAX as u32).contains(&most) {
                     return Err(Status::BadSize);
                 }
@@ -837,6 +926,33 @@ pub fn write_received(
     w.bytes(bytes)
 }
 
+/// The data of READY for RECV with `BUF`: the flags, the sender's address
+/// and the count of the bytes the service put into the cell.
+pub fn write_received_count(
+    w: &mut Writer,
+    flags: u32,
+    from: &Address,
+    count: u32,
+) -> Result<(), Status> {
+    w.u32(flags)?;
+    from.write(w)?;
+    w.u32(count)
+}
+
+/// The flags, the sender and the count of a READY of RECV with `BUF`; a
+/// count past `most` is BAD_SIZE.
+pub fn read_received_count(data: &[u8], most: u32) -> Result<(u32, Address, u32), Status> {
+    let mut r = Reader::new(data);
+    let flags = r.u32()?;
+    let from = Address::read(&mut r)?;
+    let count = r.u32()?;
+    r.finish()?;
+    if count > most || flags & !OUT_TRUNC != 0 {
+        return Err(Status::BadSize);
+    }
+    Ok((flags, from, count))
+}
+
 pub fn read_received(data: &[u8]) -> Result<(u32, Address, &[u8]), Status> {
     let mut r = Reader::new(data);
     let flags = r.u32()?;
@@ -956,6 +1072,36 @@ mod tests {
                 description: 4,
                 flags: 0,
                 most: 1,
+            },
+            Request::SendCell {
+                key: None,
+                description: 4,
+                flags: DONTWAIT,
+                address: Address::NONE,
+                offset: 0,
+                len: SLOT as u32,
+            },
+            Request::SendCell {
+                key: Some(10),
+                description: 4,
+                flags: 0,
+                address: Address::NONE,
+                offset: (15 * SLOT) as u32,
+                len: 1,
+            },
+            Request::RecvCell {
+                key: None,
+                description: 4,
+                flags: PEEK,
+                most: SLOT as u32,
+                offset: SLOT as u32,
+            },
+            Request::RecvCell {
+                key: Some(4),
+                description: 4,
+                flags: DONTWAIT,
+                most: 1,
+                offset: 0,
             },
             Request::Shutdown {
                 description: 4,
@@ -1086,6 +1232,68 @@ mod tests {
         let mut long = bytes;
         long.push(0);
         assert_eq!(parsed(&long), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn a_cell_carries_no_bytes_and_asks_for_one_to_a_slot() {
+        let cell = Request::SendCell {
+            key: None,
+            description: 1,
+            flags: 0,
+            address: Address::NONE,
+            offset: 0,
+            len: 1,
+        };
+        let bytes = written(&cell);
+        assert_eq!(bytes.len(), 8 + 4 + 4 + 24 + 4 + 4);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), BUF);
+        for len in [0, SLOT as u32 + 1] {
+            let wrong = Request::SendCell {
+                key: None,
+                description: 1,
+                flags: 0,
+                address: Address::NONE,
+                offset: 0,
+                len,
+            };
+            assert_eq!(parsed(&written(&wrong)), Err(Status::BadSize), "{len}");
+        }
+        let recv = Request::RecvCell {
+            key: None,
+            description: 1,
+            flags: 0,
+            most: SLOT as u32,
+            offset: 0,
+        };
+        assert_eq!(parsed(&written(&recv)), Ok(recv));
+        for most in [0, SLOT as u32 + 1] {
+            let wrong = Request::RecvCell {
+                key: None,
+                description: 1,
+                flags: 0,
+                most,
+                offset: 0,
+            };
+            assert_eq!(parsed(&written(&wrong)), Err(Status::BadSize), "{most}");
+        }
+        // A RECV without BUF still asks for 800 at most.
+        let plain = Request::Recv {
+            key: None,
+            description: 1,
+            flags: 0,
+            most: 801,
+        };
+        assert_eq!(parsed(&written(&plain)), Err(Status::BadSize));
+        // The count of a reply with BUF is at most what was asked.
+        let mut w = Writer::new();
+        write_received_count(&mut w, 0, &address(), 100).unwrap();
+        assert_eq!(
+            read_received_count(w.as_bytes(), 100),
+            Ok((0, address(), 100))
+        );
+        assert_eq!(read_received_count(w.as_bytes(), 99), Err(Status::BadSize));
+        // The options of the buffers are new numbers.
+        assert_eq!((opt::BUFFERS, opt::BUFFERED), (39, 40));
     }
 
     #[test]

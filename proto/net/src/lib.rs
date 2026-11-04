@@ -26,8 +26,9 @@
 //! | LISTEN (3) | description, backlog (u32, held to 1..=16) | status |
 //! | CONNECT (4), CONNECT_TAKE (5) | [k], description, `Address` | long: READY with no data |
 //! | ACCEPT (6), ACCEPT_TAKE (7) | [k], description, flags (u32, NONBLOCK for the new one) | long: READY description, `Address` of the peer |
-//! | SEND (8), SEND_TAKE (9) | [k], description, flags (u32, DONTWAIT 2), `Address` (family 0 when connected), then 0..=800 bytes | long: READY bytes taken (u32) |
-//! | RECV (10), RECV_TAKE (11) | [k], description, flags (u32, PEEK 1, DONTWAIT 2), most (u32, 1..=800) | long: READY flags (u32, OUT_TRUNC 1), `Address` of the sender, bytes |
+//! | SEND (8), SEND_TAKE (9) | [k], description, flags (u32, DONTWAIT 2), `Address` (family 0 when connected), then 0..=800 bytes; with `BUF` 4 in the flags, offset (u32) and len (u32, 1..=`SLOT`) of a cell of the shared buffer and no bytes | long: READY bytes taken (u32) |
+//! | RECV (10), RECV_TAKE (11) | [k], description, flags (u32, PEEK 1, DONTWAIT 2), most (u32, 1..=800); with `BUF` 4, most (1..=`SLOT`) and the offset (u32) of a cell | long: READY flags (u32, OUT_TRUNC 1), `Address` of the sender, bytes; with `BUF`, the count of bytes put into the cell (u32) in place of the bytes |
+//! | BUFFER (25) | size (u32, `BUFFER_SIZE`) and one handle: a memory object of the client with MAP_READ and MAP_WRITE | status: INVALID (size, rights, kind of object), EXISTS (the session has one), LIMIT_REACHED (no room) |
 //! | SHUTDOWN (12) | description, how (u32: 0 read, 1 write, 2 both) | status |
 //! | CLOSE (13), CLOSE_TAKE (35) | [k], description, linger (u32: `CLOSE_MAY_WAIT` when the caller may wait for a `SO_LINGER` close) | long, for a start that answers WAIT; else status |
 //! | EXPORT (23) | description | status and one handle: a pass for the description (copy of the service's channel with a label of `PASS`, right TRANSFER alone) |
@@ -249,6 +250,36 @@ pub fn check_version(header: Header) -> Result<(), Status> {
 /// and the longest reply (RECV: status 4, READY 4, flags 4, address 24,
 /// data) stay below MESSAGE_MAX.
 pub const DATA_MAX: usize = 800;
+
+/// The bytes of a session's shared buffer (BUFFER): the client's memory
+/// object, which the service maps for the session's life.
+pub const BUFFER_SIZE: usize = 262_144;
+/// The bytes of a cell of the shared buffer: one call of the client's at a
+/// time uses a cell, and a request with `BUF` names one.
+pub const SLOT: usize = 16_384;
+/// The cells of a shared buffer.
+pub const SLOTS: usize = BUFFER_SIZE / SLOT;
+
+/// Whether `offset` and `len` name bytes of one cell: the offset of a cell
+/// and a length of 1..=`SLOT` inside the buffer.
+pub const fn cell_fits(offset: u32, len: u32) -> bool {
+    let (offset, len) = (offset as usize, len as usize);
+    offset % SLOT == 0 && len >= 1 && len <= SLOT && offset + len <= BUFFER_SIZE
+}
+
+/// The request BUFFER: the header and the size; the object goes as the
+/// request's one handle.
+pub fn write_buffer(size: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Buffer.header().write(w)?;
+    w.u32(size)
+}
+
+/// The size of BUFFER from `body`: BAD_SIZE unless it is one u32.
+pub fn read_buffer(mut body: Reader<'_>) -> Result<u32, Status> {
+    let size = body.u32()?;
+    body.finish()?;
+    Ok(size)
+}
 
 /// The values of HOLD's argument.
 pub const HOLD_OFF: u32 = 0;
@@ -655,6 +686,25 @@ mod tests {
             Err(Status::BadSize)
         );
         assert_eq!(read_hold(Reader::new(&[1, 0])), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn buffer_round_trips_and_its_cells_are_checked() {
+        let mut w = Writer::new();
+        write_buffer(BUFFER_SIZE as u32, &mut w).unwrap();
+        let mut r = Reader::new(w.as_bytes());
+        assert_eq!(Header::read(&mut r).unwrap(), Method::Buffer.header());
+        assert_eq!(read_buffer(r), Ok(BUFFER_SIZE as u32));
+        assert_eq!(read_buffer(Reader::new(&[1, 0])), Err(Status::BadSize));
+        assert_eq!(SLOTS, 16);
+        assert!(cell_fits(0, SLOT as u32));
+        assert!(cell_fits((15 * SLOT) as u32, 1));
+        assert!(!cell_fits(0, 0));
+        assert!(!cell_fits(0, SLOT as u32 + 1));
+        assert!(!cell_fits(1, 1));
+        assert!(!cell_fits((255 * 1024) as u32, SLOT as u32));
+        assert!(!cell_fits(BUFFER_SIZE as u32, 1));
+        assert!(!cell_fits(u32::MAX - (u32::MAX % SLOT as u32), SLOT as u32));
     }
 
     #[test]
