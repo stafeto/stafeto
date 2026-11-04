@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The breakdown of the step of the stack by parts (the feature `split`,
+//! which only the images of the measurement turn on): the marks of the
+//! counter at the borders of the parts, a histogram of 64 buckets of 256
+//! ticks for each part, and the lines `net: split <part> p50 <..> p90 <..>
+//! max <..>` that CONFIG of the probe prints. The preemption of the service
+//! by others only adds time, so p50 and p90 say more than the maximum.
+//!
+//! The parts: `fixed` what a step costs besides the frames and the passes of
+//! groups; `frame_rx` a received frame, from the ring to the stack's answer,
+//! without the frames the stack sent in it; `frame_tx` a frame sent; `group`
+//! the pass of sending over one group and its deadline, without the frames it
+//! sent; `kernel` the calls of the kernel at the end of the step.
+
+#[cfg(feature = "split")]
+mod on {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub const FIXED: usize = 0;
+    pub const FRAME_RX: usize = 1;
+    pub const FRAME_TX: usize = 2;
+    pub const GROUP: usize = 3;
+    pub const KERNEL: usize = 4;
+    const NAMES: [&str; 5] = ["fixed", "frame_rx", "frame_tx", "group", "kernel"];
+    const BUCKETS: usize = 64;
+    const WIDTH: u64 = 256;
+
+    static HIST: [[AtomicU64; BUCKETS]; 5] = [const { [const { AtomicU64::new(0) }; BUCKETS] }; 5];
+    static MAX: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    /// The ticks of the frames sent in the step so far, of the frames
+    /// received (the whole turn of the loop) and of the passes of groups
+    /// (the whole pass).
+    pub static TX: AtomicU64 = AtomicU64::new(0);
+    pub static RX_TURNS: AtomicU64 = AtomicU64::new(0);
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn now() -> u64 {
+        rt::time::now()
+    }
+
+    pub fn record(part: usize, ticks: u64) {
+        let bucket = ((ticks / WIDTH) as usize).min(BUCKETS - 1);
+        HIST[part][bucket].fetch_add(1, Relaxed);
+        MAX[part].fetch_max(ticks, Relaxed);
+    }
+
+    pub fn begin_step() {
+        TX.store(0, Relaxed);
+        RX_TURNS.store(0, Relaxed);
+        PASSES.store(0, Relaxed);
+    }
+
+    pub fn add(counter: &AtomicU64, ticks: u64) {
+        counter.fetch_add(ticks, Relaxed);
+    }
+
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Relaxed)
+    }
+
+    fn percentile(part: usize, percent: u64) -> u64 {
+        let total: u64 = HIST[part].iter().map(|b| b.load(Relaxed)).sum();
+        if total == 0 {
+            return 0;
+        }
+        let want = (total * percent).div_ceil(100);
+        let mut seen = 0;
+        for (i, b) in HIST[part].iter().enumerate() {
+            seen += b.load(Relaxed);
+            if seen >= want {
+                return (i as u64 + 1) * WIDTH;
+            }
+        }
+        BUCKETS as u64 * WIDTH
+    }
+
+    pub fn report() {
+        for (part, name) in NAMES.iter().enumerate() {
+            rt::println!(
+                "net: split {} p50 {} p90 {} max {}",
+                name,
+                percentile(part, 50),
+                percentile(part, 90),
+                MAX[part].load(Relaxed)
+            );
+        }
+    }
+}
+
+#[cfg(feature = "split")]
+pub use on::*;
+
+#[cfg(not(feature = "split"))]
+mod off {
+    use core::sync::atomic::AtomicU64;
+
+    pub const FIXED: usize = 0;
+    pub const FRAME_RX: usize = 1;
+    pub const FRAME_TX: usize = 2;
+    pub const GROUP: usize = 3;
+    pub const KERNEL: usize = 4;
+    pub static TX: AtomicU64 = AtomicU64::new(0);
+    pub static RX_TURNS: AtomicU64 = AtomicU64::new(0);
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    pub fn now() -> u64 {
+        0
+    }
+    #[inline(always)]
+    pub fn record(_: usize, _: u64) {}
+    #[inline(always)]
+    pub fn begin_step() {}
+    #[inline(always)]
+    pub fn add(_: &AtomicU64, _: u64) {}
+    #[inline(always)]
+    pub fn get(_: &AtomicU64) -> u64 {
+        0
+    }
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub fn report() {}
+}
+
+#[cfg(not(feature = "split"))]
+pub use off::*;

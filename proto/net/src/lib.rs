@@ -9,7 +9,7 @@
 //! The first stage answers CONFIG, and PING and CRASH in a build with the
 //! feature `probe`; the second answers the sockets' methods of TCP and UDP
 //! over IPv4, with a loopback. A method of a later stage takes the next free
-//! number between 30 and 61. All the numbers are below 64: the steps of the
+//! number between 31 and 61. All the numbers are below 64: the steps of the
 //! service loop count the methods up to the notice at 64.
 //!
 //! A socket is a description, one u32 on the wire: the place in the
@@ -40,6 +40,7 @@
 //! | CANCEL (27) | k (u64) | long: CANCELLED |
 //! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
+//! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address); only a service built with the feature `probe` has it | status |
 //! | CRASH (63) | the header alone | none: the service ends with a fault; only a service built with the feature `probe` has it |
 //!
 //! An address on the wire is the family (u32, INET = 2 for IPv4; 0 for
@@ -89,12 +90,13 @@ pub enum Method {
     Cancel = 27,
     WatchTake = 28,
     WatchCancel = 29,
+    Hold = 30,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 31] = [
+    pub const ALL: [Method; 32] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -124,6 +126,7 @@ impl Method {
         Method::Cancel,
         Method::WatchTake,
         Method::WatchCancel,
+        Method::Hold,
         Method::Ping,
         Method::Crash,
     ];
@@ -221,6 +224,27 @@ pub fn check_version(header: Header) -> Result<(), Status> {
 /// and the longest reply (RECV: status 4, READY 4, flags 4, address 24,
 /// data) stay below MESSAGE_MAX.
 pub const DATA_MAX: usize = 800;
+
+/// The values of HOLD's argument.
+pub const HOLD_OFF: u32 = 0;
+pub const HOLD_ON: u32 = 1;
+pub const HOLD_ADDRESS: u32 = 2;
+
+/// The request HOLD with its argument.
+pub fn write_hold(value: u32, w: &mut Writer) -> Result<(), Status> {
+    Method::Hold.header().write(w)?;
+    w.u32(value)
+}
+
+/// The argument of HOLD from `body`: BAD_SIZE unless it is one of the three.
+pub fn read_hold(mut body: Reader<'_>) -> Result<u32, Status> {
+    let value = body.u32()?;
+    body.finish()?;
+    match value {
+        HOLD_OFF | HOLD_ON | HOLD_ADDRESS => Ok(value),
+        _ => Err(Status::BadSize),
+    }
+}
 
 /// The family of an IPv4 address on the wire.
 pub const INET: u32 = 2;
@@ -425,14 +449,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=29).collect();
+        let mut expected: Vec<u16> = (1..=30).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(30), None);
+        assert_eq!(Method::from_number(31), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
@@ -573,6 +597,22 @@ mod tests {
         let mut wide = body;
         wide[8 + 4] = 1;
         assert_eq!(read_ping(Reader::new(&wide)), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn hold_round_trips_and_takes_three_values() {
+        for value in [HOLD_OFF, HOLD_ON, HOLD_ADDRESS] {
+            let mut w = Writer::new();
+            write_hold(value, &mut w).unwrap();
+            let mut r = Reader::new(w.as_bytes());
+            assert_eq!(Header::read(&mut r).unwrap(), Method::Hold.header());
+            assert_eq!(read_hold(r), Ok(value));
+        }
+        assert_eq!(
+            read_hold(Reader::new(&3u32.to_le_bytes())),
+            Err(Status::BadSize)
+        );
+        assert_eq!(read_hold(Reader::new(&[1, 0])), Err(Status::BadSize));
     }
 
     #[test]

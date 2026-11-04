@@ -36,6 +36,18 @@ pub const BATCH: usize = 4;
 pub const BATCH: usize = 2;
 pub const STEP_RX: usize = BATCH;
 pub const STEP_TX: usize = BATCH;
+/// The groups of sockets the pass of sending visits in one step. The
+/// features `egress-1` and `egress-4` are for the measurement that chose it.
+#[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
+pub const EGRESS_GROUPS: usize = 2;
+#[cfg(feature = "egress-1")]
+pub const EGRESS_GROUPS: usize = 1;
+#[cfg(all(feature = "egress-4", not(feature = "egress-1")))]
+pub const EGRESS_GROUPS: usize = 4;
+/// The notifications to clients and the checks of readiness the step of
+/// waking does at most (the pipe service wakes eight at most).
+pub const WAKE_TELLS: usize = 8;
+pub const WAKE_CHECKS: usize = 32;
 /// The frames the loopback keeps for the next step: two steps of sending.
 pub const LOOP_FRAMES: usize = 2 * STEP_TX;
 
@@ -245,6 +257,47 @@ impl Default for LoopBook {
     }
 }
 
+/// What the step of waking may still do: WAKE_TELLS notifications and
+/// WAKE_CHECKS checks of readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeBudget {
+    tells: usize,
+    checks: usize,
+}
+
+impl WakeBudget {
+    pub const fn new() -> WakeBudget {
+        WakeBudget {
+            tells: WAKE_TELLS,
+            checks: WAKE_CHECKS,
+        }
+    }
+
+    /// Spends a check; false when the step has had its share.
+    pub fn take_check(&mut self) -> bool {
+        self.checks = match self.checks.checked_sub(1) {
+            Some(left) => left,
+            None => return false,
+        };
+        true
+    }
+
+    /// Spends a notification; false when the step has had its share.
+    pub fn take_tell(&mut self) -> bool {
+        self.tells = match self.tells.checked_sub(1) {
+            Some(left) => left,
+            None => return false,
+        };
+        true
+    }
+}
+
+impl Default for WakeBudget {
+    fn default() -> WakeBudget {
+        WakeBudget::new()
+    }
+}
+
 /// What one step of the service may still do: receive STEP_RX frames and
 /// send STEP_TX (spec 6: a step is bounded so that a burst of frames
 /// cannot hold the loop).
@@ -408,6 +461,19 @@ mod tests {
         book.done();
         assert!(book.push().is_some());
         assert_eq!(book.waiting(), LOOP_FRAMES);
+    }
+
+    #[test]
+    fn the_step_of_waking_tells_eight_and_checks_thirty_two() {
+        let mut budget = WakeBudget::new();
+        for _ in 0..WAKE_TELLS {
+            assert!(budget.take_tell());
+        }
+        assert!(!budget.take_tell());
+        for _ in 0..WAKE_CHECKS {
+            assert!(budget.take_check());
+        }
+        assert!(!budget.take_check());
     }
 
     #[test]

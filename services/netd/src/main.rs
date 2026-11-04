@@ -44,6 +44,7 @@ mod device;
 mod dma;
 mod net;
 mod seed;
+mod split;
 mod stack;
 
 use abi::{Access, Rights, Source};
@@ -74,6 +75,8 @@ rt::entry!(main);
 /// due, and a step of the departure of a session is due.
 const STEP: u64 = 1;
 const CLEANUP: u64 = 2;
+/// The step of waking the operations that wait.
+const WAKE: u64 = 4;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
@@ -160,6 +163,24 @@ fn read_config(transport: &MmioTransport<'static>) -> Result<([u8; 6], bool), ()
         .map_err(|_| ())
 }
 
+/// 16 bytes for the table of destinations from the key of the ports and 8
+/// bytes more of the entropy service's key: two SipHash-2-4 values of them.
+#[allow(deprecated)] // SipHasher is in core and has no replacement there.
+fn demux_secret(ports_key: &[u8; 16], tail: &[u8]) -> [u8; 16] {
+    use core::hash::{Hasher, SipHasher};
+    let k0 = u64::from_le_bytes(ports_key[..8].try_into().expect("8 bytes"));
+    let k1 = u64::from_le_bytes(ports_key[8..].try_into().expect("8 bytes"));
+    let mut out = [0u8; 16];
+    for (n, half) in out.chunks_mut(8).enumerate() {
+        let mut hash = SipHasher::new_with_keys(k0, k1);
+        hash.write(b"demux");
+        hash.write(&[n as u8]);
+        hash.write(tail);
+        half.copy_from_slice(&hash.finish().to_le_bytes());
+    }
+    out
+}
+
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -222,6 +243,9 @@ fn main(_: u64) -> u64 {
     let random_seed = u64::from_le_bytes(first);
     let mut ports_key = [0; 16];
     ports_key.copy_from_slice(&key[8..24]);
+    // The secret of the table of destinations: a hash of the key of the ports
+    // and the rest of the key.
+    let demux_key = demux_secret(&ports_key, &key[24..32]);
     posix_random::erase(&mut key);
     drop(entropy);
 
@@ -314,7 +338,7 @@ fn main(_: u64) -> u64 {
     // zeroed memory of the static.
     let tables = unsafe {
         let pointer = (*TABLES.0.get()).as_mut_ptr();
-        Tables::initialize_at(pointer, ports_key, &s.parent, &channel, level);
+        Tables::initialize_at(pointer, ports_key, demux_key, &s.parent, &channel, level);
         &mut *pointer
     };
     posix_random::erase(&mut ports_key);
@@ -356,6 +380,7 @@ fn main(_: u64) -> u64 {
     net.external = stack.lease.map(|lease| lease.address);
     let (own, count) = stack.addresses();
     device.set_addresses(&own[..count]);
+    device.seed_neighbours();
     let mut driver = Driver {
         transport,
         device,
@@ -371,6 +396,12 @@ fn main(_: u64) -> u64 {
         line_closed: false,
         told: 0,
         cleanup_due: false,
+        armed: None,
+        neighbours_at: 0,
+        #[cfg(feature = "probe")]
+        hold: false,
+        #[cfg(feature = "probe")]
+        held_irq: false,
         _maps: (dma_object, net_object, window),
     };
     // The line opens once the queues are up; the first step starts the
@@ -410,6 +441,7 @@ impl Tables {
     unsafe fn initialize_at(
         tables: *mut Tables,
         key: [u8; 16],
+        demux_key: [u8; 16],
         parent: &Handle<Channel>,
         channel: &Handle<Channel>,
         level: u8,
@@ -417,7 +449,14 @@ impl Tables {
         use core::ptr::addr_of_mut;
         // SAFETY: each field is in bounds and written once.
         unsafe {
-            Net::initialize_at(addr_of_mut!((*tables).net), key, parent, channel, level);
+            Net::initialize_at(
+                addr_of_mut!((*tables).net),
+                key,
+                demux_key,
+                parent,
+                channel,
+                level,
+            );
             Storage::initialize_at(addr_of_mut!((*tables).storage));
             rt::bss::fill_none(addr_of_mut!((*tables).sessions));
         }
@@ -447,6 +486,16 @@ struct Driver<'a> {
     told: u64,
     /// A step of departure is due that no notification told.
     cleanup_due: bool,
+    /// The deadline the timer is set for.
+    armed: Option<u64>,
+    /// When the neighbour entries of the own addresses are renewed.
+    neighbours_at: u64,
+    /// The probe holds the steps of the stack (HOLD), and an interrupt came
+    /// meanwhile.
+    #[cfg(feature = "probe")]
+    hold: bool,
+    #[cfg(feature = "probe")]
+    held_irq: bool,
     _maps: (Handle<Memory>, Handle<Memory>, Handle<Memory>),
 }
 
@@ -492,6 +541,13 @@ impl Driver<'_> {
     /// (`deadline`).
     fn step(&mut self, interrupt: bool, deadline: bool) {
         rt::service::step_own();
+        #[cfg(feature = "probe")]
+        if self.hold {
+            self.held_irq |= interrupt;
+            return;
+        }
+        let began = split::now();
+        split::begin_step();
         if interrupt {
             self.line_closed = true;
             let isr = Isr::read(&mut self.transport);
@@ -502,30 +558,44 @@ impl Driver<'_> {
         let now = now_ns();
         self.device.rx.begin_step();
         self.device.tx.begin_step();
-        self.stack.ingress(now, &mut self.device);
-        self.stack.egress(now, &mut self.device);
+        stack::ingress(&mut self.stack, &mut self.device, self.net, now);
+        self.stack.egress(
+            now,
+            &mut self.device,
+            &mut self.net.due,
+            &mut self.net.touched,
+        );
         self.events(now);
-        self.net.wake(&mut self.stack, now);
+        if now >= self.neighbours_at {
+            self.addresses();
+        }
         if deadline {
             self.net.sweep(&mut self.stack, now);
+        }
+        // The operations that wait are looked at by a step of their own.
+        self.net.schedule_wake();
+        if self.net.wake_due.next(0).is_some() {
+            self.tell(WAKE);
         }
         self.doorbells();
         let frames = self.device.step_frames();
         rt::service::step_detail(frames as u64);
         // Frames the share of the step left in the queue or in the loop, or
-        // work the stack has at once after a step that made progress:
-        // another step, with the line closed. A refused notification opens
-        // the line instead: the level brings the interrupt back for the
-        // frames still in the queue.
-        let next = self.stack.poll_at_ns(now);
-        let more = self.device.rx.queue.can_pop()
-            || self.device.looped.waiting() > 0
-            || (frames > 0 && next.is_some_and(|at| at <= now));
+        // groups with work left: another step, with the line closed. A
+        // refused notification opens the line instead: the level brings the
+        // interrupt back for the frames still in the queue.
+        let more =
+            self.device.rx.queue.can_pop() || self.device.looped.waiting() > 0 || self.net.due != 0;
+        let kernel = split::now();
         let continued = more && self.want_step();
         if !continued && core::mem::take(&mut self.line_closed) {
             virtio_mmio::reopen(&self.irq);
         }
-        self.arm(now, next);
+        self.arm(now);
+        let end = split::now();
+        split::record(split::KERNEL, end - kernel);
+        let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
+        split::record(split::FIXED, (end - began).saturating_sub(counted));
     }
 
     /// The change of the link (the interrupt's configuration bit).
@@ -545,11 +615,13 @@ impl Driver<'_> {
             Some(Event::Leased(lease)) => {
                 self.net.external = Some(lease.address);
                 self.addresses();
+                self.net.touch_all();
                 rt::println!("net: lease {}", lease.summary())
             }
             Some(Event::Lost) => {
                 self.net.external = None;
                 self.addresses();
+                self.net.touch_all();
                 rt::println!("net: lease lost")
             }
             None => {}
@@ -565,6 +637,9 @@ impl Driver<'_> {
     fn addresses(&mut self) {
         let (own, count) = self.stack.addresses();
         self.device.set_addresses(&own[..count]);
+        self.device.seed_neighbours();
+        self.neighbours_at = now_ns() + NEIGHBOURS_NS;
+        self.net.step_due = true;
     }
 
     fn finish_ping(&mut self, end: PingEnd) {
@@ -597,14 +672,26 @@ impl Driver<'_> {
 
     /// Sets the timer for the stack's next work (`next`), the PING's
     /// deadline or the sweep of the streams that close, never in the past.
-    fn arm(&mut self, now: u64, next: Option<u64>) {
+    fn arm(&mut self, now: u64) {
         let sweep = self.net.orphans_wait().then(|| now + SWEEP_NS);
-        let at = [next, self.stack.ping.as_ref().map(|p| p.deadline_ns), sweep]
-            .into_iter()
-            .flatten()
-            .min();
+        let at = [
+            self.stack.next_deadline(),
+            self.stack.ping.as_ref().map(|p| p.deadline_ns),
+            sweep,
+            Some(self.neighbours_at),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         if let Some(at) = at {
-            let _ = sys::timer_set(&self.timer, at.max(now + 1_000_000));
+            let at = at.max(now + 1_000_000);
+            // The timer is set when there is none or the new deadline is
+            // earlier: a later one finds the timer firing early and a step
+            // that sets it again.
+            if self.armed.is_none_or(|armed| at < armed || armed <= now) {
+                let _ = sys::timer_set(&self.timer, at);
+                self.armed = Some(at);
+            }
         }
     }
 
@@ -637,14 +724,39 @@ impl Driver<'_> {
         let (rx, rx_dropped, rx_martian) = self.device.rx.counters();
         let tx = self.device.tx.counters();
         rt::println!(
-            "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {}",
+            "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {} bad_sum {} demux_probe {}",
             rx,
             tx.tx,
             tx.dhcp,
             rx_dropped + tx.dropped,
             rx_martian + tx.martian,
-            self.net.counters.listen_short
+            self.net.counters.listen_short,
+            self.device.bad_sum,
+            self.net.demux.probe_max
         );
+        split::report();
+    }
+
+    /// HOLD: the steps of the stack wait (1), go on (0), or every group of
+    /// sockets is marked as having work (2).
+    #[cfg(feature = "probe")]
+    fn hold(&mut self, r: &mut Request<'_>) -> Answer {
+        let value = match proto_net::read_hold(r.body()) {
+            Ok(value) => value,
+            Err(status) => return Answer::Status(status),
+        };
+        match value {
+            proto_net::HOLD_ON => self.hold = true,
+            proto_net::HOLD_OFF => {
+                self.hold = false;
+                self.net.step_due = true;
+            }
+            _ => {
+                self.net.touch_all();
+                self.net.step_due = true;
+            }
+        }
+        Answer::Status(Status::Ok)
     }
 
     /// PING: an echo request to the address; the reply comes from the step
@@ -681,6 +793,10 @@ impl Driver<'_> {
     }
 }
 
+/// How often the stack is told again that its own addresses are at its own
+/// MAC: half the life of an entry of the neighbour cache (60 s).
+const NEIGHBOURS_NS: u64 = 30_000_000_000;
+
 /// How long after a step the streams that close are looked at again.
 const SWEEP_NS: u64 = 1_000_000_000;
 
@@ -689,7 +805,7 @@ const SWEEP_NS: u64 = 1_000_000_000;
 /// UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 30, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
@@ -709,6 +825,8 @@ impl Service<0> for Driver<'_> {
             Some(Method::Ping) => self.ping(r),
             #[cfg(feature = "probe")]
             Some(Method::Crash) => crash(r),
+            #[cfg(feature = "probe")]
+            Some(Method::Hold) => self.hold(r),
             Some(method) => match sockets::Request::parse(method, r.body()) {
                 Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
                 Some(Err(status)) => Answer::Status(status),
@@ -747,8 +865,15 @@ impl Service<0> for Driver<'_> {
     fn notification(&mut self, n: Notice) {
         match n.source {
             Source::Interrupt => self.step(true, false),
-            Source::Unlabeled if n.bits & (STEP | CLEANUP) != 0 => {
+            Source::Unlabeled if n.bits & (STEP | CLEANUP | WAKE) != 0 => {
                 self.told &= !n.bits;
+                if n.bits & WAKE != 0 {
+                    rt::service::step_own();
+                    let now = now_ns();
+                    if self.net.wake(&mut self.stack, now) {
+                        self.tell(WAKE);
+                    }
+                }
                 if n.bits & CLEANUP != 0 {
                     rt::service::step_own();
                     if self.net.depart_step(&mut self.stack) {
@@ -757,11 +882,18 @@ impl Service<0> for Driver<'_> {
                     self.net.step_due = true;
                 }
                 if n.bits & STEP != 0 {
-                    self.step(false, false);
+                    #[cfg(feature = "probe")]
+                    let irq = core::mem::take(&mut self.held_irq);
+                    #[cfg(not(feature = "probe"))]
+                    let irq = false;
+                    self.step(irq, false);
                 }
                 self.after_request();
             }
-            Source::Timer if n.label == TIMER_LABEL => self.step(false, true),
+            Source::Timer if n.label == TIMER_LABEL => {
+                self.armed = None;
+                self.step(false, true)
+            }
             _ => {}
         }
     }

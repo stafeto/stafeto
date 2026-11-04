@@ -15,7 +15,7 @@
 
 use crate::dma::{Host, net_at};
 use core::cell::{Cell, RefCell};
-use netd::frames::{self, BUFFER_LEN, HDR_LEN, MAX_FRAME, Route};
+use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::is_dhcp_client_frame;
 use netd::ring::{Budget, LOOP_FRAMES, LoopBook, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
@@ -51,7 +51,7 @@ fn fail(what: &str) -> ! {
 ///
 /// The device does not hold buffer `n` (it is not between `add` and
 /// `pop_used`), and the caller holds no other reference to it.
-unsafe fn buffer<'a>(n: u16) -> &'a mut [u8] {
+unsafe fn buffer_at<'a>(n: u16) -> &'a mut [u8] {
     // SAFETY: the object `net` is mapped read and write at net_at(DEVICE)
     // for the service's life; the offset is within it (ring::offset).
     unsafe { core::slice::from_raw_parts_mut((net_at(DEVICE) + offset(n)) as *mut u8, BUFFER_LEN) }
@@ -84,11 +84,11 @@ impl RxRing {
     }
 
     /// Puts buffer `n` in the queue.
-    fn give(&mut self, n: u16) {
+    pub(crate) fn give(&mut self, n: u16) {
         // SAFETY: the device does not hold the buffer (the books say so:
         // it is new or was popped), and nothing else refers to it until
         // `pop_used` returns it.
-        let slice = unsafe { buffer(n) };
+        let slice = unsafe { buffer_at(n) };
         // SAFETY: the buffer stays untouched until `take` pops it.
         let token = unsafe { self.queue.add(&[], &mut [slice]) };
         match token {
@@ -120,7 +120,7 @@ impl RxRing {
 
     /// Takes the next used buffer: its number and the length of its frame,
     /// dropping (and returning to the queue) the buffers that hold none.
-    fn pop(&mut self) -> Option<(u16, usize)> {
+    pub(crate) fn pop(&mut self) -> Option<(u16, usize)> {
         loop {
             if !self.queue.can_pop() {
                 return None;
@@ -132,7 +132,7 @@ impl RxRing {
                 fail("a used buffer the ring of receiving does not hold");
             };
             // SAFETY: the device returned the buffer (it is used).
-            let slice = unsafe { buffer(n) };
+            let slice = unsafe { buffer_at(n) };
             // SAFETY: the same buffer `give` added with this token.
             let popped = unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) };
             let Ok(used) = popped else {
@@ -190,6 +190,12 @@ impl TxRing {
         self.reclaim();
     }
 
+    /// Whether the step may still send a frame: its share is not spent and a
+    /// buffer is free.
+    pub fn can_send(&self) -> bool {
+        self.budget.tx_left() > 0 && self.book.free() > 0
+    }
+
     /// The frames the step sent.
     pub fn sent(&self) -> usize {
         self.budget.spent().1
@@ -212,7 +218,7 @@ impl TxRing {
             };
             // SAFETY: the device returned the buffer; the book gave it back
             // to the pool just now and nothing uses it before this ends.
-            let slice = unsafe { buffer(n) };
+            let slice = unsafe { buffer_at(n) };
             // SAFETY: the buffer `consume` added with this token; only the
             // number of descriptors of the chain matters to the crate.
             let popped = unsafe { self.queue.pop_used(token, &[&slice[..HDR_LEN]], &mut []) };
@@ -279,6 +285,17 @@ pub struct NetDevice {
     /// The addresses of the interface: the frames to them stay in the loop.
     own: [[u8; 4]; 2],
     own_len: usize,
+    /// The frame `stage` took and `receive` gives to the stack.
+    held: Option<Held>,
+    /// Frames of the wire whose checksums did not hold.
+    pub bad_sum: u64,
+}
+
+/// A frame taken from a ring, on its way to the stack.
+#[derive(Clone, Copy)]
+enum Held {
+    Wire { buffer: u16, length: usize },
+    Loop { place: usize, length: usize },
 }
 
 impl NetDevice {
@@ -290,6 +307,68 @@ impl NetDevice {
             mac,
             own: [[0; 4]; 2],
             own_len: 0,
+            held: None,
+            bad_sum: 0,
+        }
+    }
+
+    /// Takes the next frame (the loopback's first, then the wire's) out of
+    /// the rings and tells whom it is for, so that the stack is handed to
+    /// the set of sockets it belongs to. The frame waits for `receive`.
+    /// A frame of the wire whose checksums do not hold is dropped here and
+    /// counted. None when the share of the step for receiving is spent or
+    /// there is no frame.
+    pub fn stage(&mut self) -> Option<Dest> {
+        if self.held.is_some() {
+            return None;
+        }
+        loop {
+            if self.rx.budget.rx_left() == 0 {
+                return None;
+            }
+            if let Some((place, length)) = self.looped.pop() {
+                self.rx.budget.take_rx();
+                // SAFETY: the book keeps the place until the token drops.
+                let slot = unsafe { &*self.looped.frames.add(place) };
+                let dest = frames::target(&slot[..length]);
+                self.held = Some(Held::Loop { place, length });
+                return Some(dest);
+            }
+            let (buffer, length) = self.rx.pop()?;
+            self.rx.budget.take_rx();
+            // SAFETY: the buffer was popped and goes back below or when the
+            // token drops.
+            let slice = unsafe { buffer_at(buffer) };
+            let frame = &slice[HDR_LEN..HDR_LEN + length];
+            if !frames::verify_sums(frame) {
+                self.bad_sum += 1;
+                self.rx.give(buffer);
+                continue;
+            }
+            let dest = frames::target(frame);
+            self.held = Some(Held::Wire { buffer, length });
+            return Some(dest);
+        }
+    }
+
+    /// Puts into the loop an ARP reply for each address of the interface, so
+    /// that the stack learns they are at its own MAC without asking: an ARP
+    /// request is rate limited for a second after any other (smoltcp's
+    /// neighbour cache), and the first connection on the loopback would wait
+    /// for that second.
+    pub fn seed_neighbours(&mut self) {
+        for k in 0..self.own_len {
+            let (mac, ip) = (self.mac, self.own[k]);
+            let mut f = [0u8; 42];
+            f[..6].copy_from_slice(&mac);
+            f[6..12].copy_from_slice(&mac);
+            f[12..14].copy_from_slice(&[0x08, 0x06]);
+            f[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 2]);
+            f[22..28].copy_from_slice(&mac);
+            f[28..32].copy_from_slice(&ip);
+            f[32..38].copy_from_slice(&mac);
+            f[38..42].copy_from_slice(&ip);
+            self.looped.push(&f);
         }
     }
 
@@ -329,7 +408,7 @@ impl phy::RxToken for RxToken<'_> {
             } => {
                 // SAFETY: the buffer was popped by `pop` and goes back only
                 // when the token drops, after this borrow ends.
-                let slice = unsafe { buffer(*n) };
+                let slice = unsafe { buffer_at(*n) };
                 f(&slice[HDR_LEN..HDR_LEN + length])
             }
             RxToken::Loop {
@@ -370,6 +449,20 @@ impl phy::TxToken for TxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        let began = crate::split::now();
+        let result = self.consume_frame(len, f);
+        let spent = crate::split::now() - began;
+        crate::split::record(crate::split::FRAME_TX, spent);
+        crate::split::add(&crate::split::TX, spent);
+        result
+    }
+}
+
+impl TxToken<'_> {
+    fn consume_frame<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         let ring = self.ring;
         let spare = len <= MAX_FRAME && ring.budget.take_tx();
         let n = if spare { ring.book.alloc() } else { None };
@@ -382,7 +475,7 @@ impl phy::TxToken for TxToken<'_> {
             return f(&mut ring.scratch[..len]);
         };
         // SAFETY: the buffer is the pool's and the device does not hold it.
-        let slice = unsafe { buffer(n) };
+        let slice = unsafe { buffer_at(n) };
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
@@ -398,6 +491,7 @@ impl phy::TxToken for TxToken<'_> {
             ring.counters.martian += 1;
             return result;
         }
+        frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
         let Some(total) = frames::tx_prepare(slice, len) else {
             ring.book.release(n);
             ring.counters.dropped += 1;
@@ -434,17 +528,7 @@ impl phy::Device for NetDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
-        if self.rx.budget.rx_left() == 0 {
-            return None;
-        }
-        // The frames the stack sent itself come first, then those of the
-        // wire.
-        let looped = self.looped.pop();
-        let wire = match looped {
-            Some(_) => None,
-            None => Some(self.rx.pop()?),
-        };
-        self.rx.budget.take_rx();
+        let held = self.held.take()?;
         let tx = TxToken {
             ring: &mut self.tx,
             looped: &self.looped,
@@ -452,18 +536,17 @@ impl phy::Device for NetDevice {
             own: self.own,
             own_len: self.own_len,
         };
-        let rx = match (looped, wire) {
-            (Some((place, length)), _) => RxToken::Loop {
+        let rx = match held {
+            Held::Loop { place, length } => RxToken::Loop {
                 ring: &self.looped,
                 place,
                 length,
             },
-            (None, Some((buffer, length))) => RxToken::Wire {
+            Held::Wire { buffer, length } => RxToken::Wire {
                 ring: &mut self.rx,
                 buffer,
                 length,
             },
-            (None, None) => return None,
         };
         Some((rx, tx))
     }
@@ -486,6 +569,10 @@ impl phy::Device for NetDevice {
         // the stack: the service negotiates no offload.
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
+        // The frames of the loopback never leave the service, so smoltcp
+        // computes and checks no sum; the frames of the wire get theirs in
+        // `fill_sums` and lose them in `verify_sums`.
+        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps.max_transmission_unit = MAX_FRAME;
         caps
     }

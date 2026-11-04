@@ -92,6 +92,9 @@ net-sockets-8 = []
 net-sockets-64 = []
 net-sockets-256 = []
 net-echo = []
+net-full-batch = []
+net-all-groups = []
+net-wakes = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

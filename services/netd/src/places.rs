@@ -13,17 +13,12 @@ use proto_net::sockets::{description, generation, slot};
 /// queue of `listen` takes one).
 pub const SOCKETS_MAX: usize = 256;
 
-/// The sockets the service serves at once. The set of smoltcp has this many
-/// sockets and two more (the DHCP client and the ICMP socket), because the
-/// stack walks every place of its set in each pass. The features `limit-8`,
-/// `limit-64` and `limit-256` build the service with that limit for the
-/// measurement of the steps (`cargo xtask net-probe steps`).
-///
-/// 48 is the least the next stages need (`choose::LIMIT_LEAST`). The
-/// measurement of the stage does not choose it: the longest step of the loop
-/// is past the bound at 48 sockets and the rule finds no limit (the report of
-/// the stage, reports/2026-11-04-net-p1a), so the number waits for the
-/// decision of the expert.
+/// The sockets the service serves at once: all the places of the table. The
+/// step of the loop does not grow with the number of sockets (the sockets are
+/// in sets of a few, and a frame goes to the set of its socket), so the limit
+/// is the room of the table (reports/2026-11-04-net-p1a). The features
+/// `limit-8`, `limit-64` and `limit-256` build the service with a smaller
+/// table of sets for the measurement of that evenness.
 #[cfg(feature = "limit-8")]
 pub const SOCKETS_LIMIT: usize = 8;
 #[cfg(all(feature = "limit-64", not(feature = "limit-8")))]
@@ -34,7 +29,7 @@ pub const SOCKETS_LIMIT: usize = 64;
 ))]
 pub const SOCKETS_LIMIT: usize = SOCKETS_MAX;
 #[cfg(not(any(feature = "limit-8", feature = "limit-64", feature = "limit-256")))]
-pub const SOCKETS_LIMIT: usize = 48;
+pub const SOCKETS_LIMIT: usize = SOCKETS_MAX;
 
 /// The generations have 20 bits.
 const GENERATION_MASK: u32 = (1 << (32 - proto_net::sockets::SLOT_BITS)) - 1;

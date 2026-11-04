@@ -12,12 +12,14 @@
 //! that a peer cannot choose the four of its connections to meet in one chain.
 //! A removal shifts the chain back, leaving no tombstone.
 
+use core::hash::Hasher;
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
 use core::hash::SipHasher;
-use core::hash::Hasher;
 
-/// The places of the table: twice the sockets it must hold.
-pub const DEMUX_SLOTS: usize = 512;
+/// The places of the table: four times the sockets it must hold, so that
+/// the chains of linear probing stay short (at most 8 in the probe's runs,
+/// where 192 keys are in the table).
+pub const DEMUX_SLOTS: usize = 1024;
 /// The longest chain a probe is allowed to find (acceptance).
 pub const PROBE_LIMIT: usize = 8;
 
@@ -272,9 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn two_hundred_fifty_six_keys_fill_it_to_half_and_all_are_found() {
+    fn two_hundred_fifty_six_keys_are_all_found() {
         let mut t = Demux::new(&[9; 16]);
         for i in 0..256 {
+            assert!(t.insert(conn(i), i as usize), "{i}");
+        }
+        for i in 256..512 {
             assert!(t.insert(conn(i), i as usize), "{i}");
         }
         assert!(!t.insert(conn(1000), 0), "the table is full to its half");
@@ -332,7 +337,11 @@ mod tests {
         for &c in &chosen {
             strong.insert(conn(c), 0);
         }
-        assert!(strong.probe_max <= PROBE_LIMIT, "chain {}", strong.probe_max);
+        assert!(
+            strong.probe_max <= PROBE_LIMIT,
+            "chain {}",
+            strong.probe_max
+        );
     }
 
     #[test]

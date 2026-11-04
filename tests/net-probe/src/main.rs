@@ -68,6 +68,7 @@ fn main(_: u64) -> u64 {
         parent: &start.parent,
         channel,
         waiter,
+        level,
     };
     let mut result = Ok(());
     let mut session = None;
@@ -87,6 +88,9 @@ fn main(_: u64) -> u64 {
             b'b' => probe.bound(),
             b's' => probe.sockets(number, &mut session),
             b'e' => probe.rates(),
+            b'f' => probe.full_batch(&mut session),
+            b'a' => probe.all_groups(&mut session),
+            b'w' => probe.wakes(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -109,6 +113,8 @@ struct Probe<'a> {
     parent: &'a Handle<Channel>,
     channel: Handle<Channel>,
     waiter: Waiter,
+    /// The level of the probe's thread, for the handles it makes.
+    level: u8,
 }
 
 /// What a request to the service came to.
@@ -181,6 +187,15 @@ struct Link {
     description: [u32; 2],
     sent: [u32; 2],
     got: [u32; 2],
+}
+
+/// The connections of a role and the sessions that hold them.
+struct Pairs {
+    sessions: [Option<Handle<Channel>>; SESSIONS_MAX],
+    held: [usize; SESSIONS_MAX],
+    links: [Link; PAIRS_MAX],
+    listeners: [(usize, u32); PAIRS_MAX],
+    count: usize,
 }
 
 /// The most places the role `s` fills, in the pairs of 4 places.
@@ -436,6 +451,49 @@ impl Probe<'_> {
         self.bind(&net, third, [0; 4], 8080)
             .map_err(|_| "BIND of a port after its holder closed failed")?;
         self.close(&net, third).map_err(|_| "CLOSE failed")?;
+        // The first connection on the loopback after the start, which asks
+        // the neighbour (ARP) through the loop: the time of its CONNECT.
+        let listener = tcp(&net)?;
+        self.bind(&net, listener, [127, 0, 0, 1], 8081)
+            .map_err(|_| "BIND failed")?;
+        self.plain(
+            &net,
+            Request::Listen {
+                description: listener,
+                backlog: 1,
+            },
+        )
+        .map_err(|_| "LISTEN failed")?;
+        let client = tcp(&net)?;
+        let began = self.now();
+        self.connect_wait(&net, client, Address::v4([127, 0, 0, 1], 8081))?;
+        let took = self.now() - began;
+        rt::println!("net-probe: loopback connect {} us", took / 1000);
+        // The server end closes first, so that the stream that waits for its
+        // end is in TIME-WAIT (the table may take its place back), not in a
+        // state that holds it for a minute.
+        let mut buffer = [0; MESSAGE_MAX];
+        let len = self
+            .nonblocking(PAUSE_NS, || {
+                socket_call(
+                    &net,
+                    &Request::Accept {
+                        key: None,
+                        description: listener,
+                        flags: sockets::NONBLOCK,
+                    },
+                    &mut buffer,
+                )
+                .map(|b| b.len())
+            })
+            .map_err(|_| "ACCEPT failed")?;
+        let (server, _) =
+            sockets::read_accepted(ready(&buffer[..len]).map_err(|_| "ACCEPT's reply")?)
+                .map_err(|_| "ACCEPT's data")?;
+        self.close(&net, server).map_err(|_| "CLOSE failed")?;
+        self.sleep(50_000_000);
+        self.close(&net, client).map_err(|_| "CLOSE failed")?;
+        self.close(&net, listener).map_err(|_| "CLOSE failed")?;
         // A datagram to an address beyond the gateway leaves with the
         // external address as its source; the counters of the next CONFIG
         // would show a frame of 127.0.0.0/8 the wire refused.
@@ -477,6 +535,104 @@ impl Probe<'_> {
         Ok(current)
     }
 
+    /// `pairs` connections on the loopback: each a listening description
+    /// with a queue of one, a client and the socket it accepted, 4 places of
+    /// the table. The sessions that hold them are made as they are needed.
+    fn open_pairs(&self, root: &Handle<Channel>, pairs: usize) -> Result<Pairs, &'static str> {
+        let mut p = Pairs {
+            sessions: [const { None }; SESSIONS_MAX],
+            held: [0; SESSIONS_MAX],
+            links: [Link::default(); PAIRS_MAX],
+            listeners: [(0, 0); PAIRS_MAX],
+            count: pairs,
+        };
+        // The listeners, each with a queue of one: 2 places each.
+        for i in 0..pairs {
+            let session = self.session_of(&mut p.sessions, &mut p.held, root)?;
+            // The place of the accepted socket in this session.
+            p.held[session] += 1;
+            let net = p.sessions[session].as_ref().ok_or("no session")?;
+            let d = self
+                .new_socket(net, sockets::STREAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(net, d, [127, 0, 0, 1], 9000 + i as u32)
+                .map_err(|_| "BIND failed")?;
+            self.plain(
+                net,
+                Request::Listen {
+                    description: d,
+                    backlog: 1,
+                },
+            )
+            .map_err(|_| "LISTEN failed")?;
+            p.listeners[i] = (session, d);
+        }
+        // The clients.
+        for i in 0..pairs {
+            let session = self.session_of(&mut p.sessions, &mut p.held, root)?;
+            let net = p.sessions[session].as_ref().ok_or("no session")?;
+            let d = self
+                .new_socket(net, sockets::STREAM)
+                .map_err(|_| "SOCKET failed")?;
+            p.links[i].session[0] = session;
+            p.links[i].description[0] = d;
+            let address = Address::v4([127, 0, 0, 1], 9000 + i as u32);
+            self.connect_wait(net, d, address)?;
+        }
+        // The accepted ends take the places of the queues; others listen in
+        // their place.
+        for i in 0..pairs {
+            let (lsession, listener) = p.listeners[i];
+            let net = p.sessions[lsession].as_ref().ok_or("no session")?;
+            let mut buffer = [0; MESSAGE_MAX];
+            let len = self
+                .nonblocking(PAUSE_NS, || {
+                    socket_call(
+                        net,
+                        &Request::Accept {
+                            key: None,
+                            description: listener,
+                            flags: sockets::NONBLOCK,
+                        },
+                        &mut buffer,
+                    )
+                    .map(|b| b.len())
+                })
+                .map_err(|_| "ACCEPT failed")?;
+            let reply = ready(&buffer[..len]).map_err(|_| "ACCEPT's reply")?;
+            let (d, _) = sockets::read_accepted(reply).map_err(|_| "ACCEPT's data")?;
+            p.links[i].session[1] = lsession;
+            p.links[i].description[1] = d;
+        }
+        Ok(p)
+    }
+
+    /// Everything of `p` closes.
+    fn close_pairs(&self, p: &Pairs) -> Result<(), &'static str> {
+        for link in p.links.iter().take(p.count) {
+            for end in 0..2 {
+                let net = p.sessions[link.session[end]].as_ref().ok_or("no session")?;
+                self.close(net, link.description[end])
+                    .map_err(|_| "CLOSE failed")?;
+            }
+        }
+        for &(session, d) in p.listeners.iter().take(p.count) {
+            let net = p.sessions[session].as_ref().ok_or("no session")?;
+            self.close(net, d).map_err(|_| "CLOSE failed")?;
+        }
+        Ok(())
+    }
+
+    /// HOLD of the service (the probe build): see proto_net.
+    fn hold(&self, net: &Handle<Channel>, value: u32) -> Result<(), &'static str> {
+        let mut w = Writer::new();
+        proto_net::write_hold(value, &mut w).map_err(|_| "HOLD's request")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        call(net, w.as_bytes(), &mut buffer)
+            .map(|_| ())
+            .map_err(|_| "HOLD refused")
+    }
+
     /// Role `sN`: N places of the table, half of them the sockets of
     /// connections that carry data, then 50 PINGs.
     fn sockets(
@@ -492,86 +648,19 @@ impl Probe<'_> {
             Some(session) => session,
             None => self.connect()?,
         };
-        let mut sessions: [Option<Handle<Channel>>; SESSIONS_MAX] = [const { None }; SESSIONS_MAX];
-        let mut held = [0usize; SESSIONS_MAX];
-        let mut links = [Link::default(); PAIRS_MAX];
-        let mut listeners = [(0usize, 0u32); PAIRS_MAX];
         let ok = self.config_ready(&root)?;
         if places >= 16 {
             self.full_clone(&root, places.min(64))?;
         }
-        // The listeners, each with a queue of one: 2 places each.
-        for (i, listener) in listeners.iter_mut().enumerate().take(pairs) {
-            let session = self.session_of(&mut sessions, &mut held, &root)?;
-            // The place of the accepted socket in this session.
-            held[session] += 1;
-            let net = sessions[session].as_ref().ok_or("no session")?;
-            let d = self
-                .new_socket(net, sockets::STREAM)
-                .map_err(|_| "SOCKET failed")?;
-            self.bind(net, d, [127, 0, 0, 1], 9000 + i as u32)
-                .map_err(|_| "BIND failed")?;
-            self.plain(
-                net,
-                Request::Listen {
-                    description: d,
-                    backlog: 1,
-                },
-            )
-            .map_err(|_| "LISTEN failed")?;
-            *listener = (session, d);
-        }
-        // The clients.
-        for (i, link) in links.iter_mut().enumerate().take(pairs) {
-            let session = self.session_of(&mut sessions, &mut held, &root)?;
-            let net = sessions[session].as_ref().ok_or("no session")?;
-            let d = self
-                .new_socket(net, sockets::STREAM)
-                .map_err(|_| "SOCKET failed")?;
-            link.session[0] = session;
-            link.description[0] = d;
-            let address = Address::v4([127, 0, 0, 1], 9000 + i as u32);
-            self.connect_wait(net, d, address)?;
-        }
-        // The accepted ends take the places of the queues; others listen in
-        // their place.
-        for (i, link) in links.iter_mut().enumerate().take(pairs) {
-            let (lsession, listener) = listeners[i];
-            let net = sessions[lsession].as_ref().ok_or("no session")?;
-            let mut buffer = [0; MESSAGE_MAX];
-            let reply = self
-                .nonblocking(PAUSE_NS, || {
-                    socket_call(
-                        net,
-                        &Request::Accept {
-                            key: None,
-                            description: listener,
-                            flags: sockets::NONBLOCK,
-                        },
-                        &mut buffer,
-                    )
-                    .map(|b| b.len())
-                })
-                .map_err(|fail| {
-                    rt::println!(
-                        "net-probe: ACCEPT: {fail:?} i {i} lsession {lsession} held {held:?}"
-                    );
-                    "ACCEPT failed"
-                })?;
-            let _ = reply;
-            let reply = ready(&buffer[..reply]).map_err(|_| "ACCEPT's reply")?;
-            let (d, _) = sockets::read_accepted(reply).map_err(|_| "ACCEPT's data")?;
-            link.session[1] = lsession;
-            link.description[1] = d;
-        }
+        let mut p = self.open_pairs(&root, pairs)?;
         // Data in both directions on every connection at once.
         let mut idle_passes = 0;
         loop {
             let mut moved = false;
             let mut open = false;
-            for link in links.iter_mut().take(pairs) {
+            for link in p.links.iter_mut().take(pairs) {
                 for end in 0..2 {
-                    let net = sessions[link.session[end]].as_ref().ok_or("no session")?;
+                    let net = p.sessions[link.session[end]].as_ref().ok_or("no session")?;
                     if link.sent[end] < STREAM {
                         moved |= self.push_piece(net, link, end)?;
                     }
@@ -595,24 +684,229 @@ impl Probe<'_> {
                 self.sleep(1_000_000);
             }
         }
-        // Everything closes.
-        for link in links.iter().take(pairs) {
-            for end in 0..2 {
-                let net = sessions[link.session[end]].as_ref().ok_or("no session")?;
-                self.close(net, link.description[end])
-                    .map_err(|_| "CLOSE failed")?;
-            }
-        }
-        for &(session, d) in listeners.iter().take(pairs) {
-            let net = sessions[session].as_ref().ok_or("no session")?;
-            self.close(net, d).map_err(|_| "CLOSE failed")?;
-        }
+        self.close_pairs(&p)?;
         for _ in 0..PINGS_ROLE_S {
             ping(&root, ok).map_err(|_| "a PING of the gateway failed")?;
         }
         // The counters of the service go to the console with CONFIG.
         config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: sockets {places} ok");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `f`: the first steps after the service lets go find the full
+    /// share of sending and the full ring of the loopback. 64 connections
+    /// (all 256 places), NODELAY, HOLD, 800 bytes into each, release.
+    fn full_batch(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let mut p = self.open_pairs(&root, PAIRS_MAX)?;
+        for link in p.links.iter().take(PAIRS_MAX) {
+            let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
+            self.plain(
+                net,
+                Request::SetOpt {
+                    description: link.description[0],
+                    name: sockets::opt::NODELAY,
+                    value: 1,
+                },
+            )
+            .map_err(|_| "SETOPT failed")?;
+        }
+        self.hold(&root, proto_net::HOLD_ON)?;
+        for link in p.links.iter_mut().take(PAIRS_MAX) {
+            let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
+            if !self.push_piece(net, link, 0)? {
+                return Err("a SEND was not taken");
+            }
+        }
+        self.hold(&root, proto_net::HOLD_OFF)?;
+        // Every connection delivers its piece.
+        let mut idle_passes = 0;
+        while p
+            .links
+            .iter()
+            .take(PAIRS_MAX)
+            .any(|l| l.got[0] < PIECE as u32)
+        {
+            let mut moved = false;
+            for link in p.links.iter_mut().take(PAIRS_MAX) {
+                if link.got[0] < PIECE as u32 {
+                    let net = p.sessions[link.session[1]].as_ref().ok_or("no session")?;
+                    moved |= self.pull_piece(net, link, 1)?;
+                }
+            }
+            if !moved {
+                idle_passes += 1;
+                if idle_passes > 20_000 {
+                    return Err("the pieces did not arrive");
+                }
+                self.sleep(1_000_000);
+            }
+        }
+        self.close_pairs(&p)?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: full batch ok");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `a`: every group of sockets has work at once (the effect of a
+    /// change of the address or of an ARP frame), with 64 connections; the
+    /// connections go on working after.
+    fn all_groups(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let mut p = self.open_pairs(&root, PAIRS_MAX)?;
+        self.hold(&root, proto_net::HOLD_ADDRESS)?;
+        self.sleep(100_000_000);
+        // A piece into every connection and out of it.
+        for link in p.links.iter_mut().take(PAIRS_MAX) {
+            let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
+            if !self.push_piece(net, link, 0)? {
+                return Err("a SEND was not taken");
+            }
+        }
+        let mut idle_passes = 0;
+        while p
+            .links
+            .iter()
+            .take(PAIRS_MAX)
+            .any(|l| l.got[0] < PIECE as u32)
+        {
+            let mut moved = false;
+            for link in p.links.iter_mut().take(PAIRS_MAX) {
+                if link.got[0] < PIECE as u32 {
+                    let net = p.sessions[link.session[1]].as_ref().ok_or("no session")?;
+                    moved |= self.pull_piece(net, link, 1)?;
+                }
+            }
+            if !moved {
+                idle_passes += 1;
+                if idle_passes > 20_000 {
+                    return Err("the pieces did not arrive");
+                }
+                self.sleep(1_000_000);
+            }
+        }
+        self.close_pairs(&p)?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: all groups ok");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `w`: 16 operations wait for a datagram on one socket, armed with
+    /// the handles that tell their client; one datagram arrives and the step
+    /// of waking tells them in portions. All 16 are told.
+    fn wakes(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        const WAITING: usize = 16;
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let receiver = {
+            let mut buffer = [0; MESSAGE_MAX];
+            let request = Request::Socket {
+                family: proto_net::INET,
+                kind: sockets::DGRAM,
+                flags: 0,
+            };
+            let reply = socket_call(&root, &request, &mut buffer).map_err(|_| "SOCKET failed")?;
+            sockets::read_word(reply).map_err(|_| "SOCKET's reply")?
+        };
+        self.bind(&root, receiver, [127, 0, 0, 1], 9200)
+            .map_err(|_| "BIND failed")?;
+        let mut keys = [0u64; WAITING];
+        for key in keys.iter_mut() {
+            let mut buffer = [0; MESSAGE_MAX];
+            let start = Request::Recv {
+                key: None,
+                description: receiver,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            let reply = socket_call(&root, &start, &mut buffer).map_err(|_| "RECV failed")?;
+            match long::Reply::read(reply) {
+                Ok(long::Reply::Wait(k)) => *key = k,
+                _ => return Err("RECV did not wait"),
+            }
+        }
+        // Arm each with a handle that notifies this probe under its own label.
+        for (i, key) in keys.iter().enumerate() {
+            let notify = sys::handle_label(
+                &self.channel,
+                abi::Rights::NOTIFY | abi::Rights::TRANSFER,
+                0x100 + i as u64,
+                self.level,
+            )
+            .map_err(|_| "handle_label failed")?;
+            let take = Request::Recv {
+                key: Some(*key),
+                description: receiver,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            let mut w = Writer::new();
+            take.write(&mut w).map_err(|_| "RECV's request")?;
+            let reply = sys::send_handles(&root, w.as_bytes(), [notify.erase()])
+                .map_err(|_| "RECV's take failed")?;
+            let mut buffer = [0; MESSAGE_MAX];
+            match long::Reply::read(reply.bytes(&mut buffer)) {
+                Ok(long::Reply::Armed) => {}
+                _ => return Err("RECV was not armed"),
+            }
+        }
+        // The datagram.
+        let sender = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let send = Request::Send {
+            key: None,
+            description: sender,
+            flags: 0,
+            address: Address::v4([127, 0, 0, 1], 9200),
+            data: b"wake",
+        };
+        socket_call(&root, &send, &mut buffer).map_err(|_| "SEND failed")?;
+        // All 16 are told.
+        let mut told = 0u32;
+        let end = self.now() + 5_000_000_000;
+        while told.count_ones() < WAITING as u32 {
+            match self.waiter.receive_until(&self.channel, end) {
+                Ok(rt::wait::Waited::Got(sys::Received::Notification {
+                    source: abi::Source::Session,
+                    label,
+                    bits,
+                    ..
+                })) if bits & 1 != 0 && (0x100..0x100 + WAITING as u64).contains(&label) => {
+                    told |= 1 << (label - 0x100);
+                }
+                Ok(rt::wait::Waited::Got(_)) => {}
+                _ => return Err("not all the operations were told"),
+            }
+        }
+        for key in keys {
+            let mut w = Writer::new();
+            Request::Cancel(key)
+                .write(&mut w)
+                .map_err(|_| "CANCEL's request")?;
+            let mut buffer = [0; MESSAGE_MAX];
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "CANCEL failed")?;
+        }
+        self.close(&root, sender).map_err(|_| "CLOSE failed")?;
+        self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: wakes ok {WAITING}");
         *keep = Some(root);
         Ok(())
     }

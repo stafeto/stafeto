@@ -18,6 +18,7 @@ use crate::net::{
 };
 use crate::stack::{Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
+use netd::demux::Key;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
 use proto_net::sockets::{self, Request as Call, opt};
@@ -171,11 +172,13 @@ impl Net {
                     kind,
                     place: place as u16,
                 };
+                self.told &= !(1 << op_index(key));
                 self.socks[place].waiters |= 1 << op_index(key);
                 self.attention.set(place);
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
+                self.told &= !(1 << op_index(key));
                 match notify {
                     Some(handle) => {
                         if let Err(e) = self.ops.arm(label, key, handle) {
@@ -222,6 +225,21 @@ impl Net {
         call: Call<'_>,
     ) -> Answer {
         let now = now_ns();
+        // The group of the description has work for the next pass of sending.
+        let touching = match call {
+            Call::Listen { description, .. }
+            | Call::Connect { description, .. }
+            | Call::Accept { description, .. }
+            | Call::Send { description, .. }
+            | Call::Recv { description, .. }
+            | Call::Shutdown { description, .. }
+            | Call::Close { description, .. }
+            | Call::SetOpt { description, .. } => Some(description),
+            _ => None,
+        };
+        if let Some(place) = touching.and_then(|d| self.find(&s.data.held, d)) {
+            self.touch(place);
+        }
         match call {
             Call::Socket {
                 family,
@@ -436,8 +454,19 @@ impl Net {
         }
         let sock = &mut self.socks[place];
         sock.bound = true;
+        sock.port_held = true;
         sock.address = ip;
         sock.port = port;
+        if sock.proto == Proto::Udp {
+            self.register(
+                place,
+                Key::Bound {
+                    tcp: false,
+                    address: ip,
+                    port,
+                },
+            );
+        }
         ok()
     }
 
@@ -460,6 +489,7 @@ impl Net {
                 return refuse(proto_net::NO_ADDRESS);
             };
             self.socks[place].bound = true;
+            self.socks[place].port_held = true;
             self.socks[place].port = port;
         }
         let sock = self.socks[place];
@@ -484,6 +514,15 @@ impl Net {
         sock.listening = true;
         sock.members = members;
         sock.member_count = count as u8;
+        let (address, port) = (sock.address, sock.port);
+        self.register(
+            place,
+            Key::Bound {
+                tcp: true,
+                address,
+                port,
+            },
+        );
         ok()
     }
 
@@ -602,6 +641,19 @@ impl Net {
         stack
             .tcp_connect(handle, remote, (sock.address, sock.port))
             .map_err(|_| proto_net::UNREACHABLE)?;
+        let t = stack.tcp(handle);
+        if let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint()) {
+            let (local, remote) = (peer_of(local), peer_of(remote));
+            self.register(
+                place,
+                Key::Conn {
+                    local: local.0,
+                    local_port: local.1,
+                    remote: remote.0,
+                    remote_port: remote.1,
+                },
+            );
+        }
         stack.tcp(handle).set_timeout(Some(Duration::from_secs(
             crate::net::CONNECT_NS / 1_000_000_000,
         )));
@@ -641,8 +693,19 @@ impl Net {
         }
         let sock = &mut self.socks[place];
         sock.bound = true;
+        sock.port_held = true;
         sock.address = [0; 4];
         sock.port = port;
+        if sock.proto == Proto::Udp {
+            self.register(
+                place,
+                Key::Bound {
+                    tcp: false,
+                    address: [0; 4],
+                    port,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -731,6 +794,12 @@ impl Net {
             });
         let local = stack.tcp(handle).local_endpoint().map(peer_of);
         self.places.set_state(m, State::Live);
+        self.touch(m);
+        // The accepted socket shares the port of the listening description
+        // and keeps it after that one closes.
+        let shared = self.socks[m].port;
+        self.ports(Proto::Tcp).hold(shared);
+        self.socks[m].port_held = true;
         self.places.hold(m);
         s.data.held.add(m);
         let accepted = &mut self.socks[m];
@@ -1171,6 +1240,7 @@ impl Net {
             Err(e) => return Answer::Status(Status::Kernel(e)),
         };
         let idx = op_index(key);
+        self.told &= !(1 << idx);
         self.info[idx] = OpInfo {
             key,
             label,
@@ -1221,6 +1291,7 @@ impl Net {
                 Ok(notify) => notify,
                 Err(answer) => return answer,
             };
+            self.told &= !(1 << idx);
             match notify {
                 Some(handle) => {
                     if let Err(e) = self.ops.arm(label, key, handle) {

@@ -90,26 +90,30 @@ pub fn ephemeral(offset: u32, counter: u32, free: impl Fn(u16) -> bool) -> Optio
         .find(|&port| free(port))
 }
 
-/// A bit for each port of one protocol: set while a socket holds the port.
+/// How many sockets hold each port of one protocol. A count and not a bit,
+/// so that a socket that lets go of a port is a subtraction and not a walk
+/// over the table (which would put the number of sockets into a step).
 pub struct PortMap {
-    bits: [u64; 1024],
+    held: [u16; 65536],
 }
 
 impl PortMap {
     pub const fn new() -> PortMap {
-        PortMap { bits: [0; 1024] }
+        PortMap { held: [0; 65536] }
     }
 
     pub fn held(&self, port: u16) -> bool {
-        self.bits[usize::from(port) / 64] >> (port % 64) & 1 != 0
+        self.held[usize::from(port)] > 0
     }
 
     pub fn hold(&mut self, port: u16) {
-        self.bits[usize::from(port) / 64] |= 1 << (port % 64);
+        let n = &mut self.held[usize::from(port)];
+        *n = n.saturating_add(1);
     }
 
     pub fn release(&mut self, port: u16) {
-        self.bits[usize::from(port) / 64] &= !(1 << (port % 64));
+        let n = &mut self.held[usize::from(port)];
+        *n = n.saturating_sub(1);
     }
 }
 
@@ -216,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn the_map_holds_and_releases_ports() {
+    fn the_map_counts_the_holders_of_a_port() {
         let mut map = PortMap::new();
         for port in [0u16, 1, 63, 64, 49152, 65535] {
             assert!(!map.held(port));
@@ -227,5 +231,14 @@ mod tests {
         assert!(!map.held(64));
         assert!(map.held(63));
         assert!(map.held(65535));
+        // Two holders: the port is free after both let go.
+        map.hold(80);
+        map.hold(80);
+        map.release(80);
+        assert!(map.held(80));
+        map.release(80);
+        assert!(!map.held(80));
+        map.release(80);
+        assert!(!map.held(80), "a count does not go below zero");
     }
 }

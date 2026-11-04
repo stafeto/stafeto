@@ -12,19 +12,26 @@
 //! in place, so the stack of the program stays small. The pool of buffers
 //! takes a page only when a socket touches it.
 
-use crate::stack::Stack;
+use crate::stack::{GROUP, GROUPS, Sh, Stack};
 use core::mem::{ManuallyDrop, MaybeUninit};
+use netd::demux::{Demux, Key};
+use netd::frames::Dest;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
 use netd::ports::{Binding, PortMap, Proto};
+use netd::ring::WakeBudget;
 use proto_net::sockets::{self, opt};
 use proto_net::{Address, INET};
 use proto_wire::clones::Clones;
 use proto_wire::watch;
 use rt::handle::{Channel, Handle};
 use rt::service::{LongOps, LongSession};
-use smoltcp::iface::SocketHandle;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Duration;
+
+fn peer_of(end: smoltcp::wire::IpEndpoint) -> ([u8; 4], u16) {
+    let smoltcp::wire::IpAddress::Ipv4(a) = end.addr;
+    (a.octets(), end.port)
+}
 
 /// The sessions of the service's channel: room for the records of the
 /// process service and the services beside them, as the pipe service has.
@@ -91,7 +98,9 @@ pub enum Conn {
 #[derive(Clone, Copy)]
 pub struct Sock {
     pub proto: Proto,
-    pub handle: Option<SocketHandle>,
+    pub handle: Option<Sh>,
+    /// What the table of destinations finds this socket by.
+    pub key: Option<Key>,
     pub nonblock: bool,
     pub reuse: bool,
     pub keepalive: bool,
@@ -102,6 +111,9 @@ pub struct Sock {
     /// The stream took a FIN from the peer.
     pub saw_fin: bool,
     pub bound: bool,
+    /// The socket holds its port in the registry (a member of a queue shares
+    /// the listening description's).
+    pub port_held: bool,
     pub address: [u8; 4],
     pub port: u16,
     pub listening: bool,
@@ -123,6 +135,7 @@ impl Sock {
     pub const EMPTY: Sock = Sock {
         proto: Proto::Tcp,
         handle: None,
+        key: None,
         nonblock: false,
         reuse: false,
         keepalive: false,
@@ -132,6 +145,7 @@ impl Sock {
         shut_wr: false,
         saw_fin: false,
         bound: false,
+        port_held: false,
         address: [0; 4],
         port: 0,
         listening: false,
@@ -233,6 +247,18 @@ pub struct Net {
     pub connecting: Mask,
     pub orphans: Mask,
     sweep_at: usize,
+    /// The table that steers a frame to its socket.
+    pub demux: Demux,
+    /// The groups with work for the pass of sending, and those the step
+    /// touched (a bit each), for the step of waking.
+    pub due: u64,
+    pub touched: u64,
+    /// The places whose waiting operations the step of waking looks at.
+    pub wake_due: Mask,
+    wake_cursor: usize,
+    /// The operations (by index) that were told and have not taken since:
+    /// telling again costs a call of the kernel and tells nothing.
+    pub told: u128,
     /// The secret of the choice of ports and its counter (RFC 6056).
     key: [u8; 16],
     counter: u32,
@@ -249,6 +275,8 @@ pub struct Net {
     /// tells itself.
     pub step_due: bool,
     pub counters: Counters,
+    /// The listening description a SYN was just routed to.
+    syn_listener: Option<usize>,
 }
 
 /// The time in nanoseconds of the guest.
@@ -270,6 +298,7 @@ impl Net {
     pub unsafe fn initialize_at(
         at: *mut Net,
         key: [u8; 16],
+        demux_key: [u8; 16],
         parent: &Handle<Channel>,
         channel: &Handle<Channel>,
         level: u8,
@@ -284,10 +313,12 @@ impl Net {
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
             addr_of_mut!((*at).key).write(key);
+            Demux::initialize_at(addr_of_mut!((*at).demux), &demux_key);
             addr_of_mut!((*at).parent).write(Some(Handle::borrowed(parent.raw())));
             addr_of_mut!((*at).notary).write(None);
             addr_of_mut!((*at).channel).write(Handle::borrowed(channel.raw()));
             addr_of_mut!((*at).external).write(None);
+            addr_of_mut!((*at).syn_listener).write(None);
             addr_of_mut!((*at).level).write(level);
         }
     }
@@ -301,7 +332,7 @@ impl Net {
     // ----- the places -----
 
     /// The smoltcp socket for place `i`.
-    fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> SocketHandle {
+    fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> Sh {
         let base = self.pool[i].as_mut_ptr();
         // SAFETY: the pool's chunk `i` belongs to the socket of place `i`
         // alone, which is removed before the place is free; the pool lives
@@ -313,7 +344,7 @@ impl Net {
             )
         };
         match proto {
-            Proto::Tcp => stack.tcp_add(rx, tx),
+            Proto::Tcp => stack.tcp_add(i, rx, tx),
             Proto::Udp => {
                 let meta = self.udp_meta[i].as_mut_ptr().cast::<udp::PacketMetadata>();
                 for k in 0..2 * PACKETS {
@@ -328,6 +359,7 @@ impl Net {
                     )
                 };
                 stack.udp_add(
+                    i,
                     udp::PacketBuffer::new(rx_meta, rx),
                     udp::PacketBuffer::new(tx_meta, tx),
                 )
@@ -363,9 +395,13 @@ impl Net {
         let mut at = 0;
         while let Some(i) = self.orphans.next(at) {
             at = i + 1;
-            let waiting = self.socks[i]
-                .handle
-                .is_some_and(|h| stack.tcp(h).state() == tcp::State::TimeWait);
+            let state = self.socks[i].handle.map(|h| stack.tcp(h).state());
+            // A stream that has closed is free at once.
+            if state.is_none_or(|s| s == tcp::State::Closed) {
+                self.release_place(stack, i);
+                return true;
+            }
+            let waiting = state == Some(tcp::State::TimeWait);
             if waiting && oldest.is_none_or(|o| self.socks[i].orphan_at < self.socks[o].orphan_at) {
                 oldest = Some(i);
             }
@@ -390,11 +426,15 @@ impl Net {
             stack.drop_socket(handle);
         }
         self.socks[i] = Sock::EMPTY;
+        if let Some(key) = sock.key {
+            self.demux.remove(&key);
+        }
+        self.wake_due.clear(i);
         self.attention.clear(i);
         self.connecting.clear(i);
         self.orphans.clear(i);
         self.places.free(i);
-        if sock.bound && sock.port != 0 && !self.port_held(sock.proto, sock.port) {
+        if sock.port_held {
             self.ports(sock.proto).release(sock.port);
         }
     }
@@ -404,18 +444,6 @@ impl Net {
             Proto::Tcp => &mut self.tcp_ports,
             Proto::Udp => &mut self.udp_ports,
         }
-    }
-
-    /// Whether a description other than the members of a queue holds the
-    /// port.
-    fn port_held(&self, proto: Proto, port: u16) -> bool {
-        (0..SOCKETS_MAX).any(|i| {
-            let s = &self.socks[i];
-            matches!(self.places.state(i), State::Live | State::Orphan)
-                && s.bound
-                && s.proto == proto
-                && s.port == port
-        })
     }
 
     /// The bindings the registry compares a new bind with.
@@ -470,6 +498,7 @@ impl Net {
     /// told (they find it gone), and the socket closes.
     fn close(&mut self, stack: &mut Stack<'static>, i: usize) {
         self.tell_all(i);
+        self.touch(i);
         let sock = self.socks[i];
         if sock.listening {
             for k in 0..usize::from(sock.member_count) {
@@ -689,6 +718,7 @@ impl Net {
     pub fn forget_op(&mut self, idx: usize) {
         let info = self.info[idx];
         let bit = 1u128 << idx;
+        self.told &= !bit;
         if info.kind == Kind::Watch {
             let set = self.watches[idx];
             for item in &set.items[..set.len] {
@@ -714,14 +744,160 @@ impl Net {
         }
     }
 
-    /// The pass after a step: for each place with waiting operations, the
-    /// ones whose condition holds are told. Stale waiters (their operation
-    /// went with its session) are dropped.
-    pub fn wake(&mut self, stack: &mut Stack<'static>, now: u64) {
-        let mut at = 0;
-        let mut seen: u128 = 0;
-        while let Some(i) = self.attention.next(at) {
+    // ----- the groups of sockets -----
+
+    /// The group of place `i` has work for the next pass of sending, and its
+    /// operations are looked at by the next step of waking.
+    pub fn touch(&mut self, i: usize) {
+        let bit = 1u64 << (i / GROUP);
+        self.due |= bit;
+        self.touched |= bit;
+    }
+
+    /// Every group has work: an address changed or a neighbour answered.
+    pub fn touch_all(&mut self) {
+        let all = if GROUPS == 64 {
+            u64::MAX
+        } else {
+            (1u64 << GROUPS) - 1
+        };
+        self.due |= all;
+    }
+
+    /// Gives the key to the socket of place `i` in the table of destinations.
+    pub fn register(&mut self, i: usize, key: Key) {
+        if self.socks[i].key.is_none() && self.demux.insert(key, i) {
+            self.socks[i].key = Some(key);
+        }
+    }
+
+    /// The place a received frame is for, None for the set of the service.
+    /// A SYN to a listening description goes to the first socket of its
+    /// queue that is still listening; `adopt` runs after the stack took it.
+    pub fn route(&mut self, stack: &mut Stack<'static>, dest: Dest) -> Option<usize> {
+        match dest {
+            Dest::Service | Dest::Arp => None,
+            Dest::Tcp {
+                local,
+                local_port,
+                remote,
+                remote_port,
+                syn,
+            } => {
+                let conn = Key::Conn {
+                    local,
+                    local_port,
+                    remote,
+                    remote_port,
+                };
+                if let Some(place) = self.demux.find(&conn) {
+                    return Some(place);
+                }
+                if !syn {
+                    return None;
+                }
+                let listener = [local, [0; 4]].into_iter().find_map(|address| {
+                    self.demux.find(&Key::Bound {
+                        tcp: true,
+                        address,
+                        port: local_port,
+                    })
+                })?;
+                let sock = self.socks[listener];
+                let member = (0..usize::from(sock.member_count))
+                    .map(|k| usize::from(sock.members[k]))
+                    .find(|&m| {
+                        self.socks[m]
+                            .handle
+                            .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
+                    })?;
+                self.syn_listener = Some(listener);
+                Some(member)
+            }
+            Dest::Udp {
+                local,
+                local_port,
+                broadcast,
+            } => {
+                let addresses = if broadcast {
+                    [[0; 4], local]
+                } else {
+                    [local, [0; 4]]
+                };
+                addresses.into_iter().find_map(|address| {
+                    self.demux.find(&Key::Bound {
+                        tcp: false,
+                        address,
+                        port: local_port,
+                    })
+                })
+            }
+        }
+    }
+
+    /// After the stack took a SYN for a listening description: the sockets of
+    /// its queue that left LISTEN get the key of their connection, and one
+    /// that went back to LISTEN (a reset) loses it.
+    pub fn adopt(&mut self, stack: &mut Stack<'static>) {
+        let Some(listener) = self.syn_listener.take() else {
+            return;
+        };
+        let sock = self.socks[listener];
+        for k in 0..usize::from(sock.member_count) {
+            let m = usize::from(sock.members[k]);
+            let Some(handle) = self.socks[m].handle else {
+                continue;
+            };
+            let t = stack.tcp(handle);
+            if t.state() == tcp::State::Listen {
+                if let Some(key) = self.socks[m].key.take() {
+                    self.demux.remove(&key);
+                }
+            } else if self.socks[m].key.is_none()
+                && let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint())
+            {
+                let (local, remote) = (peer_of(local), peer_of(remote));
+                self.register(
+                    m,
+                    Key::Conn {
+                        local: local.0,
+                        local_port: local.1,
+                        remote: remote.0,
+                        remote_port: remote.1,
+                    },
+                );
+            }
+        }
+    }
+
+    /// After a step of the stack: the places of the groups it touched that
+    /// have operations waiting or a connection under way are for the step of
+    /// waking.
+    pub fn schedule_wake(&mut self) {
+        let mut groups = core::mem::take(&mut self.touched);
+        while groups != 0 {
+            let g = groups.trailing_zeros() as usize;
+            groups &= groups - 1;
+            for i in g * GROUP..(g + 1) * GROUP {
+                if self.attention.has(i) || self.connecting.has(i) {
+                    self.wake_due.set(i);
+                }
+            }
+        }
+    }
+
+    /// The step of waking: for the places in `wake_due`, in turn, the
+    /// operations whose condition holds are told, within the share of the
+    /// step (WAKE_TELLS notifications, WAKE_CHECKS checks). A place not
+    /// finished stays. True when places are left.
+    pub fn wake(&mut self, stack: &mut Stack<'static>, now: u64) -> bool {
+        let mut budget = WakeBudget::new();
+        let mut at = self.wake_cursor;
+        'places: while let Some(i) = self.wake_due.next(at).or_else(|| self.wake_due.next(0)) {
             at = i + 1;
+            if !budget.take_check() {
+                break;
+            }
             let ev = self.events(stack, i, now);
             let mut mask = self.socks[i].waiters;
             while mask != 0 {
@@ -733,28 +909,44 @@ impl Net {
                     self.socks[i].waiters &= !bit;
                     continue;
                 }
+                if !budget.take_check() {
+                    self.wake_cursor = i;
+                    break 'places;
+                }
                 let ready = match info.kind {
                     Kind::Connect => !matches!(self.socks[i].conn, Conn::Connecting(_)),
                     Kind::Accept => ev & (watch::IN | watch::ERR) != 0,
                     Kind::Send => ev & (watch::OUT | watch::ERR | watch::HUP) != 0,
                     Kind::Recv => ev & (watch::IN | watch::ERR | watch::HUP) != 0,
-                    Kind::Watch => {
-                        if seen & bit != 0 {
-                            false
-                        } else {
-                            seen |= bit;
-                            self.watch_ready(stack, idx, now).any()
-                        }
-                    }
+                    Kind::Watch => self.watch_item_ready(idx, i, ev),
                 };
-                if ready {
+                if ready && self.told & bit == 0 {
+                    if !budget.take_tell() {
+                        self.wake_cursor = i;
+                        break 'places;
+                    }
+                    self.told |= bit;
                     self.ops.tell(info.label, info.key);
                 }
             }
             if self.socks[i].waiters == 0 {
                 self.attention.clear(i);
             }
+            self.wake_due.clear(i);
+            if at >= SOCKETS_MAX {
+                at = 0;
+            }
         }
+        self.wake_due.next(0).is_some()
+    }
+
+    /// Whether an item of the watch with index `idx` that names place `i`
+    /// holds, given the events `ev` of the place.
+    fn watch_item_ready(&self, idx: usize, i: usize, ev: u32) -> bool {
+        let set = &self.watches[idx];
+        set.items[..set.len].iter().any(|item| {
+            self.places.find(item.description) == Some(i) && ev & (item.events | watch::ALWAYS) != 0
+        })
     }
 
     /// The events of the watch with index `idx`, one word for each item.

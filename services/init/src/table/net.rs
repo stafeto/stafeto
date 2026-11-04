@@ -114,36 +114,30 @@ pub const NETD: Record = Record {
 /// The roles of the probe (tests/net-probe): `c` the interface's address and
 /// 300 pings of the gateway, `b` the registry of ports and the sessions, `sN`
 /// N places of the table at once (the digits are N) and 50 pings, `e` the
-/// rates of the loopback, `k` CRASH of the service and the same as `c`
+/// rates of the loopback, `f` the full batch of a step after a hold of the
+/// service, `a` every group of sockets with work at once, `w` sixteen
+/// operations told by one datagram, `k` CRASH of the service and the same as `c`
 /// through a new session. The images of the measurement of the steps
 /// (`net-sockets-N`) run `s` at 8, 64 and 256 places; the others at the
 /// limit of the sockets the service serves (netd::places::SOCKETS_LIMIT,
 /// which a test of xtask compares with the number here).
-#[cfg(feature = "net-sockets-8")]
-pub const ROLES: &[u8] = b"cs8k";
-#[cfg(all(feature = "net-sockets-64", not(feature = "net-sockets-8")))]
-pub const ROLES: &[u8] = b"cs64k";
-#[cfg(all(
-    feature = "net-sockets-256",
-    not(any(feature = "net-sockets-8", feature = "net-sockets-64"))
-))]
-pub const ROLES: &[u8] = b"cs256k";
-#[cfg(all(
-    feature = "net-echo",
-    not(any(
-        feature = "net-sockets-8",
-        feature = "net-sockets-64",
-        feature = "net-sockets-256"
-    ))
-))]
-pub const ROLES: &[u8] = b"cek";
-#[cfg(not(any(
-    feature = "net-sockets-8",
-    feature = "net-sockets-64",
-    feature = "net-sockets-256",
-    feature = "net-echo"
-)))]
-pub const ROLES: &[u8] = b"cbs48k";
+pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
+    b"cs8k"
+} else if cfg!(feature = "net-sockets-64") {
+    b"cs64k"
+} else if cfg!(feature = "net-sockets-256") {
+    b"cs256k"
+} else if cfg!(feature = "net-echo") {
+    b"cek"
+} else if cfg!(feature = "net-full-batch") {
+    b"cfk"
+} else if cfg!(feature = "net-all-groups") {
+    b"cak"
+} else if cfg!(feature = "net-wakes") {
+    b"cwk"
+} else {
+    b"cbs256k"
+};
 
 /// The probe (tests/net-probe).
 pub const PROBE: Record = Record {
@@ -152,8 +146,8 @@ pub const PROBE: Record = Record {
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 32 * PAGE,
-    handle_limit: 32,
+    quota: 64 * PAGE,
+    handle_limit: 64,
     restart: Restart::Never,
     console: true,
     log: false,

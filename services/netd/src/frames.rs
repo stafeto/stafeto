@@ -140,13 +140,11 @@ pub fn route(frame: &[u8], mac: [u8; 6], own: &[[u8; 4]]) -> Route {
 /// 16-bit words of RFC 1071 (2^16 is 1 modulo 0xFFFF). A tail shorter than
 /// eight bytes is padded with zeros, which only the last piece may have.
 fn add(mut acc: u64, data: &[u8]) -> u64 {
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_be_bytes(chunk.try_into().expect("8 bytes"));
-        let (sum, carry) = acc.overflowing_add(word);
+    let (words, tail) = data.as_chunks::<8>();
+    for chunk in words {
+        let (sum, carry) = acc.overflowing_add(u64::from_be_bytes(*chunk));
         acc = sum + u64::from(carry);
     }
-    let tail = chunks.remainder();
     if !tail.is_empty() {
         let mut last = [0u8; 8];
         last[..tail.len()].copy_from_slice(tail);
@@ -286,10 +284,13 @@ pub fn verify_sums(frame: &[u8]) -> bool {
 /// Whom a received frame is for, as far as the headers say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dest {
-    /// The service's own sockets (DHCP, ICMP), or nobody: ARP, ICMP, DHCP,
-    /// other protocols, fragments and frames that do not parse. The stack
-    /// answers what needs an answer (RST, port unreachable) there.
+    /// The service's own sockets (DHCP, ICMP), or nobody: ICMP, DHCP, other
+    /// protocols, fragments and frames that do not parse. The stack answers
+    /// what needs an answer (RST, port unreachable) there.
     Service,
+    /// ARP: the service's set answers, and every socket that waited for the
+    /// neighbour tries again.
+    Arp,
     /// A segment of TCP; `syn` when it opens a connection (SYN without ACK).
     Tcp {
         local: [u8; 4],
@@ -311,6 +312,9 @@ const TCP_ACK: u8 = 0x10;
 
 /// Whom the frame is for (see `Dest`).
 pub fn target(frame: &[u8]) -> Dest {
+    if frame.len() >= ETHERNET_HEADER && frame[12..14] == ETHERTYPE_ARP {
+        return Dest::Arp;
+    }
     let Some(p) = packet(frame) else {
         return Dest::Service;
     };
@@ -548,7 +552,10 @@ mod tests {
         assert!(!verify_sums(&frame), "a flipped bit in the data");
         fill_sums(&mut frame);
         frame[14 + 12] ^= 0x10;
-        assert!(!verify_sums(&frame), "a changed address breaks the header's sum");
+        assert!(
+            !verify_sums(&frame),
+            "a changed address breaks the header's sum"
+        );
     }
 
     #[test]
@@ -597,7 +604,10 @@ mod tests {
         t[14 + 20 + 13] = TCP_SYN;
         assert!(matches!(target(&t), Dest::Tcp { syn: true, .. }));
         t[14 + 20 + 13] = TCP_SYN | TCP_ACK;
-        assert!(matches!(target(&t), Dest::Tcp { syn: false, .. }), "a SYN-ACK");
+        assert!(
+            matches!(target(&t), Dest::Tcp { syn: false, .. }),
+            "a SYN-ACK"
+        );
         let mut u = udp_frame(b"abc");
         u[34..36].copy_from_slice(&67u16.to_be_bytes());
         u[36..38].copy_from_slice(&68u16.to_be_bytes());
@@ -612,7 +622,7 @@ mod tests {
                 broadcast: false
             }
         );
-        assert_eq!(target(&arp_request([10, 0, 2, 2])), Dest::Service);
+        assert_eq!(target(&arp_request([10, 0, 2, 2])), Dest::Arp);
         assert_eq!(target(&[0; 10]), Dest::Service);
         // An ICMP packet and a fragment go to the service.
         let mut icmp = udp_frame(b"abcdefgh");
