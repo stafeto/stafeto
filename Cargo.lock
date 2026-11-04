@@ -309,6 +309,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pci-walk"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
+ "virtio-pci",
+]
+
+[[package]]
 name = "pipe"
 version = "0.1.0"
 dependencies = [

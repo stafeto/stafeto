@@ -73,20 +73,51 @@ pub fn runner() -> Result<std::path::PathBuf, String> {
     Ok(binary)
 }
 
+/// The keys of `vz-run` a run sets beyond the images; a key left out keeps
+/// the runner's default (one processor, 512 MiB, no network device).
+#[derive(Clone, Copy, Default)]
+pub struct Machine {
+    pub cpus: Option<usize>,
+    pub memory_mib: Option<u64>,
+    /// The Virtio network devices on the NAT, 0 to 2.
+    pub net: usize,
+}
+
+/// The arguments of `vz-run` for `machine`, before the two images.
+pub fn machine_arguments(machine: Machine) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(cpus) = machine.cpus {
+        args.extend(["--cpus".to_string(), cpus.to_string()]);
+    }
+    if let Some(memory) = machine.memory_mib {
+        args.extend(["--memory".to_string(), memory.to_string()]);
+    }
+    if machine.net > 0 {
+        args.extend(["--net".to_string(), machine.net.to_string()]);
+    }
+    args
+}
+
+/// The command that boots `kernel` with the boot image `boot` on VZ on
+/// `machine`.
+pub fn command_on(kernel: &Path, boot: &Path, machine: Machine) -> Result<Command, String> {
+    let mut cmd = Command::new(runner()?);
+    cmd.args(machine_arguments(machine)).arg(kernel).arg(boot);
+    Ok(cmd)
+}
+
 /// The command that boots `kernel` with the boot image `boot` on VZ.
 pub fn command(kernel: &Path, boot: &Path) -> Result<Command, String> {
-    let mut cmd = Command::new(runner()?);
-    cmd.arg(kernel).arg(boot);
-    Ok(cmd)
+    command_on(kernel, boot, Machine::default())
 }
 
 /// `command` for a machine with `cpus` processors.
 pub fn command_cpus(kernel: &Path, boot: &Path, cpus: usize) -> Result<Command, String> {
-    let mut cmd = Command::new(runner()?);
-    cmd.args(["--cpus", &cpus.to_string()])
-        .arg(kernel)
-        .arg(boot);
-    Ok(cmd)
+    let machine = Machine {
+        cpus: Some(cpus),
+        ..Machine::default()
+    };
+    command_on(kernel, boot, machine)
 }
 
 /// The kernel image and the boot image of VZ, and a line of the report
@@ -289,6 +320,25 @@ pub fn clock() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_machine_keys_of_the_runner_are_set_only_when_asked_for() {
+        assert!(machine_arguments(Machine::default()).is_empty());
+        let machine = Machine {
+            cpus: Some(4),
+            memory_mib: Some(1024),
+            net: 2,
+        };
+        assert_eq!(
+            machine_arguments(machine),
+            ["--cpus", "4", "--memory", "1024", "--net", "2"]
+        );
+        let net = Machine {
+            net: 1,
+            ..Machine::default()
+        };
+        assert_eq!(machine_arguments(net), ["--net", "1"]);
+    }
 
     #[test]
     fn a_run_that_stopped_gets_the_hint() {

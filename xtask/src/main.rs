@@ -58,6 +58,7 @@ mod obj_sites;
 mod openposix;
 mod ostest;
 mod packages;
+mod pci_walk;
 mod posix_display;
 mod qemu;
 mod ring;
@@ -1650,6 +1651,8 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  pci-walk-vz [--net N] walk bus 0 on Apple VZ with N network devices (0 to 2)
+            and check the console, the entropy device and the network functions
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -1917,6 +1920,7 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("pci-walk-vz") => pci_walk::command(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {

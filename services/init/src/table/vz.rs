@@ -114,6 +114,31 @@ pub const CONSOLE: Record = Record {
     cpus: GENERAL_CPUS,
 };
 
+/// The walk of bus 0 (tests/pci-walk): one window over the whole ECAM of
+/// the bus, 32 devices of 32 KiB, which includes the console's function
+/// (whose driver also holds a window there) and the entropy device's. The
+/// program ends by itself; it needs no binding and no DMA.
+pub const PCI_WALK: Record = Record {
+    name: "pci-walk",
+    program: "pci-walk",
+    priority: 30,
+    ceiling: 30,
+    restart: Restart::Never,
+    windows: &[Window {
+        name: "ecam",
+        base: 0x4000_0000,
+        len: 0x10_0000,
+    }],
+    bindings: &[],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    ..super::entropy::RNG_VZ
+};
+
+/// The image of the walk: the console's driver for the lines and the walk.
+pub const PCI_WALK_TABLE: &[Record] = &[CONSOLE, PCI_WALK];
+
 pub const TABLE: &[Record] = &[
     CONSOLE,
     Record {
