@@ -713,6 +713,24 @@ fn wire_flags(flags: i32) -> Result<u32, i32> {
         | if flags & MSG_OOB != 0 { OOB } else { 0 })
 }
 
+/// Whether the table of handles of the process has room for the handles a
+/// reply of the pipe service may bring (`PASSES_PER_MESSAGE`): four copies of the
+/// thread's own channel are made and closed.
+fn handles_have_room() -> bool {
+    let block = crate::threads::own_block();
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
+        block.channel.load(core::sync::atomic::Ordering::Relaxed),
+    ));
+    let mut spare: [Option<Handle<Channel>>; PASSES_PER_MESSAGE] = [None, None, None, None];
+    for slot in spare.iter_mut() {
+        match rt::sys::handle_duplicate(&channel, rt::abi::Rights::NOTIFY) {
+            Ok(copy) => *slot = Some(copy),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// The descriptions the SCM_RIGHTS messages of `control` carry: the numbers
 /// of their service's descriptions, and for a socket of the network service a
 /// pass (EXPORT) among the handles of the message, listed as `PASS + k` for its
@@ -949,7 +967,15 @@ pub fn recv(
         let pipes = pipes_of(transport)?;
         let e = endpoint(end);
         let room = control.len().saturating_sub(CMSG_HEADER) / 4;
-        let max_fds = room.min(FDS_MAX) as u32;
+        // A reply that carries handles is refused whole when the table of the
+        // process has no room for them, and the message would be gone from the
+        // stream: with no room for four the call takes no descriptions (the
+        // service then lets them go and says MSG_CTRUNC, the bytes come).
+        let max_fds = if room > 0 && handles_have_room() {
+            room.min(FDS_MAX) as u32
+        } else {
+            0
+        };
         let ty = option(transport, end, OPT_TYPE, false, 0)?;
         let mut total = 0;
         let mut message = Message {

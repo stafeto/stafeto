@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2 and P4a-3, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 50] = [
+pub const CHECKS: [&str; 53] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -76,6 +76,9 @@ pub const CHECKS: [&str; 50] = [
     "scm-dead-receiver",
     "scm-close-socket",
     "scm-ctrunc",
+    "scm-retry",
+    "scm-root",
+    "scm-depart",
     "epoll-exclusive",
 ];
 

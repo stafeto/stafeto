@@ -51,13 +51,26 @@ pub const FDS_MAX: usize = 8;
 /// stands in the list of descriptions of a message as `PASS + k`, k the
 /// number of its handle among the handles of the message (`PASSES_PER_MESSAGE`
 /// at most). No description of the service has a number that high.
-pub const PASS: u32 = 0xFFFF_FFF0;
+pub const PASS: u32 = 0xFFFF_FFE0;
 /// The handles of passes one message carries at most.
 pub const PASSES_PER_MESSAGE: usize = 4;
 /// The handles of passes the service holds at most: those of messages that
 /// wait in a socket, of sends that wait for room, and of messages whose
 /// socket went and whose handles are not closed yet.
 pub const PASSES_MAX: usize = 32;
+/// The places one root (the processes of one program and its children) may
+/// hold at once.
+pub const PASSES_PER_ROOT: usize = 8;
+
+// `PASS + place` is a number of `u32` for every place, and no description of the
+// service has a number that high.
+const _: () = assert!(PASS as u64 + PASSES_MAX as u64 - 1 <= u32::MAX as u64);
+const _: () = assert!(PASSES_PER_MESSAGE < PASSES_MAX && PASSES_PER_ROOT <= PASSES_MAX);
+const _: () = assert!(PASS > (1 << 31));
+// A READY reply of SOCK_RECV (the long reply's two words, the flags, the count,
+// the numbers, the address and the bytes) always fits a message, so a reply that
+// carries handles is never refused for its size after the message left the socket.
+const _: () = assert!(8 + 8 + 4 * FDS_MAX + ADDR_MAX + SEND_MAX <= abi::MESSAGE_MAX);
 /// The most bytes of a path in an address (sun_path).
 pub const NAME_MAX: usize = 108;
 /// The sockets that wait for an accept at one listener at most.

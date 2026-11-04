@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod admissions;
+pub mod carry;
 pub mod ipc;
 pub mod named;
 pub mod sockets;

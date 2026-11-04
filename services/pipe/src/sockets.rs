@@ -29,7 +29,7 @@ use proto_pipe::sock::{
     OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE,
     OUT_CTRUNC, OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, TOO_MANY_REFS, UNIX,
 };
-use proto_pipe::sock::{OPT_PASSES, PASS, PASSES_MAX};
+use proto_pipe::sock::{OPT_PASSES, PASS, PASSES_MAX, PASSES_PER_ROOT};
 use proto_wire::{Reader, Writer};
 
 /// The live sockets one session made at most.
@@ -174,6 +174,8 @@ pub struct Sockets {
     /// to be closed (a bit each).
     pass_used: u32,
     pass_closing: u32,
+    /// The root that holds each place in use.
+    pass_root: [u64; PASSES_MAX],
     inflight: usize,
     port: u32,
     /// For each datagram socket that was read, the sockets connected to it
@@ -203,6 +205,7 @@ impl Sockets {
             limbo_len: 0,
             pass_used: 0,
             pass_closing: 0,
+            pass_root: [0; PASSES_MAX],
             inflight: 0,
             port: 0,
             owed: [0; SOCKETS],
@@ -212,7 +215,7 @@ impl Sockets {
 
     /// Whether `step` has work.
     pub fn due(&self) -> bool {
-        self.dirty != 0 || self.limbo_len != 0 || self.owed_any != 0
+        self.dirty != 0 || self.limbo_len != 0 || self.owed_any != 0 || self.pass_closing != 0
     }
 
     /// The operations that wait at the queue `queue` (DESCRIPTIONS + slot).
@@ -1488,11 +1491,19 @@ impl Pipes {
     }
 
     /// `n` slots for the handles of the passes of one message (at most
-    /// `PASSES_PER_MESSAGE`): None when the service holds `PASSES_MAX` already.
-    pub fn pass_alloc(&mut self, n: usize) -> Option<[u8; proto_pipe::sock::PASSES_PER_MESSAGE]> {
+    /// `PASSES_PER_MESSAGE`) for the root `root`: None when the service holds
+    /// `PASSES_MAX` already or the root `PASSES_PER_ROOT`.
+    pub fn pass_alloc(
+        &mut self,
+        n: usize,
+        root: u64,
+    ) -> Option<[u8; proto_pipe::sock::PASSES_PER_MESSAGE]> {
         let mut slots = [0u8; proto_pipe::sock::PASSES_PER_MESSAGE];
         let free = !self.sockets.pass_used & (u32::MAX >> (32 - PASSES_MAX));
-        if n > slots.len() || (free.count_ones() as usize) < n {
+        let held = (0..PASSES_MAX)
+            .filter(|&k| self.sockets.pass_used >> k & 1 != 0 && self.sockets.pass_root[k] == root)
+            .count();
+        if n > slots.len() || (free.count_ones() as usize) < n || held + n > PASSES_PER_ROOT {
             return None;
         }
         let mut left = free;
@@ -1501,6 +1512,7 @@ impl Pipes {
             left &= left - 1;
             *slot = k as u8;
             self.sockets.pass_used |= 1 << k;
+            self.sockets.pass_root[k as usize] = root;
         }
         Some(slots)
     }
@@ -1523,9 +1535,11 @@ impl Pipes {
         Some(slot)
     }
 
-    /// Whether a handle waits to be closed (a step is due).
-    pub fn pass_closing_due(&self) -> bool {
-        self.sockets.pass_closing != 0
+    /// The handle of slot `slot` is to be closed by a step of its own (a send
+    /// that was cancelled, a session that went): the slot stays in use until
+    /// then.
+    pub fn pass_release(&mut self, slot: usize) {
+        self.sockets.pass_closing |= 1 << slot;
     }
 
     /// The handles of passes the service holds.
@@ -2372,7 +2386,7 @@ mod tests {
         let mut w = Wakes::default();
         let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
         let (_rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
-        let slots = p.pass_alloc(2).unwrap();
+        let slots = p.pass_alloc(2, 1).unwrap();
         let ids = [PASS + u32::from(slots[0]), wr, PASS + u32::from(slots[1])];
         assert_eq!(
             p.sock_send(&a, sock(x), 0, &ids, &Addr::NONE, b"m", &mut w),
@@ -2403,7 +2417,7 @@ mod tests {
         let mut a = Held::default();
         let mut w = Wakes::default();
         let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
-        let slot = p.pass_alloc(1).unwrap()[0];
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
         p.sock_send(
             &a,
             sock(x),
@@ -2434,7 +2448,7 @@ mod tests {
         let mut a = Held::default();
         let mut w = Wakes::default();
         let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
-        let slot = p.pass_alloc(1).unwrap()[0];
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
         p.sock_send(
             &a,
             sock(x),
@@ -2464,7 +2478,7 @@ mod tests {
         let mut a = Held::default();
         let mut w = Wakes::default();
         let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
-        let slots = p.pass_alloc(3).unwrap();
+        let slots = p.pass_alloc(3, 1).unwrap();
         let ids = slots.map(|s| PASS + u32::from(s));
         p.sock_send(&a, sock(x), 0, &ids[..3], &Addr::NONE, b"m", &mut w)
             .unwrap();
@@ -2487,15 +2501,87 @@ mod tests {
     #[test]
     fn the_service_holds_thirty_two_passes_and_no_more() {
         let mut p = pipes();
-        for _ in 0..PASSES_MAX / 4 {
-            assert!(p.pass_alloc(4).is_some());
+        for k in 0..PASSES_MAX / 4 {
+            // Four roots hold eight each.
+            assert!(p.pass_alloc(4, 1 + (k / 2) as u64).is_some());
         }
         assert_eq!(p.passes_held(), PASSES_MAX);
-        assert_eq!(p.pass_alloc(1), None);
+        assert_eq!(p.pass_alloc(1, 9), None);
         p.pass_free(5);
-        assert_eq!(p.pass_alloc(2), None, "one slot is free, two are asked");
-        assert_eq!(p.pass_alloc(1).map(|s| s[0]), Some(5));
-        assert_eq!(p.pass_alloc(5), None, "a message holds four at most");
+        assert_eq!(p.pass_alloc(2, 9), None, "one slot is free, two are asked");
+        assert_eq!(p.pass_alloc(1, 9).map(|s| s[0]), Some(5));
+        assert_eq!(p.pass_alloc(5, 9), None, "a message holds four at most");
+    }
+
+    #[test]
+    fn a_root_holds_eight_passes_and_the_others_still_get_theirs() {
+        let mut p = pipes();
+        assert!(p.pass_alloc(4, 1).is_some());
+        assert!(p.pass_alloc(4, 1).is_some());
+        assert_eq!(p.passes_held(), PASSES_PER_ROOT);
+        assert_eq!(p.pass_alloc(1, 1), None, "the ninth of one root");
+        let other = p.pass_alloc(4, 2).unwrap();
+        assert_eq!(other[0], PASSES_PER_ROOT as u8);
+        // A place given back makes room for the root again.
+        p.pass_free(3);
+        assert_eq!(p.pass_alloc(1, 1).map(|s| s[0]), Some(3));
+    }
+
+    #[test]
+    fn a_pass_in_a_high_place_travels_and_arrives_as_itself() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        // Roots of eight fill the places below 31.
+        for root in 1..=3u64 {
+            p.pass_alloc(4, root).unwrap();
+            p.pass_alloc(4, root).unwrap();
+        }
+        let slot = p.pass_alloc(1, 4).unwrap()[0];
+        assert_eq!(slot, 24);
+        for root in 4..=4u64 {
+            p.pass_alloc(4, root).unwrap();
+        }
+        let top = p.pass_alloc(3, 5).unwrap();
+        assert_eq!(top[2], 31);
+        let (_rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
+        let ids = [wr, PASS + u32::from(top[2])];
+        assert!(PASS + 31 > PASS);
+        assert_eq!(
+            p.sock_send(&a, sock(x), 0, &ids, &Addr::NONE, b"m", &mut w),
+            Ok(Some(1))
+        );
+        let mut b = p.clone_endpoints(&a, &[sock(y)]).unwrap();
+        let mut out = [0; 4];
+        let got = p
+            .sock_recv(&mut b, sock(y), 0, &mut out, 8, &mut w)
+            .unwrap()
+            .unwrap();
+        // The pass of place 31 is itself and no description of the session.
+        assert_eq!(&got.fds[..got.nfds], &ids);
+        assert!(b.holds(wr) && !b.holds(0));
+        assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_pass_let_go_of_stays_in_use_until_a_step_closes_it() {
+        let mut p = pipes();
+        let mut w = Wakes::default();
+        let slots = p.pass_alloc(3, 1).unwrap();
+        for &s in &slots[..3] {
+            p.pass_release(usize::from(s));
+        }
+        assert!(p.sockets.due());
+        assert_eq!(p.passes_held(), 3);
+        let mut closed = 0;
+        while let Some(_slot) = p.pass_closing() {
+            closed += 1;
+        }
+        assert_eq!(closed, 3);
+        assert_eq!(p.passes_held(), 0);
+        assert!(!p.sockets.due());
+        p.step(&mut w);
     }
 
     #[test]
@@ -2504,7 +2590,7 @@ mod tests {
         let mut a = Held::default();
         let (x, _y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
         assert_eq!(p.sock_option(&a, sock(x), OPT_PASSES, false, 0), Ok(0));
-        p.pass_alloc(3).unwrap();
+        p.pass_alloc(3, 1).unwrap();
         assert_eq!(p.sock_option(&a, sock(x), OPT_PASSES, false, 0), Ok(3));
         assert_eq!(
             p.sock_option(&a, sock(x), OPT_PASSES, true, 1),
@@ -2520,7 +2606,7 @@ mod tests {
         let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
         // The numbers of passes have the bits of a socket's number set.
         assert_ne!(PASS & SOCK_END, 0);
-        let slot = p.pass_alloc(1).unwrap()[0];
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
         p.sock_send(
             &a,
             sock(x),

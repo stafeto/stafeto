@@ -17,6 +17,7 @@
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
+use pipe::carry::{self, Carries, Carry};
 use pipe::ipc::{Block, Flow, IPC_TAG, Out};
 use pipe::{Held, Pipes, Roots, Wakes};
 use posix_credentials::known::Known;
@@ -53,23 +54,6 @@ impl IoCapture {
             generation: 0,
         },
         queue: 0,
-    };
-}
-
-/// The slots of the handles of passes that a send which waits holds: its
-/// session's label (a session that goes lets go of them) and the slots by the
-/// number each handle had in the request.
-#[derive(Clone, Copy)]
-struct Carry {
-    n: u8,
-    label: u64,
-    slots: [u8; PASSES_PER_MESSAGE],
-}
-impl Carry {
-    const EMPTY: Self = Self {
-        n: 0,
-        label: 0,
-        slots: [0; PASSES_PER_MESSAGE],
     };
 }
 
@@ -132,7 +116,7 @@ struct Tables {
     /// The handles of the passes (sockets of the network service in messages),
     /// by slot, and the slots of the sends that wait, by operation.
     passes: [Option<Handle<Channel>>; PASSES_MAX],
-    carried: [Carry; OPERATIONS],
+    carried: Carries<OPERATIONS>,
 }
 struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -246,7 +230,7 @@ struct PipeService {
     named: &'static mut Admissions<Handle<Channel>>,
     io: &'static mut [IoCapture; OPERATIONS],
     passes: &'static mut [Option<Handle<Channel>>; PASSES_MAX],
-    carried: &'static mut [Carry; OPERATIONS],
+    carried: &'static mut Carries<OPERATIONS>,
     /// The slots of the send that is about to wait: `wait` files them under
     /// the operation it makes.
     pending_carry: Option<Carry>,
@@ -506,7 +490,7 @@ impl PipeService {
         }
         // The handles of passes the session's sends hold go with them.
         for idx in 0..OPERATIONS {
-            if self.carried[idx].n != 0 && self.carried[idx].label == s.label() {
+            if self.carried.get(idx).n != 0 && self.carried.get(idx).label == s.label() {
                 self.drop_carry(idx);
             }
         }
@@ -594,7 +578,8 @@ impl PipeService {
                     queue: end,
                 };
                 if let Some(carry) = self.pending_carry.take() {
-                    self.carried[((key & 0xffff_ffff) - 1) as usize] = Carry { label, ..carry };
+                    self.carried
+                        .file(((key & 0xffff_ffff) - 1) as usize, label, carry);
                 }
                 let ops = &self.ops;
                 let named = &self.named;
@@ -1343,7 +1328,7 @@ impl PipeService {
             Ok(Some(n)) => {
                 // The message holds the handles now.
                 if let Some(key) = send.key {
-                    self.carried[((key & 0xffff_ffff) - 1) as usize] = Carry::EMPTY;
+                    self.carried.take(((key & 0xffff_ffff) - 1) as usize);
                 }
                 self.finish(s, send.key, endpoint.id);
                 long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
@@ -1383,51 +1368,53 @@ impl PipeService {
         send: &Send<'_>,
     ) -> Result<([u32; proto_pipe::sock::FDS_MAX], Carry), Answer> {
         let mut fds = send.fds;
-        let listed = fds[..send.nfds].iter().filter(|&&id| id >= PASS).count();
+        let listed = carry::listed(&fds[..send.nfds]);
         let bad = || Answer::Status(Status::BadSize);
         if let Some(key) = send.key {
-            // A take: the slots are the operation's.
-            let carry = self.carried[((key & 0xffff_ffff) - 1) as usize];
-            if usize::from(carry.n) != listed || (listed != 0 && carry.label != s.label()) {
+            // A take brings the notification's handle at most; the places are
+            // the operation's.
+            if r.handles.len() > 1 {
                 return Err(bad());
             }
-            for id in fds[..send.nfds].iter_mut().filter(|id| **id >= PASS) {
-                let k = (*id - PASS) as usize;
-                if k >= usize::from(carry.n) {
-                    return Err(bad());
-                }
-                *id = PASS + u32::from(carry.slots[k]);
+            let held = self.carried.get(((key & 0xffff_ffff) - 1) as usize);
+            if held.n != 0 && held.label != s.label() {
+                return Err(bad());
             }
-            return Ok((fds, carry));
+            carry::translate(&mut fds[..send.nfds], held.places()).map_err(|_| bad())?;
+            return Ok((fds, held));
         }
-        if r.handles.len() != listed {
+        if r.handles.len() != listed || !carry::names_each_once(&fds[..send.nfds], listed) {
             return Err(bad());
         }
         if listed == 0 {
             return Ok((fds, Carry::EMPTY));
         }
-        // Each number names a handle once.
-        let mut named = 0u32;
-        for &id in fds[..send.nfds].iter().filter(|&&id| id >= PASS) {
-            let k = id - PASS;
-            if k as usize >= listed || named >> k & 1 != 0 {
-                return Err(bad());
-            }
-            named |= 1 << k;
-        }
+        // Each handle is a pass of the network service: a channel that can only
+        // be handed on. A channel with more rights (a session of this service
+        // may send, and a clone of it would make a message hold its own
+        // socket for ever) or a copy of this service's own channel is refused.
         let mut handles: [Option<Handle<Channel>>; PASSES_PER_MESSAGE] = [None, None, None, None];
         for (k, handle) in handles.iter_mut().enumerate().take(listed) {
-            *handle = Some(r.handles.take::<Channel>(k).map_err(|_| bad())?);
+            let fits = matches!(
+                r.handles.info(k),
+                Some((rt::abi::ObjectKind::Channel, rights)) if carry::is_pass_rights(rights)
+            );
+            if !fits {
+                return Err(bad());
+            }
+            let taken = r.handles.take::<Channel>(k).map_err(|_| bad())?;
+            if sys::copy_label(&self.channel, &taken).is_ok() {
+                return Err(bad());
+            }
+            *handle = Some(taken);
         }
-        let Some(slots) = self.pipes.pass_alloc(listed) else {
+        let Some(slots) = self.pipes.pass_alloc(listed, s.data.root) else {
             return Err(status(proto_pipe::sock::NO_BUFFERS));
         };
         for (k, handle) in handles.iter_mut().enumerate().take(listed) {
             self.passes[usize::from(slots[k])] = handle.take();
         }
-        for id in fds[..send.nfds].iter_mut().filter(|id| **id >= PASS) {
-            *id = PASS + u32::from(slots[(*id - PASS) as usize]);
-        }
+        carry::translate(&mut fds[..send.nfds], &slots[..listed]).map_err(|_| bad())?;
         Ok((
             fds,
             Carry {
@@ -1438,18 +1425,26 @@ impl PipeService {
         ))
     }
 
-    /// The handles of the slots of `carry` close and the slots are free.
+    /// The handles of the slots of `carry` close and the slots are free (a
+    /// send that was refused at its start: at most four).
     fn free_carry(&mut self, carry: &Carry) {
-        for &slot in &carry.slots[..usize::from(carry.n)] {
+        for &slot in carry.places() {
             self.passes[usize::from(slot)] = None;
             self.pipes.pass_free(usize::from(slot));
         }
     }
 
-    /// The handles the operation `idx` holds close.
+    /// The handles the operation `idx` holds are to be closed, one in each step
+    /// of the service (a send cancelled, or its session gone, closes at most 32
+    /// of them at once otherwise).
     fn drop_carry(&mut self, idx: usize) {
-        let carry = core::mem::replace(&mut self.carried[idx], Carry::EMPTY);
-        self.free_carry(&carry);
+        let held = self.carried.take(idx);
+        for &slot in held.places() {
+            self.pipes.pass_release(usize::from(slot));
+        }
+        if held.n != 0 {
+            self.kick();
+        }
     }
 
     /// SOCK_RECV (`take` false) or SOCK_RECV_TAKE.

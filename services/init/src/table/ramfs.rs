@@ -494,7 +494,11 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// segments, a stack of 32 KiB, the 64 rings of 4 KiB and the tables of
 /// its 320 sessions, 256 births and 128 long operations in `.bss`; a
 /// handle for each long operation that waits and for each pass of a socket
-/// of the network service that a message holds (32 at most).
+/// of the network service that a message holds (32 at most). 224 covers those
+/// two; the identity session each caller of the IPC calls leaves (up to 320),
+/// the tickets of named objects and the file service's notification take the
+/// rest of the table, whose end the kernel answers with LIMIT_REACHED to the
+/// sender (a pass then does not arrive).
 pub const PIPE: Record = Record {
     name: "pipe",
     program: "pipe",

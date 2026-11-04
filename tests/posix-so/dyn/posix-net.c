@@ -2146,6 +2146,158 @@ static void scm_ctrunc(void)
 	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
 }
 
+static void on_retry_alarm(int sig)
+{
+	(void)sig;
+}
+
+/* A send with a socket that waits is ended by a signal: the passes it held go,
+ * and the same send made again (the library exports the socket again) goes
+ * through once the reader has taken a message. */
+static void scm_retry(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2], p[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0 && pipe(p) == 0);
+	for (int i = 0; i < 4; i++)
+		REQUIRE(send_fds(u[0], &p[0], 1) == 1);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_retry_alarm;
+	REQUIRE(sigaction(SIGALRM, &sa, NULL) == 0);
+	alarm(1);
+	errno = 0;
+	REQUIRE(send_fds(u[0], &s, 1) == -1 && errno == EINTR);
+	/* The handles the cancelled send held close in steps of the service. */
+	passes_become(u[0], 0, 3000);
+	REQUIRE(!sees_end(c, 200));
+	int got[4];
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(close(got[0]) == 0);
+	REQUIRE(send_fds(u[0], &s, 1) == 1);
+	for (int i = 0; i < 3; i++) {
+		REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+		REQUIRE(close(got[0]) == 0);
+	}
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(write(got[0], "r", 1) == 1);
+	char b = 0;
+	REQUIRE(recv(c, &b, 1, 0) == 1 && b == 'r');
+	REQUIRE(close(got[0]) == 0 && close(s) == 0);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0 && close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+/* A root (a program and its children) holds eight passes at once: a ninth is
+ * ENOBUFS, whichever of its processes sends it. */
+static void scm_root(void)
+{
+	int port, lis = listener(16, &port);
+	int c[10], s[10];
+	for (int i = 0; i < 10; i++)
+		pair(lis, port, &c[i], &s[i]);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	REQUIRE(send_fds(u[0], s, 4) == 1);
+	REQUIRE(send_fds(u[0], s + 4, 4) == 1);
+	REQUIRE(passes_held(u[0]) == 8);
+	errno = 0;
+	REQUIRE(send_fds(u[0], s + 8, 1) == -1 && errno == ENOBUFS);
+	REQUIRE(passes_held(u[0]) == 8);
+	/* The children of the root share its eight. */
+	int v[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, v) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(u[0]);
+		close(u[1]);
+		errno = 0;
+		if (send_fds(v[0], s + 9, 1) != -1 || errno != ENOBUFS)
+			_exit(60);
+		_exit(0);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+	/* The reader takes both messages: the places come back. */
+	int got[4];
+	for (int i = 0; i < 2; i++) {
+		REQUIRE(recv_fds(u[1], got, 4, NULL) == 4);
+		for (int k = 0; k < 4; k++)
+			REQUIRE(close(got[k]) == 0);
+	}
+	for (int i = 0; i < 10; i++)
+		REQUIRE(close(s[i]) == 0);
+	passes_become(u[0], 0, 3000);
+	REQUIRE(send_fds(u[0], &c[0], 1) == 1);
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(close(got[0]) == 0);
+	for (int i = 0; i < 10; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(v[0]) == 0 && close(v[1]) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
+static int depart_u;
+static int depart_sock[8];
+
+static void *depart_sender(void *arg)
+{
+	int k = (int)(intptr_t)arg;
+	send_fds(depart_u, depart_sock + 4 * k, 4);
+	return NULL;
+}
+
+/* A process ends with two sends of four sockets each waiting: the handles
+ * they held go in steps, and the peers of the eight sockets see the end. */
+static void scm_depart(void)
+{
+	int port, lis = listener(16, &port);
+	int c[8], s[8];
+	int u[2], p[2], gate[2];
+	for (int i = 0; i < 8; i++)
+		pair(lis, port, &c[i], &s[i]);
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0 && pipe(p) == 0 && pipe(gate) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(gate[1]);
+		for (int i = 0; i < 4; i++)
+			if (send_fds(u[0], &p[0], 1) != 1)
+				_exit(70);
+		depart_u = u[0];
+		memcpy(depart_sock, s, sizeof s);
+		pthread_t t[2];
+		for (int k = 0; k < 2; k++)
+			if (pthread_create(&t[k], NULL, depart_sender, (void *)(intptr_t)k) != 0)
+				_exit(71);
+		char b;
+		if (read(gate[0], &b, 1) != 1)
+			_exit(72);
+		_exit(0);
+	}
+	close(gate[0]);
+	for (int i = 0; i < 8; i++)
+		REQUIRE(close(s[i]) == 0);
+	/* Both sends wait with their eight handles. */
+	long end = now_ms() + 3000;
+	while (passes_held(u[1]) != 8) {
+		REQUIRE(now_ms() < end);
+		pause_ms(10);
+	}
+	REQUIRE(write(gate[1], "g", 1) == 1);
+	REQUIRE(wait_exit(kid) == 0);
+	passes_become(u[1], 0, 5000);
+	for (int i = 0; i < 8; i++)
+		REQUIRE(sees_end(c[i], 3000));
+	for (int i = 0; i < 8; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(gate[1]) == 0 && close(lis) == 0);
+}
+
 static int excl_ep[2];
 static volatile int excl_woke;
 
@@ -2244,6 +2396,9 @@ static const struct {
 	{ "scm-dead-receiver", scm_dead_receiver },
 	{ "scm-close-socket", scm_close_socket },
 	{ "scm-ctrunc", scm_ctrunc },
+	{ "scm-retry", scm_retry },
+	{ "scm-root", scm_root },
+	{ "scm-depart", scm_depart },
 	{ "epoll-exclusive", epoll_exclusive },
 };
 
