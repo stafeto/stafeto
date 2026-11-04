@@ -143,7 +143,6 @@ mod tests {
         let mut fds = [PASS];
         translate(&mut fds, &[31]).unwrap();
         assert_eq!(fds, [PASS + 31]);
-        assert!(u64::from(PASS) + 31 <= u64::from(u32::MAX));
         assert!(fds[0] > PASS);
     }
 

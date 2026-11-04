@@ -2547,7 +2547,6 @@ mod tests {
         assert_eq!(top[2], 31);
         let (_rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
         let ids = [wr, PASS + u32::from(top[2])];
-        assert!(PASS + 31 > PASS);
         assert_eq!(
             p.sock_send(&a, sock(x), 0, &ids, &Addr::NONE, b"m", &mut w),
             Ok(Some(1))
