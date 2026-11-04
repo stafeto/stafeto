@@ -44,8 +44,12 @@ const LEASE_WITHIN: Duration = Duration::from_secs(20);
 const LEASE1_WITHIN: Duration = Duration::from_secs(30);
 /// The probe may take this long from the start of the machine.
 const RUN_WITHIN: Duration = Duration::from_secs(60 * 4);
-/// The closed port must refuse within this long.
-const REFUSAL_WITHIN: Duration = Duration::from_secs(1);
+/// The closed port must refuse within this long. The Mac's first SYN of a
+/// connection carries the ECN flags, and the reset to it does not end the
+/// connection (measured: the guest sends it, to the right MAC, with the right
+/// acknowledgement); the SYN sent again after one second, without the flags,
+/// gets the refusal at 1.0 s. Two seconds hold the retry.
+const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
 /// The fixed MAC addresses of `vz-run`, by device.
 const MACS: [&str; 2] = ["02:73:74:66:00:01", "02:73:74:66:00:02"];
 /// The static address of the second device in the image `--static1`.
@@ -267,7 +271,7 @@ fn closed_port(address: Ipv4Addr) -> Result<(), String> {
         Err(e) if e.raw_os_error() == Some(65) => Err(format!(
             "{target}: {e}: the Mac has no route to the guest; allow the terminal the Local Network permission"
         )),
-        other => Err(format!("{target}: {other:?}, wanted a refusal within 1 s")),
+        other => Err(format!("{target}: {other:?}, wanted a refusal within 2 s")),
     }
 }
 
