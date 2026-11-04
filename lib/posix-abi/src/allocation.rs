@@ -303,11 +303,12 @@ pub unsafe fn after_fork(
             object.wait_key,
         );
     }
-    // The parent's display piece is no mapping of the child's: its pages
-    // of the room are free again.
+    // The parent's display piece and network buffer piece are no mappings
+    // of the child's: their pages of the room are free again.
     let display = state.map.display_piece();
+    let network = state.map.kind_piece(posix_map::Kind::NetBuffer);
     state.map.forget();
-    if let Some((address, pages)) = display {
+    for (address, pages) in [display, network].into_iter().flatten() {
         state.space.set(address, pages, Page::Unbacked);
     }
     let mut last = None;
@@ -569,7 +570,21 @@ impl State {
         handle: Handle<Memory>,
         pages: usize,
     ) -> Result<usize, i32> {
-        if self.map.display_piece().is_some() {
+        self.map_special(handle, pages, posix_map::Kind::Display)
+    }
+
+    /// `handle` (`pages` pages, MAP_READ and MAP_WRITE) becomes the piece
+    /// of `kind` (the display piece or the network buffer piece), in an
+    /// object of its own at an address of the room; the address. EBUSY
+    /// when the map has one of the kind already, ENOMEM past the room, the
+    /// limits or the table. The handle goes if the map refuses it.
+    pub(crate) fn map_special(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+        kind: posix_map::Kind,
+    ) -> Result<usize, i32> {
+        if self.map.kind_piece(kind).is_some() {
             return Err(EBUSY);
         }
         self.within_data(pages)?;
@@ -578,21 +593,27 @@ impl State {
             ..Source::anonymous()
         };
         let (index, address) = self.make_own(None, pages, Access::ReadWrite, false, source, 0)?;
-        self.map.object_mut(index).display = true;
+        self.map.object_mut(index).kind = kind;
         Ok(address)
     }
 
     /// The display piece leaves the process (`mem_unmap`) and its object
     /// closes; Ok when there is none.
     pub(crate) fn unmap_display(&mut self) -> Result<(), i32> {
-        let Some((address, pages)) = self.map.display_piece() else {
+        self.unmap_special(posix_map::Kind::Display)
+    }
+
+    /// The piece of `kind` leaves the process (`mem_unmap`) and its object
+    /// closes; Ok when there is none.
+    pub(crate) fn unmap_special(&mut self, kind: posix_map::Kind) -> Result<(), i32> {
+        let Some((address, pages)) = self.map.kind_piece(kind) else {
             return Ok(());
         };
-        // SAFETY: the pages are the layer's own display piece, which the
+        // SAFETY: the pages are the layer's own piece of `kind`, which the
         // caller gives up.
         unsafe { sys::mem_unmap(&config().process, address, (pages * PAGE) as u64) }
             .map_err(|e| self.refused(e))?;
-        self.map.unmap_display();
+        self.map.unmap_kind(kind);
         self.space.set(address, pages, Page::Unbacked);
         Ok(())
     }

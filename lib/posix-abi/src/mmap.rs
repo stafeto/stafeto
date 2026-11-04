@@ -81,8 +81,8 @@ fn whole_pages(len: usize) -> Result<usize, i32> {
 /// unmapped. Pages in no mapping are left alone.
 fn release(state: &mut State, address: usize, pages: usize) -> Result<(), i32> {
     // The buffer of the screen goes with the screen's owner only (spec 3,
-    // 7.3).
-    if state.map.meets_display(address, pages) {
+    // 7.3), and the shared buffer with the network service with the layer.
+    if state.map.meets_special(address, pages) {
         return Err(EINVAL);
     }
     // The holes the range touches go first: they are no mapping, and the
@@ -527,7 +527,7 @@ pub fn mprotect(addr: usize, len: usize, prot: i32) -> Result<(), i32> {
         {
             return Err(ENOTSUP);
         }
-        if state.map.meets_display(addr, pages) {
+        if state.map.meets_special(addr, pages) {
             return Err(EINVAL);
         }
         if !mapped(state, addr, pages) {
