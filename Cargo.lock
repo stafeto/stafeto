@@ -290,8 +290,11 @@ dependencies = [
  "proto-wire",
  "rt",
  "smoltcp",
+ "virtio-console",
  "virtio-drivers",
  "virtio-mmio",
+ "virtio-pci",
+ "virtio-rng",
 ]
 
 [[package]]

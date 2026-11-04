@@ -51,6 +51,12 @@ proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }
 proto-entropy = { path = "../../proto/entropy" }
 virtio-mmio = { path = "../../lib/virtio-mmio" }
+virtio-pci = { path = "../../lib/virtio-pci" }
+
+# The numbers of the neighbours on VZ's bus that the BARs of `pci` go past.
+[dev-dependencies]
+virtio-console = { path = "../virtio-console" }
+virtio-rng = { path = "../virtio-rng" }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt, the device's crate and the stack.

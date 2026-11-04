@@ -15,6 +15,7 @@ pub mod copy;
 pub mod demux;
 pub mod frames;
 pub mod lines;
+pub mod pci;
 pub mod places;
 pub mod ports;
 pub mod resolv;
