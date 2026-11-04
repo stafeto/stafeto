@@ -53,6 +53,7 @@ mod ncdu_dialog;
 mod net;
 mod net_curl;
 mod net_probe;
+mod net_wget;
 mod obj_sites;
 mod openposix;
 mod ostest;
@@ -1668,6 +1669,12 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
+            HTTPS servers of the host, the lookups of the resolver against
+            name servers in the guest (`net-dns checks`), and check the
+            `/etc/resolv.conf` the network service writes; with `steps` the
+            service counts its steps under that traffic (TCG only); with
+            `internet` (by hand) the guest fetches example.com
   net [--machine hvf] run the shell with the network service on the terminal;
             ports 8080 and 2222 of the host are forwarded to 80 and 22;
             `curl -s http://127.0.0.1:8080/index.html | shasum` after
@@ -1921,6 +1928,7 @@ fn main() {
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
+        Some("net-wget") => net_wget::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -8789,6 +8797,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // guest, UDP both ways and the checks of `net-sock`, through the
         // ports QEMU forwards. Also in the group `net`.
         job("net-curl", || net_curl::probe(&qemu::VIRT, false)),
+        // The way out: BusyBox `wget` over HTTP and HTTPS to servers on the
+        // host, the lookups of the resolver against name servers in the
+        // guest, and the file `/etc/resolv.conf` the service writes.
+        job("net-wget", || {
+            net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
+        }),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

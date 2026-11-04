@@ -723,7 +723,7 @@ mod tests {
             net,
         } = split(&names);
         assert!(!kernel.is_empty());
-        assert_eq!(net, ["net-probe", "net-curl"]);
+        assert_eq!(net, ["net-probe", "net-curl", "net-wget"]);
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();
         for name in kernel.iter().chain(guests.iter().flatten()).chain(&net) {
             *seen.entry(name.clone()).or_default() += 1;

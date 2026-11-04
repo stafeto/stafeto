@@ -433,7 +433,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
 /// service starts again in the run (the role `k` kills it), and each start
 /// counts from nothing, so the longest is taken over all the lines of a
 /// kind.
-fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
+pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for line in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
