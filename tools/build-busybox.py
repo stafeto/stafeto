@@ -53,7 +53,7 @@ UNWIND_CFLAGS = ("-fasynchronous-unwind-tables", "-mllvm", "-enable-machine-outl
 PIC = "-fPIC"
 # BusyBox's main becomes applets_main: the probe's own C main, which relibc
 # calls, chooses the applet and its arguments.
-PATCH = "utilities echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769 sockets nc timeout"
+PATCH = "wget-nslookup utilities echo cat wc sleep head-c mktemp ash-random ash-job-control ash-builtins ash-interruptible-traps names-nofork-cat math test printf getopts alias command kill ash ls-nofork relibc main-renamed a53-835769 sockets nc timeout"
 
 
 def relibc_commit() -> str:
@@ -117,7 +117,7 @@ UTILITIES = tuple(name.upper() for name in (
     "du ed env expand expr false find fold grep head id kill ln logger logname mesg mkdir "
     "mkfifo mv nice nohup od paste patch printf pwd readlink realpath renice rm rmdir sed "
     "sleep sort split strings stty tail tee test time timeout touch tr true tsort tty uname "
-    "uncompress unexpand uniq uudecode uuencode xargs zcat busybox desktop httpd ps feature_ps_wide feature_ps_long feature_ps_time feature_ps_additional_columns feature_ls_username feature_seamless_z feature_seamless_gz "
+    "uncompress unexpand uniq uudecode uuencode xargs zcat busybox desktop httpd wget feature_wget_https feature_wget_timeout nslookup feature_nslookup_big dnsd ps feature_ps_wide feature_ps_long feature_ps_time feature_ps_additional_columns feature_ls_username feature_seamless_z feature_seamless_gz "
     "feature_mtab_support feature_awk_libm feature_awk_gnu_extensions feature_date_compat "
     "feature_date_isofmt feature_date_nano feature_dd_ibs_obs feature_dd_status feature_df_fancy "
     "feature_diff_dir feature_find_amin feature_find_atime "
@@ -300,6 +300,12 @@ def build(utilities: bool) -> None:
             content = source.read_text()
             if "//kbuild:lib-y +=" in content:
                 source.write_text(content.replace("//kbuild:lib-y +=", "//disabled-kbuild:lib-y +="))
+    if utilities:
+        # nslookup takes its own resolver (res_mkquery, ns_initparse and
+        # dn_expand of musl 1.2.4 inside networking/nslookup.c): relibc has
+        # no resolv.h for the small variant.
+        replace(SOURCE / "networking/nslookup.c",
+                "#define USE_LIBC_RESOLV 1", "#define USE_LIBC_RESOLV 0")
     run("make", "allnoconfig", cwd=SOURCE)
     config = SOURCE / ".config"
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
@@ -380,6 +386,9 @@ def build(utilities: bool) -> None:
             # clang reads a global that is const only once, before BusyBox sets
             # ptr_to_globals (awk, among others, then ran with a null pointer).
             *(("-DBB_GLOBAL_CONST=",) if utilities else ()))), cwd=SOURCE)
+    if utilities and "WGET" in names and "CONFIG_TLS=y" not in config.read_text():
+        # TLS is hidden: FEATURE_WGET_HTTPS selects it while the tree builds.
+        raise SystemExit("BusyBox wget has no TLS: CONFIG_TLS is not set")
     for archive in [SOURCE / d / "lib.a" for d in DIRECTORIES]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")
