@@ -46,6 +46,7 @@ mod net;
 mod seed;
 mod split;
 mod stack;
+mod transport;
 
 use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
@@ -65,8 +66,7 @@ use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, 
 use rt::{Handle, sys};
 use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
-use virtio_drivers::transport::Transport;
-use virtio_drivers::transport::mmio::MmioTransport;
+use virtio_drivers::transport::{SomeTransport, Transport};
 use virtio_mmio::{Isr, OpenError, PAGE, StartError};
 
 rt::entry!(main);
@@ -110,6 +110,9 @@ const STOPPED: u64 = 5;
 const NO_DEVICE: u64 = 6;
 const NOT_STARTED: u64 = 7;
 const NO_CONFIG: u64 = 9;
+/// The common configuration of a PCI device lies elsewhere than at the
+/// start of BAR 0.
+const CONFIG_ELSEWHERE: u64 = 10;
 
 /// The tables of the service in `.bss`, too big for the stack: the sockets
 /// with their buffers (`net`), the storage of the smoltcp sockets, the table
@@ -154,7 +157,7 @@ fn word(own: &[u8], at: usize) -> u64 {
 /// device holds, read at the width of each field (Virtio 1.2, 4.2.2.2: the
 /// bytes of the MAC one at a time, the status as 16 bits) between two equal
 /// generations (Virtio 1.2, 2.5.1).
-fn read_config(transport: &MmioTransport<'static>) -> Result<([u8; 6], bool), ()> {
+fn read_config(transport: &impl Transport) -> Result<([u8; 6], bool), ()> {
     transport
         .read_consistent(|| {
             let mut mac = [0u8; 6];
@@ -272,11 +275,33 @@ fn main(_: u64) -> u64 {
     let Ok(mut got) = rt::service::register(&s.parent, &channel) else {
         return NOT_REGISTERED;
     };
-    let (Ok(irq), Ok(window)) = (got.take::<Interrupt>("irq"), got.take::<Memory>("mmio")) else {
+    let Ok(irq) = got.take::<Interrupt>("irq") else {
         return NOT_REGISTERED;
     };
     let rw = Access::ReadWrite;
     let page = PAGE as u64;
+    // QEMU's transport, or VZ's function and its Virtio structures.
+    let mut windows = [None, None];
+    let pci = if let Ok(window) = got.take::<Memory>("mmio") {
+        if sys::mem_map(&s.process, &window, 0, page, dma::mmio_at(DEVICE), rw).is_err() {
+            return NOT_MAPPED;
+        }
+        windows[0] = Some(window);
+        false
+    } else {
+        let (Ok(ecam), Ok(bar)) = (got.take::<Memory>("ecam"), got.take::<Memory>("bar")) else {
+            return NOT_REGISTERED;
+        };
+        let (_, ecam_len) = netd::pci::ecam_window(1);
+        let (_, bar_len) = netd::pci::bar_window(1);
+        if sys::mem_map(&s.process, &ecam, 0, ecam_len, dma::ecam_at(), rw).is_err()
+            || sys::mem_map(&s.process, &bar, 0, bar_len, dma::bar_at(), rw).is_err()
+        {
+            return NOT_MAPPED;
+        }
+        windows = [Some(ecam), Some(bar)];
+        true
+    };
     if dma_pa == 0
         || net_pa == 0
         || sys::mem_map(
@@ -297,31 +322,43 @@ fn main(_: u64) -> u64 {
             rw,
         )
         .is_err()
-        || sys::mem_map(&s.process, &window, 0, page, dma::mmio_at(DEVICE), rw).is_err()
     {
         return NOT_MAPPED;
     }
     dma::attach(DEVICE, dma_pa, net_pa);
-    let base = dma::mmio_at(DEVICE) + (at as usize & (PAGE - 1));
-    // SAFETY: the window maps the transport's page at mmio_at as device
-    // memory, read and write; `base` is the transport within it, and only
-    // the transport and `read_config` reach the registers from here on.
-    let opened = unsafe { virtio_mmio::transport(base, virtio_mmio::device::NET) };
-    let (mut transport, status) = match opened {
-        Ok(found) => found,
-        Err(error) => {
+    let opened = if pci {
+        transport::pci_transport::<DEVICE>(&netd::pci::PLACES[DEVICE]).map_err(Some)
+    } else {
+        transport::mmio_transport(DEVICE, at).map_err(|error| {
             match error {
                 OpenError::Rejected(why) => {
                     rt::println!("virtio-net: no network device at {at:#x}: {why:?}")
                 }
                 OpenError::Unusable => rt::println!("virtio-net: no usable transport at {at:#x}"),
             }
+            None
+        })
+    };
+    let (mut transport, status) = match opened {
+        Ok(found) => found,
+        Err(Some(transport::Failure::ConfigElsewhere)) => return CONFIG_ELSEWHERE,
+        Err(Some(transport::Failure::NotReset)) => return NOT_STARTED,
+        Err(Some(transport::Failure::NoDevice)) => {
+            rt::println!("virtio-net: no network device at {at:#x}");
             return NO_DEVICE;
         }
+        Err(None) => return NO_DEVICE,
     };
     let features = match virtio_mmio::start_with(&mut transport, MAC | STATUS) {
         Ok(bits) => bits,
-        Err(StartError::Reset | StartError::Features) => return NOT_STARTED,
+        Err(StartError::Reset) => return NOT_STARTED,
+        Err(StartError::Features) => {
+            rt::println!(
+                "virtio-net: features refused, offered {:#x}",
+                transport.read_device_features()
+            );
+            return NOT_STARTED;
+        }
     };
     if features & MAC == 0 {
         rt::println!("virtio-net: the device offers no MAC address");
@@ -357,10 +394,17 @@ fn main(_: u64) -> u64 {
     virtio_mmio::ring(&mut transport, RECEIVEQ);
     device.rx.dirty = false;
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
-    rt::println!(
-        "virtio-net: virtio-mmio at {at:#x}, line {line}, status {status:#x}, mac {}",
-        Mac(mac)
-    );
+    if pci {
+        rt::println!(
+            "virtio-net: 1af4:1041 at {at:#x}, line {line}, status {status:#x}, mac {}",
+            Mac(mac)
+        );
+    } else {
+        rt::println!(
+            "virtio-net: virtio-mmio at {at:#x}, line {line}, status {status:#x}, mac {}",
+            Mac(mac)
+        );
+    }
     if !link {
         rt::println!("virtio-net: link down");
     }
@@ -391,6 +435,7 @@ fn main(_: u64) -> u64 {
         ping: None,
         mac,
         link,
+        interrupted: false,
         line_closed: false,
         told: 0,
         cleanup_due: false,
@@ -409,7 +454,7 @@ fn main(_: u64) -> u64 {
         held_rx: false,
         #[cfg(feature = "probe")]
         held_tx: false,
-        _maps: (dma_object, net_object, window),
+        _maps: (dma_object, net_object, windows),
     };
     // The static address names its servers at once; a lease does in its event.
     if driver.stack.lease.is_some() {
@@ -478,7 +523,7 @@ impl Tables {
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
-    transport: MmioTransport<'static>,
+    transport: SomeTransport<'static>,
     device: NetDevice,
     stack: Stack<'static>,
     net: &'a mut Net,
@@ -491,6 +536,8 @@ struct Driver<'a> {
     ping: Option<Pending>,
     mac: [u8; 6],
     link: bool,
+    /// The first interrupt of the device came (and was said once).
+    interrupted: bool,
     /// The line is closed (the kernel masked it at delivery and the step
     /// has not opened it yet).
     line_closed: bool,
@@ -524,7 +571,7 @@ struct Driver<'a> {
     held_rx: bool,
     #[cfg(feature = "probe")]
     held_tx: bool,
-    _maps: (Handle<Memory>, Handle<Memory>, Handle<Memory>),
+    _maps: (Handle<Memory>, Handle<Memory>, [Option<Handle<Memory>>; 2]),
 }
 
 impl Driver<'_> {
@@ -587,6 +634,9 @@ impl Driver<'_> {
         if interrupt {
             self.line_closed = true;
             let isr = Isr::read(&mut self.transport);
+            if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
+                rt::println!("virtio-net: first interrupt");
+            }
             if isr.config() {
                 self.link_changed();
             }
