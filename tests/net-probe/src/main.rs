@@ -2076,7 +2076,7 @@ impl Probe<'_> {
             *slot = Some(self.export(&root, d).map_err(|_| "EXPORT failed")?);
         }
         match self.export(&root, d) {
-            Err(Fail::Status(status)) if status == Status::Kernel(Error::LimitReached) => {}
+            Err(Fail::Status(Status::Kernel(Error::LimitReached))) => {}
             _ => return Err("the seventeenth pass of a session was not refused"),
         }
         drop(held);
