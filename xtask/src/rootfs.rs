@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 39] = [
+const SYSTEM_PATHS: [&str; 40] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -290,6 +290,8 @@ const SYSTEM_PATHS: [&str; 39] = [
     "/bin/net-sock",
     "/bin/net-dns",
     "/bin/posix-net",
+    // The image of the probe of F-Stack on its loopback.
+    "/bin/fstack-probe",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -435,6 +437,7 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         "inputrc" => Ok(INPUTRC),
         "htoprc" => Ok(b"hide_userland_threads=1\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
+        "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -1129,6 +1132,12 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
+        // The shell's image with the probe of F-Stack.
+        "boot-fstack-probe.img" => {
+            let mut files = dialog(name);
+            files.push(file("/bin/fstack-probe", 0o755, ROOT, "fstack-probe"));
+            files
+        }
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.

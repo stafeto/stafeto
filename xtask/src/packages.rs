@@ -412,6 +412,7 @@ pub fn check() -> Result<(), String> {
         "boot-net-vz.img",
         "boot-net-vz2.img",
         "boot-net-vz2-static.img",
+        "boot-fstack-probe.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -479,7 +480,8 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-net-vz2.img"
         | "boot-net-vz2-static.img"
         | "boot-net-vz-steps.img"
-        | "boot-net-vz2-steps.img" => Ok(load()?
+        | "boot-net-vz2-steps.img"
+        | "boot-fstack-probe.img" => Ok(load()?
             .into_iter()
             .filter(|p| p.kind != Kind::Game)
             .collect()),

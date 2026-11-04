@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# F-Stack: the TCP/IP stack of FreeBSD 15 as a library in user space
+# (libfstack.a, tools/build-fstack.py), with the host layer of
+# ports/f-stack over stafeto. The stack's files are under BSD-2-Clause and
+# BSD-3-Clause; the INI parser is BSD-3-Clause. The SHA-256 is that of the
+# tar stream after decompression.
+# Format: docs/packages.md.
+
+name = "f-stack"
+version = "dev-52514377"
+kind = "addon"
+url = "https://github.com/F-Stack/f-stack/archive/52514377b89750ffc03a93f401c22d2d4f269d5f.tar.gz"
+sha256 = "97bb894b50c7b012d874fcd0be5ebe347dc4ba99e2204caa0440aca6bd11127a"
+license = "BSD-2-Clause AND BSD-3-Clause"
+license_file = "LICENSE"
+depends = ["busybox"]
+build = "tools/build-fstack.py"
+files = [
+  "/etc/fstack.ini = bytes:fstack.ini",
+]

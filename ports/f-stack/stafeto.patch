@@ -1,0 +1,474 @@
+--- a/freebsd/arm64/include/pcpu.h
++++ b/freebsd/arm64/include/pcpu.h
+@@ -57,6 +57,9 @@
+ struct pcb;
+ struct pcpu;
+ 
++#ifndef FSTACK
++/* F-Stack keeps the per-CPU pointer and curthread in thread-local storage
++ * (lib/include/machine/pcpu.h): x18 is no register of the stack's own. */
+ register struct pcpu *pcpup __asm ("x18");
+ 
+ static inline struct pcpu *
+@@ -78,9 +81,7 @@
+ }
+ 
+ #define	curthread get_curthread()
+-#ifdef FSTACK
+-#undef	curthread
+-#endif
++#endif /* !FSTACK */
+ 
+ #define	PCPU_GET(member)	(pcpup->pc_ ## member)
+ #define	PCPU_ADD(member, value)	(pcpup->pc_ ## member += (value))
+--- a/freebsd/net/netisr.c
++++ b/freebsd/net/netisr.c
+@@ -984,6 +984,50 @@
+ #endif
+ }
+ 
++#ifdef FF_STAFETO
++/*
++ * F-Stack has no software interrupt threads (swi_sched does nothing): the
++ * loop of the host layer runs the queued work of every workstream here,
++ * as the thread of swi_net would. This is what delivers the packets
++ * if_simloop queues on the loopback interface. ff_stafeto_netisr_runs
++ * counts the workstreams that had work, for the idle test of the loop.
++ */
++void ff_swi_net_excute(void);
++u_long ff_stafeto_netisr_runs;
++
++void
++ff_swi_net_excute(void)
++{
++	struct netisr_workstream *nwsp;
++	u_int i;
++
++	for (i = 0; i < nws_count; i++) {
++		nwsp = DPCPU_ID_PTR(nws_array[i], nws);
++		if (nwsp->nws_pendingbits != 0) {
++			ff_stafeto_netisr_runs++;
++			swi_net(nwsp);
++		}
++	}
++}
++
++/* Whether some workstream has queued work. */
++int ff_stafeto_netisr_pending(void);
++
++int
++ff_stafeto_netisr_pending(void)
++{
++	struct netisr_workstream *nwsp;
++	u_int i;
++
++	for (i = 0; i < nws_count; i++) {
++		nwsp = DPCPU_ID_PTR(nws_array[i], nws);
++		if (nwsp->nws_pendingbits != 0)
++			return (1);
++	}
++	return (0);
++}
++#endif
++
+ static int
+ netisr_queue_workstream(struct netisr_workstream *nwsp, u_int proto,
+     struct netisr_work *npwp, struct mbuf *m, int *dosignalp)
+--- a/lib/ff_config.c
++++ b/lib/ff_config.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+@@ -36,8 +37,12 @@
+ #include <sys/socket.h>
+ #include <sys/un.h>
+ #include <arpa/inet.h>
++#ifdef FF_STAFETO
++#include "ff_stafeto_rte.h"
++#else
+ #include <rte_config.h>
+ #include <rte_string_fns.h>
++#endif
+ 
+ #include "ff_api.h"
+ #include "ff_config.h"
+@@ -1732,9 +1737,12 @@
+         return -1;
+     }
+ 
++#ifndef FF_STAFETO
++    /* stafeto has no EAL: the host layer reads the settings itself. */
+     if (dpdk_args_setup(&ff_global_cfg) <= 0) {
+         return -1;
+     }
++#endif
+ 
+     return 0;
+ }
+--- a/lib/ff_event.h
++++ b/lib/ff_event.h
+@@ -87,9 +87,9 @@
+     short filter;           /* filter for event */
+     unsigned short flags;   /* action flags for kqueue */
+     unsigned int fflags;    /* filter flag value */
+-    __int64_t data;         /* filter data value */
++    int64_t data;         /* filter data value */
+     void *udata;            /* opaque user data identifier */
+-    __uint64_t ext[4];      /* extensions */
++    uint64_t ext[4];      /* extensions */
+ };
+ 
+ #if defined(_WANT_FREEBSD11_KEVENT)
+--- a/lib/ff_freebsd_init.c
++++ b/lib/ff_freebsd_init.c
+@@ -109,7 +109,10 @@
+ 
+     pcpup = malloc(sizeof(struct pcpu), M_DEVBUF, M_ZERO);
+     pcpu_init(pcpup, cpuid, sizeof(struct pcpu));
++#if defined(__amd64__) || defined(__i386__)
++    /* Only the x86 per-CPU area points at itself. */
+     PCPU_SET(prvspace, pcpup);
++#endif
+ }
+ 
+ /*
+--- a/lib/ff_host_interface.c
++++ b/lib/ff_host_interface.c
+@@ -54,8 +54,12 @@
+ #include <sched.h>
+ #include <time.h>
+ 
++#ifdef FF_STAFETO
++#include <sys/random.h>
++#else
+ #include <openssl/rand.h>
+ #include <rte_malloc.h>
++#endif
+ 
+ #include "ff_host_interface.h"
+ #include "ff_errno.h"
+@@ -206,7 +210,7 @@
+ }
+ 
+ void
+-ff_get_current_time(time_t *sec, long *nsec)
++ff_get_current_time(int64_t *sec, long *nsec)
+ {
+     if (sec) {
+         *sec = current_ts.tv_sec;
+@@ -229,7 +233,22 @@
+ {
+     (void)reseed;
+ 
++#ifdef FF_STAFETO
++    /* The kernel's random source through getrandom(2), without OpenSSL. */
++    unsigned char *p = ptr;
++    while (len > 0) {
++        ssize_t got = getrandom(p, len, 0);
++        if (got < 0) {
++            if (errno == EINTR)
++                continue;
++            panic("ff_arc4rand: getrandom failed: %d", errno);
++        }
++        p += got;
++        len -= (unsigned int)got;
++    }
++#else
+     RAND_bytes(ptr, len);
++#endif
+ }
+ 
+ uint32_t
+@@ -566,7 +585,13 @@
+         case ff_ERANGE:      errno = ERANGE; break;
+ 
+         /* case ff_EAGAIN:       same as EWOULDBLOCK */
++#ifdef FF_STAFETO
++        /* The C library of stafeto names 41 EWOULDBLOCK; Linux, whose
++         * numbers it follows, has EWOULDBLOCK equal to EAGAIN. */
++        case ff_EWOULDBLOCK:     errno = EAGAIN; break;
++#else
+         case ff_EWOULDBLOCK:     errno = EWOULDBLOCK; break;
++#endif
+ 
+         case ff_EINPROGRESS:     errno = EINPROGRESS; break;
+         case ff_EALREADY:        errno = EALREADY; break;
+--- a/lib/ff_host_interface.h
++++ b/lib/ff_host_interface.h
+@@ -72,6 +72,10 @@
+ char *ff_getenv(const char *name);
+ 
+ void ff_os_errno(int error);
++#ifdef FF_STAFETO
++/* The program's number of the stack's error `error` (ff_os_errno's map). */
++int ff_stafeto_errno(int error);
++#endif
+ 
+ int ff_in_pcbladdr(uint16_t family, void *faddr, uint16_t fport, void *laddr);
+ 
+--- a/lib/ff_init.c
++++ b/lib/ff_init.c
+@@ -26,7 +26,9 @@
+ 
+ #include <stdlib.h>
+ 
++#ifndef FF_STAFETO
+ #include <rte_eal.h>
++#endif
+ 
+ #include "ff_api.h"
+ #include "ff_config.h"
+@@ -69,8 +71,10 @@
+     ff_dpdk_stop();
+ }
+ 
++#ifndef FF_STAFETO
+ const char *
+ ff_eal_runtime_dir(void)
+ {
+     return rte_eal_get_runtime_dir();
+ }
++#endif
+--- a/lib/ff_log.c
++++ b/lib/ff_log.c
+@@ -32,9 +32,13 @@
+ #include <ctype.h>
+ #include <arpa/inet.h>
+ #include <errno.h>
++#ifdef FF_STAFETO
++#include "ff_stafeto_rte.h"
++#else
+ #include <rte_log.h>
+ #include <rte_config.h>
+ #include <rte_string_fns.h>
++#endif
+ 
+ #include "ff_config.h"
+ #include "ff_log.h"
+--- a/lib/ff_stub_14_extra.c
++++ b/lib/ff_stub_14_extra.c
+@@ -256,7 +256,28 @@
+     
+ }
+ 
++#if defined(__amd64__)
++/* The kernel address layout of amd64's pmap.h. */
+ struct kva_layout_s kva_layout = {0};
++#endif
++
++#if defined(__aarch64__)
++/* arm64's direct map (PHYS_TO_DMAP serves unmapped mbufs only, which the
++ * stack never makes) and the choice of LSE atomics (off: the load and
++ * store exclusive pairs work on every core). */
++vm_paddr_t dmap_phys_base;
++_Bool lse_supported;
++#endif
++
++#ifdef FF_STAFETO
++/* Asynchronous I/O on sockets is never queued: the C library's aio_cancel
++ * is no stand-in for the kernel's. */
++void aio_cancel(struct kaiocb *job);
++void aio_cancel(struct kaiocb *job)
++{
++    panic("aio_cancel: no asynchronous I/O in the stack");
++}
++#endif
+ 
+ MALLOC_DEFINE(M_NVLIST, "nvlist", "kernel nvlist");
+ 
+@@ -848,10 +869,12 @@
+  * a safe fallback. Smoke testing only — full loopback semantics
+  * may require revisit if a runtime path actually relies on this.
+  */
++#ifndef FF_STAFETO
+ void ff_swi_net_excute(void);
+ void ff_swi_net_excute(void)
+ {
+ }
++#endif
+ 
+ 
+ /* ===== End of stubs ===== */
+--- a/lib/ff_syscall_wrapper.c
++++ b/lib/ff_syscall_wrapper.c
+@@ -997,6 +997,13 @@
+             optval, UIO_USERSPACE, optlen)))
+         goto kern_fail;
+ 
++#ifdef FF_STAFETO
++    /* The pending error of the socket in the program's numbers, as errno. */
++    if (level == SOL_SOCKET && optname == SO_ERROR && optval != NULL &&
++        *(int *)optval != 0)
++        *(int *)optval = ff_stafeto_errno(*(int *)optval);
++#endif
++
+     return (rc);
+ 
+ kern_fail:
+--- a/lib/include/amd64/include/pcpu.h
++++ b/lib/include/amd64/include/pcpu.h
+@@ -55,7 +55,12 @@
+ 	return (pcpup);
+ }
+ 
++#if defined(__amd64__) || defined(__i386__)
+ #define	get_pcpu()              (ff_pcpu_get()->pc_ ## prvspace)
++#else
++/* Elsewhere the per-CPU area has no pointer to itself. */
++#define	get_pcpu()              (ff_pcpu_get())
++#endif
+ 
+ #define PCPU_GET(member)         (ff_pcpu_get()->pc_ ## member)
+ #define PCPU_ADD(member, val)    (ff_pcpu_get()->pc_ ## member += (val))
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -61,6 +61,10 @@
+ 
+ include ${TOPDIR}/mk/kern.pre.mk
+ 
++# stafeto: no DPDK. The host files compile against the C library of the
++# system (STAFETO_HOST_CFLAGS names its headers) and the host layer
++# ff_stafeto_if.c stands in for F-Stack's DPDK files.
++ifneq ($(HOST_OS),stafeto)
+ ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+ $(error "no installation of DPDK found, maybe you shuld export environment variable `PKG_CONFIG_PATH`")
+ endif
+@@ -68,6 +72,9 @@
+ PKGCONF ?= pkg-config
+ 
+ DPDK_CFLAGS= -Wall -Wextra -Wno-deprecated-declarations -Werror $(shell $(PKGCONF) --cflags libdpdk)
++else
++DPDK_CFLAGS= -Wall -DFF_STAFETO ${STAFETO_HOST_CFLAGS}
++endif
+ 
+ KERNPREINCLUDES:= ${INCLUDES}
+ INCLUDES= -I${OVERRIDE_INCLUDES_ROOT} ${KERNPREINCLUDES}
+@@ -81,7 +88,9 @@
+ HOST_INCLUDES+= -I/usr/local/include/libepoll-shim
+ endif
+ 
+-ifndef DEBUG
++ifeq ($(HOST_OS),stafeto)
++HOST_CFLAGS = -O2
++else ifndef DEBUG
+ HOST_CFLAGS = -O2 -frename-registers  -funswitch-loops -fweb -Wno-format-truncation
+ else
+ HOST_CFLAGS = ${DEBUG}
+@@ -155,6 +164,9 @@
+ ifdef FF_INET6
+ HOST_CFLAGS+= -DINET6
+ CFLAGS+= -DINET6
++ifeq ($(HOST_OS),stafeto)
++CFLAGS+= -DFF_INET6
++endif
+ endif
+ 
+ ifdef FF_TCPHPTS
+@@ -228,6 +240,13 @@
+ endif
+ 
+ CFLAGS+= -DFSTACK
++ifeq ($(HOST_OS),stafeto)
++# The stack runs on one thread of its process (no ff_thread.c), and the
++# loader of stafeto's dynamic programs takes no thread-local storage of a
++# program: the per-thread variables of the stack are plain ones.
++CFLAGS+= -DFF_STAFETO -D__thread= -Wno-keyword-macro
++HOST_CFLAGS+= -D__thread= -Wno-keyword-macro
++endif
+ 
+ # SMP makes MAXCPU 1024 so UMA/SMR per-cpu storage is sized for all stack
+ # threads; without it MAXCPU is 1 and every thread shares slot 0.
+@@ -306,6 +325,15 @@
+         ff_ngctl.c
+ endif
+ 
++ifeq ($(HOST_OS),stafeto)
++FF_HOST_SRCS+=              \
++	ff_host_interface.c \
++	ff_config.c         \
++	ff_ini_parser.c     \
++	ff_log.c            \
++	ff_init.c           \
++	ff_stafeto_if.c
++else
+ FF_HOST_SRCS+=              \
+ 	ff_host_interface.c \
+ 	ff_thread.c         \
+@@ -321,6 +349,7 @@
+ 	ff_epoll.c          \
+ 	ff_log.c            \
+ 	ff_init.c
++endif
+ 
+ ifdef FF_KNI
+ FF_HOST_SRCS+=              \
+@@ -406,7 +435,18 @@
+ KERN_MSRCS+=		\
+ 	linker_if.m
+ 
+-ifeq (${MACHINE_CPUARCH},arm64)
++ifeq (${MACHINE_CPUARCH}-$(HOST_OS),arm64-stafeto)
++# FreeBSD 15 has fls and flsl inline in sys/libkern.h, and gsb_crc32.c
++# takes the portable code under FSTACK.
++LIBKERN_SRCS+=		 \
++	bcd.c		 \
++	gsb_crc32.c	 \
++	inet_ntoa.c	 \
++	jenkins_hash.c   \
++	strlcpy.c	 \
++	strnlen.c	 \
++	strtoq.c
++else ifeq (${MACHINE_CPUARCH},arm64)
+ LIBKERN_SRCS+=		 \
+ 	bcd.c		 \
+ 	inet_ntoa.c	 \
+@@ -703,6 +743,30 @@
+ # Then, only the symbols that are part of the  API are made
+ # externally available.
+ #
++ifeq ($(HOST_OS),stafeto)
++# The machine headers are in place before any object compiles.
++${HOST_OBJS} ${ASM_OBJS} ${OBJS}: | machine_includes ${MHEADERS}
++
++# The host objects join the stack in a second incremental link, and then
++# every symbol is local but the API: ff_api.symlist, the ff_* names of the
++# host files (ff_init, ff_run, ...) and the names of the host layer
++# (ff_stafeto_*). The other names of the host files (panic, ini_parse)
++# cannot meet a program's.
++libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
++	${LD} -r -o $*.stack.ro ${ASM_OBJS} ${OBJS}
++	${NM} $*.stack.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
++	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.stack.ro
++	${OBJCOPY} --globalize-symbols=ff_api.symlist --wildcard --globalize-symbol='ff_stafeto_*' $*.stack.ro
++	${NM} -g --defined-only ${HOST_OBJS} | awk 'NF == 3 && $$3 ~ /^ff_/ && $$3 !~ /^ff_stafeto_/ { print $$3 }' > $*_host_api.tmp
++	${LD} -r -o $*.ro $*.stack.ro ${HOST_OBJS}
++	${NM} $*.ro | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
++	${OBJCOPY} --localize-symbols=$*_localize_list.tmp $*.ro
++	${OBJCOPY} --globalize-symbols=ff_api.symlist --globalize-symbols=$*_host_api.tmp --wildcard --globalize-symbol='ff_stafeto_*' $*.ro
++	rm $*_localize_list.tmp $*_host_api.tmp $*.stack.ro
++	rm -f $@
++	${AR} -cqs $@ $*.ro
++	rm -f $*.ro
++else
+ libfstack.a: machine_includes ff_api.symlist ${MHEADERS} ${MSRCS} ${HOST_OBJS} ${ASM_OBJS} ${OBJS}
+ 	${LD} -d -r -o $*.ro ${ASM_OBJS} ${OBJS}
+ 	nm $*.ro  | grep -v ' U ' | cut -d ' ' -f 3 > $*_localize_list.tmp
+@@ -712,6 +776,7 @@
+ 	rm -f $@
+ 	ar -cqs $@ $*.ro ${HOST_OBJS}
+ 	rm -f $*.ro
++endif
+ 
+ ${HOST_OBJS}: %.o: %.c
+ 	${HOST_C}
+--- a/lib/opt/opt_inet6.h
++++ b/lib/opt/opt_inet6.h
+@@ -1 +1,3 @@
++#if !defined(FF_STAFETO) || defined(FF_INET6)
+ #define INET6 1
++#endif
