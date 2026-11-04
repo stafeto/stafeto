@@ -33,7 +33,7 @@
 //!
 //! `cargo xtask net-wget steps` counts the steps of the service under the
 //! same traffic (`-icount shift=4,sleep=on`) and judges them against 0.9 of
-//! term B. `cargo xtask net-wget internet` (by hand, not in ci) fetches
+//! term B. `cargo xtask net-wget internet` (a manual run; the ci jobs leave it out) fetches
 //! example.com over HTTP and HTTPS through the user network.
 
 use std::io::{Read, Write};
@@ -49,9 +49,9 @@ use crate::{
 };
 
 /// The checks of `net-dns`, in the order the program runs them.
-pub const CHECKS: [&str; 12] = [
+pub const CHECKS: [&str; 13] = [
     "answer", "id", "source", "question", "retry", "servfail", "nxdomain", "nodata", "timeout",
-    "loop", "parse", "leak",
+    "loop", "parse", "leak", "badname",
 ];
 
 /// The whole run may take this long (the ci group allows 120 s).
@@ -60,6 +60,9 @@ const RUN_WITHIN: Duration = Duration::from_secs(110);
 const HTTP_WITHIN: Duration = Duration::from_secs(20);
 const HTTPS_WITHIN: Duration = Duration::from_secs(30);
 const CHECKS_WITHIN: Duration = Duration::from_secs(45);
+/// The time a lookup of a real name may take in step 8 (two rounds of five
+/// seconds of the resolver, and the start of the program).
+const REAL_NAME_WITHIN: Duration = Duration::from_secs(25);
 /// The first connect of the guest must be quick: the hardware addresses of
 /// the gateway and the name server were asked for ahead of it.
 const FIRST_CONTACT_MAX_MS: u64 = 500;

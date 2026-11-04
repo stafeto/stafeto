@@ -399,6 +399,7 @@ fn main(_: u64) -> u64 {
         neighbours_at: 0,
         ask_due: false,
         asked: 0,
+        ask_at: None,
         resolv: Written::default(),
         #[cfg(feature = "probe")]
         hold: false,
@@ -508,6 +509,8 @@ struct Driver<'a> {
     ask_due: bool,
     /// How many of the targets of the round the requests went out for.
     asked: usize,
+    /// When the requests left go on, after a step that found the queue full.
+    ask_at: Option<u64>,
     /// The text of `/etc/resolv.conf` as the service wrote it last.
     resolv: Written,
     /// The probe holds the steps of the stack (HOLD), and an interrupt came
@@ -639,6 +642,7 @@ impl Driver<'_> {
             self.addresses();
         }
         if self.ask_due {
+            self.ask_at = None;
             self.ask_neighbours();
         }
         if deadline && self.net.orphans_wait() {
@@ -745,12 +749,18 @@ impl Driver<'_> {
         let sent = self
             .device
             .ask_neighbours(lease.address, &targets[self.asked.min(count)..count]);
-        self.asked += sent;
-        if self.asked >= count {
-            self.asked = 0;
-            self.ask_due = false;
-        } else {
-            self.net.step_due = true;
+        let (asked, round) = netd::resolv::round(self.asked.min(count), sent, count);
+        self.asked = asked;
+        match round {
+            netd::resolv::Round::Done => self.ask_due = false,
+            // The next request goes out in the next step, which the service
+            // orders itself.
+            netd::resolv::Round::Continue => {
+                self.tell(TX);
+            }
+            // The queue is full: a step after a millisecond, as for a group
+            // with nothing to send, so that the service does not spin on it.
+            netd::resolv::Round::Wait => self.ask_at = Some(now_ns() + ASK_RETRY_NS),
         }
     }
 
@@ -817,6 +827,7 @@ impl Driver<'_> {
             self.stack.ping.as_ref().map(|p| p.deadline_ns),
             sweep,
             Some(self.neighbours_at),
+            self.ask_at,
         ]
         .into_iter()
         .flatten()
@@ -958,6 +969,9 @@ fn servers_line<'a>(text: &Text, out: &'a mut [u8; netd::resolv::TEXT_MAX]) -> &
     }
     core::str::from_utf8(&out[..len]).unwrap_or("")
 }
+
+/// How long the requests of ARP wait when the queue of sending is full.
+const ASK_RETRY_NS: u64 = 1_000_000;
 
 /// How long after a step the streams that close are looked at again.
 const SWEEP_NS: u64 = 1_000_000_000;

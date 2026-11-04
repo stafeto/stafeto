@@ -60,6 +60,45 @@ impl Text {
     }
 }
 
+/// The most bytes a write of `resolv.conf` has: the text and the empty lines
+/// that cover what is left of an older, longer file.
+pub const PAD_MAX: usize = 512;
+
+/// `text` followed by empty lines to `size`, the length of the file now,
+/// in `out`: the file service has no truncate here, and a text that is
+/// shorter than the file must not leave the tail of the old one (a server
+/// line among it). Gives the bytes to write and whether `size` was past
+/// `PAD_MAX`, so that a tail remains.
+pub fn pad(text: &[u8], size: usize, out: &mut [u8; PAD_MAX]) -> (usize, bool) {
+    let total = text.len().max(size).min(PAD_MAX);
+    out[..text.len()].copy_from_slice(text);
+    out[text.len()..total].fill(b'\n');
+    (total, size > PAD_MAX)
+}
+
+/// What follows a round of ARP requests of which `sent` went out: the
+/// requests for the targets from `asked` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Round {
+    /// Every target was asked.
+    Done,
+    /// Some are left and the queue took one: the next step goes on at once.
+    Continue,
+    /// Some are left and the queue took none: a step after a short delay.
+    Wait,
+}
+
+pub fn round(asked: usize, sent: usize, count: usize) -> (usize, Round) {
+    let asked = asked + sent;
+    if asked >= count {
+        (0, Round::Done)
+    } else if sent > 0 {
+        (asked, Round::Continue)
+    } else {
+        (asked, Round::Wait)
+    }
+}
+
 /// The text of `resolv.conf` as the service wrote it last. A renewal of the
 /// lease with the same servers writes nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -131,6 +170,30 @@ mod tests {
             b"nameserver 192.168.64.1\nnameserver 8.8.4.4\nnameserver 0.100.255.7\n"
         );
         assert!(three.as_bytes().len() <= TEXT_MAX);
+    }
+
+    #[test]
+    fn a_shorter_text_is_padded_to_the_size_of_the_file() {
+        let mut out = [0u8; PAD_MAX];
+        let text = b"nameserver 10.0.2.3\n";
+        // A file of another hand, longer than the text: no tail may stay.
+        let (n, capped) = pad(text, 42, &mut out);
+        assert_eq!((n, capped), (42, false));
+        assert_eq!(&out[..20], text);
+        assert!(out[20..42].iter().all(|&b| b == b'\n'));
+        // A file as long or shorter: the text alone.
+        assert_eq!(pad(text, 20, &mut out), (20, false));
+        assert_eq!(pad(text, 0, &mut out), (20, false));
+        // A file past the buffer: padded to it, and said so.
+        assert_eq!(pad(text, 600, &mut out), (PAD_MAX, true));
+    }
+
+    #[test]
+    fn the_requests_left_get_a_step_or_a_delay() {
+        assert_eq!(round(0, 2, 2), (0, Round::Done));
+        assert_eq!(round(0, 1, 2), (1, Round::Continue));
+        assert_eq!(round(1, 0, 2), (1, Round::Wait));
+        assert_eq!(round(1, 1, 2), (0, Round::Done));
     }
 
     #[test]

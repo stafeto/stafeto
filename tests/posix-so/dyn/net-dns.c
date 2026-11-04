@@ -474,6 +474,22 @@ static void c_leak(void)
 	REQUIRE(open_descriptors() == before);
 }
 
+/* A name that cannot be asked (a label past 63 bytes, an empty label)
+ * is EAI_NONAME at once, and no query goes out. */
+static void c_badname(void)
+{
+	static char big[400];
+	uint8_t a[4]; long ms;
+	memset(big, 'a', sizeof big);
+	strcpy(big + 300, ".com");
+	scenario(S_ANSWER);
+	REQUIRE(ask(big, a, &ms) == EAI_NONAME);
+	REQUIRE(ms < 1000);
+	REQUIRE(ask("a..test", a, &ms) == EAI_NONAME);
+	REQUIRE(ms < 1000);
+	REQUIRE(queries() == 0);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -490,6 +506,7 @@ static const struct {
 	{ "loop", c_loop },
 	{ "parse", c_parse },
 	{ "leak", c_leak },
+	{ "badname", c_badname },
 };
 
 static int checks(void)

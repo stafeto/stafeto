@@ -9,7 +9,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use netd::config::{self, FILE_MAX, Settings};
 use posix_fs::{DescriptorFlags, FsError, PosixFs, StartupFiles};
 use rt::Handle;
@@ -67,18 +67,16 @@ pub fn read(parent: &Handle<Channel>) -> Result<Settings, Failure> {
     }
 }
 
-/// The descriptor of `/etc/resolv.conf`, opened at the start (u32::MAX: none),
-/// and the length of the file as the service left it.
+/// The descriptor of `/etc/resolv.conf`, opened at the start (u32::MAX: none).
 static RESOLV_FD: AtomicU32 = AtomicU32::new(u32::MAX);
-static RESOLV_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Opens `/etc/resolv.conf` for writing, made root's with mode 644 when it is
-/// not there, and emptied, in the start of the service: the open walks the
+/// not there (its text stays until the first write), in the start of the service: the open walks the
 /// path with several calls to the file service, more than a step of the loop
 /// may wait for (the waits of a step stay under CALL_WAIT_MAX). The file
 /// stays open; `write_resolv` rewrites it from its start.
 fn open_resolv(files: &mut PosixFs) -> Result<(), FsError> {
-    let flags = proto_fs::WRITE_ONLY | proto_fs::CREATE | proto_fs::TRUNCATE;
+    let flags = proto_fs::WRITE_ONLY | proto_fs::CREATE;
     let fd = files.open_policy(
         b"/etc/resolv.conf",
         flags,
@@ -90,25 +88,27 @@ fn open_resolv(files: &mut PosixFs) -> Result<(), FsError> {
     Ok(())
 }
 
-/// Writes `text` to `/etc/resolv.conf` from its start. The file service has
-/// no truncate here, so a text shorter than the last is followed by empty
-/// lines to the old end, which the resolver skips.
+/// Writes `text` to `/etc/resolv.conf` from its start, followed by empty
+/// lines to the size the file has now (`fstat`; others may have written it),
+/// which the resolver skips. A file past `PAD_MAX` bytes keeps its tail and
+/// the service says so.
 pub fn write_resolv(text: &[u8]) -> Result<(), FsError> {
     let fd = RESOLV_FD.load(Ordering::Relaxed);
     if fd == u32::MAX {
         return Err(FsError::BadFileDescriptor);
     }
-    let old = RESOLV_LEN.load(Ordering::Relaxed);
-    let mut padded = [b'\n'; netd::resolv::TEXT_MAX];
-    let total = text.len().max(old).min(padded.len());
-    padded[..text.len()].copy_from_slice(text);
     // SAFETY: the table is initialized by `read`, which opened the file, and
     // the one thread of the service is the only one here.
     let files = unsafe { (*FILES.0.get()).assume_init_mut() };
+    let size = files.fstat(fd)?.size as usize;
+    let mut out = [0u8; netd::resolv::PAD_MAX];
+    let (total, capped) = netd::resolv::pad(text, size, &mut out);
+    if capped {
+        rt::println!("net: resolv.conf is {size} bytes, a tail past {total} stays");
+    }
     files.lseek(fd, 0, posix_fs::SeekFrom::Start)?;
-    if files.write(fd, &padded[..total])? != total {
+    if files.write(fd, &out[..total])? != total {
         return Err(FsError::NoSpace);
     }
-    RESOLV_LEN.store(total, Ordering::Relaxed);
     Ok(())
 }
