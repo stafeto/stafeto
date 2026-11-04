@@ -16,6 +16,9 @@
  *                                on exec
  *   posix-net spawn-child FD     the image of the check `spawn-high`: FD is open
  *   posix-net epoll-child FD     the image of the check `epoll-exec`: FD is not open
+ *   posix-net buffer-exec-child N the image of the check `buffer-exec`: the
+ *                                service holds N shared buffers
+ *   posix-net stat               the shared buffers of the network service
  *
  * A failure prints `posix-net: NAME failed: WHAT errno N` and the exit code
  * is 1. Built with -fno-builtin; every result is compared.
@@ -41,6 +44,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -2343,6 +2347,518 @@ static void epoll_exclusive(void)
 	REQUIRE(close(lis) == 0);
 }
 
+/* ---------------------------------------------------------------- stage P4b-1:
+ * the shared buffer with the network service, the owner of a socket's
+ * signals and RDHUP of AF_UNIX. */
+
+#define SO_STAFETO_BUFFERS 0x7351
+#define SO_STAFETO_BUFFERED 0x7352
+
+/* The byte at `i` of the streams of these checks. */
+static unsigned char stream_byte(size_t i, unsigned salt)
+{
+	return (unsigned char)(i * 7u + (i >> 9) + salt);
+}
+
+static void fill(unsigned char *p, size_t from, size_t n, unsigned salt)
+{
+	for (size_t k = 0; k < n; k++)
+		p[k] = stream_byte(from + k, salt);
+}
+
+/* Whether `n` bytes at `p` are the stream's from `from`. */
+static int same(const unsigned char *p, size_t from, size_t n, unsigned salt)
+{
+	for (size_t k = 0; k < n; k++)
+		if (p[k] != stream_byte(from + k, salt))
+			return 0;
+	return 1;
+}
+
+/* SO_STAFETO_BUFFERS (the sessions with a buffer, bits 0-15) or
+ * SO_STAFETO_BUFFERED (KiB) through socket `fd`. */
+static unsigned buffers_word(int fd, int name)
+{
+	unsigned value = 0;
+	socklen_t len = sizeof value;
+	REQUIRE(getsockopt(fd, SOL_SOCKET, name, &value, &len) == 0 && len == 4);
+	return value;
+}
+
+/* A socket of the service to ask the two options through. */
+static unsigned buffers_now(int name)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	REQUIRE(fd >= 0);
+	unsigned value = buffers_word(fd, name);
+	REQUIRE(close(fd) == 0);
+	return value;
+}
+
+/* A reader of a stream on its own thread: `want` bytes in pieces of
+ * `piece`, a pause of `pause_ms` after each, checked against `salt`. */
+struct reader {
+	int fd;
+	size_t want;
+	size_t piece;
+	long pause_ms;
+	unsigned salt;
+	size_t got;
+	int bad;
+	int error;
+};
+
+/* The places the readers read into, one for each of four at once. */
+static unsigned char read_space[4][16384];
+static pthread_mutex_t read_space_lock = PTHREAD_MUTEX_INITIALIZER;
+static int read_space_used[4];
+
+static void *read_all(void *arg)
+{
+	struct reader *r = arg;
+	int slot = -1;
+	pthread_mutex_lock(&read_space_lock);
+	for (int i = 0; i < 4 && slot < 0; i++)
+		if (!read_space_used[i]) {
+			read_space_used[i] = 1;
+			slot = i;
+		}
+	pthread_mutex_unlock(&read_space_lock);
+	if (slot < 0) {
+		r->bad = 1;
+		shutdown(r->fd, SHUT_RDWR);
+		return NULL;
+	}
+	unsigned char *chunk = read_space[slot];
+	while (r->got < r->want) {
+		size_t ask = r->piece < sizeof read_space[0] ? r->piece : sizeof read_space[0];
+		ssize_t n = recv(r->fd, chunk, ask, 0);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			r->error = n < 0 ? errno : -1;
+			break;
+		}
+		if (!same(chunk, r->got, (size_t)n, r->salt))
+			r->bad = 1;
+		r->got += (size_t)n;
+		if (r->pause_ms)
+			pause_ms(r->pause_ms);
+	}
+	/* A reader that stops lets its sender go. */
+	if (r->got < r->want)
+		shutdown(r->fd, SHUT_RDWR);
+	pthread_mutex_lock(&read_space_lock);
+	read_space_used[slot] = 0;
+	pthread_mutex_unlock(&read_space_lock);
+	return NULL;
+}
+
+/* 64 KiB one way with one blocking send; the reader takes them on a thread. */
+static void buffer_send(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char out[65536];
+	fill(out, 0, sizeof out, 1);
+	unsigned before = buffers_word(c, SO_STAFETO_BUFFERED);
+	struct reader r = { s, sizeof out, 4096, 0, 1, 0, 0, 0 };
+	pthread_t t;
+	REQUIRE(pthread_create(&t, NULL, read_all, &r) == 0);
+	long began = now_ms();
+	REQUIRE(send(c, out, sizeof out, 0) == (ssize_t)sizeof out);
+	REQUIRE(pthread_join(t, NULL) == 0);
+	long took = now_ms() - began;
+	REQUIRE(r.got == sizeof out && !r.bad);
+	printf("posix-net: buffer-send took %ld ms\n", took);
+	unsigned after = buffers_word(c, SO_STAFETO_BUFFERED);
+	REQUIRE(after - before >= 64);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+struct writer {
+	int fd;
+	size_t total;
+	size_t piece;
+	unsigned salt;
+	int bad;
+};
+
+static void *write_all(void *arg)
+{
+	struct writer *w = arg;
+	unsigned char chunk[4096];
+	size_t done = 0;
+	if (w->piece > sizeof chunk) {
+		w->bad = 1;
+		return NULL;
+	}
+	while (done < w->total) {
+		size_t n = w->total - done < w->piece ? w->total - done : w->piece;
+		fill(chunk, done, n, w->salt);
+		ssize_t sent = send(w->fd, chunk, n, 0);
+		if (sent <= 0) {
+			w->bad = 1;
+			break;
+		}
+		done += (size_t)sent;
+	}
+	return NULL;
+}
+
+/* 64 KiB in one recv with MSG_WAITALL. */
+static void buffer_recv(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char in[65536];
+	struct writer w = { c, sizeof in, 3000, 2, 0 };
+	pthread_t t;
+	REQUIRE(pthread_create(&t, NULL, write_all, &w) == 0);
+	REQUIRE(recv(s, in, sizeof in, MSG_WAITALL) == (ssize_t)sizeof in);
+	REQUIRE(pthread_join(t, NULL) == 0);
+	REQUIRE(!w.bad && same(in, 0, sizeof in, 2));
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* A non-blocking send of 256 KiB takes what the socket has room for; the
+ * edge of EPOLLOUT comes when the reader makes room, and all of it arrives. */
+static void buffer_nonblock(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	REQUIRE(fcntl(c, F_SETFL, fcntl(c, F_GETFL) | O_NONBLOCK) == 0);
+	static unsigned char out[262144];
+	static unsigned char in[16384];
+	fill(out, 0, sizeof out, 3);
+	int ep = ep_new();
+	struct epoll_event ev[4];
+	ep_add(ep, c, EPOLLOUT | EPOLLET, 7);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && (ev[0].events & EPOLLOUT));
+	ssize_t first = send(c, out, sizeof out, 0);
+	REQUIRE(first > 0 && first < (ssize_t)sizeof out);
+	REQUIRE(send(c, out + first, sizeof out - (size_t)first, 0) == -1 && errno == EAGAIN);
+	size_t sent = (size_t)first, got = 0;
+	long end = now_ms() + 20000;
+	while (got < sizeof out) {
+		REQUIRE(now_ms() < end);
+		ssize_t n = recv(s, in, sizeof in, MSG_DONTWAIT);
+		if (n > 0) {
+			REQUIRE(same(in, got, (size_t)n, 3));
+			got += (size_t)n;
+		}
+		if (sent < sizeof out) {
+			if (n <= 0)
+				pause_ms(1);
+			if (ep_wait(ep, ev, 0) == 1) {
+				REQUIRE(ev[0].events & EPOLLOUT);
+				ssize_t more = send(c, out + sent, sizeof out - sent, 0);
+				REQUIRE(more > 0 || errno == EAGAIN);
+				if (more > 0)
+					sent += (size_t)more;
+			}
+		} else if (n <= 0) {
+			pause_ms(1);
+		}
+	}
+	REQUIRE(sent == sizeof out);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* A header of 200 bytes and a body of 64 KiB in one writev: in order, and
+ * through the buffer. */
+static void buffer_writev(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char whole[200 + 65536];
+	fill(whole, 0, sizeof whole, 4);
+	struct iovec iov[2] = { { whole, 200 }, { whole + 200, 65536 } };
+	unsigned before = buffers_word(c, SO_STAFETO_BUFFERED);
+	struct reader r = { s, sizeof whole, 700, 0, 4, 0, 0, 0 };
+	pthread_t t;
+	REQUIRE(pthread_create(&t, NULL, read_all, &r) == 0);
+	REQUIRE(writev(c, iov, 2) == (ssize_t)sizeof whole);
+	REQUIRE(pthread_join(t, NULL) == 0);
+	REQUIRE(r.got == sizeof whole && !r.bad);
+	/* The reader read by messages (700 bytes): the counter grew by the send. */
+	REQUIRE(buffers_word(c, SO_STAFETO_BUFFERED) - before >= 64);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+struct sender {
+	int fd;
+	int bad;
+	ssize_t sent;
+	int error;
+};
+
+/* The bytes the four senders of `buffer-threads` send (salt 10). */
+static unsigned char quarter[262144];
+
+static void *send_quarter(void *arg)
+{
+	struct sender *x = arg;
+	x->sent = send(x->fd, quarter, sizeof quarter, MSG_NOSIGNAL);
+	x->error = errno;
+	if (x->sent != (ssize_t)sizeof quarter)
+		x->bad = 1;
+	return NULL;
+}
+
+/* Four threads send 256 KiB each into four sockets to slow readers. */
+static void buffer_threads(void)
+{
+	int port, lis = listener(8, &port);
+	int c[4], s[4];
+	pthread_t ts[4], tr[4];
+	struct sender x[4];
+	struct reader r[4];
+	fill(quarter, 0, sizeof quarter, 10);
+	for (int i = 0; i < 4; i++) {
+		pair(lis, port, &c[i], &s[i]);
+		x[i] = (struct sender){ c[i], 0, 0, 0 };
+		r[i] = (struct reader){ s[i], 262144, 8192, 1, 10, 0, 0, 0 };
+	}
+	for (int i = 0; i < 4; i++) {
+		REQUIRE(pthread_create(&tr[i], NULL, read_all, &r[i]) == 0);
+		REQUIRE(pthread_create(&ts[i], NULL, send_quarter, &x[i]) == 0);
+	}
+	for (int i = 0; i < 4; i++) {
+		REQUIRE(pthread_join(ts[i], NULL) == 0 && pthread_join(tr[i], NULL) == 0);
+		if (x[i].bad || r[i].got != 262144 || r[i].bad)
+			printf("posix-net: buffer-threads note: %d sent %ld errno %d, read %lu errno %d bad %d\n",
+			       i, (long)x[i].sent, x[i].error, (unsigned long)r[i].got, r[i].error, r[i].bad);
+		REQUIRE(!x[i].bad && r[i].got == 262144 && !r[i].bad);
+		REQUIRE(close(c[i]) == 0 && close(s[i]) == 0);
+	}
+	REQUIRE(close(lis) == 0);
+}
+
+/* A forked child has no buffer of the parent's: it sends 64 KiB and the
+ * service has one buffer more, its own. */
+static void buffer_fork(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char out[65536];
+	/* The parent has its buffer (the checks before took it). */
+	fill(out, 0, sizeof out, 5);
+	struct reader warm = { s, sizeof out, 16384, 0, 5, 0, 0, 0 };
+	pthread_t t;
+	REQUIRE(pthread_create(&t, NULL, read_all, &warm) == 0);
+	REQUIRE(send(c, out, sizeof out, 0) == (ssize_t)sizeof out);
+	REQUIRE(pthread_join(t, NULL) == 0 && !warm.bad);
+	unsigned base = buffers_word(c, SO_STAFETO_BUFFERS) & 0xFFFF;
+	struct reader r = { s, sizeof out, 16384, 0, 6, 0, 0, 0 };
+	REQUIRE(pthread_create(&t, NULL, read_all, &r) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		fill(out, 0, sizeof out, 6);
+		if (send(c, out, sizeof out, 0) != (ssize_t)sizeof out)
+			_exit(71);
+		unsigned now = buffers_word(c, SO_STAFETO_BUFFERS) & 0xFFFF;
+		_exit(now == base + 1 ? 0 : 72);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+	REQUIRE(pthread_join(t, NULL) == 0);
+	REQUIRE(r.got == sizeof out && !r.bad);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* A stream through the loopback of this process, 64 KiB through it, and the
+ * buffers of the service after. */
+static unsigned send_own_64k(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char out[65536];
+	fill(out, 0, sizeof out, 8);
+	struct reader r = { s, sizeof out, 700, 0, 8, 0, 0, 0 };
+	pthread_t t;
+	REQUIRE(pthread_create(&t, NULL, read_all, &r) == 0);
+	REQUIRE(send(c, out, sizeof out, 0) == (ssize_t)sizeof out);
+	REQUIRE(pthread_join(t, NULL) == 0 && r.got == sizeof out && !r.bad);
+	unsigned now = buffers_word(c, SO_STAFETO_BUFFERS) & 0xFFFF;
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+	return now;
+}
+
+/* The image after `exec` in `buffer-exec`: the service let the old image's
+ * buffer go, and this image takes its own at its first large send. */
+static int buffer_exec_child(unsigned base)
+{
+	check = "buffer-exec";
+	unsigned after_exec = buffers_now(SO_STAFETO_BUFFERS) & 0xFFFF;
+	if (after_exec != base) {
+		printf("posix-net: buffer-exec failed: %u buffers after exec, %u before the child's errno 0\n",
+		       after_exec, base);
+		return 73;
+	}
+	return send_own_64k() == base + 1 ? 0 : 74;
+}
+
+/* A process with a buffer runs `exec` of itself. */
+static void buffer_exec(void)
+{
+	unsigned base = buffers_now(SO_STAFETO_BUFFERS) & 0xFFFF;
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		if (send_own_64k() != base + 1)
+			_exit(75);
+		char number[16];
+		snprintf(number, sizeof number, "%u", base);
+		char *args[] = { (char *)self, "buffer-exec-child", number, NULL };
+		execve(self, args, environ);
+		_exit(76);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+}
+
+static volatile sig_atomic_t interrupted;
+static void on_usr1(int sig)
+{
+	(void)sig;
+	interrupted = 1;
+}
+
+struct poke {
+	pthread_t target;
+	long after_ms;
+};
+
+static void *poke_later(void *arg)
+{
+	struct poke *p = arg;
+	pause_ms(p->after_ms);
+	pthread_kill(p->target, SIGUSR1);
+	return NULL;
+}
+
+/* A signal without SA_RESTART in the middle of a blocking send of 1 MiB:
+ * the count of the bytes that went, and a second send takes the rest. */
+static void buffer_signal(void)
+{
+	struct sigaction sa, old;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_usr1;
+	REQUIRE(sigaction(SIGUSR1, &sa, &old) == 0);
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	static unsigned char out[1048576];
+	fill(out, 0, sizeof out, 9);
+	struct reader r = { s, sizeof out, 16384, 2, 9, 0, 0, 0 };
+	pthread_t tr, tp;
+	struct poke p = { pthread_self(), 150 };
+	interrupted = 0;
+	REQUIRE(pthread_create(&tr, NULL, read_all, &r) == 0);
+	REQUIRE(pthread_create(&tp, NULL, poke_later, &p) == 0);
+	ssize_t first = send(c, out, sizeof out, 0);
+	REQUIRE(pthread_join(tp, NULL) == 0);
+	REQUIRE(interrupted);
+	REQUIRE(first > 0 && first < (ssize_t)sizeof out);
+	REQUIRE(send(c, out + first, sizeof out - (size_t)first, 0) ==
+		(ssize_t)(sizeof out - (size_t)first));
+	REQUIRE(pthread_join(tr, NULL) == 0);
+	REQUIRE(r.got == sizeof out && !r.bad);
+	REQUIRE(sigaction(SIGUSR1, &old, NULL) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+#ifndef F_SETOWN
+#error "relibc has no F_SETOWN"
+#endif
+#ifndef TCP_CORK
+#include <netinet/tcp.h>
+#endif
+
+/* F_SETOWN and F_GETOWN on a socket of the pipe service and one of the
+ * network service, FIOASYNC and FIONBIO on the first. */
+static void fsetown(void)
+{
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	int n = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(n >= 0);
+	int fds[2] = { u[0], n };
+	for (int i = 0; i < 2; i++) {
+		REQUIRE(fcntl(fds[i], F_GETOWN) == 0);
+		REQUIRE(fcntl(fds[i], F_SETOWN, getpid()) == 0);
+		REQUIRE(fcntl(fds[i], F_GETOWN) == getpid());
+	}
+	/* The owner belongs to its descriptor. */
+	REQUIRE(fcntl(u[1], F_GETOWN) == 0);
+	int on = 1;
+	REQUIRE(ioctl(u[0], FIOASYNC, &on) == 0);
+	REQUIRE(ioctl(u[0], FIONBIO, &on) == 0);
+	REQUIRE(fcntl(u[0], F_GETFL) & O_NONBLOCK);
+	char byte;
+	REQUIRE(recv(u[0], &byte, 1, 0) == -1 && errno == EAGAIN);
+	/* A file has no owner of signals. */
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	REQUIRE(fcntl(p[0], F_SETOWN, getpid()) == -1 && errno == EINVAL);
+	REQUIRE(ioctl(p[0], FIOASYNC, &on) == -1 && errno == ENOTTY);
+	/* TCP_CORK is known and not taken. */
+	REQUIRE(setsockopt(n, IPPROTO_TCP, TCP_CORK, &on, sizeof on) == -1 && errno == ENOPROTOOPT);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(n) == 0);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0);
+	/* A descriptor that closed lets its record go: the number again has none. */
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	REQUIRE(fcntl(u[0], F_GETOWN) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0);
+}
+
+/* nginx's own check of EPOLLRDHUP: a pair of AF_UNIX, one end closed; and
+ * POLLRDHUP of poll on the other. */
+static void epoll_rdhup_unix(void)
+{
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	int ep = ep_new();
+	struct epoll_event ee;
+	ee.events = EPOLLET | EPOLLIN | EPOLLRDHUP;
+	ee.data.u64 = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, u[0], &ee) == 0);
+	REQUIRE(close(u[1]) == 0);
+	long began = now_ms();
+	REQUIRE(epoll_wait(ep, &ee, 1, 1000) == 1);
+	REQUIRE(now_ms() - began < 1000);
+	REQUIRE((ee.events & EPOLLRDHUP) && (ee.events & EPOLLIN));
+	struct pollfd pf = { u[0], POLLIN | POLLRDHUP, 0 };
+	REQUIRE(poll(&pf, 1, 1000) == 1 && (pf.revents & POLLRDHUP));
+	/* Not asked for, not given. */
+	pf.events = POLLIN;
+	REQUIRE(poll(&pf, 1, 1000) == 1 && !(pf.revents & POLLRDHUP));
+	REQUIRE(close(u[0]) == 0 && close(ep) == 0);
+	/* POLLRDHUP of a stream of the network service. */
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	REQUIRE(shutdown(c, SHUT_WR) == 0);
+	struct pollfd pn = { s, POLLRDHUP, 0 };
+	REQUIRE(poll(&pn, 1, 2000) == 1 && (pn.revents & POLLRDHUP));
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* `posix-net stat`: the two options of the shared buffers. */
+static int stat_buffers(void)
+{
+	unsigned buffers = buffers_now(SO_STAFETO_BUFFERS);
+	unsigned kib = buffers_now(SO_STAFETO_BUFFERED);
+	printf("posix-net: buffers %u limit %u buffered %u KiB\n", buffers & 0xFFFF, buffers >> 16, kib);
+	return 0;
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -2400,6 +2916,16 @@ static const struct {
 	{ "scm-root", scm_root },
 	{ "scm-depart", scm_depart },
 	{ "epoll-exclusive", epoll_exclusive },
+	{ "buffer-send", buffer_send },
+	{ "buffer-recv", buffer_recv },
+	{ "buffer-nonblock", buffer_nonblock },
+	{ "buffer-writev", buffer_writev },
+	{ "buffer-threads", buffer_threads },
+	{ "buffer-fork", buffer_fork },
+	{ "buffer-exec", buffer_exec },
+	{ "buffer-signal", buffer_signal },
+	{ "fsetown", fsetown },
+	{ "epoll-rdhup-unix", epoll_rdhup_unix },
 };
 
 int main(int argc, char **argv)
@@ -2410,6 +2936,10 @@ int main(int argc, char **argv)
 		return spawn_child(atoi(argv[2]));
 	if (argc >= 3 && strcmp(argv[1], "epoll-child") == 0)
 		return epoll_child(atoi(argv[2]));
+	if (argc >= 3 && strcmp(argv[1], "buffer-exec-child") == 0)
+		return buffer_exec_child((unsigned)atoi(argv[2]));
+	if (argc == 2 && strcmp(argv[1], "stat") == 0)
+		return stat_buffers();
 	if (argc != 2 && argc != 3) {
 		printf("posix-net: usage: posix-net ADDRESS [NAME]\n");
 		return 2;
