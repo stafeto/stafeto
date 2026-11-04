@@ -157,7 +157,12 @@ pub unsafe extern "C" fn stafeto_accept(
             }
             new
         }
-        Err(errno) => -errno,
+        Err(errno) => {
+            if errno == posix_abi::constants::EAGAIN {
+                posix_abi::epoll::would_block(fd, false);
+            }
+            -errno
+        }
     }
 }
 
@@ -294,8 +299,13 @@ pub unsafe extern "C" fn stafeto_sendmsg(fd: c_int, message: *const MsgHdr, flag
             Err(errno) => return -(errno as isize),
         }
     };
-    value(call(|| layer::send(fd, flags, name, &parts[..m.iovlen], control)).map(|n| n as i64))
-        as isize
+    let sent =
+        value(call(|| layer::send(fd, flags, name, &parts[..m.iovlen], control)).map(|n| n as i64))
+            as isize;
+    if sent == -(posix_abi::constants::EAGAIN as isize) {
+        posix_abi::epoll::would_block(fd, true);
+    }
+    sent
 }
 
 /// recvmsg (and, built on it, recv, recvfrom): the bytes received; the
@@ -346,6 +356,11 @@ pub unsafe extern "C" fn stafeto_recvmsg(fd: c_int, message: *mut MsgHdr, flags:
             m.flags = got.flags;
             got.count as isize
         }
-        Err(errno) => -(errno as isize),
+        Err(errno) => {
+            if errno == posix_abi::constants::EAGAIN {
+                posix_abi::epoll::would_block(fd, false);
+            }
+            -(errno as isize)
+        }
     }
 }

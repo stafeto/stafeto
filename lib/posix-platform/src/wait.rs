@@ -49,11 +49,21 @@ unsafe fn poll(
     duration: Result<Option<u64>, i32>,
     mask: Option<u64>,
 ) -> c_int {
-    if count > wait::MAX {
+    if count > wait::MAX_LARGE {
         return -EINVAL;
     }
     if count != 0 && fds.is_null() {
         return -EFAULT;
+    }
+    if count > wait::MAX {
+        // More than the direct path takes: the engine of epoll answers, and
+        // writes the revents of the caller's array only on success.
+        // SAFETY: the caller supplies count readable and writable objects.
+        let items = unsafe { core::slice::from_raw_parts_mut(fds, count) };
+        return match call(|| wait::poll(items, duration?, mask)) {
+            Ok(ready) => ready as c_int,
+            Err(error) => -error,
+        };
     }
     let mut input = [PollFd::default(); wait::MAX];
     if count != 0 {

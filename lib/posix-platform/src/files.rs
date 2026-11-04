@@ -70,6 +70,7 @@ fn linux_stat(info: &NodeInfo) -> LinuxStat {
         5 => S_IFLNK,
         posix_fs::FIFO => S_IFIFO,
         posix_fs::SOCKET => S_IFSOCK,
+        posix_fs::ANON => 0,
         _ => S_IFCHR,
     };
     LinuxStat {
@@ -562,6 +563,8 @@ const TCSBRK: c_ulong = 0x5409;
 const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
 const FIONBIO: c_ulong = 0x5421;
+/// FIONREAD and SIOCINQ.
+const FIONREAD: c_ulong = 0x541B;
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCNOTTY: c_ulong = 0x5422;
 const TIOCGWINSZ: c_ulong = 0x5413;
@@ -756,6 +759,20 @@ pub unsafe extern "C" fn stafeto_ioctl(
         // SAFETY: FIONBIO's argument is a readable int.
         let on = unsafe { argument.cast::<c_int>().read() } != 0;
         return posix_abi::net::nonblocking(fd, on).map_or_else(|errno| -errno, |()| 0);
+    }
+    // FIONREAD (SIOCINQ) of a socket of the network service: the bytes ready to read.
+    if request == FIONREAD && posix_abi::net::is_net(fd) {
+        if argument.is_null() {
+            return -EFAULT;
+        }
+        return match posix_abi::net::readable(fd) {
+            Ok(bytes) => {
+                // SAFETY: FIONREAD's argument is a writable int.
+                unsafe { argument.cast::<c_int>().write(bytes as c_int) };
+                0
+            }
+            Err(errno) => -errno,
+        };
     }
     // relibc tcdrain uses precisely this command. Its cancellation point
     // surrounds the descriptor hold, so cleanup runs after release.

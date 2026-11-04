@@ -1142,6 +1142,9 @@ impl Shadow {
                     },
                     posix_fs::Target::Tty(n) => Names::Terminal(n),
                     posix_fs::Target::Random(n) => Names::Random(n.fd()),
+                    // An epoll descriptor never reaches the new image: its set
+                    // goes with ABANDON, and its number is free there.
+                    posix_fs::Target::Epoll(_) => continue,
                     #[cfg(feature = "procfs")]
                     posix_fs::Target::Proc(id) => match crate::procfs::carried(id) {
                         Some((node, pid, offset)) => Names::Proc { node, pid, offset },

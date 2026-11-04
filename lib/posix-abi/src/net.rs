@@ -70,6 +70,7 @@ static SESSION: AtomicU64 = AtomicU64::new(0);
 pub unsafe fn init(session: Option<Handle<Channel>>) {
     SESSION.store(session.map_or(0, |s| s.into_raw().0), Ordering::Release);
     posix_fs::set_net_release(close_description);
+    posix_fs::set_epoll_release(crate::epoll::release);
 }
 
 /// A forked child: `session`, the clone the parent made, takes the place of
@@ -210,6 +211,50 @@ fn word(request: &Request<'_>) -> Result<u32, i32> {
     let mut out = [0; MESSAGE_MAX];
     let n = rpc(request, None, &mut out)?;
     Reader::new(&out[..n]).u32().map_err(|_| EIO)
+}
+
+/// EPOLL_SET: the records of `list` in the set `set` of the session (0 makes
+/// a set); the set and one status word for each record. ENOMEM when the
+/// service has no set to give, EBADF for a set that is gone.
+pub(crate) fn epoll_set(
+    set: u32,
+    list: wire::EpollList,
+    statuses: &mut [u32; wire::EPOLL_BATCH],
+) -> Result<u32, i32> {
+    let service = channel()?;
+    let mut w = Writer::new();
+    Request::EpollSet { set, list }
+        .write(&mut w)
+        .map_err(|_| EIO)?;
+    let reply = loop {
+        match rt::sys::send(&service, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            other => break other.map_err(kernel)?,
+        }
+    };
+    let mut out = [0; MESSAGE_MAX];
+    let bytes = reply.bytes(&mut out);
+    match wire::read_epoll_set(bytes, list.len, statuses) {
+        Ok(set) => Ok(set),
+        Err(Status::Kernel(Error::PeerClosed)) => Err(ENETDOWN),
+        Err(Status::Kernel(Error::LimitReached)) => Err(ENOMEM),
+        Err(status) => Err(refusal(status).unwrap_or(EIO)),
+    }
+}
+
+/// EPOLL_DROP: the set goes. A service that ended holds none.
+pub(crate) fn epoll_drop(set: u32) {
+    let Ok(service) = channel() else { return };
+    let mut w = Writer::new();
+    if proto_net::Method::EpollDrop.header().write(&mut w).is_err() || w.u32(set).is_err() {
+        return;
+    }
+    loop {
+        match rt::sys::send(&service, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            _ => return,
+        }
+    }
 }
 
 /// CLOSE of a description, the hook of the last close of a descriptor. A
@@ -903,6 +948,17 @@ pub fn set_nonblock(description: u32, on: bool) -> Result<(), i32> {
 }
 
 /// FIONBIO of the descriptor `fd`.
+/// FIONREAD of a socket: the bytes of a stream waiting to be read, or the
+/// length of the next datagram (0 with none).
+pub fn readable(fd: i32) -> Result<u32, i32> {
+    with_socket(fd, |description| {
+        word(&Request::GetOpt {
+            description,
+            name: opt::NREAD,
+        })
+    })
+}
+
 pub fn nonblocking(fd: i32, on: bool) -> Result<(), i32> {
     with_socket(fd, |description| set_nonblock(description, on))
 }

@@ -63,7 +63,11 @@ enum Admission {
 
 /// Admission and backend selection share one table lock.
 pub(crate) fn close(fd: u32) -> Result<(), i32> {
-    operation(fd, None, false).map(|_| ())
+    let result = operation(fd, None, false).map(|_| ());
+    if result.is_ok() {
+        crate::epoll::closed(fd);
+    }
+    result
 }
 pub(crate) fn replace(
     source: u32,
@@ -71,7 +75,12 @@ pub(crate) fn replace(
     flags: Option<DescriptorFlags>,
 ) -> Result<u32, i32> {
     crate::shared::ensure_page_for(target);
-    operation(target, Some((source, flags)), false)
+    let result = operation(target, Some((source, flags)), false);
+    if result.is_ok() {
+        // The number names another descriptor now: the records of the old go.
+        crate::epoll::closed(target);
+    }
+    result
 }
 /// An implementation-owned descriptor must publish cleanup before its caller
 /// releases signal deferral. Retry only Full, never a post-admission error.

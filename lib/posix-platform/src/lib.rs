@@ -16,6 +16,7 @@
 #![no_std]
 
 mod dl;
+mod epoll;
 mod files;
 mod ipc;
 mod mapping;
@@ -138,6 +139,9 @@ pub unsafe extern "C" fn stafeto_write(fd: c_int, buf: *const u8, len: usize) ->
     loop {
         let rest = &bytes[done..];
         let got = value(call(|| posix_abi::write(fd, rest)).map(|n| n as i64)) as isize;
+        if got == -(posix_abi::constants::EAGAIN as isize) {
+            posix_abi::epoll::would_block(fd, true);
+        }
         if got == posix_request::MAX_WRITE as isize && rest.len() > posix_request::MAX_WRITE {
             done += posix_request::MAX_WRITE;
             continue;
@@ -173,6 +177,9 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
         let rest = &mut buffer[done..];
         let size = rest.len();
         let got = value(call(|| posix_abi::read(fd, rest)).map(|n| n as i64)) as isize;
+        if got == -(posix_abi::constants::EAGAIN as isize) {
+            posix_abi::epoll::would_block(fd, false);
+        }
         if got == posix_request::MAX_READ as isize
             && size > posix_request::MAX_READ
             && files::is_file(fd)
