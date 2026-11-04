@@ -24,9 +24,9 @@ use crate::{
     busybox_build, nano_build, net, net_curl, net_probe, qemu, relibc, symbolize,
 };
 
-/// The checks of `posix-net` for stages P4a-1 and P4a-2, in the order the
+/// The checks of `posix-net` for stages P4a-1, P4a-2 and P4a-3, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 32] = [
+pub const CHECKS: [&str; 50] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -59,6 +59,24 @@ pub const CHECKS: [&str; 32] = [
     "select-high",
     "fionread",
     "epoll-1000",
+    "listen-again",
+    "syn-full",
+    "timewait-syn",
+    "reuseport-4",
+    "reuseport-uid",
+    "linger-0",
+    "linger-wait",
+    "rcvtimeo",
+    "sndtimeo",
+    "accept-clofork",
+    "scm-net",
+    "scm-five",
+    "scm-mixed",
+    "scm-wait",
+    "scm-dead-receiver",
+    "scm-close-socket",
+    "scm-ctrunc",
+    "epoll-exclusive",
 ];
 
 /// How long the checks may take in all (the ci group allows 120 s for the
@@ -82,8 +100,19 @@ fn took_ms(lines: &[String], name: &str) -> Option<u64> {
 }
 
 /// `posix-net` for all its checks: a line for each, then the count.
+///
+/// `POSIX_NET_ONLY=NAME` runs the one check, for finding the cause of a failure.
 fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), String> {
-    run.send(&format!("posix-net {address}"))?;
+    let only = std::env::var("POSIX_NET_ONLY").ok();
+    let wanted: Vec<&str> = CHECKS
+        .iter()
+        .copied()
+        .filter(|name| only.as_deref().is_none_or(|only| only == *name))
+        .collect();
+    match &only {
+        Some(name) => run.send(&format!("posix-net {address} {name}"))?,
+        None => run.send(&format!("posix-net {address}"))?,
+    }
     let mut seen = 0;
     let end = Instant::now() + within;
     loop {
@@ -93,14 +122,14 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         if text.contains("failed") {
             return Err(format!("posix-net: {text}"));
         }
-        if text.contains(" took ") {
+        if text.contains(" took ") || text.contains(" note: ") {
             continue;
         }
         if let Some(count) = text.strip_suffix(" checks ok") {
-            if count != CHECKS.len().to_string() || seen != CHECKS.len() {
+            if count != wanted.len().to_string() || seen != wanted.len() {
                 return Err(format!(
                     "posix-net ran {count} checks, {seen} lines said ok, xtask knows {}",
-                    CHECKS.len()
+                    wanted.len()
                 ));
             }
             return Ok(());
@@ -108,11 +137,11 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         let name = text
             .strip_suffix(" ok")
             .ok_or_else(|| format!("an unknown line of posix-net: {line:?}"))?;
-        if CHECKS.get(seen) != Some(&name) {
+        if wanted.get(seen) != Some(&name) {
             return Err(format!(
                 "check {} is {name}, wanted {:?}",
                 seen + 1,
-                CHECKS.get(seen)
+                wanted.get(seen)
             ));
         }
         seen += 1;

@@ -470,7 +470,10 @@ pub(crate) fn export(fd: i32) -> Result<Handle<Channel>, i32> {
 pub(crate) fn adopt(pass: Handle<Channel>, kept: i32) -> Result<i32, i32> {
     let mut reply = [0u8; MESSAGE_MAX];
     let n = rpc(&Request::Adopt, Some(pass), &mut reply)?;
-    let (description, kind) = wire::read_adopted(&reply[..n]).map_err(|_| EIO)?;
+    // `rpc` took the status off: the description and the kind are left.
+    let mut r = Reader::new(&reply[..n]);
+    let description = r.u32().map_err(|_| EIO)?;
+    let kind = r.u32().map_err(|_| EIO)?;
     publish(description, kind == wire::STREAM, kept)
 }
 

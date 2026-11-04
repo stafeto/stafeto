@@ -410,8 +410,8 @@ pub struct Net {
     #[cfg(feature = "probe")]
     pub in_request: bool,
     pub counters: Counters,
-    /// The listening description a SYN was just routed to.
-    syn_listener: Option<usize>,
+    /// The socket of a queue a SYN was just routed to.
+    syn_member: Option<usize>,
 }
 
 /// The time in nanoseconds of the guest.
@@ -457,7 +457,7 @@ impl Net {
             addr_of_mut!((*at).notary).write(None);
             addr_of_mut!((*at).channel).write(Handle::borrowed(channel.raw()));
             addr_of_mut!((*at).external).write(None);
-            addr_of_mut!((*at).syn_listener).write(None);
+            addr_of_mut!((*at).syn_member).write(None);
             addr_of_mut!((*at).level).write(level);
         }
     }
@@ -1227,14 +1227,14 @@ impl Net {
                         port: local_port,
                     })
                 })?;
-                let Some((listener, member)) = self.pick_listener(stack, lead, &conn) else {
+                let Some(member) = self.pick_member(stack, lead, &conn) else {
                     // A queue with no room drops the SYN: the peer sends it
                     // again after its timeout, as it does to a busy server.
                     self.drop_frame = true;
                     self.counters.syn_dropped += 1;
                     return None;
                 };
-                self.syn_listener = Some(listener);
+                self.syn_member = Some(member);
                 Some(member)
             }
             Dest::Udp {
@@ -1280,15 +1280,15 @@ impl Net {
             })
     }
 
-    /// The listening description of the group of `lead` (or `lead` itself)
-    /// that gets the SYN of the four `conn`, and the socket of its queue
-    /// that takes it.
-    fn pick_listener(
+    /// The socket of a queue that gets the SYN of the four `conn`: of the
+    /// listening description `lead`, or of the member of its group that the
+    /// hash picks.
+    fn pick_member(
         &mut self,
         stack: &mut Stack<'static>,
         lead: usize,
         conn: &Key,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<usize> {
         let group = self.socks[lead].group;
         let listener = if group == NO_GROUP {
             lead
@@ -1309,20 +1309,25 @@ impl Net {
                 },
             )?
         };
-        let member = self.listening_member(stack, listener)?;
-        Some((listener, member))
+        self.listening_member(stack, listener)
     }
 
-    /// After the stack took a SYN for a listening description: the sockets of
-    /// its queue that left LISTEN get the key of their connection, and one
-    /// that went back to LISTEN (a reset) loses it.
+    /// After the stack took a SYN for a listening description: the stack hands
+    /// it to the first socket in LISTEN of the set of the group that holds the
+    /// socket `route` named, and that may be a socket of another listening
+    /// description of the same port (a group of SO_REUSEPORT has the queues of
+    /// all its members in the sets). Each socket of the queue of a listening
+    /// description in that group that left LISTEN gets the key of its
+    /// connection, and one that went back to LISTEN (a reset) loses it.
     pub fn adopt(&mut self, stack: &mut Stack<'static>) {
-        let Some(listener) = self.syn_listener.take() else {
+        let Some(member) = self.syn_member.take() else {
             return;
         };
-        let sock = self.socks[listener];
-        for k in 0..usize::from(sock.member_count) {
-            let m = usize::from(sock.members[k]);
+        let group = member / GROUP;
+        for m in group * GROUP..(group + 1) * GROUP {
+            if self.socks[m].listener == NO_PLACE {
+                continue;
+            }
             let Some(handle) = self.socks[m].handle else {
                 continue;
             };
