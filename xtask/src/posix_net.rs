@@ -22,9 +22,9 @@ use crate::{
     busybox_build, nano_build, net, net_curl, net_probe, qemu, relibc, symbolize,
 };
 
-/// The checks of `posix-net` for stage P4a-1, in the order the program runs
-/// them.
-pub const CHECKS: [&str; 11] = [
+/// The checks of `posix-net` for stages P4a-1 and P4a-2, in the order the
+/// program runs them.
+pub const CHECKS: [&str; 28] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -36,6 +36,23 @@ pub const CHECKS: [&str; 11] = [
     "sockets-1000",
     "ephemeral-block",
     "bind-reuse-accepted",
+    "epoll-basic",
+    "epoll-200",
+    "epoll-lt",
+    "epoll-et",
+    "epoll-et-pipe",
+    "epoll-oneshot",
+    "epoll-close",
+    "epoll-fork",
+    "epoll-exec",
+    "epoll-errors",
+    "epoll-rdhup",
+    "epoll-err-rst",
+    "epoll-signal",
+    "poll-1000",
+    "select-high",
+    "fionread",
+    "epoll-1000",
 ];
 
 /// How long the checks may take in all (the ci group allows 120 s for the
@@ -50,12 +67,17 @@ fn text_of(line: &str) -> Option<&str> {
     line.split_once("posix-net: ").map(|(_, text)| text)
 }
 
-/// The time `fork-900` printed, in milliseconds.
-fn fork_ms(lines: &[String]) -> Option<u64> {
+/// The time the check `name` printed, in milliseconds.
+fn took_ms(lines: &[String], name: &str) -> Option<u64> {
     lines.iter().find_map(|l| {
-        let rest = text_of(l)?.strip_prefix("fork-900 took ")?;
+        let rest = text_of(l)?.strip_prefix(name)?.strip_prefix(" took ")?;
         rest.strip_suffix(" ms")?.parse().ok()
     })
+}
+
+/// The time `fork-900` printed, in milliseconds.
+fn fork_ms(lines: &[String]) -> Option<u64> {
+    took_ms(lines, "fork-900")
 }
 
 /// `posix-net` for all its checks: a line for each, then the count.
@@ -70,7 +92,7 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         if text.contains("failed") {
             return Err(format!("posix-net: {text}"));
         }
-        if text.starts_with("fork-900 took ") {
+        if text.contains(" took ") {
             continue;
         }
         if let Some(count) = text.strip_suffix(" checks ok") {
@@ -175,12 +197,17 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             net_probe::STEP_MAX
         );
     }
-    let took = fork_ms(&output.lines).map_or("no time".to_owned(), |ms| format!("{ms} ms"));
+    let took = |name: &str| {
+        took_ms(&output.lines, name).map_or("no time".to_owned(), |ms| format!("{ms} ms"))
+    };
     println!(
-        "posix-net passed in {:.0} s on {}: {} checks, a fork with 900 descriptors took {took}",
+        "posix-net passed in {:.0} s on {}: {} checks, a fork with 900 descriptors took {}, a poll of 1000 {}, 1000 events of epoll {}",
         started.elapsed().as_secs_f64(),
         machine.name,
-        CHECKS.len()
+        CHECKS.len(),
+        took("fork-900"),
+        took("poll-1000"),
+        took("epoll-1000")
     );
     Ok(())
 }
