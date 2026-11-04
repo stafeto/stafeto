@@ -25,10 +25,11 @@ use crate::constants::*;
 use crate::long;
 use crate::shared;
 use crate::sockets::{
-    AF_INET, IPPROTO_TCP, IPPROTO_UDP, MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_OOB,
-    MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN, SO_ERROR,
-    SO_KEEPALIVE, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SO_TYPE, SOCK_CLOEXEC, SOCK_DGRAM,
-    SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY,
+    AF_INET, IPPROTO_TCP, IPPROTO_UDP, KEPT_FLAGS, MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_NOSIGNAL,
+    MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, Message, SO_ACCEPTCONN, SO_BROADCAST, SO_DOMAIN,
+    SO_ERROR, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_RCVTIMEO, SO_REUSEADDR, SO_REUSEPORT,
+    SO_SNDBUF, SO_SNDTIMEO, SO_TYPE, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET,
+    TCP_NODELAY,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -260,10 +261,26 @@ pub(crate) fn epoll_drop(set: u32) {
 /// CLOSE of a description, the hook of the last close of a descriptor. A
 /// service that ended holds nothing: the close succeeds.
 fn close_description(description: u32) {
-    let _ = simple(&Request::Close {
+    // The reply is a long one: READY at once, or WAIT k while a stream with a
+    // linger time has data the peer has not acknowledged. A signal or the end
+    // of the service ends the wait, and the close is done all the same.
+    let Ok(service) = channel() else { return };
+    let mut start = Writer::new();
+    let request = Request::Close {
         description,
-        linger: 0,
-    });
+        linger: wire::CLOSE_MAY_WAIT,
+    };
+    if request.write(&mut start).is_err() {
+        return;
+    }
+    let keyed = |cancel: bool, key: u64, w: &mut Writer| {
+        if cancel {
+            Request::Cancel(key).write(w)
+        } else {
+            Request::CloseTake(key).write(w)
+        }
+    };
+    let _ = long::run_no_point(&service, start.as_bytes(), keyed, &mut [], &refusal);
 }
 
 /// ABANDON of the process's session: the long operations of its threads go.
@@ -387,10 +404,10 @@ fn c_address(address: &Address, out: &mut [u8]) -> usize {
 
 // ------------------------------------------------------------------ the calls
 
-fn descriptor_flags(cloexec: bool) -> posix_fs::DescriptorFlags {
+fn descriptor_flags(kept: i32) -> posix_fs::DescriptorFlags {
     posix_fs::DescriptorFlags {
-        close_on_exec: cloexec,
-        close_on_fork: false,
+        close_on_exec: kept & crate::sockets::SOCK_CLOEXEC != 0,
+        close_on_fork: kept & crate::sockets::SOCK_CLOFORK != 0,
     }
 }
 
@@ -417,16 +434,56 @@ fn with_socket<R>(fd: i32, run: impl FnOnce(u32) -> Result<R, i32>) -> Result<R,
     with_net(fd, |net| run(net.description))
 }
 
+/// EXPORT: a pass for the socket of descriptor `fd`, a copy of the session's
+/// channel that carries the description and that another process may adopt.
+/// ENOTSOCK for a descriptor that is no socket of this service, ENOBUFS when
+/// the service has its passes all given out.
+pub(crate) fn export(fd: i32) -> Result<Handle<Channel>, i32> {
+    with_socket(fd, |description| {
+        let service = channel()?;
+        let mut w = Writer::new();
+        Request::Export { description }
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        let reply = loop {
+            match rt::sys::send(&service, w.as_bytes()) {
+                Err(Error::Interrupted) => continue,
+                other => break other.map_err(kernel)?,
+            }
+        };
+        let mut buffer = [0u8; MESSAGE_MAX];
+        let mut r = Reader::new(reply.bytes(&mut buffer));
+        match Status::from_code(r.u32().map_err(|_| EIO)?) {
+            Status::Ok => {}
+            Status::Kernel(Error::LimitReached) => return Err(ENOBUFS),
+            Status::Kernel(Error::PeerClosed) => return Err(ENETDOWN),
+            status => return Err(refusal(status).unwrap_or(EIO)),
+        }
+        let mut handles = reply.handles;
+        handles.take::<Channel>(0).map_err(|_| EIO)
+    })
+}
+
+/// ADOPT: the description a pass names becomes a descriptor of this
+/// process's session. The pass is spent either way. ENOTSOCK for a handle
+/// that is no pass of the service the session is with.
+pub(crate) fn adopt(pass: Handle<Channel>, kept: i32) -> Result<i32, i32> {
+    let mut reply = [0u8; MESSAGE_MAX];
+    let n = rpc(&Request::Adopt, Some(pass), &mut reply)?;
+    let (description, kind) = wire::read_adopted(&reply[..n]).map_err(|_| EIO)?;
+    publish(description, kind == wire::STREAM, kept)
+}
+
 /// A descriptor for the description `description`; the service closes it
 /// again on an error.
-fn publish(description: u32, stream: bool, cloexec: bool) -> Result<i32, i32> {
+fn publish(description: u32, stream: bool, kept: i32) -> Result<i32, i32> {
     let target = Target::Net(NetTarget {
         description,
         stream,
     });
     let inserted = shared::growing(|files| {
         files
-            .insert(target, descriptor_flags(cloexec))
+            .insert(target, descriptor_flags(kept))
             .map(|fd| fd as i32)
             .map_err(shared::page_error)
     });
@@ -448,7 +505,7 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
     if domain != AF_INET {
         return Err(EAFNOSUPPORT);
     }
-    if kind & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+    if kind & !(0xf | SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
     let ty = match kind & 0xf {
@@ -471,7 +528,7 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
             0
         },
     })?;
-    publish(description, ty == wire::STREAM, kind & SOCK_CLOEXEC != 0)
+    publish(description, ty == wire::STREAM, kind & KEPT_FLAGS)
 }
 
 pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
@@ -481,15 +538,13 @@ pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
             description,
             address,
         };
-        // A port below 1024 brings a copy of the identity session, which the
-        // service has the process service vouch for.
-        let identity = if (1..1024).contains(&address.port) {
-            crate::process::identity().and_then(|identity| {
-                rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
-            })
-        } else {
-            None
-        };
+        // Every bind brings a copy of the identity session: the service has
+        // the process service vouch for it when the port is below 1024 or
+        // the socket shares its port (SO_REUSEPORT), and the layer cannot
+        // tell whether the option is set.
+        let identity = crate::process::identity().and_then(|identity| {
+            rt::sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
+        });
         rpc(&request, identity, &mut [0; MESSAGE_MAX]).map(drop)
     })
 }
@@ -553,7 +608,7 @@ pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
 /// accept and accept4: the new descriptor and the true length of the
 /// peer's address, which goes into `out`.
 pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize), i32> {
-    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+    if flags & !(SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
     let point = crate::threads::cancel::Point::begin();
@@ -574,7 +629,7 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
             &mut reply,
         )?;
         let (new, peer) = wire::read_accepted(&reply[..n]).map_err(|_| EIO)?;
-        let fd = publish(new, true, flags & SOCK_CLOEXEC != 0)?;
+        let fd = publish(new, true, flags & KEPT_FLAGS)?;
         let len = out.map_or(0, |out| c_address(&peer, out));
         Ok((fd, len))
     });
@@ -621,6 +676,7 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
     }
     Ok(match name {
         SO_REUSEADDR => (opt::REUSEADDR, true),
+        SO_REUSEPORT => (opt::REUSEPORT, true),
         SO_TYPE => (opt::TYPE, false),
         SO_ERROR => (opt::ERROR, false),
         SO_BROADCAST => (opt::BROADCAST, true),
@@ -633,8 +689,85 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
     })
 }
 
-/// getsockopt: the int of the option into `out`; its true length, 4.
+/// The options whose value is not an int: SO_LINGER (a `struct linger`) and
+/// the timeouts (a `struct timeval`), the number of the protocol's option.
+fn structured(level: i32, name: i32) -> Option<u32> {
+    if level != SOL_SOCKET {
+        return None;
+    }
+    match name {
+        SO_LINGER => Some(opt::LINGER),
+        SO_RCVTIMEO => Some(opt::RCVTIMEO),
+        SO_SNDTIMEO => Some(opt::SNDTIMEO),
+        _ => None,
+    }
+}
+
+/// The bytes of the structure of the option `number` for the value `value` of
+/// the protocol: `struct linger` (two ints) or `struct timeval` (seconds and
+/// microseconds, 8 bytes each).
+fn structure_of(number: u32, value: u32, out: &mut [u8; 16]) -> usize {
+    if number == opt::LINGER {
+        let on = value & opt::LINGER_ON != 0;
+        let seconds = value & 0xFFFF;
+        out[..4].copy_from_slice(&i32::from(on).to_ne_bytes());
+        out[4..8].copy_from_slice(&(seconds as i32).to_ne_bytes());
+        8
+    } else {
+        out[..8].copy_from_slice(&i64::from(value / 1000).to_ne_bytes());
+        out[8..16].copy_from_slice(&(i64::from(value % 1000) * 1000).to_ne_bytes());
+        16
+    }
+}
+
+/// The value of the protocol for the structure `value` of the option
+/// `number`: EINVAL for a short or a negative one.
+fn value_of(number: u32, value: &[u8]) -> Result<u32, i32> {
+    if number == opt::LINGER {
+        if value.len() < 8 {
+            return Err(EINVAL);
+        }
+        let on = i32::from_ne_bytes(value[..4].try_into().map_err(|_| EINVAL)?);
+        let seconds = i32::from_ne_bytes(value[4..8].try_into().map_err(|_| EINVAL)?);
+        if on == 0 {
+            return Ok(0);
+        }
+        if seconds < 0 {
+            return Err(EINVAL);
+        }
+        return Ok(opt::LINGER_ON | seconds.min(i32::from(u16::MAX)) as u32);
+    }
+    if value.len() < 16 {
+        return Err(EINVAL);
+    }
+    let seconds = i64::from_ne_bytes(value[..8].try_into().map_err(|_| EINVAL)?);
+    let micros = i64::from_ne_bytes(value[8..16].try_into().map_err(|_| EINVAL)?);
+    if seconds < 0 || !(0..1_000_000).contains(&micros) {
+        return Err(EINVAL);
+    }
+    // A time below a millisecond is one, so that it does not mean "none".
+    let millis = seconds
+        .saturating_mul(1000)
+        .saturating_add((micros + 999) / 1000);
+    Ok(millis.min(i64::from(u32::MAX)) as u32)
+}
+
+/// getsockopt: the int of the option into `out`; its true length, 4 (8 for
+/// SO_LINGER, 16 for the timeouts).
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if let Some(number) = structured(level, name) {
+        return with_socket(fd, |description| {
+            let value = word(&Request::GetOpt {
+                description,
+                name: number,
+            })?;
+            let mut bytes = [0u8; 16];
+            let len = structure_of(number, value, &mut bytes);
+            let n = out.len().min(len);
+            out[..n].copy_from_slice(&bytes[..n]);
+            Ok(len)
+        });
+    }
     let (number, _) = option_number(level, name)?;
     with_socket(fd, |description| {
         let mut value = word(&Request::GetOpt {
@@ -654,6 +787,16 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usiz
 }
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
+    if let Some(number) = structured(level, name) {
+        let word = value_of(number, value)?;
+        return with_socket(fd, |description| {
+            simple(&Request::SetOpt {
+                description,
+                name: number,
+                value: word,
+            })
+        });
+    }
     let (number, flag) = option_number(level, name)?;
     if value.len() < 4 {
         return Err(EINVAL);

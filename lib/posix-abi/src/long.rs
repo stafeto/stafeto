@@ -13,11 +13,12 @@
 //! and the caller's point takes it. A result that was ready when the cancel
 //! came is returned: nothing is lost.
 use crate::constants::*;
+use core::cell::RefCell;
 use core::sync::atomic::Ordering;
 use posix_thread::flag;
 use proto_wire::{Status, Writer, long};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
-use rt::handle::{Channel, Handle, Timer};
+use rt::handle::{Channel, Handle, Incoming, Outgoing, Timer};
 use rt::sys;
 
 /// The errno of a refusal of the service's own, which `run_with` takes;
@@ -28,6 +29,24 @@ type Refusal<'a> = &'a dyn Fn(Status) -> Option<i32>;
 pub(crate) trait Custody {
     fn record(&self, kind: u32, key: u64) -> Result<(), i32>;
 }
+/// The handles that travel with a long operation: those the start sends (SCM_RIGHTS
+/// passes) and those its READY reply brought. The start's go with its first
+/// request and are given back when the kernel returns them (a request that was
+/// interrupted before a service took it), so that the start can go again.
+pub(crate) struct Carried {
+    pub out: Outgoing,
+    pub back: Incoming,
+}
+
+impl Carried {
+    pub(crate) fn new() -> Self {
+        Carried {
+            out: Outgoing::new(),
+            back: Incoming::none(),
+        }
+    }
+}
+
 struct Mode<'a> {
     point: bool,
     authenticated: bool,
@@ -44,6 +63,8 @@ struct Mode<'a> {
     /// or not it had SA_RESTART (connect, XSH: the connection goes on and
     /// the call fails with EINTR).
     every_handler: bool,
+    /// The handles the start sends and the reply brings.
+    carried: Option<&'a RefCell<Carried>>,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
@@ -55,6 +76,7 @@ impl Mode<'_> {
             deadline: None,
             check: None,
             every_handler: false,
+            carried: None,
         }
     }
 }
@@ -131,6 +153,7 @@ fn call(
     authenticated: bool,
     duplicable: bool,
     custody: Option<&dyn Custody>,
+    carried: Option<&RefCell<Carried>>,
 ) -> Result<(u32, usize, u64), i32> {
     let _scope = ShortScope::enter(custody.is_some())?;
     let identity = authenticated
@@ -150,7 +173,27 @@ fn call(
                 .ok_or(EIO)
         })
         .transpose()?;
+    // The handles of the start go with the request that has none of its own.
+    let carrying = match carried {
+        Some(cell) if identity.is_none() && handle.is_none() && !cell.borrow().out.is_empty() => {
+            Some((
+                cell,
+                core::mem::replace(&mut cell.borrow_mut().out, Outgoing::new()),
+            ))
+        }
+        _ => None,
+    };
     let reply = match (identity, handle) {
+        _ if carrying.is_some() => {
+            let (cell, out) = carrying.expect("the handles of the start");
+            sys::send_handles(service, request, out).map_err(|refused| {
+                // An interrupted start gets its handles back for the next.
+                if let Some(back) = refused.back {
+                    cell.borrow_mut().out = back;
+                }
+                refused.error.into_errno()
+            })?
+        }
         (Some(identity), Some(handle)) => {
             sys::send_handles(service, request, [identity.erase(), handle.erase()])
                 .map_err(|refused| refused.error.into_errno())?
@@ -164,10 +207,14 @@ fn call(
     let mut buffer = [0; MESSAGE_MAX];
     let bytes = reply.bytes(&mut buffer);
     let len = bytes.len();
-    let result = match long::Reply::read(bytes) {
+    let parsed = long::Reply::read(bytes);
+    let result = match parsed {
         Ok(long::Reply::Ready(result)) => {
             let n = result.len().min(out.len());
             out[..n].copy_from_slice(&result[..n]);
+            if let Some(cell) = carried {
+                cell.borrow_mut().back = reply.handles;
+            }
             Ok((long::READY, n, 0))
         }
         Ok(long::Reply::Wait(key)) => Ok((long::WAIT, 0, key)),
@@ -331,6 +378,29 @@ pub fn run_checked(
 /// (getentropy, getrandom, arc4random; XSH 2.9.5 allows no new points): a
 /// request of cancellation leaves the wait alone and stays for the next
 /// point; a handler without SA_RESTART still ends it with EINTR.
+/// `run_with` for an operation whose start sends handles and whose READY reply
+/// brings some (`carried`).
+pub(crate) fn run_carrying(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+    carried: &RefCell<Carried>,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            carried: Some(carried),
+            ..Mode::plain(true, false)
+        },
+    )
+}
+
 pub fn run_no_point(
     service: &Handle<Channel>,
     start: &[u8],
@@ -466,6 +536,7 @@ pub(crate) fn run_drain(
             deadline: None,
             check: None,
             every_handler: false,
+            carried: None,
         },
     )
     .map(drop)
@@ -524,6 +595,7 @@ fn run_in(
         deadline,
         check,
         every_handler,
+        carried,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -556,6 +628,7 @@ fn run_in(
                 authenticated,
                 duplicable,
                 custody,
+                carried,
             ),
             Start::Admission(build) => {
                 let request = build().map_err(|_| EIO)?;
@@ -568,6 +641,7 @@ fn run_in(
                     authenticated,
                     duplicable,
                     custody,
+                    carried,
                 )
             }
         };
@@ -633,6 +707,7 @@ fn run_in(
                 authenticated,
                 duplicable,
                 custody,
+                carried,
             ) {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => {}
@@ -667,6 +742,7 @@ fn run_in(
                 authenticated,
                 duplicable,
                 custody,
+                carried,
             );
             drop(clone_guard);
             match reply {
@@ -717,6 +793,7 @@ fn run_in(
                     authenticated,
                     duplicable,
                     custody,
+                    carried,
                 ) {
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
@@ -762,6 +839,7 @@ fn run_in(
             authenticated,
             duplicable,
             custody,
+            carried,
         ) {
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::CANCELLED, _, _)) => return Err(cancel.unwrap_or(EINTR)),
