@@ -20,6 +20,7 @@ use crate::stack::{Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
 use netd::births;
 use netd::demux::Key;
+use netd::passes::Passes;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
 use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
@@ -194,6 +195,7 @@ impl Net {
                     place: place as u16,
                 };
                 self.told &= !(1 << idx);
+                self.limit(idx, kind, place);
                 if kind == Kind::Epoll {
                     self.interest.add_waiter(place, idx);
                 } else {
@@ -203,6 +205,17 @@ impl Net {
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
+                // The time limit of the operation ran out: it ends as a call
+                // that would not wait does (EAGAIN; a connect goes on).
+                let ran_out = op_index(key).is_some_and(|idx| self.expired >> idx & 1 != 0);
+                if ran_out && kind != Kind::Linger {
+                    let code = if kind == Kind::Connect {
+                        proto_net::IN_PROGRESS
+                    } else {
+                        proto_net::AGAIN
+                    };
+                    return self.done(s, Some(key), refuse(code));
+                }
                 self.told &= !op_index(key).map_or(0, |idx| 1u128 << idx);
                 match notify {
                     Some(handle) => {
@@ -214,6 +227,27 @@ impl Net {
                 }
                 long_answer(r, long::Reply::Armed)
             }
+        }
+    }
+
+    /// The time limit of the new operation `idx` of `kind` on `place`:
+    /// SO_RCVTIMEO for what receives, SO_SNDTIMEO for what sends, the linger
+    /// time of a close.
+    fn limit(&mut self, idx: usize, kind: Kind, place: usize) {
+        let sock = &self.socks[place];
+        let ns = match kind {
+            Kind::Accept | Kind::Recv => u64::from(sock.rcvtimeo) * 1_000_000,
+            Kind::Send | Kind::Connect => u64::from(sock.sndtimeo) * 1_000_000,
+            Kind::Linger => u64::from(sock.linger & 0xFFFF) * 1_000_000_000,
+            Kind::Watch | Kind::Epoll => 0,
+        };
+        let bit = 1u128 << idx;
+        self.expired &= !bit;
+        self.timed &= !bit;
+        if ns != 0 {
+            self.op_deadline[idx] = now_ns().saturating_add(ns);
+            self.timed |= bit;
+            self.deadline_new = true;
         }
     }
 
@@ -337,19 +371,10 @@ impl Net {
             Call::Close {
                 description,
                 linger,
-            } => {
-                if linger != 0 {
-                    return refuse(proto_net::INVALID);
-                }
-                let Some(place) = self.find(&s.data.held, description) else {
-                    return refuse(proto_net::BAD_FD);
-                };
-                s.data.held.remove(place);
-                self.interest.drop_place(place, Some(s.label()));
-                self.release(stack, place);
-                self.step_due = true;
-                ok()
-            }
+            } => self.close_call(stack, s, r, description, linger),
+            Call::CloseTake(key) => self.close_take(stack, s, r, key),
+            Call::Export { description } => self.export(s, r, description),
+            Call::Adopt => self.adopt_pass(stack, s, r),
             Call::GetOpt { description, name } => {
                 let Some(place) = self.find(&s.data.held, description) else {
                     return refuse(proto_net::BAD_FD);
@@ -423,6 +448,181 @@ impl Net {
         }
     }
 
+    // ----- CLOSE -----
+
+    /// CLOSE: the session lets go of the description. With `CLOSE_MAY_WAIT`
+    /// the reply is a long one: READY, or WAIT k when the session was the last
+    /// to hold a stream with a linger time whose data is not acknowledged yet.
+    fn close_call(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        description: u32,
+        linger: u32,
+    ) -> Answer {
+        if linger > proto_net::sockets::CLOSE_MAY_WAIT {
+            return refuse(proto_net::INVALID);
+        }
+        let Some(place) = self.find(&s.data.held, description) else {
+            return refuse(proto_net::BAD_FD);
+        };
+        let waits = linger != 0 && self.close_may_linger(place);
+        s.data.held.remove(place);
+        self.interest.drop_place(place, Some(s.label()));
+        self.release(stack, place);
+        self.step_due = true;
+        if linger == 0 {
+            return ok();
+        }
+        let unacknowledged = waits
+            && self.places.state(place) == State::Orphan
+            && self.socks[place].handle.is_some_and(|h| {
+                !matches!(
+                    stack.tcp(h).state(),
+                    tcp::State::FinWait2 | tcp::State::TimeWait | tcp::State::Closed
+                )
+            })
+            && !self.socks[place].rst_pending;
+        if unacknowledged {
+            return self.wait(s, r, None, Kind::Linger, place, None);
+        }
+        long_answer(r, long::Reply::Ready(&[]))
+    }
+
+    /// Whether a close of place `place` by its last holder waits for the data
+    /// to go: a stream that blocks, with a linger time above 0.
+    fn close_may_linger(&self, place: usize) -> bool {
+        let sock = &self.socks[place];
+        sock.proto == Proto::Tcp
+            && !sock.nonblock
+            && !sock.listening
+            && sock.linger & opt::LINGER_ON != 0
+            && sock.linger & 0xFFFF != 0
+            && self.places.holders(place) == 1
+    }
+
+    /// CLOSE_TAKE: the wait of a close that answered WAIT k.
+    fn close_take(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        key: u64,
+    ) -> Answer {
+        let notify = match notify_of(r, true) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        let Some(idx) = op_index(key).filter(|_| self.ops.waits(s.label(), key)) else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        let info = self.info[idx];
+        if info.key != key || info.kind != Kind::Linger {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let place = usize::from(info.place);
+        let bit = 1u128 << idx;
+        let over = (self.lingered | self.expired) & bit != 0
+            || self.socks[place].waiters & bit == 0
+            || self.linger_done(stack, place);
+        if over {
+            return self.done(s, Some(key), long_answer(r, long::Reply::Ready(&[])));
+        }
+        self.wait(s, r, Some(key), Kind::Linger, place, notify)
+    }
+
+    // ----- EXPORT, ADOPT -----
+
+    /// EXPORT: a pass for the description, a copy of the service's channel with
+    /// a label of its own that carries TRANSFER alone (no DUPLICATE, so a holder
+    /// cannot make copies that keep kernel places charged to the service after
+    /// the pass is spent, and no SEND), so
+    /// that whoever holds it can hand it on and can ask the service for nothing.
+    /// The pass holds a reference of the place until ADOPT or the last copy goes.
+    fn export(&mut self, s: &mut Sess, r: &mut Request<'_>, d: u32) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(place) = self.find(&s.data.held, d) else {
+            return refuse(proto_net::BAD_FD);
+        };
+        let Ok(label) = self.passes.make(place, s.label()) else {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        };
+        let pass = sys::handle_label(&self.channel, Rights::TRANSFER, label, self.level);
+        match pass {
+            Ok(pass) if r.reply().u32(Status::Ok.code()).is_ok() && self.places.hold(place) => {
+                Answer::Reply([pass.erase()].into())
+            }
+            other => {
+                self.passes.end(label);
+                match other {
+                    Err(e) => Answer::Status(Status::Kernel(e)),
+                    Ok(_) => Answer::Status(Status::Kernel(Error::LimitReached)),
+                }
+            }
+        }
+    }
+
+    /// ADOPT: the description a pass names becomes the session's (the pass is
+    /// spent and its handle closes with the request). A handle that is no pass
+    /// of this service is NOT_SOCKET; a pass that was spent is BAD_FD.
+    fn adopt_pass(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+    ) -> Answer {
+        if r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(pass) = r.handles.take::<Channel>(0) else {
+            return refuse(proto_net::NOT_SOCKET);
+        };
+        let Ok(label) = sys::copy_label(&self.channel, &pass) else {
+            return refuse(proto_net::NOT_SOCKET);
+        };
+        if !Passes::is_pass(label) {
+            return refuse(proto_net::NOT_SOCKET);
+        }
+        let Some(place) = self.passes.end(label) else {
+            return refuse(proto_net::BAD_FD);
+        };
+        let kind = match self.socks[place].proto {
+            Proto::Tcp => sockets::STREAM,
+            Proto::Udp => sockets::DGRAM,
+        };
+        let name = self.places.name(place);
+        if s.data.held.has(place) {
+            // The session has the description: the reference of the pass goes.
+            self.release(stack, place);
+        } else if s.data.held.count() >= OPEN_MAX {
+            self.release(stack, place);
+            return refuse(proto_net::MFILE);
+        } else {
+            // The reference of the pass becomes the session's.
+            s.data.held.add(place);
+        }
+        match sockets::write_adopted(r.reply(), name, kind) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// The last copy of the pass `label` went: its reference of the place goes
+    /// (a label that names no pass in use is none of this).
+    pub fn pass_gone(&mut self, stack: &mut Stack<'static>, label: u64) -> bool {
+        match self.passes.end(label) {
+            Some(place) => {
+                self.release(stack, place);
+                self.step_due = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     // ----- SOCKET, BIND, LISTEN -----
 
     fn socket(
@@ -457,25 +657,21 @@ impl Net {
         word(r, self.places.name(place))
     }
 
-    /// Whether the request brought the identity session of a process the
-    /// process service vouches for as the superuser (spec 6, 3.6).
-    fn vouched(&mut self, r: &mut Request<'_>) -> bool {
+    /// The effective user of the process whose identity session the request
+    /// brought, as the process service vouches for it (spec 6, 3.6); None
+    /// without a session or when the service refuses it.
+    fn who(&mut self, r: &mut Request<'_>) -> Option<u32> {
         if r.handles.len() != 1 {
-            return false;
+            return None;
         }
-        let Ok(identity) = r.handles.take::<Channel>(0) else {
-            return false;
-        };
-        let Some(notary) = self.notary() else {
-            return false;
-        };
+        let identity = r.handles.take::<Channel>(0).ok()?;
+        let notary = self.notary()?;
         let request = proto_process::Method::Vouch.header().bytes();
-        let Ok(reply) = sys::send_handles(notary, &request, [identity.erase()]) else {
-            return false;
-        };
+        let reply = sys::send_handles(notary, &request, [identity.erase()]).ok()?;
         let mut buffer = [0; MESSAGE_MAX];
         proto_process::WhoReply::read(reply.bytes(&mut buffer))
-            .is_ok_and(|who| who.credentials.euid == 0)
+            .ok()
+            .map(|who| who.credentials.euid)
     }
 
     fn bind(
@@ -502,12 +698,26 @@ impl Net {
         if !self.own_address(ip) {
             return refuse(proto_net::NO_ADDRESS);
         }
-        if (1..1024).contains(&port) && !self.vouched(r) {
+        // The identity session of the request is vouched for once: a port
+        // below 1024 needs the superuser, and a shared port a user to hold it.
+        let low = (1..1024).contains(&port);
+        let sharing = sock.reuseport && sock.proto == Proto::Tcp;
+        let uid = if low || sharing { self.who(r) } else { None };
+        if low && uid != Some(0) {
+            return refuse(proto_net::NOT_ALLOWED);
+        }
+        if sharing && uid.is_none() {
             return refuse(proto_net::NOT_ALLOWED);
         }
         let port = if port == 0 {
             match self.ephemeral(sock.proto, ip, ([0; 4], 0)) {
-                Some(port) => port,
+                Some(port) => {
+                    if sharing && !self.join_group(place, ip, port, uid.unwrap_or(0)) {
+                        self.ports(sock.proto).release(port);
+                        return refuse(proto_net::NO_BUFFERS);
+                    }
+                    port
+                }
                 None => return refuse(proto_net::NO_ADDRESS),
             }
         } else {
@@ -518,8 +728,12 @@ impl Net {
                 listening: false,
                 connected: false,
                 reuse: sock.reuse,
+                share_uid: sharing.then_some(uid.unwrap_or(0)),
             };
             if ports::conflicts(&new, self.bindings(port, place, !sock.reuse)) {
+                return refuse(proto_net::IN_USE);
+            }
+            if sharing && !self.join_group(place, ip, port, uid.unwrap_or(0)) {
                 return refuse(proto_net::IN_USE);
             }
             self.ports(sock.proto).hold(port);
@@ -532,6 +746,7 @@ impl Net {
         }
         let sock = &mut self.socks[place];
         sock.bound = true;
+        sock.uid = uid.unwrap_or(0);
         sock.port_held = true;
         sock.address = ip;
         sock.port = port;
@@ -550,6 +765,21 @@ impl Net {
         ok()
     }
 
+    /// Puts `place`, bound to `address` and `port` with SO_REUSEPORT, in the
+    /// group of that port (made by the first); false when the group is another
+    /// user's or full.
+    fn join_group(&mut self, place: usize, address: [u8; 4], port: u16, uid: u32) -> bool {
+        // The registry has let this binding through only when every binding
+        // it overlaps was made with the option by the same user.
+        match self.groups.join(address, port, uid, place) {
+            Ok(k) => {
+                self.socks[place].group = k as u8;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn listen(&mut self, stack: &mut Stack<'static>, s: &mut Sess, d: u32, backlog: u32) -> Answer {
         let Some(place) = self.find(&s.data.held, d) else {
             return refuse(proto_net::BAD_FD);
@@ -559,6 +789,18 @@ impl Net {
             return refuse(proto_net::NOT_SUPPORTED);
         }
         if sock.listening {
+            // A second `listen` with a larger backlog builds the queue up to
+            // it; a smaller one changes nothing.
+            let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
+            while usize::from(self.socks[place].member_count) < wanted {
+                let Some(m) = self.member(stack, &sock, place) else {
+                    break;
+                };
+                let listener = &mut self.socks[place];
+                listener.members[usize::from(listener.member_count)] = m as u16;
+                listener.member_count += 1;
+                listener.room = listener.room.saturating_add(1);
+            }
             return ok();
         }
         if sock.conn != Conn::None {
@@ -595,6 +837,7 @@ impl Net {
         sock.listening = true;
         sock.members = members;
         sock.member_count = count as u8;
+        sock.room = count as u8;
         let (address, port) = (sock.address, sock.port);
         self.register(
             place,
@@ -635,6 +878,9 @@ impl Net {
         member.nodelay = sock.nodelay;
         member.keepalive = sock.keepalive;
         member.reuse = sock.reuse;
+        member.linger = sock.linger;
+        member.rcvtimeo = sock.rcvtimeo;
+        member.sndtimeo = sock.sndtimeo;
         self.apply_options(stack, m);
         Some(m)
     }
@@ -908,7 +1154,10 @@ impl Net {
             accepted.port = port;
         }
         match self.member(stack, &sock, place) {
-            Some(fresh) => self.socks[place].members[k] = fresh as u16,
+            Some(fresh) => {
+                self.socks[place].members[k] = fresh as u16;
+                self.socks[place].room = self.socks[place].room.saturating_add(1);
+            }
             None => {
                 let listener = &mut self.socks[place];
                 listener.members[k] = listener.members[usize::from(listener.member_count) - 1];
@@ -1276,6 +1525,22 @@ impl Net {
             opt::BROADCAST => sock.broadcast = on,
             opt::NODELAY => sock.nodelay = on,
             opt::NONBLOCK => sock.nonblock = on,
+            // Before BIND only: the group is made at BIND.
+            opt::REUSEPORT if sock.proto == Proto::Tcp && (sock.bound || sock.listening) => {
+                return refuse(proto_net::INVALID);
+            }
+            opt::REUSEPORT if sock.proto == Proto::Tcp => sock.reuseport = on,
+            opt::LINGER => {
+                if value != 0
+                    && (value & opt::LINGER_ON == 0
+                        || value & !opt::LINGER_ON > u32::from(u16::MAX))
+                {
+                    return refuse(proto_net::INVALID);
+                }
+                sock.linger = value;
+            }
+            opt::RCVTIMEO => sock.rcvtimeo = value,
+            opt::SNDTIMEO => sock.sndtimeo = value,
             // The buffers have one size.
             opt::RCVBUF | opt::SNDBUF => {}
             _ => return refuse(proto_net::NO_OPTION),
@@ -1288,6 +1553,9 @@ impl Net {
                 let member = &mut self.socks[m];
                 member.keepalive = sock.keepalive;
                 member.nodelay = sock.nodelay;
+                member.linger = sock.linger;
+                member.rcvtimeo = sock.rcvtimeo;
+                member.sndtimeo = sock.sndtimeo;
                 self.apply_options(stack, m);
             }
         } else {
@@ -1456,8 +1724,15 @@ impl Net {
         let result = match record.action {
             sockets::EPOLL_DEL => self.interest.delete(set, place),
             sockets::EPOLL_ADD | sockets::EPOLL_MOD => {
-                let known = epoll::EVENTS | epoll::ET | epoll::ONESHOT;
-                if record.events & epoll::EXCLUSIVE != 0 || record.events & !known != 0 {
+                // EPOLLEXCLUSIVE: ADD only, with the events Linux allows with it.
+                let exclusive = record.events & epoll::EXCLUSIVE != 0;
+                let allowed = epoll::IN | epoll::OUT | epoll::ERR | epoll::HUP | epoll::ET;
+                let known = epoll::EVENTS | epoll::ET | epoll::ONESHOT | epoll::EXCLUSIVE;
+                if record.events & !known != 0
+                    || (exclusive
+                        && (record.action != sockets::EPOLL_ADD
+                            || record.events & !(allowed | epoll::EXCLUSIVE) != 0))
+                {
                     return proto_net::INVALID;
                 }
                 let ev = self.events(stack, place, now);

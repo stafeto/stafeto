@@ -16,5 +16,6 @@ bench = false
 abi = { path = "../../lib/abi" }
 proto-init = { path = "../../proto/init" }
 proto-net = { path = "../../proto/net" }
+proto-pipe = { path = "../../proto/pipe" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }

@@ -51,7 +51,27 @@ pub mod opt {
     /// The bytes ready to read: of a stream the bytes in the queue of
     /// receiving, of a datagram socket the length of the next datagram.
     pub const NREAD: u32 = 34;
+    /// SO_LINGER: 0 for off, else `LINGER_ON` with the seconds (0 to 65 535).
+    pub const LINGER: u32 = 35;
+    /// SO_REUSEPORT: a stream before BIND; a datagram socket has no such option.
+    pub const REUSEPORT: u32 = 36;
+    /// SO_RCVTIMEO and SO_SNDTIMEO in milliseconds, 0 for none.
+    pub const RCVTIMEO: u32 = 37;
+    pub const SNDTIMEO: u32 = 38;
+    /// The bit of the value of LINGER that says it is on.
+    pub const LINGER_ON: u32 = 0x8000_0000;
 }
+
+/// The values CLOSE's `linger` word takes: the caller may wait for the close
+/// to finish (a description with a linger time that it was the last to hold).
+pub const CLOSE_MAY_WAIT: u32 = 1;
+
+/// The passes `netd` holds at once, and for one session (EXPORT).
+pub const PASSES_MAX: usize = 64;
+pub const SESSION_PASSES: usize = 16;
+/// The tag of the label of a pass: a copy of the service's channel that
+/// carries a description (EXPORT), apart from `proto_pipe::OWN`.
+pub const PASS: u64 = 1 << 62;
 
 /// The records one EPOLL_SET carries at most: the largest of 16, 8 and 4 for
 /// which the step with records on a place that holds 15 already stays within
@@ -282,6 +302,16 @@ pub enum Request<'a> {
         description: u32,
         linger: u32,
     },
+    /// The wait of a CLOSE that answered WAIT k.
+    CloseTake(u64),
+    /// A pass for the description, to hand to another process (one handle in
+    /// the reply).
+    Export {
+        description: u32,
+    },
+    /// The description a pass names becomes the session's (the request
+    /// carries the pass).
+    Adopt,
     GetOpt {
         description: u32,
         name: u32,
@@ -338,6 +368,9 @@ impl<'a> Request<'a> {
             Request::Recv { .. } => Method::RecvTake,
             Request::Shutdown { .. } => Method::Shutdown,
             Request::Close { .. } => Method::Close,
+            Request::CloseTake(_) => Method::CloseTake,
+            Request::Export { .. } => Method::Export,
+            Request::Adopt => Method::Adopt,
             Request::GetOpt { .. } => Method::GetOpt,
             Request::SetOpt { .. } => Method::SetOpt,
             Request::Name { .. } => Method::Name,
@@ -435,6 +468,9 @@ impl<'a> Request<'a> {
                 w.u32(description)?;
                 w.u32(linger)
             }
+            Request::CloseTake(key) => w.u64(key),
+            Request::Export { description } => w.u32(description),
+            Request::Adopt => Ok(()),
             Request::GetOpt { description, name } => {
                 w.u32(description)?;
                 w.u32(name)
@@ -584,6 +620,16 @@ impl<'a> Request<'a> {
                     linger: b.u32()?,
                 })
             })(),
+            Method::CloseTake => (|| match b.u64()? {
+                0 => Err(Status::BadSize),
+                key => Ok(Request::CloseTake(key)),
+            })(),
+            Method::Export => (|| {
+                Ok(Request::Export {
+                    description: b.u32()?,
+                })
+            })(),
+            Method::Adopt => Ok(Request::Adopt),
             Method::GetOpt => (|| {
                 Ok(Request::GetOpt {
                     description: b.u32()?,
@@ -740,6 +786,26 @@ pub fn read_name(reply: &[u8]) -> Result<Address, Status> {
 pub fn write_accepted(w: &mut Writer, description: u32, peer: &Address) -> Result<(), Status> {
     w.u32(description)?;
     peer.write(w)
+}
+
+/// The reply of ADOPT: the description and its kind.
+pub fn write_adopted(w: &mut Writer, description: u32, kind: u32) -> Result<(), Status> {
+    w.u32(Status::Ok.code())?;
+    w.u32(description)?;
+    w.u32(kind)
+}
+
+/// The description and the kind of an ADOPT reply.
+pub fn read_adopted(reply: &[u8]) -> Result<(u32, u32), Status> {
+    let mut r = Reader::new(reply);
+    match Status::from_code(r.u32()?) {
+        Status::Ok => {}
+        status => return Err(status),
+    }
+    let description = r.u32()?;
+    let kind = r.u32()?;
+    r.finish()?;
+    Ok((description, kind))
 }
 
 pub fn read_accepted(data: &[u8]) -> Result<(u32, Address), Status> {
@@ -899,6 +965,13 @@ mod tests {
                 description: 4,
                 linger: 0,
             },
+            Request::Close {
+                description: 4,
+                linger: CLOSE_MAY_WAIT,
+            },
+            Request::CloseTake(14),
+            Request::Export { description: 4 },
+            Request::Adopt,
             Request::GetOpt {
                 description: 4,
                 name: opt::ERROR,
@@ -1231,5 +1304,26 @@ mod tests {
         let mut w = Writer::new();
         write_received(&mut w, 2, &address(), b"").unwrap();
         assert_eq!(read_received(w.as_bytes()), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn the_reply_of_adopt_carries_the_description_and_its_kind() {
+        let mut w = Writer::new();
+        write_adopted(&mut w, 5 | 3 << 12, DGRAM).unwrap();
+        assert_eq!(read_adopted(w.as_bytes()), Ok((5 | 3 << 12, DGRAM)));
+        let mut w = Writer::new();
+        w.u32(crate::BAD_FD).unwrap();
+        assert!(read_adopted(w.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_close_take_without_a_key_is_refused() {
+        let mut w = Writer::new();
+        w.u64(0).unwrap();
+        let body = Reader::new(w.as_bytes());
+        assert!(matches!(
+            Request::parse(Method::CloseTake, body),
+            Some(Err(Status::BadSize))
+        ));
     }
 }

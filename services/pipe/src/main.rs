@@ -17,12 +17,15 @@
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
+use pipe::carry::{self, Carries, Carry};
 use pipe::ipc::{Block, Flow, IPC_TAG, Out};
 use pipe::{Held, Pipes, Roots, Wakes};
 use posix_credentials::known::Known;
 use proto_init::ServiceArgs;
 use proto_pipe::ipc::{Call, NEED_ID, Who, op as ipc_op};
-use proto_pipe::sock::{Addr, Received, Recv, SEND_MAX, Send};
+use proto_pipe::sock::{
+    Addr, PASS, PASSES_MAX, PASSES_PER_MESSAGE, Received, Recv, SEND_MAX, Send,
+};
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long, watch};
@@ -110,6 +113,10 @@ struct Tables {
     clones: Clones<CLONES>,
     named: Admissions<Handle<Channel>>,
     io: [IoCapture; OPERATIONS],
+    /// The handles of the passes (sockets of the network service in messages),
+    /// by slot, and the slots of the sends that wait, by operation.
+    passes: [Option<Handle<Channel>>; PASSES_MAX],
+    carried: Carries<OPERATIONS>,
 }
 struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -130,6 +137,7 @@ impl Tables {
         unsafe {
             rt::bss::fill_none(addr_of_mut!((*tables).sessions));
             rt::bss::fill_none(addr_of_mut!((*tables).births));
+            rt::bss::fill_none(addr_of_mut!((*tables).passes));
             Pipes::initialize_at(addr_of_mut!((*tables).pipes));
             LongOps::initialize_at(addr_of_mut!((*tables).ops));
             pipe::watches::Pool::initialize_at(addr_of_mut!((*tables).watches));
@@ -184,6 +192,9 @@ fn main(_: u64) -> u64 {
         clones: &mut tables.clones,
         named: &mut tables.named,
         io: &mut tables.io,
+        passes: &mut tables.passes,
+        carried: &mut tables.carried,
+        pending_carry: None,
         step,
         process: Handle::borrowed(start.process.raw()),
         parent: Handle::borrowed(start.parent.raw()),
@@ -218,6 +229,11 @@ struct PipeService {
     clones: &'static mut Clones<CLONES>,
     named: &'static mut Admissions<Handle<Channel>>,
     io: &'static mut [IoCapture; OPERATIONS],
+    passes: &'static mut [Option<Handle<Channel>>; PASSES_MAX],
+    carried: &'static mut Carries<OPERATIONS>,
+    /// The slots of the send that is about to wait: `wait` files them under
+    /// the operation it makes.
+    pending_carry: Option<Carry>,
     /// The copy of the service's channel with NOTIFY, label STEP, and
     /// whether a step was told and not taken.
     step: Handle<Channel>,
@@ -399,6 +415,11 @@ impl PipeService {
         }
         let named_due = self.named_cleanup();
         let more = self.pipes.step(wakes) || self.watches.cleanup_due() || named_due;
+        // A message that held a pass went with its socket: the handle closes
+        // (at most one in a step, as the other descriptions go).
+        if let Some(slot) = self.pipes.pass_closing() {
+            self.passes[slot] = None;
+        }
         self.tell_files();
         more
     }
@@ -467,6 +488,12 @@ impl PipeService {
         if self.watches.cleanup_due() {
             self.kick();
         }
+        // The handles of passes the session's sends hold go with them.
+        for idx in 0..OPERATIONS {
+            if self.carried.get(idx).n != 0 && self.carried.get(idx).label == s.label() {
+                self.drop_carry(idx);
+            }
+        }
         self.ops.gone(&mut s.data.long);
         self.pipes.ipc_forget(s.label());
         self.roots
@@ -495,6 +522,7 @@ impl PipeService {
     /// The operation `key` of `label` at `end` is over.
     fn finish(&mut self, s: &mut Session<Client, 0>, key: Option<u64>, end: u32) {
         if let Some(key) = key {
+            self.drop_carry(((key & 0xffff_ffff) - 1) as usize);
             let label = s.label();
             let finished = self.ops.finish(&mut s.data.long, label, key);
             self.over(s, finished);
@@ -549,6 +577,10 @@ impl PipeService {
                     endpoint,
                     queue: end,
                 };
+                if let Some(carry) = self.pending_carry.take() {
+                    self.carried
+                        .file(((key & 0xffff_ffff) - 1) as usize, label, carry);
+                }
                 let ops = &self.ops;
                 let named = &self.named;
                 if let Err(code) = self.pipes.wait(end, (label, key), |(l, k)| {
@@ -556,6 +588,7 @@ impl PipeService {
                 }) {
                     let finished = self.ops.finish(&mut s.data.long, label, key);
                     self.over(s, finished);
+                    self.drop_carry(((key & 0xffff_ffff) - 1) as usize);
                     return status(code);
                 }
                 long_answer(r, long::Reply::Wait(key))
@@ -663,6 +696,7 @@ impl PipeService {
         if !self.ops.finish(&mut s.data.long, label, cancel.key) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        self.drop_carry(((cancel.key & 0xffff_ffff) - 1) as usize);
         self.over(s, true);
         self.ipc_done(label, cancel.key);
         // The end the operation waits at is the one its start named; a
@@ -1275,12 +1309,16 @@ impl PipeService {
         if !self.take_ok(s, send.key, endpoint) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        let (fds, carry) = match self.send_passes(s, r, &send) {
+            Ok(passes) => passes,
+            Err(answer) => return answer,
+        };
         let mut wakes = Wakes::default();
         let put = self.pipes.sock_send(
             &s.data.held,
             endpoint,
             send.flags,
-            &send.fds[..send.nfds],
+            &fds[..send.nfds],
             &send.to,
             send.bytes,
             &mut wakes,
@@ -1288,17 +1326,124 @@ impl PipeService {
         self.tell(&wakes);
         match put {
             Ok(Some(n)) => {
+                // The message holds the handles now.
+                if let Some(key) = send.key {
+                    self.carried.take(((key & 0xffff_ffff) - 1) as usize);
+                }
                 self.finish(s, send.key, endpoint.id);
                 long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
             }
             Err(code) => {
+                if send.key.is_none() {
+                    self.free_carry(&carry);
+                }
                 self.finish(s, send.key, endpoint.id);
                 status(code)
             }
             Ok(None) => {
                 let queue = self.pipes.send_queue(&s.data.held, endpoint, &send.to).ok();
-                self.wait(s, r, send.key, endpoint, notify, queue)
+                if send.key.is_none() && carry.n != 0 {
+                    self.pending_carry = Some(carry);
+                }
+                let answer = self.wait(s, r, send.key, endpoint, notify, queue);
+                // A wait that was refused leaves the handles unfiled.
+                if let Some(unfiled) = self.pending_carry.take() {
+                    self.free_carry(&unfiled);
+                }
+                answer
             }
+        }
+    }
+
+    /// The handles of the passes of a send. A start brings them as the handles
+    /// of the request, each listed in the descriptions as `PASS + k`, k its
+    /// number among the handles; they go into slots. A take brings no handle
+    /// but the notification's and lists the numbers again: the slots the start
+    /// left, by operation. The descriptions with the slots in place of k, and
+    /// the slots.
+    fn send_passes(
+        &mut self,
+        s: &Session<Client, 0>,
+        r: &mut Request<'_>,
+        send: &Send<'_>,
+    ) -> Result<([u32; proto_pipe::sock::FDS_MAX], Carry), Answer> {
+        let mut fds = send.fds;
+        let listed = carry::listed(&fds[..send.nfds]);
+        let bad = || Answer::Status(Status::BadSize);
+        if let Some(key) = send.key {
+            // A take brings the notification's handle at most; the places are
+            // the operation's.
+            if r.handles.len() > 1 {
+                return Err(bad());
+            }
+            let held = self.carried.get(((key & 0xffff_ffff) - 1) as usize);
+            if held.n != 0 && held.label != s.label() {
+                return Err(bad());
+            }
+            carry::translate(&mut fds[..send.nfds], held.places()).map_err(|_| bad())?;
+            return Ok((fds, held));
+        }
+        if r.handles.len() != listed || !carry::names_each_once(&fds[..send.nfds], listed) {
+            return Err(bad());
+        }
+        if listed == 0 {
+            return Ok((fds, Carry::EMPTY));
+        }
+        // Each handle is a pass of the network service: a channel that can only
+        // be handed on. A channel with more rights (a session of this service
+        // may send, and a clone of it would make a message hold its own
+        // socket for ever) or a copy of this service's own channel is refused.
+        let mut handles: [Option<Handle<Channel>>; PASSES_PER_MESSAGE] = [None, None, None, None];
+        for (k, handle) in handles.iter_mut().enumerate().take(listed) {
+            let fits = matches!(
+                r.handles.info(k),
+                Some((rt::abi::ObjectKind::Channel, rights)) if carry::is_pass_rights(rights)
+            );
+            if !fits {
+                return Err(bad());
+            }
+            let taken = r.handles.take::<Channel>(k).map_err(|_| bad())?;
+            if sys::copy_label(&self.channel, &taken).is_ok() {
+                return Err(bad());
+            }
+            *handle = Some(taken);
+        }
+        let Some(slots) = self.pipes.pass_alloc(listed, s.data.root) else {
+            return Err(status(proto_pipe::sock::NO_BUFFERS));
+        };
+        for (k, handle) in handles.iter_mut().enumerate().take(listed) {
+            self.passes[usize::from(slots[k])] = handle.take();
+        }
+        carry::translate(&mut fds[..send.nfds], &slots[..listed]).map_err(|_| bad())?;
+        Ok((
+            fds,
+            Carry {
+                n: listed as u8,
+                label: s.label(),
+                slots,
+            },
+        ))
+    }
+
+    /// The handles of the slots of `carry` close and the slots are free (a
+    /// send that was refused at its start: at most four).
+    fn free_carry(&mut self, carry: &Carry) {
+        for &slot in carry.places() {
+            self.passes[usize::from(slot)] = None;
+            self.pipes.pass_free(usize::from(slot));
+        }
+    }
+
+    /// The handles the operation `idx` holds are to be closed, one in each step
+    /// of the service (a send cancelled, or its session gone, closes at most 32
+    /// of them at once otherwise).
+    fn drop_carry(&mut self, idx: usize) {
+        let held = self.carried.take(idx);
+        for &slot in held.places() {
+            self.pipes.pass_release(usize::from(slot));
+        }
+        if held.n != 0 {
+            self.kick();
         }
     }
 
@@ -1335,10 +1480,26 @@ impl PipeService {
         match got {
             Ok(Some(got)) => {
                 self.finish(s, recv.key, endpoint.id);
+                // The passes of the message go to the receiver as handles of
+                // the reply, listed in the order of the message as `PASS + k`.
+                let mut fds = got.fds;
+                let mut handles = Outgoing::new();
+                for id in fds[..got.nfds].iter_mut().filter(|id| **id >= PASS) {
+                    let slot = (*id - PASS) as usize;
+                    let handle = self.passes[slot].take();
+                    self.pipes.pass_free(slot);
+                    *id = PASS + PASSES_PER_MESSAGE as u32;
+                    if let Some(handle) = handle {
+                        let k = handles.len() as u32;
+                        if handles.push(handle.erase()).is_ok() {
+                            *id = PASS + k;
+                        }
+                    }
+                }
                 let mut w = proto_wire::Writer::new();
                 let message = Received {
                     flags: got.flags,
-                    fds: got.fds,
+                    fds,
                     nfds: got.nfds,
                     from: got.from,
                     bytes: &out[..got.n],
@@ -1346,7 +1507,10 @@ impl PipeService {
                 if message.write(&mut w).is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                long_answer(r, long::Reply::Ready(w.as_bytes()))
+                match long::Reply::Ready(w.as_bytes()).write(r.reply()) {
+                    Ok(()) => Answer::Reply(handles),
+                    Err(status) => Answer::Status(status),
+                }
             }
             Err(code) => {
                 self.finish(s, recv.key, endpoint.id);

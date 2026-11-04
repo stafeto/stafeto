@@ -13,19 +13,21 @@
 
 use crate::constants::*;
 use crate::long;
+use crate::long::Carried;
 use crate::names::AT_FDCWD;
 use crate::shared;
+use core::cell::RefCell;
 use posix_fs::{Target, Transport};
 use proto_pipe::sock::{
     ADDR_INET, ADDR_NONE, ADDR_UNIX, Addr, DGRAM, DONTWAIT, FDS_MAX, INET, NAME_MAX, OOB,
-    OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF,
-    OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PEEK, Received, Recv, SEND_MAX,
-    SOCK_END, STREAM, Send, UNIX,
+    OPT_ACCEPTCONN, OPT_ATMARK, OPT_BROADCAST, OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_PASSES,
+    OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE, OUT_CTRUNC, OUT_TRUNC, PASS,
+    PASSES_PER_MESSAGE, PEEK, Received, Recv, SEND_MAX, SOCK_END, STREAM, Send, UNIX,
 };
 use proto_pipe::{Endpoint, Method};
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::MESSAGE_MAX;
-use rt::handle::{Channel, Handle};
+use rt::handle::{Channel, Handle, Incoming};
 
 pub const AF_UNIX: i32 = 1;
 pub const AF_INET: i32 = 2;
@@ -34,6 +36,10 @@ pub const SOCK_DGRAM: i32 = 2;
 /// relibc's values: Linux's.
 pub const SOCK_NONBLOCK: i32 = 0o4000;
 pub const SOCK_CLOEXEC: i32 = 0o2000000;
+/// POSIX.1-2024: the descriptor is closed in a forked child (O_CLOFORK).
+pub const SOCK_CLOFORK: i32 = O_CLOFORK;
+/// The flags of a descriptor that `socket`, `socketpair` and `accept4` set.
+pub const KEPT_FLAGS: i32 = SOCK_CLOEXEC | SOCK_CLOFORK;
 pub const SOL_SOCKET: i32 = 1;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
@@ -44,6 +50,13 @@ pub const SO_BROADCAST: i32 = 6;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
 pub const SO_KEEPALIVE: i32 = 9;
+/// The number of the option that counts the handles of passes the pipe service
+/// holds (a number of stafeto's, outside those of Linux): read only.
+pub const SO_STAFETO_PASSES: i32 = 0x7350;
+pub const SO_REUSEPORT: i32 = 15;
+pub const SO_LINGER: i32 = 13;
+pub const SO_RCVTIMEO: i32 = 20;
+pub const SO_SNDTIMEO: i32 = 21;
 pub const SO_ACCEPTCONN: i32 = 30;
 pub const SO_DOMAIN: i32 = 39;
 pub const TCP_NODELAY: i32 = 1;
@@ -182,13 +195,13 @@ fn option(transport: Transport, end: u32, option: u32, set: bool, value: u32) ->
 fn descriptor_flags(flags: i32) -> posix_fs::DescriptorFlags {
     posix_fs::DescriptorFlags {
         close_on_exec: flags & SOCK_CLOEXEC != 0,
-        close_on_fork: false,
+        close_on_fork: flags & SOCK_CLOFORK != 0,
     }
 }
 
 /// The type of `kind` without the flags of the creation, and the flags.
-fn kind_of(kind: i32) -> Result<(u32, bool, bool), i32> {
-    if kind & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+fn kind_of(kind: i32) -> Result<(u32, bool, i32), i32> {
+    if kind & !(0xf | SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
     let ty = match kind & 0xf {
@@ -196,7 +209,7 @@ fn kind_of(kind: i32) -> Result<(u32, bool, bool), i32> {
         SOCK_DGRAM => DGRAM,
         _ => return Err(EPROTOTYPE),
     };
-    Ok((ty, kind & SOCK_NONBLOCK != 0, kind & SOCK_CLOEXEC != 0))
+    Ok((ty, kind & SOCK_NONBLOCK != 0, kind & KEPT_FLAGS))
 }
 
 fn domain_of(domain: i32, protocol: i32, ty: u32) -> Result<u32, i32> {
@@ -234,19 +247,19 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
     if domain == AF_INET && crate::net::session().is_some() {
         return crate::net::socket(domain, kind, protocol);
     }
-    let (ty, nonblock, cloexec) = kind_of(kind)?;
+    let (ty, nonblock, kept) = kind_of(kind)?;
     let domain = domain_of(domain, protocol, ty)?;
     let transport = transport()?;
     let request = create_request(Method::SockCreate, domain, ty, nonblock);
     let mut out = [0; MESSAGE_MAX];
     let n = rpc(transport, request.as_bytes(), &mut out)?;
     let id = Reader::new(&out[..n]).u32().map_err(|_| EIO)?;
-    publish(transport, id, cloexec)
+    publish(transport, id, kept)
 }
 
 /// A descriptor for the socket `id`; the socket goes again on an error.
-fn publish(transport: Transport, id: u32, cloexec: bool) -> Result<i32, i32> {
-    let flags = descriptor_flags(if cloexec { SOCK_CLOEXEC } else { 0 });
+fn publish(transport: Transport, id: u32, kept: i32) -> Result<i32, i32> {
+    let flags = descriptor_flags(kept);
     let inserted = shared::growing(|files| {
         files
             .insert(Target::Pipe(id), flags)
@@ -260,7 +273,7 @@ fn publish(transport: Transport, id: u32, cloexec: bool) -> Result<i32, i32> {
 }
 
 pub fn socketpair(domain: i32, kind: i32, protocol: i32) -> Result<[i32; 2], i32> {
-    let (ty, nonblock, cloexec) = kind_of(kind)?;
+    let (ty, nonblock, kept) = kind_of(kind)?;
     let domain = domain_of(domain, protocol, ty)?;
     if domain != UNIX {
         return Err(EOPNOTSUPP);
@@ -271,14 +284,14 @@ pub fn socketpair(domain: i32, kind: i32, protocol: i32) -> Result<[i32; 2], i32
     let n = rpc(transport, request.as_bytes(), &mut out)?;
     let mut r = Reader::new(&out[..n]);
     let (a, b) = (r.u32().map_err(|_| EIO)?, r.u32().map_err(|_| EIO)?);
-    let first = match publish(transport, a, cloexec) {
+    let first = match publish(transport, a, kept) {
         Ok(fd) => fd,
         Err(errno) => {
             let _ = transport.release(Some(Target::Pipe(b)));
             return Err(errno);
         }
     };
-    match publish(transport, b, cloexec) {
+    match publish(transport, b, kept) {
         Ok(second) => Ok([first, second]),
         Err(errno) => {
             let _ = crate::close(first);
@@ -513,12 +526,13 @@ fn cancel_request(method: Method, key: u64, end: Endpoint, w: &mut Writer) -> Re
 }
 
 /// ACCEPT: a descriptor for the next connection, with the peer's address
-/// into `out` (its true length). `flags` are SOCK_NONBLOCK and SOCK_CLOEXEC.
+/// into `out` (its true length). `flags` are SOCK_NONBLOCK, SOCK_CLOEXEC and
+/// SOCK_CLOFORK.
 pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize), i32> {
     if crate::net::is_net(fd) {
         return crate::net::accept(fd, out, flags);
     }
-    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+    if flags & !(SOCK_NONBLOCK | KEPT_FLAGS) != 0 {
         return Err(EINVAL);
     }
     let point = crate::threads::cancel::Point::begin();
@@ -552,7 +566,7 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
         let peer = Addr::read(&mut r).map_err(|_| EIO)?;
         let inet = peer.kind == ADDR_INET
             || option(transport, end, OPT_DOMAIN, false, 0).is_ok_and(|d| d == INET);
-        let new = publish(transport, id, flags & SOCK_CLOEXEC != 0)?;
+        let new = publish(transport, id, flags & KEPT_FLAGS)?;
         if flags & SOCK_NONBLOCK != 0 {
             let nb = crate::pipes::set_status_flags(transport, id, O_NONBLOCK);
             if let Err(errno) = nb {
@@ -616,6 +630,7 @@ fn option_number(level: i32, name: i32) -> Result<Option<u32>, i32> {
         SO_KEEPALIVE => OPT_KEEPALIVE,
         SO_ACCEPTCONN => OPT_ACCEPTCONN,
         SO_DOMAIN => OPT_DOMAIN,
+        SO_STAFETO_PASSES => OPT_PASSES,
         _ => return Err(ENOPROTOOPT),
     }))
 }
@@ -698,10 +713,35 @@ fn wire_flags(flags: i32) -> Result<u32, i32> {
         | if flags & MSG_OOB != 0 { OOB } else { 0 })
 }
 
+/// Whether the table of handles of the process has room for the handles a
+/// reply of the pipe service may bring (`PASSES_PER_MESSAGE`): four copies of the
+/// thread's own channel are made and closed.
+fn handles_have_room() -> bool {
+    let block = crate::threads::own_block();
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
+        block.channel.load(core::sync::atomic::Ordering::Relaxed),
+    ));
+    let mut spare: [Option<Handle<Channel>>; PASSES_PER_MESSAGE] = [None, None, None, None];
+    for slot in spare.iter_mut() {
+        match rt::sys::handle_duplicate(&channel, rt::abi::Rights::NOTIFY) {
+            Ok(copy) => *slot = Some(copy),
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// The descriptions the SCM_RIGHTS messages of `control` carry: the numbers
-/// of their service's descriptions. EOPNOTSUPP for another kind of message
-/// or a descriptor that is no description of the pipe service.
-fn rights(control: &[u8], ids: &mut [u32; FDS_MAX]) -> Result<usize, i32> {
+/// of their service's descriptions, and for a socket of the network service a
+/// pass (EXPORT) among the handles of the message, listed as `PASS + k` for its
+/// number k there. More than `PASSES_PER_MESSAGE` of those is ETOOMANYREFS.
+/// EOPNOTSUPP for another kind of message or a descriptor that is no
+/// description of either service.
+fn rights(
+    control: &[u8],
+    ids: &mut [u32; FDS_MAX],
+    carried: &RefCell<Carried>,
+) -> Result<usize, i32> {
     let mut at = 0;
     let mut count = 0;
     while control.len() - at >= CMSG_HEADER {
@@ -718,13 +758,23 @@ fn rights(control: &[u8], ids: &mut [u32; FDS_MAX]) -> Result<usize, i32> {
             let fd = i32::from_ne_bytes(*chunk);
             let fd = u32::try_from(fd).map_err(|_| EBADF)?;
             let target = shared::with_fd(fd, |files| files.target(fd).map_err(crate::error))?;
-            let Target::Pipe(id) = target else {
-                return Err(EOPNOTSUPP);
-            };
             if count == FDS_MAX {
                 return Err(EINVAL);
             }
-            ids[count] = id;
+            match target {
+                Target::Pipe(id) => ids[count] = id,
+                Target::Net(_) => {
+                    let mut c = carried.borrow_mut();
+                    let k = c.out.len();
+                    if k == PASSES_PER_MESSAGE {
+                        return Err(ETOOMANYREFS);
+                    }
+                    let pass = crate::net::export(fd as i32)?;
+                    c.out.push(pass.erase()).map_err(|_| EIO)?;
+                    ids[count] = PASS + k as u32;
+                }
+                _ => return Err(EOPNOTSUPP),
+            }
             count += 1;
         }
         at += (len + 7) & !7;
@@ -740,6 +790,7 @@ fn send_once(
     ids: &[u32],
     to: &Addr,
     bytes: &[u8],
+    carried: &RefCell<Carried>,
 ) -> Result<usize, i32> {
     let e = endpoint(end);
     let mut fds = [0; FDS_MAX];
@@ -756,7 +807,7 @@ fn send_once(
     let mut start = Writer::new();
     message(None).write(&mut start).map_err(|_| EIO)?;
     let mut result = [0; 4];
-    let n = long::run_with(
+    let n = long::run_carrying(
         pipes,
         start.as_bytes(),
         |cancel, key, w| {
@@ -768,6 +819,7 @@ fn send_once(
         },
         &mut result,
         &refusal,
+        carried,
     )?;
     if n != 4 {
         return Err(EIO);
@@ -793,13 +845,16 @@ pub fn send(
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire = wire_flags(flags)?;
     let point = crate::threads::cancel::Point::begin();
+    // The passes of the message (sockets of the network service) are handles
+    // of its first request.
+    let carried = RefCell::new(Carried::new());
     let result = with_socket(fd, |transport, end| {
         let to = match name {
             Some(raw) if raw.len() >= 2 => wire_address(transport, end, raw, Use::Reach, 0)?.0,
             _ => Addr::NONE,
         };
         let mut ids = [0; FDS_MAX];
-        let nfds = rights(control, &mut ids)?;
+        let nfds = rights(control, &mut ids, &carried)?;
         let pipes = pipes_of(transport)?;
         let ty = option(transport, end, OPT_TYPE, false, 0)?;
         if ty == DGRAM {
@@ -808,14 +863,22 @@ pub fn send(
             }
             let mut piece = [0u8; SEND_MAX];
             gather(iov, 0, &mut piece[..size]);
-            return send_once(&pipes, end, wire, &ids[..nfds], &to, &piece[..size]);
+            return send_once(
+                &pipes,
+                end,
+                wire,
+                &ids[..nfds],
+                &to,
+                &piece[..size],
+                &carried,
+            );
         }
         let mut done = 0;
         let mut piece = [0u8; SEND_MAX];
         loop {
             let n = gather(iov, done, &mut piece);
             let with = if done == 0 { &ids[..nfds] } else { &[][..] };
-            match send_once(&pipes, end, wire, with, &to, &piece[..n]) {
+            match send_once(&pipes, end, wire, with, &to, &piece[..n], &carried) {
                 // A short count goes on: the next call waits for room, or says
                 // EAGAIN (a non-blocking socket), which ends the send with
                 // the bytes that went.
@@ -904,7 +967,15 @@ pub fn recv(
         let pipes = pipes_of(transport)?;
         let e = endpoint(end);
         let room = control.len().saturating_sub(CMSG_HEADER) / 4;
-        let max_fds = room.min(FDS_MAX) as u32;
+        // A reply that carries handles is refused whole when the table of the
+        // process has no room for them, and the message would be gone from the
+        // stream: with no room for four the call takes no descriptions (the
+        // service then lets them go and says MSG_CTRUNC, the bytes come).
+        let max_fds = if room > 0 && handles_have_room() {
+            room.min(FDS_MAX) as u32
+        } else {
+            0
+        };
         let ty = option(transport, end, OPT_TYPE, false, 0)?;
         let mut total = 0;
         let mut message = Message {
@@ -926,7 +997,8 @@ pub fn recv(
             let mut start = Writer::new();
             req(None).write(&mut start).map_err(|_| EIO)?;
             let mut reply = [0u8; MESSAGE_MAX];
-            let n = long::run_with(
+            let carried = RefCell::new(Carried::new());
+            let n = long::run_carrying(
                 &pipes,
                 start.as_bytes(),
                 |cancel, key, w| {
@@ -938,6 +1010,7 @@ pub fn recv(
                 },
                 &mut reply,
                 &refusal,
+                &carried,
             );
             let n = match n {
                 Ok(n) => n,
@@ -963,6 +1036,7 @@ pub fn recv(
                 message.control_len = install(
                     transport,
                     &got.fds[..got.nfds],
+                    &mut carried.borrow_mut().back,
                     flags & MSG_CMSG_CLOEXEC != 0,
                     control,
                     &mut message.flags,
@@ -987,6 +1061,7 @@ pub fn recv(
 fn install(
     transport: Transport,
     ids: &[u32],
+    passes: &mut Incoming,
     cloexec: bool,
     control: &mut [u8],
     flags: &mut i32,
@@ -997,6 +1072,23 @@ fn install(
     let mut made = [0i32; FDS_MAX];
     let mut count = 0;
     for &id in ids {
+        if id >= PASS {
+            // A pass: the session with the network service adopts it. The
+            // handle closes when it cannot (no session, a refusal).
+            let kept = if cloexec { SOCK_CLOEXEC } else { 0 };
+            let adopted = passes
+                .take::<Channel>((id - PASS) as usize)
+                .map_err(|_| EIO)
+                .and_then(|pass| crate::net::adopt(pass, kept));
+            match adopted {
+                Ok(fd) => {
+                    made[count] = fd;
+                    count += 1;
+                }
+                Err(_) => *flags |= MSG_CTRUNC,
+            }
+            continue;
+        }
         let inserted = shared::growing(|files| {
             files
                 .insert(

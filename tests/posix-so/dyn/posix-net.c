@@ -10,6 +10,7 @@
  * Run as a dynamic program of the image with the network service:
  *
  *   posix-net ADDRESS            every check, a line `posix-net: NAME ok` each
+ *   posix-net ADDRESS NAME       the one check NAME (to find the cause of a failure)
  *   posix-net exec-child N...    the image after `exec` in the check `exec-64`:
  *                                every number named is open and does not close
  *                                on exec
@@ -36,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -123,6 +125,8 @@ static int wait_exit(pid_t child)
 	int status = 0;
 	REQUIRE(waitpid(child, &status, 0) == child);
 	REQUIRE(WIFEXITED(status));
+	if (WEXITSTATUS(status) != 0)
+		printf("posix-net: %s note: a child ended with %d\n", check, WEXITSTATUS(status));
 	return WEXITSTATUS(status);
 }
 
@@ -1358,6 +1362,987 @@ static void epoll_1000(void)
 	close_pairs();
 }
 
+
+/* ---- stage P4a-3: servers and SCM_RIGHTS ---- */
+
+#define SO_STAFETO_PASSES 0x7350
+
+/* The handles of passes the pipe service holds, as `fd` (a socket of AF_UNIX)
+ * tells. */
+static int passes_held(int fd)
+{
+	int value = -1;
+	socklen_t len = sizeof value;
+	REQUIRE(getsockopt(fd, SOL_SOCKET, SO_STAFETO_PASSES, &value, &len) == 0);
+	return value;
+}
+
+/* Waits until the pass count seen through `fd` is `want` (the handles of
+ * messages whose socket went close in steps of their own). */
+static void passes_become(int fd, int want, long ms)
+{
+	long end = now_ms() + ms;
+	while (passes_held(fd) != want) {
+		REQUIRE(now_ms() < end);
+		pause_ms(10);
+	}
+}
+
+/* Whether the peer `c` of a socket sees the end of the stream: its other
+ * end was closed by every holder (`ms` to see it). */
+static int sees_end(int c, long ms)
+{
+	struct pollfd pf = { c, POLLIN, 0 };
+	if (poll(&pf, 1, (int)ms) != 1)
+		return 0;
+	char b;
+	return recv(c, &b, 1, 0) == 0;
+}
+
+/* Sends the descriptors `fds` (n of them) in one message of one byte. */
+static ssize_t send_fds(int u, const int *fds, int n)
+{
+	char data = 'm';
+	struct iovec iov = { &data, 1 };
+	char ctl[CMSG_SPACE(sizeof(int) * 8)];
+	memset(ctl, 0, sizeof ctl);
+	struct msghdr m;
+	memset(&m, 0, sizeof m);
+	m.msg_iov = &iov;
+	m.msg_iovlen = 1;
+	m.msg_control = ctl;
+	m.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+	struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+	h->cmsg_level = SOL_SOCKET;
+	h->cmsg_type = SCM_RIGHTS;
+	h->cmsg_len = CMSG_LEN(sizeof(int) * n);
+	memcpy(CMSG_DATA(h), fds, sizeof(int) * n);
+	return sendmsg(u, &m, 0);
+}
+
+/* Receives one message into `fds` (room for `room`); the count, -1 on an
+ * error; `flags` gets msg_flags. */
+static int recv_fds(int u, int *fds, int room, int *flags)
+{
+	char data;
+	struct iovec iov = { &data, 1 };
+	char ctl[CMSG_SPACE(sizeof(int) * 8)];
+	memset(ctl, 0, sizeof ctl);
+	struct msghdr m;
+	memset(&m, 0, sizeof m);
+	m.msg_iov = &iov;
+	m.msg_iovlen = 1;
+	m.msg_control = ctl;
+	/* Room for exactly `room` descriptors: CMSG_SPACE would pad to one more. */
+	m.msg_controllen = CMSG_LEN(sizeof(int) * room);
+	if (recvmsg(u, &m, 0) != 1)
+		return -1;
+	if (flags)
+		*flags = m.msg_flags;
+	struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+	if (!h)
+		return 0;
+	REQUIRE(h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_RIGHTS);
+	int n = (int)((h->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+	memcpy(fds, CMSG_DATA(h), sizeof(int) * n);
+	return n;
+}
+
+/* A second `listen` with a larger backlog builds the queue up to it: six
+ * connections complete with nobody accepting. */
+static void listen_again(void)
+{
+	int port, lis = listener(1, &port);
+	REQUIRE(listen(lis, 6) == 0);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c[6];
+	for (int i = 0; i < 6; i++) {
+		c[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c[i] >= 0);
+		nonblock(c[i]);
+		errno = 0;
+		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == -1 && errno == EINPROGRESS);
+	}
+	for (int i = 0; i < 6; i++) {
+		struct pollfd pf = { c[i], POLLOUT, 0 };
+		REQUIRE(poll(&pf, 1, 700) == 1 && (pf.revents & POLLOUT) && !(pf.revents & (POLLERR | POLLHUP)));
+	}
+	int s[6];
+	for (int i = 0; i < 6; i++) {
+		s[i] = accept(lis, NULL, NULL);
+		REQUIRE(s[i] >= 0);
+	}
+	for (int i = 0; i < 6; i++)
+		REQUIRE(close(c[i]) == 0 && close(s[i]) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
+/* A SYN to a full queue is dropped without a reset: the second
+ * connect stays under way and goes through once an accept makes room. */
+static void syn_full(void)
+{
+	int port, lis = listener(1, &port);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c1 = socket(AF_INET, SOCK_STREAM, 0);
+	int c2 = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c1 >= 0 && c2 >= 0);
+	REQUIRE(connect(c1, (struct sockaddr *)&a, sizeof a) == 0);
+	nonblock(c2);
+	errno = 0;
+	REQUIRE(connect(c2, (struct sockaddr *)&a, sizeof a) == -1 && errno == EINPROGRESS);
+	/* No reset: nothing is reported on c2 for a while. */
+	struct pollfd pf = { c2, POLLOUT, 0 };
+	REQUIRE(poll(&pf, 1, 400) == 0);
+	int err = -1;
+	socklen_t len = sizeof err;
+	REQUIRE(getsockopt(c2, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0);
+	int s1 = accept(lis, NULL, NULL);
+	REQUIRE(s1 >= 0);
+	/* The SYN comes again and finds room. */
+	pf.revents = 0;
+	REQUIRE(poll(&pf, 1, 8000) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR));
+	int s2 = accept(lis, NULL, NULL);
+	REQUIRE(s2 >= 0);
+	exchange(c2, s2, 'w');
+	REQUIRE(close(c1) == 0 && close(c2) == 0 && close(s1) == 0 && close(s2) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
+/* A new connection on the four of a connection the server closed first (in
+ * TIME-WAIT) is accepted at once. */
+static void timewait_syn(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	struct sockaddr_in me;
+	socklen_t len = sizeof me;
+	REQUIRE(getsockname(c, (struct sockaddr *)&me, &len) == 0);
+	exchange(c, s, 'a');
+	/* The server closes first and stays in TIME-WAIT; the client follows. */
+	REQUIRE(close(s) == 0);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0);
+	pause_ms(100);
+	int c2 = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c2 >= 0);
+	int one = 1;
+	REQUIRE(setsockopt(c2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0);
+	REQUIRE(bind(c2, (struct sockaddr *)&me, sizeof me) == 0);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	nonblock(c2);
+	long began = now_ms();
+	errno = 0;
+	REQUIRE(connect(c2, (struct sockaddr *)&a, sizeof a) == -1 && errno == EINPROGRESS);
+	struct pollfd pf = { c2, POLLOUT, 0 };
+	REQUIRE(poll(&pf, 1, 800) == 1 && (pf.revents & POLLOUT) && !(pf.revents & POLLERR));
+	REQUIRE(now_ms() - began < 800);
+	int s2 = accept(lis, NULL, NULL);
+	REQUIRE(s2 >= 0);
+	exchange(c2, s2, 'b');
+	REQUIRE(close(c2) == 0 && close(s2) == 0 && close(lis) == 0);
+}
+
+/* A listener of the group of SO_REUSEPORT in a child: it accepts what the
+ * hash of the four gives it and reports each with its index on `report`; it
+ * ends after a quiet second. */
+static void group_member(int index, int port, int report, int ready)
+{
+	int lis = socket(AF_INET, SOCK_STREAM, 0);
+	if (lis < 0)
+		_exit(10);
+	int one = 1;
+	if (setsockopt(lis, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0)
+		_exit(11);
+	struct sockaddr_in a = at(INADDR_ANY, port);
+	if (bind(lis, (struct sockaddr *)&a, sizeof a) != 0)
+		_exit(12);
+	if (listen(lis, 16) != 0)
+		_exit(13);
+	char r = 'R';
+	if (write(ready, &r, 1) != 1)
+		_exit(14);
+	for (;;) {
+		struct pollfd pf = { lis, POLLIN, 0 };
+		int n = poll(&pf, 1, 1500);
+		if (n == 0)
+			_exit(0);
+		if (n < 0)
+			_exit(15);
+		int s = accept(lis, NULL, NULL);
+		if (s < 0)
+			_exit(16);
+		char tag = (char)index;
+		if (write(report, &tag, 1) != 1)
+			_exit(17);
+		/* The connection stays open until the child ends. */
+	}
+}
+
+/* Four processes listen on one port; 64 connections from different ports
+ * reach each of them at least once. */
+static void reuseport_4(void)
+{
+	int ready[2], report[2];
+	REQUIRE(pipe(ready) == 0 && pipe(report) == 0);
+	int port = 18090;
+	pid_t kids[4];
+	for (int i = 0; i < 4; i++) {
+		kids[i] = fork();
+		REQUIRE(kids[i] >= 0);
+		if (kids[i] == 0) {
+			close(ready[0]);
+			close(report[0]);
+			group_member(i, port, report[1], ready[1]);
+		}
+	}
+	/* The parent keeps no write end: a member that ended early ends the read. */
+	REQUIRE(close(ready[1]) == 0 && close(report[1]) == 0);
+	for (int i = 0; i < 4; i++) {
+		char r = 0;
+		if (read(ready[0], &r, 1) != 1 || r != 'R') {
+			for (int k = 0; k < 4; k++) {
+				int status = 0;
+				if (waitpid(kids[k], &status, WNOHANG) == kids[k])
+					printf("posix-net: reuseport-4 note: member %d ended with %d\n", k, WEXITSTATUS(status));
+			}
+			fail("a member of the group is not listening");
+		}
+	}
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c[64];
+	long began = now_ms();
+	for (int i = 0; i < 64; i++) {
+		c[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c[i] >= 0);
+		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == 0);
+		long at_ms = now_ms() - began;
+		if (at_ms > 500)
+			printf("posix-net: reuseport-4 note: connect %d done at %ld ms\n", i, at_ms);
+	}
+	int count[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < 64; i++) {
+		char tag = 99;
+		if (read(report[0], &tag, 1) != 1) {
+			printf("posix-net: reuseport-4 note: got %d of 64 reports (%d %d %d %d) at %ld ms\n", i,
+			       count[0], count[1], count[2], count[3], now_ms() - began);
+			for (int k = 0; k < 4; k++) {
+				int status = 0;
+				if (waitpid(kids[k], &status, WNOHANG) == kids[k])
+					printf("posix-net: reuseport-4 note: member %d ended with %d\n", k, WEXITSTATUS(status));
+			}
+			fail("a connection was not accepted");
+		}
+		REQUIRE(tag >= 0 && tag < 4);
+		count[(int)tag]++;
+	}
+	for (int i = 0; i < 4; i++)
+		REQUIRE(count[i] >= 1);
+	printf("posix-net: reuseport-4 note: shares %d %d %d %d\n", count[0], count[1], count[2], count[3]);
+	for (int i = 0; i < 4; i++)
+		REQUIRE(wait_exit(kids[i]) == 0);
+	for (int i = 0; i < 64; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(ready[0]) == 0 && close(report[0]) == 0);
+}
+
+/* The port of a group is held by one user: a process of another user that asks
+ * for the same port is refused, and so is one that did not ask for sharing. */
+static void reuseport_uid(void)
+{
+	int one = 1;
+	int lis = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(lis >= 0);
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == 0);
+	struct sockaddr_in a = at(INADDR_ANY, 18091);
+	REQUIRE(bind(lis, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(listen(lis, 4) == 0);
+	/* The option after bind is refused. */
+	int late = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(late >= 0);
+	struct sockaddr_in other = at(INADDR_ANY, 0);
+	REQUIRE(bind(late, (struct sockaddr *)&other, sizeof other) == 0);
+	errno = 0;
+	REQUIRE(setsockopt(late, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == -1 && errno == EINVAL);
+	REQUIRE(close(late) == 0);
+	/* The same user may join. */
+	int mate = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(mate >= 0);
+	REQUIRE(setsockopt(mate, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == 0);
+	REQUIRE(bind(mate, (struct sockaddr *)&a, sizeof a) == 0);
+	/* One that did not ask for sharing may not. */
+	int plain = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(plain >= 0);
+	errno = 0;
+	REQUIRE(bind(plain, (struct sockaddr *)&a, sizeof a) == -1 && errno == EADDRINUSE);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		if (setuid(1000) != 0)
+			_exit(20);
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (s < 0)
+			_exit(21);
+		int on = 1;
+		if (setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on) != 0)
+			_exit(22);
+		errno = 0;
+		if (bind(s, (struct sockaddr *)&a, sizeof a) != -1 || errno != EADDRINUSE)
+			_exit(23);
+		/* An address that only overlaps is the same: the rule is the user's. */
+		struct sockaddr_in lo = at(LOOPBACK, 18091);
+		int t = socket(AF_INET, SOCK_STREAM, 0);
+		if (t < 0 || setsockopt(t, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on) != 0)
+			_exit(24);
+		errno = 0;
+		if (bind(t, (struct sockaddr *)&lo, sizeof lo) != -1 || errno != EADDRINUSE)
+			_exit(25);
+		_exit(0);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+	REQUIRE(close(lis) == 0 && close(mate) == 0 && close(plain) == 0);
+}
+
+/* SO_LINGER with a time of 0: the close resets the connection. */
+static void linger_0(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	struct linger l = { 1, 0 };
+	REQUIRE(setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0);
+	struct linger back = { 0, 7 };
+	socklen_t len = sizeof back;
+	REQUIRE(getsockopt(s, SOL_SOCKET, SO_LINGER, &back, &len) == 0);
+	REQUIRE(len == sizeof back && back.l_onoff != 0 && back.l_linger == 0);
+	exchange(c, s, 'l');
+	REQUIRE(close(s) == 0);
+	struct pollfd pf = { c, POLLIN, 0 };
+	REQUIRE(poll(&pf, 1, 3000) == 1);
+	char buf[8];
+	errno = 0;
+	REQUIRE(recv(c, buf, sizeof buf, 0) == -1 && errno == ECONNRESET);
+	REQUIRE(close(c) == 0 && close(lis) == 0);
+}
+
+static int linger_peer;
+static volatile ssize_t linger_total;
+
+static void *late_reader(void *arg)
+{
+	(void)arg;
+	pause_ms(450);
+	char buf[2048];
+	ssize_t total = 0;
+	for (;;) {
+		ssize_t n = recv(linger_peer, buf, sizeof buf, 0);
+		if (n <= 0)
+			break;
+		total += n;
+	}
+	linger_total = total;
+	return NULL;
+}
+
+/* A close with a linger time waits until the peer has taken what was sent:
+ * the peer is a socket in the small tier (a window of 4 KiB) that reads late. */
+static void linger_wait(void)
+{
+	int port, lis = listener(4, &port);
+	int junk[300];
+	for (int i = 0; i < 300; i++) {
+		junk[i] = socket(AF_INET, SOCK_DGRAM, 0);
+		REQUIRE(junk[i] >= 0);
+	}
+	int c, s;
+	pair(lis, port, &c, &s);
+	int win = 0;
+	socklen_t len = sizeof win;
+	REQUIRE(getsockopt(c, SOL_SOCKET, SO_RCVBUF, &win, &len) == 0 && win == 4096);
+	struct linger l = { 1, 10 };
+	REQUIRE(setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0);
+	static char block[16384];
+	memset(block, 'L', sizeof block);
+	linger_peer = c;
+	linger_total = -1;
+	pthread_t reader;
+	REQUIRE(pthread_create(&reader, NULL, late_reader, NULL) == 0);
+	REQUIRE(send(s, block, sizeof block, MSG_WAITALL) == (ssize_t)sizeof block);
+	long began = now_ms();
+	REQUIRE(close(s) == 0);
+	long took = now_ms() - began;
+	printf("posix-net: linger-wait took %ld ms\n", took);
+	REQUIRE(took >= 250 && took < 5000);
+	REQUIRE(pthread_join(reader, NULL) == 0);
+	REQUIRE(linger_total == (ssize_t)sizeof block);
+	REQUIRE(close(c) == 0);
+	for (int i = 0; i < 300; i++)
+		REQUIRE(close(junk[i]) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
+/* SO_RCVTIMEO: a receive and an accept end with EAGAIN after the time. */
+static void rcvtimeo(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	struct timeval tv = { 0, 200000 };
+	REQUIRE(setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0);
+	struct timeval back = { 9, 9 };
+	socklen_t len = sizeof back;
+	REQUIRE(getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &back, &len) == 0);
+	REQUIRE(len == sizeof back && back.tv_sec == 0 && back.tv_usec == 200000);
+	char buf[8];
+	long began = now_ms();
+	errno = 0;
+	REQUIRE(recv(s, buf, sizeof buf, 0) == -1 && errno == EAGAIN);
+	long took = now_ms() - began;
+	printf("posix-net: rcvtimeo took %ld ms\n", took);
+	REQUIRE(took >= 190 && took <= 700);
+	/* Data that comes before the time is read. */
+	REQUIRE(send(c, "d", 1, 0) == 1);
+	REQUIRE(recv(s, buf, sizeof buf, 0) == 1);
+	/* The time goes with the description: the listener's too. */
+	REQUIRE(setsockopt(lis, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0);
+	began = now_ms();
+	errno = 0;
+	REQUIRE(accept(lis, NULL, NULL) == -1 && errno == EAGAIN);
+	took = now_ms() - began;
+	REQUIRE(took >= 190 && took <= 700);
+	/* No time: the receive waits (a late byte arrives). */
+	struct timeval none = { 0, 0 };
+	REQUIRE(setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none) == 0);
+	REQUIRE(close(c) == 0);
+	REQUIRE(recv(s, buf, sizeof buf, 0) == 0);
+	REQUIRE(close(s) == 0 && close(lis) == 0);
+}
+
+/* SO_SNDTIMEO: a send into a full buffer ends with EAGAIN after the time. */
+static void sndtimeo(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	struct timeval tv = { 0, 200000 };
+	REQUIRE(setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0);
+	static char block[1024];
+	memset(block, 'S', sizeof block);
+	long total = 0;
+	long began = 0;
+	for (;;) {
+		began = now_ms();
+		ssize_t n = send(c, block, sizeof block, 0);
+		if (n < 0) {
+			REQUIRE(errno == EAGAIN);
+			break;
+		}
+		total += n;
+		REQUIRE(total < 200000);
+	}
+	long took = now_ms() - began;
+	printf("posix-net: sndtimeo took %ld ms after %ld bytes\n", took, total);
+	REQUIRE(total >= 16384);
+	REQUIRE(took >= 190 && took <= 800);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* accept4 and socket with SOCK_CLOFORK: the descriptor is not the child's. */
+static void accept_clofork(void)
+{
+	int port, lis = listener(4, &port);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c >= 0);
+	REQUIRE(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+	int s = accept4(lis, NULL, NULL, SOCK_CLOFORK);
+	REQUIRE(s >= 0);
+	int flags = fcntl(s, F_GETFD);
+	REQUIRE(flags >= 0 && (flags & FD_CLOFORK) && !(flags & FD_CLOEXEC));
+	int plain = socket(AF_INET, SOCK_STREAM | SOCK_CLOFORK | SOCK_CLOEXEC, 0);
+	REQUIRE(plain >= 0);
+	flags = fcntl(plain, F_GETFD);
+	REQUIRE(flags >= 0 && (flags & FD_CLOFORK) && (flags & FD_CLOEXEC));
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		errno = 0;
+		if (fcntl(s, F_GETFD) != -1 || errno != EBADF)
+			_exit(30);
+		if (fcntl(plain, F_GETFD) != -1 || errno != EBADF)
+			_exit(31);
+		if (fcntl(lis, F_GETFD) < 0)
+			_exit(32);
+		_exit(0);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+	exchange(c, s, 'f');
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(plain) == 0 && close(lis) == 0);
+}
+
+/* A socket of TCP goes to another process in a message of AF_UNIX; the child
+ * adds to the stream and the peer reads both parts in order. */
+static void scm_net(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	REQUIRE(passes_held(u[0]) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(u[0]);
+		close(s);
+		close(c);
+		close(lis);
+		int got[4];
+		int fl = 0;
+		int n = recv_fds(u[1], got, 4, &fl);
+		if (n != 1) {
+			printf("posix-net: scm-net note: the child received %d, flags %d, errno %d\n", n, fl, errno);
+			fflush(stdout);
+			_exit(40);
+		}
+		if (write(got[0], "cd", 2) != 2)
+			_exit(41);
+		/* The pass is spent: the service holds none. */
+		int value = -1;
+		socklen_t len = sizeof value;
+		if (getsockopt(u[1], SOL_SOCKET, SO_STAFETO_PASSES, &value, &len) != 0 || value != 0)
+			_exit(42);
+		close(got[0]);
+		_exit(0);
+	}
+	close(u[1]);
+	REQUIRE(send(s, "ab", 2, 0) == 2);
+	REQUIRE(send_fds(u[0], &s, 1) == 1);
+	REQUIRE(passes_held(u[0]) <= 1);
+	REQUIRE(close(s) == 0);
+	REQUIRE(wait_exit(kid) == 0);
+	char buf[8];
+	ssize_t got = 0;
+	while (got < 4) {
+		struct pollfd pf = { c, POLLIN, 0 };
+		REQUIRE(poll(&pf, 1, 3000) == 1);
+		ssize_t n = recv(c, buf + got, sizeof buf - got, 0);
+		REQUIRE(n > 0);
+		got += n;
+	}
+	REQUIRE(got == 4 && memcmp(buf, "abcd", 4) == 0);
+	/* Both holders let go: the peer sees the end. */
+	REQUIRE(sees_end(c, 3000));
+	passes_become(u[0], 0, 3000);
+	REQUIRE(close(c) == 0 && close(u[0]) == 0 && close(lis) == 0);
+}
+
+/* Five sockets in one message are too many; four go. */
+static void scm_five(void)
+{
+	int port, lis = listener(8, &port);
+	int c[5], s[5];
+	for (int i = 0; i < 5; i++)
+		pair(lis, port, &c[i], &s[i]);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	errno = 0;
+	REQUIRE(send_fds(u[0], s, 5) == -1 && errno == ETOOMANYREFS);
+	REQUIRE(passes_held(u[0]) == 0);
+	/* The refusal left the sockets alone. */
+	for (int i = 0; i < 5; i++)
+		exchange(c[i], s[i], (char)('0' + i));
+	REQUIRE(send_fds(u[0], s, 4) == 1);
+	int got[8], flags = 0;
+	REQUIRE(recv_fds(u[1], got, 8, &flags) == 4 && !(flags & MSG_CTRUNC));
+	for (int i = 0; i < 4; i++) {
+		REQUIRE(write(got[i], "k", 1) == 1);
+		char b = 0;
+		REQUIRE(recv(c[i], &b, 1, 0) == 1 && b == 'k');
+		REQUIRE(close(got[i]) == 0);
+	}
+	for (int i = 0; i < 5; i++)
+		REQUIRE(close(c[i]) == 0 && close(s[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+/* A pipe, a socket of TCP and a pipe in one message come in that order. */
+static void scm_mixed(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int p[2], u[2];
+	REQUIRE(pipe(p) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	int out[3] = { p[0], s, p[1] };
+	REQUIRE(send_fds(u[0], out, 3) == 1);
+	int got[8];
+	REQUIRE(recv_fds(u[1], got, 8, NULL) == 3);
+	struct stat st;
+	REQUIRE(fstat(got[0], &st) == 0 && S_ISFIFO(st.st_mode));
+	REQUIRE(fstat(got[1], &st) == 0 && S_ISSOCK(st.st_mode));
+	REQUIRE(fstat(got[2], &st) == 0 && S_ISFIFO(st.st_mode));
+	/* The first is the read end and the third the write end of the pipe. */
+	REQUIRE(write(p[1], "y", 1) == 1);
+	char b = 0;
+	REQUIRE(read(got[0], &b, 1) == 1 && b == 'y');
+	REQUIRE(write(got[2], "x", 1) == 1);
+	REQUIRE(read(p[0], &b, 1) == 1 && b == 'x');
+	/* The second is the socket: it reaches the peer. */
+	REQUIRE(write(got[1], "t", 1) == 1);
+	REQUIRE(recv(c, &b, 1, 0) == 1 && b == 't');
+	for (int i = 0; i < 3; i++)
+		REQUIRE(close(got[i]) == 0);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0 && close(s) == 0 && close(c) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+static int wait_sender;
+static int wait_socket;
+static volatile int wait_done;
+static volatile ssize_t wait_result;
+
+static void *scm_sender(void *arg)
+{
+	(void)arg;
+	wait_result = send_fds(wait_sender, &wait_socket, 1);
+	wait_done = 1;
+	return NULL;
+}
+
+/* The buffer of messages with descriptions is full: a send with a socket
+ * waits, holding the pass, until the reader takes a message. */
+static void scm_wait(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	/* Four messages with a description fill what a socket holds. */
+	for (int i = 0; i < 4; i++)
+		REQUIRE(send_fds(u[0], &p[0], 1) == 1);
+	REQUIRE(passes_held(u[0]) == 0);
+	wait_sender = u[0];
+	wait_socket = s;
+	wait_done = 0;
+	wait_result = -2;
+	pthread_t sender;
+	REQUIRE(pthread_create(&sender, NULL, scm_sender, NULL) == 0);
+	pause_ms(400);
+	REQUIRE(wait_done == 0);
+	/* The send that waits holds the pass. */
+	REQUIRE(passes_held(u[0]) == 1);
+	int got[4];
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(close(got[0]) == 0);
+	long end = now_ms() + 3000;
+	while (!wait_done) {
+		REQUIRE(now_ms() < end);
+		pause_ms(10);
+	}
+	REQUIRE(pthread_join(sender, NULL) == 0);
+	REQUIRE(wait_result == 1);
+	for (int i = 0; i < 3; i++) {
+		REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+		REQUIRE(close(got[0]) == 0);
+	}
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(write(got[0], "z", 1) == 1);
+	char b = 0;
+	REQUIRE(recv(c, &b, 1, 0) == 1 && b == 'z');
+	REQUIRE(close(got[0]) == 0 && close(s) == 0);
+	passes_become(u[0], 0, 3000);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0 && close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+/* The process that was to receive a socket ends without reading: the socket
+ * goes with its message, and the peer sees the end. */
+static void scm_dead_receiver(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2], gate[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0 && pipe(gate) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(u[0]);
+		close(gate[1]);
+		close(s);
+		close(c);
+		close(lis);
+		char b;
+		/* Waits for the word, then ends without reading its socket. */
+		if (read(gate[0], &b, 1) != 1)
+			_exit(50);
+		_exit(0);
+	}
+	close(u[1]);
+	close(gate[0]);
+	int before = passes_held(u[0]);
+	REQUIRE(before == 0);
+	REQUIRE(send_fds(u[0], &s, 1) == 1);
+	REQUIRE(passes_held(u[0]) == 1);
+	REQUIRE(close(s) == 0);
+	/* The description lives in the message: no end seen. */
+	REQUIRE(!sees_end(c, 300));
+	REQUIRE(write(gate[1], "g", 1) == 1);
+	REQUIRE(wait_exit(kid) == 0);
+	passes_become(u[0], before, 3000);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0 && close(u[0]) == 0 && close(gate[1]) == 0 && close(lis) == 0);
+}
+
+/* The socket that holds a message with a socket closes: the pass goes. */
+static void scm_close_socket(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	int before = passes_held(u[0]);
+	REQUIRE(send_fds(u[0], &s, 1) == 1);
+	REQUIRE(passes_held(u[0]) == before + 1);
+	REQUIRE(close(s) == 0);
+	REQUIRE(!sees_end(c, 300));
+	REQUIRE(close(u[1]) == 0);
+	passes_become(u[0], before, 3000);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0 && close(u[0]) == 0 && close(lis) == 0);
+}
+
+/* A control buffer with room for one of two sockets: MSG_CTRUNC, one
+ * descriptor, and the other socket is gone (its peer sees the end). */
+static void scm_ctrunc(void)
+{
+	int port, lis = listener(4, &port);
+	int c[2], s[2];
+	for (int i = 0; i < 2; i++)
+		pair(lis, port, &c[i], &s[i]);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	REQUIRE(send_fds(u[0], s, 2) == 1);
+	REQUIRE(close(s[0]) == 0 && close(s[1]) == 0);
+	int got[4], flags = 0;
+	REQUIRE(recv_fds(u[1], got, 1, &flags) == 1);
+	REQUIRE(flags & MSG_CTRUNC);
+	REQUIRE(write(got[0], "1", 1) == 1);
+	char b = 0;
+	REQUIRE(recv(c[0], &b, 1, 0) == 1 && b == '1');
+	REQUIRE(sees_end(c[1], 3000));
+	REQUIRE(!sees_end(c[0], 200));
+	passes_become(u[0], 0, 3000);
+	REQUIRE(close(got[0]) == 0);
+	REQUIRE(sees_end(c[0], 3000));
+	for (int i = 0; i < 2; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+static void on_retry_alarm(int sig)
+{
+	(void)sig;
+}
+
+/* A send with a socket that waits is ended by a signal: the passes it held go,
+ * and the same send made again (the library exports the socket again) goes
+ * through once the reader has taken a message. */
+static void scm_retry(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int u[2], p[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0 && pipe(p) == 0);
+	for (int i = 0; i < 4; i++)
+		REQUIRE(send_fds(u[0], &p[0], 1) == 1);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_retry_alarm;
+	REQUIRE(sigaction(SIGALRM, &sa, NULL) == 0);
+	alarm(1);
+	errno = 0;
+	REQUIRE(send_fds(u[0], &s, 1) == -1 && errno == EINTR);
+	/* The handles the cancelled send held close in steps of the service. */
+	passes_become(u[0], 0, 3000);
+	REQUIRE(!sees_end(c, 200));
+	int got[4];
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(close(got[0]) == 0);
+	REQUIRE(send_fds(u[0], &s, 1) == 1);
+	for (int i = 0; i < 3; i++) {
+		REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+		REQUIRE(close(got[0]) == 0);
+	}
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(write(got[0], "r", 1) == 1);
+	char b = 0;
+	REQUIRE(recv(c, &b, 1, 0) == 1 && b == 'r');
+	REQUIRE(close(got[0]) == 0 && close(s) == 0);
+	REQUIRE(sees_end(c, 3000));
+	REQUIRE(close(c) == 0 && close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
+/* A root (a program and its children) holds eight passes at once: a ninth is
+ * ENOBUFS, whichever of its processes sends it. */
+static void scm_root(void)
+{
+	int port, lis = listener(16, &port);
+	int c[10], s[10];
+	for (int i = 0; i < 10; i++)
+		pair(lis, port, &c[i], &s[i]);
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	REQUIRE(send_fds(u[0], s, 4) == 1);
+	REQUIRE(send_fds(u[0], s + 4, 4) == 1);
+	REQUIRE(passes_held(u[0]) == 8);
+	errno = 0;
+	REQUIRE(send_fds(u[0], s + 8, 1) == -1 && errno == ENOBUFS);
+	REQUIRE(passes_held(u[0]) == 8);
+	/* The children of the root share its eight. */
+	int v[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, v) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(u[0]);
+		close(u[1]);
+		errno = 0;
+		if (send_fds(v[0], s + 9, 1) != -1 || errno != ENOBUFS)
+			_exit(60);
+		_exit(0);
+	}
+	REQUIRE(wait_exit(kid) == 0);
+	/* The reader takes both messages: the places come back. */
+	int got[4];
+	for (int i = 0; i < 2; i++) {
+		REQUIRE(recv_fds(u[1], got, 4, NULL) == 4);
+		for (int k = 0; k < 4; k++)
+			REQUIRE(close(got[k]) == 0);
+	}
+	for (int i = 0; i < 10; i++)
+		REQUIRE(close(s[i]) == 0);
+	passes_become(u[0], 0, 3000);
+	REQUIRE(send_fds(u[0], &c[0], 1) == 1);
+	REQUIRE(recv_fds(u[1], got, 4, NULL) == 1);
+	REQUIRE(close(got[0]) == 0);
+	for (int i = 0; i < 10; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(v[0]) == 0 && close(v[1]) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
+static int depart_u;
+static int depart_sock[8];
+
+static void *depart_sender(void *arg)
+{
+	int k = (int)(intptr_t)arg;
+	send_fds(depart_u, depart_sock + 4 * k, 4);
+	return NULL;
+}
+
+/* A process ends with two sends of four sockets each waiting: the handles
+ * they held go in steps, and the peers of the eight sockets see the end. */
+static void scm_depart(void)
+{
+	int port, lis = listener(16, &port);
+	int c[8], s[8];
+	int u[2], p[2], gate[2];
+	for (int i = 0; i < 8; i++)
+		pair(lis, port, &c[i], &s[i]);
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0 && pipe(p) == 0 && pipe(gate) == 0);
+	pid_t kid = fork();
+	REQUIRE(kid >= 0);
+	if (kid == 0) {
+		close(gate[1]);
+		for (int i = 0; i < 4; i++)
+			if (send_fds(u[0], &p[0], 1) != 1)
+				_exit(70);
+		depart_u = u[0];
+		memcpy(depart_sock, s, sizeof s);
+		pthread_t t[2];
+		for (int k = 0; k < 2; k++)
+			if (pthread_create(&t[k], NULL, depart_sender, (void *)(intptr_t)k) != 0)
+				_exit(71);
+		char b;
+		if (read(gate[0], &b, 1) != 1)
+			_exit(72);
+		_exit(0);
+	}
+	close(gate[0]);
+	for (int i = 0; i < 8; i++)
+		REQUIRE(close(s[i]) == 0);
+	/* Both sends wait with their eight handles. */
+	long end = now_ms() + 3000;
+	while (passes_held(u[1]) != 8) {
+		REQUIRE(now_ms() < end);
+		pause_ms(10);
+	}
+	REQUIRE(write(gate[1], "g", 1) == 1);
+	REQUIRE(wait_exit(kid) == 0);
+	passes_become(u[1], 0, 5000);
+	for (int i = 0; i < 8; i++)
+		REQUIRE(sees_end(c[i], 3000));
+	for (int i = 0; i < 8; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(gate[1]) == 0 && close(lis) == 0);
+}
+
+static int excl_ep[2];
+static volatile int excl_woke;
+
+static void *excl_waiter(void *arg)
+{
+	int k = (int)(intptr_t)arg;
+	struct epoll_event ev[4];
+	int n = epoll_wait(excl_ep[k], ev, 4, 2500);
+	if (n == 1)
+		excl_woke++;
+	return NULL;
+}
+
+/* Two sets wait on one listening socket with EPOLLEXCLUSIVE: one connection
+ * wakes one of them, the next wakes the other. */
+static void epoll_exclusive(void)
+{
+	int port, lis = listener(4, &port);
+	for (int i = 0; i < 2; i++) {
+		excl_ep[i] = ep_new();
+		ep_add(excl_ep[i], lis, EPOLLIN | EPOLLEXCLUSIVE, (uint64_t)i);
+	}
+	excl_woke = 0;
+	pthread_t t[2];
+	for (int i = 0; i < 2; i++)
+		REQUIRE(pthread_create(&t[i], NULL, excl_waiter, (void *)(intptr_t)i) == 0);
+	pause_ms(300);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c1 = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c1 >= 0);
+	REQUIRE(connect(c1, (struct sockaddr *)&a, sizeof a) == 0);
+	pause_ms(600);
+	REQUIRE(excl_woke == 1);
+	int c2 = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c2 >= 0);
+	REQUIRE(connect(c2, (struct sockaddr *)&a, sizeof a) == 0);
+	for (int i = 0; i < 2; i++)
+		REQUIRE(pthread_join(t[i], NULL) == 0);
+	REQUIRE(excl_woke == 2);
+	REQUIRE(close(c1) == 0 && close(c2) == 0);
+	for (int i = 0; i < 2; i++)
+		REQUIRE(close(excl_ep[i]) == 0);
+	REQUIRE(close(lis) == 0);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -1394,6 +2379,27 @@ static const struct {
 	{ "select-high", select_high },
 	{ "fionread", fionread },
 	{ "epoll-1000", epoll_1000 },
+	{ "listen-again", listen_again },
+	{ "syn-full", syn_full },
+	{ "timewait-syn", timewait_syn },
+	{ "reuseport-4", reuseport_4 },
+	{ "reuseport-uid", reuseport_uid },
+	{ "linger-0", linger_0 },
+	{ "linger-wait", linger_wait },
+	{ "rcvtimeo", rcvtimeo },
+	{ "sndtimeo", sndtimeo },
+	{ "accept-clofork", accept_clofork },
+	{ "scm-net", scm_net },
+	{ "scm-five", scm_five },
+	{ "scm-mixed", scm_mixed },
+	{ "scm-wait", scm_wait },
+	{ "scm-dead-receiver", scm_dead_receiver },
+	{ "scm-close-socket", scm_close_socket },
+	{ "scm-ctrunc", scm_ctrunc },
+	{ "scm-retry", scm_retry },
+	{ "scm-root", scm_root },
+	{ "scm-depart", scm_depart },
+	{ "epoll-exclusive", epoll_exclusive },
 };
 
 int main(int argc, char **argv)
@@ -1404,17 +2410,21 @@ int main(int argc, char **argv)
 		return spawn_child(atoi(argv[2]));
 	if (argc >= 3 && strcmp(argv[1], "epoll-child") == 0)
 		return epoll_child(atoi(argv[2]));
-	if (argc != 2) {
-		printf("posix-net: usage: posix-net ADDRESS\n");
+	if (argc != 2 && argc != 3) {
+		printf("posix-net: usage: posix-net ADDRESS [NAME]\n");
 		return 2;
 	}
 	int count = (int)(sizeof CHECKS / sizeof CHECKS[0]);
+	int ran = 0;
 	for (int i = 0; i < count; i++) {
+		if (argc == 3 && strcmp(argv[2], CHECKS[i].name) != 0)
+			continue;
 		check = CHECKS[i].name;
 		CHECKS[i].run();
 		printf("posix-net: %s ok\n", CHECKS[i].name);
 		fflush(stdout);
+		ran++;
 	}
-	printf("posix-net: %d checks ok\n", count);
+	printf("posix-net: %d checks ok\n", ran);
 	return 0;
 }

@@ -365,6 +365,16 @@ impl<const D: usize> NetDevice<D> {
         matches!(self.held, Some(Held::Wire { .. }))
     }
 
+    /// Drops the frame `stage` took without showing it to the stack: its
+    /// buffer goes back where it came from.
+    pub fn discard_held(&mut self) {
+        match self.held.take() {
+            Some(Held::Wire { buffer, .. }) => self.rx.give(buffer),
+            Some(Held::Loop { .. }) => self.looped.done(),
+            None => {}
+        }
+    }
+
     /// Puts the frame `stage` took aside for the next step of receiving.
     pub fn defer_held(&mut self) {
         if let Some(Held::Wire { buffer, length }) = self.held.take() {

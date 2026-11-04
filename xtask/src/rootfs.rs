@@ -1039,6 +1039,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
     "boot-net-curl-steps.img",
+    "boot-posix-net-steps.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1121,7 +1122,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
-        "boot-net.img" | "boot-net-curl-steps.img" => net_files(name),
+        "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
@@ -1613,6 +1614,7 @@ mod tests {
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),
                 "boot-net-vz2.img" | "boot-net-vz2-static.img" => crate::net::vz_programs(true),
                 "boot-net-curl-steps.img" => crate::net_curl::steps_programs(),
+                "boot-posix-net-steps.img" => crate::posix_net::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,
                 "boot-net-probe-two.img" => &crate::net_probe::TWO_PROGRAMS,

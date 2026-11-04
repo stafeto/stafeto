@@ -14,7 +14,10 @@
 //! Descriptions sent as SCM_RIGHTS stay referenced by the message
 //! (`Anc`) until they are received or the socket that holds them goes; a
 //! socket that goes gives its messages' references to `limbo`, which `step`
-//! lets go of one at a time. Every operation is O(1) or bounded by
+//! lets go of one at a time. A socket of the network service travels as a
+//! pass, a handle the service holds in a slot (`pass_alloc`): the message
+//! lists it as `PASS + slot`, and the program of the service keeps the handles
+//! by slot and closes one when `pass_closing` names its slot. Every operation is O(1) or bounded by
 //! SOCKETS, FDS_MAX or the size of one message.
 
 use super::*;
@@ -26,6 +29,7 @@ use proto_pipe::sock::{
     OPT_DOMAIN, OPT_ERROR, OPT_KEEPALIVE, OPT_RCVBUF, OPT_REUSEADDR, OPT_SNDBUF, OPT_TYPE,
     OUT_CTRUNC, OUT_TRUNC, PEEK, REFUSED, RING, SEND_MAX, STREAM, TOO_BIG, TOO_MANY_REFS, UNIX,
 };
+use proto_pipe::sock::{OPT_PASSES, PASS, PASSES_MAX, PASSES_PER_ROOT};
 use proto_wire::{Reader, Writer};
 
 /// The live sockets one session made at most.
@@ -166,6 +170,12 @@ pub struct Sockets {
     /// The descriptions of messages whose socket went, to let go of.
     limbo: [u32; INFLIGHT_MAX],
     limbo_len: usize,
+    /// The slots of the handles of passes in use, and those whose handle is
+    /// to be closed (a bit each).
+    pass_used: u32,
+    pass_closing: u32,
+    /// The root that holds each place in use.
+    pass_root: [u64; PASSES_MAX],
     inflight: usize,
     port: u32,
     /// For each datagram socket that was read, the sockets connected to it
@@ -193,6 +203,9 @@ impl Sockets {
             dirty: 0,
             limbo: [0; INFLIGHT_MAX],
             limbo_len: 0,
+            pass_used: 0,
+            pass_closing: 0,
+            pass_root: [0; PASSES_MAX],
             inflight: 0,
             port: 0,
             owed: [0; SOCKETS],
@@ -202,7 +215,7 @@ impl Sockets {
 
     /// Whether `step` has work.
     pub fn due(&self) -> bool {
-        self.dirty != 0 || self.limbo_len != 0 || self.owed_any != 0
+        self.dirty != 0 || self.limbo_len != 0 || self.owed_any != 0 || self.pass_closing != 0
     }
 
     /// The operations that wait at the queue `queue` (DESCRIPTIONS + slot).
@@ -258,7 +271,7 @@ impl Sockets {
     /// The message `anc` is out of flight.
     fn unfly(&mut self, anc: &Anc) {
         for &id in &anc.ids[..usize::from(anc.n)] {
-            if id & SOCK_END != 0 {
+            if id < PASS && id & SOCK_END != 0 {
                 let s = &mut self.s[(id & !SOCK_END) as usize];
                 s.flying = s.flying.saturating_sub(1);
             }
@@ -858,6 +871,8 @@ impl Pipes {
             OPT_ACCEPTCONN => Ok(u32::from(s.listening)),
             OPT_ATMARK => Ok(u32::from(s.oob && s.oob_at == s.rx_total)),
             OPT_DOMAIN => Ok(s.domain),
+            OPT_PASSES if set => Err(NO_OPTION),
+            OPT_PASSES => Ok(self.sockets.pass_used.count_ones()),
             _ => Err(NO_OPTION),
         }
     }
@@ -866,6 +881,10 @@ impl Pipes {
     /// sockets the session holds.
     fn travelers(&self, held: &Held, ids: &[u32]) -> Result<(), u32> {
         for &id in ids {
+            // A pass is a handle of the service's program, checked there.
+            if id >= PASS {
+                continue;
+            }
             if id & NAMED_END != 0 {
                 return Err(NOT_SUPPORTED);
             }
@@ -877,7 +896,9 @@ impl Pipes {
     }
 
     fn desc_ref(&mut self, id: u32) {
-        if id & SOCK_END != 0 {
+        if id >= PASS {
+            // The pass has its slot: one holder.
+        } else if id & SOCK_END != 0 {
             self.sockets.s[(id & !SOCK_END) as usize].refs += 1;
         } else {
             let (index, write) = proto_pipe::end_of(id);
@@ -887,7 +908,10 @@ impl Pipes {
 
     fn desc_unref(&mut self, id: u32, wakes: &mut Wakes) {
         let mut mine = Wakes::default();
-        if id & SOCK_END != 0 {
+        if id >= PASS {
+            // The handle of the pass closes: the program of the service does it.
+            self.sockets.pass_closing |= 1 << (id - PASS);
+        } else if id & SOCK_END != 0 {
             self.sock_unref((id & !SOCK_END) as usize, 1, &mut mine);
         } else {
             self.unref(id as usize, 1, &mut mine);
@@ -1002,7 +1026,7 @@ impl Pipes {
         // own in flight, or to a socket that travels itself: such a cycle
         // would keep its sockets for ever.
         for &id in fds {
-            if id & SOCK_END != 0 {
+            if id < PASS && id & SOCK_END != 0 {
                 let s = (id & !SOCK_END) as usize;
                 if s == p || self.sockets.s[s].anc_len != 0 || self.sockets.s[p].flying != 0 {
                     return Err(TOO_MANY_REFS);
@@ -1023,7 +1047,7 @@ impl Pipes {
         for (slot, &id) in anc.ids.iter_mut().zip(fds) {
             *slot = id;
             self.desc_ref(id);
-            if id & SOCK_END != 0 {
+            if id < PASS && id & SOCK_END != 0 {
                 self.sockets.s[(id & !SOCK_END) as usize].flying += 1;
             }
         }
@@ -1213,7 +1237,7 @@ impl Pipes {
             let fresh = anc.ids[..usize::from(anc.n)]
                 .iter()
                 .take(max_fds)
-                .filter(|&&id| !held.holds(id))
+                .filter(|&&id| id < PASS && !held.holds(id))
                 .count();
             if held.count() + fresh > HELD_MAX {
                 return Err(MFILE);
@@ -1234,6 +1258,11 @@ impl Pipes {
                         result.flags |= OUT_CTRUNC;
                         self.sockets.limbo_push(id);
                         self.sockets.inflight += 1;
+                    } else if id >= PASS {
+                        // A pass goes to the session as a handle: the program
+                        // of the service moves it into the reply.
+                        deliver[count] = id;
+                        count += 1;
                     } else if held.holds(id) {
                         // The session has it: this reference goes.
                         self.sockets.limbo_push(id);
@@ -1459,6 +1488,63 @@ impl Pipes {
             self.sockets.inflight -= 1;
             self.desc_unref(id, wakes);
         }
+    }
+
+    /// `n` slots for the handles of the passes of one message (at most
+    /// `PASSES_PER_MESSAGE`) for the root `root`: None when the service holds
+    /// `PASSES_MAX` already or the root `PASSES_PER_ROOT`.
+    pub fn pass_alloc(
+        &mut self,
+        n: usize,
+        root: u64,
+    ) -> Option<[u8; proto_pipe::sock::PASSES_PER_MESSAGE]> {
+        let mut slots = [0u8; proto_pipe::sock::PASSES_PER_MESSAGE];
+        let free = !self.sockets.pass_used & (u32::MAX >> (32 - PASSES_MAX));
+        let held = (0..PASSES_MAX)
+            .filter(|&k| self.sockets.pass_used >> k & 1 != 0 && self.sockets.pass_root[k] == root)
+            .count();
+        if n > slots.len() || (free.count_ones() as usize) < n || held + n > PASSES_PER_ROOT {
+            return None;
+        }
+        let mut left = free;
+        for slot in slots.iter_mut().take(n) {
+            let k = left.trailing_zeros();
+            left &= left - 1;
+            *slot = k as u8;
+            self.sockets.pass_used |= 1 << k;
+            self.sockets.pass_root[k as usize] = root;
+        }
+        Some(slots)
+    }
+
+    /// The handle of slot `slot` is out of the service's hands (closed or
+    /// given to a receiver): the slot is free.
+    pub fn pass_free(&mut self, slot: usize) {
+        self.sockets.pass_used &= !(1 << slot);
+        self.sockets.pass_closing &= !(1 << slot);
+    }
+
+    /// A slot whose handle is to be closed, if one waits: it is free after
+    /// the call (the caller closes the handle).
+    pub fn pass_closing(&mut self) -> Option<usize> {
+        if self.sockets.pass_closing == 0 {
+            return None;
+        }
+        let slot = self.sockets.pass_closing.trailing_zeros() as usize;
+        self.pass_free(slot);
+        Some(slot)
+    }
+
+    /// The handle of slot `slot` is to be closed by a step of its own (a send
+    /// that was cancelled, a session that went): the slot stays in use until
+    /// then.
+    pub fn pass_release(&mut self, slot: usize) {
+        self.sockets.pass_closing |= 1 << slot;
+    }
+
+    /// The handles of passes the service holds.
+    pub fn passes_held(&self) -> usize {
+        self.sockets.pass_used.count_ones() as usize
     }
 
     /// The sockets in use.
@@ -2291,5 +2377,246 @@ mod tests {
         );
         assert_eq!(p.sock_option(&held, s, OPT_TYPE, true, 1), Err(NO_OPTION));
         assert_eq!(p.sock_option(&held, s, 99, false, 0), Err(NO_OPTION));
+    }
+
+    #[test]
+    fn passes_arrive_in_the_order_of_the_message_among_descriptions() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        let (_rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
+        let slots = p.pass_alloc(2, 1).unwrap();
+        let ids = [PASS + u32::from(slots[0]), wr, PASS + u32::from(slots[1])];
+        assert_eq!(
+            p.sock_send(&a, sock(x), 0, &ids, &Addr::NONE, b"m", &mut w),
+            Ok(Some(1))
+        );
+        assert_eq!(p.in_flight(), 3);
+        let mut b = p.clone_endpoints(&a, &[sock(y)]).unwrap();
+        let mut out = [0; 4];
+        let got = p
+            .sock_recv(&mut b, sock(y), 0, &mut out, 8, &mut w)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got.fds[..got.nfds], &ids);
+        // The pass is no description of the session: nothing joined `held`.
+        assert!(!b.holds(ids[0]));
+        assert!(b.holds(wr));
+        assert_eq!(p.in_flight(), 0);
+        // The receiver took the handles: the slots are free once it says so.
+        assert_eq!(p.passes_held(), 2);
+        p.pass_free(usize::from(slots[0]));
+        p.pass_free(usize::from(slots[1]));
+        assert_eq!(p.passes_held(), 0);
+    }
+
+    #[test]
+    fn a_peek_gives_no_passes_and_leaves_them_in_the_message() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
+        p.sock_send(
+            &a,
+            sock(x),
+            0,
+            &[PASS + u32::from(slot)],
+            &Addr::NONE,
+            b"m",
+            &mut w,
+        )
+        .unwrap();
+        let mut out = [0; 4];
+        let got = p
+            .sock_recv(&mut a, sock(y), PEEK, &mut out, 8, &mut w)
+            .unwrap()
+            .unwrap();
+        assert_eq!((got.n, got.nfds), (1, 0));
+        assert_eq!(p.in_flight(), 1);
+        let got = p
+            .sock_recv(&mut a, sock(y), 0, &mut out, 8, &mut w)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got.fds[..got.nfds], &[PASS + u32::from(slot)]);
+    }
+
+    #[test]
+    fn a_pass_over_the_room_of_the_caller_goes_to_limbo_and_its_handle_closes() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
+        p.sock_send(
+            &a,
+            sock(x),
+            0,
+            &[PASS + u32::from(slot)],
+            &Addr::NONE,
+            b"m",
+            &mut w,
+        )
+        .unwrap();
+        let mut out = [0; 4];
+        let got = p
+            .sock_recv(&mut a, sock(y), 0, &mut out, 0, &mut w)
+            .unwrap()
+            .unwrap();
+        assert_eq!((got.nfds, got.flags), (0, OUT_CTRUNC));
+        assert_eq!(p.pass_closing(), None, "the step has not let go yet");
+        p.sock_step(&mut w);
+        assert_eq!(p.pass_closing(), Some(usize::from(slot)));
+        assert_eq!(p.passes_held(), 0);
+        assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_socket_that_goes_with_passes_in_flight_lets_their_handles_go_in_steps() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        let slots = p.pass_alloc(3, 1).unwrap();
+        let ids = slots.map(|s| PASS + u32::from(s));
+        p.sock_send(&a, sock(x), 0, &ids[..3], &Addr::NONE, b"m", &mut w)
+            .unwrap();
+        // The receiver's socket goes: the message's references go to limbo.
+        p.sock_close(&mut a, sock(y), &mut w).unwrap();
+        p.sock_close(&mut a, sock(x), &mut w).unwrap();
+        let mut closed = 0;
+        for _ in 0..16 {
+            p.step(&mut w);
+            while p.pass_closing().is_some() {
+                closed += 1;
+            }
+        }
+        assert_eq!(closed, 3);
+        assert_eq!(p.passes_held(), 0);
+        assert_eq!(p.in_flight(), 0);
+        assert_eq!(p.live_sockets(), 0);
+    }
+
+    #[test]
+    fn the_service_holds_thirty_two_passes_and_no_more() {
+        let mut p = pipes();
+        for k in 0..PASSES_MAX / 4 {
+            // Four roots hold eight each.
+            assert!(p.pass_alloc(4, 1 + (k / 2) as u64).is_some());
+        }
+        assert_eq!(p.passes_held(), PASSES_MAX);
+        assert_eq!(p.pass_alloc(1, 9), None);
+        p.pass_free(5);
+        assert_eq!(p.pass_alloc(2, 9), None, "one slot is free, two are asked");
+        assert_eq!(p.pass_alloc(1, 9).map(|s| s[0]), Some(5));
+        assert_eq!(p.pass_alloc(5, 9), None, "a message holds four at most");
+    }
+
+    #[test]
+    fn a_root_holds_eight_passes_and_the_others_still_get_theirs() {
+        let mut p = pipes();
+        assert!(p.pass_alloc(4, 1).is_some());
+        assert!(p.pass_alloc(4, 1).is_some());
+        assert_eq!(p.passes_held(), PASSES_PER_ROOT);
+        assert_eq!(p.pass_alloc(1, 1), None, "the ninth of one root");
+        let other = p.pass_alloc(4, 2).unwrap();
+        assert_eq!(other[0], PASSES_PER_ROOT as u8);
+        // A place given back makes room for the root again.
+        p.pass_free(3);
+        assert_eq!(p.pass_alloc(1, 1).map(|s| s[0]), Some(3));
+    }
+
+    #[test]
+    fn a_pass_in_a_high_place_travels_and_arrives_as_itself() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        // Roots of eight fill the places below 31.
+        for root in 1..=3u64 {
+            p.pass_alloc(4, root).unwrap();
+            p.pass_alloc(4, root).unwrap();
+        }
+        let slot = p.pass_alloc(1, 4).unwrap()[0];
+        assert_eq!(slot, 24);
+        for root in 4..=4u64 {
+            p.pass_alloc(4, root).unwrap();
+        }
+        let top = p.pass_alloc(3, 5).unwrap();
+        assert_eq!(top[2], 31);
+        let (_rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
+        let ids = [wr, PASS + u32::from(top[2])];
+        assert_eq!(
+            p.sock_send(&a, sock(x), 0, &ids, &Addr::NONE, b"m", &mut w),
+            Ok(Some(1))
+        );
+        let mut b = p.clone_endpoints(&a, &[sock(y)]).unwrap();
+        let mut out = [0; 4];
+        let got = p
+            .sock_recv(&mut b, sock(y), 0, &mut out, 8, &mut w)
+            .unwrap()
+            .unwrap();
+        // The pass of place 31 is itself and no description of the session.
+        assert_eq!(&got.fds[..got.nfds], &ids);
+        assert!(b.holds(wr) && !b.holds(0));
+        assert_eq!(p.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_pass_let_go_of_stays_in_use_until_a_step_closes_it() {
+        let mut p = pipes();
+        let mut w = Wakes::default();
+        let slots = p.pass_alloc(3, 1).unwrap();
+        for &s in &slots[..3] {
+            p.pass_release(usize::from(s));
+        }
+        assert!(p.sockets.due());
+        assert_eq!(p.passes_held(), 3);
+        let mut closed = 0;
+        while let Some(_slot) = p.pass_closing() {
+            closed += 1;
+        }
+        assert_eq!(closed, 3);
+        assert_eq!(p.passes_held(), 0);
+        assert!(!p.sockets.due());
+        p.step(&mut w);
+    }
+
+    #[test]
+    fn the_count_of_passes_is_an_option_of_any_socket() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let (x, _y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        assert_eq!(p.sock_option(&a, sock(x), OPT_PASSES, false, 0), Ok(0));
+        p.pass_alloc(3, 1).unwrap();
+        assert_eq!(p.sock_option(&a, sock(x), OPT_PASSES, false, 0), Ok(3));
+        assert_eq!(
+            p.sock_option(&a, sock(x), OPT_PASSES, true, 1),
+            Err(NO_OPTION)
+        );
+    }
+
+    #[test]
+    fn a_pass_is_no_cycle_and_takes_no_reference_of_a_socket() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let mut w = Wakes::default();
+        let (x, y) = p.sock_pair(&mut a, 1, 1, UNIX, STREAM, 0).unwrap();
+        // The numbers of passes have the bits of a socket's number set.
+        assert_ne!(PASS & SOCK_END, 0);
+        let slot = p.pass_alloc(1, 1).unwrap()[0];
+        p.sock_send(
+            &a,
+            sock(x),
+            0,
+            &[PASS + u32::from(slot)],
+            &Addr::NONE,
+            b"m",
+            &mut w,
+        )
+        .unwrap();
+        assert_eq!(p.sockets.s[(x & !SOCK_END) as usize].flying, 0);
+        assert_eq!(p.sockets.s[(y & !SOCK_END) as usize].flying, 0);
     }
 }

@@ -116,6 +116,8 @@ net-clone = []
 net-abandon = []
 # Role `E`: epoll in the service (sets, the wait, the step of waking, the drop).
 net-epoll = []
+# Role `x`: passes (EXPORT, ADOPT, the last copy going) and time limits.
+net-passes = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

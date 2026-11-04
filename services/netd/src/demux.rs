@@ -113,12 +113,18 @@ impl Demux {
         }
     }
 
+    /// The hash of `key` under the secret of the service: the slot is its
+    /// remainder, and a group of SO_REUSEPORT picks its member by it.
     #[allow(deprecated)]
-    fn home(&self, key: &Key) -> usize {
+    pub fn hash_of(&self, key: &Key) -> u64 {
         let (bytes, len) = key.bytes();
         let mut hash = SipHasher::new_with_keys(self.keys.0, self.keys.1);
         hash.write(&bytes[..len]);
-        (hash.finish() % DEMUX_SLOTS as u64) as usize
+        hash.finish()
+    }
+
+    fn home(&self, key: &Key) -> usize {
+        (self.hash_of(key) % DEMUX_SLOTS as u64) as usize
     }
 
     /// Puts `key` in the table for `place`; false when it is there already

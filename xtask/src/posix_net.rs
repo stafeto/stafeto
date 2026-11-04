@@ -24,9 +24,9 @@ use crate::{
     busybox_build, nano_build, net, net_curl, net_probe, qemu, relibc, symbolize,
 };
 
-/// The checks of `posix-net` for stages P4a-1 and P4a-2, in the order the
+/// The checks of `posix-net` for stages P4a-1, P4a-2 and P4a-3, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 32] = [
+pub const CHECKS: [&str; 53] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -59,7 +59,50 @@ pub const CHECKS: [&str; 32] = [
     "select-high",
     "fionread",
     "epoll-1000",
+    "listen-again",
+    "syn-full",
+    "timewait-syn",
+    "reuseport-4",
+    "reuseport-uid",
+    "linger-0",
+    "linger-wait",
+    "rcvtimeo",
+    "sndtimeo",
+    "accept-clofork",
+    "scm-net",
+    "scm-five",
+    "scm-mixed",
+    "scm-wait",
+    "scm-dead-receiver",
+    "scm-close-socket",
+    "scm-ctrunc",
+    "scm-retry",
+    "scm-root",
+    "scm-depart",
+    "epoll-exclusive",
 ];
+
+/// The image of the run with the counted steps of the network service and
+/// the pipe service (the passes of SCM_RIGHTS wait there).
+const STEPS_IMAGE: &str = "boot-posix-net-steps.img";
+
+/// The tag under which the pipe service prints its steps.
+const PIPE_TAG: &str = "4";
+
+/// The programs of that image: the shell's image with `netd` and `pipe` that
+/// print their longest steps.
+pub fn steps_programs() -> &'static [crate::ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<crate::ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = net_curl::steps_programs().to_vec();
+        for program in &mut programs {
+            if program.0 == "pipe" {
+                program.3 = &["steps"];
+            }
+        }
+        programs
+    })
+}
 
 /// How long the checks may take in all (the ci group allows 120 s for the
 /// boot and the run).
@@ -82,8 +125,19 @@ fn took_ms(lines: &[String], name: &str) -> Option<u64> {
 }
 
 /// `posix-net` for all its checks: a line for each, then the count.
+///
+/// `POSIX_NET_ONLY=NAME` runs the one check, for finding the cause of a failure.
 fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), String> {
-    run.send(&format!("posix-net {address}"))?;
+    let only = std::env::var("POSIX_NET_ONLY").ok();
+    let wanted: Vec<&str> = CHECKS
+        .iter()
+        .copied()
+        .filter(|name| only.as_deref().is_none_or(|only| only == *name))
+        .collect();
+    match &only {
+        Some(name) => run.send(&format!("posix-net {address} {name}"))?,
+        None => run.send(&format!("posix-net {address}"))?,
+    }
     let mut seen = 0;
     let end = Instant::now() + within;
     loop {
@@ -93,14 +147,14 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         if text.contains("failed") {
             return Err(format!("posix-net: {text}"));
         }
-        if text.contains(" took ") {
+        if text.contains(" took ") || text.contains(" note: ") {
             continue;
         }
         if let Some(count) = text.strip_suffix(" checks ok") {
-            if count != CHECKS.len().to_string() || seen != CHECKS.len() {
+            if count != wanted.len().to_string() || seen != wanted.len() {
                 return Err(format!(
                     "posix-net ran {count} checks, {seen} lines said ok, xtask knows {}",
-                    CHECKS.len()
+                    wanted.len()
                 ));
             }
             return Ok(());
@@ -108,11 +162,11 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         let name = text
             .strip_suffix(" ok")
             .ok_or_else(|| format!("an unknown line of posix-net: {line:?}"))?;
-        if CHECKS.get(seen) != Some(&name) {
+        if wanted.get(seen) != Some(&name) {
             return Err(format!(
                 "check {} is {name}, wanted {:?}",
                 seen + 1,
-                CHECKS.get(seen)
+                wanted.get(seen)
             ));
         }
         seen += 1;
@@ -146,7 +200,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = if steps {
-        (net_curl::STEPS_IMAGE, net_curl::steps_programs())
+        (STEPS_IMAGE, steps_programs())
     } else {
         (net::IMAGE, net::programs())
     };
@@ -188,6 +242,18 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         return Err("the network image faulted".into());
     }
     if steps {
+        let pipe = net_probe::longest_over_starts_of(&output.lines, PIPE_TAG);
+        if let Some(row) = pipe.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+            return Err(format!(
+                "the pipe service: a step past 0.9 of term B ({}): {row:?}",
+                net_probe::STEP_MAX
+            ));
+        }
+        let worst_pipe = pipe.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
+        println!(
+            "posix-net steps: the longest step of the pipe service is kind {} with {} ticks and detail {}; every kind: {pipe:?}",
+            worst_pipe.0, worst_pipe.1, worst_pipe.2
+        );
         let rows = steps_verdict(&output.lines)?;
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
         println!(

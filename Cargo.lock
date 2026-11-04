@@ -271,6 +271,7 @@ dependencies = [
  "abi",
  "proto-init",
  "proto-net",
+ "proto-pipe",
  "proto-wire",
  "rt",
 ]
