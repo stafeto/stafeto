@@ -857,7 +857,7 @@ fn choice_features(receive: usize, groups: usize, send: usize) -> Vec<&'static s
     });
     features.extend(match groups {
         1 => Some("egress-1"),
-        4 => Some("egress-4"),
+        2 => Some("egress-2"),
         _ => None,
     });
     features.extend(match send {

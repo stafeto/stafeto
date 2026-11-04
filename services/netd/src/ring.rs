@@ -68,13 +68,14 @@ pub const STEP_TX: usize = 4;
 /// The frames the loopback keeps for the next reception: two steps of
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
-/// The groups of sockets the pass of sending visits in one step. The
-/// features `egress-1` and `egress-4` are for the measurement that chose it.
-#[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
-pub const EGRESS_GROUPS: usize = 2;
+/// The groups of sockets the pass of sending visits in one step, by the
+/// measurement of stage P1a (reports/2026-11-04-net-p1a). The features
+/// `egress-1` and `egress-2` build the smaller values, for the measurement.
 #[cfg(feature = "egress-1")]
 pub const EGRESS_GROUPS: usize = 1;
-#[cfg(all(feature = "egress-4", not(feature = "egress-1")))]
+#[cfg(all(feature = "egress-2", not(feature = "egress-1")))]
+pub const EGRESS_GROUPS: usize = 2;
+#[cfg(not(any(feature = "egress-1", feature = "egress-2")))]
 pub const EGRESS_GROUPS: usize = 4;
 /// The operations of one session that wait at most (rt's LONG_SESSION_MAX).
 pub const SESSION_OPS: usize = 16;

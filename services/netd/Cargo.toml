@@ -38,7 +38,7 @@ send-1 = []
 # `split`: the breakdown of the step of the stack by parts (measurement only).
 split = []
 egress-1 = []
-egress-4 = []
+egress-2 = []
 limit-8 = []
 limit-64 = []
 limit-256 = []
