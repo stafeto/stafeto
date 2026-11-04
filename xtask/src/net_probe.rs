@@ -937,6 +937,15 @@ type Rows = (&'static str, Vec<(usize, u64, u64)>);
 /// `netd` is the features of the service on top of the counting of steps
 /// (the batch and the groups per step).
 fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageProgram], Roles)> {
+    let mut runs = all_runs(netd);
+    // `NET_PROBE_RUNS=x,E` keeps the named runs, to find the cause of a failure.
+    if let Ok(only) = std::env::var("NET_PROBE_RUNS") {
+        runs.retain(|(what, _, _)| only.split(',').any(|name| name == *what));
+    }
+    runs
+}
+
+fn all_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageProgram], Roles)> {
     vec![
         ("s1280", measured_programs(None, netd), Roles::LIMIT),
         (
