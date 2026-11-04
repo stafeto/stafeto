@@ -33,6 +33,9 @@ const ONESHOT: u8 = 2;
 /// The record reports (a oneshot record does not after a report, until MOD).
 const ENABLED: u8 = 4;
 const READY: u8 = 8;
+/// The record was added with EPOLLEXCLUSIVE: of the sets that have such a
+/// record on a place, one that waits is given the event.
+const EXCLUSIVE: u8 = 16;
 
 /// What a record of `events` (the events of Linux with the modes) asks for
 /// and the modes it has.
@@ -43,6 +46,9 @@ const fn modes(events: u32) -> u8 {
     }
     if events & epoll::ONESHOT != 0 {
         flags |= ONESHOT;
+    }
+    if events & epoll::EXCLUSIVE != 0 {
+        flags |= EXCLUSIVE;
     }
     flags
 }
@@ -414,7 +420,8 @@ impl<const PLACES: usize> Interests<PLACES> {
     ) -> Result<(), Refused> {
         let idx = self.find(k, place).ok_or(Refused::NoEntry)?;
         let e = &mut self.entries[idx];
-        e.flags = (e.flags & READY) | modes(events);
+        // A record added with EPOLLEXCLUSIVE stays one.
+        e.flags = (e.flags & (READY | EXCLUSIVE)) | modes(events & !epoll::EXCLUSIVE);
         e.events = events & epoll::EVENTS;
         e.label = label;
         e.last = 0;
@@ -561,16 +568,31 @@ impl<const PLACES: usize> Interests<PLACES> {
     }
 
     /// The records on `place` look at its events `ev`: those that ask for
-    /// them are listed. Returns how many records it looked at.
+    /// them are listed. Returns how many records it looked at. Of the records
+    /// added with EPOLLEXCLUSIVE only the first whose set has an operation
+    /// waiting is listed (and so its set woken): the other sets leave the
+    /// event to it, as the waiters of Linux that wake one.
     pub fn scan(&mut self, place: usize, ev: u32) -> usize {
         self.cache[place] = ev;
         let mut looked = 0;
+        let mut taken = false;
         let mut at = self.heads[place];
         while at != NONE && looked < PLACE_INTEREST {
             let idx = usize::from(at);
             at = self.entries[idx].next_place;
             looked += 1;
-            self.consider(idx, ev, true);
+            if self.entries[idx].flags & EXCLUSIVE != 0 {
+                if taken {
+                    continue;
+                }
+                self.consider(idx, ev, true);
+                let e = self.entries[idx];
+                if e.flags & READY != 0 && self.sets[usize::from(e.set)].waiters != 0 {
+                    taken = true;
+                }
+            } else {
+                self.consider(idx, ev, true);
+            }
         }
         looked
     }
@@ -624,7 +646,7 @@ impl<const PLACES: usize> Interests<PLACES> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto_net::sockets::epoll::{ERR, ET, HUP, IN, ONESHOT, OUT};
+    use proto_net::sockets::epoll::{ERR, ET, EXCLUSIVE as EXCL, HUP, IN, ONESHOT, OUT};
 
     type Table = Interests<8>;
 
@@ -901,5 +923,66 @@ mod tests {
         assert!(!t.has_ready(k));
         assert!(!t.watched(1));
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn an_exclusive_record_wakes_one_of_the_waiting_sets() {
+        let mut t = table();
+        let a = t.new_set(1).unwrap();
+        let b = t.new_set(2).unwrap();
+        t.add(a, 1, IN | EXCL, 10, 0).unwrap();
+        t.add(b, 1, IN | EXCL, 20, 0).unwrap();
+        t.add_waiter(a, 3);
+        t.add_waiter(b, 4);
+        t.scan(1, IN);
+        // One set has the event and is due; the other has nothing.
+        let (ra, rb) = (t.has_ready(a), t.has_ready(b));
+        assert!(ra != rb, "exactly one set is given the event");
+        assert_eq!(t.due.count_ones(), 1);
+        let woken = if ra { a } else { b };
+        assert_eq!(t.due, 1 << woken);
+    }
+
+    #[test]
+    fn exclusive_records_of_sets_that_wait_for_nothing_all_get_the_event() {
+        let mut t = table();
+        let a = t.new_set(1).unwrap();
+        let b = t.new_set(2).unwrap();
+        t.add(a, 1, IN | EXCL, 10, 0).unwrap();
+        t.add(b, 1, IN | EXCL, 20, 0).unwrap();
+        t.scan(1, IN);
+        assert!(t.has_ready(a) && t.has_ready(b));
+        assert_eq!(t.due, 0);
+    }
+
+    #[test]
+    fn an_exclusive_record_passes_over_a_set_that_does_not_wait() {
+        let mut t = table();
+        let a = t.new_set(1).unwrap();
+        let b = t.new_set(2).unwrap();
+        t.add(a, 1, IN | EXCL, 10, 0).unwrap();
+        t.add(b, 1, IN | EXCL, 20, 0).unwrap();
+        // Only a waits: it is the one woken, whichever record is first.
+        t.add_waiter(a, 3);
+        t.scan(1, IN);
+        assert!(t.has_ready(a));
+        assert_eq!(t.due, 1 << a);
+    }
+
+    #[test]
+    fn a_plain_record_is_given_the_event_beside_an_exclusive_one() {
+        let mut t = table();
+        let a = t.new_set(1).unwrap();
+        let b = t.new_set(2).unwrap();
+        let c = t.new_set(3).unwrap();
+        t.add(a, 1, IN | EXCL, 10, 0).unwrap();
+        t.add(b, 1, IN | EXCL, 20, 0).unwrap();
+        t.add(c, 1, IN, 30, 0).unwrap();
+        for k in [a, b, c] {
+            t.add_waiter(k, k);
+        }
+        t.scan(1, IN);
+        assert!(t.has_ready(c));
+        assert_eq!([a, b].iter().filter(|&&k| t.has_ready(k)).count(), 1);
     }
 }

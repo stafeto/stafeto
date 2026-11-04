@@ -578,6 +578,11 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         let sent = split::get(&split::TX);
         let Some(dest) = device.stage() else { break };
         let place = net.route(stack, dest);
+        if core::mem::take(&mut net.drop_frame) {
+            // A SYN to a queue with no room: no RST, the peer sends it again.
+            device.discard_held();
+            continue;
+        }
         // A frame of the wire the stack answers with a frame of its own
         // (an echo reply, a reset, an unreachable) costs two frames and
         // takes the whole step: first in the step it ends the receiving,

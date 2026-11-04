@@ -780,6 +780,11 @@ impl Driver<'_> {
         if self.cleanup_due && self.tell(CLEANUP) {
             self.cleanup_due = false;
         }
+        // An operation with a time limit was made: the timer may be set
+        // earlier for it.
+        if core::mem::take(&mut self.net.deadline_new) {
+            self.arm(now_ns());
+        }
     }
 
     /// A departure is due.
@@ -1093,6 +1098,7 @@ impl Driver<'_> {
             self.stack.next_deadline(),
             self.stack.ping.as_ref().map(|p| p.deadline_ns),
             sweep,
+            self.net.next_deadline(),
             Some(self.neighbours_at),
             self.ask_at,
             self.second.as_deref().and_then(|s| s.next_at),
@@ -1245,16 +1251,16 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. The methods of later stages (23 to 26) are UNKNOWN_METHOD.
+/// `probe`. The methods of later stages (25, 26) are UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30,
-    31, 32, 33, 34, 62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 32,
-    33, 34,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28,
+    29, 32, 33, 34, 35,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1306,6 +1312,12 @@ impl Service<0> for Driver<'_> {
     /// The last copy of a session Clone made went before it sent anything.
     fn closed(&mut self, label: u64) {
         rt::service::step_own();
+        // The last copy of a pass: its reference of the place goes.
+        if netd::passes::Passes::is_pass(label) {
+            self.net.pass_gone(&mut self.stack, label);
+            self.after_request();
+            return;
+        }
         if let Some(held) = self.net.unborn(label)
             && self
                 .net
@@ -1391,6 +1403,7 @@ impl Service<0> for Driver<'_> {
             Source::Timer if n.label == TIMER_LABEL => {
                 self.armed = None;
                 let now = now_ns();
+                self.net.expire(now);
                 if self
                     .second
                     .as_deref()

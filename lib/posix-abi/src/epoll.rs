@@ -449,8 +449,8 @@ pub fn ctl(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<(),
         CTL_ADD | CTL_MOD => {
             let event = event.ok_or(EFAULT)?;
             // EPOLLEXCLUSIVE is accepted by ADD with the bits Linux allows with
-            // it and is then a plain record (every waiting set may be woken,
-            // which Linux's "one or more" allows); MOD and the rest are EINVAL.
+            // it: the record then wakes one of the waiting sets on a socket
+            // (the service picks), as in Linux; MOD and the rest are EINVAL.
             if event.events & bits::EXCLUSIVE != 0
                 && (op == CTL_MOD
                     || event.events
@@ -466,7 +466,7 @@ pub fn ctl(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<(),
                 return Err(EINVAL);
             }
             Some(EpollEvent {
-                events: event.events & !(EPOLL_WAKEUP | bits::EXCLUSIVE),
+                events: event.events & !EPOLL_WAKEUP,
                 data: event.data,
             })
         }
@@ -630,6 +630,10 @@ fn modify(id: u32, fd: usize, generation: u64, kind: Kind, event: EpollEvent) ->
         let e = entry(inst, idx).ok_or(Need::Errno(ENOENT))?;
         if e.flags & PENDING_ADD != 0 {
             return Err(Need::Errno(ENOENT));
+        }
+        // A record added with EPOLLEXCLUSIVE cannot be modified (Linux).
+        if e.events & bits::EXCLUSIVE != 0 {
+            return Err(Need::Errno(EINVAL));
         }
         e.events = event.events;
         e.data = event.data;

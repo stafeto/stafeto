@@ -28,6 +28,9 @@ pub struct Binding {
     pub listening: bool,
     pub connected: bool,
     pub reuse: bool,
+    /// SO_REUSEPORT was set before BIND: two such bindings may share a port
+    /// (the caller checks that one user holds them).
+    pub port_reuse: bool,
 }
 
 /// Whether two addresses can both receive a packet: 0.0.0.0 meets every
@@ -46,6 +49,7 @@ pub fn conflicts(new: &Binding, held: impl IntoIterator<Item = Binding>) -> bool
             && old.port == new.port
             && overlap(old.address, new.address)
             && (old.listening || !old.connected || !new.reuse)
+            && !(old.port_reuse && new.port_reuse)
     })
 }
 
@@ -189,6 +193,7 @@ mod tests {
             listening: false,
             connected: false,
             reuse: false,
+            port_reuse: false,
         }
     }
 
@@ -221,6 +226,20 @@ mod tests {
         let mut again = new;
         again.reuse = true;
         assert!(!conflicts(&again, [waiting]), "a restart with it");
+    }
+
+    #[test]
+    fn two_bindings_that_asked_for_a_shared_port_do_not_conflict() {
+        let mut old = binding([0; 4], 80);
+        old.listening = true;
+        old.port_reuse = true;
+        let mut new = binding([0; 4], 80);
+        assert!(conflicts(&new, [old]));
+        new.port_reuse = true;
+        assert!(!conflicts(&new, [old]));
+        // Another port or protocol is none of its business.
+        new.port = 81;
+        assert!(!conflicts(&new, [old]));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! The first stage answers CONFIG, and PING and CRASH in a build with the
 //! feature `probe`; the second answers the sockets' methods of TCP and UDP
 //! over IPv4, with a loopback. A method of a later stage takes the next free
-//! number between 35 and 61. All the numbers are below 64: the steps of the
+//! number between 36 and 61. All the numbers are below 64: the steps of the
 //! service loop count the methods up to the notice at 64.
 //!
 //! A socket is a description, one u32 on the wire: the place in the
@@ -29,7 +29,9 @@
 //! | SEND (8), SEND_TAKE (9) | [k], description, flags (u32, DONTWAIT 2), `Address` (family 0 when connected), then 0..=800 bytes | long: READY bytes taken (u32) |
 //! | RECV (10), RECV_TAKE (11) | [k], description, flags (u32, PEEK 1, DONTWAIT 2), most (u32, 1..=800) | long: READY flags (u32, OUT_TRUNC 1), `Address` of the sender, bytes |
 //! | SHUTDOWN (12) | description, how (u32: 0 read, 1 write, 2 both) | status |
-//! | CLOSE (13) | description, linger (u32, 0 alone) | status |
+//! | CLOSE (13), CLOSE_TAKE (35) | [k], description, linger (u32: `CLOSE_MAY_WAIT` when the caller may wait for a `SO_LINGER` close) | long, for a start that answers WAIT; else status |
+//! | EXPORT (23) | description | status and one handle: a pass for the description (copy of the service's channel with a label of `PASS`, rights TRANSFER and DUPLICATE) |
+//! | ADOPT (24) | the header alone and one handle, a pass | status, description (u32), kind (u32, STREAM or DGRAM) |
 //! | GETOPT (14) | description, name (u32) | status, value (u32) |
 //! | SETOPT (15) | description, name, value (u32 each) | status |
 //! | NAME (16) | description, whose (u32: 0 own, 1 the peer's) | status, `Address` |
@@ -99,12 +101,13 @@ pub enum Method {
     EpollDrop = 32,
     EpollWait = 33,
     EpollWaitTake = 34,
+    CloseTake = 35,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 36] = [
+    pub const ALL: [Method; 37] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -139,6 +142,7 @@ impl Method {
         Method::EpollDrop,
         Method::EpollWait,
         Method::EpollWaitTake,
+        Method::CloseTake,
         Method::Ping,
         Method::Crash,
     ];
@@ -484,14 +488,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=34).collect();
+        let mut expected: Vec<u16> = (1..=35).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(35), None);
+        assert_eq!(Method::from_number(36), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));

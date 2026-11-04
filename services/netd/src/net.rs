@@ -18,8 +18,10 @@ use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
 use netd::interest::Interests;
+use netd::passes::Passes;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
 use netd::ports::{Binding, PortMap, Proto};
+use netd::reuse::{Groups, NO_GROUP};
 use netd::ring::{OrphanQueue, WakeBudget};
 use proto_net::sockets::{self, opt};
 use proto_net::{Address, INET};
@@ -132,6 +134,14 @@ pub struct Sock {
     pub keepalive: bool,
     pub nodelay: bool,
     pub broadcast: bool,
+    /// SO_REUSEPORT before BIND, and the group the socket is in.
+    pub reuseport: bool,
+    pub group: u8,
+    /// SO_LINGER (0 off, else `opt::LINGER_ON` and the seconds) and the
+    /// timeouts of SO_RCVTIMEO and SO_SNDTIMEO in milliseconds (0 for none).
+    pub linger: u32,
+    pub rcvtimeo: u32,
+    pub sndtimeo: u32,
     pub shut_rd: bool,
     pub shut_wr: bool,
     /// The stream took a FIN from the peer.
@@ -173,6 +183,11 @@ impl Sock {
         keepalive: false,
         nodelay: false,
         broadcast: false,
+        reuseport: false,
+        group: NO_GROUP,
+        linger: 0,
+        rcvtimeo: 0,
+        sndtimeo: 0,
         shut_rd: false,
         shut_wr: false,
         saw_fin: false,
@@ -201,6 +216,9 @@ pub enum Kind {
     Send,
     Recv,
     Watch,
+    /// A `close` of a stream with a linger time waits for the data it sent to
+    /// be acknowledged: `OpInfo::place` is the orphan's place.
+    Linger,
     /// A wait on an interest set: `OpInfo::place` is the index of the set.
     Epoll,
 }
@@ -279,6 +297,8 @@ impl Mask {
 pub struct Counters {
     /// Members of a queue that `accept` could not replace.
     pub listen_short: u64,
+    /// SYNs dropped for want of room in the queue of a listening description.
+    pub syn_dropped: u64,
 }
 
 /// The sockets of the service.
@@ -303,6 +323,24 @@ pub struct Net {
     pub udp_ports: PortMap,
     pub ops: LongOps<OPERATIONS>,
     pub info: [OpInfo; OPERATIONS],
+    /// The time limit of each operation that has one (SO_RCVTIMEO,
+    /// SO_SNDTIMEO, SO_LINGER) in nanoseconds, the operations that have one
+    /// and the operations whose time ran out, a bit each.
+    pub op_deadline: [u64; OPERATIONS],
+    pub timed: u128,
+    pub expired: u128,
+    /// The `Linger` operations whose place went: they are over.
+    pub lingered: u128,
+    /// An operation with a time limit was made since the loop last looked:
+    /// the timer may need to be set earlier.
+    pub deadline_new: bool,
+    /// The SO_REUSEPORT groups.
+    pub groups: Groups,
+    /// The passes of EXPORT that wait for ADOPT.
+    pub passes: Passes,
+    /// The frame `route` just looked at is a SYN to a full queue: the loop
+    /// drops it and the stack never sees it.
+    pub drop_frame: bool,
     pub watches: [watch::Set; OPERATIONS],
     pub clones: Clones<SESSIONS>,
     /// The interest sets of epoll and the records of the places.
@@ -407,6 +445,8 @@ impl Net {
             addr_of_mut!((*at).places).write(Places::new());
             rt::bss::fill(addr_of_mut!((*at).socks), Sock::EMPTY);
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
+            addr_of_mut!((*at).groups).write(Groups::new());
+            addr_of_mut!((*at).passes).write(Passes::new());
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
             Interests::initialize_at(addr_of_mut!((*at).interest));
@@ -560,6 +600,7 @@ impl Net {
     /// its entry in the table.
     pub fn release_place(&mut self, stack: &mut Stack<'static>, i: usize) {
         let sock = self.socks[i];
+        self.lingers_over(sock.waiters);
         if let Some(handle) = sock.handle {
             if sock.proto == Proto::Tcp {
                 stack.tcp(handle).abort();
@@ -572,6 +613,9 @@ impl Net {
         if let Some(key) = sock.key {
             self.demux.remove(&key);
         }
+        if sock.group != NO_GROUP {
+            self.leave_group(sock.group, i, sock.key);
+        }
         self.interest.drop_place(i, None);
         self.rst_wait.clear(i);
         self.wake_due.clear(i);
@@ -581,6 +625,40 @@ impl Net {
         self.places.free(i);
         if sock.port_held {
             self.ports(sock.proto).release(sock.port);
+        }
+    }
+
+    /// The place `i` left the group `k`; when it held the key of the group in
+    /// the table of destinations, the next member that listens takes it over.
+    fn leave_group(&mut self, k: u8, i: usize, key: Option<Key>) {
+        let k = usize::from(k);
+        self.groups.leave(k, i);
+        let Some(key @ Key::Bound { tcp: true, .. }) = key else {
+            return;
+        };
+        let next = self
+            .groups
+            .members(k)
+            .iter()
+            .map(|&m| usize::from(m))
+            .find(|&m| self.socks[m].listening && self.socks[m].key.is_none());
+        if let Some(m) = next {
+            self.register(m, key);
+        }
+    }
+
+    /// The operations in `waiters` that wait for a `close` to finish on a
+    /// place that goes are over.
+    fn lingers_over(&mut self, mut waiters: u128) {
+        while waiters != 0 {
+            let idx = waiters.trailing_zeros() as usize;
+            let bit = 1u128 << idx;
+            waiters &= waiters - 1;
+            if self.info[idx].kind == Kind::Linger {
+                self.lingered |= bit;
+                self.closed_ops |= bit;
+                self.wake_wanted = true;
+            }
         }
     }
 
@@ -612,6 +690,7 @@ impl Net {
                     listening: s.listening,
                     connected: s.conn != Conn::None,
                     reuse: s.reuse,
+                    port_reuse: s.reuseport,
                 })
             })
     }
@@ -689,9 +768,10 @@ impl Net {
                     tcp::State::Closed | tcp::State::Listen | tcp::State::SynSent
                 ) {
                     self.release_place(stack, i);
-                } else if t.recv_queue() > 0 {
+                } else if t.recv_queue() > 0 || sock.linger == opt::LINGER_ON {
                     // A close with bytes nobody read resets the connection
-                    // (RFC 1122, 4.2.2.13): the peer's next send fails.
+                    // (RFC 1122, 4.2.2.13): the peer's next send fails. So
+                    // does a close with SO_LINGER on and a time of 0.
                     self.abort_place(stack, i);
                 } else {
                     t.close();
@@ -1060,6 +1140,9 @@ impl Net {
         let info = self.info[idx];
         let bit = 1u128 << idx;
         self.told &= !bit;
+        self.timed &= !bit;
+        self.expired &= !bit;
+        self.lingered &= !bit;
         if info.kind == Kind::Epoll {
             self.interest.remove_waiter(usize::from(info.place), idx);
         } else if info.kind == Kind::Watch {
@@ -1126,26 +1209,31 @@ impl Net {
                     remote_port,
                 };
                 if let Some(place) = self.demux.find(&conn) {
-                    return Some(place);
+                    // A new SYN on the four of a stream in TIME-WAIT that no
+                    // session holds ends that stream (RFC 6191): the SYN goes
+                    // to the listening description as any other.
+                    if !(syn && self.time_wait_orphan(stack, place)) {
+                        return Some(place);
+                    }
+                    self.release_place(stack, place);
                 }
                 if !syn {
                     return None;
                 }
-                let listener = [local, [0; 4]].into_iter().find_map(|address| {
+                let lead = [local, [0; 4]].into_iter().find_map(|address| {
                     self.demux.find(&Key::Bound {
                         tcp: true,
                         address,
                         port: local_port,
                     })
                 })?;
-                let sock = self.socks[listener];
-                let member = (0..usize::from(sock.member_count))
-                    .map(|k| usize::from(sock.members[k]))
-                    .find(|&m| {
-                        self.socks[m]
-                            .handle
-                            .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
-                    })?;
+                let Some((listener, member)) = self.pick_listener(stack, lead, &conn) else {
+                    // A queue with no room drops the SYN: the peer sends it
+                    // again after its timeout, as it does to a busy server.
+                    self.drop_frame = true;
+                    self.counters.syn_dropped += 1;
+                    return None;
+                };
                 self.syn_listener = Some(listener);
                 Some(member)
             }
@@ -1168,6 +1256,61 @@ impl Net {
                 })
             }
         }
+    }
+
+    /// Whether place `i` is a stream that no session holds and that waits
+    /// out TIME-WAIT.
+    fn time_wait_orphan(&self, stack: &mut Stack<'static>, i: usize) -> bool {
+        self.places.state(i) == State::Orphan
+            && self.socks[i]
+                .handle
+                .is_some_and(|h| stack.tcp(h).state() == tcp::State::TimeWait)
+    }
+
+    /// The first socket of the queue of listening place `listener` that
+    /// still listens.
+    fn listening_member(&self, stack: &mut Stack<'static>, listener: usize) -> Option<usize> {
+        let sock = &self.socks[listener];
+        (0..usize::from(sock.member_count))
+            .map(|k| usize::from(sock.members[k]))
+            .find(|&m| {
+                self.socks[m]
+                    .handle
+                    .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
+            })
+    }
+
+    /// The listening description of the group of `lead` (or `lead` itself)
+    /// that gets the SYN of the four `conn`, and the socket of its queue
+    /// that takes it.
+    fn pick_listener(
+        &mut self,
+        stack: &mut Stack<'static>,
+        lead: usize,
+        conn: &Key,
+    ) -> Option<(usize, usize)> {
+        let group = self.socks[lead].group;
+        let listener = if group == NO_GROUP {
+            lead
+        } else {
+            let hash = self.demux.hash_of(conn);
+            let (socks, groups) = (&self.socks, &self.groups);
+            groups.pick(
+                usize::from(group),
+                hash,
+                |m| socks[m].listening,
+                |m| {
+                    let sock = &socks[m];
+                    (0..usize::from(sock.member_count)).any(|k| {
+                        socks[usize::from(sock.members[k])]
+                            .handle
+                            .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
+                    })
+                },
+            )?
+        };
+        let member = self.listening_member(stack, listener)?;
+        Some((listener, member))
     }
 
     /// After the stack took a SYN for a listening description: the sockets of
@@ -1308,6 +1451,7 @@ impl Net {
                     Kind::Connect => !matches!(self.socks[i].conn, Conn::Connecting(_)),
                     Kind::Accept => ev & (watch::IN | watch::ERR) != 0,
                     Kind::Epoll => false,
+                    Kind::Linger => self.linger_done(stack, i),
                     Kind::Send => ev & (watch::OUT | watch::ERR | watch::HUP) != 0,
                     Kind::Recv => ev & (watch::IN | watch::ERR | watch::HUP) != 0,
                     Kind::Watch => {
@@ -1339,6 +1483,47 @@ impl Net {
         }
         self.tell_sets(&mut budget);
         self.wake_pending()
+    }
+
+    /// Whether the data a `close` waits for is acknowledged: the stream is past
+    /// FIN-WAIT-1 and the closing states that wait for the ACK of our FIN.
+    pub fn linger_done(&self, stack: &mut Stack<'static>, i: usize) -> bool {
+        self.socks[i].handle.is_none_or(|h| {
+            matches!(
+                stack.tcp(h).state(),
+                tcp::State::FinWait2 | tcp::State::TimeWait | tcp::State::Closed
+            )
+        })
+    }
+
+    /// The operations with a time limit that ran out are told, a few in each
+    /// step of waking (by the mask of the operations whose description closed,
+    /// which that step tells within its share).
+    pub fn expire(&mut self, now: u64) {
+        let mut mask = self.timed & !self.expired;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            let bit = 1u128 << idx;
+            mask &= mask - 1;
+            if self.op_deadline[idx] <= now {
+                self.expired |= bit;
+                self.closed_ops |= bit;
+                self.wake_wanted = true;
+            }
+        }
+    }
+
+    /// The nearest time limit of the operations that wait, in nanoseconds.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let mut mask = self.timed & !self.expired;
+        let mut next: Option<u64> = None;
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let at = self.op_deadline[idx];
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
+        next
     }
 
     /// The sets with ready records whose waiting operations are told, within
@@ -1473,6 +1658,10 @@ impl Net {
             opt::BROADCAST => u32::from(s.broadcast),
             opt::NODELAY => u32::from(s.nodelay),
             opt::NONBLOCK => u32::from(s.nonblock),
+            opt::REUSEPORT if s.proto == Proto::Tcp => u32::from(s.reuseport),
+            opt::LINGER => s.linger,
+            opt::RCVTIMEO => s.rcvtimeo,
+            opt::SNDTIMEO => s.sndtimeo,
             _ => return None,
         })
     }
