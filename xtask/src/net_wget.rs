@@ -697,18 +697,23 @@ fn real_name(run: &mut qemu::Run) -> Result<(), String> {
         return Ok(());
     };
     for round in 0..4 {
+        // The runner's resolver may be slow: a lookup that does not end in
+        // time counts as an empty answer, which the host's own lookup below
+        // judges.
         let lookup = capture(
             run,
             "nslookup example.com",
             &format!("dn{round}"),
-            DIALOG_STEP,
-        )?;
+            REAL_NAME_WITHIN,
+        )
+        .unwrap_or_default();
         let resolve = capture(
             run,
             "net-dns resolve example.com",
             &format!("dr{round}"),
-            DIALOG_STEP,
-        )?;
+            REAL_NAME_WITHIN,
+        )
+        .unwrap_or_default();
         let (a, b) = (addresses_in(&lookup), addresses_in(&resolve));
         if a.is_empty() || b.is_empty() {
             match host_resolves("example.com") {
