@@ -1046,6 +1046,23 @@ impl Probe<'_> {
         if self.told.get() & (1 << 0x11) != 0 {
             return Err("an operation was told for the place of a session that went");
         }
+        // The datagram did arrive where the old operation waited.
+        let mut got = [0; MESSAGE_MAX];
+        let peek = Request::Recv {
+            key: None,
+            description: held,
+            flags: sockets::DONTWAIT,
+            most: PIECE as u32,
+        };
+        let reply = socket_call(&root, &peek, &mut got).map_err(|f| {
+            rt::println!("net-probe: stale recv {f:?}");
+            "the datagram for the old place did not arrive"
+        })?;
+        let data = ready(reply).map_err(|_| "RECV's reply")?;
+        let (_, _, bytes) = sockets::read_received(data).map_err(|_| "RECV's data")?;
+        if bytes != b"stale" {
+            return Err("the datagram for the old place arrived changed");
+        }
         let mut w = Writer::new();
         Request::Cancel(fresh_key)
             .write(&mut w)
