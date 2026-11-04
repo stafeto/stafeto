@@ -730,7 +730,14 @@ def program_inputs() -> dict:
         "htop": [ROOT / "target" / "htop" / "htop.o"],
         "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
         "doom": [ROOT / "target" / "doomgeneric" / "doom.o"],
+        "fstack-probe": [ROOT / "target" / "f-stack" / "fstack-probe.o"],
     }
+
+
+# The extra options of the link of a program. The FreeBSD stack of F-Stack
+# finds its SYSINIT, sysctl and module records in linker sets that only
+# __start_ and __stop_ references name: they keep their sections.
+PROGRAM_LINK = {"fstack-probe": ("-z", "nostart-stop-gc")}
 
 
 def build_programs(wanted_names: list) -> list:
@@ -766,7 +773,8 @@ def build_programs(wanted_names: list) -> list:
         if name.startswith("busybox"):
             compile_c(BUSYBOX_MAIN, work / f"{name}-main.o")
             objects.insert(0, work / f"{name}-main.o")
-        result = link_program(output, objects, ["--gc-sections"], capture=True)
+        result = link_program(output, objects, ["--gc-sections", *PROGRAM_LINK.get(name, ())],
+                              capture=True)
         if result.returncode != 0:
             names = sorted(set(re.findall(r"undefined symbol: (\S+)", result.stderr)))
             fail(f"{name}: link failed; undefined: {' '.join(names) or result.stderr[-2000:]}")

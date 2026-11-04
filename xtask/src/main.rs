@@ -36,6 +36,7 @@ mod disasm;
 mod display_probe;
 mod doom;
 mod entropy;
+mod fstack_probe;
 mod gpu_probe;
 mod guards;
 mod htop_dialog;
@@ -1684,6 +1685,12 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  fstack-probe [write-blocking] [MACHINE] run `fstack-probe` in the guest:
+            the TCP/IP stack of FreeBSD 15 (F-Stack) in a process on its own
+            loopback: 16 MiB through a pair of sockets, kqueue, a partial
+            write, 1 000 connections, a refused connect and the timer of a
+            SYN sent again; with `write-blocking`, what one write of 1 MiB
+            does on a blocking socket
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
@@ -1954,6 +1961,7 @@ fn main() {
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
+        Some("fstack-probe") => fstack_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2467,6 +2475,20 @@ fn write_elf_image(
         for (name, bytes) in files {
             list.push((name, bytes.as_slice()));
         }
+    }
+    // An image with F-Stack (BSD) carries its licence, the acknowledgements
+    // of its four-clause files and where the exact source is.
+    let fstack_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "fstack-probe"))
+    {
+        Some(fstack_probe::terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, source)) = &fstack_files {
+        list.push((fstack_probe::LICENSE, licence.as_slice()));
+        list.push((fstack_probe::SOURCE, source.as_bytes()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3585,6 +3607,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("nano", _) => "nano",
         ("ncdu", _) => "ncdu",
         ("doom", _) => "doom",
+        ("fstack-probe", _) => "fstack-probe",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -8838,6 +8861,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // descriptors, 1 000 sockets, a fork and an exec with many of them.
         // Also in the group `net`.
         job("posix-net", || posix_net::probe(&qemu::VIRT, false)),
+        // The TCP/IP stack of FreeBSD 15 (F-Stack) in a process, on its own
+        // loopback: 16 MiB, 1 000 connections, its clock. Also in the group
+        // `net`.
+        job("fstack-probe", || fstack_probe::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
