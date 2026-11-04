@@ -139,14 +139,19 @@ def stage_licenses(stage: Path, version: str, cache: Path) -> None:
     out.mkdir()
     for name in ("LICENSE", "LICENSE-MIT", "LICENSE-GCC-exception-3.1"):
         shutil.copy(ROOT / name, out / name)
+    # The notices of relibc and of every crate from outside the workspace
+    # that the kernel, the services and the programs link; the check fails
+    # when the file misses one of them.
+    subprocess.run([sys.executable, str(HERE / "check-licenses.py"), "--verify"], check=True)
     notices = ROOT / "target" / "relibc" / "THIRD-PARTY-NOTICES"
-    if notices.exists():
-        shutil.copy(notices, out / "relibc-THIRD-PARTY-NOTICES")
+    shutil.copy(notices, out / "relibc-THIRD-PARTY-NOTICES")
     shutil.copytree(ROOT / "docs" / "licenses", out / "crates")
     index = [f"stafeto {version}: kernel, services, tools GPL-3.0-or-later; "
              "libraries that programs link MIT; POSIX system layer "
              "GPL-3.0-or-later WITH GCC-exception-3.1",
-             f"relibc (pin {relibc_commit()[:8]}): see relibc-THIRD-PARTY-NOTICES"]
+             f"relibc (pin {relibc_commit()[:8]}): see relibc-THIRD-PARTY-NOTICES",
+             "crates from crates.io that the services and programs link"
+             " (virtio-drivers, smoltcp and theirs): see relibc-THIRD-PARTY-NOTICES"]
     for name in package_names():
         description = pkgdesc.load(name)
         index.append(f"{name} {description['version']}: {description['license']}")

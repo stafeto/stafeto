@@ -380,6 +380,9 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         &[],
         super::no_transport_probe,
     ));
+    // The quota of the network service's records covers what the service
+    // charges to it (netd_quota.rs).
+    steps.push(step("host", "netd quota", &[], super::netd_quota::check));
     steps.push(step("host", "counter read sites", &[], || {
         super::disasm::check_counter_read_sites(&super::root())
     }));

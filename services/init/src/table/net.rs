@@ -77,20 +77,15 @@ pub const NETD: Record = Record {
     }),
     priority: 35,
     ceiling: 35,
-    // The worst case, by the formula of the stage (reports/2026-11-04-net-p1a):
-    // the pages of `.data` and `.bss` of the release build (the pools of
-    // buffers are 4 096 of them: 256 places of 32 KiB and 1 024 of 8 KiB),
-    // the whole stack of 48 pages and 16 for the rest. `.bss` 19 727 361 bytes
-    // = 4 817 pages (the second device's interface, queues and books are in
-    // it, and the interest sets of epoll: 78 880 bytes), `.data` none:
-    // 4 817 + 48 + 16. The kernel does not charge the pages of `.bss` to the
-    // quota in the probe's runs, so the number is a bound that the
-    // measurement does not reach. The shared buffers of the sessions (64 of
-    // 256 KiB, BUFFER) add the tables of their mappings, which the service
-    // pays for: they lie one after another from BUFFERS_AT, so a table of the
-    // third level covers eight of them, and the probe's role B measured 9
-    // pages for 64 (30 pages charged with the first, 39 with the sixty-fourth).
-    // 16 pages are added for them, 37 left over the formula.
+    // What the kernel charges to this quota is the translation tables of the
+    // service's mappings (segments, stack, DMA objects, windows, the clients'
+    // buffers) and its kernel objects; init pays for the objects of `.data`,
+    // `.bss`, the stack and the DMA objects apart (init::quota::need_pages,
+    // worker.rs). `cargo xtask netd-quota` (a host step of ci) computes that
+    // need from the release build of netd and fails when a record of the
+    // service has less: 103 to 109 pages on 2026-11-05. The number here is
+    // still the stage's earlier worst case (the pages of `.bss` and the stack
+    // and a reserve) until it is cut to the check's need.
     quota: 4897 * PAGE,
     // 128 operations' handles of notification, the notary session, the page
     // of generations, and a reserve.

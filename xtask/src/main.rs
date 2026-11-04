@@ -55,6 +55,7 @@ mod net_curl;
 mod net_probe;
 mod net_vz;
 mod net_wget;
+mod netd_quota;
 mod obj_sites;
 mod openposix;
 mod ostest;
@@ -1610,6 +1611,8 @@ commands:
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
+  netd-quota  build the network service and check that the quota of its records
+            covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
   cpus-dialog [N]  check the CPUs in an ash dialog on N CPUs (4 by default): nproc, /proc/stat,
             the spread of loops over the CPUs, taskset, htop
@@ -1907,6 +1910,7 @@ fn main() {
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
+        Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
         Some("cpus-dialog") => args
@@ -3632,10 +3636,16 @@ fn bash_build() -> Result<(), String> {
 
 fn build_relibc() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))?;
-    // The notices follow each build of relibc.
+    // The notices follow each build of relibc, each change of the crates
+    // the workspace links (Cargo.lock) and of the script that writes them.
     let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let library = modified(target_dir().join("relibc/sysroot/lib/libc.a"));
-    if modified(notices_path()) < library {
+    let inputs = [
+        target_dir().join("relibc/sysroot/lib/libc.a"),
+        root().join("Cargo.lock"),
+        root().join("tools/check-licenses.py"),
+    ];
+    let newest = inputs.into_iter().map(modified).max().flatten();
+    if modified(notices_path()) < newest {
         run_cmd(
             Command::new("python3")
                 .arg(root().join("tools/check-licenses.py"))
