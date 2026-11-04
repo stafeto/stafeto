@@ -38,7 +38,8 @@ to `target/dist/`.
 | `SHA256SUMS` | SHA-256 of every file above |
 
 `LICENSES/relibc-THIRD-PARTY-NOTICES` holds the licence texts of relibc and
-of every crate from crates.io that a shipped binary links: the layer's, the
+of every crate from crates.io that a binary the workspace builds for the
+target links (the probes of the test images included): the layer's, the
 drivers' (virtio-drivers and its crates) and the network service's (smoltcp
 and its crates). `tools/check-licenses.py` writes it; `--verify`, which
 `tools/dist.py` runs, fails when the file misses one of those crates.

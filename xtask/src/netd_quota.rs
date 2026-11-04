@@ -35,7 +35,10 @@ const PAGE: u64 = 4096;
 /// besides the tables of the mappings of its records: the mapping table,
 /// the message buffer's mapping, its threads, channels and timer, the
 /// blocks of its handle table, and the mappings it makes as it runs (the
-/// clients' buffers).
+/// clients' buffers). The buffers are BUFFERS_MAX (64) of 256 KiB, one after
+/// another from BUFFERS_AT (services/netd/src/config.rs, dma.rs): 16 MiB,
+/// which take at most 8 tables of the third level and one of the second, so
+/// the 39 pages role B measured with all 64 mapped is the most they reach.
 pub const OBJECTS_MARGIN: u64 = 64;
 
 /// Every record of the service: they share NETD's quota.

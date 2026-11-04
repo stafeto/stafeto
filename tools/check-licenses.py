@@ -9,7 +9,8 @@ BusyBox apart from bare GPLv3 code, and the crates of the drivers. Runs in
 `cargo xtask ci` right after `cargo xtask relibc`, whose fork it reads
 (target/relibc/source). Writes target/relibc/THIRD-PARTY-NOTICES from the
 licence files of relibc's closure and of every crate from outside the
-workspace that the kernel, the services and the programs link; `--verify`
+workspace that a binary the workspace builds for the target links (the
+kernel, the services, the programs and the probes of the test images); `--verify`
 only checks that the file names each of those crates (tools/dist.py runs it
 before it ships the file)."""
 
@@ -297,9 +298,11 @@ def chosen(files: list, license_name: str) -> tuple[list, str]:
 
 
 def shipped() -> list:
-    """The crates from outside the workspace that any shipped binary links:
-    the kernel, the services, the programs, and through the layer libc.so;
-    each with its title in THIRD-PARTY-NOTICES and its package."""
+    """The crates from outside the workspace that any binary built for the
+    target links: the kernel, the services, the programs and the probes of
+    the test images (whose images carry the notices too), and through the
+    layer libc.so; each with its title in THIRD-PARTY-NOTICES and its
+    package."""
     data = metadata(ROOT, "--all-features", "--filter-platform", "aarch64-unknown-none")
     packages = {package["id"]: package for package in data["packages"]}
     named = {package["name"]: package for package in data["packages"]}
@@ -351,10 +354,10 @@ def verify_notices() -> None:
     crates = [f"{package['name']} {package['version']}" for _, package in shipped()]
     missing = [crate for crate in crates if crate not in written]
     if missing:
-        fail(f"{NOTICES} misses crates that shipped binaries link: {', '.join(missing)};"
+        fail(f"{NOTICES} misses crates that binaries built for the target link: {', '.join(missing)};"
              " run tools/check-licenses.py --notices")
-    print(f"{NOTICES.name} names all {len(crates)} crates from outside that shipped"
-          " binaries link")
+    print(f"{NOTICES.name} names all {len(crates)} crates from outside that binaries"
+          " built for the target link")
 
 
 def relibc() -> None:
