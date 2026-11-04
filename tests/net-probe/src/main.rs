@@ -436,6 +436,24 @@ impl Probe<'_> {
         self.bind(&net, third, [0; 4], 8080)
             .map_err(|_| "BIND of a port after its holder closed failed")?;
         self.close(&net, third).map_err(|_| "CLOSE failed")?;
+        // A datagram to an address beyond the gateway leaves with the
+        // external address as its source; the counters of the next CONFIG
+        // would show a frame of 127.0.0.0/8 the wire refused.
+        let datagram = self
+            .new_socket(&net, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        let send = Request::Send {
+            key: None,
+            description: datagram,
+            flags: 0,
+            address: Address::v4([192, 0, 2, 1], 9),
+            data: b"beyond",
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        socket_call(&net, &send, &mut buffer).map_err(|_| "UDP SEND beyond the gateway failed")?;
+        self.sleep(50_000_000);
+        self.close(&net, datagram).map_err(|_| "CLOSE failed")?;
+        config(&net).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: bind ok");
         Ok(())
     }
@@ -479,8 +497,8 @@ impl Probe<'_> {
         let mut links = [Link::default(); PAIRS_MAX];
         let mut listeners = [(0usize, 0u32); PAIRS_MAX];
         let ok = self.config_ready(&root)?;
-        if places >= 64 {
-            self.full_clone(&root)?;
+        if places >= 16 {
+            self.full_clone(&root, places.min(64))?;
         }
         // The listeners, each with a queue of one: 2 places each.
         for (i, listener) in listeners.iter_mut().enumerate().take(pairs) {
@@ -592,33 +610,35 @@ impl Probe<'_> {
         for _ in 0..PINGS_ROLE_S {
             ping(&root, ok).map_err(|_| "a PING of the gateway failed")?;
         }
+        // The counters of the service go to the console with CONFIG.
+        config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: sockets {places} ok");
         *keep = Some(root);
         Ok(())
     }
 
-    /// CLONE of a session that holds 64 descriptions, the most it may: the
-    /// child holds them as the parent does and lets go of them in steps when
-    /// it ends. The longest step of the method (kind 19) is this one.
-    fn full_clone(&self, net: &Handle<Channel>) -> Result<(), &'static str> {
-        let mut list = [0u32; 64];
-        for d in &mut list {
+    /// CLONE of a session that holds `count` descriptions, 64 the most it
+    /// may: the child holds them as the parent does and lets go of them in
+    /// steps when it ends. The longest step of the method (kind 19) is this
+    /// one, at 64.
+    fn full_clone(&self, net: &Handle<Channel>, count: usize) -> Result<(), &'static str> {
+        let mut all = [0u32; 64];
+        for d in &mut all[..count] {
             *d = self
                 .new_socket(net, sockets::DGRAM)
                 .map_err(|_| "SOCKET failed")?;
         }
-        let child = self
-            .clone_with(net, &list)
-            .map_err(|_| "CLONE of 64 failed")?;
+        let list = &all[..count];
+        let child = self.clone_with(net, list).map_err(|_| "CLONE failed")?;
         // The child's first request takes its descriptions.
         let mut buffer = [0; MESSAGE_MAX];
         let name = Request::Name {
-            description: list[63],
+            description: list[count - 1],
             which: sockets::OWN_NAME,
         };
         socket_call(&child, &name, &mut buffer)
             .map_err(|_| "the clone does not hold its descriptions")?;
-        for d in list {
+        for &d in list {
             self.close(net, d).map_err(|_| "CLOSE failed")?;
         }
         // The child's end lets go of the rest in steps; the places come back.
