@@ -85,8 +85,11 @@ pub const NETD: Record = Record {
     // it, and the interest sets of epoll: 78 880 bytes), `.data` none:
     // 4 817 + 48 + 16. The kernel does not charge the pages of `.bss` to the
     // quota in the probe's runs, so the number is a bound that the
-    // measurement does not reach.
-    quota: 4881 * PAGE,
+    // measurement does not reach. The shared buffers of the sessions (64 of
+    // 256 KiB, BUFFER) add the tables of their mappings, which the service
+    // pays for: a table of the third level and the nodes of the table of
+    // mappings for each, 96 pages in all.
+    quota: 4977 * PAGE,
     // 128 operations' handles of notification, the notary session, the page
     // of generations, and a reserve.
     handle_limit: 192,
@@ -360,7 +363,8 @@ pub const NETD_TWO: Record = Record {
 /// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
 /// fill a frame, `W` the host's datagrams of full frames echoed, `C` CLONE and CLONE_MORE of
 /// 1 000 descriptions, `A` ABANDON of 16 operations, `E` epoll (sets, the wait, the step of waking and the drop of sets), `x` passes of EXPORT and ADOPT and the time limits of operations, `k` CRASH of the service and the same as `c` through a new
-/// session. The images of the measurement of the steps (`net-sockets-N`) run
+/// session, `G` 1 MiB through a shared buffer and `B` 64 sessions with shared
+/// buffers. The images of the measurement of the steps (`net-sockets-N`) run
 /// `s` at 8, 64 and 256 places; the others at the limit of the sockets the
 /// service serves (netd::places::SOCKETS_LIMIT, which a test of xtask
 /// compares with the number here).
@@ -396,6 +400,8 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"clk"
 } else if cfg!(feature = "net-timers") {
     b"crk"
+} else if cfg!(feature = "net-buffers") {
+    b"cGBk"
 } else {
     b"cbs1280k"
 };
@@ -407,8 +413,18 @@ pub const PROBE: Record = Record {
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 64 * PAGE,
-    handle_limit: 64,
+    // Roles `G` and `B` keep a shared buffer of 64 pages, an object of 32
+    // and 65 sessions.
+    quota: if cfg!(feature = "net-buffers") {
+        192 * PAGE
+    } else {
+        64 * PAGE
+    },
+    handle_limit: if cfg!(feature = "net-buffers") {
+        128
+    } else {
+        64
+    },
     restart: Restart::Never,
     console: true,
     log: false,

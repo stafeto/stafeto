@@ -41,6 +41,7 @@
 //!   and a CLONE_MORE of a session that did not make the birth is refused.
 //! - `A`: 16 operations wait in one session, which asks ABANDON until none is
 //!   left: the service lets go of four in each answer.
+//! - `G` and `B`: the shared buffers (buffers.rs).
 //! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
 //!   of the loopback that is dropped is sent again by the retransmission
 //!   timer.
@@ -50,6 +51,8 @@
 
 #![no_std]
 #![no_main]
+
+mod buffers;
 
 use abi::{Error, MESSAGE_MAX};
 use proto_init::ServiceArgs;
@@ -87,6 +90,7 @@ fn main(_: u64) -> u64 {
     };
     let probe = Probe {
         parent: &start.parent,
+        process: &start.process,
         channel,
         waiter,
         level,
@@ -123,6 +127,8 @@ fn main(_: u64) -> u64 {
             b'A' => probe.abandon_many(&mut session),
             b'E' => probe.epoll_sets(&mut session),
             b'x' => probe.passes(&mut session),
+            b'G' => probe.portion(&mut session),
+            b'B' => probe.buffer_sessions(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -143,6 +149,8 @@ fn main(_: u64) -> u64 {
 
 struct Probe<'a> {
     parent: &'a Handle<Channel>,
+    /// The probe's own process, for the mapping of its shared buffer.
+    process: &'a Handle<rt::handle::Process>,
     channel: Handle<Channel>,
     waiter: Waiter,
     /// The level of the probe's thread, for the handles it makes.
