@@ -37,6 +37,12 @@ to `target/dist/`.
 | `stafeto-<version>-sbom.spdx.json` | SPDX 2.3: name, version, licence, URL and SHA-256 of stafeto, relibc and every package |
 | `SHA256SUMS` | SHA-256 of every file above |
 
+`LICENSES/relibc-THIRD-PARTY-NOTICES` holds the licence texts of relibc and
+of every crate from crates.io that a shipped binary links: the layer's, the
+drivers' (virtio-drivers and its crates) and the network service's (smoltcp
+and its crates). `tools/check-licenses.py` writes it; `--verify`, which
+`tools/dist.py` runs, fails when the file misses one of those crates.
+
 The notes come from `tools/release-notes.py`: the summary written for the
 version in `docs/releases/<version>.md` (a short introduction when there is
 none), the table of files and a link to the changes since the previous `v*`

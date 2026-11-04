@@ -10,6 +10,8 @@ publish = false
 [dependencies]
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
+# The records of the network service, whose quota `netd-quota` checks.
+init = { path = "../services/init" }
 kcore = { path = "../kcore" }
 netd = { path = "../services/netd" }
 proto-net = { path = "../proto/net" }

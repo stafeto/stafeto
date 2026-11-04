@@ -1245,6 +1245,7 @@ dependencies = [
  "abi",
  "bootimg",
  "entries",
+ "init",
  "kcore",
  "netd",
  "posix-fd",

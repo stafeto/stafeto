@@ -8,7 +8,10 @@ and its dependencies under licences GPL-2.0-only takes, the GPL-2.0-only
 BusyBox apart from bare GPLv3 code, and the crates of the drivers. Runs in
 `cargo xtask ci` right after `cargo xtask relibc`, whose fork it reads
 (target/relibc/source). Writes target/relibc/THIRD-PARTY-NOTICES from the
-licence files of relibc's closure."""
+licence files of relibc's closure and of every crate from outside the
+workspace that the kernel, the services and the programs link; `--verify`
+only checks that the file names each of those crates (tools/dist.py runs it
+before it ships the file)."""
 
 import hashlib
 import importlib.util
@@ -42,6 +45,9 @@ EXCEPTION = "GPL-3.0-or-later WITH GCC-exception-3.1"
 # every POSIX program's process before it (spec 2, 3.2), so it takes the
 # programs' terms too.
 LINK_ROOTS = ("posix-crt", "posix-platform", "loader")
+# The workspace members that run on the host alone; every other member
+# builds for the target, and the images take their binaries from them.
+HOST_ONLY = ("xtask",)
 # The exception's text from the SPDX licence list (spec 2, 5), unchanged.
 EXCEPTION_FILE = ROOT / "LICENSE-GCC-exception-3.1"
 EXCEPTION_SHA256 = "7103d4f7f7e2f8ce10d282a05e0689637f8d6d9ef7b399d808d1da313e69b960"
@@ -266,8 +272,15 @@ def drivers(data: dict, packages: dict, named: dict) -> None:
 
 
 def licence_files(directory: Path) -> list[Path]:
-    return sorted(path for path in directory.iterdir() if path.is_file() and re.match(
-        r"(LICEN[CS]E|COPYING|UNLICENSE|NOTICE|COPYRIGHT)", path.name, re.I))
+    """The licence files of a source tree: at its top, and in a LICENSES
+    directory as the REUSE layout keeps them (crc-catalog)."""
+    pattern = r"(LICEN[CS]E|COPYING|UNLICENSE|NOTICE|COPYRIGHT)"
+    files = [path for path in directory.iterdir()
+             if path.is_file() and re.match(pattern, path.name, re.I)]
+    reuse = directory / "LICENSES"
+    if reuse.is_dir():
+        files += [path for path in reuse.iterdir() if path.is_file()]
+    return sorted(files)
 
 
 def chosen(files: list, license_name: str) -> tuple[list, str]:
@@ -283,24 +296,65 @@ def chosen(files: list, license_name: str) -> tuple[list, str]:
     return files, license_name
 
 
-def layer_outside() -> list:
-    """The crates from outside the workspace that the layer links into
-    every program (item 1's closure), with their licence files."""
+def shipped() -> list:
+    """The crates from outside the workspace that any shipped binary links:
+    the kernel, the services, the programs, and through the layer libc.so;
+    each with its title in THIRD-PARTY-NOTICES and its package."""
     data = metadata(ROOT, "--all-features", "--filter-platform", "aarch64-unknown-none")
     packages = {package["id"]: package for package in data["packages"]}
     named = {package["name"]: package for package in data["packages"]}
-    linked = closure(data, [named[name]["id"] for name in LINK_ROOTS])
     members = set(data["workspace_members"])
-    notices = []
-    for package_id in sorted(linked - members, key=lambda i: packages[i]["name"]):
+    layer = closure(data, [named[name]["id"] for name in LINK_ROOTS])
+    users = {}
+    for root in members:
+        package = packages[root]
+        if package["name"] in HOST_ONLY:
+            continue
+        if not any("bin" in target["kind"] for target in package["targets"]):
+            continue
+        for package_id in closure(data, [root]) - members:
+            users.setdefault(package_id, set()).add(package["name"])
+    crates = []
+    for package_id in sorted(users.keys() | (layer - members),
+                             key=lambda i: (packages[i]["name"], packages[i]["version"])):
         package = packages[package_id]
+        if package_id in layer:
+            where = "the layer"
+        else:
+            where = "linked by " + ", ".join(sorted(users[package_id]))
+        crates.append((f"{package['name']} {package['version']} ({where})", package))
+    return crates
+
+
+def shipped_notices() -> list:
+    """The licence files of shipped(): a GPL-3.0-or-later binary takes the
+    permissive licences, the layer's crates also GPL-2.0-only's (item 1)."""
+    notices = []
+    for title, package in shipped():
+        license_name = package["license"] or ""
+        if not (allowed(license_name) or license_name in PERMISSIVE):
+            fail(f"a shipped binary links {package['name']} under {license_name!r}")
         files = licence_files(Path(package["manifest_path"]).parent)
         if not files:
-            fail(f"programs link {package['name']}, which ships no licence file")
-        files, license_name = chosen(files, package["license"] or "")
-        notices.append((f"{package['name']} {package['version']} (the layer)", license_name,
-                        files))
+            fail(f"a shipped binary links {package['name']}, which ships no licence file")
+        files, license_name = chosen(files, license_name)
+        notices.append((title, license_name, files))
     return notices
+
+
+def verify_notices() -> None:
+    """THIRD-PARTY-NOTICES names every crate shipped() finds."""
+    if not NOTICES.exists():
+        fail(f"no {NOTICES}; run cargo xtask relibc first")
+    # A section starts with a rule and "<name> <version> (<where>): <licence>".
+    written = set(re.findall(r"^={72}\n(\S+ \S+) \(", NOTICES.read_text(), re.M))
+    crates = [f"{package['name']} {package['version']}" for _, package in shipped()]
+    missing = [crate for crate in crates if crate not in written]
+    if missing:
+        fail(f"{NOTICES} misses crates that shipped binaries link: {', '.join(missing)};"
+             " run tools/check-licenses.py --notices")
+    print(f"{NOTICES.name} names all {len(crates)} crates from outside that shipped"
+          " binaries link")
 
 
 def relibc() -> None:
@@ -381,7 +435,7 @@ def relibc() -> None:
         if "General Public License" in text or re.search(r"SPDX-License-Identifier:.*(?:GPL|LGPL)", text):
             fail(f"OpenLibm linked source or header {source.relative_to(math)} is under a GNU licence")
     notices.append(("OpenLibm (static C runtime and headers)", license_name, [RELIBC / path]))
-    write_notices(notices + layer_outside())
+    write_notices(notices + shipped_notices())
     print(f"relibc links {len(linked)} crates and {len(notices) - len(linked)} more parts,"
           " all under licences GPL-2.0-only takes")
 
@@ -389,8 +443,9 @@ def relibc() -> None:
 def write_notices(notices) -> None:
     """The licence files of each part; a text met before (equal but for
     spacing) is named and written once. A file may be a text of its own."""
-    parts = ["Third-party notices: relibc, the crates the layer takes from"
-             " outside, and what they link into stafeto programs.\n"]
+    parts = ["Third-party notices: relibc and what it links into stafeto programs,"
+             " and the crates from outside that the layer, the services and the"
+             " programs link.\n"]
     seen = {}
     for title, license_name, files in notices:
         parts.append(f"\n{'=' * 72}\n{title}: {license_name}\n{'=' * 72}\n")
@@ -409,9 +464,14 @@ def write_notices(notices) -> None:
 def main() -> None:
     # --notices: relibc's closure and THIRD-PARTY-NOTICES alone (item 6),
     # for cargo xtask relibc, which puts the file into the boot images.
+    # --verify: only check that the file names every shipped crate.
+    if "--verify" in sys.argv[1:]:
+        verify_notices()
+        return
     if "--notices" not in sys.argv[1:]:
         workspace()
     relibc()
+    verify_notices()
 
 
 if __name__ == "__main__":
