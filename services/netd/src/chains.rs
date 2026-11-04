@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The places that are bound, in a chain for each port: the check of a new
-//! bind (`ports::conflicts`) looks at the places of that port alone, not at
-//! every place of the table, so BIND costs the same at 8 places and at 1 280.
+//! bind (`ports::conflicts`) looks at the places of that port alone, and no
+//! longer at every place of the table, so BIND costs the same at 8 places and at 1 280.
 //! The head of the chain of a port is in a table of 65 536 entries; each
 //! place has its next and its previous in the chain, so a place goes out in
 //! O(1) (the accepted sockets of a server all share its port, and 500 of them
