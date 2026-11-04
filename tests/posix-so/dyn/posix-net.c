@@ -240,12 +240,14 @@ static void fork_900(void)
 		}
 		_exit(0);
 	}
+	/* The child ends first: a child that lacks the descriptors fails here, not
+	 * in a wait for bytes it never wrote. */
+	REQUIRE(wait_exit(child) == 0);
 	long took = now_ms() - began;
 	for (int i = 90; i < 100; i++) {
 		char got = 0;
 		REQUIRE(recv(server[i], &got, 1, 0) == 1 && got == (char)('0' + i % 10));
 	}
-	REQUIRE(wait_exit(child) == 0);
 	printf("posix-net: fork-900 took %ld ms\n", took);
 	close_from(3);
 }
