@@ -31,6 +31,10 @@
 //!   eight sessions with queues of 16 go at once.
 //! - `u`: 150 echo requests of 1 472 bytes to the gateway, frames of the wire
 //!   at full size in both directions, for the cost of a frame of the wire.
+//! - `W`: a UDP socket on port 7000 echoes 2 000 datagrams that the host
+//!   sends through a forwarded port, at 1 472 bytes each (frames of 1 514
+//!   bytes on the wire); the first 800 bytes of each come back. The cost of
+//!   the frames of the wire, for the choice of the portions of the steps.
 //! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
 //!   of the loopback that is dropped is sent again by the retransmission
 //!   timer.
@@ -108,6 +112,7 @@ fn main(_: u64) -> u64 {
             b'l' => probe.listeners(&mut session),
             b'r' => probe.timers(&mut session),
             b'u' => probe.wire(&mut session),
+            b'W' => probe.wire_echo(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -1764,7 +1769,61 @@ impl Probe<'_> {
     }
 }
 
+/// The port of the echo of role `W` and the datagrams it takes.
+const WIRE_ECHO_PORT: u32 = 7000;
+const WIRE_ECHO_COUNT: usize = 2_000;
+
 impl Probe<'_> {
+    /// Role `W`: the host's datagrams of full frames, echoed.
+    fn wire_echo(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let socket = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.bind(&root, socket, [0, 0, 0, 0], WIRE_ECHO_PORT)
+            .map_err(|_| "BIND failed")?;
+        rt::println!("net-probe: wire echo ready {WIRE_ECHO_PORT}");
+        let recv = Request::Recv {
+            key: None,
+            description: socket,
+            flags: 0,
+            most: proto_net::DATA_MAX as u32,
+        };
+        for _ in 0..WIRE_ECHO_COUNT {
+            let end = self.now() + WAIT_NS;
+            let mut buffer = [0; MESSAGE_MAX];
+            let len = loop {
+                match socket_call(&root, &recv, &mut buffer).map(|b| b.len()) {
+                    Ok(len) => break len,
+                    Err(fail) if is(&fail, proto_net::AGAIN) && self.now() < end => {
+                        self.sleep(PAUSE_NS / 10)
+                    }
+                    Err(_) => return Err("RECV of a datagram of the host failed"),
+                }
+            };
+            let data = ready(&buffer[..len]).map_err(|_| "RECV's reply")?;
+            let (_, from, bytes) = sockets::read_received(data).map_err(|_| "RECV's data")?;
+            let mut reply = [0; MESSAGE_MAX];
+            let send = Request::Send {
+                key: None,
+                description: socket,
+                flags: 0,
+                address: from,
+                data: bytes,
+            };
+            socket_call(&root, &send, &mut reply).map_err(|_| "SEND of the echo failed")?;
+        }
+        self.close(&root, socket).map_err(|_| "CLOSE failed")?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: wire echo ok {WIRE_ECHO_COUNT}");
+        *keep = Some(root);
+        Ok(())
+    }
+
     /// Role `u`.
     fn wire(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
         let root = match keep.take() {

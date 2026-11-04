@@ -108,6 +108,8 @@ net-idle = []
 net-listen = []
 net-timers = []
 net-wire = []
+# Role `W`: the host's datagrams of full frames through a forwarded port.
+net-wire-echo = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

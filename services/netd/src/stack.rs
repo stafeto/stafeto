@@ -564,6 +564,7 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         // (an echo reply, a reset, an unreachable) costs two frames and
         // takes the whole step: first in the step it ends the receiving,
         // later it waits for the next step.
+        let wire = device.held_is_wire();
         let answered = device.held_is_answered(dest, place.is_some());
         if answered && !first {
             device.defer_held();
@@ -591,7 +592,11 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         }
         let spent = split::now() - began;
         split::record(
-            split::FRAME_RX,
+            if wire {
+                split::FRAME_RX_WIRE
+            } else {
+                split::FRAME_RX
+            },
             spent.saturating_sub(split::get(&split::TX) - sent),
         );
         split::add(&split::RX_TURNS, spent);

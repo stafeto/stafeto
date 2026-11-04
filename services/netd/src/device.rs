@@ -358,6 +358,13 @@ impl<const D: usize> NetDevice<D> {
         frames::answered(dest, routed, &slice[HDR_LEN..HDR_LEN + length])
     }
 
+    /// Whether the frame `stage` took came from the wire (the breakdown of the
+    /// steps tells the frames of the wire from those of the loopback).
+    #[allow(dead_code)] // read by the feature `split` only.
+    pub fn held_is_wire(&self) -> bool {
+        matches!(self.held, Some(Held::Wire { .. }))
+    }
+
     /// Puts the frame `stage` took aside for the next step of receiving.
     pub fn defer_held(&mut self) {
         if let Some(Held::Wire { buffer, length }) = self.held.take() {
@@ -576,16 +583,22 @@ impl<const D: usize> phy::TxToken for TxToken<'_, D> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let began = crate::split::now();
-        let result = self.consume_frame(len, f);
+        let (result, wire) = self.consume_frame(len, f);
         let spent = crate::split::now() - began;
-        crate::split::record(crate::split::FRAME_TX, spent);
+        let part = if wire {
+            crate::split::FRAME_TX_WIRE
+        } else {
+            crate::split::FRAME_TX
+        };
+        crate::split::record(part, spent);
         crate::split::add(&crate::split::TX, spent);
         result
     }
 }
 
 impl<const D: usize> TxToken<'_, D> {
-    fn consume_frame<R, F>(self, len: usize, f: F) -> R
+    /// The frame built and where it went: true for the wire.
+    fn consume_frame<R, F>(self, len: usize, f: F) -> (R, bool)
     where
         F: FnOnce(&mut [u8]) -> R,
     {
@@ -601,7 +614,7 @@ impl<const D: usize> TxToken<'_, D> {
             // (ARP and the echo reply are retried by their peers).
             ring.counters.dropped += 1;
             let len = len.min(MAX_FRAME);
-            return f(&mut ring.scratch[..len]);
+            return (f(&mut ring.scratch[..len]), false);
         };
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer_at::<D>(n) };
@@ -612,21 +625,21 @@ impl<const D: usize> TxToken<'_, D> {
             if ring.drop_loop > 0 {
                 ring.drop_loop -= 1;
                 ring.book.release(n);
-                return result;
+                return (result, false);
             }
             if !self.looped.push(n, len) {
                 ring.counters.dropped += 1;
                 ring.book.release(n);
             }
-            return result;
+            return (result, false);
         }
         if frames::martian(frame) {
             ring.book.release(n);
             ring.counters.martian += 1;
-            return result;
+            return (result, false);
         }
         ring.submit(n, len);
-        result
+        (result, true)
     }
 }
 

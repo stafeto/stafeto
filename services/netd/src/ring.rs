@@ -23,8 +23,10 @@ pub const BUFFERS: usize = RX_BUFFERS + TX_BUFFERS;
 pub const NET_PAGES: usize = BUFFERS * BUFFER_LEN / 4096;
 /// The frames a step of receiving takes and the frames a step of sending
 /// sends at most (the bound of a step, so that a flood leaves the loop its
-/// other work): by the measurement of stage P1a, reports/2026-11-04-net-p1a.
-/// The features `batch-N` (receiving) and `send-N` (sending) build the other
+/// other work): by the measurement of stage P4a-1, which prices the frames
+/// of the wire at full size (6 656 ticks received, 5 632 sent, p90) beside
+/// those of the loopback (2 048 and 768): two frames received cost an
+/// estimated 14 336 ticks, a group and a frame sent 12 800. The features `batch-N` (receiving) and `send-N` (sending) build the other
 /// values, for the measurement that chose these.
 #[cfg(feature = "batch-16")]
 pub const STEP_RX: usize = 16;
@@ -69,7 +71,7 @@ pub const STEP_TX: usize = 1;
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
 /// The groups of sockets the pass of sending visits in one step, by the
-/// measurement of stage P1a (reports/2026-11-04-net-p1a). The features
+/// measurement of stage P4a-1 (see STEP_RX). The features
 /// `egress-1` and `egress-4` build the other values, for the measurement.
 #[cfg(feature = "egress-1")]
 pub const EGRESS_GROUPS: usize = 1;
