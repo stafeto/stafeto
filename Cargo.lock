@@ -460,6 +460,7 @@ dependencies = [
  "posix-fd",
  "posix-path",
  "proto-fs",
+ "proto-net",
  "proto-pipe",
  "proto-tty",
  "proto-wire",

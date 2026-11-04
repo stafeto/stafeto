@@ -219,6 +219,9 @@ pub enum Target {
     /// in the description of this number in the layer's own table. No
     /// service holds it, so a close of it asks no one.
     Proc(u32),
+    /// A socket of the network service by its description (`proto_net`),
+    /// held in the process's session with that service.
+    Net(u32),
 }
 
 impl Target {
@@ -254,6 +257,26 @@ fn release_proc(id: u32) {
     let hook = PROC_RELEASE.load(core::sync::atomic::Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `set_proc_release` stores a value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(id);
+    }
+}
+
+/// The function that closes a `Target::Net` description in the network
+/// service when its last descriptor closes (0 until `set_net_release`).
+static NET_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Names the function that closes the description `id` of a `Target::Net`:
+/// the session with the network service lives in the ABI layer, not in the
+/// transport.
+pub fn set_net_release(release: fn(u32)) {
+    NET_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn release_net(id: u32) {
+    let hook = NET_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_net_release` stores a value, a `fn(u32)`.
         let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
         hook(id);
     }
@@ -444,6 +467,10 @@ impl Transport {
             Some(Target::Tty(id)) => self.close_terminal(id),
             Some(Target::Proc(id)) => {
                 release_proc(id);
+                Ok(())
+            }
+            Some(Target::Net(id)) => {
+                release_net(id);
                 Ok(())
             }
             _ => Ok(()),
@@ -698,6 +725,17 @@ impl Transport {
                     ..CONSOLE_INFO
                 })
             }
+            Target::Net(description) => Ok(NodeInfo {
+                kind: SOCKET,
+                permissions: 0o600,
+                device: 6,
+                special_device: 0,
+                inode: proto_net::sockets::slot(description) as u64 + 1,
+                links: 1,
+                size: 0,
+                block_size: 16_384,
+                ..CONSOLE_INFO
+            }),
             // Unnamed console transport; richer terminal metadata comes with
             // the terminal service and its namespace entry.
             _ => Ok(CONSOLE_INFO),
@@ -1270,6 +1308,21 @@ impl PosixFs {
         count
     }
 
+    /// Socket descriptions retained by a forked child, each once.
+    pub fn nets_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, flags) in self.descriptors.open() {
+            if !flags.close_on_fork
+                && let Target::Net(description) = target
+                && !out[..count].contains(&description)
+            {
+                out[count] = description;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// The session with the RAM file service and the console's driver's,
     /// which a child gets clones of.
     /// Authenticate the file session before any operation can commit.
@@ -1602,5 +1655,64 @@ impl PosixFs {
         out: &mut [u8],
     ) -> Result<Option<DirEntry>, FsError> {
         self.transport().readdir(self.target(dir.fd)?, out)
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+    use core::mem::ManuallyDrop;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use rt::{
+        fs::Files,
+        handle::{Channel, Handle},
+    };
+
+    static CLOSED: AtomicU32 = AtomicU32::new(0);
+
+    fn closed(description: u32) {
+        CLOSED.store(description, Ordering::SeqCst);
+    }
+
+    fn files() -> ManuallyDrop<PosixFs> {
+        ManuallyDrop::new(
+            PosixFs::from_files(Files::from_sessions(
+                Handle::<Channel>::from_raw(rt::abi::Handle::new(7, 9)),
+                None,
+            ))
+            .unwrap(),
+        )
+    }
+
+    /// A socket is a descriptor of its own kind: the child of a fork keeps
+    /// each description once and not the ones marked close-on-fork, the
+    /// last close hands the description to the hook, and `fstat` answers
+    /// from the layer.
+    #[test]
+    fn a_socket_descriptor_is_kept_by_fork_closed_by_hook_and_stat_without_a_request() {
+        let mut files = files();
+        let both = DescriptorFlags::default();
+        let a = files.insert(Target::Net(0x1005), both).unwrap();
+        let b = files.insert(Target::Net(0x1005), both).unwrap();
+        let skipped = DescriptorFlags {
+            close_on_exec: false,
+            close_on_fork: true,
+        };
+        files.insert(Target::Net(0x2006), skipped).unwrap();
+        let c = files.insert(Target::Net(0x3007), both).unwrap();
+        let mut kept = [0; OPEN_MAX];
+        let count = files.nets_kept_by_fork(&mut kept);
+        assert_eq!(&kept[..count], &[0x1005, 0x3007]);
+        let info = files.descriptor_information(a).unwrap();
+        assert_eq!(
+            (info.kind, info.permissions, info.device, info.inode),
+            (SOCKET, 0o600, 6, 6)
+        );
+        set_net_release(closed);
+        files.close(a).unwrap();
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 0, "another descriptor holds it");
+        files.close(b).unwrap();
+        assert_eq!(CLOSED.load(Ordering::SeqCst), 0x1005);
+        let _ = c;
     }
 }

@@ -18,6 +18,7 @@ posix-path = { path = "../posix-path" }
 proto-fs = { path = "../../proto/fs" }
 proto-wire = { path = "../../proto/wire" }
 rt = { path = "../rt" }
+proto-net = { path = "../../proto/net" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
 
