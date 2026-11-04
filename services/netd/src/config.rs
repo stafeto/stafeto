@@ -20,6 +20,9 @@
 //!   kept and not used.
 //! * `handover 0` or `handover 1`: parsed and kept; the second device
 //!   uses it (a later stage).
+//! * `buffers N`: how many sessions may hold a shared buffer (BUFFER) at
+//!   once, 0 to `BUFFERS_MAX`; 0 turns the path of the buffers off. Without
+//!   the line the limit is `BUFFERS_MAX`.
 //! * A key twice, an unknown key, a word more, a bad address: an error with
 //!   the line's number, counted from 1.
 //!
@@ -28,6 +31,9 @@
 /// The most a file holds, and a line.
 pub const FILE_MAX: usize = 1024;
 pub const LINE_MAX: usize = 128;
+
+/// The most sessions with a shared buffer, and the limit without a line.
+pub const BUFFERS_MAX: u16 = 64;
 
 /// An IPv4 address with the length of its network prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +52,15 @@ pub struct Settings {
     pub gateway: Option<[u8; 4]>,
     pub dns: Option<[u8; 4]>,
     pub handover: Option<bool>,
+    /// The line `buffers`, when the file has one (`Settings::buffers`).
+    pub buffers_line: Option<u16>,
+}
+
+impl Settings {
+    /// How many sessions may hold a shared buffer at once.
+    pub fn buffers(&self) -> u16 {
+        self.buffers_line.unwrap_or(BUFFERS_MAX)
+    }
 }
 
 /// Why a file is refused.
@@ -61,6 +76,7 @@ pub enum Reason {
     BadAddress,
     BadPrefix,
     BadHandover,
+    BadBuffers,
     NeedsAddress,
     GatewayOutside,
     NotUnicast,
@@ -81,6 +97,7 @@ impl Reason {
             Reason::BadAddress => "bad address",
             Reason::BadPrefix => "bad prefix length",
             Reason::BadHandover => "handover is 0 or 1",
+            Reason::BadBuffers => "buffers is a number from 0 to 64",
             Reason::NeedsAddress => "gateway and dns need an address line",
             Reason::GatewayOutside => "the gateway is outside the network of the address",
             Reason::NotUnicast => "not a unicast address (0.x.x.x, multicast or broadcast)",
@@ -197,7 +214,7 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
     let key = words.next().ok_or(Reason::NoValue)?;
     let known = matches!(
         key,
-        b"address" | b"address1" | b"gateway" | b"dns" | b"handover"
+        b"address" | b"address1" | b"gateway" | b"dns" | b"handover" | b"buffers"
     );
     if !known {
         return Err(Reason::UnknownKey);
@@ -220,6 +237,18 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
         }
         b"gateway" => set(&mut settings.gateway, unicast_ip(value)?),
         b"dns" => set(&mut settings.dns, unicast_ip(value)?),
+        b"buffers" => {
+            if value.is_empty() || value.len() > 2 || !value.iter().all(u8::is_ascii_digit) {
+                return Err(Reason::BadBuffers);
+            }
+            let n = value
+                .iter()
+                .fold(0u16, |n, &d| n * 10 + u16::from(d - b'0'));
+            if n > BUFFERS_MAX {
+                return Err(Reason::BadBuffers);
+            }
+            set(&mut settings.buffers_line, n)
+        }
         _ => {
             let on = match value {
                 b"0" => false,
@@ -295,6 +324,43 @@ pub fn parse(file: &[u8]) -> Result<Settings, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffers_takes_zero_to_sixty_four() {
+        assert_eq!(parse(b"").unwrap().buffers(), 64);
+        assert_eq!(parse(b"buffers 0\n").unwrap().buffers(), 0);
+        assert_eq!(parse(b"buffers 4\n").unwrap().buffers(), 4);
+        assert_eq!(parse(b"# c\nbuffers 64\n").unwrap().buffers(), 64);
+        for bad in [
+            &b"buffers 65\n"[..],
+            b"buffers -1\n",
+            b"buffers 100\n",
+            b"buffers x\n",
+        ] {
+            assert_eq!(
+                parse(bad),
+                Err(Error {
+                    line: 1,
+                    reason: Reason::BadBuffers
+                }),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse(b"buffers 1\nbuffers 2\n"),
+            Err(Error {
+                line: 2,
+                reason: Reason::KeyTwice
+            })
+        );
+        assert_eq!(
+            parse(b"buffers 1 2\n"),
+            Err(Error {
+                line: 1,
+                reason: Reason::ExtraWord
+            })
+        );
+    }
 
     const STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10.0.2.3\n";
 

@@ -16,6 +16,7 @@ use crate::net::{
     Birth, Client, Conn, Kind, NO_PLACE, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock,
     now_ns, op_index,
 };
+use crate::split;
 use crate::stack::{Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
 use netd::births;
@@ -55,6 +56,22 @@ fn word(r: &mut Request<'_>, value: u32) -> Answer {
         Ok(()) => Answer::Reply(Outgoing::new()),
         Err(status) => Answer::Status(status),
     }
+}
+
+/// The bytes of a SEND: in the message, or in a cell of the session's
+/// shared buffer (its address and length).
+#[derive(Clone, Copy)]
+enum Out<'a> {
+    Bytes(&'a [u8]),
+    Cell(usize, usize),
+}
+
+/// Where the bytes of a RECV go: the reply, or a cell (its address and
+/// the bytes asked).
+#[derive(Clone, Copy)]
+enum Into {
+    Reply,
+    Cell(usize, usize),
 }
 
 /// What an operation on a socket came to.
@@ -291,6 +308,8 @@ impl Net {
             | Call::Accept { description, .. }
             | Call::Send { description, .. }
             | Call::Recv { description, .. }
+            | Call::SendCell { description, .. }
+            | Call::RecvCell { description, .. }
             | Call::Shutdown { description, .. }
             | Call::Close { description, .. }
             | Call::SetOpt { description, .. } => Some(description),
@@ -360,13 +379,74 @@ impl Net {
                 flags,
                 address,
                 data,
-            } => self.send(stack, s, r, key, description, flags, address, data, now),
+            } => self.send(
+                stack,
+                s,
+                r,
+                key,
+                description,
+                flags,
+                address,
+                Out::Bytes(data),
+                now,
+            ),
             Call::Recv {
                 key,
                 description,
                 flags,
                 most,
-            } => self.recv(stack, s, r, key, description, flags, most as usize, now),
+            } => self.recv(
+                stack,
+                s,
+                r,
+                key,
+                description,
+                flags,
+                most as usize,
+                Into::Reply,
+                now,
+            ),
+            Call::SendCell {
+                key,
+                description,
+                flags,
+                address,
+                offset,
+                len,
+            } => match self.cell(s, offset, len) {
+                Ok(at) => self.send(
+                    stack,
+                    s,
+                    r,
+                    key,
+                    description,
+                    flags,
+                    address,
+                    Out::Cell(at, len as usize),
+                    now,
+                ),
+                Err(c) => self.done(s, key, refuse(c)),
+            },
+            Call::RecvCell {
+                key,
+                description,
+                flags,
+                most,
+                offset,
+            } => match self.cell(s, offset, most) {
+                Ok(at) => self.recv(
+                    stack,
+                    s,
+                    r,
+                    key,
+                    description,
+                    flags,
+                    most as usize,
+                    Into::Cell(at, most as usize),
+                    now,
+                ),
+                Err(c) => self.done(s, key, refuse(c)),
+            },
             Call::Shutdown { description, how } => self.shutdown(stack, s, description, how, now),
             Call::Close {
                 description,
@@ -381,6 +461,9 @@ impl Net {
                 };
                 if name == opt::NREAD {
                     return self.readable(stack, r, place);
+                }
+                if name == opt::BUFFERS || name == opt::BUFFERED {
+                    return word(r, self.buffers_word(name));
                 }
                 match self.option(place, name) {
                     Some(value) => word(r, value),
@@ -434,6 +517,8 @@ impl Net {
                     self.cleanup_wanted = true;
                 }
                 self.release_ops(&mut s.data.long);
+                // The new image starts without a shared buffer.
+                self.drop_buffer(s);
                 match sockets::write_abandoned(r.reply(), s.data.long.count() as u32) {
                     Ok(()) => Answer::Reply(Outgoing::new()),
                     Err(status) => Answer::Status(status),
@@ -1186,7 +1271,7 @@ impl Net {
         d: u32,
         flags: u32,
         address: Address,
-        data: &[u8],
+        data: Out<'_>,
         now: u64,
     ) -> Answer {
         let notify = match notify_of(r, key.is_some()) {
@@ -1206,12 +1291,16 @@ impl Net {
             return self.done(s, key, refuse(proto_net::INVALID));
         }
         self.sync(stack, place, now);
-        let io = match self.socks[place].proto {
-            Proto::Tcp => self.tcp_send(stack, place, data),
-            Proto::Udp => self.udp_send(stack, place, &address, data),
+        let io = match (self.socks[place].proto, data) {
+            (Proto::Tcp, _) => self.tcp_send(stack, place, data),
+            (Proto::Udp, Out::Bytes(data)) => self.udp_send(stack, place, &address, data),
+            (Proto::Udp, Out::Cell(..)) => Io::Fail(proto_net::INVALID),
         };
         match io {
             Io::Ready(n) => {
+                if let Out::Cell(..) = data {
+                    self.buffered += n as u64;
+                }
                 let bytes = (n as u32).to_le_bytes();
                 self.done(s, key, long_answer(r, long::Reply::Ready(&bytes)))
             }
@@ -1227,7 +1316,7 @@ impl Net {
         }
     }
 
-    fn tcp_send(&mut self, stack: &mut Stack<'static>, place: usize, data: &[u8]) -> Io<usize> {
+    fn tcp_send(&mut self, stack: &mut Stack<'static>, place: usize, data: Out<'_>) -> Io<usize> {
         // Whether the interface has an address: a stream from it has not,
         // once the lease is lost.
         let external = self.external.is_some();
@@ -1258,6 +1347,20 @@ impl Net {
         if !external && t.local_endpoint().is_some_and(|e| peer_of(e).0[0] != 127) {
             return Io::Fail(proto_net::NET_DOWN);
         }
+        let data = match data {
+            Out::Bytes(data) => data,
+            Out::Cell(at, len) => {
+                if !t.can_send() {
+                    return Io::Block;
+                }
+                let began = split::now();
+                // SAFETY: `cell` checked that the cell of `len` bytes lies in
+                // the session's mapped buffer.
+                let n = unsafe { crate::cells::cell_to_queue(t, at, len) };
+                split::record(split::BUF_COPY_TX, split::now() - began);
+                return if n == 0 { Io::Block } else { Io::Ready(n) };
+            }
+        };
         if data.is_empty() {
             return Io::Ready(0);
         }
@@ -1327,6 +1430,7 @@ impl Net {
         d: u32,
         flags: u32,
         most: usize,
+        into: Into,
         now: u64,
     ) -> Answer {
         let notify = match notify_of(r, key.is_some()) {
@@ -1348,15 +1452,25 @@ impl Net {
         self.sync(stack, place, now);
         let peek = flags & sockets::PEEK != 0;
         let mut buffer = [0u8; DATA_MAX];
-        let io = match self.socks[place].proto {
-            Proto::Tcp => self.tcp_recv(stack, place, peek, &mut buffer[..most]),
-            Proto::Udp => self.udp_recv(stack, place, peek, &mut buffer[..most]),
+        let io = match (self.socks[place].proto, into) {
+            (Proto::Tcp, Into::Reply) => {
+                self.tcp_recv(stack, place, peek, into, &mut buffer[..most])
+            }
+            (Proto::Tcp, Into::Cell(..)) => self.tcp_recv(stack, place, peek, into, &mut []),
+            (Proto::Udp, Into::Reply) => self.udp_recv(stack, place, peek, &mut buffer[..most]),
+            (Proto::Udp, Into::Cell(..)) => Io::Fail(proto_net::INVALID),
         };
         match io {
             Io::Ready((n, truncated, from)) => {
                 let mut w = Writer::new();
                 let flags = if truncated { sockets::OUT_TRUNC } else { 0 };
-                let written = sockets::write_received(&mut w, flags, &from, &buffer[..n]);
+                let written = match into {
+                    Into::Reply => sockets::write_received(&mut w, flags, &from, &buffer[..n]),
+                    Into::Cell(..) => {
+                        self.buffered += n as u64;
+                        sockets::write_received_count(&mut w, flags, &from, n as u32)
+                    }
+                };
                 let answer = match written {
                     Ok(()) => long_answer(r, long::Reply::Ready(w.as_bytes())),
                     Err(status) => Answer::Status(status),
@@ -1381,6 +1495,7 @@ impl Net {
         stack: &mut Stack<'static>,
         place: usize,
         peek: bool,
+        into: Into,
         buffer: &mut [u8],
     ) -> Io<(usize, bool, Address)> {
         let sock = &mut self.socks[place];
@@ -1401,6 +1516,14 @@ impl Net {
             return Io::Ready((0, false, from));
         }
         let t = stack.tcp(handle);
+        if let (Into::Cell(at, most), true) = (into, t.can_recv()) {
+            let began = split::now();
+            // SAFETY: `cell` checked that the cell of `most` bytes lies in the
+            // session's mapped buffer.
+            let n = unsafe { crate::cells::queue_to_cell(t, at, most, peek) };
+            split::record(split::BUF_COPY_RX, split::now() - began);
+            return Io::Ready((n, false, from));
+        }
         if t.can_recv() {
             let n = if peek {
                 t.peek_slice(buffer)

@@ -111,6 +111,22 @@ pub fn choose(parts: &Parts) -> Result<Choice, Stop> {
     })
 }
 
+/// The portions of a copy of the shared buffer to try, the largest first.
+pub const PORTIONS: [usize; 3] = [16 * 1024, 8 * 1024, 4 * 1024];
+
+/// The portion of a copy of the shared buffer (`ring::BUFFER_PORTION`): the
+/// largest of PORTIONS whose steps of SEND and of RECV with a cell, measured
+/// at that portion (`rows`: the portion, the step of SEND, the step of RECV,
+/// in ticks), stay within the budget. The longest step of a kind stands for
+/// its 90th percentile: it is never below it. None when no portion fits or
+/// none was measured.
+pub fn portion(rows: &[(usize, u64, u64)]) -> Option<usize> {
+    PORTIONS.into_iter().find(|&p| {
+        rows.iter()
+            .any(|&(q, send, recv)| q == p && send <= BUDGET && recv <= BUDGET)
+    })
+}
+
 /// Whether the longest step at 256 places stays within FLATNESS of that at 8
 /// (the same choice).
 pub fn flat(at_8: u64, at_256: u64) -> bool {
@@ -216,6 +232,20 @@ mod tests {
         // The cheaper wire frame leaves the loopback's price in force.
         p.frame_rx_wire = 100;
         assert_eq!(p.rx_price(), 500);
+    }
+
+    #[test]
+    fn the_portion_is_the_largest_whose_steps_fit() {
+        let rows = [
+            (16_384, 16_000, 9_000),
+            (8_192, 11_000, 15_613),
+            (4_096, 8_000, 7_000),
+        ];
+        assert_eq!(portion(&rows), Some(8_192));
+        assert_eq!(portion(&rows[..1]), None);
+        assert_eq!(portion(&[(16_384, 15_613, 15_000)]), Some(16_384));
+        assert_eq!(portion(&[(4_096, 15_614, 1)]), None);
+        assert_eq!(portion(&[]), None);
     }
 
     #[test]

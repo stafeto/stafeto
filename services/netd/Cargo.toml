@@ -37,6 +37,11 @@ send-2 = []
 # measurement (the default is the chosen one).
 # `split`: the breakdown of the step of the stack by parts (measurement only).
 split = []
+# `portion-N`: the bytes one request with a cell of the shared buffer copies
+# at most, N KiB, for the measurement that chose it (the default is the chosen one).
+portion-16 = []
+portion-8 = []
+portion-4 = []
 egress-1 = []
 egress-4 = []
 limit-8 = []

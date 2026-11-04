@@ -79,6 +79,23 @@ pub const EGRESS_GROUPS: usize = 1;
 pub const EGRESS_GROUPS: usize = 4;
 #[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
 pub const EGRESS_GROUPS: usize = 2;
+/// The bytes one request with a cell of the shared buffer (SEND or RECV with
+/// `BUF`) copies at most: by the measurement of stage P4b-1, the largest of
+/// 16, 8 and 4 KiB whose steps stay within the budget of a step
+/// (`netd::choose::portion`): at 16 KiB the longest SEND took 7 113 ticks
+/// and the longest RECV 7 294, the copy of a cell 3 584 (p90). The features `portion-16`, `portion-8` and
+/// `portion-4` build each, for the measurement.
+#[cfg(feature = "portion-16")]
+pub const BUFFER_PORTION: usize = 16 * 1024;
+#[cfg(all(feature = "portion-8", not(feature = "portion-16")))]
+pub const BUFFER_PORTION: usize = 8 * 1024;
+#[cfg(all(
+    feature = "portion-4",
+    not(any(feature = "portion-16", feature = "portion-8"))
+))]
+pub const BUFFER_PORTION: usize = 4 * 1024;
+#[cfg(not(any(feature = "portion-16", feature = "portion-8", feature = "portion-4")))]
+pub const BUFFER_PORTION: usize = 16 * 1024;
 /// The operations of one session that an ABANDON, or a step of departure,
 /// lets go of at most: each costs the place it waits on and its handle's close,
 /// so 16 at once came to 83 percent of the bound (reports/2026-11-04-net-p1b).

@@ -14,6 +14,7 @@
 
 use crate::stack::{GROUP, GROUPS, GroupSet, Sh, Stack};
 use core::mem::{ManuallyDrop, MaybeUninit};
+use netd::buffers::Buffers;
 use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
@@ -27,7 +28,7 @@ use proto_net::sockets::{self, opt};
 use proto_net::{Address, INET};
 use proto_wire::clones::Clones;
 use proto_wire::watch;
-use rt::handle::{Channel, Handle};
+use rt::handle::{Channel, Handle, Process};
 use rt::service::{LongOps, LongSession};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Duration;
@@ -106,6 +107,8 @@ pub struct Client {
     /// The label of init's client whose process this chain of clones
     /// belongs to: the clones of one root are counted together.
     pub root: u64,
+    /// The entry of the session's shared buffer (BUFFER) in `Net::buffers`.
+    pub buffer: Option<u8>,
 }
 
 pub use netd::births::Birth;
@@ -309,6 +312,10 @@ pub struct Counters {
     pub listen_short: u64,
     /// SYNs dropped for want of room in the queue of a listening description.
     pub syn_dropped: u64,
+    /// The pages charged to the service when the first and the sixty-fourth
+    /// shared buffer were mapped (builds with the feature `probe`).
+    #[cfg(feature = "probe")]
+    pub buffers_used: [u64; 2],
 }
 
 /// The sockets of the service.
@@ -411,6 +418,12 @@ pub struct Net {
     /// level of the service.
     pub channel: ManuallyDrop<Handle<Channel>>,
     pub level: u8,
+    /// The service's own process, which the shared buffers are mapped into.
+    pub process: Option<ManuallyDrop<Handle<Process>>>,
+    /// The shared buffers of the sessions, and the bytes that went through
+    /// them since the start.
+    pub buffers: Buffers,
+    pub buffered: u64,
     notary: Option<Handle<Channel>>,
     /// A step of the stack is due (a request changed a socket): the loop
     /// tells itself.
@@ -440,6 +453,7 @@ impl Net {
     /// # Safety
     /// `at` is valid for writes, exclusive and zeroed.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn initialize_at(
         at: *mut Net,
         key: [u8; 16],
@@ -447,6 +461,8 @@ impl Net {
         parent: &Handle<Channel>,
         channel: &Handle<Channel>,
         level: u8,
+        process: &Handle<Process>,
+        buffers: u16,
     ) {
         use core::ptr::addr_of_mut;
         // SAFETY: each field is in bounds and written once; `parent` is
@@ -469,6 +485,8 @@ impl Net {
             addr_of_mut!((*at).external).write(None);
             addr_of_mut!((*at).syn_member).write(None);
             addr_of_mut!((*at).level).write(level);
+            addr_of_mut!((*at).process).write(Some(Handle::borrowed(process.raw())));
+            addr_of_mut!((*at).buffers).write(Buffers::new(buffers));
         }
     }
 
@@ -922,6 +940,8 @@ impl Net {
     /// descriptions of those sessions and the members of the queues of closed
     /// listening descriptions. True when more are left.
     pub fn depart_step(&mut self, stack: &mut Stack<'static>) -> bool {
+        // One shared buffer of a session that went is unmapped first.
+        let buffers_left = self.unmap_retired();
         let mut ops_left = netd::ring::ABANDON_PORTION;
         'operations: for word in 0..self.departing_used.len() {
             let mut bits = self.departing_used[word];
@@ -1008,6 +1028,7 @@ impl Net {
         }
         let sets_left = self.interest.depart_step();
         self.departing_used.iter().any(|&w| w != 0)
+            || buffers_left
             || self.release_queue.next(0).is_some()
             || sets_left
             || !finished
