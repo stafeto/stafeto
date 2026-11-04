@@ -30,7 +30,7 @@
 //! | RECV (10), RECV_TAKE (11) | [k], description, flags (u32, PEEK 1, DONTWAIT 2), most (u32, 1..=800) | long: READY flags (u32, OUT_TRUNC 1), `Address` of the sender, bytes |
 //! | SHUTDOWN (12) | description, how (u32: 0 read, 1 write, 2 both) | status |
 //! | CLOSE (13), CLOSE_TAKE (35) | [k], description, linger (u32: `CLOSE_MAY_WAIT` when the caller may wait for a `SO_LINGER` close) | long, for a start that answers WAIT; else status |
-//! | EXPORT (23) | description | status and one handle: a pass for the description (copy of the service's channel with a label of `PASS`, rights TRANSFER and DUPLICATE) |
+//! | EXPORT (23) | description | status and one handle: a pass for the description (copy of the service's channel with a label of `PASS`, right TRANSFER alone) |
 //! | ADOPT (24) | the header alone and one handle, a pass | status, description (u32), kind (u32, STREAM or DGRAM) |
 //! | GETOPT (14) | description, name (u32) | status, value (u32) |
 //! | SETOPT (15) | description, name, value (u32 each) | status |

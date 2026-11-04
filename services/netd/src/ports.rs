@@ -28,9 +28,10 @@ pub struct Binding {
     pub listening: bool,
     pub connected: bool,
     pub reuse: bool,
-    /// SO_REUSEPORT was set before BIND: two such bindings may share a port
-    /// (the caller checks that one user holds them).
-    pub port_reuse: bool,
+    /// SO_REUSEPORT was set before BIND, and the effective user that held the
+    /// socket: two such bindings of one user may share a port, whatever the
+    /// addresses (as Linux's `inet_csk_bind_conflict`).
+    pub share_uid: Option<u32>,
 }
 
 /// Whether two addresses can both receive a packet: 0.0.0.0 meets every
@@ -49,7 +50,7 @@ pub fn conflicts(new: &Binding, held: impl IntoIterator<Item = Binding>) -> bool
             && old.port == new.port
             && overlap(old.address, new.address)
             && (old.listening || !old.connected || !new.reuse)
-            && !(old.port_reuse && new.port_reuse)
+            && !(old.share_uid.is_some() && old.share_uid == new.share_uid)
     })
 }
 
@@ -193,7 +194,7 @@ mod tests {
             listening: false,
             connected: false,
             reuse: false,
-            port_reuse: false,
+            share_uid: None,
         }
     }
 
@@ -232,11 +233,22 @@ mod tests {
     fn two_bindings_that_asked_for_a_shared_port_do_not_conflict() {
         let mut old = binding([0; 4], 80);
         old.listening = true;
-        old.port_reuse = true;
+        old.share_uid = Some(7);
         let mut new = binding([0; 4], 80);
         assert!(conflicts(&new, [old]));
-        new.port_reuse = true;
+        new.share_uid = Some(7);
         assert!(!conflicts(&new, [old]));
+        // Another user, or an address that only overlaps: the same rule.
+        new.share_uid = Some(8);
+        assert!(conflicts(&new, [old]));
+        new.share_uid = Some(7);
+        new.address = [10, 0, 2, 15];
+        assert!(!conflicts(&new, [old]));
+        new.share_uid = Some(8);
+        assert!(
+            conflicts(&new, [old]),
+            "another user at an overlapping address"
+        );
         // Another port or protocol is none of its business.
         new.port = 81;
         assert!(!conflicts(&new, [old]));

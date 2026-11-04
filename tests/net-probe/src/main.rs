@@ -2045,15 +2045,14 @@ impl Probe<'_> {
         if sockets::read_word(value) != Ok(sockets::DGRAM) {
             return Err("the adopted description is not the socket");
         }
-        // A pass that was spent names nothing: a copy of it is refused.
+        // A pass has the right TRANSFER alone: it cannot be copied, so a spent
+        // pass leaves no copy that keeps a place of the kernel charged to the
+        // service.
         let again = self.export(&root, d).map_err(|_| "EXPORT failed")?;
-        let copy = sys::handle_duplicate(&again, abi::Rights::TRANSFER | abi::Rights::DUPLICATE)
-            .map_err(|_| "handle_duplicate of the pass failed")?;
-        self.adopt(&other, again).map_err(|_| "ADOPT failed")?;
-        match self.adopt(&other, copy) {
-            Err(fail) if is(&fail, proto_net::BAD_FD) => {}
-            _ => return Err("a spent pass was adopted again"),
+        if sys::handle_duplicate(&again, abi::Rights::TRANSFER).is_ok() {
+            return Err("a pass could be copied");
         }
+        self.adopt(&other, again).map_err(|_| "ADOPT failed")?;
         // A handle that is no pass of the service is NOT_SOCKET: a session's own
         // channel, and a channel of the probe's.
         let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;

@@ -535,7 +535,9 @@ impl Net {
     // ----- EXPORT, ADOPT -----
 
     /// EXPORT: a pass for the description, a copy of the service's channel with
-    /// a label of its own that carries TRANSFER and DUPLICATE and no SEND, so
+    /// a label of its own that carries TRANSFER alone (no DUPLICATE, so a holder
+    /// cannot make copies that keep kernel places charged to the service after
+    /// the pass is spent, and no SEND), so
     /// that whoever holds it can hand it on and can ask the service for nothing.
     /// The pass holds a reference of the place until ADOPT or the last copy goes.
     fn export(&mut self, s: &mut Sess, r: &mut Request<'_>, d: u32) -> Answer {
@@ -548,12 +550,7 @@ impl Net {
         let Ok(label) = self.passes.make(place, s.label()) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        let pass = sys::handle_label(
-            &self.channel,
-            Rights::TRANSFER | Rights::DUPLICATE,
-            label,
-            self.level,
-        );
+        let pass = sys::handle_label(&self.channel, Rights::TRANSFER, label, self.level);
         match pass {
             Ok(pass) if r.reply().u32(Status::Ok.code()).is_ok() && self.places.hold(place) => {
                 Answer::Reply([pass.erase()].into())
@@ -731,7 +728,7 @@ impl Net {
                 listening: false,
                 connected: false,
                 reuse: sock.reuse,
-                port_reuse: sharing,
+                share_uid: sharing.then_some(uid.unwrap_or(0)),
             };
             if ports::conflicts(&new, self.bindings(port, place, !sock.reuse)) {
                 return refuse(proto_net::IN_USE);
@@ -749,6 +746,7 @@ impl Net {
         }
         let sock = &mut self.socks[place];
         sock.bound = true;
+        sock.uid = uid.unwrap_or(0);
         sock.port_held = true;
         sock.address = ip;
         sock.port = port;
@@ -771,9 +769,8 @@ impl Net {
     /// group of that port (made by the first); false when the group is another
     /// user's or full.
     fn join_group(&mut self, place: usize, address: [u8; 4], port: u16, uid: u32) -> bool {
-        // Only a bound place of the group's address may share: a binding of
-        // another address that overlaps was let through by the registry for
-        // its own option.
+        // The registry has let this binding through only when every binding
+        // it overlaps was made with the option by the same user.
         match self.groups.join(address, port, uid, place) {
             Ok(k) => {
                 self.socks[place].group = k as u8;
@@ -802,6 +799,7 @@ impl Net {
                 let listener = &mut self.socks[place];
                 listener.members[usize::from(listener.member_count)] = m as u16;
                 listener.member_count += 1;
+                listener.room = listener.room.saturating_add(1);
             }
             return ok();
         }
@@ -839,6 +837,7 @@ impl Net {
         sock.listening = true;
         sock.members = members;
         sock.member_count = count as u8;
+        sock.room = count as u8;
         let (address, port) = (sock.address, sock.port);
         self.register(
             place,
@@ -1155,7 +1154,10 @@ impl Net {
             accepted.port = port;
         }
         match self.member(stack, &sock, place) {
-            Some(fresh) => self.socks[place].members[k] = fresh as u16,
+            Some(fresh) => {
+                self.socks[place].members[k] = fresh as u16;
+                self.socks[place].room = self.socks[place].room.saturating_add(1);
+            }
             None => {
                 let listener = &mut self.socks[place];
                 listener.members[k] = listener.members[usize::from(listener.member_count) - 1];
@@ -1523,6 +1525,10 @@ impl Net {
             opt::BROADCAST => sock.broadcast = on,
             opt::NODELAY => sock.nodelay = on,
             opt::NONBLOCK => sock.nonblock = on,
+            // Before BIND only: the group is made at BIND.
+            opt::REUSEPORT if sock.proto == Proto::Tcp && (sock.bound || sock.listening) => {
+                return refuse(proto_net::INVALID);
+            }
             opt::REUSEPORT if sock.proto == Proto::Tcp => sock.reuseport = on,
             opt::LINGER => {
                 if value != 0

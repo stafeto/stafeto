@@ -4,10 +4,14 @@
 //! The groups of SO_REUSEPORT: streams of one port and one exact address
 //! that all asked for the option before BIND, under one effective user (the
 //! next process may not take the port of another user, as on Linux). Each
-//! member has a queue of `listen` of its own; a SYN goes to the member that
-//! the hash of the four picks among those that listen, and when that one has
-//! no room, to the next that has (the table of destinations names the first
-//! member that listens; the others have no entry there).
+//! member has a queue of `listen` of its own; the service names for a SYN the
+//! member that the hash of the four picks among those that listen, or the next
+//! that has room (the table of destinations names the first member that
+//! listens; the others have no entry there). The stack hands the SYN to the
+//! first socket in LISTEN of the set of the group of places of the socket
+//! named, which may belong to the queue of another member, so the choice by
+//! the hash holds only roughly and the connection goes to the member whose
+//! socket took the SYN (`Net::adopt`).
 
 /// The members of a group at most.
 pub const REUSE_MAX: usize = 16;

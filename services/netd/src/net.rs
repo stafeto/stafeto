@@ -136,6 +136,13 @@ pub struct Sock {
     pub broadcast: bool,
     /// SO_REUSEPORT before BIND, and the group the socket is in.
     pub reuseport: bool,
+    /// For a listening description: how many sockets of its queue are in
+    /// LISTEN as the service last counted them (kept up to date by the calls
+    /// and by `adopt`), and when it last looked at them all.
+    pub room: u8,
+    pub room_at: u64,
+    /// The effective user that bound the socket with SO_REUSEPORT.
+    pub uid: u32,
     pub group: u8,
     /// SO_LINGER (0 off, else `opt::LINGER_ON` and the seconds) and the
     /// timeouts of SO_RCVTIMEO and SO_SNDTIMEO in milliseconds (0 for none).
@@ -184,6 +191,9 @@ impl Sock {
         nodelay: false,
         broadcast: false,
         reuseport: false,
+        room: 0,
+        room_at: 0,
+        uid: 0,
         group: NO_GROUP,
         linger: 0,
         rcvtimeo: 0,
@@ -690,7 +700,7 @@ impl Net {
                     listening: s.listening,
                     connected: s.conn != Conn::None,
                     reuse: s.reuse,
-                    port_reuse: s.reuseport,
+                    share_uid: s.reuseport.then_some(s.uid),
                 })
             })
     }
@@ -1208,15 +1218,19 @@ impl Net {
                     remote,
                     remote_port,
                 };
-                if let Some(place) = self.demux.find(&conn) {
-                    // A new SYN on the four of a stream in TIME-WAIT that no
-                    // session holds ends that stream (RFC 6191): the SYN goes
-                    // to the listening description as any other.
-                    if !(syn && self.time_wait_orphan(stack, place)) {
-                        return Some(place);
-                    }
-                    self.release_place(stack, place);
-                }
+                // A new SYN on the four of a stream in TIME-WAIT that no session
+                // holds ends that stream and goes to the listening description
+                // as any other (RFC 1122, 4.2.2.13 allows a new connection on
+                // the four when its sequence number is higher; smoltcp does
+                // not give the service the next number the orphan expects, so
+                // any SYN does). The orphan is let go of only when a socket of
+                // a queue takes the SYN.
+                let existing = self.demux.find(&conn);
+                let orphan = match existing {
+                    Some(place) if syn && self.time_wait_orphan(stack, place) => Some(place),
+                    Some(place) => return Some(place),
+                    None => None,
+                };
                 if !syn {
                     return None;
                 }
@@ -1226,7 +1240,10 @@ impl Net {
                         address,
                         port: local_port,
                     })
-                })?;
+                });
+                let Some(lead) = lead else {
+                    return orphan;
+                };
                 let Some(member) = self.pick_member(stack, lead, &conn) else {
                     // A queue with no room drops the SYN: the peer sends it
                     // again after its timeout, as it does to a busy server.
@@ -1234,6 +1251,9 @@ impl Net {
                     self.counters.syn_dropped += 1;
                     return None;
                 };
+                if let Some(place) = orphan {
+                    self.release_place(stack, place);
+                }
                 self.syn_member = Some(member);
                 Some(member)
             }
@@ -1280,36 +1300,68 @@ impl Net {
             })
     }
 
+    /// How long a listening description that has counted no room is believed
+    /// before its queue is counted again (a socket of the queue that went back
+    /// to LISTEN with a reset is not seen otherwise), in nanoseconds.
+    const ROOM_TRUST_NS: u64 = 10_000_000;
+
+    /// The count of the sockets of the queue of `listener` that listen,
+    /// counted over the whole queue when it says none and is old.
+    fn refresh_room(&mut self, stack: &mut Stack<'static>, listener: usize, now: u64) {
+        let s = &self.socks[listener];
+        if s.room > 0 || now.saturating_sub(s.room_at) < Self::ROOM_TRUST_NS {
+            return;
+        }
+        let count = (0..usize::from(s.member_count))
+            .filter(|&k| {
+                self.socks[usize::from(s.members[k])]
+                    .handle
+                    .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
+            })
+            .count();
+        let s = &mut self.socks[listener];
+        s.room = count as u8;
+        s.room_at = now;
+    }
+
     /// The socket of a queue that gets the SYN of the four `conn`: of the
     /// listening description `lead`, or of the member of its group that the
-    /// hash picks.
+    /// hash picks. A queue without room costs no look at its sockets.
     fn pick_member(
         &mut self,
         stack: &mut Stack<'static>,
         lead: usize,
         conn: &Key,
     ) -> Option<usize> {
+        let now = now_ns();
         let group = self.socks[lead].group;
         let listener = if group == NO_GROUP {
-            lead
+            self.refresh_room(stack, lead, now);
+            (self.socks[lead].room > 0).then_some(lead)
         } else {
+            for k in 0..self.groups.members(usize::from(group)).len() {
+                let m = usize::from(self.groups.members(usize::from(group))[k]);
+                if self.socks[m].listening {
+                    self.refresh_room(stack, m, now);
+                }
+            }
             let hash = self.demux.hash_of(conn);
-            let (socks, groups) = (&self.socks, &self.groups);
-            groups.pick(
+            let socks = &self.socks;
+            self.groups.pick(
                 usize::from(group),
                 hash,
                 |m| socks[m].listening,
-                |m| {
-                    let sock = &socks[m];
-                    (0..usize::from(sock.member_count)).any(|k| {
-                        socks[usize::from(sock.members[k])]
-                            .handle
-                            .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
-                    })
-                },
-            )?
-        };
-        self.listening_member(stack, listener)
+                |m| socks[m].room > 0,
+            )
+        }?;
+        let member = self.listening_member(stack, listener);
+        if member.is_none() {
+            // The count was behind: none listens.
+            let s = &mut self.socks[listener];
+            s.room = 0;
+            s.room_at = now;
+        }
+        member
     }
 
     /// After the stack took a SYN for a listening description: the stack hands
@@ -1335,11 +1387,15 @@ impl Net {
             if t.state() == tcp::State::Listen {
                 if let Some(key) = self.socks[m].key.take() {
                     self.demux.remove(&key);
+                    let queue = usize::from(self.socks[m].listener);
+                    self.socks[queue].room = self.socks[queue].room.saturating_add(1);
                 }
             } else if self.socks[m].key.is_none()
                 && let (Some(local), Some(remote)) = (t.local_endpoint(), t.remote_endpoint())
             {
                 let (local, remote) = (peer_of(local), peer_of(remote));
+                let queue = usize::from(self.socks[m].listener);
+                self.socks[queue].room = self.socks[queue].room.saturating_sub(1);
                 self.register(
                     m,
                     Key::Conn {

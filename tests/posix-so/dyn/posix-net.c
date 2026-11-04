@@ -1477,7 +1477,7 @@ static void listen_again(void)
 	REQUIRE(close(lis) == 0);
 }
 
-/* A SYN to a full queue is dropped, not answered with a reset: the second
+/* A SYN to a full queue is dropped without a reset: the second
  * connect stays under way and goes through once an accept makes room. */
 static void syn_full(void)
 {
@@ -1657,6 +1657,14 @@ static void reuseport_uid(void)
 	struct sockaddr_in a = at(INADDR_ANY, 18091);
 	REQUIRE(bind(lis, (struct sockaddr *)&a, sizeof a) == 0);
 	REQUIRE(listen(lis, 4) == 0);
+	/* The option after bind is refused. */
+	int late = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(late >= 0);
+	struct sockaddr_in other = at(INADDR_ANY, 0);
+	REQUIRE(bind(late, (struct sockaddr *)&other, sizeof other) == 0);
+	errno = 0;
+	REQUIRE(setsockopt(late, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == -1 && errno == EINVAL);
+	REQUIRE(close(late) == 0);
 	/* The same user may join. */
 	int mate = socket(AF_INET, SOCK_STREAM, 0);
 	REQUIRE(mate >= 0);
@@ -1681,6 +1689,14 @@ static void reuseport_uid(void)
 		errno = 0;
 		if (bind(s, (struct sockaddr *)&a, sizeof a) != -1 || errno != EADDRINUSE)
 			_exit(23);
+		/* An address that only overlaps is the same: the rule is the user's. */
+		struct sockaddr_in lo = at(LOOPBACK, 18091);
+		int t = socket(AF_INET, SOCK_STREAM, 0);
+		if (t < 0 || setsockopt(t, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on) != 0)
+			_exit(24);
+		errno = 0;
+		if (bind(t, (struct sockaddr *)&lo, sizeof lo) != -1 || errno != EADDRINUSE)
+			_exit(25);
 		_exit(0);
 	}
 	REQUIRE(wait_exit(kid) == 0);
