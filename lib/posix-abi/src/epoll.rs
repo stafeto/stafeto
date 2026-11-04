@@ -20,7 +20,7 @@ use crate::constants::*;
 use crate::{shared, wait};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use posix_fs::Target;
 use posix_sync::LayerLock;
 use proto_net::sockets::{self as wire, EpollList, EpollReady, EpollRecord, epoll as bits};
@@ -123,6 +123,10 @@ static EPOLL_LOCK: LayerLock = LayerLock::raising();
 /// The descriptor numbers that have a record by edge of a pipe, a FIFO or a
 /// terminal: a read or a write that finds nothing to do looks here first, so
 /// that only a process with such records takes the lock of epoll.
+/// How many instances are in use: a process that never made one pays one load
+/// at each close (the close of a descriptor is a path of a few hundred
+/// instructions, `rtbench` S4).
+static LIVE: AtomicU32 = AtomicU32::new(0);
 static EDGE_FDS: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
 /// The descriptor numbers that have any record: a close looks here first.
 static WATCHED: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
@@ -353,6 +357,7 @@ pub fn create(flags: i32) -> Result<i32, i32> {
         *inst = Instance::EMPTY;
         inst.used = true;
         inst.generation = generation;
+        LIVE.fetch_add(1, Ordering::Relaxed);
         Some(k as u32 | generation << 8)
     })
     .ok_or(EMFILE)?;
@@ -972,6 +977,7 @@ pub fn release(id: u32) {
         let generation = inst.generation;
         *inst = Instance::EMPTY;
         inst.generation = generation;
+        LIVE.fetch_sub(1, Ordering::Relaxed);
         Some(taken)
     });
     let Some((set, after_fork, pages, by_fd)) = taken else {
@@ -1031,7 +1037,15 @@ pub fn would_block(fd: i32, write: bool) {
 /// again: its generation says it is dead (`live_entry`, and the pairs of the
 /// service for it are dropped), so it costs one record of the instance for the
 /// number, and the description it names is taken out of the service's set then.
+#[inline(always)]
 pub fn closed(fd: u32) {
+    if LIVE.load(Ordering::Relaxed) != 0 {
+        closed_of_instances(fd);
+    }
+}
+
+#[inline(never)]
+fn closed_of_instances(fd: u32) {
     let fd = fd as usize;
     if !marked(&WATCHED, fd) {
         return;
