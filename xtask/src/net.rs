@@ -22,10 +22,12 @@ pub const NETD_STACK_SIZE: u32 = 128 * 1024;
 /// The ports of the host forwarded to the guest: HTTP and SSH.
 pub const FORWARDS: [qemu::Forward; 2] = [
     qemu::Forward {
+        proto: qemu::Proto::Tcp,
         host: 8080,
         guest: 80,
     },
     qemu::Forward {
+        proto: qemu::Proto::Tcp,
         host: 2222,
         guest: 22,
     },

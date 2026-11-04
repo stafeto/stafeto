@@ -593,7 +593,7 @@ def compile_c(source: Path, output: Path, *flags, fpic=True) -> None:
 
 # ------------------------------------------------------------------- probes
 
-GOOD = ["so-hello", "so-image", "display-probe"]
+GOOD = ["so-hello", "so-image", "display-probe", "net-sock"]
 BAD = ["bad-interp", "bad-copy", "bad-tls", "bad-needed", "bad-symbol", "bad-ifunc", "bad-pie"]
 PROBE_FILES = GOOD + BAD
 # bad program: (source, what makes it bad, check)
