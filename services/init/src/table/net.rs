@@ -177,16 +177,51 @@ pub const PROBE: Record = Record {
 // NET_TABLE copies the records of the shell's table by number: a table that
 // grows would lose its new record in the image with the network.
 const _: () = assert!(super::ramfs::BUSYBOX_DIALOG_TABLE.len() == 9);
+const _: () = assert!(str_eq(
+    super::ramfs::BUSYBOX_DIALOG_TABLE[5].program,
+    "ash-launcher"
+));
+const _: () = assert!(str_eq(
+    super::ramfs::BUSYBOX_DIALOG_TABLE[2].program,
+    super::ramfs::POSIX_ABI_TABLE[1].program
+));
 
-/// The image of the shell with the network service. The shell's programs
-/// have no session with it yet (the place `Net` of a later stage).
+/// The launcher of the shell with a session with the network service: the
+/// shell and its commands get the same (the launcher's connections are the
+/// shell's).
+const NET_LAUNCHER: Record = Record {
+    connects: &[
+        "ramfs",
+        "tty",
+        "pipe",
+        "clock",
+        "posix",
+        "entropy",
+        NET_SERVICE,
+    ],
+    ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
+};
+
+/// The process service of the image with the network: the pool of the
+/// shell's image and ten more quotas of a command. `httpd` forks a child for
+/// each connection, and the eight simultaneous requests of `net-curl` make
+/// eight children over the shell, the server and the launcher.
+const NET_PROCESS_SERVICE: Record = Record {
+    quota: super::ramfs::POSIX_ABI_TABLE[1].quota
+        + super::ramfs::BUSYBOX_DIALOG_POOL
+        + 10 * super::ramfs::BUSYBOX_DIALOG_QUOTA,
+    ..super::ramfs::BUSYBOX_DIALOG_TABLE[2]
+};
+
+/// The image of the shell with the network service: the shell's programs
+/// have a session with it (the place `Net`), and `httpd` serves from it.
 pub const NET_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[0],
     super::ramfs::BUSYBOX_DIALOG_TABLE[1],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[2],
+    NET_PROCESS_SERVICE,
     super::ramfs::BUSYBOX_DIALOG_TABLE[3],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[5],
+    NET_LAUNCHER,
     super::ramfs::BUSYBOX_DIALOG_TABLE[6],
     super::ramfs::BUSYBOX_DIALOG_TABLE[7],
     super::ramfs::BUSYBOX_DIALOG_TABLE[8],

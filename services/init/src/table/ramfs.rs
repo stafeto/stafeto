@@ -190,7 +190,7 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// 2.98 MB whose heap grows by doubling chunks up to 512 KiB, and a child of
 /// the shell gets the shell's quota: bash-dialog passes with 1 050 pages and
 /// fails with 1 000 (bisected), and 1 160 pages leave 10.5%.
-const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
+pub(super) const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 
 /// What the process service adds to its own quota for the dialog: the
 /// children of the shell, the failed attempts of a search through PATH
@@ -206,7 +206,7 @@ const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 /// programs static it passed with 8 750 pages and failed with 8 625, and
 /// before the table of images 9 375 passed and 9 250 did not); 10 520 pages
 /// leave 10.0%.
-const BUSYBOX_DIALOG_POOL: u64 = 10520 * PAGE;
+pub(super) const BUSYBOX_DIALOG_POOL: u64 = 10520 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,
