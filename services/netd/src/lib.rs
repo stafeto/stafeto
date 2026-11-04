@@ -11,6 +11,7 @@
 
 pub mod choose;
 pub mod config;
+pub mod demux;
 pub mod frames;
 pub mod lines;
 pub mod places;

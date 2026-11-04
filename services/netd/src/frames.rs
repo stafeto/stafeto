@@ -128,6 +128,223 @@ pub fn route(frame: &[u8], mac: [u8; 6], own: &[[u8; 4]]) -> Route {
     Route::Wire
 }
 
+// ----- the checksums (RFC 1071) -----
+//
+// The interface tells smoltcp it need not compute or check any checksum
+// (`ChecksumCapabilities::ignored`), because the frames of the loopback never
+// leave the service. The frames of the wire get theirs here: `fill_sums` on
+// the way out, `verify_sums` on the way in.
+
+/// Adds `data` to the ones' complement sum `acc`, eight bytes at a time. The
+/// words are read big-endian, so the sum of 64-bit words is the sum of the
+/// 16-bit words of RFC 1071 (2^16 is 1 modulo 0xFFFF). A tail shorter than
+/// eight bytes is padded with zeros, which only the last piece may have.
+fn add(mut acc: u64, data: &[u8]) -> u64 {
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_be_bytes(chunk.try_into().expect("8 bytes"));
+        let (sum, carry) = acc.overflowing_add(word);
+        acc = sum + u64::from(carry);
+    }
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        let (sum, carry) = acc.overflowing_add(u64::from_be_bytes(last));
+        acc = sum + u64::from(carry);
+    }
+    acc
+}
+
+/// The sum folded to 16 bits.
+fn fold(acc: u64) -> u16 {
+    let mut sum = (acc & 0xFFFF_FFFF) + (acc >> 32);
+    sum = (sum & 0xFFFF_FFFF) + (sum >> 32);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum as u16
+}
+
+/// The Internet checksum of `data`: the complement of the folded sum.
+pub fn checksum(data: &[u8]) -> u16 {
+    !fold(add(0, data))
+}
+
+const IPV4_PROTO_ICMP: u8 = 1;
+const IPV4_PROTO_TCP: u8 = 6;
+const IPV4_PROTO_UDP: u8 = 17;
+
+/// Where the parts of the IPv4 packet in an Ethernet frame are: the header
+/// length, the protocol and the length of the transport part. None for a frame
+/// that is no IPv4, or whose lengths do not fit it, or a fragment after the
+/// first (it has no transport header).
+struct Packet {
+    header: usize,
+    protocol: u8,
+    end: usize,
+    first_fragment: bool,
+}
+
+fn packet(frame: &[u8]) -> Option<Packet> {
+    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ip = &frame[ETHERNET_HEADER..];
+    let header = usize::from(ip[0] & 0x0f) * 4;
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    if ip[0] >> 4 != 4 || header < 20 || total < header || total > ip.len() {
+        return None;
+    }
+    let fragment = u16::from_be_bytes([ip[6], ip[7]]);
+    Some(Packet {
+        header,
+        protocol: ip[9],
+        end: total,
+        first_fragment: fragment & 0x1fff == 0 && fragment & 0x2000 == 0,
+    })
+}
+
+/// The offset in the transport part of the checksum field, and whether the
+/// checksum covers the pseudo-header (RFC 793, 3.1; RFC 768; RFC 792).
+fn transport_sum(protocol: u8) -> Option<(usize, bool)> {
+    match protocol {
+        IPV4_PROTO_TCP => Some((16, true)),
+        IPV4_PROTO_UDP => Some((6, true)),
+        IPV4_PROTO_ICMP => Some((2, false)),
+        _ => None,
+    }
+}
+
+/// The sum of the transport part of the packet, with the pseudo-header when
+/// the protocol has one.
+fn transport_total(ip: &[u8], p: &Packet, pseudo: bool) -> u64 {
+    let part = &ip[p.header..p.end];
+    let mut acc = 0;
+    if pseudo {
+        let mut head = [0u8; 12];
+        head[..4].copy_from_slice(&ip[12..16]);
+        head[4..8].copy_from_slice(&ip[16..20]);
+        head[9] = p.protocol;
+        head[10..12].copy_from_slice(&(part.len() as u16).to_be_bytes());
+        acc = add(acc, &head);
+    }
+    add(acc, part)
+}
+
+/// Writes the checksums of the frame in place: the IPv4 header's and the
+/// transport's (TCP, UDP, ICMP). A UDP sum that comes out 0 goes as 0xFFFF
+/// (RFC 768). A frame that is no IPv4 stays as it is.
+pub fn fill_sums(frame: &mut [u8]) {
+    let Some(p) = packet(frame) else { return };
+    let ip = &mut frame[ETHERNET_HEADER..];
+    ip[10] = 0;
+    ip[11] = 0;
+    let header = checksum(&ip[..p.header]);
+    ip[10..12].copy_from_slice(&header.to_be_bytes());
+    let Some((at, pseudo)) = transport_sum(p.protocol) else {
+        return;
+    };
+    if !p.first_fragment || p.end < p.header + at + 2 {
+        return;
+    }
+    let field = p.header + at;
+    ip[field] = 0;
+    ip[field + 1] = 0;
+    let mut sum = !fold(transport_total(ip, &p, pseudo));
+    if sum == 0 && p.protocol == IPV4_PROTO_UDP {
+        sum = 0xFFFF;
+    }
+    ip[field..field + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// Whether the checksums of the frame hold: the IPv4 header's and the
+/// transport's. A UDP datagram with the sum 0 has none (RFC 768). A frame that
+/// is no IPv4, or whose lengths do not fit it, is not checked here (smoltcp
+/// refuses the second kind itself); an IPv4 frame with a wrong total length
+/// does not hold.
+pub fn verify_sums(frame: &[u8]) -> bool {
+    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
+        return true;
+    }
+    let Some(p) = packet(frame) else { return false };
+    let ip = &frame[ETHERNET_HEADER..];
+    if fold(add(0, &ip[..p.header])) != 0xFFFF {
+        return false;
+    }
+    let Some((at, pseudo)) = transport_sum(p.protocol) else {
+        return true;
+    };
+    if !p.first_fragment || p.end < p.header + at + 2 {
+        return true;
+    }
+    if p.protocol == IPV4_PROTO_UDP && ip[p.header + at..p.header + at + 2] == [0, 0] {
+        return true;
+    }
+    fold(transport_total(ip, &p, pseudo)) == 0xFFFF
+}
+
+/// Whom a received frame is for, as far as the headers say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dest {
+    /// The service's own sockets (DHCP, ICMP), or nobody: ARP, ICMP, DHCP,
+    /// other protocols, fragments and frames that do not parse. The stack
+    /// answers what needs an answer (RST, port unreachable) there.
+    Service,
+    /// A segment of TCP; `syn` when it opens a connection (SYN without ACK).
+    Tcp {
+        local: [u8; 4],
+        local_port: u16,
+        remote: [u8; 4],
+        remote_port: u16,
+        syn: bool,
+    },
+    /// A datagram of UDP to `local:local_port`.
+    Udp {
+        local: [u8; 4],
+        local_port: u16,
+        broadcast: bool,
+    },
+}
+
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
+
+/// Whom the frame is for (see `Dest`).
+pub fn target(frame: &[u8]) -> Dest {
+    let Some(p) = packet(frame) else {
+        return Dest::Service;
+    };
+    if !p.first_fragment || frame[ETHERNET_HEADER + 6] & 0x20 != 0 {
+        return Dest::Service;
+    }
+    let ip = &frame[ETHERNET_HEADER..];
+    let part = &ip[p.header..p.end];
+    let dst: [u8; 4] = ip[16..20].try_into().expect("4 bytes");
+    let src: [u8; 4] = ip[12..16].try_into().expect("4 bytes");
+    let port = |at: usize| u16::from_be_bytes([part[at], part[at + 1]]);
+    match p.protocol {
+        IPV4_PROTO_TCP if part.len() >= 20 => Dest::Tcp {
+            local: dst,
+            local_port: port(2),
+            remote: src,
+            remote_port: port(0),
+            syn: part[13] & (TCP_SYN | TCP_ACK) == TCP_SYN,
+        },
+        IPV4_PROTO_UDP if part.len() >= 8 => {
+            // The DHCP client of the service listens on port 68.
+            if port(0) == 67 && port(2) == 68 {
+                return Dest::Service;
+            }
+            Dest::Udp {
+                local: dst,
+                local_port: port(2),
+                broadcast: dst == [255; 4] || frame[..6] == [0xff; 6],
+            }
+        }
+        _ => Dest::Service,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +446,180 @@ mod tests {
         assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &own), Route::Wire);
         assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &[]), Route::Wire);
         assert_eq!(route(&[0; 5], mac, &own), Route::Wire);
+    }
+
+    /// The sum by the plain rule of RFC 1071: 16-bit words, one at a time.
+    fn plain(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for pair in data.chunks(2) {
+            let word = if pair.len() == 2 {
+                u16::from_be_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], 0])
+            };
+            sum += u32::from(word);
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn the_sum_agrees_with_the_plain_rule_on_every_length() {
+        // A small generator of bytes, fixed so that the test repeats.
+        let mut x: u32 = 0x1234_5678;
+        let mut data = Vec::new();
+        for _ in 0..1514 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((x >> 24) as u8);
+        }
+        for len in 0..=1514 {
+            assert_eq!(checksum(&data[..len]), plain(&data[..len]), "length {len}");
+        }
+        // All ones and all zeros.
+        assert_eq!(checksum(&[0xFF; 1500]), plain(&[0xFF; 1500]));
+        assert_eq!(checksum(&[0; 64]), 0xFFFF);
+        // The example of RFC 1071, section 3.
+        assert_eq!(
+            checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
+            !0xddf2u16
+        );
+    }
+
+    fn udp_frame(payload: &[u8]) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let mut f = vec![0; 14 + 20 + udp_len];
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&((20 + udp_len) as u16).to_be_bytes());
+        f[22] = 64;
+        f[23] = IPV4_PROTO_UDP;
+        f[26..30].copy_from_slice(&[10, 0, 2, 15]);
+        f[30..34].copy_from_slice(&[10, 0, 2, 2]);
+        f[34..36].copy_from_slice(&68u16.to_be_bytes());
+        f[36..38].copy_from_slice(&67u16.to_be_bytes());
+        f[38..40].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        f[42..].copy_from_slice(payload);
+        f
+    }
+
+    fn tcp_frame(payload: &[u8]) -> Vec<u8> {
+        let tcp_len = 20 + payload.len();
+        let mut f = vec![0; 14 + 20 + tcp_len];
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&((20 + tcp_len) as u16).to_be_bytes());
+        f[22] = 64;
+        f[23] = IPV4_PROTO_TCP;
+        f[26..30].copy_from_slice(&[127, 0, 0, 1]);
+        f[30..34].copy_from_slice(&[127, 0, 0, 1]);
+        f[34..36].copy_from_slice(&5000u16.to_be_bytes());
+        f[36..38].copy_from_slice(&80u16.to_be_bytes());
+        f[46] = 0x50;
+        f[47] = 0x18;
+        f[54..].copy_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn a_frame_with_filled_sums_verifies() {
+        for len in [0usize, 1, 7, 8, 9, 300, 1460] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            for mut frame in [udp_frame(&payload), tcp_frame(&payload)] {
+                fill_sums(&mut frame);
+                assert!(verify_sums(&frame), "length {len}");
+            }
+        }
+        // The header's sum of a known packet (RFC 1071 style check: the sum
+        // of the filled header is 0xFFFF).
+        let mut f = udp_frame(b"hello");
+        fill_sums(&mut f);
+        assert_eq!(fold(add(0, &f[14..34])), 0xFFFF);
+    }
+
+    #[test]
+    fn a_frame_with_a_bad_tcp_sum_is_dropped() {
+        let mut frame = tcp_frame(b"some bytes of data");
+        fill_sums(&mut frame);
+        assert!(verify_sums(&frame));
+        let last = frame.len() - 1;
+        frame[last] ^= 1;
+        assert!(!verify_sums(&frame), "a flipped bit in the data");
+        fill_sums(&mut frame);
+        frame[14 + 12] ^= 0x10;
+        assert!(!verify_sums(&frame), "a changed address breaks the header's sum");
+    }
+
+    #[test]
+    fn a_udp_datagram_without_a_sum_passes_and_a_zero_sum_goes_as_ones() {
+        let mut frame = udp_frame(b"abc");
+        fill_sums(&mut frame);
+        // The sum of the datagram is cleared by the sender: no sum.
+        frame[40] = 0;
+        frame[41] = 0;
+        assert!(verify_sums(&frame));
+        // A payload that makes the sum 0 is written as 0xFFFF.
+        let mut x = udp_frame(&[0, 0]);
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                x[42] = a;
+                x[43] = b;
+                fill_sums(&mut x);
+                assert_ne!(x[40..42], [0, 0], "{a} {b}");
+                assert!(verify_sums(&x));
+            }
+        }
+    }
+
+    #[test]
+    fn frames_that_are_no_ipv4_are_not_checked_and_a_wrong_length_does_not_hold() {
+        assert!(verify_sums(&arp_request([10, 0, 2, 2])));
+        let mut f = udp_frame(b"abc");
+        fill_sums(&mut f);
+        f[16] = 0xFF;
+        assert!(!verify_sums(&f));
+    }
+
+    #[test]
+    fn a_frame_finds_its_destination() {
+        let mut t = tcp_frame(b"x");
+        assert_eq!(
+            target(&t),
+            Dest::Tcp {
+                local: [127, 0, 0, 1],
+                local_port: 80,
+                remote: [127, 0, 0, 1],
+                remote_port: 5000,
+                syn: false
+            }
+        );
+        t[14 + 20 + 13] = TCP_SYN;
+        assert!(matches!(target(&t), Dest::Tcp { syn: true, .. }));
+        t[14 + 20 + 13] = TCP_SYN | TCP_ACK;
+        assert!(matches!(target(&t), Dest::Tcp { syn: false, .. }), "a SYN-ACK");
+        let mut u = udp_frame(b"abc");
+        u[34..36].copy_from_slice(&67u16.to_be_bytes());
+        u[36..38].copy_from_slice(&68u16.to_be_bytes());
+        assert_eq!(target(&u), Dest::Service, "DHCP server to client");
+        let mut v = udp_frame(b"abc");
+        v[14 + 20 + 2..14 + 20 + 4].copy_from_slice(&7u16.to_be_bytes());
+        assert_eq!(
+            target(&v),
+            Dest::Udp {
+                local: [10, 0, 2, 2],
+                local_port: 7,
+                broadcast: false
+            }
+        );
+        assert_eq!(target(&arp_request([10, 0, 2, 2])), Dest::Service);
+        assert_eq!(target(&[0; 10]), Dest::Service);
+        // An ICMP packet and a fragment go to the service.
+        let mut icmp = udp_frame(b"abcdefgh");
+        icmp[14 + 9] = IPV4_PROTO_ICMP;
+        assert_eq!(target(&icmp), Dest::Service);
+        let mut frag = tcp_frame(b"x");
+        frag[14 + 6] = 0x20;
+        assert_eq!(target(&frag), Dest::Service);
     }
 }
