@@ -1097,6 +1097,12 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 dir("/dev"),
             ];
             files.extend(devices());
+            // The probe of these images runs the Change stages of
+            // posix-files too (feature loader-abort takes `files`), whose
+            // cancelled renames work on the directories of the boot table.
+            if name != "boot-ramfs-cleanup.img" {
+                files.extend(change_dirs());
+            }
             files
         }
         "boot-posix-files.img" | "boot-posix-files-steps.img" | "boot-posix-data-steps.img" => {
