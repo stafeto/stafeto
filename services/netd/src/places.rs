@@ -194,7 +194,22 @@ impl Held {
 
     /// The lowest held place at or after `from`.
     pub fn next(&self, from: usize) -> Option<usize> {
-        (from..SOCKETS_MAX).find(|&i| self.has(i))
+        if from >= SOCKETS_MAX {
+            return None;
+        }
+        // A word at a time: the lowest bit at or after `from`.
+        let mut word = from / 64;
+        let mut bits = self.bits[word] & (!0u64 << (from % 64));
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+            word += 1;
+            if word == self.bits.len() {
+                return None;
+            }
+            bits = self.bits[word];
+        }
     }
 }
 
@@ -279,5 +294,17 @@ mod tests {
         assert_eq!(h.count(), 1);
         assert_eq!(h.next(0), Some(255));
         assert_eq!(h.next(256), None);
+        // The word borders.
+        let mut h = Held::EMPTY;
+        for i in [63, 64, 127, 128, 200] {
+            h.add(i);
+        }
+        assert_eq!(h.next(0), Some(63));
+        assert_eq!(h.next(63), Some(63));
+        assert_eq!(h.next(64), Some(64));
+        assert_eq!(h.next(65), Some(127));
+        assert_eq!(h.next(129), Some(200));
+        assert_eq!(h.next(201), None);
+        assert_eq!(h.next(255), None);
     }
 }

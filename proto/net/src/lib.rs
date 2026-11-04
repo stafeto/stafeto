@@ -40,7 +40,7 @@
 //! | CANCEL (27) | k (u64) | long: CANCELLED |
 //! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |
-//! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address); only a service built with the feature `probe` has it | status |
+//! | HOLD (30) | one u32: 1 holds the steps of the stack, 0 lets them go, 2 marks every group of sockets as having work (the effect of a change of address), 3 drops the next frame the stack sends to itself (a test of the timers); only a service built with the feature `probe` has it | status |
 //! | CRASH (63) | the header alone | none: the service ends with a fault; only a service built with the feature `probe` has it |
 //!
 //! An address on the wire is the family (u32, INET = 2 for IPv4; 0 for
@@ -229,6 +229,8 @@ pub const DATA_MAX: usize = 800;
 pub const HOLD_OFF: u32 = 0;
 pub const HOLD_ON: u32 = 1;
 pub const HOLD_ADDRESS: u32 = 2;
+/// The next frame the stack sends to itself goes nowhere (a test of the timers).
+pub const HOLD_DROP: u32 = 3;
 
 /// The request HOLD with its argument.
 pub fn write_hold(value: u32, w: &mut Writer) -> Result<(), Status> {
@@ -241,7 +243,7 @@ pub fn read_hold(mut body: Reader<'_>) -> Result<u32, Status> {
     let value = body.u32()?;
     body.finish()?;
     match value {
-        HOLD_OFF | HOLD_ON | HOLD_ADDRESS => Ok(value),
+        HOLD_OFF | HOLD_ON | HOLD_ADDRESS | HOLD_DROP => Ok(value),
         _ => Err(Status::BadSize),
     }
 }
@@ -600,8 +602,8 @@ mod tests {
     }
 
     #[test]
-    fn hold_round_trips_and_takes_three_values() {
-        for value in [HOLD_OFF, HOLD_ON, HOLD_ADDRESS] {
+    fn hold_round_trips_and_takes_four_values() {
+        for value in [HOLD_OFF, HOLD_ON, HOLD_ADDRESS, HOLD_DROP] {
             let mut w = Writer::new();
             write_hold(value, &mut w).unwrap();
             let mut r = Reader::new(w.as_bytes());
@@ -609,7 +611,7 @@ mod tests {
             assert_eq!(read_hold(r), Ok(value));
         }
         assert_eq!(
-            read_hold(Reader::new(&3u32.to_le_bytes())),
+            read_hold(Reader::new(&4u32.to_le_bytes())),
             Err(Status::BadSize)
         );
         assert_eq!(read_hold(Reader::new(&[1, 0])), Err(Status::BadSize));

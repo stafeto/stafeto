@@ -116,7 +116,8 @@ pub const NETD: Record = Record {
 /// N places of the table at once (the digits are N) and 50 pings, `e` the
 /// rates of the loopback, `f` the full batch of a step after a hold of the
 /// service, `a` every group of sockets with work at once, `w` sixteen
-/// operations told by one datagram, `k` CRASH of the service and the same as `c`
+/// operations told by one datagram, `i` 150 s of idle, `l` a queue of 16 with
+/// blocking ACCEPT and WATCH, `r` the timers, `k` CRASH of the service and the same as `c`
 /// through a new session. The images of the measurement of the steps
 /// (`net-sockets-N`) run `s` at 8, 64 and 256 places; the others at the
 /// limit of the sockets the service serves (netd::places::SOCKETS_LIMIT,
@@ -135,6 +136,12 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"cak"
 } else if cfg!(feature = "net-wakes") {
     b"cwk"
+} else if cfg!(feature = "net-idle") {
+    b"cik"
+} else if cfg!(feature = "net-listen") {
+    b"clk"
+} else if cfg!(feature = "net-timers") {
+    b"crk"
 } else {
     b"cbs256k"
 };
@@ -186,8 +193,9 @@ pub const NET_TABLE: &[Record] = &[
 /// The CPUs of the services and the probe in the images of the measurement of
 /// the steps (`net-alone`): the network service has CPU 0 to itself, so that
 /// the longest step it measures holds no time of another process (the
-/// preemption of a service by others is a term of the analysis of response
-/// time, not of its step). The image runs on two CPUs.
+/// preemption of a service by others belongs to the analysis of response
+/// time). The image runs on two CPUs. The measurement does not use it: under
+/// -icount the counter holds the instructions of all the CPUs.
 const OTHERS_CPUS: u8 = 0b0010;
 
 const fn on(r: Record, cpus: u8) -> Record {

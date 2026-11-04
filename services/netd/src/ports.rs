@@ -90,9 +90,9 @@ pub fn ephemeral(offset: u32, counter: u32, free: impl Fn(u16) -> bool) -> Optio
         .find(|&port| free(port))
 }
 
-/// How many sockets hold each port of one protocol. A count and not a bit,
-/// so that a socket that lets go of a port is a subtraction and not a walk
-/// over the table (which would put the number of sockets into a step).
+/// How many sockets hold each port of one protocol. With a count, a socket
+/// that lets go of a port subtracts one, where a bit would need a walk over
+/// the table (which would put the number of sockets into a step).
 pub struct PortMap {
     held: [u16; 65536],
 }

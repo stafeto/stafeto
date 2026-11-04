@@ -58,9 +58,13 @@ pub const CONNECT_NS: u64 = 75_000_000_000;
 const KEEPALIVE_NS: u64 = 7_200_000_000_000;
 /// The orphans one step of the sweep looks at.
 const SWEEP: usize = 4;
-/// The sessions that went and still hold descriptions at most; a session
-/// past that lets go of its descriptions at once.
-pub const DEPARTING: usize = 8;
+/// The streams `evict` looks at.
+const EVICT: usize = 8;
+/// The sessions that went and still hold descriptions at most: a session
+/// has one entry, so the table is as long as the sessions are. Past that (a
+/// session that went twice before the first entry drained) the descriptions
+/// are let go of at once.
+pub const DEPARTING: usize = SESSIONS;
 /// The descriptions the steps of departure let go of in one step.
 pub const GONE_PORTION: usize = 8;
 
@@ -110,6 +114,12 @@ pub struct Sock {
     pub shut_wr: bool,
     /// The stream took a FIN from the peer.
     pub saw_fin: bool,
+    /// For a socket of the queue of a listening description: the place of
+    /// that description (NO_PLACE for any other socket).
+    pub listener: u16,
+    /// The stream was aborted and keeps its place until the pass of its group
+    /// has sent the RST.
+    pub rst_pending: bool,
     pub bound: bool,
     /// The socket holds its port in the registry (a member of a queue shares
     /// the listening description's).
@@ -144,6 +154,8 @@ impl Sock {
         shut_rd: false,
         shut_wr: false,
         saw_fin: false,
+        listener: NO_PLACE,
+        rst_pending: false,
         bound: false,
         port_held: false,
         address: [0; 4],
@@ -188,10 +200,14 @@ impl OpInfo {
     };
 }
 
-/// The index of an operation, from its key.
-pub fn op_index(key: u64) -> usize {
-    ((key & 0xffff_ffff) - 1) as usize
+/// The index of an operation, from its key: None for a key no operation of
+/// the table has (a client may send any).
+pub fn op_index(key: u64) -> Option<usize> {
+    netd::ring::op_index(key, OPERATIONS)
 }
+
+/// The place that means no place in `Sock::listener`.
+pub const NO_PLACE: u16 = u16::MAX;
 
 /// A set of places, one bit each.
 #[derive(Clone, Copy, Default)]
@@ -212,7 +228,21 @@ impl Mask {
 
     /// The lowest place at or after `from`.
     pub fn next(&self, from: usize) -> Option<usize> {
-        (from..SOCKETS_MAX).find(|&i| self.has(i))
+        if from >= SOCKETS_MAX {
+            return None;
+        }
+        let mut word = from / 64;
+        let mut bits = self.0[word] & (!0u64 << (from % 64));
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+            word += 1;
+            if word == self.0.len() {
+                return None;
+            }
+            bits = self.0[word];
+        }
     }
 }
 
@@ -241,18 +271,35 @@ pub struct Net {
     pub clones: Clones<SESSIONS>,
     pub births: [Option<Birth>; SESSIONS],
     departing: [Held; DEPARTING],
+    /// The entries of `departing` that hold descriptions, a bit each.
+    departing_used: [u64; DEPARTING.div_ceil(64)],
     /// The places that have operations waiting, the streams that connect and
     /// those no session holds.
     pub attention: Mask,
     pub connecting: Mask,
     pub orphans: Mask,
-    sweep_at: usize,
+    /// The streams no session holds, oldest first (place and the time they
+    /// were let go of); an entry whose place has since gone is skipped.
+    orphan_queue: [(u16, u64); SOCKETS_MAX],
+    orphan_head: usize,
+    orphan_len: usize,
+    /// The members of the queue of a closed listening description that wait
+    /// to be let go of, a few a step.
+    release_queue: Mask,
+    /// The operations whose description closed, which the step of waking
+    /// tells.
+    closed_ops: u128,
     /// The table that steers a frame to its socket.
     pub demux: Demux,
     /// The groups with work for the pass of sending, and those the step
     /// touched (a bit each), for the step of waking.
     pub due: u64,
     pub touched: u64,
+    /// The groups whose pass of sending ran since the last step of waking.
+    pub passed: u64,
+    /// The service is asked for a step of departure or of waking.
+    pub cleanup_wanted: bool,
+    pub wake_wanted: bool,
     /// The places whose waiting operations the step of waking looks at.
     pub wake_due: Mask,
     wake_cursor: usize,
@@ -389,29 +436,73 @@ impl Net {
         Some(i)
     }
 
-    /// Frees the oldest stream in TIME-WAIT that no session holds.
+    /// Frees a stream that has closed, or else the oldest in TIME-WAIT, among
+    /// the first EVICT of the streams no session holds (the oldest are first).
     fn evict(&mut self, stack: &mut Stack<'static>) -> bool {
-        let mut oldest: Option<usize> = None;
-        let mut at = 0;
-        while let Some(i) = self.orphans.next(at) {
-            at = i + 1;
+        let mut chosen: Option<usize> = None;
+        let mut seen = 0;
+        let mut k = 0;
+        while k < self.orphan_len && seen < EVICT {
+            let (place, at) = self.orphan_queue[(self.orphan_head + k) % SOCKETS_MAX];
+            k += 1;
+            let i = usize::from(place);
+            if !self.orphan_live(i, at) {
+                continue;
+            }
+            seen += 1;
             let state = self.socks[i].handle.map(|h| stack.tcp(h).state());
             // A stream that has closed is free at once.
-            if state.is_none_or(|s| s == tcp::State::Closed) {
+            if state.is_none_or(|s| s == tcp::State::Closed) && !self.socks[i].rst_pending {
                 self.release_place(stack, i);
                 return true;
             }
-            let waiting = state == Some(tcp::State::TimeWait);
-            if waiting && oldest.is_none_or(|o| self.socks[i].orphan_at < self.socks[o].orphan_at) {
-                oldest = Some(i);
+            if state == Some(tcp::State::TimeWait) && chosen.is_none() {
+                chosen = Some(i);
             }
         }
-        match oldest {
+        match chosen {
             Some(i) => {
                 self.release_place(stack, i);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Whether the queue's entry (`i`, `at`) is still the stream let go of at
+    /// `at`.
+    fn orphan_live(&self, i: usize, at: u64) -> bool {
+        self.places.state(i) == State::Orphan && self.socks[i].orphan_at == at
+    }
+
+    /// A stream no session holds, to be swept in its time.
+    fn orphan_push(&mut self, i: usize, at: u64) {
+        if self.orphan_len == SOCKETS_MAX {
+            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
+            self.orphan_len -= 1;
+        }
+        let tail = (self.orphan_head + self.orphan_len) % SOCKETS_MAX;
+        self.orphan_queue[tail] = (i as u16, at);
+        self.orphan_len += 1;
+    }
+
+    /// The oldest stream no session holds that is still one.
+    fn orphan_front(&mut self) -> Option<(usize, u64)> {
+        while self.orphan_len > 0 {
+            let (place, at) = self.orphan_queue[self.orphan_head];
+            if self.orphan_live(usize::from(place), at) {
+                return Some((usize::from(place), at));
+            }
+            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
+            self.orphan_len -= 1;
+        }
+        None
+    }
+
+    fn orphan_pop(&mut self) {
+        if self.orphan_len > 0 {
+            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
+            self.orphan_len -= 1;
         }
     }
 
@@ -501,11 +592,13 @@ impl Net {
         self.touch(i);
         let sock = self.socks[i];
         if sock.listening {
+            // The queue is let go of a few sockets a step, with the RST of
+            // the connections nobody accepted.
             for k in 0..usize::from(sock.member_count) {
-                let m = usize::from(sock.members[k]);
-                self.release_place(stack, m);
+                self.release_queue.set(usize::from(sock.members[k]));
             }
             self.release_place(stack, i);
+            self.cleanup_wanted = true;
             return;
         }
         match (sock.proto, sock.handle) {
@@ -519,9 +612,11 @@ impl Net {
                 } else {
                     t.close();
                     self.places.set_state(i, State::Orphan);
-                    self.socks[i].orphan_at = now_ns();
+                    let at = now_ns();
+                    self.socks[i].orphan_at = at;
                     self.socks[i].waiters = 0;
                     self.orphans.set(i);
+                    self.orphan_push(i, at);
                     self.connecting.clear(i);
                     self.attention.clear(i);
                     self.step_due = true;
@@ -531,35 +626,70 @@ impl Net {
         }
     }
 
-    /// The streams no session holds, a few at a time: one that is closed is
-    /// free, one past ORPHAN_NS is aborted. A step looks at SWEEP of them
-    /// and goes on from there; true when streams are left to look at in this
-    /// round.
+    /// The streams no session holds, oldest first, a few at a time: one that
+    /// has closed is free, one past ORPHAN_NS is aborted (with its RST). A
+    /// step looks at SWEEP of them; true when the queue goes on.
     pub fn sweep(&mut self, stack: &mut Stack<'static>, now: u64) -> bool {
-        let mut seen = 0;
-        let mut at = self.sweep_at;
-        while seen < SWEEP {
-            let Some(i) = self.orphans.next(at) else {
-                // The round is over.
-                self.sweep_at = 0;
+        for _ in 0..SWEEP {
+            let Some((i, at)) = self.orphan_front() else {
                 return false;
             };
-            at = i + 1;
-            seen += 1;
+            if self.socks[i].rst_pending {
+                // Its RST is on the way.
+                return false;
+            }
             let closed = self.socks[i]
                 .handle
                 .is_none_or(|h| stack.tcp(h).state() == tcp::State::Closed);
-            if closed || now.saturating_sub(self.socks[i].orphan_at) >= ORPHAN_NS {
+            if closed {
+                self.orphan_pop();
                 self.release_place(stack, i);
+            } else if now.saturating_sub(at) >= ORPHAN_NS {
+                self.orphan_pop();
+                self.abort_place(stack, i);
+            } else {
+                return false;
             }
         }
-        self.sweep_at = at;
-        true
+        self.orphan_len > 0
+    }
+
+    /// The stream of place `i` is aborted: its RST goes out with the next
+    /// pass of its group, and the place is free after it. A socket that has
+    /// nothing to reset is free at once.
+    pub fn abort_place(&mut self, stack: &mut Stack<'static>, i: usize) {
+        let Some(handle) = self.socks[i].handle else {
+            self.release_place(stack, i);
+            return;
+        };
+        if self.socks[i].proto != Proto::Tcp
+            || matches!(
+                stack.tcp(handle).state(),
+                tcp::State::Closed
+                    | tcp::State::Listen
+                    | tcp::State::SynSent
+                    | tcp::State::TimeWait
+            )
+        {
+            self.release_place(stack, i);
+            return;
+        }
+        stack.tcp(handle).abort();
+        let sock = &mut self.socks[i];
+        sock.rst_pending = true;
+        sock.waiters = 0;
+        sock.listener = NO_PLACE;
+        self.places.set_state(i, State::Orphan);
+        self.release_queue.clear(i);
+        self.connecting.clear(i);
+        self.attention.clear(i);
+        self.touch(i);
+        self.step_due = true;
     }
 
     /// Whether streams wait for the sweep.
     pub fn orphans_wait(&self) -> bool {
-        self.orphans.next(0).is_some()
+        self.orphan_len > 0
     }
 
     // ----- the sessions that went -----
@@ -570,9 +700,11 @@ impl Net {
         if held.count() == 0 {
             return false;
         }
-        match self.departing.iter_mut().find(|h| h.count() == 0) {
-            Some(slot) => {
-                *slot = held;
+        let free = (0..DEPARTING).find(|&n| self.departing_used[n / 64] >> (n % 64) & 1 == 0);
+        match free {
+            Some(n) => {
+                self.departing[n] = held;
+                self.departing_used[n / 64] |= 1 << (n % 64);
                 true
             }
             None => {
@@ -586,21 +718,36 @@ impl Net {
         }
     }
 
-    /// One step of departure: GONE_PORTION descriptions let go of. True when
-    /// more are left.
+    /// One step of departure: at most GONE_PORTION places let go of, the
+    /// descriptions of the sessions that went and the members of the queues
+    /// of closed listening descriptions. True when more are left.
     pub fn depart_step(&mut self, stack: &mut Stack<'static>) -> bool {
         let mut left = GONE_PORTION;
-        for n in 0..DEPARTING {
-            while left > 0 {
-                let Some(i) = self.departing[n].next(0) else {
-                    break;
-                };
-                self.departing[n].remove(i);
-                self.release(stack, i);
-                left -= 1;
+        'entries: for word in 0..self.departing_used.len() {
+            while self.departing_used[word] != 0 {
+                if left == 0 {
+                    break 'entries;
+                }
+                let n = word * 64 + self.departing_used[word].trailing_zeros() as usize;
+                match self.departing[n].next(0) {
+                    Some(i) => {
+                        self.departing[n].remove(i);
+                        self.release(stack, i);
+                        left -= 1;
+                    }
+                    None => self.departing_used[word] &= !(1 << (n % 64)),
+                }
             }
         }
-        self.departing.iter().any(|h| h.count() > 0)
+        while left > 0 {
+            let Some(m) = self.release_queue.next(0) else {
+                break;
+            };
+            self.release_queue.clear(m);
+            self.abort_place(stack, m);
+            left -= 1;
+        }
+        self.departing_used.iter().any(|&w| w != 0) || self.release_queue.next(0).is_some()
     }
 
     // ----- what a socket is ready for -----
@@ -731,15 +878,13 @@ impl Net {
         self.info[idx] = OpInfo::EMPTY;
     }
 
-    /// Tells every operation that waits on place `i` that something changed
-    /// (the description closed): each finds out on its next take.
+    /// The operations that wait on place `i` are told (by the step of
+    /// waking, a few at a time) that the description closed: each finds out on
+    /// its next take.
     fn tell_all(&mut self, i: usize) {
-        let mut mask = self.socks[i].waiters;
-        while mask != 0 {
-            let idx = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            let info = self.info[idx];
-            self.ops.tell(info.label, info.key);
+        self.closed_ops |= self.socks[i].waiters;
+        if self.closed_ops != 0 {
+            self.wake_wanted = true;
         }
     }
 
@@ -871,8 +1016,21 @@ impl Net {
 
     /// After a step of the stack: the places of the groups it touched that
     /// have operations waiting or a connection under way are for the step of
-    /// waking.
-    pub fn schedule_wake(&mut self) {
+    /// waking, and so is the listening description of a socket of a queue (its
+    /// ACCEPT and WATCH wait on that place). A stream that was aborted is free
+    /// once the pass of its group has sent the RST.
+    pub fn schedule_wake(&mut self, stack: &mut Stack<'static>) {
+        let mut passed = core::mem::take(&mut self.passed);
+        while passed != 0 {
+            let g = passed.trailing_zeros() as usize;
+            passed &= passed - 1;
+            for i in g * GROUP..(g + 1) * GROUP {
+                if self.socks[i].rst_pending {
+                    self.socks[i].rst_pending = false;
+                    self.release_place(stack, i);
+                }
+            }
+        }
         let mut groups = core::mem::take(&mut self.touched);
         while groups != 0 {
             let g = groups.trailing_zeros() as usize;
@@ -881,8 +1039,17 @@ impl Net {
                 if self.attention.has(i) || self.connecting.has(i) {
                     self.wake_due.set(i);
                 }
+                let listener = usize::from(self.socks[i].listener);
+                if listener != usize::from(NO_PLACE) && self.attention.has(listener) {
+                    self.wake_due.set(listener);
+                }
             }
         }
+    }
+
+    /// Whether the step of waking has places or operations left.
+    pub fn wake_pending(&self) -> bool {
+        self.wake_due.next(0).is_some() || self.closed_ops != 0
     }
 
     /// The step of waking: for the places in `wake_due`, in turn, the
@@ -891,6 +1058,16 @@ impl Net {
     /// finished stays. True when places are left.
     pub fn wake(&mut self, stack: &mut Stack<'static>, now: u64) -> bool {
         let mut budget = WakeBudget::new();
+        // The operations whose description closed.
+        while self.closed_ops != 0 && budget.take_tell() {
+            let idx = self.closed_ops.trailing_zeros() as usize;
+            self.closed_ops &= self.closed_ops - 1;
+            let info = self.info[idx];
+            self.ops.tell(info.label, info.key);
+        }
+        if self.closed_ops != 0 {
+            return true;
+        }
         let mut at = self.wake_cursor;
         'places: while let Some(i) = self.wake_due.next(at).or_else(|| self.wake_due.next(0)) {
             at = i + 1;
@@ -917,7 +1094,15 @@ impl Net {
                     Kind::Accept => ev & (watch::IN | watch::ERR) != 0,
                     Kind::Send => ev & (watch::OUT | watch::ERR | watch::HUP) != 0,
                     Kind::Recv => ev & (watch::IN | watch::ERR | watch::HUP) != 0,
-                    Kind::Watch => self.watch_item_ready(idx, i, ev),
+                    Kind::Watch => {
+                        // A watch of many items costs more checks.
+                        let more = self.watches[idx].len / 8;
+                        if !budget.take_checks(more) {
+                            self.wake_cursor = i;
+                            break 'places;
+                        }
+                        self.watch_item_ready(idx, i, ev)
+                    }
                 };
                 if ready && self.told & bit == 0 {
                     if !budget.take_tell() {
@@ -936,7 +1121,7 @@ impl Net {
                 at = 0;
             }
         }
-        self.wake_due.next(0).is_some()
+        self.wake_pending()
     }
 
     /// Whether an item of the watch with index `idx` that names place `i`

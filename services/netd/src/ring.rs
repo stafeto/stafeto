@@ -76,6 +76,8 @@ pub const EGRESS_GROUPS: usize = 2;
 pub const EGRESS_GROUPS: usize = 1;
 #[cfg(all(feature = "egress-4", not(feature = "egress-1")))]
 pub const EGRESS_GROUPS: usize = 4;
+/// The operations of one session that wait at most (rt's LONG_SESSION_MAX).
+pub const SESSION_OPS: usize = 16;
 /// The notifications to clients and the checks of readiness the step of
 /// waking does at most (the pipe service wakes eight at most).
 pub const WAKE_TELLS: usize = 8;
@@ -282,12 +284,136 @@ impl LoopBook {
     pub fn waiting(&self) -> usize {
         self.head - self.read
     }
+
+    /// The places taken: the frames waiting and the one being read.
+    pub fn used(&self) -> usize {
+        self.head - self.done
+    }
+
+    /// Whether a frame of sending may be built: two places stay free, one
+    /// for it and one for the stack's answer to the frame being read, so that
+    /// no frame of the loop is lost for want of a place (a lost segment of TCP
+    /// costs the retransmission timer, a second at least).
+    pub fn room_to_send(&self) -> bool {
+        self.used() + 2 <= LOOP_FRAMES
+    }
 }
 
 impl Default for LoopBook {
     fn default() -> LoopBook {
         LoopBook::new()
     }
+}
+
+/// The frames of the loopback (spec 6, 3.3): what the stack sends to its own
+/// MAC waits here for the next reception. The frame stays in the buffer of
+/// sending it was built in (no copy): the ring holds the number of the buffer
+/// and the buffer is not in the pool until the stack is done with the frame.
+/// Both tokens of a pair reach the ring, so its parts have interior
+/// mutability; the book keeps the place of the frame being read apart from the
+/// one a reply goes to.
+pub struct LoopRing {
+    book: core::cell::RefCell<LoopBook>,
+    buffers: [core::cell::Cell<u16>; LOOP_FRAMES],
+    lengths: [core::cell::Cell<usize>; LOOP_FRAMES],
+    /// The buffers the stack is done with, which the pool of sending takes
+    /// back at the start of the next reception and of the next use.
+    returned: core::cell::RefCell<([u16; LOOP_FRAMES], usize)>,
+    /// The frames that found no place.
+    dropped: core::cell::Cell<u64>,
+}
+
+impl LoopRing {
+    pub fn new() -> LoopRing {
+        LoopRing {
+            book: core::cell::RefCell::new(LoopBook::new()),
+            buffers: core::array::from_fn(|_| core::cell::Cell::new(0)),
+            lengths: core::array::from_fn(|_| core::cell::Cell::new(0)),
+            returned: core::cell::RefCell::new(([0; LOOP_FRAMES], 0)),
+            dropped: core::cell::Cell::new(0),
+        }
+    }
+
+    pub fn waiting(&self) -> usize {
+        self.book.borrow().waiting()
+    }
+
+    /// Whether the stack may build a frame of sending (`room_to_send`).
+    pub fn room_to_send(&self) -> bool {
+        self.book.borrow().room_to_send()
+    }
+
+    /// The frames that found no place since the start.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.get()
+    }
+
+    /// Keeps the frame of `length` bytes in buffer `n`; false (counted, and
+    /// the buffer stays the caller's) when the ring is full.
+    pub fn push(&self, n: u16, length: usize) -> bool {
+        let Some(place) = self.book.borrow_mut().push() else {
+            self.dropped.set(self.dropped.get() + 1);
+            return false;
+        };
+        self.buffers[place].set(n);
+        self.lengths[place].set(length);
+        true
+    }
+
+    /// The oldest frame: its place, its buffer and its length.
+    pub fn pop(&self) -> Option<(usize, u16, usize)> {
+        let place = self.book.borrow_mut().pop()?;
+        Some((place, self.buffers[place].get(), self.lengths[place].get()))
+    }
+
+    /// The oldest frame read is done with: its buffer waits to go back to the
+    /// pool.
+    pub fn done(&self) {
+        let Some(place) = self.book.borrow_mut().done() else {
+            return;
+        };
+        let mut returned = self.returned.borrow_mut();
+        let at = returned.1;
+        // Every `take_returned` runs at the start of a reception, so the list
+        // never holds more than the ring does.
+        debug_assert!(at < LOOP_FRAMES);
+        if at < LOOP_FRAMES {
+            returned.0[at] = self.buffers[place].get();
+            returned.1 += 1;
+        }
+    }
+
+    /// A buffer the stack is done with.
+    pub fn take_returned(&self) -> Option<u16> {
+        let mut returned = self.returned.borrow_mut();
+        returned.1 = returned.1.checked_sub(1)?;
+        Some(returned.0[returned.1])
+    }
+}
+
+impl Default for LoopRing {
+    fn default() -> LoopRing {
+        LoopRing::new()
+    }
+}
+
+/// The index of the long operation `key` names in a table of `operations`
+/// places, None for a key a client made up: the low word 0 (no operation),
+/// or past the table.
+pub fn op_index(key: u64, operations: usize) -> Option<usize> {
+    let index = usize::try_from((key & 0xffff_ffff).checked_sub(1)?).ok()?;
+    (index < operations).then_some(index)
+}
+
+/// The step the loop does next among those asked for in `bits`: the bit
+/// after `last` in the order of `order`, going round, so that a step that asks
+/// for itself again cannot keep the others from running (the order of the
+/// bits would let receiving starve them). The place in `order` of the bit
+/// chosen.
+pub fn next_bit(order: &[u64], bits: u64, last: usize) -> Option<usize> {
+    (1..=order.len())
+        .map(|k| (last + k) % order.len())
+        .find(|&i| bits & order[i] != 0)
 }
 
 /// What the step of waking may still do: WAKE_TELLS notifications and
@@ -313,6 +439,18 @@ impl WakeBudget {
             None => return false,
         };
         true
+    }
+
+    /// Spends `n` checks; false (and nothing spent) when the step has not
+    /// that many left.
+    pub fn take_checks(&mut self, n: usize) -> bool {
+        match self.checks.checked_sub(n) {
+            Some(left) => {
+                self.checks = left;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Spends a notification; false when the step has had its share.
@@ -554,6 +692,80 @@ mod tests {
         assert!(!sending.take_rx());
         assert_eq!(sending.tx_left(), STEP_TX);
         assert_eq!(Budget::with(3, 5).spent(), (0, 0));
+    }
+
+    /// The last of the pool's buffers goes round the loop many times, as the
+    /// seeding of neighbours and the receiving without answers do in idle: no
+    /// buffer is lost and the list of returned ones never overflows.
+    #[test]
+    fn buffers_of_the_loop_go_back_to_the_pool_after_many_seeds_without_answers() {
+        let ring = LoopRing::new();
+        let mut pool = TxBook::new();
+        for _ in 0..200 {
+            // The seeding of two ARP replies.
+            while let Some(n) = ring.take_returned() {
+                assert!(pool.release(n));
+            }
+            for _ in 0..2 {
+                let n = pool.alloc().expect("a buffer");
+                assert!(ring.push(n, 42));
+            }
+            // The reception of them, with no answer.
+            while let Some(_frame) = ring.pop() {
+                ring.done();
+            }
+        }
+        while let Some(n) = ring.take_returned() {
+            assert!(pool.release(n));
+        }
+        assert_eq!(pool.free(), TX_BUFFERS);
+        assert_eq!(ring.dropped(), 0);
+    }
+
+    #[test]
+    fn a_frame_of_sending_leaves_a_place_for_the_answer_to_the_frame_being_read() {
+        let mut book = LoopBook::new();
+        let mut built = 0;
+        while book.room_to_send() {
+            book.push().unwrap();
+            built += 1;
+        }
+        assert_eq!(built, LOOP_FRAMES - 1);
+        // The answers to the frames read: each takes the place the stack needs
+        // while its frame is still held, and none is lost.
+        for _ in 0..built {
+            book.pop().unwrap();
+            assert!(book.push().is_some(), "an answer finds a place");
+            book.done();
+        }
+    }
+
+    #[test]
+    fn a_key_a_client_made_up_names_no_operation() {
+        assert_eq!(op_index(0, 128), None);
+        assert_eq!(op_index(1 << 32, 128), None, "generation only");
+        assert_eq!(op_index(129, 128), None);
+        assert_eq!(op_index(u64::MAX, 128), None);
+        assert_eq!(op_index(1, 128), Some(0));
+        assert_eq!(op_index((7 << 32) | 128, 128), Some(127));
+    }
+
+    #[test]
+    fn the_next_step_goes_round_the_bits() {
+        let order = [16, 1, 4, 2, 8];
+        // Receiving asks for itself again: the others still run.
+        let all = 16 | 1 | 4 | 2 | 8;
+        let mut last = 0;
+        let mut run = Vec::new();
+        for _ in 0..5 {
+            let at = next_bit(&order, all, last).unwrap();
+            run.push(order[at]);
+            last = at;
+        }
+        assert_eq!(run, [1, 4, 2, 8, 16]);
+        assert_eq!(next_bit(&order, 16, 0), Some(0), "alone it runs again");
+        assert_eq!(next_bit(&order, 0, 0), None);
+        assert_eq!(next_bit(&order, 8 | 16, 2), Some(4));
     }
 
     #[test]

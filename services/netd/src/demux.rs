@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The table that steers a received frame to the place of the socket it is
-//! for, so that the stack looks at the group of that socket alone and not at
-//! all of them (smoltcp walks every socket of a set for each frame). A TCP
+//! for, so that the stack looks at the group of that socket alone (smoltcp walks every socket of a set for each frame). A TCP
 //! socket with a connection is found by its four, a listening description and
 //! a UDP socket by its address and port; the address 0.0.0.0 stands for all.
 //!

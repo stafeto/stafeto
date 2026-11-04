@@ -125,6 +125,9 @@ const BIND: &str = "net-probe: bind ok";
 const FULL_BATCH: &str = "net-probe: full batch ok";
 const ALL_GROUPS: &str = "net-probe: all groups ok";
 const WAKES: &str = "net-probe: wakes ok 16";
+const IDLE: &str = "net-probe: idle ok";
+const LISTENERS: &str = "net-probe: listeners ok";
+const TIMERS_PREFIX: &str = "net-probe: timers ok";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -164,6 +167,9 @@ pub struct Roles {
     pub full_batch: bool,
     pub all_groups: bool,
     pub wakes: bool,
+    pub idle: bool,
+    pub listeners: bool,
+    pub timers: bool,
 }
 
 impl Roles {
@@ -173,6 +179,9 @@ impl Roles {
         full_batch: false,
         all_groups: false,
         wakes: false,
+        idle: false,
+        listeners: false,
+        timers: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -202,6 +211,18 @@ impl Roles {
         wakes: true,
         ..Roles::NONE
     };
+    pub const IDLE: Roles = Roles {
+        idle: true,
+        ..Roles::NONE
+    };
+    pub const LISTENERS: Roles = Roles {
+        listeners: true,
+        ..Roles::NONE
+    };
+    pub const TIMERS: Roles = Roles {
+        timers: true,
+        ..Roles::NONE
+    };
 }
 
 /// The sockets the service serves at once (the limit of its table).
@@ -221,6 +242,7 @@ fn rtts(line: &str) -> Option<(u64, u64)> {
 /// listen_short S bad_sum B demux_probe P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frames {
+    dropped: u64,
     dhcp: u64,
     martian: u64,
     listen_short: u64,
@@ -253,8 +275,8 @@ fn frames(line: &str) -> Option<Frames> {
     };
     rx.parse::<u64>().ok()?;
     tx.parse::<u64>().ok()?;
-    dropped.parse::<u64>().ok()?;
     Some(Frames {
+        dropped: dropped.parse().ok()?,
         dhcp: dhcp.parse().ok()?,
         martian: martian.parse().ok()?,
         listen_short: listen_short.parse().ok()?,
@@ -321,6 +343,15 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.wakes {
         once.push((WAKES, 1));
     }
+    if roles.idle {
+        once.push((IDLE, 1));
+    }
+    if roles.listeners {
+        once.push((LISTENERS, 1));
+    }
+    if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
+        return Err(format!("no line {TIMERS_PREFIX:?}"));
+    }
     if let Some(sockets) = &sockets {
         once.push((sockets.as_str(), 1));
     }
@@ -350,7 +381,7 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     // `listen` that `accept` could not refill is a fault of the table.
     if let Some(f) = counters
         .iter()
-        .find(|f| f.martian != 0 || f.listen_short != 0 || f.bad_sum != 0)
+        .find(|f| f.martian != 0 || f.listen_short != 0 || f.bad_sum != 0 || f.dropped != 0)
     {
         return Err(format!("the service counted {f:?}"));
     }
@@ -604,6 +635,17 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             measured_programs(Some("net-wakes"), netd),
             Roles::WAKES,
         ),
+        ("i", measured_programs(Some("net-idle"), netd), Roles::IDLE),
+        (
+            "l",
+            measured_programs(Some("net-listen"), netd),
+            Roles::LISTENERS,
+        ),
+        (
+            "r",
+            measured_programs(Some("net-timers"), netd),
+            Roles::TIMERS,
+        ),
     ]
 }
 
@@ -650,12 +692,15 @@ fn acceptance(
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {}, i {}, l {}, r {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
         own("s256"),
         own("f"),
         own("a"),
         own("w"),
+        own("i"),
+        own("l"),
+        own("r"),
         netd::choose::FLATNESS
     );
     Ok(all)
@@ -853,7 +898,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 /// `hvf` or the name of one of qemu::MACHINES; `steps` is the measurement.
 pub fn command(args: &[String]) -> Result<(), String> {
     // `steps RECEIVE GROUPS SEND`: the acceptance runs at that choice, read
-    // and not judged (for the note of the expert).
+    // without judging them (for the note of the expert).
     if let [first, receive, groups, send] = args
         && first == "steps"
     {
@@ -869,6 +914,26 @@ pub fn command(args: &[String]) -> Result<(), String> {
             Box::leak(choice_features(receive, groups, send).into_boxed_slice());
         let tag: &'static str = Box::leak(format!("r{receive}g{groups}s{send}").into_boxed_str());
         return acceptance(&qemu::VIRT, tag, features, false).map(|_| ());
+    }
+    // `role NAME`: one run of the acceptance (s256, s8, f, a, w, i, l or r),
+    // judged; for the deliberate breakages.
+    if let [first, name] = args
+        && first == "role"
+    {
+        let (what, programs, roles) = acceptance_runs(&[])
+            .into_iter()
+            .find(|(what, ..)| what == name)
+            .ok_or_else(|| format!("no role {name}"))?;
+        let rows = steps_run(
+            &qemu::VIRT,
+            measured_name(&format!("role-{what}")),
+            programs,
+            roles,
+            true,
+        )?;
+        let rows = steps_verdict_rows(&rows).map_err(|e| format!("run {what}: {e}"))?;
+        print_rows(&qemu::VIRT, &format!("role {what}"), &rows);
+        return Ok(());
     }
     if args == ["split"] {
         return split_only(&qemu::VIRT);
@@ -1093,6 +1158,38 @@ mod tests {
                     .unwrap_err()
                     .contains(line)
             );
+            lines.push(line.to_owned());
+            assert_eq!(verdict(&lines, Mode::Dhcp, roles), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_dropped_frame_of_the_loop_is_a_fault() {
+        let mut lines = good_run(Mode::Dhcp);
+        let at = lines.iter().position(|l| l.starts_with(FRAMES)).unwrap();
+        lines[at] = format!(
+            "{FRAMES}12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 bad_sum 0 demux_probe 2"
+        );
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::LIMIT)
+                .unwrap_err()
+                .contains("counted")
+        );
+    }
+
+    #[test]
+    fn the_roles_i_l_and_r_name_their_lines() {
+        for (roles, line) in [
+            (Roles::IDLE, IDLE),
+            (Roles::LISTENERS, LISTENERS),
+            (
+                Roles::TIMERS,
+                "net-probe: timers ok (a segment sent again after 1004 ms)",
+            ),
+        ] {
+            let mut lines = good_run(Mode::Dhcp);
+            lines.retain(|l| !l.starts_with("net-probe: sockets") && l != BIND);
+            assert!(verdict(&lines, Mode::Dhcp, roles).is_err());
             lines.push(line.to_owned());
             assert_eq!(verdict(&lines, Mode::Dhcp, roles), Ok(()));
         }

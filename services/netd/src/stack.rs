@@ -275,7 +275,7 @@ impl<'a> Stack<'a> {
     /// of the groups in `due` (a bit each) and the service's set, each in one
     /// pass over its few sockets. A group whose pass reached its end leaves
     /// `due`; one that the share of sending cut short stays. The groups the
-    /// pass visited are added to `touched`. Each pass also reads the deadline
+    /// pass visited are added to `touched` and `passed`. Each pass also reads the deadline
     /// of its set.
     pub fn egress(
         &mut self,
@@ -283,6 +283,7 @@ impl<'a> Stack<'a> {
         device: &mut NetDevice,
         due: &mut u64,
         touched: &mut u64,
+        passed: &mut u64,
     ) {
         let now = instant(now_ns);
         // The service's set only when it has work.
@@ -331,6 +332,7 @@ impl<'a> Stack<'a> {
             );
             split::add(&split::PASSES, spent);
             *touched |= 1 << g;
+            *passed |= 1 << g;
             *due &= !(1 << g);
             self.group_at[g] = match at {
                 // Work now: another pass when it sent something and the share

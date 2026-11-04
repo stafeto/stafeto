@@ -76,6 +76,8 @@ const ETHERNET_HEADER: usize = 14;
 /// the Ethernet header, 8 bytes of fixed fields, two addresses of hardware
 /// and one of protocol).
 const ARP_TARGET: usize = ETHERNET_HEADER + 24;
+/// Where the sender protocol address of an ARP frame is.
+const ARP_SENDER: usize = ETHERNET_HEADER + 14;
 const ARP_REQUEST: u16 = 1;
 
 /// The source and destination of an Ethernet frame that carries IPv4.
@@ -99,7 +101,44 @@ pub const fn is_loopback(ip: [u8; 4]) -> bool {
 /// services bound to 127.0.0.1 with a frame to the service's MAC, and when
 /// the stack would send it to the device.
 pub fn martian(frame: &[u8]) -> bool {
+    if frame.len() >= ARP_TARGET + 4 && frame[12..14] == ETHERTYPE_ARP {
+        // ARP names its ends too: a sender or a target in 127.0.0.0/8 would
+        // teach the neighbour cache a false MAC for the loopback.
+        return frame[ARP_SENDER] == 127 || frame[ARP_TARGET] == 127;
+    }
     ipv4_ends(frame).is_some_and(|(src, dst)| is_loopback(src) || is_loopback(dst))
+}
+
+/// What a buffer the device filled holds, for the receiving ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxFrame {
+    /// A frame of this length after the header.
+    Frame(usize),
+    /// A frame that must not reach the stack from the wire (127.0.0.0/8).
+    Martian,
+    /// No frame: too short, too long, or merged buffers.
+    Invalid,
+}
+
+/// What the buffer of `used` bytes holds. Every kind costs the step one unit of
+/// its share of receiving, so that a flood of frames that are dropped cannot
+/// hold a step.
+pub fn classify(buffer: &[u8], used: usize) -> RxFrame {
+    match rx_frame(buffer, used) {
+        None => RxFrame::Invalid,
+        Some(frame) if martian(frame) => RxFrame::Martian,
+        Some(frame) => RxFrame::Frame(frame.len()),
+    }
+}
+
+/// Whether an ARP frame names one of `own` as its sender: from the wire it is
+/// a forgery, which would send the stack's frames to itself out on the wire.
+pub fn arp_claims(frame: &[u8], own: &[[u8; 4]]) -> bool {
+    frame.len() >= ARP_TARGET + 4
+        && frame[12..14] == ETHERTYPE_ARP
+        && own
+            .iter()
+            .any(|a| a[..] == frame[ARP_SENDER..ARP_SENDER + 4])
 }
 
 /// Where a frame the stack sends goes.
@@ -433,7 +472,10 @@ mod tests {
         assert!(martian(&ipv4_frame([10, 0, 2, 2], [127, 0, 0, 1], mac)));
         assert!(martian(&ipv4_frame([127, 5, 5, 5], [10, 0, 2, 15], mac)));
         assert!(!martian(&ipv4_frame([10, 0, 2, 2], [10, 0, 2, 15], mac)));
-        assert!(!martian(&arp_request([127, 0, 0, 1])), "ARP is no IPv4");
+        assert!(
+            martian(&arp_request([127, 0, 0, 1])),
+            "ARP names its ends too"
+        );
         assert!(!martian(&[0; 20]));
     }
 
@@ -631,5 +673,46 @@ mod tests {
         let mut frag = tcp_frame(b"x");
         frag[14 + 6] = 0x20;
         assert_eq!(target(&frag), Dest::Service);
+    }
+
+    #[test]
+    fn arp_with_a_loopback_end_or_a_forged_sender_does_not_come_from_the_wire() {
+        let mut ask = arp_request([127, 0, 0, 1]);
+        assert!(martian(&ask), "a target in 127.0.0.0/8");
+        let mut reply = arp_request([10, 0, 2, 15]);
+        assert!(!martian(&reply));
+        reply[28..32].copy_from_slice(&[127, 0, 0, 1]);
+        assert!(martian(&reply), "a sender in 127.0.0.0/8");
+        ask[28..32].copy_from_slice(&[10, 0, 2, 2]);
+        ask[38..42].copy_from_slice(&[10, 0, 2, 15]);
+        assert!(!martian(&ask));
+        // A sender that is our own address.
+        ask[28..32].copy_from_slice(&[10, 0, 2, 15]);
+        assert!(arp_claims(&ask, &[[10, 0, 2, 15], [127, 0, 0, 1]]));
+        assert!(!arp_claims(&ask, &[[10, 0, 2, 16]]));
+        assert!(!arp_claims(&[0; 5], &[[10, 0, 2, 15]]));
+        assert!(!arp_claims(
+            &ipv4_frame([10, 0, 2, 15], [10, 0, 2, 2], [0; 6]),
+            &[[10, 0, 2, 15]]
+        ));
+    }
+
+    #[test]
+    fn a_buffer_is_a_frame_a_martian_or_nothing() {
+        let mut buffer = vec![0; HDR_LEN];
+        buffer[NUM_BUFFERS_AT] = 1;
+        let good = ipv4_frame([10, 0, 2, 2], [10, 0, 2, 15], [2; 6]);
+        let bad = ipv4_frame([10, 0, 2, 2], [127, 0, 0, 1], [2; 6]);
+        let with = |frame: &[u8]| {
+            let mut b = buffer.clone();
+            b.extend_from_slice(frame);
+            b
+        };
+        let b = with(&good);
+        assert_eq!(classify(&b, b.len()), RxFrame::Frame(good.len()));
+        let b = with(&bad);
+        assert_eq!(classify(&b, b.len()), RxFrame::Martian);
+        assert_eq!(classify(&buffer, HDR_LEN), RxFrame::Invalid);
+        assert_eq!(classify(&buffer, 3), RxFrame::Invalid);
     }
 }

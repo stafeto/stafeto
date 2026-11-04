@@ -392,6 +392,7 @@ fn main(_: u64) -> u64 {
         told: 0,
         cleanup_due: false,
         armed: None,
+        last_step: 0,
         neighbours_at: 0,
         #[cfg(feature = "probe")]
         hold: false,
@@ -488,6 +489,8 @@ struct Driver<'a> {
     cleanup_due: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
+    /// The step that ran last among those asked for together.
+    last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
     neighbours_at: u64,
     /// The probe holds the steps of the stack (HOLD), and an interrupt came
@@ -528,6 +531,12 @@ impl Driver<'_> {
     fn after_request(&mut self) {
         if core::mem::take(&mut self.net.step_due) {
             self.want_step();
+        }
+        if core::mem::take(&mut self.net.cleanup_wanted) {
+            self.cleanup();
+        }
+        if core::mem::take(&mut self.net.wake_wanted) {
+            self.tell(WAKE);
         }
         if self.cleanup_due && self.tell(CLEANUP) {
             self.cleanup_due = false;
@@ -606,6 +615,7 @@ impl Driver<'_> {
             &mut self.device,
             &mut self.net.due,
             &mut self.net.touched,
+            &mut self.net.passed,
         );
         self.events(now);
         if now >= self.neighbours_at {
@@ -628,8 +638,8 @@ impl Driver<'_> {
     /// What every step ends with: the operations that wait are looked at by a
     /// step of their own, and the doorbells ring.
     fn finish_step(&mut self, _now: u64) {
-        self.net.schedule_wake();
-        if self.net.wake_due.next(0).is_some() {
+        self.net.schedule_wake(&mut self.stack);
+        if self.net.wake_pending() {
             self.tell(WAKE);
         }
         self.doorbells();
@@ -779,7 +789,7 @@ impl Driver<'_> {
             rx,
             tx.tx,
             tx.dhcp,
-            rx_dropped + tx.dropped,
+            rx_dropped + tx.dropped + self.device.looped.dropped(),
             rx_martian + tx.martian,
             self.net.counters.listen_short,
             self.device.bad_sum,
@@ -805,6 +815,7 @@ impl Driver<'_> {
                 self.net.step_due = true;
                 self.tell(RX);
             }
+            proto_net::HOLD_DROP => self.device.tx.drop_loop = 1,
             _ => {
                 self.net.touch_all();
                 self.net.step_due = true;
@@ -922,11 +933,12 @@ impl Service<0> for Driver<'_> {
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
-                // step that is on and not for all of them.
-                let bit = [RX, TX, WAKE, CLEANUP, SWEEP]
-                    .into_iter()
-                    .find(|b| n.bits & b != 0)
-                    .unwrap_or(0);
+                // step that is on.
+                let order = [RX, TX, WAKE, CLEANUP, SWEEP];
+                let at =
+                    netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
+                self.last_step = at;
+                let bit = order[at];
                 let rest = n.bits & STEP_BITS & !bit;
                 self.told &= !bit;
                 if rest != 0 && sys::notify(&self.notify, rest).is_err() {

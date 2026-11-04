@@ -23,6 +23,15 @@
 //!   the other end, then 50 PINGs of the gateway.
 //! - `e`: the rates of the loopback through the service, 5 s each: UDP
 //!   datagrams of 64 bytes, and a TCP stream in pieces of 800 bytes.
+//! - `i`: the service idles for 150 s (five renewals of the neighbours) and
+//!   must not have ended.
+//! - `l`: blocking ACCEPT and WATCH on a listening description with a queue
+//!   of 16, woken by connections that land in sockets of other groups; a
+//!   listening description closed with a connection in its queue resets it;
+//!   eight sessions with queues of 16 go at once.
+//! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
+//!   of the loopback that is dropped is sent again by the retransmission
+//!   timer.
 //!
 //! Each check prints its line, and the last says `net-probe: ok`; xtask
 //! reads them.
@@ -69,6 +78,7 @@ fn main(_: u64) -> u64 {
         channel,
         waiter,
         level,
+        told: core::cell::Cell::new(0),
     };
     let mut result = Ok(());
     let mut session = None;
@@ -91,6 +101,9 @@ fn main(_: u64) -> u64 {
             b'f' => probe.full_batch(&mut session),
             b'a' => probe.all_groups(&mut session),
             b'w' => probe.wakes(&mut session),
+            b'i' => probe.idle(&mut session),
+            b'l' => probe.listeners(&mut session),
+            b'r' => probe.timers(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -115,6 +128,8 @@ struct Probe<'a> {
     waiter: Waiter,
     /// The level of the probe's thread, for the handles it makes.
     level: u8,
+    /// The labels (from TOLD_BASE) of the operations the service told.
+    told: core::cell::Cell<u128>,
 }
 
 /// What a request to the service came to.
@@ -198,6 +213,9 @@ struct Pairs {
     count: usize,
 }
 
+/// The first label of the handles that tell this probe of an operation.
+const TOLD_BASE: u64 = 0x100;
+
 /// The most places the role `s` fills, in the pairs of 4 places.
 const PAIRS_MAX: usize = 64;
 /// The sessions the role may need: 3 descriptions a pair, 64 a session.
@@ -232,9 +250,41 @@ impl Probe<'_> {
 
     fn sleep(&self, ns: u64) {
         let deadline = time::ticks_to_ns(time::now()).saturating_add(ns);
-        while let Ok(rt::wait::Waited::Got(_)) = self.waiter.receive_until(&self.channel, deadline)
+        while let Ok(rt::wait::Waited::Got(got)) =
+            self.waiter.receive_until(&self.channel, deadline)
         {
+            self.note(&got);
         }
+    }
+
+    /// Remembers a notification of one of the handles the probe armed
+    /// operations with (labels 0x100 to 0x17f).
+    fn note(&self, got: &sys::Received) {
+        if let sys::Received::Notification {
+            source: abi::Source::Session,
+            label,
+            bits,
+            ..
+        } = got
+            && bits & 1 != 0
+            && (TOLD_BASE..TOLD_BASE + 128).contains(label)
+        {
+            self.told.set(self.told.get() | 1 << (label - TOLD_BASE));
+        }
+    }
+
+    /// Waits up to `seconds` of the guest's time for the notification under
+    /// `label`; true when it came (it may have come before).
+    fn told_within(&self, label: u64, seconds: u64) -> bool {
+        let end = self.now() + seconds * 1_000_000_000;
+        let bit = 1u128 << (label - TOLD_BASE);
+        while self.told.get() & bit == 0 {
+            match self.waiter.receive_until(&self.channel, end) {
+                Ok(rt::wait::Waited::Got(got)) => self.note(&got),
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn now(&self) -> u64 {
@@ -425,6 +475,45 @@ impl Probe<'_> {
             Err(fail) if is(&fail, proto_net::IN_USE) => {}
             _ => return Err("BIND of 127.0.0.1:8080 next to 0.0.0.0:8080 was not refused"),
         }
+        // A key of a long operation that no operation has, in every take: the
+        // service refuses it and goes on (an index past the table once ended it).
+        for key in [129u64, (5 << 32) | 200, 1 << 32, u64::MAX] {
+            let takes = [
+                Request::Recv {
+                    key: Some(key),
+                    description: first,
+                    flags: 0,
+                    most: 1,
+                },
+                Request::Send {
+                    key: Some(key),
+                    description: first,
+                    flags: 0,
+                    address: Address::NONE,
+                    data: b"x",
+                },
+                Request::Accept {
+                    key: Some(key),
+                    description: first,
+                    flags: 0,
+                },
+                Request::Connect {
+                    key: Some(key),
+                    description: first,
+                    address: Address::v4([127, 0, 0, 1], 9),
+                },
+                Request::WatchTake(key),
+                Request::WatchCancel(key),
+            ];
+            for take in &takes {
+                let mut buffer = [0; MESSAGE_MAX];
+                match socket_call(&net, take, &mut buffer) {
+                    Err(Fail::Status(_)) => {}
+                    _ => return Err("a take with a key nobody has was not refused"),
+                }
+            }
+        }
+        config(&net).map_err(|_| "the service ended at a key nobody has")?;
         // A session of CLONE has its own descriptions, none of the first's.
         let child = self.clone_empty(&net).map_err(|_| "CLONE failed")?;
         let child_socket = tcp(&child)?;
@@ -470,8 +559,8 @@ impl Probe<'_> {
         let took = self.now() - began;
         rt::println!("net-probe: loopback connect {} us", took / 1000);
         // The server end closes first, so that the stream that waits for its
-        // end is in TIME-WAIT (the table may take its place back), not in a
-        // state that holds it for a minute.
+        // end is in TIME-WAIT, where the table may take its place back (a
+        // stream in another state holds it for a minute).
         let mut buffer = [0; MESSAGE_MAX];
         let len = self
             .nonblocking(PAUSE_NS, || {
@@ -903,6 +992,67 @@ impl Probe<'_> {
             let mut buffer = [0; MESSAGE_MAX];
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "CANCEL failed")?;
         }
+        // The operations of a session that goes leave the places they wait
+        // on: a new operation with the same number is not told for them.
+        let held = self.new_blocking(&root, sockets::DGRAM)?;
+        self.bind(&root, held, [127, 0, 0, 1], 9201)
+            .map_err(|_| "BIND failed")?;
+        let child = self
+            .clone_with(&root, &[held])
+            .map_err(|_| "CLONE failed")?;
+        let waiting = Request::Recv {
+            key: None,
+            description: held,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        let stale = self.start_wait(&child, &waiting)?;
+        let take = Request::Recv {
+            key: Some(stale),
+            description: held,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        self.take_armed(&child, &take, TOLD_BASE + 0x10)?;
+        drop(child);
+        self.sleep(100_000_000);
+        let other = self.new_blocking(&root, sockets::DGRAM)?;
+        self.bind(&root, other, [127, 0, 0, 1], 9202)
+            .map_err(|_| "BIND failed")?;
+        let fresh = Request::Recv {
+            key: None,
+            description: other,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        let fresh_key = self.start_wait(&root, &fresh)?;
+        let fresh_take = Request::Recv {
+            key: Some(fresh_key),
+            description: other,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        self.take_armed(&root, &fresh_take, TOLD_BASE + 0x11)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let to_held = Request::Send {
+            key: None,
+            description: sender,
+            flags: 0,
+            address: Address::v4([127, 0, 0, 1], 9201),
+            data: b"stale",
+        };
+        socket_call(&root, &to_held, &mut buffer).map_err(|_| "SEND failed")?;
+        self.sleep(300_000_000);
+        if self.told.get() & (1 << 0x11) != 0 {
+            return Err("an operation was told for the place of a session that went");
+        }
+        let mut w = Writer::new();
+        Request::Cancel(fresh_key)
+            .write(&mut w)
+            .map_err(|_| "CANCEL's request")?;
+        call(&root, w.as_bytes(), &mut buffer).map_err(|_| "CANCEL failed")?;
+        self.close(&root, held).map_err(|_| "CLOSE failed")?;
+        self.close(&root, other).map_err(|_| "CLOSE failed")?;
         self.close(&root, sender).map_err(|_| "CLOSE failed")?;
         self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
         config(&root).map_err(|_| "CONFIG refused")?;
@@ -1158,6 +1308,297 @@ impl Probe<'_> {
             bytes / seconds / 1_000_000,
             bytes / seconds / 100_000 % 10
         );
+        Ok(())
+    }
+}
+
+/// The roles `i`, `l` and `r`, and the checks that the other roles share.
+impl Probe<'_> {
+    /// A socket that waits (no NONBLOCK).
+    fn new_blocking(&self, net: &Handle<Channel>, kind: u32) -> Result<u32, &'static str> {
+        let mut buffer = [0; MESSAGE_MAX];
+        let request = Request::Socket {
+            family: proto_net::INET,
+            kind,
+            flags: 0,
+        };
+        let reply = socket_call(net, &request, &mut buffer).map_err(|_| "SOCKET failed")?;
+        sockets::read_word(reply).map_err(|_| "SOCKET's reply")
+    }
+
+    /// The long operation `request` (a start) of a blocking description:
+    /// its key, WAIT k.
+    fn start_wait(
+        &self,
+        net: &Handle<Channel>,
+        request: &Request<'_>,
+    ) -> Result<u64, &'static str> {
+        let mut buffer = [0; MESSAGE_MAX];
+        let reply = socket_call(net, request, &mut buffer).map_err(|fail| {
+            rt::println!("net-probe: a start: {fail:?}");
+            "a start failed"
+        })?;
+        match long::Reply::read(reply) {
+            Ok(long::Reply::Wait(key)) => Ok(key),
+            _ => Err("a start did not wait"),
+        }
+    }
+
+    /// The take `request` of an operation with a handle that tells this probe
+    /// under `label`: true when the service armed it, false when the result
+    /// was ready at once.
+    fn take_armed(
+        &self,
+        net: &Handle<Channel>,
+        request: &Request<'_>,
+        label: u64,
+    ) -> Result<bool, &'static str> {
+        let notify = sys::handle_label(
+            &self.channel,
+            abi::Rights::NOTIFY | abi::Rights::TRANSFER,
+            label,
+            self.level,
+        )
+        .map_err(|_| "handle_label failed")?;
+        let mut w = Writer::new();
+        request.write(&mut w).map_err(|_| "a take's request")?;
+        let reply =
+            sys::send_handles(net, w.as_bytes(), [notify.erase()]).map_err(|_| "a take failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        match long::Reply::read(reply.bytes(&mut buffer)) {
+            Ok(long::Reply::Armed) => Ok(true),
+            Ok(long::Reply::Ready(_)) => Ok(false),
+            _ => Err("a take was neither armed nor ready"),
+        }
+    }
+
+    /// A take with no handle: the data of READY.
+    fn take_ready(
+        &self,
+        net: &Handle<Channel>,
+        request: &Request<'_>,
+    ) -> Result<u32, &'static str> {
+        let mut buffer = [0; MESSAGE_MAX];
+        let reply = socket_call(net, request, &mut buffer).map_err(|_| "a take failed")?;
+        let data = ready(reply).map_err(|_| "a take was not ready")?;
+        // ACCEPT's data begins with the new description.
+        Ok(data
+            .get(..4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+    }
+
+    /// Role `i`: 150 s of idle, in which the service renews its neighbours
+    /// five times; it must answer CONFIG after and must not have restarted
+    /// (the verdict counts the restarts).
+    fn idle(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        self.sleep(150_000_000_000);
+        self.config_ready(&root)?;
+        rt::println!("net-probe: idle ok");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `l`.
+    fn listeners(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        const BASE: u64 = TOLD_BASE + 0x20;
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        // A listening description with a queue of 16: its sockets lie in
+        // several groups of the table, and the description in one of them.
+        let listener = self.new_blocking(&root, sockets::STREAM)?;
+        self.bind(&root, listener, [127, 0, 0, 1], 9300)
+            .map_err(|_| "BIND failed")?;
+        self.plain(
+            &root,
+            Request::Listen {
+                description: listener,
+                backlog: 16,
+            },
+        )
+        .map_err(|_| "LISTEN failed")?;
+        for round in 0..20u64 {
+            let accept = Request::Accept {
+                key: None,
+                description: listener,
+                flags: 0,
+            };
+            let key = self.start_wait(&root, &accept)?;
+            let take = Request::Accept {
+                key: Some(key),
+                description: listener,
+                flags: 0,
+            };
+            if !self.take_armed(&root, &take, BASE + round)? {
+                return Err("ACCEPT was ready before a connection");
+            }
+            let client = self
+                .new_socket(&root, sockets::STREAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.plain(
+                &root,
+                Request::Connect {
+                    key: None,
+                    description: client,
+                    address: Address::v4([127, 0, 0, 1], 9300),
+                },
+            )
+            .err()
+            .filter(|f| !is(f, proto_net::IN_PROGRESS))
+            .map_or(Ok(()), |_| Err("CONNECT failed"))?;
+            if !self.told_within(BASE + round, 5) {
+                return Err("a blocking ACCEPT was not woken by a connection");
+            }
+            let accepted = self.take_ready(&root, &take)?;
+            self.close(&root, accepted).map_err(|_| "CLOSE failed")?;
+            self.close(&root, client).map_err(|_| "CLOSE failed")?;
+        }
+        // The same with WATCH.
+        let mut set = proto_wire::watch::Set::new();
+        set.len = 1;
+        set.items[0] = proto_wire::watch::Item {
+            description: listener,
+            events: proto_wire::watch::IN,
+        };
+        let key = self.start_wait(&root, &Request::Watch(set))?;
+        if !self.take_armed(&root, &Request::WatchTake(key), BASE + 30)? {
+            return Err("WATCH was ready before a connection");
+        }
+        let client = self
+            .new_socket(&root, sockets::STREAM)
+            .map_err(|_| "SOCKET failed")?;
+        let _ = self.plain(
+            &root,
+            Request::Connect {
+                key: None,
+                description: client,
+                address: Address::v4([127, 0, 0, 1], 9300),
+            },
+        );
+        if !self.told_within(BASE + 30, 5) {
+            return Err("a WATCH of a listening description was not woken");
+        }
+        let mut w = Writer::new();
+        Request::WatchCancel(key)
+            .write(&mut w)
+            .map_err(|_| "WATCH's request")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        call(&root, w.as_bytes(), &mut buffer).map_err(|_| "WATCH_CANCEL failed")?;
+        self.close(&root, client).map_err(|_| "CLOSE failed")?;
+        // The connection in the queue is reset when the description closes:
+        // the client's end hears RESET, not silence.
+        let waiting = self
+            .new_socket(&root, sockets::STREAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.connect_wait(&root, waiting, Address::v4([127, 0, 0, 1], 9300))?;
+        self.close(&root, listener).map_err(|_| "CLOSE failed")?;
+        let end = self.now() + 3_000_000_000;
+        loop {
+            let mut buffer = [0; MESSAGE_MAX];
+            let request = Request::Recv {
+                key: None,
+                description: waiting,
+                flags: 0,
+                most: 1,
+            };
+            match socket_call(&root, &request, &mut buffer) {
+                Err(fail) if is(&fail, proto_net::RESET) => break,
+                Err(fail) if is(&fail, proto_net::AGAIN) && self.now() < end => {
+                    self.sleep(1_000_000)
+                }
+                _ => return Err("the client of a closed listening description was not reset"),
+            }
+        }
+        self.close(&root, waiting).map_err(|_| "CLOSE failed")?;
+        // Eight sessions each with a queue of 16 go at once: the places come
+        // back in portions of steps.
+        let mut sessions: [Option<Handle<Channel>>; 8] = [const { None }; 8];
+        for (i, slot) in sessions.iter_mut().enumerate() {
+            let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+            let d = self
+                .new_socket(&session, sockets::STREAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&session, d, [127, 0, 0, 1], 9400 + i as u32)
+                .map_err(|_| "BIND failed")?;
+            self.plain(
+                &session,
+                Request::Listen {
+                    description: d,
+                    backlog: 16,
+                },
+            )
+            .map_err(|_| "LISTEN failed")?;
+            *slot = Some(session);
+        }
+        drop(sessions);
+        self.sleep(500_000_000);
+        // The ports are free again.
+        let again = self
+            .new_socket(&root, sockets::STREAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.bind(&root, again, [127, 0, 0, 1], 9400)
+            .map_err(|_| "a port of a session that went is still held")?;
+        self.close(&root, again).map_err(|_| "CLOSE failed")?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: listeners ok");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `r`.
+    fn timers(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        // A PING of an address nobody answers ends by its timer, after about a
+        // second.
+        let began = self.now();
+        match ping(&root, [10, 0, 2, 99]) {
+            Err(fail) if is(&fail, proto_net::TIMEOUT) => {}
+            _ => return Err("a PING of an address nobody answers did not end in TIMEOUT"),
+        }
+        let took = self.now() - began;
+        if !(900_000_000..3_000_000_000).contains(&took) {
+            return Err("a PING that nobody answers took another time than a second");
+        }
+        // A frame of the loopback that is dropped: the segment is sent again
+        // by the retransmission timer (smoltcp waits a second at least).
+        let mut p = self.open_pairs(&root, 1)?;
+        self.sleep(200_000_000);
+        self.hold(&root, proto_net::HOLD_DROP)?;
+        let net = p.sessions[p.links[0].session[0]]
+            .as_ref()
+            .ok_or("no session")?;
+        if !self.push_piece(net, &mut p.links[0], 0)? {
+            return Err("a SEND was not taken");
+        }
+        let began = self.now();
+        let end = began + 4_000_000_000;
+        while p.links[0].got[0] < PIECE as u32 {
+            let net = p.sessions[p.links[0].session[1]]
+                .as_ref()
+                .ok_or("no session")?;
+            if !self.pull_piece(net, &mut p.links[0], 1)? {
+                if self.now() > end {
+                    return Err("a dropped segment was never sent again");
+                }
+                self.sleep(1_000_000);
+            }
+        }
+        let after = (self.now() - began) / 1_000_000;
+        self.close_pairs(&p)?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: timers ok (a segment sent again after {after} ms)");
+        *keep = Some(root);
         Ok(())
     }
 }

@@ -97,6 +97,9 @@ net-alone = []
 net-full-batch = []
 net-all-groups = []
 net-wakes = []
+net-idle = []
+net-listen = []
+net-timers = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

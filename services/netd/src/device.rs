@@ -14,10 +14,9 @@
 //! doorbell and `rt::dma::rmb` after the used index is seen.
 
 use crate::dma::{Host, net_at};
-use core::cell::{Cell, RefCell};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::is_dhcp_client_frame;
-use netd::ring::{Budget, LOOP_FRAMES, LoopBook, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
+use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
@@ -119,10 +118,13 @@ impl RxRing {
     }
 
     /// Takes the next used buffer: its number and the length of its frame,
-    /// dropping (and returning to the queue) the buffers that hold none.
+    /// dropping (and returning to the queue) the buffers that hold none or a
+    /// frame that must not reach the stack. Every buffer taken, good or not,
+    /// costs one unit of the step's share of receiving: a flood of frames
+    /// that are dropped cannot hold a step.
     pub(crate) fn pop(&mut self) -> Option<(u16, usize)> {
         loop {
-            if !self.queue.can_pop() {
+            if self.budget.rx_left() == 0 || !self.queue.can_pop() {
                 return None;
             }
             // The device wrote the used index after the buffer.
@@ -138,19 +140,19 @@ impl RxRing {
             let Ok(used) = popped else {
                 fail("a used buffer could not be taken back");
             };
-            let length = frames::rx_frame(slice, used as usize).map(<[u8]>::len);
-            match length {
+            self.budget.take_rx();
+            match frames::classify(slice, used as usize) {
                 // A frame of the loopback network on the wire never reaches
                 // the stack (RFC 1122, 3.2.1.3).
-                Some(len) if frames::martian(&slice[HDR_LEN..HDR_LEN + len]) => {
+                frames::RxFrame::Martian => {
                     self.martian += 1;
                     self.give(n);
                 }
-                Some(len) => {
+                frames::RxFrame::Frame(len) => {
                     self.frames += 1;
                     return Some((n, len));
                 }
-                None => {
+                frames::RxFrame::Invalid => {
                     self.dropped += 1;
                     self.give(n);
                 }
@@ -166,6 +168,9 @@ pub struct TxRing {
     budget: Budget,
     pub dirty: bool,
     counters: Counters,
+    /// The probe's test of the timers: the next frames of the loopback that
+    /// go nowhere (the build with the feature `probe` only sets it).
+    pub drop_loop: u32,
     /// Where a frame goes that no buffer is free for.
     scratch: [u8; MAX_FRAME],
 }
@@ -181,6 +186,7 @@ impl TxRing {
             budget: Budget::new(),
             dirty: false,
             counters: Counters::default(),
+            drop_loop: 0,
             scratch: [0; MAX_FRAME],
         }
     }
@@ -226,83 +232,6 @@ impl TxRing {
                 fail("a sent buffer could not be taken back");
             }
         }
-    }
-}
-
-/// The frames of the loopback (spec 6, 3.3): what the stack sends to its own
-/// MAC waits here for the next reception. The frame stays in the buffer of
-/// sending it was built in (no copy): the ring holds the number of the buffer
-/// and the buffer is not in the pool until the stack is done with the frame.
-/// Both tokens of a pair reach the ring, so its parts have interior
-/// mutability; the book keeps the place of the frame being read apart from the
-/// one a reply goes to.
-pub struct LoopRing {
-    book: RefCell<LoopBook>,
-    buffers: [Cell<u16>; LOOP_FRAMES],
-    lengths: [Cell<usize>; LOOP_FRAMES],
-    /// The buffers the stack is done with, which the pool of sending takes
-    /// back at its next use.
-    returned: RefCell<([u16; LOOP_FRAMES], usize)>,
-    /// The frames that found no place.
-    dropped: Cell<u64>,
-}
-
-impl LoopRing {
-    pub fn new() -> LoopRing {
-        LoopRing {
-            book: RefCell::new(LoopBook::new()),
-            buffers: core::array::from_fn(|_| Cell::new(0)),
-            lengths: core::array::from_fn(|_| Cell::new(0)),
-            returned: RefCell::new(([0; LOOP_FRAMES], 0)),
-            dropped: Cell::new(0),
-        }
-    }
-
-    pub fn waiting(&self) -> usize {
-        self.book.borrow().waiting()
-    }
-
-    /// Keeps the frame of `length` bytes in buffer `n`; false (counted, and
-    /// the buffer stays the caller's) when the ring is full.
-    fn push(&self, n: u16, length: usize) -> bool {
-        let Some(place) = self.book.borrow_mut().push() else {
-            self.dropped.set(self.dropped.get() + 1);
-            return false;
-        };
-        self.buffers[place].set(n);
-        self.lengths[place].set(length);
-        true
-    }
-
-    /// The oldest frame: its place, its buffer and its length.
-    fn pop(&self) -> Option<(usize, u16, usize)> {
-        let place = self.book.borrow_mut().pop()?;
-        Some((place, self.buffers[place].get(), self.lengths[place].get()))
-    }
-
-    /// The oldest frame read is done with: its buffer waits to go back to the
-    /// pool.
-    fn done(&self) {
-        let Some(place) = self.book.borrow_mut().done() else {
-            return;
-        };
-        let mut returned = self.returned.borrow_mut();
-        let at = returned.1;
-        returned.0[at] = self.buffers[place].get();
-        returned.1 += 1;
-    }
-
-    /// A buffer the stack is done with.
-    fn take_returned(&self) -> Option<u16> {
-        let mut returned = self.returned.borrow_mut();
-        returned.1 = returned.1.checked_sub(1)?;
-        Some(returned.0[returned.1])
-    }
-}
-
-impl Default for LoopRing {
-    fn default() -> LoopRing {
-        LoopRing::new()
     }
 }
 
@@ -352,6 +281,7 @@ impl NetDevice {
         if self.held.is_some() {
             return None;
         }
+        self.reclaim_loop();
         loop {
             if self.rx.budget.rx_left() == 0 {
                 return None;
@@ -365,11 +295,18 @@ impl NetDevice {
                 return Some(dest);
             }
             let (buffer, length) = self.rx.pop()?;
-            self.rx.budget.take_rx();
             // SAFETY: the buffer was popped and goes back below or when the
             // token drops.
             let slice = unsafe { buffer_at(buffer) };
             let frame = &slice[HDR_LEN..HDR_LEN + length];
+            // An ARP frame of the wire that names an address of the interface
+            // as its sender is a forgery (it would send the stack's frames to
+            // itself out on the wire).
+            if frames::arp_claims(frame, &self.own[..self.own_len]) {
+                self.rx.martian += 1;
+                self.rx.give(buffer);
+                continue;
+            }
             if !frames::verify_sums(frame) {
                 self.bad_sum += 1;
                 self.rx.give(buffer);
@@ -387,7 +324,11 @@ impl NetDevice {
     /// neighbour cache), and the first connection on the loopback would wait
     /// for that second.
     pub fn seed_neighbours(&mut self) {
+        self.reclaim_loop();
         for k in 0..self.own_len {
+            if !self.looped.room_to_send() {
+                break;
+            }
             let (mac, ip) = (self.mac, self.own[k]);
             let mut f = [0u8; 42];
             f[..6].copy_from_slice(&mac);
@@ -526,6 +467,11 @@ impl TxToken<'_> {
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
             // The frame stays inside, in its buffer, for the next reception.
+            if ring.drop_loop > 0 {
+                ring.drop_loop -= 1;
+                ring.book.release(n);
+                return result;
+            }
             if !self.looped.push(n, len) {
                 ring.counters.dropped += 1;
                 ring.book.release(n);
@@ -599,7 +545,11 @@ impl phy::Device for NetDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_>> {
         self.reclaim_loop();
-        if self.tx.budget.tx_left() == 0 || self.tx.book.free() == 0 {
+        // A frame of the loop that finds no place is lost, and a lost segment
+        // of TCP costs a second of the retransmission timer: the frame of
+        // sending waits for the step in which the loop has room.
+        if self.tx.budget.tx_left() == 0 || self.tx.book.free() == 0 || !self.looped.room_to_send()
+        {
             return None;
         }
         Some(TxToken {
@@ -612,8 +562,6 @@ impl phy::Device for NetDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        // The default checksum capabilities compute and check every sum in
-        // the stack: the service negotiates no offload.
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         // The frames of the loopback never leave the service, so smoltcp

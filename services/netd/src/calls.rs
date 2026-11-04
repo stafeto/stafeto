@@ -13,8 +13,8 @@
 //! with the number of sockets.
 
 use crate::net::{
-    Birth, Client, Conn, Kind, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock, now_ns,
-    op_index,
+    Birth, Client, Conn, Kind, NO_PLACE, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock,
+    now_ns, op_index,
 };
 use crate::stack::{Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
@@ -128,24 +128,47 @@ impl Net {
 
     /// The operations of a session go (it went, or ABANDON).
     pub fn abandon(&mut self, s: &mut Sess) {
+        // The operations leave the places they wait on, and the table of
+        // operations, before their numbers are given to others.
+        let label = s.label();
+        let mut keys = [0u64; netd::ring::SESSION_OPS];
+        let mut n = 0;
+        for (owner, key) in self.ops.keys() {
+            if owner == label && n < keys.len() {
+                keys[n] = key;
+                n += 1;
+            }
+        }
+        for &key in &keys[..n] {
+            if let Some(idx) = op_index(key) {
+                self.forget_op(idx);
+            }
+        }
         self.ops.gone(&mut s.data.long);
     }
 
     /// The operation `key` of the session is over.
     fn finish_op(&mut self, s: &mut Sess, key: u64) {
         let label = s.label();
-        if self.ops.finish(&mut s.data.long, label, key) {
-            self.forget_op(op_index(key));
+        if self.ops.finish(&mut s.data.long, label, key)
+            && let Some(idx) = op_index(key)
+        {
+            self.forget_op(idx);
         }
     }
 
     /// Whether `key` is an operation of `kind` of the session, on place `place`.
     fn op_ok(&self, s: &Sess, key: u64, kind: Kind, place: usize) -> bool {
-        let info = self.info[op_index(key)];
-        self.ops.waits(s.label(), key)
-            && info.key == key
-            && info.kind == kind
-            && usize::from(info.place) == place
+        // The key is a client's: the table is asked first, and the index
+        // only of a key that names an operation.
+        if !self.ops.waits(s.label(), key) {
+            return false;
+        }
+        let Some(idx) = op_index(key) else {
+            return false;
+        };
+        let info = self.info[idx];
+        info.key == key && info.kind == kind && usize::from(info.place) == place
     }
 
     /// A start makes the operation and has it wait (WAIT k); a take keeps
@@ -166,19 +189,20 @@ impl Net {
                     Ok(key) => key,
                     Err(e) => return Answer::Status(Status::Kernel(e)),
                 };
-                self.info[op_index(key)] = OpInfo {
+                let idx = op_index(key).unwrap_or(0);
+                self.info[idx] = OpInfo {
                     key,
                     label,
                     kind,
                     place: place as u16,
                 };
-                self.told &= !(1 << op_index(key));
-                self.socks[place].waiters |= 1 << op_index(key);
+                self.told &= !(1 << idx);
+                self.socks[place].waiters |= 1 << idx;
                 self.attention.set(place);
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
-                self.told &= !(1 << op_index(key));
+                self.told &= !op_index(key).map_or(0, |idx| 1u128 << idx);
                 match notify {
                     Some(handle) => {
                         if let Err(e) = self.ops.arm(label, key, handle) {
@@ -497,7 +521,7 @@ impl Net {
         let mut count = 0;
         let mut members = [0u16; crate::net::BACKLOG_MAX];
         for member in members.iter_mut().take(wanted) {
-            let Some(m) = self.member(stack, &sock) else {
+            let Some(m) = self.member(stack, &sock, place) else {
                 break;
             };
             *member = m as u16;
@@ -528,7 +552,12 @@ impl Net {
 
     /// A new place of the queue of the listening `sock`: a smoltcp socket
     /// that listens on its port and has its options.
-    fn member(&mut self, stack: &mut Stack<'static>, sock: &Sock) -> Option<usize> {
+    fn member(
+        &mut self,
+        stack: &mut Stack<'static>,
+        sock: &Sock,
+        listener: usize,
+    ) -> Option<usize> {
         let m = self.new_place(stack, State::Member, Proto::Tcp)?;
         let handle = self.socks[m].handle?;
         if stack
@@ -541,6 +570,7 @@ impl Net {
         }
         let member = &mut self.socks[m];
         member.bound = true;
+        member.listener = listener as u16;
         member.address = sock.address;
         member.port = sock.port;
         member.nodelay = sock.nodelay;
@@ -804,13 +834,14 @@ impl Net {
         s.data.held.add(m);
         let accepted = &mut self.socks[m];
         accepted.conn = Conn::Done;
+        accepted.listener = NO_PLACE;
         accepted.nonblock = flags & sockets::NONBLOCK != 0;
         accepted.peer = peer.ipv4().map(|ip| (ip, peer.port as u16));
         if let Some((ip, port)) = local {
             accepted.address = ip;
             accepted.port = port;
         }
-        match self.member(stack, &sock) {
+        match self.member(stack, &sock, place) {
             Some(fresh) => self.socks[place].members[k] = fresh as u16,
             None => {
                 let listener = &mut self.socks[place];
@@ -1239,7 +1270,7 @@ impl Net {
             Ok(key) => key,
             Err(e) => return Answer::Status(Status::Kernel(e)),
         };
-        let idx = op_index(key);
+        let idx = op_index(key).unwrap_or(0);
         self.told &= !(1 << idx);
         self.info[idx] = OpInfo {
             key,
@@ -1267,13 +1298,12 @@ impl Net {
         now: u64,
     ) -> Answer {
         let label = s.label();
-        let idx = op_index(key);
-        if !self.ops.waits(label, key)
-            || self.info[idx].key != key
-            || self.info[idx].kind != Kind::Watch
-        {
+        let valid = self.ops.waits(label, key)
+            && op_index(key)
+                .is_some_and(|idx| self.info[idx].key == key && self.info[idx].kind == Kind::Watch);
+        let Some(idx) = op_index(key).filter(|_| valid) else {
             return Answer::Status(Status::Kernel(Error::BadState));
-        }
+        };
         if cancel {
             if !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
