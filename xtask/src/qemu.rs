@@ -266,10 +266,18 @@ pub const NET_MAC_TWO: &str = "52:54:00:12:34:57";
 /// (10.0.3.0/24: the guest 10.0.3.15, the gateway 10.0.3.2, the name server
 /// 10.0.3.3). The keyboard of the input service takes transport 15 on the
 /// same page, so no image that has it runs two network devices.
-pub fn net_two() -> Vec<String> {
+///
+/// With `forward` a port of the host's 127.0.0.1 goes to port 81 of the
+/// guest on that network (10.0.3.15): a connection there must reach no
+/// socket, and the second device sends no reset.
+pub fn net_two(forward: Option<u16>) -> Vec<String> {
+    let mut netdev = String::from("user,id=n1,net=10.0.3.0/24");
+    if let Some(port) = forward {
+        netdev += &format!(",hostfwd=tcp:127.0.0.1:{port}-10.0.3.15:81");
+    }
     vec![
         "-netdev".to_owned(),
-        "user,id=n1,net=10.0.3.0/24".to_owned(),
+        netdev,
         "-device".to_owned(),
         format!("virtio-net-device,netdev=n1,bus=virtio-mmio-bus.14,mac={NET_MAC_TWO}"),
     ]

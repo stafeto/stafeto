@@ -47,6 +47,8 @@ pub const NO_DEVICE: u64 = 6;
 pub struct Outcome {
     /// The first interrupt of the device came in this step.
     pub first_interrupt: bool,
+    /// The step read a status that was not empty.
+    pub isr_seen: bool,
     /// The DHCP client leased an address or lost it.
     pub event: Option<Event>,
     /// Frames are left in the queue: another step of receiving.
@@ -111,6 +113,9 @@ impl Second {
         let Ok((mac, _)) = crate::read_config(&transport) else {
             return Err(NOT_STARTED);
         };
+        if !crate::mtu_fits(&transport, features, "virtio-net1") {
+            return Err(NOT_STARTED);
+        }
         let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
             return Err(NOT_STARTED);
         };
@@ -128,6 +133,7 @@ impl Second {
                 mac,
             );
             let device = &mut *addr_of_mut!((*at).device);
+            device.takes_dhcp = fixed.is_none();
             device.rx.fill();
             transport.finish_init();
             virtio_mmio::ring(&mut transport, RECEIVEQ);
@@ -203,7 +209,8 @@ impl Second {
         if interrupt {
             self.line_closed = true;
             let isr = Isr::read(&mut self.transport);
-            if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
+            outcome.isr_seen = !isr.is_empty();
+            if outcome.isr_seen && !core::mem::replace(&mut self.interrupted, true) {
                 outcome.first_interrupt = true;
             }
         }

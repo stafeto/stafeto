@@ -89,6 +89,21 @@ pub fn is_dhcp_server_frame(frame: &[u8]) -> bool {
     }
 }
 
+const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+
+/// Whether the second network device's stack takes `frame`: ARP (the server
+/// asks who has the leased address, the Mac asks who has the static one),
+/// and, when the device runs a DHCP client (`dhcp`), the server's messages
+/// (UDP from port 67 to 68). Nothing else reaches it, so it answers no echo
+/// and sends no reset or unreachable; with a static address it has no
+/// DHCP socket and takes ARP alone.
+pub fn second_device_takes(frame: &[u8], dhcp: bool) -> bool {
+    if frame.len() >= ETHERNET_HEADER && frame[12..14] == ETHERTYPE_ARP {
+        return true;
+    }
+    dhcp && is_dhcp_server_frame(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +175,32 @@ mod tests {
         assert!(!is_dhcp_server_frame(&arp));
         assert!(!is_dhcp_server_frame(&offer[..14 + 20 + 3]));
         assert!(!is_dhcp_server_frame(&[]));
+    }
+
+    #[test]
+    fn the_second_device_takes_arp_and_the_servers_dhcp_and_nothing_else() {
+        let mut offer = udp_frame(5, UDP, 0, 68);
+        offer[14 + 20..14 + 22].copy_from_slice(&67u16.to_be_bytes());
+        let mut arp = vec![0; 42];
+        arp[12..14].copy_from_slice(&ETHERTYPE_ARP);
+        // ARP either way; the server's message only with a DHCP client.
+        assert!(second_device_takes(&arp, true) && second_device_takes(&arp, false));
+        assert!(second_device_takes(&offer, true));
+        assert!(!second_device_takes(&offer, false), "static address");
+        // An echo request, a TCP SYN, a UDP datagram to another port, a
+        // client message, a later fragment.
+        let mut echo = udp_frame(5, 1, 0, 0);
+        echo[14 + 20] = 8;
+        let syn = udp_frame(5, 6, 0, 81);
+        let other = udp_frame(5, UDP, 0, 5000);
+        let client = udp_frame(5, UDP, 0, 67);
+        let mut later = offer.clone();
+        later[14 + 6..14 + 8].copy_from_slice(&8u16.to_be_bytes());
+        for frame in [&echo, &syn, &other, &client, &later] {
+            assert!(!second_device_takes(frame, true));
+            assert!(!second_device_takes(frame, false));
+        }
+        assert!(!second_device_takes(&[], true));
     }
 
     #[test]

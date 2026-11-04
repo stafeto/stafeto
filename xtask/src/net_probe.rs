@@ -78,6 +78,48 @@ pub const TWO_PROGRAMS: [ImageProgram; 6] = [
     ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
 ];
 
+/// A free port of the host, taken and given back.
+fn free_tcp_port() -> Result<u16, String> {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("a free port: {e}"))?;
+    Ok(listener
+        .local_addr()
+        .map_err(|e| format!("a free port: {e}"))?
+        .port())
+}
+
+/// How long the second connection must stay open.
+const SILENT_FOR: Duration = Duration::from_secs(1);
+
+/// Whether a connection to the port stays open for `SILENT_FOR`: the second
+/// device's stack answers a SYN with a reset when its filter lets one in,
+/// and slirp closes the connection of the host at once. A closed connection
+/// is the fault. The first reset of a stack that does not know its gateway's
+/// address is lost (the stack asks for the address instead), so a first
+/// connection makes that exchange and the second one is judged.
+pub fn silent_port(port: u16) -> Result<(), String> {
+    use std::io::Read;
+    let address: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let connect = || {
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+            .map_err(|e| format!("connect to the forward of the second device: {e}"))
+    };
+    let first = connect()?;
+    std::thread::sleep(Duration::from_millis(500));
+    let mut stream = connect()?;
+    stream
+        .set_read_timeout(Some(SILENT_FOR))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let mut byte = [0u8; 1];
+    let read = stream.read(&mut byte);
+    drop(first);
+    match read {
+        Ok(_) => Err("the second device closed a connection to its port 81: it answered a SYN (the filter of the second device does not hold)".to_owned()),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(()),
+        Err(e) => Err(format!("the connection to the second device ended: {e}")),
+    }
+}
+
 /// The second device's lines at each start: the transport, its line, the
 /// device's status and its MAC; and the lease the second user network gives
 /// (10.0.3.0/24).
@@ -590,8 +632,9 @@ fn run(
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
+    let forward = if two { Some(free_tcp_port()?) } else { None };
     if two {
-        cmd.args(qemu::net_two());
+        cmd.args(qemu::net_two(forward));
     }
     let began = Instant::now();
     let mut run = Run::start(cmd, Input::Null)?;
@@ -608,8 +651,15 @@ fn run(
             run.expect_line(ENDED, |l| l.starts_with(ENDED_PREFIX), within)
                 .map(|_| took)
         });
+    // The second device sends no reset: a connection to its port 81 through
+    // the forward stays open (the stack never sees the SYN).
+    let silent = match (result.as_ref(), forward) {
+        (Ok(_), Some(port)) => silent_port(port),
+        _ => Ok(()),
+    };
     let outcome = run.stop();
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
+    silent.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     verdict(&outcome.lines, mode, roles)
         .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     if two {
@@ -663,7 +713,7 @@ fn steps_lines_with(
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
     if two {
-        cmd.args(qemu::net_two());
+        cmd.args(qemu::net_two(None));
     }
     cmd.args(qemu::ICOUNT);
     // One CPU. The service alone on CPU 0 of two (the feature `net-alone` of
@@ -1253,7 +1303,9 @@ mod tests {
 
     #[test]
     fn the_second_device_sits_on_the_transport_of_init_s_table() {
-        let args = qemu::net_two().join(" ");
+        let args = qemu::net_two(Some(4321)).join(" ");
+        assert!(args.contains("hostfwd=tcp:127.0.0.1:4321-10.0.3.15:81"));
+        assert!(!qemu::net_two(None).join(" ").contains("hostfwd"));
         assert!(args.contains("bus=virtio-mmio-bus.14"));
         assert!(args.contains(&format!("mac={}", qemu::NET_MAC_TWO)));
         assert!(args.contains("net=10.0.3.0/24"));

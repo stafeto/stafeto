@@ -15,7 +15,7 @@
 
 use crate::dma::{Host, net_at};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
-use netd::lines::{is_dhcp_client_frame, is_dhcp_server_frame};
+use netd::lines::{is_dhcp_client_frame, second_device_takes};
 use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
@@ -288,6 +288,9 @@ pub struct NetDevice<const D: usize = 0> {
     deferred: Option<(u16, usize)>,
     /// Frames of the wire whose checksums did not hold.
     pub bad_sum: u64,
+    /// The second device's stack has a DHCP client (its server's messages
+    /// reach it); false with a static address.
+    pub takes_dhcp: bool,
 }
 
 /// A frame taken from a ring, on its way to the stack.
@@ -309,6 +312,7 @@ impl<const D: usize> NetDevice<D> {
             held: None,
             deferred: None,
             bad_sum: 0,
+            takes_dhcp: true,
         }
     }
 
@@ -332,6 +336,7 @@ impl<const D: usize> NetDevice<D> {
             addr_of_mut!((*at).held).write(None);
             addr_of_mut!((*at).deferred).write(None);
             addr_of_mut!((*at).bad_sum).write(0);
+            addr_of_mut!((*at).takes_dhcp).write(true);
         }
     }
 
@@ -415,11 +420,8 @@ impl<const D: usize> NetDevice<D> {
                 continue;
             }
             let dest = frames::target(frame);
-            // The second device only runs DHCP: ARP (the server asks who has
-            // the leased address) and the server's messages reach its stack,
-            // and nothing else, so that it answers no echo and sends no
-            // reset or unreachable.
-            if D != DEVICE && dest != Dest::Arp && !is_dhcp_server_frame(frame) {
+            // The second device only runs DHCP (lines::second_device_takes).
+            if D != DEVICE && !second_device_takes(frame, self.takes_dhcp) {
                 self.rx.dropped += 1;
                 self.rx.give(buffer);
                 continue;

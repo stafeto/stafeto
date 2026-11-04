@@ -452,6 +452,11 @@ fn second_device(
             echo.received
         ));
     }
+    // The echo requests are unicast to the second device alone: its own
+    // line (INTID 66) carries the interrupt, and the first device's status
+    // is empty in that notification.
+    run.expect_seen("virtio-net1: own interrupt", DIALOG_STEP)
+        .map_err(|e| format!("the line of the second device was not shown: {e}"))?;
     let arp = Command::new("/usr/sbin/arp")
         .args(["-n", &second.address.to_string()])
         .output()

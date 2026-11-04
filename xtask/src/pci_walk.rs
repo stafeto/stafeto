@@ -96,12 +96,36 @@ pub fn check(functions: &[Function], net: usize) -> Result<(), String> {
     if !at(ENTROPY_DEVICE, 0x1af4, 0x1044) {
         return Err("no 1af4:1044 at device 6".into());
     }
-    let nets = functions
+    let nets: Vec<&Function> = functions
         .iter()
         .filter(|f| f.vendor == 0x1af4 && f.id == 0x1041)
-        .count();
-    if nets != net {
-        return Err(format!("{nets} functions 1af4:1041, {net} expected"));
+        .collect();
+    if nets.len() != net {
+        return Err(format!(
+            "{} functions 1af4:1041, {net} expected",
+            nets.len()
+        ));
+    }
+    // The numbers `netd::pci` stands on: the devices, the size and kind of
+    // BAR 0, the common configuration at its start.
+    let bar0 = format!("bar 0 size {:#x} mem64", netd::pci::BAR_LEN);
+    for (i, f) in nets.iter().enumerate() {
+        if u64::from(f.device) != netd::pci::DEVICE[i] || f.function != 0 {
+            return Err(format!(
+                "network function {i} is at device {} function {}, netd::pci has device {}",
+                f.device,
+                f.function,
+                netd::pci::DEVICE[i]
+            ));
+        }
+        for wanted in [bar0.as_str(), "common bar 0 offset 0x0"] {
+            if !f.details.iter().any(|d| d == wanted) {
+                return Err(format!(
+                    "network function {i} (device {}) lacks {wanted:?}: {:?}",
+                    f.device, f.details
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -151,7 +175,7 @@ mod tests {
     const WALK: &str = "\
 pci: dev 0 fn 0 id 106b:1a00 class 060000 header 00 pin 0
 pci: dev 1 fn 0 id 1af4:1041 class 020000 header 00 pin 1
-pci: dev 1 fn 0 bar 0 size 0x4000 mem64
+pci: dev 1 fn 0 bar 0 size 0x10000 mem64
 pci: dev 1 fn 0 cap type 1 bar 0 offset 0x0 length 0x38
 pci: dev 1 fn 0 common bar 0 offset 0x0
 pci: dev 5 fn 0 id 1af4:1043 class 078000 header 00 pin 1
@@ -164,8 +188,31 @@ pci: dev 6 fn 0 id 1af4:1044 class 00ff00 header 00 pin 1
         assert_eq!(functions.len(), 4);
         assert_eq!(functions[1].class, 0x020000);
         assert_eq!(functions[1].details.len(), 3);
-        assert_eq!(functions[1].details[0], "bar 0 size 0x4000 mem64");
+        assert_eq!(functions[1].details[0], "bar 0 size 0x10000 mem64");
         check(&functions, 1).unwrap();
+    }
+
+    #[test]
+    fn a_moved_network_device_or_another_bar_size_fails() {
+        let moved = WALK.replace("dev 1 fn 0", "dev 3 fn 0");
+        let functions = parse(&lines(&moved));
+        assert!(
+            check(&functions, 1)
+                .unwrap_err()
+                .contains("netd::pci has device 1")
+        );
+        let bigger = WALK.replace("size 0x10000", "size 0x20000");
+        assert!(
+            check(&parse(&lines(&bigger)), 1)
+                .unwrap_err()
+                .contains("bar 0 size 0x10000")
+        );
+        let elsewhere = WALK.replace("common bar 0 offset 0x0", "common bar 0 offset 0x1000");
+        assert!(
+            check(&parse(&lines(&elsewhere)), 1)
+                .unwrap_err()
+                .contains("common bar 0")
+        );
     }
 
     #[test]

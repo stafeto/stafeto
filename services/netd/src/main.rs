@@ -108,6 +108,8 @@ const LINK_UP: u32 = 1;
 /// The offset of the MTU in the configuration space, after the MAC, the
 /// status and `max_virtqueue_pairs`.
 const MTU_AT: usize = 10;
+/// The least MTU the service starts on: the IP packet of a full frame.
+const MTU_MIN: u16 = 1500;
 
 /// The codes of a start that failed: the start data or an object; the
 /// entropy service; REGISTER, the window or the binding; a map; no network
@@ -433,10 +435,8 @@ fn main(_: u64) -> u64 {
     if !link {
         rt::println!("virtio-net: link down");
     }
-    if features & MTU != 0
-        && let Ok(mtu) = transport.read_config_space::<u16>(MTU_AT)
-    {
-        rt::println!("virtio-net: mtu {mtu}");
+    if !mtu_fits(&transport, features, "virtio-net") {
+        return NOT_STARTED;
     }
     // The second device, if the record has one.
     let second = match irq1 {
@@ -488,6 +488,8 @@ fn main(_: u64) -> u64 {
         line_closed: false,
         second,
         rx1_irq: false,
+        isr_empty: false,
+        own_said: false,
         told: 0,
         cleanup_due: false,
         armed: None,
@@ -529,6 +531,25 @@ fn main(_: u64) -> u64 {
     };
     let _ = rt::service::run_in(&channel, &mut driver, config, sessions);
     STOPPED
+}
+
+/// Whether the device's MTU, if it was negotiated, takes the frames the
+/// service builds (MTU_MIN): a driver sends no frame longer than the MTU
+/// (Virtio 1.2, 5.1.4.1), and the service's interface is made for 1 500. Says
+/// the value on the way.
+fn mtu_fits(transport: &impl Transport, features: u64, tag: &str) -> bool {
+    if features & MTU == 0 {
+        return true;
+    }
+    let Ok(mtu) = transport.read_config_space::<u16>(MTU_AT) else {
+        return false;
+    };
+    if mtu < MTU_MIN {
+        rt::println!("{tag}: mtu {mtu} below {MTU_MIN}");
+        return false;
+    }
+    rt::println!("{tag}: mtu {mtu}");
+    true
 }
 
 /// The transport of the network device `device` (0 or 1) at `at`, with the
@@ -666,6 +687,10 @@ struct Driver<'a> {
     /// An interrupt came that the second device's step has not read the
     /// status for.
     rx1_irq: bool,
+    /// The status the first device's step read last was empty.
+    isr_empty: bool,
+    /// The second device said its own interrupt (see `rx1_step`).
+    own_said: bool,
     /// The bits of the notifications to itself that are on their way.
     told: u64,
     /// A step of departure is due that no notification told.
@@ -759,6 +784,7 @@ impl Driver<'_> {
         if interrupt {
             self.line_closed = true;
             let isr = Isr::read(&mut self.transport);
+            self.isr_empty = isr.is_empty();
             if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
                 rt::println!("virtio-net: first interrupt");
             }
@@ -879,6 +905,14 @@ impl Driver<'_> {
         }
         if outcome.first_interrupt {
             rt::println!("virtio-net1: first interrupt");
+        }
+        // Both lines share the channel's label, so a first interrupt may be
+        // the first device's line. A status that is not empty here while the
+        // first device's was empty in the same notification is the second
+        // device's own line.
+        if interrupt && outcome.isr_seen && self.isr_empty && !self.own_said {
+            self.own_said = true;
+            rt::println!("virtio-net1: own interrupt");
         }
         let continued = outcome.more && self.tell(RX1);
         if !continued
