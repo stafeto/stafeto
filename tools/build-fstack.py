@@ -58,7 +58,9 @@ PATCH = PORT / "stafeto.patch"
 OWN = ("ff_stafeto_if.c", "ff_stafeto_rte.h")
 OUTPUT = WORK / "libfstack.a"
 INCLUDE = WORK / "include"
-# The headers of F-Stack a program includes.
+# The headers of F-Stack a program includes, as the build without
+# thread-local storage has them: install() drops `__thread` from ff_api.h,
+# whose `pcurthread` is a plain variable in the library.
 HEADERS = ("ff_api.h", "ff_event.h", "ff_errno.h", "ff_flow_map.h")
 # The probe of the stack on its loopback (tests/fstack-probe), one object
 # with the library that exports `main` alone, for tools/build-libc-so.py
@@ -203,7 +205,13 @@ def install() -> None:
     shutil.rmtree(INCLUDE, ignore_errors=True)
     INCLUDE.mkdir()
     for name in HEADERS:
-        shutil.copyfile(SOURCE / "lib" / name, INCLUDE / name)
+        text = (SOURCE / "lib" / name).read_text()
+        if name == "ff_api.h":
+            tls = "extern __thread struct thread *pcurthread;"
+            if text.count(tls) != 1:
+                raise SystemExit("ff_api.h: the declaration of pcurthread changed")
+            text = text.replace(tls, "extern struct thread *pcurthread;")
+        (INCLUDE / name).write_text(text)
     # F-Stack's licence and the acknowledgements of the advertising clauses
     # the build carries, for the image's FSTACK-LICENSE.
     shutil.copyfile(SOURCE / "LICENSE", WORK / "LICENSE")
@@ -211,7 +219,9 @@ def install() -> None:
         "Files of the build under the four-clause BSD licence ask for these\n"
         "acknowledgements:\n" + "".join(
             f"  {path}: This product includes software developed by {who}.\n"
-            for path, who in sorted(ADVERTISING_FILES.items())))
+            for path, who in sorted(ADVERTISING_FILES.items()))
+        + "\nfreebsd/kern/md5c.c and freebsd/sys/md5.h: derived from the RSA Data Security,\n"
+        "Inc. MD5 Message-Digest Algorithm.\n")
 
 
 def probe(log: Path) -> None:

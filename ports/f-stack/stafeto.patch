@@ -74,6 +74,40 @@
  static int
  netisr_queue_workstream(struct netisr_workstream *nwsp, u_int proto,
      struct netisr_work *npwp, struct mbuf *m, int *dosignalp)
+--- a/lib/ff_compat.c
++++ b/lib/ff_compat.c
+@@ -364,12 +364,31 @@
+ uint32_t
+ arc4random(void)
+ {
++#ifdef FF_STAFETO
++    /* Every value from the kernel's random source: the stack draws its
++     * ephemeral ports, ISN increments and syncookie secrets here, and a
++     * linear congruential generator is predictable from a few outputs
++     * (RFC 6528, RFC 6056). */
++    return ff_arc4random();
++#else
+     if (seed == 0) {
+         seed = ff_arc4random();
+     }
+     return (uint32_t)rand_r(&seed);
++#endif
+ }
+ 
++#ifdef FF_STAFETO
++/* The stack's arc4random, for the probe. */
++uint32_t ff_stafeto_stack_random(void);
++
++uint32_t
++ff_stafeto_stack_random(void)
++{
++    return arc4random();
++}
++#endif
++
+ #if 0
+ void
+ random_harvest_queue(const void *entropy, u_int size,
 --- a/lib/ff_config.c
 +++ b/lib/ff_config.c
 @@ -25,6 +25,7 @@

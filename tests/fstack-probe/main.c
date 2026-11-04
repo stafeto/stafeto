@@ -37,6 +37,7 @@
 int ff_stafeto_pass(void);
 uint64_t ff_stafeto_next_tick_ns(void);
 void ff_stafeto_random(void *buf, unsigned int len);
+uint32_t ff_stafeto_stack_random(void);
 void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *passes);
 
 #define CONF "/etc/fstack.ini"
@@ -47,7 +48,6 @@ void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *passes);
 #define CHUNK 65536
 
 static const char *role = "";
-static int status = 0;
 /* The buffer of the writes of 1 MiB. */
 static unsigned char big[BIG_WRITE];
 
@@ -251,6 +251,30 @@ check_random(void)
     if (zero_a || zero_b || memcmp(a, b, sizeof(a)) == 0)
         fail("two fills of 64 bytes are equal or all zero");
     ok("random");
+}
+
+/*
+ * The stack's own arc4random, which draws its ephemeral ports, ISN
+ * increments and syncookie secrets: 64 values from the kernel's random
+ * source have bit 31 set in some (rand_r of the C library gives 31 bits
+ * at most) and are not all equal.
+ */
+static void
+check_stack_random(void)
+{
+    uint32_t first = ff_stafeto_stack_random(), high = first >> 31;
+    int differ = 0;
+
+    for (int i = 1; i < 64; i++) {
+        uint32_t v = ff_stafeto_stack_random();
+
+        high |= v >> 31;
+        differ |= v != first;
+    }
+    if (!high || !differ)
+        fail("64 values of the stack's arc4random: bit 31 %s, %s", high ? "set" : "never set",
+            differ ? "they differ" : "all equal");
+    ok("stack-random");
 }
 
 /* A listener's readiness through kqueue, then 16 MiB through the pair. */
@@ -501,6 +525,7 @@ probe(void *arg)
         write_blocking();
     } else {
         check_random();
+        check_stack_random();
         check_kevent_and_stream();
         check_ephemeral();
         check_connections();
@@ -510,6 +535,10 @@ probe(void *arg)
     ff_stafeto_counters(&dropped, &ticks, &passes);
     printf("fstack-probe: %llu clock ticks, %llu passes, %llu frames dropped\n",
         (unsigned long long)ticks, (unsigned long long)passes, (unsigned long long)dropped);
+    /* The stack has no device: a frame given to the layer to send left the
+     * loopback. */
+    if (dropped != 0)
+        fail("%llu frames went to the layer to send", (unsigned long long)dropped);
     ok("all");
     ff_stop_run();
     return 0;
@@ -553,7 +582,13 @@ main(int argc, char **argv)
         return 1;
     }
     printf("fstack-probe: ff_init took %llu ms\n", (unsigned long long)(now_ms() - started));
+    /* The stack's thread, through the installed ff_api.h: a plain variable
+     * (a declaration as thread-local would not link). */
+    if (pcurthread == NULL) {
+        printf("fstack-probe: check failed: no pcurthread after ff_init\n");
+        return 1;
+    }
     ok("init");
     ff_run(probe, NULL);
-    return status;
+    return 0;
 }

@@ -3,8 +3,11 @@
 #
 # F-Stack: the TCP/IP stack of FreeBSD 15 as a library in user space
 # (libfstack.a, tools/build-fstack.py), with the host layer of
-# ports/f-stack over stafeto. The stack's files are under BSD-2-Clause and
-# BSD-3-Clause; the INI parser is BSD-3-Clause. The SHA-256 is that of the
+# ports/f-stack over stafeto. The files the build compiles are under
+# BSD-2-Clause and BSD-3-Clause, with twelve under the four-clause BSD
+# licence (their acknowledgements are in the image's FSTACK-LICENSE), the
+# MD5 of RSA Data Security, Beerware, MIT-CMU, ISC and MIT
+# (target/f-stack/licences.txt counts them). The SHA-256 is that of the
 # tar stream after decompression.
 # Format: docs/packages.md.
 
@@ -13,7 +16,7 @@ version = "dev-52514377"
 kind = "addon"
 url = "https://github.com/F-Stack/f-stack/archive/52514377b89750ffc03a93f401c22d2d4f269d5f.tar.gz"
 sha256 = "97bb894b50c7b012d874fcd0be5ebe347dc4ba99e2204caa0440aca6bd11127a"
-license = "BSD-2-Clause AND BSD-3-Clause"
+license = "BSD-2-Clause AND BSD-3-Clause AND BSD-4-Clause AND RSA-MD AND Beerware AND MIT-CMU AND ISC AND MIT"
 license_file = "LICENSE"
 depends = ["busybox"]
 build = "tools/build-fstack.py"

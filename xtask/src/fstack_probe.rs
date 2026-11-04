@@ -7,7 +7,7 @@
 //! shell's image, with no network device and no network service. xtask
 //! runs `fstack-probe` (tests/fstack-probe/main.c) from the shell: the
 //! stack starts from `/etc/fstack.ini`, two fills of its random source
-//! differ, a listener becomes ready in kqueue, 16 MiB go through a pair of
+//! differ, the stack's arc4random gives full 32-bit values, a listener becomes ready in kqueue, 16 MiB go through a pair of
 //! sockets on 127.0.0.1, one write of 1 MiB on a non-blocking socket takes
 //! part of it, two connects get two ports, 1 000 connections open and
 //! close, a connect to a closed port is refused, and a SYN the stack
@@ -49,7 +49,8 @@ pub fn terms() -> Result<(Vec<u8>, String), String> {
     let sha256 = crate::packages::value("f-stack", "sha256")?;
     let source = format!(
         "fstack-probe holds F-Stack (the TCP/IP stack of FreeBSD 15 in user space),\n\
-         under BSD-2-Clause and BSD-3-Clause (FSTACK-LICENSE).\n\n\
+         under BSD-2-Clause, BSD-3-Clause, BSD-4-Clause, RSA-MD, Beerware, MIT-CMU,\n\
+         ISC and MIT (FSTACK-LICENSE).\n\n\
          Its source: {url}\n\
          (SHA-256 of the tar stream {sha256}), built by tools/build-fstack.py with\n\
          ports/f-stack of https://github.com/stafeto/stafeto at commit {}.\n",
@@ -59,9 +60,10 @@ pub fn terms() -> Result<(Vec<u8>, String), String> {
 }
 
 /// The checks of `fstack-probe`, in the order the program runs them.
-pub const CHECKS: [&str; 9] = [
+pub const CHECKS: [&str; 10] = [
     "init",
     "random",
+    "stack-random",
     "kevent",
     "stream-16m",
     "write-partial",
