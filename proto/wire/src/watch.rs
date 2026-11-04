@@ -24,6 +24,12 @@ pub const EVENTS: u32 = 0x3ff;
 pub const READ: u32 = IN | RDNORM;
 pub const WRITE: u32 = OUT | WRNORM;
 pub const ALWAYS: u32 = ERR | HUP | NVAL;
+/// POLLRDHUP of Linux: the peer of a stream shut its writing. A set may ask
+/// for it and a service that knows it answers it (the network service);
+/// the others never set it.
+pub const RDHUP: u32 = 0x2000;
+/// The bits an item and a readiness may carry.
+pub const WIRE_EVENTS: u32 = EVENTS | RDHUP;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Item {
@@ -65,7 +71,7 @@ impl Set {
                 description: body.u32()?,
                 events: body.u32()?,
             };
-            if item.events & !EVENTS != 0 {
+            if item.events & !WIRE_EVENTS != 0 {
                 return Err(Status::BadSize);
             }
         }
@@ -79,7 +85,7 @@ impl Set {
         }
         w.u32(self.len as u32)?;
         for item in &self.items[..self.len] {
-            if item.events & !EVENTS != 0 {
+            if item.events & !WIRE_EVENTS != 0 {
                 return Err(Status::BadSize);
             }
             w.u32(item.description)?;
@@ -180,7 +186,7 @@ impl Ready {
         };
         for event in &mut ready.events[..len] {
             *event = body.u32()?;
-            if *event & !EVENTS != 0 {
+            if *event & !WIRE_EVENTS != 0 {
                 return Err(Status::BadSize);
             }
         }
@@ -362,6 +368,13 @@ mod tests {
         }
         let mut set = set();
         set.items[0].events = 1 << 31;
+        assert_eq!(set.write(&mut Writer::new()), Err(Status::BadSize));
+        // RDHUP goes both ways; the bit beside it does not.
+        set.items[0].events = IN | RDHUP;
+        let mut w = Writer::new();
+        set.write(&mut w).unwrap();
+        assert_eq!(Set::parse(Reader::new(w.as_bytes())), Ok(set));
+        set.items[0].events = 0x4000;
         assert_eq!(set.write(&mut Writer::new()), Err(Status::BadSize));
         assert_eq!(key(Reader::new(&0u64.to_le_bytes())), Err(Status::BadSize));
     }

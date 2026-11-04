@@ -46,6 +46,7 @@ pub mod names;
 pub mod net;
 mod netbuf;
 mod open_driver;
+pub mod owners;
 pub mod pipes;
 pub mod process;
 #[cfg(feature = "procfs")]
