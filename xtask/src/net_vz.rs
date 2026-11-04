@@ -279,6 +279,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let options = options(args)?;
     busybox_build()?;
     nano_build()?;
+    crate::net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, two) = match (options.devices, options.static1, options.steps) {

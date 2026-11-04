@@ -443,6 +443,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     }
     busybox_build()?;
     nano_build()?;
+    crate::net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = if steps {

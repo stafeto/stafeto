@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 40] = [
+const SYSTEM_PATHS: [&str; 41] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -287,6 +287,8 @@ const SYSTEM_PATHS: [&str; 40] = [
     // probe of the sockets.
     "/www",
     "/www/index.html",
+    // The large file of the probe of TLS (net_tls.rs).
+    "/www/256k.bin",
     "/bin/net-sock",
     "/bin/net-dns",
     "/bin/posix-net",
@@ -438,6 +440,7 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         "htoprc" => Ok(b"hide_userland_threads=1\n"),
         "freedoom1.wad" => Ok(freedoom_wad()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
+        "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -1042,6 +1045,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
     "boot-net-curl-steps.img",
+    "boot-net-tls.img",
+    "boot-net-tls-steps.img",
     "boot-posix-net-steps.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
@@ -1136,6 +1141,27 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-fstack-probe.img" => {
             let mut files = dialog(name);
             files.push(file("/bin/fstack-probe", 0o755, ROOT, "fstack-probe"));
+            files
+        }
+        // The probe of TLS: the root certificates with the probe's own CA,
+        // and a large file for full TLS records.
+        "boot-net-tls.img" | "boot-net-tls-steps.img" => {
+            let mut files = net_files(name);
+            for f in files
+                .iter_mut()
+                .filter(|f| f.path == crate::net_tls::CA_BUNDLE)
+            {
+                f.source = Some(Source::Bytes(
+                    "bundle-with-ca.crt",
+                    crate::probe_ca::bundle_with_ca(),
+                ));
+            }
+            files.push(of(
+                crate::net_tls::BIG,
+                0o644,
+                ROOT,
+                Source::Bytes("www-256k", crate::net_tls::big_file()),
+            ));
             files
         }
         // The images on Apple VZ: the network service writes `resolv.conf`
@@ -1628,7 +1654,10 @@ mod tests {
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),
                 "boot-net-vz2.img" | "boot-net-vz2-static.img" => crate::net::vz_programs(true),
-                "boot-net-curl-steps.img" => crate::net_curl::steps_programs(),
+                "boot-net-curl-steps.img" | "boot-net-tls-steps.img" => {
+                    crate::net_curl::steps_programs()
+                }
+                "boot-net-tls.img" => crate::net::programs(),
                 "boot-posix-net-steps.img" => crate::posix_net::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,

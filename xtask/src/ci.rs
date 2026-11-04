@@ -42,6 +42,7 @@ const LIBC_SO: &str = "libc.so";
 const BASE: &str = "BusyBox and base packages";
 const ADDONS: &str = "add-on packages";
 const GAMES: &str = "game packages";
+const NET_PACKAGES: &str = "network packages";
 const KERNELS: &str = "kernel images";
 const IMAGES: &str = "boot images";
 const OS_TEST_OBJECTS: &str = "os-test objects";
@@ -339,6 +340,12 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         &[RELIBC, BASE, ADDONS],
         super::doom::build_games,
     ));
+    steps.push(step(
+        "build",
+        NET_PACKAGES,
+        &[RELIBC, BASE, ADDONS],
+        super::net_build,
+    ));
     steps.push(step("build", KERNELS, &[], || {
         for variant in [
             Variant::Normal,
@@ -465,7 +472,8 @@ fn all_steps(njobs: usize) -> Vec<Step> {
 
     // The network probes run on QEMU's user-mode networking (slirp), apart
     // from the weighted split of the guest probes: every boot named `net-`.
-    steps.push(step("net", "network probes", &BOOT_NEEDS, move || {
+    let net_needs = [RELIBC, BASE, ADDONS, NET_PACKAGES, KERNELS, IMAGES, LIBC_SO];
+    steps.push(step("net", "network probes", &net_needs, move || {
         jobs::run_all(only(super::boot_jobs(Vec::new()), &net), njobs)
     }));
 
@@ -735,6 +743,7 @@ mod tests {
                 "net-probe",
                 "net-curl",
                 "net-wget",
+                "net-tls",
                 "posix-net",
                 "fstack-probe"
             ]

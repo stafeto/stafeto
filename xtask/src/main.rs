@@ -54,6 +54,7 @@ mod ncdu_dialog;
 mod net;
 mod net_curl;
 mod net_probe;
+mod net_tls;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
@@ -64,6 +65,7 @@ mod packages;
 mod pci_walk;
 mod posix_display;
 mod posix_net;
+mod probe_ca;
 mod qemu;
 mod ring;
 mod rootfs;
@@ -888,7 +890,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 6] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 8] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -900,6 +902,8 @@ const PACKAGE_PROGRAMS: [ImageProgram; 6] = [
     ("nano", "nano", 0, &["dynamic"]),
     ("ncdu", "ncdu", 0, &["dynamic"]),
     ("doom", "doom", 0, &["dynamic"]),
+    ("openssl", "openssl", 0, &["dynamic"]),
+    ("curl", "curl", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -915,15 +919,23 @@ fn shell_program_list() -> Vec<ImageProgram> {
     let packages = packages::of_image("boot-ash-dialog.img")
         .unwrap_or_else(|e| panic!("the shell image: {e}"));
     let mut programs = SHELL_SERVICES.to_vec();
-    for program in packages.iter().filter_map(|p| p.program.as_deref()) {
-        let entry = PACKAGE_PROGRAMS
-            .iter()
-            .find(|p| p.0 == program)
-            .unwrap_or_else(|| panic!("no build of the program {program} (PACKAGE_PROGRAMS)"));
-        programs.push(*entry);
-    }
+    programs.extend(package_programs(&packages));
     programs.extend(SHELL_SERVICES_LAST);
     programs
+}
+
+/// The builds of the programs that `packages` name (PACKAGE_PROGRAMS).
+fn package_programs(packages: &[packages::Package]) -> Vec<ImageProgram> {
+    packages
+        .iter()
+        .filter_map(|p| p.program.as_deref())
+        .map(|program| {
+            *PACKAGE_PROGRAMS
+                .iter()
+                .find(|p| p.0 == program)
+                .unwrap_or_else(|| panic!("no build of the program {program} (PACKAGE_PROGRAMS)"))
+        })
+        .collect()
 }
 /// The probe of the terminal service (xtask tty): the PL011's driver, the
 /// service, which prints each new longest step, and the probe.
@@ -1960,6 +1972,8 @@ fn main() {
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
+        Some("net-tls") => net_tls::command(&args[1..]),
+        Some("probe-ca") => probe_ca::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
         Some("fstack-probe") => fstack_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
@@ -2489,6 +2503,24 @@ fn write_elf_image(
     if let Some((licence, source)) = &fstack_files {
         list.push((fstack_probe::LICENSE, licence.as_slice()));
         list.push((fstack_probe::SOURCE, source.as_bytes()));
+    }
+    // An image with OpenSSL (Apache-2.0), curl (curl) or the root
+    // certificates (MPL-2.0) carries their licences and where the exact
+    // sources are.
+    let has = |program: &str| {
+        sources
+            .iter()
+            .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == program))
+    };
+    let tls_files = net_tls::terms_files(
+        has("openssl"),
+        has("curl"),
+        rootfs::files_of(name)
+            .iter()
+            .any(|f| f.path == net_tls::CA_BUNDLE),
+    )?;
+    for (name, bytes) in &tls_files {
+        list.push((name, bytes.as_slice()));
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3562,6 +3594,7 @@ static LIBC_SO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static DYNAMIC_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static NANO_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static NET_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
 static PACKAGE_SCRIPTS_BUILT: Mutex<Vec<(String, ())>> = Mutex::new(Vec::new());
 
 /// relibc built, once in a run of xtask.
@@ -3608,6 +3641,8 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("ncdu", _) => "ncdu",
         ("doom", _) => "doom",
         ("fstack-probe", _) => "fstack-probe",
+        ("openssl", _) => "openssl",
+        ("curl", _) => "curl",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -3649,6 +3684,12 @@ fn busybox_build() -> Result<(), String> {
 /// so each dialog needs all.
 fn nano_build() -> Result<(), String> {
     once(&NANO_BUILT, (), || packages_built(packages::Kind::Addon))
+}
+
+/// The network packages built (OpenSSL, curl and the root certificates),
+/// once in a run of xtask: the images with the network service hold them.
+fn net_build() -> Result<(), String> {
+    once(&NET_BUILT, (), || packages_built(packages::Kind::Net))
 }
 
 /// bash built (its object, which `tools/build-libc-so.py programs` links), once in a run of xtask. It is
@@ -7583,7 +7624,11 @@ fn packages_command(mode: Option<&str>) -> Result<(), String> {
             busybox_build()?;
             nano_build()?;
             build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-            packages::table("boot-ash-dialog.img")
+            packages::table("boot-ash-dialog.img")?;
+            // The network packages are in the images with the network.
+            net_build()?;
+            build_boot_image(net::IMAGE, net::programs(), BOOT_PROFILE)?;
+            packages::table(net::IMAGE)
         }
         Some(other) => Err(format!("packages: unknown argument {other}")),
     }
@@ -8857,6 +8902,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-wget", || {
             net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
         }),
+        // TLS: curl and `openssl s_client` of the guest against two
+        // `openssl s_server` of the host, the certificate checked both ways.
+        job("net-tls", || {
+            net_tls::probe(&qemu::VIRT, net_tls::Mode::Normal)
+        }),
         // The descriptors and sockets of a process that serves many: 1 024
         // descriptors, 1 000 sockets, a fork and an exec with many of them.
         // Also in the group `net`.
@@ -8885,6 +8935,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_os_test_build.py",
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
+        "tools/test_ca_bundle.py",
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
     }

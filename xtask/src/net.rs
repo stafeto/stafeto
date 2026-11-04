@@ -36,13 +36,20 @@ pub const FORWARDS: [qemu::Forward; 2] = [
 ];
 
 /// The programs of the image: those of the shell image with the table
-/// that has the network service, and the service itself.
+/// that has the network service, the service itself, and the programs of
+/// the network packages (curl, openssl).
 pub fn programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let mut programs = shell_programs().to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-net"]);
         programs.push(("netd", "netd", NETD_STACK_SIZE, &[]));
+        let net: Vec<packages::Package> = packages::of_image(IMAGE)
+            .unwrap_or_else(|e| panic!("{IMAGE}: {e}"))
+            .into_iter()
+            .filter(|p| p.kind == packages::Kind::Net)
+            .collect();
+        programs.extend(package_programs(&net));
         programs
     })
 }
@@ -131,6 +138,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     busybox_build()?;
     nano_build()?;
+    net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
@@ -190,6 +198,7 @@ pub const VZ2_STEPS_IMAGE: &str = "boot-net-vz2-steps.img";
 fn run_vz(devices: usize) -> Result<(), String> {
     busybox_build()?;
     nano_build()?;
+    net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
