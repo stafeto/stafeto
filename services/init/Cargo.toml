@@ -110,6 +110,10 @@ net-timers = []
 net-wire = []
 # Role `W`: the host's datagrams of full frames through a forwarded port.
 net-wire-echo = []
+# Roles `C` (CLONE and CLONE_MORE of 1 000 descriptions) and `A` (ABANDON of 16
+# operations).
+net-clone = []
+net-abandon = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

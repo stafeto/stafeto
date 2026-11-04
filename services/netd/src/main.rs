@@ -1225,16 +1225,15 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. CLONE_MORE (20) and the methods of later stages (22 to 26) are
-/// UNKNOWN_METHOD.
+/// `probe`. The methods of later stages (22 to 26) are UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 30, 31, 62,
-    63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29, 30, 31,
+    62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29,
 ];
 
 impl Service<0> for Driver<'_> {

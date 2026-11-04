@@ -227,6 +227,8 @@ const TIMERS_PREFIX: &str = "net-probe: timers ok";
 const WIRE_PREFIX: &str = "net-probe: wire ok 150";
 const WIRE_ECHO_READY: &str = "net-probe: wire echo ready 7000";
 const WIRE_ECHO_OK: &str = "net-probe: wire echo ok 2000";
+const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
+const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -248,6 +250,8 @@ pub const STEP_MAX: u64 = TERM_B * 9 / 10;
 pub const PORTION_MAX: u64 = TERM_B * 8 / 10;
 /// The kinds of steps: CLONE, and the service's own steps.
 const CLONE_KIND: usize = 19;
+const CLONE_MORE_KIND: usize = 20;
+const ABANDON_KIND: usize = 18;
 const OWN_KIND: usize = 65;
 
 /// How the interface got its address.
@@ -271,6 +275,8 @@ pub struct Roles {
     pub timers: bool,
     pub wire: bool,
     pub wire_echo: bool,
+    pub clone_many: bool,
+    pub abandon_many: bool,
 }
 
 impl Roles {
@@ -285,6 +291,8 @@ impl Roles {
         timers: false,
         wire: false,
         wire_echo: false,
+        clone_many: false,
+        abandon_many: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -332,6 +340,14 @@ impl Roles {
     };
     pub const WIRE_ECHO: Roles = Roles {
         wire_echo: true,
+        ..Roles::NONE
+    };
+    pub const CLONE_MANY: Roles = Roles {
+        clone_many: true,
+        ..Roles::NONE
+    };
+    pub const ABANDON_MANY: Roles = Roles {
+        abandon_many: true,
         ..Roles::NONE
     };
 }
@@ -467,6 +483,12 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
         once.push((WIRE_ECHO_READY, 1));
         once.push((WIRE_ECHO_OK, 1));
     }
+    if roles.clone_many {
+        once.push((CLONE_OK, 1));
+    }
+    if roles.abandon_many {
+        once.push((ABANDON_OK, 1));
+    }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
     }
@@ -586,7 +608,10 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
             "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
         ));
     }
-    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+    if let Some(row) = rows
+        .iter()
+        .find(|r| (r.0 == CLONE_KIND || r.0 == CLONE_MORE_KIND) && r.1 > PORTION_MAX)
+    {
         return Err(format!(
             "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
         ));
@@ -618,7 +643,10 @@ pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, Strin
             "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
         ));
     }
-    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+    if let Some(row) = rows
+        .iter()
+        .find(|r| (r.0 == CLONE_KIND || r.0 == CLONE_MORE_KIND) && r.1 > PORTION_MAX)
+    {
         return Err(format!(
             "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
         ));
@@ -835,6 +863,16 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             Roles::TIMERS,
         ),
         ("u", measured_programs(Some("net-wire"), netd), Roles::WIRE),
+        (
+            "C",
+            measured_programs(Some("net-clone"), netd),
+            Roles::CLONE_MANY,
+        ),
+        (
+            "A",
+            measured_programs(Some("net-abandon"), netd),
+            Roles::ABANDON_MANY,
+        ),
     ]
 }
 
@@ -986,7 +1024,7 @@ fn acceptance(
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
         own("s1280"),
         own("f"),
@@ -997,7 +1035,21 @@ fn acceptance(
         own("r"),
         own("u"),
         own("W"),
+        own("C"),
+        own("A"),
         netd::choose::FLATNESS
+    );
+    let kind = |run: &str, kind: usize| {
+        all.iter()
+            .find(|(w, _)| *w == run)
+            .and_then(|(_, rows)| step_of(rows, kind))
+            .map_or(0, |(ticks, _)| ticks)
+    };
+    println!(
+        "net-probe: CLONE of 64 {}, CLONE_MORE of 64 {} (portion bound {PORTION_MAX}), ABANDON of 4 of 16 operations {}",
+        kind("C", CLONE_KIND),
+        kind("C", CLONE_MORE_KIND),
+        kind("A", ABANDON_KIND)
     );
     Ok(all)
 }

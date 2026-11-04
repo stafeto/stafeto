@@ -357,7 +357,8 @@ pub const NETD_TWO: Record = Record {
 /// service, `a` every group of sockets with work at once, `w` sixteen and
 /// then 128 operations told by one datagram, `i` 150 s of idle, `l` a queue of
 /// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
-/// fill a frame, `W` the host's datagrams of full frames echoed, `k` CRASH of the service and the same as `c` through a new
+/// fill a frame, `W` the host's datagrams of full frames echoed, `C` CLONE and CLONE_MORE of
+/// 1 000 descriptions, `A` ABANDON of 16 operations, `k` CRASH of the service and the same as `c` through a new
 /// session. The images of the measurement of the steps (`net-sockets-N`) run
 /// `s` at 8, 64 and 256 places; the others at the limit of the sockets the
 /// service serves (netd::places::SOCKETS_LIMIT, which a test of xtask
@@ -380,6 +381,10 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"cuk"
 } else if cfg!(feature = "net-wire-echo") {
     b"cWk"
+} else if cfg!(feature = "net-clone") {
+    b"cCk"
+} else if cfg!(feature = "net-abandon") {
+    b"cAk"
 } else if cfg!(feature = "net-idle") {
     b"cik"
 } else if cfg!(feature = "net-listen") {

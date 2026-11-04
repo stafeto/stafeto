@@ -35,6 +35,12 @@
 //!   sends through a forwarded port, at 1 472 bytes each (frames of 1 514
 //!   bytes on the wire); the first 800 bytes of each come back. The cost of
 //!   the frames of the wire, for the choice of the portions of the steps.
+//! - `C`: 1 000 datagram sockets in one session, CLONE of the first 64 and
+//!   CLONE_MORE of the rest in portions of 64 (16 steps of the service, none of
+//!   them longer than a portion); the new session uses the last description
+//!   and a CLONE_MORE of a session that did not make the birth is refused.
+//! - `A`: 16 operations wait in one session, which asks ABANDON until none is
+//!   left: the service lets go of four in each answer.
 //! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
 //!   of the loopback that is dropped is sent again by the retransmission
 //!   timer.
@@ -113,6 +119,8 @@ fn main(_: u64) -> u64 {
             b'r' => probe.timers(&mut session),
             b'u' => probe.wire(&mut session),
             b'W' => probe.wire_echo(&mut session),
+            b'C' => probe.clone_many(&mut session),
+            b'A' => probe.abandon_many(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -1778,11 +1786,152 @@ impl Probe<'_> {
     }
 }
 
+/// The sockets role `C` makes.
+const CLONE_SOCKETS: usize = 1000;
+
 /// The port of the echo of role `W` and the datagrams it takes.
 const WIRE_ECHO_PORT: u32 = 7000;
 const WIRE_ECHO_COUNT: usize = 2_000;
 
 impl Probe<'_> {
+    /// Role `C`: CLONE and CLONE_MORE with 1 000 descriptions.
+    fn clone_many(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let mut all = [0u32; CLONE_SOCKETS];
+        for d in all.iter_mut() {
+            *d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+        }
+        // CLONE of the first portion: the birth and the session.
+        let first = sockets::List::new(&all[..sockets::CLONE_MAX]).ok_or("a list")?;
+        let mut w = Writer::new();
+        Request::Clone(first)
+            .write(&mut w)
+            .map_err(|_| "CLONE's request")?;
+        let mut reply = sys::send(&root, w.as_bytes()).map_err(|_| "CLONE failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let birth = sockets::read_word(reply.bytes(&mut buffer)).map_err(|_| "CLONE's reply")?;
+        let child = reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| "CLONE gave no session")?;
+        // A session that did not make the birth may not add to it.
+        let other = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+        let mut portions = 1;
+        for chunk in all[sockets::CLONE_MAX..].chunks(sockets::CLONE_MAX) {
+            let list = sockets::List::new(chunk).ok_or("a list")?;
+            if portions == 1 {
+                let mut buffer = [0; MESSAGE_MAX];
+                match socket_call(&other, &Request::CloneMore { birth, list }, &mut buffer) {
+                    Err(fail) if is(&fail, proto_net::BAD_FD) => {}
+                    other => {
+                        rt::println!("net-probe: CLONE_MORE of another session's birth: {other:?}");
+                        return Err("CLONE_MORE of another session's birth was not refused");
+                    }
+                }
+            }
+            self.plain(&root, Request::CloneMore { birth, list })
+                .map_err(|_| "CLONE_MORE failed")?;
+            portions += 1;
+        }
+        // The same portion again is passed over; a description the session
+        // does not hold is refused and changes nothing.
+        let again = sockets::List::new(&all[..4]).ok_or("a list")?;
+        self.plain(&root, Request::CloneMore { birth, list: again })
+            .map_err(|_| "CLONE_MORE of held descriptions failed")?;
+        let stale = sockets::List::new(&[all[0] ^ (1 << sockets::SLOT_BITS)]).ok_or("a list")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        match socket_call(
+            &root,
+            &Request::CloneMore { birth, list: stale },
+            &mut buffer,
+        ) {
+            Err(fail) if is(&fail, proto_net::BAD_FD) => {}
+            _ => return Err("CLONE_MORE of a description nobody holds was not refused"),
+        }
+        // The child uses the first and the last description.
+        for d in [all[0], all[CLONE_SOCKETS - 1]] {
+            self.close(&child, d)
+                .map_err(|_| "the child does not hold a description")?;
+        }
+        drop(child);
+        drop(other);
+        for d in all {
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: clone ok {CLONE_SOCKETS} in {portions} portions");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// Role `A`: 16 operations wait, ABANDON until none is left.
+    fn abandon_many(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        const WAITING: usize = 16;
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+        let receiver = {
+            let mut buffer = [0; MESSAGE_MAX];
+            let request = Request::Socket {
+                family: proto_net::INET,
+                kind: sockets::DGRAM,
+                flags: 0,
+            };
+            let reply = socket_call(&root, &request, &mut buffer).map_err(|_| "SOCKET failed")?;
+            sockets::read_word(reply).map_err(|_| "SOCKET's reply")?
+        };
+        self.bind(&root, receiver, [127, 0, 0, 1], 9300)
+            .map_err(|_| "BIND failed")?;
+        let child = self
+            .clone_with(&root, &[receiver])
+            .map_err(|_| "CLONE failed")?;
+        for k in 0..WAITING {
+            let start = Request::Recv {
+                key: None,
+                description: receiver,
+                flags: 0,
+                most: PIECE as u32,
+            };
+            if let Err(e) = self.start_wait(&child, &start) {
+                rt::println!("net-probe: start {k} failed");
+                return Err(e);
+            }
+        }
+        let mut asked = 0;
+        loop {
+            let mut buffer = [0; MESSAGE_MAX];
+            let reply = call(&child, &Method::Abandon.header().bytes(), &mut buffer)
+                .map_err(|_| "ABANDON failed")?;
+            asked += 1;
+            let left = sockets::read_abandoned(reply).map_err(|_| "ABANDON's reply")?;
+            if left == 0 {
+                break;
+            }
+            if asked > WAITING {
+                return Err("ABANDON does not end");
+            }
+        }
+        if asked != WAITING / 4 {
+            return Err("ABANDON did not let go of four operations in each answer");
+        }
+        drop(session);
+        drop(child);
+        self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: abandon ok {WAITING} in {asked} asks");
+        *keep = Some(root);
+        Ok(())
+    }
+
     /// Role `W`: the host's datagrams of full frames, echoed.
     fn wire_echo(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
         let root = match keep.take() {
