@@ -652,6 +652,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
 
     /// The record of number `fd`, in the table or in its page; None when the
     /// number is out of range or its page is not there.
+    #[inline(always)]
     fn slot(&self, fd: u32) -> Option<&EntrySlot<T>> {
         let fd = fd as usize;
         if fd < N {
@@ -663,6 +664,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         Some(unsafe { &page.as_ref().slots[fd % N] })
     }
 
+    #[inline(always)]
     fn slot_mut(&mut self, fd: u32) -> Option<&mut EntrySlot<T>> {
         let fd = fd as usize;
         if fd < N {
@@ -675,6 +677,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
 
     /// `Error::NeedPage` when `fd` is a number of the table whose page is not
     /// there yet.
+    #[inline(always)]
     fn need_page(&self, fd: u32) -> Result<(), Error> {
         if (fd as usize) < Self::FDS && self.slot(fd).is_none() {
             return Err(Error::NeedPage(fd as usize / N - 1));
@@ -684,6 +687,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
 
     /// Writes the state of `fd` and keeps the bitmap of the numbers in use:
     /// the number is in use unless it is empty.
+    #[inline(always)]
     fn set_state(&mut self, fd: u32, state: EntryState<T>) {
         let empty = matches!(state, EntryState::Empty);
         self.slot_mut(fd)
@@ -740,10 +744,20 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
     }
 
     /// Whether a number holds `backend` in an open entry.
+    #[inline(always)]
     fn references_by_number(&self, backend: T) -> bool {
-        self.used().any(|fd| {
-            matches!(self.slot(fd).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
-        })
+        for (word, &bits) in self.occupied.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let fd = word as u32 * 64 + left.trailing_zeros();
+                left &= left - 1;
+                if matches!(self.slot(fd).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Gives the table the page `k` (the number `N * (k + 1)` and the `N - 1`
@@ -780,6 +794,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         self.pages.get(k).is_some_and(|p| p.is_some())
     }
 
+    #[inline(always)]
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
         match self.slot(fd).map(|slot| slot.state) {
             Some(EntryState::Open(entry)) => Ok(entry),
@@ -787,6 +802,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         }
     }
 
+    #[inline(always)]
     pub fn get(&self, fd: u32) -> Result<T, Error> {
         Ok(self.entry(fd)?.backend)
     }
@@ -820,6 +836,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         self.allocation_limit = limit.min(Self::FDS as u64) as u32;
     }
 
+    #[inline(always)]
     pub fn vacant(&self, minimum: u32) -> Result<u32, Error> {
         if minimum as usize >= Self::FDS || minimum >= self.allocation_limit {
             return Err(Error::InvalidArgument);
@@ -844,12 +861,16 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         Err(Error::TooManyOpenFiles)
     }
 
+    #[inline(always)]
     fn install(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
-        self.need_page(fd)?;
-        let slot = self.slot_mut(fd).ok_or(Error::BadFileDescriptor)?;
+        let Some(slot) = self.slot_mut(fd) else {
+            self.need_page(fd)?;
+            return Err(Error::BadFileDescriptor);
+        };
         let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
         slot.generation = generation;
-        self.set_state(fd, EntryState::Open(Entry { backend, flags }));
+        slot.state = EntryState::Open(Entry { backend, flags });
+        self.occupied[fd as usize / 64] |= 1 << (fd % 64);
         Ok(())
     }
 
@@ -875,14 +896,24 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
     }
 
     /// Whether another open descriptor names what `fd` names.
+    #[inline(always)]
     pub fn has_open_alias(&self, fd: u32) -> bool {
         let Ok(backend) = self.get(fd) else {
             return false;
         };
-        self.used().any(|number| {
-            number != fd
-                && matches!(self.slot(number).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
-        })
+        for (word, &bits) in self.occupied.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let number = word as u32 * 64 + left.trailing_zeros();
+                left &= left - 1;
+                if number != fd
+                    && matches!(self.slot(number).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn referenced(&self, backend: T) -> bool {

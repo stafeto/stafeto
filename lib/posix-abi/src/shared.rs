@@ -711,9 +711,19 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }),
-        Dup { fd } => growing_in(&[fd], |files| {
-            files.dup(fd).map(|value| value as u64).map_err(page_error)
-        }),
+        Dup { fd } => {
+            let copy =
+                |files: &mut PosixFs| files.dup(fd).map(|value| value as u64).map_err(page_error);
+            // The common call is one pass; a number in a page that is not
+            // there yet asks for it and goes again.
+            match with_fd(fd, copy) {
+                Err(code) if code >= NEED_PAGE => {
+                    provide_page((code - NEED_PAGE) as usize)?;
+                    growing_in(&[fd], copy)
+                }
+                other => other,
+            }
+        }
         Dup2 { source, target } => duplicate_replacing(source, target, None),
         Dup3 {
             source,
@@ -833,19 +843,6 @@ pub fn with_descriptors<R>(
     fds: &[u32],
     f: impl FnOnce(&mut PosixFs) -> Result<R, i32>,
 ) -> Result<R, i32> {
-    waiting_for(|files| fds.iter().find_map(|&fd| files.closing(fd)), f)
-}
-
-/// `with_descriptors` for an operation on every descriptor: it waits for the
-/// closes in flight of any of them.
-pub fn with_every_descriptor<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
-    waiting_for(|files| files.any_closing(), f)
-}
-
-fn waiting_for<R>(
-    closing: impl Fn(&PosixFs) -> Option<posix_fs::closing::CloseToken>,
-    f: impl FnOnce(&mut PosixFs) -> Result<R, i32>,
-) -> Result<R, i32> {
     enum Step<R> {
         Close(posix_fs::closing::CloseToken),
         Done(Result<R, i32>),
@@ -853,7 +850,29 @@ fn waiting_for<R>(
     let mut f = Some(f);
     loop {
         let step = process_state(|files| {
-            if let Some(token) = closing(files) {
+            if let Some(token) = fds.iter().find_map(|&fd| files.closing(fd)) {
+                return Ok(Step::Close(token));
+            }
+            Ok(Step::Done(f.take().expect("one fd operation")(files)))
+        })?;
+        match step {
+            Step::Close(token) => crate::close_driver::settle_token(token)?,
+            Step::Done(result) => return result,
+        }
+    }
+}
+
+/// `with_descriptors` for an operation on every descriptor: it waits for the
+/// closes in flight of any of them.
+pub fn with_every_descriptor<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    enum Step<R> {
+        Close(posix_fs::closing::CloseToken),
+        Done(Result<R, i32>),
+    }
+    let mut f = Some(f);
+    loop {
+        let step = process_state(|files| {
+            if let Some(token) = files.any_closing() {
                 return Ok(Step::Close(token));
             }
             Ok(Step::Done(f.take().expect("one fd operation")(files)))

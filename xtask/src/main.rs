@@ -90,6 +90,10 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a child of the test init (tests/child), which its loader
 /// maps (rt::loader).
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The stack of the probe of the RAM service: the startup list of the layer's
+/// files (`posix_fs::Late`) and its checks of the table of descriptors need
+/// more than a child's.
+const RAMFS_PROBE_STACK_SIZE: u32 = 32 * 1024;
 /// The main stack of a POSIX program: its requests on its files run on its
 /// own stack, under the lock of the layer, with no file worker.
 const POSIX_STACK_SIZE: u32 = 64 * 1024;
@@ -190,7 +194,7 @@ const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
-    ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
+    ("ramfs-probe", "ramfs-probe", RAMFS_PROBE_STACK_SIZE, &[]),
 ];
 const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
