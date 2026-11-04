@@ -697,8 +697,11 @@ pub const OS_TEST_TABLE: &[Record] = &[
 /// quota was 544 before the calls of message queues, semaphores and segments
 /// and the checks of the pages of a segment, which the programs that use
 /// semaphores carry, and 512 before the files, shared memory and the
-/// rendezvous of the process service.
-const OS_TEST_QUOTA: u64 = 1280 * PAGE;
+/// rendezvous of the process service. 1,312 since the layer carries the path
+/// of the shared buffer with the network service in every program (two pages
+/// more of a static test): mmap/1-2 maps 4 MiB of shared memory, which its own
+/// quota pays for, and failed with ENOMEM at 1,280.
+const OS_TEST_QUOTA: u64 = 1312 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
