@@ -146,8 +146,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # rounds of five seconds, a check of every reply, a random transaction number,
 # the socket closed on every path, getaddrinfo with EAI_AGAIN, EAI_FAIL and
 # EAI_NONAME as POSIX has them, name pointers followed backwards only, a name
-# with a label past 63 bytes refused at once.
-COMMIT = "17f55a102a9d01fa161a1d001d9b55196fba28d4"
+# with a label past 63 bytes refused at once; tagged pin-849c2f1b.
+COMMIT = "849c2f1bb345fd880a1ef1d9938a6c52aec46d79"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
