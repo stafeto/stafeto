@@ -1988,11 +1988,8 @@ impl Probe<'_> {
     ) -> Result<u32, &'static str> {
         let list = EpollList::new(records).ok_or("an epoll list")?;
         let mut buffer = [0; MESSAGE_MAX];
-        let reply =
-            socket_call(net, &Request::EpollSet { set, list }, &mut buffer).map_err(|fail| {
-                rt::println!("net-probe: EPOLL_SET: {fail:?}");
-                "EPOLL_SET refused"
-            })?;
+        let reply = socket_call(net, &Request::EpollSet { set, list }, &mut buffer)
+            .map_err(|_| "EPOLL_SET refused")?;
         let mut statuses = [0u32; sockets::EPOLL_BATCH];
         let set = sockets::read_epoll_set(reply, records.len(), &mut statuses)
             .map_err(|_| "EPOLL_SET's reply")?;
