@@ -121,7 +121,9 @@ impl<C: Copy> ControlRecord<C> {
         }
     }
 }
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize>
+    Table<T, N, R, S, C, PAGES>
+{
     fn control_record(&self, token: ControlToken) -> Result<ControlRecord<C>, Error> {
         let slot = self
             .residents
@@ -627,13 +629,13 @@ mod tests {
         type Write = Table<u32, 32, [u64; 3], [u8; 1012], [u64; 15]>;
         type Read = Table<u32, 32, [u64; 3], [u8; 1016], [u64; 15]>;
         assert_eq!(size_of::<ControlRecord<[u64; 15]>>(), 168);
-        assert_eq!(size_of::<Base>(), 7184);
+        assert_eq!(size_of::<Base>(), 7312);
         assert!(size_of::<Control>() > size_of::<Base>());
         assert_eq!(
             size_of::<Write>(),
             size_of::<ExistingWrite>() + JOBS_MAX * 120
         );
-        assert_eq!(size_of::<Write>(), 56720);
+        assert_eq!(size_of::<Write>(), 56848);
         assert_eq!(size_of::<Read>(), size_of::<Write>());
     }
     fn owner(id: u64) -> OwnerToken {

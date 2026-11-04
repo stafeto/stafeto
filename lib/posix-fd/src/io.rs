@@ -66,7 +66,9 @@ pub(super) struct IoRecord<T, R> {
     cleanup: R,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize>
+    Table<T, N, R, S, C, PAGES>
+{
     pub(super) fn io_pinned(&self, backend: T) -> bool {
         self.holds
             .iter()
@@ -520,8 +522,8 @@ mod tests {
         type Small = Table<u32, 4, [u64; 3]>;
         assert_eq!(size_of::<IoRecord<u32, [u64; 3]>>(), 40);
         assert_eq!(size_of::<DisposalSnapshot<u32, [u64; 3]>>(), 32);
-        assert_eq!(size_of::<Table<u32, 32, [u64; 3]>>(), 7184);
-        assert_eq!(size_of::<Table<u32, 32, [u64; 3], [u8; 1012]>>(), 54800);
+        assert_eq!(size_of::<Table<u32, 32, [u64; 3]>>(), 7312);
+        assert_eq!(size_of::<Table<u32, 32, [u64; 3], [u8; 1012]>>(), 54928);
         let mut place = MaybeUninit::<Small>::uninit();
         // SAFETY: aligned uninitialized complete allocation is exclusively owned.
         unsafe {

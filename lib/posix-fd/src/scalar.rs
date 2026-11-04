@@ -138,7 +138,9 @@ impl<T: Copy, S: Copy> ScalarRecord<T, S> {
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize>
+    Table<T, N, R, S, C, PAGES>
+{
     pub(super) fn scalar_pinned(&self, backend: T) -> bool {
         self.residents
             .iter()
@@ -893,7 +895,7 @@ mod tests {
         type Payload = Table<u32, 32, [u64; 3], [u8; 1012]>;
         assert_eq!(size_of::<ScalarToken>(), 16);
         assert_eq!(size_of::<ScalarRecord<u32, [u8; 1012]>>(), 1072);
-        assert_eq!(size_of::<Base>(), 7184);
-        assert_eq!(size_of::<Payload>(), 54800);
+        assert_eq!(size_of::<Base>(), 7312);
+        assert_eq!(size_of::<Payload>(), 54928);
     }
 }

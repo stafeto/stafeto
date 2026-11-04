@@ -59,7 +59,9 @@ impl<T, C> CloseSlot<T, C> {
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize>
+    Table<T, N, R, S, C, PAGES>
+{
     fn close_record(&self, token: CloseToken) -> Result<CloseRecord<T, C>, Error> {
         let slot = self
             .closings
@@ -95,7 +97,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         Ok(value)
     }
     pub fn closing(&self, fd: u32) -> Option<CloseToken> {
-        match self.entries.get(fd as usize)?.state {
+        match self.slot(fd)?.state {
             EntryState::Closing(token) => Some(token),
             _ => None,
         }
@@ -215,7 +217,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Ok(blocked);
         }
         let backend = self.get(source)?;
-        if target as usize >= N {
+        if target as usize >= Self::FDS {
             return Err(Error::BadFileDescriptor);
         }
         if source == target {
@@ -228,12 +230,14 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if let Some(blocked) = self.close_blocked(target) {
             return Ok(blocked);
         }
-        self.entries[target as usize]
+        self.need_page(target)?;
+        self.slot(target)
+            .ok_or(Error::BadFileDescriptor)?
             .generation
             .checked_add(1)
             .ok_or(Error::Io)?;
         let next = Some((backend, flags.unwrap_or_default()));
-        match self.entries[target as usize].state {
+        match self.slot(target).ok_or(Error::BadFileDescriptor)?.state {
             EntryState::Empty => {
                 self.install(target, backend, flags.unwrap_or_default())?;
                 Ok(CloseAdmission::Replaced(target))
@@ -267,10 +271,9 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             slot: index,
             generation: slot.generation,
         };
-        self.entries[fd as usize].state = EntryState::Closing(token);
-        let last_alias = !self.entries.iter().any(
-                |slot| matches!(slot.state, EntryState::Open(open) if open.backend == backend),
-            ) && !self.closing_references(backend, false)
+        self.set_state(fd, EntryState::Closing(token));
+        let last_alias = !self.references_by_number(backend)
+            && !self.closing_references(backend, false)
                 // A pinned description outlives its last number: the
                 // service keeps it for the mapping.
                 && !self.pinned_backend(backend)
@@ -295,7 +298,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Ok(None);
         }
         let snapshot = record.snapshot;
-        let entry = &self.entries[snapshot.entry.fd as usize];
+        let entry = self.slot(snapshot.entry.fd).ok_or(Error::Io)?;
         if entry.generation != snapshot.entry.generation()
             || !matches!(entry.state, EntryState::Closing(current) if current == token)
         {
@@ -303,7 +306,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         }
         match snapshot.replacement {
             Some((next, flags)) => self.install(snapshot.entry.fd, next, flags)?,
-            None => self.entries[snapshot.entry.fd as usize].state = EntryState::Empty,
+            None => self.set_state(snapshot.entry.fd, EntryState::Empty),
         }
         record.snapshot.complete = true;
         self.save_close(token, record);
