@@ -607,13 +607,19 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
 /// counts from nothing, so the longest is taken over all the lines of a
 /// kind.
 pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
+    longest_over_starts_of(lines, NET_TAG)
+}
+
+/// `longest_over_starts` for the service that prints its steps under `tag`
+/// (the pipe service prints under 4).
+pub fn longest_over_starts_of(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for line in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
         let [
             "service",
             "step:",
-            NET_TAG,
+            found,
             "kind",
             kind,
             ticks,
@@ -624,6 +630,9 @@ pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
         else {
             continue;
         };
+        if *found != tag {
+            continue;
+        }
         let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
         else {
             continue;

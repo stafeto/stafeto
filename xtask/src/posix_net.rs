@@ -79,6 +79,28 @@ pub const CHECKS: [&str; 50] = [
     "epoll-exclusive",
 ];
 
+/// The image of the run with the counted steps of the network service and
+/// the pipe service (the passes of SCM_RIGHTS wait there).
+const STEPS_IMAGE: &str = "boot-posix-net-steps.img";
+
+/// The tag under which the pipe service prints its steps.
+const PIPE_TAG: &str = "4";
+
+/// The programs of that image: the shell's image with `netd` and `pipe` that
+/// print their longest steps.
+pub fn steps_programs() -> &'static [crate::ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<crate::ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = net_curl::steps_programs().to_vec();
+        for program in &mut programs {
+            if program.0 == "pipe" {
+                program.3 = &["steps"];
+            }
+        }
+        programs
+    })
+}
+
 /// How long the checks may take in all (the ci group allows 120 s for the
 /// boot and the run).
 const CHECKS_WITHIN: Duration = Duration::from_secs(100);
@@ -175,7 +197,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = if steps {
-        (net_curl::STEPS_IMAGE, net_curl::steps_programs())
+        (STEPS_IMAGE, steps_programs())
     } else {
         (net::IMAGE, net::programs())
     };
@@ -217,6 +239,18 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         return Err("the network image faulted".into());
     }
     if steps {
+        let pipe = net_probe::longest_over_starts_of(&output.lines, PIPE_TAG);
+        if let Some(row) = pipe.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+            return Err(format!(
+                "the pipe service: a step past 0.9 of term B ({}): {row:?}",
+                net_probe::STEP_MAX
+            ));
+        }
+        let worst_pipe = pipe.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
+        println!(
+            "posix-net steps: the longest step of the pipe service is kind {} with {} ticks and detail {}; every kind: {pipe:?}",
+            worst_pipe.0, worst_pipe.1, worst_pipe.2
+        );
         let rows = steps_verdict(&output.lines)?;
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
         println!(
