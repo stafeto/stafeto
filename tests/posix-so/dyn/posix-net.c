@@ -2743,6 +2743,15 @@ static void *poke_later(void *arg)
 	return NULL;
 }
 
+/* The reader of `buffer-signal`: nothing until the signal came, so that the
+ * send waits for room when it comes, then everything. */
+static void *read_after_signal(void *arg)
+{
+	while (!interrupted)
+		pause_ms(5);
+	return read_all(arg);
+}
+
 /* A signal without SA_RESTART in the middle of a blocking send of 1 MiB:
  * the count of the bytes that went, and a second send takes the rest. */
 static void buffer_signal(void)
@@ -2756,11 +2765,11 @@ static void buffer_signal(void)
 	pair(lis, port, &c, &s);
 	static unsigned char out[1048576];
 	fill(out, 0, sizeof out, 9);
-	struct reader r = { s, sizeof out, 16384, 2, 9, 0, 0, 0 };
+	struct reader r = { s, sizeof out, 16384, 0, 9, 0, 0, 0 };
 	pthread_t tr, tp;
 	struct poke p = { pthread_self(), 150 };
 	interrupted = 0;
-	REQUIRE(pthread_create(&tr, NULL, read_all, &r) == 0);
+	REQUIRE(pthread_create(&tr, NULL, read_after_signal, &r) == 0);
 	REQUIRE(pthread_create(&tp, NULL, poke_later, &p) == 0);
 	ssize_t first = send(c, out, sizeof out, 0);
 	REQUIRE(pthread_join(tp, NULL) == 0);
