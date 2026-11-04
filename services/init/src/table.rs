@@ -927,6 +927,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-net-vz") as usize
+    + cfg!(feature = "table-net-vz2") as usize
+    + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-display") as usize
@@ -982,6 +984,8 @@ const _: () = assert!(
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
     feature = "table-net-vz",
+    feature = "table-net-vz2",
+    feature = "table-net-probe-two",
     feature = "table-input",
     feature = "table-posix-random",
     feature = "table-posix-display",
@@ -1070,6 +1074,10 @@ pub const TABLE: &[Record] = net::NET_TABLE;
 pub const TABLE: &[Record] = net::NET_PROBE_TABLE;
 #[cfg(feature = "table-net-vz")]
 pub const TABLE: &[Record] = net::NET_VZ_TABLE;
+#[cfg(feature = "table-net-vz2")]
+pub const TABLE: &[Record] = net::NET_VZ2_TABLE;
+#[cfg(feature = "table-net-probe-two")]
+pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-pci-walk-vz")]
 pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 #[cfg(feature = "table-input")]
@@ -1800,6 +1808,8 @@ mod tests {
             net::NET_TABLE,
             net::NET_PROBE_TABLE,
             net::NET_VZ_TABLE,
+            net::NET_VZ2_TABLE,
+            net::NET_PROBE_TWO_TABLE,
             doom::TABLE,
             gpu::TABLE,
             input::TABLE,
@@ -1861,6 +1871,64 @@ mod tests {
         }
         assert!(pages.iter().any(|&(_, n)| n == "uart"));
         assert!(pages.iter().any(|&(_, n)| n == "rng"));
+    }
+
+    /// The record of two network devices holds the windows of both, the
+    /// lines of both, and four names in all (REGISTER's reply gives at
+    /// most `START_NAMES`).
+    #[test]
+    fn the_records_of_two_network_devices_have_four_names_and_the_numbers_of_the_service() {
+        for record in [net::NETD_VZ2, net::NETD_TWO] {
+            assert_eq!(record.windows.len() + record.bindings.len(), 4);
+            assert_eq!(record.args.len(), 16);
+            assert_eq!(record.dma.len(), 2);
+            assert_eq!(record.dma[0].size, 16 * PAGE);
+            assert_eq!(record.dma[1].size, 512 * PAGE);
+            assert!(record.dma[1].size <= 4 * 1024 * 1024);
+        }
+        let vz = net::NETD_VZ2;
+        let (ecam, ecam_len) = netd::pci::ecam_window(2);
+        let (bar, bar_len) = netd::pci::bar_window(2);
+        assert_eq!((vz.windows[0].base, vz.windows[0].len), (ecam, ecam_len));
+        assert_eq!((vz.windows[1].base, vz.windows[1].len), (bar, bar_len));
+        assert_eq!(vz.bindings[0].line, netd::pci::line(0));
+        assert_eq!(vz.bindings[1].line, netd::pci::line(1));
+        assert_eq!(vz.args[8..], netd::pci::function(1).to_le_bytes());
+        // Four writes: the reset through BAR 0 and the command word of
+        // each device, at its own offsets in the windows.
+        assert_eq!(vz.quiesce.len(), 4);
+        assert_eq!(
+            vz.quiesce[2].offset,
+            netd::pci::bar_offset(1) + netd::pci::DEVICE_STATUS
+        );
+        assert_eq!(
+            vz.quiesce[3].offset,
+            netd::pci::ecam_offset(1) + COMMAND_WORD
+        );
+        assert_eq!(vz.quiesce[2].window, "bar");
+        assert_eq!(vz.quiesce[3].window, "ecam");
+        // Their windows and lines are those of the one-device record's,
+        // extended.
+        assert_eq!(vz.windows[0].base, net::NETD_VZ.windows[0].base);
+        assert_eq!(vz.bindings[0], net::NETD_VZ.bindings[0]);
+        // QEMU: the transports 7 and 14, lines 55 and 62, in two pages.
+        let qemu = net::NETD_TWO;
+        assert_eq!(qemu.windows[0].base, 0x0a00_0000);
+        assert_eq!(qemu.windows[1].base, 0x0a00_1000);
+        assert_eq!(qemu.bindings[1].line, 62);
+        assert_eq!(qemu.args[8..], 0x0a00_1c00u64.to_le_bytes());
+        assert_eq!(qemu.quiesce[1].offset, 0xc70);
+    }
+
+    #[test]
+    fn the_images_of_two_network_devices_pass_the_table_check() {
+        let shell = order_of(net::NET_VZ2_TABLE);
+        assert_eq!(shell.len(), 10);
+        assert_eq!(shell[8], NET_SERVICE);
+        assert_eq!(
+            order_of(net::NET_PROBE_TWO_TABLE),
+            ["ramfs", "rng", "entropy", "net", "net-probe"]
+        );
     }
 
     /// The command word of a PCI function.

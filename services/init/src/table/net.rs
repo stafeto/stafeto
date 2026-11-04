@@ -80,12 +80,13 @@ pub const NETD: Record = Record {
     // The worst case, by the formula of the stage (reports/2026-11-04-net-p1a):
     // the pages of `.data` and `.bss` of the release build (the pool of
     // buffers is 2 048 of them), the whole stack of 32 pages and 16 for the
-    // rest. `.bss` 8 922 225 bytes = 2 178 pages, `.data` none: 2 178 + 32 +
-    // 16. The kernel does not charge the pages of `.bss` to the quota in the
+    // rest. `.bss` 9 156 865 bytes = 2 236 pages (the second device's
+    // interface, queues and books are in it), `.data` none: 2 236 + 32 + 16.
+    // The kernel does not charge the pages of `.bss` to the quota in the
     // probe's runs (the table filled to 256 places passes with 32 pages and
     // fails to start with 24, where the page tables of the mappings do not
     // fit), so the number is a bound that the measurement does not reach.
-    quota: 2226 * PAGE,
+    quota: 2284 * PAGE,
     // 128 operations' handles of notification, the notary session, the page
     // of generations, and a reserve.
     handle_limit: 192,
@@ -195,6 +196,31 @@ const fn vz_stop(i: usize) -> [Write; 2] {
 
 static VZ_ARGS: [u8; 16] = vz_args::<1>();
 static VZ_STOP: [Write; 2] = vz_stop(0);
+static VZ2_ARGS: [u8; 16] = vz_args::<2>();
+static VZ2_STOP: [Write; 4] = {
+    let (a, b) = (vz_stop(0), vz_stop(1));
+    [a[0], a[1], b[0], b[1]]
+};
+
+/// The objects of an instance with two devices: each of the first's two
+/// objects twice as big, the second device taking the second half of each
+/// (`MAX_DMA` is two objects; the second device's own objects come with
+/// the claim of it, a later stage). `net` is 2 MiB, under the 4 MiB a
+/// contiguous object may be.
+pub const DMA_TWO: &[Dma] = &[
+    Dma {
+        name: "dma",
+        size: 16 * PAGE,
+        uncached: true,
+        duplicate: false,
+    },
+    Dma {
+        name: "net",
+        size: 512 * PAGE,
+        uncached: false,
+        duplicate: false,
+    },
+];
 
 /// The service on VZ with the first network device: INTA of device 1 at
 /// INTID 65.
@@ -218,6 +244,110 @@ pub const NETD_VZ: Record = Record {
     }],
     args: &VZ_ARGS,
     quiesce: &VZ_STOP,
+    ..NETD
+};
+
+/// The service on VZ with both network devices: the windows hold the pages
+/// of the functions of devices 1 and 2 and their BARs, INTA of device 2 is
+/// INTID 66, and init stops both devices.
+pub const NETD_VZ2: Record = Record {
+    windows: &[
+        Window {
+            name: "ecam",
+            base: VZ_ECAM + (VZ_DEVICE[0] << 15),
+            len: vz_function(1) + super::PAGE - vz_function(0),
+        },
+        Window {
+            name: "bar",
+            base: VZ_BAR,
+            len: 2 * VZ_BAR_LEN,
+        },
+    ],
+    bindings: &[
+        Binding {
+            name: "irq",
+            line: 64 + VZ_DEVICE[0] as u32,
+            edge: false,
+        },
+        Binding {
+            name: "irq1",
+            line: 64 + VZ_DEVICE[1] as u32,
+            edge: false,
+        },
+    ],
+    args: &VZ2_ARGS,
+    quiesce: &VZ2_STOP,
+    dma: DMA_TWO,
+    ..NETD
+};
+
+/// The second virtio-mmio transport of QEMU's `virt` for the image of two
+/// devices (`-device virtio-net-device,bus=virtio-mmio-bus.14`): transport
+/// 14 at 0xa001c00 on the page 0xa001000, INTID 62.
+pub const TRANSPORT1: u64 = 0x0a00_1c00;
+pub const LINE1: u32 = 48 + 14;
+
+const fn mmio_args() -> [u8; 16] {
+    let (a, b) = (TRANSPORT.to_le_bytes(), TRANSPORT1.to_le_bytes());
+    let mut args = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        args[i] = a[i];
+        args[8 + i] = b[i];
+        i += 1;
+    }
+    args
+}
+
+static MMIO2_ARGS: [u8; 16] = mmio_args();
+
+/// The service with both network devices on QEMU: the Status of each
+/// transport written 0 once an instance ended.
+pub const NETD_TWO: Record = Record {
+    windows: &[
+        Window {
+            name: "mmio",
+            base: TRANSPORT & !(PAGE - 1),
+            len: PAGE,
+        },
+        Window {
+            name: "mmio1",
+            base: TRANSPORT1 & !(PAGE - 1),
+            len: PAGE,
+        },
+    ],
+    bindings: &[
+        Binding {
+            name: "irq",
+            line: LINE,
+            edge: false,
+        },
+        Binding {
+            name: "irq1",
+            line: LINE1,
+            edge: false,
+        },
+    ],
+    args: &MMIO2_ARGS,
+    quiesce: &[
+        Write {
+            window: "mmio",
+            offset: (TRANSPORT & (PAGE - 1)) + MMIO_STATUS,
+            bits: 32,
+            value: 0,
+            settled: 0xFFFF_FFFF,
+            only_if: None,
+        },
+        Write {
+            window: "mmio1",
+            offset: (TRANSPORT1 & (PAGE - 1)) + MMIO_STATUS,
+            bits: 32,
+            value: 0,
+            settled: 0xFFFF_FFFF,
+            only_if: None,
+        },
+    ],
+    dma: DMA_TWO,
     ..NETD
 };
 
@@ -356,6 +486,20 @@ pub const NET_VZ_TABLE: &[Record] = &[
     NETD_VZ,
 ];
 
+/// The image of the shell on VZ with both network devices.
+pub const NET_VZ2_TABLE: &[Record] = &[
+    NET_VZ_TABLE[0],
+    NET_VZ_TABLE[1],
+    NET_VZ_TABLE[2],
+    NET_VZ_TABLE[3],
+    NET_VZ_TABLE[4],
+    NET_VZ_TABLE[5],
+    NET_VZ_TABLE[6],
+    NET_VZ_TABLE[7],
+    NET_VZ_TABLE[8],
+    NETD_VZ2,
+];
+
 /// The CPUs of the services and the probe in the images of the measurement of
 /// the steps (`net-alone`): the network service has CPU 0 to itself, so that
 /// the longest step it measures holds no time of another process (the
@@ -388,6 +532,20 @@ pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-alone") {
         PROBE,
     ]
 };
+
+/// The probe's image with both network devices on QEMU (role `c` and
+/// `k`): the lease of each and their first interrupts are what the run of
+/// xtask looks for.
+pub const NET_PROBE_TWO_TABLE: &[Record] = &[
+    super::ramfs::RAM_LEGACY,
+    super::entropy::RNG,
+    super::entropy::ENTROPY,
+    NETD_TWO,
+    Record {
+        args: b"ck",
+        ..PROBE
+    },
+];
 
 // The profile of the boot files goes to the network service.
 const _: () = {

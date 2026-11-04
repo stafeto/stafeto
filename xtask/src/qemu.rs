@@ -257,6 +257,24 @@ pub fn net(forwards: &[Forward]) -> Vec<String> {
     a
 }
 
+/// The mac address of the second network device of the image of two.
+pub const NET_MAC_TWO: &str = "52:54:00:12:34:57";
+
+/// The second Virtio network device of the network service, for the image
+/// of two devices: transport 14 of `virt` (address 0xa001c00 on the page
+/// 0xa001000, INTID 62; `table/net.rs`), on a user network of its own
+/// (10.0.3.0/24: the guest 10.0.3.15, the gateway 10.0.3.2, the name server
+/// 10.0.3.3). The keyboard of the input service takes transport 15 on the
+/// same page, so no image that has it runs two network devices.
+pub fn net_two() -> Vec<String> {
+    vec![
+        "-netdev".to_owned(),
+        "user,id=n1,net=10.0.3.0/24".to_owned(),
+        "-device".to_owned(),
+        format!("virtio-net-device,netdev=n1,bus=virtio-mmio-bus.14,mac={NET_MAC_TWO}"),
+    ]
+}
+
 /// The Virtio keyboard of the input service (services/virtio-input), on
 /// the transport init's table names, 15 (`table/input.rs`): address
 /// 0xa001e00, INTID 63, on the page 0xa001000 with the empty transports 8 to

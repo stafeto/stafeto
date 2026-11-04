@@ -43,6 +43,7 @@ mod device;
 mod dma;
 mod files;
 mod net;
+mod second;
 mod seed;
 mod split;
 mod stack;
@@ -64,6 +65,8 @@ use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, sys};
+use second::Second;
+use smoltcp::iface::SocketStorage;
 use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::{SomeTransport, Transport};
@@ -81,7 +84,9 @@ const CLEANUP: u64 = 2;
 const WAKE: u64 = 4;
 const SWEEP: u64 = 8;
 const RESOLV: u64 = 32;
-const STEP_BITS: u64 = RX | TX | CLEANUP | WAKE | SWEEP | RESOLV;
+/// The second device's step of receiving (second.rs).
+const RX1: u64 = 64;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
@@ -129,6 +134,10 @@ struct Tables {
     net: Net,
     storage: Storage<'static>,
     sessions: [Option<Session<Client, 0>>; SESSIONS],
+    /// The second device, once `Second::start_at` built it, and its one
+    /// socket's storage.
+    second: core::mem::MaybeUninit<Second>,
+    second_storage: second::Storage,
 }
 struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
 // SAFETY: only the main thread reaches it, once (`main`).
@@ -210,6 +219,8 @@ fn main(_: u64) -> u64 {
     // init puts first, then the record's, where the transport is.
     let own = args.map_or(&[][..], |a| a.own);
     let (dma_pa, net_pa, at) = (word(own, 0), word(own, 8), word(own, 16));
+    // The second device's transport or function, 0 without one.
+    let at1 = word(own, 24);
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
         return NOT_REGISTERED;
@@ -284,76 +295,82 @@ fn main(_: u64) -> u64 {
     let Ok(irq) = got.take::<Interrupt>("irq") else {
         return NOT_REGISTERED;
     };
+    // The record of two devices has a second binding, and its objects hold
+    // the second device's half behind the first's.
+    let irq1 = got.take::<Interrupt>("irq1").ok();
+    let devices = 1 + usize::from(irq1.is_some());
     let rw = Access::ReadWrite;
     let page = PAGE as u64;
-    // QEMU's transport, or VZ's function and its Virtio structures.
-    let mut windows = [None, None];
+    // QEMU's transports, or VZ's functions and their Virtio structures.
+    let mut windows: [Option<Handle<Memory>>; 3] = [None, None, None];
     let pci = if let Ok(window) = got.take::<Memory>("mmio") {
         if sys::mem_map(&s.process, &window, 0, page, dma::mmio_at(DEVICE), rw).is_err() {
             return NOT_MAPPED;
         }
         windows[0] = Some(window);
+        if devices == 2 {
+            let Ok(window) = got.take::<Memory>("mmio1") else {
+                return NOT_REGISTERED;
+            };
+            if sys::mem_map(&s.process, &window, 0, page, dma::mmio_at(1), rw).is_err() {
+                return NOT_MAPPED;
+            }
+            windows[2] = Some(window);
+        }
         false
     } else {
         let (Ok(ecam), Ok(bar)) = (got.take::<Memory>("ecam"), got.take::<Memory>("bar")) else {
             return NOT_REGISTERED;
         };
-        let (_, ecam_len) = netd::pci::ecam_window(1);
-        let (_, bar_len) = netd::pci::bar_window(1);
+        let (_, ecam_len) = netd::pci::ecam_window(devices);
+        let (_, bar_len) = netd::pci::bar_window(devices);
         if sys::mem_map(&s.process, &ecam, 0, ecam_len, dma::ecam_at(), rw).is_err()
             || sys::mem_map(&s.process, &bar, 0, bar_len, dma::bar_at(), rw).is_err()
         {
             return NOT_MAPPED;
         }
-        windows = [Some(ecam), Some(bar)];
+        windows[0] = Some(ecam);
+        windows[1] = Some(bar);
         true
     };
-    if dma_pa == 0
-        || net_pa == 0
-        || sys::mem_map(
-            &s.process,
-            &dma_object,
-            0,
-            dma::DMA_PAGES as u64 * page,
-            dma::dma_at(DEVICE),
-            rw,
-        )
-        .is_err()
-        || sys::mem_map(
-            &s.process,
-            &net_object,
-            0,
-            NET_PAGES as u64 * page,
-            dma::net_at(DEVICE),
-            rw,
-        )
-        .is_err()
-    {
+    // Each device has its half of each object: `dma` holds the pages of the
+    // queues of both, `net` the buffers of both.
+    let dma_half = dma::DMA_PAGES as u64 * page;
+    let net_half = NET_PAGES as u64 * page;
+    if dma_pa == 0 || net_pa == 0 {
         return NOT_MAPPED;
     }
-    dma::attach(DEVICE, dma_pa, net_pa);
-    let opened = if pci {
-        transport::pci_transport::<DEVICE>(&netd::pci::PLACES[DEVICE]).map_err(Some)
-    } else {
-        transport::mmio_transport(DEVICE, at).map_err(|error| {
-            match error {
-                OpenError::Rejected(why) => {
-                    rt::println!("virtio-net: no network device at {at:#x}: {why:?}")
-                }
-                OpenError::Unusable => rt::println!("virtio-net: no usable transport at {at:#x}"),
-            }
-            None
-        })
-    };
-    let (mut transport, status) = match opened {
-        Ok(found) => found,
-        Err(Some(transport::Failure::ConfigElsewhere)) => return CONFIG_ELSEWHERE,
-        Err(Some(transport::Failure::NotReset)) => return NOT_STARTED,
-        Err(Some(transport::Failure::NoDevice)) => {
-            rt::println!("virtio-net: no network device at {at:#x}");
-            return NO_DEVICE;
+    for d in 0..devices {
+        let (dma_offset, net_offset) = (d as u64 * dma_half, d as u64 * net_half);
+        if sys::mem_map(
+            &s.process,
+            &dma_object,
+            dma_offset,
+            dma_half,
+            dma::dma_at(d),
+            rw,
+        )
+        .is_err()
+            || sys::mem_map(
+                &s.process,
+                &net_object,
+                net_offset,
+                net_half,
+                dma::net_at(d),
+                rw,
+            )
+            .is_err()
+        {
+            return NOT_MAPPED;
         }
-        Err(None) => return NO_DEVICE,
+    }
+    dma::attach(DEVICE, dma_pa, net_pa);
+    if devices == 2 {
+        dma::attach(1, dma_pa + dma_half, net_pa + net_half);
+    }
+    let (mut transport, status) = match open_device(pci, DEVICE, at) {
+        Ok(found) => found,
+        Err(code) => return code,
     };
     let features = match virtio_mmio::start_with(&mut transport, MTU | MAC | STATUS) {
         Ok(bits) => bits,
@@ -393,6 +410,8 @@ fn main(_: u64) -> u64 {
         net,
         storage,
         sessions,
+        second,
+        second_storage,
     } = tables;
     let mut device = NetDevice::new(RxRing::new(rx_queue), TxRing::new(tx_queue), mac);
     device.rx.fill();
@@ -419,6 +438,25 @@ fn main(_: u64) -> u64 {
     {
         rt::println!("virtio-net: mtu {mtu}");
     }
+    // The second device, if the record has one.
+    let second = match irq1 {
+        Some(irq1) => {
+            let started = start_second(
+                pci,
+                at1,
+                irq1,
+                second,
+                second_storage,
+                &settings,
+                random_seed,
+            );
+            match started {
+                Ok(second) => Some(second),
+                Err(code) => return code,
+            }
+        }
+        None => None,
+    };
 
     let now = now_ns();
     let mut stack = Stack::new(
@@ -448,6 +486,8 @@ fn main(_: u64) -> u64 {
         link,
         interrupted: false,
         line_closed: false,
+        second,
+        rx1_irq: false,
         told: 0,
         cleanup_due: false,
         armed: None,
@@ -476,6 +516,7 @@ fn main(_: u64) -> u64 {
     virtio_mmio::reopen(&driver.irq);
     driver.rx_step(false);
     driver.tx_step(false);
+    driver.rx1_step(false);
     #[cfg(feature = "steps")]
     rt::service::report_steps(14);
     let config = Config {
@@ -488,6 +529,73 @@ fn main(_: u64) -> u64 {
     };
     let _ = rt::service::run_in(&channel, &mut driver, config, sessions);
     STOPPED
+}
+
+/// The transport of the network device `device` (0 or 1) at `at`, with the
+/// status it had before the service's reset; says why on failure and gives
+/// the code the service ends with.
+fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'static>, u32), u64> {
+    let tag = if device == DEVICE {
+        "virtio-net"
+    } else {
+        "virtio-net1"
+    };
+    let opened = if pci {
+        match device {
+            DEVICE => transport::pci_transport::<DEVICE>(&netd::pci::PLACES[DEVICE]),
+            _ => transport::pci_transport::<1>(&netd::pci::PLACES[1]),
+        }
+        .map_err(Some)
+    } else {
+        transport::mmio_transport(device, at).map_err(|error| {
+            match error {
+                OpenError::Rejected(why) => {
+                    rt::println!("{tag}: no network device at {at:#x}: {why:?}")
+                }
+                OpenError::Unusable => rt::println!("{tag}: no usable transport at {at:#x}"),
+            }
+            None
+        })
+    };
+    match opened {
+        Ok(found) => Ok(found),
+        Err(Some(transport::Failure::ConfigElsewhere)) => Err(CONFIG_ELSEWHERE),
+        Err(Some(transport::Failure::NotReset)) => Err(NOT_STARTED),
+        Err(Some(transport::Failure::NoDevice)) => {
+            rt::println!("{tag}: no network device at {at:#x}");
+            Err(NO_DEVICE)
+        }
+        Err(None) => Err(NO_DEVICE),
+    }
+}
+
+/// Starts the second device in `slot`.
+fn start_second<'a>(
+    pci: bool,
+    at1: u64,
+    irq1: Handle<Interrupt>,
+    slot: &'a mut core::mem::MaybeUninit<Second>,
+    storage: &'static mut second::Storage,
+    settings: &Settings,
+    seed: u64,
+) -> Result<&'a mut Second, u64> {
+    let (transport, status) = open_device(pci, 1, at1)?;
+    // SAFETY: the slot is exclusive and empty, the storage is the one
+    // socket's and used nowhere else; the device is up when `start_at`
+    // returns Ok.
+    unsafe {
+        Second::start_at(
+            slot.as_mut_ptr(),
+            storage,
+            transport,
+            irq1,
+            (pci, at1, status),
+            seed.wrapping_add(1),
+            now_ns(),
+            settings.address1,
+        )?;
+        Ok(slot.assume_init_mut())
+    }
 }
 
 /// The static address of the file, when it names one.
@@ -527,6 +635,7 @@ impl Tables {
             );
             Storage::initialize_at(addr_of_mut!((*tables).storage));
             rt::bss::fill_none(addr_of_mut!((*tables).sessions));
+            addr_of_mut!((*tables).second_storage).write([SocketStorage::EMPTY]);
         }
     }
 }
@@ -552,6 +661,11 @@ struct Driver<'a> {
     /// The line is closed (the kernel masked it at delivery and the step
     /// has not opened it yet).
     line_closed: bool,
+    /// The second device, if the record has one.
+    second: Option<&'a mut Second>,
+    /// An interrupt came that the second device's step has not read the
+    /// status for.
+    rx1_irq: bool,
     /// The bits of the notifications to itself that are on their way.
     told: u64,
     /// A step of departure is due that no notification told.
@@ -582,7 +696,7 @@ struct Driver<'a> {
     held_rx: bool,
     #[cfg(feature = "probe")]
     held_tx: bool,
-    _maps: (Handle<Memory>, Handle<Memory>, [Option<Handle<Memory>>; 2]),
+    _maps: (Handle<Memory>, Handle<Memory>, [Option<Handle<Memory>>; 3]),
 }
 
 impl Driver<'_> {
@@ -744,6 +858,37 @@ impl Driver<'_> {
         }
     }
 
+    /// The second device's step (second.rs): its status if an interrupt
+    /// brought the step, the frames of DHCP and ARP, the client's pass; it
+    /// asks for another step while frames are left, and opens its line when
+    /// the queue is empty.
+    fn rx1_step(&mut self, interrupt: bool) {
+        let Some(second) = self.second.as_deref_mut() else {
+            return;
+        };
+        rt::service::step_own();
+        let now = now_ns();
+        let outcome = second.step(now, interrupt);
+        match outcome.event {
+            Some(Event::Leased(lease)) => rt::println!("net: lease1 {}", lease.summary()),
+            Some(Event::Lost) => rt::println!("net: lease1 lost"),
+            None => {}
+        }
+        if outcome.first_interrupt {
+            rt::println!("virtio-net1: first interrupt");
+        }
+        let continued = outcome.more && self.tell(RX1);
+        if !continued
+            && let Some(second) = self.second.as_deref_mut()
+            && core::mem::take(&mut second.line_closed)
+        {
+            virtio_mmio::reopen(&second.irq);
+        }
+        if !continued {
+            self.arm(now);
+        }
+    }
+
     /// The change of the link (the interrupt's configuration bit).
     fn link_changed(&mut self) {
         let Ok((_, up)) = read_config(&self.transport) else {
@@ -891,6 +1036,7 @@ impl Driver<'_> {
             sweep,
             Some(self.neighbours_at),
             self.ask_at,
+            self.second.as_deref().and_then(|s| s.next_at),
         ]
         .into_iter()
         .flatten()
@@ -1106,12 +1252,21 @@ impl Service<0> for Driver<'_> {
 
     fn notification(&mut self, n: Notice) {
         match n.source {
-            Source::Interrupt => self.rx_step(true),
+            Source::Interrupt => {
+                // The lines of both devices share the channel's label: the
+                // first device's step reads its status, and the second's
+                // reads its own (a status that is empty costs a read).
+                self.rx_step(true);
+                if self.second.is_some() {
+                    self.rx1_irq = true;
+                    self.tell(RX1);
+                }
+            }
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, TX, WAKE, CLEANUP, SWEEP, RESOLV];
+                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -1129,6 +1284,10 @@ impl Service<0> for Driver<'_> {
                         #[cfg(not(feature = "probe"))]
                         let irq = false;
                         self.rx_step(irq)
+                    }
+                    RX1 => {
+                        let irq = core::mem::take(&mut self.rx1_irq);
+                        self.rx1_step(irq)
                     }
                     TX => self.tx_step(false),
                     WAKE => {
@@ -1156,6 +1315,14 @@ impl Service<0> for Driver<'_> {
             }
             Source::Timer if n.label == TIMER_LABEL => {
                 self.armed = None;
+                let now = now_ns();
+                if self
+                    .second
+                    .as_deref()
+                    .is_some_and(|s| s.next_at.is_some_and(|at| at <= now))
+                {
+                    self.tell(RX1);
+                }
                 self.tx_step(true);
                 self.after_request();
             }

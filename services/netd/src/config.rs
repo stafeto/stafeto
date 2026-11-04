@@ -13,6 +13,11 @@
 //!   `dns`.
 //! * `gateway G`: an address inside the network of `address`.
 //! * `dns D`: one address.
+//! * `address1 A/N`: the address of the second network device, with the same
+//!   checks as `address`, and no gateway or name server. With it the second
+//!   device runs no DHCP. When `address` is given too, the two are not in
+//!   one network. A file for a machine with one device may hold it: it is
+//!   kept and not used.
 //! * `handover 0` or `handover 1`: parsed and kept; the second device
 //!   uses it (a later stage).
 //! * A key twice, an unknown key, a word more, a bad address: an error with
@@ -35,6 +40,9 @@ pub struct Cidr {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub address: Option<Cidr>,
+    /// The static address of the second device (no gateway, no name
+    /// server).
+    pub address1: Option<Cidr>,
     pub gateway: Option<[u8; 4]>,
     pub dns: Option<[u8; 4]>,
     pub handover: Option<bool>,
@@ -57,6 +65,7 @@ pub enum Reason {
     GatewayOutside,
     NotUnicast,
     GatewayIsAddress,
+    SameNetwork,
 }
 
 impl Reason {
@@ -76,6 +85,7 @@ impl Reason {
             Reason::GatewayOutside => "the gateway is outside the network of the address",
             Reason::NotUnicast => "not a unicast address (0.x.x.x, multicast or broadcast)",
             Reason::GatewayIsAddress => "the gateway is the interface's own address",
+            Reason::SameNetwork => "address1 is in the network of address",
         }
     }
 }
@@ -185,7 +195,10 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
     }
     let mut words = text.split(|&b| blank(b)).filter(|w| !w.is_empty());
     let key = words.next().ok_or(Reason::NoValue)?;
-    let known = matches!(key, b"address" | b"gateway" | b"dns" | b"handover");
+    let known = matches!(
+        key,
+        b"address" | b"address1" | b"gateway" | b"dns" | b"handover"
+    );
     if !known {
         return Err(Reason::UnknownKey);
     }
@@ -194,12 +207,16 @@ fn line(settings: &mut Settings, text: &[u8]) -> Result<(), Reason> {
         return Err(Reason::ExtraWord);
     }
     match key {
-        b"address" => {
+        b"address" | b"address1" => {
             let cidr = parse_cidr(value)?;
             if !unicast(cidr.address) {
                 return Err(Reason::NotUnicast);
             }
-            set(&mut settings.address, cidr)
+            if key == b"address" {
+                set(&mut settings.address, cidr)
+            } else {
+                set(&mut settings.address1, cidr)
+            }
         }
         b"gateway" => set(&mut settings.gateway, unicast_ip(value)?),
         b"dns" => set(&mut settings.dns, unicast_ip(value)?),
@@ -235,6 +252,20 @@ pub fn parse(file: &[u8]) -> Result<Settings, Error> {
         dns,
         ..
     } = settings;
+    // Two static addresses in one network would make the stack's routes
+    // ambiguous: the second device is for another network.
+    if let (Some(a), Some(b)) = (address, settings.address1)
+        && same_network(&a, b.address)
+    {
+        let at = file
+            .split(|&b| b == b'\n')
+            .position(|l| trim(l).starts_with(b"address1"))
+            .map_or(0, |n| n + 1);
+        return Err(Error {
+            line: at,
+            reason: Reason::SameNetwork,
+        });
+    }
     match (address, gateway, dns) {
         (None, None, None) => {}
         (None, _, _) => {
@@ -408,6 +439,45 @@ mod tests {
         );
         assert!(parse(b"address 127.0.0.1/8").is_ok());
         assert!(parse(b"address 223.255.255.254/24").is_ok());
+    }
+
+    #[test]
+    fn address1_is_the_second_devices_and_needs_no_address() {
+        let s = parse(b"address1 192.168.64.250/24\n").unwrap();
+        assert_eq!(s.address, None);
+        assert_eq!(
+            s.address1,
+            Some(Cidr {
+                address: [192, 168, 64, 250],
+                prefix: 24
+            })
+        );
+        // Both, in different networks.
+        assert!(parse(STATIC).is_ok());
+        let both = parse(b"address 10.0.2.15/24\naddress1 10.0.3.15/24").unwrap();
+        assert!(both.address.is_some() && both.address1.is_some());
+        // The same checks as `address`.
+        assert_eq!(fault(b"address1 224.0.0.1/24"), (1, Reason::NotUnicast));
+        assert_eq!(fault(b"address1 10.0.3.15"), (1, Reason::BadPrefix));
+        assert_eq!(
+            fault(b"address1 10.0.3.15/24\naddress1 10.0.3.16/24"),
+            (2, Reason::KeyTwice)
+        );
+        // A gateway or a name server alone still needs `address`.
+        assert_eq!(
+            fault(b"address1 10.0.3.15/24\ngateway 10.0.3.1"),
+            (0, Reason::NeedsAddress)
+        );
+    }
+
+    #[test]
+    fn the_two_static_addresses_are_not_in_one_network() {
+        assert_eq!(
+            fault(b"address 10.0.2.15/24\n\naddress1 10.0.2.16/24"),
+            (3, Reason::SameNetwork)
+        );
+        assert!(parse(b"address 10.0.2.15/16\naddress1 10.0.3.16/24").is_err());
+        assert!(parse(b"address 10.0.2.15/24\naddress1 10.0.3.16/24").is_ok());
     }
 
     #[test]

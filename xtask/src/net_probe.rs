@@ -67,6 +67,60 @@ pub const PROGRAMS: [ImageProgram; 6] = [
     ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
 ];
 
+/// The image of two network devices: the probe's image with init's table of
+/// two devices (`table-net-probe-two`).
+pub const TWO_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-net-probe-two"]),
+    RAM,
+    RNG,
+    ENTROPY,
+    ("netd", "netd", NETD_STACK_SIZE, &["probe"]),
+    ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
+];
+
+/// The second device's lines at each start: the transport, its line, the
+/// device's status and its MAC; and the lease the second user network gives
+/// (10.0.3.0/24).
+pub const DEVICE_LINE_TWO: &str =
+    "virtio-net1: virtio-mmio at 0xa001c00, line 62, status 0x0, mac 52:54:00:12:34:57";
+const LEASE_TWO: &str = "net: lease1 10.0.3.15/24 gw 10.0.3.2 dns 10.0.3.3";
+
+/// Judges the lines of the run of two devices beyond `verdict`'s: each
+/// device started twice (the second time after the restart), each leased
+/// its address twice, said its first interrupt twice (once per start), and
+/// the first device's did not mix with the second's.
+pub fn two_verdict(lines: &[String]) -> Result<(), String> {
+    let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
+    for (marker, wanted) in [
+        (DEVICE_LINE_TWO, 2),
+        (LEASE_TWO, 2),
+        ("virtio-net1: first interrupt", 2),
+        ("virtio-net: first interrupt", 2),
+    ] {
+        if count(marker) != wanted {
+            let found: Vec<_> = lines
+                .iter()
+                .filter(|l| l.starts_with("virtio-net") || l.starts_with("net: lease"))
+                .collect();
+            return Err(format!(
+                "{} lines {marker:?}, {wanted} expected; the service said {found:?}",
+                count(marker)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The image of two devices under -icount: the service counts its steps.
+pub const TWO_STEPS_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-net-probe-two"]),
+    RAM,
+    RNG,
+    ENTROPY,
+    ("netd", "netd", NETD_STACK_SIZE, &["probe", "steps"]),
+    ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
+];
+
 /// The image of the run under -icount: the service counts its steps.
 #[allow(dead_code)] // the list of images of rootfs.rs names it.
 pub const STEPS_PROGRAMS: [ImageProgram; 6] = [
@@ -520,19 +574,25 @@ pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, Strin
 
 /// A run on `machine` of the image `name` with `programs`: the machine
 /// starts, and the lines are read until the client ends. The time to the
-/// first address is the host's wall time.
+/// first address is the host's wall time. With `two` the machine has the
+/// second network device too (`qemu::net_two`) and the lines of both are
+/// judged.
 fn run(
     machine: &qemu::Machine,
     name: &'static str,
     programs: &'static [ImageProgram],
     mode: Mode,
     roles: Roles,
+    two: bool,
 ) -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
+    if two {
+        cmd.args(qemu::net_two());
+    }
     let began = Instant::now();
     let mut run = Run::start(cmd, Input::Null)?;
     let within = Duration::from_secs(60);
@@ -552,6 +612,10 @@ fn run(
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     verdict(&outcome.lines, mode, roles)
         .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
+    if two {
+        two_verdict(&outcome.lines)
+            .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
+    }
     if let Some(us) = loopback_connect(&outcome.lines)
         && us > CONNECT_MAX_US
     {
@@ -581,11 +645,26 @@ fn steps_lines(
     roles: Roles,
     strict: bool,
 ) -> Result<Vec<String>, String> {
+    steps_lines_with(machine, name, programs, roles, strict, false)
+}
+
+/// `steps_lines`, with the second network device when `two`.
+fn steps_lines_with(
+    machine: &qemu::Machine,
+    name: &'static str,
+    programs: &'static [ImageProgram],
+    roles: Roles,
+    strict: bool,
+    two: bool,
+) -> Result<Vec<String>, String> {
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
+    if two {
+        cmd.args(qemu::net_two());
+    }
     cmd.args(qemu::ICOUNT);
     // One CPU. The service alone on CPU 0 of two (the feature `net-alone` of
     // init, `-smp 2`) was tried: under -icount the counter is the instructions
@@ -600,6 +679,11 @@ fn steps_lines(
     if strict {
         verdict(&output.lines, Mode::Dhcp, roles)
             .map_err(|e| format!("net-probe under -icount on {} ({name}): {e}", machine.name))?;
+        if two {
+            two_verdict(&output.lines).map_err(|e| {
+                format!("net-probe under -icount on {} ({name}): {e}", machine.name)
+            })?;
+        }
         crate::check_waits(&output.lines, &[NET_TAG], "net-probe")?;
     }
     Ok(output.lines)
@@ -942,6 +1026,7 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         &PROGRAMS,
         Mode::Dhcp,
         Roles::LIMIT,
+        false,
     )?;
     run(
         machine,
@@ -949,6 +1034,15 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
         &PROGRAMS,
         Mode::Static,
         Roles::LIMIT,
+        false,
+    )?;
+    run(
+        machine,
+        "boot-net-probe-two.img",
+        &TWO_PROGRAMS,
+        Mode::Dhcp,
+        Roles::NONE,
+        true,
     )?;
     if !machine.is_hvf() {
         steps(machine)?;
@@ -995,6 +1089,21 @@ pub fn command(args: &[String]) -> Result<(), String> {
         )?;
         let rows = steps_verdict_rows(&rows).map_err(|e| format!("run {what}: {e}"))?;
         print_rows(&qemu::VIRT, &format!("role {what}"), &rows);
+        return Ok(());
+    }
+    // `two-steps`: the image of two devices under -icount, judged by the
+    // same bound as the others.
+    if args == ["two-steps"] {
+        let lines = steps_lines_with(
+            &qemu::VIRT,
+            "boot-net-steps-two.img",
+            &TWO_STEPS_PROGRAMS,
+            Roles::NONE,
+            true,
+            true,
+        )?;
+        let rows = steps_verdict(&lines).map_err(|e| format!("two devices: {e}"))?;
+        print_rows(&qemu::VIRT, "two devices", &rows);
         return Ok(());
     }
     if args == ["split"] {
@@ -1108,6 +1217,48 @@ mod tests {
         lines.push(OK.to_owned());
         lines.push(ENDED.to_owned());
         lines
+    }
+
+    fn two_run() -> Vec<String> {
+        let mut lines = good_run(Mode::Dhcp);
+        for _ in 0..2 {
+            lines.push(DEVICE_LINE_TWO.to_owned());
+            lines.push(LEASE_TWO.to_owned());
+            lines.push("virtio-net1: first interrupt".to_owned());
+            lines.push("virtio-net: first interrupt".to_owned());
+        }
+        lines
+    }
+
+    #[test]
+    fn a_run_of_two_devices_needs_the_lines_of_both() {
+        assert_eq!(two_verdict(&two_run()), Ok(()));
+        for marker in [
+            DEVICE_LINE_TWO,
+            LEASE_TWO,
+            "virtio-net1: first interrupt",
+            "virtio-net: first interrupt",
+        ] {
+            let mut lines = two_run();
+            let at = lines.iter().position(|l| l == marker).unwrap();
+            lines.remove(at);
+            assert!(
+                two_verdict(&lines).unwrap_err().contains(marker),
+                "{marker}"
+            );
+        }
+        // The second user network's lease is not the first's.
+        assert!(two_verdict(&good_run(Mode::Dhcp)).is_err());
+    }
+
+    #[test]
+    fn the_second_device_sits_on_the_transport_of_init_s_table() {
+        let args = qemu::net_two().join(" ");
+        assert!(args.contains("bus=virtio-mmio-bus.14"));
+        assert!(args.contains(&format!("mac={}", qemu::NET_MAC_TWO)));
+        assert!(args.contains("net=10.0.3.0/24"));
+        assert_eq!(TWO_PROGRAMS[0].3, &["table-net-probe-two"]);
+        assert_eq!(TWO_STEPS_PROGRAMS[4].3, &["probe", "steps"]);
     }
 
     #[test]

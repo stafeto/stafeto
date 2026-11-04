@@ -65,6 +65,30 @@ pub fn is_dhcp_client_frame(frame: &[u8]) -> bool {
     }
 }
 
+const DHCP_CLIENT_PORT: u16 = 68;
+
+/// Whether `frame` is an Ethernet frame that carries an IPv4 datagram of
+/// UDP from port 67 to port 68 (RFC 2131, 4.1): a server's message to a
+/// client. The header length and the fragment offset of IPv4 are honoured.
+pub fn is_dhcp_server_frame(frame: &[u8]) -> bool {
+    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
+        return false;
+    }
+    let ip = &frame[ETHERNET_HEADER..];
+    let header = usize::from(ip[0] & 0x0f) * 4;
+    let fragment = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff;
+    if ip[0] >> 4 != 4 || header < 20 || ip[9] != UDP || fragment != 0 {
+        return false;
+    }
+    match ip.get(header..header + 4) {
+        Some(ports) => {
+            u16::from_be_bytes([ports[0], ports[1]]) == DHCP_SERVER_PORT
+                && u16::from_be_bytes([ports[2], ports[3]]) == DHCP_CLIENT_PORT
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +134,32 @@ mod tests {
         assert!(is_dhcp_client_frame(&udp_frame(5, UDP, 0, 67)));
         // IPv4 options move the UDP header.
         assert!(is_dhcp_client_frame(&udp_frame(7, UDP, 0, 67)));
+    }
+
+    #[test]
+    fn a_dhcp_server_frame_is_from_67_to_68() {
+        let mut offer = udp_frame(5, UDP, 0, 68);
+        offer[14 + 20..14 + 22].copy_from_slice(&67u16.to_be_bytes());
+        assert!(is_dhcp_server_frame(&offer));
+        // Options move the UDP header.
+        let mut long = udp_frame(7, UDP, 0, 68);
+        long[14 + 28..14 + 30].copy_from_slice(&67u16.to_be_bytes());
+        assert!(is_dhcp_server_frame(&long));
+        // A client message, a datagram from another port, TCP, a later
+        // fragment, ARP, and a cut frame are not.
+        assert!(!is_dhcp_server_frame(&udp_frame(5, UDP, 0, 67)));
+        assert!(!is_dhcp_server_frame(&udp_frame(5, UDP, 0, 68)));
+        let mut tcp = offer.clone();
+        tcp[14 + 9] = 6;
+        assert!(!is_dhcp_server_frame(&tcp));
+        let mut later = offer.clone();
+        later[14 + 6..14 + 8].copy_from_slice(&8u16.to_be_bytes());
+        assert!(!is_dhcp_server_frame(&later));
+        let mut arp = offer.clone();
+        arp[12..14].copy_from_slice(&[0x08, 0x06]);
+        assert!(!is_dhcp_server_frame(&arp));
+        assert!(!is_dhcp_server_frame(&offer[..14 + 20 + 3]));
+        assert!(!is_dhcp_server_frame(&[]));
     }
 
     #[test]

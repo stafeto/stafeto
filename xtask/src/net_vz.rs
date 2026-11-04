@@ -137,6 +137,20 @@ pub fn arp_mac(output: &str) -> Option<String> {
     })
 }
 
+/// The first line of the run that `wanted` takes: one that came already, or
+/// the next that comes within `within`.
+fn line_where(
+    run: &mut qemu::Run,
+    what: &str,
+    wanted: impl Fn(&str) -> bool,
+    within: Duration,
+) -> Result<String, String> {
+    if let Some(line) = run.lines().iter().find(|l| wanted(l)) {
+        return Ok(line.clone());
+    }
+    run.expect_line(what, wanted, within)
+}
+
 struct Options {
     devices: usize,
     static1: bool,
@@ -192,7 +206,8 @@ fn first_device(
 ) -> Result<Address, String> {
     let mut mac = MACS[0].to_owned();
     mac.insert_str(0, "mac ");
-    let driver = run.expect_line(
+    let driver = line_where(
+        run,
         "the driver's line",
         |l| l.starts_with("virtio-net: 1af4:1041 at "),
         BOOT_TIMEOUT,
@@ -201,7 +216,12 @@ fn first_device(
     if driver != expected {
         return Err(format!("the driver says {driver:?}, wanted {expected:?}"));
     }
-    let lease_line = run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
+    let lease_line = line_where(
+        run,
+        "the lease",
+        |l| l.contains("net: lease "),
+        BOOT_TIMEOUT,
+    )?;
     let lease_at = started.elapsed();
     let lease = parse_address(&lease_line, "lease").ok_or(format!("the lease {lease_line:?}"))?;
     println!(
@@ -348,7 +368,8 @@ fn second_device(
     first: Ipv4Addr,
     static1: bool,
 ) -> Result<(), String> {
-    let driver = run.expect_line(
+    let driver = line_where(
+        run,
         "the second driver's line",
         |l| l.starts_with("virtio-net1: 1af4:1041 at "),
         BOOT_TIMEOUT,
@@ -363,7 +384,8 @@ fn second_device(
         ));
     }
     let second = if static1 {
-        let line = run.expect_line(
+        let line = line_where(
+            run,
             "the static address",
             |l| l.contains("net: static1 "),
             BOOT_TIMEOUT,
@@ -371,11 +393,15 @@ fn second_device(
         parse_address(&line, "static1").ok_or(format!("the line {line:?}"))?
     } else {
         let wait = LEASE1_WITHIN;
-        let line = run
-            .expect_line("the second lease", |l| l.contains("net: lease1 "), wait)
-            .map_err(|e| {
-                format!("net-vz: the second device got no lease in 30 s ({e}); try --static1")
-            })?;
+        let line = line_where(
+            run,
+            "the second lease",
+            |l| l.contains("net: lease1 "),
+            wait,
+        )
+        .map_err(|e| {
+            format!("net-vz: the second device got no lease in 30 s ({e}); try --static1")
+        })?;
         parse_address(&line, "lease1").ok_or(format!("the line {line:?}"))?
     };
     println!(
