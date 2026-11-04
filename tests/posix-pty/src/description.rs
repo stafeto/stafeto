@@ -25,7 +25,7 @@ pub extern "C" fn stafeto_pty_clone_full(fd: u32) -> i32 {
             return Err(25);
         }
         let parent = transport.terminal().ok_or(25)?;
-        let mut ids = [0; posix_fs::OPEN_MAX];
+        let mut ids = [0; posix_fs::TTY_KEPT_MAX];
         let count = posix_abi::shared::terminals_kept_by_fork(&mut ids)?;
         if count != 32 {
             return Err(5);

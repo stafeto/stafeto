@@ -634,7 +634,7 @@ fn content(node: &Node) -> Result<Text, i32> {
 /// the table with the memory (the child's offsets are its own from then);
 /// `exec` carries the node and the offset (`inherit`), and the new image
 /// makes the text again at its first read.
-const DESCRIPTIONS: usize = posix_fs::OPEN_MAX;
+const DESCRIPTIONS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Description {
@@ -912,10 +912,10 @@ pub fn open(path: &[u8], flags: i32) -> Result<i32, i32> {
             return Err(errno);
         }
     };
-    let inserted = crate::shared::with_files(|files| {
+    let inserted = crate::shared::growing(|files| {
         files
             .insert_proc(id, crate::descriptor_flags(flags))
-            .map_err(crate::error)
+            .map_err(crate::shared::page_error)
     });
     match inserted {
         Ok(fd) => Ok(fd as i32),

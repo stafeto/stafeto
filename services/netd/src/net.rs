@@ -12,8 +12,9 @@
 //! in place, so the stack of the program stays small. The pool of buffers
 //! takes a page only when a socket touches it.
 
-use crate::stack::{GROUP, GROUPS, Sh, Stack};
+use crate::stack::{GROUP, GROUPS, GroupSet, Sh, Stack};
 use core::mem::{ManuallyDrop, MaybeUninit};
+use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
@@ -41,13 +42,28 @@ pub const ROOT_CLONES: usize = 255;
 /// The long operations that wait in the service at most.
 pub const OPERATIONS: usize = 128;
 /// The descriptions one session holds: a process cannot hold more.
-pub const OPEN_MAX: usize = 64;
+pub const OPEN_MAX: usize = 1024;
 /// The sockets of the queue of `listen` at most.
 pub const BACKLOG_MAX: usize = 16;
 /// The bytes of a buffer of one direction of a TCP socket, and the packets
-/// and bytes of one direction of a UDP socket.
+/// and bytes of one direction of a UDP socket: the first `FULL_PLACES` places
+/// have `BUFFER` bytes a direction, the others `SMALL_BUFFER` (1 280 sockets
+/// of 16 KiB a side would be 40 MiB). Places are given from the lowest, so
+/// while fewer than `FULL_PLACES` sockets are open every one has the full buffer.
 pub const BUFFER: usize = 16 * 1024;
+pub const SMALL_BUFFER: usize = 4 * 1024;
+pub const FULL_PLACES: usize = 256;
+const SMALL_PLACES: usize = SOCKETS_MAX - FULL_PLACES;
 const PACKETS: usize = 16;
+
+/// The bytes of a direction of the buffers of place `i`.
+pub const fn buffer_of(i: usize) -> usize {
+    if i < FULL_PLACES {
+        BUFFER
+    } else {
+        SMALL_BUFFER
+    }
+}
 /// How long a stream no session holds may close, in nanoseconds: smoltcp's
 /// FIN-WAIT-2 has no end of its own.
 pub const ORPHAN_NS: u64 = 60_000_000_000;
@@ -62,6 +78,8 @@ const SWEEP: usize = 4;
 const RST_NS: u64 = 1_000_000_000;
 /// The streams `evict` looks at.
 const EVICT: usize = 8;
+/// The groups of sockets `schedule_wake` looks at in one step.
+const SCHEDULE_GROUPS: usize = 16;
 /// The sessions that went and still hold descriptions at most: a session
 /// has one entry, so the table is as long as the sessions are. Past that (a
 /// session that went twice before the first entry drained) the descriptions
@@ -87,8 +105,7 @@ pub struct Client {
     pub root: u64,
 }
 
-/// A clone that sent nothing yet: its label, its descriptions and its root.
-pub type Birth = (u64, Held, u64);
+pub use netd::births::Birth;
 
 /// How a stream's connection stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,12 +278,20 @@ pub struct Counters {
 pub struct Net {
     pub places: Places<SOCKETS_MAX>,
     pub socks: [Sock; SOCKETS_MAX],
-    /// The buffers: place i uses `pool[i]`, the first half for receiving
-    /// and the second for sending.
-    pool: [[u8; 2 * BUFFER]; SOCKETS_MAX],
+    /// The buffers: place i below `FULL_PLACES` uses `pool_full[i]`, the others
+    /// `pool_small[i - FULL_PLACES]`; the first half for receiving and the
+    /// second for sending.
+    pool_full: [[u8; 2 * BUFFER]; FULL_PLACES],
+    pool_small: [[u8; 2 * SMALL_BUFFER]; SMALL_PLACES],
     /// The packet records of a datagram socket: place i, then the two
     /// directions.
     udp_meta: [[MaybeUninit<udp::PacketMetadata>; 2 * PACKETS]; SOCKETS_MAX],
+    /// The bound places, in a chain for each port.
+    pub chains: PortChains<SOCKETS_MAX>,
+    /// The bound places that are connected and do not listen: a bind that
+    /// may share the port (SO_REUSEADDR) has no need to look at them, so the
+    /// accepted connections of a busy server are not walked.
+    pub connected: PortChains<SOCKETS_MAX>,
     pub tcp_ports: PortMap,
     pub udp_ports: PortMap,
     pub ops: LongOps<OPERATIONS>,
@@ -275,6 +300,9 @@ pub struct Net {
     pub clones: Clones<SESSIONS>,
     pub births: [Option<Birth>; SESSIONS],
     departing: [Held; DEPARTING],
+    /// The operations of each departing session that wait still: a step of
+    /// departure lets go of a portion of them before the places.
+    departing_long: [LongSession; DEPARTING],
     /// The entries of `departing` that hold descriptions, a bit each.
     departing_used: [u64; DEPARTING.div_ceil(64)],
     /// The places that have operations waiting, the streams that connect and
@@ -297,10 +325,13 @@ pub struct Net {
     pub demux: Demux,
     /// The groups with work for the pass of sending, and those the step
     /// touched (a bit each), for the step of waking.
-    pub due: u64,
-    pub touched: u64,
+    pub due: GroupSet,
+    pub touched: GroupSet,
+    /// Where `schedule_wake` goes on, so that groups above the first few are
+    /// reached when the lower ones are touched again in every step.
+    schedule_cursor: usize,
     /// The groups whose pass of sending ran since the last step of waking.
-    pub passed: u64,
+    pub passed: GroupSet,
     /// The service is asked for a step of departure or of waking.
     pub cleanup_wanted: bool,
     pub wake_wanted: bool,
@@ -365,6 +396,7 @@ impl Net {
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
+            rt::bss::fill(addr_of_mut!((*at).departing_long), LongSession::default());
             addr_of_mut!((*at).key).write(key);
             Demux::initialize_at(addr_of_mut!((*at).demux), &demux_key);
             addr_of_mut!((*at).parent).write(Some(Handle::borrowed(parent.raw())));
@@ -386,14 +418,19 @@ impl Net {
 
     /// The smoltcp socket for place `i`.
     fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> Sh {
-        let base = self.pool[i].as_mut_ptr();
-        // SAFETY: the pool's chunk `i` belongs to the socket of place `i`
-        // alone, which is removed before the place is free; the pool lives
+        let size = buffer_of(i);
+        let base = if i < FULL_PLACES {
+            self.pool_full[i].as_mut_ptr()
+        } else {
+            self.pool_small[i - FULL_PLACES].as_mut_ptr()
+        };
+        // SAFETY: the pool's chunk of place `i` belongs to the socket of place
+        // `i` alone, which is removed before the place is free; the pool lives
         // as long as the service.
         let (rx, tx) = unsafe {
             (
-                core::slice::from_raw_parts_mut(base, BUFFER),
-                core::slice::from_raw_parts_mut(base.add(BUFFER), BUFFER),
+                core::slice::from_raw_parts_mut(base, size),
+                core::slice::from_raw_parts_mut(base.add(size), size),
             )
         };
         match proto {
@@ -515,6 +552,8 @@ impl Net {
             }
             stack.drop_socket(handle);
         }
+        self.chains.unlink(i);
+        self.connected.unlink(i);
         self.socks[i] = Sock::EMPTY;
         if let Some(key) = sock.key {
             self.demux.remove(&key);
@@ -538,19 +577,45 @@ impl Net {
     }
 
     /// The bindings the registry compares a new bind with.
-    pub fn bindings(&self, skip: usize) -> impl Iterator<Item = Binding> + '_ {
-        (0..SOCKETS_MAX).filter_map(move |i| {
-            let s = &self.socks[i];
-            let live = matches!(self.places.state(i), State::Live | State::Orphan);
-            (i != skip && live && s.bound).then_some(Binding {
-                proto: s.proto,
-                address: s.address,
-                port: s.port,
-                listening: s.listening,
-                connected: s.conn != Conn::None,
-                reuse: s.reuse,
+    pub fn bindings(
+        &self,
+        port: u16,
+        skip: usize,
+        with_connected: bool,
+    ) -> impl Iterator<Item = Binding> + '_ {
+        let connected = with_connected.then(|| self.connected.chain(port));
+        self.chains
+            .chain(port)
+            .chain(connected.into_iter().flatten())
+            .filter_map(move |i| {
+                let s = &self.socks[i];
+                let live = matches!(self.places.state(i), State::Live | State::Orphan);
+                (i != skip && live && s.bound).then_some(Binding {
+                    proto: s.proto,
+                    address: s.address,
+                    port: s.port,
+                    listening: s.listening,
+                    connected: s.conn != Conn::None,
+                    reuse: s.reuse,
+                })
             })
-        })
+    }
+
+    /// Puts the bound place `i` in the chain of its port that its state asks
+    /// for: connected and not listening, or the other.
+    pub fn rechain(&mut self, i: usize) {
+        let s = &self.socks[i];
+        if !s.bound {
+            return;
+        }
+        let port = s.port;
+        if s.conn != Conn::None && !s.listening {
+            self.chains.unlink(i);
+            self.connected.link(i, port);
+        } else {
+            self.connected.unlink(i);
+            self.chains.link(i, port);
+        }
     }
 
     /// An ephemeral port for a connection from `local` to `remote`, held in
@@ -568,7 +633,7 @@ impl Net {
             Proto::Tcp => &self.tcp_ports,
             Proto::Udp => &self.udp_ports,
         };
-        let port = netd::ports::ephemeral(offset, counter, |p| !map.held(p))?;
+        let port = netd::ports::ephemeral(offset, counter, map)?;
         self.ports(proto).hold(port);
         Some(port)
     }
@@ -720,19 +785,23 @@ impl Net {
     // ----- the sessions that went -----
 
     /// A session that went (or a clone that was never taken) lets go of its
-    /// descriptions in steps. True when a step of departure is due.
-    pub fn depart(&mut self, stack: &mut Stack<'static>, held: Held) -> bool {
-        if held.count() == 0 {
+    /// operations and its descriptions in steps. True when a step of
+    /// departure is due.
+    pub fn depart(&mut self, stack: &mut Stack<'static>, held: Held, long: LongSession) -> bool {
+        if held.count() == 0 && long.is_empty() {
             return false;
         }
         let free = (0..DEPARTING).find(|&n| self.departing_used[n / 64] >> (n % 64) & 1 == 0);
         match free {
             Some(n) => {
                 self.departing[n] = held;
+                self.departing_long[n] = long;
                 self.departing_used[n / 64] |= 1 << (n % 64);
                 true
             }
             None => {
+                let mut long = long;
+                while self.release_ops(&mut long) {}
                 let mut held = held;
                 while let Some(i) = held.next(0) {
                     held.remove(i);
@@ -743,10 +812,34 @@ impl Net {
         }
     }
 
-    /// One step of departure: at most GONE_PORTION places let go of, the
-    /// descriptions of the sessions that went and the members of the queues
-    /// of closed listening descriptions. True when more are left.
+    /// One step of departure: at most ABANDON_PORTION operations of the
+    /// sessions that went let go of, then at most GONE_PORTION places, the
+    /// descriptions of those sessions and the members of the queues of closed
+    /// listening descriptions. True when more are left.
     pub fn depart_step(&mut self, stack: &mut Stack<'static>) -> bool {
+        let mut ops_left = netd::ring::ABANDON_PORTION;
+        'operations: for word in 0..self.departing_used.len() {
+            let mut bits = self.departing_used[word];
+            while bits != 0 {
+                if ops_left == 0 {
+                    break 'operations;
+                }
+                let n = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let mut long = core::mem::take(&mut self.departing_long[n]);
+                while ops_left > 0 && !long.is_empty() {
+                    let Some(key) = self.ops.first(&long) else {
+                        break;
+                    };
+                    if let Some(idx) = op_index(key) {
+                        self.forget_op(idx);
+                    }
+                    self.ops.gone_some(&mut long, 1);
+                    ops_left -= 1;
+                }
+                self.departing_long[n] = long;
+            }
+        }
         let mut left = GONE_PORTION;
         'entries: for word in 0..self.departing_used.len() {
             while self.departing_used[word] != 0 {
@@ -754,6 +847,10 @@ impl Net {
                     break 'entries;
                 }
                 let n = word * 64 + self.departing_used[word].trailing_zeros() as usize;
+                if !self.departing_long[n].is_empty() {
+                    // Its operations are not all let go of: the places wait.
+                    break 'entries;
+                }
                 match self.departing[n].next(0) {
                     Some(i) => {
                         self.departing[n].remove(i);
@@ -847,6 +944,7 @@ impl Net {
                         proto_net::REFUSED
                     };
                     self.socks[i].conn = Conn::None;
+                    self.rechain(i);
                     self.connecting.clear(i);
                 }
                 _ => {
@@ -855,6 +953,7 @@ impl Net {
                         t.set_keep_alive(Some(duration(KEEPALIVE_NS)));
                     }
                     self.socks[i].conn = Conn::Done;
+                    self.rechain(i);
                     self.connecting.clear(i);
                 }
             }
@@ -957,19 +1056,13 @@ impl Net {
     /// The group of place `i` has work for the next pass of sending, and its
     /// operations are looked at by the next step of waking.
     pub fn touch(&mut self, i: usize) {
-        let bit = 1u64 << (i / GROUP);
-        self.due |= bit;
-        self.touched |= bit;
+        self.due.set(i / GROUP);
+        self.touched.set(i / GROUP);
     }
 
     /// Every group has work: an address changed or a neighbour answered.
     pub fn touch_all(&mut self) {
-        let all = if GROUPS == 64 {
-            u64::MAX
-        } else {
-            (1u64 << GROUPS) - 1
-        };
-        self.due |= all;
+        self.due.set_below(GROUPS);
     }
 
     /// Gives the key to the socket of place `i` in the table of destinations.
@@ -1087,18 +1180,29 @@ impl Net {
         // An aborted stream is let go of by the step of departure once its RST
         // has really gone out (smoltcp forgets the connection after the
         // single RST): the pass of its group is the time to look.
-        let mut passed = core::mem::take(&mut self.passed);
-        while passed != 0 && self.rst_wait.next(0).is_some() {
-            let g = passed.trailing_zeros() as usize;
-            passed &= passed - 1;
-            if (g * GROUP..(g + 1) * GROUP).any(|i| self.rst_wait.has(i)) {
-                self.cleanup_wanted = true;
+        let passed = self.passed.take();
+        if self.rst_wait.next(0).is_some() {
+            let mut at = 0;
+            while let Some(g) = passed.next(at) {
+                at = g + 1;
+                if (g * GROUP..(g + 1) * GROUP).any(|i| self.rst_wait.has(i)) {
+                    self.cleanup_wanted = true;
+                    break;
+                }
             }
         }
-        let mut groups = core::mem::take(&mut self.touched);
-        while groups != 0 {
-            let g = groups.trailing_zeros() as usize;
-            groups &= groups - 1;
+        // At most SCHEDULE_GROUPS groups in a step: a burst of requests touches
+        // every group, and the walk over all of them in one step took 13 500
+        // ticks at 1 280 places. The rest wait for the next step.
+        let mut left = SCHEDULE_GROUPS;
+        while let Some(g) = self.touched.next_wrapping(self.schedule_cursor) {
+            if left == 0 {
+                self.step_due = true;
+                break;
+            }
+            left -= 1;
+            self.schedule_cursor = g + 1;
+            self.touched.clear(g);
             for i in g * GROUP..(g + 1) * GROUP {
                 if self.attention.has(i) || self.connecting.has(i) {
                     self.wake_due.set(i);
@@ -1247,7 +1351,7 @@ impl Net {
                 Proto::Udp => sockets::DGRAM,
             },
             opt::ERROR => core::mem::take(&mut s.error),
-            opt::RCVBUF | opt::SNDBUF => BUFFER as u32,
+            opt::RCVBUF | opt::SNDBUF => buffer_of(i) as u32,
             opt::ACCEPTCONN => u32::from(s.listening),
             opt::DOMAIN => INET,
             opt::KEEPALIVE => u32::from(s.keepalive),

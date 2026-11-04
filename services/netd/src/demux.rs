@@ -15,10 +15,10 @@ use core::hash::Hasher;
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
 use core::hash::SipHasher;
 
-/// The places of the table: four times the sockets it must hold, so that
-/// the chains of linear probing stay short (at most 8 in the probe's runs,
-/// where 192 keys are in the table).
-pub const DEMUX_SLOTS: usize = 1024;
+/// The places of the table: six times the 1 280 sockets it must hold (one
+/// sixth full), so that the chains of linear probing stay short (at most 8
+/// in the probe's runs: with 4 096 places a chain of 9 came up).
+pub const DEMUX_SLOTS: usize = 8192;
 /// The longest chain a probe is allowed to find (acceptance).
 pub const PROBE_LIMIT: usize = 8;
 
@@ -228,7 +228,7 @@ mod tests {
         Key::Conn {
             local: [127, 0, 0, 1],
             local_port: 80,
-            remote: [127, 0, 0, 1],
+            remote: [127, 0, (i >> 16) as u8, 1],
             remote_port: 49152u16.wrapping_add(i as u16),
         }
     }
@@ -273,20 +273,21 @@ mod tests {
     }
 
     #[test]
-    fn two_hundred_fifty_six_keys_are_all_found() {
+    fn the_keys_of_all_the_sockets_are_found() {
         let mut t = Demux::new(&[9; 16]);
-        for i in 0..256 {
+        // 1 280 sockets with a key each: less than a third of the table.
+        for i in 0..1280 {
             assert!(t.insert(conn(i), i as usize), "{i}");
         }
-        for i in 256..512 {
-            assert!(t.insert(conn(i), i as usize), "{i}");
-        }
-        assert!(!t.insert(conn(1000), 0), "the table is full to its half");
-        for i in 0..256 {
+        for i in 0..1280 {
             assert_eq!(t.find(&conn(i)), Some(i as usize));
         }
-        // Half full is the worst case; the runs of the probe hold half that.
-        assert!(t.probe_max <= 2 * PROBE_LIMIT, "chain {}", t.probe_max);
+        assert!(t.probe_max <= PROBE_LIMIT, "chain {}", t.probe_max);
+        // The table takes keys up to its half and refuses past it.
+        for i in 1280..DEMUX_SLOTS as u32 / 2 {
+            assert!(t.insert(conn(i), i as usize), "{i}");
+        }
+        assert!(!t.insert(conn(5000), 0), "the table is full to its half");
     }
 
     #[test]

@@ -10,6 +10,10 @@
 //! stack to them are in `frame_rx`);
 //! sending: `fixed_tx + e * group + k * frame_tx` for e groups and k frames;
 //!
+//! where the price of a frame is the larger of the price of a frame of the
+//! loopback and that of a frame of the wire (stage P4a-1: a frame of the wire
+//! has its sums checked or made over up to 1 514 bytes);
+//!
 //! and no term has the number of sockets in it. A step may take 0.85 of the
 //! bound of 0.9 of term B (18 369 ticks under -icount): the 15 percent cover
 //! the worst parts meeting in one step and the spread between builds.
@@ -38,18 +42,31 @@ pub struct Parts {
     pub fixed_tx: u64,
     pub frame_rx: u64,
     pub frame_tx: u64,
+    pub frame_rx_wire: u64,
+    pub frame_tx_wire: u64,
     pub group: u64,
 }
 
 impl Parts {
+    /// The price of a received frame: the larger of the loopback's and the
+    /// wire's.
+    pub fn rx_price(&self) -> u64 {
+        self.frame_rx.max(self.frame_rx_wire)
+    }
+
+    /// The price of a sent frame.
+    pub fn tx_price(&self) -> u64 {
+        self.frame_tx.max(self.frame_tx_wire)
+    }
+
     /// The estimate of a step of receiving of k frames.
     pub fn receiving(&self, frames: usize) -> u64 {
-        self.fixed_rx + frames as u64 * self.frame_rx
+        self.fixed_rx + frames as u64 * self.rx_price()
     }
 
     /// The estimate of a step of sending of e groups and k frames.
     pub fn sending(&self, groups: usize, frames: usize) -> u64 {
-        self.fixed_tx + groups as u64 * self.group + frames as u64 * self.frame_tx
+        self.fixed_tx + groups as u64 * self.group + frames as u64 * self.tx_price()
     }
 }
 
@@ -110,6 +127,8 @@ mod tests {
             fixed_tx,
             frame_rx: rx,
             frame_tx: tx,
+            frame_rx_wire: 0,
+            frame_tx_wire: 0,
             group,
         }
     }
@@ -180,6 +199,23 @@ mod tests {
         // The sending step is past it.
         let s = parts(1_000, 13_000, 500, 1_500, 1_500);
         assert_eq!(choose(&s).unwrap_err().sending, 16_000);
+    }
+
+    #[test]
+    fn a_dearer_frame_of_the_wire_sets_the_price() {
+        let mut p = parts(2_000, 4_000, 500, 400, 1_000);
+        assert_eq!(choose(&p).unwrap().receive, 16);
+        p.frame_rx_wire = 3_000;
+        p.frame_tx_wire = 2_500;
+        assert_eq!(p.rx_price(), 3_000);
+        assert_eq!(p.tx_price(), 2_500);
+        assert_eq!(p.receiving(4), 14_000);
+        let c = choose(&p).unwrap();
+        assert_eq!(c.receive, 4);
+        assert_eq!(c.send, 2);
+        // The cheaper wire frame leaves the loopback's price in force.
+        p.frame_rx_wire = 100;
+        assert_eq!(p.rx_price(), 500);
     }
 
     #[test]

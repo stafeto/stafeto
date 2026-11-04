@@ -83,37 +83,91 @@ pub fn offset(
     (hash.finish() % u64::from(EPHEMERAL_COUNT)) as u32
 }
 
-/// The first free port of the candidates, None after TRIES.
-pub fn ephemeral(offset: u32, counter: u32, free: impl Fn(u16) -> bool) -> Option<u16> {
-    (0..TRIES)
-        .map(|i| candidate(offset, counter, i))
-        .find(|&port| free(port))
+/// The port of the choice for a connection: the first free of the TRIES
+/// candidates (RFC 6056, algorithm 3), and then the first free port after the
+/// last candidate, found a word of the bitmap at a time (at most 256 words,
+/// whatever the number of sockets). None only when the whole range is held.
+pub fn ephemeral(offset: u32, counter: u32, map: &PortMap) -> Option<u16> {
+    for i in 0..TRIES {
+        let port = candidate(offset, counter, i);
+        if !map.held(port) {
+            return Some(port);
+        }
+    }
+    let after = offset.wrapping_add(counter).wrapping_add(TRIES) % EPHEMERAL_COUNT;
+    map.first_free_from(after)
+        .map(|n| EPHEMERAL_FIRST + n as u16)
 }
 
 /// How many sockets hold each port of one protocol. With a count, a socket
 /// that lets go of a port subtracts one, where a bit would need a walk over
-/// the table (which would put the number of sockets into a step).
+/// the table (which would put the number of sockets into a step). The ports
+/// of the ephemeral range are also a bit each, set while the count is not
+/// zero, for the search of a free one.
 pub struct PortMap {
     held: [u16; 65536],
+    used: [u64; EPHEMERAL_WORDS],
 }
+
+const EPHEMERAL_WORDS: usize = EPHEMERAL_COUNT as usize / 64;
 
 impl PortMap {
     pub const fn new() -> PortMap {
-        PortMap { held: [0; 65536] }
+        PortMap {
+            held: [0; 65536],
+            used: [0; EPHEMERAL_WORDS],
+        }
     }
 
     pub fn held(&self, port: u16) -> bool {
         self.held[usize::from(port)] > 0
     }
 
+    fn mark(&mut self, port: u16, on: bool) {
+        if port >= EPHEMERAL_FIRST && u32::from(port - EPHEMERAL_FIRST) < EPHEMERAL_COUNT {
+            let n = usize::from(port - EPHEMERAL_FIRST);
+            if on {
+                self.used[n / 64] |= 1 << (n % 64);
+            } else {
+                self.used[n / 64] &= !(1 << (n % 64));
+            }
+        }
+    }
+
     pub fn hold(&mut self, port: u16) {
         let n = &mut self.held[usize::from(port)];
+        let first = *n == 0;
         *n = n.saturating_add(1);
+        if first {
+            self.mark(port, true);
+        }
     }
 
     pub fn release(&mut self, port: u16) {
         let n = &mut self.held[usize::from(port)];
         *n = n.saturating_sub(1);
+        if *n == 0 {
+            self.mark(port, false);
+        }
+    }
+
+    /// The index in the ephemeral range of the first port that is free at or
+    /// after `from`, going round the end of the range.
+    pub fn first_free_from(&self, from: u32) -> Option<u32> {
+        let start = (from % EPHEMERAL_COUNT) as usize;
+        for step in 0..=EPHEMERAL_WORDS {
+            let word = (start / 64 + step) % EPHEMERAL_WORDS;
+            let mut free = !self.used[word];
+            if step == 0 {
+                free &= !0u64 << (start % 64);
+            } else if step == EPHEMERAL_WORDS {
+                free &= !(!0u64 << (start % 64));
+            }
+            if free != 0 {
+                return Some((word * 64) as u32 + free.trailing_zeros());
+            }
+        }
+        None
     }
 }
 
@@ -202,21 +256,48 @@ mod tests {
         assert!(a < EPHEMERAL_COUNT);
     }
 
+    fn held_map(ports: impl IntoIterator<Item = u16>) -> PortMap {
+        let mut map = PortMap::new();
+        for p in ports {
+            map.hold(p);
+        }
+        map
+    }
+
     #[test]
     fn ports_come_from_the_ephemeral_range_and_skip_the_held_ones() {
-        let first = ephemeral(100, 0, |_| true).unwrap();
+        let map = PortMap::new();
+        let first = ephemeral(100, 0, &map).unwrap();
         assert_eq!(first, EPHEMERAL_FIRST + 100);
         // The counter moves the choice by one.
-        assert_eq!(ephemeral(100, 1, |_| true), Some(first + 1));
+        assert_eq!(ephemeral(100, 1, &map), Some(first + 1));
         // A held candidate is skipped.
-        assert_eq!(ephemeral(100, 0, |p| p != first), Some(first + 1));
+        assert_eq!(ephemeral(100, 0, &held_map([first])), Some(first + 1));
         // The range wraps.
-        let last = ephemeral(EPHEMERAL_COUNT - 1, 0, |_| true).unwrap();
+        let last = ephemeral(EPHEMERAL_COUNT - 1, 0, &map).unwrap();
         assert_eq!(last, 65535);
-        assert_eq!(ephemeral(EPHEMERAL_COUNT - 1, 1, |_| true), Some(49152));
-        // 64 held candidates in a row end the choice.
-        assert_eq!(ephemeral(5, 0, |p| p >= EPHEMERAL_FIRST + 69), None);
-        assert!(ephemeral(5, 0, |p| p >= EPHEMERAL_FIRST + 68).is_some());
+        assert_eq!(ephemeral(EPHEMERAL_COUNT - 1, 1, &map), Some(49152));
+    }
+
+    #[test]
+    fn a_block_of_held_ports_longer_than_the_candidates_is_passed() {
+        // 500 ports in a row held, the choice starts inside the block.
+        let block = held_map(EPHEMERAL_FIRST + 10..EPHEMERAL_FIRST + 510);
+        assert_eq!(
+            ephemeral(20, 0, &block),
+            Some(EPHEMERAL_FIRST + 510),
+            "the first free port after the candidates"
+        );
+        // A block that ends the range goes round to its start.
+        let end = held_map(EPHEMERAL_FIRST + 16000..=65535);
+        assert_eq!(ephemeral(16100, 0, &end), Some(EPHEMERAL_FIRST));
+        // Released ports are free again.
+        let mut map = held_map(EPHEMERAL_FIRST..EPHEMERAL_FIRST + 200);
+        map.release(EPHEMERAL_FIRST + 150);
+        assert_eq!(ephemeral(0, 0, &map), Some(EPHEMERAL_FIRST + 150));
+        // Only the whole range held refuses.
+        let all = held_map(EPHEMERAL_FIRST..=65535);
+        assert_eq!(ephemeral(7, 0, &all), None);
     }
 
     #[test]

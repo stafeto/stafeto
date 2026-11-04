@@ -225,6 +225,10 @@ const IDLE: &str = "net-probe: idle ok";
 const LISTENERS: &str = "net-probe: listeners ok";
 const TIMERS_PREFIX: &str = "net-probe: timers ok";
 const WIRE_PREFIX: &str = "net-probe: wire ok 150";
+const WIRE_ECHO_READY: &str = "net-probe: wire echo ready 7000";
+const WIRE_ECHO_OK: &str = "net-probe: wire echo ok 2000";
+const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
+const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -246,6 +250,8 @@ pub const STEP_MAX: u64 = TERM_B * 9 / 10;
 pub const PORTION_MAX: u64 = TERM_B * 8 / 10;
 /// The kinds of steps: CLONE, and the service's own steps.
 const CLONE_KIND: usize = 19;
+const CLONE_MORE_KIND: usize = 20;
+const ABANDON_KIND: usize = 18;
 const OWN_KIND: usize = 65;
 
 /// How the interface got its address.
@@ -268,6 +274,9 @@ pub struct Roles {
     pub listeners: bool,
     pub timers: bool,
     pub wire: bool,
+    pub wire_echo: bool,
+    pub clone_many: bool,
+    pub abandon_many: bool,
 }
 
 impl Roles {
@@ -281,6 +290,9 @@ impl Roles {
         listeners: false,
         timers: false,
         wire: false,
+        wire_echo: false,
+        clone_many: false,
+        abandon_many: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -324,6 +336,18 @@ impl Roles {
     };
     pub const WIRE: Roles = Roles {
         wire: true,
+        ..Roles::NONE
+    };
+    pub const WIRE_ECHO: Roles = Roles {
+        wire_echo: true,
+        ..Roles::NONE
+    };
+    pub const CLONE_MANY: Roles = Roles {
+        clone_many: true,
+        ..Roles::NONE
+    };
+    pub const ABANDON_MANY: Roles = Roles {
+        abandon_many: true,
         ..Roles::NONE
     };
 }
@@ -455,6 +479,16 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     if roles.wire && !lines.iter().any(|l| l.starts_with(WIRE_PREFIX)) {
         return Err(format!("no line {WIRE_PREFIX:?}"));
     }
+    if roles.wire_echo {
+        once.push((WIRE_ECHO_READY, 1));
+        once.push((WIRE_ECHO_OK, 1));
+    }
+    if roles.clone_many {
+        once.push((CLONE_OK, 1));
+    }
+    if roles.abandon_many {
+        once.push((ABANDON_OK, 1));
+    }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
     }
@@ -574,7 +608,10 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
             "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
         ));
     }
-    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+    if let Some(row) = rows
+        .iter()
+        .find(|r| (r.0 == CLONE_KIND || r.0 == CLONE_MORE_KIND) && r.1 > PORTION_MAX)
+    {
         return Err(format!(
             "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
         ));
@@ -606,7 +643,10 @@ pub fn traffic_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, Strin
             "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
         ));
     }
-    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+    if let Some(row) = rows
+        .iter()
+        .find(|r| (r.0 == CLONE_KIND || r.0 == CLONE_MORE_KIND) && r.1 > PORTION_MAX)
+    {
         return Err(format!(
             "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
         ));
@@ -790,7 +830,7 @@ type Rows = (&'static str, Vec<(usize, u64, u64)>);
 /// (the batch and the groups per step).
 fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageProgram], Roles)> {
     vec![
-        ("s256", measured_programs(None, netd), Roles::LIMIT),
+        ("s1280", measured_programs(None, netd), Roles::LIMIT),
         (
             "s8",
             measured_programs(Some("net-sockets-8"), netd),
@@ -823,7 +863,108 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             Roles::TIMERS,
         ),
         ("u", measured_programs(Some("net-wire"), netd), Roles::WIRE),
+        (
+            "C",
+            measured_programs(Some("net-clone"), netd),
+            Roles::CLONE_MANY,
+        ),
+        (
+            "A",
+            measured_programs(Some("net-abandon"), netd),
+            Roles::ABANDON_MANY,
+        ),
     ]
+}
+
+/// The datagrams the host sends in a burst before it reads their echoes
+/// (the socket of the guest keeps 16).
+const WIRE_BURST: usize = 8;
+const WIRE_DATAGRAMS: usize = 2_000;
+const WIRE_SIZE: usize = 1_472;
+/// What the guest sends back of each datagram (DATA_MAX of the protocol).
+const WIRE_ECHOED: usize = 800;
+
+/// The run of role `W` under -icount: the host sends 2 000 datagrams of
+/// 1 472 bytes through a forwarded UDP port, in bursts of eight, and reads the
+/// first 800 bytes of each back. The lines the machine printed.
+fn wire_echo_lines(
+    machine: &qemu::Machine,
+    name: &'static str,
+    programs: &'static [ImageProgram],
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    use std::net::UdpSocket;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("udp socket: {e}"))?;
+    // The forwarded port must differ from the socket the host reads on.
+    let forwarded = {
+        let probe = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("udp socket: {e}"))?;
+        probe
+            .local_addr()
+            .map_err(|e| format!("udp address: {e}"))?
+            .port()
+    };
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::net(&[qemu::Forward {
+        proto: qemu::Proto::Udp,
+        host: forwarded,
+        guest: 7000,
+    }]));
+    cmd.args(["-icount", "shift=4,sleep=on"]);
+    let mut run = Run::start(cmd, Input::Null)?;
+    let long = crate::BOOT_TIMEOUT * 20;
+    let target: std::net::SocketAddr = ([127, 0, 0, 1], forwarded).into();
+    let sent = (|| {
+        run.expect_line("the echo socket", |l| l == WIRE_ECHO_READY, long)?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|e| format!("udp timeout: {e}"))?;
+        let mut datagram = [0u8; WIRE_SIZE];
+        let mut back = [0u8; WIRE_SIZE];
+        let mut sent = 0;
+        while sent < WIRE_DATAGRAMS {
+            let burst = WIRE_BURST.min(WIRE_DATAGRAMS - sent);
+            for k in 0..burst {
+                let n = (sent + k) as u32;
+                for (i, b) in datagram.iter_mut().enumerate() {
+                    *b = (n as usize).wrapping_mul(31).wrapping_add(i) as u8;
+                }
+                socket
+                    .send_to(&datagram, target)
+                    .map_err(|e| format!("udp send: {e}"))?;
+            }
+            for k in 0..burst {
+                let n = (sent + k) as u32;
+                let (got, _) = socket
+                    .recv_from(&mut back)
+                    .map_err(|e| format!("no echo of datagram {n}: {e}"))?;
+                if got != WIRE_ECHOED {
+                    return Err(format!("the echo of datagram {n} has {got} bytes"));
+                }
+                let first = (n as usize).wrapping_mul(31) as u8;
+                if back[0] != first {
+                    return Err(format!("the echo of datagram {n} is another datagram's"));
+                }
+            }
+            sent += burst;
+        }
+        run.expect_line(
+            "the end of the client",
+            |l| l.starts_with(ENDED_PREFIX),
+            long,
+        )?;
+        Ok::<(), String>(())
+    })();
+    let output = run.stop();
+    sent.map_err(|e| format!("net-probe wire echo on {} ({name}): {e}", machine.name))?;
+    if strict {
+        verdict(&output.lines, Mode::Dhcp, Roles::WIRE_ECHO)
+            .map_err(|e| format!("net-probe wire echo on {} ({name}): {e}", machine.name))?;
+        crate::check_waits(&output.lines, &[NET_TAG], "net-probe")?;
+    }
+    Ok(output.lines)
 }
 
 /// The acceptance of the step (reports/2026-11-04-net-p1a): every row of
@@ -853,6 +994,20 @@ fn acceptance(
         print_rows(machine, &format!("{tag} run {what}"), &rows);
         all.push((what, rows));
     }
+    let lines = wire_echo_lines(
+        machine,
+        measured_name(&format!("{tag}-W")),
+        measured_programs(Some("net-wire-echo"), netd),
+        strict,
+    )?;
+    let rows = longest_over_starts(&lines);
+    let rows = if strict {
+        steps_verdict_rows(&rows).map_err(|e| format!("run W: {e}"))?
+    } else {
+        rows
+    };
+    print_rows(machine, &format!("{tag} run W"), &rows);
+    all.push(("W", rows));
     let own = |what: &str| {
         all.iter()
             .find(|(w, _)| *w == what)
@@ -860,18 +1015,18 @@ fn acceptance(
             .map(|(ticks, _)| ticks)
             .unwrap_or(0)
     };
-    if strict && !netd::choose::flat(own("s8"), own("s256")) {
+    if strict && !netd::choose::flat(own("s8"), own("s1280")) {
         return Err(format!(
             "the longest step is not even: {} ticks at 256 places, {} at 8 (the spread {} at most)",
-            own("s256"),
+            own("s1280"),
             own("s8"),
             netd::choose::FLATNESS
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {}, C {}, A {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
-        own("s256"),
+        own("s1280"),
         own("f"),
         own("a"),
         own("w"),
@@ -879,7 +1034,22 @@ fn acceptance(
         own("l"),
         own("r"),
         own("u"),
+        own("W"),
+        own("C"),
+        own("A"),
         netd::choose::FLATNESS
+    );
+    let kind = |run: &str, kind: usize| {
+        all.iter()
+            .find(|(w, _)| *w == run)
+            .and_then(|(_, rows)| step_of(rows, kind))
+            .map_or(0, |(ticks, _)| ticks)
+    };
+    println!(
+        "net-probe: CLONE of 64 {}, CLONE_MORE of 64 {} (portion bound {PORTION_MAX}), ABANDON of 4 of 16 operations {}",
+        kind("C", CLONE_KIND),
+        kind("C", CLONE_MORE_KIND),
+        kind("A", ABANDON_KIND)
     );
     Ok(all)
 }
@@ -926,6 +1096,8 @@ fn split_parts(lines: &[String]) -> Option<netd::choose::Parts> {
         fixed_tx: p90("fixed_tx")?,
         frame_rx: p90("frame_rx")?,
         frame_tx: p90("frame_tx")?,
+        frame_rx_wire: p90("frame_rx_wire")?,
+        frame_tx_wire: p90("frame_tx_wire")?,
         group: p90("group")?,
     })
 }
@@ -936,8 +1108,8 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
     let lines = steps_lines(
         machine,
         measured_name("split"),
-        measured_programs(Some("net-sockets-256"), &["split"]),
-        Roles::places(SOCKETS_LIMIT),
+        measured_programs(None, &["split"]),
+        Roles::LIMIT,
         false,
     )?;
     let parts = split_parts(&lines).ok_or("no breakdown of the steps in the lines")?;
@@ -949,6 +1121,24 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
         netd::choose::BUDGET
     );
     print_rows(machine, "split image", &longest_over_starts(&lines));
+    let wire = steps_lines(
+        machine,
+        measured_name("split-wire"),
+        measured_programs(Some("net-wire"), &["split"]),
+        Roles::WIRE,
+        false,
+    )?;
+    let echo = wire_echo_lines(
+        machine,
+        measured_name("split-wire-echo"),
+        measured_programs(Some("net-wire-echo"), &["split"]),
+        false,
+    )?;
+    for (what, lines) in [("ping", &wire), ("echo", &echo)] {
+        for line in lines.iter().filter(|l| l.starts_with("net: split ")) {
+            println!("net-probe on {} ({what}): {line}", machine.name);
+        }
+    }
     Ok(())
 }
 
@@ -960,12 +1150,12 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
 /// `netd::ring`; the command fails when the code has other numbers.
 pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     use netd::choose;
-    let split_programs = measured_programs(Some("net-sockets-256"), &["split"]);
+    let split_programs = measured_programs(None, &["split"]);
     let lines = steps_lines(
         machine,
         measured_name("split"),
         split_programs,
-        Roles::places(SOCKETS_LIMIT),
+        Roles::LIMIT,
         false,
     )?;
     for line in lines
@@ -977,9 +1167,11 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     }
     let mut parts = split_parts(&lines).ok_or("no breakdown of the step in the lines")?;
     println!("net-probe: the parts of the step, p90 ticks: {parts:?}");
-    // The frames of the loop carry no sums; the frames of the wire do. The
-    // image of the role `u` sends and takes frames of 1 514 bytes, and the
-    // dearer of the two prices is the price of a frame.
+    // The frames of the loop carry no sums; the frames of the wire do. Two
+    // images measure the frames of the wire: role `u` (echo requests that fill
+    // a frame, both ways) and role `W` (the host's datagrams of 1 514 bytes
+    // received and answered); the dearer 90th percentile of each side is the
+    // price of the wire.
     let wire_lines = steps_lines(
         machine,
         measured_name("split-wire"),
@@ -987,13 +1179,20 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
         Roles::WIRE,
         false,
     )?;
-    let wire = split_parts(&wire_lines).ok_or("no breakdown of the wire frames in the lines")?;
+    let echo_lines = wire_echo_lines(
+        machine,
+        measured_name("split-wire-echo"),
+        measured_programs(Some("net-wire-echo"), &["split"]),
+        false,
+    )?;
+    let by_ping = split_parts(&wire_lines).ok_or("no breakdown of the wire frames (ping)")?;
+    let by_echo = split_parts(&echo_lines).ok_or("no breakdown of the wire frames (echo)")?;
     println!(
-        "net-probe: the cost of a frame of the wire, p90 ticks: received {}, sent {}",
-        wire.frame_rx, wire.frame_tx
+        "net-probe: the cost of a frame of the wire, p90 ticks: received {} (ping) and {} (echo), sent {} (ping) and {} (echo)",
+        by_ping.frame_rx_wire, by_echo.frame_rx_wire, by_ping.frame_tx_wire, by_echo.frame_tx_wire
     );
-    parts.frame_rx = parts.frame_rx.max(wire.frame_rx);
-    parts.frame_tx = parts.frame_tx.max(wire.frame_tx);
+    parts.frame_rx_wire = by_ping.frame_rx_wire.max(by_echo.frame_rx_wire);
+    parts.frame_tx_wire = by_ping.frame_tx_wire.max(by_echo.frame_tx_wire);
     println!("net-probe: the parts the rule reads: {parts:?}");
     let choice = match choose::choose(&parts) {
         Ok(choice) => choice,
@@ -1121,11 +1320,23 @@ pub fn command(args: &[String]) -> Result<(), String> {
         let tag: &'static str = Box::leak(format!("r{receive}g{groups}s{send}").into_boxed_str());
         return acceptance(&qemu::VIRT, tag, features, false).map(|_| ());
     }
-    // `role NAME`: one run of the acceptance (s256, s8, f, a, w, i, l or r),
+    // `role NAME`: one run of the acceptance (s1280, s8, f, a, w, i, l or r),
     // judged; for the deliberate breakages.
     if let [first, name] = args
         && first == "role"
     {
+        if name == "W" {
+            let lines = wire_echo_lines(
+                &qemu::VIRT,
+                measured_name("role-W"),
+                measured_programs(Some("net-wire-echo"), &[]),
+                true,
+            )?;
+            let rows = steps_verdict_rows(&longest_over_starts(&lines))
+                .map_err(|e| format!("run W: {e}"))?;
+            print_rows(&qemu::VIRT, "role W", &rows);
+            return Ok(());
+        }
         let (what, programs, roles) = acceptance_runs(&[])
             .into_iter()
             .find(|(what, ..)| what == name)
@@ -1476,6 +1687,8 @@ mod tests {
             ("fixed_tx", 6000),
             ("frame_rx", 1800),
             ("frame_tx", 1500),
+            ("frame_rx_wire", 3100),
+            ("frame_tx_wire", 2900),
             ("group", 1300),
         ]
         .iter()
@@ -1488,8 +1701,9 @@ mod tests {
         assert_eq!(parts.fixed_rx, 5000);
         assert_eq!(parts.fixed_tx, 6000);
         assert_eq!(parts.group, 1300);
+        assert_eq!((parts.frame_rx_wire, parts.frame_tx_wire), (3100, 2900));
         assert!(netd::choose::choose(&parts).is_ok());
-        assert_eq!(split_parts(&lines[..3]), None, "a part is missing");
+        assert_eq!(split_parts(&lines[..6]), None, "a part is missing");
     }
 
     #[test]

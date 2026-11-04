@@ -319,7 +319,13 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
                 random_hint: false,
             },
             Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
-            Names::Net(n) => InheritedTarget::Ready(Target::Net(n)),
+            Names::Net {
+                description,
+                stream,
+            } => InheritedTarget::Ready(Target::Net(posix_fs::NetTarget {
+                description,
+                stream,
+            })),
             Names::Fifo {
                 packed,
                 ram_generation,
@@ -464,6 +470,11 @@ fn loaded_main() -> u64 {
             })
             .and_then(|()| posix_abi::allocation::init(process).map_err(|_| "heap failed"))
             .and_then(|()| adopt_map(&area))
+            // The descriptors that lie beyond the table's own numbers wait for
+            // the heap to give the pages of the table.
+            .and_then(|()| {
+                posix_abi::shared::place_late().map_err(|_| "descriptors beyond the table failed")
+            })
             .and_then(|()| {
                 let _ = posix_abi::clock::attach_page(posix_abi::allocation::process());
                 posix_abi::threads::init(Handle::from_raw(thread)).map_err(|_| "threads failed")

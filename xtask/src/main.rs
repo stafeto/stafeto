@@ -61,6 +61,7 @@ mod ostest;
 mod packages;
 mod pci_walk;
 mod posix_display;
+mod posix_net;
 mod qemu;
 mod ring;
 mod rootfs;
@@ -89,6 +90,10 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a child of the test init (tests/child), which its loader
 /// maps (rt::loader).
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The stack of the probe of the RAM service: the startup list of the layer's
+/// files (`posix_fs::Late`) and its checks of the table of descriptors need
+/// more than a child's.
+const RAMFS_PROBE_STACK_SIZE: u32 = 32 * 1024;
 /// The main stack of a POSIX program: its requests on its files run on its
 /// own stack, under the lock of the layer, with no file worker.
 const POSIX_STACK_SIZE: u32 = 64 * 1024;
@@ -189,7 +194,7 @@ const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
-    ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
+    ("ramfs-probe", "ramfs-probe", RAMFS_PROBE_STACK_SIZE, &[]),
 ];
 const POSIX_FILES_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-files"]),
@@ -1676,6 +1681,9 @@ commands:
             once through a forwarded port, UDP goes both ways, `net-sock` runs
             its checks in the guest, a new `httpd` takes the same port; with
             `steps` the service counts its steps with real traffic (TCG only)
+  posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
+            descriptors, 1 000 sockets, a fork and an exec with many
+            descriptors; with `steps` the service counts its steps (TCG only)
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the
@@ -1940,6 +1948,7 @@ fn main() {
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
+        Some("posix-net") => posix_net::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -3775,7 +3784,7 @@ fn relibc_hello_probe() -> Result<(), String> {
     // stand in front of it.
     qemu::expect_line_end(
         &outcome,
-        "end_badly: hello.c:454: Assertion `how == NULL` failed.",
+        "end_badly: hello.c:457: Assertion `how == NULL` failed.",
     )?;
     println!("relibc C-program guest probe passed");
     Ok(())
@@ -8814,6 +8823,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("net-wget", || {
             net_wget::probe(&qemu::VIRT, net_wget::Mode::Normal)
         }),
+        // The descriptors and sockets of a process that serves many: 1 024
+        // descriptors, 1 000 sockets, a fork and an exec with many of them.
+        // Also in the group `net`.
+        job("posix-net", || posix_net::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

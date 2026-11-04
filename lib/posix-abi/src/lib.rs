@@ -171,6 +171,10 @@ pub fn error(error: FsError) -> c_int {
         FsError::FileTooLarge => EFBIG,
         FsError::FileSizeLimit => FILE_SIZE_REFUSAL,
         FsError::TooManyOpenFiles => EMFILE,
+        // A call that can allocate a number asks for the page first
+        // (`shared::page_error`) and goes again when the page is wanted; a
+        // call that does not is told EMFILE.
+        FsError::NeedPage(_) => EMFILE,
         FsError::NotSeekable => ESPIPE,
         FsError::OffsetOverflow => EOVERFLOW,
         FsError::NoData => ENXIO,
@@ -471,10 +475,10 @@ pub fn pipe2(flags: c_int) -> Result<[c_int; 2], c_int> {
         Ok(files.transport())
     })?;
     let (read, write) = pipes::create(transport, flags & O_NONBLOCK != 0)?;
-    let inserted = shared::with_files(|files| {
+    let inserted = shared::growing(|files| {
         files
             .insert_pipe(read, write, descriptor_flags(flags))
-            .map_err(error)
+            .map_err(shared::page_error)
     });
     match inserted {
         Ok((read, write)) => Ok([read as c_int, write as c_int]),
@@ -519,7 +523,7 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             };
             Ok(Some((flags & 3) as c_int | append))
         }
-        posix_fs::Target::Net(description) => net::status_flags(description, set).map(Some),
+        posix_fs::Target::Net(net) => net::status_flags(net.description, set).map(Some),
         // A file or directory of /proc is read only.
         posix_fs::Target::Proc(_) => Ok(Some(0)),
         _ => Ok(None),

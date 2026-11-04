@@ -21,6 +21,9 @@ struct FileCell(core::cell::UnsafeCell<core::mem::MaybeUninit<PosixFs>>);
 // SAFETY: FILES_BUSY admits one native owner; its guard drops the initialized table.
 unsafe impl Sync for FileCell {}
 static FILES: FileCell = FileCell(core::cell::UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+#[repr(C, align(4096))]
+struct Pages([[u8; posix_fs::DESCRIPTOR_PAGE_BYTES]; posix_fs::DESCRIPTOR_PAGES]);
+static mut PAGES: Pages = Pages([[0; posix_fs::DESCRIPTOR_PAGE_BYTES]; posix_fs::DESCRIPTOR_PAGES]);
 static FILES_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 struct NativeFiles;
 impl NativeFiles {
@@ -32,12 +35,32 @@ impl NativeFiles {
         let result = StartupFiles::connect(parent, false).and_then(|startup| {
             // SAFETY: this guard owns the allocation exclusively and keeps it pinned.
             unsafe {
-                PosixFs::initialize_at((*FILES.0.get()).as_mut_ptr(), startup, b"/", None, false)
+                PosixFs::initialize_at(
+                    (*FILES.0.get()).as_mut_ptr(),
+                    startup,
+                    b"/",
+                    None,
+                    false,
+                    &mut posix_fs::Late::new(),
+                )
             }
         });
         if let Err(error) = result {
             FILES_BUSY.store(false, Ordering::Release);
             return Err(error);
+        }
+        // The pages of the table of descriptors beyond its own numbers: the
+        // guard owns them for as long as it owns the table.
+        for k in 0..posix_fs::DESCRIPTOR_PAGES {
+            // SAFETY: each page is 4096 aligned bytes of the static, given once
+            // to the table of this guard, which is the only user.
+            let page = unsafe { (&raw mut PAGES.0[k]).cast::<u8>() };
+            // SAFETY: as above; the table zeroes nothing it does not own.
+            unsafe {
+                (*FILES.0.get())
+                    .assume_init_mut()
+                    .add_page(k, core::ptr::NonNull::new_unchecked(page));
+            }
         }
         Ok(Self)
     }
@@ -72,7 +95,7 @@ fn alias_clone_list(
     exact: posix_fs::RamTarget,
 ) -> Result<rt::fs::PreparedOpen, &'static str> {
     let mut kept = [held; posix_fs::KEPT_BY_FORK_MAX];
-    if native.kept_by_fork(&mut kept) != 1 || kept[0] != exact.prepared() {
+    if native.kept_by_fork(&mut kept) != Ok(1) || kept[0] != exact.prepared() {
         return Err("exact alias clone list");
     }
     Ok(kept[0])
@@ -189,8 +212,16 @@ fn check_initialization(
         let startup =
             StartupFiles::connect(parent, false).map_err(|_| "error fixture transports")?;
         // SAFETY: the startup-only allocation is aligned, exclusive and uninitialized.
-        if unsafe { PosixFs::initialize_at(destination, startup, cwd, list, false) }
-            != Err(expected)
+        if unsafe {
+            PosixFs::initialize_at(
+                destination,
+                startup,
+                cwd,
+                list,
+                false,
+                &mut posix_fs::Late::new(),
+            )
+        } != Err(expected)
         {
             return Err("initialization error result");
         }
@@ -270,8 +301,16 @@ fn check_exact_imports(
                 .write_bytes(0xa5, core::mem::size_of::<PosixFs>())
         };
         // SAFETY: the allocation is aligned, exclusive and retains no initialized fields.
-        if unsafe { PosixFs::initialize_at(destination, startup, b"/", Some(&list), false) }
-            != Err(expected)
+        if unsafe {
+            PosixFs::initialize_at(
+                destination,
+                startup,
+                b"/",
+                Some(&list),
+                false,
+                &mut posix_fs::Late::new(),
+            )
+        } != Err(expected)
         {
             return Err("last import failure");
         }
@@ -305,6 +344,7 @@ fn check_exact_imports(
             b"/",
             Some(&list),
             false,
+            &mut posix_fs::Late::new(),
         )
     }
     .map_err(|_| "alias import initialization")?;

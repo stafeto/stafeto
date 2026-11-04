@@ -13,10 +13,12 @@ use rt::abi::{Error, Rights};
 use rt::handle::{Channel, Handle, Timer};
 use rt::sys;
 
-/// The descriptions one poll or select takes: the whole table of descriptors.
+/// The descriptions one poll or select takes on the direct path: the holds of
+/// the table (each entry of a poll holds its description while the poll waits).
 /// A Watch of a service takes `watch::MAX` of them at most, so a poll splits its
 /// set into several Watches of the same service (as it does for the terminal).
-pub const MAX: usize = posix_fs::OPEN_MAX;
+pub const POLL_INLINE: usize = posix_fs::HOLDS_MAX;
+pub const MAX: usize = POLL_INLINE;
 const LIMIT: usize = MAX;
 const _: () = assert!(LIMIT >= watch::MAX);
 
@@ -411,7 +413,7 @@ fn run(
             Some(Target::Net(description)) => {
                 let at = 6 + (subscriptions[6].set.len + subscriptions[7].set.len) / watch::MAX;
                 subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
-                subscriptions[at].add(*description, requested, index);
+                subscriptions[at].add(description.description, requested, index);
             }
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}

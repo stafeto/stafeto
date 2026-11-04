@@ -34,11 +34,13 @@ use smoltcp::wire::{
 
 /// The places of one set of sockets.
 pub const GROUP: usize = 4;
+/// The groups the walk over the deadlines looks at in one step.
+pub const DEADLINE_CHECKS: usize = 64;
 /// The sets of the descriptions' sockets, and the room for their storage.
 pub const GROUPS: usize = netd::places::SOCKETS_LIMIT / GROUP;
 const _: () = assert!(netd::places::SOCKETS_LIMIT.is_multiple_of(GROUP));
-// A set of groups is a bit each in a word.
-const _: () = assert!(GROUPS <= 64);
+/// A set of groups: a bit each, in as many words as the groups need.
+pub type GroupSet = netd::groups::GroupMask<{ GROUPS.div_ceil(64) }>;
 const _: () = assert!(netd::places::SOCKETS_LIMIT <= netd::places::SOCKETS_MAX);
 /// The sockets of the service itself: the DHCP client and the ICMP socket.
 const SERVICE_SLOTS: usize = 2;
@@ -46,7 +48,7 @@ const SERVICE_SLOTS: usize = 2;
 /// A socket of a description: the set it is in and its handle there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sh {
-    pub group: u8,
+    pub group: u16,
     pub handle: SocketHandle,
 }
 
@@ -156,6 +158,10 @@ pub struct Stack<'a> {
     /// The least of the deadlines of the groups (u64::MAX for none): the walk
     /// over them is made only once it has come.
     earliest: u64,
+    /// The walk over the deadlines goes DEADLINE_CHECKS groups a step: where
+    /// it goes on, and the least deadline seen in the sweep so far.
+    sweep_cursor: usize,
+    sweep_min: u64,
     /// The service's set has work: a frame for it, a PING, a new address.
     pub service_due: bool,
     /// The service's set was passed or took a frame since `take_service_ran`.
@@ -234,6 +240,8 @@ impl<'a> Stack<'a> {
             group_at: [None; GROUPS + 1],
             cursor: 0,
             earliest: u64::MAX,
+            sweep_cursor: 0,
+            sweep_min: u64::MAX,
             service_due: true,
             service_ran: false,
             lease: None,
@@ -289,9 +297,9 @@ impl<'a> Stack<'a> {
         &mut self,
         now_ns: u64,
         device: &mut NetDevice,
-        due: &mut u64,
-        touched: &mut u64,
-        passed: &mut u64,
+        due: &mut GroupSet,
+        touched: &mut GroupSet,
+        passed: &mut GroupSet,
     ) {
         let now = instant(now_ns);
         // The service's set only when it has work.
@@ -302,30 +310,39 @@ impl<'a> Stack<'a> {
             let _ = self.iface.poll_egress(now, device, &mut self.service);
             self.group_at[GROUPS] = Self::deadline(self.iface.poll_at(now, &self.service));
         }
-        // The walk over the deadlines of the groups only when one has come.
+        // The walk over the deadlines of the groups only when one has come, and
+        // DEADLINE_CHECKS groups of it in a step (the cursor goes on in the
+        // next step, which the timer of the earliest deadline, now, asks for).
         if now_ns >= self.earliest {
-            let mut earliest = u64::MAX;
-            for (g, at) in self.group_at[..GROUPS].iter_mut().enumerate() {
-                match *at {
+            let end = (self.sweep_cursor + DEADLINE_CHECKS).min(GROUPS);
+            for g in self.sweep_cursor..end {
+                match self.group_at[g] {
                     Some(t) if t <= now_ns => {
-                        *due |= 1 << g;
-                        *at = None;
+                        due.set(g);
+                        self.group_at[g] = None;
                     }
-                    Some(t) => earliest = earliest.min(t),
+                    Some(t) => self.sweep_min = self.sweep_min.min(t),
                     None => {}
                 }
             }
-            self.earliest = earliest;
+            if end == GROUPS {
+                self.sweep_cursor = 0;
+                self.earliest = core::mem::replace(&mut self.sweep_min, u64::MAX);
+            } else {
+                self.sweep_cursor = end;
+                self.earliest = now_ns;
+            }
         }
         let mut ran = 0;
-        let mut seen = 0;
-        while ran < EGRESS_GROUPS && seen < GROUPS && *due != 0 && device.tx.can_send() {
-            let g = self.cursor % GROUPS;
+        // The next group that is due from the cursor, found a word at a time,
+        // so that the step costs the groups it passes and not the groups of
+        // the table.
+        while ran < EGRESS_GROUPS && device.tx.can_send() {
+            let from = self.cursor % GROUPS;
+            let Some(g) = due.next(from).or_else(|| due.next(0)) else {
+                break;
+            };
             self.cursor = g + 1;
-            seen += 1;
-            if *due >> g & 1 == 0 {
-                continue;
-            }
             ran += 1;
             let began = split::now();
             let tx_before = split::get(&split::TX);
@@ -339,16 +356,16 @@ impl<'a> Stack<'a> {
                 spent.saturating_sub(split::get(&split::TX) - tx_before),
             );
             split::add(&split::PASSES, spent);
-            *touched |= 1 << g;
-            *passed |= 1 << g;
-            *due &= !(1 << g);
+            touched.set(g);
+            passed.set(g);
+            due.clear(g);
             self.group_at[g] = match at {
                 // Work now: another pass when it sent something and the share
                 // is not spent; a group with nothing to send waits a
                 // millisecond, as the timer of the service would.
                 Some(at) if at <= now_ns => {
                     if sent > 0 {
-                        *due |= 1 << g;
+                        due.set(g);
                         Some(at)
                     } else {
                         Some(now_ns + 1_000_000)
@@ -358,6 +375,7 @@ impl<'a> Stack<'a> {
             };
             if let Some(t) = self.group_at[g] {
                 self.earliest = self.earliest.min(t);
+                self.sweep_min = self.sweep_min.min(t);
             }
         }
     }
@@ -397,7 +415,7 @@ impl<'a> Stack<'a> {
             tcp::SocketBuffer::new(tx),
         ));
         Sh {
-            group: group as u8,
+            group: group as u16,
             handle,
         }
     }
@@ -413,7 +431,7 @@ impl<'a> Stack<'a> {
         let group = place / GROUP;
         let handle = self.groups[group].add(udp::Socket::new(rx, tx));
         Sh {
-            group: group as u8,
+            group: group as u16,
             handle,
         }
     }
@@ -564,6 +582,7 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         // (an echo reply, a reset, an unreachable) costs two frames and
         // takes the whole step: first in the step it ends the receiving,
         // later it waits for the next step.
+        let wire = device.held_is_wire();
         let answered = device.held_is_answered(dest, place.is_some());
         if answered && !first {
             device.defer_held();
@@ -591,7 +610,11 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
         }
         let spent = split::now() - began;
         split::record(
-            split::FRAME_RX,
+            if wire {
+                split::FRAME_RX_WIRE
+            } else {
+                split::FRAME_RX
+            },
             spent.saturating_sub(split::get(&split::TX) - sent),
         );
         split::add(&split::RX_TURNS, spent);

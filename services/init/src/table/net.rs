@@ -78,15 +78,14 @@ pub const NETD: Record = Record {
     priority: 35,
     ceiling: 35,
     // The worst case, by the formula of the stage (reports/2026-11-04-net-p1a):
-    // the pages of `.data` and `.bss` of the release build (the pool of
-    // buffers is 2 048 of them), the whole stack of 32 pages and 16 for the
-    // rest. `.bss` 9 156 865 bytes = 2 236 pages (the second device's
-    // interface, queues and books are in it), `.data` none: 2 236 + 32 + 16.
-    // The kernel does not charge the pages of `.bss` to the quota in the
-    // probe's runs (the table filled to 256 places passes with 32 pages and
-    // fails to start with 24, where the page tables of the mappings do not
-    // fit), so the number is a bound that the measurement does not reach.
-    quota: 2284 * PAGE,
+    // the pages of `.data` and `.bss` of the release build (the pools of
+    // buffers are 4 096 of them: 256 places of 32 KiB and 1 024 of 8 KiB),
+    // the whole stack of 48 pages and 16 for the rest. `.bss` 19 236 829 bytes
+    // = 4 697 pages (the second device's interface, queues and books are in
+    // it), `.data` none: 4 697 + 48 + 16. The kernel does not charge the pages
+    // of `.bss` to the quota in the probe's runs, so the number is a bound
+    // that the measurement does not reach.
+    quota: 4761 * PAGE,
     // 128 operations' handles of notification, the notary session, the page
     // of generations, and a reserve.
     handle_limit: 192,
@@ -358,7 +357,8 @@ pub const NETD_TWO: Record = Record {
 /// service, `a` every group of sockets with work at once, `w` sixteen and
 /// then 128 operations told by one datagram, `i` 150 s of idle, `l` a queue of
 /// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
-/// fill a frame, `k` CRASH of the service and the same as `c` through a new
+/// fill a frame, `W` the host's datagrams of full frames echoed, `C` CLONE and CLONE_MORE of
+/// 1 000 descriptions, `A` ABANDON of 16 operations, `k` CRASH of the service and the same as `c` through a new
 /// session. The images of the measurement of the steps (`net-sockets-N`) run
 /// `s` at 8, 64 and 256 places; the others at the limit of the sockets the
 /// service serves (netd::places::SOCKETS_LIMIT, which a test of xtask
@@ -379,6 +379,12 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"cwk"
 } else if cfg!(feature = "net-wire") {
     b"cuk"
+} else if cfg!(feature = "net-wire-echo") {
+    b"cWk"
+} else if cfg!(feature = "net-clone") {
+    b"cCk"
+} else if cfg!(feature = "net-abandon") {
+    b"cAk"
 } else if cfg!(feature = "net-idle") {
     b"cik"
 } else if cfg!(feature = "net-listen") {
@@ -386,7 +392,7 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
 } else if cfg!(feature = "net-timers") {
     b"crk"
 } else {
-    b"cbs256k"
+    b"cbs1280k"
 };
 
 /// The probe (tests/net-probe).

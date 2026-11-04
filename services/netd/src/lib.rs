@@ -9,11 +9,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod births;
+pub mod chains;
 pub mod choose;
 pub mod config;
 pub mod copy;
 pub mod demux;
 pub mod frames;
+pub mod groups;
 pub mod lines;
 pub mod pci;
 pub mod places;

@@ -125,6 +125,9 @@ pub const BLOCK_MAX: usize = HEADER + 2 * PATH_MAX + DESCRIPTORS * DESCRIPTOR + 
 /// number u32, what it names u32 (`Names`) and the service's number of its
 /// open description u32.
 pub const DESCRIPTORS: usize = 64;
+/// The numbers a descriptor of a block may have: below the layer's table
+/// (`posix_fs::OPEN_MAX`), 1 024.
+pub const FD_MAX: usize = 1024;
 pub const DESCRIPTOR: usize = 28;
 
 /// What a descriptor of a block names.
@@ -142,8 +145,12 @@ pub enum Names {
     Pipe(u32),
     /// The socket description of this number in the session of the network
     /// service the child gets, which holds it. The loader takes the kind
-    /// only with a session in the slot Net.
-    Net(u32),
+    /// only with a session in the slot Net. `stream` tells a stream socket
+    /// from a datagram socket.
+    Net {
+        description: u32,
+        stream: bool,
+    },
     /// The terminal of this number of the terminal service, which the
     /// child's session in the slot Terminal serves (5f); the loader takes
     /// the kind only with that session.
@@ -185,7 +192,10 @@ impl Descriptor {
             Names::Error => (2, 0, 0, 0),
             Names::File(n) => (3, n, 0, 0),
             Names::Pipe(n) => (4, n, 0, 0),
-            Names::Net(n) => (10, n, 0, 0),
+            Names::Net {
+                description,
+                stream,
+            } => (10, description, u64::from(stream), 0),
             Names::Terminal(n) => (5, n, 0, 0),
             Names::Random(n) => (6, n, 0, 0),
             Names::PendingTerminal(n) => (7, n, 0, 0),
@@ -216,7 +226,14 @@ impl Descriptor {
         let fd = word(0);
         let ram_generation = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let pipe_generation = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        if word(1) != 8 && word(1) != 9 && (ram_generation != 0 || pipe_generation != 0) {
+        if word(1) == 10 && ram_generation > 1 {
+            return None;
+        }
+        if word(1) != 8
+            && word(1) != 9
+            && !(word(1) == 10 && ram_generation <= 1)
+            && (ram_generation != 0 || pipe_generation != 0)
+        {
             return None;
         }
         if word(1) == 9 && pipe_generation != 0 {
@@ -228,7 +245,10 @@ impl Descriptor {
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
-            (10, n) => Names::Net(n),
+            (10, n) => Names::Net {
+                description: n,
+                stream: ram_generation == 1,
+            },
             (5, n) => Names::Terminal(n),
             (6, n) => Names::Random(n),
             (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
@@ -251,7 +271,7 @@ impl Descriptor {
             },
             _ => return None,
         };
-        ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
+        ((fd as usize) < FD_MAX).then_some(Descriptor { fd, names })
     }
 }
 /// The bytes of the header of a block.
@@ -570,7 +590,7 @@ impl<'a> Block<'a> {
                     Names::File(_) | Names::Random(_) | Names::Fifo { .. }
                 ) | (Slot::Entropy, Names::Random(_))
                     | (Slot::Pipes, Names::Pipe(_) | Names::Fifo { .. })
-                    | (Slot::Net, Names::Net(_))
+                    | (Slot::Net, Names::Net { .. })
                     | (
                         Slot::Terminal,
                         Names::Terminal(_) | Names::PendingTerminal(_)
@@ -752,13 +772,14 @@ impl<'a> Block<'a> {
         let at = HEADER + path_len + cwd_len;
         let descriptors = &bytes[at..at + DESCRIPTOR * count];
         let strings = &bytes[at + DESCRIPTOR * count..];
-        let mut seen = 0u64;
+        let mut seen = [0u64; FD_MAX / 64];
         for chunk in descriptors.as_chunks::<DESCRIPTOR>().0 {
             let d = Descriptor::read(chunk).ok_or(BlockError::Malformed)?;
-            if seen & 1 << d.fd != 0 {
+            let (word, bit) = (d.fd as usize / 64, 1u64 << (d.fd % 64));
+            if seen[word] & bit != 0 {
                 return Err(BlockError::Malformed);
             }
-            seen |= 1 << d.fd;
+            seen[word] |= bit;
         }
         let nuls = strings.iter().filter(|&&b| b == 0).count();
         let well_formed = !path.is_empty()
@@ -1818,7 +1839,10 @@ mod tests {
             },
             Descriptor {
                 fd: 8,
-                names: Names::Net(3),
+                names: Names::Net {
+                    description: 3,
+                    stream: true,
+                },
             },
             Descriptor {
                 fd: 7,
@@ -1880,11 +1904,14 @@ mod tests {
             "fd 0 twice"
         );
         let mut far = out[..len].to_vec();
-        far[at..at + 4].copy_from_slice(&64u32.to_le_bytes());
-        assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 64");
+        far[at..at + 4].copy_from_slice(&(FD_MAX as u32).to_le_bytes());
+        assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 1024");
         let mut last = out[..len].to_vec();
-        last[at..at + 4].copy_from_slice(&63u32.to_le_bytes());
-        assert!(Block::read(&last).is_ok(), "fd 63 is the last of the table");
+        last[at..at + 4].copy_from_slice(&(FD_MAX as u32 - 1).to_le_bytes());
+        assert!(
+            Block::read(&last).is_ok(),
+            "fd 1023 is the last of the table"
+        );
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
@@ -2076,11 +2103,37 @@ mod tests {
             let got = handle_slots(Reader::new(w.as_bytes()), half.len()).unwrap();
             assert_eq!(got.iter().flatten().count(), half.len());
         }
-        let d = Descriptor {
-            fd: 3,
-            names: Names::Net(0x1_2345),
+        for stream in [false, true] {
+            let d = Descriptor {
+                fd: 3,
+                names: Names::Net {
+                    description: 0x1_2345,
+                    stream,
+                },
+            };
+            assert_eq!(Descriptor::read(&d.bytes()), Some(d));
+        }
+        // A number up to 1 023 is carried; a stream word beyond 1 is refused.
+        let high = Descriptor {
+            fd: FD_MAX as u32 - 1,
+            names: Names::Output,
         };
-        assert_eq!(Descriptor::read(&d.bytes()), Some(d));
+        assert_eq!(Descriptor::read(&high.bytes()), Some(high));
+        let over = Descriptor {
+            fd: FD_MAX as u32,
+            names: Names::Output,
+        };
+        assert_eq!(Descriptor::read(&over.bytes()), None);
+        let mut odd = Descriptor {
+            fd: 3,
+            names: Names::Net {
+                description: 1,
+                stream: true,
+            },
+        }
+        .bytes();
+        odd[12] = 2;
+        assert_eq!(Descriptor::read(&odd), None);
     }
 
     /// Required sessions are declared independently of offered Handles.

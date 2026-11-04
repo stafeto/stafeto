@@ -12,7 +12,10 @@
 //! groups; `frame_rx` a received frame, from the ring to the stack's answer,
 //! without the frames the stack sent in it; `frame_tx` a frame sent; `group`
 //! the pass of sending over one group and its deadline, without the frames it
-//! sent; `kernel` the calls of the kernel at the end of the step.
+//! sent; `kernel` the calls of the kernel at the end of the step. The parts
+//! `frame_rx_wire` and `frame_tx_wire` are the frames of the wire (sums
+//! checked or made, up to 1 514 bytes), which `frame_rx` and `frame_tx` leave
+//! to the frames of the loopback.
 
 #[cfg(feature = "split")]
 mod on {
@@ -24,14 +27,23 @@ mod on {
     pub const FRAME_TX: usize = 2;
     pub const GROUP: usize = 3;
     pub const KERNEL: usize = 4;
-    const NAMES: [&str; 6] = [
-        "fixed_rx", "frame_rx", "frame_tx", "group", "kernel", "fixed_tx",
+    pub const FRAME_RX_WIRE: usize = 6;
+    pub const FRAME_TX_WIRE: usize = 7;
+    const NAMES: [&str; 8] = [
+        "fixed_rx",
+        "frame_rx",
+        "frame_tx",
+        "group",
+        "kernel",
+        "fixed_tx",
+        "frame_rx_wire",
+        "frame_tx_wire",
     ];
     const BUCKETS: usize = 64;
     const WIDTH: u64 = 256;
 
-    static HIST: [[AtomicU64; BUCKETS]; 6] = [const { [const { AtomicU64::new(0) }; BUCKETS] }; 6];
-    static MAX: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static HIST: [[AtomicU64; BUCKETS]; 8] = [const { [const { AtomicU64::new(0) }; BUCKETS] }; 8];
+    static MAX: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     /// The ticks of the frames sent in the step so far, of the frames
     /// received (the whole turn of the loop) and of the passes of groups
     /// (the whole pass).
@@ -110,6 +122,8 @@ mod off {
     pub const FRAME_TX: usize = 2;
     pub const GROUP: usize = 3;
     pub const KERNEL: usize = 4;
+    pub const FRAME_RX_WIRE: usize = 6;
+    pub const FRAME_TX_WIRE: usize = 7;
     pub static TX: AtomicU64 = AtomicU64::new(0);
     pub static RX_TURNS: AtomicU64 = AtomicU64::new(0);
     pub static PASSES: AtomicU64 = AtomicU64::new(0);

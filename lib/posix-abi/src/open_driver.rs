@@ -96,15 +96,29 @@ pub(crate) fn open(
         loop {
             // Binding and preparation retries run without a numeric reservation or defer.
             files.open_prepare_recover(recovery.job).map_err(protocol)?;
+            // The page of the table for the number the open will take is there
+            // before the reservation. Another thread may take that number
+            // meanwhile; the reservation then changes nothing, and the loop goes
+            // round to ask for the next page.
+            crate::shared::ensure_vacant_page();
             let defer = Defer::enter();
             let final_result = (|| {
-                let (entry, context) = crate::shared::with_files(|files| {
-                    let entry = files.reserve_open_record(claim).map_err(crate::error)?;
+                let reserved = crate::shared::with_files(|files| {
+                    let entry = files
+                        .reserve_open_record(claim)
+                        .map_err(crate::shared::page_error)?;
                     let context = files
                         .begin_open_finalize(claim, entry)
                         .map_err(crate::error)?;
                     Ok((entry, context))
-                })?;
+                });
+                let (entry, context) = match reserved {
+                    Err(code) if crate::shared::is_page_code(code) => {
+                        recovery.phase = Phase::Preparing;
+                        return Ok(FinalPhase::Prepared(Status::Ok));
+                    }
+                    other => other?,
+                };
                 recovery.phase = Phase::Committing;
                 let finished = match context.send_once() {
                     FinalizeResult::Finished(held) => Ok(held),
@@ -241,7 +255,7 @@ pub(crate) fn detach(owner: u64) -> bool {
         return false;
     };
     let notified = crate::shared::try_with_files(|files| {
-        let mut tokens = [None; posix_fs::OPEN_MAX];
+        let mut tokens = [None; posix_fd::JOBS_MAX];
         for (slot, token) in files.open_tokens().enumerate() {
             tokens[slot] = Some(token);
         }
@@ -319,10 +333,10 @@ pub(crate) fn help() {
                     snapshot.phase == OpenPhase::Canceling || snapshot.owner.is_none()
                 })
             })
-            .min_by_key(|token| (token.slot() + posix_fs::OPEN_MAX - cursor) % posix_fs::OPEN_MAX);
+            .min_by_key(|token| (token.slot() + posix_fd::JOBS_MAX - cursor) % posix_fd::JOBS_MAX);
         if let Some(token) = token {
             CURSOR.store(
-                (token.slot() + 1) % posix_fs::OPEN_MAX,
+                (token.slot() + 1) % posix_fd::JOBS_MAX,
                 core::sync::atomic::Ordering::Relaxed,
             );
         }

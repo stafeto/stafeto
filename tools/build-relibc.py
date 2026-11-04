@@ -147,7 +147,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # the socket closed on every path, getaddrinfo with EAI_AGAIN, EAI_FAIL and
 # EAI_NONAME as POSIX has them, name pointers followed backwards only, a name
 # with a label past 63 bytes refused at once; tagged pin-849c2f1b.
-COMMIT = "849c2f1bb345fd880a1ef1d9938a6c52aec46d79"
+# sysconf(_SC_OPEN_MAX) up to 1 024, the table of descriptors of the layer;
+# tagged pin-bb7e563d.
+COMMIT = "bb7e563d4bea7cacd354dc2e6438d3935253bfcd"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

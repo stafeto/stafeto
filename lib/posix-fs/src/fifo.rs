@@ -56,7 +56,7 @@ impl PosixFs {
             .map_err(FsError::from)
     }
     pub(crate) fn mark_fifo_io_jump(&mut self, owner: OwnerToken, target: Frame) {
-        let mut departing = [None; super::OPEN_MAX];
+        let mut departing = [None; super::HOLDS_MAX];
         for (index, token) in self.descriptors.io_tokens().enumerate() {
             if self.descriptors.io_snapshot(token).is_ok_and(|record| {
                 record.owner == owner

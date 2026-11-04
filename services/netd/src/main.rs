@@ -63,7 +63,9 @@ use proto_net::sockets;
 use proto_net::{Method, VERSION, code};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
-use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
+use rt::service::{
+    Answer, Config, Heartbeat, LongSession, Notice, Pending, Request, Service, Session,
+};
 use rt::{Handle, sys};
 use second::Second;
 use smoltcp::iface::SocketStorage;
@@ -881,7 +883,7 @@ impl Driver<'_> {
         // The DHCP client's set has a message to send after a frame of the
         // server (a request after an offer) that only a pass of sending
         // makes; without this step it would wait for the client's retry.
-        let sending = (self.net.due != 0 || self.stack.service_due) && self.tell(TX);
+        let sending = (self.net.due.any() || self.stack.service_due) && self.tell(TX);
         if !receiving && !sending {
             self.arm(now);
         }
@@ -1223,16 +1225,15 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. CLONE_MORE (20) and the methods of later stages (22 to 26) are
-/// UNKNOWN_METHOD.
+/// `probe`. The methods of later stages (22 to 26) are UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 30, 31, 62,
-    63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29, 30, 31,
+    62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1267,9 +1268,9 @@ impl Service<0> for Driver<'_> {
     /// let go of in steps.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
-        self.net.abandon(s);
         let held = core::mem::take(&mut s.data.held);
-        if self.net.depart(&mut self.stack, held) {
+        let long = core::mem::take(&mut s.data.long);
+        if self.net.depart(&mut self.stack, held, long) {
             self.cleanup();
         }
         self.net.step_due = true;
@@ -1280,7 +1281,9 @@ impl Service<0> for Driver<'_> {
     fn closed(&mut self, label: u64) {
         rt::service::step_own();
         if let Some(held) = self.net.unborn(label)
-            && self.net.depart(&mut self.stack, held)
+            && self
+                .net
+                .depart(&mut self.stack, held, LongSession::default())
         {
             self.cleanup();
         }

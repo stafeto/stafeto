@@ -37,7 +37,14 @@ pub fn read(parent: &Handle<Channel>) -> Result<Settings, Failure> {
     // SAFETY: FILES is aligned, writable and used by nobody else; the
     // table stays initialized for `write_resolv`.
     let initialized = unsafe {
-        PosixFs::initialize_at((*FILES.0.get()).as_mut_ptr(), startup, b"/", None, false)
+        PosixFs::initialize_at(
+            (*FILES.0.get()).as_mut_ptr(),
+            startup,
+            b"/",
+            None,
+            false,
+            &mut posix_fs::Late::new(),
+        )
     };
     initialized.map_err(Failure::Unreadable)?;
     // SAFETY: initialize_at succeeded, and no reference to the table

@@ -700,10 +700,28 @@ enum ShadowHold {
     Ordinary(posix_fs::Target),
     Fifo(posix_fd::IoToken, posix_fd::OwnerToken),
 }
+/// The places of the shadow: the descriptors the child starts with (at most
+/// `proto_loader::DESCRIPTORS`) and a few more that the file actions touch.
+const SHADOW_MAX: usize = proto_loader::DESCRIPTORS + 16;
+
+/// What the shadow knows of one descriptor: what it names for the child
+/// (None once an action closed it), the hold on the caller's description, and
+/// the token of a terminal an action opens.
+#[derive(Clone, Copy)]
+struct ShadowSlot {
+    fd: u32,
+    entry: Option<(posix_fs::Target, bool)>,
+    held: Option<ShadowHold>,
+    pending: Option<u32>,
+}
+
+/// The child's table is as sparse as the caller's: the descriptors without
+/// FD_CLOEXEC, and those an action touches (a descriptor an action closed
+/// stays as a slot with no entry, so that it is not read from the caller's
+/// table again).
 struct Shadow {
-    entries: [Option<(posix_fs::Target, bool)>; posix_fs::OPEN_MAX],
-    held: [Option<ShadowHold>; posix_fs::OPEN_MAX],
-    opened: [Option<u32>; posix_fs::OPEN_MAX],
+    slots: [Option<ShadowSlot>; SHADOW_MAX],
+    opened: [Option<u32>; SHADOW_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
     /// The creation mask the child starts with: the mode of a file an Open
@@ -712,7 +730,6 @@ struct Shadow {
     terminal_opens: [proto_loader::TerminalAction; proto_loader::TERMINAL_ACTIONS],
     terminal_count: usize,
     terminal_open_count: usize,
-    pending: [Option<u32>; posix_fs::OPEN_MAX],
     /// POSIX_SPAWN_RESETIDS with effective IDs that differ from the real
     /// ones: the child runs under the real IDs, and the actions of files and
     /// the search of PATH, which run here under the effective ones, check
@@ -723,13 +740,34 @@ struct Shadow {
     real_ids: bool,
 }
 
+/// Holds the description the descriptor `fd` names, for a request outside the
+/// lock: the target to use, and the hold to give back.
+fn hold_descriptor(
+    files: &mut posix_fs::PosixFs,
+    fd: u32,
+    owner: Option<posix_fd::OwnerToken>,
+    frame: entries::Frame,
+) -> Result<(posix_fs::Target, ShadowHold), i32> {
+    if matches!(files.target(fd), Ok(posix_fs::Target::Fifo(_))) {
+        let owner = owner.ok_or(crate::constants::EIO)?;
+        let (token, target) = files
+            .begin_fifo_io(owner, fd, frame)
+            .map_err(crate::error)?;
+        Ok((target, ShadowHold::Fifo(token, owner)))
+    } else {
+        let target = files.hold(fd).map_err(crate::error)?;
+        Ok((target, ShadowHold::Ordinary(target)))
+    }
+}
+
 impl Shadow {
-    /// The caller's table and current directory, its files held.
+    /// The caller's descriptors without FD_CLOEXEC and its current
+    /// directory, the files held. ENOMEM when more than the places there are
+    /// stay open across the exec or spawn.
     fn take() -> Result<Shadow, i32> {
         let mut shadow = Shadow {
-            entries: [None; posix_fs::OPEN_MAX],
-            held: [None; posix_fs::OPEN_MAX],
-            opened: [None; posix_fs::OPEN_MAX],
+            slots: [None; SHADOW_MAX],
+            opened: [None; SHADOW_MAX],
             cwd: [0; proto_loader::PATH_MAX],
             cwd_len: 0,
             umask: 0,
@@ -737,37 +775,37 @@ impl Shadow {
                 proto_loader::TERMINAL_ACTIONS],
             terminal_count: 0,
             terminal_open_count: 0,
-            pending: [None; posix_fs::OPEN_MAX],
             real_ids: false,
         };
-        let numbers = core::array::from_fn::<_, { posix_fs::OPEN_MAX }, _>(|fd| fd as u32);
         let owner = crate::relibc::open_owner()
             .ok()
             .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
         let frame = crate::change::frame();
-        let captured = crate::shared::with_descriptors(&numbers, |files| {
+        let captured = crate::shared::with_every_descriptor(|files| {
             // The snapshot goes into the shadow itself, and the loop below
             // holds each of its targets (no second table on the stack).
             for (fd, target, flags) in files.descriptors() {
-                shadow.entries[fd as usize] = Some((target, flags.close_on_exec));
-            }
-            for fd in 0..posix_fs::OPEN_MAX {
-                if let Some((_, close_on_exec)) = &shadow.entries[fd] {
-                    let close_on_exec = *close_on_exec;
-                    let (target, held) =
-                        if matches!(files.target(fd as u32), Ok(posix_fs::Target::Fifo(_))) {
-                            let owner = owner.ok_or(crate::constants::EIO)?;
-                            let (token, target) = files
-                                .begin_fifo_io(owner, fd as u32, frame)
-                                .map_err(crate::error)?;
-                            (target, ShadowHold::Fifo(token, owner))
-                        } else {
-                            let target = files.hold(fd as u32).map_err(crate::error)?;
-                            (target, ShadowHold::Ordinary(target))
-                        };
-                    shadow.held[fd] = Some(held);
-                    shadow.entries[fd] = Some((target, close_on_exec));
+                if flags.close_on_exec {
+                    continue;
                 }
+                shadow.slot_for(fd)?.entry = Some((target, false));
+            }
+            for at in 0..SHADOW_MAX {
+                let Some(slot) = shadow.slots[at].as_mut() else {
+                    continue;
+                };
+                // The holds of the table are fewer than the places of the shadow:
+                // a full table is the lack of room the caller is told of.
+                let (target, held) =
+                    hold_descriptor(files, slot.fd, owner, frame).map_err(|errno| {
+                        if errno == crate::constants::EMFILE {
+                            crate::constants::ENOMEM
+                        } else {
+                            errno
+                        }
+                    })?;
+                slot.held = Some(held);
+                slot.entry = Some((target, false));
             }
             let own = files.cwd();
             let n = own.len().min(shadow.cwd.len());
@@ -780,6 +818,87 @@ impl Shadow {
             return Err(error);
         }
         Ok(shadow)
+    }
+
+    fn find(&self, fd: u32) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.is_some_and(|slot| slot.fd == fd))
+    }
+
+    /// The slot of `fd`, made when it has none: ENOMEM when all the places
+    /// are taken.
+    fn slot_for(&mut self, fd: u32) -> Result<&mut ShadowSlot, i32> {
+        let at = match self.find(fd) {
+            Some(at) => at,
+            None => {
+                let at = self
+                    .slots
+                    .iter()
+                    .position(Option::is_none)
+                    .ok_or(crate::constants::ENOMEM)?;
+                self.slots[at] = Some(ShadowSlot {
+                    fd,
+                    entry: None,
+                    held: None,
+                    pending: None,
+                });
+                at
+            }
+        };
+        Ok(self.slots[at]
+            .as_mut()
+            .expect("the slot was just found or made"))
+    }
+
+    fn pending_of(&self, fd: u32) -> Option<u32> {
+        self.find(fd)
+            .and_then(|at| self.slots[at])
+            .and_then(|slot| slot.pending)
+    }
+
+    /// What `fd` names for the child, for an action that copies or reads it:
+    /// the shadow's entry, or, for a descriptor no action touched and the
+    /// caller opened with FD_CLOEXEC, the caller's own (held from here on).
+    /// EBADF for none.
+    fn source(&mut self, fd: u32) -> Result<(posix_fs::Target, bool), i32> {
+        use crate::constants::EBADF;
+        if let Some(at) = self.find(fd) {
+            return self.slots[at].and_then(|slot| slot.entry).ok_or(EBADF);
+        }
+        let owner = crate::relibc::open_owner()
+            .ok()
+            .and_then(|owner| posix_fd::OwnerToken::new(owner).ok());
+        let frame = crate::change::frame();
+        let (target, flags, held) = crate::shared::with_fd(fd, |files| {
+            let flags = files.descriptor_flags(fd).map_err(crate::error)?;
+            let (target, held) = hold_descriptor(files, fd, owner, frame)?;
+            Ok((target, flags, held))
+        })?;
+        match self.slot_for(fd) {
+            Ok(slot) => {
+                slot.entry = Some((target, flags.close_on_exec));
+                slot.held = Some(held);
+                Ok((target, flags.close_on_exec))
+            }
+            Err(error) => {
+                self.release(held);
+                Err(error)
+            }
+        }
+    }
+
+    /// Gives back one hold of the shadow.
+    fn release(&mut self, held: ShadowHold) {
+        match held {
+            ShadowHold::Fifo(token, owner) => crate::fifo_io::finish(token, owner),
+            ShadowHold::Ordinary(target) => {
+                let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
+                if let Ok(Some(target)) = release {
+                    let _ = crate::shared::release_target(target);
+                }
+            }
+        }
     }
 
     fn cwd(&self) -> &[u8] {
@@ -827,17 +946,20 @@ impl Shadow {
     /// action sequence, before any following Open takes effect.
     fn replace_entry(
         &mut self,
-        fd: usize,
+        fd: u32,
         entry: Option<(posix_fs::Target, bool)>,
         pending: Option<u32>,
     ) -> Result<(), i32> {
-        if let Some(token) = self.pending[fd]
+        // A descriptor not in the shadow that an action closes or replaces
+        // is entered, so that it is not read from the caller's table again.
+        self.slot_for(fd)?;
+        if let Some(token) = self.pending_of(fd)
             && pending != Some(token)
             && !self
-                .pending
+                .slots
                 .iter()
-                .enumerate()
-                .any(|(i, &p)| i != fd && p == Some(token))
+                .flatten()
+                .any(|slot| slot.fd != fd && slot.pending == Some(token))
         {
             if self.terminal_count == proto_loader::TERMINAL_ACTIONS {
                 return Err(crate::constants::EMFILE);
@@ -850,17 +972,18 @@ impl Shadow {
             };
             self.terminal_count += 1;
         }
-        self.entries[fd] = entry;
-        self.pending[fd] = pending;
+        let slot = self.slot_for(fd)?;
+        slot.entry = entry;
+        slot.pending = pending;
         Ok(())
     }
 
     /// One file action, in order ([P24-SPAWN]).
     fn apply(&mut self, action: FileAction<'_>) -> Result<(), i32> {
         use crate::constants::{EBADF, ENOTDIR};
-        let slot = |fd: u32| -> Result<usize, i32> {
+        let slot = |fd: u32| -> Result<u32, i32> {
             ((fd as usize) < posix_fs::OPEN_MAX)
-                .then_some(fd as usize)
+                .then_some(fd)
                 .ok_or(EBADF)
         };
         match action {
@@ -868,10 +991,10 @@ impl Shadow {
                 self.replace_entry(slot(fd)?, None, None)?;
             }
             FileAction::Dup2(fd, new) => {
-                let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
+                let (target, _) = self.source(slot(fd)?)?;
                 // The copy has no FD_CLOEXEC, and so has the descriptor
                 // dup2 names twice ([P24-SPAWN]).
-                self.replace_entry(slot(new)?, Some((target, false)), self.pending[slot(fd)?])?;
+                self.replace_entry(slot(new)?, Some((target, false)), self.pending_of(fd))?;
             }
             FileAction::Open {
                 fd,
@@ -928,8 +1051,9 @@ impl Shadow {
                     };
                     self.terminal_count += 1;
                     self.terminal_open_count += 1;
-                    self.entries[place] = Some((posix_fs::Target::Tty(0), flags & O_CLOEXEC != 0));
-                    self.pending[place] = Some(token);
+                    let slot = self.slot_for(place)?;
+                    slot.entry = Some((posix_fs::Target::Tty(0), flags & O_CLOEXEC != 0));
+                    slot.pending = Some(token);
                     return Ok(());
                 }
                 self.replace_entry(place, None, None)?;
@@ -953,7 +1077,8 @@ impl Shadow {
                     return Err(crate::constants::EMFILE);
                 };
                 *free = Some(own);
-                self.entries[place] = Some((target?, flags & crate::constants::O_CLOEXEC != 0));
+                let entry = (target?, flags & crate::constants::O_CLOEXEC != 0);
+                self.slot_for(place)?.entry = Some(entry);
             }
             FileAction::Chdir(path) => {
                 let mut full = [0; proto_loader::PATH_MAX];
@@ -967,7 +1092,7 @@ impl Shadow {
                 self.set_cwd(&canonical[..len]);
             }
             FileAction::Fchdir(fd) => {
-                let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
+                let (target, _) = self.source(slot(fd)?)?;
                 // The directory the descriptor names now, by the path the
                 // service gives it; a descriptor of another service is ENOTDIR.
                 let mut canonical = [0; crate::names::MAX_PATH + 1];
@@ -981,28 +1106,35 @@ impl Shadow {
         Ok(())
     }
 
-    /// The descriptors the child starts with: those without FD_CLOEXEC.
-    fn descriptors(&self) -> ([proto_loader::Descriptor; proto_loader::DESCRIPTORS], usize) {
+    /// The descriptors the child starts with: those without FD_CLOEXEC, in
+    /// the order of their numbers. ENOMEM when there are more than a block
+    /// carries.
+    fn descriptors(
+        &self,
+    ) -> Result<([proto_loader::Descriptor; proto_loader::DESCRIPTORS], usize), i32> {
         use proto_loader::{Descriptor, Names};
         let mut out = [Descriptor {
             fd: 0,
             names: Names::Input,
         }; proto_loader::DESCRIPTORS];
         let mut count = 0;
-        for (fd, entry) in self.entries.iter().enumerate() {
-            let Some((target, false)) = entry else {
+        for slot in self.slots.iter().flatten() {
+            let Some((target, false)) = slot.entry else {
                 continue;
             };
-            let names = if let Some(token) = self.pending[fd] {
+            let names = if let Some(token) = slot.pending {
                 Names::PendingTerminal(token)
             } else {
-                match *target {
+                match target {
                     posix_fs::Target::Input => Names::Input,
                     posix_fs::Target::Output => Names::Output,
                     posix_fs::Target::Error => Names::Error,
                     posix_fs::Target::Ram(n) => Names::File(n.fd()),
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
-                    posix_fs::Target::Net(n) => Names::Net(n),
+                    posix_fs::Target::Net(n) => Names::Net {
+                        description: n.description,
+                        stream: n.stream,
+                    },
                     posix_fs::Target::Fifo(n) => Names::Fifo {
                         packed: n.packed(),
                         ram_generation: n.ram_generation(),
@@ -1019,18 +1151,25 @@ impl Shadow {
                     posix_fs::Target::Proc(_) => continue,
                 }
             };
-            out[count] = Descriptor {
-                fd: fd as u32,
-                names,
-            };
+            // The child carries 64 at most (`proto_loader::DESCRIPTORS`).
+            *out.get_mut(count).ok_or(crate::constants::ENOMEM)? =
+                Descriptor { fd: slot.fd, names };
             count += 1;
         }
-        (out, count)
+        // In the order of the numbers (at most 64: an insertion sort).
+        for at in 1..count {
+            let mut k = at;
+            while k > 0 && out[k - 1].fd > out[k].fd {
+                out.swap(k - 1, k);
+                k -= 1;
+            }
+        }
+        Ok((out, count))
     }
 
-    fn shared_terminals(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
-        let (list, count) = self.descriptors();
-        let mut ids = [0; posix_fs::OPEN_MAX];
+    fn shared_terminals(&self) -> Result<([u32; proto_loader::DESCRIPTORS], usize), i32> {
+        let (list, count) = self.descriptors()?;
+        let mut ids = [0; proto_loader::DESCRIPTORS];
         let mut n = 0;
         for descriptor in &list[..count] {
             if let proto_loader::Names::Terminal(id) = descriptor.names
@@ -1041,25 +1180,39 @@ impl Shadow {
                 n += 1;
             }
         }
-        (ids, n)
+        Ok((ids, n))
     }
 
     /// The service's descriptions the child's session shares, each once.
-    fn shared(&self) -> impl Iterator<Item = rt::fs::PreparedOpen> + Clone + '_ {
-        (0..self.entries.len()).filter_map(move |index| {
-            let Some((target, false)) = self.entries[index] else { return None; };
-            let captured = target.ram_target()?.prepared();
-            let duplicate = self.entries[..index].iter().any(|entry| {
-                matches!(entry, Some((old, false)) if old.ram_target().is_some_and(|old| old.prepared() == captured))
-            });
-            (!duplicate).then_some(captured)
-        })
+    fn shared(&self) -> ([rt::fs::PreparedOpen; proto_loader::DESCRIPTORS], usize) {
+        let mut out = [rt::fs::PreparedOpen {
+            fd: 0,
+            slot: 0,
+            generation: 0,
+            random: false,
+        }; proto_loader::DESCRIPTORS];
+        let mut count = 0;
+        for slot in self.slots.iter().flatten() {
+            let Some((target, false)) = slot.entry else {
+                continue;
+            };
+            let Some(captured) = target.ram_target().map(|n| n.prepared()) else {
+                continue;
+            };
+            if !out[..count].contains(&captured) && count < out.len() {
+                out[count] = captured;
+                count += 1;
+            }
+        }
+        (out, count)
     }
 
     /// The ends of pipes the child's session shares, each once.
-    fn shared_pipes(&self) -> ([proto_pipe::Endpoint; posix_fs::OPEN_MAX], usize) {
-        let (list, count) = self.descriptors();
-        let mut ends = [proto_pipe::Endpoint::anonymous(0); posix_fs::OPEN_MAX];
+    fn shared_pipes(
+        &self,
+    ) -> Result<([proto_pipe::Endpoint; proto_loader::DESCRIPTORS], usize), i32> {
+        let (list, count) = self.descriptors()?;
+        let mut ends = [proto_pipe::Endpoint::anonymous(0); proto_loader::DESCRIPTORS];
         let mut found = 0;
         for d in &list[..count] {
             let endpoint = match d.names {
@@ -1080,37 +1233,31 @@ impl Shadow {
                 found += 1;
             }
         }
-        (ends, found)
+        Ok((ends, found))
     }
 
     /// The descriptions of sockets the child's session shares, each once.
-    fn shared_nets(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
-        let (list, count) = self.descriptors();
-        let mut out = [0; posix_fs::OPEN_MAX];
+    fn shared_nets(&self) -> Result<([u32; proto_loader::DESCRIPTORS], usize), i32> {
+        let (list, count) = self.descriptors()?;
+        let mut out = [0; proto_loader::DESCRIPTORS];
         let mut found = 0;
         for d in &list[..count] {
-            if let proto_loader::Names::Net(n) = d.names
-                && !out[..found].contains(&n)
+            if let proto_loader::Names::Net { description, .. } = d.names
+                && !out[..found].contains(&description)
             {
-                out[found] = n;
+                out[found] = description;
                 found += 1;
             }
         }
-        (out, found)
+        Ok((out, found))
     }
 
     /// The caller lets go: its holds end and the descriptors the actions
     /// opened close (the child's session keeps the descriptions it shares).
     fn finish(&mut self) {
-        for held in self.held.iter_mut().filter_map(Option::take) {
-            match held {
-                ShadowHold::Fifo(token, owner) => crate::fifo_io::finish(token, owner),
-                ShadowHold::Ordinary(target) => {
-                    let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
-                    if let Ok(Some(target)) = release {
-                        let _ = crate::shared::release_target(target);
-                    }
-                }
+        for at in 0..SHADOW_MAX {
+            if let Some(held) = self.slots[at].as_mut().and_then(|slot| slot.held.take()) {
+                self.release(held);
             }
         }
         for fd in self.opened.iter_mut().filter_map(Option::take) {
@@ -1297,7 +1444,7 @@ fn block<'s>(
     use crate::constants::{E2BIG, EINVAL, ENAMETOOLONG, ENOMEM};
     use proto_loader::{Block, BlockError};
     let cwd = shadow.cwd();
-    let (descriptors, count) = shadow.descriptors();
+    let (descriptors, count) = shadow.descriptors()?;
     let strings: usize = argv.clone().chain(envp.clone()).map(|s| s.len() + 1).sum();
     let len = Block::len(path.len(), cwd.len(), strings) + proto_loader::DESCRIPTOR * count;
     let pages = (len.min(proto_loader::BLOCK_MAX) as u64).next_multiple_of(4096);
@@ -1656,6 +1803,16 @@ fn exec_stopped<'s>(
         ExecSource::Path(path) => path,
         ExecSource::Descriptor(_) => b"/",
     };
+    // More descriptors stay open than a block carries: ENOMEM before any hold.
+    let staying = crate::shared::with_files(|files| {
+        Ok(files
+            .descriptors()
+            .filter(|(_, _, flags)| !flags.close_on_exec)
+            .count())
+    })?;
+    if staying > proto_loader::DESCRIPTORS {
+        return Err(crate::constants::ENOMEM);
+    }
     let mut shadow = Shadow::take()?;
     let carried = proto_loader::Carried {
         pending,
@@ -1877,18 +2034,31 @@ fn image_ready(
 /// Whether the Loader took them.
 fn move_files(c: &Handle<Channel>) -> bool {
     use proto_loader::Slot;
-    for fd in 0..posix_fs::OPEN_MAX as u32 {
-        let close_on_exec = crate::shared::with_files(|files| match files.descriptor_flags(fd) {
-            Ok(flags) => Ok(flags.close_on_exec),
-            Err(posix_fs::FsError::BadFileDescriptor) => Ok(false),
-            Err(error) => Err(crate::error(error)),
+    // One pass over the numbers in use (not the 1 024 a table may have).
+    let mut from = 0;
+    loop {
+        let found = crate::shared::with_files(|files| {
+            Ok(files.next_descriptor(from).map(|fd| {
+                let close_on_exec = match files.descriptor_flags(fd) {
+                    Ok(flags) => Ok(flags.close_on_exec),
+                    Err(posix_fs::FsError::BadFileDescriptor) => Ok(false),
+                    Err(error) => Err(crate::error(error)),
+                };
+                (fd, close_on_exec)
+            }))
         });
+        let (fd, close_on_exec) = match found {
+            Err(_) => return false,
+            Ok(None) => break,
+            Ok(Some(next)) => next,
+        };
         let Ok(close_on_exec) = close_on_exec else {
             return false;
         };
         if close_on_exec && crate::close(fd as i32).is_err() {
             return false;
         }
+        from = fd + 1;
     }
     // A stopped thread never ends the request it holds a description
     // for: a description whose last descriptor went meanwhile closes
@@ -1911,9 +2081,9 @@ fn move_files(c: &Handle<Channel>) -> bool {
         slot: 0,
         generation: 0,
         random: false,
-    }; posix_fs::OPEN_MAX];
+    }; posix_fs::INHERITED_MAX];
     let sessions = crate::shared::with_files(|files| {
-        let count = files.kept_by_exec(&mut kept);
+        let count = files.kept_by_exec(&mut kept).map_err(crate::error)?;
         let (channel, uart) = files.sessions();
         Ok((channel.raw(), uart.map(Handle::raw), count))
     });
@@ -2019,17 +2189,7 @@ fn commit(
         let (files, uart) = fs.sessions();
         Ok((files.raw(), uart.map(Handle::raw)))
     })?;
-    let mut kept = [rt::fs::PreparedOpen {
-        fd: 0,
-        slot: 0,
-        generation: 0,
-        random: false,
-    }; posix_fs::OPEN_MAX];
-    let mut count = 0;
-    for held in shadow.shared() {
-        kept[count] = held;
-        count += 1;
-    }
+    let (kept, count) = shadow.shared();
     let files = rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
         .map_err(clone_errno)?;
     let uart = match uart {
@@ -2048,7 +2208,7 @@ fn commit(
     let pipes = match crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
         Some(_) if NO_PIPES_SESSION.load(Ordering::Relaxed) => None,
         Some(pipes) => {
-            let (ends, count) = shadow.shared_pipes();
+            let (ends, count) = shadow.shared_pipes()?;
             Some(crate::fork::pipes_clone(pipes, &ends[..count])?)
         }
         None => None,
@@ -2057,7 +2217,7 @@ fn commit(
     // caller's.
     let terminal = match crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))? {
         Some(terminal) => {
-            let (ids, count) = shadow.shared_terminals();
+            let (ids, count) = shadow.shared_terminals()?;
             Some(crate::terminal::clone_kept(terminal, Some(&ids[..count]))?)
         }
         None => None,
@@ -2076,8 +2236,12 @@ fn commit(
     };
     let entropy = crate::fork::entropy_clone();
     let display = crate::display::clone_session();
-    let (nets, count) = shadow.shared_nets();
-    let net = crate::net::clone_kept(&nets[..count])?;
+    let (nets, count) = shadow.shared_nets()?;
+    // The child carries 64 descriptors at most: one portion.
+    let net = crate::net::clone_kept(|out| {
+        out[..count].copy_from_slice(&nets[..count]);
+        Ok((count, false))
+    })?;
     let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),

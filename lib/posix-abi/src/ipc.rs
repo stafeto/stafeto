@@ -409,11 +409,11 @@ pub fn mq_open(
         close_on_exec: cloexec,
         close_on_fork: false,
     };
-    let inserted = shared::with_files(|files| {
+    let inserted = shared::growing(|files| {
         files
             .insert(Target::Pipe(id), flags)
             .map(|fd| fd as i32)
-            .map_err(crate::error)
+            .map_err(shared::page_error)
     });
     if inserted.is_err() {
         let _ = transport.release(Some(Target::Pipe(id)));

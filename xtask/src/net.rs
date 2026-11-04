@@ -15,9 +15,11 @@ pub const IMAGE: &str = "boot-net.img";
 /// The stack of the network service. The frame of `main` holds the two
 /// queues of the device's crate (about 8 KiB each), the rings' books, the
 /// stack's interface and sockets, and the buffers of the start (the key, the
-/// file `netd.conf`): about 62 KiB in the release build. 128 KiB leaves the
-/// calls under it their room.
-pub const NETD_STACK_SIZE: u32 = 128 * 1024;
+/// file `netd.conf`): about 62 KiB in the release build at 256 places, more at
+/// 320 groups of sockets (1 280 places); the image of two devices ran out of
+/// 128 KiB inside the second device's queue. 192 KiB leaves the calls under it
+/// their room.
+pub const NETD_STACK_SIZE: u32 = 192 * 1024;
 
 /// The ports of the host forwarded to the guest: HTTP and SSH.
 pub const FORWARDS: [qemu::Forward; 2] = [

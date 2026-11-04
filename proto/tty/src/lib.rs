@@ -96,6 +96,10 @@ use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 pub const VERSION: u16 = 4;
 /// The side tag of an opaque open description.
 pub const MASTER: u32 = 1 << 31;
+/// The descriptions of the service in all, which a process keeps across a fork
+/// at most.
+pub const DESCRIPTIONS_MAX: usize = 256;
+
 /// The elements of one Watch of the service at most. A poll of more
 /// terminal descriptions makes several (`WATCH_GROUPS`), a step each.
 pub const WATCH_MAX: usize = 16;

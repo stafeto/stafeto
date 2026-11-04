@@ -34,9 +34,9 @@
 //! | SETOPT (15) | description, name, value (u32 each) | status |
 //! | NAME (16) | description, whose (u32: 0 own, 1 the peer's) | status, `Address` |
 //! | WATCH (17), WATCH_TAKE (28), WATCH_CANCEL (29) | `proto_wire::watch` | as the terminal service's |
-//! | ABANDON (18) | the header alone | status |
-//! | CLONE (19) | count (u32, 0..=64), descriptions | status, one handle: the new session |
-//! | CLONE_MORE (20) | taken, its body is a later stage's | UNKNOWN_METHOD |
+//! | ABANDON (18) | the header alone | status, how many of the session's long operations are left (u32); the caller asks again until 0 |
+//! | CLONE (19) | count (u32, 0..=64), descriptions | status, the birth (u32), one handle: the new session |
+//! | CLONE_MORE (20) | the birth (u32, CLONE's reply), count (u32, 1..=64), descriptions | status |
 //! | CANCEL (27) | k (u64) | long: CANCELLED |
 //! | CONFIG (21) | the header alone | status, `address` (an `Address`, port 0), the prefix length (u32), `gateway` and `dns` (an `Address` each, family 0 when absent), the MAC (6 bytes) and 2 zero bytes; NET_DOWN while there is no address |
 //! | PING (62) | an `Address` of port 0 | status, 4 zero bytes, the round-trip time (u64, nanoseconds); NET_DOWN, TIMEOUT after one second of the guest's time, LIMIT_REACHED for a second PING while the first waits |

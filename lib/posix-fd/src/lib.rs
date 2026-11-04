@@ -12,6 +12,8 @@
 
 #[cfg(test)]
 extern crate self as posix_fd;
+#[cfg(test)]
+extern crate std;
 
 mod io;
 pub use io::*;
@@ -24,6 +26,7 @@ pub use scalar::*;
 
 use core::{
     num::NonZeroU64,
+    ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -39,6 +42,9 @@ pub enum Error {
     TooManyOpenFiles,
     InvalidArgument,
     Io,
+    /// The number lies in the page `k` of entries, which the table does not
+    /// have yet: the caller maps a page, gives it to `add_page`, and asks again.
+    NeedPage(usize),
 }
 
 /// A caller-issued, nonreused lifetime. Detach precedes thread-place reuse.
@@ -199,6 +205,16 @@ struct EntrySlot<T> {
     generation: u64,
     state: EntryState<T>,
 }
+
+/// A page of `N` entries for the numbers `N` and above, in memory the caller
+/// maps (`Table::add_page`). Its size is `N` entries; the owner of the table
+/// checks that it fits the page it maps.
+pub struct EntryPage<T, const N: usize> {
+    slots: [EntrySlot<T>; N],
+}
+
+/// The words of the bitmap of the numbers in use: 1 024 numbers at most.
+const OCCUPIED_WORDS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct Hold<T> {
@@ -417,8 +433,22 @@ pub enum JobPlace {
     },
 }
 
-pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Copy = ()> {
+/// The table of descriptors. The numbers `0..N` lie in the table itself, the
+/// numbers `N..N * (1 + PAGES)` in `PAGES` pages of `N` entries each that the
+/// owner maps when a number asks for one (`Error::NeedPage`); the holds stay
+/// `N`. A bitmap names the numbers that are not empty, so that the walks
+/// visit those alone.
+pub struct Table<
+    T: Copy + Eq,
+    const N: usize,
+    R: Copy = (),
+    S: Copy = (),
+    C: Copy = (),
+    const PAGES: usize = 0,
+> {
     entries: [EntrySlot<T>; N],
+    pages: [Option<NonNull<EntryPage<T, N>>>; PAGES],
+    occupied: [u64; OCCUPIED_WORDS],
     holds: [HoldSlot<T, R, S, C>; N],
     /// All job kinds retain custody while every ordinary I/O hold is occupied.
     residents: [HoldSlot<T, R, S, C>; JOBS_MAX],
@@ -437,13 +467,18 @@ pub struct Table<T: Copy + Eq, const N: usize, R: Copy = (), S: Copy = (), C: Co
     allocation_limit: u32,
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize> Default
+    for Table<T, N, R, S, C, PAGES>
+{
     fn default() -> Self {
+        const { assert!(N * (1 + PAGES) <= OCCUPIED_WORDS * 64) };
         Self {
             entries: [EntrySlot {
                 generation: 0,
                 state: EntryState::Empty,
             }; N],
+            pages: [None; PAGES],
+            occupied: [0; OCCUPIED_WORDS],
             holds: [const {
                 HoldSlot {
                     generation: 0,
@@ -469,12 +504,17 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Default for Table<
             pins: [None; MAP_PINS],
             pin_generations: [0; MAP_PINS],
             jobs: AtomicU32::new(0),
-            allocation_limit: N as u32,
+            allocation_limit: Self::FDS as u32,
         }
     }
 }
 
-impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, C> {
+impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize>
+    Table<T, N, R, S, C, PAGES>
+{
+    /// The numbers the table can name: the table's own and those of its pages.
+    pub const FDS: usize = N * (1 + PAGES);
+
     /// Armed early-release operations retain their generations in the service.
     pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
         Self {
@@ -543,13 +583,16 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
                 });
             }
         }
-        // SAFETY: exclusive startup ownership permits initializing this field.
+        const { assert!(N * (1 + PAGES) <= OCCUPIED_WORDS * 64) };
+        // SAFETY: exclusive startup ownership permits initializing these fields.
         unsafe {
+            core::ptr::addr_of_mut!((*destination).pages).write([None; PAGES]);
+            core::ptr::addr_of_mut!((*destination).occupied).write([0; OCCUPIED_WORDS]);
             core::ptr::addr_of_mut!((*destination).release_early).write(release_early);
             core::ptr::addr_of_mut!((*destination).pins).write([None; MAP_PINS]);
             core::ptr::addr_of_mut!((*destination).pin_generations).write([0; MAP_PINS]);
             core::ptr::addr_of_mut!((*destination).jobs).write(AtomicU32::new(0));
-            core::ptr::addr_of_mut!((*destination).allocation_limit).write(N as u32);
+            core::ptr::addr_of_mut!((*destination).allocation_limit).write(Self::FDS as u32);
         }
     }
 
@@ -607,13 +650,159 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         &self.jobs
     }
 
+    /// The record of number `fd`, in the table or in its page; None when the
+    /// number is out of range or its page is not there.
+    #[inline(always)]
+    fn slot(&self, fd: u32) -> Option<&EntrySlot<T>> {
+        let fd = fd as usize;
+        if fd < N {
+            return self.entries.get(fd);
+        }
+        let page = (*self.pages.get(fd / N - 1)?)?;
+        // SAFETY: a page given to `add_page` stays mapped and is the table's
+        // alone until the table is gone.
+        Some(unsafe { &page.as_ref().slots[fd % N] })
+    }
+
+    #[inline(always)]
+    fn slot_mut(&mut self, fd: u32) -> Option<&mut EntrySlot<T>> {
+        let fd = fd as usize;
+        if fd < N {
+            return self.entries.get_mut(fd);
+        }
+        let mut page = (*self.pages.get(fd / N - 1)?)?;
+        // SAFETY: as in `slot`; `&mut self` makes the access exclusive.
+        Some(unsafe { &mut page.as_mut().slots[fd % N] })
+    }
+
+    /// `Error::NeedPage` when `fd` is a number of the table whose page is not
+    /// there yet.
+    #[inline(always)]
+    fn need_page(&self, fd: u32) -> Result<(), Error> {
+        if (fd as usize) < Self::FDS && self.slot(fd).is_none() {
+            return Err(Error::NeedPage(fd as usize / N - 1));
+        }
+        Ok(())
+    }
+
+    /// Writes the state of `fd` and keeps the bitmap of the numbers in use:
+    /// the number is in use unless it is empty.
+    #[inline(always)]
+    fn set_state(&mut self, fd: u32, state: EntryState<T>) {
+        let empty = matches!(state, EntryState::Empty);
+        self.slot_mut(fd)
+            .expect("the page of the number is there")
+            .state = state;
+        let (word, bit) = (fd as usize / 64, fd % 64);
+        if empty {
+            self.occupied[word] &= !(1 << bit);
+        } else {
+            self.occupied[word] |= 1 << bit;
+        }
+    }
+
+    /// The page of entries that the number `fd` lies in when the table does
+    /// not have it yet; None when the number is in place, its page is there,
+    /// or no page could hold it.
+    pub fn missing_page(&self, fd: u32) -> Option<usize> {
+        match self.need_page(fd) {
+            Err(Error::NeedPage(k)) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// The lowest number at or above `from` that is in use (open, being
+    /// opened or being closed), a word of the bitmap at a time.
+    pub fn next_used(&self, from: u32) -> Option<u32> {
+        let mut word = from as usize / 64;
+        let mut bits = self
+            .occupied
+            .get(word)
+            .map(|w| w & (!0u64 << (from % 64)))?;
+        loop {
+            if bits != 0 {
+                return Some(word as u32 * 64 + bits.trailing_zeros());
+            }
+            word += 1;
+            bits = *self.occupied.get(word)?;
+        }
+    }
+
+    /// The numbers in use (not empty), from the lowest.
+    fn used(&self) -> impl Iterator<Item = u32> + '_ {
+        self.occupied.iter().enumerate().flat_map(|(w, &word)| {
+            let mut left = word;
+            core::iter::from_fn(move || {
+                if left == 0 {
+                    return None;
+                }
+                let bit = left.trailing_zeros();
+                left &= left - 1;
+                Some(w as u32 * 64 + bit)
+            })
+        })
+    }
+
+    /// Whether a number holds `backend` in an open entry.
+    #[inline(always)]
+    fn references_by_number(&self, backend: T) -> bool {
+        for (word, &bits) in self.occupied.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let fd = word as u32 * 64 + left.trailing_zeros();
+                left &= left - 1;
+                if matches!(self.slot(fd).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Gives the table the page `k` (the number `N * (k + 1)` and the `N - 1`
+    /// after it): `memory` is written with `N` empty records of generation 0.
+    /// Returns false, with `memory` untouched, when the table has the page
+    /// already; the caller then frees its own. A page stays until the table is
+    /// gone, so that no number's generation starts again.
+    ///
+    /// # Safety
+    /// `memory` is aligned for `EntryPage<T, N>`, writable for its size, and
+    /// stays mapped, used by nothing else, for the life of the table.
+    pub unsafe fn add_page(&mut self, k: usize, memory: NonNull<EntryPage<T, N>>) -> bool {
+        let Some(place) = self.pages.get_mut(k) else {
+            return false;
+        };
+        if place.is_some() {
+            return false;
+        }
+        // SAFETY: the caller's guarantee covers the write of N records.
+        unsafe {
+            memory.as_ptr().write(EntryPage {
+                slots: [EntrySlot {
+                    generation: 0,
+                    state: EntryState::Empty,
+                }; N],
+            });
+        }
+        *place = Some(memory);
+        true
+    }
+
+    /// Whether the page `k` is there.
+    pub fn has_page(&self, k: usize) -> bool {
+        self.pages.get(k).is_some_and(|p| p.is_some())
+    }
+
+    #[inline(always)]
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
-        match self.entries.get(fd as usize).map(|slot| slot.state) {
+        match self.slot(fd).map(|slot| slot.state) {
             Some(EntryState::Open(entry)) => Ok(entry),
             _ => Err(Error::BadFileDescriptor),
         }
     }
 
+    #[inline(always)]
     pub fn get(&self, fd: u32) -> Result<T, Error> {
         Ok(self.entry(fd)?.backend)
     }
@@ -624,50 +813,64 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn set_flags(&mut self, fd: u32, flags: Flags) -> Result<(), Error> {
         let backend = self.get(fd)?;
-        self.entries[fd as usize].state = EntryState::Open(Entry { backend, flags });
+        self.set_state(fd, EntryState::Open(Entry { backend, flags }));
         Ok(())
     }
 
     pub fn entry_token(&self, fd: u32) -> Result<EntryToken, Error> {
         self.entry(fd)?;
-        Ok(EntryToken::new(fd, self.entries[fd as usize].generation))
+        let generation = self.slot(fd).ok_or(Error::BadFileDescriptor)?.generation;
+        Ok(EntryToken::new(fd, generation))
     }
 
     /// Published descriptors form the fork and exec snapshot.
     pub fn open(&self) -> impl Iterator<Item = (u32, T, Flags)> + '_ {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(fd, slot)| match slot.state {
-                EntryState::Open(e) => Some((fd as u32, e.backend, e.flags)),
-                _ => None,
-            })
+        self.used().filter_map(|fd| match self.slot(fd)?.state {
+            EntryState::Open(e) => Some((fd, e.backend, e.flags)),
+            _ => None,
+        })
     }
 
     /// Existing descriptors and already reserved Opens retain their custody.
     pub fn set_allocation_limit(&mut self, limit: u64) {
-        self.allocation_limit = limit.min(N as u64) as u32;
+        self.allocation_limit = limit.min(Self::FDS as u64) as u32;
     }
 
+    #[inline(always)]
     pub fn vacant(&self, minimum: u32) -> Result<u32, Error> {
-        if minimum as usize >= N || minimum >= self.allocation_limit {
+        if minimum as usize >= Self::FDS || minimum >= self.allocation_limit {
             return Err(Error::InvalidArgument);
         }
-        self.entries
-            .iter()
-            .enumerate()
-            .take(self.allocation_limit as usize)
-            .skip(minimum as usize)
-            .find(|(_, slot)| matches!(slot.state, EntryState::Empty))
-            .map(|(fd, _)| fd as u32)
-            .ok_or(Error::TooManyOpenFiles)
+        // The first zero of the bitmap at or above `minimum` and below the
+        // limit, a word at a time.
+        let limit = self.allocation_limit;
+        let mut fd = minimum;
+        while fd < limit {
+            let (word, bit) = (fd as usize / 64, fd % 64);
+            let free = !self.occupied[word] >> bit << bit;
+            if free != 0 {
+                let found = word as u32 * 64 + free.trailing_zeros();
+                if found >= limit {
+                    break;
+                }
+                self.need_page(found)?;
+                return Ok(found);
+            }
+            fd = (word as u32 + 1) * 64;
+        }
+        Err(Error::TooManyOpenFiles)
     }
 
+    #[inline(always)]
     fn install(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
-        let slot = &mut self.entries[fd as usize];
+        let Some(slot) = self.slot_mut(fd) else {
+            self.need_page(fd)?;
+            return Err(Error::BadFileDescriptor);
+        };
         let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
         slot.generation = generation;
         slot.state = EntryState::Open(Entry { backend, flags });
+        self.occupied[fd as usize / 64] |= 1 << (fd % 64);
         Ok(())
     }
 
@@ -693,20 +896,28 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     /// Whether another open descriptor names what `fd` names.
+    #[inline(always)]
     pub fn has_open_alias(&self, fd: u32) -> bool {
         let Ok(backend) = self.get(fd) else {
             return false;
         };
-        self.entries.iter().enumerate().any(|(number, slot)| {
-            number != fd as usize
-                && matches!(slot.state, EntryState::Open(e) if e.backend == backend)
-        })
+        for (word, &bits) in self.occupied.iter().enumerate() {
+            let mut left = bits;
+            while left != 0 {
+                let number = word as u32 * 64 + left.trailing_zeros();
+                left &= left - 1;
+                if number != fd
+                    && matches!(self.slot(number).map(|s| s.state), Some(EntryState::Open(e)) if e.backend == backend)
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn referenced(&self, backend: T) -> bool {
-        self.entries
-            .iter()
-            .any(|slot| matches!(slot.state, EntryState::Open(e) if e.backend == backend))
+        self.references_by_number(backend)
             || self.pinned_backend(backend)
             || self.closing_references(backend, true)
     }
@@ -912,7 +1123,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
 
     pub fn close(&mut self, fd: u32) -> Result<Option<T>, Error> {
         let backend = self.get(fd)?;
-        self.entries[fd as usize].state = EntryState::Empty;
+        self.set_state(fd, EntryState::Empty);
         Ok(self.left(backend))
     }
 
@@ -925,7 +1136,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     pub fn pending(&self, fd: u32) -> Option<OpenToken> {
-        let EntryState::Pending(slot) = self.entries.get(fd as usize)?.state else {
+        let EntryState::Pending(slot) = self.slot(fd)?.state else {
             return None;
         };
         let held = self.residents.get(slot)?;
@@ -978,7 +1189,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         allow_same: bool,
     ) -> Result<Replacement<T>, Error> {
         let backend = self.get(source)?;
-        if target as usize >= N {
+        if target as usize >= Self::FDS {
             return Err(Error::BadFileDescriptor);
         }
         if source == target {
@@ -1001,6 +1212,8 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Err(Error::Io);
         }
         let old = self.entry(target).ok();
+        // A page that is not there yet is asked for before any change.
+        self.need_page(target)?;
         self.install(target, backend, flags)?;
         let release = old
             .filter(|old| old.backend != backend)
@@ -1012,10 +1225,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     pub fn place(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
-        let slot = self
-            .entries
-            .get(fd as usize)
-            .ok_or(Error::BadFileDescriptor)?;
+        if fd as usize >= Self::FDS {
+            return Err(Error::BadFileDescriptor);
+        }
+        self.need_page(fd)?;
+        let slot = self.slot(fd).ok_or(Error::BadFileDescriptor)?;
         if !matches!(slot.state, EntryState::Empty) {
             return Err(Error::BadFileDescriptor);
         }
@@ -1211,11 +1425,11 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             return Err(Error::TooManyOpenFiles);
         }
         let fd = self.vacant(minimum)?;
-        let slot = &mut self.entries[fd as usize];
+        let slot = self.slot_mut(fd).ok_or(Error::BadFileDescriptor)?;
         let generation = slot.generation.checked_add(1).ok_or(Error::Io)?;
         let entry = EntryToken::new(fd, generation);
         slot.generation = generation;
-        slot.state = EntryState::Pending(claim.open.slot);
+        self.set_state(fd, EntryState::Pending(claim.open.slot));
         record.phase = Phase::Reserved {
             recovery,
             entry,
@@ -1244,7 +1458,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if entry != expected || !self.reserved(claim.open, entry) {
             return Err(Error::Io);
         }
-        self.entries[entry.fd as usize].state = EntryState::Empty;
+        self.set_state(entry.fd, EntryState::Empty);
         record.phase = Phase::Preparing(recovery);
         record.claimant = None;
         self.save(claim.open, record);
@@ -1272,7 +1486,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     }
 
     fn reserved(&self, token: OpenToken, entry: EntryToken) -> bool {
-        self.entries.get(entry.fd as usize).is_some_and(|slot| {
+        self.slot(entry.fd).is_some_and(|slot| {
             slot.generation == entry.generation()
                 && matches!(slot.state, EntryState::Pending(h) if h == token.slot)
         })
@@ -1296,7 +1510,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
         if !self.reserved(claim.open, entry) {
             return Err(Error::Io);
         }
-        self.entries[entry.fd as usize].state = EntryState::Open(Entry { backend, flags });
+        self.set_state(entry.fd, EntryState::Open(Entry { backend, flags }));
         record.phase = Phase::Published(entry);
         record.claimant = None;
         self.save(claim.open, record);
@@ -1339,7 +1553,7 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
             if !self.reserved(token, entry) {
                 return Err(Error::Io);
             }
-            self.entries[entry.fd as usize].state = EntryState::Empty;
+            self.set_state(entry.fd, EntryState::Empty);
         }
         if record.owner.is_none() {
             self.free_open(token);
@@ -1453,9 +1667,17 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy> Table<T, N, R, S, 
     /// Published fd references survive. The parent owns every unresolved job.
     /// The caller establishes child-exclusive access before this operation.
     pub fn discard_open_after_fork(&mut self) {
-        for entry in &mut self.entries {
-            if matches!(entry.state, EntryState::Pending(_) | EntryState::Closing(_)) {
-                entry.state = EntryState::Empty;
+        for word in 0..OCCUPIED_WORDS {
+            let mut left = self.occupied[word];
+            while left != 0 {
+                let fd = word as u32 * 64 + left.trailing_zeros();
+                left &= left - 1;
+                if matches!(
+                    self.slot(fd).map(|s| s.state),
+                    Some(EntryState::Pending(_) | EntryState::Closing(_))
+                ) {
+                    self.set_state(fd, EntryState::Empty);
+                }
             }
         }
         for slot in self.holds.iter_mut().chain(self.residents.iter_mut()) {
@@ -2755,5 +2977,153 @@ mod tests {
         assert!(table.open_snapshot(open).is_err());
         assert_eq!(table.finish_cancel(open, 5), Err(Error::BadFileDescriptor));
         assert!(table.begin_open(owner(2), 80).is_ok());
+    }
+
+    /// A table of 4 numbers in place and 3 pages of 4 more, and the pages
+    /// the test gives it (leaked: the table keeps them for its life).
+    use std::{boxed::Box, vec, vec::Vec};
+
+    type Paged = Table<u32, 4, u64, (), (), 3>;
+
+    fn page(table: &mut Paged, k: usize) {
+        let memory = Box::leak(Box::new(
+            core::mem::MaybeUninit::<EntryPage<u32, 4>>::uninit(),
+        ));
+        // Memory that is not zero, as a heap page that was used before.
+        // SAFETY: the leaked box is writable for its size.
+        unsafe { core::ptr::write_bytes(memory.as_mut_ptr(), 0xA5, 1) };
+        // SAFETY: the memory is aligned, writable, and leaked for good.
+        assert!(unsafe { table.add_page(k, NonNull::new(memory.as_mut_ptr()).unwrap()) });
+    }
+
+    #[test]
+    fn a_number_in_a_page_that_is_not_there_asks_for_it() {
+        let mut table = Paged::default();
+        for fd in 0..4 {
+            assert_eq!(table.insert(10 + fd, Flags::default()), Ok(fd));
+        }
+        assert_eq!(table.insert(14, Flags::default()), Err(Error::NeedPage(0)));
+        assert_eq!(table.place(9, 1, Flags::default()), Err(Error::NeedPage(1)));
+        assert_eq!(table.dup2(0, 9), Err(Error::NeedPage(1)));
+        assert_eq!(table.get(9), Err(Error::BadFileDescriptor));
+        // Out of the numbers of the table: no page helps.
+        assert_eq!(
+            table.place(16, 1, Flags::default()),
+            Err(Error::BadFileDescriptor)
+        );
+        assert_eq!(table.dup2(0, 16), Err(Error::BadFileDescriptor));
+    }
+
+    #[test]
+    fn a_page_starts_empty() {
+        let mut table = Paged::default();
+        page(&mut table, 0);
+        assert!(table.has_page(0));
+        for fd in 4..8 {
+            assert_eq!(table.get(fd), Err(Error::BadFileDescriptor));
+            assert_eq!(table.entry_token(fd), Err(Error::BadFileDescriptor));
+            assert_eq!(table.slot(fd).unwrap().generation, 0);
+        }
+        assert_eq!(table.open().count(), 0);
+        assert_eq!(table.vacant(4), Ok(4));
+        // A second page for the same place is refused and leaves the first.
+        table.place(5, 55, Flags::default()).unwrap();
+        let memory = Box::leak(Box::new(
+            core::mem::MaybeUninit::<EntryPage<u32, 4>>::uninit(),
+        ));
+        // SAFETY: as above.
+        assert!(!unsafe { table.add_page(0, NonNull::new(memory.as_mut_ptr()).unwrap()) });
+        assert_eq!(table.get(5), Ok(55));
+    }
+
+    #[test]
+    fn vacant_goes_through_the_border_of_a_page() {
+        let mut table = Paged::default();
+        page(&mut table, 0);
+        for fd in 0..8 {
+            assert_eq!(table.insert(fd, Flags::default()), Ok(fd));
+        }
+        // The ninth number is in the second page.
+        assert_eq!(table.insert(8, Flags::default()), Err(Error::NeedPage(1)));
+        page(&mut table, 1);
+        assert_eq!(table.insert(8, Flags::default()), Ok(8));
+        // The least free number is found again after a close in a page.
+        table.close(6).unwrap();
+        assert_eq!(table.insert(66, Flags::default()), Ok(6));
+        assert_eq!(table.vacant(7), Ok(9));
+        assert_eq!(table.vacant(0), Ok(9));
+    }
+
+    #[test]
+    fn the_allocation_limit_stops_below_a_page() {
+        let mut table = Paged::default();
+        table.set_allocation_limit(6);
+        for fd in 0..4 {
+            table.insert(fd, Flags::default()).unwrap();
+        }
+        // Number 4 is below the limit but its page is not there.
+        assert_eq!(table.insert(4, Flags::default()), Err(Error::NeedPage(0)));
+        page(&mut table, 0);
+        assert_eq!(table.insert(4, Flags::default()), Ok(4));
+        assert_eq!(table.insert(5, Flags::default()), Ok(5));
+        // The limit ends the numbers: no page is asked for past it.
+        assert_eq!(
+            table.insert(6, Flags::default()),
+            Err(Error::TooManyOpenFiles)
+        );
+        assert_eq!(table.dup2(0, 6), Err(Error::BadFileDescriptor));
+        table.set_allocation_limit(1_000_000);
+        assert_eq!(table.insert(6, Flags::default()), Ok(6));
+    }
+
+    #[test]
+    fn the_generation_of_a_number_in_a_page_grows() {
+        let mut table = Paged::default();
+        page(&mut table, 0);
+        table.place(5, 50, Flags::default()).unwrap();
+        let first = table.entry_token(5).unwrap();
+        table.close(5).unwrap();
+        table.place(5, 51, Flags::default()).unwrap();
+        let second = table.entry_token(5).unwrap();
+        assert!(second.generation() > first.generation());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_walks_see_the_numbers_in_use_only() {
+        let mut table = Paged::default();
+        page(&mut table, 0);
+        page(&mut table, 1);
+        table.place(2, 20, Flags::default()).unwrap();
+        table.place(7, 70, Flags::default()).unwrap();
+        table.place(11, 70, Flags::default()).unwrap();
+        let open: Vec<_> = table.open().map(|(fd, b, _)| (fd, b)).collect();
+        assert_eq!(open, vec![(2, 20), (7, 70), (11, 70)]);
+        assert!(table.has_open_alias(7));
+        assert!(table.has_open_alias(11));
+        assert!(!table.has_open_alias(2));
+        assert_eq!(table.close(7), Ok(None));
+        assert!(!table.has_open_alias(11));
+        assert_eq!(table.close(11), Ok(Some(70)));
+        let open: Vec<_> = table.open().map(|(fd, _, _)| fd).collect();
+        assert_eq!(open, vec![2]);
+    }
+
+    #[test]
+    fn a_reservation_in_a_page_counts_in_the_bitmap_and_goes_after_a_fork() {
+        let mut table = Paged::default();
+        page(&mut table, 0);
+        for fd in 0..4 {
+            table.place(fd, fd, Flags::default()).unwrap();
+        }
+        let (open, claim) = table.begin_open(owner(1), 5).unwrap();
+        let entry = table
+            .reserve_open(claim, 4, Flags::default())
+            .expect("the number 4 is free and its page is there");
+        assert_eq!(entry.fd, 4);
+        assert_eq!(table.vacant(0), Ok(5));
+        table.discard_open_after_fork();
+        assert_eq!(table.vacant(0), Ok(4));
+        let _ = open;
     }
 }

@@ -43,7 +43,7 @@ pub fn set_nofile_limit(limit: u64) -> Result<(), i32> {
     })
 }
 
-pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+pub fn terminals_kept_by_fork(out: &mut [u32; posix_fs::TTY_KEPT_MAX]) -> Result<usize, i32> {
     process_state(|files| Ok(files.terminals_kept_by_fork(out)))
 }
 
@@ -90,6 +90,7 @@ pub unsafe fn init(
             cwd,
             inherited,
             secure,
+            &mut *LATE.0.get(),
         )
     }
     .map_err(|_| rt::abi::Error::BadState)?;
@@ -146,22 +147,25 @@ pub unsafe fn after_fork(
 pub fn kept_by_fork(
     out: &mut [rt::fs::PreparedOpen; posix_fs::KEPT_BY_FORK_MAX],
 ) -> Result<usize, i32> {
-    process_state(|files| Ok(files.kept_by_fork(out)))
+    process_state(|files| files.kept_by_fork(out).map_err(crate::error))
 }
 
 /// The ends of pipes a forked child's session shares
 /// (posix_fs::PosixFs::pipes_kept_by_fork), into `out`; how many.
 pub fn pipes_kept_by_fork(
-    out: &mut [proto_pipe::Endpoint; posix_fs::OPEN_MAX],
+    out: &mut [proto_pipe::Endpoint; proto_pipe::HELD_MAX],
 ) -> Result<usize, i32> {
     process_state(|files| Ok(files.pipes_kept_by_fork(out)))
 }
 
-/// The descriptions of sockets of the network service a forked child's
-/// session keeps (posix_fs::PosixFs::nets_kept_by_fork), into `out`; how
-/// many.
-pub fn nets_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
-    process_state(|files| Ok(files.nets_kept_by_fork(out)))
+/// A portion of the descriptions of sockets of the network service a forked
+/// child's session keeps (posix_fs::PosixFs::nets_kept_by_fork_from), into
+/// `out`: how many and where the next portion starts.
+pub fn nets_kept_by_fork_from(
+    start: u32,
+    out: &mut [u32; posix_fs::NETS_PORTION],
+) -> Result<(usize, Option<u32>), i32> {
+    process_state(|files| Ok(files.nets_kept_by_fork_from(start, out)))
 }
 
 /// Runs `run` holding the lock of the process's files, for the probes of
@@ -490,7 +494,7 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
             terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
         }
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
-        Target::Net(description) => net_reply(description, count, &mut *out),
+        Target::Net(net) => net_reply(net.description, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
         #[cfg(feature = "procfs")]
         Target::Proc(id) => {
@@ -625,13 +629,13 @@ pub(crate) fn open_from(
             finish(transport, path, trailing_slash, terminal)?
         }
     };
-    let inserted = process_state(|files| {
+    let inserted = growing(|files| {
         let flags = crate::descriptor_flags(flags);
         match opened {
             Opened::Resident(fd) => return Ok(fd),
             Opened::Terminal(number, _) => files.insert_terminal(number, flags),
         }
-        .map_err(crate::error)
+        .map_err(page_error)
     });
     // A session leader that opens a terminal without O_NOCTTY takes it as
     // its controlling terminal when its session has none and the terminal
@@ -680,7 +684,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                     .map_err(|status| crate::error(posix_fs::FsError::from(status))),
                 // The write of a pipe waits here, outside the lock.
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
-                Target::Net(description) => crate::net::write(description, bytes).map(|n| n as u64),
+                Target::Net(net) => crate::net::write(net.description, bytes).map(|n| n as u64),
                 Target::Fifo(target) => {
                     crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
                         .map(|n| n as u64)
@@ -707,12 +711,19 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }),
-        Dup { fd } => with_fd(fd, |files| {
-            files
-                .dup(fd)
-                .map(|value| value as u64)
-                .map_err(crate::error)
-        }),
+        Dup { fd } => {
+            let copy =
+                |files: &mut PosixFs| files.dup(fd).map(|value| value as u64).map_err(page_error);
+            // The common call is one pass; a number in a page that is not
+            // there yet asks for it and goes again.
+            match with_fd(fd, copy) {
+                Err(code) if code >= NEED_PAGE => {
+                    provide_page((code - NEED_PAGE) as usize)?;
+                    growing_in(&[fd], copy)
+                }
+                other => other,
+            }
+        }
         Dup2 { source, target } => duplicate_replacing(source, target, None),
         Dup3 {
             source,
@@ -777,11 +788,13 @@ fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
             out,
         ),
         Cleanup => {
-            for fd in 0..posix_fs::OPEN_MAX as u32 {
+            let mut from = 0;
+            while let Some(fd) = process_state(|files| Ok(files.next_descriptor(from)))? {
                 match crate::close_driver::close(fd) {
                     Ok(()) | Err(EBADF) => {}
                     Err(error) => return Err(error),
                 }
+                from = fd + 1;
             }
             write(Reply::Unit, out)
         }
@@ -849,8 +862,129 @@ pub fn with_descriptors<R>(
     }
 }
 
+/// `with_descriptors` for an operation on every descriptor: it waits for the
+/// closes in flight of any of them.
+pub fn with_every_descriptor<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    enum Step<R> {
+        Close(posix_fs::closing::CloseToken),
+        Done(Result<R, i32>),
+    }
+    let mut f = Some(f);
+    loop {
+        let step = process_state(|files| {
+            if let Some(token) = files.any_closing() {
+                return Ok(Step::Close(token));
+            }
+            Ok(Step::Done(f.take().expect("one fd operation")(files)))
+        })?;
+        match step {
+            Step::Close(token) => crate::close_driver::settle_token(token)?,
+            Step::Done(result) => return result,
+        }
+    }
+}
+
 pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
     process_state(f)
+}
+
+/// The code an operation that may need a page of the table of descriptors
+/// returns for `FsError::NeedPage(k)`: `NEED_PAGE + k`, which `growing` and
+/// `growing_in` answer with the page. Any other error is `crate::error`'s.
+pub fn page_error(error: posix_fs::FsError) -> i32 {
+    match error {
+        posix_fs::FsError::NeedPage(k) => NEED_PAGE + k as i32,
+        error => crate::error(error),
+    }
+}
+
+/// Whether `code` is one `page_error` made for a page that is wanted.
+pub fn is_page_code(code: i32) -> bool {
+    code >= NEED_PAGE
+}
+
+/// The base of the codes `page_error` makes: no errno comes near it.
+const NEED_PAGE: i32 = 0x4000_0000;
+
+/// Runs `f` on the files; when it asks for a page of the table of
+/// descriptors (`page_error`), maps one outside the lock, gives it to the
+/// table, and runs `f` again. EMFILE when there is no memory for the page.
+pub fn growing<R>(f: impl FnMut(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    growing_in(&[], f)
+}
+
+/// `growing`, with `with_descriptors`' wait for closes of `fds` in flight.
+pub fn growing_in<R>(
+    fds: &[u32],
+    mut f: impl FnMut(&mut PosixFs) -> Result<R, i32>,
+) -> Result<R, i32> {
+    loop {
+        match with_descriptors(fds, &mut f) {
+            Err(code) if code >= NEED_PAGE => provide_page((code - NEED_PAGE) as usize)?,
+            other => return other,
+        }
+    }
+}
+
+/// Maps a page for the table of descriptors and gives it to the table, after
+/// the page `k` was asked for. A page another thread gave first is unmapped.
+fn provide_page(k: usize) -> Result<(), i32> {
+    let page = crate::allocation::map_pages(posix_fs::DESCRIPTOR_PAGE_BYTES).map_err(|_| EMFILE)?;
+    // SAFETY: `map_pages` gave whole zeroed pages to this caller alone, page
+    // aligned; the table keeps the page for good once it takes it.
+    let added = process_state(|files| Ok(unsafe { files.add_page(k, page) }))?;
+    if !added {
+        // SAFETY: the table refused the page, which nothing uses.
+        unsafe { crate::allocation::unmap_pages(page, posix_fs::DESCRIPTOR_PAGE_BYTES) };
+    }
+    Ok(())
+}
+
+/// Before a `dup2` or `dup3` onto the number `fd`: its page is there.
+pub fn ensure_page_for(fd: u32) {
+    if let Ok(Some(k)) = process_state(|files| Ok(files.page_of(fd))) {
+        let _ = provide_page(k);
+    }
+}
+
+/// Before an operation that opens a descriptor in a way that cannot be run
+/// again (the deferred open): the page of the lowest free number is there.
+pub fn ensure_vacant_page() {
+    while let Ok(Some(k)) = process_state(|files| Ok(files.page_needed(0))) {
+        if provide_page(k).is_err() {
+            break;
+        }
+    }
+}
+
+/// The startup descriptors whose numbers lie in pages: `init` keeps them
+/// until the heap can give the pages (`place_late`).
+struct LateCell(UnsafeCell<posix_fs::Late>);
+// SAFETY: startup is single-threaded; only `init` and `place_late` touch it.
+unsafe impl Sync for LateCell {}
+static LATE: LateCell = LateCell(UnsafeCell::new(posix_fs::Late::new()));
+
+/// Places the startup descriptors that lie beyond the table's own numbers,
+/// now that the heap gives the pages.
+///
+/// # Safety
+/// Startup, after the heap is initialized, before any other thread runs.
+pub unsafe fn place_late() -> Result<(), rt::abi::Error> {
+    // SAFETY: the caller's promise gives this borrow alone.
+    let late = unsafe { &*LATE.0.get() };
+    for (fd, target) in late.iter() {
+        loop {
+            match process_state(|files| files.place_late(fd, target).map_err(page_error)) {
+                Err(code) if code >= NEED_PAGE => {
+                    provide_page((code - NEED_PAGE) as usize)
+                        .map_err(|_| rt::abi::Error::NoMemory)?;
+                }
+                Ok(()) => break,
+                Err(_) => return Err(rt::abi::Error::BadState),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn dispatch<'a>(

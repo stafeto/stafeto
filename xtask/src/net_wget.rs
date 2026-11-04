@@ -356,7 +356,13 @@ fn capture(
         .iter()
         .rposition(|l| l.trim() == end)
         .ok_or_else(|| format!("no {end} line"))?;
-    Ok(text[first + 1..last].to_vec())
+    // The lines of the counted steps of the service (`service step: ...`, in
+    // the runs under -icount) come to the console at any time.
+    Ok(text[first + 1..last]
+        .iter()
+        .filter(|l| !l.starts_with("service "))
+        .cloned()
+        .collect())
 }
 
 /// Runs a command that ends with `echo NAME-ok` on success and `echo
