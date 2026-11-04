@@ -36,6 +36,7 @@ pub fn record_locks_none() -> bool {
     shared::with_files(|files| Ok(files.knows_no_record_lock())).unwrap_or(false)
 }
 pub mod display;
+pub mod epoll;
 pub mod ipc;
 pub mod lock_fields;
 pub mod long;

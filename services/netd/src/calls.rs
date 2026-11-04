@@ -22,7 +22,7 @@ use netd::births;
 use netd::demux::Key;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
-use proto_net::sockets::{self, Request as Call, opt};
+use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
 use proto_wire::{Status, Writer, long, watch};
 use rt::handle::{Channel, Handle, Outgoing};
@@ -194,8 +194,12 @@ impl Net {
                     place: place as u16,
                 };
                 self.told &= !(1 << idx);
-                self.socks[place].waiters |= 1 << idx;
-                self.attention.set(place);
+                if kind == Kind::Epoll {
+                    self.interest.add_waiter(place, idx);
+                } else {
+                    self.socks[place].waiters |= 1 << idx;
+                    self.attention.set(place);
+                }
                 long_answer(r, long::Reply::Wait(key))
             }
             Some(key) => {
@@ -258,9 +262,40 @@ impl Net {
             | Call::SetOpt { description, .. } => Some(description),
             _ => None,
         };
-        if let Some(place) = touching.and_then(|d| self.find(&s.data.held, d)) {
+        let touched = touching.and_then(|d| self.find(&s.data.held, d));
+        if let Some(place) = touched {
             self.touch(place);
         }
+        #[cfg(feature = "probe")]
+        {
+            self.in_request = true;
+        }
+        let answer = self.dispatch(stack, s, r, call, now);
+        #[cfg(feature = "probe")]
+        {
+            self.in_request = false;
+        }
+        // A request that changed a place with records brings what the service
+        // knows of its events up to date: a read that took the last byte must
+        // not leave the place reported readable.
+        if let Some(place) = touched
+            && self.interest.watched(place)
+        {
+            let ev = self.events(stack, place, now);
+            self.interest.scan(place, ev);
+            self.wake_wanted |= self.interest.due != 0;
+        }
+        answer
+    }
+
+    fn dispatch(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        call: Call<'_>,
+        now: u64,
+    ) -> Answer {
         match call {
             Call::Socket {
                 family,
@@ -310,6 +345,7 @@ impl Net {
                     return refuse(proto_net::BAD_FD);
                 };
                 s.data.held.remove(place);
+                self.interest.drop_place(place, Some(s.label()));
                 self.release(stack, place);
                 self.step_due = true;
                 ok()
@@ -318,6 +354,9 @@ impl Net {
                 let Some(place) = self.find(&s.data.held, description) else {
                     return refuse(proto_net::BAD_FD);
                 };
+                if name == opt::NREAD {
+                    return self.readable(stack, r, place);
+                }
                 match self.option(place, name) {
                     Some(value) => word(r, value),
                     None => refuse(proto_net::NO_OPTION),
@@ -354,7 +393,21 @@ impl Net {
             Call::Watch(set) => self.watch_start(stack, s, r, set, now),
             Call::WatchTake(key) => self.watch_keyed(stack, s, r, key, false, now),
             Call::WatchCancel(key) => self.watch_keyed(stack, s, r, key, true, now),
+            Call::EpollSet { set, list } => self.epoll_set(stack, s, r, set, list.as_slice(), now),
+            Call::EpollDrop(set) => self.epoll_drop(s, set),
+            Call::EpollWait {
+                key,
+                set,
+                most,
+                flags,
+            } => self.epoll_wait(s, r, key, set, most as usize, flags),
             Call::Abandon => {
+                // The sets go with the operations (an exec closes the
+                // descriptors of epoll before it).
+                if self.interest.sets_of(s.label()) != 0 {
+                    self.interest.drop_sets_of(s.label());
+                    self.cleanup_wanted = true;
+                }
                 self.release_ops(&mut s.data.long);
                 match sockets::write_abandoned(r.reply(), s.data.long.count() as u32) {
                     Ok(()) => Answer::Reply(Outgoing::new()),
@@ -1354,6 +1407,177 @@ impl Net {
         } else {
             long_answer(r, long::Reply::Armed)
         }
+    }
+
+    // ----- EPOLL -----
+
+    /// NREAD (FIONREAD): the bytes of a stream waiting to be read, or the
+    /// length of the next datagram.
+    fn readable(
+        &mut self,
+        stack: &mut Stack<'static>,
+        r: &mut Request<'_>,
+        place: usize,
+    ) -> Answer {
+        let sock = self.socks[place];
+        if sock.listening {
+            return refuse(proto_net::INVALID);
+        }
+        let n = match (sock.proto, sock.handle) {
+            (Proto::Tcp, Some(h)) => stack.tcp(h).recv_queue(),
+            (Proto::Udp, Some(h)) => stack.udp(h).peek().map_or(0, |(p, _)| p.len()),
+            _ => 0,
+        };
+        word(r, n as u32)
+    }
+
+    /// The code of a record's refusal.
+    fn epoll_code(refused: netd::interest::Refused) -> u32 {
+        use netd::interest::Refused;
+        match refused {
+            Refused::NoSpace => proto_net::NO_SPACE,
+            Refused::Exists => proto_net::EXISTS,
+            Refused::NoEntry => proto_net::NO_ENTRY,
+        }
+    }
+
+    /// One record of EPOLL_SET: 0 or the code of its refusal.
+    fn epoll_record(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &Sess,
+        set: usize,
+        record: &EpollRecord,
+        now: u64,
+    ) -> u32 {
+        let Some(place) = self.find(&s.data.held, record.description) else {
+            return proto_net::BAD_FD;
+        };
+        let result = match record.action {
+            sockets::EPOLL_DEL => self.interest.delete(set, place),
+            sockets::EPOLL_ADD | sockets::EPOLL_MOD => {
+                let known = epoll::EVENTS | epoll::ET | epoll::ONESHOT;
+                if record.events & epoll::EXCLUSIVE != 0 || record.events & !known != 0 {
+                    return proto_net::INVALID;
+                }
+                let ev = self.events(stack, place, now);
+                let done = if record.action == sockets::EPOLL_ADD {
+                    self.interest
+                        .add(set, place, record.events, record.label, ev)
+                        .map(drop)
+                } else {
+                    self.interest
+                        .modify(set, place, record.events, record.label, ev)
+                };
+                if done.is_ok() {
+                    self.attention.set(place);
+                }
+                done
+            }
+            _ => return proto_net::INVALID,
+        };
+        result.err().map_or(0, Self::epoll_code)
+    }
+
+    /// EPOLL_SET: the records of a set of the session (a set of its own is
+    /// made when `wire` is 0). The request wakes nobody: a set with ready
+    /// records and waiting operations is left to the step of waking.
+    fn epoll_set(
+        &mut self,
+        stack: &mut Stack<'static>,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        wire: u32,
+        records: &[EpollRecord],
+        now: u64,
+    ) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let label = s.label();
+        let set = if wire == 0 {
+            match self.interest.new_set(label) {
+                Some(k) => k,
+                None => return Answer::Status(Status::Kernel(Error::LimitReached)),
+            }
+        } else {
+            match self.interest.find_set(label, wire) {
+                Some(k) => k,
+                None => return refuse(proto_net::BAD_FD),
+            }
+        };
+        let mut statuses = [0u32; sockets::EPOLL_BATCH];
+        for (status, record) in statuses.iter_mut().zip(records) {
+            *status = self.epoll_record(stack, s, set, record, now);
+        }
+        rt::service::step_detail(records.len() as u64);
+        self.wake_wanted |= self.interest.due != 0;
+        let wire = self.interest.wire(set);
+        match sockets::write_epoll_set(r.reply(), wire, &statuses[..records.len()]) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// EPOLL_DROP: the set goes (its records in steps); the operations that
+    /// wait on it are told and find it gone.
+    fn epoll_drop(&mut self, s: &mut Sess, wire: u32) -> Answer {
+        let Some(set) = self.interest.find_set(s.label(), wire) else {
+            return refuse(proto_net::BAD_FD);
+        };
+        self.closed_ops |= self.interest.drop_set(set);
+        self.wake_wanted = true;
+        self.cleanup_wanted = true;
+        ok()
+    }
+
+    /// EPOLL_WAIT and its take: the ready records of the set, or a wait for
+    /// them. Nothing leaves the lists until the answer is READY, so a
+    /// cancel loses no event.
+    fn epoll_wait(
+        &mut self,
+        s: &mut Sess,
+        r: &mut Request<'_>,
+        key: Option<u64>,
+        wire: u32,
+        most: usize,
+        flags: u32,
+    ) -> Answer {
+        let notify = match notify_of(r, key.is_some()) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        let Some(set) = self.interest.find_set(s.label(), wire) else {
+            if let Some(key) = key {
+                self.finish_op(s, key);
+            }
+            return refuse(proto_net::BAD_FD);
+        };
+        if let Some(key) = key
+            && !self.op_ok(s, key, Kind::Epoll, set)
+        {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        let mut ready = EpollReady::EMPTY;
+        self.interest.take(set, most, &mut ready);
+        rt::service::step_detail(ready.len as u64);
+        if ready.len == 0 && (key.is_some() || flags & sockets::EPOLL_DONTWAIT == 0) {
+            let answer = self.wait(s, r, key, Kind::Epoll, set, notify);
+            // The look at the list was cut short (it is longer than the window
+            // and the records seen reported nothing): records are left, and
+            // nothing else would wake the wait for them.
+            if self.interest.has_ready(set) {
+                self.interest.due |= 1 << set;
+                self.wake_wanted = true;
+            }
+            return answer;
+        }
+        let mut w = Writer::new();
+        let answer = match ready.write(&mut w) {
+            Ok(()) => long_answer(r, long::Reply::Ready(w.as_bytes())),
+            Err(status) => Answer::Status(status),
+        };
+        self.done(s, key, answer)
     }
 
     // ----- CLONE -----

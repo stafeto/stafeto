@@ -150,6 +150,9 @@ pub const FIFO: u32 = 4;
 /// The kind of a socket's node information: a socket of the pipe service,
 /// or the node a bound socket names in the file service.
 pub const SOCKET: u32 = 6;
+/// The kind of the node information of a descriptor with no file behind it
+/// (an epoll instance): `fstat` answers a mode with no file type.
+pub const ANON: u32 = 7;
 
 impl FileKind {
     fn from_wire(kind: u32) -> Result<Self, FsError> {
@@ -249,6 +252,10 @@ pub enum Target {
     /// A socket of the network service by its description (`proto_net`),
     /// held in the process's session with that service.
     Net(NetTarget),
+    /// An epoll instance of the layer (`posix_abi::epoll`) by its number in
+    /// the layer's table: no service holds it, and the last close of it
+    /// drops its interest set in the network service.
+    Epoll(u32),
 }
 
 /// A socket of the network service: its description in the process's session
@@ -293,6 +300,24 @@ fn release_proc(id: u32) {
     let hook = PROC_RELEASE.load(core::sync::atomic::Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `set_proc_release` stores a value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(id);
+    }
+}
+
+/// The function that frees an epoll instance when the last descriptor of it
+/// closes (0 until `set_epoll_release`).
+static EPOLL_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Names the function that frees the epoll instance `id` of a `Target::Epoll`.
+pub fn set_epoll_release(release: fn(u32)) {
+    EPOLL_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn release_epoll(id: u32) {
+    let hook = EPOLL_RELEASE.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_epoll_release` stores a value, a `fn(u32)`.
         let hook: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(hook) };
         hook(id);
     }
@@ -537,6 +562,10 @@ impl Transport {
             }
             Some(Target::Net(net)) => {
                 release_net(net.description);
+                Ok(())
+            }
+            Some(Target::Epoll(id)) => {
+                release_epoll(id);
                 Ok(())
             }
             _ => Ok(()),
@@ -800,6 +829,17 @@ impl Transport {
                 links: 1,
                 size: 0,
                 block_size: 16_384,
+                ..CONSOLE_INFO
+            }),
+            Target::Epoll(id) => Ok(NodeInfo {
+                kind: ANON,
+                permissions: 0o600,
+                device: 7,
+                special_device: 0,
+                inode: u64::from(id) + 1,
+                links: 1,
+                size: 0,
+                block_size: 4096,
                 ..CONSOLE_INFO
             }),
             // Unnamed console transport; richer terminal metadata comes with
@@ -1500,6 +1540,16 @@ impl PosixFs {
     /// What `fd` names.
     pub fn target(&self, fd: u32) -> Result<Target, FsError> {
         self.descriptors.get(fd).map_err(FsError::from)
+    }
+
+    /// The generation of the number `fd` in the table: a number closed and
+    /// opened again has another, so a record that names the number with the
+    /// generation it had knows whether it still names the same descriptor.
+    pub fn entry_generation(&self, fd: u32) -> Result<u64, FsError> {
+        self.descriptors
+            .entry_token(fd)
+            .map(|token| token.generation())
+            .map_err(FsError::from)
     }
 
     /// What `fd` names, held for a request outside the owner's lock.

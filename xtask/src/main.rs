@@ -1683,7 +1683,8 @@ commands:
             `steps` the service counts its steps with real traffic (TCG only)
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
-            descriptors; with `steps` the service counts its steps (TCG only)
+            descriptors, epoll, poll and select over many descriptors; with
+            `steps` the service counts its steps (TCG only)
   net-wget [steps|internet] [MACHINE] run `wget` of the guest against HTTP and
             HTTPS servers of the host, the lookups of the resolver against
             name servers in the guest (`net-dns checks`), and check the

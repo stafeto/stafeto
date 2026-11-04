@@ -149,7 +149,9 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # with a label past 63 bytes refused at once; tagged pin-849c2f1b.
 # sysconf(_SC_OPEN_MAX) up to 1 024, the table of descriptors of the layer;
 # tagged pin-bb7e563d.
-COMMIT = "bb7e563d4bea7cacd354dc2e6438d3935253bfcd"
+# epoll: epoll_create1, epoll_ctl and epoll_pwait go to the layer, SOCK_CLOFORK;
+# tagged pin-429cd460.
+COMMIT = "429cd46076a19444d526ada7da46d29c4c39fba7"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

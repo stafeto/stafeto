@@ -318,6 +318,185 @@ fn kernel_error(error: Error) -> i32 {
     }
 }
 
+/// The wait of the network service for the ready records of an interest set
+/// (EPOLL_WAIT): one more subscription of `run`, whose answers are the pairs
+/// of the records that were ready (the service takes them off its list when
+/// it answers READY, so a cancel loses none).
+pub struct NetWait {
+    set: u32,
+    most: u32,
+    key: u64,
+    armed: bool,
+    label: u64,
+    /// The pairs taken: the label of a record and its events.
+    pub ready: proto_net::sockets::EpollReady,
+}
+
+// The pairs of a READY are the one large variant, and a reply lives on the stack
+// for the length of one call.
+#[allow(clippy::large_enum_variant)]
+enum NetReply {
+    Wait(u64),
+    Armed,
+    Ready(proto_net::sockets::EpollReady),
+    Cancelled,
+}
+
+/// The errno of a refusal of the network service on the wait.
+fn net_refusal(status: Status) -> i32 {
+    match status {
+        Status::Kernel(Error::LimitReached) => EAGAIN,
+        Status::Kernel(error) => kernel_error(error),
+        Status::Unknown(code) => match code {
+            proto_net::BAD_FD => EBADF,
+            proto_net::AGAIN => EAGAIN,
+            _ => EIO,
+        },
+        _ => EIO,
+    }
+}
+
+impl NetWait {
+    /// A wait on `set` for at most `most` pairs (1 to 64).
+    pub fn new(set: u32, most: u32) -> Self {
+        Self {
+            set,
+            most,
+            key: 0,
+            armed: false,
+            label: 0,
+            ready: proto_net::sockets::EpollReady::EMPTY,
+        }
+    }
+
+    fn call(
+        &self,
+        request: &proto_net::sockets::Request<'_>,
+        notify: Option<Handle<Channel>>,
+    ) -> Result<NetReply, i32> {
+        use proto_net::sockets::EpollReady;
+        let mut body = Writer::new();
+        request.write(&mut body).map_err(|_| EIO)?;
+        let session = crate::net::session().ok_or(EBADF)?;
+        let owner = Handle::<Channel>::borrowed(session);
+        let result = match notify {
+            Some(notify) => sys::send_handles(&owner, body.as_bytes(), [notify.erase()])
+                .map_err(|refused| refused.error),
+            None => sys::send(&owner, body.as_bytes()),
+        }
+        .map_err(kernel_error)?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        match long::Reply::read(result.bytes(&mut buffer)) {
+            Ok(long::Reply::Wait(key)) => Ok(NetReply::Wait(key)),
+            Ok(long::Reply::Armed) => Ok(NetReply::Armed),
+            Ok(long::Reply::Cancelled) => Ok(NetReply::Cancelled),
+            Ok(long::Reply::Ready(bytes)) => EpollReady::parse(bytes)
+                .map(NetReply::Ready)
+                .map_err(|_| EIO),
+            Err(status) => Err(net_refusal(status)),
+        }
+    }
+
+    fn wait_request(&self, key: Option<u64>, flags: u32) -> proto_net::sockets::Request<'static> {
+        proto_net::sockets::Request::EpollWait {
+            key,
+            set: self.set,
+            most: self.most,
+            flags,
+        }
+    }
+
+    fn start(&mut self) -> Result<(), i32> {
+        match self.call(&self.wait_request(None, 0), None)? {
+            NetReply::Wait(key) => {
+                self.key = key;
+                Ok(())
+            }
+            NetReply::Ready(ready) => {
+                self.ready = ready;
+                Ok(())
+            }
+            _ => Err(EIO),
+        }
+    }
+
+    /// The next pairs without waiting: the records that are ready now are
+    /// taken into `ready` in place of the pairs it had (a poll over many
+    /// descriptors asks again while each answer is full). How many came.
+    pub fn more(&mut self) -> Result<usize, i32> {
+        match self.call(
+            &self.wait_request(None, proto_net::sockets::EPOLL_DONTWAIT),
+            None,
+        )? {
+            NetReply::Ready(ready) => {
+                self.ready = ready;
+                Ok(ready.len)
+            }
+            _ => Err(EIO),
+        }
+    }
+
+    fn take(&mut self, channel: &Handle<Channel>, level: u8) -> Result<(), i32> {
+        if self.key == 0 {
+            return Ok(());
+        }
+        let notify = if self.armed {
+            None
+        } else {
+            Some(
+                sys::handle_label(
+                    channel,
+                    Rights::NOTIFY | Rights::TRANSFER,
+                    self.label,
+                    level,
+                )
+                .map_err(kernel_error)?,
+            )
+        };
+        match self.call(&self.wait_request(Some(self.key), 0), notify)? {
+            NetReply::Ready(ready) => {
+                // The operation is over with its answer.
+                self.key = 0;
+                self.armed = false;
+                self.ready = ready;
+                Ok(())
+            }
+            NetReply::Armed => {
+                self.armed = true;
+                Ok(())
+            }
+            _ => Err(EIO),
+        }
+    }
+
+    fn cancel(&mut self) -> Result<(), i32> {
+        if self.key == 0 {
+            return Ok(());
+        }
+        let request = proto_net::sockets::Request::Cancel(self.key);
+        loop {
+            match self.call(&request, None) {
+                Err(EINTR) => continue,
+                Ok(NetReply::Cancelled) => {
+                    self.key = 0;
+                    return Ok(());
+                }
+                // The set went (EPOLL_DROP, or the session): nothing waits.
+                Err(EBADF) => {
+                    self.key = 0;
+                    return Ok(());
+                }
+                _ => return Err(EIO),
+            }
+        }
+    }
+}
+impl Drop for NetWait {
+    fn drop(&mut self) {
+        let _ = self.cancel();
+    }
+}
+
 /// The terminal descriptions placed in the Watches so far.
 fn terminals_placed(subscriptions: &[Subscription]) -> usize {
     subscriptions[2..6].iter().map(|s| s.set.len).sum()
@@ -334,6 +513,7 @@ fn run(
     until: Option<u64>,
     handled: u64,
     selecting: bool,
+    mut net: Option<&mut NetWait>,
 ) -> Result<usize, i32> {
     if items.len() > LIMIT {
         return Err(EINVAL);
@@ -347,11 +527,15 @@ fn run(
     let mut ready = [0; LIMIT];
     let pins = Pins::snapshot(items, &mut ready)?;
     let transport = pins.transport.ok_or(EIO)?;
+    if let Some(net) = net.as_deref_mut() {
+        net.label = TAG | id << 4 | 9;
+    }
     // The Watches of the pipe service take `watch::MAX` elements each, those of
     // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`),
     // those of the network service `watch::MAX` again; every one has a label
     // of its own. The low four bits of a label: 0 and 4 the pipes, 1, 3, 5
-    // and 7 the terminal's, 2 the timer, 8 and 12 the network's.
+    // and 7 the terminal's, 2 the timer, 8 and 12 the network's, 9 its wait on
+    // an interest set.
     const PIPE_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
     const TERMINAL_WATCHES: usize = LIMIT.div_ceil(proto_tty::WATCH_MAX);
     const NET_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
@@ -415,6 +599,10 @@ fn run(
                 subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
                 subscriptions[at].add(description.description, requested, index);
             }
+            // A poll of an epoll descriptor reports POLLERR: a departure from
+            // Linux, which reports POLLIN when records are ready (nesting is not
+            // supported).
+            Some(Target::Epoll(_)) => ready[index] = watch::ERR,
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}
         }
@@ -446,6 +634,22 @@ fn run(
                 }
             }
         }
+        if let Some(net) = net.as_deref_mut() {
+            loop {
+                match net.start() {
+                    Err(EINTR)
+                        if block.handled.load(Ordering::SeqCst) == handled
+                            && !threads::cancel::requested() =>
+                    {
+                        continue;
+                    }
+                    result => {
+                        result?;
+                        break;
+                    }
+                }
+            }
+        }
         loop {
             if signals::pending_unblocked() {
                 signals::deliver_now();
@@ -454,6 +658,7 @@ fn run(
                 return Err(EINTR);
             }
             if ready_count(&ready[..items.len()]) != 0
+                || net.as_deref().is_some_and(|n| n.ready.len != 0)
                 || until.is_some_and(|deadline| now() >= deadline)
             {
                 return Ok(());
@@ -474,7 +679,25 @@ fn run(
                     }
                 }
             }
-            if ready_count(&ready[..items.len()]) != 0 {
+            if let Some(net) = net.as_deref_mut() {
+                loop {
+                    match net.take(&channel, level) {
+                        Err(EINTR)
+                            if block.handled.load(Ordering::SeqCst) == handled
+                                && !threads::cancel::requested() =>
+                        {
+                            continue;
+                        }
+                        result => {
+                            result?;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ready_count(&ready[..items.len()]) != 0
+                || net.as_deref().is_some_and(|n| n.ready.len != 0)
+            {
                 continue;
             }
             signals::probe_window(signals::window::POLL);
@@ -513,6 +736,11 @@ fn run(
             cleanup_error.get_or_insert(error);
         }
     }
+    if let Some(net) = net
+        && let Err(error) = net.cancel()
+    {
+        cleanup_error.get_or_insert(error);
+    }
     drop(subscriptions);
     drop(timer);
     drop(pins);
@@ -531,7 +759,7 @@ fn run(
 
 /// A cancellation boundary shared by the four C readiness interfaces.
 /// `duration` is relative nanoseconds; the temporary mask spans all cleanup.
-fn boundary<T>(
+pub(crate) fn boundary<T>(
     duration: Option<u64>,
     mask: Option<u64>,
     mut operation: impl FnMut(Option<u64>, u64) -> Result<T, i32>,
@@ -566,8 +794,266 @@ fn boundary<T>(
 
 pub fn poll(items: &mut [PollFd], duration: Option<u64>, mask: Option<u64>) -> Result<usize, i32> {
     boundary(duration, mask, |until, handled| {
-        run(items, until, handled, false)
+        engine(items, until, handled, false)
     })
+}
+
+/// The entries of an epoll wait on the other descriptors, and the wait of the
+/// service's set with them (`epoll::pwait`): `run` with the set's wait.
+pub(crate) fn run_net(
+    items: &mut [PollFd],
+    net: Option<&mut NetWait>,
+    until: Option<u64>,
+    handled: u64,
+) -> Result<usize, i32> {
+    run(items, until, handled, false, net)
+}
+
+/// The most entries a poll or select takes: the descriptors of a process.
+pub const MAX_LARGE: usize = posix_fs::OPEN_MAX;
+
+/// Up to `MAX` entries go the direct way (the holds and the Watches); more
+/// go through the engine of epoll, with a set of the network service for the
+/// sockets (`large`).
+fn engine(
+    items: &mut [PollFd],
+    until: Option<u64>,
+    handled: u64,
+    selecting: bool,
+) -> Result<usize, i32> {
+    if items.len() <= LIMIT {
+        run(items, until, handled, selecting, None)
+    } else if items.len() <= MAX_LARGE {
+        large(items, until, handled, selecting)
+    } else {
+        Err(EINVAL)
+    }
+}
+
+/// The work space of a large poll: for each descriptor number the first
+/// entry that names it (plus one), the events asked for (the union over the
+/// entries that name it) and the events that came.
+#[repr(C)]
+struct Work {
+    first: [u16; MAX_LARGE],
+    asked: [u16; MAX_LARGE],
+    got: [u16; MAX_LARGE],
+    /// For a descriptor number that names a socket the description of which
+    /// an earlier number has, that number plus one: the service keeps one
+    /// record for a description, and the events of the record are the
+    /// numbers' alike.
+    alias: [u16; MAX_LARGE],
+    /// For each place of the service's table, the first number that names a
+    /// description there, plus one.
+    owner_of_place: [u16; 1 << proto_net::sockets::SLOT_BITS],
+}
+const WORK_PAGES: usize = core::mem::size_of::<Work>().div_ceil(4096) * 4096;
+
+/// A poll or select over more than `MAX` entries (spec 6, 3.4): a temporary
+/// interest set in the network service holds the sockets, the other
+/// descriptors (at most `MAX` of them, EAGAIN past that) go the direct way,
+/// and one wait takes both. By level, one record for each number.
+#[inline(never)]
+fn large(
+    items: &mut [PollFd],
+    until: Option<u64>,
+    handled: u64,
+    selecting: bool,
+) -> Result<usize, i32> {
+    let page = crate::allocation::map_pages(WORK_PAGES).map_err(|_| EAGAIN)?;
+    // SAFETY: zeroed pages of the size of `Work`, this call's alone.
+    let work = unsafe { &mut *page.as_ptr().cast::<Work>() };
+    let mut net = NetWait::new(0, 64);
+    let result = large_in(items, until, handled, selecting, work, &mut net);
+    if net.set != 0 {
+        crate::net::epoll_drop(net.set);
+    }
+    // SAFETY: the pages came from `map_pages` and nothing uses them now.
+    unsafe { crate::allocation::unmap_pages(page, WORK_PAGES) };
+    result
+}
+
+fn large_in(
+    items: &mut [PollFd],
+    until: Option<u64>,
+    handled: u64,
+    selecting: bool,
+    work: &mut Work,
+    net: &mut NetWait,
+) -> Result<usize, i32> {
+    use proto_net::sockets::{self as wire, EpollList, EpollRecord};
+    let mut others = [PollFd::default(); LIMIT];
+    let mut other_fd = [0u16; LIMIT];
+    let mut others_len = 0;
+    // The first entry of each number, the union of the events asked.
+    for (k, item) in items.iter().enumerate() {
+        let fd = item.fd;
+        if fd < 0 || fd as usize >= MAX_LARGE {
+            continue;
+        }
+        let fd = fd as usize;
+        if work.first[fd] == 0 {
+            work.first[fd] = k as u16 + 1;
+        }
+        work.asked[fd] |= item.events as u16 & watch::EVENTS as u16;
+    }
+    let mut records = [EpollRecord::default(); wire::EPOLL_BATCH];
+    let mut count = 0;
+    let mut invalid = false;
+    let session = crate::net::session();
+    // The records of a batch go in one EPOLL_SET; the first makes the set.
+    let send = |records: &[EpollRecord], net: &mut NetWait| -> Result<(), i32> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let list = EpollList::new(records).ok_or(EIO)?;
+        let mut out = [0u32; wire::EPOLL_BATCH];
+        net.set = crate::net::epoll_set(net.set, list, &mut out)?;
+        // A description that closed meanwhile is not an error of the poll.
+        if out[..records.len()]
+            .iter()
+            .any(|&status| status != 0 && status != proto_net::BAD_FD)
+        {
+            return Err(EAGAIN);
+        }
+        Ok(())
+    };
+    // The targets in groups of 64 under one lock each.
+    let mut start = 0;
+    while start < items.len() {
+        let end = (start + 64).min(items.len());
+        let mut targets = [None; 64];
+        let mut numbers = [u32::MAX; 64];
+        for (k, item) in items[start..end].iter().enumerate() {
+            let fd = item.fd;
+            if fd >= 0
+                && (fd as usize) < MAX_LARGE
+                && work.first[fd as usize] == (start + k) as u16 + 1
+            {
+                numbers[k] = fd as u32;
+            }
+        }
+        shared::with_descriptors(&numbers[..end - start], |files| {
+            for (k, &fd) in numbers[..end - start].iter().enumerate() {
+                if fd != u32::MAX {
+                    targets[k] = Some(files.target(fd).ok());
+                }
+            }
+            Ok(())
+        })?;
+        for (k, target) in targets[..end - start].iter().enumerate() {
+            let Some(target) = *target else { continue };
+            let at = start + k;
+            let fd = items[at].fd as usize;
+            match target {
+                None => {
+                    invalid = true;
+                    work.got[fd] |= watch::NVAL as u16;
+                }
+                Some(Target::Net(n)) if session.is_some() => {
+                    let place = wire::slot(n.description);
+                    let owner = usize::from(work.owner_of_place[place]);
+                    if owner != 0 {
+                        // Another number of the same description: its events
+                        // join the record of that number (a MOD).
+                        work.alias[fd] = owner as u16;
+                        let first = usize::from(work.first[owner - 1]) - 1;
+                        work.asked[owner - 1] |= work.asked[fd];
+                        records[count] = EpollRecord {
+                            action: wire::EPOLL_MOD,
+                            description: n.description,
+                            events: u32::from(work.asked[owner - 1]),
+                            label: first as u32,
+                        };
+                        count += 1;
+                        if count == records.len() {
+                            send(&records[..count], net)?;
+                            count = 0;
+                        }
+                        continue;
+                    }
+                    work.owner_of_place[place] = fd as u16 + 1;
+                    records[count] = EpollRecord {
+                        action: wire::EPOLL_ADD,
+                        description: n.description,
+                        events: u32::from(work.asked[fd]),
+                        label: at as u32,
+                    };
+                    count += 1;
+                    if count == records.len() {
+                        send(&records[..count], net)?;
+                        count = 0;
+                    }
+                }
+                Some(_) => {
+                    // At most `LIMIT` other descriptors: EAGAIN past that.
+                    if others_len == LIMIT {
+                        return Err(EAGAIN);
+                    }
+                    others[others_len] = PollFd {
+                        fd: fd as i32,
+                        events: work.asked[fd] as i16,
+                        revents: 0,
+                    };
+                    other_fd[others_len] = fd as u16;
+                    others_len += 1;
+                }
+            }
+        }
+        start = end;
+    }
+    send(&records[..count], net)?;
+    if invalid && selecting {
+        return Err(EBADF);
+    }
+    let with_net = net.set != 0;
+    run(
+        &mut others[..others_len],
+        until,
+        handled,
+        selecting,
+        with_net.then_some(&mut *net),
+    )?;
+    for k in 0..others_len {
+        work.got[usize::from(other_fd[k])] |= others[k].revents as u16;
+    }
+    // The pairs came in answers of 64 at most: ask again while one was full.
+    let mut absorbed = 0;
+    loop {
+        for &(label, events) in net.ready.as_slice() {
+            let fd = items[label as usize].fd as usize;
+            work.got[fd] |= events as u16;
+        }
+        absorbed += 1;
+        if !with_net || net.ready.len < 64 || absorbed > MAX_LARGE / 64 + 1 {
+            break;
+        }
+        if net.more()? == 0 {
+            break;
+        }
+    }
+    for item in items.iter() {
+        let fd = item.fd;
+        if fd >= 0 && (fd as usize) < MAX_LARGE && work.alias[fd as usize] != 0 {
+            let owner = usize::from(work.alias[fd as usize]) - 1;
+            work.got[fd as usize] |= work.got[owner];
+        }
+    }
+    let mut total = 0;
+    for item in items.iter_mut() {
+        let fd = item.fd;
+        item.revents = if fd < 0 {
+            0
+        } else if fd as usize >= MAX_LARGE || work.first[fd as usize] == 0 {
+            watch::NVAL as i16
+        } else {
+            (u32::from(work.got[fd as usize]) & (item.events as u16 as u32 | watch::ALWAYS)) as i16
+        };
+        if item.revents != 0 {
+            total += 1;
+        }
+    }
+    Ok(total)
 }
 
 /// Select preserves input sets on failure and counts each returned set bit.
@@ -581,30 +1067,37 @@ pub fn select(
         if !(0..=posix_types::FD_SETSIZE as i32).contains(&nfds) {
             return Err(EINVAL);
         }
-        let mut items = [PollFd::default(); LIMIT];
+        let named = (0..nfds as usize)
+            .filter(|&fd| has(&sets[0], fd) || has(&sets[1], fd) || has(&sets[2], fd))
+            .count();
+        if (0..nfds as usize).any(|fd| {
+            fd >= posix_fs::OPEN_MAX
+                && (has(&sets[0], fd) || has(&sets[1], fd) || has(&sets[2], fd))
+        }) {
+            return Err(EBADF);
+        }
+        // Up to `LIMIT` entries live on the stack, more in pages of the heap.
+        let mut small = [PollFd::default(); LIMIT];
+        let pages = if named > LIMIT {
+            let size = (named * core::mem::size_of::<PollFd>()).div_ceil(4096) * 4096;
+            Some((
+                crate::allocation::map_pages(size).map_err(|_| EAGAIN)?,
+                size,
+            ))
+        } else {
+            None
+        };
+        let items: &mut [PollFd] = match pages {
+            // SAFETY: zeroed pages for `named` entries, this call's alone.
+            Some((page, _)) => unsafe {
+                core::slice::from_raw_parts_mut(page.as_ptr().cast::<PollFd>(), named)
+            },
+            None => &mut small[..named],
+        };
         let mut count = 0;
         for fd in 0..nfds as usize {
             let bits = [has(&sets[0], fd), has(&sets[1], fd), has(&sets[2], fd)];
             if bits.iter().any(|&b| b) {
-                if fd >= posix_fs::OPEN_MAX {
-                    return Err(EBADF);
-                }
-                if count == LIMIT {
-                    // More descriptors than a watch takes: EBADF for one that
-                    // is no descriptor, else EINVAL.
-                    for other in 0..nfds as usize {
-                        let named =
-                            has(&sets[0], other) || has(&sets[1], other) || has(&sets[2], other);
-                        if named
-                            && !crate::shared::with_files(|files| {
-                                Ok(files.target(other as u32).is_ok())
-                            })?
-                        {
-                            return Err(EBADF);
-                        }
-                    }
-                    return Err(EINVAL);
-                }
                 items[count] = PollFd {
                     fd: fd as i32,
                     events: ((if bits[0] { watch::IN } else { 0 })
@@ -616,26 +1109,35 @@ pub fn select(
                 count += 1;
             }
         }
-        run(&mut items[..count], until, handled, true)?;
-        let mut output = [[0; 16]; 3];
-        let mut bits = 0;
-        for item in &items[..count] {
-            let fd = item.fd as usize;
-            let ready = item.revents as u16 as u32;
-            for (set, events) in [
-                watch::IN | watch::HUP | watch::ERR,
-                watch::OUT | watch::ERR,
-                watch::PRI,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if has(&sets[set], fd) && ready & events != 0 {
-                    output[set][fd / 64] |= 1 << (fd % 64);
-                    bits += 1;
+        let polled = engine(&mut items[..count], until, handled, true);
+        let items = &items[..count];
+        let result = polled.map(|_| {
+            let mut output = [[0; 16]; 3];
+            let mut bits = 0;
+            for item in items {
+                let fd = item.fd as usize;
+                let ready = item.revents as u16 as u32;
+                for (set, events) in [
+                    watch::IN | watch::HUP | watch::ERR,
+                    watch::OUT | watch::ERR,
+                    watch::PRI,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if has(&sets[set], fd) && ready & events != 0 {
+                        output[set][fd / 64] |= 1 << (fd % 64);
+                        bits += 1;
+                    }
                 }
             }
+            (output, bits)
+        });
+        if let Some((page, size)) = pages {
+            // SAFETY: the pages came from `map_pages` and nothing uses them now.
+            unsafe { crate::allocation::unmap_pages(page, size) };
         }
+        let (output, bits) = result?;
         *sets = output;
         Ok((bits, until.map(|until| until.saturating_sub(now()))))
     })

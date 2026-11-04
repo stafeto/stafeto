@@ -53,7 +53,7 @@
 
 use abi::{Error, MESSAGE_MAX};
 use proto_init::ServiceArgs;
-use proto_net::sockets::{self, Request};
+use proto_net::sockets::{self, EpollList, EpollReady, EpollRecord, Request};
 use proto_net::text::{Ip, Mac};
 use proto_net::{Address, Config, Method, NET_DOWN, code};
 use proto_wire::{Status, Writer, long};
@@ -121,6 +121,7 @@ fn main(_: u64) -> u64 {
             b'W' => probe.wire_echo(&mut session),
             b'C' => probe.clone_many(&mut session),
             b'A' => probe.abandon_many(&mut session),
+            b'E' => probe.epoll_sets(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -1974,6 +1975,503 @@ impl Probe<'_> {
         }
         config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: abandon ok {WAITING} in {asked} asks");
+        *keep = Some(root);
+        Ok(())
+    }
+
+    /// One EPOLL_SET of `records` in `set` (0 makes a set): the set.
+    fn epoll_set(
+        &self,
+        net: &Handle<Channel>,
+        set: u32,
+        records: &[EpollRecord],
+    ) -> Result<u32, &'static str> {
+        let list = EpollList::new(records).ok_or("an epoll list")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let reply = socket_call(net, &Request::EpollSet { set, list }, &mut buffer)
+            .map_err(|_| "EPOLL_SET refused")?;
+        let mut statuses = [0u32; sockets::EPOLL_BATCH];
+        let set = sockets::read_epoll_set(reply, records.len(), &mut statuses)
+            .map_err(|_| "EPOLL_SET's reply")?;
+        if statuses[..records.len()].iter().any(|&s| s != 0) {
+            rt::println!(
+                "net-probe: EPOLL_SET statuses {:?}",
+                &statuses[..records.len()]
+            );
+            return Err("an EPOLL_SET record was refused");
+        }
+        Ok(set)
+    }
+
+    /// EPOLL_WAIT of `set` with `most` pairs: the pairs (a start that waits
+    /// gives the key instead).
+    fn epoll_wait_now(
+        &self,
+        net: &Handle<Channel>,
+        set: u32,
+        most: u32,
+    ) -> Result<EpollReady, &'static str> {
+        let mut buffer = [0; MESSAGE_MAX];
+        let request = Request::EpollWait {
+            key: None,
+            set,
+            most,
+            flags: sockets::EPOLL_DONTWAIT,
+        };
+        let reply = socket_call(net, &request, &mut buffer).map_err(|_| "EPOLL_WAIT failed")?;
+        EpollReady::parse(ready(reply).map_err(|_| "EPOLL_WAIT was not ready")?)
+            .map_err(|_| "EPOLL_WAIT's pairs")
+    }
+
+    /// Role `E`: epoll in the service. The sets and records of sixteen
+    /// places that fifteen other sessions watch (EPOLL_SET with a batch on
+    /// places with fifteen records), a wait of 64 pairs after 64 stale
+    /// records, the step of waking over places with records and sets with
+    /// waiting operations, the drop of a set of 1 000 records and the
+    /// departure of sessions with sets (the steps of CLEANUP).
+    fn epoll_sets(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        const PLACES: usize = sockets::EPOLL_BATCH;
+        const WATCHERS: usize = 15;
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        self.config_ready(&root)?;
+        let rec = |action: u32, description: u32, events: u32, label: u32| EpollRecord {
+            action,
+            description,
+            events,
+            label,
+        };
+        let mut places = [0u32; PLACES];
+        for (i, d) in places.iter_mut().enumerate() {
+            *d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, *d, [127, 0, 0, 1], 9400 + i as u32)
+                .map_err(|_| "BIND failed")?;
+        }
+        // Fifteen sessions, each with a set that watches every place for IN,
+        // and a wait of its own that is armed.
+        let mut watchers: [Option<(Handle<Channel>, u32, u64)>; WATCHERS] =
+            [const { None }; WATCHERS];
+        for (k, slot) in watchers.iter_mut().enumerate() {
+            let session = self
+                .clone_with(&root, &places)
+                .map_err(|_| "CLONE failed")?;
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records.iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    places[i],
+                    proto_net::sockets::epoll::IN,
+                    i as u32,
+                );
+            }
+            // One record at a time, as the layer's epoll_ctl does: the
+            // steps of the batches that are measured below come after these
+            // and are each the longest of their kind so far.
+            let mut set = 0;
+            for batch in records.chunks(1) {
+                set = self.epoll_set(&session, set, batch)?;
+            }
+            let request = Request::EpollWait {
+                key: None,
+                set,
+                most: 64,
+                flags: 0,
+            };
+            let key = self.start_wait(&session, &request)?;
+            let take = Request::EpollWait {
+                key: Some(key),
+                set,
+                most: 64,
+                flags: 0,
+            };
+            if !self.take_armed(&session, &take, 700 + k as u64)? {
+                return Err("a wait of a set was ready with nothing to report");
+            }
+            *slot = Some((session, set, key));
+        }
+        // The batches of 4, 8 and 16 records on places that hold fifteen
+        // records each: the steps of EPOLL_SET the batch is chosen by.
+        for size in [4usize, 8, 16] {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records[..size].iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    places[i],
+                    proto_net::sockets::epoll::OUT,
+                    i as u32,
+                );
+            }
+            let set = self.epoll_set(&root, 0, &records[..size])?;
+            for r in records[..size].iter_mut() {
+                r.action = sockets::EPOLL_DEL;
+            }
+            self.epoll_set(&root, set, &records[..size])?;
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            rt::println!("net-probe: epoll batch {size} ok");
+        }
+        // The step of waking: a datagram to each place tells the fifteen
+        // waits (the set of each lists the place's record and is due).
+        let sender = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        self.bind(&root, sender, [127, 0, 0, 1], 9390)
+            .map_err(|_| "BIND failed")?;
+        for i in 0..PLACES {
+            let request = Request::Send {
+                key: None,
+                description: sender,
+                flags: 0,
+                address: Address::v4([127, 0, 0, 1], 9400 + i as u32),
+                data: b"e",
+            };
+            self.plain(&root, request).map_err(|_| "SEND failed")?;
+        }
+        self.sleep(200_000_000);
+        for (k, slot) in watchers.iter().enumerate() {
+            let Some((session, set, key)) = slot else {
+                return Err("a watcher is missing");
+            };
+            let take = Request::EpollWait {
+                key: Some(*key),
+                set: *set,
+                most: 64,
+                flags: 0,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            let reply = socket_call(session, &take, &mut buffer).map_err(|_| "a take failed")?;
+            let pairs = EpollReady::parse(ready(reply).map_err(|_| "a take was not ready")?)
+                .map_err(|_| "a take's pairs")?;
+            if pairs.len != PLACES {
+                rt::println!("net-probe: watcher {k} got {} pairs", pairs.len);
+                return Err("a watcher did not get a pair for each place");
+            }
+        }
+        rt::println!("net-probe: epoll wake ok {WATCHERS}");
+        // RECV and SEND on places that have sixteen records: every request that
+        // touches a place with records works out its events and looks at them.
+        {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records.iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    places[i],
+                    proto_net::sockets::epoll::IN,
+                    i as u32,
+                );
+            }
+            let set = self.epoll_set(&root, 0, &records)?;
+            for &place in &places {
+                let take = Request::Recv {
+                    key: None,
+                    description: place,
+                    flags: sockets::DONTWAIT,
+                    most: PIECE as u32,
+                };
+                self.plain(&root, take).map_err(|_| "RECV failed")?;
+                let send = Request::Send {
+                    key: None,
+                    description: place,
+                    flags: 0,
+                    address: Address::v4([127, 0, 0, 1], 9390),
+                    data: b"q",
+                };
+                self.plain(&root, send).map_err(|_| "SEND failed")?;
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            rt::println!("net-probe: epoll requests ok");
+        }
+        // A wait of 64 pairs behind 64 records that report nothing now: 128
+        // records looked at.
+        let stale: [u32; 64] = core::array::from_fn(|_| 0);
+        let mut stale = stale;
+        let mut valid = [0u32; 64];
+        for (i, d) in stale.iter_mut().enumerate() {
+            *d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, *d, [127, 0, 0, 1], 9500 + i as u32)
+                .map_err(|_| "BIND failed")?;
+            let request = Request::Send {
+                key: None,
+                description: sender,
+                flags: 0,
+                address: Address::v4([127, 0, 0, 1], 9500 + i as u32),
+                data: b"s",
+            };
+            self.plain(&root, request).map_err(|_| "SEND failed")?;
+        }
+        for (i, d) in valid.iter_mut().enumerate() {
+            *d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, *d, [127, 0, 0, 1], 9600 + i as u32)
+                .map_err(|_| "BIND failed")?;
+        }
+        self.sleep(200_000_000);
+        let mut set = 0;
+        for chunk in 0..4 {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records.iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    stale[chunk * PLACES + i],
+                    proto_net::sockets::epoll::IN,
+                    (chunk * PLACES + i) as u32,
+                );
+            }
+            set = self.epoll_set(&root, set, &records)?;
+        }
+        for d in stale {
+            let request = Request::Recv {
+                key: None,
+                description: d,
+                flags: sockets::DONTWAIT,
+                most: PIECE as u32,
+            };
+            self.plain(&root, request).map_err(|_| "RECV failed")?;
+        }
+        for chunk in 0..4 {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records.iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    valid[chunk * PLACES + i],
+                    proto_net::sockets::epoll::OUT,
+                    (100 + chunk * PLACES + i) as u32,
+                );
+            }
+            set = self.epoll_set(&root, set, &records)?;
+        }
+        let pairs = self.epoll_wait_now(&root, set, 64)?;
+        if pairs.len != 64 {
+            rt::println!("net-probe: {} pairs", pairs.len);
+            return Err("the wait did not give 64 pairs");
+        }
+        rt::println!("net-probe: epoll wait ok 64 after 64 stale");
+        // A request that changes a place with records brings what the service
+        // knows of its events up to date: a datagram taken while the steps of
+        // the stack are held (no step of waking follows) leaves no stale report.
+        {
+            let d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, d, [127, 0, 0, 1], 9700)
+                .map_err(|_| "BIND failed")?;
+            let set = self.epoll_set(
+                &root,
+                0,
+                &[rec(sockets::EPOLL_ADD, d, proto_net::sockets::epoll::IN, 1)],
+            )?;
+            let request = Request::Send {
+                key: None,
+                description: sender,
+                flags: 0,
+                address: Address::v4([127, 0, 0, 1], 9700),
+                data: b"r",
+            };
+            self.plain(&root, request).map_err(|_| "SEND failed")?;
+            self.sleep(100_000_000);
+            self.hold(&root, proto_net::HOLD_ON)?;
+            let take = Request::Recv {
+                key: None,
+                description: d,
+                flags: sockets::DONTWAIT,
+                most: PIECE as u32,
+            };
+            self.plain(&root, take).map_err(|_| "RECV failed")?;
+            let pairs = self.epoll_wait_now(&root, set, 64);
+            self.hold(&root, proto_net::HOLD_OFF)?;
+            if pairs?.len != 0 {
+                return Err("a place that was read was still reported");
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        // A session that lets go of a description takes its records off the
+        // place, which another session still holds: 17 rounds of 64 places
+        // through one set (it takes 1 024 records) never fill it.
+        {
+            let set = self.epoll_set(&root, 0, &[])?;
+            // The holders stay until the end: the places are held all the time.
+            let mut holders: [Option<Handle<Channel>>; 17] = [const { None }; 17];
+            for holder in holders.iter_mut() {
+                let mut group = [0u32; 64];
+                for d in group.iter_mut() {
+                    *d = self
+                        .new_socket(&root, sockets::DGRAM)
+                        .map_err(|_| "SOCKET failed")?;
+                }
+                *holder = Some(self.clone_with(&root, &group).map_err(|_| "CLONE failed")?);
+                for chunk in group.chunks(PLACES) {
+                    let mut records = [EpollRecord::default(); PLACES];
+                    for (r, &d) in records.iter_mut().zip(chunk) {
+                        *r = rec(sockets::EPOLL_ADD, d, proto_net::sockets::epoll::IN, 0);
+                    }
+                    self.epoll_set(&root, set, &records[..chunk.len()])?;
+                }
+                for &d in &group {
+                    self.close(&root, d).map_err(|_| "CLOSE failed")?;
+                }
+            }
+            drop(holders);
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut w = Writer::new();
+            Request::EpollDrop(set)
+                .write(&mut w)
+                .map_err(|_| "EPOLL_DROP's request")?;
+            call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+            rt::println!("net-probe: epoll close ok");
+        }
+        // A request that makes a set ready wakes nobody itself: sixteen waits
+        // of one set are told by the step of waking, eight at a time, and the
+        // EPOLL_SET step stays short.
+        {
+            let u = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            let session = self.clone_with(&root, &[u]).map_err(|_| "CLONE failed")?;
+            let set = self.epoll_set(&session, 0, &[])?;
+            let mut keys = [0u64; 16];
+            for (k, key) in keys.iter_mut().enumerate() {
+                let start = Request::EpollWait {
+                    key: None,
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                *key = self.start_wait(&session, &start)?;
+                let take = Request::EpollWait {
+                    key: Some(*key),
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                if !self.take_armed(&session, &take, 900 + k as u64)? {
+                    return Err("a wait of an empty set was ready");
+                }
+            }
+            self.epoll_set(
+                &session,
+                set,
+                &[rec(
+                    sockets::EPOLL_ADD,
+                    u,
+                    proto_net::sockets::epoll::OUT,
+                    5,
+                )],
+            )?;
+            self.sleep(100_000_000);
+            for (k, key) in keys.iter().enumerate() {
+                let take = Request::EpollWait {
+                    key: Some(*key),
+                    set,
+                    most: 64,
+                    flags: 0,
+                };
+                let mut buffer = [0; MESSAGE_MAX];
+                let reply =
+                    socket_call(&session, &take, &mut buffer).map_err(|_| "a take failed")?;
+                let ready = EpollReady::parse(ready(reply).map_err(|_| "a take was not ready")?)
+                    .map_err(|_| "a take's pairs")?;
+                // The first take has the record; the others find it listed
+                // again (by level) and report it as well.
+                if ready.len == 0 {
+                    rt::println!("net-probe: wait {k} of the set was told and found nothing");
+                    return Err("a wait of a ready set found nothing");
+                }
+            }
+            drop(session);
+            self.close(&root, u).map_err(|_| "CLOSE failed")?;
+        }
+        // A set of 800 records dropped, then the sessions that watch.
+        let mut big = [0u32; 800];
+        let mut made = 0;
+        while made < big.len() {
+            let d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            big[made] = d;
+            made += 1;
+        }
+        let mut big_set = 0;
+        for chunk in big.chunks(PLACES) {
+            let mut records = [EpollRecord::default(); PLACES];
+            for (i, r) in records[..chunk.len()].iter_mut().enumerate() {
+                *r = rec(
+                    sockets::EPOLL_ADD,
+                    chunk[i],
+                    proto_net::sockets::epoll::OUT,
+                    i as u32,
+                );
+            }
+            big_set = self.epoll_set(&root, big_set, &records[..chunk.len()])?;
+        }
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut w = Writer::new();
+        Request::EpollDrop(big_set)
+            .write(&mut w)
+            .map_err(|_| "EPOLL_DROP's request")?;
+        call(&root, w.as_bytes(), &mut buffer).map_err(|_| "EPOLL_DROP failed")?;
+        let request = Request::EpollSet {
+            set: big_set,
+            list: EpollList::new(&[]).ok_or("a list")?,
+        };
+        match socket_call(&root, &request, &mut buffer) {
+            Err(fail) if is(&fail, proto_net::BAD_FD) => {}
+            _ => return Err("a dropped set answered"),
+        }
+        for d in big {
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        // The fifteen sessions go with their sets and the waits armed.
+        for slot in watchers.iter_mut() {
+            drop(slot.take());
+        }
+        self.sleep(300_000_000);
+        // The sets of the sessions that went are free again: fifteen new
+        // sessions make four sets each, and the root three more (it has one
+        // still), which fills the 64 sets of the service and no more.
+        let mut sessions: [Option<Handle<Channel>>; WATCHERS] = [const { None }; WATCHERS];
+        for slot in sessions.iter_mut() {
+            let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
+            for _ in 0..4 {
+                self.epoll_set(&session, 0, &[])?;
+            }
+            *slot = Some(session);
+        }
+        for _ in 0..3 {
+            self.epoll_set(&root, 0, &[])?;
+        }
+        match self.epoll_set(&root, 0, &[]) {
+            Err(_) => {}
+            Ok(_) => return Err("the service made a set past its 64"),
+        }
+        drop(sessions);
+        for d in stale.iter().chain(valid.iter()).chain(places.iter()) {
+            self.close(&root, *d).map_err(|_| "CLOSE failed")?;
+        }
+        self.close(&root, sender).map_err(|_| "CLOSE failed")?;
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: epoll ok");
         *keep = Some(root);
         Ok(())
     }

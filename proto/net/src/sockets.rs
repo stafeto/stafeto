@@ -48,8 +48,152 @@ pub mod opt {
     pub const NODELAY: u32 = 32;
     /// The description's own flag NONBLOCK, for `fcntl`.
     pub const NONBLOCK: u32 = 33;
-    /// Reserved for a later stage (the bytes ready to read).
+    /// The bytes ready to read: of a stream the bytes in the queue of
+    /// receiving, of a datagram socket the length of the next datagram.
     pub const NREAD: u32 = 34;
+}
+
+/// The records one EPOLL_SET carries at most: the largest of 16, 8 and 4 for
+/// which the step with records on a place that holds 15 already stays within
+/// the budget of a step (`cargo xtask net-probe steps`, role `e`).
+pub const EPOLL_BATCH: usize = 16;
+/// The pairs one EPOLL_WAIT answers at most.
+pub const EPOLL_MOST: usize = 64;
+/// The actions of a record of EPOLL_SET.
+pub const EPOLL_ADD: u32 = 1;
+pub const EPOLL_MOD: u32 = 2;
+pub const EPOLL_DEL: u32 = 3;
+/// The bits of events on the wire are those of Linux's epoll.
+pub mod epoll {
+    pub const IN: u32 = 0x1;
+    pub const PRI: u32 = 0x2;
+    pub const OUT: u32 = 0x4;
+    pub const ERR: u32 = 0x8;
+    pub const HUP: u32 = 0x10;
+    pub const RDNORM: u32 = 0x40;
+    pub const WRNORM: u32 = 0x100;
+    pub const RDHUP: u32 = 0x2000;
+    pub const EXCLUSIVE: u32 = 1 << 28;
+    pub const ONESHOT: u32 = 1 << 30;
+    pub const ET: u32 = 1 << 31;
+    /// The events a record may ask for besides the modes.
+    pub const EVENTS: u32 = IN | PRI | OUT | ERR | HUP | RDNORM | WRNORM | RDHUP;
+}
+
+/// One record of EPOLL_SET.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EpollRecord {
+    pub action: u32,
+    pub description: u32,
+    pub events: u32,
+    pub label: u32,
+}
+
+/// The records of an EPOLL_SET.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpollList {
+    pub len: usize,
+    pub records: [EpollRecord; EPOLL_BATCH],
+}
+
+impl EpollList {
+    pub fn new(items: &[EpollRecord]) -> Option<EpollList> {
+        let mut list = EpollList {
+            len: items.len(),
+            records: [EpollRecord::default(); EPOLL_BATCH],
+        };
+        list.records.get_mut(..items.len())?.copy_from_slice(items);
+        Some(list)
+    }
+
+    pub fn as_slice(&self) -> &[EpollRecord] {
+        &self.records[..self.len]
+    }
+}
+
+/// The pairs of an EPOLL_WAIT's READY: the label of the record and the events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpollReady {
+    pub len: usize,
+    pub pairs: [(u32, u32); EPOLL_MOST],
+}
+
+impl EpollReady {
+    pub const EMPTY: EpollReady = EpollReady {
+        len: 0,
+        pairs: [(0, 0); EPOLL_MOST],
+    };
+
+    pub fn push(&mut self, label: u32, events: u32) -> bool {
+        match self.pairs.get_mut(self.len) {
+            Some(pair) => {
+                *pair = (label, events);
+                self.len += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        &self.pairs[..self.len]
+    }
+
+    /// The data of READY.
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.len as u32)?;
+        for &(label, events) in self.as_slice() {
+            w.u32(label)?;
+            w.u32(events)?;
+        }
+        Ok(())
+    }
+
+    /// The pairs of the data of a READY: BAD_SIZE unless the count is within
+    /// `EPOLL_MOST` and the bytes are exactly those of the pairs.
+    pub fn parse(data: &[u8]) -> Result<EpollReady, Status> {
+        let mut r = Reader::new(data);
+        let len = r.u32()? as usize;
+        if len > EPOLL_MOST {
+            return Err(Status::BadSize);
+        }
+        let mut ready = EpollReady::EMPTY;
+        for pair in &mut ready.pairs[..len] {
+            *pair = (r.u32()?, r.u32()?);
+        }
+        ready.len = len;
+        r.finish()?;
+        Ok(ready)
+    }
+}
+
+/// EPOLL_WAIT's flag: no waiting, READY with no pairs when none is ready.
+pub const EPOLL_DONTWAIT: u32 = DONTWAIT;
+
+/// EPOLL_SET's reply: status 0, the set and one status word for each record.
+pub fn write_epoll_set(w: &mut Writer, set: u32, statuses: &[u32]) -> Result<(), Status> {
+    w.u32(Status::Ok.code())?;
+    w.u32(set)?;
+    for &status in statuses {
+        w.u32(status)?;
+    }
+    Ok(())
+}
+
+/// The set and the statuses of a reply of EPOLL_SET with `count` records
+/// (`statuses` gets them); a refusal is the error.
+pub fn read_epoll_set(reply: &[u8], count: usize, statuses: &mut [u32]) -> Result<u32, Status> {
+    let mut r = Reader::new(reply);
+    match Status::from_code(r.u32()?) {
+        Status::Ok => {}
+        status => return Err(status),
+    }
+    let set = r.u32()?;
+    for status in statuses.get_mut(..count).ok_or(Status::BadSize)? {
+        *status = r.u32()?;
+    }
+    r.finish()?;
+    Ok(set)
 }
 
 /// The bits of a description on the wire: the place in the service's table
@@ -163,6 +307,18 @@ pub enum Request<'a> {
         list: List,
     },
     Cancel(u64),
+    /// The interest records of a set of the session (0 makes a set).
+    EpollSet {
+        set: u32,
+        list: EpollList,
+    },
+    EpollDrop(u32),
+    EpollWait {
+        key: Option<u64>,
+        set: u32,
+        most: u32,
+        flags: u32,
+    },
 }
 
 impl<'a> Request<'a> {
@@ -192,6 +348,10 @@ impl<'a> Request<'a> {
             Request::Clone(_) => Method::Clone,
             Request::CloneMore { .. } => Method::CloneMore,
             Request::Cancel(_) => Method::Cancel,
+            Request::EpollSet { .. } => Method::EpollSet,
+            Request::EpollDrop(_) => Method::EpollDrop,
+            Request::EpollWait { key: None, .. } => Method::EpollWait,
+            Request::EpollWait { .. } => Method::EpollWaitTake,
         }
     }
 
@@ -311,6 +471,29 @@ impl<'a> Request<'a> {
                     w.u32(d)?;
                 }
                 Ok(())
+            }
+            Request::EpollSet { set, list } => {
+                w.u32(set)?;
+                w.u32(list.len as u32)?;
+                for record in list.as_slice() {
+                    w.u32(record.action)?;
+                    w.u32(record.description)?;
+                    w.u32(record.events)?;
+                    w.u32(record.label)?;
+                }
+                Ok(())
+            }
+            Request::EpollDrop(set) => w.u32(set),
+            Request::EpollWait {
+                key,
+                set,
+                most,
+                flags,
+            } => {
+                put_key(w, key)?;
+                w.u32(set)?;
+                w.u32(most)?;
+                w.u32(flags)
             }
         }
     }
@@ -453,6 +636,42 @@ impl<'a> Request<'a> {
                     *item = b.u32()?;
                 }
                 Ok(Request::CloneMore { birth, list })
+            })(),
+            Method::EpollSet => (|| {
+                let set = b.u32()?;
+                let count = b.u32()? as usize;
+                if count > EPOLL_BATCH {
+                    return Err(Status::BadSize);
+                }
+                let mut list = EpollList {
+                    len: count,
+                    records: [EpollRecord::default(); EPOLL_BATCH],
+                };
+                for record in &mut list.records[..count] {
+                    *record = EpollRecord {
+                        action: b.u32()?,
+                        description: b.u32()?,
+                        events: b.u32()?,
+                        label: b.u32()?,
+                    };
+                }
+                Ok(Request::EpollSet { set, list })
+            })(),
+            Method::EpollDrop => (|| Ok(Request::EpollDrop(b.u32()?)))(),
+            Method::EpollWait | Method::EpollWaitTake => (|| {
+                let key = get_key(b, method == Method::EpollWaitTake)?;
+                let set = b.u32()?;
+                let most = b.u32()?;
+                let flags = b.u32()?;
+                if !(1..=EPOLL_MOST as u32).contains(&most) || flags & !EPOLL_DONTWAIT != 0 {
+                    return Err(Status::BadSize);
+                }
+                Ok(Request::EpollWait {
+                    key,
+                    set,
+                    most,
+                    flags,
+                })
             })(),
             _ => return None,
         };
@@ -704,6 +923,41 @@ mod tests {
                 list: List::new(&[1, 2, 3 | 1 << 12]).unwrap(),
             },
             Request::Cancel(13),
+            Request::EpollSet {
+                set: 0,
+                list: EpollList::new(&[]).unwrap(),
+            },
+            Request::EpollSet {
+                set: 3 | 2 << 8,
+                list: EpollList::new(&[
+                    EpollRecord {
+                        action: EPOLL_ADD,
+                        description: 5,
+                        events: epoll::IN | epoll::ET,
+                        label: 0x0001_0007,
+                    },
+                    EpollRecord {
+                        action: EPOLL_DEL,
+                        description: 6,
+                        events: 0,
+                        label: 0,
+                    },
+                ])
+                .unwrap(),
+            },
+            Request::EpollDrop(3 | 2 << 8),
+            Request::EpollWait {
+                key: None,
+                set: 1,
+                most: 64,
+                flags: 0,
+            },
+            Request::EpollWait {
+                key: Some(5),
+                set: 1,
+                most: 1,
+                flags: EPOLL_DONTWAIT,
+            },
         ]
     }
 
@@ -875,6 +1129,60 @@ mod tests {
         let mut w = Writer::new();
         write_abandoned(&mut w, 4).unwrap();
         assert_eq!(read_abandoned(w.as_bytes()), Ok(4));
+    }
+
+    #[test]
+    fn epoll_requests_and_replies_fit_and_round_trip() {
+        let full = EpollList::new(&[EpollRecord::default(); EPOLL_BATCH]).unwrap();
+        let bytes = written(&Request::EpollSet { set: 1, list: full });
+        assert_eq!(bytes.len(), 8 + 8 + EPOLL_BATCH * 16);
+        assert!(bytes.len() <= MESSAGE_MAX);
+        assert!(EpollList::new(&[EpollRecord::default(); EPOLL_BATCH + 1]).is_none());
+        // One record more than a batch is a bad size.
+        let mut over = written(&Request::EpollSet {
+            set: 1,
+            list: EpollList::new(&[]).unwrap(),
+        });
+        over[12..16].copy_from_slice(&(EPOLL_BATCH as u32 + 1).to_le_bytes());
+        over.extend_from_slice(&[0; (EPOLL_BATCH + 1) * 16]);
+        assert_eq!(parsed(&over), Err(Status::BadSize));
+        // The most pairs of a wait are one to 64, and the flags only DONTWAIT.
+        for (most, flags) in [(0u32, 0u32), (65, 0), (1, 1), (1, 4)] {
+            let mut bytes = written(&Request::EpollWait {
+                key: None,
+                set: 1,
+                most: 1,
+                flags: 0,
+            });
+            let at = bytes.len() - 8;
+            bytes[at..at + 4].copy_from_slice(&most.to_le_bytes());
+            bytes[at + 4..].copy_from_slice(&flags.to_le_bytes());
+            assert_eq!(parsed(&bytes), Err(Status::BadSize), "{most} {flags}");
+        }
+        // The longest reply: 64 pairs in a READY.
+        let mut ready = EpollReady::EMPTY;
+        for k in 0..EPOLL_MOST as u32 {
+            assert!(ready.push(k, epoll::IN));
+        }
+        assert!(!ready.push(0, 0));
+        let mut inner = Writer::new();
+        ready.write(&mut inner).unwrap();
+        assert_eq!(EpollReady::parse(inner.as_bytes()), Ok(ready));
+        let mut w = Writer::new();
+        proto_wire::long::Reply::Ready(inner.as_bytes())
+            .write(&mut w)
+            .unwrap();
+        assert_eq!(w.as_bytes().len(), 4 + 4 + 4 + 64 * 8);
+        assert!(w.as_bytes().len() <= MESSAGE_MAX);
+        let mut cut = inner.as_bytes().to_vec();
+        cut.pop();
+        assert_eq!(EpollReady::parse(&cut), Err(Status::BadSize));
+        let mut w = Writer::new();
+        write_epoll_set(&mut w, 9, &[0, crate::EXISTS]).unwrap();
+        let mut statuses = [0; 2];
+        assert_eq!(read_epoll_set(w.as_bytes(), 2, &mut statuses), Ok(9));
+        assert_eq!(statuses, [0, crate::EXISTS]);
+        assert!(read_epoll_set(w.as_bytes(), 1, &mut statuses).is_err());
     }
 
     #[test]

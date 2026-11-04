@@ -953,6 +953,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the network service is the clone the
         // parent made, which holds the descriptions the child keeps.
         crate::net::after_fork(handle(raw(Slot::Net)));
+        // The instances of epoll are the parent's, whose set the parent's
+        // session holds: the child's calls on them are EBADF.
+        crate::epoll::after_fork();
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();

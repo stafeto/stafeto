@@ -9,7 +9,7 @@
 //! The first stage answers CONFIG, and PING and CRASH in a build with the
 //! feature `probe`; the second answers the sockets' methods of TCP and UDP
 //! over IPv4, with a loopback. A method of a later stage takes the next free
-//! number between 32 and 61. All the numbers are below 64: the steps of the
+//! number between 35 and 61. All the numbers are below 64: the steps of the
 //! service loop count the methods up to the notice at 64.
 //!
 //! A socket is a description, one u32 on the wire: the place in the
@@ -34,6 +34,9 @@
 //! | SETOPT (15) | description, name, value (u32 each) | status |
 //! | NAME (16) | description, whose (u32: 0 own, 1 the peer's) | status, `Address` |
 //! | WATCH (17), WATCH_TAKE (28), WATCH_CANCEL (29) | `proto_wire::watch` | as the terminal service's |
+//! | EPOLL_SET (22) | set (u32, 0 makes a new one), count (u32, 0..=`EPOLL_BATCH`), and for each record: action (u32: ADD 1, MOD 2, DEL 3), description, events (u32, the bits of Linux), label (u32) | status, set (u32), one status word for each record (0 or a code) |
+//! | EPOLL_DROP (32) | set | status |
+//! | EPOLL_WAIT (33), EPOLL_WAIT_TAKE (34) | [k], set, most (u32, 1..=`EPOLL_MOST`), flags (u32, DONTWAIT 2) | long: READY count (u32), then the pairs (label u32, events u32) |
 //! | ABANDON (18) | the header alone | status, how many of the session's long operations are left (u32); the caller asks again until 0 |
 //! | CLONE (19) | count (u32, 0..=64), descriptions | status, the birth (u32), one handle: the new session |
 //! | CLONE_MORE (20) | the birth (u32, CLONE's reply), count (u32, 1..=64), descriptions | status |
@@ -93,12 +96,15 @@ pub enum Method {
     WatchCancel = 29,
     Hold = 30,
     PingWire = 31,
+    EpollDrop = 32,
+    EpollWait = 33,
+    EpollWaitTake = 34,
     Ping = 62,
     Crash = 63,
 }
 
 impl Method {
-    pub const ALL: [Method; 33] = [
+    pub const ALL: [Method; 36] = [
         Method::Socket,
         Method::Bind,
         Method::Listen,
@@ -130,6 +136,9 @@ impl Method {
         Method::WatchCancel,
         Method::Hold,
         Method::PingWire,
+        Method::EpollDrop,
+        Method::EpollWait,
+        Method::EpollWaitTake,
         Method::Ping,
         Method::Crash,
     ];
@@ -176,10 +185,16 @@ pub const NET_DOWN: u32 = 727;
 pub const TIMEOUT: u32 = 728;
 pub const ALREADY: u32 = 729;
 pub const IN_PROGRESS: u32 = 730;
+/// An interest record that exists already (EPOLL_SET, ADD).
+pub const EXISTS: u32 = 731;
+/// No such interest record (EPOLL_SET, MOD and DEL).
+pub const NO_ENTRY: u32 = 732;
+/// A limit of the interest tables: the records of a place, of a set, or of the service.
+pub const NO_SPACE: u32 = 733;
 
 /// Every code of the service, for the checks that none repeats and none
 /// is a code of the wire (below 512).
-pub const CODES: [u32; 24] = [
+pub const CODES: [u32; 27] = [
     BAD_FD,
     AGAIN,
     MFILE,
@@ -204,6 +219,9 @@ pub const CODES: [u32; 24] = [
     TIMEOUT,
     ALREADY,
     IN_PROGRESS,
+    EXISTS,
+    NO_ENTRY,
+    NO_SPACE,
 ];
 
 pub const fn code(code: u32) -> Status {
@@ -466,14 +484,14 @@ mod tests {
     #[test]
     fn the_methods_keep_their_numbers() {
         let numbers: Vec<_> = Method::ALL.iter().map(|m| m.number()).collect();
-        let mut expected: Vec<u16> = (1..=31).collect();
+        let mut expected: Vec<u16> = (1..=34).collect();
         expected.extend([62, 63]);
         assert_eq!(numbers, expected);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(32), None);
+        assert_eq!(Method::from_number(35), None);
         assert_eq!(Method::from_number(61), None);
         // The steps of the service loop count the methods below the notice.
         assert!(Method::ALL.iter().all(|m| m.number() < 64));
@@ -515,9 +533,12 @@ mod tests {
                 NET_DOWN,
                 TIMEOUT,
                 ALREADY,
-                IN_PROGRESS
+                IN_PROGRESS,
+                EXISTS,
+                NO_ENTRY,
+                NO_SPACE
             ],
-            [724, 725, 726, 727, 728, 729, 730]
+            [724, 725, 726, 727, 728, 729, 730, 731, 732, 733]
         );
     }
 

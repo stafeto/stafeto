@@ -12,6 +12,7 @@ abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg", features = ["write"] }
 kcore = { path = "../kcore" }
 netd = { path = "../services/netd" }
+proto-net = { path = "../proto/net" }
 rtc = { path = "../lib/rtc" }
 
 [dev-dependencies]

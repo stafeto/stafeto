@@ -5,7 +5,8 @@
  * The checks of the descriptors and sockets of a process that serves many
  * (stage P4a of subproject 6): a table of 1 024 descriptors, the limit,
  * the lowest free number, 1 000 sockets, a fork and an exec with many
- * descriptors, and the buffers of the sockets by their place in the service.
+ * descriptors, and the buffers of the sockets by their place in the service;
+ * epoll, and poll and select over more than 64 descriptors.
  * Run as a dynamic program of the image with the network service:
  *
  *   posix-net ADDRESS            every check, a line `posix-net: NAME ok` each
@@ -13,6 +14,7 @@
  *                                every number named is open and does not close
  *                                on exec
  *   posix-net spawn-child FD     the image of the check `spawn-high`: FD is open
+ *   posix-net epoll-child FD     the image of the check `epoll-exec`: FD is not open
  *
  * A failure prints `posix-net: NAME failed: WHAT errno N` and the exit code
  * is 1. Built with -fno-builtin; every result is compared.
@@ -20,9 +22,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +72,12 @@ static long now_ms(void)
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+static void pause_ms(long ms)
+{
+	struct timespec t = { ms / 1000, (ms % 1000) * 1000000L };
+	nanosleep(&t, NULL);
 }
 
 /* A listener on the loopback and a port of the service's choosing. */
@@ -462,6 +474,890 @@ static void bind_reuse_accepted(void)
 	}
 }
 
+/* ------------------------------------------------------------------ epoll */
+
+static void nonblock(int fd)
+{
+	int flags = fcntl(fd, F_GETFL);
+	REQUIRE(flags >= 0);
+	REQUIRE(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+}
+
+static int ep_new(void)
+{
+	int ep = epoll_create1(0);
+	REQUIRE(ep >= 0);
+	return ep;
+}
+
+static void ep_do(int ep, int op, int fd, uint32_t events, uint64_t data)
+{
+	struct epoll_event e;
+	memset(&e, 0, sizeof e);
+	e.events = events;
+	e.data.u64 = data;
+	REQUIRE(epoll_ctl(ep, op, fd, &e) == 0);
+}
+
+static void ep_add(int ep, int fd, uint32_t events, uint64_t data)
+{
+	ep_do(ep, EPOLL_CTL_ADD, fd, events, data);
+}
+
+/* The events of one wait; at most 64 of them come at once. */
+static int ep_wait(int ep, struct epoll_event *out, int ms)
+{
+	return epoll_wait(ep, out, 64, ms);
+}
+
+/* Reads until the descriptor has nothing (EAGAIN). */
+static void drain(int fd)
+{
+	char buf[256];
+	for (;;) {
+		ssize_t n = read(fd, buf, sizeof buf);
+		if (n < 0) {
+			REQUIRE(errno == EAGAIN);
+			return;
+		}
+		REQUIRE(n > 0);
+	}
+}
+
+/* Waits for `want` events in all, each token once (a token is below `size`);
+ * `seen` counts the tokens. Fails after `ms`. */
+static void collect(int ep, int want, unsigned char *seen, int size, int ms)
+{
+	struct epoll_event ev[64];
+	int total = 0;
+	long end = now_ms() + ms;
+	while (total < want) {
+		long left = end - now_ms();
+		if (left <= 0) {
+			printf("posix-net: %s failed: %d of %d events came\n", check, total, want);
+			for (int i = 0; i < size; i++)
+				if (!seen[i])
+					printf("posix-net: missing %d\n", i);
+			fflush(stdout);
+		}
+		REQUIRE(left > 0);
+		int n = ep_wait(ep, ev, (int)left);
+		REQUIRE(n >= 0);
+		for (int i = 0; i < n; i++) {
+			uint64_t token = ev[i].data.u64;
+			REQUIRE(token < (uint64_t)size);
+			REQUIRE(seen[token] == 0);
+			seen[token] = 1;
+			total++;
+		}
+	}
+	REQUIRE(total == want);
+}
+
+static void epoll_basic(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = epoll_create1(EPOLL_CLOEXEC);
+	REQUIRE(ep >= 0);
+	REQUIRE((fcntl(ep, F_GETFD) & FD_CLOEXEC) != 0);
+	struct stat st;
+	REQUIRE(fstat(ep, &st) == 0 && (st.st_mode & 0777) == 0600);
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN, 41);
+	ep_add(ep, c, EPOLLOUT, 42);
+	/* The client is writable at once, the server has nothing to read. */
+	REQUIRE(ep_wait(ep, ev, 0) == 1);
+	REQUIRE(ev[0].data.u64 == 42 && (ev[0].events & EPOLLOUT));
+	REQUIRE(send(c, "a", 1, 0) == 1);
+	int n = ep_wait(ep, ev, 2000);
+	REQUIRE(n >= 1);
+	int found = 0;
+	for (int i = 0; i < n; i++)
+		if (ev[i].data.u64 == 41) {
+			REQUIRE(ev[i].events & EPOLLIN);
+			found = 1;
+		}
+	REQUIRE(found);
+	/* MOD changes the data word, DEL ends the reports. */
+	ep_do(ep, EPOLL_CTL_MOD, s, EPOLLIN, 43);
+	found = 0;
+	n = ep_wait(ep, ev, 0);
+	for (int i = 0; i < n; i++)
+		if (ev[i].data.u64 == 43)
+			found = 1;
+	REQUIRE(found);
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, s, NULL) == 0);
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, c, NULL) == 0);
+	REQUIRE(ep_wait(ep, ev, 100) == 0);
+	REQUIRE(close(ep) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* 100 connections and a socket of AF_UNIX in one set, by edge: every event
+ * comes once, twice over. */
+static void epoll_200(void)
+{
+	int port, lis = listener(4, &port);
+	static int client[100], server[100];
+	static unsigned char seen[101];
+	int ep = ep_new();
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	nonblock(u[0]);
+	for (int i = 0; i < 100; i++) {
+		pair(lis, port, &client[i], &server[i]);
+		nonblock(server[i]);
+		ep_add(ep, server[i], EPOLLIN | EPOLLET, (uint64_t)i);
+	}
+	ep_add(ep, u[0], EPOLLIN | EPOLLET, 100);
+	struct epoll_event ev[64];
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	for (int round = 0; round < 2; round++) {
+		memset(seen, 0, sizeof seen);
+		for (int i = 0; i < 100; i++)
+			REQUIRE(send(client[i], "x", 1, 0) == 1);
+		REQUIRE(write(u[1], "y", 1) == 1);
+		collect(ep, 101, seen, 101, 10000);
+		/* By edge nothing comes again. */
+		REQUIRE(ep_wait(ep, ev, 200) == 0);
+		for (int i = 0; i < 100; i++)
+			drain(server[i]);
+		drain(u[0]);
+	}
+	for (int i = 0; i < 100; i++) {
+		REQUIRE(close(client[i]) == 0);
+		REQUIRE(close(server[i]) == 0);
+	}
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* By level a socket with bytes is reported again and again, and not once
+ * they are read. */
+static void epoll_lt(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN, 7);
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	REQUIRE(send(c, "ab", 2, 0) == 2);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 7);
+	REQUIRE(ep_wait(ep, ev, 0) == 1 && ev[0].data.u64 == 7);
+	char buf[2];
+	REQUIRE(recv(s, buf, 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 0) == 1);
+	REQUIRE(recv(s, buf, 1, 0) == 1);
+	/* Nothing left: no false report, and a read finds nothing. */
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	REQUIRE(recv(s, buf, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* By edge a report comes with new bytes, and the bytes left bring none. */
+static void epoll_et(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	nonblock(s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN | EPOLLET, 9);
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	REQUIRE(send(c, "a", 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 9);
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	REQUIRE(send(c, "b", 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 9);
+	/* Two bytes wait; one is read; no new bytes, no report. */
+	char buf[2];
+	REQUIRE(recv(s, buf, 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	drain(s);
+	REQUIRE(ep_wait(ep, ev, 100) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* A pipe by edge: the second message wakes the wait after the reader found
+ * nothing (EAGAIN). */
+static void epoll_et_pipe(void)
+{
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	nonblock(p[0]);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, p[0], EPOLLIN | EPOLLET, 5);
+	REQUIRE(write(p[1], "one", 3) == 3);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 5);
+	REQUIRE(ep_wait(ep, ev, 100) == 0);
+	drain(p[0]);
+	REQUIRE(write(p[1], "two", 3) == 3);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 5);
+	drain(p[0]);
+	/* A socket pair of AF_UNIX the same way. */
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	nonblock(u[0]);
+	ep_add(ep, u[0], EPOLLIN | EPOLLET, 6);
+	REQUIRE(write(u[1], "m1", 2) == 2);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 6);
+	drain(u[0]);
+	REQUIRE(write(u[1], "m2", 2) == 2);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 6);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0 && close(ep) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0);
+}
+
+static void epoll_oneshot(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN | EPOLLONESHOT, 3);
+	REQUIRE(send(c, "a", 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 3);
+	/* The bytes are still there, and the record is off. */
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	ep_do(ep, EPOLL_CTL_MOD, s, EPOLLIN | EPOLLONESHOT, 4);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 4);
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	/* A pipe the same way. */
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	ep_add(ep, p[0], EPOLLIN | EPOLLONESHOT, 8);
+	REQUIRE(write(p[1], "x", 1) == 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 8);
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* A number that closed is no longer reported, and its record does not
+ * name the socket that takes the number. */
+static void epoll_close(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN, 1);
+	/* The description lives on in a copy, and the number closes. */
+	int d = dup(s);
+	REQUIRE(d >= 0);
+	REQUIRE(close(s) == 0);
+	REQUIRE(send(c, "a", 1, 0) == 1);
+	REQUIRE(ep_wait(ep, ev, 300) == 0);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, s, NULL) == -1 && errno == EBADF);
+	/* The copy of the description is another number: it can be added, and
+	 * the byte that came is reported for it. */
+	ep_add(ep, d, EPOLLIN, 3);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 3);
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, d, NULL) == 0);
+	/* The lowest number is s again, a new socket's. */
+	int n = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(n == s);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	REQUIRE(connect(n, (struct sockaddr *)&a, sizeof a) == 0);
+	int peer = accept(lis, NULL, NULL);
+	REQUIRE(peer >= 0);
+	REQUIRE(send(peer, "b", 1, 0) == 1);
+	struct pollfd pf = { n, POLLIN, 0 };
+	REQUIRE(poll(&pf, 1, 2000) == 1);
+	REQUIRE(ep_wait(ep, ev, 300) == 0);
+	/* No record of the old number is in the way of the new one. */
+	ep_add(ep, n, EPOLLIN, 2);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 2);
+	REQUIRE(close(n) == 0);
+	/* Sockets that come and go on the same numbers and places leave no
+	 * records behind. */
+	for (int k = 0; k < 40; k++) {
+		int cc = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(cc >= 0);
+		REQUIRE(connect(cc, (struct sockaddr *)&a, sizeof a) == 0);
+		int ss = accept(lis, NULL, NULL);
+		REQUIRE(ss >= 0);
+		ep_add(ep, ss, EPOLLIN, (uint64_t)(100 + k));
+		REQUIRE(close(ss) == 0);
+		REQUIRE(close(cc) == 0);
+	}
+	REQUIRE(close(peer) == 0 && close(d) == 0 && close(c) == 0);
+	REQUIRE(close(ep) == 0 && close(lis) == 0);
+}
+
+/* The child of a fork has the epoll descriptor but not the set: EBADF; its
+ * close succeeds; the parent's wait goes on. */
+static void epoll_fork(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN, 12);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		int bad = 0;
+		errno = 0;
+		if (epoll_wait(ep, ev, 8, 0) != -1 || errno != EBADF)
+			bad |= 1;
+		errno = 0;
+		struct epoll_event e = { EPOLLIN, { .u64 = 1 } };
+		if (epoll_ctl(ep, EPOLL_CTL_ADD, c, &e) != -1 || errno != EBADF)
+			bad |= 2;
+		if (close(ep) != 0)
+			bad |= 4;
+		/* The parent is waiting: this byte wakes it. */
+		if (send(c, "z", 1, 0) != 1)
+			bad |= 8;
+		_exit(bad);
+	}
+	REQUIRE(ep_wait(ep, ev, 10000) == 1 && ev[0].data.u64 == 12);
+	REQUIRE(wait_exit(child) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+static int epoll_child(int fd)
+{
+	errno = 0;
+	if (fcntl(fd, F_GETFD) != -1 || errno != EBADF)
+		return 1;
+	/* The number is free: the next descriptor takes it. */
+	int p[2];
+	if (pipe(p) != 0 || p[0] > fd)
+		return 2;
+	return 0;
+}
+
+/* An epoll descriptor closes at exec whatever its flags: the number is free
+ * in the new image. */
+static void epoll_exec(void)
+{
+	int ep = ep_new();
+	char number[16];
+	snprintf(number, sizeof number, "%d", ep);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		char *argv[] = { (char *)self, "epoll-child", number, NULL };
+		execv(self, argv);
+		_exit(99);
+	}
+	REQUIRE(wait_exit(child) == 0);
+	REQUIRE(close(ep) == 0);
+}
+
+static void epoll_errors(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event e = { EPOLLIN, { .u64 = 1 } };
+	ep_add(ep, s, EPOLLIN, 1);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, s, &e) == -1 && errno == EEXIST);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_MOD, c, &e) == -1 && errno == ENOENT);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, c, NULL) == -1 && errno == ENOENT);
+	int file = open(self, O_RDONLY);
+	REQUIRE(file >= 0);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, file, &e) == -1 && errno == EPERM);
+	/* EPOLLEXCLUSIVE: an ADD with the bits Linux allows with it goes (nginx
+	 * adds its listening sockets so); MOD and other bits are EINVAL. */
+	struct epoll_event ex = { EPOLLIN | EPOLLEXCLUSIVE, { .u64 = 1 } };
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, c, &ex) == 0);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_MOD, c, &ex) == -1 && errno == EINVAL);
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_DEL, c, NULL) == 0);
+	struct epoll_event bad = { EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT, { .u64 = 1 } };
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, c, &bad) == -1 && errno == EINVAL);
+	bad.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLRDHUP;
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, c, &bad) == -1 && errno == EINVAL);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, ep, &e) == -1 && errno == EINVAL);
+	int ep2 = ep_new();
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, ep2, &e) == -1 && errno == EINVAL);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, EPOLL_CTL_ADD, 999, &e) == -1 && errno == EBADF);
+	errno = 0;
+	REQUIRE(epoll_ctl(s, EPOLL_CTL_ADD, c, &e) == -1 && errno == EINVAL);
+	errno = 0;
+	REQUIRE(epoll_ctl(ep, 9, c, &e) == -1 && errno == EINVAL);
+	errno = 0;
+	REQUIRE(epoll_wait(ep, &e, 0, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	REQUIRE(epoll_create1(1) == -1 && errno == EINVAL);
+	REQUIRE(close(file) == 0 && close(ep2) == 0 && close(ep) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+static void epoll_rdhup(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, s, EPOLLIN | EPOLLRDHUP, 1);
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	REQUIRE(shutdown(c, SHUT_WR) == 0);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1);
+	REQUIRE((ev[0].events & EPOLLRDHUP) && (ev[0].events & EPOLLIN));
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+/* A reset is an error of the socket, once. */
+static void epoll_err_rst(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, c, EPOLLIN, 1);
+	REQUIRE(send(c, "x", 1, 0) == 1);
+	struct pollfd pf = { s, POLLIN, 0 };
+	REQUIRE(poll(&pf, 1, 2000) == 1);
+	/* The server closes with a byte unread: the client is reset. */
+	REQUIRE(close(s) == 0);
+	REQUIRE(ep_wait(ep, ev, 5000) == 1);
+	REQUIRE(ev[0].events & EPOLLERR);
+	int err = 0;
+	socklen_t len = sizeof err;
+	REQUIRE(getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &len) == 0);
+	REQUIRE(err == ECONNRESET);
+	len = sizeof err;
+	REQUIRE(getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &len) == 0);
+	REQUIRE(err == 0);
+	REQUIRE(close(c) == 0 && close(ep) == 0 && close(lis) == 0);
+}
+
+static volatile int alarms;
+
+static void on_alarm(int sig)
+{
+	(void)sig;
+	alarms++;
+}
+
+/* A signal ends the wait with EINTR even with SA_RESTART; the mask of
+ * epoll_pwait holds one back for the time of the wait. */
+static void epoll_signal(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = on_alarm;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	REQUIRE(sigaction(SIGALRM, &sa, NULL) == 0);
+	int ep = ep_new();
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	ep_add(ep, p[0], EPOLLIN, 1);
+	struct epoll_event ev[4];
+	alarms = 0;
+	alarm(1);
+	errno = 0;
+	long began = now_ms();
+	REQUIRE(epoll_wait(ep, ev, 4, 8000) == -1 && errno == EINTR);
+	REQUIRE(alarms == 1 && now_ms() - began < 6000);
+	/* The signal is blocked; the mask of epoll_pwait lets it in for the
+	 * time of the wait, and the blocked mask is back after. */
+	sigset_t held, empty, after;
+	sigemptyset(&held);
+	sigaddset(&held, SIGALRM);
+	sigemptyset(&empty);
+	REQUIRE(sigprocmask(SIG_BLOCK, &held, NULL) == 0);
+	alarm(1);
+	errno = 0;
+	REQUIRE(epoll_pwait(ep, ev, 4, 8000, &empty) == -1 && errno == EINTR);
+	REQUIRE(alarms == 2);
+	REQUIRE(sigprocmask(SIG_SETMASK, NULL, &after) == 0 && sigismember(&after, SIGALRM) == 1);
+	/* And without the mask the same signal waits until it is unblocked. */
+	alarm(1);
+	REQUIRE(epoll_wait(ep, ev, 4, 1500) == 0);
+	REQUIRE(alarms == 2);
+	REQUIRE(sigprocmask(SIG_UNBLOCK, &held, NULL) == 0);
+	for (int i = 0; i < 100 && alarms < 3; i++)
+		pause_ms(20);
+	REQUIRE(alarms == 3);
+	sa.sa_handler = SIG_DFL;
+	REQUIRE(sigaction(SIGALRM, &sa, NULL) == 0);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0 && close(ep) == 0);
+}
+
+/* The wait of a set whose list of ready records holds 500 that report
+ * nothing now (their bytes were read; more than the start and the take of a wait look at, 2 * 128): the byte that comes for the last of
+ * them wakes the wait. */
+static void epoll_stale_list(void)
+{
+	int port, lis = listener(4, &port);
+	static int client[500], server[500];
+	int ep = ep_new();
+	for (int i = 0; i < 500; i++) {
+		pair(lis, port, &client[i], &server[i]);
+		nonblock(server[i]);
+		ep_add(ep, server[i], EPOLLIN, (uint64_t)i);
+		REQUIRE(send(client[i], "x", 1, 0) == 1);
+	}
+	struct epoll_event ev[64];
+	static unsigned char seen[500];
+	int total = 0, last = -1;
+	long end = now_ms() + 50000;
+	while (total < 500) {
+		REQUIRE(now_ms() < end);
+		int n = ep_wait(ep, ev, 1000);
+		REQUIRE(n >= 0);
+		for (int i = 0; i < n; i++) {
+			if (!seen[ev[i].data.u64]) {
+				seen[ev[i].data.u64] = 1;
+				total++;
+			}
+			last = (int)ev[i].data.u64;
+		}
+	}
+	for (int i = 0; i < 500; i++)
+		drain(server[i]);
+	/* The last record reported is the last in the list. */
+	REQUIRE(last >= 0);
+	REQUIRE(send(client[last], "y", 1, 0) == 1);
+	long began = now_ms();
+	int n = ep_wait(ep, ev, 5000);
+	REQUIRE(n == 1 && ev[0].data.u64 == (uint64_t)last);
+	REQUIRE(now_ms() - began < 1000);
+	for (int i = 0; i < 500; i++) {
+		REQUIRE(close(client[i]) == 0);
+		REQUIRE(close(server[i]) == 0);
+	}
+	REQUIRE(close(ep) == 0 && close(lis) == 0);
+}
+
+/* A record by edge for IN and OUT: OUT comes once, and a byte brings IN
+ * alone; a write to a full buffer, drained by the peer, brings OUT again. */
+static void epoll_et_inout(void)
+{
+	int u[2];
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	nonblock(u[0]);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, u[0], EPOLLIN | EPOLLOUT | EPOLLET, 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].events == EPOLLOUT);
+	REQUIRE(write(u[1], "b", 1) == 1);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].events == EPOLLIN);
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	drain(u[0]);
+	/* A socket of the service the same way: fill, drain, one OUT. */
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	nonblock(c);
+	nonblock(s);
+	ep_add(ep, c, EPOLLIN | EPOLLOUT | EPOLLET, 2);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 2 && ev[0].events == EPOLLOUT);
+	static char block[800];
+	memset(block, 'f', sizeof block);
+	/* Write until EAGAIN; room that came while the buffer filled is reported
+	 * (once) and written again, until a write finds none and all is quiet. */
+	int quiet = 0;
+	for (int round = 0; round < 30 && !quiet; round++) {
+		for (;;) {
+			ssize_t n = send(c, block, sizeof block, 0);
+			if (n < 0) {
+				REQUIRE(errno == EAGAIN);
+				break;
+			}
+		}
+		quiet = ep_wait(ep, ev, 300) == 0;
+	}
+	REQUIRE(quiet);
+	drain(s);
+	REQUIRE(ep_wait(ep, ev, 3000) == 1 && ev[0].data.u64 == 2 && (ev[0].events & EPOLLOUT));
+	REQUIRE(ep_wait(ep, ev, 300) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(ep) == 0);
+}
+
+/* A listening socket in a set: two connections are one report by level,
+ * and none once both are accepted. */
+static void epoll_listener(void)
+{
+	int port, lis = listener(4, &port);
+	int ep = ep_new();
+	struct epoll_event ev[64];
+	ep_add(ep, lis, EPOLLIN, 1);
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int c1 = socket(AF_INET, SOCK_STREAM, 0);
+	int c2 = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(c1 >= 0 && c2 >= 0);
+	REQUIRE(connect(c1, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(connect(c2, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1 && ev[0].data.u64 == 1 && (ev[0].events & EPOLLIN));
+	int s1 = accept(lis, NULL, NULL);
+	REQUIRE(s1 >= 0);
+	REQUIRE(ep_wait(ep, ev, 2000) == 1);
+	int s2 = accept(lis, NULL, NULL);
+	REQUIRE(s2 >= 0);
+	REQUIRE(ep_wait(ep, ev, 300) == 0);
+	REQUIRE(close(c1) == 0 && close(c2) == 0 && close(s1) == 0 && close(s2) == 0);
+	REQUIRE(close(ep) == 0 && close(lis) == 0);
+}
+
+static int thread_ep;
+static int thread_events;
+static int thread_errno;
+
+static void *thread_waiter(void *arg)
+{
+	(void)arg;
+	struct epoll_event ev[8];
+	thread_events = epoll_wait(thread_ep, ev, 8, 5000);
+	thread_errno = errno;
+	return NULL;
+}
+
+/* One thread waits while another adds a socket that is ready already: the
+ * event reaches the waiter (it is not lost between the add and its answer). */
+static void epoll_threads(void)
+{
+	int port, lis = listener(4, &port);
+	thread_ep = ep_new();
+	for (int round = 0; round < 40; round++) {
+		int c, s;
+		pair(lis, port, &c, &s);
+		REQUIRE(send(c, "t", 1, 0) == 1);
+		struct pollfd pf = { s, POLLIN, 0 };
+		REQUIRE(poll(&pf, 1, 2000) == 1);
+		pthread_t waiter;
+		thread_events = -2;
+		REQUIRE(pthread_create(&waiter, NULL, thread_waiter, NULL) == 0);
+		pause_ms(round % 4);
+		ep_add(thread_ep, s, EPOLLIN | EPOLLET, (uint64_t)round);
+		REQUIRE(pthread_join(waiter, NULL) == 0);
+		if (thread_events != 1) {
+			/* The add reported it, or the wait did: one of them has it. */
+			struct epoll_event ev[8];
+			printf("posix-net: epoll-threads failed: the waiter got %d, errno %d\n", thread_events, thread_errno);
+			REQUIRE(thread_events == 0 || thread_events == -1);
+			REQUIRE(ep_wait(thread_ep, ev, 0) == 0);
+			fail("an event of an add was lost");
+		}
+		REQUIRE(epoll_ctl(thread_ep, EPOLL_CTL_DEL, s, NULL) == 0);
+		REQUIRE(close(c) == 0 && close(s) == 0);
+	}
+	REQUIRE(close(thread_ep) == 0 && close(lis) == 0);
+}
+
+#define PAIRS 500
+static int cl[PAIRS], sv[PAIRS];
+
+/* PAIRS connections through one listener. */
+static void many_pairs(void)
+{
+	int port, lis = listener(4, &port);
+	for (int i = 0; i < PAIRS; i++)
+		pair(lis, port, &cl[i], &sv[i]);
+	REQUIRE(close(lis) == 0);
+}
+
+static void close_pairs(void)
+{
+	for (int i = 0; i < PAIRS; i++) {
+		REQUIRE(close(cl[i]) == 0);
+		REQUIRE(close(sv[i]) == 0);
+	}
+}
+
+/* A poll of 1 000 descriptors goes through the service's engine. */
+static void poll_1000(void)
+{
+	many_pairs();
+	static struct pollfd fds[2 * PAIRS];
+	for (int i = 0; i < PAIRS; i++) {
+		fds[2 * i] = (struct pollfd){ cl[i], POLLIN, 0 };
+		fds[2 * i + 1] = (struct pollfd){ sv[i], POLLIN, 0 };
+	}
+	REQUIRE(poll(fds, 2 * PAIRS, 0) == 0);
+	for (int i = 0; i < 10; i++)
+		REQUIRE(send(cl[i * 50], "x", 1, 0) == 1);
+	/* The bytes cross the loopback: wait until all ten are in. */
+	long began = now_ms();
+	int ready = 0;
+	while (ready < 10 && now_ms() - began < 5000) {
+		for (int i = 0; i < 2 * PAIRS; i++)
+			fds[i].revents = 0;
+		ready = poll(fds, 2 * PAIRS, 1000);
+		REQUIRE(ready >= 0);
+	}
+	long took = now_ms() - began;
+	REQUIRE(ready == 10);
+	for (int i = 0; i < 2 * PAIRS; i++) {
+		int want = (i % 2 == 1 && (i / 2) % 50 == 0);
+		REQUIRE((fds[i].revents != 0) == want);
+		if (want)
+			REQUIRE(fds[i].revents == POLLIN);
+	}
+	printf("posix-net: poll-1000 took %ld ms\n", took);
+	/* Every socket can send. */
+	for (int i = 0; i < 2 * PAIRS; i++) {
+		fds[i].events = POLLOUT;
+		fds[i].revents = 0;
+	}
+	REQUIRE(poll(fds, 2 * PAIRS, 1000) == 2 * PAIRS);
+	for (int i = 0; i < 2 * PAIRS; i++)
+		REQUIRE(fds[i].revents == POLLOUT);
+	/* A descriptor that is no descriptor, and a number twice. */
+	fds[0] = (struct pollfd){ 1020, POLLIN, 0 };
+	fds[1] = (struct pollfd){ sv[0], POLLIN, 0 };
+	fds[2] = (struct pollfd){ sv[0], POLLOUT, 0 };
+	for (int i = 3; i < 2 * PAIRS; i++)
+		fds[i] = (struct pollfd){ -1, 0, 0 };
+	REQUIRE(poll(fds, 2 * PAIRS, 1000) == 3);
+	REQUIRE(fds[0].revents == POLLNVAL && fds[1].revents == POLLIN && fds[2].revents == POLLOUT);
+	/* Two numbers of one description. */
+	int copy = dup(sv[0]);
+	REQUIRE(copy >= 0);
+	fds[0] = (struct pollfd){ sv[0], POLLIN, 0 };
+	fds[1] = (struct pollfd){ copy, POLLIN | POLLOUT, 0 };
+	fds[2] = (struct pollfd){ -1, 0, 0 };
+	REQUIRE(poll(fds, 2 * PAIRS, 1000) == 2);
+	REQUIRE(fds[0].revents == POLLIN && fds[1].revents == (POLLIN | POLLOUT));
+	REQUIRE(close(copy) == 0);
+	close_pairs();
+}
+
+static void select_high(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	REQUIRE(dup2(s, 900) == 900);
+	fd_set rd;
+	struct timeval none = { 0, 0 };
+	FD_ZERO(&rd);
+	FD_SET(900, &rd);
+	REQUIRE(select(901, &rd, NULL, NULL, &none) == 0);
+	REQUIRE(send(c, "a", 1, 0) == 1);
+	struct timeval first = { 2, 0 };
+	FD_ZERO(&rd);
+	FD_SET(900, &rd);
+	REQUIRE(select(901, &rd, NULL, NULL, &first) == 1 && FD_ISSET(900, &rd));
+	/* More than 64 named: seventy sockets and the high number. */
+	static int a[35], b[35];
+	for (int i = 0; i < 35; i++)
+		pair(lis, port, &a[i], &b[i]);
+	REQUIRE(send(a[20], "q", 1, 0) == 1);
+	struct timeval wait = { 3, 0 };
+	FD_ZERO(&rd);
+	for (int i = 0; i < 35; i++) {
+		FD_SET(a[i], &rd);
+		FD_SET(b[i], &rd);
+	}
+	FD_SET(900, &rd);
+	int n = select(901, &rd, NULL, NULL, &wait);
+	REQUIRE(n == 2);
+	REQUIRE(FD_ISSET(b[20], &rd) && FD_ISSET(900, &rd));
+	for (int i = 0; i < 35; i++) {
+		REQUIRE(close(a[i]) == 0);
+		REQUIRE(close(b[i]) == 0);
+	}
+	REQUIRE(close(900) == 0 && close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* The bytes ready to read of a stream, and the next datagram's length. */
+static void fionread(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s;
+	pair(lis, port, &c, &s);
+	int n = -1;
+	REQUIRE(ioctl(s, FIONREAD, &n) == 0 && n == 0);
+	static char block[4096];
+	memset(block, 'k', sizeof block);
+	REQUIRE(send(c, block, sizeof block, MSG_WAITALL) == (ssize_t)sizeof block);
+	long end = now_ms() + 5000;
+	for (;;) {
+		REQUIRE(ioctl(s, FIONREAD, &n) == 0);
+		if (n == 4096 || now_ms() > end)
+			break;
+		pause_ms(10);
+	}
+	REQUIRE(n == 4096);
+	char buf[100];
+	REQUIRE(recv(s, buf, sizeof buf, 0) == (ssize_t)sizeof buf);
+	REQUIRE(ioctl(s, FIONREAD, &n) == 0 && n == 4096 - 100);
+	int u1 = socket(AF_INET, SOCK_DGRAM, 0);
+	int u2 = socket(AF_INET, SOCK_DGRAM, 0);
+	REQUIRE(u1 >= 0 && u2 >= 0);
+	struct sockaddr_in a = at(LOOPBACK, 0);
+	REQUIRE(bind(u2, (struct sockaddr *)&a, sizeof a) == 0);
+	socklen_t len = sizeof a;
+	REQUIRE(getsockname(u2, (struct sockaddr *)&a, &len) == 0);
+	REQUIRE(ioctl(u2, FIONREAD, &n) == 0 && n == 0);
+	REQUIRE(sendto(u1, block, 300, 0, (struct sockaddr *)&a, sizeof a) == 300);
+	end = now_ms() + 5000;
+	for (;;) {
+		REQUIRE(ioctl(u2, FIONREAD, &n) == 0);
+		if (n == 300 || now_ms() > end)
+			break;
+		pause_ms(10);
+	}
+	REQUIRE(n == 300);
+	REQUIRE(recv(u2, block, sizeof block, 0) == 300);
+	REQUIRE(ioctl(u2, FIONREAD, &n) == 0 && n == 0);
+	int p[2];
+	REQUIRE(pipe(p) == 0);
+	errno = 0;
+	REQUIRE(ioctl(p[0], FIONREAD, &n) == -1 && errno == ENOTTY);
+	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0);
+	REQUIRE(close(u1) == 0 && close(u2) == 0);
+	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+}
+
+/* 1 000 sockets in one set: each gets a byte from its peer and every event
+ * comes. The time from the writes to the last event is printed. */
+static void epoll_1000(void)
+{
+	many_pairs();
+	static unsigned char seen[2 * PAIRS];
+	int ep = ep_new();
+	for (int i = 0; i < PAIRS; i++) {
+		nonblock(cl[i]);
+		nonblock(sv[i]);
+		ep_add(ep, cl[i], EPOLLIN | EPOLLET, (uint64_t)(2 * i));
+		ep_add(ep, sv[i], EPOLLIN | EPOLLET, (uint64_t)(2 * i + 1));
+	}
+	struct epoll_event ev[64];
+	REQUIRE(ep_wait(ep, ev, 0) == 0);
+	long began = now_ms();
+	for (int i = 0; i < PAIRS; i++) {
+		REQUIRE(send(cl[i], "c", 1, 0) == 1);
+		REQUIRE(send(sv[i], "s", 1, 0) == 1);
+	}
+	collect(ep, 2 * PAIRS, seen, 2 * PAIRS, 60000);
+	long took = now_ms() - began;
+	REQUIRE(ep_wait(ep, ev, 200) == 0);
+	printf("posix-net: epoll-1000 took %ld ms\n", took);
+	REQUIRE(close(ep) == 0);
+	close_pairs();
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -477,6 +1373,27 @@ static const struct {
 	{ "sockets-1000", sockets_1000 },
 	{ "ephemeral-block", ephemeral_block },
 	{ "bind-reuse-accepted", bind_reuse_accepted },
+	{ "epoll-basic", epoll_basic },
+	{ "epoll-200", epoll_200 },
+	{ "epoll-lt", epoll_lt },
+	{ "epoll-et", epoll_et },
+	{ "epoll-et-pipe", epoll_et_pipe },
+	{ "epoll-oneshot", epoll_oneshot },
+	{ "epoll-close", epoll_close },
+	{ "epoll-fork", epoll_fork },
+	{ "epoll-exec", epoll_exec },
+	{ "epoll-errors", epoll_errors },
+	{ "epoll-rdhup", epoll_rdhup },
+	{ "epoll-err-rst", epoll_err_rst },
+	{ "epoll-signal", epoll_signal },
+	{ "epoll-stale-list", epoll_stale_list },
+	{ "epoll-et-inout", epoll_et_inout },
+	{ "epoll-listener", epoll_listener },
+	{ "epoll-threads", epoll_threads },
+	{ "poll-1000", poll_1000 },
+	{ "select-high", select_high },
+	{ "fionread", fionread },
+	{ "epoll-1000", epoll_1000 },
 };
 
 int main(int argc, char **argv)
@@ -485,6 +1402,8 @@ int main(int argc, char **argv)
 		return exec_child(argc, argv);
 	if (argc >= 3 && strcmp(argv[1], "spawn-child") == 0)
 		return spawn_child(atoi(argv[2]));
+	if (argc >= 3 && strcmp(argv[1], "epoll-child") == 0)
+		return epoll_child(atoi(argv[2]));
 	if (argc != 2) {
 		printf("posix-net: usage: posix-net ADDRESS\n");
 		return 2;

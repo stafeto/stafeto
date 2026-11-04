@@ -509,6 +509,8 @@ fn main(_: u64) -> u64 {
         held_rx: false,
         #[cfg(feature = "probe")]
         held_tx: false,
+        #[cfg(feature = "probe")]
+        longest: [0; 2],
         _maps: (dma_object, net_object, windows),
     };
     // The static address names its servers at once; a lease does in its event.
@@ -723,10 +725,28 @@ struct Driver<'a> {
     held_rx: bool,
     #[cfg(feature = "probe")]
     held_tx: bool,
+    /// The longest step of waking and of departure so far (the probe's lines
+    /// `net: step wake` and `net: step cleanup`, which the measurement of the
+    /// interest sets reads: the own steps of the service are one kind).
+    #[cfg(feature = "probe")]
+    longest: [u64; 2],
     _maps: (Handle<Memory>, Handle<Memory>, [Option<Handle<Memory>>; 3]),
 }
 
 impl Driver<'_> {
+    /// A step of waking (`which` 0) or of departure (1) took until now from
+    /// `began`: a line when it is the longest of its kind (builds with the
+    /// feature `probe`).
+    #[cfg(feature = "probe")]
+    fn measured(&mut self, which: usize, began: u64) {
+        let ticks = rt::time::now().saturating_sub(began);
+        if ticks > self.longest[which] {
+            self.longest[which] = ticks;
+            let name = ["wake", "cleanup"][which];
+            rt::println!("net: step {name} {ticks} ticks");
+        }
+    }
+
     /// Tells the loop `bit` unless it is told already; false when the
     /// notification was refused and nothing is on its way.
     fn tell(&mut self, bit: u64) -> bool {
@@ -1225,15 +1245,16 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. The methods of later stages (22 to 26) are UNKNOWN_METHOD.
+/// `probe`. The methods of later stages (23 to 26) are UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29, 30, 31,
-    62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 30,
+    31, 32, 33, 34, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 27, 28, 29,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 28, 29, 32,
+    33, 34,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1270,6 +1291,11 @@ impl Service<0> for Driver<'_> {
         rt::service::step_own();
         let held = core::mem::take(&mut s.data.held);
         let long = core::mem::take(&mut s.data.long);
+        // The interest sets of the session go with it, their records in steps.
+        if self.net.interest.sets_of(s.label()) != 0 {
+            self.net.interest.drop_sets_of(s.label());
+            self.cleanup();
+        }
         if self.net.depart(&mut self.stack, held, long) {
             self.cleanup();
         }
@@ -1332,14 +1358,23 @@ impl Service<0> for Driver<'_> {
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
+                        #[cfg(feature = "probe")]
+                        let began = rt::time::now();
                         let left = self.net.wake(&mut self.stack, now_ns());
+                        #[cfg(feature = "probe")]
+                        self.measured(0, began);
                         if left {
                             self.tell(WAKE);
                         }
                     }
                     CLEANUP => {
                         rt::service::step_own();
-                        if self.net.depart_step(&mut self.stack) {
+                        #[cfg(feature = "probe")]
+                        let began = rt::time::now();
+                        let more = self.net.depart_step(&mut self.stack);
+                        #[cfg(feature = "probe")]
+                        self.measured(1, began);
+                        if more {
                             self.cleanup();
                         }
                     }

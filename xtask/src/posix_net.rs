@@ -6,9 +6,11 @@
 //! with the network service on QEMU's user network, where xtask runs
 //! `posix-net ADDRESS` (tests/posix-so/dyn/posix-net.c) over the serial port:
 //! the limit of 1 024 descriptors, 1 000 sockets, a fork and an exec with
-//! many descriptors, and the buffers of the sockets by their place in the
-//! service. The program prints a line for each check and xtask compares them
-//! with its own list. The run needs no `-icount`.
+//! many descriptors, the buffers of the sockets by their place in the
+//! service, and (stage P4a-2) epoll, poll and select over more than 64
+//! descriptors and 1 000 sockets in one set. The program prints a line for
+//! each check and xtask compares them with its own list. The run needs no
+//! `-icount`.
 //!
 //! `cargo xtask posix-net steps` runs the same under -icount with the service
 //! counting its steps, and judges every step against 0.9 of term B and the
@@ -22,9 +24,9 @@ use crate::{
     busybox_build, nano_build, net, net_curl, net_probe, qemu, relibc, symbolize,
 };
 
-/// The checks of `posix-net` for stage P4a-1, in the order the program runs
-/// them.
-pub const CHECKS: [&str; 11] = [
+/// The checks of `posix-net` for stages P4a-1 and P4a-2, in the order the
+/// program runs them.
+pub const CHECKS: [&str; 32] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -36,6 +38,27 @@ pub const CHECKS: [&str; 11] = [
     "sockets-1000",
     "ephemeral-block",
     "bind-reuse-accepted",
+    "epoll-basic",
+    "epoll-200",
+    "epoll-lt",
+    "epoll-et",
+    "epoll-et-pipe",
+    "epoll-oneshot",
+    "epoll-close",
+    "epoll-fork",
+    "epoll-exec",
+    "epoll-errors",
+    "epoll-rdhup",
+    "epoll-err-rst",
+    "epoll-signal",
+    "epoll-stale-list",
+    "epoll-et-inout",
+    "epoll-listener",
+    "epoll-threads",
+    "poll-1000",
+    "select-high",
+    "fionread",
+    "epoll-1000",
 ];
 
 /// How long the checks may take in all (the ci group allows 120 s for the
@@ -50,10 +73,10 @@ fn text_of(line: &str) -> Option<&str> {
     line.split_once("posix-net: ").map(|(_, text)| text)
 }
 
-/// The time `fork-900` printed, in milliseconds.
-fn fork_ms(lines: &[String]) -> Option<u64> {
+/// The time the check `name` printed, in milliseconds.
+fn took_ms(lines: &[String], name: &str) -> Option<u64> {
     lines.iter().find_map(|l| {
-        let rest = text_of(l)?.strip_prefix("fork-900 took ")?;
+        let rest = text_of(l)?.strip_prefix(name)?.strip_prefix(" took ")?;
         rest.strip_suffix(" ms")?.parse().ok()
     })
 }
@@ -70,7 +93,7 @@ fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), St
         if text.contains("failed") {
             return Err(format!("posix-net: {text}"));
         }
-        if text.starts_with("fork-900 took ") {
+        if text.contains(" took ") {
             continue;
         }
         if let Some(count) = text.strip_suffix(" checks ok") {
@@ -175,12 +198,17 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             net_probe::STEP_MAX
         );
     }
-    let took = fork_ms(&output.lines).map_or("no time".to_owned(), |ms| format!("{ms} ms"));
+    let took = |name: &str| {
+        took_ms(&output.lines, name).map_or("no time".to_owned(), |ms| format!("{ms} ms"))
+    };
     println!(
-        "posix-net passed in {:.0} s on {}: {} checks, a fork with 900 descriptors took {took}",
+        "posix-net passed in {:.0} s on {}: {} checks, a fork with 900 descriptors took {}, a poll of 1000 {}, 1000 events of epoll {}",
         started.elapsed().as_secs_f64(),
         machine.name,
-        CHECKS.len()
+        CHECKS.len(),
+        took("fork-900"),
+        took("poll-1000"),
+        took("epoll-1000")
     );
     Ok(())
 }
@@ -238,8 +266,9 @@ mod tests {
         assert_eq!(text_of("/ # posix-net: limits ok"), Some("limits ok"));
         assert_eq!(text_of("net-sock: limits ok"), None);
         let lines = vec!["posix-net: fork-900 took 37 ms".to_owned()];
-        assert_eq!(fork_ms(&lines), Some(37));
-        assert_eq!(fork_ms(&[]), None);
+        assert_eq!(took_ms(&lines, "fork-900"), Some(37));
+        assert_eq!(took_ms(&lines, "epoll-1000"), None);
+        assert_eq!(took_ms(&[], "fork-900"), None);
     }
 
     #[test]

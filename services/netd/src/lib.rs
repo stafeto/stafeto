@@ -17,6 +17,7 @@ pub mod copy;
 pub mod demux;
 pub mod frames;
 pub mod groups;
+pub mod interest;
 pub mod lines;
 pub mod pci;
 pub mod places;

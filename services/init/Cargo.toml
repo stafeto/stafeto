@@ -114,6 +114,8 @@ net-wire-echo = []
 # operations).
 net-clone = []
 net-abandon = []
+# Role `E`: epoll in the service (sets, the wait, the step of waking, the drop).
+net-epoll = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

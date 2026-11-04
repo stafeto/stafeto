@@ -496,6 +496,8 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         Target::Net(net) => net_reply(net.description, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
+        // An epoll descriptor has nothing to read.
+        Target::Epoll(_) => Err(EINVAL),
         #[cfg(feature = "procfs")]
         Target::Proc(id) => {
             let mut bytes = [0; posix_fs::MAX_READ];
@@ -685,6 +687,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                 // The write of a pipe waits here, outside the lock.
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
                 Target::Net(net) => crate::net::write(net.description, bytes).map(|n| n as u64),
+                Target::Epoll(_) => Err(EINVAL),
                 Target::Fifo(target) => {
                     crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
                         .map(|n| n as u64)
@@ -705,6 +708,9 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                     _ => return Err(EINVAL),
                 };
                 return crate::procfs::seek(id, offset, whence).map(|value| value as u64);
+            }
+            if let Target::Epoll(_) = target {
+                return Err(ESPIPE);
             }
             transport
                 .lseek(target, offset, origin)
