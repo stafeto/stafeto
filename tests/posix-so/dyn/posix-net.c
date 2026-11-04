@@ -1001,25 +1001,25 @@ static void epoll_signal(void)
 	REQUIRE(close(p[0]) == 0 && close(p[1]) == 0 && close(ep) == 0);
 }
 
-/* The wait of a set whose list of ready records holds 200 that report
- * nothing now (their bytes were read): the byte that comes for the last of
+/* The wait of a set whose list of ready records holds 500 that report
+ * nothing now (their bytes were read; more than the start and the take of a wait look at, 2 * 128): the byte that comes for the last of
  * them wakes the wait. */
 static void epoll_stale_list(void)
 {
 	int port, lis = listener(4, &port);
-	static int client[200], server[200];
+	static int client[500], server[500];
 	int ep = ep_new();
-	for (int i = 0; i < 200; i++) {
+	for (int i = 0; i < 500; i++) {
 		pair(lis, port, &client[i], &server[i]);
 		nonblock(server[i]);
 		ep_add(ep, server[i], EPOLLIN, (uint64_t)i);
 		REQUIRE(send(client[i], "x", 1, 0) == 1);
 	}
 	struct epoll_event ev[64];
-	static unsigned char seen[200];
+	static unsigned char seen[500];
 	int total = 0, last = -1;
-	long end = now_ms() + 20000;
-	while (total < 200) {
+	long end = now_ms() + 50000;
+	while (total < 500) {
 		REQUIRE(now_ms() < end);
 		int n = ep_wait(ep, ev, 1000);
 		REQUIRE(n >= 0);
@@ -1031,7 +1031,7 @@ static void epoll_stale_list(void)
 			last = (int)ev[i].data.u64;
 		}
 	}
-	for (int i = 0; i < 200; i++)
+	for (int i = 0; i < 500; i++)
 		drain(server[i]);
 	/* The last record reported is the last in the list. */
 	REQUIRE(last >= 0);
@@ -1040,7 +1040,7 @@ static void epoll_stale_list(void)
 	int n = ep_wait(ep, ev, 5000);
 	REQUIRE(n == 1 && ev[0].data.u64 == (uint64_t)last);
 	REQUIRE(now_ms() - began < 1000);
-	for (int i = 0; i < 200; i++) {
+	for (int i = 0; i < 500; i++) {
 		REQUIRE(close(client[i]) == 0);
 		REQUIRE(close(server[i]) == 0);
 	}

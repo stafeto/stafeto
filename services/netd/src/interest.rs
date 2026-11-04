@@ -689,6 +689,33 @@ mod tests {
     }
 
     #[test]
+    fn a_take_that_saw_stale_records_only_leaves_the_rest_of_the_list() {
+        let mut t: Box<Interests<1280>> = unsafe { Box::new_zeroed().assume_init() };
+        t.reset();
+        let k = t.new_set(1).unwrap();
+        for place in 0..400 {
+            t.add(k, place, IN, place as u32, IN).unwrap();
+        }
+        // Every place lost its event but the last, whose record is at the tail.
+        for place in 0..399 {
+            t.scan(place, 0);
+        }
+        let mut out = EpollReady::EMPTY;
+        t.take(k, 64, &mut out);
+        // The window is 128 records: nothing came, and records are left (the
+        // service wakes the wait for them, `has_ready`).
+        assert_eq!(out.len, 0);
+        assert!(t.has_ready(k));
+        t.take(k, 64, &mut out);
+        t.take(k, 64, &mut out);
+        assert_eq!(out.len, 0);
+        assert!(t.has_ready(k));
+        t.take(k, 64, &mut out);
+        assert_eq!(out.len, 1);
+        assert_eq!(out.as_slice()[0].0, 399);
+    }
+
+    #[test]
     fn an_edge_record_reports_an_event_that_went_and_came_back() {
         let mut t = table();
         let k = t.new_set(7).unwrap();

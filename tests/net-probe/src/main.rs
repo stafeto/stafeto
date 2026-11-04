@@ -2169,17 +2169,17 @@ impl Probe<'_> {
                 );
             }
             let set = self.epoll_set(&root, 0, &records)?;
-            for i in 0..PLACES {
+            for &place in &places {
                 let take = Request::Recv {
                     key: None,
-                    description: places[i],
+                    description: place,
                     flags: sockets::DONTWAIT,
                     most: PIECE as u32,
                 };
                 self.plain(&root, take).map_err(|_| "RECV failed")?;
                 let send = Request::Send {
                     key: None,
-                    description: places[i],
+                    description: place,
                     flags: 0,
                     address: Address::v4([127, 0, 0, 1], 9390),
                     data: b"q",
