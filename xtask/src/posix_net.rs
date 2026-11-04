@@ -29,11 +29,11 @@ pub const CHECKS: [&str; 9] = [
     "nofile-low",
     "rcvbuf-tiers",
     "fds-1000",
-    "sockets-1000",
     "fork-900",
     "clofork-many",
     "exec-64",
     "spawn-high",
+    "sockets-1000",
 ];
 
 /// How long the checks may take in all (the ci group allows 120 s for the
