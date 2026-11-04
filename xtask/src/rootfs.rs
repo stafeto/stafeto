@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 36] = [
+const SYSTEM_PATHS: [&str; 37] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -286,6 +286,7 @@ const SYSTEM_PATHS: [&str; 36] = [
     "/www",
     "/www/index.html",
     "/bin/net-sock",
+    "/bin/net-dns",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -334,7 +335,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 12] = [
+pub const SHARED: [(&str, &str); 13] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -347,6 +348,7 @@ pub const SHARED: [(&str, &str); 12] = [
     ("bad-pie", "probes/bad-pie"),
     ("display-probe", "probes/display-probe"),
     ("net-sock", "probes/net-sock"),
+    ("net-dns", "probes/net-dns"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -379,6 +381,7 @@ fn shared_files() -> Vec<RootFile> {
             "bad-ifunc" => "/bin/bad-ifunc",
             "display-probe" => "/bin/display-probe",
             "net-sock" => "/bin/net-sock",
+            "net-dns" => "/bin/net-dns",
             _ => "/bin/bad-pie",
         };
         files.push(file(path, 0o755, ROOT, name));
@@ -975,12 +978,6 @@ pub fn runner_check() -> Vec<RootFile> {
 /// QEMU user network's own settings, so that no DHCP frame is needed.
 const NETD_CONF_STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10.0.2.3\n";
 
-/// `/etc/resolv.conf` of the shell image with the network service: the
-/// name server of QEMU's user network. The service does not write it yet
-/// (the lease's name server goes there in the stage of the resolver); on
-/// another network this file is wrong.
-const RESOLV_CONF: &[u8] = b"nameserver 10.0.2.3\n";
-
 /// The bytes of `/www/index.html` of the image with the network service: 64
 /// KiB of lines from a fixed generator, so that the host knows the page
 /// without reading the image (`cargo xtask net-curl`).
@@ -1093,13 +1090,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-net.img" | "boot-net-curl-steps.img" => {
             let mut files = dialog(name);
-            files.push(of(
-                "/etc/resolv.conf",
-                0o644,
-                ROOT,
-                Source::Bytes("resolv.conf", RESOLV_CONF),
-            ));
-            // The page `httpd -h /www` serves, and the probe of the sockets.
+            // The page `httpd -h /www` serves, and the probes of the sockets
+            // and of the resolver. `/etc/resolv.conf` is the network
+            // service's to write.
             files.push(dir("/www"));
             files.push(of(
                 "/www/index.html",
@@ -1108,6 +1101,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 Source::Bytes("www-index", www_index()),
             ));
             files.push(file("/bin/net-sock", 0o755, ROOT, "net-sock"));
+            files.push(file("/bin/net-dns", 0o755, ROOT, "net-dns"));
             files
         }
         "boot-net-probe-static.img" => vec![of(

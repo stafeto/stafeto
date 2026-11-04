@@ -142,7 +142,12 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # _POSIX_THREAD_PROCESS_SHARED is claimed, and the owner word of a mutex
 # carries the PID, and a semaphore wait that ends with an error passes its
 # wake on; tagged pin-db34fecb.
-COMMIT = "db34fecb1fd776aee3ce2ec021aaec8589d52ee1"
+# Name lookups (stafeto-design#537): up to three servers of resolv.conf, two
+# rounds of five seconds, a check of every reply, a random transaction number,
+# the socket closed on every path, getaddrinfo with EAI_AGAIN, EAI_FAIL and
+# EAI_NONAME as POSIX has them, name pointers followed backwards only, a name
+# with a label past 63 bytes refused at once; tagged pin-849c2f1b.
+COMMIT = "849c2f1bb345fd880a1ef1d9938a6c52aec46d79"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

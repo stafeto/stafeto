@@ -104,7 +104,10 @@ pub struct Lease {
     pub address: [u8; 4],
     pub prefix: u8,
     pub gateway: Option<[u8; 4]>,
+    /// The first name server: what the line of the lease and CONFIG say.
     pub dns: Option<[u8; 4]>,
+    /// All the name servers (three at most), for `resolv.conf`.
+    pub servers: [Option<[u8; 4]>; netd::resolv::SERVERS],
 }
 
 impl Lease {
@@ -246,6 +249,7 @@ impl<'a> Stack<'a> {
             prefix: address.prefix,
             gateway,
             dns,
+            servers: [dns, None, None],
         };
         self.apply(&lease);
     }
@@ -463,6 +467,9 @@ impl<'a> Stack<'a> {
                     prefix: config.address.prefix_len(),
                     gateway: config.router.map(|r| r.octets()),
                     dns: config.dns_servers.first().map(|d| d.octets()),
+                    servers: core::array::from_fn(|k| {
+                        config.dns_servers.get(k).map(|d| d.octets())
+                    }),
                 };
                 self.apply(&lease);
                 Some(Event::Leased(lease))

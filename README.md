@@ -44,7 +44,7 @@ The work runs in subprojects. Subproject 1 (the kernel and a minimal userland) i
 **Later subprojects**
 
 - Graphics and input: virtio-gpu, touch input, a compositor; Doom as the first playable target (under way).
-- Network: virtio-net, a TCP/IP stack and IPv4 sockets.
+- Network: virtio-net, a TCP/IP stack and IPv4 sockets (under way). BusyBox `wget` fetches over HTTP and over HTTPS with TLS 1.2 only; it checks no certificate, so use it where the content is verified another way (see `docs/posix-coverage.md`, Names and `wget`).
 - Packages and apps: a package format, signed packages, an app sandbox.
 
 ## Build from source
