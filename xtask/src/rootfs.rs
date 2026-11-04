@@ -1117,9 +1117,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
-        "boot-net.img" | "boot-net-curl-steps.img" => {
-            net_files(name)
-        }
+        "boot-net.img" | "boot-net-curl-steps.img" => net_files(name),
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
