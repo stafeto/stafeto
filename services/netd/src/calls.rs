@@ -466,7 +466,7 @@ impl Net {
                 connected: false,
                 reuse: sock.reuse,
             };
-            if ports::conflicts(&new, self.bindings(port, place)) {
+            if ports::conflicts(&new, self.bindings(port, place, !sock.reuse)) {
                 return refuse(proto_net::IN_USE);
             }
             self.ports(sock.proto).hold(port);
@@ -694,6 +694,7 @@ impl Net {
             crate::net::CONNECT_NS / 1_000_000_000,
         )));
         self.socks[place].conn = Conn::Connecting(now);
+        self.rechain(place);
         self.socks[place].peer = Some(remote);
         self.connecting.set(place);
         self.step_due = true;
@@ -844,6 +845,8 @@ impl Net {
         s.data.held.add(m);
         let accepted = &mut self.socks[m];
         accepted.conn = Conn::Done;
+        self.rechain(m);
+        let accepted = &mut self.socks[m];
         accepted.listener = NO_PLACE;
         accepted.nonblock = flags & sockets::NONBLOCK != 0;
         accepted.peer = peer.ipv4().map(|ip| (ip, peer.port as u16));

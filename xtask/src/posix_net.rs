@@ -24,7 +24,7 @@ use crate::{
 
 /// The checks of `posix-net` for stage P4a-1, in the order the program runs
 /// them.
-pub const CHECKS: [&str; 10] = [
+pub const CHECKS: [&str; 11] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -35,6 +35,7 @@ pub const CHECKS: [&str; 10] = [
     "spawn-high",
     "sockets-1000",
     "ephemeral-block",
+    "bind-reuse-accepted",
 ];
 
 /// How long the checks may take in all (the ci group allows 120 s for the

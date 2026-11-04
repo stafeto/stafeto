@@ -56,6 +56,11 @@ impl<const W: usize> GroupMask<W> {
         }
     }
 
+    /// The lowest group at or after `from`, or else the lowest of all.
+    pub fn next_wrapping(&self, from: usize) -> Option<usize> {
+        self.next(from).or_else(|| self.next(0))
+    }
+
     /// The set, which is empty afterwards.
     pub fn take(&mut self) -> Self {
         core::mem::replace(self, Self::EMPTY)
@@ -90,6 +95,33 @@ mod tests {
         assert_eq!(m.next(65), Some(319));
         let taken = m.take();
         assert!(!m.any() && taken.has(0));
+    }
+
+    /// A walk of 16 groups a step from a cursor reaches every group even when
+    /// the lowest groups are touched again at once.
+    #[test]
+    fn a_cursor_walk_does_not_starve_the_high_groups() {
+        let mut touched = GroupMask::<5>::EMPTY;
+        for g in 0..20 {
+            touched.set(g);
+        }
+        let mut cursor = 0;
+        let mut seen = [false; 20];
+        for _step in 0..2 {
+            for _ in 0..16 {
+                let Some(g) = touched.next_wrapping(cursor) else {
+                    break;
+                };
+                touched.clear(g);
+                seen[g] = true;
+                cursor = g + 1;
+            }
+            // The four lowest groups are touched again in every step.
+            for g in 0..4 {
+                touched.set(g);
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "{seen:?}");
     }
 
     #[test]

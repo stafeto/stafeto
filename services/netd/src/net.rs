@@ -288,6 +288,10 @@ pub struct Net {
     udp_meta: [[MaybeUninit<udp::PacketMetadata>; 2 * PACKETS]; SOCKETS_MAX],
     /// The bound places, in a chain for each port.
     pub chains: PortChains<SOCKETS_MAX>,
+    /// The bound places that are connected and do not listen: a bind that
+    /// may share the port (SO_REUSEADDR) has no need to look at them, so the
+    /// accepted connections of a busy server are not walked.
+    pub connected: PortChains<SOCKETS_MAX>,
     pub tcp_ports: PortMap,
     pub udp_ports: PortMap,
     pub ops: LongOps<OPERATIONS>,
@@ -323,6 +327,9 @@ pub struct Net {
     /// touched (a bit each), for the step of waking.
     pub due: GroupSet,
     pub touched: GroupSet,
+    /// Where `schedule_wake` goes on, so that groups above the first few are
+    /// reached when the lower ones are touched again in every step.
+    schedule_cursor: usize,
     /// The groups whose pass of sending ran since the last step of waking.
     pub passed: GroupSet,
     /// The service is asked for a step of departure or of waking.
@@ -546,6 +553,7 @@ impl Net {
             stack.drop_socket(handle);
         }
         self.chains.unlink(i);
+        self.connected.unlink(i);
         self.socks[i] = Sock::EMPTY;
         if let Some(key) = sock.key {
             self.demux.remove(&key);
@@ -569,19 +577,45 @@ impl Net {
     }
 
     /// The bindings the registry compares a new bind with.
-    pub fn bindings(&self, port: u16, skip: usize) -> impl Iterator<Item = Binding> + '_ {
-        self.chains.chain(port).filter_map(move |i| {
-            let s = &self.socks[i];
-            let live = matches!(self.places.state(i), State::Live | State::Orphan);
-            (i != skip && live && s.bound).then_some(Binding {
-                proto: s.proto,
-                address: s.address,
-                port: s.port,
-                listening: s.listening,
-                connected: s.conn != Conn::None,
-                reuse: s.reuse,
+    pub fn bindings(
+        &self,
+        port: u16,
+        skip: usize,
+        with_connected: bool,
+    ) -> impl Iterator<Item = Binding> + '_ {
+        let connected = with_connected.then(|| self.connected.chain(port));
+        self.chains
+            .chain(port)
+            .chain(connected.into_iter().flatten())
+            .filter_map(move |i| {
+                let s = &self.socks[i];
+                let live = matches!(self.places.state(i), State::Live | State::Orphan);
+                (i != skip && live && s.bound).then_some(Binding {
+                    proto: s.proto,
+                    address: s.address,
+                    port: s.port,
+                    listening: s.listening,
+                    connected: s.conn != Conn::None,
+                    reuse: s.reuse,
+                })
             })
-        })
+    }
+
+    /// Puts the bound place `i` in the chain of its port that its state asks
+    /// for: connected and not listening, or the other.
+    pub fn rechain(&mut self, i: usize) {
+        let s = &self.socks[i];
+        if !s.bound {
+            return;
+        }
+        let port = s.port;
+        if s.conn != Conn::None && !s.listening {
+            self.chains.unlink(i);
+            self.connected.link(i, port);
+        } else {
+            self.connected.unlink(i);
+            self.chains.link(i, port);
+        }
     }
 
     /// An ephemeral port for a connection from `local` to `remote`, held in
@@ -910,6 +944,7 @@ impl Net {
                         proto_net::REFUSED
                     };
                     self.socks[i].conn = Conn::None;
+                    self.rechain(i);
                     self.connecting.clear(i);
                 }
                 _ => {
@@ -918,6 +953,7 @@ impl Net {
                         t.set_keep_alive(Some(duration(KEEPALIVE_NS)));
                     }
                     self.socks[i].conn = Conn::Done;
+                    self.rechain(i);
                     self.connecting.clear(i);
                 }
             }
@@ -1159,12 +1195,13 @@ impl Net {
         // every group, and the walk over all of them in one step took 13 500
         // ticks at 1 280 places. The rest wait for the next step.
         let mut left = SCHEDULE_GROUPS;
-        while let Some(g) = self.touched.next(0) {
+        while let Some(g) = self.touched.next_wrapping(self.schedule_cursor) {
             if left == 0 {
                 self.step_due = true;
                 break;
             }
             left -= 1;
+            self.schedule_cursor = g + 1;
             self.touched.clear(g);
             for i in g * GROUP..(g + 1) * GROUP {
                 if self.attention.has(i) || self.connecting.has(i) {

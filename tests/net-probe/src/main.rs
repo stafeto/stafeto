@@ -1926,6 +1926,52 @@ impl Probe<'_> {
         drop(session);
         drop(child);
         self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
+        // A session that goes with 16 operations waiting and 8 descriptions:
+        // the step of departure lets go of the operations a portion at a time,
+        // then of the places.
+        let mut held = [0u32; 8];
+        for (i, d) in held.iter_mut().enumerate() {
+            *d = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.bind(&root, *d, [127, 0, 0, 1], 9310 + i as u32)
+                .map_err(|_| "BIND failed")?;
+            // new_socket makes a nonblocking socket; the operations need a
+            // blocking one, which SOCKET with flags 0 gives.
+        }
+        let _ = held;
+        let mut blocking = [0u32; 8];
+        for (i, d) in blocking.iter_mut().enumerate() {
+            let mut buffer = [0; MESSAGE_MAX];
+            let request = Request::Socket {
+                family: proto_net::INET,
+                kind: sockets::DGRAM,
+                flags: 0,
+            };
+            let reply = socket_call(&root, &request, &mut buffer).map_err(|_| "SOCKET failed")?;
+            *d = sockets::read_word(reply).map_err(|_| "SOCKET's reply")?;
+            self.bind(&root, *d, [127, 0, 0, 1], 9330 + i as u32)
+                .map_err(|_| "BIND failed")?;
+        }
+        let leaving = self
+            .clone_with(&root, &blocking)
+            .map_err(|_| "CLONE failed")?;
+        for d in blocking {
+            for _ in 0..2 {
+                let start = Request::Recv {
+                    key: None,
+                    description: d,
+                    flags: 0,
+                    most: PIECE as u32,
+                };
+                self.start_wait(&leaving, &start)?;
+            }
+        }
+        drop(leaving);
+        self.sleep(100_000_000);
+        for d in blocking.iter().chain(held.iter()) {
+            self.close(&root, *d).map_err(|_| "CLOSE failed")?;
+        }
         config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: abandon ok {WAITING} in {asked} asks");
         *keep = Some(root);

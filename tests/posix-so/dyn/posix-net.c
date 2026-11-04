@@ -305,6 +305,15 @@ static void exec_64(void)
 	for (int fd = 0; fd < 65; fd++)
 		REQUIRE(fcntl(fd, F_GETFD) >= 0);
 	close_from(3);
+	/* 65 different sockets: the table holds 64 of them for a call, and exec
+	 * still answers ENOMEM with every descriptor alive. */
+	for (int i = 0; i < 65; i++)
+		REQUIRE(socket(AF_INET, SOCK_DGRAM, 0) == 3 + i);
+	errno = 0;
+	REQUIRE(execve(self, plain, environ) == -1 && errno == ENOMEM);
+	for (int fd = 3; fd < 68; fd++)
+		REQUIRE(fcntl(fd, F_GETFD) >= 0);
+	close_from(3);
 	/* 64: the console's three and 61 numbers spread up to 976. */
 	char *args[70];
 	char text[61][8];
@@ -421,6 +430,37 @@ static void ephemeral_block(void)
 		REQUIRE(close(held[i]) == 0);
 }
 
+/* A server that restarts: with 450 accepted connections on its port, a new
+ * socket with SO_REUSEADDR binds the port the listener left. */
+static void bind_reuse_accepted(void)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(fd >= 0);
+	int one = 1;
+	REQUIRE(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0);
+	struct sockaddr_in a = at(LOOPBACK, 0);
+	REQUIRE(bind(fd, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(listen(fd, 8) == 0);
+	socklen_t len = sizeof a;
+	REQUIRE(getsockname(fd, (struct sockaddr *)&a, &len) == 0);
+	int port = ntohs(a.sin_port);
+	static int client[450], server[450];
+	for (int i = 0; i < 450; i++)
+		pair(fd, port, &client[i], &server[i]);
+	REQUIRE(close(fd) == 0);
+	int again = socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(again >= 0);
+	REQUIRE(setsockopt(again, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0);
+	struct sockaddr_in b = at(LOOPBACK, port);
+	REQUIRE(bind(again, (struct sockaddr *)&b, sizeof b) == 0);
+	REQUIRE(listen(again, 8) == 0);
+	REQUIRE(close(again) == 0);
+	for (int i = 0; i < 450; i++) {
+		REQUIRE(close(client[i]) == 0);
+		REQUIRE(close(server[i]) == 0);
+	}
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -435,6 +475,7 @@ static const struct {
 	{ "spawn-high", spawn_high },
 	{ "sockets-1000", sockets_1000 },
 	{ "ephemeral-block", ephemeral_block },
+	{ "bind-reuse-accepted", bind_reuse_accepted },
 };
 
 int main(int argc, char **argv)

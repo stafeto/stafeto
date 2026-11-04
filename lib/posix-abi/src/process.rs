@@ -794,7 +794,16 @@ impl Shadow {
                 let Some(slot) = shadow.slots[at].as_mut() else {
                     continue;
                 };
-                let (target, held) = hold_descriptor(files, slot.fd, owner, frame)?;
+                // The holds of the table are fewer than the places of the shadow:
+                // a full table is the lack of room the caller is told of.
+                let (target, held) =
+                    hold_descriptor(files, slot.fd, owner, frame).map_err(|errno| {
+                        if errno == crate::constants::EMFILE {
+                            crate::constants::ENOMEM
+                        } else {
+                            errno
+                        }
+                    })?;
                 slot.held = Some(held);
                 slot.entry = Some((target, false));
             }
@@ -1794,6 +1803,16 @@ fn exec_stopped<'s>(
         ExecSource::Path(path) => path,
         ExecSource::Descriptor(_) => b"/",
     };
+    // More descriptors stay open than a block carries: ENOMEM before any hold.
+    let staying = crate::shared::with_files(|files| {
+        Ok(files
+            .descriptors()
+            .filter(|(_, _, flags)| !flags.close_on_exec)
+            .count())
+    })?;
+    if staying > proto_loader::DESCRIPTORS {
+        return Err(crate::constants::ENOMEM);
+    }
     let mut shadow = Shadow::take()?;
     let carried = proto_loader::Carried {
         pending,
