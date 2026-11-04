@@ -1172,6 +1172,13 @@ impl Driver<'_> {
         if all != 0 {
             rt::println!("net: buffers 1 used {first} pages, 64 used {all} pages");
         }
+        if self.net.counters.largest_copy != 0 {
+            rt::println!(
+                "net: buffer portion {} largest copy {}",
+                netd::ring::BUFFER_PORTION,
+                self.net.counters.largest_copy
+            );
+        }
         split::report();
     }
 

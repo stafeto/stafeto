@@ -261,9 +261,10 @@ pub fn op_index(key: u64) -> Option<usize> {
     netd::ring::op_index(key, OPERATIONS)
 }
 
-/// The event RDHUP of epoll: the peer closed its sending side. The watches
-/// never ask for it (their events stop at `watch::EVENTS`).
+/// The event RDHUP of epoll: the peer closed its sending side. A watch asks
+/// for it as `watch::RDHUP` (a poll with POLLRDHUP), the same bit.
 pub const RDHUP: u32 = proto_net::sockets::epoll::RDHUP;
+const _: () = assert!(RDHUP == watch::RDHUP);
 
 /// The place that means no place in `Sock::listener`.
 pub const NO_PLACE: u16 = u16::MAX;
@@ -316,6 +317,10 @@ pub struct Counters {
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
     pub buffers_used: [u64; 2],
+    /// The most bytes one request with a cell copied (builds with the
+    /// feature `probe`): never more than the portion.
+    #[cfg(feature = "probe")]
+    pub largest_copy: u64,
 }
 
 /// The sockets of the service.

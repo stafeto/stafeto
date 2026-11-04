@@ -1246,6 +1246,9 @@ fn acceptance(
         longest_named(&buffer_run, "cleanup"),
         buffer_lines(&buffer_run).join("; ")
     );
+    if strict && !buffer_run.is_empty() {
+        copy_verdict(&buffer_run, netd::ring::BUFFER_PORTION).map_err(|e| format!("run B: {e}"))?;
+    }
     if strict && longest_named(&buffer_run, "cleanup") > STEP_MAX {
         return Err(format!(
             "the step of departure with the buffers took {} ticks, {STEP_MAX} at most",
@@ -1481,6 +1484,32 @@ fn buffer_lines(lines: &[String]) -> Vec<&str> {
         .collect()
 }
 
+/// The portion of the service and the most bytes one request with a cell
+/// copied, from the line `net: buffer portion P largest copy L` (the largest
+/// L of the run).
+fn largest_copy(lines: &[String]) -> Option<(usize, usize)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("net: buffer portion ")?;
+            let (portion, largest) = rest.split_once(" largest copy ")?;
+            Some((portion.parse().ok()?, largest.parse().ok()?))
+        })
+        .max_by_key(|&(_, largest)| largest)
+}
+
+/// A request with a cell copied more than the portion of the service, or the
+/// service has another portion than `portion`.
+fn copy_verdict(lines: &[String], portion: usize) -> Result<(), String> {
+    match largest_copy(lines) {
+        Some((p, largest)) if p == portion && largest <= portion => Ok(()),
+        Some((p, largest)) => Err(format!(
+            "a request with a cell copied {largest} bytes; the portion is {p} ({portion} built)"
+        )),
+        None => Err("no line of the copies of the shared buffers".to_owned()),
+    }
+}
+
 /// The 90th percentile of a part of the breakdown (`net: split <part> n ..
 /// p90 ..`) in the line with the most samples.
 fn split_p90(lines: &[String], part: &str) -> Option<u64> {
@@ -1535,6 +1564,7 @@ pub fn portion_series(machine: &qemu::Machine) -> Result<usize, String> {
             Roles::BUFFERS,
             true,
         )?;
+        copy_verdict(&lines, bytes).map_err(|e| format!("portion {bytes}: {e}"))?;
         let longest = longest_over_starts(&lines);
         let send = step_of(&longest, SEND_KIND).map_or(0, |(t, _)| t);
         let recv = step_of(&longest, RECV_KIND).map_or(0, |(t, _)| t);
@@ -2001,6 +2031,18 @@ mod tests {
             Some(3584)
         );
         assert_eq!(portion_feature(netd::ring::BUFFER_PORTION), "portion-16");
+        let copies = |line: &str| vec!["x".to_owned(), line.to_owned()];
+        assert_eq!(
+            copy_verdict(&copies("net: buffer portion 4096 largest copy 4096"), 4096),
+            Ok(())
+        );
+        assert!(
+            copy_verdict(&copies("net: buffer portion 4096 largest copy 16384"), 4096).is_err()
+        );
+        assert!(
+            copy_verdict(&copies("net: buffer portion 16384 largest copy 4096"), 4096).is_err()
+        );
+        assert!(copy_verdict(&[], 4096).is_err());
     }
 
     #[test]

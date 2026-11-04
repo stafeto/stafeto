@@ -1300,6 +1300,10 @@ impl Net {
             Io::Ready(n) => {
                 if let Out::Cell(..) = data {
                     self.buffered += n as u64;
+                    #[cfg(feature = "probe")]
+                    {
+                        self.counters.largest_copy = self.counters.largest_copy.max(n as u64);
+                    }
                 }
                 let bytes = (n as u32).to_le_bytes();
                 self.done(s, key, long_answer(r, long::Reply::Ready(&bytes)))
@@ -1468,6 +1472,10 @@ impl Net {
                     Into::Reply => sockets::write_received(&mut w, flags, &from, &buffer[..n]),
                     Into::Cell(..) => {
                         self.buffered += n as u64;
+                        #[cfg(feature = "probe")]
+                        {
+                            self.counters.largest_copy = self.counters.largest_copy.max(n as u64);
+                        }
                         sockets::write_received_count(&mut w, flags, &from, n as u32)
                     }
                 };

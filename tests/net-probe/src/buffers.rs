@@ -270,6 +270,8 @@ impl Probe<'_> {
         self.carry(&net, &p, G_BYTES)?;
         let kib = self.option(&net, p.ends[0], opt::BUFFERED)?;
         self.close_pair(&net, &p)?;
+        // CONFIG has the service print the largest copy of a request.
+        crate::config(&root).map_err(|_| "CONFIG failed")?;
         // SAFETY: nothing of the probe's own lies in the buffer.
         unsafe { sys::mem_unmap(self.process, BUFFER_AT, BUFFER_SIZE as u64) }
             .map_err(|_| "the probe's buffer is not unmapped")?;
@@ -325,6 +327,7 @@ impl Probe<'_> {
             self.carry(net, &p, SLOT as u32)?;
             self.close_pair(net, &p)?;
         }
+        crate::config(&root).map_err(|_| "CONFIG failed")?;
         if words != 64 | 64 << 16 {
             rt::println!("net-probe: BUFFERS {words:#x}");
             return Err("BUFFERS does not say 64 of 64");
