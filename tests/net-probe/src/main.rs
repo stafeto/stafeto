@@ -29,6 +29,8 @@
 //!   of 16, woken by connections that land in sockets of other groups; a
 //!   listening description closed with a connection in its queue resets it;
 //!   eight sessions with queues of 16 go at once.
+//! - `u`: 150 echo requests of 1 472 bytes to the gateway, frames of the wire
+//!   at full size in both directions, for the cost of a frame of the wire.
 //! - `r`: the timers: a PING that nobody answers ends in TIMEOUT, and a frame
 //!   of the loopback that is dropped is sent again by the retransmission
 //!   timer.
@@ -104,6 +106,7 @@ fn main(_: u64) -> u64 {
             b'i' => probe.idle(&mut session),
             b'l' => probe.listeners(&mut session),
             b'r' => probe.timers(&mut session),
+            b'u' => probe.wire(&mut session),
             _ => Err("an unknown role"),
         };
         if result.is_err() {
@@ -168,6 +171,15 @@ fn ping(session: &Handle<Channel>, target: [u8; 4]) -> Result<u64, Fail> {
     let mut buffer = [0; MESSAGE_MAX];
     let bytes = call(session, w.as_bytes(), &mut buffer)?;
     proto_net::read_ping_reply(bytes).map_err(|_| Fail::Bad("PING's reply"))
+}
+
+/// PING_WIRE of `target`: an echo request that fills a frame (probe builds).
+fn ping_wire(session: &Handle<Channel>, target: [u8; 4]) -> Result<u64, Fail> {
+    let mut w = Writer::new();
+    proto_net::write_ping_wire(&Address::v4(target, 0), &mut w).map_err(Fail::Status)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let bytes = call(session, w.as_bytes(), &mut buffer)?;
+    proto_net::read_ping_reply(bytes).map_err(|_| Fail::Bad("PING_WIRE's reply"))
 }
 
 /// One request of the sockets' methods: the reply's bytes in `buffer`.
@@ -992,6 +1004,51 @@ impl Probe<'_> {
             let mut buffer = [0; MESSAGE_MAX];
             call(&root, w.as_bytes(), &mut buffer).map_err(|_| "CANCEL failed")?;
         }
+        // 64 operations wait on one socket (four sessions of 16): one datagram
+        // tells them all, eight at most in a step.
+        let crowd = self.new_blocking(&root, sockets::DGRAM)?;
+        self.bind(&root, crowd, [127, 0, 0, 1], 9203)
+            .map_err(|_| "BIND failed")?;
+        let mut crowd_sessions: [Option<Handle<Channel>>; 4] = [const { None }; 4];
+        for (n, slot) in crowd_sessions.iter_mut().enumerate() {
+            let session = self
+                .clone_with(&root, &[crowd])
+                .map_err(|_| "CLONE failed")?;
+            for k in 0..16u64 {
+                let label = TOLD_BASE + 0x40 + n as u64 * 16 + k;
+                let start = Request::Recv {
+                    key: None,
+                    description: crowd,
+                    flags: 0,
+                    most: PIECE as u32,
+                };
+                let key = self.start_wait(&session, &start)?;
+                let take = Request::Recv {
+                    key: Some(key),
+                    description: crowd,
+                    flags: 0,
+                    most: PIECE as u32,
+                };
+                self.take_armed(&session, &take, label)?;
+            }
+            *slot = Some(session);
+        }
+        let to_crowd = Request::Send {
+            key: None,
+            description: sender,
+            flags: 0,
+            address: Address::v4([127, 0, 0, 1], 9203),
+            data: b"crowd",
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        socket_call(&root, &to_crowd, &mut buffer).map_err(|_| "SEND failed")?;
+        for label in TOLD_BASE + 0x40..TOLD_BASE + 0x80 {
+            if !self.told_within(label, 5) {
+                return Err("not all 64 operations on one socket were told");
+            }
+        }
+        drop(crowd_sessions);
+        self.close(&root, crowd).map_err(|_| "CLOSE failed")?;
         // The operations of a session that goes leave the places they wait
         // on: a new operation with the same number is not told for them.
         let held = self.new_blocking(&root, sockets::DGRAM)?;
@@ -1073,7 +1130,7 @@ impl Probe<'_> {
         self.close(&root, sender).map_err(|_| "CLOSE failed")?;
         self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
         config(&root).map_err(|_| "CONFIG refused")?;
-        rt::println!("net-probe: wakes ok {WAITING}");
+        rt::println!("net-probe: wakes ok {WAITING} and 64");
         *keep = Some(root);
         Ok(())
     }
@@ -1509,49 +1566,63 @@ impl Probe<'_> {
         let mut buffer = [0; MESSAGE_MAX];
         call(&root, w.as_bytes(), &mut buffer).map_err(|_| "WATCH_CANCEL failed")?;
         self.close(&root, client).map_err(|_| "CLOSE failed")?;
-        // The connection in the queue is reset when the description closes:
-        // the client's end hears RESET, not silence.
-        let waiting = self
-            .new_socket(&root, sockets::STREAM)
-            .map_err(|_| "SOCKET failed")?;
-        self.connect_wait(&root, waiting, Address::v4([127, 0, 0, 1], 9300))?;
-        self.close(&root, listener).map_err(|_| "CLOSE failed")?;
-        let end = self.now() + 3_000_000_000;
-        loop {
-            let mut buffer = [0; MESSAGE_MAX];
-            let request = Request::Recv {
-                key: None,
-                description: waiting,
-                flags: 0,
-                most: 1,
-            };
-            match socket_call(&root, &request, &mut buffer) {
-                Err(fail) if is(&fail, proto_net::RESET) => break,
-                Err(fail) if is(&fail, proto_net::AGAIN) && self.now() < end => {
-                    self.sleep(1_000_000)
-                }
-                _ => return Err("the client of a closed listening description was not reset"),
-            }
+        // The connections in the queue are reset when the description closes:
+        // each client's end hears RESET. Eight wait.
+        let mut waiting = [0u32; 8];
+        for w in &mut waiting {
+            *w = self
+                .new_socket(&root, sockets::STREAM)
+                .map_err(|_| "SOCKET failed")?;
+            self.connect_wait(&root, *w, Address::v4([127, 0, 0, 1], 9300))?;
         }
-        self.close(&root, waiting).map_err(|_| "CLOSE failed")?;
-        // Eight sessions each with a queue of 16 go at once: the places come
-        // back in portions of steps.
+        self.close(&root, listener).map_err(|_| "CLOSE failed")?;
+        let end = self.now() + 5_000_000_000;
+        for &w in &waiting {
+            loop {
+                let mut buffer = [0; MESSAGE_MAX];
+                let request = Request::Recv {
+                    key: None,
+                    description: w,
+                    flags: 0,
+                    most: 1,
+                };
+                match socket_call(&root, &request, &mut buffer) {
+                    Err(fail) if is(&fail, proto_net::RESET) => break,
+                    Err(fail) if is(&fail, proto_net::AGAIN) && self.now() < end => {
+                        self.sleep(1_000_000)
+                    }
+                    _ => return Err("a client of a closed listening description was not reset"),
+                }
+            }
+            self.close(&root, w).map_err(|_| "CLOSE failed")?;
+        }
+        // Eight sessions go at once, each holding eight listening descriptions
+        // with a connected stream in the queue and the client's end: the
+        // places come back in portions of steps, the streams with the work of
+        // the table of destinations, the port and smoltcp.
         let mut sessions: [Option<Handle<Channel>>; 8] = [const { None }; 8];
         for (i, slot) in sessions.iter_mut().enumerate() {
             let session = self.clone_empty(&root).map_err(|_| "CLONE failed")?;
-            let d = self
-                .new_socket(&session, sockets::STREAM)
-                .map_err(|_| "SOCKET failed")?;
-            self.bind(&session, d, [127, 0, 0, 1], 9400 + i as u32)
-                .map_err(|_| "BIND failed")?;
-            self.plain(
-                &session,
-                Request::Listen {
-                    description: d,
-                    backlog: 16,
-                },
-            )
-            .map_err(|_| "LISTEN failed")?;
+            for j in 0..8u32 {
+                let port = 9500 + i as u32 * 8 + j;
+                let d = self
+                    .new_socket(&session, sockets::STREAM)
+                    .map_err(|_| "SOCKET failed")?;
+                self.bind(&session, d, [127, 0, 0, 1], port)
+                    .map_err(|_| "BIND failed")?;
+                self.plain(
+                    &session,
+                    Request::Listen {
+                        description: d,
+                        backlog: 1,
+                    },
+                )
+                .map_err(|_| "LISTEN failed")?;
+                let c = self
+                    .new_socket(&session, sockets::STREAM)
+                    .map_err(|_| "SOCKET failed")?;
+                self.connect_wait(&session, c, Address::v4([127, 0, 0, 1], port))?;
+            }
             *slot = Some(session);
         }
         drop(sessions);
@@ -1560,7 +1631,7 @@ impl Probe<'_> {
         let again = self
             .new_socket(&root, sockets::STREAM)
             .map_err(|_| "SOCKET failed")?;
-        self.bind(&root, again, [127, 0, 0, 1], 9400)
+        self.bind(&root, again, [127, 0, 0, 1], 9500)
             .map_err(|_| "a port of a session that went is still held")?;
         self.close(&root, again).map_err(|_| "CLOSE failed")?;
         config(&root).map_err(|_| "CONFIG refused")?;
@@ -1613,8 +1684,81 @@ impl Probe<'_> {
         }
         let after = (self.now() - began) / 1_000_000;
         self.close_pairs(&p)?;
+        // One datagram on a quiet service, between sockets of two groups: the
+        // blocking RECV is woken within 50 ms. Nothing else touches the group
+        // of the sender, so the SEND itself must ask for its pass.
+        let receiver = self.new_blocking(&root, sockets::DGRAM)?;
+        self.bind(&root, receiver, [127, 0, 0, 1], 9210)
+            .map_err(|_| "BIND failed")?;
+        let mut spare = [0u32; 8];
+        let mut sender = self
+            .new_socket(&root, sockets::DGRAM)
+            .map_err(|_| "SOCKET failed")?;
+        let mut used = 0;
+        while sockets::slot(sender) / 4 == sockets::slot(receiver) / 4 && used < spare.len() {
+            spare[used] = sender;
+            used += 1;
+            sender = self
+                .new_socket(&root, sockets::DGRAM)
+                .map_err(|_| "SOCKET failed")?;
+        }
+        for &d in &spare[..used] {
+            self.close(&root, d).map_err(|_| "CLOSE failed")?;
+        }
+        let waiting = Request::Recv {
+            key: None,
+            description: receiver,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        let key = self.start_wait(&root, &waiting)?;
+        let take = Request::Recv {
+            key: Some(key),
+            description: receiver,
+            flags: 0,
+            most: PIECE as u32,
+        };
+        self.take_armed(&root, &take, TOLD_BASE + 0x20)?;
+        self.sleep(200_000_000);
+        let began = self.now();
+        let quiet = Request::Send {
+            key: None,
+            description: sender,
+            flags: 0,
+            address: Address::v4([127, 0, 0, 1], 9210),
+            data: b"quiet",
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        socket_call(&root, &quiet, &mut buffer).map_err(|_| "SEND failed")?;
+        if !self.told_within(TOLD_BASE + 0x20, 1) || self.now() - began > 50_000_000 {
+            return Err("a datagram on a quiet service did not wake its RECV within 50 ms");
+        }
+        self.take_ready(&root, &take)?;
+        self.close(&root, sender).map_err(|_| "CLOSE failed")?;
+        self.close(&root, receiver).map_err(|_| "CLOSE failed")?;
         config(&root).map_err(|_| "CONFIG refused")?;
         rt::println!("net-probe: timers ok (a segment sent again after {after} ms)");
+        *keep = Some(root);
+        Ok(())
+    }
+}
+
+impl Probe<'_> {
+    /// Role `u`.
+    fn wire(&self, keep: &mut Option<Handle<Channel>>) -> Result<(), &'static str> {
+        let root = match keep.take() {
+            Some(session) => session,
+            None => self.connect()?,
+        };
+        let gateway = self.config_ready(&root)?;
+        let mut longest = 0;
+        for _ in 0..150 {
+            let took =
+                ping_wire(&root, gateway).map_err(|_| "a PING_WIRE of the gateway failed")?;
+            longest = longest.max(took);
+        }
+        config(&root).map_err(|_| "CONFIG refused")?;
+        rt::println!("net-probe: wire ok 150 (longest {} us)", longest / 1000);
         *keep = Some(root);
         Ok(())
     }

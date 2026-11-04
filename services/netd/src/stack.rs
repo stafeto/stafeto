@@ -56,9 +56,9 @@ pub struct Storage<'a> {
     sockets: [SocketStorage<'a>; netd::places::SOCKETS_LIMIT],
     service: [SocketStorage<'a>; SERVICE_SLOTS],
     rx_meta: [icmp::PacketMetadata; 4],
-    rx_data: [u8; 1024],
+    rx_data: [u8; 2048],
     tx_meta: [icmp::PacketMetadata; 4],
-    tx_data: [u8; 1024],
+    tx_data: [u8; 2048],
 }
 
 impl Storage<'_> {
@@ -87,9 +87,9 @@ impl Storage<'_> {
 
 /// The identifier of the echo requests of PING.
 const IDENT: u16 = 0x5354;
-/// The bytes of data in an echo request.
+/// The bytes of data in an echo request of PING.
 #[cfg_attr(not(feature = "probe"), allow(dead_code))]
-const ECHO_DATA: usize = 32;
+pub const ECHO_DATA: usize = 32;
 /// How long a PING waits for its reply, in the guest's time.
 #[cfg_attr(not(feature = "probe"), allow(dead_code))]
 pub const PING_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -476,14 +476,15 @@ impl<'a> Stack<'a> {
     /// Queues an echo request to `target`; false when the socket has no
     /// room.
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
-    pub fn ping_start(&mut self, target: [u8; 4], now_ns: u64) -> bool {
+    pub fn ping_start(&mut self, target: [u8; 4], now_ns: u64, length: usize) -> bool {
         let socket = self.service.get_mut::<icmp::Socket>(self.icmp);
         self.seq = self.seq.wrapping_add(1);
-        let data = [0x5A; ECHO_DATA];
+        let data = [0x5A; proto_net::PING_WIRE_DATA];
+        let data = &data[..length];
         let repr = Icmpv4Repr::EchoRequest {
             ident: IDENT,
             seq_no: self.seq,
-            data: &data,
+            data,
         };
         let Ok(bytes) = socket.send(repr.buffer_len(), IpAddress::Ipv4(ipv4(target))) else {
             return false;

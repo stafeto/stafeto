@@ -354,6 +354,9 @@ impl NetDevice {
     /// The buffers of the loopback the stack is done with go back to the pool
     /// of sending.
     fn reclaim_loop(&mut self) {
+        if self.looped.overflowed() {
+            fail("the list of returned buffers of the loop overflowed");
+        }
         while let Some(n) = self.looped.take_returned() {
             self.tx.book.release(n);
         }

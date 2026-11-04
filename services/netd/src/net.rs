@@ -18,7 +18,7 @@ use netd::demux::{Demux, Key};
 use netd::frames::Dest;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
 use netd::ports::{Binding, PortMap, Proto};
-use netd::ring::WakeBudget;
+use netd::ring::{OrphanQueue, WakeBudget};
 use proto_net::sockets::{self, opt};
 use proto_net::{Address, INET};
 use proto_wire::clones::Clones;
@@ -58,6 +58,8 @@ pub const CONNECT_NS: u64 = 75_000_000_000;
 const KEEPALIVE_NS: u64 = 7_200_000_000_000;
 /// The orphans one step of the sweep looks at.
 const SWEEP: usize = 4;
+/// How long an aborted stream waits for its RST, in nanoseconds.
+const RST_NS: u64 = 1_000_000_000;
 /// The streams `evict` looks at.
 const EVICT: usize = 8;
 /// The sessions that went and still hold descriptions at most: a session
@@ -280,9 +282,9 @@ pub struct Net {
     pub orphans: Mask,
     /// The streams no session holds, oldest first (place and the time they
     /// were let go of); an entry whose place has since gone is skipped.
-    orphan_queue: [(u16, u64); SOCKETS_MAX],
-    orphan_head: usize,
-    orphan_len: usize,
+    orphan_queue: OrphanQueue<SOCKETS_MAX>,
+    /// The aborted streams that wait for their RST to go out.
+    rst_wait: Mask,
     /// The members of the queue of a closed listening description that wait
     /// to be let go of, a few a step.
     release_queue: Mask,
@@ -437,19 +439,19 @@ impl Net {
     }
 
     /// Frees a stream that has closed, or else the oldest in TIME-WAIT, among
-    /// the first EVICT of the streams no session holds (the oldest are first).
+    /// the first EVICT entries of the streams no session holds (the oldest are
+    /// first).
     fn evict(&mut self, stack: &mut Stack<'static>) -> bool {
+        let live = Self::live_orphan(&self.places, &self.socks);
+        let _ = self.orphan_queue.front(live);
         let mut chosen: Option<usize> = None;
-        let mut seen = 0;
-        let mut k = 0;
-        while k < self.orphan_len && seen < EVICT {
-            let (place, at) = self.orphan_queue[(self.orphan_head + k) % SOCKETS_MAX];
-            k += 1;
-            let i = usize::from(place);
+        for k in 0..self.orphan_queue.len().min(EVICT) {
+            let Some((i, at)) = self.orphan_queue.get(k) else {
+                break;
+            };
             if !self.orphan_live(i, at) {
                 continue;
             }
-            seen += 1;
             let state = self.socks[i].handle.map(|h| stack.tcp(h).state());
             // A stream that has closed is free at once.
             if state.is_none_or(|s| s == tcp::State::Closed) && !self.socks[i].rst_pending {
@@ -475,35 +477,28 @@ impl Net {
         self.places.state(i) == State::Orphan && self.socks[i].orphan_at == at
     }
 
+    /// The test of an entry of the queue, over the tables it reads.
+    fn live_orphan<'a>(
+        places: &'a Places<SOCKETS_MAX>,
+        socks: &'a [Sock; SOCKETS_MAX],
+    ) -> impl Fn(usize, u64) -> bool + 'a {
+        move |i, at| places.state(i) == State::Orphan && socks[i].orphan_at == at
+    }
+
     /// A stream no session holds, to be swept in its time.
     fn orphan_push(&mut self, i: usize, at: u64) {
-        if self.orphan_len == SOCKETS_MAX {
-            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
-            self.orphan_len -= 1;
-        }
-        let tail = (self.orphan_head + self.orphan_len) % SOCKETS_MAX;
-        self.orphan_queue[tail] = (i as u16, at);
-        self.orphan_len += 1;
+        let live = Self::live_orphan(&self.places, &self.socks);
+        self.orphan_queue.push(i, at, live);
     }
 
     /// The oldest stream no session holds that is still one.
     fn orphan_front(&mut self) -> Option<(usize, u64)> {
-        while self.orphan_len > 0 {
-            let (place, at) = self.orphan_queue[self.orphan_head];
-            if self.orphan_live(usize::from(place), at) {
-                return Some((usize::from(place), at));
-            }
-            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
-            self.orphan_len -= 1;
-        }
-        None
+        let live = Self::live_orphan(&self.places, &self.socks);
+        self.orphan_queue.front(live)
     }
 
     fn orphan_pop(&mut self) {
-        if self.orphan_len > 0 {
-            self.orphan_head = (self.orphan_head + 1) % SOCKETS_MAX;
-            self.orphan_len -= 1;
-        }
+        self.orphan_queue.pop();
     }
 
     /// The place goes: its smoltcp socket, its port when no other holds it,
@@ -520,6 +515,7 @@ impl Net {
         if let Some(key) = sock.key {
             self.demux.remove(&key);
         }
+        self.rst_wait.clear(i);
         self.wake_due.clear(i);
         self.attention.clear(i);
         self.connecting.clear(i);
@@ -651,7 +647,7 @@ impl Net {
                 return false;
             }
         }
-        self.orphan_len > 0
+        !self.orphan_queue.is_empty()
     }
 
     /// The stream of place `i` is aborted: its RST goes out with the next
@@ -677,6 +673,9 @@ impl Net {
         stack.tcp(handle).abort();
         let sock = &mut self.socks[i];
         sock.rst_pending = true;
+        self.rst_wait.set(i);
+        let sock = &mut self.socks[i];
+        sock.orphan_at = now_ns();
         sock.waiters = 0;
         sock.listener = NO_PLACE;
         self.places.set_state(i, State::Orphan);
@@ -689,7 +688,7 @@ impl Net {
 
     /// Whether streams wait for the sweep.
     pub fn orphans_wait(&self) -> bool {
-        self.orphan_len > 0
+        !self.orphan_queue.is_empty()
     }
 
     // ----- the sessions that went -----
@@ -747,7 +746,31 @@ impl Net {
             self.abort_place(stack, m);
             left -= 1;
         }
-        self.departing_used.iter().any(|&w| w != 0) || self.release_queue.next(0).is_some()
+        // The aborted streams whose RST has gone out. One whose RST has not
+        // gone is marked for the next pass of its group, and its place stays.
+        let mut at = 0;
+        while let Some(m) = self.rst_wait.next(at) {
+            at = m + 1;
+            // A RST that cannot go for a second (no neighbour, no buffer) is
+            // given up: the place is not held for ever.
+            let sent = self.socks[m]
+                .handle
+                .is_none_or(|h| stack.tcp(h).remote_endpoint().is_none())
+                || now_ns().saturating_sub(self.socks[m].orphan_at) > RST_NS;
+            if sent {
+                if left == 0 {
+                    break;
+                }
+                self.socks[m].rst_pending = false;
+                self.release_place(stack, m);
+                left -= 1;
+            } else {
+                self.touch(m);
+            }
+        }
+        self.departing_used.iter().any(|&w| w != 0)
+            || self.release_queue.next(0).is_some()
+            || (left == 0 && self.rst_wait.next(0).is_some())
     }
 
     // ----- what a socket is ready for -----
@@ -1019,16 +1042,16 @@ impl Net {
     /// waking, and so is the listening description of a socket of a queue (its
     /// ACCEPT and WATCH wait on that place). A stream that was aborted is free
     /// once the pass of its group has sent the RST.
-    pub fn schedule_wake(&mut self, stack: &mut Stack<'static>) {
+    pub fn schedule_wake(&mut self) {
+        // An aborted stream is let go of by the step of departure once its RST
+        // has really gone out (smoltcp forgets the connection after the
+        // single RST): the pass of its group is the time to look.
         let mut passed = core::mem::take(&mut self.passed);
-        while passed != 0 {
+        while passed != 0 && self.rst_wait.next(0).is_some() {
             let g = passed.trailing_zeros() as usize;
             passed &= passed - 1;
-            for i in g * GROUP..(g + 1) * GROUP {
-                if self.socks[i].rst_pending {
-                    self.socks[i].rst_pending = false;
-                    self.release_place(stack, i);
-                }
+            if (g * GROUP..(g + 1) * GROUP).any(|i| self.rst_wait.has(i)) {
+                self.cleanup_wanted = true;
             }
         }
         let mut groups = core::mem::take(&mut self.touched);
@@ -1080,6 +1103,11 @@ impl Net {
                 let idx = mask.trailing_zeros() as usize;
                 let bit = 1u128 << idx;
                 mask &= mask - 1;
+                // An operation told already waits for its take: it costs
+                // nothing, so that the rest of the place is reached.
+                if self.told & bit != 0 {
+                    continue;
+                }
                 let info = self.info[idx];
                 if !self.ops.waits(info.label, info.key) {
                     self.socks[i].waiters &= !bit;

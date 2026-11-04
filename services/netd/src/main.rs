@@ -638,7 +638,7 @@ impl Driver<'_> {
     /// What every step ends with: the operations that wait are looked at by a
     /// step of their own, and the doorbells ring.
     fn finish_step(&mut self, _now: u64) {
-        self.net.schedule_wake(&mut self.stack);
+        self.net.schedule_wake();
         if self.net.wake_pending() {
             self.tell(WAKE);
         }
@@ -827,7 +827,7 @@ impl Driver<'_> {
     /// PING: an echo request to the address; the reply comes from the step
     /// that sees the answer, or TIMEOUT after a second.
     #[cfg(feature = "probe")]
-    fn ping(&mut self, r: &mut Request<'_>) -> Answer {
+    fn ping(&mut self, r: &mut Request<'_>, length: usize) -> Answer {
         let target = match proto_net::read_ping(r.body()) {
             Ok(address) => address.ipv4(),
             Err(status) => return Answer::Status(status),
@@ -847,7 +847,7 @@ impl Driver<'_> {
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
-        if !self.stack.ping_start(target, now_ns()) {
+        if !self.stack.ping_start(target, now_ns(), length) {
             let status = code(proto_net::NO_BUFFERS);
             let _ = pending.answer(&proto_wire::reply(status), Outgoing::new());
             return Answer::Deferred;
@@ -870,7 +870,8 @@ const SWEEP_NS: u64 = 1_000_000_000;
 /// UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 30, 62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 30, 31, 62,
+    63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
@@ -887,7 +888,9 @@ impl Service<0> for Driver<'_> {
         let answer = match Method::from_number(r.method()) {
             Some(Method::Config) => self.config(r),
             #[cfg(feature = "probe")]
-            Some(Method::Ping) => self.ping(r),
+            Some(Method::Ping) => self.ping(r, stack::ECHO_DATA),
+            #[cfg(feature = "probe")]
+            Some(Method::PingWire) => self.ping(r, proto_net::PING_WIRE_DATA),
             #[cfg(feature = "probe")]
             Some(Method::Crash) => crash(r),
             #[cfg(feature = "probe")]
@@ -956,7 +959,8 @@ impl Service<0> for Driver<'_> {
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
-                        if self.net.wake(&mut self.stack, now_ns()) {
+                        let left = self.net.wake(&mut self.stack, now_ns());
+                        if left {
                             self.tell(WAKE);
                         }
                     }

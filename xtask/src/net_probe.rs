@@ -124,10 +124,11 @@ const PINGS_AFTER: &str = "net-probe: after restart ping 10.0.2.2 ok 10";
 const BIND: &str = "net-probe: bind ok";
 const FULL_BATCH: &str = "net-probe: full batch ok";
 const ALL_GROUPS: &str = "net-probe: all groups ok";
-const WAKES: &str = "net-probe: wakes ok 16";
+const WAKES: &str = "net-probe: wakes ok 16 and 64";
 const IDLE: &str = "net-probe: idle ok";
 const LISTENERS: &str = "net-probe: listeners ok";
 const TIMERS_PREFIX: &str = "net-probe: timers ok";
+const WIRE_PREFIX: &str = "net-probe: wire ok 150";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -170,6 +171,7 @@ pub struct Roles {
     pub idle: bool,
     pub listeners: bool,
     pub timers: bool,
+    pub wire: bool,
 }
 
 impl Roles {
@@ -182,6 +184,7 @@ impl Roles {
         idle: false,
         listeners: false,
         timers: false,
+        wire: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -221,6 +224,10 @@ impl Roles {
     };
     pub const TIMERS: Roles = Roles {
         timers: true,
+        ..Roles::NONE
+    };
+    pub const WIRE: Roles = Roles {
+        wire: true,
         ..Roles::NONE
     };
 }
@@ -348,6 +355,9 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     }
     if roles.listeners {
         once.push((LISTENERS, 1));
+    }
+    if roles.wire && !lines.iter().any(|l| l.starts_with(WIRE_PREFIX)) {
+        return Err(format!("no line {WIRE_PREFIX:?}"));
     }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
@@ -646,6 +656,7 @@ fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageP
             measured_programs(Some("net-timers"), netd),
             Roles::TIMERS,
         ),
+        ("u", measured_programs(Some("net-wire"), netd), Roles::WIRE),
     ]
 }
 
@@ -692,7 +703,7 @@ fn acceptance(
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {}, i {}, l {}, r {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
         own("s256"),
         own("f"),
@@ -701,6 +712,7 @@ fn acceptance(
         own("i"),
         own("l"),
         own("r"),
+        own("u"),
         netd::choose::FLATNESS
     );
     Ok(all)
@@ -797,8 +809,26 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     {
         println!("net-probe on {}: {line}", machine.name);
     }
-    let parts = split_parts(&lines).ok_or("no breakdown of the step in the lines")?;
+    let mut parts = split_parts(&lines).ok_or("no breakdown of the step in the lines")?;
     println!("net-probe: the parts of the step, p90 ticks: {parts:?}");
+    // The frames of the loop carry no sums; the frames of the wire do. The
+    // image of the role `u` sends and takes frames of 1 514 bytes, and the
+    // dearer of the two prices is the price of a frame.
+    let wire_lines = steps_lines(
+        machine,
+        measured_name("split-wire"),
+        measured_programs(Some("net-wire"), &["split"]),
+        Roles::WIRE,
+        false,
+    )?;
+    let wire = split_parts(&wire_lines).ok_or("no breakdown of the wire frames in the lines")?;
+    println!(
+        "net-probe: the cost of a frame of the wire, p90 ticks: received {}, sent {}",
+        wire.frame_rx, wire.frame_tx
+    );
+    parts.frame_rx = parts.frame_rx.max(wire.frame_rx);
+    parts.frame_tx = parts.frame_tx.max(wire.frame_tx);
+    println!("net-probe: the parts the rule reads: {parts:?}");
     let choice = match choose::choose(&parts) {
         Ok(choice) => choice,
         Err(stop) => {
@@ -851,20 +881,20 @@ fn choice_features(receive: usize, groups: usize, send: usize) -> Vec<&'static s
     features.extend(match receive {
         16 => Some("batch-16"),
         8 => Some("batch-8"),
-        2 => Some("batch-2"),
+        4 => Some("batch-4"),
         1 => Some("batch-1"),
         _ => None,
     });
     features.extend(match groups {
         1 => Some("egress-1"),
-        2 => Some("egress-2"),
+        4 => Some("egress-4"),
         _ => None,
     });
     features.extend(match send {
         16 => Some("send-16"),
         8 => Some("send-8"),
+        4 => Some("send-4"),
         2 => Some("send-2"),
-        1 => Some("send-1"),
         _ => None,
     });
     features

@@ -100,6 +100,7 @@ net-wakes = []
 net-idle = []
 net-listen = []
 net-timers = []
+net-wire = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

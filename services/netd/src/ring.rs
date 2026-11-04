@@ -31,52 +31,52 @@ pub const STEP_RX: usize = 16;
 #[cfg(all(feature = "batch-8", not(feature = "batch-16")))]
 pub const STEP_RX: usize = 8;
 #[cfg(all(
-    feature = "batch-2",
+    feature = "batch-4",
     not(any(feature = "batch-16", feature = "batch-8"))
 ))]
-pub const STEP_RX: usize = 2;
+pub const STEP_RX: usize = 4;
 #[cfg(all(
     feature = "batch-1",
-    not(any(feature = "batch-16", feature = "batch-8", feature = "batch-2"))
+    not(any(feature = "batch-16", feature = "batch-8", feature = "batch-4"))
 ))]
 pub const STEP_RX: usize = 1;
 #[cfg(not(any(
     feature = "batch-16",
     feature = "batch-8",
-    feature = "batch-2",
+    feature = "batch-4",
     feature = "batch-1"
 )))]
-pub const STEP_RX: usize = 4;
+pub const STEP_RX: usize = 2;
 #[cfg(feature = "send-16")]
 pub const STEP_TX: usize = 16;
 #[cfg(all(feature = "send-8", not(feature = "send-16")))]
 pub const STEP_TX: usize = 8;
-#[cfg(all(feature = "send-2", not(any(feature = "send-16", feature = "send-8"))))]
-pub const STEP_TX: usize = 2;
+#[cfg(all(feature = "send-4", not(any(feature = "send-16", feature = "send-8"))))]
+pub const STEP_TX: usize = 4;
 #[cfg(all(
-    feature = "send-1",
-    not(any(feature = "send-16", feature = "send-8", feature = "send-2"))
+    feature = "send-2",
+    not(any(feature = "send-16", feature = "send-8", feature = "send-4"))
 ))]
-pub const STEP_TX: usize = 1;
+pub const STEP_TX: usize = 2;
 #[cfg(not(any(
     feature = "send-16",
     feature = "send-8",
-    feature = "send-2",
-    feature = "send-1"
+    feature = "send-4",
+    feature = "send-2"
 )))]
-pub const STEP_TX: usize = 4;
+pub const STEP_TX: usize = 1;
 /// The frames the loopback keeps for the next reception: two steps of
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
 /// The groups of sockets the pass of sending visits in one step, by the
 /// measurement of stage P1a (reports/2026-11-04-net-p1a). The features
-/// `egress-1` and `egress-2` build the smaller values, for the measurement.
+/// `egress-1` and `egress-4` build the other values, for the measurement.
 #[cfg(feature = "egress-1")]
 pub const EGRESS_GROUPS: usize = 1;
-#[cfg(all(feature = "egress-2", not(feature = "egress-1")))]
-pub const EGRESS_GROUPS: usize = 2;
-#[cfg(not(any(feature = "egress-1", feature = "egress-2")))]
+#[cfg(all(feature = "egress-4", not(feature = "egress-1")))]
 pub const EGRESS_GROUPS: usize = 4;
+#[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
+pub const EGRESS_GROUPS: usize = 2;
 /// The operations of one session that wait at most (rt's LONG_SESSION_MAX).
 pub const SESSION_OPS: usize = 16;
 /// The notifications to clients and the checks of readiness the step of
@@ -306,6 +306,101 @@ impl Default for LoopBook {
     }
 }
 
+/// The streams no session holds, oldest first: the place and the time they
+/// were let go of. A stream can leave the table from the middle (a close, an
+/// eviction), so an entry may be stale; `live` says whether an entry still is
+/// the stream let go of at that time. The queue never has more entries than
+/// `N`, and a full one drops its stale entries before it drops anything.
+pub struct OrphanQueue<const N: usize> {
+    entries: [(u16, u64); N],
+    head: usize,
+    len: usize,
+}
+
+impl<const N: usize> OrphanQueue<N> {
+    pub const fn new() -> Self {
+        OrphanQueue {
+            entries: [(0, 0); N],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The entry `k` places from the head, if any.
+    pub fn get(&self, k: usize) -> Option<(usize, u64)> {
+        (k < self.len).then(|| {
+            let (place, at) = self.entries[(self.head + k) % N];
+            (usize::from(place), at)
+        })
+    }
+
+    /// Adds a stream. A full queue first drops its stale entries (there are
+    /// some: the live streams are at most N, and one is being added, so at
+    /// least one place of the queue is stale or the table has no room for the
+    /// stream).
+    pub fn push(&mut self, place: usize, at: u64, live: impl Fn(usize, u64) -> bool) {
+        if self.len == N {
+            self.compact(&live);
+        }
+        if self.len == N {
+            // Every entry is live: the oldest stays and the new one is
+            // refused only when N streams are live, which the table of N
+            // places cannot hold together with a new one.
+            return;
+        }
+        let tail = (self.head + self.len) % N;
+        self.entries[tail] = (place as u16, at);
+        self.len += 1;
+    }
+
+    /// Drops the stale entries, keeping the order of the live ones.
+    pub fn compact(&mut self, live: &impl Fn(usize, u64) -> bool) {
+        let mut kept = 0;
+        for k in 0..self.len {
+            let (place, at) = self.entries[(self.head + k) % N];
+            if live(usize::from(place), at) {
+                self.entries[kept] = (place, at);
+                kept += 1;
+            }
+        }
+        self.head = 0;
+        self.len = kept;
+    }
+
+    /// The oldest live stream, dropping the stale entries before it.
+    pub fn front(&mut self, live: impl Fn(usize, u64) -> bool) -> Option<(usize, u64)> {
+        while self.len > 0 {
+            let (place, at) = self.entries[self.head];
+            if live(usize::from(place), at) {
+                return Some((usize::from(place), at));
+            }
+            self.pop();
+        }
+        None
+    }
+
+    pub fn pop(&mut self) {
+        if self.len > 0 {
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
+        }
+    }
+}
+
+impl<const N: usize> Default for OrphanQueue<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The frames of the loopback (spec 6, 3.3): what the stack sends to its own
 /// MAC waits here for the next reception. The frame stays in the buffer of
 /// sending it was built in (no copy): the ring holds the number of the buffer
@@ -322,6 +417,9 @@ pub struct LoopRing {
     returned: core::cell::RefCell<([u16; LOOP_FRAMES], usize)>,
     /// The frames that found no place.
     dropped: core::cell::Cell<u64>,
+    /// The list of returned buffers was full when a frame was done with: a
+    /// buffer would be lost, which the service must not go on from.
+    overflowed: core::cell::Cell<bool>,
 }
 
 impl LoopRing {
@@ -332,6 +430,7 @@ impl LoopRing {
             lengths: core::array::from_fn(|_| core::cell::Cell::new(0)),
             returned: core::cell::RefCell::new(([0; LOOP_FRAMES], 0)),
             dropped: core::cell::Cell::new(0),
+            overflowed: core::cell::Cell::new(false),
         }
     }
 
@@ -377,11 +476,18 @@ impl LoopRing {
         let at = returned.1;
         // Every `take_returned` runs at the start of a reception, so the list
         // never holds more than the ring does.
-        debug_assert!(at < LOOP_FRAMES);
         if at < LOOP_FRAMES {
             returned.0[at] = self.buffers[place].get();
             returned.1 += 1;
+        } else {
+            self.overflowed.set(true);
         }
+    }
+
+    /// Whether a buffer was lost for want of room in the list of returned
+    /// ones.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.get()
     }
 
     /// A buffer the stack is done with.
@@ -739,6 +845,45 @@ mod tests {
             assert!(book.push().is_some(), "an answer finds a place");
             book.done();
         }
+    }
+
+    #[test]
+    fn a_full_queue_of_orphans_loses_no_live_one() {
+        // A live stream is a place whose time is odd; the others went.
+        let live = |_place: usize, at: u64| at % 2 == 1;
+        let mut q = OrphanQueue::<8>::new();
+        // A young live head, then entries that go stale (closed in the
+        // middle), until the queue is full.
+        q.push(0, 1, live);
+        for k in 1..8 {
+            q.push(k, 2 * k as u64, live);
+        }
+        assert_eq!(q.len(), 8);
+        // A new live stream: the stale ones are dropped, not the head.
+        q.push(9, 21, live);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.get(0), Some((0, 1)));
+        assert_eq!(q.get(1), Some((9, 21)));
+        assert_eq!(q.front(live), Some((0, 1)));
+        q.pop();
+        assert_eq!(q.front(live), Some((9, 21)));
+        q.pop();
+        assert_eq!(q.front(live), None);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn the_queue_goes_round_its_array() {
+        let live = |_: usize, _: u64| true;
+        let mut q = OrphanQueue::<4>::new();
+        for round in 0..10u64 {
+            q.push(1, round, live);
+            q.push(2, round, live);
+            assert_eq!(q.front(live).map(|e| e.1), Some(round));
+            q.pop();
+            q.pop();
+        }
+        assert!(q.is_empty());
     }
 
     #[test]

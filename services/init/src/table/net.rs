@@ -115,13 +115,14 @@ pub const NETD: Record = Record {
 /// 300 pings of the gateway, `b` the registry of ports and the sessions, `sN`
 /// N places of the table at once (the digits are N) and 50 pings, `e` the
 /// rates of the loopback, `f` the full batch of a step after a hold of the
-/// service, `a` every group of sockets with work at once, `w` sixteen
-/// operations told by one datagram, `i` 150 s of idle, `l` a queue of 16 with
-/// blocking ACCEPT and WATCH, `r` the timers, `k` CRASH of the service and the same as `c`
-/// through a new session. The images of the measurement of the steps
-/// (`net-sockets-N`) run `s` at 8, 64 and 256 places; the others at the
-/// limit of the sockets the service serves (netd::places::SOCKETS_LIMIT,
-/// which a test of xtask compares with the number here).
+/// service, `a` every group of sockets with work at once, `w` sixteen and
+/// then 64 operations told by one datagram, `i` 150 s of idle, `l` a queue of
+/// 16 with blocking ACCEPT and WATCH, `r` the timers, `u` echo requests that
+/// fill a frame, `k` CRASH of the service and the same as `c` through a new
+/// session. The images of the measurement of the steps (`net-sockets-N`) run
+/// `s` at 8, 64 and 256 places; the others at the limit of the sockets the
+/// service serves (netd::places::SOCKETS_LIMIT, which a test of xtask
+/// compares with the number here).
 pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"cs8k"
 } else if cfg!(feature = "net-sockets-64") {
@@ -136,6 +137,8 @@ pub const ROLES: &[u8] = if cfg!(feature = "net-sockets-8") {
     b"cak"
 } else if cfg!(feature = "net-wakes") {
     b"cwk"
+} else if cfg!(feature = "net-wire") {
+    b"cuk"
 } else if cfg!(feature = "net-idle") {
     b"cik"
 } else if cfg!(feature = "net-listen") {

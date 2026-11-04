@@ -27,18 +27,18 @@ bench = false
 probe = []
 batch-16 = []
 batch-8 = []
-batch-2 = []
+batch-4 = []
 batch-1 = []
 send-16 = []
 send-8 = []
+send-4 = []
 send-2 = []
-send-1 = []
 # `limit-8`, `limit-64`, `limit-256`: the sockets limit, for the same
 # measurement (the default is the chosen one).
 # `split`: the breakdown of the step of the stack by parts (measurement only).
 split = []
 egress-1 = []
-egress-2 = []
+egress-4 = []
 limit-8 = []
 limit-64 = []
 limit-256 = []

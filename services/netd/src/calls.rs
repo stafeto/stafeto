@@ -189,7 +189,7 @@ impl Net {
                     Ok(key) => key,
                     Err(e) => return Answer::Status(Status::Kernel(e)),
                 };
-                let idx = op_index(key).unwrap_or(0);
+                let idx = op_index(key).expect("a key the table of operations gave");
                 self.info[idx] = OpInfo {
                     key,
                     label,
@@ -1270,7 +1270,7 @@ impl Net {
             Ok(key) => key,
             Err(e) => return Answer::Status(Status::Kernel(e)),
         };
-        let idx = op_index(key).unwrap_or(0);
+        let idx = op_index(key).expect("a key the table of operations gave");
         self.told &= !(1 << idx);
         self.info[idx] = OpInfo {
             key,
