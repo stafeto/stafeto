@@ -1,0 +1,70 @@
+The run-probes of nginx's configure, made answerable without running the
+target's program (tools/build-nginx.py): where auto/feature, auto/types/sizeof
+and auto/endianness ran the compiled probe, they run
+`$NGX_AUTOTEST_ANSWER $NGX_AUTOTEST` with the probe's name in
+NGX_AUTOTEST_NAME. With NGX_AUTOTEST_ANSWER empty they run the probe itself,
+as before. tools/nginx/autotest-answer.py answers. No other file of nginx
+changes.
+
+
+--- a/auto/endianness
++++ b/auto/endianness
+@@ -32,7 +32,7 @@
+ eval "$ngx_test >> $NGX_AUTOCONF_ERR 2>&1"
+ 
+ if [ -x $NGX_AUTOTEST ]; then
+-    if $NGX_AUTOTEST >/dev/null 2>&1; then
++    if NGX_AUTOTEST_NAME="byte ordering" $NGX_AUTOTEST_ANSWER $NGX_AUTOTEST >/dev/null 2>&1; then
+         echo " little endian"
+         have=NGX_HAVE_LITTLE_ENDIAN . auto/have
+     else
+
+--- a/auto/feature
++++ b/auto/feature
+@@ -53,7 +53,7 @@
+ 
+         yes)
+             # /bin/sh is used to intercept "Killed" or "Abort trap" messages
+-            if /bin/sh -c $NGX_AUTOTEST >> $NGX_AUTOCONF_ERR 2>&1; then
++            if NGX_AUTOTEST_NAME="$ngx_feature" /bin/sh -c "$NGX_AUTOTEST_ANSWER $NGX_AUTOTEST" >> $NGX_AUTOCONF_ERR 2>&1; then
+                 echo " found"
+                 ngx_found=yes
+ 
+@@ -68,14 +68,14 @@
+ 
+         value)
+             # /bin/sh is used to intercept "Killed" or "Abort trap" messages
+-            if /bin/sh -c $NGX_AUTOTEST >> $NGX_AUTOCONF_ERR 2>&1; then
++            if NGX_AUTOTEST_NAME="$ngx_feature" /bin/sh -c "$NGX_AUTOTEST_ANSWER $NGX_AUTOTEST" >> $NGX_AUTOCONF_ERR 2>&1; then
+                 echo " found"
+                 ngx_found=yes
+ 
+                 cat << END >> $NGX_AUTO_CONFIG_H
+ 
+ #ifndef $ngx_feature_name
+-#define $ngx_feature_name  `$NGX_AUTOTEST`
++#define $ngx_feature_name  `NGX_AUTOTEST_NAME="$ngx_feature" $NGX_AUTOTEST_ANSWER $NGX_AUTOTEST`
+ #endif
+ 
+ END
+@@ -86,7 +86,7 @@
+ 
+         bug)
+             # /bin/sh is used to intercept "Killed" or "Abort trap" messages
+-            if /bin/sh -c $NGX_AUTOTEST >> $NGX_AUTOCONF_ERR 2>&1; then
++            if NGX_AUTOTEST_NAME="$ngx_feature" /bin/sh -c "$NGX_AUTOTEST_ANSWER $NGX_AUTOTEST" >> $NGX_AUTOCONF_ERR 2>&1; then
+                 echo " not found"
+ 
+             else
+
+--- a/auto/types/sizeof
++++ b/auto/types/sizeof
+@@ -40,7 +40,7 @@
+ 
+ 
+ if [ -x $NGX_AUTOTEST ]; then
+-    ngx_size=`$NGX_AUTOTEST`
++    ngx_size=`NGX_AUTOTEST_NAME="sizeof $ngx_type" $NGX_AUTOTEST_ANSWER $NGX_AUTOTEST`
+     echo " $ngx_size bytes"
+ fi
+ 
