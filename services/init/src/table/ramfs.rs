@@ -493,12 +493,13 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// The pipe service (5e), beside the RAM file service at its level: its
 /// segments, a stack of 32 KiB, the 64 rings of 4 KiB and the tables of
 /// its 320 sessions, 256 births and 128 long operations in `.bss`; a
-/// handle for each long operation that waits.
+/// handle for each long operation that waits and for each pass of a socket
+/// of the network service that a message holds (32 at most).
 pub const PIPE: Record = Record {
     name: "pipe",
     program: "pipe",
     quota: 160 * PAGE,
-    handle_limit: 192,
+    handle_limit: 224,
     restart: Restart::Never,
     ..RAM_BASE
 };

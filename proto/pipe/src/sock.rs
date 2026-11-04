@@ -47,6 +47,17 @@ pub const RING: usize = 4096;
 pub const SEND_MAX: usize = 800;
 /// The most descriptions one message carries.
 pub const FDS_MAX: usize = 8;
+/// A pass of the network service (a socket of AF_INET sent as SCM_RIGHTS)
+/// stands in the list of descriptions of a message as `PASS + k`, k the
+/// number of its handle among the handles of the message (`PASSES_PER_MESSAGE`
+/// at most). No description of the service has a number that high.
+pub const PASS: u32 = 0xFFFF_FFF0;
+/// The handles of passes one message carries at most.
+pub const PASSES_PER_MESSAGE: usize = 4;
+/// The handles of passes the service holds at most: those of messages that
+/// wait in a socket, of sends that wait for room, and of messages whose
+/// socket went and whose handles are not closed yet.
+pub const PASSES_MAX: usize = 32;
 /// The most bytes of a path in an address (sun_path).
 pub const NAME_MAX: usize = 108;
 /// The sockets that wait for an accept at one listener at most.
@@ -77,6 +88,8 @@ pub const OPT_KEEPALIVE: u32 = 8;
 pub const OPT_BROADCAST: u32 = 9;
 /// Whether the next byte to read is the mark of a pending out-of-band byte.
 pub const OPT_ATMARK: u32 = 10;
+/// The handles of passes the service holds (read only, any socket).
+pub const OPT_PASSES: u32 = 11;
 
 /// EADDRINUSE.
 pub const IN_USE: u32 = 708;
