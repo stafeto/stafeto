@@ -2337,7 +2337,12 @@ impl Probe<'_> {
             self.epoll_set(
                 &session,
                 set,
-                &[rec(sockets::EPOLL_ADD, u, proto_net::sockets::epoll::OUT, 5)],
+                &[rec(
+                    sockets::EPOLL_ADD,
+                    u,
+                    proto_net::sockets::epoll::OUT,
+                    5,
+                )],
             )?;
             self.sleep(100_000_000);
             for (k, key) in keys.iter().enumerate() {

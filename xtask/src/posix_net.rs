@@ -6,9 +6,11 @@
 //! with the network service on QEMU's user network, where xtask runs
 //! `posix-net ADDRESS` (tests/posix-so/dyn/posix-net.c) over the serial port:
 //! the limit of 1 024 descriptors, 1 000 sockets, a fork and an exec with
-//! many descriptors, and the buffers of the sockets by their place in the
-//! service. The program prints a line for each check and xtask compares them
-//! with its own list. The run needs no `-icount`.
+//! many descriptors, the buffers of the sockets by their place in the
+//! service, and (stage P4a-2) epoll, poll and select over more than 64
+//! descriptors and 1 000 sockets in one set. The program prints a line for
+//! each check and xtask compares them with its own list. The run needs no
+//! `-icount`.
 //!
 //! `cargo xtask posix-net steps` runs the same under -icount with the service
 //! counting its steps, and judges every step against 0.9 of term B and the
