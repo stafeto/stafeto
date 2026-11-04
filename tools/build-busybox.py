@@ -117,7 +117,7 @@ UTILITIES = tuple(name.upper() for name in (
     "du ed env expand expr false find fold grep head id kill ln logger logname mesg mkdir "
     "mkfifo mv nice nohup od paste patch printf pwd readlink realpath renice rm rmdir sed "
     "sleep sort split strings stty tail tee test time timeout touch tr true tsort tty uname "
-    "uncompress unexpand uniq uudecode uuencode xargs zcat busybox desktop ps feature_ps_wide feature_ps_long feature_ps_time feature_ps_additional_columns feature_ls_username feature_seamless_z feature_seamless_gz "
+    "uncompress unexpand uniq uudecode uuencode xargs zcat busybox desktop httpd ps feature_ps_wide feature_ps_long feature_ps_time feature_ps_additional_columns feature_ls_username feature_seamless_z feature_seamless_gz "
     "feature_mtab_support feature_awk_libm feature_awk_gnu_extensions feature_date_compat "
     "feature_date_isofmt feature_date_nano feature_dd_ibs_obs feature_dd_status feature_df_fancy "
     "feature_diff_dir feature_find_amin feature_find_atime "
@@ -353,6 +353,11 @@ def build(utilities: bool) -> None:
             config.write_text(text.replace(f"# CONFIG_{name} is not set", f"CONFIG_{name}=y"))
         elif f"CONFIG_{name}=y" not in text:
             raise SystemExit(f"BusyBox has no CONFIG_{name}")
+    if "HTTPD" in names:
+        # httpd serves plain files: the allnoconfig leaves every feature of it
+        # off, and its default port 0 is out of the range the build asks
+        # about, so it takes the 80 of the default.
+        replace(config, "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=0", "CONFIG_FEATURE_HTTPD_PORT_DEFAULT=80")
     replace(config, "# CONFIG_FEATURE_SH_STANDALONE is not set",
             "CONFIG_FEATURE_SH_STANDALONE=y")
     replace(config, "# CONFIG_FEATURE_SH_NOFORK is not set",
