@@ -141,7 +141,16 @@ fn main(_: u64) -> u64 {
     let Ok(ecam) = got.take::<Memory>("ecam") else {
         return 2;
     };
-    if sys::mem_map(&start.process, &ecam, 0, ECAM_LEN, ECAM_AT, Access::ReadWrite).is_err() {
+    if sys::mem_map(
+        &start.process,
+        &ecam,
+        0,
+        ECAM_LEN,
+        ECAM_AT,
+        Access::ReadWrite,
+    )
+    .is_err()
+    {
         return 3;
     }
     for device in 0..32 {
