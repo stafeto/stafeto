@@ -308,6 +308,50 @@ pub unsafe extern "C" fn stafeto_sendmsg(fd: c_int, message: *const MsgHdr, flag
     sent
 }
 
+/// The most parts of a writev the platform sends as one: nginx gathers up
+/// to 64 (`NGX_IOVS_PREALLOCATE`); more go part by part through relibc.
+const WRITEV_MAX: usize = 64;
+
+/// writev of a stream socket of the network service as one send, which
+/// relibc's writev asks first: the bytes sent, a negated errno, or
+/// `isize::MIN` for any other descriptor (relibc then writes the parts its
+/// own way). EPIPE follows SIGPIPE, as a write's does.
+///
+/// # Safety
+/// `iov` is `iovcnt` readable struct iovec whose parts are readable; relibc
+/// checked the count (1 to IOV_MAX).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_writev_socket(
+    fd: c_int,
+    iov: *const IoVec,
+    iovcnt: c_int,
+) -> isize {
+    let count = iovcnt.max(0) as usize;
+    if iov.is_null() || count > WRITEV_MAX || !posix_abi::net::is_net(fd) {
+        return isize::MIN;
+    }
+    let mut parts: [&[u8]; WRITEV_MAX] = [&[]; WRITEV_MAX];
+    for (k, part) in parts.iter_mut().enumerate().take(count) {
+        // SAFETY: the caller's promise.
+        let v = unsafe { &*iov.add(k) };
+        *part = match unsafe { input(v.base, v.len) } {
+            Ok(bytes) => bytes,
+            Err(errno) => return -(errno as isize),
+        };
+    }
+    let Some(sent) = call(|| Ok(posix_abi::net::writev(fd, &parts[..count])))
+        .ok()
+        .flatten()
+    else {
+        return isize::MIN;
+    };
+    let sent = value(sent.map(|n| n as i64)) as isize;
+    if sent == -(posix_abi::constants::EAGAIN as isize) {
+        posix_abi::epoll::would_block(fd, true);
+    }
+    sent
+}
+
 /// recvmsg (and, built on it, recv, recvfrom): the bytes received; the
 /// length of the sender's address, the flags of the message and the length
 /// of the control data are set in `message`.

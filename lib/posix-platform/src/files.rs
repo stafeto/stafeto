@@ -391,6 +391,10 @@ const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
+/// The owner of a socket's signals (relibc's values, Linux's).
+const F_SETOWN: c_int = 8;
+const F_GETOWN: c_int = 9;
+const O_NONBLOCK: c_int = 0o4000;
 /// The status flags F_SETFL cannot take yet (Linux's O_APPEND, O_NONBLOCK)
 /// but on a pipe, whose O_NONBLOCK it sets.
 const UNSUPPORTED_STATUS: u64 = 0o2000 | 0o4000;
@@ -435,6 +439,17 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             Ok(None) => {}
             Err(errno) => return -errno,
         }
+    }
+    // The owner of a socket's signals, kept and never signalled
+    // (posix_abi::owners).
+    if command == F_SETOWN || command == F_GETOWN {
+        let change = if command == F_SETOWN {
+            posix_abi::owners::Change::SetOwner(argument as c_int)
+        } else {
+            posix_abi::owners::Change::GetOwner
+        };
+        return call(|| posix_abi::owners::change(fd, change, EINVAL))
+            .unwrap_or_else(|errno| -errno);
     }
     // A copy at the lowest free number from the argument may need a page of
     // the table of descriptors: the call grows the table and asks again.
@@ -563,6 +578,7 @@ const TCSBRK: c_ulong = 0x5409;
 const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
 const FIONBIO: c_ulong = 0x5421;
+const FIOASYNC: c_ulong = 0x5452;
 /// FIONREAD and SIOCINQ.
 const FIONREAD: c_ulong = 0x541B;
 const TIOCSCTTY: c_ulong = 0x540E;
@@ -759,6 +775,40 @@ pub unsafe extern "C" fn stafeto_ioctl(
         // SAFETY: FIONBIO's argument is a readable int.
         let on = unsafe { argument.cast::<c_int>().read() } != 0;
         return posix_abi::net::nonblocking(fd, on).map_or_else(|errno| -errno, |()| 0);
+    }
+    // FIONBIO of any other descriptor: O_NONBLOCK of its description, as
+    // F_SETFL sets it (nginx makes the channels of its workers so).
+    if request == FIONBIO {
+        if argument.is_null() {
+            return -EFAULT;
+        }
+        // SAFETY: FIONBIO's argument is a readable int.
+        let on = unsafe { argument.cast::<c_int>().read() } != 0;
+        let flags = stafeto_fcntl(fd, F_GETFL, 0);
+        if flags < 0 {
+            return flags;
+        }
+        let flags = if on {
+            flags | O_NONBLOCK
+        } else {
+            flags & !O_NONBLOCK
+        };
+        let set = stafeto_fcntl(fd, F_SETFL, flags as u64);
+        return set.min(0);
+    }
+    // FIOASYNC of a socket: the flag is kept, and no SIGIO is ever sent.
+    if request == FIOASYNC {
+        if argument.is_null() {
+            return -EFAULT;
+        }
+        // SAFETY: FIOASYNC's argument is a readable int.
+        let on = unsafe { argument.cast::<c_int>().read() };
+        if !(0..=1).contains(&on) {
+            return -EINVAL;
+        }
+        let change = posix_abi::owners::Change::Asynchronous(on == 1);
+        return call(|| posix_abi::owners::change(fd, change, ENOTTY))
+            .unwrap_or_else(|errno| -errno);
     }
     // FIONREAD (SIOCINQ) of a socket of the network service: the bytes ready to read.
     if request == FIONREAD && posix_abi::net::is_net(fd) {

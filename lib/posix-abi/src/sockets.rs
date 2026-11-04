@@ -53,6 +53,12 @@ pub const SO_KEEPALIVE: i32 = 9;
 /// The number of the option that counts the handles of passes the pipe service
 /// holds (a number of stafeto's, outside those of Linux): read only.
 pub const SO_STAFETO_PASSES: i32 = 0x7350;
+/// The sessions of the network service with a shared buffer now (bits 0-15)
+/// and their limit (bits 16-31), on any socket of the service.
+pub const SO_STAFETO_BUFFERS: i32 = 0x7351;
+/// The KiB that went through the shared buffers of the network service
+/// since it started (wrapping), on any socket of the service.
+pub const SO_STAFETO_BUFFERED: i32 = 0x7352;
 pub const SO_REUSEPORT: i32 = 15;
 pub const SO_LINGER: i32 = 13;
 pub const SO_RCVTIMEO: i32 = 20;

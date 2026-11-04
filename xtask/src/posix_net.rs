@@ -24,9 +24,9 @@ use crate::{
     busybox_build, nano_build, net, net_curl, net_probe, qemu, relibc, symbolize,
 };
 
-/// The checks of `posix-net` for stages P4a-1, P4a-2 and P4a-3, in the order the
+/// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 53] = [
+pub const CHECKS: [&str; 63] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -80,6 +80,16 @@ pub const CHECKS: [&str; 53] = [
     "scm-root",
     "scm-depart",
     "epoll-exclusive",
+    "buffer-send",
+    "buffer-recv",
+    "buffer-nonblock",
+    "buffer-writev",
+    "buffer-threads",
+    "buffer-fork",
+    "buffer-exec",
+    "buffer-signal",
+    "fsetown",
+    "epoll-rdhup-unix",
 ];
 
 /// The image of the run with the counted steps of the network service and

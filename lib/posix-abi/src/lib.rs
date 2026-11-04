@@ -44,7 +44,9 @@ pub mod metadata;
 pub mod mmap;
 pub mod names;
 pub mod net;
+mod netbuf;
 mod open_driver;
+pub mod owners;
 pub mod pipes;
 pub mod process;
 #[cfg(feature = "procfs")]
@@ -327,7 +329,11 @@ pub fn close(number: c_int) -> Result<(), c_int> {
 /// Reads into `buffer`: a point of cancellation.
 pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
-    let result = read_inner(number, buffer);
+    // A large read of a stream socket goes through the shared buffer.
+    let result = match net::read_large(number, buffer) {
+        Some(result) => result,
+        None => read_inner(number, buffer),
+    };
     if result.is_ok_and(|n| n > 0) {
         point.end();
     } else {

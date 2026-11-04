@@ -118,6 +118,8 @@ net-abandon = []
 net-epoll = []
 # Role `x`: passes (EXPORT, ADOPT, the last copy going) and time limits.
 net-passes = []
+# Roles `G` and `B`: the shared buffers (the portion of a copy and 64 sessions).
+net-buffers = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

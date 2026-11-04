@@ -53,6 +53,19 @@ pub const fn bar_at() -> usize {
     0x10_3000_0000
 }
 
+/// Where the service maps the shared buffers of the sessions (BUFFER): entry
+/// `i` of `netd::buffers` at `BUFFERS_AT + i * BUFFER_SPAN`, above the
+/// windows and the objects of the devices.
+pub const BUFFERS_AT: usize = 0x11_0000_0000;
+pub const BUFFER_SPAN: usize = proto_net::BUFFER_SIZE;
+
+pub const fn buffer_at(i: usize) -> usize {
+    BUFFERS_AT + i * BUFFER_SPAN
+}
+
+const _: () = assert!(bar_at() + 0x1000_0000 <= BUFFERS_AT);
+const _: () = assert!(BUFFER_SPAN == 0x4_0000);
+
 struct Slot {
     dma_pa: AtomicU64,
     net_pa: AtomicU64,

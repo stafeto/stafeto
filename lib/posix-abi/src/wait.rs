@@ -597,7 +597,9 @@ fn run(
             Some(Target::Net(description)) => {
                 let at = 6 + (subscriptions[6].set.len + subscriptions[7].set.len) / watch::MAX;
                 subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
-                subscriptions[at].add(description.description, requested, index);
+                // The service knows POLLRDHUP of a stream.
+                let rdhup = item.events as u16 as u32 & watch::RDHUP;
+                subscriptions[at].add(description.description, requested | rdhup, index);
             }
             // A poll of an epoll descriptor reports POLLERR: a departure from
             // Linux, which reports POLLIN when records are ready (nesting is not
@@ -743,6 +745,12 @@ fn run(
     }
     drop(subscriptions);
     drop(timer);
+    // A socket of the pipe service whose peer went says POLLRDHUP with its
+    // POLLHUP, as Linux's AF_UNIX sockets do.
+    let mut unix = [false; LIMIT];
+    for (slot, target) in unix.iter_mut().zip(&pins.targets) {
+        *slot = matches!(target, Some(Target::Pipe(end)) if end & proto_pipe::sock::SOCK_END != 0);
+    }
     drop(pins);
     if let Some(error) = cleanup_error {
         return Err(error);
@@ -751,8 +759,11 @@ fn run(
     if block.handled.load(Ordering::SeqCst) != handled || threads::cancel::requested() {
         return Err(EINTR);
     }
-    for (item, events) in items.iter_mut().zip(ready) {
-        item.revents = events as i16;
+    for ((item, events), unix) in items.iter_mut().zip(ready.iter_mut()).zip(unix) {
+        if unix && *events & watch::HUP != 0 {
+            *events |= item.events as u16 as u32 & POLLRDHUP;
+        }
+        item.revents = *events as i16;
     }
     Ok(ready_count(&ready[..items.len()]))
 }
@@ -808,6 +819,9 @@ pub(crate) fn run_net(
 ) -> Result<usize, i32> {
     run(items, until, handled, false, net)
 }
+
+/// POLLRDHUP of Linux: the peer of a stream shut its writing or went.
+pub const POLLRDHUP: u32 = watch::RDHUP;
 
 /// The most entries a poll or select takes: the descriptors of a process.
 pub const MAX_LARGE: usize = posix_fs::OPEN_MAX;
@@ -895,7 +909,7 @@ fn large_in(
         if work.first[fd] == 0 {
             work.first[fd] = k as u16 + 1;
         }
-        work.asked[fd] |= item.events as u16 & watch::EVENTS as u16;
+        work.asked[fd] |= item.events as u16 & (watch::EVENTS | POLLRDHUP) as u16;
     }
     let mut records = [EpollRecord::default(); wire::EPOLL_BATCH];
     let mut count = 0;

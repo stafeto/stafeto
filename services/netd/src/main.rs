@@ -39,6 +39,7 @@
 #![no_main]
 
 mod calls;
+mod cells;
 mod device;
 mod dma;
 mod files;
@@ -62,7 +63,7 @@ use proto_init::ServiceArgs;
 use proto_net::sockets;
 use proto_net::{Method, VERSION, code};
 use proto_wire::{Status, Writer};
-use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
+use rt::handle::{Channel, Interrupt, Memory, Outgoing, Process, Resource, Timer};
 use rt::service::{
     Answer, Config, Heartbeat, LongSession, Notice, Pending, Request, Service, Session,
 };
@@ -406,7 +407,14 @@ fn main(_: u64) -> u64 {
     // zeroed memory of the static.
     let tables = unsafe {
         let pointer = (*TABLES.0.get()).as_mut_ptr();
-        Tables::initialize_at(pointer, ports_key, demux_key, &s.parent, &channel, level);
+        Tables::initialize_at(
+            pointer,
+            ports_key,
+            demux_key,
+            (&s.parent, &channel, &s.process),
+            level,
+            settings.buffers(),
+        );
         &mut *pointer
     };
     posix_random::erase(&mut ports_key);
@@ -643,9 +651,9 @@ impl Tables {
         tables: *mut Tables,
         key: [u8; 16],
         demux_key: [u8; 16],
-        parent: &Handle<Channel>,
-        channel: &Handle<Channel>,
+        (parent, channel, process): (&Handle<Channel>, &Handle<Channel>, &Handle<Process>),
         level: u8,
+        buffers: u16,
     ) {
         use core::ptr::addr_of_mut;
         // SAFETY: each field is in bounds and written once.
@@ -657,6 +665,8 @@ impl Tables {
                 parent,
                 channel,
                 level,
+                process,
+                buffers,
             );
             Storage::initialize_at(addr_of_mut!((*tables).storage));
             rt::bss::fill_none(addr_of_mut!((*tables).sessions));
@@ -1158,6 +1168,17 @@ impl Driver<'_> {
             self.device.bad_sum,
             self.net.demux.probe_max
         );
+        let [first, all] = self.net.counters.buffers_used;
+        if all != 0 {
+            rt::println!("net: buffers 1 used {first} pages, 64 used {all} pages");
+        }
+        if self.net.counters.largest_copy != 0 {
+            rt::println!(
+                "net: buffer portion {} largest copy {}",
+                netd::ring::BUFFER_PORTION,
+                self.net.counters.largest_copy
+            );
+        }
         split::report();
     }
 
@@ -1252,16 +1273,16 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. The methods of later stages (25, 26) are UNKNOWN_METHOD.
+/// `probe`. The method of a later stage (26) is UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28,
-    29, 30, 31, 32, 33, 34, 35, 62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27,
+    28, 29, 30, 31, 32, 33, 34, 35, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28,
-    29, 32, 33, 34, 35,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27,
+    28, 29, 32, 33, 34, 35,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1281,6 +1302,7 @@ impl Service<0> for Driver<'_> {
             Some(Method::Crash) => crash(r),
             #[cfg(feature = "probe")]
             Some(Method::Hold) => self.hold(r),
+            Some(Method::Buffer) => self.net.buffer(s, r),
             Some(method) => match sockets::Request::parse(method, r.body()) {
                 Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
                 Some(Err(status)) => Answer::Status(status),
@@ -1298,6 +1320,10 @@ impl Service<0> for Driver<'_> {
         rt::service::step_own();
         let held = core::mem::take(&mut s.data.held);
         let long = core::mem::take(&mut s.data.long);
+        // The shared buffer is unmapped by a step of departure.
+        if self.net.retire_buffer(s) {
+            self.cleanup();
+        }
         // The interest sets of the session go with it, their records in steps.
         if self.net.interest.sets_of(s.label()) != 0 {
             self.net.interest.drop_sets_of(s.label());

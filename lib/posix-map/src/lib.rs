@@ -11,12 +11,14 @@
 //! range across several pieces is walked one piece at a time, as the
 //! kernel's calls take a range inside one entry. `Space` records what each
 //! page of the layer's room is for. No device window is ever in the map: a
-//! POSIX process has no device resource. The one DMA object that can be is
-//! the buffer of the screen, the *display piece* (spec 3, 7.3): `fork` does
-//! not copy it into the child (`Map::inherited` leaves it out, so the child
-//! has a hole there), `munmap` and `mprotect` refuse it (`Refused::Display`,
-//! EINVAL), and only `unmap_display` takes it out. The handle type is a
-//! parameter, so that the host tests use plain numbers.
+//! POSIX process has no device resource. Two pieces are the layer's own and
+//! of a kind of their own (`Kind`): the buffer of the screen, the *display
+//! piece* (spec 3, 7.3), a DMA object, and the process's shared buffer with
+//! the network service, the *network buffer piece*. `fork` copies neither
+//! into the child (`Map::inherited` leaves them out, so the child has a hole
+//! there), `munmap` and `mprotect` refuse both (`Refused::Special`, EINVAL),
+//! and only `unmap_kind` takes one out. The handle type is a parameter, so
+//! that the host tests use plain numbers.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -176,9 +178,10 @@ pub struct Object<H> {
     /// filled: immutable, without a file, and shared with a forked child
     /// without a copy.
     pub image: bool,
-    /// The buffer of the screen (spec 3, 7.3): not copied by `fork`, not
-    /// changed by `munmap` or `mprotect`, taken out by `unmap_display`.
-    pub display: bool,
+    /// What the object is to the layer: a plain mapping, or one of the two
+    /// pieces that `fork` does not copy, `munmap` and `mprotect` do not
+    /// change, and only `unmap_kind` takes out.
+    pub kind: Kind,
     /// The key of an anonymous shared object for waits by address between
     /// processes (0: none). A forked child shows the same object with the
     /// same key.
@@ -194,7 +197,7 @@ impl<H> Object<H> {
             may_write: true,
             dirty: false,
             image: false,
-            display: false,
+            kind: Kind::Plain,
             wait_key: 0,
         }
     }
@@ -202,10 +205,36 @@ impl<H> Object<H> {
     /// The buffer of the screen: writable, never shared with a child.
     pub fn display(handle: H) -> Self {
         Object {
-            display: true,
+            kind: Kind::Display,
             ..Object::new(handle, false, None)
         }
     }
+
+    /// The shared buffer with the network service: writable, never shared
+    /// with a child.
+    pub fn net_buffer(handle: H) -> Self {
+        Object {
+            kind: Kind::NetBuffer,
+            ..Object::new(handle, false, None)
+        }
+    }
+
+    /// Whether the object is one of the layer's own pieces.
+    pub fn special(&self) -> bool {
+        self.kind != Kind::Plain
+    }
+}
+
+/// The kinds of the objects of a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A mapping of the program or of the layer that `fork`, `munmap` and
+    /// `mprotect` treat as POSIX says.
+    Plain,
+    /// The buffer of the screen (spec 3, 7.3).
+    Display,
+    /// The shared buffer of the process with the network service.
+    NetBuffer,
 }
 
 /// Why a map refused a change.
@@ -218,9 +247,9 @@ pub enum Refused {
     Malformed,
     /// The range meets a piece the map holds.
     Overlap,
-    /// The range meets the display piece, which only `unmap_display`
-    /// changes.
-    Display,
+    /// The range meets the display piece or the network buffer piece, which
+    /// only `unmap_kind` changes.
+    Special,
 }
 
 /// The pieces of a process, sorted by address, and its objects. An empty
@@ -450,30 +479,43 @@ impl<H> Map<H> {
         at == address.saturating_add(pages.saturating_mul(PAGE))
     }
 
-    /// Whether some page of the range lies in the display piece.
-    pub fn meets_display(&self, address: usize, pages: usize) -> bool {
+    /// Whether some page of the range lies in the display piece or in the
+    /// network buffer piece.
+    pub fn meets_special(&self, address: usize, pages: usize) -> bool {
         self.walk(address, pages)
-            .any(|(i, ..)| self.object(self.piece(i).object()).display)
+            .any(|(i, ..)| self.object(self.piece(i).object()).special())
     }
 
-    /// The pieces a forked child gets: all but the display piece.
+    /// The pieces a forked child gets: all but the display piece and the
+    /// network buffer piece.
     pub fn inherited(&self) -> impl Iterator<Item = &Piece> {
         self.iter()
-            .filter(|piece| !self.object(piece.object()).display)
+            .filter(|piece| !self.object(piece.object()).special())
+    }
+
+    /// The first address and the pages of the piece of `kind` (Display or
+    /// NetBuffer), when the map has one.
+    pub fn kind_piece(&self, kind: Kind) -> Option<(usize, usize)> {
+        self.iter()
+            .find(|piece| self.object(piece.object()).kind == kind)
+            .map(|piece| (piece.address, piece.pages()))
     }
 
     /// The display piece's first address and pages, when the map has one.
     pub fn display_piece(&self) -> Option<(usize, usize)> {
-        self.iter()
-            .find(|piece| self.object(piece.object()).display)
-            .map(|piece| (piece.address, piece.pages()))
+        self.kind_piece(Kind::Display)
     }
 
-    /// The display piece leaves the map (the kernel's `mem_unmap` of it
+    /// The display piece leaves the map: `unmap_kind` of Display.
+    pub fn unmap_display(&mut self) -> Option<(usize, usize, Object<H>)> {
+        self.unmap_kind(Kind::Display)
+    }
+
+    /// The piece of `kind` leaves the map (the kernel's `mem_unmap` of it
     /// succeeded): its address, its pages and the object, which the caller
     /// closes. None without one.
-    pub fn unmap_display(&mut self) -> Option<(usize, usize, Object<H>)> {
-        let (address, pages) = self.display_piece()?;
+    pub fn unmap_kind(&mut self, kind: Kind) -> Option<(usize, usize, Object<H>)> {
+        let (address, pages) = self.kind_piece(kind)?;
         let at = self.find(address)?;
         let object = self.piece(at).object();
         self.remove_piece(at);
@@ -587,8 +629,8 @@ impl<H> Map<H> {
         pages: usize,
         access: Access,
     ) -> Result<(), Refused> {
-        if self.object(self.piece(index).object()).display {
-            return Err(Refused::Display);
+        if self.object(self.piece(index).object()).special() {
+            return Err(Refused::Special);
         }
         let at = self.cut(index, address, pages)?;
         let cut = *self.piece(at);
@@ -605,8 +647,8 @@ impl<H> Map<H> {
         address: usize,
         pages: usize,
     ) -> Result<Option<Object<H>>, Refused> {
-        if self.object(self.piece(index).object()).display {
-            return Err(Refused::Display);
+        if self.object(self.piece(index).object()).special() {
+            return Err(Refused::Special);
         }
         let at = self.cut(index, address, pages)?;
         let object = self.piece(at).object();
@@ -626,8 +668,8 @@ impl<H> Map<H> {
         address: usize,
         pages: usize,
     ) -> Result<(), Refused> {
-        if self.object(self.piece(index).object()).display {
-            return Err(Refused::Display);
+        if self.object(self.piece(index).object()).special() {
+            return Err(Refused::Special);
         }
         let at = self.cut(index, address, pages)?;
         self.remove_piece(at);
@@ -990,6 +1032,37 @@ mod tests {
         assert_eq!(run(&mut make(), 0x1E000, 1), (vec![(0x1D000, 2)], 1));
     }
 
+    /// The network buffer piece is kept from a forked child, refused by
+    /// `munmap` and `mprotect`, and taken out by `unmap_kind` alone, as the
+    /// display piece is; the one does not stand for the other.
+    #[test]
+    fn the_network_buffer_piece_follows_the_rule_of_the_display_piece() {
+        let mut map = with_screen();
+        map.push(0x4000_0000, 64, Access::ReadWrite, 0, Object::net_buffer(8))
+            .unwrap();
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.kind_piece(Kind::NetBuffer), Some((0x4000_0000, 64)));
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+        let at = map.find(0x4000_0000).unwrap();
+        assert!(map.meets_special(0x4000_0000 + PAGE, 1));
+        assert_eq!(map.unmap(at, 0x4000_0000, 64), Err(Refused::Special));
+        assert_eq!(map.unmap_keep(at, 0x4000_0000, 1), Err(Refused::Special));
+        assert_eq!(
+            map.protect(at, 0x4000_0000, 64, Access::Read),
+            Err(Refused::Special)
+        );
+        let (address, pages, object) = map.unmap_kind(Kind::NetBuffer).unwrap();
+        assert_eq!(
+            (address, pages, object.handle, object.kind),
+            (0x4000_0000, 64, 8, Kind::NetBuffer)
+        );
+        // The display piece stays.
+        assert_eq!(map.display_piece(), Some((0x2000_0000, 250)));
+        assert!(map.unmap_kind(Kind::NetBuffer).is_none());
+        assert!(!map.meets_special(0x4000_0000, 64));
+    }
+
     /// A map with the heap's chunk, the display piece (250 pages) and a
     /// file mapping, as a process that owns the screen has.
     fn with_screen() -> Map<u32> {
@@ -1031,18 +1104,18 @@ mod tests {
             (0x2000_0000, 1),
             (0x2000_0000 + 100 * PAGE, 3),
         ] {
-            assert!(map.meets_display(address, pages));
-            assert_eq!(map.unmap(at, address, pages), Err(Refused::Display));
-            assert_eq!(map.unmap_keep(at, address, pages), Err(Refused::Display));
+            assert!(map.meets_special(address, pages));
+            assert_eq!(map.unmap(at, address, pages), Err(Refused::Special));
+            assert_eq!(map.unmap_keep(at, address, pages), Err(Refused::Special));
             assert_eq!(
                 map.protect(at, address, pages, Access::Read),
-                Err(Refused::Display)
+                Err(Refused::Special)
             );
         }
         // A range that reaches the piece from a neighbour meets it too.
-        assert!(map.meets_display(0x2000_0000 - PAGE, 2));
-        assert!(!map.meets_display(0x1000_0000, 16));
-        assert!(!map.meets_display(0x3000_0000, 4));
+        assert!(map.meets_special(0x2000_0000 - PAGE, 2));
+        assert!(!map.meets_special(0x1000_0000, 16));
+        assert!(!map.meets_special(0x3000_0000, 4));
         assert_eq!(held(&map), before);
         // The other pieces still change.
         let heap = map.find(0x1000_0000).unwrap();
@@ -1057,11 +1130,11 @@ mod tests {
         let mut map = with_screen();
         let (address, pages, object) = map.unmap_display().unwrap();
         assert_eq!(
-            (address, pages, object.handle, object.display),
-            (0x2000_0000, 250, 7, true)
+            (address, pages, object.handle, object.kind),
+            (0x2000_0000, 250, 7, Kind::Display)
         );
         assert_eq!(map.len(), 2);
-        assert!(!map.meets_display(0x2000_0000, 250));
+        assert!(!map.meets_special(0x2000_0000, 250));
         assert!(map.unmap_display().is_none());
         // The pages are free for another mapping, which `munmap` may take.
         let again = map

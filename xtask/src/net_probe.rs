@@ -236,6 +236,8 @@ const CLONE_OK: &str = "net-probe: clone ok 1000 in 16 portions";
 const ABANDON_OK: &str = "net-probe: abandon ok 16 in 4 asks";
 const EPOLL_OK: &str = "net-probe: epoll ok";
 const PASSES_OK: &str = "net-probe: passes ok";
+const PORTION_PREFIX: &str = "net-probe: portion ok 1048576 ";
+const BUFFERS_PREFIX: &str = "net-probe: buffers ok 64 then 64";
 const EPOLL_WAKE: &str = "net-probe: epoll wake ok 15";
 const EPOLL_REQUESTS: &str = "net-probe: epoll requests ok";
 const EPOLL_CLOSE: &str = "net-probe: epoll close ok";
@@ -270,6 +272,9 @@ const EPOLL_DROP_KIND: usize = 32;
 const EPOLL_WAIT_KIND: usize = 33;
 const OWN_KIND: usize = 65;
 const BIND_KIND: usize = 2;
+const SEND_KIND: usize = 8;
+const RECV_KIND: usize = 10;
+const BUFFER_KIND: usize = 25;
 
 /// How the interface got its address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +301,7 @@ pub struct Roles {
     pub abandon_many: bool,
     pub epoll_sets: bool,
     pub passes: bool,
+    pub buffers: bool,
 }
 
 impl Roles {
@@ -314,6 +320,7 @@ impl Roles {
         abandon_many: false,
         epoll_sets: false,
         passes: false,
+        buffers: false,
     };
 
     /// The images of the ci run: the registry, and the table filled to the
@@ -377,6 +384,10 @@ impl Roles {
     };
     pub const PASSES: Roles = Roles {
         passes: true,
+        ..Roles::NONE
+    };
+    pub const BUFFERS: Roles = Roles {
+        buffers: true,
         ..Roles::NONE
     };
 }
@@ -536,6 +547,13 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
         once.push((EPOLL_CLOSE, 1));
         once.push((EPOLL_REQUESTS, 1));
         once.push((EPOLL_OK, 1));
+    }
+    if roles.buffers {
+        for prefix in [PORTION_PREFIX, BUFFERS_PREFIX] {
+            if !lines.iter().any(|l| l.starts_with(prefix)) {
+                return Err(format!("no line {prefix:?}"));
+            }
+        }
     }
     if roles.timers && !lines.iter().any(|l| l.starts_with(TIMERS_PREFIX)) {
         return Err(format!("no line {TIMERS_PREFIX:?}"));
@@ -1014,6 +1032,11 @@ fn all_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageProgram]
             measured_programs(Some("net-passes"), netd),
             Roles::PASSES,
         ),
+        (
+            "B",
+            measured_programs(Some("net-buffers"), netd),
+            Roles::BUFFERS,
+        ),
     ]
 }
 
@@ -1121,6 +1144,7 @@ fn acceptance(
     let mut all = Vec::new();
     let mut epoll_run = Vec::new();
     let mut pass_run = Vec::new();
+    let mut buffer_run = Vec::new();
     for (what, programs, roles) in acceptance_runs(netd) {
         let lines = steps_lines(
             machine,
@@ -1134,6 +1158,8 @@ fn acceptance(
             epoll_run = lines;
         } else if what == "x" {
             pass_run = lines;
+        } else if what == "B" {
+            buffer_run = lines;
         }
         let rows = if strict {
             steps_verdict_rows(&rows).map_err(|e| format!("run {what}: {e}"))?
@@ -1210,6 +1236,25 @@ fn acceptance(
         kind("x", OWN_KIND),
         longest_named(&pass_run, "wake"),
     );
+    println!(
+        "net-probe: with the shared buffers (portion {} KiB): SEND {}, RECV {}, BUFFER {}, ABANDON with an unmap {}, the step of departure with an unmap {}; {} (bound {STEP_MAX})",
+        netd::ring::BUFFER_PORTION / 1024,
+        kind("B", SEND_KIND),
+        kind("B", RECV_KIND),
+        kind("B", BUFFER_KIND),
+        kind("B", ABANDON_KIND),
+        longest_named(&buffer_run, "cleanup"),
+        buffer_lines(&buffer_run).join("; ")
+    );
+    if strict && !buffer_run.is_empty() {
+        copy_verdict(&buffer_run, netd::ring::BUFFER_PORTION).map_err(|e| format!("run B: {e}"))?;
+    }
+    if strict && longest_named(&buffer_run, "cleanup") > STEP_MAX {
+        return Err(format!(
+            "the step of departure with the buffers took {} ticks, {STEP_MAX} at most",
+            longest_named(&buffer_run, "cleanup")
+        ));
+    }
     let by_batch = epoll_set_by_batch(&epoll_run);
     println!(
         "net-probe: EPOLL_SET by batch {by_batch:?}, EPOLL_WAIT of 64 pairs {}, EPOLL_DROP {} (chosen batch {})",
@@ -1426,7 +1471,130 @@ pub fn series(machine: &qemu::Machine) -> Result<(), String> {
             "the choice is {choice:?}; netd::ring has {in_code:?}"
         ));
     }
-    Ok(())
+    portion_series(machine).map(drop)
+}
+
+/// The lines of a run of role `B` about the buffers: the quota of the service
+/// at the first and the sixty-fourth, and the role's own line.
+fn buffer_lines(lines: &[String]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with("net: buffers ") || l.starts_with(BUFFERS_PREFIX))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The portion of the service and the most bytes one request with a cell
+/// copied, from the line `net: buffer portion P largest copy L` (the largest
+/// L of the run).
+fn largest_copy(lines: &[String]) -> Option<(usize, usize)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("net: buffer portion ")?;
+            let (portion, largest) = rest.split_once(" largest copy ")?;
+            Some((portion.parse().ok()?, largest.parse().ok()?))
+        })
+        .max_by_key(|&(_, largest)| largest)
+}
+
+/// A request with a cell copied more than the portion of the service, or the
+/// service has another portion than `portion`.
+fn copy_verdict(lines: &[String], portion: usize) -> Result<(), String> {
+    match largest_copy(lines) {
+        Some((p, largest)) if p == portion && largest <= portion => Ok(()),
+        Some((p, largest)) => Err(format!(
+            "a request with a cell copied {largest} bytes; the portion is {p} ({portion} built)"
+        )),
+        None => Err("no line of the copies of the shared buffers".to_owned()),
+    }
+}
+
+/// The 90th percentile of a part of the breakdown (`net: split <part> n ..
+/// p90 ..`) in the line with the most samples.
+fn split_p90(lines: &[String], part: &str) -> Option<u64> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            match words.as_slice() {
+                [
+                    "net:",
+                    "split",
+                    name,
+                    "n",
+                    n,
+                    "p50",
+                    _,
+                    "p90",
+                    p90,
+                    "max",
+                    _,
+                ] if *name == part => Some((n.parse::<u64>().ok()?, p90.parse::<u64>().ok()?)),
+                _ => None,
+            }
+        })
+        .max_by_key(|&(n, _)| n)
+        .map(|(_, p90)| p90)
+}
+
+/// The feature of the service that builds the portion `bytes`.
+fn portion_feature(bytes: usize) -> &'static str {
+    match bytes {
+        16_384 => "portion-16",
+        8_192 => "portion-8",
+        _ => "portion-4",
+    }
+}
+
+/// The measurement that chooses the portion of a copy of the shared buffer
+/// (`netd::ring::BUFFER_PORTION`): the roles `G` and `B` under -icount with
+/// the service built at each of `netd::choose::PORTIONS` (and the breakdown
+/// of the copies), the longest steps of SEND and RECV with a cell, and the
+/// rule `netd::choose::portion`. Fails when the code has another portion.
+pub fn portion_series(machine: &qemu::Machine) -> Result<usize, String> {
+    let mut rows = Vec::new();
+    for bytes in netd::choose::PORTIONS {
+        let features: &'static [&'static str] =
+            Box::leak(vec!["split", portion_feature(bytes)].into_boxed_slice());
+        let lines = steps_lines(
+            machine,
+            measured_name(&format!("portion-{}", bytes / 1024)),
+            measured_programs(Some("net-buffers"), features),
+            Roles::BUFFERS,
+            true,
+        )?;
+        copy_verdict(&lines, bytes).map_err(|e| format!("portion {bytes}: {e}"))?;
+        let longest = longest_over_starts(&lines);
+        let send = step_of(&longest, SEND_KIND).map_or(0, |(t, _)| t);
+        let recv = step_of(&longest, RECV_KIND).map_or(0, |(t, _)| t);
+        println!(
+            "net-probe: portion {} KiB: SEND {send}, RECV {recv}, buf_copy_tx p90 {}, buf_copy_rx p90 {}, BUFFER {}, ABANDON {}, departure {} (budget {})",
+            bytes / 1024,
+            split_p90(&lines, "buf_copy_tx").unwrap_or(0),
+            split_p90(&lines, "buf_copy_rx").unwrap_or(0),
+            step_of(&longest, BUFFER_KIND).map_or(0, |(t, _)| t),
+            step_of(&longest, ABANDON_KIND).map_or(0, |(t, _)| t),
+            longest_named(&lines, "cleanup"),
+            netd::choose::BUDGET
+        );
+        // The breakdown makes CONFIG print its lines, a long step of its own:
+        // the bound of every step is the acceptance's (run `B`, no breakdown).
+        rows.push((bytes, send, recv));
+    }
+    let chosen = netd::choose::portion(&rows)
+        .ok_or_else(|| format!("no portion fits the budget: {rows:?}"))?;
+    println!(
+        "net-probe: the portion of a copy of the shared buffer is {} KiB",
+        chosen / 1024
+    );
+    if chosen != netd::ring::BUFFER_PORTION {
+        return Err(format!(
+            "the measurement chooses a portion of {chosen} bytes; netd::ring has {}",
+            netd::ring::BUFFER_PORTION
+        ));
+    }
+    Ok(chosen)
 }
 
 /// The features of the service that build the choice: the frames of receiving
@@ -1560,6 +1728,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }
     if args == ["split"] {
         return split_only(&qemu::VIRT);
+    }
+    // `portion`: the measurement of the portion of a copy of the shared
+    // buffer alone (`series` runs it too).
+    if args == ["portion"] {
+        return portion_series(&qemu::VIRT).map(drop);
     }
     let (steps, args) = match args.split_first() {
         Some((first, rest)) if first == "steps" => (true, rest),
@@ -1828,6 +2001,48 @@ mod tests {
             lines.push(line.to_owned());
             assert_eq!(verdict(&lines, Mode::Dhcp, roles), Ok(()));
         }
+    }
+
+    #[test]
+    fn the_roles_g_and_b_name_their_lines() {
+        let mut lines = good_run(Mode::Dhcp);
+        lines.retain(|l| !l.starts_with("net-probe: sockets") && l != BIND);
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::BUFFERS)
+                .unwrap_err()
+                .contains("portion ok")
+        );
+        lines.push("net-probe: portion ok 1048576 buffered 2048 KiB".to_owned());
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::BUFFERS)
+                .unwrap_err()
+                .contains("buffers ok")
+        );
+        lines.push("net-probe: buffers ok 64 then 64, object mappings 65".to_owned());
+        assert_eq!(verdict(&lines, Mode::Dhcp, Roles::BUFFERS), Ok(()));
+        assert_eq!(
+            split_p90(
+                &[
+                    "net: split buf_copy_tx n 3 p50 256 p90 512 max 600".to_owned(),
+                    "net: split buf_copy_tx n 90 p50 256 p90 3584 max 4000".to_owned(),
+                ],
+                "buf_copy_tx"
+            ),
+            Some(3584)
+        );
+        assert_eq!(portion_feature(netd::ring::BUFFER_PORTION), "portion-16");
+        let copies = |line: &str| vec!["x".to_owned(), line.to_owned()];
+        assert_eq!(
+            copy_verdict(&copies("net: buffer portion 4096 largest copy 4096"), 4096),
+            Ok(())
+        );
+        assert!(
+            copy_verdict(&copies("net: buffer portion 4096 largest copy 16384"), 4096).is_err()
+        );
+        assert!(
+            copy_verdict(&copies("net: buffer portion 16384 largest copy 4096"), 4096).is_err()
+        );
+        assert!(copy_verdict(&[], 4096).is_err());
     }
 
     #[test]
