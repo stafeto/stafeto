@@ -28,6 +28,11 @@ probe = []
 batch-8 = []
 batch-4 = []
 batch-2 = []
+# `limit-8`, `limit-64`, `limit-256`: the sockets limit, for the same
+# measurement (the default is the chosen one).
+limit-8 = []
+limit-64 = []
+limit-256 = []
 steps = ["rt/step-stats"]
 
 [dependencies]

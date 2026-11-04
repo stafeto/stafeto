@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use crate::qemu::{Input, Run};
 use crate::{
     BOOT_PROFILE, CHILD_STACK_SIZE, INIT_STACK_SIZE, ImageProgram, TERM_B, Variant, build,
-    build_boot_image, longest_steps, qemu, run_until,
+    build_boot_image, qemu, run_until,
 };
 
 pub use crate::net::NETD_STACK_SIZE;
@@ -90,7 +90,15 @@ fn measured_programs(places: usize, batch: usize) -> &'static [ImageProgram] {
             _ => "net-sockets-256",
         },
     ]);
-    let mut netd = vec!["probe", "steps"];
+    let mut netd = vec![
+        "probe",
+        "steps",
+        match places {
+            8 => "limit-8",
+            64 => "limit-64",
+            _ => "limit-256",
+        },
+    ];
     match batch {
         8 => netd.push("batch-8"),
         4 => netd.push("batch-4"),
@@ -324,10 +332,45 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     Ok(())
 }
 
+/// The longest step of each kind in `lines`: (kind, ticks, detail). The
+/// service starts again in the run (the role `k` kills it), and each start
+/// counts from nothing, so the longest is taken over all the lines, not the
+/// last of a kind.
+fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "step:",
+            NET_TAG,
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+        ] = words.as_slice()
+        else {
+            continue;
+        };
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
+        else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) if row.1 >= ticks => {}
+            Some(row) => *row = (kind, ticks, detail),
+            None => out.push((kind, ticks, detail)),
+        }
+    }
+    out
+}
+
 /// The steps of the service: every kind came and every row stays under
 /// STEP_MAX, and a CLONE (kind 19) under PORTION_MAX when the run made one.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
-    let rows = longest_steps(lines, NET_TAG);
+    let rows = longest_over_starts(lines);
     for (kind, name) in STEP_KINDS {
         if !rows.iter().any(|(k, ..)| *k == kind) {
             return Err(format!("the network service: no step {name}: {rows:?}"));
@@ -415,7 +458,7 @@ fn steps_run(
     verdict(&output.lines, Mode::Dhcp, roles)
         .map_err(|e| format!("net-probe under -icount on {}: {e}", machine.name))?;
     crate::check_waits(&output.lines, &[NET_TAG], "net-probe")?;
-    Ok(longest_steps(&output.lines, NET_TAG))
+    Ok(longest_over_starts(&output.lines))
 }
 
 fn print_rows(machine: &qemu::Machine, what: &str, rows: &[(usize, u64, u64)]) {
@@ -455,6 +498,9 @@ fn step_of(rows: &[(usize, u64, u64)], kind: usize) -> Option<(u64, u64)> {
     rows.iter().find(|r| r.0 == kind).map(|r| (r.1, r.2))
 }
 
+/// The longest steps of one run: its batch, its places and the rows.
+type Measured = (usize, usize, Vec<(usize, u64, u64)>);
+
 /// `cargo xtask net-probe steps`: the measurement that chooses the batch of
 /// frames of a step and the limit of the sockets (spec 6, 6; the rule is
 /// `netd::choose`). Each batch is measured with `s` at 8 places, the first
@@ -462,44 +508,59 @@ fn step_of(rows: &[(usize, u64, u64)], kind: usize) -> Option<(u64, u64)> {
 /// places gives the line from which the limit comes.
 pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     use netd::choose::{self, Point};
-    let mut at8 = Vec::new();
+    // Every batch at every number of places: the rule needs the first column
+    // and, for the batch it picks, the other two; the whole table shows what
+    // the batch changes.
+    let mut table: Vec<Measured> = Vec::new();
     for batch in choose::BATCHES {
-        let programs = measured_programs(8, batch);
-        let rows = steps_run(machine, measured_name(batch, 8), programs, Roles::places(8))?;
-        print_rows(machine, &format!("batch {batch}, 8 places"), &rows);
-        at8.push((batch, rows));
+        for places in [8, 64, 256] {
+            let rows = steps_run(
+                machine,
+                measured_name(batch, places),
+                measured_programs(places, batch),
+                Roles::places(places),
+            )?;
+            print_rows(machine, &format!("batch {batch}, {places} places"), &rows);
+            table.push((batch, places, rows));
+        }
     }
-    let own = |batch: usize| {
-        at8.iter()
-            .find(|(b, _)| *b == batch)
-            .and_then(|(_, rows)| step_of(rows, OWN_KIND).map(|(ticks, _)| ticks))
+    let own_of = |batch: usize, places: usize| {
+        table
+            .iter()
+            .find(|(b, p, _)| *b == batch && *p == places)
+            .and_then(|(_, _, rows)| step_of(rows, OWN_KIND).map(|(ticks, _)| ticks))
     };
-    let batch = choose::batch(own).map_err(|stop| format!("no batch: {stop:?}"))?;
+    println!("net-probe: the longest own step (kind {OWN_KIND}), ticks:");
+    println!("  batch   8 places  64 places  256 places");
+    for batch in choose::BATCHES {
+        let cell = |places| own_of(batch, places).map_or("-".to_owned(), |t| t.to_string());
+        println!(
+            "  {batch:>5}  {:>9}  {:>9}  {:>10}",
+            cell(8),
+            cell(64),
+            cell(256)
+        );
+    }
+    let batch = choose::batch(|k| own_of(k, 8)).map_err(|stop| format!("no batch: {stop:?}"))?;
     println!(
         "net-probe: the batch is {batch} frames (the longest own step at 8 sockets within {})",
         choose::BOUND
     );
-    let mut points = vec![Point {
-        sockets: 8,
-        ticks: own(batch).unwrap_or(0),
-    }];
-    for places in [64, 256] {
-        let programs = measured_programs(places, batch);
-        let rows = steps_run(
-            machine,
-            measured_name(batch, places),
-            programs,
-            Roles::places(places),
-        )?;
-        print_rows(machine, &format!("batch {batch}, {places} places"), &rows);
-        points.push(Point {
-            sockets: places,
-            ticks: step_of(&rows, OWN_KIND).map_or(0, |(ticks, _)| ticks),
-        });
+    let points: Vec<Point> = [8, 64, 256]
+        .into_iter()
+        .map(|sockets| Point {
+            sockets,
+            ticks: own_of(batch, sockets).unwrap_or(0),
+        })
+        .collect();
+    match choose::limit(&[points[0], points[1], points[2]]) {
+        Ok(limit) => {
+            println!("net-probe: the limit of the sockets is {limit} (the line through {points:?})")
+        }
+        Err(stop) => println!(
+            "net-probe: no limit of the sockets from the line through {points:?}: {stop:?} (the stage waits for the expert)"
+        ),
     }
-    let limit = choose::limit(&[points[0], points[1], points[2]])
-        .map_err(|stop| format!("no limit: {stop:?}"))?;
-    println!("net-probe: the limit of the sockets is {limit} (the line through {points:?})");
     Ok(())
 }
 
@@ -530,6 +591,32 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 /// `cargo xtask net-probe [MACHINE]`: the machine is `tcg` (the default),
 /// `hvf` or the name of one of qemu::MACHINES; `steps` is the measurement.
 pub fn command(args: &[String]) -> Result<(), String> {
+    // `steps BATCH PLACES`: one image of the measurement.
+    if let [first, batch, places] = args
+        && first == "steps"
+    {
+        let batch: usize = batch
+            .parse()
+            .map_err(|_| "BATCH is 16, 8, 4 or 2".to_owned())?;
+        let places: usize = places
+            .parse()
+            .map_err(|_| "PLACES is 8, 64 or 256".to_owned())?;
+        if !netd::choose::BATCHES.contains(&batch) || ![8, 64, 256].contains(&places) {
+            return Err("usage: cargo xtask net-probe steps [BATCH PLACES]".to_owned());
+        }
+        let rows = steps_run(
+            &qemu::VIRT,
+            measured_name(batch, places),
+            measured_programs(places, batch),
+            Roles::places(places),
+        )?;
+        print_rows(
+            &qemu::VIRT,
+            &format!("batch {batch}, {places} places"),
+            &rows,
+        );
+        return Ok(());
+    }
     let (steps, args) = match args.split_first() {
         Some((first, rest)) if first == "steps" => (true, rest),
         _ => (false, args),
@@ -818,6 +905,21 @@ mod tests {
             );
         }
         assert!(tree.contains("proto-net "));
+    }
+
+    /// The images run the role `s` at the limit of the sockets, which the
+    /// table of init spells out.
+    #[test]
+    fn the_roles_of_the_images_name_the_sockets_limit() {
+        let table = std::fs::read_to_string(crate::root().join("services/init/src/table/net.rs"))
+            .expect("the table of the network service");
+        assert!(
+            table.contains(&format!("b\"cbs{SOCKETS_LIMIT}k\"")),
+            "the roles of the probe name another limit than {SOCKETS_LIMIT}"
+        );
+        const { assert!(netd::choose::LIMIT_LEAST <= SOCKETS_LIMIT) };
+        const { assert!(SOCKETS_LIMIT <= netd::places::SOCKETS_MAX) };
+        assert_eq!(Roles::LIMIT.places, Some(SOCKETS_LIMIT));
     }
 
     /// The image of the shell holds the service built without PING and

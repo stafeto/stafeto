@@ -22,10 +22,15 @@ use smoltcp::wire::{
     Ipv4Cidr,
 };
 
-/// The sockets of the set: the descriptions' (SOCKETS_MAX, members of a
+/// The room for the sockets: the descriptions' (SOCKETS_MAX, members of a
 /// queue of `listen` among them), the ICMP socket of PING and the DHCP
 /// client.
 pub const SOCKET_SLOTS: usize = netd::places::SOCKETS_MAX + 2;
+/// The sockets of the set: the stack walks every place of its set in each
+/// pass, so the set has what the limit of the descriptions and the two
+/// sockets of the service need, no more.
+const SET_SLOTS: usize = netd::places::SOCKETS_LIMIT + 2;
+const _: () = assert!(SET_SLOTS <= SOCKET_SLOTS);
 
 /// The storage of the sockets and the ICMP socket's buffers, which the
 /// stack borrows; it lives in the service's `.bss`.
@@ -161,7 +166,7 @@ impl<'a> Stack<'a> {
             tx_meta,
             tx_data,
         } = storage;
-        let mut set = SocketSet::new(&mut sockets[..]);
+        let mut set = SocketSet::new(&mut sockets[..SET_SLOTS]);
         let mut icmp_socket = icmp::Socket::new(
             icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_data[..]),
             icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_data[..]),

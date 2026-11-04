@@ -535,7 +535,9 @@ impl Probe<'_> {
                     .map(|b| b.len())
                 })
                 .map_err(|fail| {
-                    rt::println!("net-probe: ACCEPT: {fail:?} i {i} lsession {lsession} held {held:?}");
+                    rt::println!(
+                        "net-probe: ACCEPT: {fail:?} i {i} lsession {lsession} held {held:?}"
+                    );
                     "ACCEPT failed"
                 })?;
             let _ = reply;

@@ -56,7 +56,8 @@ pub const DMA: &[Dma] = &[
     },
 ];
 
-/// The network service.
+/// The network service (the same record in the image of the shell and in the
+/// images of the probe: its `.bss` is the same in both).
 pub const NETD: Record = Record {
     name: NET_SERVICE,
     program: "netd",
@@ -66,11 +67,18 @@ pub const NETD: Record = Record {
     }),
     priority: 35,
     ceiling: 35,
-    // Measured: the probe's runs pass with 24 pages and fail with 16 (the
-    // pages the service touches: the stack, the table of the files read at
-    // the start, the data); 64 leave the code paths of this stage room.
-    quota: 64 * PAGE,
-    handle_limit: 64,
+    // The worst case, by the formula of the stage (reports/2026-11-04-net-p1a):
+    // the pages of `.data` and `.bss` of the release build (the pool of
+    // buffers is 2 048 of them), the whole stack of 32 pages and 16 for the
+    // rest. `.bss` 8 922 225 bytes = 2 178 pages, `.data` none: 2 178 + 32 +
+    // 16. The kernel does not charge the pages of `.bss` to the quota in the
+    // probe's runs (the table filled to 256 places passes with 32 pages and
+    // fails to start with 24, where the page tables of the mappings do not
+    // fit), so the number is a bound that the measurement does not reach.
+    quota: 2226 * PAGE,
+    // 128 operations' handles of notification, the notary session, the page
+    // of generations, and a reserve.
+    handle_limit: 192,
     restart: Restart::Always,
     console: true,
     log: false,
@@ -135,7 +143,7 @@ pub const ROLES: &[u8] = b"cek";
     feature = "net-sockets-256",
     feature = "net-echo"
 )))]
-pub const ROLES: &[u8] = b"cbs128k";
+pub const ROLES: &[u8] = b"cbs48k";
 
 /// The probe (tests/net-probe).
 pub const PROBE: Record = Record {
