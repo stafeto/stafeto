@@ -372,6 +372,7 @@ fn metadata_target(dirfd: c_int, path: &[u8], at_flags: c_int) -> Result<(Placed
             };
         }
         Target::Pipe(_) => return Err(EINVAL),
+        Target::Net(_) => return Err(ENOTDIR),
         _ => return Err(EROFS),
     }
     Ok((placed, true))

@@ -348,6 +348,7 @@ dependencies = [
  "proto-gpu",
  "proto-input",
  "proto-loader",
+ "proto-net",
  "proto-pipe",
  "proto-process",
  "proto-tty",

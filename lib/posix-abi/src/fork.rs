@@ -169,7 +169,7 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy and Display; 0 for
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display and Net; 0 for
 /// none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
@@ -180,6 +180,7 @@ pub struct Sessions {
     pub terminal: u64,
     pub entropy: u64,
     pub display: u64,
+    pub net: u64,
 }
 
 impl Sessions {
@@ -196,6 +197,7 @@ impl Sessions {
             (Slot::Terminal, self.terminal),
             (Slot::Entropy, self.entropy),
             (Slot::Display, self.display),
+            (Slot::Net, self.net),
         ] {
             if raw != 0 {
                 mask |= slot.bit();
@@ -218,6 +220,7 @@ impl Sessions {
             self.terminal,
             self.entropy,
             self.display,
+            self.net,
         ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -283,6 +286,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Terminal, session(sessions.terminal)),
         (Slot::Entropy, session(sessions.entropy)),
         (Slot::Display, session(sessions.display)),
+        (Slot::Net, session(sessions.net)),
     ];
     match crate::process::give_sessions(c, given) {
         0 => Ok(()),
@@ -804,6 +808,13 @@ fn sessions() -> Result<Sessions, i32> {
         if let Some(clone) = crate::display::clone_session() {
             out.display = clone.into_raw().0;
         }
+        sub(10);
+        // The child's sockets: a refusal fails the fork, or the child would
+        // hold none of the descriptors it has (the service's end excepted).
+        let (list, count) = crate::net::kept_by_fork()?;
+        if let Some(clone) = crate::net::clone_kept(&list[..count])? {
+            out.net = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -940,6 +951,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the display service is the clone the
         // parent made; it has no owner session and no display piece.
         crate::display::after_fork(handle(raw(Slot::Display)));
+        // The child's session with the network service is the clone the
+        // parent made, which holds the descriptions the child keeps.
+        crate::net::after_fork(handle(raw(Slot::Net)));
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();

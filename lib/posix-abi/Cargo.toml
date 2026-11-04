@@ -60,6 +60,7 @@ process-client = { path = "../process-client" }
 proto-process = { path = "../../proto/process" }
 proto-fs = { path = "../../proto/fs" }
 proto-loader = { path = "../../proto/loader" }
+proto-net = { path = "../../proto/net" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-tty = { path = "../../proto/tty" }
 posix-random = { path = "../posix-random" }

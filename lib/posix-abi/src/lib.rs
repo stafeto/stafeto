@@ -42,6 +42,7 @@ pub mod long;
 pub mod metadata;
 pub mod mmap;
 pub mod names;
+pub mod net;
 mod open_driver;
 pub mod pipes;
 pub mod process;
@@ -518,6 +519,7 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
             };
             Ok(Some((flags & 3) as c_int | append))
         }
+        posix_fs::Target::Net(description) => net::status_flags(description, set).map(Some),
         // A file or directory of /proc is read only.
         posix_fs::Target::Proc(_) => Ok(Some(0)),
         _ => Ok(None),

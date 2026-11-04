@@ -106,17 +106,28 @@ impl Drop for Pins {
 enum Service {
     Pipe,
     Terminal,
+    Net,
 }
 impl Service {
+    /// The header of the operation: 0 starts a Watch, 1 takes it, 2
+    /// cancels it. The network service numbers the three apart.
     fn method(self, operation: u16) -> proto_wire::Header {
+        const NET: [proto_net::Method; 3] = [
+            proto_net::Method::Watch,
+            proto_net::Method::WatchTake,
+            proto_net::Method::WatchCancel,
+        ];
+        if let Self::Net = self {
+            return NET[usize::from(operation)].header();
+        }
         proto_wire::Header::new(
             (match self {
                 Self::Pipe => 14,
-                Self::Terminal => 25,
+                _ => 25,
             }) + operation,
             match self {
                 Self::Pipe => proto_pipe::VERSION,
-                Self::Terminal => proto_tty::VERSION,
+                _ => proto_tty::VERSION,
             },
         )
     }
@@ -202,7 +213,7 @@ impl Subscription {
         self.service.method(0).write(&mut body).map_err(|_| EIO)?;
         match self.service {
             Service::Pipe => self.set.write(&mut body),
-            Service::Terminal => watch::Set {
+            Service::Terminal | Service::Net => watch::Set {
                 len: self.set.len,
                 items: self.set.items,
             }
@@ -307,7 +318,7 @@ fn kernel_error(error: Error) -> i32 {
 
 /// The terminal descriptions placed in the Watches so far.
 fn terminals_placed(subscriptions: &[Subscription]) -> usize {
-    subscriptions[2..].iter().map(|s| s.set.len).sum()
+    subscriptions[2..6].iter().map(|s| s.set.len).sum()
 }
 
 fn ready_count(ready: &[u32]) -> usize {
@@ -328,28 +339,33 @@ fn run(
     let block = threads::own_block();
     let id = NEXT
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            n.checked_add(1).filter(|next| *next < TAG >> 3)
+            n.checked_add(1).filter(|next| *next < TAG >> 4)
         })
         .map_err(|_| EAGAIN)?;
     let mut ready = [0; LIMIT];
     let pins = Pins::snapshot(items, &mut ready)?;
     let transport = pins.transport.ok_or(EIO)?;
     // The Watches of the pipe service take `watch::MAX` elements each, those of
-    // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`);
-    // every one has a label of its own. The low three bits of a label: 0 and 4
-    // the pipes, 1, 3, 5 and 7 the terminal's, 2 the timer.
+    // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`),
+    // those of the network service `watch::MAX` again; every one has a label
+    // of its own. The low four bits of a label: 0 and 4 the pipes, 1, 3, 5
+    // and 7 the terminal's, 2 the timer, 8 and 12 the network's.
     const PIPE_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
     const TERMINAL_WATCHES: usize = LIMIT.div_ceil(proto_tty::WATCH_MAX);
-    const _: () = assert!(PIPE_WATCHES == 2 && TERMINAL_WATCHES == 4);
+    const NET_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
+    const _: () = assert!(PIPE_WATCHES == 2 && TERMINAL_WATCHES == 4 && NET_WATCHES == 2);
     const PIPE_LABELS: [u64; PIPE_WATCHES] = [0, 4];
     const TERMINAL_LABELS: [u64; TERMINAL_WATCHES] = [1, 3, 5, 7];
+    const NET_LABELS: [u64; NET_WATCHES] = [8, 12];
     let mut subscriptions = [
-        Subscription::new(Service::Pipe, TAG | id << 3 | PIPE_LABELS[0]),
-        Subscription::new(Service::Pipe, TAG | id << 3 | PIPE_LABELS[1]),
-        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[0]),
-        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[1]),
-        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[2]),
-        Subscription::new(Service::Terminal, TAG | id << 3 | TERMINAL_LABELS[3]),
+        Subscription::new(Service::Pipe, TAG | id << 4 | PIPE_LABELS[0]),
+        Subscription::new(Service::Pipe, TAG | id << 4 | PIPE_LABELS[1]),
+        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[0]),
+        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[1]),
+        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[2]),
+        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[3]),
+        Subscription::new(Service::Net, TAG | id << 4 | NET_LABELS[0]),
+        Subscription::new(Service::Net, TAG | id << 4 | NET_LABELS[1]),
     ];
     for (index, (item, target)) in items.iter().zip(&pins.targets).enumerate() {
         let requested = (item.events as u16 as u32) & watch::EVENTS;
@@ -391,6 +407,11 @@ fn run(
                 let owner = transport.terminal().ok_or(EIO)?.raw().0;
                 subscriptions[2 + group].owner = owner;
                 subscriptions[2 + group].add(proto_tty::CONSOLE, requested, index);
+            }
+            Some(Target::Net(description)) => {
+                let at = 6 + (subscriptions[6].set.len + subscriptions[7].set.len) / watch::MAX;
+                subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
+                subscriptions[at].add(*description, requested, index);
             }
             Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
             None => {}
@@ -466,7 +487,7 @@ fn run(
             if let Some(until) = until {
                 if timer.is_none() {
                     let labelled =
-                        sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 3 | 2, level)
+                        sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 4 | 2, level)
                             .map_err(kernel_error)?;
                     timer = Some(sys::timer_create(&labelled, level).map_err(kernel_error)?);
                 }
