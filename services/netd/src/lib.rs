@@ -9,7 +9,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod choose;
 pub mod config;
 pub mod frames;
 pub mod lines;
+pub mod places;
+pub mod ports;
 pub mod ring;

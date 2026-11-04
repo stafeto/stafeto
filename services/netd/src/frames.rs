@@ -69,6 +69,65 @@ pub fn tx_prepare(buffer: &mut [u8], frame_len: usize) -> Option<usize> {
     Some(HDR_LEN + frame_len)
 }
 
+const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
+const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+const ETHERNET_HEADER: usize = 14;
+/// Where an ARP request's target protocol address is in the frame (RFC 826:
+/// the Ethernet header, 8 bytes of fixed fields, two addresses of hardware
+/// and one of protocol).
+const ARP_TARGET: usize = ETHERNET_HEADER + 24;
+const ARP_REQUEST: u16 = 1;
+
+/// The source and destination of an Ethernet frame that carries IPv4.
+pub fn ipv4_ends(frame: &[u8]) -> Option<([u8; 4], [u8; 4])> {
+    if frame.len() < ETHERNET_HEADER + 20 || frame[12..14] != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ip = &frame[ETHERNET_HEADER..];
+    Some((ip[12..16].try_into().ok()?, ip[16..20].try_into().ok()?))
+}
+
+/// Whether an IPv4 address is of the loopback network, 127.0.0.0/8 (RFC
+/// 1122, 3.2.1.3).
+pub const fn is_loopback(ip: [u8; 4]) -> bool {
+    ip[0] == 127
+}
+
+/// A frame of IPv4 whose source or destination is in 127.0.0.0/8: such a
+/// frame never belongs on the wire (RFC 1122, 3.2.1.3). Dropped when it
+/// comes from the device, so that a node of the network cannot reach the
+/// services bound to 127.0.0.1 with a frame to the service's MAC, and when
+/// the stack would send it to the device.
+pub fn martian(frame: &[u8]) -> bool {
+    ipv4_ends(frame).is_some_and(|(src, dst)| is_loopback(src) || is_loopback(dst))
+}
+
+/// Where a frame the stack sends goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Wire,
+    Loop,
+}
+
+/// A frame to the service's own MAC, or an ARP request for one of its own
+/// addresses, stays in the loop; any other goes to the device.
+pub fn route(frame: &[u8], mac: [u8; 6], own: &[[u8; 4]]) -> Route {
+    if frame.len() < ETHERNET_HEADER {
+        return Route::Wire;
+    }
+    if frame[..6] == mac {
+        return Route::Loop;
+    }
+    if frame[12..14] == ETHERTYPE_ARP
+        && let Some(target) = frame.get(ARP_TARGET..ARP_TARGET + 4)
+        && u16::from_be_bytes([frame[20], frame[21]]) == ARP_REQUEST
+        && own.iter().any(|a| a[..] == *target)
+    {
+        return Route::Loop;
+    }
+    Route::Wire
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +185,49 @@ mod tests {
         assert_eq!(tx_prepare(&mut b, MAX_FRAME + 1), None);
         assert_eq!(tx_prepare(&mut b[..HDR_LEN + 41], 42), None);
         assert_eq!(tx_prepare(&mut b, MAX_FRAME), Some(HDR_LEN + MAX_FRAME));
+    }
+
+    fn ipv4_frame(src: [u8; 4], dst: [u8; 4], mac: [u8; 6]) -> Vec<u8> {
+        let mut f = vec![0; 14 + 20 + 8];
+        f[..6].copy_from_slice(&mac);
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x45;
+        f[26..30].copy_from_slice(&src);
+        f[30..34].copy_from_slice(&dst);
+        f
+    }
+
+    fn arp_request(target: [u8; 4]) -> Vec<u8> {
+        let mut f = vec![0; 42];
+        f[..6].fill(0xff);
+        f[12..14].copy_from_slice(&[8, 6]);
+        f[20..22].copy_from_slice(&1u16.to_be_bytes());
+        f[38..42].copy_from_slice(&target);
+        f
+    }
+
+    #[test]
+    fn a_frame_with_the_loopback_network_is_a_martian() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        assert!(martian(&ipv4_frame([10, 0, 2, 2], [127, 0, 0, 1], mac)));
+        assert!(martian(&ipv4_frame([127, 5, 5, 5], [10, 0, 2, 15], mac)));
+        assert!(!martian(&ipv4_frame([10, 0, 2, 2], [10, 0, 2, 15], mac)));
+        assert!(!martian(&arp_request([127, 0, 0, 1])), "ARP is no IPv4");
+        assert!(!martian(&[0; 20]));
+    }
+
+    #[test]
+    fn a_frame_to_the_own_mac_or_for_an_own_address_stays_in_the_loop() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        let own = [[10, 0, 2, 15], [127, 0, 0, 1]];
+        let to_self = ipv4_frame([10, 0, 2, 15], [10, 0, 2, 15], mac);
+        assert_eq!(route(&to_self, mac, &own), Route::Loop);
+        let out = ipv4_frame([10, 0, 2, 15], [10, 0, 2, 3], [0x52, 0x55, 0, 0, 0, 2]);
+        assert_eq!(route(&out, mac, &own), Route::Wire);
+        assert_eq!(route(&arp_request([127, 0, 0, 1]), mac, &own), Route::Loop);
+        assert_eq!(route(&arp_request([10, 0, 2, 15]), mac, &own), Route::Loop);
+        assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &own), Route::Wire);
+        assert_eq!(route(&arp_request([10, 0, 2, 2]), mac, &[]), Route::Wire);
+        assert_eq!(route(&[0; 5], mac, &own), Route::Wire);
     }
 }

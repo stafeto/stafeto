@@ -22,9 +22,22 @@ pub const BUFFERS: usize = RX_BUFFERS + TX_BUFFERS;
 /// The pages of the network object: 512 buffers of BUFFER_LEN bytes.
 pub const NET_PAGES: usize = BUFFERS * BUFFER_LEN / 4096;
 /// The frames one step receives and the frames it sends at most (the
-/// bound of a step, so that a flood leaves the loop its other work).
-pub const STEP_RX: usize = 16;
-pub const STEP_TX: usize = 16;
+/// bound of a step, so that a flood leaves the loop its other work). The
+/// features `batch-8`, `batch-4` and `batch-2` are for the measurement that
+/// chose them (reports/2026-11-04-net-p1a): the build of the service has
+/// one value.
+#[cfg(not(any(feature = "batch-8", feature = "batch-4", feature = "batch-2")))]
+pub const BATCH: usize = 16;
+#[cfg(feature = "batch-8")]
+pub const BATCH: usize = 8;
+#[cfg(feature = "batch-4")]
+pub const BATCH: usize = 4;
+#[cfg(feature = "batch-2")]
+pub const BATCH: usize = 2;
+pub const STEP_RX: usize = BATCH;
+pub const STEP_TX: usize = BATCH;
+/// The frames the loopback keeps for the next step: two steps of sending.
+pub const LOOP_FRAMES: usize = 2 * STEP_TX;
 
 const _: () = assert!(NET_PAGES == 256);
 
@@ -173,6 +186,65 @@ impl Default for TxBook {
     }
 }
 
+/// The frames the loopback keeps (spec 6, 3.3): the stack's frames to its
+/// own address wait here for the next reception. The frames themselves lie in
+/// a table of the service; this is the book of its places. A frame is
+/// pushed at `head`, read at `read`, and its place is the reader's until
+/// `done`: the stack builds replies to a frame while it holds it.
+pub struct LoopBook {
+    head: usize,
+    read: usize,
+    done: usize,
+}
+
+impl LoopBook {
+    pub const fn new() -> LoopBook {
+        LoopBook {
+            head: 0,
+            read: 0,
+            done: 0,
+        }
+    }
+
+    /// The place for a new frame, None when all LOOP_FRAMES are taken.
+    pub fn push(&mut self) -> Option<usize> {
+        if self.head - self.done >= LOOP_FRAMES {
+            return None;
+        }
+        let place = self.head % LOOP_FRAMES;
+        self.head += 1;
+        Some(place)
+    }
+
+    /// The place of the oldest frame not read.
+    pub fn pop(&mut self) -> Option<usize> {
+        if self.read == self.head {
+            return None;
+        }
+        let place = self.read % LOOP_FRAMES;
+        self.read += 1;
+        Some(place)
+    }
+
+    /// The oldest frame read is done with, its place is free.
+    pub fn done(&mut self) {
+        if self.done < self.read {
+            self.done += 1;
+        }
+    }
+
+    /// The frames waiting to be read.
+    pub fn waiting(&self) -> usize {
+        self.head - self.read
+    }
+}
+
+impl Default for LoopBook {
+    fn default() -> LoopBook {
+        LoopBook::new()
+    }
+}
+
 /// What one step of the service may still do: receive STEP_RX frames and
 /// send STEP_TX (spec 6: a step is bounded so that a burst of frames
 /// cannot hold the loop).
@@ -307,18 +379,50 @@ mod tests {
     }
 
     #[test]
-    fn a_step_receives_and_sends_sixteen_frames() {
+    fn the_loop_keeps_frames_in_order_and_holds_the_place_until_done() {
+        let mut book = LoopBook::new();
+        assert_eq!(book.pop(), None);
+        let a = book.push().unwrap();
+        let b = book.push().unwrap();
+        assert_ne!(a, b);
+        assert_eq!(book.waiting(), 2);
+        assert_eq!(book.pop(), Some(a));
+        // The frame read is still held: its reply goes to the next place.
+        let c = book.push().unwrap();
+        assert!(c != a && c != b);
+        book.done();
+        assert_eq!(book.pop(), Some(b));
+        assert_eq!(book.pop(), Some(c));
+        assert_eq!(book.pop(), None);
+    }
+
+    #[test]
+    fn the_loop_refuses_a_frame_when_it_is_full() {
+        let mut book = LoopBook::new();
+        for _ in 0..LOOP_FRAMES {
+            assert!(book.push().is_some());
+        }
+        assert_eq!(book.push(), None);
+        assert!(book.pop().is_some());
+        assert_eq!(book.push(), None, "a place is free after done alone");
+        book.done();
+        assert!(book.push().is_some());
+        assert_eq!(book.waiting(), LOOP_FRAMES);
+    }
+
+    #[test]
+    fn a_step_receives_and_sends_a_batch_of_frames() {
         let mut budget = Budget::new();
         for _ in 0..STEP_RX {
             assert!(budget.take_rx());
         }
         assert!(!budget.take_rx());
-        assert_eq!(budget.tx_left(), 16);
+        assert_eq!(budget.tx_left(), STEP_TX);
         for _ in 0..STEP_TX {
             assert!(budget.take_tx());
         }
         assert!(!budget.take_tx());
-        assert_eq!(budget.spent(), (16, 16));
+        assert_eq!(budget.spent(), (STEP_RX, STEP_TX));
         assert_eq!(budget.rx_left(), 0);
     }
 }

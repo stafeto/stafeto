@@ -21,8 +21,13 @@ bench = false
 # of CONFIG, for the network probe.
 # `steps`: each new longest step of the loop goes to the console (rt's
 # feature step-stats), for the measurement under -icount.
+# `batch-8`, `batch-4`, `batch-2`: the frames of a step, for the
+# measurement that chose them (the default is 16).
 [features]
 probe = []
+batch-8 = []
+batch-4 = []
+batch-2 = []
 steps = ["rt/step-stats"]
 
 [dependencies]
