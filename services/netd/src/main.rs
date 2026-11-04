@@ -54,7 +54,7 @@ use device::{DEVICE, NetDevice, RxRing, TxRing};
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
 use netd::lines::Mac;
-use netd::resolv::Text;
+use netd::resolv::{Text, Written};
 use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
 use proto_net::sockets;
@@ -399,7 +399,7 @@ fn main(_: u64) -> u64 {
         neighbours_at: 0,
         ask_due: false,
         asked: 0,
-        resolv: None,
+        resolv: Written::default(),
         #[cfg(feature = "probe")]
         hold: false,
         #[cfg(feature = "probe")]
@@ -509,7 +509,7 @@ struct Driver<'a> {
     /// How many of the targets of the round the requests went out for.
     asked: usize,
     /// The text of `/etc/resolv.conf` as the service wrote it last.
-    resolv: Option<Text>,
+    resolv: Written,
     /// The probe holds the steps of the stack (HOLD), and an interrupt came
     /// meanwhile.
     #[cfg(feature = "probe")]
@@ -767,12 +767,12 @@ impl Driver<'_> {
             rt::println!("net: resolv.conf no server");
             return;
         }
-        if self.resolv == Some(text) {
+        if !self.resolv.needs(&text) {
             return;
         }
         match files::write_resolv(text.as_bytes()) {
             Ok(()) => {
-                self.resolv = Some(text);
+                self.resolv.record(text);
                 let mut line = [0u8; netd::resolv::TEXT_MAX];
                 rt::println!("net: resolv.conf {}", servers_line(&text, &mut line));
             }

@@ -60,6 +60,24 @@ impl Text {
     }
 }
 
+/// The text of `resolv.conf` as the service wrote it last. A renewal of the
+/// lease with the same servers writes nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Written(Option<Text>);
+
+impl Written {
+    /// Whether `text` differs from what was written (nothing written yet
+    /// counts as different).
+    pub fn needs(&self, text: &Text) -> bool {
+        self.0.as_ref() != Some(text)
+    }
+
+    /// `text` is in the file now.
+    pub fn record(&mut self, text: Text) {
+        self.0 = Some(text);
+    }
+}
+
 fn on_link(address: [u8; 4], prefix: u8, other: [u8; 4]) -> bool {
     let mask = u32::MAX
         .checked_shl(32 - u32::from(prefix.min(32)))
@@ -116,12 +134,17 @@ mod tests {
     }
 
     #[test]
-    fn the_same_servers_give_the_same_text() {
+    fn a_renewal_with_the_same_servers_writes_nothing() {
         let a = Text::new(&[Some([10, 0, 2, 3]), None, None]);
         let b = Text::new(&[Some([10, 0, 2, 3]), None, None]);
         let c = Text::new(&[Some([10, 0, 2, 4]), None, None]);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
+        let mut written = Written::default();
+        assert!(written.needs(&a));
+        written.record(a);
+        assert!(!written.needs(&b));
+        assert!(written.needs(&c));
+        written.record(c);
+        assert!(written.needs(&a));
     }
 
     #[test]
