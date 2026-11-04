@@ -87,9 +87,11 @@ pub const NETD: Record = Record {
     // quota in the probe's runs, so the number is a bound that the
     // measurement does not reach. The shared buffers of the sessions (64 of
     // 256 KiB, BUFFER) add the tables of their mappings, which the service
-    // pays for: a table of the third level and the nodes of the table of
-    // mappings for each, 96 pages in all.
-    quota: 4977 * PAGE,
+    // pays for: they lie one after another from BUFFERS_AT, so a table of the
+    // third level covers eight of them, and the probe's role B measured 9
+    // pages for 64 (30 pages charged with the first, 39 with the sixty-fourth).
+    // 16 pages are added for them, 37 left over the formula.
+    quota: 4897 * PAGE,
     // 128 operations' handles of notification, the notary session, the page
     // of generations, and a reserve.
     handle_limit: 192,
