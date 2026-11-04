@@ -2015,6 +2015,116 @@ impl Probe<'_> {
         sockets::read_adopted(bytes).map_err(Fail::Status)
     }
 
+    /// A request to the pipe service: the status code of its reply.
+    fn pipe_status(
+        pipe: &Handle<Channel>,
+        request: &[u8],
+        handles: impl Into<rt::handle::Outgoing>,
+    ) -> Result<u32, &'static str> {
+        let reply = sys::send_handles(pipe, request, handles).map_err(|_| "a request to pipe")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        let word = bytes.get(..4).ok_or("a short reply of pipe")?;
+        Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+    }
+
+    /// The handles of passes the pipe service holds, through socket `end`.
+    fn pipe_passes(pipe: &Handle<Channel>, end: u32) -> Result<u32, &'static str> {
+        let mut w = Writer::new();
+        proto_pipe::Method::SockOpt
+            .header()
+            .write(&mut w)
+            .map_err(|_| "SOCK_OPT")?;
+        for word in [end, proto_pipe::sock::OPT_PASSES, 0, 0] {
+            w.u32(word).map_err(|_| "SOCK_OPT")?;
+        }
+        let reply = sys::send(pipe, w.as_bytes()).map_err(|_| "SOCK_OPT failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        match bytes.get(..8) {
+            Some(b) if b[..4] == [0; 4] => Ok(u32::from_le_bytes([b[4], b[5], b[6], b[7]])),
+            _ => Err("SOCK_OPT was refused"),
+        }
+    }
+
+    /// What the pipe service takes for a pass: a pass of the network service
+    /// (a channel with the right TRANSFER alone) goes, and the service's own
+    /// session, which it hands to any client in answer to WITNESS with the right
+    /// TRANSFER alone, is refused with BAD_SIZE and no place of passes is taken.
+    fn pass_rules(&self, root: &Handle<Channel>, d: u32) -> Result<(), &'static str> {
+        use proto_pipe::sock::{Addr, PASS, Send};
+        let pipe = rt::service::connect(self.parent, "pipe").map_err(|_| "connect to pipe")?;
+        let mut w = Writer::new();
+        proto_pipe::Method::SockPair
+            .header()
+            .write(&mut w)
+            .map_err(|_| "SOCK_PAIR")?;
+        for word in [proto_pipe::sock::UNIX, proto_pipe::sock::STREAM, 0] {
+            w.u32(word).map_err(|_| "SOCK_PAIR")?;
+        }
+        let mut reply = sys::send(&pipe, w.as_bytes()).map_err(|_| "SOCK_PAIR failed")?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        let (end, _other) = match (bytes.get(4..8), bytes.get(8..12)) {
+            (Some(a), Some(b)) if bytes[..4] == [0; 4] => (
+                u32::from_le_bytes([a[0], a[1], a[2], a[3]]),
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            ),
+            _ => return Err("SOCK_PAIR was refused"),
+        };
+        drop(reply.handles.take::<Channel>(0));
+        let send = |fds: &[u32], handle: Handle<Channel>| -> Result<u32, &'static str> {
+            let mut list = [0u32; proto_pipe::sock::FDS_MAX];
+            list[..fds.len()].copy_from_slice(fds);
+            let message = Send {
+                key: None,
+                end,
+                flags: 0,
+                fds: list,
+                nfds: fds.len(),
+                to: Addr::NONE,
+                bytes: b"m",
+            };
+            let mut w = Writer::new();
+            message.write(&mut w).map_err(|_| "SOCK_SEND")?;
+            Self::pipe_status(&pipe, w.as_bytes(), [handle.erase()])
+        };
+        if Self::pipe_passes(&pipe, end)? != 0 {
+            return Err("the pipe service held passes at the start");
+        }
+        // A pass of the network service is taken (the control of the check).
+        let pass = self.export(root, d).map_err(|_| "EXPORT failed")?;
+        if send(&[PASS], pass)? != 0 {
+            return Err("a pass was not taken by the pipe service");
+        }
+        if Self::pipe_passes(&pipe, end)? != 1 {
+            return Err("a pass taken was not counted");
+        }
+        // The service's own session: WITNESS of an open of the pipe service.
+        let ticket = proto_pipe::named::NamedTicket {
+            slot: 32,
+            generation: 1,
+        };
+        let mut w = Writer::new();
+        ticket
+            .request(proto_pipe::Method::PayerWitness, &mut w)
+            .map_err(|_| "WITNESS")?;
+        let mut reply = sys::send(&pipe, w.as_bytes()).map_err(|_| "WITNESS failed")?;
+        let witness = reply
+            .handles
+            .take::<Channel>(0)
+            .map_err(|_| "WITNESS gave no handle")?;
+        let code = send(&[PASS], witness)?;
+        if code != Status::BadSize.code() {
+            rt::println!("net-probe: a session of the pipe service as a pass gave {code}");
+            return Err("the pipe service took its own session as a pass");
+        }
+        if Self::pipe_passes(&pipe, end)? != 1 {
+            return Err("a refused pass was counted");
+        }
+        Ok(())
+    }
+
     /// Role `x`: passes (EXPORT, ADOPT, the last copy of a pass going, the
     /// limit of a session), BIND with SO_REUSEPORT without the identity
     /// session, and sixteen operations that wait with a time limit.
@@ -2068,6 +2178,7 @@ impl Probe<'_> {
             Err(fail) if is(&fail, proto_net::NOT_SOCKET) => {}
             _ => return Err("a foreign channel was taken for a pass"),
         }
+        self.pass_rules(&root, d)?;
         // A session holds sixteen passes: the seventeenth is refused.
         let mut held: [Option<Handle<Channel>>; proto_net::sockets::SESSION_PASSES] =
             Default::default();

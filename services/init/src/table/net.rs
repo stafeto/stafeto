@@ -415,7 +415,11 @@ pub const PROBE: Record = Record {
     trace: false,
     windows: &[],
     bindings: &[],
-    connects: &[NET_SERVICE],
+    connects: if cfg!(feature = "net-passes") {
+        &[NET_SERVICE, "pipe"]
+    } else {
+        &[NET_SERVICE]
+    },
     args: ROLES,
     dma: &[],
     quiesce: &[],
@@ -526,7 +530,17 @@ const fn on(r: Record, cpus: u8) -> Record {
 /// The images of the probe, which differ in the files of the RAM service
 /// and in the features of the service: the RAM files, the entropy device's
 /// driver and service, the network service and the probe.
-pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-alone") {
+pub const NET_PROBE_TABLE: &[Record] = if cfg!(feature = "net-passes") {
+    // Role `x` sends a handle of the pipe service's own sessions as a pass.
+    &[
+        super::ramfs::RAM_LEGACY,
+        super::ramfs::PIPE,
+        super::entropy::RNG,
+        super::entropy::ENTROPY,
+        NETD,
+        PROBE,
+    ]
+} else if cfg!(feature = "net-alone") {
     &[
         super::ramfs::RAM_LEGACY,
         on(super::entropy::RNG, OTHERS_CPUS),

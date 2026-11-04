@@ -189,14 +189,19 @@ fn measured_programs(
     init.extend(roles);
     let mut service = vec!["probe", "steps"];
     service.extend_from_slice(netd);
-    Box::leak(Box::new([
+    let mut programs = vec![
         ("init", "init", INIT_STACK_SIZE, leak(init)),
         RAM,
         RNG,
         ENTROPY,
         ("netd", "netd", NETD_STACK_SIZE, leak(service)),
         ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
-    ]))
+    ];
+    // The role `x` also talks to the pipe service.
+    if roles == Some("net-passes") {
+        programs.push(("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]));
+    }
+    Box::leak(programs.into_boxed_slice())
 }
 
 /// The name of an image of the measurement.
