@@ -659,6 +659,13 @@ impl Budget {
         true
     }
 
+    /// Ends the receiving of the step: the frames taken so far stay its
+    /// share, and it takes no more.
+    pub fn end_rx(&mut self) {
+        self.rx_start -= self.rx;
+        self.rx = 0;
+    }
+
     pub fn rx_left(&self) -> usize {
         self.rx
     }
@@ -682,6 +689,17 @@ impl Default for Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_that_ends_its_receiving_keeps_the_frames_it_took() {
+        let mut budget = Budget::with(4, 4);
+        assert!(budget.take_rx() && budget.take_rx());
+        budget.end_rx();
+        assert_eq!((budget.rx_left(), budget.spent()), (0, (2, 0)));
+        assert!(!budget.take_rx());
+        assert!(budget.take_tx());
+        assert_eq!(budget.spent(), (2, 1));
+    }
 
     #[test]
     fn the_object_holds_the_buffers() {

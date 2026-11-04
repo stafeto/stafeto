@@ -664,7 +664,9 @@ impl Driver<'_> {
         // notification opens the line instead: the level brings the
         // interrupt back for the frames still in the queue.
         let kernel = split::now();
-        let more = self.device.rx.queue.can_pop() || self.device.looped.waiting() > 0;
+        let more = self.device.rx.queue.can_pop()
+            || self.device.looped.waiting() > 0
+            || self.device.has_deferred();
         let continued = more && self.tell(RX);
         if !continued && core::mem::take(&mut self.line_closed) {
             virtio_mmio::reopen(&self.irq);

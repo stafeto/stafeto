@@ -88,6 +88,21 @@ const RUN_WITHIN: Duration = Duration::from_secs(110);
 /// an alarm or a late byte).
 const CHECKS_WITHIN: Duration = Duration::from_secs(90);
 
+/// The port of the guest with no listener, which the host reaches through a
+/// forward: the first connection of the run must end in a second.
+const CLOSED_GUEST_PORT: u16 = 81;
+/// The datagrams of 1 472 bytes sent to a UDP port with no socket, and the
+/// connections to the port with no listener: each makes the stack answer
+/// with a frame of its own (port unreachable, reset), the case the rule of
+/// the step of receiving is for (netd::frames::answered).
+const ANSWERED_UDP: usize = 64;
+const ANSWERED_TCP: usize = 32;
+/// The reset of the guest to the very first connection reaches the host
+/// only when the service asked for its gateway's address before (the ARP
+/// request of the gateway every 30 s); while this is true a closed first
+/// connection that stays open is a warning.
+pub const CLOSED_PORT_NEEDS_GATEWAY_REQUEST: bool = true;
+
 /// The image of the run with the counted steps.
 pub const STEPS_IMAGE: &str = "boot-net-curl-steps.img";
 
@@ -252,6 +267,51 @@ fn curl(port: u16) -> Result<bool, String> {
     Ok(true)
 }
 
+/// A connection to the guest's port with no listener through the forward:
+/// slirp accepts it, asks the guest, and closes it when the guest resets;
+/// without the reset (lost, as the first answer to the gateway is while the
+/// service does not know its address) slirp sends the SYN again after
+/// seconds. The connection must be closed within `within`.
+fn closed_connection(port: u16, within: Duration) -> Result<Duration, String> {
+    let started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&local(port), within)
+        .map_err(|e| format!("connect to the forward of the closed port: {e}"))?;
+    stream
+        .set_read_timeout(Some(within))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let mut byte = [0u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => Ok(started.elapsed()),
+        Ok(_) => Err("the closed port sent data".to_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(started.elapsed()),
+        Err(e) => Err(format!(
+            "the connection to the closed port stayed open for {} ms ({e}): the guest's reset did not arrive",
+            started.elapsed().as_millis()
+        )),
+    }
+}
+
+/// The frames the stack answers: 64 datagrams of 1 472 bytes to a UDP port
+/// no socket has, then 32 connections to the port with no listener. Each
+/// connection is closed within a second.
+fn answered_frames(udp_port: u16, closed_port: u16) -> Result<(), String> {
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("udp socket: {e}"))?;
+    let datagram = [0x55u8; 1472];
+    for _ in 0..ANSWERED_UDP {
+        socket
+            .send_to(&datagram, local(udp_port))
+            .map_err(|e| format!("udp send: {e}"))?;
+    }
+    for n in 0..ANSWERED_TCP {
+        closed_connection(closed_port, Duration::from_secs(2))
+            .map_err(|e| format!("connection {} of {ANSWERED_TCP}: {e}", n + 1))?;
+    }
+    println!(
+        "net-curl: {ANSWERED_UDP} datagrams of 1472 bytes to a port with no socket and {ANSWERED_TCP} connections to a port with no listener answered"
+    );
+    Ok(())
+}
+
 /// UDP with the guest: the echo through the forwarded port, and a datagram
 /// the guest sends to the host (10.0.2.2 is the host for slirp).
 fn udp(run: &mut qemu::Run, address: &str, forward: u16) -> Result<(), String> {
@@ -393,6 +453,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let tcp = free_tcp_port()?;
     let udp_port = free_udp_port()?;
+    let closed_port = free_tcp_port()?;
     let forwards = [
         Forward {
             proto: Proto::Tcp,
@@ -403,6 +464,11 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             proto: Proto::Udp,
             host: udp_port,
             guest: 7,
+        },
+        Forward {
+            proto: Proto::Tcp,
+            host: closed_port,
+            guest: CLOSED_GUEST_PORT,
         },
     ];
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
@@ -418,6 +484,19 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
         let lease = run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         let address = lease_address(&lease).ok_or(format!("the lease line {lease:?}"))?;
+        // The first exchange after the lease: the guest's reset to a
+        // connection to a port with no listener closes it within a second.
+        match closed_connection(closed_port, Duration::from_secs(1)) {
+            Ok(took) => println!(
+                "net-curl: the first connection, to a closed port, was closed in {} ms",
+                took.as_millis()
+            ),
+            Err(why) if CLOSED_PORT_NEEDS_GATEWAY_REQUEST => {
+                println!("net-curl: WARNING the first connection, to a closed port: {why}")
+            }
+            Err(why) => return Err(why),
+        }
+        answered_frames(udp_port, closed_port)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("httpd -f -p 80 -h /www & H=$!")?;
         run.expect("# ", DIALOG_STEP)?;

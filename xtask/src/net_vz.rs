@@ -50,10 +50,6 @@ const REFUSAL_WITHIN: Duration = Duration::from_secs(1);
 const MACS: [&str; 2] = ["02:73:74:66:00:01", "02:73:74:66:00:02"];
 /// The static address of the second device in the image `--static1`.
 const STATIC1: &str = "192.168.64.250";
-/// The closed-port check needs the guest's ARP request for its gateway
-/// (the first reply to the host is lost without it); a failure of it is a
-/// warning while this is true.
-const CLOSED_PORT_NEEDS_GATEWAY_REQUEST: bool = true;
 
 /// What the guest's line of a lease or a static address says.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -277,7 +273,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         let first = first_device(&mut run, started, services_at)?;
         let guest = first.address;
         if let Err(why) = closed_port(guest) {
-            if CLOSED_PORT_NEEDS_GATEWAY_REQUEST && !why.contains("Local Network") {
+            if net_curl::CLOSED_PORT_NEEDS_GATEWAY_REQUEST && !why.contains("Local Network") {
                 println!(
                     "net-vz: WARNING closed port: {why} (needs the ARP request of the gateway)"
                 );

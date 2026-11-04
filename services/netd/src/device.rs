@@ -107,6 +107,11 @@ impl RxRing {
         self.budget = budget;
     }
 
+    /// Ends the step's receiving after the frame it just took.
+    pub fn end_rx(&mut self) {
+        self.budget.end_rx();
+    }
+
     /// The frames the step received and dropped.
     pub fn received(&self) -> usize {
         self.budget.spent().0
@@ -275,6 +280,10 @@ pub struct NetDevice {
     own_len: usize,
     /// The frame `stage` took and `receive` gives to the stack.
     held: Option<Held>,
+    /// A frame of the wire the stack answers with a frame of its own that
+    /// did not come first in its step: it waits for the next step of
+    /// receiving, whose first frame it is (`defer`).
+    deferred: Option<(u16, usize)>,
     /// Frames of the wire whose checksums did not hold.
     pub bad_sum: u64,
 }
@@ -296,7 +305,33 @@ impl NetDevice {
             own: [[0; 4]; 2],
             own_len: 0,
             held: None,
+            deferred: None,
             bad_sum: 0,
+        }
+    }
+
+    /// Whether a frame waits for the next step of receiving.
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// Whether the frame `stage` took, a frame of the wire for `dest`, is one
+    /// the stack answers with a frame of its own (`frames::answered`;
+    /// `routed`: a socket owns it). The loop's frames are not: their answers
+    /// carry no sums and cost less.
+    pub fn held_is_answered(&self, dest: Dest, routed: bool) -> bool {
+        let Some(Held::Wire { buffer, length }) = self.held else {
+            return false;
+        };
+        // SAFETY: the frame was popped by `stage` and waits for `receive`.
+        let slice = unsafe { buffer_at(buffer) };
+        frames::answered(dest, routed, &slice[HDR_LEN..HDR_LEN + length])
+    }
+
+    /// Puts the frame `stage` took aside for the next step of receiving.
+    pub fn defer_held(&mut self) {
+        if let Some(Held::Wire { buffer, length }) = self.held.take() {
+            self.deferred = Some((buffer, length));
         }
     }
 
@@ -311,6 +346,19 @@ impl NetDevice {
             return None;
         }
         self.reclaim_loop();
+        if self.rx.budget.rx_left() == 0 {
+            return None;
+        }
+        // The frame put aside by the step before comes first, before the
+        // loop's: it passed the checks below when it was taken.
+        if let Some((buffer, length)) = self.deferred.take() {
+            self.rx.budget.take_rx();
+            // SAFETY: the buffer was popped and has been held since.
+            let slice = unsafe { buffer_at(buffer) };
+            let dest = frames::target(&slice[HDR_LEN..HDR_LEN + length]);
+            self.held = Some(Held::Wire { buffer, length });
+            return Some(dest);
+        }
         loop {
             if self.rx.budget.rx_left() == 0 {
                 return None;
