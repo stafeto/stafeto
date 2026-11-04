@@ -103,9 +103,41 @@ pub const NETD: Record = Record {
     cpus: NETD_CPUS,
 };
 
-/// The probe (tests/net-probe, roles `c` and `k`): the interface's address
-/// and 300 pings of the gateway, then CRASH of the service and the same
-/// again through a new session.
+/// The roles of the probe (tests/net-probe): `c` the interface's address and
+/// 300 pings of the gateway, `b` the registry of ports and the sessions, `sN`
+/// N places of the table at once (the digits are N) and 50 pings, `e` the
+/// rates of the loopback, `k` CRASH of the service and the same as `c`
+/// through a new session. The images of the measurement of the steps
+/// (`net-sockets-N`) run `s` at 8, 64 and 256 places; the others at the
+/// limit of the sockets the service serves (netd::places::SOCKETS_LIMIT,
+/// which a test of xtask compares with the number here).
+#[cfg(feature = "net-sockets-8")]
+pub const ROLES: &[u8] = b"cs8k";
+#[cfg(all(feature = "net-sockets-64", not(feature = "net-sockets-8")))]
+pub const ROLES: &[u8] = b"cs64k";
+#[cfg(all(
+    feature = "net-sockets-256",
+    not(any(feature = "net-sockets-8", feature = "net-sockets-64"))
+))]
+pub const ROLES: &[u8] = b"cs256k";
+#[cfg(all(
+    feature = "net-echo",
+    not(any(
+        feature = "net-sockets-8",
+        feature = "net-sockets-64",
+        feature = "net-sockets-256"
+    ))
+))]
+pub const ROLES: &[u8] = b"cek";
+#[cfg(not(any(
+    feature = "net-sockets-8",
+    feature = "net-sockets-64",
+    feature = "net-sockets-256",
+    feature = "net-echo"
+)))]
+pub const ROLES: &[u8] = b"cbs128k";
+
+/// The probe (tests/net-probe).
 pub const PROBE: Record = Record {
     name: "net-probe",
     program: "net-probe",
@@ -121,7 +153,7 @@ pub const PROBE: Record = Record {
     windows: &[],
     bindings: &[],
     connects: &[NET_SERVICE],
-    args: b"ck",
+    args: ROLES,
     dma: &[],
     quiesce: &[],
     trusted: false,

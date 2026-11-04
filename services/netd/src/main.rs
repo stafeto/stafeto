@@ -4,10 +4,11 @@
 //! The network service of stafeto (spec 6): its own driver of the Virtio
 //! network device on a virtio-mmio transport (Virtio 1.2, 5.1) and the
 //! smoltcp stack over it, with DHCP (or the static address of
-//! `/etc/netd.conf`), ARP and the answer to ICMP echo. The first stage has
-//! one client method, CONFIG, which tells the interface's address; a build
-//! with the feature `probe` adds PING (an echo request to an address, for
-//! the network probe) and CRASH.
+//! `/etc/netd.conf`), ARP and the answer to ICMP echo. CONFIG tells the
+//! interface's address; the sockets' methods of proto_net serve TCP and UDP
+//! over IPv4, with a loopback inside the one interface (`net.rs`,
+//! `calls.rs`); a build with the feature `probe` adds PING (an echo request
+//! to an address, for the network probe) and CRASH.
 //!
 //! The device is `net` of init's table: two DMA objects (`dma`, the pages
 //! of the two queues, and `net`, 512 buffers of 2 KiB for the frames), the
@@ -18,12 +19,15 @@
 //!
 //! The service never waits for the device. An interrupt (or the service's
 //! own notification STEP, or its timer) starts a step: the used buffers of
-//! sending come back, the stack takes at most 16 received frames and sends
-//! at most 16, the buffers of receiving go back to the queue, the doorbells
-//! ring, and the timer is set for the stack's next deadline. A step that
-//! left received frames behind notifies the service again and keeps the
-//! line closed; otherwise the line opens again (irq_ack) with the source
-//! cleared.
+//! sending come back, the stack takes the frames of the loopback and then of
+//! the wire (`ring::STEP_RX` at most) and sends in one pass over its
+//! sockets (`ring::STEP_TX` frames at most), the operations that wait are
+//! told, the buffers of receiving go back to the queue, the doorbells ring,
+//! and the timer is set for the stack's next deadline. A step that left
+//! frames behind notifies the service again and keeps the line closed;
+//! otherwise the line opens again (irq_ack) with the source cleared. A
+//! call of a socket never runs the stack: it changes the buffers of one
+//! socket and asks for a step.
 //!
 //! The key of the stack comes from the entropy service and the address
 //! settings from the file service, both before the service registers with
@@ -34,24 +38,30 @@
 #![no_std]
 #![no_main]
 
+mod calls;
 mod conf;
 mod device;
 mod dma;
+mod net;
 mod seed;
 mod stack;
 
 use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
-use device::{DEVICE, NetDevice, RxRing, TxRing};
+use core::cell::UnsafeCell;
+use device::{DEVICE, LoopRing, NetDevice, RxRing, TxRing};
+use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
+use netd::frames::MAX_FRAME;
 use netd::lines::Mac;
-use netd::ring::{NET_PAGES, QUEUE_SIZE};
+use netd::ring::{LOOP_FRAMES, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
+use proto_net::sockets;
 use proto_net::{Method, VERSION, code};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
-use rt::{Handle, sys, time};
+use rt::{Handle, sys};
 use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::Transport;
@@ -60,10 +70,10 @@ use virtio_mmio::{Isr, OpenError, PAGE, StartError};
 
 rt::entry!(main);
 
-/// The sessions of the service's channel.
-const SESSIONS: usize = 8;
-/// The bit of the service's notification to itself: a step is due.
+/// The bits of the service's notification to itself: a step of the stack is
+/// due, and a step of the departure of a session is due.
 const STEP: u64 = 1;
+const CLEANUP: u64 = 2;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
@@ -93,6 +103,22 @@ const NO_DEVICE: u64 = 6;
 const NOT_STARTED: u64 = 7;
 const NO_CONFIG: u64 = 9;
 
+/// The tables of the service in `.bss`, too big for the stack: the sockets
+/// with their buffers (`net`), the storage of the smoltcp sockets, the table
+/// of sessions and the frames of the loopback. They are filled in place at
+/// the start (`Net::initialize_at`); nothing in them is touched before a
+/// socket needs it.
+struct Tables {
+    net: Net,
+    storage: Storage<'static>,
+    sessions: [Option<Session<Client, 0>>; SESSIONS],
+    loop_frames: [[u8; MAX_FRAME]; LOOP_FRAMES],
+}
+struct Bss(UnsafeCell<core::mem::MaybeUninit<Tables>>);
+// SAFETY: only the main thread reaches it, once (`main`).
+unsafe impl Sync for Bss {}
+static TABLES: Bss = Bss(UnsafeCell::new(core::mem::MaybeUninit::zeroed()));
+
 /// The heap the device's crate may ask for: none (the queues have no
 /// indirect entries, the only thing of the crate that allocates).
 struct NoHeap;
@@ -115,10 +141,6 @@ fn word(own: &[u8], at: usize) -> u64 {
     own.get(at..at + 8)
         .and_then(|b| b.try_into().ok())
         .map_or(0, u64::from_le_bytes)
-}
-
-fn now_ns() -> u64 {
-    time::ticks_to_ns(time::now())
 }
 
 /// The MAC address and the link status the configuration space of the
@@ -159,18 +181,47 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
 
-    // The key of the stack: its first 8 bytes seed the stack, and the rest
-    // is erased (the ports of the next stage take their secret from the
-    // service that has it).
+    // The timer of the service, made before anything is waited for: it ends
+    // the wait for the key, and after REGISTER it serves the deadlines of the
+    // stack.
+    let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(view) = sys::handle_label(&channel, Rights::RECEIVE, TIMER_LABEL, level) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(timer) = sys::timer_create(&view, level) else {
+        return NOT_REGISTERED;
+    };
+
+    // The key of the stack: its first 8 bytes seed the stack, the next 16
+    // are the secret of the choice of ports (RFC 6056), and the rest is
+    // erased.
     let Ok(entropy) = rt::service::connect(&s.parent, "entropy") else {
         return NO_ENTROPY;
     };
-    let Ok(mut key) = seed::take(&entropy, &channel, level) else {
-        return NO_ENTROPY;
+    let mut key = match seed::take(&entropy, &channel, level, (&timer, TIMER_LABEL)) {
+        Ok(key) => key,
+        Err(failure) => {
+            match failure {
+                seed::Failure::Gone => {
+                    rt::println!("net: no key from the entropy service (gone)")
+                }
+                seed::Failure::Timeout => {
+                    rt::println!("net: no key from the entropy service (timeout)")
+                }
+                seed::Failure::Refused(status) => {
+                    rt::println!("net: no key from the entropy service ({status:?})")
+                }
+            }
+            return NO_ENTROPY;
+        }
     };
     let mut first = [0; 8];
     first.copy_from_slice(&key[..8]);
     let random_seed = u64::from_le_bytes(first);
+    let mut ports_key = [0; 16];
+    ports_key.copy_from_slice(&key[8..24]);
     posix_random::erase(&mut key);
     drop(entropy);
 
@@ -259,10 +310,26 @@ fn main(_: u64) -> u64 {
     let Ok(tx_queue) = Q::new(&mut transport, TRANSMITQ, false, false) else {
         return NOT_STARTED;
     };
-    let mut device = NetDevice {
-        rx: RxRing::new(rx_queue),
-        tx: TxRing::new(tx_queue),
+    // SAFETY: only this thread reaches TABLES, here once; the pointer is to
+    // zeroed memory of the static.
+    let tables = unsafe {
+        let pointer = (*TABLES.0.get()).as_mut_ptr();
+        Tables::initialize_at(pointer, ports_key, &s.parent, &channel, level);
+        &mut *pointer
     };
+    posix_random::erase(&mut ports_key);
+    let Tables {
+        net,
+        storage,
+        sessions,
+        loop_frames,
+    } = tables;
+    let mut device = NetDevice::new(
+        RxRing::new(rx_queue),
+        TxRing::new(tx_queue),
+        LoopRing::new(loop_frames),
+        mac,
+    );
     device.rx.fill();
     transport.finish_init();
     virtio_mmio::ring(&mut transport, RECEIVEQ);
@@ -276,19 +343,9 @@ fn main(_: u64) -> u64 {
         rt::println!("virtio-net: link down");
     }
 
-    let Ok(notify) = sys::handle_duplicate(&channel, Rights::NOTIFY) else {
-        return NOT_REGISTERED;
-    };
-    let Ok(view) = sys::handle_label(&channel, Rights::RECEIVE, TIMER_LABEL, level) else {
-        return NOT_REGISTERED;
-    };
-    let Ok(timer) = sys::timer_create(&view, level) else {
-        return NOT_REGISTERED;
-    };
-    let mut storage = Storage::new();
     let now = now_ns();
     let mut stack = Stack::new(
-        &mut storage,
+        storage,
         &mut device,
         mac,
         random_seed,
@@ -296,10 +353,14 @@ fn main(_: u64) -> u64 {
         settings.address.is_none(),
     );
     announce_static(&mut stack, &settings);
+    net.external = stack.lease.map(|lease| lease.address);
+    let (own, count) = stack.addresses();
+    device.set_addresses(&own[..count]);
     let mut driver = Driver {
         transport,
         device,
         stack,
+        net,
         irq,
         notify,
         timer,
@@ -308,13 +369,14 @@ fn main(_: u64) -> u64 {
         mac,
         link,
         line_closed: false,
-        step_told: false,
+        told: 0,
+        cleanup_due: false,
         _maps: (dma_object, net_object, window),
     };
     // The line opens once the queues are up; the first step starts the
     // DHCP client.
     virtio_mmio::reopen(&driver.irq);
-    driver.step(false);
+    driver.step(false, false);
     #[cfg(feature = "steps")]
     rt::service::report_steps(14);
     let config = Config {
@@ -325,7 +387,7 @@ fn main(_: u64) -> u64 {
             priority: level,
         }),
     };
-    let _ = rt::service::run::<Driver, SESSIONS, 1>(&channel, &mut driver, config);
+    let _ = rt::service::run_in(&channel, &mut driver, config, sessions);
     STOPPED
 }
 
@@ -339,12 +401,36 @@ fn announce_static(stack: &mut Stack<'_>, settings: &Settings) {
     }
 }
 
+impl Tables {
+    /// The tables as they start, in place.
+    ///
+    /// # Safety
+    /// `tables` is valid for writes, exclusive and zeroed.
+    #[inline(never)]
+    unsafe fn initialize_at(
+        tables: *mut Tables,
+        key: [u8; 16],
+        parent: &Handle<Channel>,
+        channel: &Handle<Channel>,
+        level: u8,
+    ) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            Net::initialize_at(addr_of_mut!((*tables).net), key, parent, channel, level);
+            Storage::initialize_at(addr_of_mut!((*tables).storage));
+            rt::bss::fill_none(addr_of_mut!((*tables).sessions));
+        }
+    }
+}
+
 /// The service: the device and the stack, the binding of its line, the
-/// timer, and the PING that waits for its reply.
+/// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
     transport: MmioTransport<'static>,
     device: NetDevice,
-    stack: Stack<'a>,
+    stack: Stack<'static>,
+    net: &'a mut Net,
     irq: Handle<Interrupt>,
     /// A copy of the service's channel with NOTIFY: the service tells
     /// itself a step is due.
@@ -357,25 +443,54 @@ struct Driver<'a> {
     /// The line is closed (the kernel masked it at delivery and the step
     /// has not opened it yet).
     line_closed: bool,
-    /// A STEP notification is on its way.
-    step_told: bool,
+    /// The bits of the notifications to itself that are on their way.
+    told: u64,
+    /// A step of departure is due that no notification told.
+    cleanup_due: bool,
     _maps: (Handle<Memory>, Handle<Memory>, Handle<Memory>),
 }
 
 impl Driver<'_> {
-    /// Asks the loop for a step, unless one is asked for; false when the
-    /// notification was refused and no step is on its way.
-    fn want_step(&mut self) -> bool {
-        if self.step_told {
+    /// Tells the loop `bit` unless it is told already; false when the
+    /// notification was refused and nothing is on its way.
+    fn tell(&mut self, bit: u64) -> bool {
+        if self.told & bit != 0 {
             return true;
         }
-        self.step_told = sys::notify(&self.notify, STEP).is_ok();
-        self.step_told
+        if sys::notify(&self.notify, bit).is_ok() {
+            self.told |= bit;
+            return true;
+        }
+        false
+    }
+
+    /// Asks the loop for a step of the stack.
+    fn want_step(&mut self) -> bool {
+        self.tell(STEP)
+    }
+
+    /// The requests made while a step or a departure was wanted: the loop
+    /// is told, once.
+    fn after_request(&mut self) {
+        if core::mem::take(&mut self.net.step_due) {
+            self.want_step();
+        }
+        if self.cleanup_due && self.tell(CLEANUP) {
+            self.cleanup_due = false;
+        }
+    }
+
+    /// A departure is due.
+    fn cleanup(&mut self) {
+        if !self.tell(CLEANUP) {
+            self.cleanup_due = true;
+        }
     }
 
     /// One step of the service: from the interrupt (`interrupt`: read the
-    /// status first), the service's own notification, or the timer.
-    fn step(&mut self, interrupt: bool) {
+    /// status first), the service's own notification, or the timer
+    /// (`deadline`).
+    fn step(&mut self, interrupt: bool, deadline: bool) {
         rt::service::step_own();
         if interrupt {
             self.line_closed = true;
@@ -390,17 +505,27 @@ impl Driver<'_> {
         self.stack.ingress(now, &mut self.device);
         self.stack.egress(now, &mut self.device);
         self.events(now);
+        self.net.wake(&mut self.stack, now);
+        if deadline {
+            self.net.sweep(&mut self.stack, now);
+        }
         self.doorbells();
-        rt::service::step_detail(self.device.step_frames() as u64);
-        // Frames the share of the step left in the queue: another step,
-        // with the line closed.
-        // A refused notification opens the line instead: the level brings the
-        // interrupt back for the frames still in the queue.
-        let continued = self.device.rx.queue.can_pop() && self.want_step();
+        let frames = self.device.step_frames();
+        rt::service::step_detail(frames as u64);
+        // Frames the share of the step left in the queue or in the loop, or
+        // work the stack has at once after a step that made progress:
+        // another step, with the line closed. A refused notification opens
+        // the line instead: the level brings the interrupt back for the
+        // frames still in the queue.
+        let next = self.stack.poll_at_ns(now);
+        let more = self.device.rx.queue.can_pop()
+            || self.device.looped.waiting() > 0
+            || (frames > 0 && next.is_some_and(|at| at <= now));
+        let continued = more && self.want_step();
         if !continued && core::mem::take(&mut self.line_closed) {
             virtio_mmio::reopen(&self.irq);
         }
-        self.arm(now);
+        self.arm(now, next);
     }
 
     /// The change of the link (the interrupt's configuration bit).
@@ -417,8 +542,16 @@ impl Driver<'_> {
     /// What the DHCP client and the PING made of the step.
     fn events(&mut self, now: u64) {
         match self.stack.dhcp_event() {
-            Some(Event::Leased(lease)) => rt::println!("net: lease {}", lease.summary()),
-            Some(Event::Lost) => rt::println!("net: lease lost"),
+            Some(Event::Leased(lease)) => {
+                self.net.external = Some(lease.address);
+                self.addresses();
+                rt::println!("net: lease {}", lease.summary())
+            }
+            Some(Event::Lost) => {
+                self.net.external = None;
+                self.addresses();
+                rt::println!("net: lease lost")
+            }
             None => {}
         }
         if self.ping.is_some()
@@ -426,6 +559,12 @@ impl Driver<'_> {
         {
             self.finish_ping(end);
         }
+    }
+
+    /// The frames to the addresses of the interface stay in the loop.
+    fn addresses(&mut self) {
+        let (own, count) = self.stack.addresses();
+        self.device.set_addresses(&own[..count]);
     }
 
     fn finish_ping(&mut self, end: PingEnd) {
@@ -456,17 +595,15 @@ impl Driver<'_> {
         }
     }
 
-    /// Sets the timer for the stack's next work or the PING's deadline,
-    /// never in the past.
-    fn arm(&mut self, now: u64) {
-        let next = [
-            self.stack.poll_at_ns(now),
-            self.stack.ping.as_ref().map(|p| p.deadline_ns),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
-        if let Some(at) = next {
+    /// Sets the timer for the stack's next work (`next`), the PING's
+    /// deadline or the sweep of the streams that close, never in the past.
+    fn arm(&mut self, now: u64, next: Option<u64>) {
+        let sweep = self.net.orphans_wait().then(|| now + SWEEP_NS);
+        let at = [next, self.stack.ping.as_ref().map(|p| p.deadline_ns), sweep]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(at) = at {
             let _ = sys::timer_set(&self.timer, at.max(now + 1_000_000));
         }
     }
@@ -497,14 +634,16 @@ impl Driver<'_> {
     /// The counters of the probe's line.
     #[cfg(feature = "probe")]
     fn report_frames(&self) {
-        let (rx, rx_dropped) = self.device.rx.counters();
+        let (rx, rx_dropped, rx_martian) = self.device.rx.counters();
         let tx = self.device.tx.counters();
         rt::println!(
-            "net: frames rx {} tx {} dhcp {} dropped {}",
+            "net: frames rx {} tx {} dhcp {} dropped {} martian {} listen_short {}",
             rx,
             tx.tx,
             tx.dhcp,
-            rx_dropped + tx.dropped
+            rx_dropped + tx.dropped,
+            rx_martian + tx.martian,
+            self.net.counters.listen_short
         );
     }
 
@@ -542,41 +681,87 @@ impl Driver<'_> {
     }
 }
 
+/// How long after a step the streams that close are looked at again.
+const SWEEP_NS: u64 = 1_000_000_000;
+
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`.
+/// `probe`. CLONE_MORE (20) and the methods of later stages (22 to 26) are
+/// UNKNOWN_METHOD.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    Method::Config.number(),
-    Method::Ping.number(),
-    Method::Crash.number(),
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
-const METHODS: &[u16] = &[Method::Config.number()];
+const METHODS: &[u16] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 27, 28, 29,
+];
 
-impl Service<1> for Driver<'_> {
+impl Service<0> for Driver<'_> {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = METHODS;
-    type Data = ();
+    type Data = Client;
 
-    fn request(&mut self, _: &mut Session<(), 1>, r: &mut Request<'_>) -> Answer {
-        match Method::from_number(r.method()) {
+    fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        self.net.claim(s, r.label());
+        let answer = match Method::from_number(r.method()) {
             Some(Method::Config) => self.config(r),
             #[cfg(feature = "probe")]
             Some(Method::Ping) => self.ping(r),
             #[cfg(feature = "probe")]
             Some(Method::Crash) => crash(r),
-            _ => Answer::Status(Status::UnknownMethod),
+            Some(method) => match sockets::Request::parse(method, r.body()) {
+                Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
+                Some(Err(status)) => Answer::Status(status),
+                None => Answer::Status(Status::UnknownMethod),
+            },
+            None => Answer::Status(Status::UnknownMethod),
+        };
+        self.after_request();
+        answer
+    }
+
+    /// The client of `s` went: its operations go, and its descriptions are
+    /// let go of in steps.
+    fn gone(&mut self, s: &mut Session<Client, 0>) {
+        rt::service::step_own();
+        self.net.abandon(s);
+        let held = core::mem::take(&mut s.data.held);
+        if self.net.depart(&mut self.stack, held) {
+            self.cleanup();
         }
+        self.net.step_due = true;
+        self.after_request();
+    }
+
+    /// The last copy of a session Clone made went before it sent anything.
+    fn closed(&mut self, label: u64) {
+        rt::service::step_own();
+        if let Some(held) = self.net.unborn(label)
+            && self.net.depart(&mut self.stack, held)
+        {
+            self.cleanup();
+        }
+        self.after_request();
     }
 
     fn notification(&mut self, n: Notice) {
         match n.source {
-            Source::Interrupt => self.step(true),
-            Source::Unlabeled if n.bits & STEP != 0 => {
-                self.step_told = false;
-                self.step(false);
+            Source::Interrupt => self.step(true, false),
+            Source::Unlabeled if n.bits & (STEP | CLEANUP) != 0 => {
+                self.told &= !n.bits;
+                if n.bits & CLEANUP != 0 {
+                    rt::service::step_own();
+                    if self.net.depart_step(&mut self.stack) {
+                        self.cleanup();
+                    }
+                    self.net.step_due = true;
+                }
+                if n.bits & STEP != 0 {
+                    self.step(false, false);
+                }
+                self.after_request();
             }
-            Source::Timer if n.label == TIMER_LABEL => self.step(false),
+            Source::Timer if n.label == TIMER_LABEL => self.step(false, true),
             _ => {}
         }
     }

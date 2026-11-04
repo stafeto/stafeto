@@ -17,6 +17,14 @@
 //! 3. `boot-net-steps.img` under -icount: the first run again with the
 //!    service counting its steps. Every step stays under 0.9 of term B.
 //!
+//! The client has more roles than the first stage had: `b` (the registry of
+//! ports and the sessions) and `sN` (N places of the table filled, half of
+//! them sockets of connections that carry 64 KiB each way on the loopback).
+//! The images run `b` and `s` at the limit of the sockets (`SOCKETS_LIMIT`).
+//! `cargo xtask net-probe steps` is the measurement that chose the frames
+//! of a step and that limit: `s` at 8, 64 and 256 places with each batch of
+//! frames, and the rule of `netd::choose` over the longest steps.
+//!
 //! The echo to the gateway is the one ICMP slirp answers; the stack's own
 //! answer to a ping (feature `auto-icmp-echo-reply` of smoltcp) is
 //! invisible to this probe, so a test reads the manifest of the service for
@@ -67,6 +75,43 @@ pub const STEPS_PROGRAMS: [ImageProgram; 6] = [
     ("net-probe", "net-probe", CHILD_STACK_SIZE, &[]),
 ];
 
+/// An image of the measurement of the steps: `places` of `s` (8, 64 or 256)
+/// and a batch of `batch` frames a step. The lists of features live as long
+/// as the program.
+fn measured_programs(places: usize, batch: usize) -> &'static [ImageProgram] {
+    fn leak(features: Vec<&'static str>) -> &'static [&'static str] {
+        Box::leak(features.into_boxed_slice())
+    }
+    let init = leak(vec![
+        "table-net-probe",
+        match places {
+            8 => "net-sockets-8",
+            64 => "net-sockets-64",
+            _ => "net-sockets-256",
+        },
+    ]);
+    let mut netd = vec!["probe", "steps"];
+    match batch {
+        8 => netd.push("batch-8"),
+        4 => netd.push("batch-4"),
+        2 => netd.push("batch-2"),
+        _ => {}
+    }
+    Box::leak(Box::new([
+        ("init", "init", INIT_STACK_SIZE, init),
+        RAM,
+        RNG,
+        ENTROPY,
+        ("netd", "netd", NETD_STACK_SIZE, leak(netd)),
+        ("net-probe", "net-probe", CHILD_STACK_SIZE, &[]),
+    ]))
+}
+
+/// The name of an image of the measurement.
+fn measured_name(batch: usize, places: usize) -> &'static str {
+    Box::leak(format!("boot-net-steps-b{batch}-s{places}.img").into_boxed_str())
+}
+
 /// The service's line at each start: the transport, its line, the device's
 /// status as the driver found it (0: init stopped the device before the new
 /// instance) and the MAC.
@@ -80,6 +125,7 @@ const CONFIG_AFTER: &str =
     "net-probe: after restart config 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 mac 52:54:00:12:34:56";
 const PINGS: &str = "net-probe: ping 10.0.2.2 ok 300";
 const PINGS_AFTER: &str = "net-probe: after restart ping 10.0.2.2 ok 10";
+const BIND: &str = "net-probe: bind ok";
 const KILLED: &str = "net-probe: the service was killed";
 const OK: &str = "net-probe: ok";
 const ENDED: &str = "init: net-probe ended: exit code 0, not restarted";
@@ -96,6 +142,12 @@ const NET_TAG: &str = "14";
 const STEP_KINDS: [(usize, &str); 3] = [(21, "Config"), (62, "Ping"), (65, "the own steps")];
 /// The most one step of the service may take (spec 6): 0.9 of term B.
 pub const STEP_MAX: u64 = TERM_B * 9 / 10;
+/// The most the step of a CLONE of 64 descriptions may take: a portion, 0.8 of
+/// term B.
+pub const PORTION_MAX: u64 = TERM_B * 8 / 10;
+/// The kinds of steps: CLONE, and the service's own steps.
+const CLONE_KIND: usize = 19;
+const OWN_KIND: usize = 65;
 
 /// How the interface got its address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +155,33 @@ pub enum Mode {
     Dhcp,
     Static,
 }
+
+/// What the client ran besides `c` and `k`: whether `b`, and the places of
+/// `s` if it ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Roles {
+    pub bind: bool,
+    pub places: Option<usize>,
+}
+
+impl Roles {
+    /// The images of the ci run: the registry, and the table filled to the
+    /// limit.
+    pub const LIMIT: Roles = Roles {
+        bind: true,
+        places: Some(SOCKETS_LIMIT),
+    };
+
+    pub const fn places(places: usize) -> Roles {
+        Roles {
+            bind: false,
+            places: Some(places),
+        }
+    }
+}
+
+/// The sockets the service serves at once (the limit of its table).
+pub const SOCKETS_LIMIT: usize = netd::places::SOCKETS_LIMIT;
 
 /// The numbers after `max` and `median` of the line of round trips.
 fn rtts(line: &str) -> Option<(u64, u64)> {
@@ -114,23 +193,53 @@ fn rtts(line: &str) -> Option<(u64, u64)> {
     Some((max.parse().ok()?, median.parse().ok()?))
 }
 
-/// The `dhcp` counter of a line `net: frames rx R tx T dhcp D dropped X`.
-fn dhcp_count(line: &str) -> Option<u64> {
+/// The counters of a line `net: frames rx R tx T dhcp D dropped X martian M
+/// listen_short S`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frames {
+    dhcp: u64,
+    martian: u64,
+    listen_short: u64,
+}
+
+fn frames(line: &str) -> Option<Frames> {
     let rest = line.strip_prefix(FRAMES)?;
     let words: Vec<&str> = rest.split_whitespace().collect();
-    let [rx, "tx", tx, "dhcp", dhcp, "dropped", dropped] = words.as_slice() else {
+    let [
+        rx,
+        "tx",
+        tx,
+        "dhcp",
+        dhcp,
+        "dropped",
+        dropped,
+        "martian",
+        martian,
+        "listen_short",
+        listen_short,
+    ] = words.as_slice()
+    else {
         return None;
     };
     rx.parse::<u64>().ok()?;
     tx.parse::<u64>().ok()?;
     dropped.parse::<u64>().ok()?;
-    dhcp.parse().ok()
+    Some(Frames {
+        dhcp: dhcp.parse().ok()?,
+        martian: martian.parse().ok()?,
+        listen_short: listen_short.parse().ok()?,
+    })
+}
+
+/// The `dhcp` counter of a line of frames.
+fn dhcp_count(line: &str) -> Option<u64> {
+    frames(line).map(|f| f.dhcp)
 }
 
 /// Judges the lines of a run: the device started twice, the address came
 /// each time as `mode` says, the client printed every line once and did
 /// not fail, and the service was killed once and restarted by init.
-pub fn verdict(lines: &[String], mode: Mode) -> Result<(), String> {
+pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String> {
     let count = |marker: &str| lines.iter().filter(|l| l.as_str() == marker).count();
     if let Some(failed) = lines.iter().find(|l| l.starts_with("net-probe: failed")) {
         return Err(failed.clone());
@@ -139,7 +248,8 @@ pub fn verdict(lines: &[String], mode: Mode) -> Result<(), String> {
         Mode::Dhcp => (LEASE, "net: static"),
         Mode::Static => (STATIC, "net: lease"),
     };
-    let once = [
+    let sockets = roles.places.map(|n| format!("net-probe: sockets {n} ok"));
+    let mut once = vec![
         (DEVICE_LINE, 2),
         (addressed, 2),
         (CONFIG, 1),
@@ -150,6 +260,12 @@ pub fn verdict(lines: &[String], mode: Mode) -> Result<(), String> {
         (OK, 1),
         (ENDED, 1),
     ];
+    if roles.bind {
+        once.push((BIND, 1));
+    }
+    if let Some(sockets) = &sockets {
+        once.push((sockets.as_str(), 1));
+    }
     for (marker, wanted) in once {
         if count(marker) != wanted {
             let found: Vec<_> = lines
@@ -170,6 +286,15 @@ pub fn verdict(lines: &[String], mode: Mode) -> Result<(), String> {
         return Err(format!(
             "{line:?} in a run that gets its address by {mode:?}"
         ));
+    }
+    let counters: Vec<Frames> = lines.iter().filter_map(|l| frames(l)).collect();
+    // A frame of 127.0.0.0/8 on the wire is a fault of the stack; a queue of
+    // `listen` that `accept` could not refill is a fault of the table.
+    if let Some(f) = counters
+        .iter()
+        .find(|f| f.martian != 0 || f.listen_short != 0)
+    {
+        return Err(format!("the service counted {f:?}"));
     }
     let dhcp: Vec<u64> = lines.iter().filter_map(|l| dhcp_count(l)).collect();
     if dhcp.is_empty() {
@@ -200,7 +325,7 @@ pub fn verdict(lines: &[String], mode: Mode) -> Result<(), String> {
 }
 
 /// The steps of the service: every kind came and every row stays under
-/// STEP_MAX.
+/// STEP_MAX, and a CLONE (kind 19) under PORTION_MAX when the run made one.
 pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = longest_steps(lines, NET_TAG);
     for (kind, name) in STEP_KINDS {
@@ -211,6 +336,11 @@ pub fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String>
     if let Some(row) = rows.iter().find(|r| r.1 > STEP_MAX) {
         return Err(format!(
             "the network service: a step past 0.9 of term B ({STEP_MAX}): {row:?}"
+        ));
+    }
+    if let Some(row) = rows.iter().find(|r| r.0 == CLONE_KIND && r.1 > PORTION_MAX) {
+        return Err(format!(
+            "the network service: CLONE past 0.8 of term B ({PORTION_MAX}): {row:?}"
         ));
     }
     Ok(rows)
@@ -224,6 +354,7 @@ fn run(
     name: &'static str,
     programs: &'static [ImageProgram],
     mode: Mode,
+    roles: Roles,
 ) -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
@@ -247,7 +378,7 @@ fn run(
         });
     let outcome = run.stop();
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
-    verdict(&outcome.lines, mode)
+    verdict(&outcome.lines, mode, roles)
         .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     let rtt = outcome.lines.iter().find_map(|l| rtts(l));
     println!(
@@ -262,33 +393,113 @@ fn run(
     Ok(())
 }
 
-/// The run under -icount: the service's steps are read from its lines.
-fn steps(machine: &qemu::Machine) -> Result<(), String> {
+/// One run under -icount of an image of `programs`: the longest steps.
+fn steps_run(
+    machine: &qemu::Machine,
+    name: &'static str,
+    programs: &'static [ImageProgram],
+    roles: Roles,
+) -> Result<Vec<(usize, u64, u64)>, String> {
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-net-steps.img", &STEPS_PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
     cmd.args(qemu::ICOUNT);
     let output = run_until(
         cmd,
-        crate::BOOT_TIMEOUT * 4,
+        crate::BOOT_TIMEOUT * 20,
         Some(ENDED_PREFIX),
         &kernel.elf,
     )?;
-    verdict(&output.lines, Mode::Dhcp)
+    verdict(&output.lines, Mode::Dhcp, roles)
         .map_err(|e| format!("net-probe under -icount on {}: {e}", machine.name))?;
-    let rows = steps_verdict(&output.lines)?;
     crate::check_waits(&output.lines, &[NET_TAG], "net-probe")?;
+    Ok(longest_steps(&output.lines, NET_TAG))
+}
+
+fn print_rows(machine: &qemu::Machine, what: &str, rows: &[(usize, u64, u64)]) {
     let text: Vec<_> = rows
         .iter()
-        .map(|(kind, ticks, detail)| format!("kind {kind} {ticks} (frames {detail})"))
+        .map(|(kind, ticks, detail)| format!("kind {kind} {ticks} (detail {detail})"))
         .collect();
     println!(
-        "net-probe on {}: the longest steps under -icount, ticks (0.9 of term B {STEP_MAX}): {}",
+        "net-probe on {}: the longest steps under -icount, {what}, ticks (0.9 of term B {STEP_MAX}): {}",
         machine.name,
         text.join(", ")
     );
+}
+
+/// The run under -icount at the limit of the sockets: the service's steps
+/// are read from its lines.
+fn steps(machine: &qemu::Machine) -> Result<(), String> {
+    let rows = steps_run(machine, "boot-net-steps.img", &STEPS_PROGRAMS, Roles::LIMIT)?;
+    let rows = steps_verdict_rows(&rows)?;
+    print_rows(machine, &format!("{SOCKETS_LIMIT} sockets"), &rows);
+    Ok(())
+}
+
+/// The check of `steps_verdict` over rows already read.
+fn steps_verdict_rows(rows: &[(usize, u64, u64)]) -> Result<Vec<(usize, u64, u64)>, String> {
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(kind, ticks, detail)| {
+            format!("service step: {NET_TAG} kind {kind} {ticks} ticks detail {detail}")
+        })
+        .collect();
+    steps_verdict(&lines)
+}
+
+/// The longest step of kind `kind` in `rows`: ticks and detail.
+fn step_of(rows: &[(usize, u64, u64)], kind: usize) -> Option<(u64, u64)> {
+    rows.iter().find(|r| r.0 == kind).map(|r| (r.1, r.2))
+}
+
+/// `cargo xtask net-probe steps`: the measurement that chooses the batch of
+/// frames of a step and the limit of the sockets (spec 6, 6; the rule is
+/// `netd::choose`). Each batch is measured with `s` at 8 places, the first
+/// that stays within the bound is the batch, and with it `s` at 64 and 256
+/// places gives the line from which the limit comes.
+pub fn series(machine: &qemu::Machine) -> Result<(), String> {
+    use netd::choose::{self, Point};
+    let mut at8 = Vec::new();
+    for batch in choose::BATCHES {
+        let programs = measured_programs(8, batch);
+        let rows = steps_run(machine, measured_name(batch, 8), programs, Roles::places(8))?;
+        print_rows(machine, &format!("batch {batch}, 8 places"), &rows);
+        at8.push((batch, rows));
+    }
+    let own = |batch: usize| {
+        at8.iter()
+            .find(|(b, _)| *b == batch)
+            .and_then(|(_, rows)| step_of(rows, OWN_KIND).map(|(ticks, _)| ticks))
+    };
+    let batch = choose::batch(own).map_err(|stop| format!("no batch: {stop:?}"))?;
+    println!(
+        "net-probe: the batch is {batch} frames (the longest own step at 8 sockets within {})",
+        choose::BOUND
+    );
+    let mut points = vec![Point {
+        sockets: 8,
+        ticks: own(batch).unwrap_or(0),
+    }];
+    for places in [64, 256] {
+        let programs = measured_programs(places, batch);
+        let rows = steps_run(
+            machine,
+            measured_name(batch, places),
+            programs,
+            Roles::places(places),
+        )?;
+        print_rows(machine, &format!("batch {batch}, {places} places"), &rows);
+        points.push(Point {
+            sockets: places,
+            ticks: step_of(&rows, OWN_KIND).map_or(0, |(ticks, _)| ticks),
+        });
+    }
+    let limit = choose::limit(&[points[0], points[1], points[2]])
+        .map_err(|stop| format!("no limit: {stop:?}"))?;
+    println!("net-probe: the limit of the sockets is {limit} (the line through {points:?})");
     Ok(())
 }
 
@@ -296,12 +507,19 @@ fn steps(machine: &qemu::Machine) -> Result<(), String> {
 /// The steps run needs the emulation's own clock, so it runs on QEMU's
 /// TCG only.
 pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
-    run(machine, "boot-net-probe.img", &PROGRAMS, Mode::Dhcp)?;
+    run(
+        machine,
+        "boot-net-probe.img",
+        &PROGRAMS,
+        Mode::Dhcp,
+        Roles::LIMIT,
+    )?;
     run(
         machine,
         "boot-net-probe-static.img",
         &PROGRAMS,
         Mode::Static,
+        Roles::LIMIT,
     )?;
     if !machine.is_hvf() {
         steps(machine)?;
@@ -310,8 +528,12 @@ pub fn probe(machine: &qemu::Machine) -> Result<(), String> {
 }
 
 /// `cargo xtask net-probe [MACHINE]`: the machine is `tcg` (the default),
-/// `hvf` or the name of one of qemu::MACHINES.
+/// `hvf` or the name of one of qemu::MACHINES; `steps` is the measurement.
 pub fn command(args: &[String]) -> Result<(), String> {
+    let (steps, args) = match args.split_first() {
+        Some((first, rest)) if first == "steps" => (true, rest),
+        _ => (false, args),
+    };
     let machine = match args {
         [] => &qemu::VIRT,
         [name] => match name.as_str() {
@@ -319,17 +541,73 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "tcg" => &qemu::VIRT,
             other => qemu::machine(Some(&other.to_owned()))?,
         },
-        _ => return Err("usage: cargo xtask net-probe [hvf|tcg|MACHINE]".to_owned()),
+        _ => return Err("usage: cargo xtask net-probe [steps] [hvf|tcg|MACHINE]".to_owned()),
     };
     if machine.is_hvf() {
         crate::hvf_host().map_err(|why| format!("net-probe on {}: {why}", machine.name))?;
     }
-    probe(machine)
+    if steps {
+        if machine.is_hvf() {
+            return Err(
+                "the measurement of the steps needs the emulation's clock (tcg)".to_owned(),
+            );
+        }
+        return series(machine);
+    }
+    probe(machine)?;
+    if machine.is_hvf() {
+        rates(machine)?;
+    }
+    Ok(())
+}
+
+/// The rates of the loopback through the service on the machine (role `e`).
+fn rates(machine: &qemu::Machine) -> Result<(), String> {
+    static ECHO: [ImageProgram; 6] = [
+        (
+            "init",
+            "init",
+            INIT_STACK_SIZE,
+            &["table-net-probe", "net-echo"],
+        ),
+        RAM,
+        RNG,
+        ENTROPY,
+        ("netd", "netd", NETD_STACK_SIZE, &["probe"]),
+        ("net-probe", "net-probe", CHILD_STACK_SIZE, &[]),
+    ];
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-net-echo.img", &ECHO, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::net(&[]));
+    let mut run = Run::start(cmd, Input::Null)?;
+    let within = Duration::from_secs(90);
+    let result = run.expect_line(ENDED, |l| l.starts_with(ENDED_PREFIX), within);
+    let outcome = run.stop();
+    result.map_err(|e| format!("net-probe echo on {}: {e}", machine.name))?;
+    let echo: Vec<&String> = outcome
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("net-probe: echo "))
+        .collect();
+    if echo.len() != 2 {
+        return Err(format!(
+            "net-probe echo: {} lines of rates, 2 expected",
+            echo.len()
+        ));
+    }
+    for line in echo {
+        println!("net-probe on {}: {line}", machine.name);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COUNTERS: &str = "martian 0 listen_short 0";
 
     fn good_run(mode: Mode) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
@@ -338,13 +616,16 @@ mod tests {
             Mode::Static => STATIC,
         };
         let dhcp = if mode == Mode::Dhcp { 3 } else { 0 };
+        let places = SOCKETS_LIMIT;
         for round in 0..2 {
             lines.push(DEVICE_LINE.to_owned());
             lines.push(address.to_owned());
             if round == 0 {
                 lines.push(CONFIG.to_owned());
-                lines.push(format!("{FRAMES}12 tx 9 dhcp {dhcp} dropped 0"));
+                lines.push(format!("{FRAMES}12 tx 9 dhcp {dhcp} dropped 0 {COUNTERS}"));
                 lines.push(PINGS.to_owned());
+                lines.push(BIND.to_owned());
+                lines.push(format!("net-probe: sockets {places} ok"));
                 lines.push(format!("{RTT}900 us median 300 us"));
                 lines.push(KILLED.to_owned());
                 lines.push(
@@ -361,8 +642,14 @@ mod tests {
 
     #[test]
     fn a_run_with_every_line_passes() {
-        assert_eq!(verdict(&good_run(Mode::Dhcp), Mode::Dhcp), Ok(()));
-        assert_eq!(verdict(&good_run(Mode::Static), Mode::Static), Ok(()));
+        assert_eq!(
+            verdict(&good_run(Mode::Dhcp), Mode::Dhcp, Roles::LIMIT),
+            Ok(())
+        );
+        assert_eq!(
+            verdict(&good_run(Mode::Static), Mode::Static, Roles::LIMIT),
+            Ok(())
+        );
     }
 
     #[test]
@@ -376,12 +663,15 @@ mod tests {
             CONFIG_AFTER,
             PINGS_AFTER,
             OK,
+            BIND,
         ] {
             let mut lines = good_run(Mode::Dhcp);
             let at = lines.iter().rposition(|l| l == marker).unwrap();
             lines.remove(at);
             assert!(
-                verdict(&lines, Mode::Dhcp).unwrap_err().contains(marker),
+                verdict(&lines, Mode::Dhcp, Roles::LIMIT)
+                    .unwrap_err()
+                    .contains(marker),
                 "{marker}"
             );
         }
@@ -391,26 +681,34 @@ mod tests {
     fn a_failure_of_the_client_is_the_verdict() {
         let mut lines = good_run(Mode::Dhcp);
         lines.push("net-probe: failed: a PING of the gateway failed".to_owned());
-        assert!(verdict(&lines, Mode::Dhcp).unwrap_err().contains("PING"));
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::LIMIT)
+                .unwrap_err()
+                .contains("PING")
+        );
     }
 
     #[test]
     fn dhcp_must_send_frames_and_a_static_run_none() {
         let mut lines = good_run(Mode::Dhcp);
         for l in lines.iter_mut().filter(|l| l.starts_with(FRAMES)) {
-            *l = format!("{FRAMES}12 tx 9 dhcp 1 dropped 0");
+            *l = format!("{FRAMES}12 tx 9 dhcp 1 dropped 0 {COUNTERS}");
         }
-        assert!(verdict(&lines, Mode::Dhcp).unwrap_err().contains("DHCP"));
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::LIMIT)
+                .unwrap_err()
+                .contains("DHCP")
+        );
         // The line of the other way to get an address is a fault.
         let mut lines = good_run(Mode::Static);
         lines.push(LEASE.to_owned());
-        assert!(verdict(&lines, Mode::Static).is_err());
+        assert!(verdict(&lines, Mode::Static, Roles::LIMIT).is_err());
         let mut lines = good_run(Mode::Static);
         for l in lines.iter_mut().filter(|l| l.starts_with(FRAMES)) {
-            *l = format!("{FRAMES}12 tx 9 dhcp 2 dropped 0");
+            *l = format!("{FRAMES}12 tx 9 dhcp 2 dropped 0 {COUNTERS}");
         }
         assert!(
-            verdict(&lines, Mode::Static)
+            verdict(&lines, Mode::Static, Roles::LIMIT)
                 .unwrap_err()
                 .contains("static")
         );
@@ -420,7 +718,11 @@ mod tests {
     fn the_service_must_restart_once() {
         let mut lines = good_run(Mode::Dhcp);
         lines.retain(|l| !l.starts_with(SERVICE_ENDED));
-        assert!(verdict(&lines, Mode::Dhcp).unwrap_err().contains("restart"));
+        assert!(
+            verdict(&lines, Mode::Dhcp, Roles::LIMIT)
+                .unwrap_err()
+                .contains("restart")
+        );
     }
 
     #[test]
@@ -431,7 +733,7 @@ mod tests {
         );
         assert_eq!(rtts("net-probe: ping rtt max x us median 300 us"), None);
         assert_eq!(
-            dhcp_count("net: frames rx 12 tx 9 dhcp 3 dropped 1"),
+            dhcp_count("net: frames rx 12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0"),
             Some(3)
         );
         assert_eq!(dhcp_count("net: frames rx 12 tx 9 dropped 1"), None);
@@ -497,7 +799,13 @@ mod tests {
     #[test]
     fn the_probe_does_not_build_the_service() {
         let output = std::process::Command::new(env!("CARGO"))
-            .args(["tree", "-p", "net-probe", "--target", "aarch64-unknown-none"])
+            .args([
+                "tree",
+                "-p",
+                "net-probe",
+                "--target",
+                "aarch64-unknown-none",
+            ])
             .current_dir(crate::root())
             .output()
             .expect("cargo tree");

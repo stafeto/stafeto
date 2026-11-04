@@ -44,6 +44,8 @@ virtio-mmio = { path = "../../lib/virtio-mmio" }
 rt = { path = "../../lib/rt" }
 posix-fs = { path = "../../lib/posix-fs" }
 proto-fs = { path = "../../proto/fs" }
+proto-pipe = { path = "../../proto/pipe" }
+proto-process = { path = "../../proto/process" }
 posix-random = { path = "../../lib/posix-random" }
 # `alloc` as the other drivers take it: one build of the boot image unifies
 # the crate's features, and the service never allocates.

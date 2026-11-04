@@ -85,6 +85,13 @@ table-gpu = []
 # (xtask net-probe).
 table-net = []
 table-net-probe = []
+# The roles of the probe's client: `s` at 8, 64 or 256 places of the table
+# (the measurement of the steps), or the rates of the loopback; with none the
+# client runs the registry and the table filled to the sockets limit.
+net-sockets-8 = []
+net-sockets-64 = []
+net-sockets-256 = []
+net-echo = []
 # The probe of the input service (xtask input-probe).
 table-input = []
 # The C probe of getentropy and getrandom (xtask posix-random).

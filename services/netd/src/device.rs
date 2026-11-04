@@ -14,9 +14,10 @@
 //! doorbell and `rt::dma::rmb` after the used index is seen.
 
 use crate::dma::{Host, net_at};
-use netd::frames::{self, BUFFER_LEN, HDR_LEN, MAX_FRAME};
+use core::cell::{Cell, RefCell};
+use netd::frames::{self, BUFFER_LEN, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::is_dhcp_client_frame;
-use netd::ring::{Budget, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
+use netd::ring::{Budget, LOOP_FRAMES, LoopBook, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
@@ -31,6 +32,8 @@ pub struct Counters {
     pub tx: u64,
     pub dhcp: u64,
     pub dropped: u64,
+    /// Frames of 127.0.0.0/8 the stack would have sent to the device.
+    pub martian: u64,
 }
 
 /// The device broke the protocol or a ring broke its books: the service
@@ -63,6 +66,8 @@ pub struct RxRing {
     pub dirty: bool,
     dropped: u64,
     frames: u64,
+    /// Frames of 127.0.0.0/8 that came from the device.
+    martian: u64,
 }
 
 impl RxRing {
@@ -74,6 +79,7 @@ impl RxRing {
             dirty: false,
             dropped: 0,
             frames: 0,
+            martian: 0,
         }
     }
 
@@ -108,8 +114,8 @@ impl RxRing {
     }
 
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
-    pub fn counters(&self) -> (u64, u64) {
-        (self.frames, self.dropped)
+    pub fn counters(&self) -> (u64, u64, u64) {
+        (self.frames, self.dropped, self.martian)
     }
 
     /// Takes the next used buffer: its number and the length of its frame,
@@ -134,6 +140,12 @@ impl RxRing {
             };
             let length = frames::rx_frame(slice, used as usize).map(<[u8]>::len);
             match length {
+                // A frame of the loopback network on the wire never reaches
+                // the stack (RFC 1122, 3.2.1.3).
+                Some(len) if frames::martian(&slice[HDR_LEN..HDR_LEN + len]) => {
+                    self.martian += 1;
+                    self.give(n);
+                }
                 Some(len) => {
                     self.frames += 1;
                     return Some((n, len));
@@ -211,23 +223,99 @@ impl TxRing {
     }
 }
 
-/// The two rings as the stack's device.
+/// The frames of the loopback (spec 6, 3.3): what the stack sends to its own
+/// MAC waits here for the next reception. Both tokens of a pair reach the
+/// ring, so its parts have interior mutability; the book keeps the place of
+/// the frame being read apart from the one a reply goes to.
+pub struct LoopRing {
+    book: RefCell<LoopBook>,
+    frames: *mut [u8; MAX_FRAME],
+    lengths: [Cell<usize>; LOOP_FRAMES],
+    /// The frames that found no place.
+    dropped: Cell<u64>,
+}
+
+impl LoopRing {
+    /// A ring over `frames`, the table of LOOP_FRAMES frames.
+    pub fn new(frames: &'static mut [[u8; MAX_FRAME]; LOOP_FRAMES]) -> LoopRing {
+        LoopRing {
+            book: RefCell::new(LoopBook::new()),
+            frames: frames.as_mut_ptr(),
+            lengths: core::array::from_fn(|_| Cell::new(0)),
+            dropped: Cell::new(0),
+        }
+    }
+
+    pub fn waiting(&self) -> usize {
+        self.book.borrow().waiting()
+    }
+
+    /// Keeps `frame`; false (counted) when the ring is full.
+    fn push(&self, frame: &[u8]) -> bool {
+        let Some(place) = self.book.borrow_mut().push() else {
+            self.dropped.set(self.dropped.get() + 1);
+            return false;
+        };
+        // SAFETY: the place is free (the book gave it) and no token holds it.
+        let slot = unsafe { &mut *self.frames.add(place) };
+        slot[..frame.len()].copy_from_slice(frame);
+        self.lengths[place].set(frame.len());
+        true
+    }
+
+    /// The oldest frame: its place and length.
+    fn pop(&self) -> Option<(usize, usize)> {
+        let place = self.book.borrow_mut().pop()?;
+        Some((place, self.lengths[place].get()))
+    }
+}
+
+/// The two rings as the stack's device, and the loopback beside them.
 pub struct NetDevice {
     pub rx: RxRing,
     pub tx: TxRing,
+    pub looped: LoopRing,
+    pub mac: [u8; 6],
+    /// The addresses of the interface: the frames to them stay in the loop.
+    own: [[u8; 4]; 2],
+    own_len: usize,
 }
 
 impl NetDevice {
+    pub fn new(rx: RxRing, tx: TxRing, looped: LoopRing, mac: [u8; 6]) -> NetDevice {
+        NetDevice {
+            rx,
+            tx,
+            looped,
+            mac,
+            own: [[0; 4]; 2],
+            own_len: 0,
+        }
+    }
+
+    /// The addresses of the interface, for the route of the frames.
+    pub fn set_addresses(&mut self, own: &[[u8; 4]]) {
+        self.own_len = own.len().min(self.own.len());
+        self.own[..self.own_len].copy_from_slice(&own[..self.own_len]);
+    }
+
     /// The frames the step received and sent, for the line of steps.
     pub fn step_frames(&self) -> usize {
         self.rx.received() + self.tx.sent()
     }
 }
 
-pub struct RxToken<'a> {
-    ring: &'a mut RxRing,
-    buffer: u16,
-    length: usize,
+pub enum RxToken<'a> {
+    Wire {
+        ring: &'a mut RxRing,
+        buffer: u16,
+        length: usize,
+    },
+    Loop {
+        ring: &'a LoopRing,
+        place: usize,
+        length: usize,
+    },
 }
 
 impl phy::RxToken for RxToken<'_> {
@@ -235,23 +323,46 @@ impl phy::RxToken for RxToken<'_> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // SAFETY: the buffer was popped by `pop` and goes back only when
-        // the token drops, after this borrow ends.
-        let slice = unsafe { buffer(self.buffer) };
-        f(&slice[HDR_LEN..HDR_LEN + self.length])
+        match &self {
+            RxToken::Wire {
+                buffer: n, length, ..
+            } => {
+                // SAFETY: the buffer was popped by `pop` and goes back only
+                // when the token drops, after this borrow ends.
+                let slice = unsafe { buffer(*n) };
+                f(&slice[HDR_LEN..HDR_LEN + length])
+            }
+            RxToken::Loop {
+                ring,
+                place,
+                length,
+            } => {
+                // SAFETY: the book keeps the place from new frames until
+                // the token drops.
+                let slot = unsafe { &*ring.frames.add(*place) };
+                f(&slot[..*length])
+            }
+        }
     }
 }
 
 impl Drop for RxToken<'_> {
-    /// The buffer goes back to the queue as soon as the stack is done with
-    /// the frame, whether or not it read it.
+    /// The buffer goes back to the queue (the place back to the loop) as
+    /// soon as the stack is done with the frame, whether or not it read it.
     fn drop(&mut self) {
-        self.ring.give(self.buffer);
+        match self {
+            RxToken::Wire { ring, buffer, .. } => ring.give(*buffer),
+            RxToken::Loop { ring, .. } => ring.book.borrow_mut().done(),
+        }
     }
 }
 
 pub struct TxToken<'a> {
     ring: &'a mut TxRing,
+    looped: &'a LoopRing,
+    mac: [u8; 6],
+    own: [[u8; 4]; 2],
+    own_len: usize,
 }
 
 impl phy::TxToken for TxToken<'_> {
@@ -273,6 +384,20 @@ impl phy::TxToken for TxToken<'_> {
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer(n) };
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
+        let frame = &slice[HDR_LEN..HDR_LEN + len];
+        if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
+            // The frame stays inside: a copy for the next reception.
+            if !self.looped.push(frame) {
+                ring.counters.dropped += 1;
+            }
+            ring.book.release(n);
+            return result;
+        }
+        if frames::martian(frame) {
+            ring.book.release(n);
+            ring.counters.martian += 1;
+            return result;
+        }
         let Some(total) = frames::tx_prepare(slice, len) else {
             ring.book.release(n);
             ring.counters.dropped += 1;
@@ -312,23 +437,48 @@ impl phy::Device for NetDevice {
         if self.rx.budget.rx_left() == 0 {
             return None;
         }
-        let (buffer, length) = self.rx.pop()?;
+        // The frames the stack sent itself come first, then those of the
+        // wire.
+        let looped = self.looped.pop();
+        let wire = match looped {
+            Some(_) => None,
+            None => Some(self.rx.pop()?),
+        };
         self.rx.budget.take_rx();
-        Some((
-            RxToken {
+        let tx = TxToken {
+            ring: &mut self.tx,
+            looped: &self.looped,
+            mac: self.mac,
+            own: self.own,
+            own_len: self.own_len,
+        };
+        let rx = match (looped, wire) {
+            (Some((place, length)), _) => RxToken::Loop {
+                ring: &self.looped,
+                place,
+                length,
+            },
+            (None, Some((buffer, length))) => RxToken::Wire {
                 ring: &mut self.rx,
                 buffer,
                 length,
             },
-            TxToken { ring: &mut self.tx },
-        ))
+            (None, None) => return None,
+        };
+        Some((rx, tx))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_>> {
         if self.tx.budget.tx_left() == 0 || self.tx.book.free() == 0 {
             return None;
         }
-        Some(TxToken { ring: &mut self.tx })
+        Some(TxToken {
+            ring: &mut self.tx,
+            looped: &self.looped,
+            mac: self.mac,
+            own: self.own,
+            own_len: self.own_len,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

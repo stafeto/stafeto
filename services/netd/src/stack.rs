@@ -13,19 +13,24 @@ use crate::device::NetDevice;
 use netd::config::Cidr;
 use netd::lines::Summary;
 use smoltcp::iface::{
-    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet, SocketStorage,
+    Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet, SocketStorage,
 };
-use smoltcp::socket::{dhcpv4, icmp};
+use smoltcp::socket::{dhcpv4, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr,
 };
 
+/// The sockets of the set: the descriptions' (SOCKETS_MAX, members of a
+/// queue of `listen` among them), the ICMP socket of PING and the DHCP
+/// client.
+pub const SOCKET_SLOTS: usize = netd::places::SOCKETS_MAX + 2;
+
 /// The storage of the sockets and the ICMP socket's buffers, which the
-/// stack borrows; the caller keeps it alive.
+/// stack borrows; it lives in the service's `.bss`.
 pub struct Storage<'a> {
-    sockets: [SocketStorage<'a>; 4],
+    sockets: [SocketStorage<'a>; SOCKET_SLOTS],
     rx_meta: [icmp::PacketMetadata; 4],
     rx_data: [u8; 1024],
     tx_meta: [icmp::PacketMetadata; 4],
@@ -33,13 +38,21 @@ pub struct Storage<'a> {
 }
 
 impl Storage<'_> {
-    pub const fn new() -> Self {
-        Storage {
-            sockets: [SocketStorage::EMPTY; 4],
-            rx_meta: [icmp::PacketMetadata::EMPTY; 4],
-            rx_data: [0; 1024],
-            tx_meta: [icmp::PacketMetadata::EMPTY; 4],
-            tx_data: [0; 1024],
+    /// The storage as it starts, in place in zeroed memory (the empty
+    /// socket is not all zeros, and a static of it would go to `.data`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            let sockets = addr_of_mut!((*at).sockets).cast::<SocketStorage<'_>>();
+            for i in 0..SOCKET_SLOTS {
+                sockets.add(i).write(SocketStorage::EMPTY);
+            }
+            rt::bss::fill(addr_of_mut!((*at).rx_meta), icmp::PacketMetadata::EMPTY);
+            rt::bss::fill(addr_of_mut!((*at).tx_meta), icmp::PacketMetadata::EMPTY);
         }
     }
 }
@@ -109,6 +122,19 @@ pub fn instant(now_ns: u64) -> Instant {
     Instant::from_micros((now_ns / 1000) as i64)
 }
 
+/// 127.0.0.1/8, the interface's second address (RFC 1122, 3.2.1.3): the
+/// first is the external one, which the stack takes as the source of the
+/// frames it sends to a gateway.
+const LOOPBACK: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
+
+/// The endpoint a socket listens or binds on: the wildcard address is none.
+pub fn listen_endpoint(address: [u8; 4], port: u16) -> smoltcp::wire::IpListenEndpoint {
+    smoltcp::wire::IpListenEndpoint {
+        addr: (address != [0; 4]).then(|| IpAddress::Ipv4(ipv4(address))),
+        port,
+    }
+}
+
 fn ipv4(octets: [u8; 4]) -> Ipv4Address {
     Ipv4Address::from(octets)
 }
@@ -124,7 +150,10 @@ impl<'a> Stack<'a> {
     ) -> Stack<'a> {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = seed;
-        let iface = Interface::new(config, device, instant(now_ns));
+        let mut iface = Interface::new(config, device, instant(now_ns));
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
+        });
         let Storage {
             sockets,
             rx_meta,
@@ -169,6 +198,7 @@ impl<'a> Stack<'a> {
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
             let _ = addrs.push(IpCidr::Ipv4(cidr));
+            let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
         });
         let routes = self.iface.routes_mut();
         routes.remove_default_ipv4_route();
@@ -179,7 +209,10 @@ impl<'a> Stack<'a> {
     }
 
     fn remove(&mut self) {
-        self.iface.update_ip_addrs(|addrs| addrs.clear());
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.clear();
+            let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
+        });
         self.iface.routes_mut().remove_default_ipv4_route();
         self.lease = None;
     }
@@ -200,19 +233,75 @@ impl<'a> Stack<'a> {
         }
     }
 
-    /// Sends what the stack has until it has nothing or the share of
-    /// sending is spent.
+    /// Sends what the stack has, in one pass over the sockets: each gives
+    /// at most one frame, and the device gives no token once the share of
+    /// sending is spent. A pass visits every socket, so a loop of calls would
+    /// cost as many passes as it has rounds.
     pub fn egress(&mut self, now_ns: u64, device: &mut NetDevice) {
         let now = instant(now_ns);
         self.iface.poll_maintenance(now);
-        // `transmit` gives no token once the share is spent, which ends the
-        // stack's pass; the count bounds the loop all the same.
-        for _ in 0..=netd::ring::STEP_TX {
-            match self.iface.poll_egress(now, device, &mut self.sockets) {
-                PollResult::None => break,
-                PollResult::SocketStateChanged => {}
+        let _ = self.iface.poll_egress(now, device, &mut self.sockets);
+    }
+
+    /// The addresses of the interface, for the route of its frames.
+    pub fn addresses(&self) -> ([[u8; 4]; 2], usize) {
+        let mut own = [[0; 4]; 2];
+        let mut n = 0;
+        for cidr in self.iface.ip_addrs() {
+            if let IpCidr::Ipv4(c) = cidr
+                && n < own.len()
+            {
+                own[n] = c.address().octets();
+                n += 1;
             }
         }
+        (own, n)
+    }
+
+    /// A TCP socket over the two buffers.
+    pub fn tcp_add(&mut self, rx: &'a mut [u8], tx: &'a mut [u8]) -> SocketHandle {
+        self.sockets.add(tcp::Socket::new(
+            tcp::SocketBuffer::new(rx),
+            tcp::SocketBuffer::new(tx),
+        ))
+    }
+
+    /// A UDP socket over the buffers of the two directions.
+    pub fn udp_add(
+        &mut self,
+        rx: udp::PacketBuffer<'a>,
+        tx: udp::PacketBuffer<'a>,
+    ) -> SocketHandle {
+        self.sockets.add(udp::Socket::new(rx, tx))
+    }
+
+    pub fn drop_socket(&mut self, handle: SocketHandle) {
+        let _ = self.sockets.remove(handle);
+    }
+
+    pub fn tcp(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'a> {
+        self.sockets.get_mut::<tcp::Socket>(handle)
+    }
+
+    pub fn udp(&mut self, handle: SocketHandle) -> &mut udp::Socket<'a> {
+        self.sockets.get_mut::<udp::Socket>(handle)
+    }
+
+    /// `connect` of a TCP socket: the interface's context chooses the route.
+    pub fn tcp_connect(
+        &mut self,
+        handle: SocketHandle,
+        remote: ([u8; 4], u16),
+        local: ([u8; 4], u16),
+    ) -> Result<(), tcp::ConnectError> {
+        let remote = smoltcp::wire::IpEndpoint::new(IpAddress::Ipv4(ipv4(remote.0)), remote.1);
+        let addr = (local.0 != [0; 4]).then(|| IpAddress::Ipv4(ipv4(local.0)));
+        let local = smoltcp::wire::IpListenEndpoint {
+            addr,
+            port: local.1,
+        };
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.connect(self.iface.context(), remote, local)
     }
 
     /// The deadline of the stack's next work, in nanoseconds of the

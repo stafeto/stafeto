@@ -13,6 +13,15 @@ use proto_net::sockets::{description, generation, slot};
 /// queue of `listen` takes one).
 pub const SOCKETS_MAX: usize = 256;
 
+/// The sockets the service serves at once, chosen by the measurement of the
+/// stage (reports/2026-11-04-net-p1a): the longest step of the loop stays
+/// within the bound at this many. The build with the feature `probe` serves
+/// SOCKETS_MAX for the measurement itself.
+#[cfg(feature = "probe")]
+pub const SOCKETS_LIMIT: usize = SOCKETS_MAX;
+#[cfg(not(feature = "probe"))]
+pub const SOCKETS_LIMIT: usize = 128;
+
 /// The generations have 20 bits.
 const GENERATION_MASK: u32 = (1 << (32 - proto_net::sockets::SLOT_BITS)) - 1;
 
