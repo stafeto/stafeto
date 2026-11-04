@@ -23,7 +23,7 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION" make python3 git curl \
-          ca-certificates bzip2 xz-utils patch ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
+          ca-certificates bzip2 xz-utils patch gawk ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
         echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
         "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version | head -1
 

@@ -76,6 +76,18 @@ them for the licence notes of the image.
   of the sources (`DOOM-LICENSE`, `DOOM-SOURCE`, `FREEDOOM-LICENSE`,
   `FREEDOOM-SOURCE`), and the check of the image compares the WAD with the
   one the build script unpacked.
+- F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
+  space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
+  RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an add-on that installs only its
+  settings, `/etc/fstack.ini`. `tools/build-fstack.py` builds its library
+  `libfstack.a` from the pinned commit with `ports/f-stack` (the patch and
+  the host layer of stafeto in place of DPDK) and joins it with the probe
+  of `tests/fstack-probe`; `cargo xtask fstack-probe` runs the stack on its
+  own loopback in the image `boot-fstack-probe.img`, which carries
+  F-Stack's licence and the acknowledgements its four-clause files and its
+  MD5 ask for (`FSTACK-LICENSE`, `FSTACK-SOURCE`). The installed headers are
+  those of the build without thread-local storage: `ff_api.h` declares
+  `pcurthread` a plain variable.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 
