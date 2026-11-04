@@ -18,6 +18,7 @@ use crate::net::{
 };
 use crate::stack::{Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
+use netd::births;
 use netd::demux::Key;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
@@ -25,7 +26,7 @@ use proto_net::sockets::{self, Request as Call, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
 use proto_wire::{Status, Writer, long, watch};
 use rt::handle::{Channel, Handle, Outgoing};
-use rt::service::{Answer, Request, Session};
+use rt::service::{Answer, LongSession, Request, Session};
 use rt::sys;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Duration;
@@ -104,7 +105,7 @@ impl Net {
             return;
         }
         s.data.root = label;
-        if let Some((_, held, root)) = self
+        if let Some((_, held, root, _)) = self
             .clones
             .place_of(label)
             .and_then(|place| self.births[place].take_if(|b| b.0 == label))
@@ -123,28 +124,24 @@ impl Net {
             .place_of(label)
             .and_then(|place| self.births[place].take_if(|b| b.0 == label));
         self.clones.gone(label);
-        birth.map(|(_, held, _)| held)
+        birth.map(|(_, held, _, _)| held)
     }
 
-    /// The operations of a session go (it went, or ABANDON).
-    pub fn abandon(&mut self, s: &mut Sess) {
-        // The operations leave the places they wait on, and the table of
-        // operations, before their numbers are given to others.
-        let label = s.label();
-        let mut keys = [0u64; netd::ring::SESSION_OPS];
-        let mut n = 0;
-        for (owner, key) in self.ops.keys() {
-            if owner == label && n < keys.len() {
-                keys[n] = key;
-                n += 1;
-            }
-        }
-        for &key in &keys[..n] {
+    /// Up to `ABANDON_PORTION` operations of a session go (ABANDON, or a step
+    /// of departure of a session that went): each leaves the place it waits
+    /// on before its number is given to others. True when the session has more.
+    pub fn release_ops(&mut self, long: &mut LongSession) -> bool {
+        netd::ring::abandon_portion(|| {
+            let Some(key) = self.ops.first(long) else {
+                return false;
+            };
             if let Some(idx) = op_index(key) {
                 self.forget_op(idx);
             }
-        }
-        self.ops.gone(&mut s.data.long);
+            self.ops.gone_some(long, 1);
+            true
+        });
+        !long.is_empty()
     }
 
     /// The operation `key` of the session is over.
@@ -358,10 +355,14 @@ impl Net {
             Call::WatchTake(key) => self.watch_keyed(stack, s, r, key, false, now),
             Call::WatchCancel(key) => self.watch_keyed(stack, s, r, key, true, now),
             Call::Abandon => {
-                self.abandon(s);
-                ok()
+                self.release_ops(&mut s.data.long);
+                match sockets::write_abandoned(r.reply(), s.data.long.count() as u32) {
+                    Ok(()) => Answer::Reply(Outgoing::new()),
+                    Err(status) => Answer::Status(status),
+                }
             }
             Call::Clone(list) => self.clone_session(s, r, list.as_slice()),
+            Call::CloneMore { birth, list } => self.clone_more(s, birth, list.as_slice()),
             Call::Cancel(key) => {
                 self.finish_op(s, key);
                 long_answer(r, long::Reply::Cancelled)
@@ -1375,15 +1376,17 @@ impl Net {
             label,
             self.level,
         );
+        let word =
+            proto_net::sockets::birth_word(self.clones.place_of(label).unwrap_or(0), label >> 16);
         match session {
-            Ok(session) if r.reply().u32(0).is_ok() => {
+            Ok(session) if sockets::write_cloned(r.reply(), word).is_ok() => {
                 let mut place = 0;
                 while let Some(p) = child.next(place) {
                     place = p + 1;
                     self.places.hold(p);
                 }
                 if let Some(birth) = self.clones.place_of(label) {
-                    self.births[birth] = Some((label, child, root));
+                    self.births[birth] = Some((label, child, root, s.label()));
                 }
                 Answer::Reply([session.erase()].into())
             }
@@ -1395,6 +1398,37 @@ impl Net {
                 }
             }
         }
+    }
+
+    /// CLONE_MORE: more descriptions for the birth `word` (CLONE's reply)
+    /// that the calling session made and that sent nothing yet. All the
+    /// descriptions are checked before the birth changes, and one the birth
+    /// holds already is passed over (`netd::births`).
+    fn clone_more(&mut self, s: &mut Sess, word: u32, list: &[u32]) -> Answer {
+        let Ok((place, (label, mut held, root, parent))) =
+            births::permitted(&self.births, word, s.label())
+        else {
+            return refuse(proto_net::BAD_FD);
+        };
+        let mut added = Held::EMPTY;
+        for &d in list {
+            let Some(p) = self.find(&s.data.held, d) else {
+                return refuse(proto_net::BAD_FD);
+            };
+            added.add(p);
+        }
+        if births::fits(&held, &added, OPEN_MAX).is_err() {
+            return refuse(proto_net::MFILE);
+        }
+        let mut at = 0;
+        while let Some(p) = added.next(at) {
+            at = p + 1;
+            if held.add(p) {
+                self.places.hold(p);
+            }
+        }
+        self.births[place] = Some((label, held, root, parent));
+        ok()
     }
 }
 

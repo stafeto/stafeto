@@ -7,7 +7,7 @@
 
 pub const PTYS: usize = 8;
 pub const TERMINALS: usize = PTYS + 1;
-pub const DESCRIPTIONS: usize = 256;
+pub const DESCRIPTIONS: usize = proto_tty::DESCRIPTIONS_MAX;
 pub const HOLDS: usize = 32;
 const ID_GENERATION_MAX: u32 = u32::MAX >> 9;
 pub const NONBLOCK: u32 = 0o4000;

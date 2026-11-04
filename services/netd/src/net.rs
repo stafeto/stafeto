@@ -87,8 +87,7 @@ pub struct Client {
     pub root: u64,
 }
 
-/// A clone that sent nothing yet: its label, its descriptions and its root.
-pub type Birth = (u64, Held, u64);
+pub use netd::births::Birth;
 
 /// How a stream's connection stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +274,9 @@ pub struct Net {
     pub clones: Clones<SESSIONS>,
     pub births: [Option<Birth>; SESSIONS],
     departing: [Held; DEPARTING],
+    /// The operations of each departing session that wait still: a step of
+    /// departure lets go of a portion of them before the places.
+    departing_long: [LongSession; DEPARTING],
     /// The entries of `departing` that hold descriptions, a bit each.
     departing_used: [u64; DEPARTING.div_ceil(64)],
     /// The places that have operations waiting, the streams that connect and
@@ -365,6 +367,7 @@ impl Net {
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
+            rt::bss::fill(addr_of_mut!((*at).departing_long), LongSession::default());
             addr_of_mut!((*at).key).write(key);
             Demux::initialize_at(addr_of_mut!((*at).demux), &demux_key);
             addr_of_mut!((*at).parent).write(Some(Handle::borrowed(parent.raw())));
@@ -720,19 +723,23 @@ impl Net {
     // ----- the sessions that went -----
 
     /// A session that went (or a clone that was never taken) lets go of its
-    /// descriptions in steps. True when a step of departure is due.
-    pub fn depart(&mut self, stack: &mut Stack<'static>, held: Held) -> bool {
-        if held.count() == 0 {
+    /// operations and its descriptions in steps. True when a step of
+    /// departure is due.
+    pub fn depart(&mut self, stack: &mut Stack<'static>, held: Held, long: LongSession) -> bool {
+        if held.count() == 0 && long.is_empty() {
             return false;
         }
         let free = (0..DEPARTING).find(|&n| self.departing_used[n / 64] >> (n % 64) & 1 == 0);
         match free {
             Some(n) => {
                 self.departing[n] = held;
+                self.departing_long[n] = long;
                 self.departing_used[n / 64] |= 1 << (n % 64);
                 true
             }
             None => {
+                let mut long = long;
+                while self.release_ops(&mut long) {}
                 let mut held = held;
                 while let Some(i) = held.next(0) {
                     held.remove(i);
@@ -743,10 +750,34 @@ impl Net {
         }
     }
 
-    /// One step of departure: at most GONE_PORTION places let go of, the
-    /// descriptions of the sessions that went and the members of the queues
-    /// of closed listening descriptions. True when more are left.
+    /// One step of departure: at most ABANDON_PORTION operations of the
+    /// sessions that went let go of, then at most GONE_PORTION places, the
+    /// descriptions of those sessions and the members of the queues of closed
+    /// listening descriptions. True when more are left.
     pub fn depart_step(&mut self, stack: &mut Stack<'static>) -> bool {
+        let mut ops_left = netd::ring::ABANDON_PORTION;
+        'operations: for word in 0..self.departing_used.len() {
+            let mut bits = self.departing_used[word];
+            while bits != 0 {
+                if ops_left == 0 {
+                    break 'operations;
+                }
+                let n = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let mut long = core::mem::take(&mut self.departing_long[n]);
+                while ops_left > 0 && !long.is_empty() {
+                    let Some(key) = self.ops.first(&long) else {
+                        break;
+                    };
+                    if let Some(idx) = op_index(key) {
+                        self.forget_op(idx);
+                    }
+                    self.ops.gone_some(&mut long, 1);
+                    ops_left -= 1;
+                }
+                self.departing_long[n] = long;
+            }
+        }
         let mut left = GONE_PORTION;
         'entries: for word in 0..self.departing_used.len() {
             while self.departing_used[word] != 0 {
@@ -754,6 +785,10 @@ impl Net {
                     break 'entries;
                 }
                 let n = word * 64 + self.departing_used[word].trailing_zeros() as usize;
+                if !self.departing_long[n].is_empty() {
+                    // Its operations are not all let go of: the places wait.
+                    break 'entries;
+                }
                 match self.departing[n].next(0) {
                     Some(i) => {
                         self.departing[n].remove(i);

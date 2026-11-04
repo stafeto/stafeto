@@ -785,7 +785,7 @@ fn sessions() -> Result<Sessions, i32> {
             out.uart = clone.into_raw().0;
         }
         sub(6);
-        let mut ends = [proto_pipe::Endpoint::anonymous(0); posix_fs::OPEN_MAX];
+        let mut ends = [proto_pipe::Endpoint::anonymous(0); proto_pipe::HELD_MAX];
         let count = crate::shared::pipes_kept_by_fork(&mut ends)?;
         if let Some(pipes) = crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
             let clone = pipes_clone(pipes, &ends[..count])?;
@@ -794,7 +794,7 @@ fn sessions() -> Result<Sessions, i32> {
         sub(7);
         if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
         {
-            let mut ends = [0; posix_fs::OPEN_MAX];
+            let mut ends = [0; posix_fs::TTY_KEPT_MAX];
             let count = crate::shared::terminals_kept_by_fork(&mut ends)?;
             out.terminal = crate::terminal::clone_kept(terminal, Some(&ends[..count]))?
                 .into_raw()
@@ -811,8 +811,7 @@ fn sessions() -> Result<Sessions, i32> {
         sub(10);
         // The child's sockets: a refusal fails the fork, or the child would
         // hold none of the descriptors it has (the service's end excepted).
-        let (list, count) = crate::net::kept_by_fork()?;
-        if let Some(clone) = crate::net::clone_kept(&list[..count])? {
+        if let Some(clone) = crate::net::clone_kept(crate::net::kept_by_fork_portions())? {
             out.net = clone.into_raw().0;
         }
         Ok(())

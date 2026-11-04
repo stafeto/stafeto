@@ -25,7 +25,7 @@ pub(crate) fn detach(owner: u64) -> bool {
 pub(crate) fn help() {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let start = NEXT.fetch_add(1, Ordering::Relaxed) % posix_fs::OPEN_MAX;
+    let start = NEXT.fetch_add(1, Ordering::Relaxed) % posix_fs::HOLDS_MAX;
     let token = crate::shared::try_with_files(|files| {
         Ok(files
             .fifo_disposals()
@@ -42,7 +42,7 @@ pub(crate) fn help() {
 /// Each of the existing thirty-two paid debts gets one exact cleanup attempt.
 pub(crate) fn drain_for_exec() -> bool {
     let debts = crate::shared::try_with_files(|files| {
-        let mut debts = [None; posix_fs::OPEN_MAX];
+        let mut debts = [None; posix_fs::HOLDS_MAX];
         for (index, token) in files.fifo_disposals().enumerate() {
             debts[index] = Some(token);
         }

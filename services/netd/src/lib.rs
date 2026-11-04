@@ -9,6 +9,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod births;
 pub mod choose;
 pub mod config;
 pub mod copy;

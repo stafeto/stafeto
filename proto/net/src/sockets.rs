@@ -156,6 +156,12 @@ pub enum Request<'a> {
     WatchCancel(u64),
     Abandon,
     Clone(List),
+    /// More descriptions for the birth CLONE's reply named (`birth`): 1 to
+    /// `CLONE_MAX`.
+    CloneMore {
+        birth: u32,
+        list: List,
+    },
     Cancel(u64),
 }
 
@@ -184,6 +190,7 @@ impl<'a> Request<'a> {
             Request::WatchCancel(_) => Method::WatchCancel,
             Request::Abandon => Method::Abandon,
             Request::Clone(_) => Method::Clone,
+            Request::CloneMore { .. } => Method::CloneMore,
             Request::Cancel(_) => Method::Cancel,
         }
     }
@@ -291,6 +298,14 @@ impl<'a> Request<'a> {
             }
             Request::Abandon => Ok(()),
             Request::Clone(list) => {
+                w.u32(list.len as u32)?;
+                for &d in list.as_slice() {
+                    w.u32(d)?;
+                }
+                Ok(())
+            }
+            Request::CloneMore { birth, list } => {
+                w.u32(birth)?;
                 w.u32(list.len as u32)?;
                 for &d in list.as_slice() {
                     w.u32(d)?;
@@ -424,6 +439,21 @@ impl<'a> Request<'a> {
                 }
                 Ok(Request::Clone(list))
             })(),
+            Method::CloneMore => (|| {
+                let birth = b.u32()?;
+                let count = b.u32()? as usize;
+                if !(1..=CLONE_MAX).contains(&count) {
+                    return Err(Status::BadSize);
+                }
+                let mut list = List {
+                    len: count,
+                    items: [0; CLONE_MAX],
+                };
+                for item in &mut list.items[..count] {
+                    *item = b.u32()?;
+                }
+                Ok(Request::CloneMore { birth, list })
+            })(),
             _ => return None,
         };
         Some(match request {
@@ -534,9 +564,28 @@ pub fn read_received(data: &[u8]) -> Result<(u32, Address, &[u8]), Status> {
     Ok((flags, from, bytes))
 }
 
-/// CLONE's reply: status 0 (the session comes as a handle).
-pub fn write_ok(w: &mut Writer) -> Result<(), Status> {
-    w.u32(Status::Ok.code())
+/// CLONE's reply: status 0 and the word of the birth (`birth_word`), which
+/// CLONE_MORE names; the session comes as a handle.
+pub fn write_cloned(w: &mut Writer, birth: u32) -> Result<(), Status> {
+    write_word(w, birth)
+}
+
+/// The word of the birth of a clone made at place `place` of the service's
+/// table with the generation `generation` (the low 16 bits of each): the
+/// number CLONE_MORE names it by.
+pub const fn birth_word(place: usize, generation: u64) -> u32 {
+    (place as u32 & 0xFFFF) | ((generation as u32 & 0xFFFF) << 16)
+}
+
+/// The reply of ABANDON: status 0 and how many of the session's long
+/// operations are left; the caller asks again until it is 0.
+pub fn write_abandoned(w: &mut Writer, left: u32) -> Result<(), Status> {
+    write_word(w, left)
+}
+
+/// The operations left in an ABANDON reply.
+pub fn read_abandoned(reply: &[u8]) -> Result<u32, Status> {
+    read_word(reply)
 }
 
 #[cfg(test)]
@@ -650,6 +699,10 @@ mod tests {
             Request::Abandon,
             Request::Clone(List::new(&[]).unwrap()),
             Request::Clone(List::new(&[1, 2, 3 | 1 << 12]).unwrap()),
+            Request::CloneMore {
+                birth: 0x0005_0003,
+                list: List::new(&[1, 2, 3 | 1 << 12]).unwrap(),
+            },
             Request::Cancel(13),
         ]
     }
@@ -796,9 +849,42 @@ mod tests {
     }
 
     #[test]
+    fn clone_more_takes_one_to_sixty_four_descriptions() {
+        let more = |count: usize| {
+            let list = List {
+                len: count,
+                items: [7; CLONE_MAX],
+            };
+            written(&Request::CloneMore { birth: 9, list })
+        };
+        assert_eq!(more(64).len(), 8 + 8 + 64 * 4);
+        let mut empty = more(1);
+        empty.truncate(8 + 8);
+        empty[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(parsed(&empty), Err(Status::BadSize), "no descriptions");
+        let mut many = more(1);
+        many[12..16].copy_from_slice(&65u32.to_le_bytes());
+        assert_eq!(parsed(&many), Err(Status::BadSize), "65 descriptions");
+    }
+
+    #[test]
+    fn the_replies_of_clone_and_abandon_carry_a_word() {
+        let mut w = Writer::new();
+        write_cloned(&mut w, birth_word(0x1_0002, 0x7_0003)).unwrap();
+        assert_eq!(read_word(w.as_bytes()), Ok(0x0003_0002));
+        let mut w = Writer::new();
+        write_abandoned(&mut w, 4).unwrap();
+        assert_eq!(read_abandoned(w.as_bytes()), Ok(4));
+    }
+
+    #[test]
     fn the_methods_of_other_kinds_are_not_sockets() {
         assert!(Request::parse(Method::Config, Reader::new(&[])).is_none());
-        assert!(Request::parse(Method::CloneMore, Reader::new(&[])).is_none());
+        // CLONE_MORE is a sockets' method now: a short body is a bad size.
+        assert!(matches!(
+            Request::parse(Method::CloneMore, Reader::new(&[])),
+            Some(Err(_))
+        ));
         assert!(Request::parse(Method::Ping, Reader::new(&[])).is_none());
     }
 

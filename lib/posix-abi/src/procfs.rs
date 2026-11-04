@@ -634,7 +634,7 @@ fn content(node: &Node) -> Result<Text, i32> {
 /// the table with the memory (the child's offsets are its own from then);
 /// `exec` carries the node and the offset (`inherit`), and the new image
 /// makes the text again at its first read.
-const DESCRIPTIONS: usize = posix_fs::OPEN_MAX;
+const DESCRIPTIONS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Description {

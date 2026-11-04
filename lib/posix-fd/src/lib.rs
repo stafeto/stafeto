@@ -697,6 +697,23 @@ impl<T: Copy + Eq, const N: usize, R: Copy, S: Copy, C: Copy, const PAGES: usize
         }
     }
 
+    /// The lowest number at or above `from` that is in use (open, being
+    /// opened or being closed), a word of the bitmap at a time.
+    pub fn next_used(&self, from: u32) -> Option<u32> {
+        let mut word = from as usize / 64;
+        let mut bits = self
+            .occupied
+            .get(word)
+            .map(|w| w & (!0u64 << (from % 64)))?;
+        loop {
+            if bits != 0 {
+                return Some(word as u32 * 64 + bits.trailing_zeros());
+            }
+            word += 1;
+            bits = *self.occupied.get(word)?;
+        }
+    }
+
     /// The numbers in use (not empty), from the lowest.
     fn used(&self) -> impl Iterator<Item = u32> + '_ {
         self.occupied.iter().enumerate().flat_map(|(w, &word)| {

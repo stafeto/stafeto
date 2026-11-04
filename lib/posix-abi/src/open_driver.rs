@@ -241,7 +241,7 @@ pub(crate) fn detach(owner: u64) -> bool {
         return false;
     };
     let notified = crate::shared::try_with_files(|files| {
-        let mut tokens = [None; posix_fs::OPEN_MAX];
+        let mut tokens = [None; posix_fd::JOBS_MAX];
         for (slot, token) in files.open_tokens().enumerate() {
             tokens[slot] = Some(token);
         }
@@ -319,10 +319,10 @@ pub(crate) fn help() {
                     snapshot.phase == OpenPhase::Canceling || snapshot.owner.is_none()
                 })
             })
-            .min_by_key(|token| (token.slot() + posix_fs::OPEN_MAX - cursor) % posix_fs::OPEN_MAX);
+            .min_by_key(|token| (token.slot() + posix_fd::JOBS_MAX - cursor) % posix_fd::JOBS_MAX);
         if let Some(token) = token {
             CURSOR.store(
-                (token.slot() + 1) % posix_fs::OPEN_MAX,
+                (token.slot() + 1) % posix_fd::JOBS_MAX,
                 core::sync::atomic::Ordering::Relaxed,
             );
         }

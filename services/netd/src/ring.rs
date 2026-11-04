@@ -79,6 +79,26 @@ pub const EGRESS_GROUPS: usize = 1;
 pub const EGRESS_GROUPS: usize = 4;
 #[cfg(not(any(feature = "egress-1", feature = "egress-4")))]
 pub const EGRESS_GROUPS: usize = 2;
+/// The operations of one session that an ABANDON, or a step of departure,
+/// lets go of at most: each costs the place it waits on and its handle's close,
+/// so 16 at once came to 83 percent of the bound (reports/2026-11-04-net-p1b).
+pub const ABANDON_PORTION: usize = 4;
+
+/// Lets go of operations by `one`, which frees the next of the session's and
+/// says whether it had one, up to `ABANDON_PORTION` of them; how many went,
+/// and whether the session has more (the caller asks again).
+pub fn abandon_portion(mut one: impl FnMut() -> bool) -> (usize, bool) {
+    let mut gone = 0;
+    while gone < ABANDON_PORTION {
+        if !one() {
+            return (gone, false);
+        }
+        gone += 1;
+    }
+    // A full portion: the next ask finds out whether there is more.
+    (gone, true)
+}
+
 /// The operations of one session that wait at most (rt's LONG_SESSION_MAX).
 pub const SESSION_OPS: usize = 16;
 /// The notifications to clients and the checks of readiness the step of
@@ -1027,5 +1047,22 @@ mod tests {
     #[test]
     fn the_loop_holds_the_frames_of_two_steps() {
         const { assert!(LOOP_FRAMES >= 2 * STEP_TX && LOOP_FRAMES >= 2 * STEP_RX) };
+    }
+
+    #[test]
+    fn abandon_lets_go_of_four_at_most() {
+        let left = core::cell::Cell::new(10);
+        let mut one = || {
+            if left.get() == 0 {
+                return false;
+            }
+            left.set(left.get() - 1);
+            true
+        };
+        assert_eq!(abandon_portion(&mut one), (4, true));
+        assert_eq!(abandon_portion(&mut one), (4, true));
+        assert_eq!(left.get(), 2);
+        assert_eq!(abandon_portion(&mut one), (2, false));
+        assert_eq!(abandon_portion(&mut one), (0, false));
     }
 }

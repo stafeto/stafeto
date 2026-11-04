@@ -32,8 +32,8 @@ use crate::sockets::{
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
-use posix_fs::Target;
-use proto_net::sockets::{self as wire, List, Request, opt};
+use posix_fs::{NetTarget, Target};
+use proto_net::sockets::{self as wire, CLONE_MAX, List, Request, opt};
 use proto_net::{Address, DATA_MAX};
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights};
@@ -223,48 +223,91 @@ fn close_description(description: u32) {
 
 /// ABANDON of the process's session: the long operations of its threads go.
 /// An exec asks it before the session moves to the new image, whose stopped
-/// threads never end their waits.
+/// threads never end their waits. The service lets go of a few operations
+/// in each answer and says how many are left; the ask goes on until none is.
 pub(crate) fn abandon() {
     let Ok(service) = channel() else { return };
     let request = proto_net::Method::Abandon.header().bytes();
-    while rt::sys::send(&service, &request) == Err(Error::Interrupted) {}
+    loop {
+        let mut reply = match rt::sys::send(&service, &request) {
+            Err(Error::Interrupted) => continue,
+            Ok(reply) => reply,
+            Err(_) => return,
+        };
+        let mut buffer = [0u8; MESSAGE_MAX];
+        match wire::read_abandoned(reply.bytes(&mut buffer)) {
+            Ok(left) if left > 0 => {}
+            _ => return,
+        }
+    }
 }
 
-/// A clone of the process's session for a child that holds `list`, the
-/// descriptions of the descriptors the child keeps; None when the process
-/// has no session. A refusal other than the service's end fails the fork or
-/// spawn (the child without its sockets would close them silently): the
-/// errno. The end of the service gives the child a copy of the dead session.
-pub(crate) fn clone_kept(list: &[u32]) -> Result<Option<Handle<Channel>>, i32> {
+/// A clone of the process's session for a child that holds the descriptions
+/// `portion` gives, the descriptors the child keeps; None when the process
+/// has no session. `portion` fills one portion of up to `CLONE_MAX`
+/// descriptions into its argument and says how many and whether there is
+/// another; the first goes with CLONE, the rest with CLONE_MORE (each at most
+/// 64, so that no step of the service is longer for a process with many
+/// sockets). A refusal other than the service's end fails the fork or spawn
+/// (the child without its sockets would close them silently): the errno,
+/// and the clone made so far is closed, which lets the service go of its
+/// descriptions. The end of the service gives the child a copy of the dead
+/// session.
+pub(crate) fn clone_kept(
+    mut portion: impl FnMut(&mut [u32; CLONE_MAX]) -> Result<(usize, bool), i32>,
+) -> Result<Option<Handle<Channel>>, i32> {
     let Some(raw) = session() else {
         return Ok(None);
     };
     let service = Handle::<Channel>::borrowed(raw);
-    let list = List::new(list).ok_or(EIO)?;
+    let mut items = [0u32; CLONE_MAX];
+    let (count, mut more) = portion(&mut items)?;
+    let list = List::new(&items[..count]).ok_or(EIO)?;
     let mut w = Writer::new();
     Request::Clone(list).write(&mut w).map_err(|_| EIO)?;
-    match rt::service::clone_session(&service, w.as_bytes()) {
-        Ok(clone) => Ok(Some(clone)),
-        Err(Status::Kernel(Error::PeerClosed)) => {
-            let copy = rt::sys::handle_duplicate(
-                &service,
-                Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE,
-            );
-            if copy.is_err() {
-                rt::println!("posix: the network service is gone; the child has no session");
-            }
-            Ok(copy.ok())
+    let (clone, birth) = match rt::service::clone_session_word(&service, w.as_bytes()) {
+        Ok(made) => made,
+        Err(Status::Kernel(Error::PeerClosed)) => return Ok(dead_copy(&service)),
+        Err(status) => return Err(crate::process::clone_errno(status)),
+    };
+    while more {
+        let (count, next) = portion(&mut items)?;
+        more = next;
+        if count == 0 {
+            continue;
         }
-        Err(status) => Err(crate::process::clone_errno(status)),
+        let list = List::new(&items[..count]).ok_or(EIO)?;
+        simple(&Request::CloneMore { birth, list })
+            .map_err(|errno| if errno == ENETDOWN { EIO } else { errno })?;
     }
+    Ok(Some(clone))
 }
 
-/// The descriptions of the descriptors without FD_CLOFORK the layer keeps
-/// across a fork, each once.
-pub(crate) fn kept_by_fork() -> Result<([u32; posix_fs::OPEN_MAX], usize), i32> {
-    let mut list = [0; posix_fs::OPEN_MAX];
-    let count = shared::nets_kept_by_fork(&mut list)?;
-    Ok((list, count))
+/// The copy of the dead session a child gets when the service has ended.
+fn dead_copy(service: &Handle<Channel>) -> Option<Handle<Channel>> {
+    let copy =
+        rt::sys::handle_duplicate(service, Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE);
+    if copy.is_err() {
+        rt::println!("posix: the network service is gone; the child has no session");
+    }
+    copy.ok()
+}
+
+/// The portions of the descriptions of the descriptors without FD_CLOFORK the
+/// layer keeps across a fork: the closure `clone_kept` takes.
+pub(crate) fn kept_by_fork_portions()
+-> impl FnMut(&mut [u32; CLONE_MAX]) -> Result<(usize, bool), i32> {
+    let mut start = 0;
+    move |out| {
+        let (count, next) = shared::nets_kept_by_fork_from(start, out)?;
+        match next {
+            Some(fd) => {
+                start = fd;
+                Ok((count, true))
+            }
+            None => Ok((count, false)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- addresses
@@ -316,20 +359,29 @@ pub fn is_net(fd: i32) -> bool {
 
 /// Runs `run` on the description `fd` names, the descriptor held so that
 /// no other thread's close ends the description meanwhile.
-fn with_socket<R>(fd: i32, run: impl FnOnce(u32) -> Result<R, i32>) -> Result<R, i32> {
+fn with_net<R>(fd: i32, run: impl FnOnce(NetTarget) -> Result<R, i32>) -> Result<R, i32> {
     let fd = u32::try_from(fd).map_err(|_| EBADF)?;
     shared::held(fd, |_, target| match target {
-        Target::Net(description) => run(description),
+        Target::Net(net) => run(net),
         _ => Err(ENOTSOCK),
     })
 }
 
+/// `with_net` for the calls that need the description alone.
+fn with_socket<R>(fd: i32, run: impl FnOnce(u32) -> Result<R, i32>) -> Result<R, i32> {
+    with_net(fd, |net| run(net.description))
+}
+
 /// A descriptor for the description `description`; the service closes it
 /// again on an error.
-fn publish(description: u32, cloexec: bool) -> Result<i32, i32> {
-    let inserted = shared::with_files(|files| {
+fn publish(description: u32, stream: bool, cloexec: bool) -> Result<i32, i32> {
+    let target = Target::Net(NetTarget {
+        description,
+        stream,
+    });
+    let inserted = shared::growing(|files| {
         files
-            .insert(Target::Net(description), descriptor_flags(cloexec))
+            .insert(target, descriptor_flags(cloexec))
             .map(|fd| fd as i32)
             .map_err(crate::error)
     });
@@ -374,7 +426,7 @@ pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
             0
         },
     })?;
-    publish(description, kind & SOCK_CLOEXEC != 0)
+    publish(description, ty == wire::STREAM, kind & SOCK_CLOEXEC != 0)
 }
 
 pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
@@ -477,7 +529,7 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
             &mut reply,
         )?;
         let (new, peer) = wire::read_accepted(&reply[..n]).map_err(|_| EIO)?;
-        let fd = publish(new, flags & SOCK_CLOEXEC != 0)?;
+        let fd = publish(new, true, flags & SOCK_CLOEXEC != 0)?;
         let len = out.map_or(0, |out| c_address(&peer, out));
         Ok((fd, len))
     });
@@ -671,38 +723,40 @@ pub fn send(
         return Err(EOPNOTSUPP);
     }
     let point = crate::threads::cancel::Point::begin();
-    let result = with_socket(fd, |description| {
-        let to = match name {
-            Some(raw) if raw.len() >= 2 => wire_address(raw)?,
-            _ => Address::NONE,
-        };
-        let ty = word(&Request::GetOpt {
-            description,
-            name: opt::TYPE,
-        })?;
-        if ty == wire::DGRAM {
-            if size > DATA_MAX {
-                return Err(EMSGSIZE);
+    let result = with_net(
+        fd,
+        |NetTarget {
+             description,
+             stream,
+         }| {
+            let to = match name {
+                Some(raw) if raw.len() >= 2 => wire_address(raw)?,
+                _ => Address::NONE,
+            };
+            if !stream {
+                if size > DATA_MAX {
+                    return Err(EMSGSIZE);
+                }
+                let mut piece = [0u8; DATA_MAX];
+                crate::sockets::gather(iov, 0, &mut piece[..size]);
+                return send_once(description, wire_flags, to, &piece[..size]);
             }
+            let mut done = 0;
             let mut piece = [0u8; DATA_MAX];
-            crate::sockets::gather(iov, 0, &mut piece[..size]);
-            return send_once(description, wire_flags, to, &piece[..size]);
-        }
-        let mut done = 0;
-        let mut piece = [0u8; DATA_MAX];
-        loop {
-            let n = crate::sockets::gather(iov, done, &mut piece);
-            match send_once(description, wire_flags, to, &piece[..n]) {
-                Ok(sent) => done += sent,
-                Err(_) if done > 0 => break,
-                Err(errno) => return Err(errno),
+            loop {
+                let n = crate::sockets::gather(iov, done, &mut piece);
+                match send_once(description, wire_flags, to, &piece[..n]) {
+                    Ok(sent) => done += sent,
+                    Err(_) if done > 0 => break,
+                    Err(errno) => return Err(errno),
+                }
+                if done >= size {
+                    break;
+                }
             }
-            if done >= size {
-                break;
-            }
-        }
-        Ok(done)
-    });
+            Ok(done)
+        },
+    );
     if result == Err(EPIPE) && flags & MSG_NOSIGNAL == 0 {
         let _ = crate::signals::raise(SIGPIPE);
     }
@@ -722,65 +776,67 @@ pub fn recv(
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire_flags = receive_flags(flags)?;
     let point = crate::threads::cancel::Point::begin();
-    let result = with_socket(fd, |description| {
-        let ty = word(&Request::GetOpt {
-            description,
-            name: opt::TYPE,
-        })?;
-        let mut message = Message {
-            count: 0,
-            name_len: 0,
-            flags: 0,
-            control_len: 0,
-        };
-        let _ = control;
-        if size == 0 && ty == wire::STREAM {
-            return Ok(message);
-        }
-        let mut total = 0;
-        let mut name = name;
-        loop {
-            let most = (size - total).clamp(1, DATA_MAX) as u32;
-            let mut reply = [0u8; MESSAGE_MAX];
-            let n = run(
-                true,
-                |key| Request::Recv {
-                    key,
-                    description,
-                    flags: wire_flags,
-                    most,
-                },
-                &mut reply,
-            );
-            let n = match n {
-                Ok(n) => n,
-                Err(_) if total > 0 => break,
-                Err(errno) => return Err(errno),
+    let result = with_net(
+        fd,
+        |NetTarget {
+             description,
+             stream,
+         }| {
+            let mut message = Message {
+                count: 0,
+                name_len: 0,
+                flags: 0,
+                control_len: 0,
             };
-            let (got_flags, from, bytes) = wire::read_received(&reply[..n]).map_err(|_| EIO)?;
-            let take = bytes.len().min(size - total);
-            crate::sockets::scatter(iov, total, &bytes[..take]);
-            if total == 0 {
-                if let Some(out) = name.as_deref_mut() {
-                    message.name_len = c_address(&from, out);
+            let _ = control;
+            if size == 0 && stream {
+                return Ok(message);
+            }
+            let mut total = 0;
+            let mut name = name;
+            loop {
+                let most = (size - total).clamp(1, DATA_MAX) as u32;
+                let mut reply = [0u8; MESSAGE_MAX];
+                let n = run(
+                    true,
+                    |key| Request::Recv {
+                        key,
+                        description,
+                        flags: wire_flags,
+                        most,
+                    },
+                    &mut reply,
+                );
+                let n = match n {
+                    Ok(n) => n,
+                    Err(_) if total > 0 => break,
+                    Err(errno) => return Err(errno),
+                };
+                let (got_flags, from, bytes) = wire::read_received(&reply[..n]).map_err(|_| EIO)?;
+                let take = bytes.len().min(size - total);
+                crate::sockets::scatter(iov, total, &bytes[..take]);
+                if total == 0 {
+                    if let Some(out) = name.as_deref_mut() {
+                        message.name_len = c_address(&from, out);
+                    }
+                    if got_flags & wire::OUT_TRUNC != 0 || take < bytes.len() {
+                        message.flags |= MSG_TRUNC;
+                    }
                 }
-                if got_flags & wire::OUT_TRUNC != 0 || take < bytes.len() {
-                    message.flags |= MSG_TRUNC;
+                total += take;
+                // A peek reads the head of the queue again on each ask: one ask.
+                if bytes.is_empty()
+                    || !stream
+                    || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL
+                    || total >= size
+                {
+                    break;
                 }
             }
-            total += take;
-            // A peek reads the head of the queue again on each ask: one ask.
-            if bytes.is_empty()
-                || ty != wire::STREAM
-                || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL
-                || total >= size
-            {
-                break;
-            }
-        }
-        message.count = total;
-        Ok(message)
-    });
+            message.count = total;
+            Ok(message)
+        },
+    );
     finish(point, &result);
     result
 }

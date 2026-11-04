@@ -6,6 +6,9 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod change;
 pub mod closing;
 pub mod control;
@@ -45,6 +48,9 @@ pub enum FsError {
     /// Process FSIZE refusal, distinct from physical file capacity.
     FileSizeLimit,
     TooManyOpenFiles,
+    /// The number lies in the page `k` of the table, which the owner has to
+    /// map and give (`PosixFs::add_page`) before the call is made again.
+    NeedPage(usize),
     NotSeekable,
     OffsetOverflow,
     NoData,
@@ -78,6 +84,7 @@ impl From<DescriptorError> for FsError {
             DescriptorError::TooManyOpenFiles => Self::TooManyOpenFiles,
             DescriptorError::InvalidArgument => Self::InvalidArgument,
             DescriptorError::Io => Self::Io,
+            DescriptorError::NeedPage(k) => Self::NeedPage(k),
         }
     }
 }
@@ -183,15 +190,35 @@ pub struct DirEntry {
     pub name_len: usize,
 }
 
-/// Local descriptor bound. The RAM service separately bounds open descriptions.
-pub const OPEN_MAX: usize = 64;
+/// Local descriptor bound: the numbers 0 to 1 023. The first `HOLDS_MAX` lie in
+/// the table; the others lie in pages of `HOLDS_MAX` entries that the layer maps
+/// when a number asks for one (`posix_fd::Table`). The RAM service separately
+/// bounds open descriptions.
+pub const OPEN_MAX: usize = 1024;
+/// The operations of a process in flight at once, and the descriptors that
+/// lie in the table itself.
+pub const HOLDS_MAX: usize = 64;
+/// The pages of descriptors beyond the table's own.
+pub const DESCRIPTOR_PAGES: usize = OPEN_MAX / HOLDS_MAX - 1;
+/// The page of descriptors the layer maps: its size in bytes.
+pub const DESCRIPTOR_PAGE_BYTES: usize = 4096;
+/// The descriptors an inherited list names at most (the start area's).
+pub const INHERITED_MAX: usize = 64;
+/// The descriptions of the RAM service one session holds at most.
+pub const RAM_KEPT_MAX: usize = 32;
+/// The descriptions of the terminal service one process keeps across a fork
+/// at most: all the terminal service has.
+pub const TTY_KEPT_MAX: usize = proto_tty::DESCRIPTIONS_MAX;
+/// The socket descriptions one portion of a clone names at most
+/// (`proto_net::sockets::CLONE_MAX`).
+pub const NETS_PORTION: usize = proto_net::sockets::CLONE_MAX;
 /// The shared mappings of files a process pins besides its descriptors
 /// (`pin_for_map`).
 pub use posix_fd::{MAP_PINS, PinRef};
 /// The descriptions a forked child of the process can share at most: those
 /// of its descriptors and its pins. A file service session holds fewer
 /// (the RAM service's 32 places), so the list is never full.
-pub const KEPT_BY_FORK_MAX: usize = OPEN_MAX + MAP_PINS;
+pub const KEPT_BY_FORK_MAX: usize = RAM_KEPT_MAX + MAP_PINS;
 /// The longest current directory, in bytes.
 pub const MAX_CWD: usize = MAX_PATH;
 
@@ -221,7 +248,16 @@ pub enum Target {
     Proc(u32),
     /// A socket of the network service by its description (`proto_net`),
     /// held in the process's session with that service.
-    Net(u32),
+    Net(NetTarget),
+}
+
+/// A socket of the network service: its description in the process's session
+/// and whether it is a stream (the kind of a socket does not change in its
+/// life, so every `send` and `recv` knows it without asking).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetTarget {
+    pub description: u32,
+    pub stream: bool,
 }
 
 impl Target {
@@ -301,18 +337,48 @@ pub struct PosixFs {
     /// the console's input, output and error go there (5f).
     terminal: Option<Handle<Channel>>,
     paths: PathState,
-    descriptors: Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>,
+    descriptors: Descriptors,
     /// What the process knows about its record locks (`closing`).
     record_locks: closing::RecordLocks,
 }
 
+/// The table of descriptors: `HOLDS_MAX` numbers in place, the rest in pages.
+type Descriptors =
+    Table<Target, HOLDS_MAX, open::Recovery, (), control::Recovery, DESCRIPTOR_PAGES>;
+
 const _: () = assert!(core::mem::size_of::<PosixFs>() <= 28672);
+const _: () = assert!(
+    core::mem::size_of::<posix_fd::EntryPage<Target, HOLDS_MAX>>() <= DESCRIPTOR_PAGE_BYTES
+);
 
 // Typed control receipts retain their complete immutable source and outcome.
 const _: () = assert!(core::mem::size_of::<control::Recovery>() == 120);
-const _: () = assert!(
-    core::mem::size_of::<Table<Target, OPEN_MAX, open::Recovery, (), control::Recovery>>() <= 24576
-);
+const _: () = assert!(core::mem::size_of::<Descriptors>() <= 24576);
+
+/// The startup descriptors whose numbers lie beyond the table's own: they wait
+/// for the pages of the table (`PosixFs::add_page`), which need the heap.
+pub struct Late {
+    items: [Option<(u32, Target)>; INHERITED_MAX],
+}
+
+impl Late {
+    pub const fn new() -> Self {
+        Self {
+            items: [None; INHERITED_MAX],
+        }
+    }
+
+    /// The numbers and what they name.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, Target)> + '_ {
+        self.items.iter().flatten().copied()
+    }
+}
+
+impl Default for Late {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Owned startup transports, prepared before the pinned descriptor table exists.
 pub struct StartupFiles {
@@ -469,8 +535,8 @@ impl Transport {
                 release_proc(id);
                 Ok(())
             }
-            Some(Target::Net(id)) => {
-                release_net(id);
+            Some(Target::Net(net)) => {
+                release_net(net.description);
                 Ok(())
             }
             _ => Ok(()),
@@ -725,7 +791,7 @@ impl Transport {
                     ..CONSOLE_INFO
                 })
             }
-            Target::Net(description) => Ok(NodeInfo {
+            Target::Net(NetTarget { description, .. }) => Ok(NodeInfo {
                 kind: SOCKET,
                 permissions: 0o600,
                 device: 6,
@@ -982,25 +1048,30 @@ impl PosixFs {
         cwd: &[u8],
         inherited: Option<&[Inherited]>,
         secure: bool,
+        late: &mut Late,
     ) -> Result<(), FsError> {
         let mut paths = PathState::new();
         if !cwd.is_empty() {
             paths.set_cwd(cwd)?;
         }
-        let mut occupied = [false; OPEN_MAX];
+        if inherited.is_some_and(|list| list.len() > INHERITED_MAX) {
+            return Err(FsError::InvalidArgument);
+        }
+        let mut occupied = [0u64; OPEN_MAX / 64];
         if let Some(list) = inherited {
             for item in list {
-                let slot = occupied
-                    .get_mut(item.fd as usize)
+                let word = occupied
+                    .get_mut(item.fd as usize / 64)
                     .ok_or(FsError::BadFileDescriptor)?;
-                if *slot {
+                let bit = 1u64 << (item.fd % 64);
+                if *word & bit != 0 {
                     return Err(FsError::InvalidArgument);
                 }
-                *slot = true;
+                *word |= bit;
             }
         }
-        let mut normalized = [None; OPEN_MAX];
-        let mut captured = [None; OPEN_MAX];
+        let mut normalized = [None; INHERITED_MAX];
+        let mut captured = [None; INHERITED_MAX];
         if let Some(list) = inherited {
             for (index, item) in list.iter().enumerate() {
                 let ram_fd = |target| match target {
@@ -1068,7 +1139,7 @@ impl PosixFs {
                     };
                     target
                 };
-                normalized[item.fd as usize] = Some(target);
+                normalized[index] = Some(target);
             }
         }
         let StartupFiles {
@@ -1091,19 +1162,22 @@ impl PosixFs {
         // SAFETY: all fields are initialized; startup owns the only reference.
         let own = unsafe { &mut *destination };
         if let Some(list) = inherited {
-            for item in list {
+            for (index, item) in list.iter().enumerate() {
+                let target = normalized[index].expect("normalized import");
+                // The numbers beyond the table wait for their pages, which
+                // the layer can map once its heap exists.
+                if item.fd as usize >= HOLDS_MAX {
+                    late.items[index] = Some((item.fd, target));
+                    continue;
+                }
                 own.descriptors
-                    .place(
-                        item.fd,
-                        normalized[item.fd as usize].expect("normalized import"),
-                        DescriptorFlags::default(),
-                    )
+                    .place(item.fd, target, DescriptorFlags::default())
                     .expect("validated startup descriptor");
             }
         }
         if inherited.is_none() || secure {
             for (fd, target) in [(0, Target::Input), (1, Target::Output), (2, Target::Error)] {
-                if !occupied[fd as usize] {
+                if occupied[fd as usize / 64] & (1 << (fd % 64)) == 0 {
                     own.descriptors
                         .place(fd, target, DescriptorFlags::default())
                         .expect("fresh standard descriptor");
@@ -1156,9 +1230,21 @@ impl PosixFs {
     ) -> Result<Self, FsError> {
         let mut destination = core::mem::MaybeUninit::uninit();
         let startup = StartupFiles::from_sessions(files, uart, None, None);
+        let mut late = Late::new();
         // SAFETY: this compatibility constructor owns fresh local storage until return.
         unsafe {
-            Self::initialize_at(destination.as_mut_ptr(), startup, cwd, inherited, secure)?;
+            Self::initialize_at(
+                destination.as_mut_ptr(),
+                startup,
+                cwd,
+                inherited,
+                secure,
+                &mut late,
+            )?;
+        }
+        // The compatibility constructor has no pages to give.
+        if late.items.iter().any(Option::is_some) {
+            return Err(FsError::TooManyOpenFiles);
         }
         // SAFETY: initialize_at completed all fields.
         Ok(unsafe { destination.assume_init() })
@@ -1206,14 +1292,17 @@ impl PosixFs {
         self.descriptors.set_allocation_limit(limit);
     }
 
-    pub fn kept_by_fork(&self, out: &mut [rt::fs::PreparedOpen; KEPT_BY_FORK_MAX]) -> usize {
+    pub fn kept_by_fork(
+        &self,
+        out: &mut [rt::fs::PreparedOpen; KEPT_BY_FORK_MAX],
+    ) -> Result<usize, FsError> {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
             if let Some(n) = target.ram_target()
                 && !flags.close_on_fork
                 && !out[..count].contains(&n.prepared())
             {
-                out[count] = n.prepared();
+                *out.get_mut(count).ok_or(FsError::TooManyOpenFiles)? = n.prepared();
                 count += 1;
             }
         }
@@ -1223,11 +1312,11 @@ impl PosixFs {
             if let Some(n) = target.ram_target()
                 && !out[..count].contains(&n.prepared())
             {
-                out[count] = n.prepared();
+                *out.get_mut(count).ok_or(FsError::TooManyOpenFiles)? = n.prepared();
                 count += 1;
             }
         }
-        count
+        Ok(count)
     }
 
     /// A reference to the pin of the shared mapping of the file `key`, kept
@@ -1265,21 +1354,24 @@ impl PosixFs {
     /// Every RAM description retained by exec, including FD_CLOFORK. The
     /// pins of shared mappings are not among them: the new image has no
     /// mappings.
-    pub fn kept_by_exec(&self, out: &mut [rt::fs::PreparedOpen; OPEN_MAX]) -> usize {
+    pub fn kept_by_exec(
+        &self,
+        out: &mut [rt::fs::PreparedOpen; INHERITED_MAX],
+    ) -> Result<usize, FsError> {
         let mut count = 0;
         for (_, target, _) in self.descriptors.open() {
             if let Some(n) = target.ram_target()
                 && !out[..count].contains(&n.prepared())
             {
-                out[count] = n.prepared();
+                *out.get_mut(count).ok_or(FsError::TooManyOpenFiles)? = n.prepared();
                 count += 1;
             }
         }
-        count
+        Ok(count)
     }
 
     /// The terminal descriptions retained by a forked child, each once.
-    pub fn terminals_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+    pub fn terminals_kept_by_fork(&self, out: &mut [u32; TTY_KEPT_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
             if !flags.close_on_fork
@@ -1294,7 +1386,10 @@ impl PosixFs {
     }
 
     /// Pipe ends retained by a forked child, each once.
-    pub fn pipes_kept_by_fork(&self, out: &mut [proto_pipe::Endpoint; OPEN_MAX]) -> usize {
+    pub fn pipes_kept_by_fork(
+        &self,
+        out: &mut [proto_pipe::Endpoint; proto_pipe::HELD_MAX],
+    ) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
             if let Some(n) = target.pipe_endpoint()
@@ -1308,19 +1403,32 @@ impl PosixFs {
         count
     }
 
-    /// Socket descriptions retained by a forked child, each once.
-    pub fn nets_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+    /// Socket descriptions retained by a forked child, each once within a
+    /// portion: up to 64 of those at or above the descriptor `start`, into
+    /// `out`, with how many and the descriptor to go on from (None at the
+    /// end). A description that two portions both name is named twice; the
+    /// service takes it once.
+    pub fn nets_kept_by_fork_from(
+        &self,
+        start: u32,
+        out: &mut [u32; NETS_PORTION],
+    ) -> (usize, Option<u32>) {
         let mut count = 0;
-        for (_, target, flags) in self.descriptors.open() {
-            if !flags.close_on_fork
-                && let Target::Net(description) = target
-                && !out[..count].contains(&description)
-            {
-                out[count] = description;
-                count += 1;
+        for (fd, target, flags) in self.descriptors.open() {
+            if fd < start || flags.close_on_fork {
+                continue;
             }
+            let Target::Net(net) = target else { continue };
+            if out[..count].contains(&net.description) {
+                continue;
+            }
+            if count == out.len() {
+                return (count, Some(fd));
+            }
+            out[count] = net.description;
+            count += 1;
         }
-        count
+        (count, None)
     }
 
     /// The session with the RAM file service and the console's driver's,
@@ -1464,6 +1572,43 @@ impl PosixFs {
     pub fn insert_proc(&mut self, id: u32, flags: DescriptorFlags) -> Result<u32, FsError> {
         self.descriptors
             .insert(Target::Proc(id), flags)
+            .map_err(FsError::from)
+    }
+
+    /// The lowest descriptor at or above `from` that is in use (open, being
+    /// opened or being closed): the walks of exec and of the exit visit the
+    /// numbers in use alone.
+    pub fn next_descriptor(&self, from: u32) -> Option<u32> {
+        self.descriptors.next_used(from)
+    }
+
+    /// Gives the table of descriptors the page `k` of entries: `memory` is
+    /// `DESCRIPTOR_PAGE_BYTES` of zeroed, aligned memory the table keeps for
+    /// good. False, with `memory` unused, when the page is there already.
+    ///
+    /// # Safety
+    /// `memory` is writable for `DESCRIPTOR_PAGE_BYTES`, aligned for the entries
+    /// (a page is), and used by nothing else from now on.
+    pub unsafe fn add_page(&mut self, k: usize, memory: core::ptr::NonNull<u8>) -> bool {
+        // SAFETY: the caller's promise covers the page; the const assertion
+        // above fits the entries in it.
+        unsafe { self.descriptors.add_page(k, memory.cast()) }
+    }
+
+    /// The page of the table that the lowest free number at or above `minimum`
+    /// lies in, when the table does not have it yet.
+    pub fn page_needed(&self, minimum: u32) -> Option<usize> {
+        match self.descriptors.vacant(minimum) {
+            Err(DescriptorError::NeedPage(k)) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// The descriptor `fd` named by a startup list whose number lies in a page
+    /// (`Late`), once the page is there.
+    pub fn place_late(&mut self, fd: u32, target: Target) -> Result<(), FsError> {
+        self.descriptors
+            .place(fd, target, DescriptorFlags::default())
             .map_err(FsError::from)
     }
 
@@ -1684,6 +1829,60 @@ mod net_tests {
         )
     }
 
+    fn net(description: u32) -> Target {
+        Target::Net(NetTarget {
+            description,
+            stream: true,
+        })
+    }
+
+    /// A process with hundreds of sockets names their descriptions in
+    /// portions of 64, from the descriptor the last portion stopped at, each
+    /// description once within a portion.
+    #[test]
+    fn the_sockets_a_fork_keeps_come_in_portions() {
+        let mut files = files();
+        let both = DescriptorFlags::default();
+        // 200 descriptions, each held by two descriptors: the numbers beyond
+        // 63 are in the pages the test gives.
+        for k in 0..(DESCRIPTOR_PAGES) {
+            let page = std::boxed::Box::leak(std::boxed::Box::new([0u8; 8192]));
+            let aligned = (page.as_mut_ptr() as usize).next_multiple_of(4096) as *mut u8;
+            // SAFETY: 4096 aligned bytes inside the leaked allocation.
+            assert!(unsafe { files.add_page(k, core::ptr::NonNull::new(aligned).unwrap()) });
+        }
+        for d in 0..200u32 {
+            files.insert(net(d), both).unwrap();
+        }
+        for d in 0..200u32 {
+            files.insert(net(d), both).unwrap();
+        }
+        let mut seen = std::vec::Vec::new();
+        let mut start = 0;
+        let mut portions = 0;
+        loop {
+            let mut kept = [0; NETS_PORTION];
+            let (count, next) = files.nets_kept_by_fork_from(start, &mut kept);
+            assert!(count <= NETS_PORTION);
+            let portion = &kept[..count];
+            for (i, d) in portion.iter().enumerate() {
+                assert!(!portion[..i].contains(d), "once within a portion");
+            }
+            seen.extend_from_slice(portion);
+            portions += 1;
+            match next {
+                Some(fd) => start = fd,
+                None => break,
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, (0..200).collect::<std::vec::Vec<_>>());
+        // A description that a later descriptor names again may come in a
+        // later portion again; the service takes it once.
+        assert!(portions >= 4, "200 descriptions in portions of 64");
+    }
+
     /// A socket is a descriptor of its own kind: the child of a fork keeps
     /// each description once and not the ones marked close-on-fork, the
     /// last close hands the description to the hook, and `fstat` answers
@@ -1692,17 +1891,17 @@ mod net_tests {
     fn a_socket_descriptor_is_kept_by_fork_closed_by_hook_and_stat_without_a_request() {
         let mut files = files();
         let both = DescriptorFlags::default();
-        let a = files.insert(Target::Net(0x1005), both).unwrap();
-        let b = files.insert(Target::Net(0x1005), both).unwrap();
+        let a = files.insert(net(0x1005), both).unwrap();
+        let b = files.insert(net(0x1005), both).unwrap();
         let skipped = DescriptorFlags {
             close_on_exec: false,
             close_on_fork: true,
         };
-        files.insert(Target::Net(0x2006), skipped).unwrap();
-        let c = files.insert(Target::Net(0x3007), both).unwrap();
-        let mut kept = [0; OPEN_MAX];
-        let count = files.nets_kept_by_fork(&mut kept);
-        assert_eq!(&kept[..count], &[0x1005, 0x3007]);
+        files.insert(net(0x2006), skipped).unwrap();
+        let c = files.insert(net(0x3007), both).unwrap();
+        let mut kept = [0; NETS_PORTION];
+        let (count, next) = files.nets_kept_by_fork_from(0, &mut kept);
+        assert_eq!((&kept[..count], next), (&[0x1005, 0x3007][..], None));
         let info = files.descriptor_information(a).unwrap();
         assert_eq!(
             (info.kind, info.permissions, info.device, info.inode),

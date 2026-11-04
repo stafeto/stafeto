@@ -1148,6 +1148,16 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
 /// again: the service never saw it. The errors: send's, the service's
 /// status, BAD_SIZE for a reply without the session.
 pub fn clone_session(session: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
+    clone_session_word(session, request).map(|(clone, _)| clone)
+}
+
+/// `clone_session` for a service whose reply to CLONE has a word after the
+/// status (the network service's birth, which CLONE_MORE names): the new
+/// session and the word, 0 when the reply has none.
+pub fn clone_session_word(
+    session: &Handle<Channel>,
+    request: &[u8],
+) -> Result<(Handle<Channel>, u32), Status> {
     let mut reply = loop {
         match sys::send(session, request) {
             Err(Error::Interrupted) => {
@@ -1161,8 +1171,13 @@ pub fn clone_session(session: &Handle<Channel>, request: &[u8]) -> Result<Handle
         }
     };
     let mut buffer = [0; MESSAGE_MAX];
-    match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
-        Status::Ok => reply.handles.take(0).map_err(|_| Status::BadSize),
+    let mut body = Reader::new(reply.bytes(&mut buffer));
+    match Status::from_code(body.u32()?) {
+        Status::Ok => {
+            let word = body.u32().unwrap_or(0);
+            let clone = reply.handles.take(0).map_err(|_| Status::BadSize)?;
+            Ok((clone, word))
+        }
         status => Err(status),
     }
 }
@@ -1188,6 +1203,18 @@ struct LongOp {
 pub struct LongSession {
     count: u8,
     head: Option<u16>,
+}
+
+impl LongSession {
+    /// Whether the session has no operation that waits.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    /// How many operations of the session wait.
+    pub fn count(&self) -> usize {
+        usize::from(self.count)
+    }
 }
 
 /// The long operations of a service in two steps (proto_wire::long): N at
@@ -1361,6 +1388,22 @@ impl<const N: usize> LongOps<N> {
         }
     }
 
+    /// The key of the operation at the head of the session's list, in O(1).
+    pub fn first(&self, session: &LongSession) -> Option<u64> {
+        let index = usize::from(session.head?);
+        Some((u64::from(self.generations[index]) << 32) | (index as u64 + 1))
+    }
+
+    /// The first `n` operations of the session go with their handles, as
+    /// `gone` lets all of them go; true when some are left. O(n).
+    pub fn gone_some(&mut self, session: &mut LongSession, n: usize) -> bool {
+        for _ in 0..n {
+            let Some(head) = session.head else { break };
+            self.free_place(session, usize::from(head));
+        }
+        session.head.is_some()
+    }
+
     /// The operations that wait, and the handles they hold.
     pub fn counts(&self) -> (usize, usize) {
         let live = self.ops.iter().flatten().count();
@@ -1384,6 +1427,35 @@ impl<const N: usize> LongOps<N> {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod long_portion_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_lets_go_of_its_operations_a_portion_at_a_time() {
+        let mut ops = LongOps::<8>::new();
+        let mut mine = LongSession::default();
+        let mut other = LongSession::default();
+        let mut keys = [0u64; 6];
+        for key in &mut keys {
+            *key = ops.start(&mut mine, 7).unwrap();
+        }
+        let kept = ops.start(&mut other, 8).unwrap();
+        // The head is the last started.
+        assert_eq!(ops.first(&mine), Some(keys[5]));
+        assert!(ops.gone_some(&mut mine, 4));
+        assert_eq!(ops.first(&mine), Some(keys[1]));
+        assert!(!ops.waits(7, keys[5]) && !ops.waits(7, keys[2]) && ops.waits(7, keys[1]));
+        assert!(
+            !ops.gone_some(&mut mine, 4),
+            "the last two go, none are left"
+        );
+        assert!(mine.is_empty() && ops.first(&mine).is_none());
+        assert!(ops.waits(8, kept), "another session's operation stays");
+        assert!(!ops.gone_some(&mut mine, 4), "nothing left, nothing to do");
     }
 }
 

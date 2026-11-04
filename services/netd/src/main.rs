@@ -63,7 +63,9 @@ use proto_net::sockets;
 use proto_net::{Method, VERSION, code};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
-use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
+use rt::service::{
+    Answer, Config, Heartbeat, LongSession, Notice, Pending, Request, Service, Session,
+};
 use rt::{Handle, sys};
 use second::Second;
 use smoltcp::iface::SocketStorage;
@@ -1267,9 +1269,9 @@ impl Service<0> for Driver<'_> {
     /// let go of in steps.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
-        self.net.abandon(s);
         let held = core::mem::take(&mut s.data.held);
-        if self.net.depart(&mut self.stack, held) {
+        let long = core::mem::take(&mut s.data.long);
+        if self.net.depart(&mut self.stack, held, long) {
             self.cleanup();
         }
         self.net.step_due = true;
@@ -1280,7 +1282,9 @@ impl Service<0> for Driver<'_> {
     fn closed(&mut self, label: u64) {
         rt::service::step_own();
         if let Some(held) = self.net.unborn(label)
-            && self.net.depart(&mut self.stack, held)
+            && self
+                .net
+                .depart(&mut self.stack, held, LongSession::default())
         {
             self.cleanup();
         }

@@ -108,7 +108,12 @@ impl ResourceLimits {
             soft: 8 * 1024 * 1024,
             hard: 8 * 1024 * 1024,
         };
-        values[NOFILE] = Limit { soft: 64, hard: 64 };
+        // The layer's table of descriptors names 1 024 numbers: the limit
+        // cannot go higher (`posix_fd::Table::set_allocation_limit`).
+        values[NOFILE] = Limit {
+            soft: 1024,
+            hard: 1024,
+        };
         values[STACK] = Limit {
             soft: 64 * 1024,
             hard: 64 * 1024,
@@ -241,6 +246,6 @@ mod tests {
         }
         assert_eq!(limits.values[CORE].hard, 0);
         assert_eq!(limits.values[STACK].hard, 64 * 1024);
-        assert_eq!(limits.values[NOFILE].hard, 64);
+        assert_eq!(limits.values[NOFILE].hard, 1024);
     }
 }

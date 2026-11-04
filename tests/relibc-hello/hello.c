@@ -118,7 +118,7 @@ static int files(void) {
     struct utsname name;
     CHECK(uname(&name) == 0 && strcmp(name.sysname, "stafeto") == 0);
     struct rlimit limit;
-    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 64);
+    CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur == 1024);
 
     /* Pages back from an edge and from the middle, which splits the
      * mapping: then each piece left goes alone. */
@@ -741,9 +741,9 @@ static int constants(void) {
         printf("relibc-hello: sysconf claims the XSI option or the wrong version\n");
         return 24;
     }
-    /* The layer's descriptor table holds 64. */
-    if (sysconf(_SC_OPEN_MAX) != 64 || errno != 0) {
-        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 64\n", sysconf(_SC_OPEN_MAX));
+    /* The layer's descriptor table holds 1 024. */
+    if (sysconf(_SC_OPEN_MAX) != 1024 || errno != 0) {
+        printf("relibc-hello: sysconf(_SC_OPEN_MAX) is %ld, expected 1024\n", sysconf(_SC_OPEN_MAX));
         return 25;
     }
     /* The CPUs: sysconf, the mask of sched_getaffinity and the CPU the thread
