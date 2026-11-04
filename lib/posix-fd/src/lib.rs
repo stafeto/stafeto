@@ -2958,6 +2958,9 @@ mod tests {
         let memory = Box::leak(Box::new(
             core::mem::MaybeUninit::<EntryPage<u32, 4>>::uninit(),
         ));
+        // Memory that is not zero, as a heap page that was used before.
+        // SAFETY: the leaked box is writable for its size.
+        unsafe { core::ptr::write_bytes(memory.as_mut_ptr(), 0xA5, 1) };
         // SAFETY: the memory is aligned, writable, and leaked for good.
         assert!(unsafe { table.add_page(k, NonNull::new(memory.as_mut_ptr()).unwrap()) });
     }
