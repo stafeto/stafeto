@@ -629,8 +629,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// 10.1%, under one page to the probe's 90% (#300). With 576 pages and the
 /// relibc of #432 the workload measures 499: 13.4% left, 19 pages to 90%,
 /// near the cost of a thread of the volley (20 pages). The steps probe
-/// reserves 250 of them on the 2 GiB machine, 24 MiB more.
-const STEPS_QUOTA: u64 = 576 * PAGE;
+/// reserves 250 of them on the 2 GiB machine, 24 MiB more. The sockets of the
+/// network service (the layer's `net.rs`, the session in fork and spawn)
+/// added 22: 521 measured, and 608 pages leave 14.3%, 26 pages to 90%.
+const STEPS_QUOTA: u64 = 608 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retained 572 charged pages when it was set to 704. The
