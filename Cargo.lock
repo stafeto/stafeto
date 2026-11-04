@@ -1221,6 +1221,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-net"
+version = "0.1.0"
+dependencies = [
+ "virtio-drivers",
+ "virtio-mmio",
+]
+
+[[package]]
 name = "virtio-pci"
 version = "0.1.0"
 
