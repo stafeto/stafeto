@@ -223,7 +223,7 @@ impl<const D: usize> TxRing<D> {
     /// header) on the wire: its sums, its header, the queue.
     fn submit(&mut self, n: u16, len: usize) {
         // SAFETY: the buffer is the pool's and the device does not hold it.
-        let slice = unsafe { buffer_at(n) };
+        let slice = unsafe { buffer_at::<D>(n) };
         frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
         let Some(total) = frames::tx_prepare(slice, len) else {
             self.book.release(n);
@@ -482,7 +482,7 @@ impl<const D: usize> NetDevice<D> {
             };
             let request = frames::arp_request(self.mac, sender, target);
             // SAFETY: the buffer is the pool's and the device does not hold it.
-            let slice = unsafe { buffer_at(n) };
+            let slice = unsafe { buffer_at::<D>(n) };
             slice[HDR_LEN..HDR_LEN + request.len()].copy_from_slice(&request);
             self.tx.submit(n, request.len());
             queued += 1;

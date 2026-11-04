@@ -174,6 +174,7 @@ impl Second {
                 prefix: cidr.prefix,
                 gateway: None,
                 dns: None,
+                servers: [None; netd::resolv::SERVERS],
             });
             rt::println!("net: static1 {}/{}", Ip(cidr.address), cidr.prefix);
         }
@@ -255,6 +256,8 @@ impl Second {
                     prefix: config.address.prefix_len(),
                     gateway: config.router.map(|r| r.octets()),
                     dns: config.dns_servers.first().map(|d| d.octets()),
+                    // The second device writes no resolv.conf.
+                    servers: [None; netd::resolv::SERVERS],
                 };
                 self.apply(&lease);
                 // The summary keeps what the server offered; only the

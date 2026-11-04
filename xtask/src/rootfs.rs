@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 37] = [
+const SYSTEM_PATHS: [&str; 38] = [
     "/bin",
     "/lib",
     "/lib/libc.so",

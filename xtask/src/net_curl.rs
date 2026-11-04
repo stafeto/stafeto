@@ -101,7 +101,7 @@ const ANSWERED_TCP: usize = 32;
 /// only when the service asked for its gateway's address before (the ARP
 /// request of the gateway every 30 s); while this is true a closed first
 /// connection that stays open is a warning.
-pub const CLOSED_PORT_NEEDS_GATEWAY_REQUEST: bool = true;
+pub const CLOSED_PORT_NEEDS_GATEWAY_REQUEST: bool = false;
 
 /// The image of the run with the counted steps.
 pub const STEPS_IMAGE: &str = "boot-net-curl-steps.img";
