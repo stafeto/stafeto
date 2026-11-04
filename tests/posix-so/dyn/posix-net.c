@@ -2518,8 +2518,10 @@ static void buffer_recv(void)
 	pthread_t t;
 	REQUIRE(pthread_create(&t, NULL, write_all, &w) == 0);
 	REQUIRE(recv(s, in, sizeof in, MSG_WAITALL) == (ssize_t)sizeof in);
+	/* The bytes before the join: a wrong count leaves the writer waiting. */
+	REQUIRE(same(in, 0, sizeof in, 2));
 	REQUIRE(pthread_join(t, NULL) == 0);
-	REQUIRE(!w.bad && same(in, 0, sizeof in, 2));
+	REQUIRE(!w.bad);
 	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
 }
 
@@ -2587,6 +2589,21 @@ static void buffer_writev(void)
 	REQUIRE(r.got == sizeof whole && !r.bad);
 	/* The reader read by messages (700 bytes): the counter grew by the send. */
 	REQUIRE(buffers_word(c, SO_STAFETO_BUFFERED) - before >= 64);
+	/* Eight parts of 700 bytes, each small enough for a message: as one
+	 * send of 5 600 bytes they go through the buffer, part by part none
+	 * would. */
+	struct iovec small[8];
+	for (int i = 0; i < 8; i++) {
+		small[i].iov_base = whole + 700 * i;
+		small[i].iov_len = 700;
+	}
+	before = buffers_word(c, SO_STAFETO_BUFFERED);
+	r = (struct reader){ s, 5600, 700, 0, 4, 0, 0, 0 };
+	REQUIRE(pthread_create(&t, NULL, read_all, &r) == 0);
+	REQUIRE(writev(c, small, 8) == 5600);
+	REQUIRE(pthread_join(t, NULL) == 0);
+	REQUIRE(r.got == 5600 && !r.bad);
+	REQUIRE(buffers_word(c, SO_STAFETO_BUFFERED) - before >= 5);
 	REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
 }
 
