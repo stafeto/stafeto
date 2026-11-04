@@ -1002,6 +1002,7 @@ impl Shadow {
                     posix_fs::Target::Error => Names::Error,
                     posix_fs::Target::Ram(n) => Names::File(n.fd()),
                     posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                    posix_fs::Target::Net(n) => Names::Net(n),
                     posix_fs::Target::Fifo(n) => Names::Fifo {
                         packed: n.packed(),
                         ram_generation: n.ram_generation(),
@@ -1080,6 +1081,22 @@ impl Shadow {
             }
         }
         (ends, found)
+    }
+
+    /// The descriptions of sockets the child's session shares, each once.
+    fn shared_nets(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
+        let (list, count) = self.descriptors();
+        let mut out = [0; posix_fs::OPEN_MAX];
+        let mut found = 0;
+        for d in &list[..count] {
+            if let proto_loader::Names::Net(n) = d.names
+                && !out[..found].contains(&n)
+            {
+                out[found] = n;
+                found += 1;
+            }
+        }
+        (out, found)
     }
 
     /// The caller lets go: its holds end and the descriptors the actions
@@ -1885,6 +1902,10 @@ fn move_files(c: &Handle<Channel>) -> bool {
     }
     // The screen goes back with the old image (spec 3, 3.5).
     crate::display::release_for_exec();
+    // The operations of the stopped threads that wait in the session with the
+    // network service go: the new image gets the session itself, with the
+    // descriptions of the descriptors that stay.
+    crate::net::abandon();
     let mut kept = [rt::fs::PreparedOpen {
         fd: 0,
         slot: 0,
@@ -1941,6 +1962,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Terminal, moved(terminal)),
             (Slot::Entropy, moved(crate::random::session())),
             (Slot::Display, moved(crate::display::session())),
+            (Slot::Net, moved(crate::net::session())),
         ],
     ) == 0
 }
@@ -2054,6 +2076,8 @@ fn commit(
     };
     let entropy = crate::fork::entropy_clone();
     let display = crate::display::clone_session();
+    let (nets, count) = shadow.shared_nets();
+    let net = crate::net::clone_kept(&nets[..count])?;
     let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
@@ -2062,6 +2086,7 @@ fn commit(
         (Slot::Terminal, terminal),
         (Slot::Entropy, entropy),
         (Slot::Display, display),
+        (Slot::Net, net),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);

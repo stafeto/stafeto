@@ -40,6 +40,10 @@ struct Mode<'a> {
     /// Asked once after the start has answered WAIT and before the first
     /// take: false ends the operation with EAGAIN (a cancel).
     check: Option<&'a dyn Fn() -> bool>,
+    /// A handler that ran since the operation began ends the wait whether
+    /// or not it had SA_RESTART (connect, XSH: the connection goes on and
+    /// the call fails with EINTR).
+    every_handler: bool,
 }
 impl Mode<'_> {
     fn plain(point: bool, authenticated: bool) -> Self {
@@ -50,6 +54,7 @@ impl Mode<'_> {
             custody: None,
             deadline: None,
             check: None,
+            every_handler: false,
         }
     }
 }
@@ -405,6 +410,30 @@ pub(crate) fn run_terminal(
     )
 }
 
+/// `run_with` for an operation that SA_RESTART does not restart: the wait
+/// ends with EINTR as soon as any handler has run since the operation began.
+/// The operation goes on in the service after "cancel k" (a connection
+/// handshake), so a later call can see its end.
+pub fn run_no_restart(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(
+        service,
+        Start::Once(start),
+        keyed,
+        out,
+        refusal,
+        Mode {
+            every_handler: true,
+            ..Mode::plain(true, false)
+        },
+    )
+}
+
 // Private sentinel: only a decoded service START refusal produces it.
 const ADMISSION_LIMIT: i32 = -31002;
 
@@ -436,6 +465,7 @@ pub(crate) fn run_drain(
             custody,
             deadline: None,
             check: None,
+            every_handler: false,
         },
     )
     .map(drop)
@@ -493,11 +523,17 @@ fn run_in(
         custody,
         deadline,
         check,
+        every_handler,
     } = mode;
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
     let block = crate::threads::own_block();
     let _outer = OuterRestart::enter(&block.flags);
+    let began = block.handled.load(Ordering::SeqCst);
+    let stop = || {
+        ending(&block.flags, point)
+            || (every_handler && block.handled.load(Ordering::SeqCst) != began)
+    };
     let admission = matches!(start, Start::Admission(_));
     let start_refusal = |status| {
         if admission && status == Status::Kernel(Error::LimitReached) {
@@ -507,7 +543,7 @@ fn run_in(
         }
     };
     let key = loop {
-        if admission && ending(&block.flags, point) {
+        if admission && stop() {
             return Err(EINTR);
         }
         let reply = match &start {
@@ -548,7 +584,7 @@ fn run_in(
             // entries around the operation: with one, the kernel would end
             // every wait and no handler would run, and the start would go
             // on for ever.
-            Err(EINTR) if !ending(&block.flags, point) => {}
+            Err(EINTR) if !stop() => {}
             Err(error) => return Err(error),
             Ok(_) => return Err(EIO),
         }
@@ -601,7 +637,7 @@ fn run_in(
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => {}
                 Ok(_) => break 'wait Some(EIO),
-                Err(EINTR) if ending(&block.flags, point) => break 'wait None,
+                Err(EINTR) if stop() => break 'wait None,
                 Err(EINTR) => armed = false,
                 Err(error) => break 'wait Some(error),
             }
@@ -637,7 +673,7 @@ fn run_in(
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => armed = true,
                 Ok(_) => break 'wait Some(EIO),
-                Err(EINTR) if ending(&block.flags, point) => break 'wait None,
+                Err(EINTR) if stop() => break 'wait None,
                 Err(EINTR) => continue,
                 Err(error) => break 'wait Some(error),
             }
@@ -646,7 +682,7 @@ fn run_in(
         // blocks; one that comes from here on stays pending and makes
         // `receive` return at once.
         let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-        if ending(&block.flags, point) {
+        if stop() {
             drop(guard);
             break 'wait None;
         }
@@ -685,7 +721,7 @@ fn run_in(
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
                     Ok(_) => break 'wait Some(EIO),
-                    Err(EINTR) if ending(&block.flags, point) => break 'wait None,
+                    Err(EINTR) if stop() => break 'wait None,
                     // The service told once and keeps the result for the
                     // next "take"; it tells no second time, so the take
                     // goes again with a new copy and does not wait.
@@ -705,7 +741,7 @@ fn run_in(
             }
             Ok(_) => {}
             Err(Error::Interrupted) => {
-                if ending(&block.flags, point) {
+                if stop() {
                     break 'wait None;
                 }
                 // Every handler that ran had SA_RESTART: wait on.

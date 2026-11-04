@@ -552,6 +552,7 @@ const TCSETSF: c_ulong = 0x5404;
 const TCSBRK: c_ulong = 0x5409;
 const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
+const FIONBIO: c_ulong = 0x5421;
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCNOTTY: c_ulong = 0x5422;
 const TIOCGWINSZ: c_ulong = 0x5413;
@@ -737,6 +738,15 @@ pub unsafe extern "C" fn stafeto_ioctl(
 ) -> c_int {
     if request == TCGETS {
         return get_termios_fd(fd, argument).unwrap_or_else(|errno| -errno);
+    }
+    // FIONBIO sets O_NONBLOCK of a socket of the network service.
+    if request == FIONBIO && posix_abi::net::is_net(fd) {
+        if argument.is_null() {
+            return -EFAULT;
+        }
+        // SAFETY: FIONBIO's argument is a readable int.
+        let on = unsafe { argument.cast::<c_int>().read() } != 0;
+        return posix_abi::net::nonblocking(fd, on).map_or_else(|errno| -errno, |()| 0);
     }
     // relibc tcdrain uses precisely this command. Its cancellation point
     // surrounds the descriptor hold, so cleanup runs after release.

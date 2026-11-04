@@ -199,8 +199,25 @@ pub const GPU: &[&str] = &[
 /// networking: the only way in).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Forward {
+    pub proto: Proto,
     pub host: u16,
     pub guest: u16,
+}
+
+/// The protocol of a forwarded port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    fn name(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
 }
 
 /// The MAC address of the guest's network device.
@@ -217,7 +234,12 @@ pub const NET_MAC: &str = "52:54:00:12:34:56";
 pub fn net(forwards: &[Forward]) -> Vec<String> {
     let mut netdev = String::from("user,id=n0");
     for f in forwards {
-        netdev += &format!(",hostfwd=tcp:127.0.0.1:{}-:{}", f.host, f.guest);
+        netdev += &format!(
+            ",hostfwd={}:127.0.0.1:{}-:{}",
+            f.proto.name(),
+            f.host,
+            f.guest
+        );
     }
     let mut a = vec![
         "-netdev".to_owned(),
@@ -1191,10 +1213,12 @@ mod tests {
         ));
         let two = net(&[
             Forward {
+                proto: Proto::Tcp,
                 host: 8080,
                 guest: 80,
             },
             Forward {
+                proto: Proto::Udp,
                 host: 2222,
                 guest: 22,
             },
@@ -1202,7 +1226,7 @@ mod tests {
         .join(" ");
         assert!(
             two.contains(
-                "user,id=n0,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:2222-:22"
+                "user,id=n0,hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=udp:127.0.0.1:2222-:22"
             )
         );
     }

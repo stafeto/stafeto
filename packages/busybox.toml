@@ -46,6 +46,7 @@ files = [
   "/bin/fold = link:busybox",
   "/bin/grep = link:busybox",
   "/bin/head = link:busybox",
+  "/bin/httpd = link:busybox",
   "/bin/id = link:busybox",
   "/bin/kill = link:busybox",
   "/bin/ln = link:busybox",

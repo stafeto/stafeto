@@ -231,6 +231,9 @@ fn transport() -> Result<Transport, i32> {
 }
 
 pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
+    if domain == AF_INET && crate::net::session().is_some() {
+        return crate::net::socket(domain, kind, protocol);
+    }
     let (ty, nonblock, cloexec) = kind_of(kind)?;
     let domain = domain_of(domain, protocol, ty)?;
     let transport = transport()?;
@@ -395,6 +398,9 @@ fn c_address(addr: &Addr, inet: bool, out: &mut [u8]) -> usize {
 }
 
 pub fn bind(fd: i32, raw: &[u8], umask: u32) -> Result<(), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::bind(fd, raw);
+    }
     with_socket(fd, |transport, end| {
         let (addr, made) = wire_address(transport, end, raw, Use::Bind, umask)?;
         let mut w = Writer::new();
@@ -410,12 +416,18 @@ pub fn bind(fd: i32, raw: &[u8], umask: u32) -> Result<(), i32> {
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::listen(fd, backlog);
+    }
     with_socket(fd, |transport, end| {
         simple(transport, Method::SockListen, end, &[backlog.max(0) as u32])
     })
 }
 
 pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::connect(fd, raw);
+    }
     let point = crate::threads::cancel::Point::begin();
     let result = with_socket(fd, |transport, end| {
         let (addr, _) = if raw.len() >= 2 && u16::from_ne_bytes([raw[0], raw[1]]) == 0 {
@@ -503,6 +515,9 @@ fn cancel_request(method: Method, key: u64, end: Endpoint, w: &mut Writer) -> Re
 /// ACCEPT: a descriptor for the next connection, with the peer's address
 /// into `out` (its true length). `flags` are SOCK_NONBLOCK and SOCK_CLOEXEC.
 pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::accept(fd, out, flags);
+    }
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return Err(EINVAL);
     }
@@ -569,10 +584,16 @@ fn name(fd: i32, peer: bool, out: &mut [u8]) -> Result<usize, i32> {
 }
 
 pub fn getsockname(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::getsockname(fd, out);
+    }
     name(fd, false, out)
 }
 
 pub fn getpeername(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::getpeername(fd, out);
+    }
     name(fd, true, out)
 }
 
@@ -601,6 +622,9 @@ fn option_number(level: i32, name: i32) -> Result<Option<u32>, i32> {
 
 /// getsockopt: the int of the option into `out`; its true length, 4.
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::getsockopt(fd, level, name, out);
+    }
     let number = option_number(level, name)?;
     with_socket(fd, |transport, end| {
         let value = match number {
@@ -615,6 +639,9 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usiz
 }
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::setsockopt(fd, level, name, value);
+    }
     let number = option_number(level, name)?;
     if value.len() < 4 {
         return Err(EINVAL);
@@ -627,6 +654,9 @@ pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i3
 }
 
 pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::shutdown(fd, how);
+    }
     if !(0..=SHUT_RDWR).contains(&how) {
         return Err(EINVAL);
     }
@@ -637,6 +667,9 @@ pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
 
 /// sockatmark: no socket has out-of-band data.
 pub fn sockatmark(fd: i32) -> Result<i32, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::sockatmark(fd);
+    }
     with_socket(fd, |transport, end| {
         option(transport, end, OPT_ATMARK, false, 0).map(|mark| mark as i32)
     })
@@ -754,6 +787,9 @@ pub fn send(
     iov: &[&[u8]],
     control: &[u8],
 ) -> Result<usize, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::send(fd, flags, name, iov, control);
+    }
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire = wire_flags(flags)?;
     let point = crate::threads::cancel::Point::begin();
@@ -801,7 +837,7 @@ pub fn send(
 }
 
 /// Up to `out.len()` bytes of `iov` from `offset` on, into `out`: how many.
-fn gather(iov: &[&[u8]], offset: usize, out: &mut [u8]) -> usize {
+pub(crate) fn gather(iov: &[&[u8]], offset: usize, out: &mut [u8]) -> usize {
     let (mut skip, mut put) = (offset, 0);
     for part in iov {
         if skip >= part.len() {
@@ -820,7 +856,7 @@ fn gather(iov: &[&[u8]], offset: usize, out: &mut [u8]) -> usize {
 }
 
 /// `bytes` into `iov` from `offset` on.
-fn scatter(iov: &mut [&mut [u8]], offset: usize, bytes: &[u8]) {
+pub(crate) fn scatter(iov: &mut [&mut [u8]], offset: usize, bytes: &[u8]) {
     let (mut skip, mut at) = (offset, 0);
     for part in iov.iter_mut() {
         if skip >= part.len() {
@@ -858,6 +894,9 @@ pub fn recv(
     iov: &mut [&mut [u8]],
     control: &mut [u8],
 ) -> Result<Message, i32> {
+    if crate::net::is_net(fd) {
+        return crate::net::recv(fd, flags, name, iov, control);
+    }
     let size: usize = iov.iter().map(|part| part.len()).sum();
     let wire = wire_flags(flags)?;
     let point = crate::threads::cancel::Point::begin();

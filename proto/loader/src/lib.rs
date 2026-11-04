@@ -140,6 +140,10 @@ pub enum Names {
     /// service the child gets, which holds it (5e). The loader takes the
     /// kind only with a session in the slot Pipes.
     Pipe(u32),
+    /// The socket description of this number in the session of the network
+    /// service the child gets, which holds it. The loader takes the kind
+    /// only with a session in the slot Net.
+    Net(u32),
     /// The terminal of this number of the terminal service, which the
     /// child's session in the slot Terminal serves (5f); the loader takes
     /// the kind only with that session.
@@ -181,6 +185,7 @@ impl Descriptor {
             Names::Error => (2, 0, 0, 0),
             Names::File(n) => (3, n, 0, 0),
             Names::Pipe(n) => (4, n, 0, 0),
+            Names::Net(n) => (10, n, 0, 0),
             Names::Terminal(n) => (5, n, 0, 0),
             Names::Random(n) => (6, n, 0, 0),
             Names::PendingTerminal(n) => (7, n, 0, 0),
@@ -223,6 +228,7 @@ impl Descriptor {
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
+            (10, n) => Names::Net(n),
             (5, n) => Names::Terminal(n),
             (6, n) => Names::Random(n),
             (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
@@ -426,14 +432,18 @@ pub enum Slot {
     /// (`proto_gpu`): fork and spawn give the child a CLONE of it, exec moves
     /// it. Empty in an image without the display service.
     Display = 11,
+    /// The process's session with the network service, a `Net` session
+    /// (`proto_net`): fork and spawn give the child a CLONE of it, exec moves
+    /// it. Empty in an image without the network service.
+    Net = 12,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 12;
+pub const SLOTS: usize = 13;
 
 impl Slot {
     /// The sessions Handles brings, in their order.
-    pub const GIVEN: [Slot; 7] = [
+    pub const GIVEN: [Slot; 8] = [
         Slot::Files,
         Slot::Clock,
         Slot::Driver,
@@ -441,6 +451,7 @@ impl Slot {
         Slot::Terminal,
         Slot::Entropy,
         Slot::Display,
+        Slot::Net,
     ];
 
     /// The bit of this slot in Fork's required session mask.
@@ -470,6 +481,7 @@ impl Slot {
             9 => Some(Slot::Terminal),
             10 => Some(Slot::Entropy),
             11 => Some(Slot::Display),
+            12 => Some(Slot::Net),
             _ => None,
         }
     }
@@ -558,6 +570,7 @@ impl<'a> Block<'a> {
                     Names::File(_) | Names::Random(_) | Names::Fifo { .. }
                 ) | (Slot::Entropy, Names::Random(_))
                     | (Slot::Pipes, Names::Pipe(_) | Names::Fifo { .. })
+                    | (Slot::Net, Names::Net(_))
                     | (
                         Slot::Terminal,
                         Names::Terminal(_) | Names::PendingTerminal(_)
@@ -874,7 +887,7 @@ pub struct Start {
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 6;
+pub const START_VERSION: u32 = 7;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
@@ -884,7 +897,10 @@ pub const DYNAMIC: u32 = 2;
 pub const AUXV_PAIRS: usize = 8;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 192);
+const _: () = assert!(START_SIZE == 200);
+/// Where the initial stack starts in the area: the header rounded up to 16,
+/// the alignment the stack needs.
+const STACK_AT: usize = START_SIZE.next_multiple_of(16);
 
 /// The entries of the memory map the loader hands over at most: the three
 /// segments of a program, the three of libc.so, its stack and the start area
@@ -938,7 +954,7 @@ impl MapEntry {
 pub const fn area_len(block: &Block<'_>) -> usize {
     let stack = 8 * (1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS);
     let strings = block.cwd.len() + 1 + block.strings.len() + block.descriptors.len();
-    (START_SIZE + stack + MAP_ENTRIES * MAP_ENTRY + strings).next_multiple_of(16)
+    (STACK_AT + stack + MAP_ENTRIES * MAP_ENTRY + strings).next_multiple_of(16)
 }
 
 /// Writes the start area of `block` into `area`, which lies at `at` in the
@@ -961,7 +977,7 @@ pub fn write_area(
     if maps.len() > MAP_ENTRIES {
         return Err(BlockError::Malformed);
     }
-    let stack_at = START_SIZE;
+    let stack_at = STACK_AT;
     let words = 1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS;
     let maps_at = stack_at + 8 * words;
     for (i, entry) in maps.iter().enumerate() {
@@ -1638,8 +1654,14 @@ mod tests {
             handle_slots(Reader::new(w.as_bytes()), 1),
             Ok([Some(Slot::Display), None, None, None])
         );
+        let w = body(&[12]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 1),
+            Ok([Some(Slot::Net), None, None, None])
+        );
         for (slots, count) in [
-            (&[12][..], 1),
+            (&[13][..], 1),
+            (&[12, 12][..], 2),
             (&[11, 11][..], 2),
             (&[10, 10][..], 2),
             (&[4, 5, 6, 8, 5][..], 5),
@@ -1734,7 +1756,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -1795,6 +1817,10 @@ mod tests {
                 names: Names::Terminal(0),
             },
             Descriptor {
+                fd: 8,
+                names: Names::Net(3),
+            },
+            Descriptor {
                 fd: 7,
                 names: Names::Random(11),
             },
@@ -1815,6 +1841,7 @@ mod tests {
         assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
         assert_eq!(read.strings(), b"ls\0");
         assert!(read.needs(Slot::Pipes) && read.needs(Slot::Terminal) && read.needs(Slot::Files));
+        assert!(read.needs(Slot::Net));
         let mut plain = vec![0; BLOCK_MAX];
         let plain_len = Block::write_with(
             &mut plain,
@@ -1828,6 +1855,7 @@ mod tests {
         .unwrap();
         let plain = Block::read(&plain[..plain_len]).unwrap();
         assert!(!plain.needs(Slot::Pipes) && !plain.needs(Slot::Terminal));
+        assert!(!plain.needs(Slot::Net));
         let mut random = vec![0; BLOCK_MAX];
         let random_len = Block::write_with(
             &mut random,
@@ -2032,6 +2060,29 @@ mod tests {
         );
     }
 
+    /// The network slot is a given slot: its bit is in the required mask, and
+    /// all eight given slots go in two Handles of four.
+    #[test]
+    fn the_net_slot_is_given_with_the_others() {
+        assert_ne!(Slot::GIVEN_MASK & (1 << 12), 0);
+        assert_eq!(Slot::given(12), Some(Slot::Net));
+        assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Net);
+        let slots = Slot::GIVEN.map(|slot| slot as u32);
+        for half in slots.chunks(abi::MESSAGE_HANDLES) {
+            let mut w = Writer::new();
+            for s in half {
+                w.u32(*s).unwrap();
+            }
+            let got = handle_slots(Reader::new(w.as_bytes()), half.len()).unwrap();
+            assert_eq!(got.iter().flatten().count(), half.len());
+        }
+        let d = Descriptor {
+            fd: 3,
+            names: Names::Net(0x1_2345),
+        };
+        assert_eq!(Descriptor::read(&d.bytes()), Some(d));
+    }
+
     /// Required sessions are declared independently of offered Handles.
     #[test]
     fn fork_accepts_only_given_session_bits() {
@@ -2110,7 +2161,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (6, 8, 8));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (7, 8, 8));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];
@@ -2324,7 +2375,7 @@ mod tests {
                 image: false,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();

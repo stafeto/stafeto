@@ -1823,6 +1823,45 @@ mod tests {
         assert!(net::NETD.connects.contains(&ram.name));
     }
 
+    /// Only the image with the network service gives its launcher (and so
+    /// the shell) a session with it, and its process service has the pool
+    /// for the children of `httpd`: ten more quotas of a command than the
+    /// shell's image.
+    #[test]
+    fn the_network_session_goes_to_the_launcher_of_the_network_image_alone() {
+        let has = |table: &[Record]| table.iter().any(|r| r.connects.contains(&NET_SERVICE));
+        assert!(has(net::NET_TABLE));
+        let launcher = net::NET_TABLE
+            .iter()
+            .find(|r| r.program == "ash-launcher")
+            .unwrap();
+        assert!(launcher.connects.contains(&NET_SERVICE));
+        assert!(
+            !ramfs::BUSYBOX_DIALOG_TABLE
+                .iter()
+                .any(|r| r.connects.contains(&NET_SERVICE))
+        );
+        for table in [
+            ramfs::TABLE,
+            ramfs::BUSYBOX_TABLE,
+            ramfs::POSIX_ABI_TABLE,
+            ramfs::POSIX_SOCK_TABLE,
+            ramfs::POSIX_POLL_TABLE,
+            ramfs::POSIX_PROCS_TABLE,
+            doom::TABLE,
+            normal::TABLE,
+        ] {
+            assert!(!has(table));
+        }
+        let plain = ramfs::BUSYBOX_DIALOG_TABLE[2];
+        let process = net::NET_TABLE[2];
+        assert_eq!(process.program, plain.program);
+        assert_eq!(
+            process.quota - plain.quota,
+            10 * ramfs::BUSYBOX_DIALOG_QUOTA
+        );
+    }
+
     #[test]
     fn fifo_broker_authority_is_limited_to_the_ram_service() {
         let ram = ramfs::POSIX_PROCS_TABLE[0];

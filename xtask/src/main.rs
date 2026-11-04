@@ -51,6 +51,7 @@ mod native_scopes;
 mod native_stop_barrier_tests;
 mod ncdu_dialog;
 mod net;
+mod net_curl;
 mod net_probe;
 mod obj_sites;
 mod openposix;
@@ -1662,8 +1663,15 @@ commands:
             of the service, and its steps under -icount (TCG only); on hvf the
             rates of the loopback; with `steps` the measurement that chooses
             the frames of a step and the limit of the sockets (TCG only)
+  net-curl [steps] [MACHINE] run the sockets of the network service from the
+            host: `httpd` of the guest answers 20 requests in a row and 8 at
+            once through a forwarded port, UDP goes both ways, `net-sock` runs
+            its checks in the guest, a new `httpd` takes the same port; with
+            `steps` the service counts its steps with real traffic (TCG only)
   net [--machine hvf] run the shell with the network service on the terminal;
-            ports 8080 and 2222 of the host are forwarded to 80 and 22
+            ports 8080 and 2222 of the host are forwarded to 80 and 22;
+            `curl -s http://127.0.0.1:8080/index.html | shasum` after
+            `httpd -f -p 80 -h /www &` fetches the page of the image
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
@@ -1912,6 +1920,7 @@ fn main() {
         },
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
+        Some("net-curl") => net_curl::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -8776,6 +8785,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // then its steps under -icount. A boot named `net-` runs in the
         // group `net` of ci.
         job("net-probe", || net_probe::probe(&qemu::VIRT)),
+        // The sockets of the network service from the host: `httpd` of the
+        // guest, UDP both ways and the checks of `net-sock`, through the
+        // ports QEMU forwards. Also in the group `net`.
+        job("net-curl", || net_curl::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

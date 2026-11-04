@@ -237,6 +237,9 @@ pub unsafe fn posix_init_process(
     // The display service, when the record names it ("gpu"); none otherwise,
     // and the screen calls give ENODEV. SAFETY: as above.
     unsafe { posix_abi::display::init(rt::service::connect(parent, "gpu").ok()) };
+    // The network service, when the record names it ("net"); none otherwise,
+    // and AF_INET stays with the pipe service's loopback. SAFETY: as above.
+    unsafe { posix_abi::net::init(rt::service::connect(parent, "net").ok()) };
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
     // CLOCK_REALTIME without IPC; a clock service without its page leaves
@@ -316,6 +319,7 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
                 random_hint: false,
             },
             Names::Pipe(n) => InheritedTarget::Ready(Target::Pipe(n)),
+            Names::Net(n) => InheritedTarget::Ready(Target::Net(n)),
             Names::Fifo {
                 packed,
                 ram_generation,
@@ -481,6 +485,10 @@ fn loaded_main() -> u64 {
                 .filter(|_| area.flags & SECURE == 0),
         )
     };
+    // The network session passes as it comes, set-ID or not: a program that
+    // inherits sockets (inetd style) keeps serving them; the service
+    // checks the identity only through the process service. SAFETY: as above.
+    unsafe { posix_abi::net::init(one(Slot::Net).map(Handle::from_raw)) };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

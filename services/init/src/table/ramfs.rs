@@ -190,7 +190,7 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// 2.98 MB whose heap grows by doubling chunks up to 512 KiB, and a child of
 /// the shell gets the shell's quota: bash-dialog passes with 1 050 pages and
 /// fails with 1 000 (bisected), and 1 160 pages leave 10.5%.
-const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
+pub(super) const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 
 /// What the process service adds to its own quota for the dialog: the
 /// children of the shell, the failed attempts of a search through PATH
@@ -206,7 +206,7 @@ const BUSYBOX_DIALOG_QUOTA: u64 = 1160 * PAGE;
 /// programs static it passed with 8 750 pages and failed with 8 625, and
 /// before the table of images 9 375 passed and 9 250 did not); 10 520 pages
 /// leave 10.0%.
-const BUSYBOX_DIALOG_POOL: u64 = 10520 * PAGE;
+pub(super) const BUSYBOX_DIALOG_POOL: u64 = 10520 * PAGE;
 
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,
@@ -629,8 +629,10 @@ const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 /// 10.1%, under one page to the probe's 90% (#300). With 576 pages and the
 /// relibc of #432 the workload measures 499: 13.4% left, 19 pages to 90%,
 /// near the cost of a thread of the volley (20 pages). The steps probe
-/// reserves 250 of them on the 2 GiB machine, 24 MiB more.
-const STEPS_QUOTA: u64 = 576 * PAGE;
+/// reserves 250 of them on the 2 GiB machine, 24 MiB more. The sockets of the
+/// network service (the layer's `net.rs`, the session in fork and spawn)
+/// added 22: 521 measured, and 608 pages leave 14.3%, 26 pages to 90%.
+const STEPS_QUOTA: u64 = 608 * PAGE;
 
 /// The probe and each child it spawns inherit this budget. The slow 1 MiB
 /// allocator growth retained 572 charged pages when it was set to 704. The

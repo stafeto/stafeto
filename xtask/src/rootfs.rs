@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 33] = [
+const SYSTEM_PATHS: [&str; 36] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -281,6 +281,11 @@ const SYSTEM_PATHS: [&str; 33] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/resolv.conf",
+    // The image with the network service: the page `httpd` serves and the
+    // probe of the sockets.
+    "/www",
+    "/www/index.html",
+    "/bin/net-sock",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -329,7 +334,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 11] = [
+pub const SHARED: [(&str, &str); 12] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -341,6 +346,7 @@ pub const SHARED: [(&str, &str); 11] = [
     ("bad-ifunc", "probes/bad-ifunc"),
     ("bad-pie", "probes/bad-pie"),
     ("display-probe", "probes/display-probe"),
+    ("net-sock", "probes/net-sock"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -372,6 +378,7 @@ fn shared_files() -> Vec<RootFile> {
             "bad-symbol" => "/bin/bad-symbol",
             "bad-ifunc" => "/bin/bad-ifunc",
             "display-probe" => "/bin/display-probe",
+            "net-sock" => "/bin/net-sock",
             _ => "/bin/bad-pie",
         };
         files.push(file(path, 0o755, ROOT, name));
@@ -974,11 +981,41 @@ const NETD_CONF_STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10
 /// another network this file is wrong.
 const RESOLV_CONF: &[u8] = b"nameserver 10.0.2.3\n";
 
+/// The bytes of `/www/index.html` of the image with the network service: 64
+/// KiB of lines from a fixed generator, so that the host knows the page
+/// without reading the image (`cargo xtask net-curl`).
+pub fn www_index() -> &'static [u8] {
+    static PAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut page = Vec::with_capacity(WWW_INDEX_LEN);
+        let mut line = 0;
+        while page.len() < WWW_INDEX_LEN {
+            let text = format!("{line:06} {:016x}{:016x}{:016x}\n", next(), next(), next());
+            page.extend_from_slice(text.as_bytes());
+            line += 1;
+        }
+        page.truncate(WWW_INDEX_LEN - 1);
+        page.push(b'\n');
+        page
+    })
+}
+
+/// The length of the page.
+pub const WWW_INDEX_LEN: usize = 64 * 1024;
+
 /// The names of the images that carry a table, which `files_of` lists.
 #[cfg(test)]
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
+    "boot-net-curl-steps.img",
     "boot-net-probe.img",
     "boot-net-probe-static.img",
     "boot-net-steps.img",
@@ -1054,7 +1091,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ),
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
-        "boot-net.img" => {
+        "boot-net.img" | "boot-net-curl-steps.img" => {
             let mut files = dialog(name);
             files.push(of(
                 "/etc/resolv.conf",
@@ -1062,6 +1099,15 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 ROOT,
                 Source::Bytes("resolv.conf", RESOLV_CONF),
             ));
+            // The page `httpd -h /www` serves, and the probe of the sockets.
+            files.push(dir("/www"));
+            files.push(of(
+                "/www/index.html",
+                0o644,
+                ROOT,
+                Source::Bytes("www-index", www_index()),
+            ));
+            files.push(file("/bin/net-sock", 0o755, ROOT, "net-sock"));
             files
         }
         "boot-net-probe-static.img" => vec![of(
@@ -1533,6 +1579,7 @@ mod tests {
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
                 "boot-net.img" => crate::net::programs(),
+                "boot-net-curl-steps.img" => crate::net_curl::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,
                 "boot-posix-procs.img" | "boot-posix-jobs.img" => &crate::POSIX_PROCS_PROGRAMS,

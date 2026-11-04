@@ -609,6 +609,10 @@ impl Net {
                     tcp::State::Closed | tcp::State::Listen | tcp::State::SynSent
                 ) {
                     self.release_place(stack, i);
+                } else if t.recv_queue() > 0 {
+                    // A close with bytes nobody read resets the connection
+                    // (RFC 1122, 4.2.2.13): the peer's next send fails.
+                    self.abort_place(stack, i);
                 } else {
                     t.close();
                     self.places.set_state(i, State::Orphan);
@@ -623,6 +627,25 @@ impl Net {
                 }
             }
             _ => self.release_place(stack, i),
+        }
+    }
+
+    /// Bytes that arrive for a stream nobody holds any more (its CLOSE came
+    /// first) reset the connection (RFC 1122, 4.2.2.13): the peer's next send
+    /// fails at once and not after the window of the orphan has filled.
+    pub fn reset_data_after_close(&mut self, stack: &mut Stack<'static>, i: usize) {
+        if self.places.state(i) != State::Orphan
+            || self.socks[i].rst_pending
+            || self.socks[i].proto != Proto::Tcp
+        {
+            return;
+        }
+        let Some(handle) = self.socks[i].handle else {
+            return;
+        };
+        let t = stack.tcp(handle);
+        if matches!(t.state(), tcp::State::FinWait1 | tcp::State::FinWait2) && t.recv_queue() > 0 {
+            self.abort_place(stack, i);
         }
     }
 

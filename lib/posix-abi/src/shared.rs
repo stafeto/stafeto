@@ -157,6 +157,13 @@ pub fn pipes_kept_by_fork(
     process_state(|files| Ok(files.pipes_kept_by_fork(out)))
 }
 
+/// The descriptions of sockets of the network service a forked child's
+/// session keeps (posix_fs::PosixFs::nets_kept_by_fork), into `out`; how
+/// many.
+pub fn nets_kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+    process_state(|files| Ok(files.nets_kept_by_fork(out)))
+}
+
 /// Runs `run` holding the lock of the process's files, for the probes of
 /// a fork while another thread holds it.
 pub(crate) fn hold(run: impl FnOnce()) {
@@ -453,6 +460,16 @@ fn terminal_reply(
     Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
 }
 
+/// The reply of a read of a socket of the network service, its bytes once
+/// they came.
+#[inline(never)]
+fn net_reply(description: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
+    let mut bytes = [0; proto_net::DATA_MAX];
+    let extent = (count as usize).min(bytes.len());
+    let n = crate::net::read(description, &mut bytes[..extent])?;
+    Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+}
+
 /// A read of `fd`: what it names held, outside the lock; the read of a
 /// pipe or of the terminal waits here. Each kind has its own frame: the
 /// reads of files stay as deep as they were (threads with small stacks
@@ -473,6 +490,7 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
             terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
         }
         Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
+        Target::Net(description) => net_reply(description, count, &mut *out),
         Target::Random(_) => random_reply(count, &mut *out),
         #[cfg(feature = "procfs")]
         Target::Proc(id) => {
@@ -662,6 +680,7 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
                     .map_err(|status| crate::error(posix_fs::FsError::from(status))),
                 // The write of a pipe waits here, outside the lock.
                 Target::Pipe(end) => crate::pipes::write(transport, end, bytes).map(|n| n as u64),
+                Target::Net(description) => crate::net::write(description, bytes).map(|n| n as u64),
                 Target::Fifo(target) => {
                     crate::pipes::write_endpoint(transport, target.endpoint(), bytes)
                         .map(|n| n as u64)
