@@ -4,35 +4,43 @@
 import Foundation
 import Virtualization
 
+let usage =
+    "usage: vz-run [--window-reports] [--cpus N] [--memory MIB] [--net N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n"
+func fail() -> Never {
+    fputs(usage, stderr)
+    exit(2)
+}
+
 // --window-reports: the guest's console is served by the terminal service,
 // which takes the size of the window of the runner's terminal as a report.
 let windowReports = CommandLine.arguments.contains("--window-reports")
 var arguments = CommandLine.arguments.filter { $0 != "--window-reports" }
-// --cpus N: the machine has N processors (one by default).
-var cpuCount = 1
-if let at = arguments.firstIndex(of: "--cpus") {
-    guard at + 1 < arguments.count, let n = Int(arguments[at + 1]), n >= 1 else {
-        fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
-        exit(2)
+/// The value of the key `name` as an integer, removed with the key from
+/// `arguments`; `fallback` when the key is absent.
+func number(_ name: String, _ fallback: UInt64, atLeast: UInt64 = 0, atMost: UInt64 = UInt64.max)
+    -> UInt64
+{
+    guard let at = arguments.firstIndex(of: name) else { return fallback }
+    guard at + 1 < arguments.count, let n = UInt64(arguments[at + 1]), n >= atLeast, n <= atMost
+    else {
+        fail()
     }
-    cpuCount = n
     arguments.removeSubrange(at...(at + 1))
+    return n
 }
+// --cpus N: the machine has N processors (one by default).
+let cpuCount = Int(number("--cpus", 1, atLeast: 1))
+// --memory MIB: the machine's memory, 512 by default, 256 at least.
+let memoryMiB = number("--memory", 512, atLeast: 256)
+// --net N: N Virtio network devices on the NAT (none by default), each
+// with a MAC address of its own that stays the same from run to run: the
+// DHCP service of macOS keeps a lease by MAC address, so the guest gets
+// the same address each time.
+let netCount = Int(number("--net", 0, atMost: 2))
 // --time SECONDS: the time the guest's clock starts at, in seconds since
 // the epoch (the host's time by default).
-var startTime = UInt64(Date().timeIntervalSince1970)
-if let at = arguments.firstIndex(of: "--time") {
-    guard at + 1 < arguments.count, let t = UInt64(arguments[at + 1]) else {
-        fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
-        exit(2)
-    }
-    startTime = t
-    arguments.removeSubrange(at...(at + 1))
-}
-guard arguments.count == 3 else {
-    fputs("usage: vz-run [--window-reports] [--cpus N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n", stderr)
-    exit(2)
-}
+let startTime = number("--time", UInt64(Date().timeIntervalSince1970))
+guard arguments.count == 3 else { fail() }
 
 // VZ has no PL031, so the guest's clock service starts at the time the
 // boot image carries in its file `boot-time` (lib/rtc): 16 bytes, the
@@ -82,7 +90,7 @@ func stamped(_ path: String, _ seconds: UInt64) -> String {
 
 let configuration = VZVirtualMachineConfiguration()
 configuration.cpuCount = cpuCount
-configuration.memorySize = 512 * 1024 * 1024
+configuration.memorySize = memoryMiB * 1024 * 1024
 let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: arguments[1]))
 boot.initialRamdiskURL = URL(fileURLWithPath: stamped(arguments[2], startTime))
 boot.commandLine = "console=hvc0"
@@ -138,6 +146,16 @@ if windowReports {
 // A Virtio entropy device: the driver of services/virtio-rng finds it at
 // device 6 of bus 0, after the console.
 configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+
+// Locally administered unicast addresses (first byte 0x02), one per device.
+var networkDevices: [VZVirtioNetworkDeviceConfiguration] = []
+for i in 0..<netCount {
+    let device = VZVirtioNetworkDeviceConfiguration()
+    device.attachment = VZNATNetworkDeviceAttachment()
+    device.macAddress = VZMACAddress(string: "02:73:74:66:00:0\(i + 1)")!
+    networkDevices.append(device)
+}
+configuration.networkDevices = networkDevices
 
 do {
     try configuration.validate()

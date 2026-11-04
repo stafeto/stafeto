@@ -409,6 +409,9 @@ pub fn check() -> Result<(), String> {
         "boot-doom.img",
         "boot-net.img",
         "boot-net-curl-steps.img",
+        "boot-net-vz.img",
+        "boot-net-vz2.img",
+        "boot-net-vz2-static.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -468,7 +471,14 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
 /// probes that list the few files they use and hold no package.
 pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
     match name {
-        "boot-ash-dialog.img" | "boot-net.img" | "boot-net-curl-steps.img" => Ok(load()?
+        "boot-ash-dialog.img"
+        | "boot-net.img"
+        | "boot-net-curl-steps.img"
+        | "boot-net-vz.img"
+        | "boot-net-vz2.img"
+        | "boot-net-vz2-static.img"
+        | "boot-net-vz-steps.img"
+        | "boot-net-vz2-steps.img" => Ok(load()?
             .into_iter()
             .filter(|p| p.kind != Kind::Game)
             .collect()),

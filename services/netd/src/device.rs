@@ -15,15 +15,16 @@
 
 use crate::dma::{Host, net_at};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
-use netd::lines::is_dhcp_client_frame;
+use netd::lines::{is_dhcp_client_frame, second_device_takes};
 use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, RxBook, TxBook, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use virtio_drivers::queue::VirtQueue;
 
-/// The device the first stage serves.
+/// The device that serves the sockets and the loopback; the second device
+/// (`D` = 1) only runs DHCP.
 pub const DEVICE: usize = 0;
-pub type Queue = VirtQueue<Host<DEVICE>, QUEUE_SIZE>;
+pub type Queue<const D: usize> = VirtQueue<Host<D>, QUEUE_SIZE>;
 
 /// The frames counted since the start (the probe's line).
 #[derive(Clone, Copy, Default)]
@@ -44,21 +45,22 @@ fn fail(what: &str) -> ! {
     rt::sys::process_exit(FAILED)
 }
 
-/// Buffer `n` of the object `net`.
+/// Buffer `n` of the object `net`, in the half of device `D`.
 ///
 /// # Safety
 ///
 /// The device does not hold buffer `n` (it is not between `add` and
 /// `pop_used`), and the caller holds no other reference to it.
-unsafe fn buffer_at<'a>(n: u16) -> &'a mut [u8] {
-    // SAFETY: the object `net` is mapped read and write at net_at(DEVICE)
-    // for the service's life; the offset is within it (ring::offset).
-    unsafe { core::slice::from_raw_parts_mut((net_at(DEVICE) + offset(n)) as *mut u8, BUFFER_LEN) }
+unsafe fn buffer_at<'a, const D: usize>(n: u16) -> &'a mut [u8] {
+    // SAFETY: the object `net` (its half of device `D`) is mapped read and
+    // write at net_at(D) for the service's life; the offset is within it
+    // (ring::offset).
+    unsafe { core::slice::from_raw_parts_mut((net_at(D) + offset(n)) as *mut u8, BUFFER_LEN) }
 }
 
 /// The ring of receiving.
-pub struct RxRing {
-    pub queue: Queue,
+pub struct RxRing<const D: usize = 0> {
+    pub queue: Queue<D>,
     book: RxBook,
     budget: Budget,
     /// Buffers went back in since the last doorbell.
@@ -69,8 +71,8 @@ pub struct RxRing {
     martian: u64,
 }
 
-impl RxRing {
-    pub fn new(queue: Queue) -> RxRing {
+impl<const D: usize> RxRing<D> {
+    pub fn new(queue: Queue<D>) -> RxRing<D> {
         RxRing {
             queue,
             book: RxBook::new(),
@@ -87,7 +89,7 @@ impl RxRing {
         // SAFETY: the device does not hold the buffer (the books say so:
         // it is new or was popped), and nothing else refers to it until
         // `pop_used` returns it.
-        let slice = unsafe { buffer_at(n) };
+        let slice = unsafe { buffer_at::<D>(n) };
         // SAFETY: the buffer stays untouched until `take` pops it.
         let token = unsafe { self.queue.add(&[], &mut [slice]) };
         match token {
@@ -105,6 +107,11 @@ impl RxRing {
 
     pub fn begin_step(&mut self, budget: Budget) {
         self.budget = budget;
+    }
+
+    /// Ends the step's receiving after the frame it just took.
+    pub fn end_rx(&mut self) {
+        self.budget.end_rx();
     }
 
     /// The frames the step received and dropped.
@@ -134,7 +141,7 @@ impl RxRing {
                 fail("a used buffer the ring of receiving does not hold");
             };
             // SAFETY: the device returned the buffer (it is used).
-            let slice = unsafe { buffer_at(n) };
+            let slice = unsafe { buffer_at::<D>(n) };
             // SAFETY: the same buffer `give` added with this token.
             let popped = unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) };
             let Ok(used) = popped else {
@@ -162,8 +169,8 @@ impl RxRing {
 }
 
 /// The ring of sending.
-pub struct TxRing {
-    pub queue: Queue,
+pub struct TxRing<const D: usize = 0> {
+    pub queue: Queue<D>,
     book: TxBook,
     budget: Budget,
     pub dirty: bool,
@@ -175,8 +182,8 @@ pub struct TxRing {
     scratch: [u8; MAX_FRAME],
 }
 
-impl TxRing {
-    pub fn new(mut queue: Queue) -> TxRing {
+impl<const D: usize> TxRing<D> {
+    pub fn new(mut queue: Queue<D>) -> TxRing<D> {
         // No interrupt for sent buffers: the step takes them back
         // (Virtio 1.2, 5.1.6.2.3).
         queue.set_dev_notify(false);
@@ -216,7 +223,7 @@ impl TxRing {
     /// header) on the wire: its sums, its header, the queue.
     fn submit(&mut self, n: u16, len: usize) {
         // SAFETY: the buffer is the pool's and the device does not hold it.
-        let slice = unsafe { buffer_at(n) };
+        let slice = unsafe { buffer_at::<D>(n) };
         frames::fill_sums(&mut slice[HDR_LEN..HDR_LEN + len]);
         let Some(total) = frames::tx_prepare(slice, len) else {
             self.book.release(n);
@@ -253,7 +260,7 @@ impl TxRing {
             };
             // SAFETY: the device returned the buffer; the book gave it back
             // to the pool just now and nothing uses it before this ends.
-            let slice = unsafe { buffer_at(n) };
+            let slice = unsafe { buffer_at::<D>(n) };
             // SAFETY: the buffer `consume` added with this token; only the
             // number of descriptors of the chain matters to the crate.
             let popped = unsafe { self.queue.pop_used(token, &[&slice[..HDR_LEN]], &mut []) };
@@ -265,9 +272,9 @@ impl TxRing {
 }
 
 /// The two rings as the stack's device, and the loopback beside them.
-pub struct NetDevice {
-    pub rx: RxRing,
-    pub tx: TxRing,
+pub struct NetDevice<const D: usize = 0> {
+    pub rx: RxRing<D>,
+    pub tx: TxRing<D>,
     pub looped: LoopRing,
     pub mac: [u8; 6],
     /// The addresses of the interface: the frames to them stay in the loop.
@@ -275,8 +282,15 @@ pub struct NetDevice {
     own_len: usize,
     /// The frame `stage` took and `receive` gives to the stack.
     held: Option<Held>,
+    /// A frame of the wire the stack answers with a frame of its own that
+    /// did not come first in its step: it waits for the next step of
+    /// receiving, whose first frame it is (`defer`).
+    deferred: Option<(u16, usize)>,
     /// Frames of the wire whose checksums did not hold.
     pub bad_sum: u64,
+    /// The second device's stack has a DHCP client (its server's messages
+    /// reach it); false with a static address.
+    pub takes_dhcp: bool,
 }
 
 /// A frame taken from a ring, on its way to the stack.
@@ -286,8 +300,8 @@ enum Held {
     Loop { buffer: u16, length: usize },
 }
 
-impl NetDevice {
-    pub fn new(rx: RxRing, tx: TxRing, mac: [u8; 6]) -> NetDevice {
+impl<const D: usize> NetDevice<D> {
+    pub fn new(rx: RxRing<D>, tx: TxRing<D>, mac: [u8; 6]) -> NetDevice<D> {
         NetDevice {
             rx,
             tx,
@@ -296,7 +310,58 @@ impl NetDevice {
             own: [[0; 4]; 2],
             own_len: 0,
             held: None,
+            deferred: None,
             bad_sum: 0,
+            takes_dhcp: true,
+        }
+    }
+
+    /// The device as `new` makes it, built in place: the two rings hold the
+    /// queues, which are big, and a value of the whole device would be
+    /// another copy of them on the stack.
+    ///
+    /// # Safety
+    ///
+    /// `at` is valid for writes and exclusive.
+    pub unsafe fn initialize_at(at: *mut Self, rx: RxRing<D>, tx: TxRing<D>, mac: [u8; 6]) {
+        use core::ptr::addr_of_mut;
+        // SAFETY: each field is in bounds and written once.
+        unsafe {
+            addr_of_mut!((*at).rx).write(rx);
+            addr_of_mut!((*at).tx).write(tx);
+            addr_of_mut!((*at).looped).write(LoopRing::new());
+            addr_of_mut!((*at).mac).write(mac);
+            addr_of_mut!((*at).own).write([[0; 4]; 2]);
+            addr_of_mut!((*at).own_len).write(0);
+            addr_of_mut!((*at).held).write(None);
+            addr_of_mut!((*at).deferred).write(None);
+            addr_of_mut!((*at).bad_sum).write(0);
+            addr_of_mut!((*at).takes_dhcp).write(true);
+        }
+    }
+
+    /// Whether a frame waits for the next step of receiving.
+    pub fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// Whether the frame `stage` took, a frame of the wire for `dest`, is one
+    /// the stack answers with a frame of its own (`frames::answered`;
+    /// `routed`: a socket owns it). The loop's frames are not: their answers
+    /// carry no sums and cost less.
+    pub fn held_is_answered(&self, dest: Dest, routed: bool) -> bool {
+        let Some(Held::Wire { buffer, length }) = self.held else {
+            return false;
+        };
+        // SAFETY: the frame was popped by `stage` and waits for `receive`.
+        let slice = unsafe { buffer_at::<D>(buffer) };
+        frames::answered(dest, routed, &slice[HDR_LEN..HDR_LEN + length])
+    }
+
+    /// Puts the frame `stage` took aside for the next step of receiving.
+    pub fn defer_held(&mut self) {
+        if let Some(Held::Wire { buffer, length }) = self.held.take() {
+            self.deferred = Some((buffer, length));
         }
     }
 
@@ -311,6 +376,19 @@ impl NetDevice {
             return None;
         }
         self.reclaim_loop();
+        if self.rx.budget.rx_left() == 0 {
+            return None;
+        }
+        // The frame put aside by the step before comes first, before the
+        // loop's: it passed the checks below when it was taken.
+        if let Some((buffer, length)) = self.deferred.take() {
+            self.rx.budget.take_rx();
+            // SAFETY: the buffer was popped and has been held since.
+            let slice = unsafe { buffer_at::<D>(buffer) };
+            let dest = frames::target(&slice[HDR_LEN..HDR_LEN + length]);
+            self.held = Some(Held::Wire { buffer, length });
+            return Some(dest);
+        }
         loop {
             if self.rx.budget.rx_left() == 0 {
                 return None;
@@ -318,7 +396,7 @@ impl NetDevice {
             if let Some((_, buffer, length)) = self.looped.pop() {
                 self.rx.budget.take_rx();
                 // SAFETY: the ring holds the buffer until the token drops.
-                let slice = unsafe { buffer_at(buffer) };
+                let slice = unsafe { buffer_at::<D>(buffer) };
                 let dest = frames::target(&slice[HDR_LEN..HDR_LEN + length]);
                 self.held = Some(Held::Loop { buffer, length });
                 return Some(dest);
@@ -326,7 +404,7 @@ impl NetDevice {
             let (buffer, length) = self.rx.pop()?;
             // SAFETY: the buffer was popped and goes back below or when the
             // token drops.
-            let slice = unsafe { buffer_at(buffer) };
+            let slice = unsafe { buffer_at::<D>(buffer) };
             let frame = &slice[HDR_LEN..HDR_LEN + length];
             // An ARP frame of the wire that names an address of the interface
             // as its sender is a forgery (it would send the stack's frames to
@@ -342,6 +420,12 @@ impl NetDevice {
                 continue;
             }
             let dest = frames::target(frame);
+            // The second device only runs DHCP (lines::second_device_takes).
+            if D != DEVICE && !second_device_takes(frame, self.takes_dhcp) {
+                self.rx.dropped += 1;
+                self.rx.give(buffer);
+                continue;
+            }
             self.held = Some(Held::Wire { buffer, length });
             return Some(dest);
         }
@@ -372,7 +456,7 @@ impl NetDevice {
                 continue;
             };
             // SAFETY: the buffer is the pool's and the device does not hold it.
-            let slice = unsafe { buffer_at(n) };
+            let slice = unsafe { buffer_at::<D>(n) };
             slice[HDR_LEN..HDR_LEN + f.len()].copy_from_slice(&f);
             if !self.looped.push(n, f.len()) {
                 self.tx.book.release(n);
@@ -398,7 +482,7 @@ impl NetDevice {
             };
             let request = frames::arp_request(self.mac, sender, target);
             // SAFETY: the buffer is the pool's and the device does not hold it.
-            let slice = unsafe { buffer_at(n) };
+            let slice = unsafe { buffer_at::<D>(n) };
             slice[HDR_LEN..HDR_LEN + request.len()].copy_from_slice(&request);
             self.tx.submit(n, request.len());
             queued += 1;
@@ -429,9 +513,9 @@ impl NetDevice {
     }
 }
 
-pub enum RxToken<'a> {
+pub enum RxToken<'a, const D: usize = 0> {
     Wire {
-        ring: &'a mut RxRing,
+        ring: &'a mut RxRing<D>,
         buffer: u16,
         length: usize,
     },
@@ -442,7 +526,7 @@ pub enum RxToken<'a> {
     },
 }
 
-impl phy::RxToken for RxToken<'_> {
+impl<const D: usize> phy::RxToken for RxToken<'_, D> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -453,21 +537,21 @@ impl phy::RxToken for RxToken<'_> {
             } => {
                 // SAFETY: the buffer was popped by `pop` and goes back only
                 // when the token drops, after this borrow ends.
-                let slice = unsafe { buffer_at(*n) };
+                let slice = unsafe { buffer_at::<D>(*n) };
                 f(&slice[HDR_LEN..HDR_LEN + length])
             }
             RxToken::Loop {
                 buffer: n, length, ..
             } => {
                 // SAFETY: the ring holds the buffer until the token drops.
-                let slice = unsafe { buffer_at(*n) };
+                let slice = unsafe { buffer_at::<D>(*n) };
                 f(&slice[HDR_LEN..HDR_LEN + length])
             }
         }
     }
 }
 
-impl Drop for RxToken<'_> {
+impl<const D: usize> Drop for RxToken<'_, D> {
     /// The buffer goes back to the queue (the place back to the loop) as
     /// soon as the stack is done with the frame, whether or not it read it.
     fn drop(&mut self) {
@@ -478,15 +562,15 @@ impl Drop for RxToken<'_> {
     }
 }
 
-pub struct TxToken<'a> {
-    ring: &'a mut TxRing,
+pub struct TxToken<'a, const D: usize = 0> {
+    ring: &'a mut TxRing<D>,
     looped: &'a LoopRing,
     mac: [u8; 6],
     own: [[u8; 4]; 2],
     own_len: usize,
 }
 
-impl phy::TxToken for TxToken<'_> {
+impl<const D: usize> phy::TxToken for TxToken<'_, D> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -500,7 +584,7 @@ impl phy::TxToken for TxToken<'_> {
     }
 }
 
-impl TxToken<'_> {
+impl<const D: usize> TxToken<'_, D> {
     fn consume_frame<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -520,7 +604,7 @@ impl TxToken<'_> {
             return f(&mut ring.scratch[..len]);
         };
         // SAFETY: the buffer is the pool's and the device does not hold it.
-        let slice = unsafe { buffer_at(n) };
+        let slice = unsafe { buffer_at::<D>(n) };
         let result = f(&mut slice[HDR_LEN..HDR_LEN + len]);
         let frame = &slice[HDR_LEN..HDR_LEN + len];
         if frames::route(frame, self.mac, &self.own[..self.own_len]) == Route::Loop {
@@ -546,17 +630,17 @@ impl TxToken<'_> {
     }
 }
 
-impl phy::Device for NetDevice {
+impl<const D: usize> phy::Device for NetDevice<D> {
     type RxToken<'a>
-        = RxToken<'a>
+        = RxToken<'a, D>
     where
         Self: 'a;
     type TxToken<'a>
-        = TxToken<'a>
+        = TxToken<'a, D>
     where
         Self: 'a;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
+    fn receive(&mut self, _timestamp: Instant) -> Option<(RxToken<'_, D>, TxToken<'_, D>)> {
         let held = self.held.take()?;
         let tx = TxToken {
             ring: &mut self.tx,
@@ -580,7 +664,7 @@ impl phy::Device for NetDevice {
         Some((rx, tx))
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_>> {
+    fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_, D>> {
         self.reclaim_loop();
         // A frame of the loop that finds no place is lost, and a lost segment
         // of TCP costs a second of the retransmission timer: the frame of

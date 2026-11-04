@@ -188,6 +188,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "netd",
  "proto-fs",
  "proto-init",
  "proto-pipe",
@@ -290,8 +291,11 @@ dependencies = [
  "proto-wire",
  "rt",
  "smoltcp",
+ "virtio-console",
  "virtio-drivers",
  "virtio-mmio",
+ "virtio-pci",
+ "virtio-rng",
 ]
 
 [[package]]
@@ -306,6 +310,15 @@ name = "os-test-run"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+]
+
+[[package]]
+name = "pci-walk"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
+ "virtio-pci",
 ]
 
 [[package]]

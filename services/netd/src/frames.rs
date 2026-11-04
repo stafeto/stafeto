@@ -404,6 +404,48 @@ pub fn target(frame: &[u8]) -> Dest {
     }
 }
 
+/// Whether the stack answers the frame in the step that takes it: a frame
+/// no socket of the table owns (`routed` false) that the stack replies to
+/// with an echo reply (ICMP echo request, RFC 792), a reset (TCP to a port
+/// with no socket, RFC 9293, 3.5.1), a port unreachable (UDP, RFC 1122,
+/// 4.1.3.1) or a protocol unreachable (RFC 792). The reply is a frame of the
+/// wire made from the request (up to 590 bytes of it in an error, the
+/// whole of an echo), summed and sent in the same step, so the step costs
+/// that of two frames; such a frame takes the whole step of receiving (the
+/// rule of `device::NetDevice`). ARP, DHCP and every other ICMP type get no
+/// answer; a fragment or a frame that does not parse is dropped by the
+/// stack with none.
+pub fn answered(dest: Dest, routed: bool, frame: &[u8]) -> bool {
+    if routed {
+        return false;
+    }
+    match dest {
+        Dest::Arp => false,
+        Dest::Tcp { .. } | Dest::Udp { .. } => true,
+        Dest::Service => service_answered(frame),
+    }
+}
+
+/// `answered` for a frame the service's set takes.
+fn service_answered(frame: &[u8]) -> bool {
+    let Some(p) = packet(frame) else {
+        return false;
+    };
+    if !p.first_fragment || frame[ETHERNET_HEADER + 6] & 0x20 != 0 {
+        return false;
+    }
+    let part = &frame[ETHERNET_HEADER + p.header..ETHERNET_HEADER + p.end];
+    match p.protocol {
+        IPV4_PROTO_ICMP => part.first() == Some(&ICMP_ECHO_REQUEST),
+        // The UDP of the service is the DHCP client's (port 67 to 68), or
+        // too short to parse.
+        IPV4_PROTO_UDP | IPV4_PROTO_TCP => false,
+        _ => true,
+    }
+}
+
+const ICMP_ECHO_REQUEST: u8 = 8;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -592,6 +634,71 @@ mod tests {
         f[47] = 0x18;
         f[54..].copy_from_slice(payload);
         f
+    }
+
+    fn icmp_frame(kind: u8) -> Vec<u8> {
+        let mut f = vec![0; 14 + 20 + 8];
+        f[12..14].copy_from_slice(&[8, 0]);
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&28u16.to_be_bytes());
+        f[22] = 64;
+        f[23] = IPV4_PROTO_ICMP;
+        f[26..30].copy_from_slice(&[10, 0, 2, 2]);
+        f[30..34].copy_from_slice(&[10, 0, 2, 15]);
+        f[34] = kind;
+        f
+    }
+
+    /// The classes of frames that take the whole step: those the stack
+    /// answers with a frame of its own (ECHO, RST, port and protocol
+    /// unreachable), and none of the others.
+    #[test]
+    fn the_stack_answers_an_echo_request_a_reset_and_an_unreachable() {
+        let echo = icmp_frame(8);
+        assert_eq!(target(&echo), Dest::Service);
+        assert!(answered(Dest::Service, false, &echo));
+        // An echo reply, and an error addressed to us (port unreachable,
+        // type 3), get no answer.
+        assert!(!answered(Dest::Service, false, &icmp_frame(0)));
+        assert!(!answered(Dest::Service, false, &icmp_frame(3)));
+        // UDP and TCP with no socket (place None): port unreachable, RST.
+        let udp = udp_frame(&[0; 1472]);
+        let tcp = tcp_frame(&[]);
+        let (udp_dest, tcp_dest) = (target(&udp), target(&tcp));
+        assert!(matches!(udp_dest, Dest::Udp { .. }));
+        assert!(matches!(tcp_dest, Dest::Tcp { .. }));
+        assert!(answered(udp_dest, false, &udp));
+        assert!(answered(tcp_dest, false, &tcp));
+        // With a socket the group of the socket answers in its own set.
+        assert!(!answered(udp_dest, true, &udp));
+        assert!(!answered(tcp_dest, true, &tcp));
+        // ARP; DHCP (UDP 67 to 68 goes to the service's set).
+        let arp = arp_request([10, 0, 2, 15]);
+        assert!(!answered(target(&arp), false, &arp));
+        let dhcp = udp_frame(b"offer");
+        let mut dhcp = dhcp;
+        dhcp[34..36].copy_from_slice(&67u16.to_be_bytes());
+        dhcp[36..38].copy_from_slice(&68u16.to_be_bytes());
+        assert_eq!(target(&dhcp), Dest::Service);
+        assert!(!answered(Dest::Service, false, &dhcp));
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_answered_and_a_fragment_or_a_runt_is_not() {
+        let mut other = icmp_frame(8);
+        other[23] = 89;
+        assert_eq!(target(&other), Dest::Service);
+        assert!(answered(Dest::Service, false, &other));
+        // A fragment after the first and a first fragment with more behind
+        // it: the stack builds no answer.
+        let mut later = icmp_frame(8);
+        later[20..22].copy_from_slice(&0x0008u16.to_be_bytes());
+        assert!(!answered(Dest::Service, false, &later));
+        let mut more = icmp_frame(8);
+        more[20] = 0x20;
+        assert!(!answered(Dest::Service, false, &more));
+        assert!(!answered(Dest::Service, false, &[0; 10]));
+        assert!(!answered(Dest::Service, false, &[]));
     }
 
     #[test]

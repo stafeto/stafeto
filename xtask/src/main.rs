@@ -53,11 +53,13 @@ mod ncdu_dialog;
 mod net;
 mod net_curl;
 mod net_probe;
+mod net_vz;
 mod net_wget;
 mod obj_sites;
 mod openposix;
 mod ostest;
 mod packages;
+mod pci_walk;
 mod posix_display;
 mod qemu;
 mod ring;
@@ -1650,6 +1652,8 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  pci-walk-vz [--net N] walk bus 0 on Apple VZ with N network devices (0 to 2)
+            and check the console, the entropy device and the network functions
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -1664,6 +1668,9 @@ commands:
             of the service, and its steps under -icount (TCG only); on hvf the
             rates of the loopback; with `steps` the measurement that chooses
             the frames of a step and the limit of the sockets (TCG only)
+  net-vz [--net 2] [--static1] [--steps] run the shell with the network service on
+            Apple VZ: the lease, HTTP and the Mac's ping of the guest; with
+            --net 2 the second device too (--static1: its static address)
   net-curl [steps] [MACHINE] run the sockets of the network service from the
             host: `httpd` of the guest answers 20 requests in a row and 8 at
             once through a forwarded port, UDP goes both ways, `net-sock` runs
@@ -1675,8 +1682,10 @@ commands:
             `/etc/resolv.conf` the network service writes; with `steps` the
             service counts its steps under that traffic (TCG only); with
             `internet` (by hand) the guest fetches example.com
-  net [--machine hvf] run the shell with the network service on the terminal;
-            ports 8080 and 2222 of the host are forwarded to 80 and 22;
+  net [--machine hvf|vz] [--net N] run the shell with the network service on
+            the terminal; ports 8080 and 2222 of the host are forwarded to
+            80 and 22; with --machine vz it runs on Apple VZ with N network
+            devices on the NAT and the Mac reaches the guest at its lease;
             `curl -s http://127.0.0.1:8080/index.html | shasum` after
             `httpd -f -p 80 -h /www &` fetches the page of the image
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
@@ -1917,6 +1926,7 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("pci-walk-vz") => pci_walk::command(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -1928,6 +1938,7 @@ fn main() {
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
+        Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
@@ -11657,6 +11668,8 @@ fn ci_lints() -> Result<(), String> {
         "netd",
         "--package",
         "net-probe",
+        "--package",
+        "pci-walk",
         "--features",
         "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps",
         "--target",

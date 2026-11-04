@@ -1,0 +1,18 @@
+[package]
+name = "pci-walk"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest program that walks bus 0 of Apple VZ and prints its devices"
+
+[[bin]]
+name = "pci-walk"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+rt = { path = "../../lib/rt" }
+virtio-pci = { path = "../../lib/virtio-pci" }

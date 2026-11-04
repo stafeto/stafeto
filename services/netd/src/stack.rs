@@ -554,11 +554,22 @@ impl<'a> Stack<'a> {
 /// marks every group: a socket that waited for the neighbour tries again.
 pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net, now_ns: u64) {
     let now = instant(now_ns);
+    let mut first = true;
     loop {
         let began = split::now();
         let sent = split::get(&split::TX);
         let Some(dest) = device.stage() else { break };
         let place = net.route(stack, dest);
+        // A frame of the wire the stack answers with a frame of its own
+        // (an echo reply, a reset, an unreachable) costs two frames and
+        // takes the whole step: first in the step it ends the receiving,
+        // later it waits for the next step.
+        let answered = device.held_is_answered(dest, place.is_some());
+        if answered && !first {
+            device.defer_held();
+            break;
+        }
+        first = false;
         let set = match place {
             Some(place) => {
                 net.touch(place);
@@ -584,5 +595,8 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
             spent.saturating_sub(split::get(&split::TX) - sent),
         );
         split::add(&split::RX_TURNS, spent);
+        if answered {
+            device.rx.end_rx();
+        }
     }
 }

@@ -18,6 +18,7 @@
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use netd::pci;
 use netd::ring::NET_PAGES;
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 use virtio_mmio::{Arena, PAGE};
@@ -41,10 +42,25 @@ pub const fn mmio_at(d: usize) -> usize {
     0x10_1000_0000 + d * 0x1_0000
 }
 
+/// Where the service maps the window `ecam` (the pages of the functions)
+/// and the window `bar` (the BARs 0 of the devices) of VZ; device `d`
+/// takes its own offset inside each (`netd::pci`).
+pub const fn ecam_at() -> usize {
+    0x10_2000_0000
+}
+
+pub const fn bar_at() -> usize {
+    0x10_3000_0000
+}
+
 struct Slot {
     dma_pa: AtomicU64,
     net_pa: AtomicU64,
     queue_taken: AtomicUsize,
+    /// The physical address and the length of BAR 0 of a PCI device, which
+    /// the crate asks a virtual address of for each Virtio structure.
+    bar_pa: AtomicU64,
+    bar_len: AtomicU64,
 }
 
 static SLOTS: [Slot; DEVICES] = [const {
@@ -52,6 +68,8 @@ static SLOTS: [Slot; DEVICES] = [const {
         dma_pa: AtomicU64::new(0),
         net_pa: AtomicU64::new(0),
         queue_taken: AtomicUsize::new(0),
+        bar_pa: AtomicU64::new(0),
+        bar_len: AtomicU64::new(0),
     }
 }; DEVICES];
 
@@ -64,6 +82,14 @@ pub fn attach(d: usize, dma_pa: u64, net_pa: u64) {
     slot.queue_taken.store(0, Ordering::Relaxed);
 }
 
+/// Tells device `d` where its BAR 0 lies: the structures of a Virtio PCI
+/// device are in it.
+pub fn attach_bar(d: usize, bar_pa: u64, bar_len: u64) {
+    let slot = &SLOTS[d];
+    slot.bar_pa.store(bar_pa, Ordering::Relaxed);
+    slot.bar_len.store(bar_len, Ordering::Relaxed);
+}
+
 /// The DMA of device `D`.
 pub struct Host<const D: usize>;
 
@@ -74,8 +100,9 @@ impl<const D: usize> Host<D> {
 // SAFETY: `dma_alloc` gives zeroed pages of the object `dma`, each at most
 // once and aligned to a page, or the address 0 for a failure; `share`
 // gives the physical address of a buffer inside the object `net` or stops
-// the service; `mmio_phys_to_virt` is for PCI BARs, which virtio-mmio has
-// none of, and stops.
+// the service; `mmio_phys_to_virt` gives an address inside the window `bar`
+// for a structure inside BAR 0 of the device, and stops the service for
+// any other.
 unsafe impl<const D: usize> Hal for Host<D> {
     fn dma_alloc(pages: usize, _direction: BufferDirection) -> (PhysAddr, NonNull<u8>) {
         #[allow(clippy::let_unit_value)]
@@ -103,8 +130,15 @@ unsafe impl<const D: usize> Hal for Host<D> {
         0
     }
 
-    unsafe fn mmio_phys_to_virt(_paddr: PhysAddr, _size: usize) -> NonNull<u8> {
-        panic!("virtio-mmio has no BAR");
+    unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
+        let slot = &SLOTS[D];
+        let offset = paddr.wrapping_sub(slot.bar_pa.load(Ordering::Relaxed));
+        assert!(
+            offset.saturating_add(size as u64) <= slot.bar_len.load(Ordering::Relaxed),
+            "a Virtio structure outside BAR 0"
+        );
+        let va = bar_at() + pci::bar_offset(D) as usize + offset as usize;
+        NonNull::new(va as *mut u8).expect("the window bar is no null")
     }
 
     unsafe fn share(buffer: NonNull<[u8]>, _direction: BufferDirection) -> PhysAddr {
