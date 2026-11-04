@@ -613,6 +613,22 @@ pub fn longest_over_starts(lines: &[String]) -> Vec<(usize, u64, u64)> {
     out
 }
 
+/// The longest step of waking (`which` "wake") or of departure ("cleanup")
+/// the service printed in a run of the role `E` (builds with the feature `probe`).
+fn longest_named(lines: &[String], which: &str) -> u64 {
+    let prefix = format!("net: step {which} ");
+    lines
+        .iter()
+        .filter_map(|l| {
+            l.strip_prefix(&prefix)?
+                .strip_suffix(" ticks")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The longest step of EPOLL_SET for each number of records (the detail of
 /// its lines), the numbers 4, 8 and 16 the batch is chosen from.
 fn epoll_set_by_batch(lines: &[String]) -> Vec<(usize, u64)> {
@@ -1137,7 +1153,20 @@ fn acceptance(
         kind("E", EPOLL_DROP_KIND),
         proto_net::sockets::EPOLL_BATCH
     );
+    println!(
+        "net-probe: the step of waking with records on its places {}, the step of departure of sets {} (bound {STEP_MAX})",
+        longest_named(&epoll_run, "wake"),
+        longest_named(&epoll_run, "cleanup")
+    );
     if strict {
+        for which in ["wake", "cleanup"] {
+            let ticks = longest_named(&epoll_run, which);
+            if ticks > STEP_MAX {
+                return Err(format!(
+                    "the step of {which} took {ticks} ticks, {STEP_MAX} at most"
+                ));
+            }
+        }
         let chosen = epoll_batch_choice(&by_batch);
         if chosen != Some(proto_net::sockets::EPOLL_BATCH) {
             return Err(format!(
@@ -1861,6 +1890,44 @@ mod tests {
     /// The service answers the pings of the network with the stack's own
     /// code: without this feature of smoltcp it stays silent, which no
     /// probe on the user network sees (slirp sends the guest no echo).
+    #[test]
+    fn the_steps_of_waking_and_departure_are_read_by_name() {
+        let lines: Vec<String> = [
+            "net: step wake 324 ticks",
+            "net: step cleanup 3205 ticks",
+            "net: step wake 6518 ticks",
+            "net: step wakes 99999 ticks",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        assert_eq!(longest_named(&lines, "wake"), 6518);
+        assert_eq!(longest_named(&lines, "cleanup"), 3205);
+        assert_eq!(longest_named(&[], "wake"), 0);
+    }
+
+    #[test]
+    fn the_batch_of_epoll_set_is_the_largest_within_the_budget() {
+        let budget = netd::choose::BUDGET;
+        assert_eq!(
+            epoll_batch_choice(&[(4, 7_000), (8, 9_000), (16, budget)]),
+            Some(16)
+        );
+        assert_eq!(
+            epoll_batch_choice(&[(4, 7_000), (8, 9_000), (16, budget + 1)]),
+            Some(8)
+        );
+        assert_eq!(
+            epoll_batch_choice(&[(16, budget + 1), (8, budget + 1)]),
+            None
+        );
+        let line = |detail: usize, ticks: u64| {
+            format!("service step: 14 kind 22 {ticks} ticks detail {detail}")
+        };
+        let lines = vec![line(8, 100), line(16, 300), line(16, 200), line(1, 9_999)];
+        assert_eq!(epoll_set_by_batch(&lines), [(8, 100), (16, 300)]);
+    }
+
     #[test]
     fn the_stack_answers_ping_by_its_feature() {
         let manifest = std::fs::read_to_string(crate::root().join("services/netd/Cargo.toml"))
