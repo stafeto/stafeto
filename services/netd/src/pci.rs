@@ -93,7 +93,8 @@ mod tests {
     const _: () = assert!(PLACES[0].bar.is_multiple_of(BAR_LEN));
     const _: () = assert!(PLACES[1].bar.is_multiple_of(BAR_LEN));
     const _: () = assert!(PLACES[0].bar >= virtio_rng::PLACE.bar + virtio_rng::PLACE.bar_len);
-    const _: () = assert!(PLACES[0].bar >= virtio_console::pci::BAR_BASE + virtio_console::pci::BAR_LEN);
+    const _: () =
+        assert!(PLACES[0].bar >= virtio_console::pci::BAR_BASE + virtio_console::pci::BAR_LEN);
     const _: () = assert!(PLACES[1].bar == PLACES[0].bar + BAR_LEN);
     // BAR 2: 64 bytes aligned, past the others.
     const _: () = assert!(PLACES[0].bar2 > virtio_rng::PLACE.bar2);

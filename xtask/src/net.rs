@@ -45,23 +45,81 @@ pub fn programs() -> &'static [ImageProgram] {
     })
 }
 
-fn machine_of(args: &[String]) -> Result<&'static qemu::Machine, String> {
-    match args {
-        [] => Ok(&qemu::VIRT),
-        [flag, name] if flag == "--machine" => match name.as_str() {
-            "hvf" => Ok(&qemu::HVF_V3),
-            "tcg" => Ok(&qemu::VIRT),
-            other => qemu::machine(Some(&other.to_owned())),
-        },
-        _ => Err("usage: cargo xtask net [--machine hvf|tcg|NAME]".to_owned()),
+/// The programs of the image on Apple VZ with one network device or, with
+/// `two`, two: those of the image of QEMU with the Virtio console's driver
+/// for the PL011's, and init's table of VZ.
+pub fn vz_programs(two: bool) -> &'static [ImageProgram] {
+    static ONE: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    static TWO: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    let list = if two { &TWO } else { &ONE };
+    list.get_or_init(|| {
+        let mut programs = programs().to_vec();
+        for program in &mut programs {
+            match program.0 {
+                "init" => {
+                    program.3 = if two {
+                        &["table-net-vz2"]
+                    } else {
+                        &["table-net-vz"]
+                    }
+                }
+                "uart" => {
+                    *program = ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]);
+                }
+                _ => {}
+            }
+        }
+        programs
+    })
+}
+
+/// Where `cargo xtask net` runs the image: QEMU on a machine, or Apple VZ
+/// with one or two network devices.
+enum Target {
+    Qemu(&'static qemu::Machine),
+    Vz(usize),
+}
+
+fn target_of(args: &[String]) -> Result<Target, String> {
+    let usage = "usage: cargo xtask net [--machine hvf|tcg|vz|NAME] [--net N]";
+    let mut machine = None;
+    let mut net = None;
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let value = rest.next().ok_or(usage)?;
+        match flag.as_str() {
+            "--machine" => machine = Some(value.as_str()),
+            "--net" => {
+                net = Some(
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=2).contains(n))
+                        .ok_or("--net takes 1 or 2")?,
+                )
+            }
+            _ => return Err(usage.to_owned()),
+        }
+    }
+    match (machine, net) {
+        (Some("vz"), net) => Ok(Target::Vz(net.unwrap_or(1))),
+        (_, Some(_)) => Err("--net belongs to --machine vz".to_owned()),
+        (None | Some("tcg"), None) => Ok(Target::Qemu(&qemu::VIRT)),
+        (Some("hvf"), None) => Ok(Target::Qemu(&qemu::HVF_V3)),
+        (Some(other), None) => Ok(Target::Qemu(qemu::machine(Some(&other.to_owned()))?)),
     }
 }
 
-/// `cargo xtask net [--machine hvf]`: QEMU with the console on the
-/// terminal (Ctrl-A X quits), the network device on the user network, and
-/// the shell. The service prints `net: lease ...` once DHCP answers.
+/// `cargo xtask net [--machine hvf|vz] [--net N]`: QEMU with the console on
+/// the terminal (Ctrl-A X quits), the network device on the user network,
+/// and the shell; or, with `--machine vz`, Apple VZ with N network devices
+/// on the NAT (the Mac reaches the guest at the address of its lease). The
+/// service prints `net: lease ...` once DHCP answers.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let machine = machine_of(args)?;
+    let machine = match target_of(args)? {
+        Target::Qemu(machine) => machine,
+        Target::Vz(devices) => return run_vz(devices),
+    };
     if machine.is_hvf() {
         hvf_host().map_err(|why| {
             format!(
@@ -102,6 +160,42 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The names of the images on VZ: one device, two.
+pub const VZ_IMAGE: &str = "boot-net-vz.img";
+pub const VZ2_IMAGE: &str = "boot-net-vz2.img";
+pub const VZ2_STATIC_IMAGE: &str = "boot-net-vz2-static.img";
+
+/// The shell with the network on Apple VZ on the terminal.
+fn run_vz(devices: usize) -> Result<(), String> {
+    busybox_build()?;
+    nano_build()?;
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        if devices == 2 { VZ2_IMAGE } else { VZ_IMAGE },
+        vz_programs(devices == 2),
+        BOOT_PROFILE,
+    )?;
+    let machine = vz::Machine {
+        net: devices,
+        ..vz::Machine::default()
+    };
+    let mut cmd = vz::command_on(&kernel.image, &image, machine)?;
+    println!(
+        "net on VZ with {devices} network devices: the console is ash; the service prints `net: lease` when DHCP answers; reach the guest at that address from this Mac (bridge100)"
+    );
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("vz-run: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("vz-run exited with {status}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,10 +221,31 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_comes_from_the_flag() {
-        assert_eq!(machine_of(&[]).map(|m| m.name), Ok(qemu::VIRT.name));
-        let hvf = ["--machine".to_owned(), "hvf".to_owned()];
-        assert_eq!(machine_of(&hvf).map(|m| m.name), Ok(qemu::HVF_V3.name));
-        assert!(machine_of(&["x".to_owned()]).is_err());
+    fn the_target_comes_from_the_flags() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let name = |list: &[&str]| match target_of(&args(list)) {
+            Ok(Target::Qemu(machine)) => machine.name.to_owned(),
+            Ok(Target::Vz(n)) => format!("vz {n}"),
+            Err(why) => why,
+        };
+        assert_eq!(name(&[]), qemu::VIRT.name);
+        assert_eq!(name(&["--machine", "hvf"]), qemu::HVF_V3.name);
+        assert_eq!(name(&["--machine", "vz"]), "vz 1");
+        assert_eq!(name(&["--machine", "vz", "--net", "2"]), "vz 2");
+        assert!(target_of(&args(&["--net", "2"])).is_err());
+        assert!(target_of(&args(&["--machine", "vz", "--net", "3"])).is_err());
+        assert!(target_of(&args(&["x"])).is_err());
+    }
+
+    /// The images on VZ hold the Virtio console's driver in place of the
+    /// PL011's and the table of VZ, and the shipping service.
+    #[test]
+    fn the_vz_images_have_the_consoles_driver_and_the_table_of_vz() {
+        let one = vz_programs(false);
+        assert_eq!(one[0].3, &["table-net-vz"]);
+        assert!(one.iter().any(|p| p.0 == "virtio-console"));
+        assert!(!one.iter().any(|p| p.0 == "uart"));
+        let netd = one.iter().find(|p| p.0 == "netd").unwrap();
+        assert!(!netd.3.contains(&"probe"));
     }
 }

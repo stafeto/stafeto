@@ -978,6 +978,26 @@ pub fn runner_check() -> Vec<RootFile> {
 /// QEMU user network's own settings, so that no DHCP frame is needed.
 const NETD_CONF_STATIC: &[u8] = b"address 10.0.2.15/24\ngateway 10.0.2.2\ndns 10.0.2.3\n";
 
+/// `/etc/netd.conf` of the VZ image with a static address for the second
+/// device: no address for the first, which keeps DHCP.
+const NETD_CONF_STATIC1: &[u8] = b"address1 192.168.64.250/24\n";
+
+/// The files of the shell images with the network service: the shell's, the
+/// page `httpd -h /www` serves, and the probes of the sockets and of the
+/// resolver. `/etc/resolv.conf` is the network service's to write.
+fn net_files(image: &str) -> Vec<RootFile> {
+    let mut files = dialog(image);
+    files.push(dir("/www"));
+    files.push(of(
+        "/www/index.html",
+        0o644,
+        ROOT,
+        Source::Bytes("www-index", www_index()),
+    ));
+    files.push(file("/bin/net-sock", 0o755, ROOT, "net-sock"));
+    files.push(file("/bin/net-dns", 0o755, ROOT, "net-dns"));
+    files
+}
 /// The bytes of `/www/index.html` of the image with the network service: 64
 /// KiB of lines from a fixed generator, so that the host knows the page
 /// without reading the image (`cargo xtask net-curl`).
@@ -1013,6 +1033,9 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-net.img",
     "boot-net-curl-steps.img",
+    "boot-net-vz.img",
+    "boot-net-vz2.img",
+    "boot-net-vz2-static.img",
     "boot-net-probe.img",
     "boot-net-probe-static.img",
     "boot-net-steps.img",
@@ -1089,19 +1112,24 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         ],
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-net.img" | "boot-net-curl-steps.img" => {
-            let mut files = dialog(name);
-            // The page `httpd -h /www` serves, and the probes of the sockets
-            // and of the resolver. `/etc/resolv.conf` is the network
-            // service's to write.
-            files.push(dir("/www"));
+            let mut files = net_files(name);
+            files
+        }
+        // The images on Apple VZ: the network service writes `resolv.conf`
+        // from the lease. The image with a static address for the second
+        // device has the file `netd.conf` too.
+        "boot-net-vz.img"
+        | "boot-net-vz2.img"
+        | "boot-net-vz-steps.img"
+        | "boot-net-vz2-steps.img" => net_files(name),
+        "boot-net-vz2-static.img" => {
+            let mut files = net_files(name);
             files.push(of(
-                "/www/index.html",
+                "/etc/netd.conf",
                 0o644,
                 ROOT,
-                Source::Bytes("www-index", www_index()),
+                Source::Bytes("netd.conf", NETD_CONF_STATIC1),
             ));
-            files.push(file("/bin/net-sock", 0o755, ROOT, "net-sock"));
-            files.push(file("/bin/net-dns", 0o755, ROOT, "net-dns"));
             files
         }
         "boot-net-probe-static.img" => vec![of(
@@ -1573,6 +1601,8 @@ mod tests {
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
                 "boot-net.img" => crate::net::programs(),
+                "boot-net-vz.img" => crate::net::vz_programs(false),
+                "boot-net-vz2.img" | "boot-net-vz2-static.img" => crate::net::vz_programs(true),
                 "boot-net-curl-steps.img" => crate::net_curl::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,

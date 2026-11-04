@@ -88,15 +88,21 @@ const TIMER_LABEL: u64 = 1;
 const RECEIVEQ: u16 = 0;
 const TRANSMITQ: u16 = 1;
 /// The features the service asks for: `VIRTIO_F_VERSION_1` (added by
-/// `start_with`), `VIRTIO_NET_F_MAC` and `VIRTIO_NET_F_STATUS`. No
-/// checksum offload, no segmentation offload, no merged buffers, no control
-/// queue (Virtio 1.2, 5.1.3).
+/// `start_with`), `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
+/// `VIRTIO_NET_F_STATUS`. No checksum offload, no segmentation offload, no
+/// merged buffers, no control queue (Virtio 1.2, 5.1.3). Apple's device
+/// clears `FEATURES_OK` for any set without MTU (it offers MTU and wants it
+/// accepted), whatever else the set holds.
+const MTU: u64 = 1 << 3;
 const MAC: u64 = 1 << 5;
 const STATUS: u64 = 1 << 16;
 /// The offset of the link status in the configuration space (Virtio 1.2,
 /// 5.1.4), after the six bytes of the MAC.
 const STATUS_AT: usize = 6;
 const LINK_UP: u32 = 1;
+/// The offset of the MTU in the configuration space, after the MAC, the
+/// status and `max_virtqueue_pairs`.
+const MTU_AT: usize = 10;
 
 /// The codes of a start that failed: the start data or an object; the
 /// entropy service; REGISTER, the window or the binding; a map; no network
@@ -349,7 +355,7 @@ fn main(_: u64) -> u64 {
         }
         Err(None) => return NO_DEVICE,
     };
-    let features = match virtio_mmio::start_with(&mut transport, MAC | STATUS) {
+    let features = match virtio_mmio::start_with(&mut transport, MTU | MAC | STATUS) {
         Ok(bits) => bits,
         Err(StartError::Reset) => return NOT_STARTED,
         Err(StartError::Features) => {
@@ -407,6 +413,11 @@ fn main(_: u64) -> u64 {
     }
     if !link {
         rt::println!("virtio-net: link down");
+    }
+    if features & MTU != 0
+        && let Ok(mtu) = transport.read_config_space::<u16>(MTU_AT)
+    {
+        rt::println!("virtio-net: mtu {mtu}");
     }
 
     let now = now_ns();

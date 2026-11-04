@@ -127,14 +127,18 @@ fn free_udp_port() -> Result<u16, String> {
 
 /// One HTTP/1.0 GET of `/index.html`: the body and the time it took, or why
 /// not.
-fn get(port: u16) -> Result<(Vec<u8>, Duration), String> {
-    get_within(port, READ_WITHIN)
+fn get(address: SocketAddr) -> Result<(Vec<u8>, Duration), String> {
+    get_within(address, READ_WITHIN)
+}
+
+/// The forwarded port of the host as an address of the run.
+fn local(port: u16) -> SocketAddr {
+    ([127, 0, 0, 1], port).into()
 }
 
 /// `get`, giving up after `within` on each step.
-fn get_within(port: u16, within: Duration) -> Result<(Vec<u8>, Duration), String> {
+pub fn get_within(address: SocketAddr, within: Duration) -> Result<(Vec<u8>, Duration), String> {
     let started = Instant::now();
-    let address: SocketAddr = ([127, 0, 0, 1], port).into();
     let mut stream =
         TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
     stream
@@ -154,7 +158,7 @@ fn get_within(port: u16, within: Duration) -> Result<(Vec<u8>, Duration), String
 }
 
 /// The body of a response: after the blank line; the status must be 200.
-fn body_of(answer: &[u8]) -> Result<Vec<u8>, String> {
+pub fn body_of(answer: &[u8]) -> Result<Vec<u8>, String> {
     let split = answer
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -168,7 +172,7 @@ fn body_of(answer: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Whether the body is the page of the image.
-fn check_body(body: &[u8]) -> Result<(), String> {
+pub fn check_body(body: &[u8]) -> Result<(), String> {
     let page = rootfs::www_index();
     if body == page {
         return Ok(());
@@ -191,13 +195,13 @@ fn summary(times: &mut [Duration]) -> (u128, u128) {
 }
 
 /// The requests of the run: twenty in a row, eight at once.
-fn requests(port: u16, started: Instant) -> Result<(u128, u128), String> {
+pub fn requests(address: SocketAddr, started: Instant) -> Result<(u128, u128), String> {
     // The first request waits for `httpd` to listen. A SYN that comes before
     // the server listens gets no RST that arrives (the stack's answer is
     // dropped while it asks for the gateway's address), and QEMU sends the
     // SYN again after seconds: the request starts again after two.
     let first = loop {
-        match get_within(port, Duration::from_secs(2)) {
+        match get_within(address, Duration::from_secs(2)) {
             Ok(answer) => break answer,
             Err(why) if started.elapsed() < LISTEN_WITHIN => {
                 let _ = why;
@@ -209,12 +213,12 @@ fn requests(port: u16, started: Instant) -> Result<(u128, u128), String> {
     check_body(&first.0).map_err(|e| format!("request 1: {e}"))?;
     let mut times = vec![first.1];
     for n in 2..=SEQUENTIAL {
-        let (body, time) = get(port).map_err(|e| format!("request {n}: {e}"))?;
+        let (body, time) = get(address).map_err(|e| format!("request {n}: {e}"))?;
         check_body(&body).map_err(|e| format!("request {n}: {e}"))?;
         times.push(time);
     }
     let threads: Vec<_> = (0..CONCURRENT)
-        .map(|_| std::thread::spawn(move || get(port)))
+        .map(|_| std::thread::spawn(move || get(address)))
         .collect();
     for (n, thread) in threads.into_iter().enumerate() {
         let (body, time) = thread
@@ -349,7 +353,7 @@ fn checks(run: &mut qemu::Run, address: &str) -> Result<(), String> {
 }
 
 /// The guest's address from the line `net: lease A.B.C.D/N ...`.
-fn lease_address(line: &str) -> Option<String> {
+pub fn lease_address(line: &str) -> Option<String> {
     let rest = line.split("net: lease ").nth(1)?;
     let address = rest.split('/').next()?;
     (address.split('.').count() == 4).then(|| address.to_owned())
@@ -417,7 +421,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         run.expect("# ", DIALOG_STEP)?;
         run.send("httpd -f -p 80 -h /www & H=$!")?;
         run.expect("# ", DIALOG_STEP)?;
-        let timing = requests(tcp, started)?;
+        let timing = requests(local(tcp), started)?;
         println!(
             "net-curl: {} requests in a row and {} at once ok, {} ms median, {} ms the longest",
             SEQUENTIAL, CONCURRENT, timing.0, timing.1
@@ -432,7 +436,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         // of one more request is in TIME-WAIT on that port (the server's
         // child closed first, 10 s in the stack): the new bind needs
         // SO_REUSEADDR. One request makes the orphan just before.
-        let (body, _) = get(tcp).map_err(|e| format!("the request before the kill: {e}"))?;
+        let (body, _) = get(local(tcp)).map_err(|e| format!("the request before the kill: {e}"))?;
         check_body(&body).map_err(|e| format!("before the kill: {e}"))?;
         run.send("kill $H; wait $H")?;
         run.expect("# ", DIALOG_STEP)?;
@@ -443,7 +447,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             run.send("httpd -f -p 80 -h /www &")?;
             run.expect("# ", DIALOG_STEP)?;
             std::thread::sleep(Duration::from_millis(300));
-            if let Ok(answer) = get_within(tcp, Duration::from_secs(2)) {
+            if let Ok(answer) = get_within(local(tcp), Duration::from_secs(2)) {
                 answered = Some(answer);
                 break;
             }

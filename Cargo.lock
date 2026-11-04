@@ -188,6 +188,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "netd",
  "proto-fs",
  "proto-init",
  "proto-pipe",

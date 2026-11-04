@@ -21,14 +21,24 @@
 //! of an instance that ended go: Status 0, which reads 0 once the reset is
 //! done.
 //!
+//! On Apple VZ the device is a Virtio PCI function: `NETD_VZ` (and
+//! `NETD_VZ2` with a second network device) hold the windows `ecam` (the
+//! pages of the functions, device 1 and 2 of bus 0) and `bar` (their BARs
+//! 0), and the bindings of INTA, INTID 64 + the device (the numbers are
+//! those of `cargo xtask pci-walk-vz`; services/netd/src/pci.rs holds the
+//! same, and a test of this crate compares them). The device masters the
+//! bus with no SMMU, so init stops it as the console and the entropy
+//! device (vz.rs): the Virtio reset through `device_status` at the start
+//! of BAR 0 while the function decodes its BARs, then the command word 0.
+//!
 //! The service connects to the entropy service (the key of the stack) and
 //! to the RAM file service (`/etc/netd.conf`, with the boot profile
 //! `BOOT_PROFILE_CLIENTS` names). Level 35: below both, above the
 //! processes of POSIX, whose ceilings stay at 31 in the tables.
 
 use super::{
-    BOOT_PROFILE_CLIENTS, Binding, Dma, Kind, NET_SERVICE, NETD_CPUS, Record, Restart, Shares,
-    Window, Write,
+    BOOT_PROFILE_CLIENTS, Binding, Dma, Gate, Kind, NET_SERVICE, NETD_CPUS, Record, Restart,
+    Shares, Window, Write,
 };
 use crate::PAGE;
 use crate::watch::Watch;
@@ -109,6 +119,106 @@ pub const NETD: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: NETD_CPUS,
+};
+
+/// The PCI devices of the network on VZ's bus 0 (services/netd/src/pci.rs).
+const VZ_DEVICE: [u64; 2] = [1, 2];
+const VZ_ECAM: u64 = 0x4000_0000;
+/// BAR 0 of the first device and the bytes of each BAR 0.
+const VZ_BAR: u64 = 0x1_0002_0000;
+const VZ_BAR_LEN: u64 = 0x1_0000;
+/// `device_status` of the Virtio common configuration, the command word
+/// of the function and its bit of memory decoding.
+const DEVICE_STATUS: u64 = 0x14;
+const COMMAND: u64 = 4;
+const MEMORY: u32 = 1 << 1;
+
+/// The page of the function of device `i` in ECAM, and where it lies inside
+/// the window `ecam`, which starts at the page of device 0.
+const fn vz_function(i: usize) -> u64 {
+    VZ_ECAM + (VZ_DEVICE[i] << 15)
+}
+
+const fn vz_ecam_offset(i: usize) -> u64 {
+    vz_function(i) - vz_function(0)
+}
+
+const fn vz_bar_offset(i: usize) -> u64 {
+    i as u64 * VZ_BAR_LEN
+}
+
+/// The arguments of the record after the objects' addresses: the function
+/// of each device, 0 for a device the record has not.
+const fn vz_args<const N: usize>() -> [u8; 16] {
+    let mut args = [0u8; 16];
+    let mut i = 0;
+    while i < N {
+        let word = vz_function(i).to_le_bytes();
+        let mut b = 0;
+        while b < 8 {
+            args[8 * i + b] = word[b];
+            b += 1;
+        }
+        i += 1;
+    }
+    args
+}
+
+/// The stop of device `i` of the record: the Virtio reset through BAR 0,
+/// while the function decodes its BARs (`Write::only_if`), and then the
+/// command word 0 (VZ stops the machine at a byte write to the
+/// configuration space; the word's status half reads back what it holds).
+const fn vz_stop(i: usize) -> [Write; 2] {
+    [
+        Write {
+            window: "bar",
+            offset: vz_bar_offset(i) + DEVICE_STATUS,
+            bits: 8,
+            value: 0,
+            settled: 0xFF,
+            only_if: Some(Gate {
+                window: "ecam",
+                offset: vz_ecam_offset(i) + COMMAND,
+                bits: MEMORY,
+            }),
+        },
+        Write {
+            window: "ecam",
+            offset: vz_ecam_offset(i) + COMMAND,
+            bits: 32,
+            value: 0,
+            settled: 0xFFFF,
+            only_if: None,
+        },
+    ]
+}
+
+static VZ_ARGS: [u8; 16] = vz_args::<1>();
+static VZ_STOP: [Write; 2] = vz_stop(0);
+
+/// The service on VZ with the first network device: INTA of device 1 at
+/// INTID 65.
+pub const NETD_VZ: Record = Record {
+    windows: &[
+        Window {
+            name: "ecam",
+            base: VZ_ECAM + (VZ_DEVICE[0] << 15),
+            len: super::PAGE,
+        },
+        Window {
+            name: "bar",
+            base: VZ_BAR,
+            len: VZ_BAR_LEN,
+        },
+    ],
+    bindings: &[Binding {
+        name: "irq",
+        line: 64 + VZ_DEVICE[0] as u32,
+        edge: false,
+    }],
+    args: &VZ_ARGS,
+    quiesce: &VZ_STOP,
+    ..NETD
 };
 
 /// The roles of the probe (tests/net-probe): `c` the interface's address and
@@ -226,6 +336,24 @@ pub const NET_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[7],
     super::ramfs::BUSYBOX_DIALOG_TABLE[8],
     NETD,
+];
+
+/// The image of the shell with the network service on VZ (`cargo xtask net
+/// --machine vz`): the console's driver in place of the PL011's, the
+/// shell's table as `vz::BUSYBOX_DIALOG_TABLE` has it (the clock without a
+/// PL031: the time `vz-run` writes into the image), the entropy device's
+/// driver of VZ for the key of the stack, and `NETD_VZ`.
+pub const NET_VZ_TABLE: &[Record] = &[
+    super::vz::CONSOLE,
+    super::ramfs::RAM_FIFO_CLOCKED,
+    NET_PROCESS_SERVICE,
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::PIPE,
+    NET_LAUNCHER,
+    super::ramfs::TTY,
+    super::entropy::RNG_VZ,
+    super::entropy::ENTROPY,
+    NETD_VZ,
 ];
 
 /// The CPUs of the services and the probe in the images of the measurement of

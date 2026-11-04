@@ -926,6 +926,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
+    + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-display") as usize
@@ -980,6 +981,7 @@ const _: () = assert!(
     feature = "table-net",
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
+    feature = "table-net-vz",
     feature = "table-input",
     feature = "table-posix-random",
     feature = "table-posix-display",
@@ -1066,6 +1068,8 @@ pub const TABLE: &[Record] = gpu::TABLE;
 pub const TABLE: &[Record] = net::NET_TABLE;
 #[cfg(feature = "table-net-probe")]
 pub const TABLE: &[Record] = net::NET_PROBE_TABLE;
+#[cfg(feature = "table-net-vz")]
+pub const TABLE: &[Record] = net::NET_VZ_TABLE;
 #[cfg(feature = "table-pci-walk-vz")]
 pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 #[cfg(feature = "table-input")]
@@ -1795,6 +1799,7 @@ mod tests {
         for table in [
             net::NET_TABLE,
             net::NET_PROBE_TABLE,
+            net::NET_VZ_TABLE,
             doom::TABLE,
             gpu::TABLE,
             input::TABLE,
@@ -1813,6 +1818,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The records of the network on VZ hold the numbers the service has
+    /// (`netd::pci`), and their windows touch neither the pages of the
+    /// console's function (device 5) and the entropy device's (6) nor the
+    /// BARs of those two, which sit before the network's.
+    #[test]
+    fn the_network_records_of_vz_agree_with_the_service_and_leave_the_others_alone() {
+        let record = net::NETD_VZ;
+        let window = |name: &str| *record.windows.iter().find(|w| w.name == name).unwrap();
+        let (ecam_base, ecam_len) = netd::pci::ecam_window(1);
+        assert_eq!(
+            (window("ecam").base, window("ecam").len),
+            (ecam_base, ecam_len)
+        );
+        let (bar_base, bar_len) = netd::pci::bar_window(1);
+        assert_eq!((window("bar").base, window("bar").len), (bar_base, bar_len));
+        assert_eq!(record.bindings[0].line, netd::pci::line(0));
+        assert_eq!(record.args[..8], netd::pci::function(0).to_le_bytes());
+        // The stop: the reset through BAR 0 gated on decoding, then the
+        // command word, at the offsets of device 0 inside the windows.
+        assert_eq!(record.quiesce.len(), 2);
+        assert_eq!(
+            record.quiesce[0].offset,
+            netd::pci::bar_offset(0) + netd::pci::DEVICE_STATUS
+        );
+        assert_eq!(
+            record.quiesce[1].offset,
+            netd::pci::ecam_offset(0) + COMMAND_WORD
+        );
+        let mut pages: Vec<(u64, &str)> = Vec::new();
+        for r in net::NET_VZ_TABLE {
+            for w in r.windows {
+                for page in (w.base / PAGE..(w.base + w.len) / PAGE).map(|p| p * PAGE) {
+                    if let Some((_, other)) = pages.iter().find(|(p, _)| *p == page) {
+                        panic!("{} and {other} share the page {page:#x}", r.name);
+                    }
+                    pages.push((page, r.name));
+                }
+            }
+        }
+        assert!(pages.iter().any(|&(_, n)| n == "uart"));
+        assert!(pages.iter().any(|&(_, n)| n == "rng"));
+    }
+
+    /// The command word of a PCI function.
+    const COMMAND_WORD: u64 = 4;
+
+    #[test]
+    fn the_network_image_of_vz_passes_the_table_check() {
+        assert_eq!(
+            order_of(net::NET_VZ_TABLE),
+            [
+                "uart",
+                "tty",
+                "clock",
+                "pipe",
+                "ramfs",
+                "posix",
+                "rng",
+                "entropy",
+                "net",
+                "busybox-probe"
+            ]
+        );
     }
 
     #[test]

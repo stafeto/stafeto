@@ -134,7 +134,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
         println!("{line}");
     }
     let functions = parse(&lines);
-    check(&functions, net).map_err(|e| format!("pci-walk on VZ with {net} network devices: {e}"))?;
+    check(&functions, net)
+        .map_err(|e| format!("pci-walk on VZ with {net} network devices: {e}"))?;
     println!("pci-walk on VZ with {net} network devices: ok");
     Ok(())
 }
@@ -173,6 +174,10 @@ pci: dev 6 fn 0 id 1af4:1044 class 00ff00 header 00 pin 1
         assert!(check(&functions, 0).unwrap_err().contains("1 functions"));
         assert!(check(&functions, 2).is_err());
         let moved = WALK.replace("dev 5 fn 0", "dev 4 fn 0");
-        assert!(check(&parse(&lines(&moved)), 1).unwrap_err().contains("device 5"));
+        assert!(
+            check(&parse(&lines(&moved)), 1)
+                .unwrap_err()
+                .contains("device 5")
+        );
     }
 }
