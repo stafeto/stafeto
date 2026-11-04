@@ -267,8 +267,8 @@ fn release_proc(id: u32) {
 static NET_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Names the function that closes the description `id` of a `Target::Net`:
-/// the session with the network service lives in the ABI layer, not in the
-/// transport.
+/// the session with the network service lives in the ABI layer
+/// (`posix_abi::net`); the transport holds no handle of it.
 pub fn set_net_release(release: fn(u32)) {
     NET_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
 }

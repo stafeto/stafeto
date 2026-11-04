@@ -540,10 +540,15 @@ fn option_number(level: i32, name: i32) -> Result<(u32, bool), i32> {
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
     let (number, _) = option_number(level, name)?;
     with_socket(fd, |description| {
-        let value = word(&Request::GetOpt {
+        let mut value = word(&Request::GetOpt {
             description,
             name: number,
         })?;
+        // The deferred error of the service is a code of its protocol: the
+        // option holds the errno.
+        if number == opt::ERROR && value != 0 {
+            value = refusal(Status::from_code(value)).unwrap_or(EIO) as u32;
+        }
         let bytes = value.to_ne_bytes();
         let n = out.len().min(4);
         out[..n].copy_from_slice(&bytes[..n]);
@@ -764,7 +769,12 @@ pub fn recv(
                 }
             }
             total += take;
-            if bytes.is_empty() || ty != wire::STREAM || flags & MSG_WAITALL == 0 || total >= size {
+            // A peek reads the head of the queue again on each ask: one ask.
+            if bytes.is_empty()
+                || ty != wire::STREAM
+                || flags & (MSG_WAITALL | MSG_PEEK) != MSG_WAITALL
+                || total >= size
+            {
                 break;
             }
         }

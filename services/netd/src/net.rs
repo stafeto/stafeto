@@ -630,6 +630,25 @@ impl Net {
         }
     }
 
+    /// Bytes that arrive for a stream nobody holds any more (its CLOSE came
+    /// first) reset the connection (RFC 1122, 4.2.2.13): the peer's next send
+    /// fails at once and not after the window of the orphan has filled.
+    pub fn reset_data_after_close(&mut self, stack: &mut Stack<'static>, i: usize) {
+        if self.places.state(i) != State::Orphan
+            || self.socks[i].rst_pending
+            || self.socks[i].proto != Proto::Tcp
+        {
+            return;
+        }
+        let Some(handle) = self.socks[i].handle else {
+            return;
+        };
+        let t = stack.tcp(handle);
+        if matches!(t.state(), tcp::State::FinWait1 | tcp::State::FinWait2) && t.recv_queue() > 0 {
+            self.abort_place(stack, i);
+        }
+    }
+
     /// The streams no session holds, oldest first, a few at a time: one that
     /// has closed is free, one past ORPHAN_NS is aborted (with its RST). A
     /// step looks at SWEEP of them; true when the queue goes on.

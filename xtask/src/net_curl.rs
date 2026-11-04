@@ -41,7 +41,7 @@ use crate::{
 };
 
 /// The checks of `net-sock`, in the order the program runs them.
-pub const CHECKS: [&str; 21] = [
+pub const CHECKS: [&str; 28] = [
     "tcp-loop",
     "tcp-own",
     "udp-loop",
@@ -63,6 +63,13 @@ pub const CHECKS: [&str; 21] = [
     "close-flush",
     "names",
     "fstat",
+    "nonblock-refused",
+    "hangup",
+    "spawn-socket",
+    "cloexec-exec",
+    "clofork",
+    "epipe-unread",
+    "peek-waitall",
 ];
 
 /// The requests one after the other and those at once.
@@ -418,21 +425,27 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         udp(&mut run, &address, udp_port)?;
         checks(&mut run, &address)?;
         run.expect("# ", DIALOG_STEP)?;
-        // A new server on the port the first one used.
-        run.send("kill $H")?;
+        // A new server on the port the first one used, while the connection
+        // of one more request is in TIME-WAIT on that port (the server's
+        // child closed first, 10 s in the stack): the new bind needs
+        // SO_REUSEADDR. One request makes the orphan just before.
+        let (body, _) = get(tcp).map_err(|e| format!("the request before the kill: {e}"))?;
+        check_body(&body).map_err(|e| format!("before the kill: {e}"))?;
+        run.send("kill $H; wait $H")?;
         run.expect("# ", DIALOG_STEP)?;
-        run.send("httpd -f -p 80 -h /www &")?;
-        run.expect("# ", DIALOG_STEP)?;
-        let (body, _) = loop {
-            match get(tcp) {
-                Ok(answer) => break answer,
-                Err(why) if started.elapsed() < RUN_WITHIN => {
-                    let _ = why;
-                    std::thread::sleep(Duration::from_millis(300));
-                }
-                Err(why) => return Err(format!("the request to the new httpd: {why}")),
+        // The old listener goes in steps of the service after the kill: a
+        // start that finds the port in use ends, and starts again.
+        let mut answered = None;
+        for _ in 0..10 {
+            run.send("httpd -f -p 80 -h /www &")?;
+            run.expect("# ", DIALOG_STEP)?;
+            std::thread::sleep(Duration::from_millis(300));
+            if let Ok(answer) = get_within(tcp, Duration::from_secs(2)) {
+                answered = Some(answer);
+                break;
             }
-        };
+        }
+        let (body, _) = answered.ok_or("the new httpd never answered on the port")?;
         check_body(&body).map_err(|e| format!("the new httpd: {e}"))?;
         println!("net-curl: a new httpd on the same port ok");
         reported = Some(timing);

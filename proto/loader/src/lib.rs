@@ -887,7 +887,7 @@ pub struct Start {
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 6;
+pub const START_VERSION: u32 = 7;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
@@ -2161,7 +2161,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (6, 8, 8));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (7, 8, 8));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];

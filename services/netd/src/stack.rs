@@ -567,8 +567,9 @@ pub fn ingress(stack: &mut Stack<'static>, device: &mut NetDevice, net: &mut Net
             }
         };
         let _ = stack.iface.poll_ingress_single(now, device, set);
-        if place.is_some() {
+        if let Some(place) = place {
             net.adopt(stack);
+            net.reset_data_after_close(stack, place);
         }
         let spent = split::now() - began;
         split::record(

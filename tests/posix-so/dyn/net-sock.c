@@ -18,12 +18,15 @@
  *   udp-send ADDR PORT TEXT    sends TEXT as one datagram
  *   exec-child FD              the program after `exec` in the check `exec`:
  *                              writes `exec` to the inherited socket FD
+ *   bind-child PORT FD         the new image of `cloexec-exec`: FD is closed
+ *                              and PORT can be bound
  *
  * Built with -fno-builtin; every result is compared.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -38,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 
+extern char **environ;
 static const char *check = "start";
 static uint32_t own;
 
@@ -537,19 +541,25 @@ static void on_pipe(int sig)
 	pipes++;
 }
 
-static void epipe(void)
+/* The server closes, then the client sends until a send fails: with `unread`
+ * the server holds a byte nobody read (its close resets the connection); without
+ * it the first send reaches a closed socket, which resets the connection. One
+ * ECONNRESET may come, then EPIPE with one SIGPIPE for each. */
+static void epipe_with(int unread)
 {
 	struct sigaction sa;
 	memset(&sa, 0, sizeof sa);
 	sa.sa_handler = on_pipe;
 	sigemptyset(&sa.sa_mask);
 	REQUIRE(sigaction(SIGPIPE, &sa, NULL) == 0);
+	pipes = 0;
 	int c, s;
 	pair(LOOPBACK, &c, &s);
-	/* The server closes with a byte nobody read: it resets the connection. */
-	REQUIRE(send(c, "u", 1, 0) == 1);
-	struct pollfd unread = { s, POLLIN, 0 };
-	REQUIRE(poll(&unread, 1, 5000) == 1);
+	if (unread) {
+		REQUIRE(send(c, "u", 1, 0) == 1);
+		struct pollfd waiting = { s, POLLIN, 0 };
+		REQUIRE(poll(&waiting, 1, 5000) == 1);
+	}
 	close(s);
 	int resets = 0, broken = 0;
 	for (int i = 0; i < 200 && broken < 2; i++) {
@@ -572,6 +582,9 @@ static void epipe(void)
 	REQUIRE(errno == EPIPE && pipes == broken);
 	close(c);
 }
+
+static void epipe(void) { epipe_with(0); }
+static void epipe_unread(void) { epipe_with(1); }
 
 static void msgsize(void)
 {
@@ -670,6 +683,165 @@ static void fstat_check(void)
 	close(fd);
 }
 
+static void nonblock_refused(void)
+{
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	REQUIRE(fd >= 0);
+	struct sockaddr_in a = at(LOOPBACK, 1);
+	errno = 0;
+	REQUIRE(connect(fd, (struct sockaddr *)&a, sizeof a) == -1);
+	REQUIRE(errno == EINPROGRESS || errno == ECONNREFUSED);
+	/* No event asked for: the error comes all the same. */
+	struct pollfd p = { fd, 0, 0 };
+	REQUIRE(poll(&p, 1, 10000) == 1);
+	REQUIRE(p.revents & POLLERR);
+	int error = -1;
+	socklen_t len = sizeof error;
+	REQUIRE(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0);
+	REQUIRE(error == ECONNREFUSED);
+	error = -1;
+	REQUIRE(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0);
+	REQUIRE(error == 0);
+	close(fd);
+}
+
+static void hangup(void)
+{
+	int c, s;
+	pair(LOOPBACK, &c, &s);
+	REQUIRE(send(c, "u", 1, 0) == 1);
+	struct pollfd waiting = { s, POLLIN, 0 };
+	REQUIRE(poll(&waiting, 1, 5000) == 1);
+	close(s);
+	/* The server closed with a byte unread: a reset, and POLLHUP unasked. */
+	struct pollfd p = { c, 0, 0 };
+	REQUIRE(poll(&p, 1, 10000) == 1);
+	REQUIRE(p.revents & POLLHUP);
+	close(c);
+}
+
+static void spawn_socket(void)
+{
+	int c, s;
+	pair(LOOPBACK, &c, &s);
+	char number[16], address[32];
+	snprintf(number, sizeof number, "%d", s);
+	snprintf(address, sizeof address, "%u.%u.%u.%u", own >> 24, (own >> 16) & 255,
+		 (own >> 8) & 255, own & 255);
+	char *args[] = { "net-sock", address, "exec-child", number, NULL };
+	pid_t child;
+	REQUIRE(posix_spawn(&child, "/bin/net-sock", NULL, NULL, args, environ) == 0);
+	char buf[8];
+	REQUIRE(read_all(c, buf, 4) == 4);
+	REQUIRE(memcmp(buf, "exec", 4) == 0);
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(c);
+	close(s);
+}
+
+/* A socket made with SOCK_CLOEXEC is gone in the new image, and its port is
+ * free there. */
+static void cloexec_exec(void)
+{
+	int port;
+	int l = stream();
+	struct sockaddr_in a = at(LOOPBACK, 0);
+	REQUIRE(bind(l, (struct sockaddr *)&a, sizeof a) == 0);
+	port = port_of(l);
+	close(l);
+	l = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	REQUIRE(l >= 0);
+	a = at(LOOPBACK, port);
+	REQUIRE(bind(l, (struct sockaddr *)&a, sizeof a) == 0);
+	REQUIRE(listen(l, 4) == 0);
+	REQUIRE(fcntl(l, F_GETFD) & FD_CLOEXEC);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		char number[16], text[16], address[32];
+		snprintf(number, sizeof number, "%d", l);
+		snprintf(text, sizeof text, "%d", port);
+		snprintf(address, sizeof address, "%u.%u.%u.%u", own >> 24, (own >> 16) & 255,
+			 (own >> 8) & 255, own & 255);
+		char *args[] = { "net-sock", address, "bind-child", text, number, NULL };
+		execv("/bin/net-sock", args);
+		_exit(2);
+	}
+	close(l);
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	REQUIRE(WIFEXITED(status));
+	errno = WEXITSTATUS(status);
+	REQUIRE(WEXITSTATUS(status) == 0);
+}
+
+/* The new image of cloexec_exec: the descriptor is closed, and the port can
+ * be bound once the old image's description is gone (the parent let go of
+ * its own at once). */
+static int bind_child(int port, int fd)
+{
+	check = "bind-child";
+	errno = 0;
+	REQUIRE(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+	for (int tries = 0; tries < 30; tries++) {
+		int again = stream();
+		struct sockaddr_in a = at(LOOPBACK, port);
+		if (bind(again, (struct sockaddr *)&a, sizeof a) == 0) {
+			close(again);
+			return 0;
+		}
+		REQUIRE(errno == EADDRINUSE);
+		close(again);
+		pause_ms(100);
+	}
+	REQUIRE(0 && "the port stayed in use");
+	return 1;
+}
+
+static void clofork(void)
+{
+	int c, s;
+	pair(LOOPBACK, &c, &s);
+	REQUIRE(fcntl(s, F_SETFD, FD_CLOFORK) == 0);
+	REQUIRE(fcntl(s, F_GETFD) & FD_CLOFORK);
+	pid_t child = fork();
+	REQUIRE(child >= 0);
+	if (child == 0) {
+		errno = 0;
+		if (send(s, "x", 1, 0) != -1 || errno != EBADF)
+			_exit(2);
+		_exit(0);
+	}
+	int status = 0;
+	REQUIRE(waitpid(child, &status, 0) == child);
+	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	exchange(c, s);
+	close(c);
+	close(s);
+}
+
+static void peek_waitall(void)
+{
+	int c, s;
+	pair(LOOPBACK, &c, &s);
+	REQUIRE(send(c, "abcdef", 6, 0) == 6);
+	struct pollfd p = { s, POLLIN, 0 };
+	REQUIRE(poll(&p, 1, 5000) == 1);
+	pause_ms(50);
+	char buf[16];
+	REQUIRE(recv(s, buf, 4, MSG_PEEK | MSG_WAITALL) == 4);
+	REQUIRE(memcmp(buf, "abcd", 4) == 0);
+	/* More asked than queued: what is there, once. */
+	REQUIRE(recv(s, buf, 10, MSG_PEEK | MSG_WAITALL) == 6);
+	REQUIRE(memcmp(buf, "abcdef", 6) == 0);
+	REQUIRE(recv(s, buf, 6, MSG_WAITALL) == 6);
+	REQUIRE(memcmp(buf, "abcdef", 6) == 0);
+	close(c);
+	close(s);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -695,6 +867,13 @@ static const struct {
 	{ "close-flush", close_flush },
 	{ "names", names },
 	{ "fstat", fstat_check },
+	{ "nonblock-refused", nonblock_refused },
+	{ "hangup", hangup },
+	{ "spawn-socket", spawn_socket },
+	{ "cloexec-exec", cloexec_exec },
+	{ "clofork", clofork },
+	{ "epipe-unread", epipe_unread },
+	{ "peek-waitall", peek_waitall },
 };
 
 static int udp_echo(int port)
@@ -733,6 +912,8 @@ int main(int argc, char **argv)
 		return udp_echo(atoi(argv[3]));
 	if (argc >= 3 && strcmp(argv[2], "udp-send") == 0 && argc == 6)
 		return udp_send(argv[3], atoi(argv[4]), argv[5]);
+	if (argc >= 3 && strcmp(argv[2], "bind-child") == 0 && argc == 5)
+		return bind_child(atoi(argv[3]), atoi(argv[4]));
 	if (argc >= 3 && strcmp(argv[2], "exec-child") == 0 && argc == 4) {
 		check = "exec-child";
 		REQUIRE(send(atoi(argv[3]), "exec", 4, 0) == 4);
