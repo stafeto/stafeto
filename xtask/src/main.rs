@@ -58,6 +58,7 @@ mod net_tls;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
+mod nginx_probe;
 mod obj_sites;
 mod openposix;
 mod ostest;
@@ -890,7 +891,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 8] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 9] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -904,6 +905,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 8] = [
     ("doom", "doom", 0, &["dynamic"]),
     ("openssl", "openssl", 0, &["dynamic"]),
     ("curl", "curl", 0, &["dynamic"]),
+    ("nginx", "nginx", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -1703,6 +1705,12 @@ commands:
             write, 1 000 connections, a refused connect and the timer of a
             SYN sent again; with `write-blocking`, what one write of 1 MiB
             does on a blocking socket
+  nginx-probe [steps] [MACHINE] run nginx in the guest from ash (boot-nginx-probe.img):
+            a master and four workers under nobody with SO_REUSEPORT, 200 requests
+            over 16 connections that stay open, 256 KiB answers by digest through
+            the shared buffer, a reload by SIGHUP under requests, SIGQUIT, the
+            variant with EPOLLEXCLUSIVE; no [alert], [emerg] or [crit] line; with
+            `steps` the network service counts its steps (TCG only)
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
@@ -1970,6 +1978,7 @@ fn main() {
         Some("net") => net::run(&args[1..]),
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
+        Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
@@ -2519,6 +2528,22 @@ fn write_elf_image(
     )?;
     for (name, bytes) in &tls_files {
         list.push((name, bytes.as_slice()));
+    }
+    // An image with nginx (BSD-2-Clause) carries its licence, PCRE2's
+    // (BSD-3-Clause with the PCRE2 exception) and where the exact sources
+    // are.
+    let nginx_files = if sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "nginx"))
+    {
+        Some(nginx_probe::terms_files()?)
+    } else {
+        None
+    };
+    if let Some(files) = &nginx_files {
+        for (name, bytes) in files {
+            list.push((name, bytes.as_slice()));
+        }
     }
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
@@ -3641,6 +3666,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("fstack-probe", _) => "fstack-probe",
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
+        ("nginx", _) => "nginx",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -3684,7 +3710,7 @@ fn nano_build() -> Result<(), String> {
     once(&NANO_BUILT, (), || packages_built(packages::Kind::Addon))
 }
 
-/// The network packages built (OpenSSL, curl and the root certificates),
+/// The network packages built (OpenSSL, curl, the root certificates, nginx with PCRE2),
 /// once in a run of xtask: the images with the network service hold them.
 fn net_build() -> Result<(), String> {
     once(&NET_BUILT, (), || packages_built(packages::Kind::Net))
@@ -8934,6 +8960,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
+        "tools/test_nginx_answer.py",
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
     }

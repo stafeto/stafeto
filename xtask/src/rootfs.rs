@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 41] = [
+const SYSTEM_PATHS: [&str; 43] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -294,6 +294,10 @@ const SYSTEM_PATHS: [&str; 41] = [
     "/bin/posix-net",
     // The image of the probe of F-Stack on its loopback.
     "/bin/fstack-probe",
+    // The image of `nginx-probe`: the files it fetches and the setting of
+    // nginx with one listening socket for all the workers.
+    "/www/10k.bin",
+    "/etc/nginx/exclusive.conf",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -441,6 +445,8 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         "freedoom1.wad" => Ok(freedoom_wad()),
         "fstack.ini" => Ok(include_bytes!("../../ports/f-stack/fstack.ini")),
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
+        "mime.types" => Ok(crate::nginx_probe::mime_types()),
+        "nginx.conf" => Ok(crate::nginx_probe::NGINX_CONF.as_bytes()),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -1010,6 +1016,53 @@ fn net_files(image: &str) -> Vec<RootFile> {
     files.push(file("/bin/posix-net", 0o755, ROOT, "posix-net"));
     files
 }
+/// The files of the images of `nginx-probe`: those of the shell with the
+/// network (nginx among them), with the probe's variant of nginx's settings
+/// in place of the package's, the variant with one listening socket, the
+/// files of 10 KiB and 256 KiB the probe fetches, and `netd.conf` with
+/// four buffers.
+fn nginx_files(image: &str) -> Vec<RootFile> {
+    let mut files = net_files(image);
+    let settings = files
+        .iter_mut()
+        .find(|f| f.path == "/etc/nginx/nginx.conf")
+        .unwrap_or_else(|| panic!("{image}: no /etc/nginx/nginx.conf"));
+    settings.source = Some(Source::Bytes(
+        "nginx-probe.conf",
+        crate::nginx_probe::probe_conf().as_bytes(),
+    ));
+    files.extend([
+        of(
+            "/etc/nginx/exclusive.conf",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-exclusive.conf",
+                crate::nginx_probe::exclusive_conf().as_bytes(),
+            ),
+        ),
+        of(
+            "/www/10k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-10k", crate::nginx_probe::www_10k()),
+        ),
+        of(
+            "/www/256k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("www-256k", crate::net_tls::big_file()),
+        ),
+        of(
+            "/etc/netd.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("netd.conf", crate::nginx_probe::NETD_CONF),
+        ),
+    ]);
+    files
+}
+
 /// The bytes of `/www/index.html` of the image with the network service: 64
 /// KiB of lines from a fixed generator, so that the host knows the page
 /// without reading the image (`cargo xtask net-curl`).
@@ -1048,6 +1101,8 @@ pub const IMAGES: &[&str] = &[
     "boot-net-tls.img",
     "boot-net-tls-steps.img",
     "boot-posix-net-steps.img",
+    "boot-nginx-probe.img",
+    "boot-nginx-probe-steps.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1164,6 +1219,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             ));
             files
         }
+        "boot-nginx-probe.img" | "boot-nginx-probe-steps.img" => nginx_files(name),
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
@@ -1658,6 +1714,8 @@ mod tests {
                     crate::net_curl::steps_programs()
                 }
                 "boot-net-tls.img" => crate::net::programs(),
+                "boot-nginx-probe.img" => crate::nginx_probe::programs(),
+                "boot-nginx-probe-steps.img" => crate::nginx_probe::steps_programs(),
                 "boot-posix-net-steps.img" => crate::posix_net::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,

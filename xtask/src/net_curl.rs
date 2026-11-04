@@ -122,7 +122,7 @@ pub fn steps_programs() -> &'static [crate::ImageProgram] {
 }
 
 /// A free port of the host, taken and given back.
-fn free_tcp_port() -> Result<u16, String> {
+pub fn free_tcp_port() -> Result<u16, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("a free port: {e}"))?;
     let port = listener
         .local_addr()
