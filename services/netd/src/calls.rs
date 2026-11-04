@@ -466,7 +466,7 @@ impl Net {
                 connected: false,
                 reuse: sock.reuse,
             };
-            if ports::conflicts(&new, self.bindings(place)) {
+            if ports::conflicts(&new, self.bindings(port, place)) {
                 return refuse(proto_net::IN_USE);
             }
             self.ports(sock.proto).hold(port);
@@ -482,6 +482,8 @@ impl Net {
         sock.port_held = true;
         sock.address = ip;
         sock.port = port;
+        self.chains.link(place, port);
+        let sock = &self.socks[place];
         if sock.proto == Proto::Udp {
             self.register(
                 place,
@@ -516,6 +518,7 @@ impl Net {
             self.socks[place].bound = true;
             self.socks[place].port_held = true;
             self.socks[place].port = port;
+            self.chains.link(place, port);
         }
         let sock = self.socks[place];
         let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
@@ -574,6 +577,8 @@ impl Net {
         member.listener = listener as u16;
         member.address = sock.address;
         member.port = sock.port;
+        self.chains.link(m, sock.port);
+        let member = &mut self.socks[m];
         member.nodelay = sock.nodelay;
         member.keepalive = sock.keepalive;
         member.reuse = sock.reuse;
@@ -727,6 +732,8 @@ impl Net {
         sock.port_held = true;
         sock.address = [0; 4];
         sock.port = port;
+        self.chains.link(place, port);
+        let sock = &self.socks[place];
         if sock.proto == Proto::Udp {
             self.register(
                 place,

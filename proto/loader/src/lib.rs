@@ -147,7 +147,10 @@ pub enum Names {
     /// service the child gets, which holds it. The loader takes the kind
     /// only with a session in the slot Net. `stream` tells a stream socket
     /// from a datagram socket.
-    Net { description: u32, stream: bool },
+    Net {
+        description: u32,
+        stream: bool,
+    },
     /// The terminal of this number of the terminal service, which the
     /// child's session in the slot Terminal serves (5f); the loader takes
     /// the kind only with that session.

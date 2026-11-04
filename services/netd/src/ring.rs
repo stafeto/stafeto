@@ -24,9 +24,9 @@ pub const NET_PAGES: usize = BUFFERS * BUFFER_LEN / 4096;
 /// The frames a step of receiving takes and the frames a step of sending
 /// sends at most (the bound of a step, so that a flood leaves the loop its
 /// other work): by the measurement of stage P4a-1, which prices the frames
-/// of the wire at full size (6 656 ticks received, 5 632 sent, p90) beside
+/// of the wire at full size (7 168 ticks received, 5 632 sent, p90) beside
 /// those of the loopback (2 048 and 768): two frames received cost an
-/// estimated 14 336 ticks, a group and a frame sent 12 800. The features `batch-N` (receiving) and `send-N` (sending) build the other
+/// estimated 15 360 ticks, a group and a frame sent 12 800. The features `batch-N` (receiving) and `send-N` (sending) build the other
 /// values, for the measurement that chose these.
 #[cfg(feature = "batch-16")]
 pub const STEP_RX: usize = 16;

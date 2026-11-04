@@ -12,8 +12,9 @@
 //! in place, so the stack of the program stays small. The pool of buffers
 //! takes a page only when a socket touches it.
 
-use crate::stack::{GROUP, GROUPS, Sh, Stack};
+use crate::stack::{GROUP, GROUPS, GroupSet, Sh, Stack};
 use core::mem::{ManuallyDrop, MaybeUninit};
+use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
@@ -41,13 +42,28 @@ pub const ROOT_CLONES: usize = 255;
 /// The long operations that wait in the service at most.
 pub const OPERATIONS: usize = 128;
 /// The descriptions one session holds: a process cannot hold more.
-pub const OPEN_MAX: usize = 64;
+pub const OPEN_MAX: usize = 1024;
 /// The sockets of the queue of `listen` at most.
 pub const BACKLOG_MAX: usize = 16;
 /// The bytes of a buffer of one direction of a TCP socket, and the packets
-/// and bytes of one direction of a UDP socket.
+/// and bytes of one direction of a UDP socket: the first `FULL_PLACES` places
+/// have `BUFFER` bytes a direction, the others `SMALL_BUFFER` (1 280 sockets
+/// of 16 KiB a side would be 40 MiB). Places are given from the lowest, so
+/// while fewer than `FULL_PLACES` sockets are open every one has the full buffer.
 pub const BUFFER: usize = 16 * 1024;
+pub const SMALL_BUFFER: usize = 4 * 1024;
+pub const FULL_PLACES: usize = 256;
+const SMALL_PLACES: usize = SOCKETS_MAX - FULL_PLACES;
 const PACKETS: usize = 16;
+
+/// The bytes of a direction of the buffers of place `i`.
+pub const fn buffer_of(i: usize) -> usize {
+    if i < FULL_PLACES {
+        BUFFER
+    } else {
+        SMALL_BUFFER
+    }
+}
 /// How long a stream no session holds may close, in nanoseconds: smoltcp's
 /// FIN-WAIT-2 has no end of its own.
 pub const ORPHAN_NS: u64 = 60_000_000_000;
@@ -62,6 +78,8 @@ const SWEEP: usize = 4;
 const RST_NS: u64 = 1_000_000_000;
 /// The streams `evict` looks at.
 const EVICT: usize = 8;
+/// The groups of sockets `schedule_wake` looks at in one step.
+const SCHEDULE_GROUPS: usize = 16;
 /// The sessions that went and still hold descriptions at most: a session
 /// has one entry, so the table is as long as the sessions are. Past that (a
 /// session that went twice before the first entry drained) the descriptions
@@ -260,12 +278,16 @@ pub struct Counters {
 pub struct Net {
     pub places: Places<SOCKETS_MAX>,
     pub socks: [Sock; SOCKETS_MAX],
-    /// The buffers: place i uses `pool[i]`, the first half for receiving
-    /// and the second for sending.
-    pool: [[u8; 2 * BUFFER]; SOCKETS_MAX],
+    /// The buffers: place i below `FULL_PLACES` uses `pool_full[i]`, the others
+    /// `pool_small[i - FULL_PLACES]`; the first half for receiving and the
+    /// second for sending.
+    pool_full: [[u8; 2 * BUFFER]; FULL_PLACES],
+    pool_small: [[u8; 2 * SMALL_BUFFER]; SMALL_PLACES],
     /// The packet records of a datagram socket: place i, then the two
     /// directions.
     udp_meta: [[MaybeUninit<udp::PacketMetadata>; 2 * PACKETS]; SOCKETS_MAX],
+    /// The bound places, in a chain for each port.
+    pub chains: PortChains<SOCKETS_MAX>,
     pub tcp_ports: PortMap,
     pub udp_ports: PortMap,
     pub ops: LongOps<OPERATIONS>,
@@ -299,10 +321,10 @@ pub struct Net {
     pub demux: Demux,
     /// The groups with work for the pass of sending, and those the step
     /// touched (a bit each), for the step of waking.
-    pub due: u64,
-    pub touched: u64,
+    pub due: GroupSet,
+    pub touched: GroupSet,
     /// The groups whose pass of sending ran since the last step of waking.
-    pub passed: u64,
+    pub passed: GroupSet,
     /// The service is asked for a step of departure or of waking.
     pub cleanup_wanted: bool,
     pub wake_wanted: bool,
@@ -389,14 +411,19 @@ impl Net {
 
     /// The smoltcp socket for place `i`.
     fn make_socket(&mut self, stack: &mut Stack<'static>, i: usize, proto: Proto) -> Sh {
-        let base = self.pool[i].as_mut_ptr();
-        // SAFETY: the pool's chunk `i` belongs to the socket of place `i`
-        // alone, which is removed before the place is free; the pool lives
+        let size = buffer_of(i);
+        let base = if i < FULL_PLACES {
+            self.pool_full[i].as_mut_ptr()
+        } else {
+            self.pool_small[i - FULL_PLACES].as_mut_ptr()
+        };
+        // SAFETY: the pool's chunk of place `i` belongs to the socket of place
+        // `i` alone, which is removed before the place is free; the pool lives
         // as long as the service.
         let (rx, tx) = unsafe {
             (
-                core::slice::from_raw_parts_mut(base, BUFFER),
-                core::slice::from_raw_parts_mut(base.add(BUFFER), BUFFER),
+                core::slice::from_raw_parts_mut(base, size),
+                core::slice::from_raw_parts_mut(base.add(size), size),
             )
         };
         match proto {
@@ -518,6 +545,7 @@ impl Net {
             }
             stack.drop_socket(handle);
         }
+        self.chains.unlink(i);
         self.socks[i] = Sock::EMPTY;
         if let Some(key) = sock.key {
             self.demux.remove(&key);
@@ -541,8 +569,8 @@ impl Net {
     }
 
     /// The bindings the registry compares a new bind with.
-    pub fn bindings(&self, skip: usize) -> impl Iterator<Item = Binding> + '_ {
-        (0..SOCKETS_MAX).filter_map(move |i| {
+    pub fn bindings(&self, port: u16, skip: usize) -> impl Iterator<Item = Binding> + '_ {
+        self.chains.chain(port).filter_map(move |i| {
             let s = &self.socks[i];
             let live = matches!(self.places.state(i), State::Live | State::Orphan);
             (i != skip && live && s.bound).then_some(Binding {
@@ -992,19 +1020,13 @@ impl Net {
     /// The group of place `i` has work for the next pass of sending, and its
     /// operations are looked at by the next step of waking.
     pub fn touch(&mut self, i: usize) {
-        let bit = 1u64 << (i / GROUP);
-        self.due |= bit;
-        self.touched |= bit;
+        self.due.set(i / GROUP);
+        self.touched.set(i / GROUP);
     }
 
     /// Every group has work: an address changed or a neighbour answered.
     pub fn touch_all(&mut self) {
-        let all = if GROUPS == 64 {
-            u64::MAX
-        } else {
-            (1u64 << GROUPS) - 1
-        };
-        self.due |= all;
+        self.due.set_below(GROUPS);
     }
 
     /// Gives the key to the socket of place `i` in the table of destinations.
@@ -1122,18 +1144,28 @@ impl Net {
         // An aborted stream is let go of by the step of departure once its RST
         // has really gone out (smoltcp forgets the connection after the
         // single RST): the pass of its group is the time to look.
-        let mut passed = core::mem::take(&mut self.passed);
-        while passed != 0 && self.rst_wait.next(0).is_some() {
-            let g = passed.trailing_zeros() as usize;
-            passed &= passed - 1;
-            if (g * GROUP..(g + 1) * GROUP).any(|i| self.rst_wait.has(i)) {
-                self.cleanup_wanted = true;
+        let passed = self.passed.take();
+        if self.rst_wait.next(0).is_some() {
+            let mut at = 0;
+            while let Some(g) = passed.next(at) {
+                at = g + 1;
+                if (g * GROUP..(g + 1) * GROUP).any(|i| self.rst_wait.has(i)) {
+                    self.cleanup_wanted = true;
+                    break;
+                }
             }
         }
-        let mut groups = core::mem::take(&mut self.touched);
-        while groups != 0 {
-            let g = groups.trailing_zeros() as usize;
-            groups &= groups - 1;
+        // At most SCHEDULE_GROUPS groups in a step: a burst of requests touches
+        // every group, and the walk over all of them in one step took 13 500
+        // ticks at 1 280 places. The rest wait for the next step.
+        let mut left = SCHEDULE_GROUPS;
+        while let Some(g) = self.touched.next(0) {
+            if left == 0 {
+                self.step_due = true;
+                break;
+            }
+            left -= 1;
+            self.touched.clear(g);
             for i in g * GROUP..(g + 1) * GROUP {
                 if self.attention.has(i) || self.connecting.has(i) {
                     self.wake_due.set(i);
@@ -1282,7 +1314,7 @@ impl Net {
                 Proto::Udp => sockets::DGRAM,
             },
             opt::ERROR => core::mem::take(&mut s.error),
-            opt::RCVBUF | opt::SNDBUF => BUFFER as u32,
+            opt::RCVBUF | opt::SNDBUF => buffer_of(i) as u32,
             opt::ACCEPTCONN => u32::from(s.listening),
             opt::DOMAIN => INET,
             opt::KEEPALIVE => u32::from(s.keepalive),

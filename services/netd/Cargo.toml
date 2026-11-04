@@ -33,7 +33,7 @@ send-16 = []
 send-8 = []
 send-4 = []
 send-2 = []
-# `limit-8`, `limit-64`, `limit-256`: the sockets limit, for the same
+# `limit-8`, `limit-64`, `limit-256`, `limit-1280`: the sockets limit, for the same
 # measurement (the default is the chosen one).
 # `split`: the breakdown of the step of the stack by parts (measurement only).
 split = []
@@ -42,6 +42,7 @@ egress-4 = []
 limit-8 = []
 limit-64 = []
 limit-256 = []
+limit-1280 = []
 steps = ["rt/step-stats"]
 
 [dependencies]

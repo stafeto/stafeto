@@ -802,7 +802,7 @@ type Rows = (&'static str, Vec<(usize, u64, u64)>);
 /// (the batch and the groups per step).
 fn acceptance_runs(netd: &[&'static str]) -> Vec<(&'static str, &'static [ImageProgram], Roles)> {
     vec![
-        ("s256", measured_programs(None, netd), Roles::LIMIT),
+        ("s1280", measured_programs(None, netd), Roles::LIMIT),
         (
             "s8",
             measured_programs(Some("net-sockets-8"), netd),
@@ -977,18 +977,18 @@ fn acceptance(
             .map(|(ticks, _)| ticks)
             .unwrap_or(0)
     };
-    if strict && !netd::choose::flat(own("s8"), own("s256")) {
+    if strict && !netd::choose::flat(own("s8"), own("s1280")) {
         return Err(format!(
             "the longest step is not even: {} ticks at 256 places, {} at 8 (the spread {} at most)",
-            own("s256"),
+            own("s1280"),
             own("s8"),
             netd::choose::FLATNESS
         ));
     }
     println!(
-        "net-probe: the longest own step: s8 {}, s256 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {} (bound {STEP_MAX}, evenness {} at most)",
+        "net-probe: the longest own step: s8 {}, s1280 {}, f {}, a {}, w {}, i {}, l {}, r {}, u {}, W {} (bound {STEP_MAX}, evenness {} at most)",
         own("s8"),
-        own("s256"),
+        own("s1280"),
         own("f"),
         own("a"),
         own("w"),
@@ -1056,8 +1056,8 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
     let lines = steps_lines(
         machine,
         measured_name("split"),
-        measured_programs(Some("net-sockets-256"), &["split"]),
-        Roles::places(SOCKETS_LIMIT),
+        measured_programs(None, &["split"]),
+        Roles::LIMIT,
         false,
     )?;
     let parts = split_parts(&lines).ok_or("no breakdown of the steps in the lines")?;
@@ -1098,12 +1098,12 @@ fn split_only(machine: &qemu::Machine) -> Result<(), String> {
 /// `netd::ring`; the command fails when the code has other numbers.
 pub fn series(machine: &qemu::Machine) -> Result<(), String> {
     use netd::choose;
-    let split_programs = measured_programs(Some("net-sockets-256"), &["split"]);
+    let split_programs = measured_programs(None, &["split"]);
     let lines = steps_lines(
         machine,
         measured_name("split"),
         split_programs,
-        Roles::places(SOCKETS_LIMIT),
+        Roles::LIMIT,
         false,
     )?;
     for line in lines
@@ -1268,7 +1268,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         let tag: &'static str = Box::leak(format!("r{receive}g{groups}s{send}").into_boxed_str());
         return acceptance(&qemu::VIRT, tag, features, false).map(|_| ());
     }
-    // `role NAME`: one run of the acceptance (s256, s8, f, a, w, i, l or r),
+    // `role NAME`: one run of the acceptance (s1280, s8, f, a, w, i, l or r),
     // judged; for the deliberate breakages.
     if let [first, name] = args
         && first == "role"

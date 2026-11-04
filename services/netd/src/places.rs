@@ -11,13 +11,14 @@ use proto_net::sockets::{description, generation, slot};
 
 /// The places of the table, and so the most descriptions (every member of a
 /// queue of `listen` takes one).
-pub const SOCKETS_MAX: usize = 256;
+pub const SOCKETS_MAX: usize = 1280;
 
 /// The sockets the service serves at once: all the places of the table. The
 /// step of the loop does not grow with the number of sockets (the sockets are
 /// in sets of a few, and a frame goes to the set of its socket), so the limit
 /// is the room of the table (reports/2026-11-04-net-p1a). The features
-/// `limit-8`, `limit-64` and `limit-256` build the service with a smaller
+/// `limit-8`, `limit-64`, `limit-256` (and `limit-1280`, the default) build the
+/// service with a smaller or the full
 /// table of sets for the measurement of that evenness.
 #[cfg(feature = "limit-8")]
 pub const SOCKETS_LIMIT: usize = 8;
@@ -27,7 +28,7 @@ pub const SOCKETS_LIMIT: usize = 64;
     feature = "limit-256",
     not(any(feature = "limit-8", feature = "limit-64"))
 ))]
-pub const SOCKETS_LIMIT: usize = SOCKETS_MAX;
+pub const SOCKETS_LIMIT: usize = 256;
 #[cfg(not(any(feature = "limit-8", feature = "limit-64", feature = "limit-256")))]
 pub const SOCKETS_LIMIT: usize = SOCKETS_MAX;
 
@@ -51,17 +52,22 @@ pub struct Places<const N: usize> {
     generation: [u32; N],
     state: [State; N],
     refs: [u16; N],
-    free: [u16; N],
+    /// The free places, a bit each: a place is given from the lowest, so that
+    /// the places with the full buffers (the lowest) are used first.
+    free: [u64; FREE_WORDS],
     free_len: usize,
 }
 
+/// The words of the bitmap of the free places: 4 096 places at most.
+const FREE_WORDS: usize = 64;
+
 impl<const N: usize> Places<N> {
     pub const fn new() -> Self {
-        assert!(N <= 4096);
-        let mut free = [0; N];
+        assert!(N <= FREE_WORDS * 64);
+        let mut free = [0u64; FREE_WORDS];
         let mut i = 0;
         while i < N {
-            free[i] = (N - 1 - i) as u16;
+            free[i / 64] |= 1 << (i % 64);
             i += 1;
         }
         Places {
@@ -77,8 +83,13 @@ impl<const N: usize> Places<N> {
     /// holder; None when the table is full.
     pub fn allocate(&mut self, state: State) -> Option<usize> {
         debug_assert!(state != State::Free);
-        self.free_len = self.free_len.checked_sub(1)?;
-        let i = usize::from(self.free[self.free_len]);
+        if self.free_len == 0 {
+            return None;
+        }
+        let word = self.free.iter().position(|&w| w != 0)?;
+        let i = word * 64 + self.free[word].trailing_zeros() as usize;
+        self.free[word] &= self.free[word] - 1;
+        self.free_len -= 1;
         self.generation[i] = match (self.generation[i] + 1) & GENERATION_MASK {
             0 => 1,
             g => g,
@@ -93,7 +104,7 @@ impl<const N: usize> Places<N> {
         if self.state[i] != State::Free {
             self.state[i] = State::Free;
             self.refs[i] = 0;
-            self.free[self.free_len] = i as u16;
+            self.free[i / 64] |= 1 << (i % 64);
             self.free_len += 1;
         }
     }
@@ -231,6 +242,20 @@ mod tests {
         assert_ne!(p.name(again), first);
         assert_eq!(p.find(first), None);
         assert_eq!(p.find(p.name(again)), Some(i));
+    }
+
+    #[test]
+    fn the_lowest_free_place_is_given_first() {
+        let mut p = Places::<300>::new();
+        let places: Vec<_> = (0..300).map(|_| p.allocate(State::Live).unwrap()).collect();
+        assert_eq!(places, (0..300).collect::<Vec<_>>());
+        p.free(290);
+        p.free(70);
+        p.free(5);
+        assert_eq!(p.allocate(State::Live), Some(5));
+        assert_eq!(p.allocate(State::Live), Some(70));
+        assert_eq!(p.allocate(State::Live), Some(290));
+        assert_eq!(p.allocate(State::Live), None);
     }
 
     #[test]

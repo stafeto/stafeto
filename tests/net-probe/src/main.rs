@@ -240,10 +240,16 @@ const CROWD_BASE: u64 = 0x400;
 /// The operations the crowd has: the whole table of the service.
 const CROWD: usize = 128;
 
-/// The most places the role `s` fills, in the pairs of 4 places.
-const PAIRS_MAX: usize = 64;
-/// The sessions the role may need: 3 descriptions a pair, 64 a session.
-const SESSIONS_MAX: usize = 8;
+/// The most places the role `s` fills, in the pairs of 4 places (all 1 280).
+const PAIRS_MAX: usize = 320;
+/// The pairs of the roles that fill 256 places (`f`, `a`).
+const PAIRS_256: usize = 64;
+/// The descriptions a session of the role holds: a process holds 1 024 at
+/// most, and the role spreads the connections over sessions of 64, so that
+/// CLONE and the clones' labels are tried.
+const SESSION_SHARE: usize = 64;
+/// The sessions the role may need: 3 descriptions a pair.
+const SESSIONS_MAX: usize = 16;
 /// The bytes each end of a connection sends in the role `s`.
 const STREAM: u32 = 64 * 1024;
 const PIECE: usize = 800;
@@ -640,15 +646,18 @@ impl Probe<'_> {
         Ok(())
     }
 
-    /// The session `n` of the role `s`, made when the one before holds 64
-    /// descriptions.
+    /// The session `n` of the role `s`, made when the one before holds
+    /// `SESSION_SHARE` descriptions.
     fn session_of(
         &self,
         sessions: &mut [Option<Handle<Channel>>; SESSIONS_MAX],
         held: &mut [usize; SESSIONS_MAX],
         root: &Handle<Channel>,
     ) -> Result<usize, &'static str> {
-        let current = held.iter().position(|&h| h < 64).unwrap_or(SESSIONS_MAX);
+        let current = held
+            .iter()
+            .position(|&h| h < SESSION_SHARE)
+            .unwrap_or(SESSIONS_MAX);
         if current == SESSIONS_MAX {
             return Err("the role needs more sessions than it has");
         }
@@ -766,7 +775,7 @@ impl Probe<'_> {
     ) -> Result<(), &'static str> {
         let pairs = places / 4;
         if pairs == 0 || pairs > PAIRS_MAX {
-            return Err("the role s takes 4 to 256 places");
+            return Err("the role s takes 4 to 1280 places");
         }
         let root = match keep.take() {
             Some(session) => session,
@@ -828,8 +837,8 @@ impl Probe<'_> {
             None => self.connect()?,
         };
         self.config_ready(&root)?;
-        let mut p = self.open_pairs(&root, PAIRS_MAX)?;
-        for link in p.links.iter().take(PAIRS_MAX) {
+        let mut p = self.open_pairs(&root, PAIRS_256)?;
+        for link in p.links.iter().take(PAIRS_256) {
             let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
             self.plain(
                 net,
@@ -842,7 +851,7 @@ impl Probe<'_> {
             .map_err(|_| "SETOPT failed")?;
         }
         self.hold(&root, proto_net::HOLD_ON)?;
-        for link in p.links.iter_mut().take(PAIRS_MAX) {
+        for link in p.links.iter_mut().take(PAIRS_256) {
             let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
             if !self.push_piece(net, link, 0)? {
                 return Err("a SEND was not taken");
@@ -854,11 +863,11 @@ impl Probe<'_> {
         while p
             .links
             .iter()
-            .take(PAIRS_MAX)
+            .take(PAIRS_256)
             .any(|l| l.got[0] < PIECE as u32)
         {
             let mut moved = false;
-            for link in p.links.iter_mut().take(PAIRS_MAX) {
+            for link in p.links.iter_mut().take(PAIRS_256) {
                 if link.got[0] < PIECE as u32 {
                     let net = p.sessions[link.session[1]].as_ref().ok_or("no session")?;
                     moved |= self.pull_piece(net, link, 1)?;
@@ -888,11 +897,11 @@ impl Probe<'_> {
             None => self.connect()?,
         };
         self.config_ready(&root)?;
-        let mut p = self.open_pairs(&root, PAIRS_MAX)?;
+        let mut p = self.open_pairs(&root, PAIRS_256)?;
         self.hold(&root, proto_net::HOLD_ADDRESS)?;
         self.sleep(100_000_000);
         // A piece into every connection and out of it.
-        for link in p.links.iter_mut().take(PAIRS_MAX) {
+        for link in p.links.iter_mut().take(PAIRS_256) {
             let net = p.sessions[link.session[0]].as_ref().ok_or("no session")?;
             if !self.push_piece(net, link, 0)? {
                 return Err("a SEND was not taken");
@@ -902,11 +911,11 @@ impl Probe<'_> {
         while p
             .links
             .iter()
-            .take(PAIRS_MAX)
+            .take(PAIRS_256)
             .any(|l| l.got[0] < PIECE as u32)
         {
             let mut moved = false;
-            for link in p.links.iter_mut().take(PAIRS_MAX) {
+            for link in p.links.iter_mut().take(PAIRS_256) {
                 if link.got[0] < PIECE as u32 {
                     let net = p.sessions[link.session[1]].as_ref().ok_or("no session")?;
                     moved |= self.pull_piece(net, link, 1)?;

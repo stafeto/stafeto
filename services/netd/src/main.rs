@@ -883,7 +883,7 @@ impl Driver<'_> {
         // The DHCP client's set has a message to send after a frame of the
         // server (a request after an offer) that only a pass of sending
         // makes; without this step it would wait for the client's retry.
-        let sending = (self.net.due != 0 || self.stack.service_due) && self.tell(TX);
+        let sending = (self.net.due.any() || self.stack.service_due) && self.tell(TX);
         if !receiving && !sending {
             self.arm(now);
         }
