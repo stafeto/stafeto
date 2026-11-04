@@ -533,7 +533,7 @@ static void collect(int ep, int want, unsigned char *seen, int size, int ms)
 	while (total < want) {
 		long left = end - now_ms();
 		if (left <= 0) {
-			printf("posix-net: %s: %d of %d events came\n", check, total, want);
+			printf("posix-net: %s failed: %d of %d events came\n", check, total, want);
 			for (int i = 0; i < size; i++)
 				if (!seen[i])
 					printf("posix-net: missing %d\n", i);

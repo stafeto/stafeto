@@ -2276,16 +2276,16 @@ impl Probe<'_> {
         // through one set (it takes 1 024 records) never fill it.
         {
             let set = self.epoll_set(&root, 0, &[])?;
-            for _ in 0..17 {
+            // The holders stay until the end: the places are held all the time.
+            let mut holders: [Option<Handle<Channel>>; 17] = [const { None }; 17];
+            for holder in holders.iter_mut() {
                 let mut group = [0u32; 64];
                 for d in group.iter_mut() {
                     *d = self
                         .new_socket(&root, sockets::DGRAM)
                         .map_err(|_| "SOCKET failed")?;
                 }
-                let holder = self
-                    .clone_with(&root, &group)
-                    .map_err(|_| "CLONE failed")?;
+                *holder = Some(self.clone_with(&root, &group).map_err(|_| "CLONE failed")?);
                 for chunk in group.chunks(PLACES) {
                     let mut records = [EpollRecord::default(); PLACES];
                     for (r, &d) in records.iter_mut().zip(chunk) {
@@ -2296,8 +2296,8 @@ impl Probe<'_> {
                 for &d in &group {
                     self.close(&root, d).map_err(|_| "CLOSE failed")?;
                 }
-                drop(holder);
             }
+            drop(holders);
             let mut buffer = [0; MESSAGE_MAX];
             let mut w = Writer::new();
             Request::EpollDrop(set)

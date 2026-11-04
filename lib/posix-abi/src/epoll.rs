@@ -1026,28 +1026,31 @@ pub fn would_block(fd: i32, write: bool) {
 }
 
 /// The descriptor number `fd` closed (or was given another descriptor by
-/// `dup2`): its records go from every instance.
+/// `dup2`): its records of pipes, FIFOs and terminals go from every instance.
+/// A record of a socket of the service stays until the number is looked at
+/// again: its generation says it is dead (`live_entry`, and the pairs of the
+/// service for it are dropped), so it costs one record of the instance for the
+/// number, and the description it names is taken out of the service's set then.
 pub fn closed(fd: u32) {
     let fd = fd as usize;
     if !marked(&WATCHED, fd) {
         return;
     }
-    let mut flush_ids = [None; INSTANCES];
-    locked(|table| {
-        for (k, inst) in table.iter_mut().enumerate().filter(|(_, i)| i.used) {
-            if inst.after_fork {
-                continue;
-            }
-            if let Some(idx) = by_fd(inst, fd)
-                && free_entry(inst, idx, true)
-            {
-                flush_ids[k] = Some(k as u32 | inst.generation << 8);
+    let kept = locked(|table| {
+        let mut kept = false;
+        for inst in table.iter_mut().filter(|i| i.used && !i.after_fork) {
+            if let Some(idx) = by_fd(inst, fd) {
+                if entry(inst, idx).is_some_and(|e| e.flags & NET != 0) {
+                    kept = true;
+                } else {
+                    free_entry(inst, idx, false);
+                }
             }
         }
+        kept
     });
-    mark(&WATCHED, fd, false);
-    mark(&EDGE_FDS, fd, false);
-    for id in flush_ids.into_iter().flatten() {
-        let _ = flush(id);
+    if !kept {
+        mark(&WATCHED, fd, false);
     }
+    mark(&EDGE_FDS, fd, false);
 }
