@@ -14,7 +14,9 @@ bootimg = { path = "../lib/bootimg", features = ["write"] }
 init = { path = "../services/init" }
 kcore = { path = "../kcore" }
 netd = { path = "../services/netd" }
+pkgd = { path = "../services/pkgd", features = ["host"] }
 pkgfmt = { path = "../lib/pkgfmt", features = ["write"] }
+proto-pkg = { path = "../proto/pkg", features = ["alloc"] }
 proto-net = { path = "../proto/net" }
 rtc = { path = "../lib/rtc" }
 virtio-pci = { path = "../lib/virtio-pci" }

@@ -112,31 +112,35 @@ fn key_stem(file: &[u8]) -> Option<&str> {
 }
 
 /// The container of the layer in `out`, whole pages: its length, or None
-/// when the buffer is too small. The directories `/etc/pkg` and
-/// `/etc/pkg/keys` are in it (0o040755, 0:0): the base has them, and a
-/// layer merges its directories with those; the files are 0o100644, 0:0.
+/// when the buffer is too small. The directories `/etc`, `/etc/pkg` and
+/// `/etc/pkg/keys` are in it (0o040755, 0:0): a layer lists the directory
+/// above each entry, the base has them all, and a layer merges its
+/// directories with those; the files are 0o100644, 0:0.
 pub fn container(settings: &Settings<'_>, out: &mut [u8]) -> Option<usize> {
     const PATH_MAX: usize = 96;
     let files = settings.count() as usize;
-    // Entry i < 2 is a directory, entry 2 + k the file k of the blob; the
+    // Entry i < 3 is a directory, entry 3 + k the file k of the blob; the
     // table wants them in ascending order of the path, so they are sorted
     // by path with their file numbers along.
-    let mut paths = [[0u8; PATH_MAX]; 34];
-    let mut lens = [0usize; 34];
+    let mut paths = [[0u8; PATH_MAX]; 35];
+    let mut lens = [0usize; 35];
     let mut contents: [&[u8]; 32] = [&[]; 32];
-    for (i, dir) in [&b"/etc/pkg"[..], b"/etc/pkg/keys"].into_iter().enumerate() {
+    for (i, dir) in [&b"/etc"[..], b"/etc/pkg", b"/etc/pkg/keys"]
+        .into_iter()
+        .enumerate()
+    {
         paths[i][..dir.len()].copy_from_slice(dir);
         lens[i] = dir.len();
     }
     for (k, f) in settings.files().enumerate() {
         let (head, name) = (b"/etc/pkg/", f.name);
-        paths[2 + k][..head.len()].copy_from_slice(head);
-        paths[2 + k][head.len()..head.len() + name.len()].copy_from_slice(name);
-        lens[2 + k] = head.len() + name.len();
+        paths[3 + k][..head.len()].copy_from_slice(head);
+        paths[3 + k][head.len()..head.len() + name.len()].copy_from_slice(name);
+        lens[3 + k] = head.len() + name.len();
         contents[k] = f.data;
     }
-    let n = 2 + files;
-    let mut order = [0usize; 34];
+    let n = 3 + files;
+    let mut order = [0usize; 35];
     for (i, slot) in order.iter_mut().enumerate().take(n) {
         *slot = i;
     }
@@ -148,10 +152,10 @@ pub fn container(settings: &Settings<'_>, out: &mut [u8]) -> Option<usize> {
     rootfs[12..16].copy_from_slice(&(n as u32).to_le_bytes());
     let mut at = 24 + 24 * n;
     for (row, &i) in order[..n].iter().enumerate() {
-        let (mode, file) = if i < 2 {
+        let (mode, file) = if i < 3 {
             (0o040_755u32, 0)
         } else {
-            (0o100_644, 3 + i - 2)
+            (0o100_644, i)
         };
         let e = 24 + 24 * row;
         rootfs[e..e + 4].copy_from_slice(&(at as u32).to_le_bytes());

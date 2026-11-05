@@ -1,0 +1,21 @@
+[package]
+name = "store-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The probe of the package service: a POSIX program that asks pkgd and looks at the tree its layers made"
+
+[[bin]]
+name = "store-probe"
+test = false
+bench = false
+
+[dependencies]
+libc-ffi = { path = "../libc-ffi" }
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt" }
+proto-pkg = { path = "../../proto/pkg" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

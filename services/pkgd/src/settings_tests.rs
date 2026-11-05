@@ -121,7 +121,7 @@ fn the_container_is_a_layer_the_file_service_reads() {
     BootImage::parse_as(&out[..out.len() - 4096], &PACKAGE).unwrap();
     let table = view.file(1).unwrap().data;
     let rootfs = Rootfs::open(table, view.count()).unwrap();
-    assert_eq!(rootfs.len(), 4);
+    assert_eq!(rootfs.len(), 5);
     let mut seen = Vec::new();
     for n in 0..rootfs.len() {
         let e = rootfs.entry(n as u32);
@@ -130,6 +130,7 @@ fn the_container_is_a_layer_the_file_service_reads() {
     assert_eq!(
         seen,
         [
+            ("/etc".to_string(), 0o040_755, 0, 0),
             ("/etc/pkg".to_string(), 0o040_755, 0, 0),
             ("/etc/pkg/keys".to_string(), 0o040_755, 0, 0),
             ("/etc/pkg/keys/games.pub".to_string(), 0o100_644, 0, 0),
@@ -140,9 +141,9 @@ fn the_container_is_a_layer_the_file_service_reads() {
     for n in 0..rootfs.len() {
         rootfs.check_entry(n as u32, view.count()).unwrap();
     }
-    let key = view.file(rootfs.entry(2).file).unwrap().data;
+    let key = view.file(rootfs.entry(3).file).unwrap().data;
     assert!(key.starts_with(b"ed25519 "));
-    let repos = view.file(rootfs.entry(3).file).unwrap().data;
+    let repos = view.file(rootfs.entry(4).file).unwrap().data;
     assert!(repos.starts_with(b"games https://"));
 }
 
@@ -162,7 +163,7 @@ fn the_container_of_the_largest_blob_fits_its_buffer() {
     assert!(len <= CONTAINER_MAX);
     let view = BootImage::view_as(&out[..len], &PACKAGE).unwrap();
     let rootfs = Rootfs::open(view.file(1).unwrap().data, view.count()).unwrap();
-    assert_eq!(rootfs.len(), 34);
+    assert_eq!(rootfs.len(), 35);
     for n in 0..rootfs.len() {
         rootfs.check_entry(n as u32, view.count()).unwrap();
     }
