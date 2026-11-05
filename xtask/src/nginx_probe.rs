@@ -137,6 +137,10 @@ const QUIT_WITHIN: Duration = Duration::from_secs(10);
 /// `reconfiguring` the probe keeps asking before it counts the processes.
 const RELOAD_GAP: Duration = Duration::from_millis(50);
 const RELOAD_FOR: Duration = Duration::from_secs(5);
+/// How long after the reload the probe waits for every new worker to hold
+/// a shared buffer, and how often it reads the count meanwhile.
+const BUFFER_WITHIN: Duration = Duration::from_secs(2);
+const BUFFER_EVERY: Duration = Duration::from_millis(200);
 /// The whole run on TCG without -icount.
 const RUN_WITHIN: Duration = Duration::from_secs(240);
 /// The kinds of the network service's steps (the methods of proto/net,
@@ -815,7 +819,18 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         .and_then(|mut c| c.get("/256k.bin"))
         .map_err(|e| format!("GET /256k.bin after the reload: {e}"))?;
     same("GET /256k.bin after the reload", &body, www_256k())?;
-    let (sessions, after) = buffered(run)?;
+    // A new worker asks for its buffer by itself, some time after it
+    // starts: the count is read again until it is whole or BUFFER_WITHIN
+    // has passed. A worker refused its buffer never gets one, so the count
+    // stays short then (`buffers 4`).
+    let asked = Instant::now();
+    let (sessions, after) = loop {
+        let (sessions, after) = buffered(run)?;
+        if sessions as usize == WORKERS || asked.elapsed() >= BUFFER_WITHIN {
+            break (sessions, after);
+        }
+        std::thread::sleep(BUFFER_EVERY);
+    };
     let grown = after.wrapping_sub(before);
     if sessions as usize != WORKERS || grown < (WWW_256K_LEN / 1024) as u64 {
         return Err(format!(
@@ -823,7 +838,8 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         ));
     }
     println!(
-        "nginx-probe: after the reload {sessions} sessions hold a buffer, and 256 KiB went through them"
+        "nginx-probe: after the reload {sessions} sessions hold a buffer ({} ms after the answer), and 256 KiB went through them",
+        asked.elapsed().as_millis()
     );
     Ok(())
 }
