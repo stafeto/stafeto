@@ -598,6 +598,11 @@ impl Net {
                     .allocate_in(state, own_sets, owners.barred().as_slice());
                 if i.is_none() && self.places.used() < SOCKETS_LIMIT {
                     self.counters.set_barred += 1;
+                    if self.counters.set_barred == 1 {
+                        rt::println!(
+                            "netd: set_barred: no set without another member's queue sockets"
+                        );
+                    }
                 }
                 i?
             }
