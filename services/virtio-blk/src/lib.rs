@@ -194,7 +194,7 @@ pub enum Kind {
     Flush,
 }
 
-/// The state of a place (Р8): the request is with the device, has its
+/// The state of a place (the rule of the flush): the request is with the device, has its
 /// answer and waits for TAKE, or was let go (CANCEL, the client's end) and
 /// the device still has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

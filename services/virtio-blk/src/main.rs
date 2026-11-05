@@ -500,8 +500,12 @@ impl Driver {
         if popped.is_err() {
             return Outcome::Io;
         }
-        // SAFETY: the byte the device wrote; read once, volatile.
-        let byte = unsafe { core::ptr::read_volatile((DMA_AT + dma::status(place)) as *const u8) };
+        // SAFETY: the byte the device wrote, inside the mapped object; an
+        // atomic load reads it afresh, with the barrier the answer needs.
+        let byte = unsafe {
+            core::sync::atomic::AtomicU8::from_ptr((DMA_AT + dma::status(place)) as *mut u8)
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
         Outcome::from_byte(byte)
     }
 
