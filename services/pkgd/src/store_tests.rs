@@ -294,7 +294,7 @@ fn a_run_never_crosses_the_records_the_table_or_what_a_transaction_took() {
             };
             let run = extent(first, need);
             assert!(run.first >= SUPERS && run.end() <= 6000);
-            for e in list[..n].iter().chain(&taken) {
+            for e in list[..n].iter().chain(&taken).chain([&own]) {
                 assert!(
                     run.end() <= e.first || e.end() <= run.first,
                     "{run:?} on {e:?}"
