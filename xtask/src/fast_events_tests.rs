@@ -255,6 +255,7 @@ fn every_routed_call_has_its_branch() {
                 "pub extern \"C\" fn stafeto_fcntl(",
                 "pub unsafe extern \"C\" fn stafeto_ioctl(",
                 "pub unsafe extern \"C\" fn stafeto_pread(",
+                "pub unsafe extern \"C\" fn stafeto_pwrite(",
             ],
         ),
         (
@@ -297,4 +298,57 @@ fn the_idle_loop_turns_the_interrupts_on_and_asks_the_bank() {
             .rfind("wake.is_some_and(|w| w())")
             .is_some()
     );
+}
+
+fn sockaddr_in(len: usize, family: u16) -> Vec<u8> {
+    let mut a = vec![0u8; len];
+    if len >= 2 {
+        a[..2].copy_from_slice(&family.to_ne_bytes());
+    }
+    a
+}
+
+#[test]
+fn an_address_for_the_stack_is_16_bytes_of_the_inet_family() {
+    // Lengths below 16, and none at all, are EINVAL.
+    for len in [0, 1, 2, 4, 15, 129, 200] {
+        assert_eq!(
+            check_inet(&sockaddr_in(len, AF_INET)),
+            Err(22),
+            "length {len}"
+        );
+    }
+    // Another family is EAFNOSUPPORT.
+    assert_eq!(check_inet(&sockaddr_in(16, 1)), Err(97));
+    assert_eq!(check_inet(&sockaddr_in(16, 10)), Err(97));
+    // 16 bytes pass whole; a longer address is cut to 16 (Linux ignores the
+    // rest), so the stack never copies more than a sockaddr_in.
+    let mut long = sockaddr_in(100, AF_INET);
+    long[2..16].copy_from_slice(&[0x50, 0, 127, 0, 0, 1, 9, 9, 9, 9, 9, 9, 9, 9]);
+    long[16] = 0xee;
+    assert_eq!(check_inet(&sockaddr_in(128, AF_INET)).unwrap().len(), 16);
+    let got = check_inet(&long).unwrap();
+    assert_eq!(got.len(), SOCKADDR_IN);
+    assert_eq!(&got[..], &long[..16]);
+    assert_eq!(check_inet(&sockaddr_in(16, AF_INET)).unwrap().len(), 16);
+}
+
+#[test]
+fn an_address_written_by_the_stack_is_cut_to_the_programs_length() {
+    let mut have = [0xaau8; SOCKADDR_ROOM];
+    have[..16].copy_from_slice(&[2, 0, 0x1f, 0x90, 10, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // Room enough: 16 bytes, the true length 16.
+    let mut big = [0xffu8; 32];
+    assert_eq!(cut_address(&have[..16], 16, &mut big), 16);
+    assert_eq!(&big[..16], &have[..16]);
+    assert_eq!(&big[16..], &[0xff; 16]);
+    // Four bytes of room: four are written, the guard behind stays, and the
+    // true length 16 comes back.
+    let mut small = [0xffu8; 8];
+    assert_eq!(cut_address(&have, 16, &mut small[..4]), 16);
+    assert_eq!(&small[..4], &have[..4]);
+    assert_eq!(&small[4..], &[0xff; 4]);
+    // No room at all: nothing is written.
+    let mut none: [u8; 0] = [];
+    assert_eq!(cut_address(&have, 16, &mut none), 16);
 }

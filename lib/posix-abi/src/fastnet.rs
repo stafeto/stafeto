@@ -19,6 +19,7 @@
 
 use crate::constants::*;
 use crate::fast::{self, FastClaim};
+use crate::fast_events;
 pub use crate::fast_events::{FAST_BASE, FAST_MAX, FAST_TICKETS, Number, classify, is_fast};
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
@@ -423,8 +424,9 @@ pub fn socket(kind: i32, protocol: i32) -> Result<i32, i32> {
 
 pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
     let n = number(fd)?;
-    // SAFETY: the table's function; `raw` is readable.
-    count(|t| unsafe { (t.bind)(n, raw.as_ptr(), raw.len() as u32) as isize }).map(drop)
+    let address = fast_events::check_inet(raw)?;
+    // SAFETY: the table's function; `address` is 16 readable bytes.
+    count(|t| unsafe { (t.bind)(n, address.as_ptr(), address.len() as u32) as isize }).map(drop)
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
@@ -435,8 +437,9 @@ pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
 
 pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
     let n = number(fd)?;
-    // SAFETY: the table's function; `raw` is readable.
-    count(|t| unsafe { (t.connect)(n, raw.as_ptr(), raw.len() as u32) as isize }).map(drop)
+    let address = fast_events::check_inet(raw)?;
+    // SAFETY: the table's function; `address` is 16 readable bytes.
+    count(|t| unsafe { (t.connect)(n, address.as_ptr(), address.len() as u32) as isize }).map(drop)
 }
 
 pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize), i32> {
@@ -444,26 +447,31 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
         return Err(EINVAL);
     }
     let n = number(fd)?;
-    let (pointer, mut len) = match out {
-        Some(out) => (out.as_mut_ptr(), out.len() as u32),
-        None => (core::ptr::null_mut(), 0),
-    };
-    let lenp: *mut u32 = if pointer.is_null() {
-        core::ptr::null_mut()
+    // The stack writes the peer into the layer's own buffer; the program
+    // gets as much of it as its length allows and learns the true length.
+    let mut room = [0u8; fast_events::SOCKADDR_ROOM];
+    let mut len = room.len() as u32;
+    let (pointer, lenp): (*mut u8, *mut u32) = if out.is_some() {
+        (room.as_mut_ptr(), &raw mut len)
     } else {
-        &raw mut len
+        (core::ptr::null_mut(), core::ptr::null_mut())
     };
     // The new socket is non-blocking from the birth.
     // SAFETY: the table's function; the buffer and its length are this call's.
     let new = count(|t| unsafe { (t.accept4)(n, pointer, lenp, SOCK_NONBLOCK) as isize })? as c_int;
     let fd = publish(new)?;
-    Ok((fd, if pointer.is_null() { 0 } else { len as usize }))
+    let true_len = match out {
+        Some(out) => fast_events::cut_address(&room, len as usize, out),
+        None => 0,
+    };
+    Ok((fd, true_len))
 }
 
 fn name(fd: i32, peer: bool, out: &mut [u8]) -> Result<usize, i32> {
     let n = number(fd)?;
-    let mut len = out.len() as u32;
-    let pointer = out.as_mut_ptr();
+    let mut room = [0u8; fast_events::SOCKADDR_ROOM];
+    let mut len = room.len() as u32;
+    let pointer = room.as_mut_ptr();
     // SAFETY: the table's function; the buffer and its length are this call's.
     count(|t| unsafe {
         if peer {
@@ -472,7 +480,7 @@ fn name(fd: i32, peer: bool, out: &mut [u8]) -> Result<usize, i32> {
             (t.getsockname)(n, pointer, &raw mut len) as isize
         }
     })?;
-    Ok(len as usize)
+    Ok(fast_events::cut_address(&room, len as usize, out))
 }
 
 pub fn getsockname(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
@@ -571,8 +579,9 @@ pub fn send(
         return Err(EOPNOTSUPP);
     }
     let flags = message_flags(flags)?;
-    let (to, to_len) = match name {
-        Some(name) => (name.as_ptr(), name.len() as u32),
+    let address = name.map(fast_events::check_inet).transpose()?;
+    let (to, to_len) = match &address {
+        Some(address) => (address.as_ptr(), address.len() as u32),
         None => (core::ptr::null(), 0),
     };
     if let [part] = iov {
@@ -616,14 +625,14 @@ pub fn recv(
     let n = number(fd)?;
     let flags = message_flags(flags)?;
     let _ = control;
-    let (from, mut from_len) = match name {
-        Some(name) => (name.as_mut_ptr(), name.len() as u32),
-        None => (core::ptr::null_mut(), 0),
-    };
-    let from_pointer: *mut u32 = if from.is_null() {
-        core::ptr::null_mut()
+    // The sender's address goes to the layer's buffer first.
+    let mut room = [0u8; fast_events::SOCKADDR_ROOM];
+    let mut from_len = room.len() as u32;
+    let wanted = name.is_some();
+    let (from, from_pointer): (*mut u8, *mut u32) = if wanted {
+        (room.as_mut_ptr(), &raw mut from_len)
     } else {
-        &raw mut from_len
+        (core::ptr::null_mut(), core::ptr::null_mut())
     };
     let got = if let [part] = iov {
         // SAFETY: the table's function; the buffers are this call's.
@@ -658,9 +667,13 @@ pub fn recv(
         from_len = message.namelen;
         got
     };
+    let name_len = match name {
+        Some(out) => fast_events::cut_address(&room, from_len as usize, out),
+        None => 0,
+    };
     Ok(crate::sockets::Message {
         count: got,
-        name_len: if from.is_null() { 0 } else { from_len as usize },
+        name_len,
         flags: 0,
         control_len: 0,
     })
@@ -765,4 +778,45 @@ pub fn refuse_dup(source: i32, target: i32) -> i32 {
         let _ = target;
         EBADF
     }
+}
+
+// The branches of the common entries (`close`, `read`, `write`, `lseek`,
+// `dup*`) for a fast number stand in functions of their own: out of line and
+// cold, so that the path of every other program stays a comparison and a
+// tail call.
+
+#[cold]
+#[inline(never)]
+pub fn close_cold(fd: i32) -> Result<(), i32> {
+    close(fd)
+}
+
+#[cold]
+#[inline(never)]
+pub fn read_cold(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
+    read(fd, out)
+}
+
+#[cold]
+#[inline(never)]
+pub fn write_cold(fd: i32, bytes: &[u8]) -> Result<usize, i32> {
+    write(fd, bytes)
+}
+
+#[cold]
+#[inline(never)]
+pub fn lseek_cold(fd: i32) -> Result<i64, i32> {
+    Err(unsupported(fd))
+}
+
+#[cold]
+#[inline(never)]
+pub fn dup_cold(fd: i32) -> Result<c_int, i32> {
+    Err(refuse_copy(fd))
+}
+
+#[cold]
+#[inline(never)]
+pub fn dup2_cold(source: i32, target: i32) -> Result<c_int, i32> {
+    Err(refuse_dup(source, target))
 }

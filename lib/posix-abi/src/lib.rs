@@ -341,7 +341,7 @@ pub fn openat_policy(
 
 pub fn close(number: c_int) -> Result<(), c_int> {
     if fastnet::is_fast(number) {
-        return fastnet::close(number);
+        return fastnet::close_cold(number);
     }
     close_driver::close(fd(number)?)
 }
@@ -349,7 +349,7 @@ pub fn close(number: c_int) -> Result<(), c_int> {
 /// Reads into `buffer`: a point of cancellation.
 pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     if fastnet::is_fast(number) {
-        return fastnet::read(number, buffer);
+        return fastnet::read_cold(number, buffer);
     }
     let point = threads::cancel::Point::begin();
     // A large read of a stream socket goes through the shared buffer.
@@ -462,7 +462,7 @@ pub fn finish_file_size<T>(result: Result<T, i32>) -> Result<T, i32> {
 /// and its handler ran ([write]). A point of cancellation.
 pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     if fastnet::is_fast(number) {
-        return fastnet::write(number, bytes);
+        return fastnet::write_cold(number, bytes);
     }
     let point = threads::cancel::Point::begin();
     let result = fd(number)
@@ -482,7 +482,7 @@ pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
 
 pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {
     if fastnet::is_fast(number) {
-        return Err(fastnet::unsupported(number));
+        return fastnet::lseek_cold(number);
     }
     let fd = fd(number)?;
     let origin = match origin {
@@ -568,14 +568,14 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
 
 pub fn dup(number: c_int) -> Result<c_int, c_int> {
     if fastnet::is_fast(number) {
-        return Err(fastnet::refuse_copy(number));
+        return fastnet::dup_cold(number);
     }
     shared::number(Request::Dup { fd: fd(number)? }).map(|fd| fd as c_int)
 }
 
 pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
     if fastnet::is_fast(source) || fastnet::is_fast(target) {
-        return Err(fastnet::refuse_dup(source, target));
+        return fastnet::dup2_cold(source, target);
     }
     shared::number(Request::Dup2 {
         source: fd(source)?,
@@ -587,7 +587,7 @@ pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
 /// Replace a descriptor and capture its close flags in the same table transition.
 pub fn dup3(source: c_int, target: c_int, flags: c_int) -> Result<c_int, c_int> {
     if fastnet::is_fast(source) || fastnet::is_fast(target) {
-        return Err(fastnet::refuse_dup(source, target));
+        return fastnet::dup2_cold(source, target);
     }
     shared::number(Request::Dup3 {
         source: fd(source)?,

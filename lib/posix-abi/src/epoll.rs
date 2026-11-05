@@ -112,6 +112,10 @@ struct Instance {
     /// The kqueue of the stack behind the fast sockets of the instance
     /// (their records live in it alone), -1 before the first.
     kq: i32,
+    /// When the records that are not fast were last looked at, nanoseconds
+    /// of the counter (0: never). One look for each tick of the instance,
+    /// however many calls of `epoll_pwait` there are.
+    shared_at: u64,
 }
 
 impl Instance {
@@ -129,6 +133,7 @@ impl Instance {
         pending: [0; PENDING],
         pending_len: 0,
         kq: -1,
+        shared_at: 0,
     };
 }
 
@@ -552,6 +557,19 @@ fn ctl_fast(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<()
                 delete_filters(kq, n)?;
             }
             let (list, len) = fast_events::changes(n, event.events & !EPOLL_WAKEUP, event.data);
+            // A record that exists is replaced whole: a filter the new
+            // interest does not ask for goes (both asked for, nothing to do).
+            if len == 1 {
+                let other = if list[0].filter == fast_events::EVFILT_READ {
+                    fast_events::EVFILT_WRITE
+                } else {
+                    fast_events::EVFILT_READ
+                };
+                match fastnet::change(kq, &[fast_events::delete(n, other)]) {
+                    Ok(()) | Err(ENOENT) => {}
+                    Err(errno) => return Err(errno),
+                }
+            }
             fastnet::change(kq, &list[..len])
         }
         CTL_DEL => {
@@ -883,7 +901,7 @@ fn round(
     consumed: &mut EpollReady,
 ) -> Result<usize, i32> {
     loop {
-        let filled = round_once(id, out, until, handled, consumed, None)?;
+        let filled = round_once(id, out, until, handled, consumed, None, false)?;
         if filled > 0 || until.is_some_and(|deadline| wait::now() >= deadline) {
             return Ok(filled);
         }
@@ -899,9 +917,13 @@ fn round_once(
     handled: u64,
     consumed: &mut EpollReady,
     wake: Option<fn() -> bool>,
+    fast_only: bool,
 ) -> Result<usize, i32> {
     flush(id)?;
     let mut g = gather(id)?;
+    // An instance of fast records alone has nothing to ask of the services:
+    // the wait is the timer and the thread's channel.
+    let nothing_shared = fast_only && g.len == 0 && !g.nets;
     // The service gives pairs it takes off its lists for good: it is
     // asked for no more than fit, and a place is kept for the other
     // descriptors when there are any, so that sockets never crowd them out.
@@ -910,10 +932,10 @@ fn round_once(
     // The wait holds the service's set even when no socket is in it yet:
     // a socket another thread adds meanwhile wakes it (a service that
     // is not there leaves the set 0 and the wait to the other descriptors).
-    if g.set == 0 {
+    if g.set == 0 && !nothing_shared {
         g.set = ensure_set(id).unwrap_or(0);
     }
-    let mut net = (g.set != 0).then(|| wait::NetWait::new(g.set, most as u32));
+    let mut net = (g.set != 0 && !nothing_shared).then(|| wait::NetWait::new(g.set, most as u32));
     let len = g.len;
     let ran = wait::run_net(&mut g.items[..len], net.as_mut(), until, handled, wake);
     // What the service gave is kept for the error exits, which put it back.
@@ -933,11 +955,6 @@ fn round_once(
 
 /// The stack's clock tick and the longest sleep of the loop.
 const TICK_NS: u64 = 10_000_000;
-/// When the records that are not fast were last looked at, in nanoseconds
-/// of the counter (0: never). One look for each tick of the process, however
-/// many calls of `epoll_pwait` there are: the look is requests to services,
-/// and under load a call ends at every batch of events.
-static SHARED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// The wake test of the loop's sleep: bits of the service's notifications
 /// wait in the bank, or the service let go.
@@ -984,6 +1001,14 @@ fn look(kq: i32, events: &mut [Kevent], out: &mut [EpollEvent]) -> Result<(i32, 
     Ok((work, deliver_fast(&events[..got], out)))
 }
 
+/// The time of the last look at the instance's records that are not fast.
+fn set_shared_at(id: u32, at: u64) {
+    let _ = with_instance(id, |inst| {
+        inst.shared_at = at;
+        Ok(())
+    });
+}
+
 fn fast_round(
     id: u32,
     kq: i32,
@@ -1004,19 +1029,39 @@ fn fast_round(
         if block.handled.load(Ordering::SeqCst) != handled || crate::threads::cancel::requested() {
             return Err(EINTR);
         }
-        let has_shared = with_instance(id, |inst| Ok(inst.count > 0))?;
+        let (has_shared, last) = with_instance(id, |inst| Ok((inst.count > 0, inst.shared_at)))?;
         let now = wait::now();
-        let last = SHARED_AT.load(Ordering::Relaxed);
         let due = has_shared && (last == 0 || now.saturating_sub(last) >= TICK_NS);
         // The fast records first; a place stays for the others when their
         // turn is due, so that they never starve under a flood of events.
         let keep = usize::from(due && out.len() > 1);
         let room = out.len() - keep;
         let (work, mut filled) = look(kq, &mut events, &mut out[..room])?;
-        if due {
+        if due && filled < out.len() {
             let at = wait::now();
-            SHARED_AT.store(at, Ordering::Relaxed);
-            filled += round_once(id, &mut out[filled..], Some(at), handled, consumed, None)?;
+            set_shared_at(id, at);
+            match round_once(
+                id,
+                &mut out[filled..],
+                Some(at),
+                handled,
+                consumed,
+                None,
+                true,
+            ) {
+                Ok(more) => filled += more,
+                // The events of the kqueue are out of it for good (an edge
+                // or a oneshot record would never report again): the call
+                // gives them, and the pairs taken from the service go back to
+                // it. A signal ends the next call.
+                Err(_) if filled > 0 => {
+                    if consumed.len != 0 {
+                        restore(id, consumed);
+                        *consumed = EpollReady::EMPTY;
+                    }
+                }
+                Err(errno) => return Err(errno),
+            }
         }
         if filled > 0 {
             return Ok(filled);
@@ -1063,9 +1108,10 @@ fn fast_round(
             handled,
             consumed,
             Some(fast_wake),
+            true,
         );
         fastnet::notify(false);
-        SHARED_AT.store(wait::now(), Ordering::Relaxed);
+        set_shared_at(id, wait::now());
         let bits = posix_sync::receiver::take_pending();
         if bits != 0 {
             fastnet::absorb(bits);

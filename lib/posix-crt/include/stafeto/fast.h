@@ -157,7 +157,8 @@ int stafeto_fast_lost(void);
  * address is renewed at the same address (a new address is not supported).
  */
 #define STAFETO_FAST_TABLE_VERSION 1
-/* The process ends when the service lets go of the device. */
+/* Accepted and kept; the process does not end on its own yet. Until it does,
+ * epoll_pwait answers ENETDOWN once the service has let go of the device. */
 #define STAFETO_FAST_EXIT_ON_LOSS 1u
 
 struct stafeto_fast_table {

@@ -22,11 +22,14 @@
  * Built with -fno-builtin; every result is compared.
  */
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +54,7 @@ void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *pass_coun
 
 static int epfd = -1;
 static int mixed[2];
+static volatile int alarms;
 static int stop;
 static unsigned char page[PAGE_BYTES];
 static char head[128];
@@ -211,6 +215,48 @@ check_calls(void)
     len = sizeof(a);
     REQUIRE(getpeername(c, (struct sockaddr *)&a, &len) == 0);
     REQUIRE(a.sin_port == htons(SCRATCH_PORT));
+    {
+        /* An address is cut to the program's length, and the bytes behind it
+         * stay: the stack writes into a buffer of the layer. */
+        struct {
+            unsigned char room[4];
+            unsigned char guard[16];
+        } cut;
+        struct sockaddr_in wrong;
+
+        memset(&cut, 0xee, sizeof(cut));
+        len = 4;
+        REQUIRE(getsockname(c, (struct sockaddr *)cut.room, &len) == 0);
+        REQUIRE(len == sizeof(struct sockaddr_in));
+        REQUIRE(cut.room[0] == AF_INET && cut.room[1] == 0);
+        for (n = 0; n < 16; n++)
+            REQUIRE(cut.guard[n] == 0xee);
+        memset(&cut, 0xee, sizeof(cut));
+        len = 0;
+        REQUIRE(getpeername(c, (struct sockaddr *)cut.room, &len) == 0);
+        REQUIRE(len == sizeof(struct sockaddr_in) && cut.room[0] == 0xee);
+        /* An address of the wrong length or family never reaches the stack. */
+        memset(&wrong, 0, sizeof(wrong));
+        wrong.sin_family = AF_INET;
+        {
+            int u = socket(AF_INET, SOCK_STREAM, 0);
+
+            REQUIRE(u >= FAST_BASE);
+            REFUSED(bind(u, (struct sockaddr *)&wrong, 0), EINVAL);
+            REFUSED(bind(u, (struct sockaddr *)&wrong, 4), EINVAL);
+            REFUSED(connect(u, (struct sockaddr *)&wrong, 15), EINVAL);
+            {
+                unsigned char big[256];
+
+                memset(big, 0, sizeof(big));
+                big[0] = AF_INET;
+                REFUSED(bind(u, (struct sockaddr *)big, 200), EINVAL);
+            }
+            wrong.sin_family = AF_UNIX;
+            REFUSED(bind(u, (struct sockaddr *)&wrong, sizeof(wrong)), EAFNOSUPPORT);
+            REQUIRE(close(u) == 0);
+        }
+    }
     ok("names");
 
     /* The queue is empty: accept answers at once even though the program
@@ -423,6 +469,13 @@ static struct connection connections[MAX_CONNECTIONS];
 static int echo_listener, page_listener;
 
 static void
+on_alarm(int sig)
+{
+    (void)sig;
+    alarms++;
+}
+
+static void
 drop(struct connection *c)
 {
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
@@ -476,7 +529,26 @@ serve_echo(struct connection *c)
                 stop = 1;
                 return;
             }
-            if (got >= 6 && memcmp(c->out, "?unmix", 6) == 0) {
+            if (got >= 6 && memcmp(c->out, "?alarm", 6) == 0) {
+                struct sigaction sa;
+                struct itimerval it;
+
+                memset(&sa, 0, sizeof(sa));
+                sa.sa_handler = on_alarm;
+                REQUIRE(sigaction(SIGALRM, &sa, NULL) == 0);
+                memset(&it, 0, sizeof(it));
+                it.it_interval.tv_usec = 1000;
+                it.it_value.tv_usec = 1000;
+                REQUIRE(setitimer(ITIMER_REAL, &it, NULL) == 0);
+                c->out_len = (unsigned)snprintf((char *)c->out, sizeof(c->out), "alarm\n");
+            } else if (got >= 6 && memcmp(c->out, "?quiet", 6) == 0) {
+                struct itimerval it;
+
+                memset(&it, 0, sizeof(it));
+                REQUIRE(setitimer(ITIMER_REAL, &it, NULL) == 0);
+                c->out_len = (unsigned)snprintf((char *)c->out, sizeof(c->out), "quiet %d\n",
+                    alarms > 0);
+            } else if (got >= 6 && memcmp(c->out, "?unmix", 6) == 0) {
                 REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, mixed[0], NULL) == 0);
                 c->out_len = (unsigned)snprintf((char *)c->out, sizeof(c->out), "unmixed\n");
             } else if (got >= 4 && memcmp(c->out, "?mix", 4) == 0) {

@@ -38,8 +38,11 @@ pub const IMAGE: &str = "boot-fast-layer.img";
 
 const ECHO_PORT: u16 = 7;
 const PAGE_PORT: u16 = 80;
-/// The most the median of the echo after a pause of 60 ms may take.
-const IDLE_MEDIAN_MAX_US: u64 = 3000;
+/// An echo after a pause that took longer than this missed the wake of the
+/// idle loop (it waited for the stack's next tick); at most this share of the
+/// echoes may.
+const IDLE_SLOW_US: u64 = 6000;
+const IDLE_SLOW_SHARE_MAX: f64 = 0.10;
 const LINE_WITHIN: Duration = Duration::from_secs(60);
 
 /// The checks of the program, in its order (`fast-layer: <name> ok`).
@@ -133,15 +136,25 @@ fn pattern(size: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-/// The median and the 90th percentile of the echo of 32 bytes on one
-/// connection after pauses of 60 ms, in microseconds.
-fn idle_latency(port: u16, count: usize) -> Result<(u64, u64), String> {
+/// The echo times of 32 bytes on one connection after pauses of 60 ms plus a
+/// random 0 to 10 ms (the pause must not be a multiple of the stack's tick of
+/// 10 ms, or an echo that missed the wake would wait the same time every
+/// time): the median and the 90th percentile in microseconds, and the share
+/// of the echoes slower than `IDLE_SLOW_US`.
+fn idle_latency(port: u16, count: usize) -> Result<(u64, u64, f64), String> {
     let mut stream = connect(port)?;
     let message = [0x42u8; 32];
     let mut got = [0u8; 32];
     let mut times = Vec::new();
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9e37_79b9, |d| d.as_nanos() as u64)
+        | 1;
     for _ in 0..count {
-        std::thread::sleep(Duration::from_millis(60));
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        std::thread::sleep(Duration::from_micros(60_000 + state % 10_000));
         let started = Instant::now();
         stream
             .write_all(&message)
@@ -154,8 +167,9 @@ fn idle_latency(port: u16, count: usize) -> Result<(u64, u64), String> {
         }
         times.push(started.elapsed().as_micros() as u64);
     }
+    let slow = times.iter().filter(|&&t| t > IDLE_SLOW_US).count() as f64 / times.len() as f64;
     times.sort_unstable();
-    Ok((times[times.len() / 2], times[times.len() * 9 / 10]))
+    Ok((times[times.len() / 2], times[times.len() * 9 / 10], slow))
 }
 
 /// A command of the echo (`?mix`, `?unmix`) and its one-line answer.
@@ -272,24 +286,41 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             slowest = slowest.max(handle.join().map_err(|_| "a fetch panicked".to_owned())??);
         }
         notes.push(format!("4 pages at once, the slowest in {slowest:.2} s"));
-        let (median, p90) = idle_latency(echo_host, 40)?;
+        let (median, p90, slow) = idle_latency(echo_host, 60)?;
         notes.push(format!(
-            "echo after a pause of 60 ms: median {median} us, 90th percentile {p90} us"
+            "echo after a pause of 60 to 70 ms: median {median} us, 90th percentile {p90} us, {:.0} % over {IDLE_SLOW_US} us",
+            slow * 100.0
         ));
-        if median > IDLE_MEDIAN_MAX_US {
+        if slow > IDLE_SLOW_SHARE_MAX {
             return Err(format!(
-                "an echo after a pause took {median} us at the median, over {IDLE_MEDIAN_MAX_US}: the idle loop does not wake on the device's interrupt"
+                "{:.0} % of the echoes after a pause took over {IDLE_SLOW_US} us (at most {:.0} %): the idle loop does not wake on the device's interrupt",
+                slow * 100.0,
+                IDLE_SLOW_SHARE_MAX * 100.0
             ));
         }
         // The same with the end of a pipe in the set (as nginx's channel is):
         // the sleep of the loop then holds a subscription at the pipe's
         // service and gives it back at each wake. Not judged, reported.
         command_of(echo_host, "?mix", "mixed\n")?;
-        let (mixed_median, mixed_p90) = idle_latency(echo_host, 40)?;
-        command_of(echo_host, "?unmix", "unmixed\n")?;
+        let (mixed_median, mixed_p90, mixed_slow) = idle_latency(echo_host, 60)?;
         notes.push(format!(
-            "with a pipe in the set: median {mixed_median} us, 90th percentile {mixed_p90} us"
+            "with a pipe in the set: median {mixed_median} us, 90th percentile {mixed_p90} us, {:.0} % over {IDLE_SLOW_US} us",
+            mixed_slow * 100.0
         ));
+        // A signal every millisecond while the pipe is in the set: the
+        // calls of epoll_pwait end with EINTR in the middle of the loop, and
+        // no event of the stack's queue may be lost with them (the 16 echoes
+        // of edge-triggered connections all come back within 2 s).
+        command_of(echo_host, "?alarm", "alarm\n")?;
+        for n in 0..16u8 {
+            let seconds = echo(echo_host, &pattern(1 + 97 * n as usize, n), 0)?;
+            if seconds > 2.0 {
+                return Err(format!("echo {n} under signals took {seconds:.1} s"));
+            }
+        }
+        command_of(echo_host, "?quiet", "quiet 1\n")?;
+        command_of(echo_host, "?unmix", "unmixed\n")?;
+        notes.push("16 echoes under a signal every millisecond".to_owned());
         let before = stats(echo_host)?;
         let at = Instant::now();
         std::thread::sleep(Duration::from_secs(2));
@@ -303,6 +334,13 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         if !(70.0..=130.0).contains(&ticks) {
             return Err(format!(
                 "the stack's clock ran {ticks:.0} ticks a second, wanted 100"
+            ));
+        }
+        // A wake takes two steps (the look, and the look after the interrupts
+        // went on); a loop that skips the second look takes one.
+        if passes < 1.5 * ticks {
+            return Err(format!(
+                "the idle stack took {passes:.0} steps a second for {ticks:.0} ticks, wanted at least 1.5 for each: the look after the interrupts went on is missing"
             ));
         }
         let mut stream = connect(echo_host)?;
@@ -366,6 +404,10 @@ mod tests {
             "fast-layer: serving",
             "fast-layer: ended",
             "ticks=%llu passes=%llu",
+            "?mix",
+            "?unmix",
+            "?alarm",
+            "?quiet",
         ] {
             assert!(source.contains(text), "layer.c does not print {text}");
         }

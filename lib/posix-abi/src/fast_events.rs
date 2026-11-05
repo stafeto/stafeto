@@ -179,3 +179,41 @@ pub fn translate(batch: &[Kevent], mut push: impl FnMut(u32, u64)) -> usize {
     }
     pushed
 }
+
+// ------------------------------------------------------------ addresses
+
+/// `sizeof(struct sockaddr_in)` and the family `AF_INET` of Linux.
+pub const SOCKADDR_IN: usize = 16;
+pub const AF_INET: u16 = 2;
+/// The room the layer gives the stack for an address it writes
+/// (`struct sockaddr_storage`).
+pub const SOCKADDR_ROOM: usize = 128;
+const EINVAL: i32 = 22;
+const EAFNOSUPPORT: i32 = 97;
+
+/// The address a call hands to the stack, checked as Linux does: at least a
+/// `sockaddr_in` long and at most a `sockaddr_storage` (EINVAL), and of the
+/// family `AF_INET` (EAFNOSUPPORT).
+/// The stack gets exactly 16 bytes; it copies what the length says into a
+/// buffer of its own, so a longer or shorter length must never reach it.
+pub fn check_inet(raw: &[u8]) -> Result<[u8; SOCKADDR_IN], i32> {
+    let Some(head) = raw.first_chunk::<SOCKADDR_IN>() else {
+        return Err(EINVAL);
+    };
+    if raw.len() > SOCKADDR_ROOM {
+        return Err(EINVAL);
+    }
+    if u16::from_ne_bytes([head[0], head[1]]) != AF_INET {
+        return Err(EAFNOSUPPORT);
+    }
+    Ok(*head)
+}
+
+/// An address the stack wrote into the layer's buffer (`written` bytes of
+/// `have` valid) goes to the program's buffer `out` cut to its length, as
+/// POSIX says; the answer is the true length the program learns.
+pub fn cut_address(have: &[u8], true_len: usize, out: &mut [u8]) -> usize {
+    let n = have.len().min(true_len).min(out.len());
+    out[..n].copy_from_slice(&have[..n]);
+    true_len
+}
