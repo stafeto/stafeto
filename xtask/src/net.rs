@@ -206,13 +206,16 @@ fn run_vz(devices: usize) -> Result<(), String> {
         vz_programs(devices == 2),
         BOOT_PROFILE,
     )?;
+    let suffix = vz::claim_suffix()?;
     let machine = vz::Machine {
         net: devices,
+        mac_suffix: suffix.value,
         ..vz::Machine::default()
     };
     let mut cmd = vz::command_on(&kernel.image, &image, machine)?;
     println!(
-        "net on VZ with {devices} network devices: the console is ash; the service prints `net: lease` when DHCP answers; reach the guest at that address from this Mac (bridge100)"
+        "net on VZ with {devices} network devices (MAC suffix {}): the console is ash; the service prints `net: lease` when DHCP answers; reach the guest at that address from this Mac (bridge100)",
+        suffix.value
     );
     let status = cmd
         .stdin(Stdio::inherit())

@@ -5,7 +5,7 @@ import Foundation
 import Virtualization
 
 let usage =
-    "usage: vz-run [--window-reports] [--cpus N] [--memory MIB] [--net N] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n"
+    "usage: vz-run [--window-reports] [--cpus N] [--memory MIB] [--net N] [--mac-suffix S] [--time SECONDS] KERNEL_IMAGE BOOT_IMAGE\n"
 func fail() -> Never {
     fputs(usage, stderr)
     exit(2)
@@ -37,6 +37,10 @@ let memoryMiB = number("--memory", 512, atLeast: 256)
 // DHCP service of macOS keeps a lease by MAC address, so the guest gets
 // the same address each time.
 let netCount = Int(number("--net", 0, atMost: 2))
+// --mac-suffix S: the fifth byte of the MAC addresses (0 by default, 0 to
+// 255), so that guests run side by side get different leases on the NAT:
+// the addresses are 02:73:74:66:SS:0N.
+let macSuffix = number("--mac-suffix", 0, atMost: 255)
 // --time SECONDS: the time the guest's clock starts at, in seconds since
 // the epoch (the host's time by default).
 let startTime = number("--time", UInt64(Date().timeIntervalSince1970))
@@ -147,12 +151,13 @@ if windowReports {
 // device 6 of bus 0, after the console.
 configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
-// Locally administered unicast addresses (first byte 0x02), one per device.
+// Locally administered unicast addresses (first byte 0x02), one per device,
+// the fifth byte the suffix of the run.
 var networkDevices: [VZVirtioNetworkDeviceConfiguration] = []
 for i in 0..<netCount {
     let device = VZVirtioNetworkDeviceConfiguration()
     device.attachment = VZNATNetworkDeviceAttachment()
-    device.macAddress = VZMACAddress(string: "02:73:74:66:00:0\(i + 1)")!
+    device.macAddress = VZMACAddress(string: String(format: "02:73:74:66:%02x:%02x", macSuffix, i + 1))!
     networkDevices.append(device)
 }
 configuration.networkDevices = networkDevices

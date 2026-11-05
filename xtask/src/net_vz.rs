@@ -9,7 +9,7 @@
 //! console. With one network device:
 //!
 //! 1. the line of the driver (`virtio-net: 1af4:1041 at ...`, the fixed MAC
-//!    of `vz-run`), the lease within 20 s of the start of the services, the
+//!    of `vz-run` with the suffix the run claimed), the lease within 20 s of the start of the services, the
 //!    gateway in the network of the address, and the first interrupt;
 //! 2. a connection to a port with no listener ends in a refusal within a
 //!    second (the RST of the guest to the first SYN is not lost);
@@ -83,8 +83,83 @@ fn is_return_step(line: &str, after_kill: bool) -> bool {
         })
 }
 
-/// The fixed MAC addresses of `vz-run`, by device.
-const MACS: [&str; 2] = ["02:73:74:66:00:01", "02:73:74:66:00:02"];
+/// The leases file of the DHCP service of macOS.
+const LEASES: &str = "/var/db/dhcpd_leases";
+
+/// A MAC address with one or two digits a byte, as two digits.
+fn normal_mac(text: &str) -> Option<String> {
+    let bytes: Vec<u8> = text
+        .split(':')
+        .map(|b| u8::from_str_radix(b, 16).ok())
+        .collect::<Option<_>>()?;
+    (bytes.len() == 6).then(|| {
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
+/// The address the leases file `text` holds last for `mac`: its entries are
+/// blocks of `key=value` lines, the MAC address in `hw_address=1,2:73:...`
+/// with one digit for a zero byte.
+pub fn leased_to(text: &str, mac: &str) -> Option<Ipv4Addr> {
+    let mut found = None;
+    for block in text.split('}') {
+        let value = |key: &str| {
+            block
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        };
+        let hw = value("hw_address").and_then(|h| h.split_once(',').map(|(_, m)| m));
+        if hw.and_then(normal_mac).as_deref() == Some(mac)
+            && let Some(address) = value("ip_address").and_then(|a| a.trim().parse().ok())
+        {
+            found = Some(address);
+        }
+    }
+    found
+}
+
+/// Whether the DHCP service gave `mac` the address `lease` the console
+/// shows: a foreign guest with the same MAC address would own the lease
+/// instead. A leases file that cannot be read or has no entry yet is no
+/// evidence; the line says so and the check goes on.
+pub fn lease_is_ours(mac: &str, lease: Ipv4Addr) -> Result<(), String> {
+    let Ok(text) = std::fs::read_to_string(LEASES) else {
+        println!("net-vz: {LEASES} cannot be read; the lease of {mac} is not cross-checked");
+        return Ok(());
+    };
+    match leased_to(&text, mac) {
+        Some(address) if address == lease => {
+            println!("net-vz: {LEASES} gives {lease} to {mac}");
+            Ok(())
+        }
+        Some(address) => Err(format!(
+            "{LEASES} gives {address} to {mac}, the console shows {lease}"
+        )),
+        None => {
+            println!("net-vz: {LEASES} has no entry for {mac} yet");
+            Ok(())
+        }
+    }
+}
+
+/// The ARP cache of the Mac must show `mac` for `address`.
+fn arp_is(address: Ipv4Addr, mac: &str) -> Result<(), String> {
+    let arp = Command::new("/usr/sbin/arp")
+        .args(["-n", &address.to_string()])
+        .output()
+        .map_err(|e| format!("arp: {e}"))?;
+    let text = String::from_utf8_lossy(&arp.stdout).into_owned();
+    let got = arp_mac(&text).ok_or_else(|| format!("arp has no entry for {address}: {text}"))?;
+    if got != mac {
+        return Err(format!("arp gives {got} for {address}, wanted {mac}"));
+    }
+    println!("net-vz: arp -n {address} shows {got}");
+    Ok(())
+}
 /// The static address of the second device in the image `--static1`.
 const STATIC1: &str = "192.168.64.250";
 
@@ -160,18 +235,7 @@ pub fn parse_ping(output: &str) -> Option<PingResult> {
 /// The MAC address in the output of `arp -n ADDRESS`, as two digits per
 /// byte (macOS prints `2:73:74:66:0:2`).
 pub fn arp_mac(output: &str) -> Option<String> {
-    let word = output.split(" at ").nth(1)?.split_whitespace().next()?;
-    let bytes: Vec<u8> = word
-        .split(':')
-        .map(|b| u8::from_str_radix(b, 16).ok())
-        .collect::<Option<_>>()?;
-    (bytes.len() == 6).then(|| {
-        bytes
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(":")
-    })
+    normal_mac(output.split(" at ").nth(1)?.split_whitespace().next()?)
 }
 
 /// The first line of the run that `wanted` takes: one that came already, or
@@ -252,9 +316,9 @@ fn first_device(
     run: &mut qemu::Run,
     started: Instant,
     services_at: Duration,
+    mac: &str,
 ) -> Result<Address, String> {
-    let mut mac = MACS[0].to_owned();
-    mac.insert_str(0, "mac ");
+    let mac = format!("mac {mac}");
     let driver = line_where(
         run,
         "the driver's line",
@@ -340,8 +404,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
         net::vz_programs(two)
     };
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    let suffix = vz::claim_suffix()?;
+    let macs = [vz::mac(suffix.value, 0), vz::mac(suffix.value, 1)];
     let machine = vz::Machine {
         net: options.devices,
+        mac_suffix: suffix.value,
         ..vz::Machine::default()
     };
     let started = Instant::now();
@@ -352,7 +419,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let result = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
         let services_at = started.elapsed();
-        let first = first_device(&mut run, started, services_at)?;
+        let first = first_device(&mut run, started, services_at, &macs[0])?;
         let guest = first.address;
         if let Err(why) = closed_port(guest) {
             if net_curl::CLOSED_PORT_NEEDS_GATEWAY_REQUEST && !why.contains("Local Network") {
@@ -367,6 +434,10 @@ pub fn command(args: &[String]) -> Result<(), String> {
         run.send("httpd -f -p 80 -h /www & H=$!")?;
         run.expect("# ", DIALOG_STEP)?;
         let timing = net_curl::requests(http(guest), Instant::now())?;
+        // The guest has talked to the Mac: its address must be ours by the
+        // ARP cache and by the DHCP service's file.
+        arp_is(guest, &macs[0])?;
+        lease_is_ours(&macs[0], guest)?;
         println!(
             "net-vz: 20 requests in a row and 8 at once ok, {} ms median, {} ms the longest",
             timing.0, timing.1
@@ -391,13 +462,13 @@ pub fn command(args: &[String]) -> Result<(), String> {
         net_curl::check_body(&body).map_err(|e| format!("after the pings: {e}"))?;
         println!("net-vz: the service is alive after the pings");
         if options.devices == 2 {
-            let second = second_device(&mut run, started, guest, options.static1)?;
+            let second = second_device(&mut run, started, guest, options.static1, &macs[1])?;
             let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
                 .map_err(|e| format!("the request with two devices: {e}"))?;
             net_curl::check_body(&body).map_err(|e| format!("with two devices: {e}"))?;
             println!("net-vz: HTTP to the first device passes with two devices");
             if options.fast {
-                owner(&mut run, guest, second, options.static1)?;
+                owner(&mut run, guest, second, options.static1, &macs[1])?;
             }
         }
         Ok::<(), String>(())
@@ -489,6 +560,7 @@ fn second_device(
     started: Instant,
     first: Ipv4Addr,
     static1: bool,
+    mac: &str,
 ) -> Result<Address, String> {
     let driver = line_where(
         run,
@@ -496,10 +568,7 @@ fn second_device(
         |l| l.starts_with("virtio-net1: 1af4:1041 at "),
         BOOT_TIMEOUT,
     )?;
-    let expected = format!(
-        "virtio-net1: 1af4:1041 at 0x40010000, line 66, status 0x0, mac {}",
-        MACS[1]
-    );
+    let expected = format!("virtio-net1: 1af4:1041 at 0x40010000, line 66, status 0x0, mac {mac}");
     if driver != expected {
         return Err(format!(
             "the second driver says {driver:?}, wanted {expected:?}"
@@ -551,23 +620,8 @@ fn second_device(
     // is empty in that notification.
     run.expect_seen("virtio-net1: own interrupt", DIALOG_STEP)
         .map_err(|e| format!("the line of the second device was not shown: {e}"))?;
-    let arp = Command::new("/usr/sbin/arp")
-        .args(["-n", &second.address.to_string()])
-        .output()
-        .map_err(|e| format!("arp: {e}"))?;
-    let text = String::from_utf8_lossy(&arp.stdout).into_owned();
-    let mac =
-        arp_mac(&text).ok_or_else(|| format!("arp has no entry for {}: {text}", second.address))?;
-    if mac != MACS[1] {
-        return Err(format!(
-            "arp gives {mac} for {}, wanted {}",
-            second.address, MACS[1]
-        ));
-    }
-    println!(
-        "net-vz: the Mac's ARP cache has {} for {}; 0 of 2 echoes answered",
-        mac, second.address
-    );
+    arp_is(second.address, mac)?;
+    println!("net-vz: 0 of 2 echoes answered by the second device");
     Ok(second)
 }
 
@@ -587,11 +641,12 @@ fn owner(
     guest: Ipv4Addr,
     second: Address,
     static1: bool,
+    mac: &str,
 ) -> Result<(), String> {
     const ECHO_PORT: u16 = 7;
     let within = LEASE1_WITHIN;
     let cidr = format!("{}/{}", second.address, second.prefix);
-    let claimed = format!("fast-echo: claimed {cidr} mac {}", MACS[1]);
+    let claimed = format!("fast-echo: claimed {cidr} mac {mac}");
     let renewed = format!("net: renew1 {cidr}");
     // The static address needs no lease and prints no line when the device
     // comes back: the second claim shows the address is kept.
@@ -700,17 +755,7 @@ fn owner(
                     ));
                 }
             }
-            let arp = Command::new("/usr/sbin/arp")
-                .args(["-n", &second.address.to_string()])
-                .output()
-                .map_err(|e| format!("arp: {e}"))?;
-            let text = String::from_utf8_lossy(&arp.stdout).into_owned();
-            let mac = arp_mac(&text)
-                .ok_or_else(|| format!("arp has no entry for {}: {text}", second.address))?;
-            if mac != MACS[1] {
-                return Err(format!("arp gives {mac}, wanted {}", MACS[1]));
-            }
-            println!("net-vz: arp -n {} shows {mac}", second.address);
+            arp_is(second.address, mac)?;
         }
         if static1 && round == 1 {
             // A static address has no lease to ask for again through the ring.
@@ -790,6 +835,20 @@ mod tests {
         assert_eq!(parse_ping("ping: cannot resolve"), None);
         let none = "2 packets transmitted, 0 packets received, 100.0% packet loss\n";
         assert_eq!(parse_ping(none).unwrap().received, 0);
+    }
+
+    #[test]
+    fn the_lease_of_a_mac_is_read_from_the_leases_file() {
+        let text = "{\n\tname=a\n\tip_address=192.168.64.3\n\thw_address=1,2:73:74:66:0:1\n\tlease=0x1\n}\n{\n\tname=b\n\tip_address=192.168.64.4\n\thw_address=1,2:73:74:66:1:1\n}\n";
+        assert_eq!(
+            leased_to(text, "02:73:74:66:00:01"),
+            Some("192.168.64.3".parse().unwrap())
+        );
+        assert_eq!(
+            leased_to(text, "02:73:74:66:01:01"),
+            Some("192.168.64.4".parse().unwrap())
+        );
+        assert_eq!(leased_to(text, "02:73:74:66:02:01"), None);
     }
 
     #[test]
