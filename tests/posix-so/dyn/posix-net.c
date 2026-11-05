@@ -1175,6 +1175,84 @@ static void epoll_threads(void)
 	REQUIRE(close(thread_ep) == 0 && close(lis) == 0);
 }
 
+/* The writer of wait-churn: bytes on a socket of the network service and on a
+ * socket of the pipe service at odd moments, so that the answers to the waits
+ * of the main thread come late, from the other CPU. */
+static volatile int churn_stop;
+static int churn_tcp, churn_unix;
+
+static void *churn_writer(void *arg)
+{
+	(void)arg;
+	for (unsigned n = 0; !churn_stop; n++) {
+		struct timespec t = { 0, (long)(n % 4) * 100000L };
+		nanosleep(&t, NULL);
+		(void)send(churn_tcp, "t", 1, MSG_DONTWAIT);
+		(void)send(churn_unix, "u", 1, MSG_DONTWAIT);
+	}
+	return NULL;
+}
+
+/* Many waits with short timeouts while answers come late: every poll, select
+ * and epoll_wait leaves its notification sessions behind on the thread's
+ * channel, and with 1 024 places taken the next wait failed with EAGAIN
+ * (stafeto-design#569). None may fail. */
+static void wait_churn(void)
+{
+	int port, lis = listener(4, &port);
+	int c, s, u[2];
+	pair(lis, port, &c, &s);
+	REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, u) == 0);
+	nonblock(s);
+	nonblock(u[1]);
+	int ep = ep_new();
+	ep_add(ep, s, EPOLLIN, 1);
+	ep_add(ep, u[1], EPOLLIN, 2);
+	churn_tcp = c;
+	churn_unix = u[0];
+	churn_stop = 0;
+	pthread_t writer;
+	REQUIRE(pthread_create(&writer, NULL, churn_writer, NULL) == 0);
+	char buf[256];
+	for (int i = 0; i < 4000; i++) {
+		int n = -1;
+		switch (i % 3) {
+		case 0: {
+			struct pollfd pf[2] = { { s, POLLIN, 0 }, { u[1], POLLIN, 0 } };
+			n = poll(pf, 2, 1);
+			break;
+		}
+		case 1: {
+			struct epoll_event ev[8];
+			n = epoll_wait(ep, ev, 8, 1);
+			break;
+		}
+		default: {
+			fd_set rd;
+			FD_ZERO(&rd);
+			FD_SET(s, &rd);
+			FD_SET(u[1], &rd);
+			struct timeval tv = { 0, 1000 };
+			n = select((s > u[1] ? s : u[1]) + 1, &rd, NULL, NULL, &tv);
+			break;
+		}
+		}
+		if (n < 0) {
+			printf("posix-net: wait-churn failed at wait %d: errno %d\n", i, errno);
+			fflush(stdout);
+		}
+		REQUIRE(n >= 0);
+		while (recv(s, buf, sizeof buf, MSG_DONTWAIT) > 0)
+			;
+		while (recv(u[1], buf, sizeof buf, MSG_DONTWAIT) > 0)
+			;
+	}
+	churn_stop = 1;
+	REQUIRE(pthread_join(writer, NULL) == 0);
+	REQUIRE(close(ep) == 0 && close(c) == 0 && close(s) == 0);
+	REQUIRE(close(u[0]) == 0 && close(u[1]) == 0 && close(lis) == 0);
+}
+
 #define PAIRS 500
 static int cl[PAIRS], sv[PAIRS];
 
@@ -3007,6 +3085,7 @@ static const struct {
 	{ "fsetown", fsetown },
 	{ "epoll-rdhup-unix", epoll_rdhup_unix },
 	{ "fast-claim-off", fast_claim_off },
+	{ "wait-churn", wait_churn },
 };
 
 int main(int argc, char **argv)

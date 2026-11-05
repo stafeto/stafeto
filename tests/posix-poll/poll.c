@@ -25,10 +25,57 @@ int stafeto_watch_full_tty(uint32_t, uint32_t);
 void stafeto_watch_close_channel(void);
 int stafeto_watch_stats(uint32_t, uint32_t);
 int stafeto_poll_level(uint32_t);
+uint64_t stafeto_poll_queued(void);
 #define CHECK(c) do { if (!(c)) { printf("posix-poll: line %d: %s errno %d\n", __LINE__, #c, errno); fflush(stdout); return 20; } } while (0)
 #define IN 1u
 #define OUT 4u
 #define HUP 16u
+
+static volatile int churn_stop;
+static void *churn_writer(void *arg) {
+    int fd = *(int *)arg;
+    unsigned n = 0;
+    while (!churn_stop) {
+        struct timespec delay = {0, (long)(n++ % 3) * 400000L};
+        nanosleep(&delay, NULL);
+        if (write(fd, "x", 1) < 0) break;
+    }
+    return NULL;
+}
+
+/* Every poll and select makes notification sessions on the thread's channel,
+ * and the late wakeups and the CLIENT_GONE of the ones it leaves must not stay
+ * queued there: each holds a source place, 1 024 of them end every wait with
+ * EAGAIN (stafeto-design#569). */
+static int channel_stays_empty(void) {
+    int ends[2];
+    CHECK(pipe(ends) == 0);
+    pthread_t writer;
+    churn_stop = 0;
+    CHECK(pthread_create(&writer, NULL, churn_writer, &ends[1]) == 0);
+    for (int i = 0; i < 300; i++) {
+        char buf[64];
+        if (i % 2) {
+            struct pollfd pf = { ends[0], POLLIN, 0 };
+            CHECK(poll(&pf, 1, 5) >= 0);
+        } else {
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(ends[0], &rd);
+            struct timeval tv = { 0, 5000 };
+            CHECK(select(ends[0] + 1, &rd, NULL, NULL, &tv) >= 0);
+        }
+        uint64_t queued = stafeto_poll_queued();
+        if (queued != 0) printf("posix-poll: %llu notifications queued after wait %d\n", (unsigned long long)queued, i);
+        CHECK(queued == 0);
+        struct pollfd now = { ends[0], POLLIN, 0 };
+        if (poll(&now, 1, 0) == 1) CHECK(read(ends[0], buf, sizeof buf) >= 1);
+    }
+    churn_stop = 1;
+    CHECK(pthread_join(writer, NULL) == 0);
+    CHECK(close(ends[0]) == 0 && close(ends[1]) == 0);
+    return 0;
+}
 
 static int service_watches(void) {
     int first[2], second[2];
@@ -558,6 +605,7 @@ int main(int argc, char **argv) {
     if (argc == 2) return lifecycle_start();
     CHECK(argc == 6 && lifecycle_resume(argv) == 0);
     CHECK(lower_writer_ready() == 0);
+    CHECK(channel_stays_empty() == 0);
     int result = frontends();
     if (result != 0) return result;
     result = service_watches();

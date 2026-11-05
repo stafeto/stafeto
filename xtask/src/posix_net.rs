@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 64] = [
+pub const CHECKS: [&str; 65] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -91,6 +91,7 @@ pub const CHECKS: [&str; 64] = [
     "fsetown",
     "epoll-rdhup-unix",
     "fast-claim-off",
+    "wait-churn",
 ];
 
 /// The image of the run with the counted steps of the network service and
@@ -138,8 +139,12 @@ fn took_ms(lines: &[String], name: &str) -> Option<u64> {
 /// `posix-net` for all its checks: a line for each, then the count.
 ///
 /// `POSIX_NET_ONLY=NAME` runs the one check, for finding the cause of a failure.
-fn checks(run: &mut qemu::Run, address: &str, within: Duration) -> Result<(), String> {
-    let only = std::env::var("POSIX_NET_ONLY").ok();
+fn checks(
+    run: &mut qemu::Run,
+    address: &str,
+    within: Duration,
+    only: Option<String>,
+) -> Result<(), String> {
     let wanted: Vec<&str> = CHECKS
         .iter()
         .copied()
@@ -203,6 +208,22 @@ pub fn command(args: &[String]) -> Result<(), String> {
 }
 
 pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String> {
+    probe_only(machine, steps, std::env::var("POSIX_NET_ONLY").ok())
+}
+
+/// The check `wait-churn` on two CPUs, where the answers to a wait come late
+/// from the other CPU (stafeto-design#569).
+pub fn wait_churn_smp() -> Result<(), String> {
+    qemu::on_cpus(2, || {
+        probe_only(&qemu::VIRT, false, Some("wait-churn".to_owned()))
+    })
+}
+
+fn probe_only(
+    machine: &'static qemu::Machine,
+    steps: bool,
+    only: Option<String>,
+) -> Result<(), String> {
     if machine.is_hvf() {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
     }
@@ -238,6 +259,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             } else {
                 CHECKS_WITHIN
             },
+            only,
         )?;
         run.expect("# ", DIALOG_STEP)?;
         Ok::<(), String>(())
