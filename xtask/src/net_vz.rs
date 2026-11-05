@@ -24,6 +24,18 @@
 //! `netd.conf`), prints its own lines, answers no echo (it serves only
 //! DHCP), and the Mac's ARP cache holds its MAC address for it.
 //!
+//! With `--fast` (two devices, `--static1` too) the image is the one of
+//! `cargo xtask fast-probe` on VZ (`handover 1` and `fast-echo`). The checks
+//! above run, the second device being the service's until the claim; then
+//! `fast-echo 7 &` claims it (`claimed`, and with a lease `net: renew1`: the
+//! lease again through the bypass ring), and the Mac reaches the program at
+//! the second address: 300 UDP datagrams of 64 and 1 400 bytes come back
+//! byte for byte, the echo rate at both sizes, `ping` of the address
+//! answered, and `arp -n` shows the MAC address of the device. `kill -9` of
+//! the program gives the device back (`net: device 1 back`, then the lease
+//! or the static address), and a second program claims it and echoes. HTTP to
+//! the first address passes before, during and after.
+//!
 //! The Mac may refuse to connect to the guest ("No route to host") when the
 //! terminal has no permission for the local network (System Settings,
 //! Privacy and Security, Local Network).
@@ -32,6 +44,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::fast_probe;
 use crate::net_curl;
 use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, Variant, build, build_boot_image,
@@ -161,14 +174,17 @@ struct Options {
     /// The service counts its steps (`netd` built with `steps`), and the
     /// longest of each kind is judged by 0.9 of term B.
     steps: bool,
+    /// The second device goes to `fast-echo` (the image of the owner).
+    fast: bool,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
-    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps]";
+    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps] [--fast]";
     let mut found = Options {
         devices: 1,
         static1: false,
         steps: false,
+        fast: false,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -176,6 +192,10 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--net" if rest.next().map(String::as_str) == Some("2") => found.devices = 2,
             "--static1" => found.static1 = true,
             "--steps" => found.steps = true,
+            "--fast" => {
+                found.fast = true;
+                found.devices = 2;
+            }
             _ => return Err(usage.to_owned()),
         }
     }
@@ -283,13 +303,18 @@ pub fn command(args: &[String]) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, two) = match (options.devices, options.static1, options.steps) {
+        (_, false, false) if options.fast => (fast_probe::VZ_IMAGE, true),
+        (_, true, false) if options.fast => (fast_probe::VZ_STATIC_IMAGE, true),
+        (_, _, true) if options.fast => (fast_probe::VZ_STEPS_IMAGE, true),
         (1, _, false) => (net::VZ_IMAGE, false),
         (1, _, true) => (net::VZ_STEPS_IMAGE, false),
         (_, false, false) => (net::VZ2_IMAGE, true),
         (_, true, false) => (net::VZ2_STATIC_IMAGE, true),
         (_, _, true) => (net::VZ2_STEPS_IMAGE, true),
     };
-    let programs = if options.steps {
+    let programs = if options.fast {
+        fast_probe::vz_programs(options.steps)
+    } else if options.steps {
         net::vz_steps_programs(two)
     } else {
         net::vz_programs(two)
@@ -346,11 +371,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
         net_curl::check_body(&body).map_err(|e| format!("after the pings: {e}"))?;
         println!("net-vz: the service is alive after the pings");
         if options.devices == 2 {
-            second_device(&mut run, started, guest, options.static1)?;
+            let second = second_device(&mut run, started, guest, options.static1)?;
             let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
                 .map_err(|e| format!("the request with two devices: {e}"))?;
             net_curl::check_body(&body).map_err(|e| format!("with two devices: {e}"))?;
             println!("net-vz: HTTP to the first device passes with two devices");
+            if options.fast {
+                owner(&mut run, guest, second, options.static1)?;
+            }
         }
         Ok::<(), String>(())
     })();
@@ -400,7 +428,7 @@ fn second_device(
     started: Instant,
     first: Ipv4Addr,
     static1: bool,
-) -> Result<(), String> {
+) -> Result<Address, String> {
     let driver = line_where(
         run,
         "the second driver's line",
@@ -479,6 +507,123 @@ fn second_device(
         "net-vz: the Mac's ARP cache has {} for {}; 0 of 2 echoes answered",
         mac, second.address
     );
+    Ok(second)
+}
+
+/// One request to the first address, answered with the page.
+fn http_alive(guest: Ipv4Addr, when: &str) -> Result<(), String> {
+    let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
+        .map_err(|e| format!("the request {when}: {e}"))?;
+    net_curl::check_body(&body).map_err(|e| format!("{when}: {e}"))?;
+    println!("net-vz: HTTP to the first device passes {when}");
+    Ok(())
+}
+
+/// The program that owns the second device, from its claim to its end and a
+/// second claim.
+fn owner(
+    run: &mut qemu::Run,
+    guest: Ipv4Addr,
+    second: Address,
+    static1: bool,
+) -> Result<(), String> {
+    const ECHO_PORT: u16 = 7;
+    let within = LEASE1_WITHIN;
+    let cidr = format!("{}/{}", second.address, second.prefix);
+    let claimed = format!("fast-echo: claimed {cidr} mac {}", MACS[1]);
+    let renewed = format!("net: renew1 {cidr}");
+    let again = if static1 {
+        format!("net: static1 {cidr}")
+    } else {
+        format!("net: lease1 {cidr}")
+    };
+    let mut socket_target = None;
+    for round in 1..=2 {
+        let claim_at = Instant::now();
+        run.send(&format!("fast-echo {ECHO_PORT} &"))?;
+        let mut wanted = vec![claimed.as_str()];
+        if !static1 {
+            wanted.push(renewed.as_str());
+        }
+        fast_probe::expect_all(run, &wanted, within)?;
+        println!(
+            "net-vz: claim {round}: claimed{} {} ms after the command",
+            if static1 { "" } else { " and renew1" },
+            claim_at.elapsed().as_millis()
+        );
+        let socket = socket_target.get_or_insert_with(|| {
+            std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket of the Mac")
+        });
+        socket
+            .connect((second.address, ECHO_PORT))
+            .map_err(|e| format!("connect: {e}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let at = Instant::now();
+        let mut sent_again = fast_probe::echoes(socket, 200, 64)?;
+        sent_again += fast_probe::echoes(socket, 100, 1400)?;
+        println!(
+            "net-vz: 300 echoes of UDP in {} ms ({sent_again} sent again)",
+            at.elapsed().as_millis()
+        );
+        http_alive(guest, &format!("with the owner running (claim {round})"))?;
+        if round == 1 {
+            for size in [64, 1400] {
+                let (per_second, lost) = fast_probe::rate(socket, size, Duration::from_secs(3))?;
+                println!(
+                    "net-vz: echo rate of {size} bytes: {per_second} a second ({lost} unanswered)"
+                );
+            }
+            for (count, size) in [(5, 56), (5, 1472)] {
+                let result = ping(second.address, count, size, None)?;
+                println!(
+                    "net-vz: ping -c {count} -s {size} of the owner: {} of {} answered; {}",
+                    result.received,
+                    result.sent,
+                    result.round_trip.as_deref().unwrap_or("no round-trip line")
+                );
+                if result.received != count {
+                    return Err(format!(
+                        "the owner answered {} of {count} echoes of {size} bytes",
+                        result.received
+                    ));
+                }
+            }
+            let arp = Command::new("/usr/sbin/arp")
+                .args(["-n", &second.address.to_string()])
+                .output()
+                .map_err(|e| format!("arp: {e}"))?;
+            let text = String::from_utf8_lossy(&arp.stdout).into_owned();
+            let mac = arp_mac(&text)
+                .ok_or_else(|| format!("arp has no entry for {}: {text}", second.address))?;
+            if mac != MACS[1] {
+                return Err(format!("arp gives {mac}, wanted {}", MACS[1]));
+            }
+            println!("net-vz: arp -n {} shows {mac}", second.address);
+        }
+        if static1 && round == 1 {
+            // A static address has no lease to ask for again through the ring.
+            let line = format!("net: renew1 {cidr}");
+            if run.lines().iter().any(|l| l.contains(&line)) {
+                return Err("a static address renewed through the ring".into());
+            }
+        }
+        if round == 2 {
+            run.send("kill -QUIT $!")?;
+            fast_probe::expect_all(run, &["net: device 1 back", again.as_str()], within)?;
+            http_alive(guest, "after the second owner ended")?;
+            break;
+        }
+        let killed_at = Instant::now();
+        run.send("kill -9 $!")?;
+        fast_probe::expect_all(run, &["net: device 1 back", again.as_str()], within)?;
+        println!(
+            "net-vz: kill -9 to the lease or address again {} ms",
+            killed_at.elapsed().as_millis()
+        );
+        http_alive(guest, "after the owner was killed")?;
+    }
     Ok(())
 }
 

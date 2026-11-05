@@ -23,6 +23,14 @@
  *   fast-echo PORT --retry    a claim refused while another owns the device,
  *                             then tries until it is free (`retry ok`), then
  *                             echo
+ *   fast-echo PORT --idle MS  (with any of the above that echoes) the wait of
+ *                             an idle owner lasts MS milliseconds, so only
+ *                             the device's interrupt wakes it in time; a UDP
+ *                             datagram that starts with `RACE` makes the
+ *                             owner stay away from the queue for 200 ms
+ *                             before it turns the interrupts on
+ *   fast-echo PORT --crash    ask the network service of the probe's image
+ *                             to fault (`crash sent`), claiming nothing
  *
  * Lines: `fast-echo: claimed A/N mac M`, `fast-echo: address A/N` when the
  * service says the address changed, `fast-echo: lost` when the device was
@@ -44,15 +52,22 @@
 #include <vnet.h>
 
 extern char **environ;
+extern int stafeto_fast_probe_crash(void);
 
 #define ETH 14
 #define BURST 32
 #define WAIT_NS 10000000ull
+#define RACE_GAP_NS 200000000ull
 
 static uint8_t own_ip[4];
 static uint8_t own_mac[6];
 static uint16_t port;
 static unsigned long echoed;
+static unsigned long wait_ns = WAIT_NS;
+/* `--idle`: the owner of the probe's image, which stays away from its queue
+ * when asked, once, before it turns the interrupts on. */
+static int idle_mode;
+static int race_gap;
 
 static void fail(const char *what)
 {
@@ -161,6 +176,8 @@ static void echo(const uint8_t *f, uint32_t len, unsigned header, int icmp)
 		vnet_rx_return(buf);
 	else
 		echoed++;
+	if (idle_mode && !icmp && be16(f + ETH + 2) >= header + 8 + 4 && memcmp(f + ETH + header + 8, "RACE", 4) == 0)
+		race_gap = 1;
 }
 
 /* What the service's interface of the second device may get from the wire:
@@ -326,12 +343,17 @@ static int run(void)
 		if (!waiting) {
 			/* Interrupts on, then a look at the queue once more: a frame
 			 * that came in between brings no interrupt. */
+			if (race_gap) {
+				struct timespec gap = { 0, RACE_GAP_NS };
+				nanosleep(&gap, NULL);
+				race_gap = 0;
+			}
 			vnet_notify(1);
 			waiting = 1;
 			continue;
 		}
 		uint32_t bits = 0;
-		if (stafeto_fast_wait(WAIT_NS, &bits) != 0 && errno != ETIMEDOUT && errno != EINTR)
+		if (stafeto_fast_wait(wait_ns, &bits) != 0 && errno != ETIMEDOUT && errno != EINTR)
 			fail("stafeto_fast_wait");
 		if (bits & STAFETO_FAST_ADDRESS) {
 			struct stafeto_fast_config c;
@@ -340,25 +362,42 @@ static int run(void)
 				say_address("address", &c);
 			}
 		}
+		/* The service let go of its notifications (it ended or took the
+		 * device back), or the device was reset under the program. A new
+		 * service may have started the device again by now, so the device's
+		 * status alone does not tell. */
 		if ((bits & STAFETO_FAST_GONE) || vnet_lost()) {
-			if (vnet_lost()) {
-				printf("fast-echo: lost after %lu echoes\n", echoed);
-				fflush(stdout);
-				return 2;
-			}
+			printf("fast-echo: lost after %lu echoes\n", echoed);
+			fflush(stdout);
+			return 2;
 		}
 	}
 }
 
 int main(int argc, char **argv)
 {
-	if (argc < 2 || argc > 4) {
-		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--retry|--as UID]\n");
+	if (argc < 2 || argc > 6) {
+		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--retry|--crash|--as UID] [--idle MS]\n");
 		return 2;
 	}
 	port = (uint16_t)atoi(argv[1]);
+	for (int i = 2; i + 1 < argc; i++) {
+		if (strcmp(argv[i], "--idle") == 0) {
+			wait_ns = (unsigned long)atoi(argv[i + 1]) * 1000000ul;
+			idle_mode = 1;
+			for (int j = i; j + 2 < argc; j++)
+				argv[j] = argv[j + 2];
+			argc -= 2;
+			break;
+		}
+	}
 	const char *mode = argc >= 3 ? argv[2] : "";
 	struct stafeto_fast_claim c;
+	if (strcmp(mode, "--crash") == 0) {
+		int sent = stafeto_fast_probe_crash();
+		printf("fast-echo: crash sent %d\n", sent);
+		return 0;
+	}
 	if (strcmp(mode, "--as") == 0) {
 		REQUIRE(argc == 4);
 		REQUIRE(setuid((uid_t)atoi(argv[3])) == 0);

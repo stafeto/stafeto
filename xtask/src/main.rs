@@ -1693,9 +1693,11 @@ commands:
             of the service, and its steps under -icount (TCG only); on hvf the
             rates of the loopback; with `steps` the measurement that chooses
             the frames of a step and the limit of the sockets (TCG only)
-  net-vz [--net 2] [--static1] [--steps] run the shell with the network service on
+  net-vz [--net 2] [--static1] [--steps] [--fast] run the shell with the network service on
             Apple VZ: the lease, HTTP and the Mac's ping of the guest; with
-            --net 2 the second device too (--static1: its static address)
+            --net 2 the second device too (--static1: its static address);
+            with --fast `fast-echo` claims the second device and the Mac
+            reaches it: UDP echo, ping, ARP, kill -9 and a new claim
   net-curl [steps] [MACHINE] run the sockets of the network service from the
             host: `httpd` of the guest answers 20 requests in a row and 8 at
             once through a forwarded port, UDP goes both ways, `net-sock` runs
@@ -1717,7 +1719,9 @@ commands:
             `fast-echo` (QEMU, two devices): the claim, the lease again
             through the bypass ring, the echo of UDP from the host, EPERM for
             another user, EBUSY for a second owner, the device back after
-            kill -9; with `steps` the service counts its steps (TCG only)
+            kill -9, a pause of 2 s before an echo; with `steps` the service
+            counts its steps (TCG only); with `crash` the service ends while
+            the program owns the device
   nginx-probe [steps] [MACHINE] run nginx in the guest from ash (boot-nginx-probe.img):
             a master and four workers under nobody with SO_REUSEPORT, 200 requests
             over 16 connections that stay open, 256 KiB answers by digest through
@@ -8970,6 +8974,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // service through the bypass ring, the copies below the threshold
         // of free buffers. Also in the group `net`.
         job("fstack-device", || fstack_device::probe(&qemu::VIRT, false)),
+        // The same with the network service built for the probe: it ends
+        // by CRASH while the program owns the device, which sees it and
+        // leaves, and a new owner gets the device from the new service.
+        // Also in the group `net`.
+        job("fast-probe-crash", || fast_probe::crash(&[])),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

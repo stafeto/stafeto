@@ -38,10 +38,6 @@ type Sess = Session<Client, 0>;
 const GIVEN: Rights = Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::TRANSFER.0);
 const RING_NEEDS: Rights = Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0);
 
-/// The pages of the objects of the second device: `dma1`, then the four of
-/// buffers (init's table).
-const OBJECT_PAGES: [u32; fast::OBJECTS] = [8, 1024, 1024, 1024, 1024];
-
 /// What the service knows of the device for a claim: whether the file
 /// allows it, the transport, and the physical addresses of its objects.
 pub struct Claimable {
@@ -50,6 +46,9 @@ pub struct Claimable {
     /// The second device's transport (QEMU) or function (VZ).
     pub at: u64,
     pub objects: [u64; fast::OBJECTS],
+    /// The pages of the objects: `dma1`, then the four of buffers (what
+    /// `memory_info` says of each at the start of the service).
+    pub pages: [u32; fast::OBJECTS],
 }
 
 /// The owner of the second device.
@@ -165,7 +164,7 @@ impl Driver<'_> {
             },
             objects: core::array::from_fn(|i| Object {
                 pa: self.claimable.objects[i],
-                pages: OBJECT_PAGES[i],
+                pages: self.claimable.pages[i],
                 uncached: i == 0,
             }),
             bar_sizes: if pci { netd::pci::BAR_SIZES } else { [0; 6] },

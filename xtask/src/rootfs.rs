@@ -1137,6 +1137,9 @@ pub const IMAGES: &[&str] = &[
     "boot-net-vz2-static.img",
     "boot-net-vz-steps.img",
     "boot-net-vz2-steps.img",
+    "boot-fast-vz.img",
+    "boot-fast-vz-static.img",
+    "boot-fast-vz-steps.img",
     "boot-net-probe.img",
     "boot-net-probe-static.img",
     "boot-net-steps.img",
@@ -1268,7 +1271,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         }
         // The shell with both network devices, `handover 1`, and the
         // program that claims the second.
-        "boot-fast-probe.img" | "boot-fast-probe-steps.img" => {
+        "boot-fast-probe.img" | "boot-fast-probe-steps.img" | "boot-fast-probe-crash.img" => {
             let mut files = net_files(name);
             files.push(of(
                 "/etc/netd.conf",
@@ -1301,6 +1304,25 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 Source::Bytes("netd.conf", crate::fstack_device::NETD_CONF_DHCP),
             ));
             files.push(file("/bin/fstack-probe", 0o755, ROOT, "fstack-probe"));
+            files
+        }
+        // The same on Apple VZ.
+        "boot-fast-vz.img" | "boot-fast-vz-steps.img" | "boot-fast-vz-static.img" => {
+            let mut files = net_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes(
+                    "netd.conf",
+                    if name == "boot-fast-vz-static.img" {
+                        crate::fast_probe::NETD_CONF_VZ_STATIC
+                    } else {
+                        crate::fast_probe::NETD_CONF
+                    },
+                ),
+            ));
+            files.push(file("/bin/fast-echo", 0o755, ROOT, "fast-echo"));
             files
         }
         "boot-net-probe-static.img" => vec![of(
@@ -1776,6 +1798,8 @@ mod tests {
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
                 "boot-net-vz2-steps.img" => crate::net::vz_steps_programs(true),
                 "boot-net-vz2.img" | "boot-net-vz2-static.img" => crate::net::vz_programs(true),
+                "boot-fast-vz.img" | "boot-fast-vz-static.img" => crate::net::vz_programs(true),
+                "boot-fast-vz-steps.img" => crate::net::vz_steps_programs(true),
                 "boot-net-curl-steps.img" | "boot-net-tls-steps.img" => {
                     crate::net_curl::steps_programs()
                 }

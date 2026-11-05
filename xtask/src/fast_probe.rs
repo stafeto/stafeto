@@ -25,7 +25,19 @@
 //!    first owner: the device comes back and gets its lease, the second
 //!    claims it (`retry ok`: no departure of a refused try reads as the
 //!    service's end), renews, and echoes 100 datagrams;
-//! 7. `kill -QUIT`: the device comes back again.
+//! 7. the second owner waits idle for 1 000 ms at a time (`--idle 1000`):
+//!    after a pause of 2 s one datagram is answered within 100 ms, so the
+//!    device's interrupt wakes it and the wait does not time out; a datagram
+//!    that arrives while the owner keeps away from its queue (`RACE`) is
+//!    answered long before the wait ends, since the queue is looked at once
+//!    more after the interrupts are turned on;
+//! 8. `kill -QUIT`: the device comes back again.
+//!
+//! `cargo xtask fast-probe crash` runs an image whose service is built for
+//! the probe (it faults on CRASH): `fast-echo 7 &` owns the device, another
+//! `fast-echo 7 --crash` ends the service, init restarts it. The owner
+//! sees the end of the service and leaves (`fast-echo: lost`), the new
+//! service leases the second address again.
 //!
 //! `cargo xtask fast-probe steps` runs the same under -icount with the
 //! service counting its steps (and the second owner pushing 16 frames into
@@ -45,10 +57,21 @@ use crate::{
 /// The images: the probe, and the probe with the steps counted.
 pub const IMAGE: &str = "boot-fast-probe.img";
 pub const STEPS_IMAGE: &str = "boot-fast-probe-steps.img";
+pub const CRASH_IMAGE: &str = "boot-fast-probe-crash.img";
 
 /// `/etc/netd.conf` of the images: DHCP on both devices, and the second
 /// device may go to a program.
 pub const NETD_CONF: &[u8] = b"handover 1\n";
+/// The same on Apple VZ with a static address for the second device
+/// (`cargo xtask net-vz --fast --static1`).
+pub const NETD_CONF_VZ_STATIC: &[u8] = b"handover 1\naddress1 192.168.64.250/24\n";
+
+/// The images on Apple VZ (`cargo xtask net-vz --fast`): both devices, the
+/// DHCP lease or the static address of the second, `handover 1` and
+/// `fast-echo`; the third counts the steps of the service.
+pub const VZ_IMAGE: &str = "boot-fast-vz.img";
+pub const VZ_STATIC_IMAGE: &str = "boot-fast-vz-static.img";
+pub const VZ_STEPS_IMAGE: &str = "boot-fast-vz-steps.img";
 
 /// The second address on QEMU's second user network, and the device's MAC.
 const SECOND: &str = "10.0.3.15/24";
@@ -59,6 +82,12 @@ const CLAIM_KIND: usize = 26;
 const CLAIM_MORE_KIND: usize = 36;
 const KICK_KIND: usize = 37;
 
+/// The echo after a pause must come this soon, and the echo of a datagram
+/// that came while the owner stayed away from its queue (200 ms) well before
+/// the idle wait (1 000 ms) ends.
+const IDLE_ECHO_WITHIN: Duration = Duration::from_millis(100);
+const RACE_ECHO_WITHIN: Duration = Duration::from_millis(600);
+
 /// How long a line may take on TCG, and under -icount.
 const LINE_WITHIN: Duration = Duration::from_secs(30);
 const LINE_WITHIN_STEPS: Duration = Duration::from_secs(120);
@@ -66,12 +95,46 @@ const LINE_WITHIN_STEPS: Duration = Duration::from_secs(120);
 /// The programs of the image: the shell's with the network service, the
 /// table of both devices.
 pub fn programs(steps: bool) -> &'static [ImageProgram] {
+    programs_of(if steps { Kind::Steps } else { Kind::Plain })
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Plain,
+    Steps,
+    /// The service with the methods of the probe (CRASH).
+    Crash,
+}
+
+/// The programs of the image on VZ: the two-device image of VZ (init's
+/// table of VZ with the shell), and the service counting its steps if asked.
+pub fn vz_programs(steps: bool) -> &'static [ImageProgram] {
+    if steps {
+        net::vz_steps_programs(true)
+    } else {
+        net::vz_programs(true)
+    }
+}
+
+fn programs_of(kind: Kind) -> &'static [ImageProgram] {
     static PLAIN: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     static STEPS: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
-    let list = if steps { &STEPS } else { &PLAIN };
+    static CRASH: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    let (list, steps) = match kind {
+        Kind::Plain => (&PLAIN, false),
+        Kind::Steps => (&STEPS, true),
+        Kind::Crash => (&CRASH, false),
+    };
     list.get_or_init(|| {
         let mut programs = net::programs().to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-net-two"]);
+        if kind == Kind::Crash {
+            for program in &mut programs {
+                if program.0 == "netd" {
+                    program.3 = &["probe"];
+                }
+            }
+        }
         if steps {
             for program in &mut programs {
                 if program.0 == "netd" {
@@ -108,6 +171,73 @@ pub(crate) fn expect_all(
         left.retain(|w| !line.contains(w));
     }
     Ok(())
+}
+
+/// A UDP socket of the host connected to a free port, which the forward of
+/// the second device's port takes, and that port.
+fn forwarded_socket(timeout_s: u64) -> Result<(UdpSocket, u16), String> {
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("a UDP socket: {e}"))?;
+    // A free port of the host for the forward, taken and given back.
+    let host = UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .map_err(|e| format!("a free UDP port: {e}"))?
+        .port();
+    socket
+        .connect(("127.0.0.1", host))
+        .map_err(|e| format!("connect: {e}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(timeout_s)))
+        .map_err(|e| format!("timeout: {e}"))?;
+    Ok((socket, host))
+}
+
+/// The echo rate: datagrams of `size` bytes sent 16 at a time to the
+/// connected `socket`, the answers counted, for `span`; the datagrams per
+/// second answered and the number not answered. The socket's timeout stays
+/// as it was.
+pub fn rate(socket: &UdpSocket, size: usize, span: Duration) -> Result<(u64, u64), String> {
+    const WINDOW: usize = 16;
+    let before = socket.read_timeout().map_err(|e| format!("timeout: {e}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|e| format!("timeout: {e}"))?;
+    let (mut sent, mut got) = (0u64, 0u64);
+    let started = Instant::now();
+    let mut buffer = vec![0u8; 2048];
+    while started.elapsed() < span {
+        for i in 0..WINDOW {
+            let mut datagram = vec![(i as u8) ^ 0x5a; size];
+            datagram[..8].copy_from_slice(&sent.to_be_bytes());
+            socket
+                .send(&datagram)
+                .map_err(|e| format!("rate: send: {e}"))?;
+            sent += 1;
+        }
+        for _ in 0..WINDOW {
+            match socket.recv(&mut buffer) {
+                Ok(len) if len == size => got += 1,
+                Ok(len) => return Err(format!("rate: {len} bytes came back for {size}")),
+                Err(_) => break,
+            }
+        }
+    }
+    let per_second = (got as f64 / started.elapsed().as_secs_f64()) as u64;
+    socket
+        .set_read_timeout(before)
+        .map_err(|e| format!("timeout: {e}"))?;
+    Ok((per_second, sent - got))
+}
+
+/// One datagram of `payload` and how long its echo takes.
+fn echo_time(socket: &UdpSocket, payload: &[u8]) -> Result<Duration, String> {
+    let at = Instant::now();
+    socket.send(payload).map_err(|e| format!("send: {e}"))?;
+    let mut got = vec![0u8; 2048];
+    let len = socket.recv(&mut got).map_err(|e| format!("no echo: {e}"))?;
+    if got[..len] != *payload {
+        return Err("the echo differs from the datagram".into());
+    }
+    Ok(at.elapsed())
 }
 
 /// `count` datagrams of `size` bytes through the forwarded port, each
@@ -147,6 +277,7 @@ pub(crate) fn echoes(socket: &UdpSocket, count: usize, size: usize) -> Result<us
 pub fn command(args: &[String]) -> Result<(), String> {
     let (steps, rest) = match args.first().map(String::as_str) {
         Some("steps") => (true, &args[1..]),
+        Some("crash") => return crash(&args[1..]),
         _ => (false, args),
     };
     let machine = match rest {
@@ -172,18 +303,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     let kernel = build(Variant::Normal)?;
     let name = if steps { STEPS_IMAGE } else { IMAGE };
     let image = build_boot_image(name, programs(steps), BOOT_PROFILE)?;
-    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("a UDP socket: {e}"))?;
-    // A free port of the host for the forward, taken and given back.
-    let host = UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .map_err(|e| format!("a free UDP port: {e}"))?
-        .port();
-    socket
-        .connect(("127.0.0.1", host))
-        .map_err(|e| format!("connect: {e}"))?;
-    socket
-        .set_read_timeout(Some(Duration::from_secs(if steps { 10 } else { 2 })))
-        .map_err(|e| format!("timeout: {e}"))?;
+    let (socket, host) = forwarded_socket(if steps { 10 } else { 2 })?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     cmd.args(qemu::net(&[]));
@@ -265,7 +385,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         // A second program waits for the device (its refused tries leave
         // their departures on its channel); the owner killed: the device
         // comes back, and goes to the one that waits.
-        run.send(&format!("fast-echo {PORT} --retry &"))?;
+        run.send(&format!("fast-echo {PORT} --retry --idle 1000 &"))?;
         expect_all(&mut run, &["fast-echo: retry busy"], within)?;
         let killed_at = Instant::now();
         run.send("kill -9 %1")?;
@@ -289,6 +409,51 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         notes.push(format!(
             "100 echoes after the new claim ({again} sent again)"
         ));
+        if !steps {
+            // The owner waits 1 000 ms at a time. After a pause only the
+            // interrupt of the device can wake it in time.
+            std::thread::sleep(Duration::from_secs(2));
+            let woken = echo_time(&socket, b"after a pause of two seconds")?;
+            if woken > IDLE_ECHO_WITHIN {
+                return Err(format!(
+                    "the echo after a pause took {} ms (wanted {} ms at most): the interrupt did not wake the owner",
+                    woken.as_millis(),
+                    IDLE_ECHO_WITHIN.as_millis()
+                ));
+            }
+            notes.push(format!(
+                "echo after a pause of 2 s {} ms",
+                woken.as_millis()
+            ));
+            // A datagram that arrives while the owner stays away from its
+            // queue brings no interrupt; the owner looks at the queue once
+            // more after it turns the interrupts on.
+            let mut race = b"RACE".to_vec();
+            race.extend_from_slice(&[7; 60]);
+            let mut got = vec![0u8; 2048];
+            socket.send(&race).map_err(|e| format!("send: {e}"))?;
+            socket
+                .recv(&mut got)
+                .map_err(|e| format!("no echo of RACE: {e}"))?;
+            let missed = echo_time(&socket, b"sent while the owner is away")?;
+            if missed > RACE_ECHO_WITHIN {
+                return Err(format!(
+                    "the echo of a datagram that came while the owner was away took {} ms (wanted {} ms at most): the queue was not looked at again",
+                    missed.as_millis(),
+                    RACE_ECHO_WITHIN.as_millis()
+                ));
+            }
+            notes.push(format!(
+                "echo of a datagram sent while the owner is away {} ms",
+                missed.as_millis()
+            ));
+            for size in [64, 1400] {
+                let (per_second, unanswered) = rate(&socket, size, Duration::from_secs(2))?;
+                notes.push(format!(
+                    "{size} bytes: {per_second} echoes a second ({unanswered} unanswered)"
+                ));
+            }
+        }
         run.send("kill -QUIT $!")?;
         expect_all(&mut run, &[back], within)?;
         run.send("echo probe-end")?;
@@ -319,6 +484,113 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     }
     println!(
         "fast-probe passed in {:.0} s on {}: {}",
+        started.elapsed().as_secs_f64(),
+        machine.name,
+        notes.join("; ")
+    );
+    Ok(())
+}
+
+/// `cargo xtask fast-probe crash [tcg|hvf]`: the network service ends while a
+/// program owns the second device.
+pub fn crash(rest: &[String]) -> Result<(), String> {
+    let machine = match rest {
+        [] => &qemu::VIRT,
+        [name] if name == "hvf" => &qemu::HVF_V3,
+        [name] if name == "tcg" => &qemu::VIRT,
+        _ => return Err("usage: cargo xtask fast-probe crash [tcg|hvf]".to_owned()),
+    };
+    if machine.is_hvf() {
+        crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
+    }
+    busybox_build()?;
+    nano_build()?;
+    crate::net_build()?;
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(CRASH_IMAGE, programs_of(Kind::Crash), BOOT_PROFILE)?;
+    let (socket, host) = forwarded_socket(2)?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::net(&[]));
+    cmd.args(qemu::net_two_with(&[qemu::Forward {
+        proto: qemu::Proto::Udp,
+        host,
+        guest: PORT,
+    }]));
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let started = Instant::now();
+    let claimed = format!("fast-echo: claimed {SECOND} mac {}", qemu::NET_MAC_TWO);
+    let renewed = format!("net: renew1 {SECOND}");
+    let lease1 = format!("net: lease1 {SECOND}");
+    let mut notes = Vec::new();
+    let talked = (|| {
+        run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        expect_all(
+            &mut run,
+            &[
+                "net: lease 10.0.2.15/24",
+                &lease1,
+                "virtio-net1: first interrupt",
+            ],
+            BOOT_TIMEOUT,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send(&format!("fast-echo {PORT} &"))?;
+        expect_all(&mut run, &[claimed.as_str(), renewed.as_str()], LINE_WITHIN)?;
+        echoes(&socket, 50, 64)?;
+        // The service ends while the program owns the device; init stops the
+        // device and starts the service again.
+        let crashed_at = Instant::now();
+        run.send(&format!("fast-echo {PORT} --crash"))?;
+        expect_all(
+            &mut run,
+            &[
+                "fast-echo: crash sent",
+                "init: net ended: fault",
+                "fast-echo: lost after 50 echoes",
+            ],
+            LINE_WITHIN,
+        )?;
+        notes.push(format!(
+            "the owner left {} ms after CRASH",
+            crashed_at.elapsed().as_millis()
+        ));
+        // The new service has the device and leases its address again. A
+        // program cannot claim it from this shell: the shell's session is with
+        // the service that ended (the sessions of the clients are not made
+        // anew), so a program that starts again here has no way to the new
+        // service.
+        expect_all(&mut run, &[lease1.as_str()], LINE_WITHIN)?;
+        notes.push(format!(
+            "CRASH to the new service's lease1 {} ms",
+            crashed_at.elapsed().as_millis()
+        ));
+        run.send("echo probe-end")?;
+        run.expect("probe-end", DIALOG_STEP)?;
+        Ok::<(), String>(())
+    })();
+    let output = run.stop();
+    symbolize::backtrace(&output.lines, &kernel.elf);
+    talked?;
+    if output
+        .lines
+        .iter()
+        .any(|line| line.contains("KERNEL PANIC") || line.contains("out of memory"))
+    {
+        return Err("the image of the fast path panicked".into());
+    }
+    // The service faulted once, on purpose, and no other process.
+    let faults = output
+        .lines
+        .iter()
+        .filter(|l| l.contains("process fault:"))
+        .count();
+    if faults != 1 {
+        return Err(format!("{faults} process faults, wanted the one of CRASH"));
+    }
+    println!(
+        "fast-probe crash passed in {:.0} s on {}: {}",
         started.elapsed().as_secs_f64(),
         machine.name,
         notes.join("; ")

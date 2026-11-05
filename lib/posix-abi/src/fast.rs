@@ -459,3 +459,16 @@ pub fn config() -> Result<FastConfig, i32> {
         .map(|c| config_of(&c))
         .map_err(refusal)
 }
+
+/// The network service built for its probe faults on CRASH (method 63); the
+/// service of the shell answers an unknown method. The probe of the owner
+/// uses it to end the service while the device is claimed.
+pub fn probe_crash() -> Result<(), i32> {
+    let service = service()?;
+    let mut w = Writer::new();
+    proto_net::Method::Crash
+        .header()
+        .write(&mut w)
+        .map_err(|_| EIO)?;
+    call(&service, w.as_bytes(), rt::handle::Outgoing::new()).map(|_| ())
+}
