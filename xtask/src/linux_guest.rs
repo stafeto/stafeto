@@ -403,6 +403,10 @@ struct Report {
     answer: Duration,
     /// Every attempt to get the first answer: when and how it ended.
     attempts: Vec<String>,
+    /// The Mac's load average and the other machines of VZ and QEMU on it,
+    /// before the guest starts and after its last answer: no quiet Mac is
+    /// asked for, the conditions are recorded.
+    conditions: Vec<String>,
     /// The kernel's settings (`sysctl -a`), where the guest is Linux.
     sysctl: Vec<String>,
     cpus: String,
@@ -699,6 +703,10 @@ fn check_linux(dir: &Path, expected: &(String, String)) -> Result<Guest, String>
         system: "Linux 6.18 (Alpine 3.24)",
         ..Report::default()
     };
+    report.conditions.push(format!(
+        "before the start: {}",
+        crate::nginx_bench::other_guests(0)
+    ));
     let command = linux_command(dir, &suffix)?;
     let started = Instant::now();
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
@@ -749,6 +757,10 @@ fn check_linux(dir: &Path, expected: &(String, String)) -> Result<Guest, String>
         report.served = served;
         net_vz::lease_is_ours("linux-guest", &own, address)?;
         read_fingerprints(&mut run, &mut report, true)?;
+        report.conditions.push(format!(
+            "at the end: {}",
+            crate::nginx_bench::other_guests(1)
+        ));
         verify(&report, &expected.0, &expected.1)
     })();
     let _ = run.send("poweroff -f");
@@ -774,6 +786,10 @@ fn check_stafeto(expected: &(String, String)) -> Result<Guest, String> {
         system: "stafeto (boot-net-bench)",
         ..Report::default()
     };
+    report.conditions.push(format!(
+        "before the start: {}",
+        crate::nginx_bench::other_guests(0)
+    ));
     let command = vz::command_on(&kernel.image, &image, machine(&suffix))?;
     let started = Instant::now();
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
@@ -816,6 +832,10 @@ fn check_stafeto(expected: &(String, String)) -> Result<Guest, String> {
         report.served = served;
         net_vz::lease_is_ours("stafeto", &own, lease.address)?;
         read_fingerprints(&mut run, &mut report, false)?;
+        report.conditions.push(format!(
+            "at the end: {}",
+            crate::nginx_bench::other_guests(1)
+        ));
         verify(&report, &expected.0, &expected.1)
     })();
     let lines = run.lines().to_vec();
@@ -870,6 +890,7 @@ fn check() -> Result<(), String> {
         save(&format!("{name}-console.log"), &guest.lines);
         save(&format!("{name}-nginx-v.txt"), &guest.report.nginx_v);
         save(&format!("{name}-first-answer.txt"), &guest.report.attempts);
+        save(&format!("{name}-conditions.txt"), &guest.report.conditions);
         if !guest.report.sysctl.is_empty() {
             save(&format!("{name}-sysctl.txt"), &guest.report.sysctl);
         }

@@ -89,7 +89,7 @@ console logs, the output of `nginx -V`, the lines `configure arguments` of both
 sides and their difference (`configure-arguments.txt`), the attempts of the first
 answer (`*-first-answer.txt`), the kernel settings of the Linux guest
 (`linux-sysctl.txt`, the defaults the measurement of "Linux as it comes" runs on)
-and the virtio-net feature bits go to `target/linux-guest/check-<time>/`. The two
+the Mac's load average and the other machines of VZ and QEMU before and after each guest (`*-conditions.txt`; no quiet Mac is asked for, the conditions are recorded) and the virtio-net feature bits go to `target/linux-guest/check-<time>/`. The two
 times of the table are liveness checks: from the start of `vz-run` to the prompt,
 and from the moment four workers of nginx and the shell are up to the first answer
 on the Mac, taken the same way on both sides.
