@@ -382,7 +382,8 @@ three runs of the machine: a pattern of 4 MiB and the last 32 sectors of a
 disk of 64 MiB written, flushed and marked; the same file read again after a
 new start of QEMU and a restart of the service (CRASH); and the errors of the
 host's `blkdebug` (the first flush and the first read of sector 4096 fail)
-reaching the client. Under `-icount` the service prints each new longest step
+reaching the client, with a throttle that holds the third write for a second so
+that a FLUSH meets a write at the device. Under `-icount` the service prints each new longest step
 of its loop, and no kind may pass 18,369 ticks, 0.9 of term B. The jobs of the
 CI are `blk-probe`, `blk-probe GICv3` and `blk-faults`.
 `cargo xtask run --store` attaches the file `target/store-<image>.img`
