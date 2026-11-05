@@ -948,7 +948,6 @@ fn child() -> Result<(), &'static str> {
     unsafe {
         crate::allocation::after_fork(process, map).map_err(|_| "its memory map")?;
         crate::threads::after_fork(thread).map_err(|_| "its thread")?;
-        crate::cpu::after_fork();
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {
@@ -984,6 +983,9 @@ fn child() -> Result<(), &'static str> {
         crate::process::register_router(&native).map_err(|_| "its router")?;
     }
     crate::mmap::attach_shared();
+    // The account of the child starts here: its loader's work and its own
+    // binding are behind it.
+    crate::cpu::after_fork();
     let hook = AT_CHILD.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `at_child` stores a value, a `fn()`.
