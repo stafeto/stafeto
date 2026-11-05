@@ -78,6 +78,7 @@ mod obj_sites;
 mod openposix;
 mod ostest;
 mod keys;
+mod notices;
 mod packages;
 mod pci_walk;
 mod posix_display;
@@ -3608,8 +3609,7 @@ fn script_value(script: &str, name: &str) -> Result<String, String> {
 /// BusyBox's LICENSE (GPLv2 with its note) and the note of BusyBox's
 /// copyright and of the exact source of the program in the image.
 fn busybox_terms() -> Result<(Vec<u8>, String), String> {
-    let path = target_dir().join("busybox/source/LICENSE");
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = notices::licence_text("busybox")?;
     let version = packages::value("busybox", "version")?;
     let sha256 = packages::value("busybox", "sha256")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
@@ -3634,8 +3634,7 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
 fn bash_terms() -> Result<(Vec<u8>, String), String> {
     let version = packages::value("bash", "version")?;
     let sha256 = packages::value("bash", "sha256")?;
-    let path = target_dir().join(format!("bash/bash-{version}/COPYING"));
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = notices::licence_text("bash")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(
         "bash holds GNU bash {version}, Copyright (C) the Free Software Foundation, Inc.\n\

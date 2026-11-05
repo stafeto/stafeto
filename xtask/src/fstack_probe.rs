@@ -42,7 +42,7 @@ pub fn terms() -> Result<(Vec<u8>, String), String> {
         let path = work.join(name);
         std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
     };
-    let mut licence = read("LICENSE")?;
+    let mut licence = crate::notices::licence_text("f-stack")?;
     licence.extend_from_slice(b"\n");
     licence.extend(read("ACKNOWLEDGEMENTS")?);
     let url = crate::packages::value("f-stack", "url")?;
