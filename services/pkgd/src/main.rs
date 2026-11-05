@@ -362,11 +362,12 @@ impl Pkgd {
             core::ptr::copy_nonoverlapping(blob, buffer_at(place) as *mut u8, n);
         }
         let w = r.reply();
-        if w.u32(0)
-            .and_then(|()| w.u32(len as u32))
-            .and_then(|()| w.u32(n as u32))
-            .is_err()
-        {
+        let reply = proto_pkg::Settings {
+            total: len as u32,
+            copied: n as u32,
+            generation: GENERATION.load(Acquire),
+        };
+        if w.u32(0).and_then(|()| reply.write(w)).is_err() {
             return Answer::Status(Status::BadSize);
         }
         Answer::Reply(Outgoing::new())

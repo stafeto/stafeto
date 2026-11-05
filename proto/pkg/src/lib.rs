@@ -14,7 +14,7 @@
 //! | INSTALL_COMMIT (5) | the receipt's session | `receipt` u32, `flags` u32 | long: none |
 //! | INSTALL_CANCEL (6) | the receipt's session | `receipt` u32 | none |
 //! | REMOVE (7) | UID 0 | `count` u32, the names; the identity session | long: none |
-//! | SETTINGS_GET (8) | all | `offset` u32 | `total` u32, `copied` u32; the bytes are in cell 0 of the buffer |
+//! | SETTINGS_GET (8) | all | `offset` u32 | `total` u32, `copied` u32, `generation` u64; the bytes are in cell 0 of the buffer |
 //! | SETTINGS_SET (9) | UID 0 | `len` u32 (the blob is in the buffer); the identity session | long: none |
 //! | SERIAL (10) | all | the repository name | `serial` u64 |
 //! | SERIAL_SET (11) | UID 0 | the repository name, `serial` u64; the identity session | long: none |
@@ -441,6 +441,41 @@ pub fn read_take(mut body: Reader<'_>) -> Result<u64, Status> {
         return Err(Status::BadSize);
     }
     Ok(key)
+}
+
+/// The reply of SETTINGS_GET after its status: the length of the blob, the
+/// bytes put in cell 0 and the generation of the store the blob is of. A blob
+/// longer than a cell comes in parts; a client that sees the generation change
+/// between the parts starts again, so it never joins the start of the old blob
+/// to the end of a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub total: u32,
+    pub copied: u32,
+    pub generation: u64,
+}
+
+impl Settings {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(self.total)?;
+        w.u32(self.copied)?;
+        w.u64(self.generation)
+    }
+
+    pub fn read(bytes: &[u8]) -> Result<Settings, Status> {
+        let mut r = Reader::new(bytes);
+        match Status::from_code(r.u32()?) {
+            Status::Ok => {}
+            status => return Err(status),
+        }
+        let settings = Settings {
+            total: r.u32()?,
+            copied: r.u32()?,
+            generation: r.u64()?,
+        };
+        r.finish()?;
+        Ok(settings)
+    }
 }
 
 /// The reply of STATUS after its status.
