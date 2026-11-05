@@ -264,6 +264,22 @@ static int spawn(pid_t *pid, const char *role, const posix_spawn_file_actions_t 
     return posix_spawn(pid, "/bin/procs-child", actions, attr, argv, envp);
 }
 
+/* Spawns the catcher with SIGUSR1 blocked from its first instruction: a
+ * signal sent before it installs its handler waits in the mask and comes
+ * when the catcher unblocks it, so no pause stands in for its start-up. */
+static int spawn_catcher(pid_t *pid, int flags) {
+    posix_spawnattr_t attr;
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_SETSIGMASK);
+    posix_spawnattr_setsigmask(&attr, &blocked);
+    int e = spawn(pid, "catch", NULL, &attr);
+    posix_spawnattr_destroy(&attr);
+    return e;
+}
+
 static void pause_ms(long ms);
 
 /* The bytes of the service's pool once its ends settled: what a child gives
@@ -402,8 +418,8 @@ static void kills(pid_t sleeper) {
     expect("SIGKILL", kill(blocker, SIGKILL), 0);
     reap("the blocker after SIGKILL", blocker, 0, SIGKILL);
 
-    pid_t catcher = start("catch");
-    pause_ms(100);
+    pid_t catcher = -1;
+    expect("the catcher", spawn_catcher(&catcher, 0), 0);
     expect("kill of the catcher", kill(catcher, SIGUSR1), 0);
     reap("the catcher", catcher, 42, 0);
 
@@ -528,17 +544,15 @@ static void groups(void) {
     action.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &action, NULL);
     handled = 0;
-    pid_t c = start("catch");
-    pause_ms(100);
+    pid_t c = -1;
+    expect("a catcher in the probe's group", spawn_catcher(&c, 0), 0);
     expect("kill(0)", kill(0, SIGUSR1), 0);
     expect("the probe's handler before kill(0) returned", handled, 1);
     reap("a child of the probe's group after kill(0)", c, 42, 0);
 
     /* kill(-1) reaches a child of another group and skips the probe. */
     handled = 0;
-    expect("a child in a group of its own",
-           spawn_in(&c, "catch", POSIX_SPAWN_SETPGROUP, 0), 0);
-    pause_ms(100);
+    expect("a child in a group of its own", spawn_catcher(&c, POSIX_SPAWN_SETPGROUP), 0);
     expect("kill(-1)", kill(-1, SIGUSR1), 0);
     expect("kill(-1) left the sender out", handled, 0);
     reap("a child of another group after kill(-1)", c, 42, 0);
@@ -3558,6 +3572,12 @@ static int role(const char *name) {
         memset(&action, 0, sizeof action);
         action.sa_handler = exit_42;
         sigaction(SIGUSR1, &action, NULL);
+        /* The parent spawned it with SIGUSR1 blocked; a signal that came
+         * early is taken here, with the handler in place. */
+        sigset_t usr1;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigprocmask(SIG_UNBLOCK, &usr1, NULL);
         for (;;) sleep(60);
     }
     if (strcmp(name, "orphan") == 0) {
