@@ -20,7 +20,9 @@
 use crate::constants::*;
 use crate::fast::{self, FastClaim};
 use crate::fast_events;
-pub use crate::fast_events::{FAST_BASE, FAST_MAX, FAST_TICKETS, Number, classify, is_fast};
+pub use crate::fast_events::{
+    FAST_BASE, FAST_MAX, FAST_TICKETS, Number, above_table, classify, is_fast,
+};
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::mem::MaybeUninit;

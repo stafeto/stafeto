@@ -30,6 +30,15 @@ pub fn is_fast(fd: i32) -> bool {
     fd >= FAST_BASE
 }
 
+/// Whether `fd`, read as unsigned, is above the table of descriptors: a fast
+/// number, but also a negative one, which the cold branch answers with EBADF.
+/// One compare for the common entries, and a test of the range that also
+/// bounds the sign for the code behind it.
+#[inline(always)]
+pub fn above_table(fd: i32) -> bool {
+    fd as u32 >= FAST_BASE as u32
+}
+
 /// The socket or ticket a number names, `None` outside both ranges.
 pub fn classify(fd: i32) -> Option<Number> {
     let offset = fd.checked_sub(FAST_BASE)?;

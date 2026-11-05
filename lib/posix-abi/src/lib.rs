@@ -340,7 +340,7 @@ pub fn openat_policy(
 }
 
 pub fn close(number: c_int) -> Result<(), c_int> {
-    if fastnet::is_fast(number) {
+    if fastnet::above_table(number) {
         return fastnet::close_cold(number);
     }
     close_driver::close(fd(number)?)
@@ -348,7 +348,7 @@ pub fn close(number: c_int) -> Result<(), c_int> {
 
 /// Reads into `buffer`: a point of cancellation.
 pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
-    if fastnet::is_fast(number) {
+    if fastnet::above_table(number) {
         return fastnet::read_cold(number, buffer);
     }
     let point = threads::cancel::Point::begin();
@@ -461,7 +461,7 @@ pub fn finish_file_size<T>(result: Result<T, i32>) -> Result<T, i32> {
 /// (pipes::write). EPIPE comes after SIGPIPE went to the calling thread,
 /// and its handler ran ([write]). A point of cancellation.
 pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
-    if fastnet::is_fast(number) {
+    if fastnet::above_table(number) {
         return fastnet::write_cold(number, bytes);
     }
     let point = threads::cancel::Point::begin();
@@ -481,7 +481,7 @@ pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
 }
 
 pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {
-    if fastnet::is_fast(number) {
+    if fastnet::above_table(number) {
         return fastnet::lseek_cold(number);
     }
     let fd = fd(number)?;
@@ -567,14 +567,14 @@ pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_i
 }
 
 pub fn dup(number: c_int) -> Result<c_int, c_int> {
-    if fastnet::is_fast(number) {
+    if fastnet::above_table(number) {
         return fastnet::dup_cold(number);
     }
     shared::number(Request::Dup { fd: fd(number)? }).map(|fd| fd as c_int)
 }
 
 pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
-    if fastnet::is_fast(source) || fastnet::is_fast(target) {
+    if fastnet::above_table(source) || fastnet::above_table(target) {
         return fastnet::dup2_cold(source, target);
     }
     shared::number(Request::Dup2 {
@@ -586,7 +586,7 @@ pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
 
 /// Replace a descriptor and capture its close flags in the same table transition.
 pub fn dup3(source: c_int, target: c_int, flags: c_int) -> Result<c_int, c_int> {
-    if fastnet::is_fast(source) || fastnet::is_fast(target) {
+    if fastnet::above_table(source) || fastnet::above_table(target) {
         return fastnet::dup2_cold(source, target);
     }
     shared::number(Request::Dup3 {
