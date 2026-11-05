@@ -100,8 +100,8 @@ const PORTION: usize = 16 * 1024;
 /// the reading; `record` is what the store says of it, and `series` the
 /// system's. `revoked` is the list of revocations whole: names in it are
 /// ascending without repeats, so at most one entry names the key that signed.
-/// With `manifest` (an installation, not a start from the disk, where the signature
-/// that covers the manifest and the bytes is enough) the SHA-256 of each file is
+/// With `manifest` (an installation; a start from the disk relies on the signature
+/// that covers the manifest and the bytes) the SHA-256 of each file is
 /// compared with its line in the manifest. `seen` hears each phase.
 #[allow(clippy::too_many_arguments)]
 pub fn check<'a>(

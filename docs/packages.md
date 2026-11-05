@@ -498,13 +498,13 @@ steps of a few thousand ticks: the reads (LIST, INFO, SETTINGS_GET, SERIAL, STAT
 BUFFER, the copy of 16 KiB that a FEED brings, and the start and the result (TAKE) of each change
 of the store, which is a long operation. The worker thread (level 30, round robin) takes everything
 long: it reads the store through the disk service, creates and maps the object of each package,
-hashes it as the bytes arrive (SHA-256 in software takes some 540,000 ticks for 16 KiB, so no step
+hashes it as the bytes arrive (SHA-256 in software takes some 690,000 ticks for 16 KiB under `-icount`, so no step
 could hold a portion), checks the signature and attaches the object as a layer, and runs the
 transactions below. STATUS says `starting` until the worker has read the disk; LIST and INFO show
 the packages it has published meanwhile. The main thread gives the worker one job at a time (a
 cell with the arguments, a state, a code and a value, and a notification each way). The worker
 changes the table, the entries and the blobs the main thread reads only inside a change of the
-state, and a read that comes then gets `BUSY`. The service never restarts: its layers stay in the
+state (a sequence count that is odd meanwhile), and a read that meets a change, on one CPU or on two, gets `BUSY`. The service never restarts: its layers stay in the
 file service when it ends.
 
 **The store.** The whole disk, in blocks of 4 KiB. Blocks 0 and 1 are the two copies of the

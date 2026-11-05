@@ -467,6 +467,9 @@ struct Entry {
     version_len: usize,
     size: u64,
     sha256: [u8; 32],
+    /// The name of the file of the package, `<stem>.pkg`: the package's name unless the index says other.
+    stem: [u8; 64],
+    stem_len: usize,
 }
 
 impl Entry {
@@ -477,6 +480,8 @@ impl Entry {
         version_len: 0,
         size: 0,
         sha256: [0; 32],
+        stem: [0; 64],
+        stem_len: 0,
     };
 
     fn name(&self) -> &[u8] {
@@ -491,7 +496,7 @@ impl Entry {
     fn path(&self, buf: &mut [u8; 96]) -> *const c_char {
         let mut at = FILES.len();
         buf[..at].copy_from_slice(FILES);
-        for part in [self.name(), b".pkg"] {
+        for part in [&self.stem[..self.stem_len], b".pkg"] {
             buf[at..at + part.len()].copy_from_slice(part);
             at += part.len();
         }
@@ -530,12 +535,15 @@ fn load_index() -> Result<Index, Fail> {
         else {
             return Err("a line of the index");
         };
+        let stem = fields.next().unwrap_or(name);
         let e = index
             .entries
             .get_mut(index.count)
             .ok_or("too many packages")?;
         e.name[..name.len()].copy_from_slice(name);
         e.name_len = name.len();
+        e.stem[..stem.len()].copy_from_slice(stem);
+        e.stem_len = stem.len();
         e.version[..version.len()].copy_from_slice(version);
         e.version_len = version.len();
         e.size = size
@@ -556,10 +564,11 @@ fn load_index() -> Result<Index, Fail> {
 }
 
 impl Index {
-    fn get(&self, name: &[u8]) -> Result<&Entry, Fail> {
+    /// The package whose file is `<stem>.pkg`.
+    fn get(&self, stem: &[u8]) -> Result<&Entry, Fail> {
         self.entries[..self.count]
             .iter()
-            .find(|e| e.name() == name)
+            .find(|e| &e.stem[..e.stem_len] == stem)
             .ok_or("a package the index does not have")
     }
 }
@@ -676,9 +685,15 @@ impl Pkgd {
                 Some(h) => sys::send_handles(&self.0, request, [h.erase()]).map_err(|r| r.error)?,
             };
             let mut out = [0; MESSAGE_MAX];
-            let key = match long::Reply::read(reply.bytes(&mut out))? {
-                long::Reply::Wait(key) => key,
-                _ => return Err(Status::BadSize),
+            let key = match long::Reply::read(reply.bytes(&mut out)) {
+                Ok(long::Reply::Wait(key)) => key,
+                // The store is held for the moment: a group is being dropped.
+                Err(Status::Unknown(pkg::BUSY)) => {
+                    pause(5);
+                    continue;
+                }
+                Ok(_) => return Err(Status::BadSize),
+                Err(status) => return Err(status),
             };
             match self.finish(key, hammer) {
                 Err(Status::Unknown(pkg::BUSY)) => pause(5),
@@ -1012,6 +1027,8 @@ fn full(pkgd: &Pkgd, index: &Index, steps: bool) -> Result<(), Fail> {
     say!("refused INVALID for a repository the store does not know, nothing changed");
     // 3. Without the superuser: every change is refused, with the session or without one.
     not_allowed(pkgd, second, &one)?;
+    session_goes(pkgd, second, &one)?;
+    foreign(pkgd, second, &one)?;
     // 4. A group: nothing before its end, both after it.
     let big = index.get(b"big")?;
     let wide = index.get(b"wide")?;
@@ -1041,7 +1058,9 @@ fn full(pkgd: &Pkgd, index: &Index, steps: bool) -> Result<(), Fail> {
         return Err("the group");
     }
     say!("group of big and wide: nothing before its end, both after, one generation");
+    replace(pkgd, index, steps)?;
     changes(pkgd, index, steps)?;
+    own_repository(pkgd, index)?;
     // 6. wide goes, and its space comes back.
     let before = snap(pkgd)?;
     pkgd.remove(&[b"wide"], true)
@@ -1319,6 +1338,139 @@ fn doom(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
     }
     say!(
         "Doom installed: freedoom and doomgeneric as a group, the program and the WAD are in the tree"
+    );
+    Ok(())
+}
+
+impl Pkgd {
+    /// A session of its own for a child of this one: another label at the service.
+    fn other(&self) -> Result<Pkgd, Fail> {
+        rt::service::clone_session(&self.0, &Method::Clone.header().bytes())
+            .map(Pkgd)
+            .map_err(|_| "CLONE")
+    }
+
+    /// The request of INSTALL_BEGIN for `e` from `repository`.
+    fn begin_request(e: &Entry, repository: &[u8]) -> Result<Writer, Fail> {
+        let mut w = Writer::new();
+        pkg::Begin {
+            name: e.name(),
+            version: &e.version[..e.version_len],
+            size: e.size,
+            sha256: e.sha256,
+            repository,
+            flags: 1,
+        }
+        .write(&mut w)
+        .map_err(|_| "a BEGIN")?;
+        Ok(w)
+    }
+}
+
+/// A session that goes while its INSTALL_BEGIN waits for the worker, and one that goes with a receipt
+/// open, leave the store free for the next session.
+fn session_goes(pkgd: &Pkgd, e: &Entry, was: &Snap) -> Result<(), Fail> {
+    let request = Pkgd::begin_request(e, b"stafeto")?;
+    // The begin is given and the session closes before anyone takes its result.
+    {
+        let other = pkgd.other()?;
+        let identity = posix_abi::process::identity()
+            .and_then(|i| sys::handle_duplicate(i, Rights::NOTIFY | Rights::TRANSFER).ok())
+            .ok_or("no identity session")?;
+        sys::send_handles(&other.0, request.as_bytes(), [identity.erase()])
+            .map_err(|_| "BEGIN of a session that goes")?;
+    }
+    cancel(pkgd, e, was)?;
+    // A session that goes with a receipt open.
+    {
+        let other = pkgd.other()?;
+        other
+            .change(request.as_bytes(), true, false)
+            .map_err(|_| "BEGIN of a session that goes with a receipt")?;
+    }
+    cancel(pkgd, e, was)?;
+    say!("a session that goes at once, or with a receipt open, leaves the store free");
+    Ok(())
+}
+
+/// A receipt is its session's: another session cannot feed it, commit it or cancel it.
+fn foreign(pkgd: &Pkgd, e: &Entry, was: &Snap) -> Result<(), Fail> {
+    let request = Pkgd::begin_request(e, b"stafeto")?;
+    let receipt = pkgd
+        .change(request.as_bytes(), true, false)
+        .map_err(|_| "BEGIN")?;
+    let other = pkgd.other()?;
+    let mut w = Writer::new();
+    pkg::write_commit(receipt, pkg::COMMIT_END, &mut w).map_err(|_| "COMMIT")?;
+    let refused = is(other.feed(receipt, 0, 16), pkg::INVALID)
+        && is(other.change(w.as_bytes(), false, false), pkg::INVALID)
+        && is(
+            other.word(Method::InstallCancel, receipt, &mut [0; MESSAGE_MAX]),
+            pkg::INVALID,
+        );
+    // The holder still has it, and ends it.
+    let held = pkgd
+        .word(Method::InstallCancel, receipt, &mut [0; MESSAGE_MAX])
+        .is_ok();
+    if !refused || !held {
+        return Err("a receipt of another session");
+    }
+    // The next receipt of the holder begins as soon as the worker dropped this one.
+    cancel(pkgd, e, was)?;
+    say!("another session cannot feed, commit or cancel a receipt it does not hold");
+    Ok(())
+}
+
+/// `hello` replaced by a new version, a replacement that conflicts refused, and a package of the
+/// owner's repository (its key is in the settings blob) installed, the same signed by the release key refused.
+fn replace(pkgd: &Pkgd, index: &Index, steps: bool) -> Result<(), Fail> {
+    let before = snap(pkgd)?;
+    let stafeto = Install::new(b"stafeto", steps);
+    pkgd.install(index.get(b"hello-2")?, &stafeto)
+        .map_err(|_| "hello 2.0")?;
+    let after = snap(pkgd)?;
+    let mut total = 0;
+    let meta = pkgd.info(b"hello", &mut total).map_err(|_| "INFO")?;
+    if after.stat.generation != before.stat.generation + 1
+        || after.stat.disk != before.stat.disk
+        || !meta[..total.min(4096)]
+            .windows(12)
+            .any(|w| w == b"version 2.0\n")
+    {
+        return Err("the replacement of hello");
+    }
+    hello()?;
+    let conflict = index.get(b"hello-conflict")?;
+    if !is(pkgd.install(conflict, &stafeto), pkg::CONFLICT) || !snap(pkgd)?.same(&after) {
+        return Err("a replacement that conflicts");
+    }
+    hello()?;
+    say!(
+        "hello replaced by version 2.0: the new program runs, a replacement that conflicts is refused and the old one runs"
+    );
+    Ok(())
+}
+
+/// Packages of the owner's repository `games2`, whose key the settings blob holds.
+fn own_repository(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
+    let before = snap(pkgd)?;
+    let own = Install::new(b"games2", false);
+    pkgd.install(index.get(b"own")?, &own)
+        .map_err(|_| "a package of games2")?;
+    let after = snap(pkgd)?;
+    if after.has(b"own").is_none() || mode_of(b"/opt/own/bin/own").is_none() {
+        return Err("the package of games2 is not there");
+    }
+    if !is(
+        pkgd.install(index.get(b"own-bad")?, &own),
+        pkg::UNTRUSTED_KEY,
+    ) || !snap(pkgd)?.same(&after)
+        || before.stat.disk + 1 != after.stat.disk
+    {
+        return Err("a package of games2 signed by the release key");
+    }
+    say!(
+        "own repository: a package signed by the key of games2 is installed, one signed by the release key is UNTRUSTED_KEY"
     );
     Ok(())
 }

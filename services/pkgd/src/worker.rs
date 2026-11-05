@@ -781,7 +781,7 @@ impl Worker {
             } else {
                 bytes.len()
             };
-            // The hash is of the copy in the window, not of the cell the disk service wrote.
+            // The hash is of the copy in the window.
             // SAFETY: the bytes were copied to the window just above.
             let copy = unsafe {
                 core::slice::from_raw_parts((at + first as usize * BLOCK) as *const u8, bytes.len())

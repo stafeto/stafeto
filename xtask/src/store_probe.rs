@@ -804,6 +804,50 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
             )?,
         ),
     ];
+    // A new version of `hello`, one that conflicts, and the owner's repository: its key is the
+    // one the settings blob of `games2` holds, and the release key is not.
+    let own_seed = [10u8; 32];
+    let own_key = Key {
+        name: pkgfmt::Name::new("games2").map_err(|e| e.to_string())?,
+        public: sig::public_key(&own_seed),
+    };
+    let owner = Signer {
+        seed: &own_seed,
+        key: &own_key,
+        certificate: None,
+    };
+    packages.push((
+        "hello-2".into(),
+        package(
+            "hello",
+            hello,
+            official,
+            &[],
+            &Options {
+                version: Some("2.0".into()),
+                ..Options::default()
+            },
+        )?,
+    ));
+    packages.push((
+        "hello-conflict".into(),
+        package(
+            "hello",
+            tiny,
+            official,
+            &[],
+            &Options {
+                version: Some("3.0".into()),
+                passwd: true,
+                ..Options::default()
+            },
+        )?,
+    ));
+    packages.push(("own".into(), package("own", tiny, owner, &[], &plain)?));
+    packages.push((
+        "own-bad".into(),
+        package("own-bad", tiny, official, &[], &plain)?,
+    ));
     if steps {
         // Names and versions as long as they may be: the worst LIST.
         for n in 1..=5 {
@@ -820,18 +864,18 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
     let mut files = Vec::new();
     let mut blocks = std::collections::BTreeMap::new();
     let mut index = String::new();
-    for (name, bytes) in &packages {
-        let meta_version = pkgfmt::Package::parse(bytes)
-            .map_err(|e| format!("{name}: {e}"))
-            .map(|p| p.meta.version.to_string())
-            .unwrap_or_else(|_| "1.0".to_string());
+    for (stem, bytes) in &packages {
+        // The name and the version are the package's own; the file is `<stem>.pkg`.
+        let (name, meta_version) = pkgfmt::Package::parse(bytes)
+            .map(|p| (p.meta.name.to_string(), p.meta.version.to_string()))
+            .unwrap_or_else(|_| (stem.clone(), "1.0".to_string()));
         index.push_str(&format!(
-            "{name} {meta_version} {} {}\n",
+            "{name} {meta_version} {} {} {stem}\n",
             bytes.len(),
             hex_of(&pkgfmt::sha::sha256(bytes))
         ));
-        blocks.insert(name.clone(), bytes.len() as u64 / 4096);
-        files.push((format!("packages/{name}.pkg"), bytes.clone()));
+        blocks.insert(stem.clone(), bytes.len() as u64 / 4096);
+        files.push((format!("packages/{stem}.pkg"), bytes.clone()));
     }
     files.push(("packages/index".into(), index.into_bytes()));
     let settings1 = settings_blob("games", 9, 0)?;
@@ -882,7 +926,11 @@ fn full_lines(world: &World, steps: bool) -> Vec<String> {
         "store-probe: refused NO_SPACE, nothing changed",
         "store-probe: refused INVALID for a repository the store does not know, nothing changed",
         "store-probe: not allowed without UID 0, or without an identity session: begin, remove, serial, settings, revoked",
+        "store-probe: a session that goes at once, or with a receipt open, leaves the store free",
+        "store-probe: another session cannot feed, commit or cancel a receipt it does not hold",
         "store-probe: group of big and wide: nothing before its end, both after, one generation",
+        "store-probe: hello replaced by version 2.0: the new program runs, a replacement that conflicts is refused and the old one runs",
+        "store-probe: own repository: a package signed by the key of games2 is installed, one signed by the release key is UNTRUSTED_KEY",
         "store-probe: settings: a blob that breaks the rules is INVALID, the old one stays",
         "store-probe: serial: 2 is set, 1 is ROLLBACK, 2 again changes nothing",
         "store-probe: revoked: keyb is detached and flagged, an older list is ROLLBACK, a bad signature is BAD_SIGNATURE, the key is REVOKED",

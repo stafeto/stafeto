@@ -43,7 +43,7 @@ pub enum Point {
     /// The write of the superblock is torn inside its first sector: the copy it goes to is refused
     /// at the next start, and the other copy is the state.
     SuperTorn,
-    /// The superblock was accepted, not flushed.
+    /// The superblock was accepted and is still to be flushed.
     SuperWritten,
     /// The superblock is flushed (F3) in an installation.
     Committed,
@@ -53,7 +53,7 @@ pub enum Point {
     RemoveCommitted,
     /// The table is flushed in a change of the settings.
     SettingsTable,
-    /// A new store has its table, not its superblock.
+    /// A new store has its table and no superblock yet.
     FormatTable,
 }
 
