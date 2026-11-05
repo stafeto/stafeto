@@ -2,46 +2,53 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The package service (pk3-design): two threads of one process. The main
-//! thread (level 32) is the loop of a service (rt::service) and answers the
-//! reads of its clients in steps that stay short: the list of packages, the
-//! `meta` of one, the serial of a repository, the settings, the status, a
-//! session of its own for a child (CLONE) and the buffer of a client. The
-//! worker thread (`worker.rs`, level 30) reads the store from the disk,
-//! checks and attaches the packages to the file service and takes all the
-//! long calls, so the main thread never waits for them. The packages of the
-//! boot image are read here, before the service registers.
+//! thread (level 32) is the loop of a service (rt::service) and answers its
+//! clients in steps that stay short: the reads (the list of packages, the
+//! `meta` of one, the serial of a repository, the settings, the status), a
+//! session of its own for a child (CLONE), the buffer of a client, the copy of
+//! the bytes of a package that are fed, and the start and the result of the
+//! changes of the store (INSTALL_BEGIN and the rest, which are long operations
+//! with TAKE). The worker thread (`worker.rs`, `jobs.rs`, level 30) reads the store
+//! from the disk, receives and checks the packages, makes the transactions, attaches
+//! and detaches the layers of the file service and takes all the long calls, so the
+//! main thread never waits for them. A change asks for UID 0 of the process service
+//! (Vouch). The packages of the boot image are read here, before the service registers.
 
 #![no_std]
 #![no_main]
 
+mod jobs;
 mod shared;
 mod worker;
 
 use abi::{Access, Error, Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
 use pkgd::packages::Entry;
+use pkgd::receipts::check_feed;
 use pkgd::store::{self, PACKAGES};
 use proto_pkg::{
-    BUFFER_SIZE, CELL_BYTES, INFO_MAX, LIST_MAX, Method, STATUS_DAMAGED, STATUS_READ_ONLY,
-    STATUS_STARTING, Stat, VERSION, code, read_info, read_word,
+    BEGIN_WORLD, BUFFER_SIZE, CELL_BYTES, COMMIT_END, Feed, INFO_MAX, LIST_MAX, Method,
+    STATUS_DAMAGED, STATUS_READ_ONLY, STATUS_STARTING, Stat, VERSION, code, read_begin,
+    read_commit, read_info, read_remove, read_serial, read_take, read_word,
 };
-use proto_wire::Status;
 use proto_wire::clones::Clones;
+use proto_wire::{Status, long};
 use rt::handle::{Channel, Memory, Outgoing, Process};
-use rt::service::{Answer, Config, Heartbeat, Notice, Request, Service, Session};
+use rt::service::{
+    Answer, Config, Heartbeat, LongOps, LongSession, Notice, Request, Service, Session,
+};
 use rt::{Handle, sys};
 use shared::*;
 
 rt::entry!(main);
 
-/// Where the service maps the boot image, and the buffers of its clients.
+/// Where the service maps the boot image.
 const IMAGE_AT: usize = 0x50_0000_0000;
-const BUFFERS_AT: usize = 0x58_0000_0000;
-/// The buffers at once, one for each session that gave one.
-const BUFFERS: usize = 4;
 /// The sessions the loop keeps, and the clones of them at most.
 const SESSIONS: usize = 128;
 const CLONES: usize = 64;
+/// The long operations at once: one change of the store at a time.
+const OPERATIONS: usize = 4;
 const OWN: u64 = 1 << 63;
 
 /// The codes of a start that failed.
@@ -85,6 +92,13 @@ fn main(_: u64) -> u64 {
     ) else {
         return NOT_REGISTERED;
     };
+    // The channel the worker waits on for a job, and the copy that kicks it.
+    let Ok(jobs) = sys::channel_create(worker::LEVEL) else {
+        return NOT_REGISTERED;
+    };
+    let Ok(kick) = sys::handle_label(&jobs, Rights::NOTIFY, LABEL_KICK, worker::LEVEL) else {
+        return NOT_REGISTERED;
+    };
     // The raw handles the worker uses stay alive for the life of the process.
     for (i, raw) in [
         (worker::PROCESS, s.process.raw()),
@@ -92,6 +106,7 @@ fn main(_: u64) -> u64 {
         (worker::LAYERS_SESSION, layers.into_raw()),
         (worker::MAIN_CHANNEL, channel.raw()),
         (worker::WAKE, done.into_raw()),
+        (worker::JOBS, jobs.into_raw()),
     ] {
         worker::RAW[i].store(raw.0, Release);
     }
@@ -102,10 +117,17 @@ fn main(_: u64) -> u64 {
     rt::service::report_steps(16);
     let mut service = Pkgd {
         process: Handle::borrowed(s.process.raw()),
+        parent: Handle::borrowed(s.parent.raw()),
+        notary: None,
         clones: Clones::new(),
         channel: Handle::borrowed(channel.raw()),
         level,
         buffers: [None; BUFFERS],
+        stale: [false; BUFFERS],
+        kick,
+        ops: LongOps::new(),
+        pending: None,
+        rx: None,
     };
     let config = Config {
         issued: 0,
@@ -143,23 +165,53 @@ unsafe fn image_packages(s: &mut rt::startup::Startup) -> u32 {
     n as u32
 }
 
-/// What a session keeps: the place of its buffer, if it gave one.
+/// What a session keeps: the place of its buffer, if it gave one, and its long operations.
 #[derive(Default)]
 struct Sess {
     buffer: Option<u8>,
+    long: LongSession,
+}
+
+/// The receipt being fed, as the main thread knows it: the session that holds it, its
+/// number, the place of its object and its size.
+#[derive(Clone, Copy)]
+struct Rx {
+    owner: u64,
+    number: u32,
+    slot: usize,
+    size: u64,
 }
 
 struct Pkgd {
     process: core::mem::ManuallyDrop<Handle<Process>>,
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
+    parent: core::mem::ManuallyDrop<Handle<Channel>>,
+    /// The notary session with the process service, asked of init at the first use.
+    notary: Option<Handle<Channel>>,
     clones: Clones<CLONES>,
     level: u8,
     /// The label of the session whose buffer is mapped at each place.
     buffers: [Option<u64>; BUFFERS],
+    /// The buffer of a session that went while a job might read it: unmapped when the job is done.
+    stale: [bool; BUFFERS],
+    /// A copy of the worker's channel that wakes it.
+    kick: Handle<Channel>,
+    ops: LongOps<OPERATIONS>,
+    /// The session and key of the long operation whose job the worker has.
+    pending: Option<(u64, u64)>,
+    rx: Option<Rx>,
 }
 
-fn buffer_at(place: u8) -> usize {
-    BUFFERS_AT + usize::from(place) * BUFFER_SIZE as usize
+fn answer(status: Status) -> Answer {
+    Answer::Status(status)
+}
+
+fn refuse(c: u32) -> Answer {
+    Answer::Status(code(c))
+}
+
+fn busy_reads() -> bool {
+    WRITING.load(Acquire)
 }
 
 /// The entry at LIST position `i`: the disk's 64, then the image's.
@@ -185,6 +237,9 @@ impl Pkgd {
         let Ok(first) = read_word(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
+        if busy_reads() {
+            return refuse(proto_pkg::BUSY);
+        }
         let end = PACKAGES + IMAGE_MAX;
         let mut at = first as usize;
         let mut found = [None; LIST_MAX as usize];
@@ -228,6 +283,9 @@ impl Pkgd {
         let Ok((name, offset)) = read_info(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
+        if busy_reads() {
+            return refuse(proto_pkg::BUSY);
+        }
         let found = (0..PACKAGES + IMAGE_MAX)
             .filter_map(listed)
             .find(|e| e.name() == name);
@@ -252,10 +310,10 @@ impl Pkgd {
         let Ok((repo, _)) = proto_pkg::read_serial(r.body(), false) else {
             return Answer::Status(Status::BadSize);
         };
-        if STARTING.load(Acquire) {
+        if STARTING.load(Acquire) || busy_reads() {
             return Answer::Status(code(proto_pkg::BUSY));
         }
-        // SAFETY: the worker is done: the table is the main thread's.
+        // SAFETY: nothing writes the table while WRITING is clear and the start is over.
         let table = unsafe { &*TABLE.get() };
         let serial = table
             .find_repo(repo)
@@ -271,6 +329,9 @@ impl Pkgd {
     fn status(&self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
+        }
+        if busy_reads() {
+            return refuse(proto_pkg::BUSY);
         }
         let mut flags = 0;
         for (on, bit) in [
@@ -329,7 +390,7 @@ impl Pkgd {
             &object,
             0,
             u64::from(size),
-            buffer_at(place as u8),
+            buffer_at(place),
             Access::ReadWrite,
         );
         match mapped {
@@ -350,7 +411,7 @@ impl Pkgd {
         let Some(place) = s.data.buffer else {
             return Answer::Status(code(proto_pkg::NO_BUFFER));
         };
-        if STARTING.load(Acquire) {
+        if STARTING.load(Acquire) || busy_reads() {
             return Answer::Status(code(proto_pkg::BUSY));
         }
         let len = SETTINGS_LEN.load(Acquire);
@@ -359,7 +420,7 @@ impl Pkgd {
         // SAFETY: the blob is the main thread's now; the cell is the client's, written raw.
         unsafe {
             let blob = (*SETTINGS.get()).as_ptr().add(from);
-            core::ptr::copy_nonoverlapping(blob, buffer_at(place) as *mut u8, n);
+            core::ptr::copy_nonoverlapping(blob, buffer_at(usize::from(place)) as *mut u8, n);
         }
         let w = r.reply();
         let reply = proto_pkg::Settings {
@@ -371,6 +432,372 @@ impl Pkgd {
             return Answer::Status(Status::BadSize);
         }
         Answer::Reply(Outgoing::new())
+    }
+
+    /// Wakes the worker.
+    fn wake(&self) {
+        let _ = sys::notify(&self.kick, 1);
+    }
+
+    /// The effective user of the process whose identity session the request brought, as the
+    /// process service vouches for it; None without a session or when the service refuses.
+    fn vouch(&mut self, identity: Handle<Channel>) -> Option<u32> {
+        if self.notary.is_none() {
+            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        }
+        let notary = self.notary.as_ref()?;
+        let request = proto_process::Method::Vouch.header().bytes();
+        let reply = sys::send_handles(notary, &request, [identity.erase()]).ok()?;
+        let mut buffer = [0; abi::MESSAGE_MAX];
+        proto_process::WhoReply::read(reply.bytes(&mut buffer))
+            .ok()
+            .map(|who| who.credentials.euid)
+    }
+
+    /// The gate of a change of the store: the identity session of the request is that of
+    /// the superuser (NOT_ALLOWED otherwise, and without a session or when the process
+    /// service refuses), the store is read, it can be written, and the device flushes.
+    fn gate(&mut self, r: &mut Request<'_>) -> Result<(), Answer> {
+        let identity = (r.handles.len() == 1)
+            .then(|| r.handles.take::<Channel>(0).ok())
+            .flatten();
+        let allowed = identity.and_then(|channel| self.vouch(channel)) == Some(0);
+        if !allowed {
+            return Err(refuse(proto_pkg::NOT_ALLOWED));
+        }
+        if STARTING.load(Acquire) {
+            return Err(refuse(proto_pkg::BUSY));
+        }
+        if DAMAGED.load(Acquire) {
+            return Err(refuse(proto_pkg::DAMAGED));
+        }
+        if READ_ONLY.load(Acquire) {
+            return Err(refuse(proto_pkg::NO_FLUSH));
+        }
+        Ok(())
+    }
+
+    /// Whether the worker can take a job.
+    fn job_free(&self) -> bool {
+        JOB_STATE.load(Acquire) == IDLE && self.pending.is_none()
+    }
+
+    /// The job in `JOB` goes to the worker as a long operation of the session: WAIT k.
+    fn give(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let label = r.label();
+        let key = match self.ops.start(&mut s.data.long, label) {
+            Ok(key) => key,
+            Err(error) => return answer(Status::Kernel(error)),
+        };
+        self.pending = Some((label, key));
+        JOB_STATE.store(PENDING, Release);
+        self.wake();
+        long_answer(r, long::Reply::Wait(key))
+    }
+
+    /// The job that is in `JOB`, made ready by `fill`, for a change of the store that is not
+    /// an installation: no group of another session or of this one is open.
+    fn change(
+        &mut self,
+        s: &mut Session<Sess, 0>,
+        r: &mut Request<'_>,
+        fill: impl FnOnce(&mut JobArgs) -> Result<(), Answer>,
+    ) -> Answer {
+        if let Err(refused) = self.gate(r) {
+            return refused;
+        }
+        if !self.job_free() || GROUP_OWNER.load(Acquire) != 0 {
+            return refuse(proto_pkg::BUSY);
+        }
+        // SAFETY: the job cell is the main thread's while the state is IDLE.
+        let job = unsafe { &mut *JOB.get() };
+        *job = JobArgs::EMPTY;
+        job.owner = r.label();
+        if let Err(refused) = fill(job) {
+            return refused;
+        }
+        self.give(s, r)
+    }
+
+    /// INSTALL_BEGIN: the index's record, the repository and the flags; the number of the
+    /// receipt comes with the result of the long operation.
+    fn install_begin(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let begin = match read_begin(r.body()) {
+            Ok(begin) => begin,
+            Err(status) => return answer(status),
+        };
+        if let Err(refused) = self.gate(r) {
+            return refused;
+        }
+        // A package of the boot image is the image's, whatever the index says.
+        // SAFETY: the image entries were filled before the loop began.
+        if pkgd::packages::in_image(unsafe { &*IMAGE_ENTRIES.get() }, begin.name) {
+            return refuse(proto_pkg::IN_IMAGE);
+        }
+        let label = r.label();
+        let owner = GROUP_OWNER.load(Acquire);
+        if !self.job_free() || self.rx.is_some() || (owner != 0 && owner != label) {
+            return refuse(proto_pkg::BUSY);
+        }
+        let (Some(name), Some(version), Some(repo)) = (
+            store::to_field(begin.name),
+            store::to_field(begin.version),
+            store::to_field(begin.repository),
+        ) else {
+            return refuse(proto_pkg::INVALID);
+        };
+        // SAFETY: the job cell is the main thread's while the state is IDLE.
+        let job = unsafe { &mut *JOB.get() };
+        *job = JobArgs::EMPTY;
+        job.kind = JobKind::Begin;
+        job.owner = label;
+        job.size = begin.size;
+        job.sha256 = begin.sha256;
+        job.world = begin.flags & BEGIN_WORLD != 0;
+        job.name = name;
+        job.version = version;
+        job.repo = repo;
+        self.give(s, r)
+    }
+
+    /// FEED: the bytes in a cell of the buffer are copied into the object of the receipt, at
+    /// the end of what came, and the worker hashes and writes them. Past the size of the
+    /// package the receipt goes (TOO_LONG).
+    fn feed(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let feed = match Feed::read(r.body()) {
+            Ok(feed) => feed,
+            Err(status) => return answer(status),
+        };
+        let Some(rx) = self
+            .rx
+            .filter(|rx| rx.owner == r.label() && rx.number == feed.receipt)
+        else {
+            return refuse(proto_pkg::INVALID);
+        };
+        let Some(place) = s.data.buffer else {
+            return refuse(proto_pkg::NO_BUFFER);
+        };
+        let fed = FED.load(Acquire);
+        if check_feed(rx.size, fed, feed.len).is_err() {
+            self.drop_receipt();
+            return refuse(proto_pkg::TOO_LONG);
+        }
+        // SAFETY: the cell lies in the client's buffer, mapped for its session; the window
+        // of the object is mapped for `size` bytes and `fed + len` is not past it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (buffer_at(usize::from(place)) + feed.cell as usize * CELL_BYTES as usize)
+                    as *const u8,
+                (window(rx.slot) + fed as usize) as *mut u8,
+                feed.len as usize,
+            )
+        };
+        FED.store(fed + u64::from(feed.len), Release);
+        self.wake();
+        Answer::Status(Status::Ok)
+    }
+
+    /// The receipt, with its group, goes: the worker drops them.
+    fn drop_receipt(&mut self) {
+        self.rx = None;
+        CANCEL.store(true, Release);
+        self.wake();
+    }
+
+    /// INSTALL_COMMIT: all of the package came; the worker checks it and, at the end of the
+    /// group, makes the transaction.
+    fn install_commit(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let Ok((number, flags)) = read_commit(r.body()) else {
+            return answer(Status::BadSize);
+        };
+        let label = r.label();
+        let Some(rx) = self
+            .rx
+            .filter(|rx| rx.owner == label && rx.number == number)
+        else {
+            return refuse(proto_pkg::INVALID);
+        };
+        if FED.load(Acquire) != rx.size {
+            return refuse(proto_pkg::INVALID);
+        }
+        if !self.job_free() {
+            return refuse(proto_pkg::BUSY);
+        }
+        // SAFETY: the job cell is the main thread's while the state is IDLE.
+        let job = unsafe { &mut *JOB.get() };
+        *job = JobArgs::EMPTY;
+        job.kind = JobKind::Commit;
+        job.owner = label;
+        job.number = number;
+        job.end = flags & COMMIT_END != 0;
+        self.rx = None;
+        self.give(s, r)
+    }
+
+    /// INSTALL_CANCEL: the receipt and the group go; the store is free once the worker has dropped
+    /// them.
+    fn install_cancel(&mut self, r: &mut Request<'_>) -> Answer {
+        let Ok(number) = read_word(r.body()) else {
+            return answer(Status::BadSize);
+        };
+        let label = r.label();
+        let held = GROUP_OWNER.load(Acquire) == label;
+        let named = self.rx.is_none_or(|rx| rx.number == number);
+        if !held || !named {
+            return refuse(proto_pkg::INVALID);
+        }
+        self.drop_receipt();
+        Answer::Status(Status::Ok)
+    }
+
+    fn remove(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let mut names: [&[u8]; 8] = [&[]; 8];
+        let count = match read_remove(r.body(), &mut names) {
+            Ok(count) => count,
+            Err(status) => return answer(status),
+        };
+        let mut fields = [[0; 64]; 8];
+        for (field, name) in fields.iter_mut().zip(&names).take(count) {
+            let Some(made) = store::to_field(name) else {
+                return refuse(proto_pkg::INVALID);
+            };
+            *field = made;
+        }
+        self.change(s, r, |job| {
+            job.kind = JobKind::Remove;
+            job.names = fields;
+            job.count = count;
+            Ok(())
+        })
+    }
+
+    fn serial_set(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let (repository, serial) = match read_serial(r.body(), true) {
+            Ok(got) => got,
+            Err(status) => return answer(status),
+        };
+        let Some(field) = store::to_field(repository) else {
+            return refuse(proto_pkg::INVALID);
+        };
+        self.change(s, r, |job| {
+            job.kind = JobKind::SerialSet;
+            job.repo = field;
+            job.serial = serial;
+            Ok(())
+        })
+    }
+
+    /// SETTINGS_SET and REVOKED_SET: the blob or the list is `len` bytes in the buffer.
+    fn blob_set(
+        &mut self,
+        s: &mut Session<Sess, 0>,
+        r: &mut Request<'_>,
+        kind: JobKind,
+        most: usize,
+    ) -> Answer {
+        let Ok(len) = read_word(r.body()) else {
+            return answer(Status::BadSize);
+        };
+        let Some(place) = s.data.buffer else {
+            return refuse(proto_pkg::NO_BUFFER);
+        };
+        if len == 0 || len as usize > most {
+            return refuse(proto_pkg::INVALID);
+        }
+        self.change(s, r, |job| {
+            job.kind = kind;
+            job.len = len as usize;
+            job.buffer = usize::from(place);
+            Ok(())
+        })
+    }
+
+    /// The job the worker finished: the receipt of a package that began is the session's, and
+    /// the client whose operation it was is told. A job whose session went is over.
+    fn settle(&mut self) {
+        if JOB_STATE.load(Acquire) != DONE {
+            return;
+        }
+        // SAFETY: the worker is done with the cell until the state is IDLE again.
+        let kind = unsafe { (*JOB.get()).kind };
+        match self.pending {
+            Some((label, key)) => {
+                // SAFETY: as above.
+                let (owner, size) = unsafe { ((*JOB.get()).owner, (*JOB.get()).size) };
+                if kind == JobKind::Begin && JOB_CODE.load(Acquire) == 0 && self.rx.is_none() {
+                    self.rx = Some(Rx {
+                        owner,
+                        number: JOB_VALUE.load(Acquire),
+                        slot: JOB_SLOT.load(Acquire) as usize,
+                        size,
+                    });
+                }
+                self.ops.tell(label, key);
+            }
+            None => {
+                JOB_STATE.store(IDLE, Release);
+                self.release_stale();
+            }
+        }
+    }
+
+    /// The buffers of sessions that went while the worker might read them go now that it
+    /// does not.
+    fn release_stale(&mut self) {
+        if JOB_STATE.load(Acquire) != IDLE {
+            return;
+        }
+        for place in 0..BUFFERS {
+            if self.stale[place] {
+                // SAFETY: nothing of the service's own lies in the buffer's range.
+                let gone = unsafe {
+                    sys::mem_unmap(&self.process, buffer_at(place), u64::from(BUFFER_SIZE))
+                };
+                if gone.is_ok() {
+                    self.buffers[place] = None;
+                    self.stale[place] = false;
+                }
+            }
+        }
+    }
+
+    /// TAKE: the result of the long operation once the worker has done it, or ARMED (keeping
+    /// the handle with NOTIFY the first TAKE brings).
+    fn take(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let Ok(key) = read_take(r.body()) else {
+            return answer(Status::BadSize);
+        };
+        let label = r.label();
+        if !self.ops.waits(label, key) {
+            return answer(Status::Kernel(Error::BadState));
+        }
+        if self.pending == Some((label, key)) && JOB_STATE.load(Acquire) == DONE {
+            // The receipt of a begin is the session's before the client has its number.
+            self.settle();
+            let c = JOB_CODE.load(Acquire);
+            let value = JOB_VALUE.load(Acquire);
+            // SAFETY: the worker is done with the cell.
+            let kind = unsafe { (*JOB.get()).kind };
+            JOB_STATE.store(IDLE, Release);
+            self.pending = None;
+            self.ops.finish(&mut s.data.long, label, key);
+            self.release_stale();
+            if c != 0 {
+                return refuse(c);
+            }
+            let bytes = value.to_le_bytes();
+            let result: &[u8] = if kind == JobKind::Begin { &bytes } else { &[] };
+            return long_answer(r, long::Reply::Ready(result));
+        }
+        if !r.handles.is_empty() {
+            match r.handles.take::<Channel>(0) {
+                Ok(notify) => {
+                    let _ = self.ops.arm(label, key, notify);
+                }
+                Err(error) => return answer(Status::Kernel(error)),
+            }
+        }
+        long_answer(r, long::Reply::Armed)
     }
 
     /// CLONE: a session of its own for a child of the client.
@@ -411,12 +838,28 @@ fn repository_of(e: &Entry) -> &'static [u8] {
         .map_or(&b""[..], |(name, _)| name)
 }
 
+/// The reply of a long operation, through the request's reply buffer.
+fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
+    match reply.write(r.reply()) {
+        Ok(()) => Answer::Reply(Outgoing::new()),
+        Err(status) => Answer::Status(status),
+    }
+}
+
 const METHODS: &[u16] = &[
     Method::List.number(),
     Method::Info.number(),
+    Method::InstallBegin.number(),
+    Method::Feed.number(),
+    Method::InstallCommit.number(),
+    Method::InstallCancel.number(),
+    Method::Remove.number(),
     Method::SettingsGet.number(),
+    Method::SettingsSet.number(),
     Method::Serial.number(),
+    Method::SerialSet.number(),
     Method::Clone.number(),
+    Method::RevokedSet.number(),
     Method::Take.number(),
     Method::Buffer.number(),
     Method::Status.number(),
@@ -431,26 +874,46 @@ impl Service<0> for Pkgd {
         match Method::from_number(r.method()) {
             Some(Method::List) => self.list(r),
             Some(Method::Info) => self.info(r),
+            Some(Method::InstallBegin) => self.install_begin(s, r),
+            Some(Method::Feed) => self.feed(s, r),
+            Some(Method::InstallCommit) => self.install_commit(s, r),
+            Some(Method::InstallCancel) => self.install_cancel(r),
+            Some(Method::Remove) => self.remove(s, r),
             Some(Method::SettingsGet) => self.settings(s, r),
+            Some(Method::SettingsSet) => self.blob_set(s, r, JobKind::SettingsSet, 64 * 1024),
             Some(Method::Serial) => self.serial(r),
+            Some(Method::SerialSet) => self.serial_set(s, r),
             Some(Method::Clone) => self.clone_session(r),
+            Some(Method::RevokedSet) => self.blob_set(s, r, JobKind::RevokedSet, REVOKED_FILE_MAX),
+            Some(Method::Take) => self.take(s, r),
             Some(Method::Buffer) => self.give_buffer(s, r),
             Some(Method::Status) => self.status(r),
-            // No operation of this part ever waits: every key is unknown.
-            Some(Method::Take) => Answer::Status(Status::Kernel(Error::BadState)),
-            _ => Answer::Status(Status::UnknownMethod),
+            None => Answer::Status(Status::UnknownMethod),
         }
     }
 
     fn gone(&mut self, s: &mut Session<Sess, 0>) {
-        if let Some(place) = s.data.buffer.take() {
-            // SAFETY: nothing of the service's own lies in the buffer's range.
-            let gone =
-                unsafe { sys::mem_unmap(&self.process, buffer_at(place), u64::from(BUFFER_SIZE)) };
-            if gone.is_ok() {
-                self.buffers[usize::from(place)] = None;
-            }
+        let label = s.label();
+        self.ops.gone(&mut s.data.long);
+        let running = self.pending.is_some_and(|(l, _)| l == label);
+        if running {
+            // The job goes on; its result has no one to tell and its buffer stays until it ends.
+            self.pending = None;
         }
+        if self.rx.is_some_and(|rx| rx.owner == label) {
+            self.rx = None;
+        }
+        // The group of the session, or the job that is to open one, is dropped.
+        if GROUP_OWNER.load(Acquire) == label || running {
+            CANCEL.store(true, Release);
+            self.wake();
+        }
+        if let Some(place) = s.data.buffer.take() {
+            self.stale[usize::from(place)] = true;
+        }
+        // A job that is done and has no one to take it is idle again.
+        self.settle();
+        self.release_stale();
     }
 
     /// The last copy of a session went: a clone's place is free again, whether or
@@ -464,18 +927,16 @@ impl Service<0> for Pkgd {
     fn notification(&mut self, n: Notice) {
         // The step of a notification is measured apart from the heartbeat's.
         rt::service::step_own();
-        if n.source == Source::Session && (LABEL_LAYER..=LABEL_DONE).contains(&n.label) {
+        if n.source == Source::Session && n.label == LABEL_DONE {
+            self.settle();
             #[cfg(feature = "steps")]
-            if n.label == LABEL_DONE {
-                rt::println!(
-                    "pkgd: work read_hash={} check={}",
-                    HASH_TICKS.load(Acquire),
-                    CHECK_TICKS.load(Acquire)
-                );
-                if let Ok(m) = sys::process_memory(&self.process) {
-                    rt::println!("pkgd: memory used={} pages", m.used / 4096);
-                }
-            }
+            rt::println!(
+                "pkgd: work sha16k={} parse={} ed25519={} manifest16k={}",
+                SHA_TICKS.load(Acquire),
+                PARSE_TICKS.load(Acquire),
+                SIGN_TICKS.load(Acquire),
+                MANIFEST_TICKS.load(Acquire)
+            );
         }
     }
 }

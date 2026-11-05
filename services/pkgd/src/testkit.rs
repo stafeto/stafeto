@@ -73,6 +73,12 @@ impl Default for Spec<'_> {
 
 /// A signed package file with a program at `/opt/<name>/bin/<name>`.
 pub fn package(spec: &Spec<'_>) -> Vec<u8> {
+    package_with(spec, |_| {})
+}
+
+/// The same, with `tamper` changing the covered part before it is signed: a package
+/// whose signature is good and whose parts disagree.
+pub fn package_with(spec: &Spec<'_>, tamper: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let path = format!("/opt/{}/bin/{}", spec.name, spec.name);
     let (dir, bin) = (
         format!("/opt/{}", spec.name),
@@ -119,7 +125,8 @@ pub fn package(spec: &Spec<'_>) -> Vec<u8> {
         relibc: "-",
         size: 0,
     };
-    let covered = container(&meta, &items, 1_700_000_000).unwrap();
+    let mut covered = container(&meta, &items, 1_700_000_000).unwrap();
+    tamper(&mut covered);
     let certificate = spec.certified.then(certificate);
     sign(covered, &spec.seed, name(spec.key), certificate, spec.time).unwrap()
 }

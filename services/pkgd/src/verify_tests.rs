@@ -49,6 +49,8 @@ fn run(bytes: &[u8], record: &Record, trust: &Trust, revoked: &[Revocation]) -> 
         crate::SERIES,
         trust,
         Some(&list),
+        false,
+        &mut |_| {},
     )
     .map(drop)
 }
@@ -72,6 +74,8 @@ fn a_package_of_the_official_repository_passes_and_keeps_its_meta() {
         crate::SERIES,
         &trust,
         None,
+        false,
+        &mut |_| {},
     )
     .unwrap();
     assert!(checked.meta.starts_with(b"name hello\n"));
@@ -201,6 +205,8 @@ fn entry(spec: &Spec<'_>) -> Option<Entry> {
         crate::SERIES,
         &select(true, &roots, &[]),
         None,
+        false,
+        &mut |_| {},
     )
     .unwrap();
     let mut e = Entry {
@@ -545,4 +551,93 @@ fn the_list_of_revocations_never_goes_back_and_marks_the_packages_it_names() {
         (900, 1, 70, [8; 32])
     );
     assert_eq!(out.check(5, 131_072, 2), Ok(()));
+}
+
+#[test]
+fn the_manifest_is_checked_for_an_installation_and_not_for_a_start_from_the_disk() {
+    let spec = Spec {
+        padding: 10_000,
+        ..Spec::default()
+    };
+    let good = package(&spec);
+    // A byte of the program changed before the signing: the signature is good, the
+    // manifest names another file.
+    let bad = package_with(&spec, |covered| {
+        let at = covered
+            .windows(4)
+            .position(|w| w == b"\x7fELF")
+            .expect("the program");
+        covered[at + 30] ^= 1;
+    });
+    let roots = official();
+    let trust = select(true, &roots, &[]);
+    for (bytes, manifest, wanted) in [
+        (&good, true, Ok(())),
+        (&bad, false, Ok(())),
+        (&bad, true, Err(Fault::BadManifest)),
+    ] {
+        let record = record_of(bytes, "hello", "1.0");
+        let (covered, whole) = hashes(bytes);
+        let mut portions = 0;
+        let got = check(
+            bytes,
+            &covered,
+            &whole,
+            &record,
+            crate::SERIES,
+            &trust,
+            None,
+            manifest,
+            &mut |phase| portions += usize::from(phase == crate::verify::Phase::Portion),
+        )
+        .map(drop);
+        assert_eq!(got, wanted, "{manifest}");
+        assert_eq!(portions > 0, manifest);
+    }
+    assert_eq!(Fault::BadManifest.code(), proto_pkg::BAD_MANIFEST);
+}
+
+#[test]
+fn a_list_names_the_packages_its_keys_signed_at_or_after_the_time() {
+    use crate::verify::revoked_by;
+    let bytes = package(&Spec::default());
+    let record = record_of(&bytes, "hello", "1.0");
+    let roots = official();
+    let (covered, whole) = hashes(&bytes);
+    let checked = check(
+        &bytes,
+        &covered,
+        &whole,
+        &record,
+        crate::SERIES,
+        &select(true, &roots, &[]),
+        None,
+        false,
+        &mut |_| {},
+    )
+    .unwrap();
+    let signed = 1_800_000_000;
+    for (since, wanted) in [(0, true), (signed, true), (signed + 1, false)] {
+        let text = pkgfmt::revoked::write(
+            1,
+            &[Revocation {
+                name: name("test-release"),
+                since,
+            }],
+        )
+        .unwrap();
+        let list = pkgfmt::revoked::Revoked::parse(&text).unwrap();
+        assert_eq!(revoked_by(checked.trailer, &list), wanted, "{since}");
+    }
+    let other = pkgfmt::revoked::write(
+        1,
+        &[Revocation {
+            name: name("other-key"),
+            since: 0,
+        }],
+    )
+    .unwrap();
+    let list = pkgfmt::revoked::Revoked::parse(&other).unwrap();
+    assert!(!revoked_by(checked.trailer, &list));
+    assert!(!revoked_by(&[0; 10], &list));
 }

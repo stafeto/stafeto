@@ -23,6 +23,9 @@ bench = false
 # `host`: the writer of a store for xtask, no program.
 [features]
 steps = ["rt/step-stats"]
+# `crash`: the service stops for good at the point `STAFETO_PKGD_CRASH_AT` names
+# (store-crash), after the line `pkgd: crash point N`.
+crash = []
 host = ["proto-pkg/alloc", "pkgfmt/write"]
 
 [dependencies]
@@ -36,6 +39,7 @@ proto-wire = { path = "../../proto/wire" }
 abi = { path = "../../lib/abi" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
+proto-process = { path = "../../proto/process" }
 rt = { path = "../../lib/rt" }
 
 [dev-dependencies]

@@ -144,6 +144,15 @@ pub struct Staged {
     pub record: Record,
 }
 
+/// A package that was committed: what waits for the end of the group, and the
+/// SHA-256 of its covered part and of the whole file.
+#[derive(Clone, Copy, Debug)]
+pub struct Committed {
+    pub staged: Staged,
+    pub covered: [u8; 32],
+    pub whole: [u8; 32],
+}
+
 /// The one open group: the session that holds the store and what it received.
 pub struct Group {
     owner: u64,
@@ -282,7 +291,7 @@ impl Group {
 
     /// INSTALL_COMMIT of receipt `number`, which must be complete: the package waits for
     /// the end of the group. `INVALID` for another number or a receipt that is not complete.
-    pub fn commit(&mut self, number: u32) -> Result<Staged, u32> {
+    pub fn commit(&mut self, number: u32) -> Result<Committed, u32> {
         let Some((receipt, staged)) = self.open.take_if(|(r, _)| r.number == number) else {
             return Err(proto_pkg::INVALID);
         };
@@ -290,13 +299,19 @@ impl Group {
             self.open = Some((receipt, staged));
             return Err(proto_pkg::INVALID);
         }
+        // The digests are taken from the receipt that is whole.
+        let (covered, whole) = receipt.digests().ok_or(proto_pkg::INVALID)?;
         let place = self
             .staged
             .iter_mut()
             .find(|s| s.is_none())
             .expect("a group below its limit has a place");
         *place = Some(staged);
-        Ok(staged)
+        Ok(Committed {
+            staged,
+            covered,
+            whole,
+        })
     }
 
     /// The table of the state the group makes: `accepted` and one generation more, the

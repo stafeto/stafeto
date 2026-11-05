@@ -387,7 +387,7 @@ fn a_package_that_is_not_in_the_world_is_a_dependency() {
     r.set_fed(bytes.len() as u64);
     r.absorb(&bytes);
     r.wrote(2);
-    let staged = g.commit(1).unwrap();
+    let staged = g.commit(1).unwrap().staged;
     assert_eq!(staged.record.flags, DEPENDENCY);
 }
 
