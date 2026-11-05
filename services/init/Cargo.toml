@@ -119,6 +119,9 @@ table-bench-vz = []
 # The same image with the shell's processes on CPUs 1 to 3, away from the
 # network service on CPU 0 (the measurement T5 of the network service).
 table-bench-pinned-vz = []
+# The same image with every program on CPU 0, where the network service runs
+# (the measurement of the cost of a call on another CPU).
+table-bench-cpu0-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.

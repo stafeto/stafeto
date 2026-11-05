@@ -1090,6 +1090,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-bench-vz") as usize
     + cfg!(feature = "table-bench-pinned-vz") as usize
+    + cfg!(feature = "table-bench-cpu0-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1161,6 +1162,7 @@ const _: () = assert!(
     feature = "table-net-vz2",
     feature = "table-bench-vz",
     feature = "table-bench-pinned-vz",
+    feature = "table-bench-cpu0-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1265,6 +1267,8 @@ pub const TABLE: &[Record] = net::NET_VZ2_TABLE;
 pub const TABLE: &[Record] = bench::BENCH_VZ_TABLE;
 #[cfg(feature = "table-bench-pinned-vz")]
 pub const TABLE: &[Record] = bench::BENCH_PINNED_VZ_TABLE;
+#[cfg(feature = "table-bench-cpu0-vz")]
+pub const TABLE: &[Record] = bench::BENCH_CPU0_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -2057,6 +2061,7 @@ mod tests {
             net::NET_VZ2_TABLE,
             bench::BENCH_VZ_TABLE,
             bench::BENCH_PINNED_VZ_TABLE,
+            bench::BENCH_CPU0_VZ_TABLE,
             net::NET_PROBE_TWO_TABLE,
             net::NET_TWO_TABLE,
             doom::TABLE,
@@ -2351,6 +2356,25 @@ mod tests {
             } else {
                 assert_eq!(pinned, plain, "{}", pinned.name);
             }
+        }
+    }
+
+    /// The table of the image with every program on CPU 0 differs from the
+    /// image of the measurement in the masks alone: all on the boot CPU but
+    /// the process service, which keeps every CPU to place its processes.
+    #[test]
+    fn the_cpu0_bench_image_puts_every_program_but_the_process_service_on_cpu_0() {
+        assert_eq!(
+            order_of(bench::BENCH_CPU0_VZ_TABLE),
+            order_of(bench::BENCH_VZ_TABLE)
+        );
+        for (one, plain) in bench::BENCH_CPU0_VZ_TABLE.iter().zip(bench::BENCH_VZ_TABLE) {
+            let cpus = if plain.cpus == ALL_CPUS {
+                ALL_CPUS
+            } else {
+                0b0001
+            };
+            assert_eq!(*one, Record { cpus, ..*plain }, "{}", one.name);
         }
     }
 
