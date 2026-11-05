@@ -654,7 +654,7 @@ checked, the layers attached, also when the store is damaged or absent), and the
 and the full image waits for it 30 s: the shell starts after the layers are in place, in 0.2 s of the
 boot under QEMU's emulation. The base table is 14 of 16 records with `blk` and `pkgd`; the 16,896
 pages of the service come out of the pool of the process service, which has fourteen quotas of a
-command (init has 17,506 pages free on the base image after the services started, 137,540 on the
+command (init has 17,503 pages free on the base image after the services started, 137,537 on the
 full image on 1 GiB). `cargo xtask init-wait` runs the three ways to start a waiting record: after
 READY, at the deadline (a service built never to say it), and when the service ends.
 
