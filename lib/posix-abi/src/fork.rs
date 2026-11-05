@@ -948,6 +948,7 @@ fn child() -> Result<(), &'static str> {
     unsafe {
         crate::allocation::after_fork(process, map).map_err(|_| "its memory map")?;
         crate::threads::after_fork(thread).map_err(|_| "its thread")?;
+        crate::cpu::after_fork();
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {

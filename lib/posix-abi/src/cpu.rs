@@ -16,9 +16,26 @@
 //! time. CPU-time clocks and `clock` count both.
 
 use crate::constants::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use proto_process::{Method, account_op};
 use rt::handle::{Handle, Thread};
 use rt::sys;
+
+/// The process time (ticks) and the part of it spent in the kernel that
+/// the process had when `after_fork` ran: the loader's work of building
+/// the child is behind it, and the child's own account starts from here.
+static BASE_TICKS: AtomicU64 = AtomicU64::new(0);
+static BASE_KERNEL: AtomicU64 = AtomicU64::new(0);
+
+/// The account of the child of a fork starts at zero (XSH fork, times,
+/// clock): the process's time so far, the work of its loader, is taken as
+/// the start. Called in the child, before it runs the program.
+pub fn after_fork() {
+    if let Ok((ticks, kernel)) = sys::process_times(crate::allocation::process()) {
+        BASE_TICKS.store(ticks, Ordering::Relaxed);
+        BASE_KERNEL.store(kernel.min(ticks), Ordering::Relaxed);
+    }
+}
 
 /// The id of the clock of thread `id` (the number the layer gives it):
 /// pthread_getcpuclockid. A CPU-time clock of another process is not given.
@@ -52,7 +69,7 @@ fn ns(ticks: u64) -> u64 {
 /// The time the calling process's threads have run, ns.
 pub fn process_ns() -> Result<u64, i32> {
     sys::process_time(crate::allocation::process())
-        .map(ns)
+        .map(|ticks| ns(ticks.saturating_sub(BASE_TICKS.load(Ordering::Relaxed))))
         .map_err(|_| EIO)
 }
 
@@ -78,7 +95,12 @@ pub fn thread_ns_of(id: u64) -> Result<u64, i32> {
 /// The user and the system time of the calling process, ns.
 pub fn process_split_ns() -> Result<(u64, u64), i32> {
     sys::process_times(crate::allocation::process())
-        .map(split)
+        .map(|(ticks, kernel)| {
+            split((
+                ticks.saturating_sub(BASE_TICKS.load(Ordering::Relaxed)),
+                kernel.saturating_sub(BASE_KERNEL.load(Ordering::Relaxed)),
+            ))
+        })
         .map_err(|_| EIO)
 }
 
