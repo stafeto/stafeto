@@ -152,7 +152,14 @@ pub fn search(word: &str, available: &[Available], installed: &[Installed]) -> V
 
 /// What `pkg info` shows.
 pub struct Info<'a> {
-    pub meta: &'a pkgfmt::meta::Meta<'a>,
+    pub name: &'a str,
+    /// `<version>-<release>`, whole.
+    pub version: &'a str,
+    pub provides: &'a [String],
+    pub depends: &'a [String],
+    pub needs: &'a [String],
+    pub license: &'a str,
+    pub summary: &'a str,
     pub repository: &'a str,
     /// `installed (by request)`, `installed (dependency)`, `part of the image` or `available`.
     pub state: &'a str,
@@ -164,26 +171,22 @@ pub struct Info<'a> {
     pub source: &'a str,
 }
 
-fn list_text(value: &str) -> String {
-    pkgfmt::meta::list(value).collect::<Vec<_>>().join(" ")
-}
-
 /// The lines of `pkg info`.
 pub fn info(i: &Info<'_>) -> Vec<String> {
-    let m = i.meta;
     let field = |key: &str, value: &str| format!("{key:<12}{value}");
+    let words = |list: &[String]| list.join(" ");
     let sha = match i.sha256.get(..12) {
         Some(head) if i.sha256.len() > 12 => format!("{head}\u{2026}"),
         _ => i.sha256.to_string(),
     };
     let mut out = alloc::vec![
-        field("name", m.name),
-        field("version", &format!("{}-{}", m.version, m.release)),
-        field("provides", &list_text(m.provides)),
-        field("depends", &list_text(m.depends)),
-        field("needs", &list_text(m.needs)),
-        field("license", m.license),
-        field("summary", m.summary),
+        field("name", i.name),
+        field("version", i.version),
+        field("provides", &words(i.provides)),
+        field("depends", &words(i.depends)),
+        field("needs", &words(i.needs)),
+        field("license", i.license),
+        field("summary", i.summary),
         field("repository", i.repository),
         field("state", i.state),
         field("size", &i.size.to_string()),
@@ -199,6 +202,28 @@ pub fn info(i: &Info<'_>) -> Vec<String> {
     out.push("source:".into());
     out.extend(i.source.lines().map(String::from));
     out
+}
+
+/// The last line of an installation: `installed doomgeneric e257a095-1 (doom),
+/// freedoom 0.13.0-1 (dependency)`. `items` are the packages in the order they
+/// were received, with the mark of the requested one; `request` is the name the
+/// owner typed, which is named when it is not the package's own.
+pub fn installed_line(request: &str, items: &[(&str, &str, bool)]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for &(name, version, world) in items.iter().rev() {
+        let mark = match (world, request == name) {
+            (true, true) => String::new(),
+            (true, false) => format!(" ({request})"),
+            (false, _) => " (dependency)".to_string(),
+        };
+        let part = format!("{name} {}{mark}", short(version));
+        if world {
+            parts.insert(0, part);
+        } else {
+            parts.push(part);
+        }
+    }
+    format!("installed {}", parts.join(", "))
 }
 
 /// What `pkg check` knows of the store.
@@ -413,30 +438,19 @@ mod tests {
 
     #[test]
     fn info_lines() {
-        let meta = pkgfmt::meta::Meta {
-            name: "doomgeneric",
-            version: "e257a09527062bfb986b6e5e0780839b6cbd5b71",
-            release: "1",
-            arch: "aarch64",
-            series: "0.3",
-            license: "GPL-2.0-or-later",
-            depends: "freedoom",
-            provides: "doom",
-            needs: "display input",
-            summary: "Doom engine (Doomgeneric)",
-            url: "https://example.org/x.tar.gz",
-            sha256: &"0".repeat(64),
-            recipe: &"1".repeat(64),
-            commit: &"2".repeat(40),
-            relibc: "-",
-            size: 1,
-        };
         let notices = vec![
             "/usr/share/licenses/doomgeneric/LICENSE".to_string(),
             "/usr/share/licenses/doomgeneric/SOURCE".to_string(),
         ];
+        let list = |text: &str| -> Vec<String> { text.split(' ').map(String::from).collect() };
         let lines = info(&Info {
-            meta: &meta,
+            name: "doomgeneric",
+            version: "e257a09527062bfb986b6e5e0780839b6cbd5b71-1",
+            provides: &list("doom"),
+            depends: &list("freedoom"),
+            needs: &list("display input"),
+            license: "GPL-2.0-or-later",
+            summary: "Doom engine (Doomgeneric)",
             repository: "stafeto",
             state: "installed (by request)",
             size: 495_616,
@@ -464,6 +478,45 @@ mod tests {
             "            /usr/share/licenses/doomgeneric/SOURCE"
         );
         assert_eq!(&lines[13..], ["source:", "line one", "line two"]);
+        // An available package has no notices yet.
+        let none = info(&Info {
+            name: "x",
+            version: "1-1",
+            provides: &[],
+            depends: &[],
+            needs: &[],
+            license: "MIT",
+            summary: "s",
+            repository: "stafeto",
+            state: "available",
+            size: 1,
+            sha256: "abcd",
+            notices: &[],
+            source: "src/x.tar.xz",
+        });
+        assert!(none.iter().all(|l| !l.starts_with("notices")));
+        assert_eq!(none[2], "provides    ");
+        assert_eq!(&none[11..], ["source:", "src/x.tar.xz"]);
+    }
+
+    #[test]
+    fn the_last_line_names_the_requested_name_and_the_dependencies() {
+        let items = [
+            ("freedoom", "0.13.0-1", false),
+            (
+                "doomgeneric",
+                "e257a09527062bfb986b6e5e0780839b6cbd5b71-1",
+                true,
+            ),
+        ];
+        assert_eq!(
+            installed_line("doom", &items),
+            "installed doomgeneric e257a095-1 (doom), freedoom 0.13.0-1 (dependency)"
+        );
+        assert_eq!(
+            installed_line("hello", &[("hello", "1.0-1", true)]),
+            "installed hello 1.0-1"
+        );
     }
 
     #[test]
