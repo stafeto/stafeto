@@ -3,12 +3,16 @@
 
 //! The steps that touch the disk, over a `Device` (pk3-design R6, R7): the
 //! choice of the superblock at a start, the layout of an empty store, and
-//! the two writes that make a new table the store's state: the table into
-//! a free extent with a flush (F2), then a superblock with a generation
-//! one higher into the copy with the lower one, with a flush (F3). The
-//! flush before the table (F1) belongs to whoever wrote the data. The
-//! device behind the trait is the disk service for the service, a file for
-//! the host's writer and a model with a crash for the tests.
+//! the transactions that make a new table the store's state. A transaction
+//! is the flush of the data (F1), the table into a free extent with a flush
+//! (F2), the layers attached or detached, and a superblock with a generation
+//! one higher into the copy with the lower one, with a flush (F3); the order
+//! of an installation, a removal, a new settings layer, a serial and a list of
+//! revocations is `transact`. The device behind the trait is the disk service
+//! for the service, a file for the host's writer and a model with a crash for
+//! the tests; the same trait carries the calls to the file service (`attach`,
+//! `detach`) and the places the crash tests stop at (`point`), so a model sees
+//! the whole order.
 
 use crate::store::{
     BLOCK, Extent, RECORDS, SUPERS, Superblock, TABLE_BLOCKS, TABLE_BYTES, Table, find_free,
@@ -19,13 +23,115 @@ use crate::store::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Failed;
 
+/// The places of the plan a crash test stops at (`store-crash`, pk3-design R17),
+/// in the order of the table of the note; the number is the one the build for the
+/// crash gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Point {
+    /// An object and an extent are taken, nothing is written.
+    Begin = 1,
+    /// The first write of the data of a package was accepted.
+    Data,
+    /// The data are flushed (F1).
+    DataFlushed,
+    /// The first of the five blocks of the table was accepted.
+    TablePart,
+    /// The table is flushed (F2) in an installation.
+    TableFlushed,
+    /// The layers are attached, the superblock is not written.
+    Attached,
+    /// The write of the superblock reaches the medium in its first sector only.
+    SuperTorn,
+    /// The superblock was accepted, not flushed.
+    SuperWritten,
+    /// The superblock is flushed (F3) in an installation.
+    Committed,
+    /// The table is flushed in a removal.
+    RemoveTable,
+    /// The superblock is flushed in a removal, the layers are not detached.
+    RemoveCommitted,
+    /// The table is flushed in a change of the settings.
+    SettingsTable,
+    /// A new store has its table, not its superblock.
+    FormatTable,
+}
+
+impl Point {
+    pub const ALL: [Point; 13] = [
+        Point::Begin,
+        Point::Data,
+        Point::DataFlushed,
+        Point::TablePart,
+        Point::TableFlushed,
+        Point::Attached,
+        Point::SuperTorn,
+        Point::SuperWritten,
+        Point::Committed,
+        Point::RemoveTable,
+        Point::RemoveCommitted,
+        Point::SettingsTable,
+        Point::FormatTable,
+    ];
+
+    pub const fn number(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Point::Begin => "begin",
+            Point::Data => "data",
+            Point::DataFlushed => "data-flushed",
+            Point::TablePart => "table-part",
+            Point::TableFlushed => "table-flushed",
+            Point::Attached => "attached",
+            Point::SuperTorn => "super-torn",
+            Point::SuperWritten => "super-written",
+            Point::Committed => "committed",
+            Point::RemoveTable => "remove-table",
+            Point::RemoveCommitted => "remove-committed",
+            Point::SettingsTable => "settings-table",
+            Point::FormatTable => "format-table",
+        }
+    }
+}
+
 /// The disk as the store needs it: blocks of 4 KiB, written, read and
 /// flushed. A write that returned is on the medium only after a flush.
+///
+/// The other methods are the calls of a plan that are not the disk's; each has
+/// a default for a device that has no file service to call and no crash to
+/// place: the writer of the host.
 pub trait Device {
     fn blocks(&self) -> u64;
     fn read(&mut self, block: u64, out: &mut [u8; BLOCK]) -> Result<(), Failed>;
     fn write(&mut self, block: u64, data: &[u8; BLOCK]) -> Result<(), Failed>;
     fn flush(&mut self) -> Result<(), Failed>;
+
+    /// Attaches the package or the settings layer of table place `slot` to
+    /// the file service; the code of the refusal (`proto_pkg`) when it
+    /// refuses. The tree is as before when it does.
+    fn attach(&mut self, slot: usize) -> Result<(), u32> {
+        let _ = slot;
+        Ok(())
+    }
+
+    /// Detaches the layer of `slot`.
+    fn detach(&mut self, slot: usize) {
+        let _ = slot;
+    }
+
+    /// The plan is at `point`: the build for the crash tests stops here when it is
+    /// its point.
+    fn point(&mut self, point: Point) {
+        let _ = point;
+    }
+
+    /// The write of the superblock `data` to `block` is about to come: the
+    /// build for the crash tests writes the first sector of it alone and stops.
+    fn tear(&mut self, block: u64, data: &[u8; BLOCK]) {
+        let _ = (block, data);
+    }
 }
 
 /// The store a start found.
@@ -126,6 +232,7 @@ pub fn open(dev: &mut impl Device, table: &mut Table) -> Result<Start, Failed> {
 pub fn format(dev: &mut impl Device, table: &mut Table) -> Result<Opened, Failed> {
     table.init(1);
     write_table(dev, table, SUPERS)?;
+    dev.point(Point::FormatTable);
     let sb = superblock_of(dev.blocks(), table, SUPERS);
     write_super(dev, 0, &sb)?;
     Ok(Opened {
@@ -149,6 +256,9 @@ pub fn superblock_of(blocks: u64, table: &Table, first: u64) -> Superblock {
 pub fn write_table(dev: &mut impl Device, table: &Table, first: u64) -> Result<(), Failed> {
     for (i, chunk) in table.0.as_chunks::<BLOCK>().0.iter().enumerate() {
         dev.write(first + i as u64, chunk)?;
+        if i == 0 {
+            dev.point(Point::TablePart);
+        }
     }
     dev.flush()
 }
@@ -156,7 +266,10 @@ pub fn write_table(dev: &mut impl Device, table: &Table, first: u64) -> Result<(
 /// The superblock into `copy`, then a flush (F3): the table it names is the
 /// store's state once this returns.
 pub fn write_super(dev: &mut impl Device, copy: u8, sb: &Superblock) -> Result<(), Failed> {
-    dev.write(u64::from(copy), &sb.encode())?;
+    let bytes = sb.encode();
+    dev.tear(u64::from(copy), &bytes);
+    dev.write(u64::from(copy), &bytes)?;
+    dev.point(Point::SuperWritten);
     dev.flush()
 }
 
@@ -176,6 +289,124 @@ pub fn publish(
     let sb = superblock_of(dev.blocks(), next, first);
     let copy = 1 - opened.copy;
     write_super(dev, copy, &sb)?;
+    Ok(Opened {
+        superblock: sb,
+        copy,
+    })
+}
+
+/// What a transaction changes besides the table (pk3-design R7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// One or more packages in: the layers of the replaced go and the new ones
+    /// attach before the superblock, so a refusal of the file service leaves the
+    /// old state with no write to undo.
+    Install,
+    /// Packages out: the layers detach after the superblock, since their bytes
+    /// are all in memory and the disk no longer matters to them.
+    Remove,
+    /// A new settings layer: as an installation, the old layer replaced.
+    Settings,
+    /// A serial of a repository: the table alone.
+    Serial,
+    /// A new list of revocations: the layers of the packages it revokes detach after the
+    /// superblock.
+    Revoked,
+}
+
+/// The layers of a transaction, by the place of the table: `detach` the
+/// packages that go (or the settings layer that a new one replaces), `attach` the
+/// ones that come. The new settings layer has the place `store::SETTINGS_NEW`, so that it
+/// differs from the old one until the table is the state.
+#[derive(Clone, Copy, Debug)]
+pub struct Change<'a> {
+    pub kind: Kind,
+    pub detach: &'a [usize],
+    pub attach: &'a [usize],
+}
+
+/// Why a transaction did not become the store's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The disk failed: the state of the medium is the old or the new one, whole.
+    Io,
+    /// The file service refused a layer (the code of `proto_pkg`); the state is the old
+    /// one and the layers are as they were.
+    Attach(u32),
+}
+
+impl From<Failed> for Refused {
+    fn from(_: Failed) -> Refused {
+        Refused::Io
+    }
+}
+
+/// The layers as they were: those attached by this transaction go, those it
+/// detached come back.
+fn undo(dev: &mut impl Device, change: &Change<'_>, attached: usize) {
+    for &slot in change.attach[..attached].iter().rev() {
+        dev.detach(slot);
+    }
+    for &slot in change.detach {
+        // A layer that cannot come back leaves a package missing from the tree
+        // until the next start, which reads the old state: nothing else to do.
+        let _ = dev.attach(slot);
+    }
+}
+
+/// The transaction `change` from the state `opened` (whose table is `accepted`) to
+/// `next` (already the next generation): F1, the table into a free extent and F2,
+/// then the layers and the superblock in the order of the kind (`Kind`), F3. The data
+/// the table names are written by the caller before. `Err(Io)` leaves the store with
+/// the old state or the new one, whole; either error leaves the layers as they were,
+/// except that after `Io` from the last flush the new state may be the medium's.
+pub fn transact(
+    dev: &mut impl Device,
+    opened: &Opened,
+    accepted: &Table,
+    next: &Table,
+    change: &Change<'_>,
+) -> Result<Opened, Refused> {
+    dev.flush()?;
+    dev.point(Point::DataFlushed);
+    let first = free_table_extent(accepted, next, opened).ok_or(Refused::Io)?;
+    write_table(dev, next, first)?;
+    match change.kind {
+        Kind::Install => dev.point(Point::TableFlushed),
+        Kind::Remove => dev.point(Point::RemoveTable),
+        Kind::Settings => dev.point(Point::SettingsTable),
+        Kind::Serial | Kind::Revoked => {}
+    }
+    let attach_first = matches!(change.kind, Kind::Install | Kind::Settings);
+    if attach_first {
+        for &slot in change.detach {
+            dev.detach(slot);
+        }
+        for (done, &slot) in change.attach.iter().enumerate() {
+            if let Err(code) = dev.attach(slot) {
+                undo(dev, change, done);
+                return Err(Refused::Attach(code));
+            }
+        }
+        dev.point(Point::Attached);
+    }
+    let sb = superblock_of(dev.blocks(), next, first);
+    let copy = 1 - opened.copy;
+    if let Err(failed) = write_super(dev, copy, &sb) {
+        if attach_first {
+            undo(dev, change, change.attach.len());
+        }
+        return Err(failed.into());
+    }
+    dev.point(match change.kind {
+        Kind::Remove => Point::RemoveCommitted,
+        _ => Point::Committed,
+    });
+    if !attach_first {
+        for &slot in change.detach {
+            dev.detach(slot);
+        }
+    }
     Ok(Opened {
         superblock: sb,
         copy,

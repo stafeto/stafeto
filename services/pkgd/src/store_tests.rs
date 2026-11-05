@@ -147,6 +147,37 @@ fn a_table_round_trips_and_each_rule_is_checked() {
 }
 
 /// A disk with `table` as its state, through the writes the service makes.
+#[test]
+fn a_table_names_a_package_once_a_repository_it_has_and_a_version_that_reads() {
+    let a = record(10, 3, "hello");
+    // The same name twice, in two places.
+    let twice = table_with(&[(0, a), (4, record(20, 1, "hello"))]);
+    assert_eq!(twice.check(7, DISK, 2), Err(TableError::Record(4)));
+    // A repository place that is empty, and one that is not.
+    let mut t = table_with(&[(0, Record { repo: 3, ..a })]);
+    assert_eq!(t.check(7, DISK, 2), Err(TableError::Record(0)));
+    t.set_repo(3, b"games", 1);
+    assert_eq!(t.check(7, DISK, 2), Ok(()));
+    // A version that is empty, has a space or a control byte, or has bytes after its length.
+    for version in [&b""[..], b"1 0", b"1\x01", b"1.0"] {
+        let mut field = [0u8; 64];
+        field[0] = version.len() as u8;
+        field[1..=version.len()].copy_from_slice(version);
+        if version == b"1.0" {
+            field[10] = 1;
+        }
+        let r = Record {
+            version: field,
+            ..a
+        };
+        assert_eq!(
+            table_with(&[(0, r)]).check(7, DISK, 2),
+            Err(TableError::Record(0)),
+            "{version:?}"
+        );
+    }
+}
+
 fn disk_with(table: &mut Table, generation: u64, copy: u8, first: u64) -> ModelDisk {
     let mut disk = ModelDisk::new(DISK);
     table.set_generation(generation);

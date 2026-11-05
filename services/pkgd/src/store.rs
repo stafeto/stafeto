@@ -21,6 +21,9 @@ pub const PACKAGES: usize = 64;
 pub const SETTINGS_SLOT: usize = 64;
 pub const REVOKED_SLOT: usize = 65;
 pub const RECORDS: usize = 66;
+/// The place of the layer of a new settings blob until its table is the state;
+/// no record has it.
+pub const SETTINGS_NEW: usize = RECORDS;
 pub const REPOS: usize = 16;
 const HEADER: usize = 64;
 const RECORD_SIZE: usize = 256;
@@ -229,6 +232,14 @@ pub fn to_field(text: &[u8]) -> Option<[u8; 64]> {
     Some(f)
 }
 
+/// A version field: a length of 1 to 63, the visible ASCII bytes, zeros after.
+fn version_ok(field: &[u8; 64]) -> bool {
+    let len = usize::from(field[0]);
+    (1..=63).contains(&len)
+        && field[1..=len].iter().all(|b| (0x21..0x7f).contains(b))
+        && field[1 + len..].iter().all(|&b| b == 0)
+}
+
 /// Why a table is not good.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableError {
@@ -343,8 +354,20 @@ impl Table {
                 continue;
             }
             let whole = r.length.div_ceil(BLOCK as u64);
-            let named = i >= PACKAGES || Name::from_field(&r.name).is_ok();
-            let repo_ok = r.repo == NO_REPO || usize::from(r.repo) < REPOS && i < PACKAGES;
+            let named = i >= PACKAGES
+                || Name::from_field(&r.name).is_ok() && version_ok(&r.version)
+                    // A name is in the table once: the list and the layers would
+                    // show the first of two, and the second would not attach.
+                    && (0..i).all(|j| {
+                        let other = self.record(j);
+                        other.kind != PACKAGE || other.name_bytes() != r.name_bytes()
+                    });
+            // A package names a repository the table has.
+            let repo_ok = if i >= PACKAGES {
+                r.repo == NO_REPO
+            } else {
+                usize::from(r.repo) < REPOS && self.repo(usize::from(r.repo)).is_some()
+            };
             if r.kind != slot_kind
                 || r.flags & !(WORLD | DEPENDENCY | REVOKED) != 0
                 || r.length == 0

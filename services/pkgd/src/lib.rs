@@ -30,6 +30,8 @@ mod store_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
+mod tx_tests;
+#[cfg(test)]
 mod verify_tests;
 
 mod config {

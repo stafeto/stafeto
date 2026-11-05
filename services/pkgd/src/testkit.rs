@@ -4,13 +4,13 @@
 //! What the tests of the library share: development keys, signed packages and
 //! a model of the disk that loses what was not flushed.
 
-use crate::commit::{Device, Failed};
+use crate::commit::{Device, Failed, Point};
 use crate::store::BLOCK;
 use pkgfmt::cert::PURPOSE_PACKAGES;
 use pkgfmt::container::write::{Content, Item, container, sign};
 use pkgfmt::meta::Meta;
 use pkgfmt::{Certificate, Key, Name, sig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROOT_SEED: [u8; 32] = [1; 32];
 pub const RELEASE_SEED: [u8; 32] = [2; 32];
@@ -136,6 +136,10 @@ pub struct ModelDisk {
     pub log: Vec<String>,
     /// Blocks whose read fails.
     pub bad: Vec<u64>,
+    /// The layers the file service holds, by place of the table.
+    pub attached: BTreeSet<usize>,
+    /// The places whose attach the file service refuses.
+    pub refuse: Vec<usize>,
 }
 
 /// What a power failure does to the writes that were not flushed.
@@ -160,6 +164,8 @@ impl ModelDisk {
             limit: None,
             log: Vec::new(),
             bad: Vec::new(),
+            attached: BTreeSet::new(),
+            refuse: Vec::new(),
         }
     }
 
@@ -202,6 +208,8 @@ impl ModelDisk {
             limit: None,
             log: Vec::new(),
             bad: Vec::new(),
+            attached: self.attached.clone(),
+            refuse: Vec::new(),
         }
     }
 
@@ -245,6 +253,25 @@ impl Device for ModelDisk {
             self.kept.insert(block, data);
         }
         Ok(())
+    }
+
+    fn attach(&mut self, slot: usize) -> Result<(), u32> {
+        if self.refuse.contains(&slot) {
+            self.log.push(format!("refused {slot}"));
+            return Err(proto_pkg::CONFLICT);
+        }
+        self.log.push(format!("attach {slot}"));
+        self.attached.insert(slot);
+        Ok(())
+    }
+
+    fn detach(&mut self, slot: usize) {
+        self.log.push(format!("detach {slot}"));
+        self.attached.remove(&slot);
+    }
+
+    fn point(&mut self, point: Point) {
+        self.log.push(format!("point {}", point.name()));
     }
 }
 
