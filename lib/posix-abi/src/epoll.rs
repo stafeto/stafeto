@@ -972,9 +972,23 @@ fn pwait_fast(
     mask: Option<u64>,
 ) -> Result<usize, i32> {
     let mut consumed = EpollReady::EMPTY;
+    // The events a round put into `out`: the boundary turns a result into
+    // EINTR when a handler ran during the call, however late, but events
+    // taken from the kqueue (an edge, a oneshot) are not given by the stack
+    // again, so a call that holds some returns them, as Linux does; the
+    // handler has run, and the signal is not lost.
+    let mut held = 0;
     let result = wait::boundary(timeout, mask, |until, handled| {
-        fast_round(id, kq, out, until, handled, &mut consumed)
+        let round = fast_round(id, kq, out, until, handled, &mut consumed);
+        if let Ok(n) = round {
+            held = n;
+        }
+        round
     });
+    let result = match result {
+        Err(EINTR) if held > 0 => Ok(held),
+        other => other,
+    };
     if result.is_err() && consumed.len != 0 {
         restore(id, &consumed);
     }
