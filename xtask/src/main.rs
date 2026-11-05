@@ -40,6 +40,7 @@ mod owner_lifetime;
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
 
+mod base_image;
 mod bash_dialog;
 mod blk_probe;
 mod ci;
@@ -1654,6 +1655,9 @@ commands:
   dist       build the release files of this version in target/dist (docs/release.md)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  image base|full [run]
+            build the base image (the base packages as layers) or the full
+            image (all packages), and with `run` boot it in QEMU
   image-listing [--out DIR] [image...]
             build the images that hold packages and write the listing of the
             tree each shows (path, mode, owner, SHA-256), for comparing
@@ -2036,6 +2040,7 @@ fn main() {
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
+        Some("image") => base_image::command(&args[1..]),
         Some("image-listing") => image_listing::command(&args[1..]),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),

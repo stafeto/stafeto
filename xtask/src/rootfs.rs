@@ -1507,6 +1507,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ash-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
+    "boot-base.img",
+    "boot-full.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1590,6 +1592,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        // The base image has no package that makes /usr and /usr/share,
+        // which the time zones stand in.
+        "boot-base.img" | "boot-full.img" => {
+            let mut files = dialog(name);
+            for d in ["/usr", "/usr/share"] {
+                if !files.iter().any(|f| f.path == d) {
+                    files.push(dir(d));
+                }
+            }
+            files
+        }
         "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
@@ -2298,6 +2311,7 @@ mod tests {
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
+                "boot-base.img" | "boot-full.img" => crate::base_image::programs(image),
                 "boot-net.img" => crate::net::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),
