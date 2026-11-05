@@ -23,13 +23,15 @@ use crate::fast_events;
 pub use crate::fast_events::{
     FAST_BASE, FAST_MAX, FAST_TICKETS, Number, above_table, classify, is_fast,
 };
+use crate::fast_tickets::{self, Tickets};
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use posix_sync::LayerLock;
 
 const ENOTTY: i32 = 25;
+const ENOTCONN: i32 = 107;
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
 const SOCK_NONBLOCK: i32 = 0o4000;
@@ -218,23 +220,51 @@ pub fn up() -> bool {
     STACK.load(Ordering::Acquire) == 2
 }
 
-/// Starts the stack once: the claim of the second device, then the
-/// table's `start`. Outside `FAST_LOCK` (the claim waits for the device).
-/// A refusal is final for the process, but a signal that ended the claim
-/// leaves the start to the next call.
+/// The channel of the thread that starts the stack: a handler that runs on
+/// that thread while it waits and calls a fast socket meets the state
+/// "starting" and must not wait for itself.
+static STARTER: AtomicU64 = AtomicU64::new(0);
+
+fn own_channel() -> u64 {
+    crate::threads::own_block().channel.load(Ordering::Relaxed)
+}
+
+/// Starts the stack once: the claim of the second device, the table's
+/// `start`, then the sockets of the stack for the tickets (all at once, so
+/// that no SYN for the second listener finds its port closed while the
+/// program adds the first). Outside `FAST_LOCK` (the claim waits for the
+/// device); the pause of the claim is not ended by a signal, since the
+/// calls that start the stack (`epoll_ctl`, `accept`, `connect`) have no
+/// EINTR to give. A refusal is final for the process. A thread that finds
+/// the start going waits for it; a handler on the starting thread gets
+/// EAGAIN at once.
 pub fn ensure_stack() -> Result<(), i32> {
     let t = table().ok_or(EBADF)?;
     loop {
-        match STACK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        // The exchange and the mark of the starting thread are one step for
+        // a handler of this thread: the entries of signals wait in a
+        // critical section, so a handler never sees "starting" with no mark.
+        posix_sync::enter();
+        let swapped = STACK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        if swapped.is_ok() {
+            STARTER.store(own_channel(), Ordering::Release);
+        }
+        posix_sync::leave();
+        match swapped {
             Ok(_) => break,
             Err(2) => return Ok(()),
             Err(3) => return Err(REFUSED.load(Ordering::Acquire)),
-            Err(_) => crate::threads::sleep::pause(1_000_000)?,
+            Err(_) => {
+                if STARTER.load(Ordering::Acquire) == own_channel() {
+                    return Err(EAGAIN);
+                }
+                let _ = crate::threads::sleep::pause(1_000_000);
+            }
         }
     }
     // SAFETY: a `FastClaim` is plain numbers.
     let mut claim: FastClaim = unsafe { core::mem::zeroed() };
-    let started = match fast::claim(&mut claim, 0) {
+    let started = match fast::claim_steady(&mut claim, 0) {
         // SAFETY: the table's start, with the claim it asked for.
         Ok(()) => match unsafe { (t.start)(&claim) } {
             r if r < 0 => Err(-r),
@@ -244,16 +274,17 @@ pub fn ensure_stack() -> Result<(), i32> {
     };
     match started {
         Ok(()) => {
-            STACK.store(2, Ordering::Release);
+            // The state turns to "up" inside the tickets' lock, after their
+            // sockets exist: a call on a ticket then finds a socket.
+            tickets(|tickets| {
+                make_sockets(t, tickets);
+                STACK.store(2, Ordering::Release);
+            });
             Ok(())
         }
         Err(errno) => {
-            if errno == EINTR {
-                STACK.store(0, Ordering::Release);
-            } else {
-                REFUSED.store(errno, Ordering::Release);
-                STACK.store(3, Ordering::Release);
-            }
+            REFUSED.store(errno, Ordering::Release);
+            STACK.store(3, Ordering::Release);
             Err(errno)
         }
     }
@@ -369,13 +400,157 @@ pub fn close_raw(n: c_int) {
 
 // ------------------------------------------------------------ the numbers
 
-/// The number of F-Stack behind a number of the program.
-fn number(fd: i32) -> Result<c_int, i32> {
+/// What a number of the program names now.
+enum Route {
+    /// The socket `n` of the stack.
+    Stack(c_int),
+    /// A ticket the stack has not made a socket for.
+    Ticket(usize),
+}
+
+struct TicketTable(UnsafeCell<Tickets>);
+// SAFETY: every access is under `TICKET_LOCK`.
+unsafe impl Sync for TicketTable {}
+static TICKETS: TicketTable = TicketTable(UnsafeCell::new(Tickets::new()));
+/// The lock of the tickets. The holder is in a critical section and sleeps
+/// nowhere; the start of the stack takes `FAST_LOCK` inside it (that order
+/// only).
+static TICKET_LOCK: LayerLock = LayerLock::new();
+
+fn tickets<R>(f: impl FnOnce(&mut Tickets) -> R) -> R {
+    let _guard = TICKET_LOCK.lock();
+    // SAFETY: the lock gives this access alone.
+    f(unsafe { &mut *TICKETS.0.get() })
+}
+
+/// Runs `f` on the tickets while the stack is not up, `None` once it is
+/// (the tickets then have sockets, and the call goes the way of the stack).
+fn on_ticket<R>(f: impl FnOnce(&mut Tickets) -> Result<R, i32>) -> Option<Result<R, i32>> {
+    tickets(|t| if up() { None } else { Some(f(t)) })
+}
+
+fn route(fd: i32) -> Result<Route, i32> {
     match classify(fd) {
-        Some(Number::Socket(n)) => Ok(n),
-        // The tickets of the listeners come with the processes that open
-        // them before the stack starts.
-        Some(Number::Ticket(_)) | None => Err(EBADF),
+        Some(Number::Socket(n)) => Ok(Route::Stack(n)),
+        Some(Number::Ticket(i)) if registered() => {
+            let i = i as usize;
+            let (used, socket, error) = tickets(|t| {
+                let slot = &t.slots[i];
+                (slot.used, slot.socket, slot.error)
+            });
+            if !used {
+                Err(EBADF)
+            } else if !up() {
+                Ok(Route::Ticket(i))
+            } else if socket >= 0 {
+                Ok(Route::Stack(socket))
+            } else if socket == fast_tickets::REFUSED {
+                Err(error)
+            } else {
+                Err(EBADF)
+            }
+        }
+        _ => Err(EBADF),
+    }
+}
+
+/// The socket of the stack behind a number that has one.
+fn number(fd: i32) -> Result<c_int, i32> {
+    match route(fd)? {
+        Route::Stack(n) => Ok(n),
+        Route::Ticket(_) => Err(ENOTCONN),
+    }
+}
+
+/// The socket of the stack behind a number, starting the stack when the
+/// number is a ticket: `accept`, `connect` and `epoll_ctl` do that.
+pub fn stack_of(fd: i32) -> Result<c_int, i32> {
+    loop {
+        match route(fd)? {
+            Route::Stack(n) => return Ok(n),
+            Route::Ticket(_) => ensure_stack()?,
+        }
+    }
+}
+
+/// A call that goes to the stack for a number of the stack and to the
+/// record for a ticket that the stack has not made a socket for.
+fn with_route<R>(
+    fd: i32,
+    mut stack: impl FnMut(c_int) -> Result<R, i32>,
+    mut ticket: impl FnMut(&mut Tickets, usize) -> Result<R, i32>,
+) -> Result<R, i32> {
+    loop {
+        match route(fd)? {
+            Route::Stack(n) => return stack(n),
+            Route::Ticket(i) => {
+                if let Some(result) = on_ticket(|t| ticket(t, i)) {
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+/// The sockets of the stack for the tickets, when the stack starts (the
+/// caller holds the lock of the tickets). A ticket whose socket cannot be made
+/// keeps the errno: the calls on its number answer with it.
+fn make_sockets(t: &FastTable, tickets: &mut Tickets) {
+    for i in 0..tickets.slots.len() {
+        if !tickets.slots[i].used {
+            continue;
+        }
+        let ticket = tickets.slots[i];
+        let _guard = FAST_LOCK.lock();
+        match make_socket(t, &ticket) {
+            Ok(n) => tickets.slots[i].socket = n,
+            Err(errno) => tickets.refuse(i, errno),
+        }
+    }
+}
+
+/// One socket of the stack from a ticket: the options the program set,
+/// non-blocking, the address, the backlog.
+fn make_socket(t: &FastTable, ticket: &fast_tickets::Ticket) -> Result<c_int, i32> {
+    // SAFETY: the table's functions; the buffers are this call's.
+    unsafe {
+        let n = (t.socket)(AF_INET, SOCK_STREAM, 0);
+        if n < 0 {
+            return Err(-n);
+        }
+        let failed = |why: c_int| {
+            (t.close)(n);
+            Err(-why)
+        };
+        if n >= FAST_MAX {
+            return failed(-EMFILE);
+        }
+        let mut on: c_int = 1;
+        let r = (t.ioctl)(n, FIONBIO, (&raw mut on).cast());
+        if r < 0 {
+            return failed(r);
+        }
+        for (&(level, name), value) in fast_tickets::OPTIONS.iter().zip(&ticket.options) {
+            if let Some(value) = value {
+                let r = (t.setsockopt)(n, level, name, (&raw const *value).cast(), 4);
+                if r < 0 {
+                    return failed(r);
+                }
+            }
+        }
+        if let Some(address) = &ticket.address {
+            let r = (t.bind)(n, address.as_ptr(), address.len() as u32);
+            if r < 0 {
+                return failed(r);
+            }
+        }
+        if let Some(backlog) = ticket.backlog {
+            let r = (t.listen)(n, backlog);
+            if r < 0 {
+                return failed(r);
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -406,7 +581,22 @@ pub fn socket(kind: i32, protocol: i32) -> Result<i32, i32> {
     if protocol != 0 && protocol != IPPROTO_TCP {
         return Err(EINVAL);
     }
-    ensure_stack()?;
+    let cloexec = kind & SOCK_CLOEXEC != 0;
+    let clofork = kind & SOCK_CLOFORK != 0;
+    // Before the stack runs the socket is a ticket (a process that opens its
+    // listeners and then forks has no stack in the parent).
+    let made = tickets(|tickets| match STACK.load(Ordering::Acquire) {
+        2 => None,
+        3 => Some(Err(REFUSED.load(Ordering::Acquire))),
+        _ => Some(
+            tickets
+                .open(cloexec, clofork)
+                .map(|i| FAST_BASE + FAST_MAX + i as i32),
+        ),
+    });
+    if let Some(made) = made {
+        return made;
+    }
     let n = count(|t| {
         // SAFETY: the table's functions.
         let n = unsafe { (t.socket)(AF_INET, SOCK_STREAM, 0) };
@@ -425,21 +615,33 @@ pub fn socket(kind: i32, protocol: i32) -> Result<i32, i32> {
 }
 
 pub fn bind(fd: i32, raw: &[u8]) -> Result<(), i32> {
-    let n = number(fd)?;
     let address = fast_events::check_inet(raw)?;
-    // SAFETY: the table's function; `address` is 16 readable bytes.
-    count(|t| unsafe { (t.bind)(n, address.as_ptr(), address.len() as u32) as isize }).map(drop)
+    with_route(
+        fd,
+        // SAFETY: the table's function; `address` is 16 readable bytes.
+        |n| {
+            count(|t| unsafe { (t.bind)(n, address.as_ptr(), address.len() as u32) as isize })
+                .map(drop)
+        },
+        |tickets, i| tickets.bind(i, address),
+    )
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
-    let n = number(fd)?;
-    // SAFETY: the table's function.
-    count(|t| unsafe { (t.listen)(n, backlog) as isize }).map(drop)
+    with_route(
+        fd,
+        // SAFETY: the table's function.
+        |n| count(|t| unsafe { (t.listen)(n, backlog) as isize }).map(drop),
+        |tickets, i| {
+            tickets.listen(i, backlog);
+            Ok(())
+        },
+    )
 }
 
 pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
-    let n = number(fd)?;
     let address = fast_events::check_inet(raw)?;
+    let n = stack_of(fd)?;
     // SAFETY: the table's function; `address` is 16 readable bytes.
     count(|t| unsafe { (t.connect)(n, address.as_ptr(), address.len() as u32) as isize }).map(drop)
 }
@@ -448,7 +650,7 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC | SOCK_CLOFORK) != 0 {
         return Err(EINVAL);
     }
-    let n = number(fd)?;
+    let n = stack_of(fd)?;
     // The stack writes the peer into the layer's own buffer; the program
     // gets as much of it as its length allows and learns the true length.
     let mut room = [0u8; fast_events::SOCKADDR_ROOM];
@@ -470,7 +672,14 @@ pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize
 }
 
 fn name(fd: i32, peer: bool, out: &mut [u8]) -> Result<usize, i32> {
-    let n = number(fd)?;
+    let n = match route(fd)? {
+        Route::Stack(n) => n,
+        Route::Ticket(i) if !peer => {
+            let address = tickets(|t| t.name(i));
+            return Ok(fast_events::cut_address(&address, address.len(), out));
+        }
+        Route::Ticket(_) => return Err(ENOTCONN),
+    };
     let mut room = [0u8; fast_events::SOCKADDR_ROOM];
     let mut len = room.len() as u32;
     let pointer = room.as_mut_ptr();
@@ -494,21 +703,44 @@ pub fn getpeername(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
 }
 
 pub fn getsockopt(fd: i32, level: i32, option: i32, out: &mut [u8]) -> Result<usize, i32> {
-    let n = number(fd)?;
-    let mut len = out.len() as u32;
-    let pointer = out.as_mut_ptr();
-    // SAFETY: the table's function; the buffer and its length are this call's.
-    count(|t| unsafe { (t.getsockopt)(n, level, option, pointer, &raw mut len) as isize })?;
-    Ok(len as usize)
+    loop {
+        match route(fd)? {
+            Route::Stack(n) => {
+                let mut len = out.len() as u32;
+                let pointer = out.as_mut_ptr();
+                // SAFETY: the table's function; the buffer and its length are this call's.
+                count(|t| unsafe {
+                    (t.getsockopt)(n, level, option, pointer, &raw mut len) as isize
+                })?;
+                return Ok(len as usize);
+            }
+            Route::Ticket(i) => {
+                let asked = on_ticket(|t| {
+                    let value = t.option(i, level, option)?;
+                    let room = out.first_chunk_mut::<4>().ok_or(EINVAL)?;
+                    *room = value.to_ne_bytes();
+                    Ok(4)
+                });
+                if let Some(result) = asked {
+                    return result;
+                }
+            }
+        }
+    }
 }
 
 pub fn setsockopt(fd: i32, level: i32, option: i32, value: &[u8]) -> Result<(), i32> {
-    let n = number(fd)?;
-    // SAFETY: the table's function; `value` is readable.
-    count(|t| unsafe {
-        (t.setsockopt)(n, level, option, value.as_ptr(), value.len() as u32) as isize
-    })
-    .map(drop)
+    with_route(
+        fd,
+        // SAFETY: the table's function; `value` is readable.
+        |n| {
+            count(|t| unsafe {
+                (t.setsockopt)(n, level, option, value.as_ptr(), value.len() as u32) as isize
+            })
+            .map(drop)
+        },
+        |tickets, i| tickets.set_option(i, level, option, value),
+    )
 }
 
 pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
@@ -523,6 +755,39 @@ pub fn sockatmark(fd: i32) -> Result<i32, i32> {
 }
 
 pub fn close(fd: i32) -> Result<(), i32> {
+    // A ticket closes whatever became of it: the entry is freed, and the
+    // socket of the stack, if the stack made one, closes (a ticket the stack
+    // refused has none, and its number still closes with 0, as any open
+    // number does).
+    if let Some(Number::Ticket(i)) = classify(fd) {
+        let i = i as usize;
+        if !registered() {
+            return Err(EBADF);
+        }
+        loop {
+            let (used, socket) = tickets(|t| (t.slots[i].used, t.slots[i].socket));
+            if !used {
+                return Err(EBADF);
+            }
+            if !up() {
+                if let Some(done) = on_ticket(|t| {
+                    t.close(i);
+                    Ok(())
+                }) {
+                    return done;
+                }
+                continue;
+            }
+            // SAFETY: the table's function.
+            let closed = if socket >= 0 {
+                count(|t| unsafe { (t.close)(socket) as isize }).map(drop)
+            } else {
+                Ok(())
+            };
+            tickets(|t| t.close(i));
+            return closed;
+        }
+    }
     let n = number(fd)?;
     // SAFETY: the table's function.
     count(|t| unsafe { (t.close)(n) as isize }).map(drop)
@@ -558,6 +823,37 @@ pub unsafe fn writev(fd: i32, iov: *const IoVec, count_: i32) -> Result<usize, i
     }
     // SAFETY: the table's function; the caller's vector.
     count(|t| unsafe { (t.writev)(n, iov, count_) })
+}
+
+/// The child of a `fork`: the tickets with `FD_CLOFORK` go.
+pub fn after_fork() {
+    if registered() {
+        tickets(|t| t.after_fork());
+        // The thread that was starting the stack is not in the child: a
+        // start the parent had begun is the child's to make.
+        let _ = STACK.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+        STARTER.store(0, Ordering::Release);
+    }
+}
+
+/// The service let go of the device and the program asked for the process
+/// to end then (`EXIT_ON_LOSS`): the process ends with 2, which the main
+/// process of nginx does not answer with a new worker.
+pub fn exit_if_lost() {
+    if lost() && table_flags() & EXIT_ON_LOSS != 0 {
+        rt::println!("fast: the network service let the device go; the process ends");
+        crate::exit(2);
+    }
+}
+
+/// One last step of the stack before the process ends, so that the FIN of
+/// the sockets just closed and the last segments leave: `close` puts them in
+/// the ring, and the doorbell rings at the end of a step. Nothing waits for
+/// the peer's answers. Not after the service let go.
+pub fn last_pass() {
+    if registered() && up() && !lost() {
+        let _ = pass();
+    }
 }
 
 /// The flags of a message that the glue translates; the rest are refused.
@@ -685,7 +981,22 @@ pub fn recv(
 /// descriptor flags are kept nowhere (a fast socket is closed by the
 /// process that made it); duplication is refused.
 pub fn fcntl(fd: i32, command: c_int, argument: u64) -> Result<c_int, i32> {
-    number(fd)?;
+    route(fd)?;
+    // A ticket keeps its descriptor flags, for the fork that closes some.
+    if let Some(Number::Ticket(i)) = classify(fd)
+        && (command == F_GETFD || command == F_SETFD)
+    {
+        return tickets(|t| {
+            let slot = &mut t.slots[i as usize];
+            if command == F_SETFD {
+                slot.cloexec = argument as c_int & FD_CLOEXEC != 0;
+                slot.clofork = argument as c_int & FD_CLOFORK != 0;
+                return Ok(0);
+            }
+            Ok(if slot.cloexec { FD_CLOEXEC } else { 0 }
+                | if slot.clofork { FD_CLOFORK } else { 0 })
+        });
+    }
     match command {
         F_GETFL => Ok(O_RDWR_ | O_NONBLOCK),
         F_SETFL => {
@@ -708,7 +1019,16 @@ pub fn fcntl(fd: i32, command: c_int, argument: u64) -> Result<c_int, i32> {
 /// `argument` is what `request` says: a readable int for FIONBIO, a
 /// writable one for FIONREAD.
 pub unsafe fn ioctl(fd: i32, request: u64, argument: *mut u8) -> Result<c_int, i32> {
-    let n = number(fd)?;
+    let n = match route(fd)? {
+        Route::Stack(n) => n,
+        // A ticket has no data to read.
+        Route::Ticket(_) if request == FIONREAD && !argument.is_null() => {
+            // SAFETY: FIONREAD's argument is a writable int.
+            unsafe { argument.cast::<c_int>().write(0) };
+            return Ok(0);
+        }
+        Route::Ticket(_) => 0,
+    };
     match request {
         FIONBIO => {
             if argument.is_null() {
@@ -733,7 +1053,10 @@ pub unsafe fn ioctl(fd: i32, request: u64, argument: *mut u8) -> Result<c_int, i
 
 /// fstat: a socket.
 pub fn stat(fd: i32) -> Result<proto_fs::NodeInfo, i32> {
-    let n = number(fd)?;
+    let n = match route(fd)? {
+        Route::Stack(n) => n,
+        Route::Ticket(i) => i as c_int,
+    };
     Ok(proto_fs::NodeInfo {
         kind: posix_fs::SOCKET,
         permissions: 0o600,

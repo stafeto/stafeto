@@ -882,6 +882,12 @@ pub extern "C" fn stafeto_probe_load_abort(place: c_int, pid: c_int) -> c_int {
     posix_abi::process::probe_load_abort(place as usize, pid)
 }
 
+/// The waits the layer has built in this process (`posix_abi::wait::probe_watch_builds`).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_watch_builds() -> u64 {
+    posix_abi::wait::probe_watch_builds()
+}
+
 /// The loads the calling record may have at once
 /// (posix_abi::process::probe_loads).
 #[unsafe(no_mangle)]

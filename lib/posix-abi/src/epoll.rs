@@ -534,7 +534,7 @@ fn ensure_kq(id: u32) -> Result<i32, i32> {
 /// a record that exists works as MOD; MOD deletes the filters and adds them
 /// again, which also switches a oneshot record on.
 fn ctl_fast(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<(), i32> {
-    if epfd < 0 || !fastnet::up() {
+    if epfd < 0 || !fastnet::registered() {
         return Err(EBADF);
     }
     let epoll_target = shared::with_descriptors(&[epfd as u32], |files| {
@@ -543,9 +543,17 @@ fn ctl_fast(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<()
     let Target::Epoll(id) = epoll_target else {
         return Err(EINVAL);
     };
-    let Some(fast_events::Number::Socket(n)) = fast_events::classify(fd) else {
+    if fast_events::classify(fd).is_none() {
         return Err(EBADF);
-    };
+    }
+    // The first record of a fast number or ticket starts the stack (the
+    // claim waits for the device and no signal ends it), and the tickets get
+    // their sockets. A record of a ticket that was never made is not there to
+    // delete.
+    if op == CTL_DEL && !fastnet::up() {
+        return Err(ENOENT);
+    }
+    let n = fastnet::stack_of(fd)?;
     match op {
         CTL_ADD | CTL_MOD => {
             let event = event.ok_or(EFAULT)?;
@@ -914,7 +922,7 @@ fn round(
     consumed: &mut EpollReady,
 ) -> Result<usize, i32> {
     loop {
-        let filled = round_once(id, out, until, handled, consumed, None, false)?;
+        let filled = round_once(id, out, until, handled, consumed)?;
         if filled > 0 || until.is_some_and(|deadline| wait::now() >= deadline) {
             return Ok(filled);
         }
@@ -922,21 +930,16 @@ fn round(
 }
 
 /// One go of `round`: the events of the records that are not fast, or none
-/// when `until` came or `wake` said so first.
+/// when `until` came first.
 fn round_once(
     id: u32,
     out: &mut [EpollEvent],
     until: Option<u64>,
     handled: u64,
     consumed: &mut EpollReady,
-    wake: Option<fn() -> bool>,
-    fast_only: bool,
 ) -> Result<usize, i32> {
     flush(id)?;
     let mut g = gather(id)?;
-    // An instance of fast records alone has nothing to ask of the services:
-    // the wait is the timer and the thread's channel.
-    let nothing_shared = fast_only && g.len == 0 && !g.nets;
     // The service gives pairs it takes off its lists for good: it is
     // asked for no more than fit, and a place is kept for the other
     // descriptors when there are any, so that sockets never crowd them out.
@@ -945,12 +948,12 @@ fn round_once(
     // The wait holds the service's set even when no socket is in it yet:
     // a socket another thread adds meanwhile wakes it (a service that
     // is not there leaves the set 0 and the wait to the other descriptors).
-    if g.set == 0 && !nothing_shared {
+    if g.set == 0 {
         g.set = ensure_set(id).unwrap_or(0);
     }
-    let mut net = (g.set != 0 && !nothing_shared).then(|| wait::NetWait::new(g.set, most as u32));
+    let mut net = (g.set != 0).then(|| wait::NetWait::new(g.set, most as u32));
     let len = g.len;
-    let ran = wait::run_net(&mut g.items[..len], net.as_mut(), until, handled, wake);
+    let ran = wait::run_net(&mut g.items[..len], net.as_mut(), until, handled);
     // What the service gave is kept for the error exits, which put it back.
     if let Some(net) = &net {
         *consumed = net.ready;
@@ -991,21 +994,141 @@ fn pwait_fast(
     // again, so a call that holds some returns them, as Linux does; the
     // handler has run, and the signal is not lost.
     let mut held = 0;
+    let mut sharing = Sharing::new();
     let result = wait::boundary(timeout, mask, |until, handled| {
-        let round = fast_round(id, kq, out, until, handled, &mut consumed);
+        let round = fast_round(id, kq, out, until, handled, &mut consumed, &mut sharing);
         if let Ok(n) = round {
             held = n;
         }
         round
     });
+    // The subscriptions of the call end with it.
+    let ended = sharing.end();
     let result = match result {
         Err(EINTR) if held > 0 => Ok(held),
         other => other,
+    };
+    let result = match (result, ended) {
+        (Ok(_), Err(errno)) => Err(errno),
+        (result, _) => result,
     };
     if result.is_err() && consumed.len != 0 {
         restore(id, &consumed);
     }
     result
+}
+
+/// The wait on the instance's records that are not fast, kept for the whole
+/// call of `epoll_pwait`: the subscriptions at the services (the channel of
+/// nginx to its main process lives in the pipe service) are made once and each
+/// turn of the loop only looks at them, and they are made again when the
+/// records change.
+struct Sharing {
+    gathered: Option<Gathered>,
+    /// Made from a constant and built in place (it is large); `built` says
+    /// whether it holds subscriptions.
+    watching: wait::Watching,
+    built: bool,
+    net: Option<wait::NetWait>,
+}
+
+/// Whether two gatherings ask the same of the services.
+fn same_records(a: &Gathered, b: &Gathered) -> bool {
+    a.len == b.len
+        && a.set == b.set
+        && a.nets == b.nets
+        && a.items[..a.len] == b.items[..b.len]
+        && a.index[..a.len] == b.index[..b.len]
+        && a.egen[..a.len] == b.egen[..b.len]
+}
+
+impl Sharing {
+    const fn new() -> Self {
+        Sharing {
+            gathered: None,
+            watching: wait::Watching::BLANK,
+            built: false,
+            net: None,
+        }
+    }
+
+    /// Cancels the subscriptions.
+    fn end(&mut self) -> Result<(), i32> {
+        self.gathered = None;
+        let closed = if core::mem::take(&mut self.built) {
+            self.watching.close(self.net.as_mut())
+        } else {
+            Ok(())
+        };
+        self.net = None;
+        closed
+    }
+
+    /// One turn: the events of the records that are not fast, or none when
+    /// `until` came or `wake` said so first.
+    fn turn(
+        &mut self,
+        id: u32,
+        out: &mut [EpollEvent],
+        until: Option<u64>,
+        handled: u64,
+        consumed: &mut EpollReady,
+        wake: Option<fn() -> bool>,
+    ) -> Result<usize, i32> {
+        flush(id)?;
+        let mut fresh = gather(id)?;
+        // The service gives pairs it takes off its lists for good: it is
+        // asked for no more than fit, and a place is kept for the other
+        // descriptors when there are any, so that sockets never crowd them
+        // out.
+        let reserve = usize::from(fresh.len > 0 && out.len() > 1);
+        let most = (out.len() - reserve).min(wire::EPOLL_MOST);
+        let kept = self.built
+            && self
+                .gathered
+                .as_ref()
+                .is_some_and(|old| same_records(old, &fresh));
+        if !kept {
+            self.end()?;
+            // A wait on the service's set only when sockets of the
+            // service are in the instance: with none there is nothing to
+            // wait for there, and a socket another thread adds is seen at
+            // the next turn.
+            if fresh.nets && fresh.set == 0 {
+                fresh.set = ensure_set(id).unwrap_or(0);
+            }
+            self.net =
+                (fresh.nets && fresh.set != 0).then(|| wait::NetWait::new(fresh.set, most as u32));
+            self.built = true;
+            self.watching
+                .build(&fresh.items[..fresh.len], false, self.net.as_mut())?;
+            self.gathered = Some(fresh);
+        }
+        let (Some(g), watching) = (self.gathered.as_mut(), &mut self.watching) else {
+            return Err(EIO);
+        };
+        if let Some(net) = self.net.as_mut() {
+            net.ready = EpollReady::EMPTY;
+            // The room of this turn (the turn that checks the records once a
+            // tick has less than the turn that sleeps): the service must
+            // not take more pairs off its list than fit.
+            net.fit(most as u32)?;
+        }
+        let ran = watching.turn(until, handled, wake, self.net.as_mut());
+        // What the service gave is kept for the error exits, which put it back.
+        if let Some(net) = &self.net {
+            *consumed = net.ready;
+        }
+        ran?;
+        let len = g.len;
+        watching.revents(&mut g.items[..len]);
+        let mut filled = 0;
+        if let Some(net) = &self.net {
+            filled = deliver_net(id, &net.ready, out)?;
+        }
+        filled += deliver_others(id, g, &mut out[filled..])?;
+        Ok(filled)
+    }
 }
 
 /// The events of the kqueue as the user sees them, into `out`.
@@ -1043,11 +1166,13 @@ fn fast_round(
     until: Option<u64>,
     handled: u64,
     consumed: &mut EpollReady,
+    sharing: &mut Sharing,
 ) -> Result<usize, i32> {
     let block = crate::threads::own_block();
     let mut events = [Kevent::default(); 64];
     loop {
         if posix_sync::receiver::lost() {
+            fastnet::exit_if_lost();
             return Err(ENETDOWN);
         }
         if crate::signals::pending_unblocked() {
@@ -1067,15 +1192,7 @@ fn fast_round(
         if due && filled < out.len() {
             let at = wait::now();
             set_shared_at(id, at);
-            match round_once(
-                id,
-                &mut out[filled..],
-                Some(at),
-                handled,
-                consumed,
-                None,
-                true,
-            ) {
+            match sharing.turn(id, &mut out[filled..], Some(at), handled, consumed, None) {
                 Ok(more) => filled += more,
                 // The events of the kqueue are out of it for good (an edge
                 // or a oneshot record would never report again): the call
@@ -1132,14 +1249,13 @@ fn fast_round(
         let tick = fastnet::next_tick_ns().min(TICK_NS);
         let wake_at = wait::now().saturating_add(tick);
         let sleep_until = until.map_or(wake_at, |deadline| deadline.min(wake_at));
-        let slept = round_once(
+        let slept = sharing.turn(
             id,
             out,
             Some(sleep_until),
             handled,
             consumed,
             Some(fast_wake),
-            true,
         );
         fastnet::notify(false);
         set_shared_at(id, wait::now());

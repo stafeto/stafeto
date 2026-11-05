@@ -39,6 +39,7 @@ pub mod display;
 pub mod epoll;
 pub mod fast;
 pub mod fast_events;
+pub mod fast_tickets;
 pub mod fastnet;
 pub mod ipc;
 pub mod lock_fields;
@@ -620,6 +621,7 @@ pub fn getcwd(buffer: &mut [u8]) -> Result<usize, c_int> {
 
 /// Ends the process with `status`; its threads and resources go with it.
 pub fn exit(status: c_int) -> ! {
+    fastnet::last_pass();
     rt::sys::process_exit((status & 255) as u64)
 }
 

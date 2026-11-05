@@ -20,9 +20,17 @@ use rt::sys;
 pub const POLL_INLINE: usize = posix_fs::HOLDS_MAX;
 pub const MAX: usize = POLL_INLINE;
 const LIMIT: usize = MAX;
-const _: () = assert!(LIMIT >= watch::MAX);
+const _: () = assert!(LIMIT >= watch::MAX && LIMIT <= 256);
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+/// How many waits were built (`Watching::build`), for the probes: the loop of
+/// `epoll_pwait` builds one for a call and again when its records change.
+static BUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of waits built so far in this process.
+pub fn probe_watch_builds() -> u64 {
+    BUILDS.load(Ordering::Relaxed)
+}
 const TAG: u64 = 1 << 63;
 
 /// The absolute counter deadline, taken from the invocation's start.
@@ -41,12 +49,15 @@ struct Pins {
     transport: Option<Transport>,
 }
 impl Pins {
-    fn snapshot(items: &[PollFd], ready: &mut [u32; LIMIT]) -> Result<Self, i32> {
-        let mut pins = Self {
-            targets: [None; LIMIT],
-            loans: [None; LIMIT],
-            transport: None,
-        };
+    const BLANK: Self = Self {
+        targets: [None; LIMIT],
+        loans: [None; LIMIT],
+        transport: None,
+    };
+
+    /// Holds the descriptions of `items`, in place (the table is large).
+    fn fill(&mut self, items: &[PollFd], ready: &mut [u32; LIMIT]) -> Result<(), i32> {
+        let pins = self;
         let mut numbers = [u32::MAX; LIMIT];
         for (number, item) in numbers.iter_mut().zip(items) {
             if item.fd >= 0 {
@@ -82,8 +93,7 @@ impl Pins {
                 }
             }
             Ok(())
-        })?;
-        Ok(pins)
+        })
     }
 }
 impl Drop for Pins {
@@ -140,22 +150,23 @@ struct Subscription {
     owner: u64,
     key: u64,
     armed: bool,
+    /// Taken at the start of the turn: no second take before the sleep.
+    fresh: bool,
     label: u64,
     set: proto_pipe::WatchSet,
-    original: [usize; watch::MAX],
+    original: [u8; watch::MAX],
 }
 impl Subscription {
-    fn new(service: Service, label: u64) -> Self {
-        Self {
-            service,
-            owner: 0,
-            key: 0,
-            armed: false,
-            label,
-            set: proto_pipe::WatchSet::new(),
-            original: [0; watch::MAX],
-        }
-    }
+    const BLANK: Self = Self {
+        service: Service::Pipe,
+        owner: 0,
+        key: 0,
+        armed: false,
+        fresh: false,
+        label: 0,
+        set: proto_pipe::WatchSet::new(),
+        original: [0; watch::MAX],
+    };
     fn add(&mut self, description: u32, events: u32, index: usize) {
         self.add_endpoint(
             proto_pipe::Endpoint {
@@ -167,7 +178,7 @@ impl Subscription {
         );
     }
     fn add_endpoint(&mut self, endpoint: proto_pipe::Endpoint, events: u32, index: usize) {
-        self.original[self.set.len] = index;
+        self.original[self.set.len] = index as u8;
         self.set.generations[self.set.len] = endpoint.generation;
         let description = endpoint.id;
         self.set.items[self.set.len] = watch::Item {
@@ -181,7 +192,7 @@ impl Subscription {
             return Err(EIO);
         }
         for (event, index) in incoming.events[..incoming.len].iter().zip(&self.original) {
-            ready[*index] |= event;
+            ready[usize::from(*index)] |= event;
         }
         Ok(())
     }
@@ -327,6 +338,7 @@ pub struct NetWait {
     most: u32,
     key: u64,
     armed: bool,
+    fresh: bool,
     label: u64,
     /// The pairs taken: the label of a record and its events.
     pub ready: proto_net::sockets::EpollReady,
@@ -364,6 +376,7 @@ impl NetWait {
             most,
             key: 0,
             armed: false,
+            fresh: false,
             label: 0,
             ready: proto_net::sockets::EpollReady::EMPTY,
         }
@@ -395,6 +408,21 @@ impl NetWait {
                 .map_err(|_| EIO),
             Err(status) => Err(net_refusal(status)),
         }
+    }
+
+    /// The most pairs a take may give is `most`: an operation that waits
+    /// for more than the room of this turn would take pairs off the
+    /// service's list for good and have no place to put them, so it is
+    /// cancelled (it loses none) and the next start asks for fewer.
+    pub fn fit(&mut self, most: u32) -> Result<(), i32> {
+        if self.key != 0 && most < self.most {
+            self.cancel()?;
+            self.armed = false;
+        }
+        if self.key == 0 || most < self.most {
+            self.most = most;
+        }
+        Ok(())
     }
 
     fn wait_request(&self, key: Option<u64>, flags: u32) -> proto_net::sockets::Request<'static> {
@@ -532,160 +560,205 @@ fn run_waking(
     mut net: Option<&mut NetWait>,
     wake: Option<fn() -> bool>,
 ) -> Result<usize, i32> {
-    if items.len() > LIMIT {
-        return Err(EINVAL);
+    let mut watching = Watching::BLANK;
+    watching.build(items, selecting, net.as_deref_mut())?;
+    let outcome = watching.turn(until, handled, wake, net.as_deref_mut());
+    let closed = watching.close(net);
+    closed?;
+    outcome?;
+    if threads::own_block().handled.load(Ordering::SeqCst) != handled
+        || threads::cancel::requested()
+    {
+        return Err(EINTR);
     }
-    let block = threads::own_block();
-    let id = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            n.checked_add(1).filter(|next| *next < TAG >> 4)
-        })
-        .map_err(|_| EAGAIN)?;
-    let mut ready = [0; LIMIT];
-    let pins = Pins::snapshot(items, &mut ready)?;
-    let transport = pins.transport.ok_or(EIO)?;
-    if let Some(net) = net.as_deref_mut() {
-        net.label = TAG | id << 4 | 9;
-    }
-    // The Watches of the pipe service take `watch::MAX` elements each, those of
-    // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`),
-    // those of the network service `watch::MAX` again; every one has a label
-    // of its own. The low four bits of a label: 0 and 4 the pipes, 1, 3, 5
-    // and 7 the terminal's, 2 the timer, 8 and 12 the network's, 9 its wait on
-    // an interest set.
-    const PIPE_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
-    const TERMINAL_WATCHES: usize = LIMIT.div_ceil(proto_tty::WATCH_MAX);
-    const NET_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
-    const _: () = assert!(PIPE_WATCHES == 2 && TERMINAL_WATCHES == 4 && NET_WATCHES == 2);
-    const PIPE_LABELS: [u64; PIPE_WATCHES] = [0, 4];
-    const TERMINAL_LABELS: [u64; TERMINAL_WATCHES] = [1, 3, 5, 7];
-    const NET_LABELS: [u64; NET_WATCHES] = [8, 12];
-    let mut subscriptions = [
-        Subscription::new(Service::Pipe, TAG | id << 4 | PIPE_LABELS[0]),
-        Subscription::new(Service::Pipe, TAG | id << 4 | PIPE_LABELS[1]),
-        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[0]),
-        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[1]),
-        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[2]),
-        Subscription::new(Service::Terminal, TAG | id << 4 | TERMINAL_LABELS[3]),
-        Subscription::new(Service::Net, TAG | id << 4 | NET_LABELS[0]),
-        Subscription::new(Service::Net, TAG | id << 4 | NET_LABELS[1]),
-    ];
-    for (index, (item, target)) in items.iter().zip(&pins.targets).enumerate() {
-        let requested = (item.events as u16 as u32) & watch::EVENTS;
-        if selecting && ready[index] == watch::NVAL {
-            return Err(EBADF);
+    Ok(watching.revents(items))
+}
+
+/// The subscriptions of a wait with the pins of its descriptors. One wait
+/// that turns more than once (the loop of `epoll_pwait`) keeps them between
+/// its turns, so that a turn costs a look at each service and not the
+/// making and the cancelling of its subscriptions; the owner builds a new
+/// one when its records change.
+pub(crate) struct Watching {
+    // The subscriptions go before the pins: they are cancelled while the
+    // descriptions are still held.
+    subscriptions: [Subscription; 8],
+    timer: Option<Handle<Timer>>,
+    pins: Pins,
+    /// What the snapshot already knows (a descriptor that is not open).
+    known: [u32; LIMIT],
+    ready: [u32; LIMIT],
+    len: usize,
+    id: u64,
+}
+
+impl Watching {
+    /// Nothing watched yet. The structure is large (the stack of a thread is
+    /// not): it is made from this constant in its place, then `build`.
+    pub(crate) const BLANK: Self = Self {
+        subscriptions: [Subscription::BLANK; 8],
+        timer: None,
+        pins: Pins::BLANK,
+        known: [0; LIMIT],
+        ready: [0; LIMIT],
+        len: 0,
+        id: 0,
+    };
+
+    /// The subscriptions and the pins for `items`, in place; `net` gets its
+    /// label.
+    pub(crate) fn build(
+        &mut self,
+        items: &[PollFd],
+        selecting: bool,
+        net: Option<&mut NetWait>,
+    ) -> Result<(), i32> {
+        if items.len() > LIMIT {
+            return Err(EINVAL);
         }
-        if selecting && requested & watch::PRI != 0 && matches!(target, Some(Target::Ram(_))) {
-            let target = (*target).ok_or(EIO)?;
-            let regular =
-                transport.fstat(target).map_err(crate::error)?.kind == posix_fs::FileKind::Regular;
-            ready[index] =
-                requested & (watch::READ | watch::WRITE | if regular { watch::PRI } else { 0 });
-            continue;
+        BUILDS.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                n.checked_add(1).filter(|next| *next < TAG >> 4)
+            })
+            .map_err(|_| EAGAIN)?;
+        let mut ready = [0; LIMIT];
+        self.pins.fill(items, &mut ready)?;
+        let pins = &self.pins;
+        let transport = pins.transport.ok_or(EIO)?;
+        if let Some(net) = net {
+            net.label = TAG | id << 4 | 9;
         }
-        if selecting && requested & (watch::READ | watch::WRITE) == 0 {
-            continue;
+        // The Watches of the pipe service take `watch::MAX` elements each, those of
+        // the terminal service `proto_tty::WATCH_MAX` (`proto_tty::watch_group`),
+        // those of the network service `watch::MAX` again; every one has a label
+        // of its own. The low four bits of a label: 0 and 4 the pipes, 1, 3, 5
+        // and 7 the terminal's, 2 the timer, 8 and 12 the network's, 9 its wait on
+        // an interest set.
+        const PIPE_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
+        const TERMINAL_WATCHES: usize = LIMIT.div_ceil(proto_tty::WATCH_MAX);
+        const NET_WATCHES: usize = LIMIT.div_ceil(watch::MAX);
+        const _: () = assert!(PIPE_WATCHES == 2 && TERMINAL_WATCHES == 4 && NET_WATCHES == 2);
+        const PIPE_LABELS: [u64; PIPE_WATCHES] = [0, 4];
+        const TERMINAL_LABELS: [u64; TERMINAL_WATCHES] = [1, 3, 5, 7];
+        const NET_LABELS: [u64; NET_WATCHES] = [8, 12];
+        let subscriptions = &mut self.subscriptions;
+        for (slot, (service, label)) in subscriptions.iter_mut().zip([
+            (Service::Pipe, PIPE_LABELS[0]),
+            (Service::Pipe, PIPE_LABELS[1]),
+            (Service::Terminal, TERMINAL_LABELS[0]),
+            (Service::Terminal, TERMINAL_LABELS[1]),
+            (Service::Terminal, TERMINAL_LABELS[2]),
+            (Service::Terminal, TERMINAL_LABELS[3]),
+            (Service::Net, NET_LABELS[0]),
+            (Service::Net, NET_LABELS[1]),
+        ]) {
+            *slot = Subscription::BLANK;
+            slot.service = service;
+            slot.label = TAG | id << 4 | label;
         }
-        match target {
-            Some(Target::Pipe(end)) => {
-                let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
-                subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
-                subscriptions[at].add(*end, requested, index);
+        for (index, (item, target)) in items.iter().zip(&pins.targets).enumerate() {
+            let requested = (item.events as u16 as u32) & watch::EVENTS;
+            if selecting && ready[index] == watch::NVAL {
+                return Err(EBADF);
             }
-            Some(Target::Fifo(target)) => {
-                let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
-                subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
-                subscriptions[at].add_endpoint(target.endpoint(), requested, index);
+            if selecting && requested & watch::PRI != 0 && matches!(target, Some(Target::Ram(_))) {
+                let target = (*target).ok_or(EIO)?;
+                let regular = transport.fstat(target).map_err(crate::error)?.kind
+                    == posix_fs::FileKind::Regular;
+                ready[index] =
+                    requested & (watch::READ | watch::WRITE | if regular { watch::PRI } else { 0 });
+                continue;
             }
-            Some(Target::Tty(terminal)) => {
-                let group = proto_tty::watch_group(terminals_placed(&subscriptions));
-                let owner = transport.terminal().ok_or(EBADF)?.raw().0;
-                subscriptions[2 + group].owner = owner;
-                subscriptions[2 + group].add(*terminal, requested, index);
+            if selecting && requested & (watch::READ | watch::WRITE) == 0 {
+                continue;
             }
-            Some(Target::Input | Target::Output | Target::Error)
-                if transport.terminal().is_some() =>
-            {
-                let group = proto_tty::watch_group(terminals_placed(&subscriptions));
-                let owner = transport.terminal().ok_or(EIO)?.raw().0;
-                subscriptions[2 + group].owner = owner;
-                subscriptions[2 + group].add(proto_tty::CONSOLE, requested, index);
-            }
-            Some(Target::Net(description)) => {
-                let at = 6 + (subscriptions[6].set.len + subscriptions[7].set.len) / watch::MAX;
-                subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
-                // The service knows POLLRDHUP of a stream.
-                let rdhup = item.events as u16 as u32 & watch::RDHUP;
-                subscriptions[at].add(description.description, requested | rdhup, index);
-            }
-            // A poll of an epoll descriptor reports POLLERR: a departure from
-            // Linux, which reports POLLIN when records are ready (nesting is not
-            // supported).
-            Some(Target::Epoll(_)) => ready[index] = watch::ERR,
-            Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
-            None => {}
-        }
-    }
-    let channel =
-        Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-    let level = (block.base_level.load(Ordering::Relaxed) as u8).max(1);
-    let mut timer: Option<Handle<Timer>> = None;
-    let outcome = (|| {
-        if signals::pending_unblocked() {
-            signals::deliver_now();
-        }
-        if block.handled.load(Ordering::SeqCst) != handled || threads::cancel::requested() {
-            return Err(EINTR);
-        }
-        for subscription in &mut subscriptions {
-            loop {
-                match subscription.start(&mut ready) {
-                    Err(EINTR)
-                        if block.handled.load(Ordering::SeqCst) == handled
-                            && !threads::cancel::requested() =>
-                    {
-                        continue;
-                    }
-                    result => {
-                        result?;
-                        break;
-                    }
+            match target {
+                Some(Target::Pipe(end)) => {
+                    let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
+                    subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
+                    subscriptions[at].add(*end, requested, index);
                 }
-            }
-        }
-        if let Some(net) = net.as_deref_mut() {
-            loop {
-                match net.start() {
-                    Err(EINTR)
-                        if block.handled.load(Ordering::SeqCst) == handled
-                            && !threads::cancel::requested() =>
-                    {
-                        continue;
-                    }
-                    result => {
-                        result?;
-                        break;
-                    }
+                Some(Target::Fifo(target)) => {
+                    let at = (subscriptions[0].set.len + subscriptions[1].set.len) / watch::MAX;
+                    subscriptions[at].owner = transport.pipes().map_err(crate::error)?.raw().0;
+                    subscriptions[at].add_endpoint(target.endpoint(), requested, index);
                 }
+                Some(Target::Tty(terminal)) => {
+                    let group = proto_tty::watch_group(terminals_placed(&*subscriptions));
+                    let owner = transport.terminal().ok_or(EBADF)?.raw().0;
+                    subscriptions[2 + group].owner = owner;
+                    subscriptions[2 + group].add(*terminal, requested, index);
+                }
+                Some(Target::Input | Target::Output | Target::Error)
+                    if transport.terminal().is_some() =>
+                {
+                    let group = proto_tty::watch_group(terminals_placed(&*subscriptions));
+                    let owner = transport.terminal().ok_or(EIO)?.raw().0;
+                    subscriptions[2 + group].owner = owner;
+                    subscriptions[2 + group].add(proto_tty::CONSOLE, requested, index);
+                }
+                Some(Target::Net(description)) => {
+                    let at = 6 + (subscriptions[6].set.len + subscriptions[7].set.len) / watch::MAX;
+                    subscriptions[at].owner = crate::net::session().ok_or(EBADF)?.0;
+                    // The service knows POLLRDHUP of a stream.
+                    let rdhup = item.events as u16 as u32 & watch::RDHUP;
+                    subscriptions[at].add(description.description, requested | rdhup, index);
+                }
+                // A poll of an epoll descriptor reports POLLERR: a departure from
+                // Linux, which reports POLLIN when records are ready (nesting is not
+                // supported).
+                Some(Target::Epoll(_)) => ready[index] = watch::ERR,
+                Some(_) => ready[index] = requested & (watch::READ | watch::WRITE),
+                None => {}
             }
         }
-        loop {
+        self.known = ready;
+        self.ready = ready;
+        self.len = items.len();
+        self.id = id;
+        self.timer = None;
+        Ok(())
+    }
+
+    /// One turn: waits until a descriptor is ready, `until` comes, `wake`
+    /// says so or a signal needs the caller. What is ready is in `revents`
+    /// after it. The subscriptions of an earlier turn stay (a turn looks at
+    /// each with one call); `close` cancels them.
+    pub(crate) fn turn(
+        &mut self,
+        until: Option<u64>,
+        handled: u64,
+        wake: Option<fn() -> bool>,
+        mut net: Option<&mut NetWait>,
+    ) -> Result<(), i32> {
+        let block = threads::own_block();
+        let channel =
+            Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+        let level = (block.base_level.load(Ordering::Relaxed) as u8).max(1);
+        let id = self.id;
+        self.ready = self.known;
+        let len = self.len;
+        let outcome = (|| {
             if signals::pending_unblocked() {
                 signals::deliver_now();
             }
             if block.handled.load(Ordering::SeqCst) != handled || threads::cancel::requested() {
                 return Err(EINTR);
             }
-            if ready_count(&ready[..items.len()]) != 0
-                || net.as_deref().is_some_and(|n| n.ready.len != 0)
-                || until.is_some_and(|deadline| now() >= deadline)
-                || wake.is_some_and(|w| w())
-            {
-                return Ok(());
-            }
-            for subscription in &mut subscriptions {
+            // A look at each service: what is not started starts, what is
+            // started is taken (the answer is what is ready now).
+            for subscription in &mut self.subscriptions {
+                subscription.fresh = false;
                 loop {
-                    match subscription.take(&channel, level, &mut ready) {
+                    let ready = &mut self.ready;
+                    let step = if subscription.key == 0 {
+                        subscription.start(ready)
+                    } else {
+                        subscription.fresh = true;
+                        subscription.take(&channel, level, ready)
+                    };
+                    match step {
                         Err(EINTR)
                             if block.handled.load(Ordering::SeqCst) == handled
                                 && !threads::cancel::requested() =>
@@ -700,8 +773,15 @@ fn run_waking(
                 }
             }
             if let Some(net) = net.as_deref_mut() {
+                net.fresh = false;
                 loop {
-                    match net.take(&channel, level) {
+                    let step = if net.key == 0 {
+                        net.start()
+                    } else {
+                        net.fresh = true;
+                        net.take(&channel, level)
+                    };
+                    match step {
                         Err(EINTR)
                             if block.handled.load(Ordering::SeqCst) == handled
                                 && !threads::cancel::requested() =>
@@ -715,87 +795,158 @@ fn run_waking(
                     }
                 }
             }
-            if ready_count(&ready[..items.len()]) != 0
-                || net.as_deref().is_some_and(|n| n.ready.len != 0)
-            {
-                continue;
-            }
-            signals::probe_window(signals::window::POLL);
-            let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-            if block.handled.load(Ordering::SeqCst) != handled
-                || signals::pending_unblocked()
-                || threads::cancel::requested()
-            {
-                drop(guard);
-                continue;
-            }
-            if wake.is_some_and(|w| w()) {
-                drop(guard);
-                return Ok(());
-            }
-            if let Some(until) = until {
-                if timer.is_none() {
-                    let labelled =
-                        sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 4 | 2, level)
-                            .map_err(kernel_error)?;
-                    timer = Some(sys::timer_create(&labelled, level).map_err(kernel_error)?);
+            loop {
+                if signals::pending_unblocked() {
+                    signals::deliver_now();
                 }
-                sys::timer_set(timer.as_ref().ok_or(EIO)?, until).map_err(kernel_error)?;
+                if block.handled.load(Ordering::SeqCst) != handled || threads::cancel::requested() {
+                    return Err(EINTR);
+                }
+                if ready_count(&self.ready[..len]) != 0
+                    || net.as_deref().is_some_and(|n| n.ready.len != 0)
+                    || until.is_some_and(|deadline| now() >= deadline)
+                    || wake.is_some_and(|w| w())
+                {
+                    return Ok(());
+                }
+                for subscription in &mut self.subscriptions {
+                    if core::mem::take(&mut subscription.fresh) {
+                        continue;
+                    }
+                    loop {
+                        match subscription.take(&channel, level, &mut self.ready) {
+                            Err(EINTR)
+                                if block.handled.load(Ordering::SeqCst) == handled
+                                    && !threads::cancel::requested() =>
+                            {
+                                continue;
+                            }
+                            result => {
+                                result?;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(net) = net.as_deref_mut() {
+                    if core::mem::take(&mut net.fresh) {
+                        // Taken a moment ago.
+                    } else {
+                        loop {
+                            match net.take(&channel, level) {
+                                Err(EINTR)
+                                    if block.handled.load(Ordering::SeqCst) == handled
+                                        && !threads::cancel::requested() =>
+                                {
+                                    continue;
+                                }
+                                result => {
+                                    result?;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if ready_count(&self.ready[..len]) != 0
+                    || net.as_deref().is_some_and(|n| n.ready.len != 0)
+                {
+                    continue;
+                }
+                signals::probe_window(signals::window::POLL);
+                let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
+                if block.handled.load(Ordering::SeqCst) != handled
+                    || signals::pending_unblocked()
+                    || threads::cancel::requested()
+                {
+                    drop(guard);
+                    continue;
+                }
+                if wake.is_some_and(|w| w()) {
+                    drop(guard);
+                    return Ok(());
+                }
+                if let Some(until) = until {
+                    if self.timer.is_none() {
+                        let labelled =
+                            sys::handle_label(&channel, Rights::RECEIVE, TAG | id << 4 | 2, level)
+                                .map_err(kernel_error)?;
+                        self.timer =
+                            Some(sys::timer_create(&labelled, level).map_err(kernel_error)?);
+                    }
+                    sys::timer_set(self.timer.as_ref().ok_or(EIO)?, until).map_err(kernel_error)?;
+                }
+                let incoming = crate::fast::receive(&channel);
+                drop(guard);
+                match incoming {
+                    Ok(_) | Err(Error::Interrupted) => {}
+                    Err(error) => return Err(kernel_error(error)),
+                }
+                // Woken: the next round takes each subscription again.
+                for subscription in &mut self.subscriptions {
+                    subscription.fresh = false;
+                }
+                if let Some(net) = net.as_deref_mut() {
+                    net.fresh = false;
+                }
             }
-            let incoming = crate::fast::receive(&channel);
-            drop(guard);
-            match incoming {
-                Ok(_) | Err(Error::Interrupted) => {}
-                Err(error) => return Err(kernel_error(error)),
+        })();
+        if let Some(timer) = self.timer.as_ref() {
+            let _ = sys::timer_cancel(timer);
+        }
+        outcome
+    }
+
+    /// Cancels every subscription (and `net`'s wait) and empties what late
+    /// wakeups left on the thread's channel. The first error of the
+    /// cancelling, after all were tried.
+    pub(crate) fn close(&mut self, net: Option<&mut NetWait>) -> Result<(), i32> {
+        // Every subscription cancels even after partial registration or an early error.
+        let mut cleanup_error = None;
+        for subscription in &mut self.subscriptions {
+            if let Err(error) = subscription.cancel(&mut [0; LIMIT]) {
+                cleanup_error.get_or_insert(error);
             }
         }
-    })();
-    if let Some(timer) = timer.as_ref() {
-        let _ = sys::timer_cancel(timer);
-    }
-    // Every subscription cancels even after partial registration or an early error.
-    let mut cleanup_error = None;
-    for subscription in &mut subscriptions {
-        if let Err(error) = subscription.cancel(&mut ready) {
+        if let Some(net) = net
+            && let Err(error) = net.cancel()
+        {
             cleanup_error.get_or_insert(error);
         }
-    }
-    if let Some(net) = net
-        && let Err(error) = net.cancel()
-    {
-        cleanup_error.get_or_insert(error);
-    }
-    drop(subscriptions);
-    drop(timer);
-    // Late wakeups and the CLIENT_GONE of the sessions above stay queued on the
-    // thread's channel and each holds a source place; drain them so the places
-    // of the next wait are free.
-    for _ in 0..rt::abi::MAX_SLOTS {
-        if crate::fast::try_receive(&channel).is_err() {
-            break;
+        self.timer = None;
+        // Late wakeups and the CLIENT_GONE of the sessions above stay queued on the
+        // thread's channel and each holds a source place; drain them so the places
+        // of the next wait are free.
+        let block = threads::own_block();
+        let channel =
+            Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+        for _ in 0..rt::abi::MAX_SLOTS {
+            if crate::fast::try_receive(&channel).is_err() {
+                break;
+            }
         }
+        cleanup_error.map_or(Ok(()), Err)
     }
-    // A socket of the pipe service whose peer went says POLLRDHUP with its
-    // POLLHUP, as Linux's AF_UNIX sockets do.
-    let mut unix = [false; LIMIT];
-    for (slot, target) in unix.iter_mut().zip(&pins.targets) {
-        *slot = matches!(target, Some(Target::Pipe(end)) if end & proto_pipe::sock::SOCK_END != 0);
-    }
-    drop(pins);
-    if let Some(error) = cleanup_error {
-        return Err(error);
-    }
-    outcome?;
-    if block.handled.load(Ordering::SeqCst) != handled || threads::cancel::requested() {
-        return Err(EINTR);
-    }
-    for ((item, events), unix) in items.iter_mut().zip(ready.iter_mut()).zip(unix) {
-        if unix && *events & watch::HUP != 0 {
-            *events |= item.events as u16 as u32 & POLLRDHUP;
+
+    /// The events that came, into the entries; how many entries have some.
+    pub(crate) fn revents(&self, items: &mut [PollFd]) -> usize {
+        // A socket of the pipe service whose peer went says POLLRDHUP with its
+        // POLLHUP, as Linux's AF_UNIX sockets do.
+        let mut ready = self.ready;
+        for ((item, events), target) in items
+            .iter_mut()
+            .zip(ready.iter_mut())
+            .zip(&self.pins.targets)
+        {
+            let unix =
+                matches!(target, Some(Target::Pipe(end)) if end & proto_pipe::sock::SOCK_END != 0);
+            if unix && *events & watch::HUP != 0 {
+                *events |= item.events as u16 as u32 & POLLRDHUP;
+            }
+            item.revents = *events as i16;
         }
-        item.revents = *events as i16;
+        ready_count(&ready[..self.len])
     }
-    Ok(ready_count(&ready[..items.len()]))
 }
 
 /// A cancellation boundary shared by the four C readiness interfaces.
@@ -854,9 +1005,8 @@ pub(crate) fn run_net(
     net: Option<&mut NetWait>,
     until: Option<u64>,
     handled: u64,
-    wake: Option<fn() -> bool>,
 ) -> Result<usize, i32> {
-    run_waking(items, until, handled, false, net, wake)
+    run_waking(items, until, handled, false, net, None)
 }
 
 /// POLLRDHUP of Linux: the peer of a stream shut its writing or went.

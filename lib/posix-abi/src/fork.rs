@@ -961,6 +961,9 @@ fn child() -> Result<(), &'static str> {
         // The instances of epoll are the parent's, whose set the parent's
         // session holds: the child's calls on them are EBADF.
         crate::epoll::after_fork();
+        // The tickets of the parent's listeners are the child's; those with
+        // FD_CLOFORK go.
+        crate::fastnet::after_fork();
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();

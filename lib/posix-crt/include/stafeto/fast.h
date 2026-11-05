@@ -132,8 +132,16 @@ int stafeto_fast_lost(void);
  * from a constructor of its own (the constructors of libc.so run first and
  * the layer's statics are ready), and from then on every
  * socket(AF_INET, SOCK_STREAM, ...) of the process is a socket of the stack.
- * The layer starts the stack at the first one: it claims the second device
- * (stafeto_fast_claim) and calls `start`. The sockets have numbers from
+ * Before the stack runs a socket is a ticket (numbers from 1310720 up, 16
+ * of them): the layer keeps its address, backlog and options, so that a
+ * process that opens its listeners and forks (nginx's main process) hands each
+ * child the listeners, and the child's stack makes the sockets. The layer
+ * starts the stack at the first epoll_ctl, accept or connect: it claims the
+ * second device (stafeto_fast_claim; its pause between tries is not ended
+ * by a signal, since those calls have no EINTR), calls `start`, and makes the
+ * sockets of the tickets. fork is allowed while the process has tickets only
+ * (the child's tickets with FD_CLOFORK are closed), exec is allowed too and
+ * passes no ticket on. The sockets of the stack have numbers from
  * 1048576 up and are non-blocking from birth: accept, accept4, read, write,
  * readv, writev, send, recv, sendmsg, recvmsg, connect, bind, listen, close,
  * shutdown, getsockopt, setsockopt, getsockname, getpeername, fcntl
@@ -157,8 +165,11 @@ int stafeto_fast_lost(void);
  * address is renewed at the same address (a new address is not supported).
  */
 #define STAFETO_FAST_TABLE_VERSION 1
-/* Accepted and kept; the process does not end on its own yet. Until it does,
- * epoll_pwait answers ENETDOWN once the service has let go of the device. */
+/* The process ends with status 2 when the service lets go of the device (the
+ * loop of epoll_pwait sees it at the next turn, at most one clock tick after
+ * the service ends), after a line on the console. nginx's main process does
+ * not start a new worker for status 2. Without the flag epoll_pwait answers
+ * ENETDOWN. */
 #define STAFETO_FAST_EXIT_ON_LOSS 1u
 
 struct stafeto_fast_table {

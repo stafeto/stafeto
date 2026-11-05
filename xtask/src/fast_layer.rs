@@ -21,7 +21,22 @@
 //!    device's interrupt and not on its own timer;
 //! 5. the clock ticks and steps of the stack over two idle seconds (about
 //!    100 ticks a second);
-//! 6. `?stop`: the program ends and the device comes back.
+//! 6. `?stop`: the program ends and the device comes back;
+//! 7. `fast-layer --fork &`, the shape of nginx: the main process opens two
+//!    listeners before the stack runs (tickets) and forks; the child starts
+//!    the stack at its first `epoll_ctl` and makes both sockets at once. A
+//!    client of the second listener is connected and waits while the child
+//!    watches the first alone; then it is served. At `?stop` the child closes
+//!    its sockets and ends: every client reads the end of the stream (no
+//!    reset) within a second, which only the last step of the stack before
+//!    the process ends allows;
+//! 8. `fast-layer --rules`: what the tickets answer, `fork` before the stack,
+//!    a process of nobody refused, the claim that waits for another's device
+//!    while a signal runs its handler (no EINTR), and the refusals of the
+//!    process that holds the stack;
+//! 9. `fast-layer --loss`: the echo is served, then the network service is
+//!    made to fault: the process ends with status 2 within two seconds after
+//!    the line of the layer (the glue's table asks to end on the loss).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -44,6 +59,9 @@ const PAGE_PORT: u16 = 80;
 const IDLE_SLOW_US: u64 = 6000;
 const IDLE_SLOW_SHARE_MAX: f64 = 0.10;
 const LINE_WITHIN: Duration = Duration::from_secs(60);
+const RULES_WITHIN: Duration = Duration::from_secs(120);
+/// The process ends within this long of the service's fault.
+const LOSS_WITHIN: Duration = Duration::from_secs(2);
 
 /// The checks of the program, in its order (`fast-layer: <name> ok`).
 pub const CHECKS: &[&str] = &[
@@ -63,13 +81,41 @@ pub const CHECKS: &[&str] = &[
     "mixed_set",
 ];
 
+/// The checks of `fast-layer --rules`, in its order.
+pub const RULES: &[&str] = &[
+    "ticket_range",
+    "ticket_name",
+    "ticket_not_connected",
+    "ticket_options",
+    "ticket_in_use",
+    "ticket_flags",
+    "ticket_limit",
+    "fork_before_stack",
+    "nobody_refused",
+    "claim_wait_signal",
+    "ticket_made",
+    "ticket_refused",
+    "stack_rules",
+    "watch_builds",
+];
+
+/// The client of the second listener must not be refused, and every client
+/// must read the end of the stream when the child ends, within this long.
+const CLOSE_WITHIN: Duration = Duration::from_secs(1);
+
 /// The programs of the image: the network image's with the table of both
-/// devices and the larger quota of the shell's commands.
+/// devices and the larger quota of the shell's commands; the service has the
+/// method that makes it fault, for the last scenario.
 pub fn programs() -> &'static [ImageProgram] {
     static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| {
         let mut programs = net::programs().to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-fstack-device"]);
+        for program in &mut programs {
+            if program.0 == "netd" {
+                program.3 = &["probe"];
+            }
+        }
         programs.push(("fast-layer", "fast-layer", 0, &["dynamic"]));
         programs
     })
@@ -210,6 +256,127 @@ fn stats(port: u16) -> Result<(u64, u64), String> {
     Ok((field("ticks=")?, field("passes=")?))
 }
 
+/// The service ends while the program holds the device: the program ends
+/// with 2 after its line, and the shell sees the status.
+fn loss_run(run: &mut qemu::Run, echo_host: u16, notes: &mut Vec<String>) -> Result<(), String> {
+    run.send("fast-layer --loss; echo loss-status=$?")?;
+    expect_all(run, &["fast-layer: loss serving"], LINE_WITHIN)?;
+    let mut stream = connect(echo_host)?;
+    stream
+        .write_all(b"?crash")
+        .map_err(|e| format!("?crash: {e}"))?;
+    let crashed_at = Instant::now();
+    expect_all(
+        run,
+        &[
+            "fast-layer: crash sent",
+            "init: net ended: fault",
+            "fast: the network service let the device go; the process ends",
+            "loss-status=2",
+        ],
+        LINE_WITHIN,
+    )?;
+    let took = crashed_at.elapsed();
+    if took > LOSS_WITHIN {
+        return Err(format!(
+            "the process ended {took:?} after the crash, wanted within {LOSS_WITHIN:?}"
+        ));
+    }
+    notes.push(format!(
+        "the service faulted and the process ended with status 2 in {} ms",
+        took.as_millis()
+    ));
+    Ok(())
+}
+
+/// The shape of nginx: tickets in the main process, the stack in its child.
+fn fork_run(
+    run: &mut qemu::Run,
+    echo_host: u16,
+    page_host: u16,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let began = Instant::now();
+    run.send("fast-layer --fork &")?;
+    expect_all(
+        run,
+        &["fast-layer: tickets ok", "fast-layer: child serving"],
+        LINE_WITHIN,
+    )?;
+    notes.push(format!(
+        "tickets in the main process, the child's stack up and serving in {} ms",
+        began.elapsed().as_millis()
+    ));
+    // A client of the second listener, which the child does not watch yet:
+    // the stack made the socket with the others, so the connection is taken
+    // and waits.
+    let mut second = connect(page_host)?;
+    second
+        .write_all(b"hello")
+        .map_err(|e| format!("second listener: {e}"))?;
+    std::thread::sleep(Duration::from_millis(300));
+    let mut first = connect(echo_host)?;
+    first
+        .write_all(b"?second")
+        .map_err(|e| format!("first listener: {e}"))?;
+    let mut got = [0u8; 7];
+    first
+        .read_exact(&mut got)
+        .map_err(|e| format!("?second: {e}"))?;
+    if &got != b"second\n" {
+        return Err(format!("?second was answered with {got:?}"));
+    }
+    let mut hello = [0u8; 5];
+    second
+        .read_exact(&mut hello)
+        .map_err(|e| format!("the client of the second listener got no echo: {e}"))?;
+    if &hello != b"hello" {
+        return Err("the second listener echoed something else".to_owned());
+    }
+    let mut idle = connect(echo_host)?;
+    idle.write_all(b"idle")
+        .map_err(|e| format!("idle connection: {e}"))?;
+    let mut idle_echo = [0u8; 4];
+    idle.read_exact(&mut idle_echo)
+        .map_err(|e| format!("idle connection: {e}"))?;
+    // `?stop`: the child closes everything and ends; each client reads the
+    // end of the stream, and not a reset, in time.
+    first
+        .write_all(b"?stop")
+        .map_err(|e| format!("?stop: {e}"))?;
+    let sent = Instant::now();
+    let mut slowest = Duration::ZERO;
+    for (name, stream) in [
+        ("first", &mut first),
+        ("second", &mut second),
+        ("idle", &mut idle),
+    ] {
+        stream
+            .set_read_timeout(Some(CLOSE_WITHIN))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => slowest = slowest.max(sent.elapsed()),
+            Ok(_) => return Err(format!("the {name} connection got data at the end")),
+            Err(e) => {
+                return Err(format!(
+                    "the {name} connection did not read the end of the stream within {CLOSE_WITHIN:?}: {e}"
+                ));
+            }
+        }
+    }
+    notes.push(format!(
+        "second listener served before its epoll_ctl; three connections read the end of the stream within {} ms of the stop",
+        slowest.as_millis()
+    ));
+    expect_all(
+        run,
+        &["fast-layer: fork ended", "net: device 1 back"],
+        LINE_WITHIN,
+    )?;
+    Ok(())
+}
+
 pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     if machine.is_hvf() {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
@@ -300,14 +467,22 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             ));
         }
         // The same with the end of a pipe in the set (as nginx's channel is):
-        // the sleep of the loop then holds a subscription at the pipe's
-        // service and gives it back at each wake. Not judged, reported.
+        // the loop holds one subscription at the pipe's service for the call
+        // and each wake only looks at it, so the share of slow echoes is that
+        // of the loop without the pipe.
         command_of(echo_host, "?mix", "mixed\n")?;
         let (mixed_median, mixed_p90, mixed_slow) = idle_latency(echo_host, 60)?;
         notes.push(format!(
             "with a pipe in the set: median {mixed_median} us, 90th percentile {mixed_p90} us, {:.0} % over {IDLE_SLOW_US} us",
             mixed_slow * 100.0
         ));
+        if mixed_slow > IDLE_SLOW_SHARE_MAX {
+            return Err(format!(
+                "{:.0} % of the echoes with a pipe in the set took over {IDLE_SLOW_US} us (at most {:.0} %): the loop makes its subscriptions at every wake",
+                mixed_slow * 100.0,
+                IDLE_SLOW_SHARE_MAX * 100.0
+            ));
+        }
         // A signal every millisecond while the pipe is in the set: the
         // calls of epoll_pwait end with EINTR in the middle of the loop, and
         // no event of the stack's queue may be lost with them (the 16 echoes
@@ -372,6 +547,23 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             &["fast-layer: ended", "net: device 1 back"],
             LINE_WITHIN,
         )?;
+        fork_run(&mut run, echo_host, page_host, &mut notes)?;
+        let began = Instant::now();
+        run.send("fast-layer --rules")?;
+        let mut lines: Vec<String> = RULES
+            .iter()
+            .map(|name| format!("fast-layer: {name} ok"))
+            .collect();
+        lines.push("fast-layer: rules passed".to_owned());
+        lines.push("net: device 1 back".to_owned());
+        let wanted: Vec<&str> = lines.iter().map(String::as_str).collect();
+        expect_all(&mut run, &wanted, RULES_WITHIN)?;
+        notes.push(format!(
+            "{} rules of the tickets and of the process with the stack in {} ms",
+            RULES.len(),
+            began.elapsed().as_millis()
+        ));
+        loss_run(&mut run, echo_host, &mut notes)?;
         run.send("echo probe-end")?;
         run.expect("probe-end", DIALOG_STEP)?;
         Ok::<(), String>(())
@@ -379,11 +571,38 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
     talked?;
+    // The deepest use of the main stack (1 MiB, 768 KiB of it painted), in
+    // the main run and in `--rules`.
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.contains("fast-layer: stack used"))
+    {
+        let used = line
+            .split("stack used ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| format!("no number in {line:?}"))?;
+        if used >= 768 * 1024 {
+            return Err(format!(
+                "the main stack went through its painted area: {line}"
+            ));
+        }
+        notes.push(format!("main stack used {used} bytes"));
+    }
+    // The service faulted once, on purpose, and no other process.
+    let faults = output
+        .lines
+        .iter()
+        .filter(|l| l.contains("process fault:"))
+        .count();
+    if faults != 1 {
+        return Err(format!("{faults} process faults, wanted the one of CRASH"));
+    }
     if output.lines.iter().any(|line| {
-        line.contains("process fault:")
-            || line.contains("KERNEL PANIC")
+        line.contains("KERNEL PANIC")
             || line.contains("out of memory")
-            || line.contains("init: net ended")
             || line.contains("net: bypass broken")
             || line.contains("fast-layer: check failed")
     }) {
@@ -420,11 +639,28 @@ mod tests {
                 "layer.c does not print {name}"
             );
         }
+        for name in RULES {
+            assert!(
+                source.contains(&format!("ok(\"{name}\")")),
+                "layer.c does not print {name}"
+            );
+        }
         for text in [
+            "ok(\"tickets\")",
+            "fast-layer: child serving",
+            "fast-layer: fork ended",
+            "fast-layer: rules passed",
+            "--fork",
+            "--rules",
+            "?second",
             "fast-layer: serving",
             "fast-layer: ended",
             "ticks=%llu passes=%llu",
             "?mix",
+            "?crash",
+            "fast-layer: stack used",
+            "fast-layer: loss serving",
+            "fast-layer: crash sent",
             "?unmix",
             "?alarm",
             "?quiet",

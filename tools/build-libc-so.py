@@ -72,7 +72,8 @@ EXTRA = {
     "environ": "programs declare it; relibc's headers lack it",
 }
 # libc.so's one entry and the probe hook of the layer (3.12.3).
-ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image", "stafeto_fast_probe_crash"]
+ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image", "stafeto_fast_probe_crash",
+               "stafeto_probe_watch_builds"]
 # Compiler helpers the objects of C programs refer to: the outlined atomics
 # of AArch64, binary128 long double, 128-bit integers.
 HELPER = re.compile(r"^(__aarch64_\w+|__[a-z]+(tf|ti)[0-9]|__(fix|float|extend|trunc)\w*(tf|ti)\w*)$")
@@ -823,7 +824,9 @@ def program_inputs() -> dict:
 # finds its SYSINIT, sysctl and module records in linker sets that only
 # __start_ and __stop_ references name: they keep their sections.
 PROGRAM_LINK = {"fstack-probe": ("-z", "nostart-stop-gc"),
-                "fast-layer": ("-z", "nostart-stop-gc")}
+                # A main stack of 1 MiB (the default is 64 KiB): the stack
+                # of FreeBSD runs on the thread's stack under the program's.
+                "fast-layer": ("-z", "nostart-stop-gc", "-z", "stack-size=1048576")}
 
 
 def build_programs(wanted_names: list) -> list:

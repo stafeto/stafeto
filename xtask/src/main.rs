@@ -23,6 +23,9 @@ mod fast_events;
 #[cfg(test)]
 mod fast_events_tests;
 #[cfg(test)]
+#[path = "../../lib/posix-abi/src/fast_tickets.rs"]
+mod fast_tickets;
+#[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
 mod futex_deadline;
 #[cfg(test)]
