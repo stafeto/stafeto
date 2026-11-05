@@ -40,7 +40,8 @@ pub enum Point {
     TableFlushed,
     /// The layers are attached, the superblock is not written.
     Attached,
-    /// The write of the superblock reaches the medium in its first sector only.
+    /// The write of the superblock is torn inside its first sector: the copy it goes to is refused
+    /// at the next start, and the other copy is the state.
     SuperTorn,
     /// The superblock was accepted, not flushed.
     SuperWritten,
@@ -128,7 +129,7 @@ pub trait Device {
     }
 
     /// The write of the superblock `data` to `block` is about to come: the
-    /// build for the crash tests writes the first sector of it alone and stops.
+    /// build for the crash tests writes the first 64 bytes of it alone and stops.
     fn tear(&mut self, block: u64, data: &[u8; BLOCK]) {
         let _ = (block, data);
     }

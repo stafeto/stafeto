@@ -489,18 +489,23 @@ only an image whose table has the record `blk` uses it.
 ## The package service
 
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches
-them to the RAM file service as layers; `proto/pkg` (MIT) is its protocol. This part reads: the
-service starts from the disk, and the methods that change the store (install, remove, settings,
-serial, revocation) come with the next part.
+them to the RAM file service as layers; `proto/pkg` (MIT) is its protocol. The service starts from
+the disk, receives packages, and changes the store with the methods INSTALL_BEGIN, FEED,
+INSTALL_COMMIT, INSTALL_CANCEL, REMOVE, SETTINGS_SET, SERIAL_SET and REVOKED_SET.
 
-**Two threads.** The main thread (level 32) is the loop of a service and answers LIST, INFO,
-SETTINGS_GET, SERIAL, STATUS, CLONE, TAKE and BUFFER in steps of a few thousand ticks. The worker
-thread (level 30, round robin) takes everything long: it reads the store through the disk service,
-creates and maps the object of each package, hashes it as the bytes arrive (SHA-256 in software
-takes some 540,000 ticks for 16 KiB, so no step could hold a portion), checks the signature and
-attaches the object as a layer. STATUS says `starting` until the worker is done; LIST and INFO show
-the packages it has published meanwhile. The service never restarts: its layers stay in the file
-service when it ends.
+**Two threads.** The main thread (level 32) is the loop of a service and answers its clients in
+steps of a few thousand ticks: the reads (LIST, INFO, SETTINGS_GET, SERIAL, STATUS), CLONE and
+BUFFER, the copy of 16 KiB that a FEED brings, and the start and the result (TAKE) of each change
+of the store, which is a long operation. The worker thread (level 30, round robin) takes everything
+long: it reads the store through the disk service, creates and maps the object of each package,
+hashes it as the bytes arrive (SHA-256 in software takes some 540,000 ticks for 16 KiB, so no step
+could hold a portion), checks the signature and attaches the object as a layer, and runs the
+transactions below. STATUS says `starting` until the worker has read the disk; LIST and INFO show
+the packages it has published meanwhile. The main thread gives the worker one job at a time (a
+cell with the arguments, a state, a code and a value, and a notification each way). The worker
+changes the table, the entries and the blobs the main thread reads only inside a change of the
+state, and a read that comes then gets `BUSY`. The service never restarts: its layers stay in the
+file service when it ends.
 
 **The store.** The whole disk, in blocks of 4 KiB. Blocks 0 and 1 are the two copies of the
 superblock (`STAFSTOR`, version 1, the generation, where the table is and its SHA-256, and the
@@ -526,6 +531,60 @@ skipped`) and the service goes on. The roots of a development build come from th
 `STAFETO_PKG_ROOTS` (xtask gives the root of `target/keys`); otherwise they are
 `pkgfmt::OFFICIAL_ROOTS`.
 
+**Changing the store.** Every method that changes it (INSTALL_BEGIN, REMOVE, SETTINGS_SET,
+SERIAL_SET, REVOKED_SET) brings a copy of the identity session of the calling process; the service
+has the process service vouch for it (`Vouch`, over a notary session it asks `init` for at the
+first use) and refuses with `NOT_ALLOWED` unless the effective user is 0, or when the session is
+missing or refused. The calls that follow an INSTALL_BEGIN (FEED, INSTALL_COMMIT, INSTALL_CANCEL)
+belong to the session that began it and do not ask again. The reply is `DAMAGED` for a damaged
+store and `NO_FLUSH` for a disk that cannot flush, and `BUSY` while another session holds the store
+or the worker has a job.
+
+*Receiving a package.* INSTALL_BEGIN gives the record of the index (name, version, size, SHA-256),
+the repository (which the table must know: the official one always, the others once SERIAL_SET
+gave them a place) and the flag for the world. The worker takes the first free place of the table,
+the first free extent of the disk that clears the table, the extents of the group so far and the
+next table, and creates and maps an object of the size. The long operation ends with the number of
+the receipt. FEED names a cell of the client's buffer and a length; the main thread copies the
+bytes into the object after those that came and counts them, and the worker hashes the object (in
+portions of 16 KiB, taking the SHA-256 of the covered part at the page where it ends, whatever the
+sizes of the pieces) and writes whole blocks to the extent. A FEED past the size is `TOO_LONG` and
+the receipt goes. INSTALL_COMMIT waits for all of it, then checks, in the order of the codes: the
+SHA-256 of the file against the index (`BAD_HASH`), the layout, the name and the version
+(`BAD_PACKAGE`), the series (`WRONG_SERIES`), the signature against the trust of the repository and
+the list of revocations (`UNTRUSTED_KEY`, `REVOKED`, `BAD_SIGNATURE`) and the SHA-256 of each file
+against the manifest (`BAD_MANIFEST`; the check of a start from the disk leaves this one out, the
+signature covers the manifest and the bytes). Without the flag "end of the group" the package is
+flushed and waits; with it the group becomes the state. A refusal drops the whole group: the
+objects close and the extents are free, since only the table holds an extent.
+
+*The transaction* (`commit::transact`, one plan for all kinds): the data are flushed (F1); the
+next table goes into a free extent and is flushed (F2); then, for an installation or new
+settings, the layers of the replaced packages detach and the new ones attach (a refusal of the
+file service, `CONFLICT` with the number of the entry, undoes them in reverse order and brings the
+detached ones back, and the old state is still the store's, with nothing to write over); then the
+superblock goes into the copy that holds the lower generation and is flushed (F3); a failed write
+of it takes the layers back and answers `IO`. A removal and a list of revocations write the
+superblock before they detach, since the bytes of the packages are in memory and the disk no
+longer matters to them. A serial changes the table alone. `SERIAL_SET` below the held number is
+`ROLLBACK`, equal changes nothing; a list of revocations below the held serial is `ROLLBACK`, one
+without a root's signature `BAD_SIGNATURE`; REMOVE answers `IN_IMAGE`, `NOT_FOUND` or
+`NEEDED_BY`; SETTINGS_SET answers `INVALID` for a blob that breaks the rules (`proto/pkg`, the
+blob; `settings.rs`), and the blob is the truth about the keys of the owner's repositories whether
+its layer attached or not. SETTINGS_GET carries the generation of the store in each reply, and a
+client that reads a blob of several parts starts again when it changes.
+
+*Crash points.* A build with the feature `crash` and `STAFETO_PKGD_CRASH_AT=N` stops for good at
+the point `N` of `commit::Point` after the line `pkgd: crash point N <name>`: `begin`, `data`,
+`data-flushed`, `table-part`, `table-flushed`, `attached`, `super-torn` (the write of the superblock
+is torn inside its first sector: 64 bytes of it reach the disk, which its checksum refuses),
+`super-written`, `committed`, `remove-table`, `remove-committed`, `settings-table`, `format-table`.
+The same plan runs in the host tests over a model of the disk that loses what was not flushed
+(all, none, or any subset of the pending writes, and a write of the superblock torn at 512
+bytes), with a crash after every write and every flush of every kind of transaction: the store at
+the next start is the whole old state or the whole new one, the data of the new one are whole,
+and the free space is the disk less the extents of the table found.
+
 **Running it.** `cargo xtask store-probe` writes a store on the host with the service's own writer
 (`pkgd::host`, feature `host`): `hello`, whose program exits with 42, a copy `broken` with a byte
 changed after the signing, `revoked` (signed by a second development release key, which the list
@@ -534,12 +593,28 @@ names), the settings with the repository `games` and its key, and the list. The 
 answers and at the tree, and runs the program. A second run on a disk of zeros checks the format.
 `cargo xtask store-probe steps` adds `big` (16 MiB) and `wide` (1,000 files in a directory) and measures the steps
 under `-icount`: no step of the package service, the disk service or the file service's layer calls
-passes 18,369 ticks while the worker creates, maps, hashes and attaches. The jobs of the CI are
-`store-probe` and `store-probe steps`.
+passes 18,369 ticks while the worker creates, maps, hashes and attaches.
+
+The full scenario runs on a disk of zeros (the image holds the packages and the blobs under
+`/test/packages/`, with an index the probe reads): `hello`, signed by the development key, is
+installed, attached and run; each refusal (`BAD_SIGNATURE`, `UNTRUSTED_KEY`, `WRONG_SERIES`,
+`BAD_MANIFEST`, `CONFLICT`, `BAD_HASH`, `TOO_LONG`, `NO_MEMORY` for a size of 70 MiB, `NO_SPACE`
+for 600 MiB, `INVALID` for an unknown repository) leaves the status and the list as they were;
+INSTALL_CANCEL frees the store; a process whose effective user is 1000, or that sends no identity
+session, is `NOT_ALLOWED`; a group of `big` and `wide` shows nothing before its end; the settings
+of `games` and then of `games2` (a blob of two cells) replace the layer; the serial and the list of
+revocations never go back and the list detaches the package of the revoked key; REMOVE gives the
+space back. Then the machine starts again on the same disk file and the probe finds the packages,
+the settings and the serial in place. `cargo xtask store-crash [N]` builds the service for each
+crash point (or for point `N`), kills the machine on the line, starts it again on the same disk and
+compares the store with the state before or after the change (point 8 allows either; point 13
+checks that the disk is formatted again). `cargo xtask store-probe doom` installs Doom from
+`target/pkg` (`cargo xtask pkg-build freedoom doomgeneric`) as a group and prints the memory the
+service holds. The jobs of the CI are `store-probe`, `store-probe steps` and `store-crash`.
 
 ## What stays for subproject 5
 
-Installing and removing packages in a running system (the changing methods of `pkgd`), delivery
-(in the image, from a disk, over the network), dependency resolution at
-install time, and the sandbox and quotas of an application. Nothing here changes the quotas of
+The place of `pkgd` in the images and the order of the start (the clients ask for the place
+`Packages`, and the shell waits for the service), delivery (in the image, from a disk, over the
+network), dependency resolution at install time, and the sandbox and quotas of an application. Nothing here changes the quotas of
 the image.

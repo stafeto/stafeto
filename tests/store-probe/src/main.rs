@@ -825,8 +825,14 @@ impl<'a> Install<'a> {
     }
 }
 
+/// Milliseconds since the tick `from` of the counter.
+fn since_ms(from: u64) -> u64 {
+    rt::time::ticks_to_ns(rt::time::now().wrapping_sub(from)) / 1_000_000
+}
+
 /// The start of every job: the service has read its disk, a buffer is given.
 fn begin(pkgd: &Pkgd) -> Result<Snap, Fail> {
+    let began = rt::time::now();
     let mut status = pkgd.status().map_err(|_| "STATUS")?;
     let mut rounds = 0;
     while status.flags & pkg::STATUS_STARTING != 0 {
@@ -837,6 +843,7 @@ fn begin(pkgd: &Pkgd) -> Result<Snap, Fail> {
         status = pkgd.status().map_err(|_| "STATUS")?;
         rounds += 1;
     }
+    say!("pkgd ready after {} ms", since_ms(began));
     pkgd.buffer(true).map_err(|_| "BUFFER")?;
     snap(pkgd)
 }
@@ -850,6 +857,7 @@ fn scenario(mode: &[u8]) -> Result<(), Fail> {
     match mode {
         b"full" => full(&pkgd, &index, false),
         b"full-steps" => full(&pkgd, &index, true),
+        b"doom" => doom(&pkgd, &index),
         b"crash-install" => {
             begin(&pkgd)?;
             let second = index.get(b"second")?;
@@ -1275,6 +1283,42 @@ fn after_restart(pkgd: &Pkgd, now: &Snap) -> Result<(), Fail> {
     );
     say!(
         "restart: hello runs, big, the settings and the serial are in place, wide and keyb are not"
+    );
+    Ok(())
+}
+
+/// Doom from the packages `freedoom` and `doomgeneric`, built by `cargo xtask pkg-build`, installed
+/// as a group; on the machine started again on the same disk, in place.
+fn doom(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
+    let now = begin(pkgd)?;
+    let (wad, program) = (&b"/games/freedoom1.wad"[..], &b"/bin/doom"[..]);
+    if now.has(b"doomgeneric").is_some() {
+        if now.has(b"freedoom").is_none() || mode_of(program).is_none() || mode_of(wad).is_none() {
+            return Err("Doom is not in place after the restart");
+        }
+        say!("restart: Doom is in place, listed and in the tree");
+        return Ok(());
+    }
+    let began = rt::time::now();
+    let part = Install {
+        end: false,
+        ..Install::new(b"stafeto", false)
+    };
+    pkgd.install(index.get(b"freedoom")?, &part)
+        .map_err(|_| "the installation of freedoom")?;
+    pkgd.install(index.get(b"doomgeneric")?, &Install::new(b"stafeto", false))
+        .map_err(|_| "the installation of doomgeneric")?;
+    say!("Doom installed in {} ms", since_ms(began));
+    let listed = snap(pkgd)?;
+    if listed.has(b"freedoom").is_none()
+        || listed.has(b"doomgeneric").is_none()
+        || mode_of(program).is_none()
+        || mode_of(wad).is_none()
+    {
+        return Err("Doom is not in the tree");
+    }
+    say!(
+        "Doom installed: freedoom and doomgeneric as a group, the program and the WAD are in the tree"
     );
     Ok(())
 }

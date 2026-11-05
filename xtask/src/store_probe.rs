@@ -97,6 +97,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         None => disk().and_then(|()| empty()).and_then(|()| full(false)),
         Some("steps") => steps(),
         Some("full") => full(false),
+        Some("doom") => doom(),
         Some(other) => Err(format!("store-probe: unknown argument {other}")),
     }
 }
@@ -140,6 +141,10 @@ fn dev_keys() -> Result<Keys, String> {
         second_certificate,
     })
 }
+
+/// The program of a package that is never started: a few bytes after the mark of an executable.
+/// Only `hello` runs, and its program is the probe's own file.
+const TINY: &[u8] = b"\x7fELF a program that is never run, with room for the manifest to name it";
 
 /// Who signs a package: a key, and the certificate of a root for it (none for a key nobody vouches for).
 #[derive(Clone, Copy)]
@@ -434,8 +439,9 @@ fn image_with(
             source: None,
         })
         .collect();
-    extra.extend(files.into_iter().map(|(path, bytes)| {
-        let file: &'static str = Box::leak(path.replace('/', "-").into_boxed_str());
+    extra.extend(files.into_iter().enumerate().map(|(n, (path, bytes))| {
+        // The name of a file of the image is 32 bytes at most.
+        let file: &'static str = Box::leak(format!("test-{n}").into_boxed_str());
         let path: &'static str = Box::leak(format!("/test/{path}").into_boxed_str());
         let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
         rootfs::RootFile {
@@ -720,6 +726,7 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
         certificate: None,
     };
     let plain = Options::default();
+    let tiny = TINY;
     let wide = wide_files();
     let big = [("/big/data".to_string(), big_data())];
     let mut packages: Vec<(String, Vec<u8>)> = vec![
@@ -729,22 +736,22 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
         ),
         (
             "second".into(),
-            package("second", hello, official, &[], &plain)?,
+            package("second", tiny, official, &[], &plain)?,
         ),
-        ("big".into(), package("big", hello, official, &big, &plain)?),
+        ("big".into(), package("big", tiny, official, &big, &plain)?),
         (
             "wide".into(),
-            package("wide", hello, official, &wide, &plain)?,
+            package("wide", tiny, official, &wide, &plain)?,
         ),
         (
             "keyb".into(),
-            package("keyb", hello, second_key, &[], &plain)?,
+            package("keyb", tiny, second_key, &[], &plain)?,
         ),
         (
             "bad-sig".into(),
             package(
                 "bad-sig",
-                hello,
+                tiny,
                 official,
                 &[],
                 &Options {
@@ -755,13 +762,13 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
         ),
         (
             "other-key".into(),
-            package("other-key", hello, nobody, &[], &plain)?,
+            package("other-key", tiny, nobody, &[], &plain)?,
         ),
         (
             "old-series".into(),
             package(
                 "old-series",
-                hello,
+                tiny,
                 official,
                 &[],
                 &Options {
@@ -774,7 +781,7 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
             "bad-manifest".into(),
             package(
                 "bad-manifest",
-                hello,
+                tiny,
                 official,
                 &[],
                 &Options {
@@ -787,7 +794,7 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
             "conflict".into(),
             package(
                 "conflict",
-                hello,
+                tiny,
                 official,
                 &[],
                 &Options {
@@ -807,10 +814,7 @@ fn make_world(hello: &[u8], steps: bool, mode: &str) -> Result<World, String> {
                 version: Some(version),
                 ..Options::default()
             };
-            packages.push((
-                name.clone(),
-                package(&name, hello, official, &[], &options)?,
-            ));
+            packages.push((name.clone(), package(&name, tiny, official, &[], &options)?));
         }
     }
     let mut files = Vec::new();
@@ -1075,7 +1079,13 @@ fn crash_point(point: u8, hello: &[u8]) -> Result<(), String> {
     };
     let item = |name: &str| -> Result<Item, String> {
         Ok(Item {
-            bytes: package(name, hello, official, &[], &Options::default())?,
+            bytes: package(
+                name,
+                if name == "hello" { hello } else { TINY },
+                official,
+                &[],
+                &Options::default(),
+            )?,
             repository: "stafeto".into(),
             flags: pkgd::store::WORLD,
             installed: 1,
@@ -1177,12 +1187,77 @@ fn crash_point(point: u8, hello: &[u8]) -> Result<(), String> {
     println!(
         "store-crash {point} {name}: killed there, found {} (generation {generation}, {free} blocks free, {} packages): ok",
         match (found == old, found == new) {
+            _ if c.after == After::Formatted => "a store formatted again",
             (true, false) => "the old state",
-            (false, true) if c.after == After::Formatted => "a store formatted again",
             (false, true) => "the new state",
             _ => "the old state, which is also the new",
         },
         disk
     );
+    Ok(())
+}
+
+/// `cargo xtask store-probe doom`: Doom from the packages `freedoom` and `doomgeneric` of
+/// `target/pkg` (`cargo xtask pkg-build freedoom doomgeneric`) installed as a group on a disk of
+/// zeros, the memory the service holds after it, and the machine started again on the same disk.
+fn doom() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let dir = root().join("target/pkg");
+    let find = |prefix: &str| -> Result<(String, Vec<u8>), String> {
+        let found = std::fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(Result::ok)
+            .find(|f| f.file_name().to_string_lossy().starts_with(prefix));
+        let path = found
+            .ok_or_else(|| {
+                format!("no {prefix}* in target/pkg: cargo xtask pkg-build freedoom doomgeneric")
+            })?
+            .path();
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok((prefix.trim_end_matches('-').to_string(), bytes))
+    };
+    let packages = [find("freedoom-")?, find("doomgeneric-")?];
+    let mut files = Vec::new();
+    let mut index = String::new();
+    let mut pages = 0;
+    for (name, bytes) in &packages {
+        let package = pkgfmt::Package::parse(bytes).map_err(|e| format!("{name}: {e}"))?;
+        index.push_str(&format!(
+            "{name} {} {} {}\n",
+            package.meta.version,
+            bytes.len(),
+            hex_of(&pkgfmt::sha::sha256(bytes))
+        ));
+        pages += bytes.len() / 4096;
+        files.push((format!("packages/{name}.pkg"), bytes.clone()));
+    }
+    files.push(("packages/index".into(), index.into_bytes()));
+    files.push(("mode".into(), b"doom\n".to_vec()));
+    let image = image_with("boot-store-doom.img", &PROGRAMS, files, None)?;
+    hello_elf()?;
+    let file = Disk::new("doom");
+    write_disk(&file, None)?;
+    let first = run(&image, &file.0, false)?;
+    expect(
+        &first,
+        &["store-probe: Doom installed: freedoom and doomgeneric as a group, the program and the WAD are in the tree".to_string()],
+    )?;
+    let second = run(&image, &file.0, false)?;
+    expect(
+        &second,
+        &["store-probe: restart: Doom is in place, listed and in the tree".to_string()],
+    )?;
+    println!("store-probe doom: the packages take {pages} pages of the disk");
+    for line in first.iter().chain(&second).filter(|l| {
+        l.starts_with("pkgd: memory")
+            || l.starts_with("store-probe: Doom installed in")
+            || l.starts_with("store-probe: pkgd ready after")
+            || l.starts_with("pkgd: ready")
+    }) {
+        println!("{line}");
+    }
+    println!("store-probe doom: Doom installed as a group, in place after the restart: ok");
     Ok(())
 }

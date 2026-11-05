@@ -301,9 +301,14 @@ impl Device for Disk {
         if CRASH_AT != Point::SuperTorn.number() {
             return;
         }
-        // The first sector of the superblock reaches the disk, the rest does not.
+        // The write is torn inside its first sector: the first 64 bytes of the superblock reach
+        // the disk, the rest of the sector is zeros. The superblock is 128 bytes with its own
+        // SHA-256 at the end, so the copy is refused and the other copy is the state.
         // SAFETY: cell 0 of the mapped buffer; no request of it is in flight.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), Self::cell(0), SECTOR) };
+        unsafe {
+            core::ptr::write_bytes(Self::cell(0), 0, SECTOR);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), Self::cell(0), 64);
+        }
         if let Ok(key) = self.io(Blk::Write, 0, 1, block * u64::from(BLOCK_SECTORS)) {
             let _ = self.finish(key, 0);
         }

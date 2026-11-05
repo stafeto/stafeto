@@ -42,6 +42,10 @@ use shared::*;
 
 rt::entry!(main);
 
+/// The sum of the longest times the last report named.
+#[cfg(feature = "steps")]
+static LAST_WORK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Where the service maps the boot image.
 const IMAGE_AT: usize = 0x50_0000_0000;
 /// The sessions the loop keeps, and the clones of them at most.
@@ -930,13 +934,20 @@ impl Service<0> for Pkgd {
         if n.source == Source::Session && n.label == LABEL_DONE {
             self.settle();
             #[cfg(feature = "steps")]
-            rt::println!(
-                "pkgd: work sha16k={} parse={} ed25519={} manifest16k={}",
-                SHA_TICKS.load(Acquire),
-                PARSE_TICKS.load(Acquire),
-                SIGN_TICKS.load(Acquire),
-                MANIFEST_TICKS.load(Acquire)
-            );
+            {
+                // The line again only when one of the longest times grew.
+                let times = [&SHA_TICKS, &PARSE_TICKS, &SIGN_TICKS, &MANIFEST_TICKS]
+                    .map(|t| t.load(Acquire));
+                if times.iter().sum::<u64>() != LAST_WORK.swap(times.iter().sum(), Release) {
+                    rt::println!(
+                        "pkgd: work sha16k={} parse={} ed25519={} manifest16k={}",
+                        times[0],
+                        times[1],
+                        times[2],
+                        times[3]
+                    );
+                }
+            }
         }
     }
 }
