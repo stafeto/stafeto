@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 65] = [
+pub const CHECKS: [&str; 66] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -64,6 +64,7 @@ pub const CHECKS: [&str; 65] = [
     "timewait-syn",
     "reuseport-4",
     "reuseport-handoff",
+    "reuseport-churn",
     "reuseport-uid",
     "linger-0",
     "linger-wait",
