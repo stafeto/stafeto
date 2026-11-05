@@ -322,6 +322,13 @@ fn main(_: u64) -> u64 {
     }
     let command = config_read(virtio_pci::COMMAND) & 0xFFFF;
     config_write(virtio_pci::COMMAND, virtio_pci::bus_master(command));
+    // QEMU lets the device master the bus without the bit, and VZ ignores a
+    // reset of it, so the machine does not show a driver that lost it: the
+    // driver reads the word back.
+    if config_read(virtio_pci::COMMAND) & virtio_pci::BUS_MASTER == 0 {
+        rt::println!("virtio-blk: bus mastering is off");
+        return NOT_STARTED;
+    }
     let negotiated = virtio_mmio::start_with(&mut transport, feature::WANTED)
         .ok()
         .and_then(negotiate);
