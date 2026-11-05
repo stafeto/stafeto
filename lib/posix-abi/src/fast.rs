@@ -35,7 +35,7 @@ use proto_net::fast::{self as wire, Claimed, RING_PAGES};
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights};
 use rt::handle::{Channel, Handle, Memory, Timer};
-use rt::sys::{self, Received};
+use rt::sys;
 
 /// The label of the wait's timer on the thread's channel: next to
 /// `FAST_LABEL` and outside `FAST_MASK`.
