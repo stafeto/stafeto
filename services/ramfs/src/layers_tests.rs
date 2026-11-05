@@ -1325,3 +1325,45 @@ fn the_tables_the_kernel_prepays_for_the_mappings_of_layers_have_a_bound() {
     // Sixty-four small layers take 192: past the bound, so the service refuses the 54th.
     assert!(54 * table_pages(4096) > TABLE_PAGES_MAX && 53 * table_pages(4096) <= TABLE_PAGES_MAX);
 }
+
+#[test]
+fn a_name_a_user_makes_in_the_bucket_between_the_steps_of_a_search_is_found_after_it() {
+    let mut ram = ram();
+    let bytes = Spec::new()
+        .file("/a", 0o644, b"1")
+        .file("/b", 0o644, b"2")
+        .file("/c", 0o644, b"3")
+        .file("/d", 0o644, b"4")
+        .build();
+    let one = crate::storage::tests_support::OneBucket::new();
+    let index = ram.storage.layer_begin_attach(1, false).unwrap();
+    ram.storage
+        .layer_mapped(index, bytes.as_ptr(), bytes.len())
+        .unwrap();
+    let mut made = false;
+    let mut mine = None;
+    let mut last = LayerReply::Resolving;
+    for _ in 0..1_000 {
+        last = ram.storage.layer_step(1, NOW, &Limits::PORTIONS);
+        // Three names are in and the search for the fourth has taken a link: a user makes
+        // the same name, which goes to the head of the chain.
+        if !made && ram.storage.layer_names(1) == 3 {
+            last = ram.storage.layer_step(1, NOW, &Limits::PORTIONS);
+            mine = Some(user_file(&mut ram, ROOT, b"d"));
+            made = true;
+        }
+        if last != LayerReply::Resolving {
+            break;
+        }
+    }
+    assert_eq!(
+        last,
+        LayerReply::Entry {
+            status: CONFLICT,
+            entry: 3
+        }
+    );
+    settle(&mut ram);
+    assert_eq!(path(&ram, "/d").ok(), mine);
+    drop(one);
+}

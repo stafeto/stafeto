@@ -357,6 +357,7 @@ fn run(steps: bool) -> Result<Vec<String>, String> {
         "layer-probe: 2 conflict, set-ID and table refusals ok",
         "layer-probe: 3 detach, open file, release and unmap ok",
         "layer-probe: 4 big three times beside a reader ok",
+        "layer-probe: 5 a refused unmap keeps the record ok",
         "layer-user: good looked at ok",
         "layer-user: open file and program after the detach ok",
         "layer-user: ok",

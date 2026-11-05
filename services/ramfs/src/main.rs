@@ -67,7 +67,7 @@ const METHODS: &[u16] = BASE_METHODS;
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
-        + cfg!(feature = "layer-probe") as usize
+        + 2 * cfg!(feature = "layer-probe") as usize
         + cfg!(feature = "steps") as usize
         + 3 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
@@ -78,7 +78,8 @@ const METHODS: &[u16] = &{
     }
     if cfg!(feature = "layer-probe") {
         methods[i] = 0xfff0;
-        i += 1;
+        methods[i + 1] = 0xfff1;
+        i += 2;
     }
     if cfg!(feature = "steps") {
         methods[i] = 0xfff5;
@@ -437,6 +438,8 @@ fn main(_: u64) -> u64 {
         cancel_reported: 0,
         mapper,
         mapping: Mapping::Idle,
+        #[cfg(feature = "layer-probe")]
+        refuse_unmap: false,
         layer_pending: None,
         layer_channels: [const { None }; LAYERS_MAX],
         layer_sizes: [0; LAYERS_MAX],
@@ -466,6 +469,8 @@ struct Fs {
     /// The thread that maps and unmaps the objects of layers, and what it does now.
     mapper: Option<mapper::Mapper>,
     mapping: Mapping,
+    #[cfg(feature = "layer-probe")]
+    refuse_unmap: bool,
     /// The reply to the LayerStart of an attach, which waits for the mapping.
     layer_pending: Option<Pending>,
     /// For each layer record: the channel to tell its client of the release, the size of the
@@ -1769,6 +1774,14 @@ impl Fs {
         let Some(outcome) = mapper.take() else {
             return;
         };
+        #[cfg(feature = "layer-probe")]
+        let outcome = if matches!(self.mapping, Mapping::Releasing(_))
+            && core::mem::take(&mut self.refuse_unmap)
+        {
+            Err(rt::abi::Error::BadState)
+        } else {
+            outcome
+        };
         match core::mem::replace(&mut self.mapping, Mapping::Idle) {
             Mapping::Attaching(index) => {
                 let pending = self.layer_pending.take();
@@ -2459,6 +2472,16 @@ impl Service<0> for Fs {
         #[cfg(feature = "layer-probe")]
         if r.method() == 0xfff0 {
             return self.mapping_count(s, r);
+        }
+        // The next unmapping of a layer is refused (a fault for the probe to see that the
+        // record of a layer whose window stays mapped is kept and not told as released).
+        #[cfg(feature = "layer-probe")]
+        if r.method() == 0xfff1 {
+            if !matches!(s.data.binding, Binding::Boot) && !proto_fs::is_boot_profile(r.label()) {
+                return status(proto_fs::PERMISSION);
+            }
+            self.refuse_unmap = true;
+            return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "image-info-probe")]
         if r.method() == 0xfff7 {

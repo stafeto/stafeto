@@ -250,6 +250,36 @@ impl Probe {
         must!(self.notified(3, 2000), "no notification of good again");
         must!(self.mappings()? == before, "all mappings are back");
         rt::println!("layer-probe: 4 big three times beside a reader ok");
+        drop(big);
+        drop(again);
+        // 5. An unmapping the kernel refuses (the service is made to see one): the layer is
+        // not told as released and its record stays.
+        let mut w = Writer::new();
+        Header::new(0xfff1, proto_fs::VERSION)
+            .write(&mut w)
+            .map_err(|_| "header")?;
+        sys::send(&self.profile, w.as_bytes()).map_err(|_| "the fault call")?;
+        let layer = self.load("good")?;
+        must!(
+            matches!(self.attach(9, &layer, true)?, LayerReply::Done { .. }),
+            "attach for the refused unmap"
+        );
+        must!(
+            matches!(self.detach(9)?, LayerReply::Done { .. }),
+            "detach for the refused unmap"
+        );
+        must!(
+            !self.notified(9, 500),
+            "a refused unmap was told as released"
+        );
+        must!(
+            self.attach(9, &layer, false)?
+                == (LayerReply::Refused {
+                    status: ALREADY_EXISTS
+                }),
+            "the record of a layer whose window stayed was taken again"
+        );
+        rt::println!("layer-probe: 5 a refused unmap keeps the record ok");
         Ok(())
     }
 
