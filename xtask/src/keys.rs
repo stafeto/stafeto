@@ -19,7 +19,7 @@ use pkgfmt::cert::{self, Certificate};
 use pkgfmt::{Key, Name, keyfile, sig, time};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const DAY: u64 = 86_400;
@@ -106,7 +106,15 @@ pub fn generate(role: Role, name: &str, dir: &Path, root: &Path) -> Result<Strin
             role.word()
         ));
     }
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // A directory that is not there yet is made closed to other users; one
+    // that exists keeps the mode its owner gave it.
+    if !dir.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     check_dir(dir, root)?;
     let seed = random_seed()?;
     let pair = Key {
@@ -205,6 +213,35 @@ pub struct Signing {
     pub certificate: Option<[u8; cert::SIZE]>,
 }
 
+/// The roots and the direct keys that must accept what `s` signs: the root
+/// that issued its certificate (`keys/<issuer>.pub` of the tree when there is
+/// such a file, else the root of the development keys), or the key itself
+/// when it has no certificate.
+pub fn trust_of(s: &Signing, tree: &Path) -> Result<(Vec<Key>, Vec<Key>), String> {
+    let Some(bytes) = &s.certificate else {
+        let key = Key {
+            name: s.key,
+            public: sig::public_key(&s.seed),
+        };
+        return Ok((Vec::new(), vec![key]));
+    };
+    let c = Certificate::parse(bytes).map_err(|e| format!("certificate: {e}"))?;
+    let official = tree.join("keys").join(format!("{}.pub", c.issuer.as_str()));
+    if official.is_file() {
+        return Ok((vec![read_public(&official)?], Vec::new()));
+    }
+    let dev = dev_keys(tree)?;
+    if dev.root.name != c.issuer {
+        return Err(format!(
+            "the certificate of {} is issued by {}, which is neither keys/{}.pub nor the development root",
+            c.key.as_str(),
+            c.issuer.as_str(),
+            c.issuer.as_str()
+        ));
+    }
+    Ok((vec![dev.root], Vec::new()))
+}
+
 pub fn signing(
     key: Option<&Path>,
     certificate: Option<&Path>,
@@ -220,7 +257,17 @@ pub fn signing(
             let certificate = match cert_path {
                 Some(p) => {
                     let bytes = fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-                    Certificate::parse(&bytes).map_err(|e| format!("{}: {e}", p.display()))?;
+                    let c =
+                        Certificate::parse(&bytes).map_err(|e| format!("{}: {e}", p.display()))?;
+                    let seed_public = sig::public_key(&read_private(key)?);
+                    if c.key != name || c.public != seed_public {
+                        return Err(format!(
+                            "{}: the certificate is of {} with another public key than the private key {} has",
+                            p.display(),
+                            c.key.as_str(),
+                            key.display()
+                        ));
+                    }
                     let mut out = [0u8; cert::SIZE];
                     out.copy_from_slice(&bytes);
                     Some(out)
@@ -709,6 +756,102 @@ mod tests {
         c.root_key = dir.join("t-root.key");
         c.key = dir.join("other-release.pub");
         assert!(certify(&c, &tree).unwrap_err().contains("is named"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_key_directory_is_closed_to_other_users() {
+        let base = scratch("mode");
+        let nested = base.join("a").join("keys");
+        generate(Role::Root, "t-root", &nested, &crate::root()).unwrap();
+        for d in [&nested, &base.join("a")] {
+            assert_eq!(fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        // An existing directory keeps its mode.
+        let open = base.join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        generate(Role::Release, "t-release", &open, &crate::root()).unwrap();
+        assert_eq!(
+            fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_root_named_like_the_official_one_must_be_that_key() {
+        let dir = scratch("official");
+        let tree = crate::root();
+        generate(Role::Root, "stafeto-root-1", &dir, &tree).unwrap();
+        generate(Role::Release, "t-release", &dir, &tree).unwrap();
+        let err = certify(
+            &Certify {
+                root_key: dir.join("stafeto-root-1.key"),
+                key: dir.join("t-release.pub"),
+                purposes: 1,
+                from: 0,
+                days: 1,
+                out: None,
+            },
+            &tree,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("is not the one that keys/stafeto-root-1.pub names"),
+            "{err}"
+        );
+        assert!(!dir.join("t-release.cert").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_certificate_of_another_key_is_refused_for_signing() {
+        let dir = scratch("signing");
+        let tree = crate::root();
+        generate(Role::Root, "t-root", &dir, &tree).unwrap();
+        generate(Role::Release, "t-release", &dir, &tree).unwrap();
+        generate(Role::Release, "t-release-2", &dir, &tree).unwrap();
+        let mut c = Certify {
+            root_key: dir.join("t-root.key"),
+            key: dir.join("t-release.pub"),
+            purposes: 1,
+            from: 0,
+            days: 1,
+            out: None,
+        };
+        certify(&c, &tree).unwrap();
+        // The certificate of t-release with the private key of t-release: fine.
+        let good = signing(
+            Some(&dir.join("t-release.key")),
+            Some(&dir.join("t-release.cert")),
+            &tree,
+        )
+        .unwrap();
+        assert!(good.certificate.is_some());
+        // With the private key of another pair, and with another name: refused.
+        fs::copy(dir.join("t-release.cert"), dir.join("t-release-2.cert")).unwrap();
+        let err = signing(
+            Some(&dir.join("t-release-2.key")),
+            Some(&dir.join("t-release-2.cert")),
+            &tree,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("another public key"), "{err}");
+        // Same name, another key: a key file t-release.key of a second pair.
+        let other = dir.join("other");
+        fs::create_dir(&other).unwrap();
+        generate(Role::Release, "t-release", &other, &tree).unwrap();
+        let err = signing(
+            Some(&other.join("t-release.key")),
+            Some(&dir.join("t-release.cert")),
+            &tree,
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("another public key"), "{err}");
+        c.days = 1;
         fs::remove_dir_all(&dir).unwrap();
     }
 }

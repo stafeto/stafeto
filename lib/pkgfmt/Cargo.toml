@@ -12,7 +12,8 @@ bench = false
 
 [dependencies]
 bootimg = { path = "../bootimg" }
-ed25519-compact = { version = "2.6", default-features = false }
+# Pinned: the strict checks of verification live in this crate (a test in sig.rs).
+ed25519-compact = { version = "=2.6.0", default-features = false }
 sha2 = { version = "0.11", default-features = false }
 
 [features]

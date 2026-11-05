@@ -67,6 +67,13 @@ impl<'a> Package<'a> {
         if trailer.covered != covered as u64 {
             return Err(Error::LengthMismatch);
         }
+        // The reader of the table looks for a repeated name among all the
+        // files before, so the number of files is bounded before it runs.
+        if covered < 16 || crate::u32_at(bytes, 12) > FILES_MAX {
+            return Err(Error::BadLayout(
+                "more content files than entries are allowed",
+            ));
+        }
         let image = BootImage::parse_as(&bytes[..covered], &PACKAGE).map_err(Error::Container)?;
         let count = image.count();
         if count < 3 {
@@ -541,6 +548,90 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_file_count_is_refused_before_the_table_is_read() {
+        let good = build(&items());
+        for count in [FILES_MAX + 1, 600_000, u32::MAX] {
+            let mut b = good.clone();
+            b[12..16].copy_from_slice(&count.to_le_bytes());
+            assert_eq!(
+                Package::parse(&b).err(),
+                Some(Error::BadLayout(
+                    "more content files than entries are allowed"
+                ))
+            );
+        }
+        // A hostile file of 30 MB with a table of 600 000 empty files at one
+        // place is refused at once.
+        let mut big = alloc::vec![0u8; 30_000_000 / 4096 * 4096];
+        big[..8].copy_from_slice(b"STAFPKG1");
+        big[8..12].copy_from_slice(&1u32.to_le_bytes());
+        big[12..16].copy_from_slice(&600_000u32.to_le_bytes());
+        let tail = big.len() - TRAILER_SIZE;
+        let block = Block::sign(
+            &REL,
+            Kind::Package,
+            tail as u64,
+            [0; 32],
+            1,
+            n("t-release"),
+            None,
+        );
+        big[tail..tail + BLOCK_SIZE].copy_from_slice(&block.to_bytes());
+        let started = std::time::Instant::now();
+        assert!(Package::parse(&big).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn corrupted_and_cut_packages_give_errors_and_no_panic() {
+        let good = build(&items());
+        let roots = trust_keys();
+        let trust = Trust {
+            roots: &roots,
+            direct: &[],
+        };
+        let check = |b: &[u8]| match Package::parse(b) {
+            Err(_) => true,
+            Ok(p) => p.verify(&trust, &[]).is_err(),
+        };
+        // Every cut at a boundary of 8 bytes is an error.
+        for cut in (0..good.len()).step_by(8) {
+            assert!(Package::parse(&good[..cut]).is_err(), "cut at {cut}");
+        }
+        // Every changed byte of the header, the table, the three texts and the
+        // trailer is an error of parse or of the signature check; so is every
+        // 97th byte of the contents.
+        let p = Package::parse(&good).unwrap();
+        let table_end = 16 + 48 * p.image.count() as usize;
+        let mut regions: Vec<core::ops::Range<usize>> =
+            vec![0..table_end, good.len() - TRAILER_SIZE..good.len()];
+        for n in 0..3 {
+            let f = p.image.file_at(n).unwrap();
+            regions.push(f.offset as usize..f.offset as usize + f.data.len());
+        }
+        let mut flips = 0;
+        for r in regions {
+            for at in r {
+                let mut b = good.clone();
+                b[at] ^= 0x55;
+                assert!(check(&b), "byte {at}");
+                flips += 1;
+            }
+        }
+        for at in (0..good.len()).step_by(97) {
+            let mut b = good.clone();
+            b[at] ^= 0xff;
+            assert!(check(&b), "byte {at}");
+        }
+        assert!(flips > 1000);
+        // Garbage of every length up to two pages does not panic either.
+        for len in 0..8192 {
+            let junk: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let _ = Package::parse(&junk);
+        }
+    }
+
+    #[test]
     fn parse_alone_refuses_a_covered_length_that_is_not_the_package() {
         let good = build(&items());
         let tail = good.len() - TRAILER_SIZE;
@@ -610,7 +701,7 @@ mod tests {
         b[at.offset as usize..at.offset as usize + swapped.len()]
             .copy_from_slice(swapped.as_bytes());
         assert_eq!(verify_err(&b), Error::BadManifest(1));
-        // A flipped content byte is found by the hashing check, not by parse.
+        // The hashing check finds a flipped content byte; parse passes it.
         let mut b = good.clone();
         let c = p.image.file_at(7).unwrap().offset as usize;
         b[c] ^= 1;

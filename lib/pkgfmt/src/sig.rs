@@ -251,6 +251,56 @@ mod tests {
         );
     }
 
+    /// The group order L of Ed25519, little endian.
+    const L: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+    ];
+
+    #[test]
+    fn verification_is_strict() {
+        let (secret, public, message, signature) = RFC8032[0];
+        let seed: [u8; 32] = unhex(secret).try_into().unwrap();
+        let public: [u8; 32] = unhex(public).try_into().unwrap();
+        let message = unhex(message);
+        let good: [u8; 64] = unhex(signature).try_into().unwrap();
+        assert!(verify(&public, &message, &good));
+        assert_eq!(sign(&seed, &message), good);
+        // S + L is the same point equation, and a strict verifier refuses it.
+        let mut malleable = good;
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(good[32 + i]) + u16::from(L[i]) + carry;
+            malleable[32 + i] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0);
+        assert!(!verify(&public, &message, &malleable));
+        // A key of small order (the identity point, and the point of order
+        // two) checks no signature.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut order_two = [0u8; 32];
+        order_two[..31].fill(0xff);
+        order_two[0] = 0xec;
+        order_two[31] = 0x7f;
+        for weak in [identity, order_two] {
+            assert!(!verify(&weak, &message, &good));
+            let mut forged = [0u8; 64];
+            forged[0] = 1; // R is the identity, S is 0: the equation holds for any message with a weak A
+            assert!(!verify(&weak, b"anything", &forged));
+        }
+        // R with a non-canonical encoding (y = p + 1, the identity again), and
+        // the same for the key.
+        let mut alias = [0xffu8; 32];
+        alias[0] = 0xee;
+        alias[31] = 0x7f;
+        let mut bent = good;
+        bent[..32].copy_from_slice(&alias);
+        assert!(!verify(&public, &message, &bent));
+        assert!(!verify(&alias, &message, &good));
+    }
+
     fn sample() -> Block {
         Block::sign(
             &[7; 32],

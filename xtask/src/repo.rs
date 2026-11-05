@@ -103,11 +103,41 @@ fn sha_hex(data: &[u8]) -> String {
     sha::hex(&sha::sha256(data), &mut buf).to_string()
 }
 
+/// Makes `dir` ready for a new repository: a directory under `target/` is
+/// emptied (it is the tool's own); any other directory must not exist or be
+/// empty, so that no option can delete what the tool did not make.
+fn prepare(dir: &Path) -> Result<(), String> {
+    let target = crate::root().join("target");
+    let canonical = |p: &Path| p.canonicalize().ok();
+    let under_target = match (canonical(dir), canonical(&target)) {
+        (Some(d), Some(t)) => d != t && d.starts_with(&t),
+        _ => false,
+    };
+    if !dir.exists() {
+        return Ok(());
+    }
+    if under_target {
+        return std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()));
+    }
+    let empty = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .next()
+        .is_none();
+    if empty {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: the directory is not empty and not under target/; repo deletes only what it made there",
+            dir.display()
+        ))
+    }
+}
+
 /// The whole of `repo` for the packages built: the directory.
 pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, String> {
     let tree = crate::root();
     let dir = o.dir.clone().unwrap_or_else(directory);
-    let _ = std::fs::remove_dir_all(&dir);
+    prepare(&dir)?;
     std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let dev = keys::dev_keys(&tree)?;
     let signing = keys::signing(o.key.as_deref(), o.cert.as_deref(), &tree)?;
@@ -208,6 +238,24 @@ pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, St
         signing.key,
         signing.certificate,
     );
+    let (roots, direct) = keys::trust_of(&signing, &tree)?;
+    pkgfmt::trust::verify(
+        &block,
+        Kind::Index,
+        &sha::sha256(text.as_bytes()),
+        text.len() as u64,
+        &Trust {
+            roots: &roots,
+            direct: &direct,
+        },
+        &[],
+    )
+    .map_err(|e| {
+        format!(
+            "INDEX: the signature of the key {} is not accepted: {e}",
+            signing.key.as_str()
+        )
+    })?;
     std::fs::write(dir.join("INDEX"), &text).map_err(|e| format!("INDEX: {e}"))?;
     std::fs::write(dir.join("INDEX.sig"), block.to_bytes())
         .map_err(|e| format!("INDEX.sig: {e}"))?;
@@ -565,6 +613,29 @@ mod tests {
         std::fs::write(dir.join("revoked.sig"), block.to_bytes()).unwrap();
         assert!(check(&dir, &[root]).unwrap_err().contains("Revoked"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repo_deletes_only_what_it_made() {
+        let tmp = std::env::temp_dir().join(format!("stafeto-prepare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Missing and empty directories outside target/ are fine.
+        assert!(prepare(&tmp.join("new")).is_ok());
+        assert!(prepare(&tmp).is_ok());
+        // One with files in it, or the tree itself, is refused and kept.
+        std::fs::write(tmp.join("precious"), b"x").unwrap();
+        assert!(prepare(&tmp).unwrap_err().contains("not empty"));
+        assert!(tmp.join("precious").exists());
+        assert!(prepare(&crate::root()).is_err());
+        assert!(prepare(&crate::root().join("xtask")).is_err());
+        std::fs::remove_dir_all(&tmp).unwrap();
+        // Under target/ the directory is the tool's own.
+        let own = crate::root().join("target").join("prepare-test");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("old"), b"x").unwrap();
+        assert!(prepare(&own).is_ok());
+        assert!(!own.exists());
     }
 
     #[test]

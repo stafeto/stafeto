@@ -300,8 +300,8 @@ link programs (for a package with programs) and `build-depends <name>
   development keys of `target/keys/` sign (`keys.rs`); the signature block
   holds the certificate of `stafeto-dev-release` from `stafeto-dev-root`.
 - `cargo xtask repo [--serial N] [--expires-days D] [--no-sources]
-  [--key K.key --cert K.cert] [--check]` builds all packages and lays out
-  `target/repo/<series>/aarch64/`: the packages, `INDEX` and `INDEX.sig`,
+  [--key K.key --cert K.cert] [--dir D] [--check]` builds all packages and lays out
+  `target/repo/<series>/aarch64/` (or `D`, which must be new, empty or under `target/`: `repo` deletes only what it made there): the packages, `INDEX` and `INDEX.sig`,
   `revoked` and `revoked.sig` (an empty list signed by the development
   root) and `src/`. An index lives 30 days at most. A package whose licence,
   or the licence of a package linked into it, is a GPL licence gets

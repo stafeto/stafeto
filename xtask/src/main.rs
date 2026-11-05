@@ -1651,7 +1651,8 @@ commands:
   pkg-build [name...]  build the package files (.stpkg) in target/pkg; `--recipe` prints the inputs
             of the fingerprints instead (docs/packages.md)
   repo      build the package files and a signed repository of them in target/repo
-            (`--check` checks one; `--no-sources` skips the source archives)
+            (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
+            in another directory, which must be empty or new, or under target/)
   pkg-identity  check that the flat images and the packages give the same bytes at the same
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they

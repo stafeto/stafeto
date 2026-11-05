@@ -280,7 +280,7 @@ def crypto(data: dict, packages: dict, named: dict) -> None:
     link too; all of them are under permissive licences."""
     pkgfmt = named["pkgfmt"]
     if pkgfmt["license"] != "MIT":
-        fail(f"pkgfmt is {pkgfmt['license']!r}, not MIT")
+        fail(f"pkgfmt is {pkgfmt['license']!r}; it must be MIT")
     outside = []
     for package_id in closure(data, [pkgfmt["id"]]):
         package = packages[package_id]

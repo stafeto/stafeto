@@ -337,7 +337,7 @@ fn python_names(text: &str) -> Vec<String> {
 /// `deps` the recipes of the packages linked in.
 pub fn recipe_lines(
     root: &Path,
-    list: &dyn Fn(&str) -> Vec<String>,
+    list: &dyn Fn(&str) -> Result<Vec<String>, String>,
     p: &Package,
     all: &[Package],
     data: &[(String, String)],
@@ -373,7 +373,7 @@ pub fn recipe_lines(
     dirs.dedup();
     let mut tracked: BTreeSet<String> = BTreeSet::new();
     for d in &dirs {
-        tracked.extend(list(d));
+        tracked.extend(list(d)?);
     }
     for path in tracked {
         lines.push(file(&path)?);
@@ -407,14 +407,16 @@ pub fn recipe_hash(lines: &[String]) -> String {
     sha256_hex(text.as_bytes())
 }
 
-fn git_list(dir: &str) -> Vec<String> {
+/// The files of the tree under `dir` that git knows. A failure of git stops
+/// the build: a recipe made without them would differ from the true one.
+fn git_list(dir: &str) -> Result<Vec<String>, String> {
     run_output(
         Command::new("git")
             .args(["ls-files", dir])
             .current_dir(crate::root()),
     )
     .map(|s| s.lines().map(str::to_string).collect())
-    .unwrap_or_default()
+    .map_err(|e| format!("the inputs of the recipe under {dir}: {e}"))
 }
 
 /// The version of the clang that builds relibc and the programs.
@@ -589,7 +591,7 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         .clone()
         .unwrap_or_else(|| crate::target_dir().join("pkg"));
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
-    let trust_root = keys::dev_keys(&tree).ok();
+    let (roots, direct) = keys::trust_of(&signing, &tree)?;
     let mut built = Vec::new();
     for p in selected {
         let recipe = recipes[&p.name].0.clone();
@@ -658,18 +660,21 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         file.check_policy(&p.name)
             .map_err(|e| format!("{}: {e}", p.name))?;
         Manifest::check(&file).map_err(|e| format!("{}: {e}", p.name))?;
-        if let Some(dev) = &trust_root
-            && opts.key.is_none()
-        {
-            file.verify(
-                &pkgfmt::Trust {
-                    roots: &[dev.root],
-                    direct: &[],
-                },
-                &[],
+        // What the device would do with the file: it must accept it.
+        file.verify(
+            &pkgfmt::Trust {
+                roots: &roots,
+                direct: &direct,
+            },
+            &[],
+        )
+        .map_err(|e| {
+            format!(
+                "{}: the signature of the key {} is not accepted: {e}",
+                p.name,
+                signing.key.as_str()
             )
-            .map_err(|e| format!("{}: {e}", p.name))?;
-        }
+        })?;
         let path = out_dir.join(file_name(p));
         let temp = path.with_extension("stpkg.part");
         std::fs::write(&temp, &bytes).map_err(|e| format!("{}: {e}", temp.display()))?;
@@ -807,7 +812,7 @@ mod tests {
         let _ = build;
         recipe_lines(
             root,
-            &|d| walk(root, d),
+            &|d| Ok(walk(root, d)),
             p,
             all,
             &[(format!("/bin/{name}"), data.into())],
@@ -862,7 +867,7 @@ mod tests {
         let p = &all[0];
         let with = recipe_lines(
             &root,
-            &|d| walk(&root, d),
+            &|d| Ok(walk(&root, d)),
             p,
             &all,
             &[],
@@ -874,6 +879,25 @@ mod tests {
         assert!(with.contains(&"pin relibc abc".to_string()));
         assert!(with.contains(&"build-depends z r".to_string()));
         assert!(with.windows(2).all(|w| w[0] <= w[1]));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_failing_git_stops_the_recipe() {
+        let root = scratch("git");
+        tree(&root);
+        let all = [package("a", "tools/build-a.py")];
+        let err = recipe_lines(
+            &root,
+            &|_| Err("git is gone".to_string()),
+            &all[0],
+            &all,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("git is gone"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
