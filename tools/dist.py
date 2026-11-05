@@ -6,7 +6,10 @@
 the archive to run in QEMU, the kernel with its symbols, the sources of the
 GPL packages with our build scripts, the SBOM and SHA256SUMS, in the output
 directory. xtask builds the kernel and the boot image and passes them here;
-the sources of the packages come from packages/*.toml at their SHA-256."""
+the sources of the packages come from packages/*.toml at their SHA-256. The
+archive of the shell image carries the notices of the packages the image
+holds and no others: `cargo xtask dist` builds those packages and passes the
+directory of their notices (`--licenses`)."""
 
 import argparse
 import gzip
@@ -18,7 +21,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import zipfile
 import urllib.request
 from pathlib import Path
 
@@ -29,16 +31,6 @@ import pkgdesc  # noqa: E402
 ROOT = pkgdesc.ROOT
 HERE = Path(__file__).resolve().parent
 RELIBC_REPOSITORY = "https://github.com/stafeto/relibc"
-# What a source tree names its licence text.
-LICENSE_NAMES = re.compile(r"^(COPYING|COPYING\.[A-Za-z0-9]+|LICENSE|LICENSE\.[a-z]+|LICENCE|UNLICENSE|COPYRIGHT)$")
-# The licence texts of packages whose source carries none, with their
-# SHA-256: the bundle of root certificates is one PEM file under MPL-2.0.
-PACKAGE_LICENSES = {
-    "ca-bundle": (HERE / "ca-bundle" / "MPL-2.0.txt",
-                  "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"),
-}
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
@@ -62,10 +54,6 @@ def matches(path: Path, expected: str) -> bool:
                 digest.update(block)
         return digest.hexdigest() == expected
     return False
-
-
-def package_names() -> list[str]:
-    return sorted(path.stem for path in (ROOT / "packages").glob("*.toml"))
 
 
 def is_gpl(expression: str) -> bool:
@@ -96,43 +84,6 @@ def fetch(description: dict, cache: Path) -> Path:
     return path
 
 
-def license_texts(archive: Path, wanted: str = "") -> dict[str, bytes]:
-    """The licence files in the top two directories of a source archive, and
-    the file `wanted` (a path below the top directory) the description names.
-    A source that is one file (the PEM file of the root certificates) gives
-    the lines of its header that begin with `##`, which name its origin."""
-    found = {}
-    if not zipfile.is_zipfile(archive) and not tarfile.is_tarfile(archive):
-        lines = []
-        with archive.open("rb") as file:
-            for line in file:
-                if not line.startswith(b"##"):
-                    break
-                lines.append(line)
-        if lines:
-            found["cacert.pem.NOTICE"] = b"".join(lines)
-        return found
-
-    def take(name: str, read) -> None:
-        parts = name.split("/")
-        if (len(parts) <= 2 and LICENSE_NAMES.match(parts[-1])
-                or wanted and "/".join(parts[1:]) == wanted):
-            found[parts[-1]] = read()
-
-    # Most sources come as tarballs; a release such as Freedoom comes as a zip.
-    if zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as zip_file:
-            for info in zip_file.infolist():
-                if not info.is_dir():
-                    take(info.filename, lambda info=info: zip_file.read(info))
-        return found
-    with tarfile.open(archive) as tar:
-        for member in tar:
-            if member.isfile():
-                take(member.name, lambda member=member: tar.extractfile(member).read())
-    return found
-
-
 def git_archive(directory: Path, prefix: str, destination: Path, revision: str = "HEAD") -> None:
     with destination.open("wb") as file:
         subprocess.run(["git", "archive", "--format=tar", f"--prefix={prefix}/", revision],
@@ -152,7 +103,23 @@ def write_tar_xz(destination: Path, directory: Path) -> None:
                     recursive=False, filter=normal)
 
 
-def stage_licenses(stage: Path, version: str, cache: Path) -> None:
+def archive_packages(licenses: Path) -> list[tuple[str, str, str]]:
+    """The packages of the archive: name, version-release and SPDX licence,
+    from `packages.txt` of the directory of notices."""
+    rows = []
+    for line in (licenses / "packages.txt").read_text().splitlines():
+        name, version, license_name = line.split("\t")
+        rows.append((name, version, license_name))
+    return rows
+
+
+def source_names(licenses: Path) -> list[str]:
+    """The packages whose sources and records the archive owes: those it
+    holds and the packages linked into them."""
+    return sorted((licenses / "sources.txt").read_text().split())
+
+
+def stage_licenses(stage: Path, version: str, licenses: Path) -> None:
     out = stage / "LICENSES"
     out.mkdir()
     for name in ("LICENSE", "LICENSE-MIT", "LICENSE-GCC-exception-3.1"):
@@ -170,37 +137,15 @@ def stage_licenses(stage: Path, version: str, cache: Path) -> None:
              f"relibc (pin {relibc_commit()[:8]}): see relibc-THIRD-PARTY-NOTICES",
              "crates from crates.io that the services and programs link"
              " (virtio-drivers, smoltcp and theirs): see relibc-THIRD-PARTY-NOTICES"]
-    for name in package_names():
-        description = pkgdesc.load(name)
-        index.append(f"{name} {description['version']}: {description['license']}")
-        wanted = description.get("license_file", "")
-        texts = license_texts(fetch(description, cache), wanted)
-        if wanted:
-            texts = {k: v for k, v in texts.items() if k == Path(wanted).name} or texts
-        target = out / "packages" / name
-        target.mkdir(parents=True)
-        for file_name, data in texts.items():
-            (target / file_name).write_bytes(data)
-        if name in PACKAGE_LICENSES:
-            path, expected = PACKAGE_LICENSES[name]
-            if sha256_file(path) != expected:
-                raise SystemExit(f"dist: {path} has an unexpected SHA-256")
-            shutil.copy(path, target / path.name)
-        # A description with an empty `license_file` (paxmirabilis) names a
-        # source whose files state the terms in their headers; the image
-        # carries them in UTILITIES-LICENSE.
-        if not texts and description.get("license_file") != "":
-            raise SystemExit(f"dist: no licence text found in the source of {name}")
-    # The notices in the headers of the files of the ready-made utilities
-    # (paxmirabilis has no licence file), as the image carries them.
-    ready = ROOT / "target" / "ready-utils" / "notices"
-    if ready.exists():
-        shutil.copy(ready, out / "ready-utils-NOTICES")
-    index.append("ready-utils-NOTICES: the notices in the headers of the compiled files of the ready-made utilities")
+    # The notices of each package the image holds, as the package carries
+    # them in /usr/share/licenses/<name>/ (xtask extracted them).
+    for name, package_version, license_name in archive_packages(licenses):
+        index.append(f"{name} {package_version}: {license_name}")
+        shutil.copytree(licenses / name, out / "packages" / name)
     (out / "INDEX.txt").write_text("\n".join(index) + "\n")
 
 
-def sbom(version: str, commit: str, cache: Path) -> dict:
+def sbom(version: str, commit: str, names: list[str]) -> dict:
     packages = [{
         "SPDXID": "SPDXRef-stafeto", "name": "stafeto", "versionInfo": version,
         "downloadLocation": "https://github.com/stafeto/stafeto",
@@ -212,7 +157,7 @@ def sbom(version: str, commit: str, cache: Path) -> dict:
         "licenseDeclared": "MIT", "licenseConcluded": "NOASSERTION",
         "copyrightText": "NOASSERTION", "filesAnalyzed": False,
     }]
-    for name in package_names():
+    for name in names:
         d = pkgdesc.load(name)
         packages.append({
             "SPDXID": f"SPDXRef-{name}", "name": name, "versionInfo": d["version"],
@@ -232,11 +177,11 @@ def sbom(version: str, commit: str, cache: Path) -> dict:
     }
 
 
-def stage_sources(stage: Path, version: str, cache: Path) -> None:
+def stage_sources(stage: Path, version: str, cache: Path, names: list[str]) -> None:
     packages = stage / "packages"
     packages.mkdir(parents=True)
     gpl = []
-    for name in package_names():
+    for name in names:
         d = pkgdesc.load(name)
         if is_gpl(d["license"]):
             shutil.copy(fetch(d, cache), packages / cache_name(d))
@@ -310,6 +255,8 @@ def main() -> None:
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--boot", type=Path, required=True)
+    parser.add_argument("--licenses", type=Path, required=True,
+                        help="the notices of the packages of the image (target/dist-licenses)")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     version, out = args.version, args.out
@@ -327,7 +274,7 @@ def main() -> None:
     shutil.copy(HERE / "dist" / "run.sh", run / "run.sh")
     (run / "run.sh").chmod(0o755)
     (run / "README.md").write_text((HERE / "dist" / "README.md").read_text().replace("@VERSION@", version))
-    stage_licenses(run, version, cache)
+    stage_licenses(run, version, args.licenses)
     write_tar_xz(out / f"{run.name}.tar.xz", run)
 
     kernel = work / f"stafeto-{version}-kernel"
@@ -337,11 +284,12 @@ def main() -> None:
     write_tar_xz(out / f"{kernel.name}.tar.xz", kernel)
 
     sources = work / f"stafeto-{version}-gpl-sources"
-    stage_sources(sources, version, cache)
+    names = source_names(args.licenses)
+    stage_sources(sources, version, cache, names)
     write_tar_xz(out / f"{sources.name}.tar.xz", sources)
 
     (out / f"stafeto-{version}-sbom.spdx.json").write_text(
-        json.dumps(sbom(version, relibc_commit(), cache), indent=2) + "\n")
+        json.dumps(sbom(version, relibc_commit(), names), indent=2) + "\n")
     refuse_linux_guest(out, ROOT / "target" / "linux-guest")
     lines = [f"{sha256_file(p)}  {p.name}" for p in sorted(out.iterdir())]
     (out / "SHA256SUMS").write_text("\n".join(lines) + "\n")

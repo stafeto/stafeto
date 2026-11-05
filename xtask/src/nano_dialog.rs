@@ -21,7 +21,7 @@ pub fn nano_terms() -> Result<(Vec<u8>, Vec<u8>, String), String> {
     let curses = packages::value("ncurses", "version")?;
     let curses_sha256 = packages::value("ncurses", "sha256")?;
     let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-    let licence = read(target_dir().join(format!("nano/nano-{version}/COPYING")))?;
+    let licence = crate::notices::licence_text("nano")?;
     let ncurses = read(target_dir().join(format!("ncurses/ncurses-{curses}/COPYING")))?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(

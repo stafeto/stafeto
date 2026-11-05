@@ -6,11 +6,13 @@
 
 name = "freedoom"
 version = "0.13.0"
-kind = "game"
+kind = "optional"
+image = "games"
+release = "1"
+summary = "Freedoom Phase 1 game data"
 url = "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip"
 sha256 = "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59"
 license = "BSD-3-Clause"
-depends = ["busybox"]
 build = "tools/build-freedoom.py"
 dirs = ["/games"]
 files = [

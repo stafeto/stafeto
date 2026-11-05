@@ -18,8 +18,7 @@ fn version() -> Result<String, String> {
 pub fn htop_terms() -> Result<(Vec<u8>, String), String> {
     let version = version()?;
     let sha256 = packages::value("htop", "sha256")?;
-    let path = target_dir().join(format!("htop/htop-{version}/COPYING"));
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = crate::notices::licence_text("htop")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(
         "htop holds htop {version}, Copyright (C) the htop dev team and Hisham Muhammad.\n\

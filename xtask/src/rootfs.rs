@@ -313,7 +313,7 @@ const SYSTEM_PATHS: [&str; 49] = [
 
 /// Whether the base system owns `path`: the paths above and the device
 /// nodes below /dev.
-fn is_system(path: &str) -> bool {
+pub fn is_system(path: &str) -> bool {
     SYSTEM_PATHS.contains(&path)
         || path.starts_with("/dev/")
         // The sets W1 and W2 of the load, in the image of the measurement
@@ -685,16 +685,16 @@ pub fn package_table(
         bytes,
     ));
     let mut out = format!(
-        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "{:<12} {:<14} {:<17} {:<8} {:>6} {:>10}\n",
         "package", "version", "license", "kind", "files", "bytes"
     );
     for (name, version, license, kind, count, bytes) in &rows {
         out +=
-            &format!("{name:<12} {version:<14} {license:<17} {kind:<7} {count:>6} {bytes:>10}\n");
+            &format!("{name:<12} {version:<14} {license:<17} {kind:<8} {count:>6} {bytes:>10}\n");
     }
     let total: u64 = rows.iter().map(|r| r.5).sum();
     out += &format!(
-        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "{:<12} {:<14} {:<17} {:<8} {:>6} {:>10}\n",
         "total",
         "",
         "",
@@ -1830,24 +1830,27 @@ mod tests {
         assert!(error.contains("/bin/stray"), "{error}");
         // A path two packages name.
         let mut twice = packages.clone();
-        let path = twice[1].files[0].clone();
-        twice[2].files.push(path.clone());
+        let with_files: Vec<usize> = (0..twice.len())
+            .filter(|&n| !twice[n].files.is_empty())
+            .collect();
+        let path = twice[with_files[0]].files[0].clone();
+        twice[with_files[1]].files.push(path.clone());
         let error = check_owners(image, &files, &twice).unwrap_err();
         assert!(error.contains(&path.0), "{error}");
         // A file a package names and the image lacks.
         let mut lacking = packages.clone();
-        lacking[1]
+        lacking[with_files[0]]
             .files
             .push(("/bin/ghost".into(), "elf:busybox-probe".into()));
         let error = check_owners(image, &files, &lacking).unwrap_err();
         assert!(error.contains("/bin/ghost"), "{error}");
         // A package that installs nothing leaves nothing to own: its row
-        // has no files, and some other package depends on it (the fts of
+        // has no files, and some other package links it in (the fts of
         // pax).
         for p in packages.iter().filter(|p| p.files.is_empty()) {
             assert!(
-                packages.iter().any(|q| q.depends.contains(&p.name)),
-                "{} installs nothing and no package depends on it",
+                packages.iter().any(|q| q.build_depends.contains(&p.name)),
+                "{} installs nothing and no package links it in",
                 p.name
             );
         }

@@ -8,11 +8,13 @@
 name = "paxmirabilis"
 version = "20240817"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "pax archiver of MirBSD"
 url = "https://snapshot.debian.org/archive/debian/20240818T022821Z/pool/main/p/pax/pax_20240817.orig.tar.gz"
 sha256 = "c3afddd5c3df07859f6e4cfc16bbe8046ed08b862feaa1dbc345353086af8f4c"
 license = "BSD-3-Clause AND MirOS AND ISC"
 license_file = ""
-depends = ["busybox", "musl-fts"]
 build = "tools/build-busybox.py"
 files = [
   "/bin/pax = link:busybox",

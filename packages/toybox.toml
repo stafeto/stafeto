@@ -8,11 +8,13 @@
 name = "toybox"
 version = "0.8.15"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "Toybox utilities"
 url = "https://landley.net/toybox/downloads/toybox-0.8.15.tar.gz"
 sha256 = "323e8466849c40740ed1a061aa63260b72c6c4ab797858fedbd7028d256c28f9"
 license = "0BSD"
 license_file = "LICENSE"
-depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = [
   "/bin/file = link:busybox",

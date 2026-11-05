@@ -6,11 +6,15 @@
 
 name = "nano"
 version = "9.2"
-kind = "addon"
+kind = "optional"
+image = "shell"
+release = "1"
+summary = "GNU nano text editor"
 url = "https://ftp.gnu.org/gnu/nano/nano-9.2.tar.xz"
 sha256 = "05ecb99247b782e8a5b3a25ed4101dd034b0236902f7449bc9795b717642f7e9"
 license = "GPL-3.0-or-later"
-depends = ["busybox", "ncurses"]
+depends = ["ncurses"]
+build_depends = ["ncurses"]
 build = "tools/build-nano.py"
 program = "nano"
 files = [

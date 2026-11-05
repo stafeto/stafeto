@@ -277,11 +277,8 @@ pub fn terms_files() -> Result<[(&'static str, Vec<u8>); 4], String> {
     let pcre2 = packages::value("pcre2", "version")?;
     let pcre2_url = packages::value("pcre2", "url")?;
     let pcre2_sha256 = packages::value("pcre2", "sha256")?;
-    let read = |path: std::path::PathBuf| {
-        std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
-    };
-    let nginx_licence = read(nginx_source()?.join("LICENSE"))?;
-    let pcre2_licence = read(target_dir().join(format!("nginx/pcre2-{pcre2}/LICENCE.md")))?;
+    let nginx_licence = crate::notices::licence_text("nginx")?;
+    let pcre2_licence = crate::notices::licence_text("pcre2")?;
     let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
     let commit = crate::rtbench2::commit();
     let nginx_note = format!(
@@ -1832,6 +1829,6 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
             std::fs::read_to_string(crate::root().join(".github/workflows/ci.yml")).unwrap();
         assert!(workflow.contains("  nginx-probe:\n"));
         assert!(workflow.contains("run: cargo xtask nginx-probe\n"));
-        assert!(workflow.contains("needs: [build, group, doom-probe, nginx-probe]"));
+        assert!(workflow.contains("needs: [build, group, doom-probe, nginx-probe, pkg]"));
     }
 }

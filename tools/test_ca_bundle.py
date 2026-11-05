@@ -3,14 +3,13 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 """The checks of tools/build-ca-bundle.py on bundles made here: the count of
-certificates, the date of the header, the SHA-256, and the notice that
-tools/dist.py takes from the header of a source that is one file."""
+certificates, the date of the header, the SHA-256, and the header that
+the notices of the package keep (xtask notices.rs reads it the same way)."""
 
 from hashlib import sha256
 import importlib.util
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 
@@ -19,9 +18,6 @@ sys.path.insert(0, str(HERE))
 spec = importlib.util.spec_from_file_location("build_ca_bundle", HERE / "build-ca-bundle.py")
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
-spec = importlib.util.spec_from_file_location("dist", HERE / "dist.py")
-dist = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(dist)
 
 BLOCK = b"-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n-----END CERTIFICATE-----\n"
 
@@ -64,14 +60,9 @@ class BundleTests(unittest.TestCase):
             builder.check(data, sha256(data).hexdigest(), "2026-11-01")
 
     def test_the_notice_of_a_source_of_one_file_is_its_header(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "cacert-2026-10-20.pem"
-            path.write_bytes(bundle(3))
-            texts = dist.license_texts(path)
-            self.assertEqual(list(texts), ["cacert.pem.NOTICE"])
-            self.assertTrue(texts["cacert.pem.NOTICE"].startswith(b"##\n## Bundle"))
-            self.assertNotIn(b"BEGIN CERTIFICATE", texts["cacert.pem.NOTICE"])
-            self.assertEqual(builder.header(bundle(3)), texts["cacert.pem.NOTICE"])
+        header = builder.header(bundle(3))
+        self.assertTrue(header.startswith(b"##\n## Bundle"))
+        self.assertNotIn(b"BEGIN CERTIFICATE", header)
 
 
 if __name__ == "__main__":

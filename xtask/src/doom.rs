@@ -86,7 +86,7 @@ pub fn build_games() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     nano_build()?;
-    packages_built(packages::Kind::Game)
+    packages_built(&[packages::Group::Game])
 }
 
 /// The licence texts of Doomgeneric and Freedoom and the notes of their
@@ -99,10 +99,8 @@ pub fn doom_terms() -> Result<(Vec<u8>, String, Vec<u8>, String), String> {
     let freedoom = packages::value("freedoom", "version")?;
     let freedoom_sha256 = packages::value("freedoom", "sha256")?;
     let freedoom_url = packages::value("freedoom", "url")?;
-    let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
-    let doom_licence = read(target_dir().join(format!("doomgeneric/doomgeneric-{doom}/LICENSE")))?;
-    let freedoom_licence =
-        read(target_dir().join(format!("freedoom/freedoom-{freedoom}/COPYING.txt")))?;
+    let doom_licence = crate::notices::licence_text("doomgeneric")?;
+    let freedoom_licence = crate::notices::licence_text("freedoom")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let doom_note = format!(
         "doom holds Doomgeneric, commit {doom} of https://github.com/ozkl/doomgeneric,\n\

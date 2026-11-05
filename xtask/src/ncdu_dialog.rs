@@ -20,8 +20,7 @@ pub fn ncdu_terms() -> Result<(Vec<u8>, String), String> {
     let version = version()?;
     let sha256 = packages::value("ncdu", "sha256")?;
     let url = packages::value("ncdu", "url")?;
-    let path = target_dir().join(format!("ncdu/ncdu-{version}/COPYING"));
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = crate::notices::licence_text("ncdu")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(
         "ncdu holds ncdu {version}, Copyright (c) Yorhel.\n\

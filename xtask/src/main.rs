@@ -56,6 +56,7 @@ mod htop_dialog;
 mod image;
 mod input_probe;
 mod jobs;
+mod keys;
 mod linux_guest;
 mod measure;
 mod monitor;
@@ -74,15 +75,19 @@ mod net_wget;
 mod netd_quota;
 mod nginx_bench;
 mod nginx_probe;
+mod notices;
 mod obj_sites;
 mod openposix;
 mod ostest;
 mod packages;
 mod pci_walk;
+mod pkg;
+mod pkg_probes;
 mod posix_display;
 mod posix_net;
 mod probe_ca;
 mod qemu;
+mod repo;
 mod ring;
 mod rootfs;
 mod rtbench;
@@ -1641,6 +1646,18 @@ commands:
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
+  keys      the keys that sign packages: `keys root|release <name> [--dir D]`,
+            `keys certify --root R.key --key K.pub`, `keys show <file>` (docs/packages.md)
+  pkg-build [name...]  build the package files (.stpkg) in target/pkg; `--recipe` prints the inputs
+            of the fingerprints instead (docs/packages.md)
+  repo      build the package files and a signed repository of them in target/repo
+            (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
+            in another directory, which must be empty or new, or under target/)
+  pkg-identity  check that the flat images and the packages give the same bytes at the same
+            paths, that the repository is whole and that a package builds again to the same bytes
+  dist-licenses  check that the release archives carry the notices of the packages they
+            hold and no others (no notice of F-Stack in the archives without it)
+  pkg-ci    pkg-build, repo, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -1986,6 +2003,12 @@ fn main() {
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
+        Some("keys") => keys::command(&args[1..]),
+        Some("pkg-build") => pkg::command(&args[1..]),
+        Some("repo") => repo::command(&args[1..]),
+        Some("pkg-identity") => pkg_probes::identity(),
+        Some("dist-licenses") => pkg_probes::dist_licenses(),
+        Some("pkg-ci") => pkg_probes::ci(),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
@@ -3604,8 +3627,7 @@ fn script_value(script: &str, name: &str) -> Result<String, String> {
 /// BusyBox's LICENSE (GPLv2 with its note) and the note of BusyBox's
 /// copyright and of the exact source of the program in the image.
 fn busybox_terms() -> Result<(Vec<u8>, String), String> {
-    let path = target_dir().join("busybox/source/LICENSE");
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = notices::licence_text("busybox")?;
     let version = packages::value("busybox", "version")?;
     let sha256 = packages::value("busybox", "sha256")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
@@ -3630,8 +3652,7 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
 fn bash_terms() -> Result<(Vec<u8>, String), String> {
     let version = packages::value("bash", "version")?;
     let sha256 = packages::value("bash", "sha256")?;
-    let path = target_dir().join(format!("bash/bash-{version}/COPYING"));
-    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = notices::licence_text("bash")?;
     let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
     let source = format!(
         "bash holds GNU bash {version}, Copyright (C) the Free Software Foundation, Inc.\n\
@@ -3746,21 +3767,31 @@ fn dynamic_programs(names: &[&str]) -> Result<(), String> {
     })
 }
 
-/// The scripts of the packages of `kind` run, each once in a run of xtask
+/// The scripts of the packages of `groups` run, each once in a run of xtask
 /// and in the order of the packages (a package after its dependencies).
-fn packages_built(kind: packages::Kind) -> Result<(), String> {
-    for package in packages::load()?.iter().filter(|p| p.kind == kind) {
-        once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
-            run_cmd(Command::new("python3").arg(root().join(&package.build)))
-        })?;
+fn packages_built(groups: &[packages::Group]) -> Result<(), String> {
+    for package in packages::load()?
+        .iter()
+        .filter(|p| groups.contains(&p.group()))
+    {
+        package_script(package)?;
     }
     Ok(())
+}
+
+/// The script of one package run, once in a run of xtask.
+fn package_script(package: &packages::Package) -> Result<(), String> {
+    once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
+        run_cmd(Command::new("python3").arg(root().join(&package.build)))
+    })
 }
 
 /// BusyBox and the other packages of the base set built, once in a run of
 /// xtask.
 fn busybox_build() -> Result<(), String> {
-    once(&BUSYBOX_BUILT, (), || packages_built(packages::Kind::Base))
+    once(&BUSYBOX_BUILT, (), || {
+        packages_built(&[packages::Group::Base])
+    })
 }
 
 /// The add-on packages built (ncurses, nano, htop, ncdu and bash: the objects
@@ -3768,13 +3799,15 @@ fn busybox_build() -> Result<(), String> {
 /// the image), once in a run of xtask. The shell image holds all of them,
 /// so each dialog needs all.
 fn nano_build() -> Result<(), String> {
-    once(&NANO_BUILT, (), || packages_built(packages::Kind::Addon))
+    once(&NANO_BUILT, (), || {
+        packages_built(&[packages::Group::Addon, packages::Group::Fstack])
+    })
 }
 
 /// The network packages built (OpenSSL, curl, the root certificates, nginx with PCRE2),
 /// once in a run of xtask: the images with the network service hold them.
 fn net_build() -> Result<(), String> {
-    once(&NET_BUILT, (), || packages_built(packages::Kind::Net))
+    once(&NET_BUILT, (), || packages_built(&[packages::Group::Net]))
 }
 
 /// bash built (its object, which `tools/build-libc-so.py programs` links), once in a run of xtask. It is
@@ -8568,6 +8601,9 @@ fn dist() -> Result<(), String> {
     bash_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
+    // The archive carries the notices of the packages of the shell image,
+    // as those packages carry them.
+    let licenses = pkg_probes::stage_licenses()?;
     run_cmd(
         Command::new("python3")
             .arg(root().join("tools/dist.py"))
@@ -8578,6 +8614,8 @@ fn dist() -> Result<(), String> {
             .arg(&kernel.elf)
             .arg("--boot")
             .arg(&image)
+            .arg("--licenses")
+            .arg(&licenses)
             .arg("--out")
             .arg(target_dir().join("dist")),
     )
@@ -9043,6 +9081,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
+        "tools/test_pkg_source.py",
         "tools/test_nginx_answer.py",
         "tools/test_linux_guest.py",
     ] {
@@ -9054,6 +9093,8 @@ fn host_tests() -> Result<(), String> {
         "abi",
         "--package",
         "bootimg",
+        "--package",
+        "pkgfmt",
         "--package",
         "dynlink",
         "--package",

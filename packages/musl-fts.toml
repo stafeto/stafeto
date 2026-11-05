@@ -9,10 +9,12 @@
 name = "musl-fts"
 version = "1.2.7"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "fts(3) source for pax"
 url = "https://github.com/void-linux/musl-fts/archive/refs/tags/v1.2.7.tar.gz"
 sha256 = "8abda56cf9914921483017c001ed6c67f807b7793de75dbe991ea5e1e6f69630"
 license = "BSD-3-Clause"
 license_file = "COPYING"
-depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = []

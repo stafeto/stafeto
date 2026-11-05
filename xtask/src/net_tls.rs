@@ -34,7 +34,7 @@
 //! the image with the network (`boot-net.img`).
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -159,7 +159,6 @@ pub fn terms_files(
     bundle: bool,
 ) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
     let openssl = !programs.is_empty();
-    let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
     let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
     let commit = crate::rtbench2::commit();
     let mut files = Vec::new();
@@ -169,10 +168,7 @@ pub fn terms_files(
         let url = packages::value("openssl", "url")?;
         let line = std::fs::read_to_string(crate::target_dir().join("openssl/configure-line.txt"))
             .map_err(|e| format!("openssl/configure-line.txt: {e}: tools/build-openssl.py"))?;
-        files.push((
-            OPENSSL_LICENSE,
-            read(crate::target_dir().join(format!("openssl/openssl-{version}/LICENSE.txt")))?,
-        ));
+        files.push((OPENSSL_LICENSE, crate::notices::licence_text("openssl")?));
         files.push((
             OPENSSL_SOURCE,
             format!(
@@ -195,10 +191,7 @@ pub fn terms_files(
         let version = packages::value("curl", "version")?;
         let sha256 = packages::value("curl", "sha256")?;
         let url = packages::value("curl", "url")?;
-        files.push((
-            CURL_LICENSE,
-            read(crate::target_dir().join(format!("curl/curl-{version}/COPYING")))?,
-        ));
+        files.push((CURL_LICENSE, crate::notices::licence_text("curl")?));
         files.push((
             CURL_SOURCE,
             format!(
@@ -223,16 +216,10 @@ pub fn terms_files(
             .split(|&b| b == b'\n')
             .filter(|l| l.starts_with(b"-----BEGIN CERTIFICATE-----"))
             .count();
-        let header: Vec<u8> = data
-            .split_inclusive(|&b| b == b'\n')
-            .take_while(|l| l.starts_with(b"##"))
-            .flatten()
-            .copied()
-            .collect();
-        let mut licence = read(crate::root().join("tools/ca-bundle/MPL-2.0.txt"))?;
-        licence.extend_from_slice(b"\n\nThe header of the file:\n\n");
-        licence.extend_from_slice(&header);
-        files.push((CA_BUNDLE_LICENSE, licence));
+        files.push((
+            CA_BUNDLE_LICENSE,
+            crate::notices::licence_text("ca-bundle")?,
+        ));
         files.push((
             CA_BUNDLE_SOURCE,
             format!(

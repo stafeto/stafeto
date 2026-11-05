@@ -237,6 +237,7 @@ def workspace() -> None:
     print(f"GPL-2.0-only programs ({', '.join(p['name'] for p in gpl2)}) link MIT,"
           " GPL-2.0-only compatible and exception crates alone")
     drivers(data, packages, named)
+    crypto(data, packages, named)
 
 
 def drivers(data: dict, packages: dict, named: dict) -> None:
@@ -271,6 +272,26 @@ def drivers(data: dict, packages: dict, named: dict) -> None:
     if "smoltcp" not in network:
         fail("netd no longer links smoltcp")
     print("netd links " + ", ".join(sorted(network)) + " under permissive licences")
+
+
+def crypto(data: dict, packages: dict, named: dict) -> None:
+    """The package format (lib/pkgfmt, MIT) links the signature and hash
+    crates of crates.io, which the device programs that read packages will
+    link too; all of them are under permissive licences."""
+    pkgfmt = named["pkgfmt"]
+    if pkgfmt["license"] != "MIT":
+        fail(f"pkgfmt is {pkgfmt['license']!r}; it must be MIT")
+    outside = []
+    for package_id in closure(data, [pkgfmt["id"]]):
+        package = packages[package_id]
+        if package["source"] is None:
+            continue
+        if package["license"] not in PERMISSIVE:
+            fail(f"pkgfmt links {package['name']} under {package['license']}")
+        outside.append(package["name"])
+    if "ed25519-compact" not in outside:
+        fail("pkgfmt no longer links ed25519-compact")
+    print("pkgfmt links " + ", ".join(sorted(outside)) + " under permissive licences")
 
 
 def licence_files(directory: Path) -> list[Path]:
