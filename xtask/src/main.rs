@@ -41,6 +41,7 @@ mod owner_lifetime;
 mod service_sample;
 
 mod bash_dialog;
+mod blk_probe;
 mod ci;
 mod clock_probe;
 mod cpus_dialog;
@@ -1548,7 +1549,9 @@ const USAGE: &str = "usage: cargo xtask <command>
 commands:
   build     build the kernel image and the boot image
   run       build and boot in QEMU to the shell (Ctrl-A X quits); with
-            --hvf under HVF on a Mac with Apple silicon
+            --hvf under HVF on a Mac with Apple silicon; with --store a
+            disk of 512 MiB, target/store-<image>.img, is attached, and
+            --fresh-store makes it new
   test [--jobs N] host tests, then boot checks, the console dialog, init
             tests and kernel tests in QEMU; N boots at a time (half the
             cores by default; 1 runs them one after the other)
@@ -1713,6 +1716,11 @@ commands:
   pci-walk [--hvf]      walk bus 0 on QEMU with the disk (virtio-blk-pci)
   pci-walk-vz [--net N] walk bus 0 on Apple VZ with N network devices (0 to 2)
             and check the console, the entropy device and the network functions
+  blk-probe [--hvf|--plain] run the probe of the disk service in QEMU: refusals, a
+            pattern written and flushed, CANCEL, the same file read after a
+            new start of QEMU and a restart of the service, the errors the
+            host injects, and the service's steps under -icount; with --hvf
+            under HVF, with --plain on QEMU's emulation without -icount
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -2044,6 +2052,7 @@ fn main() {
         Some("entropy-vz") => entropy::probe_vz(),
         Some("pci-walk") => pci_walk::command_qemu(&args[1..]),
         Some("pci-walk-vz") => pci_walk::command(&args[1..]),
+        Some("blk-probe") => blk_probe::command(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -2812,10 +2821,33 @@ fn raw_init(code: &[u32], rodata: bool, data_size: u64) -> Result<Vec<u8>, Strin
 /// `cargo xtask run` (spec 14): the normal build on the machine of
 /// run_machine, with the console on the terminal.
 fn run(args: &[String]) -> Result<(), String> {
-    let m = run_machine(args, hvf_host)?;
+    let is_store = |a: &String| a == "--store" || a == "--fresh-store";
+    let store = args.iter().any(is_store);
+    let fresh = args.iter().any(|a| a == "--fresh-store");
+    let rest: Vec<String> = args.iter().filter(|a| !is_store(a)).cloned().collect();
+    let m = run_machine(&rest, hvf_host)?;
     let a = build(Variant::Normal)?;
-    let cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    if store {
+        // The disk of the image: a file of its own, which survives the run.
+        let file = store_path(&a.boot_image);
+        qemu::store_file(&file, STORE_BYTES, fresh)?;
+        cmd.args(qemu::store(&file, None));
+    }
     run_interactive_qemu(cmd, &a.elf)
+}
+
+/// The bytes of the disk file `run --store` attaches: 512 MiB, sparse.
+const STORE_BYTES: u64 = 512 << 20;
+
+/// The disk file of the boot image `image`: `target/store-<name>.img`, with
+/// the name of the image without its `.img`.
+fn store_path(image: &Path) -> PathBuf {
+    let name = image.file_stem().map_or_else(
+        || "boot".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    target_dir().join(format!("store-{name}.img"))
 }
 
 fn run_interactive_qemu(cmd: Command, elf: &Path) -> Result<(), String> {
@@ -9009,6 +9041,17 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The bus walk of QEMU's `virt` with the disk: the numbers of
         // virtio_pci::qemu against the machine.
         job("pci-walk", || pci_walk::command_qemu(&[])),
+        // The disk service on virtio-blk-pci: refusals, a pattern written
+        // and flushed, CANCEL, the file read again after a new start of
+        // QEMU and a restart of the service; the steps under -icount.
+        job("blk-probe", || blk_probe::probe(&qemu::VIRT, true)),
+        // The same on the GICv3 machine, without the steps.
+        job("blk-probe GICv3", || {
+            blk_probe::probe(&qemu::VIRT_V3, false)
+        }),
+        // The errors the host injects into a flush and a read reach the
+        // client of the service.
+        job("blk-faults", || blk_probe::faults(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
@@ -9199,6 +9242,10 @@ fn host_tests() -> Result<(), String> {
         "virtio-input",
         "--package",
         "proto-net",
+        "--package",
+        "proto-blk",
+        "--package",
+        "virtio-blk",
         "--package",
         "netd",
         // The driver library with the functions of the C program that owns
@@ -11763,6 +11810,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "proto-net",
         "--package",
+        "proto-blk",
+        "--package",
         "virtio-mmio",
         "--all-targets",
         "--",
@@ -11797,6 +11846,8 @@ fn ci_lints() -> Result<(), String> {
         "virtio-gpu",
         "--package",
         "virtio-input",
+        "--package",
+        "virtio-blk",
         "--package",
         "netd",
         "--lib",
@@ -11938,8 +11989,12 @@ fn ci_lints() -> Result<(), String> {
         "net-probe",
         "--package",
         "pci-walk",
+        "--package",
+        "virtio-blk",
+        "--package",
+        "blk-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -13040,6 +13095,16 @@ mod tests {
         let mut early = good.clone();
         early.rotate_right(1);
         assert!(smp_report(&early, 4).unwrap_err().contains("before"));
+    }
+
+    /// `run --store` attaches the disk file of its image, named for the
+    /// image without its `.img`.
+    #[test]
+    fn the_disk_file_of_run_is_named_for_the_image() {
+        let file = store_path(Path::new("/x/boot-blk-probe.img"));
+        assert_eq!(file.file_name().unwrap(), "store-boot-blk-probe.img");
+        assert_eq!(file.parent().unwrap(), target_dir());
+        assert_eq!(STORE_BYTES, 536_870_912);
     }
 
     /// `cargo xtask run` boots VIRT; with `--hvf` it boots HVF_V3 only

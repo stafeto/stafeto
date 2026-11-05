@@ -355,6 +355,16 @@ pub fn start<T: Transport>(transport: &mut T) -> Result<(), StartError> {
     start_with(transport, Feature::VERSION_1.bits()).map(drop)
 }
 
+/// Orders the load of a device's register before the loads that follow.
+#[inline]
+fn read_barrier() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier has no other effect.
+    unsafe {
+        core::arch::asm!("dmb oshld", options(nostack, preserves_flags))
+    };
+}
+
 /// What the interrupt status of a transport said (Virtio 1.2, 4.2.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Isr(u32);
@@ -369,8 +379,15 @@ impl Isr {
 
     /// Reads the interrupt status and acknowledges it, which drops the
     /// level of the line; nothing for the status 0.
+    ///
+    /// A barrier follows the read: the device's index in the queue, which the
+    /// driver reads next, must not be read before the status (`dmb oshld`
+    /// [G34]), or an answer that came in between would lose its bit and wait
+    /// for the next interrupt.
     pub fn read<T: Transport>(transport: &mut T) -> Isr {
-        Isr::from_status(transport.ack_interrupt())
+        let status = Isr::from_status(transport.ack_interrupt());
+        read_barrier();
+        status
     }
 
     fn from_status(status: InterruptStatus) -> Isr {

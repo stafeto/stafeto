@@ -330,6 +330,66 @@ link programs (for a package with programs) and `build-depends <name>
    features) to `PACKAGE_PROGRAMS` in `xtask/src/main.rs`.
 4. Run `cargo xtask packages`, then `cargo xtask packages table`.
 
+## The disk service
+
+The packages of a running system live on a disk. `services/virtio-blk` (the
+service `blk`) reads, writes and flushes the Virtio block device of QEMU's
+`virt` machine for its clients; `proto/blk` (MIT) is its protocol. On VZ the
+service is not built yet.
+
+**Where the disk is.** `qemu::store` (`xtask/src/qemu.rs`) attaches a
+`virtio-blk-pci` over a raw file at device 1 of bus 0, modern interface only,
+INTx only, `cache=writeback`, `werror=report,rerror=report`. With
+`highmem-ecam=off` (on every machine of xtask and in `tools/dist/run.sh`) the
+function is at 0x3f00_8000, and its INTA is line 36. No firmware runs under
+`-kernel`, so the driver measures BAR 4 (16 KiB), puts it at 0x1000_0000 and
+turns decoding on (`virtio_pci::qemu`, `virtio_pci::Bar64`); only after the
+reset of the device does it turn bus mastering on. Init gives the record
+`blk` (`services/init/src/table/pkg.rs`) the windows `ecam` and `bar`, the
+binding `irq` and one DMA object of 32 pages, uncached, and resets the device
+itself when an instance ends. The service runs at level 39, above its client
+`pkgd`, whose ceiling stays at 38 or less.
+
+**The protocol.** The client makes a memory object of 64 KiB, gives it with
+BUFFER (the service maps it for the session's life; one session holds it at
+a time) and uses it as four cells of 16 KiB. READ and WRITE name a cell, a
+count of 1 to 32 sectors of 512 bytes and a first sector; FLUSH names
+nothing. Each answers WAIT k at once, and the device's interrupt brings the
+result: the client takes it with TAKE k (READY, ARMED with a handle that
+gets a notification, or the refusal `IO`), or drops it with CANCEL k. A cell
+is busy from WAIT to TAKE; up to four reads and writes and one flush are
+with the device at once. A WRITE is copied out of its cell before WAIT, and
+a READ is copied into its cell when TAKE says READY, one copy of 16 KiB at
+most in a step. The codes are `RANGE` 1101, `IO` 1102, `UNSUPPORTED` 1103,
+`READ_ONLY` 1104, `INVALID` 1105, `NO_BUFFER` 1106, `EXISTS` 1107 and `BUSY`
+1108, besides the codes of the wire.
+
+**What FLUSH means.** A WRITE that says READY says that the device took the
+data, which may lie in its cache until a power loss. A FLUSH that says READY
+says that the device answered OK to a flush, and every write that had its
+answer before the service took the FLUSH is on the medium (Virtio 1.2,
+5.2.6). The service keeps the order: a FLUSH is refused with `BUSY` while a
+write is with the device, and a WRITE while a flush is. A client that must
+survive a power loss writes all its data, takes every WRITE, flushes, takes
+the FLUSH, and only then writes the next step. A disk without the flush
+feature has the flag cleared in INFO and answers `UNSUPPORTED` to FLUSH; a
+client that needs durability refuses to write there. The host side must pass
+the flush on: `cache=unsafe` swallows it, and the VZ block device needs
+`synchronizationMode: .full` for the same reason.
+
+**Running it.** `cargo xtask blk-probe [--hvf]` runs the probe (`tests/blk-probe`) in
+three runs of the machine: a pattern of 4 MiB and the last 32 sectors of a
+disk of 64 MiB written, flushed and marked; the same file read again after a
+new start of QEMU and a restart of the service (CRASH); and the errors of the
+host's `blkdebug` (the first flush and the first read of sector 4096 fail)
+reaching the client, with a throttle that holds the third write for a second so
+that a FLUSH meets a write at the device. Under `-icount` the service prints each new longest step
+of its loop, and no kind may pass 18,369 ticks, 0.9 of term B. The jobs of the
+CI are `blk-probe`, `blk-probe GICv3` and `blk-faults`.
+`cargo xtask run --store` attaches the file `target/store-<image>.img`
+(512 MiB, sparse) to the image it boots, and `--fresh-store` makes it new;
+only an image whose table has the record `blk` uses it.
+
 ## What stays for subproject 5
 
 Installing and removing packages in a running system, the store and delivery

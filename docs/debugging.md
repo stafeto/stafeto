@@ -203,6 +203,7 @@ at 0x3f00_8000, its BAR 4 sits at 0x1000_0000, and its INTx is line 36 (the
 swizzle of the tree's `interrupt-map`). `cargo xtask pci-walk [--hvf]`
 boots a probe that prints the functions of the bus with the disk attached
 and checks them; run it first when a disk driver sees no device.
+`cargo xtask blk-probe` runs the disk service on that disk (docs/packages.md).
 
 What differs from QEMU's own emulation:
 
