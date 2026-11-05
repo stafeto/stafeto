@@ -328,15 +328,14 @@ pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mm
 /// stop the machine on a full host disk. With `faults`, the drive goes
 /// through `blkdebug` with that rules file.
 pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
+    let image = option_path(image);
     let drive = match faults {
         None => format!(
-            "if=none,id=store,format=raw,file={},cache=writeback,werror=report,rerror=report",
-            image.display()
+            "if=none,id=store,format=raw,file={image},cache=writeback,werror=report,rerror=report"
         ),
         Some(rules) => format!(
-            "if=none,id=store,driver=raw,file.driver=blkdebug,file.config={},file.image.filename={},cache=writeback,werror=report,rerror=report",
-            rules.display(),
-            image.display()
+            "if=none,id=store,driver=raw,file.driver=blkdebug,file.config={},file.image.filename={image},cache=writeback,werror=report,rerror=report",
+            option_path(rules)
         ),
     };
     [
@@ -348,6 +347,12 @@ pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// A path inside an option of QEMU, whose parser takes a comma as the end
+/// of a value unless it is doubled.
+fn option_path(path: &Path) -> String {
+    path.display().to_string().replace(',', ",,")
 }
 
 /// The file of a disk: a sparse file of `bytes` zeros, made when it is
@@ -1308,6 +1313,14 @@ mod tests {
         assert!(!joined.contains("unsafe"));
         let faulty = store(Path::new("s.img"), Some(Path::new("r.cfg"))).join(" ");
         assert!(faulty.contains("driver=raw,file.driver=blkdebug,file.config=r.cfg,file.image.filename=s.img,cache=writeback"));
+    }
+
+    #[test]
+    fn a_comma_in_a_path_is_doubled_for_the_parser_of_qemu() {
+        let plain = store(Path::new("a,b.img"), None).join(" ");
+        assert!(plain.contains("file=a,,b.img,cache=writeback"));
+        let faulty = store(Path::new("a,b.img"), Some(Path::new("c,d.cfg"))).join(" ");
+        assert!(faulty.contains("file.config=c,,d.cfg,file.image.filename=a,,b.img,cache="));
     }
 
     #[test]

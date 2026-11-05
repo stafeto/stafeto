@@ -1,0 +1,19 @@
+[package]
+name = "blk-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the disk service"
+
+[[bin]]
+name = "blk-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-blk = { path = "../../proto/blk" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

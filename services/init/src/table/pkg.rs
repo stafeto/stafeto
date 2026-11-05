@@ -153,7 +153,8 @@ pub const BLK_PROBE: Record = Record {
     kind: Kind::Client,
     priority: 30,
     ceiling: 30,
-    quota: 32 * PAGE,
+    // The shared buffer of 16 pages is its own object, mapped in both.
+    quota: 64 * PAGE,
     handle_limit: 32,
     restart: Restart::Never,
     console: true,
