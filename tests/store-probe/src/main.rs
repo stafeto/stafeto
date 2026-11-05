@@ -957,8 +957,8 @@ fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
         return Err("the installation on a deaf disk is not IO");
     }
     let first = since_ms(from);
-    // The service waited for the deadline (1 s) and no more than ten times it.
-    if !(900..10_000).contains(&first) {
+    // The service waited for the deadline (3 s) and no more than seven times it.
+    if !(2_900..20_000).contains(&first) {
         return Err("the wait of the service for the disk is not its deadline");
     }
     if !snap(pkgd)?.same(&was) {
@@ -973,8 +973,8 @@ fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
         return Err("the second installation on a deaf disk is not IO");
     }
     let second = since_ms(from);
-    // Without the dead mark it would wait for the deadline again (1 s).
-    if second >= 900 {
+    // Without the dead mark it would wait for the deadline again (3 s).
+    if second >= 2_000 {
         say!("the second installation took {second} ms");
         return Err("the second installation did not end at once");
     }

@@ -621,7 +621,7 @@ leaves the thread no other end; past the deadline the disk is dead for this run 
 (`pkgd: the disk service did not answer in time`), the job that waits ends with `IO` and drops its
 group, and every later request that needs the disk is `IO` at once. The disk service that restarts is
 not followed: the machine is restarted. `cargo xtask store-probe deaf` builds the disk service to go
-deaf at the first write of a package's data and `pkgd` with a wait of 1 s: the installation is `IO`
+deaf at the first write of a package's data and `pkgd` with a wait of 3 s: the installation is `IO`
 after the deadline, the store is as it was and free, and the next one is `IO` at once. The jobs of the
 CI add `init-wait` and `pkg-slot` below.
 

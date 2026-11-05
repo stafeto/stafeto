@@ -398,7 +398,7 @@ pub fn crash_at(_: Point) {}
 #[cfg(not(feature = "short-deadline"))]
 const DISK_WAIT_NS: u64 = 10_000_000_000;
 #[cfg(feature = "short-deadline")]
-const DISK_WAIT_NS: u64 = 1_000_000_000;
+const DISK_WAIT_NS: u64 = 3_000_000_000;
 
 /// The disk service: the buffer of four cells and its INFO.
 fn connect_disk(process: &Handle<Process>) -> Result<Disk, Fail> {

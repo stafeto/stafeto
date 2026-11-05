@@ -1035,7 +1035,7 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
 }
 
 /// The disk service built to stop answering at the first write of a package's data
-/// (`deaf`), the package service with a wait of 1 s for it (`short-deadline`): the
+/// (`deaf`), the package service with a wait of 3 s for it (`short-deadline`): the
 /// installation of `big` is refused IO within the wait, the store is as it was and free, the
 /// next installation is refused at once.
 fn deaf() -> Result<(), String> {
