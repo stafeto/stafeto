@@ -63,6 +63,18 @@ const RUN_WITHIN: Duration = Duration::from_secs(60 * 4);
 /// refusal comes at 1.0 s (the guest's RST is right: right MAC, right
 /// acknowledgement).
 const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
+/// The kind of the steps of the second device's return, and their bound on
+/// VZ: 50 ms of the counter (24 MHz).
+const RETURN_KIND: usize = 65;
+const RETURN_MAX: u64 = 1_200_000;
+/// Whether a line of steps is one of the second device's return.
+fn is_return_step(line: &str) -> bool {
+    line.contains(&format!("kind {RETURN_KIND} "))
+        && line
+            .rsplit_once("detail ")
+            .is_some_and(|(_, d)| d.trim().parse::<u64>().is_ok_and(|d| d != 0))
+}
+
 /// The fixed MAC addresses of `vz-run`, by device.
 const MACS: [&str; 2] = ["02:73:74:66:00:01", "02:73:74:66:00:02"];
 /// The static address of the second device in the image `--static1`.
@@ -409,8 +421,42 @@ pub fn command(args: &[String]) -> Result<(), String> {
             worst.1,
             net_probe::STEP_MAX
         );
-        if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+        // The device that comes back from its owner is reset by the host: the
+        // first access after the reset stalls the processor for about 20 ms
+        // (the guest cannot split it), so the steps of the return (kind 65
+        // with a detail) have a bound of their own on VZ, 50 ms of the
+        // counter. The others keep 0.9 of term B.
+        let (back, rest): (Vec<String>, Vec<String>) = output
+            .lines
+            .iter()
+            .cloned()
+            .partition(|l| is_return_step(l));
+        if let Some(row) = net_probe::longest_over_starts(&rest)
+            .iter()
+            .find(|r| r.1 > net_probe::STEP_MAX)
+        {
             return Err(format!("a step past 0.9 of term B: {row:?}"));
+        }
+        // The longest step of the return by its detail (1 reset, 2 open,
+        // 3 and 4 the queues, 5 on the fill).
+        let mut returns: std::collections::BTreeMap<u64, u64> = Default::default();
+        for line in &back {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if let Some(i) = words.iter().position(|w| *w == "ticks")
+                && let (Some(ticks), Some(detail)) = (
+                    words.get(i - 1).and_then(|w| w.parse::<u64>().ok()),
+                    words.last().and_then(|w| w.parse::<u64>().ok()),
+                )
+            {
+                let longest = returns.entry(detail).or_default();
+                *longest = (*longest).max(ticks);
+            }
+        }
+        println!(
+            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {RETURN_MAX})"
+        );
+        if let Some(row) = returns.iter().find(|r| *r.1 > RETURN_MAX) {
+            return Err(format!("a step of the return past its bound: {row:?}"));
         }
     }
     println!(
@@ -721,6 +767,19 @@ mod tests {
         let line = "? (192.168.64.4) at 2:73:74:66:0:2 on bridge100 ifscope [ethernet]\n";
         assert_eq!(arp_mac(line).as_deref(), Some("02:73:74:66:00:02"));
         assert_eq!(arp_mac("? (192.168.64.9) -- no entry"), None);
+    }
+
+    #[test]
+    fn a_step_of_the_return_has_kind_65_and_a_detail() {
+        assert!(is_return_step(
+            "service step: 14 kind 65 443318 ticks detail 2"
+        ));
+        assert!(!is_return_step(
+            "service step: 14 kind 65 3000 ticks detail 0"
+        ));
+        assert!(!is_return_step(
+            "service step: 14 kind 36 3000 ticks detail 1"
+        ));
     }
 
     #[test]
