@@ -225,7 +225,8 @@ fn run_command(
         lines
             .into_iter()
             .map(|l| l.trim().to_owned())
-            .filter(|l| !l.starts_with("rc=") && !l.is_empty())
+            // The service writes lines of its own to the console at any time (`pkgd: memory ...`).
+            .filter(|l| !l.starts_with("rc=") && !l.is_empty() && !l.starts_with("pkgd: "))
             .collect(),
     ))
 }
