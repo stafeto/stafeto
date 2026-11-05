@@ -231,7 +231,7 @@ jobs:
           rc=0
           for i in 1 2 3 4 5 6 7 8; do
             cargo xtask nginx-probe > run$i.log 2>&1 || { echo "run $i FAILED"; rc=1; }
-            grep -a "DIAG\|posix-net: buffers\|after the reload\|start worker\|exited with\|^xtask" run$i.log | tail -80
+            grep -a "DIAG\|posix-net: buffers\|after the reload\|start worker\|exited with\|^xtask\|reconfiguring" run$i.log | awk '/reconfiguring/{on=1} on' | head -300
           done
           exit $rc
 
