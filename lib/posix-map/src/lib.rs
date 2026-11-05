@@ -14,7 +14,8 @@
 //! POSIX process has no device resource. Two pieces are the layer's own and
 //! of a kind of their own (`Kind`): the buffer of the screen, the *display
 //! piece* (spec 3, 7.3), a DMA object, and the process's shared buffer with
-//! the network service, the *network buffer piece*. `fork` copies neither
+//! the network service, the *network buffer piece*; the pieces of a claimed
+//! network device (`Kind::Fast`) are of a kind of their own as well. `fork` copies neither
 //! into the child (`Map::inherited` leaves them out, so the child has a hole
 //! there), `munmap` and `mprotect` refuse both (`Refused::Special`, EINVAL),
 //! and only `unmap_kind` takes one out. The handle type is a parameter, so
@@ -235,6 +236,11 @@ pub enum Kind {
     Display,
     /// The shared buffer of the process with the network service.
     NetBuffer,
+    /// The window, the objects and the bypass ring of the second network
+    /// device that the process claimed (spec 6, 3.9): several pieces, which
+    /// stay until the process ends; `fork` and `exec` are refused while
+    /// the map has one.
+    Fast,
 }
 
 /// Why a map refused a change.

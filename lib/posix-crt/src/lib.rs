@@ -31,6 +31,7 @@ use rt::handle::{Channel, Handle, Process, Resource, Thread};
 // The C functions of the screen and the keys, which libc.so exports.
 #[cfg(feature = "shared")]
 mod display_c;
+mod fast_c;
 
 // relibc's platform calls the layer through posix-platform's functions.
 extern crate posix_platform;

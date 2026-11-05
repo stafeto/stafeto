@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! The C functions of the claimed network device, exported from libc.so
+//! (spec 6, 3.9; `<stafeto/fast.h>`). Each is the layer's call
+//! (`posix_abi::fast`) with the errno set as C expects: 0 or a count, or -1
+//! with errno.
+
+use core::ffi::{c_int, c_uint};
+use posix_abi::fast::{self, FastClaim, FastConfig};
+
+unsafe extern "C" {
+    fn __errno_location() -> *mut c_int;
+}
+
+fn fail(errno: i32) -> c_int {
+    // SAFETY: relibc's errno of this thread.
+    unsafe { *__errno_location() = errno };
+    -1
+}
+
+/// Claims the second network device and describes it in `*out`.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_fast_claim`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_claim(out: *mut FastClaim, flags: c_uint) -> c_int {
+    // SAFETY: the caller's pointer, checked for null.
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return fail(posix_abi::constants::EINVAL);
+    };
+    match fast::claim(out, flags) {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Waits for the network service's notification.
+///
+/// # Safety
+/// `bits` is null or points to a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_wait(timeout_ns: u64, bits: *mut u32) -> c_int {
+    match fast::wait(timeout_ns) {
+        Ok(got) => {
+            // SAFETY: the caller's pointer, checked for null.
+            if let Some(bits) = unsafe { bits.as_mut() } {
+                *bits = got;
+            }
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}
+
+/// Tells the network service of frames in the bypass ring.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_kick(count: u32) -> c_int {
+    match fast::kick(count) {
+        Ok(taken) => taken as c_int,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// The second address.
+///
+/// # Safety
+/// `out` is null or points to a writable `struct stafeto_fast_config`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_config(out: *mut FastConfig) -> c_int {
+    // SAFETY: the caller's pointer, checked for null.
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return fail(posix_abi::constants::EINVAL);
+    };
+    match fast::config() {
+        Ok(config) => {
+            *out = config;
+            0
+        }
+        Err(errno) => fail(errno),
+    }
+}

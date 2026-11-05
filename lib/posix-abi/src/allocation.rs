@@ -597,6 +597,28 @@ impl State {
         Ok(address)
     }
 
+    /// A piece of the claimed network device (`posix_map::Kind::Fast`):
+    /// `pages` pages of `handle` from page `offset`, read and write, at an
+    /// address of the room; the address. ENOMEM past the room, the limits
+    /// or the table; the handle goes if the map refuses it. The pieces stay
+    /// until the process ends.
+    pub(crate) fn map_fast(
+        &mut self,
+        handle: Handle<Memory>,
+        pages: usize,
+        offset: usize,
+    ) -> Result<usize, i32> {
+        self.within_data(pages)?;
+        let source = Source {
+            existing: Some(handle),
+            offset,
+            ..Source::anonymous()
+        };
+        let (index, address) = self.make_own(None, pages, Access::ReadWrite, false, source, 0)?;
+        self.map.object_mut(index).kind = posix_map::Kind::Fast;
+        Ok(address)
+    }
+
     /// The display piece leaves the process (`mem_unmap`) and its object
     /// closes; Ok when there is none.
     pub(crate) fn unmap_display(&mut self) -> Result<(), i32> {

@@ -1756,6 +1756,10 @@ fn exec_selected<'s>(
     if matches!(source, ExecSource::Path(path) if path.is_empty()) {
         return Err(ENOENT);
     }
+    // The claimed network device stays with this image (spec 6, 3.9).
+    if crate::fast::claimed() {
+        return Err(crate::constants::EPERM);
+    }
     let block = crate::threads::own_block();
     // Step 1: every signal of the caller held, the others stopped.
     let mask = block.mask.swap(!0, Ordering::SeqCst);

@@ -654,6 +654,11 @@ pub fn deliver_after_fork() {
 /// (relibc's allocator and standard streams) lets them go first, since a
 /// handler may use them.
 pub fn fork_held(window: Option<fn()>) -> Result<i32, i32> {
+    // A process that claimed the network device keeps it alone (spec 6,
+    // 3.9): a child would share the device's memory with no driver.
+    if crate::fast::claimed() {
+        return Err(crate::constants::EPERM);
+    }
     // A program init started has no code in its map: nothing to stop for.
     let at = resume as *const () as u64;
     let code = crate::allocation::regions(|map| {
