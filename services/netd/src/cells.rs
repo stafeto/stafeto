@@ -63,8 +63,14 @@ impl Net {
             return Answer::Status(Status::Kernel(Error::BadState));
         };
         let i = match self.buffers.give(s.label()) {
-            Ok(i) => i,
-            Err(Refusal::Full) => return Answer::Status(Status::Kernel(Error::LimitReached)),
+            Ok(i) => {
+                rt::println!("DIAG buffer given {i} label {:#x} count {}", s.label(), self.buffers.count());
+                i
+            }
+            Err(Refusal::Full) => {
+                rt::println!("DIAG buffer FULL label {:#x} count {}", s.label(), self.buffers.count());
+                return Answer::Status(Status::Kernel(Error::LimitReached));
+            }
         };
         let at = dma::buffer_at(i);
         match sys::mem_map(
@@ -90,6 +96,7 @@ impl Net {
                 Answer::Status(Status::Ok)
             }
             Err(error) => {
+                rt::println!("DIAG buffer map failed {error:?} entry {i}");
                 self.buffers.free(i);
                 let error = match error {
                     Error::NoMemory | Error::LimitReached => Error::LimitReached,
@@ -112,6 +119,7 @@ impl Net {
         if gone.is_ok() {
             self.buffers.free(i);
         }
+        rt::println!("DIAG buffer unmap {i} ok {} count {}", gone.is_ok(), self.buffers.count());
         gone.is_ok()
     }
 
@@ -132,6 +140,7 @@ impl Net {
     pub fn retire_buffer(&mut self, s: &mut Sess) -> bool {
         match s.data.buffer.take() {
             Some(i) => {
+                rt::println!("DIAG buffer retire {i} label {:#x}", s.label());
                 self.buffers.retire(usize::from(i));
                 true
             }
