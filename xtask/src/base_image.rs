@@ -15,6 +15,7 @@ pub const FULL_IMAGE: &str = "boot-full.img";
 
 /// The stack of the package tool, which `apps/pkg/build.rs` asks the linker for (`-zstack-size`): the
 /// frames of its requests, the walk of the dependencies and the checks of signatures.
+#[cfg(test)]
 pub const PKG_STACK_SIZE: u32 = 256 * 1024;
 
 /// The programs of both images: the services of the shell, those of the
