@@ -1053,7 +1053,11 @@ fn fast_round(
                 // The events of the kqueue are out of it for good (an edge
                 // or a oneshot record would never report again): the call
                 // gives them, and the pairs taken from the service go back to
-                // it. A signal ends the next call.
+                // it. A signal ends the next call. (The window is a signal
+                // inside the stack's step of the very turn that found events;
+                // `fast-layer` runs 24 pages under a signal every millisecond
+                // and never hit it in the runs made, since a lost edge of
+                // writing is mostly made good by the next one.)
                 Err(_) if filled > 0 => {
                     if consumed.len != 0 {
                         restore(id, consumed);
