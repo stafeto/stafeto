@@ -162,12 +162,13 @@ pub fn ncdu_dialog() -> Result<(), String> {
                 "Apparent size:",
             ],
         )?;
-        // BusyBox under three names: two hard links and a symbolic link.
-        // ncdu counts the file once and does not follow the symbolic link,
-        // so the apparent size of the directory is the file's size and the
-        // length of the link's target (`/bin/busybox`).
+        // BusyBox under three names: a copy of it with a second hard link
+        // (a file of a package takes no new name: it is the package's) and a
+        // symbolic link. ncdu counts the file once and does not follow the
+        // symbolic link, so the apparent size of the directory is the file's
+        // size and the length of the link's target (`/bin/busybox`).
         run.send(
-            "mkdir /tmp/h && ln /bin/busybox /tmp/h/b1 && ln /bin/busybox /tmp/h/b2 \
+            "mkdir /tmp/h && cp /bin/busybox /tmp/h/b1 && ln /tmp/h/b1 /tmp/h/b2 \
              && ln -s /bin/busybox /tmp/h/s && echo tree-made",
         )?;
         run.expect_line("the tree", |l| l == "tree-made", DIALOG_STEP)?;
