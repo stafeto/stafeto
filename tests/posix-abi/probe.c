@@ -269,7 +269,7 @@ static int directories(void) {
     if (open("motd", O_RDONLY | O_DIRECTORY) != -1 || errno != ENOTDIR) return 79;
     fd = open("/", O_RDONLY | O_DIRECTORY);
     if (fd < 0 || (dir = fdopendir(fd)) == NULL || dirfd(dir) != fd || closedir(dir)) return 80;
-    /* The file service gives a session 1 056 places, more than the 1 024 numbers
+    /* The file service gives a session 1 072 places, more than the 1 024 numbers
      * of the layer's table: the directories run out at the layer's limit (EMFILE
      * of the process), whatever the service still has. */
     static DIR *held[1100];

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The sessions of 1 056 places: the search for a free number, the stack of free
+//! The sessions of 1 072 places: the search for a free number, the stack of free
 //! descriptions, the receipts at the places of the keys, and the portions of a
 //! clone, of CLONE_MORE and of a departure (stafeto-design#578).
 

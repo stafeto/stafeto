@@ -160,7 +160,7 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
     assert_eq!(core::mem::size_of::<Shared>(), 72);
     assert_eq!(core::mem::size_of::<Fds>(), 2240);
     // The tables of numbers and receipts are not part of it: they are a pool.
-    assert_eq!(core::mem::size_of::<Wide>(), 4832);
+    assert_eq!(core::mem::size_of::<Wide>(), 4864);
     assert_eq!(
         core::mem::size_of::<[Option<proto_fs::CloseEvent>; 16]>(),
         512

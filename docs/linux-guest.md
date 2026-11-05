@@ -124,7 +124,7 @@ besides (the guest of Linux showed 14 of those for an idle worker). Both systems
 process 1 024 descriptors: `RLIMIT_NOFILE` of Linux is 1 024 by default, and the
 layer of stafeto takes 1 024 numbers (`OPEN_MAX` of `lib/posix-fs`). 900 files, the 64
 connections of one worker and the 14 others stay under that on both systems, and
-a set of 1 000 files would not. The RAM service gives a session 1 056 places, 8 192
+a set of 1 000 files would not. The RAM service gives a session 1 072 places, 8 192
 open descriptions for the whole service and 6 144 of them for one root
 (`services/ramfs`), so its own limits are no tighter than the layer's.
 

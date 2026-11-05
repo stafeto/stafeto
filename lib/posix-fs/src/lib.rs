@@ -209,10 +209,6 @@ pub const DESCRIPTOR_PAGES: usize = OPEN_MAX / HOLDS_MAX - 1;
 pub const DESCRIPTOR_PAGE_BYTES: usize = 4096;
 /// The descriptors an inherited list names at most (the start area's).
 pub const INHERITED_MAX: usize = 64;
-/// The descriptions of the RAM service one process holds at most: one for each number
-/// of its table (the service's sessions hold 16 places more for the pins of shared
-/// mappings, `MAP_PINS`).
-pub const RAM_KEPT_MAX: usize = OPEN_MAX;
 /// The descriptions one portion of a clone of the RAM service's session names at most
 /// (`proto_fs::CLONE_PORTION`): the first goes with CLONE_EXACT, the rest with CLONE_MORE.
 pub const RAM_PORTION: usize = proto_fs::CLONE_PORTION;
@@ -225,6 +221,13 @@ pub const NETS_PORTION: usize = proto_net::sockets::CLONE_MAX;
 /// The shared mappings of files a process pins besides its descriptors
 /// (`pin_for_map`).
 pub use posix_fd::{MAP_PINS, PinRef};
+// The places of a session of the RAM service are the numbers of the table, the closes and
+// the abandoned opens whose entry is empty before the service has the physical release,
+// and the pins (`proto_fs::SESSION_PLACES`). A change to any of the four breaks the build.
+const _: () = assert!(
+    proto_fs::SESSION_PLACES
+        == OPEN_MAX + posix_fd::JOBS_MAX + posix_fd::JOBS_MAX + posix_fd::MAP_PINS
+);
 /// Where a walk over the descriptions a fork keeps stands between its portions, and
 /// the numbers of the service's session it named already.
 pub struct RamKept {

@@ -289,7 +289,7 @@ fn description_share_is_charged_to_the_retained_root_across_clone() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     // Six sessions of 1 024 numbers take the share of FIRST.
     let each = DESCRIPTION_SHARE as usize / 6;
-    let mut fds = [Fds::default(); 7];
+    let mut fds = core::array::from_fn::<Fds, 7, _>(|_| Fds::default());
     for session in &mut fds {
         session.root = FIRST;
     }
@@ -362,7 +362,7 @@ fn sparse_original_overlay_and_boot_hardlinks_share_actual_bytes() {
 #[test]
 fn gone_sessions_cancel_paid_preparations_and_leave_the_other_roots_reserve() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
-    let mut sessions = [Fds::default(); 8];
+    let mut sessions = core::array::from_fn::<Fds, 8, _>(|_| Fds::default());
     for (i, s) in sessions.iter_mut().enumerate() {
         s.root = if i < 6 { FIRST } else { SECOND };
         for j in 0..16 {

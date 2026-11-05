@@ -72,9 +72,10 @@ use proto_fs::{
 use tree::Tree;
 
 const FILE_CAPACITY: usize = 1024;
-// `PLACES` are the places of one session: the 1 024 numbers of the layer's table
-// and 16 for the descriptions the layer pins for shared mappings, which keep their
-// place after their numbers close (`proto_fs::SESSION_PLACES`). A session with
+// `PLACES` are the places of one session (`proto_fs::SESSION_PLACES`, 1 072): the 1 024
+// numbers of the layer's table, 16 closes and 16 abandoned opens whose table entry is
+// empty before the service has the physical release, and 16 for the descriptions the
+// layer pins for shared mappings, which keep their place after their numbers close. A session with
 // every place taken answers EMFILE (TOO_MANY_OPEN_FILES); the layer's table
 // ends before it does.
 use numbers::{Bits, PLACES};
@@ -88,10 +89,12 @@ pub const DESCRIPTIONS: usize = proto_fs::DESCRIPTIONS;
 /// The `wide` of a session that holds none.
 const NO_WIDE: u16 = u16::MAX;
 /// The tables of numbers and receipts the service has. A label has one place, where it is
-/// a birth first and a session after, and holds one table at most; the places and a spare
-/// portion (the table of a clone made before its label is issued) are all that can hold one
-/// at once.
-pub const WIDES: usize = places::COUNT + CLONE_PORTION;
+/// a birth first and a session after, and holds one table at most, from the first number
+/// to the end of its cleanup; the place is given back only after that. The table of a clone
+/// made before its label is issued is given back in the same step when the issue fails, and
+/// the service has one thread, so at most one such table exists with every place taken.
+/// The places (place 0 is never issued) are all the tables there can be.
+pub const WIDES: usize = places::COUNT;
 const MOTD: &[u8] = b"stafeto ramfs\n";
 /// The inode of entry `n` of the table is this plus the number of the
 /// first entry that names its file (the fixed tree has 1 to 5).
@@ -295,7 +298,7 @@ struct Open {
 /// service (`Ram`), which sessions a client cloned for its children share
 /// with their offsets and access modes (Clone). `claimed`: the session's
 /// first request took what Clone made for its label.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Fds {
     /// The tables of the session's numbers and receipts (`Wide`), which the service
     /// gives it when it first holds one and takes back when the session is gone:
@@ -3818,7 +3821,7 @@ mod tests {
     #[test]
     fn descriptions_are_bounded_across_sessions() {
         let mut ram = Ram::default();
-        let mut sessions = [Fds::default(); 8];
+        let mut sessions = core::array::from_fn::<Fds, 8, _>(|_| Fds::default());
         for (i, fds) in sessions.iter_mut().enumerate() {
             fds.root = storage::Root {
                 id: i as u64 + 1,

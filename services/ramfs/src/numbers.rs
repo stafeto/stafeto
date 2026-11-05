@@ -109,6 +109,6 @@ mod tests {
         assert_eq!(a.first_set(), Some(3));
         assert_eq!(a.first_set_without(&b), Some(64));
         assert!(a.iter_without(&b).eq([64, 65, 1055]));
-        assert!(a.get(1055) && !a.get(1056) && !a.get(5000));
+        assert!(a.get(1055) && !a.get(1072) && !a.get(5000));
     }
 }

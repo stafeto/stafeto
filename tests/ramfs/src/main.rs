@@ -137,9 +137,9 @@ fn check_initialization(
     parent: &rt::Handle<rt::handle::Channel>,
     process: &rt::Handle<rt::handle::Process>,
 ) -> Result<(), &'static str> {
-    // The edges of the service's numbers (3 to 1058) and descriptions (0 to 8191).
+    // The edges of the service's numbers (3 to 1074) and descriptions (0 to 8191).
     let held = |slot, generation| rt::fs::PreparedOpen {
-        fd: 1058,
+        fd: 1074,
         slot,
         generation,
         random: true,
@@ -150,12 +150,12 @@ fn check_initialization(
     let next = posix_fs::RamTarget::from_prepared(held(0, 2)).map_err(|_| "next exact target")?;
     if old == replacement
         || old == next
-        || replacement.fd() != 1058
+        || replacement.fd() != 1074
         || replacement.description_slot() != 8191
         || replacement.generation() != 1
         || replacement.prepared()
             != (rt::fs::PreparedOpen {
-                fd: 1058,
+                fd: 1074,
                 slot: 8191,
                 generation: 1,
                 random: false,
@@ -163,7 +163,7 @@ fn check_initialization(
     {
         return Err("full target identity");
     }
-    for (fd, slot, generation) in [(2, 0, 1), (1059, 0, 1), (3, 8192, 1), (3, 0, 0)] {
+    for (fd, slot, generation) in [(2, 0, 1), (1075, 0, 1), (3, 8192, 1), (3, 0, 0)] {
         if posix_fs::RamTarget::from_prepared(rt::fs::PreparedOpen {
             fd,
             slot,
@@ -904,7 +904,7 @@ fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<()
     }
     fs.close(fresh).map_err(|_| "close fresh")?;
     fs.close(source).map_err(|_| "close limit source")?;
-    // The service's places for a session (1 056, the layer's 1 024 numbers and 16 pins) are
+    // The service's places for a session (1 072, the layer's 1 024 numbers, 32 releases in flight and 16 pins) are
     // never taken before the layer's own: distinct opens fill every number of the table, and
     // the next open is refused by the layer, with the service still having places.
     for expected in 3..OPEN_MAX as u32 {

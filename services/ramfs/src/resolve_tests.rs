@@ -2051,7 +2051,7 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
 #[test]
 fn finished_open_handoff_succeeds_with_full_description_and_session_tables() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
-    let mut sessions = [Fds::default(); 4];
+    let mut sessions = core::array::from_fn::<Fds, 4, _>(|_| Fds::default());
     for (n, fds) in sessions.iter_mut().enumerate() {
         fds.root = Root {
             id: 301 + n as u64,
@@ -2275,7 +2275,7 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
 fn clone_into_requires_fresh_destination_including_operation_tombstones() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
     let source = Fds::default();
-    let mut destinations = [Fds::default(); 9];
+    let mut destinations = core::array::from_fn::<Fds, 9, _>(|_| Fds::default());
     destinations[0].open_watermarks[31] = 1;
     // A tombstone of an earlier operation lives in the tables of numbers and receipts, which
     // a fresh destination has not got.

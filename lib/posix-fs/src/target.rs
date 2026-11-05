@@ -190,7 +190,7 @@ mod fifo_tests {
         // The edges of the packed word: the last number, the last description, the last ticket.
         let edge = FifoTarget::new(
             RamTarget::from_prepared(PreparedOpen {
-                fd: 1058,
+                fd: 1074,
                 slot: 8191,
                 generation: 7,
                 random: false,
@@ -200,7 +200,7 @@ mod fifo_tests {
             proto_pipe::Endpoint::named(127, 9),
         )
         .unwrap();
-        assert_eq!(edge.ram().fd(), 1058);
+        assert_eq!(edge.ram().fd(), 1074);
         assert_eq!(edge.ram().description_slot(), 8191);
         assert_eq!(edge.endpoint(), proto_pipe::Endpoint::named(127, 9));
         assert_eq!(
@@ -257,7 +257,7 @@ mod fifo_tests {
             FifoTarget::from_packed(good.packed() | (1 << 31), 1, 1),
             Err(FsError::Io)
         );
-        for fd in [0, 2, 1059, 2047] {
+        for fd in [0, 2, 1075, 2047] {
             let packed = (good.packed() & !proto_fs::OPEN_FD_MASK) | fd;
             assert_eq!(FifoTarget::from_packed(packed, 1, 1), Err(FsError::Io));
         }

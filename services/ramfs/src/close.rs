@@ -13,7 +13,7 @@ use proto_fs::{CloseEvent, OPEN_DESCRIPTION_MASK, OPEN_DESCRIPTION_SHIFT, OPEN_F
 impl Ram<'_> {
     /// Session disappearance retires true OFD references without a PID close event, at
     /// most `CLONE_PORTION` of them in one call: the call is a step of the service, and a
-    /// session holds up to 1 056 numbers. The caller calls again while the session is not
+    /// session holds up to 1 072 numbers. The caller calls again while the session is not
     /// `detached`; the references that remain are the first ones in the order of the
     /// numbers. Returns the references this call retired.
     pub fn detach_session_descriptions(

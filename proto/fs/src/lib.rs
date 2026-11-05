@@ -159,13 +159,26 @@ pub const NO_FOLLOW: u32 = 256;
 /// The third word of the reply to an OPEN of a random device.
 pub const RANDOM_DEVICE: u32 = 1;
 /// Commit, Finish and FinishedQuery encode a captured Random description in fd bit31.
-/// Bits0..10 hold the session's number 3..1058; bits11..23 hold its shared description
+/// Bits0..10 hold the session's number 3..1074; bits11..23 hold its shared description
 /// slot0..8191.
 pub const OPEN_RANDOM: u32 = 1 << 31;
-/// The places of one session: 1 024 descriptor numbers, the table of the layer, and 16
-/// places for the descriptions the layer pins for shared mappings after their numbers close.
+/// The places of one session, 1 072: a place is held by every number the service has not
+/// yet been told is gone, and the layer frees a table entry before the service has the
+/// physical release. The terms, each bounded by a constant of the layer that
+/// `lib/posix-fs` ties to this sum with a build-time assertion:
+/// - 1 024 numbers, the entries of the layer's table (`posix_fs::OPEN_MAX`); an open that is
+///   pending and a close that has not finished hold an entry, so they are inside it;
+/// - 16 closes whose entry is empty and whose physical release is not yet answered, one
+///   for each close slot of a process (`posix_fd::JOBS_MAX`, `closings`, kept until
+///   `finish_close_release`);
+/// - 16 opens abandoned after publication, whose entry is closed and whose number is
+///   released by recovery, one for each open record of a process (`posix_fd::JOBS_MAX`,
+///   `residents`, `abandon_open_with_recovery`);
+/// - 16 descriptions the layer pins for shared mappings after their numbers close
+///   (`posix_fd::MAP_PINS`).
+///
 /// The numbers of a session are 3 to `3 + SESSION_PLACES - 1`.
-pub const SESSION_PLACES: usize = 1056;
+pub const SESSION_PLACES: usize = 1072;
 /// The first number of a session.
 pub const SESSION_FIRST: u32 = 3;
 /// Whether `fd` is a number a session can hold.
@@ -538,13 +551,13 @@ mod tests {
         const { assert!(HEADER_LEN + 4 + MAX_PATH <= MESSAGE_MAX) };
     }
 
-    /// The result word holds the session's numbers 3 and 1058, the descriptions 0 and 8191
+    /// The result word holds the session's numbers 3 and 1074, the descriptions 0 and 8191
     /// and OPEN_RANDOM, each in its own bits.
     #[test]
     fn the_result_word_packs_the_edges_of_its_fields() {
         assert_eq!(OPEN_FD_MASK & OPEN_DESCRIPTION_MASK, 0);
         assert_eq!(OPEN_RANDOM & (OPEN_FD_MASK | OPEN_DESCRIPTION_MASK), 0);
-        for fd in [3, 4, 67, 1058] {
+        for fd in [3, 4, 67, 1074] {
             assert!(is_session_number(fd));
             for slot in [0u32, 1, 127, 128, 8191] {
                 for random in [0, OPEN_RANDOM] {
@@ -560,8 +573,8 @@ mod tests {
             }
         }
         assert!(!is_session_number(2));
-        assert!(!is_session_number(1059));
-        assert_eq!(1058, 3 + SESSION_PLACES as u32 - 1);
+        assert!(!is_session_number(1075));
+        assert_eq!(1074, 3 + SESSION_PLACES as u32 - 1);
         assert_eq!(
             (OPEN_DESCRIPTION_MASK >> OPEN_DESCRIPTION_SHIFT) as usize,
             DESCRIPTIONS - 1

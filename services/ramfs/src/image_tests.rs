@@ -104,10 +104,10 @@ fn full_root_description_account_refuses_image_before_pin_and_recovers_one_credi
     let token = ram.storage.resolve(b"/program").unwrap();
     let entry = ram.storage.node(token).unwrap().boot;
     // Six sessions of 1 024 numbers take the whole share of the root.
-    let mut filled = [Fds {
+    let mut filled = core::array::from_fn::<Fds, 6, _>(|_| Fds {
         root: EXPENSE,
         ..Fds::default()
-    }; 6];
+    });
     for fds in &mut filled {
         for _ in 0..crate::storage::DESCRIPTION_SHARE as usize / 6 {
             ram.open_token(fds, token, proto_fs::READ_ONLY, ADMIN)

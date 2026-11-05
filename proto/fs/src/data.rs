@@ -291,7 +291,7 @@ mod tests {
             },
             kind,
             description: DataDescription {
-                packed: 1058 | (8191 << crate::OPEN_DESCRIPTION_SHIFT),
+                packed: 1074 | (8191 << crate::OPEN_DESCRIPTION_SHIFT),
                 generation: 1,
             },
             count: if kind == DataKind::Truncate { 0 } else { 1012 },
@@ -326,7 +326,7 @@ mod tests {
             args.description.packed |= 1 << bit;
             assert_eq!(args.validate(), Err(Status::BadSize));
         }
-        for fd in [0, 2, 1059, 2047] {
+        for fd in [0, 2, 1075, 2047] {
             let mut args = start(DataKind::Write);
             args.description.packed = fd;
             assert_eq!(args.validate(), Err(Status::BadSize));

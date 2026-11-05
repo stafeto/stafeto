@@ -489,7 +489,9 @@ const BIRTHS: usize = CLONES;
 /// each birth holds a description once.
 const _: () = assert!(SESSIONS + BIRTHS < u16::MAX as usize);
 /// A label has one place, as a birth and then as a session: the places can all hold tables.
-const _: () = assert!(SESSIONS <= ramfs::WIDES);
+// One table per place: a label holds a table from its first number to the end of its
+// cleanup, and its place is given back after.
+const _: () = assert!(SESSIONS == ramfs::WIDES);
 
 /// The identity channels of the sessions, by index, with a list of the
 /// free indexes: taking one costs the same with any number alive.
@@ -909,7 +911,7 @@ impl Fs {
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
         // The logical death of a departed session's descriptors goes on by portions: a
-        // session holds up to 1 056 numbers, and one step detaches `CLONE_PORTION`.
+        // session holds up to 1 072 numbers, and one step detaches `CLONE_PORTION`.
         if fds.departed && !self.ram.detached(fds) {
             self.ram.detach_session_descriptions(fds, self.locks);
             return true;

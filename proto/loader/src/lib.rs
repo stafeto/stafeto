@@ -2655,7 +2655,7 @@ mod fifo_identity_tests {
         Descriptor {
             fd,
             names: Names::Fifo {
-                packed: 1058
+                packed: 1074
                     | (8191 << proto_fs::OPEN_DESCRIPTION_SHIFT)
                     | (127 << proto_fs::FIFO_TICKET_SHIFT),
                 ram_generation: 0x1234567800000001,

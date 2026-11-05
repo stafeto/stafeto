@@ -10,7 +10,7 @@ use crate::watch::Watch;
 const MS: u64 = 1_000_000;
 
 /// The pages of the service's tables and of its writable data.
-const TABLES: u64 = 915 + 428;
+const TABLES: u64 = 915 + 392;
 
 /// The level of the file, pipe and clock services.
 pub const SERVICE_LEVEL: u8 = 48;
@@ -32,10 +32,12 @@ const RAM_BASE: Record = Record {
     ceiling: SERVICE_LEVEL,
     // Checked standalone RAM adds measured readonly and code pages.
     // Backing, stack and runtime allowance retain their existing sizes.
-    // The tables: 915 pages, and 428 for the sessions of 1 056 places, the table of 8 192
-    // descriptions and the pool of tables of numbers (stafeto-design#578: the `tables=`
+    // The tables: 915 pages, and 392 for the sessions of 1 072 places, the table of 8 192
+    // descriptions and the pool of 320 tables of numbers (stafeto-design#578). The `tables=`
     // figure of the line `ramfs: storage pages=4096 tables=...` went from 6 083 504 to
-    // 7 833 232 bytes, both builds the same).
+    // 7 688 784 bytes in the release build (+1 605 280, 392 pages) and from 6 381 488 to
+    // 7 734 864 in the build with checks (+1 353 376, 331 pages). The quota takes the
+    // larger of the two.
     quota: if cfg!(all(debug_assertions, feature = "table-ramfs")) {
         (4096 + TABLES + 11 + 34 + 12 + 128) * PAGE
     } else {
