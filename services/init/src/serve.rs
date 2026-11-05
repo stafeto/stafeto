@@ -527,8 +527,11 @@ impl Init {
         if self.started == TABLE.len() {
             println!("{STARTED}");
             // What is left of init's own quota once every record has its
-            // own: the images with many packages watch it (cargo xtask
-            // pkg-identity keeps it from 16 384 pages).
+            // own: the base and the full image watch it (cargo xtask
+            // pkg-identity keeps it from 16 384 pages). The other images
+            // print nothing more: a line at this point moves the time of
+            // the boot, and posix-lock-pages measures a sleep against it.
+            #[cfg(feature = "table-base")]
             if let Ok(memory) = sys::process_memory(&self.own) {
                 println!(
                     "init: free pages {} of {}",
