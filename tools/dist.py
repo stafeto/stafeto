@@ -290,6 +290,8 @@ def refuse_linux_guest(out: Path, guest: Path) -> None:
     for path in sorted(out.iterdir()):
         if GUEST_NAMES.search(path.name):
             raise SystemExit(f"dist: {path.name} is a file of the Linux guest")
+        if secret and path.is_file() and sha256_file(path) in secret:
+            raise SystemExit(f"dist: {path.name} is the {secret[sha256_file(path)]} of the Linux guest")
         if not path.name.endswith((".tar.xz", ".tar")):
             continue
         with tarfile.open(path) as tar:

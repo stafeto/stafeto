@@ -50,6 +50,7 @@ def image(size: int = 0x100) -> bytes:
     data = bytearray(size)
     data[0:2] = b"MZ"
     data[0x38:0x3c] = b"ARMd"
+    struct.pack_into("<Q", data, 0x10, size + 0x1000)
     return bytes(data)
 
 
@@ -208,7 +209,7 @@ class ApkTests(unittest.TestCase):
         guest.add_package(tree, {"name": "nginx"}, members)
         self.assertEqual(sorted(tree), ["usr/sbin/nginx"])
 
-    def test_the_kernel_package_gives_its_image_and_three_modules_only(self):
+    def test_the_kernel_package_gives_its_image_and_the_modules_it_has_only(self):
         tree = {}
         members = guest.read_apk(apk([
             ("boot/vmlinuz-virt", b"zboot"),
@@ -249,6 +250,56 @@ class KernelTests(unittest.TestCase):
         data[0x40:0x44] = b"\0\0\0\0"
         with self.assertRaises(SystemExit):
             guest.unzboot(bytes(data))
+
+
+class KernelEndTests(unittest.TestCase):
+    def test_a_cut_payload_is_refused(self):
+        # The start of the stream is whole and the end is gone.
+        packed = gzip.compress(image(0x4000))
+        cut = packed[: len(packed) - 12]
+        head = bytearray(0x40)
+        head[0:2] = b"MZ"
+        head[4:8] = b"zimg"
+        struct.pack_into("<II", head, 8, len(head), len(cut))
+        head[0x18:0x1c] = b"gzip"
+        with self.assertRaises(SystemExit):
+            guest.unzboot(bytes(head) + cut)
+
+    def test_bytes_after_the_stream_are_refused(self):
+        data = zboot(image())
+        head = bytearray(data[:0x40])
+        packed = data[0x40:] + b"junk"
+        struct.pack_into("<II", head, 8, len(head), len(packed))
+        with self.assertRaises(SystemExit):
+            guest.unzboot(bytes(head) + packed)
+
+    def test_an_image_size_below_the_image_is_refused(self):
+        small = bytearray(image())
+        struct.pack_into("<Q", small, 0x10, 0x10)
+        with self.assertRaises(SystemExit):
+            guest.unzboot(zboot(bytes(small)))
+
+
+class ModuleTests(unittest.TestCase):
+    def test_a_missing_module_stops_the_build(self):
+        # Breakage: the guest would boot with no network.
+        with tempfile.TemporaryDirectory() as directory:
+            lock = {"mirror": "m", "branch": "b", "repository": "r", "arch": "a",
+                    "package": [{"name": "linux-virt", "version": "1-r0", "sha256": "0" * 64,
+                                 "license": "GPL-2.0-only"}]}
+            members = apk([("boot/vmlinuz-virt", b"zboot"),
+                           ("lib/modules/6/kernel/net/failover.ko.gz", gzip.compress(b"m"))],
+                          pkginfo("linux-virt", "1-r0", "GPL-2.0-only"))
+            lock["package"][0]["sha256"] = hashlib.sha256(members).hexdigest()
+            cache = Path(directory)
+            (cache / f"{lock['package'][0]['sha256']}.apk").write_bytes(members)
+            init = cache / "init"
+            init.write_bytes(b"#!/bin/sh\n")
+            overlay = cache / "overlay"
+            overlay.mkdir()
+            with self.assertRaises(SystemExit) as raised:
+                guest.make_tree(lock, cache, overlay, init)
+            self.assertIn("virtio_net", str(raised.exception))
 
 
 class ClosureTests(unittest.TestCase):
@@ -377,6 +428,16 @@ class DistTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 dist.refuse_linux_guest(out, guest_dir)
             self.assertIn("Linux guest", str(raised.exception))
+
+    def test_a_renamed_file_of_the_guest_next_to_the_archives_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            guest_dir = out / "guest"
+            guest_dir.mkdir()
+            (guest_dir / "Image").write_bytes(b"the guest's kernel")
+            (out / "kernel-copy").write_bytes(b"the guest's kernel")
+            with self.assertRaises(SystemExit):
+                dist.refuse_linux_guest(out, guest_dir)
 
     def test_a_loose_file_of_the_guest_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:

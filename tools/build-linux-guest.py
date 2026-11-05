@@ -255,12 +255,17 @@ def unzboot(data):
         die(f"the kernel's payload is compressed with {compression!r}; only gzip is read")
     if start + length > len(data) or length == 0:
         die("the payload of the kernel lies outside the file")
+    stream = zlib.decompressobj(31)
     try:
-        image = zlib.decompressobj(31).decompress(data[start:start + length])
+        image = stream.decompress(data[start:start + length])
     except zlib.error as error:
         die(f"the payload of the kernel does not unpack: {error}")
+    if not stream.eof or stream.unused_data:
+        die("the payload of the kernel is cut short or has bytes after its gzip stream")
     if len(image) < 0x40 or image[0x38:0x3c] != IMAGE_MAGIC:
         die("the unpacked kernel has no ARMd at offset 0x38: no arm64 Image")
+    if struct.unpack_from("<Q", image, 0x10)[0] < len(image):
+        die("image_size in the header of the kernel is smaller than the Image")
     return image
 
 
@@ -428,6 +433,9 @@ def make_tree(lock, cache, overlay, init):
             kernel = found
     if kernel is None:
         die("the lock has no kernel package with " + KERNEL_FILE)
+    absent = [m for m in MODULES if f"lib/modules/{m}.ko" not in tree]
+    if absent:
+        die(f"the kernel package has no module {', '.join(absent)}: the guest would boot without its network")
     for name in DIRECTORIES:
         tree.setdefault(name, Entry("dir", 0o755 if name != "tmp" else 0o1777))
     for name, target in SYMLINKS.items():

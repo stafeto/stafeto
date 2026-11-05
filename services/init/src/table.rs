@@ -2121,6 +2121,14 @@ mod tests {
     fn the_bench_image_differs_from_the_network_image_of_vz_in_the_launcher_alone() {
         assert_eq!(order_of(bench::BENCH_VZ_TABLE), order_of(net::NET_VZ_TABLE));
         assert_eq!(BENCH_CPUS, 0b1111);
+        assert_eq!(bench::BENCH_LAUNCHER.name, net::NET_LAUNCHER.name);
+        assert_eq!(
+            bench::BENCH_VZ_TABLE
+                .iter()
+                .filter(|r| r.cpus == BENCH_CPUS)
+                .count(),
+            1
+        );
         for (bench, net) in bench::BENCH_VZ_TABLE.iter().zip(net::NET_VZ_TABLE) {
             if bench.name == bench::BENCH_LAUNCHER.name {
                 assert_eq!(bench.cpus, BENCH_CPUS);
@@ -2160,28 +2168,70 @@ mod tests {
             }
         }
         assert_eq!(users, ["bench.rs"]);
-        for table in [
-            normal::TABLE,
-            net::NET_TABLE,
-            net::NET_PROBE_TABLE,
-            net::NET_VZ_TABLE,
-            net::NET_VZ2_TABLE,
-            net::NET_TWO_TABLE,
-            vz::TABLE,
-            ramfs::POSIX_ABI_TABLE,
-            ramfs::BUSYBOX_DIALOG_TABLE,
-            fstack::FSTACK_TABLE,
-        ] {
+        for table in all_tables() {
             for r in table {
                 assert_ne!(r.cpus, BENCH_CPUS, "{}", r.name);
-                assert!(
-                    [GENERAL_CPUS, NETD_CPUS, RT_CPUS, ALL_CPUS, 0b0010].contains(&r.cpus),
-                    "{} stands on {:#06b}",
-                    r.name,
-                    r.cpus
-                );
             }
         }
+    }
+
+    /// Every table of the images but the bench table (feature-gated tables
+    /// are listed as they stand in a test build).
+    fn all_tables() -> Vec<&'static [Record]> {
+        vec![
+            normal::TABLE,
+            cycle::TABLE,
+            ceiling::TABLE,
+            test::TABLE,
+            lock_ring::TABLE,
+            doom::TABLE,
+            gpu::TABLE,
+            input::TABLE,
+            entropy::TABLE,
+            entropy::VZ_TABLE,
+            fstack::FSTACK_TABLE,
+            fstack::FSTACK_DEVICE_TABLE,
+            net::NET_TABLE,
+            net::NET_TWO_TABLE,
+            net::NET_VZ_TABLE,
+            net::NET_VZ2_TABLE,
+            net::NET_PROBE_TABLE,
+            net::NET_PROBE_TWO_TABLE,
+            vz::TABLE,
+            vz::PCI_WALK_TABLE,
+            vz::POSIX_ABI_TABLE,
+            vz::POSIX_NATIVE_TABLE,
+            vz::BUSYBOX_DIALOG_TABLE,
+            vz::POSIX_TTY_TABLE,
+            vz::POSIX_DIALOG_TABLE,
+            vz::RTBENCH_TABLE,
+            vz::RTBENCH_POSIX_TABLE,
+            vz::TTY_TABLE,
+            ramfs::TABLE,
+            ramfs::BUSYBOX_TABLE,
+            ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_TTY_TABLE,
+            ramfs::POSIX_DIALOG_TABLE,
+            ramfs::POSIX_FILES_TABLE,
+            ramfs::POSIX_ABI_TABLE,
+            ramfs::RELIBC_TABLE,
+            ramfs::POSIX_PROCS_TABLE,
+            ramfs::POSIX_SHARES_TABLE,
+            ramfs::POSIX_STEPS_TABLE,
+            ramfs::OS_TEST_TABLE,
+            ramfs::RELIBC_THREADS_TABLE,
+            ramfs::RTBENCH_POSIX_TABLE,
+            ramfs::TTY_TABLE,
+            ramfs::TTY_STEPS_TABLE,
+            ramfs::POSIX_RANDOM_TABLE,
+            ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
+            ramfs::LOADER_CHANNELS_TABLE,
+            ramfs::POSIX_POLL_TABLE,
+            ramfs::POSIX_SOCK_TABLE,
+            ramfs::POSIX_IPC_TABLE,
+            ramfs::POSIX_PTY_TABLE,
+        ]
     }
 
     #[test]

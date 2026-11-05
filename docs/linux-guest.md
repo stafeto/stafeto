@@ -39,12 +39,16 @@ package; update the lock and record the new pins in the report of the run.
 
 `cargo xtask linux-guest build` writes the overlay from the sources that
 stafeto's image uses: `tools/nginx/nginx.conf` as `/etc/nginx/nginx.conf`, and the
-files under `/www` (`index.html`, `1k.bin`, `10k.bin`, `256k.bin`, the
-generators of `rootfs` and `nginx_probe`). `/etc/nginx/mime.types` of the Alpine
-package has the same bytes as `conf/mime.types` of the nginx source; the check
-below confirms it through the fingerprint.
+files under `/www`: `index.html`, `1k.bin`, `10k.bin`, `256k.bin`, the set W1
+(1 000 files of 10 KiB under `/www/s/`) and the set W2 (64 files of 256 KiB under
+`/www/l/`), from the generators of `rootfs` and `nginx_probe` and fixed seeds.
+`/etc/nginx/mime.types` is the `conf/mime.types` of the nginx source that
+stafeto's image carries, written into the overlay as well, so that a new pin of
+the nginx package cannot change it.
 
-Stafeto's side is `boot-net-bench.img`: the network image of VZ with its own
+The RAM service serves the files of an image straight from the image, so their bytes do not count against its writable pages; the limit is the table of the image, 2 048 entries and 2 048 files since this change (`lib/bootimg/src/rootfs.rs`, 1 024 before), which W1 needs.
+
+Stafeto's side is `boot-net-bench.img` (about 48 MB with the two sets): the network image of VZ with its own
 table of `init` (`services/init/src/table/bench.rs`). Its shell, and so nginx,
 runs on all four CPUs (`BENCH_CPUS = 0b1111`); the network service stays on the
 boot CPU and the other services on the CPUs of the services. No other image
@@ -68,15 +72,59 @@ four CPUs, and compares with what stafeto's sources say:
   `worker_connections`, `worker_shutdown_timeout`, the `reuseport` parameter) are
   masked, and the rest is hashed; the expected text is built from
   `nginx.conf` and `mime.types`;
-- the digest of the files under `/www`: `openssl dgst -sha256 /www/*.*` (the one
-  hashing program both guests have; stafeto's BusyBox has no `sha256sum`), the
-  list of hashes hashed once more;
-- every file of `/www` fetched from the Mac and compared byte by byte;
+- the files under `/www`: `openssl dgst -sha256 $(find /www -type f)` (the one
+  hashing program both guests have; stafeto's BusyBox has no `sha256sum`). A file
+  that is missing, extra or changed is named; the paths and hashes are hashed once
+  more into the digest of the report;
+- twelve files of `/www` fetched from the Mac and compared byte by byte (the
+  four first files and the first and last two of each set; see the limit below);
+- nginx must not print `running with OpenSSL`: the library of the guest is the one
+  nginx was built with;
+- the lease macOS gave the guest's MAC address (`/var/db/dhcpd_leases`) is the
+  address the console shows;
 - `nproc` says 4, and the MAC address of the guest is the one the run set.
 
 A guest that differs ends the check with an error, and no run starts on it. The
-console logs, the output of `nginx -V` and the virtio-net feature bits of the
-Linux guest go to `target/linux-guest/check-<time>/`.
+console logs, the output of `nginx -V`, the lines `configure arguments` of both
+sides and their difference (`configure-arguments.txt`), the attempts of the first
+answer (`*-first-answer.txt`), the kernel settings of the Linux guest
+(`linux-sysctl.txt`, the defaults the measurement of "Linux as it comes" runs on)
+and the virtio-net feature bits go to `target/linux-guest/check-<time>/`. The two
+times of the table are liveness checks: from the start of `vz-run` to the prompt,
+and from the moment four workers of nginx and the shell are up to the first answer
+on the Mac, taken the same way on both sides.
+
+## What stays different
+
+The fingerprint of `nginx -T` covers the text of the settings only. What is
+built into the two nginx differs, and the report of a measurement names it:
+
+| What | Linux (Alpine) | stafeto | Effect on HTTP |
+|---|---|---|---|
+| compiler and flags | gcc 15, the flags of `abuild.conf` of the branch (stack protector, PIE) | clang, `-Os -fno-stack-protector -fPIC -mno-outline-atomics -mfix-cortex-a53-835769` | CPU time per request |
+| modules built in | `gzip`, `gunzip`, `gzip_static`, `sub`, `addition`, `realip`, `dav`, `flv`, `mp4`, `slice`, `secure_link`, `auth_request`, `stub_status`, `v3`, dynamic modules | `--without-http_gzip_module`, `ssl` and `v2` only | slight: the filters of `gzip`, `sub`, `addition` and `gunzip` sit in the chain and test their flag on every answer; one setting cannot level it |
+| `--with-threads`, `--with-file-aio` | yes | no | none while `aio` is off |
+| PCRE2 | the library of Alpine, with JIT | 10.49 built here, no JIT | none: no regular expression in the settings, `pcre_jit` is off |
+| OpenSSL | `libcrypto3` of Alpine with assembly | 3.5.9 built here, assembly with probes by SIGILL | none for HTTP, large for TLS (W4 and W5: print `openssl version -a` on both sides) |
+| libc and allocator | musl, mallocng | relibc | a property of the systems |
+| `--with-compat` | yes | no | negligible |
+
+The raw `*-nginx-v.txt` and `configure-arguments.txt` of every check hold both
+sides. Alpine's packages are pinned by SHA-256 taken from one download over
+HTTPS on 2026-11-05; the signatures of the packages and of `APKINDEX` are not
+checked.
+
+## A limit of stafeto the sets meet
+
+The RAM service lets a client hold 32 open files (`OPEN_MAX` in
+`services/ramfs/src/lib.rs`), and nginx keeps every file it served open with
+`open_file_cache max=1000`. A worker of stafeto that has served about 30
+distinct files answers 500 (`open() failed (24: Too many open files)`) to the
+next. The sets W1 and W2 of the load, as designed, hit it; so `check` fetches
+twelve files over HTTP and verifies all of them by hash inside the guests. The
+Linux guest has no such limit. This is for the owner to decide before the
+measurement of stage P7 (a smaller `open_file_cache` on both sides, or a larger
+`OPEN_MAX` in the RAM service).
 
 ## The guest is never shipped
 

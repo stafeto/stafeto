@@ -45,6 +45,8 @@ pub const MEMORY_MIB: u64 = 1024;
 /// answer, after the start of the machine.
 const LINUX_WITHIN: Duration = Duration::from_secs(60);
 const ANSWER_WITHIN: Duration = Duration::from_secs(30);
+/// The hashes of the files under `/www` by the guest's `openssl`.
+const WWW_WITHIN: Duration = Duration::from_secs(120);
 
 /// The programs of the image of the measurement: those of the network image
 /// of VZ with init's table of the measurement (`table-bench-vz`).
@@ -69,10 +71,45 @@ pub fn build_image() -> Result<PathBuf, String> {
 
 // What both guests carry -------------------------------------------------------
 
-/// The files under `/www` both guests carry, by their paths in the guest in
-/// the order a shell expands `/www/*.*`: the page of the images with the
-/// network and the three files of the load. One source: stafeto's image takes
-/// them from `rootfs`, the Linux guest from the overlay made here.
+/// The files of the load of the measurement: W1, 1 000 files of 10 KiB under
+/// `/www/s/` (a ladder asks for them in turn), and W2, 64 files of 256 KiB under
+/// `/www/l/`. Their bytes come from fixed seeds, so both guests carry the same.
+pub const W1_FILES: usize = 1000;
+pub const W1_LEN: usize = 10 * 1024;
+pub const W2_FILES: usize = 64;
+pub const W2_LEN: usize = 256 * 1024;
+
+fn sets() -> &'static [(&'static str, Vec<u8>)] {
+    static SETS: std::sync::OnceLock<Vec<(&'static str, Vec<u8>)>> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        let mut files = Vec::new();
+        let mut add = |path: String, seed: u64, len: usize| {
+            let path: &'static str = Box::leak(path.into_boxed_str());
+            files.push((path, nginx_probe::noise(seed, len)));
+        };
+        for n in 0..W1_FILES {
+            add(
+                format!("/www/s/{n:04}.bin"),
+                0x3c6e_f372_fe94_f82b ^ n as u64,
+                W1_LEN,
+            );
+        }
+        for n in 0..W2_FILES {
+            add(
+                format!("/www/l/{n:02}.bin"),
+                0xa54f_f53a_5f1d_36f1 ^ n as u64,
+                W2_LEN,
+            );
+        }
+        files
+    })
+}
+
+/// The files under `/www` both guests carry, by their paths in the guest, in
+/// the order of the paths: the page of the images with the network, the three
+/// files of the first measurements and the sets W1 and W2. One source:
+/// stafeto's image takes them from `rootfs`, the Linux guest from the overlay
+/// made here.
 pub fn www_files() -> Vec<(&'static str, &'static [u8])> {
     let mut files: Vec<(&'static str, &'static [u8])> = vec![
         ("/www/index.html", crate::rootfs::www_index()),
@@ -80,8 +117,35 @@ pub fn www_files() -> Vec<(&'static str, &'static [u8])> {
         ("/www/10k.bin", nginx_probe::www_10k()),
         ("/www/256k.bin", nginx_probe::www_256k()),
     ];
+    files.extend(sets().iter().map(|(path, bytes)| (*path, bytes.as_slice())));
     files.sort_by(|a, b| a.0.cmp(b.0));
     files
+}
+
+/// The files the Mac fetches over HTTP: the four of the first measurements and
+/// the first two and the last two of each set. The guests give the hashes of
+/// every file under `/www` by `openssl` (`read_fingerprints`); the fetch stays
+/// small because nginx of stafeto keeps every file it served open
+/// (`open_file_cache max=1000`) and the RAM service lets a client hold 32
+/// (`OPEN_MAX` of `services/ramfs`): a worker that has served about 30 distinct
+/// files answers 500 to the next.
+pub fn fetched_files() -> Vec<(&'static str, &'static [u8])> {
+    const SAMPLE: [&str; 8] = [
+        "/www/s/0000.bin",
+        "/www/s/0001.bin",
+        "/www/s/0998.bin",
+        "/www/s/0999.bin",
+        "/www/l/00.bin",
+        "/www/l/01.bin",
+        "/www/l/62.bin",
+        "/www/l/63.bin",
+    ];
+    www_files()
+        .into_iter()
+        .filter(|(path, _)| {
+            !(path.starts_with("/www/s/") || path.starts_with("/www/l/")) || SAMPLE.contains(path)
+        })
+        .collect()
 }
 
 /// The settings of nginx in both guests.
@@ -90,8 +154,9 @@ pub fn nginx_conf() -> &'static str {
 }
 
 /// Writes the overlay of the Linux guest into the empty `dir`: the settings
-/// of nginx and the files under `/www`.
-pub fn write_overlay(dir: &Path) -> Result<(), String> {
+/// of nginx, its `mime.types` (the file of the nginx source that stafeto's image
+/// carries) and the files under `/www`.
+pub fn write_overlay(dir: &Path, mime: &[u8]) -> Result<(), String> {
     let put = |path: &str, bytes: &[u8]| -> Result<(), String> {
         let target = dir.join(path.trim_start_matches('/'));
         std::fs::create_dir_all(target.parent().expect("a path has a parent"))
@@ -99,6 +164,7 @@ pub fn write_overlay(dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", target.display()))
     };
     put("/etc/nginx/nginx.conf", nginx_conf().as_bytes())?;
+    put("/etc/nginx/mime.types", mime)?;
     for (path, bytes) in www_files() {
         put(path, bytes)?;
     }
@@ -228,6 +294,62 @@ pub fn www_digest_of_listing(lines: &[String]) -> Result<String, String> {
     Ok(digest_of_hashes(hashes))
 }
 
+/// The paths and hashes of the listing of `openssl dgst -sha256`.
+fn listing_pairs(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (head, hash) = line.trim().split_once(")= ")?;
+            let (_, path) = head.split_once('(')?;
+            Some((path.to_owned(), hash.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// What differs between the files a guest listed and the files of the sources:
+/// a file that is missing, a file that is extra, a file with other bytes.
+pub fn www_difference(lines: &[String], files: &[(&str, &[u8])]) -> Vec<String> {
+    let listed = listing_pairs(lines);
+    let mut out = Vec::new();
+    for (path, bytes) in files {
+        match listed.iter().find(|(p, _)| p == path) {
+            None => out.push(format!("missing {path}")),
+            Some((_, hash)) if *hash != sha256_hex(bytes) => out.push(format!("changed {path}")),
+            Some(_) => {}
+        }
+    }
+    for (path, _) in &listed {
+        if !files.iter().any(|(p, _)| p == path) {
+            out.push(format!("extra {path}"));
+        }
+    }
+    out
+}
+
+/// The tokens of the `configure arguments:` lines of two builds of nginx that
+/// only one of them has: `- ` for the first, `+ ` for the second.
+pub fn configure_difference(first: &[String], second: &[String]) -> Vec<String> {
+    let words = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .find_map(|l| l.trim().strip_prefix("configure arguments:"))
+            .map(|rest| rest.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    let (a, b) = (words(first), words(second));
+    let mut out: Vec<String> = a
+        .iter()
+        .filter(|w| !b.contains(w))
+        .map(|w| format!("- {w}"))
+        .collect();
+    out.extend(
+        b.iter()
+            .filter(|w| !a.contains(w))
+            .map(|w| format!("+ {w}")),
+    );
+    out
+}
+
 /// The version nginx names in `nginx -V` (the line `nginx version:
 /// nginx/X`) and the OpenSSL it was built with (the line `built with
 /// OpenSSL X ...`).
@@ -251,6 +373,11 @@ pub fn check_versions(
     nginx: &str,
     openssl: &str,
 ) -> Result<(String, String), String> {
+    if lines.iter().any(|l| l.contains("running with OpenSSL")) {
+        return Err(format!(
+            "the library the guest's nginx runs with is not the one it was built with: {lines:?}"
+        ));
+    }
     let (n, o) = versions_of(lines)?;
     if n != nginx || o != openssl {
         return Err(format!(
@@ -268,10 +395,16 @@ struct Report {
     system: &'static str,
     address: Option<Ipv4Addr>,
     mac: String,
-    /// From the start of `vz-run` to the prompt of the shell, to the first
-    /// answer of nginx on the Mac.
+    /// From the start of `vz-run` to the prompt of the shell; from the moment
+    /// the four workers of nginx are on the console and the shell answers to
+    /// the first answer of nginx on the Mac. The same on both guests, a check
+    /// of liveness that is no part of the measurement.
     prompt: Duration,
     answer: Duration,
+    /// Every attempt to get the first answer: when and how it ended.
+    attempts: Vec<String>,
+    /// The kernel's settings (`sysctl -a`), where the guest is Linux.
+    sysctl: Vec<String>,
     cpus: String,
     nginx: String,
     openssl: String,
@@ -311,10 +444,35 @@ fn capture(
     crate::net_tls::capture(run, command, marker, within)
 }
 
+/// Waits until the console shows the four workers of nginx.
+fn workers_up(run: &mut qemu::Run, within: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let seen = run
+            .lines()
+            .iter()
+            .filter(|l| l.contains("start worker process "))
+            .count();
+        if seen >= 4 {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("{seen} of 4 workers of nginx on the console"));
+        }
+        // Takes in the console's output for a moment.
+        let _ = run.expect_seen("\u{0}pump", Duration::from_millis(100));
+    }
+}
+
 /// The digests and versions the console of a guest gives, once its shell
-/// answers: `nginx -V`, `nginx -T`, `openssl dgst -sha256 /www/*.*` and the number
-/// of CPUs, checked against what stafeto's sources say.
-fn read_fingerprints(run: &mut qemu::Run, report: &mut Report) -> Result<(), String> {
+/// answers: `nginx -V`, `nginx -T`, the hashes of `find /www -type f` and the
+/// number of CPUs, checked against what stafeto's sources say; on Linux the
+/// kernel's settings too.
+fn read_fingerprints(
+    run: &mut qemu::Run,
+    report: &mut Report,
+    kernel_settings: bool,
+) -> Result<(), String> {
     run.send("S=ok")?;
     run.expect("# ", DIALOG_STEP)?;
     report.cpus = capture(run, "nproc", "nproc", DIALOG_STEP)?
@@ -339,9 +497,31 @@ fn read_fingerprints(run: &mut qemu::Run, report: &mut Report) -> Result<(), Str
     report.openssl = openssl;
     let dump = capture(run, "nginx -T 2>&1", "config", DIALOG_STEP)?.join("\n");
     report.config_digest = config_digest(&dump);
-    let www = capture(run, "openssl dgst -sha256 /www/*.*", "www", DIALOG_STEP)?;
+    let www = capture(
+        run,
+        "openssl dgst -sha256 $(find /www -type f)",
+        "www",
+        WWW_WITHIN,
+    )?;
+    let different = www_difference(&www, &www_files());
+    if !different.is_empty() {
+        return Err(format!(
+            "{}: the files under /www differ from the sources: {}{}",
+            report.system,
+            different
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            if different.len() > 5 { ", ..." } else { "" }
+        ));
+    }
     report.www_digest = www_digest_of_listing(&www)
         .map_err(|e| format!("{}: the digest of /www: {e}", report.system))?;
+    if kernel_settings {
+        report.sysctl = capture(run, "sysctl -a 2>/dev/null", "sysctl", WWW_WITHIN)?;
+    }
     Ok(())
 }
 
@@ -375,22 +555,35 @@ fn verify(report: &Report, config: &str, www: &str) -> Result<(), String> {
 }
 
 /// Fetches every file of `/www` from the guest and compares the bytes with
-/// the sources; waits up to `ANSWER_WITHIN` for the first answer. Gives the
-/// time of the first answer and the number of files served.
-fn fetch_all(address: SocketAddr, started: Instant) -> Result<(Duration, usize), String> {
+/// the sources. The first answer is waited for up to `ANSWER_WITHIN` from
+/// `from` (the moment the workers of nginx and the shell are up); each attempt
+/// is noted with its time and the kind of its end. Gives the time of the first
+/// answer, the attempts and the number of files served.
+fn fetch_all(address: SocketAddr, from: Instant) -> Result<(Duration, Vec<String>, usize), String> {
+    let mut attempts = Vec::new();
     let first = loop {
+        let at = from.elapsed();
         let answer = Connection::open(address, Duration::from_secs(2))
             .and_then(|mut c| c.get("/index.html"));
         match answer {
-            Ok(_) => break started.elapsed(),
-            Err(_) if started.elapsed() < ANSWER_WITHIN * 3 => {
+            Ok(_) => {
+                attempts.push(format!("{} ms: answered", at.as_millis()));
+                break from.elapsed();
+            }
+            Err(why) if from.elapsed() < ANSWER_WITHIN => {
+                let kind = if why.contains("timed out") {
+                    "timeout"
+                } else {
+                    "failure"
+                };
+                attempts.push(format!("{} ms: {kind}: {why}", at.as_millis()));
                 std::thread::sleep(Duration::from_millis(100))
             }
             Err(why) => return Err(format!("the first request: {why}")),
         }
     };
     let mut served = 0;
-    for (path, bytes) in www_files() {
+    for (path, bytes) in fetched_files() {
         let url = path.trim_start_matches("/www");
         let body = Connection::open(address, Duration::from_secs(10))
             .and_then(|mut c| c.get(url))
@@ -398,7 +591,7 @@ fn fetch_all(address: SocketAddr, started: Instant) -> Result<(Duration, usize),
         nginx_probe::same(&format!("GET {url}"), &body, bytes)?;
         served += 1;
     }
-    Ok((first, served))
+    Ok((first, attempts, served))
 }
 
 /// The machine of both guests, with the MAC suffix of the run.
@@ -417,11 +610,19 @@ fn linux_dir() -> PathBuf {
 
 /// `cargo xtask linux-guest build`.
 pub fn build_guest() -> Result<PathBuf, String> {
+    // The overlay takes `mime.types` of the nginx source, which the build of
+    // the network packages unpacks.
+    crate::relibc()?;
+    crate::net_build()?;
     let dir = linux_dir();
     let overlay = dir.join("overlay");
     let _ = std::fs::remove_dir_all(&overlay);
     std::fs::create_dir_all(&overlay).map_err(|e| format!("{}: {e}", overlay.display()))?;
-    write_overlay(&overlay)?;
+    let mime = nginx_probe::mime_types();
+    if mime.is_empty() {
+        return Err("nginx's mime.types is missing: run tools/build-nginx.py".to_owned());
+    }
+    write_overlay(&overlay, mime)?;
     run_cmd(
         Command::new("python3")
             .arg(root().join("tools/build-linux-guest.py"))
@@ -451,6 +652,28 @@ fn run_guest() -> Result<(), String> {
         suffix.value
     );
     let status = linux_command(&dir, &suffix)?
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| format!("vz-run: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("vz-run exited with {status}"))
+    }
+}
+
+/// `cargo xtask linux-guest run stafeto`: the shell of stafeto's image of the
+/// measurement on the terminal (nginx is started by hand, as `check` does).
+fn run_stafeto() -> Result<(), String> {
+    crate::relibc()?;
+    crate::busybox_build()?;
+    crate::nano_build()?;
+    crate::net_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_image()?;
+    let suffix = vz::claim_suffix()?;
+    println!("linux-guest: MAC suffix {}", suffix.value);
+    let status = vz::command_on(&kernel.image, &image, machine(&suffix))?
         .stdin(std::process::Stdio::inherit())
         .status()
         .map_err(|e| format!("vz-run: {e}"))?;
@@ -519,10 +742,13 @@ fn check_linux(dir: &Path, expected: &(String, String)) -> Result<Guest, String>
         run.expect_line("ready", |l| l == "linux-guest: ready", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         report.prompt = started.elapsed();
-        let (first, served) = fetch_all((address, 80).into(), started)?;
+        workers_up(&mut run, DIALOG_STEP)?;
+        let (first, attempts, served) = fetch_all((address, 80).into(), Instant::now())?;
         report.answer = first;
+        report.attempts = attempts;
         report.served = served;
-        read_fingerprints(&mut run, &mut report)?;
+        net_vz::lease_is_ours("linux-guest", &own, address)?;
+        read_fingerprints(&mut run, &mut report, true)?;
         verify(&report, &expected.0, &expected.1)
     })();
     let _ = run.send("poweroff -f");
@@ -583,11 +809,13 @@ fn check_stafeto(expected: &(String, String)) -> Result<Guest, String> {
             |l| l.contains("using the \"epoll\" event method"),
             DIALOG_STEP,
         )?;
-        nginx_probe::lines_of(&mut run, "start worker process ", 4, DIALOG_STEP)?;
-        let (first, served) = fetch_all((lease.address, 80).into(), started)?;
+        workers_up(&mut run, DIALOG_STEP)?;
+        let (first, attempts, served) = fetch_all((lease.address, 80).into(), Instant::now())?;
         report.answer = first;
+        report.attempts = attempts;
         report.served = served;
-        read_fingerprints(&mut run, &mut report)?;
+        net_vz::lease_is_ours("stafeto", &own, lease.address)?;
+        read_fingerprints(&mut run, &mut report, false)?;
         verify(&report, &expected.0, &expected.1)
     })();
     let lines = run.lines().to_vec();
@@ -620,12 +848,31 @@ fn check() -> Result<(), String> {
         ("stafeto", check_stafeto(&expected)?),
     ];
     let mut table = String::from(
-        "| system | address | MAC | to the prompt | to the first answer | versions | `nginx -T` | `/www` | files served |\n|---|---|---|---|---|---|---|---|---|\n",
+        "| system | address | MAC | spawn to prompt | workers up to first answer (liveness, no part of the measurement) | versions | `nginx -T` | `/www` | files served |\n|---|---|---|---|---|---|---|---|---|\n",
     );
     let mut failures = Vec::new();
+    let configure = configure_difference(&guests[0].1.report.nginx_v, &guests[1].1.report.nginx_v);
+    let mut raw = Vec::new();
+    for (name, guest) in &guests {
+        raw.extend(
+            guest
+                .report
+                .nginx_v
+                .iter()
+                .filter(|l| l.trim().starts_with("configure arguments:"))
+                .map(|l| format!("{name}: {}", l.trim())),
+        );
+    }
+    raw.push("difference (- linux, + stafeto):".to_owned());
+    raw.extend(configure);
+    save("configure-arguments.txt", &raw);
     for (name, guest) in guests {
         save(&format!("{name}-console.log"), &guest.lines);
         save(&format!("{name}-nginx-v.txt"), &guest.report.nginx_v);
+        save(&format!("{name}-first-answer.txt"), &guest.report.attempts);
+        if !guest.report.sysctl.is_empty() {
+            save(&format!("{name}-sysctl.txt"), &guest.report.sysctl);
+        }
         if !guest.report.features.is_empty() {
             save(
                 &format!("{name}-features.txt"),
@@ -670,8 +917,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("run") if args.len() == 1 => run_guest(),
+        Some("run") if args.len() == 2 && args[1] == "stafeto" => run_stafeto(),
         Some("check") if args.len() == 1 => check(),
-        _ => Err("usage: cargo xtask linux-guest build|run|check".to_owned()),
+        _ => Err("usage: cargo xtask linux-guest build|run [stafeto]|check".to_owned()),
     }
 }
 
@@ -787,19 +1035,24 @@ mod tests {
     fn the_sources_of_both_guests_are_one_set_of_files() {
         let files = www_files();
         let paths: Vec<&str> = files.iter().map(|f| f.0).collect();
-        assert_eq!(
-            paths,
-            [
-                "/www/10k.bin",
-                "/www/1k.bin",
-                "/www/256k.bin",
-                "/www/index.html"
-            ]
+        assert_eq!(paths.len(), 4 + W1_FILES + W2_FILES);
+        assert_eq!(fetched_files().len(), 12);
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+        assert!(paths.contains(&"/www/index.html"));
+        assert!(paths.contains(&"/www/s/0999.bin") && paths.contains(&"/www/l/63.bin"));
+        let length = |path: &str| files.iter().find(|f| f.0 == path).unwrap().1.len();
+        assert_eq!(length("/www/s/0000.bin"), W1_LEN);
+        assert_eq!(length("/www/l/00.bin"), W2_LEN);
+        assert_ne!(
+            files.iter().find(|f| f.0 == "/www/s/0000.bin").unwrap().1,
+            files.iter().find(|f| f.0 == "/www/s/0001.bin").unwrap().1
         );
         let directory =
             std::env::temp_dir().join(format!("linux-guest-overlay-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        write_overlay(&directory).unwrap();
+        write_overlay(&directory, b"types {}\n").unwrap();
         for (path, bytes) in &files {
             let written = std::fs::read(directory.join(path.trim_start_matches('/'))).unwrap();
             assert_eq!(&written[..], *bytes, "{path}");
@@ -808,7 +1061,57 @@ mod tests {
             std::fs::read_to_string(directory.join("etc/nginx/nginx.conf")).unwrap(),
             nginx_conf()
         );
+        assert_eq!(
+            std::fs::read(directory.join("etc/nginx/mime.types")).unwrap(),
+            b"types {}\n"
+        );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_library_the_guest_runs_with_is_refused() {
+        // Breakage 3, the second half: built with the right OpenSSL and run
+        // with another.
+        let mut lines = v("1.30.6", "3.5.9");
+        assert!(check_versions(&lines, "1.30.6", "3.5.9").is_ok());
+        lines.push(
+            "running with OpenSSL 3.5.4  30 Sep 2025 (running with OpenSSL 3.5.4)".to_owned(),
+        );
+        let refused = check_versions(&lines, "1.30.6", "3.5.9").unwrap_err();
+        assert!(refused.contains("runs with"), "{refused}");
+    }
+
+    #[test]
+    fn a_file_of_the_listing_that_is_missing_extra_or_changed_is_named() {
+        let files: Vec<(&str, &[u8])> = vec![("/www/a", b"abc"), ("/www/s/1", b"")];
+        let line = |p: &str, b: &[u8]| format!("SHA2-256({p})= {}", sha256_hex(b));
+        let good = vec![line("/www/s/1", b""), line("/www/a", b"abc")];
+        assert!(www_difference(&good, &files).is_empty());
+        let missing = vec![line("/www/a", b"abc")];
+        assert_eq!(www_difference(&missing, &files), ["missing /www/s/1"]);
+        let extra = vec![good[0].clone(), good[1].clone(), line("/www/no-dot", b"x")];
+        assert_eq!(www_difference(&extra, &files), ["extra /www/no-dot"]);
+        let changed = vec![good[0].clone(), line("/www/a", b"abd")];
+        assert_eq!(www_difference(&changed, &files), ["changed /www/a"]);
+    }
+
+    #[test]
+    fn the_difference_of_the_configure_arguments_names_what_one_side_has() {
+        let linux = vec![
+            "configure arguments: --with-threads --with-http_ssl_module --with-compat".to_owned(),
+        ];
+        let stafeto = vec![
+            "configure arguments: --with-http_ssl_module --without-http_gzip_module".to_owned(),
+        ];
+        assert_eq!(
+            configure_difference(&linux, &stafeto),
+            [
+                "- --with-threads",
+                "- --with-compat",
+                "+ --without-http_gzip_module"
+            ]
+        );
+        assert!(configure_difference(&linux, &linux).is_empty());
     }
 
     #[test]

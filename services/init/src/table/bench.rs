@@ -15,28 +15,52 @@
 //! apply to it; every other image keeps it, and a test below keeps
 //! `BENCH_CPUS` out of their tables.
 
-use super::net::NET_VZ_TABLE;
+use super::net::{NET_LAUNCHER, NET_VZ_TABLE};
 use super::{BENCH_CPUS, Record};
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 /// The launcher of the shell: the process service gives the shell and its
 /// children the CPUs of the record that started them.
 pub const BENCH_LAUNCHER: Record = Record {
     cpus: BENCH_CPUS,
-    ..NET_VZ_TABLE[5]
+    ..NET_LAUNCHER
 };
 
+const fn bench_table() -> [Record; 10] {
+    assert!(NET_VZ_TABLE.len() == 10);
+    let mut out = [NET_VZ_TABLE[0]; 10];
+    let mut at = 0;
+    let mut launchers = 0;
+    while at < 10 {
+        out[at] = if str_eq(NET_VZ_TABLE[at].name, NET_LAUNCHER.name) {
+            launchers += 1;
+            BENCH_LAUNCHER
+        } else {
+            NET_VZ_TABLE[at]
+        };
+        at += 1;
+    }
+    assert!(launchers == 1);
+    out
+}
+
+const TABLE: [Record; 10] = bench_table();
+
 /// The image of the shell with the network service on VZ, with the shell's
-/// processes on all four CPUs.
-pub const BENCH_VZ_TABLE: &[Record] = &[
-    NET_VZ_TABLE[0],
-    NET_VZ_TABLE[1],
-    NET_VZ_TABLE[2],
-    NET_VZ_TABLE[3],
-    NET_VZ_TABLE[4],
-    BENCH_LAUNCHER,
-    NET_VZ_TABLE[6],
-    NET_VZ_TABLE[7],
-    NET_VZ_TABLE[8],
-    NET_VZ_TABLE[9],
-];
-const _: () = assert!(NET_VZ_TABLE.len() == 10);
+/// processes on all four CPUs: the record of `NET_LAUNCHER` by name, so that
+/// a reordered `NET_VZ_TABLE` never puts the mask on another service.
+pub const BENCH_VZ_TABLE: &[Record] = &TABLE;

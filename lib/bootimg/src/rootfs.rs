@@ -30,9 +30,9 @@ pub const MAGIC: [u8; 8] = *b"STAFROOT";
 pub const VERSION: u32 = 2;
 /// The entries of a table at most: the RAM service keeps a table of this
 /// size.
-pub const ENTRIES_MAX: usize = 1024;
+pub const ENTRIES_MAX: usize = 2048;
 /// The file numbers of the boot image the entries may name, below this.
-pub const FILES_MAX: usize = 1024;
+pub const FILES_MAX: usize = 2048;
 /// The longest path, without its terminator: `proto_fs::MAX_PATH`.
 pub const PATH_MAX: usize = 511;
 /// The longest name in a path.

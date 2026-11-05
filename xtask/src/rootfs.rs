@@ -314,6 +314,12 @@ const SYSTEM_PATHS: [&str; 48] = [
 fn is_system(path: &str) -> bool {
     SYSTEM_PATHS.contains(&path)
         || path.starts_with("/dev/")
+        // The sets W1 and W2 of the load, in the image of the measurement
+        // of stage P7 (`net_bench_files`).
+        || path == "/www/s"
+        || path == "/www/l"
+        || path.starts_with("/www/s/")
+        || path.starts_with("/www/l/")
         || ZONES
             .iter()
             .any(|(zone, _)| path == format!("{ZONEINFO}/{zone}"))
@@ -1141,6 +1147,23 @@ fn nginx_bench_files(image: &str) -> Vec<RootFile> {
     files
 }
 
+/// The files of the image of the measurement of stage P7 (`boot-net-bench.img`):
+/// those of the images of nginx's measurement and the two sets of the load,
+/// W1 under `/www/s/` and W2 under `/www/l/` (`linux_guest::www_files`), the
+/// same files as the Linux guest carries.
+fn net_bench_files(image: &str) -> Vec<RootFile> {
+    let mut files = nginx_bench_files(image);
+    files.push(dir("/www/s"));
+    files.push(dir("/www/l"));
+    for (path, bytes) in crate::linux_guest::www_files() {
+        if path.starts_with("/www/s/") || path.starts_with("/www/l/") {
+            let name: &'static str = Box::leak(path[1..].replace('/', "-").into_boxed_str());
+            files.push(of(path, 0o644, ROOT, Source::Bytes(name, bytes)));
+        }
+    }
+    files
+}
+
 /// The bytes of `/www/index.html` of the image with the network service: 64
 /// KiB of lines from a fixed generator, so that the host knows the page
 /// without reading the image (`cargo xtask net-curl`).
@@ -1308,8 +1331,8 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
-        | "boot-nginx-bench-vz-nobuf.img"
-        | "boot-net-bench.img" => nginx_bench_files(name),
+        | "boot-nginx-bench-vz-nobuf.img" => nginx_bench_files(name),
+        "boot-net-bench.img" => net_bench_files(name),
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
