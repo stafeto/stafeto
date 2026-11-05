@@ -57,6 +57,7 @@ fn options(names: Vec<String>, out: Option<PathBuf>) -> pkg::Options {
         time: None,
         out,
         recipe: false,
+        replace: Vec::new(),
     }
 }
 

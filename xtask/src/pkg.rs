@@ -503,6 +503,9 @@ pub struct Options {
     pub time: Option<u64>,
     pub out: Option<PathBuf>,
     pub recipe: bool,
+    /// Bytes to put at paths of the selected packages in place of their
+    /// own: the package file is a variant for one image (`image_files`).
+    pub replace: Vec<(String, Vec<u8>)>,
 }
 
 pub struct Built {
@@ -514,6 +517,82 @@ pub struct Built {
     /// The inputs the fingerprint hashes.
     pub lines: Vec<String>,
     pub content: u64,
+}
+
+/// The packages this run of xtask wrote to `target/pkg/`: an image takes the
+/// package files of the run, so that the image, the repository and the
+/// index of one run hold the same bytes.
+static BUILT: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// The package files of the layers of an image, as the container of the
+/// image holds them: the name (`<name>-<version>-<release>.stpkg`) and the
+/// bytes. A package the run has not built is built first (once, with the
+/// development key); the package file an image holds is the file of
+/// `target/pkg/`, so that its bytes are those of the repository of the run.
+/// A package with bytes of its own for the image (`replaced`) is built for
+/// the image into `target/pkg/variants/<image>/`.
+pub fn image_files(
+    image: &str,
+    layers: &[rootfs::LayerPackage],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let built = |name: &str| {
+        BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
+    };
+    let missing: Vec<String> = layers
+        .iter()
+        .filter(|l| l.replaced.is_empty() && !built(&l.package.name))
+        .map(|l| l.package.name.clone())
+        .collect();
+    if !missing.is_empty() {
+        build(&Options {
+            names: missing,
+            key: None,
+            cert: None,
+            time: None,
+            out: None,
+            recipe: false,
+            replace: Vec::new(),
+        })?;
+    }
+    let plain = crate::target_dir().join("pkg");
+    let mut files = Vec::new();
+    for l in layers {
+        let dir = if l.replaced.is_empty() {
+            plain.clone()
+        } else {
+            let dir = plain
+                .join("variants")
+                .join(image.strip_suffix(".img").unwrap_or(image));
+            build(&Options {
+                names: vec![l.package.name.clone()],
+                key: None,
+                cert: None,
+                time: None,
+                out: Some(dir.clone()),
+                recipe: false,
+                replace: l
+                    .replaced
+                    .iter()
+                    .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
+                    .collect(),
+            })?;
+            dir
+        };
+        let name = file_name(&l.package);
+        if name.len() > bootimg::NAME_MAX {
+            return Err(format!(
+                "{name} is over {} bytes: too long for a file of an image",
+                bootimg::NAME_MAX
+            ));
+        }
+        let path = dir.join(&name);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        files.push((name, bytes));
+    }
+    Ok(files)
 }
 
 /// The file name of a package.
@@ -606,7 +685,17 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
             relibc: has_elf.then_some(relibc.as_str()),
             ..build
         };
-        let all_parts = parts(p, &all, Some(&build))?;
+        let mut all_parts = parts(p, &all, Some(&build))?;
+        for (path, bytes) in &opts.replace {
+            let part = all_parts
+                .iter_mut()
+                .find(|part| part.path == *path && matches!(part.body, Body::Data { .. }))
+                .ok_or_else(|| format!("{}: no file {path} to replace", p.name))?;
+            part.body = Body::Data {
+                bytes: bytes.clone(),
+                elf: false,
+            };
+        }
         let items: Vec<Item<'_>> = all_parts
             .iter()
             .map(|part| Item {
@@ -679,6 +768,12 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         let temp = path.with_extension("stpkg.part");
         std::fs::write(&temp, &bytes).map_err(|e| format!("{}: {e}", temp.display()))?;
         std::fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if opts.out.is_none() {
+            BUILT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(p.name.clone());
+        }
         println!(
             "{}  {} bytes  {} entries  {} bytes of content  recipe {}",
             path.display(),
@@ -713,6 +808,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         time: None,
         out: None,
         recipe: false,
+        replace: Vec::new(),
     };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<String, String> {

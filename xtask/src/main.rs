@@ -2465,6 +2465,44 @@ fn write_elf_image(
     let target = target_dir();
     let objdump = llvm_tool("llvm-objdump")?;
     let objcopy = llvm_tool("llvm-objcopy")?;
+    // The packages of the image go in as package files, the layers of the
+    // file service; the table of the image holds the paths of the system
+    // (rootfs::layered). A program that only a package names is the
+    // package's: the image holds no ELF file of its own for it, and none of
+    // the notices that an image holds for a program in its table.
+    let rootfs::Layered {
+        system,
+        packages: layers,
+    } = rootfs::layered(name)?;
+    let named_by = |files: &[rootfs::RootFile]| -> Vec<&'static str> {
+        rootfs::sources(files)
+            .iter()
+            .filter_map(rootfs::Source::program)
+            .collect()
+    };
+    let in_table: Vec<&str> = named_by(&system)
+        .into_iter()
+        .chain(named_by(&extra))
+        .collect();
+    let in_layers: Vec<&str> = {
+        let all: Vec<packages::Package> = layers.iter().map(|l| l.package.clone()).collect();
+        named_by(&rootfs::package_files(&all)?)
+    };
+    // The copy of the ELF file of such a program that the build keeps under
+    // target/images/ is stripped as the package's file is, for the probes that
+    // read its size or its symbols.
+    for (file, elf, _) in sources {
+        if in_layers.contains(file) && !in_table.contains(file) {
+            strip_elf(elf, &objcopy)?;
+        }
+    }
+    let sources: Vec<(&str, PathBuf, u32)> = sources
+        .iter()
+        .filter(|(file, _, _)| !in_layers.contains(file) || in_table.contains(file))
+        .cloned()
+        .collect();
+    let sources = sources.as_slice();
+    let ca_in_table = system.iter().any(|f| f.path == net_tls::CA_BUNDLE);
     // The image carries each program's ELF file without symbols and debug
     // information (the checks below read the linker's file with them): the
     // loader and exec read the loadable segments alone.
@@ -2500,6 +2538,15 @@ fn write_elf_image(
         files.push((*file, written, elf.clone()));
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    // The files of the layers.
+    let layer_files = pkg::image_files(name, &layers)?;
+    for (file, bytes) in &layer_files {
+        list.push((file.as_str(), bytes.as_slice()));
+    }
+    // An image with a layer holds the notices of relibc for the programs of
+    // its packages, and of the system under /usr/share/licenses/stafeto/,
+    // where the table names the file of the image that holds them.
+    let relibc = relibc || !layers.is_empty();
 
     // An image with a program on relibc carries relibc's licence notices.
     let notices = if relibc {
@@ -2510,7 +2557,9 @@ fn write_elf_image(
     } else {
         None
     };
-    if let Some(notices) = &notices {
+    if let Some(notices) = &notices
+        && layers.is_empty()
+    {
         list.push((NOTICES, notices.as_slice()));
     }
     // An image with BusyBox (GPL-2.0-only) carries its licence, its
@@ -2644,7 +2693,7 @@ fn write_elf_image(
     let tls_files = net_tls::terms_files(
         &linked,
         has("curl"),
-        net_tls::ca_file_of(name, &rootfs::files_of(name))?,
+        net_tls::ca_file_of(name, &rootfs::files_of(name))? && ca_in_table,
     )?;
     nginx_probe::key_files_of(name, &rootfs::files_of(name))?;
     for (name, bytes) in &tls_files {
@@ -2682,7 +2731,20 @@ fn write_elf_image(
     // ELF files of programs as the linker wrote them among them, then the
     // ELF files of the other programs of stack 0 (the loader, `loader.elf`),
     // then the table (rootfs.rs).
-    let mut listed = rootfs::files_of(name);
+    let mut listed = system;
+    if !layers.is_empty() {
+        let relibc: &'static [u8] = Box::leak(
+            notices
+                .clone()
+                .ok_or_else(|| format!("{name}: no notices of relibc"))?
+                .into_boxed_slice(),
+        );
+        for f in rootfs::system_notices(relibc)? {
+            if !listed.iter().any(|g| g.path == f.path) {
+                listed.push(f);
+            }
+        }
+    }
     listed.extend(extra);
     // A program that asks for the dynamic linker needs the library the loader
     // opens for it (spec 2, 3.12.4).
