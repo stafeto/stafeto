@@ -351,6 +351,8 @@ layer is unmapped and its client told with `notify(channel, 1)` only when the la
 let go. The names and the attributes of a layer are read-only (EROFS); a directory a layer
 brings takes files of users, and a directory whose path exists is merged without changing it.
 
+The object of a layer is the client's: the service reads the names and the bytes of files from it each time they are looked at. The check phase copies into the service everything the insertion needs (kinds, modes, file numbers, offsets and lengths, the bucket of each name), so what the client writes to its object after the check changes no mode, no length and no chain of the service. A client that writes into its object between the attach and the notification of the release can only make the names and the bytes of its own layer say something else, and the rule is that it does not. The object must have pages of its own (the window of a device is refused), a link has a target of 1 to 511 bytes without a NUL, and the content of an entry is never one of the package's own files. The tables the kernel prepays for the mappings of the layers are bounded by 160 pages of the quota of the service (2 MiB of a mapping take a page, and a window two more): the service answers NO_SPACE beyond them. One session of the layer client runs a job; another session of it gets BUSY, and the leaving of a session ends only its own job.
+
 The limits: 64 layers, 4 096 entries in all layers, 1 024 in one, 256 directories that layers
 create and no other name had. A step takes at most 16 entries of the check (512 bytes of
 paths), 4 of the insertion (256 bytes of names, 1 link of a name chain) and 8 of the detach

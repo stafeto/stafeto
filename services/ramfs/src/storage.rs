@@ -1633,7 +1633,9 @@ impl<'a> Storage<'a> {
     /// Puts a published entry at the head of its chain. Constant work.
     pub(crate) fn chain_insert(&mut self, index: usize) {
         let (parent, name) = self.entry_key(index);
-        let bucket = name_bucket(parent, name);
+        let bucket = self
+            .layer_bucket(index)
+            .unwrap_or_else(|| name_bucket(parent, name));
         self.touch_name(parent, bucket);
         let head = self.state.name_heads[bucket];
         self.state.name_next[index] = head;
@@ -1789,7 +1791,9 @@ impl<'a> Storage<'a> {
     /// published ones. Constant work.
     pub(crate) fn chain_remove(&mut self, index: usize) {
         let (parent, name) = self.entry_key(index);
-        let bucket = name_bucket(parent, name);
+        let bucket = self
+            .layer_bucket(index)
+            .unwrap_or_else(|| name_bucket(parent, name));
         self.touch_name(parent, bucket);
         let prev = self.state.name_prev[index];
         let next = self.state.name_next[index];

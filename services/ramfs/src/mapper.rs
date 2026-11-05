@@ -132,7 +132,15 @@ impl Mapper {
         // SAFETY: FREE: the cell is the main thread's.
         unsafe { *CELL.order.get() = Some(order) };
         CELL.state.store(GIVEN, Ordering::Release);
-        sys::notify(&self.wake, 1)
+        if let Err(error) = sys::notify(&self.wake, 1) {
+            // The thread was not woken: the order is taken back, so that the cell does not stay
+            // given for ever.
+            // SAFETY: the thread has not seen the order; the cell is the main thread's again.
+            drop(unsafe { (*CELL.order.get()).take() });
+            CELL.state.store(FREE, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The outcome of the order once the thread did it.

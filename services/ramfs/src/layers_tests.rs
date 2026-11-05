@@ -1000,7 +1000,7 @@ fn the_steps_of_the_insertion_follow_the_portions_and_a_long_chain_goes_on_in_th
     let bytes = spec.build();
     let (reply, steps) = attach_counting(&mut ram, 1, bytes);
     assert_eq!(reply, LayerReply::Done { names: 64 });
-    // The check: 16 entries a step; the insertion: 8 entries a step; plus the first and last.
+    // The check: 8 entries a step; the insertion: 4 entries a step; plus the first and last.
     let check = 64usize.div_ceil(CHECK_ENTRIES);
     let insert = 64usize.div_ceil(INSERT_ENTRIES);
     assert_eq!(steps, check + insert);
@@ -1109,6 +1109,219 @@ fn the_portions_are_the_ones_the_measurement_chose() {
             DETACH_ENTRIES,
             DETACH_BYTES
         ),
-        (16, 512, 4, 256, 1, 8, 256)
+        (8, 512, 4, 256, 1, 8, 256)
     );
+}
+
+/// Writes into the object of a layer as its client could at any time: the bytes of the layer
+/// are leaked buffers, and nothing else reads them while a test runs.
+fn poke(bytes: &'static [u8], at: usize, value: &[u8]) {
+    let target = bytes.as_ptr() as *mut u8;
+    for (i, &b) in value.iter().enumerate() {
+        // SAFETY: the buffer is leaked by the test and `at` is inside it.
+        unsafe { target.add(at + i).write(b) };
+    }
+}
+
+/// Where the field of entry `i` of the table `rootfs` of a package is in its bytes.
+fn entry_field(bytes: &'static [u8], i: usize, field: usize) -> usize {
+    let view = bootimg::BootImage::view_as(bytes, &PACKAGE).unwrap();
+    view.file(1).unwrap().offset as usize + 24 + 24 * i + field
+}
+
+/// Begins an attach, runs the check, and stops with the layer ready to insert.
+fn checked(ram: &mut Ram<'_>, number: u32, bytes: &'static [u8]) {
+    let index = ram.storage.layer_begin_attach(number, false).unwrap();
+    ram.storage
+        .layer_mapped(index, bytes.as_ptr(), bytes.len())
+        .unwrap();
+    while ram.storage.layer_state(number) == Some(LayerState::Checking) {
+        assert_eq!(
+            ram.storage.layer_step(number, NOW, &Limits::PORTIONS),
+            LayerReply::Resolving
+        );
+    }
+    assert_eq!(ram.storage.layer_state(number), Some(LayerState::Inserting));
+}
+
+fn finish(ram: &mut Ram<'_>, number: u32) -> LayerReply {
+    for _ in 0..10_000 {
+        match ram.storage.layer_step(number, NOW, &Limits::PORTIONS) {
+            LayerReply::Resolving => {}
+            other => return other,
+        }
+    }
+    panic!("no end");
+}
+
+#[test]
+fn a_mode_the_client_writes_after_the_check_does_not_reach_the_tree() {
+    let mut ram = ram();
+    let bytes = Spec::new().file("/sneaky", 0o755, b"x").build();
+    checked(&mut ram, 1, bytes);
+    // The set-user-ID bit, written between the steps.
+    poke(
+        bytes,
+        entry_field(bytes, 0, 8),
+        &(bootimg::rootfs::REGULAR | 0o4755).to_le_bytes(),
+    );
+    assert_eq!(finish(&mut ram, 1), LayerReply::Done { names: 1 });
+    let node = ram.storage.node(path(&ram, "/sneaky").unwrap()).unwrap();
+    assert_eq!(node.mode, 0o755);
+}
+
+#[test]
+fn a_path_length_or_file_number_or_count_the_client_writes_does_not_stop_the_service() {
+    let mut ram = ram();
+    let bytes = Spec::new().dir("/q").file("/q/sneaky", 0o644, b"x").build();
+    checked(&mut ram, 1, bytes);
+    poke(bytes, entry_field(bytes, 1, 4), &1u16.to_le_bytes());
+    poke(bytes, entry_field(bytes, 1, 20), &99u32.to_le_bytes());
+    poke(bytes, 16 + 48 + 40, &1u64.to_le_bytes());
+    assert_eq!(finish(&mut ram, 1), LayerReply::Done { names: 2 });
+    assert!(path(&ram, "/q").is_ok());
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 2 });
+    settle(&mut ram);
+    ram.storage.check_name_index();
+    // The count of the table, written while the check is under way: the layer is refused.
+    let mut spec = Spec::new();
+    for n in 0..40 {
+        spec = spec.file(&format!("/f{n:02}"), 0o644, b"x");
+    }
+    let bytes = spec.build();
+    let index = ram.storage.layer_begin_attach(2, false).unwrap();
+    ram.storage
+        .layer_mapped(index, bytes.as_ptr(), bytes.len())
+        .unwrap();
+    assert_eq!(
+        ram.storage.layer_step(2, NOW, &Limits::PORTIONS),
+        LayerReply::Resolving
+    );
+    let table = entry_field(bytes, 0, 0) - 24;
+    poke(bytes, table + 12, &3u32.to_le_bytes());
+    assert!(matches!(
+        finish(&mut ram, 2),
+        LayerReply::Entry {
+            status: BAD_LAYER,
+            ..
+        }
+    ));
+    settle(&mut ram);
+    assert_eq!(ram.storage.layers_in_use(), 0);
+}
+
+#[test]
+fn a_name_the_client_changes_leaves_the_chains_of_the_service_whole() {
+    let mut ram = ram();
+    let user = user_file(&mut ram, ROOT, b"mine");
+    let bytes = Spec::new()
+        .file("/aaaa", 0o644, b"x")
+        .file("/bbbb", 0o644, b"y")
+        .build();
+    assert_eq!(attach(&mut ram, 1, bytes), LayerReply::Done { names: 2 });
+    // The bytes of the first name now say another name, which hashes elsewhere.
+    let at = entry_field(bytes, 0, 0);
+    let name_at = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let view = bootimg::BootImage::view_as(bytes, &PACKAGE).unwrap();
+    let base = view.file(1).unwrap().offset as usize;
+    poke(bytes, base + name_at + 1, b"zzzz");
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 2 });
+    settle(&mut ram);
+    // Nothing of the layer is left in any chain, and the name of a user is still found.
+    ram.storage.check_name_index();
+    assert_eq!(path(&ram, "/mine"), Ok(user));
+}
+
+#[test]
+fn a_client_that_leaves_while_its_object_is_mapped_asks_the_service_for_no_turns() {
+    let mut ram = ram();
+    let index = ram.storage.layer_begin_attach(1, false).unwrap();
+    ram.storage.layer_set_session(7);
+    // Another session of the client leaves: the job is not its.
+    ram.storage.layer_session_gone(8);
+    assert!(!ram.storage.layer_work());
+    ram.storage.layer_session_gone(7);
+    // The mapping thread is at work, and the service has no work for the job until it reports.
+    assert!(!ram.storage.layer_work());
+    assert!(!ram.storage.layer_maintain(NOW, &Limits::PORTIONS));
+    assert!(ram.storage.layer_orphan(index));
+    ram.storage.layer_unmapped(index);
+    assert_eq!(ram.storage.layer_job(), None);
+}
+
+#[test]
+fn a_name_that_sorts_between_a_directory_and_its_children_is_not_a_missing_parent() {
+    let mut ram = ram();
+    let bytes = Spec::new()
+        .dir("/a")
+        .file("/a-b", 0o644, b"x")
+        .file("/a/c", 0o644, b"y")
+        .build();
+    assert_eq!(attach(&mut ram, 1, bytes), LayerReply::Done { names: 3 });
+    assert_eq!(names(&ram, path(&ram, "/a").unwrap()), ["c"]);
+    detach(&mut ram, 1);
+    settle(&mut ram);
+    let bytes = Spec::new()
+        .dir("/a")
+        .dir("/a.b")
+        .file("/a.b/c", 0o644, b"x")
+        .file("/a/c", 0o644, b"y")
+        .build();
+    assert_eq!(attach(&mut ram, 2, bytes), LayerReply::Done { names: 4 });
+    assert_eq!(names(&ram, path(&ram, "/a.b").unwrap()), ["c"]);
+    assert_eq!(names(&ram, path(&ram, "/a").unwrap()), ["c"]);
+    // A name that is under the directory nearest to it, and not under the one before.
+    detach(&mut ram, 2);
+    settle(&mut ram);
+    let bytes = Spec::new().dir("/a").file("/a-b/c", 0o644, b"x").build();
+    assert!(matches!(
+        attach(&mut ram, 3, bytes),
+        LayerReply::Entry {
+            status: BAD_LAYER,
+            entry: 1
+        }
+    ));
+}
+
+#[test]
+fn the_content_of_an_entry_is_not_a_file_of_the_package_and_a_link_has_a_target() {
+    let mut ram = ram();
+    let mut own = Spec::new().file("/x", 0o644, b"x");
+    own.items[0].file = 1;
+    assert!(matches!(
+        attach(&mut ram, 1, own.build()),
+        LayerReply::Entry {
+            status: BAD_LAYER,
+            entry: 0
+        }
+    ));
+    settle(&mut ram);
+    for target in ["", "a\0b", &"t".repeat(512)] {
+        let bytes = Spec::new().symlink("/l", target).build();
+        assert!(
+            matches!(
+                attach(&mut ram, 1, bytes),
+                LayerReply::Entry {
+                    status: BAD_LAYER,
+                    entry: 0
+                }
+            ),
+            "{target:?}"
+        );
+        settle(&mut ram);
+    }
+    assert_eq!(
+        attach(&mut ram, 1, Spec::new().symlink("/l", "ok").build()),
+        LayerReply::Done { names: 1 }
+    );
+}
+
+#[test]
+fn the_tables_the_kernel_prepays_for_the_mappings_of_layers_have_a_bound() {
+    use crate::storage::layers::{TABLE_PAGES_MAX, table_pages};
+    assert_eq!(table_pages(4096), 3);
+    assert_eq!(table_pages(28_800_000), 14 + 2);
+    assert_eq!(table_pages(1 << 30), 512 + 2);
+    // Sixty-four small layers take 192: past the bound, so the service refuses the 54th.
+    assert!(54 * table_pages(4096) > TABLE_PAGES_MAX && 53 * table_pages(4096) <= TABLE_PAGES_MAX);
 }

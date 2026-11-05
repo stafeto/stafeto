@@ -48,7 +48,7 @@ pub const NO_ENTRY_NUMBER: u32 = u32::MAX;
 /// first entry of a step always goes).
 ///
 /// Entries one step of the check visits, and the bytes of their paths.
-pub const CHECK_ENTRIES: usize = 16;
+pub const CHECK_ENTRIES: usize = 8;
 pub const CHECK_BYTES: usize = 512;
 /// Entries one step of the insertion takes in, the bytes of their names and the links of
 /// name chains it follows.
@@ -184,6 +184,9 @@ pub(crate) struct Place {
     /// A file: the place of the node of its file (the first entry that names the file; it is
     /// this place for the first). A directory: the place of the reserve it owns, or `NONE`.
     first: u16,
+    /// The bucket of the name, found once when the name went in: the chains of the service
+    /// never hash a name that the client of the layer can still change.
+    bucket: u16,
     name_offset: u32,
     data_offset: u32,
     data_length: u32,
@@ -194,6 +197,7 @@ impl Place {
         kind: 0,
         name_length: 0,
         first: NONE,
+        bucket: 0,
         name_offset: 0,
         data_offset: 0,
         data_length: 0,
@@ -222,6 +226,15 @@ struct Job {
     layer: u8,
     /// The entry that is the parent of each entry, `NONE` for `/`.
     parent: [u16; LAYER_ENTRIES],
+    /// What the check saw of each entry, which is all the insertion reads of the table: the
+    /// client of the layer can write into its object at any time, and nothing it writes
+    /// after the check changes what goes into the tree.
+    mode: [u16; LAYER_ENTRIES],
+    file: [u16; LAYER_ENTRIES],
+    path_at: [u32; LAYER_ENTRIES],
+    path_length: [u16; LAYER_ENTRIES],
+    data_at: [u32; LAYER_ENTRIES],
+    data_length: [u32; LAYER_ENTRIES],
     /// Where the last name of each path starts, found once by the check.
     name_start: [u16; LAYER_ENTRIES],
     /// The first entry of each container file.
@@ -237,6 +250,12 @@ impl Job {
     const NONE: Self = Self {
         layer: NO_LAYER,
         parent: [NONE; LAYER_ENTRIES],
+        mode: [0; LAYER_ENTRIES],
+        file: [0; LAYER_ENTRIES],
+        path_at: [0; LAYER_ENTRIES],
+        path_length: [0; LAYER_ENTRIES],
+        data_at: [0; LAYER_ENTRIES],
+        data_length: [0; LAYER_ENTRIES],
         name_start: [0; LAYER_ENTRIES],
         first_of_file: [NONE; CONTAINER_FILES_MAX],
         stack: [NONE; DEPTH_MAX],
@@ -264,6 +283,8 @@ pub(crate) struct Layers {
     reserve_free: [u16; LAYER_DIRS],
     reserve_len: usize,
     job: Job,
+    /// The label of the session that began the running job.
+    session: u64,
     /// Layers that have no places and wait for the service to unmap them.
     released: [u8; LAYERS_MAX],
     released_head: usize,
@@ -289,6 +310,7 @@ impl Layers {
             reserve_free: [0; LAYER_DIRS],
             reserve_len: LAYER_DIRS,
             job: Job::NONE,
+            session: 0,
             released: [0; LAYERS_MAX],
             released_head: 0,
             released_len: 0,
@@ -318,11 +340,23 @@ impl Layers {
         }
         self.reserve_len = LAYER_DIRS;
         self.job.layer = NO_LAYER;
+        self.session = 0;
         self.released_head = 0;
         self.released_len = 0;
         self.queue_head = 0;
         self.queue_len = 0;
     }
+}
+
+/// The pages of tables the kernel prepays from the quota of the service for the mappings of
+/// its layers at most (`TABLES` in the table of init): the service refuses a layer whose
+/// mapping would take it past them.
+pub const TABLE_PAGES_MAX: u64 = 160;
+
+/// The pages of tables the mapping of an object of `size` bytes in a window of its own takes:
+/// a table for each 2 MiB, the table of the window and one for the edges.
+pub const fn table_pages(size: u64) -> u64 {
+    size.div_ceil(2 << 20) + 2
 }
 
 /// The bytes of the tables of the layers.
@@ -403,6 +437,17 @@ impl Storage<'_> {
         })
     }
 
+    /// The bucket of the name at entry `index` of `originals` when it is the name of a file of
+    /// a layer: the one found when the name went in.
+    pub(crate) fn layer_bucket(&self, index: usize) -> Option<usize> {
+        let b = index.checked_sub(4)?;
+        if !(SLOT_BASE..RESERVE_BASE).contains(&b) {
+            return None;
+        }
+        let place = &self.state.layers.places[b - SLOT_BASE];
+        (place.layer != NO_LAYER && place.kind == PLACE_FILE).then_some(usize::from(place.bucket))
+    }
+
     /// The name of place `b` of the image above the entries of the system's table.
     pub(crate) fn layer_name(&self, b: usize) -> &[u8] {
         if b < RESERVE_BASE {
@@ -443,11 +488,15 @@ impl Storage<'_> {
         unsafe { core::slice::from_raw_parts(map.pointer, map.length) }
     }
 
-    fn layer_rootfs<'x>(&self, index: usize) -> Rootfs<'x> {
+    /// The table of the layer as its object holds it now: `None` when the header is no longer
+    /// one (the client wrote to the object).
+    fn layer_rootfs<'x>(&self, index: usize) -> Option<Rootfs<'x>> {
         let layer = &self.state.layers.layers[index];
         let bytes = self.layer_bytes(index);
-        let table = &bytes[layer.rootfs_offset as usize..][..layer.rootfs_length as usize];
-        Rootfs::open(table, layer.files).expect("the table was opened by layer_mapped")
+        let table = bytes
+            .get(layer.rootfs_offset as usize..)?
+            .get(..layer.rootfs_length as usize)?;
+        Rootfs::open(table, layer.files).ok()
     }
 
     fn layer_index(&self, number: u32) -> Option<usize> {
@@ -462,6 +511,25 @@ impl Storage<'_> {
     pub fn layer_state(&self, number: u32) -> Option<LayerState> {
         self.layer_index(number)
             .map(|i| self.state.layers.layers[i].state)
+    }
+
+    /// The session `label` began the job that runs: only it goes on with it, and only its
+    /// leaving ends it.
+    pub fn layer_set_session(&mut self, label: u64) {
+        self.state.layers.session = label;
+    }
+
+    /// The label of the session that began the running job.
+    pub fn layer_session(&self) -> u64 {
+        self.state.layers.session
+    }
+
+    /// The session `label` of the layer client left: the job it began, if it is the one that
+    /// runs, ends by itself. Another session of the client has no job to leave.
+    pub fn layer_session_gone(&mut self, label: u64) {
+        if label == self.state.layers.session {
+            self.layer_client_gone();
+        }
     }
 
     /// Whether the layer with this number is one of the boot image.
@@ -658,12 +726,26 @@ impl Storage<'_> {
     }
 
     fn check_step(&mut self, index: usize, limits: &Limits) -> LayerReply {
-        let table = self.layer_rootfs(index);
         let mapping = self.layer_bytes(index);
         let (count, files) = {
             let layer = &self.state.layers.layers[index];
             (layer.count as usize, layer.files)
         };
+        // The headers are read again here and nowhere after the check: the client may have
+        // written to its object since the mapping, and what it wrote is checked like the
+        // rest.
+        let Some(table) = self.layer_rootfs(index).filter(|t| t.len() == count) else {
+            let at = self.state.layers.layers[index].cursor;
+            return self.check_failed(index, bad_layer(u32::from(at)));
+        };
+        let Ok(view) = BootImage::view_as(mapping, &PACKAGE) else {
+            let at = self.state.layers.layers[index].cursor;
+            return self.check_failed(index, bad_layer(u32::from(at)));
+        };
+        if view.count() != files {
+            let at = self.state.layers.layers[index].cursor;
+            return self.check_failed(index, bad_layer(u32::from(at)));
+        }
         let mut bytes = 0usize;
         let mut done = 0;
         // The path of the entry before, carried from entry to entry so that no path is read
@@ -708,35 +790,73 @@ impl Storage<'_> {
                     *slot = i as u16;
                 } else {
                     // The owners are 0:0 for both; the modes must agree.
-                    let first = table.raw_entry(u32::from(*slot)).expect("checked before");
-                    if first.mode != entry.mode {
+                    if u32::from(job.mode[*slot as usize]) != entry.mode {
                         return self.check_failed(index, bad_layer(i as u32));
                     }
                 }
             }
-            // The parent is the nearest directory above on the stack; the stack holds the
-            // directories that are prefixes of the path.
+            // The stack holds directories above the entry, each popped when the entries to
+            // come cannot be below it any more. The paths are in the order of their bytes, so
+            // the names below `d` are the block that starts at `d/`; a name that sorts between
+            // `d` and `d/` (`d-1`, `d.conf`) is not below it and leaves it on the stack.
             while job.depth > 0 {
                 let top = job.stack_path(mapping, job.depth as usize - 1);
-                if path.len() > top.len() && starts_with(path, top) && path[top.len()] == b'/' {
+                let below = path.len() > top.len() && starts_with(path, top);
+                if below && path[top.len()] == b'/' || below && path[top.len()] < b'/' {
                     break;
                 }
                 job.depth -= 1;
             }
+            // The parent is the nearest directory on the stack that the path is below.
+            let mut at = job.depth as usize;
+            let parent_at = loop {
+                if at == 0 {
+                    break None;
+                }
+                at -= 1;
+                let top = job.stack_path(mapping, at);
+                if path.len() > top.len() && starts_with(path, top) && path[top.len()] == b'/' {
+                    break Some(at);
+                }
+            };
             // What is left of the path after the directory above it is one name; without a
             // directory above, the whole path is.
-            let (parent, name_start) = match job.depth {
-                0 => (NONE, 1),
-                depth => {
-                    let at = depth as usize - 1;
-                    (job.stack[at], usize::from(job.stack_length[at]) + 1)
-                }
+            let (parent, name_start) = match parent_at {
+                None => (NONE, 1),
+                Some(at) => (job.stack[at], usize::from(job.stack_length[at]) + 1),
             };
             if path[name_start..].contains(&b'/') {
                 return self.check_failed(index, bad_layer(i as u32));
             }
             job.parent[i] = parent;
             job.name_start[i] = name_start as u16;
+            // What the insertion needs of the entry.
+            job.mode[i] = entry.mode as u16;
+            job.file[i] = entry.file as u16;
+            job.path_at[i] = (path.as_ptr() as usize - mapping.as_ptr() as usize) as u32;
+            job.path_length[i] = path.len() as u16;
+            if !entry.is_directory() {
+                // The content of a file of the package: not one of its own files (meta, rootfs,
+                // manifest); a link names a target of 1 to 511 bytes without a NUL.
+                let Ok(content) = view.file(entry.file) else {
+                    return self.check_failed(index, bad_layer(i as u32));
+                };
+                if entry.file < 3
+                    || entry.is_symlink()
+                        && (content.data.is_empty()
+                            || content.data.len() > rootfs::PATH_MAX
+                            || content.data.contains(&0))
+                {
+                    return self.check_failed(index, bad_layer(i as u32));
+                }
+                bytes += if entry.is_symlink() {
+                    content.data.len()
+                } else {
+                    0
+                };
+                job.data_at[i] = content.offset as u32;
+                job.data_length[i] = content.data.len() as u32;
+            }
             if entry.is_directory() {
                 if job.depth as usize == DEPTH_MAX {
                     return self.check_failed(index, bad_layer(i as u32));
@@ -840,7 +960,7 @@ impl Storage<'_> {
         now: proto_fs::Timestamp,
         limits: &Limits,
     ) -> LayerReply {
-        let table = self.layer_rootfs(index);
+        let mapping = self.layer_bytes(index);
         let count = self.state.layers.layers[index].count as usize;
         let mut bytes = 0usize;
         let mut links = 0;
@@ -850,28 +970,34 @@ impl Storage<'_> {
                 return LayerReply::Resolving;
             }
             let i = self.state.layers.layers[index].cursor as usize;
-            let entry = table.raw_entry(i as u32).expect("checked before");
             let Ok(parent) = self.layer_parent(index, i) else {
                 return self.insert_failed(index, refuse(CONFLICT, i as u32));
             };
-            let name_start = usize::from(self.state.layers.job.name_start[i]);
-            let name = &entry.path[name_start..];
+            // The entry as the check saw it, and the bytes of its name as the object has them
+            // now: the name is read from the object at each use, but only where the check
+            // saw it.
+            let job = &self.state.layers.job;
+            let name_start = usize::from(job.name_start[i]);
+            let path_at = job.path_at[i] as usize;
+            let name = &mapping[path_at + name_start..path_at + usize::from(job.path_length[i])];
+            let bucket = name_bucket(parent, name) as u16;
             // A name that does not fit the bytes of this step waits for the next.
             if done > 0 && bytes.saturating_add(name.len()) > limits.insert_bytes {
                 return LayerReply::Resolving;
             }
             // Look the name up in the chain of its bucket, a few links at a time.
-            let found = match self.layer_search(index, parent, name, limits.insert_links - links) {
-                Search::More => return LayerReply::Resolving,
-                Search::Done(found, spent) => {
-                    links += spent;
-                    found
-                }
-            };
+            let found =
+                match self.layer_search(index, parent, name, bucket, limits.insert_links - links) {
+                    Search::More => return LayerReply::Resolving,
+                    Search::Done(found, spent) => {
+                        links += spent;
+                        found
+                    }
+                };
             self.state.layers.layers[index].chain = Chain::START;
             bytes += name.len();
             done += 1;
-            match self.insert_entry(index, i, &entry, parent, name_start, found, now) {
+            match self.insert_entry(index, i, parent, name_start, bucket, found, now) {
                 Ok(()) => {}
                 Err(reply) => return self.insert_failed(index, reply),
             }
@@ -901,8 +1027,14 @@ impl Storage<'_> {
 
     // ---- Search of a name in the chain of its bucket -------------------------------------
 
-    fn layer_search(&mut self, index: usize, parent: Token, name: &[u8], budget: usize) -> Search {
-        let bucket = name_bucket(parent, name) as u16;
+    fn layer_search(
+        &mut self,
+        index: usize,
+        parent: Token,
+        name: &[u8],
+        bucket: u16,
+        budget: usize,
+    ) -> Search {
         let chain = self.state.layers.layers[index].chain;
         let (mut link, mut spent) = if chain.started
             && chain.bucket == bucket
@@ -953,38 +1085,35 @@ impl Storage<'_> {
         &mut self,
         index: usize,
         i: usize,
-        entry: &rootfs::RawEntry<'_>,
         parent: Token,
         name_start: usize,
+        bucket: u16,
         found: Option<Token>,
         now: proto_fs::Timestamp,
     ) -> Result<(), LayerReply> {
         let number = i as u32;
+        let mapping = self.layer_bytes(index);
+        let job = &self.state.layers.job;
+        let (mode, file) = (u32::from(job.mode[i]), u32::from(job.file[i]));
+        let (path_at, path_length) = (job.path_at[i] as usize, usize::from(job.path_length[i]));
+        let (data_offset, data_length) = (job.data_at[i], job.data_length[i]);
+        let is_directory = mode & rootfs::FORMAT == rootfs::DIRECTORY;
+        let is_symlink = mode & rootfs::FORMAT == rootfs::SYMLINK;
+        let name = &mapping[path_at + name_start..path_at + path_length];
         if self.state.layers.slot_len == 0 {
             return Err(LayerReply::Refused {
                 status: proto_fs::NO_SPACE,
             });
         }
-        let name_length = (entry.path.len() - name_start) as u8;
+        let name_length = name.len() as u8;
         let layer_time = self.state.layers.layers[index].time;
         let made = i64::try_from(layer_time)
             .ok()
             .filter(|&seconds| seconds > 0)
             .and_then(|seconds| proto_fs::Timestamp::new(seconds, 0).ok())
             .unwrap_or(now);
-        let name_offset = {
-            let base = self.layer_bytes(index).as_ptr() as usize;
-            (entry.path.as_ptr() as usize - base + name_start) as u32
-        };
-        let (data_offset, data_length) = if entry.is_directory() {
-            (0, 0)
-        } else {
-            let bytes = self.layer_bytes(index);
-            let view = BootImage::view_as(bytes, &PACKAGE).expect("viewed by layer_mapped");
-            let file = view.file(entry.file).map_err(|_| bad_layer(number))?;
-            (file.offset as u32, file.data.len() as u32)
-        };
-        let directory = entry.is_directory();
+        let name_offset = (path_at + name_start) as u32;
+        let directory = is_directory;
         match found {
             Some(token) if directory => {
                 // Merge into the directory that is there.
@@ -1015,6 +1144,7 @@ impl Storage<'_> {
                         kind: PLACE_DIR,
                         name_length,
                         first: owned.unwrap_or(NONE),
+                        bucket,
                         name_offset,
                         data_offset: 0,
                         data_length: 0,
@@ -1037,7 +1167,6 @@ impl Storage<'_> {
                     layers.reserve_len -= 1;
                     layers.reserve_free[layers.reserve_len] as usize
                 };
-                let name = &entry.path[name_start..];
                 let reserve = &mut self.state.layers.reserve[r];
                 reserve.name[..name.len()].copy_from_slice(name);
                 reserve.length = name_length;
@@ -1048,7 +1177,7 @@ impl Storage<'_> {
                 self.state.nodes[5 + rb] = Node {
                     generation,
                     kind: crate::DIR,
-                    mode: entry.mode & 0o7777,
+                    mode: mode & 0o7777,
                     links: 2,
                     parent,
                     times: [made; 3],
@@ -1084,6 +1213,7 @@ impl Storage<'_> {
                         kind: PLACE_DIR,
                         name_length,
                         first: rb as u16,
+                        bucket,
                         name_offset,
                         data_offset: 0,
                         data_length: 0,
@@ -1095,7 +1225,7 @@ impl Storage<'_> {
                 let cookie = self
                     .next_directory_cookie()
                     .map_err(|code| LayerReply::Refused { status: code })?;
-                let first_entry = self.state.layers.job.first_of_file[entry.file as usize];
+                let first_entry = self.state.layers.job.first_of_file[file as usize];
                 let b = self.pop_slot();
                 let canonical = if first_entry as usize == i {
                     b
@@ -1111,6 +1241,7 @@ impl Storage<'_> {
                         kind: PLACE_FILE,
                         name_length,
                         first: canonical as u16,
+                        bucket,
                         name_offset,
                         data_offset,
                         data_length,
@@ -1118,10 +1249,10 @@ impl Storage<'_> {
                 );
                 if canonical == b {
                     let generation = self.state.nodes[5 + b].generation + 1;
-                    let (kind, mode) = if entry.is_symlink() {
+                    let (kind, mode) = if is_symlink {
                         (SYMLINK, 0o777)
                     } else {
-                        (crate::REG, entry.mode & 0o7777)
+                        (crate::REG, mode & 0o7777)
                     };
                     self.state.nodes[5 + b] = Node {
                         generation,
@@ -1357,10 +1488,9 @@ impl Storage<'_> {
     /// Work the service has kept for a quiet moment: directories of the reserve that have lost
     /// their last name, and the work of a layer whose client left. True while there is more.
     pub fn layer_maintain(&mut self, now: proto_fs::Timestamp, limits: &Limits) -> bool {
-        let job = self.state.layers.job.layer;
-        if job != NO_LAYER && self.state.layers.layers[job as usize].orphan {
+        if let Some(job) = self.layer_orphan_job() {
             // The client is gone: roll back an attach, finish a detach.
-            let _ = self.layer_work_step(job as usize, now, limits);
+            let _ = self.layer_work_step(job, now, limits);
             return true;
         }
         let layers = &mut self.state.layers;
@@ -1379,9 +1509,18 @@ impl Storage<'_> {
 
     /// Whether `layer_maintain` has work.
     pub fn layer_work(&self) -> bool {
+        self.state.layers.queue_len != 0 || self.layer_orphan_job().is_some()
+    }
+
+    /// The job whose client left and that the service itself can go on with. A mapping that is
+    /// under way is not one: the thread that maps reports when it is done, and until then the
+    /// service has nothing to do for it and must not ask for turns.
+    fn layer_orphan_job(&self) -> Option<usize> {
         let job = self.state.layers.job.layer;
-        self.state.layers.queue_len != 0
-            || job != NO_LAYER && self.state.layers.layers[job as usize].orphan
+        (job != NO_LAYER).then_some(job as usize).filter(|&i| {
+            let layer = &self.state.layers.layers[i];
+            layer.orphan && layer.state != LayerState::Mapping
+        })
     }
 
     /// The client of the layer session left. A job of theirs ends by itself: a mapping that is

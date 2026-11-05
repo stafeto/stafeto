@@ -11,7 +11,7 @@ const MS: u64 = 1_000_000;
 
 /// The pages of the service's tables and of its writable data. The layers (pk1-design R2) add
 /// 336 pages to the tables (the `tables=` figure of the release build went from 7 688 784 to
-/// 9 042 928 bytes, 330.6 pages: `State` holds 6 400 places of the image with their names and
+/// 9 061 368 bytes, 335.1 pages: `State` holds 6 400 places of the image with their names and
 /// the tables of 64 layers), 160 to the page tables of the mappings of layers (a layer of
 /// 28.8 MB is 7 040 pages) and 5 to the thread that maps (stack and message buffer).
 const TABLES: u64 = 915 + 392 + 336 + 160 + 5;

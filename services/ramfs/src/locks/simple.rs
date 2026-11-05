@@ -830,13 +830,34 @@ impl SimpleLocks {
             removed: 0,
             wrapped: false,
         };
+        // A place with no node holds no lock and is passed by a few instructions, without a
+        // call; it counts as an inode without locks, so a turn is as long as it was before the
+        // layers (the maintenance step stays under B).
+        let mut spent = 0;
         while cursor.pending() {
             let held = self.heads[cursor.inode].count != 0;
+            let free = storage.state.nodes[cursor.inode].kind == 0 && !held;
+            if free {
+                // A place with no node holds no lock: it is passed without a call.
+                cursor.remaining -= 1;
+                cursor.inode += 1;
+                if cursor.inode == storage::NODES {
+                    cursor.inode = 0;
+                    total.wrapped = true;
+                }
+                total.visited += 1;
+                spent += 1;
+                if spent >= max_empty {
+                    break;
+                }
+                continue;
+            }
             let step = self.sweep(storage, cursor, 1, &mut live);
             total.visited += step.visited;
             total.removed += step.removed;
             total.wrapped |= step.wrapped;
-            if held || total.visited >= max_empty {
+            spent += 1;
+            if held || spent >= max_empty {
                 break;
             }
         }

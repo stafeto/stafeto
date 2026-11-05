@@ -1646,6 +1646,12 @@ impl Fs {
             if !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
             }
+            // Only the session that began the job goes on with it.
+            if self.ram.storage.layer_job().is_some()
+                && r.label() != self.ram.storage.layer_session()
+            {
+                return status(proto_fs::BUSY);
+            }
             let now = self.time_source.now();
             // The state the step started in, for the line of the step statistics (the
             // detail of the longest step of a kind).
@@ -1674,7 +1680,10 @@ impl Fs {
                 return Answer::Status(Status::BadSize);
             }
             return match self.ram.storage.layer_begin_detach(start.layer) {
-                Ok(()) => layer_reply(r, LayerReply::Resolving),
+                Ok(()) => {
+                    self.ram.storage.layer_set_session(r.label());
+                    layer_reply(r, LayerReply::Resolving)
+                }
                 Err(code) => status(code),
             };
         }
@@ -1701,8 +1710,25 @@ impl Fs {
         else {
             return Answer::Status(Status::BadSize);
         };
-        let size = sys::memory_info(&memory).map_or(0, |i| i.size);
+        let (size, own) = sys::memory_info(&memory).map_or((0, 0), |i| (i.size, i.pages * 4096));
         if size == 0 || !size.is_multiple_of(4096) || size > mapper::WINDOW_SIZE {
+            return status(proto_fs::NO_SPACE);
+        }
+        // An object of `mem_create`, with every page its own: the service reads it at each
+        // look at a name, and the window of a device is no place for that.
+        if own < size {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        // The tables the kernel prepays from the quota of the service for the mappings.
+        let prepaid: u64 = self
+            .layer_sizes
+            .iter()
+            .filter(|&&s| s != 0)
+            .map(|&s| ramfs::storage::layers::table_pages(s))
+            .sum();
+        if prepaid + ramfs::storage::layers::table_pages(size)
+            > ramfs::storage::layers::TABLE_PAGES_MAX
+        {
             return status(proto_fs::NO_SPACE);
         }
         let Some(mapper) = self.mapper.as_ref().filter(|m| m.idle()) else {
@@ -1711,6 +1737,7 @@ impl Fs {
         if self.mapping != Mapping::Idle {
             return status(proto_fs::BUSY);
         }
+        let label = r.label();
         let index = match self.ram.storage.layer_begin_attach(start.layer, false) {
             Ok(index) => index,
             Err(code) => return status(code),
@@ -1726,6 +1753,7 @@ impl Fs {
             return Answer::Deferred;
         }
         self.mapping = Mapping::Attaching(index);
+        self.ram.storage.layer_set_session(label);
         self.layer_pending = Some(pending);
         self.layer_channels[index] = Some(channel);
         self.layer_sizes[index] = size;
@@ -1770,7 +1798,12 @@ impl Fs {
                     let _ = pending.answer(out.as_bytes(), Outgoing::new());
                 }
             }
-            Mapping::Releasing(index) => self.layer_finish(index),
+            // A mapping that is not taken out stays in its window: the record is kept, so that
+            // no layer takes the window again, and the line tells the service is at fault.
+            Mapping::Releasing(index) => match outcome {
+                Ok(()) => self.layer_finish(index),
+                Err(error) => rt::println!("ramfs: layer record {index}: unmap refused: {error:?}"),
+            },
             Mapping::Idle => {}
         }
         self.layer_pump();
@@ -2048,9 +2081,12 @@ impl Service<0> for Fs {
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
         if proto_fs::is_layers(s.label()) {
             // The work of the client's job ends by itself, in portions; a reply that waits for
-            // the mapping goes with the session.
-            self.layer_pending = None;
-            self.ram.storage.layer_client_gone();
+            // the mapping goes with the session. Another session of the layer client has no
+            // job of its own to leave.
+            if s.label() == self.ram.storage.layer_session() {
+                self.layer_pending = None;
+            }
+            self.ram.storage.layer_session_gone(s.label());
         }
         self.maintenance_burst.restart();
         self.legacy_pending = true;
