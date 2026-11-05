@@ -206,14 +206,14 @@ pub fn exclusive_conf() -> &'static str {
 }
 
 /// `text` with the one `from` made `to`.
-fn replaced(text: &str, from: &str, to: &str) -> String {
+pub(crate) fn replaced(text: &str, from: &str, to: &str) -> String {
     assert_eq!(text.matches(from).count(), 1, "{from} in nginx's settings");
     text.replace(from, to)
 }
 
 /// `len` bytes from a fixed generator seeded with `seed`: the host knows the
 /// files without reading the image.
-fn noise(seed: u64, len: usize) -> Vec<u8> {
+pub(crate) fn noise(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     let mut bytes = Vec::with_capacity(len + 8);
     while bytes.len() < len {
@@ -402,14 +402,14 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A connection that stays open for several requests of HTTP/1.1.
-struct Connection {
+pub(crate) struct Connection {
     stream: TcpStream,
     /// Bytes read past the last answer.
     rest: Vec<u8>,
 }
 
 impl Connection {
-    fn open(address: SocketAddr, within: Duration) -> Result<Connection, String> {
+    pub(crate) fn open(address: SocketAddr, within: Duration) -> Result<Connection, String> {
         let stream =
             TcpStream::connect_timeout(&address, within).map_err(|e| format!("connect: {e}"))?;
         stream
@@ -424,7 +424,7 @@ impl Connection {
     }
 
     /// One GET of `path`: the body of a 200 whose length the header gives.
-    fn get(&mut self, path: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn get(&mut self, path: &str) -> Result<Vec<u8>, String> {
         self.stream
             .write_all(
                 format!(
@@ -480,7 +480,7 @@ fn content_length(head: &str) -> Option<usize> {
 }
 
 /// Fails unless `body` is `want`, by SHA-256; names the first difference.
-fn same(what: &str, body: &[u8], want: &[u8]) -> Result<(), String> {
+pub(crate) fn same(what: &str, body: &[u8], want: &[u8]) -> Result<(), String> {
     if sha256(body) == sha256(want) {
         return Ok(());
     }
@@ -569,7 +569,7 @@ fn first_page(address: SocketAddr) -> Result<(), String> {
 /// What a line of the console says after the probe's marker: the shell
 /// prints `ngx-TAG-end` for `echo ngx-"TAG"-end`, which the echo of the
 /// typed command does not hold.
-fn marker(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<(), String> {
+pub(crate) fn marker(run: &mut qemu::Run, tag: &str, within: Duration) -> Result<(), String> {
     run.send(&format!("echo ngx-\"{tag}\"-end"))?;
     let want = format!("ngx-{tag}-end");
     run.expect_line(&want.clone(), |l| l.trim_end().ends_with(&want), within)?;
@@ -634,7 +634,12 @@ fn master_and_workers(processes: &[(u32, u32)]) -> Result<(u32, Vec<u32>), Strin
 }
 
 /// Waits for `count` more lines of nginx that hold `what`.
-fn lines_of(run: &mut qemu::Run, what: &str, count: usize, within: Duration) -> Result<(), String> {
+pub(crate) fn lines_of(
+    run: &mut qemu::Run,
+    what: &str,
+    count: usize,
+    within: Duration,
+) -> Result<(), String> {
     for _ in 0..count {
         run.expect_line(what, |l| l.contains(what), within)?;
     }
@@ -671,7 +676,7 @@ fn quit(run: &mut qemu::Run, tag: &str) -> Result<(), String> {
 
 /// The counter of the shared buffers of the network service in KiB, from
 /// `posix-net stat`: `posix-net: buffers N limit L buffered K KiB`.
-fn buffered(run: &mut qemu::Run) -> Result<(u32, u64), String> {
+pub(crate) fn buffered(run: &mut qemu::Run) -> Result<(u32, u64), String> {
     run.send("posix-net stat")?;
     let line = run.expect_line(
         "posix-net stat",
@@ -758,7 +763,7 @@ fn proto_fs_max_read() -> usize {
 
 /// The mean time of one read in microseconds of the line `posix-net:
 /// readfile B bytes N rounds mean M us least L us most X us`.
-fn readfile_mean(line: &str) -> Option<u64> {
+pub(crate) fn readfile_mean(line: &str) -> Option<u64> {
     line.split(" mean ")
         .nth(1)?
         .split_whitespace()
@@ -1366,7 +1371,7 @@ fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
 
 /// Fails on a line of nginx at `crit` or above, or on a fault of the
 /// image.
-fn verdict(lines: &[String]) -> Result<(), String> {
+pub(crate) fn verdict(lines: &[String]) -> Result<(), String> {
     if let Some(line) = lines.iter().find(|l| {
         ["[alert]", "[emerg]", "[crit]"]
             .iter()

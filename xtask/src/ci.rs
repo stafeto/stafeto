@@ -482,6 +482,11 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     steps.push(step("net", "network probes", &net_needs, move || {
         jobs::run_all(only(super::boot_jobs(Vec::new()), &net), njobs)
     }));
+    // The images of nginx's measurement: the measurement itself runs by hand
+    // on a Mac (HVF and VZ), so ci builds what it boots.
+    steps.push(step("net", "nginx-bench images", &net_needs, || {
+        super::nginx_bench::build_images()
+    }));
 
     // os-test: a boot a suite, and the complete basic suite.
     let os_needs = [RELIBC, BASE, ADDONS, KERNELS, IMAGES, OS_TEST_OBJECTS];
