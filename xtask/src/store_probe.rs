@@ -97,6 +97,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         None => disk().and_then(|()| empty()).and_then(|()| full(false)),
         Some("steps") => steps(),
         Some("full") => full(false),
+        Some("full-steps") => full(true),
         Some("doom") => doom(),
         Some(other) => Err(format!("store-probe: unknown argument {other}")),
     }

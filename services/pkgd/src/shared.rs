@@ -37,10 +37,28 @@ pub const IMAGE_MAX: usize = 16;
 pub const REVOKED_FILE_MAX: usize = 16 * 1024 + 456;
 
 pub static TABLE: Shared<Table> = Shared::new(Table::zeroed());
-pub static SETTINGS: Shared<[u8; 64 * 1024]> = Shared::new([0; 64 * 1024]);
+/// A blob of 64 KiB on a page: the copy of 16 KiB the main thread makes from it runs a word at a
+/// time only when the bytes are aligned (a copy from a byte-aligned place costs four times the ticks).
+#[repr(C, align(4096))]
+pub struct Blob(pub [u8; 64 * 1024]);
+
+impl core::ops::Deref for Blob {
+    type Target = [u8; 64 * 1024];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Blob {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub static SETTINGS: Shared<Blob> = Shared::new(Blob([0; 64 * 1024]));
 /// The blob and the list of a change in the making: copied from the buffer of the
 /// client, checked, then written; the live ones above are replaced when the change is the state.
-pub static NEW_BLOB: Shared<[u8; 64 * 1024]> = Shared::new([0; 64 * 1024]);
+pub static NEW_BLOB: Shared<Blob> = Shared::new(Blob([0; 64 * 1024]));
 pub static NEW_LIST: Shared<[u8; 5 * 4096]> = Shared::new([0; 5 * 4096]);
 /// The table of the next state (the worker's) and the layers its change touches.
 pub static NEXT: Shared<GroupTable> = Shared::new(GroupTable::new());

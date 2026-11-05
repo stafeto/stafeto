@@ -539,7 +539,7 @@ impl Worker {
             return proto_pkg::INVALID;
         }
         Worker::copy_buffer(a, &mut blob[..a.len]);
-        pad(blob, a.len);
+        pad(&mut blob[..], a.len);
         let Ok(parsed) = Settings::parse(&blob[..a.len]) else {
             return proto_pkg::INVALID;
         };
@@ -563,7 +563,7 @@ impl Worker {
     fn settings_change(&mut self, a: &JobArgs, attached_before: bool) -> u32 {
         // SAFETY: the worker's, and no reference to it is live.
         let blob = unsafe { &*NEW_BLOB.get() };
-        let (extent, sha) = match self.write_blob(blob, a.len) {
+        let (extent, sha) = match self.write_blob(&blob[..], a.len) {
             Ok(written) => written,
             Err(code) => return code,
         };

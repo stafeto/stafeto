@@ -649,7 +649,8 @@ impl Worker {
         }
         // SAFETY: the thread owns the blob until `STARTING` clears.
         let blob = unsafe { &mut *SETTINGS.get() };
-        if record.length as usize > blob.len() || disk_read(&mut self.disk, &record, blob).is_err()
+        if record.length as usize > blob.len()
+            || disk_read(&mut self.disk, &record, &mut blob[..]).is_err()
         {
             rt::println!("pkgd: settings damaged, no settings layer");
             return 0;
