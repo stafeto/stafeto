@@ -45,9 +45,9 @@
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
 //!    processes `nginx`, the four workers new, each holding a shared buffer
-//!    (`posix-net stat`; a worker asks on its first connection, so bursts of
-//!    connections held open together go until all four have), and an answer
-//!    of 256 KiB goes through them; 4b again, against the new workers.
+//!    (`posix-net stat`; a worker asks on its first connection, so one new
+//!    connection every 50 ms goes until all four have, 2 s at most), and an
+//!    answer of 256 KiB goes through them; 4b again, against the new workers.
 //! 6. `kill -QUIT` of the master: it ends within 10 s.
 //! 7. `nginx -c /etc/nginx/exclusive.conf &` (one listening socket for the
 //!    four workers, EPOLLEXCLUSIVE), 40 requests over 8 connections,
@@ -139,14 +139,17 @@ const QUIT_WITHIN: Duration = Duration::from_secs(10);
 /// `reconfiguring` the probe keeps asking before it counts the processes.
 const RELOAD_GAP: Duration = Duration::from_millis(50);
 const RELOAD_FOR: Duration = Duration::from_secs(5);
-/// How long after the reload the probe works for every new worker to hold a
-/// shared buffer. A worker asks for its buffer on its first call of a stream
-/// of more than 800 bytes, so one that has accepted no connection has none,
-/// and the probe sends bursts of connections held open together
-/// (`SPREAD_REQUESTS` over `CONNECTIONS`, as in step 3) until the count is
-/// whole.
-const BUFFER_WITHIN: Duration = Duration::from_secs(10);
-const SPREAD_REQUESTS: usize = 2 * CONNECTIONS;
+/// How long after the reload every new worker must hold a shared buffer. A
+/// worker asks for its buffer on its first call of a stream of more than 800
+/// bytes, so one that has accepted no connection has none. The probe sends
+/// single connections, one every `SPREAD_GAP`, and reads the count every
+/// `BUFFER_EVERY`: the service gives the connections of the group round-robin
+/// to the workers, so four connections reach four workers.
+const BUFFER_WITHIN: Duration = Duration::from_secs(2);
+const BUFFER_EVERY: Duration = Duration::from_millis(200);
+const SPREAD_GAP: Duration = Duration::from_millis(50);
+/// The connections sent in each `SPREAD_GAP`.
+const SPREAD_CONNECTIONS: usize = 1;
 /// The whole run on TCG without -icount.
 const RUN_WITHIN: Duration = Duration::from_secs(240);
 /// The kinds of the network service's steps (the methods of proto/net,
@@ -691,24 +694,38 @@ pub(crate) fn buffered(run: &mut qemu::Run) -> Result<(u32, u64), String> {
     stat_numbers(&line).ok_or_else(|| format!("the line {line:?}"))
 }
 
-/// Reads the count of sessions with a shared buffer until it is `wanted`,
-/// and after each short read calls `spread` (traffic that reaches every
-/// worker) and reads again, until `within` has passed. The last reading
+/// Reads the count of sessions with a shared buffer until it is `wanted`:
+/// after each short reading `single` is called for each connection to send
+/// before the next reading (`BUFFER_EVERY` over `SPREAD_GAP`, one at a time)
+/// and the count is read again, until `within` has passed. The last reading
 /// comes back either way, so that the caller names a short count.
 fn until_whole(
     wanted: u32,
     within: Duration,
     mut read: impl FnMut() -> Result<(u32, u64), String>,
-    mut spread: impl FnMut() -> Result<(), String>,
+    mut single: impl FnMut() -> Result<(), String>,
 ) -> Result<(u32, u64), String> {
     let began = Instant::now();
+    let between = (BUFFER_EVERY.as_millis() / SPREAD_GAP.as_millis()) as usize * SPREAD_CONNECTIONS;
     loop {
         let (sessions, kib) = read()?;
         if sessions == wanted || began.elapsed() >= within {
             return Ok((sessions, kib));
         }
-        spread()?;
+        for _ in 0..between {
+            single()?;
+        }
     }
+}
+
+/// One new connection that asks for the page, and then the gap.
+fn single_page(address: SocketAddr) -> Result<(), String> {
+    let body = Connection::open(address, READ_WITHIN)
+        .and_then(|mut c| c.get("/index.html"))
+        .map_err(|e| format!("a single connection after the reload: {e}"))?;
+    same("the page after the reload", &body, rootfs::www_index())?;
+    std::thread::sleep(SPREAD_GAP);
+    Ok(())
 }
 
 /// (sessions with a buffer, KiB through the buffers) of the line of
@@ -851,27 +868,19 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         .map_err(|e| format!("GET /256k.bin after the reload: {e}"))?;
     same("GET /256k.bin after the reload", &body, www_256k())?;
     // A new worker asks for its buffer when it first reads a request of more
-    // than 800 bytes from a connection it accepted. The queues of the
-    // members of a SO_REUSEPORT group are served by the first socket in
-    // LISTEN of a set of four places (services/netd/src/reuse.rs), so the
-    // hash picks a member only roughly, and one request after another, 50 ms
-    // apart, can leave a member without any connection for the whole 5 s
-    // (stafeto-design#564: the other three held a buffer, the fourth never
-    // asked, and netd had refused nobody). A burst of connections held open
-    // together reaches every queue, as it does before the reload.
-    // The KiB of the answer are read before any burst: the bursts carry
-    // 2 MiB through the buffers themselves.
+    // than 800 bytes from a connection it accepted. The service hands the
+    // connections of the group to the workers round-robin
+    // (services/netd/src/reuse.rs), so single connections 50 ms apart reach
+    // all four workers within 2 s, as the ones of the reload itself did.
+    // The KiB of the answer are read first: the connections that follow
+    // carry the page through the buffers too.
     let (_, after) = buffered(run)?;
     let answered = Instant::now();
-    let mut bursts = 0;
     let (sessions, _) = until_whole(
         WORKERS as u32,
         BUFFER_WITHIN,
         || buffered(run),
-        || {
-            bursts += 1;
-            pages(address, SPREAD_REQUESTS, CONNECTIONS)
-        },
+        || single_page(address),
     )?;
     let grown = after.wrapping_sub(before);
     if sessions as usize != WORKERS || grown < (WWW_256K_LEN / 1024) as u64 {
@@ -880,7 +889,7 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         ));
     }
     println!(
-        "nginx-probe: after the reload {sessions} sessions hold a buffer ({bursts} bursts of connections, {} ms after the answer), and 256 KiB went through them",
+        "nginx-probe: after the reload {sessions} sessions hold a buffer ({} ms after the answer, on single connections), and 256 KiB went through them",
         answered.elapsed().as_millis()
     );
     Ok(())
@@ -1349,6 +1358,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     symbolize::backtrace(&output.lines, &kernel.elf);
     talked?;
     verdict(&output.lines)?;
+    crate::net_probe::placing_fault(&output.lines)?;
     if steps {
         let rows = steps_verdict(&output.lines)?;
         let worst = rows.iter().max_by_key(|r| r.1).copied().unwrap_or_default();
@@ -1602,66 +1612,80 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
         assert_eq!(content_length("HTTP/1.1 200 OK\r\nServer: nginx"), None);
     }
 
+    /// The reload step asks on single connections, a few between two
+    /// readings, and gives the workers 2 s: no bursts of connections held
+    /// open together (stafeto-design#574).
     #[test]
-    fn the_count_is_not_spread_over_when_whole() {
-        let mut spread = 0;
+    fn the_reload_sends_single_connections_within_two_seconds() {
+        assert_eq!(SPREAD_CONNECTIONS, 1);
+        assert_eq!(SPREAD_GAP, Duration::from_millis(50));
+        assert_eq!(BUFFER_EVERY, Duration::from_millis(200));
+        assert_eq!(BUFFER_WITHIN, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn no_connection_is_sent_when_the_count_is_whole() {
+        let mut sent = 0;
         let got = until_whole(
             4,
             Duration::from_secs(60),
             || Ok((4, 300)),
             || {
-                spread += 1;
+                sent += 1;
                 Ok(())
             },
         );
         assert_eq!(got, Ok((4, 300)));
-        assert_eq!(spread, 0);
+        assert_eq!(sent, 0);
     }
 
     #[test]
-    fn a_worker_without_a_connection_is_reached_by_more_traffic() {
-        // Stafeto-design#564: three sessions hold a buffer however long the
-        // probe waits; the fourth worker asks once a burst reaches it.
-        let mut counts = vec![(4, 300), (3, 290), (3, 280)];
-        let mut spread = 0;
+    fn single_connections_go_between_the_readings_until_the_count_is_whole() {
+        // Three readings are short, the fourth is whole; four single
+        // connections (200 ms over 50 ms) go after each short one.
+        let mut counts = vec![(4, 300), (3, 290), (3, 280), (2, 270)];
+        let mut sent = 0;
         let got = until_whole(
             4,
             Duration::from_secs(60),
             || Ok(counts.pop().unwrap()),
             || {
-                spread += 1;
+                sent += 1;
                 Ok(())
             },
         );
         assert_eq!(got, Ok((4, 300)));
-        assert_eq!(spread, 2);
+        assert_eq!(sent, 3 * 4);
     }
 
     #[test]
     fn a_short_count_comes_back_when_the_time_is_up() {
-        let mut spread = 0;
+        let mut sent = 0;
         let got = until_whole(
             4,
             Duration::ZERO,
             || Ok((3, 290)),
             || {
-                spread += 1;
+                sent += 1;
                 Ok(())
             },
         );
         assert_eq!(got, Ok((3, 290)));
-        assert_eq!(spread, 0);
+        assert_eq!(sent, 0);
     }
 
     #[test]
-    fn a_failed_burst_ends_the_wait() {
+    fn a_failed_connection_ends_the_wait() {
         let got = until_whole(
             4,
             Duration::from_secs(60),
             || Ok((3, 290)),
-            || Err("connection 1 of 16: reset".to_owned()),
+            || Err("a single connection after the reload: reset".to_owned()),
         );
-        assert_eq!(got, Err("connection 1 of 16: reset".to_owned()));
+        assert_eq!(
+            got,
+            Err("a single connection after the reload: reset".to_owned())
+        );
     }
 
     #[test]
