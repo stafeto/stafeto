@@ -16,15 +16,22 @@ Unknown keys are refused.
 | --- | --- |
 | `name` | The package name; equals the file name. |
 | `version` | The pinned version of the source. |
-| `kind` | `base` for the base set of the system, `addon` for the rest of the shell image, `game` for the games image only, `net` for the images with the network service only. A base package depends on base packages only, no package of the shell image depends on a game, and only a network package depends on a network package. |
+| `kind` | `base` for the packages every system holds, `optional` for the rest (spec 5, 3.3). The words `addon`, `game` and `net` of earlier descriptions are gone. |
+| `image` | The probe images the package goes into: `shell` (the shell image and the images built on it), `games` (the games image besides), `net` (the images with the network service) or `fstack` (F-Stack, in the images with the network service and the image of its probe). |
+| `release` | The number of the build of this version, a string of digits (`"1"`). |
+| `summary` | One line of up to 80 ASCII characters without `"`: what the package is. |
 | `url` | The https URL of the source archive, or of the one file that is the source (the root certificates of `ca-bundle`). |
 | `sha256` | SHA-256 of the archive, 64 lowercase hex digits. |
 | `license` | SPDX expression of the licence. |
-| `depends` | Names of the packages it needs (nano, htop and ncdu need ncurses). |
+| `depends` | The packages it needs when it runs (nano, htop and ncdu need ncurses; doomgeneric needs freedoom). Only packages that have files; a base package depends on base packages only; an optional package never names a base package, the base is always there. |
+| `build_depends` | The packages linked into it when it is built (nginx links openssl and pcre2; BusyBox links the ready-made utilities). Their notices go into its own. |
+| `provides` | Other names the package answers to (`doom`): no package has that name and no other package gives it. |
+| `needs` | What the device must offer: a subset of `display`, `input`, `net`. |
+| `notices` | More notice files for `/usr/share/licenses/<name>/`: `"<file name> = target:<path from target/>"` or `"<file name> = tree:<path from the root of the tree>"` (F-Stack's acknowledgements). |
 | `build` | The build script, from the workspace root. |
 | `program` | The image program its build links, if it has one of its own. |
 | `dirs` | Directories only this package needs. |
-| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or `link:<name>`, a symbolic link to a file of its own directory (`/bin/cat = link:busybox`: `ls -l` shows `cat -> busybox`). Several paths may name one program (hard links), and the links to one name share one file of the image. A link must name a file of the image that is no link itself. The list may be empty for a package whose code another package links (musl-fts gives pax its `fts`); some package must then depend on it. |
+| `files` | `"<path in the image> = <source>"`, where the source is `elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or `link:<name>`, a symbolic link to a file of its own directory (`/bin/cat = link:busybox`: `ls -l` shows `cat -> busybox`). Several paths may name one program (hard links), and the links to one name share one file of the image. A link must name a file of the image that is no link itself. The list may be empty for a package whose code another package links (musl-fts gives pax its `fts`); some package must then name it in `build_depends`. A link names a file of the package, of a package in its `depends` or of a base package. |
 | `license_file` | Optional: the licence file in the source tree, for tools that read it; empty where the files of the source state their terms in their headers (paxmirabilis). |
 
 Example (`packages/nano.toml`):
@@ -32,11 +39,15 @@ Example (`packages/nano.toml`):
 ```toml
 name = "nano"
 version = "9.2"
-kind = "addon"
+kind = "optional"
+image = "shell"
+release = "1"
+summary = "GNU nano text editor"
 url = "https://ftp.gnu.org/gnu/nano/nano-9.2.tar.xz"
 sha256 = "05ecb99247b782e8a5b3a25ed4101dd034b0236902f7449bc9795b717642f7e9"
 license = "GPL-3.0-or-later"
-depends = ["busybox", "ncurses"]
+depends = ["ncurses"]
+build_depends = ["ncurses"]
 build = "tools/build-nano.py"
 program = "nano"
 files = [
@@ -54,8 +65,11 @@ them for the licence notes of the image.
   Its files and its programs come from the descriptions. The probe images list
   the few files they use and hold no package, so they get no add-on.
 - `cargo xtask packages` checks the descriptions: a missing SHA-256, licence,
-  version, URL or build script, a package without files, a file that two
-  packages claim, an unknown dependency or a dependency cycle each stop it.
+  version, URL, release, summary or build script, a package without files that
+  no package links in, a file that two packages claim, an unknown name in
+  `depends`, `build_depends` or `provides`, a runtime dependency on a package
+  without files, a dependency that breaks the rules of kinds and images, a
+  link to a file of a stranger and a cycle in either list each stop it.
   It also checks that every file of the shell image belongs to exactly one
   package or to the base system (init and the services: `SYSTEM_PATHS` in
   `xtask/src/rootfs.rs`), and that every link names a file of its directory
@@ -80,7 +94,7 @@ them for the licence notes of the image.
   one the build script unpacked.
 - F-Stack (`packages/f-stack.toml`, the TCP/IP stack of FreeBSD 15 in user
   space, BSD-2-Clause and BSD-3-Clause with files under BSD-4-Clause,
-  RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an add-on that installs only its
+  RSA-MD, Beerware, MIT-CMU, ISC and MIT) is an optional package of the image kind `fstack` that installs only its
   settings, `/etc/fstack.ini`. `tools/build-fstack.py` builds its library
   `libfstack.a` from the pinned commit with `ports/f-stack` (the patch and
   the host layer of stafeto in place of DPDK) and joins it with the probe
@@ -128,16 +142,17 @@ them for the licence notes of the image.
   1.3; settings that add TLS 1.2 get nginx's default `ssl_ciphers`
   (`HIGH:!aNULL:!MD5`), which still holds the exchange of keys by RSA and
   the CBC mode, and should name `ssl_ciphers`.
-- The build scripts of the packages run in build order: base first, each
-  package after its dependencies.
+- The build scripts of the packages run in build order: the base first, each
+  package after the packages it links in (`build_depends`). The build groups
+  follow from `kind` and `image`: base and shell, optional and shell,
+  F-Stack, games, network.
 
 ## Package files and keys
 
 The library `lib/pkgfmt` reads and writes the package file `.stpkg` and what
 surrounds it. Reading needs no allocator, so a program on the device can use
 it; the writers and the checks that hash whole packages are behind the
-feature `write`. This part of the format is complete; building packages from
-the descriptions (`pkg-build`, `repo`) comes next.
+feature `write`.
 
 ### The package file
 
@@ -246,6 +261,65 @@ the 256 bytes above in `<name>.cert`.
 A private key is never written into the working tree outside `target/keys/`
 (the directory of development keys): `--dir` inside the tree elsewhere is
 refused.
+
+### Notices in the package
+
+Every package carries `/usr/share/licenses/<name>/`: `LICENSE` (the licence
+text from the outputs of its build, `xtask/src/notices.rs`), `SOURCE` (name,
+version, licence, source URL and SHA-256, the script and the commit that built
+it, the recipe, the packages linked into it with their versions and licences,
+the pin of relibc for a package with programs, and the source archive when it
+has one), the files of `notices`, and for each package in `build_depends` a
+directory of that name with its `LICENSE` and notices. No path under
+`/usr/share/licenses/` belongs to another package's name. The notice files of
+the images (`BUSYBOX-LICENSE` and the others) take their licence text from the
+same function and are the same bytes as before.
+
+### The recipe
+
+`meta` and the index carry `recipe`, the SHA-256 of the sorted lines
+`file <path> <sha256>` (the description of the package and of those built by
+the same script; the script, the `tools/*.py` files it names, the files under
+`tools/<base>/` for every loaded `tools/build-<base>.py` and under
+`ports/<name>/`), `data <path> <sha256>` (every file of the package that is
+no program), `tool clang <version>`, `pin relibc <commit>` and the scripts that
+link programs (for a package with programs) and `build-depends <name>
+<recipe>` for each package linked in. `cargo xtask pkg-build --recipe
+<name>` prints the lines.
+
+### Building packages
+
+- `cargo xtask pkg-build [name...] [--key K.key --cert K.cert] [--time SECONDS]
+  [--out D] [--recipe]` builds what the packages need and writes
+  `target/pkg/<name>-<version>-<release>.stpkg` (the version is cut to its
+  first eight digits when it is a commit). The programs are the stripped ELF
+  files the images hold, so the bytes are the same. The table `rootfs` has the
+  time `SOURCE_DATE_EPOCH` or the time of the commit, so a package builds
+  again to the same bytes. A package is read back by the code that reads it
+  on the device and passes the policy before it is moved to its place. The
+  development keys of `target/keys/` sign (`keys.rs`); the signature block
+  holds the certificate of `stafeto-dev-release` from `stafeto-dev-root`.
+- `cargo xtask repo [--serial N] [--expires-days D] [--no-sources]
+  [--key K.key --cert K.cert] [--check]` builds all packages and lays out
+  `target/repo/<series>/aarch64/`: the packages, `INDEX` and `INDEX.sig`,
+  `revoked` and `revoked.sig` (an empty list signed by the development
+  root) and `src/`. An index lives 30 days at most. A package whose licence,
+  or the licence of a package linked into it, is a GPL licence gets
+  `src/<name>-<version>-<release>-src.tar.xz`
+  (`tools/pkg-source.py`): the source archives of the package and of what is
+  linked into it as their SHA-256 sums pin them, the files of the tree that the
+  recipe names, and a README. `--check` verifies a directory: the signatures,
+  the size and SHA-256 and `meta` of every package, the policy, the sources.
+- `cargo xtask pkg-identity` checks that the shell, games and network images
+  and the packages give the same bytes, modes and owners at the same paths
+  (the notices excepted), that the repository is whole and that
+  two builds of a package agree but for the time and the signature of the
+  trailer. `cargo xtask dist-licenses` builds the release files and the
+  repository and checks that the archive of `aarch64-virt` carries the notices
+  of the packages of the shell image and no others, that no archive without
+  F-Stack holds a mark of F-Stack's notices and that the GPL packages come
+  with their sources. `cargo xtask pkg-ci` runs the four commands in a row;
+  it is the job `pkg` of the CI.
 
 ## Add a package
 

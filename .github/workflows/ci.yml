@@ -245,17 +245,70 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  pkg:
+    name: pkg
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+
+      - name: Restore the build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            target
+          key: ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Source archives of the packages
+        uses: actions/cache@v4
+        with:
+          path: target/dist-cache
+          key: dist-cache-${{ hashFiles('packages/*.toml') }}
+
+      - name: Install the pinned toolchain from the cache
+        run: rustup toolchain install
+
+      - name: Date the sources before the build
+        run: git ls-files -z | xargs -0 touch -d '2001-01-01 00:00:00'
+
+      - name: cargo xtask pkg-ci
+        run: cargo xtask pkg-ci
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          find target -type f \( -name '*.log' -o -name '*.out' -o -name '*.serial' \) -size -50M -print0 \
+            | xargs -0 -r -I{} cp --parents {} ci-logs/ || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-pkg
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   ci:
     name: ci
     if: always()
-    needs: [build, group, doom-probe, nginx-probe]
+    needs: [build, group, doom-probe, nginx-probe, pkg]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - name: Every group is green
         run: |
-          echo "build: ${{ needs.build.result }}, groups: ${{ needs.group.result }}, doom-probe: ${{ needs.doom-probe.result }}, nginx-probe: ${{ needs.nginx-probe.result }}"
+          echo "build: ${{ needs.build.result }}, groups: ${{ needs.group.result }}, doom-probe: ${{ needs.doom-probe.result }}, nginx-probe: ${{ needs.nginx-probe.result }}, pkg: ${{ needs.pkg.result }}"
           test "${{ needs.build.result }}" = success
           test "${{ needs.group.result }}" = success
           test "${{ needs.doom-probe.result }}" = success
           test "${{ needs.nginx-probe.result }}" = success
+          test "${{ needs.pkg.result }}" = success

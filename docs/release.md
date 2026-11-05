@@ -31,10 +31,10 @@ to `target/dist/`.
 
 | File | Content |
 | --- | --- |
-| `stafeto-<version>-aarch64-virt.tar.xz` | `Image`, `boot.img` of the shell image, `run.sh` (TCG by default, `--hvf`, `--cpus N`), `README.md`, `LICENSES/` |
+| `stafeto-<version>-aarch64-virt.tar.xz` | `Image`, `boot.img` of the shell image, `run.sh` (TCG by default, `--hvf`, `--cpus N`), `README.md`, `LICENSES/` (the notices of the system and, in `LICENSES/packages/<name>/`, those of the packages of the shell image alone, as the packages carry them) |
 | `stafeto-<version>-kernel.tar.xz` | the kernel `Image` and `kernel.elf` with symbols |
-| `stafeto-<version>-gpl-sources.tar.xz` | the original source archives of the GPL packages (URL and SHA-256 from `packages/*.toml`), the stafeto tree at the release commit with `tools/build-*.py`, the patches and compat files, and relibc at its pin (tag `pin-<commit>`) |
-| `stafeto-<version>-sbom.spdx.json` | SPDX 2.3: name, version, licence, URL and SHA-256 of stafeto, relibc and every package |
+| `stafeto-<version>-gpl-sources.tar.xz` | the original source archives of the GPL packages of the shell image and of the packages linked into them (URL and SHA-256 from `packages/*.toml`), the stafeto tree at the release commit with `tools/build-*.py`, the patches and compat files, and relibc at its pin (tag `pin-<commit>`) |
+| `stafeto-<version>-sbom.spdx.json` | SPDX 2.3: name, version, licence, URL and SHA-256 of stafeto, relibc and every package of the shell image and of what is linked into it |
 | `SHA256SUMS` | SHA-256 of every file above |
 
 `LICENSES/relibc-THIRD-PARTY-NOTICES` holds the licence texts of relibc and
