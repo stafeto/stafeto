@@ -18,34 +18,28 @@
 //!
 //! `wait` waits on the claiming thread's channel for the service's
 //! notifications; the kernel adds the bits of the notifications that came
-//! meanwhile into one. Another wait of the same thread on its channel (a
-//! `poll`) takes such a notification away: the program looks at its queues
-//! after every wait in any case (the device's queue is checked once more
-//! after its interrupts are turned on).
+//! meanwhile into one. Every receive of the layer on the thread's channel
+//! goes through `receive` and `try_receive` here: a notification of the
+//! active try that another wait (a `poll`, a lock, a sleep) takes off the
+//! channel lands in a bank, and `wait` takes the bank first. CLIENT_GONE
+//! also sets the sticky `lost`. A process that never claimed has no
+//! notification with the label of the fast path, so the cost of the wrappers
+//! is one comparison.
 
 use crate::constants::{EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EPERM, ETIMEDOUT};
+use crate::fast_bank::{Bank, CLIENT_GONE};
+pub use crate::fast_bank::{FAST_LABEL, FAST_MASK, GONE};
 use crate::threads;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use proto_net::fast::{self as wire, Claimed, RING_PAGES};
 use proto_wire::{Reader, Status, Writer};
-use rt::abi::{CLIENT_GONE, Error, MESSAGE_MAX, Rights};
+use rt::abi::{Error, MESSAGE_MAX, Rights};
 use rt::handle::{Channel, Handle, Memory, Timer};
 use rt::sys::{self, Received};
 
-/// The label of the service's notifications and of the wait's timer on
-/// the thread's channel: apart from the labels of `wait` (bit 63) and of
-/// the long operations (small numbers).
-///
-/// Each try of CLAIM labels its copy of the channel anew (`FAST_LABEL`
-/// with the number of the try in the low 32 bits): the service closes the
-/// copy of a refused try, the kernel puts its CLIENT_GONE on the channel
-/// with that label, and `wait` takes only the label of the claim that holds
-/// the device, so the departure of a refused try never reads as the end of
-/// the service.
-pub const FAST_LABEL: u64 = 1 << 62 | 0xfa57 << 32;
+/// The label of the wait's timer on the thread's channel: next to
+/// `FAST_LABEL` and outside `FAST_MASK`.
 const TIMER_LABEL: u64 = 1 << 62 | 0xfa58 << 32;
-/// The label of the try that got the device (0 before).
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
 /// The number of the next try.
 static TRY: AtomicU64 = AtomicU64::new(1);
 /// EPROTO: KICK on a ring the service found broken.
@@ -56,18 +50,44 @@ const BUSY_WAIT_NS: u64 = 30_000_000_000;
 const RETRY_NS: u64 = 100_000_000;
 const PAGE: usize = 4096;
 const ENETDOWN: i32 = 100;
-/// The bit `wait` gives when the service let go of its notifications: it
-/// ended, or it took the device back.
-pub const GONE: u32 = 16;
+const _: () = assert!(CLIENT_GONE == rt::abi::CLIENT_GONE);
+const _: () = assert!(TIMER_LABEL & FAST_MASK != FAST_LABEL);
 
-/// The bits of a notification of the service as `wait` gives them.
-fn bits_of(bits: u64) -> u32 {
-    let own = (bits & 0xf) as u32;
-    if bits & CLIENT_GONE != 0 {
-        own | GONE
-    } else {
-        own
+static BANK: Bank = Bank::new();
+
+/// Takes the bits the receivers banked (each bit goes to one taker).
+pub fn take_pending() -> u32 {
+    BANK.take()
+}
+
+/// Whether the service let go of its notifications.
+pub fn lost() -> bool {
+    BANK.lost()
+}
+
+#[inline(always)]
+fn bank(got: &Result<Received, Error>) {
+    if let Ok(Received::Notification { label, bits, .. }) = got
+        && label & FAST_MASK == FAST_LABEL
+    {
+        BANK.deposit(*label, *bits);
     }
+}
+
+/// `sys::receive` on the thread's channel; every receive of the layer goes
+/// through here (a test of the sources holds it). A notification with the
+/// label of the fast path is banked and still returned as it came.
+pub fn receive(channel: &Handle<Channel>) -> Result<Received, Error> {
+    let got = sys::receive(channel);
+    bank(&got);
+    got
+}
+
+/// `sys::try_receive` with the same banking.
+pub fn try_receive(channel: &Handle<Channel>) -> Result<Received, Error> {
+    let got = sys::try_receive(channel);
+    bank(&got);
+    got
 }
 
 /// `struct stafeto_fast_object`.
@@ -194,7 +214,7 @@ fn pause(until: u64) -> Result<(), i32> {
             return Ok(());
         }
         sys::timer_set(&timer, until).map_err(|_| EIO)?;
-        match sys::receive(&channel()) {
+        match receive(&channel()) {
             Ok(_) => {}
             Err(Error::Interrupted) => {
                 crate::signals::deliver_now();
@@ -284,7 +304,7 @@ pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
         let label = FAST_LABEL | (TRY.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
         match ask(&service, &ring, label) {
             Ok(got) => {
-                ACTIVE.store(label, Ordering::Release);
+                BANK.activate(label);
                 break got;
             }
             Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
@@ -362,7 +382,8 @@ pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
 }
 
 /// `stafeto_fast_wait`: the bits of the service's notifications that came,
-/// waiting up to `timeout_ns` (0 only looks).
+/// waiting up to `timeout_ns` (0 only looks). The bits a wait of another
+/// owner banked come first.
 pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
     if !claimed() {
         return Err(EBADF);
@@ -374,15 +395,16 @@ pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
     let until = crate::wait::now().saturating_add(timeout_ns);
     let block = threads::own_block();
     // The notifications of other labels (a refused try's CLIENT_GONE, a
-    // timer that fired late) are taken off the channel and dropped.
-    let active = ACTIVE.load(Ordering::Acquire);
+    // timer that fired late) are taken off the channel and dropped; those
+    // of the active try land in the bank.
     loop {
         // Whatever waits on the channel first, without blocking.
         loop {
-            match sys::try_receive(&own) {
-                Ok(Received::Notification { label, bits, .. }) if label == active => {
-                    return Ok(bits_of(bits));
-                }
+            let bits = take_pending();
+            if bits != 0 {
+                return Ok(bits);
+            }
+            match try_receive(&own) {
                 Ok(_) => {}
                 Err(Error::WouldBlock) => break,
                 Err(Error::Interrupted) => {
@@ -408,14 +430,16 @@ pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
             crate::signals::deliver_now();
             return Err(EINTR);
         }
-        let got = sys::receive(&own);
+        let got = receive(&own);
         drop(guard);
         match got {
-            Ok(Received::Notification { label, bits, .. }) if label == active => {
-                let _ = sys::timer_cancel(&timer);
-                return Ok(bits_of(bits));
+            Ok(_) => {
+                let bits = take_pending();
+                if bits != 0 {
+                    let _ = sys::timer_cancel(&timer);
+                    return Ok(bits);
+                }
             }
-            Ok(_) => {}
             Err(Error::Interrupted) => {
                 let _ = sys::timer_cancel(&timer);
                 crate::signals::deliver_now();

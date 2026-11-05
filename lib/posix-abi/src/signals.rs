@@ -1243,7 +1243,7 @@ pub fn suspend(mask: SigSet) -> i32 {
             drop(guard);
             break;
         }
-        let got = sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             // An entry that ran no handler (a stop of exec or fork parked
@@ -1363,7 +1363,7 @@ fn wait(
             }
             let _ = sys::timer_set(&timer(), deadline);
         }
-        let got = sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             Ok(sys::Received::Notification {
@@ -1478,7 +1478,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
             || {
                 let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
                 sys::timer_set(&timer, deadline).map_err(|_| EAGAIN)?;
-                match sys::receive(&channel) {
+                match crate::fast::receive(&channel) {
                     Ok(_) | Err(Error::Interrupted) => Ok(()),
                     Err(_) => Err(EAGAIN),
                 }
@@ -1566,7 +1566,7 @@ pub(crate) fn stop_others() -> Result<(), i32> {
         let _ = sys::timer_set(&timer, deadline);
         // An interrupted wait looks again: the stop holds until every
         // other thread is stopped.
-        if sys::receive(&channel).is_err() {
+        if crate::fast::receive(&channel).is_err() {
             let _ = sys::yield_now();
         }
     }
@@ -1765,7 +1765,7 @@ fn park() {
             let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
         }
         while place.load(Ordering::SeqCst) == raw && STOP.owner() != 0 {
-            if sys::receive(&channel).is_err() {
+            if crate::fast::receive(&channel).is_err() {
                 let _ = sys::yield_now();
             }
         }

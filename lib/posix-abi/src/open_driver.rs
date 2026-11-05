@@ -669,7 +669,7 @@ fn fifo_open(
             drop(guard);
             continue;
         }
-        let got = rt::sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             Ok(_) | Err(rt::abi::Error::Interrupted) => {}

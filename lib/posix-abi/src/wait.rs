@@ -720,7 +720,7 @@ fn run(
                 }
                 sys::timer_set(timer.as_ref().ok_or(EIO)?, until).map_err(kernel_error)?;
             }
-            let incoming = sys::receive(&channel);
+            let incoming = crate::fast::receive(&channel);
             drop(guard);
             match incoming {
                 Ok(_) | Err(Error::Interrupted) => {}

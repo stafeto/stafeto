@@ -23,6 +23,12 @@
  *   fast-echo PORT --retry    a claim refused while another owns the device,
  *                             then tries until it is free (`retry ok`), then
  *                             echo
+ *   fast-echo PORT --poll     echo, with a `poll` of 50 ms on an idle pair of
+ *                             AF_UNIX sockets between the look at the queue
+ *                             and the wait on the service's notifications:
+ *                             the poll takes a notification of the device off
+ *                             the thread's channel, and the wait still gets it
+ *                             (`poll ok` once the poll timed out)
  *   fast-echo PORT --idle MS  (with any of the above that echoes) the wait of
  *                             an idle owner lasts MS milliseconds, so only
  *                             the device's interrupt wakes it in time; a UDP
@@ -40,12 +46,14 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,12 +65,18 @@ extern int stafeto_fast_probe_crash(void);
 #define ETH 14
 #define BURST 32
 #define WAIT_NS 10000000ull
+/* `--poll`: a wait long enough that a notification the poll took away shows as
+ * an echo that comes late. */
+#define POLL_WAIT_NS 2000000000ull
+#define POLL_MS 50
 #define RACE_GAP_NS 200000000ull
 
 static uint8_t own_ip[4];
 static uint8_t own_mac[6];
 static uint16_t port;
 static unsigned long echoed;
+static int poll_fd = -1;
+static int poll_said;
 static unsigned long frames_seen;
 static int first_seen;
 static unsigned long wait_ns = WAIT_NS;
@@ -326,6 +340,20 @@ static void retry(struct stafeto_fast_claim *c)
 	fflush(stdout);
 }
 
+/* The pause of `--poll`: a poll with nothing to report, which waits on the
+ * thread's channel like the wait of the device does. */
+static void pause_in_poll(void)
+{
+	struct pollfd p = { .fd = poll_fd, .events = POLLIN };
+	int r = poll(&p, 1, POLL_MS);
+	REQUIRE(r == 0 || (r == -1 && errno == EINTR));
+	if (r == 0 && !poll_said) {
+		printf("fast-echo: poll ok\n");
+		fflush(stdout);
+		poll_said = 1;
+	}
+}
+
 static int run(void)
 {
 	struct vnet_buf got[BURST];
@@ -363,6 +391,8 @@ static int run(void)
 			continue;
 		}
 		uint32_t bits = 0;
+		if (poll_fd >= 0)
+			pause_in_poll();
 		if (stafeto_fast_wait(wait_ns, &bits) != 0 && errno != ETIMEDOUT && errno != EINTR)
 			fail("stafeto_fast_wait");
 		if (bits & STAFETO_FAST_ADDRESS) {
@@ -387,7 +417,7 @@ static int run(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2 || argc > 6) {
-		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--retry|--crash|--as UID] [--idle MS]\n");
+		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--retry|--poll|--crash|--as UID] [--idle MS]\n");
 		return 2;
 	}
 	port = (uint16_t)atoi(argv[1]);
@@ -440,6 +470,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	say_address("claimed", &c.config);
+	if (strcmp(mode, "--poll") == 0) {
+		int pair[2];
+		REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+		poll_fd = pair[0];
+		wait_ns = POLL_WAIT_NS;
+	}
 	if (strcmp(mode, "--flood") == 0)
 		flood();
 	return run();
