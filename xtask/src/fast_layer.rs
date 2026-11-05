@@ -318,9 +318,19 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 return Err(format!("echo {n} under signals took {seconds:.1} s"));
             }
         }
+        // Pages of 1 MiB go by edges of writing too: a lost edge stalls one.
+        let at_once: Vec<_> = (0..3)
+            .map(|_| std::thread::spawn(move || fetch(page_host, PAGE_BYTES)))
+            .collect();
+        for handle in at_once {
+            let seconds = handle.join().map_err(|_| "a fetch panicked".to_owned())??;
+            if seconds > 10.0 {
+                return Err(format!("a page under signals took {seconds:.1} s"));
+            }
+        }
         command_of(echo_host, "?quiet", "quiet 1\n")?;
         command_of(echo_host, "?unmix", "unmixed\n")?;
-        notes.push("16 echoes under a signal every millisecond".to_owned());
+        notes.push("16 echoes and 3 pages under a signal every millisecond".to_owned());
         let before = stats(echo_host)?;
         let at = Instant::now();
         std::thread::sleep(Duration::from_secs(2));
