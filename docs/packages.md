@@ -131,6 +131,122 @@ them for the licence notes of the image.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 
+## Package files and keys
+
+The library `lib/pkgfmt` reads and writes the package file `.stpkg` and what
+surrounds it. Reading needs no allocator, so a program on the device can use
+it; the writers and the checks that hash whole packages are behind the
+feature `write`. This part of the format is complete; building packages from
+the descriptions (`pkg-build`, `repo`) comes next.
+
+### The package file
+
+A container with the layout of the boot image (a 16-byte header, a table of
+48-byte entries, files at 4 KiB boundaries, zeros to the end of the last
+page), signature `STAFPKG1`, version 1, read by
+`bootimg::BootImage::parse_as(bytes, &pkgfmt::PACKAGE)`. Then one trailer page.
+
+| Part | Content |
+|---|---|
+| file 0 `meta` | text, at most 4 KiB: the keys `name version release arch series license depends provides needs summary url sha256 recipe commit relibc size`, one `key value` line each, in this order; a list with no members is `-` |
+| file 1 `rootfs` | a `STAFROOT` version 2 table; its file numbers are the numbers of the container's files |
+| file 2 `manifest` | one line per entry of `rootfs`, in its order: `<sha256 or -> <size> <mode, 6 octal digits> <elf or -> <path>` |
+| files 3.. | the contents, each named by its number in decimal digits |
+| trailer | 4 096 bytes: the signature block (456 bytes) and zeros |
+
+`Package::parse` checks, each rule with its own error: whole pages and a
+trailer that covers everything before it; the file names above; no page after
+the last file; at most 1 024 entries; every content file referenced by an
+entry; owner 0:0 and no set-ID, set-GID or sticky bit; `meta` and `manifest`
+in their strict form, the manifest agreeing with the table in path, mode, size
+and the `elf` mark; `size` in `meta` equal to the length of the content files.
+`Package::check_policy(name)` adds the rules of official packages: the files
+`/usr/share/licenses/<name>/LICENSE` and `SOURCE` exist and nothing else lies
+under `/usr/share/licenses/` outside that directory. `Manifest::check`
+(feature `write`) hashes every file and compares.
+
+### Signatures
+
+One block, `STAFSIG1`, signs three kinds of data: a package (kind 1), an index
+(2) and a revocation list (3).
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `STAFSIG1` |
+| 8 | 4 | version = 1 |
+| 12 | 4 | kind |
+| 16 | 8 | `covered`: the length of the signed bytes |
+| 24 | 32 | SHA-256 of the signed bytes |
+| 56 | 8 | time of signing, seconds UTC |
+| 64 | 64 | key name: a length byte, 1 to 63 bytes of `[a-z0-9-]`, zeros |
+| 128 | 64 | Ed25519 signature |
+| 192 | 4 | length of the certificate: 0 or 256 |
+| 196 | 4 | zeros |
+| 200 | 256 | the certificate or zeros |
+
+The signature covers `stafeto signature v1` and a zero byte, then bytes 8 to
+128 of the block. The kind, the length, the hash, the time and the key name are
+therefore all signed, and the signature of an index cannot serve as one of a
+package. `INDEX.sig` is a block of kind 2 over `INDEX`; `revoked.sig` is a
+block of kind 3 signed by a root directly.
+
+The certificate `STAFCRT1` (256 bytes) lets a root vouch for a release key:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `STAFCRT1` |
+| 8 | 4 | version = 1 |
+| 12 | 4 | purposes: bit 0 `packages`, bit 1 `elf` |
+| 16 | 64 | key name |
+| 80 | 32 | public key |
+| 112 | 8 | start of the term, seconds UTC |
+| 120 | 8 | end of the term |
+| 128 | 64 | name of the issuing root |
+| 192 | 64 | the root's signature over `stafeto certificate v1`, a zero byte and bytes 0 to 192 |
+
+`trust::verify(block, kind, digest, covered, trust, revoked)` checks in this
+order: kind (`WrongKind`), length (`LengthMismatch`), hash (`BadHash`). Without
+a certificate the key must be in `trust.roots` (revocation lists) or
+`trust.direct` (packages and indexes of a repository the owner added);
+otherwise `UnknownKey`. With a certificate (kinds 1 and 2) its issuer must be
+in `roots` with a valid signature and the block's key name (`BadCertificate`),
+the `packages` purpose must be set (`WrongPurpose`) and the time of signing
+must lie in the term (`OutsideCertificate`). A key named in the revocation
+list is refused (`Revoked`) when the block was signed at or after the entry's
+time; the clock of the device takes no part. Last the Ed25519 signature is
+checked (`BadSignature`). The official repository trusts the roots of
+`keys/*.pub` (`pkgfmt::OFFICIAL_ROOTS`) and no direct key.
+
+### Index and revocation list
+
+`INDEX` is a header (`format 1`, `repository`, `series`, `arch`, `serial`,
+`expires`), an empty line, then entries separated by one empty line, names
+ascending. The fields of an entry come in the order `name version [provides]
+[depends] [needs] license size sha256 recipe file [source] summary`. `revoked`
+is `format 1`, `serial N` and zero or more `revoke <key name> <time>` lines,
+names ascending. Times are `YYYY-MM-DDThh:mm:ssZ`. Both parsers are strict and
+name the line of a mistake (`BadIndex(n)`, `BadRevoked(n)`); the writers read
+their own output back.
+
+### Keys
+
+A public key is one line, `ed25519 <base64 of 32 bytes> <name>`, in a file
+`<name>.pub`; `keys/stafeto-root-1.pub` is the official root. A private key is
+an unencrypted PKCS#8 version 1 Ed25519 key in PEM, in `<name>.key` with mode
+0600 (the shape `openssl genpkey -algorithm ed25519` writes). A certificate is
+the 256 bytes above in `<name>.cert`.
+
+| Command | What |
+|---|---|
+| `cargo xtask keys root <name> [--dir D]` | a new root key pair, the name `...-root` or `...-root-N`; the private file is created with mode 0600 and never overwritten; only the public line is printed; `D` defaults to `$HOME/.stafeto-keys` |
+| `cargo xtask keys release <name> [--dir D]` | the same for a release key, `...-release` or `...-release-YYYY` |
+| `cargo xtask keys certify --root R.key --key K.pub [--purpose packages[,elf]] [--from YYYY-MM-DD] [--days N] [--out F]` | the certificate of `K` by the root `R`: purpose `packages`, start today at 00:00 UTC, 396 days, next to `K.pub` by default; the root must match `keys/<root name>.pub` when that file exists |
+| `cargo xtask keys show <file>` | what a `.pub`, `.cert`, `.sig` or `.stpkg` file says; it never opens a `.key` file |
+
+A private key is never written into the working tree outside `target/keys/`
+(the directory of development keys): `--dir` inside the tree elsewhere is
+refused.
+
 ## Add a package
 
 1. Write the build script in `tools/`, with the version, URL and SHA-256 taken
@@ -142,8 +258,7 @@ them for the licence notes of the image.
 
 ## What stays for subproject 5
 
-Installing and removing packages in a running system, the package file
-format, signatures and trust in sources, the store and delivery (in the image,
-from a disk, over the network), dependency resolution at install time, and
-the sandbox and quotas of an application. Nothing here changes the quotas of
+Installing and removing packages in a running system, the store and delivery
+(in the image, from a disk, over the network), dependency resolution at
+install time, and the sandbox and quotas of an application. Nothing here changes the quotas of
 the image.

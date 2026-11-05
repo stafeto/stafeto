@@ -77,6 +77,7 @@ mod nginx_probe;
 mod obj_sites;
 mod openposix;
 mod ostest;
+mod keys;
 mod packages;
 mod pci_walk;
 mod posix_display;
@@ -1641,6 +1642,8 @@ commands:
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
+  keys      the keys that sign packages: `keys root|release <name> [--dir D]`,
+            `keys certify --root R.key --key K.pub`, `keys show <file>` (docs/packages.md)
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -1986,6 +1989,7 @@ fn main() {
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
+        Some("keys") => keys::command(&args[1..]),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),

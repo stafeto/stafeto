@@ -1342,6 +1342,7 @@ dependencies = [
  "init",
  "kcore",
  "netd",
+ "pkgfmt",
  "posix-fd",
  "posix-types",
  "proto-fs",
