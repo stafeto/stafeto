@@ -456,14 +456,19 @@ pub enum Slot {
     /// (`proto_net`): fork and spawn give the child a CLONE of it, exec moves
     /// it. Empty in an image without the network service.
     Net = 12,
+    /// The process's session with the package service, a `Pkg` session
+    /// (`proto_pkg`): fork and spawn give the child a CLONE of it, exec moves
+    /// it; a set-ID program starts without it. Empty in an image without the
+    /// package service.
+    Packages = 13,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 13;
+pub const SLOTS: usize = 14;
 
 impl Slot {
     /// The sessions Handles brings, in their order.
-    pub const GIVEN: [Slot; 8] = [
+    pub const GIVEN: [Slot; 9] = [
         Slot::Files,
         Slot::Clock,
         Slot::Driver,
@@ -472,6 +477,7 @@ impl Slot {
         Slot::Entropy,
         Slot::Display,
         Slot::Net,
+        Slot::Packages,
     ];
 
     /// The bit of this slot in Fork's required session mask.
@@ -491,7 +497,7 @@ impl Slot {
     };
 
     /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
-    /// Terminal, Entropy or Display.
+    /// Terminal, Entropy, Display, Net or Packages.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
@@ -502,6 +508,7 @@ impl Slot {
             10 => Some(Slot::Entropy),
             11 => Some(Slot::Display),
             12 => Some(Slot::Net),
+            13 => Some(Slot::Packages),
             _ => None,
         }
     }
@@ -908,7 +915,7 @@ pub struct Start {
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 7;
+pub const START_VERSION: u32 = 8;
 pub const SECURE: u32 = 1;
 /// The program is dynamic: the loader filled the auxiliary vector (`auxv`)
 /// and the libc.so is in the space, so the start takes the vector as it is
@@ -918,7 +925,7 @@ pub const DYNAMIC: u32 = 2;
 pub const AUXV_PAIRS: usize = 8;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 200);
+const _: () = assert!(START_SIZE == 208);
 /// Where the initial stack starts in the area: the header rounded up to 16,
 /// the alignment the stack needs.
 const STACK_AT: usize = START_SIZE.next_multiple_of(16);
@@ -1680,8 +1687,14 @@ mod tests {
             handle_slots(Reader::new(w.as_bytes()), 1),
             Ok([Some(Slot::Net), None, None, None])
         );
+        let w = body(&[13]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 1),
+            Ok([Some(Slot::Packages), None, None, None])
+        );
         for (slots, count) in [
-            (&[13][..], 1),
+            (&[14][..], 1),
+            (&[13, 13][..], 2),
             (&[12, 12][..], 2),
             (&[11, 11][..], 2),
             (&[10, 10][..], 2),
@@ -1777,7 +1790,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9, 10, 11, 12, 13, 14];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -2087,13 +2100,28 @@ mod tests {
         );
     }
 
-    /// The network slot is a given slot: its bit is in the required mask, and
-    /// all eight given slots go in two Handles of four.
+    /// The network and package slots are given slots: their bits are in the
+    /// required mask, and all nine given slots go in three Handles of at
+    /// most four.
     #[test]
-    fn the_net_slot_is_given_with_the_others() {
+    fn the_net_and_package_slots_are_given_with_the_others() {
         assert_ne!(Slot::GIVEN_MASK & (1 << 12), 0);
+        assert_ne!(Slot::GIVEN_MASK & (1 << 13), 0);
         assert_eq!(Slot::given(12), Some(Slot::Net));
-        assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Net);
+        assert_eq!(Slot::given(13), Some(Slot::Packages));
+        assert_eq!(Slot::given(14), None);
+        assert_eq!(Slot::GIVEN[Slot::GIVEN.len() - 1], Slot::Packages);
+        assert_eq!((Slot::Packages as usize) + 1, SLOTS);
+        assert_eq!(START_VERSION, 8);
+        for (n, ok) in [(13, true), (14, false)] {
+            let mut w = Writer::new();
+            w.u32(n).unwrap();
+            assert_eq!(
+                handle_slots(Reader::new(w.as_bytes()), 1).is_ok(),
+                ok,
+                "slot {n}"
+            );
+        }
         let slots = Slot::GIVEN.map(|slot| slot as u32);
         for half in slots.chunks(abi::MESSAGE_HANDLES) {
             let mut w = Writer::new();
@@ -2214,7 +2242,7 @@ mod tests {
     /// libc.so, the stack and the area; the dynamic flag is its own bit.
     #[test]
     fn the_start_constants_of_a_dynamic_program() {
-        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (7, 8, 8));
+        assert_eq!((START_VERSION, MAP_ENTRIES, AUXV_PAIRS), (8, 8, 8));
         assert_eq!(SECURE & DYNAMIC, 0);
         assert_eq!(DYNAMIC, 2);
         let mut out = vec![0; BLOCK_MAX];
@@ -2428,7 +2456,7 @@ mod tests {
                 image: false,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 12, 13, 14];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();
