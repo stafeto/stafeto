@@ -15,6 +15,7 @@
 //! `stage_licenses` is also what `cargo xtask dist` uses to give
 //! `tools/dist.py` the notices of the packages of the shell image.
 
+use crate::notices;
 use crate::packages::{self, Package};
 use crate::pkg::{self, Built};
 use crate::repo;
@@ -312,66 +313,141 @@ fn dir_size(dir: &Path) -> u64 {
 
 // ---- pkg-identity ----
 
-struct FlatImage {
-    bytes: Vec<u8>,
+/// How long the machine of the full image has to boot and answer the
+/// commands of the probe, on TCG.
+const BOOT_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The package files an image holds in its container: name and bytes.
+fn layers_of(image: &BootImage<'_>) -> Vec<(String, Vec<u8>)> {
+    image
+        .files()
+        .filter(|f| f.name.ends_with(".stpkg"))
+        .map(|f| (f.name.to_string(), f.data.to_vec()))
+        .collect()
 }
 
-fn read_image(path: &Path) -> Result<FlatImage, String> {
-    Ok(FlatImage {
-        bytes: std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?,
-    })
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut buf = [0u8; 64];
+    pkgfmt::sha::hex(&pkgfmt::sha::sha256(bytes), &mut buf).to_string()
 }
 
-fn compare(
-    image_name: &str,
-    image: &FlatImage,
-    package: &Package,
-    repo_dir: &Path,
+/// The package files of the image at `path` are, byte for byte, the files
+/// the index of the repository in `dir` names, one for each package that
+/// has files; gives their names.
+fn same_as_index(name: &str, path: &Path, dir: &Path) -> Result<BTreeSet<String>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image = BootImage::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+    let text = std::fs::read_to_string(dir.join("INDEX")).map_err(|e| format!("INDEX: {e}"))?;
+    let index = pkgfmt::index::Index::parse(&text).map_err(|e| format!("INDEX: {e}"))?;
+    let mut held = BTreeSet::new();
+    for (file, data) in layers_of(&image) {
+        let entry = index
+            .entries()
+            .find(|e| e.file == file)
+            .ok_or_else(|| format!("{name}: {file} is in no record of the index"))?;
+        if entry.sha256 != sha256_hex(&data) {
+            return Err(format!(
+                "{name}: the SHA-256 of {file} is not the index's: the image holds another build of the package"
+            ));
+        }
+        held.insert(entry.name.to_string());
+    }
+    Ok(held)
+}
+
+/// No file of a package is in the table `rootfs` of the image at `path`; a
+/// directory of a package is there only above other entries of the table.
+fn table_holds_no_package_path(
+    name: &str,
+    path: &Path,
+    packages: &[Package],
 ) -> Result<usize, String> {
-    let parsed = BootImage::parse(&image.bytes).map_err(|e| format!("{image_name}: {e}"))?;
-    let table = parsed
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image = BootImage::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+    let table = image
         .files()
         .find(|f| f.name == "rootfs")
-        .ok_or_else(|| format!("{image_name}: no rootfs"))?;
-    let rootfs =
-        Rootfs::parse(table.data, parsed.count()).map_err(|e| format!("{image_name}: {e}"))?;
-    let path = repo_dir.join(pkg::file_name(package));
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut compared = 0;
-    for n in 0..file.rootfs.len() as u32 {
-        let e = file.rootfs.entry(n);
-        if e.path == LICENSES || e.path.starts_with(&format!("{LICENSES}/")) {
+        .ok_or_else(|| format!("{name}: no rootfs"))?;
+    let table = Rootfs::parse(table.data, image.count()).map_err(|e| format!("{name}: {e}"))?;
+    let owned = |path: &str| {
+        packages
+            .iter()
+            .any(|p| p.files.iter().any(|(f, _)| f == path) || p.dirs.iter().any(|d| d == path))
+    };
+    let mut entries = 0;
+    for n in 0..table.len() as u32 {
+        let e = table.entry(n);
+        entries += 1;
+        if !owned(e.path) {
             continue;
         }
-        let Some(at) = rootfs.find(e.path) else {
+        let above = (0..table.len() as u32)
+            .any(|m| table.entry(m).path.starts_with(&format!("{}/", e.path)));
+        if !e.is_directory() || !above {
             return Err(format!(
-                "{image_name}: {} of {} is not in the image",
-                e.path, package.name
-            ));
-        };
-        let flat = rootfs.entry(at as u32);
-        if (flat.mode, flat.uid, flat.gid) != (e.mode, e.uid, e.gid) {
-            return Err(format!(
-                "{image_name}: {} of {} is {:o} {}:{} in the image and {:o} {}:{} in the package",
-                e.path, package.name, flat.mode, flat.uid, flat.gid, e.mode, e.uid, e.gid
+                "{name}: the table rootfs holds {}, a path of a package",
+                e.path
             ));
         }
-        if !e.is_directory() {
-            let flat_bytes = parsed
-                .file_at(flat.file)
-                .map(|f| f.data)
-                .unwrap_or_default();
-            if flat_bytes != file.content(n) {
-                return Err(format!(
-                    "{image_name}: the bytes of {} of {} differ from the package's",
-                    e.path, package.name
-                ));
-            }
-        }
-        compared += 1;
     }
-    Ok(compared)
+    Ok(entries)
+}
+
+/// The lines a command of the shell wrote, with the echo of the command and
+/// the prompt left out.
+fn shell(run: &mut crate::qemu::Run, command: &str) -> Result<Vec<String>, String> {
+    let from = run.lines().len();
+    run.send(command)?;
+    run.expect(command, crate::DIALOG_STEP)?;
+    run.expect("# ", crate::DIALOG_STEP)?;
+    Ok(run.lines()[from..]
+        .iter()
+        .filter(|l| !l.contains(command))
+        .cloned()
+        .collect())
+}
+
+/// Boots the image at `path` on the machine of the base and the full image
+/// (TCG), runs `check` at the prompt of the shell, and fails when the log
+/// of ramfs says a layer was not attached.
+fn boot(
+    name: &str,
+    path: &Path,
+    check: impl FnOnce(&mut crate::qemu::Run) -> Result<(), String>,
+) -> Result<(f64, f64), String> {
+    let kernel = crate::build(crate::Variant::Normal)?;
+    let mut cmd = crate::qemu::command(&crate::qemu::VIRT, &kernel.image, Some(path));
+    cmd.args(crate::qemu::HEADLESS);
+    cmd.args(crate::base_image::machine_args());
+    let started = std::time::Instant::now();
+    let mut run = crate::qemu::Run::start(cmd, crate::qemu::Input::Pipe)?;
+    let mut services = 0.0;
+    let talked = (|| {
+        run.expect(crate::SERVICES_STARTED, BOOT_WITHIN)?;
+        services = started.elapsed().as_secs_f64();
+        run.expect("# ", crate::DIALOG_STEP)?;
+        check(&mut run)
+    })();
+    let output = run.stop();
+    crate::symbolize::backtrace(&output.lines, &kernel.elf);
+    talked.map_err(|e| format!("{name}: {e}"))?;
+    if let Some(line) = output.lines.iter().find(|l| l.contains("not attached")) {
+        return Err(format!("{name}: {line}"));
+    }
+    let took = started.elapsed();
+    if took > BOOT_WITHIN {
+        return Err(format!("{name}: the run took {:.0} s", took.as_secs_f64()));
+    }
+    Ok((services, took.as_secs_f64()))
+}
+
+/// The entries of `/usr/share/licenses`, as `ls -1` lists them.
+fn licence_directories(run: &mut crate::qemu::Run) -> Result<BTreeSet<String>, String> {
+    Ok(shell(run, "ls -1 /usr/share/licenses")?
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
 }
 
 /// The blocks of two builds equal in all but the time and the signature.
@@ -408,51 +484,135 @@ fn same_but_signature(a: &Built, b: &Built) -> Result<(), String> {
 
 pub fn identity() -> Result<(), String> {
     let started = std::time::Instant::now();
-    // 1: the images and the repository.
-    crate::relibc()?;
-    crate::busybox_build()?;
-    crate::nano_build()?;
-    crate::bash_build()?;
-    let shell = crate::build_boot_image(SHELL_IMAGE, crate::shell_programs(), crate::BOOT_PROFILE)?;
-    crate::doom::build_games()?;
-    let doom = crate::build_boot_image(
-        "boot-doom.img",
-        crate::doom::programs(),
-        crate::BOOT_PROFILE,
-    )?;
-    crate::net_build()?;
-    let net = crate::build_boot_image(
-        crate::net::IMAGE,
-        crate::net::programs(),
-        crate::BOOT_PROFILE,
-    )?;
+    // 1: the repository and the images: the images take the package files
+    // the repository was made of.
     let dir = crate::target_dir().join("repo-identity");
     repo::run(&repo::Options {
         sources: false,
         dir: Some(dir.clone()),
         ..repo::parse_options(&[])?
     })?;
-    // 2: the packages and the flat images.
-    for (name, path) in [
-        (SHELL_IMAGE, shell),
-        ("boot-doom.img", doom),
-        (crate::net::IMAGE, net),
+    let full = crate::base_image::build_image(crate::base_image::FULL_IMAGE)?;
+    let base = crate::base_image::build_image(crate::base_image::BASE_IMAGE)?;
+    let all = packages::load()?;
+    let with_files: Vec<Package> = all.iter().filter(|p| has_files(p)).cloned().collect();
+    let base_packages: Vec<Package> = with_files
+        .iter()
+        .filter(|p| p.kind == packages::Kind::Base)
+        .cloned()
+        .collect();
+    // 2: each package file in an image is the file of the index.
+    let want =
+        |list: &[Package]| -> BTreeSet<String> { list.iter().map(|p| p.name.clone()).collect() };
+    for (name, path, list) in [
+        (crate::base_image::FULL_IMAGE, &full, &with_files),
+        (crate::base_image::BASE_IMAGE, &base, &base_packages),
     ] {
-        let image = read_image(&path)?;
-        let mut total = 0;
-        let mut count = 0;
-        for p in packages::of_image(name)?.into_iter().filter(has_files) {
-            total += compare(name, &image, &p, &dir)?;
-            count += 1;
+        let held = same_as_index(name, path, &dir)?;
+        if held != want(list) {
+            return Err(format!(
+                "pkg-identity: {name} holds the packages {held:?}, wanted {:?}",
+                want(list)
+            ));
         }
         println!(
-            "pkg-identity: {count} packages of {name} give the same {total} entries as the image"
+            "pkg-identity: {} package files of {name} are the files of the index, byte for byte",
+            held.len()
         );
     }
-    // 3: the index and the packages.
+    // 3: the table of an image holds the paths of the system alone.
+    for (name, path) in [
+        (crate::base_image::FULL_IMAGE, &full),
+        (crate::base_image::BASE_IMAGE, &base),
+    ] {
+        let n = table_holds_no_package_path(name, path, &with_files)?;
+        println!(
+            "pkg-identity: the {n} entries of the table rootfs of {name} are paths of the system"
+        );
+    }
+    // 4: the index and the packages.
     let n = repo::check(&dir, &[crate::keys::dev_keys(&crate::root())?.root])?;
     println!("pkg-identity: repo --check: {n} packages whole and signed");
-    // 4: a package builds again to the same bytes.
+    // 5: the full image in QEMU: the program of a package with its mode, the
+    // licence of another in its directory, the directories of the notices.
+    let licence = notices::licence_text("freedoom")?;
+    let (services, took) = boot(crate::base_image::FULL_IMAGE, &full, |run| {
+        let listing = shell(run, "ls -l /bin/doom")?;
+        let doom = with_files
+            .iter()
+            .find(|p| p.name == "doomgeneric")
+            .ok_or("no package doomgeneric")?;
+        let (_, source) = doom
+            .files
+            .iter()
+            .find(|(path, _)| path == "/bin/doom")
+            .ok_or("doomgeneric names no /bin/doom")?;
+        let wanted = if source.starts_with("link:") {
+            'l'
+        } else {
+            '-'
+        };
+        if !listing
+            .iter()
+            .any(|l| l.starts_with(wanted) && l.contains("rwxr-xr-x") && l.ends_with("/bin/doom"))
+        {
+            return Err(format!("ls -l /bin/doom gave {listing:?}"));
+        }
+        let text = shell(run, "cat /usr/share/licenses/freedoom/LICENSE")?;
+        let wanted: Vec<&str> = std::str::from_utf8(&licence)
+            .map_err(|e| e.to_string())?
+            .lines()
+            .collect();
+        // The terminal turns each LF into CR LF; the file has CR LF itself.
+        let got: Vec<&str> = text.iter().map(|l| l.trim_end_matches('\r')).collect();
+        if let Some(at) = (0..got.len().max(wanted.len())).find(|&i| got.get(i) != wanted.get(i)) {
+            return Err(format!(
+                "cat /usr/share/licenses/freedoom/LICENSE gave {} lines, the licence text has {}: line {} is {:?}, wanted {:?}",
+                got.len(),
+                wanted.len(),
+                at + 1,
+                got.get(at),
+                wanted.get(at)
+            ));
+        }
+        let mut names = want(&with_files);
+        names.insert("stafeto".into());
+        let held = licence_directories(run)?;
+        if held != names {
+            return Err(format!(
+                "/usr/share/licenses holds {held:?}, the packages of the image and stafeto are {names:?}"
+            ));
+        }
+        Ok(())
+    })?;
+    println!(
+        "pkg-identity: {} in QEMU: ls -l /bin/doom, the licence of freedoom, the directories of the notices, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s)",
+        crate::base_image::FULL_IMAGE
+    );
+    // 6: the base image in QEMU: no game, the notices of the base packages, the screen and the keys.
+    let (services, took) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
+        let missing = shell(run, "ls /bin/doom")?;
+        if !missing
+            .iter()
+            .any(|l| l.contains("No such file or directory"))
+        {
+            return Err(format!("ls /bin/doom gave {missing:?}"));
+        }
+        let mut names = want(&base_packages);
+        names.insert("stafeto".into());
+        let held = licence_directories(run)?;
+        if held != names {
+            return Err(format!(
+                "/usr/share/licenses holds {held:?}, the base packages and stafeto are {names:?}"
+            ));
+        }
+        Ok(())
+    })?;
+    println!(
+        "pkg-identity: {} in QEMU: no /bin/doom, the notices of the base packages and of the system, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s)",
+        crate::base_image::BASE_IMAGE
+    );
+    // 7: a package builds again to the same bytes.
     let (first, second) = (
         crate::target_dir().join("pkg-again-1"),
         crate::target_dir().join("pkg-again-2"),
