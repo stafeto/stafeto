@@ -128,6 +128,24 @@ impl Entry<'_> {
     }
 }
 
+/// An entry read without a check of its path: the path bytes, the mode and the file number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawEntry<'a> {
+    pub path: &'a [u8],
+    pub mode: u32,
+    pub file: u32,
+}
+
+impl RawEntry<'_> {
+    pub fn is_directory(&self) -> bool {
+        self.mode & FORMAT == DIRECTORY
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode & FORMAT == SYMLINK
+    }
+}
+
 /// A table whose header, entries and paths are checked.
 #[derive(Debug, Clone, Copy)]
 pub struct Rootfs<'a> {
@@ -212,22 +230,48 @@ impl<'a> Rootfs<'a> {
         })
     }
 
+    /// The fields of entry `n` of a table whose entries were checked (by `entry_checked` and
+    /// `check_entry`), with the bounds of the path rechecked and nothing else: the path as
+    /// bytes, with no look at its characters. For a reader that visits each entry twice.
+    pub fn raw_entry(&self, n: u32) -> Result<RawEntry<'a>, Error> {
+        if n >= self.count {
+            return Err(Error::BadPath(n));
+        }
+        let at = HEADER_SIZE + ENTRY_SIZE * n as usize;
+        let offset = u64::from(u32_at(self.bytes, at));
+        let end = offset + u64::from(u16_at(self.bytes, at + 4));
+        if end > self.bytes.len() as u64 {
+            return Err(Error::BadPath(n));
+        }
+        Ok(RawEntry {
+            path: &self.bytes[offset as usize..end as usize],
+            mode: u32_at(self.bytes, at + 8),
+            file: u32_at(self.bytes, at + 20),
+        })
+    }
+
     /// The mode and the file number of entry `n`: a directory, regular file
     /// or link with its bits, a directory with file 0, any other entry with
     /// a file below `files` (and `FILES_MAX`). The rules of `parse` that
     /// need no other entry.
     pub fn check_entry(&self, n: u32, files: u32) -> Result<(), Error> {
         let entry = self.entry_checked(n)?;
-        match entry.mode & FORMAT {
-            DIRECTORY | REGULAR if entry.mode & !(FORMAT | 0o7777) == 0 => {}
-            SYMLINK if entry.mode == SYMLINK | SYMLINK_MODE => {}
+        Self::check_fields(n, entry.mode, entry.file, files)
+    }
+
+    /// The rules of `check_entry` for the mode and the file number of entry `n` that a reader
+    /// has already, so that it reads the path once.
+    pub fn check_fields(n: u32, mode: u32, file: u32, files: u32) -> Result<(), Error> {
+        match mode & FORMAT {
+            DIRECTORY | REGULAR if mode & !(FORMAT | 0o7777) == 0 => {}
+            SYMLINK if mode == SYMLINK | SYMLINK_MODE => {}
             _ => return Err(Error::BadMode(n)),
         }
-        if entry.is_directory() {
-            if entry.file != 0 {
+        if mode & FORMAT == DIRECTORY {
+            if file != 0 {
                 return Err(Error::BadFile(n));
             }
-        } else if entry.file >= files || entry.file as usize >= FILES_MAX {
+        } else if file >= files || file as usize >= FILES_MAX {
             return Err(Error::BadFile(n));
         }
         Ok(())
@@ -305,16 +349,28 @@ impl<'a> Rootfs<'a> {
 }
 
 /// An absolute path below `/` with names of 1 to 255 bytes, none `.` or
-/// `..`, no NUL, and at most PATH_MAX bytes.
+/// `..`, no NUL, and at most PATH_MAX bytes: one pass over the bytes.
 fn good_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix('/') else {
+    let Some(mut rest) = path.strip_prefix('/') else {
         return false;
     };
-    path.len() <= PATH_MAX
-        && !path.contains('\0')
-        && rest
-            .split('/')
-            .all(|name| (1..=NAME_MAX).contains(&name.len()) && name != "." && name != "..")
+    // `find` and `contains` of a character look a word at a time.
+    if path.len() > PATH_MAX || path.contains('\0') {
+        return false;
+    }
+    loop {
+        let (name, tail) = match rest.find('/') {
+            Some(at) => (&rest[..at], Some(&rest[at + 1..])),
+            None => (rest, None),
+        };
+        if name.is_empty() || name.len() > NAME_MAX || name == "." || name == ".." {
+            return false;
+        }
+        match tail {
+            Some(tail) => rest = tail,
+            None => return true,
+        }
+    }
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -652,6 +708,24 @@ mod tests {
             Error::LinkMismatch(1)
         );
         assert!(rootfs(&[file("/a", 0o644, 1), file("/b", 0o644, 1)], 2).is_ok());
+    }
+
+    #[test]
+    fn a_raw_entry_is_the_bytes_of_the_path_and_the_fields_of_a_checked_entry() {
+        let bytes = rootfs(&agreeing(), 5).unwrap();
+        let table = Rootfs::open(&bytes, 5).unwrap();
+        for n in 0..5 {
+            let raw = table.raw_entry(n).unwrap();
+            let checked = table.entry_checked(n).unwrap();
+            assert_eq!(raw.path, checked.path.as_bytes());
+            assert_eq!((raw.mode, raw.file), (checked.mode, checked.file));
+            assert_eq!(raw.is_directory(), checked.is_directory());
+        }
+        assert!(table.raw_entry(5).is_err());
+        // A path that runs past the table.
+        let mut bad = bytes.clone();
+        bad[HEADER_SIZE + 4..HEADER_SIZE + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(Rootfs::open(&bad, 5).unwrap().raw_entry(0).is_err());
     }
 
     #[test]
