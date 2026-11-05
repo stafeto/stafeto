@@ -352,3 +352,16 @@ fn an_address_written_by_the_stack_is_cut_to_the_programs_length() {
     let mut none: [u8; 0] = [];
     assert_eq!(cut_address(&have, 16, &mut none), 16);
 }
+
+#[test]
+fn one_unsigned_compare_splits_the_table_from_the_rest() {
+    // Below the table: false. A fast number and a negative one (which the
+    // cold branch answers with EBADF): true.
+    assert!(!above_table(0));
+    assert!(!above_table(1023));
+    assert!(!above_table(FAST_BASE - 1));
+    assert!(above_table(FAST_BASE));
+    assert!(above_table(FAST_BASE + FAST_MAX + FAST_TICKETS));
+    assert!(above_table(-1));
+    assert!(above_table(i32::MIN));
+}
