@@ -142,7 +142,6 @@ fn refusal(status: Status) -> i32 {
         proto_net::INVALID => ENODEV,
         _ => match status {
             Status::Kernel(Error::NoMemory | Error::LimitReached) => ENOMEM,
-            Status::Kernel(Error::BadState) => EBUSY,
             _ => EIO,
         },
     }
