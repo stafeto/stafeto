@@ -827,9 +827,22 @@ pub fn pwait(
     // The pairs the service gave, which the records must not lose when the
     // wait ends with an error after taking them.
     let mut consumed = EpollReady::EMPTY;
+    // The events of the last round: the boundary turns a result into EINTR
+    // when a handler ran during the call, but a record by edge or oneshot of
+    // a pipe, a FIFO or a terminal has noted its event as reported, so a
+    // call that holds events returns them (as Linux does).
+    let mut held = 0;
     let result = wait::boundary(timeout, mask, |until, handled| {
-        round(id, out, until, handled, &mut consumed)
+        let round = round(id, out, until, handled, &mut consumed);
+        if let Ok(n) = round {
+            held = n;
+        }
+        round
     });
+    let result = match result {
+        Err(EINTR) if held > 0 => Ok(held),
+        other => other,
+    };
     if result.is_err() && consumed.len != 0 {
         restore(id, &consumed);
     }

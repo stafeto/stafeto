@@ -276,6 +276,9 @@ fn every_routed_call_has_its_branch() {
     // The wait of epoll drives the stack for an instance with fast records.
     let epoll = text("lib/posix-abi/src/epoll.rs");
     assert!(body(&epoll, "pub fn pwait(").contains("pwait_fast"));
+    // Both waits return the events they hold when the boundary says EINTR.
+    assert!(body(&epoll, "pub fn pwait(").contains("Err(EINTR) if held > 0"));
+    assert!(body(&epoll, "fn pwait_fast(").contains("Err(EINTR) if held > 0"));
 }
 
 /// The loop of the stack notifies before it looks once more, and the wait
