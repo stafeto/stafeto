@@ -473,6 +473,10 @@ impl Net {
                     return self.readable(stack, r, place);
                 }
                 if name == opt::BUFFERS || name == opt::BUFFERED {
+                    #[cfg(feature = "profile")]
+                    if name == opt::BUFFERED {
+                        self.profile_due = true;
+                    }
                     return word(r, self.buffers_word(name));
                 }
                 match self.option(place, name) {

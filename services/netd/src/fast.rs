@@ -86,7 +86,9 @@ impl phy::TxToken for TxToken<'_> {
     {
         let len = len.min(FRAME_MAX);
         let result = f(&mut self.out[..len]);
+        let began = profile::now();
         fill_sums(&mut self.out[..len]);
+        profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
         profile::add(Counter::SumN, 1);
         profile::add(Counter::SumBytes, len as u64);
         match self.ring.put(&self.out[..len]) {

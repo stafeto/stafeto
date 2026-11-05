@@ -478,8 +478,6 @@ fn main(_: u64) -> u64 {
         told: 0,
         cleanup_due: false,
         armed: None,
-        #[cfg(feature = "profile")]
-        profile: Profile::new(),
         last_step: 0,
         neighbours_at: 0,
         ask_due: false,
@@ -504,7 +502,7 @@ fn main(_: u64) -> u64 {
         held_tx: false,
         #[cfg(feature = "probe")]
         longest: [0; 2],
-        #[cfg(feature = "probe")]
+        #[cfg(any(feature = "probe", feature = "profile"))]
         own: &s.thread,
         maps: Maps {
             _dma: dma_object,
@@ -777,9 +775,6 @@ struct Driver<'a> {
     cleanup_due: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
-    /// The once-a-second report of the profile's counters.
-    #[cfg(feature = "profile")]
-    profile: Profile,
     /// The step that ran last among those asked for together.
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
@@ -817,82 +812,27 @@ struct Driver<'a> {
     /// higher level that runs in the middle of a step does not lengthen it,
     /// as in rt's count of steps. No handle of its own: the operations of
     /// role `w` take the service's handles up to its limit.
-    #[cfg(feature = "probe")]
+    #[cfg(any(feature = "probe", feature = "profile"))]
     own: &'a Handle<rt::handle::Thread>,
     maps: Maps,
 }
 
-/// The report of the profile: the second it is due at and the counters at
-/// the line before.
-#[cfg(feature = "profile")]
-struct Profile {
-    at: u64,
-    second: u64,
-    last: profile::Snapshot,
-}
-
-#[cfg(feature = "profile")]
-impl Profile {
-    const fn new() -> Self {
-        Profile {
-            at: 0,
-            second: 0,
-            last: profile::Snapshot::ZERO,
-        }
-    }
-}
-
-/// The console as a `fmt::Write`, so that a line longer than a print's
-/// buffer goes out in pieces.
-#[cfg(feature = "profile")]
-struct Console;
-
-#[cfg(feature = "profile")]
-impl core::fmt::Write for Console {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        rt::console::write(text.as_bytes()).map_err(|_| core::fmt::Error)
-    }
-}
-
 impl Driver<'_> {
-    /// The lines of the profile's counters once a second (builds with the
-    /// feature `profile`): the change of each counter since the line before.
+    /// The profile's totals as records of the console (builds with the
+    /// feature `profile`): the service's own time first, then the maxima
+    /// start anew for the next snapshot.
     #[cfg(feature = "profile")]
-    fn profile_report(&mut self) {
-        use core::fmt::Write;
-        let now = now_ns();
-        if self.profile.at == 0 {
-            self.profile.at = now + PROFILE_NS;
-            let _ = writeln!(
-                Console,
-                "net: profile start frequency {} step_rx {} step_tx {}",
-                rt::time::frequency(),
-                netd::ring::STEP_RX,
-                netd::ring::STEP_TX
-            );
-            return;
-        }
-        if now < self.profile.at {
-            return;
-        }
-        self.profile.at += PROFILE_NS;
-        self.profile.second += 1;
-        let at = profile::snapshot();
-        let (second, last) = (self.profile.second, self.profile.last);
-        let _ = profile::counters_line(&mut Console, second, &last, &at);
-        let _ = Console.write_str("\n");
-        let _ = profile::calls_line(&mut Console, second, &last, &at);
-        let _ = Console.write_str("\n");
-        self.profile.last = at;
+    fn profile_snapshot(&self) {
+        profile::store(Counter::Ran, self.ran());
+        let id = profile::next_id();
+        profile::records(id, &profile::snapshot(), |record| rt::println!("{record}"));
+        profile::take_maxima();
+        split::report();
     }
-
-    #[cfg(not(feature = "profile"))]
-    #[inline(always)]
-    fn profile_report(&mut self) {}
 
     /// The ticks the service's thread has run (builds with the feature
-    /// `probe`).
-    #[cfg(feature = "probe")]
+    /// `probe` or `profile`).
+    #[cfg(any(feature = "probe", feature = "profile"))]
     fn ran(&self) -> u64 {
         sys::thread_ran(self.own).unwrap_or(0)
     }
@@ -1326,13 +1266,6 @@ impl Driver<'_> {
     /// deadline or the sweep of the streams that close, never in the past.
     fn arm(&mut self, now: u64) {
         let sweep = (self.net.orphans_wait() || self.net.rst_waiting()).then(|| now + SWEEP_NS);
-        #[cfg(feature = "profile")]
-        let report = {
-            self.profile_report();
-            Some(self.profile.at)
-        };
-        #[cfg(not(feature = "profile"))]
-        let report = None;
         let at = [
             self.stack.next_deadline(),
             self.stack.ping.as_ref().map(|p| p.deadline_ns),
@@ -1341,7 +1274,6 @@ impl Driver<'_> {
             Some(self.neighbours_at),
             self.ask_at,
             self.second.as_deref().and_then(|s| s.next_at),
-            report,
         ]
         .into_iter()
         .flatten()
@@ -1372,6 +1304,10 @@ impl Driver<'_> {
         }
         #[cfg(feature = "probe")]
         self.report_frames();
+        // The probe image with the profile prints the totals here, so that
+        // a boot of it checks that the records come whole.
+        #[cfg(all(feature = "probe", feature = "profile"))]
+        self.profile_snapshot();
         let (lease, mac) = if device == 0 {
             (self.stack.lease, self.mac)
         } else {
@@ -1525,9 +1461,6 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 
 /// How long after a step the streams that close are looked at again.
 const SWEEP_NS: u64 = 1_000_000_000;
-/// The period of the profile's lines.
-#[cfg(feature = "profile")]
-const PROFILE_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
 /// `probe`.
@@ -1574,6 +1507,10 @@ impl Service<0> for Driver<'_> {
         };
         self.after_request();
         profile::call(method, began);
+        #[cfg(feature = "profile")]
+        if core::mem::take(&mut self.net.profile_due) {
+            self.profile_snapshot();
+        }
         answer
     }
 
@@ -1631,7 +1568,9 @@ impl Service<0> for Driver<'_> {
             }
             Source::Interrupt => {
                 profile::count(Counter::Irq);
-                self.rx_step(true)
+                let began = profile::now();
+                self.rx_step(true);
+                profile::add(Counter::StepRxTicks, profile::now().saturating_sub(began));
             }
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
@@ -1648,6 +1587,7 @@ impl Service<0> for Driver<'_> {
                     self.told &= !rest;
                     self.cleanup_due |= rest & CLEANUP != 0;
                 }
+                let began = profile::now();
                 match bit {
                     RX => {
                         #[cfg(feature = "probe")]
@@ -1697,12 +1637,17 @@ impl Service<0> for Driver<'_> {
                         }
                     }
                 }
+                let kind = match bit {
+                    RX => Counter::StepRxTicks,
+                    TX => Counter::StepTxTicks,
+                    _ => Counter::StepOtherTicks,
+                };
+                profile::add(kind, profile::now().saturating_sub(began));
                 self.after_request();
             }
             Source::Timer if n.label == TIMER_LABEL => {
                 profile::count(Counter::StepTimer);
                 self.armed = None;
-                self.profile_report();
                 let now = now_ns();
                 self.net.expire(now);
                 if self
@@ -1712,7 +1657,9 @@ impl Service<0> for Driver<'_> {
                 {
                     self.tell(RX1);
                 }
+                let began = profile::now();
                 self.tx_step(true);
+                profile::add(Counter::StepTxTicks, profile::now().saturating_sub(began));
                 self.after_request();
             }
             _ => {}

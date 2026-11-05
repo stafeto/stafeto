@@ -205,7 +205,9 @@ impl<const D: usize> TxRing<D> {
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer_at::<D>(n) };
         let frame = &mut slice[HDR_LEN..HDR_LEN + len];
+        let began = profile::now();
         frames::fill_sums(frame);
+        profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
         profile::add(Counter::SumN, 1);
         profile::add(Counter::SumBytes, len as u64);
         let dhcp = is_dhcp_client_frame(frame);
@@ -397,7 +399,10 @@ impl<const D: usize> NetDevice<D> {
             }
             profile::add(Counter::SumN, 1);
             profile::add(Counter::SumBytes, length as u64);
-            if !frames::verify_sums(frame) {
+            let began = profile::now();
+            let sums_hold = frames::verify_sums(frame);
+            profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
+            if !sums_hold {
                 self.bad_sum += 1;
                 self.rx.give(buffer);
                 continue;
