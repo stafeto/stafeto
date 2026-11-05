@@ -175,3 +175,7 @@ pub fn read_image(
 pub fn in_image(images: &[Option<Entry>], name: &[u8]) -> bool {
     images.iter().flatten().any(|e| e.name() == name)
 }
+
+/// The most packages of the boot image the service lists: the full image has 21, and the
+/// service said `too many packages, skipped` to the five after the sixteenth.
+pub const IMAGE_MAX: usize = 32;

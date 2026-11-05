@@ -68,10 +68,12 @@ pub const ENTRY_REVOKED: u32 = 8;
 pub const BEGIN_WORLD: u32 = 1;
 /// Bit 0 of the flags of INSTALL_COMMIT: the last package of the group.
 pub const COMMIT_END: u32 = 1;
-/// Flags of STATUS: the store is damaged, read-only, or still being read.
+/// Flags of STATUS: the store is damaged, read-only, or still being read, or not served at
+/// all (`STATUS_NO_STORE`: its start failed or the disk stopped answering; a change is `IO`).
 pub const STATUS_DAMAGED: u32 = 1;
 pub const STATUS_READ_ONLY: u32 = 2;
 pub const STATUS_STARTING: u32 = 4;
+pub const STATUS_NO_STORE: u32 = 8;
 
 /// The codes of the service (`Status::Unknown`), clear of the codes of the
 /// wire (below 512) and of proto_blk's (1101 to 1108).

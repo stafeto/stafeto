@@ -97,10 +97,12 @@ pub fn command(args: &[String]) -> Result<(), String> {
         None => disk()
             .and_then(|()| empty())
             .and_then(|()| full(false))
-            .and_then(|()| deaf()),
+            .and_then(|()| deaf())
+            .and_then(|()| no_store()),
         Some("steps") => steps(),
         Some("full") => full(false),
         Some("deaf") => deaf(),
+        Some("no-store") => no_store(),
         Some("full-steps") => full(true),
         Some("doom") => match args.get(1).map(String::as_str) {
             None => doom(&qemu::VIRT),
@@ -1069,6 +1071,49 @@ fn deaf() -> Result<(), String> {
         .ok_or("the probe did not say how the disk's silence ended")?;
     println!(
         "store-probe deaf: {}",
+        said.trim_start_matches("store-probe: ")
+    );
+    Ok(())
+}
+
+/// The disk service deaf from its first read: the start of the package service fails on the
+/// disk, and the service still says READY, shows the failure in STATUS and refuses a change.
+fn no_store() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let world = make_world(&hello_elf()?, false, "no-store")?;
+    let mut list = PROGRAMS.to_vec();
+    for program in &mut list {
+        match program.0 {
+            "virtio-blk" => program.3 = &["deaf-start"],
+            "pkgd" => program.3 = &["short-deadline"],
+            _ => {}
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
+    let image = image_with(
+        "boot-store-no-store.img",
+        programs,
+        world.files.clone(),
+        None,
+    )?;
+    let file = Disk::new("no-store");
+    write_disk(&file, None)?;
+    let lines = run(&image, &file.0, false)?;
+    expect(
+        &lines,
+        &[
+            "pkgd: the disk service did not answer in time".to_string(),
+            "store-probe: ok".to_string(),
+        ],
+    )?;
+    let said = lines
+        .iter()
+        .find(|l| l.starts_with("store-probe: the start failed on the disk"))
+        .ok_or("the probe did not say how the failed start ended")?;
+    println!(
+        "store-probe no-store: {}",
         said.trim_start_matches("store-probe: ")
     );
     Ok(())

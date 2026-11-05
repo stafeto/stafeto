@@ -23,8 +23,11 @@
 //! the line says so. A service that ended (PEER_CLOSED) closes the
 //! process's session, so that no later fork asks again.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rt::handle::{Channel, Handle};
+
+/// A refusal of a CLONE was said already.
+static REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// The session with the package service, 0 for none.
 static SESSION: AtomicU64 = AtomicU64::new(0);
@@ -67,7 +70,7 @@ pub fn probe_swap_session(raw: u64) -> u64 {
 /// A clone of the process's session for a child (proto_pkg CLONE), when it
 /// has one. A refusal fails no fork or spawn: the child gets no session. A
 /// service that ended (PEER_CLOSED) closes the process's session; another
-/// refusal (the service at its limit of sessions) writes a line.
+/// refusal (the service at its limit of sessions) writes a line, once for the process.
 pub(crate) fn clone_session() -> Option<Handle<Channel>> {
     let packages = session()?;
     match rt::service::clone_session(
@@ -83,9 +86,12 @@ pub(crate) fn clone_session() -> Option<Handle<Channel>> {
             None
         }
         Err(status) => {
-            rt::println!(
-                "posix: the package service refused a session for a child ({status:?}); the child has none"
-            );
+            // One line for the process, not one for each fork of a busy system.
+            if !REFUSED.swap(true, Ordering::Relaxed) {
+                rt::println!(
+                    "posix: the package service refused a session for a child ({status:?}); the child has none"
+                );
+            }
             None
         }
     }

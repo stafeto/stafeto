@@ -31,9 +31,7 @@ impl<T> Shared<T> {
     }
 }
 
-/// The most packages of the boot image the service lists: the full image has 21, and the
-/// service said `too many packages, skipped` to the five after the sixteenth.
-pub const IMAGE_MAX: usize = 32;
+pub use pkgd::packages::IMAGE_MAX;
 /// The most bytes of the revocation list file: the text and its block.
 pub const REVOKED_FILE_MAX: usize = 16 * 1024 + 456;
 
@@ -87,6 +85,9 @@ pub static PUBLISHED: [AtomicBool; PACKAGES] = [const { AtomicBool::new(false) }
 pub static STARTING: AtomicBool = AtomicBool::new(true);
 /// The counter when the process began, for the line of the time its start took.
 pub static BEGAN: AtomicU64 = AtomicU64::new(0);
+/// The store is not served: the start of the worker failed, or the disk service stopped
+/// answering. A change is refused with IO at its gate, and STATUS says so.
+pub static NO_STORE: AtomicBool = AtomicBool::new(false);
 pub static DAMAGED: AtomicBool = AtomicBool::new(false);
 pub static READ_ONLY: AtomicBool = AtomicBool::new(false);
 pub static GENERATION: AtomicU64 = AtomicU64::new(0);

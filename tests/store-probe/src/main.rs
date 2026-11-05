@@ -937,6 +937,8 @@ fn scenario(mode: &[u8]) -> Result<(), Fail> {
         }
         // The disk service stops answering at the first write of data (xtask store-probe deaf).
         b"deaf" => deaf(&pkgd, &index),
+        // The disk is deaf from the first read: the start of the service fails (xtask store-probe no-store).
+        b"no-store" => no_store(&pkgd, &index),
         // The store as a restart finds it: what the service lists, its numbers, its tree.
         b"verify" => verify(&pkgd),
         // A format that crashed: the service never finishes its start before the host kills the machine.
@@ -964,6 +966,9 @@ fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
     if !snap(pkgd)?.same(&was) {
         return Err("the store changed");
     }
+    if pkgd.status().map_err(|_| "STATUS")?.flags & pkg::STATUS_NO_STORE == 0 {
+        return Err("STATUS does not say the store is not served");
+    }
     let hello = index.get(b"hello")?;
     let from = rt::time::now();
     if !is(
@@ -984,6 +989,32 @@ fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
     say!(
         "the disk stopped answering: INSTALL is IO after {first} ms, the store is as it was and free, the next one is IO after {second} ms"
     );
+    Ok(())
+}
+
+/// The disk service deaf from its first read (built with `deaf-start`, the package service with
+/// `short-deadline`): the start of the service fails, it says READY all the same, STATUS says the
+/// store is not served and a change is refused IO at once, where it used to be taken and never
+/// answered.
+fn no_store(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
+    begin(pkgd)?;
+    if pkgd.status().map_err(|_| "STATUS")?.flags & pkg::STATUS_NO_STORE == 0 {
+        return Err("STATUS does not say the store is not served");
+    }
+    let hello = index.get(b"hello")?;
+    let from = rt::time::now();
+    if !is(
+        pkgd.install(hello, &Install::new(b"stafeto", false)),
+        pkg::IO,
+    ) {
+        return Err("the installation without a store is not IO");
+    }
+    let took = since_ms(from);
+    if took >= 2_000 {
+        say!("the installation took {took} ms");
+        return Err("the installation without a store did not end at once");
+    }
+    say!("the start failed on the disk: STATUS says no store, INSTALL is IO after {took} ms");
     Ok(())
 }
 

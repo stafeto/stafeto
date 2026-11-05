@@ -49,8 +49,18 @@ static LAST_WORK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// Where the service maps the boot image.
 const IMAGE_AT: usize = 0x50_0000_0000;
 /// The sessions the loop keeps, and the clones of them at most.
-const SESSIONS: usize = 128;
-const CLONES: usize = 64;
+/// A session for each of the 255 records of the process service, one more for each fork in
+/// flight and the services beside it: the number the neighbours (`clock`, `entropy`, `pipe`,
+/// `tty`) are sized to, since every process of the shell has a session here. A session holds
+/// no handle of the service's own (the quota of 16,896 pages pays for its slot), so the
+/// record's 512 handles hold the buffers, the layers and the objects of 64 packages with room
+/// over.
+const SESSIONS: usize = 320;
+const _: () = assert!(
+    SESSIONS >= 255 + 64 && CLONES >= 255,
+    "a session for each process and its clone"
+);
+const CLONES: usize = 320;
 /// The long operations at once: one change of the store at a time.
 const OPERATIONS: usize = 4;
 const OWN: u64 = 1 << 63;
@@ -367,6 +377,7 @@ impl Pkgd {
             (DAMAGED.load(Acquire), STATUS_DAMAGED),
             (READ_ONLY.load(Acquire), STATUS_READ_ONLY),
             (STARTING.load(Acquire), STATUS_STARTING),
+            (NO_STORE.load(Acquire), proto_pkg::STATUS_NO_STORE),
         ] {
             if on {
                 flags |= bit;
@@ -510,6 +521,9 @@ impl Pkgd {
         }
         if STARTING.load(Acquire) {
             return Err(refuse(proto_pkg::BUSY));
+        }
+        if NO_STORE.load(Acquire) {
+            return Err(refuse(proto_pkg::IO));
         }
         if DAMAGED.load(Acquire) {
             return Err(refuse(proto_pkg::DAMAGED));

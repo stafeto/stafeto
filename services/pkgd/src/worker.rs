@@ -95,6 +95,7 @@ extern "C" fn work(_: u64) -> ! {
         Ok(worker) => Some(worker),
         Err(why) => {
             rt::println!("pkgd: the start failed: {why}");
+            NO_STORE.store(true, Release);
             None
         }
     };
@@ -210,6 +211,7 @@ impl Disk {
                         ..
                     } if rt::time::reached(until) => {
                         self.dead.store(true, Release);
+                        NO_STORE.store(true, Release);
                         rt::println!("pkgd: the disk service did not answer in time");
                         return Err(Status::Kernel(abi::Error::WouldBlock));
                     }

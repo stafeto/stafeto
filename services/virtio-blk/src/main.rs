@@ -809,8 +809,13 @@ impl Service<0> for Driver {
 fn deaf(kind: Kind, count: u32) -> bool {
     static DEAF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     use core::sync::atomic::Ordering::Relaxed;
-    if kind == Kind::Write && count >= 32 && !DEAF.swap(true, Relaxed) {
-        rt::println!("virtio-blk: deaf from the write of {count} sectors");
+    let trip = if cfg!(feature = "deaf-start") {
+        kind == Kind::Read
+    } else {
+        kind == Kind::Write && count >= 32
+    };
+    if trip && !DEAF.swap(true, Relaxed) {
+        rt::println!("virtio-blk: deaf from the request of {count} sectors");
     }
     DEAF.load(Relaxed)
 }

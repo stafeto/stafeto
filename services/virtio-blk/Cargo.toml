@@ -26,6 +26,9 @@ crash = []
 # on: the request stays with the driver, and no TAKE is ever READY or notified (the probe of the
 # package service's deadline on the disk, xtask store-probe deaf).
 deaf = []
+# `deaf-start`: with `deaf`, the driver stops answering at the first read, so the start of the
+# package service fails on the disk (xtask store-probe no-store).
+deaf-start = ["deaf"]
 steps = ["rt/step-stats"]
 
 [dependencies]
