@@ -1,0 +1,19 @@
+[package]
+name = "runas"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "A probe program: runas <uid> <path> [arguments] gives up the superuser and runs the program, for the probes of what a process that is not the superuser may do"
+
+[[bin]]
+name = "runas"
+test = false
+bench = false
+
+[dependencies]
+libc-ffi = { path = "../libc-ffi" }
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt" }
+rt = { path = "../../lib/rt" }

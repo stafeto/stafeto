@@ -491,7 +491,7 @@ only an image whose table has the record `blk` uses it.
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches
 them to the RAM file service as layers; `proto/pkg` (MIT) is its protocol. The service starts from
 the disk, receives packages, and changes the store with the methods INSTALL_BEGIN, FEED,
-INSTALL_COMMIT, INSTALL_CANCEL, REMOVE, SETTINGS_SET, SERIAL_SET and REVOKED_SET.
+INSTALL_COMMIT, INSTALL_CANCEL, REMOVE, SETTINGS_SET, SERIAL_SET, REVOKED_SET and WORLD_SET.
 
 **Two threads.** The main thread (level 32) is the loop of a service and answers its clients in
 steps of a few thousand ticks: the reads (LIST, INFO, SETTINGS_GET, SERIAL, STATUS), CLONE and
@@ -566,7 +566,11 @@ detached ones back, and the old state is still the store's, with nothing to writ
 superblock goes into the copy that holds the lower generation and is flushed (F3); a failed write
 of it takes the layers back and answers `IO`. A removal and a list of revocations write the
 superblock before they detach, since the bytes of the packages are in memory and the disk no
-longer matters to them. A serial changes the table alone. `SERIAL_SET` below the held number is
+longer matters to them. A serial and the flag "world" change the table alone. `WORLD_SET` (17,
+UID 0) says whether a package of the disk is in the world or only a dependency, so a package that
+stands as a dependency and is then asked for need not be received again; it answers `NOT_FOUND`
+for an unknown name and `IN_IMAGE` for a package of the image, and changes nothing when the flag
+is the one the package has. `SERIAL_SET` below the held number is
 `ROLLBACK`, equal changes nothing; a list of revocations below the held serial is `ROLLBACK`, one
 without a root's signature `BAD_SIGNATURE`; REMOVE answers `IN_IMAGE`, `NOT_FOUND` or
 `NEEDED_BY`; SETTINGS_SET answers `INVALID` for a blob that breaks the rules (`proto/pkg`, the
@@ -668,8 +672,9 @@ prints. Output goes to descriptor 1 and the lines of refusals (`pkg: <name>: <re
 descriptor 2, so `pkg list | wc -l` and redirections work. Exit codes: 0 for success (also when
 there is nothing to do), 1 for a refused operation, 2 for a command line that is not one.
 
-Commands of this part: `pkg install <name>...`, `update`, `list [--all]`, `info <name>`,
-`search <word>` and `check`. `install` and `update` need the superuser: `pkg` checks it before
+Commands: `pkg install <name>...`, `remove <name>...`, `upgrade [<name>...]`, `update`,
+`list [--all]`, `info <name>`, `search <word>`, `repo add|remove|list|save` and `check`. `install`,
+`remove`, `upgrade`, `update` and the `repo` commands that change the settings need the superuser: `pkg` checks it before
 the first download, so a process that is not the superuser downloads nothing, and the service
 checks it again for every request that changes the store.
 
@@ -695,9 +700,11 @@ after a restart. The accepted index and signature are kept in `/var/cache/pkg/<n
 
 Refused repositories. When any repository is refused (signature, header, term, clock, serial or network), `install` prints the line of the refusal and ends with 1 without deciding any name, so a damaged answer of one repository cannot put the package of another in its place; `update` does the same for the rest, and `list --all`, `info` and `search` work over the good repositories and end with 1. The version field of INSTALL_BEGIN is the `version` of the package's `meta`, with no release: the SHA-256 of the index ties the bytes to the record.
 
-Names. A name is closed by an installed package of that name or that provides it, else it is the
-first repository's package of that name, else the one package that provides it (several are an
-error that names them). The packages to receive are the requested one and the dependencies that
+Names. A name is closed by an installed package of that name or that provides it. Else the
+repositories are asked in their order, the official one first: the first that closes the name decides
+it, by a package of that name or else by the one package that provides it (several are an error
+that names them), and the same holds for the dependencies. So a repository of the owner cannot
+take a name the official one gives. The packages to receive are the requested one and the dependencies that
 are not installed, dependencies first, at most four: they are one group of the service, all
 installed or none. There are no versions in a series, so a package that is installed with another
 SHA-256 than the index has stays as it is.
@@ -714,6 +721,57 @@ waited for on every path. The words for the ends of curl are in `fetch::meaning`
 that is not trusted names the clock, since a wrong clock fails a certificate before it fails an
 index. A session that ends (the process, or `SIGKILL`) makes the service drop the open group, so
 an installation that is cut short leaves nothing half done.
+
+Removing. `pkg remove <name>...` takes the named packages and every package of the disk that the
+world which stays no longer needs. The world is the packages not marked as dependencies, less the
+named ones, and what it needs is the closure of the `depends` of its packages (a name is closed by
+a package of that name or that provides it). A named package that the world which stays needs is
+refused with the name of the package that needs it (`pkg: freedoom: needed by doomgeneric`), and
+nothing changes. A package of the image is `part of the image`. The packages go in as few REMOVE
+requests as the service takes (eight names), the ones that need others first, so that every
+state between two requests is one the service accepts. The line is
+`removed doomgeneric e257a095-1, freedoom 0.13.0-1 (no longer needed)`.
+
+The world. A package asked for is marked as of the world, one that came for another package as a
+dependency. `pkg install freedoom` while `freedoom` stands as a dependency marks it with WORLD_SET
+and downloads nothing (`freedoom 0.13.0-1: now installed by request`); a later `pkg remove doom`
+leaves it.
+
+Upgrading. `pkg upgrade [<name>...]` refreshes the indexes, then for each package of the disk (or
+the named ones) looks for the record of the repository it was installed from. A record with another
+SHA-256 replaces the package, with the world flag the old one had, in one group with the new
+dependencies it needs; the same SHA-256 changes nothing and downloads nothing; a package its
+repository's index no longer has is kept with a line; a package of the image is never touched. A
+package flagged as revoked is replaced by another build and refused when there is none. After the
+replacements the dependencies nothing needs any more are removed. A refused repository refuses the
+whole command, as for `install`. Without anything to do it prints `nothing to upgrade`.
+
+Repositories of the owner. `pkg repo add <name> <https address> <key file>` (superuser) trusts the
+key in the file, which the owner got by a channel of his own, for the repository `<name>` alone, and
+prints `games: key games-2026 SHA256:<fingerprint>, trusted for games only` so that he can compare
+the fingerprint with the publisher's. The key is never taken from the repository. The name is
+1 to 31 characters of `a-z`, `0-9` and `-`, is not `stafeto`, and there are fifteen at most. `pkg repo
+remove <name>` takes the line and the key away. Both are refused while a package installed from that
+repository stands (`pkg: games: hello-games is installed from it; pkg remove it first`): after a
+restart the service would check that package by the new key or by none and skip it. `pkg repo save`
+holds the same rule for the files, and so does the service for any client: a SETTINGS_SET whose blob
+drops the line of such a repository, disables it or changes its key is refused (`NEEDED_BY`). The
+fingerprint is `SHA256:` and the base64 of the SHA-256 of the 32 bytes of the key, without the `=`.
+It has the shape of an OpenSSH fingerprint but is the hash of the raw key, so `ssh-keygen -lf`
+gives another number; a publisher computes it from the DER of the public key with
+`openssl pkey -pubin -outform DER < key.pem | tail -c 32 | openssl dgst -sha256 -binary | base64`.
+`pkg repo list`
+shows the repositories with the fingerprints. All of it is one SETTINGS_SET of the blob the service
+holds, built by `pkg::settings` by the rules of the service, so what is sent is accepted.
+`/etc/pkg/repositories` and `/etc/pkg/keys/*.pub` are the settings layer, read-only; an edit lands in
+a copy in memory until the next boot. Every command but `repo save` compares those files with the
+saved blob and prints `pkg: /etc/pkg differs from the saved settings; pkg repo save keeps it, a
+reboot drops it` when they differ; `pkg repo save` checks the files by the same rules (a refusal
+names the line) and saves them, and `pkg check` ends with 1 while they differ.
+
+A long operation of the service is asked with TAKE until it is ready, the pause growing from 2 ms
+to 64 ms. The accepted `revoked` and its signature are kept beside the index, and the cache is
+checked again with that list.
 
 `pkg install doom` on the base image with an empty disk prints
 
@@ -734,8 +792,19 @@ mirror as its official repository and the development root as the trust, and wal
 the log of the mirror (one line a response) shows. The port 8443 of the host is the one in the
 image, so a probe that finds it taken stops with a line that names it.
 
+`cargo xtask pkg-probe install` is those steps; `cargo xtask pkg-probe` goes on, on three boots
+of the machine with the same disk, through the states of the mirror (`xtask/src/pkg_states.rs`):
+a non-superuser (`/test/runas 1000 /bin/pkg install hello`, which is refused before the network
+is asked), a file with one byte changed and a file longer than its record, an older serial and an
+index past its term, a package signed by a key nobody trusts, `app` with its dependency `lib`
+(WORLD_SET, the removal that names what needs a package), a second mirror on port 8444 whose
+certificate is signed by itself, the repository `games` with its own key (a package of the
+official key in it is refused), `pkg upgrade` to `hello` 2.0 without a download of Doom, an index
+of the official repository signed by the key of `games`, then the restart with the settings and the
+packages in place, `pkg remove doom` (both packages and their notices gone), and a last boot that
+has only `hello` and the image. After each refusal `pkg check` and `pkg list` say the same as before.
+
 ## What stays for subproject 5
 
-`pkg remove` and `upgrade`, the owner's repositories by `pkg repo`, the release of the official
-repository, and the sandbox and quotas of an application. Nothing here changes the quotas of the
+The release of the official repository, and the sandbox and quotas of an application. Nothing here changes the quotas of the
 image.

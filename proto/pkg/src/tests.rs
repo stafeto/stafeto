@@ -13,14 +13,14 @@ fn bytes(write: impl FnOnce(&mut Writer) -> Result<(), Status>) -> Vec<u8> {
 fn method_numbers_are_fixed() {
     assert_eq!(
         Method::ALL.map(Method::number),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
     for m in Method::ALL {
         assert_eq!(Method::from_number(m.number()), Some(m));
         assert_eq!(m.header(), Header::new(m.number(), VERSION));
     }
     assert_eq!(Method::from_number(0), None);
-    assert_eq!(Method::from_number(17), None);
+    assert_eq!(Method::from_number(18), None);
 }
 
 #[test]
@@ -205,6 +205,19 @@ fn remove_serial_take_and_word_round_trip() {
         Ok((&b"games"[..], 77))
     );
     assert!(read_serial(Reader::new(&wire[8..]), false).is_err());
+    let wire = bytes(|w| write_world(b"lib", true, w));
+    assert_eq!(wire[0], 17);
+    assert_eq!(read_world(Reader::new(&wire[8..])), Ok((&b"lib"[..], true)));
+    let wire = bytes(|w| write_world(b"lib", false, w));
+    assert_eq!(
+        read_world(Reader::new(&wire[8..])),
+        Ok((&b"lib"[..], false))
+    );
+    assert!(read_world(Reader::new(&wire[8..wire.len() - 1])).is_err());
+    let mut wire = wire;
+    let last = wire.len() - 4;
+    wire[last] = 2;
+    assert_eq!(read_world(Reader::new(&wire[8..])), Err(Status::BadSize));
     let wire = bytes(|w| write_take(9, w));
     assert_eq!(read_take(Reader::new(&wire[8..])), Ok(9));
     assert_eq!(write_take(0, &mut Writer::new()), Err(Status::BadSize));

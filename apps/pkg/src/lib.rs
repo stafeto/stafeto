@@ -18,6 +18,7 @@ pub mod faults;
 pub mod fetch;
 pub mod output;
 pub mod resolve;
+pub mod settings;
 pub mod verify;
 
 /// The series of the system and the roots of trust the build baked in.
@@ -30,6 +31,9 @@ pub mod baked {
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_REFUSED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
+
+pub const USAGE_REPO: &str =
+    "usage: pkg repo add <name> <https address> <key file> | remove <name> | list | save";
 
 pub const USAGE: &str = "usage: pkg install|remove|upgrade|update|list|info|search|repo|check ...";
 

@@ -29,7 +29,7 @@ use pkgd::store::{self, PACKAGES};
 use proto_pkg::{
     BEGIN_WORLD, BUFFER_SIZE, CELL_BYTES, COMMIT_END, Feed, INFO_MAX, LIST_MAX, Method,
     STATUS_DAMAGED, STATUS_READ_ONLY, STATUS_STARTING, Stat, VERSION, code, read_begin,
-    read_commit, read_info, read_remove, read_serial, read_take, read_word,
+    read_commit, read_info, read_remove, read_serial, read_take, read_word, read_world,
 };
 use proto_wire::clones::Clones;
 use proto_wire::{Status, long};
@@ -744,6 +744,22 @@ impl Pkgd {
         })
     }
 
+    fn world_set(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
+        let (name, world) = match read_world(r.body()) {
+            Ok(got) => got,
+            Err(status) => return answer(status),
+        };
+        let Some(field) = store::to_field(name) else {
+            return refuse(proto_pkg::INVALID);
+        };
+        self.change(s, r, |job| {
+            job.kind = JobKind::WorldSet;
+            job.name = field;
+            job.world = world;
+            Ok(())
+        })
+    }
+
     /// SETTINGS_SET and REVOKED_SET: the blob or the list is `len` bytes in the buffer.
     fn blob_set(
         &mut self,
@@ -936,6 +952,7 @@ const METHODS: &[u16] = &[
     Method::Take.number(),
     Method::Buffer.number(),
     Method::Status.number(),
+    Method::WorldSet.number(),
 ];
 
 impl Service<0> for Pkgd {
@@ -961,6 +978,7 @@ impl Service<0> for Pkgd {
             Some(Method::Take) => self.take(s, r),
             Some(Method::Buffer) => self.give_buffer(s, r),
             Some(Method::Status) => self.status(r),
+            Some(Method::WorldSet) => self.world_set(s, r),
             None => Answer::Status(Status::UnknownMethod),
         }
     }

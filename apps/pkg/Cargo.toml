@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "The package tool of stafeto: install, update, list, info, search and check, over the package service and curl"
+description = "The package tool of stafeto: install, remove, upgrade, update, list, info, search, repo and check, over the package service and curl"
 build = "build.rs"
 
 # What the tool decides, apart from the calls it makes: tested on the host.
@@ -33,3 +33,5 @@ rt = { path = "../../lib/rt" }
 [dev-dependencies]
 pkgfmt = { path = "../../lib/pkgfmt", features = ["write"] }
 proto-pkg = { path = "../../proto/pkg", features = ["alloc"] }
+# The rules of the settings the service applies: the blobs this tool makes must pass them.
+pkgd = { path = "../../services/pkgd", features = ["host"] }

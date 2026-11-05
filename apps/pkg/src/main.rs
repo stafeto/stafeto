@@ -30,6 +30,7 @@ use pkg::faults::{self, Detail};
 use pkg::fetch::{self, Verdict};
 use pkg::output::{self, Available, Installed};
 use pkg::resolve::{self, Candidate, Outcome};
+use pkg::settings::{self, Settings};
 use pkg::verify::{self, Serial, stamp};
 use pkg::{EXIT_OK, EXIT_REFUSED, EXIT_USAGE, USAGE, baked};
 use pkgfmt::index::Index;
@@ -75,11 +76,19 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
         }
         "info" if rest.len() == 1 => with_tool(env, |t| t.info(&rest[0])),
         "search" if rest.len() == 1 => with_tool(env, |t| t.search(&rest[0])),
-        "check" if rest.is_empty() => with_tool(env, |t| t.check()),
-        "remove" | "upgrade" | "repo" => {
-            sys::err(&format!("pkg: {command}: not in this release"));
-            return EXIT_REFUSED;
-        }
+        "check" if rest.is_empty() => with_tool_raw(env, |t| t.check()),
+        "remove" if !rest.is_empty() => with_tool(env, |t| t.remove(rest)),
+        "upgrade" => with_tool(env, |t| t.upgrade(rest)),
+        "repo" => match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            ["add", name, address, key] => with_tool(env, |t| t.repo_add(name, address, key)),
+            ["remove", name] => with_tool(env, |t| t.repo_remove(name)),
+            ["list"] => with_tool(env, |t| t.repo_list()),
+            ["save"] => with_tool_raw(env, |t| t.repo_save()),
+            _ => {
+                sys::err(pkg::USAGE_REPO);
+                return EXIT_USAGE;
+            }
+        },
         _ => {
             sys::err(USAGE);
             return EXIT_USAGE;
@@ -108,7 +117,21 @@ fn service(status: Status, subject: &str, d: &Detail<'_>) -> Line {
     }
 }
 
+/// `f` over a tool, after the check that `/etc/pkg` is what was saved (a line to the standard
+/// error when it is not; the exit code does not change).
 fn with_tool(
+    env: &[(String, String)],
+    f: impl FnOnce(&mut Tool) -> Result<i32, Line>,
+) -> Result<i32, Line> {
+    with_tool_raw(env, |t| {
+        if t.etc_differs() == Some(true) {
+            sys::err(settings::DIFFERS_LINE);
+        }
+        f(t)
+    })
+}
+
+fn with_tool_raw(
     env: &[(String, String)],
     f: impl FnOnce(&mut Tool) -> Result<i32, Line>,
 ) -> Result<i32, Line> {
@@ -232,6 +255,8 @@ impl Tool {
             }
             Err(s) => return Err(service(s, &r.name, &Detail::default())),
         }
+        // The accepted list stays beside the index, so the cache is checked with it again.
+        self.cache(r, &[("revoked", &list), ("revoked.sig", &block)]);
         if !quiet {
             sys::out(&format!(
                 "{}: revocation list {} accepted",
@@ -344,14 +369,21 @@ impl Tool {
                 Err(s) => return Err(service(s, &r.name, &Detail::default())),
             },
         }
+        // The signature first and the index last: a reader that meets the new index has its signature.
+        self.cache(r, &[("INDEX.sig", &sig), ("INDEX", &data)]);
+        Ok((data, accepted, held))
+    }
+
+    /// The files of the cache of a repository, each made whole (written beside and renamed); a
+    /// failure is told and the old file stays.
+    fn cache(&self, r: &Repository, files: &[(&str, &Vec<u8>)]) {
         let dir = format!("{CACHE}/{}", r.name);
         sys::make_directories(&dir);
-        for (file, bytes) in [("INDEX", &data), ("INDEX.sig", &sig)] {
-            if !sys::write_file(&format!("{dir}/{file}"), bytes) {
+        for (file, bytes) in files {
+            if !sys::replace_file(&format!("{dir}/{file}"), bytes) {
                 sys::err(&format!("pkg: {dir}/{file}: cannot write the cache"));
             }
         }
-        Ok((data, accepted, held))
     }
 
     /// Every repository in its order: the ones that pass, and the refusals printed.
@@ -388,8 +420,10 @@ impl Tool {
         Ok(pkg::exit_of_reading(refused))
     }
 
-    /// The installed packages with the `provides` and `depends` of their `meta`.
-    fn installed(&self) -> Result<Vec<Installed>, Line> {
+    /// The installed packages with the `provides` and `depends` of their `meta`. With `strict` a
+    /// package whose `meta` the service does not give is a refusal: a plan of removal made over an
+    /// incomplete graph would call a dependency of that package unneeded.
+    fn installed(&self, strict: bool) -> Result<Vec<Installed>, Line> {
         self.client
             .status()
             .map_err(|s| service(s, "the store", &Detail::default()))?;
@@ -399,6 +433,12 @@ impl Tool {
             .map_err(|s| service(s, "the store", &Detail::default()))?;
         for i in &mut list {
             let Ok(text) = self.client.meta(&i.name) else {
+                if strict && !i.in_image() {
+                    return Err(format!(
+                        "pkg: {}: the service did not give its meta",
+                        i.name
+                    ));
+                }
                 continue;
             };
             if let Ok(meta) = pkgfmt::meta::Meta::parse(&text) {
@@ -416,7 +456,7 @@ impl Tool {
 
     fn install(&mut self, names: &[String]) -> Result<i32, Line> {
         self.require_root()?;
-        let installed_before = self.installed()?;
+        let installed_before = self.installed(false)?;
         let (fresh, refused) = self.refresh_all(false)?;
         // A refused repository refuses the whole command: no name is decided among the others.
         if !pkg::may_change_the_store(refused) {
@@ -427,7 +467,7 @@ impl Tool {
         let mut failed = false;
         for name in names {
             match self.install_one(name, &pool, &installed, &fresh) {
-                Ok(()) => installed = self.installed()?,
+                Ok(()) => installed = self.installed(false)?,
                 Err(line) => {
                     sys::err(&line);
                     failed = true;
@@ -460,9 +500,10 @@ impl Tool {
                 return Ok(());
             }
             Outcome::Promote { name, version } => {
-                sys::out(&format!(
-                    "{request}: {name} {version} is installed (as a dependency)"
-                ));
+                self.client
+                    .world_set(&name, true)
+                    .map_err(|s| service(s, &name, &Detail::default()))?;
+                sys::out(&format!("{name} {version}: now installed by request"));
                 return Ok(());
             }
             Outcome::Install { items, notes } => (items, notes),
@@ -493,7 +534,7 @@ impl Tool {
                 .find(|f| f.repository.name == c.repository)
                 .map(|f| &f.repository)
                 .ok_or_else(|| format!("pkg: {}: no such repository", c.repository))?;
-            if let Err(line) = self.receive(c, repo, step, &mut last) {
+            if let Err(line) = self.receive(c, repo, step, None, &mut last) {
                 if let Some(receipt) = last {
                     self.client.cancel(receipt);
                 }
@@ -515,6 +556,7 @@ impl Tool {
         c: &Candidate,
         repo: &Repository,
         step: resolve::Step,
+        head: Option<String>,
         last: &mut Option<u32>,
     ) -> Result<(), Line> {
         let url = config::locate(&repo.address, &c.file).map_err(|_| {
@@ -523,12 +565,15 @@ impl Tool {
                 c.name, c.file
             )
         })?;
-        sys::out_part(&format!(
-            "{} {}: {} ... ",
-            c.name,
-            output::short(&c.version),
-            output::megabytes(c.size)
-        ));
+        sys::out_part(&match head {
+            Some(head) => format!("{head}... "),
+            None => format!(
+                "{} {}: {} ... ",
+                c.name,
+                output::short(&c.version),
+                output::megabytes(c.size)
+            ),
+        });
         let detail = Detail {
             size: c.size,
             repository: &repo.name,
@@ -617,8 +662,244 @@ impl Tool {
         }
     }
 
+    /// `pkg remove`: the named packages and the dependencies nothing needs any more, in as few
+    /// requests as the service takes.
+    fn remove(&mut self, names: &[String]) -> Result<i32, Line> {
+        self.require_root()?;
+        let installed = self.installed(true)?;
+        let plan = resolve::remove(names, &installed).map_err(|f| f.line())?;
+        self.take_away(&plan, &installed)?;
+        Ok(EXIT_OK)
+    }
+
+    /// The packages of `plan` go, batch by batch, and the line of the removal is printed. A batch
+    /// the service refuses ends it, after the line of what went before.
+    fn take_away(&self, plan: &resolve::RemovePlan, installed: &[Installed]) -> Result<(), Line> {
+        let line = |gone: &[usize]| {
+            let shown: Vec<(&str, &str, bool)> = gone
+                .iter()
+                .map(|&i| {
+                    (
+                        installed[i].name.as_str(),
+                        installed[i].version.as_str(),
+                        !plan.named.contains(&i),
+                    )
+                })
+                .collect();
+            if !shown.is_empty() {
+                sys::out(&output::removed_line(&shown));
+            }
+        };
+        let mut went = 0;
+        for batch in plan.batches() {
+            let names: Vec<&str> = batch.iter().map(|&i| installed[i].name.as_str()).collect();
+            if let Err(s) = self.client.remove(&names) {
+                line(&plan.order[..went]);
+                return Err(service(s, names[0], &Detail::default()));
+            }
+            went += batch.len();
+        }
+        line(&plan.order);
+        Ok(())
+    }
+
+    /// `pkg upgrade`: a package whose own repository's index has another SHA-256 is replaced, with
+    /// the flag of the world it had; then the dependencies nothing needs any more go. A refused
+    /// repository refuses the whole command, as for `install`.
+    fn upgrade(&mut self, names: &[String]) -> Result<i32, Line> {
+        self.require_root()?;
+        let installed = self.installed(true)?;
+        let (fresh, refused) = self.refresh_all(false)?;
+        if !pkg::may_change_the_store(refused) {
+            return Ok(EXIT_REFUSED);
+        }
+        let pool: Vec<Candidate> = fresh.iter().flat_map(|f| f.candidates.clone()).collect();
+        let plan = resolve::upgrade(names, &pool, &installed);
+        for line in &plan.kept {
+            sys::out(line);
+        }
+        let mut failed = !plan.refused.is_empty();
+        for line in &plan.refused {
+            sys::err(line);
+        }
+        let mut done = 0;
+        for r in &plan.replacements {
+            let old = &installed[r.installed];
+            let mut last = None;
+            let mut went = Ok(());
+            for step in resolve::steps(&r.items) {
+                let c = &pool[step.candidate];
+                let head = step
+                    .end
+                    .then(|| output::upgrading(&old.name, &old.version, &c.version, c.size));
+                let Some(repo) = fresh
+                    .iter()
+                    .find(|f| f.repository.name == c.repository)
+                    .map(|f| &f.repository)
+                else {
+                    went = Err(format!("pkg: {}: no such repository", c.repository));
+                    break;
+                };
+                went = self.receive(c, repo, step, head, &mut last);
+                if went.is_err() {
+                    break;
+                }
+            }
+            match went {
+                Ok(()) => done += 1,
+                Err(line) => {
+                    if let Some(receipt) = last {
+                        self.client.cancel(receipt);
+                    }
+                    sys::err(&line);
+                    failed = true;
+                }
+            }
+        }
+        // A new record may need fewer packages than the old one did, and a command cut short after a
+        // replacement leaves its leftovers to the next one: the sweep is made every time.
+        let now = self.installed(true)?;
+        let orphans = resolve::remove(&[], &now).map_err(|f| f.line())?;
+        self.take_away(&orphans, &now)?;
+        if done == 0 && orphans.order.is_empty() && plan.kept.is_empty() && !failed {
+            sys::out("nothing to upgrade");
+        }
+        Ok(if failed { EXIT_REFUSED } else { EXIT_OK })
+    }
+
+    /// The settings the service holds, as the blob and as settings.
+    fn saved(&self) -> Result<(Vec<u8>, Settings), Line> {
+        let blob = self
+            .client
+            .settings()
+            .map_err(|s| service(s, "the settings", &Detail::default()))?;
+        let settings = Settings::from_blob(&blob).map_err(|e| e.text("/etc/pkg/repositories"))?;
+        Ok((blob, settings))
+    }
+
+    fn save(&self, settings: &Settings) -> Result<(), Line> {
+        self.client
+            .settings_set(&settings.to_blob())
+            .map_err(|s| service(s, "/etc/pkg/repositories", &Detail::default()))
+    }
+
+    /// `pkg repo add <name> <address> <key file>`: the key is the one the file holds, which the
+    /// owner brought; it is never fetched from the repository. It trusts this repository alone.
+    fn repo_add(&mut self, name: &str, address: &str, key_path: &str) -> Result<i32, Line> {
+        self.require_root()?;
+        let text = sys::read_file(key_path, 4096)
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| format!("pkg: {key_path}: cannot read it"))?;
+        let installed = self.installed(false)?;
+        let (_, mut settings) = self.saved()?;
+        let key = settings
+            .add(name, address, &text, &installed)
+            .map_err(|r| match r {
+                settings::Refusal::Key(_) => settings::Refusal::Key(key_path.into()).line(),
+                other => other.line(),
+            })?;
+        self.save(&settings)?;
+        sys::out(&settings::added_line(name, &key));
+        Ok(EXIT_OK)
+    }
+
+    /// `pkg repo remove <name>`: the line and the key go at once, unless a package of it stands.
+    fn repo_remove(&mut self, name: &str) -> Result<i32, Line> {
+        self.require_root()?;
+        let installed = self.installed(false)?;
+        let (_, mut settings) = self.saved()?;
+        settings.remove(name, &installed).map_err(|r| r.line())?;
+        self.save(&settings)?;
+        sys::out(&format!("{name}: removed"));
+        Ok(EXIT_OK)
+    }
+
+    /// `pkg repo list`: the official repository, then the owner's with the fingerprints.
+    fn repo_list(&mut self) -> Result<i32, Line> {
+        let text = sys::read_file(OFFICIAL_FILE, 4096)
+            .and_then(|b| String::from_utf8(b).ok())
+            .ok_or_else(|| format!("pkg: {OFFICIAL_FILE}: cannot read it"))?;
+        let official = config::parse_official(&text).map_err(|e| e.text(OFFICIAL_FILE))?;
+        let (_, settings) = self.saved()?;
+        let off = |name: &str| {
+            settings
+                .lines
+                .iter()
+                .any(|l| matches!(l, config::Line::Disable { name: n } if n == name))
+        };
+        let roots: Vec<&str> = self.roots.iter().map(|k| k.name.as_str()).collect();
+        sys::out(&output::repository(
+            &official.name,
+            &official.address,
+            &format!("roots {}", roots.join(" ")),
+            off(&official.name),
+        ));
+        for line in &settings.lines {
+            let config::Line::Add { name, address } = line else {
+                continue;
+            };
+            let trust = settings
+                .keys
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, k)| format!("key {} {}", k.name.as_str(), settings::fingerprint(k)))
+                .unwrap_or_else(|| "no key".into());
+            sys::out(&output::repository(name, address, &trust, off(name)));
+        }
+        Ok(EXIT_OK)
+    }
+
+    /// `pkg repo save`: the files of `/etc/pkg` the owner edited become the saved settings.
+    fn repo_save(&mut self) -> Result<i32, Line> {
+        self.require_root()?;
+        let text = sys::read_file("/etc/pkg/repositories", 65_536)
+            .map(|b| {
+                String::from_utf8(b).map_err(|_| "pkg: /etc/pkg/repositories: not text".to_string())
+            })
+            .transpose()?;
+        let keys: Vec<(String, Option<String>)> = Settings::names(text.as_deref())
+            .into_iter()
+            .map(|n| {
+                let file = sys::read_file(&format!("/etc/pkg/keys/{n}.pub"), 4096)
+                    .and_then(|b| String::from_utf8(b).ok());
+                (n, file)
+            })
+            .collect();
+        let settings = Settings::from_files(text.as_deref(), &keys)?;
+        // The rule of add and remove holds for the files too: a repository a package stands from
+        // keeps its line and its key.
+        let installed = self.installed(true)?;
+        let (_, old) = self.saved()?;
+        settings
+            .check_against(&old, &installed)
+            .map_err(|r| r.line())?;
+        self.save(&settings)?;
+        let n = settings
+            .lines
+            .iter()
+            .filter(|l| matches!(l, config::Line::Add { .. }))
+            .count();
+        sys::out(&format!("saved {n} repositories"));
+        Ok(EXIT_OK)
+    }
+
+    /// Whether the files of `/etc/pkg` differ from the saved settings; None when that cannot be told.
+    fn etc_differs(&self) -> Option<bool> {
+        let blob = self.client.settings().ok()?;
+        let text = sys::read_file("/etc/pkg/repositories", 65_536);
+        let as_text = text.as_deref().and_then(|b| core::str::from_utf8(b).ok());
+        let keys: Vec<(String, Option<Vec<u8>>)> = settings::watched(&blob, as_text)
+            .into_iter()
+            .map(|n| {
+                let file = sys::read_file(&format!("/etc/pkg/keys/{n}.pub"), 4096);
+                (n, file)
+            })
+            .collect();
+        Some(settings::differs(&blob, text.as_deref(), &keys))
+    }
+
     fn list(&mut self, all: bool) -> Result<i32, Line> {
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let (available, refused) = if all {
             let c = self.cached()?;
             (c.0, c.3)
@@ -648,6 +929,34 @@ impl Tool {
             };
             found = true;
             let (roots, direct) = self.trust_of(r);
+            let entries = if r.is_official() {
+                match (
+                    sys::read_file(&format!("{dir}/revoked"), fetch::REVOKED_MAX as usize + 1),
+                    sys::read_file(&format!("{dir}/revoked.sig"), 4096),
+                ) {
+                    (Some(list), Some(block)) => {
+                        match verify::revocations(&list, &block, &self.roots) {
+                            Ok(got) => got.entries,
+                            Err(f) => {
+                                sys::err(&f.line(&r.name));
+                                refused += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {
+                        // An index the list was not kept for cannot be checked as the service would.
+                        sys::err(&format!(
+                            "pkg: {}: the cache has no revocation list; pkg update",
+                            r.name
+                        ));
+                        refused += 1;
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let checked = verify::index(
                 &data,
                 &sig,
@@ -657,7 +966,7 @@ impl Tool {
                     roots: &roots,
                     direct: &direct,
                 },
-                &[],
+                &entries,
                 sys::now(),
             );
             if let Err(f) = checked {
@@ -686,7 +995,7 @@ impl Tool {
         if !found {
             return Err("pkg: no index yet; pkg update".into());
         }
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         for line in output::search(word, &available, &installed) {
             sys::out(&line);
         }
@@ -694,7 +1003,7 @@ impl Tool {
     }
 
     fn info(&mut self, name: &str) -> Result<i32, Line> {
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let have = installed.iter().find(|i| i.name == name).or_else(|| {
             installed
                 .iter()
@@ -819,6 +1128,14 @@ impl Tool {
         });
         for line in lines {
             sys::out(&line);
+        }
+        match self.etc_differs() {
+            Some(false) => sys::out("settings saved"),
+            Some(true) => {
+                sys::err(settings::DIFFERS_LINE);
+                well = false;
+            }
+            None => {}
         }
         // The file of the roots shows people what the build trusts; it must be that.
         let baked: String = baked::ROOTS.concat();

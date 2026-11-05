@@ -73,7 +73,7 @@ macro_rules! say {
 extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     // SAFETY: relibc supplies argc live NUL-terminated strings.
     let name = unsafe { CStr::from_ptr(*argv).to_bytes() };
-    if argc > 0 && name.ends_with(b"hello") {
+    if argc > 0 && (name.ends_with(b"hello") || name.ends_with(b"hello-games")) {
         return 42;
     }
     let mode = mode();
@@ -822,6 +822,12 @@ impl Pkgd {
         self.change(w.as_bytes(), identity, false)
     }
 
+    fn world_set(&self, name: &[u8], world: bool, identity: bool) -> Result<u32, Status> {
+        let mut w = Writer::new();
+        pkg::write_world(name, world, &mut w)?;
+        self.change(w.as_bytes(), identity, false)
+    }
+
     /// SETTINGS_SET or REVOKED_SET of the first `len` bytes of the buffer.
     fn blob_set(&self, method: Method, len: usize, identity: bool) -> Result<u32, Status> {
         let mut w = Writer::new();
@@ -1268,6 +1274,7 @@ fn not_allowed(pkgd: &Pkgd, e: &Entry, was: &Snap) -> Result<(), Fail> {
         begin.write(&mut w).is_ok() && is(pkgd.change(w.as_bytes(), true, false), pkg::NOT_ALLOWED);
     refused &= is(pkgd.remove(&[b"hello"], true), pkg::NOT_ALLOWED);
     refused &= is(pkgd.serial_set(b"stafeto", 9, true), pkg::NOT_ALLOWED);
+    refused &= is(pkgd.world_set(b"hello", false, true), pkg::NOT_ALLOWED);
     refused &= is(
         pkgd.blob_set(Method::SettingsSet, 100, true),
         pkg::NOT_ALLOWED,
@@ -1279,6 +1286,7 @@ fn not_allowed(pkgd: &Pkgd, e: &Entry, was: &Snap) -> Result<(), Fail> {
     posix_abi::process::seteuid(0).map_err(|_| "seteuid(0) back")?;
     // The superuser without a session of identity is refused too.
     refused &= is(pkgd.remove(&[b"hello"], false), pkg::NOT_ALLOWED);
+    refused &= is(pkgd.world_set(b"hello", false, false), pkg::NOT_ALLOWED);
     if !refused || !snap(pkgd)?.same(was) {
         return Err("NOT_ALLOWED");
     }
@@ -1341,6 +1349,22 @@ fn changes(pkgd: &Pkgd, index: &Index, steps: bool) -> Result<(), Fail> {
     if mode_of(b"/opt/keyb/bin/keyb").is_none() {
         return Err("keyb is not in the tree");
     }
+    // The flag "world" is changed by itself: a dependency and back, the table alone.
+    let before = snap(pkgd)?;
+    if pkgd.world_set(b"keyb", false, true).is_err()
+        || snap(pkgd)?.has(b"keyb") != Some(pkg::ENTRY_DEPENDENCY)
+        || pkgd.world_set(b"keyb", false, true).is_err()
+        || pkgd.world_set(b"keyb", true, true).is_err()
+        || snap(pkgd)?.has(b"keyb") != Some(pkg::ENTRY_WORLD)
+        || !is(pkgd.world_set(b"nobody", true, true), pkg::NOT_FOUND)
+        || mode_of(b"/opt/keyb/bin/keyb").is_none()
+        || snap(pkgd)?.stat.generation == before.stat.generation
+    {
+        return Err("WORLD_SET");
+    }
+    say!(
+        "WORLD_SET: dependency and back, the same flag changes nothing, an unknown name is NOT_FOUND"
+    );
     let (len, _) = load_blob(b"revoked-2.list")?;
     pkgd.blob_set(Method::RevokedSet, len, true)
         .map_err(|_| "REVOKED_SET 2")?;

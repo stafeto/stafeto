@@ -95,6 +95,45 @@ impl<'a> Settings<'a> {
         keyfile::parse_public(core::str::from_utf8(file.data).ok()?).ok()
     }
 
+    /// Whether `repositories` has a line that adds `repository` and none that disables it.
+    pub fn lists(&self, repository: &str) -> bool {
+        self.blob
+            .files()
+            .find(|f| f.name == REPOSITORIES.as_bytes())
+            .and_then(|f| core::str::from_utf8(f.data).ok())
+            .is_some_and(|text| {
+                let mut added = false;
+                for line in text.lines() {
+                    let mut words = line.split(' ');
+                    match (words.next(), words.next()) {
+                        (Some("disable"), Some(name)) if name == repository => return false,
+                        (Some(name), Some(_)) if name == repository => added = true,
+                        _ => {}
+                    }
+                }
+                added
+            })
+    }
+
+    /// Whether these settings keep every repository in `held` (the repositories packages of the
+    /// disk were installed from): each still has its line and the key it had in `old`, the blob
+    /// the service holds (no blob, no key held). After a restart a package is checked by the key
+    /// of its repository, and a package whose repository lost its line or changed its key would
+    /// be skipped; the rule is the service's, so it holds for any client.
+    pub fn keeps(&self, old: &[u8], held: &[&str]) -> bool {
+        let before = Settings::parse(old).ok();
+        held.iter().all(|&name| {
+            let Some(now) = self.key_of(name) else {
+                return false;
+            };
+            self.lists(name)
+                && before
+                    .as_ref()
+                    .and_then(|b| b.key_of(name))
+                    .is_none_or(|was| was.public == now.public)
+        })
+    }
+
     pub fn files(&self) -> impl Iterator<Item = File<'a>> + use<'a> {
         self.blob.files()
     }

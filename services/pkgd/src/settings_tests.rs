@@ -25,6 +25,40 @@ fn valid() -> Vec<u8> {
     ])
 }
 
+fn games_with(key_name: &str, byte: u8, lines: &str) -> Vec<u8> {
+    let key = keyfile::public_line(&Key {
+        name: crate::testkit::name(key_name),
+        public: [byte; 32],
+    });
+    blob::write(&[
+        ("repositories", lines.as_bytes()),
+        ("keys/games.pub", key.as_bytes()),
+    ])
+}
+
+#[test]
+fn settings_keep_the_line_and_the_key_of_a_repository_a_package_came_from() {
+    let old = games_with("games", 5, "games https://example.org/games\n");
+    let same = games_with("games", 5, "games https://example.org/other\n");
+    let other_key = games_with("games", 6, "games https://example.org/games\n");
+    let disabled = games_with("games", 5, "disable games\n");
+    let none = blob::write(&[]);
+    let keeps =
+        |new: &[u8], old: &[u8], held: &[&str]| Settings::parse(new).unwrap().keeps(old, held);
+    // Nothing held: any blob. The address may change; the key and the line may not.
+    assert!(keeps(&none, &old, &[]));
+    assert!(keeps(&same, &old, &["games"]));
+    assert!(!keeps(&other_key, &old, &["games"]));
+    assert!(!keeps(&none, &old, &["games"]));
+    assert!(!keeps(&disabled, &old, &["games"]));
+    let added_and_disabled = games_with("games", 5, "games https://example.org/g\ndisable games\n");
+    assert!(!keeps(&added_and_disabled, &old, &["games"]));
+    // A repository the new blob lacks, whatever the old one held.
+    assert!(!keeps(&same, &old, &["games", "tools"]));
+    // With no blob held before, a key and a line are enough.
+    assert!(keeps(&same, b"", &["games"]));
+}
+
 #[test]
 fn a_blob_of_the_rules_passes() {
     let bytes = valid();

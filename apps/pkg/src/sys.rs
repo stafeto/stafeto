@@ -19,6 +19,9 @@ unsafe extern "C" {
     fn nanosleep(request: *const Timespec, rest: *mut Timespec) -> c_int;
     fn geteuid() -> u32;
     fn mkdir(path: *const c_char, mode: u32) -> c_int;
+    fn rename(from: *const c_char, to: *const c_char) -> c_int;
+    fn unlink(path: *const c_char) -> c_int;
+    fn getpid() -> c_int;
 }
 
 /// The allocator of the program: the C library's `malloc`, and `posix_memalign`
@@ -155,6 +158,32 @@ pub fn write_file(path: &str, bytes: &[u8]) -> bool {
     // SAFETY: the descriptor opened above.
     unsafe { c::close(fd) };
     ok
+}
+
+/// The file at `path` made whole: the bytes go into `path.new` (opened without following a
+/// link) and the file is renamed over `path`, so a reader meets the old file or the new one and
+/// a failed write leaves the old one. Whether it was done.
+pub fn replace_file(path: &str, bytes: &[u8]) -> bool {
+    // A name of this process: two commands at once do not write one file.
+    // SAFETY: no arguments.
+    let tmp = alloc::format!("{path}.new{}", unsafe { getpid() });
+    if !write_file(&tmp, bytes) {
+        unlink_one(&tmp);
+        return false;
+    }
+    let (from, to) = (cstring(&tmp), cstring(path));
+    // SAFETY: NUL-terminated paths.
+    let done = unsafe { rename(from.as_ptr().cast(), to.as_ptr().cast()) } == 0;
+    if !done {
+        unlink_one(&tmp);
+    }
+    done
+}
+
+fn unlink_one(path: &str) {
+    let name = cstring(path);
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(name.as_ptr().cast()) };
 }
 
 /// A directory with every one above it, mode 0755; the errors of those that

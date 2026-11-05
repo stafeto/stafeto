@@ -14,7 +14,7 @@ use abi::Access;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use pkgd::commit::{self, Change, Device, Kind, Opened, Refused};
 use pkgd::receipts::{BeginArgs, GROUP_MAX};
-use pkgd::settings::Settings;
+use pkgd::settings::{self, Settings};
 use pkgd::store::{self, BLOCK, Extent, PACKAGES, RECORDS, Table, field_bytes, find_free};
 use pkgd::{plans, verify};
 use pkgfmt::sha::sha256;
@@ -120,6 +120,7 @@ impl Worker {
             JobKind::SettingsSet => (self.settings_set(job), 0),
             JobKind::SerialSet => (self.serial_set(job), 0),
             JobKind::RevokedSet => (self.revoked_set(job), 0),
+            JobKind::WorldSet => (self.world_set(job), 0),
         };
         JOB_CODE.store(code, Release);
         JOB_VALUE.store(value, Release);
@@ -494,6 +495,33 @@ impl Worker {
         }
     }
 
+    /// WORLD_SET: the flag "world" of a package of the disk, the table alone.
+    fn world_set(&mut self, a: &JobArgs) -> u32 {
+        if GROUP_OWNER.load(Acquire) != 0 {
+            return proto_pkg::BUSY;
+        }
+        // SAFETY: the worker's reads of the entries it writes.
+        let images = unsafe { &*IMAGE_ENTRIES.get() };
+        let slot = match plans::world(table(), next(), images, field_bytes(&a.name), a.world) {
+            Err(code) => return code,
+            Ok(None) => return 0,
+            Ok(Some(slot)) => slot,
+        };
+        let change = Change {
+            kind: Kind::World,
+            detach: &[],
+            attach: &[],
+        };
+        let done = commit::transact(&mut self.disk, &opened(), table(), next(), &change);
+        self.after(done, |_| {
+            // SAFETY: inside `publish`.
+            let entries = unsafe { &mut *DISK_ENTRIES.get() };
+            if let Some(entry) = entries[slot].as_mut() {
+                entry.record = table().record(slot);
+            }
+        })
+    }
+
     /// The bytes of a blob in the client's buffer into `out`, a copy of the worker's own
     /// that nothing the client does changes after it.
     fn copy_buffer(a: &JobArgs, out: &mut [u8]) {
@@ -543,6 +571,28 @@ impl Worker {
         let Ok(parsed) = Settings::parse(&blob[..a.len]) else {
             return proto_pkg::INVALID;
         };
+        // A repository a package of the disk came from keeps its line and its key.
+        let mut held: [&str; store::REPOS] = [""; store::REPOS];
+        let mut n = 0;
+        // SAFETY: the worker's reads of the entries it writes; the table is the state.
+        let entries = unsafe { &*DISK_ENTRIES.get() };
+        for entry in entries.iter().flatten() {
+            let Some((name, _)) = table().repo(usize::from(entry.record.repo)) else {
+                continue;
+            };
+            let Ok(name) = core::str::from_utf8(name) else {
+                continue;
+            };
+            if name != settings::OFFICIAL && !held[..n].contains(&name) {
+                held[n] = name;
+                n += 1;
+            }
+        }
+        // SAFETY: the worker's; the live blob changes only in `publish`, in this thread.
+        let live: &[u8] = unsafe { &(&*SETTINGS.get()).0[..SETTINGS_LEN.load(Acquire)] };
+        if !parsed.keeps(live, &held[..n]) {
+            return proto_pkg::NEEDED_BY;
+        }
         // The object of the new layer waits in its own place until its table is the state.
         let attached_before = SETTINGS_LEN.load(Acquire) != 0
             && unsafe { &*OBJECTS.get() }[store::SETTINGS_SLOT].is_some();

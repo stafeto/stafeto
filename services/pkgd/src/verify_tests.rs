@@ -502,6 +502,57 @@ fn a_serial_never_goes_back_and_a_new_repository_takes_a_free_place() {
 }
 
 #[test]
+fn the_flag_world_changes_that_record_alone_and_refuses_the_image_and_the_unknown() {
+    use crate::plans::world;
+    use crate::store::{DEPENDENCY, WORLD};
+    let set = [
+        entry(&Spec {
+            name: "lib",
+            ..Spec::default()
+        }),
+        entry(&Spec {
+            name: "app",
+            depends: "lib",
+            ..Spec::default()
+        }),
+    ];
+    let mut table = table_of(&set);
+    let mut r = table.record(0);
+    r.flags = DEPENDENCY;
+    table.set_record(0, &r);
+    let mut image = [const { None }; 4];
+    image[0] = entry(&Spec {
+        name: "base",
+        ..Spec::default()
+    })
+    .map(|mut e| {
+        e.image = true;
+        e
+    });
+    let mut out = Table::zeroed();
+    assert_eq!(
+        world(&table, &mut out, &image, b"base", true),
+        Err(proto_pkg::IN_IMAGE)
+    );
+    assert_eq!(
+        world(&table, &mut out, &image, b"none", true),
+        Err(proto_pkg::NOT_FOUND)
+    );
+    // The flag it has already: nothing is written.
+    assert_eq!(world(&table, &mut out, &image, b"lib", false), Ok(None));
+    assert_eq!(world(&table, &mut out, &image, b"app", true), Ok(None));
+    assert_eq!(world(&table, &mut out, &image, b"lib", true), Ok(Some(0)));
+    assert_eq!(out.generation(), table.generation() + 1);
+    assert_eq!(out.record(0).flags, WORLD);
+    assert_eq!(out.record(1), table.record(1));
+    let back = table_of(&set);
+    let mut again = Table::zeroed();
+    assert_eq!(world(&out, &mut again, &image, b"lib", false), Ok(Some(0)));
+    assert_eq!(again.record(0).flags, DEPENDENCY);
+    assert_eq!(back.record(0).flags, WORLD);
+}
+
+#[test]
 fn the_list_of_revocations_never_goes_back_and_marks_the_packages_it_names() {
     use crate::plans::{revoked, settings};
     use crate::store::{Extent, REVOKED, REVOKED_SLOT, SETTINGS_SLOT};

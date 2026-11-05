@@ -7,10 +7,11 @@
 //! and the image). There are no versions: in a series a name has one record.
 //!
 //! A name `x` is looked for so: a package installed under the name `x` or
-//! that provides `x` closes it, nothing is downloaded; else the first
-//! repository that has a package named `x`; else the packages that provide
-//! `x`, which must be one. A package's own name is stronger than another's
-//! `provides`. `repository/x` looks in that repository alone.
+//! that provides `x` closes it, nothing is downloaded; else the repositories are asked in
+//! order and the first that closes the name decides it: in a repository the package named `x`,
+//! else the packages that provide `x`, which must be one. So a repository of the owner cannot
+//! take a name the official one provides.
+//! `repository/x` looks in that repository alone.
 //!
 //! The packages to receive are the requested one and those of its
 //! dependencies that are not installed, the dependencies first. They are one
@@ -23,7 +24,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use pkgfmt::index::Entry;
 use pkgfmt::sha;
-use proto_pkg::{ENTRY_DEPENDENCY, ENTRY_IMAGE};
+use proto_pkg::{ENTRY_DEPENDENCY, ENTRY_IMAGE, ENTRY_REVOKED, ENTRY_WORLD, REMOVE_MAX};
 
 /// The most new packages one group of the package service holds.
 pub const GROUP_MAX: usize = 4;
@@ -163,30 +164,42 @@ fn closed<'a>(installed: &'a [Installed], name: &str) -> Option<&'a Installed> {
     })
 }
 
-/// The record that answers `name` in the pool, by the rules of the module;
-/// `only` limits it to a repository.
+/// The record that answers `name` in the pool; `only` limits it to a repository. The repositories
+/// are asked in their order (the official one first); in each the package of that name comes
+/// before the packages that provide the name, and several providers are an error. The first
+/// repository that closes the name decides it, so a repository of the owner cannot take a name
+/// the official one gives, whether by the name of a package or by `provides`.
 fn find(pool: &[Candidate], name: &str, only: Option<&str>) -> Result<usize, Fault> {
-    let in_scope = |c: &Candidate| only.is_none_or(|r| c.repository == r);
-    if let Some(at) = pool.iter().position(|c| in_scope(c) && c.name == name) {
-        return Ok(at);
-    }
-    let mut providers: Vec<usize> = Vec::new();
-    for (at, c) in pool.iter().enumerate() {
-        if in_scope(c)
-            && c.provides.iter().any(|p| p == name)
-            && !providers.iter().any(|&o| pool[o].name == c.name)
+    let mut repositories: Vec<&str> = Vec::new();
+    for c in pool {
+        if only.is_none_or(|r| c.repository == r) && !repositories.contains(&c.repository.as_str())
         {
-            providers.push(at);
+            repositories.push(&c.repository);
         }
     }
-    match providers[..] {
-        [] => Err(Fault::NoName(name.into())),
-        [one] => Ok(one),
-        _ => Err(Fault::Ambiguous {
-            name: name.into(),
-            providers: providers.iter().map(|&at| pool[at].name.clone()).collect(),
-        }),
+    for repository in repositories {
+        let here = |c: &Candidate| c.repository == repository;
+        if let Some(at) = pool.iter().position(|c| here(c) && c.name == name) {
+            return Ok(at);
+        }
+        let mut providers: Vec<usize> = Vec::new();
+        for (at, c) in pool.iter().enumerate() {
+            if here(c) && c.provides.iter().any(|p| p == name) {
+                providers.push(at);
+            }
+        }
+        match providers[..] {
+            [] => {}
+            [one] => return Ok(one),
+            _ => {
+                return Err(Fault::Ambiguous {
+                    name: name.into(),
+                    providers: providers.iter().map(|&at| pool[at].name.clone()).collect(),
+                });
+            }
+        }
     }
+    Err(Fault::NoName(name.into()))
 }
 
 struct Walk<'a> {
@@ -359,6 +372,228 @@ pub fn install(
     })
 }
 
+/// The place in `installed` of the package that answers `name`: its own name first, then a `provides`.
+fn closed_at(installed: &[Installed], name: &str) -> Option<usize> {
+    installed.iter().position(|i| i.name == name).or_else(|| {
+        installed
+            .iter()
+            .position(|i| i.provides.iter().any(|p| p == name))
+    })
+}
+
+/// Why a removal is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveFault {
+    NotInstalled(String),
+    InImage(String),
+    /// A package that stays needs the named one: `package` is needed by `by`.
+    NeededBy {
+        package: String,
+        by: String,
+    },
+}
+
+impl RemoveFault {
+    pub fn line(&self) -> String {
+        match self {
+            RemoveFault::NotInstalled(name) => format!("pkg: {name}: not installed"),
+            RemoveFault::InImage(name) => format!("pkg: {name}: part of the image"),
+            RemoveFault::NeededBy { package, by } => {
+                format!("pkg: {package}: needed by {by}")
+            }
+        }
+    }
+}
+
+/// What a removal comes to: the places in the list of installed packages of what goes, dependents
+/// before the packages they need, and which of them were asked for. The rest go because nothing
+/// that stays needs them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovePlan {
+    pub order: Vec<usize>,
+    pub named: Vec<usize>,
+}
+
+impl RemovePlan {
+    /// The names a REMOVE takes at a time (`REMOVE_MAX`), in the order of the plan: a package
+    /// goes in the same request as, or after, the packages that need it, so every state between
+    /// two requests is one the service accepts.
+    pub fn batches(&self) -> Vec<Vec<usize>> {
+        self.order
+            .chunks(REMOVE_MAX as usize)
+            .map(<[usize]>::to_vec)
+            .collect()
+    }
+}
+
+/// `pkg remove names`: the named packages and the packages of the disk that the world that
+/// stays no longer needs (the world is the packages not marked as dependencies, less the named
+/// ones; what it needs is the closure of its `depends`). With no name, the packages nothing needs.
+pub fn remove(names: &[String], installed: &[Installed]) -> Result<RemovePlan, RemoveFault> {
+    let mut named: Vec<usize> = Vec::new();
+    for name in names {
+        let at =
+            closed_at(installed, name).ok_or_else(|| RemoveFault::NotInstalled(name.clone()))?;
+        if installed[at].in_image() {
+            return Err(RemoveFault::InImage(installed[at].name.clone()));
+        }
+        if !named.contains(&at) {
+            named.push(at);
+        }
+    }
+    let n = installed.len();
+    let mut keep = alloc::vec![false; n];
+    // (package, the package that needs it); the roots are the world that stays.
+    let mut work: Vec<(usize, Option<usize>)> = (0..n)
+        .rev()
+        .filter(|&i| {
+            !installed[i].in_image()
+                && installed[i].flags & ENTRY_DEPENDENCY == 0
+                && !named.contains(&i)
+        })
+        .map(|i| (i, None))
+        .collect();
+    while let Some((at, by)) = work.pop() {
+        if let (true, Some(by)) = (named.contains(&at), by) {
+            return Err(RemoveFault::NeededBy {
+                package: installed[at].name.clone(),
+                by: installed[by].name.clone(),
+            });
+        }
+        if keep[at] {
+            continue;
+        }
+        keep[at] = true;
+        for dep in installed[at].depends.iter().rev() {
+            if let Some(d) = closed_at(installed, dep)
+                && !installed[d].in_image()
+            {
+                work.push((d, Some(at)));
+            }
+        }
+    }
+    let gone: Vec<usize> = (0..n)
+        .filter(|&i| !installed[i].in_image() && !keep[i])
+        .collect();
+    // Dependents first: the reverse of the order that puts every package after what it needs.
+    let mut seen: Vec<usize> = Vec::new();
+    let mut post: Vec<usize> = Vec::new();
+    for &g in &gone {
+        postorder(g, installed, &gone, &mut seen, &mut post);
+    }
+    post.reverse();
+    Ok(RemovePlan { order: post, named })
+}
+
+fn postorder(
+    at: usize,
+    installed: &[Installed],
+    gone: &[usize],
+    seen: &mut Vec<usize>,
+    out: &mut Vec<usize>,
+) {
+    if seen.contains(&at) {
+        return;
+    }
+    seen.push(at);
+    for dep in &installed[at].depends {
+        if let Some(d) = closed_at(installed, dep)
+            && gone.contains(&d)
+        {
+            postorder(d, installed, gone, seen, out);
+        }
+    }
+    out.push(at);
+}
+
+/// One package of the disk the index has another build of: the packages to receive (the new
+/// dependencies first, the package last, which keeps the world flag the old one had) and the place of
+/// the old one in the list of installed packages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    pub installed: usize,
+    pub items: Vec<Item>,
+}
+
+/// What `pkg upgrade` comes to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpgradePlan {
+    pub replacements: Vec<Replacement>,
+    /// Lines about packages the index of their repository does not have: they stay.
+    pub kept: Vec<String>,
+    /// Lines of refusals; the exit code is 1 when there is one.
+    pub refused: Vec<String>,
+}
+
+/// `pkg upgrade names` (all of the disk when none): a package whose repository's index has another
+/// SHA-256 for its name is replaced (the same repository, never another's). A package of the
+/// image never is. The same SHA-256 changes nothing and downloads nothing.
+pub fn upgrade(names: &[String], pool: &[Candidate], installed: &[Installed]) -> UpgradePlan {
+    let mut plan = UpgradePlan::default();
+    let mut targets: Vec<usize> = Vec::new();
+    if names.is_empty() {
+        targets.extend((0..installed.len()).filter(|&i| !installed[i].in_image()));
+    }
+    for name in names {
+        match closed_at(installed, name) {
+            None => plan
+                .refused
+                .push(RemoveFault::NotInstalled(name.clone()).line()),
+            Some(at) if installed[at].in_image() => plan
+                .refused
+                .push(RemoveFault::InImage(installed[at].name.clone()).line()),
+            Some(at) if !targets.contains(&at) => targets.push(at),
+            Some(_) => {}
+        }
+    }
+    for at in targets {
+        let have = &installed[at];
+        let Some(found) = pool
+            .iter()
+            .position(|c| c.name == have.name && c.repository == have.repository)
+        else {
+            plan.kept.push(format!(
+                "{}: not in the index of {}, kept",
+                have.name, have.repository
+            ));
+            continue;
+        };
+        if pool[found].sha256 == have.sha256 {
+            if have.flags & ENTRY_REVOKED != 0 {
+                plan.refused.push(format!(
+                    "pkg: {}: signed by a revoked key and the index has no other build",
+                    have.name
+                ));
+            }
+            continue;
+        }
+        let mut walk = Walk {
+            pool,
+            installed,
+            items: Vec::new(),
+            notes: Vec::new(),
+            stack: Vec::new(),
+        };
+        if let Err(fault) = walk.visit(found) {
+            plan.refused.push(fault.line());
+            continue;
+        }
+        if walk.items.len() > GROUP_MAX {
+            plan.refused.push(Fault::TooMany(have.name.clone()).line());
+            continue;
+        }
+        let mut items = walk.items;
+        if let Some(last) = items.last_mut() {
+            last.world = have.flags & ENTRY_WORLD != 0;
+        }
+        plan.replacements.push(Replacement {
+            installed: at,
+            items,
+        });
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +662,37 @@ mod tests {
         );
         // The name of the package itself gives the same.
         assert_eq!(plan(&pool, &[], "doomgeneric").0, order);
+    }
+
+    #[test]
+    fn a_repository_of_the_owner_cannot_take_a_name_the_official_one_provides() {
+        // The review's case: `doomgeneric` of the official repository provides `doom`, and `games`
+        // has a package named `doom`.
+        let pool = vec![
+            c("stafeto", "doomgeneric", &["doom"], &["freedoom"]),
+            c("stafeto", "freedoom", &[], &[]),
+            c("games", "doom", &[], &[]),
+        ];
+        let (order, items) = plan(&pool, &[], "doom");
+        assert_eq!(order, ["freedoom", "doomgeneric"]);
+        assert_eq!(pool[items[1].candidate].repository, "stafeto");
+        // `games/doom` still takes the package of `games`.
+        let (order, _) = plan(&pool, &[], "games/doom");
+        assert_eq!(order, ["doom"]);
+        // The same for a dependency: the official package needs `doom`, which it gives itself.
+        let pool = vec![
+            c("stafeto", "front", &[], &["doom"]),
+            c("stafeto", "doomgeneric", &["doom"], &[]),
+            c("games", "doom", &[], &[]),
+        ];
+        let (order, _) = plan(&pool, &[], "front");
+        assert_eq!(order, ["doomgeneric", "front"]);
+        // A name only the owner's repository has is still taken from it.
+        let pool = vec![
+            c("stafeto", "front", &[], &["extra"]),
+            c("games", "extra", &[], &[]),
+        ];
+        assert_eq!(plan(&pool, &[], "front").0, ["extra", "front"]);
     }
 
     #[test]
@@ -681,5 +947,283 @@ mod tests {
             ..entry
         };
         assert!(Candidate::new("stafeto", &bad).is_none());
+    }
+
+    fn disk(name: &str, flags: u32, depends: &[&str]) -> Installed {
+        let mut i = have(name, flags, "stafeto");
+        i.depends = depends.iter().map(|s| s.to_string()).collect();
+        i
+    }
+
+    fn gone(plan: &RemovePlan, installed: &[Installed]) -> Vec<String> {
+        plan.order
+            .iter()
+            .map(|&i| installed[i].name.clone())
+            .collect()
+    }
+
+    fn doom_disk() -> Vec<Installed> {
+        vec![
+            have("busybox", ENTRY_IMAGE, "stafeto"),
+            disk("doomgeneric", ENTRY_WORLD, &["freedoom"]),
+            disk("freedoom", ENTRY_DEPENDENCY, &[]),
+        ]
+    }
+
+    #[test]
+    fn removing_doom_removes_its_dependency_that_nothing_else_needs() {
+        let held = doom_disk();
+        let plan = remove(&["doom".to_string()], &{
+            let mut h = held.clone();
+            h[1].provides = vec!["doom".into()];
+            h
+        })
+        .unwrap();
+        // The requested one first, the package it needed after it.
+        assert_eq!(gone(&plan, &held), ["doomgeneric", "freedoom"]);
+        assert_eq!(plan.named, [1]);
+        assert_eq!(plan.batches(), [vec![1, 2]]);
+    }
+
+    #[test]
+    fn a_package_the_world_that_stays_needs_is_named_with_the_package_that_needs_it() {
+        let held = doom_disk();
+        let e = remove(&["freedoom".to_string()], &held).unwrap_err();
+        assert_eq!(e.line(), "pkg: freedoom: needed by doomgeneric");
+        // Two packages, the second needs the first by a dependency chain: the nearest is named.
+        let chain = vec![
+            disk("top", ENTRY_WORLD, &["mid"]),
+            disk("mid", ENTRY_DEPENDENCY, &["low"]),
+            disk("low", ENTRY_DEPENDENCY, &[]),
+        ];
+        assert_eq!(
+            remove(&["low".to_string()], &chain).unwrap_err().line(),
+            "pkg: low: needed by mid"
+        );
+        // Both named: nothing that stays needs them.
+        let both = remove(&["top".to_string(), "mid".to_string()], &chain).unwrap();
+        assert_eq!(gone(&both, &chain), ["top", "mid", "low"]);
+    }
+
+    #[test]
+    fn the_world_stays_and_a_package_asked_for_is_not_a_dependency_that_goes() {
+        // `lib` was asked for after `app` pulled it in: it is of the world, and `app` may go alone.
+        let held = vec![
+            disk("app", ENTRY_WORLD, &["lib"]),
+            disk("lib", ENTRY_WORLD, &[]),
+        ];
+        let plan = remove(&["app".to_string()], &held).unwrap();
+        assert_eq!(gone(&plan, &held), ["app"]);
+        // Without the flag, `lib` goes with `app` (the removal of a package of the world drops what
+        // only it needed).
+        let held = vec![
+            disk("app", ENTRY_WORLD, &["lib"]),
+            disk("lib", ENTRY_DEPENDENCY, &[]),
+        ];
+        assert_eq!(
+            gone(&remove(&["app".to_string()], &held).unwrap(), &held),
+            ["app", "lib"]
+        );
+        // And `lib` alone is refused while `app` stands.
+        assert_eq!(
+            remove(&["lib".to_string()], &held).unwrap_err().line(),
+            "pkg: lib: needed by app"
+        );
+    }
+
+    #[test]
+    fn a_dependency_two_packages_need_stays_until_both_go() {
+        let held = vec![
+            disk("a", ENTRY_WORLD, &["shared"]),
+            disk("b", ENTRY_WORLD, &["shared"]),
+            disk("shared", ENTRY_DEPENDENCY, &[]),
+        ];
+        assert_eq!(
+            gone(&remove(&["a".to_string()], &held).unwrap(), &held),
+            ["a"]
+        );
+        let both = remove(&["a".to_string(), "b".to_string()], &held).unwrap();
+        let order = gone(&both, &held);
+        assert_eq!(order.len(), 3);
+        // The package two others need goes after both.
+        assert_eq!(order[2], "shared");
+    }
+
+    #[test]
+    fn the_image_and_the_unknown_are_refused_by_name() {
+        let held = doom_disk();
+        assert_eq!(
+            remove(&["busybox".to_string()], &held).unwrap_err().line(),
+            "pkg: busybox: part of the image"
+        );
+        assert_eq!(
+            remove(&["doom".to_string()], &held).unwrap_err().line(),
+            "pkg: doom: not installed"
+        );
+    }
+
+    #[test]
+    fn a_removal_of_more_than_eight_goes_in_requests_with_the_dependents_first() {
+        // A chain of ten: p0 of the world needs p1, which needs p2, and so on.
+        let held: Vec<Installed> = (0..10)
+            .map(|i| {
+                let next = format!("p{}", i + 1);
+                let deps: Vec<&str> = if i < 9 { vec![next.as_str()] } else { vec![] };
+                disk(
+                    &format!("p{i}"),
+                    if i == 0 {
+                        ENTRY_WORLD
+                    } else {
+                        ENTRY_DEPENDENCY
+                    },
+                    &deps,
+                )
+            })
+            .collect();
+        let plan = remove(&["p0".to_string()], &held).unwrap();
+        assert_eq!(plan.order, (0..10).collect::<Vec<_>>());
+        let batches = plan.batches();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 8);
+        assert_eq!(batches[1], [8, 9]);
+        // Each request leaves only a state the service accepts: nothing that stays needs what went.
+        let mut went: Vec<usize> = Vec::new();
+        for batch in &batches {
+            went.extend(batch);
+            for &i in &went {
+                for (j, other) in held.iter().enumerate() {
+                    if !went.contains(&j) {
+                        assert!(!other.depends.contains(&held[i].name), "{j} needs {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_named_removes_the_dependencies_nothing_needs() {
+        let held = vec![
+            disk("app", ENTRY_WORLD, &["lib"]),
+            disk("lib", ENTRY_DEPENDENCY, &[]),
+            disk("old", ENTRY_DEPENDENCY, &[]),
+        ];
+        let plan = remove(&[], &held).unwrap();
+        assert_eq!(gone(&plan, &held), ["old"]);
+        assert!(remove(&[], &doom_disk()).unwrap().order.is_empty());
+    }
+
+    fn newer(c: &mut Candidate, byte: u8) {
+        c.sha256 = [byte; 32];
+        c.version = "2.0-1".into();
+    }
+
+    fn pair() -> (Vec<Candidate>, Vec<Installed>) {
+        let pool = doom_pool();
+        let mut held = vec![
+            have("doomgeneric", ENTRY_WORLD, "stafeto"),
+            have("freedoom", ENTRY_DEPENDENCY, "stafeto"),
+        ];
+        // The records of the disk are those of the pool.
+        for h in &mut held {
+            h.sha256 = pool.iter().find(|c| c.name == h.name).unwrap().sha256;
+        }
+        (pool, held)
+    }
+
+    #[test]
+    fn upgrade_replaces_only_a_package_whose_sha256_differs_in_its_own_index() {
+        let (mut pool, held) = pair();
+        let plan = upgrade(&[], &pool, &held);
+        // The same SHA-256 everywhere: nothing, no download.
+        assert_eq!(plan, UpgradePlan::default());
+        newer(&mut pool[0], 9);
+        let plan = upgrade(&[], &pool, &held);
+        assert_eq!(plan.replacements.len(), 1);
+        assert_eq!(plan.replacements[0].installed, 0);
+        assert_eq!(names(&pool, &plan.replacements[0].items), ["doomgeneric"]);
+        // Breakage 19: freedoom, with the same SHA-256, is not in the plan.
+        assert!(plan.replacements.iter().all(|r| r.installed != 1));
+    }
+
+    #[test]
+    fn upgrade_keeps_the_flag_of_the_world_the_package_had() {
+        let (mut pool, mut held) = pair();
+        newer(&mut pool[0], 9);
+        newer(&mut pool[1], 6);
+        let plan = upgrade(&[], &pool, &held);
+        let world = |r: &Replacement| r.items.last().unwrap().world;
+        assert_eq!(plan.replacements.len(), 2);
+        assert!(world(&plan.replacements[0]));
+        assert!(!world(&plan.replacements[1]));
+        // Breakage 20: a dependency stays a dependency, a request stays a request.
+        held[0].flags = ENTRY_WORLD | ENTRY_REVOKED;
+        assert!(world(&upgrade(&[], &pool, &held).replacements[0]));
+    }
+
+    #[test]
+    fn upgrade_receives_the_new_dependencies_of_the_new_record_in_one_group() {
+        let (mut pool, held) = pair();
+        newer(&mut pool[0], 9);
+        pool[0].depends = vec!["freedoom".into(), "extra".into()];
+        pool.push(c("stafeto", "extra", &[], &[]));
+        let plan = upgrade(&["doom".to_string()], &pool, &held);
+        // `doom` is a provides of the new record only: the installed one has none, so it is not found.
+        assert_eq!(plan.refused, ["pkg: doom: not installed"]);
+        let plan = upgrade(&["doomgeneric".to_string()], &pool, &held);
+        let r = &plan.replacements[0];
+        assert_eq!(names(&pool, &r.items), ["extra", "doomgeneric"]);
+        assert_eq!(
+            r.items.iter().map(|i| i.world).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let steps = steps(&r.items);
+        assert_eq!(steps.iter().filter(|s| s.end).count(), 1);
+    }
+
+    #[test]
+    fn upgrade_takes_the_record_of_the_repository_the_package_came_from() {
+        let (mut pool, mut held) = pair();
+        // Another repository has another build of the name: not the one to take.
+        let mut other = c("games", "freedoom", &[], &[]);
+        other.sha256 = [1; 32];
+        pool.push(other);
+        assert_eq!(upgrade(&[], &pool, &held), UpgradePlan::default());
+        // A package whose repository's index lacks it stays, with a line.
+        held.push(have("hello-games", 1, "games"));
+        let plan = upgrade(&[], &pool, &held);
+        assert_eq!(plan.kept, ["hello-games: not in the index of games, kept"]);
+        assert!(plan.replacements.is_empty());
+    }
+
+    #[test]
+    fn upgrade_never_touches_the_image_and_names_what_it_cannot() {
+        let (mut pool, mut held) = pair();
+        pool.push(c("stafeto", "busybox", &[], &[]));
+        held.push(have("busybox", ENTRY_IMAGE, "stafeto"));
+        newer(pool.last_mut().unwrap(), 5);
+        assert_eq!(upgrade(&[], &pool, &held), UpgradePlan::default());
+        let plan = upgrade(&["busybox".to_string(), "nobody".to_string()], &pool, &held);
+        assert_eq!(
+            plan.refused,
+            [
+                "pkg: busybox: part of the image",
+                "pkg: nobody: not installed"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_revoked_package_is_replaced_by_another_build_and_refused_without_one() {
+        let (mut pool, mut held) = pair();
+        held[1].flags |= ENTRY_REVOKED;
+        let plan = upgrade(&[], &pool, &held);
+        assert_eq!(
+            plan.refused,
+            ["pkg: freedoom: signed by a revoked key and the index has no other build"]
+        );
+        newer(&mut pool[1], 7);
+        let plan = upgrade(&[], &pool, &held);
+        assert!(plan.refused.is_empty());
+        assert_eq!(plan.replacements.len(), 1);
     }
 }
