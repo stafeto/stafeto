@@ -1716,11 +1716,11 @@ commands:
   pci-walk [--hvf]      walk bus 0 on QEMU with the disk (virtio-blk-pci)
   pci-walk-vz [--net N] walk bus 0 on Apple VZ with N network devices (0 to 2)
             and check the console, the entropy device and the network functions
-  blk-probe [--hvf] run the probe of the disk service in QEMU: refusals, a
+  blk-probe [--hvf|--plain] run the probe of the disk service in QEMU: refusals, a
             pattern written and flushed, CANCEL, the same file read after a
             new start of QEMU and a restart of the service, the errors the
             host injects, and the service's steps under -icount; with --hvf
-            under HVF
+            under HVF, with --plain on QEMU's emulation without -icount
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its

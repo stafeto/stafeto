@@ -122,7 +122,9 @@ const BLK_STEP_KINDS: [(usize, &str); 9] = [
 /// term B, 18,369 ticks.
 pub const STEP_MAX: u64 = TERM_B * 9 / 10;
 
-/// The files of a command, named by its process, removed when it ends.
+/// The files of a run, named by the process, the machine and the kind of
+/// run, so that jobs of one process (the threads of `ci`) and processes side
+/// by side share none; `Drop` removes these and no others.
 struct Files {
     disk: PathBuf,
     faults: PathBuf,
@@ -130,9 +132,17 @@ struct Files {
 }
 
 impl Files {
-    fn new() -> Files {
+    fn new(machine: &qemu::Machine, run: &str) -> Files {
+        let machine: String = machine
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
         let name = |what: &str| {
-            std::env::temp_dir().join(format!("stafeto-blk-{}-{what}", std::process::id()))
+            std::env::temp_dir().join(format!(
+                "stafeto-blk-{}-{machine}-{run}-{what}",
+                std::process::id()
+            ))
         };
         Files {
             disk: name("disk.img"),
@@ -147,6 +157,19 @@ impl Drop for Files {
         for file in [&self.disk, &self.faults, &self.rules] {
             let _ = std::fs::remove_file(file);
         }
+    }
+}
+
+/// The boot image of a run: a path of its own for each machine and kind of
+/// run, since the jobs of `ci` build and read their images at the same time.
+fn image_name(machine: &qemu::Machine, run: &str) -> &'static str {
+    match (machine.name, run) {
+        ("512M", "probe") => "boot-blk-probe.img",
+        ("512M", _) => "boot-blk-faults.img",
+        ("GICv3", "probe") => "boot-blk-probe-v3.img",
+        ("GICv3", _) => "boot-blk-faults-v3.img",
+        (_, "probe") => "boot-blk-probe-hvf.img",
+        (_, _) => "boot-blk-faults-hvf.img",
     }
 }
 
@@ -251,9 +274,9 @@ fn run_probe(
 /// own emulation) run 1 is under -icount and the service's steps are
 /// judged.
 pub fn probe(machine: &qemu::Machine, steps: bool) -> Result<(), String> {
-    let files = Files::new();
+    let files = Files::new(machine, "probe");
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-blk-probe.img", &PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image(image_name(machine, "probe"), &PROGRAMS, BOOT_PROFILE)?;
     qemu::store_file(&files.disk, DISK_BYTES, true)?;
     let icount = steps && !machine.is_hvf();
     let cmd = machine_command(machine, &kernel, &image, &files.disk, None, icount);
@@ -287,9 +310,9 @@ pub fn probe(machine: &qemu::Machine, steps: bool) -> Result<(), String> {
 
 /// Run 3 on `machine`: the host's errors reach the client.
 pub fn faults(machine: &qemu::Machine) -> Result<(), String> {
-    let files = Files::new();
+    let files = Files::new(machine, "faults");
     let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-blk-probe.img", &PROGRAMS, BOOT_PROFILE)?;
+    let image = build_boot_image(image_name(machine, "faults"), &PROGRAMS, BOOT_PROFILE)?;
     qemu::store_file(&files.faults, DISK_BYTES, true)?;
     {
         use std::io::Write;
@@ -327,6 +350,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
             probe(&qemu::VIRT, true)?;
             faults(&qemu::VIRT)
         }
+        // TCG without -icount, where the speed pass of the probe means something.
+        [flag] if flag == "--plain" => probe(&qemu::VIRT, false),
         [flag] if flag == "--hvf" => {
             hvf_host()?;
             for machine in [&qemu::HVF_V3, &qemu::HVF_V2] {
@@ -335,7 +360,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: cargo xtask blk-probe [--hvf]".into()),
+        _ => Err("usage: cargo xtask blk-probe [--hvf | --plain]".into()),
     }
 }
 
@@ -426,22 +451,41 @@ mod tests {
     }
 
     #[test]
-    fn the_files_carry_the_process_and_go_with_the_command() {
-        let (disk, rules);
-        {
-            let files = Files::new();
-            let name = files
-                .disk
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            assert!(name.contains(&std::process::id().to_string()));
-            std::fs::write(&files.disk, b"x").unwrap();
-            std::fs::write(&files.rules, b"x").unwrap();
-            disk = files.disk.clone();
-            rules = files.rules.clone();
-        }
-        assert!(!disk.exists() && !rules.exists());
+    fn the_files_of_the_jobs_share_none_and_go_with_their_run() {
+        let sets: Vec<Files> = vec![
+            Files::new(&qemu::VIRT, "probe"),
+            Files::new(&qemu::VIRT_V3, "probe"),
+            Files::new(&qemu::VIRT, "faults"),
+        ];
+        let mut all: Vec<&PathBuf> = sets
+            .iter()
+            .flat_map(|f| [&f.disk, &f.faults, &f.rules])
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "two runs name one file");
+        let name = sets[0]
+            .disk
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.contains(&std::process::id().to_string()));
+        let (kept, gone) = (sets[1].disk.clone(), sets[0].disk.clone());
+        std::fs::write(&kept, b"x").unwrap();
+        std::fs::write(&gone, b"x").unwrap();
+        let mut sets = sets;
+        drop(sets.remove(0));
+        assert!(!gone.exists(), "a run removes its files");
+        assert!(kept.exists(), "a run removes only its own files");
+        drop(sets);
+        assert!(!kept.exists());
+        let images = [
+            image_name(&qemu::VIRT, "probe"),
+            image_name(&qemu::VIRT_V3, "probe"),
+            image_name(&qemu::VIRT, "faults"),
+        ];
+        assert!(images[0] != images[1] && images[1] != images[2] && images[0] != images[2]);
     }
 }

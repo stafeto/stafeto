@@ -48,6 +48,8 @@ const FAULTS: &[u8; 8] = b"STAFFLT1";
 /// The tries of a check that depends on the device being slower than the
 /// probe.
 const TRIES: usize = 200;
+/// The requests of the speed pass: 256 of 16 KiB, 4 MiB.
+const SPEED_REQUESTS: u64 = 256;
 /// The pause between connects after CRASH.
 const PAUSE_NS: u64 = 20_000_000;
 
@@ -529,8 +531,46 @@ impl Probe<'_> {
         self.cancelled()?;
         check(self.pattern(false)? == done, "sectors read back")?;
         rt::println!("blk-probe: {done} sectors read back and equal");
+        self.speed()?;
         self.mark(done)?;
         rt::println!("blk-probe: written {done} sectors");
+        Ok(())
+    }
+
+    /// 4 MiB written and read again over a stretch past the pattern, four
+    /// cells in flight, the cells as they are: the time of the service, the
+    /// device and the queue, without the pattern's arithmetic. The line is
+    /// for the people who read the log.
+    fn speed(&self) -> Result<(), Fail> {
+        const FROM: u64 = 20_000;
+        let run = |method: Method| -> Result<u64, Fail> {
+            let began = time::ticks_to_ns(time::now());
+            for batch in 0..SPEED_REQUESTS / CELLS as u64 {
+                let mut keys = [0u64; CELLS as usize];
+                for (i, key) in keys.iter_mut().enumerate() {
+                    let sector =
+                        FROM + (batch * u64::from(CELLS) + i as u64) * u64::from(SECTORS_MAX);
+                    *key = self
+                        .start(method, i as u32, SECTORS_MAX, sector)
+                        .map_err(|_| "a request of the speed pass was refused")?;
+                }
+                for key in keys {
+                    self.finish(key)
+                        .map_err(|_| "a request of the speed pass failed")?;
+                }
+            }
+            Ok(time::ticks_to_ns(time::now()) - began)
+        };
+        let wrote = run(Method::Write)?;
+        self.flush_all()?;
+        let read = run(Method::Read)?;
+        let sectors = SPEED_REQUESTS * u64::from(SECTORS_MAX);
+        rt::println!(
+            "blk-probe: speed: {sectors} sectors written in {} us, read in {} us, {} in flight",
+            wrote / 1000,
+            read / 1000,
+            CELLS
+        );
         Ok(())
     }
 
