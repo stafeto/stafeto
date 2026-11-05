@@ -384,6 +384,36 @@ bytes, names of 255 bytes in one bucket and 1 023 short names. The files of the 
 end in `.stpkg` are attached before the service registers, as layers 0x8000 and up that cannot
 be detached.
 
+## Images on layers
+
+The packages of an image are files of its container, `<name>-<version>-<release>.stpkg`, the files
+of `target/pkg/` that the repository of the same run is made of (a run of xtask builds each
+package once, so the image, the index and `pkg-identity` see the same bytes). The table `rootfs`
+of the image holds the paths of the system alone, the directories above them and the notices of the
+system under `/usr/share/licenses/stafeto/` (the licences of the tree, `relibc-THIRD-PARTY-NOTICES`,
+which is the file `THIRD-PARTY-NOTICES` of the container, and `crates/`). `rootfs::layered` splits
+the list of an image in the table and the packages; a test checks that the two make the list.
+`cargo xtask image-listing` writes the tree an image shows (path, mode, owner, SHA-256 of the
+content, table and layers merged), so that two builds can be compared.
+
+A probe that changes the bytes of a path of a package (the settings of nginx and nginx on the
+stack, the CA file with the probe's authority in the image of the probe of TLS) gets a variant of
+the package file, built for that image into `target/pkg/variants/<image>/` with the development key;
+the variants go to no repository. A program that only a package names has no ELF file of its own
+in the image, and the files of notices that an image holds for a program of its table
+(`BUSYBOX-LICENSE`, `BASH-LICENSE` and the like) stay only where the table names the program;
+`notices::image_has_package_notices` checks both cases. The files of a package carry the time of its
+package file; a file of a package takes no new name (a hard link to it is EROFS).
+
+`cargo xtask image base` builds `boot-base.img` (the ten base packages) and `cargo xtask image full`
+`boot-full.img` (every package with files), both on `table-base` (the games table with the network
+service) and on a machine with the network, the screen and the keyboard; `run` boots one in QEMU.
+`cargo xtask pkg-identity` checks that each package file of both images is, byte for byte, the file
+of the index, that their tables hold no path of a package, and that both boot: `ls -l /bin/doom`
+and the text of the licence of freedoom in the full image, no `/bin/doom` in the base image, the
+directories of `/usr/share/licenses`, the services of the screen and the keys, and no `not
+attached` line of the service.
+
 ## The disk service
 
 The packages of a running system live on a disk. `services/virtio-blk` (the
