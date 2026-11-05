@@ -2134,7 +2134,7 @@ mod tests {
         let plain = ramfs::BUSYBOX_DIALOG_TABLE[2];
         let process = net::NET_TABLE[2];
         assert_eq!(process.program, plain.program);
-        assert_eq!(process.quota - plain.quota, 10 * net::NET_COMMAND_QUOTA);
+        assert_eq!(process.quota - plain.quota, 16 * net::NET_COMMAND_QUOTA);
         assert_eq!(launcher.quota, net::NET_COMMAND_QUOTA);
     }
 
