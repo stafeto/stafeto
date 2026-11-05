@@ -626,13 +626,19 @@ fn stat_numbers(line: &str) -> Option<(u32, u64)> {
 /// Step 4: five answers of 256 KiB through the shared buffers, five of 10 KiB.
 fn large_files(run: &mut qemu::Run, address: SocketAddr) -> Result<(), String> {
     let (_, before) = buffered(run)?;
+    let mut fetched = Vec::new();
     for n in 0..LARGE_FETCHES {
-        let body = Connection::open(address, READ_WITHIN)
-            .and_then(|mut c| c.get("/256k.bin"))
+        let mut connection = Connection::open(address, READ_WITHIN)
             .map_err(|e| format!("GET /256k.bin {}: {e}", n + 1))?;
+        let at = Instant::now();
+        let body = connection
+            .get("/256k.bin")
+            .map_err(|e| format!("GET /256k.bin {}: {e}", n + 1))?;
+        fetched.push(at.elapsed());
         same(&format!("GET /256k.bin {}", n + 1), &body, www_256k())?;
     }
     let (sessions, after) = buffered(run)?;
+    let answer = fetched.iter().sum::<Duration>() / LARGE_FETCHES as u32;
     let grown = after.wrapping_sub(before);
     let wanted = (LARGE_FETCHES * WWW_256K_LEN / 1024) as u64;
     if grown < wanted {
@@ -649,7 +655,42 @@ fn large_files(run: &mut qemu::Run, address: SocketAddr) -> Result<(), String> {
     println!(
         "nginx-probe: {LARGE_FETCHES} x 256 KiB and {SMALL_FETCHES} x 10 KiB by SHA-256; the shared buffers carried {grown} KiB, {sessions} sessions hold one"
     );
+    // The cost of reading the file nginx sends: the file service answers
+    // pread in messages of at most 1 016 bytes (proto_fs::MAX_READ).
+    run.send(&format!("posix-net readfile /www/256k.bin {READ_ROUNDS}"))?;
+    let line = run.expect_line(
+        "posix-net readfile",
+        |l| l.contains("posix-net: readfile "),
+        DIALOG_STEP * 3,
+    )?;
+    let read = readfile_mean(&line).ok_or_else(|| format!("the line {line:?}"))?;
+    println!(
+        "nginx-probe: a pread of /www/256k.bin in 32 KiB pieces takes {read} us on the mean ({READ_ROUNDS} rounds, {} messages of the file service of at most {} bytes); a GET of it from the host {} us",
+        WWW_256K_LEN.div_ceil(proto_fs_max_read()),
+        proto_fs_max_read(),
+        answer.as_micros()
+    );
     Ok(())
+}
+
+/// The reads of the file in `posix-net readfile`.
+const READ_ROUNDS: usize = 100;
+
+/// The most bytes the file service answers a read with (proto_fs::MAX_READ:
+/// MESSAGE_MAX less the reply's header).
+fn proto_fs_max_read() -> usize {
+    1016
+}
+
+/// The mean time of one read in microseconds of the line `posix-net:
+/// readfile B bytes N rounds mean M us least L us most X us`.
+fn readfile_mean(line: &str) -> Option<u64> {
+    line.split(" mean ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Step 5: SIGHUP under a new connection every 50 ms; none fails, and new
@@ -964,6 +1005,18 @@ mod tests {
         lines.pop();
         lines.retain(|l| !l.contains(&format!("kind {BUFFER_KIND} ")));
         assert!(steps_verdict(&lines).unwrap_err().contains("Buffer"));
+    }
+
+    #[test]
+    fn the_time_of_a_read_comes_from_posix_net_readfile() {
+        assert_eq!(
+            readfile_mean(
+                "posix-net: readfile 262144 bytes 100 rounds mean 4210 us least 3900 us most 7000 us"
+            ),
+            Some(4210)
+        );
+        assert_eq!(readfile_mean("posix-net: readfile /x: No such file"), None);
+        assert_eq!(proto_fs_max_read(), proto_fs::MAX_READ);
     }
 
     #[test]

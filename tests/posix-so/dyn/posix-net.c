@@ -19,6 +19,8 @@
  *   posix-net buffer-exec-child N the image of the check `buffer-exec`: the
  *                                service holds N shared buffers
  *   posix-net stat               the shared buffers of the network service
+ *   posix-net readfile PATH N    N reads of the file PATH by pread in 32 KiB
+ *                                pieces: the time of one read of the file
  *
  * A failure prints `posix-net: NAME failed: WHAT errno N` and the exit code
  * is 1. Built with -fno-builtin; every result is compared.
@@ -2885,6 +2887,46 @@ static int stat_buffers(void)
 	return 0;
 }
 
+/* `posix-net readfile PATH N`: N reads of the whole file PATH by pread in
+ * pieces of 32 KiB, as nginx reads a file it sends (output_buffers 32k);
+ * prints the time of one read of the file, the shortest and the longest. */
+static int readfile(const char *path, int rounds)
+{
+	static char piece[32 * 1024];
+	int fd = open(path, O_RDONLY);
+	if (fd < 0 || rounds < 1) {
+		printf("posix-net: readfile %s: %s\n", path, fd < 0 ? strerror(errno) : "no rounds");
+		return 1;
+	}
+	long long total = 0, least = -1, most = 0, bytes = 0;
+	for (int r = 0; r < rounds; r++) {
+		struct timespec a, b;
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		off_t at = 0;
+		for (;;) {
+			ssize_t n = pread(fd, piece, sizeof piece, at);
+			if (n < 0) {
+				printf("posix-net: readfile %s: pread at %lld: %s\n", path, (long long)at,
+				       strerror(errno));
+				return 1;
+			}
+			if (n == 0)
+				break;
+			at += n;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		long long ns = (b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec);
+		total += ns;
+		least = least < 0 || ns < least ? ns : least;
+		most = ns > most ? ns : most;
+		bytes = at;
+	}
+	close(fd);
+	printf("posix-net: readfile %lld bytes %d rounds mean %lld us least %lld us most %lld us\n",
+	       bytes, rounds, total / rounds / 1000, least / 1000, most / 1000);
+	return 0;
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -2966,6 +3008,8 @@ int main(int argc, char **argv)
 		return buffer_exec_child((unsigned)atoi(argv[2]));
 	if (argc == 2 && strcmp(argv[1], "stat") == 0)
 		return stat_buffers();
+	if (argc == 4 && strcmp(argv[1], "readfile") == 0)
+		return readfile(argv[2], atoi(argv[3]));
 	if (argc != 2 && argc != 3) {
 		printf("posix-net: usage: posix-net ADDRESS [NAME]\n");
 		return 2;
