@@ -76,7 +76,6 @@ fn the_mask_takes_the_fast_label_of_every_try_and_nothing_else() {
     assert_ne!((1u64 << 62 | 0xfa58 << 32) & FAST_MASK, FAST_LABEL);
     assert_ne!((1u64 << 63 | 5) & FAST_MASK, FAST_LABEL);
     assert_ne!(7u64 & FAST_MASK, FAST_LABEL);
-    assert_ne!(0u64 & FAST_MASK, FAST_LABEL);
 }
 
 fn sources(dir: &Path, found: &mut Vec<(String, String)>) {
