@@ -604,7 +604,7 @@ impl fmt::Display for TableError<'_> {
             ),
             TableError::Layers { record } => write!(
                 f,
-                "{record} is a layer client: one at most, not a POSIX process, and it connects to {RAM_SERVICE}"
+                "{record} is a layer client: there is one at most, it is a native program, and it connects to {RAM_SERVICE}"
             ),
         }
     }
