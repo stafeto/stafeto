@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 47] = [
+const SYSTEM_PATHS: [&str; 48] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -305,6 +305,8 @@ const SYSTEM_PATHS: [&str; 47] = [
     "/etc/nginx/tls.conf",
     "/etc/nginx/server.crt",
     "/etc/nginx/server.key",
+    // The images of nginx's measurement: the smallest file of the load.
+    "/www/1k.bin",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -1092,6 +1094,53 @@ fn nginx_files(image: &str) -> Vec<RootFile> {
     files
 }
 
+/// The files of the images of nginx's measurement (`nginx-bench`): those of
+/// the shell with the network (nginx with the package's settings among
+/// them), the variant of the settings with one listening socket, the files
+/// of 1 KiB, 10 KiB and 256 KiB of the load and, in the images without the
+/// shared buffers, `netd.conf` with `buffers 0`.
+fn nginx_bench_files(image: &str) -> Vec<RootFile> {
+    let mut files = net_files(image);
+    files.extend([
+        of(
+            "/etc/nginx/exclusive.conf",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-bench-exclusive.conf",
+                crate::nginx_bench::exclusive_conf().as_bytes(),
+            ),
+        ),
+        of(
+            "/www/1k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-1k", crate::nginx_bench::www_1k()),
+        ),
+        of(
+            "/www/10k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-10k", crate::nginx_probe::www_10k()),
+        ),
+        of(
+            "/www/256k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("www-256k", crate::net_tls::big_file()),
+        ),
+    ]);
+    if image.ends_with("-nobuf.img") {
+        files.push(of(
+            "/etc/netd.conf",
+            0o644,
+            ROOT,
+            Source::Bytes("netd.conf", crate::nginx_bench::NO_BUFFERS_CONF),
+        ));
+    }
+    files
+}
+
 /// The bytes of `/www/index.html` of the image with the network service: 64
 /// KiB of lines from a fixed generator, so that the host knows the page
 /// without reading the image (`cargo xtask net-curl`).
@@ -1132,6 +1181,10 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-net-steps.img",
     "boot-nginx-probe.img",
     "boot-nginx-probe-steps.img",
+    "boot-nginx-bench.img",
+    "boot-nginx-bench-nobuf.img",
+    "boot-nginx-bench-vz.img",
+    "boot-nginx-bench-vz-nobuf.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1252,6 +1305,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-nginx-probe.img" | "boot-nginx-probe-steps.img" => nginx_files(name),
+        "boot-nginx-bench.img"
+        | "boot-nginx-bench-nobuf.img"
+        | "boot-nginx-bench-vz.img"
+        | "boot-nginx-bench-vz-nobuf.img" => nginx_bench_files(name),
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.
@@ -1806,6 +1863,12 @@ mod tests {
                 "boot-net-tls.img" => crate::net::programs(),
                 "boot-nginx-probe.img" => crate::nginx_probe::programs(),
                 "boot-nginx-probe-steps.img" => crate::nginx_probe::steps_programs(),
+                "boot-nginx-bench.img" | "boot-nginx-bench-nobuf.img" => {
+                    crate::nginx_bench::programs(false)
+                }
+                "boot-nginx-bench-vz.img" | "boot-nginx-bench-vz-nobuf.img" => {
+                    crate::nginx_bench::programs(true)
+                }
                 "boot-posix-net-steps.img" => crate::posix_net::steps_programs(),
                 "boot-net-probe.img" | "boot-net-probe-static.img" => &crate::net_probe::PROGRAMS,
                 "boot-net-steps.img" => &crate::net_probe::STEPS_PROGRAMS,

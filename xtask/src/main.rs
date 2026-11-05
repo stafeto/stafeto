@@ -60,6 +60,7 @@ mod net_tls;
 mod net_vz;
 mod net_wget;
 mod netd_quota;
+mod nginx_bench;
 mod nginx_probe;
 mod obj_sites;
 mod openposix;
@@ -1728,6 +1729,13 @@ commands:
             the shared buffer, a reload by SIGHUP under requests, SIGQUIT, the
             variant with EPOLLEXCLUSIVE; no [alert], [emerg] or [crit] line; with
             `steps` the network service counts its steps (TCG only)
+  nginx-bench [--machine hvf|vz|host] [--cpus N] [--no-buffers] [--quick]
+            measure nginx on stafeto from the Mac (by hand: HVF through the
+            forwarded port, VZ directly): the ceiling by wrk, latencies at
+            10 to 90 % of it by vegeta, 1k and 256k answers, no keep-alive,
+            one listening socket, the guest's reads of the files; `host`
+            runs the load against Homebrew's nginx; table and raw output in
+            target/nginx-bench/
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
@@ -1996,6 +2004,7 @@ fn main() {
         Some("net-probe") => net_probe::command(&args[1..]),
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
+        Some("nginx-bench") => nginx_bench::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
