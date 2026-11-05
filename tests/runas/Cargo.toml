@@ -13,4 +13,7 @@ test = false
 bench = false
 
 [dependencies]
+libc-ffi = { path = "../libc-ffi" }
+posix-abi = { path = "../../lib/posix-abi" }
 posix-crt = { path = "../../lib/posix-crt" }
+rt = { path = "../../lib/rt" }

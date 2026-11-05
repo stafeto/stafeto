@@ -172,6 +172,9 @@ impl Drop for Mirror {
     }
 }
 
+/// The requests of the mirror a command made, with the time of each.
+type Requests = Vec<(Instant, String)>;
+
 /// The path of a request of a package file in the log, for the packages of Doom.
 fn gets_of_packages(requests: &[(Instant, String)]) -> usize {
     requests
@@ -204,7 +207,7 @@ fn make_good(states: &Path) -> Result<PathBuf, String> {
             cert: None,
             root: None,
             check: false,
-            dir: Some(states.join("good")),
+            dir: Some(states.join("doom")),
         },
     )
 }
@@ -297,7 +300,12 @@ fn test_files() -> Result<Vec<rootfs::RootFile>, String> {
     cmd.args(["--target", crate::PROGRAM_TARGET, "--package", "runas"]);
     crate::run_cmd(&mut cmd)?;
     let path = crate::cargo_output(&target_dir(), crate::PROGRAM_TARGET, BOOT_PROFILE, "runas");
-    let runas = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The file the linker wrote carries its debug information (6.7 MB); the image holds it stripped.
+    let stripped = target_dir().join("pkg-probe").join("runas");
+    std::fs::create_dir_all(stripped.parent().ok_or("no directory")?).map_err(|e| e.to_string())?;
+    std::fs::copy(&path, &stripped).map_err(|e| format!("{}: {e}", path.display()))?;
+    crate::strip_elf(&stripped, &crate::llvm_tool("llvm-objcopy")?)?;
+    let runas = std::fs::read(&stripped).map_err(|e| format!("{}: {e}", stripped.display()))?;
     let leak = |b: Vec<u8>| -> &'static [u8] { Box::leak(b.into_boxed_slice()) };
     let file =
         |path: &'static str, mode: u32, tag: &'static str, bytes: Vec<u8>| rootfs::RootFile {
@@ -424,7 +432,7 @@ fn with_log(
     command: &str,
     marker: &str,
     wanted: i32,
-) -> Result<(Vec<String>, Vec<(Instant, String)>), String> {
+) -> Result<(Vec<String>, Requests), String> {
     let mark = ctx.mirror.mark();
     let lines = expect_code(run, command, marker, wanted, INSTALL_WITHIN)?;
     Ok((lines, ctx.mirror.requests(mark)))
@@ -444,7 +452,10 @@ fn got(requests: &[(Instant, String)], what: &str) -> bool {
 
 /// The store as `pkg check` and `pkg list` say it, to be sure a refusal changed nothing.
 fn store_of(run: &mut qemu::Run, marker: &str) -> Result<(Vec<String>, Vec<String>), String> {
-    let check = expect_code(run, "pkg check", &format!("{marker}c"), 0, DIALOG_STEP)?;
+    // The generation moves with a list of revocations that is taken again; the packages and the
+    // free space do not.
+    let mut check = expect_code(run, "pkg check", &format!("{marker}c"), 0, DIALOG_STEP)?;
+    check.retain(|l| !l.starts_with("store generation"));
     let list = expect_code(run, "pkg list", &format!("{marker}l"), 0, DIALOG_STEP)?;
     Ok((check, list))
 }
@@ -765,7 +776,7 @@ fn demo_run(run: &mut qemu::Run, demo: &str, marker: &str) -> Result<(u64, u64),
             timed.0
         ));
     }
-    Ok((timed.0 as u64, timed.1 as u64))
+    Ok(timed)
 }
 
 /// Steps 10 to 14: each refusal with its own line, and what stays as it was.
@@ -855,7 +866,11 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
     need(&lines, "removed app 1.0-1", "step 14")?;
     let lines = expect_code(run, "pkg list", "list-lib", 0, DIALOG_STEP)?;
     need(&lines, "lib 1.0-1 stafeto", "step 14")?;
-    if has(&lines, "[dependency]") || has(&lines, "app ") {
+    if lines
+        .iter()
+        .any(|l| l.starts_with("lib ") && l.contains("[dependency]"))
+        || lines.iter().any(|l| l.starts_with("app "))
+    {
         return Err(format!(
             "step 14: lib should stay as a package of the world: {lines:?}"
         ));

@@ -13,6 +13,11 @@
 
 use core::ffi::{c_char, c_int};
 
+// The C library and the layer under it are linked for the symbols the start and `setuid` need.
+use libc_ffi as _;
+use posix_abi as _;
+use rt as _;
+
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 

@@ -19,7 +19,7 @@ bench = false
 
 [dependencies]
 pkgfmt = { path = "../../lib/pkgfmt" }
-proto-pkg = { path = "../../proto/pkg", features = ["alloc"] }
+proto-pkg = { path = "../../proto/pkg" }
 proto-wire = { path = "../../proto/wire" }
 
 # The program alone runs on stafeto: the host tests of the library build

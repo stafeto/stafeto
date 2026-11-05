@@ -99,6 +99,22 @@ fn key_line(key: &Key) -> String {
     )
 }
 
+/// The blob of `files`: the signature, the version, the count, then each file's name and bytes.
+/// (`proto_pkg::blob::write` is for the host; the program has no use of the feature that holds it.)
+fn blob_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&blob::MAGIC);
+    out.extend_from_slice(&blob::VERSION.to_le_bytes());
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (name, data) in files {
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+    }
+    out
+}
+
 fn name_ok(name: &str) -> bool {
     name.len() <= 31 && pkgfmt::Name::new(name).is_ok()
 }
@@ -159,7 +175,7 @@ impl Settings {
         for (name, data) in &keys {
             files.push((name, data.as_bytes()));
         }
-        blob::write(&files)
+        blob_of(&files)
     }
 
     fn key_of(&self, name: &str) -> Option<&Key> {
@@ -392,6 +408,14 @@ mod tests {
             provides: vec![],
             depends: vec![],
         }
+    }
+
+    #[test]
+    fn the_blob_is_the_one_the_protocol_writes() {
+        let files: [(&str, &[u8]); 2] =
+            [("repositories", b"a https://h/x\n"), ("keys/a.pub", b"k")];
+        assert_eq!(blob_of(&files), blob::write(&files));
+        assert_eq!(blob_of(&[]), blob::write(&[]));
     }
 
     #[test]

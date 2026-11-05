@@ -1153,7 +1153,10 @@ dependencies = [
 name = "runas"
 version = "0.1.0"
 dependencies = [
+ "libc-ffi",
+ "posix-abi",
  "posix-crt",
+ "rt",
 ]
 
 [[package]]

@@ -12132,6 +12132,8 @@ fn ci_lints() -> Result<(), String> {
         "store-probe",
         "--package",
         "pkg",
+        "--package",
+        "runas",
         "--features",
         "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",

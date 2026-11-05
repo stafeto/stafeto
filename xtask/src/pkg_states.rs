@@ -12,7 +12,7 @@
 //! | `tampered` (2) | the same `INDEX` byte for byte, one byte of the file of `hello` changed |
 //! | `long` (2) | the same `INDEX`, the file of `hello` a page longer than the entry says |
 //! | `old` (1) | a good index with a smaller number |
-//! | `expired` (3) | a good signature, `expires` yesterday |
+//! | `expired` (3) | a good signature, `expires` half a minute ago |
 //! | `foreign` (4) | `good` and `alien`, a package signed by a key nobody trusts |
 //! | `next` (5) | `good`, but `hello` 2.0 |
 //! | `stolen` (6) | `next`, signed by the key of the repository `games` |
@@ -358,7 +358,9 @@ pub fn make(states: &Path, doom: &Path) -> Result<States, String> {
     let expired = compose(
         &states.join("expired"),
         &good_records,
-        &official(3, t - 2 * DAY, t - DAY),
+        // Signed a minute ago (the certificate of the release key holds from the start of today)
+        // and good until half a minute ago.
+        &official(3, t - 60, t - 30),
         Some(doom),
     )?;
     let foreign = compose(
