@@ -150,12 +150,14 @@ pub fn big_file() -> &'static [u8] {
 }
 
 /// The licence texts and the notes of the sources of OpenSSL, curl and the
-/// root certificates, for an image that holds them.
+/// root certificates, for an image that holds them; `programs` are those of
+/// the image that link OpenSSL, `openssl` among them where it is there.
 pub fn terms_files(
-    openssl: bool,
+    programs: &[&str],
     curl: bool,
     bundle: bool,
 ) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+    let openssl = programs.contains(&"openssl");
     let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
     let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
     let commit = crate::rtbench2::commit();
@@ -175,13 +177,14 @@ pub fn terms_files(
             format!(
                 "OpenSSL {version}, Copyright (c) the OpenSSL Project Authors.\n\
                  Licensed under the Apache License 2.0 (OPENSSL-LICENSE).\n\
-                 Linked statically into curl and openssl of this image.\n\n\
+                 Linked statically into {} of this image.\n\n\
                  Its source: {url}\n\
                  (SHA-256 {sha256}), built unchanged by tools/build-openssl.py\n\
                  of https://github.com/stafeto/stafeto at commit {commit} with\n\
                  {}\
                  linked with relibc https://github.com/stafeto/relibc at commit {relibc}\n\
                  (THIRD-PARTY-NOTICES).\n",
+                linked_into(programs),
                 line
             )
             .into_bytes(),
@@ -245,6 +248,18 @@ pub fn terms_files(
         ));
     }
     Ok(files)
+}
+
+/// The programs `names` in the words of a sentence, sorted: `a`, `a and
+/// b`, `a, b and c`.
+fn linked_into(names: &[&str]) -> String {
+    let mut names = names.to_vec();
+    names.sort_unstable();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// `openssl s_server -WWW` on a free port of 127.0.0.1 with the certificate
@@ -312,7 +327,7 @@ fn free_port() -> Result<u16, String> {
 /// them, waiting up to `within` for the end. The markers hold the shell
 /// variable `S` (`ok`), so the echo of the typed line, wrapped at the width
 /// of the terminal, never reads as a marker.
-fn capture(
+pub(crate) fn capture(
     run: &mut qemu::Run,
     command: &str,
     marker: &str,
@@ -349,7 +364,7 @@ fn exit_code(lines: &[String]) -> Option<i32> {
 }
 
 /// Runs `command` and gives its exit code and output.
-fn coded(
+pub(crate) fn coded(
     run: &mut qemu::Run,
     command: &str,
     marker: &str,
@@ -389,7 +404,7 @@ const UNKNOWN_CA: &str = "self-signed certificate";
 /// Whether a line of `curl -v` or `openssl s_client` names TLS 1.3 as the
 /// version of the connection made (the lines of the handshake name the
 /// versions offered).
-fn negotiated_tls13(line: &str) -> bool {
+pub(crate) fn negotiated_tls13(line: &str) -> bool {
     let line = line.trim();
     (line.contains("SSL connection using TLSv1.3") || line.starts_with("Protocol"))
         && line.contains("TLSv1.3")
@@ -746,6 +761,18 @@ fn image_has_tls_files(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The note of OpenSSL's source names the programs that link it.
+    #[test]
+    fn net_tls_programs_that_link_openssl() {
+        assert_eq!(linked_into(&["openssl"]), "openssl");
+        assert_eq!(linked_into(&["openssl", "curl"]), "curl and openssl");
+        assert_eq!(
+            linked_into(&["openssl", "nginx", "curl"]),
+            "curl, nginx and openssl"
+        );
+        assert_eq!(linked_into(&[]), "");
+    }
 
     /// A file missing at the first read is read again later, and an empty
     /// CA file stops the build of an image.

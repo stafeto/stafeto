@@ -222,6 +222,19 @@ pub fn bundle_with_ca() -> &'static [u8] {
     crate::net_tls::file_once_made(&BUNDLE, &dir().join("bundle-with-ca.crt"))
 }
 
+/// The bytes of `nginx.crt` and `nginx.key`, the certificate and the key of
+/// nginx in the images of `nginx-probe`; empty while the CA has not been
+/// made (the build of such an image refuses them so).
+pub fn nginx_certificate() -> &'static [u8] {
+    static FILE: std::sync::Mutex<Option<&'static [u8]>> = std::sync::Mutex::new(None);
+    crate::net_tls::file_once_made(&FILE, &dir().join("nginx.crt"))
+}
+
+pub fn nginx_key() -> &'static [u8] {
+    static FILE: std::sync::Mutex<Option<&'static [u8]>> = std::sync::Mutex::new(None);
+    crate::net_tls::file_once_made(&FILE, &dir().join("nginx.key"))
+}
+
 /// `cargo xtask probe-ca [--renew]`.
 pub fn command(args: &[String]) -> Result<(), String> {
     let renew = match args {

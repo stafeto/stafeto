@@ -505,18 +505,30 @@ const NET_LAUNCHER: Record = Record {
 
 /// The quota of the launcher of the shell with the network, which the shell
 /// and its commands get too. curl and openssl link OpenSSL statically (3.2
-/// MB programs) and read the 118 root certificates of the CA file (119 with the probe CA) into
-/// their heap: `net-tls` passes with 1 325 pages and fails with 1 250 at the
-/// first load of the file (bisected; the shell's 1 160 pages fail at about
-/// 90 certificates), and 1 472 pages leave 11%.
-pub const NET_COMMAND_QUOTA: u64 = 1472 * PAGE;
+/// MB programs) and read the 118 root certificates of the CA file (119 with
+/// the probe CA) into their heap: `net-tls` passes with 1 325 pages.
+///
+/// nginx links OpenSSL too (3.7 MB, 803 pages of code and read-only data),
+/// and a worker of fork gets the quota less those pages, which the master
+/// pays for. Under HTTP/2 a worker serves many streams of a connection at
+/// once, each with nginx's two output buffers of 32 KiB and the pool of its
+/// request: about 20 pages a stream. h2load's check in `nginx-probe` (10
+/// connections of 10 streams, which the hash of SO_REUSEPORT spreads over
+/// four workers at random) fails with 1 832 pages and passes with 1 904;
+/// all its 100 streams in one worker (one connection of 100 streams) fail
+/// with 3 328 pages and pass with 3 584 (bisected). 4 096 pages (16 MiB)
+/// carry the worst spread with 14% left. A quota is a limit that reserves
+/// no memory ahead.
+pub const NET_COMMAND_QUOTA: u64 = 4096 * PAGE;
 
 /// The process service of the image with the network: the pool of the
 /// shell's image and sixteen more quotas of a command. `httpd` forks a child
 /// for each connection, and the eight simultaneous requests of `net-curl`
 /// make eight children over the shell, the server and the launcher; a reload
 /// of nginx (SIGHUP) has its master, four old and four new workers alive at
-/// once beside the shell, the launcher and `posix-net`.
+/// once beside the shell, the launcher and `posix-net`. A worker's quota is
+/// the command's less nginx's image, so the nine processes of nginx take
+/// 4 096 + 8 x 3 293 = 30 440 of the 65 536 pages of the sixteen quotas.
 const NET_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL

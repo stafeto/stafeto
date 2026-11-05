@@ -17,23 +17,31 @@ does not know stops the build. No other file of nginx changes. Every step
 compiles with target/nginx/cc, clang for the target with relibc's headers
 alone, so that the probes see the same headers on any host.
 
+The modules of TLS (`http_ssl_module`) and HTTP/2 (`http_v2_module`) are in.
+OpenSSL is the static one of tools/build-openssl.py, found by `-I` and `-L`
+(target/openssl/install): `--with-openssl` would make nginx run OpenSSL's
+own `config` for the machine of the build. `configure` then checks the
+library with a compile and a link of `SSL_CTX_set_options`, a probe that
+does not run.
+
 PCRE2 is built by nginx's own Makefile from its source tree, 8-bit, static,
 without JIT (JIT needs memory that is writable and executable at once, which
-the layer refuses). The gzip module is left out, as are threads, file AIO,
-SSL and the stream module.
+the layer refuses). The gzip module is left out, as are threads, file AIO
+and the stream module.
 
 Two lines of the Makefile `configure` writes change: PCRE2's own
 `configure` gets the options of a build for another machine (nginx's
 `configure` has no option that passes them), and the link of objs/nginx
-becomes a relocatable one. The result is one relocatable object, target/nginx/nginx.o (nginx's objects
-and libpcre2-8.a), that exports `main` alone: the names of nginx's own
+becomes a relocatable one. The result is one relocatable object,
+target/nginx/nginx.o (nginx's objects, libpcre2-8.a, and OpenSSL's
+libssl.a and libcrypto.a), that exports `main` alone: the names of nginx's own
 helpers cannot meet relibc's or the program's. tools/build-libc-so.py
 programs links it against libc.so. The answers given are in
 target/nginx/autotest-answers.txt.
 
 nginx is BSD-2-Clause and PCRE2 BSD-3-Clause with the PCRE2 exception: the
 archives are fetched at build time with their SHA-256 checked, and the
-image's licence notices name both."""
+image's licence notices name both and OpenSSL's (Apache-2.0)."""
 
 from hashlib import sha256
 import os
@@ -54,6 +62,9 @@ PCRE2 = pkgdesc.load("pcre2")
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "nginx"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
+# The headers and static archives of tools/build-openssl.py.
+OPENSSL = ROOT / "target" / "openssl" / "install"
+SSL_ARCHIVES = (OPENSSL / "lib" / "libssl.a", OPENSSL / "lib" / "libcrypto.a")
 HERE = ROOT / "tools" / "nginx"
 PATCH = HERE / "cross-autotest.patch"
 ANSWER = HERE / "autotest-answer.py"
@@ -84,6 +95,7 @@ CONFIGURE = (
     "--http-scgi-temp-path=/var/lib/nginx/scgi",
     "--user=nobody", "--group=nobody",
     "--without-http_gzip_module",
+    "--with-http_ssl_module", "--with-http_v2_module",
 )
 # --build differs from --host on every host on purpose, the Linux runner of
 # ci too: autoconf takes the build for a cross one only when the two differ,
@@ -133,9 +145,10 @@ def fetch(description: dict, archive: Path) -> None:
 
 def relocatable_link(makefile: Path) -> None:
     """The recipe of `objs/nginx` in nginx's Makefile made a relocatable
-    link of the same objects and PCRE2's archive: the Rust program links
-    relibc and the crt. The recipe must be found exactly once and name no
-    library."""
+    link of the same objects, PCRE2's archive and OpenSSL's two: the Rust
+    program links relibc and the crt. The recipe must be found exactly once,
+    ask OpenSSL's libraries exactly once (they become the paths of the
+    archives) and name no other library."""
     lines = makefile.read_text().split("\n")
     heads = [i for i, line in enumerate(lines) if line.startswith("objs/nginx:")]
     if len(heads) != 1:
@@ -153,8 +166,13 @@ def relocatable_link(makefile: Path) -> None:
     end = recipe
     while lines[end].endswith("\\"):
         end += 1
+    asked = " -lssl -lcrypto"
+    found = sum(lines[i].count(asked) for i in range(recipe, end + 1))
+    if found != 1:
+        raise SystemExit(f"{makefile}: the link of objs/nginx asks OpenSSL {found} times")
     for i in range(recipe, end + 1):
-        lines[i] = lines[i].replace("-Wl,-E", "")
+        lines[i] = lines[i].replace("-Wl,-E", "").replace(f"-L{OPENSSL / 'lib'}", "")
+        lines[i] = lines[i].replace(asked, "".join(f" {archive}" for archive in SSL_ARCHIVES))
         if " -l" in lines[i]:
             raise SystemExit(f"{makefile}: the link of objs/nginx asks a library: {lines[i]!r}")
     makefile.write_text("\n".join(lines))
@@ -201,9 +219,12 @@ def main() -> None:
     libc = RELIBC / "lib" / "libc.a"
     if not (RELIBC / "include" / "stdio.h").exists() or not libc.exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
+    if not all(archive.exists() for archive in SSL_ARCHIVES):
+        raise SystemExit("build OpenSSL with tools/build-openssl.py first")
     stamp = WORK / "stamp"
     text = " ".join((NGINX["version"], NGINX["sha256"], PCRE2["version"], PCRE2["sha256"], script,
-                     *(sha256(p.read_bytes()).hexdigest() for p in (PATCH, ANSWER, libc)))) + "\n"
+                     *(sha256(p.read_bytes()).hexdigest()
+                       for p in (PATCH, ANSWER, libc, *SSL_ARCHIVES)))) + "\n"
     if stamp.exists() and stamp.read_text() == text and OUTPUT.exists():
         print(f"nginx ready: {OUTPUT}")
         return
@@ -236,7 +257,9 @@ def main() -> None:
                NGX_AUTOTEST_UNKNOWN=str(UNKNOWN), NGX_AUTOTEST_LOG=str(ANSWERS),
                AR=str(ar), RANLIB=str(ranlib))
     run(log, "./configure", *CONFIGURE,
-        f"--with-cc={cc}", f"--with-cc-opt={flags} {' '.join(MACHINE)} -Wno-error",
+        f"--with-cc={cc}",
+        f"--with-cc-opt={flags} {' '.join(MACHINE)} -I{OPENSSL / 'include'} -Wno-error",
+        f"--with-ld-opt=-L{OPENSSL / 'lib'}",
         f"--with-pcre={pcre2}", f"--with-pcre-opt={flags}",
         cwd=source, env=env)
     unknown = UNKNOWN.read_text().split("\n")

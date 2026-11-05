@@ -4,10 +4,15 @@
 //! The probe of nginx on the shared sockets of the network service
 //! (`cargo xtask nginx-probe`, its own job of ci): the image of the shell with
 //! the network service and nginx (`boot-nginx-probe.img`) on QEMU's user
-//! network, a port of the host forwarded to the port 80 of the guest. xtask
-//! drives `ash` over the serial port and talks to nginx as a client of the
-//! host:
+//! network, a port of the host forwarded to the port 80 of the guest and
+//! another to its port 443 (nginx's server of TLS 1.3 and HTTP/2,
+//! tools/nginx/tls.conf, with the certificate the probe CA signed for
+//! `nginx.stafeto.test`). xtask drives `ash` over the serial port and talks
+//! to nginx as a client of the host:
 //!
+//! 0. The guest's clock is within 600 s of the host's: the certificate is
+//!    checked against it. `nginx -V` names OpenSSL and the modules of TLS
+//!    and HTTP/2.
 //! 1. `nginx -c /etc/nginx/nginx.conf &`: the console shows `using the
 //!    "epoll" event method` and four `start worker process` lines.
 //! 2. Five processes `nginx`; the four workers have the user ID 65534
@@ -18,10 +23,29 @@
 //!    its SHA-256: the network service's counter of the shared buffers grew
 //!    by 5 x 256 KiB at least (the answers went through the buffer). Five
 //!    `GET /10k.bin` by their SHA-256.
+//!
+//!    - 4a: The host's curl with `--tlsv1.3 --http2` and the probe CA: the
+//!      connection is TLS 1.3, the answer HTTP/2, the page whole; with
+//!      `--http1.1` the answer is HTTP/1.1 over TLS. The curl of macOS has
+//!      no `--tlsv1.3`; there the version comes from what `-v` says alone.
+//!    - 4b: 100 requests of the page in one curl with `--http2 --parallel`:
+//!      one connection, every answer HTTP/2 and every body the page; the
+//!      file of 256 KiB over HTTP/2 by its SHA-256.
+//!    - 4c: Without the probe CA curl ends with 60 (no CA of the host signed
+//!      the certificate); with `-k` it fetches the page.
+//!    - 4d: The guest's curl against nginx over the network service's
+//!      loopback, its certificate given as the anchor: the page whole.
+//!    - 4e: `h2load -n 1000 -c 10 -m 10` from the host: 1000 answers 2xx over
+//!      TLS 1.3 and h2, none failed. A check: its rate is no measurement
+//!      (that runs with `--rate`). Where the host has no h2load the step
+//!      says so and is skipped; the runner of ci installs it
+//!      (nghttp2-client in .github/actions/setup).
+//!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
 //!    processes `nginx`, the four workers new, each holding a shared buffer
-//!    (`posix-net stat`), and an answer of 256 KiB goes through them.
+//!    (`posix-net stat`), and an answer of 256 KiB goes through them; 4b
+//!    again, against the new workers.
 //! 6. `kill -QUIT` of the master: it ends within 10 s.
 //! 7. `nginx -c /etc/nginx/exclusive.conf &` (one listening socket for the
 //!    four workers, EPOLLEXCLUSIVE), 40 requests over 8 connections,
@@ -34,10 +58,13 @@
 //!
 //! `cargo xtask nginx-probe steps` runs the same with the service counting its
 //! steps (`netd` built with the feature `steps`, under -icount with the guest
-//! sleeping in real time), and judges every step against 0.9 of term B.
+//! sleeping in real time), of the steps of TLS 4a and 4b alone, and judges
+//! every step against 0.9 of term B.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -54,6 +81,25 @@ pub const STEPS_IMAGE: &str = "boot-nginx-probe-steps.img";
 
 /// nginx's settings of the package (tools/nginx/nginx.conf).
 pub const NGINX_CONF: &str = include_str!("../../tools/nginx/nginx.conf");
+/// nginx's server of TLS and HTTP/2, which the probe's settings include,
+/// and the certificate and key it names.
+pub const TLS_CONF: &str = include_str!("../../tools/nginx/tls.conf");
+pub const TLS_CONF_PATH: &str = "/etc/nginx/tls.conf";
+pub const SERVER_CRT: &str = "/etc/nginx/server.crt";
+pub const SERVER_KEY: &str = "/etc/nginx/server.key";
+/// The name of the server of TLS, which its certificate holds.
+const TLS_NAME: &str = "nginx.stafeto.test";
+/// The requests of step 4b over one connection of HTTP/2, and the most
+/// streams at once.
+const H2_REQUESTS: usize = 100;
+const H2_STREAMS: usize = 10;
+/// h2load's run of step 4e: the requests, the connections and the streams
+/// of each.
+const H2LOAD_REQUESTS: usize = 1000;
+const H2LOAD_CONNECTIONS: usize = 10;
+const H2LOAD_STREAMS: usize = 10;
+/// How long a run of the host's curl or h2load may take.
+const CLIENT_WITHIN: Duration = Duration::from_secs(120);
 /// `/etc/netd.conf` of the probe: DHCP, and eight sessions with a shared
 /// buffer: in a reload the four new workers ask for theirs while the four
 /// old ones still hold theirs, and a refused buffer stays refused until
@@ -111,21 +157,40 @@ const BUFFER_KIND: usize = 25;
 /// CLONE and CLONE_MORE, which copy a session's sockets in portions.
 const CLONE_KINDS: [usize; 2] = [19, 20];
 
-/// The probe's settings: the package's with 256 connections a worker and
-/// keep-alive of 10 s.
+/// The probe's settings: the package's with 256 connections a worker,
+/// keep-alive of 10 s and the server of TLS.
 pub fn probe_conf() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
+        let text = replaced(
+            NGINX_CONF,
+            "worker_connections 512;",
+            "worker_connections 256;",
+        );
+        let text = replaced(&text, "keepalive_timeout 65;", "keepalive_timeout 10;");
         replaced(
-            &replaced(
-                NGINX_CONF,
-                "worker_connections 512;",
-                "worker_connections 256;",
-            ),
-            "keepalive_timeout 65;",
-            "keepalive_timeout 10;",
+            &text,
+            "    server {\n",
+            &format!("    include {TLS_CONF_PATH};\n    server {{\n"),
         )
     })
+}
+
+/// Fails where the list of the image `name` has nginx's key or certificate
+/// with no bytes: the probe CA was not made (`cargo xtask probe-ca`).
+pub fn key_files_of(name: &str, files: &[rootfs::RootFile]) -> Result<(), String> {
+    for file in files
+        .iter()
+        .filter(|f| f.path == SERVER_CRT || f.path == SERVER_KEY)
+    {
+        if !matches!(file.source, Some(rootfs::Source::Bytes(_, bytes)) if !bytes.is_empty()) {
+            return Err(format!(
+                "{name}: {} is empty: run cargo xtask probe-ca",
+                file.path
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The probe's settings with one listening socket that the four workers
@@ -216,8 +281,9 @@ pub fn terms_files() -> Result<[(&'static str, Vec<u8>); 4], String> {
          tools/nginx/cross-autotest.patch (auto/feature, auto/types/sizeof,\n\
          auto/endianness); no other file of nginx changed. /etc/nginx/mime.types\n\
          is the conf/mime.types of the source. Linked with PCRE2 {pcre2}\n\
-         (PCRE2-SOURCE) and relibc https://github.com/stafeto/relibc at commit\n\
-         {relibc} (THIRD-PARTY-NOTICES).\n"
+         (PCRE2-SOURCE), OpenSSL with the modules of TLS and HTTP/2\n\
+         (OPENSSL-SOURCE) and relibc https://github.com/stafeto/relibc at\n\
+         commit {relibc} (THIRD-PARTY-NOTICES).\n"
     );
     let pcre2_note = format!(
         "/bin/nginx holds PCRE2 {pcre2}, the 8-bit library without JIT,\n\
@@ -762,6 +828,344 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
     Ok(())
 }
 
+/// What `nginx -V` printed names the modules of TLS and HTTP/2 and the
+/// OpenSSL nginx was built with.
+fn modules_verdict(lines: &[String]) -> Result<(), String> {
+    let all = lines.join(" ");
+    let words: Vec<&str> = all.split_whitespace().collect();
+    for module in ["--with-http_ssl_module", "--with-http_v2_module"] {
+        if !words.contains(&module) {
+            return Err(format!("nginx -V names no {module}: {lines:?}"));
+        }
+    }
+    if !all.contains("built with OpenSSL 3.") {
+        return Err(format!("nginx -V names no OpenSSL: {lines:?}"));
+    }
+    let version = lines
+        .iter()
+        .find(|l| l.contains("built with OpenSSL"))
+        .map_or("", |l| l.trim());
+    println!("nginx-probe: {version}; the modules of TLS and HTTP/2 are in");
+    Ok(())
+}
+
+/// The host's curl against nginx's server of TLS on the forwarded port:
+/// `nginx.stafeto.test` resolved to 127.0.0.1, the certificate checked
+/// against the probe CA (`ca.crt` of `ca`), the bodies written to `dir`.
+struct Tls {
+    port: u16,
+    ca: PathBuf,
+    dir: PathBuf,
+}
+
+/// What a run of the host's curl ended with: its code, what it wrote
+/// (`-w`) and what it said on stderr.
+struct Ended {
+    code: i32,
+    written: String,
+    said: String,
+}
+
+impl Tls {
+    fn url(&self, path: &str) -> String {
+        format!("https://{TLS_NAME}:{}{path}", self.port)
+    }
+
+    fn file(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
+    /// curl with `args`, with the probe CA when `checked`.
+    fn curl(&self, checked: bool, args: &[String]) -> Result<Ended, String> {
+        let mut command = Command::new("curl");
+        command
+            .args(["-sS", "--max-time"])
+            .arg(CLIENT_WITHIN.as_secs().to_string())
+            .arg("--resolve")
+            .arg(format!("{TLS_NAME}:{}:127.0.0.1", self.port));
+        if checked {
+            command.arg("--cacert").arg(self.ca.join("ca.crt"));
+        }
+        let output = command
+            .args(args)
+            .output()
+            .map_err(|e| format!("the host's curl: {e}"))?;
+        Ok(Ended {
+            code: output.status.code().unwrap_or(-1),
+            written: String::from_utf8_lossy(&output.stdout).into_owned(),
+            said: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// The last lines of what a client said, for an error.
+fn last_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(12)..].join(" | ")
+}
+
+/// Fails unless the file `path` holds `want`.
+fn same_file(what: &str, path: &Path, want: &[u8]) -> Result<(), String> {
+    let body = std::fs::read(path).map_err(|e| format!("{what}: {}: {e}", path.display()))?;
+    same(what, &body, want)
+}
+
+fn arg(text: impl Into<String>) -> String {
+    text.into()
+}
+
+/// What curl says when it was built without an option it was given: the
+/// curl of macOS (LibreSSL) has no `--tlsv1.3`.
+const NOT_BUILT_IN: &str = "not found built-in";
+
+/// Step 4a: TLS 1.3 with HTTP/2, and HTTP/1.1 over TLS. curl asks for TLS
+/// 1.3 alone (`--tlsv1.3`) where it can; either way what it says (`-v`)
+/// must name TLS 1.3 as the version of the connection.
+fn tls_versions(tls: &Tls) -> Result<(), String> {
+    let mut only13 = true;
+    for (flag, version) in [("--http2", "2"), ("--http1.1", "1.1")] {
+        let out = tls.file("version.html");
+        let at = Instant::now();
+        let fetch = |only13: bool| {
+            let mut args = vec![arg("-v")];
+            if only13 {
+                args.push(arg("--tlsv1.3"));
+            }
+            args.extend([
+                arg(flag),
+                arg("-w"),
+                arg("%{http_version}"),
+                arg("-o"),
+                arg(out.to_string_lossy()),
+                tls.url("/index.html"),
+            ]);
+            tls.curl(true, &args)
+        };
+        let mut ended = fetch(only13)?;
+        if only13 && ended.code == 4 && ended.said.contains(NOT_BUILT_IN) {
+            println!(
+                "nginx-probe: 4a: the host's curl has no --tlsv1.3 (code 4); the version is checked in what it says"
+            );
+            only13 = false;
+            ended = fetch(only13)?;
+        }
+        let tls13 = ended.said.lines().any(crate::net_tls::negotiated_tls13);
+        if ended.code != 0 || ended.written.trim() != version || !tls13 {
+            return Err(format!(
+                "4a: curl --tlsv1.3 {flag} ended with {}, HTTP version {:?} (wanted {version}), TLS 1.3 {tls13}: {}",
+                ended.code,
+                ended.written.trim(),
+                last_lines(&ended.said)
+            ));
+        }
+        same_file(
+            &format!("4a: the page with {flag}"),
+            &out,
+            rootfs::www_index(),
+        )?;
+        println!(
+            "nginx-probe: 4a: TLS 1.3, HTTP/{version} with {flag}, the page whole in {} ms",
+            at.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
+/// (HTTP version, new connections) of each transfer in what curl wrote
+/// with `-w '%{http_version} %{num_connects}\n'`.
+fn transfers_of(written: &str) -> Vec<(String, usize)> {
+    written
+        .lines()
+        .filter_map(|line| {
+            let (version, connects) = line.trim().split_once(' ')?;
+            Some((version.to_owned(), connects.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// Step 4b: 100 requests of the page in one curl, HTTP/2 streams of one
+/// connection, and the file of 256 KiB over HTTP/2.
+fn tls_streams(tls: &Tls, when: &str) -> Result<(), String> {
+    let mut args = vec![
+        arg("--http2"),
+        arg("--parallel"),
+        arg("--parallel-max"),
+        arg(H2_STREAMS.to_string()),
+        arg("-w"),
+        arg("%{http_version} %{num_connects}\\n"),
+    ];
+    for n in 0..H2_REQUESTS {
+        args.push(arg("-o"));
+        args.push(arg(tls.file(&format!("stream-{n}")).to_string_lossy()));
+        args.push(tls.url("/index.html"));
+    }
+    let at = Instant::now();
+    let ended = tls.curl(true, &args)?;
+    let took = at.elapsed();
+    let transfers = transfers_of(&ended.written);
+    let connects: usize = transfers.iter().map(|t| t.1).sum();
+    if ended.code != 0
+        || transfers.len() != H2_REQUESTS
+        || transfers.iter().any(|t| t.0 != "2")
+        || connects != 1
+    {
+        return Err(format!(
+            "4b {when}: curl --http2 --parallel ended with {}, {} transfers of {H2_REQUESTS} over {connects} connections (wanted one), versions {:?}: {}",
+            ended.code,
+            transfers.len(),
+            transfers.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(),
+            last_lines(&ended.said)
+        ));
+    }
+    for n in 0..H2_REQUESTS {
+        same_file(
+            &format!("4b {when}: stream {}", n + 1),
+            &tls.file(&format!("stream-{n}")),
+            rootfs::www_index(),
+        )?;
+    }
+    let big = tls.file("256k.bin");
+    let at = Instant::now();
+    let ended = tls.curl(
+        true,
+        &[
+            arg("--http2"),
+            arg("-w"),
+            arg("%{http_version}"),
+            arg("-o"),
+            arg(big.to_string_lossy()),
+            tls.url("/256k.bin"),
+        ],
+    )?;
+    let big_took = at.elapsed();
+    if ended.code != 0 || ended.written.trim() != "2" {
+        return Err(format!(
+            "4b {when}: GET /256k.bin over HTTP/2 ended with {}, HTTP version {:?}: {}",
+            ended.code,
+            ended.written.trim(),
+            last_lines(&ended.said)
+        ));
+    }
+    same_file(&format!("4b {when}: /256k.bin"), &big, www_256k())?;
+    println!(
+        "nginx-probe: 4b {when}: {H2_REQUESTS} requests as HTTP/2 streams of one connection in {} ms, every page whole; 256 KiB over HTTP/2 in {} ms",
+        took.as_millis(),
+        big_took.as_millis()
+    );
+    Ok(())
+}
+
+/// Step 4c: the certificate is the probe CA's, which the host does not
+/// know.
+fn tls_unknown_ca(tls: &Tls) -> Result<(), String> {
+    let ended = tls.curl(
+        false,
+        &[arg("-o"), arg("/dev/null"), tls.url("/index.html")],
+    )?;
+    if ended.code != 60 {
+        return Err(format!(
+            "4c: curl without the probe CA ended with {} (wanted 60): {}",
+            ended.code,
+            last_lines(&ended.said)
+        ));
+    }
+    let out = tls.file("insecure.html");
+    let ended = tls.curl(
+        false,
+        &[
+            arg("-k"),
+            arg("-o"),
+            arg(out.to_string_lossy()),
+            tls.url("/index.html"),
+        ],
+    )?;
+    if ended.code != 0 {
+        return Err(format!(
+            "4c: curl -k ended with {}: {}",
+            ended.code,
+            last_lines(&ended.said)
+        ));
+    }
+    same_file("4c: the page with -k", &out, rootfs::www_index())?;
+    println!("nginx-probe: 4c: without the probe CA curl ends with 60, with -k the page is whole");
+    Ok(())
+}
+
+/// Step 4d: the guest's curl against nginx over the loopback of the network
+/// service; the leaf is the anchor (curl takes a partial chain).
+fn tls_in_guest(run: &mut qemu::Run) -> Result<(), String> {
+    let at = Instant::now();
+    let (code, lines) = crate::net_tls::coded(
+        run,
+        &format!(
+            "curl -sS --cacert {SERVER_CRT} --resolve {TLS_NAME}:443:127.0.0.1 -o /tmp/tls.html https://{TLS_NAME}/index.html 2>&1 && cmp /tmp/tls.html /www/index.html 2>&1"
+        ),
+        "guest-tls",
+        READ_WITHIN,
+    )?;
+    if code != 0 {
+        return Err(format!(
+            "4d: the guest's curl over the loopback ended with {code}: {lines:?}"
+        ));
+    }
+    println!(
+        "nginx-probe: 4d: the guest's curl over the loopback fetched the page whole in {} ms",
+        at.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+/// What h2load said, judged: TLS 1.3, h2, every request a 2xx; the rate in
+/// requests a second.
+fn h2load_verdict(said: &str) -> Result<f64, String> {
+    let line = |head: &str| {
+        said.lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(head))
+            .unwrap_or("")
+    };
+    let n = H2LOAD_REQUESTS;
+    let requests = format!(
+        "requests: {n} total, {n} started, {n} done, {n} succeeded, 0 failed, 0 errored, 0 timeout"
+    );
+    if line("requests:") != requests
+        || !line("status codes:").starts_with(&format!("status codes: {n} 2xx,"))
+        || !line("TLS Protocol:").ends_with("TLSv1.3")
+        || !line("Application protocol:").ends_with("h2")
+    {
+        return Err(format!("h2load: {}", last_lines(said)));
+    }
+    line("finished in")
+        .split(", ")
+        .find_map(|w| w.strip_suffix(" req/s")?.parse().ok())
+        .ok_or_else(|| format!("h2load: no rate in {:?}", line("finished in")))
+}
+
+/// Step 4e: h2load from the host, a check of h2 under ten connections; its
+/// rate is printed, no measurement.
+fn h2load(port: u16) -> Result<(), String> {
+    let output = Command::new("h2load")
+        .args(["-n", &H2LOAD_REQUESTS.to_string()])
+        .args(["-c", &H2LOAD_CONNECTIONS.to_string()])
+        .args(["-m", &H2LOAD_STREAMS.to_string()])
+        .args(["-T", &CLIENT_WITHIN.as_secs().to_string()])
+        .arg(format!("https://127.0.0.1:{port}/index.html"))
+        .output();
+    let output = match output {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("nginx-probe: 4e: h2load: not installed, skipped");
+            return Ok(());
+        }
+        other => other.map_err(|e| format!("h2load: {e}"))?,
+    };
+    let said = String::from_utf8_lossy(&output.stdout);
+    let rate = h2load_verdict(&said)?;
+    println!(
+        "nginx-probe: 4e: h2load: {H2LOAD_REQUESTS} requests over {H2LOAD_CONNECTIONS} connections of TLS 1.3 and h2, all 2xx; {rate:.0} req/s (a check, no measurement)"
+    );
+    Ok(())
+}
+
 /// `cargo xtask nginx-probe [steps] [MACHINE]`.
 pub fn command(args: &[String]) -> Result<(), String> {
     let (steps, rest) = match args.first().map(String::as_str) {
@@ -791,6 +1195,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     crate::busybox_build()?;
     crate::nano_build()?;
     crate::net_build()?;
+    let ca = crate::probe_ca::ensure(false)?;
     let kernel = build(Variant::Normal)?;
     let (name, programs) = if steps {
         (STEPS_IMAGE, steps_programs())
@@ -800,13 +1205,28 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let port = crate::net_curl::free_tcp_port()?;
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
+    let dir = target_dir().join("nginx-probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tls = Tls {
+        port: crate::net_curl::free_tcp_port()?,
+        ca,
+        dir,
+    };
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    cmd.args(qemu::net(&[Forward {
-        proto: Proto::Tcp,
-        host: port,
-        guest: 80,
-    }]));
+    cmd.args(qemu::net(&[
+        Forward {
+            proto: Proto::Tcp,
+            host: port,
+            guest: 80,
+        },
+        Forward {
+            proto: Proto::Tcp,
+            host: tls.port,
+            guest: 443,
+        },
+    ]));
     if steps {
         cmd.args(["-icount", "shift=4,sleep=on"]);
     }
@@ -816,6 +1236,14 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
         run.expect_line("the lease", |l| l.contains("net: lease "), BOOT_TIMEOUT)?;
         run.expect("# ", DIALOG_STEP)?;
+        run.send("S=ok")?;
+        run.expect("# ", DIALOG_STEP)?;
+        // 0.
+        let date = crate::net_tls::capture(&mut run, "date +%s", "clock", DIALOG_STEP)?;
+        let off = crate::probe_ca::clock_verdict(&date)?;
+        println!("nginx-probe: the guest's clock is {off} s from the host's");
+        let built = crate::net_tls::capture(&mut run, "nginx -V 2>&1", "version", DIALOG_STEP)?;
+        modules_verdict(&built)?;
         // 1 and 2.
         start(&mut run, "/etc/nginx/nginx.conf")?;
         let (master, workers) = master_and_workers(&nginx_processes(&mut run, "start")?)?;
@@ -828,9 +1256,18 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             "nginx-probe: {REQUESTS} requests over {CONNECTIONS} connections in {} ms",
             at.elapsed().as_millis()
         );
-        // 4, 5, 6.
+        // 4.
         large_files(&mut run, address)?;
+        tls_versions(&tls)?;
+        tls_streams(&tls, "before the reload")?;
+        if !steps {
+            tls_unknown_ca(&tls)?;
+            tls_in_guest(&mut run)?;
+            h2load(tls.port)?;
+        }
+        // 5 (and 4b again), 6.
         reload(&mut run, address, &workers)?;
+        tls_streams(&tls, "after the reload")?;
         quit(&mut run, "quit")?;
         // 7.
         start(&mut run, "/etc/nginx/exclusive.conf")?;
@@ -945,9 +1382,11 @@ mod tests {
     }
 
     /// The probe's settings differ from the package's in the connections,
-    /// the keep-alive and, for `exclusive`, the listening socket only.
+    /// the keep-alive, the server of TLS they include and, for `exclusive`,
+    /// the listening socket only.
     #[test]
     fn the_variants_of_the_settings() {
+        assert!(!NGINX_CONF.contains("include /etc/nginx/tls.conf;"));
         assert!(NGINX_CONF.contains("user nobody nobody;"));
         assert!(NGINX_CONF.contains("listen 80 reuseport;"));
         assert!(NGINX_CONF.contains("accept_mutex off;"));
@@ -955,9 +1394,99 @@ mod tests {
         let probe = probe_conf();
         assert!(probe.contains("worker_connections 256;"));
         assert!(probe.contains("keepalive_timeout 10;"));
-        assert_eq!(probe.lines().count(), NGINX_CONF.lines().count());
+        assert!(probe.contains("    include /etc/nginx/tls.conf;\n    server {\n"));
+        assert_eq!(probe.lines().count(), NGINX_CONF.lines().count() + 1);
         let exclusive = exclusive_conf();
         assert!(exclusive.contains("listen 80;") && !exclusive.contains("reuseport"));
+        assert!(exclusive.contains("include /etc/nginx/tls.conf;"));
+    }
+
+    /// The server of TLS: TLS 1.3 alone, HTTP/2, the key and certificate
+    /// of the image, the name of the certificate.
+    #[test]
+    fn the_server_of_tls() {
+        for line in [
+            "listen 443 ssl reuseport;",
+            "http2 on;",
+            "server_name nginx.stafeto.test;",
+            "ssl_certificate /etc/nginx/server.crt;",
+            "ssl_certificate_key /etc/nginx/server.key;",
+            "ssl_protocols TLSv1.3;",
+            "ssl_session_cache shared:SSL:1m;",
+            "ssl_buffer_size 16k;",
+        ] {
+            assert!(
+                TLS_CONF.lines().any(|l| l.trim() == line),
+                "{line} in tls.conf"
+            );
+        }
+        assert!(TLS_CONF.contains(&format!("server_name {TLS_NAME};")));
+    }
+
+    #[test]
+    fn nginx_names_its_modules() {
+        let printed = [
+            "nginx version: nginx/1.30.6",
+            "built with OpenSSL 3.5.9 30 Sep 2026",
+            "TLS SNI support enabled",
+            "configure arguments: --crossbuild=Linux::aarch64 --with-http_ssl_module --with-http_v2_module",
+        ]
+        .map(str::to_owned);
+        assert!(modules_verdict(&printed).is_ok());
+        let mut without = printed.clone();
+        without[3] = without[3].replace(" --with-http_v2_module", "");
+        assert!(modules_verdict(&without).unwrap_err().contains("http_v2"));
+        let mut plain = printed.clone();
+        plain[1] = "built by clang".to_owned();
+        assert!(modules_verdict(&plain).is_err());
+    }
+
+    #[test]
+    fn the_transfers_of_curl_parallel() {
+        assert_eq!(
+            transfers_of("2 1\n2 0\n2 0\n"),
+            [
+                ("2".to_owned(), 1),
+                ("2".to_owned(), 0),
+                ("2".to_owned(), 0)
+            ]
+        );
+        assert_eq!(transfers_of("1.1 1\n"), [("1.1".to_owned(), 1)]);
+        assert!(transfers_of("curl: (7) refused\n").is_empty());
+    }
+
+    #[test]
+    fn the_verdict_of_h2load() {
+        let good = "starting benchmark...
+spawning thread #0: 10 total client(s). 1000 total requests
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_256_GCM_SHA384
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+
+finished in 4.12s, 242.72 req/s, 15.21MB/s
+requests: 1000 total, 1000 started, 1000 done, 1000 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
+";
+        assert_eq!(h2load_verdict(good).unwrap(), 242.72);
+        let failed = good.replace("1000 succeeded, 0 failed", "990 succeeded, 10 failed");
+        assert!(h2load_verdict(&failed).is_err());
+        assert!(h2load_verdict(&good.replace("1000 2xx", "990 2xx")).is_err());
+        assert!(h2load_verdict(&good.replace("TLSv1.3", "TLSv1.2")).is_err());
+        assert!(h2load_verdict(&good.replace("protocol: h2", "protocol: http/1.1")).is_err());
+    }
+
+    /// The runner of ci installs h2load, so that step 4e runs there.
+    #[test]
+    fn the_runner_has_h2load() {
+        let setup = std::fs::read_to_string(crate::root().join(".github/actions/setup/action.yml"))
+            .unwrap();
+        assert!(
+            setup
+                .split_whitespace()
+                .any(|word| word == "nghttp2-client"),
+            "nghttp2-client in the packages of the runner"
+        );
     }
 
     #[test]
@@ -1069,6 +1598,38 @@ mod tests {
         assert!(programs().iter().any(|p| p.0 == "nginx"));
         let netd = steps_programs().iter().find(|p| p.0 == "netd").unwrap();
         assert_eq!(netd.3, &["steps"]);
+        assert_eq!(
+            has(TLS_CONF_PATH).and_then(|f| f.source),
+            Some(rootfs::Source::Bytes("nginx-tls.conf", TLS_CONF.as_bytes()))
+        );
+        let key = has(SERVER_KEY).unwrap();
+        assert_eq!((key.mode, key.uid, key.gid), (0o600, 0, 0));
+        assert!(has(SERVER_CRT).is_some());
+        // The image of the package's nginx has no key and no server of TLS.
+        let net = rootfs::files_of(crate::net::IMAGE);
+        assert!(
+            !net.iter()
+                .any(|f| [TLS_CONF_PATH, SERVER_KEY, SERVER_CRT].contains(&f.path))
+        );
+    }
+
+    /// An image whose key or certificate has no bytes is refused.
+    #[test]
+    fn an_empty_key_is_refused() {
+        let file = |path, bytes: &'static [u8]| rootfs::RootFile {
+            path,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            source: Some(rootfs::Source::Bytes("key", bytes)),
+        };
+        assert!(key_files_of("x", &[file(SERVER_KEY, b"k"), file(SERVER_CRT, b"c")]).is_ok());
+        assert!(
+            key_files_of("x", &[file(SERVER_KEY, b""), file(SERVER_CRT, b"c")])
+                .unwrap_err()
+                .contains(SERVER_KEY)
+        );
+        assert!(key_files_of("x", &[]).is_ok());
     }
 
     /// The job of the workflow runs the probe and the final job waits for
