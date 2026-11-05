@@ -324,12 +324,12 @@ mod tests {
         let mut queue: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
         // Other sockets stand between them, as connections do.
         for round in 0..16 {
-            for l in 0..2 {
-                let own: Vec<usize> = queue[l].iter().map(|&m| m / SET).collect();
+            for (l, q) in queue.iter_mut().enumerate() {
+                let own: Vec<usize> = q.iter().map(|&m| m / SET).collect();
                 let own = own.into_iter().filter(|&s| o.allowed(s, l));
                 let m = p.allocate_in(State::Member, own, o.barred()).unwrap();
                 o.claim(m / SET, l);
-                queue[l].push(m);
+                q.push(m);
             }
             if round % 3 == 0 {
                 p.allocate(State::Live).unwrap();
