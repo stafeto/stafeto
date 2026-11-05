@@ -96,6 +96,7 @@ mod pci_walk;
 mod pkg;
 mod pkg_probe;
 mod pkg_probes;
+mod pkg_sign;
 mod pkg_slot;
 mod pkg_states;
 mod posix_display;
@@ -1687,6 +1688,9 @@ commands:
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they
             hold and no others (no notice of F-Stack in the archives without it)
+  pkg-sign  sign again with the release key the packages of a directory that the development key
+            signed (only the last page changes; `--key K.key --cert K.cert --dir D`)
+  image-repack IMAGE --packages D  put the package files of D into a boot image of the same layout
   abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
             `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
   pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
@@ -2089,6 +2093,8 @@ fn main() {
         Some("dist-licenses") => pkg_probes::dist_licenses(),
         Some("pkg-ci") => pkg_probes::ci(),
         Some("abi") => abi_fingerprint::command(&args[1..]),
+        Some("pkg-sign") => pkg_sign::sign_command(&args[1..]),
+        Some("image-repack") => pkg_sign::repack_command(&args[1..]),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),

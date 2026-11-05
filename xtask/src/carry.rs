@@ -410,7 +410,7 @@ pub fn roots_for(base: &str, tree: &Path) -> Result<Vec<Key>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pkgfmt::cert::{Certificate, PURPOSE_PACKAGES};
     use pkgfmt::container::write::{Content, Item, container, sign};
@@ -439,11 +439,25 @@ mod tests {
     }
 
     fn package(name: &str, version: &str, release: &str, recipe: &str, key: &str) -> Vec<u8> {
+        package_with(name, version, release, recipe, &RELEASE, key, &ROOT)
+    }
+
+    /// A package signed by `key` (seed `seed`) with a certificate of `t-root`
+    /// (seed `root_seed`).
+    pub(crate) fn package_with(
+        name: &str,
+        version: &str,
+        release: &str,
+        recipe: &str,
+        seed: &[u8; 32],
+        key: &str,
+        root_seed: &[u8; 32],
+    ) -> Vec<u8> {
         let cert = Certificate::issue(
-            &ROOT,
+            root_seed,
             n("t-root"),
             n(key),
-            sig::public_key(&RELEASE),
+            sig::public_key(seed),
             PURPOSE_PACKAGES,
             0,
             4_000_000_000,
@@ -483,7 +497,7 @@ mod tests {
         };
         sign(
             container(&meta, &items, 0).unwrap(),
-            &RELEASE,
+            seed,
             n(key),
             Some(cert.to_bytes()),
             1000,
