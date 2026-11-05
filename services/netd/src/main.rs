@@ -220,6 +220,14 @@ fn main(_: u64) -> u64 {
     let (dma_pa, net_pa) = (word(own, 0), word(own, 8));
     let (dma1_pa, net1_pa) = (word(own, 16), word(own, 24));
     let second_pas: [u64; 5] = core::array::from_fn(|i| word(own, 16 + 8 * i));
+    // The size of each object as the kernel has it: the owner maps what is
+    // there, whatever init's table says.
+    let second_pages: [u32; 5] = core::array::from_fn(|i| {
+        second_objects[i]
+            .as_ref()
+            .and_then(|o| sys::memory_info(o).ok())
+            .map_or(0, |info| (info.size / PAGE as u64) as u32)
+    });
     let (at, at1) = (word(own, 8 * objects), word(own, 8 * objects + 8));
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
@@ -481,6 +489,7 @@ fn main(_: u64) -> u64 {
             pci,
             at: at1,
             objects: second_pas,
+            pages: second_pages,
         },
         #[cfg(feature = "probe")]
         hold: false,

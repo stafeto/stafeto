@@ -80,3 +80,14 @@ pub unsafe extern "C" fn stafeto_fast_config(out: *mut FastConfig) -> c_int {
         Err(errno) => fail(errno),
     }
 }
+
+/// For the probe of the owner only (not in `<stafeto/fast.h>`): asks a
+/// network service built for the probe to fault. Returns 0 when the service
+/// answered (it did not fault) and -1 with errno when it ended or refused.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_probe_crash() -> c_int {
+    match fast::probe_crash() {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}

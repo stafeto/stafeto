@@ -72,7 +72,7 @@ EXTRA = {
     "environ": "programs declare it; relibc's headers lack it",
 }
 # libc.so's one entry and the probe hook of the layer (3.12.3).
-ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image"]
+ENTRY_NAMES = ["stafeto_start", "stafeto_probe_image", "stafeto_fast_probe_crash"]
 # Compiler helpers the objects of C programs refer to: the outlined atomics
 # of AArch64, binary128 long double, 128-bit integers.
 HELPER = re.compile(r"^(__aarch64_\w+|__[a-z]+(tf|ti)[0-9]|__(fix|float|extend|trunc)\w*(tf|ti)\w*)$")

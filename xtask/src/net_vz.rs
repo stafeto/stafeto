@@ -24,6 +24,18 @@
 //! `netd.conf`), prints its own lines, answers no echo (it serves only
 //! DHCP), and the Mac's ARP cache holds its MAC address for it.
 //!
+//! With `--fast` (two devices, `--static1` too) the image is the one of
+//! `cargo xtask fast-probe` on VZ (`handover 1` and `fast-echo`). The checks
+//! above run, the second device being the service's until the claim; then
+//! `fast-echo 7 &` claims it (`claimed`, and with a lease `net: renew1`: the
+//! lease again through the bypass ring), and the Mac reaches the program at
+//! the second address: 300 UDP datagrams of 64 and 1 400 bytes come back
+//! byte for byte, the echo rate at both sizes, `ping` of the address
+//! answered, and `arp -n` shows the MAC address of the device. `kill -9` of
+//! the program gives the device back (`net: device 1 back`, then the lease
+//! or the static address), and a second program claims it and echoes. HTTP to
+//! the first address passes before, during and after.
+//!
 //! The Mac may refuse to connect to the guest ("No route to host") when the
 //! terminal has no permission for the local network (System Settings,
 //! Privacy and Security, Local Network).
@@ -32,6 +44,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::fast_probe;
 use crate::net_curl;
 use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, Variant, build, build_boot_image,
@@ -50,6 +63,26 @@ const RUN_WITHIN: Duration = Duration::from_secs(60 * 4);
 /// refusal comes at 1.0 s (the guest's RST is right: right MAC, right
 /// acknowledgement).
 const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
+/// The kind of the steps of the second device's return, and their bound on
+/// VZ: 50 ms of the counter (24 MHz), for the two sub-steps that touch the
+/// device first after the host reset it (details 1, the reset, and 2, the
+/// open) and for an own step that gets there first after an owner's death;
+/// the other sub-steps of the return keep 0.9 of term B.
+const RETURN_KIND: usize = 65;
+const RETURN_MAX: u64 = 1_200_000;
+/// Whether a line of steps is one the host's reset of the device delays: a
+/// step of kind 65 with detail 1 (the reset) or 2 (the open), or, after the
+/// owner was killed, with detail 0 (whichever own step touches the device
+/// first after the reset: the interrupt's, the owner's departure).
+fn is_return_step(line: &str, after_kill: bool) -> bool {
+    line.contains(&format!("kind {RETURN_KIND} "))
+        && line.rsplit_once("detail ").is_some_and(|(_, d)| {
+            d.trim()
+                .parse::<u64>()
+                .is_ok_and(|d| d == 1 || d == 2 || (d == 0 && after_kill))
+        })
+}
+
 /// The fixed MAC addresses of `vz-run`, by device.
 const MACS: [&str; 2] = ["02:73:74:66:00:01", "02:73:74:66:00:02"];
 /// The static address of the second device in the image `--static1`.
@@ -161,14 +194,17 @@ struct Options {
     /// The service counts its steps (`netd` built with `steps`), and the
     /// longest of each kind is judged by 0.9 of term B.
     steps: bool,
+    /// The second device goes to `fast-echo` (the image of the owner).
+    fast: bool,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
-    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps]";
+    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps] [--fast]";
     let mut found = Options {
         devices: 1,
         static1: false,
         steps: false,
+        fast: false,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -176,6 +212,10 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--net" if rest.next().map(String::as_str) == Some("2") => found.devices = 2,
             "--static1" => found.static1 = true,
             "--steps" => found.steps = true,
+            "--fast" => {
+                found.fast = true;
+                found.devices = 2;
+            }
             _ => return Err(usage.to_owned()),
         }
     }
@@ -283,13 +323,18 @@ pub fn command(args: &[String]) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, two) = match (options.devices, options.static1, options.steps) {
+        (_, false, false) if options.fast => (fast_probe::VZ_IMAGE, true),
+        (_, true, false) if options.fast => (fast_probe::VZ_STATIC_IMAGE, true),
+        (_, _, true) if options.fast => (fast_probe::VZ_STEPS_IMAGE, true),
         (1, _, false) => (net::VZ_IMAGE, false),
         (1, _, true) => (net::VZ_STEPS_IMAGE, false),
         (_, false, false) => (net::VZ2_IMAGE, true),
         (_, true, false) => (net::VZ2_STATIC_IMAGE, true),
         (_, _, true) => (net::VZ2_STEPS_IMAGE, true),
     };
-    let programs = if options.steps {
+    let programs = if options.fast {
+        fast_probe::vz_programs(options.steps)
+    } else if options.steps {
         net::vz_steps_programs(two)
     } else {
         net::vz_programs(two)
@@ -346,11 +391,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
         net_curl::check_body(&body).map_err(|e| format!("after the pings: {e}"))?;
         println!("net-vz: the service is alive after the pings");
         if options.devices == 2 {
-            second_device(&mut run, started, guest, options.static1)?;
+            let second = second_device(&mut run, started, guest, options.static1)?;
             let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
                 .map_err(|e| format!("the request with two devices: {e}"))?;
             net_curl::check_body(&body).map_err(|e| format!("with two devices: {e}"))?;
             println!("net-vz: HTTP to the first device passes with two devices");
+            if options.fast {
+                owner(&mut run, guest, second, options.static1)?;
+            }
         }
         Ok::<(), String>(())
     })();
@@ -381,8 +429,49 @@ pub fn command(args: &[String]) -> Result<(), String> {
             worst.1,
             net_probe::STEP_MAX
         );
-        if let Some(row) = rows.iter().find(|r| r.1 > net_probe::STEP_MAX) {
+        // The device that comes back from its owner is reset by the host: the
+        // first access after the reset stalls the one virtual processor, so
+        // the whole guest, for about 20 ms; a thread inside the service
+        // cannot lift that. The steps that touch the device first (kind 65,
+        // details 1 and 2, and after the owner's death any own step, detail
+        // 0) have a bound of their own on VZ, 50 ms of the counter. The
+        // others, the queues and the fill among them, keep 0.9 of term B.
+        let mut after_kill = false;
+        let (mut back, mut rest) = (Vec::new(), Vec::new());
+        for line in &output.lines {
+            after_kill |= line.contains("Killed") || line.contains("Quit");
+            if is_return_step(line, after_kill) {
+                back.push(line.clone());
+            } else {
+                rest.push(line.clone());
+            }
+        }
+        if let Some(row) = net_probe::longest_over_starts(&rest)
+            .iter()
+            .find(|r| r.1 > net_probe::STEP_MAX)
+        {
             return Err(format!("a step past 0.9 of term B: {row:?}"));
+        }
+        // The longest step of the return by its detail (1 reset, 2 open,
+        // 3 and 4 the queues, 5 on the fill).
+        let mut returns: std::collections::BTreeMap<u64, u64> = Default::default();
+        for line in &back {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if let Some(i) = words.iter().position(|w| *w == "ticks")
+                && let (Some(ticks), Some(detail)) = (
+                    words.get(i - 1).and_then(|w| w.parse::<u64>().ok()),
+                    words.last().and_then(|w| w.parse::<u64>().ok()),
+                )
+            {
+                let longest = returns.entry(detail).or_default();
+                *longest = (*longest).max(ticks);
+            }
+        }
+        println!(
+            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {RETURN_MAX})"
+        );
+        if let Some(row) = returns.iter().find(|r| *r.1 > RETURN_MAX) {
+            return Err(format!("a step of the return past its bound: {row:?}"));
         }
     }
     println!(
@@ -400,7 +489,7 @@ fn second_device(
     started: Instant,
     first: Ipv4Addr,
     static1: bool,
-) -> Result<(), String> {
+) -> Result<Address, String> {
     let driver = line_where(
         run,
         "the second driver's line",
@@ -479,6 +568,176 @@ fn second_device(
         "net-vz: the Mac's ARP cache has {} for {}; 0 of 2 echoes answered",
         mac, second.address
     );
+    Ok(second)
+}
+
+/// One request to the first address, answered with the page.
+fn http_alive(guest: Ipv4Addr, when: &str) -> Result<(), String> {
+    let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
+        .map_err(|e| format!("the request {when}: {e}"))?;
+    net_curl::check_body(&body).map_err(|e| format!("{when}: {e}"))?;
+    println!("net-vz: HTTP to the first device passes {when}");
+    Ok(())
+}
+
+/// The program that owns the second device, from its claim to its end and a
+/// second claim.
+fn owner(
+    run: &mut qemu::Run,
+    guest: Ipv4Addr,
+    second: Address,
+    static1: bool,
+) -> Result<(), String> {
+    const ECHO_PORT: u16 = 7;
+    let within = LEASE1_WITHIN;
+    let cidr = format!("{}/{}", second.address, second.prefix);
+    let claimed = format!("fast-echo: claimed {cidr} mac {}", MACS[1]);
+    let renewed = format!("net: renew1 {cidr}");
+    // The static address needs no lease and prints no line when the device
+    // comes back: the second claim shows the address is kept.
+    let again = (!static1).then(|| format!("net: lease1 {cidr}"));
+    let back = |again: &Option<String>| -> Vec<String> {
+        std::iter::once("net: device 1 back".to_owned())
+            .chain(again.clone())
+            .collect()
+    };
+    let mut socket_target = None;
+    for round in 1..=2 {
+        let claim_at = Instant::now();
+        run.send(&format!("fast-echo {ECHO_PORT} &"))?;
+        let mut wanted = vec![claimed.as_str()];
+        if !static1 {
+            wanted.push(renewed.as_str());
+        }
+        fast_probe::expect_all(run, &wanted, within)?;
+        println!(
+            "net-vz: claim {round}: claimed{} {} ms after the command",
+            if static1 { "" } else { " and renew1" },
+            claim_at.elapsed().as_millis()
+        );
+        let socket = socket_target.get_or_insert_with(|| {
+            std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket of the Mac")
+        });
+        socket
+            .connect((second.address, ECHO_PORT))
+            .map_err(|e| format!("connect: {e}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        // The first datagrams after a claim may be lost (about 20 ms with a
+        // static address; the cause is not established). Send one every 10 ms
+        // until the first comes back; its first byte counts the datagrams
+        // sent, and `fast-echo` prints the first byte of the first datagram
+        // it saw, which tells a loss before the program from a loss after it.
+        let first_at = Instant::now();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut lost_first = 0;
+        let mut buffer = [0u8; 64];
+        loop {
+            socket
+                .send(&[lost_first as u8; 32])
+                .map_err(|e| format!("send: {e}"))?;
+            if socket.recv(&mut buffer).is_ok() {
+                break;
+            }
+            lost_first += 1;
+            if first_at.elapsed() > Duration::from_secs(5) {
+                return Err("the program echoed nothing in 5 s".into());
+            }
+        }
+        println!(
+            "net-vz: the first echo came {} ms after the first datagram ({lost_first} lost before it)",
+            first_at.elapsed().as_millis()
+        );
+        // The other warm-up datagrams came back as well, or soon will.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        while socket.recv(&mut buffer).is_ok() {}
+        match run.expect_line(
+            "the first datagram the program saw",
+            |l| l.contains("fast-echo: first datagram"),
+            Duration::from_secs(3),
+        ) {
+            Ok(line) => println!(
+                "net-vz: {} ({lost_first} lost before the first echo)",
+                line.trim()
+            ),
+            Err(e) => println!("net-vz: no line of the first datagram: {e}"),
+        }
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let at = Instant::now();
+        let mut sent_again = fast_probe::echoes(socket, 200, 64)?;
+        sent_again += fast_probe::echoes(socket, 100, 1400)?;
+        println!(
+            "net-vz: 300 echoes of UDP in {} ms ({sent_again} sent again)",
+            at.elapsed().as_millis()
+        );
+        http_alive(guest, &format!("with the owner running (claim {round})"))?;
+        if round == 1 {
+            for size in [64, 1400] {
+                let (per_second, lost) = fast_probe::rate(socket, size, Duration::from_secs(3))?;
+                println!(
+                    "net-vz: echo rate of {size} bytes: {per_second} a second ({lost} unanswered)"
+                );
+            }
+            for (count, size) in [(5, 56), (5, 1472)] {
+                let result = ping(second.address, count, size, None)?;
+                println!(
+                    "net-vz: ping -c {count} -s {size} of the owner: {} of {} answered; {}",
+                    result.received,
+                    result.sent,
+                    result.round_trip.as_deref().unwrap_or("no round-trip line")
+                );
+                if result.received != count {
+                    return Err(format!(
+                        "the owner answered {} of {count} echoes of {size} bytes",
+                        result.received
+                    ));
+                }
+            }
+            let arp = Command::new("/usr/sbin/arp")
+                .args(["-n", &second.address.to_string()])
+                .output()
+                .map_err(|e| format!("arp: {e}"))?;
+            let text = String::from_utf8_lossy(&arp.stdout).into_owned();
+            let mac = arp_mac(&text)
+                .ok_or_else(|| format!("arp has no entry for {}: {text}", second.address))?;
+            if mac != MACS[1] {
+                return Err(format!("arp gives {mac}, wanted {}", MACS[1]));
+            }
+            println!("net-vz: arp -n {} shows {mac}", second.address);
+        }
+        if static1 && round == 1 {
+            // A static address has no lease to ask for again through the ring.
+            let line = format!("net: renew1 {cidr}");
+            if run.lines().iter().any(|l| l.contains(&line)) {
+                return Err("a static address renewed through the ring".into());
+            }
+        }
+        if round == 2 {
+            run.send("kill -QUIT $!")?;
+            let wanted = back(&again);
+            let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+            fast_probe::expect_all(run, &wanted, within)?;
+            http_alive(guest, "after the second owner ended")?;
+            break;
+        }
+        let killed_at = Instant::now();
+        run.send("kill -9 $!")?;
+        let wanted = back(&again);
+        let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        fast_probe::expect_all(run, &wanted, within)?;
+        println!(
+            "net-vz: kill -9 to the lease or address again {} ms",
+            killed_at.elapsed().as_millis()
+        );
+        http_alive(guest, "after the owner was killed")?;
+    }
     Ok(())
 }
 
@@ -538,6 +797,23 @@ mod tests {
         let line = "? (192.168.64.4) at 2:73:74:66:0:2 on bridge100 ifscope [ethernet]\n";
         assert_eq!(arp_mac(line).as_deref(), Some("02:73:74:66:00:02"));
         assert_eq!(arp_mac("? (192.168.64.9) -- no entry"), None);
+    }
+
+    #[test]
+    fn a_step_of_the_return_has_kind_65_and_a_detail() {
+        let line = |kind: u32, detail: u32| {
+            format!("service step: 14 kind {kind} 30000 ticks detail {detail}")
+        };
+        assert!(is_return_step(&line(65, 2), false));
+        assert!(is_return_step(&line(65, 1), false));
+        // An own step is delayed only after the owner was killed.
+        assert!(!is_return_step(&line(65, 0), false));
+        assert!(is_return_step(&line(65, 0), true));
+        // The queues and the fill keep the common bound.
+        for detail in [3, 4, 5, 6] {
+            assert!(!is_return_step(&line(65, detail), true));
+        }
+        assert!(!is_return_step(&line(36, 1), true));
     }
 
     #[test]

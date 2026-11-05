@@ -69,8 +69,10 @@ _Static_assert(sizeof(struct stafeto_fast_claim) == 480, "the layout of the clai
 #define STAFETO_FAST_RING 2u
 #define STAFETO_FAST_ADDRESS 4u
 #define STAFETO_FAST_CONFIG 8u
-/* The service let go of the notifications: it ended (vnet_lost then says
- * whether the device went), or it took the device back. */
+/* The service let go of the notifications: it ended (a restarted service
+ * may have started the device again, so the device's status may look
+ * alive), or it took the device back. The program stops using the device
+ * when it sees this bit. */
 #define STAFETO_FAST_GONE 16u
 
 /* Flags of stafeto_fast_claim: fail with EBUSY at once while the device has
@@ -89,7 +91,9 @@ _Static_assert(sizeof(struct stafeto_fast_claim) == 480, "the layout of the clai
  *   EINVAL  out is null;
  *   EIO     the service answered in a way the layer does not know.
  * The thread that claims is the one that waits: the service notifies its
- * channel. */
+ * channel. A claim that fails after the service gave the device (while the
+ * objects are mapped) leaves the device with the process until the process
+ * ends: another claim says EBUSY, fork and execve stay refused. */
 int stafeto_fast_claim(struct stafeto_fast_claim *out, unsigned flags);
 
 /* Waits for the service's notification up to timeout_ns nanoseconds (0:
