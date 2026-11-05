@@ -8,11 +8,13 @@
 name = "util-linux"
 version = "2.42.4"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "util-linux utilities"
 url = "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.4.tar.xz"
 sha256 = "5eec78fac0908c1bc18dbe91478741115a3209156dc6105a78ec46dce0f590b3"
 license = "GPL-2.0-or-later"
 license_file = "Documentation/licenses/COPYING.GPL-2.0-or-later"
-depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = [
   "/bin/newgrp = link:busybox",

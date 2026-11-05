@@ -685,16 +685,16 @@ pub fn package_table(
         bytes,
     ));
     let mut out = format!(
-        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "{:<12} {:<14} {:<17} {:<8} {:>6} {:>10}\n",
         "package", "version", "license", "kind", "files", "bytes"
     );
     for (name, version, license, kind, count, bytes) in &rows {
         out +=
-            &format!("{name:<12} {version:<14} {license:<17} {kind:<7} {count:>6} {bytes:>10}\n");
+            &format!("{name:<12} {version:<14} {license:<17} {kind:<8} {count:>6} {bytes:>10}\n");
     }
     let total: u64 = rows.iter().map(|r| r.5).sum();
     out += &format!(
-        "{:<12} {:<14} {:<17} {:<7} {:>6} {:>10}\n",
+        "{:<12} {:<14} {:<17} {:<8} {:>6} {:>10}\n",
         "total",
         "",
         "",

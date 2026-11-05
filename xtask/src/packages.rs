@@ -11,15 +11,12 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Whether a package is part of the base set of the system, an add-on of
-/// the shell image, a game (the games image only) or a program of the
-/// network (the images with the network service only).
+/// Whether a package belongs to the base set of the system or is optional
+/// (spec 5, 3.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Base,
-    Addon,
-    Game,
-    Net,
+    Optional,
 }
 
 impl Kind {
@@ -27,11 +24,42 @@ impl Kind {
     pub fn word(self) -> &'static str {
         match self {
             Kind::Base => "base",
-            Kind::Addon => "addon",
-            Kind::Game => "game",
-            Kind::Net => "net",
+            Kind::Optional => "optional",
         }
     }
+}
+
+/// The probe images a package goes into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Image {
+    Shell,
+    Games,
+    Net,
+    Fstack,
+}
+
+impl Image {
+    pub fn word(self) -> &'static str {
+        match self {
+            Image::Shell => "shell",
+            Image::Games => "games",
+            Image::Net => "net",
+            Image::Fstack => "fstack",
+        }
+    }
+}
+
+/// What builds together and which images hold a package: derived from its
+/// kind and image. The base set of the shell image, the add-ons of the shell
+/// image, F-Stack, the games (the games image only) and the programs of the
+/// network (the images with the network service only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Base,
+    Addon,
+    Fstack,
+    Game,
+    Net,
 }
 
 /// A package: the content of its description.
@@ -40,11 +68,27 @@ pub struct Package {
     pub name: String,
     pub version: String,
     pub kind: Kind,
+    pub image: Image,
+    /// The number of the build of this version: digits.
+    pub release: String,
+    /// One line, up to 80 characters of ASCII without `"`.
+    pub summary: String,
     pub url: String,
     pub sha256: String,
     /// The SPDX expression of its licence.
     pub license: String,
+    /// Packages needed when it runs.
     pub depends: Vec<String>,
+    /// Packages linked into it when it is built.
+    pub build_depends: Vec<String>,
+    /// Other names the package answers to.
+    pub provides: Vec<String>,
+    /// What the device must offer: `display`, `input`, `net`.
+    pub needs: Vec<String>,
+    /// More notice files of the package: the name in its licence directory
+    /// and where the bytes come from (`target:<path from target/>` or
+    /// `tree:<path from the root of the tree>`).
+    pub notices: Vec<(String, String)>,
     /// The script that builds it, from the root of the workspace.
     pub build: String,
     /// The image program its build links, if it has one of its own.
@@ -55,6 +99,20 @@ pub struct Package {
     /// from (`elf:<program>`, `terminfo:<entry>`, `bytes:<name>` or
     /// `link:<target>`, a symbolic link).
     pub files: Vec<(String, String)>,
+}
+
+impl Package {
+    /// The group of the build and of the images (spec 5, 3.3 and the
+    /// note of stage PK0, R12.2).
+    pub fn group(&self) -> Group {
+        match (self.kind, self.image) {
+            (_, Image::Fstack) => Group::Fstack,
+            (_, Image::Games) => Group::Game,
+            (_, Image::Net) => Group::Net,
+            (Kind::Base, Image::Shell) => Group::Base,
+            (Kind::Optional, Image::Shell) => Group::Addon,
+        }
+    }
 }
 
 enum Value {
@@ -184,15 +242,26 @@ pub fn parse(text: &str, origin: &str) -> Result<Package, String> {
     let version = required(text_of(take("version"), "version")?, "version")?;
     let kind = match required(text_of(take("kind"), "kind")?, "kind")?.as_str() {
         "base" => Kind::Base,
-        "addon" => Kind::Addon,
-        "game" => Kind::Game,
-        "net" => Kind::Net,
+        "optional" => Kind::Optional,
         other => {
             return Err(format!(
-                "{origin}: kind {other:?} is none of base, addon, game, net"
+                "{origin}: kind {other:?} is none of base, optional"
             ));
         }
     };
+    let image = match required(text_of(take("image"), "image")?, "image")?.as_str() {
+        "shell" => Image::Shell,
+        "games" => Image::Games,
+        "net" => Image::Net,
+        "fstack" => Image::Fstack,
+        other => {
+            return Err(format!(
+                "{origin}: image {other:?} is none of shell, games, net, fstack"
+            ));
+        }
+    };
+    let release = required(text_of(take("release"), "release")?, "release")?;
+    let summary = required(text_of(take("summary"), "summary")?, "summary")?;
     let url = required(text_of(take("url"), "url")?, "url")?;
     let sha256 = required(text_of(take("sha256"), "sha256")?, "sha256")?;
     let license = required(text_of(take("license"), "license")?, "license")?;
@@ -202,6 +271,16 @@ pub fn parse(text: &str, origin: &str) -> Result<Package, String> {
     let build = required(text_of(take("build"), "build")?, "build")?;
     let program = text_of(take("program"), "program")?;
     let depends = list_of(take("depends"), "depends")?;
+    let build_depends = list_of(take("build_depends"), "build_depends")?;
+    let provides = list_of(take("provides"), "provides")?;
+    let needs = list_of(take("needs"), "needs")?;
+    let mut notices = Vec::new();
+    for entry in list_of(take("notices"), "notices")? {
+        let (name, from) = entry
+            .split_once(" = ")
+            .ok_or_else(|| format!("{origin}: notice {entry:?} is not `name = from`"))?;
+        notices.push((name.to_owned(), from.to_owned()));
+    }
     let dirs = list_of(take("dirs"), "dirs")?;
     let mut files = Vec::new();
     for entry in list_of(take("files"), "files")? {
@@ -217,10 +296,17 @@ pub fn parse(text: &str, origin: &str) -> Result<Package, String> {
         name,
         version,
         kind,
+        image,
+        release,
+        summary,
         url,
         sha256,
         license,
         depends,
+        build_depends,
+        provides,
+        needs,
+        notices,
         build,
         program,
         dirs,
@@ -248,6 +334,32 @@ fn validate(p: &Package, origin: &str) -> Result<(), String> {
     }
     if !p.url.starts_with("https://") {
         return fail("url is not an https URL");
+    }
+    if p.release.is_empty() || !p.release.bytes().all(|b| b.is_ascii_digit()) {
+        return fail("release is not a string of digits");
+    }
+    if p.summary.len() > 80 || !p.summary.is_ascii() || p.summary.contains('"') {
+        return fail("summary is not one line of up to 80 ASCII characters without a quote");
+    }
+    if let Some(word) = p
+        .needs
+        .iter()
+        .find(|w| !matches!(w.as_str(), "display" | "input" | "net"))
+    {
+        return fail(&format!("needs names {word}, none of display, input, net"));
+    }
+    for (name, from) in &p.notices {
+        let plain = |t: &str| {
+            !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        };
+        if !plain(name) || matches!(name.as_str(), "LICENSE" | "SOURCE") {
+            return fail(&format!("notice name {name:?} is not a plain file name of its own"));
+        }
+        match from.split_once(':') {
+            Some(("target" | "tree", path))
+                if !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|c| c == "..") => {}
+            _ => return fail(&format!("notice source {from:?} is none of target:<path>, tree:<path>")),
+        }
     }
     for (path, from) in &p.files {
         if !path.starts_with('/') || path.ends_with('/') {
@@ -277,6 +389,19 @@ fn validate(p: &Package, origin: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The packages `p` may name in `depends` by image (rule 4 of the note of
+/// stage PK0): the shell image's packages only the shell's, the games the
+/// shell's and the games', F-Stack the shell's and F-Stack's, the network's
+/// any but the games'.
+fn image_allows(from: Image, on: Image) -> bool {
+    match from {
+        Image::Shell => on == Image::Shell,
+        Image::Games => matches!(on, Image::Shell | Image::Games),
+        Image::Fstack => matches!(on, Image::Shell | Image::Fstack),
+        Image::Net => on != Image::Games,
+    }
+}
+
 /// The check of the set: names, dependencies, build scripts, programs and
 /// that no path belongs to two packages. `root` holds the scripts.
 fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String> {
@@ -300,41 +425,89 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
             }
         }
     }
+    let find = |name: &str| packages.iter().find(|d| d.name == name);
+    let installs = |p: &Package| !(p.files.is_empty() && p.dirs.is_empty() && p.program.is_none());
+    let mut provided = BTreeSet::new();
     for p in packages {
+        // 1: the names a package gives or takes.
+        for name in &p.provides {
+            if find(name).is_some() || !provided.insert(name.as_str()) {
+                return Err(format!(
+                    "{}: provides {name}, which is already the name of a package or of what another provides",
+                    p.name
+                ));
+            }
+        }
         // A package that installs nothing is the source of another one (the
-        // fts of pax): some package depends on it.
-        if p.files.is_empty()
-            && p.dirs.is_empty()
-            && p.program.is_none()
-            && !packages.iter().any(|q| q.depends.contains(&p.name))
-        {
+        // fts of pax, PCRE2 of nginx): some package links it in.
+        if !installs(p) && !packages.iter().any(|q| q.build_depends.contains(&p.name)) {
             return Err(format!(
-                "{}: the package installs no file and no package depends on it",
+                "{}: the package installs no file and no package links it in (build_depends)",
                 p.name
             ));
         }
+        for dep in &p.build_depends {
+            if find(dep).is_none() {
+                return Err(format!(
+                    "{}: build_depends names {dep}, which is not a package",
+                    p.name
+                ));
+            }
+        }
         for dep in &p.depends {
-            let Some(d) = packages.iter().find(|d| d.name == *dep) else {
+            let Some(d) = find(dep) else {
                 return Err(format!(
                     "{}: depends on {dep}, which is not a package",
                     p.name
                 ));
             };
-            if p.kind == Kind::Base && d.kind == Kind::Addon {
+            // 2: a package without files is only linked in.
+            if !installs(d) {
                 return Err(format!(
-                    "{}: a base package depends on the add-on {dep}",
+                    "{}: depends names {dep}, a package without files (it belongs in build_depends)",
                     p.name
                 ));
             }
-            if p.kind != Kind::Game && d.kind == Kind::Game {
+            // 3: base depends on base; optional never names base.
+            if p.kind == Kind::Base && d.kind != Kind::Base {
                 return Err(format!(
-                    "{}: a package of the shell image depends on the game {dep}",
+                    "{}: a base package depends on the optional package {dep}",
                     p.name
                 ));
             }
-            if matches!(p.kind, Kind::Base | Kind::Addon | Kind::Game) && d.kind == Kind::Net {
+            if p.kind == Kind::Optional && d.kind == Kind::Base {
                 return Err(format!(
-                    "{}: a package of an image without the network depends on the network package {dep}",
+                    "{}: an optional package names the base package {dep} in depends (the base is always there)",
+                    p.name
+                ));
+            }
+            // 4: images.
+            if !image_allows(p.image, d.image) {
+                return Err(format!(
+                    "{}: a package of the {} image depends on {dep} of the {} image",
+                    p.name,
+                    p.image.word(),
+                    d.image.word()
+                ));
+            }
+        }
+        // 6: a link names a file of the package, of a package it depends on
+        // or of a base package.
+        for (path, from) in &p.files {
+            let Some(target) = from.strip_prefix("link:") else {
+                continue;
+            };
+            let at = path.rfind('/').unwrap_or(0);
+            let whole = format!("{}/{target}", &path[..at]);
+            let owner = packages
+                .iter()
+                .find(|q| q.files.iter().any(|(f, _)| *f == whole));
+            let ok = owner.is_some_and(|o| {
+                o.name == p.name || p.depends.contains(&o.name) || o.kind == Kind::Base
+            });
+            if !ok {
+                return Err(format!(
+                    "{}: {path} links to {whole}, which is no file of the package, of a dependency or of a base package",
                     p.name
                 ));
             }
@@ -342,13 +515,8 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
         // The programs a file takes its bytes from are those of the package
         // and of its dependencies.
         let mut known: Vec<&str> = p.program.iter().map(String::as_str).collect();
-        for dep in &p.depends {
-            known.extend(
-                packages
-                    .iter()
-                    .filter(|d| d.name == *dep)
-                    .filter_map(|d| d.program.as_deref()),
-            );
+        for dep in p.depends.iter().chain(&p.build_depends) {
+            known.extend(find(dep).and_then(|d| d.program.as_deref()));
         }
         for (path, from) in &p.files {
             if let Some(program) = from.strip_prefix("elf:")
@@ -361,19 +529,44 @@ fn validate_set(packages: &[Package], root: Option<&Path>) -> Result<(), String>
             }
         }
     }
+    // 5: no cycles, in each of the two relations.
+    cycle_free(packages, |p| &p.depends)?;
+    cycle_free(packages, |p| &p.build_depends)?;
     order(packages).map(drop)
 }
 
-/// The packages in build order: the base ones first, each after its
-/// dependencies, names in alphabetical order otherwise.
+/// Fails when following `edges` leads back to a package.
+fn cycle_free<'a>(
+    packages: &'a [Package],
+    edges: impl Fn(&'a Package) -> &'a Vec<String>,
+) -> Result<(), String> {
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    while done.len() < packages.len() {
+        let next = packages.iter().find(|p| {
+            !done.contains(p.name.as_str())
+                && edges(p).iter().all(|d| done.contains(d.as_str()) || !packages.iter().any(|q| q.name == *d))
+        });
+        match next {
+            Some(p) => {
+                done.insert(&p.name);
+            }
+            None => return Err("the dependencies of the packages form a cycle".into()),
+        }
+    }
+    Ok(())
+}
+
+/// The packages in build order: the groups in turn (the base ones first),
+/// each package after those it links in (`build_depends`), names in
+/// alphabetical order otherwise.
 pub fn order(packages: &[Package]) -> Result<Vec<Package>, String> {
     let mut sorted: Vec<&Package> = packages.iter().collect();
-    sorted.sort_by(|a, b| (a.kind as u8, &a.name).cmp(&(b.kind as u8, &b.name)));
+    sorted.sort_by(|a, b| (a.group() as u8, &a.name).cmp(&(b.group() as u8, &b.name)));
     let mut out: Vec<Package> = Vec::new();
     while out.len() < packages.len() {
         let next = sorted.iter().find(|p| {
             !out.iter().any(|o| o.name == p.name)
-                && p.depends.iter().all(|d| out.iter().any(|o| o.name == *d))
+                && p.build_depends.iter().all(|d| out.iter().any(|o| o.name == *d))
         });
         match next {
             Some(p) => out.push((*p).clone()),
@@ -432,13 +625,14 @@ pub fn check() -> Result<(), String> {
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
-    let count = |kind| packages.iter().filter(|p| p.kind == kind).count();
+    let count = |group| packages.iter().filter(|p| p.group() == group).count();
     println!(
-        "packages ok: {} base, {} add-on, {} game, {} net",
-        count(Kind::Base),
-        count(Kind::Addon),
-        count(Kind::Game),
-        count(Kind::Net)
+        "packages ok: {} base, {} add-on, {} F-Stack, {} game, {} net",
+        count(Group::Base),
+        count(Group::Addon),
+        count(Group::Fstack),
+        count(Group::Game),
+        count(Group::Net)
     );
     Ok(())
 }
@@ -485,18 +679,19 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
 }
 
 /// The packages the image `name` holds: the shell image holds the base ones
-/// and the add-ons, the images with the network service the network
-/// packages too, the games image the games with the shell's. The other
+/// and the add-ons, the images with the network service F-Stack and the
+/// network packages too, the image of the probe of F-Stack its own package,
+/// the games image the games with the shell's. The other
 /// images are probes that list the few files they use and hold no package.
 pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
-    let of = |kinds: &[Kind]| -> Result<Vec<Package>, String> {
+    let of = |groups: &[Group]| -> Result<Vec<Package>, String> {
         Ok(load()?
             .into_iter()
-            .filter(|p| kinds.contains(&p.kind))
+            .filter(|p| groups.contains(&p.group()))
             .collect())
     };
     match name {
-        "boot-ash-dialog.img" => of(&[Kind::Base, Kind::Addon]),
+        "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
         "boot-net.img"
         | "boot-net-curl-steps.img"
         | "boot-net-tls.img"
@@ -523,11 +718,11 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
         | "boot-nginx-bench-vz-nobuf.img"
-        | "boot-net-bench.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
+        | "boot-net-bench.img" => of(&[Group::Base, Group::Addon, Group::Fstack, Group::Net]),
         // The shell's image with the probe of F-Stack runs no network
         // service.
-        "boot-fstack-probe.img" => of(&[Kind::Base, Kind::Addon]),
-        "boot-doom.img" | "boot-doom-steps.img" => of(&[Kind::Base, Kind::Addon, Kind::Game]),
+        "boot-fstack-probe.img" => of(&[Group::Base, Group::Addon, Group::Fstack]),
+        "boot-doom.img" | "boot-doom-steps.img" => of(&[Group::Base, Group::Addon, Group::Game]),
         _ => Ok(Vec::new()),
     }
 }
@@ -540,11 +735,13 @@ mod tests {
 # a comment
 name = "demo"
 version = "1.0"   # trailing comment
-kind = "addon"
+kind = "optional"
+image = "shell"
+release = "1"
+summary = "A demonstration"
 url = "https://example.org/demo-1.0.tar.gz"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 license = "MIT"
-depends = []
 build = "tools/build-demo.py"
 program = "demo"
 files = [
@@ -559,18 +756,48 @@ files = [
         p
     }
 
+    /// A package `name` of the group in the image with one program of its own.
+    fn with(name: &str, kind: Kind, image: Image) -> Package {
+        Package {
+            name: name.into(),
+            kind,
+            image,
+            files: vec![(format!("/bin/{name}"), format!("elf:{name}"))],
+            program: Some(name.into()),
+            ..good()
+        }
+    }
+
+    fn refused(set: &[Package]) -> String {
+        validate_set(set, None).unwrap_err()
+    }
+
     #[test]
     fn a_description_reads_back() {
         let p = good();
         assert_eq!((p.name.as_str(), p.version.as_str()), ("demo", "1.0"));
-        assert_eq!(p.kind, Kind::Addon);
+        assert_eq!((p.kind, p.image, p.group()), (Kind::Optional, Image::Shell, Group::Addon));
+        assert_eq!((p.release.as_str(), p.summary.as_str()), ("1", "A demonstration"));
         assert_eq!(p.files.len(), 2);
         assert_eq!(p.files[0], ("/bin/demo".to_owned(), "elf:demo".to_owned()));
+        assert!(p.depends.is_empty() && p.build_depends.is_empty() && p.notices.is_empty());
     }
 
     #[test]
-    fn a_description_without_sha256_or_licence_is_refused() {
-        for key in ["sha256", "license", "version", "url", "build"] {
+    fn the_group_follows_kind_and_image() {
+        let g = |k, i| Package { kind: k, image: i, ..good() }.group();
+        assert_eq!(g(Kind::Base, Image::Shell), Group::Base);
+        assert_eq!(g(Kind::Optional, Image::Shell), Group::Addon);
+        assert_eq!(g(Kind::Base, Image::Fstack), Group::Fstack);
+        assert_eq!(g(Kind::Optional, Image::Fstack), Group::Fstack);
+        assert_eq!(g(Kind::Base, Image::Games), Group::Game);
+        assert_eq!(g(Kind::Base, Image::Net), Group::Net);
+        assert_eq!(g(Kind::Optional, Image::Net), Group::Net);
+    }
+
+    #[test]
+    fn a_description_without_a_required_key_is_refused() {
+        for key in ["sha256", "license", "version", "url", "build", "kind", "image", "release", "summary"] {
             let text: String = GOOD
                 .lines()
                 .filter(|l| !l.starts_with(&format!("{key} =")))
@@ -588,21 +815,42 @@ files = [
     }
 
     #[test]
-    fn a_package_without_files_needs_a_package_that_depends_on_it() {
+    fn the_old_kinds_and_bad_values_of_the_new_keys_are_refused() {
+        for old in ["addon", "game", "net"] {
+            let text = GOOD.replace("kind = \"optional\"", &format!("kind = \"{old}\""));
+            assert!(parse(&text, "x").unwrap_err().contains("none of base, optional"));
+        }
+        assert!(parse(&GOOD.replace("image = \"shell\"", "image = \"tv\""), "x").is_err());
+        let bad = |from: &str, to: &str| {
+            let p = parse(&GOOD.replace(from, to), "x").unwrap();
+            validate(&p, "x").unwrap_err()
+        };
+        assert!(bad("release = \"1\"", "release = \"1a\"").contains("release"));
+        assert!(bad("summary = \"A demonstration\"", &format!("summary = \"{}\"", "x".repeat(81))).contains("summary"));
+        assert!(bad("summary = \"A demonstration\"", "summary = \"caf\u{e9}\"").contains("summary"));
+        assert!(bad("build = ", "needs = [\"sound\"]\nbuild = ").contains("needs"));
+        assert!(bad("build = ", "notices = [\"LICENSE = tree:x\"]\nbuild = ").contains("notice"));
+        assert!(bad("build = ", "notices = [\"A = target:../x\"]\nbuild = ").contains("notice"));
+        assert!(bad("build = ", "notices = [\"A = elsewhere:x\"]\nbuild = ").contains("notice"));
+        let ok = parse(&GOOD.replace("build = ", "notices = [\"A = target:x/y\", \"B = tree:z\"]\nbuild = "), "x").unwrap();
+        validate(&ok, "x").unwrap();
+        assert_eq!(ok.notices[1], ("B".into(), "tree:z".into()));
+    }
+
+    #[test]
+    fn a_package_without_files_needs_a_package_that_links_it_in() {
         let mut p = good();
         p.files.clear();
         p.program = None;
-        assert!(
-            validate_set(std::slice::from_ref(&p), None)
-                .unwrap_err()
-                .contains("installs no file")
-        );
-        let mut user = good();
-        user.name = "user".into();
+        assert!(refused(std::slice::from_ref(&p)).contains("installs no file"));
+        let mut user = with("user", Kind::Optional, Image::Shell);
+        user.build_depends = vec![p.name.clone()];
+        assert!(validate_set(&[p.clone(), user], None).is_ok());
+        // A runtime dependency on it is the mistake: the note's rule 2.
+        let mut user = with("user", Kind::Optional, Image::Shell);
         user.depends = vec![p.name.clone()];
-        user.program = None;
-        user.files = vec![("/bin/user".to_owned(), "link:demo".to_owned())];
-        assert!(validate_set(&[p, user], None).is_ok());
+        user.build_depends = vec![p.name.clone()];
+        assert!(refused(&[p, user]).contains("a package without files"));
     }
 
     #[test]
@@ -617,130 +865,165 @@ files = [
         let a = good();
         let mut b = good();
         b.name = "other".into();
-        assert!(
-            validate_set(&[a.clone(), b], None)
-                .unwrap_err()
-                .contains("two packages")
-        );
+        assert!(refused(&[a.clone(), b]).contains("two packages"));
         assert!(validate_set(&[a], None).is_ok());
     }
 
     #[test]
-    fn dependencies_must_exist_and_not_loop() {
-        let mut a = good();
+    fn the_names_in_the_three_lists_must_exist() {
+        let mut a = with("a", Kind::Optional, Image::Shell);
         a.depends = vec!["ghost".into()];
-        assert!(validate_set(&[a], None).unwrap_err().contains("ghost"));
-        let mut a = good();
-        let mut b = good();
-        b.name = "other".into();
-        b.files = vec![("/bin/other".into(), "elf:other".into())];
-        b.program = Some("other".into());
-        a.depends = vec!["other".into()];
-        b.depends = vec!["demo".into()];
-        assert!(validate_set(&[a, b], None).unwrap_err().contains("cycle"));
+        assert!(refused(&[a]).contains("ghost"));
+        let mut a = with("a", Kind::Optional, Image::Shell);
+        a.build_depends = vec!["ghost".into()];
+        assert!(refused(&[a]).contains("ghost"));
     }
 
     #[test]
-    fn a_base_package_does_not_need_an_addon() {
-        let mut a = good();
-        a.kind = Kind::Base;
-        a.depends = vec!["other".into()];
-        let mut b = good();
-        b.name = "other".into();
-        b.files = vec![("/bin/other".into(), "elf:other".into())];
-        b.program = Some("other".into());
-        assert!(validate_set(&[a, b], None).unwrap_err().contains("add-on"));
+    fn provides_never_repeats_a_package_name_or_another_provides() {
+        let mut a = with("a", Kind::Optional, Image::Shell);
+        let b = with("b", Kind::Optional, Image::Shell);
+        a.provides = vec!["b".into()];
+        assert!(refused(&[a.clone(), b.clone()]).contains("provides b"));
+        a.provides = vec!["x".into()];
+        let mut c = with("c", Kind::Optional, Image::Shell);
+        c.provides = vec!["x".into()];
+        assert!(refused(&[a.clone(), b.clone(), c]).contains("provides x"));
+        assert!(validate_set(&[a, b], None).is_ok());
     }
 
     #[test]
-    fn a_package_of_the_shell_image_cannot_depend_on_a_game() {
-        let mut shell = good();
-        shell.depends = vec!["game".into()];
-        let mut game = good();
-        game.name = "game".into();
-        game.kind = Kind::Game;
-        game.files = vec![("/bin/game".into(), "elf:game".into())];
-        game.program = Some("game".into());
-        assert!(
-            validate_set(&[shell, game.clone()], None)
-                .unwrap_err()
-                .contains("game")
-        );
-        game.depends = vec![];
-        assert!(validate_set(&[game], None).is_ok());
+    fn neither_relation_has_a_cycle() {
+        let mut a = with("a", Kind::Optional, Image::Shell);
+        let mut b = with("b", Kind::Optional, Image::Shell);
+        a.depends = vec!["b".into()];
+        b.depends = vec!["a".into()];
+        assert!(refused(&[a, b]).contains("cycle"));
+        let mut a = with("a", Kind::Optional, Image::Shell);
+        let mut b = with("b", Kind::Optional, Image::Shell);
+        a.build_depends = vec!["b".into()];
+        b.build_depends = vec!["a".into()];
+        assert!(refused(&[a, b]).contains("cycle"));
+    }
+
+    #[test]
+    fn base_and_optional_depend_by_the_rules_of_the_note() {
+        // A base package depends on base packages only.
+        let mut base = with("base", Kind::Base, Image::Shell);
+        let other = with("other", Kind::Optional, Image::Shell);
+        base.depends = vec!["other".into()];
+        assert!(refused(&[base.clone(), other.clone()]).contains("base package depends on the optional"));
+        // An optional package never names a base package.
+        let mut opt = other;
+        base.depends.clear();
+        opt.depends = vec!["base".into()];
+        assert!(refused(&[base.clone(), opt]).contains("names the base package"));
+        // Base on base is allowed.
+        let mut second = with("second", Kind::Base, Image::Shell);
+        second.depends = vec!["base".into()];
+        assert!(validate_set(&[base, second], None).is_ok());
+    }
+
+    #[test]
+    fn depends_stay_within_the_images() {
+        let shell = with("shell", Kind::Optional, Image::Shell);
+        let games = with("games", Kind::Optional, Image::Games);
+        let fstack = with("fstack", Kind::Optional, Image::Fstack);
+        let net = with("net", Kind::Optional, Image::Net);
+        let on = |from: &Package, to: &Package| {
+            let mut f = from.clone();
+            f.depends = vec![to.name.clone()];
+            validate_set(&[f, to.clone()], None)
+        };
+        assert!(on(&shell, &games).is_err());
+        assert!(on(&shell, &net).is_err());
+        assert!(on(&shell, &fstack).is_err());
+        assert!(on(&games, &shell).is_ok());
+        assert!(on(&games, &fstack).is_err());
+        assert!(on(&fstack, &shell).is_ok());
+        assert!(on(&fstack, &games).is_err());
+        assert!(on(&net, &shell).is_ok());
+        assert!(on(&net, &fstack).is_ok());
+        assert!(on(&net, &games).is_err());
+    }
+
+    #[test]
+    fn a_link_names_a_file_of_the_package_a_dependency_or_the_base() {
+        let mut link = good();
+        link.files = vec![("/bin/x".into(), "link:y".into())];
+        link.program = None;
+        let mut own = link.clone();
+        own.files.push(("/bin/y".into(), "bytes:y".into()));
+        assert!(validate_set(&[own], None).is_ok());
+        let target = |kind, name: &str| Package {
+            name: name.into(),
+            kind,
+            files: vec![("/bin/y".into(), "bytes:y".into())],
+            program: None,
+            ..good()
+        };
+        // A stranger's file: refused; the dependency's or a base package's: fine.
+        assert!(refused(&[link.clone(), target(Kind::Optional, "t")]).contains("links to /bin/y"));
+        let mut dependent = link.clone();
+        dependent.depends = vec!["t".into()];
+        assert!(validate_set(&[dependent, target(Kind::Optional, "t")], None).is_ok());
+        assert!(validate_set(&[link, target(Kind::Base, "t")], None).is_ok());
+    }
+
+    #[test]
+    fn the_order_puts_groups_in_turn_and_builds_links_before_the_package() {
+        let mk = |name: &str, kind, build_depends: &[&str]| Package {
+            name: name.into(),
+            kind,
+            build_depends: build_depends.iter().map(|d| (*d).into()).collect(),
+            ..good()
+        };
+        let list = [
+            mk("nano", Kind::Optional, &["ncurses"]),
+            mk("ncurses", Kind::Optional, &[]),
+            mk("busybox", Kind::Base, &["ncurses"]),
+            mk("sbase", Kind::Base, &[]),
+        ];
+        let names: Vec<_> = order(&list).unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["sbase", "ncurses", "busybox", "nano"]);
     }
 
     #[test]
     fn the_games_stay_out_of_the_shell_image() {
         let shell = of_image("boot-ash-dialog.img").unwrap();
-        assert!(shell.iter().all(|p| p.kind != Kind::Game));
+        assert!(shell.iter().all(|p| p.group() != Group::Game));
         let doom = of_image("boot-doom.img").unwrap();
         assert!(doom.len() > shell.len());
         assert!(doom.iter().any(|p| p.name == "freedoom"));
     }
 
     #[test]
-    fn the_network_packages_stay_in_the_images_with_the_network() {
+    fn the_network_packages_and_fstack_stay_where_the_note_puts_them() {
         let shell = of_image("boot-ash-dialog.img").unwrap();
-        assert!(shell.iter().all(|p| p.kind != Kind::Net));
+        assert!(shell.iter().all(|p| !matches!(p.group(), Group::Net | Group::Fstack)));
         let doom = of_image("boot-doom.img").unwrap();
-        assert!(doom.iter().all(|p| p.kind != Kind::Net));
+        assert!(doom.iter().all(|p| !matches!(p.group(), Group::Net | Group::Fstack)));
         let net = of_image("boot-net.img").unwrap();
-        for name in ["openssl", "curl", "ca-bundle"] {
-            assert!(
-                net.iter().any(|p| p.name == name && p.kind == Kind::Net),
-                "{name}"
-            );
+        for name in ["openssl", "curl", "ca-bundle", "f-stack"] {
+            assert!(net.iter().any(|p| p.name == name), "{name}");
         }
-        let mut addon = good();
-        addon.depends = vec!["tls".into()];
-        let mut tls = good();
-        tls.name = "tls".into();
-        tls.kind = Kind::Net;
-        tls.files = vec![("/bin/tls".into(), "elf:tls".into())];
-        tls.program = Some("tls".into());
-        assert!(
-            validate_set(&[addon, tls.clone()], None)
-                .unwrap_err()
-                .contains("network package")
-        );
-        let mut user = tls.clone();
-        user.name = "user".into();
-        user.files = vec![("/bin/user".into(), "elf:user".into())];
-        user.program = Some("user".into());
-        user.depends = vec!["tls".into()];
-        assert!(validate_set(&[tls, user], None).is_ok());
-    }
-
-    #[test]
-    fn the_order_puts_base_first_and_dependencies_before_dependents() {
-        let mk = |name: &str, kind, depends: &[&str]| Package {
-            name: name.into(),
-            kind,
-            depends: depends.iter().map(|d| (*d).into()).collect(),
-            ..good()
-        };
-        let list = [
-            mk("nano", Kind::Addon, &["ncurses"]),
-            mk("ncurses", Kind::Addon, &[]),
-            mk("busybox", Kind::Base, &[]),
-        ];
-        let names: Vec<_> = order(&list).unwrap().into_iter().map(|p| p.name).collect();
-        assert_eq!(names, ["busybox", "ncurses", "nano"]);
+        let probe = of_image("boot-fstack-probe.img").unwrap();
+        assert!(probe.iter().any(|p| p.name == "f-stack"));
+        assert!(probe.iter().all(|p| p.group() != Group::Net));
     }
 
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert!(
-            packages
-                .iter()
-                .any(|p| p.name == "busybox" && p.kind == Kind::Base)
-        );
-        assert!(
-            packages
-                .iter()
-                .any(|p| p.name == "nano" && p.kind == Kind::Addon)
-        );
+        assert_eq!(packages.len(), 22);
+        let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(get("busybox").group(), Group::Base);
+        assert_eq!(get("nano").group(), Group::Addon);
+        assert_eq!(get("f-stack").group(), Group::Fstack);
+        assert_eq!(get("curl").kind, Kind::Base);
+        assert_eq!(get("nginx").build_depends, ["openssl", "pcre2"]);
+        assert_eq!(get("doomgeneric").provides, ["doom"]);
+        assert_eq!(get("f-stack").notices.len(), 2);
+        assert!(packages.iter().all(|p| p.release == "1"));
     }
 }

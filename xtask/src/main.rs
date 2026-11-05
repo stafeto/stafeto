@@ -3750,10 +3750,13 @@ fn dynamic_programs(names: &[&str]) -> Result<(), String> {
     })
 }
 
-/// The scripts of the packages of `kind` run, each once in a run of xtask
+/// The scripts of the packages of `groups` run, each once in a run of xtask
 /// and in the order of the packages (a package after its dependencies).
-fn packages_built(kind: packages::Kind) -> Result<(), String> {
-    for package in packages::load()?.iter().filter(|p| p.kind == kind) {
+fn packages_built(groups: &[packages::Group]) -> Result<(), String> {
+    for package in packages::load()?
+        .iter()
+        .filter(|p| groups.contains(&p.group()))
+    {
         once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
             run_cmd(Command::new("python3").arg(root().join(&package.build)))
         })?;
@@ -3764,7 +3767,7 @@ fn packages_built(kind: packages::Kind) -> Result<(), String> {
 /// BusyBox and the other packages of the base set built, once in a run of
 /// xtask.
 fn busybox_build() -> Result<(), String> {
-    once(&BUSYBOX_BUILT, (), || packages_built(packages::Kind::Base))
+    once(&BUSYBOX_BUILT, (), || packages_built(&[packages::Group::Base]))
 }
 
 /// The add-on packages built (ncurses, nano, htop, ncdu and bash: the objects
@@ -3772,13 +3775,13 @@ fn busybox_build() -> Result<(), String> {
 /// the image), once in a run of xtask. The shell image holds all of them,
 /// so each dialog needs all.
 fn nano_build() -> Result<(), String> {
-    once(&NANO_BUILT, (), || packages_built(packages::Kind::Addon))
+    once(&NANO_BUILT, (), || packages_built(&[packages::Group::Addon, packages::Group::Fstack]))
 }
 
 /// The network packages built (OpenSSL, curl, the root certificates, nginx with PCRE2),
 /// once in a run of xtask: the images with the network service hold them.
 fn net_build() -> Result<(), String> {
-    once(&NET_BUILT, (), || packages_built(packages::Kind::Net))
+    once(&NET_BUILT, (), || packages_built(&[packages::Group::Net]))
 }
 
 /// bash built (its object, which `tools/build-libc-so.py programs` links), once in a run of xtask. It is

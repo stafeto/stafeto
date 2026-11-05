@@ -8,11 +8,13 @@
 name = "ncompress"
 version = "5.0"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "compress and uncompress (ncompress)"
 url = "https://github.com/vapier/ncompress/archive/refs/tags/v5.0.tar.gz"
 sha256 = "976c267b1c1f3d2a6a66903142472184efd49b8691b07c50811b6599a449142b"
 license = "Unlicense"
 license_file = "UNLICENSE"
-depends = ["busybox"]
 build = "tools/build-busybox.py"
 files = [
   "/bin/compress = link:busybox",

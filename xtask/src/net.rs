@@ -47,7 +47,7 @@ pub fn programs() -> &'static [ImageProgram] {
         let net: Vec<packages::Package> = packages::of_image(IMAGE)
             .unwrap_or_else(|e| panic!("{IMAGE}: {e}"))
             .into_iter()
-            .filter(|p| p.kind == packages::Kind::Net)
+            .filter(|p| p.group() == packages::Group::Net)
             .collect();
         programs.extend(package_programs(&net));
         programs

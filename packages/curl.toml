@@ -6,12 +6,17 @@
 
 name = "curl"
 version = "8.23.0"
-kind = "net"
+kind = "base"
+image = "net"
+release = "1"
+summary = "curl transfer tool"
 url = "https://curl.se/download/curl-8.23.0.tar.xz"
 sha256 = "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
 license = "curl"
 license_file = "COPYING"
-depends = ["busybox", "openssl", "ca-bundle"]
+depends = ["ca-bundle"]
+build_depends = ["openssl"]
+needs = ["net"]
 build = "tools/build-curl.py"
 program = "curl"
 files = [

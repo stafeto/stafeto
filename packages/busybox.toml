@@ -7,10 +7,13 @@
 name = "busybox"
 version = "1.37.0"
 kind = "base"
+image = "shell"
+release = "1"
+summary = "BusyBox utilities and the ash shell"
 url = "https://busybox.net/downloads/busybox-1.37.0.tar.bz2"
 sha256 = "3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4"
 license = "GPL-2.0-only"
-depends = []
+build_depends = ["chimerautils", "musl-fts", "nbase", "ncompress", "ncurses", "paxmirabilis", "sbase", "toybox", "util-linux"]
 build = "tools/build-busybox.py"
 program = "busybox-probe"
 files = [

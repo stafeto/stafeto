@@ -86,7 +86,7 @@ pub fn build_games() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     nano_build()?;
-    packages_built(packages::Kind::Game)
+    packages_built(&[packages::Group::Game])
 }
 
 /// The licence texts of Doomgeneric and Freedoom and the notes of their

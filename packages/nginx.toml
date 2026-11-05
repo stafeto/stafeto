@@ -7,11 +7,15 @@
 
 name = "nginx"
 version = "1.30.6"
-kind = "net"
+kind = "optional"
+image = "net"
+release = "1"
+summary = "nginx HTTP server"
 url = "https://nginx.org/download/nginx-1.30.6.tar.gz"
 sha256 = "3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8"
 license = "BSD-2-Clause"
-depends = ["busybox", "pcre2", "openssl"]
+build_depends = ["openssl", "pcre2"]
+needs = ["net"]
 build = "tools/build-nginx.py"
 program = "nginx"
 dirs = ["/etc/nginx", "/var/log/nginx", "/var/lib", "/var/lib/nginx"]

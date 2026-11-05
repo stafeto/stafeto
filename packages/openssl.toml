@@ -7,12 +7,15 @@
 
 name = "openssl"
 version = "3.5.9"
-kind = "net"
+kind = "optional"
+image = "net"
+release = "1"
+summary = "OpenSSL command line tool"
 url = "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
 sha256 = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 license = "Apache-2.0"
 license_file = "LICENSE.txt"
-depends = ["busybox"]
+needs = ["net"]
 build = "tools/build-openssl.py"
 program = "openssl"
 # The directory OpenSSL is built to name (OPENSSLDIR) is that of ca-bundle,
