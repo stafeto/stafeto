@@ -47,6 +47,25 @@ pub const VERSION: u32 = 1;
 /// The version of the program format; it changes on its own.
 pub const PROGRAM_VERSION: u32 = 1;
 pub const NAME_MAX: usize = 32;
+
+/// The signature, version and name of one container format that has the
+/// layout of the boot image (header, table, files at 4 KiB boundaries). The
+/// boot image is `BOOT`; other formats (the package file) name themselves
+/// here and share the reader and the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Format {
+    pub magic: [u8; 8],
+    pub version: u32,
+    pub name: &'static str,
+}
+
+/// The boot image's format.
+pub const BOOT: Format = Format {
+    magic: MAGIC,
+    version: VERSION,
+    name: "STAFBOOT",
+};
+
 const HEADER_SIZE: u64 = 16;
 const ENTRY_SIZE: u64 = 48;
 const PROGRAM_HEADER_SIZE: u64 = 120;
@@ -185,6 +204,12 @@ pub struct BootImage<'a> {
 
 impl<'a> BootImage<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<BootImage<'a>, Error> {
+        Self::parse_as(bytes, &BOOT)
+    }
+
+    /// Parses a container of the given format with the layout rules of the
+    /// boot image.
+    pub fn parse_as(bytes: &'a [u8], format: &Format) -> Result<BootImage<'a>, Error> {
         let len = bytes.len() as u64;
         if len < HEADER_SIZE {
             return Err(Error::Truncated {
@@ -192,14 +217,14 @@ impl<'a> BootImage<'a> {
                 len,
             });
         }
-        if bytes[..8] != MAGIC {
-            return Err(Error::BadSignature("STAFBOOT"));
+        if bytes[..8] != format.magic {
+            return Err(Error::BadSignature(format.name));
         }
         let version = u32_at(bytes, 8);
-        if version != VERSION {
+        if version != format.version {
             return Err(Error::BadVersion {
                 found: version,
-                known: VERSION,
+                known: format.version,
             });
         }
         let count = u32_at(bytes, 12);
@@ -495,9 +520,14 @@ pub mod write {
     /// boundary, in the order given, and zeros up to the next boundary: the
     /// image is whole pages (spec 13.1).
     pub fn image(files: &[(&str, &[u8])]) -> Result<Vec<u8>, Error> {
+        image_as(&BOOT, files)
+    }
+
+    /// `image` for another container format.
+    pub fn image_as(format: &Format, files: &[(&str, &[u8])]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&format.magic);
+        out.extend_from_slice(&format.version.to_le_bytes());
         out.extend_from_slice(&(files.len() as u32).to_le_bytes());
         let table_end = HEADER_SIZE + ENTRY_SIZE * files.len() as u64;
         let mut offset = table_end.next_multiple_of(PAGE_SIZE);
@@ -517,7 +547,7 @@ pub mod write {
             out.extend_from_slice(data);
         }
         pad(&mut out);
-        BootImage::parse(&out)?;
+        BootImage::parse_as(&out, format)?;
         Ok(out)
     }
 
@@ -658,6 +688,37 @@ mod tests {
                 if l == len as u64 && need > l);
             assert!(cut, "cut at {len}: {got:?}");
         }
+    }
+
+    const OTHER: Format = Format {
+        magic: *b"STAFPKG1",
+        version: 1,
+        name: "STAFPKG1",
+    };
+
+    #[test]
+    fn other_formats_share_the_layout_but_not_the_signature() {
+        let files: [(&str, &[u8]); 2] = [("meta", b"a"), ("rootfs", b"bb")];
+        let pkg = write::image_as(&OTHER, &files).unwrap();
+        let boot = write::image(&files).unwrap();
+        assert_eq!(pkg.len(), boot.len());
+        assert_eq!(&pkg[16..], &boot[16..]);
+        let parsed = BootImage::parse_as(&pkg, &OTHER).unwrap();
+        assert_eq!(parsed.count(), 2);
+        assert_eq!(
+            BootImage::parse(&pkg).err(),
+            Some(Error::BadSignature("STAFBOOT"))
+        );
+        assert_eq!(
+            BootImage::parse_as(&boot, &OTHER).err(),
+            Some(Error::BadSignature("STAFPKG1"))
+        );
+        let mut bytes = pkg.clone();
+        bytes[8] = 2;
+        assert_eq!(
+            BootImage::parse_as(&bytes, &OTHER).err(),
+            Some(Error::BadVersion { found: 2, known: 1 })
+        );
     }
 
     #[test]
