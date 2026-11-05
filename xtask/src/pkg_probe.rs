@@ -22,6 +22,8 @@
 //! 6. `pkg info doom` and `pkg search doom`.
 //! 7. `pkg update`: `serial 2, was 2`.
 //! 8. `pkg install doom` again: "is installed", and no package was downloaded (the log of the mirror).
+//! 9. The codes of exit: 2 for a command line that is none, 1 with a line of its own for a name no
+//!    repository has, and no package downloaded for it.
 
 use crate::net_tls::{capture, coded};
 use crate::{
@@ -503,6 +505,26 @@ fn install(machine: &'static qemu::Machine) -> Result<(), String> {
             "the second pkg install doom downloads no package (the log of the mirror)".into(),
         );
 
+        // Step 9: the codes of exit. A command line that is none is 2 with the usage line; a name
+        // no repository has is 1 with its own line, and nothing is downloaded for it.
+        let mark = mirror.mark();
+        let lines = expect_code(&mut run, "pkg", "usage", 2, DIALOG_STEP)?;
+        need(
+            &lines,
+            "usage: pkg install|remove|upgrade|update|list|info|search|repo|check",
+            "step 9",
+        )?;
+        expect_code(&mut run, "pkg install", "usage2", 2, DIALOG_STEP)?;
+        let lines = expect_code(&mut run, "pkg install nosuch", "nosuch", 1, INSTALL_WITHIN)?;
+        need(&lines, "pkg: nosuch: no repository has it", "step 9")?;
+        let requests = mirror.requests(mark);
+        if gets_of_packages(&requests) != 0 {
+            return Err(format!(
+                "step 9: a name no repository has downloaded a package: {requests:?}"
+            ));
+        }
+        report.push("exit codes: 2 for a bad command line, 1 and a line of its own for a name no repository has".into());
+
         // The refusal of a process that is not the superuser is the next part's (runas).
         let free = run.lines().iter().find_map(|l| {
             l.trim()
@@ -534,7 +556,7 @@ fn install(machine: &'static qemu::Machine) -> Result<(), String> {
         println!("pkg-probe: {line}");
     }
     println!(
-        "pkg-probe install on {}: steps 1 to 8 passed in {:.0} s (the build and the repository {:.0} s, the guest {:.0} s)",
+        "pkg-probe install on {}: steps 1 to 9 passed in {:.0} s (the build and the repository {:.0} s, the guest {:.0} s)",
         machine.name,
         total.as_secs_f64(),
         prepared.as_secs_f64(),
