@@ -275,6 +275,10 @@ pub const RT_CPUS: u8 = 0b1100;
 /// decision of the SMP stage for the other images stands, and no table but
 /// `bench.rs` names this constant.
 pub const BENCH_CPUS: u8 = 0b1111;
+/// The CPUs of the shell's processes in the pinned variant of that image
+/// (`bench::BENCH_PINNED_VZ_TABLE`): CPUs 1 to 3, so that no worker of nginx
+/// shares the CPU of the network service.
+pub const BENCH_PINNED_CPUS: u8 = 0b1110;
 /// Every CPU that is up: a record with it is cut to the CPUs the machine
 /// has (the process service has them all, to give its processes the CPUs
 /// they may use).
@@ -1085,6 +1089,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-bench-vz") as usize
+    + cfg!(feature = "table-bench-pinned-vz") as usize
+    + cfg!(feature = "table-bench-cpu0-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1155,6 +1161,8 @@ const _: () = assert!(
     feature = "table-net-vz",
     feature = "table-net-vz2",
     feature = "table-bench-vz",
+    feature = "table-bench-pinned-vz",
+    feature = "table-bench-cpu0-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1257,6 +1265,10 @@ pub const TABLE: &[Record] = net::NET_VZ_TABLE;
 pub const TABLE: &[Record] = net::NET_VZ2_TABLE;
 #[cfg(feature = "table-bench-vz")]
 pub const TABLE: &[Record] = bench::BENCH_VZ_TABLE;
+#[cfg(feature = "table-bench-pinned-vz")]
+pub const TABLE: &[Record] = bench::BENCH_PINNED_VZ_TABLE;
+#[cfg(feature = "table-bench-cpu0-vz")]
+pub const TABLE: &[Record] = bench::BENCH_CPU0_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -2048,6 +2060,8 @@ mod tests {
             net::NET_VZ_TABLE,
             net::NET_VZ2_TABLE,
             bench::BENCH_VZ_TABLE,
+            bench::BENCH_PINNED_VZ_TABLE,
+            bench::BENCH_CPU0_VZ_TABLE,
             net::NET_PROBE_TWO_TABLE,
             net::NET_TWO_TABLE,
             doom::TABLE,
@@ -2315,6 +2329,53 @@ mod tests {
             .find(|r| r.name == NET_SERVICE)
             .unwrap();
         assert_eq!(netd.cpus, NETD_CPUS);
+    }
+
+    /// The pinned variant of the image of the measurement differs from it in
+    /// the launcher's mask alone: CPUs 1 to 3.
+    #[test]
+    fn the_pinned_bench_image_differs_from_the_bench_image_in_the_launcher_mask_alone() {
+        assert_eq!(BENCH_PINNED_CPUS, 0b1110);
+        assert_eq!(
+            order_of(bench::BENCH_PINNED_VZ_TABLE),
+            order_of(bench::BENCH_VZ_TABLE)
+        );
+        for (pinned, plain) in bench::BENCH_PINNED_VZ_TABLE
+            .iter()
+            .zip(bench::BENCH_VZ_TABLE)
+        {
+            if pinned.name == bench::BENCH_LAUNCHER.name {
+                assert_eq!(pinned.cpus, BENCH_PINNED_CPUS);
+                assert_eq!(
+                    Record {
+                        cpus: plain.cpus,
+                        ..*pinned
+                    },
+                    *plain
+                );
+            } else {
+                assert_eq!(pinned, plain, "{}", pinned.name);
+            }
+        }
+    }
+
+    /// The table of the image with every program on CPU 0 differs from the
+    /// image of the measurement in the masks alone: all on the boot CPU but
+    /// the process service, which keeps every CPU to place its processes.
+    #[test]
+    fn the_cpu0_bench_image_puts_every_program_but_the_process_service_on_cpu_0() {
+        assert_eq!(
+            order_of(bench::BENCH_CPU0_VZ_TABLE),
+            order_of(bench::BENCH_VZ_TABLE)
+        );
+        for (one, plain) in bench::BENCH_CPU0_VZ_TABLE.iter().zip(bench::BENCH_VZ_TABLE) {
+            let cpus = if plain.cpus == ALL_CPUS {
+                ALL_CPUS
+            } else {
+                0b0001
+            };
+            assert_eq!(*one, Record { cpus, ..*plain }, "{}", one.name);
+        }
     }
 
     /// No other table names `BENCH_CPUS`: not by the constant (a scan of the

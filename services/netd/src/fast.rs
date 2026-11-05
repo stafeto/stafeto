@@ -13,6 +13,7 @@
 //! sums are checked and written here, as `device.rs` does for the queues.
 
 use netd::bypass::{Broken, Own, Ring, Taker};
+use netd::profile::{self, Counter};
 use netd::ring::STEP_TX;
 use proto_net::fast::FRAME_MAX;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
@@ -85,7 +86,11 @@ impl phy::TxToken for TxToken<'_> {
     {
         let len = len.min(FRAME_MAX);
         let result = f(&mut self.out[..len]);
+        let began = profile::now();
         fill_sums(&mut self.out[..len]);
+        profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
+        profile::add(Counter::SumN, 1);
+        profile::add(Counter::SumBytes, len as u64);
         match self.ring.put(&self.out[..len]) {
             Ok(true) => *self.pushed += 1,
             Ok(false) => *self.lost += 1,

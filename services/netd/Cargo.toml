@@ -48,6 +48,9 @@ limit-8 = []
 limit-64 = []
 limit-256 = []
 limit-1280 = []
+# `profile`: the counters of the profile of a request (profile.rs), printed
+# once a second, for the measurement of where the time of a request goes.
+profile = ["split"]
 steps = ["rt/step-stats"]
 
 [dependencies]

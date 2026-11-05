@@ -63,7 +63,9 @@ pub const PROGRAMS: [ImageProgram; 6] = [
     RAM,
     RNG,
     ENTROPY,
-    ("netd", "netd", NETD_STACK_SIZE, &["probe"]),
+    // With the profile's counters: CONFIG prints their records, which the
+    // check below reads whole.
+    ("netd", "netd", NETD_STACK_SIZE, &["probe", "profile"]),
     ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
 ];
 
@@ -74,7 +76,7 @@ pub const TWO_PROGRAMS: [ImageProgram; 6] = [
     RAM,
     RNG,
     ENTROPY,
-    ("netd", "netd", NETD_STACK_SIZE, &["probe"]),
+    ("netd", "netd", NETD_STACK_SIZE, &["probe", "profile"]),
     ("net-probe", "net-probe", PROBE_STACK_SIZE, &[]),
 ];
 
@@ -405,6 +407,47 @@ fn rtts(line: &str) -> Option<(u64, u64)> {
     Some((max.parse().ok()?, median.parse().ok()?))
 }
 
+/// The records `net: prof <id> <name> <value> ...` of the profile's counters
+/// (the image of the probe carries them): at least one snapshot, each record
+/// at most 63 bytes with pairs of a name and a number, each snapshot with its
+/// first counter and its last (a record lost in the console's ring leaves a
+/// snapshot without one of them).
+fn profile_records(lines: &[String]) -> Result<(), String> {
+    let mut snapshots: Vec<(u64, bool, bool)> = Vec::new();
+    for line in lines.iter().filter(|l| l.starts_with("net: prof ")) {
+        let line = line.trim_end();
+        if line.len() > 63 {
+            return Err(format!(
+                "a profile record of {} bytes: {line:?}",
+                line.len()
+            ));
+        }
+        let words: Vec<&str> = line.split(' ').collect();
+        let id = words.get(2).and_then(|w| w.parse::<u64>().ok());
+        let pairs = &words[3.min(words.len())..];
+        let whole = pairs.len().is_multiple_of(2)
+            && pairs
+                .chunks(2)
+                .all(|p| p[1].parse::<u64>().is_ok() && !p[0].is_empty());
+        let Some(id) = id.filter(|_| whole && !pairs.is_empty()) else {
+            return Err(format!("a profile record that is cut: {line:?}"));
+        };
+        if snapshots.last().is_none_or(|s| s.0 != id) {
+            snapshots.push((id, false, false));
+        }
+        let last = snapshots.last_mut().unwrap();
+        last.1 |= pairs.contains(&"step_rx");
+        last.2 |= pairs.contains(&"call_max");
+    }
+    if snapshots.is_empty() {
+        return Err("the service printed no profile record".to_owned());
+    }
+    match snapshots.iter().find(|s| !s.1 || !s.2) {
+        Some(s) => Err(format!("profile snapshot {} is not whole: {s:?}", s.0)),
+        None => Ok(()),
+    }
+}
+
 /// The counters of a line `net: frames rx R tx T dhcp D dropped X martian M
 /// listen_short S syn_dropped D set_barred A syn_stray Y bad_sum B demux_probe P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,6 +649,11 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
         return Err(format!(
             "{line:?} in a run that gets its address by {mode:?}"
         ));
+    }
+    // The images with the profile's counters print their records; the images
+    // of the steps measurement carry none.
+    if lines.iter().any(|l| l.starts_with("net: prof ")) {
+        profile_records(lines)?;
     }
     let counters: Vec<Frames> = lines.iter().filter_map(|l| frames(l)).collect();
     // A frame of 127.0.0.0/8 on the wire is a fault of the stack; a queue of
@@ -869,6 +917,9 @@ fn run(
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     silent.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     verdict(&outcome.lines, mode, roles)
+        .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
+    // These images carry the profile: its records must have come whole.
+    profile_records(&outcome.lines)
         .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     if two {
         two_verdict(&outcome.lines)
@@ -1854,6 +1905,8 @@ mod tests {
             lines.push(DEVICE_LINE.to_owned());
             lines.push(address.to_owned());
             if round == 0 {
+                lines.push("net: prof 1 step_rx 4 step_tx 3 step_wake 0".to_owned());
+                lines.push("net: prof 1 ring_max 7 call_max 9 c5 2".to_owned());
                 lines.push(CONFIG.to_owned());
                 lines.push(format!("{FRAMES}12 tx 9 dhcp {dhcp} dropped 0 {COUNTERS}"));
                 lines.push(PINGS.to_owned());
@@ -1989,6 +2042,26 @@ mod tests {
                 .unwrap_err()
                 .contains("static")
         );
+    }
+
+    #[test]
+    fn a_profile_snapshot_must_come_whole() {
+        let lines = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(
+            profile_records(&lines(&[
+                "net: prof 1 step_rx 4 x 5",
+                "net: prof 1 call_max 9 c5 2"
+            ]))
+            .is_ok()
+        );
+        // A record lost from the middle of the ring leaves no call_max.
+        assert!(profile_records(&lines(&["net: prof 1 step_rx 4"])).is_err());
+        // A record cut in the middle of a pair.
+        assert!(profile_records(&lines(&["net: prof 1 step_rx 4 x"])).is_err());
+        assert!(profile_records(&lines(&["net: prof 1 step_rx 4 x 5z"])).is_err());
+        assert!(profile_records(&[]).is_err());
+        let long = format!("net: prof 1 step_rx 4 {}", "a 1 ".repeat(20));
+        assert!(profile_records(&lines(&[&long])).is_err());
     }
 
     #[test]
@@ -2328,7 +2401,7 @@ mod tests {
         let features = |list: &[ImageProgram]| -> Vec<&'static str> {
             list.iter().find(|p| p.0 == "netd").unwrap().3.to_vec()
         };
-        assert_eq!(features(&PROGRAMS), ["probe"]);
+        assert_eq!(features(&PROGRAMS), ["probe", "profile"]);
         assert_eq!(features(&STEPS_PROGRAMS), ["probe", "steps"]);
         assert_eq!(PROGRAMS[0].3, &["table-net-probe"]);
     }

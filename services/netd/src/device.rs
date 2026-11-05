@@ -17,6 +17,7 @@
 use crate::dma::{Host, net_at};
 use netd::frames::{self, BUFFER_LEN, Dest, HDR_LEN, MAX_FRAME, Route};
 use netd::lines::{is_dhcp_client_frame, second_device_takes};
+use netd::profile::{self, Counter};
 use netd::ring::{Budget, LoopRing, QUEUE_SIZE, RX_BUFFERS, offset};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
@@ -204,10 +205,15 @@ impl<const D: usize> TxRing<D> {
         // SAFETY: the buffer is the pool's and the device does not hold it.
         let slice = unsafe { buffer_at::<D>(n) };
         let frame = &mut slice[HDR_LEN..HDR_LEN + len];
+        let began = profile::now();
         frames::fill_sums(frame);
+        profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
+        profile::add(Counter::SumN, 1);
+        profile::add(Counter::SumBytes, len as u64);
         let dhcp = is_dhcp_client_frame(frame);
         match self.ring.submit(n, len) {
             Ok(Sent::Queued) => {
+                profile::count(Counter::FramesTx);
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);
             }
@@ -391,11 +397,17 @@ impl<const D: usize> NetDevice<D> {
                 self.rx.give(buffer);
                 continue;
             }
-            if !frames::verify_sums(frame) {
+            profile::add(Counter::SumN, 1);
+            profile::add(Counter::SumBytes, length as u64);
+            let began = profile::now();
+            let sums_hold = frames::verify_sums(frame);
+            profile::add(Counter::SumTicks, profile::now().saturating_sub(began));
+            if !sums_hold {
                 self.bad_sum += 1;
                 self.rx.give(buffer);
                 continue;
             }
+            profile::count(Counter::FramesRx);
             let dest = frames::target(frame);
             // The second device only runs DHCP (lines::second_device_takes).
             if D != DEVICE && !second_device_takes(frame, self.takes_dhcp) {
