@@ -423,6 +423,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg"
+version = "0.2.0"
+dependencies = [
+ "libc-ffi",
+ "pkgfmt",
+ "posix-abi",
+ "posix-crt",
+ "proto-pkg",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "pkg-slot-probe"
 version = "0.1.0"
 dependencies = [

@@ -123,15 +123,7 @@ pub fn needs_source(p: &Package, all: &[Package]) -> bool {
             .any(gpl)
 }
 
-/// The first eight characters of a version made of a commit hash, else the
-/// version.
-pub fn short_version(version: &str) -> String {
-    if version.len() == 40 && version.bytes().all(|b| b.is_ascii_hexdigit()) {
-        version[..8].to_string()
-    } else {
-        version.to_string()
-    }
-}
+pub use pkgfmt::meta::short_version;
 
 /// `<name>-<short version>-<release>`: the stem of the package file and of
 /// its source archive.
@@ -379,11 +371,6 @@ mod tests {
 
     #[test]
     fn short_versions_and_stems() {
-        assert_eq!(
-            short_version("e257a09527062bfb986b6e5e0780839b6cbd5b71"),
-            "e257a095"
-        );
-        assert_eq!(short_version("1.37.0"), "1.37.0");
         assert_eq!(stem(&package("doom", "MIT")), "doom-e257a095-2");
     }
 

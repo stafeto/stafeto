@@ -91,6 +91,7 @@ mod ostest;
 mod packages;
 mod pci_walk;
 mod pkg;
+mod pkg_probe;
 mod pkg_probes;
 mod pkg_slot;
 mod posix_display;
@@ -1751,6 +1752,9 @@ commands:
             READY, after the deadline of 3 s, and at once when the service ended
   pkg-slot  run the C probe of the package service's session in fork, spawn and exec,
             a set-ID program and the superuser's right, in QEMU
+  pkg-probe [install] [--hvf] run the package tool in the base image against a mirror of
+            the repository over https that the command starts and ends: pkg install doom
+            and the demo, update, list, info, search, check and the log of the mirror
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -2099,6 +2103,7 @@ fn main() {
         Some("store-crash") => store_probe::crash(&args[1..]),
         Some("init-wait") => init_wait::command(&args[1..]),
         Some("pkg-slot") => pkg_slot::probe(&qemu::VIRT),
+        Some("pkg-probe") => pkg_probe::command(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -9238,6 +9243,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
         "tools/test_pkg_source.py",
+        "tools/test_pkg_mirror.py",
         "tools/test_nginx_answer.py",
         "tools/test_linux_guest.py",
     ] {
@@ -9309,6 +9315,8 @@ fn host_tests() -> Result<(), String> {
         "proto-pipe",
         "--package",
         "pipe",
+        "--package",
+        "pkg",
         "--package",
         "shell",
         "--package",
@@ -11938,6 +11946,8 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "pipe",
         "--package",
+        "pkg",
+        "--package",
         "shell",
         "--package",
         "uart",
@@ -12108,6 +12118,8 @@ fn ci_lints() -> Result<(), String> {
         "pkgd",
         "--package",
         "store-probe",
+        "--package",
+        "pkg",
         "--features",
         "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",

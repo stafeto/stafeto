@@ -77,6 +77,12 @@ pub fn series() -> String {
     v.split('.').take(2).collect::<Vec<_>>().join(".")
 }
 
+/// The address of the official repository an image of a release names in
+/// `/etc/pkg/official`.
+pub fn official_address() -> String {
+    format!("https://stafeto.github.io/packages/{}/aarch64", series())
+}
+
 /// The time of the tables of the packages and the sources of the archives:
 /// the time a run has fixed for its images (`rootfs::set_build_time`), else
 /// SOURCE_DATE_EPOCH, else the time of the commit.

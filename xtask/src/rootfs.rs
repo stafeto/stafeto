@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 53] = [
+const SYSTEM_PATHS: [&str; 58] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -317,6 +317,13 @@ const SYSTEM_PATHS: [&str; 53] = [
     "/etc/nginx/server.key",
     // The images of nginx's measurement: the smallest file of the load.
     "/www/1k.bin",
+    // The package tool and what it trusts: the official repository's line and the roots
+    // of the build (the owner's repositories and keys come from the layer of settings).
+    "/bin/pkg",
+    "/etc/pkg",
+    "/etc/pkg/keys",
+    "/etc/pkg/official",
+    "/etc/pkg/keys/stafeto.pub",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -1508,6 +1515,7 @@ pub const IMAGES: &[&str] = &[
     "boot-doom-steps.img",
     "boot-base.img",
     "boot-full.img",
+    "boot-pkg-probe.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1537,6 +1545,37 @@ pub const IMAGES: &[&str] = &[
     "rtbench-posix-vz.img",
     "rtbench-posix-short.img",
 ];
+
+/// The official roots, as the file `/etc/pkg/keys/stafeto.pub` of a release holds them: the
+/// bytes `pkgfmt::OFFICIAL_ROOTS` bakes into `pkg` and `pkgd`.
+fn official_roots() -> Vec<u8> {
+    pkgfmt::OFFICIAL_ROOTS.concat().into_bytes()
+}
+
+/// The package tool and the files of what it trusts (pk4-design R15): `/bin/pkg`, the
+/// directories of `/etc/pkg`, the line of the official repository and the roots.
+fn pkg_files(address: &str, roots: &[u8]) -> Vec<RootFile> {
+    let leak = |text: String| -> &'static [u8] { Box::leak(text.into_bytes().into_boxed_slice()) };
+    let official: &'static [u8] = leak(format!("stafeto {address}\n"));
+    let roots: &'static [u8] = Box::leak(roots.to_vec().into_boxed_slice());
+    vec![
+        file("/bin/pkg", 0o755, ROOT, "pkg"),
+        dir("/etc/pkg"),
+        dir("/etc/pkg/keys"),
+        of(
+            "/etc/pkg/official",
+            0o444,
+            ROOT,
+            Source::Bytes("pkg-official", official),
+        ),
+        of(
+            "/etc/pkg/keys/stafeto.pub",
+            0o444,
+            ROOT,
+            Source::Bytes("pkg-roots", roots),
+        ),
+    ]
+}
 
 /// The list of the image `name`: none for an image with no table.
 pub fn files_of(name: &str) -> Vec<RootFile> {
@@ -1593,12 +1632,35 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         // The base image has no package that makes /usr and /usr/share,
         // which the time zones stand in.
-        "boot-base.img" | "boot-full.img" => {
+        // The probe of the package tool (crate::pkg_probe) is the base image with the probe CA
+        // in the certificate file and the mirror of the probe as the official repository,
+        // trusting the development root.
+        "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img" => {
             let mut files = dialog(name);
             for d in ["/usr", "/usr/share"] {
                 if !files.iter().any(|f| f.path == d) {
                     files.push(dir(d));
                 }
+            }
+            if name == "boot-pkg-probe.img" {
+                for f in files
+                    .iter_mut()
+                    .filter(|f| f.path == crate::net_tls::CA_BUNDLE)
+                {
+                    f.source = Some(Source::Bytes(
+                        "bundle-with-ca.crt",
+                        crate::probe_ca::bundle_with_ca(),
+                    ));
+                }
+                files.extend(pkg_files(
+                    &crate::pkg_probe::official_address(),
+                    &crate::pkg_probe::roots_file(),
+                ));
+            } else {
+                files.extend(pkg_files(
+                    &crate::pkg::official_address(),
+                    &official_roots(),
+                ));
             }
             files
         }
@@ -2264,6 +2326,77 @@ mod tests {
         );
         assert!(replaced("boot-net.img").is_empty());
         assert!(replaced("boot-doom.img").is_empty());
+        // The images that ship hold the certificate file of the package, byte for byte: the
+        // probe CA is in the probe's image alone (pk4-design R4).
+        assert!(replaced("boot-base.img").is_empty());
+        assert!(replaced("boot-full.img").is_empty());
+        assert_eq!(
+            replaced("boot-pkg-probe.img"),
+            [(
+                "ca-bundle".into(),
+                "/etc/ssl/certs/ca-certificates.crt".into()
+            )]
+        );
+    }
+
+    /// The package tool and what it trusts are paths of the system in the base and the full
+    /// image: the tool, `/etc/pkg` and its two files, which a package cannot hold. The images
+    /// that ship name the official address of the series and the official roots; the probe's
+    /// image names its mirror and the development root.
+    #[test]
+    fn the_images_hold_the_package_tool_and_what_it_trusts() {
+        let bytes = |image: &str, path: &str| -> Option<Vec<u8>> {
+            match files_of(image).iter().find(|f| f.path == path)?.source? {
+                Source::Bytes(_, b) => Some(b.to_vec()),
+                _ => None,
+            }
+        };
+        for image in ["boot-base.img", "boot-full.img", "boot-pkg-probe.img"] {
+            let files = files_of(image);
+            let tool = files.iter().find(|f| f.path == "/bin/pkg").unwrap();
+            assert_eq!((tool.mode, tool.uid, tool.gid), (0o755, 0, 0), "{image}");
+            assert_eq!(tool.source, Some(Source::Elf("pkg")));
+            for path in ["/etc/pkg", "/etc/pkg/keys"] {
+                let d = files.iter().find(|f| f.path == path).unwrap();
+                assert_eq!((d.mode, d.source), (0o755, None), "{image} {path}");
+            }
+            for path in ["/etc/pkg/official", "/etc/pkg/keys/stafeto.pub"] {
+                let f = files.iter().find(|f| f.path == path).unwrap();
+                assert_eq!((f.mode, f.uid, f.gid), (0o444, 0, 0), "{image} {path}");
+                assert!(is_system(path));
+            }
+            assert!(is_system("/bin/pkg"));
+        }
+        for image in ["boot-base.img", "boot-full.img"] {
+            assert_eq!(
+                bytes(image, "/etc/pkg/official").unwrap(),
+                format!(
+                    "stafeto https://stafeto.github.io/packages/{}/aarch64\n",
+                    crate::pkg::series()
+                )
+                .into_bytes(),
+                "{image}"
+            );
+            assert_eq!(
+                bytes(image, "/etc/pkg/keys/stafeto.pub").unwrap(),
+                pkgfmt::OFFICIAL_ROOTS.concat().into_bytes(),
+                "{image}"
+            );
+        }
+        assert_eq!(
+            bytes("boot-pkg-probe.img", "/etc/pkg/official").unwrap(),
+            format!(
+                "stafeto https://10.0.2.2:8443/{}/aarch64\n",
+                crate::pkg::series()
+            )
+            .into_bytes()
+        );
+        // The shell image without packages tools holds none of it.
+        assert!(
+            files_of("boot-ash-dialog.img")
+                .iter()
+                .all(|f| f.path != "/bin/pkg")
+        );
     }
 
     /// Each file of the shell image has one owner; a file nobody owns, a
@@ -2342,7 +2475,9 @@ mod tests {
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
-                "boot-base.img" | "boot-full.img" => crate::base_image::programs(image),
+                "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img" => {
+                    crate::base_image::programs(image)
+                }
                 "boot-net.img" => crate::net::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),

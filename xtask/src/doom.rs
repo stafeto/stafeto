@@ -170,7 +170,7 @@ fn layered_package(image: &str, name: &str) -> Result<packages::Package, String>
 
 /// The number after `timed ` in the report `timed N gametics in M realtics`
 /// and the one after `gametics in `.
-fn report_numbers(line: &str) -> Option<(u64, u64)> {
+pub(crate) fn report_numbers(line: &str) -> Option<(u64, u64)> {
     let rest = line.split(REPORT).nth(1)?;
     let (tics, rest) = rest.split_once(" gametics in ")?;
     let (real, _) = rest.split_once(" realtics")?;

@@ -56,6 +56,16 @@ pub struct Meta<'a> {
     pub size: u64,
 }
 
+/// The first eight characters of a version made of a commit hash, else the
+/// version: what the file names of packages and the lines of `pkg` show.
+pub fn short_version(version: &str) -> &str {
+    if version.len() == 40 && version.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &version[..8]
+    } else {
+        version
+    }
+}
+
 /// The members of a list value (`-` is none).
 pub fn list(value: &str) -> impl Iterator<Item = &str> {
     value.split(' ').filter(|w| *w != "-")
@@ -212,6 +222,18 @@ pub(crate) fn sample() -> Meta<'static> {
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn a_commit_version_is_short_and_any_other_stays() {
+        assert_eq!(
+            short_version("e257a09527062bfb986b6e5e0780839b6cbd5b71"),
+            "e257a095"
+        );
+        assert_eq!(short_version("1.37.0"), "1.37.0");
+        // 40 characters that are not all hexadecimal digits.
+        let odd = "g257a09527062bfb986b6e5e0780839b6cbd5b71";
+        assert_eq!(short_version(odd), odd);
+    }
 
     #[test]
     fn meta_round_trips() {
