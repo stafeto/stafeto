@@ -35,7 +35,7 @@ pub fn argv(url: &str, max: u64) -> Vec<String> {
     let mut line: Vec<String> = [
         CURL,
         "-q",
-        "-fsSL",
+        "-fsSLg",
         "--proto",
         "=https",
         "--proto-redir",
@@ -61,6 +61,7 @@ pub fn argv(url: &str, max: u64) -> Vec<String> {
             "60",
             "-o",
             "-",
+            "--url",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -151,12 +152,15 @@ mod tests {
         let line = argv("https://10.0.2.2:8443/0.3/aarch64/INDEX", 1_048_576);
         assert_eq!(
             line.join(" "),
-            "/bin/curl -q -fsSL --proto =https --proto-redir =https --tlsv1.2 \
+            "/bin/curl -q -fsSLg --proto =https --proto-redir =https --tlsv1.2 \
              --cacert /etc/ssl/certs/ca-certificates.crt --max-filesize 1048576 \
              --max-redirs 5 --connect-timeout 30 --speed-limit 1 --speed-time 60 \
-             -o - https://10.0.2.2:8443/0.3/aarch64/INDEX"
+             -o - --url https://10.0.2.2:8443/0.3/aarch64/INDEX"
         );
-        // -q is the first option; the address is the last word.
+        // -q is the first option (-g, no globbing of {} and [], is among the short ones); the
+        // address is the last word, after --url.
+        assert!(line[2].contains('g'));
+        assert_eq!(line[line.len() - 2], "--url");
         assert_eq!(line[1], "-q");
         assert_eq!(
             line.last().unwrap(),

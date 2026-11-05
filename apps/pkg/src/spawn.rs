@@ -48,6 +48,30 @@ const O_CLOEXEC: c_int = 0x80000;
 const SIGTERM: c_int = 15;
 const ENOENT: c_int = 2;
 const EACCES: c_int = 13;
+const ENOMEM: c_int = 12;
+
+/// The pids of the curls this process started, for the check that none was left without a wait
+/// (children the process inherited through `exec` are none of its business).
+struct Pids(core::cell::UnsafeCell<Vec<c_int>>);
+// SAFETY: `pkg` is one thread.
+unsafe impl Sync for Pids {}
+static STARTED: Pids = Pids(core::cell::UnsafeCell::new(Vec::new()));
+
+/// Whether a curl this process started has ended and was not waited for (it is waited for here, so
+/// that it is no zombie, and the fault is the caller's to say). `ps` does not list a zombie on this system.
+pub fn unwaited() -> bool {
+    // SAFETY: one thread, no other borrow of the list is live.
+    let pids = unsafe { &*STARTED.0.get() };
+    let mut left = false;
+    for &pid in pids {
+        let mut status: c_int = 0;
+        // SAFETY: a valid out pointer; WNOHANG is 1.
+        if unsafe { waitpid(pid, &mut status, 1) } > 0 {
+            left = true;
+        }
+    }
+    left
+}
 
 /// A running curl: its pid and the read end of its output.
 pub struct Child {
@@ -86,19 +110,25 @@ pub fn start(argv: &[String], env: &[String]) -> Result<Child, String> {
     // SAFETY: `actions` is as big and as aligned as relibc's object; every string is
     // NUL-terminated and outlives the call; the arrays end with NULL.
     let code = unsafe {
-        posix_spawn_file_actions_init(&mut actions);
-        posix_spawn_file_actions_adddup2(&mut actions, write_end, 1);
-        posix_spawn_file_actions_addopen(&mut actions, 0, null.as_ptr().cast(), 0, 0);
-        posix_spawn_file_actions_addclose(&mut actions, read_end);
-        posix_spawn_file_actions_addclose(&mut actions, write_end);
-        let code = posix_spawn(
-            &mut pid,
-            program.as_ptr().cast(),
-            &actions,
-            core::ptr::null(),
-            argp.as_ptr(),
-            envp.as_ptr(),
-        );
+        // Every result is looked at: an action that was not recorded would leave the child with
+        // an end of the pipe or without /dev/null.
+        let mut made = posix_spawn_file_actions_init(&mut actions);
+        made |= posix_spawn_file_actions_adddup2(&mut actions, write_end, 1);
+        made |= posix_spawn_file_actions_addopen(&mut actions, 0, null.as_ptr().cast(), 0, 0);
+        made |= posix_spawn_file_actions_addclose(&mut actions, read_end);
+        made |= posix_spawn_file_actions_addclose(&mut actions, write_end);
+        let code = if made != 0 {
+            ENOMEM
+        } else {
+            posix_spawn(
+                &mut pid,
+                program.as_ptr().cast(),
+                &actions,
+                core::ptr::null(),
+                argp.as_ptr(),
+                envp.as_ptr(),
+            )
+        };
         posix_spawn_file_actions_destroy(&mut actions);
         code
     };
@@ -114,6 +144,8 @@ pub fn start(argv: &[String], env: &[String]) -> Result<Child, String> {
         };
         return Err(format!("pkg: {shown}: cannot run it ({why})"));
     }
+    // SAFETY: one thread.
+    unsafe { (*STARTED.0.get()).push(pid) };
     Ok(Child { pid, fd: read_end })
 }
 

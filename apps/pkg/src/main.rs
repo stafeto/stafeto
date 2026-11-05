@@ -92,7 +92,7 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             EXIT_REFUSED
         }
     };
-    if sys::child_left_unwaited() {
+    if spawn::unwaited() {
         sys::err("pkg: a child process ended and was not waited for");
         return EXIT_REFUSED;
     }
@@ -186,11 +186,10 @@ impl Tool {
             }
         }
         let code = child.finish(over);
-        let verdict = if over {
-            Verdict::Curl(63)
-        } else {
-            fetch::verdict(code, bytes.len() as u64, exact)
-        };
+        if over {
+            return Err(format!("pkg: {url}: larger than {max} bytes"));
+        }
+        let verdict = fetch::verdict(code, bytes.len() as u64, exact);
         match verdict {
             Verdict::Whole => Ok(bytes),
             v => Err(fetch::failure(
@@ -331,29 +330,41 @@ impl Tool {
                 .line(&r.name));
             }
             Serial::Same => {}
-            Serial::Newer => self
-                .client
-                .serial_set(&r.name, accepted.serial)
-                .map_err(|s| service(s, &r.name, &Detail::default()))?,
+            Serial::Newer => match self.client.serial_set(&r.name, accepted.serial) {
+                Ok(()) => {}
+                // Another pkg raised the number between the two requests.
+                Err(Status::Unknown(p::ROLLBACK)) => {
+                    return Err(verify::Fault::Rollback {
+                        what: "index",
+                        serial: accepted.serial,
+                        held: None,
+                    }
+                    .line(&r.name));
+                }
+                Err(s) => return Err(service(s, &r.name, &Detail::default())),
+            },
         }
         let dir = format!("{CACHE}/{}", r.name);
         sys::make_directories(&dir);
-        sys::write_file(&format!("{dir}/INDEX"), &data);
-        sys::write_file(&format!("{dir}/INDEX.sig"), &sig);
+        for (file, bytes) in [("INDEX", &data), ("INDEX.sig", &sig)] {
+            if !sys::write_file(&format!("{dir}/{file}"), bytes) {
+                sys::err(&format!("pkg: {dir}/{file}: cannot write the cache"));
+            }
+        }
         Ok((data, accepted, held))
     }
 
     /// Every repository in its order: the ones that pass, and the refusals printed.
-    fn refresh_all(&mut self, update: bool) -> Result<(Vec<Fresh>, bool), Line> {
+    fn refresh_all(&mut self, update: bool) -> Result<(Vec<Fresh>, usize), Line> {
         self.load_repositories()?;
         let mut fresh = Vec::new();
-        let mut refused = false;
+        let mut refused = 0;
         for r in self.repos.clone() {
             match self.refresh(&r, update) {
                 Ok(f) => fresh.push(f),
                 Err(line) => {
                     sys::err(&line);
-                    refused = true;
+                    refused += 1;
                 }
             }
         }
@@ -374,7 +385,7 @@ impl Tool {
             .status()
             .map_err(|s| service(s, "the store", &Detail::default()))?;
         let (_, refused) = self.refresh_all(true)?;
-        Ok(if refused { EXIT_REFUSED } else { EXIT_OK })
+        Ok(pkg::exit_of_reading(refused))
     }
 
     /// The installed packages with the `provides` and `depends` of their `meta`.
@@ -407,9 +418,13 @@ impl Tool {
         self.require_root()?;
         let installed_before = self.installed()?;
         let (fresh, refused) = self.refresh_all(false)?;
+        // A refused repository refuses the whole command: no name is decided among the others.
+        if !pkg::may_change_the_store(refused) {
+            return Ok(EXIT_REFUSED);
+        }
         let pool: Vec<Candidate> = fresh.iter().flat_map(|f| f.candidates.clone()).collect();
         let mut installed = installed_before;
-        let mut failed = refused;
+        let mut failed = false;
         for name in names {
             match self.install_one(name, &pool, &installed, &fresh) {
                 Ok(()) => installed = self.installed()?,
@@ -604,18 +619,24 @@ impl Tool {
 
     fn list(&mut self, all: bool) -> Result<i32, Line> {
         let installed = self.installed()?;
-        let available = if all { self.cached()?.0 } else { Vec::new() };
+        let (available, refused) = if all {
+            let c = self.cached()?;
+            (c.0, c.3)
+        } else {
+            (Vec::new(), 0)
+        };
         for line in output::list(&installed, &available, all) {
             sys::out(&line);
         }
-        Ok(EXIT_OK)
+        Ok(pkg::exit_of_reading(refused))
     }
 
     /// The records of the cached indexes, checked again: every repository's `INDEX` and
     /// `INDEX.sig` of the last `update`, and whether any was there.
-    fn cached(&mut self) -> Result<(Vec<Available>, Vec<Candidate>, bool), Line> {
+    fn cached(&mut self) -> Result<(Vec<Available>, Vec<Candidate>, bool, usize), Line> {
         self.load_repositories()?;
         let mut found = false;
+        let mut refused = 0;
         let mut candidates = Vec::new();
         for r in &self.repos {
             let dir = format!("{CACHE}/{}", r.name);
@@ -641,6 +662,7 @@ impl Tool {
             );
             if let Err(f) = checked {
                 sys::err(&f.line(&r.name));
+                refused += 1;
                 continue;
             }
             let Some(text) = core::str::from_utf8(&data).ok() else {
@@ -655,11 +677,12 @@ impl Tool {
             candidates.iter().map(Candidate::available).collect(),
             candidates,
             found,
+            refused,
         ))
     }
 
     fn search(&mut self, word: &str) -> Result<i32, Line> {
-        let (available, _, found) = self.cached()?;
+        let (available, _, found, refused) = self.cached()?;
         if !found {
             return Err("pkg: no index yet; pkg update".into());
         }
@@ -667,7 +690,7 @@ impl Tool {
         for line in output::search(word, &available, &installed) {
             sys::out(&line);
         }
-        Ok(EXIT_OK)
+        Ok(pkg::exit_of_reading(refused))
     }
 
     fn info(&mut self, name: &str) -> Result<i32, Line> {
@@ -725,7 +748,7 @@ impl Tool {
             }
             return Ok(EXIT_OK);
         }
-        let (_, candidates, found) = self.cached()?;
+        let (_, candidates, found, refused) = self.cached()?;
         if !found {
             return Err(format!(
                 "pkg: {name}: not installed, and no index yet; pkg update"
@@ -760,7 +783,7 @@ impl Tool {
         }) {
             sys::out(&line);
         }
-        Ok(EXIT_OK)
+        Ok(pkg::exit_of_reading(refused))
     }
 
     fn check(&mut self) -> Result<i32, Line> {

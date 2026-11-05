@@ -32,6 +32,9 @@ fn main() {
         }
         None => out.push_str("pub const ROOTS: &[&str] = pkgfmt::OFFICIAL_ROOTS;\n"),
     }
+    // The stack of a program started from its file is its PT_GNU_STACK (the loader, at least 64 KiB);
+    // xtask holds the same number (`base_image::PKG_STACK_SIZE`) and tests it against the file.
+    println!("cargo:rustc-link-arg-bins=-zstack-size=262144");
     let dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     fs::write(dir.join("config.rs"), out).expect("OUT_DIR is writable");
 }

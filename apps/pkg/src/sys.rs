@@ -19,7 +19,6 @@ unsafe extern "C" {
     fn nanosleep(request: *const Timespec, rest: *mut Timespec) -> c_int;
     fn geteuid() -> u32;
     fn mkdir(path: *const c_char, mode: u32) -> c_int;
-    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
 
 /// The allocator of the program: the C library's `malloc`, and `posix_memalign`
@@ -65,26 +64,28 @@ pub fn write_all(fd: c_int, mut bytes: &[u8]) {
 
 /// A line to the standard output.
 pub fn out(line: &str) {
-    write_all(1, line.as_bytes());
+    write_all(1, pkg::output::printable(line).as_bytes());
     write_all(1, b"\n");
 }
 
 /// A line to the standard error.
 pub fn err(line: &str) {
-    write_all(2, line.as_bytes());
+    write_all(2, pkg::output::printable(line).as_bytes());
     write_all(2, b"\n");
 }
 
 /// Text without a newline to the standard output (the start of a line
 /// that a later call ends).
 pub fn out_part(text: &str) {
-    write_all(1, text.as_bytes());
+    write_all(1, pkg::output::printable(text).as_bytes());
 }
 
 pub const EINTR: c_int = 4;
 pub const O_WRONLY: c_int = 1;
 pub const O_CREAT: c_int = 0o100;
 pub const O_TRUNC: c_int = 0o1000;
+/// relibc's `O_NOFOLLOW`.
+pub const O_NOFOLLOW: c_int = 131_072;
 
 fn cstring(text: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(text.len() + 1);
@@ -130,7 +131,7 @@ pub fn write_file(path: &str, bytes: &[u8]) -> bool {
     let fd = unsafe {
         c::open(
             name.as_ptr().cast(),
-            O_WRONLY | O_CREAT | O_TRUNC,
+            O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
             0o644 as c_int,
         )
     };
@@ -191,15 +192,6 @@ pub fn pause_ms(ms: i64) {
     };
     // SAFETY: a valid request and no remainder wanted.
     unsafe { nanosleep(&t, core::ptr::null_mut()) };
-}
-
-/// Whether a child of this process has ended that nobody waited for: `pkg` waits for every curl it
-/// starts, so a child that is found here is a fault of `pkg`, which it says (a zombie is no line of
-/// `ps` on this system, so only the process itself can tell).
-pub fn child_left_unwaited() -> bool {
-    let mut status: c_int = 0;
-    // SAFETY: a valid out pointer; WNOHANG is 1.
-    unsafe { waitpid(-1, &mut status, 1) > 0 }
 }
 
 /// Whether the process runs as the superuser.

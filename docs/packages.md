@@ -691,7 +691,9 @@ started from its default would make an expired index look good); and the serial 
 one the service holds. A higher serial is given to the service (SERIAL_SET) before any package is
 received, so a repository that goes back is refused even if it is the first thing `pkg` asks
 after a restart. The accepted index and signature are kept in `/var/cache/pkg/<name>/` for
-`search`, `info` and `list --all`, which check the signature again; the cache goes with a restart.
+`search`, `info` and `list --all`, which check the signature and the header again against the trust of the repository (the revocation list is not applied to the cache, which only shows and never installs); the cache goes with a restart.
+
+Refused repositories. When any repository is refused (signature, header, term, clock, serial or network), `install` prints the line of the refusal and ends with 1 without deciding any name, so a damaged answer of one repository cannot put the package of another in its place; `update` does the same for the rest, and `list --all`, `info` and `search` work over the good repositories and end with 1. The version field of INSTALL_BEGIN is the `version` of the package's `meta`, with no release: the SHA-256 of the index ties the bytes to the record.
 
 Names. A name is closed by an installed package of that name or that provides it, else it is the
 first repository's package of that name, else the one package that provides it (several are an
@@ -701,9 +703,9 @@ installed or none. There are no versions in a series, so a package that is insta
 SHA-256 than the index has stays as it is.
 
 Downloading. `curl` runs as
-`curl -q -fsSL --proto =https --proto-redir =https --tlsv1.2 --cacert <the file of the package
+`curl -q -fsSLg --proto =https --proto-redir =https --tlsv1.2 --cacert <the file of the package
 ca-bundle> --max-filesize <size> --max-redirs 5 --connect-timeout 30 --speed-limit 1 --speed-time 60
--o - <address>` with an empty environment but for the proxy variables: `-q` first, so no
+-o - --url <address>` (`-g`: no globbing of `{}` and `[]`) with an empty environment but for the proxy variables: `-q` first, so no
 `.curlrc` can add `-k`. The size is the package's from the index (1 MiB for an index). `pkg` reads
 its output from a pipe into the cells of the buffer it shares with the service and sends a FEED for
 each full cell, counting the bytes itself: more than the size stops curl and cancels the group,

@@ -84,7 +84,9 @@ fn name_ok(name: &str) -> bool {
 }
 
 fn https_ok(address: &str) -> bool {
-    address.starts_with("https://") && address.len() > "https://".len()
+    address.starts_with("https://")
+        && address.len() > "https://".len()
+        && !address.bytes().any(|b| b <= b' ' || b == 0x7f)
 }
 
 /// The lines of `repositories`: each `<name> <https address>` or `disable
@@ -333,6 +335,17 @@ mod tests {
         assert_eq!(rule("games https://g.example extra\n"), (1, Rule::Shape));
         assert_eq!(rule("games http://g.example\n"), (1, Rule::NotHttps));
         assert_eq!(rule("games https://\n"), (1, Rule::NotHttps));
+        assert_eq!(
+            rule("games https://g.example/\u{1}x\n"),
+            (1, Rule::NotHttps)
+        );
+        assert_eq!(rule("games https://g.example/\tx\n"), (1, Rule::NotHttps));
+        assert_eq!(
+            parse_official("stafeto https://a.example/\u{7f}\n")
+                .unwrap_err()
+                .rule,
+            Rule::NotHttps
+        );
         assert_eq!(
             rule(&alloc::format!("{} https://g.example\n", "a".repeat(32))),
             (1, Rule::Name)

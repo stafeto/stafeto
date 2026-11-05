@@ -12,6 +12,14 @@ use alloc::vec::Vec;
 use pkgfmt::meta::short_version;
 use proto_pkg::{ENTRY_DEPENDENCY, ENTRY_IMAGE, ENTRY_REVOKED};
 
+/// A line as the terminal may take it: bytes below 0x20 and 0x7f, which would be sequences of the
+/// terminal when they come from a signed index or a file of a package, show as `?`.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c < ' ' || c == '\u{7f}' { '?' } else { c })
+        .collect()
+}
+
 /// `29.3 MB`: megabytes of 10^6 bytes, one digit after the point, rounded to the nearest tenth.
 pub fn megabytes(bytes: u64) -> String {
     let tenths = (bytes + 50_000) / 100_000;
@@ -296,6 +304,15 @@ mod tests {
             provides: vec![],
             depends: vec![],
         }
+    }
+
+    #[test]
+    fn control_characters_do_not_reach_the_terminal() {
+        assert_eq!(printable("a\u{1b}[2Jb\u{7f}c\td"), "a?[2Jb?c?d");
+        assert_eq!(
+            printable("plain text, \u{2026} é"),
+            "plain text, \u{2026} é"
+        );
     }
 
     #[test]
