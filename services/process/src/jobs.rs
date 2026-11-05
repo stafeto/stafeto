@@ -46,7 +46,10 @@ impl Processes {
             return;
         }
         self.records.set_stopped(target, Some(signal));
-        self.records.get_mut(target).expect("a stop target").deferred_stop = deferred;
+        self.records
+            .get_mut(target)
+            .expect("a stop target")
+            .deferred_stop = deferred;
         if !deferred {
             self.child_report(target, Some(signal))
         }
@@ -84,7 +87,10 @@ impl Processes {
             return;
         }
         self.records.set_stopped(target, None);
-        self.records.get_mut(target).expect("a continue target").deferred_stop = false;
+        self.records
+            .get_mut(target)
+            .expect("a continue target")
+            .deferred_stop = false;
         if !deferred {
             self.child_report(target, None)
         }

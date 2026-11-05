@@ -100,7 +100,8 @@ pub const LOADERS: usize = 16;
 /// starts spawns and never finishes them holds no more places than these.
 /// A place the parent committed (Ready) is out of the count: the parent
 /// finished that load, and only the child's loader holds the place until
-/// its Take.
+/// its Take. The pool of LOADERS bounds those places, and a parent whose
+/// children's loaders lag may hold many of them for a short time.
 pub const LOADERS_OF_PARENT: usize = 2;
 
 /// Where a load is.
