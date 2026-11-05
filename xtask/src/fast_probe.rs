@@ -85,7 +85,11 @@ pub fn programs(steps: bool) -> &'static [ImageProgram] {
 
 /// Waits for a line with each of `wanted`, in any order (two programs
 /// write to the one serial port).
-pub(crate) fn expect_all(run: &mut qemu::Run, wanted: &[&str], within: Duration) -> Result<(), String> {
+pub(crate) fn expect_all(
+    run: &mut qemu::Run,
+    wanted: &[&str],
+    within: Duration,
+) -> Result<(), String> {
     let mut left: Vec<&str> = wanted.to_vec();
     let end = Instant::now() + within;
     while !left.is_empty() {

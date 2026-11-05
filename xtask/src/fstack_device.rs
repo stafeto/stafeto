@@ -111,7 +111,8 @@ fn fetch(port: u16, want: usize) -> Result<f64, String> {
     stream
         .write_all(b"GET /page HTTP/1.1\r\nHost: probe\r\n\r\n")
         .map_err(|e| format!("request: {e}"))?;
-    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {PAGE_BYTES}\r\nConnection: close\r\n\r\n");
+    let head =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {PAGE_BYTES}\r\nConnection: close\r\n\r\n");
     let mut got = vec![0u8; head.len() + want];
     stream
         .read_exact(&mut got)
@@ -124,7 +125,10 @@ fn fetch(port: u16, want: usize) -> Result<f64, String> {
     }
     for (i, byte) in got[head.len()..].iter().enumerate() {
         if *byte != page_byte(i) {
-            return Err(format!("byte {i} of the page is {byte}, wanted {}", page_byte(i)));
+            return Err(format!(
+                "byte {i} of the page is {byte}, wanted {}",
+                page_byte(i)
+            ));
         }
     }
     Ok(started.elapsed().as_secs_f64())
@@ -148,10 +152,7 @@ fn stats_of(socket: &UdpSocket) -> Result<Vec<(String, u64)>, String> {
 }
 
 fn stat(stats: &[(String, u64)], key: &str) -> u64 {
-    stats
-        .iter()
-        .find(|(k, _)| k == key)
-        .map_or(0, |(_, v)| *v)
+    stats.iter().find(|(k, _)| k == key).map_or(0, |(_, v)| *v)
 }
 
 /// The median and the 90th percentile of the round trips of single datagrams
@@ -252,7 +253,9 @@ fn hold(udp: &UdpSocket, tcp_port: u16) -> Result<Vec<(String, u64)>, String> {
     for n in 0..HOLD_CONNECTIONS {
         let stream = TcpStream::connect(("127.0.0.1", tcp_port))
             .map_err(|e| format!("hold connect {n}: {e}"))?;
-        stream.set_nodelay(true).map_err(|e| format!("nodelay: {e}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| format!("nodelay: {e}"))?;
         streams.push(stream);
     }
     let chunk = [0x5a_u8; HOLD_BYTES];
@@ -385,7 +388,11 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
             udp.send(b"?stop").map_err(|e| format!("?stop: {e}"))?;
             expect_all(
                 &mut run,
-                &["fstack-probe: device ended", back, "net: lease1 10.0.3.15/24"],
+                &[
+                    "fstack-probe: device ended",
+                    back,
+                    "net: lease1 10.0.3.15/24",
+                ],
                 within,
             )?;
             run.send("echo probe-end")?;
@@ -445,12 +452,14 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
             return Err(format!("frames were dropped by the layer: {stats:?}"));
         }
         let freq = get("freq").max(1);
+        // Nanoseconds a frame costs the layer, from the totals of the counter.
+        let ns = |ticks: u64, frames: u64| ticks as f64 * 1e9 / freq as f64 / frames.max(1) as f64;
         notes.push(format!(
-            "per frame, in ticks of {freq} Hz: receive layer {}, receive input {}, send {} ({} frames in, {} out)",
-            get("rx_layer_per_frame"),
-            get("rx_input_per_frame"),
-            get("tx_per_frame"),
+            "per frame: receive in the layer {:.0} ns, handing to the stack {:.0} ns ({} frames), send with the copy {:.0} ns ({} frames); counter {freq} Hz",
+            ns(get("rx_layer_ticks"), get("rx")),
+            ns(get("rx_input_ticks"), get("rx")),
             get("rx"),
+            ns(get("tx_send_ticks"), get("tx")),
             get("tx")
         ));
         notes.push(format!(
@@ -482,7 +491,9 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
                 get("free_low")
             ));
             if get("copied") == 0 {
-                return Err(format!("no frame was copied below the threshold: {stats:?}"));
+                return Err(format!(
+                    "no frame was copied below the threshold: {stats:?}"
+                ));
             }
             if get("no_mbuf") != 0 {
                 return Err(format!("frames lost to the stack's memory: {stats:?}"));
@@ -549,9 +560,7 @@ mod tests {
     fn the_page_is_the_programs() {
         let source =
             std::fs::read_to_string(crate::root().join("tests/fstack-probe/device.c")).unwrap();
-        assert!(source.contains(
-            "return (unsigned char)(i * 7u + (i >> 8) + (i >> 16));"
-        ));
+        assert!(source.contains("return (unsigned char)(i * 7u + (i >> 8) + (i >> 16));"));
         assert_eq!(page_byte(0), 0);
         assert_eq!(page_byte(300), (300u32 * 7 + 1) as u8);
         assert_eq!(page_byte(70000), (70000u32 * 7 + 273 + 1) as u8);
