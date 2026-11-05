@@ -168,6 +168,12 @@ impl MetadataJournal {
             self.outcome = Some(outcome);
             return Ok(outcome);
         }
+        // A layer's files and directories keep their attributes while the layer is there.
+        if self.intent.needs_time() && ram.storage.is_layer_node(self.target) {
+            let outcome = MetadataOutcome::Failed(proto_fs::READ_ONLY_FILESYSTEM);
+            self.outcome = Some(outcome);
+            return Ok(outcome);
+        }
         let owner = identity.uid == 0 || identity.uid == node.uid;
         let mut mode = node.mode;
         let mut uid = node.uid;

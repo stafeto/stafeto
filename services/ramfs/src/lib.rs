@@ -30,6 +30,8 @@ pub mod io;
 #[cfg(test)]
 mod io_tests;
 pub mod job;
+#[cfg(test)]
+mod layers_tests;
 pub mod locks;
 pub mod maintenance;
 pub mod metadata;
@@ -952,6 +954,15 @@ impl<'a> Ram<'a> {
                 slot: 4,
                 generation: 1,
             },
+            File::ImageDir(n) | File::ImageRegular(n) if n as usize >= storage::ENTRIES_MAX => {
+                // A file of a layer is a canonical place of its own; the generation of the
+                // place grows each time a layer takes it again.
+                let slot = 5 + n;
+                Token {
+                    slot,
+                    generation: self.storage.state.nodes[slot as usize].generation,
+                }
+            }
             File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => Token {
                 slot: 5 + storage::canonical(self.tree(), n),
                 generation: 1,
@@ -967,7 +978,14 @@ impl<'a> Ram<'a> {
             2 => File::Tmp,
             3 => File::Motd,
             4 => File::Scratch,
-            n if (n as usize) < storage::ORIGINALS => image_file(self.tree(), n - 5),
+            n if (n as usize) < 5 + storage::ENTRIES_MAX => image_file(self.tree(), n - 5),
+            n if (n as usize) < storage::ORIGINALS => {
+                if self.storage.node(token).is_ok_and(|node| node.kind == DIR) {
+                    File::ImageDir(n - 5)
+                } else {
+                    File::ImageRegular(n - 5)
+                }
+            }
             _ if self.storage.node(token).is_ok_and(|n| n.kind == DIR) => File::NodeDir(token),
             _ => File::Node(token),
         }
@@ -2004,6 +2022,12 @@ impl<'a> Ram<'a> {
             File::Node(token) | File::NodeDir(token) => {
                 (u64::from(token.slot) + 1) | token.generation << 32
             }
+            File::ImageDir(n) | File::ImageRegular(n) if n as usize >= storage::ENTRIES_MAX => {
+                // The number changes when a layer takes the place again, which keeps the
+                // images the process service holds by inode apart.
+                let generation = self.storage.state.nodes[5 + n as usize].generation;
+                IMAGE_INODE + u64::from(n) + ((generation.max(1) - 1) << 32)
+            }
             File::ImageDir(n) | File::ImageRegular(n) | File::Null(n) | File::Random(n) => {
                 IMAGE_INODE + u64::from(self.tree().canonical(n))
             }
@@ -2122,21 +2146,33 @@ impl<'a> Ram<'a> {
         Ok(self.nth_entry(self.file(token), index, now))
     }
 
-    pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
+    /// Whether `entry` names a regular file of the image: of the table, or of a layer.
+    fn image_regular(&self, entry: u16) -> Result<(), u32> {
+        if entry as usize >= storage::ENTRIES_MAX {
+            let live = storage::Storage::is_layer_place(entry as usize)
+                && self
+                    .storage
+                    .token(5 + entry)
+                    .and_then(|t| self.storage.node(t))
+                    .is_ok_and(|node| node.kind != DIR && node.boot == entry);
+            return if live { Ok(()) } else { Err(NO_ENTRY) };
+        }
         let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
         if entry >= tree.len() || tree.entry(entry).is_directory() {
             return Err(NO_ENTRY);
         }
+        Ok(())
+    }
+
+    pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
+        self.image_regular(entry)?;
         Ok(self.node_information(File::ImageRegular(entry)))
     }
 
     /// ReadAt of an image session: the bytes of the program file `entry`
     /// from `offset`; the time of the image does not change.
     pub fn image_read(&self, entry: u16, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
-        let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
-        if entry >= tree.len() || tree.entry(entry).is_directory() {
-            return Err(NO_ENTRY);
-        }
+        self.image_regular(entry)?;
         if i64::try_from(offset).is_err() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }

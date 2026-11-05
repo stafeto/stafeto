@@ -775,6 +775,18 @@ impl Storage<'_> {
         }
         let token = edges[0].target.ok_or(NO_ENTRY)?;
         let kind = self.node(token)?.kind;
+        // The names a layer brought, and its files and directories, are read-only: a layer is
+        // a part of the tree that only its detach changes.
+        for edge in &edges[..if has_destination { 2 } else { 1 }] {
+            if let Location::Original(i) = edge.location
+                && Self::is_layer_name(i as usize)
+            {
+                return Err(proto_fs::READ_ONLY_FILESYSTEM);
+            }
+        }
+        if matches!(intent, NamespaceIntent::Link { .. }) {
+            self.layer_read_only(token)?;
+        }
         match intent {
             NamespaceIntent::Unlink if kind == crate::DIR => return Err(PERMISSION),
             NamespaceIntent::Rmdir if kind != crate::DIR => return Err(NOT_DIRECTORY),

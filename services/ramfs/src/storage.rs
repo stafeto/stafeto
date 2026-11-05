@@ -4,6 +4,8 @@
 //! One bounded inode namespace with boot-backed bytes and paid overlays.
 //! Reservations retain their expenditure root until cancellation or reclamation.
 
+#[path = "layers.rs"]
+pub mod layers;
 #[path = "namespace.rs"]
 pub mod namespace;
 
@@ -463,6 +465,8 @@ pub struct State {
     child_prev: [u16; NAME_ENTRIES],
     /// First and last entry of the names in each node that is a directory.
     children: [[u16; 2]; NODES],
+    /// The layers: package files shown as names of the tree.
+    pub(crate) layers: layers::Layers,
 }
 impl State {
     pub const fn new() -> Self {
@@ -501,6 +505,7 @@ impl State {
             child_next: [NONE; NAME_ENTRIES],
             child_prev: [NONE; NAME_ENTRIES],
             children: [[NONE; 2]; NODES],
+            layers: layers::Layers::new(),
         }
     }
 }
@@ -531,6 +536,7 @@ impl State {
         self.child_next.fill(NONE);
         self.child_prev.fill(NONE);
         self.children.fill([NONE; 2]);
+        self.layers.initialize();
     }
 }
 impl Default for State {
@@ -1092,6 +1098,7 @@ impl<'a> Storage<'a> {
         out.state.child_next.fill(NONE);
         out.state.child_prev.fill(NONE);
         out.state.children.fill([NONE; 2]);
+        out.state.layers.initialize();
         for (i, (kind, mode, links, length, parent)) in [
             (crate::DIR, 0o555, 4, 0, ROOT),
             (crate::DIR, 0o555, 2, 0, ROOT),
@@ -1470,6 +1477,16 @@ impl<'a> Storage<'a> {
     }
     fn collect(&mut self, token: Token) {
         let n = &mut self.state.nodes[token.slot as usize];
+        if n.links == 0
+            && !n.retained()
+            && n.boot != NONE
+            && Self::is_layer_place(n.boot as usize)
+            && token.slot == 5 + n.boot
+        {
+            // A file or directory of a layer that nothing holds any more.
+            self.layer_collect(token);
+            return;
+        }
         if !n.retained() && n.overlay != NONE && !n.reclaim {
             n.reclaim = true;
             let tail = (self.state.reclaim_head + self.state.reclaim_len) % INODES;
@@ -1483,6 +1500,7 @@ impl<'a> Storage<'a> {
             1 => b"tmp",
             2 => b"motd",
             3 => b"probe",
+            b if b - 4 >= ENTRIES_MAX => self.layer_name(b - 4),
             _ => {
                 let path = self
                     .tree
@@ -1678,6 +1696,10 @@ impl<'a> Storage<'a> {
         self.state.child_next[index] = NONE;
         self.state.child_prev[index] = NONE;
         self.state.nodes[parent].names -= 1;
+        self.layer_name_left(Token {
+            slot: parent as u16,
+            generation: 0,
+        });
     }
     /// The first name of the directory after `cookie`, and the one after
     /// the entry `hint` when that entry is the one the cookie belongs to.
@@ -2153,7 +2175,11 @@ impl<'a> Storage<'a> {
         let bytes = if token.slot == 3 {
             crate::MOTD
         } else if n.boot != NONE && (n.kind == crate::REG || n.kind == SYMLINK) {
-            self.tree.as_ref().unwrap().data(n.boot)
+            if n.boot as usize >= ENTRIES_MAX {
+                self.layer_data(n.boot as usize)
+            } else {
+                self.tree.as_ref().unwrap().data(n.boot)
+            }
         } else {
             &[]
         };
