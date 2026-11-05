@@ -227,7 +227,12 @@ jobs:
         run: git ls-files -z | xargs -0 touch -d '2001-01-01 00:00:00'
 
       - name: cargo xtask nginx-probe
-        run: cargo xtask nginx-probe
+        run: |
+          rc=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            cargo xtask nginx-probe > run$i.log 2>&1 && echo "run $i passed" || { echo "run $i FAILED"; rc=1; grep -a "^xtask\|posix-net: buffers\|after the reload" run$i.log | tail -15; }
+          done
+          exit $rc
 
       - name: Collect logs
         if: failure()
