@@ -40,6 +40,7 @@ mod owner_lifetime;
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
 
+mod abi_fingerprint;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
@@ -1681,7 +1682,9 @@ commands:
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they
             hold and no others (no notice of F-Stack in the archives without it)
-  pkg-ci    pkg-build, repo, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
+  abi       the fingerprint of the ABI of the packages against packages/abi.txt (`--check`, `--update`,
+            `--freeze`, `--explain`; `--release` wants a frozen series; docs/packages.md)
+  pkg-ci    pkg-build, repo, abi, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -2080,6 +2083,7 @@ fn main() {
         Some("pkg-identity") => pkg_probes::identity(),
         Some("dist-licenses") => pkg_probes::dist_licenses(),
         Some("pkg-ci") => pkg_probes::ci(),
+        Some("abi") => abi_fingerprint::command(&args[1..]),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),

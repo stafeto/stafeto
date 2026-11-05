@@ -699,6 +699,7 @@ pub fn ci() -> Result<(), String> {
     let started = std::time::Instant::now();
     pkg::command(&[])?;
     repo::command(&[])?;
+    crate::abi_fingerprint::command(&["--check".into()])?;
     identity()?;
     dist_licenses()?;
     println!("pkg-ci: {:.0} s", started.elapsed().as_secs_f64());

@@ -17,6 +17,7 @@ netd = { path = "../services/netd" }
 pkgd = { path = "../services/pkgd", features = ["host"] }
 pkgfmt = { path = "../lib/pkgfmt", features = ["write"] }
 proto-pkg = { path = "../proto/pkg", features = ["alloc"] }
+proto-loader = { path = "../proto/loader" }
 proto-net = { path = "../proto/net" }
 rtc = { path = "../lib/rtc" }
 virtio-pci = { path = "../lib/virtio-pci" }
