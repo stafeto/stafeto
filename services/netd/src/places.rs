@@ -6,6 +6,12 @@
 //! nothing), the count of the sessions that hold it, and its state. A
 //! description on the wire is a place and a generation
 //! (`proto_net::sockets`).
+//!
+//! The queue sockets of the members of a SO_REUSEPORT group are placed apart
+//! (`owners`, `Places::allocate_in`): in the sets of their own member, else in
+//! the lowest set no other member's queue stands in. With many groups some
+//! queue sockets are therefore placed above the first 256 places and have the
+//! small buffers; with none the lowest places are used first as before.
 
 use crate::owners::SET;
 use proto_net::sockets::{description, generation, slot};
@@ -308,6 +314,38 @@ mod tests {
         assert_eq!(p.allocate_in(State::Member, [5], &barred), Some(9));
         // Plain allocation takes the barred places.
         assert_eq!(p.allocate(State::Live), Some(0));
+    }
+
+    #[test]
+    fn two_listeners_that_place_in_turn_never_share_a_set() {
+        use crate::owners::Owners;
+        let mut p = Places::<256>::new();
+        let mut o = Owners::<64, 4>::new();
+        let mut queue: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        // Other sockets stand between them, as connections do.
+        for round in 0..16 {
+            for l in 0..2 {
+                let own: Vec<usize> = queue[l].iter().map(|&m| m / SET).collect();
+                let own = own.into_iter().filter(|&s| o.allowed(s, l));
+                let m = p.allocate_in(State::Member, own, o.barred()).unwrap();
+                o.claim(m / SET, l);
+                queue[l].push(m);
+            }
+            if round % 3 == 0 {
+                p.allocate(State::Live).unwrap();
+            }
+        }
+        for a in &queue[0] {
+            for b in &queue[1] {
+                assert_ne!(a / SET, b / SET, "{a} and {b} share a set");
+            }
+        }
+        // Each queue is dense: 16 sockets in 4 sets.
+        for q in &queue {
+            let mut sets: Vec<_> = q.iter().map(|m| m / SET).collect();
+            sets.dedup();
+            assert!(sets.len() <= 5, "{sets:?}");
+        }
     }
 
     #[test]
