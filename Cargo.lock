@@ -427,6 +427,7 @@ name = "pkg"
 version = "0.2.0"
 dependencies = [
  "libc-ffi",
+ "pkgd",
  "pkgfmt",
  "posix-abi",
  "posix-crt",

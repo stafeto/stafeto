@@ -233,6 +233,43 @@ pub fn installed_line(request: &str, items: &[(&str, &str, bool)]) -> String {
     format!("installed {}", parts.join(", "))
 }
 
+/// The line of a removal: `removed doomgeneric e257a095-1, freedoom 0.13.0-1 (no longer needed)`.
+/// `items` are the packages in the order they went, with whether each went because nothing
+/// needed it any longer and not because it was named.
+pub fn removed_line(items: &[(&str, &str, bool)]) -> String {
+    let parts: Vec<String> = items
+        .iter()
+        .map(|&(name, version, extra)| {
+            let mark = if extra { " (no longer needed)" } else { "" };
+            format!("{name} {}{mark}", short(version))
+        })
+        .collect();
+    format!("removed {}", parts.join(", "))
+}
+
+/// The start of the line of a replacement: `upgrading doomgeneric e257a095-1 -> e257a096-1 (0.5 MB) `.
+pub fn upgrading(name: &str, from: &str, to: &str, bytes: u64) -> String {
+    format!(
+        "upgrading {name} {} -> {} ({}) ",
+        short(from),
+        short(to),
+        megabytes(bytes)
+    )
+}
+
+/// A line of `pkg repo list`: the name, the address and what is trusted or switched off.
+pub fn repository(name: &str, address: &str, trust: &str, disabled: bool) -> String {
+    let off = if disabled { " [disabled]" } else { "" };
+    format!("{name} {address} {trust}{off}")
+}
+
+/// The pause before the next TAKE of a long operation, in ms, after `n` that found it still running:
+/// 2 ms, doubling, 64 ms at most. A change of a few thousand ticks answers at once, and one of
+/// seconds is not asked 500 times a second.
+pub fn backoff_ms(n: u32) -> i64 {
+    2i64 << n.min(5)
+}
+
 /// What `pkg check` knows of the store.
 pub struct Check<'a> {
     pub generation: u64,
@@ -573,5 +610,39 @@ mod tests {
             })
             .1
         );
+    }
+
+    #[test]
+    fn the_lines_of_a_removal_a_replacement_and_a_repository() {
+        assert_eq!(
+            removed_line(&[
+                (
+                    "doomgeneric",
+                    "e257a09527062bfb986b6e5e0780839b6cbd5b71-1",
+                    false
+                ),
+                ("freedoom", "0.13.0-1", true)
+            ]),
+            "removed doomgeneric e257a095-1, freedoom 0.13.0-1 (no longer needed)"
+        );
+        assert_eq!(
+            upgrading(
+                "doomgeneric",
+                "e257a09527062bfb986b6e5e0780839b6cbd5b71-1",
+                "e257a09627062bfb986b6e5e0780839b6cbd5b71-1",
+                495_616
+            ),
+            "upgrading doomgeneric e257a095-1 -> e257a096-1 (0.5 MB) "
+        );
+        assert_eq!(
+            repository("games", "https://h/x", "key a SHA256:x", true),
+            "games https://h/x key a SHA256:x [disabled]"
+        );
+    }
+
+    #[test]
+    fn the_pause_between_polls_grows_to_64_ms_and_stays() {
+        let pauses: alloc::vec::Vec<i64> = (0..8).map(backoff_ms).collect();
+        assert_eq!(pauses, [2, 4, 8, 16, 32, 64, 64, 64]);
     }
 }

@@ -18,6 +18,7 @@ pub mod faults;
 pub mod fetch;
 pub mod output;
 pub mod resolve;
+pub mod settings;
 pub mod verify;
 
 /// The series of the system and the roots of trust the build baked in.
