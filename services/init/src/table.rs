@@ -2771,7 +2771,8 @@ mod tests {
     /// The base image is the games table with the network service: the
     /// launcher reaches the display and the network services under the
     /// larger quota of a command, the process service has the pool of the
-    /// network image, and the services of both tables are in it once.
+    /// network image, and the services of both tables are in it once, with
+    /// the disk and the package service, which the launcher waits for.
     #[test]
     fn the_base_table_is_the_games_table_with_the_network_service() {
         assert!(check(base::BASE_TABLE).is_ok());
@@ -2779,7 +2780,9 @@ mod tests {
         let at = |names: &[&str], name: &str| names.iter().position(|&n| n == name).unwrap();
         assert!(at(&names, "input") < at(&names, "gpu"));
         assert!(at(&names, NET_SERVICE) < names.len());
-        names.retain(|&n| n != NET_SERVICE);
+        assert!(at(&names, "blk") < at(&names, "pkgd"));
+        assert!(at(&names, "ramfs") < at(&names, "pkgd"));
+        names.retain(|&n| n != NET_SERVICE && n != "blk" && n != "pkgd");
         let mut games = order_of(doom::TABLE);
         names.sort_unstable();
         games.sort_unstable();
@@ -2791,13 +2794,31 @@ mod tests {
         assert!(launcher.connects.contains(&"gpu"));
         assert!(launcher.connects.contains(&NET_SERVICE));
         assert_eq!(launcher.quota, net::NET_COMMAND_QUOTA);
+        // The launcher gets the package session, and waits 30 s for READY.
+        assert!(launcher.connects.contains(&"pkgd"));
+        assert_eq!(
+            launcher.waits,
+            &[Wait {
+                service: "pkgd",
+                deadline_ms: 30_000
+            }]
+        );
+        assert_eq!(base::PKGD_READY_MS, 30_000);
         let posix = base::BASE_TABLE
             .iter()
             .find(|r| r.name == PROCESS_SERVICE)
             .unwrap();
-        assert_eq!(posix.quota, net::NET_TABLE[2].quota);
-        // The service of the network is the one of the network image.
-        assert_eq!(base::BASE_TABLE.last().unwrap().name, net::NETD.name);
+        // The pool of the network image less the two quotas of a command that
+        // the package service takes from init.
+        assert_eq!(
+            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA,
+            net::NET_TABLE[2].quota
+        );
+        // The service of the network is the one of the network image, and the
+        // disk and package services close the table: 14 of 16 records.
+        assert_eq!(base::BASE_TABLE[11].name, net::NETD.name);
+        assert_eq!(base::BASE_TABLE.last().unwrap().name, "pkgd");
+        assert_eq!(base::BASE_TABLE.len(), 14);
     }
 
     /// Every POSIX process leaves one level above main for its thread

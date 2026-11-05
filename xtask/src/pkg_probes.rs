@@ -422,7 +422,10 @@ fn boot(
     let kernel = crate::build(crate::Variant::Normal)?;
     let mut cmd = crate::qemu::command(crate::base_image::machine(name), &kernel.image, Some(path));
     cmd.args(crate::qemu::HEADLESS);
-    cmd.args(crate::base_image::machine_args());
+    // An empty disk for the package service, new for each run.
+    let store = path.with_file_name(format!("store-pkg-identity-{name}"));
+    crate::qemu::store_file(&store, crate::STORE_BYTES, true)?;
+    cmd.args(crate::base_image::machine_args(&store));
     let started = std::time::Instant::now();
     let mut run = crate::qemu::Run::start(cmd, crate::qemu::Input::Pipe)?;
     let mut services = 0.0;

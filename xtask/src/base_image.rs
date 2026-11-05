@@ -27,6 +27,8 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
         programs.extend(package_programs(&packages));
         programs.extend(SHELL_SERVICES_LAST);
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
+        programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
+        programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
         programs.push((
             "virtio-input",
             "virtio-input",
@@ -38,12 +40,14 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     })
 }
 
-/// The devices of the machine of both images: the screen, the keyboard and
-/// the network device, on user-mode networking.
-pub fn machine_args() -> Vec<String> {
+/// The devices of the machine of both images: the screen, the keyboard, the
+/// network device on user-mode networking, and the disk of the package
+/// service, the file `store` (`qemu::store_file` makes it).
+pub fn machine_args(store: &Path) -> Vec<String> {
     let mut args: Vec<String> = qemu::GPU.iter().map(|s| (*s).to_owned()).collect();
     args.extend(qemu::KEYBOARD.iter().map(|s| (*s).to_owned()));
     args.extend(qemu::net(&[]));
+    args.extend(qemu::store(store, None));
     args
 }
 
@@ -86,9 +90,12 @@ pub fn command(args: &[String]) -> Result<(), String> {
         None => Ok(()),
         Some("run") => {
             let kernel = build(Variant::Normal)?;
+            // The disk of the image: a file of its own, which survives the run.
+            let store = store_path(&image);
+            qemu::store_file(&store, STORE_BYTES, false)?;
             let mut cmd = qemu::command(machine(name), &kernel.image, Some(&image));
             cmd.args(["-nographic"]);
-            cmd.args(machine_args());
+            cmd.args(machine_args(&store));
             run_interactive_qemu(cmd, &kernel.elf)
         }
         Some(other) => Err(format!("image {}: unknown argument {other}", args[0])),

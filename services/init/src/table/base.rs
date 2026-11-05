@@ -7,13 +7,14 @@
 //! network service (`net::NETD`). The launcher connects to both the display
 //! service and the network service, so the shell and its commands reach the
 //! screen and the network, and has the larger quota of the two tables
-//! (`NET_COMMAND_QUOTA`); the process service has the pool of the network
-//! image. The services of the disk and of packages come in the stages that
-//! make them (spec 5).
+//! (`NET_COMMAND_QUOTA`) and waits for the package service to say READY before
+//! it starts the shell; the process service has the pool of the network
+//! image. The disk service and the package service close the table.
 
 use super::doom;
 use super::net::{NET_COMMAND_QUOTA, NET_PROCESS_SERVICE, NETD};
-use super::{NET_SERVICE, Record};
+use super::pkg::{BLK, PKGD};
+use super::{NET_SERVICE, Record, Wait};
 
 // BASE_TABLE copies the records of the games table by number.
 const _: () = assert!(doom::TABLE.len() == 11);
@@ -33,14 +34,43 @@ const LAUNCHER_CONNECTS: &[&str] = &[
     "entropy",
     "gpu",
     NET_SERVICE,
+    "pkgd",
 ];
+
+/// How long the launcher waits for the package service to say READY
+/// (spec 5, section 4): the service reads the disk, checks the signature and
+/// the hash of each package and attaches its layer, a few seconds with Doom
+/// on it; past this the shell starts without waiting (`init: pkgd not ready
+/// after 30 s`).
+pub const PKGD_READY_MS: u32 = 30_000;
 
 /// The launcher of the games table with the network service too, under the
 /// larger of the two quotas of a command.
 pub const LAUNCHER: Record = Record {
     quota: at_least(doom::QUOTA, NET_COMMAND_QUOTA),
     connects: LAUNCHER_CONNECTS,
+    waits: &[Wait {
+        service: "pkgd",
+        deadline_ms: PKGD_READY_MS,
+    }],
     ..doom::TABLE[5]
+};
+
+/// The command quotas of the pool of the process service of the base and the
+/// full image: the network image's sixteen less two, which the package service
+/// takes (its 16 896 pages of quota, the disk service's 64 and the table
+/// itself are out of init's 127 789 pages on 512 MiB). Nothing of the shell,
+/// `httpd` or a reload of nginx (nine processes, 30 440 pages) needs more than
+/// the 14 x 4 096 pages left.
+pub const COMMAND_QUOTAS: u64 = 14;
+
+/// The process service of the base and the full image: the pool of the
+/// network image with `COMMAND_QUOTAS` quotas of a command.
+pub const BASE_PROCESS_SERVICE: Record = Record {
+    quota: super::ramfs::POSIX_ABI_TABLE[1].quota
+        + super::ramfs::BUSYBOX_DIALOG_POOL
+        + COMMAND_QUOTAS * NET_COMMAND_QUOTA,
+    ..NET_PROCESS_SERVICE
 };
 
 /// The table of the base and the full image.
@@ -51,11 +81,11 @@ pub const LAUNCHER: Record = Record {
 /// of 54 MB leaves the memory of init about 11 000 pages smaller than the base image's, and the
 /// pool of the process service (16 quotas of 4 096 pages) stays; so the full image runs on 1 GiB
 /// (xtask `base_image::machine`), where the number is the one in docs/packages.md. The disk
-/// and package services of the next stages come out of the same number.
+/// and package services come out of the same number.
 pub const BASE_TABLE: &[Record] = &[
     doom::TABLE[0],
     doom::TABLE[1],
-    NET_PROCESS_SERVICE,
+    BASE_PROCESS_SERVICE,
     doom::TABLE[3],
     doom::TABLE[4],
     LAUNCHER,
@@ -65,4 +95,6 @@ pub const BASE_TABLE: &[Record] = &[
     doom::TABLE[9],
     doom::TABLE[10],
     NETD,
+    BLK,
+    PKGD,
 ];

@@ -34,7 +34,7 @@ use pkgfmt::meta::Meta;
 use pkgfmt::{Certificate, Key, Kind, Revocation, keyfile, sig};
 use std::path::{Path, PathBuf};
 
-const PKGD_STACK_SIZE: u32 = 32 * 1024;
+pub const PKGD_STACK_SIZE: u32 = 32 * 1024;
 const DISK_BYTES: u64 = 512 << 20;
 /// The tags of the services' lines of steps: the file service 2, the disk 15, the package service 16.
 const RAM_TAG: &str = "2";
