@@ -59,14 +59,19 @@ check the command. A full run takes about 15 minutes:
 `--no-buffers` runs steps 1 to 4 and 7. `--machine host` runs steps 1 to 5
 and stages at 1 000, 2 500, 5 000, 7 500 and 10 000 requests a second.
 
-Run one measurement at a time and no other guest beside it: every guest of
-`vz-run` has the MAC address 02:73:74:66:00:01 and so the same lease on the
-NAT, and a second VZ guest takes the address over in the middle of a stage
-(answers 404 or refusals from the other guest). The command refuses to
-start on VZ beside another guest of `vz-run` and looks again before and
-after every ceiling and stage: a row with a new guest beside it is marked
-`foreign guest`, and on VZ the run stops there. The table notes the other
-machines of QEMU and VZ and the Mac's load average at the start and the end.
+Run one measurement at a time: other guests share the Mac's cores. The
+command claims a MAC suffix of its own (`vz-run --mac-suffix S` sets the
+fifth byte of the MAC addresses, `02:73:74:66:SS:0N`; `cargo xtask` takes
+the lowest suffix from 1 that no other run holds and no running `vz-run`
+has), so a guest of `vz-run` beside it has another MAC address and another
+lease on the NAT and cannot take the address over. Such a guest only
+earns a warning at the start. A guest with the same suffix (a runner
+started by hand with the same key) would take the lease: the command looks
+again before and after every ceiling and stage, a row with a new guest of
+any suffix is marked `foreign guest` (it shares the Mac's cores), and on VZ
+the run stops there when the new guest has the run's suffix. The table
+notes the other machines of QEMU and VZ and the Mac's load average at the
+start and the end.
 
 ## Reading the table
 

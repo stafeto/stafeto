@@ -81,6 +81,80 @@ pub struct Machine {
     pub memory_mib: Option<u64>,
     /// The Virtio network devices on the NAT, 0 to 2.
     pub net: usize,
+    /// The fifth byte of the MAC addresses (`--mac-suffix`); 0 is the
+    /// runner's default and leaves the key out.
+    pub mac_suffix: u8,
+}
+
+/// The MAC address of network device `device` (0 or 1) of a guest run with
+/// `suffix`, as `vz-run` sets it.
+pub fn mac(suffix: u8, device: usize) -> String {
+    format!("02:73:74:66:{suffix:02x}:{:02x}", device + 1)
+}
+
+/// The suffix a run with network devices holds while it lives: the lock on
+/// its file is released when the process ends, however it ends.
+pub struct Suffix {
+    pub value: u8,
+    _lock: std::fs::File,
+}
+
+/// The suffixes in the keys `--mac-suffix` of the `vz-run` processes in
+/// `ps` output (`pid command` lines); a runner without the key holds 0.
+pub fn suffixes_in(ps: &str) -> Vec<u8> {
+    let mut found = Vec::new();
+    for line in ps.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(command) = words.get(1) else {
+            continue;
+        };
+        if !(command.ends_with("/vz-run") || *command == "vz-run") {
+            continue;
+        }
+        let key = words.iter().position(|w| *w == "--mac-suffix");
+        found.push(
+            key.and_then(|at| words.get(at + 1))
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(0),
+        );
+    }
+    found
+}
+
+/// Claims the lowest free suffix from 1 up: one no other xtask run holds
+/// (a lock file per suffix in the temporary directory) and no running
+/// `vz-run` has in its key, so that guests side by side have MAC addresses
+/// of their own and so leases of their own on the NAT. A runner started by
+/// hand without the key holds 0, which is never claimed.
+pub fn claim_suffix() -> Result<Suffix, String> {
+    let directory = std::env::temp_dir().join("stafeto-vz-mac");
+    std::fs::create_dir_all(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    let ps = Command::new("ps")
+        .args(["-Ao", "pid,command"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let running = suffixes_in(&ps);
+    for value in 1..=u8::MAX {
+        if running.contains(&value) {
+            continue;
+        }
+        let path = directory.join(value.to_string());
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => return Ok(Suffix { value, _lock: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("{}: {e}", path.display()));
+            }
+        }
+    }
+    Err("no free MAC suffix for a guest of vz-run".into())
 }
 
 /// The arguments of `vz-run` for `machine`, before the two images.
@@ -94,6 +168,9 @@ pub fn machine_arguments(machine: Machine) -> Vec<String> {
     }
     if machine.net > 0 {
         args.extend(["--net".to_string(), machine.net.to_string()]);
+    }
+    if machine.mac_suffix > 0 {
+        args.extend(["--mac-suffix".to_string(), machine.mac_suffix.to_string()]);
     }
     args
 }
@@ -328,16 +405,45 @@ mod tests {
             cpus: Some(4),
             memory_mib: Some(1024),
             net: 2,
+            mac_suffix: 7,
         };
         assert_eq!(
             machine_arguments(machine),
-            ["--cpus", "4", "--memory", "1024", "--net", "2"]
+            [
+                "--cpus",
+                "4",
+                "--memory",
+                "1024",
+                "--net",
+                "2",
+                "--mac-suffix",
+                "7"
+            ]
         );
         let net = Machine {
             net: 1,
             ..Machine::default()
         };
         assert_eq!(machine_arguments(net), ["--net", "1"]);
+    }
+
+    #[test]
+    fn the_macs_carry_the_suffix_and_the_device() {
+        assert_eq!(mac(0, 0), "02:73:74:66:00:01");
+        assert_eq!(mac(0x1a, 1), "02:73:74:66:1a:02");
+    }
+
+    #[test]
+    fn the_suffixes_of_running_runners_are_read_from_ps() {
+        let ps = "  PID COMMAND\n 11 /x/target/vz-run --net 2 --mac-suffix 3 k b\n 12 vz-run --net 1 k b\n 13 /bin/sh -c vz-run --mac-suffix 9\n 14 qemu-system-aarch64 -m 1\n";
+        assert_eq!(suffixes_in(ps), [3, 0]);
+    }
+
+    #[test]
+    fn two_claims_get_different_suffixes() {
+        let a = claim_suffix().unwrap();
+        let b = claim_suffix().unwrap();
+        assert_ne!(a.value, b.value);
     }
 
     #[test]

@@ -1703,7 +1703,9 @@ commands:
             Apple VZ: the lease, HTTP and the Mac's ping of the guest; with
             --net 2 the second device too (--static1: its static address);
             with --fast `fast-echo` claims the second device and the Mac
-            reaches it: UDP echo, ping, ARP, kill -9 and a new claim
+            reaches it: UDP echo, ping, ARP, kill -9 and a new claim; every VZ
+            run with a network claims a MAC suffix of its own (vz-run
+            --mac-suffix), so guests side by side get different leases
   net-curl [steps] [MACHINE] run the sockets of the network service from the
             host: `httpd` of the guest answers 20 requests in a row and 8 at
             once through a forwarded port, UDP goes both ways, `net-sock` runs
