@@ -1025,6 +1025,9 @@ impl Driver<'_> {
         if outcome.first_interrupt {
             rt::println!("virtio-net1: first interrupt");
         }
+        if outcome.ring_broken {
+            rt::println!("net: bypass broken");
+        }
         // The notification came from the second device's own line (its
         // label), and its status was not empty.
         if interrupt && outcome.isr_seen && !self.own_said {
@@ -1037,6 +1040,7 @@ impl Driver<'_> {
         let continued = outcome.more && self.tell(RX1);
         if (!continued || outcome.owner_bits & proto_net::fast::FAST_INTERRUPT != 0)
             && let Some(second) = self.second.as_deref_mut()
+            && second.mode != second::Mode::Dead
             && core::mem::take(&mut second.line_closed)
         {
             virtio_mmio::reopen(&second.irq);
@@ -1063,9 +1067,9 @@ impl Driver<'_> {
                 rt::println!("net: device 1 back");
                 self.tell(RX1);
             }
-            second::Returned::Failed(code) => {
+            // The first device and its sockets go on; the second stays dead.
+            second::Returned::Failed => {
                 rt::println!("virtio-net1: the device did not come back");
-                sys::process_exit(code);
             }
         }
     }
@@ -1257,8 +1261,10 @@ impl Driver<'_> {
             (self.stack.lease, self.mac)
         } else {
             match self.second.as_deref() {
-                Some(second) => (second.lease, second.device.mac),
-                None => return Answer::Status(code(proto_net::INVALID)),
+                Some(second) if second.mode != second::Mode::Dead => {
+                    (second.lease, second.device.mac)
+                }
+                _ => return Answer::Status(code(proto_net::INVALID)),
             }
         };
         let Some(lease) = lease else {

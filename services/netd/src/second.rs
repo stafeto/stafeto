@@ -72,6 +72,8 @@ pub struct Outcome {
     /// The lease the client asked for again after a claim came: the lease
     /// and whether its address is another.
     pub renewed: Option<(Lease, bool)>,
+    /// The step found the bypass ring broken.
+    pub ring_broken: bool,
 }
 
 /// Who drives the device.
@@ -84,14 +86,18 @@ pub enum Mode {
     Owned,
     /// The owner went and the device comes back to the service.
     Back(Back),
+    /// The device did not come back: the service leaves it alone, its line
+    /// closed, and serves the first device as before. CLAIM and CONFIG 1
+    /// are INVALID.
+    Dead,
 }
 
 /// The steps of the device's return (spec 6, 3.9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Back {
     /// The status is written 0 and read back, `RESET_READS_STEP` times a
-    /// step at most.
-    Reset,
+    /// step at most, in `RESET_STEPS` steps at most (the count so far).
+    Reset(u16),
     /// The features and the configuration (`virtio_net::open`).
     Open,
     /// The queue of receiving on `dma1`, and then the queue of sending: one
@@ -105,6 +111,9 @@ pub enum Back {
 /// The reads of the status after the reset in one step: QEMU and VZ read 0
 /// at once.
 pub const RESET_READS_STEP: u32 = 64;
+/// The steps of the reset at most: 64 000 reads in all, then the device is
+/// dead.
+pub const RESET_STEPS: u16 = 1000;
 /// The buffers of receiving given to the queue in one step of the return.
 pub const FILL_STEP: u16 = 64;
 
@@ -114,8 +123,9 @@ pub enum Returned {
     More,
     /// The device is the service's again.
     Done,
-    /// The device refused; the service ends with this code.
-    Failed(u64),
+    /// The device refused, or its reset never ended: it is dead
+    /// (`Mode::Dead`), and the service goes on with the first device.
+    Failed,
 }
 
 pub struct Second {
@@ -270,6 +280,11 @@ impl Second {
         let mut outcome = Outcome::default();
         if interrupt {
             self.line_closed = true;
+            // A dead device's line stays closed, and its registers are not
+            // read.
+            if self.mode == Mode::Dead {
+                return outcome;
+            }
             let isr = Isr::read(&mut self.transport);
             outcome.isr_seen = !isr.is_empty();
             if outcome.isr_seen && !core::mem::replace(&mut self.interrupted, true) {
@@ -287,13 +302,13 @@ impl Second {
                     }
                     return outcome;
                 }
-                Mode::Back(_) => return outcome,
+                Mode::Back(_) | Mode::Dead => return outcome,
             }
         }
         match self.mode {
             Mode::Own => {}
             Mode::Owned => return self.ring_step(now_ns),
-            Mode::Back(_) => return outcome,
+            Mode::Back(_) | Mode::Dead => return outcome,
         }
         let now = instant(now_ns);
         self.device.rx.begin_step(Budget::receiving());
@@ -342,7 +357,7 @@ impl Second {
         };
         let now = instant(now_ns);
         outcome.taken = fast.take(own);
-        while fast.has_frame() {
+        while fast.taker.has_frame() {
             let _ = self.iface.poll_ingress_single(now, fast, &mut self.sockets);
         }
         self.iface.poll_maintenance(now);
@@ -350,7 +365,8 @@ impl Second {
         if core::mem::take(&mut fast.pushed) > 0 {
             outcome.owner_bits |= FAST_RING;
         }
-        outcome.more = fast.waiting();
+        outcome.more = fast.taker.waiting();
+        outcome.ring_broken = fast.taker.newly_broken();
         match self.dhcp_event() {
             Some(Event::Leased(lease)) => match self.renewing.take() {
                 Some(before) => {
@@ -397,13 +413,20 @@ impl Second {
         self.fast = None;
         self.renewing = None;
         self.next_at = None;
-        self.mode = Mode::Back(Back::Reset);
+        self.mode = Mode::Back(Back::Reset(0));
+    }
+
+    /// Whether the bypass ring broke (KICK is refused then).
+    pub fn ring_broken(&self) -> bool {
+        self.fast.as_ref().is_some_and(|f| f.taker.broken)
     }
 
     /// The counters of the bypass ring: refused, lost, broken.
     #[cfg_attr(not(feature = "probe"), allow(dead_code))]
     pub fn ring_counters(&self) -> Option<(u64, u64, bool)> {
-        self.fast.as_ref().map(|f| (f.refused, f.lost, f.broken))
+        self.fast
+            .as_ref()
+            .map(|f| (f.taker.refused, f.lost, f.taker.broken))
     }
 
     /// Which step of the return is next, for the line of the longest
@@ -411,7 +434,7 @@ impl Second {
     /// fill.
     pub fn back_detail(&self) -> u64 {
         match self.mode {
-            Mode::Back(Back::Reset) => 1,
+            Mode::Back(Back::Reset(_)) => 1,
             Mode::Back(Back::Open) => 2,
             Mode::Back(Back::ReceiveQueue) => 3,
             Mode::Back(Back::SendQueue) => 4,
@@ -420,15 +443,29 @@ impl Second {
         }
     }
 
-    /// One step of the return (`Back`).
+    /// One step of the return (`Back`); a refusal leaves the device dead.
     pub fn back_step(&mut self) -> Returned {
+        let returned = self.back_advance();
+        if matches!(returned, Returned::Failed) {
+            self.mode = Mode::Dead;
+            self.lease = None;
+            self.next_at = None;
+        }
+        returned
+    }
+
+    fn back_advance(&mut self) -> Returned {
         let Mode::Back(back) = self.mode else {
             return Returned::Done;
         };
         match back {
-            Back::Reset => {
+            Back::Reset(steps) => {
                 self.transport.set_status(DeviceStatus::empty());
                 if !(0..RESET_READS_STEP).any(|_| self.transport.get_status().is_empty()) {
+                    if steps + 1 >= RESET_STEPS {
+                        return Returned::Failed;
+                    }
+                    self.mode = Mode::Back(Back::Reset(steps + 1));
                     return Returned::More;
                 }
                 self.mode = Mode::Back(Back::Open);
@@ -436,28 +473,28 @@ impl Second {
             Back::Open => {
                 let opened = match crate::start_device(&mut self.transport, "virtio-net1") {
                     Ok(opened) => opened,
-                    Err(code) => return Returned::Failed(code),
+                    Err(_) => return Returned::Failed,
                 };
                 if opened.mac != self.device.mac {
                     rt::println!("virtio-net1: the MAC changed under its owner");
-                    return Returned::Failed(NOT_STARTED);
+                    return Returned::Failed;
                 }
                 let (dma_pa, net_pa) = self.objects;
                 if !crate::dma::attach(1, dma_pa, net_pa) {
-                    return Returned::Failed(NOT_STARTED);
+                    return Returned::Failed;
                 }
                 self.mode = Mode::Back(Back::ReceiveQueue);
             }
             Back::ReceiveQueue => {
                 let Ok(rx_queue) = Q::new(&mut self.transport, RECEIVEQ, false, false) else {
-                    return Returned::Failed(NOT_STARTED);
+                    return Returned::Failed;
                 };
                 self.device.rx = RxRing::new(rx_queue);
                 self.mode = Mode::Back(Back::SendQueue);
             }
             Back::SendQueue => {
                 let Ok(tx_queue) = Q::new(&mut self.transport, TRANSMITQ, false, false) else {
-                    return Returned::Failed(NOT_STARTED);
+                    return Returned::Failed;
                 };
                 self.device.tx = TxRing::new(tx_queue);
                 self.device.forget_frames();

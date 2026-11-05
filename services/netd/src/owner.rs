@@ -108,6 +108,9 @@ impl Driver<'_> {
         let Some(second) = self.second.as_deref() else {
             return refuse(proto_net::INVALID);
         };
+        if second.mode == Mode::Dead {
+            return refuse(proto_net::INVALID);
+        }
         if self.owner.is_some() || second.mode != Mode::Own {
             return refuse(proto_net::BUSY);
         }
@@ -243,7 +246,14 @@ impl Driver<'_> {
         if !self.owns(s) || self.second.as_deref().is_none_or(|s| s.fast.is_none()) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        // A broken ring takes nothing any more: KICK is refused.
+        if self.second.as_deref().is_some_and(|s| s.ring_broken()) {
+            return refuse(proto_net::INVALID);
+        }
         let taken = self.rx1_work(false);
+        if self.second.as_deref().is_some_and(|s| s.ring_broken()) {
+            return refuse(proto_net::INVALID);
+        }
         rt::service::step_detail(u64::from(taken));
         if fast::write_kick_reply(taken, r.reply()).is_err() {
             return Answer::Status(Status::BadSize);

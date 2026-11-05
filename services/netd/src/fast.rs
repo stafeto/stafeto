@@ -12,36 +12,24 @@
 //! capabilities of the device it was made with (no sums by smoltcp), so the
 //! sums are checked and written here, as `device.rs` does for the queues.
 
-use netd::bypass::{self, Broken, Own, Ring};
+use netd::bypass::{Broken, Own, Ring, Taker};
 use netd::ring::STEP_TX;
 use proto_net::fast::FRAME_MAX;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use virtio_net::frames::{fill_sums, verify_sums};
+use virtio_net::frames::fill_sums;
 
-/// The frames of the ring a step takes: the cost of a frame through the
-/// stack is that of a frame of the wire (two fit a step with room).
-pub const RING_RX: usize = 2;
-
-/// The ring and the frames a step copied from it.
+/// The ring with the frames a step took from it (`bypass::Taker`), and
+/// what the pass of sending puts in the ring to the owner.
 pub struct Fast {
-    pub ring: Ring,
-    frames: [[u8; FRAME_MAX]; RING_RX],
-    lens: [usize; RING_RX],
-    /// The frames copied this step, and the next to give to the stack.
-    count: usize,
-    next: usize,
+    pub taker: Taker,
     /// Where the stack builds a frame for the owner.
     out: [u8; FRAME_MAX],
     /// Frames put in the ring to the owner since the owner was told.
     pub pushed: u32,
     /// The frames of the pass of sending so far.
     sent: usize,
-    /// The ring broke its rules: nothing is taken from it any more.
-    pub broken: bool,
-    /// Frames of the ring the check refused, and frames the full ring to
-    /// the owner had no room for.
-    pub refused: u64,
+    /// Frames the full ring to the owner had no room for.
     pub lost: u64,
 }
 
@@ -54,63 +42,18 @@ impl Fast {
     pub unsafe fn new(base: usize) -> Fast {
         Fast {
             // SAFETY: the caller's promise.
-            ring: unsafe { Ring::at(base) },
-            frames: [[0; FRAME_MAX]; RING_RX],
-            lens: [0; RING_RX],
-            count: 0,
-            next: 0,
+            taker: unsafe { Taker::new(base) },
             out: [0; FRAME_MAX],
             pushed: 0,
             sent: 0,
-            broken: false,
-            refused: 0,
             lost: 0,
         }
     }
 
-    /// Copies up to RING_RX frames of the ring and keeps those the check
-    /// passes: the frames taken from the ring.
+    /// The frames of a step (`Taker::take`); the pass of sending starts.
     pub fn take(&mut self, own: Own) -> u32 {
-        self.count = 0;
-        self.next = 0;
         self.sent = 0;
-        let mut taken = 0;
-        while !self.broken && taken < RING_RX as u32 {
-            let slot = &mut self.frames[self.count];
-            match self.ring.take(slot) {
-                Ok(Some(len)) => {
-                    taken += 1;
-                    if bypass::accepts(&slot[..len], own) && verify_sums(&slot[..len]) {
-                        self.lens[self.count] = len;
-                        self.count += 1;
-                    } else {
-                        self.refused += 1;
-                    }
-                }
-                Ok(None) => break,
-                Err(Broken) => self.broken = true,
-            }
-        }
-        taken
-    }
-
-    /// Whether frames are left in the ring for another step.
-    pub fn waiting(&mut self) -> bool {
-        if self.broken {
-            return false;
-        }
-        match self.ring.waiting() {
-            Ok(n) => n > 0,
-            Err(Broken) => {
-                self.broken = true;
-                false
-            }
-        }
-    }
-
-    /// Whether a frame copied this step waits for the stack.
-    pub fn has_frame(&self) -> bool {
-        self.next < self.count
+        self.taker.take(own)
     }
 }
 
@@ -163,26 +106,17 @@ impl phy::Device for Fast {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
-        if self.next >= self.count || self.broken {
-            return None;
-        }
-        let i = self.next;
-        self.next += 1;
         self.sent += 1;
         let Fast {
-            frames,
-            lens,
-            ring,
+            taker,
             out,
             pushed,
             lost,
-            broken,
             ..
         } = self;
+        let (frame, ring, broken) = taker.next_frame()?;
         Some((
-            RxToken {
-                frame: &frames[i][..lens[i]],
-            },
+            RxToken { frame },
             TxToken {
                 ring,
                 out,
@@ -194,16 +128,16 @@ impl phy::Device for Fast {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<TxToken<'_>> {
-        if self.sent >= STEP_TX || self.broken {
+        if self.sent >= STEP_TX || self.taker.broken {
             return None;
         }
         self.sent += 1;
         Some(TxToken {
-            ring: &mut self.ring,
+            ring: &mut self.taker.ring,
             out: &mut self.out,
             pushed: &mut self.pushed,
             lost: &mut self.lost,
-            broken: &mut self.broken,
+            broken: &mut self.taker.broken,
         })
     }
 

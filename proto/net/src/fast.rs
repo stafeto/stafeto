@@ -8,9 +8,9 @@
 //!
 //! | Method | Request | Reply |
 //! |---|---|---|
-//! | CLAIM (26) | device (u32, 1), ring pages (u32, `RING_PAGES`); three handles: a copy of the identity session (NOTIFY, TRANSFER), a copy of the owner's channel with the label it wants (NOTIFY, TRANSFER), the owner's ring object (MAP_READ, MAP_WRITE, TRANSFER) | status, `Claimed`; four handles: the window, `dma1`, `net1a`, `net1b`. NOT_ALLOWED (not the superuser, no identity, no `handover 1`), BUSY (an owner, or the device on its way back), INVALID (the size of the ring, a device other than 1, no second device), NET_DOWN (no address yet) |
+//! | CLAIM (26) | device (u32, 1), ring pages (u32, `RING_PAGES`); three handles: a copy of the identity session (NOTIFY, TRANSFER), a copy of the owner's channel with the label it wants (NOTIFY, TRANSFER), the owner's ring object (MAP_READ, MAP_WRITE, TRANSFER) | status, `Claimed`; four handles: the window, `dma1`, `net1a`, `net1b`. NOT_ALLOWED (not the superuser, no identity, no `handover 1`), BUSY (an owner, or the device on its way back), INVALID (the size of the ring, a device other than 1, no second device, or one that did not come back from its last owner), NET_DOWN (no address yet) |
 //! | CLAIM_MORE (36) | the header alone | status; two handles: `net1c`, `net1d`. BAD_STATE (no CLAIM of this session, or taken already) |
-//! | KICK (37) | count (u32, 1..=`RING_SLOTS`: the frames the owner put in the ring to the service) | status, taken (u32: the frames this step took; the service's steps take the rest). BAD_STATE (the session owns nothing) |
+//! | KICK (37) | count (u32, 1..=`RING_SLOTS`: the frames the owner put in the ring to the service) | status, taken (u32: the frames this step took; the service's steps take the rest). BAD_STATE (the session owns nothing), INVALID (the ring's indices broke its rules: the service takes nothing from it any more) |
 //!
 //! The owner makes the ring: `RING_PAGES` pages of its quota. Page 0 holds
 //! the indices of the two rings (`Ends`): ring `TO_SERVICE` at 0, ring
