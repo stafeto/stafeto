@@ -263,7 +263,7 @@ glue_kevent(int kq, const void *changes, int n_changes, void *events, int n_even
 
 static const struct stafeto_fast_table table = {
     .version = STAFETO_FAST_TABLE_VERSION,
-    .flags = 0,
+    .flags = STAFETO_FAST_EXIT_ON_LOSS,
     .start = glue_start,
     .pass = glue_pass,
     .next_tick_ns = glue_next_tick_ns,

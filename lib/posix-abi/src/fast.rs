@@ -171,8 +171,9 @@ fn call(
 }
 
 /// Sleeps on the thread's channel until `until` (nanoseconds of the
-/// counter): the claim's pause between two tries.
-fn pause(until: u64) -> Result<(), i32> {
+/// counter): the claim's pause between two tries. A signal ends it with
+/// EINTR, or with `steady` runs its handler and sleeps on until `until`.
+fn pause(until: u64, steady: bool) -> Result<(), i32> {
     let timer = timer()?;
     loop {
         if crate::wait::now() >= until {
@@ -183,7 +184,9 @@ fn pause(until: u64) -> Result<(), i32> {
             Ok(_) => {}
             Err(Error::Interrupted) => {
                 crate::signals::deliver_now();
-                return Err(EINTR);
+                if !steady {
+                    return Err(EINTR);
+                }
             }
             Err(_) => return Err(EIO),
         }
@@ -254,6 +257,18 @@ fn ask(
 
 /// `stafeto_fast_claim`.
 pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
+    claim_with(out, flags, false)
+}
+
+/// The claim of the stack that starts by itself at the first call of a
+/// fast socket: its pause between tries is not ended by a signal (the
+/// handler runs, the wait goes on), since the calls it stands in for
+/// (`epoll_ctl`, `accept`, `connect`) have no EINTR to give.
+pub fn claim_steady(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
+    claim_with(out, flags, true)
+}
+
+fn claim_with(out: &mut FastClaim, flags: u32, steady: bool) -> Result<(), i32> {
     if claimed() {
         return Err(EBUSY);
     }
@@ -277,7 +292,7 @@ pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
                 if flags & ONCE == 0 && crate::wait::now() < started + BUSY_WAIT_NS => {}
             Err((errno, _)) => return Err(errno),
         }
-        pause(crate::wait::now() + RETRY_NS)?;
+        pause(crate::wait::now() + RETRY_NS, steady)?;
     };
     CLAIMED.store(true, Ordering::Release);
     let mut objects: [Option<Handle<Memory>>; 6] = Default::default();

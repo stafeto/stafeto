@@ -19,6 +19,15 @@
  *   TCP 80   any request (up to the empty line) gets the page: a head and
  *            1 MiB of a fixed pattern (page_byte), then the connection closes
  *
+ * `fast-layer --fork` is the shape of nginx: the main process opens two
+ * listeners before the stack runs (tickets), forks, and the child starts the
+ * stack at its first epoll_ctl, which makes both sockets at once; the child
+ * puts only the first listener in its epoll instance and serves, so a
+ * connection to the second must be accepted by the stack before the program
+ * has asked for it. `fast-layer --rules` checks the answers of the layer for
+ * the tickets and for the process that holds the stack (lines
+ * `fast-layer: <name> ok`).
+ *
  * Built with -fno-builtin; every result is compared.
  */
 
@@ -37,8 +46,10 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,8 +60,11 @@
 #define MAX_CONNECTIONS 64
 #define OUT_BYTES 65536
 #define FAST_BASE (1 << 20)
+#define TICKET_BASE (FAST_BASE + (1 << 18))
+#define FAST_TICKETS_MAX 16
 
 void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *pass_count);
+extern int stafeto_fast_probe_crash(void);
 
 static int epfd = -1;
 static int mixed[2];
@@ -717,13 +731,536 @@ serve(void)
     }
 }
 
+
+/* ----------------------------------------------------- the tickets (--fork) */
+
+static int
+wait_child(pid_t pid)
+{
+    int status = 0;
+
+    REQUIRE(waitpid(pid, &status, 0) == pid);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 100 + WTERMSIG(status);
+}
+
+/* The child of the main process: the first epoll_ctl starts the stack and
+ * makes the sockets of both tickets; only the first listener is in the
+ * instance until a client says "?second". */
+static void
+fork_child(int a, int b)
+{
+    struct epoll_event ev[8];
+    int clients[8], nclients = 0, i;
+
+    epfd = epoll_create1(0);
+    REQUIRE(epfd >= 0);
+    add(a, EPOLLIN, (void *)1);
+    printf("fast-layer: child serving\n");
+    fflush(stdout);
+    for (;;) {
+        int n = epoll_wait(epfd, ev, 8, 30000), k;
+
+        REQUIRE(n > 0);
+        for (k = 0; k < n; k++) {
+            uintptr_t who = (uintptr_t)ev[k].data.ptr;
+
+            if (who == 1 || who == 2) {
+                int fd = accept4(who == 1 ? a : b, NULL, NULL, 0);
+
+                if (fd < 0) {
+                    REQUIRE(errno == EAGAIN);
+                    continue;
+                }
+                REQUIRE(nclients < 8);
+                clients[nclients] = fd;
+                add(fd, EPOLLIN | EPOLLRDHUP, (void *)(uintptr_t)(10 + nclients));
+                nclients++;
+            } else {
+                int fd = clients[who - 10];
+                char buf[64];
+                ssize_t got = recv(fd, buf, sizeof(buf), 0);
+
+                if (got <= 0)
+                    continue;
+                if (got >= 7 && memcmp(buf, "?second", 7) == 0) {
+                    add(b, EPOLLIN, (void *)2);
+                    REQUIRE(send(fd, "second\n", 7, MSG_NOSIGNAL) == 7);
+                } else if (got >= 5 && memcmp(buf, "?stop", 5) == 0) {
+                    /* The sockets close and the process ends: the stack's
+                     * last step sends the FINs. */
+                    for (i = 0; i < nclients; i++)
+                        close(clients[i]);
+                    close(a);
+                    close(b);
+                    exit(0);
+                } else {
+                    REQUIRE(send(fd, buf, (size_t)got, MSG_NOSIGNAL) == got);
+                }
+            }
+        }
+    }
+}
+
+static void
+fork_mode(void)
+{
+    int a = tcp_socket(ECHO_PORT, 1024), b = tcp_socket(PAGE_PORT, 1024);
+    pid_t pid;
+
+    REQUIRE(a >= TICKET_BASE && b >= TICKET_BASE && a != b);
+    pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0)
+        fork_child(a, b);
+    ok("tickets");
+    /* The parent never starts the stack: its tickets close without one. */
+    REQUIRE(close(a) == 0);
+    REQUIRE(close(b) == 0);
+    REQUIRE(wait_child(pid) == 0);
+    printf("fast-layer: fork ended\n");
+    fflush(stdout);
+}
+
+/* ------------------------------------------------------------- the rules */
+
+static volatile int usr1_hits;
+
+static void
+on_usr1(int sig)
+{
+    (void)sig;
+    usr1_hits++;
+}
+
+static struct sockaddr_in
+inet(int port)
+{
+    struct sockaddr_in a;
+
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    return a;
+}
+
+/* Before the stack: what a ticket answers. */
+static void
+rules_tickets(int t)
+{
+    struct sockaddr_in a = inet(9100), got;
+    socklen_t len;
+    struct iovec iov;
+    char buf[8];
+    int v, on = 1, i, extra[FAST_TICKETS_MAX], n = 0;
+    struct stat st;
+
+    REQUIRE(t >= TICKET_BASE);
+    ok("ticket_range");
+
+    /* bind and listen are records; the name comes from the record. */
+    len = sizeof(got);
+    REQUIRE(getsockname(t, (struct sockaddr *)&got, &len) == 0 && got.sin_port == 0);
+    REQUIRE(bind(t, (struct sockaddr *)&a, sizeof(a)) == 0);
+    REQUIRE(listen(t, 511) == 0);
+    REQUIRE(listen(t, 128) == 0);
+    len = sizeof(got);
+    REQUIRE(getsockname(t, (struct sockaddr *)&got, &len) == 0);
+    REQUIRE(len == sizeof(got) && got.sin_family == AF_INET && got.sin_port == htons(9100));
+    len = 4;
+    REQUIRE(getsockname(t, (struct sockaddr *)&got, &len) == 0 && len == sizeof(got));
+    ok("ticket_name");
+
+    /* A ticket is no connection. */
+    REFUSED(read(t, buf, 1), ENOTCONN);
+    REFUSED(write(t, "x", 1), ENOTCONN);
+    REFUSED(recv(t, buf, 1, 0), ENOTCONN);
+    REFUSED(send(t, "x", 1, MSG_NOSIGNAL), ENOTCONN);
+    iov.iov_base = (void *)"x";
+    iov.iov_len = 1;
+    REFUSED(writev(t, &iov, 1), ENOTCONN);
+    REFUSED(shutdown(t, SHUT_RD), ENOTCONN);
+    len = sizeof(got);
+    REFUSED(getpeername(t, (struct sockaddr *)&got, &len), ENOTCONN);
+    ok("ticket_not_connected");
+
+    /* The options the stack will get are kept; the rest is refused. */
+    REQUIRE(setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) == 0);
+    REQUIRE(setsockopt(t, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) == 0);
+    REQUIRE(setsockopt(t, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == 0);
+    v = 0;
+    len = sizeof(v);
+    REQUIRE(getsockopt(t, SOL_SOCKET, SO_REUSEADDR, &v, &len) == 0 && v == 1 && len == 4);
+    v = 0;
+    REQUIRE(getsockopt(t, SOL_SOCKET, SO_TYPE, &v, &len) == 0 && v == SOCK_STREAM);
+    v = -1;
+    REQUIRE(getsockopt(t, SOL_SOCKET, SO_ERROR, &v, &len) == 0 && v == 0);
+    REFUSED(setsockopt(t, IPPROTO_TCP, TCP_CORK, &on, sizeof(on)), ENOPROTOOPT);
+    ok("ticket_options");
+
+    /* The address of a ticket is taken. */
+    {
+        int u = socket(AF_INET, SOCK_STREAM, 0), p = socket(AF_INET, SOCK_STREAM, 0);
+        int q = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in b = inet(9101);
+
+        REQUIRE(u >= TICKET_BASE && p >= TICKET_BASE && q >= TICKET_BASE);
+        REFUSED(bind(u, (struct sockaddr *)&a, sizeof(a)), EADDRINUSE);
+        REQUIRE(setsockopt(p, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) == 0);
+        REQUIRE(setsockopt(q, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) == 0);
+        REQUIRE(bind(p, (struct sockaddr *)&b, sizeof(b)) == 0);
+        REQUIRE(bind(q, (struct sockaddr *)&b, sizeof(b)) == 0);
+        REFUSED(bind(u, (struct sockaddr *)&b, sizeof(b)), EADDRINUSE);
+        REQUIRE(close(u) == 0 && close(p) == 0 && close(q) == 0);
+    }
+    ok("ticket_in_use");
+
+    /* The descriptor flags and the refusals of a ticket. */
+    REQUIRE((fcntl(t, F_GETFL) & O_NONBLOCK) != 0);
+    REQUIRE((fcntl(t, F_GETFD) & FD_CLOFORK) == 0 || 1);
+    REQUIRE(fcntl(t, F_SETFD, FD_CLOEXEC | FD_CLOFORK) == 0);
+    REQUIRE(fcntl(t, F_GETFD) == (FD_CLOEXEC | FD_CLOFORK));
+    REQUIRE(fcntl(t, F_SETFD, 0) == 0 && fcntl(t, F_GETFD) == 0);
+    REFUSED(fcntl(t, F_SETFL, 0), EINVAL);
+    REFUSED(fcntl(t, F_DUPFD, 0), EOPNOTSUPP);
+    REFUSED(dup(t), EOPNOTSUPP);
+    on = 0;
+    REFUSED(ioctl(t, FIONBIO, &on), EINVAL);
+    on = 1;
+    REQUIRE(ioctl(t, FIONBIO, &on) == 0);
+    v = 7;
+    REQUIRE(ioctl(t, FIONREAD, &v) == 0 && v == 0);
+    REQUIRE(fstat(t, &st) == 0 && S_ISSOCK(st.st_mode));
+    {
+        struct pollfd p;
+
+        p.fd = t;
+        p.events = POLLIN;
+        p.revents = 0;
+        REFUSED(poll(&p, 1, 0), EINVAL);
+    }
+    ok("ticket_flags");
+
+    /* Sixteen tickets, and a close gives one back, once. */
+    extra[n++] = t;
+    for (;;) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+        if (fd < 0) {
+            REQUIRE(errno == EMFILE);
+            break;
+        }
+        REQUIRE(n < FAST_TICKETS_MAX);
+        extra[n++] = fd;
+    }
+    REQUIRE(n == FAST_TICKETS_MAX);
+    REQUIRE(close(extra[5]) == 0);
+    REFUSED(close(extra[5]), EBADF);
+    extra[5] = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(extra[5] >= TICKET_BASE);
+    for (i = 1; i < n; i++)
+        REQUIRE(close(extra[i]) == 0);
+    ok("ticket_limit");
+}
+
+/* A child of the process that has tickets and no stack. */
+static void
+rules_fork(int t)
+{
+    pid_t pid;
+    int keep = socket(AF_INET, SOCK_STREAM, 0);
+    int go = socket(AF_INET, SOCK_STREAM | SOCK_CLOFORK, 0);
+    struct sockaddr_in a;
+    socklen_t len = sizeof(a);
+
+    REQUIRE(keep >= TICKET_BASE && go >= TICKET_BASE);
+    pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        /* The child has the tickets of the parent: the record with its
+         * address, and the one made with SOCK_CLOFORK closed. */
+        if (getsockname(t, (struct sockaddr *)&a, &len) != 0 || a.sin_port != htons(9100))
+            _exit(2);
+        if (getsockname(keep, (struct sockaddr *)&a, &len) != 0)
+            _exit(3);
+        if (close(go) != -1 || errno != EBADF)
+            _exit(4);
+        _exit(0);
+    }
+    REQUIRE(wait_child(pid) == 0);
+    REQUIRE(close(keep) == 0 && close(go) == 0);
+    ok("fork_before_stack");
+}
+
+/* UID 0 is checked at the claim: nobody's process cannot start the stack. */
+static void
+rules_nobody(int t)
+{
+    pid_t pid = fork();
+
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        struct epoll_event ev;
+        int e;
+
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        if (setuid(65534) != 0)
+            _exit(2);
+        e = epoll_create1(0);
+        if (e < 0)
+            _exit(3);
+        if (epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != -1 || errno != EPERM)
+            _exit(4);
+        /* The refusal is final: the same answer, no new claim. */
+        if (epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != -1 || errno != EPERM)
+            _exit(5);
+        _exit(0);
+    }
+    REQUIRE(wait_child(pid) == 0);
+    ok("nobody_refused");
+}
+
+/* The device is another process's: the claim waits for it, a signal in the
+ * pause runs its handler and the wait goes on (no EINTR from epoll_ctl). */
+static void
+rules_busy(int t)
+{
+    int held[2], ready[2];
+    pid_t holder, waiter;
+    char byte;
+
+    REQUIRE(pipe(held) == 0 && pipe(ready) == 0);
+    holder = fork();
+    REQUIRE(holder >= 0);
+    if (holder == 0) {
+        struct epoll_event ev;
+        struct timespec hold = { 2, 0 };
+        int e = epoll_create1(0);
+
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        if (e < 0 || epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != 0)
+            _exit(2);
+        if (write(held[1], "h", 1) != 1)
+            _exit(3);
+        nanosleep(&hold, NULL);
+        _exit(0);
+    }
+    REQUIRE(read(held[0], &byte, 1) == 1);
+    waiter = fork();
+    REQUIRE(waiter >= 0);
+    if (waiter == 0) {
+        struct sigaction sa;
+        struct epoll_event ev;
+        int e;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_usr1;
+        if (sigaction(SIGUSR1, &sa, NULL) != 0)
+            _exit(2);
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        e = epoll_create1(0);
+        if (e < 0 || write(ready[1], "r", 1) != 1)
+            _exit(3);
+        if (epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != 0)
+            _exit(errno == EINTR ? 4 : 5);
+        _exit(usr1_hits == 1 ? 0 : 6);
+    }
+    REQUIRE(read(ready[0], &byte, 1) == 1);
+    {
+        struct timespec pause = { 0, 600 * 1000 * 1000 };
+
+        nanosleep(&pause, NULL);
+    }
+    REQUIRE(kill(waiter, SIGUSR1) == 0);
+    REQUIRE(wait_child(waiter) == 0);
+    REQUIRE(wait_child(holder) == 0);
+    ok("claim_wait_signal");
+}
+
+/* The process that holds the stack. */
+static void
+rules_stack(int t)
+{
+    struct epoll_event ev;
+    struct sockaddr_in a = inet(9100), got;
+    socklen_t len = sizeof(got);
+    int c, s = -1, flag;
+    fd_set set;
+    uint64_t end;
+
+    epfd = epoll_create1(0);
+    REQUIRE(epfd >= 0);
+    /* The first record starts the stack and makes the socket of the
+     * ticket, bound and listening as the program left it. */
+    add(t, EPOLLIN, (void *)1);
+    REQUIRE(getsockname(t, (struct sockaddr *)&got, &len) == 0 && got.sin_port == htons(9100));
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(c >= FAST_BASE && c < TICKET_BASE);
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    errno = 0;
+    REQUIRE(connect(c, (struct sockaddr *)&a, sizeof(a)) == -1 && errno == EINPROGRESS);
+    end = now_ms() + 3000;
+    while (s < 0 && now_ms() < end) {
+        struct epoll_event out[4];
+        int n = wait_events(out, 4, 100), k;
+
+        for (k = 0; k < n; k++)
+            if (out[k].data.ptr == (void *)1)
+                s = accept4(t, NULL, NULL, 0);
+    }
+    REQUIRE(s >= FAST_BASE && s < TICKET_BASE);
+    ok("ticket_made");
+
+    REFUSED(fork(), EPERM);
+    REFUSED(execl("/bin/true", "true", (char *)NULL), EPERM);
+    REFUSED(dup(c), EOPNOTSUPP);
+    REFUSED(dup2(c, 5), EOPNOTSUPP);
+    REFUSED(fcntl(c, F_DUPFD, 0), EOPNOTSUPP);
+    REFUSED(dup(t), EOPNOTSUPP);
+    {
+        int pair[2];
+        struct msghdr m;
+        struct iovec v;
+        char control[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr *cm;
+        char byte = 'x';
+
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        memset(&m, 0, sizeof(m));
+        memset(control, 0, sizeof(control));
+        v.iov_base = &byte;
+        v.iov_len = 1;
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        m.msg_control = control;
+        m.msg_controllen = sizeof(control);
+        cm = CMSG_FIRSTHDR(&m);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cm), &t, sizeof(int));
+        errno = 0;
+        REQUIRE(sendmsg(pair[0], &m, 0) == -1 && errno == EOPNOTSUPP);
+    }
+    {
+        struct pollfd p;
+
+        p.fd = c;
+        p.events = POLLIN;
+        p.revents = 0;
+        REFUSED(poll(&p, 1, 0), EINVAL);
+    }
+    FD_ZERO(&set);
+    {
+        struct timeval zero = { 0, 0 };
+
+        REFUSED(select(c + 1, &set, NULL, NULL, &zero), EINVAL);
+    }
+    REFUSED(fcntl(c, F_SETFL, 0), EINVAL);
+    flag = 0;
+    REFUSED(ioctl(c, FIONBIO, &flag), EINVAL);
+    REFUSED(accept(t, NULL, NULL), EAGAIN);
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | EPOLLEXCLUSIVE;
+    REFUSED(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev), EINVAL);
+    /* A new socket is a socket of the stack now, no ticket. */
+    flag = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(flag >= FAST_BASE && flag < TICKET_BASE);
+    ok("stack_rules");
+}
+
+static void
+rules_mode(void)
+{
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+
+    rules_tickets(t);
+    rules_fork(t);
+    rules_nobody(t);
+    rules_busy(t);
+    rules_stack(t);
+    printf("fast-layer: rules passed\n");
+    fflush(stdout);
+}
+
+/* ------------------------------------------------------------- the loss */
+
+/* Serves the echo until "?crash": the network service ends; the layer ends
+ * the process with 2 (STAFETO_FAST_EXIT_ON_LOSS). A loop that reaches the
+ * ENETDOWN the layer gives without the flag ends with 3. */
+static void
+loss_mode(void)
+{
+    struct epoll_event ev[8];
+    int clients[8], nclients = 0;
+    int l = tcp_socket(ECHO_PORT, 16);
+
+    epfd = epoll_create1(0);
+    REQUIRE(epfd >= 0);
+    add(l, EPOLLIN, (void *)1);
+    printf("fast-layer: loss serving\n");
+    fflush(stdout);
+    for (;;) {
+        int n = epoll_wait(epfd, ev, 8, -1), k;
+
+        if (n < 0) {
+            if (errno == ENETDOWN) {
+                printf("fast-layer: epoll_wait gave ENETDOWN\n");
+                fflush(stdout);
+                _exit(3);
+            }
+            continue;
+        }
+        for (k = 0; k < n; k++) {
+            uintptr_t who = (uintptr_t)ev[k].data.ptr;
+
+            if (who == 1) {
+                int fd = accept4(l, NULL, NULL, 0);
+
+                if (fd >= 0 && nclients < 8) {
+                    clients[nclients] = fd;
+                    add(fd, EPOLLIN, (void *)(uintptr_t)(10 + nclients));
+                    nclients++;
+                }
+            } else {
+                int fd = clients[who - 10];
+                char buf[64];
+                ssize_t got = recv(fd, buf, sizeof(buf), 0);
+
+                if (got >= 6 && memcmp(buf, "?crash", 6) == 0) {
+                    /* The service faults inside the call: its answer is a
+                     * closed peer, whatever the number. */
+                    int sent = stafeto_fast_probe_crash();
+
+                    printf("fast-layer: crash sent %d\n", sent);
+                    fflush(stdout);
+                } else if (got > 0) {
+                    REQUIRE(send(fd, buf, (size_t)got, MSG_NOSIGNAL) == got);
+                }
+            }
+        }
+    }
+}
+
 int
 main(int argc, char **argv)
 {
     unsigned i;
 
-    (void)argc;
-    (void)argv;
+    if (argc > 1 && strcmp(argv[1], "--fork") == 0) {
+        fork_mode();
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--loss") == 0) {
+        loss_mode();
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--rules") == 0) {
+        rules_mode();
+        return 0;
+    }
     for (i = 0; i < PAGE_BYTES; i++)
         page[i] = page_byte(i);
     head_len = snprintf(head, sizeof(head),
