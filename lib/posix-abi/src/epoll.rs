@@ -1077,6 +1077,12 @@ impl Sharing {
     ) -> Result<usize, i32> {
         flush(id)?;
         let mut fresh = gather(id)?;
+        // The service gives pairs it takes off its lists for good: it is
+        // asked for no more than fit, and a place is kept for the other
+        // descriptors when there are any, so that sockets never crowd them
+        // out.
+        let reserve = usize::from(fresh.len > 0 && out.len() > 1);
+        let most = (out.len() - reserve).min(wire::EPOLL_MOST);
         let kept = self.built
             && self
                 .gathered
@@ -1084,15 +1090,10 @@ impl Sharing {
                 .is_some_and(|old| same_records(old, &fresh));
         if !kept {
             self.end()?;
-            // The service gives pairs it takes off its lists for good: it is
-            // asked for no more than fit, and a place is kept for the other
-            // descriptors when there are any, so that sockets never crowd
-            // them out. A wait on the service's set only when sockets of the
+            // A wait on the service's set only when sockets of the
             // service are in the instance: with none there is nothing to
             // wait for there, and a socket another thread adds is seen at
             // the next turn.
-            let reserve = usize::from(fresh.len > 0 && out.len() > 1);
-            let most = (out.len() - reserve).min(wire::EPOLL_MOST);
             if fresh.nets && fresh.set == 0 {
                 fresh.set = ensure_set(id).unwrap_or(0);
             }
@@ -1108,6 +1109,10 @@ impl Sharing {
         };
         if let Some(net) = self.net.as_mut() {
             net.ready = EpollReady::EMPTY;
+            // The room of this turn (the turn that checks the records once a
+            // tick has less than the turn that sleeps): the service must
+            // not take more pairs off its list than fit.
+            net.fit(most as u32)?;
         }
         let ran = watching.turn(until, handled, wake, self.net.as_mut());
         // What the service gave is kept for the error exits, which put it back.

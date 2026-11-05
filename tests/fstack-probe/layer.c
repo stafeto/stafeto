@@ -37,6 +37,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <stdint.h>
@@ -65,6 +66,37 @@
 
 void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *pass_count);
 extern int stafeto_fast_probe_crash(void);
+extern unsigned long long stafeto_probe_watch_builds(void);
+
+/* The depth of the main stack: the area below main's frame is painted before
+ * anything runs, and the deepest byte that changed tells how far the stack
+ * of FreeBSD, the layer and the signal handlers went. */
+#define STACK_PAINT (768 * 1024)
+static unsigned char *paint_lo, *paint_hi;
+
+static void __attribute__((noinline))
+paint_stack(void)
+{
+    volatile unsigned char area[STACK_PAINT];
+    size_t i;
+
+    for (i = 0; i < sizeof(area); i++)
+        area[i] = 0xa5;
+    paint_lo = (unsigned char *)area;
+    paint_hi = paint_lo + sizeof(area);
+}
+
+static void
+report_stack(void)
+{
+    unsigned char *p = paint_lo;
+
+    while (p < paint_hi && *p == 0xa5)
+        p++;
+    printf("fast-layer: stack used %lu of %lu painted bytes\n", (unsigned long)(paint_hi - p),
+        (unsigned long)STACK_PAINT);
+    fflush(stdout);
+}
 
 static int epfd = -1;
 static int mixed[2];
@@ -1090,6 +1122,13 @@ rules_stack(int t)
     fd_set set;
     uint64_t end;
 
+    int bad = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in away = inet(9300);
+
+    /* A ticket on the address of the first device, which the stack does not
+     * have: the stack refuses to make its socket. */
+    away.sin_addr.s_addr = htonl(0x0a00020f);
+    REQUIRE(bad >= TICKET_BASE && bind(bad, (struct sockaddr *)&away, sizeof(away)) == 0);
     epfd = epoll_create1(0);
     REQUIRE(epfd >= 0);
     /* The first record starts the stack and makes the socket of the
@@ -1112,6 +1151,15 @@ rules_stack(int t)
     }
     REQUIRE(s >= FAST_BASE && s < TICKET_BASE);
     ok("ticket_made");
+
+    /* The refused ticket answers its errno, and its number still closes. */
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    REFUSED(epoll_ctl(epfd, EPOLL_CTL_ADD, bad, &ev), EADDRNOTAVAIL);
+    REFUSED(read(bad, &flag, 1), EADDRNOTAVAIL);
+    REQUIRE(close(bad) == 0);
+    REFUSED(close(bad), EBADF);
+    ok("ticket_refused");
 
     REFUSED(fork(), EPERM);
     REFUSED(execl("/bin/true", "true", (char *)NULL), EPERM);
@@ -1171,6 +1219,93 @@ rules_stack(int t)
     ok("stack_rules");
 }
 
+/* The subscriptions of the loop are built once for a call and again when the
+ * records change (stafeto_probe_watch_builds counts the builds). */
+static int watch_epfd, watch_pipe[2];
+static volatile uint64_t watch_written;
+
+static void *
+watch_thread(void *arg)
+{
+    struct epoll_event ev;
+    struct timespec nap = { 0, 100 * 1000 * 1000 };
+
+    (void)arg;
+    nanosleep(&nap, NULL);
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.ptr = (void *)9;
+    if (epoll_ctl(watch_epfd, EPOLL_CTL_ADD, watch_pipe[0], &ev) != 0)
+        _exit(2);
+    watch_written = now_ms();
+    if (write(watch_pipe[1], "w", 1) != 1)
+        _exit(3);
+    return NULL;
+}
+
+static void
+rules_watch(int t)
+{
+    struct epoll_event ev, out[8];
+    int quiet[2], n, i;
+    uint64_t before, started, calls = 0, elapsed;
+    pthread_t thread;
+    struct sockaddr_in a = inet(9100);
+
+    watch_epfd = epoll_create1(0);
+    REQUIRE(watch_epfd >= 0 && pipe(quiet) == 0 && pipe(watch_pipe) == 0);
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.ptr = (void *)1;
+    REQUIRE(epoll_ctl(watch_epfd, EPOLL_CTL_ADD, t, &ev) == 0);
+    ev.data.ptr = (void *)2;
+    REQUIRE(epoll_ctl(watch_epfd, EPOLL_CTL_ADD, quiet[0], &ev) == 0);
+
+    /* One call that sleeps for 300 ms builds the wait once. */
+    before = stafeto_probe_watch_builds();
+    REQUIRE(epoll_wait(watch_epfd, out, 8, 300) == 0);
+    REQUIRE(stafeto_probe_watch_builds() - before == 1);
+
+    /* A record another thread adds is built in at the next tick, and the
+     * write that follows ends the call within 20 ms: two builds. */
+    before = stafeto_probe_watch_builds();
+    REQUIRE(pthread_create(&thread, NULL, watch_thread, NULL) == 0);
+    n = epoll_wait(watch_epfd, out, 8, 3000);
+    started = now_ms();
+    REQUIRE(n == 1 && out[0].data.ptr == (void *)9);
+    REQUIRE(watch_written != 0 && started - watch_written <= 20);
+    REQUIRE(pthread_join(thread, NULL) == 0);
+    REQUIRE(stafeto_probe_watch_builds() - before == 2);
+    {
+        char byte;
+
+        REQUIRE(read(watch_pipe[0], &byte, 1) == 1);
+    }
+
+    /* Under load, with events in each call: no more builds than ticks. */
+    a.sin_addr.s_addr = htonl(0x7f000001);
+    before = stafeto_probe_watch_builds();
+    started = now_ms();
+    for (i = 0; i < 50; i++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0), s, got;
+
+        REQUIRE(c >= FAST_BASE);
+        errno = 0;
+        REQUIRE(connect(c, (struct sockaddr *)&a, sizeof(a)) == -1 && errno == EINPROGRESS);
+        got = epoll_wait(watch_epfd, out, 8, 3000);
+        calls++;
+        REQUIRE(got >= 1);
+        s = accept(t, NULL, NULL);
+        if (s >= 0)
+            close(s);
+        close(c);
+    }
+    elapsed = now_ms() - started;
+    REQUIRE(stafeto_probe_watch_builds() - before <= calls);
+    REQUIRE(stafeto_probe_watch_builds() - before <= elapsed / 10 + 2);
+    ok("watch_builds");
+}
+
 static void
 rules_mode(void)
 {
@@ -1181,6 +1316,7 @@ rules_mode(void)
     rules_nobody(t);
     rules_busy(t);
     rules_stack(t);
+    rules_watch(t);
     printf("fast-layer: rules passed\n");
     fflush(stdout);
 }
@@ -1258,15 +1394,19 @@ main(int argc, char **argv)
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "--rules") == 0) {
+        paint_stack();
         rules_mode();
+        report_stack();
         return 0;
     }
     for (i = 0; i < PAGE_BYTES; i++)
         page[i] = page_byte(i);
     head_len = snprintf(head, sizeof(head),
         "HTTP/1.1 200 OK\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", PAGE_BYTES);
+    paint_stack();
     check_calls();
     serve();
+    report_stack();
     printf("fast-layer: ended\n");
     fflush(stdout);
     return 0;

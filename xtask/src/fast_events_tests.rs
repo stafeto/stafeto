@@ -561,3 +561,56 @@ fn the_loop_keeps_its_subscriptions_for_the_call() {
     assert!(turn.contains("same_records(old, &fresh)"));
     assert!(turn.contains(".build(&fresh.items"));
 }
+
+/// The wait on the service's set asks for what the turn has room for.
+#[test]
+fn each_turn_fits_the_pairs_of_the_service_to_its_room() {
+    let epoll = text("lib/posix-abi/src/epoll.rs");
+    let turn = body(&epoll, "fn turn(");
+    let fit = turn.find("net.fit(most as u32)").expect("fit");
+    let run = turn.find("watching.turn(").expect("turn");
+    assert!(fit < run);
+    let wait = text("lib/posix-abi/src/wait.rs");
+    let fits = body(&wait, "pub fn fit(");
+    // A started operation that asks for more than the room is cancelled.
+    assert!(fits.contains("most < self.most") && fits.contains("self.cancel()"));
+}
+
+/// The close of a ticket frees the entry whatever the stack made of it.
+#[test]
+fn a_ticket_the_stack_refused_still_closes() {
+    let source = text("lib/posix-abi/src/fastnet.rs");
+    let close = body(&source, "pub fn close(fd: i32)");
+    let ticket = close.find("Number::Ticket(i)").expect("ticket branch");
+    let route = close.find("route(").unwrap_or(usize::MAX);
+    assert!(ticket < route, "the ticket branch asks the route first");
+    assert!(close.contains("tickets(|t| t.close(i))"));
+    assert!(!close.contains("number(fd)?;\n    // SAFETY: the table's function.\n    let closed"));
+}
+
+/// Both hangs of the lazy start are closed.
+#[test]
+fn the_start_marks_its_thread_in_one_step_and_a_fork_clears_it() {
+    let source = text("lib/posix-abi/src/fastnet.rs");
+    let start = body(&source, "pub fn ensure_stack()");
+    let enter = start.find("posix_sync::enter()").expect("enter");
+    let swap = start.find("compare_exchange(0, 1").expect("exchange");
+    let mark = start.find("STARTER.store(own_channel()").expect("mark");
+    let leave = start.find("posix_sync::leave()").expect("leave");
+    assert!(enter < swap && swap < mark && mark < leave);
+    let fork = body(&source, "pub fn after_fork()");
+    assert!(fork.contains("compare_exchange(1, 0"));
+    assert!(fork.contains("STARTER.store(0"));
+}
+
+/// The probe counts the builds of the loop's waits, and the layer exports it.
+#[test]
+fn the_builds_of_the_waits_are_counted_for_the_probe() {
+    let wait = text("lib/posix-abi/src/wait.rs");
+    assert!(body(&wait, "pub(crate) fn build(").contains("BUILDS.fetch_add"));
+    let platform = text("lib/posix-platform/src/lib.rs");
+    assert!(platform.contains("pub extern \"C\" fn stafeto_probe_watch_builds()"));
+    let probe = text("tests/fstack-probe/layer.c");
+    assert!(probe.contains("stafeto_probe_watch_builds() - before == 1"));
+    assert!(probe.contains("stafeto_probe_watch_builds() - before == 2"));
+}

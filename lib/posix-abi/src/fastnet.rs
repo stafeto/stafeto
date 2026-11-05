@@ -241,7 +241,16 @@ fn own_channel() -> u64 {
 pub fn ensure_stack() -> Result<(), i32> {
     let t = table().ok_or(EBADF)?;
     loop {
-        match STACK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        // The exchange and the mark of the starting thread are one step for
+        // a handler of this thread: the entries of signals wait in a
+        // critical section, so a handler never sees "starting" with no mark.
+        posix_sync::enter();
+        let swapped = STACK.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        if swapped.is_ok() {
+            STARTER.store(own_channel(), Ordering::Release);
+        }
+        posix_sync::leave();
+        match swapped {
             Ok(_) => break,
             Err(2) => return Ok(()),
             Err(3) => return Err(REFUSED.load(Ordering::Acquire)),
@@ -253,7 +262,6 @@ pub fn ensure_stack() -> Result<(), i32> {
             }
         }
     }
-    STARTER.store(own_channel(), Ordering::Release);
     // SAFETY: a `FastClaim` is plain numbers.
     let mut claim: FastClaim = unsafe { core::mem::zeroed() };
     let started = match fast::claim_steady(&mut claim, 0) {
@@ -747,25 +755,42 @@ pub fn sockatmark(fd: i32) -> Result<i32, i32> {
 }
 
 pub fn close(fd: i32) -> Result<(), i32> {
-    let ticket = match classify(fd) {
-        Some(Number::Ticket(i)) => Some(i as usize),
-        _ => None,
-    };
-    with_route(
-        fd,
-        |n| {
-            // SAFETY: the table's function.
-            let closed = count(|t| unsafe { (t.close)(n) as isize }).map(drop);
-            if let Some(i) = ticket {
-                tickets(|t| t.close(i));
+    // A ticket closes whatever became of it: the entry is freed, and the
+    // socket of the stack, if the stack made one, closes (a ticket the stack
+    // refused has none, and its number still closes with 0, as any open
+    // number does).
+    if let Some(Number::Ticket(i)) = classify(fd) {
+        let i = i as usize;
+        if !registered() {
+            return Err(EBADF);
+        }
+        loop {
+            let (used, socket) = tickets(|t| (t.slots[i].used, t.slots[i].socket));
+            if !used {
+                return Err(EBADF);
             }
-            closed
-        },
-        |tickets, i| {
-            tickets.close(i);
-            Ok(())
-        },
-    )
+            if !up() {
+                if let Some(done) = on_ticket(|t| {
+                    t.close(i);
+                    Ok(())
+                }) {
+                    return done;
+                }
+                continue;
+            }
+            // SAFETY: the table's function.
+            let closed = if socket >= 0 {
+                count(|t| unsafe { (t.close)(socket) as isize }).map(drop)
+            } else {
+                Ok(())
+            };
+            tickets(|t| t.close(i));
+            return closed;
+        }
+    }
+    let n = number(fd)?;
+    // SAFETY: the table's function.
+    count(|t| unsafe { (t.close)(n) as isize }).map(drop)
 }
 
 pub fn read(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
@@ -804,6 +829,10 @@ pub unsafe fn writev(fd: i32, iov: *const IoVec, count_: i32) -> Result<usize, i
 pub fn after_fork() {
     if registered() {
         tickets(|t| t.after_fork());
+        // The thread that was starting the stack is not in the child: a
+        // start the parent had begun is the child's to make.
+        let _ = STACK.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+        STARTER.store(0, Ordering::Release);
     }
 }
 

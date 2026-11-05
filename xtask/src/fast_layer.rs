@@ -94,7 +94,9 @@ pub const RULES: &[&str] = &[
     "nobody_refused",
     "claim_wait_signal",
     "ticket_made",
+    "ticket_refused",
     "stack_rules",
+    "watch_builds",
 ];
 
 /// The client of the second listener must not be refused, and every client
@@ -569,6 +571,26 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
     talked?;
+    // The deepest use of the main stack (1 MiB, 768 KiB of it painted), in
+    // the main run and in `--rules`.
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.contains("fast-layer: stack used"))
+    {
+        let used = line
+            .split("stack used ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| format!("no number in {line:?}"))?;
+        if used >= 768 * 1024 {
+            return Err(format!(
+                "the main stack went through its painted area: {line}"
+            ));
+        }
+        notes.push(format!("main stack used {used} bytes"));
+    }
     // The service faulted once, on purpose, and no other process.
     let faults = output
         .lines
@@ -636,6 +658,7 @@ mod tests {
             "ticks=%llu passes=%llu",
             "?mix",
             "?crash",
+            "fast-layer: stack used",
             "fast-layer: loss serving",
             "fast-layer: crash sent",
             "?unmix",

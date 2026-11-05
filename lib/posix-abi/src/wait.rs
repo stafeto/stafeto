@@ -23,6 +23,14 @@ const LIMIT: usize = MAX;
 const _: () = assert!(LIMIT >= watch::MAX && LIMIT <= 256);
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
+/// How many waits were built (`Watching::build`), for the probes: the loop of
+/// `epoll_pwait` builds one for a call and again when its records change.
+static BUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of waits built so far in this process.
+pub fn probe_watch_builds() -> u64 {
+    BUILDS.load(Ordering::Relaxed)
+}
 const TAG: u64 = 1 << 63;
 
 /// The absolute counter deadline, taken from the invocation's start.
@@ -402,6 +410,21 @@ impl NetWait {
         }
     }
 
+    /// The most pairs a take may give is `most`: an operation that waits
+    /// for more than the room of this turn would take pairs off the
+    /// service's list for good and have no place to put them, so it is
+    /// cancelled (it loses none) and the next start asks for fewer.
+    pub fn fit(&mut self, most: u32) -> Result<(), i32> {
+        if self.key != 0 && most < self.most {
+            self.cancel()?;
+            self.armed = false;
+        }
+        if self.key == 0 || most < self.most {
+            self.most = most;
+        }
+        Ok(())
+    }
+
     fn wait_request(&self, key: Option<u64>, flags: u32) -> proto_net::sockets::Request<'static> {
         proto_net::sockets::Request::EpollWait {
             key,
@@ -593,6 +616,7 @@ impl Watching {
         if items.len() > LIMIT {
             return Err(EINVAL);
         }
+        BUILDS.fetch_add(1, Ordering::Relaxed);
         let id = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 n.checked_add(1).filter(|next| *next < TAG >> 4)
