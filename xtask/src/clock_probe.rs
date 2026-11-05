@@ -3,7 +3,8 @@
 
 //! The probe of the time in the ash dialog (#380): `date` shows the time of
 //! the host, and the files of the image have the time of the build that the
-//! table of the image carries (`date -r`).
+//! table of the image carries and those of a package the time of its
+//! package file (`date -r`).
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +27,25 @@ pub fn image_time(path: &Path) -> Result<u64, String> {
     let table = bootimg::rootfs::Rootfs::parse(table.data, image.count())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(table.time())
+}
+
+/// The time of the table of the package `name` that the boot image at
+/// `path` holds as a layer: the date of the files of the package.
+pub fn layer_time(path: &Path, name: &str) -> Result<u64, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    for file in image.files().filter(|f| f.name.ends_with(".stpkg")) {
+        let package =
+            pkgfmt::Package::parse(file.data).map_err(|e| format!("{}: {e}", file.name))?;
+        if package.meta.name == name {
+            return Ok(package.rootfs.time());
+        }
+    }
+    Err(format!(
+        "{}: no layer of the package {name}",
+        path.display()
+    ))
 }
 
 /// How long before the run the dialog's image is dated: the files of the
@@ -72,7 +92,12 @@ pub fn check(run: &mut qemu::Run, image: &Path) -> Result<(), String> {
         ));
     }
     run.expect("# ", DIALOG_STEP)?;
-    for path in ["/bin/busybox", "/etc/passwd"] {
+    // The files of the table have the time of the table, those of a package
+    // the time of its own.
+    for (path, built) in [
+        ("/bin/busybox", layer_time(image, "busybox")?),
+        ("/etc/passwd", built),
+    ] {
         let command = format!("date -r {path} +%s");
         run.send(&command)?;
         run.expect(&command, DIALOG_STEP)?;

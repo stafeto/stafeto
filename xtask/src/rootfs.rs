@@ -1902,6 +1902,13 @@ pub fn set_build_time(seconds: u64) {
 /// The time the files of an image get: SOURCE_DATE_EPOCH when it is set
 /// (seconds since the epoch, so that a build repeats), else the time of the
 /// build.
+pub fn fixed_build_time() -> Option<u64> {
+    match BUILD_TIME.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        seconds => Some(seconds),
+    }
+}
+
 pub fn build_time() -> Result<u64, String> {
     let fixed = BUILD_TIME.load(std::sync::atomic::Ordering::Relaxed);
     if fixed != 0 {

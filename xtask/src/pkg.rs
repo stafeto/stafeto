@@ -78,8 +78,13 @@ pub fn series() -> String {
 }
 
 /// The time of the tables of the packages and the sources of the archives:
+/// the time a run has fixed for its images (`rootfs::set_build_time`), else
 /// SOURCE_DATE_EPOCH, else the time of the commit.
 fn table_time() -> Result<u64, String> {
+    // A run that dates its images back dates the packages the same.
+    if let Some(fixed) = rootfs::fixed_build_time() {
+        return Ok(fixed);
+    }
     if let Ok(text) = std::env::var("SOURCE_DATE_EPOCH") {
         return text
             .trim()
