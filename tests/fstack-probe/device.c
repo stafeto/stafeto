@@ -14,6 +14,7 @@
  *            layer's counters as `key=value` words, `?stop` ends the program
  *   TCP 80   any request (up to the empty line) gets the page: a head and
  *            1 MiB of a fixed pattern (page_byte), then the connection closes
+ *            (`?release` closes the connections `hold` keeps)
  *
  * `fstack-probe device flood` first puts 16 frames of DHCP in the bypass
  * ring at once (the bound of the network service's step).
@@ -194,6 +195,19 @@ serve_udp(void)
             if (len > (int)sizeof(text) - 1)
                 len = (int)sizeof(text) - 1;
             ff_sendto(udp_fd, text, (size_t)len, 0, (struct linux_sockaddr *)&from, flen);
+            continue;
+        }
+        if (got == 8 && memcmp(buf, "?release", 8) == 0) {
+            /* The held connections close: the stack frees their queues, and
+             * the buffers of the device go back to the pool. */
+            int i;
+
+            for (i = 0; i < held_count; i++)
+                ff_close(held[i]);
+            printf("fstack-probe: released %d connections\n", held_count);
+            fflush(stdout);
+            held_count = 0;
+            ff_sendto(udp_fd, "released", 8, 0, (struct linux_sockaddr *)&from, flen);
             continue;
         }
         if (got == 5 && memcmp(buf, "?stop", 5) == 0) {

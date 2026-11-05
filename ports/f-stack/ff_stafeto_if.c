@@ -49,6 +49,7 @@
 #include "ff_api.h"
 #include "ff_config.h"
 #include "ff_dpdk_if.h"
+#include "ff_errno.h"
 #include "ff_host_interface.h"
 #include "ff_stafeto.h"
 #include "ff_stafeto_rte.h"
@@ -100,6 +101,9 @@ static int dev_on;
 static int dev_lost;
 static struct ff_dpdk_if_context *dev_ctx;
 static uint32_t notified;
+/* The service let go of its notifications (STAFETO_FAST_GONE): from then on
+ * every pass asks the device whether it is still the program's. */
+static int service_gone;
 static int tx_batch;
 static int tx_stalled;
 static int bypass_batch;
@@ -204,11 +208,18 @@ take_notifications(void)
 {
     uint32_t bits;
 
+    /* The service ends before init resets the device: the bit is kept until
+     * the reset shows. */
+    if (service_gone && vnet_lost())
+        dev_lost = 1;
     if (__atomic_load_n(&notified, __ATOMIC_RELAXED) == 0)
         return;
     bits = __atomic_exchange_n(&notified, 0, __ATOMIC_RELAXED);
-    if ((bits & STAFETO_FAST_GONE) && vnet_lost())
-        dev_lost = 1;
+    if (bits & STAFETO_FAST_GONE) {
+        service_gone = 1;
+        if (vnet_lost())
+            dev_lost = 1;
+    }
     if (bits & STAFETO_FAST_ADDRESS) {
         struct stafeto_fast_config c;
 
@@ -392,8 +403,17 @@ tx_queue(uint32_t buf, uint32_t len)
     return 0;
 }
 
-/* The frame of the stack (a chain of mbufs) is copied once into a buffer
- * of the pool, and the mbufs are freed. */
+/*
+ * The frame of the stack (a chain of mbufs) is copied once into a buffer
+ * of the pool, and the mbufs are freed. The answer goes up through
+ * if_transmit to tcp_output, which reads it as FreeBSD's errno: 0 for a
+ * frame sent; ENOBUFS for a frame lost to a full queue (TCP takes its
+ * sequence back and shrinks the window); ENETDOWN for a device that is
+ * gone (a soft error of the socket); EMSGSIZE for a frame past the MTU. A
+ * negative answer is ERESTART there, and the wrapper of tcp_output
+ * (tcp_var.h) takes any negative answer as a request to drop the
+ * connection with a reset: it must never come back.
+ */
 int
 ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
 {
@@ -401,27 +421,26 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     uint32_t buf;
     uint8_t *to;
     void *cur;
-    int off = 0;
+    int off = 0, sent;
 
     if (!dev_on || ctx != dev_ctx || dev_lost) {
         /* No device to send on: the frame is dropped and counted. */
         tx_dropped++;
         ff_mbuf_free(m);
-        return dev_on ? -1 : 0;
+        return dev_on ? ff_ENETDOWN : 0;
     }
     began = counter();
     if (total <= 0 || total > FF_STAFETO_FRAME_MAX) {
         stats.tx_long++;
         ff_mbuf_free(m);
-        return -1;
+        return ff_EMSGSIZE;
     }
     buf = vnet_buf_take();
     if (buf == VNET_NONE) {
-        /* A wire that lost the frame: the stack's TCP sends it again, and
-         * an error here would reach its sockets. */
+        /* No buffer: the frame is lost, and TCP sends it again. */
         stats.tx_no_buffer++;
         ff_mbuf_free(m);
-        return 0;
+        return ff_ENOBUFS;
     }
     to = vnet_buf_ptr(buf);
     cur = m;
@@ -437,9 +456,9 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     }
     ff_mbuf_free(m);
     /* A queue that stays full loses the frame the same way. */
-    (void)tx_queue(buf, (uint32_t)off);
+    sent = tx_queue(buf, (uint32_t)off);
     stats.tx_send_ticks += counter() - began;
-    return 0;
+    return sent == 0 ? 0 : ff_ENOBUFS;
 }
 
 /* A buffer of the pool, or a block of the copy path, is free: the tag in
@@ -483,7 +502,8 @@ bypass_kick(void)
 static int
 dhcp_for_service(const uint8_t *f, unsigned header)
 {
-    return header != 0 && f[ETH + 9] == 17 && be16(f + ETH + header) == 67 &&
+    return header != 0 && be16(f + ETH + 2) >= header + 8 && f[ETH + 9] == 17 &&
+        be16(f + ETH + header) == 67 &&
         be16(f + ETH + header + 2) == 68;
 }
 
@@ -600,7 +620,8 @@ from_service(void)
         }
         header = ipv4(f, (uint32_t)len);
         arp = f[12] == 0x08 && f[13] == 0x06;
-        dhcp = header != 0 && f[ETH + 9] == 17 && be16(f + ETH + header) == 68 &&
+        dhcp = header != 0 && be16(f + ETH + 2) >= header + 8 && f[ETH + 9] == 17 &&
+            be16(f + ETH + header) == 68 &&
             be16(f + ETH + header + 2) == 67;
         if (!arp && !dhcp) {
             stats.tx_foreign++;

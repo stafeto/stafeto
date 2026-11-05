@@ -61,6 +61,9 @@ const PAGE_BYTES: usize = 1 << 20;
 const HOLD_CONNECTIONS: usize = 500;
 const HOLD_SEGMENTS: usize = 20;
 const HOLD_BYTES: usize = 200;
+/// The buffers free once the held connections are closed: the pool of 8 192
+/// less the two queues of 256 and a margin for frames the stack still holds.
+const POOL_FREE_MIN: u64 = 8192 - 2 * 256 - 64;
 /// The most the median of the echo after a pause may take: a tenth of the
 /// stack's clock tick and a little over the times the probe sees (0.1 to
 /// 1.1 ms on TCG and HVF).
@@ -498,6 +501,40 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
             if get("no_mbuf") != 0 {
                 return Err(format!("frames lost to the stack's memory: {stats:?}"));
             }
+            if get("accepted") != HOLD_CONNECTIONS as u64 {
+                return Err(format!(
+                    "{} connections were accepted, wanted {HOLD_CONNECTIONS}: {stats:?}",
+                    get("accepted")
+                ));
+            }
+            // The held connections close: their buffers all come back to the
+            // pool, but for the two queues of the device.
+            let mut got = vec![0u8; 64];
+            // The closing of 500 connections may take longer than the read
+            // timeout; the command is the same again.
+            let mut released = false;
+            for _ in 0..5 {
+                udp.send(b"?release")
+                    .map_err(|e| format!("?release: {e}"))?;
+                if udp.recv(&mut got).is_ok() {
+                    released = true;
+                    break;
+                }
+            }
+            if !released {
+                return Err("no answer to ?release".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let stats = stats_of(&udp)?;
+            let free = stat(&stats, "free_now");
+            if free < POOL_FREE_MIN {
+                return Err(format!(
+                    "after the held connections closed {free} buffers are free, wanted {POOL_FREE_MIN}: {stats:?}"
+                ));
+            }
+            notes.push(format!(
+                "after the release {free} of 8 192 buffers are free"
+            ));
             udp.send(b"?stop").map_err(|e| format!("?stop: {e}"))?;
             expect_all(&mut run, &["fstack-probe: device ended", back], within)?;
         }

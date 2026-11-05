@@ -37,8 +37,8 @@ uint64_t ff_stafeto_next_tick_ns(void);
  * Idle until the work is back: at most `max_ns` and not past the next clock
  * tick. With a device it turns the device's interrupts on, steps the stack
  * once more (a frame that came in between brings no interrupt) and waits
- * for the network service's notification. Gives 1 when it found work
- * instead of waiting, else 0.
+ * for the network service's notification. Gives 1 when the second look found
+ * work and it did not wait, else 0.
  */
 int ff_stafeto_sleep(uint64_t max_ns);
 

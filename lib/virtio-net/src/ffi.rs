@@ -460,6 +460,13 @@ pub extern "C" fn vnet_tx_reclaim() -> c_int {
 pub extern "C" fn vnet_notify(on: c_int) {
     if let Some(s) = state() {
         s.rx.set_dev_notify(on != 0);
+        if on != 0 {
+            // A full barrier between the flag and the next look at the used
+            // index (Virtio 1.2, 2.7.10): the flag store is a release and
+            // the look an acquire, which AArch64 may reorder past each
+            // other without it.
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
     }
 }
 
