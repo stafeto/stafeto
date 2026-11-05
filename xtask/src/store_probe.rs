@@ -94,11 +94,22 @@ const PROGRAMS_CRASH: [ImageProgram; 10] = programs(false, true);
 
 pub fn command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        None => disk().and_then(|()| empty()).and_then(|()| full(false)),
+        None => disk()
+            .and_then(|()| empty())
+            .and_then(|()| full(false))
+            .and_then(|()| deaf()),
         Some("steps") => steps(),
         Some("full") => full(false),
+        Some("deaf") => deaf(),
         Some("full-steps") => full(true),
-        Some("doom") => doom(),
+        Some("doom") => match args.get(1).map(String::as_str) {
+            None => doom(&qemu::VIRT),
+            Some("--hvf") => {
+                crate::hvf_host()?;
+                doom(&qemu::HVF_V2)
+            }
+            Some(other) => Err(format!("store-probe doom: unknown argument {other}")),
+        },
         Some(other) => Err(format!("store-probe: unknown argument {other}")),
     }
 }
@@ -493,8 +504,18 @@ pub fn write_disk(
 
 /// Runs the machine until the probe ends: the lines of its output.
 fn run(image: &Path, disk: &Path, steps: bool) -> Result<Vec<String>, String> {
+    run_on(&qemu::VIRT, image, disk, steps)
+}
+
+/// `run` on `machine`.
+fn run_on(
+    machine: &qemu::Machine,
+    image: &Path,
+    disk: &Path,
+    steps: bool,
+) -> Result<Vec<String>, String> {
     let kernel = build(Variant::Normal)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(image));
+    let mut cmd = qemu::command(machine, &kernel.image, Some(image));
     cmd.args(qemu::HEADLESS).args(qemu::store(disk, None));
     if steps {
         cmd.args(qemu::ICOUNT);
@@ -548,6 +569,7 @@ fn disk_lines(layout: &host::Layout) -> Vec<String> {
         "store-probe: broken and revoked are not in the tree",
         "store-probe: hello runs from its layer, exit code 42",
         "store-probe: clone, a second buffer and an unknown key are refused as they should be",
+        "store-probe: buffers: two places for any session, a third is BUSY, the superuser's session still has one",
         "store-probe: ok",
     ]
     .map(String::from)
@@ -1012,6 +1034,43 @@ fn full_run(steps: bool) -> Result<Vec<String>, String> {
     Ok(first)
 }
 
+/// The disk service built to stop answering at the first write of a package's data
+/// (`deaf`), the package service with a wait of 1 s for it (`short-deadline`): the
+/// installation of `big` is refused IO within the wait, the store is as it was and free, the
+/// next installation is refused at once.
+fn deaf() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let world = make_world(&hello_elf()?, false, "deaf")?;
+    let mut list = PROGRAMS.to_vec();
+    for program in &mut list {
+        match program.0 {
+            "virtio-blk" => program.3 = &["deaf"],
+            "pkgd" => program.3 = &["short-deadline"],
+            _ => {}
+        }
+    }
+    let programs: &'static [ImageProgram] = Box::leak(list.into_boxed_slice());
+    let image = image_with("boot-store-deaf.img", programs, world.files.clone(), None)?;
+    let file = Disk::new("deaf");
+    write_disk(&file, None)?;
+    let lines = run(&image, &file.0, false)?;
+    expect(
+        &lines,
+        &[
+            "pkgd: the disk service did not answer in time".to_string(),
+            "store-probe: ok".to_string(),
+        ],
+    )?;
+    let said = lines
+        .iter()
+        .find(|l| l.starts_with("store-probe: the disk stopped answering"))
+        .ok_or("the probe did not say how the disk's silence ended")?;
+    println!("store-probe deaf: {}", said.trim_start_matches("store-probe: "));
+    Ok(())
+}
+
 /// The crash points of the note, each with what its scenario starts and what the machine finds
 /// after it is killed there and started again.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1252,7 +1311,7 @@ fn crash_point(point: u8, hello: &[u8]) -> Result<(), String> {
 /// `cargo xtask store-probe doom`: Doom from the packages `freedoom` and `doomgeneric` of
 /// `target/pkg` (`cargo xtask pkg-build freedoom doomgeneric`) installed as a group on a disk of
 /// zeros, the memory the service holds after it, and the machine started again on the same disk.
-fn doom() -> Result<(), String> {
+fn doom(machine: &qemu::Machine) -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;
     }
@@ -1291,12 +1350,12 @@ fn doom() -> Result<(), String> {
     hello_elf()?;
     let file = Disk::new("doom");
     write_disk(&file, None)?;
-    let first = run(&image, &file.0, false)?;
+    let first = run_on(machine, &image, &file.0, false)?;
     expect(
         &first,
         &["store-probe: Doom installed: freedoom and doomgeneric as a group, the program and the WAD are in the tree".to_string()],
     )?;
-    let second = run(&image, &file.0, false)?;
+    let second = run_on(machine, &image, &file.0, false)?;
     expect(
         &second,
         &["store-probe: restart: Doom is in place, listed and in the tree".to_string()],
@@ -1307,9 +1366,13 @@ fn doom() -> Result<(), String> {
             || l.starts_with("store-probe: Doom installed in")
             || l.starts_with("store-probe: pkgd ready after")
             || l.starts_with("pkgd: ready")
+            || l.starts_with("pkgd: start took")
     }) {
         println!("{line}");
     }
-    println!("store-probe doom: Doom installed as a group, in place after the restart: ok");
+    println!(
+        "store-probe doom on {}: Doom installed as a group, in place after the restart: ok",
+        machine.name
+    );
     Ok(())
 }

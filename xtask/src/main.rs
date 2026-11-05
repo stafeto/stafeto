@@ -1741,6 +1741,9 @@ commands:
             a disk of zeros is formatted, the full scenario of installations, refusals,
             changes and removals runs on a disk of zeros and again after a restart;
             steps: the service's steps under -icount
+            doom [--hvf]: Doom (freedoom and doomgeneric from target/pkg) installed on
+            a disk of zeros and found after a restart, the start time of the service,
+            on QEMU's emulation or under HVF
   store-crash [N] kill the package service's machine at each crash point of the
             note (or at point N), start it again on the same disk file and compare
             the store it finds with the state before or after the change

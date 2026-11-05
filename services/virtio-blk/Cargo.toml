@@ -22,6 +22,10 @@ bench = false
 # feature step-stats), for the measurement under -icount.
 [features]
 crash = []
+# `deaf`: the driver stops answering from the first write of a package's data (32 sectors or more)
+# on: the request stays with the driver, and no TAKE is ever READY or notified (the probe of the
+# package service's deadline on the disk, xtask store-probe deaf).
+deaf = []
 steps = ["rt/step-stats"]
 
 [dependencies]

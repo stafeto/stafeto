@@ -28,6 +28,9 @@ steps = ["rt/step-stats"]
 crash = []
 # `no-ready`: the service never says READY (xtask init-wait, the deadline of the wait).
 no-ready = []
+# `short-deadline`: the wait for the disk service's answer is 1 s, not 10 s (xtask store-probe
+# deaf, the disk service built with `deaf`).
+short-deadline = []
 # `exit-before-ready`: the service ends where it would say READY (xtask init-wait, the end
 # of a service before its READY).
 exit-before-ready = []

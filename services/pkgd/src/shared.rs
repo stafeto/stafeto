@@ -84,6 +84,8 @@ pub static KEY: Shared<Option<Key>> = Shared::new(None);
 pub static PUBLISHED: [AtomicBool; PACKAGES] = [const { AtomicBool::new(false) }; PACKAGES];
 
 pub static STARTING: AtomicBool = AtomicBool::new(true);
+/// The counter when the process began, for the line of the time its start took.
+pub static BEGAN: AtomicU64 = AtomicU64::new(0);
 pub static DAMAGED: AtomicBool = AtomicBool::new(false);
 pub static READ_ONLY: AtomicBool = AtomicBool::new(false);
 pub static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +188,10 @@ pub const LABEL_KICK: u64 = 1;
 pub const BUFFERS_AT: usize = 0x58_0000_0000;
 /// The buffers at once, one for each session that gave one.
 pub const BUFFERS: usize = 4;
+/// The places the superuser's sessions alone may take (the first ones): a session that is not
+/// the superuser's has the rest, so that four programs that ask for a buffer and keep it cannot
+/// leave `pkg install` and the changes of the settings without one.
+pub const RESERVED: usize = 2;
 
 pub const fn buffer_at(place: usize) -> usize {
     BUFFERS_AT + place * proto_pkg::BUFFER_SIZE as usize

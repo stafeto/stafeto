@@ -28,11 +28,14 @@ use proto_fs::{LayerOp, LayerReply, LayerStart, LayerStep};
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Any, Channel, Memory, Process};
 use rt::sys::{self, Received};
-use rt::{Handle, Stack};
+use rt::Handle;
 
-/// The measured use is some 54 KiB; the margin is the rest. No guard page: `rt::Stack` is static.
+/// The measured use is some 54 KiB; the margin is the rest. The stack is an object of its own,
+/// mapped at `STACK_AT` with no mapping on the page below it: an overflow faults on the guard
+/// page and ends the process, where a stack in `.bss` (`rt::Stack`) would overwrite the
+/// statics next to it.
 const STACK_SIZE: usize = 128 * 1024;
-static STACK: Stack<STACK_SIZE> = Stack::new();
+const STACK_AT: usize = 0x58_2000_0000;
 /// The thread's message buffer: the page after the main thread's.
 const MSGBUF: usize = abi::INIT_MSGBUF as usize + 4096;
 /// The blocks of a cell and the sectors of a block.
@@ -57,12 +60,22 @@ pub fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
 
 /// Starts the thread; it begins with the work of the start.
 pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, abi::Error> {
-    // SAFETY: STACK is the thread's alone.
+    // The mapping keeps the object; the page below `STACK_AT` is never mapped.
+    let stack = sys::mem_create(STACK_SIZE as u64)?;
+    sys::mem_map(
+        process,
+        &stack,
+        0,
+        STACK_SIZE as u64,
+        STACK_AT,
+        Access::ReadWrite,
+    )?;
+    // SAFETY: the stack is the thread's alone.
     let thread = unsafe {
         sys::thread_create(
             process,
             work,
-            STACK.top(),
+            STACK_AT + STACK_SIZE,
             0,
             LEVEL,
             abi::Policy::RoundRobin,
@@ -107,6 +120,13 @@ type Fail = &'static str;
 pub struct Disk {
     session: core::mem::ManuallyDrop<Handle<Channel>>,
     own: Handle<Channel>,
+    /// The timer on `own` that ends the wait for an answer of the disk service (`finish`).
+    timer: Handle<rt::handle::Timer>,
+    /// The disk service did not answer in time: a request may still be with it and its cell
+    /// will be written whenever it answers, so no request goes to it any more (this start of
+    /// the service; the disk service that restarts is not followed, a restart of the machine
+    /// is).
+    dead: core::sync::atomic::AtomicBool,
     /// A copy of `own` with NOTIFY for each cell, labelled by the cell plus one.
     notify: [Handle<Channel>; CELLS as usize],
     sectors: u64,
@@ -124,6 +144,9 @@ enum Got {
 
 impl Disk {
     fn call(&self, request: &[u8], handle: Option<Handle<Any>>) -> Result<Got, Status> {
+        if self.dead.load(Acquire) {
+            return Err(Status::Kernel(abi::Error::PeerClosed));
+        }
         let reply = match handle {
             None => sys::send(&self.session, request)?,
             Some(h) => sys::send_handles(&self.session, request, [h]).map_err(|r| r.error)?,
@@ -150,33 +173,54 @@ impl Disk {
     }
 
     /// TAKE of `key` until it is READY: the first time with a handle that
-    /// notifies this thread's channel.
+    /// notifies this thread's channel. The wait for the notification has a deadline
+    /// (`DISK_WAIT_NS`): a disk service that died or stopped answering with the request
+    /// leaves the thread no other end, and the install with its group would wait for ever.
+    /// Past it the disk is dead (`dead`) and the wait is an error, which the job that waits
+    /// turns into IO and drops its group.
     fn finish(&self, key: u64, cell: usize) -> Result<(), Status> {
         let mut w = Writer::new();
         BlkKey { key }.write(Blk::Take, &mut w)?;
         let mut notify = Some(
             sys::handle_duplicate(&self.notify[cell], Rights::NOTIFY | Rights::TRANSFER)?.erase(),
         );
-        loop {
+        let until = rt::time::ticks_to_ns(rt::time::now()) + DISK_WAIT_NS;
+        let mut armed = false;
+        let done = (|| loop {
             match self.call(w.as_bytes(), notify.take())? {
                 Got::Ready => return Ok(()),
                 Got::Armed => {}
                 Got::Wait(_) => return Err(Status::BadSize),
             }
+            if !armed {
+                sys::timer_set(&self.timer, until)?;
+                armed = true;
+            }
             loop {
-                if let Received::Notification {
-                    source: Source::Session,
-                    label,
-                    bits,
-                    ..
-                } = sys::receive(&self.own)?
-                    && label == cell as u64 + 1
-                    && bits & 1 != 0
-                {
-                    break;
+                match sys::receive(&self.own)? {
+                    Received::Notification {
+                        source: Source::Session,
+                        label,
+                        bits,
+                        ..
+                    } if label == cell as u64 + 1 && bits & 1 != 0 => break,
+                    // An expiry before the deadline is a stale one of an earlier wait.
+                    Received::Notification {
+                        source: Source::Timer,
+                        ..
+                    } if rt::time::reached(until) => {
+                        self.dead.store(true, Release);
+                        rt::println!("pkgd: the disk service did not answer in time");
+                        return Err(Status::Kernel(abi::Error::WouldBlock));
+                    }
+                    _ => {}
                 }
             }
+        })();
+        if armed {
+            let _ = sys::timer_cancel(&self.timer);
         }
+        done
     }
 
     fn cell(cell: usize) -> *mut u8 {
@@ -349,6 +393,13 @@ pub fn crash_at(point: Point) {
 #[cfg(not(feature = "crash"))]
 pub fn crash_at(_: Point) {}
 
+/// How long the thread waits for the disk service to answer one request it took: a read or a
+/// write of 16 KiB or a flush takes milliseconds, and ten seconds is a service that is gone.
+#[cfg(not(feature = "short-deadline"))]
+const DISK_WAIT_NS: u64 = 10_000_000_000;
+#[cfg(feature = "short-deadline")]
+const DISK_WAIT_NS: u64 = 1_000_000_000;
+
 /// The disk service: the buffer of four cells and its INFO.
 fn connect_disk(process: &Handle<Process>) -> Result<Disk, Fail> {
     let session = view::<Channel>(BLK_SESSION);
@@ -387,10 +438,13 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, Fail> {
         .map_err(|_| "no notification")
     };
     let notify = [label(0)?, label(1)?, label(2)?, label(3)?];
+    let timer = sys::timer_create(&own, LEVEL).map_err(|_| "no timer")?;
     Ok(Disk {
         session,
         notify,
         own,
+        timer,
+        dead: core::sync::atomic::AtomicBool::new(false),
         sectors: info.sectors,
         flush: info.flush(),
     })
@@ -937,6 +991,13 @@ fn finish_counts(opened: &commit::Opened, disk: &Disk) {
         "pkgd: ready, {} packages from the disk, {} from the image, {free} blocks free",
         DISK_PACKAGES.load(Acquire),
         IMAGE_PACKAGES.load(Acquire),
+    );
+    // What the start took, from the process's first instruction to here: the connections, the
+    // images' `meta`, the disk read, the hashes and signatures, the layers (pk3b, C8).
+    let took = rt::time::now().saturating_sub(BEGAN.load(Acquire));
+    rt::println!(
+        "pkgd: start took {} ms",
+        rt::time::ticks_to_ns(took) / 1_000_000
     );
 }
 

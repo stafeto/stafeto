@@ -62,6 +62,7 @@ const NOT_REGISTERED: u64 = 3;
 const STOPPED: u64 = 5;
 
 fn main(_: u64) -> u64 {
+    BEGAN.store(rt::time::now(), Release);
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -386,14 +387,18 @@ impl Pkgd {
         end_read(start, Answer::Reply(Outgoing::new()))
     }
 
-    /// BUFFER: the client's object, four cells, mapped for the session's life.
+    /// BUFFER: the client's object, four cells, mapped for the session's life. A second handle,
+    /// the identity session of the process, lets the service ask the process service who the
+    /// caller is (Vouch): the superuser's session may take any place, any other the places
+    /// after the `RESERVED` first ones (BUSY when they are all in use).
     fn give_buffer(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
         let Ok(size) = read_word(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        if size != BUFFER_SIZE || r.handles.len() != 1 {
+        if size != BUFFER_SIZE || !(1..=2).contains(&r.handles.len()) {
             return Answer::Status(Status::BadSize);
         }
+        let with_identity = r.handles.len() == 2;
         let needed = Rights::MAP_READ | Rights::MAP_WRITE;
         let rights = r.handles.info(0).map_or(Rights::NONE, |(_, rights)| rights);
         let Ok(object) = r.handles.take::<Memory>(0) else {
@@ -410,7 +415,12 @@ impl Pkgd {
         if s.data.buffer.is_some() {
             return Answer::Status(code(proto_pkg::INVALID));
         }
-        let Some(place) = self.buffers.iter().position(Option::is_none) else {
+        let identity = with_identity
+            .then(|| r.handles.take::<Channel>(1).ok())
+            .flatten();
+        let superuser = identity.and_then(|channel| self.vouch(channel)) == Some(0);
+        let from = if superuser { 0 } else { RESERVED };
+        let Some(place) = (from..BUFFERS).find(|&p| self.buffers[p].is_none()) else {
             return Answer::Status(code(proto_pkg::BUSY));
         };
         let mapped = sys::mem_map(
