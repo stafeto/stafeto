@@ -515,6 +515,11 @@ fn a_readdir_started_before_the_attach_and_continued_in_portions_sees_each_name_
         spec = spec.file(&format!("/many/f{n:03}"), 0o644, b"x");
     }
     let bytes = spec.build();
+    // Names of users are in the directory before the layer comes: the names the layer brings
+    // take positions above theirs.
+    for name in [b"u1".as_slice(), b"u2", b"u3"] {
+        user_file(&mut ram, ROOT, name);
+    }
     let root_names = names(&ram, ROOT);
     // Read the root directory from the start, one name at a time, while the layer goes in.
     let mut seen: Vec<String> = Vec::new();
