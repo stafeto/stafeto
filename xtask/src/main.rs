@@ -18,6 +18,11 @@ mod fast_bank;
 #[cfg(test)]
 mod fast_bank_tests;
 #[cfg(test)]
+#[path = "../../lib/posix-abi/src/fast_events.rs"]
+mod fast_events;
+#[cfg(test)]
+mod fast_events_tests;
+#[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
 mod futex_deadline;
 #[cfg(test)]
@@ -41,6 +46,7 @@ mod disasm;
 mod display_probe;
 mod doom;
 mod entropy;
+mod fast_layer;
 mod fast_probe;
 mod fstack_device;
 mod fstack_probe;
@@ -1730,7 +1736,9 @@ commands:
             another user, EBUSY for a second owner, the device back after
             kill -9, a pause of 2 s before an echo; with `steps` the service
             counts its steps (TCG only); with `crash` the service ends while
-            the program owns the device
+            the program owns the device; with `layer` `fast-layer` makes plain
+            sockets and epoll over the stack in the process: the calls, the
+            refusals, the echo and a page of 1 MiB, the wake of the idle loop
   nginx-probe [steps] [MACHINE] run nginx in the guest from ash (boot-nginx-probe.img):
             a master and four workers under nobody with SO_REUSEPORT, 200 requests
             over 16 connections that stay open, 256 KiB answers by digest through
@@ -2548,10 +2556,10 @@ fn write_elf_image(
     }
     // An image with F-Stack (BSD) carries its licence, the acknowledgements
     // of its four-clause files and where the exact source is.
-    let fstack_files = if sources
-        .iter()
-        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "fstack-probe"))
-    {
+    let fstack_files = if sources.iter().any(|(_, elf, _)| {
+        elf.file_name()
+            .is_some_and(|n| n == "fstack-probe" || n == "fast-layer")
+    }) {
         Some(fstack_probe::terms()?)
     } else {
         None
@@ -3716,6 +3724,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("ncdu", _) => "ncdu",
         ("doom", _) => "doom",
         ("fstack-probe", _) => "fstack-probe",
+        ("fast-layer", _) => "fast-layer",
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
         ("nginx", _) => "nginx",
@@ -9007,6 +9016,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // leaves, and a new owner gets the device from the new service.
         // Also in the group `net`.
         job("fast-probe-crash", || fast_probe::crash(&[])),
+        // The sockets of the POSIX layer over the stack in a process: a
+        // program that makes plain sockets and epoll, the calls on the
+        // stack's loopback, the refusals, the echo and the page through the
+        // forwarded ports, the idle loop's wake on the device's interrupt.
+        // Also in the group `net`.
+        job("fast-layer", || fast_layer::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

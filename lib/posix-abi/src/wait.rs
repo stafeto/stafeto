@@ -513,7 +513,24 @@ fn run(
     until: Option<u64>,
     handled: u64,
     selecting: bool,
+    net: Option<&mut NetWait>,
+) -> Result<usize, i32> {
+    run_waking(items, until, handled, selecting, net, None)
+}
+
+/// `run` that also ends when `wake` says so. `wake` is asked at the top of
+/// each round and again with the entries deferred, just before the receive
+/// that sleeps: whatever it watches (the bank of the service's
+/// notifications) is set by a receiver that runs outside this loop, and the
+/// kernel keeps a notification until a receive takes it, so a notification
+/// that comes after the second look ends the receive at once.
+fn run_waking(
+    items: &mut [PollFd],
+    until: Option<u64>,
+    handled: u64,
+    selecting: bool,
     mut net: Option<&mut NetWait>,
+    wake: Option<fn() -> bool>,
 ) -> Result<usize, i32> {
     if items.len() > LIMIT {
         return Err(EINVAL);
@@ -662,6 +679,7 @@ fn run(
             if ready_count(&ready[..items.len()]) != 0
                 || net.as_deref().is_some_and(|n| n.ready.len != 0)
                 || until.is_some_and(|deadline| now() >= deadline)
+                || wake.is_some_and(|w| w())
             {
                 return Ok(());
             }
@@ -710,6 +728,10 @@ fn run(
             {
                 drop(guard);
                 continue;
+            }
+            if wake.is_some_and(|w| w()) {
+                drop(guard);
+                return Ok(());
             }
             if let Some(until) = until {
                 if timer.is_none() {
@@ -812,6 +834,14 @@ pub(crate) fn boundary<T>(
 }
 
 pub fn poll(items: &mut [PollFd], duration: Option<u64>, mask: Option<u64>) -> Result<usize, i32> {
+    // A fast socket is not waited for here: the stack's `epoll` is the way.
+    if crate::fastnet::registered()
+        && items
+            .iter()
+            .any(|item| crate::fastnet::classify(item.fd).is_some())
+    {
+        return Err(EINVAL);
+    }
     boundary(duration, mask, |until, handled| {
         engine(items, until, handled, false)
     })
@@ -824,8 +854,9 @@ pub(crate) fn run_net(
     net: Option<&mut NetWait>,
     until: Option<u64>,
     handled: u64,
+    wake: Option<fn() -> bool>,
 ) -> Result<usize, i32> {
-    run(items, until, handled, false, net)
+    run_waking(items, until, handled, false, net, wake)
 }
 
 /// POLLRDHUP of Linux: the peer of a stream shut its writing or went.

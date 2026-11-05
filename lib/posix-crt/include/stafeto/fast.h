@@ -21,6 +21,7 @@
 #ifndef _STAFETO_FAST_H
 #define _STAFETO_FAST_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -114,6 +115,98 @@ int stafeto_fast_kick(uint32_t count);
 /* The second address as the service knows it now. 0, or -1 with errno
  * (ENETDOWN while there is none). */
 int stafeto_fast_config(struct stafeto_fast_config *out);
+
+/* The bits that another wait of the claiming thread took off its channel
+ * and the bank holds, taken (each bit goes to one taker): what a program
+ * that waits on the thread's channel itself gives to its own stack. 0 with
+ * none, and without a claim. */
+uint32_t stafeto_fast_take_pending(void);
+
+/* 1 once the service let go of the notifications (STAFETO_FAST_GONE came to
+ * any wait), whoever took the bit; sticky until the process ends. */
+int stafeto_fast_lost(void);
+
+/*
+ * The stack in the process (F-Stack, with libvirtio_net.a) as sockets of
+ * the C library. A program that carries the stack registers this table once,
+ * from a constructor of its own (the constructors of libc.so run first and
+ * the layer's statics are ready), and from then on every
+ * socket(AF_INET, SOCK_STREAM, ...) of the process is a socket of the stack.
+ * The layer starts the stack at the first one: it claims the second device
+ * (stafeto_fast_claim) and calls `start`. The sockets have numbers from
+ * 1048576 up and are non-blocking from birth: accept, accept4, read, write,
+ * readv, writev, send, recv, sendmsg, recvmsg, connect, bind, listen, close,
+ * shutdown, getsockopt, setsockopt, getsockname, getpeername, fcntl
+ * (O_NONBLOCK stays on; FD_CLOEXEC and FD_CLOFORK read as set), ioctl
+ * (FIONBIO 1, FIONREAD) and fstat work; epoll_ctl takes them with the
+ * events EPOLLIN, EPOLLOUT, EPOLLRDHUP, EPOLLET and EPOLLONESHOT, and
+ * epoll_pwait on such an instance drives the stack (a step of it, the
+ * events, a sleep of at most 10 ms with the device's interrupts on).
+ * poll, select, dup, dup2, dup3, F_DUPFD, descriptor passing and
+ * clearing O_NONBLOCK are refused (EINVAL, EOPNOTSUPP). A process that
+ * holds the stack cannot fork or exec.
+ *
+ * Every function answers a count not below zero, or the negated errno of
+ * Linux (ENOBUFS, ENETDOWN and EMSGSIZE of the send path among them).
+ * Addresses are the structures of Linux. `kevent` takes and gives the
+ * 64-byte struct kevent of FreeBSD, with a time of zero. The layer calls the
+ * functions one at a time (a lock of its own is held), and reaches the stack
+ * through the table alone: libc.so names nothing of the program.
+ *
+ * STAFETO_FAST_ADDRESS is only printed by the stack: a lease of the second
+ * address is renewed at the same address (a new address is not supported).
+ */
+#define STAFETO_FAST_TABLE_VERSION 1
+/* Accepted and kept; the process does not end on its own yet. Until it does,
+ * epoll_pwait answers ENETDOWN once the service has let go of the device. */
+#define STAFETO_FAST_EXIT_ON_LOSS 1u
+
+struct stafeto_fast_table {
+    uint32_t version;
+    uint32_t flags;
+    /* The claim has been made: attach the device and start the stack. */
+    int (*start)(const struct stafeto_fast_claim *);
+    /* One step of the stack (clock ticks, frames, software interrupts, the
+     * doorbell): the units of work done, 0 when idle. */
+    int (*pass)(void);
+    /* Nanoseconds to the next clock tick, 0 when due. */
+    uint64_t (*next_tick_ns)(void);
+    /* The device's interrupts on (with a full barrier) or off. */
+    void (*notify)(int on);
+    /* The bits of STAFETO_FAST_* that the layer took off the channel. */
+    void (*absorb)(uint32_t bits);
+    int (*socket)(int, int, int);
+    int (*bind)(int, const void *, uint32_t);
+    int (*listen)(int, int);
+    int (*accept4)(int, void *, uint32_t *, int);
+    int (*connect)(int, const void *, uint32_t);
+    long (*read)(int, void *, size_t);
+    long (*write)(int, const void *, size_t);
+    long (*readv)(int, const void *, int);
+    long (*writev)(int, const void *, int);
+    long (*recvfrom)(int, void *, size_t, int, void *, uint32_t *);
+    long (*sendto)(int, const void *, size_t, int, const void *, uint32_t);
+    long (*recvmsg)(int, void *, int);
+    long (*sendmsg)(int, const void *, int);
+    int (*close)(int);
+    int (*shutdown)(int, int);
+    int (*getsockopt)(int, int, int, void *, uint32_t *);
+    int (*setsockopt)(int, int, int, const void *, uint32_t);
+    int (*getsockname)(int, void *, uint32_t *);
+    int (*getpeername)(int, void *, uint32_t *);
+    int (*ioctl)(int, unsigned long, void *);
+    int (*kqueue)(void);
+    /* The time is always zero. */
+    int (*kevent)(int, const void *, int, void *, int);
+};
+
+_Static_assert(sizeof(struct stafeto_fast_table) == 8 + 27 * sizeof(void *),
+    "the layout of the table");
+
+/* Registers the table (a copy is kept): 0, or -1 with errno: EINVAL for a
+ * version or flag the layer does not know, a null function or a null
+ * table; EBUSY when a table is registered already. */
+int stafeto_fast_register(const struct stafeto_fast_table *table);
 
 #ifdef __cplusplus
 }
