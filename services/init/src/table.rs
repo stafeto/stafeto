@@ -963,6 +963,7 @@ fn order(table: &[Record]) -> Order {
     order
 }
 
+pub mod base;
 pub mod bench;
 pub mod ceiling;
 pub mod cycle;
@@ -990,6 +991,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
+    + cfg!(feature = "table-base") as usize
     + cfg!(feature = "table-posix-dialog") as usize
     + cfg!(feature = "table-posix-dialog-vz") as usize
     + cfg!(feature = "table-posix-abi") as usize
@@ -1057,6 +1059,7 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
+    feature = "table-base",
     feature = "table-posix-dialog",
     feature = "table-posix-dialog-vz",
     feature = "table-posix-abi",
@@ -1148,6 +1151,8 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-doom")]
 pub const TABLE: &[Record] = doom::TABLE;
+#[cfg(feature = "table-base")]
+pub const TABLE: &[Record] = base::BASE_TABLE;
 #[cfg(feature = "table-posix-dialog")]
 pub const TABLE: &[Record] = ramfs::POSIX_DIALOG_TABLE;
 #[cfg(feature = "table-posix-dialog-vz")]
@@ -1985,6 +1990,7 @@ mod tests {
             net::NET_PROBE_TWO_TABLE,
             net::NET_TWO_TABLE,
             doom::TABLE,
+            base::BASE_TABLE,
             gpu::TABLE,
             input::TABLE,
             entropy::TABLE,
@@ -2285,6 +2291,7 @@ mod tests {
             test::TABLE,
             lock_ring::TABLE,
             doom::TABLE,
+            base::BASE_TABLE,
             gpu::TABLE,
             input::TABLE,
             entropy::TABLE,
@@ -2359,6 +2366,8 @@ mod tests {
     fn the_network_session_goes_to_the_launcher_of_the_network_image_alone() {
         let has = |table: &[Record]| table.iter().any(|r| r.connects.contains(&NET_SERVICE));
         assert!(has(net::NET_TABLE));
+        // The base image has the network service too, with the screen.
+        assert!(has(base::BASE_TABLE));
         let launcher = net::NET_TABLE
             .iter()
             .find(|r| r.program == "ash-launcher")
@@ -2412,6 +2421,7 @@ mod tests {
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
             doom::TABLE,
+            base::BASE_TABLE,
             ramfs::POSIX_TTY_TABLE,
             ramfs::POSIX_DIALOG_TABLE,
             ramfs::POSIX_FILES_TABLE,
@@ -2705,6 +2715,38 @@ mod tests {
         assert_eq!(posix.quota, ramfs::POSIX_ABI_TABLE[1].quota + 13_824 * PAGE);
     }
 
+    /// The base image is the games table with the network service: the
+    /// launcher reaches the display and the network services under the
+    /// larger quota of a command, the process service has the pool of the
+    /// network image, and the services of both tables are in it once.
+    #[test]
+    fn the_base_table_is_the_games_table_with_the_network_service() {
+        assert!(check(base::BASE_TABLE).is_ok());
+        let mut names = order_of(base::BASE_TABLE);
+        let at = |names: &[&str], name: &str| names.iter().position(|&n| n == name).unwrap();
+        assert!(at(&names, "input") < at(&names, "gpu"));
+        assert!(at(&names, NET_SERVICE) < names.len());
+        names.retain(|&n| n != NET_SERVICE);
+        let mut games = order_of(doom::TABLE);
+        names.sort_unstable();
+        games.sort_unstable();
+        assert_eq!(names, games);
+        let launcher = base::BASE_TABLE
+            .iter()
+            .find(|r| r.program == "ash-launcher")
+            .unwrap();
+        assert!(launcher.connects.contains(&"gpu"));
+        assert!(launcher.connects.contains(&NET_SERVICE));
+        assert_eq!(launcher.quota, net::NET_COMMAND_QUOTA);
+        let posix = base::BASE_TABLE
+            .iter()
+            .find(|r| r.name == PROCESS_SERVICE)
+            .unwrap();
+        assert_eq!(posix.quota, net::NET_TABLE[2].quota);
+        // The service of the network is the one of the network image.
+        assert_eq!(base::BASE_TABLE.last().unwrap().name, net::NETD.name);
+    }
+
     /// Every POSIX process leaves one level above main for its thread
     /// owner, heap and file workers and sleep timer, and its table passes.
     #[test]
@@ -2713,6 +2755,7 @@ mod tests {
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
             doom::TABLE,
+            base::BASE_TABLE,
             ramfs::POSIX_DIALOG_TABLE,
             vz::POSIX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
