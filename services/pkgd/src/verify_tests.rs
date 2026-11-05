@@ -392,3 +392,157 @@ fn the_packages_of_the_boot_image_are_read_and_a_disk_package_of_the_same_name_i
     assert!(said.contains(&"other.stpkg: too many packages".to_string()));
     assert_eq!(read_image(b"not an image", &mut few, |_, _| {}), 0);
 }
+
+/// A table with the entries' records in the places 0, 1, ... and the official repository.
+fn table_of(entries: &[Option<Entry>]) -> Table {
+    let mut t = Table::zeroed();
+    t.init(4);
+    t.set_repo(0, b"stafeto", 0);
+    for (i, e) in entries.iter().flatten().enumerate() {
+        let mut r = e.record;
+        r.first = 10 + 100 * i as u64;
+        t.set_record(i, &r);
+    }
+    t
+}
+
+#[test]
+fn a_removal_names_what_goes_and_refuses_the_image_the_unknown_and_the_needed() {
+    use crate::plans::{REMOVE_MAX, remove};
+    let set = [
+        entry(&Spec {
+            name: "freedoom",
+            provides: "wad",
+            ..Spec::default()
+        }),
+        entry(&Spec {
+            name: "doomgeneric",
+            depends: "wad",
+            ..Spec::default()
+        }),
+        entry(&Spec {
+            name: "plain",
+            ..Spec::default()
+        }),
+    ];
+    let table = table_of(&set);
+    let mut image = [const { None }; 4];
+    image[0] = entry(&Spec {
+        name: "base",
+        ..Spec::default()
+    })
+    .map(|mut e| {
+        e.image = true;
+        e
+    });
+    let mut out = Table::zeroed();
+    let mut slots = [0; REMOVE_MAX];
+    let mut go =
+        |names: &[&[u8]], out: &mut Table| remove(&table, out, &set, &image, names, &mut slots);
+    assert_eq!(go(&[b"base"], &mut out), Err(proto_pkg::IN_IMAGE));
+    assert_eq!(go(&[b"nobody"], &mut out), Err(proto_pkg::NOT_FOUND));
+    assert_eq!(
+        go(&[b"plain", b"nobody"], &mut out),
+        Err(proto_pkg::NOT_FOUND)
+    );
+    assert_eq!(go(&[b"freedoom"], &mut out), Err(proto_pkg::NEEDED_BY));
+    // Both at once is no breakage; a name twice counts once.
+    assert_eq!(
+        go(&[b"freedoom", b"doomgeneric", b"freedoom"], &mut out),
+        Ok(2)
+    );
+    assert_eq!(out.generation(), 5);
+    assert_eq!(out.record(0), Record::EMPTY);
+    assert_eq!(out.record(1), Record::EMPTY);
+    assert_eq!(out.record(2), table.record(2));
+    assert_eq!(table.generation(), 4);
+    assert_eq!(out.check(5, 131_072, 2), Ok(()));
+}
+
+#[test]
+fn a_serial_never_goes_back_and_a_new_repository_takes_a_free_place() {
+    use crate::plans::serial;
+    let mut t = Table::zeroed();
+    t.init(4);
+    t.set_repo(0, b"stafeto", 0);
+    let mut out = Table::zeroed();
+    // Zero for an unknown repository is what is held: nothing is written.
+    assert_eq!(serial(&t, &mut out, b"games", 0), Ok(false));
+    assert_eq!(serial(&t, &mut out, b"games", 3), Ok(true));
+    assert_eq!(out.generation(), 5);
+    assert_eq!(
+        out.repo(out.find_repo(b"games").unwrap()),
+        Some((&b"games"[..], 3))
+    );
+    assert_eq!(serial(&out, &mut Table::zeroed(), b"games", 3), Ok(false));
+    assert_eq!(
+        serial(&out, &mut Table::zeroed(), b"games", 2),
+        Err(proto_pkg::ROLLBACK)
+    );
+    assert_eq!(serial(&out, &mut Table::zeroed(), b"stafeto", 1), Ok(true));
+    for bad in [&b""[..], b"Games", b"a b", &[b'a'; 32]] {
+        assert_eq!(
+            serial(&t, &mut out, bad, 1),
+            Err(proto_pkg::INVALID),
+            "{bad:?}"
+        );
+    }
+    // Sixteen repositories: the stafeto and fifteen others.
+    for i in 1..16 {
+        t.set_repo(i, format!("r{i}").as_bytes(), 1);
+    }
+    assert_eq!(serial(&t, &mut out, b"more", 1), Err(proto_pkg::NO_SPACE));
+    assert_eq!(serial(&t, &mut out, b"r3", 2), Ok(true));
+}
+
+#[test]
+fn the_list_of_revocations_never_goes_back_and_marks_the_packages_it_names() {
+    use crate::plans::{revoked, settings};
+    use crate::store::{Extent, REVOKED, REVOKED_SLOT, SETTINGS_SLOT};
+    let set = [
+        entry(&Spec {
+            name: "a",
+            ..Spec::default()
+        }),
+        entry(&Spec {
+            name: "b",
+            ..Spec::default()
+        }),
+    ];
+    let t = table_of(&set);
+    let list = Extent {
+        first: 900,
+        blocks: 2,
+    };
+    let mut flags = [false; 64];
+    flags[1] = true;
+    let mut out = Table::zeroed();
+    assert_eq!(
+        revoked(&t, &mut out, list, 5000, [7; 32], 2, &flags),
+        Ok(())
+    );
+    assert_eq!(out.record(1).flags, WORLD | REVOKED);
+    assert_eq!(out.record(0).flags, WORLD);
+    let held = out.record(REVOKED_SLOT);
+    assert_eq!((held.number, held.length, held.blocks), (2, 5000, 2));
+    assert_eq!(out.check(5, 131_072, 2), Ok(()));
+    // An older list, the same one again, and a list that frees a package.
+    let mut again = Table::zeroed();
+    assert_eq!(
+        revoked(&out, &mut again, list, 5000, [7; 32], 1, &flags),
+        Err(proto_pkg::ROLLBACK)
+    );
+    assert_eq!(
+        revoked(&out, &mut again, list, 5000, [7; 32], 2, &[false; 64]),
+        Ok(())
+    );
+    assert_eq!(again.record(1).flags, WORLD);
+    // The settings record.
+    settings(&t, &mut out, list, 70, [8; 32]);
+    let s = out.record(SETTINGS_SLOT);
+    assert_eq!(
+        (s.first, s.blocks, s.length, s.sha256),
+        (900, 1, 70, [8; 32])
+    );
+    assert_eq!(out.check(5, 131_072, 2), Ok(()));
+}

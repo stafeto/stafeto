@@ -226,11 +226,13 @@ pub fn open(dev: &mut impl Device, table: &mut Table) -> Result<Start, Failed> {
     Ok(if zeros { Start::Blank } else { Start::Damaged })
 }
 
-/// A new store: an empty table of generation 1 in blocks 2 to 6 and the
+/// A new store: a table of generation 1 with the official repository and no package in blocks 2 to 6 and the
 /// superblock of copy 0, each flushed before the next (`store formatted`).
 /// The disk is the store's, so nothing is read first.
 pub fn format(dev: &mut impl Device, table: &mut Table) -> Result<Opened, Failed> {
     table.init(1);
+    // The official repository has the first place, with no serial yet.
+    table.set_repo(0, b"stafeto", 0);
     write_table(dev, table, SUPERS)?;
     dev.point(Point::FormatTable);
     let sb = superblock_of(dev.blocks(), table, SUPERS);
@@ -330,6 +332,8 @@ pub struct Change<'a> {
 pub enum Refused {
     /// The disk failed: the state of the medium is the old or the new one, whole.
     Io,
+    /// No run of five blocks is free for the next table.
+    NoSpace,
     /// The file service refused a layer (the code of `proto_pkg`); the state is the old
     /// one and the layers are as they were.
     Attach(u32),
@@ -369,7 +373,7 @@ pub fn transact(
 ) -> Result<Opened, Refused> {
     dev.flush()?;
     dev.point(Point::DataFlushed);
-    let first = free_table_extent(accepted, next, opened).ok_or(Refused::Io)?;
+    let first = free_table_extent(accepted, next, opened).ok_or(Refused::NoSpace)?;
     write_table(dev, next, first)?;
     match change.kind {
         Kind::Install => dev.point(Point::TableFlushed),

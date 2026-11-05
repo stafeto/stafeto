@@ -523,7 +523,7 @@ fn a_disk_with_no_room_for_the_next_table_refuses_before_any_layer_is_touched() 
         attach: &[1],
     };
     let done = commit::transact(&mut disk, &opened, &accepted, &next, &change);
-    assert_eq!(done, Err(Refused::Io));
+    assert_eq!(done, Err(Refused::NoSpace));
     assert!(disk.attached.is_empty());
     assert_eq!(shape(&disk.log), "F @data-flushed");
 }
