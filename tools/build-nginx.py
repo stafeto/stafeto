@@ -159,9 +159,10 @@ def relocatable_link(makefile: Path) -> None:
 
 def compiler(path: Path, clang: Path, lld: Path, stub: Path) -> None:
     """The compiler nginx's configure and Makefile and PCRE2's configure
-    call: clang for the target with relibc's headers only, so that every
-    probe (auto/include too, which passes no flags of its own) sees the
-    target's headers on any host. A link of a program (no -c, -E, -S, -M,
+    call: clang for the target with relibc's headers and libraries only
+    (the sysroot is relibc's, so a Linux host's own libraries stay out of
+    the default search of the linker), so that every probe (auto/include
+    too, which passes no flags of its own) sees the target's on any host. A link of a program (no -c, -E, -S, -M,
     -r, -v, -fsyntax-only) gets relibc and the stubs, as the probes of the
     other packages' `configure` do; the program never runs."""
     path.write_text(f"""#!/bin/sh
@@ -172,8 +173,8 @@ for arg in "$@"; do
         -c|-E|-S|-M|-MM|-r|-v|--version|-fsyntax-only) link=no ;;
     esac
 done
-set -- --target=aarch64-linux-gnu -Qunused-arguments --ld-path={lld} -nostdinc \\
-    -isystem {RELIBC / 'include'} -idirafter {COMPAT} "$@"
+set -- --target=aarch64-linux-gnu --sysroot={RELIBC} -Qunused-arguments --ld-path={lld} \\
+    -nostdinc -isystem {RELIBC / 'include'} -idirafter {COMPAT} "$@"
 if [ $link = yes ]; then
     set -- "$@" -static -nostdlib -L{RELIBC / 'lib'} {stub} -lc
 fi
