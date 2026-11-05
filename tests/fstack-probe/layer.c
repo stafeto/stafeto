@@ -50,6 +50,7 @@
 void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *pass_count);
 
 static int epfd = -1;
+static int mixed[2];
 static int stop;
 static unsigned char page[PAGE_BYTES];
 static char head[128];
@@ -386,6 +387,22 @@ check_calls(void)
     REQUIRE(close(l) == 0);
     REFUSED(close(c), EBADF);
     ok("close");
+
+    /* One instance for both kinds of descriptors, as nginx has it (its
+     * channel to the main process next to the sockets): the end of a pipe
+     * and the sockets of the stack in the same set. The pipe stays in the
+     * set while the program serves, so the loop looks at it once for each
+     * clock tick. */
+    {
+        char byte;
+
+        REQUIRE(pipe(mixed) == 0);
+        add(mixed[0], EPOLLIN, (void *)4);
+        REQUIRE(write(mixed[1], "z", 1) == 1);
+        wait_for((void *)4);
+        REQUIRE(read(mixed[0], &byte, 1) == 1 && byte == 'z');
+    }
+    ok("mixed_set");
 }
 
 /* -------------------------------------------------------------- the server */

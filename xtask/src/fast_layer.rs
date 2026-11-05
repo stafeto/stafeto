@@ -56,6 +56,7 @@ pub const CHECKS: &[&str] = &[
     "scm_rights",
     "datagram_unchanged",
     "close",
+    "mixed_set",
 ];
 
 /// The programs of the image: the network image's with the table of both
