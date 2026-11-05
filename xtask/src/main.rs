@@ -44,6 +44,7 @@ mod abi_fingerprint;
 mod base_image;
 mod bash_dialog;
 mod blk_probe;
+mod carry;
 mod ci;
 mod clock_probe;
 mod cpus_dialog;
@@ -1672,12 +1673,16 @@ commands:
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
   keys      the keys that sign packages: `keys root|release <name> [--dir D]`,
-            `keys certify --root R.key --key K.pub`, `keys show <file>` (docs/packages.md)
+            `keys certify --root R.key --key K.pub`, `keys revoke --root R.key (--init | --key N --since T|start)`,
+            `keys show <file>` (docs/packages.md)
   pkg-build [name...]  build the package files (.stpkg) in target/pkg; `--recipe` prints the inputs
-            of the fingerprints instead (docs/packages.md)
+            of the fingerprints instead; `--previous INDEX` carries the packages whose recipe did not
+            change from a published index (docs/packages.md)
   repo      build the package files and a signed repository of them in target/repo
             (`--check` checks one; `--no-sources` skips the source archives; `--dir D` puts it
-            in another directory, which must be empty or new, or under target/)
+            in another directory, which must be empty or new, or under target/; `--previous INDEX`
+            carries; `--from DIR [--storage NAME]` writes the index of the files of DIR without a
+            build; `--check --official` checks with the roots of keys/)
   pkg-identity  check that the flat images and the packages give the same bytes at the same
             paths, that the repository is whole and that a package builds again to the same bytes
   dist-licenses  check that the release archives carry the notices of the packages they

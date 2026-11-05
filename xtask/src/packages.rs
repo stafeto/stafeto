@@ -612,8 +612,12 @@ pub fn load() -> Result<Vec<Package>, String> {
     for path in names {
         let origin = format!("packages/{}", path.file_name().unwrap().to_string_lossy());
         let text = std::fs::read_to_string(&path).map_err(|e| format!("{origin}: {e}"))?;
-        let p = parse(&text, &origin)?;
+        let mut p = parse(&text, &origin)?;
         validate(&p, &origin)?;
+        // A run that carries packages (carry.rs) fixes the releases.
+        if let Some(release) = crate::carry::release_of(&p.name) {
+            p.release = release;
+        }
         if format!("{}.toml", p.name) != path.file_name().unwrap().to_string_lossy() {
             return Err(format!("{origin}: describes {}", p.name));
         }

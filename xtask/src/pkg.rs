@@ -14,7 +14,7 @@
 
 use crate::packages::{self, Package};
 use crate::rootfs::{self, Source};
-use crate::{keys, notices};
+use crate::{carry, keys, notices};
 use pkgfmt::Package as PackageFile;
 use pkgfmt::container::write::{Content, Item, container, sign};
 use pkgfmt::manifest::Manifest;
@@ -510,6 +510,7 @@ pub fn recipes(
 
 // ---- building ----
 
+#[derive(Default)]
 pub struct Options {
     pub names: Vec<String>,
     pub key: Option<PathBuf>,
@@ -520,6 +521,9 @@ pub struct Options {
     /// Bytes that replace the packages' own at paths of the selected
     /// packages: the package file is a variant for one image (`image_files`).
     pub replace: Vec<(String, Vec<u8>)>,
+    /// The directory or address of a published index to carry unchanged
+    /// packages from (carry.rs).
+    pub previous: Option<String>,
 }
 
 pub struct Built {
@@ -531,6 +535,9 @@ pub struct Built {
     /// The inputs the fingerprint hashes.
     pub lines: Vec<String>,
     pub content: u64,
+    /// Where the file was carried from: its address in the index it came from
+    /// and the address of its source archive there.
+    pub carried: Option<(String, Option<String>)>,
 }
 
 /// The packages this run of xtask wrote to `target/pkg/`: an image takes the
@@ -569,6 +576,7 @@ pub fn image_files(
             out: None,
             recipe: false,
             replace: Vec::new(),
+            previous: None,
         })?;
     }
     let plain = crate::target_dir().join("pkg");
@@ -592,6 +600,7 @@ pub fn image_files(
                     .iter()
                     .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
                     .collect(),
+                previous: None,
             })?;
             dir
         };
@@ -675,6 +684,57 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         return Ok(Vec::new());
     }
     let tree = crate::root();
+    // The packages of a published index that did not change are carried; the
+    // releases of the plan go to the descriptions.
+    let mut carried: BTreeMap<String, (Vec<u8>, String, Option<String>)> = BTreeMap::new();
+    if let Some(base) = &opts.previous {
+        let roots = carry::roots_for(base, &tree)?;
+        let previous = carry::load(base, &series(), &carry::fetch, &roots)?;
+        let wanted: Vec<carry::Wanted<'_>> = selected
+            .iter()
+            .map(|p| carry::Wanted {
+                name: &p.name,
+                version: &p.version,
+                recipe: &recipes[&p.name].0,
+            })
+            .collect();
+        let mut plan = carry::plan(previous.as_ref(), &wanted, &carry::fetch, &roots)?;
+        if !opts.names.is_empty() {
+            plan.leaving.clear();
+        }
+        for line in carry::describe(&plan, previous.as_ref(), &series()) {
+            println!("{line}");
+        }
+        carry::set_releases(
+            plan.fates
+                .iter()
+                .map(|(n, f)| (n.clone(), f.release().to_string()))
+                .collect(),
+        );
+        let dir = carry::directory();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let serial = previous.as_ref().map_or(0, |p| p.serial);
+        std::fs::write(dir.join("previous-serial"), format!("{serial}\n"))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        for (name, fate) in plan.fates {
+            if let carry::Fate::Carried {
+                bytes,
+                address,
+                source,
+                ..
+            } = fate
+            {
+                carried.insert(name, (bytes, address, source));
+            }
+        }
+    }
+    // The descriptions again: they carry the releases of the plan.
+    let names: Vec<String> = selected.iter().map(|p| p.name.clone()).collect();
+    let all = packages::load()?;
+    let selected: Vec<&Package> = names
+        .iter()
+        .map(|n| all.iter().find(|p| p.name == *n).expect("loaded before"))
+        .collect();
     let signing = keys::signing(opts.key.as_deref(), opts.cert.as_deref(), &tree)?;
     let commit = commit()?;
     let pin = crate::script_value("tools/build-relibc.py", "COMMIT")?;
@@ -688,6 +748,36 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
     let mut built = Vec::new();
     for p in selected {
         let recipe = recipes[&p.name].0.clone();
+        if let Some((bytes, address, source)) = carried.remove(&p.name) {
+            let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", p.name))?;
+            let path = out_dir.join(file_name(p));
+            let temp = path.with_extension("stpkg.part");
+            std::fs::write(&temp, &bytes).map_err(|e| format!("{}: {e}", temp.display()))?;
+            std::fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+            if opts.out.is_none() {
+                BUILT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(p.name.clone());
+            }
+            println!(
+                "{}  {} bytes  carried from {}",
+                path.display(),
+                bytes.len(),
+                address
+            );
+            built.push(Built {
+                package: p.clone(),
+                path,
+                size: bytes.len() as u64,
+                entries: file.rootfs.len(),
+                lines: recipes[&p.name].1.clone(),
+                recipe,
+                content: file.meta.size,
+                carried: Some((address, source)),
+            });
+            continue;
+        }
         let relibc = format!("pin-{}", &pin[..8]);
         let build = notices::Build {
             commit: &commit,
@@ -804,6 +894,7 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
             lines: recipes[&p.name].1.clone(),
             recipe,
             content: file.meta.size,
+            carried: None,
         });
     }
     println!(
@@ -823,6 +914,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         out: None,
         recipe: false,
         replace: Vec::new(),
+        previous: None,
     };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<String, String> {
@@ -844,6 +936,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 );
             }
             "--recipe" => o.recipe = true,
+            "--previous" => o.previous = Some(value(&mut i)?),
             name if !name.starts_with("--") => o.names.push(name.to_string()),
             other => return Err(format!("{other}: unknown argument")),
         }
@@ -852,7 +945,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     Ok(o)
 }
 
-/// `cargo xtask pkg-build [name...] [--key K.key --cert K.cert] [--time SECONDS] [--out D] [--recipe]`.
+/// `cargo xtask pkg-build [name...] [--key K.key --cert K.cert] [--time SECONDS] [--out D] [--recipe] [--previous INDEX_DIR_OR_ADDRESS]`.
 pub fn command(args: &[String]) -> Result<(), String> {
     build(&parse_options(args)?).map(drop)
 }

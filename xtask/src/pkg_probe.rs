@@ -194,6 +194,7 @@ fn make_good(states: &Path) -> Result<PathBuf, String> {
         out: None,
         recipe: false,
         replace: Vec::new(),
+        previous: None,
     })?;
     let all = packages::load()?;
     repo::make(

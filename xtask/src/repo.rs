@@ -21,6 +21,7 @@ const DAY: u64 = 86_400;
 /// An index is good for at most this many days (spec 5, 3.7).
 const EXPIRES_MAX_DAYS: u64 = 30;
 
+#[derive(Clone)]
 pub struct Options {
     pub serial: u64,
     pub expires_days: u64,
@@ -31,6 +32,14 @@ pub struct Options {
     pub check: bool,
     pub official: bool,
     pub dir: Option<PathBuf>,
+    /// The directory or address of the published index to carry from.
+    pub previous: Option<String>,
+    /// A directory of package files to write an index for, without a build.
+    pub from: Option<PathBuf>,
+    /// The release of the storage new files are stored in (`v0.3.0-aarch64`).
+    pub storage: Option<String>,
+    /// `--serial` was given.
+    pub serial_given: bool,
 }
 
 impl Default for Options {
@@ -45,6 +54,10 @@ impl Default for Options {
             check: false,
             official: false,
             dir: None,
+            previous: None,
+            from: None,
+            storage: None,
+            serial_given: false,
         }
     }
 }
@@ -64,7 +77,11 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             String::new()
         };
         match flag {
+            "--previous" => o.previous = Some(value),
+            "--from" => o.from = Some(value.into()),
+            "--storage" => o.storage = Some(value),
             "--serial" => {
+                o.serial_given = true;
                 o.serial = value
                     .parse()
                     .map_err(|_| format!("--serial {value}: not a number"))?
@@ -142,90 +159,45 @@ fn prepare(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// The whole of `repo` for the packages built: the directory.
-pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, String> {
+/// One entry of the index with the text it borrows from.
+struct Row {
+    name: String,
+    version: String,
+    digest: String,
+    file: String,
+    size: u64,
+    source: Option<String>,
+    provides: Option<String>,
+    depends: Option<String>,
+    needs: Option<String>,
+    license: String,
+    recipe: String,
+    summary: String,
+}
+
+/// Writes `INDEX`, `INDEX.sig`, `revoked` and `revoked.sig` for `rows` into
+/// `dir`. The index is signed by the release key; the list is the development
+/// root's empty one, or with `--official` the file of `keys/`.
+fn write_repository(dir: &Path, rows: &[Row], o: &Options) -> Result<(), String> {
     let tree = crate::root();
-    let dir = o.dir.clone().unwrap_or_else(directory);
-    prepare(&dir)?;
-    std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let dev = keys::dev_keys(&tree)?;
     let signing = keys::signing(o.key.as_deref(), o.cert.as_deref(), &tree)?;
-    let commit = pkg::commit()?;
-    let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
-    // The text the entries borrow.
-    struct Row {
-        version: String,
-        digest: String,
-        file: String,
-        size: u64,
-        source: Option<String>,
-        provides: Option<String>,
-        depends: Option<String>,
-        needs: Option<String>,
-    }
-    let mut rows: Vec<Row> = Vec::new();
-    for b in built {
-        let name = pkg::file_name(&b.package);
-        let bytes = std::fs::read(&b.path).map_err(|e| format!("{}: {e}", b.path.display()))?;
-        std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("{name}: {e}"))?;
-        let source = if o.sources {
-            notices::source_archive(&b.package, all)
-        } else {
-            None
-        };
-        if let Some(archive) = &source {
-            let inputs = crate::target_dir()
-                .join("pkg/work")
-                .join(format!("{}.inputs", b.package.name));
-            std::fs::write(&inputs, b.lines.join("\n") + "\n")
-                .map_err(|e| format!("{}: {e}", inputs.display()))?;
-            crate::run_cmd(
-                Command::new("python3")
-                    .arg(tree.join("tools/pkg-source.py"))
-                    .args([
-                        "build",
-                        "--name",
-                        &b.package.name,
-                        "--commit",
-                        &commit,
-                        "--relibc",
-                        &relibc,
-                    ])
-                    .arg("--out")
-                    .arg(dir.join(archive))
-                    .arg("--inputs")
-                    .arg(&inputs),
-            )?;
-        }
-        let file = PackageFile::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
-        let join = |l: &Vec<String>| (!l.is_empty()).then(|| l.join(" "));
-        rows.push(Row {
-            version: format!("{}-{}", file.meta.version, file.meta.release),
-            digest: sha_hex(&bytes),
-            file: name,
-            size: bytes.len() as u64,
-            source,
-            provides: join(&b.package.provides),
-            depends: join(&b.package.depends),
-            needs: join(&b.package.needs),
-        });
-    }
-    let entries: Vec<Entry<'_>> = built
+    let mut rows: Vec<&Row> = rows.iter().collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    let entries: Vec<Entry<'_>> = rows
         .iter()
-        .zip(&rows)
-        .map(|(b, r)| Entry {
-            name: &b.package.name,
+        .map(|r| Entry {
+            name: &r.name,
             version: &r.version,
             provides: r.provides.as_deref(),
             depends: r.depends.as_deref(),
             needs: r.needs.as_deref(),
-            license: &b.package.license,
+            license: &r.license,
             size: r.size,
             sha256: &r.digest,
-            recipe: &b.recipe,
+            recipe: &r.recipe,
             file: &r.file,
             source: r.source.as_deref(),
-            summary: &b.package.summary,
+            summary: &r.summary,
         })
         .collect();
     let signed_at = now();
@@ -268,6 +240,15 @@ pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, St
     std::fs::write(dir.join("INDEX"), &text).map_err(|e| format!("INDEX: {e}"))?;
     std::fs::write(dir.join("INDEX.sig"), block.to_bytes())
         .map_err(|e| format!("INDEX.sig: {e}"))?;
+    if o.official {
+        // The list of the owner, as the tree keeps it.
+        for name in ["revoked", "revoked.sig"] {
+            let from = tree.join("keys").join(name);
+            std::fs::copy(&from, dir.join(name)).map_err(|e| format!("{}: {e}", from.display()))?;
+        }
+        return Ok(());
+    }
+    let dev = keys::dev_keys(&tree)?;
     let list = revoked::write(1, &[]).map_err(|e| format!("revoked: {e}"))?;
     let rblock = Block::sign(
         &dev.root_seed,
@@ -281,7 +262,168 @@ pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, St
     std::fs::write(dir.join("revoked"), &list).map_err(|e| format!("revoked: {e}"))?;
     std::fs::write(dir.join("revoked.sig"), rblock.to_bytes())
         .map_err(|e| format!("revoked.sig: {e}"))?;
+    Ok(())
+}
+
+/// The name of a file that `carried.txt` of a build directory lists: a
+/// package carried from an index, with the address of its file and of its
+/// source archive (`-` for none), separated by tabs.
+pub const CARRIED: &str = "carried.txt";
+
+/// The address of a file of the new packages in the storage of a release.
+fn stored(storage: &str, name: &str) -> String {
+    format!("https://github.com/stafeto/packages/releases/download/{storage}/{name}")
+}
+
+/// The whole of `repo` for the packages built: the directory.
+pub fn make(built: &[Built], all: &[Package], o: &Options) -> Result<PathBuf, String> {
+    let tree = crate::root();
+    let dir = o.dir.clone().unwrap_or_else(directory);
+    prepare(&dir)?;
+    std::fs::create_dir_all(dir.join("src")).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let commit = pkg::commit()?;
+    let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
+    let mut rows: Vec<Row> = Vec::new();
+    let mut carried_lines = String::new();
+    for b in built {
+        let name = pkg::file_name(&b.package);
+        let bytes = std::fs::read(&b.path).map_err(|e| format!("{}: {e}", b.path.display()))?;
+        std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("{name}: {e}"))?;
+        let source = match &b.carried {
+            Some((_, source)) => source.clone(),
+            None if o.sources => notices::source_archive(&b.package, all),
+            None => None,
+        };
+        if b.carried.is_none()
+            && let Some(archive) = &source
+        {
+            let inputs = crate::target_dir()
+                .join("pkg/work")
+                .join(format!("{}.inputs", b.package.name));
+            std::fs::write(&inputs, b.lines.join("\n") + "\n")
+                .map_err(|e| format!("{}: {e}", inputs.display()))?;
+            crate::run_cmd(
+                Command::new("python3")
+                    .arg(tree.join("tools/pkg-source.py"))
+                    .args([
+                        "build",
+                        "--name",
+                        &b.package.name,
+                        "--commit",
+                        &commit,
+                        "--relibc",
+                        &relibc,
+                    ])
+                    .arg("--out")
+                    .arg(dir.join(archive))
+                    .arg("--inputs")
+                    .arg(&inputs),
+            )?;
+        }
+        let file = PackageFile::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        let join = |l: &Vec<String>| (!l.is_empty()).then(|| l.join(" "));
+        let (file_field, source_field) = match &b.carried {
+            Some((address, source)) => {
+                carried_lines.push_str(&format!(
+                    "{name}\t{address}\t{}\n",
+                    source.as_deref().unwrap_or("-")
+                ));
+                (address.clone(), source.clone())
+            }
+            None => (name.clone(), source),
+        };
+        rows.push(Row {
+            name: b.package.name.clone(),
+            version: format!("{}-{}", file.meta.version, file.meta.release),
+            digest: sha_hex(&bytes),
+            file: file_field,
+            size: bytes.len() as u64,
+            source: source_field,
+            provides: join(&b.package.provides),
+            depends: join(&b.package.depends),
+            needs: join(&b.package.needs),
+            license: b.package.license.clone(),
+            recipe: b.recipe.clone(),
+            summary: b.package.summary.clone(),
+        });
+    }
+    if !carried_lines.is_empty() {
+        std::fs::write(dir.join(CARRIED), carried_lines)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    write_repository(&dir, &rows, o)?;
     Ok(dir)
+}
+
+/// `repo --from DIR`: the index of the package files in `DIR`, written next to
+/// them without a build. A package listed in `carried.txt` keeps the address
+/// of its file; the others get `file` and `source` in the storage `o.storage`
+/// (as full addresses) or as plain names.
+pub fn from_files(dir: &Path, o: &Options) -> Result<usize, String> {
+    let carried: std::collections::BTreeMap<String, (String, Option<String>)> =
+        match std::fs::read_to_string(dir.join(CARRIED)) {
+            Ok(text) => text
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split('\t');
+                    let name = f.next()?.to_string();
+                    let address = f.next()?.to_string();
+                    let source = f.next().filter(|s| *s != "-").map(str::to_string);
+                    Some((name, (address, source)))
+                })
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".stpkg"))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(format!("{}: no .stpkg file", dir.display()));
+    }
+    let place = |name: &str| match &o.storage {
+        Some(storage) => stored(storage, name),
+        None => name.to_string(),
+    };
+    let mut rows = Vec::new();
+    for name in &names {
+        let bytes = std::fs::read(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        let file = PackageFile::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        let m = &file.meta;
+        let list = |v: &str| (v != "-").then(|| v.to_string());
+        let (file_field, source) = match carried.get(name) {
+            Some((address, source)) => (address.clone(), source.clone()),
+            None => {
+                let stem = name.trim_end_matches(".stpkg");
+                let archive = format!("src/{stem}-src.tar.xz");
+                let source = dir.join(&archive).is_file().then(|| match &o.storage {
+                    Some(storage) => stored(storage, &format!("{stem}-src.tar.xz")),
+                    None => archive,
+                });
+                (place(name), source)
+            }
+        };
+        rows.push(Row {
+            name: m.name.to_string(),
+            version: format!("{}-{}", m.version, m.release),
+            digest: sha_hex(&bytes),
+            file: file_field,
+            size: bytes.len() as u64,
+            source,
+            provides: list(m.provides),
+            depends: list(m.depends),
+            needs: list(m.needs),
+            license: m.license.to_string(),
+            recipe: m.recipe.to_string(),
+            summary: m.summary.to_string(),
+        });
+    }
+    write_repository(dir, &rows, o)?;
+    Ok(rows.len())
 }
 
 /// The size of the packages of the series and of the base ones, in bytes.
@@ -335,7 +477,14 @@ pub fn check(dir: &Path, roots: &[Key]) -> Result<usize, String> {
     .map_err(|e| fail("INDEX.sig", e.to_string()))?;
     let mut count = 0;
     for e in index.entries() {
-        let bytes = read(e.file)?;
+        // A carried package has the address of its file in the index; the
+        // build keeps a copy of it by its name.
+        let local = if e.file.starts_with("https://") {
+            e.file.rsplit('/').next().unwrap_or(e.file)
+        } else {
+            e.file
+        };
+        let bytes = read(local)?;
         if bytes.len() as u64 != e.size {
             return Err(fail(
                 e.file,
@@ -379,8 +528,24 @@ pub fn command(args: &[String]) -> Result<(), String> {
 
 pub fn run(o: &Options) -> Result<PathBuf, String> {
     let tree = crate::root();
-    if o.official && (o.root.is_some() || !o.check) {
-        return Err("--official goes with --check and not with --root".into());
+    if o.official && o.root.is_some() {
+        return Err("--official takes the roots of keys/ and goes without --root".into());
+    }
+    if o.from.is_some() && (o.check || o.previous.is_some() || o.dir.is_some()) {
+        return Err(
+            "--from writes next to the files it reads: no --check, --previous or --dir".into(),
+        );
+    }
+    if o.storage.is_some() && o.from.is_none() {
+        return Err("--storage goes with --from".into());
+    }
+    if let Some(dir) = &o.from {
+        let n = from_files(dir, o)?;
+        println!(
+            "repo --from: the index of {n} packages in {}",
+            dir.display()
+        );
+        return Ok(dir.clone());
     }
     let roots = match &o.root {
         _ if o.official => keys::official_roots(&tree)?,
@@ -405,16 +570,24 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
     }
     let started = std::time::Instant::now();
     let built = pkg::build(&pkg::Options {
-        names: Vec::new(),
         key: o.key.clone(),
         cert: o.cert.clone(),
-        time: None,
-        out: None,
-        recipe: false,
-        replace: Vec::new(),
+        previous: o.previous.clone(),
+        ..pkg::Options::default()
     })?;
+    // The serial after the one of the index carried from, unless given.
+    let mut options = o.clone();
+    if o.previous.is_some() && !o.serial_given {
+        let text = std::fs::read_to_string(crate::carry::directory().join("previous-serial"))
+            .map_err(|e| format!("previous-serial: {e}"))?;
+        options.serial = text
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("previous-serial: {e}"))?
+            + 1;
+    }
     let all = packages::load()?;
-    let dir = make(&built, &all, o)?;
+    let dir = make(&built, &all, &options)?;
     let (total, base) = sizes(&built);
     println!(
         "repo: {} packages in {} ({} bytes of packages, {} of base packages), {:.0} s",
@@ -668,5 +841,86 @@ mod tests {
         assert!(parse_options(&words(&["--expires-days", "0"])).is_err());
         assert!(parse_options(&words(&["--serial"])).is_err());
         assert!(parse_options(&words(&["--verbose"])).is_err());
+    }
+
+    #[test]
+    fn an_index_from_files_names_the_storage_and_keeps_carried_addresses() {
+        let (dir, _) = repository("from");
+        std::fs::remove_file(dir.join("INDEX")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/demo-1.0-1-src.tar.xz"), b"s").unwrap();
+        let o = Options {
+            storage: Some("v0.3.0-aarch64".into()),
+            serial: 9,
+            ..Options::default()
+        };
+        assert_eq!(from_files(&dir, &o).unwrap(), 1);
+        let text = std::fs::read_to_string(dir.join("INDEX")).unwrap();
+        let index = Index::parse(&text).unwrap();
+        assert_eq!(index.header.serial, 9);
+        let entries: Vec<Entry<'_>> = index.entries().collect();
+        let base = "https://github.com/stafeto/packages/releases/download/v0.3.0-aarch64";
+        assert_eq!(entries[0].name, "demo");
+        assert_eq!(entries[0].file, format!("{base}/demo-1.0-1.stpkg"));
+        assert_eq!(
+            entries[0].source,
+            Some(format!("{base}/demo-1.0-1-src.tar.xz").as_str())
+        );
+        // The index verifies with the development root; without a storage the names stay.
+        let dev = keys::dev_keys(&crate::root()).unwrap();
+        let iblock = Block::parse(&std::fs::read(dir.join("INDEX.sig")).unwrap()).unwrap();
+        assert!(
+            pkgfmt::trust::verify(
+                &iblock,
+                Kind::Index,
+                &sha::sha256(text.as_bytes()),
+                text.len() as u64,
+                &Trust {
+                    roots: &[dev.root],
+                    direct: &[]
+                },
+                &[]
+            )
+            .is_ok()
+        );
+        from_files(&dir, &Options::default()).unwrap();
+        assert!(
+            std::fs::read_to_string(dir.join("INDEX"))
+                .unwrap()
+                .contains("file demo-1.0-1.stpkg")
+        );
+        // A carried file keeps the address of the index it came from.
+        std::fs::write(
+            dir.join(CARRIED),
+            "demo-1.0-1.stpkg\thttps://stafeto.github.io/packages/0.2/aarch64/demo-1.0-1.stpkg\t-\n",
+        )
+        .unwrap();
+        from_files(&dir, &o).unwrap();
+        let text = std::fs::read_to_string(dir.join("INDEX")).unwrap();
+        let index = Index::parse(&text).unwrap();
+        let entry = index.entries().next().unwrap();
+        assert_eq!(
+            entry.file,
+            "https://stafeto.github.io/packages/0.2/aarch64/demo-1.0-1.stpkg"
+        );
+        assert_eq!(entry.source, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_options_of_repo_keep_their_rules() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse_options(&args(&["--previous", "d", "--serial", "4"])).unwrap();
+        assert!(o.serial_given && o.serial == 4 && o.previous.as_deref() == Some("d"));
+        assert!(!parse_options(&args(&[])).unwrap().serial_given);
+        assert!(
+            parse_options(&args(&["--official", "--check"]))
+                .unwrap()
+                .official
+        );
+        let bad = |v: &[&str]| run(&parse_options(&args(v)).unwrap()).unwrap_err();
+        assert!(bad(&["--from", "x", "--check"]).contains("--from"));
+        assert!(bad(&["--storage", "x"]).contains("--from"));
+        assert!(bad(&["--official", "--root", "r.pub"]).contains("--official"));
     }
 }
