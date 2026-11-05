@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The packages of the Linux guest of the measurement of the network
+# (tools/build-linux-guest.py), pinned by SHA-256. The build takes exactly
+# these files and resolves no dependency: the list is the closure of nginx,
+# the openssl program (the digests of the check), BusyBox, iperf3 and the
+# kernel's modules for virtio-net, found in the
+# APKINDEX of the branch on 2026-11-05. When Alpine drops a build from the
+# branch the build stops and says which package left; update the pins here
+# and record them in the report of the measurement.
+
+mirror = "https://dl-cdn.alpinelinux.org/alpine"
+branch = "v3.24"
+repository = "main"
+arch = "aarch64"
+
+[[package]]
+name = "musl"
+version = "1.2.6-r3"
+sha256 = "2e17864102278d9049c3a56f1bceed9e8cf287065617e579325123443daed8a5"
+license = "MIT"
+
+[[package]]
+name = "busybox"
+version = "1.37.0-r31"
+sha256 = "18e3490a6f024004b2b13dd4b54bd50ccd82894938023b2d4eab389a4edcba70"
+license = "GPL-2.0-only"
+
+[[package]]
+name = "alpine-baselayout-data"
+version = "3.7.2-r1"
+sha256 = "01afabfafb08de6f694b7d764f4cfa965e6adabba05afca0b8efd1b6f9b4cd85"
+license = "GPL-2.0-only"
+
+[[package]]
+name = "zlib"
+version = "1.3.2-r1"
+sha256 = "1f77a542ac6634761b9fe38d8bdca19b154071dcfa25432e73f2bc8a0740a33f"
+license = "Zlib"
+
+[[package]]
+name = "pcre2"
+version = "10.49-r0"
+sha256 = "03efd0b29f7f38deb10a9ccb54f56e19683eb7ac27eb1f347e6dbd2e59ea000d"
+license = "BSD-3-Clause"
+
+[[package]]
+name = "libcrypto3"
+version = "3.5.9-r0"
+sha256 = "2676a2b0b6e23ea2edccf3ee982b9842a665d52603d047de3d0a185dc316d983"
+license = "Apache-2.0"
+
+[[package]]
+name = "libssl3"
+version = "3.5.9-r0"
+sha256 = "20ac252b276d73f2c69c1d25f84537c7fba81caefc026c6be1094b394af2082e"
+license = "Apache-2.0"
+
+[[package]]
+name = "openssl"
+version = "3.5.9-r0"
+sha256 = "aa27b9edfeffbf7ebafbcf29df3f02eef4bf50f793a4874ae2f52aba6b53e653"
+license = "Apache-2.0"
+
+[[package]]
+name = "nginx"
+version = "1.30.6-r0"
+sha256 = "d2b69ba1998378febf33a7e6c239c94117f34661a1e9b1d3f80889242ddb7779"
+license = "BSD-2-Clause"
+
+[[package]]
+name = "iperf3"
+version = "3.20-r0"
+sha256 = "0e1ec96c16837dbb8ae3f67768ec3e9039a32e94677ea81b7a86f7da9d8f095e"
+license = "BSD-3-Clause-LBNL"
+
+[[package]]
+name = "linux-virt"
+version = "6.18.60-r0"
+sha256 = "b931f14a93634469cc8930afe5d6837361325456b620b94e970bb981d841c99c"
+license = "GPL-2.0-only"

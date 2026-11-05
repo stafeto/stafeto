@@ -428,6 +428,7 @@ pub fn check() -> Result<(), String> {
         "boot-nginx-probe.img",
         "boot-nginx-bench.img",
         "boot-nginx-bench-vz-nobuf.img",
+        "boot-net-bench.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -520,7 +521,8 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
-        | "boot-nginx-bench-vz-nobuf.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
+        | "boot-nginx-bench-vz-nobuf.img"
+        | "boot-net-bench.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
         // The shell's image with the probe of F-Stack runs no network
         // service.
         "boot-fstack-probe.img" => of(&[Kind::Base, Kind::Addon]),

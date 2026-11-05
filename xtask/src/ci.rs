@@ -485,7 +485,8 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     // The images of nginx's measurement: the measurement itself runs by hand
     // on a Mac (HVF and VZ), so ci builds what it boots.
     steps.push(step("net", "nginx-bench images", &net_needs, || {
-        super::nginx_bench::build_images()
+        super::nginx_bench::build_images()?;
+        super::linux_guest::build_image().map(|_| ())
     }));
 
     // os-test: a boot a suite, and the complete basic suite.

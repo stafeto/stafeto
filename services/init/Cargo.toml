@@ -99,6 +99,9 @@ table-pci-walk-vz = []
 # The shell with the network service on Apple VZ, one and two network devices.
 table-net-vz = []
 table-net-vz2 = []
+# The image of the measurement of stage P7: the shell on VZ with the network
+# service and the shell's processes on four CPUs (table/bench.rs).
+table-bench-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.
