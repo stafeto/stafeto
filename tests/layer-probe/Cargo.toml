@@ -1,0 +1,19 @@
+[package]
+name = "layer-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The leader of the layer probe: attaches and detaches layers of the RAM file service through its layer session"
+
+[[bin]]
+name = "layer-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-fs = { path = "../../lib/posix-fs" }
+proto-fs = { path = "../../proto/fs" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

@@ -1300,6 +1300,14 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 },
             ),
         ],
+        // The layer probe: the directories of its layers (xtask layer_probe adds the layers
+        // as files of /test/layers; /etc/passwd comes with the accounts, for a layer to clash with)
+        // and the devices the POSIX layer opens.
+        "boot-layer-probe.img" | "boot-layer-probe-steps.img" => {
+            let mut files = vec![dir("/dev"), dir("/test"), dir("/test/layers")];
+            files.extend(devices());
+            files
+        }
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
         "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
         // The shell's image with the probe of F-Stack.

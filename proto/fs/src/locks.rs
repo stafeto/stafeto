@@ -218,12 +218,11 @@ mod tests {
         }
         assert_eq!(Method::from_number(50), Some(Method::LockStart));
         assert!(crate::METHODS.contains(&50));
-        // 52 is CloneMore (stafeto-design#578); 51 and 53 stay reserved.
+        // 52 is CloneMore (stafeto-design#578); 51 and 53 are the layer methods.
         assert_eq!(Method::from_number(52), Some(Method::CloneMore));
-        for number in [51, 53] {
-            assert_eq!(Method::from_number(number), None);
-            assert!(!crate::METHODS.contains(&number));
-        }
+        assert_eq!(Method::from_number(51), Some(Method::LayerStart));
+        assert_eq!(Method::from_number(53), Some(Method::LayerStep));
+        assert!(crate::METHODS.contains(&51) && crate::METHODS.contains(&53));
     }
 
     #[test]

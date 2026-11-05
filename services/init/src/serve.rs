@@ -1212,6 +1212,14 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         let client = &TABLE[place];
+        // The layer session of the RAM service is the RAM service under another name and
+        // another mark, for the one client the table names (table::LAYER_CLIENTS).
+        let layers = table::layer_grant(client, name.as_bytes());
+        let name = if layers {
+            Name::new(table::RAM_SERVICE.as_bytes()).expect("a checked table has names")
+        } else {
+            name
+        };
         // The sessions of the process service come in start data; a
         // service of VOUCHERS gets one of its own, a notary session, whose
         // label says so (proto_process::NOTARY).
@@ -1223,7 +1231,12 @@ impl Init {
         // (proto_process::SET_ID); the process service's session with
         // the RAM file service is that of the loaders, which it copies
         // for each (proto_fs::LOADERS).
-        let grant = if notary {
+        let grant = if layers {
+            Grant {
+                mark: proto_fs::LAYERS,
+                duplicate: false,
+            }
+        } else if notary {
             let set_id = table::SET_ID_VOUCHERS.contains(&client.name);
             let terminal = client.name == table::TERMINAL_SERVICE;
             let mut mark = proto_process::NOTARY;

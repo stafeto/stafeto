@@ -5,10 +5,10 @@
 //! Ready bytes retain their exact original result through chunk retries.
 
 use super::*;
-use crate::storage::{NODES, NONE, PAGE, ROOT};
+use crate::storage::{DEPTH_NODES, NONE, PAGE, ROOT};
 use proto_fs::{INVALID_ARGUMENT, MAX_PATH, MAX_READ, NO_ENTRY, RESOLVING};
 const INLINE: usize = MAX_PATH + 1;
-const MAX_LENGTH: usize = (NODES - 1) * 256 + 1;
+const MAX_LENGTH: usize = (DEPTH_NODES - 1) * 256 + 1;
 pub(crate) const MAX_PAGES: usize = MAX_LENGTH.div_ceil(PAGE);
 pub(crate) const NO_MEMORY: u32 = proto_wire::Status::Kernel(abi::Error::NoMemory).code();
 
@@ -268,7 +268,7 @@ impl GetcwdJournal {
                 if self.current == ROOT {
                     return self.finish_walk(storage);
                 }
-                if self.depth as usize >= NODES - 1 {
+                if self.depth as usize >= DEPTH_NODES - 1 {
                     return Ok(self.fail(NO_ENTRY));
                 }
                 let node = storage.node(self.current)?;

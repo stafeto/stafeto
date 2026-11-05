@@ -61,6 +61,7 @@ mod image;
 mod input_probe;
 mod jobs;
 mod keys;
+mod layer_probe;
 mod linux_guest;
 mod measure;
 mod monitor;
@@ -1808,6 +1809,8 @@ commands:
   posix-random run the C probe of getentropy, getrandom and fork in QEMU
   posix-display run the C probe of the display service's session in fork, spawn and exec, and of the display piece of the map, in QEMU
   display-probe run the C probe of the screen and the keys of libc.so in QEMU: stafeto_display_open, _flush, _close and stafeto_input_read, the screen compared with QEMU's screenshot, keys sent by the monitor, fork, exec, a restart of the display service
+  layer-probe [steps] attach and detach layers of the RAM file service in QEMU; steps
+            measures the steps of the layer calls under -icount
   posix-sock run the C probe of sockets in QEMU
   posix-sock-steps measure the steps of the socket calls under -icount, against term B
   posix-ipc run the C probe of message queues, semaphores and shared memory in QEMU
@@ -1959,6 +1962,7 @@ fn main() {
         Some("posix-lock-ring") => posix_lock_ring_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
+        Some("layer-probe") => layer_probe::dispatch(&args[1..]),
         Some("posix-sock") => posix_sock_probe(),
         Some("posix-sock-steps") => posix_sock_steps(),
         Some("posix-ipc") => posix_ipc_probe(),
@@ -5797,7 +5801,7 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 23] = [
+const RAM_STEP_KINDS: [(usize, &str); 25] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -5813,6 +5817,8 @@ const RAM_STEP_KINDS: [(usize, &str); 23] = [
     (25, "FinishBinding"),
     (34, "CloneExact"),
     (52, "CloneMore"),
+    (51, "LayerStart"),
+    (53, "LayerStep"),
     (44, "ChangeStart"),
     (45, "ChangeSecond"),
     (46, "ChangeStep"),
@@ -8884,6 +8890,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-jobs", posix_jobs_probe),
         job("loader-channels", loader_channels_probe),
         job("posix-poll", posix_poll_probe),
+        job("layer-probe", || layer_probe::dispatch(&[])),
+        job("layer-probe steps", || {
+            layer_probe::dispatch(&["steps".to_owned()])
+        }),
         job("posix-sock", posix_sock_probe),
         job("posix-sock-steps", posix_sock_steps),
         job("posix-ipc", posix_ipc_probe),
@@ -12050,6 +12060,10 @@ fn ci_lints() -> Result<(), String> {
         "posix-sync-probe",
         "--package",
         "posix-resources-probe",
+        "--package",
+        "layer-probe",
+        "--package",
+        "layer-user",
         "--package",
         "posix-map-probe",
         "--package",

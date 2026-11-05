@@ -1,0 +1,17 @@
+[package]
+name = "layer-user"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The POSIX program of the layer probe: looks at the layers of the RAM file service and is the program a layer holds"
+build = "build.rs"
+
+[[bin]]
+name = "layer-user"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

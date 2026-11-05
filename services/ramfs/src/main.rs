@@ -12,7 +12,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
-use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION};
+use proto_fs::{LayerOp, LayerReply, LayerStart, LayerStep, MAX_READ, MAX_WRITE, Method, VERSION};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
 use proto_wire::clones::Clones;
@@ -27,17 +27,19 @@ use ramfs::locks::simple_wait::Waits;
 use ramfs::locks::wait_receipts::Queue as WaitQueue;
 use ramfs::open::{Journal as OpenJournal, Phase as OpenPhase};
 use ramfs::resolve::{Intent, Progress, Resolve};
+use ramfs::storage::layers::{LAYERS_MAX, Limits};
 use ramfs::storage::{NONE, Root, Token};
 use ramfs::tree::{self, Index};
 use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
 use rt::abi::{Access, Rights};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Resource, Timer};
-use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
+use rt::service::{Answer, Config, Heartbeat, Pending, Request, Service, Session};
 use rt::sys;
 
 mod clock_page;
 mod lifetime_page;
+mod mapper;
 
 rt::entry!(main);
 
@@ -53,16 +55,19 @@ const BASE_METHODS: &[u16] = &[
 #[cfg(not(any(
     feature = "steps",
     feature = "lifetime-probe",
+    feature = "layer-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 )))]
 const METHODS: &[u16] = BASE_METHODS;
 #[cfg(any(
     feature = "steps",
     feature = "lifetime-probe",
+    feature = "layer-probe",
     all(feature = "signal-probe", not(feature = "steps"))
 ))]
 const METHODS: &[u16] = &{
     let mut methods = [0; BASE_METHODS.len()
+        + 2 * cfg!(feature = "layer-probe") as usize
         + cfg!(feature = "steps") as usize
         + 3 * cfg!(feature = "lifetime-probe") as usize
         + cfg!(all(feature = "signal-probe", not(feature = "steps"))) as usize];
@@ -70,6 +75,11 @@ const METHODS: &[u16] = &{
     while i < BASE_METHODS.len() {
         methods[i] = BASE_METHODS[i];
         i += 1;
+    }
+    if cfg!(feature = "layer-probe") {
+        methods[i] = 0xfff0;
+        methods[i + 1] = 0xfff1;
+        i += 2;
     }
     if cfg!(feature = "steps") {
         methods[i] = 0xfff5;
@@ -158,7 +168,7 @@ static RAM: RamBss = RamBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
 /// The files of the boot image's table: the image is mapped from the
 /// start data (`bootimage`, given to this record by init), and the table is
 /// read. An image with no table, or no image, leaves the fixed tree alone.
-fn image_tree(start: &mut rt::startup::Startup) -> Option<tree::Tree<'static>> {
+fn image_tree(start: &mut rt::startup::Startup) -> Option<(tree::Tree<'static>, &'static [u8])> {
     let image = start.take::<Memory>("bootimage").ok()?;
     let size = sys::memory_info(&image).ok()?.size;
     sys::mem_map(&start.process, &image, 0, size, IMAGE, Access::Read).ok()?;
@@ -167,11 +177,49 @@ fn image_tree(start: &mut rt::startup::Startup) -> Option<tree::Tree<'static>> {
     // SAFETY: only the main thread reaches TABLE, here once.
     let index = unsafe { &mut *TABLE.0.get() };
     match tree::load(bytes, index) {
-        Ok(tree) => Some(tree),
+        Ok(tree) => Some((tree, bytes)),
         Err(tree::Error::Missing) => None,
         Err(error) => {
             rt::println!("ramfs: the table of the boot image is refused: {error:?}");
             None
+        }
+    }
+}
+
+/// Attaches every file of the boot image whose name ends in `.stpkg` as a layer, before the
+/// service registers: the same phases as an attach by a client, without portions. A layer that
+/// cannot go in is left out with a line that says why, and the service goes on.
+fn image_layers(ram: &mut Ram<'static>, image: &'static [u8], now: proto_fs::Timestamp) {
+    let Ok(container) = bootimg::BootImage::parse(image) else {
+        return;
+    };
+    for (n, file) in container.files().enumerate() {
+        if !file.name.ends_with(".stpkg") {
+            continue;
+        }
+        let number = proto_fs::IMAGE_LAYER_FIRST + n as u32;
+        match ram.storage.layer_attach_image(number, file.data, now) {
+            Ok(_) => {}
+            Err(LayerReply::Entry { status, entry }) => {
+                let reason = match status {
+                    proto_fs::CONFLICT => "the path is taken",
+                    proto_fs::BAD_MODE => "set-ID bit or owner",
+                    _ => "the table is refused",
+                };
+                rt::println!(
+                    "ramfs: layer {}: entry {}: {}, not attached",
+                    file.name,
+                    entry as i32,
+                    reason
+                );
+            }
+            Err(reply) => {
+                rt::println!(
+                    "ramfs: layer {}: entry -1: {:?}, not attached",
+                    file.name,
+                    reply
+                );
+            }
         }
     }
 }
@@ -198,7 +246,10 @@ fn main(_: u64) -> u64 {
     let Ok(now) = time_source.initial() else {
         return 9;
     };
-    let tree = image_tree(&mut start);
+    let (tree, image) = match image_tree(&mut start) {
+        Some((tree, image)) => (Some(tree), Some(image)),
+        None => (None, None),
+    };
     let Ok(backing) = sys::mem_create((ramfs::storage::PAGES * ramfs::storage::PAGE) as u64) else {
         return 5;
     };
@@ -249,10 +300,14 @@ fn main(_: u64) -> u64 {
         Ram::initialize_at(pointer, now, state, descriptions, wides, data, tree);
         &mut *pointer
     };
+    if let Some(image) = image {
+        image_layers(ram, image, now);
+    }
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
         return 2;
     };
+    let mapper = mapper::Mapper::start(&start.process, &channel, level).ok();
     if rt::service::register(&start.parent, &channel).is_err() {
         return 3;
     }
@@ -306,6 +361,10 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<Ram<'static>>()
             + core::mem::size_of::<ramfs::Descriptions>()
             + core::mem::size_of::<ramfs::Wides>()
+    );
+    rt::println!(
+        "ramfs: layers bytes={}",
+        ramfs::storage::layers::LAYERS_BYTES
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
@@ -377,6 +436,14 @@ fn main(_: u64) -> u64 {
         orphan_cursor: 0,
         orphan_count: 0,
         cancel_reported: 0,
+        mapper,
+        mapping: Mapping::Idle,
+        #[cfg(feature = "layer-probe")]
+        refuse_unmap: false,
+        layer_pending: None,
+        layer_channels: [const { None }; LAYERS_MAX],
+        layer_sizes: [0; LAYERS_MAX],
+        layer_levels: [1; LAYERS_MAX],
     };
     // Prepare the authentic notary page after publishing the RAM endpoint.
     // Standalone boot profiles may have no Process service.
@@ -388,7 +455,29 @@ fn main(_: u64) -> u64 {
     4
 }
 
+/// What the mapping thread is doing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    Idle,
+    /// Mapping the object of layer record `.0` for an attach.
+    Attaching(usize),
+    /// Unmapping layer record `.0`, which has no place left.
+    Releasing(usize),
+}
+
 struct Fs {
+    /// The thread that maps and unmaps the objects of layers, and what it does now.
+    mapper: Option<mapper::Mapper>,
+    mapping: Mapping,
+    #[cfg(feature = "layer-probe")]
+    refuse_unmap: bool,
+    /// The reply to the LayerStart of an attach, which waits for the mapping.
+    layer_pending: Option<Pending>,
+    /// For each layer record: the channel to tell its client of the release, the size of the
+    /// mapping and the level the client named.
+    layer_channels: [Option<Handle<Channel>>; LAYERS_MAX],
+    layer_sizes: [u64; LAYERS_MAX],
+    layer_levels: [u8; LAYERS_MAX],
     ram: &'static mut Ram<'static>,
     locks: &'static mut SimpleLocks,
     wait_jobs: &'static mut WaitQueue,
@@ -1543,6 +1632,277 @@ impl Fs {
     }
 }
 
+fn layer_reply(r: &mut Request<'_>, reply: LayerReply) -> Answer {
+    if reply.write(r.reply()).is_err() {
+        return Answer::Status(Status::BadSize);
+    }
+    Answer::Reply(Outgoing::new())
+}
+
+impl Fs {
+    /// A request of the layer session: LayerStart and LayerStep, nothing else.
+    fn layer_request(&mut self, r: &mut Request<'_>) -> Answer {
+        let answer = if r.method() == Method::LayerStart as u16 {
+            self.layer_start(r)
+        } else if r.method() == Method::LayerStep as u16 {
+            let Ok(step) = LayerStep::read(r.body()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            // Only the session that began the job goes on with it.
+            if self.ram.storage.layer_job().is_some()
+                && r.label() != self.ram.storage.layer_session()
+            {
+                return status(proto_fs::BUSY);
+            }
+            let now = self.time_source.now();
+            // The state the step started in, for the line of the step statistics (the
+            // detail of the longest step of a kind).
+            #[cfg(feature = "steps")]
+            if let Some(state) = self.ram.storage.layer_state(step.layer) {
+                rt::service::step_detail(state as u64);
+            }
+            let reply = self
+                .ram
+                .storage
+                .layer_step(step.layer, now, &Limits::PORTIONS);
+            layer_reply(r, reply)
+        } else {
+            return status(proto_fs::PERMISSION);
+        };
+        self.layer_pump();
+        answer
+    }
+
+    fn layer_start(&mut self, r: &mut Request<'_>) -> Answer {
+        let Ok(start) = LayerStart::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if start.op == LayerOp::Detach {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            return match self.ram.storage.layer_begin_detach(start.layer) {
+                Ok(()) => {
+                    self.ram.storage.layer_set_session(r.label());
+                    layer_reply(r, LayerReply::Resolving)
+                }
+                Err(code) => status(code),
+            };
+        }
+        if r.handles.len() != 2 {
+            return Answer::Status(Status::BadSize);
+        }
+        let writable = match r.handles.info(0) {
+            Some((rt::abi::ObjectKind::Memory, got)) if got.contains(Rights::MAP_READ) => {
+                got.contains(Rights::MAP_WRITE)
+            }
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        };
+        match r.handles.info(1) {
+            Some((rt::abi::ObjectKind::Channel, got)) if got.contains(Rights::NOTIFY) => {}
+            _ => return status(proto_fs::INVALID_ARGUMENT),
+        }
+        if writable {
+            return status(proto_fs::PERMISSION);
+        }
+        if u32::from(self.level) <= start.level {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        let (Ok(memory), Ok(channel)) = (r.handles.take::<Memory>(0), r.handles.take::<Channel>(1))
+        else {
+            return Answer::Status(Status::BadSize);
+        };
+        let (size, own) = sys::memory_info(&memory).map_or((0, 0), |i| (i.size, i.pages * 4096));
+        if size == 0 || !size.is_multiple_of(4096) || size > mapper::WINDOW_SIZE {
+            return status(proto_fs::NO_SPACE);
+        }
+        // An object of `mem_create`, with every page its own: the service reads it at each
+        // look at a name, and the window of a device is no place for that.
+        if own < size {
+            return status(proto_fs::INVALID_ARGUMENT);
+        }
+        // The tables the kernel prepays from the quota of the service for the mappings.
+        let prepaid: u64 = self
+            .layer_sizes
+            .iter()
+            .filter(|&&s| s != 0)
+            .map(|&s| ramfs::storage::layers::table_pages(s))
+            .sum();
+        if prepaid + ramfs::storage::layers::table_pages(size)
+            > ramfs::storage::layers::TABLE_PAGES_MAX
+        {
+            return status(proto_fs::NO_SPACE);
+        }
+        let Some(mapper) = self.mapper.as_ref().filter(|m| m.idle()) else {
+            return status(proto_fs::BUSY);
+        };
+        if self.mapping != Mapping::Idle {
+            return status(proto_fs::BUSY);
+        }
+        let label = r.label();
+        let index = match self.ram.storage.layer_begin_attach(start.layer, false) {
+            Ok(index) => index,
+            Err(code) => return status(code),
+        };
+        let Some(pending) = r.defer() else {
+            self.ram.storage.layer_unmapped(index);
+            return status(proto_fs::BUSY);
+        };
+        let level = start.level as u8;
+        if let Err(error) = mapper.map(level, memory, size, mapper::window(index)) {
+            self.ram.storage.layer_unmapped(index);
+            let _ = pending.answer(&proto_wire::reply(Status::Kernel(error)), Outgoing::new());
+            return Answer::Deferred;
+        }
+        self.mapping = Mapping::Attaching(index);
+        self.ram.storage.layer_set_session(label);
+        self.layer_pending = Some(pending);
+        self.layer_channels[index] = Some(channel);
+        self.layer_sizes[index] = size;
+        self.layer_levels[index] = level;
+        Answer::Deferred
+    }
+
+    /// The mapping thread finished its order.
+    fn mapper_done(&mut self) {
+        let Some(mapper) = self.mapper.as_ref() else {
+            return;
+        };
+        let Some(outcome) = mapper.take() else {
+            return;
+        };
+        #[cfg(feature = "layer-probe")]
+        let outcome = if matches!(self.mapping, Mapping::Releasing(_))
+            && core::mem::take(&mut self.refuse_unmap)
+        {
+            Err(rt::abi::Error::BadState)
+        } else {
+            outcome
+        };
+        match core::mem::replace(&mut self.mapping, Mapping::Idle) {
+            Mapping::Attaching(index) => {
+                let pending = self.layer_pending.take();
+                let mut out = proto_wire::Writer::new();
+                let wrote = match outcome {
+                    Err(error) => {
+                        self.layer_sizes[index] = 0;
+                        self.layer_channels[index] = None;
+                        self.ram.storage.layer_unmapped(index);
+                        out.bytes(&proto_wire::reply(Status::Kernel(error)))
+                    }
+                    Ok(()) if self.ram.storage.layer_orphan(index) => {
+                        // The client left while the object was being mapped: give it back.
+                        self.layer_unmap(index);
+                        Ok(())
+                    }
+                    Ok(()) => {
+                        let size = self.layer_sizes[index] as usize;
+                        let window = mapper::window(index) as *const u8;
+                        match self.ram.storage.layer_mapped(index, window, size) {
+                            Ok(()) => LayerReply::Resolving.write(&mut out),
+                            Err(reply) => reply.write(&mut out),
+                        }
+                    }
+                };
+                if let (Some(pending), Ok(())) = (pending, wrote) {
+                    let _ = pending.answer(out.as_bytes(), Outgoing::new());
+                }
+            }
+            // A mapping that is not taken out stays in its window: the record is kept, so that
+            // no layer takes the window again, and the line tells the service is at fault.
+            Mapping::Releasing(index) => match outcome {
+                Ok(()) => self.layer_finish(index),
+                Err(error) => rt::println!("ramfs: layer record {index}: unmap refused: {error:?}"),
+            },
+            Mapping::Idle => {}
+        }
+        self.layer_pump();
+    }
+
+    /// Gives the layers that have no place left back, one at a time: unmap, tell the client.
+    fn layer_pump(&mut self) {
+        while self.mapping == Mapping::Idle && self.mapper.as_ref().is_some_and(|m| m.idle()) {
+            let Some(done) = self.ram.storage.layer_next_released() else {
+                return;
+            };
+            if done.image || self.layer_sizes[done.index] == 0 {
+                self.layer_finish(done.index);
+            } else {
+                self.layer_unmap(done.index);
+            }
+        }
+    }
+
+    /// Orders the unmapping of layer record `index`; with no thread, or no order taken, the
+    /// layer is finished at once.
+    fn layer_unmap(&mut self, index: usize) {
+        let ordered = self.mapper.as_ref().is_some_and(|m| {
+            m.unmap(
+                self.layer_levels[index],
+                self.layer_sizes[index],
+                mapper::window(index),
+            )
+            .is_ok()
+        });
+        if ordered {
+            self.mapping = Mapping::Releasing(index);
+        } else {
+            self.layer_finish(index);
+        }
+    }
+
+    /// The layer record is free: its client hears that the object is theirs again.
+    fn layer_finish(&mut self, index: usize) {
+        self.ram.storage.layer_unmapped(index);
+        self.layer_sizes[index] = 0;
+        if let Some(channel) = self.layer_channels[index].take() {
+            let _ = sys::notify(&channel, 1);
+        }
+    }
+}
+
+#[cfg(feature = "layer-probe")]
+impl Fs {
+    /// The diagnostic of the layer probe (stafeto-design pk1-design, R9): maps the one page of
+    /// the object it gets again and again at windows of its own until the kernel answers
+    /// LIMIT_REACHED, takes all of them out, and answers how many mappings the service had
+    /// before the experiment.
+    fn mapping_count(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        const TRIAL: usize = 0x68_0000_0000;
+        if !matches!(s.data.binding, Binding::Boot) && !proto_fs::is_boot_profile(r.label()) {
+            return status(proto_fs::PERMISSION);
+        }
+        if r.handles.len() != 1 || r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(memory) = r.handles.take::<Memory>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let mut mapped = 0usize;
+        while mapped < rt::abi::MAX_MAPPINGS as usize
+            && sys::mem_map(
+                &self.process,
+                &memory,
+                0,
+                4096,
+                TRIAL + mapped * 8192,
+                Access::Read,
+            )
+            .is_ok()
+        {
+            mapped += 1;
+        }
+        for i in 0..mapped {
+            // SAFETY: the pages were mapped above and nothing uses them.
+            let _ = unsafe { sys::mem_unmap(&self.process, TRIAL + i * 8192, 4096) };
+        }
+        value(r, (rt::abi::MAX_MAPPINGS as usize - mapped) as u32)
+    }
+}
+
 fn status(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
@@ -1732,6 +2092,15 @@ impl Service<0> for Fs {
 
     /// Logical FD death precedes bounded physical reclamation.
     fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        if proto_fs::is_layers(s.label()) {
+            // The work of the client's job ends by itself, in portions; a reply that waits for
+            // the mapping goes with the session. Another session of the layer client has no
+            // job of its own to leave.
+            if s.label() == self.ram.storage.layer_session() {
+                self.layer_pending = None;
+            }
+            self.ram.storage.layer_session_gone(s.label());
+        }
         self.maintenance_burst.restart();
         self.legacy_pending = true;
         Self::depart_fields(self.ram, self.locks, self.identities, &mut s.data);
@@ -1807,6 +2176,13 @@ impl Service<0> for Fs {
             self.notify_maintenance();
             return;
         }
+        if notice.label == mapper::LABEL {
+            self.mapper_done();
+            self.maintenance_burst.restart();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
         if notice.label == IPC_JOBS_LABEL {
             self.ipc_jobs_pending = true;
             self.maintenance_burst.restart();
@@ -1843,6 +2219,15 @@ impl Service<0> for Fs {
         // A turn of the work of locks only while it has work (and is not
         // paused): a round of the circle of the sessions has no turn of
         // an empty sweep or of waits that wait for nothing.
+        self.layer_pump();
+        if self.ram.storage.layer_work() {
+            let now = self.time_source.now();
+            self.ram.storage.layer_maintain(now, &Limits::PORTIONS);
+            self.layer_pump();
+            self.legacy_pending = true;
+            self.notify_maintenance();
+            return;
+        }
         self.lock_maintenance_turn = !self.lock_maintenance_turn && self.lock_work_pending();
         if self.lock_maintenance_turn {
             let began = rt::time::ticks_to_ns(rt::time::now());
@@ -2077,6 +2462,26 @@ impl Service<0> for Fs {
             if s.data.binding_preparation.is_some() && r.method() == Method::FinishBinding as u16 {
                 return status(proto_fs::RESOLVING);
             }
+        }
+        if proto_fs::is_layers(r.label()) {
+            return self.layer_request(r);
+        }
+        if r.method() == Method::LayerStart as u16 || r.method() == Method::LayerStep as u16 {
+            return status(proto_fs::PERMISSION);
+        }
+        #[cfg(feature = "layer-probe")]
+        if r.method() == 0xfff0 {
+            return self.mapping_count(s, r);
+        }
+        // The next unmapping of a layer is refused (a fault for the probe to see that the
+        // record of a layer whose window stays mapped is kept and not told as released).
+        #[cfg(feature = "layer-probe")]
+        if r.method() == 0xfff1 {
+            if !matches!(s.data.binding, Binding::Boot) && !proto_fs::is_boot_profile(r.label()) {
+                return status(proto_fs::PERMISSION);
+            }
+            self.refuse_unmap = true;
+            return Answer::Status(Status::Ok);
         }
         #[cfg(feature = "image-info-probe")]
         if r.method() == 0xfff7 {
@@ -2794,6 +3199,8 @@ impl Service<0> for Fs {
                 }
                 Answer::Reply(Outgoing::new())
             }
+            // The layer methods are those of the layer session, answered above.
+            Some(Method::LayerStart | Method::LayerStep) => status(proto_fs::PERMISSION),
             Some(Method::IpcJobs) => {
                 if body.finish().is_err() || !r.handles.is_empty() {
                     return Answer::Status(Status::BadSize);

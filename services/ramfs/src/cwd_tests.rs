@@ -461,7 +461,7 @@ fn result_chain_81_pages_boundary_and_two_page_chunk_have_exact_live_ownership()
     }
     ram.storage.cwd_result_allocate(&mut pages).unwrap();
     ram.storage.cwd_result_prepend(&mut pages, &[0]);
-    for _ in 0..(crate::storage::NODES - 1) {
+    for _ in 0..(crate::storage::DEPTH_NODES - 1) {
         let mut left = name.len();
         while left > 0 {
             if pages.first == 0 {
@@ -474,8 +474,11 @@ fn result_chain_81_pages_boundary_and_two_page_chunk_have_exact_live_ownership()
         }
     }
     // The chain holds one name of 256 bytes for each node but the root: its
-    // length follows `NODES` (2 309 with the 2 048 entries of the boot image).
-    assert_eq!(pages.length as usize, 256 * (crate::storage::NODES - 1) + 1);
+    // length follows `DEPTH_NODES` (2 309 with the 2 048 entries of the boot image).
+    assert_eq!(
+        pages.length as usize,
+        256 * (crate::storage::DEPTH_NODES - 1) + 1
+    );
     assert_eq!(pages.count, 145);
     let before = ram.storage.available();
     assert_eq!(

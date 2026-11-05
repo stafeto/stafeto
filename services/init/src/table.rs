@@ -62,7 +62,22 @@ pub const NET_SERVICE: &str = "net";
 /// The clients init gives the RAM file service's boot profile
 /// (proto_fs::BOOT_PROFILE): the diagnostic client of the RAM service and
 /// the network service, which reads `/etc/netd.conf` as the boot root.
-pub const BOOT_PROFILE_CLIENTS: &[&str] = &["ramfs-probe", NET_SERVICE];
+pub const BOOT_PROFILE_CLIENTS: &[&str] = &["ramfs-probe", NET_SERVICE, "layer-probe"];
+
+/// The client init gives the RAM file service's layer session
+/// (`proto_fs::LAYERS`, attach and detach of package files): the diagnostic client of the
+/// layers now, the package service later. It asks for the session by the name
+/// `RAM_LAYERS`, which is the RAM service under another mark; its record connects to
+/// `ramfs` as for any session.
+pub const LAYER_CLIENTS: &[&str] = &["layer-probe"];
+/// The name a layer client connects by to get the layer session of the RAM service.
+pub const RAM_LAYERS: &str = "ramfs/layers";
+
+/// Whether `client` asking for `name` gets the layer session of the RAM service: only the
+/// client the table names, by the name `RAM_LAYERS`.
+pub fn layer_grant(client: &Record, name: &[u8]) -> bool {
+    name == RAM_LAYERS.as_bytes() && LAYER_CLIENTS.contains(&client.name) && !client.is_posix()
+}
 
 /// Only the RAM service receives the named-pipe broker authority.
 pub fn fifo_broker_grant(client: &Record, service: &[u8]) -> bool {
@@ -475,6 +490,11 @@ pub enum TableError<'a> {
     Cpus {
         record: &'static str,
     },
+    /// A second layer client, or one that is a POSIX process or does not connect to the RAM
+    /// service.
+    Layers {
+        record: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -582,6 +602,10 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has no CPU, or a POSIX process has a CPU the process service lacks"
             ),
+            TableError::Layers { record } => write!(
+                f,
+                "{record} is a layer client: there is one at most, it is a native program, and it connects to {RAM_SERVICE}"
+            ),
         }
     }
 }
@@ -655,6 +679,7 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     }
     check_shares(table)?;
     check_cpus(table)?;
+    check_layers(table)?;
     Ok(order(table))
 }
 
@@ -674,6 +699,19 @@ fn check_shares(table: &[Record]) -> Result<(), TableError<'static>> {
         || timers > u64::from(SYSTEM_TIMERS - INIT_KEEP_TIMERS)
     {
         return Err(TableError::Shares { threads, timers });
+    }
+    Ok(())
+}
+
+/// The layer clients of `table`: the layer session is one client's, which is not a POSIX
+/// process and connects to the RAM service.
+fn check_layers(table: &[Record]) -> Result<(), TableError<'static>> {
+    let mut seen = false;
+    for r in table.iter().filter(|r| LAYER_CLIENTS.contains(&r.name)) {
+        if seen || r.is_posix() || !r.connects.contains(&RAM_SERVICE) {
+            return Err(TableError::Layers { record: r.name });
+        }
+        seen = true;
     }
     Ok(())
 }
@@ -943,6 +981,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-ceiling") as usize
     + cfg!(feature = "vz") as usize
     + cfg!(feature = "table-ramfs") as usize
+    + cfg!(feature = "table-layer-probe") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-doom") as usize
@@ -1006,6 +1045,7 @@ const _: () = assert!(
     feature = "table-ceiling",
     feature = "vz",
     feature = "table-ramfs",
+    feature = "table-layer-probe",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-doom",
@@ -1059,6 +1099,8 @@ const _: () = assert!(
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
 pub const TABLE: &[Record] = ramfs::TABLE;
+#[cfg(feature = "table-layer-probe")]
+pub const TABLE: &[Record] = ramfs::LAYER_PROBE_TABLE;
 #[cfg(feature = "table-posix-files")]
 pub const TABLE: &[Record] = ramfs::POSIX_FILES_TABLE;
 #[cfg(feature = "table-posix-abi")]
@@ -1230,6 +1272,38 @@ mod tests {
         line: 34,
         edge: false,
     };
+
+    /// The layer session goes to one named client that connects to the RAM service.
+    #[test]
+    fn layer_clients_are_one_non_posix_client_of_the_ram_service() {
+        let ram = service("ramfs", 40, 40);
+        let layer = client("layer-probe", 30, 30, &["ramfs"]);
+        assert!(check(&[ram, layer]).is_ok());
+        let blind = client("layer-probe", 30, 30, &[]);
+        assert!(matches!(
+            check(&[ram, blind]),
+            Err(TableError::Layers {
+                record: "layer-probe"
+            })
+        ));
+        let posix = client("layer-probe", 30, 30, &["ramfs", PROCESS_SERVICE]);
+        assert!(matches!(
+            check(&[ram, service(PROCESS_SERVICE, 40, 40), posix]),
+            Err(TableError::Layers {
+                record: "layer-probe"
+            })
+        ));
+        // The session is not the boot profile: the label of one is not the other's.
+        assert!(!proto_fs::is_boot_profile(proto_fs::LAYERS | 1));
+        assert!(!proto_fs::is_layers(proto_fs::BOOT_PROFILE | 1));
+        assert!(layer_grant(&layer, RAM_LAYERS.as_bytes()));
+        assert!(!layer_grant(&layer, RAM_SERVICE.as_bytes()));
+        let other = client("other", 30, 30, &["ramfs"]);
+        assert!(!layer_grant(&other, RAM_LAYERS.as_bytes()));
+        assert!(!layer_grant(&posix, RAM_LAYERS.as_bytes()));
+        assert!(LAYER_CLIENTS.contains(&"layer-probe"));
+        assert!(!LAYER_CLIENTS.contains(&"ramfs-probe") && !LAYER_CLIENTS.contains(&NET_SERVICE));
+    }
 
     /// The table of the test image of init (spec 15.2).
     const TEST: [Record; 10] = [
@@ -2224,6 +2298,7 @@ mod tests {
             ramfs::POSIX_TTY_TABLE,
             ramfs::POSIX_DIALOG_TABLE,
             ramfs::POSIX_FILES_TABLE,
+            ramfs::LAYER_PROBE_TABLE,
             ramfs::POSIX_ABI_TABLE,
             ramfs::RELIBC_TABLE,
             ramfs::POSIX_PROCS_TABLE,
