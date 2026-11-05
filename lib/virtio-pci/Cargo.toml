@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "The PCI configuration a Virtio PCI driver of stafeto writes on Apple VZ, shared by the drivers"
+description = "The PCI configuration a Virtio PCI driver of stafeto writes on Apple VZ and QEMU's virt, shared by the drivers"
 
 [lib]
 bench = false
