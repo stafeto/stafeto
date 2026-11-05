@@ -19,6 +19,7 @@ use netd::chains::PortChains;
 use netd::demux::{Demux, Key};
 use netd::frames::Dest;
 use netd::interest::Interests;
+use netd::owners::Owners;
 use netd::passes::Passes;
 use netd::places::{Held, Places, SOCKETS_LIMIT, SOCKETS_MAX, State};
 use netd::ports::{Binding, PortMap, Proto};
@@ -159,6 +160,9 @@ pub struct Sock {
     /// For a socket of the queue of a listening description: the place of
     /// that description (NO_PLACE for any other socket).
     pub listener: u16,
+    /// The socket of a queue counts in the owner of its set (the queue of a
+    /// member of a group).
+    pub owns_set: bool,
     /// The stream was aborted and keeps its place until the pass of its group
     /// has sent the RST.
     pub rst_pending: bool,
@@ -205,6 +209,7 @@ impl Sock {
         shut_wr: false,
         saw_fin: false,
         listener: NO_PLACE,
+        owns_set: false,
         rst_pending: false,
         bound: false,
         port_held: false,
@@ -313,6 +318,12 @@ pub struct Counters {
     pub listen_short: u64,
     /// SYNs dropped for want of room in the queue of a listening description.
     pub syn_dropped: u64,
+    /// Queue sockets of a member of a group that found no set without the
+    /// queue sockets of another member: the queue is shorter.
+    pub set_barred: u64,
+    /// SYNs taken by a queue socket of a listening description other than
+    /// the one chosen. Stays 0.
+    pub syn_stray: u64,
     /// The pages charged to the service when the first and the sixty-fourth
     /// shared buffer were mapped (builds with the feature `probe`).
     #[cfg(feature = "probe")]
@@ -358,6 +369,9 @@ pub struct Net {
     pub deadline_new: bool,
     /// The SO_REUSEPORT groups.
     pub groups: Groups,
+    /// The owners of the sets of places (queue sockets of the members of
+    /// groups).
+    pub owners: Owners<GROUPS, { SOCKETS_LIMIT.div_ceil(64) }>,
     /// The passes of EXPORT that wait for ADOPT.
     pub passes: Passes,
     /// The frame `route` just looked at is a SYN to a full queue: the loop
@@ -438,8 +452,9 @@ pub struct Net {
     #[cfg(feature = "probe")]
     pub in_request: bool,
     pub counters: Counters,
-    /// The socket of a queue a SYN was just routed to.
-    syn_member: Option<usize>,
+    /// The socket of a queue a SYN was just routed to, and the listening
+    /// description it was chosen for.
+    syn_member: Option<(usize, usize)>,
 }
 
 /// The time in nanoseconds of the guest.
@@ -477,6 +492,7 @@ impl Net {
             rt::bss::fill(addr_of_mut!((*at).socks), Sock::EMPTY);
             rt::bss::fill(addr_of_mut!((*at).info), OpInfo::EMPTY);
             addr_of_mut!((*at).groups).write(Groups::new());
+            addr_of_mut!((*at).owners).write(Owners::new());
             addr_of_mut!((*at).passes).write(Passes::new());
             LongOps::initialize_at(addr_of_mut!((*at).ops));
             rt::bss::fill_none(addr_of_mut!((*at).births));
@@ -553,10 +569,44 @@ impl Net {
         state: State,
         proto: Proto,
     ) -> Option<usize> {
+        self.place_for(stack, state, proto, None)
+    }
+
+    /// As `new_place`; for a queue socket of the member `queue.0` of a group,
+    /// whose queue stands in the places `queue.1[..queue.2]` already, the
+    /// place is in a set that no other member's queue sockets stand in.
+    pub fn place_for(
+        &mut self,
+        stack: &mut Stack<'static>,
+        state: State,
+        proto: Proto,
+        queue: Option<(usize, [u16; BACKLOG_MAX], usize)>,
+    ) -> Option<usize> {
         if self.places.used() >= SOCKETS_LIMIT && !self.evict(stack) {
             return None;
         }
-        let i = self.places.allocate(state)?;
+        let i = match queue {
+            None => self.places.allocate(state)?,
+            Some((listener, own, count)) => {
+                let owners = &self.owners;
+                let own_sets = own[..count]
+                    .iter()
+                    .map(|&m| usize::from(m) / GROUP)
+                    .filter(|&set| owners.allowed(set, listener));
+                let i = self
+                    .places
+                    .allocate_in(state, own_sets, owners.barred().as_slice());
+                if i.is_none() && self.places.used() < SOCKETS_LIMIT {
+                    self.counters.set_barred += 1;
+                    if self.counters.set_barred == 1 {
+                        rt::println!(
+                            "netd: set_barred: no set without another member's queue sockets"
+                        );
+                    }
+                }
+                i?
+            }
+        };
         let handle = self.make_socket(stack, i, proto);
         self.socks[i] = Sock {
             proto,
@@ -642,6 +692,7 @@ impl Net {
         }
         self.chains.unlink(i);
         self.connected.unlink(i);
+        self.leave_queue(i);
         self.socks[i] = Sock::EMPTY;
         if let Some(key) = sock.key {
             self.demux.remove(&key);
@@ -659,6 +710,15 @@ impl Net {
         if sock.port_held {
             self.ports(sock.proto).release(sock.port);
         }
+    }
+
+    /// The socket of place `i` is no longer a socket of a queue: its set loses
+    /// one of the sockets that make its owner.
+    pub fn leave_queue(&mut self, i: usize) {
+        if core::mem::take(&mut self.socks[i].owns_set) {
+            self.owners.release(i / GROUP);
+        }
+        self.socks[i].listener = NO_PLACE;
     }
 
     /// The place `i` left the group `k`; when it held the key of the group in
@@ -896,7 +956,7 @@ impl Net {
         sock.rst_pending = true;
         sock.orphan_at = now_ns();
         sock.waiters = 0;
-        sock.listener = NO_PLACE;
+        self.leave_queue(i);
         self.places.set_state(i, State::Orphan);
         self.release_queue.clear(i);
         self.connecting.clear(i);
@@ -1270,7 +1330,7 @@ impl Net {
                 let Some(lead) = lead else {
                     return orphan;
                 };
-                let Some(member) = self.pick_member(stack, lead, &conn) else {
+                let Some((member, listener)) = self.pick_member(stack, lead) else {
                     // A queue with no room drops the SYN: the peer sends it
                     // again after its timeout, as it does to a busy server.
                     self.drop_frame = true;
@@ -1280,7 +1340,7 @@ impl Net {
                 if let Some(place) = orphan {
                     self.release_place(stack, place);
                 }
-                self.syn_member = Some(member);
+                self.syn_member = Some((member, listener));
                 Some(member)
             }
             Dest::Udp {
@@ -1332,53 +1392,54 @@ impl Net {
     const ROOM_TRUST_NS: u64 = 10_000_000;
 
     /// The count of the sockets of the queue of `listener` that listen,
-    /// counted over the whole queue when it says none and is old.
-    fn refresh_room(&mut self, stack: &mut Stack<'static>, listener: usize, now: u64) {
-        let s = &self.socks[listener];
+    /// counted over the whole queue when it says none and is old. True when
+    /// it was counted.
+    fn refresh_room(
+        socks: &mut [Sock; SOCKETS_MAX],
+        stack: &mut Stack<'static>,
+        listener: usize,
+        now: u64,
+    ) -> bool {
+        let s = &socks[listener];
         if s.room > 0 || now.saturating_sub(s.room_at) < Self::ROOM_TRUST_NS {
-            return;
+            return false;
         }
         let count = (0..usize::from(s.member_count))
             .filter(|&k| {
-                self.socks[usize::from(s.members[k])]
+                socks[usize::from(s.members[k])]
                     .handle
                     .is_some_and(|h| stack.tcp(h).state() == tcp::State::Listen)
             })
             .count();
-        let s = &mut self.socks[listener];
+        let s = &mut socks[listener];
         s.room = count as u8;
         s.room_at = now;
+        true
     }
 
-    /// The socket of a queue that gets the SYN of the four `conn`: of the
-    /// listening description `lead`, or of the member of its group that the
-    /// hash picks. A queue without room costs no look at its sockets.
-    fn pick_member(
-        &mut self,
-        stack: &mut Stack<'static>,
-        lead: usize,
-        conn: &Key,
-    ) -> Option<usize> {
+    /// The listening description whose queue gets the SYN, and the socket of
+    /// that queue: of the listening description `lead`, or of the member of
+    /// its group the circle comes to that listens and has room. A queue
+    /// without room costs no look at its sockets, and at most one queue is
+    /// counted again for a SYN.
+    fn pick_member(&mut self, stack: &mut Stack<'static>, lead: usize) -> Option<(usize, usize)> {
         let now = now_ns();
         let group = self.socks[lead].group;
         let listener = if group == NO_GROUP {
-            self.refresh_room(stack, lead, now);
+            Self::refresh_room(&mut self.socks, stack, lead, now);
             (self.socks[lead].room > 0).then_some(lead)
         } else {
-            for k in 0..self.groups.members(usize::from(group)).len() {
-                let m = usize::from(self.groups.members(usize::from(group))[k]);
-                if self.socks[m].listening {
-                    self.refresh_room(stack, m, now);
+            let socks = &mut self.socks;
+            let mut counted = false;
+            self.groups.pick(usize::from(group), |m| {
+                if !socks[m].listening {
+                    return false;
                 }
-            }
-            let hash = self.demux.hash_of(conn);
-            let socks = &self.socks;
-            self.groups.pick(
-                usize::from(group),
-                hash,
-                |m| socks[m].listening,
-                |m| socks[m].room > 0,
-            )
+                if !counted {
+                    counted = Self::refresh_room(socks, stack, m, now);
+                }
+                socks[m].room > 0
+            })
         }?;
         let member = self.listening_member(stack, listener);
         if member.is_none() {
@@ -1387,18 +1448,19 @@ impl Net {
             s.room = 0;
             s.room_at = now;
         }
-        member
+        member.map(|m| (m, listener))
     }
 
     /// After the stack took a SYN for a listening description: the stack hands
-    /// it to the first socket in LISTEN of the set of the group that holds the
-    /// socket `route` named, and that may be a socket of another listening
-    /// description of the same port (a group of SO_REUSEPORT has the queues of
-    /// all its members in the sets). Each socket of the queue of a listening
-    /// description in that group that left LISTEN gets the key of its
-    /// connection, and one that went back to LISTEN (a reset) loses it.
+    /// it to the first socket in LISTEN of the set that holds the socket
+    /// `route` named. The sets keep the queue sockets of the members of a group
+    /// apart (`owners`), so that is a socket of the chosen member's queue;
+    /// one of another description is counted in `syn_stray` and still gets the
+    /// connection's key. Each socket of a queue in the set that left LISTEN
+    /// gets the key of its connection, and one that went back to LISTEN (a
+    /// reset) loses it.
     pub fn adopt(&mut self, stack: &mut Stack<'static>) {
-        let Some(member) = self.syn_member.take() else {
+        let Some((member, chosen)) = self.syn_member.take() else {
             return;
         };
         let group = member / GROUP;
@@ -1421,6 +1483,16 @@ impl Net {
             {
                 let (local, remote) = (peer_of(local), peer_of(remote));
                 let queue = usize::from(self.socks[m].listener);
+                if queue != chosen {
+                    // The sets keep the queues of the members apart, so this
+                    // is a fault of the placing.
+                    self.counters.syn_stray += 1;
+                    if self.counters.syn_stray == 1 {
+                        rt::println!(
+                            "netd: syn_stray: a SYN went to a queue other than the chosen one"
+                        );
+                    }
+                }
                 self.socks[queue].room = self.socks[queue].room.saturating_sub(1);
                 self.register(
                     m,

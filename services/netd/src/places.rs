@@ -6,7 +6,14 @@
 //! nothing), the count of the sessions that hold it, and its state. A
 //! description on the wire is a place and a generation
 //! (`proto_net::sockets`).
+//!
+//! The queue sockets of the members of a SO_REUSEPORT group are placed apart
+//! (`owners`, `Places::allocate_in`): in the sets of their own member, else in
+//! the lowest set no other member's queue stands in. With many groups some
+//! queue sockets are therefore placed above the first 256 places and have the
+//! small buffers; with none the lowest places are used first as before.
 
+use crate::owners::SET;
 use proto_net::sockets::{description, generation, slot};
 
 /// The places of the table, and so the most descriptions (every member of a
@@ -83,12 +90,45 @@ impl<const N: usize> Places<N> {
     /// holder; None when the table is full.
     pub fn allocate(&mut self, state: State) -> Option<usize> {
         debug_assert!(state != State::Free);
-        if self.free_len == 0 {
-            return None;
-        }
         let word = self.free.iter().position(|&w| w != 0)?;
         let i = word * 64 + self.free[word].trailing_zeros() as usize;
-        self.free[word] &= self.free[word] - 1;
+        Some(self.take(i, state))
+    }
+
+    /// A place for a queue socket of a SO_REUSEPORT member: a free place of
+    /// one of `own_sets` (the sets whose owner is the member already), else
+    /// the lowest free place that is not in a set with an owner (`barred`, a
+    /// bit per place, a word per 64 places; the places past the words are
+    /// barred). None when there is none, though free places may be left in
+    /// the sets of other owners.
+    pub fn allocate_in(
+        &mut self,
+        state: State,
+        own_sets: impl IntoIterator<Item = usize>,
+        barred: &[u64],
+    ) -> Option<usize> {
+        debug_assert!(state != State::Free);
+        for set in own_sets {
+            let (word, shift) = (set * SET / 64, set * SET % 64);
+            let free = self.free[word] >> shift & ((1 << SET) - 1);
+            if free != 0 {
+                return Some(self.take(set * SET + free.trailing_zeros() as usize, state));
+            }
+        }
+        // The places past the words of `barred` are barred.
+        for (word, &closed) in barred.iter().enumerate().take(self.free.len()) {
+            let open = self.free[word] & !closed;
+            if open != 0 {
+                return Some(self.take(word * 64 + open.trailing_zeros() as usize, state));
+            }
+        }
+        None
+    }
+
+    /// Takes the free place `i`.
+    fn take(&mut self, i: usize, state: State) -> usize {
+        let word = i / 64;
+        self.free[word] &= !(1 << (i % 64));
         self.free_len -= 1;
         self.generation[i] = match (self.generation[i] + 1) & GENERATION_MASK {
             0 => 1,
@@ -96,7 +136,7 @@ impl<const N: usize> Places<N> {
         };
         self.state[i] = state;
         self.refs[i] = 0;
-        Some(i)
+        i
     }
 
     /// The place goes back to the free ones.
@@ -256,6 +296,65 @@ mod tests {
         assert_eq!(p.allocate(State::Live), Some(70));
         assert_eq!(p.allocate(State::Live), Some(290));
         assert_eq!(p.allocate(State::Live), None);
+    }
+
+    #[test]
+    fn a_queue_socket_stays_out_of_the_sets_of_other_owners() {
+        let mut p = Places::<64>::new();
+        // Sets 0 and 1 (places 0..8) belong to others.
+        let barred = [0xFFu64];
+        assert_eq!(p.allocate_in(State::Member, [], &barred), Some(8));
+        // The own set comes first, even above the lowest free place.
+        assert_eq!(p.allocate_in(State::Member, [5], &barred), Some(20));
+        assert_eq!(p.allocate_in(State::Member, [5], &barred), Some(21));
+        // An own set that is full gives way to the lowest open place.
+        for _ in 0..2 {
+            p.allocate_in(State::Member, [5], &barred).unwrap();
+        }
+        assert_eq!(p.allocate_in(State::Member, [5], &barred), Some(9));
+        // Plain allocation takes the barred places.
+        assert_eq!(p.allocate(State::Live), Some(0));
+    }
+
+    #[test]
+    fn two_listeners_that_place_in_turn_never_share_a_set() {
+        use crate::owners::Owners;
+        let mut p = Places::<256>::new();
+        let mut o = Owners::<64, 4>::new();
+        let mut queue: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+        // Other sockets stand between them, as connections do.
+        for round in 0..16 {
+            for (l, q) in queue.iter_mut().enumerate() {
+                let own: Vec<usize> = q.iter().map(|&m| m / SET).collect();
+                let own = own.into_iter().filter(|&s| o.allowed(s, l));
+                let m = p.allocate_in(State::Member, own, o.barred()).unwrap();
+                o.claim(m / SET, l);
+                q.push(m);
+            }
+            if round % 3 == 0 {
+                p.allocate(State::Live).unwrap();
+            }
+        }
+        for a in &queue[0] {
+            for b in &queue[1] {
+                assert_ne!(a / SET, b / SET, "{a} and {b} share a set");
+            }
+        }
+        // Each queue is dense: 16 sockets in 4 sets.
+        for q in &queue {
+            let mut sets: Vec<_> = q.iter().map(|m| m / SET).collect();
+            sets.dedup();
+            assert!(sets.len() <= 5, "{sets:?}");
+        }
+    }
+
+    #[test]
+    fn no_open_place_is_none_though_places_are_free() {
+        let mut p = Places::<8>::new();
+        assert_eq!(p.allocate_in(State::Member, [], &[0xFF]), None);
+        assert_eq!(p.used(), 0);
+        assert_eq!(p.allocate_in(State::Member, [1], &[0xFF]), Some(4));
+        assert!(p.allocate(State::Live).is_some());
     }
 
     #[test]

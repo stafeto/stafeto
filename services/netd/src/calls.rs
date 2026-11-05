@@ -13,17 +13,18 @@
 //! with the number of sockets.
 
 use crate::net::{
-    Birth, Client, Conn, Kind, NO_PLACE, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock,
-    now_ns, op_index,
+    Birth, Client, Conn, Kind, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock, now_ns,
+    op_index,
 };
 use crate::split;
-use crate::stack::{Stack, listen_endpoint};
+use crate::stack::{GROUP, Stack, listen_endpoint};
 use abi::{Error, MESSAGE_MAX, Rights};
 use netd::births;
 use netd::demux::Key;
 use netd::passes::Passes;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
+use netd::reuse::NO_GROUP;
 use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
 use proto_wire::{Status, Writer, long, watch};
@@ -885,7 +886,9 @@ impl Net {
             // it; a smaller one changes nothing.
             let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
             while usize::from(self.socks[place].member_count) < wanted {
-                let Some(m) = self.member(stack, &sock, place) else {
+                let own = self.socks[place].members;
+                let count = usize::from(self.socks[place].member_count);
+                let Some(m) = self.member(stack, &sock, place, own, count) else {
                     break;
                 };
                 let listener = &mut self.socks[place];
@@ -911,11 +914,11 @@ impl Net {
         let wanted = backlog.clamp(1, crate::net::BACKLOG_MAX as u32) as usize;
         let mut count = 0;
         let mut members = [0u16; crate::net::BACKLOG_MAX];
-        for member in members.iter_mut().take(wanted) {
-            let Some(m) = self.member(stack, &sock, place) else {
+        for k in 0..wanted {
+            let Some(m) = self.member(stack, &sock, place, members, count) else {
                 break;
             };
-            *member = m as u16;
+            members[k] = m as u16;
             count += 1;
         }
         if count == 0 {
@@ -942,15 +945,25 @@ impl Net {
         ok()
     }
 
-    /// A new place of the queue of the listening `sock`: a smoltcp socket
-    /// that listens on its port and has its options.
+    /// A new place of the queue of the listening `sock`, whose queue stands in
+    /// `own[..count]` already: a smoltcp socket that listens on its port and
+    /// has its options. The queue of a member of a group stands in sets no
+    /// other member's queue stands in.
     fn member(
         &mut self,
         stack: &mut Stack<'static>,
         sock: &Sock,
         listener: usize,
+        own: [u16; crate::net::BACKLOG_MAX],
+        count: usize,
     ) -> Option<usize> {
-        let m = self.new_place(stack, State::Member, Proto::Tcp)?;
+        let grouped = sock.group != NO_GROUP;
+        let m = self.place_for(
+            stack,
+            State::Member,
+            Proto::Tcp,
+            grouped.then_some((listener, own, count)),
+        )?;
         let handle = self.socks[m].handle?;
         if stack
             .tcp(handle)
@@ -963,6 +976,11 @@ impl Net {
         let member = &mut self.socks[m];
         member.bound = true;
         member.listener = listener as u16;
+        if grouped {
+            member.owns_set = true;
+            self.owners.claim(m / GROUP, listener);
+        }
+        let member = &mut self.socks[m];
         member.address = sock.address;
         member.port = sock.port;
         self.chains.link(m, sock.port);
@@ -970,6 +988,10 @@ impl Net {
         member.nodelay = sock.nodelay;
         member.keepalive = sock.keepalive;
         member.reuse = sock.reuse;
+        // As on Linux, the connections a listening description took keep its
+        // SO_REUSEPORT and user, so a later member of the group may bind.
+        member.reuseport = sock.reuseport;
+        member.uid = sock.uid;
         member.linger = sock.linger;
         member.rcvtimeo = sock.rcvtimeo;
         member.sndtimeo = sock.sndtimeo;
@@ -1237,15 +1259,17 @@ impl Net {
         let accepted = &mut self.socks[m];
         accepted.conn = Conn::Done;
         self.rechain(m);
+        self.leave_queue(m);
         let accepted = &mut self.socks[m];
-        accepted.listener = NO_PLACE;
         accepted.nonblock = flags & sockets::NONBLOCK != 0;
         accepted.peer = peer.ipv4().map(|ip| (ip, peer.port as u16));
         if let Some((ip, port)) = local {
             accepted.address = ip;
             accepted.port = port;
         }
-        match self.member(stack, &sock, place) {
+        let own = sock.members;
+        let count = usize::from(sock.member_count);
+        match self.member(stack, &sock, place, own, count) {
             Some(fresh) => {
                 self.socks[place].members[k] = fresh as u16;
                 self.socks[place].room = self.socks[place].room.saturating_add(1);
