@@ -745,14 +745,6 @@ fn run(
     }
     drop(subscriptions);
     drop(timer);
-    // Late wakeups and the CLIENT_GONE of the sessions above stay queued on the
-    // thread's channel and each holds a source place; drain them so the places
-    // of the next wait are free.
-    for _ in 0..rt::abi::MAX_SLOTS {
-        if crate::fast::try_receive(&channel).is_err() {
-            break;
-        }
-    }
     // A socket of the pipe service whose peer went says POLLRDHUP with its
     // POLLHUP, as Linux's AF_UNIX sockets do.
     let mut unix = [false; LIMIT];
