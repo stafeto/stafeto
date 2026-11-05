@@ -36,6 +36,7 @@ mod disasm;
 mod display_probe;
 mod doom;
 mod entropy;
+mod fast_probe;
 mod fstack_probe;
 mod gpu_probe;
 mod guards;
@@ -1705,6 +1706,11 @@ commands:
             write, 1 000 connections, a refused connect and the timer of a
             SYN sent again; with `write-blocking`, what one write of 1 MiB
             does on a blocking socket
+  fast-probe [steps] [MACHINE] the second network device in the hands of
+            `fast-echo` (QEMU, two devices): the claim, the lease again
+            through the bypass ring, the echo of UDP from the host, EPERM for
+            another user, EBUSY for a second owner, the device back after
+            kill -9; with `steps` the service counts its steps (TCG only)
   nginx-probe [steps] [MACHINE] run nginx in the guest from ash (boot-nginx-probe.img):
             a master and four workers under nobody with SO_REUSEPORT, 200 requests
             over 16 connections that stay open, 256 KiB answers by digest through
@@ -1985,6 +1991,7 @@ fn main() {
         Some("probe-ca") => probe_ca::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
         Some("fstack-probe") => fstack_probe::command(&args[1..]),
+        Some("fast-probe") => fast_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
             None => input_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -8939,6 +8946,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // loopback: 16 MiB, 1 000 connections, its clock. Also in the group
         // `net`.
         job("fstack-probe", || fstack_probe::probe(&qemu::VIRT, false)),
+        // The second network device in the hands of a program: the claim,
+        // the bypass ring, the echo of UDP, the refusals, and the device
+        // back after the owner's death. Also in the group `net`.
+        job("fast-probe", || fast_probe::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -9066,6 +9077,12 @@ fn host_tests() -> Result<(), String> {
         "proto-net",
         "--package",
         "netd",
+        // The driver library with the functions of the C program that owns
+        // the second network device.
+        "--package",
+        "virtio-net",
+        "--features",
+        "virtio-net/ffi",
     ]))
 }
 

@@ -539,6 +539,21 @@ pub const NET_TABLE: &[Record] = &[
     NETD,
 ];
 
+/// The image of the shell with both network devices on QEMU (`cargo xtask
+/// fast-probe`): a program of the shell claims the second (spec 6, 3.9).
+pub const NET_TWO_TABLE: &[Record] = &[
+    NET_TABLE[0],
+    NET_TABLE[1],
+    NET_TABLE[2],
+    NET_TABLE[3],
+    NET_TABLE[4],
+    NET_TABLE[5],
+    NET_TABLE[6],
+    NET_TABLE[7],
+    NET_TABLE[8],
+    NETD_TWO,
+];
+
 /// The image of the shell with the network service on VZ (`cargo xtask net
 /// --machine vz`): the console's driver in place of the PL011's, the
 /// shell's table as `vz::BUSYBOX_DIALOG_TABLE` has it (the clock without a

@@ -293,6 +293,13 @@ impl<const D: usize> NetDevice<D> {
         }
     }
 
+    /// The frames taken from the queues are forgotten: the queues are new
+    /// after the device's reset (the second device back from its owner).
+    pub fn forget_frames(&mut self) {
+        self.held = None;
+        self.deferred = None;
+    }
+
     /// Whether a frame waits for the next step of receiving.
     pub fn has_deferred(&self) -> bool {
         self.deferred.is_some()

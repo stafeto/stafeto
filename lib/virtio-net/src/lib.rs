@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! A driver of the Virtio network device (Virtio 1.2, 5.1) as a library:
@@ -14,13 +14,17 @@
 //! It makes no call of the kernel and holds no stack: whoever maps the
 //! objects and the window, and owns the line, uses it. The network service
 //! drives its two devices through it; the library builds for the host too,
-//! where `cargo test -p virtio-net` exercises it.
+//! where `cargo test -p virtio-net` exercises it. With the feature `ffi` it
+//! is also the driver of a C program that owns the second device (`ffi`,
+//! `include/vnet.h`).
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod barrier;
 pub mod books;
 pub mod copy;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod frames;
 pub mod host;
 pub mod mmio;

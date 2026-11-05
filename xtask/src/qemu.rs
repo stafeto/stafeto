@@ -271,16 +271,45 @@ pub const NET_MAC_TWO: &str = "52:54:00:12:34:57";
 /// guest on that network (10.0.3.15): a connection there must reach no
 /// socket, and the second device sends no reset.
 pub fn net_two(forward: Option<u16>) -> Vec<String> {
+    let forwards: Vec<Forward> = forward
+        .map(|host| Forward {
+            proto: Proto::Tcp,
+            host,
+            guest: 81,
+        })
+        .into_iter()
+        .collect();
+    net_two_with(&forwards)
+}
+
+/// The second network device with `forwards` from 127.0.0.1 of the host to
+/// the second address (10.0.3.15): the echo of UDP of the program that owns
+/// the device (`cargo xtask fast-probe`).
+pub fn net_two_with(forwards: &[Forward]) -> Vec<String> {
     let mut netdev = String::from("user,id=n1,net=10.0.3.0/24");
-    if let Some(port) = forward {
-        netdev += &format!(",hostfwd=tcp:127.0.0.1:{port}-10.0.3.15:81");
+    for f in forwards {
+        netdev += &format!(
+            ",hostfwd={}:127.0.0.1:{}-10.0.3.15:{}",
+            f.proto.name(),
+            f.host,
+            f.guest
+        );
     }
-    vec![
+    let mut a = vec![
         "-netdev".to_owned(),
         netdev,
         "-device".to_owned(),
         format!("virtio-net-device,netdev=n1,bus=virtio-mmio-bus.14,mac={NET_MAC_TWO}"),
-    ]
+    ];
+    // STAFETO_PCAP1 names a file for a capture of the second device's frames.
+    if let Some(file) = std::env::var_os("STAFETO_PCAP1").filter(|f| !f.is_empty()) {
+        a.push("-object".to_owned());
+        a.push(format!(
+            "filter-dump,id=f1,netdev=n1,file={}",
+            file.to_string_lossy()
+        ));
+    }
+    a
 }
 
 /// The Virtio keyboard of the input service (services/virtio-input), on

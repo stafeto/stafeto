@@ -11,6 +11,7 @@
 
 pub mod births;
 pub mod buffers;
+pub mod bypass;
 pub mod chains;
 pub mod choose;
 pub mod config;

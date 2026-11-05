@@ -974,6 +974,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-net-probe-two") as usize
+    + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-display") as usize
@@ -1032,6 +1033,7 @@ const _: () = assert!(
     feature = "table-net-vz",
     feature = "table-net-vz2",
     feature = "table-net-probe-two",
+    feature = "table-net-two",
     feature = "table-input",
     feature = "table-posix-random",
     feature = "table-posix-display",
@@ -1125,6 +1127,8 @@ pub const TABLE: &[Record] = net::NET_VZ_TABLE;
 pub const TABLE: &[Record] = net::NET_VZ2_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
+#[cfg(feature = "table-net-two")]
+pub const TABLE: &[Record] = net::NET_TWO_TABLE;
 #[cfg(feature = "table-pci-walk-vz")]
 pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 #[cfg(feature = "table-input")]
@@ -1863,6 +1867,7 @@ mod tests {
             net::NET_VZ_TABLE,
             net::NET_VZ2_TABLE,
             net::NET_PROBE_TWO_TABLE,
+            net::NET_TWO_TABLE,
             doom::TABLE,
             gpu::TABLE,
             input::TABLE,
@@ -2065,6 +2070,10 @@ mod tests {
             order_of(net::NET_PROBE_TWO_TABLE),
             ["ramfs", "rng", "entropy", "net", "net-probe"]
         );
+        // The shell's image of QEMU with both devices: the shell's order,
+        // the service with the objects of the second device.
+        assert_eq!(order_of(net::NET_TWO_TABLE), order_of(net::NET_TABLE));
+        assert_eq!(net::NET_TWO_TABLE[9].dma.len(), 7);
     }
 
     /// The command word of a PCI function.

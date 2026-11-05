@@ -87,6 +87,9 @@ table-net = []
 table-net-probe = []
 # The probe's image with both network devices on QEMU.
 table-net-probe-two = []
+# The shell with both network devices on QEMU (xtask fast-probe: a program
+# claims the second).
+table-net-two = []
 # The probe of F-Stack on its loopback (xtask fstack-probe).
 table-fstack-probe = []
 # The walk of Apple VZ's bus 0 (xtask pci-walk-vz).

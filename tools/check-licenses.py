@@ -44,8 +44,9 @@ GPL = "GPL-3.0-or-later"
 EXCEPTION = "GPL-3.0-or-later WITH GCC-exception-3.1"
 # The programs link these and all they take (item 1); the loader runs in
 # every POSIX program's process before it (spec 2, 3.2), so it takes the
-# programs' terms too.
-LINK_ROOTS = ("posix-crt", "posix-platform", "loader")
+# programs' terms too. The driver of the network device goes statically into
+# the C program that owns the second device (libvirtio_net.a, spec 6, 3.9).
+LINK_ROOTS = ("posix-crt", "posix-platform", "loader", "virtio-net")
 # The workspace members that run on the host alone; every other member
 # builds for the target, and the images take their binaries from them.
 HOST_ONLY = ("xtask",)

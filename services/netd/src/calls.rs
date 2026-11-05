@@ -750,6 +750,13 @@ impl Net {
             return None;
         }
         let identity = r.handles.take::<Channel>(0).ok()?;
+        self.vouch(identity)
+    }
+
+    /// The effective user of the process of the identity session
+    /// `identity`, as the process service vouches for it; None when the
+    /// service refuses it.
+    pub fn vouch(&mut self, identity: Handle<Channel>) -> Option<u32> {
         let notary = self.notary()?;
         let request = proto_process::Method::Vouch.header().bytes();
         let reply = sys::send_handles(notary, &request, [identity.erase()]).ok()?;

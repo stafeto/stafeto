@@ -26,6 +26,10 @@ pub const DEVICE: [u64; 2] = [1, 2];
 pub const NET_ID: u32 = 0x1041_1af4;
 /// The bytes of BAR 0, as the walk measured them.
 pub const BAR_LEN: u64 = 0x1_0000;
+/// The bytes of BAR 2 (the walk's measure): the sizes CLAIM tells the owner
+/// of the second device, which has no window `ecam` to measure them.
+pub const BAR2_LEN: u64 = 0x40;
+pub const BAR_SIZES: [u64; 6] = [BAR_LEN, 0, BAR2_LEN, 0, 0, 0];
 pub const PAGE: u64 = 4096;
 /// ECAM of bus 0: the page of function 0 of device `n` is at
 /// `ECAM + (n << 15)`.

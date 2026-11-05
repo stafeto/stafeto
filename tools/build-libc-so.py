@@ -20,7 +20,11 @@ Subcommands:
           target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the
-          property that makes it bad.
+          property that makes it bad; fast-echo links libvirtio_net.a.
+  vnet    the driver of the Virtio network device for a C program that
+          owns the second device (lib/virtio-net with the feature `ffi`) as
+          the static library target/libc-so/libvirtio_net.a, with its header
+          lib/virtio-net/include/vnet.h.
   report  sizes, relocations by kind, exported names, the longest chain.
 
 The relibc is the commit tools/build-relibc.py pins, built a second time
@@ -341,6 +345,61 @@ def build_layer() -> Path:
     return OUT / "layer" / LAYER_TARGET / "release" / "libposix_crt.a"
 
 
+VNET = OUT / "libvirtio_net.a"
+VNET_INCLUDE = ROOT / "lib" / "virtio-net" / "include"
+
+
+def build_vnet() -> Path:
+    """lib/virtio-net with the feature `ffi` as a static library for C
+    programs: no rt and no _start (crt1.o and libc.so have them), core and
+    compiler_builtins built with the pinned nightly as for the layer, a
+    panic that calls abort, and no allocator (the library allocates
+    nothing). Cargo knows whether the sources changed."""
+    env = dict(os.environ)
+    for name in ("RUSTUP_TOOLCHAIN", "RUSTC", "CARGO_ENCODED_RUSTFLAGS"):
+        env.pop(name, None)
+    sysroot = run("rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot", capture=True).stdout.strip()
+    cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+    remap = " ".join(f"--remap-path-prefix={path}={name}" for path, name in
+                     ((ROOT, "/stafeto"), (sysroot, "/rust"), (cargo_home, "/cargo")))
+    env["RUSTFLAGS"] = f"-C target-feature=+fix-cortex-a53-835769 {remap}"
+    env["CARGO_TARGET_DIR"] = str(OUT / "vnet")
+    run("cargo", f"+{TOOLCHAIN}", "rustc", "--release", "--locked", "-p", "virtio-net",
+        "--features", "ffi", "--target", LAYER_TARGET, "--crate-type", "staticlib",
+        "-Zbuild-std=core,compiler_builtins", cwd=ROOT, env=env)
+    built = OUT / "vnet" / LAYER_TARGET / "release" / "libvirtio_net.a"
+    # One relocatable object with the functions of vnet.h alone global: the
+    # archive of cargo also defines memcpy, memset, memcmp, strlen and the
+    # functions of libm (compiler_builtins, weak) and the symbols of core,
+    # which would take the program's own calls (nginx's, F-Stack's) away
+    # from libc.so and clash with a second library of Rust. Inside the
+    # object the library's code keeps its copies.
+    work = OUT / "vnet-object"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    whole = work / "vnet.o"
+    run(lld(), "-r", "--whole-archive", built, "-o", whole)
+    keep = work / "keep.txt"
+    keep.write_text("".join(f"{n}\n" for n in VNET_NAMES))
+    run(llvm("llvm-objcopy"), f"--keep-global-symbols={keep}", "--strip-debug", whole)
+    archive = work / "libvirtio_net.a"
+    run(llvm("llvm-ar"), "rcs", archive, whole)
+    if not VNET.exists() or digest(VNET) != digest(archive):
+        shutil.copyfile(archive, VNET)
+    defined = archive_names(VNET, "-g", "--defined-only")
+    if defined != set(VNET_NAMES):
+        extra = sorted(defined - set(VNET_NAMES))[:5]
+        missing = sorted(set(VNET_NAMES) - defined)[:5]
+        fail(f"libvirtio_net.a defines globally {extra} more and lacks {missing}")
+    return VNET
+
+
+# The functions of vnet.h.
+VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "vnet_buf_ptr",
+              "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost",
+              "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop"]
+
+
 def archive_names(archive: Path, *flags) -> set:
     out = run(llvm("llvm-nm"), *flags, archive, capture=True).stdout
     return {line.split()[-1] for line in out.splitlines()
@@ -594,8 +653,10 @@ def compile_c(source: Path, output: Path, *flags, fpic=True) -> None:
 # ------------------------------------------------------------------- probes
 
 GOOD = ["so-hello", "so-image", "display-probe", "net-sock", "net-dns", "posix-net"]
+# Good programs linked with libvirtio_net.a as well.
+WITH_VNET = ["fast-echo"]
 BAD = ["bad-interp", "bad-copy", "bad-tls", "bad-needed", "bad-symbol", "bad-ifunc", "bad-pie"]
-PROBE_FILES = GOOD + BAD
+PROBE_FILES = GOOD + WITH_VNET + BAD
 # bad program: (source, what makes it bad, check)
 
 
@@ -641,12 +702,14 @@ def good_checks(name: str, elf: Elf) -> str | None:
 def probes_stamp() -> str:
     sources = sorted(SOURCES.glob("*.c"))
     return "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
-                      digest(Path(__file__)), *(digest(p) for p in sources))) + "\n"
+                      digest(Path(__file__)), digest(VNET), digest(VNET_INCLUDE / "vnet.h"),
+                      *(digest(p) for p in sources))) + "\n"
 
 
 def build_probes() -> list:
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
+    build_vnet()
     wanted = probes_stamp()
     if (PROBES_STAMP.exists() and PROBES_STAMP.read_text() == wanted
             and all((PROBES / n).exists() for n in PROBE_FILES)):
@@ -663,6 +726,16 @@ def build_probes() -> list:
         # so-hello exports so_exported, which its dl mode looks up by name.
         link_program(PROBES / name, [work / f"{name}.o"],
                      ["--export-dynamic-symbol=so_exported"] if name == "so-hello" else None)
+        made[name] = "good"
+    # The owner of the second network device: the driver's static library
+    # beside libc.so (its memcpy is libc.so's; the library has vnet_copy).
+    for name in WITH_VNET:
+        compile_c(SOURCES / f"{name}.c", work / f"{name}.o", "-I", VNET_INCLUDE)
+        link_program(PROBES / name, [work / f"{name}.o", VNET], ["--gc-sections", "--strip-debug"])
+        # The program's own calls of the C library go to libc.so.
+        imported = {n for n, is_def, _, _, _ in Elf(PROBES / name).dynsym() if n and not is_def}
+        if "memcpy" not in imported:
+            fail(f"{name}: memcpy is not libc.so's")
         made[name] = "good"
     # bad-interp: another dynamic linker.
     compile_c(SOURCES / "bad-interp.c", work / "bad-interp.o")
@@ -854,6 +927,8 @@ def main(argv: list) -> None:
             print((PROGRAMS / "report.txt").read_text(), end="")
         elif command == "probes":
             print("probes:", " ".join(build_probes()))
+        elif command == "vnet":
+            print(f"libvirtio_net.a ready: {build_vnet()}")
         elif command == "report":
             print(report())
         else:

@@ -1225,6 +1225,7 @@ dependencies = [
 name = "virtio-net"
 version = "0.1.0"
 dependencies = [
+ "proto-net",
  "virtio-drivers",
  "virtio-mmio",
 ]

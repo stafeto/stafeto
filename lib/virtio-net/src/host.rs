@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The DMA of the device's crate over a driver's objects: the pages of the
@@ -181,7 +181,7 @@ unsafe impl<const D: usize> Hal for Host<D> {
         let pa = queues.pa + (first * PAGE) as u64;
         // SAFETY: the pages are the queues' object, mapped read and write at
         // its address, and no one else has them; the crate expects zeroes.
-        unsafe { core::ptr::write_bytes(va as *mut u8, 0, pages * PAGE) };
+        unsafe { crate::copy::zero_pages(va, pages) };
         match NonNull::new(va as *mut u8) {
             Some(at) => (pa, at),
             None => (0, NonNull::dangling()),
