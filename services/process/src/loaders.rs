@@ -98,6 +98,9 @@ pub const fn portion_level(requester: u8, service: u8) -> u8 {
 pub const LOADERS: usize = 16;
 /// The loaders of one parent at once (5c, decision 7): a process that
 /// starts spawns and never finishes them holds no more places than these.
+/// A place the parent committed (Ready) is out of the count: the parent
+/// finished that load, and only the child's loader holds the place until
+/// its Take.
 pub const LOADERS_OF_PARENT: usize = 2;
 
 /// Where a load is.
@@ -186,13 +189,14 @@ impl<T> Loaders<T> {
     }
 
     /// Whether the record in `parent` may start another load: a place is
-    /// free and it has fewer than LOADERS_OF_PARENT.
+    /// free and it has fewer than LOADERS_OF_PARENT places not yet
+    /// committed.
     pub fn room_for(&self, parent: usize) -> bool {
         let own = self
             .places
             .iter()
             .flatten()
-            .filter(|p| p.parent == parent)
+            .filter(|p| p.parent == parent && p.stage != Stage::Ready)
             .count();
         self.room() && own < LOADERS_OF_PARENT
     }
@@ -529,6 +533,23 @@ mod tests {
         assert!(t.take(50, 8, 1, ()).is_some(), "another parent's");
         t.free(1);
         assert!(t.take(51, 7, 1, ()).is_some());
+    }
+
+    /// Places the parent committed (Ready) wait for the child's Take and do
+    /// not count against the parent's limit; uncommitted ones still do.
+    #[test]
+    fn committed_places_do_not_count_against_the_parent() {
+        let mut t = Loaders::<()>::new();
+        for record in 1..=LOADERS_OF_PARENT {
+            assert!(t.take(record, 7, 1, ()).is_some());
+            t.get_mut(t.of(record).unwrap()).unwrap().stage = Stage::Loaded;
+            t.commit(record).unwrap();
+        }
+        assert!(t.room_for(7), "two committed places, none loading");
+        assert!(t.take(50, 7, 1, ()).is_some());
+        assert!(t.take(51, 7, 1, ()).is_some());
+        assert!(!t.room_for(7), "two uncommitted places");
+        assert_eq!(t.take(52, 7, 1, ()), None);
     }
 
     /// SetId is kept once, for the record and image of its place, while it
