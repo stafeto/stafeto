@@ -264,20 +264,26 @@ static int spawn(pid_t *pid, const char *role, const posix_spawn_file_actions_t 
     return posix_spawn(pid, "/bin/procs-child", actions, attr, argv, envp);
 }
 
-/* Spawns the catcher with SIGUSR1 blocked from its first instruction: a
- * signal sent before it installs its handler waits in the mask and comes
- * when the catcher unblocks it, so no pause stands in for its start-up. */
-static int spawn_catcher(pid_t *pid, int flags) {
+/* Spawns `role` with the signals of `blocked` blocked from its first
+ * instruction: a signal sent before the child sets up its handling waits in
+ * the mask and comes when the child unblocks it, so no pause stands in for
+ * its start-up. */
+static int spawn_masked(pid_t *pid, const char *role, int flags, const sigset_t *blocked) {
     posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_SETSIGMASK);
+    posix_spawnattr_setsigmask(&attr, blocked);
+    int e = spawn(pid, role, NULL, &attr);
+    posix_spawnattr_destroy(&attr);
+    return e;
+}
+
+/* The catcher: SIGUSR1 blocked until its handler is in place. */
+static int spawn_catcher(pid_t *pid, int flags) {
     sigset_t blocked;
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGUSR1);
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_SETSIGMASK);
-    posix_spawnattr_setsigmask(&attr, &blocked);
-    int e = spawn(pid, "catch", NULL, &attr);
-    posix_spawnattr_destroy(&attr);
-    return e;
+    return spawn_masked(pid, "catch", flags, &blocked);
 }
 
 static void pause_ms(long ms);
@@ -412,8 +418,11 @@ static void kills(pid_t sleeper) {
     reap("the sleeper after SIGTERM", sleeper, 0, SIGTERM);
     expect("kill of a taken child", kill(sleeper, SIGTERM) == -1 && errno == ESRCH, 1);
 
-    pid_t blocker = start("block");
-    pause_ms(100);
+    /* The blocker starts with every signal blocked, as it blocks them itself. */
+    sigset_t everything;
+    sigfillset(&everything);
+    pid_t blocker = -1;
+    expect("the blocker", spawn_masked(&blocker, "block", 0, &everything), 0);
     expect("SIGTERM to a child that blocks it", kill(blocker, SIGTERM), 0);
     expect("SIGKILL", kill(blocker, SIGKILL), 0);
     reap("the blocker after SIGKILL", blocker, 0, SIGKILL);
