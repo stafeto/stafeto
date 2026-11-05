@@ -232,7 +232,16 @@ fn the_writes_come_in_the_order_the_note_gives() {
     table.set_repo(0, b"stafeto", 0);
     disk.log.clear();
     install(&mut disk, &opened, &table, "hello", 2, 0).unwrap();
-    let log = disk.log.join(",");
+    let writes: Vec<_> = disk
+        .log
+        .iter()
+        .filter(|l| !l.starts_with("point"))
+        .collect();
+    let log = writes
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
     // Data blocks, F1, the table, F2, the superblock of the older copy, F3.
     assert_eq!(
         log,

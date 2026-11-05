@@ -23,6 +23,8 @@ pub enum Fault {
     /// after it was signed.
     Covered,
     BadPackage,
+    /// A file of the package is not the one the manifest names.
+    BadManifest,
     WrongSeries,
     UntrustedKey,
     Revoked,
@@ -35,6 +37,7 @@ impl Fault {
         match self {
             Fault::BadHash | Fault::Covered => proto_pkg::BAD_HASH,
             Fault::BadPackage => proto_pkg::BAD_PACKAGE,
+            Fault::BadManifest => proto_pkg::BAD_MANIFEST,
             Fault::WrongSeries => proto_pkg::WRONG_SERIES,
             Fault::UntrustedKey => proto_pkg::UNTRUSTED_KEY,
             Fault::Revoked => proto_pkg::REVOKED,
@@ -47,6 +50,7 @@ impl Fault {
         match self {
             Fault::BadHash => "not the file of the table",
             Fault::BadPackage => "not a package",
+            Fault::BadManifest => "bad manifest",
             Fault::WrongSeries => "wrong series",
             Fault::UntrustedKey => "untrusted key",
             Fault::Revoked => "key revoked",
@@ -77,11 +81,29 @@ pub struct Checked<'a> {
     pub trailer: &'a [u8],
 }
 
+/// Where a check is, for the one who times its parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// The layout is read and the names and the series are right.
+    Parsed,
+    /// The signature is checked against the trust.
+    Signed,
+    /// One portion of a file was hashed for the manifest (only an installation).
+    Portion,
+}
+
+/// The bytes the manifest check hashes at a time.
+const PORTION: usize = 16 * 1024;
+
 /// Checks the package file `bytes`. `covered` is the SHA-256 of the covered
 /// part (all but the trailer page) and `whole` that of the file, both from
 /// the reading; `record` is what the store says of it, and `series` the
 /// system's. `revoked` is the list of revocations whole: names in it are
 /// ascending without repeats, so at most one entry names the key that signed.
+/// With `manifest` (an installation; a start from the disk relies on the signature
+/// that covers the manifest and the bytes) the SHA-256 of each file is
+/// compared with its line in the manifest. `seen` hears each phase.
+#[allow(clippy::too_many_arguments)]
 pub fn check<'a>(
     bytes: &'a [u8],
     covered: &[u8; 32],
@@ -90,6 +112,8 @@ pub fn check<'a>(
     series: &str,
     trust: &Trust,
     revoked: Option<&Revoked<'_>>,
+    manifest: bool,
+    seen: &mut dyn FnMut(Phase),
 ) -> Result<Checked<'a>, Fault> {
     if *whole != record.sha256 || bytes.len() as u64 != record.length {
         return Err(Fault::BadHash);
@@ -104,6 +128,7 @@ pub fn check<'a>(
     if meta.series != series {
         return Err(Fault::WrongSeries);
     }
+    seen(Phase::Parsed);
     let hit = revoked.and_then(|list| list.entries().find(|r| r.name == package.trailer.key));
     trust::verify(
         &package.trailer,
@@ -114,6 +139,21 @@ pub fn check<'a>(
         hit.as_slice(),
     )
     .map_err(fault_of)?;
+    seen(Phase::Signed);
+    if manifest {
+        let n = package.rootfs.len() as u32;
+        for (i, line) in package.manifest.entries().enumerate().take(n as usize) {
+            let Some(digest) = line.sha256 else { continue };
+            let mut stream = pkgfmt::sha::Stream::new();
+            for part in package.content(i as u32).chunks(PORTION) {
+                stream.update(part);
+                seen(Phase::Portion);
+            }
+            if stream.finish() != digest {
+                return Err(Fault::BadManifest);
+            }
+        }
+    }
     let meta_file = package.image.file_at(0).ok_or(Fault::BadPackage)?;
     let at = package.covered().len();
     Ok(Checked {
@@ -133,4 +173,14 @@ pub fn select<'k>(official: bool, roots: &'k [Key], own: &'k [Key]) -> Trust<'k>
             direct: own,
         }
     }
+}
+
+/// Whether the list of revocations names the key that signed the package whose trailer
+/// (the signature block) is `trailer`, at or before the time it signed.
+pub fn revoked_by(trailer: &[u8], list: &Revoked<'_>) -> bool {
+    let Ok(block) = pkgfmt::Block::parse(trailer) else {
+        return false;
+    };
+    list.entries()
+        .any(|r| r.name == block.key && block.time >= r.since)
 }

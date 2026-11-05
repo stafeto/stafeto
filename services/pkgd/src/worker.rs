@@ -6,19 +6,20 @@
 //! maps the object of each package, hashes it as the bytes arrive, checks
 //! its signature, and attaches it to the file service as a layer, all in
 //! straight lines that wait in calls; the main thread of the service never
-//! waits for any of it and keeps answering. The thread owns the table of
-//! the store and the packages of the disk until it tells the main thread
-//! it is done (`shared::STARTING` clears), and the main thread reads what the
-//! thread published, entry by entry, meanwhile.
+//! waits for any of it and keeps answering. At the start the thread fills the
+//! table of the store and the packages of the disk, and the main thread reads
+//! what the thread published, entry by entry, meanwhile (`shared`). Then the
+//! thread serves the jobs of the main thread (`jobs.rs`): the receipt of a
+//! package, the transactions of the store.
 
 use crate::shared::*;
 use abi::{Access, MESSAGE_MAX, Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
-use pkgd::commit::{self, Device, Failed, Start};
+use pkgd::commit::{self, Device, Failed, Point, Start};
 use pkgd::packages::Entry;
 use pkgd::settings::{self, Settings};
-use pkgd::store::{self, BLOCK, PACKAGES, Record, Table};
-use pkgd::verify::{self, Fault};
+use pkgd::store::{self, BLOCK, Record, Table};
+use pkgd::verify::{self, Fault, Phase};
 use pkgfmt::revoked::Revoked;
 use pkgfmt::sha::{Stream, sha256};
 use pkgfmt::{Key, Trust, keyfile};
@@ -39,7 +40,7 @@ const CELL_BLOCKS: u64 = CELL_BYTES as u64 / BLOCK as u64;
 const BLOCK_SECTORS: u32 = (BLOCK / SECTOR) as u32;
 
 /// The raw handles of the main thread's, kept for this thread.
-pub const HANDLES: usize = 5;
+pub const HANDLES: usize = 6;
 pub static RAW: [core::sync::atomic::AtomicU64; HANDLES] =
     [const { core::sync::atomic::AtomicU64::new(0) }; HANDLES];
 pub const PROCESS: usize = 0;
@@ -47,8 +48,10 @@ pub const BLK_SESSION: usize = 1;
 pub const LAYERS_SESSION: usize = 2;
 pub const MAIN_CHANNEL: usize = 3;
 pub const WAKE: usize = 4;
+/// The channel the main thread kicks: the thread waits on it for a job.
+pub const JOBS: usize = 5;
 
-fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
+pub fn view<K>(i: usize) -> core::mem::ManuallyDrop<Handle<K>> {
     Handle::borrowed(abi::Handle(RAW[i].load(Acquire)))
 }
 
@@ -75,16 +78,25 @@ pub fn start(process: &Handle<Process>) -> Result<Handle<rt::handle::Thread>, ab
 pub const LEVEL: u8 = 30;
 
 extern "C" fn work(_: u64) -> ! {
-    let outcome = run();
-    if let Err(why) = outcome {
-        rt::println!("pkgd: the start failed: {why}");
-    }
+    let worker = match boot() {
+        Ok(worker) => Some(worker),
+        Err(why) => {
+            rt::println!("pkgd: the start failed: {why}");
+            None
+        }
+    };
     STARTING.store(false, Release);
     let tell = view::<Channel>(WAKE);
-    // The thread has nothing more to do in this part: it waits for the end of the process.
     let _ = sys::notify(&tell, 1);
-    loop {
-        let _ = sys::receive(&tell);
+    match worker {
+        Some(mut worker) => worker.serve(),
+        // No store to serve: the thread waits for the end of the process.
+        None => {
+            let jobs = view::<Channel>(JOBS);
+            loop {
+                let _ = sys::receive(&jobs);
+            }
+        }
     }
 }
 
@@ -92,13 +104,13 @@ type Fail = &'static str;
 
 /// The disk service as a `Device`: one block at a time, with its own channel
 /// for the notifications of the operations.
-struct Disk {
+pub struct Disk {
     session: core::mem::ManuallyDrop<Handle<Channel>>,
     own: Handle<Channel>,
     /// A copy of `own` with NOTIFY for each cell, labelled by the cell plus one.
     notify: [Handle<Channel>; CELLS as usize],
     sectors: u64,
-    flush: bool,
+    pub flush: bool,
 }
 
 /// Where the thread maps the disk service's buffer.
@@ -169,6 +181,22 @@ impl Disk {
 
     fn cell(cell: usize) -> *mut u8 {
         (BUFFER_AT + cell * CELL_BYTES as usize) as *mut u8
+    }
+
+    /// `bytes` (whole blocks, at most a cell) to the blocks from `first`.
+    pub fn write_blocks(&mut self, first: u64, bytes: &[u8]) -> Result<(), Failed> {
+        debug_assert!(bytes.len().is_multiple_of(BLOCK) && bytes.len() <= CELL_BYTES as usize);
+        // SAFETY: cell 0 of the mapped buffer; no request of it is in flight.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), Self::cell(0), bytes.len()) };
+        let key = self
+            .io(
+                Blk::Write,
+                0,
+                (bytes.len() / SECTOR) as u32,
+                first * u64::from(BLOCK_SECTORS),
+            )
+            .map_err(|_| Failed)?;
+        self.finish(key, 0).map_err(|_| Failed)
     }
 
     /// Reads `blocks` blocks from `first` into `to(chunk_start_block, bytes)`,
@@ -242,7 +270,84 @@ impl Device for Disk {
             _ => Err(Failed),
         }
     }
+
+    fn attach(&mut self, slot: usize) -> Result<(), u32> {
+        // SAFETY: the worker's: the objects change under its hand alone.
+        let objects = unsafe { &*OBJECTS.get() };
+        let Some(memory) = objects[slot].as_ref() else {
+            return Err(proto_pkg::INVALID);
+        };
+        let layer = next_layer();
+        attach_layer(memory, layer)?;
+        // SAFETY: as above.
+        unsafe { (*LAYER_OF.get())[slot] = layer };
+        Ok(())
+    }
+
+    fn detach(&mut self, slot: usize) {
+        // SAFETY: the worker's.
+        let layer = unsafe { core::mem::take(&mut (*LAYER_OF.get())[slot]) };
+        if layer != 0 {
+            detach_layer(layer);
+        }
+    }
+
+    fn point(&mut self, point: Point) {
+        crash_at(point);
+    }
+
+    #[cfg(feature = "crash")]
+    fn tear(&mut self, block: u64, data: &[u8; BLOCK]) {
+        if CRASH_AT != Point::SuperTorn.number() {
+            return;
+        }
+        // The write is torn inside its first sector: the first 64 bytes of the superblock reach
+        // the disk, the rest of the sector is zeros. The superblock is 128 bytes with its own
+        // SHA-256 at the end, so the copy is refused and the other copy is the state.
+        // SAFETY: cell 0 of the mapped buffer; no request of it is in flight.
+        unsafe {
+            core::ptr::write_bytes(Self::cell(0), 0, SECTOR);
+            core::ptr::copy_nonoverlapping(data.as_ptr(), Self::cell(0), 64);
+        }
+        if let Ok(key) = self.io(Blk::Write, 0, 1, block * u64::from(BLOCK_SECTORS)) {
+            let _ = self.finish(key, 0);
+        }
+        crash_at(Point::SuperTorn);
+    }
 }
+
+/// The point the build for the crash tests stops at (`STAFETO_PKGD_CRASH_AT`), 0 for none.
+#[cfg(feature = "crash")]
+const CRASH_AT: u8 = match option_env!("STAFETO_PKGD_CRASH_AT") {
+    Some(text) => {
+        let (bytes, mut n, mut i) = (text.as_bytes(), 0u8, 0);
+        while i < bytes.len() {
+            n = n * 10 + (bytes[i] - b'0');
+            i += 1;
+        }
+        n
+    }
+    None => 0,
+};
+
+/// The build for the crash tests prints the line of its point and stops there for good:
+/// the host kills the machine on the line and starts it again on the same disk.
+#[cfg(feature = "crash")]
+pub fn crash_at(point: Point) {
+    if point.number() != CRASH_AT {
+        return;
+    }
+    rt::println!("pkgd: crash point {} {}", point.number(), point.name());
+    let held = sys::channel_create(LEVEL);
+    loop {
+        if let Ok(channel) = &held {
+            let _ = sys::receive(channel);
+        }
+    }
+}
+
+#[cfg(not(feature = "crash"))]
+pub fn crash_at(_: Point) {}
 
 /// The disk service: the buffer of four cells and its INFO.
 fn connect_disk(process: &Handle<Process>) -> Result<Disk, Fail> {
@@ -291,17 +396,30 @@ fn connect_disk(process: &Handle<Process>) -> Result<Disk, Fail> {
     })
 }
 
-/// A number for the next layer, from 1 on and round after 256.
+/// A number for the next layer: from 1 to the greatest the file service takes and round
+/// again, never one a layer of the table holds.
 fn next_layer() -> u32 {
-    LAYER.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % 256 + 1
+    loop {
+        let n = LAYER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            % proto_fs::LAYER_NUMBER_MAX
+            + 1;
+        // SAFETY: the worker's.
+        if !unsafe { &*LAYER_OF.get() }.contains(&n) {
+            return n;
+        }
+    }
 }
+
+/// How long the file service may stay busy with the layer before it, in nanoseconds.
+const BUSY_NS: u64 = 30_000_000_000;
 
 /// Attaches `memory` as a layer: LayerStart with the object and the
 /// notification, then LayerStep until the answer. The code of the refusal.
-fn attach(memory: &Handle<Memory>, layer: u32) -> Result<(), u32> {
+fn attach_layer(memory: &Handle<Memory>, layer: u32) -> Result<(), u32> {
     let session = view::<Channel>(LAYERS_SESSION);
     let main = view::<Channel>(MAIN_CHANNEL);
-    for _ in 0..1000 {
+    let until = rt::time::now() + rt::time::ns_to_ticks(BUSY_NS);
+    loop {
         let copy = sys::handle_duplicate(memory, Rights::MAP_READ | Rights::TRANSFER)
             .map_err(|_| proto_pkg::NO_MEMORY)?;
         let tell = sys::handle_label(
@@ -320,120 +438,498 @@ fn attach(memory: &Handle<Memory>, layer: u32) -> Result<(), u32> {
         start.write(&mut w).map_err(|_| proto_pkg::INVALID)?;
         let reply = sys::send_handles(&session, w.as_bytes(), [copy.erase(), tell.erase()])
             .map_err(|_| proto_pkg::IO)?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let mut answer = LayerReply::read(proto_wire::Reader::new(reply.bytes(&mut buffer)))
-            .map_err(|_| proto_pkg::IO)?;
-        loop {
-            match answer {
-                LayerReply::Resolving => {
-                    let mut w = Writer::new();
-                    LayerStep { layer }
-                        .write(&mut w)
-                        .map_err(|_| proto_pkg::INVALID)?;
-                    let reply = sys::send(&session, w.as_bytes()).map_err(|_| proto_pkg::IO)?;
-                    answer = LayerReply::read(proto_wire::Reader::new(reply.bytes(&mut buffer)))
-                        .map_err(|_| proto_pkg::IO)?;
-                }
-                LayerReply::Done { .. } => return Ok(()),
-                LayerReply::Entry { status, entry } => {
-                    rt::println!("pkgd: layer {layer}: status {status} at entry {entry}");
-                    return Err(match status {
-                        proto_fs::CONFLICT => proto_pkg::CONFLICT,
-                        _ => proto_pkg::BAD_PACKAGE,
-                    });
-                }
-                LayerReply::Refused { status } if status == proto_fs::BUSY => break,
-                LayerReply::Refused { status } if status == proto_fs::NO_SPACE => {
-                    return Err(proto_pkg::NO_SPACE);
-                }
-                LayerReply::Refused { .. } => return Err(proto_pkg::IO),
-            }
+        match layer_steps(&session, layer, reply)? {
+            Steps::Done => return Ok(()),
+            Steps::Busy => {}
         }
         // The mapping thread of the file service is busy with the last layer.
+        if rt::time::now() > until {
+            return Err(proto_pkg::BUSY);
+        }
         let _ = sys::yield_now();
     }
-    Err(proto_pkg::BUSY)
 }
 
-/// What the start of the disk is and does. The lines it prints are the
-/// service's account of what it found (pk3-design R12).
-fn run() -> Result<(), Fail> {
+/// Detaches layer `layer`: LayerStart, then LayerStep until the answer. A layer the file
+/// service does not know is gone already.
+fn detach_layer(layer: u32) {
+    let session = view::<Channel>(LAYERS_SESSION);
+    let until = rt::time::now() + rt::time::ns_to_ticks(BUSY_NS);
+    loop {
+        let mut w = Writer::new();
+        let start = LayerStart {
+            op: LayerOp::Detach,
+            layer,
+            level: 0,
+        };
+        if start.write(&mut w).is_err() {
+            return;
+        }
+        let Ok(reply) = sys::send(&session, w.as_bytes()) else {
+            return;
+        };
+        match layer_steps(&session, layer, reply) {
+            Ok(Steps::Busy) if rt::time::now() <= until => {
+                let _ = sys::yield_now();
+            }
+            Ok(Steps::Done) => return,
+            _ => {
+                rt::println!("pkgd: layer {layer}: not detached");
+                return;
+            }
+        }
+    }
+}
+
+enum Steps {
+    Done,
+    Busy,
+}
+
+/// The answers of the file service to a LayerStart until the end: Done, or BUSY when its
+/// mapping thread has the last layer still; the code of any other refusal.
+fn layer_steps(session: &Handle<Channel>, layer: u32, mut reply: sys::Reply) -> Result<Steps, u32> {
+    let mut buffer = [0; MESSAGE_MAX];
+    loop {
+        let answer = LayerReply::read(proto_wire::Reader::new(reply.bytes(&mut buffer)))
+            .map_err(|_| proto_pkg::IO)?;
+        match answer {
+            LayerReply::Resolving => {
+                let mut w = Writer::new();
+                LayerStep { layer }
+                    .write(&mut w)
+                    .map_err(|_| proto_pkg::INVALID)?;
+                reply = sys::send(session, w.as_bytes()).map_err(|_| proto_pkg::IO)?;
+            }
+            LayerReply::Done { .. } => return Ok(Steps::Done),
+            LayerReply::Entry { status, entry } => {
+                rt::println!("pkgd: layer {layer}: status {status} at entry {entry}");
+                return Err(match status {
+                    proto_fs::CONFLICT => proto_pkg::CONFLICT,
+                    _ => proto_pkg::BAD_PACKAGE,
+                });
+            }
+            LayerReply::Refused { status } if status == proto_fs::BUSY => return Ok(Steps::Busy),
+            LayerReply::Refused { status } if status == proto_fs::NO_SPACE => {
+                return Err(proto_pkg::NO_SPACE);
+            }
+            LayerReply::Refused { .. } => return Err(proto_pkg::IO),
+        }
+    }
+}
+
+/// What the worker keeps between its jobs.
+pub struct Worker {
+    pub disk: Disk,
+    pub process: core::mem::ManuallyDrop<Handle<Process>>,
+    pub roots: ([Key; 4], usize),
+    /// The list of revocations of the state, parsed from `REVOKED_FILE`.
+    pub revoked: Option<Revoked<'static>>,
+    /// The receipt being fed: its number, the place of the table, the size and the first
+    /// block of its extent; its object is mapped at `window(slot)`.
+    pub open: Option<crate::jobs::Open>,
+    /// A write of the data failed: the code the commit answers.
+    pub failed: Option<u32>,
+    /// The first write of the data of the receipt is still to come (the crash point).
+    pub first_write: bool,
+}
+
+/// The state the worker starts with: the disk service connected, the store read, its
+/// packages attached; the lines it prints are the service's account of what it found
+/// (pk3-design R12).
+fn boot() -> Result<Worker, Fail> {
     let process = view::<Process>(PROCESS);
-    let mut disk = connect_disk(&process)?;
+    let disk = connect_disk(&process)?;
     let roots = roots();
     rt::print!("pkgd: roots");
     for key in &roots.0[..roots.1] {
         rt::print!(" {}", key.name.as_str());
     }
     rt::println!();
-    // SAFETY: the thread owns the table until `STARTING` clears.
-    let table = unsafe { &mut *TABLE.get() };
-    let opened = match commit::open(&mut disk, table).map_err(|_| "the disk failed")? {
-        Start::Store(opened) => opened,
-        Start::Blank if disk.flush => {
-            let opened = commit::format(&mut disk, table).map_err(|_| "the format failed")?;
-            rt::println!(
-                "pkgd: store formatted, {} blocks",
-                disk.blocks() - store::SUPERS
-            );
-            READ_ONLY.store(false, Release);
-            GENERATION.store(opened.superblock.generation, Release);
-            finish_counts(&opened, table, &disk);
-            return Ok(());
-        }
-        Start::Blank => {
-            rt::println!("pkgd: device has no flush, store read-only");
-            READ_ONLY.store(true, Release);
-            return Ok(());
-        }
-        Start::Damaged => {
-            rt::println!("pkgd: store damaged, no package from the disk");
-            DAMAGED.store(true, Release);
-            return Ok(());
-        }
+    let mut worker = Worker {
+        disk,
+        process,
+        roots,
+        revoked: None,
+        open: None,
+        failed: None,
+        first_write: true,
     };
-    if !disk.flush {
-        rt::println!("pkgd: device has no flush, store read-only");
-        READ_ONLY.store(true, Release);
-    }
-    GENERATION.store(opened.superblock.generation, Release);
-    let settings_len = read_settings(&mut disk, table, &process);
-    let revoked = read_revoked(&mut disk, table, &roots);
-    let mut disk_count = 0;
-    for (slot, published) in PUBLISHED.iter().enumerate() {
-        let record = table.record(slot);
-        if record.kind != store::PACKAGE {
-            continue;
-        }
-        match load(
-            &mut disk,
-            &process,
-            table,
-            &record,
-            slot,
-            &roots,
-            settings_len,
-            revoked.as_ref(),
-        ) {
-            Ok(entry) => {
-                // SAFETY: the slot is published below, after the entry is whole.
-                unsafe { (*DISK_ENTRIES.get())[slot] = Some(entry) };
-                published.store(true, Release);
-                disk_count += 1;
-            }
-            Err(why) => rt::println!(
-                "pkgd: {}: {why}, skipped",
-                core::str::from_utf8(record.name_bytes()).unwrap_or("?")
-            ),
-        }
-    }
-    DISK_PACKAGES.store(disk_count, Release);
-    finish_counts(&opened, table, &disk);
-    Ok(())
+    worker.start()?;
+    Ok(worker)
 }
 
-fn finish_counts(opened: &commit::Opened, table: &Table, disk: &Disk) {
-    let free = commit::free_of(table, opened);
+impl Worker {
+    /// The start: the superblocks, the table, the settings, the list of revocations, each
+    /// package of the table.
+    fn start(&mut self) -> Result<(), Fail> {
+        // The table is read into the scratch table of the next state, then it is the state's.
+        // SAFETY: nothing reads either until `TABLE` has entries that are published.
+        let scratch = unsafe { &mut (*NEXT.get()).next };
+        let opened = match commit::open(&mut self.disk, scratch).map_err(|_| "the disk failed")? {
+            Start::Store(opened) => opened,
+            Start::Blank if self.disk.flush => {
+                let opened =
+                    commit::format(&mut self.disk, scratch).map_err(|_| "the format failed")?;
+                rt::println!(
+                    "pkgd: store formatted, {} blocks",
+                    self.disk.blocks() - store::SUPERS
+                );
+                READ_ONLY.store(false, Release);
+                self.set_state(scratch, opened);
+                finish_counts(&opened, &self.disk);
+                return Ok(());
+            }
+            Start::Blank => {
+                rt::println!("pkgd: device has no flush, store read-only");
+                READ_ONLY.store(true, Release);
+                return Ok(());
+            }
+            Start::Damaged => {
+                rt::println!("pkgd: store damaged, no package from the disk");
+                DAMAGED.store(true, Release);
+                return Ok(());
+            }
+        };
+        if !self.disk.flush {
+            rt::println!("pkgd: device has no flush, store read-only");
+            READ_ONLY.store(true, Release);
+        }
+        self.set_state(scratch, opened);
+        // SAFETY: as above, and the table is the thread's to read.
+        let table = unsafe { &*TABLE.get() };
+        let settings_len = self.read_settings(table);
+        self.revoked = self.read_revoked(table);
+        let mut disk_count = 0;
+        for (slot, published) in PUBLISHED.iter().enumerate() {
+            let record = table.record(slot);
+            if record.kind != store::PACKAGE {
+                continue;
+            }
+            match self.load(table, &record, slot, settings_len) {
+                Ok(entry) => {
+                    // SAFETY: the slot is published below, after the entry is whole.
+                    unsafe { (*DISK_ENTRIES.get())[slot] = Some(entry) };
+                    published.store(true, Release);
+                    disk_count += 1;
+                }
+                Err(why) => rt::println!(
+                    "pkgd: {}: {why}, skipped",
+                    core::str::from_utf8(record.name_bytes()).unwrap_or("?")
+                ),
+            }
+        }
+        DISK_PACKAGES.store(disk_count, Release);
+        finish_counts(&opened, &self.disk);
+        Ok(())
+    }
+
+    /// `table` of the state `opened` is the table the main thread reads and the worker
+    /// compares the next state with.
+    fn set_state(&mut self, table: &Table, opened: commit::Opened) {
+        // SAFETY: only at the start, before any entry is published, or inside `publish`.
+        unsafe {
+            (*TABLE.get()).0 = table.0;
+            *OPENED.get() = Some(opened);
+        }
+        GENERATION.store(opened.superblock.generation, Release);
+        let free = commit::free_of(table, &opened);
+        FREE.store(free, Release);
+        BLOCKS.store(self.disk.blocks(), Release);
+    }
+
+    /// The blob of settings from its extent, checked, made into the container of
+    /// a layer and attached. The length of the blob, 0 for none. The blob is the
+    /// state, whether its layer attached or not: the keys of the owner's repositories
+    /// and `SETTINGS_GET` come from it, and a layer that did not attach says so.
+    fn read_settings(&mut self, table: &Table) -> usize {
+        let record = table.record(store::SETTINGS_SLOT);
+        if record.kind != store::SETTINGS {
+            return 0;
+        }
+        // SAFETY: the thread owns the blob until `STARTING` clears.
+        let blob = unsafe { &mut *SETTINGS.get() };
+        if record.length as usize > blob.len()
+            || disk_read(&mut self.disk, &record, &mut blob[..]).is_err()
+        {
+            rt::println!("pkgd: settings damaged, no settings layer");
+            return 0;
+        }
+        let bytes = &blob[..record.length as usize];
+        let Ok(parsed) = Settings::parse(bytes)
+            .map_err(|_| ())
+            .and_then(|s| (sha256(bytes) == record.sha256).then_some(s).ok_or(()))
+        else {
+            rt::println!("pkgd: settings damaged, no settings layer");
+            return 0;
+        };
+        SETTINGS_LEN.store(bytes.len(), Release);
+        match self.settings_layer(&parsed, store::SETTINGS_SLOT) {
+            Ok(()) => {}
+            Err(why) => rt::println!("pkgd: settings layer: {why}, not attached"),
+        }
+        bytes.len()
+    }
+
+    /// The container of the settings `parsed` made into an object in place `slot` of
+    /// `OBJECTS` and attached.
+    pub fn settings_layer(&mut self, parsed: &Settings<'_>, slot: usize) -> Result<(), Fail> {
+        let memory = self.settings_object(parsed)?;
+        // SAFETY: the thread's.
+        unsafe { (*OBJECTS.get())[slot] = Some(memory) };
+        if let Err(code) = self.disk.attach(slot) {
+            // SAFETY: as above.
+            unsafe { (*OBJECTS.get())[slot] = None };
+            rt::println!("pkgd: settings layer: code {code}");
+            return Err("the file service refused it");
+        }
+        Ok(())
+    }
+
+    /// The object holding the container of the settings `parsed`.
+    pub fn settings_object(&mut self, parsed: &Settings<'_>) -> Result<Handle<Memory>, Fail> {
+        // SAFETY: the thread's.
+        let out = unsafe { &mut *CONTAINER.get() };
+        let len = settings::container(parsed, out).ok_or("the container is not made")?;
+        let at = window(store::SETTINGS_NEW);
+        let memory = sys::mem_create(len as u64).map_err(|_| "no memory")?;
+        sys::mem_map(&self.process, &memory, 0, len as u64, at, Access::ReadWrite)
+            .map_err(|_| "not mapped")?;
+        // SAFETY: the window is the thread's and mapped for `len` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), at as *mut u8, len) };
+        // SAFETY: nothing reads the window any more.
+        let _ = unsafe { sys::mem_unmap(&self.process, at, len as u64) };
+        Ok(memory)
+    }
+
+    /// The list of revocations from its extent: the text, then the block of the
+    /// signature of a root. The entries that count; none when the list is bad.
+    fn read_revoked(&mut self, table: &Table) -> Option<Revoked<'static>> {
+        let record = table.record(store::REVOKED_SLOT);
+        if record.kind != store::REVOKED_LIST {
+            return None;
+        }
+        // SAFETY: the thread owns the buffer until it is done.
+        let buffer = unsafe { &mut *REVOKED_FILE.get() };
+        let bad = |why: &str| {
+            rt::println!("pkgd: revocation list damaged ({why}), using the empty list");
+            None
+        };
+        if record.length as usize > buffer.len()
+            || record.length as usize <= pkgfmt::sig::BLOCK_SIZE
+            || disk_read(&mut self.disk, &record, buffer).is_err()
+        {
+            return bad("read");
+        }
+        if sha256(&buffer[..record.length as usize]) != record.sha256 {
+            return bad("hash");
+        }
+        match self.parse_list(record.length as usize) {
+            Ok(list) if list.serial == record.number => Some(list),
+            Ok(_) => bad("serial"),
+            Err(()) => bad("signature"),
+        }
+    }
+
+    /// The list of revocations in the first `len` bytes of `REVOKED_FILE`, when a root
+    /// signed it.
+    pub fn parse_list(&self, len: usize) -> Result<Revoked<'static>, ()> {
+        // SAFETY: the buffer is static and nothing writes it while the list is parsed.
+        let bytes: &'static [u8] =
+            unsafe { core::slice::from_raw_parts((*REVOKED_FILE.get()).as_ptr(), len) };
+        list_of(bytes, &self.roots)
+    }
+
+    /// One package of the disk: its object created and filled while the hashes
+    /// run, the checks of `pkgd::verify`, the attach. The words of what refused it.
+    fn load(
+        &mut self,
+        table: &Table,
+        record: &Record,
+        slot: usize,
+        settings_len: usize,
+    ) -> Result<Entry, &'static str> {
+        // A package of the image of the same name is the one that is used.
+        // SAFETY: the main thread filled the image entries before this thread began.
+        let images = unsafe { &*IMAGE_ENTRIES.get() };
+        if pkgd::packages::in_image(images, record.name_bytes()) {
+            return Err("in the image");
+        }
+        // A package the table marks revoked stays out when the list that says so is not read.
+        if record.flags & store::REVOKED != 0 && self.revoked.is_none() {
+            return Err("key revoked");
+        }
+        let len = record.length;
+        let memory = sys::mem_create(len).map_err(|_| "no memory")?;
+        let at = window(slot);
+        sys::mem_map(&self.process, &memory, 0, len, at, Access::ReadWrite)
+            .map_err(|_| "not mapped")?;
+        let blocks = u64::from(record.blocks);
+        let mut stream = Stream::new();
+        let mut covered = [0u8; 32];
+        let read = self.disk.read_run(record.first, blocks, |first, bytes| {
+            // SAFETY: the window holds `len` bytes and this is the thread's alone.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (at + first as usize * BLOCK) as *mut u8,
+                    bytes.len(),
+                )
+            };
+            let last = first + (bytes.len() / BLOCK) as u64 == blocks;
+            let body = if last {
+                bytes.len() - BLOCK
+            } else {
+                bytes.len()
+            };
+            // The hash is of the copy in the window.
+            // SAFETY: the bytes were copied to the window just above.
+            let copy = unsafe {
+                core::slice::from_raw_parts((at + first as usize * BLOCK) as *const u8, bytes.len())
+            };
+            let hashing = Stopwatch::new();
+            stream.update(&copy[..body]);
+            if last {
+                covered = stream.clone().finish();
+                stream.update(&copy[body..]);
+            }
+            hashing.keep(&SHA_TICKS);
+        });
+        // SAFETY: the unmap below is the last use of the window.
+        let unmap = || {
+            let _ = unsafe { sys::mem_unmap(&self.process, at, len) };
+        };
+        if read.is_err() {
+            unmap();
+            return Err("read failed");
+        }
+        let whole = stream.finish();
+        // SAFETY: the window holds the whole file, no one writes it now.
+        let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, len as usize) };
+        let repo = table.repo(usize::from(record.repo)).map(|(name, _)| name);
+        let own = match repo {
+            Some(b"stafeto") | None => None,
+            Some(name) => settings_key(settings_len, name),
+        };
+        let official = matches!(repo, Some(b"stafeto"));
+        let own_keys = own.map_or([].as_slice(), |k| core::slice::from_ref(k));
+        let trust = verify::select(official, &self.roots.0[..self.roots.1], own_keys);
+        let checked = check_timed(
+            bytes,
+            &covered,
+            &whole,
+            record,
+            &trust,
+            self.revoked.as_ref(),
+            false,
+        );
+        let entry = match checked {
+            Ok(checked) => {
+                let mut entry = Entry {
+                    record: *record,
+                    image: false,
+                    layer: 0,
+                    meta_len: 0,
+                    meta: [0; pkgd::packages::META_MAX],
+                    trailer: [0; pkgd::packages::TRAILER],
+                };
+                if entry.keep(checked.meta, checked.trailer) {
+                    Ok(entry)
+                } else {
+                    Err(Fault::BadPackage)
+                }
+            }
+            Err(fault) => Err(fault),
+        };
+        unmap();
+        let mut entry = entry.map_err(Fault::words)?;
+        // SAFETY: the thread's.
+        unsafe { (*OBJECTS.get())[slot] = Some(memory) };
+        if let Err(code) = self.disk.attach(slot) {
+            // SAFETY: as above.
+            unsafe { (*OBJECTS.get())[slot] = None };
+            return Err(match code {
+                proto_pkg::CONFLICT => "conflict",
+                proto_pkg::NO_SPACE => "no space for a layer",
+                _ => "not attached",
+            });
+        }
+        // SAFETY: as above.
+        entry.layer = unsafe { (*LAYER_OF.get())[slot] };
+        Ok(entry)
+    }
+}
+
+/// The list of revocations in `bytes` (the text, then the block of a root's signature).
+pub fn list_of(bytes: &'static [u8], roots: &([Key; 4], usize)) -> Result<Revoked<'static>, ()> {
+    if bytes.len() <= pkgfmt::sig::BLOCK_SIZE {
+        return Err(());
+    }
+    let (text, block) = bytes.split_at(bytes.len() - pkgfmt::sig::BLOCK_SIZE);
+    let trust = Trust {
+        roots: &roots.0[..roots.1],
+        direct: &[],
+    };
+    let parsed = core::str::from_utf8(text)
+        .ok()
+        .and_then(|t| Revoked::parse(t).ok());
+    let signed = pkgfmt::Block::parse(block).ok().and_then(|b| {
+        pkgfmt::trust::verify(
+            &b,
+            pkgfmt::Kind::Revoked,
+            &sha256(text),
+            text.len() as u64,
+            &trust,
+            &[],
+        )
+        .ok()
+    });
+    match (parsed, signed) {
+        (Some(list), Some(_)) => Ok(list),
+        _ => Err(()),
+    }
+}
+
+/// `verify::check` with the time of its parts kept for the report, for a package that
+/// came from the disk (`manifest` false) or from a client.
+pub fn check_timed<'a>(
+    bytes: &'a [u8],
+    covered: &[u8; 32],
+    whole: &[u8; 32],
+    record: &Record,
+    trust: &Trust<'_>,
+    revoked: Option<&Revoked<'_>>,
+    manifest: bool,
+) -> Result<verify::Checked<'a>, Fault> {
+    let mut mark = rt::time::now();
+    verify::check(
+        bytes,
+        covered,
+        whole,
+        record,
+        pkgd::SERIES,
+        trust,
+        revoked,
+        manifest,
+        &mut |phase| {
+            let now = rt::time::now();
+            let longest = match phase {
+                Phase::Parsed => &PARSE_TICKS,
+                Phase::Signed => &SIGN_TICKS,
+                Phase::Portion => &MANIFEST_TICKS,
+            };
+            longest.fetch_max(
+                now.wrapping_sub(mark),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            mark = now;
+        },
+    )
+}
+
+fn finish_counts(opened: &commit::Opened, disk: &Disk) {
+    // SAFETY: the table is the state's, read here by the thread that wrote it.
+    let free = commit::free_of(unsafe { &*TABLE.get() }, opened);
     FREE.store(free, Release);
     BLOCKS.store(disk.blocks(), Release);
     GENERATION.store(opened.superblock.generation, Release);
@@ -462,64 +958,6 @@ fn roots() -> ([Key; 4], usize) {
     (keys, n)
 }
 
-/// The blob of settings from its extent, checked, made into the container of
-/// a layer and attached. The length of the blob, 0 for none.
-fn read_settings(disk: &mut Disk, table: &Table, process: &Handle<Process>) -> usize {
-    let record = table.record(store::SETTINGS_SLOT);
-    if record.kind != store::SETTINGS {
-        return 0;
-    }
-    // SAFETY: the thread owns the blob until `STARTING` clears.
-    let blob = unsafe { &mut *SETTINGS.get() };
-    if record.length as usize > blob.len() || disk_read(disk, &record, blob).is_err() {
-        rt::println!("pkgd: settings damaged, no settings layer");
-        return 0;
-    }
-    let bytes = &blob[..record.length as usize];
-    let Ok(parsed) = Settings::parse(bytes)
-        .map_err(|_| ())
-        .and_then(|s| (sha256(bytes) == record.sha256).then_some(s).ok_or(()))
-    else {
-        rt::println!("pkgd: settings damaged, no settings layer");
-        return 0;
-    };
-    // SAFETY: as above.
-    let out = unsafe { &mut *CONTAINER.get() };
-    let Some(len) = settings::container(&parsed, out) else {
-        return 0;
-    };
-    let layer = next_layer();
-    let attached = sys::mem_create(len as u64)
-        .map_err(|_| proto_pkg::NO_MEMORY)
-        .and_then(|memory| {
-            sys::mem_map(
-                process,
-                &memory,
-                0,
-                len as u64,
-                window(PACKAGES),
-                Access::ReadWrite,
-            )
-            .map_err(|_| proto_pkg::NO_MEMORY)?;
-            // SAFETY: the window is the thread's and mapped for `len` bytes.
-            unsafe {
-                core::ptr::copy_nonoverlapping(out.as_ptr(), window(PACKAGES) as *mut u8, len)
-            };
-            // SAFETY: nothing reads the window any more.
-            let _ = unsafe { sys::mem_unmap(process, window(PACKAGES), len as u64) };
-            attach(&memory, layer).map(|()| memory)
-        });
-    match attached {
-        Ok(memory) => {
-            // SAFETY: the thread owns the handles of the start.
-            unsafe { (*OBJECTS.get())[PACKAGES] = Some(memory) };
-            SETTINGS_LEN.store(bytes.len(), Release);
-        }
-        Err(code) => rt::println!("pkgd: settings layer: code {code}, not attached"),
-    }
-    bytes.len()
-}
-
 /// The extent of `record` into `out`.
 fn disk_read(disk: &mut Disk, record: &Record, out: &mut [u8]) -> Result<(), Failed> {
     disk.read_run(record.first, u64::from(record.blocks), |at, bytes| {
@@ -529,180 +967,13 @@ fn disk_read(disk: &mut Disk, record: &Record, out: &mut [u8]) -> Result<(), Fai
     })
 }
 
-/// The list of revocations from its extent: the text, then the block of the
-/// signature of a root. The entries that count; none when the list is bad.
-fn read_revoked(
-    disk: &mut Disk,
-    table: &Table,
-    roots: &([Key; 4], usize),
-) -> Option<Revoked<'static>> {
-    let record = table.record(store::REVOKED_SLOT);
-    if record.kind != store::REVOKED_LIST {
-        return None;
-    }
-    // SAFETY: the thread owns the buffer until `STARTING` clears.
-    let buffer = unsafe { &mut *REVOKED_FILE.get() };
-    let bad = |why: &str| {
-        rt::println!("pkgd: revocation list damaged ({why}), using the empty list");
-        None
-    };
-    if record.length as usize > buffer.len()
-        || record.length as usize <= pkgfmt::sig::BLOCK_SIZE
-        || disk_read(disk, &record, buffer).is_err()
-    {
-        return bad("read");
-    }
-    // SAFETY: the buffer is static and nothing writes it after this read.
-    let bytes: &'static [u8] =
-        unsafe { core::slice::from_raw_parts(buffer.as_ptr(), record.length as usize) };
-    if sha256(bytes) != record.sha256 {
-        return bad("hash");
-    }
-    let (text, block) = bytes.split_at(bytes.len() - pkgfmt::sig::BLOCK_SIZE);
-    let trust = Trust {
-        roots: &roots.0[..roots.1],
-        direct: &[],
-    };
-    let parsed = core::str::from_utf8(text)
-        .ok()
-        .and_then(|t| pkgfmt::revoked::Revoked::parse(t).ok());
-    let signed = pkgfmt::Block::parse(block).ok().and_then(|b| {
-        pkgfmt::trust::verify(
-            &b,
-            pkgfmt::Kind::Revoked,
-            &sha256(text),
-            text.len() as u64,
-            &trust,
-            &[],
-        )
-        .ok()
-    });
-    let (Some(list), Some(_)) = (parsed, signed) else {
-        return bad("signature");
-    };
-    if list.serial != record.number {
-        return bad("serial");
-    }
-    Some(list)
-}
-
-/// One package of the disk: its object created and filled while the hashes
-/// run, the checks of `pkgd::verify`, the attach. The words of what refused it.
-#[allow(clippy::too_many_arguments)]
-fn load(
-    disk: &mut Disk,
-    process: &Handle<Process>,
-    table: &Table,
-    record: &Record,
-    slot: usize,
-    roots: &([Key; 4], usize),
-    settings_len: usize,
-    revoked: Option<&Revoked<'_>>,
-) -> Result<Entry, &'static str> {
-    // A package of the image of the same name is the one that is used.
-    // SAFETY: the main thread filled the image entries before this thread began.
-    let images = unsafe { &*IMAGE_ENTRIES.get() };
-    if pkgd::packages::in_image(images, record.name_bytes()) {
-        return Err("in the image");
-    }
-    let len = record.length;
-    let memory = sys::mem_create(len).map_err(|_| "no memory")?;
-    let at = window(slot);
-    sys::mem_map(process, &memory, 0, len, at, Access::ReadWrite).map_err(|_| "not mapped")?;
-    let blocks = u64::from(record.blocks);
-    let mut stream = Stream::new();
-    let mut covered = [0u8; 32];
-    let hashed = Stopwatch::new();
-    let read = disk.read_run(record.first, blocks, |first, bytes| {
-        // SAFETY: the window holds `len` bytes and this is the thread's alone.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (at + first as usize * BLOCK) as *mut u8,
-                bytes.len(),
-            )
-        };
-        let last = first + (bytes.len() / BLOCK) as u64 == blocks;
-        let body = if last {
-            bytes.len() - BLOCK
-        } else {
-            bytes.len()
-        };
-        stream.update(&bytes[..body]);
-        if last {
-            covered = stream.clone().finish();
-            stream.update(&bytes[body..]);
-        }
-    });
-    hashed.keep(&HASH_TICKS);
-    // SAFETY: the unmap below is the last use of the window.
-    let unmap = || {
-        let _ = unsafe { sys::mem_unmap(process, at, len) };
-    };
-    if read.is_err() {
-        unmap();
-        return Err("read failed");
-    }
-    let whole = stream.finish();
-    // SAFETY: the window holds the whole file, no one writes it now.
-    let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, len as usize) };
-    let repo = table.repo(usize::from(record.repo)).map(|(name, _)| name);
-    let own = match repo {
-        Some(b"stafeto") | None => None,
-        Some(name) => settings_key(settings_len, name),
-    };
-    let official = matches!(repo, Some(b"stafeto"));
-    let own_keys = own.map_or([].as_slice(), |k| core::slice::from_ref(k));
-    let trust = verify::select(official, &roots.0[..roots.1], own_keys);
-    let checking = Stopwatch::new();
-    let checked = verify::check(
-        bytes,
-        &covered,
-        &whole,
-        record,
-        pkgd::SERIES,
-        &trust,
-        revoked,
-    );
-    checking.keep(&CHECK_TICKS);
-    let entry = match checked {
-        Ok(checked) => {
-            let mut entry = Entry {
-                record: *record,
-                image: false,
-                layer: 0,
-                meta_len: 0,
-                meta: [0; pkgd::packages::META_MAX],
-                trailer: [0; pkgd::packages::TRAILER],
-            };
-            if entry.keep(checked.meta, checked.trailer) {
-                Ok(entry)
-            } else {
-                Err(Fault::BadPackage)
-            }
-        }
-        Err(fault) => Err(fault),
-    };
-    unmap();
-    let mut entry = entry.map_err(Fault::words)?;
-    entry.layer = next_layer();
-    attach(&memory, entry.layer).map_err(|code| match code {
-        proto_pkg::CONFLICT => "conflict",
-        proto_pkg::NO_SPACE => "no space for a layer",
-        _ => "not attached",
-    })?;
-    // SAFETY: the thread owns the handles until it is done.
-    unsafe { (*OBJECTS.get())[slot] = Some(memory) };
-    Ok(entry)
-}
-
 /// The key of the owner's repository `name` out of the settings blob, which
 /// the thread read (`read_settings`), parsed again.
-fn settings_key(len: usize, name: &[u8]) -> Option<&'static Key> {
+pub fn settings_key(len: usize, name: &[u8]) -> Option<&'static Key> {
     if len == 0 {
         return None;
     }
-    // SAFETY: the blob is the thread's until it is done and unchanged by now.
+    // SAFETY: the blob is the worker's to read: it changes under its hand alone.
     let blob = unsafe { core::slice::from_raw_parts((*SETTINGS.get()).as_ptr(), len) };
     let key = Settings::parse(blob)
         .ok()?

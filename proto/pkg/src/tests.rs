@@ -274,3 +274,25 @@ fn the_blob_limits_are_exact() {
     assert!(blob::Blob::parse(&blob::write(&[("a", &over)])).is_err());
     assert!(blob::Blob::parse(&blob::write(&[("", b"x")])).is_err());
 }
+
+#[test]
+fn a_settings_reply_round_trips_with_its_generation() {
+    let reply = Settings {
+        total: 70_000,
+        copied: 16_384,
+        generation: 9,
+    };
+    let mut w = Writer::new();
+    w.u32(0).unwrap();
+    reply.write(&mut w).unwrap();
+    assert_eq!(Settings::read(w.as_bytes()), Ok(reply));
+    // Cut, with a byte too many, and a refusal.
+    assert!(Settings::read(&w.as_bytes()[..w.as_bytes().len() - 1]).is_err());
+    let mut longer = w.as_bytes().to_vec();
+    longer.push(0);
+    assert!(Settings::read(&longer).is_err());
+    assert_eq!(
+        Settings::read(&Status::Unknown(BUSY).code().to_le_bytes()),
+        Err(code(BUSY))
+    );
+}

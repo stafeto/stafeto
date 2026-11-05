@@ -433,6 +433,7 @@ dependencies = [
  "proto-fs",
  "proto-init",
  "proto-pkg",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
