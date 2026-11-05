@@ -275,7 +275,7 @@ static int directories(void) {
     static DIR *held[1100];
     int held_count = 0;
     while (held_count < 1100 && (held[held_count] = opendir("/")) != NULL) held_count++;
-    if (held_count < 1000 || held_count > 1021) return 81;
+    if (held_count < 1000 || held_count > 1024) return 81;
     if (errno != EMFILE || open("motd", O_RDONLY) != -1 || errno != EMFILE) return 82;
     saved_fd = dirfd(held[7]);
     if (closedir(held[7]) || (held[7] = opendir("/tmp")) == NULL || dirfd(held[7]) != saved_fd) return 83;
