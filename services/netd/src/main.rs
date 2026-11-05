@@ -479,6 +479,8 @@ fn main(_: u64) -> u64 {
         held_tx: false,
         #[cfg(feature = "probe")]
         longest: [0; 2],
+        #[cfg(feature = "probe")]
+        own: &s.thread,
         _maps: Maps {
             _dma: dma_object,
             _net: net_object,
@@ -771,16 +773,30 @@ struct Driver<'a> {
     /// interest sets reads: the own steps of the service are one kind).
     #[cfg(feature = "probe")]
     longest: [u64; 2],
+    /// The service's own thread (its handle of the start data), whose time
+    /// of its own (thread_ran) the two steps are measured in: a thread of a
+    /// higher level that runs in the middle of a step does not lengthen it,
+    /// as in rt's count of steps. No handle of its own: the operations of
+    /// role `w` take the service's handles up to its limit.
+    #[cfg(feature = "probe")]
+    own: &'a Handle<rt::handle::Thread>,
     _maps: Maps,
 }
 
 impl Driver<'_> {
-    /// A step of waking (`which` 0) or of departure (1) took until now from
-    /// `began`: a line when it is the longest of its kind (builds with the
-    /// feature `probe`).
+    /// The ticks the service's thread has run (builds with the feature
+    /// `probe`).
+    #[cfg(feature = "probe")]
+    fn ran(&self) -> u64 {
+        sys::thread_ran(self.own).unwrap_or(0)
+    }
+
+    /// A step of waking (`which` 0) or of departure (1) ran until now from
+    /// `began` (`ran`): a line when it is the longest of its kind (builds
+    /// with the feature `probe`).
     #[cfg(feature = "probe")]
     fn measured(&mut self, which: usize, began: u64) {
-        let ticks = rt::time::now().saturating_sub(began);
+        let ticks = self.ran().saturating_sub(began);
         if ticks > self.longest[which] {
             self.longest[which] = ticks;
             let name = ["wake", "cleanup"][which];
@@ -1422,7 +1438,7 @@ impl Service<0> for Driver<'_> {
                     WAKE => {
                         rt::service::step_own();
                         #[cfg(feature = "probe")]
-                        let began = rt::time::now();
+                        let began = self.ran();
                         let left = self.net.wake(&mut self.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
@@ -1433,7 +1449,7 @@ impl Service<0> for Driver<'_> {
                     CLEANUP => {
                         rt::service::step_own();
                         #[cfg(feature = "probe")]
-                        let began = rt::time::now();
+                        let began = self.ran();
                         let more = self.net.depart_step(&mut self.stack);
                         #[cfg(feature = "probe")]
                         self.measured(1, began);
