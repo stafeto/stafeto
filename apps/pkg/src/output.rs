@@ -12,10 +12,9 @@ use alloc::vec::Vec;
 use pkgfmt::meta::short_version;
 use proto_pkg::{ENTRY_DEPENDENCY, ENTRY_IMAGE, ENTRY_REVOKED};
 
-/// `29.3 MB`: megabytes of 10^6 bytes, one digit after the point, rounded
-/// down so that no size is shown larger than it is.
+/// `29.3 MB`: megabytes of 10^6 bytes, one digit after the point, rounded to the nearest tenth.
 pub fn megabytes(bytes: u64) -> String {
-    let tenths = bytes / 100_000;
+    let tenths = (bytes + 50_000) / 100_000;
     format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
@@ -303,9 +302,11 @@ mod tests {
     fn sizes_are_megabytes_of_a_million_bytes() {
         assert_eq!(megabytes(29_323_264), "29.3 MB");
         assert_eq!(megabytes(28_827_648), "28.8 MB");
-        assert_eq!(megabytes(495_616), "0.4 MB");
+        assert_eq!(megabytes(495_616), "0.5 MB");
         assert_eq!(megabytes(0), "0.0 MB");
-        assert_eq!(megabytes(999_999), "0.9 MB");
+        assert_eq!(megabytes(49_999), "0.0 MB");
+        assert_eq!(megabytes(50_000), "0.1 MB");
+        assert_eq!(megabytes(999_999), "1.0 MB");
         assert_eq!(megabytes(1_000_000), "1.0 MB");
         assert_eq!(megabytes(533_000_000), "533.0 MB");
     }

@@ -85,13 +85,18 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             return EXIT_USAGE;
         }
     };
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(line) => {
             sys::err(&line);
             EXIT_REFUSED
         }
+    };
+    if sys::child_left_unwaited() {
+        sys::err("pkg: a child process ended and was not waited for");
+        return EXIT_REFUSED;
     }
+    code
 }
 
 /// The line of a refusal of the service, or of its end.
@@ -563,14 +568,14 @@ impl Tool {
                     break;
                 }
                 filled += n;
-                if total + filled as u64 > c.size {
+                if !fetch::fits(total, filled, c.size) {
                     break;
                 }
             }
             if filled == 0 {
                 break;
             }
-            if total + filled as u64 > c.size {
+            if !fetch::fits(total, filled, c.size) {
                 verdict = Some(Verdict::TooMany);
                 break;
             }

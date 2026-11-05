@@ -19,6 +19,7 @@ unsafe extern "C" {
     fn nanosleep(request: *const Timespec, rest: *mut Timespec) -> c_int;
     fn geteuid() -> u32;
     fn mkdir(path: *const c_char, mode: u32) -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
 
 /// The allocator of the program: the C library's `malloc`, and `posix_memalign`
@@ -190,6 +191,15 @@ pub fn pause_ms(ms: i64) {
     };
     // SAFETY: a valid request and no remainder wanted.
     unsafe { nanosleep(&t, core::ptr::null_mut()) };
+}
+
+/// Whether a child of this process has ended that nobody waited for: `pkg` waits for every curl it
+/// starts, so a child that is found here is a fault of `pkg`, which it says (a zombie is no line of
+/// `ps` on this system, so only the process itself can tell).
+pub fn child_left_unwaited() -> bool {
+    let mut status: c_int = 0;
+    // SAFETY: a valid out pointer; WNOHANG is 1.
+    unsafe { waitpid(-1, &mut status, 1) > 0 }
 }
 
 /// Whether the process runs as the superuser.

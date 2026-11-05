@@ -125,6 +125,12 @@ pub fn verdict(code: i32, got: u64, size: Option<u64>) -> Verdict {
     }
 }
 
+/// Whether `got` more bytes after `total` still fit in the `size` the index names: the count `pkg`
+/// keeps itself, besides `--max-filesize` of curl and the `TOO_LONG` of the service.
+pub fn fits(total: u64, got: usize, size: u64) -> bool {
+    total + got as u64 <= size
+}
+
 /// The line for a download that was not whole: `url` is the address, `what`
 /// the name the lengths are told of (a package, or the file), `size` its length.
 pub fn failure(verdict: Verdict, url: &str, what: &str, size: u64, clock: &str) -> String {
@@ -219,6 +225,15 @@ mod tests {
         assert_eq!(verdict(56, 9, Some(10)), Verdict::Curl(56));
         assert_eq!(verdict(63, 0, Some(10)), Verdict::Curl(63));
         assert_eq!(verdict(22, 0, None), Verdict::Curl(22));
+    }
+
+    #[test]
+    fn the_count_stops_at_the_size() {
+        assert!(fits(0, 100, 100));
+        assert!(fits(90, 10, 100));
+        assert!(!fits(90, 11, 100));
+        assert!(!fits(100, 1, 100));
+        assert!(fits(100, 0, 100));
     }
 
     #[test]
