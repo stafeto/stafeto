@@ -563,35 +563,37 @@ fn owner(
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| format!("timeout: {e}"))?;
-        std::thread::sleep(Duration::from_millis(
-            std::env::var("PAUSE_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        ));
-        if std::env::var("EXPERIMENT").is_ok() {
-            let begin = Instant::now();
-            socket
-                .set_read_timeout(Some(Duration::from_millis(1)))
-                .map_err(|e| format!("timeout: {e}"))?;
-            let mut buffer = [0u8; 64];
-            let mut answered = Vec::new();
-            for seq in 0u8..60 {
-                let _ = socket.send(&[seq; 32]);
-                let until = Instant::now() + Duration::from_millis(5);
-                while Instant::now() < until {
-                    if let Ok(n) = socket.recv(&mut buffer) {
-                        if n == 32 {
-                            answered.push((buffer[0], begin.elapsed().as_millis()));
-                        }
-                    }
-                }
+        // The first datagrams of the Mac go out while it still looks for the
+        // MAC address of the program (ARP) and are lost: send one every 10 ms
+        // until the first comes back.
+        let first_at = Instant::now();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut lost_first = 0;
+        let mut buffer = [0u8; 64];
+        loop {
+            socket.send(&[0x5a; 32]).map_err(|e| format!("send: {e}"))?;
+            if socket.recv(&mut buffer).is_ok() {
+                break;
             }
-            println!("net-vz: EXPERIMENT answered (seq, ms): {answered:?}");
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .map_err(|e| format!("timeout: {e}"))?;
+            lost_first += 1;
+            if first_at.elapsed() > Duration::from_secs(5) {
+                return Err("the program echoed nothing in 5 s".into());
+            }
         }
+        println!(
+            "net-vz: the first echo came {} ms after the first datagram ({lost_first} lost before it)",
+            first_at.elapsed().as_millis()
+        );
+        // The other warm-up datagrams came back as well, or soon will.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        while socket.recv(&mut buffer).is_ok() {}
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| format!("timeout: {e}"))?;
         let at = Instant::now();
         let mut sent_again = fast_probe::echoes(socket, 200, 64)?;
         sent_again += fast_probe::echoes(socket, 100, 1400)?;
