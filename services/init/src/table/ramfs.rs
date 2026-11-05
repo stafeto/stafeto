@@ -9,8 +9,12 @@ use crate::watch::Watch;
 
 const MS: u64 = 1_000_000;
 
-/// The pages of the service's tables and of its writable data.
-const TABLES: u64 = 915 + 392;
+/// The pages of the service's tables and of its writable data. The layers (pk1-design R2) add
+/// 302 pages to the tables (`State` went from 1 762 400 to 2 999 808 bytes: 6 400 places of the
+/// image and their names, the tables of 64 layers), 160 to the page tables of the mappings of
+/// layers (a layer of 28.8 MB is 7 040 pages) and 5 to the thread that maps (stack and message
+/// buffer).
+const TABLES: u64 = 915 + 392 + 302 + 160 + 5;
 
 /// The level of the file, pipe and clock services.
 pub const SERVICE_LEVEL: u8 = 48;
@@ -103,6 +107,39 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+    },
+];
+
+/// The layer probe (tests/layer-probe, xtask layer-probe): the RAM files with the clock, the
+/// process service, the POSIX program that reads a layer (`layer-user`) and the native
+/// leader that attaches and detaches layers through its layer session and the boot profile.
+/// The leader reads the package files of its tests from the files of the image; its level is
+/// the level the mapping thread of the RAM service works at.
+pub const LAYER_PROBE_TABLE: &[Record] = &[
+    RAM_CLOCKED,
+    // The program of a layer runs as a child of `layer-user` with its quota: a pool for the
+    // few at once (a reader that starts one for each pass over a file, and one that waits).
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 6 * 1024 * PAGE + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "layer-probe",
+        program: "layer-probe",
+        connects: &["ramfs"],
+        // The big layer of 32 MiB and the layer being read.
+        quota: 12288 * PAGE,
+        ..TABLE[1]
+    },
+    Record {
+        name: "layer-user",
+        program: "layer-user",
+        args: b"layer-user\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 1024 * PAGE,
+        root: true,
+        ..POSIX
     },
 ];
 
