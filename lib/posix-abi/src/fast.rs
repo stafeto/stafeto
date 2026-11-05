@@ -6,7 +6,8 @@
 //! bypass ring (17 pages of the process's quota) and sends CLAIM to the
 //! network service with a copy of the identity session (the service has
 //! the process service vouch for the superuser), a copy of the calling
-//! thread's channel with the label `FAST_LABEL` (the service notifies it)
+//! thread's channel with a label of `FAST_LABEL`, new for each try (the
+//! service notifies it)
 //! and a copy of the ring; CLAIM_MORE brings the last two objects. The
 //! window, the five objects and the ring become pieces of the memory map of
 //! their own kind (`posix_map::Kind::Fast`): `munmap`, `mprotect` and
@@ -34,8 +35,21 @@ use rt::sys::{self, Received};
 /// The label of the service's notifications and of the wait's timer on
 /// the thread's channel: apart from the labels of `wait` (bit 63) and of
 /// the long operations (small numbers).
-pub const FAST_LABEL: u64 = 1 << 62 | 0xfa57;
-const TIMER_LABEL: u64 = 1 << 62 | 0xfa58;
+///
+/// Each try of CLAIM labels its copy of the channel anew (`FAST_LABEL`
+/// with the number of the try in the low 32 bits): the service closes the
+/// copy of a refused try, the kernel puts its CLIENT_GONE on the channel
+/// with that label, and `wait` takes only the label of the claim that holds
+/// the device, so the departure of a refused try never reads as the end of
+/// the service.
+pub const FAST_LABEL: u64 = 1 << 62 | 0xfa57 << 32;
+const TIMER_LABEL: u64 = 1 << 62 | 0xfa58 << 32;
+/// The label of the try that got the device (0 before).
+static ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// The number of the next try.
+static TRY: AtomicU64 = AtomicU64::new(1);
+/// EPROTO: KICK on a ring the service found broken.
+const EPROTO: i32 = 71;
 /// How long `claim` waits for the second address and for the device.
 const ADDRESS_WAIT_NS: u64 = 20_000_000_000;
 const BUSY_WAIT_NS: u64 = 30_000_000_000;
@@ -222,6 +236,7 @@ fn timer() -> Result<core::mem::ManuallyDrop<Handle<Timer>>, i32> {
 fn ask(
     service: &Handle<Channel>,
     ring: &Handle<Memory>,
+    label: u64,
 ) -> Result<(Claimed, sys::Reply), (i32, Option<Status>)> {
     let identity = crate::process::identity()
         .and_then(|i| sys::handle_duplicate(i, Rights::NOTIFY | Rights::TRANSFER).ok())
@@ -229,7 +244,7 @@ fn ask(
     let notify = sys::handle_label(
         &channel(),
         Rights::NOTIFY | Rights::TRANSFER,
-        FAST_LABEL,
+        label,
         level(),
     )
     .map_err(|_| (EIO, None))?;
@@ -266,8 +281,12 @@ pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
     let ring = sys::mem_create(size as u64).map_err(|_| ENOMEM)?;
     let started = crate::wait::now();
     let (claimed, mut reply) = loop {
-        match ask(&service, &ring) {
-            Ok(got) => break got,
+        let label = FAST_LABEL | (TRY.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
+        match ask(&service, &ring, label) {
+            Ok(got) => {
+                ACTIVE.store(label, Ordering::Release);
+                break got;
+            }
             Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
             Err((EBUSY, Some(_)))
                 if flags & ONCE == 0 && crate::wait::now() < started + BUSY_WAIT_NS => {}
@@ -354,15 +373,16 @@ pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
     }
     let until = crate::wait::now().saturating_add(timeout_ns);
     let block = threads::own_block();
+    // The notifications of other labels (a refused try's CLIENT_GONE, a
+    // timer that fired late) are taken off the channel and dropped.
+    let active = ACTIVE.load(Ordering::Acquire);
     loop {
         // Whatever waits on the channel first, without blocking.
         loop {
             match sys::try_receive(&own) {
-                Ok(Received::Notification {
-                    label: FAST_LABEL,
-                    bits,
-                    ..
-                }) => return Ok(bits_of(bits)),
+                Ok(Received::Notification { label, bits, .. }) if label == active => {
+                    return Ok(bits_of(bits));
+                }
                 Ok(_) => {}
                 Err(Error::WouldBlock) => break,
                 Err(Error::Interrupted) => {
@@ -391,11 +411,7 @@ pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
         let got = sys::receive(&own);
         drop(guard);
         match got {
-            Ok(Received::Notification {
-                label: FAST_LABEL,
-                bits,
-                ..
-            }) => {
+            Ok(Received::Notification { label, bits, .. }) if label == active => {
                 let _ = sys::timer_cancel(&timer);
                 return Ok(bits_of(bits));
             }
@@ -423,7 +439,13 @@ pub fn kick(count: u32) -> Result<u32, i32> {
     wire::write_kick(count, &mut w).map_err(|_| EIO)?;
     let reply = call(&service, w.as_bytes(), rt::handle::Outgoing::new())?;
     let mut buffer = [0u8; MESSAGE_MAX];
-    wire::read_kick_reply(reply.bytes(&mut buffer)).map_err(refusal)
+    wire::read_kick_reply(reply.bytes(&mut buffer)).map_err(|status| {
+        if status.code() == proto_net::INVALID {
+            EPROTO
+        } else {
+            refusal(status)
+        }
+    })
 }
 
 /// `stafeto_fast_config`: the second address now.

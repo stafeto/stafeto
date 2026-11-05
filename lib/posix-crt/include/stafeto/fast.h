@@ -98,7 +98,10 @@ int stafeto_fast_claim(struct stafeto_fast_claim *out, unsigned flags);
 int stafeto_fast_wait(uint64_t timeout_ns, uint32_t *bits);
 
 /* Tells the service that `count` frames (1 to 16) wait in the bypass ring
- * to it: the frames it took in this step, or -1 with errno. */
+ * to it: the frames it took in this step, or -1 with errno: EPROTO when the
+ * service found the ring's indices broken (it takes nothing from the ring
+ * any more and says `net: bypass broken`; the device stays the program's
+ * until it ends), EINVAL for a count out of range, EBADF without a claim. */
 int stafeto_fast_kick(uint32_t count);
 
 /* The second address as the service knows it now. 0, or -1 with errno
