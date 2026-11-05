@@ -524,7 +524,7 @@ pub fn stage_of(samples: &[Sample], asked: u32, malloc: usize, length: usize) ->
 }
 
 /// The lines of nginx's log that say a buffer was not allocated.
-fn malloc_failures(lines: &[String]) -> usize {
+pub(crate) fn malloc_failures(lines: &[String]) -> usize {
     lines
         .iter()
         .filter(|l| l.contains("malloc(") && l.contains("failed"))
@@ -534,7 +534,7 @@ fn malloc_failures(lines: &[String]) -> usize {
 /// The lines of nginx at `crit` or above other than `malloc(...) failed`:
 /// a fault of the system under the load (a worker whose `epoll_wait`
 /// fails logs a line each turn of its loop).
-fn alerts(lines: &[String]) -> Vec<String> {
+pub(crate) fn alerts(lines: &[String]) -> Vec<String> {
     lines
         .iter()
         .filter(|l| {
@@ -550,7 +550,7 @@ fn alerts(lines: &[String]) -> Vec<String> {
 /// Ends the run after `step` when nginx logged `alerts`: the stages after it
 /// would measure a broken server, and the flood of its log slows the reading
 /// of the console.
-fn stop_on(step: &str, alerts: &[String]) -> Result<(), String> {
+pub(crate) fn stop_on(step: &str, alerts: &[String]) -> Result<(), String> {
     match alerts.first() {
         None => Ok(()),
         Some(first) => Err(format!(
@@ -690,7 +690,7 @@ fn table(rows: &[Row]) -> String {
 
 /// The server under load: nginx in a guest whose console xtask reads, or
 /// Homebrew's nginx on the Mac.
-enum Server<'a> {
+pub(crate) enum Server<'a> {
     Guest(&'a mut qemu::Run),
     Host {
         child: Child,
@@ -701,11 +701,11 @@ enum Server<'a> {
 
 impl Server<'_> {
     /// A mark in the server's log, from which `log_since` reads.
-    fn mark(&mut self) -> Result<usize, String> {
+    pub(crate) fn mark(&mut self) -> Result<usize, String> {
         Ok(self.log_lines()?.len())
     }
 
-    fn log_lines(&mut self) -> Result<Vec<String>, String> {
+    pub(crate) fn log_lines(&mut self) -> Result<Vec<String>, String> {
         match self {
             Server::Guest(run) => {
                 // The marker takes in what the console printed so far.
@@ -722,7 +722,7 @@ impl Server<'_> {
         }
     }
 
-    fn log_since(&mut self, mark: usize) -> Result<Vec<String>, String> {
+    pub(crate) fn log_since(&mut self, mark: usize) -> Result<Vec<String>, String> {
         let lines = self.log_lines()?;
         Ok(lines.get(mark..).unwrap_or_default().to_vec())
     }
@@ -746,7 +746,12 @@ struct Bench {
 }
 
 /// Runs `program args`, its output into `name` in `dir`.
-fn run_tool(dir: &Path, name: &str, program: &str, args: &[String]) -> Result<String, String> {
+pub(crate) fn run_tool(
+    dir: &Path,
+    name: &str,
+    program: &str,
+    args: &[String],
+) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -767,7 +772,7 @@ fn run_tool(dir: &Path, name: &str, program: &str, args: &[String]) -> Result<St
 /// flood takes xtask longer than the guest takes to write it) and gives the
 /// line. With `top`, halfway through the load the guest's `top` shows what
 /// its processes take of its CPUs (into `top-TAG.txt`).
-fn watched(
+pub(crate) fn watched(
     server: &mut Server<'_>,
     dir: &Path,
     name: &str,
@@ -827,7 +832,7 @@ fn alert_until(run: &mut qemu::Run, until: Instant) -> Option<String> {
 
 /// The guests of vz-run on the Mac: all of them, or with the MAC suffix
 /// `suffix` only (those share the lease of the run's guest).
-fn vz_guests(suffix: Option<u8>) -> usize {
+pub(crate) fn vz_guests(suffix: Option<u8>) -> usize {
     let ps = Command::new("ps")
         .args(["-Ao", "pid,command"])
         .output()
@@ -1057,7 +1062,7 @@ impl Bench {
 }
 
 /// The samples of a file of `vegeta attack`, through `vegeta encode --to csv`.
-fn samples_of(results: &Path) -> Result<Vec<Sample>, String> {
+pub(crate) fn samples_of(results: &Path) -> Result<Vec<Sample>, String> {
     let mut child = Command::new("vegeta")
         .args(["encode", "--to", "csv"])
         .arg(results)
@@ -1077,7 +1082,7 @@ fn samples_of(results: &Path) -> Result<Vec<Sample>, String> {
     Ok(samples)
 }
 
-fn slug(step: &str) -> String {
+pub(crate) fn slug(step: &str) -> String {
     step.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -1275,7 +1280,7 @@ pub(crate) fn other_guests(own: usize) -> String {
 }
 
 /// The lines of `ps` of the machines of QEMU and VZ running on the Mac.
-fn guests() -> Vec<String> {
+pub(crate) fn guests() -> Vec<String> {
     let list = Command::new("ps")
         .args(["-Ao", "pid,command"])
         .output()
