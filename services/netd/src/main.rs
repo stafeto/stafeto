@@ -58,6 +58,7 @@ use device::{DEVICE, NetDevice, RxRing, TxRing};
 use net::{Client, Net, SESSIONS, now_ns};
 use netd::config::Settings;
 use netd::lines::Mac;
+use netd::profile::{self, Counter};
 use netd::resolv::{Text, Written};
 use netd::ring::{Budget, NET_PAGES, QUEUE_SIZE};
 use proto_init::ServiceArgs;
@@ -477,6 +478,8 @@ fn main(_: u64) -> u64 {
         told: 0,
         cleanup_due: false,
         armed: None,
+        #[cfg(feature = "profile")]
+        profile: Profile::new(),
         last_step: 0,
         neighbours_at: 0,
         ask_due: false,
@@ -774,6 +777,9 @@ struct Driver<'a> {
     cleanup_due: bool,
     /// The deadline the timer is set for.
     armed: Option<u64>,
+    /// The once-a-second report of the profile's counters.
+    #[cfg(feature = "profile")]
+    profile: Profile,
     /// The step that ran last among those asked for together.
     last_step: usize,
     /// When the neighbour entries of the own addresses are renewed.
@@ -816,7 +822,74 @@ struct Driver<'a> {
     maps: Maps,
 }
 
+/// The report of the profile: the second it is due at and the counters at
+/// the line before.
+#[cfg(feature = "profile")]
+struct Profile {
+    at: u64,
+    second: u64,
+    last: profile::Snapshot,
+}
+
+#[cfg(feature = "profile")]
+impl Profile {
+    const fn new() -> Self {
+        Profile {
+            at: 0,
+            second: 0,
+            last: profile::Snapshot::ZERO,
+        }
+    }
+}
+
+/// The console as a `fmt::Write`, so that a line longer than a print's
+/// buffer goes out in pieces.
+#[cfg(feature = "profile")]
+struct Console;
+
+#[cfg(feature = "profile")]
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        rt::console::write(text.as_bytes()).map_err(|_| core::fmt::Error)
+    }
+}
+
 impl Driver<'_> {
+    /// The lines of the profile's counters once a second (builds with the
+    /// feature `profile`): the change of each counter since the line before.
+    #[cfg(feature = "profile")]
+    fn profile_report(&mut self) {
+        use core::fmt::Write;
+        let now = now_ns();
+        if self.profile.at == 0 {
+            self.profile.at = now + PROFILE_NS;
+            let _ = writeln!(
+                Console,
+                "net: profile start frequency {} step_rx {} step_tx {}",
+                rt::time::frequency(),
+                netd::ring::STEP_RX,
+                netd::ring::STEP_TX
+            );
+            return;
+        }
+        if now < self.profile.at {
+            return;
+        }
+        self.profile.at += PROFILE_NS;
+        self.profile.second += 1;
+        let at = profile::snapshot();
+        let (second, last) = (self.profile.second, self.profile.last);
+        let _ = profile::counters_line(&mut Console, second, &last, &at);
+        let _ = Console.write_str("\n");
+        let _ = profile::calls_line(&mut Console, second, &last, &at);
+        let _ = Console.write_str("\n");
+        self.profile.last = at;
+    }
+
+    #[cfg(not(feature = "profile"))]
+    #[inline(always)]
+    fn profile_report(&mut self) {}
+
     /// The ticks the service's thread has run (builds with the feature
     /// `probe`).
     #[cfg(feature = "probe")]
@@ -844,9 +917,11 @@ impl Driver<'_> {
             return true;
         }
         if sys::notify(&self.notify, bit).is_ok() {
+            profile::count(Counter::Told);
             self.told |= bit;
             return true;
         }
+        profile::count(Counter::Refused);
         false
     }
 
@@ -890,6 +965,7 @@ impl Driver<'_> {
     /// steps that follow.
     fn rx_step(&mut self, interrupt: bool) {
         rt::service::step_own();
+        profile::count(Counter::StepRx);
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_irq |= interrupt;
@@ -900,7 +976,9 @@ impl Driver<'_> {
         split::begin_step();
         if interrupt {
             self.line_closed = true;
+            let began = profile::now();
             let isr = Isr::read(&mut self.transport);
+            profile::timed(Counter::IsrN, Counter::IsrTicks, Counter::IsrMax, began);
             if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
                 rt::println!("virtio-net: first interrupt");
             }
@@ -925,7 +1003,14 @@ impl Driver<'_> {
             || self.device.has_deferred();
         let continued = more && self.tell(RX);
         if !continued && core::mem::take(&mut self.line_closed) {
+            let began = profile::now();
             virtio_mmio::reopen(&self.irq);
+            profile::timed(
+                Counter::ReopenN,
+                Counter::ReopenTicks,
+                Counter::ReopenMax,
+                began,
+            );
         }
         self.next_steps(now, continued);
         let end = split::now();
@@ -939,6 +1024,7 @@ impl Driver<'_> {
     /// the timer (`deadline`) or the service's own notification.
     fn tx_step(&mut self, deadline: bool) {
         rt::service::step_own();
+        profile::count(Counter::StepTx);
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_tx = true;
@@ -1011,6 +1097,7 @@ impl Driver<'_> {
     /// frames taken from the ring.
     fn rx1_step(&mut self, interrupt: bool) -> u32 {
         rt::service::step_own();
+        profile::count(Counter::StepRx1);
         self.rx1_work(interrupt)
     }
 
@@ -1066,6 +1153,7 @@ impl Driver<'_> {
             return;
         };
         rt::service::step_own();
+        profile::count(Counter::StepReturn);
         // The line of the longest step says which step of the return it was.
         rt::service::step_detail(second.back_detail());
         match second.back_step() {
@@ -1212,15 +1300,25 @@ impl Driver<'_> {
 
     /// Rings the doorbell of each queue that got buffers in the step.
     fn doorbells(&mut self) {
-        if core::mem::take(&mut self.device.rx.ring.dirty)
-            && self.device.rx.ring.queue.should_notify()
-        {
-            ring(&mut self.transport, RECEIVEQ);
+        if core::mem::take(&mut self.device.rx.ring.dirty) {
+            if self.device.rx.ring.queue.should_notify() {
+                let began = profile::now();
+                ring(&mut self.transport, RECEIVEQ);
+                profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
+                profile::count(Counter::BellRx);
+            } else {
+                profile::count(Counter::Skipped);
+            }
         }
-        if core::mem::take(&mut self.device.tx.ring.dirty)
-            && self.device.tx.ring.queue.should_notify()
-        {
-            ring(&mut self.transport, TRANSMITQ);
+        if core::mem::take(&mut self.device.tx.ring.dirty) {
+            if self.device.tx.ring.queue.should_notify() {
+                let began = profile::now();
+                ring(&mut self.transport, TRANSMITQ);
+                profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
+                profile::count(Counter::BellTx);
+            } else {
+                profile::count(Counter::Skipped);
+            }
         }
     }
 
@@ -1228,6 +1326,13 @@ impl Driver<'_> {
     /// deadline or the sweep of the streams that close, never in the past.
     fn arm(&mut self, now: u64) {
         let sweep = (self.net.orphans_wait() || self.net.rst_waiting()).then(|| now + SWEEP_NS);
+        #[cfg(feature = "profile")]
+        let report = {
+            self.profile_report();
+            Some(self.profile.at)
+        };
+        #[cfg(not(feature = "profile"))]
+        let report = None;
         let at = [
             self.stack.next_deadline(),
             self.stack.ping.as_ref().map(|p| p.deadline_ns),
@@ -1236,6 +1341,7 @@ impl Driver<'_> {
             Some(self.neighbours_at),
             self.ask_at,
             self.second.as_deref().and_then(|s| s.next_at),
+            report,
         ]
         .into_iter()
         .flatten()
@@ -1419,6 +1525,9 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 
 /// How long after a step the streams that close are looked at again.
 const SWEEP_NS: u64 = 1_000_000_000;
+/// The period of the profile's lines.
+#[cfg(feature = "profile")]
+const PROFILE_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
 /// `probe`.
@@ -1439,6 +1548,8 @@ impl Service<0> for Driver<'_> {
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let began = profile::now();
+        let method = r.method();
         self.net.claim(s, r.label());
         let answer = match Method::from_number(r.method()) {
             Some(Method::Config) => self.config(r),
@@ -1462,6 +1573,7 @@ impl Service<0> for Driver<'_> {
             None => Answer::Status(Status::UnknownMethod),
         };
         self.after_request();
+        profile::call(method, began);
         answer
     }
 
@@ -1514,9 +1626,13 @@ impl Service<0> for Driver<'_> {
             // (`proto_init::binding_label`): the line says whose interrupt it
             // is, and the step reads that device's status alone.
             Source::Interrupt if n.label == proto_init::binding_label(1) => {
+                profile::count(Counter::Irq);
                 self.rx1_step(true);
             }
-            Source::Interrupt => self.rx_step(true),
+            Source::Interrupt => {
+                profile::count(Counter::Irq);
+                self.rx_step(true)
+            }
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
@@ -1547,6 +1663,7 @@ impl Service<0> for Driver<'_> {
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
+                        profile::count(Counter::StepWake);
                         #[cfg(feature = "probe")]
                         let began = self.ran();
                         let left = self.net.wake(&mut self.stack, now_ns());
@@ -1558,6 +1675,7 @@ impl Service<0> for Driver<'_> {
                     }
                     CLEANUP => {
                         rt::service::step_own();
+                        profile::count(Counter::StepCleanup);
                         #[cfg(feature = "probe")]
                         let began = self.ran();
                         let more = self.net.depart_step(&mut self.stack);
@@ -1567,9 +1685,13 @@ impl Service<0> for Driver<'_> {
                             self.cleanup();
                         }
                     }
-                    RESOLV => self.resolv_step(),
+                    RESOLV => {
+                        profile::count(Counter::StepResolv);
+                        self.resolv_step()
+                    }
                     _ => {
                         rt::service::step_own();
+                        profile::count(Counter::StepSweep);
                         if self.net.sweep(&mut self.stack, now_ns()) {
                             self.tell(SWEEP);
                         }
@@ -1578,7 +1700,9 @@ impl Service<0> for Driver<'_> {
                 self.after_request();
             }
             Source::Timer if n.label == TIMER_LABEL => {
+                profile::count(Counter::StepTimer);
                 self.armed = None;
+                self.profile_report();
                 let now = now_ns();
                 self.net.expire(now);
                 if self

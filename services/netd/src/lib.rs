@@ -26,6 +26,7 @@ pub mod passes;
 pub mod pci;
 pub mod places;
 pub mod ports;
+pub mod profile;
 pub mod resolv;
 pub mod reuse;
 pub mod ring;

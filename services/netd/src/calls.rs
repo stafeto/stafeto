@@ -24,6 +24,7 @@ use netd::demux::Key;
 use netd::passes::Passes;
 use netd::places::{Held, State};
 use netd::ports::{self, Binding, Proto};
+use netd::profile::{self, Counter};
 use netd::reuse::NO_GROUP;
 use proto_net::sockets::{self, EpollReady, EpollRecord, Request as Call, epoll, opt};
 use proto_net::{Address, DATA_MAX, INET, code};
@@ -34,6 +35,14 @@ use rt::sys;
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Duration;
 use smoltcp::wire::{IpAddress, IpEndpoint};
+
+/// `n` bytes went between a socket's queue and a buffer of the caller (the
+/// profile's count of copies).
+#[inline(always)]
+fn copied(n: usize) {
+    profile::count(Counter::CopyN);
+    profile::add(Counter::CopyBytes, n as u64);
+}
 
 type Sess = Session<Client, 0>;
 
@@ -1393,6 +1402,7 @@ impl Net {
                 // the session's mapped buffer.
                 let n = unsafe { crate::cells::cell_to_queue(t, at, len) };
                 split::record(split::BUF_COPY_TX, split::now() - began);
+                copied(n);
                 return if n == 0 { Io::Block } else { Io::Ready(n) };
             }
         };
@@ -1404,7 +1414,10 @@ impl Net {
         }
         match t.send_slice(data) {
             Ok(0) => Io::Block,
-            Ok(n) => Io::Ready(n),
+            Ok(n) => {
+                copied(n);
+                Io::Ready(n)
+            }
             Err(_) => Io::Fail(proto_net::PIPE),
         }
     }
@@ -1561,6 +1574,7 @@ impl Net {
             // session's mapped buffer.
             let n = unsafe { crate::cells::queue_to_cell(t, at, most, peek) };
             split::record(split::BUF_COPY_RX, split::now() - began);
+            copied(n);
             return Io::Ready((n, false, from));
         }
         if t.can_recv() {
@@ -1570,7 +1584,10 @@ impl Net {
                 t.recv_slice(buffer)
             };
             return match n {
-                Ok(n) => Io::Ready((n, false, from)),
+                Ok(n) => {
+                    copied(n);
+                    Io::Ready((n, false, from))
+                }
                 Err(_) => Io::Fail(proto_net::RESET),
             };
         }
