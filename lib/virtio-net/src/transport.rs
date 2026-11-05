@@ -64,6 +64,10 @@ pub enum Failure {
     NoDevice,
     /// The device did not reset.
     NotReset,
+    /// BAR 0 of the configuration space lies elsewhere than the BAR the
+    /// caller maps: a wrong place, a snapshot of another function or the
+    /// window of another device.
+    BarElsewhere,
 }
 
 /// The configuration space of one function, as the device's crate reads
@@ -213,16 +217,37 @@ const AT: DeviceFunction = DeviceFunction {
     function: 0,
 };
 
+/// The address BAR 0 of the configuration space `access` holds: its low
+/// word without the type bits, and the high word for a 64-bit memory BAR
+/// (PCI Local Bus 3.0, 6.2.5.1).
+pub fn bar0_address<C: ConfigurationAccess>(access: &C) -> u64 {
+    let low = access.read_word(AT, BAR0_WORD as u8 * 4);
+    if low & 1 != 0 {
+        return u64::from(low & !0b11);
+    }
+    let high = if low & 0b110 == 0b100 {
+        access.read_word(AT, (BAR0_WORD as u8 + 1) * 4)
+    } else {
+        0
+    };
+    u64::from(high) << 32 | u64::from(low & !0b1111)
+}
+
 /// The Virtio PCI transport of device `D` (slot `D` of `host`) over the
 /// configuration space `access`, whose BAR 0 is `bar` (mapped at `bar.va`,
 /// at `bar.pa` for the device): the structures found in the capability list,
-/// the device reset; the status it had before the reset goes with it. The
+/// the device reset; the status it had before the reset goes with it. BAR 0
+/// of the configuration space must be `bar.pa` (`Failure::BarElsewhere`):
+/// the structures the crate finds there are reached through `bar.va`. The
 /// caller turns bus mastering on after this (Virtio 1.2, 2.4.1: the device
 /// forgets every queue before it may master the bus again).
 pub fn pci_transport<const D: usize, C: ConfigurationAccess>(
     access: C,
     bar: Region,
 ) -> Result<(PciTransport, u32), Failure> {
+    if bar0_address(&access) != bar.pa {
+        return Err(Failure::BarElsewhere);
+    }
     if !host::attach_bar(D, bar) {
         return Err(Failure::NoDevice);
     }
@@ -349,5 +374,29 @@ mod tests {
         assert_eq!(mac, [2, 0x73, 0x74, 0x66, 0, 2]);
         drop(transport);
         drop(memory);
+    }
+
+    #[test]
+    fn a_bar_mapped_elsewhere_than_bar_0_is_refused() {
+        let snapshot = vz_function();
+        assert_eq!(bar0_address(&snapshot), BAR0);
+        let mut memory = vec![0u8; BAR_LEN as usize];
+        // The BAR 0 of the first device of VZ, next to the second's.
+        let other = Region {
+            va: memory.as_mut_ptr() as usize,
+            pa: BAR0 - BAR_LEN,
+            len: BAR_LEN as usize,
+        };
+        assert_eq!(
+            pci_transport::<1, _>(snapshot, other).err(),
+            Some(Failure::BarElsewhere)
+        );
+        // A 32-bit BAR has no high word, and an I/O BAR two type bits.
+        let mut words = [0u32; 64];
+        words[4] = 0x5003_0008;
+        words[5] = 0xffff_ffff;
+        assert_eq!(bar0_address(&Snapshot::new(words, [0; 6])), 0x5003_0000);
+        words[4] = 0xc001;
+        assert_eq!(bar0_address(&Snapshot::new(words, [0; 6])), 0xc000);
     }
 }

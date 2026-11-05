@@ -564,6 +564,10 @@ fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'stat
             Ok((transport, status)) => Ok((transport.into(), status)),
             Err(None) => Err(CONFIG_ELSEWHERE),
             Err(Some(transport::Failure::NotReset)) => Err(NOT_STARTED),
+            Err(Some(transport::Failure::BarElsewhere)) => {
+                rt::println!("{tag}: BAR 0 of the function lies elsewhere than its window");
+                Err(NO_DEVICE)
+            }
             Err(Some(transport::Failure::NoDevice)) => {
                 rt::println!("{tag}: no network device at {at:#x}");
                 Err(NO_DEVICE)
