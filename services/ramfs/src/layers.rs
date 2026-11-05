@@ -1227,7 +1227,9 @@ impl Storage<'_> {
                     .map_err(|code| LayerReply::Refused { status: code })?;
                 let first_entry = self.state.layers.job.first_of_file[file as usize];
                 let b = self.pop_slot();
-                let canonical = if first_entry as usize == i {
+                // A symbolic link has a node of its own, as in the table of an image: the
+                // links that name one file of the package share its bytes and nothing else.
+                let canonical = if first_entry as usize == i || is_symlink {
                     b
                 } else {
                     self.state.layers.entry_place[index][first_entry as usize] as usize
