@@ -23,6 +23,7 @@
 //! | TAKE (14) | all | `key` u64; the first time a handle with NOTIFY labelled k | READY and the result, ARMED, or the refusal |
 //! | BUFFER (15) | all | `size` u32 and a memory object with MAP_READ and MAP_WRITE; optionally the identity session after it | none |
 //! | STATUS (16) | all | none | `generation` u64, `blocks` u64, `free` u64, `disk` u32, `image` u32, `flags` u32 |
+//! | WORLD_SET (17) | UID 0 | the package name, `world` u32 (1 the world, 0 a dependency); the identity session | long: none |
 //!
 //! A string is one byte of length and the bytes. The buffer is CELLS cells
 //! of CELL_BYTES, the client's object, as in proto_blk. The service has four
@@ -149,10 +150,11 @@ pub enum Method {
     Take = 14,
     Buffer = 15,
     Status = 16,
+    WorldSet = 17,
 }
 
 impl Method {
-    pub const ALL: [Method; 16] = [
+    pub const ALL: [Method; 17] = [
         Method::List,
         Method::Info,
         Method::InstallBegin,
@@ -169,6 +171,7 @@ impl Method {
         Method::Take,
         Method::Buffer,
         Method::Status,
+        Method::WorldSet,
     ];
 
     pub const fn number(self) -> u16 {
@@ -431,6 +434,25 @@ pub fn read_serial(mut body: Reader<'_>, set: bool) -> Result<(&[u8], u64), Stat
     let serial = if set { body.u64()? } else { 0 };
     body.finish()?;
     Ok((repository, serial))
+}
+
+/// WORLD_SET: the name of a package of the disk and whether it is in the world (1) or
+/// only a dependency (0).
+pub fn write_world(name: &[u8], world: bool, w: &mut Writer) -> Result<(), Status> {
+    Method::WorldSet.header().write(w)?;
+    put_text(w, name, NAME_MAX)?;
+    w.u32(u32::from(world))
+}
+
+/// The name and the flag of a WORLD_SET body: BAD_SIZE for a flag other than 0 or 1.
+pub fn read_world(mut body: Reader<'_>) -> Result<(&[u8], bool), Status> {
+    let name = get_text(&mut body, NAME_MAX)?;
+    let flag = body.u32()?;
+    body.finish()?;
+    if flag > 1 {
+        return Err(Status::BadSize);
+    }
+    Ok((name, flag == 1))
 }
 
 /// TAKE: the key of the operation, above 0.

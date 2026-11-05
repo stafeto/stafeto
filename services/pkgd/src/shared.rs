@@ -135,6 +135,7 @@ pub enum JobKind {
     SettingsSet,
     SerialSet,
     RevokedSet,
+    WorldSet,
 }
 
 /// What a job needs, as the main thread read it from the request. Names are

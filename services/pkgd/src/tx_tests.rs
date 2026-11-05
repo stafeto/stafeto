@@ -306,6 +306,52 @@ fn a_serial_crashes_to_the_old_number_or_the_new() {
     matrix(&tx, &disk, &opened, &accepted);
 }
 
+/// The transaction that makes package `slot` a dependency, the table alone.
+fn world_tx(opened: &Opened, accepted: &Table, slot: usize) -> Tx {
+    let mut tx = Tx::new(opened, accepted, Kind::World);
+    let mut r = tx.next.record(slot);
+    r.flags = (r.flags & !WORLD) | DEPENDENCY;
+    tx.next.set_record(slot, &r);
+    tx
+}
+
+#[test]
+fn the_flag_world_of_a_package_crashes_to_the_old_flag_or_the_new() {
+    let (disk, opened, accepted) = store();
+    let tx = world_tx(&opened, &accepted, 1);
+    matrix(&tx, &disk, &opened, &accepted);
+}
+
+#[test]
+fn the_flag_world_writes_the_table_and_flushes_it_before_the_superblock() {
+    let (disk, opened, accepted) = store();
+    let tx = world_tx(&opened, &accepted, 1);
+    let (disk, done) = run_logged(&tx, disk, &opened, &accepted);
+    done.unwrap();
+    assert_eq!(
+        shape(&disk.log),
+        "F @data-flushed w1 @table-part w4 F w1 @super-written F @committed"
+    );
+    assert!(disk.attached.is_empty());
+}
+
+#[test]
+fn the_flag_world_is_what_the_next_start_reads() {
+    let (disk, opened, accepted) = store();
+    let tx = world_tx(&opened, &accepted, 1);
+    let (disk, done) = run_logged(&tx, disk, &opened, &accepted);
+    done.unwrap();
+    let mut found = disk.after(Loss::None, false);
+    let mut table = Table::zeroed();
+    let Start::Store(now) = commit::open(&mut found, &mut table).unwrap() else {
+        panic!("a store");
+    };
+    assert_eq!(now.superblock.generation, opened.superblock.generation + 1);
+    assert_eq!(table.record(1).flags, DEPENDENCY);
+    assert_eq!(table.record(0).flags, WORLD);
+    assert_eq!(table.record(2).flags, WORLD);
+}
+
 #[test]
 fn a_list_of_revocations_crashes_to_the_old_list_or_the_new_with_its_flags() {
     let (disk, opened, accepted) = store();

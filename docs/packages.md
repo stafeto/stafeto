@@ -491,7 +491,7 @@ only an image whose table has the record `blk` uses it.
 `services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches
 them to the RAM file service as layers; `proto/pkg` (MIT) is its protocol. The service starts from
 the disk, receives packages, and changes the store with the methods INSTALL_BEGIN, FEED,
-INSTALL_COMMIT, INSTALL_CANCEL, REMOVE, SETTINGS_SET, SERIAL_SET and REVOKED_SET.
+INSTALL_COMMIT, INSTALL_CANCEL, REMOVE, SETTINGS_SET, SERIAL_SET, REVOKED_SET and WORLD_SET.
 
 **Two threads.** The main thread (level 32) is the loop of a service and answers its clients in
 steps of a few thousand ticks: the reads (LIST, INFO, SETTINGS_GET, SERIAL, STATUS), CLONE and
@@ -566,7 +566,11 @@ detached ones back, and the old state is still the store's, with nothing to writ
 superblock goes into the copy that holds the lower generation and is flushed (F3); a failed write
 of it takes the layers back and answers `IO`. A removal and a list of revocations write the
 superblock before they detach, since the bytes of the packages are in memory and the disk no
-longer matters to them. A serial changes the table alone. `SERIAL_SET` below the held number is
+longer matters to them. A serial and the flag "world" change the table alone. `WORLD_SET` (17,
+UID 0) says whether a package of the disk is in the world or only a dependency, so a package that
+stands as a dependency and is then asked for need not be received again; it answers `NOT_FOUND`
+for an unknown name and `IN_IMAGE` for a package of the image, and changes nothing when the flag
+is the one the package has. `SERIAL_SET` below the held number is
 `ROLLBACK`, equal changes nothing; a list of revocations below the held serial is `ROLLBACK`, one
 without a root's signature `BAD_SIGNATURE`; REMOVE answers `IN_IMAGE`, `NOT_FOUND` or
 `NEEDED_BY`; SETTINGS_SET answers `INVALID` for a blob that breaks the rules (`proto/pkg`, the

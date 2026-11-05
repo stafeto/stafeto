@@ -120,6 +120,7 @@ impl Worker {
             JobKind::SettingsSet => (self.settings_set(job), 0),
             JobKind::SerialSet => (self.serial_set(job), 0),
             JobKind::RevokedSet => (self.revoked_set(job), 0),
+            JobKind::WorldSet => (self.world_set(job), 0),
         };
         JOB_CODE.store(code, Release);
         JOB_VALUE.store(value, Release);
@@ -492,6 +493,33 @@ impl Worker {
                 self.after(done, |_| {})
             }
         }
+    }
+
+    /// WORLD_SET: the flag "world" of a package of the disk, the table alone.
+    fn world_set(&mut self, a: &JobArgs) -> u32 {
+        if GROUP_OWNER.load(Acquire) != 0 {
+            return proto_pkg::BUSY;
+        }
+        // SAFETY: the worker's reads of the entries it writes.
+        let images = unsafe { &*IMAGE_ENTRIES.get() };
+        let slot = match plans::world(table(), next(), images, field_bytes(&a.name), a.world) {
+            Err(code) => return code,
+            Ok(None) => return 0,
+            Ok(Some(slot)) => slot,
+        };
+        let change = Change {
+            kind: Kind::World,
+            detach: &[],
+            attach: &[],
+        };
+        let done = commit::transact(&mut self.disk, &opened(), table(), next(), &change);
+        self.after(done, |_| {
+            // SAFETY: inside `publish`.
+            let entries = unsafe { &mut *DISK_ENTRIES.get() };
+            if let Some(entry) = entries[slot].as_mut() {
+                entry.record = table().record(slot);
+            }
+        })
     }
 
     /// The bytes of a blob in the client's buffer into `out`, a copy of the worker's own

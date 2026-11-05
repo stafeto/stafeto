@@ -41,7 +41,7 @@ const RAM_TAG: &str = "2";
 const PKGD_TAG: &str = "16";
 /// The kinds of the package service's steps that must come: all of its methods, the heartbeat,
 /// a notification and the departure of a session.
-const PKGD_STEP_KINDS: [(usize, &str); 19] = [
+const PKGD_STEP_KINDS: [(usize, &str); 20] = [
     (1, "List"),
     (2, "Info"),
     (3, "InstallBegin"),
@@ -58,6 +58,7 @@ const PKGD_STEP_KINDS: [(usize, &str); 19] = [
     (14, "Take"),
     (15, "Buffer"),
     (16, "Status"),
+    (17, "WorldSet"),
     (64, "the heartbeat"),
     (65, "a notification"),
     (66, "the departure of a session"),

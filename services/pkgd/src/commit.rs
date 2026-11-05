@@ -312,6 +312,8 @@ pub enum Kind {
     Settings,
     /// A serial of a repository: the table alone.
     Serial,
+    /// The flag "world" of a package: the table alone.
+    World,
     /// A new list of revocations: the layers of the packages it revokes detach after the
     /// superblock.
     Revoked,
@@ -380,7 +382,7 @@ pub fn transact(
         Kind::Install => dev.point(Point::TableFlushed),
         Kind::Remove => dev.point(Point::RemoveTable),
         Kind::Settings => dev.point(Point::SettingsTable),
-        Kind::Serial | Kind::Revoked => {}
+        Kind::Serial | Kind::World | Kind::Revoked => {}
     }
     let attach_first = matches!(change.kind, Kind::Install | Kind::Settings);
     if attach_first {
