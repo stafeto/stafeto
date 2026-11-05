@@ -1,0 +1,21 @@
+[package]
+name = "proto-pkg"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the package service of stafeto (services/pkgd): its method numbers, codes, the bodies of its requests and the settings blob"
+
+[lib]
+bench = false
+
+[features]
+# The writer of the settings blob, for the host.
+alloc = []
+
+[dependencies]
+proto-wire = { path = "../wire" }
+
+[dev-dependencies]
+proto-blk = { path = "../blk" }
