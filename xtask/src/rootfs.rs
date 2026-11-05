@@ -1020,7 +1020,7 @@ fn net_files(image: &str) -> Vec<RootFile> {
 /// network (nginx among them), with the probe's variant of nginx's settings
 /// in place of the package's, the variant with one listening socket, the
 /// files of 10 KiB and 256 KiB the probe fetches, and `netd.conf` with
-/// four buffers.
+/// eight buffers.
 fn nginx_files(image: &str) -> Vec<RootFile> {
     let mut files = net_files(image);
     let settings = files

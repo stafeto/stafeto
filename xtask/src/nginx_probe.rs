@@ -20,7 +20,8 @@
 //!    `GET /10k.bin` by their SHA-256.
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
-//!    processes `nginx`, the four workers new.
+//!    processes `nginx`, the four workers new, each holding a shared buffer
+//!    (`posix-net stat`), and an answer of 256 KiB goes through them.
 //! 6. `kill -QUIT` of the master: it ends within 10 s.
 //! 7. `nginx -c /etc/nginx/exclusive.conf &` (one listening socket for the
 //!    four workers, EPOLLEXCLUSIVE), 40 requests over 8 connections,
@@ -29,7 +30,7 @@
 //! No line `[alert]`, `[emerg]` or `[crit]` in the whole run: they would
 //! show nginx's self-check of EPOLLRDHUP timing out or a worker not spawned.
 //! The settings are those of the package with 256 connections a worker and
-//! keep-alive of 10 s; `netd.conf` gives four buffers.
+//! keep-alive of 10 s; `netd.conf` gives eight buffers.
 //!
 //! `cargo xtask nginx-probe steps` runs the same with the service counting its
 //! steps (`netd` built with the feature `steps`, under -icount with the guest
@@ -53,9 +54,11 @@ pub const STEPS_IMAGE: &str = "boot-nginx-probe-steps.img";
 
 /// nginx's settings of the package (tools/nginx/nginx.conf).
 pub const NGINX_CONF: &str = include_str!("../../tools/nginx/nginx.conf");
-/// `/etc/netd.conf` of the probe: DHCP, and four sessions with a shared
-/// buffer (one for each worker).
-pub const NETD_CONF: &[u8] = b"buffers 4\n";
+/// `/etc/netd.conf` of the probe: DHCP, and eight sessions with a shared
+/// buffer: in a reload the four new workers ask for theirs while the four
+/// old ones still hold theirs, and a refused buffer stays refused until
+/// `exec`.
+pub const NETD_CONF: &[u8] = b"buffers 8\n";
 
 /// nginx's licence and PCRE2's in an image, and the notes of their sources.
 const NGINX_LICENSE: &str = "NGINX-LICENSE";
@@ -737,6 +740,24 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
     }
     println!(
         "nginx-probe: SIGHUP under {done} requests on new connections, none failed; workers {old:?} became {workers:?}"
+    );
+    // The new workers took their buffers while the old ones still held
+    // theirs: the old ones gave them back, the new ones hold one each, and an
+    // answer of 256 KiB goes through the buffers.
+    let (_, before) = buffered(run)?;
+    let body = Connection::open(address, READ_WITHIN)
+        .and_then(|mut c| c.get("/256k.bin"))
+        .map_err(|e| format!("GET /256k.bin after the reload: {e}"))?;
+    same("GET /256k.bin after the reload", &body, www_256k())?;
+    let (sessions, after) = buffered(run)?;
+    let grown = after.wrapping_sub(before);
+    if sessions as usize != WORKERS || grown < (WWW_256K_LEN / 1024) as u64 {
+        return Err(format!(
+            "after the reload {sessions} sessions hold a shared buffer (wanted {WORKERS}, one for each new worker) and an answer of 256 KiB carried {grown} KiB through them"
+        ));
+    }
+    println!(
+        "nginx-probe: after the reload {sessions} sessions hold a buffer, and 256 KiB went through them"
     );
     Ok(())
 }

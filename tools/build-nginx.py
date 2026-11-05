@@ -85,6 +85,9 @@ CONFIGURE = (
     "--user=nobody", "--group=nobody",
     "--without-http_gzip_module",
 )
+# --build differs from --host on every host on purpose, the Linux runner of
+# ci too: autoconf takes the build for a cross one only when the two differ,
+# and else tries to run a program of the target and fails.
 PCRE2_CONFIGURE = ("--host=aarch64-linux-gnu", "--build=aarch64-apple-darwin", "--disable-jit",
                    "--disable-shared", "--disable-pcre2grep-libz", "--disable-pcre2grep-libbz2")
 
