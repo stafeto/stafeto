@@ -229,7 +229,9 @@ impl Probe {
         self.touch("phase4")?;
         let big = self.synthesize()?;
         for round in 0..3 {
+            let began = rt::time::now();
             let reply = self.attach(5, &big, true)?;
+            let micros = rt::time::ticks_to_ns(rt::time::now() - began) / 1000;
             must!(matches!(reply, LayerReply::Done { names: 2 }), "attach big");
             must!(self.mappings()? == before + 2, "big maps once");
             must!(
@@ -237,7 +239,7 @@ impl Probe {
                 "detach big"
             );
             must!(self.notified(5, 2000), "no notification of big");
-            rt::println!("layer-probe: big round {round} ok");
+            rt::println!("layer-probe: big round {round} ok, attach {micros} us");
         }
         self.touch("stop")?;
         self.wait_for("user-ok")?;
