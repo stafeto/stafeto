@@ -650,7 +650,11 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
             "{line:?} in a run that gets its address by {mode:?}"
         ));
     }
-    profile_records(lines)?;
+    // The images with the profile's counters print their records; the images
+    // of the steps measurement carry none.
+    if lines.iter().any(|l| l.starts_with("net: prof ")) {
+        profile_records(lines)?;
+    }
     let counters: Vec<Frames> = lines.iter().filter_map(|l| frames(l)).collect();
     // A frame of 127.0.0.0/8 on the wire is a fault of the stack; a queue of
     // `listen` that `accept` could not refill is a fault of the table.
@@ -913,6 +917,9 @@ fn run(
     let took = result.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     silent.map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     verdict(&outcome.lines, mode, roles)
+        .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
+    // These images carry the profile: its records must have come whole.
+    profile_records(&outcome.lines)
         .map_err(|e| format!("net-probe on {} ({name}): {e}", machine.name))?;
     if two {
         two_verdict(&outcome.lines)
