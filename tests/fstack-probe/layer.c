@@ -274,11 +274,15 @@ check_calls(void)
     n = wait_events(out, 4, 3000);
     REQUIRE(n >= 1 && out[0].data.ptr == (void *)2);
     REQUIRE(read(s, buf, sizeof(buf)) == 1);
+    /* A oneshot record that fired is off but still there (EV_ONESHOT would
+     * have deleted it): DEL finds it. */
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, s, NULL) == 0);
+    REFUSED(epoll_ctl(epfd, EPOLL_CTL_DEL, s, NULL), ENOENT);
     ok("oneshot");
 
     /* The end of the stream: EPOLLRDHUP with the read, and 0 from read. */
     ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_MOD, s, &ev) == 0);
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, s, &ev) == 0);
     REQUIRE(shutdown(c, SHUT_WR) == 0);
     REQUIRE((wait_for((void *)2) & EPOLLRDHUP) != 0);
     REQUIRE(read(s, buf, sizeof(buf)) == 0);
