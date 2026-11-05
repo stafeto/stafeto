@@ -716,32 +716,30 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
     Ok(())
 }
 
-/// Fails unless the boot image at `path` carries the CA file it should
-/// (with the probe CA in the images of the probe) and the licence notes of
-/// OpenSSL, curl and the root certificates.
+/// Fails unless the boot image at `path` carries, in the package file of
+/// `ca-bundle`, the CA file it should (with the probe CA in the images of
+/// the probe), and the notices of OpenSSL, curl and the root certificates in
+/// their packages.
 fn image_has_tls_files(path: &Path, name: &str) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let wanted = if name == net::IMAGE {
         ca_bundle()
     } else {
         probe_ca::bundle_with_ca()
     };
-    if wanted.is_empty() || !image.files().any(|f| f.data == wanted) {
+    let layered = rootfs::layered(name)?;
+    let bundle = layered
+        .packages
+        .iter()
+        .find(|l| l.package.name == "ca-bundle")
+        .ok_or_else(|| format!("{name} holds no package ca-bundle"))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let held =
+        crate::notices::layer_content(&bytes, &crate::pkg::file_name(&bundle.package), CA_BUNDLE)?;
+    if wanted.is_empty() || held != wanted {
         return Err(format!("{name} carries no whole CA file"));
     }
-    for note in [
-        OPENSSL_LICENSE,
-        OPENSSL_SOURCE,
-        CURL_LICENSE,
-        CURL_SOURCE,
-        CA_BUNDLE_LICENSE,
-        CA_BUNDLE_SOURCE,
-    ] {
-        if !image.files().any(|f| f.name == note && !f.data.is_empty()) {
-            return Err(format!("{name} carries no {note}"));
-        }
+    for package in ["openssl", "curl", "ca-bundle"] {
+        crate::notices::image_has_package_notices(path, name, package)?;
     }
     Ok(())
 }

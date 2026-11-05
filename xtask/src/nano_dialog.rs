@@ -43,33 +43,6 @@ pub fn nano_terms() -> Result<(Vec<u8>, Vec<u8>, String), String> {
     Ok((licence, ncurses, source))
 }
 
-/// Fails unless the boot image at `path` carries the terms of nano and
-/// ncurses.
-fn image_has_nano_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, ncurses, _) = nano_terms()?;
-    let version = version()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    let archive = format!("nano-{version}.tar.xz");
-    if carries(NANO_LICENSE, &|data| data == licence.as_slice())
-        && carries(NCURSES_LICENSE, &|data| data == ncurses.as_slice())
-        && carries(NANO_SOURCE, &|data| {
-            data.windows(archive.len()).any(|w| w == archive.as_bytes())
-                && data.windows(5).any(|w| w == b"GPLv3")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no nano terms", path.display()))
-    }
-}
-
 /// Keys as an xterm sends them in the application mode that nano's `keypad`
 /// asks for (`smkx` of xterm-256color).
 const LEFT: &[u8] = b"\x1bOD";
@@ -118,7 +91,7 @@ pub fn nano_dialog() -> Result<(), String> {
     nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_nano_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "nano")?;
     let version = version()?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);

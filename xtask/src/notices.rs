@@ -11,7 +11,7 @@
 //! `licence_text` too.
 
 use crate::packages::{self, Package};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The directory of the licences of a package.
 pub fn directory(name: &str) -> String {
@@ -227,6 +227,119 @@ pub fn files(
         }
     }
     Ok(out)
+}
+
+// ---- the notices of a package in an image ----
+
+/// The files of the container an image held for the notices of a package
+/// before its packages went in as layers; an image whose table names a
+/// program of the package still holds them.
+fn container_files(package: &str) -> &'static [&'static str] {
+    match package {
+        "busybox" => &["BUSYBOX-LICENSE", "BUSYBOX-SOURCE"],
+        "bash" => &["BASH-LICENSE", "BASH-SOURCE"],
+        "nano" => &["NANO-LICENSE", "NANO-SOURCE", "NCURSES-LICENSE"],
+        "htop" => &["HTOP-LICENSE", "HTOP-SOURCE"],
+        "ncdu" => &["NCDU-LICENSE", "NCDU-SOURCE"],
+        "doomgeneric" => &["DOOM-LICENSE", "DOOM-SOURCE"],
+        "freedoom" => &["FREEDOOM-LICENSE", "FREEDOOM-SOURCE"],
+        "f-stack" => &["FSTACK-LICENSE", "FSTACK-SOURCE"],
+        "openssl" => &["OPENSSL-LICENSE", "OPENSSL-SOURCE"],
+        "curl" => &["CURL-LICENSE", "CURL-SOURCE"],
+        "ca-bundle" => &["CA-BUNDLE-LICENSE", "CA-BUNDLE-SOURCE"],
+        "nginx" => &["NGINX-LICENSE", "NGINX-SOURCE"],
+        "pcre2" => &["PCRE2-LICENCE", "PCRE2-SOURCE"],
+        _ => &[],
+    }
+}
+
+/// The bytes of `path` in the package file `file` that the boot image
+/// `image` holds as a file of its container.
+pub fn layer_content(image: &[u8], file: &str, path: &str) -> Result<Vec<u8>, String> {
+    let container = bootimg::BootImage::parse(image).map_err(|e| e.to_string())?;
+    let held = container
+        .files()
+        .find(|f| f.name == file)
+        .ok_or_else(|| format!("the image holds no {file}"))?;
+    let package = pkgfmt::Package::parse(held.data).map_err(|e| format!("{file}: {e}"))?;
+    let at = package
+        .rootfs
+        .find(path)
+        .ok_or_else(|| format!("{file} has no {path}"))?;
+    Ok(package.content(at as u32).to_vec())
+}
+
+/// Fails unless the boot image at `path`, the image `image`, carries the
+/// notices of `package` where they belong: in the package file the image
+/// holds as a layer (`/usr/share/licenses/<package>/LICENSE` equal to the
+/// licence text, a `SOURCE`, and the notices of each package linked into
+/// it), and nowhere else; or, when the table of the image names a program
+/// of the package, in the files of the container that the image has always
+/// held for it.
+pub fn image_has_package_notices(path: &Path, image: &str, package: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let container =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = licence_text(package)?;
+    let layered = crate::rootfs::layered(image)?;
+    let all = packages::load()?;
+    let wanted = all
+        .iter()
+        .find(|p| p.name == package)
+        .ok_or_else(|| format!("no package {package}"))?;
+    let at = |name: &str| container.files().find(|f| f.name == name);
+    if let Some(layer) = layered.packages.iter().find(|l| l.package.name == package) {
+        // The licences of the ready-made utilities went with BusyBox's.
+        let extra: &[&str] = if package == "busybox" {
+            &["UTILITIES-LICENSE"]
+        } else {
+            &[]
+        };
+        for old in container_files(package).iter().chain(extra) {
+            if at(old).is_some() {
+                return Err(format!(
+                    "{}: duplicate notice: the image holds {old} and the package {package}",
+                    path.display()
+                ));
+            }
+        }
+        let file = crate::pkg::file_name(&layer.package);
+        let dir = directory(package);
+        let text = layer_content(&bytes, &file, &format!("{dir}/LICENSE"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if text != licence {
+            return Err(format!(
+                "{}: {file} carries a LICENSE that is not the licence of {package}",
+                path.display()
+            ));
+        }
+        let source = layer_content(&bytes, &file, &format!("{dir}/SOURCE"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if source.is_empty() {
+            return Err(format!("{}: the SOURCE of {file} is empty", path.display()));
+        }
+        for dep in &wanted.build_depends {
+            let linked = format!("{dir}/{dep}/LICENSE");
+            let has_files = all
+                .iter()
+                .any(|p| p.name == *dep && !(p.files.is_empty() && p.dirs.is_empty()));
+            if has_files && layer_content(&bytes, &file, &linked).is_err() {
+                return Err(format!("{}: {file} has no {linked}", path.display()));
+            }
+        }
+        return Ok(());
+    }
+    let names = container_files(package);
+    if names.is_empty() {
+        return Err(format!("{package} has no notices of the container"));
+    }
+    for name in names {
+        let held = at(name).ok_or_else(|| format!("{} carries no {name}", path.display()))?;
+        if held.data.is_empty() || (name.ends_with("-LICENSE") && held.data != licence) {
+            return Err(format!("{} carries a wrong {name}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

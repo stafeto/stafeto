@@ -1285,6 +1285,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         (IMAGE, programs())
     };
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
+    crate::notices::image_has_package_notices(&image, name, "nginx")?;
     let port = crate::net_curl::free_tcp_port()?;
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
     let dir = target_dir().join("nginx-probe");

@@ -277,7 +277,7 @@ pub fn bash_dialog() -> Result<(), String> {
     nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_bash_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "bash")?;
     // The entries of /bin: the table of the image lists them (rootfs.rs).
     let bin_count = (rootfs::utilities() + 7).to_string();
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));

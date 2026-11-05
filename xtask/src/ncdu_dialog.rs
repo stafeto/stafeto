@@ -36,30 +36,6 @@ pub fn ncdu_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
-/// Fails unless the boot image at `path` carries ncdu's terms.
-fn image_has_ncdu_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = ncdu_terms()?;
-    let archive = format!("ncdu-{}.tar.gz", version()?);
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(NCDU_LICENSE, &|data| data == licence.as_slice())
-        && carries(NCDU_SOURCE, &|data| {
-            data.windows(archive.len()).any(|w| w == archive.as_bytes())
-                && data.windows(3).any(|w| w == b"MIT")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no ncdu terms", path.display()))
-    }
-}
-
 /// `text` without the escape sequences of the terminal (CSI sequences and
 /// the selections of a character set), as ncurses wrote them.
 fn plain(text: &str) -> String {
@@ -154,7 +130,7 @@ pub fn ncdu_dialog() -> Result<(), String> {
     nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_ncdu_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "ncdu")?;
     let busybox = std::fs::metadata(image_elf(
         &target_dir(),
         "boot-ash-dialog.img",

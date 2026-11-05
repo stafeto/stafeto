@@ -3790,30 +3790,6 @@ fn bash_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
-/// Fails unless the boot image at `path` carries bash's licence and the
-/// note of its source.
-fn image_has_bash_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = bash_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(BASH_LICENSE, &|data| data == licence.as_slice())
-        && carries(BASH_SOURCE, &|data| {
-            data.windows(15).any(|w| w == b"bash-5.3.tar.gz")
-                && data.windows(5).any(|w| w == b"GPLv3")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no bash terms", path.display()))
-    }
-}
-
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
@@ -3992,56 +3968,6 @@ fn links_relibc(bytes: &[u8]) -> bool {
     bytes
         .windows(b"relibc_start_v1".len())
         .any(|window| window == b"relibc_start_v1")
-}
-
-/// Fails unless the boot image at `path` carries BusyBox's licence and
-/// the note of its source.
-fn image_has_busybox_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = busybox_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(BUSYBOX_LICENSE, &|data| data == licence.as_slice())
-        && carries(BUSYBOX_SOURCE, &|data| {
-            data.windows(16).any(|w| w == b"busybox-1.37.0.t")
-                && data.windows(5).any(|w| w == b"GPLv2")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no BusyBox terms", path.display()))
-    }
-}
-
-/// Fails unless the boot image at `path` carries the licences of the
-/// ready-made utilities and the note of where their sources are.
-fn image_has_ready_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, note) = ready_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(READY_LICENSE, &|data| data == licence.as_slice())
-        && carries(BUSYBOX_SOURCE, &|data| {
-            data.windows(note.len()).any(|w| w == note.as_bytes())
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} carries no terms of the ready-made utilities",
-            path.display()
-        ))
-    }
 }
 
 /// Fails unless the boot image at `path` carries relibc's notices.
@@ -7233,7 +7159,7 @@ fn busybox_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "stafeto ramfs")?;
     image_has_notices(&image)?;
-    image_has_busybox_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-busybox.img", "busybox")?;
     println!(
         "BusyBox cat guest probe passed, {NOTICES}, {BUSYBOX_LICENSE} and {BUSYBOX_SOURCE} in its image"
     );
@@ -7899,8 +7825,8 @@ fn ash_dialog() -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     clock_probe::date_images_back()?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_ready_terms(&image)?;
-    image_has_bash_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "busybox")?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "bash")?;
     packages::check()?;
     packages::table("boot-ash-dialog.img")?;
     // What `ls -l` shows of the files of /bin: the mode, the links and the

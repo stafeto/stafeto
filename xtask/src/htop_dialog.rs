@@ -34,38 +34,13 @@ pub fn htop_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
-/// Fails unless the boot image at `path` carries htop's terms.
-fn image_has_htop_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = htop_terms()?;
-    let version = version()?;
-    let archive = format!("htop-{version}.tar.xz");
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(HTOP_LICENSE, &|data| data == licence.as_slice())
-        && carries(HTOP_SOURCE, &|data| {
-            data.windows(archive.len()).any(|w| w == archive.as_bytes())
-                && data.windows(5).any(|w| w == b"GPLv2")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no htop terms", path.display()))
-    }
-}
-
 pub fn htop_dialog() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_htop_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "htop")?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;

@@ -851,6 +851,9 @@ pub fn probe(machine: &'static qemu::Machine, kind: Kind) -> Result<(), String> 
     let ca = crate::probe_ca::ensure(false)?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(image_of(kind), programs(kind), BOOT_PROFILE)?;
+    for package in ["nginx-fast", "f-stack"] {
+        crate::notices::image_has_package_notices(&image, image_of(kind), package)?;
+    }
     let ports = Ports {
         http: crate::net_curl::free_tcp_port()?,
         https: crate::net_curl::free_tcp_port()?,
