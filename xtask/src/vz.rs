@@ -146,8 +146,12 @@ pub fn claim_suffix() -> Result<Suffix, String> {
             .write(true)
             .open(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        if file.try_lock().is_ok() {
-            return Ok(Suffix { value, _lock: file });
+        match file.try_lock() {
+            Ok(()) => return Ok(Suffix { value, _lock: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("{}: {e}", path.display()));
+            }
         }
     }
     Err("no free MAC suffix for a guest of vz-run".into())

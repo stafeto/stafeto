@@ -9,8 +9,8 @@
 //! console. With one network device:
 //!
 //! 1. the line of the driver (`virtio-net: 1af4:1041 at ...`, the fixed MAC
-//!    of `vz-run` with the suffix the run claimed), the lease within 20 s of the start of the services, the
-//!    gateway in the network of the address, and the first interrupt;
+//!    of `vz-run` with the suffix the run claimed), the lease within 20 s of
+//!    the start of the services, the gateway in the network of the address, and the first interrupt;
 //! 2. a connection to a port with no listener ends in a refusal within a
 //!    second (the RST of the guest to the first SYN is not lost);
 //! 3. `httpd -f -p 80 -h /www &`, twenty requests in a row and eight at
@@ -101,11 +101,11 @@ fn normal_mac(text: &str) -> Option<String> {
     })
 }
 
-/// The address the leases file `text` holds last for `mac`: its entries are
+/// The address the leases file `text` holds for `mac`: the first entry, the
+/// newest, wins. Its entries are
 /// blocks of `key=value` lines, the MAC address in `hw_address=1,2:73:...`
 /// with one digit for a zero byte.
 pub fn leased_to(text: &str, mac: &str) -> Option<Ipv4Addr> {
-    let mut found = None;
     for block in text.split('}') {
         let value = |key: &str| {
             block
@@ -116,31 +116,31 @@ pub fn leased_to(text: &str, mac: &str) -> Option<Ipv4Addr> {
         if hw.and_then(normal_mac).as_deref() == Some(mac)
             && let Some(address) = value("ip_address").and_then(|a| a.trim().parse().ok())
         {
-            found = Some(address);
+            return Some(address);
         }
     }
-    found
+    None
 }
 
 /// Whether the DHCP service gave `mac` the address `lease` the console
 /// shows: a foreign guest with the same MAC address would own the lease
 /// instead. A leases file that cannot be read or has no entry yet is no
 /// evidence; the line says so and the check goes on.
-pub fn lease_is_ours(mac: &str, lease: Ipv4Addr) -> Result<(), String> {
+pub fn lease_is_ours(who: &str, mac: &str, lease: Ipv4Addr) -> Result<(), String> {
     let Ok(text) = std::fs::read_to_string(LEASES) else {
-        println!("net-vz: {LEASES} cannot be read; the lease of {mac} is not cross-checked");
+        println!("{who}: {LEASES} cannot be read; the lease of {mac} is not cross-checked");
         return Ok(());
     };
     match leased_to(&text, mac) {
         Some(address) if address == lease => {
-            println!("net-vz: {LEASES} gives {lease} to {mac}");
+            println!("{who}: {LEASES} gives {lease} to {mac}");
             Ok(())
         }
         Some(address) => Err(format!(
             "{LEASES} gives {address} to {mac}, the console shows {lease}"
         )),
         None => {
-            println!("net-vz: {LEASES} has no entry for {mac} yet");
+            println!("{who}: {LEASES} has no entry for {mac} yet");
             Ok(())
         }
     }
@@ -437,7 +437,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         // The guest has talked to the Mac: its address must be ours by the
         // ARP cache and by the DHCP service's file.
         arp_is(guest, &macs[0])?;
-        lease_is_ours(&macs[0], guest)?;
+        lease_is_ours("net-vz", &macs[0], guest)?;
         println!(
             "net-vz: 20 requests in a row and 8 at once ok, {} ms median, {} ms the longest",
             timing.0, timing.1
@@ -849,6 +849,11 @@ mod tests {
             Some("192.168.64.4".parse().unwrap())
         );
         assert_eq!(leased_to(text, "02:73:74:66:02:01"), None);
+        let twice = "{\n\tip_address=192.168.64.9\n\thw_address=1,2:73:74:66:0:1\n}\n{\n\tip_address=192.168.64.3\n\thw_address=1,2:73:74:66:0:1\n}\n";
+        assert_eq!(
+            leased_to(twice, "02:73:74:66:00:01"),
+            Some("192.168.64.9".parse().unwrap())
+        );
     }
 
     #[test]

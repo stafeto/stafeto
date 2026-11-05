@@ -68,9 +68,10 @@ lease on the NAT and cannot take the address over. Such a guest only
 earns a warning at the start. A guest with the same suffix (a runner
 started by hand with the same key) would take the lease: the command looks
 again before and after every ceiling and stage, a row with a new guest of
-the same suffix is marked `foreign guest`, and on VZ the run stops there.
-The table notes the other
-machines of QEMU and VZ and the Mac's load average at the start and the end.
+any suffix is marked `foreign guest` (it shares the Mac's cores), and on VZ
+the run stops there when the new guest has the run's suffix. The table
+notes the other machines of QEMU and VZ and the Mac's load average at the
+start and the end.
 
 ## Reading the table
 

@@ -142,10 +142,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
     };
     let kernel = build(Variant::Normal)?;
     let boot = build_boot_image("boot-pci-walk-vz.img", &PROGRAMS, BOOT_PROFILE)?;
-    let suffix = vz::claim_suffix()?;
+    let suffix = if net > 0 {
+        Some(vz::claim_suffix()?)
+    } else {
+        None
+    };
     let machine = vz::Machine {
         net,
-        mac_suffix: suffix.value,
+        mac_suffix: suffix.as_ref().map_or(0, |s| s.value),
         ..vz::Machine::default()
     };
     let mut run = qemu::Run::start(

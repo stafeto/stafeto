@@ -738,6 +738,8 @@ struct Bench {
     /// The guests of vz-run when the run started (its own on VZ), and
     /// whether a new one ends the run (on VZ, where it takes the lease).
     vz_guests: usize,
+    /// The guests of vz-run with the run's suffix at the start.
+    own_guests: usize,
     /// The MAC suffix of the run's guest (0 on the host).
     suffix: u8,
     stop_on_foreign: bool,
@@ -823,9 +825,9 @@ fn alert_until(run: &mut qemu::Run, until: Instant) -> Option<String> {
     .ok()
 }
 
-/// The guests of vz-run on the Mac that have the MAC suffix `suffix`, and
-/// so the lease of the run's guest.
-fn vz_guests(suffix: u8) -> usize {
+/// The guests of vz-run on the Mac: all of them, or with the MAC suffix
+/// `suffix` only (those share the lease of the run's guest).
+fn vz_guests(suffix: Option<u8>) -> usize {
     let ps = Command::new("ps")
         .args(["-Ao", "pid,command"])
         .output()
@@ -833,19 +835,21 @@ fn vz_guests(suffix: u8) -> usize {
         .unwrap_or_default();
     vz::suffixes_in(&ps)
         .iter()
-        .filter(|s| **s == suffix)
+        .filter(|s| suffix.is_none_or(|x| **s == x))
         .count()
 }
 
 impl Bench {
-    /// Whether a guest of vz-run came up since the run started.
+    /// Whether a guest of vz-run came up since the run started: it shares
+    /// the Mac's cores whatever its suffix.
     fn foreign(&self) -> bool {
-        vz_guests(self.suffix) > self.vz_guests
+        vz_guests(None) > self.vz_guests
     }
 
     /// Ends the run after `step` beside a foreign guest of VZ.
     fn stop_on_foreign(&self, step: &str, foreign: bool) -> Result<(), String> {
-        if foreign && self.stop_on_foreign {
+        // Only a guest of the same suffix takes the lease.
+        if foreign && self.stop_on_foreign && vz_guests(Some(self.suffix)) > self.own_guests {
             return Err(format!(
                 "{step}: a foreign guest of vz-run came up beside the run (same MAC suffix, same lease); the run stops here"
             ));
@@ -1450,7 +1454,7 @@ fn guest(options: &Options) -> Result<(), String> {
             None => {
                 let lease = net_vz::parse_address(&lease, "lease")
                     .ok_or_else(|| format!("the lease {lease:?}"))?;
-                net_vz::lease_is_ours(&vz::mac(mac_suffix, 0), lease.address)?;
+                net_vz::lease_is_ours("nginx-bench", &vz::mac(mac_suffix, 0), lease.address)?;
                 (lease.address, 80).into()
             }
         };
@@ -1484,7 +1488,8 @@ fn guest(options: &Options) -> Result<(), String> {
             address,
             lengths: Lengths::of(options.quick),
             rows: Vec::new(),
-            vz_guests: vz_guests(mac_suffix),
+            vz_guests: vz_guests(None),
+            own_guests: vz_guests(Some(mac_suffix)),
             suffix: mac_suffix,
             stop_on_foreign: vz,
         });
@@ -1585,7 +1590,8 @@ fn host(options: &Options) -> Result<(), String> {
         base: format!("http://{address}"),
         address,
         lengths: Lengths::of(options.quick),
-        vz_guests: vz_guests(0),
+        vz_guests: vz_guests(None),
+        own_guests: 0,
         suffix: 0,
         stop_on_foreign: false,
         rows: vec![Row::Note(format!(
