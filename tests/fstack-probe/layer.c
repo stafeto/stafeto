@@ -310,6 +310,34 @@ check_calls(void)
     REFUSED(fork(), EPERM);
     ok("refusals");
 
+    /* An error of the stack arrives in the numbers of Linux: a connect to a
+     * port nobody listens on ends with ECONNREFUSED, which SO_ERROR gives
+     * and the record reports as an error. */
+    {
+        int r = socket(AF_INET, SOCK_STREAM, 0), err = 0;
+        struct sockaddr_in to;
+        uint32_t got;
+        socklen_t elen = sizeof(err);
+
+        REQUIRE(r >= FAST_BASE);
+        memset(&to, 0, sizeof(to));
+        to.sin_family = AF_INET;
+        to.sin_port = htons(9);
+        to.sin_addr.s_addr = htonl(0x7f000001);
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLOUT | EPOLLIN | EPOLLET;
+        ev.data.ptr = (void *)3;
+        REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, r, &ev) == 0);
+        errno = 0;
+        REQUIRE(connect(r, (struct sockaddr *)&to, sizeof(to)) == -1 && errno == EINPROGRESS);
+        got = wait_for((void *)3);
+        REQUIRE((got & (EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLIN)) != 0);
+        REQUIRE(getsockopt(r, SOL_SOCKET, SO_ERROR, &err, &elen) == 0);
+        REQUIRE(err == ECONNREFUSED);
+        REQUIRE(close(r) == 0);
+    }
+    ok("refused_connect");
+
     /* A descriptor of the stack does not travel over a socket pair. */
     {
         int pair[2];

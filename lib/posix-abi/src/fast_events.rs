@@ -131,7 +131,7 @@ pub fn delete(n: i32, filter: i16) -> Kevent {
     }
 }
 
-/// The events of one kevent as epoll has them (Р9.3 of the design): reading
+/// The events of one kevent as epoll has them (the design of the second device): reading
 /// is `EPOLLIN`, and with the end of the stream also `EPOLLRDHUP`; writing
 /// is `EPOLLOUT`, and with the end `EPOLLHUP`; an error of the record is
 /// `EPOLLERR`.

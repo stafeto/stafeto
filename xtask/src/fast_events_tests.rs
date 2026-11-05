@@ -204,10 +204,10 @@ fn every_call_of_the_table_is_under_the_lock() {
     }
 }
 
-/// The calls of Р6 that reach the stack: each function of the layer starts
+/// The calls that reach the stack: each function of the layer starts
 /// with a test for the fast numbers (or `takes`, for `socket`).
 #[test]
-fn every_call_of_the_table_of_routes_has_its_branch() {
+fn every_routed_call_has_its_branch() {
     let routes: &[(&str, &[&str])] = &[
         (
             "lib/posix-abi/src/sockets.rs",

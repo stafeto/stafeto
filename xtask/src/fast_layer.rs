@@ -52,6 +52,7 @@ pub const CHECKS: &[&str] = &[
     "oneshot",
     "rdhup",
     "refusals",
+    "refused_connect",
     "scm_rights",
     "datagram_unchanged",
     "close",

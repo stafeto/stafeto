@@ -110,7 +110,7 @@ struct Instance {
     pending: [u32; PENDING],
     pending_len: u8,
     /// The kqueue of the stack behind the fast sockets of the instance
-    /// (their records live there, not here), -1 before the first.
+    /// (their records live in it alone), -1 before the first.
     kq: i32,
 }
 
@@ -525,7 +525,7 @@ fn ensure_kq(id: u32) -> Result<i32, i32> {
 }
 
 /// The records of a fast socket live in the kqueue of the stack, `data`
-/// in the event's `udata` (Р9 of the design of the second device). ADD of
+/// in the event's `udata` (see `<stafeto/fast.h>`). ADD of
 /// a record that exists works as MOD; MOD deletes the filters and adds them
 /// again, which also switches a oneshot record on.
 fn ctl_fast(epfd: i32, op: i32, fd: i32, event: Option<EpollEvent>) -> Result<(), i32> {
@@ -934,9 +934,9 @@ fn round_once(
 /// The stack's clock tick and the longest sleep of the loop.
 const TICK_NS: u64 = 10_000_000;
 /// When the records that are not fast were last looked at, in nanoseconds
-/// of the counter (0: never). One look for each tick of the process, not for
-/// each call of `epoll_pwait`: the look is requests to services, and under
-/// load a call ends at every batch of events.
+/// of the counter (0: never). One look for each tick of the process, however
+/// many calls of `epoll_pwait` there are: the look is requests to services,
+/// and under load a call ends at every batch of events.
 static SHARED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// The wake test of the loop's sleep: bits of the service's notifications
@@ -946,7 +946,7 @@ fn fast_wake() -> bool {
 }
 
 /// epoll_pwait on an instance with fast records: the loop that drives the
-/// stack of the process (the design's Р10).
+/// stack of the process (see `<stafeto/fast.h>`).
 fn pwait_fast(
     id: u32,
     kq: i32,
