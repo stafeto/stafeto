@@ -390,9 +390,9 @@ check_calls(void)
 
     /* One instance for both kinds of descriptors, as nginx has it (its
      * channel to the main process next to the sockets): the end of a pipe
-     * and the sockets of the stack in the same set. The pipe stays in the
-     * set while the program serves, so the loop looks at it once for each
-     * clock tick. */
+     * and the sockets of the stack in the same set. The command `?mix` of
+     * the echo puts the pipe back into the set while the program serves, so
+     * that the loop looks at it once for each clock tick and sleeps on it. */
     {
         char byte;
 
@@ -401,6 +401,7 @@ check_calls(void)
         REQUIRE(write(mixed[1], "z", 1) == 1);
         wait_for((void *)4);
         REQUIRE(read(mixed[0], &byte, 1) == 1 && byte == 'z');
+        REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, mixed[0], NULL) == 0);
     }
     ok("mixed_set");
 }
@@ -475,7 +476,13 @@ serve_echo(struct connection *c)
                 stop = 1;
                 return;
             }
-            if (got >= 6 && memcmp(c->out, "?stats", 6) == 0)
+            if (got >= 6 && memcmp(c->out, "?unmix", 6) == 0) {
+                REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, mixed[0], NULL) == 0);
+                c->out_len = (unsigned)snprintf((char *)c->out, sizeof(c->out), "unmixed\n");
+            } else if (got >= 4 && memcmp(c->out, "?mix", 4) == 0) {
+                add(mixed[0], EPOLLIN, (void *)4);
+                c->out_len = (unsigned)snprintf((char *)c->out, sizeof(c->out), "mixed\n");
+            } else if (got >= 6 && memcmp(c->out, "?stats", 6) == 0)
                 stats(c);
             else
                 c->out_len = (unsigned)got;
@@ -607,6 +614,8 @@ serve(void)
                 accept_all(echo_listener, ECHO_PORT);
             } else if (ev[k].data.ptr == &page_listener) {
                 accept_all(page_listener, PAGE_PORT);
+            } else if (ev[k].data.ptr == (void *)4) {
+                continue;
             } else {
                 struct connection *c = ev[k].data.ptr;
 

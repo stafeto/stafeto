@@ -158,6 +158,25 @@ fn idle_latency(port: u16, count: usize) -> Result<(u64, u64), String> {
     Ok((times[times.len() / 2], times[times.len() * 9 / 10]))
 }
 
+/// A command of the echo (`?mix`, `?unmix`) and its one-line answer.
+fn command_of(port: u16, text: &str, answer: &str) -> Result<(), String> {
+    let mut stream = connect(port)?;
+    stream
+        .write_all(text.as_bytes())
+        .map_err(|e| format!("{text}: {e}"))?;
+    let mut got = vec![0u8; answer.len()];
+    stream
+        .read_exact(&mut got)
+        .map_err(|e| format!("{text}: {e}"))?;
+    if got != answer.as_bytes() {
+        return Err(format!(
+            "{text} was answered with {:?}",
+            String::from_utf8_lossy(&got)
+        ));
+    }
+    Ok(())
+}
+
 /// `ticks=N passes=M` of the program, asked on a new connection.
 fn stats(port: u16) -> Result<(u64, u64), String> {
     let mut stream = connect(port)?;
@@ -262,6 +281,15 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 "an echo after a pause took {median} us at the median, over {IDLE_MEDIAN_MAX_US}: the idle loop does not wake on the device's interrupt"
             ));
         }
+        // The same with the end of a pipe in the set (as nginx's channel is):
+        // the sleep of the loop then holds a subscription at the pipe's
+        // service and gives it back at each wake. Not judged, reported.
+        command_of(echo_host, "?mix", "mixed\n")?;
+        let (mixed_median, mixed_p90) = idle_latency(echo_host, 40)?;
+        command_of(echo_host, "?unmix", "unmixed\n")?;
+        notes.push(format!(
+            "with a pipe in the set: median {mixed_median} us, 90th percentile {mixed_p90} us"
+        ));
         let before = stats(echo_host)?;
         let at = Instant::now();
         std::thread::sleep(Duration::from_secs(2));
