@@ -1250,6 +1250,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
+name = "virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-blk",
+ "proto-init",
+ "proto-wire",
+ "rt",
+ "virtio-drivers",
+ "virtio-mmio",
+ "virtio-pci",
+]
+
+[[package]]
 name = "virtio-console"
 version = "0.1.0"
 dependencies = [
