@@ -548,7 +548,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     if let Some(old) = &old {
         for (i, name) in PARTS.iter().enumerate() {
             if old.digests[i] != now[i] {
-                println!("abi: part {name} differs from abi.txt");
+                println!("abi: part {name} differs from abi.txt (now {})", now[i]);
                 if let Some(before) = &previous[i] {
                     for l in line_diff(before, &parts.0[i]) {
                         println!("  {l}");

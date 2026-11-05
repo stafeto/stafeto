@@ -118,8 +118,7 @@ fn sha_of(path: &Path) -> Result<String, String> {
     Ok(pkgfmt::sha::hex(&pkgfmt::sha::sha256(&bytes), &mut buf).to_string())
 }
 
-/// Step 8 of `pkg-identity`: `built` is the repository of step 1 (development key), `full` the
-/// full image of that build.
+/// Step 8 of `pkg-identity`: `built` is the repository of step 1 (development key).
 ///
 /// A published repository is made from `built` by signing its packages with a first probe key.
 /// A build that carries from it with one recipe changed (`--perturb freedoom`) keeps the files
@@ -127,7 +126,7 @@ fn sha_of(path: &Path) -> Result<String, String> {
 /// Signing with a second probe key changes only the last page of the new package and leaves the
 /// carried ones. An image built from the files of the run takes the signed files over its own
 /// and keeps every other file.
-fn carry_over(built: &Path, full: &Path) -> Result<(), String> {
+fn carry_over(built: &Path) -> Result<(), String> {
     use crate::{keys, pkg_sign};
     let tree = crate::root();
     let dev = keys::dev_keys(&tree)?;
@@ -262,8 +261,7 @@ fn carry_over(built: &Path, full: &Path) -> Result<(), String> {
         done.kept.len()
     );
     // The image of this run holds the carried files and the new one; the signed files go in.
-    let image = crate::base_image::build_image(crate::base_image::FULL_IMAGE)?;
-    let _ = full;
+    let image = crate::base_image::rebuild_image(crate::base_image::FULL_IMAGE)?;
     let copy = work.join("boot-full.img");
     std::fs::copy(&image, &copy).map_err(|e| format!("{}: {e}", image.display()))?;
     let n = pkg_sign::repack(&copy, &signed)?;
@@ -938,7 +936,7 @@ pub fn identity() -> Result<(), String> {
         "pkg-identity: two builds of freedoom and busybox agree byte for byte but for the time and the signature"
     );
     // 8: the packages of a published index are carried, signed again and put into an image.
-    carry_over(&dir, &full)?;
+    carry_over(&dir)?;
     println!("pkg-identity: {:.0} s", started.elapsed().as_secs_f64());
     Ok(())
 }

@@ -95,6 +95,14 @@ pub fn build_image(name: &'static str) -> Result<PathBuf, String> {
     build_boot_image(name, programs(name), BOOT_PROFILE)
 }
 
+/// The image `name` built again from the package files of `target/pkg` as they are now: the
+/// image of `build_image` is kept for the run, and a run that carries packages (their releases
+/// change the names of the files) needs the image with the files it has made since.
+pub fn rebuild_image(name: &'static str) -> Result<PathBuf, String> {
+    prepare()?;
+    crate::write_boot_image(name, programs(name), BOOT_PROFILE)
+}
+
 /// `cargo xtask image base|full [run]`.
 pub fn command(args: &[String]) -> Result<(), String> {
     let name = match args.first().map(String::as_str) {
