@@ -244,7 +244,11 @@ mod tests {
         let data = alloc::vec![7u8; 30_000_000];
         let start = std::time::Instant::now();
         let digest = crate::sha::sha256(&data);
-        eprintln!("SHA-256 of 30 MB: {:?} ({:02x})", start.elapsed(), digest[0]);
+        eprintln!(
+            "SHA-256 of 30 MB: {:?} ({:02x})",
+            start.elapsed(),
+            digest[0]
+        );
     }
 
     fn sample() -> Block {

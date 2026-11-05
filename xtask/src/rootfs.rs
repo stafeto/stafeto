@@ -1830,24 +1830,27 @@ mod tests {
         assert!(error.contains("/bin/stray"), "{error}");
         // A path two packages name.
         let mut twice = packages.clone();
-        let path = twice[1].files[0].clone();
-        twice[2].files.push(path.clone());
+        let with_files: Vec<usize> = (0..twice.len())
+            .filter(|&n| !twice[n].files.is_empty())
+            .collect();
+        let path = twice[with_files[0]].files[0].clone();
+        twice[with_files[1]].files.push(path.clone());
         let error = check_owners(image, &files, &twice).unwrap_err();
         assert!(error.contains(&path.0), "{error}");
         // A file a package names and the image lacks.
         let mut lacking = packages.clone();
-        lacking[1]
+        lacking[with_files[0]]
             .files
             .push(("/bin/ghost".into(), "elf:busybox-probe".into()));
         let error = check_owners(image, &files, &lacking).unwrap_err();
         assert!(error.contains("/bin/ghost"), "{error}");
         // A package that installs nothing leaves nothing to own: its row
-        // has no files, and some other package depends on it (the fts of
+        // has no files, and some other package links it in (the fts of
         // pax).
         for p in packages.iter().filter(|p| p.files.is_empty()) {
             assert!(
-                packages.iter().any(|q| q.depends.contains(&p.name)),
-                "{} installs nothing and no package depends on it",
+                packages.iter().any(|q| q.build_depends.contains(&p.name)),
+                "{} installs nothing and no package links it in",
                 p.name
             );
         }

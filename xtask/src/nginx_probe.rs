@@ -1829,6 +1829,6 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
             std::fs::read_to_string(crate::root().join(".github/workflows/ci.yml")).unwrap();
         assert!(workflow.contains("  nginx-probe:\n"));
         assert!(workflow.contains("run: cargo xtask nginx-probe\n"));
-        assert!(workflow.contains("needs: [build, group, doom-probe, nginx-probe]"));
+        assert!(workflow.contains("needs: [build, group, doom-probe, nginx-probe, pkg]"));
     }
 }
