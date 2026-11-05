@@ -201,13 +201,9 @@ fn make_good(states: &Path) -> Result<PathBuf, String> {
         &all,
         &repo::Options {
             serial: GOOD_SERIAL,
-            expires_days: 30,
             sources: false,
-            key: None,
-            cert: None,
-            root: None,
-            check: false,
             dir: Some(states.join("doom")),
+            ..repo::Options::default()
         },
     )
 }

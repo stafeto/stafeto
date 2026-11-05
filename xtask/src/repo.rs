@@ -29,24 +29,32 @@ pub struct Options {
     pub cert: Option<PathBuf>,
     pub root: Option<PathBuf>,
     pub check: bool,
+    pub official: bool,
     pub dir: Option<PathBuf>,
 }
 
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            serial: 1,
+            expires_days: EXPIRES_MAX_DAYS,
+            sources: true,
+            key: None,
+            cert: None,
+            root: None,
+            check: false,
+            official: false,
+            dir: None,
+        }
+    }
+}
+
 pub fn parse_options(args: &[String]) -> Result<Options, String> {
-    let mut o = Options {
-        serial: 1,
-        expires_days: EXPIRES_MAX_DAYS,
-        sources: true,
-        key: None,
-        cert: None,
-        root: None,
-        check: false,
-        dir: None,
-    };
+    let mut o = Options::default();
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        let wants_value = flag != "--no-sources" && flag != "--check";
+        let wants_value = flag != "--no-sources" && flag != "--check" && flag != "--official";
         let value = if wants_value {
             i += 1;
             args.get(i)
@@ -77,6 +85,7 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--root" => o.root = Some(value.into()),
             "--dir" => o.dir = Some(value.into()),
             "--check" => o.check = true,
+            "--official" => o.official = true,
             other => return Err(format!("{other}: unknown argument")),
         }
         i += 1;
@@ -363,14 +372,18 @@ pub fn check(dir: &Path, roots: &[Key]) -> Result<usize, String> {
     Ok(count)
 }
 
-/// `cargo xtask repo [--serial N] [--expires-days D] [--no-sources] [--key K.key --cert K.cert] [--check]`.
+/// `cargo xtask repo [--serial N] [--expires-days D] [--no-sources] [--key K.key --cert K.cert] [--check [--official]]`.
 pub fn command(args: &[String]) -> Result<(), String> {
     run(&parse_options(args)?).map(drop)
 }
 
 pub fn run(o: &Options) -> Result<PathBuf, String> {
     let tree = crate::root();
+    if o.official && (o.root.is_some() || !o.check) {
+        return Err("--official goes with --check and not with --root".into());
+    }
     let roots = match &o.root {
+        _ if o.official => keys::official_roots(&tree)?,
         Some(path) => {
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
