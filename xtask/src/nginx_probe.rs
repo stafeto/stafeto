@@ -1476,16 +1476,39 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
         assert!(h2load_verdict(&good.replace("protocol: h2", "protocol: http/1.1")).is_err());
     }
 
+    /// The words of the commands `apt-get install` of a workflow's steps,
+    /// over the lines that end in a backslash; comments are not commands.
+    fn installed(text: &str) -> Vec<&str> {
+        let mut words = Vec::new();
+        let mut going = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('#') {
+                going = false;
+                continue;
+            }
+            if let Some(rest) = line.split_once("apt-get install").map(|(_, r)| r) {
+                going = true;
+                words.extend(rest.split_whitespace());
+            } else if going {
+                words.extend(line.split_whitespace());
+            }
+            going = going && line.ends_with('\\');
+        }
+        words
+    }
+
     /// The runner of ci installs h2load, so that step 4e runs there.
     #[test]
     fn the_runner_has_h2load() {
         let setup = std::fs::read_to_string(crate::root().join(".github/actions/setup/action.yml"))
             .unwrap();
         assert!(
-            setup
-                .split_whitespace()
-                .any(|word| word == "nghttp2-client"),
+            installed(&setup).contains(&"nghttp2-client"),
             "nghttp2-client in the packages of the runner"
+        );
+        assert!(!installed("# apt-get install nghttp2-client\n").contains(&"nghttp2-client"));
+        assert!(
+            !installed("apt-get install a \\\n  b\n# nghttp2-client\n").contains(&"nghttp2-client")
         );
     }
 
