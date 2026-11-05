@@ -9243,6 +9243,7 @@ fn host_tests() -> Result<(), String> {
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
     }
+        "tools/test_pkg_mirror.py",
     run_cmd(cargo().env("STAFETO_REQUIRE_LIBC_SO", "1").args([
         "test",
         "--package",
