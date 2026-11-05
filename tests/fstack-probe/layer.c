@@ -428,6 +428,21 @@ check_calls(void)
     }
     ok("datagram_unchanged");
 
+    /* ADD of a record that exists replaces it whole: the filter the new
+     * interest leaves out is gone (writing, level: it would report at once). */
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.ptr = (void *)6;
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev) == 0);
+    n = wait_events(out, 4, 3000);
+    REQUIRE(n >= 1 && out[0].data.ptr == (void *)6 && (out[0].events & EPOLLOUT));
+    ev.events = EPOLLIN;
+    ev.data.ptr = (void *)7;
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_ADD, c, &ev) == 0);
+    REQUIRE(wait_events(out, 4, 150) == 0);
+    REQUIRE(epoll_ctl(epfd, EPOLL_CTL_DEL, c, NULL) == 0);
+    ok("add_replaces");
+
     REQUIRE(close(c) == 0);
     REQUIRE(close(s) == 0);
     REQUIRE(close(l) == 0);

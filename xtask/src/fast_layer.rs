@@ -56,6 +56,7 @@ pub const CHECKS: &[&str] = &[
     "rdhup",
     "refusals",
     "refused_connect",
+    "add_replaces",
     "scm_rights",
     "datagram_unchanged",
     "close",
