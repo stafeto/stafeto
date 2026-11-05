@@ -759,7 +759,17 @@ impl Bench {
             malloc,
             command,
         });
-        stop_on(step, &alerts)?;
+        if matches!(server, Server::Guest(_)) {
+            stop_on(step, &alerts)?;
+        } else if let Some(first) = alerts.first() {
+            // Homebrew's nginx on macOS logs its own alerts under overload
+            // (TCP_NODELAY on a socket the peer closed); they are noted.
+            self.rows.push(Row::Note(format!(
+                "{step}: Homebrew's nginx logged {} lines at crit or above, the first `{}`",
+                alerts.len(),
+                first.trim()
+            )));
+        }
         Ok(wrk)
     }
 
@@ -860,7 +870,17 @@ impl Bench {
             stage: stage.clone(),
             command,
         });
-        stop_on(step, &alerts)?;
+        if matches!(server, Server::Guest(_)) {
+            stop_on(step, &alerts)?;
+        } else if let Some(first) = alerts.first() {
+            // Homebrew's nginx on macOS logs its own alerts under overload
+            // (TCP_NODELAY on a socket the peer closed); they are noted.
+            self.rows.push(Row::Note(format!(
+                "{step}: Homebrew's nginx logged {} lines at crit or above, the first `{}`",
+                alerts.len(),
+                first.trim()
+            )));
+        }
         Ok(stage)
     }
 }
