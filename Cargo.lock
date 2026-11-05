@@ -835,6 +835,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-blk"
+version = "0.1.0"
+dependencies = [
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-clock"
 version = "0.1.0"
 dependencies = [
