@@ -859,12 +859,19 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
     // (stafeto-design#564: the other three held a buffer, the fourth never
     // asked, and netd had refused nobody). A burst of connections held open
     // together reaches every queue, as it does before the reload.
+    // The KiB of the answer are read before any burst: the bursts carry
+    // 2 MiB through the buffers themselves.
+    let (_, after) = buffered(run)?;
     let answered = Instant::now();
-    let (sessions, after) = until_whole(
+    let mut bursts = 0;
+    let (sessions, _) = until_whole(
         WORKERS as u32,
         BUFFER_WITHIN,
         || buffered(run),
-        || pages(address, SPREAD_REQUESTS, CONNECTIONS),
+        || {
+            bursts += 1;
+            pages(address, SPREAD_REQUESTS, CONNECTIONS)
+        },
     )?;
     let grown = after.wrapping_sub(before);
     if sessions as usize != WORKERS || grown < (WWW_256K_LEN / 1024) as u64 {
@@ -873,7 +880,7 @@ fn reload(run: &mut qemu::Run, address: SocketAddr, old: &[u32]) -> Result<(), S
         ));
     }
     println!(
-        "nginx-probe: after the reload {sessions} sessions hold a buffer ({} ms after the answer), and 256 KiB went through them",
+        "nginx-probe: after the reload {sessions} sessions hold a buffer ({bursts} bursts of connections, {} ms after the answer), and 256 KiB went through them",
         answered.elapsed().as_millis()
     );
     Ok(())
