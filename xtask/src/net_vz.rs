@@ -66,16 +66,21 @@ const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
 /// The kind of the steps of the second device's return, and their bound on
 /// VZ: 50 ms of the counter (24 MHz), for the two sub-steps that touch the
 /// device first after the host reset it (details 1, the reset, and 2, the
-/// open); the other sub-steps of the return keep 0.9 of term B.
+/// open) and for an own step that gets there first after an owner's death;
+/// the other sub-steps of the return keep 0.9 of term B.
 const RETURN_KIND: usize = 65;
 const RETURN_MAX: u64 = 1_200_000;
-/// Whether a line of steps is one of the second device's return that the
-/// host's reset delays: the reset (detail 1) or the open (detail 2).
-fn is_return_step(line: &str) -> bool {
+/// Whether a line of steps is one the host's reset of the device delays: a
+/// step of kind 65 with detail 1 (the reset) or 2 (the open), or, after the
+/// owner was killed, with detail 0 (whichever own step touches the device
+/// first after the reset: the interrupt's, the owner's departure).
+fn is_return_step(line: &str, after_kill: bool) -> bool {
     line.contains(&format!("kind {RETURN_KIND} "))
-        && line
-            .rsplit_once("detail ")
-            .is_some_and(|(_, d)| d.trim().parse::<u64>().is_ok_and(|d| d == 1 || d == 2))
+        && line.rsplit_once("detail ").is_some_and(|(_, d)| {
+            d.trim()
+                .parse::<u64>()
+                .is_ok_and(|d| d == 1 || d == 2 || (d == 0 && after_kill))
+        })
 }
 
 /// The fixed MAC addresses of `vz-run`, by device.
@@ -427,15 +432,20 @@ pub fn command(args: &[String]) -> Result<(), String> {
         // The device that comes back from its owner is reset by the host: the
         // first access after the reset stalls the one virtual processor, so
         // the whole guest, for about 20 ms; a thread inside the service
-        // cannot lift that. The two sub-steps that touch the device first
-        // (kind 65, details 1 and 2) have a bound of their own on VZ, 50 ms
-        // of the counter. The others, the queues and the fill among them,
-        // keep 0.9 of term B.
-        let (back, rest): (Vec<String>, Vec<String>) = output
-            .lines
-            .iter()
-            .cloned()
-            .partition(|l| is_return_step(l));
+        // cannot lift that. The steps that touch the device first (kind 65,
+        // details 1 and 2, and after the owner's death any own step, detail
+        // 0) have a bound of their own on VZ, 50 ms of the counter. The
+        // others, the queues and the fill among them, keep 0.9 of term B.
+        let mut after_kill = false;
+        let (mut back, mut rest) = (Vec::new(), Vec::new());
+        for line in &output.lines {
+            after_kill |= line.contains("Killed") || line.contains("Quit");
+            if is_return_step(line, after_kill) {
+                back.push(line.clone());
+            } else {
+                rest.push(line.clone());
+            }
+        }
         if let Some(row) = net_probe::longest_over_starts(&rest)
             .iter()
             .find(|r| r.1 > net_probe::STEP_MAX)
@@ -791,22 +801,19 @@ mod tests {
 
     #[test]
     fn a_step_of_the_return_has_kind_65_and_a_detail() {
-        assert!(is_return_step(
-            "service step: 14 kind 65 443318 ticks detail 2"
-        ));
-        assert!(!is_return_step(
-            "service step: 14 kind 65 3000 ticks detail 0"
-        ));
+        let line = |kind: u32, detail: u32| {
+            format!("service step: 14 kind {kind} 30000 ticks detail {detail}")
+        };
+        assert!(is_return_step(&line(65, 2), false));
+        assert!(is_return_step(&line(65, 1), false));
+        // An own step is delayed only after the owner was killed.
+        assert!(!is_return_step(&line(65, 0), false));
+        assert!(is_return_step(&line(65, 0), true));
         // The queues and the fill keep the common bound.
-        assert!(!is_return_step(
-            "service step: 14 kind 65 30000 ticks detail 3"
-        ));
-        assert!(!is_return_step(
-            "service step: 14 kind 65 30000 ticks detail 5"
-        ));
-        assert!(!is_return_step(
-            "service step: 14 kind 36 3000 ticks detail 1"
-        ));
+        for detail in [3, 4, 5, 6] {
+            assert!(!is_return_step(&line(65, detail), true));
+        }
+        assert!(!is_return_step(&line(36, 1), true));
     }
 
     #[test]
