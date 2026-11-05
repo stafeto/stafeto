@@ -1736,7 +1736,12 @@ commands:
             under HVF, with --plain on QEMU's emulation without -icount
   store-probe [steps] run the package service in QEMU: a store written on the host is
             attached from the disk, the packages that fail their checks are skipped,
-            a disk of zeros is formatted; steps: the service's steps under -icount
+            a disk of zeros is formatted, the full scenario of installations, refusals,
+            changes and removals runs on a disk of zeros and again after a restart;
+            steps: the service's steps under -icount
+  store-crash [N] kill the package service's machine at each crash point of the
+            note (or at point N), start it again on the same disk file and compare
+            the store it finds with the state before or after the change
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -2082,6 +2087,7 @@ fn main() {
         Some("pci-walk-vz") => pci_walk::command(&args[1..]),
         Some("blk-probe") => blk_probe::command(&args[1..]),
         Some("store-probe") => store_probe::command(&args[1..]),
+        Some("store-crash") => store_probe::crash(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -9110,6 +9116,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("store-probe steps", || {
             store_probe::command(&["steps".into()])
         }),
+        // The service built to stop at each crash point, the machine killed there and started
+        // again on the same disk: the store is the whole old state or the whole new one.
+        job("store-crash", || store_probe::crash(&[])),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
@@ -12083,7 +12092,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "store-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash",
         "--target",
         PROGRAM_TARGET,
         "--",
