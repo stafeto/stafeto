@@ -300,6 +300,11 @@ impl Cells {
         self.places[place].state
     }
 
+    /// What the request in `place` is and how many sectors it names.
+    pub fn request(&self, place: usize) -> (Kind, u32) {
+        (self.places[place].kind, self.places[place].count)
+    }
+
     /// Whether a write is with the device, one the client let go included.
     fn write_at_device(&self) -> bool {
         self.places[..CELLS as usize]
