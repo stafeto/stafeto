@@ -56,6 +56,7 @@ mod htop_dialog;
 mod image;
 mod input_probe;
 mod jobs;
+mod keys;
 mod linux_guest;
 mod measure;
 mod monitor;
@@ -74,17 +75,19 @@ mod net_wget;
 mod netd_quota;
 mod nginx_bench;
 mod nginx_probe;
+mod notices;
 mod obj_sites;
 mod openposix;
 mod ostest;
-mod keys;
-mod notices;
 mod packages;
 mod pci_walk;
+mod pkg;
+mod pkg_probes;
 mod posix_display;
 mod posix_net;
 mod probe_ca;
 mod qemu;
+mod repo;
 mod ring;
 mod rootfs;
 mod rtbench;
@@ -1645,6 +1648,15 @@ commands:
             prints its packages with their sizes
   keys      the keys that sign packages: `keys root|release <name> [--dir D]`,
             `keys certify --root R.key --key K.pub`, `keys show <file>` (docs/packages.md)
+  pkg-build [name...]  build the package files (.stpkg) in target/pkg; `--recipe` prints the inputs
+            of the fingerprints instead (docs/packages.md)
+  repo      build the package files and a signed repository of them in target/repo
+            (`--check` checks one; `--no-sources` skips the source archives)
+  pkg-identity  check that the flat images and the packages give the same bytes at the same
+            paths, that the repository is whole and that a package builds again to the same bytes
+  dist-licenses  check that the release archives carry the notices of the packages they
+            hold and no others (no notice of F-Stack in the archives without it)
+  pkg-ci    pkg-build, repo, pkg-identity and dist-licenses in a row (the job `pkg` of CI)
   netd-quota  build the network service and check that the quota of its records
             covers the tables of its mappings and its kernel objects
   htop-dialog  check htop in an ash dialog in QEMU: processes, CPU and memory meters, quit
@@ -1991,6 +2003,11 @@ fn main() {
         Some("ash-dialog") => ash_dialog(),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
+        Some("pkg-build") => pkg::command(&args[1..]),
+        Some("repo") => repo::command(&args[1..]),
+        Some("pkg-identity") => pkg_probes::identity(),
+        Some("dist-licenses") => pkg_probes::dist_licenses(),
+        Some("pkg-ci") => pkg_probes::ci(),
         Some("netd-quota") => netd_quota::check(),
         Some("nano-dialog") => nano_dialog::nano_dialog(),
         Some("htop-dialog") => htop_dialog::htop_dialog(),
@@ -3756,17 +3773,24 @@ fn packages_built(groups: &[packages::Group]) -> Result<(), String> {
         .iter()
         .filter(|p| groups.contains(&p.group()))
     {
-        once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
-            run_cmd(Command::new("python3").arg(root().join(&package.build)))
-        })?;
+        package_script(package)?;
     }
     Ok(())
+}
+
+/// The script of one package run, once in a run of xtask.
+fn package_script(package: &packages::Package) -> Result<(), String> {
+    once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
+        run_cmd(Command::new("python3").arg(root().join(&package.build)))
+    })
 }
 
 /// BusyBox and the other packages of the base set built, once in a run of
 /// xtask.
 fn busybox_build() -> Result<(), String> {
-    once(&BUSYBOX_BUILT, (), || packages_built(&[packages::Group::Base]))
+    once(&BUSYBOX_BUILT, (), || {
+        packages_built(&[packages::Group::Base])
+    })
 }
 
 /// The add-on packages built (ncurses, nano, htop, ncdu and bash: the objects
@@ -3774,7 +3798,9 @@ fn busybox_build() -> Result<(), String> {
 /// the image), once in a run of xtask. The shell image holds all of them,
 /// so each dialog needs all.
 fn nano_build() -> Result<(), String> {
-    once(&NANO_BUILT, (), || packages_built(&[packages::Group::Addon, packages::Group::Fstack]))
+    once(&NANO_BUILT, (), || {
+        packages_built(&[packages::Group::Addon, packages::Group::Fstack])
+    })
 }
 
 /// The network packages built (OpenSSL, curl, the root certificates, nginx with PCRE2),
@@ -8574,6 +8600,9 @@ fn dist() -> Result<(), String> {
     bash_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
+    // The archive carries the notices of the packages of the shell image,
+    // as those packages carry them.
+    let licenses = pkg_probes::stage_licenses()?;
     run_cmd(
         Command::new("python3")
             .arg(root().join("tools/dist.py"))
@@ -8584,6 +8613,8 @@ fn dist() -> Result<(), String> {
             .arg(&kernel.elf)
             .arg("--boot")
             .arg(&image)
+            .arg("--licenses")
+            .arg(&licenses)
             .arg("--out")
             .arg(target_dir().join("dist")),
     )
@@ -9049,6 +9080,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_open_posix_build.py",
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
+        "tools/test_pkg_source.py",
         "tools/test_nginx_answer.py",
         "tools/test_linux_guest.py",
     ] {
@@ -9060,6 +9092,8 @@ fn host_tests() -> Result<(), String> {
         "abi",
         "--package",
         "bootimg",
+        "--package",
+        "pkgfmt",
         "--package",
         "dynlink",
         "--package",

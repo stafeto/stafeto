@@ -39,21 +39,14 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
             "doomgeneric/doomgeneric-{}/LICENSE",
             version(name)?
         ))),
-        "freedoom" => read(target.join(format!(
-            "freedoom/freedoom-{}/COPYING.txt",
-            version(name)?
-        ))),
+        "freedoom" => {
+            read(target.join(format!("freedoom/freedoom-{}/COPYING.txt", version(name)?)))
+        }
         "f-stack" => read(target.join("f-stack/LICENSE")),
-        "openssl" => read(target.join(format!(
-            "openssl/openssl-{}/LICENSE.txt",
-            version(name)?
-        ))),
+        "openssl" => read(target.join(format!("openssl/openssl-{}/LICENSE.txt", version(name)?))),
         "curl" => read(target.join(format!("curl/curl-{}/COPYING", version(name)?))),
         "pcre2" => read(target.join(format!("nginx/pcre2-{}/LICENCE.md", version(name)?))),
-        "nginx" => read(target.join(format!(
-            "nginx/nginx-{}/LICENSE",
-            version(name)?
-        ))),
+        "nginx" => read(target.join(format!("nginx/nginx-{}/LICENSE", version(name)?))),
         "ca-bundle" => {
             let mut text = read(crate::root().join("tools/ca-bundle/MPL-2.0.txt"))?;
             text.extend_from_slice(b"\n\nThe header of the file:\n\n");
@@ -76,14 +69,18 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
 /// `target/ready-utils/notices` that start with the package's name.
 fn ready_utility_text(name: &str) -> Result<Vec<u8>, String> {
     let work = crate::target_dir().join("ready-utils");
-    let manifest = std::fs::read_to_string(work.join("manifest"))
-        .map_err(|e| format!("{name}: ready-utils/manifest: {e}: python3 tools/build-busybox.py writes it"))?;
+    let manifest = std::fs::read_to_string(work.join("manifest")).map_err(|e| {
+        format!("{name}: ready-utils/manifest: {e}: python3 tools/build-busybox.py writes it")
+    })?;
     let row = manifest
         .lines()
         .map(|l| l.split('\t').collect::<Vec<_>>())
         .find(|f| f.first() == Some(&name))
         .ok_or_else(|| format!("{name}: no licence source is known for this package"))?;
-    let file = row.get(4).copied().ok_or_else(|| format!("{name}: a bad row in ready-utils/manifest"))?;
+    let file = row
+        .get(4)
+        .copied()
+        .ok_or_else(|| format!("{name}: a bad row in ready-utils/manifest"))?;
     let mut text = Vec::new();
     if file != "-" {
         text.extend(read(work.join(file))?);
@@ -202,7 +199,11 @@ fn notice_file(from: &str) -> Result<Vec<u8>, String> {
 /// `/usr/share/licenses/<name>/` and the bytes. Its own `LICENSE`, `SOURCE`
 /// and `notices`, then for each package linked in (`build_depends`) its
 /// `LICENSE` and `notices` in a directory of that name.
-pub fn files(p: &Package, all: &[Package], b: &Build<'_>) -> Result<Vec<(String, Vec<u8>)>, String> {
+pub fn files(
+    p: &Package,
+    all: &[Package],
+    b: &Build<'_>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
     let base = directory(&p.name);
     let mut out = vec![
         (format!("{base}/LICENSE"), licence_text(&p.name)?),
@@ -240,7 +241,10 @@ mod tests {
 
     #[test]
     fn short_versions_and_stems() {
-        assert_eq!(short_version("e257a09527062bfb986b6e5e0780839b6cbd5b71"), "e257a095");
+        assert_eq!(
+            short_version("e257a09527062bfb986b6e5e0780839b6cbd5b71"),
+            "e257a095"
+        );
         assert_eq!(short_version("1.37.0"), "1.37.0");
         assert_eq!(stem(&package("doom", "MIT")), "doom-e257a095-2");
     }
@@ -255,7 +259,10 @@ mod tests {
         assert!(needs_source(&gpl, &all));
         assert!(needs_source(&user, &all));
         assert!(!needs_source(&free, &all));
-        assert_eq!(source_archive(&user, &all).unwrap(), "src/b-e257a095-2-src.tar.xz");
+        assert_eq!(
+            source_archive(&user, &all).unwrap(),
+            "src/b-e257a095-2-src.tar.xz"
+        );
     }
 
     #[test]
@@ -264,16 +271,33 @@ mod tests {
         let mut user = package("b", "MIT");
         user.build_depends = vec!["a".into()];
         let all = [gpl, user.clone()];
-        let build = Build { commit: &"1".repeat(40), relibc: Some("pin-0a1b2c3d"), recipe: &"2".repeat(64) };
+        let build = Build {
+            commit: &"1".repeat(40),
+            relibc: Some("pin-0a1b2c3d"),
+            recipe: &"2".repeat(64),
+        };
         let text = source_text(&user, &all, &build);
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("b e257a09527062bfb986b6e5e0780839b6cbd5b71-2, licence MIT."));
         assert_eq!(lines[1], "Source: https://example.org/x.tar.gz");
-        assert!(lines[3].starts_with("Built by tools/build-x.py of https://github.com/stafeto/stafeto at commit 111"));
-        assert!(lines[4].starts_with("Linked into it: a e257a09527062bfb986b6e5e0780839b6cbd5b71 (GPL-2.0-or-later);"));
-        assert!(lines[5].contains("relibc https://github.com/stafeto/relibc at commit pin-0a1b2c3d"));
+        assert!(lines[3].starts_with(
+            "Built by tools/build-x.py of https://github.com/stafeto/stafeto at commit 111"
+        ));
+        assert!(lines[4].starts_with(
+            "Linked into it: a e257a09527062bfb986b6e5e0780839b6cbd5b71 (GPL-2.0-or-later);"
+        ));
+        assert!(
+            lines[5].contains("relibc https://github.com/stafeto/relibc at commit pin-0a1b2c3d")
+        );
         assert!(lines[6].starts_with("The corresponding source: src/b-e257a095-2-src.tar.xz"));
-        let plain = source_text(&all[0], &all, &Build { relibc: None, ..build });
+        let plain = source_text(
+            &all[0],
+            &all,
+            &Build {
+                relibc: None,
+                ..build
+            },
+        );
         assert!(!plain.contains("Linked"));
     }
 }

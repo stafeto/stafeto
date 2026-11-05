@@ -350,15 +350,25 @@ fn validate(p: &Package, origin: &str) -> Result<(), String> {
     }
     for (name, from) in &p.notices {
         let plain = |t: &str| {
-            !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
         };
         if !plain(name) || matches!(name.as_str(), "LICENSE" | "SOURCE") {
-            return fail(&format!("notice name {name:?} is not a plain file name of its own"));
+            return fail(&format!(
+                "notice name {name:?} is not a plain file name of its own"
+            ));
         }
         match from.split_once(':') {
             Some(("target" | "tree", path))
-                if !path.is_empty() && !path.starts_with('/') && !path.split('/').any(|c| c == "..") => {}
-            _ => return fail(&format!("notice source {from:?} is none of target:<path>, tree:<path>")),
+                if !path.is_empty()
+                    && !path.starts_with('/')
+                    && !path.split('/').any(|c| c == "..") => {}
+            _ => {
+                return fail(&format!(
+                    "notice source {from:?} is none of target:<path>, tree:<path>"
+                ));
+            }
         }
     }
     for (path, from) in &p.files {
@@ -544,7 +554,9 @@ fn cycle_free<'a>(
     while done.len() < packages.len() {
         let next = packages.iter().find(|p| {
             !done.contains(p.name.as_str())
-                && edges(p).iter().all(|d| done.contains(d.as_str()) || !packages.iter().any(|q| q.name == *d))
+                && edges(p)
+                    .iter()
+                    .all(|d| done.contains(d.as_str()) || !packages.iter().any(|q| q.name == *d))
         });
         match next {
             Some(p) => {
@@ -566,7 +578,9 @@ pub fn order(packages: &[Package]) -> Result<Vec<Package>, String> {
     while out.len() < packages.len() {
         let next = sorted.iter().find(|p| {
             !out.iter().any(|o| o.name == p.name)
-                && p.build_depends.iter().all(|d| out.iter().any(|o| o.name == *d))
+                && p.build_depends
+                    .iter()
+                    .all(|d| out.iter().any(|o| o.name == *d))
         });
         match next {
             Some(p) => out.push((*p).clone()),
@@ -776,8 +790,14 @@ files = [
     fn a_description_reads_back() {
         let p = good();
         assert_eq!((p.name.as_str(), p.version.as_str()), ("demo", "1.0"));
-        assert_eq!((p.kind, p.image, p.group()), (Kind::Optional, Image::Shell, Group::Addon));
-        assert_eq!((p.release.as_str(), p.summary.as_str()), ("1", "A demonstration"));
+        assert_eq!(
+            (p.kind, p.image, p.group()),
+            (Kind::Optional, Image::Shell, Group::Addon)
+        );
+        assert_eq!(
+            (p.release.as_str(), p.summary.as_str()),
+            ("1", "A demonstration")
+        );
         assert_eq!(p.files.len(), 2);
         assert_eq!(p.files[0], ("/bin/demo".to_owned(), "elf:demo".to_owned()));
         assert!(p.depends.is_empty() && p.build_depends.is_empty() && p.notices.is_empty());
@@ -785,7 +805,14 @@ files = [
 
     #[test]
     fn the_group_follows_kind_and_image() {
-        let g = |k, i| Package { kind: k, image: i, ..good() }.group();
+        let g = |k, i| {
+            Package {
+                kind: k,
+                image: i,
+                ..good()
+            }
+            .group()
+        };
         assert_eq!(g(Kind::Base, Image::Shell), Group::Base);
         assert_eq!(g(Kind::Optional, Image::Shell), Group::Addon);
         assert_eq!(g(Kind::Base, Image::Fstack), Group::Fstack);
@@ -797,7 +824,9 @@ files = [
 
     #[test]
     fn a_description_without_a_required_key_is_refused() {
-        for key in ["sha256", "license", "version", "url", "build", "kind", "image", "release", "summary"] {
+        for key in [
+            "sha256", "license", "version", "url", "build", "kind", "image", "release", "summary",
+        ] {
             let text: String = GOOD
                 .lines()
                 .filter(|l| !l.starts_with(&format!("{key} =")))
@@ -818,7 +847,11 @@ files = [
     fn the_old_kinds_and_bad_values_of_the_new_keys_are_refused() {
         for old in ["addon", "game", "net"] {
             let text = GOOD.replace("kind = \"optional\"", &format!("kind = \"{old}\""));
-            assert!(parse(&text, "x").unwrap_err().contains("none of base, optional"));
+            assert!(
+                parse(&text, "x")
+                    .unwrap_err()
+                    .contains("none of base, optional")
+            );
         }
         assert!(parse(&GOOD.replace("image = \"shell\"", "image = \"tv\""), "x").is_err());
         let bad = |from: &str, to: &str| {
@@ -826,13 +859,28 @@ files = [
             validate(&p, "x").unwrap_err()
         };
         assert!(bad("release = \"1\"", "release = \"1a\"").contains("release"));
-        assert!(bad("summary = \"A demonstration\"", &format!("summary = \"{}\"", "x".repeat(81))).contains("summary"));
-        assert!(bad("summary = \"A demonstration\"", "summary = \"caf\u{e9}\"").contains("summary"));
+        assert!(
+            bad(
+                "summary = \"A demonstration\"",
+                &format!("summary = \"{}\"", "x".repeat(81))
+            )
+            .contains("summary")
+        );
+        assert!(
+            bad("summary = \"A demonstration\"", "summary = \"caf\u{e9}\"").contains("summary")
+        );
         assert!(bad("build = ", "needs = [\"sound\"]\nbuild = ").contains("needs"));
         assert!(bad("build = ", "notices = [\"LICENSE = tree:x\"]\nbuild = ").contains("notice"));
         assert!(bad("build = ", "notices = [\"A = target:../x\"]\nbuild = ").contains("notice"));
         assert!(bad("build = ", "notices = [\"A = elsewhere:x\"]\nbuild = ").contains("notice"));
-        let ok = parse(&GOOD.replace("build = ", "notices = [\"A = target:x/y\", \"B = tree:z\"]\nbuild = "), "x").unwrap();
+        let ok = parse(
+            &GOOD.replace(
+                "build = ",
+                "notices = [\"A = target:x/y\", \"B = tree:z\"]\nbuild = ",
+            ),
+            "x",
+        )
+        .unwrap();
         validate(&ok, "x").unwrap();
         assert_eq!(ok.notices[1], ("B".into(), "tree:z".into()));
     }
@@ -912,7 +960,10 @@ files = [
         let mut base = with("base", Kind::Base, Image::Shell);
         let other = with("other", Kind::Optional, Image::Shell);
         base.depends = vec!["other".into()];
-        assert!(refused(&[base.clone(), other.clone()]).contains("base package depends on the optional"));
+        assert!(
+            refused(&[base.clone(), other.clone()])
+                .contains("base package depends on the optional")
+        );
         // An optional package never names a base package.
         let mut opt = other;
         base.depends.clear();
@@ -1000,9 +1051,16 @@ files = [
     #[test]
     fn the_network_packages_and_fstack_stay_where_the_note_puts_them() {
         let shell = of_image("boot-ash-dialog.img").unwrap();
-        assert!(shell.iter().all(|p| !matches!(p.group(), Group::Net | Group::Fstack)));
+        assert!(
+            shell
+                .iter()
+                .all(|p| !matches!(p.group(), Group::Net | Group::Fstack))
+        );
         let doom = of_image("boot-doom.img").unwrap();
-        assert!(doom.iter().all(|p| !matches!(p.group(), Group::Net | Group::Fstack)));
+        assert!(
+            doom.iter()
+                .all(|p| !matches!(p.group(), Group::Net | Group::Fstack))
+        );
         let net = of_image("boot-net.img").unwrap();
         for name in ["openssl", "curl", "ca-bundle", "f-stack"] {
             assert!(net.iter().any(|p| p.name == name), "{name}");

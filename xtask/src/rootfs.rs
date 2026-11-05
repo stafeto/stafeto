@@ -313,7 +313,7 @@ const SYSTEM_PATHS: [&str; 49] = [
 
 /// Whether the base system owns `path`: the paths above and the device
 /// nodes below /dev.
-fn is_system(path: &str) -> bool {
+pub fn is_system(path: &str) -> bool {
     SYSTEM_PATHS.contains(&path)
         || path.starts_with("/dev/")
         // The sets W1 and W2 of the load, in the image of the measurement

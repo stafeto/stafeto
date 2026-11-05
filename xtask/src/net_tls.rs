@@ -168,10 +168,7 @@ pub fn terms_files(
         let url = packages::value("openssl", "url")?;
         let line = std::fs::read_to_string(crate::target_dir().join("openssl/configure-line.txt"))
             .map_err(|e| format!("openssl/configure-line.txt: {e}: tools/build-openssl.py"))?;
-        files.push((
-            OPENSSL_LICENSE,
-            crate::notices::licence_text("openssl")?,
-        ));
+        files.push((OPENSSL_LICENSE, crate::notices::licence_text("openssl")?));
         files.push((
             OPENSSL_SOURCE,
             format!(
@@ -194,10 +191,7 @@ pub fn terms_files(
         let version = packages::value("curl", "version")?;
         let sha256 = packages::value("curl", "sha256")?;
         let url = packages::value("curl", "url")?;
-        files.push((
-            CURL_LICENSE,
-            crate::notices::licence_text("curl")?,
-        ));
+        files.push((CURL_LICENSE, crate::notices::licence_text("curl")?));
         files.push((
             CURL_SOURCE,
             format!(
@@ -222,7 +216,10 @@ pub fn terms_files(
             .split(|&b| b == b'\n')
             .filter(|l| l.starts_with(b"-----BEGIN CERTIFICATE-----"))
             .count();
-        files.push((CA_BUNDLE_LICENSE, crate::notices::licence_text("ca-bundle")?));
+        files.push((
+            CA_BUNDLE_LICENSE,
+            crate::notices::licence_text("ca-bundle")?,
+        ));
         files.push((
             CA_BUNDLE_SOURCE,
             format!(

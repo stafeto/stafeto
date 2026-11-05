@@ -46,7 +46,8 @@ fn role_name(name: &str, role: Role) -> bool {
     let word = role.word();
     let tail = |marker: String| name.rfind(&marker).map(|at| &name[at + marker.len()..]);
     let plain = name.ends_with(&format!("-{word}")) && name.len() > word.len() + 1;
-    let numbered = tail(format!("-{word}-")).is_some_and(|t| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()));
+    let numbered = tail(format!("-{word}-"))
+        .is_some_and(|t| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()));
     plain || numbered
 }
 
@@ -58,8 +59,12 @@ fn default_dir() -> Result<PathBuf, String> {
 /// Refuses a directory inside the working tree other than under
 /// `target/keys`.
 fn check_dir(dir: &Path, root: &Path) -> Result<(), String> {
-    let dir = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
-    let root = root.canonicalize().map_err(|e| format!("{}: {e}", root.display()))?;
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", dir.display()))?;
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", root.display()))?;
     if dir.starts_with(&root) && !dir.starts_with(root.join("target").join("keys")) {
         return Err(format!(
             "{}: a private key does not go into the working tree outside target/keys",
@@ -72,7 +77,9 @@ fn check_dir(dir: &Path, root: &Path) -> Result<(), String> {
 fn random_seed() -> Result<[u8; 32], String> {
     let mut seed = [0u8; 32];
     let mut f = fs::File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?;
-    let n = f.read(&mut seed).map_err(|e| format!("/dev/urandom: {e}"))?;
+    let n = f
+        .read(&mut seed)
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
     if n != seed.len() {
         return Err(format!("/dev/urandom gave {n} bytes of {}", seed.len()));
     }
@@ -86,7 +93,8 @@ fn create_new(path: &Path, mode: u32, data: &[u8]) -> Result<(), String> {
         .mode(mode)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    f.write_all(data).map_err(|e| format!("{}: {e}", path.display()))
+    f.write_all(data)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A new key pair in `dir` (created with mode 0700 if missing); the public
@@ -115,6 +123,126 @@ pub fn generate(role: Role, name: &str, dir: &Path, root: &Path) -> Result<Strin
     let line = keyfile::public_line(&pair);
     create_new(&dir.join(format!("{name}.pub")), 0o644, line.as_bytes())?;
     Ok(line)
+}
+
+/// The development pair `name` in `dir`, made if it does not exist yet; its
+/// seed and key.
+pub fn load_or_generate(
+    role: Role,
+    name: &str,
+    dir: &Path,
+    root: &Path,
+) -> Result<([u8; 32], Key), String> {
+    if !dir.join(format!("{name}.key")).exists() {
+        generate(role, name, dir, root)?;
+    }
+    let seed = read_private(&dir.join(format!("{name}.key")))?;
+    let key = Key {
+        name: Name::new(name).map_err(|_| format!("{name}: not a key name"))?,
+        public: sig::public_key(&seed),
+    };
+    Ok((seed, key))
+}
+
+/// The keys of the development builds in `target/keys/`: a root and a
+/// release key with a certificate from the root, made on first use and
+/// renewed when the certificate is gone or over.
+pub struct DevKeys {
+    pub root_seed: [u8; 32],
+    pub root: Key,
+    pub release_seed: [u8; 32],
+    pub release: Key,
+    pub certificate: [u8; cert::SIZE],
+}
+
+pub fn dev_keys(tree: &Path) -> Result<DevKeys, String> {
+    let dir = tree.join("target").join("keys");
+    let (root_seed, root) = load_or_generate(Role::Root, "stafeto-dev-root", &dir, tree)?;
+    let (release_seed, release) =
+        load_or_generate(Role::Release, "stafeto-dev-release", &dir, tree)?;
+    let path = dir.join("stafeto-dev-release.cert");
+    let usable = |c: &Certificate| {
+        c.key == release.name && c.check_signature(&root.public) && c.not_after > now() + DAY
+    };
+    let current = fs::read(&path)
+        .ok()
+        .and_then(|b| Certificate::parse(&b).ok())
+        .filter(usable);
+    let certificate = match current {
+        Some(c) => c,
+        None => {
+            let from = now() / DAY * DAY;
+            let c = Certificate::issue(
+                &root_seed,
+                root.name,
+                release.name,
+                release.public,
+                cert::PURPOSE_PACKAGES,
+                from,
+                from + DEFAULT_DAYS * DAY,
+            );
+            let temp = path.with_extension("cert.tmp");
+            let _ = fs::remove_file(&temp);
+            create_new(&temp, 0o644, &c.to_bytes())?;
+            fs::rename(&temp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+            c
+        }
+    };
+    Ok(DevKeys {
+        root_seed,
+        root,
+        release_seed,
+        release,
+        certificate: certificate.to_bytes(),
+    })
+}
+
+/// The key to sign with: `--key K.key --cert K.cert` when given, else the
+/// development release key.
+pub struct Signing {
+    pub seed: [u8; 32],
+    pub key: Name,
+    pub certificate: Option<[u8; cert::SIZE]>,
+}
+
+pub fn signing(
+    key: Option<&Path>,
+    certificate: Option<&Path>,
+    tree: &Path,
+) -> Result<Signing, String> {
+    match (key, certificate) {
+        (Some(key), cert_path) => {
+            let name = key
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| Name::new(s).ok())
+                .ok_or_else(|| format!("{}: not a key file name", key.display()))?;
+            let certificate = match cert_path {
+                Some(p) => {
+                    let bytes = fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+                    Certificate::parse(&bytes).map_err(|e| format!("{}: {e}", p.display()))?;
+                    let mut out = [0u8; cert::SIZE];
+                    out.copy_from_slice(&bytes);
+                    Some(out)
+                }
+                None => None,
+            };
+            Ok(Signing {
+                seed: read_private(key)?,
+                key: name,
+                certificate,
+            })
+        }
+        (None, Some(_)) => Err("--cert comes with --key".into()),
+        (None, None) => {
+            let dev = dev_keys(tree)?;
+            Ok(Signing {
+                seed: dev.release_seed,
+                key: dev.release.name,
+                certificate: Some(dev.certificate),
+            })
+        }
+    }
 }
 
 fn read_private(path: &Path) -> Result<[u8; 32], String> {
@@ -177,7 +305,9 @@ fn purpose_words(bits: u32) -> String {
 
 fn instant(secs: u64) -> String {
     let mut buf = [0u8; time::TEXT_LEN];
-    time::format(secs, &mut buf).unwrap_or("out of range").to_string()
+    time::format(secs, &mut buf)
+        .unwrap_or("out of range")
+        .to_string()
 }
 
 pub struct Certify {
@@ -192,10 +322,17 @@ pub struct Certify {
 /// Writes the certificate of `Certify::key` signed by `Certify::root_key`;
 /// the path and a summary.
 pub fn certify(c: &Certify, tree: &Path) -> Result<(PathBuf, String), String> {
-    let stem = c.root_key.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let issuer = Name::new(stem).map_err(|_| format!("{}: not a key file name", c.root_key.display()))?;
+    let stem = c
+        .root_key
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let issuer =
+        Name::new(stem).map_err(|_| format!("{}: not a key file name", c.root_key.display()))?;
     if !role_name(stem, Role::Root) {
-        return Err(format!("{stem}: the issuer is a root key, named ...-root or ...-root-N"));
+        return Err(format!(
+            "{stem}: the issuer is a root key, named ...-root or ...-root-N"
+        ));
     }
     let seed = read_private(&c.root_key)?;
     let public = sig::public_key(&seed);
@@ -203,16 +340,27 @@ pub fn certify(c: &Certify, tree: &Path) -> Result<(PathBuf, String), String> {
     if official.is_file() {
         let key = read_public(&official)?;
         if key.public != public {
-            return Err(format!("{}: the private key is not the one that keys/{stem}.pub names", c.root_key.display()));
+            return Err(format!(
+                "{}: the private key is not the one that keys/{stem}.pub names",
+                c.root_key.display()
+            ));
         }
     }
     let key = read_public(&c.key)?;
     if !role_name(key.name.as_str(), Role::Release) {
-        return Err(format!("{}: the certified key is a release key", key.name.as_str()));
+        return Err(format!(
+            "{}: the certified key is a release key",
+            key.name.as_str()
+        ));
     }
     let not_after = c.from + c.days * DAY;
-    let cert = Certificate::issue(&seed, issuer, key.name, key.public, c.purposes, c.from, not_after);
-    let path = c.out.clone().unwrap_or_else(|| c.key.with_extension("cert"));
+    let cert = Certificate::issue(
+        &seed, issuer, key.name, key.public, c.purposes, c.from, not_after,
+    );
+    let path = c
+        .out
+        .clone()
+        .unwrap_or_else(|| c.key.with_extension("cert"));
     let temp = path.with_extension("cert.tmp");
     let _ = fs::remove_file(&temp);
     create_new(&temp, 0o644, &cert.to_bytes())?;
@@ -232,17 +380,24 @@ pub fn certify(c: &Certify, tree: &Path) -> Result<(PathBuf, String), String> {
 pub fn show(path: &Path) -> Result<String, String> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "key" {
-        return Err(format!("{}: a private key; show does not open it", path.display()));
+        return Err(format!(
+            "{}: a private key; show does not open it",
+            path.display()
+        ));
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let fail = |e: pkgfmt::Error| format!("{}: {e}", path.display());
     match ext {
         "pub" => {
-            let k = pkgfmt::keyfile::parse_public(std::str::from_utf8(&bytes).map_err(|_| format!("{}: not text", path.display()))?)
-                .map_err(fail)?;
+            let k = pkgfmt::keyfile::parse_public(
+                std::str::from_utf8(&bytes).map_err(|_| format!("{}: not text", path.display()))?,
+            )
+            .map_err(fail)?;
             Ok(format!("public key {}", k.name.as_str()))
         }
-        "cert" => Ok(describe_certificate(&Certificate::parse(&bytes).map_err(fail)?)),
+        "cert" => Ok(describe_certificate(
+            &Certificate::parse(&bytes).map_err(fail)?,
+        )),
         "sig" => Ok(describe_block(&pkgfmt::Block::parse(&bytes).map_err(fail)?)),
         "stpkg" => {
             if bytes.len() < pkgfmt::container::TRAILER_SIZE {
@@ -251,7 +406,10 @@ pub fn show(path: &Path) -> Result<String, String> {
             let tail = &bytes[bytes.len() - pkgfmt::container::TRAILER_SIZE..];
             Ok(describe_block(&pkgfmt::Block::parse(tail).map_err(fail)?))
         }
-        other => Err(format!("{}: .{other} is not a .pub, .cert, .sig or .stpkg file", path.display())),
+        other => Err(format!(
+            "{}: .{other} is not a .pub, .cert, .sig or .stpkg file",
+            path.display()
+        )),
     }
 }
 
@@ -320,7 +478,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let tree = crate::root();
     match args.first().map(String::as_str) {
         Some(word @ ("root" | "release")) => {
-            let role = if word == "root" { Role::Root } else { Role::Release };
+            let role = if word == "root" {
+                Role::Root
+            } else {
+                Role::Release
+            };
             let name = args.get(1).ok_or_else(usage)?;
             only_known(&args[2..], &["--dir"])?;
             let dir = match option(&args[2..], "--dir")? {
@@ -332,16 +494,22 @@ pub fn command(args: &[String]) -> Result<(), String> {
         }
         Some("certify") => {
             let rest = &args[1..];
-            only_known(rest, &["--root", "--key", "--purpose", "--from", "--days", "--out"])?;
+            only_known(
+                rest,
+                &["--root", "--key", "--purpose", "--from", "--days", "--out"],
+            )?;
             let root_key = option(rest, "--root")?.ok_or_else(usage)?;
             let key = option(rest, "--key")?.ok_or_else(usage)?;
-            let purposes = purposes_of(&option(rest, "--purpose")?.unwrap_or_else(|| "packages".into()))?;
+            let purposes =
+                purposes_of(&option(rest, "--purpose")?.unwrap_or_else(|| "packages".into()))?;
             let from = match option(rest, "--from")? {
                 Some(d) => day_start(&d).ok_or_else(|| format!("{d}: not a date YYYY-MM-DD"))?,
                 None => now() / DAY * DAY,
             };
             let days = match option(rest, "--days")? {
-                Some(d) => d.parse().map_err(|_| format!("{d}: not a number of days"))?,
+                Some(d) => d
+                    .parse()
+                    .map_err(|_| format!("{d}: not a number of days"))?,
                 None => DEFAULT_DAYS,
             };
             let (path, summary) = certify(
@@ -374,8 +542,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// RFC 8410, section 10.3, and its public half.
-    const RFC8410_PEM: &str =
-        "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
+    const RFC8410_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
     const RFC8410_PUBLIC: &str = "Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=";
 
     fn scratch(tag: &str) -> PathBuf {
@@ -405,7 +572,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, dir.join("t-release.cert"));
-        assert!(summary.contains("2026-11-05T00:00:00Z to 2027-12-06T00:00:00Z"), "{summary}");
+        assert!(
+            summary.contains("2026-11-05T00:00:00Z to 2027-12-06T00:00:00Z"),
+            "{summary}"
+        );
         let cert = Certificate::parse(&fs::read(&path).unwrap()).unwrap();
         let mut buf = [0u8; 44];
         let root_public = sig::public_key(&keyfile::parse_private(RFC8410_PEM).unwrap());
@@ -415,13 +585,38 @@ mod tests {
         assert_eq!(cert.not_after - cert.not_before, 396 * DAY);
         // The certificate verifies a block of the release key against the root.
         let seed = read_private(&dir.join("t-release.key")).unwrap();
-        let block = Block::sign(&seed, Kind::Package, 1, [0; 32], day_start("2026-11-06").unwrap(), cert.key, Some(cert.to_bytes()));
-        let roots = [Key { name: cert.issuer, public: root_public }];
-        let signer = trust::verify(&block, Kind::Package, &[0; 32], 1, &Trust { roots: &roots, direct: &[] }, &[]).unwrap();
+        let block = Block::sign(
+            &seed,
+            Kind::Package,
+            1,
+            [0; 32],
+            day_start("2026-11-06").unwrap(),
+            cert.key,
+            Some(cert.to_bytes()),
+        );
+        let roots = [Key {
+            name: cert.issuer,
+            public: root_public,
+        }];
+        let signer = trust::verify(
+            &block,
+            Kind::Package,
+            &[0; 32],
+            1,
+            &Trust {
+                roots: &roots,
+                direct: &[],
+            },
+            &[],
+        )
+        .unwrap();
         assert_eq!(signer.root, Some(cert.issuer));
         // show reads it back.
         let shown = show(&path).unwrap();
-        assert!(shown.contains("certificate of t-release for packages"), "{shown}");
+        assert!(
+            shown.contains("certificate of t-release for packages"),
+            "{shown}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -430,16 +625,34 @@ mod tests {
         let dir = scratch("pair");
         let tree = crate::root();
         let line = generate(Role::Root, "t-root-2", &dir, &tree).unwrap();
-        let mode = fs::metadata(dir.join("t-root-2.key")).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(dir.join("t-root-2.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(fs::read_to_string(dir.join("t-root-2.pub")).unwrap(), line);
         assert!(!line.contains("PRIVATE"));
         assert!(generate(Role::Root, "t-root-2", &dir, &tree).is_err());
-        for (role, name) in [(Role::Root, "t-release"), (Role::Release, "t-root"), (Role::Release, "x"), (Role::Root, "Bad-root"), (Role::Root, "t-root-x")] {
+        for (role, name) in [
+            (Role::Root, "t-release"),
+            (Role::Release, "t-root"),
+            (Role::Release, "x"),
+            (Role::Root, "Bad-root"),
+            (Role::Root, "t-root-x"),
+        ] {
             assert!(generate(role, name, &dir, &tree).is_err(), "{name}");
         }
-        assert!(show(&dir.join("t-root-2.key")).unwrap_err().contains("does not open"));
-        assert!(show(&dir.join("t-root-2.pub")).unwrap().contains("t-root-2"));
+        assert!(
+            show(&dir.join("t-root-2.key"))
+                .unwrap_err()
+                .contains("does not open")
+        );
+        assert!(
+            show(&dir.join("t-root-2.pub"))
+                .unwrap()
+                .contains("t-root-2")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -480,10 +693,17 @@ mod tests {
         c.root_key = dir.join("t-release.key");
         assert!(certify(&c, &tree).is_err());
         // A private key that is not unencrypted PKCS#8.
-        fs::write(dir.join("enc-root.key"), "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n").unwrap();
+        fs::write(
+            dir.join("enc-root.key"),
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+        )
+        .unwrap();
         c.root_key = dir.join("enc-root.key");
         let err = certify(&c, &tree).unwrap_err();
-        assert!(err.contains("not an unencrypted PKCS#8 Ed25519 key; convert it with openssl pkey"), "{err}");
+        assert!(
+            err.contains("not an unencrypted PKCS#8 Ed25519 key; convert it with openssl pkey"),
+            "{err}"
+        );
         // A public line that names another key than its file.
         fs::copy(dir.join("t-release.pub"), dir.join("other-release.pub")).unwrap();
         c.root_key = dir.join("t-root.key");
