@@ -131,7 +131,7 @@ impl Fault {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Item {
     pub candidate: usize,
-    /// Installed by request (the requested one), not as a dependency.
+    /// Installed by request: the requested package (the dependencies are marked as dependencies).
     pub world: bool,
 }
 
@@ -257,6 +257,48 @@ impl Walk<'_> {
                 short(&c.version)
             ));
         }
+    }
+}
+
+/// A step of receiving a group: the package, whether it is of the world, and whether it is the
+/// last of the group (the service attaches the whole group at the end of the last).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub candidate: usize,
+    pub world: bool,
+    pub end: bool,
+}
+
+/// The steps of a plan: one group, which ends at the last package.
+pub fn steps(items: &[Item]) -> Vec<Step> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(n, i)| Step {
+            candidate: i.candidate,
+            world: i.world,
+            end: n + 1 == items.len(),
+        })
+        .collect()
+}
+
+/// The version a package's `meta` names: the index says `<version>-<release>`, the service compares
+/// the version of the record with the `version` line of `meta`, which has no release.
+pub fn meta_version(version: &str) -> &str {
+    version.rsplit_once('-').map_or(version, |(v, _)| v)
+}
+
+/// The record INSTALL_BEGIN carries for `c`: what the index says of the package (never what
+/// was received: the service compares the bytes with it), the repository it comes from, and
+/// the mark of the world for the requested package.
+pub fn begin(c: &Candidate, world: bool) -> proto_pkg::Begin<'_> {
+    proto_pkg::Begin {
+        name: c.name.as_bytes(),
+        version: meta_version(&c.version).as_bytes(),
+        size: c.size,
+        sha256: c.sha256,
+        repository: c.repository.as_bytes(),
+        flags: if world { proto_pkg::BEGIN_WORLD } else { 0 },
     }
 }
 
@@ -557,6 +599,60 @@ mod tests {
             install("nowhere/hello", &pool, &[]).unwrap_err().line(),
             "pkg: nowhere: no such repository"
         );
+    }
+
+    #[test]
+    fn a_plan_is_one_group_that_ends_at_its_last_package() {
+        let pool = doom_pool();
+        let Outcome::Install { items, .. } = install("doom", &pool, &[]).unwrap() else {
+            panic!("an installation");
+        };
+        let steps = steps(&items);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps.iter().map(|s| (s.world, s.end)).collect::<Vec<_>>(),
+            [(false, false), (true, true)]
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.end).count(),
+            1,
+            "one end for the group"
+        );
+        // A group of one package ends at it.
+        let one = [Item {
+            candidate: 2,
+            world: true,
+        }];
+        assert_eq!(super::steps(&one)[0].end, true);
+    }
+
+    #[test]
+    fn the_version_of_meta_has_no_release() {
+        assert_eq!(meta_version("2.0-1"), "2.0");
+        assert_eq!(
+            meta_version("e257a09527062bfb986b6e5e0780839b6cbd5b71-1"),
+            "e257a09527062bfb986b6e5e0780839b6cbd5b71"
+        );
+        // A version that has dashes keeps them but for the release.
+        assert_eq!(meta_version("2026-10-20-1"), "2026-10-20");
+        assert_eq!(meta_version("1.0"), "1.0");
+    }
+
+    #[test]
+    fn begin_carries_the_record_of_the_index() {
+        let mut hello = c("games", "hello", &[], &[]);
+        hello.version = "2.0-1".into();
+        hello.size = 4096;
+        hello.sha256 = [7; 32];
+        let record = begin(&hello, true);
+        assert_eq!(record.name, b"hello");
+        // The version of `meta`, with no release.
+        assert_eq!(record.version, b"2.0");
+        assert_eq!(record.size, 4096);
+        assert_eq!(record.sha256, [7; 32]);
+        assert_eq!(record.repository, b"games");
+        assert_eq!(record.flags, proto_pkg::BEGIN_WORLD);
+        assert_eq!(begin(&hello, false).flags, 0);
     }
 
     #[test]

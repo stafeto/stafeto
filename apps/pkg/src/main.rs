@@ -386,6 +386,9 @@ impl Tool {
                 continue;
             };
             if let Ok(meta) = pkgfmt::meta::Meta::parse(&text) {
+                // The record of the store has the version of `meta`; the index and the lines
+                // of `pkg` say `<version>-<release>`.
+                i.version = format!("{}-{}", meta.version, meta.release);
                 i.provides = pkgfmt::meta::list(meta.provides)
                     .map(String::from)
                     .collect();
@@ -463,13 +466,14 @@ impl Tool {
             }
         }
         let mut last = None;
-        for (n, (c, world)) in chosen.iter().enumerate() {
+        for step in resolve::steps(&items) {
+            let c = &pool[step.candidate];
             let repo = fresh
                 .iter()
                 .find(|f| f.repository.name == c.repository)
                 .map(|f| &f.repository)
                 .ok_or_else(|| format!("pkg: {}: no such repository", c.repository))?;
-            if let Err(line) = self.receive(c, repo, *world, n + 1 == chosen.len(), &mut last) {
+            if let Err(line) = self.receive(c, repo, step, &mut last) {
                 if let Some(receipt) = last {
                     self.client.cancel(receipt);
                 }
@@ -490,8 +494,7 @@ impl Tool {
         &self,
         c: &Candidate,
         repo: &Repository,
-        world: bool,
-        end: bool,
+        step: resolve::Step,
         last: &mut Option<u32>,
     ) -> Result<(), Line> {
         let url = config::locate(&repo.address, &c.file).map_err(|_| {
@@ -511,14 +514,7 @@ impl Tool {
             repository: &repo.name,
             ..Detail::default()
         };
-        let record = p::Begin {
-            name: c.name.as_bytes(),
-            version: c.version.as_bytes(),
-            size: c.size,
-            sha256: c.sha256,
-            repository: repo.name.as_bytes(),
-            flags: if world { p::BEGIN_WORLD } else { 0 },
-        };
+        let record = resolve::begin(c, step.world);
         let receipt = self.client.begin(&record).map_err(|s| {
             sys::out("failed");
             self.refusal(s, &c.name, &detail)
@@ -528,7 +524,7 @@ impl Tool {
             sys::out("failed");
             return Err(line);
         }
-        self.client.commit(receipt, end).map_err(|s| {
+        self.client.commit(receipt, step.end).map_err(|s| {
             sys::out("failed");
             self.refusal(s, &c.name, &detail)
         })?;

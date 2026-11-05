@@ -142,8 +142,8 @@ pub struct Revocations {
     pub entries: alloc::vec::Vec<Revocation>,
 }
 
-/// The list `list` signed by `sig`: by one of the `roots`, not by a certified
-/// key and not by a key of an owner.
+/// The list `list` signed by `sig`: by one of the `roots` (a certified key or a key of an
+/// owner never signs a list).
 pub fn revocations(list: &[u8], sig: &[u8], roots: &[Key]) -> Result<Revocations, Fault> {
     block_of(list, sig, Kind::Revoked, &Trust { roots, direct: &[] }, &[])?;
     let text = core::str::from_utf8(list).map_err(|_| Fault::Malformed(1))?;
