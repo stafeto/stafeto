@@ -201,6 +201,16 @@ impl<T> Loaders<T> {
         self.room() && own < LOADERS_OF_PARENT
     }
 
+    /// Whether the place of `record` is committed and its loader has not
+    /// taken: a stop of the record waits for the Take, so that a stopped
+    /// record does not hold its place (and the pool of places) for as long
+    /// as the stop lasts.
+    pub fn waits_for_take(&self, record: usize) -> bool {
+        self.of(record)
+            .and_then(|slot| self.get(slot))
+            .is_some_and(|p| p.stage == Stage::Ready)
+    }
+
     /// A place for the loader of the record in `record`, a child of the
     /// record in `parent`, image `image`: Booting, one generation on. None
     /// with every place taken, when the parent has LOADERS_OF_PARENT, or
@@ -550,6 +560,34 @@ mod tests {
         assert!(t.take(51, 7, 1, ()).is_some());
         assert!(!t.room_for(7), "two uncommitted places");
         assert_eq!(t.take(52, 7, 1, ()), None);
+    }
+
+    /// A stop waits for Take only while the place is committed: a place
+    /// that loads stops at once or by the commit's own rule, and a record
+    /// without a place stops at once. Taking the place of every committed
+    /// record out of the stop is what keeps one parent from freezing all
+    /// the places.
+    #[test]
+    fn a_stop_waits_for_take_only_in_a_committed_place() {
+        let mut t = Loaders::<()>::new();
+        assert!(!t.waits_for_take(1), "no place");
+        for record in 1..=LOADERS {
+            let parent = 100 + record;
+            assert!(t.take(record, parent, 1, ()).is_some());
+            assert!(!t.waits_for_take(record), "booting");
+            t.get_mut(t.of(record).unwrap()).unwrap().stage = Stage::Loaded;
+            assert!(!t.waits_for_take(record), "loaded");
+            t.commit(record).unwrap();
+            assert!(t.waits_for_take(record), "committed");
+        }
+        // Every place is committed and waits for its Take: with the stops
+        // deferred, each one frees at its loader's Take, and the pool opens.
+        assert!(!t.room());
+        for record in 1..=LOADERS {
+            t.free(record).unwrap();
+            assert!(!t.waits_for_take(record), "taken");
+        }
+        assert!(t.room());
     }
 
     /// SetId is kept once, for the record and image of its place, while it

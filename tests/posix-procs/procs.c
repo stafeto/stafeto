@@ -418,6 +418,23 @@ static void kills(pid_t sleeper) {
     expect("SIGKILL", kill(blocker, SIGKILL), 0);
     reap("the blocker after SIGKILL", blocker, 0, SIGKILL);
 
+    /* A stop right after the spawn waits for the loader's Take, so children
+     * stopped one after the other never hold the pool of loader places
+     * (16): twenty spawns of one parent all succeed. */
+    pid_t frozen[20];
+    int made = 0;
+    for (int i = 0; i < 20; i++) {
+        frozen[i] = start("sleep");
+        if (frozen[i] < 0) break;
+        made++;
+        if (kill(frozen[i], SIGSTOP) != 0) failures++;
+    }
+    expect("twenty spawns stopped at once", made, 20);
+    for (int i = 0; i < made; i++) {
+        kill(frozen[i], SIGKILL);
+        reap("a child stopped at once", frozen[i], 0, SIGKILL);
+    }
+
     pid_t catcher = -1;
     expect("the catcher", spawn_catcher(&catcher, 0), 0);
     expect("kill of the catcher", kill(catcher, SIGUSR1), 0);

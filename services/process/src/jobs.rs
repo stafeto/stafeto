@@ -37,13 +37,40 @@ impl Processes {
         if matches!(r.state, State::Zombie(_)) || r.stopped.is_some() {
             return;
         }
-        let loading = r.state == State::Loading;
-        if !loading && sys::process_control(&r.process, true, r.ceiling).is_err() {
+        // A record whose loader has not taken its program yet (LOADING, or
+        // Ready and waiting for Take) stops when the loader has: its loader
+        // is a thread of the process, and a stopped one would hold its
+        // place for as long as the stop lasts.
+        let deferred = r.state == State::Loading || self.waits_for_take(target);
+        if !deferred && sys::process_control(&r.process, true, r.ceiling).is_err() {
             return;
         }
         self.records.set_stopped(target, Some(signal));
-        if !loading {
+        self.records.get_mut(target).expect("a stop target").deferred_stop = deferred;
+        if !deferred {
             self.child_report(target, Some(signal))
+        }
+    }
+
+    /// Whether the loader of the record in `index` has its commit and has
+    /// not taken yet: its place is Ready.
+    fn waits_for_take(&self, index: usize) -> bool {
+        self.loaders.waits_for_take(index)
+    }
+
+    /// The stop that waited for Take takes effect: the loader took its
+    /// program and its place is free.
+    pub(super) fn apply_deferred_stop(&mut self, child: usize) {
+        let Some(r) = self.records.get_mut(child) else {
+            return;
+        };
+        let Some(signal) = r.stopped else {
+            return;
+        };
+        let report = core::mem::take(&mut r.deferred_stop);
+        let _ = sys::process_control(&r.process, true, r.ceiling);
+        if report {
+            self.child_report(child, Some(signal));
         }
     }
 
@@ -52,12 +79,13 @@ impl Processes {
         if matches!(r.state, State::Zombie(_)) || r.stopped.is_none() {
             return;
         }
-        let loading = r.state == State::Loading;
-        if !loading && sys::process_control(&r.process, false, r.ceiling).is_err() {
+        let deferred = r.deferred_stop;
+        if !deferred && sys::process_control(&r.process, false, r.ceiling).is_err() {
             return;
         }
         self.records.set_stopped(target, None);
-        if !loading {
+        self.records.get_mut(target).expect("a continue target").deferred_stop = false;
+        if !deferred {
             self.child_report(target, None)
         }
     }

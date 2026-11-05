@@ -559,6 +559,13 @@ pub mod account_op {
     /// user 0 (`PERMISSION` to another); `PERMISSION` also for a process
     /// the caller could not send a signal to.
     pub const PROCESS_TIME: u32 = 5;
+    /// ticks u64, kernel u64 -> status. The child of a fork says how much
+    /// its process had run, and how much of it in the kernel, when it bound
+    /// its layer: the work of its loader. The service leaves that out of
+    /// the account it keeps (the CPU-time clock of the process for its
+    /// parent, the children's time after a wait, the process list). Taken
+    /// once, and no more than the process has run.
+    pub const FORK_BASE: u32 = 6;
 }
 
 /// SIGQUEUE_MAX: the occurrences sent by sigqueue that wait for one process

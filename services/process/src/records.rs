@@ -138,6 +138,13 @@ pub struct Record<P> {
     /// (system time; the rest of each is user time).
     pub carried_kernel: u64,
     pub children_kernel: u64,
+    /// The counter ticks, and the part of them in the kernel, the process of
+    /// a child of fork had run when it bound its layer: the work of its
+    /// loader, which its own account leaves out.
+    pub base_ticks: u64,
+    pub base_kernel: u64,
+    /// The stop in `stopped` waits for the Take of the record's loader.
+    pub deferred_stop: bool,
     /// The CPU its main thread was put on (`Processes::place`).
     pub cpu: u8,
     /// The CPUs its process runs on (kernel spec 8, process_create x8):
@@ -545,6 +552,9 @@ impl<P> Records<P> {
             children_ticks: 0,
             carried_kernel: 0,
             children_kernel: 0,
+            base_ticks: 0,
+            base_kernel: 0,
+            deferred_stop: false,
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,
