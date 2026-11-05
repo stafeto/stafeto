@@ -330,6 +330,36 @@ link programs (for a package with programs) and `build-depends <name>
    features) to `PACKAGE_PROGRAMS` in `xtask/src/main.rs`.
 4. Run `cargo xtask packages`, then `cargo xtask packages table`.
 
+## Layers in the RAM file service
+
+A package file shows its table `rootfs` as names of the tree of the RAM file service, a layer.
+Attaching and detaching go through the layer session (`proto_fs::LAYERS`), which init gives to
+the one client of `table::LAYER_CLIENTS` that asks for the name `ramfs/layers`. The session
+carries `LayerStart` (method 51, with the operation, the layer number and the level the mapping
+thread works at) and `LayerStep` (method 53) and nothing else; any other session that sends
+them gets PERMISSION. Protocol version 20 adds the codes `CONFLICT` (a path is taken),
+`BAD_LAYER` (the table or the container breaks a rule) and `BAD_MODE` (a set-ID, set-GID or
+sticky bit, or an owner other than 0:0); the answer names the entry of the table.
+
+An attach takes two descriptors, a memory object with read access and no write access and a
+channel with NOTIFY, and runs in phases of bounded steps: the mapping (a thread of the service
+maps the object, so no other client waits for it), the check of the table without any visible
+change, and the insertion of the names, with a rollback on a conflict. A detach takes the names
+out in the opposite order. A file that is still open, or a program that is loading, holds its
+place: the open file reads to the end (it behaves as a deleted open file, `st_nlink` 0), and the
+layer is unmapped and its client told with `notify(channel, 1)` only when the last holder has
+let go. The names and the attributes of a layer are read-only (EROFS); a directory a layer
+brings takes files of users, and a directory whose path exists is merged without changing it.
+
+The limits: 64 layers, 4 096 entries in all layers, 1 024 in one, 256 directories that layers
+create and no other name had. A step takes at most 16 entries of the check (512 bytes of
+paths), 4 of the insertion (256 bytes of names, 1 link of a name chain) and 8 of the detach
+(256 bytes of names); `cargo xtask layer-probe steps` checks that the longest step of the
+service stays under 0.9 B and the longest layer step under 0.8 B on layers with paths of 511
+bytes, names of 255 bytes in one bucket and 1 023 short names. The files of the boot image that
+end in `.stpkg` are attached before the service registers, as layers 0x8000 and up that cannot
+be detached.
+
 ## What stays for subproject 5
 
 Installing and removing packages in a running system, the store and delivery
