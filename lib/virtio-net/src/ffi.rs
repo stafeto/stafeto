@@ -371,6 +371,13 @@ pub extern "C" fn vnet_buf_take() -> u32 {
     pool().take().unwrap_or(NONE)
 }
 
+/// How many buffers the pool holds free: the program's measure for how
+/// many frames it may keep without a copy.
+#[unsafe(no_mangle)]
+pub extern "C" fn vnet_buf_free() -> u32 {
+    pool().free_len as u32
+}
+
 /// Where the frame of buffer `buf` starts (after the Virtio header).
 #[unsafe(no_mangle)]
 pub extern "C" fn vnet_buf_ptr(buf: u32) -> *mut c_void {
@@ -453,6 +460,13 @@ pub extern "C" fn vnet_tx_reclaim() -> c_int {
 pub extern "C" fn vnet_notify(on: c_int) {
     if let Some(s) = state() {
         s.rx.set_dev_notify(on != 0);
+        if on != 0 {
+            // A full barrier between the flag and the next look at the used
+            // index (Virtio 1.2, 2.7.10): the flag store is a release and
+            // the look an acquire, which AArch64 may reorder past each
+            // other without it.
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
     }
 }
 
@@ -586,6 +600,7 @@ mod tests {
         // The pool hands out every buffer once, the four objects in turn.
         let first: Vec<u32> = (0..4).map(|_| pool.take().unwrap()).collect();
         assert_eq!(first, [0, 2048, 4096, 6144]);
+        assert_eq!(pool.free_len, BUFFERS - 4);
         for n in first.into_iter().rev() {
             pool.give(n);
         }

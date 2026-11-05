@@ -53,19 +53,22 @@ WORK = ROOT / "target" / "f-stack"
 SOURCE = WORK / "source"
 RELIBC = ROOT / "target" / "relibc" / "sysroot"
 PORT = ROOT / "ports" / "f-stack"
+FAST_INCLUDE = ROOT / "lib" / "posix-crt" / "include"
+VNET_INCLUDE = ROOT / "lib" / "virtio-net" / "include"
 PATCH = PORT / "stafeto.patch"
 # The files of ports/f-stack that go into lib/ of the tree.
-OWN = ("ff_stafeto_if.c", "ff_stafeto_rte.h")
+OWN = ("ff_stafeto_if.c", "ff_stafeto_rte.h", "ff_stafeto.h")
 OUTPUT = WORK / "libfstack.a"
 INCLUDE = WORK / "include"
 # The headers of F-Stack a program includes, as the build without
 # thread-local storage has them: install() drops `__thread` from ff_api.h,
 # whose `pcurthread` is a plain variable in the library.
-HEADERS = ("ff_api.h", "ff_event.h", "ff_errno.h", "ff_flow_map.h")
+HEADERS = ("ff_api.h", "ff_event.h", "ff_errno.h", "ff_flow_map.h", "ff_stafeto.h")
 # The probe of the stack on its loopback (tests/fstack-probe), one object
 # with the library that exports `main` alone, for tools/build-libc-so.py
 # programs.
-PROBE_SOURCE = ROOT / "tests" / "fstack-probe" / "main.c"
+PROBE_SOURCES = (ROOT / "tests" / "fstack-probe" / "main.c",
+                 ROOT / "tests" / "fstack-probe" / "device.c")
 PROBE = WORK / "fstack-probe.o"
 # What the tree needs to build: the library, its make fragments and the
 # FreeBSD sources, with the licence and the sample settings.
@@ -124,7 +127,7 @@ def stamp_text() -> str:
     script = sha256(Path(__file__).read_bytes()).hexdigest()
     own = sha256(b"".join((PORT / name).read_bytes()
                           for name in (*OWN, "stafeto.patch", "fstack.ini")))
-    own.update(PROBE_SOURCE.read_bytes())
+    own.update(b"".join(source.read_bytes() for source in PROBE_SOURCES))
     return f"{VERSION} {SHA256} {script} {own.hexdigest()} relibc {relibc_commit()}\n"
 
 
@@ -187,7 +190,10 @@ def build(log: Path, jobs: int) -> None:
     cc = " ".join((str(clang), "--target=aarch64-linux-gnu", "-mno-outline-atomics",
                    "-fno-stack-protector", "-ffunction-sections", "-fdata-sections",
                    A53_ERRATA, "-fPIC", "-MD"))
-    host = " ".join(("-O2", "-nostdinc", f"-isystem {RELIBC / 'include'}", "-Wno-error"))
+    # The host half also reads the claim of the second device
+    # (<stafeto/fast.h>) and the library of its driver (vnet.h).
+    host = " ".join(("-O2", "-nostdinc", f"-isystem {RELIBC / 'include'}",
+                     f"-isystem {FAST_INCLUDE}", f"-isystem {VNET_INCLUDE}", "-Wno-error"))
     variables = [f"{option}=" for option in OPTIONS_OFF]
     variables += [
         "HOST_OS=stafeto", "TGT_OS=stafeto", "MACHINE_CPUARCH=arm64", "COMPILER_TYPE=clang",
@@ -227,16 +233,22 @@ def install() -> None:
 def probe(log: Path) -> None:
     """tests/fstack-probe joined with the library into one object that
     exports `main`: a name of the host layer the library keeps local is
-    missing here, and the link of the program fails."""
+    missing here, and the link of the program fails. The probe of the
+    device also reads <stafeto/fast.h> and vnet.h; the program is linked
+    with libvirtio_net.a."""
     clang, lld = tool("clang", "llvm"), tool("ld.lld", "lld")
     objcopy = tool("llvm-objcopy", "llvm")
-    main_o = WORK / "fstack-probe-main.o"
+    objects = []
+    for source in PROBE_SOURCES:
+        out = WORK / f"fstack-probe-{source.stem}.o"
+        run(log, clang, "--target=aarch64-linux-gnu", "-nostdinc", "-isystem", RELIBC / "include",
+            "-isystem", FAST_INCLUDE, "-isystem", VNET_INCLUDE,
+            "-I", INCLUDE, "-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
+            "-fdata-sections", A53_ERRATA, "-fPIC", "-fno-builtin", "-O2", "-Wall", "-Werror",
+            "-c", source, "-o", out)
+        objects.append(out)
     joined = WORK / "fstack-probe.ro"
-    run(log, clang, "--target=aarch64-linux-gnu", "-nostdinc", "-isystem", RELIBC / "include",
-        "-I", INCLUDE, "-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
-        "-fdata-sections", A53_ERRATA, "-fPIC", "-fno-builtin", "-O2", "-Wall", "-Werror",
-        "-c", PROBE_SOURCE, "-o", main_o)
-    run(log, lld, "-r", "-o", joined, main_o, OUTPUT)
+    run(log, lld, "-r", "-o", joined, *objects, OUTPUT)
     PROBE.unlink(missing_ok=True)
     run(log, objcopy, "--keep-global-symbol=main", joined, PROBE)
     joined.unlink()

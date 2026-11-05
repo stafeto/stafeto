@@ -979,7 +979,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-random") as usize
     + cfg!(feature = "table-posix-display") as usize
     + cfg!(feature = "table-display") as usize
-    + cfg!(feature = "table-fstack-probe") as usize;
+    + cfg!(feature = "table-fstack-probe") as usize
+    + cfg!(feature = "table-fstack-device") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -1038,7 +1039,8 @@ const _: () = assert!(
     feature = "table-posix-random",
     feature = "table-posix-display",
     feature = "table-display",
-    feature = "table-fstack-probe"
+    feature = "table-fstack-probe",
+    feature = "table-fstack-device"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -1141,6 +1143,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_DISPLAY_TABLE;
 pub const TABLE: &[Record] = ramfs::DISPLAY_TABLE;
 #[cfg(feature = "table-fstack-probe")]
 pub const TABLE: &[Record] = fstack::FSTACK_TABLE;
+#[cfg(feature = "table-fstack-device")]
+pub const TABLE: &[Record] = fstack::FSTACK_DEVICE_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -2260,6 +2264,10 @@ mod tests {
         assert_eq!(
             order_of(fstack::FSTACK_TABLE),
             order_of(ramfs::BUSYBOX_DIALOG_TABLE)
+        );
+        assert_eq!(
+            order_of(fstack::FSTACK_DEVICE_TABLE),
+            order_of(net::NET_TWO_TABLE)
         );
         assert_eq!(order_of(vz::TABLE), ["uart", "shell"]);
         assert_eq!(

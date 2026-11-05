@@ -92,6 +92,8 @@ table-net-probe-two = []
 table-net-two = []
 # The probe of F-Stack on its loopback (xtask fstack-probe).
 table-fstack-probe = []
+# The probe of F-Stack on the second network device (xtask fstack-probe device).
+table-fstack-device = []
 # The walk of Apple VZ's bus 0 (xtask pci-walk-vz).
 table-pci-walk-vz = []
 # The shell with the network service on Apple VZ, one and two network devices.

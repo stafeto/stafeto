@@ -395,7 +395,7 @@ def build_vnet() -> Path:
 
 
 # The functions of vnet.h.
-VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "vnet_buf_ptr",
+VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "vnet_buf_ptr", "vnet_buf_free",
               "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost",
               "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop"]
 
@@ -806,7 +806,7 @@ def program_inputs() -> dict:
         "htop": [ROOT / "target" / "htop" / "htop.o"],
         "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
         "doom": [ROOT / "target" / "doomgeneric" / "doom.o"],
-        "fstack-probe": [ROOT / "target" / "f-stack" / "fstack-probe.o"],
+        "fstack-probe": [ROOT / "target" / "f-stack" / "fstack-probe.o", VNET],
         "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
         "curl": [ROOT / "target" / "curl" / "curl.o"],
         "nginx": [ROOT / "target" / "nginx" / "nginx.o"],
@@ -828,6 +828,8 @@ def build_programs(wanted_names: list) -> list:
         fail(f"unknown program {unknown[0]}")
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
+    if not wanted_names or "fstack-probe" in wanted_names:
+        build_vnet()
     PROGRAMS.mkdir(parents=True, exist_ok=True)
     work = PROGRAMS / "obj"
     work.mkdir(exist_ok=True)

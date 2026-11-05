@@ -43,3 +43,32 @@ pub const FSTACK_TABLE: &[Record] = &[
     BUSYBOX_DIALOG_TABLE[7],
     BUSYBOX_DIALOG_TABLE[8],
 ];
+
+/// The image of the probe of F-Stack on the second network device
+/// (`cargo xtask fstack-probe device`): the table of the image with both
+/// network devices, with the larger quota for the shell's commands, as above
+/// (the pool of the process service holds the four quotas of the shell's
+/// image and not the sixteen of the commands of the image with the network:
+/// the network service needs the memory).
+const DEVICE_PROCESS_SERVICE: Record = Record {
+    quota: POSIX_ABI_TABLE[1].quota + BUSYBOX_DIALOG_POOL + 4 * FSTACK_COMMAND_QUOTA,
+    ..super::net::NET_TWO_TABLE[2]
+};
+
+const DEVICE_LAUNCHER: Record = Record {
+    quota: FSTACK_COMMAND_QUOTA,
+    ..super::net::NET_TWO_TABLE[5]
+};
+
+pub const FSTACK_DEVICE_TABLE: &[Record] = &[
+    super::net::NET_TWO_TABLE[0],
+    super::net::NET_TWO_TABLE[1],
+    DEVICE_PROCESS_SERVICE,
+    super::net::NET_TWO_TABLE[3],
+    super::net::NET_TWO_TABLE[4],
+    DEVICE_LAUNCHER,
+    super::net::NET_TWO_TABLE[6],
+    super::net::NET_TWO_TABLE[7],
+    super::net::NET_TWO_TABLE[8],
+    super::net::NET_TWO_TABLE[9],
+];
