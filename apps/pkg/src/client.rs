@@ -206,6 +206,33 @@ impl Client {
         self.change(w.as_bytes(), true).map(drop)
     }
 
+    /// REMOVE of `names` (at most `REMOVE_MAX`), one change of the store.
+    pub fn remove(&self, names: &[&str]) -> Result<(), Status> {
+        let bytes: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        let mut w = Writer::new();
+        p::write_remove(&bytes, &mut w)?;
+        self.change(w.as_bytes(), true).map(drop)
+    }
+
+    /// WORLD_SET: the package `name` is of the world (`true`) or only a dependency, the table alone.
+    pub fn world_set(&self, name: &str, world: bool) -> Result<(), Status> {
+        let mut w = Writer::new();
+        p::write_world(name.as_bytes(), world, &mut w)?;
+        self.change(w.as_bytes(), true).map(drop)
+    }
+
+    /// SETTINGS_SET: the blob, which goes into the cells of the buffer.
+    pub fn settings_set(&self, blob: &[u8]) -> Result<(), Status> {
+        if blob.len() > p::BUFFER_SIZE as usize {
+            return Err(Status::BadSize);
+        }
+        // SAFETY: the buffer is mapped and holds BUFFER_SIZE bytes from cell 0 on.
+        unsafe { core::ptr::copy_nonoverlapping(blob.as_ptr(), cell(0), blob.len()) };
+        let mut w = Writer::new();
+        p::write_word(Method::SettingsSet, blob.len() as u32, &mut w)?;
+        self.change(w.as_bytes(), true).map(drop)
+    }
+
     /// REVOKED_SET of the list and its block, one after the other in cell 0.
     pub fn revoked_set(&self, list: &[u8], block: &[u8]) -> Result<(), Status> {
         let len = list.len() + block.len();
@@ -309,11 +336,13 @@ impl Client {
         Err(Status::Unknown(p::BUSY))
     }
 
-    /// TAKE until the operation is READY (a quarter of an hour at most).
+    /// TAKE until the operation is READY (a quarter of an hour at most). The pause between the
+    /// asks grows from 2 ms to 64 ms (`output::backoff_ms`): a long operation, a replacement of
+    /// Doom or a removal, is not asked 500 times a second.
     fn take(&self, key: u64) -> Result<u32, Status> {
         let mut w = Writer::new();
         p::write_take(key, &mut w)?;
-        for _ in 0..450_000 {
+        for n in 0..15_000u32 {
             let (out, len) = self.exchange(w.as_bytes(), false)?;
             match long::Reply::read(&out[..len])? {
                 long::Reply::Ready(result) => {
@@ -322,7 +351,7 @@ impl Client {
                     word[..n].copy_from_slice(&result[..n]);
                     return Ok(u32::from_le_bytes(word));
                 }
-                long::Reply::Armed => sys::pause_ms(2),
+                long::Reply::Armed => sys::pause_ms(pkg::output::backoff_ms(n)),
                 _ => return Err(Status::BadSize),
             }
         }

@@ -95,6 +95,7 @@ mod pkg;
 mod pkg_probe;
 mod pkg_probes;
 mod pkg_slot;
+mod pkg_states;
 mod posix_display;
 mod posix_net;
 mod probe_ca;

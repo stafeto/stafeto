@@ -1150,6 +1150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "runas"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "safe-mmio"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

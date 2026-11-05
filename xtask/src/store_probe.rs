@@ -125,14 +125,14 @@ fn now() -> u64 {
 
 /// The development keys: the root and release key of `keys::dev_keys`, and a second release
 /// key with a certificate of the same root, which the list of revocations names.
-struct Keys {
-    dev: keys::DevKeys,
+pub(crate) struct Keys {
+    pub(crate) dev: keys::DevKeys,
     second_seed: [u8; 32],
     second: Key,
     second_certificate: [u8; pkgfmt::cert::SIZE],
 }
 
-fn dev_keys() -> Result<Keys, String> {
+pub(crate) fn dev_keys() -> Result<Keys, String> {
     let tree = root();
     let dev = keys::dev_keys(&tree)?;
     let dir = tree.join("target").join("keys");
@@ -159,33 +159,36 @@ fn dev_keys() -> Result<Keys, String> {
 
 /// The program of a package that is never started: a few bytes after the mark of an executable.
 /// Only `hello` runs, and its program is the probe's own file.
-const TINY: &[u8] = b"\x7fELF a program that is never run, with room for the manifest to name it";
+pub(crate) const TINY: &[u8] =
+    b"\x7fELF a program that is never run, with room for the manifest to name it";
 
 /// Who signs a package: a key, and the certificate of a root for it (none for a key nobody vouches for).
 #[derive(Clone, Copy)]
-struct Signer<'a> {
-    seed: &'a [u8; 32],
-    key: &'a Key,
-    certificate: Option<[u8; pkgfmt::cert::SIZE]>,
+pub(crate) struct Signer<'a> {
+    pub(crate) seed: &'a [u8; 32],
+    pub(crate) key: &'a Key,
+    pub(crate) certificate: Option<[u8; pkgfmt::cert::SIZE]>,
 }
 
 /// What differs between the packages of the probe.
 #[derive(Default)]
-struct Options {
+pub(crate) struct Options {
     /// A series other than the system's.
-    series: Option<String>,
-    version: Option<String>,
+    pub(crate) series: Option<String>,
+    pub(crate) version: Option<String>,
+    /// The `depends` line of `meta`, `-` when none.
+    pub(crate) depends: Option<String>,
     /// A byte of the program changed before the signing: the manifest names another file.
-    bad_manifest: bool,
+    pub(crate) bad_manifest: bool,
     /// A file `/etc/passwd`, which the base has.
-    passwd: bool,
+    pub(crate) passwd: bool,
     /// A byte of the signature changed after the signing.
-    bad_signature: bool,
+    pub(crate) bad_signature: bool,
 }
 
 /// A package file: a program `/opt/<name>/bin/<name>` of `program`, a hard link to it, and
 /// `extra` files of their own.
-fn package(
+pub(crate) fn package(
     name: &str,
     program: &[u8],
     signer: Signer<'_>,
@@ -257,7 +260,7 @@ fn package(
         arch: "aarch64",
         series: &series,
         license: "MIT",
-        depends: "-",
+        depends: options.depends.as_deref().unwrap_or("-"),
         provides: "-",
         needs: "-",
         summary: "A package of the store probe",
@@ -318,7 +321,7 @@ fn revoked_list(keys: &Keys, serial: u64, revoked: &[Key]) -> Result<Vec<u8>, St
 }
 
 /// The key file line of the owner's repository whose key has the seed `seed`.
-fn repository_key(name: &str, seed: u8) -> Result<String, String> {
+pub(crate) fn repository_key(name: &str, seed: u8) -> Result<String, String> {
     Ok(keyfile::public_line(&Key {
         name: pkgfmt::Name::new(name).map_err(|e| e.to_string())?,
         public: sig::public_key(&[seed; 32]),
@@ -403,7 +406,7 @@ fn wide_files() -> Vec<(String, Vec<u8>)> {
 }
 
 /// The ELF file of `store-probe`, which is the program the package `hello` holds.
-fn hello_elf() -> Result<Vec<u8>, String> {
+pub(crate) fn hello_elf() -> Result<Vec<u8>, String> {
     let mut cmd = cargo();
     cmd.arg("build").args(BOOT_PROFILE.args());
     cmd.args(["--target", PROGRAM_TARGET, "--package", "store-probe"]);

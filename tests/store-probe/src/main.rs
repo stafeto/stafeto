@@ -73,7 +73,7 @@ macro_rules! say {
 extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     // SAFETY: relibc supplies argc live NUL-terminated strings.
     let name = unsafe { CStr::from_ptr(*argv).to_bytes() };
-    if argc > 0 && name.ends_with(b"hello") {
+    if argc > 0 && (name.ends_with(b"hello") || name.ends_with(b"hello-games")) {
         return 42;
     }
     let mode = mode();

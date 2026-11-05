@@ -32,6 +32,9 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_REFUSED: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 
+pub const USAGE_REPO: &str =
+    "usage: pkg repo add <name> <https address> <key file> | remove <name> | list | save";
+
 pub const USAGE: &str = "usage: pkg install|remove|upgrade|update|list|info|search|repo|check ...";
 
 /// Whether `install` and `upgrade` may go on after the repositories were asked: when any one was
