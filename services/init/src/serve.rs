@@ -249,6 +249,9 @@ struct Entry {
     passed: bool,
     /// The running instance of a service said READY.
     ready: bool,
+    /// Some instance of the service said READY (kept when it ends, for a record that comes to
+    /// its gate later and need not say the service ended before READY).
+    was_ready: bool,
 }
 
 impl Entry {
@@ -273,6 +276,7 @@ impl Entry {
         gate: None,
         passed: false,
         ready: false,
+        was_ready: false,
     };
 }
 
@@ -408,6 +412,7 @@ impl Init {
         };
         let entry = &self.entries[service];
         match entry.state {
+            State::Ended | State::Broken if entry.was_ready => Standing::Gone,
             State::Ended | State::Broken => Standing::Over,
             _ if entry.ready => Standing::Ready,
             _ => Standing::NotReady,
@@ -471,6 +476,7 @@ impl Init {
         }
         if !self.entries[place].ready {
             self.entries[place].ready = true;
+            self.entries[place].was_ready = true;
             self.gates(place, true);
         }
         Answer::Status(Status::Ok)

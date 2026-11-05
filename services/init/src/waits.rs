@@ -29,8 +29,11 @@ pub enum Standing {
     NotReady,
     /// The running instance said READY.
     Ready,
-    /// The record ended or broke for good, so no READY will come.
+    /// The record ended or broke for good before any READY, so none will come.
     Over,
+    /// The service said READY and has ended since: there is nothing to wait for, and nothing
+    /// went wrong that a line should say.
+    Gone,
 }
 
 /// Why a record starts after its wait.
@@ -112,7 +115,7 @@ impl Gate {
         };
         for (i, wait) in record.waits.iter().enumerate() {
             match standing(wait.service) {
-                Standing::Ready => gate.ready[i] = true,
+                Standing::Ready | Standing::Gone => gate.ready[i] = true,
                 Standing::Over => {
                     return Err(Release::Ended {
                         service: wait.service,
@@ -297,6 +300,11 @@ mod tests {
         assert_eq!(
             Gate::open(&record, 0, |_| Standing::Ready).err(),
             Some(Release::Ready)
+        );
+        assert_eq!(
+            Gate::open(&record, 0, |_| Standing::Gone).err(),
+            Some(Release::Ready),
+            "a service that ended after its READY is a met wait"
         );
         assert_eq!(
             Gate::open(&record, 0, |_| Standing::Over).err(),
