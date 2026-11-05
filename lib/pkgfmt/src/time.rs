@@ -70,8 +70,19 @@ pub fn parse(text: &str) -> Option<u64> {
         return None;
     }
     let (y, m, d) = (digits(&b[0..4])?, digits(&b[5..7])?, digits(&b[8..10])?);
-    let (h, mi, s) = (digits(&b[11..13])?, digits(&b[14..16])?, digits(&b[17..19])?);
-    if y < 1970 || !(1..=12).contains(&m) || d < 1 || d > month_days(y, m) || h > 23 || mi > 59 || s > 59 {
+    let (h, mi, s) = (
+        digits(&b[11..13])?,
+        digits(&b[14..16])?,
+        digits(&b[17..19])?,
+    );
+    if y < 1970
+        || !(1..=12).contains(&m)
+        || d < 1
+        || d > month_days(y, m)
+        || h > 23
+        || mi > 59
+        || s > 59
+    {
         return None;
     }
     Some((days_from_civil(y, m, d) * 86_400 + h * 3600 + mi * 60 + s) as u64)

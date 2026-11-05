@@ -45,7 +45,11 @@ impl<'a> Revoked<'a> {
             Some((n, l)) => field(l, "serial").and_then(decimal).ok_or(bad(n))?,
             None => return Err(bad(2)),
         };
-        let body_at = text.split_inclusive('\n').take(2).map(str::len).sum::<usize>();
+        let body_at = text
+            .split_inclusive('\n')
+            .take(2)
+            .map(str::len)
+            .sum::<usize>();
         let mut previous: Option<Name> = None;
         while let Some((n, line)) = next(&mut lines)? {
             let r = parse_entry(line).ok_or(bad(n))?;
@@ -61,7 +65,9 @@ impl<'a> Revoked<'a> {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = Revocation> + 'a {
-        self.body.lines().map(|l| parse_entry(l).expect("parse checked every line"))
+        self.body
+            .lines()
+            .map(|l| parse_entry(l).expect("parse checked every line"))
     }
 }
 
@@ -117,14 +123,24 @@ mod tests {
         for (text, line) in [
             ("format 2\nserial 1\n", 1),
             ("format 1\nserial 01\n", 2),
-            ("format 1\nserial 1\nrevoke b 1970-01-01T00:00:00Z\nrevoke a 1970-01-01T00:00:00Z\n", 4),
-            ("format 1\nserial 1\nrevoke a 1970-01-01T00:00:00Z\nrevoke a 1970-01-01T00:00:00Z\n", 4),
+            (
+                "format 1\nserial 1\nrevoke b 1970-01-01T00:00:00Z\nrevoke a 1970-01-01T00:00:00Z\n",
+                4,
+            ),
+            (
+                "format 1\nserial 1\nrevoke a 1970-01-01T00:00:00Z\nrevoke a 1970-01-01T00:00:00Z\n",
+                4,
+            ),
             ("format 1\nserial 1\nrevoke a 1970-01-01T00:00:00\n", 3),
             ("format 1\nserial 1\nrevoke A 1970-01-01T00:00:00Z\n", 3),
             ("format 1\nserial 1\n\n", 3),
             ("format 1\nserial 1\nrevoke a 1970-01-01T00:00:00Z", 3),
         ] {
-            assert_eq!(Revoked::parse(text).err(), Some(Error::BadRevoked(line)), "{text:?}");
+            assert_eq!(
+                Revoked::parse(text).err(),
+                Some(Error::BadRevoked(line)),
+                "{text:?}"
+            );
         }
     }
 }

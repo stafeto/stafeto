@@ -77,7 +77,9 @@ pub struct Index<'a> {
 }
 
 fn hex64(v: &str) -> bool {
-    v.len() == 64 && v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    v.len() == 64
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// A relative name (no leading `/`, no `.` or `..` or empty part) or an
@@ -91,11 +93,15 @@ fn location(v: &str) -> bool {
 
 fn repository_ok(v: &str) -> bool {
     (1..=32).contains(&v.len())
-        && v.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        && v.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
 fn version_ok(v: &str) -> bool {
-    !v.is_empty() && v.len() <= 96 && v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._+~-".contains(&c))
+    !v.is_empty()
+        && v.len() <= 96
+        && v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._+~-".contains(&c))
 }
 
 /// Reads one entry; the cursor stops after its last line.
@@ -121,7 +127,9 @@ fn read_entry<'a>(lines: &mut Lines<'a>) -> Result<Entry<'a>, Error> {
         }
     }
     let need = |lines: &mut Lines<'a>, key| -> Result<&'a str, Error> {
-        take(lines, key, false).map_err(bad)?.ok_or(bad(lines.number()))
+        take(lines, key, false)
+            .map_err(bad)?
+            .ok_or(bad(lines.number()))
     };
     let maybe = |lines: &mut Lines<'a>, key| take(lines, key, true).map_err(bad);
 
@@ -143,7 +151,10 @@ fn read_entry<'a>(lines: &mut Lines<'a>) -> Result<Entry<'a>, Error> {
         return Err(bad(line_of(lines)));
     }
     let needs = maybe(lines, "needs")?;
-    if needs.is_some_and(|v| !v.split(' ').all(|w| matches!(w, "display" | "input" | "net"))) {
+    if needs.is_some_and(|v| {
+        !v.split(' ')
+            .all(|w| matches!(w, "display" | "input" | "net"))
+    }) {
         return Err(bad(line_of(lines)));
     }
     let license = need(lines, "license")?;
@@ -311,7 +322,11 @@ pub fn write(header: &Header<'_>, entries: &[Entry<'_>]) -> Result<alloc::string
         let mut put = |key: &str, v: &str| out.push_str(&format!("{key} {v}\n"));
         put("name", e.name);
         put("version", e.version);
-        for (key, v) in [("provides", e.provides), ("depends", e.depends), ("needs", e.needs)] {
+        for (key, v) in [
+            ("provides", e.provides),
+            ("depends", e.depends),
+            ("needs", e.needs),
+        ] {
             if let Some(v) = v {
                 put(key, v);
             }
@@ -371,7 +386,11 @@ mod tests {
         doom.depends = Some("freedoom");
         doom.needs = Some("display input");
         doom.source = Some("src/doomgeneric-e257a095-1-src.tar.xz");
-        write(&header(), &[entry("freedoom", "freedoom-0.13-1.stpkg"), doom]).unwrap()
+        write(
+            &header(),
+            &[entry("freedoom", "freedoom-0.13-1.stpkg"), doom],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -409,12 +428,24 @@ mod tests {
         // Names out of order, an empty line inside an entry, two empty lines.
         assert_eq!(refused(&text.replace("name freedoom", "name aaa")), 21);
         assert_eq!(refused(&text.replacen("serial 1\n", "serial 1\n\n", 1)), 6);
-        assert_eq!(refused(&text.replace("\n\nname freedoom", "\n\n\nname freedoom")), 21);
+        assert_eq!(
+            refused(&text.replace("\n\nname freedoom", "\n\n\nname freedoom")),
+            21
+        );
         assert_eq!(refused(&text.replacen("format 1", "format 2", 1)), 1);
         assert_eq!(refused(&text.replacen("arch aarch64", "arch x86", 1)), 4);
-        assert_eq!(refused(&text.replacen("expires 2026-12-05T00:00:00Z", "expires 2026-12-05", 1)), 6);
-        assert_eq!(refused(&text.replacen("file freedoom-0.13-1.stpkg", "file ../x", 1)), 27);
-        assert_eq!(refused(&text.replacen("file freedoom-0.13-1.stpkg", "file /x", 1)), 27);
+        assert_eq!(
+            refused(&text.replacen("expires 2026-12-05T00:00:00Z", "expires 2026-12-05", 1)),
+            6
+        );
+        assert_eq!(
+            refused(&text.replacen("file freedoom-0.13-1.stpkg", "file ../x", 1)),
+            27
+        );
+        assert_eq!(
+            refused(&text.replacen("file freedoom-0.13-1.stpkg", "file /x", 1)),
+            27
+        );
         assert_eq!(refused(&(text.clone() + "\n")), 29);
         assert_eq!(refused(text.trim_end()), 28);
         assert_eq!(refused(&text.replacen("sha256 0123", "sha256 ABCD", 1)), 15);

@@ -66,7 +66,11 @@ pub fn verify(
     }
     let (public, root) = match &block.certificate {
         None => {
-            let keys = if kind == Kind::Revoked { trust.roots } else { trust.direct };
+            let keys = if kind == Kind::Revoked {
+                trust.roots
+            } else {
+                trust.direct
+            };
             let key = find(keys, &block.key).ok_or(Error::UnknownKey)?;
             (key.public, None)
         }
@@ -86,7 +90,10 @@ pub fn verify(
             (c.public, Some(c.issuer))
         }
     };
-    if revoked.iter().any(|r| r.name == block.key && block.time >= r.since) {
+    if revoked
+        .iter()
+        .any(|r| r.name == block.key && block.time >= r.since)
+    {
         return Err(Error::Revoked);
     }
     if !block.check_signature(&public) {
@@ -120,15 +127,29 @@ mod tests {
     }
 
     fn certificate(purposes: u32) -> [u8; cert::SIZE] {
-        Certificate::issue(&ROOT, n("t-root"), n("t-release"), public_key(&REL), purposes, 1000, 2000)
-            .to_bytes()
+        Certificate::issue(
+            &ROOT,
+            n("t-root"),
+            n("t-release"),
+            public_key(&REL),
+            purposes,
+            1000,
+            2000,
+        )
+        .to_bytes()
     }
 
     fn block(kind: Kind, time: u64, cert: Option<[u8; cert::SIZE]>) -> Block {
         Block::sign(&REL, kind, 77, DIGEST, time, n("t-release"), cert)
     }
 
-    fn check(b: &Block, kind: Kind, roots: &[Key], direct: &[Key], rev: &[Revocation]) -> Result<Signer, Error> {
+    fn check(
+        b: &Block,
+        kind: Kind,
+        roots: &[Key],
+        direct: &[Key],
+        rev: &[Revocation],
+    ) -> Result<Signer, Error> {
         verify(b, kind, &DIGEST, 77, &Trust { roots, direct }, rev)
     }
 
@@ -143,10 +164,22 @@ mod tests {
     #[test]
     fn data_must_match_the_block() {
         let b = block(Kind::Package, 1500, Some(certificate(1)));
-        let t = Trust { roots: &[root_key()], direct: &[] };
-        assert_eq!(verify(&b, Kind::Index, &DIGEST, 77, &t, &[]), Err(Error::WrongKind));
-        assert_eq!(verify(&b, Kind::Package, &DIGEST, 76, &t, &[]), Err(Error::LengthMismatch));
-        assert_eq!(verify(&b, Kind::Package, &[4; 32], 77, &t, &[]), Err(Error::BadHash));
+        let t = Trust {
+            roots: &[root_key()],
+            direct: &[],
+        };
+        assert_eq!(
+            verify(&b, Kind::Index, &DIGEST, 77, &t, &[]),
+            Err(Error::WrongKind)
+        );
+        assert_eq!(
+            verify(&b, Kind::Package, &DIGEST, 76, &t, &[]),
+            Err(Error::LengthMismatch)
+        );
+        assert_eq!(
+            verify(&b, Kind::Package, &[4; 32], 77, &t, &[]),
+            Err(Error::BadHash)
+        );
     }
 
     #[test]
@@ -167,7 +200,15 @@ mod tests {
 
     #[test]
     fn the_term_of_the_certificate_bounds_the_time_of_signing() {
-        let t = |time| check(&block(Kind::Package, time, Some(certificate(1))), Kind::Package, &[root_key()], &[], &[]);
+        let t = |time| {
+            check(
+                &block(Kind::Package, time, Some(certificate(1))),
+                Kind::Package,
+                &[root_key()],
+                &[],
+                &[],
+            )
+        };
         assert!(t(1000).is_ok());
         assert!(t(2000).is_ok());
         assert_eq!(t(2001), Err(Error::OutsideCertificate));
@@ -177,47 +218,102 @@ mod tests {
     #[test]
     fn the_certificate_must_come_from_a_root_for_packages() {
         let b = block(Kind::Package, 1500, Some(certificate(1)));
-        let stranger = Key { name: n("t-root"), public: public_key(&[9; 32]) };
-        assert_eq!(check(&b, Kind::Package, &[stranger], &[], &[]), Err(Error::BadCertificate));
-        let other = Key { name: n("other-root"), public: public_key(&ROOT) };
-        assert_eq!(check(&b, Kind::Package, &[other], &[], &[]), Err(Error::BadCertificate));
+        let stranger = Key {
+            name: n("t-root"),
+            public: public_key(&[9; 32]),
+        };
+        assert_eq!(
+            check(&b, Kind::Package, &[stranger], &[], &[]),
+            Err(Error::BadCertificate)
+        );
+        let other = Key {
+            name: n("other-root"),
+            public: public_key(&ROOT),
+        };
+        assert_eq!(
+            check(&b, Kind::Package, &[other], &[], &[]),
+            Err(Error::BadCertificate)
+        );
         let elf_only = block(Kind::Package, 1500, Some(certificate(cert::PURPOSE_ELF)));
-        assert_eq!(check(&elf_only, Kind::Package, &[root_key()], &[], &[]), Err(Error::WrongPurpose));
+        assert_eq!(
+            check(&elf_only, Kind::Package, &[root_key()], &[], &[]),
+            Err(Error::WrongPurpose)
+        );
         // The block's key name differs from the certificate's.
         let mut renamed = block(Kind::Package, 1500, Some(certificate(1)));
         renamed.key = n("t-release-2");
-        assert_eq!(check(&renamed, Kind::Package, &[root_key()], &[], &[]), Err(Error::BadCertificate));
+        assert_eq!(
+            check(&renamed, Kind::Package, &[root_key()], &[], &[]),
+            Err(Error::BadCertificate)
+        );
     }
 
     #[test]
     fn revocation_counts_from_since_on() {
         let b = block(Kind::Package, 1500, Some(certificate(1)));
-        let rev = |since| [Revocation { name: n("t-release"), since }];
-        assert_eq!(check(&b, Kind::Package, &[root_key()], &[], &rev(1500)), Err(Error::Revoked));
+        let rev = |since| {
+            [Revocation {
+                name: n("t-release"),
+                since,
+            }]
+        };
+        assert_eq!(
+            check(&b, Kind::Package, &[root_key()], &[], &rev(1500)),
+            Err(Error::Revoked)
+        );
         assert!(check(&b, Kind::Package, &[root_key()], &[], &rev(1501)).is_ok());
-        let other = [Revocation { name: n("else"), since: 0 }];
+        let other = [Revocation {
+            name: n("else"),
+            since: 0,
+        }];
         assert!(check(&b, Kind::Package, &[root_key()], &[], &other).is_ok());
     }
 
     #[test]
     fn direct_keys_sign_without_a_certificate_and_roots_do_not_sign_packages() {
-        let direct = Key { name: n("t-release"), public: public_key(&REL) };
+        let direct = Key {
+            name: n("t-release"),
+            public: public_key(&REL),
+        };
         let b = block(Kind::Package, 1500, None);
-        assert_eq!(check(&b, Kind::Package, &[root_key()], &[], &[]), Err(Error::UnknownKey));
-        assert_eq!(check(&b, Kind::Package, &[], &[direct], &[]).unwrap().root, None);
+        assert_eq!(
+            check(&b, Kind::Package, &[root_key()], &[], &[]),
+            Err(Error::UnknownKey)
+        );
+        assert_eq!(
+            check(&b, Kind::Package, &[], &[direct], &[]).unwrap().root,
+            None
+        );
         // A revocation list is signed by a root directly.
         let rb = Block::sign(&ROOT, Kind::Revoked, 77, DIGEST, 1500, n("t-root"), None);
         assert!(check(&rb, Kind::Revoked, &[root_key()], &[], &[]).is_ok());
-        assert_eq!(check(&rb, Kind::Revoked, &[], &[root_key()], &[]), Err(Error::UnknownKey));
+        assert_eq!(
+            check(&rb, Kind::Revoked, &[], &[root_key()], &[]),
+            Err(Error::UnknownKey)
+        );
         // Nor does a certificate belong on it.
-        let cb = Block::sign(&REL, Kind::Revoked, 77, DIGEST, 1500, n("t-release"), Some(certificate(1)));
-        assert_eq!(check(&cb, Kind::Revoked, &[root_key()], &[], &[]), Err(Error::BadCertificate));
+        let cb = Block::sign(
+            &REL,
+            Kind::Revoked,
+            77,
+            DIGEST,
+            1500,
+            n("t-release"),
+            Some(certificate(1)),
+        );
+        assert_eq!(
+            check(&cb, Kind::Revoked, &[root_key()], &[], &[]),
+            Err(Error::BadCertificate)
+        );
     }
 
     #[test]
     fn a_bad_signature_is_refused() {
         let mut b = block(Kind::Package, 1500, Some(certificate(1)));
         b.signature[3] ^= 1;
-        assert_eq!(check(&b, Kind::Package, &[root_key()], &[], &[]), Err(Error::BadSignature));
+        assert_eq!(
+            check(&b, Kind::Package, &[root_key()], &[], &[]),
+            Err(Error::BadSignature)
+        );
     }
 }

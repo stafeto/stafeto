@@ -228,6 +228,25 @@ mod tests {
         }
     }
 
+    /// `cargo test -p pkgfmt --release -- --ignored --nocapture`: the cost of
+    /// one signature check and of hashing 30 MB on the host.
+    #[test]
+    #[ignore]
+    fn timing() {
+        let seed = [5u8; 32];
+        let public = public_key(&seed);
+        let signature = sign(&seed, b"message");
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(verify(&public, b"message", &signature));
+        }
+        eprintln!("Ed25519 verify: {:?} each", start.elapsed() / 1000);
+        let data = alloc::vec![7u8; 30_000_000];
+        let start = std::time::Instant::now();
+        let digest = crate::sha::sha256(&data);
+        eprintln!("SHA-256 of 30 MB: {:?} ({:02x})", start.elapsed(), digest[0]);
+    }
+
     fn sample() -> Block {
         Block::sign(
             &[7; 32],

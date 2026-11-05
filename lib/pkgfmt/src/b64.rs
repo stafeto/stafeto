@@ -18,7 +18,11 @@ pub const fn encoded_len(n: usize) -> usize {
 pub fn encode<'a>(input: &[u8], out: &'a mut [u8]) -> &'a str {
     let n = encoded_len(input.len());
     for (i, chunk) in input.chunks(3).enumerate() {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let v = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
         for j in 0..4 {
             out[4 * i + j] = ALPHABET[(v >> (18 - 6 * j) & 63) as usize];
@@ -53,7 +57,11 @@ pub fn decode(text: &str, out: &mut [u8]) -> Result<usize, Error> {
         }
         let mut v = 0u32;
         for (j, &c) in q.iter().enumerate() {
-            let d = if j >= 4 - pad { 0 } else { value(c).ok_or(Error::BadBase64)? };
+            let d = if j >= 4 - pad {
+                0
+            } else {
+                value(c).ok_or(Error::BadBase64)?
+            };
             v = v << 6 | d;
         }
         let bytes = [(v >> 16) as u8, (v >> 8) as u8, v as u8];
@@ -96,7 +104,10 @@ mod tests {
     #[test]
     fn the_reader_is_strict() {
         let mut out = [0u8; 12];
-        for bad in ["Zg=", "Zg", "Zh==", "Zm9=", "Zg=A", "Z===", "=g==", "Zm9v\n", "Zm 9", "Zm9-", "Zg==Zg=="] {
+        for bad in [
+            "Zg=", "Zg", "Zh==", "Zm9=", "Zg=A", "Z===", "=g==", "Zm9v\n", "Zm 9", "Zm9-",
+            "Zg==Zg==",
+        ] {
             assert_eq!(decode(bad, &mut out), Err(Error::BadBase64), "{bad}");
         }
     }

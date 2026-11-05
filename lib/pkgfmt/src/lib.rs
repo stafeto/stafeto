@@ -143,7 +143,9 @@ impl Name {
         let b = text.as_bytes();
         if b.is_empty()
             || b.len() > 63
-            || !b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            || !b
+                .iter()
+                .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
         {
             return Err(Error::BadName);
         }

@@ -94,15 +94,17 @@ mod tests {
     use super::*;
 
     /// RFC 8410, section 10.3: the private key and its public half.
-    const RFC8410_PEM: &str =
-        "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
+    const RFC8410_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
     const RFC8410_PUBLIC: &str = "Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=";
 
     #[test]
     fn the_rfc_8410_key_gives_its_public_half() {
         let seed = parse_private(RFC8410_PEM).unwrap();
         let mut buf = [0u8; 44];
-        assert_eq!(b64::encode(&crate::sig::public_key(&seed), &mut buf), RFC8410_PUBLIC);
+        assert_eq!(
+            b64::encode(&crate::sig::public_key(&seed), &mut buf),
+            RFC8410_PUBLIC
+        );
         assert_eq!(private_pem(&seed), RFC8410_PEM);
     }
 
@@ -124,9 +126,13 @@ mod tests {
 
     #[test]
     fn public_lines_are_strict() {
-        let k = parse_public("ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= t-root\n").unwrap();
+        let k =
+            parse_public("ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= t-root\n").unwrap();
         assert_eq!(k.name.as_str(), "t-root");
-        assert_eq!(public_line(&k), "ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= t-root\n");
+        assert_eq!(
+            public_line(&k),
+            "ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= t-root\n"
+        );
         for bad in [
             "ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE= t-root",
             "ed25519 Gb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=  t-root\n",

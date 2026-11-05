@@ -28,10 +28,22 @@ pub struct ManifestEntry<'a> {
 
 fn parse_line(line: &str) -> Option<ManifestEntry<'_>> {
     let mut parts = line.splitn(5, ' ');
-    let (digest, size, mode, elf, path) =
-        (parts.next()?, parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    let sha256 = if digest == "-" { None } else { Some(sha::unhex(digest)?) };
-    if mode.len() != 6 || !mode.bytes().all(|c| (b'0'..=b'7').contains(&c)) || !path.starts_with('/') {
+    let (digest, size, mode, elf, path) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    let sha256 = if digest == "-" {
+        None
+    } else {
+        Some(sha::unhex(digest)?)
+    };
+    if mode.len() != 6
+        || !mode.bytes().all(|c| (b'0'..=b'7').contains(&c))
+        || !path.starts_with('/')
+    {
         return None;
     }
     let elf = match elf {
@@ -80,7 +92,9 @@ impl<'a> Manifest<'a> {
 
     /// The entries in order.
     pub fn entries(&self) -> impl Iterator<Item = ManifestEntry<'a>> {
-        self.text.lines().map(|l| parse_line(l).expect("parse checked every line"))
+        self.text
+            .lines()
+            .map(|l| parse_line(l).expect("parse checked every line"))
     }
 
     /// Entry `n`, without hashing anything.
@@ -103,7 +117,10 @@ pub fn line(content: Option<&[u8]>, mode: u32, path: &str) -> alloc::string::Str
             )
         }
     };
-    alloc::format!("{digest} {size} {mode:06o} {} {path}\n", if elf { "elf" } else { "-" })
+    alloc::format!(
+        "{digest} {size} {mode:06o} {} {path}\n",
+        if elf { "elf" } else { "-" }
+    )
 }
 
 #[cfg(any(test, feature = "write"))]

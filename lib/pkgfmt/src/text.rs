@@ -32,10 +32,7 @@ impl<'a> Lines<'a> {
         };
         let line = &self.rest[..end];
         self.rest = &self.rest[end + 1..];
-        if line.len() > self.limit
-            || line.ends_with(' ')
-            || line.chars().any(|c| c.is_control())
-        {
+        if line.len() > self.limit || line.ends_with(' ') || line.chars().any(|c| c.is_control()) {
             return Err(self.number);
         }
         Ok(Some((self.number, line)))
@@ -59,7 +56,10 @@ pub(crate) fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 
 /// A decimal number without a sign, a plus or leading zeros.
 pub(crate) fn decimal(text: &str) -> Option<u64> {
-    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) || !text.bytes().all(|b| b.is_ascii_digit()) {
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     text.parse().ok()
@@ -72,7 +72,8 @@ pub(crate) fn package_name(text: &str) -> bool {
     !b.is_empty()
         && b.len() <= 64
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
-        && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._+-".contains(&c))
+        && b.iter()
+            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._+-".contains(&c))
 }
 
 /// Words of a list line: names separated by single spaces.

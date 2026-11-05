@@ -62,7 +62,9 @@ pub fn list(value: &str) -> impl Iterator<Item = &str> {
 }
 
 fn hex(v: &str, n: usize) -> bool {
-    v.len() == n && v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    v.len() == n
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 fn valid(key: &str, v: &str) -> bool {
@@ -71,7 +73,8 @@ fn valid(key: &str, v: &str) -> bool {
         "version" => {
             !v.is_empty()
                 && v.len() <= 96
-                && v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._+~-".contains(&c))
+                && v.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._+~-".contains(&c))
         }
         "release" => decimal(v).is_some(),
         "arch" => v == "aarch64",
@@ -80,7 +83,11 @@ fn valid(key: &str, v: &str) -> bool {
             .is_some_and(|(a, b)| decimal(a).is_some() && decimal(b).is_some()),
         "license" => v.is_ascii(),
         "depends" | "provides" => names_ok(v),
-        "needs" => v == "-" || v.split(' ').all(|w| matches!(w, "display" | "input" | "net")),
+        "needs" => {
+            v == "-"
+                || v.split(' ')
+                    .all(|w| matches!(w, "display" | "input" | "net"))
+        }
         "summary" => v.len() <= 80 && v.is_ascii() && !v.contains('"'),
         "url" => v.starts_with("https://") && !v.contains(' '),
         "sha256" | "recipe" => hex(v, 64),
@@ -101,15 +108,33 @@ impl<'a> Meta<'a> {
                 Ok(None) => return Err(Error::BadMeta(lines.number() + 1)),
                 Err(n) => return Err(Error::BadMeta(n)),
             };
-            let v = field(line, key).filter(|v| valid(key, v)).ok_or(Error::BadMeta(n))?;
+            let v = field(line, key)
+                .filter(|v| valid(key, v))
+                .ok_or(Error::BadMeta(n))?;
             *slot = v;
         }
         match lines.next_line() {
             Ok(None) => {}
             Ok(Some((n, _))) | Err(n) => return Err(Error::BadMeta(n)),
         }
-        let [name, version, release, arch, series, license, depends, provides, needs, summary, url, sha256, recipe, commit, relibc, size] =
-            values;
+        let [
+            name,
+            version,
+            release,
+            arch,
+            series,
+            license,
+            depends,
+            provides,
+            needs,
+            summary,
+            url,
+            sha256,
+            recipe,
+            commit,
+            relibc,
+            size,
+        ] = values;
         Ok(Meta {
             name,
             version,
@@ -135,9 +160,22 @@ impl<'a> Meta<'a> {
     pub fn to_text(&self) -> Result<alloc::string::String, Error> {
         let size = alloc::format!("{}", self.size);
         let values = [
-            self.name, self.version, self.release, self.arch, self.series, self.license,
-            self.depends, self.provides, self.needs, self.summary, self.url, self.sha256,
-            self.recipe, self.commit, self.relibc, &size,
+            self.name,
+            self.version,
+            self.release,
+            self.arch,
+            self.series,
+            self.license,
+            self.depends,
+            self.provides,
+            self.needs,
+            self.summary,
+            self.url,
+            self.sha256,
+            self.recipe,
+            self.commit,
+            self.relibc,
+            &size,
         ];
         let mut out = alloc::string::String::new();
         for (key, v) in KEYS.iter().zip(values) {
@@ -180,7 +218,10 @@ mod tests {
         let text = sample().to_text().unwrap();
         assert_eq!(Meta::parse(&text), Ok(sample()));
         assert!(text.starts_with("name doomgeneric\nversion e257"));
-        assert_eq!(list("display input").collect::<Vec<_>>(), ["display", "input"]);
+        assert_eq!(
+            list("display input").collect::<Vec<_>>(),
+            ["display", "input"]
+        );
         assert_eq!(list("-").count(), 0);
     }
 
@@ -201,11 +242,23 @@ mod tests {
         assert_eq!(line_of(&good.replace("release 1\n", "release \n")), 3);
         assert_eq!(line_of(&good.replace("release 1\n", "release 1 \n")), 3);
         assert_eq!(line_of(good.trim_end()), 16);
-        assert_eq!(line_of(&good.replace("needs display input", "needs sound")), 9);
+        assert_eq!(
+            line_of(&good.replace("needs display input", "needs sound")),
+            9
+        );
         assert_eq!(line_of(&good.replace("release 1", "release 01")), 3);
         assert_eq!(line_of(&good.replace("arch aarch64", "arch x86")), 4);
         assert_eq!(line_of(&(good.clone() + "extra 1\n")), 17);
-        assert_eq!(line_of(&good.replace("name doomgeneric", &alloc::format!("name {}", "a".repeat(600)))), 1);
-        assert_eq!(line_of(&good.replace("relibc pin-0a1b2c3d", "relibc pin-0A1B2C3D")), 15);
+        assert_eq!(
+            line_of(&good.replace(
+                "name doomgeneric",
+                &alloc::format!("name {}", "a".repeat(600))
+            )),
+            1
+        );
+        assert_eq!(
+            line_of(&good.replace("relibc pin-0a1b2c3d", "relibc pin-0A1B2C3D")),
+            15
+        );
     }
 }
