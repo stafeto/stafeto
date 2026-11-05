@@ -26,6 +26,11 @@ steps = ["rt/step-stats"]
 # `crash`: the service stops for good at the point `STAFETO_PKGD_CRASH_AT` names
 # (store-crash), after the line `pkgd: crash point N`.
 crash = []
+# `no-ready`: the service never says READY (xtask init-wait, the deadline of the wait).
+no-ready = []
+# `exit-before-ready`: the service ends where it would say READY (xtask init-wait, the end
+# of a service before its READY).
+exit-before-ready = []
 host = ["proto-pkg/alloc", "pkgfmt/write"]
 
 [dependencies]

@@ -16,7 +16,7 @@
 //! instance that ended goes, with the Virtio reset while the function
 //! decodes its BAR, then the command word 0.
 
-use super::{Binding, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Window, Write};
+use super::{Binding, Dma, GENERAL_CPUS, Gate, Kind, Record, Restart, Shares, Wait, Window, Write};
 use crate::PAGE;
 use crate::watch::Watch;
 use virtio_pci::qemu;
@@ -244,6 +244,59 @@ pub const STORE_PROBE_TABLE: &[Record] = &[
     STORE_PROBE,
 ];
 
+/// The probe of the place `Packages` (tests/pkg-slot): the first POSIX process, root, with a
+/// session of the package service by name; its copy forks, spawns and execs.
+pub const PKG_SLOT: Record = Record {
+    name: "pkg-slot",
+    program: "pkg-slot",
+    args: b"pkg-slot\0",
+    connects: &["ramfs", "pipe", "clock", "posix", "pkgd"],
+    quota: super::ramfs::PROCS_QUOTA,
+    // The disk of the probe is empty: the service formats it before it answers, and the
+    // probe starts when it said READY.
+    waits: &[Wait {
+        service: "pkgd",
+        deadline_ms: 30_000,
+    }],
+    ..STORE_PROBE
+};
+
+/// The image of the probe of the place `Packages`: the store probe's services and the probe.
+pub const PKG_SLOT_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    STORE_PROBE_TABLE[1],
+    STORE_PROBE_TABLE[2],
+    STORE_PROBE_TABLE[3],
+    STORE_PROBE_TABLE[4],
+    BLK,
+    PKGD,
+    PKG_SLOT,
+];
+
+/// The client of the wait probe (xtask init-wait): the program of the store probe, whose
+/// file `/test/mode` says `wait` (it prints the time it started and ends), waiting 3 s for
+/// the package service's READY.
+pub const INIT_WAIT_CLIENT: Record = Record {
+    name: "init-wait",
+    waits: &[Wait {
+        service: "pkgd",
+        deadline_ms: 3_000,
+    }],
+    ..STORE_PROBE
+};
+
+/// The image of the wait probe: the store probe's, the client at the end.
+pub const INIT_WAIT_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    STORE_PROBE_TABLE[1],
+    STORE_PROBE_TABLE[2],
+    STORE_PROBE_TABLE[3],
+    STORE_PROBE_TABLE[4],
+    BLK,
+    PKGD,
+    INIT_WAIT_CLIENT,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +370,19 @@ mod tests {
         assert!(!PKGD.is_posix() && !PKGD.trusted && PKGD.dma.is_empty());
         assert!(crate::table::check(STORE_PROBE_TABLE).is_ok());
         assert!(STORE_PROBE.is_posix() && STORE_PROBE.root);
+        // The tables of the probes of the wait and of the place Packages: the store probe's
+        // services, a client that waits 3 s for pkgd, a POSIX process with its session.
+        assert!(crate::table::check(INIT_WAIT_TABLE).is_ok());
+        assert!(crate::table::check(PKG_SLOT_TABLE).is_ok());
+        assert_eq!(
+            INIT_WAIT_CLIENT.waits,
+            &[Wait {
+                service: "pkgd",
+                deadline_ms: 3_000
+            }]
+        );
+        assert!(PKG_SLOT.is_posix() && PKG_SLOT.root && PKG_SLOT.connects.contains(&"pkgd"));
+        assert_eq!(PKG_SLOT.waits.len(), 1);
     }
 
     #[test]

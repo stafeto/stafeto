@@ -261,6 +261,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("store-probe", 20),
     ("store-probe steps", 25),
     ("store-crash", 25),
+    ("init-wait", 12),
+    ("pkg-slot", 12),
     ("gpu-probe", 8),
     ("input-probe", 10),
     ("posix-random", 19),

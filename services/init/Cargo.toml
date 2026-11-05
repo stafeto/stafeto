@@ -106,6 +106,10 @@ table-pci-walk-qemu = []
 # The disk service and its probe (xtask blk-probe).
 table-blk-probe = []
 table-store-probe = []
+# The package service with a client that waits 3 s for its READY (xtask init-wait).
+table-init-wait = []
+# The package service and the probe of its session in fork, spawn and exec (xtask pkg-slot).
+table-pkg-slot = []
 # The shell with the network service on Apple VZ, one and two network devices.
 table-net-vz = []
 table-net-vz2 = []

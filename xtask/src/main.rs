@@ -61,6 +61,7 @@ mod guards;
 mod htop_dialog;
 mod image;
 mod image_listing;
+mod init_wait;
 mod input_probe;
 mod jobs;
 mod keys;
@@ -91,6 +92,7 @@ mod packages;
 mod pci_walk;
 mod pkg;
 mod pkg_probes;
+mod pkg_slot;
 mod posix_display;
 mod posix_net;
 mod probe_ca;
@@ -1742,6 +1744,10 @@ commands:
   store-crash [N] kill the package service's machine at each crash point of the
             note (or at point N), start it again on the same disk file and compare
             the store it finds with the state before or after the change
+  init-wait run the wait of a record for the package service's READY: it starts after
+            READY, after the deadline of 3 s, and at once when the service ended
+  pkg-slot  run the C probe of the package service's session in fork, spawn and exec,
+            a set-ID program and the superuser's right, in QEMU
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
@@ -2088,6 +2094,8 @@ fn main() {
         Some("blk-probe") => blk_probe::command(&args[1..]),
         Some("store-probe") => store_probe::command(&args[1..]),
         Some("store-crash") => store_probe::crash(&args[1..]),
+        Some("init-wait") => init_wait::command(&args[1..]),
+        Some("pkg-slot") => pkg_slot::probe(&qemu::VIRT),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
             Some("--hvf") => hvf_host().and_then(|()| {
@@ -9119,6 +9127,12 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // The service built to stop at each crash point, the machine killed there and started
         // again on the same disk: the store is the whole old state or the whole new one.
         job("store-crash", || store_probe::crash(&[])),
+        // A record that waits for the package service's READY starts after it, at the
+        // deadline of the wait, and when the service ends first.
+        job("init-wait", || init_wait::command(&[])),
+        // The place Packages of the start area in fork, spawn and exec, and the right of the
+        // superuser alone through it.
+        job("pkg-slot", || pkg_slot::probe(&qemu::VIRT)),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and
@@ -12092,7 +12106,7 @@ fn ci_lints() -> Result<(), String> {
         "--package",
         "store-probe",
         "--features",
-        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report,virtio-gpu/crash,virtio-gpu/steps,virtio-input/steps,input-probe/quick,netd/probe,netd/steps,virtio-blk/crash,virtio-blk/steps,pkgd/steps,pkgd/crash,pkgd/no-ready",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -12140,6 +12154,8 @@ fn ci_lints() -> Result<(), String> {
         "posix-random-probe",
         "--package",
         "posix-display-probe",
+        "--package",
+        "pkg-slot-probe",
         "--package",
         "display-run",
         "--package",

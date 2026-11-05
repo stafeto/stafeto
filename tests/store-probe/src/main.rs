@@ -79,6 +79,14 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     let mode = mode();
     let done = match mode.as_slice() {
         b"" => run(),
+        // The client of xtask init-wait: it says when init started it.
+        b"wait" => {
+            say!(
+                "client started at {} ns",
+                rt::time::ticks_to_ns(rt::time::now())
+            );
+            Ok(())
+        }
         other => scenario(other),
     };
     match done {

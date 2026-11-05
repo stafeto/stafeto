@@ -88,7 +88,7 @@ const fn programs(steps: bool, crash: bool) -> [ImageProgram; 10] {
         ("loader", "loader", 0, &[]),
     ]
 }
-const PROGRAMS: [ImageProgram; 10] = programs(false, false);
+pub const PROGRAMS: [ImageProgram; 10] = programs(false, false);
 const PROGRAMS_STEPS: [ImageProgram; 10] = programs(true, false);
 const PROGRAMS_CRASH: [ImageProgram; 10] = programs(false, true);
 
@@ -411,7 +411,7 @@ fn image(steps: bool) -> Result<PathBuf, String> {
 
 /// An image whose tree has the files `files` under `/test/`, with the service built to stop at
 /// crash point `crash_at` when there is one.
-fn image_with(
+pub fn image_with(
     name: &str,
     programs: &'static [ImageProgram],
     files: Vec<(String, Vec<u8>)>,
@@ -457,10 +457,10 @@ fn image_with(
 }
 
 /// The file of a disk run: named by the process, removed at the end.
-struct Disk(PathBuf);
+pub struct Disk(pub PathBuf);
 
 impl Disk {
-    fn new(what: &str) -> Disk {
+    pub fn new(what: &str) -> Disk {
         Disk(std::env::temp_dir().join(format!("stafeto-store-{}-{what}.img", std::process::id())))
     }
 }
@@ -471,7 +471,10 @@ impl Drop for Disk {
     }
 }
 
-fn write_disk(disk: &Disk, contents: Option<&Contents>) -> Result<Option<host::Layout>, String> {
+pub fn write_disk(
+    disk: &Disk,
+    contents: Option<&Contents>,
+) -> Result<Option<host::Layout>, String> {
     qemu::store_file(&disk.0, DISK_BYTES, true)?;
     let Some(contents) = contents else {
         return Ok(None);

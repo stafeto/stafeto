@@ -779,6 +779,17 @@ impl Pkgd {
         }
     }
 
+    /// READY to init: the start is over (the probes of the wait change it: `no-ready` says
+    /// nothing, `exit-before-ready` ends the process).
+    fn say_ready(&mut self) {
+        #[cfg(feature = "exit-before-ready")]
+        sys::process_exit(7);
+        #[cfg(not(any(feature = "no-ready", feature = "exit-before-ready")))]
+        if let Err(why) = rt::service::ready(&self.parent) {
+            rt::println!("pkgd: READY refused: {why:?}");
+        }
+    }
+
     /// The buffers of sessions that went while the worker might read them go now that it
     /// does not.
     fn release_stale(&mut self) {
@@ -971,9 +982,7 @@ impl Service<0> for Pkgd {
             // start the records that wait for the service (spec 5, section 4).
             if !self.ready && !STARTING.load(Acquire) {
                 self.ready = true;
-                if let Err(why) = rt::service::ready(&self.parent) {
-                    rt::println!("pkgd: READY refused: {why:?}");
-                }
+                self.say_ready();
             }
             self.settle();
             #[cfg(feature = "steps")]
