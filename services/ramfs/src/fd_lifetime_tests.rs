@@ -158,7 +158,9 @@ fn real_reference_bookkeeping_has_measured_fixed_layout() {
         core::mem::size_of::<Fds>()
     );
     assert_eq!(core::mem::size_of::<Shared>(), 72);
-    assert_eq!(core::mem::size_of::<Fds>(), 3592);
+    assert_eq!(core::mem::size_of::<Fds>(), 2240);
+    // The tables of numbers and receipts are not part of it: they are a pool.
+    assert_eq!(core::mem::size_of::<Wide>(), 4864);
     assert_eq!(
         core::mem::size_of::<[Option<proto_fs::CloseEvent>; 16]>(),
         512
@@ -195,11 +197,11 @@ fn authoritative_ofd_life_checks_slot_generation_and_real_count_independently_of
 }
 
 #[test]
-fn detached_true_fds_keep_admission_until_all_32_physical_holds_return() {
+fn detached_true_fds_keep_admission_until_all_physical_holds_return() {
     let mut ram = Ram::default();
     let mut fds = Fds::default();
     assert!(fds.custody_empty());
-    let mut held_fds = [0; OPEN_MAX];
+    let mut held_fds = [0; PLACES];
     for fd in &mut held_fds {
         *fd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
     }
@@ -207,13 +209,15 @@ fn detached_true_fds_keep_admission_until_all_32_physical_holds_return() {
         let opened = held(&ram, &fds, fd);
         ram.detach_descriptor(&mut fds, opened).unwrap();
     }
-    assert_eq!(fds.live_fds, 0);
+    assert!(ram.detached(&fds));
     assert!(!fds.custody_empty());
-    for left in (0..OPEN_MAX).rev() {
+    for left in (0..PLACES).rev() {
         assert!(ram.release_step(&mut fds));
         assert_eq!(fds.custody_empty(), left == 0);
         assert_eq!(ram.open_descriptions(), left);
     }
+    // The last number takes the session's tables of numbers back with it.
+    assert_eq!(ram.wides.held(), 0);
     assert!(!ram.release_step(&mut fds));
     assert!(fds.custody_empty());
 }

@@ -253,8 +253,8 @@ impl Descriptor {
             (6, n) => Names::Random(n),
             (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
             (8, packed)
-                if packed & !0x003fff3f == 0
-                    && (3..35).contains(&(packed & 63))
+                if packed & !proto_fs::FIFO_PACKED_MASK == 0
+                    && proto_fs::is_session_number(packed & proto_fs::OPEN_FD_MASK)
                     && ram_generation != 0
                     && pipe_generation != 0 =>
             {
@@ -2655,7 +2655,9 @@ mod fifo_identity_tests {
         Descriptor {
             fd,
             names: Names::Fifo {
-                packed: 34 | (127 << 8) | (127 << 15),
+                packed: 1074
+                    | (8191 << proto_fs::OPEN_DESCRIPTION_SHIFT)
+                    | (127 << proto_fs::FIFO_TICKET_SHIFT),
                 ram_generation: 0x1234567800000001,
                 pipe_generation: 0xabcdef1200000001,
             },

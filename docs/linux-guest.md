@@ -40,7 +40,7 @@ package; update the lock and record the new pins in the report of the run.
 `cargo xtask linux-guest build` writes the overlay from the sources that
 stafeto's image uses: `tools/nginx/nginx.conf` as `/etc/nginx/nginx.conf`, and the
 files under `/www`: `index.html`, `1k.bin`, `10k.bin`, `256k.bin`, the set W1
-(1 000 files of 10 KiB under `/www/s/`) and the set W2 (64 files of 256 KiB under
+(900 files of 10 KiB under `/www/s/`) and the set W2 (64 files of 256 KiB under
 `/www/l/`), from the generators of `rootfs` and `nginx_probe` and fixed seeds.
 `/etc/nginx/mime.types` is the `conf/mime.types` of the nginx source that
 stafeto's image carries, written into the overlay as well, so that a new pin of
@@ -76,8 +76,10 @@ four CPUs, and compares with what stafeto's sources say:
   hashing program both guests have; stafeto's BusyBox has no `sha256sum`). A file
   that is missing, extra or changed is named; the paths and hashes are hashed once
   more into the digest of the report;
-- twelve files of `/www` fetched from the Mac and compared byte by byte (the
-  four first files and the first and last two of each set; see the limit below);
+- every file of `/www` (the four of the first measurements, the 900 files of W1 and
+  the 64 files of W2) fetched from the Mac over HTTP and compared byte by byte, so a
+  server that refuses one file of the sets, as nginx does when it has no descriptor
+  left for it (`open() failed (24: Too many open files)`), fails the check;
 - nginx must not print `running with OpenSSL`: the library of the guest is the one
   nginx was built with;
 - the lease macOS gave the guest's MAC address (`/var/db/dhcpd_leases`) is the
@@ -114,17 +116,17 @@ sides. Alpine's packages are pinned by SHA-256 taken from one download over
 HTTPS on 2026-11-05; the signatures of the packages and of `APKINDEX` are not
 checked.
 
-## A limit of stafeto the sets meet
+## The descriptors the sets need
 
-The RAM service lets a client hold 32 open files (`OPEN_MAX` in
-`services/ramfs/src/lib.rs`), and nginx keeps every file it served open with
-`open_file_cache max=1000`. A worker of stafeto that has served about 30
-distinct files answers 500 (`open() failed (24: Too many open files)`) to the
-next. The sets W1 and W2 of the load, as designed, hit it; so `check` fetches
-twelve files over HTTP and verifies all of them by hash inside the guests. The
-Linux guest has no such limit. This is for the owner to decide before the
-measurement of stage P7 (a smaller `open_file_cache` on both sides, or a larger
-`OPEN_MAX` in the RAM service).
+nginx keeps every file it served open with `open_file_cache max=1000`, so a worker
+that has served all of W1 holds 900 files, its sockets and the descriptors it has
+besides (the guest of Linux showed 14 of those for an idle worker). Both systems give a
+process 1 024 descriptors: `RLIMIT_NOFILE` of Linux is 1 024 by default, and the
+layer of stafeto takes 1 024 numbers (`OPEN_MAX` of `lib/posix-fs`). 900 files, the 64
+connections of one worker and the 14 others stay under that on both systems, and
+a set of 1 000 files would not. The RAM service gives a session 1 072 places, 8 192
+open descriptions for the whole service and 6 144 of them for one root
+(`services/ramfs`), so its own limits are no tighter than the layer's.
 
 ## The guest is never shipped
 

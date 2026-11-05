@@ -45,7 +45,7 @@ pub struct DataDescription {
 impl DataDescription {
     pub fn validate(self) -> Result<(), Status> {
         if self.packed & !(OPEN_DESCRIPTION_MASK | OPEN_FD_MASK) != 0
-            || !(3..=34).contains(&(self.packed & OPEN_FD_MASK))
+            || !crate::is_session_number(self.packed & OPEN_FD_MASK)
             || self.generation == 0
         {
             return Err(Status::BadSize);
@@ -56,7 +56,7 @@ impl DataDescription {
         self.packed & OPEN_FD_MASK
     }
     pub fn slot(self) -> u32 {
-        (self.packed & OPEN_DESCRIPTION_MASK) >> 8
+        (self.packed & OPEN_DESCRIPTION_MASK) >> crate::OPEN_DESCRIPTION_SHIFT
     }
 }
 
@@ -291,7 +291,7 @@ mod tests {
             },
             kind,
             description: DataDescription {
-                packed: 34 | (127 << 8),
+                packed: 1074 | (8191 << crate::OPEN_DESCRIPTION_SHIFT),
                 generation: 1,
             },
             count: if kind == DataKind::Truncate { 0 } else { 1012 },
@@ -321,9 +321,14 @@ mod tests {
                 Err(Status::BadSize)
             );
         }
-        for bit in [6, 7, 15, 16, 30, 31] {
+        for bit in [24, 25, 30, 31] {
             let mut args = start(DataKind::Write);
             args.description.packed |= 1 << bit;
+            assert_eq!(args.validate(), Err(Status::BadSize));
+        }
+        for fd in [0, 2, 1075, 2047] {
+            let mut args = start(DataKind::Write);
+            args.description.packed = fd;
             assert_eq!(args.validate(), Err(Status::BadSize));
         }
         let mut args = start(DataKind::Read);

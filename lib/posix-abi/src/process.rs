@@ -2101,7 +2101,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // The old image's session remains tied to its authority. The new image
     // receives a true unclaimed clone whose Pending binding the Loader authenticates.
     let Ok(files) =
-        rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
+        rt::fs::Files::clone_exact_all_on(&Handle::<Channel>::borrowed(files), &kept[..count])
     else {
         return false;
     };
@@ -2151,6 +2151,10 @@ pub(crate) fn clone_errno(status: Status) -> i32 {
     match status {
         Status::Kernel(rt::abi::Error::LimitReached) => EAGAIN,
         Status::Kernel(rt::abi::Error::NoMemory) => ENOMEM,
+        // The file service has no place left for the clone (births, numbers or descriptions).
+        Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES | proto_fs::TOO_MANY_FILES_IN_SYSTEM) => {
+            EAGAIN
+        }
         _ => EIO,
     }
 }
@@ -2197,8 +2201,9 @@ fn commit(
         Ok((files.raw(), uart.map(Handle::raw)))
     })?;
     let (kept, count) = shadow.shared();
-    let files = rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
-        .map_err(clone_errno)?;
+    let files =
+        rt::fs::Files::clone_exact_all_on(&Handle::<Channel>::borrowed(files), &kept[..count])
+            .map_err(clone_errno)?;
     let uart = match uart {
         Some(u) => Some(
             rt::service::clone_session(

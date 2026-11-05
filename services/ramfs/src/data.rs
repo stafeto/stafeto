@@ -339,7 +339,7 @@ mod tests {
             count,
             position,
             description: DataDescription {
-                packed: fd | ((token.slot as u32) << 8),
+                packed: fd | ((token.slot as u32) << proto_fs::OPEN_DESCRIPTION_SHIFT),
                 generation: token.generation,
             },
         }

@@ -18,7 +18,9 @@ pub const FILE_PAGES: usize = 2048;
 pub const INODE_SHARE: u16 = 192;
 pub const DENTRY_SHARE: u16 = 384;
 pub const PAGE_SHARE: u16 = 3072;
-pub const DESCRIPTION_SHARE: u16 = 96;
+/// The descriptions one root may hold: three quarters of the service's, as the shares of
+/// inodes, names and pages are.
+pub const DESCRIPTION_SHARE: u16 = 6144;
 pub const ROOTS: usize = 320;
 pub const PREPARATIONS: usize = 128;
 pub const PREPARATION_SHARE: u16 = 96;
@@ -1415,7 +1417,7 @@ impl<'a> Storage<'a> {
         let i = self.account(root)?;
         let a = self.state.accounts[i].as_mut().unwrap();
         if a.usage.descriptions == DESCRIPTION_SHARE {
-            return Err(proto_fs::TOO_MANY_OPEN_FILES);
+            return Err(proto_fs::TOO_MANY_FILES_IN_SYSTEM);
         }
         a.usage.descriptions += 1;
         Ok(())

@@ -1803,7 +1803,8 @@ static void pins_close_on_fork(void) {
 }
 
 /* A process maps 16 files shared, closes them and starts the program
- * `after`, which finds the 32 places of its session free. */
+ * `after`, which finds the places of its session free (every number
+ * of the table). */
 static int pins_exec(const char *how) {
     pin_unlink_all();
     for (int i = 0; i < PINS; i++) {
@@ -1821,20 +1822,22 @@ static int pins_exec(const char *how) {
 static int pins_after(void) {
     char path[48];
     pin_path(path, sizeof path, 1);
-    int fds[40];
+    static int fds[1100];
     int opened = 0;
-    while (opened < 40 && (fds[opened] = open(path, O_RDWR | O_CREAT, 0600)) >= 0) opened++;
+    while (opened < 1100 && (fds[opened] = open(path, O_RDWR | O_CREAT, 0600)) >= 0) opened++;
     int count = opened;
     while (opened > 0) close(fds[--opened]);
     pin_unlink_all();
-    return count >= 32 ? 0 : 1;
+    /* Every number of the layer's table is free, with the 16 places of the pins
+     * of the service's session beside them. */
+    return count >= 1000 ? 0 : 1;
 }
 
 static void pins_through_exec(void) {
     char *plain[] = {"map", "pinsafter", NULL};
     char *args[] = {"map", "pinexec", "exec", NULL};
     int free_places = spawn_status(plain);
-    check("pins: a new process has the 32 places", free_places == 0);
+    check("pins: a new process has all its places", free_places == 0);
     int after = spawn_status(args);
     check("pins: exec drops the pins", after == 0);
     pin_unlink_all();

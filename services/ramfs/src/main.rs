@@ -104,6 +104,15 @@ struct StorageBss(UnsafeCell<core::mem::MaybeUninit<ramfs::storage::State>>);
 // SAFETY: only the service thread accesses the storage tables.
 unsafe impl Sync for StorageBss {}
 static STORAGE: StorageBss = StorageBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct DescriptionsBss(UnsafeCell<core::mem::MaybeUninit<ramfs::Descriptions>>);
+// SAFETY: only the service thread accesses the table of open descriptions.
+unsafe impl Sync for DescriptionsBss {}
+static DESCRIPTION_TABLE: DescriptionsBss =
+    DescriptionsBss(UnsafeCell::new(core::mem::MaybeUninit::uninit()));
+struct WidesBss(UnsafeCell<core::mem::MaybeUninit<ramfs::Wides>>);
+// SAFETY: only the service thread accesses the tables of numbers and receipts.
+unsafe impl Sync for WidesBss {}
+static WIDE_TABLES: WidesBss = WidesBss(UnsafeCell::new(core::mem::MaybeUninit::zeroed()));
 struct LocksBss(UnsafeCell<core::mem::MaybeUninit<SimpleLocks>>);
 // SAFETY: the sole service thread initializes and owns all lock tables.
 unsafe impl Sync for LocksBss {}
@@ -222,10 +231,22 @@ fn main(_: u64) -> u64 {
         Waits::initialize_at(waits);
         (&mut *jobs, &mut *waits)
     };
+    // SAFETY: the table of descriptions is exclusive permanent storage; every field is written first.
+    let descriptions = unsafe {
+        let pointer = (*DESCRIPTION_TABLE.0.get()).as_mut_ptr();
+        ramfs::Descriptions::initialize_at(pointer);
+        &mut *pointer
+    };
+    // SAFETY: the pool of tables is zeroed permanent storage; its stack of free ones is written first.
+    let wides = unsafe {
+        let pointer = (*WIDE_TABLES.0.get()).as_mut_ptr();
+        ramfs::Wides::initialize_at(pointer);
+        &mut *pointer
+    };
     // SAFETY: RAM is exclusive permanent storage; every field is written first.
     let ram = unsafe {
         let pointer = (*RAM.0.get()).as_mut_ptr();
-        Ram::initialize_at(pointer, now, state, data, tree);
+        Ram::initialize_at(pointer, now, state, descriptions, wides, data, tree);
         &mut *pointer
     };
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
@@ -283,6 +304,8 @@ fn main(_: u64) -> u64 {
             + core::mem::size_of::<WaitQueue>()
             + core::mem::size_of::<Waits<Handle<Channel>>>()
             + core::mem::size_of::<Ram<'static>>()
+            + core::mem::size_of::<ramfs::Descriptions>()
+            + core::mem::size_of::<ramfs::Wides>()
     );
     rt::println!("ramfs: ready");
     // SAFETY: only the main thread reaches TABLES, here once.
@@ -462,6 +485,13 @@ const CLONES: usize = 320;
 /// LIMIT_REACHED. A child that never touches a file keeps its birth, so
 /// there is room for every record and its transient binding preparation.
 const BIRTHS: usize = CLONES;
+/// A description's count of references (16 bits) never overflows: each session and
+/// each birth holds a description once.
+const _: () = assert!(SESSIONS + BIRTHS < u16::MAX as usize);
+/// A label has one place, as a birth and then as a session: the places can all hold tables.
+// One table per place: a label holds a table from its first number to the end of its
+// cleanup, and its place is given back after.
+const _: () = assert!(SESSIONS == ramfs::WIDES);
 
 /// The identity channels of the sessions, by index, with a list of the
 /// free indexes: taking one costs the same with any number alive.
@@ -880,6 +910,12 @@ impl Fs {
 
     /// A dead or superseded authority releases one retained reference per pass.
     fn cleanup_step(&mut self, fds: &mut Fds, label: u64) -> bool {
+        // The logical death of a departed session's descriptors goes on by portions: a
+        // session holds up to 1 072 numbers, and one step detaches `CLONE_PORTION`.
+        if fds.departed && !self.ram.detached(fds) {
+            self.ram.detach_session_descriptions(fds, self.locks);
+            return true;
+        }
         if fds.departed && fds.wait_departure < 16 {
             self.waits.departure(
                 self.wait_jobs,
@@ -1520,43 +1556,61 @@ fn value(r: &mut Request<'_>, number: u32) -> Answer {
 }
 
 impl Fs {
-    /// CLONE with a list of descriptors of the session `fds` (count u32,
-    /// then each u32): a session of the service's own label whose
+    /// The list of a CLONE, CLONE_EXACT or CLONE_MORE: `count` entries of `body`, each a
+    /// number (CLONE) or a packed number and description slot with the generation of
+    /// the description (the exact forms) that `fds` must hold, into `list`.
+    fn clone_list(
+        &self,
+        fds: &Fds,
+        body: &mut proto_wire::Reader<'_>,
+        exact: bool,
+        list: &mut [u32],
+    ) -> Result<(), Answer> {
+        for fd in list {
+            let Ok(n) = body.u32() else {
+                return Err(Answer::Status(Status::BadSize));
+            };
+            if !exact {
+                *fd = n;
+                continue;
+            }
+            let Ok(generation) = body.u64() else {
+                return Err(Answer::Status(Status::BadSize));
+            };
+            if n & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
+                || !proto_fs::is_session_number(n & proto_fs::OPEN_FD_MASK)
+                || generation == 0
+            {
+                return Err(Answer::Status(Status::BadSize));
+            }
+            *fd = n & proto_fs::OPEN_FD_MASK;
+            let expected = ramfs::storage::Token {
+                slot: ((n & proto_fs::OPEN_DESCRIPTION_MASK) >> proto_fs::OPEN_DESCRIPTION_SHIFT)
+                    as u16,
+                generation,
+            };
+            if self.ram.description_token(fds, *fd) != Ok(expected) {
+                return Err(status(proto_fs::STALE_PROOF));
+            }
+        }
+        Ok(())
+    }
+
+    /// CLONE with a list of descriptors of the session `fds` (count u32 of at most
+    /// `CLONE_PORTION`, then each u32): a session of the service's own label whose
     /// descriptors of the same numbers share their open descriptions;
     /// BAD_FD for a number of none, LIMIT_REACHED with BIRTHS clones that
-    /// sent nothing yet.
+    /// sent nothing yet. The reply after the status is the birth word that
+    /// CLONE_MORE names the clone by, with the session as the handle.
     fn clone_session(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let mut list = [0u32; 32];
+        let mut list = [0u32; ramfs::CLONE_PORTION];
         let Ok(count) = ramfs::clone_count(&mut body, r.handles.len()) else {
             return Answer::Status(Status::BadSize);
         };
-        for fd in &mut list[..count] {
-            let Ok(n) = body.u32() else {
-                return Answer::Status(Status::BadSize);
-            };
-            if r.method() == Method::CloneExact as u16 {
-                let Ok(generation) = body.u64() else {
-                    return Answer::Status(Status::BadSize);
-                };
-                if n & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
-                    || !(3..35).contains(&(n & proto_fs::OPEN_FD_MASK))
-                    || generation == 0
-                {
-                    return Answer::Status(Status::BadSize);
-                }
-                *fd = n & proto_fs::OPEN_FD_MASK;
-                let expected = ramfs::storage::Token {
-                    slot: ((n & proto_fs::OPEN_DESCRIPTION_MASK)
-                        >> proto_fs::OPEN_DESCRIPTION_SHIFT) as u16,
-                    generation,
-                };
-                if self.ram.description_token(fds, *fd) != Ok(expected) {
-                    return status(proto_fs::STALE_PROOF);
-                }
-            } else {
-                *fd = n;
-            }
+        let exact = r.method() == Method::CloneExact as u16;
+        if let Err(answer) = self.clone_list(fds, &mut body, exact, &mut list[..count]) {
+            return answer;
         }
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
@@ -1597,7 +1651,12 @@ impl Fs {
         }
         match self.session(label) {
             Ok(session) => {
-                if r.reply().u32(0).is_err() {
+                let reply = r.reply();
+                if reply
+                    .u32(0)
+                    .and_then(|()| reply.u32(Self::birth_word(label)))
+                    .is_err()
+                {
                     self.drop_identity(&mut child);
                     self.ram.release(&mut child);
                     return Answer::Status(Status::BadSize);
@@ -1613,6 +1672,55 @@ impl Fs {
                 Answer::Status(Status::Kernel(e))
             }
         }
+    }
+
+    /// CLONE_MORE: the birth word, a count of 1 to `CLONE_PORTION` and the exact
+    /// numbers (as CLONE_EXACT has them): the descriptions join the birth of the
+    /// calling session's own clone that sent nothing yet. Nothing changes unless all
+    /// of them join (`Ram::clone_more_fds`).
+    fn clone_more(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut body = r.body();
+        let (Ok(word), Ok(count)) = (body.u32(), body.u32()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let count = count as usize;
+        if count == 0 || count > ramfs::CLONE_PORTION {
+            return Answer::Status(Status::BadSize);
+        }
+        let mut list = [0u32; ramfs::CLONE_PORTION];
+        if let Err(answer) = self.clone_list(fds, &mut body, true, &mut list[..count]) {
+            return answer;
+        }
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let i = Self::birth_index(u64::from(word));
+        let Some(label) = self
+            .births
+            .get(i)
+            .and_then(Option::as_ref)
+            .map(|(label, _)| *label)
+            .filter(|&label| Self::birth_word(label) == word)
+            .filter(|&label| self.clones.client_of(label) == Some(r.label()))
+        else {
+            return status(proto_fs::BAD_FD);
+        };
+        let (_, mut child) = self.births[i].take().expect("a birth the caller made");
+        let result = self.ram.clone_more_fds(fds, &list[..count], &mut child);
+        self.births[i] = Some((label, child));
+        match result {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(code) => status(code),
+        }
+    }
+
+    /// The word of the birth of the clone `label`: the low 32 bits of its label, in
+    /// which the place of the birth and the generation of the label both stand.
+    fn birth_word(label: u64) -> u32 {
+        label as u32
     }
 }
 
@@ -2155,7 +2263,7 @@ impl Service<0> for Fs {
             if !r.handles.is_empty() || r.body().finish().is_err() {
                 return Answer::Status(Status::BadSize);
             }
-            let counts = s.data.retained_counts();
+            let counts = self.ram.retained_counts(&s.data);
             let phase = self
                 .identities
                 .get(s.data.authority_index as usize)
@@ -2463,6 +2571,7 @@ impl Service<0> for Fs {
         let mut body = r.body();
         match Method::from_number(r.method()) {
             Some(Method::Clone | Method::CloneExact) => self.clone_session(&s.data, r),
+            Some(Method::CloneMore) => self.clone_more(&s.data, r),
             Some(
                 Method::OpenExec
                 | Method::OpenExecFd
@@ -2778,7 +2887,7 @@ impl Service<0> for Fs {
                 if body.finish().is_err()
                     || !r.handles.is_empty()
                     || packed & !(proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK) != 0
-                    || !(3..35).contains(&(packed & proto_fs::OPEN_FD_MASK))
+                    || !proto_fs::is_session_number(packed & proto_fs::OPEN_FD_MASK)
                     || generation == 0
                 {
                     return Answer::Status(Status::BadSize);

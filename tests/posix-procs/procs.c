@@ -925,6 +925,132 @@ static int steps_fork_many(void) {
     return 0;
 }
 
+/* The role stepopen (stafeto-design#578): the RAM file service with sessions of
+ * many numbers.
+ *
+ * Phase 1, the limits: seven children open 880 files each and hold them, 6 160
+ * descriptions of the service for one root, past its share of 6 144. The one
+ * that is told so gets ENFILE (the service's, and the root's share), and
+ * this process, whose table has numbers to spare, gets ENFILE too.
+ *
+ * Phase 2, the steps: five children open 1 000 files each and hold them; with
+ * those 5 000 descriptions held, this process opens 1 000 of its own, reads 12 KiB
+ * at several of them, and forks with all of them (CLONE_EXACT of 32, then 31
+ * CLONE_MORE); the children of the forks end holding 1 000 numbers (the
+ * departure of the session, a portion at a time). Then the holders end and this
+ * process closes its numbers. The service prints its longest steps itself; the run
+ * checks them against B. */
+#define STEPS_OPEN_FILES 1000
+#define STEPS_OPEN_HOLDERS 5
+#define STEPS_LIMIT_HOLDERS 7
+#define STEPS_LIMIT_FILES 880
+/* Opens up to `count` files into `fds`; how many, with errno of the refusal. */
+static int steps_open_files(int fds[], int count) {
+    int opened = 0;
+    while (opened < count && (fds[opened] = open("/bin/procs-child", O_RDONLY)) >= 0) opened++;
+    return opened;
+}
+/* Holders: each forks, opens `count` files, tells by `ready` how it ended ('x' all, 'f' ENFILE,
+ * 'm' EMFILE, 'o' another error) and holds them until `release` closes. */
+static int steps_holders(pid_t holders[], int n, int count, int ready[2], int release[2]) {
+    for (int h = 0; h < n; h++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            printf("posix-procs: steps: holder %d fork gave %s\n", h, strerror(errno));
+            return 82;
+        }
+        if (pid == 0) {
+            int *own = malloc(count * sizeof *own);
+            if (!own) _exit(8);
+            int opened = steps_open_files(own, count);
+            char c = opened == count ? 'x' : errno == ENFILE ? 'f' : errno == EMFILE ? 'm' : 'o';
+            if (write(ready[1], &c, 1) != 1) _exit(10);
+            /* The end of the pipe lets this child go. */
+            close(release[1]);
+            if (read(release[0], &c, 1) != 0) _exit(11);
+            _exit(7);
+        }
+        holders[h] = pid;
+    }
+    return 0;
+}
+static int steps_holders_end(pid_t holders[], int n) {
+    for (int h = 0; h < n; h++) {
+        int status = -1;
+        if (waitpid(holders[h], &status, 0) != holders[h] || !WIFEXITED(status) || WEXITSTATUS(status) != 7)
+            return 87;
+    }
+    return 0;
+}
+static int steps_open(void) {
+    int *fds = malloc(STEPS_OPEN_FILES * sizeof *fds);
+    char *block = malloc(12288);
+    if (!fds || !block) return 80;
+    pid_t holders[STEPS_LIMIT_HOLDERS];
+    int ready[2], release[2];
+    /* Phase 1. */
+    if (pipe(ready) != 0 || pipe(release) != 0) return 81;
+    int failed = steps_holders(holders, STEPS_LIMIT_HOLDERS, STEPS_LIMIT_FILES, ready, release);
+    if (failed) return failed;
+    int told_enfile = 0;
+    for (int h = 0; h < STEPS_LIMIT_HOLDERS; h++) {
+        char c;
+        if (read(ready[0], &c, 1) != 1) return 83;
+        if (c == 'f') told_enfile++;
+        else if (c != 'x') {
+            printf("posix-procs: steps: a holder was refused with '%c'\n", c);
+            return 89;
+        }
+    }
+    int more = open("/bin/procs-child", O_RDONLY);
+    if (told_enfile == 0 || more >= 0 || errno != ENFILE) {
+        printf("posix-procs: steps: %d holders told ENFILE, an open gave %d errno %d\n", told_enfile, more, errno);
+        return 90;
+    }
+    close(release[1]);
+    close(release[0]);
+    close(ready[0]);
+    close(ready[1]);
+    failed = steps_holders_end(holders, STEPS_LIMIT_HOLDERS);
+    if (failed) return failed;
+    /* Phase 2. */
+    if (pipe(ready) != 0 || pipe(release) != 0) return 81;
+    failed = steps_holders(holders, STEPS_OPEN_HOLDERS, STEPS_OPEN_FILES, ready, release);
+    if (failed) return failed;
+    for (int h = 0; h < STEPS_OPEN_HOLDERS; h++) {
+        char c;
+        if (read(ready[0], &c, 1) != 1 || c != 'x') return 83;
+    }
+    if (steps_open_files(fds, STEPS_OPEN_FILES) != STEPS_OPEN_FILES) return 88;
+    for (int i = 0; i < STEPS_OPEN_FILES; i += 100)
+        if (pread(fds[i], block, 12288, 0) != 12288) return 84;
+    for (int i = 0; i < 3; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            printf("posix-procs: steps: fork with %d files gave %s, where %#llx\n", STEPS_OPEN_FILES, strerror(errno), stafeto_probe_fork_refusal());
+            return 85;
+        }
+        if (pid == 0) {
+            char c;
+            _exit(pread(fds[STEPS_OPEN_FILES - 1], &c, 1, 0) == 1 ? 7 : 9);
+        }
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 7) return 86;
+    }
+    close(release[1]);
+    close(release[0]);
+    close(ready[0]);
+    close(ready[1]);
+    failed = steps_holders_end(holders, STEPS_OPEN_HOLDERS);
+    if (failed) return failed;
+    for (int i = 0; i < STEPS_OPEN_FILES; i++)
+        if (close(fds[i]) != 0) return 88;
+    free(fds);
+    free(block);
+    printf("posix-procs: steps: open files ok\n");
+    return 0;
+}
+
 #if SHARE_STEPS
 /* The role stepwaiters: the table of the asks that wait for a shared object
  * full. The pause of the maker (stafeto_probe_fill_pause) holds the entry
@@ -1579,6 +1705,11 @@ static int steps_run(void) {
         return 7;
     }
 #endif
+    /* The RAM file service with sessions of 1 000 numbers (stafeto-design#578),
+     * before the crowd: five children hold 1 000 files each at once. */
+    pid_t opener = -1;
+    if (steps_spawn(&opener, "stepopen", "0") != 0) return 5;
+    reap("a child with 1 000 open files", opener, 0, 0);
     pid_t branches[STEPS_BRANCHES];
     for (int b = 0; b < STEPS_BRANCHES; b++) {
         char index[8];
@@ -3050,10 +3181,13 @@ static int proc_fd_role(void) {
 static int proc_descriptions(void) {
     pid_t other = getppid();
     int before = failures;
-    /* One descriptor free: the open of a file of /proc takes it, and no
-     * second one for a pipe. */
-    int held[80], count = 0;
-    for (; count < 80; count++) {
+    /* One descriptor free (the table of the layer is full: the file service has
+     * places to spare): the open of a file of /proc takes it, and no second
+     * one for a pipe. */
+    /* In the heap: a static array would raise the program's pages in every stage. */
+    int *held = malloc(1100 * sizeof *held), count = 0;
+    if (!held) return 1;
+    for (; count < 1100; count++) {
         held[count] = open("/dev/null", O_RDONLY);
         if (held[count] < 0) break;
     }
@@ -3067,6 +3201,7 @@ static int proc_descriptions(void) {
     expect("it reads", fd >= 0 && read(fd, text, sizeof text - 1) > 0 && atoi(text) == (int)getpid(), 1);
     if (fd >= 0) close(fd);
     while (count > 0) close(held[--count]);
+    free(held);
 
     printf("posix-procs: proc stage nine\n");
     /* Nine directories of processes open together, each lists and reads the
@@ -3187,6 +3322,7 @@ static int role(const char *name) {
 #endif
     if (strcmp(name, "stepfork") == 0) return steps_fork();
     if (strcmp(name, "stepforkmany") == 0) return steps_fork_many();
+    if (strcmp(name, "stepopen") == 0) return steps_open();
     if (strcmp(name, "steppipes") == 0) return steps_pipes();
 #if SHARE_STEPS
     if (strcmp(name, "stepwaiters") == 0) return steps_waiters();

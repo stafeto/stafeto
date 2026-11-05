@@ -287,30 +287,38 @@ fn reservation_cancellation_lost_reply_and_each_pin_keep_accounting() {
 #[test]
 fn description_share_is_charged_to_the_retained_root_across_clone() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
-    let mut fds = [Fds::default(); 4];
+    // Six sessions of 1 024 numbers take the share of FIRST.
+    let each = DESCRIPTION_SHARE as usize / 6;
+    let mut fds = core::array::from_fn::<Fds, 7, _>(|_| Fds::default());
     for session in &mut fds {
         session.root = FIRST;
     }
-    for session in &mut fds[..3] {
-        for _ in 0..32 {
+    for session in &mut fds[..6] {
+        for _ in 0..each {
             ram.open(session, "/tmp/probe", READ_WRITE).unwrap();
         }
     }
     assert_eq!(ram.storage.usage(FIRST).descriptions, DESCRIPTION_SHARE);
     assert_eq!(
-        ram.open(&mut fds[3], "/tmp/probe", READ_WRITE),
-        Err(proto_fs::TOO_MANY_OPEN_FILES)
+        ram.open(&mut fds[6], "/tmp/probe", READ_WRITE),
+        Err(proto_fs::TOO_MANY_FILES_IN_SYSTEM)
     );
-    fds[3].root = SECOND;
+    fds[6].root = SECOND;
     for _ in 0..32 {
-        ram.open(&mut fds[3], "/tmp/probe", READ_WRITE).unwrap();
+        ram.open(&mut fds[6], "/tmp/probe", READ_WRITE).unwrap();
     }
-    assert_eq!(ram.open_descriptions(), 128);
+    assert_eq!(ram.open_descriptions(), DESCRIPTION_SHARE as usize + 32);
     let mut child = ram.clone_fds(&fds[0], &[3]).unwrap();
     ram.release(&mut fds[0]);
-    assert_eq!(ram.storage.usage(FIRST).descriptions, 65);
+    assert_eq!(
+        ram.storage.usage(FIRST).descriptions,
+        DESCRIPTION_SHARE - each as u16 + 1
+    );
     ram.release(&mut child);
-    assert_eq!(ram.storage.usage(FIRST).descriptions, 64);
+    assert_eq!(
+        ram.storage.usage(FIRST).descriptions,
+        DESCRIPTION_SHARE - each as u16
+    );
     for session in &mut fds {
         ram.release(session);
     }
@@ -354,7 +362,7 @@ fn sparse_original_overlay_and_boot_hardlinks_share_actual_bytes() {
 #[test]
 fn gone_sessions_cancel_paid_preparations_and_leave_the_other_roots_reserve() {
     let mut ram = Ram::new(proto_fs::Timestamp::legacy_ns(0));
-    let mut sessions = [Fds::default(); 8];
+    let mut sessions = core::array::from_fn::<Fds, 8, _>(|_| Fds::default());
     for (i, s) in sessions.iter_mut().enumerate() {
         s.root = if i < 6 { FIRST } else { SECOND };
         for j in 0..16 {
@@ -564,9 +572,21 @@ fn independent_review_open_directory_is_an_authorized_relative_base() {
         "directory inode={directory:?}, fd={fd}, description={:?}",
         ram.description_token(&fds, fd).unwrap()
     );
+    // A directory a descriptor holds is a base in the form of the descriptor, which one
+    // comparison of its description's generation checks; the raw token of that
+    // directory is no base, and no walk over the session's numbers looks for it.
     assert!(
-        ram.owns_directory_base(&fds, directory),
-        "genuine open directory denied as relative base"
+        !ram.owns_directory_base(&fds, directory),
+        "a raw token of a directory the session holds is no base"
+    );
+    let generation = ram.description_token(&fds, fd).unwrap().generation;
+    assert_eq!(
+        ram.request_base(&fds, fd | 1 << 31, generation, true),
+        Ok(directory)
+    );
+    assert_eq!(
+        ram.request_base(&fds, directory.slot.into(), directory.generation, true),
+        Err(proto_fs::BAD_FD)
     );
     ram.release(&mut fds);
 }

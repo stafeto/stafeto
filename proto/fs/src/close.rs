@@ -40,8 +40,9 @@ impl CloseEvent {
     pub fn validate(self) -> Result<usize, u32> {
         let index = self.key.validate()?;
         if self.packed & !(OPEN_FD_MASK | OPEN_DESCRIPTION_MASK) != 0
-            || !(3..35).contains(&(self.packed & OPEN_FD_MASK))
-            || (self.packed & OPEN_DESCRIPTION_MASK) >> OPEN_DESCRIPTION_SHIFT >= 128
+            || !crate::is_session_number(self.packed & OPEN_FD_MASK)
+            || (self.packed & OPEN_DESCRIPTION_MASK) >> OPEN_DESCRIPTION_SHIFT
+                >= crate::DESCRIPTIONS as u32
             || self.description_generation == 0
         {
             return Err(INVALID_ARGUMENT);
@@ -166,8 +167,8 @@ mod tests {
     fn close_events_reject_invalid_descriptors_and_never_publish_partial_requests() {
         for packed in [
             2,
-            35,
-            3 | 128 << OPEN_DESCRIPTION_SHIFT,
+            3 + crate::SESSION_PLACES as u32,
+            3 | (crate::DESCRIPTIONS as u32) << OPEN_DESCRIPTION_SHIFT,
             event().packed | crate::OPEN_RANDOM,
             u32::MAX,
         ] {

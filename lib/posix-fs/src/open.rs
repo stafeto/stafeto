@@ -160,7 +160,7 @@ impl Recovery {
         let fd = self.backend_fd & proto_fs::OPEN_FD_MASK;
         (self.backend_fd & !proto_fs::OPEN_RESULT_MASK == 0
             && self.description_generation != 0
-            && (3..35).contains(&fd))
+            && proto_fs::is_session_number(fd))
         .then_some(PreparedOpen {
             fd,
             slot: (self.backend_fd & proto_fs::OPEN_DESCRIPTION_MASK)

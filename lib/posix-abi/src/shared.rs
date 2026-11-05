@@ -142,12 +142,14 @@ pub unsafe fn after_fork(
     }
 }
 
-/// The descriptions of the RAM file service a forked child's session
-/// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
-pub fn kept_by_fork(
-    out: &mut [rt::fs::PreparedOpen; posix_fs::KEPT_BY_FORK_MAX],
-) -> Result<usize, i32> {
-    process_state(|files| files.kept_by_fork(out).map_err(crate::error))
+/// The next portion of the descriptions of the RAM file service a forked child's
+/// session shares (posix_fs::PosixFs::kept_by_fork_from), into `out`; how many and
+/// whether another portion follows.
+pub fn kept_by_fork_from(
+    cursor: &mut posix_fs::RamKept,
+    out: &mut [rt::fs::PreparedOpen; posix_fs::RAM_PORTION],
+) -> Result<(usize, bool), i32> {
+    process_state(|files| files.kept_by_fork_from(cursor, out).map_err(crate::error))
 }
 
 /// The ends of pipes a forked child's session shares

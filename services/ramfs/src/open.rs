@@ -377,9 +377,16 @@ mod tests {
             ram.storage.lookup(ROOT, b"finalized"),
             Err(proto_fs::NO_ENTRY)
         );
-        let slots = fds.slots;
-        let tentative = fds.tentative;
-        let receipts = fds.open_receipts;
+        let (numbers, taken, tentative, receipts, valid) = {
+            let wide = ram.wides.get(&fds);
+            (
+                wide.numbers,
+                wide.taken,
+                wide.tentative,
+                wide.receipts,
+                wide.receipts_valid,
+            )
+        };
         let now = proto_fs::Timestamp::legacy_ns(123);
         with_proof!(
             commit,
@@ -393,9 +400,12 @@ mod tests {
             now
         )
         .unwrap();
-        assert_eq!(fds.slots, slots);
-        assert_eq!(fds.tentative, tentative);
-        assert!(fds.open_receipts == receipts);
+        let wide = ram.wides.get(&fds);
+        assert_eq!(wide.numbers, numbers);
+        assert_eq!(wide.taken, taken);
+        assert_eq!(wide.tentative, tentative);
+        assert!(wide.receipts == receipts);
+        assert_eq!(wide.receipts_valid, valid);
         assert!(!journal.needs_time(&ram, &fds).unwrap());
         assert_eq!(ram.finish_preflighted(&mut fds, publication), held);
         assert_eq!(ram.finished_open(&fds, key), Ok(held));
@@ -741,7 +751,7 @@ mod create_directory_policy_tests {
             ram.prepare_open_token(&mut fds, ROOT, proto_fs::CREATE, identity, None),
             Err(proto_fs::IS_DIRECTORY)
         ));
-        assert!(fds.slots.iter().all(Option::is_none));
+        assert!(ram.wides.get(&fds).taken.is_empty());
         let held = ram
             .prepare_open_token(
                 &mut fds,
@@ -752,7 +762,7 @@ mod create_directory_policy_tests {
             )
             .unwrap();
         ram.cancel_open(&mut fds, held).unwrap();
-        assert!(fds.slots.iter().all(Option::is_none));
+        assert!(ram.wides.get(&fds).taken.is_empty());
         assert!(matches!(
             ram.prepare_open_token(
                 &mut fds,

@@ -767,19 +767,30 @@ fn sessions() -> Result<Sessions, i32> {
             slot: 0,
             generation: 0,
             random: false,
-        }; posix_fs::KEPT_BY_FORK_MAX];
+        }; posix_fs::RAM_PORTION];
         sub(3);
-        let count = crate::shared::kept_by_fork(&mut kept)?;
+        let mut cursor = posix_fs::RamKept::new();
+        let (count, mut more) = crate::shared::kept_by_fork_from(&mut cursor, &mut kept)?;
         let (files, uart) = crate::shared::with_files(|fs| {
             let (files, uart) = fs.sessions();
             Ok((files.raw(), uart.map(Handle::raw)))
         })?;
         sub(4);
-        // The complete captured list is validated before child references exist.
-        let clone =
-            rt::fs::Files::clone_exact_on(&Handle::<Channel>::borrowed(files), &kept[..count])
-                .map_err(clone_errno)?;
+        // Each portion is validated whole before it changes the child's session; the
+        // first creates it, the rest join it (CLONE_MORE, on the parent's session). A
+        // refusal drops the child's session with the rest (`out.close`), and the fork fails.
+        let files_session = Handle::<Channel>::borrowed(files);
+        let (clone, birth) = rt::fs::Files::clone_exact_birth_on(&files_session, &kept[..count])
+            .map_err(clone_errno)?;
         out.files = clone.into_raw().0;
+        while more {
+            let (count, next) = crate::shared::kept_by_fork_from(&mut cursor, &mut kept)?;
+            more = next;
+            if count != 0 {
+                rt::fs::Files::clone_more_on(&files_session, birth, &kept[..count])
+                    .map_err(clone_errno)?;
+            }
+        }
         sub(5);
         if let Some(uart) = uart {
             let clone = rt::service::clone_session(
