@@ -14,7 +14,7 @@ use abi::Access;
 use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 use pkgd::commit::{self, Change, Device, Kind, Opened, Refused};
 use pkgd::receipts::{BeginArgs, GROUP_MAX};
-use pkgd::settings::Settings;
+use pkgd::settings::{self, Settings};
 use pkgd::store::{self, BLOCK, Extent, PACKAGES, RECORDS, Table, field_bytes, find_free};
 use pkgd::{plans, verify};
 use pkgfmt::sha::sha256;
@@ -571,6 +571,28 @@ impl Worker {
         let Ok(parsed) = Settings::parse(&blob[..a.len]) else {
             return proto_pkg::INVALID;
         };
+        // A repository a package of the disk came from keeps its line and its key.
+        let mut held: [&str; store::REPOS] = [""; store::REPOS];
+        let mut n = 0;
+        // SAFETY: the worker's reads of the entries it writes; the table is the state.
+        let entries = unsafe { &*DISK_ENTRIES.get() };
+        for entry in entries.iter().flatten() {
+            let Some((name, _)) = table().repo(usize::from(entry.record.repo)) else {
+                continue;
+            };
+            let Ok(name) = core::str::from_utf8(name) else {
+                continue;
+            };
+            if name != settings::OFFICIAL && !held[..n].contains(&name) {
+                held[n] = name;
+                n += 1;
+            }
+        }
+        // SAFETY: the worker's; the live blob changes only in `publish`, in this thread.
+        let live: &[u8] = unsafe { &(&*SETTINGS.get()).0[..SETTINGS_LEN.load(Acquire)] };
+        if !parsed.keeps(live, &held[..n]) {
+            return proto_pkg::NEEDED_BY;
+        }
         // The object of the new layer waits in its own place until its table is the state.
         let attached_before = SETTINGS_LEN.load(Acquire) != 0
             && unsafe { &*OBJECTS.get() }[store::SETTINGS_SLOT].is_some();

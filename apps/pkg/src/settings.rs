@@ -73,8 +73,11 @@ pub struct Settings {
     pub keys: Vec<(String, Key)>,
 }
 
-/// `SHA256:<base64 of the SHA-256 of the 32 bytes, without the padding>`, as OpenSSH writes the
-/// fingerprint of a key.
+/// `SHA256:<base64 of the SHA-256 of the 32 bytes of the key, without the padding>`. It is written
+/// in the form OpenSSH uses for a fingerprint, but it is the hash of the raw key, not of the
+/// `ssh-ed25519` blob, so `ssh-keygen -lf` gives another number for the same key. A publisher
+/// computes it with `openssl pkey -pubin -outform DER | tail -c 32 | openssl dgst -sha256 -binary | base64`
+/// (the last 32 bytes of the DER of an Ed25519 public key are the key), without the `=`.
 pub fn fingerprint(key: &Key) -> String {
     let mut buf = [0u8; 44];
     let text = b64::encode(&sha::sha256(&key.public), &mut buf);
@@ -178,6 +181,37 @@ impl Settings {
         blob_of(&files)
     }
 
+    /// Whether these settings keep every repository a package of the disk came from: each still has
+    /// its line and the key it had in `old`. (The service holds the same rule for any client.)
+    pub fn check_against(&self, old: &Settings, installed: &[Installed]) -> Result<(), Refusal> {
+        for i in installed
+            .iter()
+            .filter(|i| !i.in_image() && i.repository != OFFICIAL)
+        {
+            let name = i.repository.as_str();
+            let listed = self
+                .lines
+                .iter()
+                .any(|l| matches!(l, Line::Add { name: n, .. } if n == name))
+                && !self
+                    .lines
+                    .iter()
+                    .any(|l| matches!(l, Line::Disable { name: n } if n == name));
+            let kept = match (self.key_of(name), old.key_of(name)) {
+                (Some(now), Some(was)) => now.public == was.public,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !listed || !kept {
+                return Err(Refusal::Installed {
+                    repository: name.into(),
+                    package: i.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn key_of(&self, name: &str) -> Option<&Key> {
         self.keys.iter().find(|(n, _)| n == name).map(|(_, k)| k)
     }
@@ -215,6 +249,7 @@ impl Settings {
             Ok(_) => {}
         }
         let key = keyfile::parse_public(key_file).map_err(|_| Refusal::Key(name.into()))?;
+        let old = self.clone();
         let address = address.trim_end_matches('/').to_string();
         let known = self
             .lines
@@ -244,6 +279,7 @@ impl Settings {
         }
         self.keys.retain(|(n, _)| n != name);
         self.keys.push((name.into(), key));
+        self.check_against(&old, installed)?;
         Ok(key)
     }
 
@@ -527,6 +563,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.keys[0].1.public, [2; 32]);
+    }
+
+    #[test]
+    fn the_files_of_save_keep_the_key_and_the_line_of_a_repository_a_package_stands_from() {
+        let mut old = Settings::default();
+        old.add("games", "https://h/x", &file(&key("a", 1)), &[])
+            .unwrap();
+        let stands = [held("hello-games", "games"), held("x", "stafeto")];
+        let k1 = file(&key("a", 1));
+        let k2 = file(&key("b", 2));
+        let text = "games https://h/y\n";
+        let save = |repos: Option<&str>, keys: &[(String, Option<String>)]| {
+            Settings::from_files(repos, keys).unwrap()
+        };
+        // The same key (another address) is kept.
+        let same = save(Some(text), &[("games".into(), Some(k1.clone()))]);
+        assert_eq!(same.check_against(&old, &stands), Ok(()));
+        // Another key, and no line, are refused with the line of add and remove.
+        let changed = save(Some(text), &[("games".into(), Some(k2))]);
+        assert_eq!(
+            changed.check_against(&old, &stands).unwrap_err().line(),
+            "pkg: games: hello-games is installed from it; pkg remove it first"
+        );
+        let gone = save(None, &[]);
+        assert!(gone.check_against(&old, &stands).is_err());
+        // With nothing installed from it, both are fine; a disabled repository has no line to keep.
+        assert_eq!(gone.check_against(&old, &[held("x", "stafeto")]), Ok(()));
+        assert_eq!(changed.check_against(&old, &[]), Ok(()));
+        let off = save(
+            Some("games https://h/y\ndisable games\n"),
+            &[("games".into(), Some(k1))],
+        );
+        assert!(off.check_against(&old, &stands).is_err());
     }
 
     #[test]

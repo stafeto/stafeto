@@ -3,7 +3,8 @@
 
 //! `runas <uid> <path> [arguments]`: the group and then the user become `<uid>` (the group
 //! first, since a process that is not the superuser cannot change it), and the program at
-//! `<path>` replaces this one and runs with the arguments. It is a program of the probes
+//! `<path>` replaces this one and runs with the arguments. The supplementary groups are emptied
+//! first, so the program has the one group and the one user. It is a program of the probes
 //! only (`cargo xtask pkg-probe` puts it at `/test/runas`): it shows what a program that is not
 //! the superuser's gets from the package tool. It ends with 125 for a bad command line, 126
 //! when an ID cannot be set and 127 when the program does not start, the codes a shell uses.
@@ -22,6 +23,7 @@ use rt as _;
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 unsafe extern "C" {
+    fn setgroups(count: usize, list: *const u32) -> c_int;
     fn setgid(id: u32) -> c_int;
     fn setuid(id: u32) -> c_int;
     fn execv(path: *const c_char, argv: *const *mut c_char) -> c_int;
@@ -57,7 +59,8 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
         let Some(id) = number(*argv.add(1)) else {
             return 125;
         };
-        if setgid(id) != 0 || setuid(id) != 0 {
+        // The supplementary groups of the superuser go first; the group and the user follow.
+        if setgroups(0, core::ptr::null()) != 0 || setgid(id) != 0 || setuid(id) != 0 {
             return 126;
         }
         execv(*argv.add(2), argv.add(2) as *const *mut c_char);

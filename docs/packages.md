@@ -753,7 +753,14 @@ the fingerprint with the publisher's. The key is never taken from the repository
 1 to 31 characters of `a-z`, `0-9` and `-`, is not `stafeto`, and there are fifteen at most. `pkg repo
 remove <name>` takes the line and the key away. Both are refused while a package installed from that
 repository stands (`pkg: games: hello-games is installed from it; pkg remove it first`): after a
-restart the service would check that package by the new key or by none and skip it. `pkg repo list`
+restart the service would check that package by the new key or by none and skip it. `pkg repo save`
+holds the same rule for the files, and so does the service for any client: a SETTINGS_SET whose blob
+drops the line of such a repository, disables it or changes its key is refused (`NEEDED_BY`). The
+fingerprint is `SHA256:` and the base64 of the SHA-256 of the 32 bytes of the key, without the `=`.
+It has the shape of an OpenSSH fingerprint but is the hash of the raw key, so `ssh-keygen -lf`
+gives another number; a publisher computes it from the DER of the public key with
+`openssl pkey -pubin -outform DER < key.pem | tail -c 32 | openssl dgst -sha256 -binary | base64`.
+`pkg repo list`
 shows the repositories with the fingerprints. All of it is one SETTINGS_SET of the blob the service
 holds, built by `pkg::settings` by the rules of the service, so what is sent is accepted.
 `/etc/pkg/repositories` and `/etc/pkg/keys/*.pub` are the settings layer, read-only; an edit lands in

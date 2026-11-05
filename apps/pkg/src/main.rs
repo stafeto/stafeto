@@ -369,7 +369,8 @@ impl Tool {
                 Err(s) => return Err(service(s, &r.name, &Detail::default())),
             },
         }
-        self.cache(r, &[("INDEX", &data), ("INDEX.sig", &sig)]);
+        // The signature first and the index last: a reader that meets the new index has its signature.
+        self.cache(r, &[("INDEX.sig", &sig), ("INDEX", &data)]);
         Ok((data, accepted, held))
     }
 
@@ -419,8 +420,10 @@ impl Tool {
         Ok(pkg::exit_of_reading(refused))
     }
 
-    /// The installed packages with the `provides` and `depends` of their `meta`.
-    fn installed(&self) -> Result<Vec<Installed>, Line> {
+    /// The installed packages with the `provides` and `depends` of their `meta`. With `strict` a
+    /// package whose `meta` the service does not give is a refusal: a plan of removal made over an
+    /// incomplete graph would call a dependency of that package unneeded.
+    fn installed(&self, strict: bool) -> Result<Vec<Installed>, Line> {
         self.client
             .status()
             .map_err(|s| service(s, "the store", &Detail::default()))?;
@@ -430,6 +433,12 @@ impl Tool {
             .map_err(|s| service(s, "the store", &Detail::default()))?;
         for i in &mut list {
             let Ok(text) = self.client.meta(&i.name) else {
+                if strict && !i.in_image() {
+                    return Err(format!(
+                        "pkg: {}: the service did not give its meta",
+                        i.name
+                    ));
+                }
                 continue;
             };
             if let Ok(meta) = pkgfmt::meta::Meta::parse(&text) {
@@ -447,7 +456,7 @@ impl Tool {
 
     fn install(&mut self, names: &[String]) -> Result<i32, Line> {
         self.require_root()?;
-        let installed_before = self.installed()?;
+        let installed_before = self.installed(false)?;
         let (fresh, refused) = self.refresh_all(false)?;
         // A refused repository refuses the whole command: no name is decided among the others.
         if !pkg::may_change_the_store(refused) {
@@ -458,7 +467,7 @@ impl Tool {
         let mut failed = false;
         for name in names {
             match self.install_one(name, &pool, &installed, &fresh) {
-                Ok(()) => installed = self.installed()?,
+                Ok(()) => installed = self.installed(false)?,
                 Err(line) => {
                     sys::err(&line);
                     failed = true;
@@ -657,34 +666,40 @@ impl Tool {
     /// requests as the service takes.
     fn remove(&mut self, names: &[String]) -> Result<i32, Line> {
         self.require_root()?;
-        let installed = self.installed()?;
+        let installed = self.installed(true)?;
         let plan = resolve::remove(names, &installed).map_err(|f| f.line())?;
         self.take_away(&plan, &installed)?;
         Ok(EXIT_OK)
     }
 
-    /// The packages of `plan` go, batch by batch, and the line of the removal is printed.
+    /// The packages of `plan` go, batch by batch, and the line of the removal is printed. A batch
+    /// the service refuses ends it, after the line of what went before.
     fn take_away(&self, plan: &resolve::RemovePlan, installed: &[Installed]) -> Result<(), Line> {
+        let line = |gone: &[usize]| {
+            let shown: Vec<(&str, &str, bool)> = gone
+                .iter()
+                .map(|&i| {
+                    (
+                        installed[i].name.as_str(),
+                        installed[i].version.as_str(),
+                        !plan.named.contains(&i),
+                    )
+                })
+                .collect();
+            if !shown.is_empty() {
+                sys::out(&output::removed_line(&shown));
+            }
+        };
+        let mut went = 0;
         for batch in plan.batches() {
             let names: Vec<&str> = batch.iter().map(|&i| installed[i].name.as_str()).collect();
-            self.client
-                .remove(&names)
-                .map_err(|s| service(s, names[0], &Detail::default()))?;
+            if let Err(s) = self.client.remove(&names) {
+                line(&plan.order[..went]);
+                return Err(service(s, names[0], &Detail::default()));
+            }
+            went += batch.len();
         }
-        let gone: Vec<(&str, &str, bool)> = plan
-            .order
-            .iter()
-            .map(|&i| {
-                (
-                    installed[i].name.as_str(),
-                    installed[i].version.as_str(),
-                    !plan.named.contains(&i),
-                )
-            })
-            .collect();
-        if !gone.is_empty() {
-            sys::out(&output::removed_line(&gone));
-        }
+        line(&plan.order);
         Ok(())
     }
 
@@ -693,7 +708,7 @@ impl Tool {
     /// repository refuses the whole command, as for `install`.
     fn upgrade(&mut self, names: &[String]) -> Result<i32, Line> {
         self.require_root()?;
-        let installed = self.installed()?;
+        let installed = self.installed(true)?;
         let (fresh, refused) = self.refresh_all(false)?;
         if !pkg::may_change_the_store(refused) {
             return Ok(EXIT_REFUSED);
@@ -741,12 +756,12 @@ impl Tool {
                 }
             }
         }
-        if done > 0 {
-            // A new record may need fewer packages than the old one did.
-            let now = self.installed()?;
-            let orphans = resolve::remove(&[], &now).map_err(|f| f.line())?;
-            self.take_away(&orphans, &now)?;
-        } else if plan.kept.is_empty() && !failed {
+        // A new record may need fewer packages than the old one did, and a command cut short after a
+        // replacement leaves its leftovers to the next one: the sweep is made every time.
+        let now = self.installed(true)?;
+        let orphans = resolve::remove(&[], &now).map_err(|f| f.line())?;
+        self.take_away(&orphans, &now)?;
+        if done == 0 && orphans.order.is_empty() && plan.kept.is_empty() && !failed {
             sys::out("nothing to upgrade");
         }
         Ok(if failed { EXIT_REFUSED } else { EXIT_OK })
@@ -775,7 +790,7 @@ impl Tool {
         let text = sys::read_file(key_path, 4096)
             .and_then(|b| String::from_utf8(b).ok())
             .ok_or_else(|| format!("pkg: {key_path}: cannot read it"))?;
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let (_, mut settings) = self.saved()?;
         let key = settings
             .add(name, address, &text, &installed)
@@ -791,7 +806,7 @@ impl Tool {
     /// `pkg repo remove <name>`: the line and the key go at once, unless a package of it stands.
     fn repo_remove(&mut self, name: &str) -> Result<i32, Line> {
         self.require_root()?;
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let (_, mut settings) = self.saved()?;
         settings.remove(name, &installed).map_err(|r| r.line())?;
         self.save(&settings)?;
@@ -851,6 +866,13 @@ impl Tool {
             })
             .collect();
         let settings = Settings::from_files(text.as_deref(), &keys)?;
+        // The rule of add and remove holds for the files too: a repository a package stands from
+        // keeps its line and its key.
+        let installed = self.installed(true)?;
+        let (_, old) = self.saved()?;
+        settings
+            .check_against(&old, &installed)
+            .map_err(|r| r.line())?;
         self.save(&settings)?;
         let n = settings
             .lines
@@ -877,7 +899,7 @@ impl Tool {
     }
 
     fn list(&mut self, all: bool) -> Result<i32, Line> {
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let (available, refused) = if all {
             let c = self.cached()?;
             (c.0, c.3)
@@ -922,7 +944,15 @@ impl Tool {
                             }
                         }
                     }
-                    _ => Vec::new(),
+                    _ => {
+                        // An index the list was not kept for cannot be checked as the service would.
+                        sys::err(&format!(
+                            "pkg: {}: the cache has no revocation list; pkg update",
+                            r.name
+                        ));
+                        refused += 1;
+                        continue;
+                    }
                 }
             } else {
                 Vec::new()
@@ -965,7 +995,7 @@ impl Tool {
         if !found {
             return Err("pkg: no index yet; pkg update".into());
         }
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         for line in output::search(word, &available, &installed) {
             sys::out(&line);
         }
@@ -973,7 +1003,7 @@ impl Tool {
     }
 
     fn info(&mut self, name: &str) -> Result<i32, Line> {
-        let installed = self.installed()?;
+        let installed = self.installed(false)?;
         let have = installed.iter().find(|i| i.name == name).or_else(|| {
             installed
                 .iter()

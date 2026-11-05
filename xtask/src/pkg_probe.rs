@@ -781,6 +781,7 @@ fn demo_run(run: &mut qemu::Run, demo: &str, marker: &str) -> Result<(u64, u64),
 
 /// Steps 10 to 14: each refusal with its own line, and what stays as it was.
 fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
+    let untouched = store_of(run, "s9")?;
     // Step 10: a process that is not the superuser. The tool refuses before it asks the network.
     let (lines, requests) = with_log(
         run,
@@ -795,6 +796,9 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         .push("not UID 0: pkg: permission denied, the mirror was not asked".into());
 
     let before = store_of(run, "s10")?;
+    if before != untouched {
+        return Err("step 10: the store changed after a process that is not the superuser".into());
+    }
     // Step 11: a byte of the file changed, and a file longer than the index says.
     ctx.state(&ctx.states.tampered)?;
     let (lines, _) = with_log(run, ctx, "pkg install hello", "tampered", 1)?;
@@ -844,6 +848,9 @@ fn refusals(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
         "pkg: alien: signed by a key the repository stafeto does not trust",
         "step 13",
     )?;
+    if store_of(run, "s13")? != before {
+        return Err("step 13: the store changed after a package of a foreign key".into());
+    }
     let lines = expect_code(run, "pkg install hello", "hello1", 0, INSTALL_WITHIN)?;
     need(&lines, "installed hello 1.0-1", "step 13")?;
     expect_code(run, "/opt/hello/bin/hello", "run-hello", 42, DIALOG_STEP)?;
@@ -1042,6 +1049,12 @@ fn second_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
     }
     ctx.report
         .push("pkg remove doom: both packages and their notices are gone".into());
+    // The settings layer is read-only, so the files cannot be edited here (the host tests hold the
+    // check of /etc/pkg); `repo save` of the files as they are keeps what the service holds.
+    let lines = expect_code(run, "pkg repo save", "b2-save", 0, DIALOG_STEP)?;
+    need(&lines, "saved 1 repositories", "boot 2")?;
+    let lines = expect_code(run, "pkg check", "b2-check", 0, DIALOG_STEP)?;
+    need(&lines, "settings saved", "boot 2")?;
     let lines = expect_code(run, "pkg repo remove games", "b2-rm-games", 1, DIALOG_STEP)?;
     need(
         &lines,
@@ -1114,6 +1127,18 @@ mod tests {
             official_address(),
             format!("https://10.0.2.2:8443/{}/aarch64", pkg::series())
         );
+    }
+
+    /// `runas` gives up the superuser and is for the probe alone: no image of a release holds it.
+    #[test]
+    fn runas_is_in_no_image_of_the_tree() {
+        for image in rootfs::IMAGES {
+            let files = rootfs::files_of(image);
+            assert!(
+                files.iter().all(|f| !f.path.starts_with("/test")),
+                "{image} holds a file of the probes"
+            );
+        }
     }
 
     #[test]

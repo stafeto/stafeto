@@ -21,6 +21,7 @@ unsafe extern "C" {
     fn mkdir(path: *const c_char, mode: u32) -> c_int;
     fn rename(from: *const c_char, to: *const c_char) -> c_int;
     fn unlink(path: *const c_char) -> c_int;
+    fn getpid() -> c_int;
 }
 
 /// The allocator of the program: the C library's `malloc`, and `posix_memalign`
@@ -163,7 +164,9 @@ pub fn write_file(path: &str, bytes: &[u8]) -> bool {
 /// link) and the file is renamed over `path`, so a reader meets the old file or the new one and
 /// a failed write leaves the old one. Whether it was done.
 pub fn replace_file(path: &str, bytes: &[u8]) -> bool {
-    let tmp = alloc::format!("{path}.new");
+    // A name of this process: two commands at once do not write one file.
+    // SAFETY: no arguments.
+    let tmp = alloc::format!("{path}.new{}", unsafe { getpid() });
     if !write_file(&tmp, bytes) {
         unlink_one(&tmp);
         return false;
