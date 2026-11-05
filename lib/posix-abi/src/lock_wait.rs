@@ -224,7 +224,7 @@ impl Wait {
         crate::signals::swap_mask(self.outer);
         self.settle();
         if !self.signalled() {
-            let _ = sys::receive(&self.channel);
+            let _ = crate::fast::receive(&self.channel);
         }
         // Before the mask closes: a closed mask would send a signal that
         // came meanwhile back to the process service.

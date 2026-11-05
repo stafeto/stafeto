@@ -97,8 +97,11 @@ _Static_assert(sizeof(struct stafeto_fast_claim) == 480, "the layout of the clai
 int stafeto_fast_claim(struct stafeto_fast_claim *out, unsigned flags);
 
 /* Waits for the service's notification up to timeout_ns nanoseconds (0:
- * only looks) and gives its bits (several may come together). 0, or -1
- * with errno: ETIMEDOUT, EINTR (a signal), EBADF (no claim). */
+ * only looks) and gives its bits (several may come together). A bit that
+ * another wait of the same thread (poll, select, a lock, a sleep) took off
+ * the thread's channel is kept and comes with the first call after; each
+ * bit goes to one call. 0, or -1 with errno: ETIMEDOUT, EINTR (a signal),
+ * EBADF (no claim). */
 int stafeto_fast_wait(uint64_t timeout_ns, uint32_t *bits);
 
 /* Tells the service that `count` frames (1 to 16) wait in the bypass ring

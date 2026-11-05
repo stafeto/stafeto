@@ -31,7 +31,14 @@
 //!    that arrives while the owner keeps away from its queue (`RACE`) is
 //!    answered long before the wait ends, since the queue is looked at once
 //!    more after the interrupts are turned on;
-//! 8. `kill -QUIT`: the device comes back again.
+//! 8. `kill -QUIT`: the device comes back again;
+//! 9. `fast-echo 7 --poll &`: a `poll` of 50 ms sits between the look at
+//!    the queue and the wait on the device's notifications (`poll ok`), and
+//!    20 single datagrams, each at another moment of the poll's period, come
+//!    back within 100 ms: a notification the poll took off the thread's
+//!    channel is kept for the wait (the time is not judged under -icount);
+//!    `kill -QUIT`: the device comes back. The same 20 single datagrams are
+//!    timed against the plain owner of step 3 for comparison.
 //!
 //! `cargo xtask fast-probe crash` runs an image whose service is built for
 //! the probe (it faults on CRASH): `fast-echo 7 &` owns the device, another
@@ -244,6 +251,47 @@ fn echo_time(socket: &UdpSocket, payload: &[u8]) -> Result<Duration, String> {
     Ok(at.elapsed())
 }
 
+/// `count` datagrams, one at a time, each sent at another moment of the
+/// period of the owner's poll; the slowest answer. With `judge`, an answer
+/// later than 100 ms is an error.
+fn single_echoes(socket: &UdpSocket, count: usize, judge: bool) -> Result<Duration, String> {
+    let mut slowest = Duration::ZERO;
+    let mut buffer = [0u8; 64];
+    for i in 0..count {
+        std::thread::sleep(Duration::from_millis(7 + 3 * i as u64));
+        let message = [i as u8; 64];
+        // The first datagram waits for ARP and may need a second try.
+        let mut got = None;
+        for _ in 0..3 {
+            let sent = Instant::now();
+            socket
+                .send(&message)
+                .map_err(|e| format!("send {i}: {e}"))?;
+            if let Ok(n) = socket.recv(&mut buffer) {
+                if buffer[..n] != message[..] {
+                    return Err(format!("the echo {i} differs"));
+                }
+                got = Some(sent.elapsed());
+                break;
+            }
+            if i > 0 {
+                break;
+            }
+        }
+        let took = got.ok_or(format!("no echo {i}"))?;
+        if judge && i > 0 && took > Duration::from_millis(100) {
+            return Err(format!(
+                "echo {i} took {} ms, a notification the poll took was lost",
+                took.as_millis()
+            ));
+        }
+        if i > 0 {
+            slowest = slowest.max(took);
+        }
+    }
+    Ok(slowest)
+}
+
 /// `count` datagrams of `size` bytes through the forwarded port, each
 /// back byte for byte: the datagrams sent again after a timeout.
 pub(crate) fn echoes(socket: &UdpSocket, count: usize, size: usize) -> Result<usize, String> {
@@ -381,6 +429,13 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             "300 echoes in {} ms ({again} sent again)",
             echo_at.elapsed().as_millis()
         ));
+        // The plain owner's answer time for single datagrams, the
+        // comparison for the owner with a poll (step 9).
+        let plain = single_echoes(&socket, 20, false)?;
+        notes.push(format!(
+            "20 single echoes of the plain owner, the slowest {} ms",
+            plain.as_millis()
+        ));
         // A user other than the superuser, and a second owner.
         run.send(&format!("fast-echo {PORT} --as 1000"))?;
         expect_all(&mut run, &["fast-echo: refused ok"], within)?;
@@ -481,6 +536,16 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
                 ));
             }
         }
+        run.send("kill -QUIT $!")?;
+        expect_all(&mut run, &[back], within)?;
+        // The poll between two waits of the owner.
+        run.send(&format!("fast-echo {PORT} --poll &"))?;
+        expect_all(&mut run, &[claimed.as_str(), "fast-echo: poll ok"], within)?;
+        let slowest = single_echoes(&socket, 20, !steps)?;
+        notes.push(format!(
+            "20 single echoes with the poll between the waits, the slowest {} ms",
+            slowest.as_millis()
+        ));
         run.send("kill -QUIT $!")?;
         expect_all(&mut run, &[back], within)?;
         run.send("echo probe-end")?;
@@ -700,6 +765,7 @@ mod tests {
             "flood taken",
             "retry busy",
             "retry ok",
+            "poll ok",
         ] {
             assert!(echo.contains(line), "{line}");
         }

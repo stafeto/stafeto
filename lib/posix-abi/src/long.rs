@@ -568,7 +568,7 @@ pub(crate) fn admission_pause() -> Result<(), i32> {
             drop(guard);
             break Err(EIO);
         }
-        let got = sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             Ok(_) | Err(Error::Interrupted) => {}
@@ -775,7 +775,7 @@ fn run_in(
             }
             alarm.1 = sys::timer_set(&alarm.timer(), deadline).is_ok();
         }
-        let got = sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             Ok(sys::Received::Notification {

@@ -132,7 +132,7 @@ fn sleep_in(deadline: Sleep, point: bool) -> Result<(), i32> {
         let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sleep entry deferral");
         let _ = sys::timer_set(&timer(), wake);
-        let got = sys::receive(&channel);
+        let got = crate::fast::receive(&channel);
         drop(guard);
         match got {
             Ok(sys::Received::Notification {

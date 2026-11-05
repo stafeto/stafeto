@@ -54,7 +54,9 @@ pub mod bit {
     pub const CANCEL: u64 = 1 << 2;
 }
 
+pub mod fast_bank;
 mod preparation;
+pub mod receiver;
 pub use preparation::DeliveryPreparation;
 
 static CEILING: AtomicU8 = AtomicU8::new(0);
@@ -541,7 +543,7 @@ pub fn futex_wait(
     }
     probe();
     let outcome = loop {
-        match sys::receive(&channel) {
+        match receiver::receive(&channel) {
             Ok(sys::Received::Notification {
                 source: Source::Unlabeled,
                 bits,
