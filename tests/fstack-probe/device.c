@@ -145,7 +145,7 @@ stats_text(char *out, size_t cap)
     frames_out = s.tx_frames ? s.tx_frames : 1;
     return snprintf(out, cap,
         "rx=%llu zero_copy=%llu copied=%llu bypass=%llu bypass_full=%llu no_mbuf=%llu "
-        "tx=%llu tx_no_buffer=%llu tx_full=%llu tx_long=%llu tx_bypass=%llu foreign=%llu "
+        "tx=%llu tx_no_buffer=%llu tx_full=%llu tx_long=%llu tx_bypass=%llu foreign=%llu tx_waited=%llu "
         "rx_layer_ticks=%llu rx_input_ticks=%llu tx_send_ticks=%llu "
         "rx_layer_per_frame=%llu rx_input_per_frame=%llu tx_per_frame=%llu "
         "kicks=%llu sleeps=%llu found_work=%llu notifications=%llu freq=%llu "
@@ -156,6 +156,7 @@ stats_text(char *out, size_t cap)
         (unsigned long long)s.tx_frames, (unsigned long long)s.tx_no_buffer,
         (unsigned long long)s.tx_full, (unsigned long long)s.tx_long,
         (unsigned long long)s.tx_bypass, (unsigned long long)s.tx_foreign,
+        (unsigned long long)s.tx_waited,
         (unsigned long long)s.rx_layer_ticks, (unsigned long long)s.rx_input_ticks,
         (unsigned long long)s.tx_send_ticks,
         (unsigned long long)(s.rx_layer_ticks / frames_in),

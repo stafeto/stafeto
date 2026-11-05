@@ -19,8 +19,8 @@
 //!    (`?stats`): the frames came in without a copy, an ARP reply went to the
 //!    network service through the bypass ring; `?stop` ends the program and
 //!    the device comes back;
-//! 2. `fstack-probe device hold &`: 2 000 connections of TCP 80 each send
-//!    five segments that nobody reads, so the stack keeps more than the pool
+//! 2. `fstack-probe device hold &`: 500 connections of TCP 80 each send
+//!    twenty segments that nobody reads, so the stack keeps more than the pool
 //!    holds above the threshold of the layer; the echo of UDP on another
 //!    socket still answers, and some frames were copied.
 //!
@@ -44,6 +44,12 @@ use crate::{
 /// The images: the probe, and the probe with the steps counted.
 pub const IMAGE: &str = "boot-fstack-device.img";
 pub const STEPS_IMAGE: &str = "boot-fstack-device-steps.img";
+/// The image whose second device runs DHCP: the stack's address is a lease,
+/// and the service's client renews it through the bypass ring.
+pub const DHCP_IMAGE: &str = "boot-fstack-device-dhcp.img";
+
+/// `/etc/netd.conf` of the image with DHCP on the second device.
+pub const NETD_CONF_DHCP: &[u8] = b"handover 1\n";
 
 /// `/etc/netd.conf` of the images: the second device may go to a program,
 /// and its address is fixed.
@@ -52,8 +58,8 @@ pub const NETD_CONF: &[u8] = b"handover 1\naddress1 10.0.3.15/24\n";
 const UDP_PORT: u16 = 7;
 const TCP_PORT: u16 = 80;
 const PAGE_BYTES: usize = 1 << 20;
-const HOLD_CONNECTIONS: usize = 2000;
-const HOLD_SEGMENTS: usize = 5;
+const HOLD_CONNECTIONS: usize = 500;
+const HOLD_SEGMENTS: usize = 20;
 const HOLD_BYTES: usize = 200;
 
 /// How long a line may take on TCG, and under -icount.
@@ -195,11 +201,13 @@ fn echo_rate(socket: &UdpSocket, total: usize, window: usize) -> Result<f64, Str
     Ok(total as f64 / started.elapsed().as_secs_f64())
 }
 
-/// `cargo xtask fstack-probe device [steps] [tcg|hvf]`.
+/// `cargo xtask fstack-probe device [steps|dhcp|static] [tcg|hvf]`.
 pub fn command(args: &[String]) -> Result<(), String> {
-    let (steps, rest) = match args.first().map(String::as_str) {
-        Some("steps") => (true, &args[1..]),
-        _ => (false, args),
+    let (only, steps, rest) = match args.first().map(String::as_str) {
+        Some("steps") => (None, true, &args[1..]),
+        Some("dhcp") => (Some(true), false, &args[1..]),
+        Some("static") => (Some(false), false, &args[1..]),
+        _ => (None, false, args),
     };
     let machine = match rest {
         [] => &qemu::VIRT,
@@ -209,10 +217,15 @@ pub fn command(args: &[String]) -> Result<(), String> {
             other => qemu::machine(Some(&other.to_owned()))?,
         },
         _ => {
-            return Err("usage: cargo xtask fstack-probe device [steps] [tcg|hvf]".to_owned());
+            return Err(
+                "usage: cargo xtask fstack-probe device [steps|dhcp|static] [tcg|hvf]".to_owned(),
+            );
         }
     };
-    probe(machine, steps)
+    match only {
+        Some(dhcp) => session(machine, false, dhcp),
+        None => probe(machine, steps),
+    }
 }
 
 fn free_port(tcp: bool) -> Result<u16, String> {
@@ -241,12 +254,15 @@ fn hold(udp: &UdpSocket, tcp_port: u16) -> Result<Vec<(String, u64)>, String> {
     let chunk = [0x5a_u8; HOLD_BYTES];
     for round in 0..HOLD_SEGMENTS {
         for (n, stream) in streams.iter_mut().enumerate() {
-            stream
-                .write_all(&chunk)
-                .map_err(|e| format!("hold write {n} of round {round}: {e}"))?;
+            if let Err(e) = stream.write_all(&chunk) {
+                return Err(format!(
+                    "hold write {n} (port {:?}) of round {round}: {e}",
+                    stream.local_addr().map(|a| a.port())
+                ));
+            }
         }
         // Let the stack and slirp take the round before the next.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
     // The stack keeps the segments. The echo on another socket still answers.
     let again = echoes(udp, 50, 64)?;
@@ -256,7 +272,17 @@ fn hold(udp: &UdpSocket, tcp_port: u16) -> Result<Vec<(String, u64)>, String> {
     Ok(stats)
 }
 
+/// Both runs: the second device with its fixed address, then (not under
+/// -icount) with a lease.
 pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String> {
+    session(machine, steps, false)?;
+    if !steps {
+        session(machine, false, true)?;
+    }
+    Ok(())
+}
+
+fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(), String> {
     if machine.is_hvf() {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
     }
@@ -265,7 +291,11 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     crate::net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
-    let name = if steps { STEPS_IMAGE } else { IMAGE };
+    let name = match (steps, dhcp) {
+        (true, _) => STEPS_IMAGE,
+        (false, false) => IMAGE,
+        (false, true) => DHCP_IMAGE,
+    };
     let image = build_boot_image(name, programs(steps), BOOT_PROFILE)?;
     let udp_host = free_port(false)?;
     let tcp_host = free_port(true)?;
@@ -303,11 +333,12 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
     let mut notes = Vec::new();
     let talked = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
-        expect_all(
-            &mut run,
-            &["net: lease 10.0.2.15/24", "net: static1 10.0.3.15/24"],
-            BOOT_TIMEOUT,
-        )?;
+        let second = if dhcp {
+            "net: lease1 10.0.3.15/24"
+        } else {
+            "net: static1 10.0.3.15/24"
+        };
+        expect_all(&mut run, &["net: lease 10.0.2.15/24", second], BOOT_TIMEOUT)?;
         run.expect("# ", DIALOG_STEP)?;
         let began = Instant::now();
         run.send(&format!(
@@ -321,11 +352,42 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         if steps {
             first.push("fstack-probe: flood taken");
         }
+        if dhcp {
+            first.push("net: renew1 10.0.3.15/24");
+        }
         expect_all(&mut run, &first, within)?;
         notes.push(format!(
             "claim, stack start and serving {} ms",
             began.elapsed().as_millis()
         ));
+        if dhcp {
+            // The service's client asks for its lease again through the
+            // bypass ring, both ways, while the stack answers ARP and the
+            // echo with the leased address.
+            let again = echoes(&udp, 100, 64)?;
+            let stats = stats_of(&udp)?;
+            if stat(&stats, "bypass") < 2 || stat(&stats, "tx_bypass") < 2 {
+                return Err(format!(
+                    "the lease went through the ring {} times in and {} out: {stats:?}",
+                    stat(&stats, "bypass"),
+                    stat(&stats, "tx_bypass")
+                ));
+            }
+            notes.push(format!(
+                "lease again through the ring: {} frames to the service, {} from it; 100 echoes ({again} sent again)",
+                stat(&stats, "bypass"),
+                stat(&stats, "tx_bypass")
+            ));
+            udp.send(b"?stop").map_err(|e| format!("?stop: {e}"))?;
+            expect_all(
+                &mut run,
+                &["fstack-probe: device ended", back, "net: lease1 10.0.3.15/24"],
+                within,
+            )?;
+            run.send("echo probe-end")?;
+            run.expect("probe-end", DIALOG_STEP)?;
+            return Ok(());
+        }
         let again = echoes(&udp, if steps { 30 } else { 200 }, 64)?;
         let again = again + if steps { 0 } else { echoes(&udp, 100, 1400)? };
         notes.push(format!("echoes ({again} sent again)"));
@@ -446,7 +508,8 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         );
     }
     println!(
-        "fstack-probe device passed in {:.0} s on {}: {}",
+        "fstack-probe device{} passed in {:.0} s on {}: {}",
+        if dhcp { " dhcp" } else { "" },
         started.elapsed().as_secs_f64(),
         machine.name,
         notes.join("; ")
@@ -467,6 +530,7 @@ mod tests {
         assert_eq!(netd.3, &["steps"]);
         assert!(programs(false).iter().any(|p| p.0 == "fstack-probe"));
         assert_eq!(NETD_CONF, b"handover 1\naddress1 10.0.3.15/24\n");
+        assert_eq!(NETD_CONF_DHCP, b"handover 1\n");
     }
 
     /// The page's pattern is the program's.

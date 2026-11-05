@@ -69,6 +69,8 @@
 #define FF_STAFETO_FRAME_MAX 1514
 #define FF_STAFETO_FRAME_MIN 60
 #define BYPASS_KICK_MAX 16
+/* How long a frame waits for room in the full queue of sending. */
+#define FF_STAFETO_TX_WAIT_US 500
 
 extern void ff_hardclock(void);
 /* The workstreams of the stack's software interrupts that had work
@@ -99,6 +101,7 @@ static int dev_lost;
 static struct ff_dpdk_if_context *dev_ctx;
 static uint32_t notified;
 static int tx_batch;
+static int tx_stalled;
 static int bypass_batch;
 static struct ff_stafeto_device_stats stats;
 
@@ -348,7 +351,12 @@ tx_flush(void)
 }
 
 /* A frame of `len` bytes, already in buffer `buf` at vnet_buf_ptr, to the
- * queue of sending (padded to the shortest frame of the wire). */
+ * queue of sending (padded to the shortest frame of the wire). A full queue
+ * is rung and waited for, at most FF_STAFETO_TX_WAIT_US per frame: the stack
+ * can make hundreds of frames in one step (every delayed acknowledgement of
+ * a thousand connections falls due in one clock tick), and the device takes
+ * them as it runs. A queue that did not move within the wait is left alone
+ * for the rest of the pass and drops what comes. */
 static int
 tx_queue(uint32_t buf, uint32_t len)
 {
@@ -359,14 +367,24 @@ tx_queue(uint32_t buf, uint32_t len)
         len = FF_STAFETO_FRAME_MIN;
     }
     if (vnet_tx(buf, (uint16_t)len) != 0) {
-        /* Full: the device may have taken frames since. */
-        tx_flush();
-        vnet_tx_reclaim();
-        if (vnet_tx(buf, (uint16_t)len) != 0) {
+        uint64_t until = counter() + stats.ticks_per_second * FF_STAFETO_TX_WAIT_US / 1000000;
+        int queued = -1;
+
+        while (!tx_stalled) {
+            tx_flush();
+            vnet_tx_reclaim();
+            queued = vnet_tx(buf, (uint16_t)len);
+            if (queued == 0)
+                break;
+            if (counter() >= until)
+                tx_stalled = 1;
+        }
+        if (queued != 0) {
             vnet_rx_return(buf);
             stats.tx_full++;
             return -1;
         }
+        stats.tx_waited++;
     }
     stats.tx_frames++;
     if (++tx_batch >= FF_STAFETO_TX_BATCH)
@@ -383,7 +401,7 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     uint32_t buf;
     uint8_t *to;
     void *cur;
-    int off = 0, sent;
+    int off = 0;
 
     if (!dev_on || ctx != dev_ctx || dev_lost) {
         /* No device to send on: the frame is dropped and counted. */
@@ -399,9 +417,11 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
     }
     buf = vnet_buf_take();
     if (buf == VNET_NONE) {
+        /* A wire that lost the frame: the stack's TCP sends it again, and
+         * an error here would reach its sockets. */
         stats.tx_no_buffer++;
         ff_mbuf_free(m);
-        return -1;
+        return 0;
     }
     to = vnet_buf_ptr(buf);
     cur = m;
@@ -416,9 +436,10 @@ ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
         off += (int)len;
     }
     ff_mbuf_free(m);
-    sent = tx_queue(buf, (uint32_t)off);
+    /* A queue that stays full loses the frame the same way. */
+    (void)tx_queue(buf, (uint32_t)off);
     stats.tx_send_ticks += counter() - began;
-    return sent;
+    return 0;
 }
 
 /* A buffer of the pool, or a block of the copy path, is free: the tag in
@@ -612,6 +633,7 @@ ff_stafeto_pass(void)
     int ticks = 0, received = 0;
 
     passes++;
+    tx_stalled = 0;
     while (now >= next_tick_ns && ticks < FF_STAFETO_MAX_TICKS) {
         ff_hardclock();
         ff_update_current_ts();

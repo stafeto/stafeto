@@ -60,7 +60,7 @@ int ff_stafeto_device_lost(void);
 struct ff_stafeto_device_stats {
     uint64_t ticks_per_second;
     uint64_t rx_frames, rx_zero_copy, rx_copied, rx_bypass, rx_bypass_full, rx_no_mbuf;
-    uint64_t tx_frames, tx_no_buffer, tx_full, tx_long, tx_bypass, tx_foreign;
+    uint64_t tx_frames, tx_no_buffer, tx_full, tx_long, tx_bypass, tx_foreign, tx_waited;
     uint64_t rx_layer_ticks, rx_input_ticks, tx_send_ticks;
     uint64_t kicks, sleeps, sleeps_found_work, notifications;
     uint32_t free_low, free_now;
