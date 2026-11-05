@@ -87,6 +87,9 @@ const KICK_KIND: usize = 37;
 /// the idle wait (1 000 ms) ends.
 const IDLE_ECHO_WITHIN: Duration = Duration::from_millis(100);
 const RACE_ECHO_WITHIN: Duration = Duration::from_millis(600);
+/// An echo sooner than this left the datagram outside the owner's absence
+/// (200 ms).
+const RACE_ECHO_AT_LEAST: Duration = Duration::from_millis(150);
 
 /// How long a line may take on TCG, and under -icount.
 const LINE_WITHIN: Duration = Duration::from_secs(30);
@@ -438,18 +441,35 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             let mut race = b"RACE".to_vec();
             race.extend_from_slice(&[7; 60]);
             let mut got = vec![0u8; 2048];
-            socket.send(&race).map_err(|e| format!("send: {e}"))?;
-            socket
-                .recv(&mut got)
-                .map_err(|e| format!("no echo of RACE: {e}"))?;
-            let missed = echo_time(&socket, b"sent while the owner is away")?;
-            if missed > RACE_ECHO_WITHIN {
-                return Err(format!(
-                    "the echo of a datagram that came while the owner was away took {} ms (wanted {} ms at most): the queue was not looked at again",
-                    missed.as_millis(),
-                    RACE_ECHO_WITHIN.as_millis()
-                ));
+            // The second datagram must land in the 200 ms the owner stays
+            // away; one that comes sooner is taken in a pass of its loop and
+            // proves nothing, so the bait goes again (three times at most).
+            let mut caught = None;
+            for _ in 0..3 {
+                std::thread::sleep(Duration::from_millis(400));
+                socket.send(&race).map_err(|e| format!("send: {e}"))?;
+                socket
+                    .recv(&mut got)
+                    .map_err(|e| format!("no echo of RACE: {e}"))?;
+                let missed = echo_time(&socket, b"sent while the owner is away")?;
+                if missed > RACE_ECHO_WITHIN {
+                    return Err(format!(
+                        "the echo of a datagram that came while the owner was away took {} ms (wanted {} ms at most): the queue was not looked at again",
+                        missed.as_millis(),
+                        RACE_ECHO_WITHIN.as_millis()
+                    ));
+                }
+                if missed >= RACE_ECHO_AT_LEAST {
+                    caught = Some(missed);
+                    break;
+                }
             }
+            let Some(missed) = caught else {
+                return Err(format!(
+                    "three baits and no datagram fell in the owner's absence (an echo came in less than {} ms each time)",
+                    RACE_ECHO_AT_LEAST.as_millis()
+                ));
+            };
             notes.push(format!(
                 "echo of a datagram sent while the owner is away {} ms",
                 missed.as_millis()

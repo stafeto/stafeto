@@ -64,15 +64,18 @@ const RUN_WITHIN: Duration = Duration::from_secs(60 * 4);
 /// acknowledgement).
 const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
 /// The kind of the steps of the second device's return, and their bound on
-/// VZ: 50 ms of the counter (24 MHz).
+/// VZ: 50 ms of the counter (24 MHz), for the two sub-steps that touch the
+/// device first after the host reset it (details 1, the reset, and 2, the
+/// open); the other sub-steps of the return keep 0.9 of term B.
 const RETURN_KIND: usize = 65;
 const RETURN_MAX: u64 = 1_200_000;
-/// Whether a line of steps is one of the second device's return.
+/// Whether a line of steps is one of the second device's return that the
+/// host's reset delays: the reset (detail 1) or the open (detail 2).
 fn is_return_step(line: &str) -> bool {
     line.contains(&format!("kind {RETURN_KIND} "))
         && line
             .rsplit_once("detail ")
-            .is_some_and(|(_, d)| d.trim().parse::<u64>().is_ok_and(|d| d != 0))
+            .is_some_and(|(_, d)| d.trim().parse::<u64>().is_ok_and(|d| d == 1 || d == 2))
 }
 
 /// The fixed MAC addresses of `vz-run`, by device.
@@ -422,10 +425,12 @@ pub fn command(args: &[String]) -> Result<(), String> {
             net_probe::STEP_MAX
         );
         // The device that comes back from its owner is reset by the host: the
-        // first access after the reset stalls the processor for about 20 ms
-        // (the guest cannot split it), so the steps of the return (kind 65
-        // with a detail) have a bound of their own on VZ, 50 ms of the
-        // counter. The others keep 0.9 of term B.
+        // first access after the reset stalls the one virtual processor, so
+        // the whole guest, for about 20 ms; a thread inside the service
+        // cannot lift that. The two sub-steps that touch the device first
+        // (kind 65, details 1 and 2) have a bound of their own on VZ, 50 ms
+        // of the counter. The others, the queues and the fill among them,
+        // keep 0.9 of term B.
         let (back, rest): (Vec<String>, Vec<String>) = output
             .lines
             .iter()
@@ -609,9 +614,11 @@ fn owner(
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| format!("timeout: {e}"))?;
-        // The first datagrams of the Mac go out while it still looks for the
-        // MAC address of the program (ARP) and are lost: send one every 10 ms
-        // until the first comes back.
+        // The first datagrams after a claim may be lost (about 20 ms with a
+        // static address; the cause is not established). Send one every 10 ms
+        // until the first comes back; its first byte counts the datagrams
+        // sent, and `fast-echo` prints the first byte of the first datagram
+        // it saw, which tells a loss before the program from a loss after it.
         let first_at = Instant::now();
         socket
             .set_read_timeout(Some(Duration::from_millis(10)))
@@ -619,7 +626,9 @@ fn owner(
         let mut lost_first = 0;
         let mut buffer = [0u8; 64];
         loop {
-            socket.send(&[0x5a; 32]).map_err(|e| format!("send: {e}"))?;
+            socket
+                .send(&[lost_first as u8; 32])
+                .map_err(|e| format!("send: {e}"))?;
             if socket.recv(&mut buffer).is_ok() {
                 break;
             }
@@ -637,6 +646,17 @@ fn owner(
             .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(|e| format!("timeout: {e}"))?;
         while socket.recv(&mut buffer).is_ok() {}
+        match run.expect_line(
+            "the first datagram the program saw",
+            |l| l.contains("fast-echo: first datagram"),
+            Duration::from_secs(3),
+        ) {
+            Ok(line) => println!(
+                "net-vz: {} ({lost_first} lost before the first echo)",
+                line.trim()
+            ),
+            Err(e) => println!("net-vz: no line of the first datagram: {e}"),
+        }
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| format!("timeout: {e}"))?;
@@ -776,6 +796,13 @@ mod tests {
         ));
         assert!(!is_return_step(
             "service step: 14 kind 65 3000 ticks detail 0"
+        ));
+        // The queues and the fill keep the common bound.
+        assert!(!is_return_step(
+            "service step: 14 kind 65 30000 ticks detail 3"
+        ));
+        assert!(!is_return_step(
+            "service step: 14 kind 65 30000 ticks detail 5"
         ));
         assert!(!is_return_step(
             "service step: 14 kind 36 3000 ticks detail 1"

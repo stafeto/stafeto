@@ -63,6 +63,8 @@ static uint8_t own_ip[4];
 static uint8_t own_mac[6];
 static uint16_t port;
 static unsigned long echoed;
+static unsigned long frames_seen;
+static int first_seen;
 static unsigned long wait_ns = WAIT_NS;
 /* `--idle`: the owner of the probe's image, which stays away from its queue
  * when asked, once, before it turns the interrupts on. */
@@ -153,6 +155,13 @@ static void arp_reply(const uint8_t *f)
  * and the ports of UDP, or the type of an ICMP echo request made a reply. */
 static void echo(const uint8_t *f, uint32_t len, unsigned header, int icmp)
 {
+	if (!icmp && !first_seen && len > ETH + header + 8) {
+		/* The first datagram of the port: its first byte numbers it, which
+		 * tells a loss before the program from a loss after it. */
+		first_seen = 1;
+		printf("fast-echo: first datagram byte %u after %lu frames\n", f[ETH + header + 8], frames_seen);
+		fflush(stdout);
+	}
 	uint32_t buf = vnet_buf_take();
 	if (buf == VNET_NONE)
 		return;
@@ -193,6 +202,7 @@ static int for_service(const uint8_t *f, uint32_t len, unsigned header)
 /* One frame of the device. Gives 1 when it went to the service. */
 static int frame(const uint8_t *f, uint32_t len)
 {
+	frames_seen++;
 	unsigned header = ipv4(f, len);
 	if (for_service(f, len, header))
 		return vnet_bypass_push(f, len);
