@@ -2140,6 +2140,7 @@ fn move_files(c: &Handle<Channel>) -> bool {
             (Slot::Entropy, moved(crate::random::session())),
             (Slot::Display, moved(crate::display::session())),
             (Slot::Net, moved(crate::net::session())),
+            (Slot::Packages, moved(crate::packages::session())),
         ],
     ) == 0
 }
@@ -2248,6 +2249,7 @@ fn commit(
     };
     let entropy = crate::fork::entropy_clone();
     let display = crate::display::clone_session();
+    let packages = crate::packages::clone_session();
     let (nets, count) = shadow.shared_nets()?;
     // The child carries 64 descriptors at most: one portion.
     let net = crate::net::clone_kept(|out| {
@@ -2263,6 +2265,7 @@ fn commit(
         (Slot::Entropy, entropy),
         (Slot::Display, display),
         (Slot::Net, net),
+        (Slot::Packages, packages),
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);
