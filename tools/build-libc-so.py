@@ -368,12 +368,29 @@ def build_vnet() -> Path:
         "--features", "ffi", "--target", LAYER_TARGET, "--crate-type", "staticlib",
         "-Zbuild-std=core,compiler_builtins", cwd=ROOT, env=env)
     built = OUT / "vnet" / LAYER_TARGET / "release" / "libvirtio_net.a"
-    if not VNET.exists() or digest(VNET) != digest(built):
-        shutil.copyfile(built, VNET)
+    # One relocatable object with the functions of vnet.h alone global: the
+    # archive of cargo also defines memcpy, memset, memcmp, strlen and the
+    # functions of libm (compiler_builtins, weak) and the symbols of core,
+    # which would take the program's own calls (nginx's, F-Stack's) away
+    # from libc.so and clash with a second library of Rust. Inside the
+    # object the library's code keeps its copies.
+    work = OUT / "vnet-object"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    whole = work / "vnet.o"
+    run(lld(), "-r", "--whole-archive", built, "-o", whole)
+    keep = work / "keep.txt"
+    keep.write_text("".join(f"{n}\n" for n in VNET_NAMES))
+    run(llvm("llvm-objcopy"), f"--keep-global-symbols={keep}", "--strip-debug", whole)
+    archive = work / "libvirtio_net.a"
+    run(llvm("llvm-ar"), "rcs", archive, whole)
+    if not VNET.exists() or digest(VNET) != digest(archive):
+        shutil.copyfile(archive, VNET)
     defined = archive_names(VNET, "-g", "--defined-only")
-    missing = [n for n in VNET_NAMES if n not in defined]
-    if missing:
-        fail(f"libvirtio_net.a lacks {missing[0]}")
+    if defined != set(VNET_NAMES):
+        extra = sorted(defined - set(VNET_NAMES))[:5]
+        missing = sorted(set(VNET_NAMES) - defined)[:5]
+        fail(f"libvirtio_net.a defines globally {extra} more and lacks {missing}")
     return VNET
 
 
@@ -715,6 +732,10 @@ def build_probes() -> list:
     for name in WITH_VNET:
         compile_c(SOURCES / f"{name}.c", work / f"{name}.o", "-I", VNET_INCLUDE)
         link_program(PROBES / name, [work / f"{name}.o", VNET], ["--gc-sections", "--strip-debug"])
+        # The program's own calls of the C library go to libc.so.
+        imported = {n for n, is_def, _, _, _ in Elf(PROBES / name).dynsym() if n and not is_def}
+        if "memcpy" not in imported:
+            fail(f"{name}: memcpy is not libc.so's")
         made[name] = "good"
     # bad-interp: another dynamic linker.
     compile_c(SOURCES / "bad-interp.c", work / "bad-interp.o")
