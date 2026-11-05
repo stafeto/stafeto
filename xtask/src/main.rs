@@ -59,6 +59,7 @@ mod gpu_probe;
 mod guards;
 mod htop_dialog;
 mod image;
+mod image_listing;
 mod input_probe;
 mod jobs;
 mod keys;
@@ -1653,6 +1654,10 @@ commands:
   dist       build the release files of this version in target/dist (docs/release.md)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  image-listing [--out DIR] [image...]
+            build the images that hold packages and write the listing of the
+            tree each shows (path, mode, owner, SHA-256), for comparing
+            two builds
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
@@ -2031,6 +2036,7 @@ fn main() {
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
+        Some("image-listing") => image_listing::command(&args[1..]),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
         Some("pkg-build") => pkg::command(&args[1..]),
