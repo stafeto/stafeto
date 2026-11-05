@@ -13,8 +13,8 @@
 //! with the number of sockets.
 
 use crate::net::{
-    Birth, Client, Conn, Kind, NO_PLACE, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock,
-    now_ns, op_index,
+    Birth, Client, Conn, Kind, Net, OPEN_MAX, OWN, OpInfo, ROOT_CLONES, SESSIONS, Sock, now_ns,
+    op_index,
 };
 use crate::split;
 use crate::stack::{GROUP, Stack, listen_endpoint};
