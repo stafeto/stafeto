@@ -138,41 +138,34 @@ pub fn terms_files() -> Result<[(&'static str, Vec<u8>); 4], String> {
     ])
 }
 
-/// Fails unless the boot image at `path` carries the terms of the games and
-/// the WAD that `tools/build-freedoom.py` unpacked, whole.
-fn image_has_doom_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+/// Fails unless the boot image at `path`, the image `image`, carries the
+/// notices of the games in the packages of Doomgeneric and Freedoom and the
+/// WAD that `tools/build-freedoom.py` unpacked, whole, in the package of
+/// Freedoom.
+fn image_has_doom_terms(path: &Path, image: &str) -> Result<(), String> {
+    notices::image_has_package_notices(path, image, "doomgeneric")?;
+    notices::image_has_package_notices(path, image, "freedoom")?;
     let version = packages::value("freedoom", "version")?;
     let wad_path = target_dir().join(format!("freedoom/freedoom-{version}/{WAD}"));
     let wad = std::fs::read(&wad_path).map_err(|e| format!("{}: {e}", wad_path.display()))?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    let mentions = |data: &[u8], text: &str| data.windows(text.len()).any(|w| w == text.as_bytes());
-    let (licence, _, freedoom_licence, _) = doom_terms()?;
-    let doom = packages::value("doomgeneric", "version")?;
-    if !wad.is_empty()
-        && carries(WAD, &|data| data == wad.as_slice())
-        && carries(DOOM_LICENSE, &|data| data == licence.as_slice())
-        && carries(DOOM_SOURCE, &|data| {
-            mentions(data, &doom) && mentions(data, "GPLv2")
-        })
-        && carries(FREEDOOM_LICENSE, &|data| {
-            data == freedoom_licence.as_slice()
-        })
-        && carries(FREEDOOM_SOURCE, &|data| mentions(data, &version))
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} carries no whole WAD or no terms of the games",
-            path.display()
-        ))
+    let freedoom = layered_package(image, "freedoom")?;
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let held =
+        notices::layer_content(&bytes, &pkg::file_name(&freedoom), &format!("/games/{WAD}"))?;
+    if wad.is_empty() || held != wad {
+        return Err(format!("{} carries no whole WAD", path.display()));
     }
+    Ok(())
+}
+
+/// The package `name` of the image `image`.
+fn layered_package(image: &str, name: &str) -> Result<packages::Package, String> {
+    rootfs::layered(image)?
+        .packages
+        .into_iter()
+        .map(|l| l.package)
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("{image} holds no package {name}"))
 }
 
 /// The number after `timed ` in the report `timed N gametics in M realtics`
@@ -190,7 +183,7 @@ pub fn doom_headless(machine: &'static qemu::Machine) -> Result<(), String> {
     build_games()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
-    image_has_doom_terms(&image)?;
+    image_has_doom_terms(&image, IMAGE)?;
     packages::check()?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -470,7 +463,7 @@ pub fn doom_probe(machine: &'static qemu::Machine) -> Result<(), String> {
     build_games()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
-    image_has_doom_terms(&image)?;
+    image_has_doom_terms(&image, IMAGE)?;
     packages::check()?;
     let scratch = Scratch::new()?;
     let cmd = probe_command(machine, &kernel.image, &image, &scratch);
@@ -543,7 +536,7 @@ pub fn doom_window(args: &[String]) -> Result<(), String> {
     build_games()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(IMAGE, programs(), BOOT_PROFILE)?;
-    image_has_doom_terms(&image)?;
+    image_has_doom_terms(&image, IMAGE)?;
     packages::check()?;
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     if cfg!(target_os = "macos") {

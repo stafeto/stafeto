@@ -36,30 +36,6 @@ pub fn ncdu_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
-/// Fails unless the boot image at `path` carries ncdu's terms.
-fn image_has_ncdu_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = ncdu_terms()?;
-    let archive = format!("ncdu-{}.tar.gz", version()?);
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(NCDU_LICENSE, &|data| data == licence.as_slice())
-        && carries(NCDU_SOURCE, &|data| {
-            data.windows(archive.len()).any(|w| w == archive.as_bytes())
-                && data.windows(3).any(|w| w == b"MIT")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no ncdu terms", path.display()))
-    }
-}
-
 /// `text` without the escape sequences of the terminal (CSI sequences and
 /// the selections of a character set), as ncurses wrote them.
 fn plain(text: &str) -> String {
@@ -154,7 +130,7 @@ pub fn ncdu_dialog() -> Result<(), String> {
     nano_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_ncdu_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "ncdu")?;
     let busybox = std::fs::metadata(image_elf(
         &target_dir(),
         "boot-ash-dialog.img",
@@ -186,12 +162,13 @@ pub fn ncdu_dialog() -> Result<(), String> {
                 "Apparent size:",
             ],
         )?;
-        // BusyBox under three names: two hard links and a symbolic link.
-        // ncdu counts the file once and does not follow the symbolic link,
-        // so the apparent size of the directory is the file's size and the
-        // length of the link's target (`/bin/busybox`).
+        // BusyBox under three names: a copy of it with a second hard link
+        // (a file of a package takes no new name: it is the package's) and a
+        // symbolic link. ncdu counts the file once and does not follow the
+        // symbolic link, so the apparent size of the directory is the file's
+        // size and the length of the link's target (`/bin/busybox`).
         run.send(
-            "mkdir /tmp/h && ln /bin/busybox /tmp/h/b1 && ln /bin/busybox /tmp/h/b2 \
+            "mkdir /tmp/h && cp /bin/busybox /tmp/h/b1 && ln /tmp/h/b1 /tmp/h/b2 \
              && ln -s /bin/busybox /tmp/h/s && echo tree-made",
         )?;
         run.expect_line("the tree", |l| l == "tree-made", DIALOG_STEP)?;

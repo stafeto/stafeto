@@ -531,7 +531,7 @@ pub const NET_COMMAND_QUOTA: u64 = 4096 * PAGE;
 /// once beside the shell, the launcher and `posix-net`. A worker's quota is
 /// the command's less nginx's image, so the nine processes of nginx take
 /// 4 096 + 8 x 3 293 = 30 440 of the 65 536 pages of the sixteen quotas.
-const NET_PROCESS_SERVICE: Record = Record {
+pub const NET_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
         + 16 * NET_COMMAND_QUOTA,

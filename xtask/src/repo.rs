@@ -398,6 +398,7 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         time: None,
         out: None,
         recipe: false,
+        replace: Vec::new(),
     })?;
     let all = packages::load()?;
     let dir = make(&built, &all, o)?;

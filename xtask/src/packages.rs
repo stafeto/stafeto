@@ -724,6 +724,12 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
             .into_iter()
             .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))
             .collect()),
+        // The base image holds the base packages, the full image all of them.
+        "boot-base.img" => Ok(load()?
+            .into_iter()
+            .filter(|p| p.kind == Kind::Base)
+            .collect()),
+        "boot-full.img" => load(),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
         "boot-net.img"
         | "boot-net-curl-steps.img"

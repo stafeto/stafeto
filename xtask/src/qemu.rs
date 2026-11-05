@@ -76,6 +76,17 @@ pub const VIRT: Machine = Machine {
     accel: "tcg",
 };
 
+/// The spec machine with 1 GiB: the machine of the full image, whose
+/// container of 54 MB leaves init 15 837 pages free on 512 MiB, under the
+/// 16 384 that the images keep (docs/packages.md, "Images on layers").
+pub const VIRT_1G: Machine = Machine {
+    name: "1G",
+    machine: "virt,gic-version=2,highmem-ecam=off",
+    cpu: "cortex-a72",
+    memory: "1G",
+    accel: "tcg",
+};
+
 /// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
 /// goes through SMC.
 pub const VIRT_EL2: Machine = Machine {
@@ -841,6 +852,15 @@ impl Run {
         let mut lines = self.transcript.lines();
         if let End::Marker(at) = end {
             lines.truncate(at + 1);
+        }
+        // Every run of every image with layers: a layer the file service
+        // left out (a path taken, a table it refuses) fails the probe whatever
+        // the probe asked of the machine.
+        if let Some(line) = lines
+            .iter()
+            .find(|l| l.contains("ramfs: layer ") && l.contains("not attached"))
+        {
+            panic!("a layer of the image was not attached: {line}");
         }
         Outcome {
             lines,
@@ -2038,6 +2058,20 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         let o = run.stop();
         assert_eq!(*echoed.borrow(), ["one", "two", "prompt> "]);
         assert_eq!(o.lines, ["one", "two", "prompt> "]);
+    }
+
+    /// Every run of every image with layers: the line of ramfs that says a
+    /// layer was left out fails the run when it ends, whatever the probe asks.
+    #[test]
+    #[should_panic(expected = "a layer of the image was not attached")]
+    fn a_layer_the_service_left_out_fails_the_run() {
+        let mut run = Run::start(
+            sh("echo 'ramfs: layer a.stpkg: entry 3: the path is taken, not attached'; exec cat"),
+            Input::Pipe,
+        )
+        .unwrap();
+        run.expect("attached\n", Duration::from_secs(5)).unwrap();
+        run.stop();
     }
 
     /// Spec 14: `stop` kills the child and joins the thread that reads

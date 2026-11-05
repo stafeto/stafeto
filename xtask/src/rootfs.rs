@@ -591,6 +591,176 @@ fn shell_files(image: &str) -> Result<Vec<RootFile>, String> {
     Ok(files)
 }
 
+/// The tree of an image split in two: what the table `rootfs` of the image
+/// holds, and the packages whose package files (`.stpkg`) the image holds
+/// as layers (docs/packages.md).
+pub struct Layered {
+    /// The files of the table: the system's, with the directories above
+    /// them (a layer's directory merges with the table's).
+    pub system: Vec<RootFile>,
+    pub packages: Vec<LayerPackage>,
+}
+
+/// A package of an image.
+pub struct LayerPackage {
+    pub package: crate::packages::Package,
+    /// The bytes that replace the package's own at paths of the package (a probe's settings, a certificate file with its own
+    /// authority): the image holds a variant of the package file.
+    pub replaced: Vec<(&'static str, &'static [u8])>,
+}
+
+/// The paths `package` names, the files and its directories.
+fn owns(package: &crate::packages::Package, path: &str) -> bool {
+    package.files.iter().any(|(p, _)| p == path) || package.dirs.iter().any(|d| d == path)
+}
+
+/// Splits the list of the image `name` (`files_of`) into its table and its
+/// layers: the files a package of the image names are the package's, with
+/// the bytes the list gives them when those differ from the package's own;
+/// all others are the system's.
+pub fn layered(name: &str) -> Result<Layered, String> {
+    let packages: Vec<crate::packages::Package> = crate::packages::of_image(name)?
+        .into_iter()
+        .filter(|p| !(p.files.is_empty() && p.dirs.is_empty()))
+        .collect();
+    let declared = package_files(&packages)?;
+    let mut layers: Vec<LayerPackage> = packages
+        .iter()
+        .map(|p| LayerPackage {
+            package: p.clone(),
+            replaced: Vec::new(),
+        })
+        .collect();
+    let mut system = Vec::new();
+    for f in files_of(name) {
+        let Some(at) = packages.iter().position(|p| owns(p, f.path)) else {
+            system.push(f);
+            continue;
+        };
+        let own = declared
+            .iter()
+            .find(|d| d.path == f.path)
+            .ok_or_else(|| format!("{name}: {} is declared by no package", f.path))?;
+        if f.source == own.source && (f.mode, f.uid, f.gid) == (own.mode, own.uid, own.gid) {
+            continue;
+        }
+        match (f.source, own.source) {
+            (Some(Source::Bytes(_, bytes)), Some(Source::Bytes(..)))
+                if (f.mode, f.uid, f.gid) == (own.mode, own.uid, own.gid) =>
+            {
+                layers[at].replaced.push((f.path, bytes));
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: {} of {} differs from the package's in more than its bytes",
+                    f.path, packages[at].name
+                ));
+            }
+        }
+    }
+    // The table holds the directories above its files, as a package that
+    // names them would give them.
+    let mut have: Vec<&'static str> = system.iter().map(|f| f.path).collect();
+    let mut above = Vec::new();
+    for f in &system {
+        for (i, _) in f.path.match_indices('/').skip(1) {
+            let parent = &f.path[..i];
+            if !have.contains(&parent) {
+                have.push(parent);
+                above.push(
+                    declared
+                        .iter()
+                        .find(|d| d.path == parent && d.source.is_none())
+                        .map_or(dir(parent), |d| RootFile {
+                            path: parent,
+                            mode: d.mode,
+                            uid: d.uid,
+                            gid: d.gid,
+                            source: None,
+                        }),
+                );
+            }
+        }
+    }
+    system.extend(above);
+    Ok(Layered {
+        system,
+        packages: layers,
+    })
+}
+
+/// The directories and files of the notices of the system, which an image
+/// with layers holds under `/usr/share/licenses/stafeto/`: the licences of
+/// the tree, the notices of relibc (the file of the container the image
+/// carries for the programs on relibc) and of the crates that programs
+/// link (`docs/licenses`).
+pub fn system_notices(relibc: &'static [u8]) -> Result<Vec<RootFile>, String> {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let root = crate::root();
+    let base = "/usr/share/licenses/stafeto";
+    let mut files = vec![
+        dir("/usr"),
+        dir("/usr/share"),
+        dir("/usr/share/licenses"),
+        dir(base),
+    ];
+    for (n, name) in ["LICENSE", "LICENSE-MIT", "LICENSE-GCC-exception-3.1"]
+        .into_iter()
+        .enumerate()
+    {
+        let bytes = std::fs::read(root.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        files.push(of(
+            leak(format!("{base}/{name}")),
+            0o644,
+            ROOT,
+            Source::Bytes(
+                leak(format!("stafeto-notice-{n}")),
+                Box::leak(bytes.into_boxed_slice()),
+            ),
+        ));
+    }
+    files.push(of(
+        leak(format!("{base}/relibc-THIRD-PARTY-NOTICES")),
+        0o644,
+        ROOT,
+        Source::Bytes("THIRD-PARTY-NOTICES", relibc),
+    ));
+    files.push(dir(leak(format!("{base}/crates"))));
+    // The tree of docs/licenses, in order, with the files named by number.
+    let mut stack = vec![(root.join("docs/licenses"), format!("{base}/crates"))];
+    let mut count = 0;
+    while let Some((from, to)) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&from)
+            .map_err(|e| format!("{}: {e}", from.display()))?
+            .flatten()
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let path = format!("{to}/{name}");
+            if e.path().is_dir() {
+                files.push(dir(leak(path.clone())));
+                stack.push((e.path(), path));
+            } else {
+                let bytes = std::fs::read(e.path()).map_err(|e| e.to_string())?;
+                count += 1;
+                files.push(of(
+                    leak(path),
+                    0o644,
+                    ROOT,
+                    Source::Bytes(
+                        leak(format!("crate-licence-{count}")),
+                        Box::leak(bytes.into_boxed_slice()),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Fails unless each file of the image `name` belongs to exactly one
 /// package or to the base system, and each file a package names is in the
 /// image. `files` is the list of the image.
@@ -1047,7 +1217,7 @@ fn net_files(image: &str) -> Vec<RootFile> {
 }
 /// The files of the images of `nginx-probe`: those of the shell with the
 /// network (nginx among them), with the probe's variant of nginx's settings
-/// in place of the package's, the variant with one listening socket, the
+/// as the package's, the variant with one listening socket, the
 /// files of 10 KiB and 256 KiB the probe fetches, `netd.conf` with eight
 /// buffers, and the server of TLS (`tls.conf`) with nginx's certificate and
 /// key from the probe CA, the key readable by root alone.
@@ -1113,7 +1283,7 @@ fn nginx_files(image: &str) -> Vec<RootFile> {
 
 /// The files of the images of nginx on the stack (`cargo xtask fast-probe
 /// nginx`, `net-vz --fast --nginx`): those of the shell with the network, with
-/// the probe's variant of the settings of `nginx-fast` in place of the
+/// the probe's variant of the settings of `nginx-fast` as the
 /// package's, the variant under nobody, the files of 10 KiB and 256 KiB the
 /// probe fetches, the second device's fixed address in `netd.conf`, and the
 /// server of TLS with the probe CA's certificate and key.
@@ -1336,6 +1506,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ash-dialog.img",
     "boot-doom.img",
     "boot-doom-steps.img",
+    "boot-base.img",
+    "boot-full.img",
     "boot-posix-procs.img",
     "boot-posix-lifetimes.img",
     "boot-posix-lock-rules.img",
@@ -1419,6 +1591,17 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-ash-dialog.img" | "boot-doom.img" | "boot-doom-steps.img" => dialog(name),
+        // The base image has no package that makes /usr and /usr/share,
+        // which the time zones stand in.
+        "boot-base.img" | "boot-full.img" => {
+            let mut files = dialog(name);
+            for d in ["/usr", "/usr/share"] {
+                if !files.iter().any(|f| f.path == d) {
+                    files.push(dir(d));
+                }
+            }
+            files
+        }
         "boot-net.img" | "boot-net-curl-steps.img" | "boot-posix-net-steps.img" => net_files(name),
         // The shell's image with the probe of F-Stack.
         "boot-fstack-probe.img" => {
@@ -1731,6 +1914,13 @@ pub fn set_build_time(seconds: u64) {
 /// The time the files of an image get: SOURCE_DATE_EPOCH when it is set
 /// (seconds since the epoch, so that a build repeats), else the time of the
 /// build.
+pub fn fixed_build_time() -> Option<u64> {
+    match BUILD_TIME.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        seconds => Some(seconds),
+    }
+}
+
 pub fn build_time() -> Result<u64, String> {
     let fixed = BUILD_TIME.load(std::sync::atomic::Ordering::Relaxed);
     if fixed != 0 {
@@ -1945,6 +2135,115 @@ mod tests {
         }
     }
 
+    /// The table of an image and the files of its layers make the tree the
+    /// list of the image names: no path of a package is in the table, the
+    /// bytes a probe puts at a path of a package are the variant's, the
+    /// table alone is a table the file service reads, and the paths the
+    /// table gains are the directories above its files.
+    #[test]
+    fn the_table_and_the_layers_of_an_image_make_the_tree_it_had() {
+        let mut layered_images = 0;
+        for image in IMAGES {
+            let full = files_of(image);
+            let split = layered(image).unwrap_or_else(|e| panic!("{image}: {e}"));
+            // A directory both name is the table's directory above a file,
+            // which merges with the package's.
+            for f in &split.system {
+                assert!(
+                    f.source.is_none() || !split.packages.iter().any(|l| owns(&l.package, f.path)),
+                    "{image}: {} is a path of the table and of a package",
+                    f.path
+                );
+            }
+            let all: Vec<_> = split.packages.iter().map(|l| l.package.clone()).collect();
+            let declared = package_files(&all).unwrap();
+            let mut merged: Vec<(&str, u32, u32, u32, Option<Source>)> = Vec::new();
+            for f in &split.system {
+                merged.push((f.path, f.mode, f.uid, f.gid, f.source));
+            }
+            for f in &declared {
+                let mut source = f.source;
+                for l in &split.packages {
+                    if let Some((_, bytes)) = l.replaced.iter().find(|(p, _)| *p == f.path) {
+                        let was = full.iter().find(|g| g.path == f.path).unwrap();
+                        assert!(
+                            matches!(was.source, Some(Source::Bytes(_, b)) if b == *bytes),
+                            "{image}: {} is not the variant's bytes",
+                            f.path
+                        );
+                        source = was.source;
+                    }
+                }
+                merged.push((f.path, f.mode, f.uid, f.gid, source));
+            }
+            merged.sort_by(|a, b| a.0.cmp(b.0));
+            // A path two sources name is a directory both name, alike.
+            for pair in merged.windows(2) {
+                if pair[0].0 == pair[1].0 {
+                    assert!(
+                        pair[0].4.is_none() && pair[0] == pair[1],
+                        "{image}: {} is in two sources",
+                        pair[0].0
+                    );
+                }
+            }
+            merged.dedup_by(|a, b| a.0 == b.0);
+            let mut want: Vec<_> = full
+                .iter()
+                .map(|f| (f.path, f.mode, f.uid, f.gid, f.source))
+                .collect();
+            want.sort_by(|a, b| a.0.cmp(b.0));
+            assert_eq!(merged, want, "{image}");
+            // The table alone is a table.
+            let total = sources(&split.system).len() as u32;
+            let bytes = table(&split.system, 0, total).unwrap_or_else(|e| panic!("{image}: {e}"));
+            Rootfs::parse(&bytes, total).unwrap_or_else(|e| panic!("{image}: {e}"));
+            // An image with no package has no layer and a table of its list.
+            if split.packages.is_empty() {
+                assert_eq!(split.system.len(), full.len(), "{image}");
+            } else {
+                layered_images += 1;
+            }
+        }
+        assert!(layered_images >= 20, "{layered_images} images with layers");
+    }
+
+    /// The variants: the certificate file of the probe's authority in the
+    /// image of the probe of TLS, the settings of the probes of nginx.
+    #[test]
+    fn the_probes_put_their_bytes_in_variants_of_packages() {
+        let replaced = |image: &str| -> Vec<(String, String)> {
+            layered(image)
+                .unwrap()
+                .packages
+                .iter()
+                .flat_map(|l| {
+                    l.replaced
+                        .iter()
+                        .map(|(p, _)| (l.package.name.clone(), (*p).to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(
+            replaced("boot-net-tls.img"),
+            [(
+                "ca-bundle".into(),
+                "/etc/ssl/certs/ca-certificates.crt".into()
+            )]
+        );
+        assert_eq!(
+            replaced("boot-nginx-probe.img"),
+            [("nginx".into(), "/etc/nginx/nginx.conf".into())]
+        );
+        assert_eq!(
+            replaced("boot-fast-nginx.img"),
+            [("nginx-fast".into(), "/etc/nginx/nginx-fast.conf".into())]
+        );
+        assert!(replaced("boot-net.img").is_empty());
+        assert!(replaced("boot-doom.img").is_empty());
+    }
+
     /// Each file of the shell image has one owner; a file nobody owns, a
     /// file two packages claim and a file a package lacks are refused.
     #[test]
@@ -2021,6 +2320,7 @@ mod tests {
                 "boot-ash-dialog.img" => shell,
                 "boot-doom.img" => crate::doom::programs(),
                 "boot-doom-steps.img" => crate::doom::steps_programs(),
+                "boot-base.img" | "boot-full.img" => crate::base_image::programs(image),
                 "boot-net.img" => crate::net::programs(),
                 "boot-net-vz.img" => crate::net::vz_programs(false),
                 "boot-net-vz-steps.img" => crate::net::vz_steps_programs(false),

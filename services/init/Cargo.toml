@@ -68,6 +68,7 @@ table-busybox = []
 table-busybox-dialog = []
 # The games image: the dialog with the quota of Doom (xtask doom-headless).
 table-doom = []
+table-base = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
 # The probe of the terminal service (xtask tty, tty-vz).

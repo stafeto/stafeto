@@ -40,6 +40,7 @@ mod owner_lifetime;
 #[path = "../../lib/rt/src/service/sample.rs"]
 mod service_sample;
 
+mod base_image;
 mod bash_dialog;
 mod blk_probe;
 mod ci;
@@ -59,6 +60,7 @@ mod gpu_probe;
 mod guards;
 mod htop_dialog;
 mod image;
+mod image_listing;
 mod input_probe;
 mod jobs;
 mod keys;
@@ -1653,6 +1655,13 @@ commands:
   dist       build the release files of this version in target/dist (docs/release.md)
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  image base|full [run]
+            build the base image (the base packages as layers) or the full
+            image (all packages), and with `run` boot it in QEMU
+  image-listing [--out DIR] [image...]
+            build the images that hold packages and write the listing of the
+            tree each shows (path, mode, owner, SHA-256), for comparing
+            two builds
   packages  check the package descriptions (packages/*.toml) and that every file
             of the shell image has one owner; with `table` builds the image and
             prints its packages with their sizes
@@ -2031,6 +2040,8 @@ fn main() {
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
         Some("ash-dialog") => ash_dialog(),
+        Some("image") => base_image::command(&args[1..]),
+        Some("image-listing") => image_listing::command(&args[1..]),
         Some("packages") => packages_command(args.get(1).map(String::as_str)),
         Some("keys") => keys::command(&args[1..]),
         Some("pkg-build") => pkg::command(&args[1..]),
@@ -2459,6 +2470,44 @@ fn write_elf_image(
     let target = target_dir();
     let objdump = llvm_tool("llvm-objdump")?;
     let objcopy = llvm_tool("llvm-objcopy")?;
+    // The packages of the image go in as package files, the layers of the
+    // file service; the table of the image holds the paths of the system
+    // (rootfs::layered). A program that only a package names is the
+    // package's: the image holds no ELF file of its own for it, and none of
+    // the notices that an image holds for a program in its table.
+    let rootfs::Layered {
+        system,
+        packages: layers,
+    } = rootfs::layered(name)?;
+    let named_by = |files: &[rootfs::RootFile]| -> Vec<&'static str> {
+        rootfs::sources(files)
+            .iter()
+            .filter_map(rootfs::Source::program)
+            .collect()
+    };
+    let in_table: Vec<&str> = named_by(&system)
+        .into_iter()
+        .chain(named_by(&extra))
+        .collect();
+    let in_layers: Vec<&str> = {
+        let all: Vec<packages::Package> = layers.iter().map(|l| l.package.clone()).collect();
+        named_by(&rootfs::package_files(&all)?)
+    };
+    // The copy of the ELF file of such a program that the build keeps under
+    // target/images/ is stripped as the package's file is, for the probes that
+    // read its size or its symbols.
+    for (file, elf, _) in sources {
+        if in_layers.contains(file) && !in_table.contains(file) {
+            strip_elf(elf, &objcopy)?;
+        }
+    }
+    let sources: Vec<(&str, PathBuf, u32)> = sources
+        .iter()
+        .filter(|(file, _, _)| !in_layers.contains(file) || in_table.contains(file))
+        .cloned()
+        .collect();
+    let sources = sources.as_slice();
+    let ca_in_table = system.iter().any(|f| f.path == net_tls::CA_BUNDLE);
     // The image carries each program's ELF file without symbols and debug
     // information (the checks below read the linker's file with them): the
     // loader and exec read the loadable segments alone.
@@ -2494,6 +2543,15 @@ fn write_elf_image(
         files.push((*file, written, elf.clone()));
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    // The files of the layers.
+    let layer_files = pkg::image_files(name, &layers)?;
+    for (file, bytes) in &layer_files {
+        list.push((file.as_str(), bytes.as_slice()));
+    }
+    // An image with a layer holds the notices of relibc for the programs of
+    // its packages, and of the system under /usr/share/licenses/stafeto/,
+    // where the table names the file of the image that holds them.
+    let relibc = relibc || !layers.is_empty();
 
     // An image with a program on relibc carries relibc's licence notices.
     let notices = if relibc {
@@ -2504,7 +2562,9 @@ fn write_elf_image(
     } else {
         None
     };
-    if let Some(notices) = &notices {
+    if let Some(notices) = &notices
+        && layers.is_empty()
+    {
         list.push((NOTICES, notices.as_slice()));
     }
     // An image with BusyBox (GPL-2.0-only) carries its licence, its
@@ -2638,7 +2698,7 @@ fn write_elf_image(
     let tls_files = net_tls::terms_files(
         &linked,
         has("curl"),
-        net_tls::ca_file_of(name, &rootfs::files_of(name))?,
+        net_tls::ca_file_of(name, &rootfs::files_of(name))? && ca_in_table,
     )?;
     nginx_probe::key_files_of(name, &rootfs::files_of(name))?;
     for (name, bytes) in &tls_files {
@@ -2676,7 +2736,20 @@ fn write_elf_image(
     // ELF files of programs as the linker wrote them among them, then the
     // ELF files of the other programs of stack 0 (the loader, `loader.elf`),
     // then the table (rootfs.rs).
-    let mut listed = rootfs::files_of(name);
+    let mut listed = system;
+    if !layers.is_empty() {
+        let relibc: &'static [u8] = Box::leak(
+            notices
+                .clone()
+                .ok_or_else(|| format!("{name}: no notices of relibc"))?
+                .into_boxed_slice(),
+        );
+        for f in rootfs::system_notices(relibc)? {
+            if !listed.iter().any(|g| g.path == f.path) {
+                listed.push(f);
+            }
+        }
+    }
     listed.extend(extra);
     // A program that asks for the dynamic linker needs the library the loader
     // opens for it (spec 2, 3.12.4).
@@ -3722,30 +3795,6 @@ fn bash_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
-/// Fails unless the boot image at `path` carries bash's licence and the
-/// note of its source.
-fn image_has_bash_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = bash_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(BASH_LICENSE, &|data| data == licence.as_slice())
-        && carries(BASH_SOURCE, &|data| {
-            data.windows(15).any(|w| w == b"bash-5.3.tar.gz")
-                && data.windows(5).any(|w| w == b"GPLv3")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no bash terms", path.display()))
-    }
-}
-
 /// The builds of relibc and of BusyBox of this run of xtask: one is
 /// enough for every check that takes them.
 static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
@@ -3926,70 +3975,36 @@ fn links_relibc(bytes: &[u8]) -> bool {
         .any(|window| window == b"relibc_start_v1")
 }
 
-/// Fails unless the boot image at `path` carries BusyBox's licence and
-/// the note of its source.
-fn image_has_busybox_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, _) = busybox_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(BUSYBOX_LICENSE, &|data| data == licence.as_slice())
-        && carries(BUSYBOX_SOURCE, &|data| {
-            data.windows(16).any(|w| w == b"busybox-1.37.0.t")
-                && data.windows(5).any(|w| w == b"GPLv2")
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("{} carries no BusyBox terms", path.display()))
-    }
-}
-
-/// Fails unless the boot image at `path` carries the licences of the
-/// ready-made utilities and the note of where their sources are.
-fn image_has_ready_terms(path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let image =
-        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (licence, note) = ready_terms()?;
-    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
-        image
-            .files()
-            .any(|file| file.name == name && check(file.data))
-    };
-    if carries(READY_LICENSE, &|data| data == licence.as_slice())
-        && carries(BUSYBOX_SOURCE, &|data| {
-            data.windows(note.len()).any(|w| w == note.as_bytes())
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} carries no terms of the ready-made utilities",
-            path.display()
-        ))
-    }
-}
-
 /// Fails unless the boot image at `path` carries relibc's notices.
 fn image_has_notices(path: &Path) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let image =
         bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let notices = std::fs::read(notices_path()).map_err(|e| format!("{NOTICES}: {e}"))?;
-    if image
+    if !image
         .files()
         .any(|file| file.name == NOTICES && file.data == notices.as_slice())
     {
-        Ok(())
-    } else {
-        Err(format!("{} carries no {NOTICES}", path.display()))
+        return Err(format!("{} carries no {NOTICES}", path.display()));
     }
+    // An image with layers names the file in the notices of the system.
+    if image.files().any(|f| f.name.ends_with(".stpkg")) {
+        let table = image
+            .files()
+            .find(|f| f.name == "rootfs")
+            .ok_or_else(|| format!("{}: no table of files", path.display()))?;
+        let table = bootimg::rootfs::Rootfs::parse(table.data, image.count())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let want = "/usr/share/licenses/stafeto/relibc-THIRD-PARTY-NOTICES";
+        let held = table
+            .find(want)
+            .and_then(|n| image.file_at(table.entry(n as u32).file))
+            .is_some_and(|f| f.data == notices.as_slice());
+        if !held {
+            return Err(format!("{} carries no {want}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn relibc_hello_probe() -> Result<(), String> {
@@ -7165,7 +7180,7 @@ fn busybox_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "stafeto ramfs")?;
     image_has_notices(&image)?;
-    image_has_busybox_terms(&image)?;
+    notices::image_has_package_notices(&image, "boot-busybox.img", "busybox")?;
     println!(
         "BusyBox cat guest probe passed, {NOTICES}, {BUSYBOX_LICENSE} and {BUSYBOX_SOURCE} in its image"
     );
@@ -7831,8 +7846,9 @@ fn ash_dialog() -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     clock_probe::date_images_back()?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    image_has_ready_terms(&image)?;
-    image_has_bash_terms(&image)?;
+    image_has_notices(&image)?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "busybox")?;
+    notices::image_has_package_notices(&image, "boot-ash-dialog.img", "bash")?;
     packages::check()?;
     packages::table("boot-ash-dialog.img")?;
     // What `ls -l` shows of the files of /bin: the mode, the links and the

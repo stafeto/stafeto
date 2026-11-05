@@ -105,6 +105,11 @@ impl Spec {
         let file = 2 + self.contents.len() as u32;
         self.push(path, bootimg::rootfs::SYMLINK | 0o777, file)
     }
+    /// A symbolic link in the file of the earlier symbolic link `of`: the same target bytes.
+    fn symlink_like(self, path: &str, of: &str) -> Self {
+        let item = self.items.iter().find(|i| i.path == of).unwrap().clone();
+        self.push(path, item.mode, item.file)
+    }
     fn owner(mut self, uid: u32, gid: u32) -> Self {
         let last = self.items.last_mut().unwrap();
         last.uid = uid;
@@ -289,6 +294,41 @@ fn an_attached_layer_shows_names_modes_owners_sizes_links_and_symbolic_links() {
     // The same names answer the calls that go by path.
     assert_eq!(ram.information("/layer/bin/hi").unwrap().links, 2);
     assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 7 });
+    assert_eq!(settle(&mut ram).len(), 1);
+    assert_eq!(same_tree(&ram), before);
+}
+
+/// The links of a package that name one file (BusyBox's applets) are symbolic links with a node
+/// of their own each, as they are in the table of an image: one link, one inode, the same target.
+#[test]
+fn symbolic_links_that_share_a_file_of_the_package_are_nodes_of_their_own() {
+    let mut ram = ram();
+    let before = same_tree(&ram);
+    let bytes = Spec::new()
+        .dir("/bin")
+        .symlink("/bin/ash", "busybox")
+        .file("/bin/busybox", 0o755, b"program")
+        .symlink_like("/bin/cat", "/bin/ash")
+        .symlink_like("/bin/ls", "/bin/ash")
+        .build();
+    assert_eq!(attach(&mut ram, 1, bytes), LayerReply::Done { names: 5 });
+    let mut inodes = Vec::new();
+    for name in ["/bin/ash", "/bin/cat", "/bin/ls"] {
+        let token = path(&ram, name).unwrap();
+        let node = ram.storage.node(token).unwrap();
+        assert_eq!(
+            (node.kind, node.mode, node.links),
+            (SYMLINK, 0o777, 1),
+            "{name}"
+        );
+        assert_eq!(read_all(&ram, token), b"busybox", "{name}");
+        inodes.push(ram.information(name).unwrap().inode);
+    }
+    inodes.sort_unstable();
+    inodes.dedup();
+    assert_eq!(inodes.len(), 3);
+    // One link goes with its layer and the rest are whole until it does.
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 5 });
     assert_eq!(settle(&mut ram).len(), 1);
     assert_eq!(same_tree(&ram), before);
 }
