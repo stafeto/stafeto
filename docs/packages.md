@@ -455,7 +455,7 @@ serial, revocation) come with the next part.
 SETTINGS_GET, SERIAL, STATUS, CLONE, TAKE and BUFFER in steps of a few thousand ticks. The worker
 thread (level 30, round robin) takes everything long: it reads the store through the disk service,
 creates and maps the object of each package, hashes it as the bytes arrive (SHA-256 in software
-takes some 460,000 ticks for 16 KiB, so no step could hold a portion), checks the signature and
+takes some 540,000 ticks for 16 KiB, so no step could hold a portion), checks the signature and
 attaches the object as a layer. STATUS says `starting` until the worker is done; LIST and INFO show
 the packages it has published meanwhile. The service never restarts: its layers stay in the file
 service when it ends.
@@ -490,7 +490,7 @@ changed after the signing, `revoked` (signed by a second development release key
 names), the settings with the repository `games` and its key, and the list. The service must attach
 `hello` and the settings and skip the other two; the probe (`tests/store-probe`) looks at the
 answers and at the tree, and runs the program. A second run on a disk of zeros checks the format.
-`cargo xtask store-probe steps` adds `big` (16 MiB) and `wide` (1,024 entries) and measures the steps
+`cargo xtask store-probe steps` adds `big` (16 MiB) and `wide` (1,000 files in a directory) and measures the steps
 under `-icount`: no step of the package service, the disk service or the file service's layer calls
 passes 18,369 ticks while the worker creates, maps, hashes and attaches. The jobs of the CI are
 `store-probe` and `store-probe steps`.

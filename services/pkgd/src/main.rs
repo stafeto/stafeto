@@ -18,11 +18,9 @@ mod shared;
 mod worker;
 
 use abi::{Access, Error, Rights, Source};
-use bootimg::BootImage;
 use core::sync::atomic::Ordering::{Acquire, Release};
-use pkgd::packages::{Entry, META_MAX, TRAILER};
-use pkgd::store::{self, PACKAGES, Record};
-use pkgfmt::meta::Meta;
+use pkgd::packages::Entry;
+use pkgd::store::{self, PACKAGES};
 use proto_pkg::{
     BUFFER_SIZE, CELL_BYTES, INFO_MAX, LIST_MAX, Method, STATUS_DAMAGED, STATUS_READ_ONLY,
     STATUS_STARTING, Stat, VERSION, code, read_info, read_word,
@@ -137,44 +135,11 @@ unsafe fn image_packages(s: &mut rt::startup::Startup) -> u32 {
     }
     // SAFETY: the image stays mapped, read-only, for the life of the process.
     let bytes = unsafe { core::slice::from_raw_parts(IMAGE_AT as *const u8, info.size as usize) };
-    let Ok(container) = BootImage::parse(bytes) else {
-        return 0;
-    };
     // SAFETY: the caller: no other thread yet.
     let entries = unsafe { &mut *IMAGE_ENTRIES.get() };
-    let mut n = 0;
-    for file in container.files().filter(|f| f.name.ends_with(".stpkg")) {
-        let meta = bootimg::BootImage::view_as(file.data, &pkgfmt::PACKAGE)
-            .ok()
-            .and_then(|v| v.file(0).ok())
-            .and_then(|f| core::str::from_utf8(f.data).ok().map(|t| (t, f.data)));
-        let Some((text, raw)) = meta else { continue };
-        let Ok(m) = Meta::parse(text) else { continue };
-        let (Some(name), Some(version)) = (
-            store::to_field(m.name.as_bytes()),
-            store::to_field(m.version.as_bytes()),
-        ) else {
-            continue;
-        };
-        let mut entry = Entry {
-            record: Record {
-                kind: store::PACKAGE,
-                repo: store::NO_REPO,
-                name,
-                version,
-                ..Record::EMPTY
-            },
-            image: true,
-            layer: 0,
-            meta_len: 0,
-            meta: [0; META_MAX],
-            trailer: [0; TRAILER],
-        };
-        if n < IMAGE_MAX && entry.keep(raw, &[]) {
-            entries[n] = Some(entry);
-            n += 1;
-        }
-    }
+    let n = pkgd::packages::read_image(bytes, entries, |name, why| {
+        rt::println!("pkgd: {name}: {why}, skipped");
+    });
     n as u32
 }
 

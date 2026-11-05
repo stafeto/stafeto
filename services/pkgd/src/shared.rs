@@ -31,8 +31,6 @@ impl<T> Shared<T> {
 
 /// The most packages of the boot image the service lists.
 pub const IMAGE_MAX: usize = 16;
-/// The most entries of the revocation list that count.
-pub const REVOKED_MAX: usize = 128;
 /// The most bytes of the revocation list file: the text and its block.
 pub const REVOKED_FILE_MAX: usize = 16 * 1024 + 456;
 

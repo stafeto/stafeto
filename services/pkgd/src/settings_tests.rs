@@ -167,6 +167,6 @@ fn the_container_of_the_largest_blob_fits_its_buffer() {
     for n in 0..rootfs.len() {
         rootfs.check_entry(n as u32, view.count()).unwrap();
     }
-    // A buffer that is too small is refused, not overrun.
+    // A buffer that is too small is refused.
     assert!(container(&s, &mut out[..len - 1]).is_none());
 }

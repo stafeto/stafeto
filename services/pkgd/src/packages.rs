@@ -108,3 +108,70 @@ pub fn find<'a>(entries: &'a [Option<Entry>], name: &[u8]) -> Option<(usize, &'a
         .enumerate()
         .find_map(|(i, e)| e.as_ref().filter(|e| e.name() == name).map(|e| (i, e)))
 }
+
+/// The packages of the boot image `image`: for each file named `*.stpkg` an
+/// entry with the flag `image`, the name and version of its `meta` and a copy
+/// of it, in `out`; how many. `skipped(file, why)` hears of each file left out.
+pub fn read_image(
+    image: &[u8],
+    out: &mut [Option<Entry>],
+    mut skipped: impl FnMut(&str, &'static str),
+) -> usize {
+    let Ok(container) = bootimg::BootImage::parse(image) else {
+        return 0;
+    };
+    let mut n = 0;
+    for file in container.files().filter(|f| f.name.ends_with(".stpkg")) {
+        let raw = bootimg::BootImage::view_as(file.data, &pkgfmt::PACKAGE)
+            .ok()
+            .and_then(|v| v.file(0).ok())
+            .map(|f| f.data);
+        let Some(raw) = raw else {
+            skipped(file.name, "not a package");
+            continue;
+        };
+        let Some(meta) = core::str::from_utf8(raw)
+            .ok()
+            .and_then(|t| Meta::parse(t).ok())
+        else {
+            skipped(file.name, "meta is not good");
+            continue;
+        };
+        let (Some(name), Some(version)) = (
+            crate::store::to_field(meta.name.as_bytes()),
+            crate::store::to_field(meta.version.as_bytes()),
+        ) else {
+            skipped(file.name, "name or version too long");
+            continue;
+        };
+        let mut entry = Entry {
+            record: Record {
+                kind: crate::store::PACKAGE,
+                repo: crate::store::NO_REPO,
+                name,
+                version,
+                ..Record::EMPTY
+            },
+            image: true,
+            layer: 0,
+            meta_len: 0,
+            meta: [0; META_MAX],
+            trailer: [0; TRAILER],
+        };
+        if n >= out.len() {
+            skipped(file.name, "too many packages");
+        } else if !entry.keep(raw, &[]) {
+            skipped(file.name, "meta too long");
+        } else {
+            out[n] = Some(entry);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Whether a package of the image has this name: the package of the disk of
+/// the same name is left out.
+pub fn in_image(images: &[Option<Entry>], name: &[u8]) -> bool {
+    images.iter().flatten().any(|e| e.name() == name)
+}

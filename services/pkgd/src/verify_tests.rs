@@ -38,6 +38,8 @@ fn hashes(bytes: &[u8]) -> ([u8; 32], [u8; 32]) {
 }
 
 fn run(bytes: &[u8], record: &Record, trust: &Trust, revoked: &[Revocation]) -> Result<(), Fault> {
+    let text = pkgfmt::revoked::write(1, revoked).unwrap();
+    let list = pkgfmt::revoked::Revoked::parse(&text).unwrap();
     let (covered, whole) = hashes(bytes);
     check(
         bytes,
@@ -46,7 +48,7 @@ fn run(bytes: &[u8], record: &Record, trust: &Trust, revoked: &[Revocation]) -> 
         record,
         crate::SERIES,
         trust,
-        revoked,
+        Some(&list),
     )
     .map(drop)
 }
@@ -69,7 +71,7 @@ fn a_package_of_the_official_repository_passes_and_keeps_its_meta() {
         &record,
         crate::SERIES,
         &trust,
-        &[],
+        None,
     )
     .unwrap();
     assert!(checked.meta.starts_with(b"name hello\n"));
@@ -198,7 +200,7 @@ fn entry(spec: &Spec<'_>) -> Option<Entry> {
         &record,
         crate::SERIES,
         &select(true, &roots, &[]),
-        &[],
+        None,
     )
     .unwrap();
     let mut e = Entry {
@@ -318,4 +320,75 @@ fn the_writer_of_the_host_makes_a_store_the_service_starts_from() {
     disk.read_block(r.first, &mut block);
     assert_eq!(&block[..], &hello[..BLOCK]);
     assert_eq!(disk.pending(), 0);
+}
+
+#[test]
+fn a_long_list_of_revocations_is_applied_to_the_last_name_as_to_the_first() {
+    let bytes = package(&Spec::default());
+    let record = record_of(&bytes, "hello", "1.0");
+    let roots = official();
+    let trust = select(true, &roots, &[]);
+    // 600 names, the key that signed after all the others, as a list of 16 KiB holds.
+    let mut entries: Vec<Revocation> = (0..599)
+        .map(|i| Revocation {
+            name: name(&format!("a-key-{i:04}")),
+            since: 0,
+        })
+        .collect();
+    assert_eq!(run(&bytes, &record, &trust, &entries), Ok(()));
+    entries.push(Revocation {
+        name: name("test-release"),
+        since: 0,
+    });
+    assert_eq!(run(&bytes, &record, &trust, &entries), Err(Fault::Revoked));
+}
+
+#[test]
+fn the_packages_of_the_boot_image_are_read_and_a_disk_package_of_the_same_name_is_left_out() {
+    use crate::packages::{in_image, read_image};
+    let hello = package(&Spec::default());
+    let other = package(&Spec {
+        name: "other",
+        ..Spec::default()
+    });
+    let ugly = bootimg::write::image_as(
+        &pkgfmt::PACKAGE,
+        &[("meta", b"junk"), ("rootfs", b"x"), ("manifest", b"")],
+    )
+    .unwrap();
+    let image = bootimg::write::image(&[
+        ("init", b"program"),
+        ("hello.stpkg", &hello),
+        ("not.stpkg", b"not a package at all"),
+        ("ugly.stpkg", &ugly),
+        ("other.stpkg", &other),
+        ("data.bin", b"no suffix"),
+    ])
+    .unwrap();
+    let mut said = Vec::new();
+    let mut out = [None, None, None];
+    let n = read_image(&image, &mut out, |file, why| {
+        said.push(format!("{file}: {why}"))
+    });
+    assert_eq!(n, 2);
+    assert_eq!(
+        said,
+        ["not.stpkg: not a package", "ugly.stpkg: meta is not good"]
+    );
+    let e = out[0].as_ref().unwrap();
+    assert!(e.image && e.name() == b"hello" && e.record.version_bytes() == b"1.0");
+    assert!(e.meta().starts_with(b"name hello\n") && e.layer == 0);
+    assert_eq!(e.flags(), proto_pkg::ENTRY_IMAGE);
+    assert_eq!(out[1].as_ref().unwrap().name(), b"other");
+    assert!(out[2].is_none());
+    assert!(in_image(&out, b"hello") && !in_image(&out, b"world"));
+    // More packages than places: the rest are reported, not dropped silently.
+    let mut few = [None];
+    let mut said = Vec::new();
+    assert_eq!(
+        read_image(&image, &mut few, |f, w| said.push(format!("{f}: {w}"))),
+        1
+    );
+    assert!(said.contains(&"other.stpkg: too many packages".to_string()));
+    assert_eq!(read_image(b"not an image", &mut few, |_, _| {}), 0);
 }

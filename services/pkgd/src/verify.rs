@@ -10,8 +10,9 @@
 //! only an installation checks, is not here.
 
 use crate::store::Record;
+use pkgfmt::revoked::Revoked;
 use pkgfmt::sig::BLOCK_SIZE;
-use pkgfmt::{Error, Key, Package, Revocation, Trust, trust};
+use pkgfmt::{Error, Key, Package, Trust, trust};
 
 /// Why a package is refused, as the codes of proto_pkg name it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +80,8 @@ pub struct Checked<'a> {
 /// Checks the package file `bytes`. `covered` is the SHA-256 of the covered
 /// part (all but the trailer page) and `whole` that of the file, both from
 /// the reading; `record` is what the store says of it, and `series` the
-/// system's.
+/// system's. `revoked` is the list of revocations whole: names in it are
+/// ascending without repeats, so at most one entry names the key that signed.
 pub fn check<'a>(
     bytes: &'a [u8],
     covered: &[u8; 32],
@@ -87,7 +89,7 @@ pub fn check<'a>(
     record: &Record,
     series: &str,
     trust: &Trust,
-    revoked: &[Revocation],
+    revoked: Option<&Revoked<'_>>,
 ) -> Result<Checked<'a>, Fault> {
     if *whole != record.sha256 || bytes.len() as u64 != record.length {
         return Err(Fault::BadHash);
@@ -102,13 +104,14 @@ pub fn check<'a>(
     if meta.series != series {
         return Err(Fault::WrongSeries);
     }
+    let hit = revoked.and_then(|list| list.entries().find(|r| r.name == package.trailer.key));
     trust::verify(
         &package.trailer,
         pkgfmt::Kind::Package,
         covered,
         package.covered().len() as u64,
         trust,
-        revoked,
+        hit.as_slice(),
     )
     .map_err(fault_of)?;
     let meta_file = package.image.file_at(0).ok_or(Fault::BadPackage)?;

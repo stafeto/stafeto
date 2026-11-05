@@ -19,8 +19,9 @@ use pkgd::packages::Entry;
 use pkgd::settings::{self, Settings};
 use pkgd::store::{self, BLOCK, PACKAGES, Record, Table};
 use pkgd::verify::{self, Fault};
+use pkgfmt::revoked::Revoked;
 use pkgfmt::sha::{Stream, sha256};
-use pkgfmt::{Key, Revocation, Trust, keyfile};
+use pkgfmt::{Key, Trust, keyfile};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk, SECTOR};
 use proto_fs::{LayerOp, LayerReply, LayerStart, LayerStep};
 use proto_wire::{Status, Writer, long};
@@ -28,7 +29,8 @@ use rt::handle::{Any, Channel, Memory, Process};
 use rt::sys::{self, Received};
 use rt::{Handle, Stack};
 
-const STACK_SIZE: usize = 64 * 1024;
+/// The measured use is some 54 KiB; the margin is the rest. No guard page: `rt::Stack` is static.
+const STACK_SIZE: usize = 128 * 1024;
 static STACK: Stack<STACK_SIZE> = Stack::new();
 /// The thread's message buffer: the page after the main thread's.
 const MSGBUF: usize = abi::INIT_MSGBUF as usize + 4096;
@@ -411,7 +413,7 @@ fn run() -> Result<(), Fail> {
             slot,
             &roots,
             settings_len,
-            &revoked,
+            revoked.as_ref(),
         ) {
             Ok(entry) => {
                 // SAFETY: the slot is published below, after the entry is whole.
@@ -533,17 +535,16 @@ fn read_revoked(
     disk: &mut Disk,
     table: &Table,
     roots: &([Key; 4], usize),
-) -> ([Option<Revocation>; REVOKED_MAX], usize) {
-    let none = ([None; REVOKED_MAX], 0);
+) -> Option<Revoked<'static>> {
     let record = table.record(store::REVOKED_SLOT);
     if record.kind != store::REVOKED_LIST {
-        return none;
+        return None;
     }
     // SAFETY: the thread owns the buffer until `STARTING` clears.
     let buffer = unsafe { &mut *REVOKED_FILE.get() };
     let bad = |why: &str| {
         rt::println!("pkgd: revocation list damaged ({why}), using the empty list");
-        none
+        None
     };
     if record.length as usize > buffer.len()
         || record.length as usize <= pkgfmt::sig::BLOCK_SIZE
@@ -551,7 +552,9 @@ fn read_revoked(
     {
         return bad("read");
     }
-    let bytes = &buffer[..record.length as usize];
+    // SAFETY: the buffer is static and nothing writes it after this read.
+    let bytes: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(buffer.as_ptr(), record.length as usize) };
     if sha256(bytes) != record.sha256 {
         return bad("hash");
     }
@@ -580,12 +583,7 @@ fn read_revoked(
     if list.serial != record.number {
         return bad("serial");
     }
-    let mut out = none;
-    for r in list.entries().take(REVOKED_MAX) {
-        out.0[out.1] = Some(r);
-        out.1 += 1;
-    }
-    out
+    Some(list)
 }
 
 /// One package of the disk: its object created and filled while the hashes
@@ -599,16 +597,12 @@ fn load(
     slot: usize,
     roots: &([Key; 4], usize),
     settings_len: usize,
-    revoked: &([Option<Revocation>; REVOKED_MAX], usize),
+    revoked: Option<&Revoked<'_>>,
 ) -> Result<Entry, &'static str> {
     // A package of the image of the same name is the one that is used.
     // SAFETY: the main thread filled the image entries before this thread began.
     let images = unsafe { &*IMAGE_ENTRIES.get() };
-    if images
-        .iter()
-        .flatten()
-        .any(|e| e.name() == record.name_bytes())
-    {
+    if pkgd::packages::in_image(images, record.name_bytes()) {
         return Err("in the image");
     }
     let len = record.length;
@@ -660,12 +654,6 @@ fn load(
     let official = matches!(repo, Some(b"stafeto"));
     let own_keys = own.map_or([].as_slice(), |k| core::slice::from_ref(k));
     let trust = verify::select(official, &roots.0[..roots.1], own_keys);
-    let list: [Revocation; REVOKED_MAX] = core::array::from_fn(|i| {
-        revoked.0[i].unwrap_or(Revocation {
-            name: pkgfmt::Name::new("none").expect("a name"),
-            since: u64::MAX,
-        })
-    });
     let checking = Stopwatch::new();
     let checked = verify::check(
         bytes,
@@ -674,7 +662,7 @@ fn load(
         record,
         pkgd::SERIES,
         &trust,
-        &list[..revoked.1],
+        revoked,
     );
     checking.keep(&CHECK_TICKS);
     let entry = match checked {

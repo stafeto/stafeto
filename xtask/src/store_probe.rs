@@ -13,7 +13,7 @@
 //! 2. A disk of zeros: the service formats it, and nothing is listed.
 //!
 //! `steps` runs the first with the services under -icount with their step statistics and a
-//! store that also holds `big` (16 MiB) and `wide` (1,024 entries), so the main thread of the
+//! store that also holds `big` (16 MiB) and `wide` (1,000 files in a directory), so the main thread of the
 //! service answers while its worker creates, maps, hashes and attaches them: every kind of its
 //! steps and of the disk service's stays under 0.9 of term B (18,369 ticks).
 
