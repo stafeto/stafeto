@@ -276,7 +276,7 @@ fn probe_only(
     }) {
         return Err("the network image faulted".into());
     }
-    net_probe::syn_stray_fault(&output.lines)?;
+    net_probe::placing_fault(&output.lines)?;
     if steps {
         let pipe = net_probe::longest_over_starts_of(&output.lines, PIPE_TAG);
         if let Some(row) = pipe.iter().find(|r| r.1 > net_probe::STEP_MAX) {

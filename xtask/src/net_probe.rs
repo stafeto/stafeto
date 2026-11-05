@@ -417,7 +417,6 @@ struct Frames {
     #[allow(dead_code)]
     syn_dropped: u64,
     /// Queue sockets of a group member the sets had no place for.
-    #[allow(dead_code)]
     set_barred: u64,
     /// SYNs taken by the queue of another member than the chosen one.
     syn_stray: u64,
@@ -469,11 +468,17 @@ fn frames(line: &str) -> Option<Frames> {
     })
 }
 
-/// The line the service prints when a SYN went to a queue other than the
-/// chosen one (a fault of the placing of the queue sockets): the run fails.
-pub fn syn_stray_fault(lines: &[String]) -> Result<(), String> {
-    match lines.iter().find(|l| l.contains("netd: syn_stray")) {
-        Some(line) => Err(format!("the service counted a stray SYN: {line:?}")),
+/// The lines the service prints when a SYN went to a queue other than the
+/// chosen one, and when a queue socket of a group member found no set free of
+/// other members' queue sockets: faults of the placing, and the run fails.
+pub fn placing_fault(lines: &[String]) -> Result<(), String> {
+    match lines
+        .iter()
+        .find(|l| l.contains("netd: syn_stray") || l.contains("netd: set_barred"))
+    {
+        Some(line) => Err(format!(
+            "the service counted a fault of the placing: {line:?}"
+        )),
         None => Ok(()),
     }
 }
@@ -2304,6 +2309,20 @@ mod tests {
 
     /// The image of the shell holds the service built without PING and
     /// CRASH; only the probe's images have them.
+    #[test]
+    fn a_fault_of_the_placing_is_named() {
+        let line = "net: frames rx 12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 2 bad_sum 0 demux_probe 1";
+        assert_eq!(frames(line).map(|f| f.syn_stray), Some(2));
+        let quiet = vec!["netd: ready".to_owned()];
+        assert!(placing_fault(&quiet).is_ok());
+        let stray =
+            vec!["netd: syn_stray: a SYN went to a queue other than the chosen one".to_owned()];
+        assert!(placing_fault(&stray).is_err());
+        let barred =
+            vec!["netd: set_barred: no set without another member's queue sockets".to_owned()];
+        assert!(placing_fault(&barred).is_err());
+    }
+
     #[test]
     fn the_images_of_the_probe_build_the_service_with_its_features() {
         let features = |list: &[ImageProgram]| -> Vec<&'static str> {
