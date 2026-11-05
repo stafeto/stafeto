@@ -319,6 +319,59 @@ pub fn net_two_with(forwards: &[Forward]) -> Vec<String> {
 /// (`-display none`). The images that run the service add these arguments.
 pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mmio-bus.15"];
 
+/// The disk of a run (services/virtio-blk): a modern virtio-blk-pci at
+/// device 1 of bus 0, where `virtio_pci::qemu::DISK` expects it, over the
+/// raw file `image`. No legacy interface and no MSI-X (`vectors=0`), so the
+/// function has the one BAR 4 and raises INTx. The write cache is on
+/// (`cache=writeback`) and a FLUSH reaches the host file; `unsafe` would
+/// swallow it. Errors go to the guest (`werror`, `rerror`) where QEMU would
+/// stop the machine on a full host disk. With `faults`, the drive goes
+/// through `blkdebug` with that rules file.
+pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
+    let drive = match faults {
+        None => format!(
+            "if=none,id=store,format=raw,file={},cache=writeback,werror=report,rerror=report",
+            image.display()
+        ),
+        Some(rules) => format!(
+            "if=none,id=store,driver=raw,file.driver=blkdebug,file.config={},file.image.filename={},cache=writeback,werror=report,rerror=report",
+            rules.display(),
+            image.display()
+        ),
+    };
+    [
+        "-drive",
+        &drive,
+        "-device",
+        "virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The file of a disk: a sparse file of `bytes` zeros, made when it is
+/// missing or when `fresh` asks for a new one. An existing file of another
+/// length is an error, so that a disk with data on it is never cut or
+/// grown.
+pub fn store_file(path: &Path, bytes: u64, fresh: bool) -> Result<(), String> {
+    if path.exists() && !fresh {
+        let have = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if have != bytes {
+            return Err(format!(
+                "{} is {have} bytes, {bytes} expected; --fresh-store makes a new one",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.set_len(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory,
@@ -1243,6 +1296,38 @@ mod tests {
         for m in MACHINES {
             assert!(m.machine.contains("highmem-ecam=off"), "{}", m.name);
         }
+    }
+
+    #[test]
+    fn the_store_is_a_modern_blk_at_device_1_with_a_write_cache() {
+        let joined = store(Path::new("s.img"), None).join(" ");
+        assert!(joined.contains("-drive if=none,id=store,format=raw,file=s.img,cache=writeback,werror=report,rerror=report"));
+        assert!(joined.contains(
+            "-device virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store"
+        ));
+        assert!(!joined.contains("unsafe"));
+        let faulty = store(Path::new("s.img"), Some(Path::new("r.cfg"))).join(" ");
+        assert!(faulty.contains("driver=raw,file.driver=blkdebug,file.config=r.cfg,file.image.filename=s.img,cache=writeback"));
+    }
+
+    #[test]
+    fn the_store_file_is_made_once_and_kept_at_its_length() {
+        let dir = std::env::temp_dir().join(format!("stafeto-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.img");
+        store_file(&path, 8192, false).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+        std::fs::write(&path, [7u8; 8192]).unwrap();
+        store_file(&path, 8192, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[0], 7);
+        assert!(
+            store_file(&path, 4096, false)
+                .unwrap_err()
+                .contains("--fresh-store")
+        );
+        store_file(&path, 4096, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; 4096]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
