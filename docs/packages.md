@@ -700,9 +700,11 @@ after a restart. The accepted index and signature are kept in `/var/cache/pkg/<n
 
 Refused repositories. When any repository is refused (signature, header, term, clock, serial or network), `install` prints the line of the refusal and ends with 1 without deciding any name, so a damaged answer of one repository cannot put the package of another in its place; `update` does the same for the rest, and `list --all`, `info` and `search` work over the good repositories and end with 1. The version field of INSTALL_BEGIN is the `version` of the package's `meta`, with no release: the SHA-256 of the index ties the bytes to the record.
 
-Names. A name is closed by an installed package of that name or that provides it, else it is the
-first repository's package of that name, else the one package that provides it (several are an
-error that names them). The packages to receive are the requested one and the dependencies that
+Names. A name is closed by an installed package of that name or that provides it. Else the
+repositories are asked in their order, the official one first: the first that closes the name decides
+it, by a package of that name or else by the one package that provides it (several are an error
+that names them), and the same holds for the dependencies. So a repository of the owner cannot
+take a name the official one gives. The packages to receive are the requested one and the dependencies that
 are not installed, dependencies first, at most four: they are one group of the service, all
 installed or none. There are no versions in a series, so a package that is installed with another
 SHA-256 than the index has stays as it is.

@@ -7,10 +7,11 @@
 //! and the image). There are no versions: in a series a name has one record.
 //!
 //! A name `x` is looked for so: a package installed under the name `x` or
-//! that provides `x` closes it, nothing is downloaded; else the first
-//! repository that has a package named `x`; else the packages that provide
-//! `x`, which must be one. A package's own name is stronger than another's
-//! `provides`. `repository/x` looks in that repository alone.
+//! that provides `x` closes it, nothing is downloaded; else the repositories are asked in
+//! order and the first that closes the name decides it: in a repository the package named `x`,
+//! else the packages that provide `x`, which must be one. So a repository of the owner cannot
+//! take a name the official one provides.
+//! `repository/x` looks in that repository alone.
 //!
 //! The packages to receive are the requested one and those of its
 //! dependencies that are not installed, the dependencies first. They are one
@@ -163,30 +164,42 @@ fn closed<'a>(installed: &'a [Installed], name: &str) -> Option<&'a Installed> {
     })
 }
 
-/// The record that answers `name` in the pool, by the rules of the module;
-/// `only` limits it to a repository.
+/// The record that answers `name` in the pool; `only` limits it to a repository. The repositories
+/// are asked in their order (the official one first); in each the package of that name comes
+/// before the packages that provide the name, and several providers are an error. The first
+/// repository that closes the name decides it, so a repository of the owner cannot take a name
+/// the official one gives, whether by the name of a package or by `provides`.
 fn find(pool: &[Candidate], name: &str, only: Option<&str>) -> Result<usize, Fault> {
-    let in_scope = |c: &Candidate| only.is_none_or(|r| c.repository == r);
-    if let Some(at) = pool.iter().position(|c| in_scope(c) && c.name == name) {
-        return Ok(at);
-    }
-    let mut providers: Vec<usize> = Vec::new();
-    for (at, c) in pool.iter().enumerate() {
-        if in_scope(c)
-            && c.provides.iter().any(|p| p == name)
-            && !providers.iter().any(|&o| pool[o].name == c.name)
+    let mut repositories: Vec<&str> = Vec::new();
+    for c in pool {
+        if only.is_none_or(|r| c.repository == r) && !repositories.contains(&c.repository.as_str())
         {
-            providers.push(at);
+            repositories.push(&c.repository);
         }
     }
-    match providers[..] {
-        [] => Err(Fault::NoName(name.into())),
-        [one] => Ok(one),
-        _ => Err(Fault::Ambiguous {
-            name: name.into(),
-            providers: providers.iter().map(|&at| pool[at].name.clone()).collect(),
-        }),
+    for repository in repositories {
+        let here = |c: &Candidate| c.repository == repository;
+        if let Some(at) = pool.iter().position(|c| here(c) && c.name == name) {
+            return Ok(at);
+        }
+        let mut providers: Vec<usize> = Vec::new();
+        for (at, c) in pool.iter().enumerate() {
+            if here(c) && c.provides.iter().any(|p| p == name) {
+                providers.push(at);
+            }
+        }
+        match providers[..] {
+            [] => {}
+            [one] => return Ok(one),
+            _ => {
+                return Err(Fault::Ambiguous {
+                    name: name.into(),
+                    providers: providers.iter().map(|&at| pool[at].name.clone()).collect(),
+                });
+            }
+        }
     }
+    Err(Fault::NoName(name.into()))
 }
 
 struct Walk<'a> {
@@ -649,6 +662,37 @@ mod tests {
         );
         // The name of the package itself gives the same.
         assert_eq!(plan(&pool, &[], "doomgeneric").0, order);
+    }
+
+    #[test]
+    fn a_repository_of_the_owner_cannot_take_a_name_the_official_one_provides() {
+        // The review's case: `doomgeneric` of the official repository provides `doom`, and `games`
+        // has a package named `doom`.
+        let pool = vec![
+            c("stafeto", "doomgeneric", &["doom"], &["freedoom"]),
+            c("stafeto", "freedoom", &[], &[]),
+            c("games", "doom", &[], &[]),
+        ];
+        let (order, items) = plan(&pool, &[], "doom");
+        assert_eq!(order, ["freedoom", "doomgeneric"]);
+        assert_eq!(pool[items[1].candidate].repository, "stafeto");
+        // `games/doom` still takes the package of `games`.
+        let (order, _) = plan(&pool, &[], "games/doom");
+        assert_eq!(order, ["doom"]);
+        // The same for a dependency: the official package needs `doom`, which it gives itself.
+        let pool = vec![
+            c("stafeto", "front", &[], &["doom"]),
+            c("stafeto", "doomgeneric", &["doom"], &[]),
+            c("games", "doom", &[], &[]),
+        ];
+        let (order, _) = plan(&pool, &[], "front");
+        assert_eq!(order, ["doomgeneric", "front"]);
+        // A name only the owner's repository has is still taken from it.
+        let pool = vec![
+            c("stafeto", "front", &[], &["extra"]),
+            c("games", "extra", &[], &[]),
+        ];
+        assert_eq!(plan(&pool, &[], "front").0, ["extra", "front"]);
     }
 
     #[test]
