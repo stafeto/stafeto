@@ -49,6 +49,12 @@ pub struct Bank {
     lost: AtomicBool,
 }
 
+impl Default for Bank {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Bank {
     pub const fn new() -> Self {
         Self {
