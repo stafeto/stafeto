@@ -2060,6 +2060,20 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert_eq!(o.lines, ["one", "two", "prompt> "]);
     }
 
+    /// Every run of every image with layers: the line of ramfs that says a
+    /// layer was left out fails the run when it ends, whatever the probe asks.
+    #[test]
+    #[should_panic(expected = "a layer of the image was not attached")]
+    fn a_layer_the_service_left_out_fails_the_run() {
+        let mut run = Run::start(
+            sh("echo 'ramfs: layer a.stpkg: entry 3: the path is taken, not attached'; exec cat"),
+            Input::Pipe,
+        )
+        .unwrap();
+        run.expect("attached\n", Duration::from_secs(5)).unwrap();
+        run.stop();
+    }
+
     /// Spec 14: `stop` kills the child and joins the thread that reads
     /// it, whose pipe the kill closed; a line typed into the pipe of its
     /// stdin comes back from `cat`.
