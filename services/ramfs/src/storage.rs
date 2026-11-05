@@ -24,8 +24,26 @@ pub const DESCRIPTION_SHARE: u16 = 6144;
 pub const ROOTS: usize = 320;
 pub const PREPARATIONS: usize = 128;
 pub const PREPARATION_SHARE: u16 = 96;
-pub const ORIGINALS: usize = bootimg::rootfs::ENTRIES_MAX + 5;
+/// The places of the boot space, the "places of the image" `b`: the entries of the table
+/// of the system (`b` below `ENTRIES_MAX`), then the entries of the layers (`LAYER_SLOTS`),
+/// then the directories that layers created (`LAYER_DIRS`). Place `b` has its node in
+/// `nodes[5 + b]` and its name in `originals[4 + b]`.
+pub const ENTRIES_MAX: usize = bootimg::rootfs::ENTRIES_MAX;
+/// The entries of all layers at once.
+pub const LAYER_SLOTS: usize = 4096;
+/// The directories that layers created and no other name had: a layer's directory whose
+/// path exists merges into it and takes none of these.
+pub const LAYER_DIRS: usize = 256;
+pub const BOOT_SPACE: usize = ENTRIES_MAX + LAYER_SLOTS + LAYER_DIRS;
+pub const ORIGINALS: usize = BOOT_SPACE + 5;
+/// The entries of `originals` that are names: the four fixed ones and the places of the
+/// image. The names the users make start here (`dentries[i]` is entry `ORIGINAL_ENTRIES + i`).
+pub const ORIGINAL_ENTRIES: usize = ORIGINALS - 1;
 pub const NODES: usize = ORIGINALS + INODES;
+/// A bound for the length of a chain of parents: the nodes of the system's table and of the
+/// users, as before the layers. A path is 511 bytes at most, so the chain of a layer's
+/// directory is 255 names deep at most, and the chains of the users are bounded by `INODES`.
+pub const DEPTH_NODES: usize = ENTRIES_MAX + 5 + INODES;
 pub const NONE: u16 = u16::MAX;
 /// Heads of the name chains: one per bucket of (parent, name).
 pub const BUCKETS: usize = 2048;
@@ -372,13 +390,19 @@ impl Dentry {
 struct Original {
     parent: Token,
     node: Token,
+    /// A place that has no name: not in use, or a directory that merged into another.
     hidden: bool,
+    /// The position of the name in its directory. The fixed names and the entries of the
+    /// system's table have `3 + index`; a name a layer brings takes the next one of the
+    /// service, which is above every position already given.
+    cookie: u64,
 }
 impl Original {
     const EMPTY: Self = Self {
         parent: ROOT,
         node: ROOT,
-        hidden: false,
+        hidden: true,
+        cookie: 0,
     };
 }
 
@@ -402,7 +426,6 @@ pub struct FileSystemInfo {
 pub struct State {
     pub nodes: [Node; NODES],
     originals: [Original; ORIGINALS],
-    original_len: usize,
     next_cookie: u64,
     boot_files: u64,
     boot_blocks: u64,
@@ -446,7 +469,6 @@ impl State {
         Self {
             nodes: [Node::EMPTY; NODES],
             originals: [Original::EMPTY; ORIGINALS],
-            original_len: 0,
             next_cookie: (3 + ORIGINALS) as u64,
             boot_files: 0,
             boot_blocks: 0,
@@ -1110,7 +1132,7 @@ impl<'a> Storage<'a> {
                 ..Node::EMPTY
             };
         }
-        out.state.original_len = 4;
+        let mut named = 4;
         for (d, slot) in [1, 2, 3, 4].into_iter().enumerate() {
             out.state.originals[d] = Original {
                 parent: out.state.nodes[slot].parent,
@@ -1119,6 +1141,7 @@ impl<'a> Storage<'a> {
                     generation: 1,
                 },
                 hidden: false,
+                cookie: 3 + d as u64,
             };
         }
         if let Some(tree) = tree {
@@ -1149,6 +1172,7 @@ impl<'a> Storage<'a> {
                             generation: 1,
                         },
                         hidden: true,
+                        cookie: 3 + 4 + u64::from(n),
                     };
                     continue;
                 }
@@ -1185,11 +1209,12 @@ impl<'a> Storage<'a> {
                         generation: 1,
                     },
                     hidden: false,
+                    cookie: 3 + 4 + u64::from(n),
                 };
             }
-            out.state.original_len += tree.len() as usize;
+            named += tree.len() as usize;
         }
-        for i in 0..out.state.original_len {
+        for i in 0..named {
             let original = out.state.originals[i];
             if original.hidden {
                 continue;
@@ -1471,11 +1496,11 @@ impl<'a> Storage<'a> {
         }
     }
     pub fn entry(&self, parent: Token, index: usize) -> Option<(&[u8], Token)> {
-        if index < self.state.original_len {
+        if index < ORIGINAL_ENTRIES {
             let d = self.state.originals[index];
             return (!d.hidden && d.parent == parent).then(|| (self.original_name(index), d.node));
         }
-        let d = self.state.dentries.get(index - self.state.original_len)?;
+        let d = self.state.dentries.get(index - ORIGINAL_ENTRIES)?;
         (d.len != 0 && !d.reserved && d.parent == parent)
             .then_some((&d.name[..d.len as usize], d.node))
     }
@@ -1494,15 +1519,15 @@ impl<'a> Storage<'a> {
         index: usize,
     ) -> Option<(u64, &[u8], Token)> {
         let (name, token) = self.entry(parent, index)?;
-        let cookie = if index < self.state.original_len {
-            3 + index as u64
+        let cookie = if index < ORIGINAL_ENTRIES {
+            self.state.originals[index].cookie
         } else {
-            self.state.dentries[index - self.state.original_len].cookie
+            self.state.dentries[index - ORIGINAL_ENTRIES].cookie
         };
         Some((cookie, name, token))
     }
     pub fn entries(&self) -> usize {
-        self.state.original_len + DENTRIES
+        ORIGINAL_ENTRIES + DENTRIES
     }
     pub fn lookup(&self, parent: Token, name: &[u8]) -> Result<Token, u32> {
         self.find(parent, name)
@@ -1531,13 +1556,13 @@ impl<'a> Storage<'a> {
     }
     /// The parent and name of an entry that is or was published.
     fn entry_key(&self, index: usize) -> (Token, &[u8]) {
-        if index < self.state.original_len {
+        if index < ORIGINAL_ENTRIES {
             (
                 self.state.originals[index].parent,
                 self.original_name(index),
             )
         } else {
-            let d = &self.state.dentries[index - self.state.original_len];
+            let d = &self.state.dentries[index - ORIGINAL_ENTRIES];
             (d.parent, &d.name[..d.len as usize])
         }
     }
@@ -1604,10 +1629,10 @@ impl<'a> Storage<'a> {
     pub(crate) fn entry_cookie(&self, index: usize) -> u64 {
         #[cfg(test)]
         tests_support::COOKIE_LINKS.with(|count| count.set(count.get() + 1));
-        if index < self.state.original_len {
-            3 + index as u64
+        if index < ORIGINAL_ENTRIES {
+            self.state.originals[index].cookie
         } else {
-            self.state.dentries[index - self.state.original_len].cookie
+            self.state.dentries[index - ORIGINAL_ENTRIES].cookie
         }
     }
     /// Appends a newly published name. Its cookie was allocated at commit.
@@ -1723,18 +1748,18 @@ impl<'a> Storage<'a> {
             return None;
         }
         let name = self.entry_key(index).1;
-        let node = if index < self.state.original_len {
+        let node = if index < ORIGINAL_ENTRIES {
             self.state.originals[index].node
         } else {
-            self.state.dentries[index - self.state.original_len].node
+            self.state.dentries[index - ORIGINAL_ENTRIES].node
         };
         Some((self.entry_cookie(index), name, node))
     }
     pub(crate) fn published(&self, index: usize) -> bool {
-        if index < self.state.original_len {
+        if index < ORIGINAL_ENTRIES {
             !self.state.originals[index].hidden
         } else {
-            let d = &self.state.dentries[index - self.state.original_len];
+            let d = &self.state.dentries[index - ORIGINAL_ENTRIES];
             d.len != 0 && !d.reserved
         }
     }
@@ -2014,7 +2039,7 @@ impl<'a> Storage<'a> {
         let cookie = self.next_directory_cookie()?;
         self.state.dentries[reservation.dentry as usize].cookie = cookie;
         self.state.dentries[reservation.dentry as usize].reserved = false;
-        let entry = self.state.original_len + reservation.dentry as usize;
+        let entry = ORIGINAL_ENTRIES + reservation.dentry as usize;
         self.publish(entry);
         let n = &mut self.state.nodes[reservation.token.slot as usize];
         n.pins[Pin::Pending.index()] -= 1;
@@ -2100,7 +2125,7 @@ impl<'a> Storage<'a> {
     fn drop_dentry(&mut self, i: usize) {
         let d = self.state.dentries[i];
         if d.len != 0 && !d.reserved {
-            self.unpublish(self.state.original_len + i);
+            self.unpublish(ORIGINAL_ENTRIES + i);
         }
         let root = d.root as usize;
         self.state.dentries[i] = Dentry::EMPTY;

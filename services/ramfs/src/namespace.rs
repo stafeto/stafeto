@@ -319,7 +319,7 @@ impl Preparation {
                     if at == ROOT {
                         self.finish_ancestors(storage)?;
                     } else {
-                        if self.ancestor_steps == NODES as u16 {
+                        if self.ancestor_steps == crate::storage::DEPTH_NODES as u16 {
                             return Err(INVALID_ARGUMENT);
                         }
                         self.ancestor = Some(storage.node(at)?.parent);
@@ -423,7 +423,7 @@ impl Preparation {
         let cookie = if replacement {
             let index = match self.edges[1].location {
                 Location::Original(i) => i as usize,
-                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                Location::Dynamic(i) => crate::storage::ORIGINAL_ENTRIES + i as usize,
                 _ => unreachable!("proved replacement"),
             };
             Some(storage.entry_cookie(index))
@@ -461,7 +461,7 @@ impl Preparation {
         if self.intent == NamespaceIntent::Rename
             && let Location::Dynamic(slot) = self.edges[0].location
         {
-            let entry = storage.state.original_len + slot as usize;
+            let entry = crate::storage::ORIGINAL_ENTRIES + slot as usize;
             if keeps_place {
                 storage.chain_remove(entry);
             } else {
@@ -471,7 +471,7 @@ impl Preparation {
         let position = if replacement {
             let entry = match self.edges[1].location {
                 Location::Original(i) => i as usize,
-                Location::Dynamic(i) => storage.state.original_len + i as usize,
+                Location::Dynamic(i) => crate::storage::ORIGINAL_ENTRIES + i as usize,
                 _ => unreachable!("proved replacement"),
             };
             let position = (
@@ -491,7 +491,7 @@ impl Preparation {
             } else {
                 self.reserves.dentries[2].take().expect("paid new name")
             };
-            let entry = storage.state.original_len + slot as usize;
+            let entry = crate::storage::ORIGINAL_ENTRIES + slot as usize;
             let d = &mut storage.state.dentries[slot as usize];
             d.parent = self.edges[1].parent;
             d.node = source;
@@ -620,10 +620,12 @@ impl Storage<'_> {
         if valid { Ok(()) } else { Err(STALE_PROOF) }
     }
     pub(crate) fn namespace_location(&self, index: usize) -> Result<Location, u32> {
-        if index < self.state.original_len {
+        if index < crate::storage::ORIGINAL_ENTRIES {
             Ok(Location::Original(index as u16))
         } else if index < self.entries() {
-            Ok(Location::Dynamic((index - self.state.original_len) as u16))
+            Ok(Location::Dynamic(
+                (index - crate::storage::ORIGINAL_ENTRIES) as u16,
+            ))
         } else {
             Err(STALE_PROOF)
         }
