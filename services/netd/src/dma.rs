@@ -42,6 +42,15 @@ pub const fn bar_at() -> usize {
     0x10_3000_0000
 }
 
+/// Where the service maps the bypass ring of the owner of the second device
+/// (`proto_net::fast`), between the windows and the shared buffers.
+pub const RING_AT: usize = 0x10_4000_0000;
+
+const _: () = assert!(
+    RING_AT >= bar_at() + 0x1000_0000
+        && RING_AT + proto_net::fast::RING_PAGES as usize * PAGE <= BUFFERS_AT
+);
+
 /// Where the service maps the shared buffers of the sessions (BUFFER): entry
 /// `i` of `netd::buffers` at `BUFFERS_AT + i * BUFFER_SPAN`, above the
 /// windows and the objects of the devices.

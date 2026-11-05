@@ -42,8 +42,10 @@ mod calls;
 mod cells;
 mod device;
 mod dma;
+mod fast;
 mod files;
 mod net;
+mod owner;
 mod second;
 mod seed;
 mod split;
@@ -92,7 +94,9 @@ const SWEEP: u64 = 8;
 const RESOLV: u64 = 32;
 /// The second device's step of receiving (second.rs).
 const RX1: u64 = 64;
-const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV;
+/// A step of the second device's return from its owner (owner.rs).
+const RETURN: u64 = 128;
+const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV | RETURN;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
 /// The objects of the second device in the start data of a record of two
@@ -215,6 +219,7 @@ fn main(_: u64) -> u64 {
     let own = args.map_or(&[][..], |a| a.own);
     let (dma_pa, net_pa) = (word(own, 0), word(own, 8));
     let (dma1_pa, net1_pa) = (word(own, 16), word(own, 24));
+    let second_pas: [u64; 5] = core::array::from_fn(|i| word(own, 16 + 8 * i));
     let (at, at1) = (word(own, 8 * objects), word(own, 8 * objects + 8));
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
@@ -421,6 +426,7 @@ fn main(_: u64) -> u64 {
                 second_storage,
                 &settings,
                 random_seed,
+                (dma1_pa, net1_pa),
             );
             match started {
                 Ok(second) => Some(second),
@@ -469,6 +475,13 @@ fn main(_: u64) -> u64 {
         asked: 0,
         ask_at: None,
         resolv: Written::default(),
+        owner: None,
+        claimable: owner::Claimable {
+            handover: settings.handover == Some(true),
+            pci,
+            at: at1,
+            objects: second_pas,
+        },
         #[cfg(feature = "probe")]
         hold: false,
         #[cfg(feature = "probe")]
@@ -481,11 +494,11 @@ fn main(_: u64) -> u64 {
         longest: [0; 2],
         #[cfg(feature = "probe")]
         own: &s.thread,
-        _maps: Maps {
+        maps: Maps {
             _dma: dma_object,
             _net: net_object,
-            _windows: windows,
-            _second: second_objects,
+            windows,
+            second: second_objects,
         },
     };
     // The static address names its servers at once; a lease does in its event.
@@ -636,6 +649,7 @@ fn pci_transport<const D: usize>()
 }
 
 /// Starts the second device in `slot`.
+#[allow(clippy::too_many_arguments)]
 fn start_second<'a>(
     pci: bool,
     at1: u64,
@@ -644,6 +658,7 @@ fn start_second<'a>(
     storage: &'static mut second::Storage,
     settings: &Settings,
     seed: u64,
+    objects: (u64, u64),
 ) -> Result<&'a mut Second, u64> {
     let (transport, status) = open_device(pci, 1, at1)?;
     // SAFETY: the slot is exclusive and empty, the storage is the one
@@ -659,6 +674,7 @@ fn start_second<'a>(
             seed.wrapping_add(1),
             now_ns(),
             settings.address1,
+            objects,
         )?;
         Ok(slot.assume_init_mut())
     }
@@ -709,12 +725,13 @@ impl Tables {
 }
 
 /// The objects and the windows the service holds for its life: the
-/// mappings and the copies it may hand on need them.
+/// mappings and the copies it hands to the owner of the second device
+/// (owner.rs) need them. The windows: `mmio` or `ecam`, `bar`, `mmio1`.
 struct Maps {
     _dma: Handle<Memory>,
     _net: Handle<Memory>,
-    _windows: [Option<Handle<Memory>>; 3],
-    _second: [Option<Handle<Memory>>; SECOND_OBJECTS.len()],
+    windows: [Option<Handle<Memory>>; 3],
+    second: [Option<Handle<Memory>>; SECOND_OBJECTS.len()],
 }
 
 /// The service: the device and the stack, the binding of its line, the
@@ -761,6 +778,9 @@ struct Driver<'a> {
     ask_at: Option<u64>,
     /// The text of `/etc/resolv.conf` as the service wrote it last.
     resolv: Written,
+    /// The program that owns the second device, and what a claim needs.
+    owner: Option<owner::Owner>,
+    claimable: owner::Claimable,
     /// The probe holds the steps of the stack (HOLD), and an interrupt came
     /// meanwhile.
     #[cfg(feature = "probe")]
@@ -784,7 +804,7 @@ struct Driver<'a> {
     /// role `w` take the service's handles up to its limit.
     #[cfg(feature = "probe")]
     own: &'a Handle<rt::handle::Thread>,
-    _maps: Maps,
+    maps: Maps,
 }
 
 impl Driver<'_> {
@@ -977,17 +997,29 @@ impl Driver<'_> {
     /// The second device's step (second.rs): its status if an interrupt
     /// brought the step, the frames of DHCP and ARP, the client's pass; it
     /// asks for another step while frames are left, and opens its line when
-    /// the queue is empty.
-    fn rx1_step(&mut self, interrupt: bool) {
-        let Some(second) = self.second.as_deref_mut() else {
-            return;
-        };
+    /// the queue is empty. While a program owns the device, the frames come
+    /// from the bypass ring, and an interrupt only tells the owner. The
+    /// frames taken from the ring.
+    fn rx1_step(&mut self, interrupt: bool) -> u32 {
         rt::service::step_own();
+        self.rx1_work(interrupt)
+    }
+
+    /// The work of `rx1_step`, which KICK does in its own step.
+    fn rx1_work(&mut self, interrupt: bool) -> u32 {
+        let Some(second) = self.second.as_deref_mut() else {
+            return 0;
+        };
         let now = now_ns();
         let outcome = second.step(now, interrupt);
         match outcome.event {
             Some(Event::Leased(lease)) => rt::println!("net: lease1 {}", lease.summary()),
             Some(Event::Lost) => rt::println!("net: lease1 lost"),
+            None => {}
+        }
+        match outcome.renewed {
+            Some((lease, false)) => rt::println!("net: renew1 {}", lease.summary()),
+            Some((lease, true)) => rt::println!("net: renew1 {} changed", lease.summary()),
             None => {}
         }
         if outcome.first_interrupt {
@@ -999,8 +1031,11 @@ impl Driver<'_> {
             self.own_said = true;
             rt::println!("virtio-net1: own interrupt");
         }
+        self.tell_owner(outcome.owner_bits);
+        // Frames left in the queue or the ring: another step, with the line
+        // closed. The owner's device opens it at once: its status was read.
         let continued = outcome.more && self.tell(RX1);
-        if !continued
+        if (!continued || outcome.owner_bits & proto_net::fast::FAST_INTERRUPT != 0)
             && let Some(second) = self.second.as_deref_mut()
             && core::mem::take(&mut second.line_closed)
         {
@@ -1008,6 +1043,30 @@ impl Driver<'_> {
         }
         if !continued {
             self.arm(now);
+        }
+        outcome.taken
+    }
+
+    /// A step of the second device's return from its owner.
+    fn return_step(&mut self) {
+        let Some(second) = self.second.as_deref_mut() else {
+            return;
+        };
+        rt::service::step_own();
+        // The line of the longest step says which step of the return it was.
+        rt::service::step_detail(second.back_detail());
+        match second.back_step() {
+            second::Returned::More => {
+                self.tell(RETURN);
+            }
+            second::Returned::Done => {
+                rt::println!("net: device 1 back");
+                self.tell(RX1);
+            }
+            second::Returned::Failed(code) => {
+                rt::println!("virtio-net1: the device did not come back");
+                sys::process_exit(code);
+            }
         }
     }
 
@@ -1180,14 +1239,29 @@ impl Driver<'_> {
         }
     }
 
-    /// CONFIG: the interface's address, or NET_DOWN while it has none.
+    /// CONFIG: the address of the interface of the device the request
+    /// names (the first without one), or NET_DOWN while it has none. The
+    /// second device's gateway and name server are what its lease said; the
+    /// service routes nothing through them.
     fn config(&mut self, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() || !r.handles.is_empty() {
+        let device = match proto_net::fast::read_config(r.body()) {
+            Ok(device) => device,
+            Err(status) => return Answer::Status(status),
+        };
+        if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
         #[cfg(feature = "probe")]
         self.report_frames();
-        let Some(lease) = self.stack.lease else {
+        let (lease, mac) = if device == 0 {
+            (self.stack.lease, self.mac)
+        } else {
+            match self.second.as_deref() {
+                Some(second) => (second.lease, second.device.mac),
+                None => return Answer::Status(code(proto_net::INVALID)),
+            }
+        };
+        let Some(lease) = lease else {
             return Answer::Status(code(proto_net::NET_DOWN));
         };
         let config = proto_net::Config {
@@ -1195,7 +1269,7 @@ impl Driver<'_> {
             prefix: u32::from(lease.prefix),
             gateway: lease.gateway,
             dns: lease.dns,
-            mac: self.mac,
+            mac,
         };
         if config.write(r.reply()).is_err() {
             return Answer::Status(Status::BadSize);
@@ -1230,6 +1304,11 @@ impl Driver<'_> {
                 netd::ring::BUFFER_PORTION,
                 self.net.counters.largest_copy
             );
+        }
+        if let Some((refused, lost, broken)) =
+            self.second.as_deref().and_then(|s| s.ring_counters())
+        {
+            rt::println!("net: bypass refused {refused} lost {lost} broken {broken}");
         }
         split::report();
     }
@@ -1325,16 +1404,16 @@ const ASK_RETRY_NS: u64 = 1_000_000;
 const SWEEP_NS: u64 = 1_000_000_000;
 
 /// The methods of the service: PING and CRASH only with the feature
-/// `probe`. The method of a later stage (26) is UNKNOWN_METHOD.
+/// `probe`.
 #[cfg(feature = "probe")]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27,
-    28, 29, 30, 31, 32, 33, 34, 35, 62, 63,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 62, 63,
 ];
 #[cfg(not(feature = "probe"))]
 const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27,
-    28, 29, 32, 33, 34, 35,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 32, 33, 34, 35, 36, 37,
 ];
 
 impl Service<0> for Driver<'_> {
@@ -1355,6 +1434,9 @@ impl Service<0> for Driver<'_> {
             #[cfg(feature = "probe")]
             Some(Method::Hold) => self.hold(r),
             Some(Method::Buffer) => self.net.buffer(s, r),
+            Some(Method::Claim) => self.claim(s, r),
+            Some(Method::ClaimMore) => self.claim_more(s, r),
+            Some(Method::Kick) => self.kick(s, r),
             Some(method) => match sockets::Request::parse(method, r.body()) {
                 Some(Ok(call)) => self.net.call(&mut self.stack, s, r, call),
                 Some(Err(status)) => Answer::Status(status),
@@ -1370,6 +1452,8 @@ impl Service<0> for Driver<'_> {
     /// let go of in steps.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
+        // The owner of the second device went: the device comes back.
+        self.owner_gone(s);
         let held = core::mem::take(&mut s.data.held);
         let long = core::mem::take(&mut s.data.long);
         // The shared buffer is unmapped by a step of departure.
@@ -1412,13 +1496,15 @@ impl Service<0> for Driver<'_> {
             // Init labels the bindings of a record of two devices
             // (`proto_init::binding_label`): the line says whose interrupt it
             // is, and the step reads that device's status alone.
-            Source::Interrupt if n.label == proto_init::binding_label(1) => self.rx1_step(true),
+            Source::Interrupt if n.label == proto_init::binding_label(1) => {
+                self.rx1_step(true);
+            }
             Source::Interrupt => self.rx_step(true),
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
                 // step that is on.
-                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV];
+                let order = [RX, RX1, TX, WAKE, CLEANUP, SWEEP, RESOLV, RETURN];
                 let at =
                     netd::ring::next_bit(&order, n.bits & STEP_BITS, self.last_step).unwrap_or(0);
                 self.last_step = at;
@@ -1437,7 +1523,10 @@ impl Service<0> for Driver<'_> {
                         let irq = false;
                         self.rx_step(irq)
                     }
-                    RX1 => self.rx1_step(false),
+                    RX1 => {
+                        self.rx1_step(false);
+                    }
+                    RETURN => self.return_step(),
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
