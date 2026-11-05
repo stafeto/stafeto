@@ -73,11 +73,12 @@ const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
 /// the other sub-steps of the return keep 0.9 of term B.
 const RETURN_KIND: usize = 65;
 const RETURN_MAX: u64 = 1_200_000;
-/// The same after nginx on the stack served `wrk -c200` and was told to quit:
-/// the host's reset of a device that has just carried a load took 27 to 86 ms
-/// (the runs of stage P6b-3), against 16 to 20 ms of an idle one. 100 ms of
-/// the counter.
-const RETURN_MAX_AFTER_LOAD: u64 = 2_400_000;
+/// The same for the reset (detail 1) after nginx on the stack served
+/// `wrk -c200` and was told to quit: the host's reset of a device that has
+/// just carried a load took 27, 55, 57, 57, 86 and 128 ms
+/// (the runs of stage P6b-3), against 16 to 20 ms of an idle one. 200 ms of
+/// the counter: the bound guards against a change, the host sets the time.
+const RETURN_MAX_AFTER_LOAD: u64 = 4_800_000;
 /// Whether a line of steps is one the host's reset of the device delays: a
 /// step of kind 65 with detail 1 (the reset) or 2 (the open), or, after the
 /// owner was killed, with detail 0 (whichever own step touches the device
@@ -447,8 +448,6 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let machine = vz::Machine {
         net: options.devices,
         mac_suffix: suffix.value,
-        // The pool of nginx's commands is large (init's table).
-        memory_mib: options.nginx.then_some(2048),
         ..vz::Machine::default()
     };
     let started = Instant::now();
@@ -588,10 +587,14 @@ pub fn command(args: &[String]) -> Result<(), String> {
         }
         // The longest step of the return by its detail (1 reset, 2 open,
         // 3 and 4 the queues, 5 on the fill).
-        let bound = if options.nginx {
-            RETURN_MAX_AFTER_LOAD
-        } else {
-            RETURN_MAX
+        // The reset (detail 1) after a load of nginx has its own bound; the
+        // other steps of the return keep the bound of every other run.
+        let bound_of = |detail: u64| {
+            if options.nginx && detail == 1 {
+                RETURN_MAX_AFTER_LOAD
+            } else {
+                RETURN_MAX
+            }
         };
         let mut returns: std::collections::BTreeMap<u64, u64> = Default::default();
         for line in &back {
@@ -607,9 +610,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
             }
         }
         println!(
-            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {bound})"
+            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {RETURN_MAX}, {RETURN_MAX_AFTER_LOAD} for the reset after the load of nginx)"
         );
-        if let Some(row) = returns.iter().find(|r| *r.1 > bound) {
+        if let Some(row) = returns.iter().find(|r| *r.1 > bound_of(*r.0)) {
             return Err(format!("a step of the return past its bound: {row:?}"));
         }
     }

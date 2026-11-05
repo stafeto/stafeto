@@ -36,9 +36,12 @@
 //!    handler calling `accept` on the ticket (EAGAIN) and a second thread
 //!    that calls it during the start (it waits, then EAGAIN), and the refusals
 //!    of the process that holds the stack;
-//! 9. `fast-layer --loss`: the echo is served, then the network service is
-//!    made to fault: the process ends with status 2 within two seconds after
-//!    the line of the layer (the glue's table asks to end on the loss).
+//! 9. `STAFETO_FAST_EXIT_IN_PASS=100 fast-layer --loss`: the glue ends the
+//!    process with status 1 inside a step of the stack, as `ff_mmap` does when
+//!    `mmap` fails; the status arrives and the device comes back;
+//! 10. `fast-layer --loss`: the echo is served, then the network service is
+//!     made to fault: the process ends with status 2 within two seconds after
+//!     the line of the layer (the glue's table asks to end on the loss).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -64,6 +67,8 @@ const LINE_WITHIN: Duration = Duration::from_secs(60);
 const RULES_WITHIN: Duration = Duration::from_secs(120);
 /// The process ends within this long of the service's fault.
 const LOSS_WITHIN: Duration = Duration::from_secs(2);
+/// An exit from inside a call of the table completes this soon.
+const EXIT_IN_CALL_WITHIN: Duration = Duration::from_secs(8);
 
 /// The checks of the program, in its order (`fast-layer: <name> ok`).
 pub const CHECKS: &[&str] = &[
@@ -257,6 +262,30 @@ fn stats(port: u16) -> Result<(u64, u64), String> {
             .ok_or_else(|| format!("no {name} in {text:?}"))
     };
     Ok((field("ticks=")?, field("passes=")?))
+}
+
+/// The process ends from inside a call of the table (the glue calls `exit(1)`
+/// in its 100th step, as the stack's `ff_mmap` does when `mmap` fails): it
+/// ends with status 1 and gives the device back within five seconds. The
+/// layer's last steps must not enter the stack, whose lock this very thread
+/// holds.
+fn exit_in_call_run(run: &mut qemu::Run, notes: &mut Vec<String>) -> Result<(), String> {
+    run.send("STAFETO_FAST_EXIT_IN_PASS=100 fast-layer --loss; echo exit-call-status=$?")?;
+    let at = Instant::now();
+    expect_all(
+        run,
+        &[
+            "fast-layer: loss serving",
+            "exit-call-status=1",
+            "net: device 1 back",
+        ],
+        EXIT_IN_CALL_WITHIN,
+    )?;
+    notes.push(format!(
+        "an exit from inside a step of the stack ended the process with status 1 and gave the device back {} ms after the start",
+        at.elapsed().as_millis()
+    ));
+    Ok(())
 }
 
 /// The service ends while the program holds the device: the program ends
@@ -566,6 +595,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             RULES.len(),
             began.elapsed().as_millis()
         ));
+        exit_in_call_run(&mut run, &mut notes)?;
         loss_run(&mut run, echo_host, &mut notes)?;
         run.send("echo probe-end")?;
         run.expect("probe-end", DIALOG_STEP)?;

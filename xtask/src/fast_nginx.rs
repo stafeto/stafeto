@@ -458,10 +458,13 @@ fn files(address: SocketAddr) -> Result<(), String> {
     Ok(())
 }
 
-/// `width` connections open at once, each fetching the page of 64 KiB at the
-/// same time: the worker holds the buffers of all the answers together, which
+/// `width` connections open at once (the time to open them one after another
+/// and the time to answer are given apart: a connection through the user
+/// network of QEMU may wait for a SYN to be sent again), each fetching the page
+/// of 64 KiB at the same time: the worker holds the buffers of all the answers together, which
 /// is the largest holding of the run and sets the quota of the command.
-fn wide(address: SocketAddr, width: usize) -> Result<(), String> {
+fn wide(address: SocketAddr, width: usize) -> Result<(Duration, Duration), String> {
+    let opening = Instant::now();
     let mut open = Vec::new();
     for n in 0..width {
         open.push(
@@ -469,6 +472,8 @@ fn wide(address: SocketAddr, width: usize) -> Result<(), String> {
                 .map_err(|e| format!("connection {} of {width}: {e}", n + 1))?,
         );
     }
+    let opened = opening.elapsed();
+    let answering = Instant::now();
     let threads: Vec<_> = open
         .into_iter()
         .map(|mut c| {
@@ -488,7 +493,7 @@ fn wide(address: SocketAddr, width: usize) -> Result<(), String> {
         }
     }
     if failed.is_empty() {
-        Ok(())
+        Ok((opened, answering.elapsed()))
     } else {
         Err(format!(
             "{} of {width} answers failed: {}",
@@ -940,11 +945,11 @@ fn scenario(
         at.elapsed().as_millis()
     ));
     if kind != Kind::Steps {
-        let at = Instant::now();
-        wide(address, WIDE)?;
+        let (opened, answered) = wide(address, WIDE)?;
         notes.push(format!(
-            "3: {WIDE} connections at once, each with the page of 64 KiB, in {} ms",
-            at.elapsed().as_millis()
+            "3: {WIDE} connections at once, each with the page of 64 KiB: opened one after another in {} ms, answered in {} ms",
+            opened.as_millis(),
+            answered.as_millis()
         ));
         files(address)?;
         no_buffers(run)?;

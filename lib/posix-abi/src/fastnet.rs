@@ -28,7 +28,7 @@ use crate::wait;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use posix_sync::LayerLock;
 
 const ENOTTY: i32 = 25;
@@ -189,6 +189,16 @@ pub fn table_flags() -> u32 {
 /// outside it.
 static FAST_LOCK: LayerLock = LayerLock::new();
 
+/// The thread that holds `FAST_LOCK` (the address of its block, plus one),
+/// 0 when none does. A process that ends from inside a call of the table (the
+/// stack's `ff_mmap` ends it when `mmap` fails) must not enter the stack
+/// again: the lock has no re-entry, and the stack is in the middle of a call.
+static LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+fn thread_mark() -> usize {
+    posix_thread::block() as usize + 1
+}
+
 /// Runs `f` with the table under the lock, EBADF without a table or a stack.
 fn locked<R>(f: impl FnOnce(&FastTable) -> R) -> Result<R, i32> {
     let t = table().ok_or(EBADF)?;
@@ -196,7 +206,24 @@ fn locked<R>(f: impl FnOnce(&FastTable) -> R) -> Result<R, i32> {
         return Err(EBADF);
     }
     let _guard = FAST_LOCK.lock();
+    let _owner = OwnerMark::set();
     Ok(f(t))
+}
+
+/// Says in `LOCK_OWNER` that this thread holds the lock, until it drops.
+struct OwnerMark;
+
+impl OwnerMark {
+    fn set() -> Self {
+        LOCK_OWNER.store(thread_mark(), Ordering::Relaxed);
+        OwnerMark
+    }
+}
+
+impl Drop for OwnerMark {
+    fn drop(&mut self) {
+        LOCK_OWNER.store(0, Ordering::Relaxed);
+    }
 }
 
 /// `locked` for a call whose answer is a count or a negated errno.
@@ -850,9 +877,14 @@ pub fn exit_if_lost() {
 /// The longest the process stays on at its end for the stack's last
 /// segments, and the quiet that ends the wait sooner: a stack that found no
 /// work (no frame came, no work of its own was queued) for this long has
-/// nothing to send that the peer's window lets it.
-const DRAIN_MAX_NS: u64 = 200_000_000;
+/// nothing to send that the peer's window lets it. A client at the other end
+/// of a slow path (the window of a user network of QEMU opens every few
+/// milliseconds) needs most of a second for a tail of a few hundred KiB.
+const DRAIN_MAX_NS: u64 = 1_000_000_000;
 const DRAIN_QUIET_NS: u64 = 20_000_000;
+/// The pause between two steps when the stack has no work: a wait for the
+/// device's notification of at most this long.
+const DRAIN_PAUSE_NS: u64 = 1_000_000;
 
 /// The steps of the stack before the process ends, so that the FIN of the
 /// sockets just closed and the tails of their send buffers leave: `close`
@@ -860,11 +892,13 @@ const DRAIN_QUIET_NS: u64 = 20_000_000;
 /// socket that is closed while the peer has not yet taken all its data keeps
 /// the rest in the stack, which dies with the process, so the steps go on
 /// while the peer's acknowledgements keep the stack at work, for at most
-/// `DRAIN_MAX_NS` and until `DRAIN_QUIET_NS` pass without work. Nothing
-/// waits for the peer's answers to the FIN. They do not run after the
-/// service let go.
+/// `DRAIN_MAX_NS` and until `DRAIN_QUIET_NS` pass without work; between the
+/// steps of an idle stack the thread that holds the claim waits for the
+/// device's interrupt. Nothing waits for the peer's answers to the FIN. They
+/// do not run after the service let go, nor in a thread that holds the lock
+/// of the table (the process ends from inside a call of the stack).
 pub fn last_pass() {
-    if !(registered() && up() && !lost()) {
+    if !(registered() && up() && !lost()) || LOCK_OWNER.load(Ordering::Relaxed) == thread_mark() {
         return;
     }
     let started = wait::now();
@@ -882,7 +916,23 @@ pub fn last_pass() {
         {
             return;
         }
-        core::hint::spin_loop();
+        if now == quiet_from {
+            continue;
+        }
+        // Idle: the interrupts on, one more look, then the wait.
+        notify(true);
+        if !matches!(pass(), Ok(0)) {
+            notify(false);
+            quiet_from = wait::now();
+            continue;
+        }
+        match fast::wait(DRAIN_PAUSE_NS) {
+            Ok(bits) => absorb(bits),
+            Err(_) => {
+                let _ = rt::sys::yield_now();
+            }
+        }
+        notify(false);
     }
 }
 

@@ -81,6 +81,14 @@ flags_of(int linux_flags)
 static int stats_on;
 static uint64_t stats_said;
 
+/*
+ * With STAFETO_FAST_EXIT_IN_PASS=N the process ends with status 1 inside its
+ * Nth step of the stack, as the stack's ff_mmap does when mmap fails: the
+ * probe of the layer checks that an exit from inside a call of the table
+ * completes (the layer must not enter the stack again from its end).
+ */
+static long exit_in_pass;
+
 static void
 glue_stats(void)
 {
@@ -115,6 +123,8 @@ glue_start(const struct stafeto_fast_claim *claim)
         claim->config.prefix);
     fflush(stderr);
     stats_on = getenv("STAFETO_FAST_STATS") != NULL;
+    if (getenv("STAFETO_FAST_EXIT_IN_PASS") != NULL)
+        exit_in_pass = atol(getenv("STAFETO_FAST_EXIT_IN_PASS"));
     return 0;
 }
 
@@ -123,6 +133,8 @@ glue_pass(void)
 {
     int work = ff_stafeto_pass();
 
+    if (exit_in_pass > 0 && --exit_in_pass == 0)
+        exit(1);
     if (stats_on)
         glue_stats();
     return work;

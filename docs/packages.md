@@ -119,8 +119,11 @@ them for the licence notes of the image.
   holds F-Stack's (`/usr/share/licenses/nginx-fast/f-stack/`, with the file
   `NOTICES` of the copyright lines and terms of the files the stack's build
   compiled, which `tools/build-fstack.py` writes). F-Stack's notices are in
-  these two packages and nowhere else: the kernel archive and the archive of
+  these two packages in the distribution: the kernel archive and the archive of
   the shell image carry none of them (`cargo xtask dist-licenses` checks it).
+  The probe images that hold the stack (`fstack-probe`, `fast-layer`,
+  `nginx-fast`) carry the same notices at the level of the image, in
+  `FSTACK-LICENSE`.
   `cargo xtask fast-probe nginx` runs the pages over HTTP and HTTPS, a reload
   under load, a worker killed, the quit and the worker under nobody; with
   `crash` the network service ends under requests; with `steps` the service
