@@ -2528,11 +2528,16 @@ fn write_elf_image(
             .iter()
             .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == program))
     };
+    let linked: Vec<&str> = ["curl", "nginx", "openssl"]
+        .into_iter()
+        .filter(|program| has(program))
+        .collect();
     let tls_files = net_tls::terms_files(
-        has("openssl"),
+        &linked,
         has("curl"),
         net_tls::ca_file_of(name, &rootfs::files_of(name))?,
     )?;
+    nginx_probe::key_files_of(name, &rootfs::files_of(name))?;
     for (name, bytes) in &tls_files {
         list.push((name, bytes.as_slice()));
     }

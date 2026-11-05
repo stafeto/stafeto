@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 44] = [
+const SYSTEM_PATHS: [&str; 47] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -300,6 +300,11 @@ const SYSTEM_PATHS: [&str; 44] = [
     // nginx with one listening socket for all the workers.
     "/www/10k.bin",
     "/etc/nginx/exclusive.conf",
+    // ... and nginx's server of TLS with the key and the certificate the
+    // probe CA made for it.
+    "/etc/nginx/tls.conf",
+    "/etc/nginx/server.crt",
+    "/etc/nginx/server.key",
 ];
 
 /// Whether the base system owns `path`: the paths above and the device
@@ -1024,8 +1029,9 @@ fn net_files(image: &str) -> Vec<RootFile> {
 /// The files of the images of `nginx-probe`: those of the shell with the
 /// network (nginx among them), with the probe's variant of nginx's settings
 /// in place of the package's, the variant with one listening socket, the
-/// files of 10 KiB and 256 KiB the probe fetches, and `netd.conf` with
-/// eight buffers.
+/// files of 10 KiB and 256 KiB the probe fetches, `netd.conf` with eight
+/// buffers, and the server of TLS (`tls.conf`) with nginx's certificate and
+/// key from the probe CA, the key readable by root alone.
 fn nginx_files(image: &str) -> Vec<RootFile> {
     let mut files = net_files(image);
     let settings = files
@@ -1063,6 +1069,24 @@ fn nginx_files(image: &str) -> Vec<RootFile> {
             0o644,
             ROOT,
             Source::Bytes("netd.conf", crate::nginx_probe::NETD_CONF),
+        ),
+        of(
+            crate::nginx_probe::TLS_CONF_PATH,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-tls.conf", crate::nginx_probe::TLS_CONF.as_bytes()),
+        ),
+        of(
+            crate::nginx_probe::SERVER_CRT,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx.crt", crate::probe_ca::nginx_certificate()),
+        ),
+        of(
+            crate::nginx_probe::SERVER_KEY,
+            0o600,
+            ROOT,
+            Source::Bytes("nginx.key", crate::probe_ca::nginx_key()),
         ),
     ]);
     files

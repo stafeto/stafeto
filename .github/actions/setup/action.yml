@@ -17,13 +17,15 @@ runs:
       run: |
         # The C probes need the clang of the developers' Macs (23): the
         # distribution's clang 18 lacks the __INT64_C family relibc's headers use.
+        # nghttp2-client brings h2load, which step 4e of nginx-probe runs.
         sudo install -d -m 0755 /etc/apt/keyrings
         curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
         echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-$LLVM_VERSION main" | sudo tee /etc/apt/sources.list.d/llvm.list
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           "clang-$LLVM_VERSION" "lld-$LLVM_VERSION" "llvm-$LLVM_VERSION" make python3 git curl \
-          ca-certificates bzip2 xz-utils patch gawk ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison
+          ca-certificates bzip2 xz-utils patch gawk ninja-build pkg-config libglib2.0-dev libpixman-1-dev libslirp-dev python3-venv flex bison \
+          nghttp2-client
         echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
         "/usr/lib/llvm-$LLVM_VERSION/bin/clang" --version | head -1
 

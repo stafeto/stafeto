@@ -112,8 +112,19 @@ them for the licence notes of the image.
   the target through `tools/nginx/cross-autotest.patch` and
   `tools/nginx/autotest-answer.py`, which answers sizes from the compiler and
   every other run-probe from a table with a reason; a probe it does not know
-  stops the build. `cargo xtask nginx-probe` runs nginx in the images
-  `boot-nginx-probe.img` and `boot-nginx-probe-steps.img`.
+  stops the build. nginx has the modules of TLS and HTTP/2
+  (`--with-http_ssl_module --with-http_v2_module`) and links OpenSSL's static
+  archives (`depends` names `openssl`); `nginx -V` lists both modules. The
+  package's `nginx.conf` serves HTTP on port 80 alone: a server of TLS needs
+  a key and a certificate, which no image of a release carries.
+  `tools/nginx/tls.conf` is such a server (port 443, `http2 on`,
+  `ssl_protocols TLSv1.3`); it goes, with nginx's key and certificate from
+  the probe CA, only into the images of `cargo xtask nginx-probe`
+  (`boot-nginx-probe.img` and `boot-nginx-probe-steps.img`), whose settings
+  include it. It speaks TLS 1.3 alone, with OpenSSL's default suites of TLS
+  1.3; settings that add TLS 1.2 get nginx's default `ssl_ciphers`
+  (`HIGH:!aNULL:!MD5`), which still holds the exchange of keys by RSA and
+  the CBC mode, and should name `ssl_ciphers`.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 

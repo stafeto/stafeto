@@ -36,7 +36,7 @@ ANSWERS = {
     "mmap(MAP_ANON|MAP_SHARED)": (0, "an anonymous shared mapping stays shared across fork"),
     'mmap("/dev/zero", MAP_SHARED)': (1, "nginx takes MAP_ANON first; a shared /dev/zero is not claimed"),
     "System V shared memory": (1, "nginx takes MAP_ANON first; the segments of the pipe service are few (8 of 1 MiB)"),
-    "POSIX semaphores": (1, "kept off: the accept mutex is off and the configurations have no shared zone, so nginx's shared mutex never waits"),
+    "POSIX semaphores": (1, "kept off: the accept mutex is off, and the lock of the one shared zone (the keys of the TLS tickets of tls.conf) is held briefly, at most once a second a worker: nginx's shared mutex spins and yields with sched_yield"),
     "POSIX semaphores in libpthread": (1, "as POSIX semaphores"),
     "sendfile()": (1, "relibc has no sys/sendfile.h; nginx writes with writev"),
     "sendfile64()": (1, "relibc has no sys/sendfile.h; nginx writes with writev"),
