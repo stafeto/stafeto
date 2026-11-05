@@ -34,7 +34,11 @@ pub struct PrevEntry {
     pub version: String,
     pub release: String,
     pub recipe: String,
+    /// What the new index says in `file`: the full address when the index
+    /// came from an address, the entry's own field when it came from a directory.
     pub file: String,
+    /// Where the file is read from.
+    pub fetch: String,
     pub source: Option<String>,
     pub size: u64,
     pub sha256: String,
@@ -169,6 +173,7 @@ pub fn load(
             ),
         ));
     }
+    let remote = base.starts_with("https://");
     let mut entries = Vec::new();
     for e in index.entries() {
         let (version, release) = split_version(e.version)
@@ -178,8 +183,19 @@ pub fn load(
             version: version.to_string(),
             release: release.to_string(),
             recipe: e.recipe.to_string(),
-            file: address_of(base, e.file),
-            source: e.source.map(|s| address_of(base, s)),
+            file: if remote {
+                address_of(base, e.file)
+            } else {
+                e.file.to_string()
+            },
+            fetch: address_of(base, e.file),
+            source: e.source.map(|s| {
+                if remote {
+                    address_of(base, s)
+                } else {
+                    s.to_string()
+                }
+            }),
             size: e.size,
             sha256: e.sha256.to_string(),
         });
@@ -286,21 +302,21 @@ pub fn plan(
             );
             continue;
         }
-        let bytes = fetch(&old.file)?
-            .ok_or_else(|| format!("{}: the file of {} is missing", old.file, w.name))?;
+        let bytes = fetch(&old.fetch)?
+            .ok_or_else(|| format!("{}: the file of {} is missing", old.fetch, w.name))?;
         if bytes.len() as u64 != old.size {
             return Err(format!(
                 "{}: {} bytes, the index says {}",
-                old.file,
+                old.fetch,
                 bytes.len(),
                 old.size
             ));
         }
         let mut hex = [0u8; 64];
         if sha::hex(&sha::sha256(&bytes), &mut hex) != old.sha256 {
-            return Err(format!("{}: the SHA-256 differs from the index", old.file));
+            return Err(format!("{}: the SHA-256 differs from the index", old.fetch));
         }
-        let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", old.file))?;
+        let file = PackageFile::parse(&bytes).map_err(|e| format!("{}: {e}", old.fetch))?;
         let m = &file.meta;
         if m.name != w.name
             || m.version != w.version
@@ -309,7 +325,7 @@ pub fn plan(
         {
             return Err(format!(
                 "{}: the meta of the file differs from the entry of the index",
-                old.file
+                old.fetch
             ));
         }
         match file.verify(&trust, &prev.revocations) {
@@ -333,7 +349,7 @@ pub fn plan(
                     },
                 );
             }
-            Err(e) => return Err(format!("{}: {e}", old.file)),
+            Err(e) => return Err(format!("{}: {e}", old.fetch)),
         }
     }
     let leaving = prev
@@ -647,10 +663,8 @@ pub(crate) mod tests {
             } => {
                 assert_eq!(release, "3");
                 assert_eq!(bytes, &alpha);
-                assert_eq!(
-                    address,
-                    &dir.join("alpha-1.0-3.stpkg").display().to_string()
-                );
+                // The index came from a directory: the entry keeps its own field.
+                assert_eq!(address, "alpha-1.0-3.stpkg");
             }
             other => panic!("{other:?}"),
         }

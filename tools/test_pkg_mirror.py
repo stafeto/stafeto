@@ -81,11 +81,11 @@ class MirrorTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def start(self):
+    def start(self, *extra):
         port = free_port()
         child = subprocess.Popen(
             [sys.executable, MIRROR, "--dir", self.www, "--port", str(port),
-             "--cert", self.cert, "--key", self.key],
+             "--cert", self.cert, "--key", self.key, *extra],
             stdout=subprocess.PIPE, text=True,
         )
         self.addCleanup(self.stop, child)
@@ -117,6 +117,24 @@ class MirrorTest(unittest.TestCase):
         self.assertEqual(
             child.stdout.readline().strip(), "pkg-mirror: GET /0.2/aarch64/big.bin 200 300000"
         )
+
+    def test_a_listed_path_is_answered_302_and_the_client_follows_it(self):
+        table = os.path.join(self.tmp, "redirects")
+        with open(table, "w") as f:
+            f.write("/moved/INDEX /0.2/aarch64/INDEX\n")
+        child, port = self.start("--redirects", table)
+        # urllib follows the redirect: the body is the file at the target.
+        status, length, body = self.fetch(port, "/moved/INDEX")
+        self.assertEqual((status, body), (200, b"state one\n"))
+        self.assertEqual(child.stdout.readline().strip(), "pkg-mirror: GET /moved/INDEX 302 0")
+        self.assertEqual(
+            child.stdout.readline().strip(), "pkg-mirror: GET /0.2/aarch64/INDEX 200 10"
+        )
+        # The table is read at each request: a line added later counts, a path not in it is served as ever.
+        with open(table, "a") as f:
+            f.write("/also /0.2/aarch64/INDEX\n")
+        self.assertEqual(self.fetch(port, "/also")[2], b"state one\n")
+        self.assertEqual(self.fetch(port, "/0.2/aarch64/INDEX")[0], 200)
 
     def test_a_missing_file_is_a_404_in_the_log(self):
         child, port = self.start()

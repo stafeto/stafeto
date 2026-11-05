@@ -32,6 +32,7 @@ use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, DIALOG_STEP, SERVICES_STARTED, STORE_BYTES, Variant, base_image,
     build, keys, packages, pkg, probe_ca, qemu, repo, root, symbolize, target_dir,
 };
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,7 @@ impl Mirror {
         port: u16,
         certificate: &Path,
         key: &Path,
+        redirects: Option<&Path>,
     ) -> Result<Mirror, String> {
         // A port that is taken stops the probe with a line that names it: the port is in the image.
         drop(
@@ -102,6 +104,11 @@ impl Mirror {
             .arg(certificate)
             .arg("--key")
             .arg(key)
+            .args(
+                redirects
+                    .iter()
+                    .flat_map(|r| [OsStr::new("--redirects"), r.as_os_str()]),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .stdin(Stdio::null())
@@ -195,6 +202,7 @@ fn make_good(states: &Path) -> Result<PathBuf, String> {
         recipe: false,
         replace: Vec::new(),
         previous: None,
+        perturb: Vec::new(),
     })?;
     let all = packages::load()?;
     repo::make(
@@ -471,7 +479,11 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
     let www_b = dir.join("www-b");
     std::fs::create_dir_all(www.join(pkg::series())).map_err(|e| e.to_string())?;
     let doom = make_good(&states_dir)?;
-    let states = pkg_states::make(&states_dir, &doom)?;
+    let states = pkg_states::make(&states_dir, &doom, &format!("https://10.0.2.2:{PORT}"))?;
+    point_at(&www.join("store"), &states.store)?;
+    let redirects = dir.join("redirects");
+    std::fs::write(&redirects, &states.redirects)
+        .map_err(|e| format!("{}: {e}", redirects.display()))?;
     point_at(&www.join(pkg::series()).join("aarch64"), &states.good)?;
     let games_link = www.join("games").join(pkg::series()).join("aarch64");
     point_at(&games_link, &states.games)?;
@@ -489,12 +501,19 @@ fn scenario(machine: &'static qemu::Machine, full: bool) -> Result<(), String> {
         test_files()?,
     )?;
     let prepared = started.elapsed();
-    let mirror = Mirror::start(&www, PORT, &ca.join("host-a.crt"), &ca.join("host-a.key"))?;
+    let mirror = Mirror::start(
+        &www,
+        PORT,
+        &ca.join("host-a.crt"),
+        &ca.join("host-a.key"),
+        Some(&redirects),
+    )?;
     let other = Mirror::start(
         &www_b,
         OTHER_PORT,
         &ca.join("host-b.crt"),
         &ca.join("host-b.key"),
+        None,
     )?;
     // The disk of the guest: new for the run, the same for its boots.
     let store = image.with_file_name("store-pkg-probe.img");
@@ -1087,6 +1106,43 @@ fn third_boot(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
     let lines = expect_code(run, "pkg check", "b3-check", 0, DIALOG_STEP)?;
     need(&lines, "settings saved", "boot 3")?;
     ctx.report.push("a third boot: only hello and the image, no path of Doom, no /etc/pkg/repositories, pkg check 0".into());
+    absolute(run, ctx)
+}
+
+/// Step 19: an index with full addresses in `file`, a second directory of the mirror, and a
+/// redirect from one address to another: `pkg install doom` puts Doom in again.
+fn absolute(run: &mut qemu::Run, ctx: &mut Ctx<'_>) -> Result<(), String> {
+    ctx.state(&ctx.states.absolute)?;
+    let (lines, requests) = with_log(run, ctx, "pkg install doom", "abs-install", 0)?;
+    need(
+        &lines,
+        &format!(
+            "fetching {}/INDEX ... ok (serial 7, signed by stafeto-dev-release)",
+            official_address()
+        ),
+        "step 19",
+    )?;
+    need(&lines, "(doom), freedoom 0.13.0-1 (dependency)", "step 19")?;
+    let storage = pkg_states::STORAGE;
+    for wanted in [
+        format!("/store/{storage}/doomgeneric-e257a095-1.stpkg 302 0"),
+        "/store/moved/doomgeneric-e257a095-1.stpkg 200".to_string(),
+        format!("/store/{storage}/freedoom-0.13.0-1.stpkg 200"),
+    ] {
+        if !got(&requests, &wanted) {
+            return Err(format!(
+                "step 19: the mirror did not log {wanted}: {requests:?}"
+            ));
+        }
+    }
+    expect_code(
+        run,
+        "ls /bin/doom /games/freedoom1.wad",
+        "abs-ls",
+        0,
+        DIALOG_STEP,
+    )?;
+    ctx.report.push("an index with full addresses: pkg install doom follows a 302 from one address to another and puts Doom in".into());
     Ok(())
 }
 

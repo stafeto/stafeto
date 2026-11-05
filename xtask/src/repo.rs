@@ -40,6 +40,8 @@ pub struct Options {
     pub storage: Option<String>,
     /// `--serial` was given.
     pub serial_given: bool,
+    /// Packages whose recipe is changed on purpose (`pkg-build --perturb`).
+    pub perturb: Vec<String>,
 }
 
 impl Default for Options {
@@ -58,6 +60,7 @@ impl Default for Options {
             from: None,
             storage: None,
             serial_given: false,
+            perturb: Vec::new(),
         }
     }
 }
@@ -80,6 +83,7 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--previous" => o.previous = Some(value),
             "--from" => o.from = Some(value.into()),
             "--storage" => o.storage = Some(value),
+            "--perturb" => o.perturb.push(value),
             "--serial" => {
                 o.serial_given = true;
                 o.serial = value
@@ -573,6 +577,7 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         key: o.key.clone(),
         cert: o.cert.clone(),
         previous: o.previous.clone(),
+        perturb: o.perturb.clone(),
         ..pkg::Options::default()
     })?;
     // The serial after the one of the index carried from, unless given.

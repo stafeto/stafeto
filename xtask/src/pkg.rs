@@ -524,6 +524,9 @@ pub struct Options {
     /// The directory or address of a published index to carry unchanged
     /// packages from (carry.rs).
     pub previous: Option<String>,
+    /// Packages whose recipe gets one more line, so that their recipe changes
+    /// (the probe of carrying makes a change this way).
+    pub perturb: Vec<String>,
 }
 
 pub struct Built {
@@ -577,6 +580,7 @@ pub fn image_files(
             recipe: false,
             replace: Vec::new(),
             previous: None,
+            perturb: Vec::new(),
         })?;
     }
     let plain = crate::target_dir().join("pkg");
@@ -601,6 +605,7 @@ pub fn image_files(
                     .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
                     .collect(),
                 previous: None,
+                perturb: Vec::new(),
             })?;
             dir
         };
@@ -671,7 +676,15 @@ pub fn build(opts: &Options) -> Result<Vec<Built>, String> {
         v
     };
     build_outputs(&needed)?;
-    let recipes = recipes(&all, &needed)?;
+    let mut recipes = recipes(&all, &needed)?;
+    for name in &opts.perturb {
+        let entry = recipes
+            .get_mut(name)
+            .ok_or_else(|| format!("--perturb {name}: no such package"))?;
+        entry.1.push(format!("perturb {name}"));
+        entry.1.sort();
+        entry.0 = recipe_hash(&entry.1);
+    }
     if opts.recipe {
         for p in &selected {
             let (hash, lines) = &recipes[&p.name];
@@ -915,6 +928,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         recipe: false,
         replace: Vec::new(),
         previous: None,
+        perturb: Vec::new(),
     };
     let mut i = 0;
     let value = |i: &mut usize| -> Result<String, String> {
@@ -937,6 +951,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             }
             "--recipe" => o.recipe = true,
             "--previous" => o.previous = Some(value(&mut i)?),
+            "--perturb" => o.perturb.push(value(&mut i)?),
             name if !name.starts_with("--") => o.names.push(name.to_string()),
             other => return Err(format!("{other}: unknown argument")),
         }
