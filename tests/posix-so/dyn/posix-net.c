@@ -1629,7 +1629,7 @@ static void timewait_syn(void)
 }
 
 /* A listener of the group of SO_REUSEPORT in a child: it accepts what the
- * hash of the four gives it and reports each with its index on `report`; it
+ * circle of the group gives it and reports each with its index on `report`; it
  * ends after a quiet second. */
 static void group_member(int index, int port, int report, int ready)
 {
@@ -1890,6 +1890,31 @@ static void reuseport_handoff(void)
 	for (int i = 0; i < FIRST + SECOND; i++)
 		REQUIRE(close(c[i]) == 0);
 	REQUIRE(close(fifth) == 0 && close(report[0]) == 0);
+}
+
+/* A member of a group that accepts and closes, over and over: the sets of
+ * places its queue sockets stood in go back to the service each time, so the
+ * 320 sets last through 400 rounds (a set that stayed with a dead member would
+ * run out and `listen` would fail). */
+static void reuseport_churn(void)
+{
+	int one = 1;
+	for (int i = 0; i < 400; i++) {
+		int port = 19000 + i;
+		int lis = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(lis >= 0);
+		REQUIRE(setsockopt(lis, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == 0);
+		struct sockaddr_in any = at(INADDR_ANY, port);
+		REQUIRE(bind(lis, (struct sockaddr *)&any, sizeof any) == 0);
+		REQUIRE(listen(lis, 1) == 0);
+		struct sockaddr_in a = at(LOOPBACK, port);
+		int c = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c >= 0);
+		REQUIRE(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+		int s = accept(lis, NULL, NULL);
+		REQUIRE(s >= 0);
+		REQUIRE(close(c) == 0 && close(s) == 0 && close(lis) == 0);
+	}
 }
 
 /* The port of a group is held by one user: a process of another user that asks
@@ -3219,6 +3244,7 @@ static const struct {
 	{ "timewait-syn", timewait_syn },
 	{ "reuseport-4", reuseport_4 },
 	{ "reuseport-handoff", reuseport_handoff },
+	{ "reuseport-churn", reuseport_churn },
 	{ "reuseport-uid", reuseport_uid },
 	{ "linger-0", linger_0 },
 	{ "linger-wait", linger_wait },
