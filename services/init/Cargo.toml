@@ -104,6 +104,7 @@ table-pci-walk-vz = []
 table-pci-walk-qemu = []
 # The disk service and its probe (xtask blk-probe).
 table-blk-probe = []
+table-store-probe = []
 # The shell with the network service on Apple VZ, one and two network devices.
 table-net-vz = []
 table-net-vz2 = []

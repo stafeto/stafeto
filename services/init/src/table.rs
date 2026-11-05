@@ -69,7 +69,7 @@ pub const BOOT_PROFILE_CLIENTS: &[&str] = &["ramfs-probe", NET_SERVICE, "layer-p
 /// layers now, the package service later. It asks for the session by the name
 /// `RAM_LAYERS`, which is the RAM service under another mark; its record connects to
 /// `ramfs` as for any session.
-pub const LAYER_CLIENTS: &[&str] = &["layer-probe"];
+pub const LAYER_CLIENTS: &[&str] = &["layer-probe", "pkgd"];
 /// The name a layer client connects by to get the layer session of the RAM service.
 pub const RAM_LAYERS: &str = "ramfs/layers";
 
@@ -110,10 +110,15 @@ pub const VOUCHERS: &[&str] = &[
     TERMINAL_SERVICE,
     PIPE_SERVICE,
     NET_SERVICE,
+    PACKAGE_SERVICE,
 ];
 /// The vouchers whose notary session may tell the process service that a
 /// file is set-ID (proto_process SetId, spec 2, 3.2): the file services.
 pub const SET_ID_VOUCHERS: &[&str] = &[RAM_SERVICE];
+/// The package service: it attaches the packages of its store as layers of the RAM file
+/// service, asks the process service who a client is (a notary session), and gets the boot
+/// image to read the packages the image holds.
+pub const PACKAGE_SERVICE: &str = "pkgd";
 /// The name of the terminal service (5f): its notary session may send
 /// TtySignal, SetCtty and DropCtty (proto_process::TERMINAL).
 pub const TERMINAL_SERVICE: &str = "tty";
@@ -1020,6 +1025,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-pci-walk-qemu") as usize
     + cfg!(feature = "table-blk-probe") as usize
+    + cfg!(feature = "table-store-probe") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-bench-vz") as usize
@@ -1086,6 +1092,7 @@ const _: () = assert!(
     feature = "table-pci-walk-vz",
     feature = "table-pci-walk-qemu",
     feature = "table-blk-probe",
+    feature = "table-store-probe",
     feature = "table-net-vz",
     feature = "table-net-vz2",
     feature = "table-bench-vz",
@@ -1199,6 +1206,8 @@ pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 pub const TABLE: &[Record] = pkg::PCI_WALK_QEMU_TABLE;
 #[cfg(feature = "table-blk-probe")]
 pub const TABLE: &[Record] = pkg::BLK_PROBE_TABLE;
+#[cfg(feature = "table-store-probe")]
+pub const TABLE: &[Record] = pkg::STORE_PROBE_TABLE;
 #[cfg(feature = "table-input")]
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]

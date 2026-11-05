@@ -4,7 +4,8 @@
 //! The tables of the package stages on QEMU's `virt` machine: the walk of
 //! bus 0 (tests/pci-walk), which measures the host bridge, the disk's
 //! function and its BAR before a driver relies on them, and the disk
-//! service (services/virtio-blk) with its probe (tests/blk-probe).
+//! service (services/virtio-blk) with its probe (tests/blk-probe), and the package service
+//! (services/pkgd) with its probe (tests/store-probe).
 //!
 //! The disk is the Virtio PCI function at device 1 of bus 0 (xtask's
 //! `qemu::store`): the page of its configuration in ECAM, BAR 4 of 16 KiB at
@@ -176,6 +177,70 @@ pub const BLK_PROBE: Record = Record {
 /// its client.
 pub const BLK_PROBE_TABLE: &[Record] = &[super::normal::TABLE[0], BLK, BLK_PROBE];
 
+/// The package service (pk3-design R2, R5, R15): level 32 for its main thread, below the
+/// disk (39) and the file service (48) it calls and above no one it serves but the
+/// processes of POSIX (ceiling 31). Its quota is the 16,384 pages of the objects of the
+/// packages and 512 of its own. It never restarts: its layers stay in the file service
+/// when it ends, and a new instance could not take them over (R12). It connects to the
+/// disk and to the file service (the layer session by the name `ramfs/layers`, which init
+/// gives a layer client); init gives it the boot image and a notary session of the
+/// process service without a record of its own.
+pub const PKGD: Record = Record {
+    name: "pkgd",
+    program: "pkgd",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 32,
+    ceiling: 32,
+    quota: 16_896 * PAGE,
+    handle_limit: 512,
+    restart: Restart::Never,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["blk", "ramfs"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    trusted: false,
+    root: false,
+    shares: Shares::CREATOR,
+    cpus: GENERAL_CPUS,
+};
+
+/// The probe of the package service (tests/store-probe): the first POSIX process, root,
+/// with a session of the package service by name. It starts the program of a package
+/// from the disk, so it has the quota of a child of its own.
+pub const STORE_PROBE: Record = Record {
+    name: "store-probe",
+    program: "store-probe",
+    args: b"store-probe\0",
+    connects: &["ramfs", "clock", "posix", "pkgd"],
+    root: true,
+    quota: super::ramfs::PROCS_QUOTA,
+    ..super::ramfs::POSIX
+};
+
+/// The image of the store probe: the PL011's driver, the file service, the process, clock
+/// and pipe services, the disk and package services and the probe.
+pub const STORE_PROBE_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    super::ramfs::RAM_FIFO_CLOCKED,
+    Record {
+        quota: super::ramfs::POSIX_ABI_TABLE[1].quota + 3 * super::ramfs::PROCS_QUOTA,
+        ..super::ramfs::POSIX_ABI_TABLE[1]
+    },
+    super::ramfs::CLOCK_RTC,
+    super::ramfs::PIPE,
+    BLK,
+    PKGD,
+    STORE_PROBE,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +292,44 @@ mod tests {
         );
         assert_eq!(command.value, 0);
         assert!(command.only_if.is_none());
+    }
+
+    #[test]
+    fn the_package_service_is_below_the_disk_above_its_clients_and_its_table_is_whole() {
+        const { assert!(PKGD.priority <= BLK.priority && PKGD.ceiling <= BLK.priority) };
+        assert_eq!((PKGD.priority, PKGD.ceiling), (32, 32));
+        for client in STORE_PROBE_TABLE
+            .iter()
+            .filter(|r| r.connects.contains(&"pkgd"))
+        {
+            assert!(
+                client.ceiling <= PKGD.priority,
+                "{} is above pkgd",
+                client.name
+            );
+        }
+        assert_eq!(PKGD.quota, (16_384 + 512) * PAGE);
+        assert_eq!(PKGD.restart, Restart::Never);
+        assert_eq!(PKGD.connects, &["blk", "ramfs"]);
+        assert!(!PKGD.is_posix() && !PKGD.trusted && PKGD.dma.is_empty());
+        assert!(crate::table::check(STORE_PROBE_TABLE).is_ok());
+        assert!(STORE_PROBE.is_posix() && STORE_PROBE.root);
+    }
+
+    #[test]
+    fn init_gives_pkgd_the_layer_session_the_notary_and_the_image() {
+        assert!(crate::table::LAYER_CLIENTS.contains(&"pkgd"));
+        assert!(crate::table::VOUCHERS.contains(&"pkgd"));
+        assert!(!crate::table::SET_ID_VOUCHERS.contains(&"pkgd"));
+        assert!(crate::table::layer_grant(
+            &PKGD,
+            crate::table::RAM_LAYERS.as_bytes()
+        ));
+        assert!(!crate::table::layer_grant(
+            &STORE_PROBE,
+            crate::table::RAM_LAYERS.as_bytes()
+        ));
+        assert_eq!(crate::table::PACKAGE_SERVICE, "pkgd");
     }
 
     #[test]
