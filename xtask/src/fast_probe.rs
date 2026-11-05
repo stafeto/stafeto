@@ -264,17 +264,22 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         expect_all(&mut run, &["fast-echo: retry busy"], within)?;
         let killed_at = Instant::now();
         run.send("kill -9 %1")?;
-        expect_all(&mut run, &[back], within)?;
-        expect_all(&mut run, &[&lease1], within)?;
-        notes.push(format!(
-            "kill -9 to lease1 {} ms",
-            killed_at.elapsed().as_millis()
-        ));
+        // The service's lines and the program's come in either order.
         expect_all(
             &mut run,
-            &["fast-echo: retry ok", claimed.as_str(), renewed.as_str()],
+            &[
+                back,
+                &lease1,
+                "fast-echo: retry ok",
+                claimed.as_str(),
+                renewed.as_str(),
+            ],
             within,
         )?;
+        notes.push(format!(
+            "kill -9 to the new owner's renew1 {} ms",
+            killed_at.elapsed().as_millis()
+        ));
         let again = echoes(&socket, 100, 512)?;
         notes.push(format!(
             "100 echoes after the new claim ({again} sent again)"
