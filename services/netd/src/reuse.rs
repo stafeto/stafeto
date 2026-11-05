@@ -4,14 +4,14 @@
 //! The groups of SO_REUSEPORT: streams of one port and one exact address
 //! that all asked for the option before BIND, under one effective user (the
 //! next process may not take the port of another user, as on Linux). Each
-//! member has a queue of `listen` of its own; the service names for a SYN the
-//! member that the hash of the four picks among those that listen, or the next
-//! that has room (the table of destinations names the first member that
-//! listens; the others have no entry there). The stack hands the SYN to the
-//! first socket in LISTEN of the set of the group of places of the socket
-//! named, which may belong to the queue of another member, so the choice by
-//! the hash holds only roughly and the connection goes to the member whose
-//! socket took the SYN (`Net::adopt`).
+//! member has a queue of `listen` of its own. The service names for a SYN the
+//! next member after the last one chosen that listens and has room in its
+//! queue (the table of destinations names the first member that listens; the
+//! others have no entry there). The stack hands the SYN to the first socket in
+//! LISTEN of the set of places of the socket named; the sets keep the queue
+//! sockets of different members apart (`owners`), so that socket is the
+//! chosen member's own and the choice is exact. A member that is full is
+//! skipped.
 
 /// The members of a group at most.
 pub const REUSE_MAX: usize = 16;
@@ -36,6 +36,8 @@ struct Group {
     port: u16,
     uid: u32,
     len: u8,
+    /// Where the circle goes on: the position of the member to look at first.
+    next: u8,
     members: [u16; REUSE_MAX],
 }
 
@@ -45,6 +47,7 @@ const EMPTY: Group = Group {
     port: 0,
     uid: 0,
     len: 0,
+    next: 0,
     members: [0; REUSE_MAX],
 };
 
@@ -122,9 +125,17 @@ impl Groups {
             .iter()
             .position(|&m| usize::from(m) == place)
         {
-            // The order of the members is kept: the hash picks by position.
+            // The order of the members is kept: the circle goes by position.
             g.members.copy_within(at + 1..len, at);
             g.len -= 1;
+            // A member before the pointer left: the pointer moves back with
+            // the rest, so the circle does not jump over the next member.
+            if at < usize::from(g.next) {
+                g.next -= 1;
+            }
+            if g.next >= g.len {
+                g.next = 0;
+            }
         }
         if g.len == 0 {
             *g = EMPTY;
@@ -137,32 +148,23 @@ impl Groups {
         &g.members[..usize::from(g.len)]
     }
 
-    /// The member that gets a SYN of the hash `hash`: the `hash` modulo the
-    /// number of members for which `listens` holds, and from there on the
-    /// first that `has_room` holds for. None when no member listens or none
-    /// has room.
-    pub fn pick(
-        &self,
-        k: usize,
-        hash: u64,
-        mut listens: impl FnMut(usize) -> bool,
-        mut has_room: impl FnMut(usize) -> bool,
-    ) -> Option<usize> {
-        let mut live = [0u16; REUSE_MAX];
-        let mut n = 0;
-        for &m in self.members(k) {
-            if listens(usize::from(m)) {
-                live[n] = m;
-                n += 1;
+    /// The member that gets the next SYN: the first from the pointer of the
+    /// circle for which `usable` holds (it listens and has room in its
+    /// queue); the pointer goes on to the member after it. None when no member
+    /// is usable.
+    pub fn pick(&mut self, k: usize, mut usable: impl FnMut(usize) -> bool) -> Option<usize> {
+        let g = &mut self.groups[k];
+        let len = usize::from(g.len);
+        let first = usize::from(g.next);
+        for i in 0..len {
+            let at = (first + i) % len;
+            let m = usize::from(g.members[at]);
+            if usable(m) {
+                g.next = ((at + 1) % len) as u8;
+                return Some(m);
             }
         }
-        if n == 0 {
-            return None;
-        }
-        let first = (hash % n as u64) as usize;
-        (0..n)
-            .map(|i| usize::from(live[(first + i) % n]))
-            .find(|&m| has_room(m))
+        None
     }
 }
 
@@ -210,36 +212,64 @@ mod tests {
         assert_eq!(g.join([0; 4], 9, 1, 0), Err(Refused::Full));
     }
 
-    #[test]
-    fn the_hash_picks_among_the_members_that_listen_and_the_next_has_room() {
+    fn four() -> (Groups, usize) {
         let mut g = Groups::new();
         let k = g.join([0; 4], 80, 1, 10).unwrap();
-        g.join([0; 4], 80, 1, 11).unwrap();
-        g.join([0; 4], 80, 1, 12).unwrap();
-        // 11 does not listen: the hash picks among 10 and 12.
-        let listens = |m: usize| m != 11;
-        assert_eq!(g.pick(k, 0, listens, |_| true), Some(10));
-        assert_eq!(g.pick(k, 1, listens, |_| true), Some(12));
-        assert_eq!(g.pick(k, 2, listens, |_| true), Some(10));
-        // The one picked is full: the next goes on, round the circle.
-        assert_eq!(g.pick(k, 0, listens, |m| m == 12), Some(12));
-        assert_eq!(g.pick(k, 1, listens, |m| m == 10), Some(10));
-        // Nobody has room, or nobody listens.
-        assert_eq!(g.pick(k, 0, listens, |_| false), None);
-        assert_eq!(g.pick(k, 0, |_| false, |_| true), None);
+        for place in 11..14 {
+            g.join([0; 4], 80, 1, place).unwrap();
+        }
+        (g, k)
     }
 
     #[test]
-    fn every_member_is_picked_by_some_hash() {
-        let mut g = Groups::new();
-        let k = g.join([0; 4], 80, 1, 0).unwrap();
-        for place in 1..4 {
-            g.join([0; 4], 80, 1, place).unwrap();
+    fn the_circle_gives_each_member_the_same_share() {
+        let (mut g, k) = four();
+        let mut count = [0u32; 4];
+        for _ in 0..256 {
+            count[g.pick(k, |_| true).unwrap() - 10] += 1;
         }
-        let mut seen = [false; 4];
-        for hash in 0..16u64 {
-            seen[g.pick(k, hash, |_| true, |_| true).unwrap()] = true;
+        assert_eq!(count, [64; 4]);
+    }
+
+    #[test]
+    fn a_member_with_no_room_or_not_listening_is_skipped() {
+        let (mut g, k) = four();
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            got.push(g.pick(k, |m| m != 11 && m != 12).unwrap());
         }
-        assert_eq!(seen, [true; 4]);
+        assert_eq!(got, [10, 13, 10, 13, 10, 13]);
+        assert_eq!(g.pick(k, |_| false), None);
+    }
+
+    #[test]
+    fn the_circle_does_not_jump_when_a_member_leaves() {
+        let (mut g, k) = four();
+        assert_eq!(g.pick(k, |_| true), Some(10));
+        assert_eq!(g.pick(k, |_| true), Some(11));
+        // 12 is next; 10 leaves, from before the pointer.
+        g.leave(k, 10);
+        assert_eq!(g.pick(k, |_| true), Some(12));
+        assert_eq!(g.pick(k, |_| true), Some(13));
+        assert_eq!(g.pick(k, |_| true), Some(11));
+        // The member at the pointer leaves: the one after it is next.
+        g.leave(k, 12);
+        assert_eq!(g.pick(k, |_| true), Some(13));
+        // A member before the pointer and then one at it leave.
+        g.leave(k, 11);
+        g.join([0; 4], 80, 1, 20).unwrap();
+        assert_eq!(g.pick(k, |_| true), Some(13));
+        assert_eq!(g.pick(k, |_| true), Some(20));
+    }
+
+    #[test]
+    fn a_new_member_is_picked_within_len_picks() {
+        let (mut g, k) = four();
+        for _ in 0..7 {
+            g.pick(k, |_| true);
+        }
+        g.join([0; 4], 80, 1, 99).unwrap();
+        let seen: Vec<_> = (0..5).map(|_| g.pick(k, |_| true).unwrap()).collect();
+        assert!(seen.contains(&99), "{seen:?}");
     }
 }

@@ -21,6 +21,7 @@ pub mod frames;
 pub mod groups;
 pub mod interest;
 pub mod lines;
+pub mod owners;
 pub mod passes;
 pub mod pci;
 pub mod places;

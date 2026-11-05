@@ -33,7 +33,7 @@ use smoltcp::wire::{
 };
 
 /// The places of one set of sockets.
-pub const GROUP: usize = 4;
+pub const GROUP: usize = netd::owners::SET;
 /// The groups the walk over the deadlines looks at in one step.
 pub const DEADLINE_CHECKS: usize = 64;
 /// The sets of the descriptions' sockets, and the room for their storage.
