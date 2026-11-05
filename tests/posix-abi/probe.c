@@ -269,13 +269,13 @@ static int directories(void) {
     if (open("motd", O_RDONLY | O_DIRECTORY) != -1 || errno != ENOTDIR) return 79;
     fd = open("/", O_RDONLY | O_DIRECTORY);
     if (fd < 0 || (dir = fdopendir(fd)) == NULL || dirfd(dir) != fd || closedir(dir)) return 80;
-    /* The file service holds 32 descriptions for a session, and the layer's
-     * table of 64 has room for the rest: the directories run out at the
-     * service's limit. */
-    DIR *held[64];
+    /* The file service gives a session 1 056 places, more than the 1 024 numbers
+     * of the layer's table: the directories run out at the layer's limit (EMFILE
+     * of the process), whatever the service still has. */
+    static DIR *held[1100];
     int held_count = 0;
-    while (held_count < 64 && (held[held_count] = opendir("/")) != NULL) held_count++;
-    if (held_count != 32) return 81;
+    while (held_count < 1100 && (held[held_count] = opendir("/")) != NULL) held_count++;
+    if (held_count < 1000 || held_count > 1021) return 81;
     if (errno != EMFILE || open("motd", O_RDONLY) != -1 || errno != EMFILE) return 82;
     saved_fd = dirfd(held[7]);
     if (closedir(held[7]) || (held[7] = opendir("/tmp")) == NULL || dirfd(held[7]) != saved_fd) return 83;

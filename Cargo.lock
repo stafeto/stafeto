@@ -886,6 +886,7 @@ name = "proto-loader"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-fs",
  "proto-wire",
 ]
 

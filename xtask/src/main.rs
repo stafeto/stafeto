@@ -5765,7 +5765,7 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 22] = [
+const RAM_STEP_KINDS: [(usize, &str); 23] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -5780,6 +5780,7 @@ const RAM_STEP_KINDS: [(usize, &str); 22] = [
     (24, "ResolveSecond"),
     (25, "FinishBinding"),
     (34, "CloneExact"),
+    (52, "CloneMore"),
     (44, "ChangeStart"),
     (45, "ChangeSecond"),
     (46, "ChangeStep"),
@@ -6755,7 +6756,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32, grid: bool) -> Result<(
             &rows,
             &[46usize, 55, 56, 57, 58, 59, 60, 61, 62, 65][..],
         ),
-        ("RAM", &ram, &[3usize, 59, 62][..]),
+        // 52 CloneMore: a fork with 1 000 files of the session (stafeto-design#578).
+        ("RAM", &ram, &[3usize, 52, 59, 62][..]),
     ] {
         for kind in kinds {
             let ticks = measured.iter().find(|(k, ..)| k == kind).map_or(0, |r| r.1);

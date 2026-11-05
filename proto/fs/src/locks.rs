@@ -218,7 +218,9 @@ mod tests {
         }
         assert_eq!(Method::from_number(50), Some(Method::LockStart));
         assert!(crate::METHODS.contains(&50));
-        for number in [51, 52, 53] {
+        // 52 is CloneMore (stafeto-design#578); 51 and 53 stay reserved.
+        assert_eq!(Method::from_number(52), Some(Method::CloneMore));
+        for number in [51, 53] {
             assert_eq!(Method::from_number(number), None);
             assert!(!crate::METHODS.contains(&number));
         }

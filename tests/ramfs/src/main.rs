@@ -94,8 +94,11 @@ fn alias_clone_list(
     held: rt::fs::PreparedOpen,
     exact: posix_fs::RamTarget,
 ) -> Result<rt::fs::PreparedOpen, &'static str> {
-    let mut kept = [held; posix_fs::KEPT_BY_FORK_MAX];
-    if native.kept_by_fork(&mut kept) != Ok(1) || kept[0] != exact.prepared() {
+    let mut kept = [held; posix_fs::RAM_PORTION];
+    let mut cursor = posix_fs::RamKept::new();
+    if native.kept_by_fork_from(&mut cursor, &mut kept) != Ok((1, false))
+        || kept[0] != exact.prepared()
+    {
         return Err("exact alias clone list");
     }
     Ok(kept[0])
@@ -134,32 +137,33 @@ fn check_initialization(
     parent: &rt::Handle<rt::handle::Channel>,
     process: &rt::Handle<rt::handle::Process>,
 ) -> Result<(), &'static str> {
+    // The edges of the service's numbers (3 to 1058) and descriptions (0 to 8191).
     let held = |slot, generation| rt::fs::PreparedOpen {
-        fd: 34,
+        fd: 1058,
         slot,
         generation,
         random: true,
     };
     let old = posix_fs::RamTarget::from_prepared(held(0, 1)).map_err(|_| "old exact target")?;
-    let replacement =
-        posix_fs::RamTarget::from_prepared(held(127, 1)).map_err(|_| "replacement exact target")?;
+    let replacement = posix_fs::RamTarget::from_prepared(held(8191, 1))
+        .map_err(|_| "replacement exact target")?;
     let next = posix_fs::RamTarget::from_prepared(held(0, 2)).map_err(|_| "next exact target")?;
     if old == replacement
         || old == next
-        || replacement.fd() != 34
-        || replacement.description_slot() != 127
+        || replacement.fd() != 1058
+        || replacement.description_slot() != 8191
         || replacement.generation() != 1
         || replacement.prepared()
             != (rt::fs::PreparedOpen {
-                fd: 34,
-                slot: 127,
+                fd: 1058,
+                slot: 8191,
                 generation: 1,
                 random: false,
             })
     {
         return Err("full target identity");
     }
-    for (fd, slot, generation) in [(2, 0, 1), (35, 0, 1), (3, 128, 1), (3, 0, 0)] {
+    for (fd, slot, generation) in [(2, 0, 1), (1059, 0, 1), (3, 8192, 1), (3, 0, 0)] {
         if posix_fs::RamTarget::from_prepared(rt::fs::PreparedOpen {
             fd,
             slot,
@@ -875,9 +879,6 @@ fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'st
     Ok(())
 }
 
-/// The open descriptions one session holds at the file service.
-const SERVICE_SHARE: u32 = 32;
-
 fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     let mut fs = NativeFiles::connect(parent).map_err(|_| "limit connect")?;
     let source = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "limit open")?;
@@ -903,10 +904,10 @@ fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<()
     }
     fs.close(fresh).map_err(|_| "close fresh")?;
     fs.close(source).map_err(|_| "close limit source")?;
-    // The service's share of the table (32 open descriptions for a session) is
-    // reachable with distinct opens, and the next open is refused by the service
-    // while the table of the layer still has places.
-    for expected in 3..3 + SERVICE_SHARE {
+    // The service's places for a session (1 056, the layer's 1 024 numbers and 16 pins) are
+    // never taken before the layer's own: distinct opens fill every number of the table, and
+    // the next open is refused by the layer, with the service still having places.
+    for expected in 3..OPEN_MAX as u32 {
         if fs.open(b"/etc/motd", READ_ONLY) != Ok(expected) {
             return Err("distinct open descriptions reach local bound");
         }
@@ -914,7 +915,7 @@ fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<()
     if fs.open(b"/etc/motd", READ_ONLY) != Err(FsError::TooManyOpenFiles) {
         return Err("distinct open descriptor exhaustion");
     }
-    for fd in 3..3 + SERVICE_SHARE {
+    for fd in 3..OPEN_MAX as u32 {
         fs.close(fd).map_err(|_| "close distinct description")?;
     }
     Ok(())

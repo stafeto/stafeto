@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 18 of the bounded RAM file service. Numbers are little endian.
+//! Version 19 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -47,8 +47,9 @@
 //! OpenFinish(client key) publishes its exact descriptor and releases the paid job.
 //! Query active phases0..4 reply status0/phase/jobID (16 bytes). Finished phase5
 //! replies status0/5/jobID0/fd/reserved0/description generation (32 bytes).
-//! Close retains a tombstone; a replaced receipt returns terminal OPEN_RETIRED.
-//! Commit/Finish/FinishedQuery pack fd bits0..5, description slot bits8..14 and
+//! A finished Open leaves a receipt at its key place; a receipt the same place
+//! replaces, or a descriptor closed since, returns terminal OPEN_RETIRED.
+//! Commit/Finish/FinishedQuery pack fd bits0..10, description slot bits11..23 and
 //! OPEN_RANDOM bit31. All other bits are zero. Numeric operations use the bare fd;
 //! recovery retains the full description token and captured device type.
 //! ResolveCancel releases the job and hidden descriptor; committed file effects
@@ -130,7 +131,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 18;
+pub const VERSION: u16 = 19;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -158,13 +159,38 @@ pub const NO_FOLLOW: u32 = 256;
 /// The third word of the reply to an OPEN of a random device.
 pub const RANDOM_DEVICE: u32 = 1;
 /// Commit, Finish and FinishedQuery encode a captured Random description in fd bit31.
-/// Bits0..5 hold fd3..34; bits8..14 hold its shared description slot0..127.
+/// Bits0..10 hold the session's number 3..1058; bits11..23 hold its shared description
+/// slot0..8191.
 pub const OPEN_RANDOM: u32 = 1 << 31;
+/// The places of one session: 1 024 descriptor numbers, the table of the layer, and 16
+/// places for the descriptions the layer pins for shared mappings after their numbers close.
+/// The numbers of a session are 3 to `3 + SESSION_PLACES - 1`.
+pub const SESSION_PLACES: usize = 1056;
+/// The first number of a session.
+pub const SESSION_FIRST: u32 = 3;
+/// Whether `fd` is a number a session can hold.
+pub const fn is_session_number(fd: u32) -> bool {
+    fd >= SESSION_FIRST && fd < SESSION_FIRST + SESSION_PLACES as u32
+}
+/// The open descriptions the service holds at most, which its sessions share.
+pub const DESCRIPTIONS: usize = 8192;
+/// The most descriptions or numbers one Clone, CloneExact or CloneMore carries.
+pub const CLONE_PORTION: usize = 32;
 /// A success word retains the exact shared description slot.
-pub const OPEN_DESCRIPTION_SHIFT: u32 = 8;
-pub const OPEN_DESCRIPTION_MASK: u32 = 127 << OPEN_DESCRIPTION_SHIFT;
-pub const OPEN_FD_MASK: u32 = 63;
+pub const OPEN_DESCRIPTION_SHIFT: u32 = 11;
+pub const OPEN_DESCRIPTION_MASK: u32 = 0x1FFF << OPEN_DESCRIPTION_SHIFT;
+pub const OPEN_FD_MASK: u32 = 0x7FF;
 pub const OPEN_RESULT_MASK: u32 = OPEN_RANDOM | OPEN_DESCRIPTION_MASK | OPEN_FD_MASK;
+/// A named FIFO crosses an exec as one word: its number and description slot of the
+/// file service, and above them the slot of its named ticket of the pipe service.
+pub const FIFO_TICKET_SHIFT: u32 = 24;
+pub const FIFO_TICKET_MASK: u32 = 127;
+pub const FIFO_PACKED_MASK: u32 =
+    OPEN_FD_MASK | OPEN_DESCRIPTION_MASK | (FIFO_TICKET_MASK << FIFO_TICKET_SHIFT);
+const _: () = {
+    assert!(SESSION_FIRST as usize + SESSION_PLACES - 1 <= OPEN_FD_MASK as usize);
+    assert!(DESCRIPTIONS - 1 <= (OPEN_DESCRIPTION_MASK >> OPEN_DESCRIPTION_SHIFT) as usize);
+};
 
 pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;
@@ -220,6 +246,9 @@ pub const LOCK_CANCELLED: u32 = 331;
 pub const LOCK_DEADLOCK: u32 = 332;
 /// The authenticated process soft FSIZE refused a write (EFBIG and SIGXFSZ).
 pub const FILE_SIZE_LIMIT: u32 = 333;
+/// ENFILE: the service's table of open descriptions, or the share of the client's root,
+/// is full. TOO_MANY_OPEN_FILES (EMFILE) is the session's own numbers.
+pub const TOO_MANY_FILES_IN_SYSTEM: u32 = 334;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -347,7 +376,8 @@ pub enum Method {
     CaptureDescription = 32,
     /// Packed fd/slot u32 and generation u64. Reply status and Closed0/AlreadyGone1.
     CloseExact = 33,
-    /// Count u32 and exact packed fd/slot u32 + generation u64 entries. Maximum 32.
+    /// Count u32 and exact packed fd/slot u32 + generation u64 entries. Maximum `CLONE_PORTION`.
+    /// The reply carries the birth word CloneMore names.
     CloneExact = 34,
     DataStart = 35,
     DataFeed = 36,
@@ -366,7 +396,13 @@ pub enum Method {
     /// Exact close key and description; detach the last local alias and retain its outcome.
     CloseEvent = 49,
     LockStart = 50,
-    /// Numbers 51 to 53 stay reserved.
+    /// The birth u32 a Clone or CloneExact answered with, a count u32 of 1 to
+    /// `CLONE_PORTION` and the numbers, each with the packed slot and generation of
+    /// CloneExact. The calling session adds the descriptions to the birth of its child
+    /// that sent nothing yet; a number the birth holds is passed over. The whole list is
+    /// checked before the birth changes. Reply: status.
+    CloneMore = 52,
+    /// Numbers 51 and 53 stay reserved.
     WaitStart = 54,
     WaitQuery = 55,
     WaitCancel = 56,
@@ -449,6 +485,7 @@ impl Method {
             48 => Some(Self::ChangeRelease),
             49 => Some(Self::CloseEvent),
             50 => Some(Self::LockStart),
+            52 => Some(Self::CloneMore),
             54 => Some(Self::WaitStart),
             55 => Some(Self::WaitQuery),
             56 => Some(Self::WaitCancel),
@@ -466,8 +503,8 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 54,
-    55, 56, 57, 58, 59, 60, 61, 62, 63,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 52,
+    54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -499,6 +536,36 @@ mod tests {
         assert_eq!(valid_path(&path[..MAX_PATH]).map(str::len), Ok(MAX_PATH));
         assert_eq!(valid_path(&path), Err(Status::BadSize));
         const { assert!(HEADER_LEN + 4 + MAX_PATH <= MESSAGE_MAX) };
+    }
+
+    /// The result word holds the session's numbers 3 and 1058, the descriptions 0 and 8191
+    /// and OPEN_RANDOM, each in its own bits.
+    #[test]
+    fn the_result_word_packs_the_edges_of_its_fields() {
+        assert_eq!(OPEN_FD_MASK & OPEN_DESCRIPTION_MASK, 0);
+        assert_eq!(OPEN_RANDOM & (OPEN_FD_MASK | OPEN_DESCRIPTION_MASK), 0);
+        for fd in [3, 4, 67, 1058] {
+            assert!(is_session_number(fd));
+            for slot in [0u32, 1, 127, 128, 8191] {
+                for random in [0, OPEN_RANDOM] {
+                    let word = fd | (slot << OPEN_DESCRIPTION_SHIFT) | random;
+                    assert_eq!(word & !OPEN_RESULT_MASK, 0);
+                    assert_eq!(word & OPEN_FD_MASK, fd);
+                    assert_eq!(
+                        (word & OPEN_DESCRIPTION_MASK) >> OPEN_DESCRIPTION_SHIFT,
+                        slot
+                    );
+                    assert_eq!(word & OPEN_RANDOM, random);
+                }
+            }
+        }
+        assert!(!is_session_number(2));
+        assert!(!is_session_number(1059));
+        assert_eq!(1058, 3 + SESSION_PLACES as u32 - 1);
+        assert_eq!(
+            (OPEN_DESCRIPTION_MASK >> OPEN_DESCRIPTION_SHIFT) as usize,
+            DESCRIPTIONS - 1
+        );
     }
 
     #[test]

@@ -35,6 +35,9 @@ pub mod maintenance;
 pub mod metadata;
 #[cfg(test)]
 mod metadata_tests;
+pub mod numbers;
+#[cfg(test)]
+mod open_files_tests;
 pub use storage::namespace;
 #[cfg(test)]
 mod create_tests;
@@ -57,7 +60,7 @@ use storage::{BOOT_ROOT, Pin, Storage, Token};
 /// Read the common Clone count before allocating a session or retaining references.
 pub fn clone_count(body: &mut proto_wire::Reader<'_>, handle_count: usize) -> Result<usize, u32> {
     let count = body.u32().map_err(|_| proto_wire::BAD_SIZE)? as usize;
-    if count > OPEN_MAX || handle_count != 0 {
+    if count > CLONE_PORTION || handle_count != 0 {
         return Err(proto_wire::BAD_SIZE);
     }
     Ok(count)
@@ -69,14 +72,26 @@ use proto_fs::{
 use tree::Tree;
 
 const FILE_CAPACITY: usize = 1024;
-/// The places of one session. A Clone carries at most as many descriptions
-/// as a session holds. A description the layer pins for a shared mapping
-/// keeps one of these places after its numbers close, so the list of a
-/// Clone never exceeds them.
-const OPEN_MAX: usize = 32;
+// `PLACES` are the places of one session: the 1 024 numbers of the layer's table
+// and 16 for the descriptions the layer pins for shared mappings, which keep their
+// place after their numbers close (`proto_fs::SESSION_PLACES`). A session with
+// every place taken answers EMFILE (TOO_MANY_OPEN_FILES); the layer's table
+// ends before it does.
+use numbers::{Bits, PLACES};
+/// The numbers or descriptions one Clone or CLONE_MORE carries, and the numbers one
+/// step of a departure or of the release of a birth detaches: every step of the
+/// service that walks a session's numbers does at most this many of them.
+pub const CLONE_PORTION: usize = proto_fs::CLONE_PORTION;
 /// The open descriptions of the service at most, which the sessions share
-/// (spec 2, 3.7; 5c): past them, open is TOO_MANY_OPEN_FILES.
-pub const DESCRIPTIONS: usize = 128;
+/// (spec 2, 3.7; 5c): past them, open is TOO_MANY_FILES_IN_SYSTEM (ENFILE).
+pub const DESCRIPTIONS: usize = proto_fs::DESCRIPTIONS;
+/// The `wide` of a session that holds none.
+const NO_WIDE: u16 = u16::MAX;
+/// The tables of numbers and receipts the service has. A label has one place, where it is
+/// a birth first and a session after, and holds one table at most; the places and a spare
+/// portion (the table of a clone made before its label is issued) are all that can hold one
+/// at once.
+pub const WIDES: usize = places::COUNT + CLONE_PORTION;
 const MOTD: &[u8] = b"stafeto ramfs\n";
 /// The inode of entry `n` of the table is this plus the number of the
 /// first entry that names its file (the fixed tree has 1 to 5).
@@ -282,11 +297,11 @@ struct Open {
 /// first request took what Clone made for its label.
 #[derive(Clone, Copy)]
 pub struct Fds {
-    slots: [Option<u8>; OPEN_MAX],
-    /// Reserved descriptions are paid and held, but are not yet public descriptors.
-    tentative: u32,
-    /// Published session references, independent of physical operation holds.
-    live_fds: u32,
+    /// The tables of the session's numbers and receipts (`Wide`), which the service
+    /// gives it when it first holds one and takes back when the session is gone:
+    /// `NO_WIDE` for none. A session that holds no file has none, and the tables do
+    /// not move with the session's record (a step of the service copies the record).
+    wide: u16,
     pub claimed: bool,
     /// The endpoint ended; this paid cell awaits bounded physical cleanup.
     pub departed: bool,
@@ -310,8 +325,6 @@ pub struct Fds {
     close_receipts: [Option<proto_fs::CloseEvent>; proto_fs::CLOSE_KEY_PLACES],
     pub image_hold: Option<image::ImageHold>,
     pub image_outcome: Option<image::ImageOutcome>,
-    /// Exact completed operations survive Close as tombstones until this fd is reused.
-    open_receipts: [OpenReceipt; OPEN_MAX],
     pub root: storage::Root,
     pub cwd: Option<Token>,
     preparations: [Option<storage::Reservation>; 16],
@@ -320,9 +333,7 @@ pub struct Fds {
 impl Default for Fds {
     fn default() -> Self {
         Self {
-            slots: [None; OPEN_MAX],
-            tentative: 0,
-            live_fds: 0,
+            wide: NO_WIDE,
             claimed: false,
             departed: false,
             wait_departure: 16,
@@ -342,7 +353,6 @@ impl Default for Fds {
             close_receipts: [None; proto_fs::CLOSE_KEY_PLACES],
             image_hold: None,
             image_outcome: None,
-            open_receipts: [OpenReceipt::EMPTY; OPEN_MAX],
             root: BOOT_ROOT,
             cwd: None,
             preparations: [None; 16],
@@ -357,7 +367,7 @@ impl Fds {
         if self.auth_probe_gc.is_some() || self.auth_probe_gc_reservation.is_some() {
             return false;
         }
-        self.slots.iter().all(Option::is_none)
+        self.wide == NO_WIDE
             && self.resolvers.iter().all(|&id| id == 0)
             && self.preparations.iter().all(Option::is_none)
             && self.image_hold.is_none()
@@ -379,9 +389,7 @@ impl Fds {
         true
     }
     fn fresh_clone_destination(&self) -> bool {
-        if self.slots.iter().any(Option::is_some)
-            || self.tentative != 0
-            || self.live_fds != 0
+        if self.wide != NO_WIDE
             || self.claimed
             || self.departed
             || self.binding != authority::Binding::Unbound
@@ -397,10 +405,6 @@ impl Fds {
             || self.close_receipts.iter().any(Option::is_some)
             || self.image_hold.is_some()
             || self.image_outcome.is_some()
-            || self
-                .open_receipts
-                .iter()
-                .any(|&receipt| receipt != OpenReceipt::EMPTY)
             || self.root != BOOT_ROOT
             || self.cwd.is_some()
             || self.preparations.iter().any(Option::is_some)
@@ -424,39 +428,6 @@ impl Fds {
     }
     pub fn preparation_available(&self) -> bool {
         self.preparation_count() < self.resolvers.len()
-    }
-    /// Retained references in this session, without authenticating or mutating it.
-    #[cfg(feature = "auth-probe")]
-    pub fn retained_counts(&self) -> [u32; 5] {
-        [
-            self.slots.iter().filter(|slot| slot.is_some()).count() as u32,
-            u32::from(self.cwd.is_some()),
-            u32::from(self.binding_preparation.is_some()),
-            u32::from(self.authority_index != storage::NONE),
-            self.resolvers.iter().filter(|&&id| id != 0).count() as u32,
-        ]
-    }
-    /// The description of `fd`.
-    fn description(&self, fd: u32) -> Result<usize, u32> {
-        let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        if slot >= OPEN_MAX || self.tentative & (1 << slot) != 0 {
-            return Err(BAD_FD);
-        }
-        self.slots
-            .get(slot)
-            .copied()
-            .flatten()
-            .map(usize::from)
-            .ok_or(BAD_FD)
-    }
-
-    /// The descriptors that name a description, for a session that goes.
-    pub fn numbers(&self) -> impl Iterator<Item = u32> + '_ {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter(|(slot, d)| d.is_some() && self.tentative & (1 << slot) == 0)
-            .map(|(slot, _)| slot as u32 + 3)
     }
 }
 
@@ -490,26 +461,22 @@ enum FinishMode {
     Replay,
 }
 
-/// A completed operation owns the precise description in one session slot.
+/// A completed operation, kept at the place of its key: the number it published and
+/// the exact description under it. The acknowledged named ticket of a FIFO is the
+/// slot and the generation; a generation of 0 says there is none.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct OpenReceipt {
     key: proto_fs::OpenKey,
     description: Token,
     fifo_generation: u64,
+    fd: u16,
+    fifo_slot: u16,
 }
-const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 40);
+const _: () = assert!(core::mem::size_of::<OpenReceipt>() == 48);
 impl OpenReceipt {
-    // Description slots occupy seven bits. The upper byte stores the exact
-    // acknowledged named-ticket slot plus one, never a wire description slot.
-    fn description(self) -> Token {
-        Token {
-            slot: self.description.slot & 127,
-            generation: self.description.generation,
-        }
-    }
     fn fifo_ticket(self) -> Option<proto_pipe::NamedTicket> {
         (self.fifo_generation != 0).then(|| proto_pipe::NamedTicket {
-            slot: u32::from((self.description.slot >> 8) - 1),
+            slot: u32::from(self.fifo_slot),
             generation: self.fifo_generation,
         })
     }
@@ -523,12 +490,14 @@ impl OpenReceipt {
             generation: 0,
         },
         fifo_generation: 0,
+        fd: 0,
+        fifo_slot: 0,
     };
 }
 
 /// An open description and the descriptors of all sessions that name it.
 #[derive(Clone, Copy)]
-struct Shared {
+pub struct Shared {
     open: Open,
     refs: u16,
     fd_refs: u16,
@@ -536,18 +505,273 @@ struct Shared {
     generation: u64,
 }
 
+/// The open descriptions of the service: the table, the generation each place of it
+/// has reached, and the stack of the places that are free. Taking a free place and
+/// giving one back cost one step each, whatever number of descriptions is open.
+pub struct Descriptions {
+    slots: [Option<Shared>; DESCRIPTIONS],
+    generations: [u64; DESCRIPTIONS],
+    /// The free places; the one at the top is taken next.
+    free: [u16; DESCRIPTIONS],
+    free_len: usize,
+}
+impl Descriptions {
+    /// What a new table is, in place in zeroed or uninitialized memory (the service's `.bss`).
+    ///
+    /// # Safety
+    /// `at` is valid for writes and exclusive.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: each field lies in the caller's allocation and is written once.
+        unsafe {
+            let slots = core::ptr::addr_of_mut!((*at).slots).cast::<Option<Shared>>();
+            let generations = core::ptr::addr_of_mut!((*at).generations).cast::<u64>();
+            let free = core::ptr::addr_of_mut!((*at).free).cast::<u16>();
+            for index in 0..DESCRIPTIONS {
+                slots.add(index).write(None);
+                generations.add(index).write(0);
+                // The place 0 is at the top: the first description takes it.
+                free.add(index).write((DESCRIPTIONS - 1 - index) as u16);
+            }
+            core::ptr::addr_of_mut!((*at).free_len).write(DESCRIPTIONS);
+        }
+    }
+    /// A table that lives as long as the program (the tests'; the service has its own in `.bss`).
+    #[cfg(test)]
+    pub fn leaked() -> &'static mut Self {
+        extern crate std;
+        let table = std::boxed::Box::leak(std::boxed::Box::<Self>::new_uninit());
+        // SAFETY: the allocation is exclusive and `initialize_at` writes every field.
+        unsafe {
+            Self::initialize_at(table.as_mut_ptr());
+            table.assume_init_mut()
+        }
+    }
+    /// The place the next description takes: the top of the stack.
+    fn next_free(&self) -> Option<usize> {
+        self.free_len
+            .checked_sub(1)
+            .map(|top| usize::from(self.free[top]))
+    }
+    /// The next generation of the place `index`.
+    fn next_generation(&self, index: usize) -> Option<u64> {
+        self.generations[index].checked_add(1)
+    }
+    /// The description `shared` takes the place `index`, which `next_free` named.
+    fn install(&mut self, index: usize, shared: Shared) {
+        debug_assert_eq!(self.next_free(), Some(index));
+        debug_assert!(self.slots[index].is_none());
+        self.free_len -= 1;
+        self.generations[index] = shared.generation;
+        self.slots[index] = Some(shared);
+    }
+    /// The place `index` is free again.
+    fn give_back(&mut self, index: usize) {
+        debug_assert!(self.slots[index].is_some());
+        debug_assert!(self.free_len < DESCRIPTIONS);
+        self.slots[index] = None;
+        self.free[self.free_len] = index as u16;
+        self.free_len += 1;
+    }
+    /// The descriptions that are open.
+    pub fn open(&self) -> usize {
+        DESCRIPTIONS - self.free_len
+    }
+}
+impl core::ops::Deref for Descriptions {
+    type Target = [Option<Shared>; DESCRIPTIONS];
+    fn deref(&self) -> &Self::Target {
+        &self.slots
+    }
+}
+impl core::ops::DerefMut for Descriptions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots
+    }
+}
+
+/// The numbers and receipts of one session: the description each place names, the
+/// places that are taken, unpublished or published, and the exact completed Open of each
+/// key place. A session holds one from its first number to its end, and a table is
+/// valid only where its bit says so (a place that is not taken, a receipt not valid),
+/// so a table that comes back from a session that went needs no clearing but its bits.
+pub struct Wide {
+    /// The description each taken place names. The number of a place is its index plus 3.
+    numbers: [u16; PLACES],
+    /// The places that hold a description, published or not or already detached.
+    taken: Bits,
+    /// Reserved descriptions are paid and held, but are not yet public descriptors.
+    tentative: Bits,
+    /// Published session references, independent of physical operation holds.
+    live: Bits,
+    /// The exact completed operation of each key place, until a later one of that place
+    /// replaces it. It answers only while its descriptor is open.
+    receipts: [OpenReceipt; proto_fs::JOB_KEY_PLACES],
+    /// The key places that hold a receipt.
+    receipts_valid: u64,
+}
+static NO_NUMBERS: Wide = Wide::EMPTY;
+const _: () = assert!(proto_fs::JOB_KEY_PLACES <= u64::BITS as usize);
+impl Wide {
+    const EMPTY: Self = Self {
+        numbers: [0; PLACES],
+        taken: Bits::EMPTY,
+        tentative: Bits::EMPTY,
+        live: Bits::EMPTY,
+        receipts: [OpenReceipt::EMPTY; proto_fs::JOB_KEY_PLACES],
+        receipts_valid: 0,
+    };
+    /// A table for a session that starts to hold files.
+    fn reset(&mut self) {
+        self.taken = Bits::EMPTY;
+        self.tentative = Bits::EMPTY;
+        self.live = Bits::EMPTY;
+        self.receipts_valid = 0;
+    }
+    /// The description of `fd`.
+    fn description(&self, fd: u32) -> Result<usize, u32> {
+        let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
+        if self.tentative.get(slot) {
+            return Err(BAD_FD);
+        }
+        self.at(slot).ok_or(BAD_FD)
+    }
+    /// The description the place `slot` holds, whether it is published or not.
+    fn at(&self, slot: usize) -> Option<usize> {
+        self.taken
+            .get(slot)
+            .then(|| usize::from(self.numbers[slot]))
+    }
+    /// The free place with the lowest number, found in at most 17 words.
+    fn free_place(&self) -> Option<usize> {
+        self.taken.first_clear()
+    }
+    /// The place `slot` holds the description `index` from now on.
+    fn bind(&mut self, slot: usize, index: usize) {
+        debug_assert!(!self.taken.get(slot));
+        self.numbers[slot] = index as u16;
+        self.taken.set(slot);
+    }
+    /// The place `slot` is free.
+    fn unbind(&mut self, slot: usize) {
+        self.taken.clear(slot);
+    }
+    /// The descriptors that name a description, for a session that goes.
+    fn numbers(&self) -> impl Iterator<Item = u32> + '_ {
+        self.taken
+            .iter_without(&self.tentative)
+            .map(|slot| slot as u32 + 3)
+    }
+    /// The lowest descriptor that names a description and is no unpublished one: the
+    /// next that a release closes. At most 17 words are read.
+    fn first_number(&self) -> Option<u32> {
+        self.taken
+            .first_set_without(&self.tentative)
+            .map(|slot| slot as u32 + 3)
+    }
+    fn receipt(&self, place: usize) -> OpenReceipt {
+        if self.receipts_valid & (1 << place) != 0 {
+            self.receipts[place]
+        } else {
+            OpenReceipt::EMPTY
+        }
+    }
+    fn set_receipt(&mut self, place: usize, receipt: OpenReceipt) {
+        self.receipts[place] = receipt;
+        self.receipts_valid |= 1 << place;
+    }
+}
+
+/// The tables of the sessions that hold files, and the stack of those that are free.
+/// A session takes one when it first holds a number and gives it back when it is gone.
+pub struct Wides {
+    slots: [Wide; WIDES],
+    /// The free tables; the one at the top is taken next.
+    free: [u16; WIDES],
+    free_len: usize,
+}
+impl Wides {
+    /// What a new pool is, in place in zeroed memory (the service's `.bss`): only the
+    /// stack of free tables is written, and no table is.
+    ///
+    /// # Safety
+    /// `at` is valid for writes, exclusive and zeroed.
+    pub unsafe fn initialize_at(at: *mut Self) {
+        // SAFETY: the fields lie in the caller's allocation and are written once.
+        unsafe {
+            let free = core::ptr::addr_of_mut!((*at).free).cast::<u16>();
+            for index in 0..WIDES {
+                free.add(index).write((WIDES - 1 - index) as u16);
+            }
+            core::ptr::addr_of_mut!((*at).free_len).write(WIDES);
+        }
+    }
+    /// A pool that lives as long as the program (the tests').
+    #[cfg(test)]
+    pub fn leaked() -> &'static mut Self {
+        extern crate std;
+        let pool = std::boxed::Box::leak(std::boxed::Box::<Self>::new_zeroed());
+        // SAFETY: the allocation is exclusive and zeroed.
+        unsafe {
+            Self::initialize_at(pool.as_mut_ptr());
+            pool.assume_init_mut()
+        }
+    }
+    /// The tables of `fds`, empty ones for a session that holds none.
+    fn get(&self, fds: &Fds) -> &Wide {
+        match self.slots.get(usize::from(fds.wide)) {
+            Some(wide) => wide,
+            None => &NO_NUMBERS,
+        }
+    }
+    fn get_mut(&mut self, fds: &Fds) -> &mut Wide {
+        &mut self.slots[usize::from(fds.wide)]
+    }
+    /// `fds` has tables: the top of the stack, with no number and no receipt.
+    fn acquire(&mut self, fds: &mut Fds) -> Result<(), u32> {
+        if fds.wide != NO_WIDE {
+            return Ok(());
+        }
+        let top = self
+            .free_len
+            .checked_sub(1)
+            .ok_or(proto_fs::TOO_MANY_FILES_IN_SYSTEM)?;
+        let index = self.free[top];
+        self.free_len = top;
+        self.slots[usize::from(index)].reset();
+        fds.wide = index;
+        Ok(())
+    }
+    /// `fds` gives its tables back, with every number of them closed.
+    fn release(&mut self, fds: &mut Fds) {
+        if fds.wide == NO_WIDE {
+            return;
+        }
+        debug_assert!(self.slots[usize::from(fds.wide)].taken.is_empty());
+        debug_assert!(self.free_len < WIDES);
+        self.free[self.free_len] = fds.wide;
+        self.free_len += 1;
+        fds.wide = NO_WIDE;
+    }
+    /// The tables that are in use.
+    pub fn held(&self) -> usize {
+        WIDES - self.free_len
+    }
+}
+
 /// Read-only authoritative OFD generations and actual published fd counts.
 pub struct DescriptionLifetimes<'a> {
     descriptions: &'a [Option<Shared>; DESCRIPTIONS],
+    wides: &'a Wides,
 }
 impl DescriptionLifetimes<'_> {
     /// Validate the exact published source while storage is borrowed separately.
     pub fn source_live(&self, fds: &Fds, source: TentativeOpen) -> bool {
+        let wide = self.wides.get(fds);
         !fds.departed
-            && fds
+            && wide
                 .description(source.fd)
                 .is_ok_and(|slot| slot == source.description.slot as usize)
-            && fds.live_fds & (1 << (source.fd - 3)) != 0
+            && wide.live.get((source.fd - 3) as usize)
             && self.live(source.description)
     }
     pub fn live(&self, token: Token) -> bool {
@@ -611,8 +835,9 @@ impl File {
 pub struct Ram<'a> {
     pub storage: Storage<'a>,
     /// The open descriptions, shared by the sessions that name them.
-    descriptions: [Option<Shared>; DESCRIPTIONS],
-    description_generations: [u64; DESCRIPTIONS],
+    descriptions: &'a mut Descriptions,
+    /// The tables of numbers and receipts of the sessions that hold files.
+    wides: &'a mut Wides,
     tree: Option<Tree<'a>>,
     /// The steps of a cancel that were refused or did not end; the service
     /// prints the count when it moves.
@@ -647,19 +872,28 @@ impl<'a> Ram<'a> {
         state.initialize();
         let data =
             std::boxed::Box::leak(std::vec![0; storage::PAGES * storage::PAGE].into_boxed_slice());
-        Self::with_storage(now, state, data, tree)
+        Self::with_storage(
+            now,
+            state,
+            Descriptions::leaked(),
+            Wides::leaked(),
+            data,
+            tree,
+        )
     }
 
     pub fn with_storage(
         now: proto_fs::Timestamp,
         state: &'a mut storage::State,
+        descriptions: &'a mut Descriptions,
+        wides: &'a mut Wides,
         data: &'a mut [u8],
         tree: Option<Tree<'a>>,
     ) -> Self {
         Self {
             storage: Storage::new(state, data, tree, now),
-            descriptions: [None; DESCRIPTIONS],
-            description_generations: [0; DESCRIPTIONS],
+            descriptions,
+            wides,
             tree,
             cancel_refusals: 0,
         }
@@ -673,6 +907,8 @@ impl<'a> Ram<'a> {
         destination: *mut Self,
         now: proto_fs::Timestamp,
         state: &'a mut storage::State,
+        descriptions: &'a mut Descriptions,
+        wides: &'a mut Wides,
         data: &'a mut [u8],
         tree: Option<Tree<'a>>,
     ) {
@@ -680,14 +916,8 @@ impl<'a> Ram<'a> {
         unsafe {
             core::ptr::addr_of_mut!((*destination).storage)
                 .write(Storage::new(state, data, tree, now));
-            let descriptions =
-                core::ptr::addr_of_mut!((*destination).descriptions).cast::<Option<Shared>>();
-            let generations =
-                core::ptr::addr_of_mut!((*destination).description_generations).cast::<u64>();
-            for index in 0..DESCRIPTIONS {
-                descriptions.add(index).write(None);
-                generations.add(index).write(0);
-            }
+            core::ptr::addr_of_mut!((*destination).descriptions).write(descriptions);
+            core::ptr::addr_of_mut!((*destination).wides).write(wides);
             core::ptr::addr_of_mut!((*destination).tree).write(tree);
             core::ptr::addr_of_mut!((*destination).cancel_refusals).write(0);
         }
@@ -748,13 +978,13 @@ impl<'a> Ram<'a> {
 
     /// The open description `fd` of `fds` names.
     fn get(&self, fds: &Fds, fd: u32) -> Result<Open, u32> {
-        let index = fds.description(fd)?;
+        let index = self.wides.get(fds).description(fd)?;
         Ok(self.descriptions[index].expect("a named description").open)
     }
 
     /// The open description `fd` of `fds` names takes `open`.
     fn put(&mut self, fds: &Fds, fd: u32, open: Open) -> Result<(), u32> {
-        let index = fds.description(fd)?;
+        let index = self.wides.get(fds).description(fd)?;
         self.descriptions[index]
             .as_mut()
             .expect("a named description")
@@ -763,42 +993,50 @@ impl<'a> Ram<'a> {
     }
 
     /// A new description of `open` under the lowest free descriptor of
-    /// `fds`: TOO_MANY_OPEN_FILES with the session's descriptors or the
-    /// service's descriptions taken.
+    /// `fds`: TOO_MANY_OPEN_FILES (EMFILE) with the session's descriptors taken,
+    /// TOO_MANY_FILES_IN_SYSTEM (ENFILE) with the service's descriptions or the root's
+    /// share of them taken.
     fn insert(&mut self, fds: &mut Fds, open: Open) -> Result<u32, u32> {
         self.insert_mode(fds, open, true)
     }
 
     fn insert_mode(&mut self, fds: &mut Fds, open: Open, published: bool) -> Result<u32, u32> {
-        let slot = fds
-            .slots
-            .iter()
-            .position(Option::is_none)
+        let slot = self
+            .wides
+            .get(fds)
+            .free_place()
             .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         let index = self
             .descriptions
-            .iter()
-            .position(Option::is_none)
-            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
-        let generation = self.description_generations[index]
-            .checked_add(1)
-            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+            .next_free()
+            .ok_or(proto_fs::TOO_MANY_FILES_IN_SYSTEM)?;
+        let generation = self
+            .descriptions
+            .next_generation(index)
+            .ok_or(proto_fs::TOO_MANY_FILES_IN_SYSTEM)?;
         self.storage.charge_description(fds.root)?;
         if let Err(code) = self.storage.pin(self.token(open.file), Pin::Fd) {
             self.storage.release_description(fds.root);
             return Err(code);
         }
-        self.descriptions[index] = Some(Shared {
-            open,
-            refs: 1,
-            fd_refs: u16::from(published),
-            root: fds.root,
-            generation,
-        });
-        self.description_generations[index] = generation;
-        fds.slots[slot] = Some(index as u8);
+        if let Err(code) = self.wides.acquire(fds) {
+            self.storage.release_description(fds.root);
+            let _ = self.storage.unpin(self.token(open.file), Pin::Fd);
+            return Err(code);
+        }
+        self.descriptions.install(
+            index,
+            Shared {
+                open,
+                refs: 1,
+                fd_refs: u16::from(published),
+                root: fds.root,
+                generation,
+            },
+        );
+        self.wides.get_mut(fds).bind(slot, index);
         if published {
-            fds.live_fds |= 1 << slot;
+            self.wides.get_mut(fds).live.set(slot);
         }
         Ok(slot as u32 + 3)
     }
@@ -893,7 +1131,7 @@ impl<'a> Ram<'a> {
             false,
         )?;
         let description = self.description_token(fds, fd)?;
-        fds.tentative |= 1 << (fd - 3);
+        self.wides.get_mut(fds).tentative.set((fd - 3) as usize);
         Ok(TentativeOpen { fd, description })
     }
     /// Boot regular files and the fixed motd remain immutable until full executable pins.
@@ -903,10 +1141,10 @@ impl<'a> Ram<'a> {
     }
     fn tentative_slot(&self, fds: &Fds, held: TentativeOpen) -> Result<usize, u32> {
         let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        if slot >= OPEN_MAX || fds.tentative & (1 << slot) == 0 {
+        if !self.wides.get(fds).tentative.get(slot) {
             return Err(BAD_FD);
         }
-        let description = fds.slots[slot].ok_or(BAD_FD)? as usize;
+        let description = self.wides.get(fds).at(slot).ok_or(BAD_FD)?;
         if held.description.slot as usize != description
             || !self.descriptions[description]
                 .is_some_and(|d| d.generation == held.description.generation)
@@ -917,9 +1155,13 @@ impl<'a> Ram<'a> {
     }
     pub fn validate_tentative(&self, fds: &Fds, held: TentativeOpen) -> Result<Token, u32> {
         let slot = self.tentative_slot(fds, held)?;
-        let description = fds.slots[slot].expect("retained tentative description");
+        let description = self
+            .wides
+            .get(fds)
+            .at(slot)
+            .expect("retained tentative description");
         Ok(self.token(
-            self.descriptions[description as usize]
+            self.descriptions[description]
                 .expect("retained description")
                 .open
                 .file,
@@ -930,7 +1172,7 @@ impl<'a> Ram<'a> {
     pub fn publish_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = self.tentative_slot(fds, held)?;
         self.publish_descriptor(fds, slot);
-        fds.tentative &= !(1 << slot);
+        self.wides.get_mut(fds).tentative.clear(slot);
         Ok(held.fd)
     }
     /// Check receipt and exact descriptor ownership before any file effect.
@@ -941,8 +1183,8 @@ impl<'a> Ram<'a> {
         key: proto_fs::OpenKey,
         held: TentativeOpen,
     ) -> Result<FinishOpenPreflight, u32> {
-        key.validate()?;
-        let (slot, mode) = if fds.open_receipts.iter().any(|receipt| receipt.key == key) {
+        let place = key.validate()?;
+        let (slot, mode) = if self.wides.get(fds).receipt(place).key == key {
             if self.finished_open(fds, key)? != held {
                 return Err(proto_fs::PERMISSION);
             }
@@ -965,13 +1207,18 @@ impl<'a> Ram<'a> {
         proof: FinishOpenPreflight,
     ) -> TentativeOpen {
         if matches!(proof.mode, FinishMode::Publish) {
-            fds.open_receipts[proof.slot] = OpenReceipt {
-                key: proof.key,
-                description: proof.held.description,
-                fifo_generation: 0,
-            };
+            self.wides.get_mut(fds).set_receipt(
+                proof.key.slot as usize,
+                OpenReceipt {
+                    key: proof.key,
+                    description: proof.held.description,
+                    fifo_generation: 0,
+                    fd: proof.held.fd as u16,
+                    fifo_slot: 0,
+                },
+            );
             self.publish_descriptor(fds, proof.slot);
-            fds.tentative &= !(1 << proof.slot);
+            self.wides.get_mut(fds).tentative.clear(proof.slot);
         }
         proof.held
     }
@@ -988,34 +1235,29 @@ impl<'a> Ram<'a> {
     }
     /// Recover a completed outcome only while this session still owns its reference.
     pub fn finished_open(&self, fds: &Fds, key: proto_fs::OpenKey) -> Result<TentativeOpen, u32> {
-        key.validate()?;
-        let slot = fds
-            .open_receipts
-            .iter()
-            .position(|receipt| receipt.key == key)
-            .ok_or(proto_fs::OPEN_RETIRED)?;
-        let receipt = fds.open_receipts[slot];
-        let description = receipt.description();
-        if fds.tentative & (1 << slot) != 0
-            || fds.slots[slot] != u8::try_from(description.slot).ok()
+        let place = key.validate()?;
+        let receipt = self.wides.get(fds).receipt(place);
+        if receipt.key != key {
+            return Err(proto_fs::OPEN_RETIRED);
+        }
+        let description = receipt.description;
+        let slot = usize::from(receipt.fd).wrapping_sub(3);
+        if self.wides.get(fds).tentative.get(slot)
+            || self.wides.get(fds).at(slot) != Some(description.slot as usize)
             || !self.descriptions[description.slot as usize]
                 .is_some_and(|shared| shared.generation == description.generation)
         {
             return Err(proto_fs::OPEN_RETIRED);
         }
         Ok(TentativeOpen {
-            fd: slot as u32 + 3,
+            fd: u32::from(receipt.fd),
             description,
         })
     }
     /// Terminal acknowledgement belongs to this exact finished Open, not a reused fd.
     pub fn fifo_acked(&self, fds: &Fds, ack: proto_fs::FifoAck) -> Result<bool, u32> {
         self.finished_open(fds, ack.key)?;
-        let receipt = fds
-            .open_receipts
-            .iter()
-            .find(|receipt| receipt.key == ack.key)
-            .ok_or(proto_fs::OPEN_RETIRED)?;
+        let receipt = self.wides.get(fds).receipt(ack.key.validate()?);
         match receipt.fifo_ticket() {
             None => Ok(false),
             Some(ticket)
@@ -1033,13 +1275,12 @@ impl<'a> Ram<'a> {
         if ack.ticket_slot >= 128 || ack.ticket_generation == 0 {
             return Err(proto_fs::PERMISSION);
         }
-        let receipt = fds
-            .open_receipts
-            .iter_mut()
-            .find(|receipt| receipt.key == ack.key)
-            .ok_or(proto_fs::OPEN_RETIRED)?;
-        receipt.description.slot |= ((ack.ticket_slot + 1) as u16) << 8;
+        let place = ack.key.validate()?;
+        let wide = self.wides.get_mut(fds);
+        let mut receipt = wide.receipt(place);
+        receipt.fifo_slot = ack.ticket_slot as u16;
         receipt.fifo_generation = ack.ticket_generation;
+        wide.set_receipt(place, receipt);
         Ok(())
     }
     /// Validate the exact finished FIFO and its immutable access direction.
@@ -1067,7 +1308,7 @@ impl<'a> Ram<'a> {
     /// Preserve the exact description's device type through Commit and final handoff.
     pub fn marked_open(&self, fds: &Fds, held: TentativeOpen) -> Result<u32, u32> {
         let slot = held.fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        if slot >= OPEN_MAX || fds.slots[slot] != u8::try_from(held.description.slot).ok() {
+        if self.wides.get(fds).at(slot) != Some(held.description.slot as usize) {
             return Err(BAD_FD);
         }
         let shared = self
@@ -1099,22 +1340,27 @@ impl<'a> Ram<'a> {
 
     pub fn cancel_open(&mut self, fds: &mut Fds, held: TentativeOpen) -> Result<(), u32> {
         let slot = self.tentative_slot(fds, held)?;
-        fds.tentative &= !(1 << slot);
+        self.wides.get_mut(fds).tentative.clear(slot);
         self.close(fds, held.fd)
     }
     fn release_tentative_step(&mut self, fds: &mut Fds) -> bool {
-        if fds.tentative == 0 {
+        if self.wides.get(fds).tentative.is_empty() {
             return false;
         }
-        let slot = fds.tentative.trailing_zeros() as usize;
-        fds.tentative &= !(1 << slot);
+        let slot = self
+            .wides
+            .get(fds)
+            .tentative
+            .first_set()
+            .expect("a tentative place");
+        self.wides.get_mut(fds).tentative.clear(slot);
         let _ = self.close(fds, slot as u32 + 3);
         true
     }
 
     fn publish_descriptor(&mut self, fds: &mut Fds, slot: usize) {
-        assert_eq!(fds.live_fds & (1 << slot), 0);
-        let index = fds.slots[slot].expect("prepaid description") as usize;
+        assert!(!self.wides.get(fds).live.get(slot));
+        let index = self.wides.get(fds).at(slot).expect("prepaid description");
         let shared = self.descriptions[index]
             .as_mut()
             .expect("prepaid description");
@@ -1123,13 +1369,14 @@ impl<'a> Ram<'a> {
             .checked_add(1)
             .expect("bounded session references");
         assert!(shared.fd_refs <= shared.refs);
-        fds.live_fds |= 1 << slot;
+        self.wides.get_mut(fds).live.set(slot);
     }
 
     /// A new lock request names an exact, currently published session reference.
     pub fn live_description(&self, fds: &Fds, held: TentativeOpen) -> Result<(Token, u32), u32> {
         let description = self.description_token(fds, held.fd)?;
-        if description != held.description || fds.live_fds & (1 << (held.fd - 3)) == 0 {
+        if description != held.description || !self.wides.get(fds).live.get((held.fd - 3) as usize)
+        {
             return Err(BAD_FD);
         }
         let shared = self.descriptions[description.slot as usize]
@@ -1149,7 +1396,7 @@ impl<'a> Ram<'a> {
             return Ok(None);
         }
         let slot = (held.fd - 3) as usize;
-        if fds.live_fds & (1 << slot) == 0 {
+        if !self.wides.get(fds).live.get(slot) {
             return Ok(None);
         }
         let index = held.description.slot as usize;
@@ -1165,7 +1412,7 @@ impl<'a> Ram<'a> {
             .expect("retained description");
         assert!(shared.fd_refs > 0);
         shared.fd_refs -= 1;
-        fds.live_fds &= !(1 << slot);
+        self.wides.get_mut(fds).live.clear(slot);
         Ok(Some(DescriptorClose {
             inode,
             description: held.description,
@@ -1176,13 +1423,13 @@ impl<'a> Ram<'a> {
     /// Close: the descriptor goes, and its description with the last one
     /// that names it, in any session.
     pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
-        let index = fds.description(fd)?;
+        let index = self.wides.get(fds).description(fd)?;
         let held = TentativeOpen {
             fd,
             description: self.description_token(fds, fd)?,
         };
         self.detach_descriptor(fds, held)?;
-        fds.slots[(fd - 3) as usize] = None;
+        self.wides.get_mut(fds).unbind((fd - 3) as usize);
         let shared = self.descriptions[index]
             .as_mut()
             .expect("a named description");
@@ -1193,7 +1440,7 @@ impl<'a> Ram<'a> {
             let file = shared.open.file;
             let root = shared.root;
             let token = self.token(file);
-            self.descriptions[index] = None;
+            self.descriptions.give_back(index);
             self.storage.unpin(token, Pin::Fd)?;
             self.storage.release_description(root);
         }
@@ -1320,15 +1567,53 @@ impl<'a> Ram<'a> {
             let _ = self.storage.unpin(cwd, Pin::Cwd);
             return true;
         }
+        // The session is going: with its last number the tables of numbers and receipts
+        // go back to the pool in the same step.
         if self.release_tentative_step(fds) {
+            self.release_empty_wide(fds);
             return true;
         }
-        let first = fds.numbers().next();
-        if let Some(fd) = first {
+        if let Some(fd) = self.wides.get(fds).first_number() {
             let _ = self.close(fds, fd);
+            self.release_empty_wide(fds);
+            return true;
+        }
+        // Tables with no number in them (every number was closed by the client).
+        if fds.wide != NO_WIDE {
+            self.wides.release(fds);
             return true;
         }
         false
+    }
+
+    /// The tables of `fds` go back to the pool when no number is left in them.
+    fn release_empty_wide(&mut self, fds: &mut Fds) {
+        if self.wides.get(fds).taken.is_empty() {
+            self.wides.release(fds);
+        }
+    }
+
+    /// The descriptors of `fds` that name a description and are no unpublished ones.
+    pub fn numbers<'s>(&'s self, fds: &Fds) -> impl Iterator<Item = u32> + 's {
+        self.wides.get(fds).numbers()
+    }
+
+    /// Whether every published reference of the session has been detached (the
+    /// logical death of its descriptors, which a departure takes by portions).
+    pub fn detached(&self, fds: &Fds) -> bool {
+        self.wides.get(fds).live.is_empty()
+    }
+
+    /// Retained references in this session, without authenticating or mutating it.
+    #[cfg(feature = "auth-probe")]
+    pub fn retained_counts(&self, fds: &Fds) -> [u32; 5] {
+        [
+            self.wides.get(fds).taken.count() as u32,
+            u32::from(fds.cwd.is_some()),
+            u32::from(fds.binding_preparation.is_some()),
+            u32::from(fds.authority_index != storage::NONE),
+            fds.resolvers.iter().filter(|&&id| id != 0).count() as u32,
+        ]
     }
 
     /// Split disjoint storage mutation and authoritative description reads.
@@ -1336,7 +1621,8 @@ impl<'a> Ram<'a> {
         (
             &mut self.storage,
             DescriptionLifetimes {
-                descriptions: &self.descriptions,
+                descriptions: &self.descriptions.slots,
+                wides: &*self.wides,
             },
         )
     }
@@ -1346,13 +1632,14 @@ impl<'a> Ram<'a> {
         (
             &self.storage,
             DescriptionLifetimes {
-                descriptions: &self.descriptions,
+                descriptions: &self.descriptions.slots,
+                wides: &*self.wides,
             },
         )
     }
 
     pub fn description_token(&self, fds: &Fds, fd: u32) -> Result<Token, u32> {
-        let slot = fds.description(fd)?;
+        let slot = self.wides.get(fds).description(fd)?;
         Ok(Token {
             slot: slot as u16,
             generation: self.descriptions[slot]
@@ -1418,18 +1705,13 @@ impl<'a> Ram<'a> {
         }
     }
 
-    /// A raw token can serve as a relative base only when this session retains it.
+    /// A raw token can serve as a relative base only as the session's root or
+    /// current directory. A directory a descriptor holds is a base by the form of the
+    /// descriptor (`Base::Fd`: its number and the generation of its description, which
+    /// one comparison checks), never by a walk over the numbers of the session.
     pub fn owns_directory_base(&self, fds: &Fds, token: Token) -> bool {
-        if !self.storage.node(token).is_ok_and(|n| n.kind == DIR) {
-            return false;
-        }
-        fds.cwd.unwrap_or(storage::ROOT) == token
-            || fds.numbers().any(|fd| {
-                fds.description(fd)
-                    .ok()
-                    .and_then(|slot| self.descriptions[slot].as_ref())
-                    .is_some_and(|description| self.token(description.open.file) == token)
-            })
+        self.storage.node(token).is_ok_and(|n| n.kind == DIR)
+            && fds.cwd.unwrap_or(storage::ROOT) == token
     }
     pub fn set_cwd_token(&mut self, fds: &mut Fds, token: Token) -> Result<(), u32> {
         if self.storage.node(token)?.kind != DIR {
@@ -1461,16 +1743,15 @@ impl<'a> Ram<'a> {
             }
         }
         while self.release_tentative_step(fds) {}
-        let numbers: [Option<u32>; OPEN_MAX] = {
-            let mut list = [None; OPEN_MAX];
-            for (place, fd) in list.iter_mut().zip(fds.numbers()) {
-                *place = Some(fd);
-            }
-            list
-        };
-        for fd in numbers.into_iter().flatten() {
-            let _ = self.close(fds, fd);
+        // Every number goes in this call: it serves the tables of a clone that
+        // failed (at most `CLONE_PORTION` numbers) and the host tests. A session
+        // or a birth that is gone releases its numbers a step at a time
+        // (`detach_session_descriptions`, `release_step`).
+        let taken = self.wides.get(fds).taken;
+        for slot in taken.iter_without(&Bits::EMPTY) {
+            let _ = self.close(fds, slot as u32 + 3);
         }
+        self.wides.release(fds);
     }
 
     /// Capture a published description before importing it into a local table.
@@ -1499,7 +1780,7 @@ impl<'a> Ram<'a> {
 
     /// Clone's descriptors: a session's of the same numbers as `list` of
     /// `fds`, which share their descriptions, offsets and access modes;
-    /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
+    /// BAD_FD for a number no descriptor has. At most `CLONE_PORTION` numbers.
     pub fn clone_fds(&mut self, fds: &Fds, list: &[u32]) -> Result<Fds, u32> {
         let mut out = Fds::default();
         self.clone_fds_into(fds, list, &mut out)?;
@@ -1513,37 +1794,88 @@ impl<'a> Ram<'a> {
         if !out.fresh_clone_destination() {
             return Err(proto_fs::INVALID_ARGUMENT);
         }
-        let mut slots = [None; OPEN_MAX];
+        if list.len() > CLONE_PORTION {
+            return Err(proto_wire::BAD_SIZE);
+        }
         for &fd in list {
-            let index = fds.description(fd)?;
-            if fds.live_fds & (1 << (fd - 3)) == 0 {
+            self.wides.get(fds).description(fd)?;
+            if !self.wides.get(fds).live.get((fd - 3) as usize) {
                 return Err(BAD_FD);
             }
-            slots[(fd - 3) as usize] = Some(index as u8);
         }
         if let Some(cwd) = fds.cwd {
             self.storage.pin(cwd, Pin::Cwd)?;
         }
+        if !list.is_empty()
+            && let Err(code) = self.wides.acquire(out)
+        {
+            if let Some(cwd) = fds.cwd {
+                let _ = self.storage.unpin(cwd, Pin::Cwd);
+            }
+            return Err(code);
+        }
         out.root = fds.root;
-        out.slots = slots;
-        out.live_fds = out.slots.iter().enumerate().fold(0, |mask, (slot, value)| {
-            mask | (u32::from(value.is_some()) << slot)
-        });
         out.cwd = fds.cwd;
-        // At most 641 session/birth records, including this child, own 32 references each.
-        for index in out.slots.iter().flatten() {
-            let shared = self.descriptions[usize::from(*index)]
+        self.share_numbers(fds, list, out);
+        Ok(())
+    }
+
+    /// CLONE_MORE: the descriptions of the numbers `list` of `fds` join the birth `out`,
+    /// which holds the numbers of the Clone before it. A number the birth holds
+    /// already, with the same description, is passed over. The whole list is checked
+    /// before the birth changes; at most `CLONE_PORTION` numbers.
+    pub fn clone_more_fds(&mut self, fds: &Fds, list: &[u32], out: &mut Fds) -> Result<(), u32> {
+        if list.is_empty() || list.len() > CLONE_PORTION {
+            return Err(proto_wire::BAD_SIZE);
+        }
+        if out.departed || out.root != fds.root {
+            return Err(proto_fs::PERMISSION);
+        }
+        for &fd in list {
+            let index = self.wides.get(fds).description(fd)?;
+            let slot = (fd - 3) as usize;
+            if !self.wides.get(fds).live.get(slot) {
+                return Err(BAD_FD);
+            }
+            if self
+                .wides
+                .get(out)
+                .at(slot)
+                .is_some_and(|held| held != index)
+            {
+                return Err(BAD_FD);
+            }
+        }
+        self.wides.acquire(out)?;
+        self.share_numbers(fds, list, out);
+        Ok(())
+    }
+
+    /// The numbers `list` of `fds`, each checked, name the same descriptions in
+    /// `out`, which count them in; a number `out` holds already counts once.
+    fn share_numbers(&mut self, fds: &Fds, list: &[u32], out: &mut Fds) {
+        for &fd in list {
+            let slot = (fd - 3) as usize;
+            if self.wides.get(out).taken.get(slot) {
+                continue;
+            }
+            let index = self.wides.get(fds).at(slot).expect("a checked number");
+            let wide = self.wides.get_mut(out);
+            wide.bind(slot, index);
+            wide.live.set(slot);
+            // At most 641 session and birth records hold each description once, so a
+            // count of 16 bits never overflows (`SESSIONS + BIRTHS` in the service).
+            let shared = self.descriptions[index]
                 .as_mut()
                 .expect("a named description");
             shared.refs += 1;
             shared.fd_refs += 1;
         }
-        Ok(())
     }
 
     /// The descriptions that are open.
     pub fn open_descriptions(&self) -> usize {
-        self.descriptions.iter().flatten().count()
+        self.descriptions.open()
     }
 
     pub fn seek(&mut self, fds: &mut Fds, fd: u32, offset: u32) -> Result<u32, u32> {
@@ -2440,7 +2772,7 @@ mod tests {
     fn description_limit_reports_emfile_and_recovers_on_close() {
         let mut ram = Ram::default();
         let mut fds = Fds::default();
-        for expected in 3..OPEN_MAX as u32 + 3 {
+        for expected in 3..PLACES as u32 + 3 {
             assert_eq!(ram.open(&mut fds, "/etc/motd", READ_ONLY), Ok(expected));
         }
         assert_eq!(
@@ -2641,6 +2973,8 @@ mod tests {
                 allocation.as_mut_ptr(),
                 proto_fs::Timestamp::ZERO,
                 state,
+                Descriptions::leaked(),
+                Wides::leaked(),
                 data,
                 tree,
             );
@@ -3043,7 +3377,7 @@ mod tests {
             groups: proto_process::Groups::EMPTY,
         };
         let mut fds = Fds::default();
-        let mut receipts = [None; OPEN_MAX];
+        let mut receipts = [None; CLONE_PORTION];
         for (slot, saved) in receipts.iter_mut().enumerate() {
             let held = ram
                 .prepare_open_token(&mut fds, random, READ_WRITE, identity, None)
@@ -3068,8 +3402,8 @@ mod tests {
             );
             *saved = Some((key, held));
         }
-        assert_eq!(ram.open_descriptions(), OPEN_MAX);
-        let numbers: Vec<u32> = fds.numbers().collect();
+        assert_eq!(ram.open_descriptions(), CLONE_PORTION);
+        let numbers: Vec<u32> = ram.numbers(&fds).collect();
         let mut child = ram.clone_fds(&fds, &numbers).unwrap();
         for fd in numbers {
             assert!(ram.is_random(&child, fd));
@@ -3119,7 +3453,9 @@ mod tests {
         ram.release(&mut child);
         ram.release(&mut fds);
         assert_eq!(ram.open_descriptions(), 0);
-        let mut full: [Fds; 4] = core::array::from_fn(|group| Fds {
+        // Eight sessions of 1 024 numbers take every description of the service; the
+        // description 8191 is among them, under a number of 11 bits.
+        let mut full: [Fds; 8] = core::array::from_fn(|group| Fds {
             root: storage::Root {
                 id: 500 + group as u64,
                 generation: 1,
@@ -3127,21 +3463,32 @@ mod tests {
             ..Fds::default()
         });
         for session in &mut full {
-            for _ in 0..OPEN_MAX {
+            for _ in 0..DESCRIPTIONS / 8 {
                 let held = ram
                     .prepare_open_token(session, random, READ_WRITE, identity, None)
                     .unwrap();
                 ram.publish_open(session, held).unwrap();
             }
         }
-        let last = TentativeOpen {
-            fd: 34,
-            description: ram.description_token(&full[3], 34).unwrap(),
-        };
-        assert_eq!(last.description.slot, 127);
+        assert_eq!(ram.open_descriptions(), DESCRIPTIONS);
+        let (session, last) = full
+            .iter()
+            .find_map(|session| {
+                ram.numbers(session)
+                    .map(|fd| TentativeOpen {
+                        fd,
+                        description: ram.description_token(session, fd).unwrap(),
+                    })
+                    .find(|held| held.description.slot as usize == DESCRIPTIONS - 1)
+                    .map(|held| (session, held))
+            })
+            .expect("the last description is taken by one of them");
+        assert!(last.fd >= 3 && last.fd < 3 + (DESCRIPTIONS / 8) as u32);
         assert_eq!(
-            ram.marked_open(&full[3], last),
-            Ok(proto_fs::OPEN_RANDOM | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT) | 34)
+            ram.marked_open(session, last),
+            Ok(proto_fs::OPEN_RANDOM
+                | ((DESCRIPTIONS as u32 - 1) << proto_fs::OPEN_DESCRIPTION_SHIFT)
+                | last.fd)
         );
         for session in &mut full {
             ram.release(session);
@@ -3466,27 +3813,86 @@ mod tests {
         assert_eq!(ram.open_descriptions(), 0);
     }
 
-    /// The service's descriptions are bounded across its sessions.
+    /// The service's descriptions are bounded across its sessions: past them the
+    /// answer is ENFILE, and a session with numbers left gets no EMFILE.
     #[test]
     fn descriptions_are_bounded_across_sessions() {
         let mut ram = Ram::default();
-        let mut sessions = [Fds::default(); DESCRIPTIONS / OPEN_MAX];
+        let mut sessions = [Fds::default(); 8];
         for (i, fds) in sessions.iter_mut().enumerate() {
             fds.root = storage::Root {
                 id: i as u64 + 1,
                 generation: 1,
             };
-            for _ in 0..OPEN_MAX {
+            for _ in 0..DESCRIPTIONS / 8 {
                 ram.open(fds, "/etc/motd", READ_ONLY).unwrap();
             }
         }
+        assert_eq!(ram.open_descriptions(), DESCRIPTIONS);
         let mut one_more = Fds::default();
         assert_eq!(
             ram.open(&mut one_more, "/etc/motd", READ_ONLY),
-            Err(proto_fs::TOO_MANY_OPEN_FILES)
+            Err(proto_fs::TOO_MANY_FILES_IN_SYSTEM)
         );
         ram.release(&mut sessions[0]);
         assert!(ram.open(&mut one_more, "/etc/motd", READ_ONLY).is_ok());
+        ram.release(&mut one_more);
+        for session in &mut sessions[1..] {
+            ram.release(session);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
+    }
+
+    /// The share of one root is a bound of its own: a second root opens a file while
+    /// the first has taken its share (breakage 4 of the note: a share nobody checks).
+    #[test]
+    fn a_root_stops_at_its_share_and_another_root_goes_on() {
+        let mut ram = Ram::default();
+        let first = storage::Root {
+            id: 1,
+            generation: 1,
+        };
+        let second = storage::Root {
+            id: 2,
+            generation: 1,
+        };
+        let share = storage::DESCRIPTION_SHARE as usize;
+        let mut sessions = std::vec::Vec::new();
+        let mut taken = 0;
+        while taken < share {
+            let mut fds = Fds {
+                root: first,
+                ..Fds::default()
+            };
+            for _ in 0..PLACES.min(share - taken) {
+                ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+                taken += 1;
+            }
+            sessions.push(fds);
+        }
+        assert!(
+            sessions.len() > 1,
+            "the share is more than one session holds"
+        );
+        let mut more = Fds {
+            root: first,
+            ..Fds::default()
+        };
+        assert_eq!(
+            ram.open(&mut more, "/etc/motd", READ_ONLY),
+            Err(proto_fs::TOO_MANY_FILES_IN_SYSTEM)
+        );
+        assert_eq!(ram.open_descriptions(), share);
+        let mut other = Fds {
+            root: second,
+            ..Fds::default()
+        };
+        assert_eq!(ram.open(&mut other, "/etc/motd", READ_ONLY), Ok(3));
+        ram.release(&mut other);
+        for fds in &mut sessions {
+            ram.release(fds);
+        }
+        assert_eq!(ram.open_descriptions(), 0);
     }
     #[test]
     fn paid_open_preserves_device_only_changes_profile() {
@@ -3556,7 +3962,7 @@ mod tests {
             let mut charge = ram.storage.charge_preparation(fds.root).unwrap();
             let before_usage = ram.storage.usage(fds.root);
             let before_epoch = ram.storage.state.epoch;
-            let before_generations = ram.description_generations;
+            let before_generations = ram.descriptions.generations;
             let result = journal.prepare(&mut ram, &mut fds, proof, identity, &mut charge);
             assert_eq!(result.map(|_| ()), expected);
             if result.is_ok() {
@@ -3598,7 +4004,7 @@ mod tests {
             assert_eq!(after_node.mode, before_node.mode);
             assert_eq!(after_node.pins, before_node.pins);
             if expected.is_err() {
-                assert_eq!(ram.description_generations, before_generations);
+                assert_eq!(ram.descriptions.generations, before_generations);
             }
             ram.storage.release_preparation(charge);
             resolver.release(&mut ram.storage);

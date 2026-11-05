@@ -2182,11 +2182,12 @@ fn the_base_of_a_resolve_or_an_open_names_a_descriptor_a_node_or_the_reserved_di
         base(&env, proto_fs::BASE_ABSOLUTE, 1, true),
         Err(proto_wire::BAD_SIZE)
     );
-    // The earlier form: the root token, and a token of a directory the session holds.
+    // The earlier form: the root token. A token of a directory a descriptor holds is
+    // no base in it (no walk over the numbers of the session looks for it).
     assert_eq!(base(&env, 0, 1, true), Ok(ROOT));
     assert_eq!(
         base(&env, u32::from(dir.slot), dir.generation, true),
-        Ok(dir)
+        Err(BAD_FD)
     );
     assert_eq!(
         base(&env, u32::from(file.slot), file.generation, true),

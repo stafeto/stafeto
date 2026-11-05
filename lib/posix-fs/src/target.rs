@@ -16,7 +16,7 @@ pub struct RamTarget {
 }
 
 // These bits belong only to the local target, never to a native message.
-const KIND_SHIFT: u32 = 16;
+const KIND_SHIFT: u32 = 24;
 const KIND_MASK: u32 = 7 << KIND_SHIFT;
 const _: () = {
     assert!(core::mem::size_of::<RamTarget>() == 16);
@@ -36,7 +36,7 @@ impl Eq for RamTarget {}
 impl RamTarget {
     /// Accept a strictly decoded native result before local publication.
     pub fn from_prepared(held: PreparedOpen) -> Result<Self, FsError> {
-        if !(3..35).contains(&held.fd) || held.slot >= 128 {
+        if !proto_fs::is_session_number(held.fd) || held.slot >= proto_fs::DESCRIPTIONS as u32 {
             return Err(FsError::Io);
         }
         Ok(Self {
@@ -111,7 +111,9 @@ impl FifoTarget {
             return Err(FsError::Io);
         }
         Ok(Self {
-            packed: ram.fd() | (ram.description_slot() << 8) | (slot << 15),
+            packed: ram.fd()
+                | (ram.description_slot() << proto_fs::OPEN_DESCRIPTION_SHIFT)
+                | (slot << proto_fs::FIFO_TICKET_SHIFT),
             ram_generation: ram.generation,
             pipe_generation: NonZeroU64::new(endpoint.generation).ok_or(FsError::Io)?,
         })
@@ -121,12 +123,12 @@ impl FifoTarget {
         ram_generation: u64,
         pipe_generation: u64,
     ) -> Result<Self, FsError> {
-        if packed & !0x003fff3f != 0 {
+        if packed & !proto_fs::FIFO_PACKED_MASK != 0 {
             return Err(FsError::Io);
         }
         let ram = RamTarget::from_prepared(PreparedOpen {
-            fd: packed & 63,
-            slot: (packed >> 8) & 127,
+            fd: packed & proto_fs::OPEN_FD_MASK,
+            slot: (packed & proto_fs::OPEN_DESCRIPTION_MASK) >> proto_fs::OPEN_DESCRIPTION_SHIFT,
             generation: ram_generation,
             random: false,
         })?
@@ -134,7 +136,8 @@ impl FifoTarget {
         Self::new(
             ram,
             proto_pipe::Endpoint {
-                id: proto_pipe::NAMED_END | ((packed >> 15) & 127),
+                id: proto_pipe::NAMED_END
+                    | ((packed >> proto_fs::FIFO_TICKET_SHIFT) & proto_fs::FIFO_TICKET_MASK),
                 generation: pipe_generation,
             },
         )
@@ -144,13 +147,15 @@ impl FifoTarget {
     }
     pub fn ram(self) -> RamTarget {
         RamTarget {
-            packed: (self.packed & 0x7f3f) | (4 << KIND_SHIFT),
+            packed: (self.packed & (proto_fs::OPEN_FD_MASK | proto_fs::OPEN_DESCRIPTION_MASK))
+                | (4 << KIND_SHIFT),
             generation: self.ram_generation,
         }
     }
     pub fn endpoint(self) -> proto_pipe::Endpoint {
         proto_pipe::Endpoint {
-            id: proto_pipe::NAMED_END | ((self.packed >> 15) & 127),
+            id: proto_pipe::NAMED_END
+                | ((self.packed >> proto_fs::FIFO_TICKET_SHIFT) & proto_fs::FIFO_TICKET_MASK),
             generation: self.pipe_generation.get(),
         }
     }
@@ -182,6 +187,27 @@ mod fifo_tests {
             proto_pipe::Endpoint::named(127, 0xabcdef1200000001),
         )
         .unwrap();
+        // The edges of the packed word: the last number, the last description, the last ticket.
+        let edge = FifoTarget::new(
+            RamTarget::from_prepared(PreparedOpen {
+                fd: 1058,
+                slot: 8191,
+                generation: 7,
+                random: false,
+            })
+            .unwrap()
+            .with_kind(FileKind::Fifo),
+            proto_pipe::Endpoint::named(127, 9),
+        )
+        .unwrap();
+        assert_eq!(edge.ram().fd(), 1058);
+        assert_eq!(edge.ram().description_slot(), 8191);
+        assert_eq!(edge.endpoint(), proto_pipe::Endpoint::named(127, 9));
+        assert_eq!(
+            FifoTarget::from_packed(edge.packed(), 7, 9),
+            Ok(edge),
+            "an exec carries the word whole"
+        );
         assert_eq!(a.ram().fd(), 34);
         assert_eq!(a.ram().description_slot(), 127);
         assert_eq!(a.ram_generation(), 0x1234567800000001);
@@ -225,11 +251,15 @@ mod fifo_tests {
         );
         let good =
             FifoTarget::new(ram(FileKind::Fifo, 1), proto_pipe::Endpoint::named(127, 1)).unwrap();
-        for bit in [6, 7, 22, 31] {
-            assert_eq!(
-                FifoTarget::from_packed(good.packed() | (1 << bit), 1, 1),
-                Err(FsError::Io)
-            );
+        // Only bit 31 lies outside the number, the description slot and the ticket slot; a
+        // number past the places of the service, or below 3, is no number.
+        assert_eq!(
+            FifoTarget::from_packed(good.packed() | (1 << 31), 1, 1),
+            Err(FsError::Io)
+        );
+        for fd in [0, 2, 1059, 2047] {
+            let packed = (good.packed() & !proto_fs::OPEN_FD_MASK) | fd;
+            assert_eq!(FifoTarget::from_packed(packed, 1, 1), Err(FsError::Io));
         }
         assert_eq!(
             FifoTarget::from_packed(good.packed(), 0, 1),

@@ -11,17 +11,21 @@ use crate::{
 use proto_fs::{CloseEvent, OPEN_DESCRIPTION_MASK, OPEN_DESCRIPTION_SHIFT, OPEN_FD_MASK};
 
 impl Ram<'_> {
-    /// Session disappearance retires true OFD references without a PID close event.
+    /// Session disappearance retires true OFD references without a PID close event, at
+    /// most `CLONE_PORTION` of them in one call: the call is a step of the service, and a
+    /// session holds up to 1 056 numbers. The caller calls again while the session is not
+    /// `detached`; the references that remain are the first ones in the order of the
+    /// numbers. Returns the references this call retired.
     pub fn detach_session_descriptions(
         &mut self,
         fds: &mut Fds,
         _locks: &mut SimpleLocks,
     ) -> usize {
         let mut detached = 0;
-        for slot in 0..crate::OPEN_MAX {
-            if fds.live_fds & (1 << slot) == 0 {
-                continue;
-            }
+        while detached < crate::CLONE_PORTION {
+            let Some(slot) = self.wides.get(fds).live.first_set() else {
+                break;
+            };
             let fd = slot as u32 + 3;
             let description = self
                 .description_token(fds, fd)

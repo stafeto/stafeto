@@ -1489,7 +1489,7 @@ fn tentative_open_prepays_resources_without_exposing_a_descriptor() {
         ram.storage.usage(ROOT_ACCOUNT).descriptions,
         before.descriptions + 1
     );
-    assert_eq!(fds.numbers().count(), 0);
+    assert_eq!(ram.numbers(&fds).count(), 0);
     assert_eq!(ram.description_token(&fds, held.fd), Err(proto_fs::BAD_FD));
     assert!(matches!(
         ram.clone_fds(&fds, &[held.fd]),
@@ -1588,20 +1588,20 @@ fn tentative_open_failure_and_full_cleanup_preserve_descriptor_accounting() {
         ..Fds::default()
     };
     let token = create(&mut ram, ROOT, b"full-open", REG, 0o600);
-    for _ in 0..32 {
+    for _ in 0..crate::numbers::PLACES {
         ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None)
             .unwrap();
     }
     let before = ram.storage.usage(ROOT_ACCOUNT);
-    assert_eq!(fds.numbers().count(), 0);
-    assert_eq!(ram.open_descriptions(), 32);
+    assert_eq!(ram.numbers(&fds).count(), 0);
+    assert_eq!(ram.open_descriptions(), crate::numbers::PLACES);
     assert!(matches!(
         ram.prepare_open_token(&mut fds, token, proto_fs::READ_WRITE, OWNER, None),
         Err(proto_fs::TOO_MANY_OPEN_FILES)
     ));
     assert_eq!(ram.storage.usage(ROOT_ACCOUNT), before);
-    assert_eq!(ram.open_descriptions(), 32);
-    for _ in 0..32 {
+    assert_eq!(ram.open_descriptions(), crate::numbers::PLACES);
+    for _ in 0..crate::numbers::PLACES {
         assert!(ram.release_step(&mut fds));
     }
     assert!(!ram.release_step(&mut fds));
@@ -1970,7 +1970,7 @@ fn finished_open_receipt_preserves_exact_reference_across_close_reuse_and_clone(
         .prepare_open_token(&mut owner, inode, proto_fs::READ_WRITE, OWNER, None)
         .unwrap();
     assert_eq!(ram.finished_open(&owner, key), Err(proto_fs::OPEN_RETIRED));
-    assert!(owner.numbers().next().is_none());
+    assert!(ram.numbers(&owner).next().is_none());
     assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
     assert_eq!(ram.finish_open(&mut owner, key, held), Ok(held));
     assert_eq!(ram.finished_open(&owner, key), Ok(held));
@@ -2080,7 +2080,7 @@ fn finished_open_handoff_succeeds_with_full_description_and_session_tables() {
     }
     assert_eq!(ram.open_descriptions(), 128);
     for fds in &mut sessions {
-        assert_eq!(fds.numbers().count(), 32);
+        assert_eq!(ram.numbers(fds).count(), 32);
         for slot in 0..32 {
             let key = proto_fs::OpenKey {
                 slot,
@@ -2231,7 +2231,8 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
         .unwrap();
     let held = ram.capture_description(&source, fd).unwrap().0;
     // The live session model gives a second numeric slot the same description.
-    source.slots[1] = source.slots[0];
+    let index = ram.wides.get(&source).at(0).unwrap();
+    ram.wides.get_mut(&source).bind(1, index);
     ram.descriptions[held.description.slot as usize]
         .as_mut()
         .unwrap()
@@ -2240,7 +2241,7 @@ fn clone_into_deduplicates_numeric_fds_and_retains_distinct_alias_slots() {
     let mut out = Fds::default();
     ram.clone_fds_into(&source, &[fd, fd, 4, 4], &mut out)
         .unwrap();
-    assert_eq!(out.numbers().count(), 2);
+    assert_eq!(ram.numbers(&out).count(), 2);
     assert_eq!(out.root, source.root);
     assert_eq!(
         ram.descriptions[held.description.slot as usize]
@@ -2276,8 +2277,16 @@ fn clone_into_requires_fresh_destination_including_operation_tombstones() {
     let source = Fds::default();
     let mut destinations = [Fds::default(); 9];
     destinations[0].open_watermarks[31] = 1;
-    destinations[1].open_receipts[31].key.generation = 1;
-    destinations[2].open_receipts[31].description.slot = 1;
+    // A tombstone of an earlier operation lives in the tables of numbers and receipts, which
+    // a fresh destination has not got.
+    for out in &mut destinations[1..3] {
+        ram.wides.acquire(out).unwrap();
+    }
+    let mut receipt = crate::OpenReceipt::EMPTY;
+    receipt.key.generation = 1;
+    ram.wides.get_mut(&destinations[1]).set_receipt(31, receipt);
+    receipt.description.slot = 1;
+    ram.wides.get_mut(&destinations[2]).set_receipt(31, receipt);
     destinations[3].binding = Binding::Boot;
     destinations[4].root = ROOT_ACCOUNT;
     destinations[5].binding_outcome = Some(0);
@@ -2292,8 +2301,14 @@ fn clone_into_requires_fresh_destination_including_operation_tombstones() {
         assert!(!out.fresh_clone_destination());
     }
     assert_eq!(destinations[0].open_watermarks[31], 1);
-    assert_eq!(destinations[1].open_receipts[31].key.generation, 1);
-    assert_eq!(destinations[2].open_receipts[31].description.slot, 1);
+    assert_eq!(
+        ram.wides.get(&destinations[1]).receipt(31).key.generation,
+        1
+    );
+    assert_eq!(
+        ram.wides.get(&destinations[2]).receipt(31).description.slot,
+        1
+    );
     assert_eq!(ram.open_descriptions(), 0);
 }
 

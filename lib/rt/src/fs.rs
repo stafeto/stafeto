@@ -454,7 +454,10 @@ impl Files {
     }
 
     fn exact_description_word(held: PreparedOpen) -> Result<u32, Status> {
-        if !(3..35).contains(&held.fd) || held.slot >= 128 || held.generation == 0 {
+        if !proto_fs::is_session_number(held.fd)
+            || held.slot >= proto_fs::DESCRIPTIONS as u32
+            || held.generation == 0
+        {
             return Err(Status::BadSize);
         }
         Ok(held.fd | (held.slot << proto_fs::OPEN_DESCRIPTION_SHIFT))
@@ -465,7 +468,16 @@ impl Files {
         channel: &Handle<Channel>,
         descriptions: &[PreparedOpen],
     ) -> Result<Handle<Channel>, Status> {
-        if descriptions.len() > 32 {
+        Self::clone_exact_birth_on(channel, descriptions).map(|(clone, _)| clone)
+    }
+
+    /// `clone_exact_on` with the birth word of the reply, which `clone_more_on` names
+    /// the clone by: the first portion of a list that is longer than a clone carries.
+    pub fn clone_exact_birth_on(
+        channel: &Handle<Channel>,
+        descriptions: &[PreparedOpen],
+    ) -> Result<(Handle<Channel>, u32), Status> {
+        if descriptions.len() > proto_fs::CLONE_PORTION {
             return Err(Status::BadSize);
         }
         let mut w = Writer::new();
@@ -483,7 +495,8 @@ impl Files {
                 Ok(()) => Err(Status::BadSize),
             };
         }
-        if reply.len != 4
+        let birth = (reply.words[0] >> 32) as u32;
+        if reply.len != 8
             || reply.handles.len() != 1
             || !reply.handles.info(0).is_some_and(|(kind, rights)| {
                 kind == abi::ObjectKind::Channel
@@ -492,7 +505,48 @@ impl Files {
         {
             return Err(Status::BadSize);
         }
-        reply.handles.take(0).map_err(Status::Kernel)
+        let clone = reply.handles.take(0).map_err(Status::Kernel)?;
+        Ok((clone, birth))
+    }
+
+    /// A clone of the session that holds the descriptions `descriptions`, however many
+    /// (the caller bounds them): the first portion goes with CLONE_EXACT and the rest
+    /// with CLONE_MORE, each of at most `CLONE_PORTION`. A refusal of any portion drops
+    /// the clone, which the service then releases a portion at a time.
+    pub fn clone_exact_all_on(
+        channel: &Handle<Channel>,
+        descriptions: &[PreparedOpen],
+    ) -> Result<Handle<Channel>, Status> {
+        let first = descriptions.len().min(proto_fs::CLONE_PORTION);
+        let (clone, birth) = Self::clone_exact_birth_on(channel, &descriptions[..first])?;
+        for portion in descriptions[first..].chunks(proto_fs::CLONE_PORTION) {
+            Self::clone_more_on(channel, birth, portion)?;
+        }
+        Ok(clone)
+    }
+
+    /// CLONE_MORE: the next portion (at most `CLONE_PORTION`) of the descriptions the
+    /// clone of the birth word `birth` takes. The service checks the whole portion
+    /// before the clone changes; a refusal leaves the clone as it was, and the caller
+    /// closes it.
+    pub fn clone_more_on(
+        channel: &Handle<Channel>,
+        birth: u32,
+        descriptions: &[PreparedOpen],
+    ) -> Result<(), Status> {
+        if descriptions.is_empty() || descriptions.len() > proto_fs::CLONE_PORTION {
+            return Err(Status::BadSize);
+        }
+        let mut w = Writer::new();
+        Method::CloneMore.header().write(&mut w)?;
+        w.u32(birth)?;
+        w.u32(descriptions.len() as u32)?;
+        for held in descriptions {
+            w.u32(Self::exact_description_word(*held)?)?;
+            w.u64(held.generation)?;
+        }
+        let reply = Self::send_on_with(channel, w.as_bytes(), true)?;
+        Self::open_reply(&reply, 8)
     }
 
     /// The numeric-reservation phase performs one request before releasing its defer.
@@ -666,7 +720,9 @@ impl Files {
     }
     fn open_description(marked_fd: u32, generation: u64) -> Result<PreparedOpen, Status> {
         let fd = marked_fd & proto_fs::OPEN_FD_MASK;
-        if marked_fd & !proto_fs::OPEN_RESULT_MASK != 0 || !(3..35).contains(&fd) || generation == 0
+        if marked_fd & !proto_fs::OPEN_RESULT_MASK != 0
+            || !proto_fs::is_session_number(fd)
+            || generation == 0
         {
             return Err(Status::BadSize);
         }

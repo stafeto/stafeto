@@ -103,12 +103,13 @@ fn full_root_description_account_refuses_image_before_pin_and_recovers_one_credi
     let mut ram = Ram::with_tree(proto_fs::Timestamp::legacy_ns(0), tree);
     let token = ram.storage.resolve(b"/program").unwrap();
     let entry = ram.storage.node(token).unwrap().boot;
+    // Six sessions of 1 024 numbers take the whole share of the root.
     let mut filled = [Fds {
         root: EXPENSE,
         ..Fds::default()
-    }; 3];
+    }; 6];
     for fds in &mut filled {
-        for _ in 0..32 {
+        for _ in 0..crate::storage::DESCRIPTION_SHARE as usize / 6 {
             ram.open_token(fds, token, proto_fs::READ_ONLY, ADMIN)
                 .unwrap();
         }
@@ -119,17 +120,23 @@ fn full_root_description_account_refuses_image_before_pin_and_recovers_one_credi
     };
     assert_eq!(
         ram.hold_image(&mut image, token, entry),
-        Err(proto_fs::TOO_MANY_OPEN_FILES)
+        Err(proto_fs::TOO_MANY_FILES_IN_SYSTEM)
     );
     assert!(image.image_hold.is_none());
-    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 96);
+    assert_eq!(
+        ram.storage.usage(EXPENSE).descriptions,
+        crate::storage::DESCRIPTION_SHARE
+    );
     assert_eq!(
         ram.storage.node(token).unwrap().pins[Pin::Image as usize],
         0
     );
     ram.close(&mut filled[0], 3).unwrap();
     ram.hold_image(&mut image, token, entry).unwrap();
-    assert_eq!(ram.storage.usage(EXPENSE).descriptions, 96);
+    assert_eq!(
+        ram.storage.usage(EXPENSE).descriptions,
+        crate::storage::DESCRIPTION_SHARE
+    );
     ram.release(&mut image);
     ram.release(&mut image);
     for fds in &mut filled {

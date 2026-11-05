@@ -71,10 +71,12 @@ pub fn build_image() -> Result<PathBuf, String> {
 
 // What both guests carry -------------------------------------------------------
 
-/// The files of the load of the measurement: W1, 1 000 files of 10 KiB under
+/// The files of the load of the measurement: W1, 900 files of 10 KiB under
 /// `/www/s/` (a ladder asks for them in turn), and W2, 64 files of 256 KiB under
 /// `/www/l/`. Their bytes come from fixed seeds, so both guests carry the same.
-pub const W1_FILES: usize = 1000;
+/// 900 files and 64 connections stay under the 1 024 descriptors a process has on both
+/// systems, with the descriptors nginx keeps besides them (stafeto-design#578).
+pub const W1_FILES: usize = 900;
 pub const W1_LEN: usize = 10 * 1024;
 pub const W2_FILES: usize = 64;
 pub const W2_LEN: usize = 256 * 1024;
@@ -122,30 +124,14 @@ pub fn www_files() -> Vec<(&'static str, &'static [u8])> {
     files
 }
 
-/// The files the Mac fetches over HTTP: the four of the first measurements and
-/// the first two and the last two of each set. The guests give the hashes of
-/// every file under `/www` by `openssl` (`read_fingerprints`); the fetch stays
-/// small because nginx of stafeto keeps every file it served open
-/// (`open_file_cache max=1000`) and the RAM service lets a client hold 32
-/// (`OPEN_MAX` of `services/ramfs`): a worker that has served about 30 distinct
-/// files answers 500 to the next.
+/// The files the Mac fetches over HTTP: every file under `/www`. nginx keeps each file it
+/// served open (`open_file_cache max=1000`), and the RAM service lets a client hold 1 056
+/// numbers (`services/ramfs`), so a worker that has served all of W1 holds 900 files and
+/// answers the next request: the fetch is the check that none is refused with
+/// "Too many open files". The guests also give the hashes of every file under `/www`
+/// (`read_fingerprints`).
 pub fn fetched_files() -> Vec<(&'static str, &'static [u8])> {
-    const SAMPLE: [&str; 8] = [
-        "/www/s/0000.bin",
-        "/www/s/0001.bin",
-        "/www/s/0998.bin",
-        "/www/s/0999.bin",
-        "/www/l/00.bin",
-        "/www/l/01.bin",
-        "/www/l/62.bin",
-        "/www/l/63.bin",
-    ];
     www_files()
-        .into_iter()
-        .filter(|(path, _)| {
-            !(path.starts_with("/www/s/") || path.starts_with("/www/l/")) || SAMPLE.contains(path)
-        })
-        .collect()
 }
 
 /// The settings of nginx in both guests.
@@ -1057,12 +1043,15 @@ mod tests {
         let files = www_files();
         let paths: Vec<&str> = files.iter().map(|f| f.0).collect();
         assert_eq!(paths.len(), 4 + W1_FILES + W2_FILES);
-        assert_eq!(fetched_files().len(), 12);
+        // The check takes every file by HTTP: the files fetched are all the files carried.
+        assert_eq!(fetched_files().len(), paths.len());
+        assert_eq!(fetched_files().len(), 4 + 900 + 64);
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted);
         assert!(paths.contains(&"/www/index.html"));
-        assert!(paths.contains(&"/www/s/0999.bin") && paths.contains(&"/www/l/63.bin"));
+        assert!(paths.contains(&"/www/s/0899.bin") && paths.contains(&"/www/l/63.bin"));
+        assert!(!paths.contains(&"/www/s/0900.bin"));
         let length = |path: &str| files.iter().find(|f| f.0 == path).unwrap().1.len();
         assert_eq!(length("/www/s/0000.bin"), W1_LEN);
         assert_eq!(length("/www/l/00.bin"), W2_LEN);

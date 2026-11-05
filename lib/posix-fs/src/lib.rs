@@ -62,7 +62,8 @@ pub enum FsError {
     Again,
     /// A write to a pipe with no reader.
     Broken,
-    /// Every pipe of the service in use.
+    /// Every pipe of the service in use, or every open description of the file service,
+    /// or the share of the client's root of them (ENFILE).
     TooManyInSystem,
     /// A directory with too many links (EMLINK).
     TooManyLinks,
@@ -118,6 +119,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::FILE_SIZE_LIMIT) => Self::FileSizeLimit,
             Status::Unknown(proto_fs::NAME_TOO_LONG) => Self::NameTooLong,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
+            Status::Unknown(proto_fs::TOO_MANY_FILES_IN_SYSTEM) => Self::TooManyInSystem,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
             Status::Unknown(proto_fs::OFFSET_OVERFLOW) => Self::OffsetOverflow,
             Status::Unknown(proto_fs::NO_DATA) => Self::NoData,
@@ -207,8 +209,13 @@ pub const DESCRIPTOR_PAGES: usize = OPEN_MAX / HOLDS_MAX - 1;
 pub const DESCRIPTOR_PAGE_BYTES: usize = 4096;
 /// The descriptors an inherited list names at most (the start area's).
 pub const INHERITED_MAX: usize = 64;
-/// The descriptions of the RAM service one session holds at most.
-pub const RAM_KEPT_MAX: usize = 32;
+/// The descriptions of the RAM service one process holds at most: one for each number
+/// of its table (the service's sessions hold 16 places more for the pins of shared
+/// mappings, `MAP_PINS`).
+pub const RAM_KEPT_MAX: usize = OPEN_MAX;
+/// The descriptions one portion of a clone of the RAM service's session names at most
+/// (`proto_fs::CLONE_PORTION`): the first goes with CLONE_EXACT, the rest with CLONE_MORE.
+pub const RAM_PORTION: usize = proto_fs::CLONE_PORTION;
 /// The descriptions of the terminal service one process keeps across a fork
 /// at most: all the terminal service has.
 pub const TTY_KEPT_MAX: usize = proto_tty::DESCRIPTIONS_MAX;
@@ -218,10 +225,44 @@ pub const NETS_PORTION: usize = proto_net::sockets::CLONE_MAX;
 /// The shared mappings of files a process pins besides its descriptors
 /// (`pin_for_map`).
 pub use posix_fd::{MAP_PINS, PinRef};
-/// The descriptions a forked child of the process can share at most: those
-/// of its descriptors and its pins. A file service session holds fewer
-/// (the RAM service's 32 places), so the list is never full.
-pub const KEPT_BY_FORK_MAX: usize = RAM_KEPT_MAX + MAP_PINS;
+/// Where a walk over the descriptions a fork keeps stands between its portions, and
+/// the numbers of the service's session it named already.
+pub struct RamKept {
+    seen: [u64; proto_fs::SESSION_PLACES.div_ceil(64)],
+    /// The first descriptor the walk looks at next.
+    start: u32,
+    /// The walk is past the descriptors, among the pins from `pin` on.
+    pins: bool,
+    pin: usize,
+}
+impl RamKept {
+    pub const fn new() -> Self {
+        Self {
+            seen: [0; proto_fs::SESSION_PLACES.div_ceil(64)],
+            start: 0,
+            pins: false,
+            pin: 0,
+        }
+    }
+    fn place(number: u32) -> usize {
+        number.wrapping_sub(proto_fs::SESSION_FIRST) as usize
+    }
+    fn seen(&self, number: u32) -> bool {
+        let place = Self::place(number);
+        self.seen
+            .get(place / 64)
+            .is_none_or(|word| word & (1 << (place % 64)) != 0)
+    }
+    fn mark(&mut self, number: u32) {
+        let place = Self::place(number);
+        self.seen[place / 64] |= 1 << (place % 64);
+    }
+}
+impl Default for RamKept {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 /// The longest current directory, in bytes.
 pub const MAX_CWD: usize = MAX_PATH;
 
@@ -1332,31 +1373,61 @@ impl PosixFs {
         self.descriptors.set_allocation_limit(limit);
     }
 
-    pub fn kept_by_fork(
+    /// The service's descriptions a forked child's session shares with its parent's,
+    /// those of the descriptors without FD_CLOFORK and of the pins of shared mappings,
+    /// each once, a portion at a time: up to `RAM_PORTION` into `out` from where `cursor`
+    /// stands, with how many and whether another portion follows. The first portion
+    /// goes with CLONE_EXACT and the rest with CLONE_MORE. A description that two
+    /// descriptors name through one number of the session (`dup`) is named once, in the
+    /// first portion that reaches it, whatever portion the other descriptor lies in.
+    pub fn kept_by_fork_from(
         &self,
-        out: &mut [rt::fs::PreparedOpen; KEPT_BY_FORK_MAX],
-    ) -> Result<usize, FsError> {
+        cursor: &mut RamKept,
+        out: &mut [rt::fs::PreparedOpen; RAM_PORTION],
+    ) -> Result<(usize, bool), FsError> {
         let mut count = 0;
-        for (_, target, flags) in self.descriptors.open() {
-            if let Some(n) = target.ram_target()
-                && !flags.close_on_fork
-                && !out[..count].contains(&n.prepared())
-            {
-                *out.get_mut(count).ok_or(FsError::TooManyOpenFiles)? = n.prepared();
+        if !cursor.pins {
+            for (fd, target, flags) in self.descriptors.open() {
+                if fd < cursor.start || flags.close_on_fork {
+                    continue;
+                }
+                let Some(n) = target.ram_target() else {
+                    continue;
+                };
+                if cursor.seen(n.fd()) {
+                    continue;
+                }
+                if count == out.len() {
+                    cursor.start = fd;
+                    return Ok((count, true));
+                }
+                cursor.mark(n.fd());
+                out[count] = n.prepared();
                 count += 1;
             }
+            cursor.pins = true;
         }
         // The pins of shared mappings go with the memory, whatever the
         // flags of the descriptors that named them.
-        for target in self.descriptors.pinned_all() {
-            if let Some(n) = target.ram_target()
-                && !out[..count].contains(&n.prepared())
-            {
-                *out.get_mut(count).ok_or(FsError::TooManyOpenFiles)? = n.prepared();
-                count += 1;
+        for (place, target) in self.descriptors.pinned_all().enumerate() {
+            if place < cursor.pin {
+                continue;
             }
+            let Some(n) = target.ram_target() else {
+                continue;
+            };
+            if cursor.seen(n.fd()) {
+                continue;
+            }
+            if count == out.len() {
+                cursor.pin = place;
+                return Ok((count, true));
+            }
+            cursor.mark(n.fd());
+            out[count] = n.prepared();
+            count += 1;
         }
-        Ok(count)
+        Ok((count, false))
     }
 
     /// A reference to the pin of the shared mapping of the file `key`, kept
@@ -1868,6 +1939,128 @@ impl PosixFs {
         out: &mut [u8],
     ) -> Result<Option<DirEntry>, FsError> {
         self.transport().readdir(self.target(dir.fd)?, out)
+    }
+}
+
+#[cfg(test)]
+mod ram_tests {
+    use super::*;
+    use core::mem::ManuallyDrop;
+    use rt::{
+        fs::{Files, PreparedOpen},
+        handle::{Channel, Handle},
+    };
+
+    fn fresh() -> ManuallyDrop<PosixFs> {
+        let mut files = ManuallyDrop::new(
+            PosixFs::from_files(Files::from_sessions(
+                Handle::<Channel>::from_raw(rt::abi::Handle::new(7, 9)),
+                None,
+            ))
+            .unwrap(),
+        );
+        for k in 0..DESCRIPTOR_PAGES {
+            let page = std::boxed::Box::leak(std::boxed::Box::new([0u8; 8192]));
+            let aligned = (page.as_mut_ptr() as usize).next_multiple_of(4096) as *mut u8;
+            // SAFETY: 4096 aligned bytes inside the leaked allocation.
+            assert!(unsafe { files.add_page(k, core::ptr::NonNull::new(aligned).unwrap()) });
+        }
+        files
+    }
+
+    /// The number `n` of the service's session (3 and up) with the description slot `n`.
+    fn ram(n: u32) -> Target {
+        Target::Ram(
+            RamTarget::from_prepared(PreparedOpen {
+                fd: n,
+                slot: n,
+                generation: 1,
+                random: false,
+            })
+            .unwrap()
+            .with_kind(FileKind::Regular),
+        )
+    }
+
+    /// The two codes of a full table reach the layer apart: the session's own numbers are
+    /// EMFILE, the service's descriptions and the root's share of them are ENFILE.
+    #[test]
+    fn the_codes_of_a_full_session_and_of_a_full_service_are_apart() {
+        assert_eq!(
+            FsError::from(Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES)),
+            FsError::TooManyOpenFiles
+        );
+        assert_eq!(
+            FsError::from(Status::Unknown(proto_fs::TOO_MANY_FILES_IN_SYSTEM)),
+            FsError::TooManyInSystem
+        );
+    }
+
+    /// A process with hundreds of files names their descriptions in portions of
+    /// `RAM_PORTION`, each number once, those of descriptors with FD_CLOFORK not at all,
+    /// and the pins of shared mappings in the last portion.
+    #[test]
+    fn the_files_a_fork_keeps_come_in_portions_each_number_once() {
+        let mut files = fresh();
+        let both = DescriptorFlags::default();
+        let skipped = DescriptorFlags {
+            close_on_exec: false,
+            close_on_fork: true,
+        };
+        // 900 numbers, 60 of them held by two descriptors, 30 more with FD_CLOFORK.
+        for n in 3..903 {
+            files.insert(ram(n), both).unwrap();
+        }
+        for n in 3..63 {
+            files.insert(ram(n), both).unwrap();
+        }
+        for n in 903..933 {
+            files.insert(ram(n), skipped).unwrap();
+        }
+        let mut cursor = RamKept::new();
+        let mut seen = std::vec::Vec::new();
+        let mut portions = 0;
+        loop {
+            let mut kept = [PreparedOpen {
+                fd: 0,
+                slot: 0,
+                generation: 0,
+                random: false,
+            }; RAM_PORTION];
+            let (count, more) = files.kept_by_fork_from(&mut cursor, &mut kept).unwrap();
+            assert!(count <= RAM_PORTION);
+            assert!(
+                !more || count == RAM_PORTION,
+                "a portion that is not full is the last"
+            );
+            seen.extend(kept[..count].iter().map(|held| held.fd));
+            portions += 1;
+            if !more {
+                break;
+            }
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "each number once, across the portions"
+        );
+        assert_eq!(sorted, (3..903).collect::<std::vec::Vec<_>>());
+        assert_eq!(portions, 900usize.div_ceil(RAM_PORTION));
+        // No file: one empty portion and no other.
+        let empty = fresh();
+        let mut kept = [PreparedOpen {
+            fd: 0,
+            slot: 0,
+            generation: 0,
+            random: false,
+        }; RAM_PORTION];
+        assert_eq!(
+            empty.kept_by_fork_from(&mut RamKept::new(), &mut kept),
+            Ok((0, false))
+        );
     }
 }
 

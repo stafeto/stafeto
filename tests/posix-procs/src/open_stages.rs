@@ -101,14 +101,14 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
         }
     }
     reply.len = 16;
-    for (fd, generation) in [(2u32, 1), (35, 1), (3, 0)] {
+    for (fd, generation) in [(2u32, 1), (1059, 1), (3, 0)] {
         reply.words[0] = (fd as u64) << 32;
         reply.words[1] = generation;
         if Files::open_commit_reply(&reply) != Err(Status::BadSize) {
             return Err(68);
         }
     }
-    for fd in [3u32, 32, 34] {
+    for fd in [3u32, 32, 34, 35, 1058] {
         reply.words[0] = (fd as u64) << 32;
         reply.words[1] = 1;
         if Files::open_commit_reply(&reply)
@@ -125,7 +125,7 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     // Corrupt accepted success replies retain ambiguous recovery semantics.
     for marked in [
         proto_fs::OPEN_RANDOM | 3,
-        proto_fs::OPEN_RANDOM | 34 | (127 << proto_fs::OPEN_DESCRIPTION_SHIFT),
+        proto_fs::OPEN_RANDOM | 1058 | (8191 << proto_fs::OPEN_DESCRIPTION_SHIFT),
     ] {
         reply.len = 16;
         reply.words[0] = (marked as u64) << 32;
@@ -150,11 +150,11 @@ fn start_recovery(files: &Files) -> Result<(), i32> {
     }
     for marked in [
         proto_fs::OPEN_RANDOM | 2,
-        proto_fs::OPEN_RANDOM | 35,
+        proto_fs::OPEN_RANDOM | 1059,
         (1u32 << 30) | 3,
-        (1u32 << 6) | 3,
-        (1u32 << 7) | 3,
-        (1u32 << 15) | 3,
+        (1u32 << 24) | 3,
+        (1u32 << 25) | 3,
+        (1u32 << 27) | 3,
     ] {
         reply.len = 16;
         reply.words[0] = (marked as u64) << 32;
@@ -731,7 +731,7 @@ fn finish_recovery(files: &Files) -> Result<(), i32> {
         (16, 5, 0, held.fd, 0, held.generation),
         (32, 5, id, held.fd, 0, held.generation),
         (32, 5, 0, held.fd, 1, held.generation),
-        (32, 5, 0, 35, 0, held.generation),
+        (32, 5, 0, 1059, 0, held.generation),
         (32, 5, 0, held.fd, 0, 0),
         (32, 0, 0, held.fd, 0, held.generation),
     ] {
