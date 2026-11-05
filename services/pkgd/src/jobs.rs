@@ -106,6 +106,10 @@ impl Worker {
     }
 
     fn run_job(&mut self) {
+        // A group the main thread cancelled goes before the job that may have been given after it.
+        if CANCEL.swap(false, AcqRel) {
+            self.drop_group();
+        }
         JOB_STATE.store(RUNNING, Release);
         // SAFETY: the main thread gives no other job and writes none while the state is not IDLE.
         let job = unsafe { &*JOB.get() };
