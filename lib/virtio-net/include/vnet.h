@@ -43,6 +43,10 @@ void vnet_rx_return(uint32_t buf);
 uint32_t vnet_buf_take(void);
 void *vnet_buf_ptr(uint32_t buf);
 
+/* How many buffers the pool holds free (those in the queues and in the
+ * program's hands are not among them). */
+uint32_t vnet_buf_free(void);
+
 /* The frame of len bytes in buf into the queue of sending, without the
  * doorbell: 0, or -1 (the queue is full; the buffer stays the program's).
  * The doorbell, and the buffers the device sent back to the pool (their

@@ -85,7 +85,7 @@ pub fn programs(steps: bool) -> &'static [ImageProgram] {
 
 /// Waits for a line with each of `wanted`, in any order (two programs
 /// write to the one serial port).
-fn expect_all(run: &mut qemu::Run, wanted: &[&str], within: Duration) -> Result<(), String> {
+pub(crate) fn expect_all(run: &mut qemu::Run, wanted: &[&str], within: Duration) -> Result<(), String> {
     let mut left: Vec<&str> = wanted.to_vec();
     let end = Instant::now() + within;
     while !left.is_empty() {
@@ -94,6 +94,7 @@ fn expect_all(run: &mut qemu::Run, wanted: &[&str], within: Duration) -> Result<
             |l| {
                 left.iter().any(|w| l.contains(w))
                     || (l.contains("fast-echo:") && l.contains("failed"))
+                    || l.contains("fstack-probe: check failed")
             },
             end.saturating_duration_since(Instant::now()),
         )?;
@@ -107,7 +108,7 @@ fn expect_all(run: &mut qemu::Run, wanted: &[&str], within: Duration) -> Result<
 
 /// `count` datagrams of `size` bytes through the forwarded port, each
 /// back byte for byte: the datagrams sent again after a timeout.
-fn echoes(socket: &UdpSocket, count: usize, size: usize) -> Result<usize, String> {
+pub(crate) fn echoes(socket: &UdpSocket, count: usize, size: usize) -> Result<usize, String> {
     let mut again = 0;
     let mut got = vec![0u8; 2048];
     for n in 0..count {
@@ -323,7 +324,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
 
 /// The longest step of each kind, judged against the bound; the steps of
 /// CLAIM, CLAIM_MORE and KICK must be among them.
-fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
+pub(crate) fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     let rows = net_probe::longest_over_starts(lines);
     for (kind, name) in [
         (CLAIM_KIND, "CLAIM"),

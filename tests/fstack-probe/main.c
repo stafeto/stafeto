@@ -560,6 +560,9 @@ on_fault(int sig, siginfo_t *info, void *context)
     _exit(1);
 }
 
+/* The stack on the second network device (device.c). */
+int fstack_device_main(int argc, char **argv);
+
 int
 main(int argc, char **argv)
 {
@@ -576,6 +579,8 @@ main(int argc, char **argv)
     sigaction(SIGILL, &fault, NULL);
     if (argc > 1)
         role = argv[1];
+    if (strcmp(role, "device") == 0)
+        return fstack_device_main(argc, argv);
     started = now_ms();
     if (ff_init(3, args) != 0) {
         printf("fstack-probe: check failed: ff_init\n");

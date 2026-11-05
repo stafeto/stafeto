@@ -344,6 +344,26 @@
      return (rc);
  
  kern_fail:
+--- a/lib/ff_veth.c
++++ b/lib/ff_veth.c
+@@ -1025,10 +1025,17 @@
+             printf("%s: ff_veth_setaddr failed\n", sc->host_ifname);
+         }
+ 
++#ifdef FF_STAFETO
++        /* An interface with no gateway has no default route. */
++        if (sc->gateway != 0) {
++#endif
+         ret = ff_veth_set_gateway(sc, RT_DEFAULT_FIB);
+         if (ret != 0) {
+             printf("%s: ff_veth_set_gateway failed\n", sc->host_ifname);
+         }
++#ifdef FF_STAFETO
++        }
++#endif
+ 
+         if (sc->nb_vip) {
+             ret = ff_veth_setvaddr(sc, cfg, NULL);
 --- a/lib/include/amd64/include/pcpu.h
 +++ b/lib/include/amd64/include/pcpu.h
 @@ -55,7 +55,12 @@

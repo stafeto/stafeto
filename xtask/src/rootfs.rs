@@ -1279,6 +1279,19 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files.push(file("/bin/fast-echo", 0o755, ROOT, "fast-echo"));
             files
         }
+        // The shell with both network devices, `handover 1` and the fixed
+        // address of the second, and the probe of the stack on it.
+        "boot-fstack-device.img" | "boot-fstack-device-steps.img" => {
+            let mut files = net_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", crate::fstack_device::NETD_CONF),
+            ));
+            files.push(file("/bin/fstack-probe", 0o755, ROOT, "fstack-probe"));
+            files
+        }
         "boot-net-probe-static.img" => vec![of(
             "/etc/netd.conf",
             0o644,

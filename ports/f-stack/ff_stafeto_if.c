@@ -3,24 +3,37 @@
  * Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
  *
  * The host layer of F-Stack on stafeto, in place of ff_dpdk_if.c: what the
- * FreeBSD stack expects of DPDK. This first stage has no network device:
- * the stack runs on its loopback interface alone.
+ * FreeBSD stack expects of DPDK.
  *
  * - Memory: the stack takes its memory through ff_mmap and ff_malloc
- *   (ff_host_interface.c), anonymous memory of the process.
- * - Frames: an interface without a device drops what it is given to send
- *   and counts it; no frame is ever received.
+ *   (ff_host_interface.c), anonymous memory of the process. The frames of
+ *   the device lie in the four objects of 4 MiB of the claim.
+ * - Frames: with a claim (ff_stafeto_attach) the stack has the second
+ *   network device as its interface, driven with libvirtio_net.a. Frames
+ *   come in without a copy while the pool holds FF_STAFETO_RX_LOW free
+ *   buffers (the mbuf's storage is the buffer, which goes back to the pool
+ *   when the stack frees the mbuf) and with one copy below that; a frame
+ *   goes out with one copy into a buffer of the pool. A DHCP message from
+ *   the server (UDP 67 to 68) goes to the network service through the
+ *   bypass ring, and so does a copy of every ARP reply for the stack's
+ *   address; the frames the service puts in the ring go out on the wire.
+ *   Without a claim an interface drops what it is given to send and counts
+ *   it, and no frame is received: the stack has its loopback alone.
  * - Time: ff_get_tsc_ns reads CLOCK_MONOTONIC (the C library reads the
  *   counter of the core without a call to the kernel), and a pass of the
  *   loop runs ff_hardclock once per 1/hz that has passed, at most
  *   FF_STAFETO_MAX_TICKS in one pass.
  * - The loop: ff_stafeto_pass is one step of the stack (clock ticks, the
- *   queued work of the stack's software interrupts, which delivers the
- *   loopback's packets); ff_run calls it, then the program's function,
- *   and sleeps until the next tick when neither found anything to do (the
- *   function returns more than 0 when it did work) and no work is queued.
+ *   frames of the device, the queued work of the stack's software
+ *   interrupts, the frames to send); ff_run calls it, then the program's
+ *   function, and ff_stafeto_sleep when neither found anything to do.
+ *   Under load the device's interrupts stay off. Idle, they go on, the
+ *   queue is looked at once more, and the thread waits on the network
+ *   service's notification for at most the time to the next tick (10 ms at
+ *   hz 100).
  * - Settings: ff_load_config reads the file (the [dpdk] section only for
- *   its form); no port is attached.
+ *   its form); the interface of the device takes its address, mask,
+ *   gateway and MAC from the claim, with no [port0] section.
  */
 
 #include <errno.h>
@@ -30,16 +43,32 @@
 #include <string.h>
 #include <time.h>
 
+#include <stafeto/fast.h>
+#include <vnet.h>
+
 #include "ff_api.h"
 #include "ff_config.h"
 #include "ff_dpdk_if.h"
 #include "ff_host_interface.h"
+#include "ff_stafeto.h"
 #include "ff_stafeto_rte.h"
 #include "ff_veth.h"
 
 /* At most this many clock ticks in one pass, when the loop was late. */
 #define FF_STAFETO_MAX_TICKS 10
 #define NSEC_PER_SEC 1000000000ULL
+/* Frames taken from the queue of receiving, and frames put in the queue
+ * of sending before the doorbell, in one pass. */
+#define FF_STAFETO_RX_BURST 32
+#define FF_STAFETO_TX_BATCH 32
+/* Frames come in without a copy while the pool holds this many free
+ * buffers or more: the stack keeps a buffer as long as its data lies in a
+ * socket's queue, and an empty queue of receiving drops frames silently. */
+#define FF_STAFETO_RX_LOW 1024
+/* The longest frame of the wire the interface takes: header and MTU. */
+#define FF_STAFETO_FRAME_MAX 1514
+#define FF_STAFETO_FRAME_MIN 60
+#define BYPASS_KICK_MAX 16
 
 extern void ff_hardclock(void);
 /* The workstreams of the stack's software interrupts that had work
@@ -60,6 +89,18 @@ uint32_t ff_stafeto_log_levels[FF_STAFETO_LOG_TYPES] = {
 static uint64_t tx_dropped;
 static uint64_t ticks_done;
 static uint64_t passes;
+
+/* The device: the claim, the interface the stack made of it, what the
+ * network service told, the frames put in the queue of sending since the
+ * doorbell, and the frames put in the bypass ring since the last kick. */
+static struct stafeto_fast_claim dev_claim;
+static int dev_on;
+static int dev_lost;
+static struct ff_dpdk_if_context *dev_ctx;
+static uint32_t notified;
+static int tx_batch;
+static int bypass_batch;
+static struct ff_stafeto_device_stats stats;
 
 /* The clock of the stack: the time of the next tick and its period. */
 static uint64_t next_tick_ns;
@@ -88,6 +129,102 @@ ff_cur_proc_id(void)
     return 0;
 }
 
+#define ETH 14
+
+static inline uint64_t
+counter(void)
+{
+    uint64_t v;
+
+    __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v) : : "memory");
+    return v;
+}
+
+static inline uint16_t
+be16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] << 8 | p[1]);
+}
+
+static int
+same(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    return memcmp(a, b, n) == 0;
+}
+
+/* The IPv4 header of a frame: its length, or 0 when the frame holds no
+ * whole, unfragmented IPv4 datagram. */
+static unsigned
+ipv4(const uint8_t *f, uint32_t len)
+{
+    unsigned header, total;
+
+    if (len < ETH + 20 || f[12] != 0x08 || f[13] != 0x00 || f[14] >> 4 != 4)
+        return 0;
+    header = (f[14] & 0x0f) * 4u;
+    total = be16(f + ETH + 2);
+    if (header < 20 || total < header || ETH + total > len ||
+        (be16(f + ETH + 6) & 0x3fff) != 0)
+        return 0;
+    return header;
+}
+
+int
+ff_stafeto_attach(const struct stafeto_fast_claim *claim)
+{
+    if (dev_on || claim == NULL)
+        return -1;
+    dev_claim = *claim;
+    dev_on = 1;
+    return 0;
+}
+
+int
+ff_stafeto_device_lost(void)
+{
+    return dev_lost;
+}
+
+void
+ff_stafeto_absorb(uint32_t bits)
+{
+    if (bits == 0)
+        return;
+    __atomic_fetch_or(&notified, bits, __ATOMIC_RELAXED);
+    stats.notifications++;
+}
+
+/* What the network service told since the last look: its end or the
+ * device's loss, and a new address (a lease; the stack keeps its own). */
+static void
+take_notifications(void)
+{
+    uint32_t bits;
+
+    if (__atomic_load_n(&notified, __ATOMIC_RELAXED) == 0)
+        return;
+    bits = __atomic_exchange_n(&notified, 0, __ATOMIC_RELAXED);
+    if ((bits & STAFETO_FAST_GONE) && vnet_lost())
+        dev_lost = 1;
+    if (bits & STAFETO_FAST_ADDRESS) {
+        struct stafeto_fast_config c;
+
+        if (stafeto_fast_config(&c) == 0)
+            fprintf(stderr, "f-stack: the service says the address is now %u.%u.%u.%u/%u\n",
+                c.address[0], c.address[1], c.address[2], c.address[3], c.prefix);
+    }
+}
+
+/* One look at the service's channel, without waiting. */
+static void
+look_at_channel(void)
+{
+    uint32_t bits = 0;
+
+    if (stafeto_fast_wait(0, &bits) == 0)
+        ff_stafeto_absorb(bits);
+}
+
 int
 ff_dpdk_init(int argc, char **argv)
 {
@@ -99,15 +236,66 @@ ff_dpdk_init(int argc, char **argv)
         return -1;
     }
     tick_ns = NSEC_PER_SEC / (uint64_t)ff_global_cfg.freebsd.hz;
+    if (dev_on) {
+        int opened = vnet_open(&dev_claim);
+
+        if (opened != 0) {
+            fprintf(stderr, "f-stack: vnet_open failed %d\n", opened);
+            return -1;
+        }
+        {
+            uint64_t frequency;
+
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+            stats.ticks_per_second = frequency;
+        }
+        stats.free_low = vnet_buf_free();
+    }
     return 0;
+}
+
+static void
+dotted(char *out, uint32_t a)
+{
+    snprintf(out, 16, "%u.%u.%u.%u", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
 }
 
 int
 ff_dpdk_if_up(void)
 {
-    /* No device: the loopback interface of the stack is the only one. */
     next_tick_ns = ff_get_tsc_ns() + tick_ns;
     ff_update_current_ts();
+    if (dev_on) {
+        /* The interface of the device: the address, mask, broadcast and
+         * gateway of the claim as the strings F-Stack's attach reads. A
+         * checksum is the stack's to make and to check (no feature of the
+         * device is negotiated). */
+        const struct stafeto_fast_config *c = &dev_claim.config;
+        struct ff_port_cfg cfg;
+        char addr[16], mask[16], bcast[16], gateway[16];
+        uint32_t a = (uint32_t)c->address[0] << 24 | (uint32_t)c->address[1] << 16 |
+            (uint32_t)c->address[2] << 8 | c->address[3];
+        uint32_t g = (uint32_t)c->gateway[0] << 24 | (uint32_t)c->gateway[1] << 16 |
+            (uint32_t)c->gateway[2] << 8 | c->gateway[3];
+        uint32_t m = c->prefix == 0 ? 0 : ~0u << (32 - c->prefix);
+
+        dotted(addr, a);
+        dotted(mask, m);
+        dotted(bcast, a | ~m);
+        dotted(gateway, g);
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.port_id = 0;
+        memcpy(cfg.mac, c->mac, 6);
+        cfg.addr = addr;
+        cfg.netmask = mask;
+        cfg.broadcast = bcast;
+        cfg.gateway = gateway;
+        dev_ctx = ff_veth_attach(&cfg);
+        if (dev_ctx == NULL) {
+            fprintf(stderr, "f-stack: the interface of the device did not attach\n");
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -122,6 +310,9 @@ ff_dpdk_register_if(void *sc, void *ifp, struct ff_port_cfg *cfg)
     ctx->ifp = ifp;
     ctx->port_id = cfg->port_id;
     ctx->mtu = cfg->mtu;
+    /* The stack sends (the announcement of the address) while it attaches. */
+    if (dev_on && dev_ctx == NULL)
+        dev_ctx = ctx;
     return ctx;
 }
 
@@ -145,35 +336,280 @@ ff_dpdk_if_set_mtu(struct ff_dpdk_if_context *ctx, uint16_t mtu)
     return 0;
 }
 
-int
-ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
+/* The doorbell of the queue of sending, when frames went in since the last. */
+static void
+tx_flush(void)
 {
-    (void)ctx;
-    (void)total;
-    /* No device to send on: the frame is dropped and counted. */
-    tx_dropped++;
-    ff_mbuf_free(m);
+    if (tx_batch > 0) {
+        vnet_tx_kick();
+        stats.kicks++;
+        tx_batch = 0;
+    }
+}
+
+/* A frame of `len` bytes, already in buffer `buf` at vnet_buf_ptr, to the
+ * queue of sending (padded to the shortest frame of the wire). */
+static int
+tx_queue(uint32_t buf, uint32_t len)
+{
+    uint8_t *to = vnet_buf_ptr(buf);
+
+    if (len < FF_STAFETO_FRAME_MIN) {
+        memset(to + len, 0, FF_STAFETO_FRAME_MIN - len);
+        len = FF_STAFETO_FRAME_MIN;
+    }
+    if (vnet_tx(buf, (uint16_t)len) != 0) {
+        /* Full: the device may have taken frames since. */
+        tx_flush();
+        vnet_tx_reclaim();
+        if (vnet_tx(buf, (uint16_t)len) != 0) {
+            vnet_rx_return(buf);
+            stats.tx_full++;
+            return -1;
+        }
+    }
+    stats.tx_frames++;
+    if (++tx_batch >= FF_STAFETO_TX_BATCH)
+        tx_flush();
     return 0;
 }
 
+/* The frame of the stack (a chain of mbufs) is copied once into a buffer
+ * of the pool, and the mbufs are freed. */
+int
+ff_dpdk_if_send(struct ff_dpdk_if_context *ctx, void *m, int total)
+{
+    uint64_t began;
+    uint32_t buf;
+    uint8_t *to;
+    void *cur;
+    int off = 0, sent;
+
+    if (!dev_on || ctx != dev_ctx || dev_lost) {
+        /* No device to send on: the frame is dropped and counted. */
+        tx_dropped++;
+        ff_mbuf_free(m);
+        return dev_on ? -1 : 0;
+    }
+    began = counter();
+    if (total <= 0 || total > FF_STAFETO_FRAME_MAX) {
+        stats.tx_long++;
+        ff_mbuf_free(m);
+        return -1;
+    }
+    buf = vnet_buf_take();
+    if (buf == VNET_NONE) {
+        stats.tx_no_buffer++;
+        ff_mbuf_free(m);
+        return -1;
+    }
+    to = vnet_buf_ptr(buf);
+    cur = m;
+    while (cur != NULL && off < total) {
+        void *data;
+        unsigned len;
+
+        ff_next_mbuf(&cur, &data, &len);
+        if (len > (unsigned)(total - off))
+            len = (unsigned)(total - off);
+        vnet_copy(to + off, data, len);
+        off += (int)len;
+    }
+    ff_mbuf_free(m);
+    sent = tx_queue(buf, (uint32_t)off);
+    stats.tx_send_ticks += counter() - began;
+    return sent;
+}
+
+/* A buffer of the pool, or a block of the copy path, is free: the tag in
+ * the mbuf's argument tells which (the low bit is set for a buffer, whose
+ * number is in the rest). */
 void
 ff_dpdk_pktmbuf_free(void *m)
 {
-    /* Only frames of a device are external buffers of the stack's mbufs. */
-    (void)m;
+    if ((uintptr_t)m & 1)
+        vnet_rx_return((uint32_t)((uintptr_t)m >> 1));
+    else
+        free(m);
+}
+
+/* A frame for the network service through the bypass ring. */
+static void
+bypass_push(const uint8_t *f, uint32_t len)
+{
+    if (vnet_bypass_push(f, len)) {
+        stats.rx_bypass++;
+        bypass_batch++;
+    } else {
+        stats.rx_bypass_full++;
+    }
+}
+
+/* Tells the service how many frames wait in the ring (at most 16 a time). */
+static void
+bypass_kick(void)
+{
+    while (bypass_batch > 0) {
+        int n = bypass_batch > BYPASS_KICK_MAX ? BYPASS_KICK_MAX : bypass_batch;
+
+        (void)stafeto_fast_kick((uint32_t)n);
+        bypass_batch -= n;
+    }
+}
+
+/* What the service's interface of the device may get from the wire: a
+ * server's DHCP message (UDP from 67 to 68). */
+static int
+dhcp_for_service(const uint8_t *f, unsigned header)
+{
+    return header != 0 && f[ETH + 9] == 17 && be16(f + ETH + header) == 67 &&
+        be16(f + ETH + header + 2) == 68;
+}
+
+/* An ARP reply for the address of the interface: the service's interface
+ * asks for the gateway's hardware address too, and the stack needs the
+ * reply as well, so it goes to both. */
+static int
+arp_reply_for_us(const uint8_t *f, uint32_t len)
+{
+    return len >= 42 && f[12] == 0x08 && f[13] == 0x06 && f[ETH + 7] == 2 &&
+        same(f + 38, dev_claim.config.address, 4);
+}
+
+/* One received frame, in the buffer `b`: to the service, to the stack
+ * without a copy while the pool is full enough, or to the stack with one
+ * copy. The buffer is the stack's until its mbuf is freed, or the pool's
+ * at once. */
+static void
+rx_one(const struct vnet_buf *b)
+{
+    const uint8_t *f = b->frame;
+    uint32_t len = b->len;
+    uint64_t began, handed;
+    void *hdr;
+
+    stats.rx_frames++;
+    if (len < ETH || len > FF_STAFETO_FRAME_MAX + 4) {
+        vnet_rx_return(b->buf);
+        return;
+    }
+    began = counter();
+    if (dhcp_for_service(f, ipv4(f, len))) {
+        bypass_push(f, len);
+        vnet_rx_return(b->buf);
+        return;
+    }
+    if (arp_reply_for_us(f, len))
+        bypass_push(f, len);
+    if (vnet_buf_free() >= FF_STAFETO_RX_LOW) {
+        hdr = ff_mbuf_gethdr((void *)(((uintptr_t)b->buf << 1) | 1), (uint16_t)len,
+            (void *)f, (uint16_t)len, 0);
+        if (hdr == NULL) {
+            stats.rx_no_mbuf++;
+            vnet_rx_return(b->buf);
+            return;
+        }
+        stats.rx_zero_copy++;
+    } else {
+        void *block = malloc(len);
+
+        if (block == NULL) {
+            stats.rx_no_mbuf++;
+            vnet_rx_return(b->buf);
+            return;
+        }
+        vnet_copy(block, f, len);
+        vnet_rx_return(b->buf);
+        hdr = ff_mbuf_gethdr(block, (uint16_t)len, block, (uint16_t)len, 0);
+        if (hdr == NULL) {
+            stats.rx_no_mbuf++;
+            free(block);
+            return;
+        }
+        stats.rx_copied++;
+    }
+    handed = counter();
+    stats.rx_layer_ticks += handed - began;
+    ff_veth_process_packet(dev_ctx->ifp, hdr);
+    stats.rx_input_ticks += counter() - handed;
+}
+
+/* Up to a burst of frames from the queue of receiving. The number taken. */
+static int
+rx_pass(void)
+{
+    struct vnet_buf got[FF_STAFETO_RX_BURST];
+    uint32_t free_now;
+    int n, i;
+
+    n = vnet_rx_burst(got, FF_STAFETO_RX_BURST);
+    if (n < 0) {
+        /* The device broke the protocol of the queue: no more use of it. */
+        fprintf(stderr, "f-stack: the device broke the protocol of its queue\n");
+        dev_lost = 1;
+        return 0;
+    }
+    for (i = 0; i < n; i++)
+        rx_one(&got[i]);
+    free_now = vnet_buf_free();
+    if (free_now < stats.free_low)
+        stats.free_low = free_now;
+    if (bypass_batch > 0)
+        bypass_kick();
+    return n;
+}
+
+/* The frames the service put in the bypass ring go to the wire once they
+ * look like what its interface may send: from the device's MAC, ARP or a
+ * client's DHCP message (UDP from 68 to 67). */
+static void
+from_service(void)
+{
+    uint8_t f[FF_STAFETO_FRAME_MAX];
+    size_t len;
+
+    while ((len = vnet_bypass_pop(f, sizeof(f))) != 0) {
+        unsigned header;
+        int arp, dhcp;
+        uint32_t buf;
+
+        if (len < ETH || !same(f + 6, dev_claim.config.mac, 6)) {
+            stats.tx_foreign++;
+            continue;
+        }
+        header = ipv4(f, (uint32_t)len);
+        arp = f[12] == 0x08 && f[13] == 0x06;
+        dhcp = header != 0 && f[ETH + 9] == 17 && be16(f + ETH + header) == 68 &&
+            be16(f + ETH + header + 2) == 67;
+        if (!arp && !dhcp) {
+            stats.tx_foreign++;
+            continue;
+        }
+        buf = vnet_buf_take();
+        if (buf == VNET_NONE) {
+            stats.tx_no_buffer++;
+            continue;
+        }
+        vnet_copy(vnet_buf_ptr(buf), f, len);
+        if (tx_queue(buf, (uint32_t)len) == 0)
+            stats.tx_bypass++;
+    }
 }
 
 /*
- * One step of the stack: the clock ticks that are due, then the queued
- * work of the software interrupts. Returns the units of work done (the
- * workstreams that had work), 0 when the step found the stack idle.
+ * One step of the stack: the clock ticks that are due, the device's frames
+ * (the sent buffers back to the pool, the service's frames to the wire,
+ * the received frames to the stack), then the queued work of the software
+ * interrupts and the doorbell of the frames that work sent. Returns the
+ * units of work done (the frames received and the workstreams that had
+ * work), 0 when the step found the stack idle.
  */
 int
 ff_stafeto_pass(void)
 {
     unsigned long runs = ff_stafeto_netisr_runs;
     uint64_t now = ff_get_tsc_ns();
-    int ticks = 0;
+    int ticks = 0, received = 0;
 
     passes++;
     while (now >= next_tick_ns && ticks < FF_STAFETO_MAX_TICKS) {
@@ -186,8 +622,22 @@ ff_stafeto_pass(void)
     if (now >= next_tick_ns)
         next_tick_ns = now + tick_ns;
     ticks_done += (uint64_t)ticks;
+    if (dev_on && !dev_lost) {
+        /* Once per clock tick a look at the service's channel: its end
+         * must reach a stack that never sleeps. */
+        if (ticks > 0)
+            look_at_channel();
+        take_notifications();
+        if (!dev_lost) {
+            vnet_tx_reclaim();
+            from_service();
+            received = rx_pass();
+        }
+    }
     ff_swi_net_excute();
-    return (int)(ff_stafeto_netisr_runs - runs);
+    if (dev_on && !dev_lost)
+        tx_flush();
+    return (int)(ff_stafeto_netisr_runs - runs) + received;
 }
 
 /* The time to the next clock tick in nanoseconds, 0 when it is due. */
@@ -199,31 +649,72 @@ ff_stafeto_next_tick_ns(void)
     return now >= next_tick_ns ? 0 : next_tick_ns - now;
 }
 
+int
+ff_stafeto_sleep(uint64_t max_ns)
+{
+    uint64_t wait;
+    uint32_t bits = 0;
+
+    if (!dev_on || dev_lost) {
+        struct timespec ts;
+
+        wait = ff_stafeto_next_tick_ns();
+        if (wait > max_ns)
+            wait = max_ns;
+        ts.tv_sec = (time_t)(wait / NSEC_PER_SEC);
+        ts.tv_nsec = (long)(wait % NSEC_PER_SEC);
+        if (wait)
+            nanosleep(&ts, NULL);
+        return 0;
+    }
+    stats.sleeps++;
+    /* The interrupts on, then a look at the queue once more: a frame that
+     * came in between brings no interrupt. */
+    vnet_notify(1);
+    if (ff_stafeto_pass() > 0 || __atomic_load_n(&notified, __ATOMIC_RELAXED) != 0) {
+        vnet_notify(0);
+        stats.sleeps_found_work++;
+        return 1;
+    }
+    wait = ff_stafeto_next_tick_ns();
+    if (wait > max_ns)
+        wait = max_ns;
+    if (wait == 0) {
+        vnet_notify(0);
+        return 1;
+    }
+    if (stafeto_fast_wait(wait, &bits) == 0)
+        ff_stafeto_absorb(bits);
+    vnet_notify(0);
+    return 0;
+}
+
 void
 ff_dpdk_run(loop_func_t loop, void *arg)
 {
     stop_loop = 0;
-    while (!stop_loop) {
+    while (!stop_loop && !dev_lost) {
         int work = ff_stafeto_pass();
         int busy = loop(arg);
 
-        if (work == 0 && busy <= 0 && ff_stafeto_netisr_pending() == 0) {
-            uint64_t wait = ff_stafeto_next_tick_ns();
-            struct timespec ts = {
-                .tv_sec = (time_t)(wait / NSEC_PER_SEC),
-                .tv_nsec = (long)(wait % NSEC_PER_SEC),
-            };
-
-            if (wait)
-                nanosleep(&ts, NULL);
-        }
+        if (work == 0 && busy <= 0 && ff_stafeto_netisr_pending() == 0)
+            ff_stafeto_sleep(UINT64_MAX);
     }
+    if (dev_lost)
+        fprintf(stderr, "f-stack: the device was taken away\n");
 }
 
 void
 ff_dpdk_stop(void)
 {
     stop_loop = 1;
+}
+
+void
+ff_stafeto_device_stats(struct ff_stafeto_device_stats *out)
+{
+    *out = stats;
+    out->free_now = dev_on ? vnet_buf_free() : 0;
 }
 
 /* The counters of the layer, for the probes. */

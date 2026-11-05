@@ -37,6 +37,7 @@ mod display_probe;
 mod doom;
 mod entropy;
 mod fast_probe;
+mod fstack_device;
 mod fstack_probe;
 mod gpu_probe;
 mod guards;
@@ -1706,6 +1707,12 @@ commands:
             write, 1 000 connections, a refused connect and the timer of a
             SYN sent again; with `write-blocking`, what one write of 1 MiB
             does on a blocking socket
+  fstack-probe device [steps] [MACHINE] the stack of F-Stack on the second
+            network device (QEMU, two devices): the claim, the echo of UDP and
+            a page of TCP from the host through forwarded ports, the frames to
+            the network service through the bypass ring, the copies below the
+            threshold of free buffers; with `steps` the service counts its
+            steps (TCG only)
   fast-probe [steps] [MACHINE] the second network device in the hands of
             `fast-echo` (QEMU, two devices): the claim, the lease again
             through the bypass ring, the echo of UDP from the host, EPERM for
@@ -1990,6 +1997,9 @@ fn main() {
         Some("net-tls") => net_tls::command(&args[1..]),
         Some("probe-ca") => probe_ca::command(&args[1..]),
         Some("posix-net") => posix_net::command(&args[1..]),
+        Some("fstack-probe") if args.get(1).map(String::as_str) == Some("device") => {
+            fstack_device::command(&args[2..])
+        }
         Some("fstack-probe") => fstack_probe::command(&args[1..]),
         Some("fast-probe") => fast_probe::command(&args[1..]),
         Some("input-probe") => match args.get(1).map(String::as_str) {
@@ -8955,6 +8965,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // the bypass ring, the echo of UDP, the refusals, and the device
         // back after the owner's death. Also in the group `net`.
         job("fast-probe", || fast_probe::probe(&qemu::VIRT, false)),
+        // The stack of F-Stack on the second network device: the echo of UDP
+        // and a page of TCP through the forwarded ports, the frames to the
+        // service through the bypass ring, the copies below the threshold
+        // of free buffers. Also in the group `net`.
+        job("fstack-device", || fstack_device::probe(&qemu::VIRT, false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots

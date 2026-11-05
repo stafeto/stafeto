@@ -371,6 +371,13 @@ pub extern "C" fn vnet_buf_take() -> u32 {
     pool().take().unwrap_or(NONE)
 }
 
+/// How many buffers the pool holds free: the program's measure for how
+/// many frames it may keep without a copy.
+#[unsafe(no_mangle)]
+pub extern "C" fn vnet_buf_free() -> u32 {
+    pool().free_len as u32
+}
+
 /// Where the frame of buffer `buf` starts (after the Virtio header).
 #[unsafe(no_mangle)]
 pub extern "C" fn vnet_buf_ptr(buf: u32) -> *mut c_void {
@@ -586,6 +593,7 @@ mod tests {
         // The pool hands out every buffer once, the four objects in turn.
         let first: Vec<u32> = (0..4).map(|_| pool.take().unwrap()).collect();
         assert_eq!(first, [0, 2048, 4096, 6144]);
+        assert_eq!(pool.free_len, BUFFERS - 4);
         for n in first.into_iter().rev() {
             pool.give(n);
         }
