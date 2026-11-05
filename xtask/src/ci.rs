@@ -129,7 +129,7 @@ struct Split {
 /// The probes with this start of their name run in the group `net`.
 const NET_PREFIX: &str = "net-";
 /// The probes of the group `net` that do not start with the prefix.
-const NET_NAMED: [&str; 2] = ["posix-net", "fstack-probe"];
+const NET_NAMED: [&str; 3] = ["posix-net", "fstack-probe", "fast-probe"];
 
 /// Expected seconds of the probes, from a run on the CI machine. A probe
 /// not in the table counts as `DEFAULT_WEIGHT`.
@@ -745,7 +745,8 @@ mod tests {
                 "net-wget",
                 "net-tls",
                 "posix-net",
-                "fstack-probe"
+                "fstack-probe",
+                "fast-probe"
             ]
         );
         let mut seen: BTreeMap<String, usize> = BTreeMap::new();

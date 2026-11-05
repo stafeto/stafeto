@@ -505,7 +505,9 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
         | "boot-net-vz-steps.img"
         | "boot-net-vz2-steps.img"
         | "boot-nginx-probe.img"
-        | "boot-nginx-probe-steps.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
+        | "boot-nginx-probe-steps.img"
+        | "boot-fast-probe.img"
+        | "boot-fast-probe-steps.img" => of(&[Kind::Base, Kind::Addon, Kind::Net]),
         // The shell's image with the probe of F-Stack runs no network
         // service.
         "boot-fstack-probe.img" => of(&[Kind::Base, Kind::Addon]),

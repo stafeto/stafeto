@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 43] = [
+const SYSTEM_PATHS: [&str; 44] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -292,6 +292,8 @@ const SYSTEM_PATHS: [&str; 43] = [
     "/bin/net-sock",
     "/bin/net-dns",
     "/bin/posix-net",
+    // The image of the probe of the second network device's owner.
+    "/bin/fast-echo",
     // The image of the probe of F-Stack on its loopback.
     "/bin/fstack-probe",
     // The image of `nginx-probe`: the files it fetches and the setting of
@@ -346,7 +348,7 @@ const ZONES: [(&str, &[u8]); 10] = [
 /// libc-so`, spec 2, 3.12.3), each with its file under target/libc-so: the
 /// shared library itself, the good dynamic programs of tests/posix-so and the
 /// bad ones the loader refuses.
-pub const SHARED: [(&str, &str); 14] = [
+pub const SHARED: [(&str, &str); 15] = [
     ("libc.so", "libc.so"),
     ("so-hello", "probes/so-hello"),
     ("so-image", "probes/so-image"),
@@ -361,6 +363,7 @@ pub const SHARED: [(&str, &str); 14] = [
     ("net-sock", "probes/net-sock"),
     ("net-dns", "probes/net-dns"),
     ("posix-net", "probes/posix-net"),
+    ("fast-echo", "probes/fast-echo"),
 ];
 
 /// The path of the library in the images, which the loader opens.
@@ -381,7 +384,9 @@ fn library() -> Vec<RootFile> {
 /// with `procs`).
 fn shared_files() -> Vec<RootFile> {
     let mut files = Vec::new();
-    for (name, _) in &SHARED[1..] {
+    // The owner of the second network device goes into the image of its
+    // probe alone (fast_probe.rs).
+    for (name, _) in SHARED[1..].iter().filter(|(n, _)| *n != "fast-echo") {
         let path: &'static str = match *name {
             "so-hello" => "/bin/so-hello",
             "so-image" => "/bin/so-image",
@@ -1235,6 +1240,19 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 ROOT,
                 Source::Bytes("netd.conf", NETD_CONF_STATIC1),
             ));
+            files
+        }
+        // The shell with both network devices, `handover 1`, and the
+        // program that claims the second.
+        "boot-fast-probe.img" | "boot-fast-probe-steps.img" => {
+            let mut files = net_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", crate::fast_probe::NETD_CONF),
+            ));
+            files.push(file("/bin/fast-echo", 0o755, ROOT, "fast-echo"));
             files
         }
         "boot-net-probe-static.img" => vec![of(
