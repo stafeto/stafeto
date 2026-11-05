@@ -49,6 +49,7 @@
 #include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
+#include <stafeto/fast.h>
 
 extern char **environ;
 static const char *check = "start";
@@ -2811,6 +2812,17 @@ static void buffer_signal(void)
 
 /* F_SETOWN and F_GETOWN on a socket of the pipe service and one of the
  * network service, FIOASYNC and FIONBIO on the first. */
+/* The second network device goes to a program only where /etc/netd.conf
+ * says `handover 1`: in this image (one device, no such line) the claim of
+ * the superuser is EPERM, before the service looks for the device (which
+ * would answer ENODEV). */
+static void fast_claim_off(void)
+{
+	struct stafeto_fast_claim c;
+	errno = 0;
+	REQUIRE(stafeto_fast_claim(&c, STAFETO_FAST_ONCE) == -1 && errno == EPERM);
+}
+
 static void fsetown(void)
 {
 	int u[2];
@@ -2994,6 +3006,7 @@ static const struct {
 	{ "buffer-signal", buffer_signal },
 	{ "fsetown", fsetown },
 	{ "epoll-rdhup-unix", epoll_rdhup_unix },
+	{ "fast-claim-off", fast_claim_off },
 };
 
 int main(int argc, char **argv)

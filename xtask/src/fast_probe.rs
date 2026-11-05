@@ -21,8 +21,10 @@
 //!    than the queue of receiving holds;
 //! 5. `fast-echo 7 --as 1000`: EPERM (`refused ok`); `fast-echo 7 --once`
 //!    while the first owns the device: EBUSY (`busy ok`);
-//! 6. `kill -9`: the device comes back and gets its lease; a new
-//!    `fast-echo 7 &` claims it, renews, and echoes 100 datagrams;
+//! 6. `fast-echo 7 --retry &` is refused and tries again; `kill -9` of the
+//!    first owner: the device comes back and gets its lease, the second
+//!    claims it (`retry ok`: no departure of a refused try reads as the
+//!    service's end), renews, and echoes 100 datagrams;
 //! 7. `kill -QUIT`: the device comes back again.
 //!
 //! `cargo xtask fast-probe steps` runs the same under -icount with the
@@ -255,17 +257,24 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         expect_all(&mut run, &["fast-echo: refused ok"], within)?;
         run.send(&format!("fast-echo {PORT} --once"))?;
         expect_all(&mut run, &["fast-echo: busy ok"], within)?;
-        // The owner killed: the device comes back, and goes to a new one.
+        // A second program waits for the device (its refused tries leave
+        // their departures on its channel); the owner killed: the device
+        // comes back, and goes to the one that waits.
+        run.send(&format!("fast-echo {PORT} --retry &"))?;
+        expect_all(&mut run, &["fast-echo: retry busy"], within)?;
         let killed_at = Instant::now();
-        run.send("kill -9 $!")?;
+        run.send("kill -9 %1")?;
         expect_all(&mut run, &[back], within)?;
         expect_all(&mut run, &[&lease1], within)?;
         notes.push(format!(
             "kill -9 to lease1 {} ms",
             killed_at.elapsed().as_millis()
         ));
-        run.send(&format!("fast-echo {PORT} &"))?;
-        expect_all(&mut run, &[claimed.as_str(), renewed.as_str()], within)?;
+        expect_all(
+            &mut run,
+            &["fast-echo: retry ok", claimed.as_str(), renewed.as_str()],
+            within,
+        )?;
         let again = echoes(&socket, 100, 512)?;
         notes.push(format!(
             "100 echoes after the new claim ({again} sent again)"
@@ -380,6 +389,8 @@ mod tests {
             "refused ok",
             "busy ok",
             "flood taken",
+            "retry busy",
+            "retry ok",
         ] {
             assert!(echo.contains(line), "{line}");
         }

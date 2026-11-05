@@ -26,7 +26,7 @@ use crate::{
 
 /// The checks of `posix-net` for stages P4a-1, P4a-2, P4a-3 and P4b-1, in the order the
 /// program runs them.
-pub const CHECKS: [&str; 63] = [
+pub const CHECKS: [&str; 64] = [
     "limits",
     "nofile-low",
     "rcvbuf-tiers",
@@ -90,6 +90,7 @@ pub const CHECKS: [&str; 63] = [
     "buffer-signal",
     "fsetown",
     "epoll-rdhup-unix",
+    "fast-claim-off",
 ];
 
 /// The image of the run with the counted steps of the network service and

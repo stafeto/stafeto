@@ -20,6 +20,9 @@
  *   fast-echo PORT --as UID   setuid(UID), then claim: `refused ok` for EPERM
  *   fast-echo PORT --rules    claim, then fork and execve fail with EPERM and
  *                             munmap and mprotect of the mappings with EINVAL
+ *   fast-echo PORT --retry    a claim refused while another owns the device,
+ *                             then tries until it is free (`retry ok`), then
+ *                             echo
  *
  * Lines: `fast-echo: claimed A/N mac M`, `fast-echo: address A/N` when the
  * service says the address changed, `fast-echo: lost` when the device was
@@ -36,6 +39,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #include <vnet.h>
 
@@ -260,6 +264,41 @@ static int rules(const struct stafeto_fast_claim *c)
 	return 0;
 }
 
+static long now_ms(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+/* A claim refused while another process owns the device, then tries until
+ * the device is free (`--retry`), with no wait on the thread's channel in
+ * between: the service's notification of the claim that got the device is
+ * the only one `stafeto_fast_wait` gives, so the departure of a refused
+ * try never reads as the end of the service. */
+static void retry(struct stafeto_fast_claim *c)
+{
+	errno = 0;
+	REQUIRE(stafeto_fast_claim(c, STAFETO_FAST_ONCE) == -1 && errno == EBUSY);
+	printf("fast-echo: retry busy\n");
+	fflush(stdout);
+	long start = now_ms();
+	while (stafeto_fast_claim(c, STAFETO_FAST_ONCE) != 0) {
+		REQUIRE(errno == EBUSY);
+		REQUIRE(now_ms() - start < 60000);
+		long until = now_ms() + 100;
+		while (now_ms() < until)
+			;
+	}
+	uint32_t bits = 0;
+	errno = 0;
+	int waited = stafeto_fast_wait(0, &bits);
+	REQUIRE(waited == 0 || errno == ETIMEDOUT);
+	REQUIRE((bits & STAFETO_FAST_GONE) == 0);
+	printf("fast-echo: retry ok\n");
+	fflush(stdout);
+}
+
 static int run(void)
 {
 	struct vnet_buf got[BURST];
@@ -314,7 +353,7 @@ static int run(void)
 int main(int argc, char **argv)
 {
 	if (argc < 2 || argc > 4) {
-		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--as UID]\n");
+		printf("fast-echo: usage: fast-echo PORT [--flood|--once|--rules|--retry|--as UID]\n");
 		return 2;
 	}
 	port = (uint16_t)atoi(argv[1]);
@@ -335,8 +374,11 @@ int main(int argc, char **argv)
 		printf("fast-echo: busy ok\n");
 		return 0;
 	}
-	if (stafeto_fast_claim(&c, 0) != 0)
+	if (strcmp(mode, "--retry") == 0) {
+		retry(&c);
+	} else if (stafeto_fast_claim(&c, 0) != 0) {
 		fail("stafeto_fast_claim");
+	}
 	REQUIRE(c.kind == STAFETO_FAST_MMIO || c.kind == STAFETO_FAST_PCI);
 	REQUIRE(c.objects[0].uncached == 1 && c.objects[1].pages == 1024 && c.ring != 0);
 	memcpy(own_ip, c.config.address, 4);
