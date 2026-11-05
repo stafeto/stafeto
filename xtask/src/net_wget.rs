@@ -368,7 +368,7 @@ fn capture(
 /// Runs a command that ends with `echo NAME-ok` on success and `echo
 /// NAME-no` on failure (the shell variable `S` holds `ok`, so the typed
 /// command does not hold the answer), and gives the time it took.
-fn step(
+pub(crate) fn step(
     run: &mut qemu::Run,
     name: &str,
     command: &str,
@@ -449,7 +449,7 @@ fn first_contact_ms(lines: &[String]) -> Option<u64> {
 /// The steps of the service: the kinds that wget's traffic makes came (the
 /// service's own, Send, Recv, Clone) and every row is under STEP_MAX, a
 /// CLONE under PORTION_MAX.
-fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
+pub(crate) fn steps_verdict(lines: &[String]) -> Result<Vec<(usize, u64, u64)>, String> {
     const KINDS: [(usize, &str); 4] = [
         (65, "the own steps"),
         (8, "Send"),
@@ -505,6 +505,7 @@ pub fn probe(machine: &'static qemu::Machine, mode: Mode) -> Result<(), String> 
     }
     busybox_build()?;
     nano_build()?;
+    crate::net_build()?;
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let steps = mode == Mode::Steps;

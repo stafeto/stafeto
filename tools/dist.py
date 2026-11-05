@@ -31,6 +31,12 @@ HERE = Path(__file__).resolve().parent
 RELIBC_REPOSITORY = "https://github.com/stafeto/relibc"
 # What a source tree names its licence text.
 LICENSE_NAMES = re.compile(r"^(COPYING|COPYING\.[A-Za-z0-9]+|LICENSE|LICENSE\.[a-z]+|LICENCE|UNLICENSE|COPYRIGHT)$")
+# The licence texts of packages whose source carries none, with their
+# SHA-256: the bundle of root certificates is one PEM file under MPL-2.0.
+PACKAGE_LICENSES = {
+    "ca-bundle": (HERE / "ca-bundle" / "MPL-2.0.txt",
+                  "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"),
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -92,8 +98,20 @@ def fetch(description: dict, cache: Path) -> Path:
 
 def license_texts(archive: Path, wanted: str = "") -> dict[str, bytes]:
     """The licence files in the top two directories of a source archive, and
-    the file `wanted` (a path below the top directory) the description names."""
+    the file `wanted` (a path below the top directory) the description names.
+    A source that is one file (the PEM file of the root certificates) gives
+    the lines of its header that begin with `##`, which name its origin."""
     found = {}
+    if not zipfile.is_zipfile(archive) and not tarfile.is_tarfile(archive):
+        lines = []
+        with archive.open("rb") as file:
+            for line in file:
+                if not line.startswith(b"##"):
+                    break
+                lines.append(line)
+        if lines:
+            found["cacert.pem.NOTICE"] = b"".join(lines)
+        return found
 
     def take(name: str, read) -> None:
         parts = name.split("/")
@@ -163,6 +181,11 @@ def stage_licenses(stage: Path, version: str, cache: Path) -> None:
         target.mkdir(parents=True)
         for file_name, data in texts.items():
             (target / file_name).write_bytes(data)
+        if name in PACKAGE_LICENSES:
+            path, expected = PACKAGE_LICENSES[name]
+            if sha256_file(path) != expected:
+                raise SystemExit(f"dist: {path} has an unexpected SHA-256")
+            shutil.copy(path, target / path.name)
         # A description with an empty `license_file` (paxmirabilis) names a
         # source whose files state the terms in their headers; the image
         # carries them in UTILITIES-LICENSE.

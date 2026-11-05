@@ -467,8 +467,17 @@ const NET_LAUNCHER: Record = Record {
         "entropy",
         NET_SERVICE,
     ],
+    quota: NET_COMMAND_QUOTA,
     ..super::ramfs::BUSYBOX_DIALOG_TABLE[5]
 };
+
+/// The quota of the launcher of the shell with the network, which the shell
+/// and its commands get too. curl and openssl link OpenSSL statically (3.2
+/// MB programs) and read the 118 root certificates of the CA file (119 with the probe CA) into
+/// their heap: `net-tls` passes with 1 325 pages and fails with 1 250 at the
+/// first load of the file (bisected; the shell's 1 160 pages fail at about
+/// 90 certificates), and 1 472 pages leave 11%.
+pub const NET_COMMAND_QUOTA: u64 = 1472 * PAGE;
 
 /// The process service of the image with the network: the pool of the
 /// shell's image and ten more quotas of a command. `httpd` forks a child for
@@ -477,7 +486,7 @@ const NET_LAUNCHER: Record = Record {
 const NET_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
-        + 10 * super::ramfs::BUSYBOX_DIALOG_QUOTA,
+        + 10 * NET_COMMAND_QUOTA,
     ..super::ramfs::BUSYBOX_DIALOG_TABLE[2]
 };
 

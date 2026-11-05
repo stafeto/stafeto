@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# OpenSSL of the long-term branch 3.5: the static archives libcrypto.a and
+# libssl.a that curl links, and the program openssl.
+# Format: docs/packages.md.
+
+name = "openssl"
+version = "3.5.9"
+kind = "net"
+url = "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
+sha256 = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+license = "Apache-2.0"
+license_file = "LICENSE.txt"
+depends = ["busybox"]
+build = "tools/build-openssl.py"
+program = "openssl"
+# The directory OpenSSL is built to name (OPENSSLDIR) is that of ca-bundle,
+# which holds no openssl.cnf: the program runs on its built-in settings.
+files = [
+  "/bin/openssl = elf:openssl",
+]

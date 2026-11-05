@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The root certificates of Mozilla in one PEM file, as curl.se publishes
+# them, put in the image unchanged. The source is that one file; its header
+# names its origin, Mozilla's certdata.txt, and https://curl.se/docs/caextract.html
+# gives its licence: "the same license as the Mozilla source file: MPL 2.0".
+# Format: docs/packages.md.
+
+name = "ca-bundle"
+version = "2026-10-20"
+kind = "net"
+url = "https://curl.se/ca/cacert-2026-10-20.pem"
+sha256 = "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe"
+license = "MPL-2.0"
+license_file = ""
+depends = []
+build = "tools/build-ca-bundle.py"
+dirs = ["/etc/ssl", "/etc/ssl/certs"]
+files = [
+  "/etc/ssl/certs/ca-certificates.crt = bytes:ca-certificates.crt",
+]

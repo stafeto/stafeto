@@ -16,8 +16,8 @@ Unknown keys are refused.
 | --- | --- |
 | `name` | The package name; equals the file name. |
 | `version` | The pinned version of the source. |
-| `kind` | `base` for the base set of the system, `addon` for the rest of the shell image, `game` for the games image only. A base package depends on base packages only, and no package of the shell image depends on a game. |
-| `url` | The https URL of the source archive. |
+| `kind` | `base` for the base set of the system, `addon` for the rest of the shell image, `game` for the games image only, `net` for the images with the network service only. A base package depends on base packages only, no package of the shell image depends on a game, and only a network package depends on a network package. |
+| `url` | The https URL of the source archive, or of the one file that is the source (the root certificates of `ca-bundle`). |
 | `sha256` | SHA-256 of the archive, 64 lowercase hex digits. |
 | `license` | SPDX expression of the licence. |
 | `depends` | Names of the packages it needs (nano, htop and ncdu need ncurses). |
@@ -66,7 +66,9 @@ them for the licence notes of the image.
   A program that several paths name counts once, for the first package that
   names it, so the packages linked into BusyBox (sbase, toybox, ncompress, chimerautils,
   nbase, paxmirabilis, util-linux) show 0 bytes (their names are links to `busybox`;
-  so are the `tput` and `tabs` of ncurses). `cargo xtask ash-dialog` prints the same table.
+  so are the `tput` and `tabs` of ncurses). It then builds `boot-net.img` and
+  prints its table, the network packages among the rows. `cargo xtask
+  ash-dialog` prints the table of the shell image.
 - The games image (`boot-doom.img`) holds the shell image's packages and the
   games: Doomgeneric (`/bin/doom`, GPL-2.0-or-later) and the Freedoom data
   (`/games/freedoom1.wad`, BSD-3-Clause). The shell image holds no game.
@@ -88,6 +90,20 @@ them for the licence notes of the image.
   MD5 ask for (`FSTACK-LICENSE`, `FSTACK-SOURCE`). The installed headers are
   those of the build without thread-local storage: `ff_api.h` declares
   `pcurthread` a plain variable.
+- The images with the network service (`boot-net.img` of `cargo xtask net`,
+  the images of the network probes) hold the shell image's packages and the
+  network packages: OpenSSL 3.5.9 (`/bin/openssl`, Apache-2.0), curl 8.23.0
+  (`/bin/curl`, curl) and `ca-bundle`, the root certificates of Mozilla
+  (`/etc/ssl/certs/ca-certificates.crt`, MPL-2.0). OpenSSL is built into the
+  static archives `libcrypto.a` and `libssl.a`, which curl and `openssl` link
+  (the loader opens no library beside libc.so). The source of `ca-bundle` is
+  one PEM file put in the image unchanged; the release takes its notice from
+  the header of the file and the text of MPL-2.0 from
+  `tools/ca-bundle/MPL-2.0.txt`. The images carry the licences and the notes
+  of the sources (`OPENSSL-LICENSE`, `OPENSSL-SOURCE`, `CURL-LICENSE`,
+  `CURL-SOURCE`, `CA-BUNDLE-LICENSE`, `CA-BUNDLE-SOURCE`). The images of the
+  probe of TLS (`cargo xtask net-tls`) replace the bytes of the CA file with
+  the same roots plus the probe CA of `cargo xtask probe-ca`.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 
