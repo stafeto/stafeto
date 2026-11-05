@@ -76,10 +76,11 @@ pub fn after_fork() {
         BASE_THREAD.store(crate::threads::thread_number(), Ordering::Relaxed);
     }
     // The service leaves it out of its own account of this process.
-    if let Ok(mut w) = crate::process::request(Method::Account, &[account_op::FORK_BASE]) {
-        if w.u64(ticks).is_ok() && w.u64(kernel).is_ok() {
-            let _ = crate::process::ask(&w);
-        }
+    if let Ok(mut w) = crate::process::request(Method::Account, &[account_op::FORK_BASE])
+        && w.u64(ticks).is_ok()
+        && w.u64(kernel).is_ok()
+    {
+        let _ = crate::process::ask(&w);
     }
 }
 
