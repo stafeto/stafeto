@@ -499,7 +499,9 @@ fn all_steps(njobs: usize) -> Vec<Step> {
     // on a Mac (HVF and VZ), so ci builds what it boots.
     steps.push(step("net", "nginx-bench images", &net_needs, || {
         super::nginx_bench::build_images()?;
-        super::linux_guest::build_image().map(|_| ())
+        super::linux_guest::build_image()?;
+        super::linux_guest::build_variant(false)?;
+        super::linux_guest::build_variant(true).map(|_| ())
     }));
 
     // os-test: a boot a suite, and the complete basic suite.

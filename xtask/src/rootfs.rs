@@ -1709,7 +1709,9 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
         | "boot-nginx-bench-vz-nobuf.img" => nginx_bench_files(name),
-        "boot-net-bench.img" => net_bench_files(name),
+        "boot-net-bench.img" | "boot-net-bench-profile.img" | "boot-net-bench-pinned.img" => {
+            net_bench_files(name)
+        }
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.

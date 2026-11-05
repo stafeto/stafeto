@@ -233,6 +233,9 @@ struct CpuUse {
     /// CPU time of all CPUs per answer, microseconds.
     busy_us: f64,
     known: bool,
+    /// CPU time per answer of each program (the processes of one name
+    /// together), microseconds, the largest first; empty when not read.
+    procs: Vec<(String, f64)>,
 }
 
 /// One step: what the load gave, with the latencies counted from the
@@ -522,6 +525,76 @@ fn parse_stat(lines: &[String]) -> Vec<(u64, u64)> {
     cpus.into_iter().map(|c| c.1).collect()
 }
 
+/// The CPU time of each process from the lines of `/proc/<pid>/stat`:
+/// `(pid, name, jiffies)` of user and system time together. The name is the
+/// text between the first `(` and the last `)`, so that a name with spaces
+/// or brackets stays whole; lines that are no stat line are skipped.
+fn parse_proc_times(lines: &[String]) -> Vec<(u64, String, u64)> {
+    let mut out = Vec::new();
+    for line in lines {
+        let (Some(open), Some(close)) = (line.find('('), line.rfind(')')) else {
+            continue;
+        };
+        let Ok(pid) = line[..open].trim().parse::<u64>() else {
+            continue;
+        };
+        // After the name: state ppid pgrp session tty tpgid flags minflt
+        // cminflt majflt cmajflt utime stime.
+        let fields: Vec<&str> = line[close + 1..].split_whitespace().collect();
+        let time = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok());
+        if let (Some(user), Some(system)) = (time(11), time(12)) {
+            out.push((pid, line[open + 1..close].to_owned(), user + system));
+        }
+    }
+    out
+}
+
+/// The CPU time per answer of each program between two readings of the
+/// processes' times, microseconds, the largest first. A process that began
+/// between them counts from zero; one that ended is not in the second reading
+/// and its time is lost (the services and nginx's workers run throughout).
+fn proc_use(
+    before: &[(u64, String, u64)],
+    after: &[(u64, String, u64)],
+    answers: usize,
+) -> Vec<(String, f64)> {
+    if answers == 0 {
+        return Vec::new();
+    }
+    let mut by_name: Vec<(String, f64)> = Vec::new();
+    for (pid, name, now) in after {
+        let was = before
+            .iter()
+            .find(|(p, n, _)| p == pid && n == name)
+            .map_or(0, |b| b.2);
+        let us = now.saturating_sub(was) as f64 * JIFFY_US / answers as f64;
+        match by_name.iter_mut().find(|(n, _)| n == name) {
+            Some(entry) => entry.1 += us,
+            None => by_name.push((name.clone(), us)),
+        }
+    }
+    by_name.sort_by(|a, b| b.1.total_cmp(&a.1));
+    by_name
+}
+
+/// `name=microseconds` pairs joined by `;`, and back.
+fn procs_text(procs: &[(String, f64)]) -> String {
+    procs
+        .iter()
+        .map(|(n, us)| format!("{n}={us:.2}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn procs_of(text: &str) -> Vec<(String, f64)> {
+    text.split(';')
+        .filter_map(|p| {
+            let (name, us) = p.rsplit_once('=')?;
+            Some((name.to_owned(), us.parse().ok()?))
+        })
+        .collect()
+}
+
 /// The use of the CPUs between two readings of `/proc/stat`, for
 /// `answers` answers. A reading with fewer lines than the guest has CPUs
 /// leaves the use unknown (a layer that prints one `cpu0` line for all).
@@ -548,6 +621,7 @@ fn cpu_use(before: &[(u64, u64)], after: &[(u64, u64)], cpus: usize, answers: us
             busy * JIFFY_US / answers as f64
         },
         known: true,
+        procs: Vec::new(),
     }
 }
 
@@ -637,6 +711,7 @@ impl Measured {
         if let Some(cpu) = &self.cpu {
             put("cpu_known", cpu.known.to_string());
             put("cpu_busy_us", format!("{:.2}", cpu.busy_us));
+            put("cpu_procs", procs_text(&cpu.procs));
             put(
                 "cpu_idle",
                 cpu.idle
@@ -676,6 +751,7 @@ impl Measured {
             cpu: g("cpu_known").map(|k| CpuUse {
                 known: k == "true",
                 busy_us: f("cpu_busy_us").unwrap_or(0.0),
+                procs: procs_of(g("cpu_procs").unwrap_or("")),
                 idle: g("cpu_idle")
                     .unwrap_or("")
                     .split(',')
@@ -887,6 +963,18 @@ impl Guest {
         let lines =
             crate::net_tls::capture(&mut self.run, "grep ^cpu /proc/stat", "stat", DIALOG_STEP)?;
         Ok(parse_stat(&lines))
+    }
+
+    /// The CPU time of each process of the guest, in jiffies, from
+    /// `/proc/<pid>/stat` (Linux and stafeto write the same fields).
+    fn procs(&mut self) -> Result<Vec<(u64, String, u64)>, String> {
+        let lines = crate::net_tls::capture(
+            &mut self.run,
+            "for f in /proc/[0-9]*/stat; do cat $f; done 2>/dev/null",
+            "procs",
+            DIALOG_STEP,
+        )?;
+        Ok(parse_proc_times(&lines))
     }
 
     /// The counters of the system: `ListenDrops` of Linux, `posix-net stat`
@@ -1106,9 +1194,21 @@ struct Options {
     nat: u32,
     max_rate: Option<u32>,
     resume: Option<PathBuf>,
+    /// The image of S4: the plain one, the one with the profile's counters of
+    /// the network service, or that one with the shell's processes on CPUs 1
+    /// to 3.
+    image: ImageKind,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4] [--workloads w1,w2,w3] [--phases nat,sweep,rounds] [--rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--quick] [--resume DIR] | tables DIR";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ImageKind {
+    #[default]
+    Plain,
+    Profile,
+    Pinned,
+}
+
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4] [--workloads w1,w2,w3] [--phases nat,sweep,rounds] [--rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned] [--quick] [--resume DIR] | tables DIR";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -1126,6 +1226,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         nat: 30,
         max_rate: None,
         resume: None,
+        image: ImageKind::Plain,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1152,6 +1253,14 @@ fn options(args: &[String]) -> Result<Options, String> {
                         Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1, w2, w3)"))
                     })
                     .collect::<Result<_, _>>()?
+            }
+            "--image" => {
+                o.image = match value(arg)?.as_str() {
+                    "plain" => ImageKind::Plain,
+                    "profile" => ImageKind::Profile,
+                    "pinned" => ImageKind::Pinned,
+                    other => return Err(format!("no image {other:?} (plain, profile, pinned)")),
+                }
             }
             "--phases" => o.phases = value(arg)?.split(',').map(str::to_owned).collect(),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
@@ -1321,7 +1430,11 @@ impl Bench {
                 )?;
             }
             let foreign_before = vz_guests(None) > g.vz_start;
-            let before = if cpu { Some(g.stat()?) } else { None };
+            let before = if cpu {
+                Some((g.stat()?, g.procs()?))
+            } else {
+                None
+            };
             let mut m = attack(
                 &raw,
                 Some(&mut g.run),
@@ -1333,9 +1446,11 @@ impl Bench {
                 warm,
                 wl.keep_alive(),
             )?;
-            if let Some(before) = before {
+            if let Some((before, procs_before)) = before {
                 let after = g.stat()?;
-                m.cpu = Some(cpu_use(&before, &after, linux_guest::CPUS, m.ok));
+                let mut used = cpu_use(&before, &after, linux_guest::CPUS, m.ok);
+                used.procs = proc_use(&procs_before, &g.procs()?, m.ok);
+                m.cpu = Some(used);
             }
             m.foreign = foreign_before || vz_guests(None) > g.vz_start;
             m.load = load_now();
@@ -1514,6 +1629,7 @@ impl Bench {
             ]
             .to_vec();
             let before = g.stat()?;
+            let procs_before = g.procs()?;
             let mut server = Server::Guest(&mut g.run);
             let mark = server.mark()?;
             let (text, seen) = watched(
@@ -1530,7 +1646,8 @@ impl Bench {
             let after = g.stat()?;
             let mut found = alerts(&log);
             found.extend(seen);
-            let cpu = cpu_use(&before, &after, linux_guest::CPUS, wrk.requests as usize);
+            let mut cpu = cpu_use(&before, &after, linux_guest::CPUS, wrk.requests as usize);
+            cpu.procs = proc_use(&procs_before, &g.procs()?, wrk.requests as usize);
             Ok::<(Wrk, CpuUse, Option<String>), String>((wrk, cpu, found.first().cloned()))
         })();
         let mut rec = Rec::new();
@@ -1548,6 +1665,7 @@ impl Bench {
                 }
                 rec.insert("alert".into(), alert.unwrap_or_else(|| "-".into()));
                 rec.insert("cpu_known".into(), cpu.known.to_string());
+                rec.insert("cpu_procs".into(), procs_text(&cpu.procs));
                 rec.insert(
                     "cpu_idle".into(),
                     cpu.idle
@@ -2443,7 +2561,11 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         crate::busybox_build()?;
         crate::nano_build()?;
         kernel = build(Variant::Normal)?.image;
-        image = linux_guest::build_image()?;
+        image = match o.image {
+            ImageKind::Plain => linux_guest::build_image()?,
+            ImageKind::Profile => linux_guest::build_variant(false)?,
+            ImageKind::Pinned => linux_guest::build_variant(true)?,
+        };
     }
     let (config, www) = linux_guest::expected()?;
     Ok(Prepared {
@@ -2845,6 +2967,45 @@ mod tests {
     }
 
     #[test]
+    fn the_times_of_the_processes_are_read_and_divided_by_the_answers() {
+        let lines: Vec<String> = [
+            "12 (netd) S 1 12 12 0 0 0 0 0 0 0 300 20 0 0 20 0",
+            "30 (nginx) S 1 30 30 0 0 0 0 0 0 0 100 10 0 0 20 0",
+            "31 (nginx) S 1 30 30 0 0 0 0 0 0 0 50 0 0 0 20 0",
+            "40 (a (b) c) S 1 40 40 0 0 0 0 0 0 0 7 1 0 0 20 0",
+            "not a stat line",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let before = parse_proc_times(&lines);
+        assert_eq!(before.len(), 4);
+        assert_eq!(before[0], (12, "netd".to_owned(), 320));
+        assert_eq!(before[3], (40, "a (b) c".to_owned(), 8));
+        let mut after = before.clone();
+        after[0].2 += 100;
+        after[1].2 += 50;
+        after[2].2 += 25;
+        after.push((50, "nginx".into(), 25));
+        // 100 jiffies of netd over 1000 answers: 1 s over 1000 = 1000 us.
+        let used = proc_use(&before, &after, 1000);
+        assert_eq!(used[0], ("netd".to_owned(), 1000.0));
+        assert_eq!(used[1], ("nginx".to_owned(), 1000.0));
+        assert!(proc_use(&before, &after, 0).is_empty());
+        assert_eq!(procs_of(&procs_text(&used)), used);
+    }
+
+    #[test]
+    fn the_image_option_is_read_and_refused() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(options(&args(&[])).unwrap().image, ImageKind::Plain);
+        assert_eq!(
+            options(&args(&["--image", "pinned"])).unwrap().image,
+            ImageKind::Pinned
+        );
+        assert!(options(&args(&["--image", "x"])).is_err());
+    }
+
+    #[test]
     fn a_step_survives_its_record() {
         let m = Measured {
             seconds: 60,
@@ -2856,6 +3017,7 @@ mod tests {
                 idle: vec![10.5, 20.0, 30.0, 40.0],
                 busy_us: 12.5,
                 known: true,
+                procs: vec![("netd".into(), 210.25), ("nginx".into(), 50.5)],
             }),
             counters: "ListenDrops 0 ListenOverflows 0".into(),
             alert: Some("nginx [crit] x=y".into()),

@@ -116,6 +116,9 @@ table-net-vz2 = []
 # The image of the measurement of stage P7: the shell on VZ with the network
 # service and the shell's processes on four CPUs (table/bench.rs).
 table-bench-vz = []
+# The same image with the shell's processes on CPUs 1 to 3, away from the
+# network service on CPU 0 (the measurement T5 of the network service).
+table-bench-pinned-vz = []
 # The roles of the probe's client: `s` at 8, 64 or 256 places of the table
 # (the measurement of the steps), or the rates of the loopback; with none the
 # client runs the registry and the table filled to the sockets limit.

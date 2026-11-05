@@ -40,6 +40,10 @@ Both guests carry the same files and the same settings (`tools/nginx/nginx.conf`
 
 The run promises no ratio between the rows; it gives numbers with the spread of their repeats. The rates of R\* are for this Mac on this day.
 
+## The profile of the network service
+
+`--image profile` runs S4 on `boot-net-bench-profile.img` and `--image pinned` on `boot-net-bench-pinned.img`: the image of the measurement with `netd` built with the feature `profile` (counters of steps, interrupts, doorbells, frames, checksums, copies and requests by method, printed by `netd` once a second as `net: profile ...` lines on the console, see `services/netd/src/profile.rs`), and the second one with the shell's processes, nginx's workers among them, on CPUs 1 to 3 (`BENCH_PINNED_CPUS`) so that none shares the CPU of `netd`. The counters cost some instructions, so a run on these images is for the profile and not for the ratio against Linux. Every confirmation run and every ceiling also records the CPU time per answer of each program (`cpu_procs`: the sum of user and system time from `/proc/<pid>/stat` between the two readings, the processes of one name together), for both guests.
+
 ## The commands
 
 ```

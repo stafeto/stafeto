@@ -38,6 +38,11 @@ use crate::{
 /// The image of stafeto in the measurement: the network image of VZ with the
 /// shell's processes on all four CPUs (`init::table::bench`).
 pub const BENCH_IMAGE: &str = "boot-net-bench.img";
+/// The two variants of the image for the profile of the network service
+/// (`netd` built with the feature `profile`, which prints its counters once
+/// a second): the shell's processes on all four CPUs, and on CPUs 1 to 3.
+pub const PROFILE_IMAGE: &str = "boot-net-bench-profile.img";
+pub const PINNED_IMAGE: &str = "boot-net-bench-pinned.img";
 /// The machine of both guests (the provisional ruling B2 of the owner).
 pub const CPUS: usize = 4;
 pub const MEMORY_MIB: u64 = 1024;
@@ -61,6 +66,42 @@ pub fn bench_programs() -> &'static [ImageProgram] {
         }
         programs
     })
+}
+
+/// The programs of a variant: those of the network image of VZ with init's
+/// table `table` and the network service with the profile's counters.
+fn variant_programs(table: &'static [&'static str]) -> Vec<ImageProgram> {
+    let mut programs = net::vz_programs(false).to_vec();
+    for program in &mut programs {
+        match program.0 {
+            "init" => program.3 = table,
+            "netd" => program.3 = &["profile"],
+            _ => {}
+        }
+    }
+    programs
+}
+
+/// The programs of the profile image (`table-bench-vz`).
+pub fn profile_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| variant_programs(&["table-bench-vz"]))
+}
+
+/// The programs of the pinned image (`table-bench-pinned-vz`).
+pub fn pinned_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| variant_programs(&["table-bench-pinned-vz"]))
+}
+
+/// Builds a variant of the image of the measurement: `pinned` for the shell's
+/// processes on CPUs 1 to 3, else on all four, both with the profile.
+pub fn build_variant(pinned: bool) -> Result<PathBuf, String> {
+    if pinned {
+        build_boot_image(PINNED_IMAGE, pinned_programs(), BOOT_PROFILE)
+    } else {
+        build_boot_image(PROFILE_IMAGE, profile_programs(), BOOT_PROFILE)
+    }
 }
 
 /// Builds the image of the measurement (a step of ci, which can run
@@ -1134,6 +1175,25 @@ mod tests {
         assert_eq!(bench_programs()[0].3, &["table-bench-vz"]);
         assert_eq!(net::vz_programs(false)[0].3, &["table-net-vz"]);
         assert_eq!(bench_programs().len(), net::vz_programs(false).len());
+    }
+
+    #[test]
+    fn the_variants_of_the_image_differ_in_the_table_and_the_profile_alone() {
+        let plain = net::vz_programs(false);
+        for (programs, table) in [
+            (profile_programs(), "table-bench-vz"),
+            (pinned_programs(), "table-bench-pinned-vz"),
+        ] {
+            assert_eq!(programs.len(), plain.len());
+            for (variant, base) in programs.iter().zip(plain) {
+                match variant.0 {
+                    "init" => assert_eq!(variant.3, &[table]),
+                    "netd" => assert_eq!(variant.3, &["profile"]),
+                    _ => assert_eq!(variant, base),
+                }
+            }
+        }
+        assert!(!bench_programs().iter().any(|p| p.3.contains(&"profile")));
     }
 
     #[test]
