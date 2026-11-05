@@ -1,0 +1,35 @@
+[package]
+name = "pkg"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The package tool of stafeto: install, update, list, info, search and check, over the package service and curl"
+build = "build.rs"
+
+# What the tool decides, apart from the calls it makes: tested on the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "pkg"
+test = false
+bench = false
+
+[dependencies]
+pkgfmt = { path = "../../lib/pkgfmt" }
+proto-pkg = { path = "../../proto/pkg" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without the layer.
+[target.'cfg(target_os = "none")'.dependencies]
+libc-ffi = { path = "../../tests/libc-ffi" }
+posix-abi = { path = "../../lib/posix-abi" }
+posix-crt = { path = "../../lib/posix-crt" }
+rt = { path = "../../lib/rt" }
+
+[dev-dependencies]
+pkgfmt = { path = "../../lib/pkgfmt", features = ["write"] }
+proto-pkg = { path = "../../proto/pkg", features = ["alloc"] }
