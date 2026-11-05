@@ -5,7 +5,7 @@
 1. Run QEMU with an exception log:
 
    ```
-   qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m 512M -nographic \
+   qemu-system-aarch64 -M virt,gic-version=2,highmem-ecam=off -cpu cortex-a72 -m 512M -nographic \
      -kernel target/stafeto.img -initrd target/boot.img \
      -d int,cpu_reset,guest_errors -D qemu.log
    ```
@@ -179,9 +179,9 @@ output and xtask prints how to enable symbolization.
 `cargo xtask hvf` runs the boot checks, the console dialog with the
 shell, the test init and the kernel tests under HVF on a Mac with Apple
 silicon, on two machines:
-`-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on -cpu host`, with
+`-machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on -cpu host`, with
 Apple's GICv3 in the macOS kernel, and
-`-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
+`-machine virt,gic-version=2,highmem-ecam=off -accel hvf,kernel-irqchip=off -cpu host`,
 with QEMU's GICv2. On any other host it prints why it skips and succeeds;
 `cargo xtask ci` does not run it. `cargo xtask run --hvf` boots the
 normal build on the first machine with the console on the terminal, and
@@ -190,7 +190,7 @@ fails with the reason on any other host. To run one by hand, after
 `CARGO_TARGET_DIR` when it is set):
 
 ~~~
-qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf,kernel-irqchip=on \
+qemu-system-aarch64 -machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on \
   -cpu host -m 512M -display none -serial stdio -monitor none \
   -kernel target/stafeto-ktest.img -initrd target/boot.img
 ~~~

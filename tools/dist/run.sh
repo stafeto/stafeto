@@ -74,11 +74,11 @@ fi
 
 if [ "$accel" = hvf ]; then
     # Apple's GICv3 in the macOS kernel and the host's CPU model.
-    machine=virt,gic-version=3
+    machine=virt,gic-version=3,highmem-ecam=off
     accelerator=hvf,kernel-irqchip=on
     cpu=host
 else
-    machine=virt,gic-version=2
+    machine=virt,gic-version=2,highmem-ecam=off
     accelerator=tcg
     cpu=cortex-a72
 fi

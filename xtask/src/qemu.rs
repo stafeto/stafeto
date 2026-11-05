@@ -70,7 +70,7 @@ impl Machine {
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
     name: "512M",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "cortex-a72",
     memory: "512M",
     accel: "tcg",
@@ -80,7 +80,7 @@ pub const VIRT: Machine = Machine {
 /// goes through SMC.
 pub const VIRT_EL2: Machine = Machine {
     name: "EL2",
-    machine: "virt,gic-version=2,virtualization=on",
+    machine: "virt,gic-version=2,highmem-ecam=off,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
     accel: "tcg",
@@ -93,7 +93,7 @@ pub const VIRT_EL2: Machine = Machine {
 /// through HVC, as on VIRT.
 pub const VIRT_2G: Machine = Machine {
     name: "2G",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "cortex-a53",
     memory: "2G",
     accel: "tcg",
@@ -103,7 +103,7 @@ pub const VIRT_2G: Machine = Machine {
 /// the kernel takes the version from the device tree.
 pub const VIRT_V3: Machine = Machine {
     name: "GICv3",
-    machine: "virt,gic-version=3",
+    machine: "virt,gic-version=3,highmem-ecam=off",
     cpu: "cortex-a72",
     memory: "512M",
     accel: "tcg",
@@ -113,7 +113,7 @@ pub const VIRT_V3: Machine = Machine {
 /// before it drops there.
 pub const VIRT_EL2_V3: Machine = Machine {
     name: "EL2 GICv3",
-    machine: "virt,gic-version=3,virtualization=on",
+    machine: "virt,gic-version=3,highmem-ecam=off,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
     accel: "tcg",
@@ -125,7 +125,7 @@ pub const VIRT_EL2_V3: Machine = Machine {
 /// entered at EL1; the entry at EL2 is the TCG machines' to check.
 pub const HVF_V3: Machine = Machine {
     name: "HVF GICv3",
-    machine: "virt,gic-version=3",
+    machine: "virt,gic-version=3,highmem-ecam=off",
     cpu: "host",
     memory: "512M",
     accel: "hvf,kernel-irqchip=on",
@@ -136,7 +136,7 @@ pub const HVF_V3: Machine = Machine {
 /// and barriers, as the PinePhone's GIC-400 will have them.
 pub const HVF_V2: Machine = Machine {
     name: "HVF GICv2",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "host",
     memory: "512M",
     accel: "hvf,kernel-irqchip=off",
@@ -1239,10 +1239,17 @@ mod tests {
     }
 
     #[test]
+    fn every_machine_puts_ecam_below_4_gib() {
+        for m in MACHINES {
+            assert!(m.machine.contains("highmem-ecam=off"), "{}", m.name);
+        }
+    }
+
+    #[test]
     fn args_select_the_spec_machine_and_boot_image() {
         let a = args(&VIRT, Path::new("k.img"), Some(Path::new("b.img")));
         let joined = a.join(" ");
-        assert!(joined.contains("-machine virt,gic-version=2"));
+        assert!(joined.contains("-machine virt,gic-version=2,highmem-ecam=off"));
         assert!(!joined.contains("virtualization"));
         assert!(joined.contains("-cpu cortex-a72"));
         assert!(joined.contains("-m 512M"));
@@ -1309,20 +1316,24 @@ mod tests {
     #[test]
     fn gicv3_machines_ask_for_gic_version_3() {
         let joined = args(&VIRT_V3, Path::new("k.img"), None).join(" ");
-        assert!(joined.contains("-machine virt,gic-version=3 "));
+        assert!(joined.contains("-machine virt,gic-version=3,highmem-ecam=off "));
         assert!(joined.contains("-cpu cortex-a72"));
         assert!(joined.contains("-m 512M"));
         let joined = args(&VIRT_EL2_V3, Path::new("k.img"), None).join(" ");
-        assert!(joined.contains("-machine virt,gic-version=3,virtualization=on"));
+        assert!(joined.contains("-machine virt,gic-version=3,highmem-ecam=off,virtualization=on"));
         assert!(joined.contains("-cpu cortex-a53"));
     }
 
     #[test]
     fn hvf_machines_pin_the_irqchip() {
         let v3 = args(&HVF_V3, Path::new("k.img"), None).join(" ");
-        assert!(v3.contains("-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on "));
+        assert!(v3.contains(
+            "-machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on "
+        ));
         let v2 = args(&HVF_V2, Path::new("k.img"), None).join(" ");
-        assert!(v2.contains("-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off "));
+        assert!(v2.contains(
+            "-machine virt,gic-version=2,highmem-ecam=off -accel hvf,kernel-irqchip=off "
+        ));
         for m in [&HVF_V3, &HVF_V2] {
             let a = args(m, Path::new("k.img"), None).join(" ");
             assert!(m.is_hvf());
@@ -1608,7 +1619,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     fn el2_args_turn_on_virtualization_on_a_cortex_a53() {
         let a = args(&VIRT_EL2, Path::new("k.img"), Some(Path::new("b.img")));
         let joined = a.join(" ");
-        assert!(joined.contains("-machine virt,gic-version=2,virtualization=on"));
+        assert!(joined.contains("-machine virt,gic-version=2,highmem-ecam=off,virtualization=on"));
         assert!(joined.contains("-cpu cortex-a53"));
         assert!(joined.contains("-m 512M"));
         assert!(joined.contains("-kernel k.img"));
