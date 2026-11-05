@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# PCRE2, the regular expressions of nginx's `location ~` and `rewrite`:
+# tools/build-nginx.py builds its 8-bit library without JIT into nginx; the
+# package installs no file of its own.
+# Format: docs/packages.md.
+
+name = "pcre2"
+version = "10.49"
+kind = "net"
+url = "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz"
+sha256 = "929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae"
+license = "BSD-3-Clause WITH PCRE2-exception"
+license_file = "LICENCE.md"
+depends = ["busybox"]
+build = "tools/build-nginx.py"
+files = []

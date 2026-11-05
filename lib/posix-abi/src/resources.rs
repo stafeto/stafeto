@@ -152,6 +152,18 @@ pub fn initialize_nofile() -> Result<(), i32> {
     let limit = crate::process::client().limit(NOFILE).map_err(errno)?;
     crate::shared::set_nofile_limit(limit.soft)
 }
+/// setgroups: EINVAL above the 16 places of the list, EPERM for a caller
+/// that is not the superuser.
+pub fn set_groups(list: &[u32]) -> Result<(), i32> {
+    let mut groups = proto_process::Groups::EMPTY;
+    let places = groups.ids.get_mut(..list.len()).ok_or(EINVAL)?;
+    places.copy_from_slice(list);
+    groups.count = list.len() as u32;
+    if !groups.valid() {
+        return Err(EINVAL);
+    }
+    crate::process::client().set_groups(&groups).map_err(errno)
+}
 pub fn groups() -> Result<proto_process::Groups, i32> {
     crate::process::client().groups().map_err(errno)
 }

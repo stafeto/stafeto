@@ -483,6 +483,11 @@ pub enum Method {
     /// it. The reply to Get: status, the kind u32 (`IMAGE_FOUND` ...) and
     /// the pages u32.
     Image = 46,
+    /// setgroups: the body is a `Groups` (the count u32 and 16 IDs u32, the
+    /// unused ones 0). PERMISSION unless the caller's effective user ID is
+    /// 0, INVALID for a list that is not valid. A change raises the
+    /// generation of the credentials. Reply: the status.
+    SetGroups = 47,
     /// Generate a directed job signal and return its epoch ticket.
     SignalGeneration = 48,
     /// Apply a delivered default stop with its epoch ticket.
@@ -664,8 +669,8 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
-    58, 59, 60, 61, 62, 63,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+    57, 58, 59, 60, 61, 62, 63,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1783,6 +1788,7 @@ mod tests {
             Method::LoaderTerminal,
             Method::LoaderClock,
             Method::Image,
+            Method::SetGroups,
             Method::SignalGeneration,
             Method::StopSelf,
             Method::DetachCtty,

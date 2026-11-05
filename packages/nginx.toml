@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# nginx, the stable branch, with the settings of the measure of the network
+# (tools/nginx/nginx.conf); in the images with the network service only.
+# Format: docs/packages.md.
+
+name = "nginx"
+version = "1.30.6"
+kind = "net"
+url = "https://nginx.org/download/nginx-1.30.6.tar.gz"
+sha256 = "3cf46f5ed7504d460125866b7bea99fb357f31d887e2e63b35503310e9b8b6c8"
+license = "BSD-2-Clause"
+depends = ["busybox", "pcre2"]
+build = "tools/build-nginx.py"
+program = "nginx"
+dirs = ["/etc/nginx", "/var/log/nginx", "/var/lib", "/var/lib/nginx"]
+files = [
+  "/bin/nginx = elf:nginx",
+  "/etc/nginx/mime.types = bytes:mime.types",
+  "/etc/nginx/nginx.conf = bytes:nginx.conf",
+]

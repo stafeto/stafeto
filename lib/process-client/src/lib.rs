@@ -145,6 +145,18 @@ impl Client {
         }
         Ok(groups)
     }
+    /// setgroups: the service keeps `groups` as the record's supplementary
+    /// list.
+    pub fn set_groups(&self, groups: &proto_process::Groups) -> Result<(), Status> {
+        let mut w = Writer::new();
+        Method::SetGroups.header().write(&mut w)?;
+        groups.write(&mut w)?;
+        let mut buffer = [0; 64];
+        if self.call(w.as_bytes(), &mut buffer)? != proto_wire::reply(Status::Ok) {
+            return Err(Status::BadSize);
+        }
+        Ok(())
+    }
     /// Change: the service changes the record's credentials once, whatever
     /// signals come while the caller waits for the reply.
     pub fn change(&self, operation: Change, id: u32) -> Result<(), Status> {

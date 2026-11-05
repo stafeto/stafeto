@@ -512,13 +512,15 @@ const NET_LAUNCHER: Record = Record {
 pub const NET_COMMAND_QUOTA: u64 = 1472 * PAGE;
 
 /// The process service of the image with the network: the pool of the
-/// shell's image and ten more quotas of a command. `httpd` forks a child for
-/// each connection, and the eight simultaneous requests of `net-curl` make
-/// eight children over the shell, the server and the launcher.
+/// shell's image and sixteen more quotas of a command. `httpd` forks a child
+/// for each connection, and the eight simultaneous requests of `net-curl`
+/// make eight children over the shell, the server and the launcher; a reload
+/// of nginx (SIGHUP) has its master, four old and four new workers alive at
+/// once beside the shell, the launcher and `posix-net`.
 const NET_PROCESS_SERVICE: Record = Record {
     quota: super::ramfs::POSIX_ABI_TABLE[1].quota
         + super::ramfs::BUSYBOX_DIALOG_POOL
-        + 10 * NET_COMMAND_QUOTA,
+        + 16 * NET_COMMAND_QUOTA,
     ..super::ramfs::BUSYBOX_DIALOG_TABLE[2]
 };
 

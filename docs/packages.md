@@ -104,6 +104,16 @@ them for the licence notes of the image.
   `CURL-SOURCE`, `CA-BUNDLE-LICENSE`, `CA-BUNDLE-SOURCE`). The images of the
   probe of TLS (`cargo xtask net-tls`) replace the bytes of the CA file with
   the same roots plus the probe CA of `cargo xtask probe-ca`.
+- nginx 1.30.6 (`/bin/nginx`, BSD-2-Clause, with `/etc/nginx/mime.types` and
+  `/etc/nginx/nginx.conf`) and PCRE2 10.49 (BSD-3-Clause with the PCRE2
+  exception, linked into nginx, no file of its own) are network packages
+  too. An image with nginx carries `NGINX-LICENSE`, `NGINX-SOURCE`,
+  `PCRE2-LICENCE` and `PCRE2-SOURCE`. nginx's `configure` runs its probes for
+  the target through `tools/nginx/cross-autotest.patch` and
+  `tools/nginx/autotest-answer.py`, which answers sizes from the compiler and
+  every other run-probe from a table with a reason; a probe it does not know
+  stops the build. `cargo xtask nginx-probe` runs nginx in the images
+  `boot-nginx-probe.img` and `boot-nginx-probe-steps.img`.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 
