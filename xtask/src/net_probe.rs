@@ -406,7 +406,7 @@ fn rtts(line: &str) -> Option<(u64, u64)> {
 }
 
 /// The counters of a line `net: frames rx R tx T dhcp D dropped X martian M
-/// listen_short S syn_dropped D bad_sum B demux_probe P`.
+/// listen_short S syn_dropped D set_barred A syn_stray Y bad_sum B demux_probe P`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frames {
     dropped: u64,
@@ -416,6 +416,11 @@ struct Frames {
     /// The SYNs a full queue dropped: not a fault.
     #[allow(dead_code)]
     syn_dropped: u64,
+    /// Queue sockets of a group member the sets had no place for.
+    #[allow(dead_code)]
+    set_barred: u64,
+    /// SYNs taken by the queue of another member than the chosen one.
+    syn_stray: u64,
     bad_sum: u64,
     demux_probe: u64,
 }
@@ -437,6 +442,10 @@ fn frames(line: &str) -> Option<Frames> {
         listen_short,
         "syn_dropped",
         syn_dropped,
+        "set_barred",
+        set_barred,
+        "syn_stray",
+        syn_stray,
         "bad_sum",
         bad_sum,
         "demux_probe",
@@ -453,9 +462,20 @@ fn frames(line: &str) -> Option<Frames> {
         martian: martian.parse().ok()?,
         listen_short: listen_short.parse().ok()?,
         syn_dropped: syn_dropped.parse().ok()?,
+        set_barred: set_barred.parse().ok()?,
+        syn_stray: syn_stray.parse().ok()?,
         bad_sum: bad_sum.parse().ok()?,
         demux_probe: demux_probe.parse().ok()?,
     })
+}
+
+/// The line the service prints when a SYN went to a queue other than the
+/// chosen one (a fault of the placing of the queue sockets): the run fails.
+pub fn syn_stray_fault(lines: &[String]) -> Result<(), String> {
+    match lines.iter().find(|l| l.contains("netd: syn_stray")) {
+        Some(line) => Err(format!("the service counted a stray SYN: {line:?}")),
+        None => Ok(()),
+    }
 }
 
 /// The `dhcp` counter of a line of frames.
@@ -585,10 +605,13 @@ pub fn verdict(lines: &[String], mode: Mode, roles: Roles) -> Result<(), String>
     let counters: Vec<Frames> = lines.iter().filter_map(|l| frames(l)).collect();
     // A frame of 127.0.0.0/8 on the wire is a fault of the stack; a queue of
     // `listen` that `accept` could not refill is a fault of the table.
-    if let Some(f) = counters
-        .iter()
-        .find(|f| f.martian != 0 || f.listen_short != 0 || f.bad_sum != 0 || f.dropped != 0)
-    {
+    if let Some(f) = counters.iter().find(|f| {
+        f.martian != 0
+            || f.listen_short != 0
+            || f.bad_sum != 0
+            || f.dropped != 0
+            || f.syn_stray != 0
+    }) {
         return Err(format!("the service counted {f:?}"));
     }
     if let Some(f) = counters.iter().find(|f| f.demux_probe > DEMUX_PROBE_MAX) {
@@ -1811,7 +1834,8 @@ fn rates(machine: &qemu::Machine) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const COUNTERS: &str = "martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 2";
+    const COUNTERS: &str =
+        "martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 2";
 
     fn good_run(mode: Mode) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
@@ -1967,7 +1991,7 @@ mod tests {
         let mut lines = good_run(Mode::Dhcp);
         let at = lines.iter().position(|l| l.starts_with(FRAMES)).unwrap();
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 bad_sum 1 demux_probe 2"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 1 demux_probe 2"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -1975,7 +1999,7 @@ mod tests {
                 .contains("counted")
         );
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 9"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 0 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 9"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -2050,7 +2074,7 @@ mod tests {
         let mut lines = good_run(Mode::Dhcp);
         let at = lines.iter().position(|l| l.starts_with(FRAMES)).unwrap();
         lines[at] = format!(
-            "{FRAMES}12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 2"
+            "{FRAMES}12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 2"
         );
         assert!(
             verdict(&lines, Mode::Dhcp, Roles::LIMIT)
@@ -2132,7 +2156,7 @@ mod tests {
         assert_eq!(rtts("net-probe: ping rtt max x us median 300 us"), None);
         assert_eq!(
             dhcp_count(
-                "net: frames rx 12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 bad_sum 0 demux_probe 1"
+                "net: frames rx 12 tx 9 dhcp 3 dropped 1 martian 0 listen_short 0 syn_dropped 0 set_barred 0 syn_stray 0 bad_sum 0 demux_probe 1"
             ),
             Some(3)
         );

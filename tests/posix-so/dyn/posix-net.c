@@ -1586,10 +1586,14 @@ static void group_member(int index, int port, int report, int ready)
 	}
 }
 
-/* Four processes listen on one port; 64 connections from different ports
- * reach each of them at least once. */
+/* Four processes listen on one port; 256 connections from different ports
+ * are shared out evenly: the service names the next member of the circle that
+ * has room, so each gets 64 and a share is never outside 48..80 (a quarter
+ * either way). The connections stay open until the end: 256 clients, 256
+ * accepted and 64 sockets of the queues. */
 static void reuseport_4(void)
 {
+	enum { CONNS = 256 };
 	int ready[2], report[2];
 	REQUIRE(pipe(ready) == 0 && pipe(report) == 0);
 	int port = 18090;
@@ -1617,21 +1621,21 @@ static void reuseport_4(void)
 		}
 	}
 	struct sockaddr_in a = at(LOOPBACK, port);
-	int c[64];
+	int c[CONNS];
 	long began = now_ms();
-	for (int i = 0; i < 64; i++) {
+	for (int i = 0; i < CONNS; i++) {
 		c[i] = socket(AF_INET, SOCK_STREAM, 0);
 		REQUIRE(c[i] >= 0);
 		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == 0);
 		long at_ms = now_ms() - began;
-		if (at_ms > 500)
+		if (at_ms > 500 && i % 16 == 0)
 			printf("posix-net: reuseport-4 note: connect %d done at %ld ms\n", i, at_ms);
 	}
 	int count[4] = { 0, 0, 0, 0 };
-	for (int i = 0; i < 64; i++) {
+	for (int i = 0; i < CONNS; i++) {
 		char tag = 99;
 		if (read(report[0], &tag, 1) != 1) {
-			printf("posix-net: reuseport-4 note: got %d of 64 reports (%d %d %d %d) at %ld ms\n", i,
+			printf("posix-net: reuseport-4 note: got %d of %d reports (%d %d %d %d) at %ld ms\n", i, CONNS,
 			       count[0], count[1], count[2], count[3], now_ms() - began);
 			for (int k = 0; k < 4; k++) {
 				int status = 0;
@@ -1643,14 +1647,171 @@ static void reuseport_4(void)
 		REQUIRE(tag >= 0 && tag < 4);
 		count[(int)tag]++;
 	}
-	for (int i = 0; i < 4; i++)
-		REQUIRE(count[i] >= 1);
 	printf("posix-net: reuseport-4 note: shares %d %d %d %d\n", count[0], count[1], count[2], count[3]);
 	for (int i = 0; i < 4; i++)
+		REQUIRE(count[i] >= 48 && count[i] <= 80);
+	for (int i = 0; i < 4; i++)
 		REQUIRE(wait_exit(kids[i]) == 0);
-	for (int i = 0; i < 64; i++)
+	for (int i = 0; i < CONNS; i++)
 		REQUIRE(close(c[i]) == 0);
 	REQUIRE(close(ready[0]) == 0 && close(report[0]) == 0);
+}
+
+/* A listening description of the group, the way a reload of nginx hands it on:
+ * the process that made it forks a successor that inherits the description
+ * and ends at once, with nothing taken from the queue. The successor of
+ * member 3 starts to accept 1.5 s late (its queue is only 2 long and fills:
+ * the circle skips it), the others at once. A successor must accept a
+ * connection within 2 s of its first `accept`; it reports each on `report`
+ * and 100 + index when it waited in vain, and ends after a quiet second. */
+static void handoff_successor(int index, int lis, int report)
+{
+	if (index == 3)
+		pause_ms(1500);
+	int first = 1;
+	for (;;) {
+		struct pollfd pf = { lis, POLLIN, 0 };
+		int n = poll(&pf, 1, first ? 2000 : 1000);
+		if (n == 0) {
+			char bad = (char)(100 + index);
+			if (first && write(report, &bad, 1) != 1)
+				_exit(30);
+			_exit(first ? 31 : 0);
+		}
+		if (n < 0)
+			_exit(32);
+		int s = accept(lis, NULL, NULL);
+		if (s < 0)
+			_exit(33);
+		first = 0;
+		char tag = (char)index;
+		if (write(report, &tag, 1) != 1)
+			_exit(34);
+	}
+}
+
+static void handoff_report(int report, int seen[4], int *bad)
+{
+	for (;;) {
+		struct pollfd pf = { report, POLLIN, 0 };
+		if (poll(&pf, 1, 0) != 1)
+			return;
+		char tag = 0;
+		if (read(report, &tag, 1) != 1)
+			return;
+		if (tag >= 100)
+			(*bad)++;
+		else if (tag >= 0 && tag < 4)
+			seen[(int)tag]++;
+	}
+}
+
+/* One connection every 50 ms reaches every successor within 2 s, and a fifth
+ * description that joins the group gets one within 2 s as well. */
+static void reuseport_handoff(void)
+{
+	enum { FIRST = 40, SECOND = 40 };
+	int ready[2], report[2];
+	REQUIRE(pipe(ready) == 0 && pipe(report) == 0);
+	int port = 18092;
+	for (int i = 0; i < 4; i++) {
+		pid_t maker = fork();
+		REQUIRE(maker >= 0);
+		if (maker == 0) {
+			close(ready[0]);
+			close(report[0]);
+			int lis = socket(AF_INET, SOCK_STREAM, 0);
+			int one = 1;
+			if (lis < 0 || setsockopt(lis, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) != 0)
+				_exit(10);
+			struct sockaddr_in any = at(INADDR_ANY, port);
+			if (bind(lis, (struct sockaddr *)&any, sizeof any) != 0)
+				_exit(12);
+			if (listen(lis, i == 3 ? 2 : 16) != 0)
+				_exit(13);
+			pid_t successor = fork();
+			if (successor < 0)
+				_exit(14);
+			if (successor == 0) {
+				close(ready[1]);
+				handoff_successor(i, lis, report[1]);
+			}
+			char r = 'R';
+			if (write(ready[1], &r, 1) != 1)
+				_exit(15);
+			_exit(0);
+		}
+		REQUIRE(wait_exit(maker) == 0);
+	}
+	REQUIRE(close(ready[1]) == 0);
+	char r[4];
+	REQUIRE(read(ready[0], r, 4) == 4);
+	REQUIRE(close(ready[0]) == 0);
+	REQUIRE(close(report[1]) == 0);
+	struct sockaddr_in a = at(LOOPBACK, port);
+	int seen[4] = { 0, 0, 0, 0 }, bad = 0;
+	int c[FIRST + SECOND];
+	for (int i = 0; i < FIRST; i++) {
+		c[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c[i] >= 0);
+		long t = now_ms();
+		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == 0);
+		/* A SYN that met a full queue waits for its second try. */
+		if (now_ms() - t > 800)
+			fail("a connection waited for a queue nobody takes from");
+		handoff_report(report[0], seen, &bad);
+		pause_ms(50);
+	}
+	/* The fifth description joins the group. */
+	int fifth = socket(AF_INET, SOCK_STREAM, 0);
+	int one = 1;
+	REQUIRE(fifth >= 0 && setsockopt(fifth, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == 0);
+	struct sockaddr_in any = at(INADDR_ANY, port);
+	REQUIRE(bind(fifth, (struct sockaddr *)&any, sizeof any) == 0);
+	REQUIRE(listen(fifth, 16) == 0);
+	REQUIRE(fcntl(fifth, F_SETFL, O_NONBLOCK) == 0);
+	long joined = now_ms();
+	long got_fifth = -1;
+	for (int i = FIRST; i < FIRST + SECOND; i++) {
+		c[i] = socket(AF_INET, SOCK_STREAM, 0);
+		REQUIRE(c[i] >= 0);
+		long t = now_ms();
+		REQUIRE(connect(c[i], (struct sockaddr *)&a, sizeof a) == 0);
+		if (now_ms() - t > 800)
+			fail("a connection waited for a queue nobody takes from");
+		int s = accept(fifth, NULL, NULL);
+		if (s >= 0) {
+			if (got_fifth < 0)
+				got_fifth = now_ms() - joined;
+			REQUIRE(close(s) == 0);
+		}
+		handoff_report(report[0], seen, &bad);
+		pause_ms(50);
+	}
+	printf("posix-net: reuseport-handoff note: successors %d %d %d %d, the fifth at %ld ms\n", seen[0], seen[1],
+	       seen[2], seen[3], got_fifth);
+	REQUIRE(got_fifth >= 0 && got_fifth <= 2000);
+	/* The successors end after a quiet second; the pipe ends then. */
+	for (;;) {
+		struct pollfd pf = { report[0], POLLIN, 0 };
+		if (poll(&pf, 1, 4000) != 1)
+			fail("the successors did not end");
+		char tag;
+		ssize_t n = read(report[0], &tag, 1);
+		if (n == 0)
+			break;
+		REQUIRE(n == 1);
+		if (tag >= 100)
+			bad++;
+		else if (tag >= 0 && tag < 4)
+			seen[(int)tag]++;
+	}
+	REQUIRE(bad == 0);
+	for (int i = 0; i < 4; i++)
+		REQUIRE(seen[i] >= 1);
+	for (int i = 0; i < FIRST + SECOND; i++)
+		REQUIRE(close(c[i]) == 0);
+	REQUIRE(close(fifth) == 0 && close(report[0]) == 0);
 }
 
 /* The port of a group is held by one user: a process of another user that asks
@@ -2979,6 +3140,7 @@ static const struct {
 	{ "syn-full", syn_full },
 	{ "timewait-syn", timewait_syn },
 	{ "reuseport-4", reuseport_4 },
+	{ "reuseport-handoff", reuseport_handoff },
 	{ "reuseport-uid", reuseport_uid },
 	{ "linger-0", linger_0 },
 	{ "linger-wait", linger_wait },
