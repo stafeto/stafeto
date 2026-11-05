@@ -517,8 +517,10 @@ const NET_LAUNCHER: Record = Record {
 /// four workers at random) fails with 1 832 pages and passes with 1 904;
 /// all its 100 streams in one worker (one connection of 100 streams) fail
 /// with 3 328 pages and pass with 3 584 (bisected). 4 096 pages (16 MiB)
-/// carry the worst spread with 14% left. A quota is a limit that reserves
-/// no memory ahead.
+/// carry the worst spread with 14% left. A quota comes off init's at boot;
+/// its pages are taken on use. The sixteen quotas of the pool below leave
+/// init 26 752 of its 125 753 pages free after the boot of
+/// `boot-nginx-probe.img` on 512 MiB (71 360 with 1 472 pages a command).
 pub const NET_COMMAND_QUOTA: u64 = 4096 * PAGE;
 
 /// The process service of the image with the network: the pool of the

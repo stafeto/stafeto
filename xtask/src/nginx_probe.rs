@@ -38,8 +38,9 @@
 //!    - 4e: `h2load -n 1000 -c 10 -m 10` from the host: 1000 answers 2xx over
 //!      TLS 1.3 and h2, none failed. A check: its rate is no measurement
 //!      (that runs with `--rate`). Where the host has no h2load the step
-//!      says so and is skipped; the runner of ci installs it
-//!      (nghttp2-client in .github/actions/setup).
+//!      says so and is skipped, on the runner of ci (GITHUB_ACTIONS) it
+//!      fails: the runner installs it (nghttp2-client in
+//!      .github/actions/setup).
 //!
 //! 5. `kill -HUP` of the master: `reconfiguring`; meanwhile a new connection
 //!    every 50 ms asks for the page, and none fails; 5 s later five
@@ -1157,6 +1158,16 @@ fn h2load_verdict(said: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("h2load: no rate in {:?}", line("finished in")))
 }
 
+/// Step 4e on a host without h2load: skipped on a developer's machine,
+/// refused on the runner of ci, which installs it (nghttp2-client).
+fn without_h2load(in_ci: bool) -> Result<(), String> {
+    if in_ci {
+        return Err("4e: h2load is missing on the runner of ci (nghttp2-client)".to_owned());
+    }
+    println!("nginx-probe: 4e: h2load: not installed, skipped");
+    Ok(())
+}
+
 /// Step 4e: h2load from the host, a check of h2 under ten connections; its
 /// rate is printed, no measurement.
 fn h2load(port: u16) -> Result<(), String> {
@@ -1169,8 +1180,7 @@ fn h2load(port: u16) -> Result<(), String> {
         .output();
     let output = match output {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("nginx-probe: 4e: h2load: not installed, skipped");
-            return Ok(());
+            return without_h2load(std::env::var_os("GITHUB_ACTIONS").is_some());
         }
         other => other.map_err(|e| format!("h2load: {e}"))?,
     };
@@ -1511,6 +1521,12 @@ status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx
             going = going && line.ends_with('\\');
         }
         words
+    }
+
+    #[test]
+    fn h2load_may_be_missing_off_ci_alone() {
+        assert!(without_h2load(false).is_ok());
+        assert!(without_h2load(true).unwrap_err().contains("h2load"));
     }
 
     /// The runner of ci installs h2load, so that step 4e runs there.

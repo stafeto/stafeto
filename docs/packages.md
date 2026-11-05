@@ -122,9 +122,9 @@ them for the licence notes of the image.
   the probe CA, only into the images of `cargo xtask nginx-probe`
   (`boot-nginx-probe.img` and `boot-nginx-probe-steps.img`), whose settings
   include it. It speaks TLS 1.3 alone, with OpenSSL's default suites of TLS
-  1.3; settings that add TLS 1.2 get OpenSSL's DEFAULT list of ciphers for
-  it, which still holds the exchange of keys by RSA and the CBC mode, and
-  should name `ssl_ciphers`.
+  1.3; settings that add TLS 1.2 get nginx's default `ssl_ciphers`
+  (`HIGH:!aNULL:!MD5`), which still holds the exchange of keys by RSA and
+  the CBC mode, and should name `ssl_ciphers`.
 - The build scripts of the packages run in build order: base first, each
   package after its dependencies.
 

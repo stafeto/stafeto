@@ -151,13 +151,14 @@ pub fn big_file() -> &'static [u8] {
 
 /// The licence texts and the notes of the sources of OpenSSL, curl and the
 /// root certificates, for an image that holds them; `programs` are those of
-/// the image that link OpenSSL, `openssl` among them where it is there.
+/// the image that link OpenSSL (`curl`, `nginx`, `openssl`): OpenSSL's
+/// licence and note go into an image where any of them is.
 pub fn terms_files(
     programs: &[&str],
     curl: bool,
     bundle: bool,
 ) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
-    let openssl = programs.contains(&"openssl");
+    let openssl = !programs.is_empty();
     let read = |path: PathBuf| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()));
     let relibc = crate::script_value("tools/build-relibc.py", "COMMIT")?;
     let commit = crate::rtbench2::commit();
@@ -771,6 +772,7 @@ mod tests {
             linked_into(&["openssl", "nginx", "curl"]),
             "curl, nginx and openssl"
         );
+        assert_eq!(linked_into(&["nginx"]), "nginx");
         assert_eq!(linked_into(&[]), "");
     }
 
