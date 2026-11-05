@@ -308,6 +308,10 @@ fn main(_: u64) -> u64 {
     let Ok(mut transport) = PciTransport::new::<Host, _>(&mut root, at) else {
         return NO_DEVICE;
     };
+    // The crate turned bus mastering on with the decoding; the device must
+    // be reset before it may master the bus.
+    let command = config_read(virtio_pci::COMMAND) & 0xFFFF & !virtio_pci::BUS_MASTER;
+    config_write(virtio_pci::COMMAND, command);
     let status = transport.get_status().bits();
     // The device forgets every queue before it may master the bus again
     // (Virtio 1.2, 2.4.1): a stop of an instance that ended may not have
