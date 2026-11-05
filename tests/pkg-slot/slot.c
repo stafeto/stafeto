@@ -32,10 +32,12 @@ extern int ps_session(void);
 extern int ps_list(void);
 extern int ps_begin(void);
 extern int ps_clone_ok(void);
+extern int ps_buffer(int mode);
 extern void ps_hide(int hide);
 extern uint64_t ps_ns(void);
 
 #define NOT_ALLOWED 1201
+#define BUSY 1217
 
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -120,6 +122,21 @@ static int checks(void) {
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     printf("pkg-slot: INSTALL_BEGIN is NOT_ALLOWED for a process that is not the superuser, and taken from the superuser\n");
+
+    /* Two sessions with no identity take the two places for any session; a process that is user
+     * 1000, with its identity, is BUSY at the third, and the superuser still has a place. */
+    CHECK(ps_buffer(0) == 0);
+    CHECK(ps_buffer(0) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        if (setuid(1000) != 0) _exit(60);
+        _exit(ps_buffer(1) == BUSY ? 0 : 61);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(ps_buffer(2) == 0);
+    printf("pkg-slot: BUFFER of a process that is user 1000 is BUSY when the places for any session are in use, the superuser still has one\n");
     return 0;
 }
 

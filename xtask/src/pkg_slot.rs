@@ -38,13 +38,14 @@ pub const PROGRAMS: [ImageProgram; 10] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const LINES: [&str; 6] = [
+const LINES: [&str; 7] = [
     "pkg-slot: the start gave a session that answers a LIST and a CLONE",
     "pkg-slot: a forked child has a session of its own that answers, the parent's answers after the child ended",
     "pkg-slot: a spawned program has a session of its own",
     "pkg-slot: a set-ID program gets no session",
     "pkg-slot: exec keeps the session, and the parent's answers after the program ended",
     "pkg-slot: INSTALL_BEGIN is NOT_ALLOWED for a process that is not the superuser, and taken from the superuser",
+    "pkg-slot: BUFFER of a process that is user 1000 is BUSY when the places for any session are in use, the superuser still has one",
 ];
 
 const PRICE: &str = "pkg-slot: fork with the session ";

@@ -22,6 +22,14 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
     let at = usize::from(image == FULL_IMAGE);
     LISTS[at].get_or_init(|| {
         let packages = packages::of_image(image).unwrap_or_else(|e| panic!("{image}: {e}"));
+        // The package service lists this many packages of the image and says `too many packages,
+        // skipped` to the rest: the build refuses an image it would fail.
+        assert!(
+            packages.len() <= pkgd::packages::IMAGE_MAX,
+            "{image} holds {} packages, the package service lists {} (pkgd::packages::IMAGE_MAX)",
+            packages.len(),
+            pkgd::packages::IMAGE_MAX
+        );
         let mut programs = SHELL_SERVICES.to_vec();
         programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
         programs.extend(package_programs(&packages));

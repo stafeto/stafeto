@@ -52,6 +52,70 @@ fn ask(request: &[u8], identity: bool) -> i32 {
     }
 }
 
+/// The sessions BUFFER was asked on and keeps (their places stay in use).
+static KEPT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// BUFFER on a session: mode 0 on a new clone of the process's session with no identity (kept),
+/// 1 on the process's own session with its identity, 2 on a new clone with the identity (kept).
+/// 0 for an answer OK, else the code of the refusal.
+#[unsafe(no_mangle)]
+pub extern "C" fn ps_buffer(mode: i32) -> i32 {
+    let Some(own) = packages::session() else {
+        return -1;
+    };
+    let own = Handle::<Channel>::borrowed(own);
+    let session = if mode == 1 {
+        None
+    } else {
+        match rt::service::clone_session(&own, &Method::Clone.header().bytes()) {
+            Ok(clone) => Some(clone),
+            Err(_) => return -1,
+        }
+    };
+    let target = session.as_ref().unwrap_or(&own);
+    let Ok(object) = sys::mem_create(u64::from(pkg::BUFFER_SIZE)) else {
+        return -1;
+    };
+    let Ok(copy) = sys::handle_duplicate(
+        &object,
+        Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
+    ) else {
+        return -1;
+    };
+    let mut w = Writer::new();
+    if pkg::write_word(Method::Buffer, pkg::BUFFER_SIZE, &mut w).is_err() {
+        return -1;
+    }
+    let who = (mode != 0)
+        .then(posix_abi::process::identity)
+        .flatten()
+        .and_then(|i| sys::handle_duplicate(i, Rights::NOTIFY | Rights::TRANSFER).ok());
+    let reply = match who {
+        None => sys::send_handles(target, w.as_bytes(), [copy.erase()]),
+        Some(who) => sys::send_handles(target, w.as_bytes(), [copy.erase(), who.erase()]),
+    };
+    let Ok(reply) = reply else {
+        return -1;
+    };
+    let mut out = [0; MESSAGE_MAX];
+    let code = match Reader::new(reply.bytes(&mut out))
+        .u32()
+        .map(Status::from_code)
+    {
+        Ok(Status::Ok) => 0,
+        Ok(Status::Unknown(code)) => code as i32,
+        _ => -1,
+    };
+    // A session that holds a place is kept for the probe's life.
+    if code == 0
+        && let Some(session) = session
+        && let Some(cell) = KEPT.iter().find(|c| c.load(Ordering::Relaxed) == 0)
+    {
+        cell.store(session.into_raw().0, Ordering::Relaxed);
+    }
+    code
+}
+
 /// LIST from the first entry: 0 when the service answers it, else the code.
 #[unsafe(no_mangle)]
 pub extern "C" fn ps_list() -> i32 {
