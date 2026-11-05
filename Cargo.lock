@@ -423,6 +423,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkgd"
+version = "0.2.0"
+dependencies = [
+ "abi",
+ "bootimg",
+ "pkgfmt",
+ "proto-blk",
+ "proto-fs",
+ "proto-init",
+ "proto-pkg",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "pkgfmt"
 version = "0.1.0"
 dependencies = [
