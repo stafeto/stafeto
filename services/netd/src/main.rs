@@ -48,7 +48,6 @@ mod second;
 mod seed;
 mod split;
 mod stack;
-mod transport;
 
 use abi::{Access, Rights, Source};
 use core::alloc::{GlobalAlloc, Layout};
@@ -73,7 +72,11 @@ use smoltcp::iface::SocketStorage;
 use stack::{Event, PingEnd, Stack, Storage};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::{SomeTransport, Transport};
-use virtio_mmio::{Isr, OpenError, PAGE, StartError};
+use virtio_mmio::{Isr, PAGE};
+use virtio_net::barrier::ring;
+use virtio_net::open::{MAC, MTU, STATUS};
+use virtio_net::transport::{self, Function, OpenError};
+use virtio_net::{OpenFailure, Opened};
 
 rt::entry!(main);
 
@@ -92,25 +95,19 @@ const RX1: u64 = 64;
 const STEP_BITS: u64 = RX | RX1 | TX | CLEANUP | WAKE | SWEEP | RESOLV;
 /// The label of the service's timer.
 const TIMER_LABEL: u64 = 1;
+/// The objects of the second device in the start data of a record of two
+/// devices, after `dma` and `net`: the pages of its queues and four objects
+/// of 4 MiB of buffers.
+const SECOND_OBJECTS: [&str; 5] = ["dma1", "net1a", "net1b", "net1c", "net1d"];
 /// The device's queues: `receiveq` and `transmitq` (Virtio 1.2, 5.1.2).
 const RECEIVEQ: u16 = 0;
 const TRANSMITQ: u16 = 1;
-/// The features the service asks for: `VIRTIO_F_VERSION_1` (added by
-/// `start_with`), `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
+/// The features the service asks for (`virtio_net::open`):
+/// `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MTU`, `VIRTIO_NET_F_MAC` and
 /// `VIRTIO_NET_F_STATUS`. No checksum offload, no segmentation offload, no
 /// merged buffers, no control queue (Virtio 1.2, 5.1.3). Apple's device
-/// clears `FEATURES_OK` for any set without MTU (it offers MTU and wants it
-/// accepted), whatever else the set holds.
-const MTU: u64 = 1 << 3;
-const MAC: u64 = 1 << 5;
-const STATUS: u64 = 1 << 16;
-/// The offset of the link status in the configuration space (Virtio 1.2,
-/// 5.1.4), after the six bytes of the MAC.
-const STATUS_AT: usize = 6;
-const LINK_UP: u32 = 1;
-/// The offset of the MTU in the configuration space, after the MAC, the
-/// status and `max_virtqueue_pairs`.
-const MTU_AT: usize = 10;
+/// clears `FEATURES_OK` for any set without MTU.
+const WANTED: u64 = MTU | MAC | STATUS;
 /// The least MTU the service starts on: the IP packet of a full frame.
 const MTU_MIN: u16 = 1500;
 
@@ -173,23 +170,6 @@ fn word(own: &[u8], at: usize) -> u64 {
         .map_or(0, u64::from_le_bytes)
 }
 
-/// The MAC address and the link status the configuration space of the
-/// device holds, read at the width of each field (Virtio 1.2, 4.2.2.2: the
-/// bytes of the MAC one at a time, the status as 16 bits) between two equal
-/// generations (Virtio 1.2, 2.5.1).
-fn read_config(transport: &impl Transport) -> Result<([u8; 6], bool), ()> {
-    transport
-        .read_consistent(|| {
-            let mut mac = [0u8; 6];
-            for (at, byte) in mac.iter_mut().enumerate() {
-                *byte = transport.read_config_space::<u8>(at)?;
-            }
-            let status = transport.read_config_space::<u16>(STATUS_AT)?;
-            Ok((mac, u32::from(status) & LINK_UP != 0))
-        })
-        .map_err(|_| ())
-}
-
 /// 16 bytes for the table of destinations from the key of the ports and 8
 /// bytes more of the entropy service's key: two SipHash-2-4 values of them.
 #[allow(deprecated)] // SipHasher is in core and has no replacement there.
@@ -219,13 +199,23 @@ fn main(_: u64) -> u64 {
     else {
         return NO_START_DATA;
     };
+    // The record of two devices gives the second device objects of its own
+    // (init's table): the service drives it on `dma1` and the first
+    // megabyte of `net1a`, and keeps the others.
+    let second_objects = SECOND_OBJECTS.map(|name| s.take::<Memory>(name).ok());
+    let objects = if second_objects.iter().all(Option::is_some) {
+        2 + SECOND_OBJECTS.len()
+    } else {
+        2
+    };
     let args = ServiceArgs::read(s.args()).ok();
-    // The own arguments: the physical addresses of `dma` and `net`, which
-    // init puts first, then the record's, where the transport is.
+    // The own arguments: the physical addresses of the objects, which init
+    // puts first in their order, then the record's, where the transports
+    // are: the second device's transport or function is 0 without one.
     let own = args.map_or(&[][..], |a| a.own);
-    let (dma_pa, net_pa, at) = (word(own, 0), word(own, 8), word(own, 16));
-    // The second device's transport or function, 0 without one.
-    let at1 = word(own, 24);
+    let (dma_pa, net_pa) = (word(own, 0), word(own, 8));
+    let (dma1_pa, net1_pa) = (word(own, 16), word(own, 24));
+    let (at, at1) = (word(own, 8 * objects), word(own, 8 * objects + 8));
     let level = sys::thread_info(&s.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
         return NOT_REGISTERED;
@@ -300,8 +290,7 @@ fn main(_: u64) -> u64 {
     let Ok(irq) = got.take::<Interrupt>("irq") else {
         return NOT_REGISTERED;
     };
-    // The record of two devices has a second binding, and its objects hold
-    // the second device's half behind the first's.
+    // The record of two devices has a second binding.
     let irq1 = got.take::<Interrupt>("irq1").ok();
     let devices = 1 + usize::from(irq1.is_some());
     let rw = Access::ReadWrite;
@@ -338,64 +327,37 @@ fn main(_: u64) -> u64 {
         windows[1] = Some(bar);
         true
     };
-    // Each device has its half of each object: `dma` holds the pages of the
-    // queues of both, `net` the buffers of both.
-    let dma_half = dma::DMA_PAGES as u64 * page;
-    let net_half = NET_PAGES as u64 * page;
-    if dma_pa == 0 || net_pa == 0 {
-        return NOT_MAPPED;
-    }
-    for d in 0..devices {
-        let (dma_offset, net_offset) = (d as u64 * dma_half, d as u64 * net_half);
-        if sys::mem_map(
-            &s.process,
-            &dma_object,
-            dma_offset,
-            dma_half,
-            dma::dma_at(d),
-            rw,
-        )
-        .is_err()
-            || sys::mem_map(
-                &s.process,
-                &net_object,
-                net_offset,
-                net_half,
-                dma::net_at(d),
-                rw,
-            )
-            .is_err()
+    // Each device has its pages of the queues (`dma`, `dma1`) and its 512
+    // buffers (`net`, the first megabyte of `net1a`).
+    let dma_len = dma::DMA_PAGES as u64 * page;
+    let net_len = NET_PAGES as u64 * page;
+    let [dma1_object, net1_object, ..] = &second_objects;
+    let maps = [
+        (Some(&dma_object), dma_pa, Some(&net_object), net_pa),
+        (dma1_object.as_ref(), dma1_pa, net1_object.as_ref(), net1_pa),
+    ];
+    for (d, &(dma_object, dma_pa, net_object, net_pa)) in maps.iter().enumerate().take(devices) {
+        let (Some(dma_object), Some(net_object)) = (dma_object, net_object) else {
+            return NOT_MAPPED;
+        };
+        if dma_pa == 0
+            || net_pa == 0
+            || sys::mem_map(&s.process, dma_object, 0, dma_len, dma::dma_at(d), rw).is_err()
+            || sys::mem_map(&s.process, net_object, 0, net_len, dma::net_at(d), rw).is_err()
+            || !dma::attach(d, dma_pa, net_pa)
         {
             return NOT_MAPPED;
         }
-    }
-    dma::attach(DEVICE, dma_pa, net_pa);
-    if devices == 2 {
-        dma::attach(1, dma_pa + dma_half, net_pa + net_half);
     }
     let (mut transport, status) = match open_device(pci, DEVICE, at) {
         Ok(found) => found,
         Err(code) => return code,
     };
-    let features = match virtio_mmio::start_with(&mut transport, MTU | MAC | STATUS) {
-        Ok(bits) => bits,
-        Err(StartError::Reset) => return NOT_STARTED,
-        Err(StartError::Features) => {
-            rt::println!(
-                "virtio-net: features refused, offered {:#x}",
-                transport.read_device_features()
-            );
-            return NOT_STARTED;
-        }
+    let opened = match start_device(&mut transport, "virtio-net") {
+        Ok(opened) => opened,
+        Err(code) => return code,
     };
-    if features & MAC == 0 {
-        rt::println!("virtio-net: the device offers no MAC address");
-        return NO_DEVICE;
-    }
-    let Ok((mac, link)) = read_config(&transport) else {
-        return NOT_STARTED;
-    };
-    let link = link || features & STATUS == 0;
+    let (mac, link) = (opened.mac, opened.link);
     type Q = VirtQueue<dma::Host<DEVICE>, QUEUE_SIZE>;
     let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
         return NOT_STARTED;
@@ -428,8 +390,8 @@ fn main(_: u64) -> u64 {
     let mut device = NetDevice::new(RxRing::new(rx_queue), TxRing::new(tx_queue), mac);
     device.rx.fill();
     transport.finish_init();
-    virtio_mmio::ring(&mut transport, RECEIVEQ);
-    device.rx.dirty = false;
+    ring(&mut transport, RECEIVEQ);
+    device.rx.ring.dirty = false;
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
     if pci {
         rt::println!(
@@ -445,7 +407,7 @@ fn main(_: u64) -> u64 {
     if !link {
         rt::println!("virtio-net: link down");
     }
-    if !mtu_fits(&transport, features, "virtio-net") {
+    if !mtu_fits(&opened, "virtio-net") {
         return NOT_STARTED;
     }
     // The second device, if the record has one.
@@ -497,8 +459,6 @@ fn main(_: u64) -> u64 {
         interrupted: false,
         line_closed: false,
         second,
-        rx1_irq: false,
-        isr_empty: false,
         own_said: false,
         told: 0,
         cleanup_due: false,
@@ -519,7 +479,14 @@ fn main(_: u64) -> u64 {
         held_tx: false,
         #[cfg(feature = "probe")]
         longest: [0; 2],
-        _maps: (dma_object, net_object, windows),
+        #[cfg(feature = "probe")]
+        own: &s.thread,
+        _maps: Maps {
+            _dma: dma_object,
+            _net: net_object,
+            _windows: windows,
+            _second: second_objects,
+        },
     };
     // The static address names its servers at once; a lease does in its event.
     if driver.stack.lease.is_some() {
@@ -545,16 +512,31 @@ fn main(_: u64) -> u64 {
     STOPPED
 }
 
+/// The device on `transport` reset, its features negotiated (WANTED), its MAC
+/// address and link status read (`virtio_net::open`); says why on failure
+/// and gives the code the service ends with.
+fn start_device(transport: &mut SomeTransport<'static>, tag: &str) -> Result<Opened, u64> {
+    match virtio_net::open(transport, WANTED) {
+        Ok(opened) => Ok(opened),
+        Err(OpenFailure::Reset | OpenFailure::Config) => Err(NOT_STARTED),
+        Err(OpenFailure::Features { offered }) => {
+            rt::println!("{tag}: features refused, offered {offered:#x}");
+            Err(NOT_STARTED)
+        }
+        Err(OpenFailure::NoMac) => {
+            rt::println!("{tag}: the device offers no MAC address");
+            Err(NO_DEVICE)
+        }
+    }
+}
+
 /// Whether the device's MTU, if it was negotiated, takes the frames the
 /// service builds (MTU_MIN): a driver sends no frame longer than the MTU
 /// (Virtio 1.2, 5.1.4.1), and the service's interface is made for 1 500. Says
 /// the value on the way.
-fn mtu_fits(transport: &impl Transport, features: u64, tag: &str) -> bool {
-    if features & MTU == 0 {
+fn mtu_fits(opened: &Opened, tag: &str) -> bool {
+    let Some(mtu) = opened.mtu else {
         return true;
-    }
-    let Ok(mtu) = transport.read_config_space::<u16>(MTU_AT) else {
-        return false;
     };
     if mtu < MTU_MIN {
         rt::println!("{tag}: mtu {mtu} below {MTU_MIN}");
@@ -573,33 +555,84 @@ fn open_device(pci: bool, device: usize, at: u64) -> Result<(SomeTransport<'stat
     } else {
         "virtio-net1"
     };
-    let opened = if pci {
-        match device {
-            DEVICE => transport::pci_transport::<DEVICE>(&netd::pci::PLACES[DEVICE]),
-            _ => transport::pci_transport::<1>(&netd::pci::PLACES[1]),
-        }
-        .map_err(Some)
-    } else {
-        transport::mmio_transport(device, at).map_err(|error| {
-            match error {
-                OpenError::Rejected(why) => {
-                    rt::println!("{tag}: no network device at {at:#x}: {why:?}")
-                }
-                OpenError::Unusable => rt::println!("{tag}: no usable transport at {at:#x}"),
+    if pci {
+        let opened = match device {
+            DEVICE => pci_transport::<DEVICE>(),
+            _ => pci_transport::<1>(),
+        };
+        return match opened {
+            Ok((transport, status)) => Ok((transport.into(), status)),
+            Err(None) => Err(CONFIG_ELSEWHERE),
+            Err(Some(transport::Failure::NotReset)) => Err(NOT_STARTED),
+            Err(Some(transport::Failure::BarElsewhere)) => {
+                rt::println!("{tag}: BAR 0 of the function lies elsewhere than its window");
+                Err(NO_DEVICE)
             }
-            None
-        })
-    };
-    match opened {
-        Ok(found) => Ok(found),
-        Err(Some(transport::Failure::ConfigElsewhere)) => Err(CONFIG_ELSEWHERE),
-        Err(Some(transport::Failure::NotReset)) => Err(NOT_STARTED),
-        Err(Some(transport::Failure::NoDevice)) => {
-            rt::println!("{tag}: no network device at {at:#x}");
+            Err(Some(transport::Failure::NoDevice)) => {
+                rt::println!("{tag}: no network device at {at:#x}");
+                Err(NO_DEVICE)
+            }
+        };
+    }
+    let base = dma::mmio_at(device) + (at as usize & (PAGE - 1));
+    // SAFETY: the window maps the transport's page at mmio_at as device
+    // memory, read and write; `base` is the transport within it, and only
+    // the transport and the reads of the configuration space reach the
+    // registers from here on.
+    match unsafe { transport::mmio_transport(base) } {
+        Ok((transport, status)) => Ok((transport.into(), status)),
+        Err(OpenError::Rejected(why)) => {
+            rt::println!("{tag}: no network device at {at:#x}: {why:?}");
             Err(NO_DEVICE)
         }
-        Err(None) => Err(NO_DEVICE),
+        Err(OpenError::Unusable) => {
+            rt::println!("{tag}: no usable transport at {at:#x}");
+            Err(NO_DEVICE)
+        }
     }
+}
+
+/// The Virtio PCI function of device `D` of the record, whose page the
+/// window `ecam` maps at `ecam_at() + ecam_offset(D)`, set up as the other
+/// drivers of VZ set theirs up (virtio_pci): the ID of the function checked,
+/// the common configuration looked up in its capability list (init stops
+/// the device through `device_status` at the start of BAR 0; None when it
+/// lies elsewhere), the BARs written with decoding off and then on, the
+/// device reset (`virtio_net::transport::pci_transport`), and bus mastering
+/// on only then (Virtio 1.2, 2.4.1, 3.1.1). Every access to the
+/// configuration space is 32 bits wide, as VZ stops the machine at a byte
+/// write there.
+fn pci_transport<const D: usize>()
+-> Result<(virtio_drivers::transport::pci::PciTransport, u32), Option<transport::Failure>> {
+    let place = &netd::pci::PLACES[D];
+    let page = dma::ecam_at() + netd::pci::ecam_offset(D) as usize;
+    let read = |offset: usize| {
+        // SAFETY: the page is mapped as device memory, read and write; the
+        // offset is a register of virtio_pci.
+        unsafe { virtio_net::mmio::read32(page + offset) }
+    };
+    let write = |offset: usize, value: u32| {
+        // SAFETY: as for `read`.
+        unsafe { virtio_net::mmio::write32(page + offset, value) }
+    };
+    // The record names the function of the network device; one that holds
+    // something else ends the service before it writes there.
+    if read(virtio_pci::ID) != place.id {
+        return Err(Some(transport::Failure::NoDevice));
+    }
+    if virtio_pci::common_config(read) != Some((0, 0)) {
+        return Err(None);
+    }
+    let found = read(virtio_pci::COMMAND) & 0xFFFF;
+    for (offset, value) in place.set_up(found) {
+        write(offset, value);
+    }
+    let opened = transport::pci_transport::<D, _>(Function(page), dma::bar(D)).map_err(Some)?;
+    write(
+        virtio_pci::COMMAND,
+        virtio_pci::bus_master(read(virtio_pci::COMMAND)),
+    );
+    Ok(opened)
 }
 
 /// Starts the second device in `slot`.
@@ -675,6 +708,15 @@ impl Tables {
     }
 }
 
+/// The objects and the windows the service holds for its life: the
+/// mappings and the copies it may hand on need them.
+struct Maps {
+    _dma: Handle<Memory>,
+    _net: Handle<Memory>,
+    _windows: [Option<Handle<Memory>>; 3],
+    _second: [Option<Handle<Memory>>; SECOND_OBJECTS.len()],
+}
+
 /// The service: the device and the stack, the binding of its line, the
 /// timer, the sockets, and the PING that waits for its reply.
 struct Driver<'a> {
@@ -698,11 +740,6 @@ struct Driver<'a> {
     line_closed: bool,
     /// The second device, if the record has one.
     second: Option<&'a mut Second>,
-    /// An interrupt came that the second device's step has not read the
-    /// status for.
-    rx1_irq: bool,
-    /// The status the first device's step read last was empty.
-    isr_empty: bool,
     /// The second device said its own interrupt (see `rx1_step`).
     own_said: bool,
     /// The bits of the notifications to itself that are on their way.
@@ -740,16 +777,30 @@ struct Driver<'a> {
     /// interest sets reads: the own steps of the service are one kind).
     #[cfg(feature = "probe")]
     longest: [u64; 2],
-    _maps: (Handle<Memory>, Handle<Memory>, [Option<Handle<Memory>>; 3]),
+    /// The service's own thread (its handle of the start data), whose time
+    /// of its own (thread_ran) the two steps are measured in: a thread of a
+    /// higher level that runs in the middle of a step does not lengthen it,
+    /// as in rt's count of steps. No handle of its own: the operations of
+    /// role `w` take the service's handles up to its limit.
+    #[cfg(feature = "probe")]
+    own: &'a Handle<rt::handle::Thread>,
+    _maps: Maps,
 }
 
 impl Driver<'_> {
-    /// A step of waking (`which` 0) or of departure (1) took until now from
-    /// `began`: a line when it is the longest of its kind (builds with the
-    /// feature `probe`).
+    /// The ticks the service's thread has run (builds with the feature
+    /// `probe`).
+    #[cfg(feature = "probe")]
+    fn ran(&self) -> u64 {
+        sys::thread_ran(self.own).unwrap_or(0)
+    }
+
+    /// A step of waking (`which` 0) or of departure (1) ran until now from
+    /// `began` (`ran`): a line when it is the longest of its kind (builds
+    /// with the feature `probe`).
     #[cfg(feature = "probe")]
     fn measured(&mut self, which: usize, began: u64) {
-        let ticks = rt::time::now().saturating_sub(began);
+        let ticks = self.ran().saturating_sub(began);
         if ticks > self.longest[which] {
             self.longest[which] = ticks;
             let name = ["wake", "cleanup"][which];
@@ -821,7 +872,6 @@ impl Driver<'_> {
         if interrupt {
             self.line_closed = true;
             let isr = Isr::read(&mut self.transport);
-            self.isr_empty = isr.is_empty();
             if !isr.is_empty() && !core::mem::replace(&mut self.interrupted, true) {
                 rt::println!("virtio-net: first interrupt");
             }
@@ -841,7 +891,7 @@ impl Driver<'_> {
         // notification opens the line instead: the level brings the
         // interrupt back for the frames still in the queue.
         let kernel = split::now();
-        let more = self.device.rx.queue.can_pop()
+        let more = self.device.rx.ring.queue.can_pop()
             || self.device.looped.waiting() > 0
             || self.device.has_deferred();
         let continued = more && self.tell(RX);
@@ -943,11 +993,9 @@ impl Driver<'_> {
         if outcome.first_interrupt {
             rt::println!("virtio-net1: first interrupt");
         }
-        // Both lines share the channel's label, so a first interrupt may be
-        // the first device's line. A status that is not empty here while the
-        // first device's was empty in the same notification is the second
-        // device's own line.
-        if interrupt && outcome.isr_seen && self.isr_empty && !self.own_said {
+        // The notification came from the second device's own line (its
+        // label), and its status was not empty.
+        if interrupt && outcome.isr_seen && !self.own_said {
             self.own_said = true;
             rt::println!("virtio-net1: own interrupt");
         }
@@ -965,7 +1013,7 @@ impl Driver<'_> {
 
     /// The change of the link (the interrupt's configuration bit).
     fn link_changed(&mut self) {
-        let Ok((_, up)) = read_config(&self.transport) else {
+        let Ok((_, up)) = virtio_net::open::read_config(&self.transport) else {
             return;
         };
         if up != self.link {
@@ -1092,11 +1140,15 @@ impl Driver<'_> {
 
     /// Rings the doorbell of each queue that got buffers in the step.
     fn doorbells(&mut self) {
-        if core::mem::take(&mut self.device.rx.dirty) && self.device.rx.queue.should_notify() {
-            virtio_mmio::ring(&mut self.transport, RECEIVEQ);
+        if core::mem::take(&mut self.device.rx.ring.dirty)
+            && self.device.rx.ring.queue.should_notify()
+        {
+            ring(&mut self.transport, RECEIVEQ);
         }
-        if core::mem::take(&mut self.device.tx.dirty) && self.device.tx.queue.should_notify() {
-            virtio_mmio::ring(&mut self.transport, TRANSMITQ);
+        if core::mem::take(&mut self.device.tx.ring.dirty)
+            && self.device.tx.ring.queue.should_notify()
+        {
+            ring(&mut self.transport, TRANSMITQ);
         }
     }
 
@@ -1357,16 +1409,11 @@ impl Service<0> for Driver<'_> {
 
     fn notification(&mut self, n: Notice) {
         match n.source {
-            Source::Interrupt => {
-                // The lines of both devices share the channel's label: the
-                // first device's step reads its status, and the second's
-                // reads its own (a status that is empty costs a read).
-                self.rx_step(true);
-                if self.second.is_some() {
-                    self.rx1_irq = true;
-                    self.tell(RX1);
-                }
-            }
+            // Init labels the bindings of a record of two devices
+            // (`proto_init::binding_label`): the line says whose interrupt it
+            // is, and the step reads that device's status alone.
+            Source::Interrupt if n.label == proto_init::binding_label(1) => self.rx1_step(true),
+            Source::Interrupt => self.rx_step(true),
             Source::Unlabeled if n.bits & STEP_BITS != 0 => {
                 // One step at a time: the first bit in this order, and the
                 // others are told again, so that a request waits for the
@@ -1390,15 +1437,12 @@ impl Service<0> for Driver<'_> {
                         let irq = false;
                         self.rx_step(irq)
                     }
-                    RX1 => {
-                        let irq = core::mem::take(&mut self.rx1_irq);
-                        self.rx1_step(irq)
-                    }
+                    RX1 => self.rx1_step(false),
                     TX => self.tx_step(false),
                     WAKE => {
                         rt::service::step_own();
                         #[cfg(feature = "probe")]
-                        let began = rt::time::now();
+                        let began = self.ran();
                         let left = self.net.wake(&mut self.stack, now_ns());
                         #[cfg(feature = "probe")]
                         self.measured(0, began);
@@ -1409,7 +1453,7 @@ impl Service<0> for Driver<'_> {
                     CLEANUP => {
                         rt::service::step_own();
                         #[cfg(feature = "probe")]
-                        let began = rt::time::now();
+                        let began = self.ran();
                         let more = self.net.depart_step(&mut self.stack);
                         #[cfg(feature = "probe")]
                         self.measured(1, began);

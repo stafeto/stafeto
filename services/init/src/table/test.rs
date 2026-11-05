@@ -74,6 +74,7 @@ pub const TABLE: &[Record] = &[
             name: "rtc",
             base: 0x0901_0000,
             len: PAGE,
+            duplicate: false,
         }],
         bindings: &[Binding {
             name: "rtc-irq",

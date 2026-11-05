@@ -251,6 +251,22 @@ impl Adoption {
     }
 }
 
+/// The label of the notifications of binding `i` of a record with more than
+/// one binding: init binds each line through a session of the service's
+/// registered channel with `binding_label(i)`, so that the interrupt of a
+/// line comes to the service with the label of its binding and the service
+/// tells its devices apart. Bit 61 keeps the labels apart from those init
+/// gives the service's clients (a count from 1) and from those a service
+/// gives itself (the clones of proto_wire, bit 63, and the passes of
+/// proto_net, bit 62). The session goes when init closes it after the
+/// binding: the service sees CLIENT_GONE of the label once, and the binding
+/// keeps the label.
+pub const BINDING_LABEL: u64 = 1 << 61;
+
+pub const fn binding_label(i: usize) -> u64 {
+    BINDING_LABEL | i as u64
+}
+
 /// Names in a reply to START: one per handle a message carries.
 pub const START_NAMES: usize = MESSAGE_HANDLES;
 /// The bytes of a reply to START before its piece of arguments.

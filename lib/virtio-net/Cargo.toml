@@ -1,0 +1,17 @@
+[package]
+name = "virtio-net"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "A driver of the Virtio network device as a library: frames and their sums, the books and rings of the queues, the DMA over a driver's objects, the virtio-mmio and Virtio PCI transports"
+
+# No call of the kernel and no stack: tested on the host.
+[lib]
+bench = false
+
+[dependencies]
+# The checks and the start of a transport, without the calls of rt.
+virtio-mmio = { path = "../virtio-mmio", default-features = false }
+virtio-drivers = { version = "0.13", default-features = false }

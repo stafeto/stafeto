@@ -295,6 +295,7 @@ dependencies = [
  "virtio-console",
  "virtio-drivers",
  "virtio-mmio",
+ "virtio-net",
  "virtio-pci",
  "virtio-rng",
 ]
@@ -1218,6 +1219,14 @@ dependencies = [
  "rt",
  "virtio-drivers",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio-net"
+version = "0.1.0"
+dependencies = [
+ "virtio-drivers",
+ "virtio-mmio",
 ]
 
 [[package]]

@@ -98,6 +98,7 @@ pub const NETD: Record = Record {
         name: "mmio",
         base: TRANSPORT & !(PAGE - 1),
         len: PAGE,
+        duplicate: false,
     }],
     bindings: &[Binding {
         name: "irq",
@@ -202,25 +203,46 @@ static VZ2_STOP: [Write; 4] = {
     [a[0], a[1], b[0], b[1]]
 };
 
-/// The objects of an instance with two devices: each of the first's two
-/// objects twice as big, the second device taking the second half of each
-/// (`MAX_DMA` is two objects; the second device's own objects come with
-/// the claim of it, a later stage). `net` is 2 MiB, under the 4 MiB a
-/// contiguous object may be.
+/// The objects of an instance with two devices: the first device's two, as
+/// in `DMA`, and the second device's own: `dma1` (8 pages, uncached: the
+/// pages of its queues) and four objects of 4 MiB of buffers, `net1a` to
+/// `net1d` (cached). The service drives the second device on `dma1` and the
+/// first megabyte of `net1a` (512 buffers, as the first device's) and keeps
+/// the rest for the program that claims the device, which gets copies of
+/// all five: they carry DUPLICATE. With `console` these are the eight names
+/// of the start data a record may have (START_DATA_MAX).
 pub const DMA_TWO: &[Dma] = &[
+    DMA[0],
+    DMA[1],
     Dma {
-        name: "dma",
-        size: 16 * PAGE,
+        name: "dma1",
+        size: 8 * PAGE,
         uncached: true,
-        duplicate: false,
+        duplicate: true,
     },
-    Dma {
-        name: "net",
-        size: 512 * PAGE,
-        uncached: false,
-        duplicate: false,
-    },
+    BUFFERS_1[0],
+    BUFFERS_1[1],
+    BUFFERS_1[2],
+    BUFFERS_1[3],
 ];
+
+/// The objects of buffers of the second device: 1 024 pages each, the most a
+/// contiguous object may be (abi::MAX_CONTIGUOUS_PAGES).
+const BUFFERS_1: [Dma; 4] = {
+    let names = ["net1a", "net1b", "net1c", "net1d"];
+    let mut objects = [Dma {
+        name: "",
+        size: 1024 * PAGE,
+        uncached: false,
+        duplicate: true,
+    }; 4];
+    let mut i = 0;
+    while i < 4 {
+        objects[i].name = names[i];
+        i += 1;
+    }
+    objects
+};
 
 /// The service on VZ with the first network device: INTA of device 1 at
 /// INTID 65.
@@ -230,11 +252,13 @@ pub const NETD_VZ: Record = Record {
             name: "ecam",
             base: VZ_ECAM + (VZ_DEVICE[0] << 15),
             len: super::PAGE,
+            duplicate: false,
         },
         Window {
             name: "bar",
             base: VZ_BAR,
             len: VZ_BAR_LEN,
+            duplicate: false,
         },
     ],
     bindings: &[Binding {
@@ -256,11 +280,15 @@ pub const NETD_VZ2: Record = Record {
             name: "ecam",
             base: VZ_ECAM + (VZ_DEVICE[0] << 15),
             len: vz_function(1) + super::PAGE - vz_function(0),
+            duplicate: false,
         },
+        // The program that claims the second device gets copies of the
+        // window (spec 6, 3.9); the service keeps its own.
         Window {
             name: "bar",
             base: VZ_BAR,
             len: 2 * VZ_BAR_LEN,
+            duplicate: true,
         },
     ],
     bindings: &[
@@ -309,11 +337,15 @@ pub const NETD_TWO: Record = Record {
             name: "mmio",
             base: TRANSPORT & !(PAGE - 1),
             len: PAGE,
+            duplicate: false,
         },
+        // The program that claims the second device gets copies of the
+        // window (spec 6, 3.9); the service keeps its own.
         Window {
             name: "mmio1",
             base: TRANSPORT1 & !(PAGE - 1),
             len: PAGE,
+            duplicate: true,
         },
     ],
     bindings: &[

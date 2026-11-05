@@ -19,7 +19,7 @@
 use crate::device::{NetDevice, RxRing, TxRing};
 use crate::dma::Host;
 use crate::stack::{Event, Lease, instant};
-use crate::{MAC, MTU, RECEIVEQ, STATUS, TRANSMITQ};
+use crate::{RECEIVEQ, TRANSMITQ};
 use core::ptr::addr_of_mut;
 use netd::config::Cidr;
 use netd::lines::{Ip, Mac};
@@ -31,7 +31,8 @@ use smoltcp::socket::dhcpv4;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::{SomeTransport, Transport};
-use virtio_mmio::{Isr, StartError};
+use virtio_mmio::Isr;
+use virtio_net::barrier::ring;
 
 type Q = VirtQueue<Host<1>, QUEUE_SIZE>;
 
@@ -40,7 +41,6 @@ pub type Storage = [SocketStorage<'static>; 1];
 
 /// Why the device did not start: the code the service ends with.
 pub const NOT_STARTED: u64 = 7;
-pub const NO_DEVICE: u64 = 6;
 
 /// What a step of the device found, for the service to say or to act on.
 #[derive(Default)]
@@ -95,25 +95,9 @@ impl Second {
         fixed: Option<Cidr>,
     ) -> Result<(), u64> {
         let (pci, function, status) = place;
-        let features = match virtio_mmio::start_with(&mut transport, MTU | MAC | STATUS) {
-            Ok(bits) => bits,
-            Err(StartError::Reset) => return Err(NOT_STARTED),
-            Err(StartError::Features) => {
-                rt::println!(
-                    "virtio-net1: features refused, offered {:#x}",
-                    transport.read_device_features()
-                );
-                return Err(NOT_STARTED);
-            }
-        };
-        if features & MAC == 0 {
-            rt::println!("virtio-net1: the device offers no MAC address");
-            return Err(NO_DEVICE);
-        }
-        let Ok((mac, _)) = crate::read_config(&transport) else {
-            return Err(NOT_STARTED);
-        };
-        if !crate::mtu_fits(&transport, features, "virtio-net1") {
+        let opened = crate::start_device(&mut transport, "virtio-net1")?;
+        let mac = opened.mac;
+        if !crate::mtu_fits(&opened, "virtio-net1") {
             return Err(NOT_STARTED);
         }
         let Ok(rx_queue) = Q::new(&mut transport, RECEIVEQ, false, false) else {
@@ -136,8 +120,8 @@ impl Second {
             device.takes_dhcp = fixed.is_none();
             device.rx.fill();
             transport.finish_init();
-            virtio_mmio::ring(&mut transport, RECEIVEQ);
-            device.rx.dirty = false;
+            ring(&mut transport, RECEIVEQ);
+            device.rx.ring.dirty = false;
             let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
             config.random_seed = seed;
             let iface = Interface::new(config, device, instant(now_ns));
@@ -234,13 +218,17 @@ impl Second {
             .iface
             .poll_at(now, &self.sockets)
             .map(|at| (at.total_micros().max(0) as u64).saturating_mul(1000));
-        if core::mem::take(&mut self.device.rx.dirty) && self.device.rx.queue.should_notify() {
-            virtio_mmio::ring(&mut self.transport, RECEIVEQ);
+        if core::mem::take(&mut self.device.rx.ring.dirty)
+            && self.device.rx.ring.queue.should_notify()
+        {
+            ring(&mut self.transport, RECEIVEQ);
         }
-        if core::mem::take(&mut self.device.tx.dirty) && self.device.tx.queue.should_notify() {
-            virtio_mmio::ring(&mut self.transport, TRANSMITQ);
+        if core::mem::take(&mut self.device.tx.ring.dirty)
+            && self.device.tx.ring.queue.should_notify()
+        {
+            ring(&mut self.transport, TRANSMITQ);
         }
-        outcome.more = self.device.rx.queue.can_pop();
+        outcome.more = self.device.rx.ring.queue.can_pop();
         outcome
     }
 

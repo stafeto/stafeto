@@ -77,6 +77,10 @@ enum Order {
 /// own handles to the DMA objects; or why not.
 pub type Loaded = Result<(Spawned, Kept), Error>;
 
+// The check of the table counts the names of the start data against the
+// room of the giver.
+const _: () = assert!(init::table::START_DATA_MAX == rt::startup::NAMES_MAX);
+
 /// Init's own handles to the DMA objects of an instance (Record::dma),
 /// which go only after its device stopped.
 pub type Kept = [Option<Handle<Memory>>; MAX_DMA];
@@ -403,7 +407,8 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
         }
         let copy = sys::handle_duplicate(&object, rights)?;
         // The checks of the table keep the names apart from the others of
-        // the start data, and MAX_DMA keeps them within its room.
+        // the start data, MAX_DMA keeps them within its room, and
+        // START_DATA_MAX keeps all of them within the giver's.
         let _ = spawned.giver.give(d.name, copy.erase());
         own[8 * i..8 * i + 8].copy_from_slice(&pa.to_le_bytes());
         kept[i] = Some(object);

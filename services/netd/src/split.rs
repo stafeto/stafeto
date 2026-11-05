@@ -45,8 +45,11 @@ mod on {
         "buf_copy_tx",
         "buf_copy_rx",
     ];
-    const BUCKETS: usize = 64;
-    const WIDTH: u64 = 256;
+    // Buckets of 64 ticks up to 16 384: the rule of the frames of a step
+    // reads a p90 that is the top of its bucket, and a wider bucket moved it
+    // across the budget by its width alone.
+    const BUCKETS: usize = 256;
+    const WIDTH: u64 = 64;
 
     static HIST: [[AtomicU64; BUCKETS]; 10] =
         [const { [const { AtomicU64::new(0) }; BUCKETS] }; 10];

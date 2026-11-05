@@ -60,11 +60,13 @@ pub const CONSOLE: Record = Record {
             name: "ecam",
             base: FUNCTION,
             len: PAGE,
+            duplicate: false,
         },
         Window {
             name: "bar",
             base: BAR,
             len: 16 * PAGE,
+            duplicate: false,
         },
     ],
     bindings: &[Binding {
@@ -128,6 +130,7 @@ pub const PCI_WALK: Record = Record {
         name: "ecam",
         base: 0x4000_0000,
         len: 0x10_0000,
+        duplicate: false,
     }],
     bindings: &[],
     args: &[],

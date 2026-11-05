@@ -14,13 +14,21 @@ bench = false
 
 [dependencies]
 bitflags = { version = "2", default-features = false }
-virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }
+virtio-drivers = { version = "0.13", default-features = false }
 
 # The fake transport of the tests of `start_with` implements the crate's
 # trait, whose methods are bounded by zerocopy's.
 [dev-dependencies]
 zerocopy = { version = "0.8", default-features = false }
 
-# The calls of the driver's process exist on stafeto alone.
+# `rt`: `transport`, `reopen` and `ring`, which make the calls of a driver's
+# process (on stafeto alone), and the feature `alloc` of the device's crate,
+# as the drivers take it. Without it the library is the checks, the start
+# and the DMA of the device's crate, with no heap, which a library with no
+# call of the kernel builds on (lib/virtio-net).
+[features]
+default = ["rt"]
+rt = ["dep:rt", "virtio-drivers/alloc"]
+
 [target.'cfg(target_os = "none")'.dependencies]
-rt = { path = "../rt" }
+rt = { path = "../rt", optional = true }

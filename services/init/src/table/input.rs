@@ -64,6 +64,7 @@ pub const INPUT: Record = Record {
         name: "mmio",
         base: TRANSPORT & !(PAGE - 1),
         len: PAGE,
+        duplicate: false,
     }],
     bindings: &[Binding {
         name: "irq",

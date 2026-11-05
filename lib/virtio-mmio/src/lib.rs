@@ -392,11 +392,12 @@ impl Isr {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", feature = "rt"))]
 pub use device_side::*;
 
-/// What needs the kernel's calls: the registers and the line.
-#[cfg(target_os = "none")]
+/// What needs the kernel's calls: the registers and the line (the feature
+/// `rt`).
+#[cfg(all(target_os = "none", feature = "rt"))]
 mod device_side {
     use super::*;
     use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};

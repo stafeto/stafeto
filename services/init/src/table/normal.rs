@@ -37,6 +37,7 @@ pub const TABLE: &[Record] = &[
             name: "regs",
             base: PL011,
             len: PAGE,
+            duplicate: false,
         }],
         bindings: &[Binding {
             name: "irq",
