@@ -26,9 +26,9 @@ use pkgfmt::{Key, Trust, keyfile};
 use proto_blk::{CELL_BYTES, CELLS, Info, Key as BlkKey, Method as Blk, SECTOR};
 use proto_fs::{LayerOp, LayerReply, LayerStart, LayerStep};
 use proto_wire::{Status, Writer, long};
+use rt::Handle;
 use rt::handle::{Any, Channel, Memory, Process};
 use rt::sys::{self, Received};
-use rt::Handle;
 
 /// The measured use is some 54 KiB; the margin is the rest. The stack is an object of its own,
 /// mapped at `STACK_AT` with no mapping on the page below it: an overflow faults on the guard

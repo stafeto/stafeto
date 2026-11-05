@@ -1067,7 +1067,10 @@ fn deaf() -> Result<(), String> {
         .iter()
         .find(|l| l.starts_with("store-probe: the disk stopped answering"))
         .ok_or("the probe did not say how the disk's silence ended")?;
-    println!("store-probe deaf: {}", said.trim_start_matches("store-probe: "));
+    println!(
+        "store-probe deaf: {}",
+        said.trim_start_matches("store-probe: ")
+    );
     Ok(())
 }
 

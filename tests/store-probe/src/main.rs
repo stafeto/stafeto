@@ -404,7 +404,9 @@ fn buffers(pkgd: &Pkgd) -> Result<(), Fail> {
     if d.buffer_with(false, true).is_err() {
         return Err("the superuser's session has no place kept for it");
     }
-    say!("buffers: two places for any session, a third is BUSY, the superuser's session still has one");
+    say!(
+        "buffers: two places for any session, a third is BUSY, the superuser's session still has one"
+    );
     Ok(())
 }
 
@@ -964,7 +966,10 @@ fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
     }
     let hello = index.get(b"hello")?;
     let from = rt::time::now();
-    if !is(pkgd.install(hello, &Install::new(b"stafeto", false)), pkg::IO) {
+    if !is(
+        pkgd.install(hello, &Install::new(b"stafeto", false)),
+        pkg::IO,
+    ) {
         return Err("the second installation on a deaf disk is not IO");
     }
     let second = since_ms(from);
