@@ -99,6 +99,8 @@ table-fstack-device = []
 table-pci-walk-vz = []
 # The walk of QEMU's bus 0 (xtask pci-walk).
 table-pci-walk-qemu = []
+# The disk service and its probe (xtask blk-probe).
+table-blk-probe = []
 # The shell with the network service on Apple VZ, one and two network devices.
 table-net-vz = []
 table-net-vz2 = []

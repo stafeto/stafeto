@@ -1019,6 +1019,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-net-probe") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-pci-walk-qemu") as usize
+    + cfg!(feature = "table-blk-probe") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-bench-vz") as usize
@@ -1082,6 +1083,7 @@ const _: () = assert!(
     feature = "table-net-probe",
     feature = "table-pci-walk-vz",
     feature = "table-pci-walk-qemu",
+    feature = "table-blk-probe",
     feature = "table-net-vz",
     feature = "table-net-vz2",
     feature = "table-bench-vz",
@@ -1191,6 +1193,8 @@ pub const TABLE: &[Record] = net::NET_TWO_TABLE;
 pub const TABLE: &[Record] = vz::PCI_WALK_TABLE;
 #[cfg(feature = "table-pci-walk-qemu")]
 pub const TABLE: &[Record] = pkg::PCI_WALK_QEMU_TABLE;
+#[cfg(feature = "table-blk-probe")]
+pub const TABLE: &[Record] = pkg::BLK_PROBE_TABLE;
 #[cfg(feature = "table-input")]
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
@@ -2279,6 +2283,7 @@ mod tests {
             vz::TABLE,
             vz::PCI_WALK_TABLE,
             pkg::PCI_WALK_QEMU_TABLE,
+            pkg::BLK_PROBE_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::POSIX_NATIVE_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,

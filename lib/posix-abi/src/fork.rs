@@ -983,6 +983,9 @@ fn child() -> Result<(), &'static str> {
         crate::process::register_router(&native).map_err(|_| "its router")?;
     }
     crate::mmap::attach_shared();
+    // The account of the child starts here: its loader's work and its own
+    // binding are behind it.
+    crate::cpu::after_fork();
     let hook = AT_CHILD.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `at_child` stores a value, a `fn()`.

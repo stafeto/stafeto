@@ -264,6 +264,28 @@ static int spawn(pid_t *pid, const char *role, const posix_spawn_file_actions_t 
     return posix_spawn(pid, "/bin/procs-child", actions, attr, argv, envp);
 }
 
+/* Spawns `role` with the signals of `blocked` blocked from its first
+ * instruction: a signal sent before the child sets up its handling waits in
+ * the mask and comes when the child unblocks it, so no pause stands in for
+ * its start-up. */
+static int spawn_masked(pid_t *pid, const char *role, int flags, const sigset_t *blocked) {
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, flags | POSIX_SPAWN_SETSIGMASK);
+    posix_spawnattr_setsigmask(&attr, blocked);
+    int e = spawn(pid, role, NULL, &attr);
+    posix_spawnattr_destroy(&attr);
+    return e;
+}
+
+/* The catcher: SIGUSR1 blocked until its handler is in place. */
+static int spawn_catcher(pid_t *pid, int flags) {
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    return spawn_masked(pid, "catch", flags, &blocked);
+}
+
 static void pause_ms(long ms);
 
 /* The bytes of the service's pool once its ends settled: what a child gives
@@ -396,14 +418,34 @@ static void kills(pid_t sleeper) {
     reap("the sleeper after SIGTERM", sleeper, 0, SIGTERM);
     expect("kill of a taken child", kill(sleeper, SIGTERM) == -1 && errno == ESRCH, 1);
 
-    pid_t blocker = start("block");
-    pause_ms(100);
+    /* The blocker starts with every signal blocked, as it blocks them itself. */
+    sigset_t everything;
+    sigfillset(&everything);
+    pid_t blocker = -1;
+    expect("the blocker", spawn_masked(&blocker, "block", 0, &everything), 0);
     expect("SIGTERM to a child that blocks it", kill(blocker, SIGTERM), 0);
     expect("SIGKILL", kill(blocker, SIGKILL), 0);
     reap("the blocker after SIGKILL", blocker, 0, SIGKILL);
 
-    pid_t catcher = start("catch");
-    pause_ms(100);
+    /* A stop right after the spawn waits for the loader's Take, so children
+     * stopped one after the other never hold the pool of loader places
+     * (16): twenty spawns of one parent all succeed. */
+    pid_t frozen[20];
+    int made = 0;
+    for (int i = 0; i < 20; i++) {
+        frozen[i] = start("sleep");
+        if (frozen[i] < 0) break;
+        made++;
+        if (kill(frozen[i], SIGSTOP) != 0) failures++;
+    }
+    expect("twenty spawns stopped at once", made, 20);
+    for (int i = 0; i < made; i++) {
+        kill(frozen[i], SIGKILL);
+        reap("a child stopped at once", frozen[i], 0, SIGKILL);
+    }
+
+    pid_t catcher = -1;
+    expect("the catcher", spawn_catcher(&catcher, 0), 0);
     expect("kill of the catcher", kill(catcher, SIGUSR1), 0);
     reap("the catcher", catcher, 42, 0);
 
@@ -528,17 +570,15 @@ static void groups(void) {
     action.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &action, NULL);
     handled = 0;
-    pid_t c = start("catch");
-    pause_ms(100);
+    pid_t c = -1;
+    expect("a catcher in the probe's group", spawn_catcher(&c, 0), 0);
     expect("kill(0)", kill(0, SIGUSR1), 0);
     expect("the probe's handler before kill(0) returned", handled, 1);
     reap("a child of the probe's group after kill(0)", c, 42, 0);
 
     /* kill(-1) reaches a child of another group and skips the probe. */
     handled = 0;
-    expect("a child in a group of its own",
-           spawn_in(&c, "catch", POSIX_SPAWN_SETPGROUP, 0), 0);
-    pause_ms(100);
+    expect("a child in a group of its own", spawn_catcher(&c, POSIX_SPAWN_SETPGROUP), 0);
     expect("kill(-1)", kill(-1, SIGUSR1), 0);
     expect("kill(-1) left the sender out", handled, 0);
     reap("a child of another group after kill(-1)", c, 42, 0);
@@ -3558,6 +3598,12 @@ static int role(const char *name) {
         memset(&action, 0, sizeof action);
         action.sa_handler = exit_42;
         sigaction(SIGUSR1, &action, NULL);
+        /* The parent spawned it with SIGUSR1 blocked; a signal that came
+         * early is taken here, with the handler in place. */
+        sigset_t usr1;
+        sigemptyset(&usr1);
+        sigaddset(&usr1, SIGUSR1);
+        sigprocmask(SIG_UNBLOCK, &usr1, NULL);
         for (;;) sleep(60);
     }
     if (strcmp(name, "orphan") == 0) {

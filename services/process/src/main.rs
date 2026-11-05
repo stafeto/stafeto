@@ -603,10 +603,12 @@ fn cpu_ticks(record: &Record<Handle<Process>>) -> (u64, u64) {
         record
             .carried_ticks
             .saturating_add(ran)
+            .saturating_sub(record.base_ticks)
             .saturating_add(record.children_ticks),
         record
             .carried_kernel
             .saturating_add(kernel)
+            .saturating_sub(record.base_kernel)
             .saturating_add(record.children_kernel),
     )
 }
@@ -1963,6 +1965,19 @@ impl Processes {
                 }
                 Answer::Reply(Outgoing::new())
             }
+            proto_process::account_op::FORK_BASE => {
+                let (Ok(ticks), Ok(kernel), Ok(())) = (body.u64(), body.u64(), body.finish())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let ran = sys::process_times(&caller.process).unwrap_or((0, 0));
+                let record = self.records.get_mut(index).expect("the caller");
+                if record.base_ticks == 0 && record.base_kernel == 0 {
+                    record.base_ticks = ticks.min(ran.0);
+                    record.base_kernel = kernel.min(ran.1).min(record.base_ticks);
+                }
+                Answer::Status(Status::Ok)
+            }
             proto_process::account_op::PROCESS_TIME => {
                 let (Ok(pid), Ok(())) = (body.u32(), body.finish()) else {
                     return Answer::Status(Status::BadSize);
@@ -1989,7 +2004,8 @@ impl Processes {
                 }
                 let ticks = record
                     .carried_ticks
-                    .saturating_add(sys::process_time(&record.process).unwrap_or(0));
+                    .saturating_add(sys::process_time(&record.process).unwrap_or(0))
+                    .saturating_sub(record.base_ticks);
                 let w = r.reply();
                 if w.u32(0).and_then(|()| w.u64(ticks)).is_err() {
                     return Answer::Status(Status::BadSize);
@@ -3668,7 +3684,8 @@ impl Processes {
                             nice: i32::from(record.nice),
                             ticks: record
                                 .carried_ticks
-                                .saturating_add(sys::process_time(&record.process).unwrap_or(0)),
+                                .saturating_add(sys::process_time(&record.process).unwrap_or(0))
+                                .saturating_sub(record.base_ticks),
                             memory: sys::process_memory(&record.process).map_or(0, |m| m.used),
                             threads: self.pages.page(i).map_or(0, |page| {
                                 page.threads.load(core::sync::atomic::Ordering::Acquire)
@@ -3829,8 +3846,16 @@ impl Processes {
         let old = core::mem::replace(&mut record.process, incoming);
         // The time of the images before this one goes on counting.
         let (ran, kernel) = sys::process_times(&old).unwrap_or((0, 0));
-        record.carried_ticks = record.carried_ticks.saturating_add(ran);
-        record.carried_kernel = record.carried_kernel.saturating_add(kernel);
+        record.carried_ticks = record
+            .carried_ticks
+            .saturating_add(ran)
+            .saturating_sub(record.base_ticks);
+        record.carried_kernel = record
+            .carried_kernel
+            .saturating_add(kernel)
+            .saturating_sub(record.base_kernel);
+        record.base_ticks = 0;
+        record.base_kernel = 0;
         let ceiling = record.ceiling;
         record.image = image;
         record.image_pages = image_pages;
@@ -3857,10 +3882,7 @@ impl Processes {
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
         }
-        if self.records.get(index).is_some_and(|r| r.stopped.is_some()) {
-            let r = self.records.get(index).expect("a stopped record");
-            let _ = sys::process_control(&r.process, true, r.ceiling);
-        }
+        // A stop that came before the commit takes effect at Take.
         // The loads the old image started: nobody gives their loaders a
         // block once it is gone.
         let mut children = [0u16; loaders::LOADERS];
@@ -4222,6 +4244,7 @@ impl Processes {
         #[cfg(not(feature = "image-probe"))]
         self.loaders.free(child);
         self.generations.invalidate(child);
+        self.apply_deferred_stop(child);
         Answer::Reply(handles)
     }
 
@@ -4286,11 +4309,6 @@ impl Processes {
         // The services that remember credentials see the new ones before
         // the child runs a request.
         self.generations.raise(child);
-        if let Some(signal) = self.records.get(child).and_then(|r| r.stopped) {
-            let r = self.records.get(child).expect("a committed child");
-            let _ = sys::process_control(&r.process, true, r.ceiling);
-            self.child_report(child, Some(signal));
-        }
         let slot = self.loaders.of(child).expect("a committed place");
         let place = self.loaders.get_mut(slot).expect("a place");
         self.routers[child] = place.held.thread.take();
