@@ -95,6 +95,9 @@ table-net-two = []
 table-fstack-probe = []
 # The probe of F-Stack on the second network device (xtask fstack-probe device).
 table-fstack-device = []
+# nginx on the stack in a process, on QEMU and on Apple VZ (xtask fast-probe nginx, net-vz --nginx).
+table-fast-nginx = []
+table-fast-nginx-vz = []
 # The walk of Apple VZ's bus 0 (xtask pci-walk-vz).
 table-pci-walk-vz = []
 # The walk of QEMU's bus 0 (xtask pci-walk).

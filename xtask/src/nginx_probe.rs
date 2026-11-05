@@ -458,6 +458,11 @@ impl Connection {
         Ok(body)
     }
 
+    /// The socket of the connection.
+    pub(crate) fn stream(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
     fn fill(&mut self) -> Result<(), String> {
         let mut chunk = [0u8; 16 * 1024];
         match self.stream.read(&mut chunk) {
@@ -506,7 +511,11 @@ pub(crate) fn same(what: &str, body: &[u8], want: &[u8]) -> Result<(), String> {
 /// whose SYN found that queue full after 7.8 s (sixteen connects at once to
 /// a listener of backlog 1 that accepts every 0.5 s lose nine of them on
 /// the host alone).
-fn pages(address: SocketAddr, requests: usize, connections: usize) -> Result<(), String> {
+pub(crate) fn pages(
+    address: SocketAddr,
+    requests: usize,
+    connections: usize,
+) -> Result<(), String> {
     let mut open = Vec::new();
     for n in 0..connections {
         open.push(
@@ -556,7 +565,7 @@ fn pages(address: SocketAddr, requests: usize, connections: usize) -> Result<(),
 /// The first request, which waits for nginx to listen: a SYN that comes
 /// before a worker listens is answered by a reset that slirp turns into a
 /// closed connection.
-fn first_page(address: SocketAddr) -> Result<(), String> {
+pub(crate) fn first_page(address: SocketAddr) -> Result<(), String> {
     let started = Instant::now();
     loop {
         let answer = Connection::open(address, Duration::from_secs(2))
@@ -582,7 +591,7 @@ pub(crate) fn marker(run: &mut qemu::Run, tag: &str, within: Duration) -> Result
 }
 
 /// The processes of the guest whose name holds `nginx`: (PID, user ID).
-fn nginx_processes(run: &mut qemu::Run, tag: &str) -> Result<Vec<(u32, u32)>, String> {
+pub(crate) fn nginx_processes(run: &mut qemu::Run, tag: &str) -> Result<Vec<(u32, u32)>, String> {
     let from = run.lines().len();
     run.send("grep -E '^(Name|Uid):' /proc/[0-9]*/status")?;
     marker(run, tag, DIALOG_STEP)?;
@@ -916,10 +925,10 @@ fn modules_verdict(lines: &[String]) -> Result<(), String> {
 /// The host's curl against nginx's server of TLS on the forwarded port:
 /// `nginx.stafeto.test` resolved to 127.0.0.1, the certificate checked
 /// against the probe CA (`ca.crt` of `ca`), the bodies written to `dir`.
-struct Tls {
-    port: u16,
-    ca: PathBuf,
-    dir: PathBuf,
+pub(crate) struct Tls {
+    pub(crate) port: u16,
+    pub(crate) ca: PathBuf,
+    pub(crate) dir: PathBuf,
 }
 
 /// What a run of the host's curl ended with: its code, what it wrote
@@ -985,7 +994,7 @@ const NOT_BUILT_IN: &str = "not found built-in";
 /// Step 4a: TLS 1.3 with HTTP/2, and HTTP/1.1 over TLS. curl asks for TLS
 /// 1.3 alone (`--tlsv1.3`) where it can; either way what it says (`-v`)
 /// must name TLS 1.3 as the version of the connection.
-fn tls_versions(tls: &Tls) -> Result<(), String> {
+pub(crate) fn tls_versions(tls: &Tls) -> Result<(), String> {
     let mut only13 = true;
     for (flag, version) in [("--http2", "2"), ("--http1.1", "1.1")] {
         let out = tls.file("version.html");
@@ -1049,7 +1058,7 @@ fn transfers_of(written: &str) -> Vec<(String, usize)> {
 
 /// Step 4b: 100 requests of the page in one curl, HTTP/2 streams of one
 /// connection, and the file of 256 KiB over HTTP/2.
-fn tls_streams(tls: &Tls, when: &str) -> Result<(), String> {
+pub(crate) fn tls_streams(tls: &Tls, when: &str) -> Result<(), String> {
     let mut args = vec![
         arg("--http2"),
         arg("--parallel"),
@@ -1121,7 +1130,7 @@ fn tls_streams(tls: &Tls, when: &str) -> Result<(), String> {
 
 /// Step 4c: the certificate is the probe CA's, which the host does not
 /// know.
-fn tls_unknown_ca(tls: &Tls) -> Result<(), String> {
+pub(crate) fn tls_unknown_ca(tls: &Tls) -> Result<(), String> {
     let ended = tls.curl(
         false,
         &[arg("-o"), arg("/dev/null"), tls.url("/index.html")],

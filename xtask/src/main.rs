@@ -51,6 +51,7 @@ mod display_probe;
 mod doom;
 mod entropy;
 mod fast_layer;
+mod fast_nginx;
 mod fast_probe;
 mod fstack_device;
 mod fstack_probe;
@@ -916,7 +917,7 @@ const SHELL_SERVICES_LAST: [ImageProgram; 4] = [
 /// programs of stack 0 go into the image as their ELF files alone, which the
 /// process service starts from the RAM files; init starts the launcher
 /// (`ash-launcher`), which spawns BusyBox from its file.
-const PACKAGE_PROGRAMS: [ImageProgram; 9] = [
+const PACKAGE_PROGRAMS: [ImageProgram; 10] = [
     (
         "busybox-probe",
         "busybox-probe",
@@ -931,6 +932,7 @@ const PACKAGE_PROGRAMS: [ImageProgram; 9] = [
     ("openssl", "openssl", 0, &["dynamic"]),
     ("curl", "curl", 0, &["dynamic"]),
     ("nginx", "nginx", 0, &["dynamic"]),
+    ("nginx-fast", "nginx-fast", 0, &["dynamic"]),
 ];
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
@@ -1736,11 +1738,14 @@ commands:
             of the service, and its steps under -icount (TCG only); on hvf the
             rates of the loopback; with `steps` the measurement that chooses
             the frames of a step and the limit of the sockets (TCG only)
-  net-vz [--net 2] [--static1] [--steps] [--fast] run the shell with the network service on
+  net-vz [--net 2] [--static1] [--steps] [--fast] [--nginx] run the shell with the network service on
             Apple VZ: the lease, HTTP and the Mac's ping of the guest; with
             --net 2 the second device too (--static1: its static address);
             with --fast `fast-echo` claims the second device and the Mac
-            reaches it: UDP echo, ping, ARP, kill -9 and a new claim; every VZ
+            reaches it: UDP echo, ping, ARP, kill -9 and a new claim; with
+            --nginx (and --static1) `nginx-fast` serves the second address:
+            the pages over HTTP and HTTPS, ping, kill -9 of the worker, the
+            load of `wrk -c200`, the lazy start; every VZ
             run with a network claims a MAC suffix of its own (vz-run
             --mac-suffix), so guests side by side get different leases
   net-curl [steps] [MACHINE] run the sockets of the network service from the
@@ -1768,7 +1773,11 @@ commands:
             counts its steps (TCG only); with `crash` the service ends while
             the program owns the device; with `layer` `fast-layer` makes plain
             sockets and epoll over the stack in the process: the calls, the
-            refusals, the echo and a page of 1 MiB, the wake of the idle loop
+            refusals, the echo and a page of 1 MiB, the wake of the idle loop;
+            with `nginx` [crash|steps] `nginx-fast` serves the pages over HTTP
+            and HTTPS from the stack in its process: 200 requests, the wake, a
+            reload under load, a worker killed, the quit under a download, the
+            worker under nobody
   nginx-probe [steps] [MACHINE] run nginx in the guest from ash (boot-nginx-probe.img):
             a master and four workers under nobody with SO_REUSEPORT, 200 requests
             over 16 connections that stay open, 256 KiB answers by digest through
@@ -2599,7 +2608,7 @@ fn write_elf_image(
     // of its four-clause files and where the exact source is.
     let fstack_files = if sources.iter().any(|(_, elf, _)| {
         elf.file_name()
-            .is_some_and(|n| n == "fstack-probe" || n == "fast-layer")
+            .is_some_and(|n| n == "fstack-probe" || n == "fast-layer" || n == "nginx-fast")
     }) {
         Some(fstack_probe::terms()?)
     } else {
@@ -3790,6 +3799,7 @@ fn dynamic_name(package: &str, features: &[&str]) -> &'static str {
         ("openssl", _) => "openssl",
         ("curl", _) => "curl",
         ("nginx", _) => "nginx",
+        ("nginx-fast", _) => "nginx-fast",
         _ => panic!("no dynamic build of the program {package}"),
     }
 }
@@ -3811,17 +3821,26 @@ fn dynamic_programs(names: &[&str]) -> Result<(), String> {
 /// The scripts of the packages of `groups` run, each once in a run of xtask
 /// and in the order of the packages (a package after its dependencies).
 fn packages_built(groups: &[packages::Group]) -> Result<(), String> {
-    for package in packages::load()?
-        .iter()
-        .filter(|p| groups.contains(&p.group()))
-    {
+    packages_built_where(|p| groups.contains(&p.group()) && !p.needs_network_device())
+}
+
+/// The scripts of the packages `wanted` accepts, as above.
+fn packages_built_where(wanted: impl Fn(&packages::Package) -> bool) -> Result<(), String> {
+    for package in packages::load()?.iter().filter(|p| wanted(p)) {
         package_script(package)?;
     }
     Ok(())
 }
 
-/// The script of one package run, once in a run of xtask.
+/// The script of one package run, once in a run of xtask, after those of
+/// the packages linked into it.
 fn package_script(package: &packages::Package) -> Result<(), String> {
+    let all = packages::load()?;
+    for dep in &package.build_depends {
+        if let Some(linked) = all.iter().find(|p| p.name == *dep) {
+            package_script(linked)?;
+        }
+    }
     once(&PACKAGE_SCRIPTS_BUILT, package.build.clone(), || {
         run_cmd(Command::new("python3").arg(root().join(&package.build)))
     })
@@ -3848,7 +3867,9 @@ fn nano_build() -> Result<(), String> {
 /// The network packages built (OpenSSL, curl, the root certificates, nginx with PCRE2),
 /// once in a run of xtask: the images with the network service hold them.
 fn net_build() -> Result<(), String> {
-    once(&NET_BUILT, (), || packages_built(&[packages::Group::Net]))
+    once(&NET_BUILT, (), || {
+        packages_built_where(|p| p.group() == packages::Group::Net || p.needs_network_device())
+    })
 }
 
 /// bash built (its object, which `tools/build-libc-so.py programs` links), once in a run of xtask. It is
@@ -9123,6 +9144,25 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // forwarded ports, the idle loop's wake on the device's interrupt.
         // Also in the group `net`.
         job("fast-layer", || fast_layer::probe(&qemu::VIRT)),
+        // nginx on the stack in its own process, on the second device: the
+        // pages over HTTP and HTTPS through the forwarded ports, the wake of
+        // the idle loop, a reload under load, a worker killed, the quit under
+        // a download and with connections in rest, the worker under nobody.
+        // Also in the group `net`.
+        job("fast-nginx", || {
+            fast_nginx::probe(&qemu::VIRT, fast_nginx::Kind::Plain)
+        }),
+        // The same image with the network service built to fault: the service
+        // ends under a stream of requests, the worker leaves with status 2 and
+        // the main process starts no other.
+        job("fast-nginx-crash", || {
+            fast_nginx::probe(&qemu::VIRT, fast_nginx::Kind::Crash)
+        }),
+        // The start, the first pages and a worker killed, under -icount with
+        // the network service counting its steps: none passes 0.9 of term B.
+        job("fast-nginx-steps", || {
+            fast_nginx::probe(&qemu::VIRT, fast_nginx::Kind::Steps)
+        }),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
