@@ -931,7 +931,7 @@ static int steps_fork_many(void) {
  * Phase 1, the limits: seven children open 880 files each and hold them, 6 160
  * descriptions of the service for one root, past its share of 6 144. The one
  * that is told so gets ENFILE (the service's, and the root's share), and
- * this process, whose table has numbers to spare, gets ENFILE too, not EMFILE.
+ * this process, whose table has numbers to spare, gets ENFILE too.
  *
  * Phase 2, the steps: five children open 1 000 files each and hold them; with
  * those 5 000 descriptions held, this process opens 1 000 of its own, reads 12 KiB

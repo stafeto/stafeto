@@ -295,8 +295,11 @@ static void nofile(void) {
     check("dup3 ceiling", dup3(file, 8, 0) == -1 && errno == EBADF);
     errno = 0;
     check("F_DUPFD minimum ceiling", fcntl(file, F_DUPFD, 8) == -1 && errno == EINVAL);
-    int opened[32], count = 0;
-    while (count < 32) {
+    static int opened[1100];
+    int count = 0;
+    /* The table of the layer (1 024 numbers) is the physical bound; the file
+     * service has more places than that. */
+    while (count < 1100) {
         int fd = open("/dev/null", O_RDONLY);
         if (fd < 0) break;
         opened[count++] = fd;
@@ -328,12 +331,14 @@ static void nofile(void) {
     check("privileged infinity roundtrip", setrlimit(RLIMIT_NOFILE, &infinity) == 0
         && same_limit(RLIMIT_NOFILE, &infinity));
     count = 0;
-    while (count < 32) {
+    /* The table of the layer (1 024 numbers) is the physical bound; the file
+     * service has more places than that. */
+    while (count < 1100) {
         int fd = open("/dev/null", O_RDONLY);
         if (fd < 0) break;
         opened[count++] = fd;
     }
-    check("physical capacity remains finite under infinity", count == 31 && errno == EMFILE);
+    check("physical capacity remains finite under infinity", count >= 1000 && count <= 1024 && errno == EMFILE);
     while (count) close(opened[--count]);
     struct rlimit invalid = {9, 8};
     errno = 0;
