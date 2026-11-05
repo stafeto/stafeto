@@ -318,9 +318,18 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
                 return Err(format!("echo {n} under signals took {seconds:.1} s"));
             }
         }
-        // Pages of 1 MiB go by edges of writing too: a lost edge stalls one.
+        // Pages of 1 MiB go by edges of writing too, and many of them give
+        // the loop many turns with events in them: a lost edge stalls one.
         let at_once: Vec<_> = (0..3)
-            .map(|_| std::thread::spawn(move || fetch(page_host, PAGE_BYTES)))
+            .map(|_| {
+                std::thread::spawn(move || {
+                    let mut slowest = 0.0f64;
+                    for _ in 0..8 {
+                        slowest = slowest.max(fetch(page_host, PAGE_BYTES)?);
+                    }
+                    Ok::<f64, String>(slowest)
+                })
+            })
             .collect();
         for handle in at_once {
             let seconds = handle.join().map_err(|_| "a fetch panicked".to_owned())??;
@@ -330,7 +339,7 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
         }
         command_of(echo_host, "?quiet", "quiet 1\n")?;
         command_of(echo_host, "?unmix", "unmixed\n")?;
-        notes.push("16 echoes and 3 pages under a signal every millisecond".to_owned());
+        notes.push("16 echoes and 24 pages under a signal every millisecond".to_owned());
         let before = stats(echo_host)?;
         let at = Instant::now();
         std::thread::sleep(Duration::from_secs(2));
