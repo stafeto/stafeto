@@ -12,8 +12,11 @@
 //!
 //! The load comes from the Mac: `wrk` (closed loop) gives the ceiling and
 //! counts the errors of the connections, `vegeta` (open loop at a fixed
-//! rate, its latency counted from the time the request was due) gives the
-//! latencies. One run:
+//! rate) gives the latencies. vegeta counts a latency from the moment a
+//! worker takes the request, and a pacer that fell behind sends the missed
+//! requests at once, so a stall of vegeta itself is not in the latency:
+//! xtask computes each request's lag behind the schedule from its sequence
+//! number and marks a stage whose p99 of lag passes 0.1 ms. One run:
 //!
 //! 1. every file once by its SHA-256;
 //! 2. the ceiling: `wrk -t2 -c64 -d30s` of `/10k.bin` (R_max), and the
@@ -83,6 +86,9 @@ pub const WWW_1K_LEN: usize = 1024;
 const ACHIEVED_SHARE: f64 = 0.95;
 /// p99.9 needs at least this many requests in a stage.
 const P999_REQUESTS: usize = 100_000;
+/// A stage whose p99 of lag behind the schedule passes this (ns) is marked:
+/// vegeta itself stood, and that time is not in the latencies.
+const GENERATOR_LATE_NS: u64 = 100_000;
 /// The shares of R_max of the ladder, in per cent.
 const LADDER: [u32; 5] = [10, 25, 50, 75, 90];
 /// The connections of `wrk` for the ceiling and for the criterion.
@@ -325,26 +331,96 @@ pub fn parse_wrk(text: &str) -> Option<Wrk> {
     rate.then_some(found)
 }
 
-/// One result of `vegeta encode --to csv`: when the request was due (ns
-/// since the epoch), the status (0 for a request that failed) and the
-/// latency (ns).
+/// One result of `vegeta encode --to csv`: when a worker took the request
+/// (ns since the epoch), the status (0 for a request that failed), the
+/// latency (ns) and the request's number in the attack.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     pub at: u64,
     pub code: u16,
     pub latency: u64,
+    pub seq: u64,
+}
+
+/// The fields of a line of CSV, quotes (`"` doubled inside) taken off.
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            ('"', _) => quoted = !quoted,
+            (',', false) => fields.push(std::mem::take(&mut field)),
+            _ => field.push(c),
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 /// A line of the CSV: timestamp, code, latency, bytes out, bytes in, error,
-/// ...; the first five fields have no commas or quotes.
+/// body, attack, seq, method, URL, headers.
 pub fn parse_sample(line: &str) -> Option<Sample> {
-    let mut fields = line.split(',');
-    let at = fields.next()?.parse().ok()?;
-    let code = fields.next()?.parse().ok()?;
-    let latency = fields.next()?.parse().ok()?;
-    let _bytes_out: u64 = fields.next()?.parse().ok()?;
-    let _bytes_in: u64 = fields.next()?.parse().ok()?;
-    Some(Sample { at, code, latency })
+    let fields = csv_fields(line);
+    let number = |i: usize| fields.get(i)?.parse::<u64>().ok();
+    Some(Sample {
+        at: number(0)?,
+        code: u16::try_from(number(1)?).ok()?,
+        latency: number(2)?,
+        seq: number(8)?,
+    })
+}
+
+/// Each request's lag behind the schedule of `rate` requests a second, in
+/// ns: when a worker took it against its time on the schedule (its number
+/// over the rate), the schedule set by the request that was least late.
+pub fn lags(samples: &[Sample], rate: u32) -> Vec<u64> {
+    let gap = |seq: u64| i128::from(seq) * 1_000_000_000 / i128::from(rate.max(1));
+    let Some(start) = samples.iter().map(|s| s.at as i128 - gap(s.seq)).min() else {
+        return Vec::new();
+    };
+    samples
+        .iter()
+        .map(|s| (s.at as i128 - start - gap(s.seq)).max(0) as u64)
+        .collect()
+}
+
+/// The summary of `samples` by the second of the stage, as CSV: the second,
+/// the requests taken in it, p50, p99 and the longest latency in ms, the
+/// answers other than 200, and the longest lag behind the schedule in ms.
+pub fn by_second(samples: &[Sample], rate: u32) -> String {
+    let lag = lags(samples, rate);
+    let first = samples.iter().map(|s| s.at).min().unwrap_or(0);
+    let mut seconds: Vec<(Vec<u64>, usize, u64)> = Vec::new();
+    for (s, lag) in samples.iter().zip(lag) {
+        let i = ((s.at - first) / 1_000_000_000) as usize;
+        if seconds.len() <= i {
+            seconds.resize(i + 1, (Vec::new(), 0, 0));
+        }
+        let second = &mut seconds[i];
+        second.0.push(s.latency);
+        second.1 += usize::from(s.code != 200);
+        second.2 = second.2.max(lag);
+    }
+    let mut out = "second,requests,p50_ms,p99_ms,max_ms,not_200,max_lag_ms\n".to_owned();
+    for (i, (mut latencies, failed, lag)) in seconds.into_iter().enumerate() {
+        latencies.sort_unstable();
+        let at = |p| percentile(&latencies, p).map_or(0.0, |ns| ns as f64 / 1e6);
+        out += &format!(
+            "{i},{},{:.3},{:.3},{:.3},{failed},{:.3}\n",
+            latencies.len(),
+            at(500),
+            at(990),
+            at(1000),
+            lag as f64 / 1e6
+        );
+    }
+    out
 }
 
 /// The value at `per_mille` / 1000 of `sorted` by the nearest rank.
@@ -371,19 +447,43 @@ pub struct Stage {
     pub p99: Option<u64>,
     pub p999: Option<u64>,
     pub megabytes_per_second: f64,
+    /// The p99 and the longest of the lags behind the schedule.
+    pub lag_p99: Option<u64>,
+    pub lag_max: Option<u64>,
+    /// A guest of vz-run came up beside the run during the stage.
+    pub foreign: bool,
 }
 
 impl Stage {
-    /// Whether the stage stays out of the table of p99: below 95 % of the
-    /// asked rate, or with an error.
+    /// Whether the stage stays out of the table of p99: a foreign guest of
+    /// VZ beside it, an error, below 95 % of the asked rate, or vegeta late
+    /// on its own schedule.
     pub fn marked(&self) -> Option<&'static str> {
-        if self.failed > 0 || self.malloc > 0 {
+        if self.foreign {
+            Some("foreign guest")
+        } else if self.failed > 0 || self.malloc > 0 {
             Some("errors")
         } else if self.achieved < f64::from(self.asked) * ACHIEVED_SHARE {
             Some("saturated")
+        } else if self.lag_p99.is_some_and(|l| l > GENERATOR_LATE_NS) {
+            Some("generator late")
         } else {
             None
         }
+    }
+}
+
+/// The mark of a ceiling of `wrk`: a foreign guest, or errors of connect,
+/// timeouts, answers other than 200 or `malloc(...) failed`. The errors of
+/// reading at the end of a run on QEMU come from the forwarded port and
+/// leave the row unmarked.
+pub fn ceiling_mark(wrk: &Wrk, malloc: usize, foreign: bool) -> Option<&'static str> {
+    if foreign {
+        Some("foreign guest")
+    } else if wrk.connect + wrk.timeout + wrk.non_2xx > 0 || malloc > 0 {
+        Some("errors")
+    } else {
+        None
     }
 }
 
@@ -402,6 +502,8 @@ pub fn stage_of(samples: &[Sample], asked: u32, malloc: usize, length: usize) ->
     let seconds = (last.saturating_sub(first)) as f64 / 1e9;
     let bytes = (ok * length) as f64;
     let per_second = |n: f64| if seconds > 0.0 { n / seconds } else { 0.0 };
+    let mut lag = lags(samples, asked);
+    lag.sort_unstable();
     Stage {
         asked,
         requests: samples.len(),
@@ -415,6 +517,9 @@ pub fn stage_of(samples: &[Sample], asked: u32, malloc: usize, length: usize) ->
             .then(|| percentile(&latencies, 999))
             .flatten(),
         megabytes_per_second: per_second(bytes) / 1e6,
+        lag_p99: percentile(&lag, 990),
+        lag_max: lag.last().copied(),
+        foreign: false,
     }
 }
 
@@ -464,6 +569,7 @@ enum Row {
         connections: u32,
         wrk: Wrk,
         malloc: usize,
+        mark: Option<&'static str>,
         command: String,
     },
     Stage {
@@ -489,7 +595,7 @@ fn ms(ns: Option<u64>) -> String {
 /// The Markdown of the rows.
 fn table(rows: &[Row]) -> String {
     let mut out = String::new();
-    out += "### Ceilings (wrk, closed loop)\n\n| Step | File | Connections | Requests/s | Transfer/s | Requests | Socket errors (connect/read/write/timeout) | Non-2xx | malloc failed |\n|---|---|---|---|---|---|---|---|---|\n";
+    out += "### Ceilings (wrk, closed loop)\n\n| Step | File | Connections | Requests/s | Transfer/s | Requests | Socket errors (connect/read/write/timeout) | Non-2xx | malloc failed | Mark |\n|---|---|---|---|---|---|---|---|---|---|\n";
     for row in rows {
         if let Row::Ceiling {
             step,
@@ -497,11 +603,12 @@ fn table(rows: &[Row]) -> String {
             connections,
             wrk,
             malloc,
+            mark,
             ..
         } = row
         {
             out += &format!(
-                "| {step} | {path} | {connections} | {:.0} | {} | {} | {}/{}/{}/{} | {} | {malloc} |\n",
+                "| {step} | {path} | {connections} | {:.0} | {} | {} | {}/{}/{}/{} | {} | {malloc} | {} |\n",
                 wrk.per_second,
                 wrk.transfer,
                 wrk.requests,
@@ -509,11 +616,12 @@ fn table(rows: &[Row]) -> String {
                 wrk.read,
                 wrk.write,
                 wrk.timeout,
-                wrk.non_2xx
+                wrk.non_2xx,
+                mark.unwrap_or("")
             );
         }
     }
-    out += "\n### Stages (vegeta, open loop)\n\n| Step | File | Keep-alive | Asked/s | Achieved/s | Requests | p50 ms | p99 ms | p99.9 ms | Failed | malloc failed | MB/s | Mark |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+    out += "\n### Stages (vegeta, open loop)\n\n| Step | File | Keep-alive | Asked/s | Achieved/s | Requests | p50 ms | p99 ms | p99.9 ms | Failed | malloc failed | MB/s | Lag p99/max ms | Mark |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
     for row in rows {
         if let Row::Stage {
             step,
@@ -524,7 +632,7 @@ fn table(rows: &[Row]) -> String {
         } = row
         {
             out += &format!(
-                "| {step} | {path} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {:.1} | {} |\n",
+                "| {step} | {path} | {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {:.1} | {}/{} | {} |\n",
                 if *keep_alive { "yes" } else { "no" },
                 s.asked,
                 s.achieved,
@@ -535,6 +643,8 @@ fn table(rows: &[Row]) -> String {
                 s.failed,
                 s.malloc,
                 s.megabytes_per_second,
+                ms(s.lag_p99),
+                ms(s.lag_max),
                 s.marked().unwrap_or("")
             );
         }
@@ -625,6 +735,10 @@ struct Bench {
     address: SocketAddr,
     lengths: Lengths,
     rows: Vec<Row>,
+    /// The guests of vz-run when the run started (its own on VZ), and
+    /// whether a new one ends the run (on VZ, where it takes the lease).
+    vz_guests: usize,
+    stop_on_foreign: bool,
 }
 
 /// Runs `program args`, its output into `name` in `dir`.
@@ -707,7 +821,27 @@ fn alert_until(run: &mut qemu::Run, until: Instant) -> Option<String> {
     .ok()
 }
 
+/// The guests of vz-run on the Mac.
+fn vz_guests() -> usize {
+    guests().iter().filter(|g| g.contains("vz-run")).count()
+}
+
 impl Bench {
+    /// Whether a guest of vz-run came up since the run started.
+    fn foreign(&self) -> bool {
+        vz_guests() > self.vz_guests
+    }
+
+    /// Ends the run after `step` beside a foreign guest of VZ.
+    fn stop_on_foreign(&self, step: &str, foreign: bool) -> Result<(), String> {
+        if foreign && self.stop_on_foreign {
+            return Err(format!(
+                "{step}: a foreign guest of vz-run came up beside the run (same MAC address, same lease); the run stops here"
+            ));
+        }
+        Ok(())
+    }
+
     /// Runs `program args`, its output into `name` in the run's directory.
     fn tool(&self, name: &str, program: &str, args: &[String]) -> Result<String, String> {
         run_tool(&self.dir, name, program, args)
@@ -720,7 +854,7 @@ impl Bench {
         step: &str,
         path: &str,
         connections: u32,
-    ) -> Result<Wrk, String> {
+    ) -> Result<(Wrk, Option<&'static str>), String> {
         let args: Vec<String> = [
             "-t2".to_owned(),
             format!("-c{connections}"),
@@ -731,6 +865,7 @@ impl Bench {
         ]
         .to_vec();
         let command = format!("wrk {}", args.join(" "));
+        let mut foreign = self.foreign();
         let mark = server.mark()?;
         let name = format!("wrk-{}.txt", slug(step));
         let (text, seen) = watched(
@@ -747,9 +882,17 @@ impl Bench {
         let malloc = malloc_failures(&log);
         let mut alerts = alerts(&log);
         alerts.extend(seen);
+        foreign |= self.foreign();
+        let marked = ceiling_mark(&wrk, malloc, foreign);
         println!(
-            "nginx-bench: {step}: {:.0} requests/s, socket errors connect {} read {} write {} timeout {}, non-2xx {}, malloc failed {malloc}",
-            wrk.per_second, wrk.connect, wrk.read, wrk.write, wrk.timeout, wrk.non_2xx
+            "nginx-bench: {step}: {:.0} requests/s, socket errors connect {} read {} write {} timeout {}, non-2xx {}, malloc failed {malloc}{}",
+            wrk.per_second,
+            wrk.connect,
+            wrk.read,
+            wrk.write,
+            wrk.timeout,
+            wrk.non_2xx,
+            marked.map(|m| format!(" ({m})")).unwrap_or_default()
         );
         self.rows.push(Row::Ceiling {
             step: step.to_owned(),
@@ -757,8 +900,10 @@ impl Bench {
             connections,
             wrk: wrk.clone(),
             malloc,
+            mark: marked,
             command,
         });
+        self.stop_on_foreign(step, foreign)?;
         if matches!(server, Server::Guest(_)) {
             stop_on(step, &alerts)?;
         } else if let Some(first) = alerts.first() {
@@ -770,7 +915,7 @@ impl Bench {
                 first.trim()
             )));
         }
-        Ok(wrk)
+        Ok((wrk, marked))
     }
 
     /// A warm-up and a stage of `vegeta attack` at `rate` of `path`.
@@ -822,6 +967,7 @@ impl Bench {
                 &format!("targets.txt (GET {}{path})", self.base),
             )
             .replace(&format!("{}/", self.dir.display()), "");
+        let mut foreign = self.foreign();
         let mark = server.mark()?;
         let (_, seen) = watched(
             server,
@@ -846,11 +992,18 @@ impl Bench {
             .iter()
             .find(|(p, _)| *p == path)
             .map_or(0, |(_, bytes)| bytes.len());
-        let stage = stage_of(&samples, rate, malloc, length);
+        foreign |= self.foreign();
+        let mut stage = stage_of(&samples, rate, malloc, length);
+        stage.foreign = foreign;
+        std::fs::write(
+            self.dir.join(format!("seconds-{slug}.csv")),
+            by_second(&samples, rate),
+        )
+        .map_err(|e| format!("seconds-{slug}.csv: {e}"))?;
         // The results compress well; `gunzip` gives vegeta's file back.
         let _ = Command::new("gzip").arg("-f").arg(&results).status();
         println!(
-            "nginx-bench: {step}: asked {rate}/s, achieved {:.0}/s, {} requests, p50 {} ms, p99 {} ms, p99.9 {} ms, failed {}, malloc failed {}{}",
+            "nginx-bench: {step}: asked {rate}/s, achieved {:.0}/s, {} requests, p50 {} ms, p99 {} ms, p99.9 {} ms, failed {}, malloc failed {}, lag p99 {} ms max {} ms{}",
             stage.achieved,
             stage.requests,
             ms(stage.p50),
@@ -858,6 +1011,8 @@ impl Bench {
             ms(stage.p999),
             stage.failed,
             stage.malloc,
+            ms(stage.lag_p99),
+            ms(stage.lag_max),
             stage
                 .marked()
                 .map(|m| format!(" ({m})"))
@@ -870,6 +1025,7 @@ impl Bench {
             stage: stage.clone(),
             command,
         });
+        self.stop_on_foreign(step, foreign)?;
         if matches!(server, Server::Guest(_)) {
             stop_on(step, &alerts)?;
         } else if let Some(first) = alerts.first() {
@@ -954,7 +1110,12 @@ fn check_files(address: SocketAddr) -> Result<(), String> {
 /// The load of steps 1 to 4 against `server`; gives R_max.
 fn load(bench: &mut Bench, server: &mut Server<'_>, options: &Options) -> Result<f64, String> {
     check_files(bench.address)?;
-    let ceiling = bench.ceiling(server, "2. ceiling", "/10k.bin", WRK_CONNECTIONS)?;
+    let (ceiling, marked) = bench.ceiling(server, "2. ceiling", "/10k.bin", WRK_CONNECTIONS)?;
+    if let Some(mark) = marked {
+        return Err(format!(
+            "the ceiling of /10k.bin is marked {mark}: no ladder is built on it"
+        ));
+    }
     let r_max = ceiling.per_second;
     if options.quick {
         bench.stage(
@@ -988,7 +1149,7 @@ fn load(bench: &mut Bench, server: &mut Server<'_>, options: &Options) -> Result
         server,
         "4. 256k at 50 % of its ceiling",
         "/256k.bin",
-        share_of(large.per_second, 50),
+        share_of(large.0.per_second, 50),
         true,
     )?;
     if options.target == Target::Host {
@@ -1023,7 +1184,7 @@ fn exclusive(bench: &mut Bench, server: &mut Server<'_>) -> Result<(), String> {
         server,
         "6. exclusive at 50 % of its ceiling",
         "/10k.bin",
-        share_of(wrk.per_second, 50),
+        share_of(wrk.0.per_second, 50),
         true,
     )?;
     Ok(())
@@ -1305,6 +1466,8 @@ fn guest(options: &Options) -> Result<(), String> {
             address,
             lengths: Lengths::of(options.quick),
             rows: Vec::new(),
+            vz_guests: vz_guests(),
+            stop_on_foreign: vz,
         });
         let r_max = load(bench, &mut Server::Guest(&mut run), options)?;
         bench
@@ -1403,6 +1566,8 @@ fn host(options: &Options) -> Result<(), String> {
         base: format!("http://{address}"),
         address,
         lengths: Lengths::of(options.quick),
+        vz_guests: vz_guests(),
+        stop_on_foreign: false,
         rows: vec![Row::Note(format!(
             "Homebrew's {} at {address}, the package's settings (host_conf), kqueue",
             String::from_utf8_lossy(
@@ -1505,17 +1670,22 @@ Transfer/sec:    207.52MB
 
     #[test]
     fn a_line_of_the_csv_of_vegeta_gives_a_sample() {
-        let line = "1762300000000000000,200,1234567,0,10240,,,0,GET,http://127.0.0.1:8080/10k.bin,\"Content-Length: 10240\"";
+        // The columns of vegeta 12.13.0's encoder: timestamp, code, latency,
+        // bytes out, bytes in, error, body, attack, seq, method, URL, headers.
+        let line = "1762300000000000000,200,1234567,0,0,,,,7,GET,http://127.0.0.1:8080/10k.bin,QWNjZXB0LVJhbmdlczogYnl0ZXM=";
         assert_eq!(
             parse_sample(line),
             Some(Sample {
                 at: 1_762_300_000_000_000_000,
                 code: 200,
                 latency: 1_234_567,
+                seq: 7,
             })
         );
-        let failed = "1762300000000000000,0,10000000000,0,0,\"Get \"\"http://x\"\": context deadline exceeded\",,1,GET,http://x,";
-        assert_eq!(parse_sample(failed).unwrap().code, 0);
+        // A quoted error with commas and doubled quotes keeps seq in place.
+        let failed = "1762300000000000000,0,10000000000,0,0,\"Get \"\"http://x\"\": dial tcp, a, b\",,,12,GET,http://x,";
+        let failed = parse_sample(failed).unwrap();
+        assert_eq!((failed.code, failed.seq), (0, 12));
         assert_eq!(parse_sample("timestamp,code"), None);
     }
 
@@ -1528,6 +1698,7 @@ Transfer/sec:    207.52MB
                 at: 1_000_000_000_000 + n * gap,
                 code: 200,
                 latency: latency(n),
+                seq: n,
             })
             .collect()
     }
@@ -1572,6 +1743,68 @@ Transfer/sec:    207.52MB
             |n| if n == 9999 { 2_000_000_000 } else { 1_000_000 },
         );
         assert_eq!(stage_of(&late, 1000, 0, 10240).marked(), Some("saturated"));
+    }
+
+    /// The lag of a request is its taking behind the schedule from its
+    /// number; a pacer that stood and sent the missed requests at once
+    /// marks the stage, though no latency grew.
+    #[test]
+    fn the_lag_behind_the_schedule_comes_from_seq() {
+        let on_time = samples(1000, 10, |_| 1_000_000);
+        assert!(lags(&on_time, 1000).iter().all(|&l| l == 0));
+        let stage = stage_of(&on_time, 1000, 0, 10240);
+        assert_eq!((stage.lag_p99, stage.lag_max), (Some(0), Some(0)));
+        assert_eq!(stage.marked(), None);
+        // vegeta stood 50 ms at every second: the 50 requests due then are
+        // taken together at its end.
+        let mut late = on_time.clone();
+        for s in &mut late {
+            let into = s.seq % 1000;
+            if into < 50 {
+                s.at += (50 - into) * 1_000_000;
+            }
+        }
+        let lag = lags(&late, 1000);
+        assert_eq!(lag.iter().max(), Some(&50_000_000));
+        let stage = stage_of(&late, 1000, 0, 10240);
+        assert_eq!(stage.p99, Some(1_000_000), "the latency did not grow");
+        assert_eq!(stage.marked(), Some("generator late"));
+        assert_eq!(stage.lag_max, Some(50_000_000));
+    }
+
+    #[test]
+    fn the_summary_by_second_has_a_line_a_second() {
+        let mut s = samples(100, 3, |n| if n == 150 { 9_000_000 } else { 1_000_000 });
+        s[250].code = 0;
+        let csv = by_second(&s, 100);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "second,requests,p50_ms,p99_ms,max_ms,not_200,max_lag_ms"
+        );
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1], "0,100,1.000,1.000,1.000,0,0.000");
+        assert_eq!(lines[2], "1,100,1.000,1.000,9.000,0,0.000");
+        assert_eq!(lines[3], "2,100,1.000,1.000,1.000,1,0.000");
+    }
+
+    #[test]
+    fn a_ceiling_with_errors_or_beside_a_foreign_guest_is_marked() {
+        let wrk = parse_wrk(WRK_OUTPUT).unwrap();
+        assert_eq!(ceiling_mark(&wrk, 0, false), Some("errors"));
+        let clean = Wrk {
+            read: 64,
+            ..Wrk {
+                per_second: 9876.0,
+                ..Wrk::default()
+            }
+        };
+        assert_eq!(ceiling_mark(&clean, 0, false), None, "reads at the end");
+        assert_eq!(ceiling_mark(&clean, 1, false), Some("errors"));
+        assert_eq!(ceiling_mark(&clean, 0, true), Some("foreign guest"));
+        let mut stage = stage_of(&samples(100, 10, |_| 1_000_000), 100, 0, 10240);
+        stage.foreign = true;
+        assert_eq!(stage.marked(), Some("foreign guest"));
     }
 
     #[test]

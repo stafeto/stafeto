@@ -7,7 +7,11 @@ so it only builds the four images and runs the host tests of the command.
 
 - `brew install wrk vegeta` (wrk 4.2.0 for the ceiling and the connection
   errors, vegeta 12.13.0 for the latencies at a fixed rate); `brew install
-  nginx` for the reference run on the Mac.
+  nginx` for the reference run on the Mac. vegeta counts a latency from the
+  moment a worker takes the request, and when its pacer falls behind it
+  sends the missed requests at once: a stall of vegeta itself is not in the
+  latency. xtask computes each request's lag behind the schedule from its
+  sequence number and gives its p99 and its longest for every stage.
 - For VZ, the terminal needs the Local Network permission (System Settings,
   Privacy and Security) to reach the guest on the NAT.
 - A quiet Mac: the load generator and the guest share its cores, and macOS
@@ -58,8 +62,11 @@ and stages at 1 000, 2 500, 5 000, 7 500 and 10 000 requests a second.
 Run one measurement at a time and no other guest beside it: every guest of
 `vz-run` has the MAC address 02:73:74:66:00:01 and so the same lease on the
 NAT, and a second VZ guest takes the address over in the middle of a stage
-(answers 404 or refusals from the other guest). The table notes the other
-machines of QEMU and VZ seen at the start and the end of the run.
+(answers 404 or refusals from the other guest). The command refuses to
+start on VZ beside another guest of `vz-run` and looks again before and
+after every ceiling and stage: a row with a new guest beside it is marked
+`foreign guest`, and on VZ the run stops there. The table notes the other
+machines of QEMU and VZ and the Mac's load average at the start and the end.
 
 ## Reading the table
 
@@ -68,9 +75,19 @@ command of every load and the notes; beside it the output of every tool, the
 console and vegeta's results (`gunzip` gives the file `vegeta report` and
 `vegeta encode` read). xtask sorts the latencies itself: p50 and p99 by the
 nearest rank, p99.9 only from 100 000 requests. A stage is marked
-`saturated` below 95 % of its rate and `errors` with a failed request, an
-answer other than 200 or a line `malloc(...) failed` of nginx; neither goes
-in a table of p99.
+`foreign guest` (above), `errors` with a failed request, an answer other
+than 200 or a line `malloc(...) failed` of nginx, `saturated` below 95 % of
+its rate, and `generator late` when the p99 of its lag behind the schedule
+passes 0.1 ms; no marked stage goes in a table of p99. A ceiling of wrk is
+marked `errors` with errors of `connect`, timeouts, answers other than 200
+or `malloc(...) failed` (the errors of reading at the end of a run on QEMU
+come from the forwarded port and leave it unmarked); no ladder is built on a
+marked ceiling of `/10k.bin`. Beside each stage `seconds-<step>.csv` sums it
+up by the second: requests, p50, p99 and the longest latency, answers other
+than 200 and the longest lag.
+
+`wrk` prints its transfer in MiB (1 048 576 bytes); the MB/s of the stages
+are 10^6 bytes a second.
 
 On QEMU the load goes through the user network's forwarded port, which
 listens with a backlog of one: the connections of wrk and vegeta queue
