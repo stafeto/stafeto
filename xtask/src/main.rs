@@ -1754,9 +1754,11 @@ commands:
             READY, after the deadline of 3 s, and at once when the service ended
   pkg-slot  run the C probe of the package service's session in fork, spawn and exec,
             a set-ID program and the superuser's right, in QEMU
-  pkg-probe [install] [--hvf] run the package tool in the base image against a mirror of
-            the repository over https that the command starts and ends: pkg install doom
+  pkg-probe [install] [--hvf] run the package tool in the base image against mirrors of
+            the repositories over https that the command starts and ends: pkg install doom
             and the demo, update, list, info, search, check and the log of the mirror
+            (install stops there); the plain command goes on with every refusal, remove,
+            upgrade, the second repository and a restart on the same disk
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
             shown, the screen compared with QEMU's screenshot by CRC-32, one
             owner, the screen's return, a restart of the service, and its
