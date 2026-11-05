@@ -377,32 +377,32 @@ pub fn check_versions(
 
 /// What one guest showed.
 #[derive(Debug, Default)]
-struct Report {
-    system: &'static str,
-    address: Option<Ipv4Addr>,
-    mac: String,
+pub(crate) struct Report {
+    pub(crate) system: &'static str,
+    pub(crate) address: Option<Ipv4Addr>,
+    pub(crate) mac: String,
     /// From the start of `vz-run` to the prompt of the shell; from the moment
     /// the four workers of nginx are on the console and the shell answers to
     /// the first answer of nginx on the Mac. The same on both guests, a check
     /// of liveness that is no part of the measurement.
-    prompt: Duration,
-    answer: Duration,
+    pub(crate) prompt: Duration,
+    pub(crate) answer: Duration,
     /// Every attempt to get the first answer: when and how it ended.
-    attempts: Vec<String>,
+    pub(crate) attempts: Vec<String>,
     /// The Mac's load average and the other machines of VZ and QEMU on it,
     /// before the guest starts and after its last answer: no quiet Mac is
     /// asked for, the conditions are recorded.
-    conditions: Vec<String>,
+    pub(crate) conditions: Vec<String>,
     /// The kernel's settings (`sysctl -a`), where the guest is Linux.
-    sysctl: Vec<String>,
-    cpus: String,
-    nginx: String,
-    openssl: String,
-    nginx_v: Vec<String>,
-    config_digest: String,
-    www_digest: String,
-    features: String,
-    served: usize,
+    pub(crate) sysctl: Vec<String>,
+    pub(crate) cpus: String,
+    pub(crate) nginx: String,
+    pub(crate) openssl: String,
+    pub(crate) nginx_v: Vec<String>,
+    pub(crate) config_digest: String,
+    pub(crate) www_digest: String,
+    pub(crate) features: String,
+    pub(crate) served: usize,
 }
 
 impl Report {
@@ -435,7 +435,11 @@ fn capture(
 }
 
 /// Waits until the console shows the four workers of nginx.
-fn workers_up(run: &mut qemu::Run, within: Duration) -> Result<(), String> {
+pub(crate) fn workers_up(
+    run: &mut qemu::Run,
+    within: Duration,
+    count: usize,
+) -> Result<(), String> {
     let deadline = Instant::now() + within;
     loop {
         let seen = run
@@ -443,11 +447,11 @@ fn workers_up(run: &mut qemu::Run, within: Duration) -> Result<(), String> {
             .iter()
             .filter(|l| l.contains("start worker process "))
             .count();
-        if seen >= 4 {
+        if seen >= count {
             return Ok(());
         }
         if Instant::now() > deadline {
-            return Err(format!("{seen} of 4 workers of nginx on the console"));
+            return Err(format!("{seen} of {count} workers of nginx on the console"));
         }
         // Takes in the console's output for a moment.
         let _ = run.expect_seen("\u{0}pump", Duration::from_millis(100));
@@ -458,7 +462,7 @@ fn workers_up(run: &mut qemu::Run, within: Duration) -> Result<(), String> {
 /// answers: `nginx -V`, `nginx -T`, the hashes of `find /www -type f` and the
 /// number of CPUs, checked against what stafeto's sources say; on Linux the
 /// kernel's settings too.
-fn read_fingerprints(
+pub(crate) fn read_fingerprints(
     run: &mut qemu::Run,
     report: &mut Report,
     kernel_settings: bool,
@@ -516,7 +520,7 @@ fn read_fingerprints(
 }
 
 /// The fingerprints a guest must show, from stafeto's sources.
-fn expected() -> Result<(String, String), String> {
+pub(crate) fn expected() -> Result<(String, String), String> {
     let mime = nginx_probe::mime_types();
     if mime.is_empty() {
         return Err("nginx's mime.types is missing: run tools/build-nginx.py".to_owned());
@@ -528,7 +532,7 @@ fn expected() -> Result<(String, String), String> {
 }
 
 /// Refuses a guest whose fingerprints are not the expected ones.
-fn verify(report: &Report, config: &str, www: &str) -> Result<(), String> {
+pub(crate) fn verify(report: &Report, config: &str, www: &str) -> Result<(), String> {
     if report.config_digest != config {
         return Err(format!(
             "{}: the fingerprint of `nginx -T` is {}, stafeto's sources give {config}",
@@ -585,7 +589,7 @@ fn fetch_all(address: SocketAddr, from: Instant) -> Result<(Duration, Vec<String
 }
 
 /// The machine of both guests, with the MAC suffix of the run.
-fn machine(suffix: &vz::Suffix) -> vz::Machine {
+pub(crate) fn machine(suffix: &vz::Suffix) -> vz::Machine {
     vz::Machine {
         cpus: Some(CPUS),
         memory_mib: Some(MEMORY_MIB),
@@ -594,7 +598,7 @@ fn machine(suffix: &vz::Suffix) -> vz::Machine {
     }
 }
 
-fn linux_dir() -> PathBuf {
+pub(crate) fn linux_dir() -> PathBuf {
     target_dir().join("linux-guest")
 }
 
@@ -625,7 +629,7 @@ pub fn build_guest() -> Result<PathBuf, String> {
 }
 
 /// The command that boots the guest of Linux built in `dir`.
-fn linux_command(dir: &Path, suffix: &vz::Suffix) -> Result<Command, String> {
+pub(crate) fn linux_command(dir: &Path, suffix: &vz::Suffix) -> Result<Command, String> {
     vz::command_on(
         &dir.join("Image"),
         &dir.join("initramfs.cpio.gz"),
@@ -736,7 +740,7 @@ fn check_linux(dir: &Path, expected: &(String, String)) -> Result<Guest, String>
         run.expect_line("ready", |l| l == "linux-guest: ready", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         report.prompt = started.elapsed();
-        workers_up(&mut run, DIALOG_STEP)?;
+        workers_up(&mut run, DIALOG_STEP, 4)?;
         let (first, attempts, served) = fetch_all((address, 80).into(), Instant::now())?;
         report.answer = first;
         report.attempts = attempts;
@@ -811,7 +815,7 @@ fn check_stafeto(expected: &(String, String)) -> Result<Guest, String> {
             |l| l.contains("using the \"epoll\" event method"),
             DIALOG_STEP,
         )?;
-        workers_up(&mut run, DIALOG_STEP)?;
+        workers_up(&mut run, DIALOG_STEP, 4)?;
         let (first, attempts, served) = fetch_all((lease.address, 80).into(), Instant::now())?;
         report.answer = first;
         report.attempts = attempts;

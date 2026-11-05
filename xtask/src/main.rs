@@ -76,6 +76,7 @@ mod native_scopes;
 mod native_stop_barrier_tests;
 mod ncdu_dialog;
 mod net;
+mod net_bench;
 mod net_curl;
 mod net_probe;
 mod net_tls;
@@ -1822,6 +1823,15 @@ commands:
             one listening socket, the guest's reads of the files; `host`
             runs the load against Homebrew's nginx; table and raw output in
             target/nginx-bench/
+  net-bench run [options] | tables DIR
+            measure HTTP on stafeto (S4) against Linux (L1, L4) on Apple VZ
+            with four CPUs each (stage P7; by hand, on a Mac that is not
+            quiet): the limit of the NAT, a walk up a grid of rates with
+            bisection to find R* (p99 within 1 ms, corrected for the lag of
+            the load generator), confirmation and 50 and 80 % runs in
+            rounds that alternate the systems, the floor of the Mac, the CPUs
+            of the guest; one file per step in target/net-bench/<time>/,
+            `--resume DIR` repeats nothing done; see docs/net-bench.md
   linux-guest build|run|check  the Linux guest of the measurement of the
             network (stage P7; Alpine 3.24 packages pinned in
             tools/linux-guest/alpine.lock, built on this Mac and never
@@ -2117,6 +2127,7 @@ fn main() {
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
+        Some("net-bench") => net_bench::command(&args[1..]),
         Some("linux-guest") => linux_guest::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
