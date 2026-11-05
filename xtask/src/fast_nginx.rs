@@ -121,6 +121,12 @@ const START_WITHIN: Duration = Duration::from_secs(60);
 const QUIT_WITHIN: Duration = Duration::from_secs(20);
 const READ_WITHIN: Duration = Duration::from_secs(30);
 const REQUESTS: usize = 200;
+/// The hundred connections of the wide step are opened one after another
+/// through the queue of one of the user network of QEMU: 135 ms on a fast
+/// machine, 27 663 ms on ci (a SYN sent again after a second now and then).
+/// The answers took 564 ms and 1 704 ms. The deadlines are twice the largest
+/// seen: 60 s to open, and the 30 s of a read for each answer.
+const WIDE_OPEN_WITHIN: Duration = Duration::from_secs(60);
 /// The connections of the step that loads the worker's memory the most.
 const WIDE: usize = 100;
 const CONNECTIONS: usize = 16;
@@ -473,6 +479,13 @@ fn wide(address: SocketAddr, width: usize) -> Result<(Duration, Duration), Strin
         );
     }
     let opened = opening.elapsed();
+    if opened > WIDE_OPEN_WITHIN {
+        return Err(format!(
+            "{width} connections took {} ms to open, past {} ms",
+            opened.as_millis(),
+            WIDE_OPEN_WITHIN.as_millis()
+        ));
+    }
     let answering = Instant::now();
     let threads: Vec<_> = open
         .into_iter()
