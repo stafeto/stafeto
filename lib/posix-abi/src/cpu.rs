@@ -14,11 +14,75 @@
 //! that is the system time (`process_split_ns`, `thread_split_ns`,
 //! `children_split_ns` give user and system time) and the rest is the user
 //! time. CPU-time clocks and `clock` count both.
+//!
+//! The child of a fork starts its account at zero: `after_fork` keeps the
+//! time its loader and its binding took as the start, here and in the
+//! service. The loader of a posix_spawn child is the load of its own image
+//! and counts for it.
 
 use crate::constants::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use proto_process::{Method, account_op};
 use rt::handle::{Handle, Thread};
 use rt::sys;
+
+/// The process time (ticks) and the part of it spent in the kernel that
+/// the process had when `after_fork` ran: the loader's work of building
+/// the child is behind it, and the child's own account starts from here.
+static BASE_TICKS: AtomicU64 = AtomicU64::new(0);
+static BASE_KERNEL: AtomicU64 = AtomicU64::new(0);
+/// The same for the main thread of the child, which is its loader's thread:
+/// its number, and the ticks and the kernel part it had run.
+static BASE_THREAD: AtomicU64 = AtomicU64::new(0);
+static BASE_THREAD_TICKS: AtomicU64 = AtomicU64::new(0);
+static BASE_THREAD_KERNEL: AtomicU64 = AtomicU64::new(0);
+
+/// The start of the account of thread `id`: what it ran before the child
+/// bound its layer (the main thread only), ticks and the part in the kernel.
+fn thread_base(id: u64) -> (u64, u64) {
+    if id != 0 && id == BASE_THREAD.load(Ordering::Relaxed) {
+        (
+            BASE_THREAD_TICKS.load(Ordering::Relaxed),
+            BASE_THREAD_KERNEL.load(Ordering::Relaxed),
+        )
+    } else {
+        (0, 0)
+    }
+}
+
+/// The account of the child of a fork starts at zero (XSH fork, times,
+/// clock): the process's time so far, the work of its loader, is taken as
+/// the start. The process service keeps the same start for what the parent
+/// and `ps` see. Called in the child at the end of its binding, before the
+/// program runs; what a parent's copy of the numbers held goes first.
+pub fn after_fork() {
+    BASE_TICKS.store(0, Ordering::Relaxed);
+    BASE_KERNEL.store(0, Ordering::Relaxed);
+    BASE_THREAD.store(0, Ordering::Relaxed);
+    BASE_THREAD_TICKS.store(0, Ordering::Relaxed);
+    BASE_THREAD_KERNEL.store(0, Ordering::Relaxed);
+    let Ok((ticks, kernel)) = sys::process_times(crate::allocation::process()) else {
+        return;
+    };
+    let kernel = kernel.min(ticks);
+    BASE_TICKS.store(ticks, Ordering::Relaxed);
+    BASE_KERNEL.store(kernel, Ordering::Relaxed);
+    let block = crate::threads::own_block();
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
+    if let (Ok(ran), Ok((all, in_kernel))) = (sys::thread_ran(&thread), sys::thread_times(&thread))
+    {
+        BASE_THREAD_TICKS.store(ran, Ordering::Relaxed);
+        BASE_THREAD_KERNEL.store(in_kernel.min(all), Ordering::Relaxed);
+        BASE_THREAD.store(crate::threads::thread_number(), Ordering::Relaxed);
+    }
+    // The service leaves it out of its own account of this process.
+    if let Ok(mut w) = crate::process::request(Method::Account, &[account_op::FORK_BASE])
+        && w.u64(ticks).is_ok()
+        && w.u64(kernel).is_ok()
+    {
+        let _ = crate::process::ask(&w);
+    }
+}
 
 /// The id of the clock of thread `id` (the number the layer gives it):
 /// pthread_getcpuclockid. A CPU-time clock of another process is not given.
@@ -52,7 +116,7 @@ fn ns(ticks: u64) -> u64 {
 /// The time the calling process's threads have run, ns.
 pub fn process_ns() -> Result<u64, i32> {
     sys::process_time(crate::allocation::process())
-        .map(ns)
+        .map(|ticks| ns(ticks.saturating_sub(BASE_TICKS.load(Ordering::Relaxed))))
         .map_err(|_| EIO)
 }
 
@@ -62,7 +126,10 @@ pub fn thread_ns() -> Result<u64, i32> {
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(
         block.thread.load(core::sync::atomic::Ordering::Relaxed),
     ));
-    sys::thread_ran(&thread).map(ns).map_err(|_| EIO)
+    let base = thread_base(crate::threads::thread_number()).0;
+    sys::thread_ran(&thread)
+        .map(|ticks| ns(ticks.saturating_sub(base)))
+        .map_err(|_| EIO)
 }
 
 /// The time thread `id` has run, ns (ESRCH for one that is gone).
@@ -71,14 +138,22 @@ pub fn thread_ns_of(id: u64) -> Result<u64, i32> {
         return thread_ns();
     }
     crate::relibc::with_target(id, |_, native| {
-        sys::thread_ran(native).map(ns).map_err(|_| ESRCH)
+        let base = thread_base(id).0;
+        sys::thread_ran(native)
+            .map(|ticks| ns(ticks.saturating_sub(base)))
+            .map_err(|_| ESRCH)
     })?
 }
 
 /// The user and the system time of the calling process, ns.
 pub fn process_split_ns() -> Result<(u64, u64), i32> {
     sys::process_times(crate::allocation::process())
-        .map(split)
+        .map(|(ticks, kernel)| {
+            split((
+                ticks.saturating_sub(BASE_TICKS.load(Ordering::Relaxed)),
+                kernel.saturating_sub(BASE_KERNEL.load(Ordering::Relaxed)),
+            ))
+        })
         .map_err(|_| EIO)
 }
 
@@ -88,7 +163,15 @@ pub fn thread_split_ns() -> Result<(u64, u64), i32> {
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(
         block.thread.load(core::sync::atomic::Ordering::Relaxed),
     ));
-    sys::thread_times(&thread).map(split).map_err(|_| EIO)
+    let (base, base_kernel) = thread_base(crate::threads::thread_number());
+    sys::thread_times(&thread)
+        .map(|(ticks, kernel)| {
+            split((
+                ticks.saturating_sub(base),
+                kernel.saturating_sub(base_kernel),
+            ))
+        })
+        .map_err(|_| EIO)
 }
 
 /// The user and the system time of the children that were waited for,

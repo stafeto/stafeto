@@ -782,8 +782,14 @@ static int t_c_clock(void) {
     pid_t child = fork();
     if (child < 0) return 4;
     if (child == 0) {
+        /* The processor time of a child of fork starts at zero (XSH fork):
+         * the work of its loader is not in it, however long that took.
+         * The parent has d >= 30 ms by now. */
         clock_t c = clock();
-        _exit(c != (clock_t)-1 && c < d ? 0 : 1);
+        /* Its only thread, the loader's, starts at zero as well. */
+        struct timespec th;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &th) != 0 || th.tv_sec != 0 || th.tv_nsec >= 20 * T_MS) _exit(2);
+        _exit(c != (clock_t)-1 && c < d && c < 20000 ? 0 : 1);
     }
     int status = -1;
     if (waitpid(child, &status, 0) != child) return 5;
