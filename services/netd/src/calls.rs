@@ -1214,6 +1214,7 @@ impl Net {
         // The member becomes the new description; another listens in its
         // place.
         let m = usize::from(sock.members[k]);
+        rt::println!("DIAG accept label {:#x} listener {} member {}", s.label(), place, m);
         let Some(handle) = self.socks[m].handle else {
             return self.done(s, key, refuse(proto_net::INVALID));
         };
