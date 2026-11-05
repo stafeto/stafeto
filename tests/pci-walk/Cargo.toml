@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "Guest program that walks bus 0 of Apple VZ and prints its devices"
+description = "Guest program that walks bus 0 of Apple VZ or QEMU's virt and prints its devices"
 
 [[bin]]
 name = "pci-walk"

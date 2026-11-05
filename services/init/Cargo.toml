@@ -96,6 +96,8 @@ table-fstack-probe = []
 table-fstack-device = []
 # The walk of Apple VZ's bus 0 (xtask pci-walk-vz).
 table-pci-walk-vz = []
+# The walk of QEMU's bus 0 (xtask pci-walk).
+table-pci-walk-qemu = []
 # The shell with the network service on Apple VZ, one and two network devices.
 table-net-vz = []
 table-net-vz2 = []
@@ -147,6 +149,7 @@ proto-init = { path = "../../proto/init" }
 proto-pipe = { path = "../../proto/pipe" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
+virtio-pci = { path = "../../lib/virtio-pci" }
 # The text of a batch of the kernel log (uart::log), which the worker
 # shows once the console's driver ended for good.
 uart = { path = "../uart" }

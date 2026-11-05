@@ -251,6 +251,7 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("kernel tests 2G icount", 1),
     ("tty", 10),
     ("entropy", 6),
+    ("pci-walk", 4),
     ("gpu-probe", 8),
     ("input-probe", 10),
     ("posix-random", 19),
