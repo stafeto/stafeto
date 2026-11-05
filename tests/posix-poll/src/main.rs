@@ -16,3 +16,9 @@ pub extern "C" fn stafeto_poll_level(level: u32) -> i32 {
     };
     posix_abi::threads::set_level(level).map_or(-1, |()| 0)
 }
+
+/// The notifications queued on this thread's channel.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_poll_queued() -> u64 {
+    posix_abi::probe_queued()
+}

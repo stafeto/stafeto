@@ -158,6 +158,20 @@ pub fn probe_ceiling() -> u8 {
     ceiling().expect("the ceiling")
 }
 
+/// The notifications waiting on the calling thread's channel, for the guest
+/// probes: none stay there after a poll, select or epoll_wait.
+#[cfg(feature = "thread-probe")]
+pub fn probe_queued() -> u64 {
+    let channel = rt::handle::Handle::<rt::handle::Channel>::borrowed(rt::abi::Handle(
+        threads::own_block()
+            .channel
+            .load(core::sync::atomic::Ordering::Relaxed),
+    ));
+    rt::sys::channel_info(&channel)
+        .expect("channel_info")
+        .queued
+}
+
 /// The errno of a file error.
 pub fn error(error: FsError) -> c_int {
     match error {

@@ -8975,6 +8975,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         // descriptors, 1 000 sockets, a fork and an exec with many of them.
         // Also in the group `net`.
         job("posix-net", || posix_net::probe(&qemu::VIRT, false)),
+        // Many waits with late answers on two CPUs: none fails with EAGAIN.
+        job("posix-net wait-churn smp 2", posix_net::wait_churn_smp),
         // The TCP/IP stack of FreeBSD 15 (F-Stack) in a process, on its own
         // loopback: 16 MiB, 1 000 connections, its clock. Also in the group
         // `net`.
