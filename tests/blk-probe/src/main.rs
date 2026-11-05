@@ -6,8 +6,7 @@
 //!
 //! - zeros, the mode of writing: the refusals of the service (a request
 //!   before BUFFER, a count of 0 and 33, a cell past the buffer, a range
-//!   past the disk, a cell in flight, a second BUFFER, a FLUSH with a write
-//!   at the device); a pattern of 4 MiB at sector 2048 and one of the last
+//!   past the disk, a cell in flight, a second BUFFER); a pattern of 4 MiB at sector 2048 and one of the last
 //!   32 sectors of the disk, written four cells in flight, FLUSH; a CANCEL
 //!   of a read in flight; the whole pattern read back and compared; sector
 //!   0 marked `STAFBLK1`, the way `pkgd` will commit (data, flush, then the
@@ -18,7 +17,9 @@
 //!   sectors read again.
 //! - `STAFFLT1`, the mode of faults: the host's `blkdebug` fails the first
 //!   flush and the first read of sector 4096; the client sees IO for each,
-//!   and READY for the second try.
+//!   and READY for the second try. The host also holds each write after the
+//!   first for a second, so a FLUSH sent right after a write meets a
+//!   write that is with the device and is refused BUSY.
 //!
 //! Every operation goes in two steps (proto_blk, proto_wire::long). Each
 //! check prints its line, and xtask reads them.
@@ -478,25 +479,6 @@ impl Probe<'_> {
         let again = self.give()?;
         check(again == Err(code(proto_blk::EXISTS)), "a second BUFFER")?;
         rt::println!("blk-probe: a cell in flight is BUSY, a second BUFFER is EXISTS");
-        // A FLUSH while a write is with the device is BUSY: the device may
-        // answer first, so the check tries again until it sees one.
-        let mut busy = false;
-        for _ in 0..TRIES {
-            let write = self
-                .start(Method::Write, 0, 1, 1)
-                .map_err(|_| "WRITE refused")?;
-            match self.start_flush() {
-                Err(status) if status == code(proto_blk::BUSY) => busy = true,
-                Ok(flush) => self.finish(flush).map_err(|_| "FLUSH failed")?,
-                Err(_) => return Err("FLUSH was refused otherwise"),
-            }
-            self.finish(write).map_err(|_| "WRITE failed")?;
-            if busy {
-                break;
-            }
-        }
-        check(busy, "FLUSH with a write at the device was never BUSY")?;
-        rt::println!("blk-probe: FLUSH with a write at the device is BUSY");
         Ok(())
     }
 
@@ -592,6 +574,21 @@ impl Probe<'_> {
             .start(Method::Write, 0, 32, 2048)
             .map_err(|_| "WRITE refused")?;
         self.finish(key).map_err(|_| "WRITE failed")?;
+        // The bucket of the host's throttle takes two writes at once, and
+        // holds the third for a second.
+        let key = self
+            .start(Method::Write, 2, 1, 2112)
+            .map_err(|_| "WRITE refused")?;
+        self.finish(key).map_err(|_| "WRITE failed")?;
+        let held = self
+            .start(Method::Write, 1, 1, 2080)
+            .map_err(|_| "WRITE refused")?;
+        check(
+            self.start_flush() == Err(code(proto_blk::BUSY)),
+            "FLUSH with a write at the device was not BUSY",
+        )?;
+        self.finish(held).map_err(|_| "WRITE failed")?;
+        rt::println!("blk-probe: FLUSH with a write at the device is BUSY");
         // The first flush fails on the host.
         let key = self.start_flush().map_err(|_| "FLUSH refused")?;
         check(

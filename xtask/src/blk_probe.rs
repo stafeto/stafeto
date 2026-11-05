@@ -18,7 +18,9 @@
 //!    the first flush and the first read of sector 4096 with EIO, and the
 //!    client sees IO for each and READY for the second try. A flush that
 //!    never reached the device (or `cache=unsafe`, which swallows it) shows
-//!    here.
+//!    here. The drive also holds every write after the first for half a
+//!    second (`throttling`), so that the rule of the flush is seen with a
+//!    write at the device, whatever the speed of the host.
 //!
 //! The jobs of `ci` are `blk-probe` (runs 1 and 2 under -icount), `blk-probe
 //! GICv3` (runs 1 and 2 on the GICv3 machine) and `blk-faults` (run 3). With
@@ -77,10 +79,9 @@ const ENDS: &str = "init: blk-probe ended: ";
 /// The lines of the probe, once each, per mode.
 const NO_BUFFER: &str = "blk-probe: READ before BUFFER is NO_BUFFER";
 const INFO: &str = "blk-probe: 131072 sectors, block 512, flush";
-const WRITE_LINES: [&str; 8] = [
+const WRITE_LINES: [&str; 7] = [
     "blk-probe: bad requests are refused: counts, cell, range, keys",
     "blk-probe: a cell in flight is BUSY, a second BUFFER is EXISTS",
-    "blk-probe: FLUSH with a write at the device is BUSY",
     "blk-probe: 8224 sectors of the pattern written, four cells in flight",
     "blk-probe: FLUSH after the writes is READY",
     "blk-probe: CANCEL ended a read in flight, the cell came free",
@@ -92,7 +93,8 @@ const CHECK_LINES: [&str; 3] = [
     "blk-probe: crashing blk",
     "blk-probe: restarted",
 ];
-const FAULT_LINES: [&str; 5] = [
+const FAULT_LINES: [&str; 6] = [
+    "blk-probe: FLUSH with a write at the device is BUSY",
     "blk-probe: a failed FLUSH is IO",
     "blk-probe: the second FLUSH is READY",
     "blk-probe: a failed READ is IO",

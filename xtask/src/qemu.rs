@@ -326,28 +326,42 @@ pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mm
 /// (`cache=writeback`) and a FLUSH reaches the host file; `unsafe` would
 /// swallow it. Errors go to the guest (`werror`, `rerror`) where QEMU would
 /// stop the machine on a full host disk. With `faults`, the drive goes
-/// through `blkdebug` with that rules file.
+/// through `blkdebug` with that rules file, and writes after the first wait
+/// a second (THROTTLE).
 pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
     let image = option_path(image);
-    let drive = match faults {
-        None => format!(
-            "if=none,id=store,format=raw,file={image},cache=writeback,werror=report,rerror=report"
+    let (drive, mut out) = match faults {
+        None => (
+            format!(
+                "if=none,id=store,format=raw,file={image},cache=writeback,werror=report,rerror=report"
+            ),
+            Vec::new(),
         ),
-        Some(rules) => format!(
-            "if=none,id=store,driver=raw,file.driver=blkdebug,file.config={},file.image.filename={image},cache=writeback,werror=report,rerror=report",
-            option_path(rules)
+        Some(rules) => (
+            format!(
+                "if=none,id=store,driver=throttle,throttle-group=slow,file.driver=raw,file.file.driver=blkdebug,file.file.config={},file.file.image.filename={image},cache=writeback,werror=report,rerror=report",
+                option_path(rules)
+            ),
+            vec!["-object".to_owned(), THROTTLE.to_owned()],
         ),
     };
-    [
-        "-drive",
-        &drive,
-        "-device",
-        "virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    out.extend(
+        [
+            "-drive",
+            &drive,
+            "-device",
+            "virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    out
 }
+
+/// The group the drive with injected faults is throttled by: a write after
+/// the first waits a second, so that a request is with the device for a
+/// time the guest can count on.
+const THROTTLE: &str = "throttle-group,id=slow,x-iops-write=1,x-iops-write-max=1";
 
 /// A path inside an option of QEMU, whose parser takes a comma as the end
 /// of a value unless it is doubled.
@@ -1312,7 +1326,11 @@ mod tests {
         ));
         assert!(!joined.contains("unsafe"));
         let faulty = store(Path::new("s.img"), Some(Path::new("r.cfg"))).join(" ");
-        assert!(faulty.contains("driver=raw,file.driver=blkdebug,file.config=r.cfg,file.image.filename=s.img,cache=writeback"));
+        assert!(faulty.contains("driver=throttle,throttle-group=slow,file.driver=raw,file.file.driver=blkdebug,file.file.config=r.cfg,file.file.image.filename=s.img,cache=writeback"));
+        assert!(
+            faulty.contains("-object throttle-group,id=slow,x-iops-write=1,x-iops-write-max=1")
+        );
+        assert!(!joined.contains("throttling"));
     }
 
     #[test]
@@ -1320,7 +1338,9 @@ mod tests {
         let plain = store(Path::new("a,b.img"), None).join(" ");
         assert!(plain.contains("file=a,,b.img,cache=writeback"));
         let faulty = store(Path::new("a,b.img"), Some(Path::new("c,d.cfg"))).join(" ");
-        assert!(faulty.contains("file.config=c,,d.cfg,file.image.filename=a,,b.img,cache="));
+        assert!(
+            faulty.contains("file.file.config=c,,d.cfg,file.file.image.filename=a,,b.img,cache=")
+        );
     }
 
     #[test]
