@@ -519,6 +519,9 @@ pub fn fstatat(
         // The current directory itself.
         return fstatat(dirfd, Some(b"."), flags & !AT_EMPTY_PATH);
     }
+    if crate::fastnet::is_fast(dirfd) {
+        return crate::fastnet::stat(dirfd);
+    }
     let fd = u32::try_from(dirfd).map_err(|_| EBADF)?;
     crate::shared::held(fd, |transport, target| {
         crate::shared::descriptor_information(transport, target)

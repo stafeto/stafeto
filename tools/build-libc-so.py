@@ -807,6 +807,12 @@ def program_inputs() -> dict:
         "ncdu": [ROOT / "target" / "ncdu" / "ncdu.o"],
         "doom": [ROOT / "target" / "doomgeneric" / "doom.o"],
         "fstack-probe": [ROOT / "target" / "f-stack" / "fstack-probe.o", VNET],
+        # The probe of the layer's sockets: a program that carries the stack
+        # as nginx-fast will (the stack, the device's driver, the glue that
+        # registers the table).
+        "fast-layer": [ROOT / "target" / "f-stack" / "fast-layer.o",
+                       ROOT / "target" / "f-stack" / "ff_stafeto_glue.o",
+                       ROOT / "target" / "f-stack" / "libfstack.a", VNET],
         "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
         "curl": [ROOT / "target" / "curl" / "curl.o"],
         "nginx": [ROOT / "target" / "nginx" / "nginx.o"],
@@ -816,7 +822,8 @@ def program_inputs() -> dict:
 # The extra options of the link of a program. The FreeBSD stack of F-Stack
 # finds its SYSINIT, sysctl and module records in linker sets that only
 # __start_ and __stop_ references name: they keep their sections.
-PROGRAM_LINK = {"fstack-probe": ("-z", "nostart-stop-gc")}
+PROGRAM_LINK = {"fstack-probe": ("-z", "nostart-stop-gc"),
+                "fast-layer": ("-z", "nostart-stop-gc")}
 
 
 def build_programs(wanted_names: list) -> list:
@@ -828,7 +835,7 @@ def build_programs(wanted_names: list) -> list:
         fail(f"unknown program {unknown[0]}")
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
-    if not wanted_names or "fstack-probe" in wanted_names:
+    if not wanted_names or "fstack-probe" in wanted_names or "fast-layer" in wanted_names:
         build_vnet()
     PROGRAMS.mkdir(parents=True, exist_ok=True)
     work = PROGRAMS / "obj"

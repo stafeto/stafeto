@@ -172,6 +172,7 @@ pub(crate) fn expect_all(
                 left.iter().any(|w| l.contains(w))
                     || (l.contains("fast-echo:") && l.contains("failed"))
                     || l.contains("fstack-probe: check failed")
+                    || l.contains("fast-layer: check failed")
             },
             end.saturating_duration_since(Instant::now()),
         )?;
@@ -330,6 +331,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let (steps, rest) = match args.first().map(String::as_str) {
         Some("steps") => (true, &args[1..]),
         Some("crash") => return crash(&args[1..]),
+        Some("layer") => return crate::fast_layer::command(&args[1..]),
         _ => (false, args),
     };
     let machine = match rest {
@@ -339,7 +341,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "tcg" => &qemu::VIRT,
             other => qemu::machine(Some(&other.to_owned()))?,
         },
-        _ => return Err("usage: cargo xtask fast-probe [steps] [tcg|hvf]".to_owned()),
+        _ => return Err("usage: cargo xtask fast-probe [steps|layer] [tcg|hvf]".to_owned()),
     };
     probe(machine, steps)
 }

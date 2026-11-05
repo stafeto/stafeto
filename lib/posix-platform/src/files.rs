@@ -277,6 +277,9 @@ pub(crate) fn is_file(fd: c_int) -> bool {
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
+    if posix_abi::fastnet::is_fast(fd) {
+        return -(posix_abi::fastnet::unsupported(fd) as isize);
+    }
     // SAFETY: the caller's promise.
     unsafe { read_at(Place::Fd(fd), buf, len, offset) }
 }
@@ -317,6 +320,9 @@ pub unsafe extern "C" fn stafeto_pwrite(
     len: usize,
     offset: i64,
 ) -> isize {
+    if posix_abi::fastnet::is_fast(fd) {
+        return -(posix_abi::fastnet::unsupported(fd) as isize);
+    }
     // SAFETY: the caller's promise.
     unsafe { write_at(Place::Fd(fd), buf, len, offset) }
 }
@@ -423,6 +429,9 @@ const O_RDWR: c_int = 2;
 /// for the rest.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_int {
+    if posix_abi::fastnet::is_fast(fd) {
+        return posix_abi::fastnet::fcntl(fd, command, argument).unwrap_or_else(|errno| -errno);
+    }
     if matches!(command, 5 | 6 | 7 | 36 | 37 | 38) {
         return call(|| {
             // SAFETY: relibc passes the flock address for these commands.
@@ -764,6 +773,11 @@ pub unsafe extern "C" fn stafeto_ioctl(
     request: c_ulong,
     argument: *mut c_void,
 ) -> c_int {
+    if posix_abi::fastnet::is_fast(fd) {
+        // SAFETY: the caller's promise about `argument` for `request`.
+        return unsafe { posix_abi::fastnet::ioctl(fd, request, argument.cast()) }
+            .unwrap_or_else(|errno| -errno);
+    }
     if request == TCGETS {
         return get_termios_fd(fd, argument).unwrap_or_else(|errno| -errno);
     }

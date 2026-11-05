@@ -60,6 +60,21 @@ fn a_bit_goes_to_one_taker_and_bits_that_came_meanwhile_join() {
 }
 
 #[test]
+fn a_waiting_loop_wakes_on_bits_and_on_the_loss() {
+    let bank = Bank::new();
+    bank.activate(TRY_3);
+    assert!(!bank.waiting());
+    bank.deposit(TRY_3, 0b1);
+    assert!(bank.waiting());
+    assert_eq!(bank.take(), 0b1);
+    assert!(!bank.waiting());
+    // The loss stays: the loop that sees it does not sleep again.
+    bank.deposit(TRY_3, CLIENT_GONE);
+    assert_eq!(bank.take(), GONE);
+    assert!(bank.waiting());
+}
+
+#[test]
 fn the_bits_of_a_notification_map_as_wait_gives_them() {
     assert_eq!(bits_of(0xf), 0xf);
     assert_eq!(bits_of(0x30), 0);

@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 48] = [
+const SYSTEM_PATHS: [&str; 49] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -296,6 +296,8 @@ const SYSTEM_PATHS: [&str; 48] = [
     "/bin/fast-echo",
     // The image of the probe of F-Stack on its loopback.
     "/bin/fstack-probe",
+    // The probe of the layer's sockets over the stack in a process.
+    "/bin/fast-layer",
     // The image of `nginx-probe`: the files it fetches and the setting of
     // nginx with one listening socket for all the workers.
     "/www/10k.bin",
@@ -1374,6 +1376,18 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
                 Source::Bytes("netd.conf", crate::fstack_device::NETD_CONF),
             ));
             files.push(file("/bin/fstack-probe", 0o755, ROOT, "fstack-probe"));
+            files
+        }
+        // The same, with the program that carries the stack as plain sockets.
+        "boot-fast-layer.img" => {
+            let mut files = net_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", crate::fstack_device::NETD_CONF),
+            ));
+            files.push(file("/bin/fast-layer", 0o755, ROOT, "fast-layer"));
             files
         }
         "boot-fstack-device-dhcp.img" => {

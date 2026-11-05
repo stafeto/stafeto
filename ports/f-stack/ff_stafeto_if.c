@@ -237,6 +237,12 @@ look_at_channel(void)
 
     if (stafeto_fast_wait(0, &bits) == 0)
         ff_stafeto_absorb(bits);
+    /* The bit GONE comes once. A loop that took it off the channel (the
+     * POSIX layer's epoll_pwait) gives it to ff_stafeto_absorb through the
+     * table; the loss itself is sticky in the layer, so a look here that
+     * missed the bit still learns it. */
+    if (!service_gone && stafeto_fast_lost())
+        ff_stafeto_absorb(STAFETO_FAST_GONE);
 }
 
 int

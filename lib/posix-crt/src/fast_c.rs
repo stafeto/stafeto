@@ -8,6 +8,7 @@
 
 use core::ffi::{c_int, c_uint};
 use posix_abi::fast::{self, FastClaim, FastConfig};
+use posix_abi::fastnet;
 
 unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
@@ -90,4 +91,29 @@ pub extern "C" fn stafeto_fast_probe_crash() -> c_int {
         Ok(()) => 0,
         Err(errno) => fail(errno),
     }
+}
+
+/// Registers the program's table of the stack (see `<stafeto/fast.h>`).
+///
+/// # Safety
+/// `table` is null or points to a whole `struct stafeto_fast_table`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fast_register(table: *const fastnet::FastTable) -> c_int {
+    // SAFETY: the caller's promise.
+    match unsafe { fastnet::register(table) } {
+        Ok(()) => 0,
+        Err(errno) => fail(errno),
+    }
+}
+
+/// The bits the layer banked for the claiming thread, taken.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_take_pending() -> u32 {
+    fast::take_pending()
+}
+
+/// Whether the service let go of the notifications.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fast_lost() -> c_int {
+    c_int::from(fast::lost())
 }

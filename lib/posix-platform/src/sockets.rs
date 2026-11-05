@@ -327,6 +327,17 @@ pub unsafe extern "C" fn stafeto_writev_socket(
     iovcnt: c_int,
 ) -> isize {
     let count = iovcnt.max(0) as usize;
+    if posix_abi::fastnet::is_fast(fd) {
+        // The stack takes the program's vector as it is.
+        // SAFETY: the caller's promise.
+        let sent = unsafe {
+            posix_abi::fastnet::writev(fd, iov.cast::<posix_abi::fastnet::IoVec>(), iovcnt)
+        };
+        return match sent {
+            Ok(n) => n as isize,
+            Err(errno) => -(errno as isize),
+        };
+    }
     if iov.is_null() || count > WRITEV_MAX || !posix_abi::net::is_net(fd) {
         return isize::MIN;
     }

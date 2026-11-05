@@ -57,7 +57,7 @@ pub const NETD_CONF: &[u8] = b"handover 1\naddress1 10.0.3.15/24\n";
 
 const UDP_PORT: u16 = 7;
 const TCP_PORT: u16 = 80;
-const PAGE_BYTES: usize = 1 << 20;
+pub(crate) const PAGE_BYTES: usize = 1 << 20;
 const HOLD_CONNECTIONS: usize = 500;
 const HOLD_SEGMENTS: usize = 20;
 const HOLD_BYTES: usize = 200;
@@ -95,7 +95,7 @@ pub fn programs(steps: bool) -> &'static [ImageProgram] {
 }
 
 /// Byte `i` of the page (device.c: page_byte).
-fn page_byte(i: usize) -> u8 {
+pub(crate) fn page_byte(i: usize) -> u8 {
     (i as u32)
         .wrapping_mul(7)
         .wrapping_add((i >> 8) as u32)
@@ -104,7 +104,7 @@ fn page_byte(i: usize) -> u8 {
 
 /// One request for the page: the head and the first `want` bytes of the body,
 /// each compared; the seconds it took.
-fn fetch(port: u16, want: usize) -> Result<f64, String> {
+pub(crate) fn fetch(port: u16, want: usize) -> Result<f64, String> {
     let started = Instant::now();
     let mut stream =
         TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
@@ -236,7 +236,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn free_port(tcp: bool) -> Result<u16, String> {
+pub(crate) fn free_port(tcp: bool) -> Result<u16, String> {
     if tcp {
         std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|s| s.local_addr())

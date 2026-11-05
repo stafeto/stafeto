@@ -250,6 +250,9 @@ fn transport() -> Result<Transport, i32> {
 }
 
 pub fn socket(domain: i32, kind: i32, protocol: i32) -> Result<i32, i32> {
+    if crate::fastnet::takes(domain, kind) {
+        return crate::fastnet::socket(kind, protocol);
+    }
     if domain == AF_INET && crate::net::session().is_some() {
         return crate::net::socket(domain, kind, protocol);
     }
@@ -417,6 +420,9 @@ fn c_address(addr: &Addr, inet: bool, out: &mut [u8]) -> usize {
 }
 
 pub fn bind(fd: i32, raw: &[u8], umask: u32) -> Result<(), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::bind(fd, raw);
+    }
     if crate::net::is_net(fd) {
         return crate::net::bind(fd, raw);
     }
@@ -435,6 +441,9 @@ pub fn bind(fd: i32, raw: &[u8], umask: u32) -> Result<(), i32> {
 }
 
 pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::listen(fd, backlog);
+    }
     if crate::net::is_net(fd) {
         return crate::net::listen(fd, backlog);
     }
@@ -444,6 +453,9 @@ pub fn listen(fd: i32, backlog: i32) -> Result<(), i32> {
 }
 
 pub fn connect(fd: i32, raw: &[u8]) -> Result<(), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::connect(fd, raw);
+    }
     if crate::net::is_net(fd) {
         return crate::net::connect(fd, raw);
     }
@@ -535,6 +547,9 @@ fn cancel_request(method: Method, key: u64, end: Endpoint, w: &mut Writer) -> Re
 /// into `out` (its true length). `flags` are SOCK_NONBLOCK, SOCK_CLOEXEC and
 /// SOCK_CLOFORK.
 pub fn accept(fd: i32, out: Option<&mut [u8]>, flags: i32) -> Result<(i32, usize), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::accept(fd, out, flags);
+    }
     if crate::net::is_net(fd) {
         return crate::net::accept(fd, out, flags);
     }
@@ -604,6 +619,9 @@ fn name(fd: i32, peer: bool, out: &mut [u8]) -> Result<usize, i32> {
 }
 
 pub fn getsockname(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::getsockname(fd, out);
+    }
     if crate::net::is_net(fd) {
         return crate::net::getsockname(fd, out);
     }
@@ -611,6 +629,9 @@ pub fn getsockname(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
 }
 
 pub fn getpeername(fd: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::getpeername(fd, out);
+    }
     if crate::net::is_net(fd) {
         return crate::net::getpeername(fd, out);
     }
@@ -643,6 +664,9 @@ fn option_number(level: i32, name: i32) -> Result<Option<u32>, i32> {
 
 /// getsockopt: the int of the option into `out`; its true length, 4.
 pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usize, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::getsockopt(fd, level, name, out);
+    }
     if crate::net::is_net(fd) {
         return crate::net::getsockopt(fd, level, name, out);
     }
@@ -660,6 +684,9 @@ pub fn getsockopt(fd: i32, level: i32, name: i32, out: &mut [u8]) -> Result<usiz
 }
 
 pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::setsockopt(fd, level, name, value);
+    }
     if crate::net::is_net(fd) {
         return crate::net::setsockopt(fd, level, name, value);
     }
@@ -675,6 +702,9 @@ pub fn setsockopt(fd: i32, level: i32, name: i32, value: &[u8]) -> Result<(), i3
 }
 
 pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::shutdown(fd, how);
+    }
     if crate::net::is_net(fd) {
         return crate::net::shutdown(fd, how);
     }
@@ -688,6 +718,9 @@ pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
 
 /// sockatmark: no socket has out-of-band data.
 pub fn sockatmark(fd: i32) -> Result<i32, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::sockatmark(fd);
+    }
     if crate::net::is_net(fd) {
         return crate::net::sockatmark(fd);
     }
@@ -762,6 +795,9 @@ fn rights(
         }
         for chunk in control[at + CMSG_HEADER..at + len].as_chunks::<4>().0 {
             let fd = i32::from_ne_bytes(*chunk);
+            if crate::fastnet::is_fast(fd) {
+                return Err(crate::fastnet::refuse_copy(fd));
+            }
             let fd = u32::try_from(fd).map_err(|_| EBADF)?;
             let target = shared::with_fd(fd, |files| files.target(fd).map_err(crate::error))?;
             if count == FDS_MAX {
@@ -845,6 +881,9 @@ pub fn send(
     iov: &[&[u8]],
     control: &[u8],
 ) -> Result<usize, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::send(fd, flags, name, iov, control);
+    }
     if crate::net::is_net(fd) {
         return crate::net::send(fd, flags, name, iov, control);
     }
@@ -963,6 +1002,9 @@ pub fn recv(
     iov: &mut [&mut [u8]],
     control: &mut [u8],
 ) -> Result<Message, i32> {
+    if crate::fastnet::is_fast(fd) {
+        return crate::fastnet::recv(fd, flags, name, iov, control);
+    }
     if crate::net::is_net(fd) {
         return crate::net::recv(fd, flags, name, iov, control);
     }

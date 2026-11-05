@@ -89,4 +89,10 @@ impl Bank {
     pub fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
     }
+
+    /// Whether a taker has something to do: bits wait in the bank, or the
+    /// service let go. One load of each, for the wake test of a sleeping loop.
+    pub fn waiting(&self) -> bool {
+        self.pending.load(Ordering::Acquire) != 0 || self.lost.load(Ordering::Acquire)
+    }
 }

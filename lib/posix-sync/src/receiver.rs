@@ -33,6 +33,12 @@ pub fn lost() -> bool {
     BANK.lost()
 }
 
+/// Whether bits wait in the bank or the service let go: the wake test of a
+/// loop that sleeps on the thread's channel.
+pub fn waiting() -> bool {
+    BANK.waiting()
+}
+
 #[inline(always)]
 fn bank(got: &Result<Received, Error>) {
     if let Ok(Received::Notification { label, bits, .. }) = got

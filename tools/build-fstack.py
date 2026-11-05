@@ -70,6 +70,14 @@ HEADERS = ("ff_api.h", "ff_event.h", "ff_errno.h", "ff_flow_map.h", "ff_stafeto.
 PROBE_SOURCES = (ROOT / "tests" / "fstack-probe" / "main.c",
                  ROOT / "tests" / "fstack-probe" / "device.c")
 PROBE = WORK / "fstack-probe.o"
+# The table through which the POSIX layer reaches the stack (ports/f-stack/
+# ff_stafeto_glue.c) and the probe of the layer's sockets built on it
+# (tests/fstack-probe/layer.c): objects a program links beside libfstack.a
+# and libvirtio_net.a.
+GLUE_SOURCE = PORT / "ff_stafeto_glue.c"
+LAYER_SOURCE = ROOT / "tests" / "fstack-probe" / "layer.c"
+GLUE = WORK / "ff_stafeto_glue.o"
+LAYER = WORK / "fast-layer.o"
 # What the tree needs to build: the library, its make fragments and the
 # FreeBSD sources, with the licence and the sample settings.
 MEMBERS = ("lib/", "mk/", "freebsd/", "LICENSE")
@@ -128,6 +136,7 @@ def stamp_text() -> str:
     own = sha256(b"".join((PORT / name).read_bytes()
                           for name in (*OWN, "stafeto.patch", "fstack.ini")))
     own.update(b"".join(source.read_bytes() for source in PROBE_SOURCES))
+    own.update(GLUE_SOURCE.read_bytes() + LAYER_SOURCE.read_bytes())
     return f"{VERSION} {SHA256} {script} {own.hexdigest()} relibc {relibc_commit()}\n"
 
 
@@ -254,6 +263,18 @@ def probe(log: Path) -> None:
     joined.unlink()
 
 
+def glue(log: Path) -> None:
+    """The glue of the table and the probe of the layer, each one object
+    (-fno-builtin for the probe: every checked operation stays)."""
+    clang = tool("clang", "llvm")
+    for source, out in ((GLUE_SOURCE, GLUE), (LAYER_SOURCE, LAYER)):
+        run(log, clang, "--target=aarch64-linux-gnu", "-nostdinc", "-isystem", RELIBC / "include",
+            "-isystem", FAST_INCLUDE, "-isystem", VNET_INCLUDE,
+            "-I", INCLUDE, "-mno-outline-atomics", "-fno-stack-protector", "-ffunction-sections",
+            "-fdata-sections", A53_ERRATA, "-fPIC", "-fno-builtin", "-O2", "-Wall", "-Werror",
+            "-c", source, "-o", out)
+
+
 def main() -> None:
     WORK.mkdir(parents=True, exist_ok=True)
     jobs = os.cpu_count() or 4
@@ -266,7 +287,8 @@ def main() -> None:
     again = args == ["--again"]
     text = stamp_text()
     stamp = WORK / "stamp"
-    if not again and stamp.exists() and stamp.read_text() == text and PROBE.exists():
+    if (not again and stamp.exists() and stamp.read_text() == text and PROBE.exists()
+            and GLUE.exists() and LAYER.exists()):
         print(f"f-stack ready: {OUTPUT}")
         return
     stamp.unlink(missing_ok=True)
@@ -277,6 +299,7 @@ def main() -> None:
     build(log, jobs)
     install()
     probe(log)
+    glue(log)
     (WORK / "build-seconds").write_text(f"{time.monotonic() - started:.0f}\n")
     licenses()
     if not args:
