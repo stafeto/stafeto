@@ -658,7 +658,82 @@ command (init has 17,503 pages free on the base image after the services started
 full image on 1 GiB). `cargo xtask init-wait` runs the three ways to start a waiting record: after
 READY, at the deadline (a service built never to say it), and when the service ends.
 
+## The package tool
+
+`/bin/pkg` is a program of the base and the full image (`apps/pkg`, Rust over the POSIX layer). It
+asks the package service through the session the start gives every process, and downloads with
+`/bin/curl` as a child. What it decides is a library that `cargo test -p pkg` tests on the host
+(`config`, `fetch`, `verify`, `resolve`, `output`, `faults`); the program makes the calls and
+prints. Output goes to descriptor 1 and the lines of refusals (`pkg: <name>: <reason>`) to
+descriptor 2, so `pkg list | wc -l` and redirections work. Exit codes: 0 for success (also when
+there is nothing to do), 1 for a refused operation, 2 for a command line that is not one.
+
+Commands of this part: `pkg install <name>...`, `update`, `list [--all]`, `info <name>`,
+`search <word>` and `check`. `install` and `update` need the superuser: `pkg` checks it before
+the first download, so a process that is not the superuser downloads nothing, and the service
+checks it again for every request that changes the store.
+
+Repositories. `/etc/pkg/official` holds one line, `stafeto <https address>`, the official
+repository of the series (the image of the probe names its mirror). The roots the build trusts are
+baked into `pkg` and `pkgd` alike (`STAFETO_PKG_ROOTS` in a development build, the official roots
+otherwise); `/etc/pkg/keys/stafeto.pub` shows them to people, and `pkg check` says when the file is
+not the roots of the build. The owner's repositories are the lines `<name> <https address>` of
+`repositories` in the settings layer of the service, each with its key `keys/<name>.pub`, trusted
+for that repository alone.
+
+An index. For each repository in order `pkg` downloads the revocation list (the official one),
+the index and its signature, and accepts the index when: the list is signed by a root and
+the service takes it (a list older than the accepted one is a rollback); the signature is of a
+key the repository trusts, signed inside the term of its certificate and not revoked by the list;
+the header names this repository, this series and `aarch64`; the clock is before `expires`
+(strictly) and not more than 600 seconds behind the time the index was signed (a clock that
+started from its default would make an expired index look good); and the serial is not below the
+one the service holds. A higher serial is given to the service (SERIAL_SET) before any package is
+received, so a repository that goes back is refused even if it is the first thing `pkg` asks
+after a restart. The accepted index and signature are kept in `/var/cache/pkg/<name>/` for
+`search`, `info` and `list --all`, which check the signature again; the cache goes with a restart.
+
+Names. A name is closed by an installed package of that name or that provides it, else it is the
+first repository's package of that name, else the one package that provides it (several are an
+error that names them). The packages to receive are the requested one and the dependencies that
+are not installed, dependencies first, at most four: they are one group of the service, all
+installed or none. There are no versions in a series, so a package that is installed with another
+SHA-256 than the index has stays as it is.
+
+Downloading. `curl` runs as
+`curl -q -fsSL --proto =https --proto-redir =https --tlsv1.2 --cacert <the file of the package
+ca-bundle> --max-filesize <size> --max-redirs 5 --connect-timeout 30 --speed-limit 1 --speed-time 60
+-o - <address>` with an empty environment but for the proxy variables: `-q` first, so no
+`.curlrc` can add `-k`. The size is the package's from the index (1 MiB for an index). `pkg` reads
+its output from a pipe into the cells of the buffer it shares with the service and sends a FEED for
+each full cell, counting the bytes itself: more than the size stops curl and cancels the group,
+fewer after a clean end is refused, and the service refuses the same again (`TOO_LONG`). `curl` is
+waited for on every path. The words for the ends of curl are in `fetch::meaning`; a certificate
+that is not trusted names the clock, since a wrong clock fails a certificate before it fails an
+index. A session that ends (the process, or `SIGKILL`) makes the service drop the open group, so
+an installation that is cut short leaves nothing half done.
+
+`pkg install doom` on the base image with an empty disk prints
+
+    fetching https://stafeto.github.io/packages/0.3/aarch64/INDEX ... ok (serial 3, signed by stafeto-release-2026)
+    installing freedoom 0.13.0-1, doomgeneric e257a095-1 (29.3 MB)
+    doomgeneric needs display input
+    freedoom 0.13.0-1: 28.8 MB ... ok
+    doomgeneric e257a095-1: 0.5 MB ... ok
+    installed doomgeneric e257a095-1 (doom), freedoom 0.13.0-1 (dependency)
+
+and every refusal of the service has a line of its own (`faults::line`; a test goes through all 22
+codes). `cargo xtask pkg-probe` starts the mirror of the probe, `tools/pkg-mirror.py` (a Python
+`http.server` with TLS 1.2 and above and the certificate `host-a` of the probe CA, SAN
+`10.0.2.2`), for the length of one run and ends it with the run; it runs the base image with the
+mirror as its official repository and the development root as the trust, and walks `check`, `list`
+(also through a pipe), `install doom`, the demo of Doom (`timed N gametics`, exit 255), `info`,
+`search`, `update` (`serial 2, was 2`) and a second `install doom` that downloads nothing, which
+the log of the mirror (one line a response) shows. The port 8443 of the host is the one in the
+image, so a probe that finds it taken stops with a line that names it.
+
 ## What stays for subproject 5
 
-Delivery (in the image, from a disk, over the network), dependency resolution at install time, and
-the sandbox and quotas of an application. Nothing here changes the quotas of the image.
+`pkg remove` and `upgrade`, the owner's repositories by `pkg repo`, the release of the official
+repository, and the sandbox and quotas of an application. Nothing here changes the quotas of the
+image.

@@ -13,6 +13,9 @@ use crate::*;
 pub const BASE_IMAGE: &str = "boot-base.img";
 pub const FULL_IMAGE: &str = "boot-full.img";
 
+/// The stack of the package tool: the frames of its requests and the checks of signatures.
+pub const PKG_STACK_SIZE: u32 = 256 * 1024;
+
 /// The programs of both images: the services of the shell, those of the
 /// network, the screen and the keys, and the programs of the packages the
 /// image holds (their ELF files are what the packages carry).
@@ -37,6 +40,7 @@ pub fn programs(image: &str) -> &'static [ImageProgram] {
         programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
         programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
         programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
+        programs.push(("pkg", "pkg", PKG_STACK_SIZE, &[]));
         programs.push((
             "virtio-input",
             "virtio-input",
@@ -71,14 +75,19 @@ pub fn machine(image: &str) -> &'static qemu::Machine {
     }
 }
 
-/// The image `name` built.
-pub fn build_image(name: &'static str) -> Result<PathBuf, String> {
+/// What the programs of the base and the full image are built from.
+pub fn prepare() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
     nano_build()?;
     bash_build()?;
     doom::build_games()?;
-    net_build()?;
+    net_build()
+}
+
+/// The image `name` built.
+pub fn build_image(name: &'static str) -> Result<PathBuf, String> {
+    prepare()?;
     build_boot_image(name, programs(name), BOOT_PROFILE)
 }
 

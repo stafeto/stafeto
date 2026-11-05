@@ -281,6 +281,9 @@ jobs:
       - name: cargo xtask pkg-ci
         run: cargo xtask pkg-ci
 
+      - name: cargo xtask pkg-probe
+        run: cargo xtask pkg-probe
+
       - name: Collect logs
         if: failure()
         run: |
