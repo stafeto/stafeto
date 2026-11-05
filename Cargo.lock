@@ -423,6 +423,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkgd"
+version = "0.2.0"
+dependencies = [
+ "abi",
+ "bootimg",
+ "pkgfmt",
+ "proto-blk",
+ "proto-fs",
+ "proto-init",
+ "proto-pkg",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "pkgfmt"
 version = "0.1.0"
 dependencies = [
@@ -942,6 +957,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-pkg"
+version = "0.1.0"
+dependencies = [
+ "proto-blk",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-process"
 version = "0.1.0"
 dependencies = [
@@ -1148,6 +1171,18 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "store-probe"
+version = "0.1.0"
+dependencies = [
+ "libc-ffi",
+ "posix-abi",
+ "posix-crt",
+ "proto-pkg",
+ "proto-wire",
+ "rt",
+]
 
 [[package]]
 name = "syn"
@@ -1392,11 +1427,13 @@ dependencies = [
  "init",
  "kcore",
  "netd",
+ "pkgd",
  "pkgfmt",
  "posix-fd",
  "posix-types",
  "proto-fs",
  "proto-net",
+ "proto-pkg",
  "proto-wire",
  "rtc",
  "virtio-pci",

@@ -28,7 +28,8 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use init::table::{
-    BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PROCESS_SERVICE, RAM_SERVICE, Record, TABLE,
+    BOOT_IMAGE, CLOCK_SERVICE, Gate, MAX_DMA, PACKAGE_SERVICE, PROCESS_SERVICE, RAM_SERVICE,
+    Record, TABLE,
 };
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
@@ -383,14 +384,17 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
 /// thread (spec 13.3): the copies of the system resource of `resources`;
 /// a copy of each of its DMA objects, made here (`dma`), under its name;
 /// the boot image, read-only, for the process service, the RAM file
-/// service and the clock service (BOOT_IMAGE); and
+/// service, the clock service and the package service (BOOT_IMAGE); and
 /// the arguments (`set_args`) with the physical address of each DMA
 /// object, 8 bytes little-endian, before the record's. Returns init's own
 /// handles to the DMA objects.
 fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     let resource = view::<Resource>(RESOURCE);
     resources(record, &mut spawned.giver, &resource)?;
-    if record.name == PROCESS_SERVICE || record.name == RAM_SERVICE || record.name == CLOCK_SERVICE
+    if record.name == PROCESS_SERVICE
+        || record.name == RAM_SERVICE
+        || record.name == CLOCK_SERVICE
+        || record.name == PACKAGE_SERVICE
     {
         let image =
             sys::handle_duplicate(&view::<Memory>(BOOT), Rights::MAP_READ | Rights::TRANSFER)?;

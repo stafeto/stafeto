@@ -103,7 +103,7 @@ const FAULT_LINES: [&str; 6] = [
 ];
 
 /// The tag of the service's lines of steps (rt::service::report_steps).
-const BLK_TAG: &str = "15";
+pub const BLK_TAG: &str = "15";
 /// The kinds of the service's steps that must come in run 1: the methods
 /// INFO to CANCEL of proto_blk, the interrupt (rt::service::step_own, 65)
 /// and the departure of a session (66).

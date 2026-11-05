@@ -258,6 +258,8 @@ const WEIGHTS: &[(&str, u32)] = &[
     ("blk-probe", 15),
     ("blk-probe GICv3", 10),
     ("blk-faults", 8),
+    ("store-probe", 12),
+    ("store-probe steps", 15),
     ("gpu-probe", 8),
     ("input-probe", 10),
     ("posix-random", 19),

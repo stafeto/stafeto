@@ -150,7 +150,7 @@ pub const LAYER_PROBE_TABLE: &[Record] = &[
 /// handles holds the layer's memory map, one handle for each object of the
 /// process's memory (at most 128), beside those of its threads and files; a
 /// table grows by chunks only as far as the process uses it.
-const POSIX: Record = Record {
+pub(super) const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     handle_limit: 512,
     // The images of these tables have no tasks of realtime: the four CPUs
@@ -695,7 +695,7 @@ const STEPS_QUOTA: u64 = 608 * PAGE;
 /// streams without a file, the probes of relibc in the image, 64 descriptions
 /// of poll) measured 651 and 649 pages: 11 to 90% of 736. With 768 pages 90% is
 /// 691, 40 pages away, about two threads of a volley.
-const PROCS_QUOTA: u64 = 768 * PAGE;
+pub(super) const PROCS_QUOTA: u64 = 768 * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the terminal, process and clock services, and

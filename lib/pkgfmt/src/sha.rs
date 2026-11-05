@@ -7,6 +7,7 @@
 use sha2::{Digest, Sha256};
 
 /// SHA-256 over data that arrives in pieces.
+#[derive(Clone)]
 pub struct Stream(Sha256);
 
 impl Stream {

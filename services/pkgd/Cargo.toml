@@ -1,0 +1,44 @@
+[package]
+name = "pkgd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The package service of stafeto: the store on the disk, the packages attached to the file service"
+build = "build.rs"
+
+# What the service decides, apart from the device and the calls: tested on
+# the host, and written to a disk file by xtask with the feature `host`.
+[lib]
+bench = false
+
+[[bin]]
+name = "pkgd"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount.
+# `host`: the writer of a store for xtask, no program.
+[features]
+steps = ["rt/step-stats"]
+host = ["proto-pkg/alloc", "pkgfmt/write"]
+
+[dependencies]
+bootimg = { path = "../../lib/bootimg" }
+pkgfmt = { path = "../../lib/pkgfmt" }
+proto-blk = { path = "../../proto/blk" }
+proto-pkg = { path = "../../proto/pkg" }
+proto-wire = { path = "../../proto/wire" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+abi = { path = "../../lib/abi" }
+proto-fs = { path = "../../proto/fs" }
+proto-init = { path = "../../proto/init" }
+rt = { path = "../../lib/rt" }
+
+[dev-dependencies]
+bootimg = { path = "../../lib/bootimg", features = ["write"] }
+pkgfmt = { path = "../../lib/pkgfmt", features = ["write"] }
+proto-pkg = { path = "../../proto/pkg", features = ["alloc"] }

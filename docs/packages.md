@@ -444,9 +444,60 @@ CI are `blk-probe`, `blk-probe GICv3` and `blk-faults`.
 (512 MiB, sparse) to the image it boots, and `--fresh-store` makes it new;
 only an image whose table has the record `blk` uses it.
 
+## The package service
+
+`services/pkgd` (the service `pkgd`) keeps the packages of a running system on the disk and attaches
+them to the RAM file service as layers; `proto/pkg` (MIT) is its protocol. This part reads: the
+service starts from the disk, and the methods that change the store (install, remove, settings,
+serial, revocation) come with the next part.
+
+**Two threads.** The main thread (level 32) is the loop of a service and answers LIST, INFO,
+SETTINGS_GET, SERIAL, STATUS, CLONE, TAKE and BUFFER in steps of a few thousand ticks. The worker
+thread (level 30, round robin) takes everything long: it reads the store through the disk service,
+creates and maps the object of each package, hashes it as the bytes arrive (SHA-256 in software
+takes some 540,000 ticks for 16 KiB, so no step could hold a portion), checks the signature and
+attaches the object as a layer. STATUS says `starting` until the worker is done; LIST and INFO show
+the packages it has published meanwhile. The service never restarts: its layers stay in the file
+service when it ends.
+
+**The store.** The whole disk, in blocks of 4 KiB. Blocks 0 and 1 are the two copies of the
+superblock (`STAFSTOR`, version 1, the generation, where the table is and its SHA-256, and the
+SHA-256 of the superblock itself). The table (`STAFTBL1`, 20,480 bytes, five blocks) has 66 records
+of 256 bytes (64 places of packages, one of the settings blob, one of the list of revocations) and
+16 repositories with their serials; each record names an extent of the disk, the SHA-256 of its
+file, the name and the version. The table is written whole into a free extent, then a superblock
+with the next generation goes into the copy that holds the lower one, each followed by a flush;
+at a start the good copy with the higher generation wins, so the store is the whole old state or
+the whole new one, and the free space is the disk less the extents of the table found. Both
+superblocks zero: the service formats the disk (`pkgd: store formatted`); neither good and the disk
+not zero: `pkgd: store damaged, no package from the disk`.
+
+**At a start** the worker reads the settings blob and attaches the layer it makes (`/etc`,
+`/etc/pkg`, `/etc/pkg/keys`, `repositories`, `keys/<name>.pub`, mode 0644 for the files, as the
+file service wants the directory above each entry listed), reads the list of revocations (text,
+then the block of a root's signature) and then each package: object created, bytes read four cells
+in flight and hashed, the SHA-256 of the file against the table's, `Package::parse`, name, version
+and series against the record, the signature against the trust of its repository (the roots of
+the build for `stafeto`; for a repository of the owner only the key of his `keys/<repository>.pub`)
+and the list, then the attach. A package that fails gets a line (`pkgd: broken: bad signature,
+skipped`) and the service goes on. The roots of a development build come from the file named in
+`STAFETO_PKG_ROOTS` (xtask gives the root of `target/keys`); otherwise they are
+`pkgfmt::OFFICIAL_ROOTS`.
+
+**Running it.** `cargo xtask store-probe` writes a store on the host with the service's own writer
+(`pkgd::host`, feature `host`): `hello`, whose program exits with 42, a copy `broken` with a byte
+changed after the signing, `revoked` (signed by a second development release key, which the list
+names), the settings with the repository `games` and its key, and the list. The service must attach
+`hello` and the settings and skip the other two; the probe (`tests/store-probe`) looks at the
+answers and at the tree, and runs the program. A second run on a disk of zeros checks the format.
+`cargo xtask store-probe steps` adds `big` (16 MiB) and `wide` (1,000 files in a directory) and measures the steps
+under `-icount`: no step of the package service, the disk service or the file service's layer calls
+passes 18,369 ticks while the worker creates, maps, hashes and attaches. The jobs of the CI are
+`store-probe` and `store-probe steps`.
+
 ## What stays for subproject 5
 
-Installing and removing packages in a running system, the store and delivery
+Installing and removing packages in a running system (the changing methods of `pkgd`), delivery
 (in the image, from a disk, over the network), dependency resolution at
 install time, and the sandbox and quotas of an application. Nothing here changes the quotas of
 the image.
