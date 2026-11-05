@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 58] = [
+const SYSTEM_PATHS: [&str; 60] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -315,6 +315,10 @@ const SYSTEM_PATHS: [&str; 58] = [
     "/etc/nginx/tls.conf",
     "/etc/nginx/server.crt",
     "/etc/nginx/server.key",
+    // The images of the measurement of stage P7: the settings of W4 and W5,
+    // the plain ones with the include of that server.
+    "/etc/nginx/nginx-tls.conf",
+    "/etc/nginx/nginx-fast-tls.conf",
     // The images of nginx's measurement: the smallest file of the load.
     "/www/1k.bin",
     // The package tool and what it trusts: the official repository's line and the roots
@@ -1439,6 +1443,50 @@ fn net_bench_files(image: &str) -> Vec<RootFile> {
     let mut files = nginx_bench_files(image);
     files.push(dir("/www/s"));
     files.push(dir("/www/l"));
+    // W4 and W5: the settings with the server of TLS (both variants, the
+    // row picks its own), the server of TLS, the probe CA's key and
+    // certificate, the key readable by root alone.
+    files.extend([
+        of(
+            crate::linux_guest::TLS_CONF,
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-tls.conf",
+                crate::linux_guest::nginx_tls_conf().as_bytes(),
+            ),
+        ),
+        of(
+            crate::linux_guest::FAST_TLS_CONF,
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-fast-tls.conf",
+                crate::linux_guest::nginx_fast_tls_conf().as_bytes(),
+            ),
+        ),
+        of(
+            crate::nginx_probe::TLS_CONF_PATH,
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-tls.conf-server",
+                crate::nginx_probe::TLS_CONF.as_bytes(),
+            ),
+        ),
+        of(
+            crate::nginx_probe::SERVER_CRT,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx.crt", crate::probe_ca::nginx_certificate()),
+        ),
+        of(
+            crate::nginx_probe::SERVER_KEY,
+            0o600,
+            ROOT,
+            Source::Bytes("nginx.key", crate::probe_ca::nginx_key()),
+        ),
+    ]);
     for (path, bytes) in crate::linux_guest::www_files() {
         if path.starts_with("/www/s/") || path.starts_with("/www/l/") {
             let name: &'static str = Box::leak(path[1..].replace('/', "-").into_boxed_str());

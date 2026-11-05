@@ -74,6 +74,9 @@ const MAX_ROUNDS: u32 = 12;
 const SHARES: [u32; 2] = [50, 80];
 /// The warm-up pass over a set before a block, its rate for the set.
 const PASS_RATE: u32 = 2000;
+/// The same for W4 and W5: TLS costs a guest more, and a pass over the set
+/// that overloads it spoils the first step (W2 had that).
+const TLS_PASS_RATE: u32 = 1000;
 /// Idle time after which the cache of nginx's open files may have expired
 /// (`inactive=60s`): the set is passed again.
 const COLD_AFTER: Duration = Duration::from_secs(45);
@@ -95,22 +98,36 @@ const JIFFY_US: f64 = 10_000.0;
 const START_WITHIN: Duration = Duration::from_secs(30);
 /// The settings of nginx in the image of F1.
 const FAST_CONF: &str = "/etc/nginx/nginx-fast.conf";
+/// The settings of nginx of the other rows.
+const NGINX_CONF: &str = "/etc/nginx/nginx.conf";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Workload {
     W1,
     W2,
     W3,
+    W4,
+    W5,
 }
 
 impl Workload {
-    const ALL: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
+    const ALL: [Workload; 5] = [
+        Workload::W1,
+        Workload::W2,
+        Workload::W3,
+        Workload::W4,
+        Workload::W5,
+    ];
+    /// The loads of HTTP; W4 and W5 (TLS) are asked for by name.
+    const DEFAULT: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
 
     fn name(self) -> &'static str {
         match self {
             Workload::W1 => "w1",
             Workload::W2 => "w2",
             Workload::W3 => "w3",
+            Workload::W4 => "w4",
+            Workload::W5 => "w5",
         }
     }
 
@@ -119,13 +136,18 @@ impl Workload {
     }
 
     fn keep_alive(self) -> bool {
-        self != Workload::W3
+        !matches!(self, Workload::W3 | Workload::W5)
+    }
+
+    /// Whether the load speaks TLS 1.3 and HTTP/2 (`h2load`, port 443).
+    fn tls(self) -> bool {
+        matches!(self, Workload::W4 | Workload::W5)
     }
 
     /// The paths of the set, in the order the load takes them.
     fn paths(self) -> Vec<String> {
         match self {
-            Workload::W1 | Workload::W3 => (0..linux_guest::W1_FILES)
+            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 => (0..linux_guest::W1_FILES)
                 .map(|n| format!("/s/{n:04}.bin"))
                 .collect(),
             Workload::W2 => (0..linux_guest::W2_FILES)
@@ -136,7 +158,7 @@ impl Workload {
 
     fn length(self) -> usize {
         match self {
-            Workload::W1 | Workload::W3 => linux_guest::W1_LEN,
+            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 => linux_guest::W1_LEN,
             Workload::W2 => linux_guest::W2_LEN,
         }
     }
@@ -144,7 +166,7 @@ impl Workload {
     /// The rates of the first walk, from the bottom up.
     fn grid(self) -> Vec<u32> {
         match self {
-            Workload::W1 => GRID.to_vec(),
+            Workload::W1 | Workload::W4 => GRID.to_vec(),
             _ => GRID_NEW
                 .iter()
                 .chain(GRID.iter().filter(|r| **r > 1000))
@@ -171,6 +193,7 @@ impl Workload {
     fn pass(self) -> (u32, u32) {
         match self {
             Workload::W2 => (500, 8),
+            Workload::W4 | Workload::W5 => (TLS_PASS_RATE, 10),
             _ => (PASS_RATE, 10),
         }
     }
@@ -393,6 +416,37 @@ fn measure(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measu
             .flatten(),
         p99_raw: stage.p99.unwrap_or(0),
         lag_p99: stage.lag_p99.unwrap_or(0),
+        lag_max: stage.lag_max.unwrap_or(0),
+        mbps: stage.megabytes_per_second,
+        ..Measured::default()
+    }
+}
+
+/// The step of `samples` from `h2load`, asked at `rate`. The percentiles are
+/// the log's own, from the start of a request to the end of its answer. The
+/// correction of `measure` does not apply: it reads the requests against one
+/// clock, and `h2load` has a timer for each of its 64 connections, each
+/// starting when its handshake ends, so the starts of the connections meet and
+/// part by a millisecond or two with nothing stalled (the lag so counted
+/// was 1 to 3 ms on the floor, which no `h2load` stall explains). The floor
+/// is the same `h2load` on the loopback and takes that noise in the rule; the
+/// lag against the single schedule stays in `lag_max` and in the seconds file
+/// as information, and `lag_p99` is 0.
+fn measure_h2(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measured {
+    let stage = stage_of(samples, rate, malloc, length);
+    let p99 = stage.p99.unwrap_or(0);
+    Measured {
+        rate,
+        requests: stage.requests,
+        ok: stage.ok,
+        failed: stage.failed,
+        malloc,
+        achieved: stage.achieved,
+        p50: stage.p50.unwrap_or(0),
+        p99,
+        p999: stage.p999,
+        p99_raw: p99,
+        lag_p99: 0,
         lag_max: stage.lag_max.unwrap_or(0),
         mbps: stage.megabytes_per_second,
         ..Measured::default()
@@ -952,9 +1006,144 @@ fn wrk_script(paths: &[String], keep_alive: bool) -> String {
     )
 }
 
-/// One attack of `vegeta` at `base`: `warm` seconds with their results
-/// dropped, then `secs`. On a guest, nginx's console is read through the
-/// step and a line at crit or above ends the run with an error.
+// The load over TLS ----------------------------------------------------------------------
+
+/// The connections of W4 and how fast `h2load` opens them. A connection
+/// has its own timer, so connections opened together would send together:
+/// they open one after the other, a request interval apart (`rate` in a
+/// second, at most 1 000 connections a second as `--rate-period` counts
+/// milliseconds), and the 64 requests of each period come evenly.
+fn connection_pace(rate: u32) -> (u32, u32) {
+    if rate <= 1000 {
+        (1, 1000_u32.div_ceil(rate.max(1)))
+    } else {
+        (rate.div_ceil(1000), 1)
+    }
+}
+
+/// The arguments of `h2load` for a step of W4 (`keep_alive`: 64 long
+/// connections, 100 streams each at most, each connection at its share of
+/// the rate) or of W5 (a connection for each request, opened at the rate).
+/// It is an open loop: `h2load` sends at the rate whatever the answers do,
+/// and writes the start and the length of each request into `log`.
+fn h2load_args(uris: &Path, rate: u32, secs: u32, keep_alive: bool, log: &Path) -> Vec<String> {
+    let total = u64::from(rate.max(1)) * u64::from(secs);
+    let threads = if rate > 16_000 { 2 } else { 1 };
+    let (count, period) = connection_pace(rate);
+    let mut args = vec![
+        "-i".to_owned(),
+        uris.display().to_string(),
+        format!("-n{total}"),
+        format!("-t{threads}"),
+        // The rate of opening cannot pass the connections there are.
+        format!(
+            "-r{}",
+            count
+                .max(threads)
+                .min(if keep_alive { CONNECTIONS } else { u32::MAX })
+        ),
+        format!("--rate-period={period}ms"),
+        format!("--log-file={}", log.display()),
+    ];
+    if keep_alive {
+        args.extend([
+            format!("-c{CONNECTIONS}"),
+            "-m100".to_owned(),
+            format!("--rps={:.6}", f64::from(rate) / f64::from(CONNECTIONS)),
+        ]);
+    } else {
+        args.extend([format!("-c{total}"), "-m1".to_owned()]);
+    }
+    args
+}
+
+/// The ceiling of W4 as `wrk -c64` finds it for W1: `connections` long
+/// connections with one request in flight on each, as fast as the guest
+/// answers (ten streams on each hang the guest of F1 after 640 requests).
+fn h2load_ceiling_args(uris: &Path, connections: u32, secs: u32) -> Vec<String> {
+    vec![
+        "-i".to_owned(),
+        uris.display().to_string(),
+        format!("-c{connections}"),
+        "-m1".to_owned(),
+        "-t2".to_owned(),
+        format!("-D{secs}s"),
+        "--warm-up-time=2s".to_owned(),
+    ]
+}
+
+fn write_uris(path: &Path, base: &str, paths: &[String]) -> Result<(), String> {
+    let text: String = paths.iter().map(|p| format!("{base}{p}\n")).collect();
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The requests of a log of `h2load`: lines of the start (microseconds since
+/// the epoch), the status and the time to the end of the answer
+/// (microseconds). The lines are in the order of the ends of the answers;
+/// the samples are in the order of the starts, numbered in that order, so
+/// that the schedule of the rate (`lags`) reads them as it reads `vegeta`'s.
+fn parse_h2load_log(text: &str) -> Vec<Sample> {
+    let mut samples: Vec<Sample> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let at: u64 = fields.next()?.trim().parse().ok()?;
+            let code: u16 = fields.next()?.trim().parse().ok()?;
+            let micros: u64 = fields.next()?.trim().parse().ok()?;
+            Some(Sample {
+                at: at * 1000,
+                code,
+                latency: micros * 1000,
+                seq: 0,
+            })
+        })
+        .collect();
+    samples.sort_by_key(|s| s.at);
+    for (n, s) in samples.iter_mut().enumerate() {
+        s.seq = n as u64;
+    }
+    samples
+}
+
+/// The numbers of the summary of `h2load` at the end of a run of the
+/// ceiling, in the fields `wrk` has: requests done, rate, transfer, errored
+/// requests (as connect), timeouts, answers other than 2xx.
+fn parse_h2load(text: &str) -> Option<Wrk> {
+    let mut found = Wrk::default();
+    let mut rate = false;
+    let number = |line: &str, label: &str| -> Option<u64> {
+        let before = line.split(label).next()?;
+        before
+            .rsplit([' ', ','])
+            .find(|w| !w.is_empty())?
+            .parse()
+            .ok()
+    };
+    let mut ok2xx = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("finished in ") {
+            let mut parts = rest.split(", ");
+            found.seconds = parts.next()?.trim_end_matches('s').parse().ok()?;
+            found.per_second = parts.next()?.trim_end_matches(" req/s").parse().ok()?;
+            found.transfer = parts.next()?.trim_end_matches("/s").to_owned();
+            rate = true;
+        } else if line.starts_with("requests: ") {
+            found.requests = number(line, " done")?;
+            found.connect = number(line, " errored")?;
+            found.timeout = number(line, " timeout")?;
+        } else if line.starts_with("status codes: ") {
+            ok2xx = number(line, " 2xx")?;
+        }
+    }
+    found.non_2xx = found.requests.saturating_sub(ok2xx);
+    rate.then_some(found)
+}
+
+/// One attack of `vegeta` at `base` (W1 to W3) or of `h2load` (W4 and W5):
+/// `warm` seconds with their results dropped, then `secs`. On a guest,
+/// nginx's console is read through the step and a line at crit or above ends
+/// the run with an error.
 #[allow(clippy::too_many_arguments)]
 fn attack(
     raw: &Path,
@@ -968,38 +1157,61 @@ fn attack(
     keep_alive: bool,
 ) -> Result<Measured, String> {
     let tag = slug(key);
+    let (program, extension) = if wl.tls() {
+        ("h2load", "log")
+    } else {
+        ("vegeta", "bin")
+    };
     let targets = raw.join(format!("targets-{tag}.txt"));
-    write_targets(&targets, base, &wl.paths())?;
+    if wl.tls() {
+        write_uris(&targets, base, &wl.paths())?;
+    } else {
+        write_targets(&targets, base, &wl.paths())?;
+    }
     let mut go =
         |name: &str, seconds: u32, out: &Path| -> Result<(Option<String>, usize), String> {
-            let args = vegeta_args(&targets, rate, seconds, keep_alive, out);
+            let args = if wl.tls() {
+                h2load_args(&targets, rate, seconds, keep_alive, out)
+            } else {
+                vegeta_args(&targets, rate, seconds, keep_alive, out)
+            };
             match guest.as_deref_mut() {
                 Some(run) => {
                     let mut server = Server::Guest(run);
                     let mark = server.mark()?;
-                    let (_, seen) =
-                        watched(&mut server, raw, name, "vegeta", &args, seconds, None)?;
+                    let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
                     let log = server.log_since(mark)?;
                     let mut found = alerts(&log);
                     found.extend(seen);
                     Ok((found.first().cloned(), malloc_failures(&log)))
                 }
                 None => {
-                    run_tool(raw, name, "vegeta", &args)?;
+                    run_tool(raw, name, program, &args)?;
                     Ok((None, 0))
                 }
             }
         };
     if warm > 0 {
-        let out = raw.join(format!("{tag}-warm.bin"));
-        let (alert, _) = go(&format!("vegeta-{tag}-warm.txt"), warm, &out)?;
+        let out = raw.join(format!("{tag}-warm.{extension}"));
+        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out)?;
         let _ = std::fs::remove_file(&out);
         stop_on(&format!("{key} (warm-up)"), &Vec::from_iter(alert))?;
     }
-    let results = raw.join(format!("{tag}.bin"));
-    let (alert, malloc) = go(&format!("vegeta-{tag}.txt"), secs, &results)?;
-    let samples = samples_of(&results)?;
-    let mut m = measure(&samples, rate, wl.length(), malloc);
+    let results = raw.join(format!("{tag}.{extension}"));
+    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results)?;
+    let samples = if wl.tls() {
+        parse_h2load_log(
+            &std::fs::read_to_string(&results)
+                .map_err(|e| format!("{}: {e}", results.display()))?,
+        )
+    } else {
+        samples_of(&results)?
+    };
+    let mut m = if wl.tls() {
+        measure_h2(&samples, rate, wl.length(), malloc)
+    } else {
+        measure(&samples, rate, wl.length(), malloc)
+    };
     m.seconds = secs;
     m.alert = alert;
     std::fs::write(
@@ -1016,7 +1228,23 @@ fn attack(
 struct Floor {
     child: Child,
     port: u16,
+    /// The port of the server of TLS 1.3 and HTTP/2 of the same nginx.
+    tls_port: u16,
     root: PathBuf,
+}
+
+/// The settings of the floor: those of `host_conf` and a second server of
+/// TLS 1.3 with HTTP/2 on its own port, with the key and certificate of the
+/// probe CA in the floor's directory.
+fn floor_conf(root: &Path, port: u16, tls_port: u16) -> String {
+    let d = root.display();
+    nginx_probe::replaced(
+        &nginx_bench::host_conf(root, port),
+        "    server {\n",
+        &format!(
+            "    server {{\n        listen 127.0.0.1:{tls_port} ssl;\n        http2 on;\n        server_name _;\n        root {d}/www;\n        ssl_certificate {d}/server.crt;\n        ssl_certificate_key {d}/server.key;\n        ssl_protocols TLSv1.3;\n        ssl_session_cache shared:SSL:1m;\n        ssl_session_tickets on;\n        ssl_buffer_size 16k;\n        location / {{ }}\n    }}\n    server {{\n"
+        ),
+    )
 }
 
 impl Floor {
@@ -1032,8 +1260,18 @@ impl Floor {
                 .map_err(|e| format!("{path}: {e}"))?;
         }
         let port = crate::net_curl::free_tcp_port()?;
+        let mut tls_port = port;
+        while tls_port == port {
+            tls_port = crate::net_curl::free_tcp_port()?;
+        }
+        for (name, bytes) in [
+            ("server.crt", crate::probe_ca::nginx_certificate()),
+            ("server.key", crate::probe_ca::nginx_key()),
+        ] {
+            std::fs::write(root.join(name), bytes).map_err(|e| format!("{name}: {e}"))?;
+        }
         let conf = root.join("nginx.conf");
-        std::fs::write(&conf, nginx_bench::host_conf(&root, port))
+        std::fs::write(&conf, floor_conf(&root, port, tls_port))
             .map_err(|e| format!("nginx.conf: {e}"))?;
         let log =
             std::fs::File::create(root.join("error.log")).map_err(|e| format!("error.log: {e}"))?;
@@ -1047,7 +1285,12 @@ impl Floor {
             .stderr(log)
             .spawn()
             .map_err(|e| format!("nginx of Homebrew: {e} (brew install nginx)"))?;
-        let floor = Floor { child, port, root };
+        let floor = Floor {
+            child,
+            port,
+            tls_port,
+            root,
+        };
         let address: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
         let started = Instant::now();
         while Connection::open(address, Duration::from_secs(2))
@@ -1085,6 +1328,10 @@ impl Floor {
 
 /// What a run builds before it boots anything.
 struct Prepared {
+    /// The fingerprints of the settings with TLS (W4, W5): the rows with
+    /// `nginx.conf`, and F1.
+    config_tls: String,
+    fast_config_tls: String,
     linux: PathBuf,
     kernel: PathBuf,
     image: PathBuf,
@@ -1108,6 +1355,8 @@ struct Window {
 
 struct Guest {
     sys: System,
+    /// Whether nginx runs the settings with the server of TLS.
+    tls: bool,
     run: qemu::Run,
     address: SocketAddr,
     mac: String,
@@ -1247,7 +1496,44 @@ fn expect_fetch(address: SocketAddr) -> Result<(), String> {
     }
 }
 
-fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
+/// The first file over TLS and HTTP/2 from the Mac (the server speaks TLS 1.3
+/// alone, and the curl of macOS has no option to ask for it): the protocol is
+/// HTTP/2 and the bytes are the file's. The certificate of the probe CA is
+/// not checked here (the load does not check it either).
+fn expect_tls(address: Ipv4Addr) -> Result<(), String> {
+    let out = Command::new("curl")
+        .args([
+            "-sk",
+            "--http2",
+            "--max-time",
+            "10",
+            "-w",
+            "\n%{http_version}",
+            &format!("https://{address}:443/s/0000.bin"),
+        ])
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    let wanted = linux_guest::www_files()
+        .into_iter()
+        .find(|f| f.0 == "/www/s/0000.bin")
+        .map(|f| f.1)
+        .ok_or("no /www/s/0000.bin")?;
+    let split = out
+        .stdout
+        .len()
+        .checked_sub(2)
+        .filter(|at| out.stdout.get(*at..) == Some(b"\n2"))
+        .ok_or_else(|| {
+            format!(
+                "the first request over TLS did not use HTTP/2 (curl {:?}: {})",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+    nginx_probe::same("GET /s/0000.bin over TLS", &out.stdout[..split], wanted)
+}
+
+fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
     let suffix = vz::claim_suffix()?;
     let mut report = Report {
         system: sys.name(),
@@ -1291,33 +1577,58 @@ fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
         run.expect_line("ready", |l| l == "linux-guest: ready", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         linux_guest::workers_up(&mut run, DIALOG_STEP, 4)?;
-        linux_guest::read_fingerprints(&mut run, &mut report, false)?;
-        linux_guest::verify(&report, &prep.config, &prep.www)?;
+        let conf = if tls {
+            linux_guest::TLS_CONF
+        } else {
+            NGINX_CONF
+        };
+        if tls {
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx",
+                &format!("nginx -T -c {conf}"),
+            )?;
+        } else {
+            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+        }
+        let wanted = if tls { &prep.config_tls } else { &prep.config };
+        linux_guest::verify(&report, wanted, &prep.www)?;
         run.send("M=$(cat /var/run/nginx.pid)")?;
-        if sys.workers() == 1 {
-            // The same settings with one worker, the one allowed difference.
+        if sys.workers() == 1 || tls {
+            // The settings of the row: one worker for L1, the one allowed
+            // difference, and the server of TLS for W4 and W5.
+            let workers = sys.workers();
             let from = run.lines().len();
-            run.send("sed 's/^worker_processes 4;/worker_processes 1;/' /etc/nginx/nginx.conf > /tmp/one.conf; kill -QUIT $M; while kill -0 $M 2>/dev/null; do sleep 0.2; done; nginx -c /tmp/one.conf & M=$!")?;
+            run.send(&format!("sed 's/^worker_processes 4;/worker_processes {workers};/' {conf} > /tmp/run.conf; kill -QUIT $M; while kill -0 $M 2>/dev/null; do sleep 0.2; done; nginx -c /tmp/run.conf & M=$!"))?;
             nginx_probe::marker(&mut run, "one", START_WITHIN)?;
             let started = Instant::now();
             while run.lines()[from..]
                 .iter()
                 .filter(|l| l.contains("start worker process "))
                 .count()
-                < 1
+                < workers
             {
                 if started.elapsed() > START_WITHIN {
-                    return Err("the worker of L1 did not start".to_owned());
+                    return Err(format!(
+                        "the {workers} workers of {} did not start",
+                        sys.name()
+                    ));
                 }
                 let _ = run.expect_seen("\u{0}pump", Duration::from_millis(100));
             }
         }
         expect_fetch((address, 80).into())?;
+        if tls {
+            expect_tls(address)?;
+        }
         Ok(address)
     })();
     match result {
         Ok(address) => Ok(Guest {
             sys,
+            tls,
             run,
             address: (address, 80).into(),
             mac: report.mac.clone(),
@@ -1335,7 +1646,7 @@ fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
     }
 }
 
-fn boot_stafeto(prep: &Prepared, sys: System) -> Result<Guest, String> {
+fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
     let fast = sys == System::F1;
     let suffix = vz::claim_suffix()?;
     let mut report = Report {
@@ -1367,7 +1678,12 @@ fn boot_stafeto(prep: &Prepared, sys: System) -> Result<Guest, String> {
         if fast {
             // The stack starts with the program, on the second device: the
             // address the load goes to is the static one of `netd.conf`.
-            run.send(&format!("nginx-fast -c {FAST_CONF} & M=$!"))?;
+            let conf = if tls {
+                linux_guest::FAST_TLS_CONF
+            } else {
+                FAST_CONF
+            };
+            run.send(&format!("nginx-fast -c {conf} & M=$!"))?;
             run.expect_line(
                 "the stack",
                 |l| l.contains("fast: the stack is up on "),
@@ -1379,30 +1695,58 @@ fn boot_stafeto(prep: &Prepared, sys: System) -> Result<Guest, String> {
                 &mut report,
                 false,
                 "nginx-fast",
-                &format!("nginx-fast -T -c {FAST_CONF}"),
+                &format!("nginx-fast -T -c {conf}"),
             )?;
-            linux_guest::verify(&report, &prep.fast_config, &prep.www)?;
+            let wanted = if tls {
+                &prep.fast_config_tls
+            } else {
+                &prep.fast_config
+            };
+            linux_guest::verify(&report, wanted, &prep.www)?;
             let address: Ipv4Addr = linux_guest::FAST_ADDRESS
                 .parse()
                 .map_err(|e| format!("{e}"))?;
             expect_fetch((address, 80).into())?;
+            if tls {
+                expect_tls(address)?;
+            }
             return Ok(address);
         }
-        run.send("nginx -c /etc/nginx/nginx.conf & M=$!")?;
+        let conf = if tls {
+            linux_guest::TLS_CONF
+        } else {
+            NGINX_CONF
+        };
+        run.send(&format!("nginx -c {conf} & M=$!"))?;
         run.expect_line(
             "the event method",
             |l| l.contains("using the \"epoll\" event method"),
             START_WITHIN,
         )?;
         linux_guest::workers_up(&mut run, DIALOG_STEP, 4)?;
-        linux_guest::read_fingerprints(&mut run, &mut report, false)?;
-        linux_guest::verify(&report, &prep.config, &prep.www)?;
+        if tls {
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx",
+                &format!("nginx -T -c {conf}"),
+            )?;
+        } else {
+            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+        }
+        let wanted = if tls { &prep.config_tls } else { &prep.config };
+        linux_guest::verify(&report, wanted, &prep.www)?;
         expect_fetch((lease.address, 80).into())?;
+        if tls {
+            expect_tls(lease.address)?;
+        }
         Ok(lease.address)
     })();
     match result {
         Ok(address) => Ok(Guest {
             sys,
+            tls,
             run,
             address: (address, 80).into(),
             mac: report.mac.clone(),
@@ -1465,7 +1809,7 @@ const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1] [-
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
         systems: vec![System::L1, System::L4, System::S4],
-        workloads: Workload::ALL.to_vec(),
+        workloads: Workload::DEFAULT.to_vec(),
         phases: ["nat", "sweep", "rounds"].map(str::to_owned).to_vec(),
         rounds: CONFIRMS,
         max_rounds: MAX_ROUNDS,
@@ -1504,9 +1848,7 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--workloads" => {
                 o.workloads = value(arg)?
                     .split(',')
-                    .map(|s| {
-                        Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1, w2, w3)"))
-                    })
+                    .map(|s| Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1 to w5)")))
                     .collect::<Result<_, _>>()?
             }
             "--image" => {
@@ -1590,15 +1932,19 @@ impl Bench {
     }
 
     /// Brings `sys` up if it is not the guest that stands.
-    fn boot(&mut self, sys: System) -> Result<(), String> {
-        if self.guest.as_ref().is_some_and(|g| g.sys == sys) {
+    fn boot(&mut self, sys: System, tls: bool) -> Result<(), String> {
+        if self
+            .guest
+            .as_ref()
+            .is_some_and(|g| g.sys == sys && g.tls == tls)
+        {
             return Ok(());
         }
         self.release();
         let guest = if sys.linux() {
-            boot_linux(&self.prep, sys)
+            boot_linux(&self.prep, sys, tls)
         } else {
-            boot_stafeto(&self.prep, sys)
+            boot_stafeto(&self.prep, sys, tls)
         };
         match guest {
             Ok(g) => {
@@ -1673,12 +2019,16 @@ impl Bench {
         if let Some(m) = self.measured(key) {
             return Ok(m);
         }
-        self.boot(sys)?;
+        self.boot(sys, wl.tls())?;
         let raw = self.raw.clone();
-        let profiled = self.opts.image != ImageKind::Plain && !sys.linux();
+        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
-            let base = format!("http://{}", g.address);
+            let base = if wl.tls() {
+                format!("https://{}:443", g.address.ip())
+            } else {
+                format!("http://{}", g.address)
+            };
             if g.warmed
                 .is_none_or(|(w, t)| w != wl || t.elapsed() > COLD_AFTER)
             {
@@ -1764,8 +2114,12 @@ impl Bench {
         if let Some(m) = self.measured(key) {
             return Ok(m);
         }
-        let port = self.floor.as_ref().ok_or("the floor is not up")?.port;
-        let base = format!("http://127.0.0.1:{port}");
+        let floor = self.floor.as_ref().ok_or("the floor is not up")?;
+        let base = if wl.tls() {
+            format!("https://127.0.0.1:{}", floor.tls_port)
+        } else {
+            format!("http://127.0.0.1:{}", floor.port)
+        };
         let mut m = attack(
             &self.raw,
             None,
@@ -1873,39 +2227,59 @@ impl Bench {
         if self.get(key).is_some() {
             return Ok(());
         }
-        self.boot(sys)?;
+        self.boot(sys, wl.tls())?;
         let (raw, secs) = (self.raw.clone(), self.opts.ceiling);
-        let profiled = self.opts.image != ImageKind::Plain && !sys.linux();
+        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
         let script = raw.join(format!("wrk-{}.lua", wl.name()));
         std::fs::write(&script, wrk_script(&wl.paths(), wl.keep_alive()))
             .map_err(|e| format!("{}: {e}", script.display()))?;
+        let uris = raw.join(format!("uris-{}.txt", slug(key)));
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
-            let args: Vec<String> = [
-                "-t2".to_owned(),
-                format!("-c{connections}"),
-                format!("-d{secs}s"),
-                "--timeout".to_owned(),
-                "10s".to_owned(),
-                "-s".to_owned(),
-                script.display().to_string(),
-                format!("http://{}/", g.address),
-            ]
-            .to_vec();
+            // W4: `h2load` with the connections open and streams to fill
+            // them, as fast as the guest answers; the others: `wrk`.
+            let (program, args): (&str, Vec<String>) = if wl.tls() {
+                write_uris(
+                    &uris,
+                    &format!("https://{}:443", g.address.ip()),
+                    &wl.paths(),
+                )?;
+                ("h2load", h2load_ceiling_args(&uris, connections, secs))
+            } else {
+                (
+                    "wrk",
+                    [
+                        "-t2".to_owned(),
+                        format!("-c{connections}"),
+                        format!("-d{secs}s"),
+                        "--timeout".to_owned(),
+                        "10s".to_owned(),
+                        "-s".to_owned(),
+                        script.display().to_string(),
+                        format!("http://{}/", g.address),
+                    ]
+                    .to_vec(),
+                )
+            };
             let before = g.open_window(profiled)?;
             let mut server = Server::Guest(&mut g.run);
             let mark = server.mark()?;
             let (text, seen) = watched(
                 &mut server,
                 &raw,
-                &format!("wrk-{}.txt", slug(key)),
-                "wrk",
+                &format!("{program}-{}.txt", slug(key)),
+                program,
                 &args,
                 secs,
                 None,
             )?;
             let log = server.log_since(mark)?;
-            let wrk = parse_wrk(&text).ok_or_else(|| format!("wrk printed no rate: {text}"))?;
+            let wrk = if wl.tls() {
+                parse_h2load(&text)
+            } else {
+                parse_wrk(&text)
+            }
+            .ok_or_else(|| format!("{program} printed no rate: {text}"))?;
             let cpu = g.close_window(&before, wrk.requests as usize)?;
             let mut found = alerts(&log);
             found.extend(seen);
@@ -1972,7 +2346,7 @@ impl Bench {
                 if self.get(&key).is_some() {
                     continue;
                 }
-                self.boot(System::L4)?;
+                self.boot(System::L4, false)?;
                 let address = self.guest.as_ref().ok_or("no guest")?.address.ip();
                 let mut args = vec![
                     "-c".to_owned(),
@@ -2030,7 +2404,16 @@ impl Bench {
                 // or without an R* (a row that holds no 1 ms, S4 on W2 or F1,
                 // has its ceiling and its CPU time all the same).
                 if round <= self.opts.rounds {
-                    for wl in self.opts.workloads.clone() {
+                    // W5 has no ceiling: a connection for each request has no
+                    // closed loop that `h2load` runs.
+                    let loads: Vec<Workload> = self
+                        .opts
+                        .workloads
+                        .iter()
+                        .copied()
+                        .filter(|w| *w != Workload::W5)
+                        .collect();
+                    for wl in loads {
                         for c in [CONNECTIONS, wl.criterion()] {
                             self.ceiling(
                                 &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
@@ -2087,7 +2470,9 @@ impl Bench {
                 }
                 self.release();
             }
-            if states.values().all(|(_, c)| c.done()) {
+            // The rounds with ceilings are all taken, whether the rows have an
+            // R* to confirm or not; the later ones go on for the open pairs.
+            if round >= self.opts.rounds && states.values().all(|(_, c)| c.done()) {
                 break;
             }
         }
@@ -2810,7 +3195,7 @@ fn tables(dir: &Path) -> Result<String, String> {
 
 // The command ---------------------------------------------------------------------------
 
-fn tools_present(phases: &[String]) -> Result<(), String> {
+fn tools_present(phases: &[String], workloads: &[Workload]) -> Result<(), String> {
     let mut tools = vec![
         ("vegeta", "-version"),
         ("wrk", "--version"),
@@ -2819,16 +3204,21 @@ fn tools_present(phases: &[String]) -> Result<(), String> {
     if phases.iter().any(|p| p == "nat") {
         tools.push(("iperf3", "--version"));
     }
+    if workloads.iter().any(|w| w.tls()) {
+        tools.push(("h2load", "--version"));
+        tools.push(("curl", "--version"));
+    }
     for (program, flag) in tools {
-        Command::new(program)
-            .arg(flag)
-            .output()
-            .map_err(|e| format!("{program}: {e} (brew install vegeta wrk nginx iperf3)"))?;
+        Command::new(program).arg(flag).output().map_err(|e| {
+            format!("{program}: {e} (brew install vegeta wrk nginx iperf3 nghttp2)")
+        })?;
     }
     Ok(())
 }
 
 fn prepare(o: &Options) -> Result<Prepared, String> {
+    // The key and certificate of the probe CA go into every guest.
+    crate::probe_ca::ensure(false)?;
     crate::relibc()?;
     crate::net_build()?;
     let linux = if o.systems.iter().any(|s| s.linux()) {
@@ -2855,7 +3245,10 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     }
     let (config, www) = linux_guest::expected()?;
     let (fast_config, _) = linux_guest::expected_fast();
+    let (config_tls, fast_config_tls) = linux_guest::expected_tls()?;
     Ok(Prepared {
+        config_tls,
+        fast_config_tls,
         linux,
         kernel,
         image,
@@ -2868,7 +3261,7 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
 
 fn run(args: &[String]) -> Result<(), String> {
     let o = options(args)?;
-    tools_present(&o.phases)?;
+    tools_present(&o.phases, &o.workloads)?;
     let dir = match &o.resume {
         Some(dir) => std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?,
         None => {
@@ -3380,6 +3773,115 @@ mod tests {
             Measured::of(&rec_of(&rec_text(&plain.rec()))).unwrap(),
             plain
         );
+    }
+
+    #[test]
+    fn the_connections_of_w4_open_a_request_interval_apart() {
+        assert_eq!(connection_pace(250), (1, 4));
+        assert_eq!(connection_pace(1000), (1, 1));
+        assert_eq!(connection_pace(3000), (3, 1));
+        assert_eq!(connection_pace(96_000), (96, 1));
+        let args = h2load_args(Path::new("u.txt"), 1000, 30, true, Path::new("l.log"));
+        for wanted in [
+            "-n30000",
+            "-t1",
+            "-r1",
+            "--rate-period=1ms",
+            "-c64",
+            "-m100",
+            "--rps=15.625000",
+            "--log-file=l.log",
+        ] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+        // W5: a connection for each request, opened at the rate, no pacing of
+        // requests on a connection.
+        let args = h2load_args(Path::new("u.txt"), 250, 10, false, Path::new("l.log"));
+        for wanted in ["-n2500", "-c2500", "-m1", "-r1", "--rate-period=4ms"] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+        assert!(!args.iter().any(|a| a.starts_with("--rps")));
+        // Above 16 000 a second two threads, each with at least a connection a period.
+        let args = h2load_args(Path::new("u.txt"), 24_000, 10, true, Path::new("l.log"));
+        assert!(args.contains(&"-t2".to_owned()) && args.contains(&"-r24".to_owned()));
+        // Never more connections a period than the 64 there are.
+        let args = h2load_args(Path::new("u.txt"), 96_000, 10, true, Path::new("l.log"));
+        assert!(args.contains(&"-r64".to_owned()));
+    }
+
+    #[test]
+    fn the_ceiling_of_w4_keeps_one_request_in_flight_on_each_connection() {
+        let args = h2load_ceiling_args(Path::new("u.txt"), 64, 15);
+        for wanted in ["-c64", "-m1", "-D15s", "--warm-up-time=2s"] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn the_log_of_h2load_is_read_in_the_order_of_the_starts() {
+        let text = "1000000\t200\t900\n1000500\t200\t300\n999900\t404\t5000\nnot a line\n";
+        let samples = parse_h2load_log(text);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| (s.at, s.code, s.latency, s.seq))
+                .collect::<Vec<_>>(),
+            [
+                (999_900_000, 404, 5_000_000, 0),
+                (1_000_000_000, 200, 900_000, 1),
+                (1_000_500_000, 200, 300_000, 2)
+            ]
+        );
+        // A step read from it: the percentiles are the log's own and the lag
+        // against the one schedule is not part of them.
+        let m = measure_h2(&samples, 1000, 10240, 0);
+        assert_eq!((m.requests, m.ok, m.failed), (3, 2, 1));
+        assert_eq!((m.p99, m.p99_raw, m.lag_p99), (5_000_000, 5_000_000, 0));
+        assert_eq!(m.p50, 900_000);
+    }
+
+    #[test]
+    fn the_summary_of_h2load_is_read() {
+        let text = "starting benchmark...\nfinished in 15.00s, 52345.50 req/s, 12.50MB/s\nrequests: 785183 total, 785183 started, 785180 done, 785100 succeeded, 83 failed, 3 errored, 2 timeout\nstatus codes: 785000 2xx, 0 3xx, 177 4xx, 0 5xx\n";
+        let got = parse_h2load(text).unwrap();
+        assert_eq!(got.requests, 785_180);
+        assert_eq!(got.per_second, 52345.5);
+        assert_eq!(got.transfer, "12.50MB");
+        assert_eq!((got.connect, got.timeout, got.non_2xx), (3, 2, 180));
+        assert_eq!(parse_h2load("h2load: nothing"), None);
+    }
+
+    #[test]
+    fn the_loads_over_tls_are_the_set_of_w1_on_port_443() {
+        for wl in [Workload::W4, Workload::W5] {
+            assert!(wl.tls());
+            assert_eq!(wl.paths(), Workload::W1.paths());
+            assert_eq!(wl.length(), linux_guest::W1_LEN);
+            assert_eq!(wl.pass(), (TLS_PASS_RATE, 10));
+        }
+        assert!(Workload::W4.keep_alive() && !Workload::W5.keep_alive());
+        assert_eq!(Workload::W4.grid(), Workload::W1.grid());
+        assert_eq!(Workload::W5.grid(), Workload::W3.grid());
+        assert!(!Workload::W1.tls() && !Workload::W2.tls() && !Workload::W3.tls());
+        assert_eq!(Workload::of("w5"), Some(Workload::W5));
+        // A run takes the loads of HTTP unless asked for the others.
+        let o = options(&[]).unwrap();
+        assert_eq!(o.workloads, Workload::DEFAULT);
+        let o = options(&["--workloads".to_owned(), "w4,w5".to_owned()]).unwrap();
+        assert_eq!(o.workloads, [Workload::W4, Workload::W5]);
+    }
+
+    #[test]
+    fn the_floor_has_a_server_of_tls_beside_the_one_of_http() {
+        let text = floor_conf(Path::new("/f"), 8080, 8443);
+        assert!(text.contains("listen 127.0.0.1:8080;"));
+        assert!(text.contains("listen 127.0.0.1:8443 ssl;"));
+        assert!(text.contains("http2 on;"));
+        assert!(text.contains("ssl_certificate /f/server.crt;"));
+        assert!(text.contains("ssl_protocols TLSv1.3;"));
+        assert!(text.contains("ssl_session_tickets on;"));
+        assert_eq!(text.matches("    server {").count(), 2);
     }
 
     #[test]

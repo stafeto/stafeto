@@ -141,11 +141,13 @@ pub fn bench_fast_programs() -> &'static [ImageProgram] {
 /// Builds the image of the measurement (a step of ci, which can run
 /// neither HVF nor VZ).
 pub fn build_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
     build_boot_image(BENCH_IMAGE, bench_programs(), BOOT_PROFILE)
 }
 
 /// Builds the image of F1.
 pub fn build_fast_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
     build_boot_image(BENCH_FAST_IMAGE, bench_fast_programs(), BOOT_PROFILE)
 }
 
@@ -226,6 +228,63 @@ pub fn nginx_fast_conf() -> &'static str {
     crate::fast_nginx::NGINX_FAST_CONF
 }
 
+/// The path of the settings with the server of TLS in the guests of Linux
+/// and in S4, and in F1.
+pub const TLS_CONF: &str = "/etc/nginx/nginx-tls.conf";
+pub const FAST_TLS_CONF: &str = "/etc/nginx/nginx-fast-tls.conf";
+
+/// `conf` with the server of TLS (`tls.conf`) included before its server of
+/// HTTP, the one change W4 and W5 make: the same `http` block, the same
+/// listener on port 80, and the listener of TLS 1.3 and HTTP/2 on 443.
+pub fn with_tls(conf: &str) -> String {
+    nginx_probe::replaced(
+        conf,
+        "    server {\n",
+        &format!(
+            "    include {};\n    server {{\n",
+            nginx_probe::TLS_CONF_PATH
+        ),
+    )
+}
+
+/// The settings of nginx of the guests of Linux and S4 for W4 and W5.
+pub fn nginx_tls_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(nginx_conf()))
+}
+
+/// The settings of F1 for W4 and W5.
+pub fn nginx_fast_tls_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(nginx_fast_conf()))
+}
+
+/// What `nginx -T -c PATH` prints: each file of `parts` (its path and its
+/// bytes) after the line that names it, in the order nginx reads them.
+pub fn expected_dump(parts: &[(&str, &str)]) -> String {
+    parts
+        .iter()
+        .map(|(path, text)| format!("# configuration file {path}:\n{text}\n"))
+        .collect()
+}
+
+/// The dump of the settings with TLS: for the rows with `nginx.conf` (the
+/// types before the server of TLS) and for F1.
+pub fn expected_tls_dump(fast: bool, mime: &[u8]) -> String {
+    let (path, conf) = if fast {
+        (FAST_TLS_CONF, nginx_fast_tls_conf())
+    } else {
+        (TLS_CONF, nginx_tls_conf())
+    };
+    let mime = String::from_utf8_lossy(mime);
+    let mut parts = vec![(path, conf)];
+    if !fast {
+        parts.push(("/etc/nginx/mime.types", mime.as_ref()));
+    }
+    parts.push((nginx_probe::TLS_CONF_PATH, nginx_probe::TLS_CONF));
+    expected_dump(&parts)
+}
+
 /// Writes the overlay of the Linux guest into the empty `dir`: the settings
 /// of nginx, its `mime.types` (the file of the nginx source that stafeto's image
 /// carries) and the files under `/www`.
@@ -238,6 +297,15 @@ pub fn write_overlay(dir: &Path, mime: &[u8]) -> Result<(), String> {
     };
     put("/etc/nginx/nginx.conf", nginx_conf().as_bytes())?;
     put("/etc/nginx/mime.types", mime)?;
+    // W4 and W5: the same settings with the server of TLS, and the key and
+    // the certificate of the probe CA.
+    put(TLS_CONF, nginx_tls_conf().as_bytes())?;
+    put(nginx_probe::TLS_CONF_PATH, nginx_probe::TLS_CONF.as_bytes())?;
+    put(
+        nginx_probe::SERVER_CRT,
+        crate::probe_ca::nginx_certificate(),
+    )?;
+    put(nginx_probe::SERVER_KEY, crate::probe_ca::nginx_key())?;
     for (path, bytes) in www_files() {
         put(path, bytes)?;
     }
@@ -636,6 +704,19 @@ pub(crate) fn expected() -> Result<(String, String), String> {
     ))
 }
 
+/// The fingerprints of the settings with TLS: for the rows with `nginx.conf`
+/// and for F1.
+pub(crate) fn expected_tls() -> Result<(String, String), String> {
+    let mime = nginx_probe::mime_types();
+    if mime.is_empty() {
+        return Err("nginx's mime.types is missing: run tools/build-nginx.py".to_owned());
+    }
+    Ok((
+        config_digest(&expected_tls_dump(false, mime)),
+        config_digest(&expected_tls_dump(true, mime)),
+    ))
+}
+
 /// The fingerprints of F1: the settings are its own file (`nginx-fast.conf`),
 /// the files under `/www` are those of the other rows.
 pub(crate) fn expected_fast() -> (String, String) {
@@ -723,6 +804,8 @@ pub(crate) fn linux_dir() -> PathBuf {
 
 /// `cargo xtask linux-guest build`.
 pub fn build_guest() -> Result<PathBuf, String> {
+    // The overlay carries the key and the certificate of the probe CA (W4, W5).
+    crate::probe_ca::ensure(false)?;
     // The overlay takes `mime.types` of the nginx source, which the build of
     // the network packages unpacks.
     crate::relibc()?;
@@ -1316,6 +1399,51 @@ mod tests {
             config_digest(&expected_fast_config_output(&workers)),
             config
         );
+    }
+
+    /// W4 and W5 change one thing in the settings of the rows: the server
+    /// of TLS, included before the server of HTTP. Every line of the plain
+    /// settings is still there, in its place.
+    #[test]
+    fn the_settings_with_tls_add_the_include_and_change_nothing_else() {
+        for (plain, tls) in [
+            (nginx_conf(), nginx_tls_conf()),
+            (nginx_fast_conf(), nginx_fast_tls_conf()),
+        ] {
+            let added: Vec<&str> = tls
+                .lines()
+                .filter(|l| !plain.lines().any(|p| p == *l))
+                .collect();
+            assert_eq!(added, ["    include /etc/nginx/tls.conf;"]);
+            assert_eq!(tls.lines().count(), plain.lines().count() + 1);
+            assert!(tls.contains("    include /etc/nginx/tls.conf;\n    server {\n"));
+        }
+        assert!(nginx_probe::TLS_CONF.contains("listen 443 ssl"));
+        assert!(nginx_probe::TLS_CONF.contains("ssl_protocols TLSv1.3;"));
+    }
+
+    #[test]
+    fn the_dump_with_tls_names_the_files_in_the_order_nginx_reads_them() {
+        let plain = expected_tls_dump(false, b"types {}\n");
+        let paths: Vec<&str> = plain
+            .lines()
+            .filter(|l| l.starts_with("# configuration file "))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "# configuration file /etc/nginx/nginx-tls.conf:",
+                "# configuration file /etc/nginx/mime.types:",
+                "# configuration file /etc/nginx/tls.conf:"
+            ]
+        );
+        let fast = expected_tls_dump(true, b"types {}\n");
+        assert!(fast.starts_with("# configuration file /etc/nginx/nginx-fast-tls.conf:"));
+        assert!(!fast.contains("mime.types"));
+        // A guest whose server of TLS differs from the file of the sources
+        // has another fingerprint.
+        let changed = fast.replace("ssl_protocols TLSv1.3;", "ssl_protocols TLSv1.2 TLSv1.3;");
+        assert_ne!(config_digest(&changed), config_digest(&fast));
     }
 
     #[test]

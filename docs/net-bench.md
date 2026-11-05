@@ -4,7 +4,7 @@ A manual measurement on an Apple Silicon Mac (stage P7): ci has neither HVF nor 
 
 ## What it needs
 
-- `brew install vegeta wrk nginx iperf3` (vegeta 12.13.0 at a fixed rate, wrk 4.2.0 for the ceiling, Homebrew's nginx for the floor, iperf3 for the limit of the NAT). The versions go into the report.
+- `brew install vegeta wrk nginx iperf3 nghttp2` (vegeta 12.13.0 at a fixed rate, wrk 4.2.0 for the ceiling, Homebrew's nginx for the floor, iperf3 for the limit of the NAT, h2load of nghttp2 for W4 and W5). The versions go into the report.
 - The Local Network permission for the terminal, as for `nginx-bench --machine vz`.
 - No quiet Mac. Other work may run on it; the method below tolerates that and records it.
 
@@ -26,8 +26,14 @@ F1 has its own file of settings, `tools/nginx/nginx-fast.conf`. It differs from 
 | W1 | 900 files of 10 KiB (`/s/0000.bin` to `/s/0899.bin`, taken in turn), 64 long connections |
 | W2 | 64 files of 256 KiB (`/l/00.bin` to `/l/63.bin`), 64 long connections |
 | W3 | the files of W1, a new connection for each request (up to 64 at once) |
+| W4 | the files of W1 over TLS 1.3 and HTTP/2, 64 long connections with up to 100 streams each (`h2load`) |
+| W5 | the files of W1 over TLS 1.3, a new connection (a new handshake, no resumption) for each request (`h2load`) |
 
 Both guests carry the same files and the same settings (`tools/nginx/nginx.conf`); `linux-guest check` proves it, and every guest the run starts passes the same fingerprints of `nginx -T`, of `/www` and of the versions before it is loaded. L1 differs from L4 in `worker_processes`, an allowed difference.
+
+W4 and W5 take the settings with the server of TLS (`tools/nginx/tls.conf`, TLS 1.3 alone, HTTP/2, the key and certificate of the probe CA): `nginx-tls.conf` for L1, L4 and S4, `nginx-fast-tls.conf` for F1, each the plain settings with one more line, the `include` of `tls.conf` before the server of HTTP. A guest that runs them starts from the plain settings, passes the fingerprints of the TLS settings (`nginx -T -c`, which prints the three files of the settings) and restarts nginx on them (Linux) or starts it on them (stafeto); the first file is fetched over TLS from the Mac with `curl --http2` and compared with its source. The Linux guest has the files in its overlay, so `cargo xtask linux-guest build` rebuilds its initramfs with them (the hash of the image changes, nothing of the plain run does). The floor is the same Homebrew nginx with a second server of TLS on a port of its own.
+
+`h2load` is an open loop at a fixed rate, and it writes the start and the length of every request to a file (`--log-file`); the percentiles come from that file, from the start of a request to the end of its answer. The correction for the lag does not apply to them: it reads the requests against one clock, and `h2load` has a timer for each of its 64 connections, each starting when its handshake ends, so the requests of the connections meet and part by a millisecond or two with nothing stalled (counted against one schedule `t0 + n / rate` over the requests sorted by their start, the lag was 1 to 3 ms even on the floor). The floor is the same `h2load` on the loopback and takes that noise in the rule of the noise; the lag against the single schedule is kept as information (`lag_max` and the seconds files), and the p99 of lag in the rule is 0. W4 opens its 64 connections one after another a request interval apart (`-r` and `--rate-period` in whole milliseconds, so a rate above 1 000 a second opens several connections in a millisecond), each connection at one 64th of the rate (`--rps`), so the requests of the 64 timers do not arrive in a burst. W5 opens a connection at the rate and sends one request on it (`-c` of all requests, `-m1`). The log starts a request after the handshake, so W5's latency is that of the request on a new connection and leaves the handshake out; the summary of `h2load` has the time for connect of the run (the console output of every step is kept). The ceiling of W4 is `h2load` with the connections open and one request in flight on each, as fast as the guest answers, as `wrk -c64` does for W1 (the criterion `-c100`), and W5 has none. With ten streams in flight on each of 64 connections the guest of F1 answers the first 640 requests and then none (the worker is alive and the CPUs are idle), so the ceiling uses one.
 
 ## The method
 
@@ -58,6 +64,7 @@ On stafeto `/proc` lists the programs the process service started for the shell 
 ```
 cargo xtask net-bench run                      # nat, sweep and rounds for L1, L4, S4 and W1 to W3
 cargo xtask net-bench run --systems l4,s4,f1 --phases sweep,rounds
+cargo xtask net-bench run --systems l4,s4,f1 --workloads w4 --phases sweep,rounds
 cargo xtask net-bench run --systems s4,l4 --workloads w1 --phases sweep
 cargo xtask net-bench run --quick --max-rate 2000   # a few minutes, to see that it works
 cargo xtask net-bench run --resume target/net-bench/<time>
