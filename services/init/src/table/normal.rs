@@ -52,6 +52,7 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     },
     // No heartbeat: it waits for input and has no periodic work (spec
     // 13.6); the console only for the message of its panic.
@@ -77,5 +78,6 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     },
 ];

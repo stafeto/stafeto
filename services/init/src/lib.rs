@@ -15,6 +15,7 @@ pub mod labels;
 pub mod quota;
 pub mod restart;
 pub mod table;
+pub mod waits;
 pub mod watch;
 pub mod work;
 

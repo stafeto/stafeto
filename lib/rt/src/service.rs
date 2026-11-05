@@ -1121,6 +1121,27 @@ pub fn register(parent: &Handle<Channel>, channel: &Handle<Channel>) -> Result<R
     })
 }
 
+/// READY through `parent`, the service's connection to init: the service
+/// finished its own start and answers with all it has (spec 5, section 4),
+/// so init starts the records that wait for it. Once, after REGISTER. A send
+/// that came back INTERRUPTED goes again: init never saw it. The errors:
+/// send's as the status, init's refusal (BAD_STATE for a client or an
+/// instance that has not registered).
+pub fn ready(parent: &Handle<Channel>) -> Result<(), Status> {
+    let request = Method::Ready.header().bytes();
+    let reply = loop {
+        match sys::send(parent, &request) {
+            Err(Error::Interrupted) => continue,
+            other => break other?,
+        }
+    };
+    let mut buffer = [0; MESSAGE_MAX];
+    match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+        Status::Ok => Ok(()),
+        status => Err(status),
+    }
+}
+
 /// CONNECT through `parent`, the program's connection to init
 /// (Startup::parent): a session with the service `name` (spec 13.4), a
 /// handle with SEND, TRANSFER and a label of its own. Init answers once

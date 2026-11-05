@@ -128,6 +128,14 @@
 //! witness closed. Once init answered 0, the service starts the thread; on
 //! any other answer it kills the process.
 //!
+//! READY: a service tells init that it finished its own start and answers
+//! with all it has (spec 5, section 4): the header alone, and the reply its
+//! status alone. Init starts the records that wait for the service
+//! (`Record::waits`) once each service they name sent READY. BAD_STATE for a
+//! record that is no service or whose instance has not registered; a second
+//! READY of the instance changes nothing. A service sends it when it is
+//! ready, once (`rt::service::ready`).
+//!
 //! REPLACED, also from the process service alone, once the record of a
 //! process init started made an exec: the header, the ticket u64 of the
 //! record's instance and one handle, the new process (DUPLICATE, TRANSFER).
@@ -157,10 +165,11 @@ pub enum Method {
     Adopt = 8,
     Adopted = 9,
     Replaced = 11,
+    Ready = 12,
 }
 
 impl Method {
-    pub const ALL: [Method; 10] = [
+    pub const ALL: [Method; 11] = [
         Method::Start,
         Method::Register,
         Method::Connect,
@@ -171,6 +180,7 @@ impl Method {
         Method::Adopt,
         Method::Adopted,
         Method::Replaced,
+        Method::Ready,
     ];
 
     pub const fn number(self) -> u16 {
@@ -1155,14 +1165,16 @@ mod tests {
     #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
         assert_eq!(Method::from_number(10), None);
-        assert_eq!(Method::from_number(12), None);
+        assert_eq!(Method::from_number(12), Some(Method::Ready));
+        assert_eq!(Method::from_number(13), None);
+        assert_eq!(Method::Ready.header().bytes(), [12, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(VERSION, 1);
         assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);

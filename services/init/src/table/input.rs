@@ -87,6 +87,7 @@ pub const INPUT: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
+    waits: &[],
 };
 
 /// The display service as the images that take keys have it: its session
@@ -121,6 +122,7 @@ const PROBE: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
+    waits: &[],
 };
 
 /// A program the table gives no connection to the input service (role

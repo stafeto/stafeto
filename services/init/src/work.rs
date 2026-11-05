@@ -207,6 +207,7 @@ mod tests {
             root: false,
             shares: Shares::CREATOR,
             cpus: GENERAL_CPUS,
+            waits: &[],
         }
     }
 

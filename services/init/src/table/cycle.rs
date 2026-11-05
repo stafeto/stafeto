@@ -34,6 +34,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     }
 }
 

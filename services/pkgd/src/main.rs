@@ -132,6 +132,7 @@ fn main(_: u64) -> u64 {
         ops: LongOps::new(),
         pending: None,
         rx: None,
+        ready: false,
     };
     let config = Config {
         issued: 0,
@@ -187,6 +188,9 @@ struct Rx {
 }
 
 struct Pkgd {
+    /// READY went to init (once the start of the worker is over, in the
+    /// store's good state or not).
+    ready: bool,
     process: core::mem::ManuallyDrop<Handle<Process>>,
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
     parent: core::mem::ManuallyDrop<Handle<Channel>>,
@@ -962,6 +966,15 @@ impl Service<0> for Pkgd {
         // The step of a notification is measured apart from the heartbeat's.
         rt::service::step_own();
         if n.source == Source::Session && n.label == LABEL_DONE {
+            // The start is over (the worker cleared STARTING, whatever the
+            // store is: a damaged disk or none is served as such): init may
+            // start the records that wait for the service (spec 5, section 4).
+            if !self.ready && !STARTING.load(Acquire) {
+                self.ready = true;
+                if let Err(why) = rt::service::ready(&self.parent) {
+                    rt::println!("pkgd: READY refused: {why:?}");
+                }
+            }
             self.settle();
             #[cfg(feature = "steps")]
             {

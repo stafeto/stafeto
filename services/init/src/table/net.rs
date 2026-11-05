@@ -121,6 +121,7 @@ pub const NETD: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: NETD_CPUS,
+    waits: &[],
 };
 
 /// The PCI devices of the network on VZ's bus 0 (services/netd/src/pci.rs).
@@ -472,6 +473,7 @@ pub const PROBE: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: super::GENERAL_CPUS,
+    waits: &[],
 };
 
 // NET_TABLE copies the records of the shell's table by number: a table that
