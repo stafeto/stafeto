@@ -107,6 +107,25 @@ them for the licence notes of the image.
   MD5 ask for (`FSTACK-LICENSE`, `FSTACK-SOURCE`). The installed headers are
   those of the build without thread-local storage: `ff_api.h` declares
   `pcurthread` a plain variable.
+- nginx on the stack (`packages/nginx-fast.toml`, an optional package of the image kind
+  `fstack`, BSD-2-Clause) links the object of the package `nginx` with
+  `libfstack.a`, the device's driver and the glue of `ports/f-stack` into
+  `/bin/nginx-fast` (`tools/build-libc-so.py programs`; `-z nostart-stop-gc`
+  keeps the sets of the stack, `-z stack-size=1048576` gives it a main stack
+  of 1 MiB) and installs `/etc/nginx/nginx-fast.conf`. It needs the network
+  and the second device, so only the images with both devices hold it
+  (`boot-fast-nginx.img` and its variants, `Package::needs_network_device`).
+  Its `build_depends` are f-stack, openssl and pcre2, so its notice directory
+  holds F-Stack's (`/usr/share/licenses/nginx-fast/f-stack/`, with the file
+  `NOTICES` of the copyright lines and terms of the files the stack's build
+  compiled, which `tools/build-fstack.py` writes). F-Stack's notices are in
+  these two packages and nowhere else: the kernel archive and the archive of
+  the shell image carry none of them (`cargo xtask dist-licenses` checks it).
+  `cargo xtask fast-probe nginx` runs the pages over HTTP and HTTPS, a reload
+  under load, a worker killed, the quit and the worker under nobody; with
+  `crash` the network service ends under requests; with `steps` the service
+  counts its steps; `cargo xtask net-vz --fast --static1 --nginx` runs it on
+  Apple VZ with `wrk`.
 - The images with the network service (`boot-net.img` of `cargo xtask net`,
   the images of the network probes) hold the shell image's packages and the
   network packages: OpenSSL 3.5.9 (`/bin/openssl`, Apache-2.0), curl 8.23.0

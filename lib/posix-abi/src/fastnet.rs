@@ -24,6 +24,7 @@ pub use crate::fast_events::{
     FAST_BASE, FAST_MAX, FAST_TICKETS, Number, above_table, classify, is_fast,
 };
 use crate::fast_tickets::{self, Tickets};
+use crate::wait;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::mem::MaybeUninit;
@@ -846,13 +847,42 @@ pub fn exit_if_lost() {
     }
 }
 
-/// One last step of the stack before the process ends, so that the FIN of
-/// the sockets just closed and the last segments leave: `close` puts them in
-/// the ring, and the doorbell rings at the end of a step. Nothing waits for
-/// the peer's answers. Not after the service let go.
+/// The longest the process stays on at its end for the stack's last
+/// segments, and the quiet that ends the wait sooner: a stack that found no
+/// work (no frame came, no work of its own was queued) for this long has
+/// nothing to send that the peer's window lets it.
+const DRAIN_MAX_NS: u64 = 200_000_000;
+const DRAIN_QUIET_NS: u64 = 20_000_000;
+
+/// The steps of the stack before the process ends, so that the FIN of the
+/// sockets just closed and the tails of their send buffers leave: `close`
+/// puts them in the ring, and the doorbell rings at the end of a step. A
+/// socket that is closed while the peer has not yet taken all its data keeps
+/// the rest in the stack, which dies with the process, so the steps go on
+/// while the peer's acknowledgements keep the stack at work, for at most
+/// `DRAIN_MAX_NS` and until `DRAIN_QUIET_NS` pass without work. Nothing
+/// waits for the peer's answers to the FIN. They do not run after the
+/// service let go.
 pub fn last_pass() {
-    if registered() && up() && !lost() {
-        let _ = pass();
+    if !(registered() && up() && !lost()) {
+        return;
+    }
+    let started = wait::now();
+    let mut quiet_from = started;
+    loop {
+        let now = wait::now();
+        match pass() {
+            Ok(0) => {}
+            Ok(_) => quiet_from = now,
+            Err(_) => return,
+        }
+        if lost()
+            || now.saturating_sub(quiet_from) >= DRAIN_QUIET_NS
+            || now.saturating_sub(started) >= DRAIN_MAX_NS
+        {
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 

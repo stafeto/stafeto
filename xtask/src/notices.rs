@@ -46,7 +46,9 @@ pub fn licence_text(name: &str) -> Result<Vec<u8>, String> {
         "openssl" => read(target.join(format!("openssl/openssl-{}/LICENSE.txt", version(name)?))),
         "curl" => read(target.join(format!("curl/curl-{}/COPYING", version(name)?))),
         "pcre2" => read(target.join(format!("nginx/pcre2-{}/LICENCE.md", version(name)?))),
-        "nginx" => read(target.join(format!("nginx/nginx-{}/LICENSE", version(name)?))),
+        "nginx" | "nginx-fast" => {
+            read(target.join(format!("nginx/nginx-{}/LICENSE", version(name)?)))
+        }
         "ca-bundle" => {
             let mut text = read(crate::root().join("tools/ca-bundle/MPL-2.0.txt"))?;
             text.extend_from_slice(b"\n\nThe header of the file:\n\n");

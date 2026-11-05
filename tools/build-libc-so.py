@@ -16,7 +16,7 @@ Subcommands:
           3.12.3; the programs of the images use it).
   programs [NAME...]
           link the dynamic programs of the images (busybox, busybox-utils,
-          bash, nano, htop, ncdu, doom, nginx; all by default) from the objects their build scripts left, into
+          bash, nano, htop, ncdu, doom, nginx, nginx-fast; all by default) from the objects their build scripts left, into
           target/libc-so/programs, and check each one.
   probes  build the programs of tests/posix-so/dyn into
           target/libc-so/probes and check that each bad one has the
@@ -700,6 +700,21 @@ def good_checks(name: str, elf: Elf) -> str | None:
     return None
 
 
+def fast_checks(elf: Elf) -> None:
+    """nginx-fast takes its string functions from libc.so (its own copies
+    would take the program's calls away from the layer) and registers the
+    stack's table through the layer."""
+    symbols = elf.dynsym()
+    imported = {name for name, defined, *_ in symbols if name and not defined}
+    defined = {name for name, is_defined, *_ in symbols if name and is_defined}
+    for name in ("memcpy", "stafeto_fast_register"):
+        if name not in imported:
+            fail(f"nginx-fast: {name} is not libc.so's")
+    for name in ("memcpy", "strlen"):
+        if name in defined:
+            fail(f"nginx-fast defines {name}")
+
+
 def probes_stamp() -> str:
     sources = sorted(SOURCES.glob("*.c"))
     return "\n".join((digest(SYSROOT / "lib" / "libc.so"), digest(SYSROOT / "lib" / "crt1.o"),
@@ -814,6 +829,11 @@ def program_inputs() -> dict:
         "fast-layer": [ROOT / "target" / "f-stack" / "fast-layer.o",
                        ROOT / "target" / "f-stack" / "ff_stafeto_glue.o",
                        ROOT / "target" / "f-stack" / "libfstack.a", VNET],
+        # nginx on the stack in its own process (packages/nginx-fast.toml):
+        # nginx's object, the stack, the device's driver and the glue.
+        "nginx-fast": [ROOT / "target" / "nginx" / "nginx.o",
+                       ROOT / "target" / "f-stack" / "libfstack.a", VNET,
+                       ROOT / "target" / "f-stack" / "ff_stafeto_glue.o"],
         "openssl": [ROOT / "target" / "openssl" / "openssl.o"],
         "curl": [ROOT / "target" / "curl" / "curl.o"],
         "nginx": [ROOT / "target" / "nginx" / "nginx.o"],
@@ -824,6 +844,11 @@ def program_inputs() -> dict:
 # finds its SYSINIT, sysctl and module records in linker sets that only
 # __start_ and __stop_ references name: they keep their sections.
 PROGRAM_LINK = {"fstack-probe": ("-z", "nostart-stop-gc"),
+                # Without nostart-stop-gc --gc-sections drops the SYSINIT
+                # sets and the stack does not come up. A main stack of 1 MiB:
+                # the stack and OpenSSL (TLS under HTTP/2) run on the one
+                # thread of the worker.
+                "nginx-fast": ("-z", "nostart-stop-gc", "-z", "stack-size=1048576"),
                 # A main stack of 1 MiB (the default is 64 KiB): the stack
                 # of FreeBSD runs on the thread's stack under the program's.
                 "fast-layer": ("-z", "nostart-stop-gc", "-z", "stack-size=1048576")}
@@ -838,7 +863,8 @@ def build_programs(wanted_names: list) -> list:
         fail(f"unknown program {unknown[0]}")
     if not (SYSROOT / "lib" / "libc.so").exists():
         fail("build libc.so first: tools/build-libc-so.py build")
-    if not wanted_names or "fstack-probe" in wanted_names or "fast-layer" in wanted_names:
+    if (not wanted_names or "fstack-probe" in wanted_names or "fast-layer" in wanted_names
+            or "nginx-fast" in wanted_names):
         build_vnet()
     PROGRAMS.mkdir(parents=True, exist_ok=True)
     work = PROGRAMS / "obj"
@@ -873,6 +899,8 @@ def build_programs(wanted_names: list) -> list:
         why = good_checks(name, elf)
         if why:
             fail(f"program {name}: {why}")
+        if name == "nginx-fast":
+            fast_checks(elf)
         stamp.write_text(wanted)
         built.append(name)
     for name in built:

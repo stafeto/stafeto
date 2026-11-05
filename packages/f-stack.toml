@@ -24,6 +24,7 @@ license_file = "LICENSE"
 notices = [
   "ACKNOWLEDGEMENTS = target:f-stack/ACKNOWLEDGEMENTS",
   "FILES = target:f-stack/licences.txt",
+  "NOTICES = target:f-stack/NOTICES",
 ]
 build = "tools/build-fstack.py"
 files = [

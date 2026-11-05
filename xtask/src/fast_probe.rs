@@ -332,6 +332,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         Some("steps") => (true, &args[1..]),
         Some("crash") => return crash(&args[1..]),
         Some("layer") => return crate::fast_layer::command(&args[1..]),
+        Some("nginx") => return crate::fast_nginx::command(&args[1..]),
         _ => (false, args),
     };
     let machine = match rest {
@@ -341,7 +342,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "tcg" => &qemu::VIRT,
             other => qemu::machine(Some(&other.to_owned()))?,
         },
-        _ => return Err("usage: cargo xtask fast-probe [steps|layer] [tcg|hvf]".to_owned()),
+        _ => return Err("usage: cargo xtask fast-probe [steps|layer|nginx] [tcg|hvf]".to_owned()),
     };
     probe(machine, steps)
 }

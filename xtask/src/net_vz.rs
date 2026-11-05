@@ -44,6 +44,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::fast_nginx;
 use crate::fast_probe;
 use crate::net_curl;
 use crate::{
@@ -57,6 +58,8 @@ const LEASE_WITHIN: Duration = Duration::from_secs(20);
 const LEASE1_WITHIN: Duration = Duration::from_secs(30);
 /// The probe may take this long from the start of the machine.
 const RUN_WITHIN: Duration = Duration::from_secs(60 * 4);
+/// With nginx on the stack: the load of `wrk` takes 40 s of it.
+const RUN_WITHIN_NGINX: Duration = Duration::from_secs(60 * 7);
 /// The closed port must refuse within this long. The two seconds are for the
 /// behaviour of XNU: a RST that answers an ECN-setup SYN from a local peer is
 /// dropped, and the SYN is sent again without ECN after one second, whose
@@ -70,6 +73,11 @@ const REFUSAL_WITHIN: Duration = Duration::from_secs(2);
 /// the other sub-steps of the return keep 0.9 of term B.
 const RETURN_KIND: usize = 65;
 const RETURN_MAX: u64 = 1_200_000;
+/// The same after nginx on the stack served `wrk -c200` and was told to quit:
+/// the host's reset of a device that has just carried a load took 27 to 86 ms
+/// (the runs of stage P6b-3), against 16 to 20 ms of an idle one. 100 ms of
+/// the counter.
+const RETURN_MAX_AFTER_LOAD: u64 = 2_400_000;
 /// Whether a line of steps is one the host's reset of the device delays: a
 /// step of kind 65 with detail 1 (the reset) or 2 (the open), or, after the
 /// owner was killed, with detail 0 (whichever own step touches the device
@@ -260,15 +268,19 @@ struct Options {
     steps: bool,
     /// The second device goes to `fast-echo` (the image of the owner).
     fast: bool,
+    /// The second device goes to nginx on the stack (`--fast --static1`
+    /// with it): the image of `cargo xtask fast-probe nginx` on VZ.
+    nginx: bool,
 }
 
 fn options(args: &[String]) -> Result<Options, String> {
-    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps] [--fast]";
+    let usage = "usage: cargo xtask net-vz [--net 2] [--static1] [--steps] [--fast] [--nginx]";
     let mut found = Options {
         devices: 1,
         static1: false,
         steps: false,
         fast: false,
+        nginx: false,
     };
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
@@ -280,8 +292,16 @@ fn options(args: &[String]) -> Result<Options, String> {
                 found.fast = true;
                 found.devices = 2;
             }
+            "--nginx" => {
+                found.nginx = true;
+                found.fast = true;
+                found.devices = 2;
+            }
             _ => return Err(usage.to_owned()),
         }
+    }
+    if found.nginx && !found.static1 {
+        return Err("--nginx belongs to --static1 (the address of the page is fixed)".to_owned());
     }
     if found.static1 && found.devices != 2 {
         return Err("--static1 belongs to --net 2".to_owned());
@@ -289,7 +309,7 @@ fn options(args: &[String]) -> Result<Options, String> {
     Ok(found)
 }
 
-fn ping(
+pub(crate) fn ping(
     address: Ipv4Addr,
     count: u32,
     size: u32,
@@ -387,6 +407,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let (name, two) = match (options.devices, options.static1, options.steps) {
+        (_, _, false) if options.nginx => (fast_nginx::VZ_IMAGE, true),
+        (_, _, true) if options.nginx => (fast_nginx::VZ_STEPS_IMAGE, true),
         (_, false, false) if options.fast => (fast_probe::VZ_IMAGE, true),
         (_, true, false) if options.fast => (fast_probe::VZ_STATIC_IMAGE, true),
         (_, _, true) if options.fast => (fast_probe::VZ_STEPS_IMAGE, true),
@@ -396,19 +418,37 @@ pub fn command(args: &[String]) -> Result<(), String> {
         (_, true, false) => (net::VZ2_STATIC_IMAGE, true),
         (_, _, true) => (net::VZ2_STEPS_IMAGE, true),
     };
-    let programs = if options.fast {
+    let programs = if options.nginx {
+        fast_nginx::programs(if options.steps {
+            fast_nginx::Kind::VzSteps
+        } else {
+            fast_nginx::Kind::Vz
+        })
+    } else if options.fast {
         fast_probe::vz_programs(options.steps)
     } else if options.steps {
         net::vz_steps_programs(two)
     } else {
         net::vz_programs(two)
     };
+    // The probe CA of nginx's certificate (the images of nginx).
+    let ca = if options.nginx {
+        crate::probe_ca::ensure(false)?
+    } else {
+        std::path::PathBuf::new()
+    };
+    let ca_dir = crate::target_dir().join("fast-nginx");
+    if options.nginx {
+        std::fs::create_dir_all(&ca_dir).map_err(|e| format!("{}: {e}", ca_dir.display()))?;
+    }
     let image = build_boot_image(name, programs, BOOT_PROFILE)?;
     let suffix = vz::claim_suffix()?;
     let macs = [vz::mac(suffix.value, 0), vz::mac(suffix.value, 1)];
     let machine = vz::Machine {
         net: options.devices,
         mac_suffix: suffix.value,
+        // The pool of nginx's commands is large (init's table).
+        memory_mib: options.nginx.then_some(2048),
         ..vz::Machine::default()
     };
     let started = Instant::now();
@@ -431,17 +471,28 @@ pub fn command(args: &[String]) -> Result<(), String> {
             }
         }
         run.expect("# ", DIALOG_STEP)?;
-        run.send("httpd -f -p 80 -h /www & H=$!")?;
-        run.expect("# ", DIALOG_STEP)?;
-        let timing = net_curl::requests(http(guest), Instant::now())?;
+        // The shell of the image of nginx has the quota of one command for
+        // each process it runs (init's table): `httpd` and its eight children
+        // are the first device's checks of the other images, and nginx's
+        // own are below.
+        let timing = if options.nginx {
+            ping(guest, 2, 56, None)?;
+            None
+        } else {
+            run.send("httpd -f -p 80 -h /www & H=$!")?;
+            run.expect("# ", DIALOG_STEP)?;
+            Some(net_curl::requests(http(guest), Instant::now())?)
+        };
         // The guest has talked to the Mac: its address must be ours by the
         // ARP cache and by the DHCP service's file.
         arp_is(guest, &macs[0])?;
         lease_is_ours("net-vz", &macs[0], guest)?;
-        println!(
-            "net-vz: 20 requests in a row and 8 at once ok, {} ms median, {} ms the longest",
-            timing.0, timing.1
-        );
+        if let Some(timing) = timing {
+            println!(
+                "net-vz: 20 requests in a row and 8 at once ok, {} ms median, {} ms the longest",
+                timing.0, timing.1
+            );
+        }
         for (count, size, interval) in [(5, 56, None), (5, 1472, None), (200, 1472, Some("0.1"))] {
             let result = ping(guest, count, size, interval)?;
             println!(
@@ -457,17 +508,23 @@ pub fn command(args: &[String]) -> Result<(), String> {
                 ));
             }
         }
-        let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
-            .map_err(|e| format!("the request after the pings: {e}"))?;
-        net_curl::check_body(&body).map_err(|e| format!("after the pings: {e}"))?;
-        println!("net-vz: the service is alive after the pings");
+        if !options.nginx {
+            let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
+                .map_err(|e| format!("the request after the pings: {e}"))?;
+            net_curl::check_body(&body).map_err(|e| format!("after the pings: {e}"))?;
+            println!("net-vz: the service is alive after the pings");
+        }
         if options.devices == 2 {
             let second = second_device(&mut run, started, guest, options.static1, &macs[1])?;
-            let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
-                .map_err(|e| format!("the request with two devices: {e}"))?;
-            net_curl::check_body(&body).map_err(|e| format!("with two devices: {e}"))?;
-            println!("net-vz: HTTP to the first device passes with two devices");
-            if options.fast {
+            if !options.nginx {
+                let (body, _) = net_curl::get_within(http(guest), Duration::from_secs(10))
+                    .map_err(|e| format!("the request with two devices: {e}"))?;
+                net_curl::check_body(&body).map_err(|e| format!("with two devices: {e}"))?;
+                println!("net-vz: HTTP to the first device passes with two devices");
+            }
+            if options.nginx {
+                fast_nginx::vz_run(&mut run, second.address, &ca, &ca_dir)?;
+            } else if options.fast {
                 owner(&mut run, guest, second, options.static1, &macs[1])?;
             }
         }
@@ -482,7 +539,13 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }) {
         return Err("the network image faulted".into());
     }
-    if started.elapsed() > RUN_WITHIN {
+    if started.elapsed()
+        > if options.nginx {
+            RUN_WITHIN_NGINX
+        } else {
+            RUN_WITHIN
+        }
+    {
         return Err(format!(
             "the run took {:.0} s",
             started.elapsed().as_secs_f64()
@@ -525,6 +588,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
         }
         // The longest step of the return by its detail (1 reset, 2 open,
         // 3 and 4 the queues, 5 on the fill).
+        let bound = if options.nginx {
+            RETURN_MAX_AFTER_LOAD
+        } else {
+            RETURN_MAX
+        };
         let mut returns: std::collections::BTreeMap<u64, u64> = Default::default();
         for line in &back {
             let words: Vec<&str> = line.split_whitespace().collect();
@@ -539,9 +607,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
             }
         }
         println!(
-            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {RETURN_MAX})"
+            "net-vz steps: the steps of the return by detail: {returns:?} (the bound on VZ is {bound})"
         );
-        if let Some(row) = returns.iter().find(|r| *r.1 > RETURN_MAX) {
+        if let Some(row) = returns.iter().find(|r| *r.1 > bound) {
             return Err(format!("a step of the return past its bound: {row:?}"));
         }
     }

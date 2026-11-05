@@ -72,3 +72,63 @@ pub const FSTACK_DEVICE_TABLE: &[Record] = &[
     super::net::NET_TWO_TABLE[8],
     super::net::NET_TWO_TABLE[9],
 ];
+
+/// The quota of the launcher in the images of nginx on the stack, which the
+/// shell and its commands get too: the master of `nginx-fast` (6 MB of code
+/// and read-only data, the settings, the shared zones) and its worker (the
+/// zones of FreeBSD, the hashes, the wheel of callouts, the heap of the
+/// copies below the threshold, nginx's pools and buffers, OpenSSL under
+/// HTTP/2) run beside the shell.
+pub const FAST_COMMAND_QUOTA: u64 = 8192 * PAGE;
+
+/// The process service of the image of nginx on the stack: the pool of the
+/// shell's image and five quotas of a command, for the shell, the master,
+/// the worker, the new worker of a reload and a command of the probe.
+const FAST_PROCESS_SERVICE: Record = Record {
+    quota: POSIX_ABI_TABLE[1].quota + BUSYBOX_DIALOG_POOL + 5 * FAST_COMMAND_QUOTA,
+    ..super::net::NET_TWO_TABLE[2]
+};
+
+const FAST_LAUNCHER: Record = Record {
+    quota: FAST_COMMAND_QUOTA,
+    ..super::net::NET_TWO_TABLE[5]
+};
+
+/// The image with both network devices on QEMU and `nginx-fast` (`cargo
+/// xtask fast-probe nginx`).
+pub const FAST_NGINX_TABLE: &[Record] = &[
+    super::net::NET_TWO_TABLE[0],
+    super::net::NET_TWO_TABLE[1],
+    FAST_PROCESS_SERVICE,
+    super::net::NET_TWO_TABLE[3],
+    super::net::NET_TWO_TABLE[4],
+    FAST_LAUNCHER,
+    super::net::NET_TWO_TABLE[6],
+    super::net::NET_TWO_TABLE[7],
+    super::net::NET_TWO_TABLE[8],
+    super::net::NET_TWO_TABLE[9],
+];
+
+const FAST_VZ_PROCESS_SERVICE: Record = Record {
+    quota: POSIX_ABI_TABLE[1].quota + BUSYBOX_DIALOG_POOL + 5 * FAST_COMMAND_QUOTA,
+    ..super::net::NET_VZ2_TABLE[2]
+};
+
+const FAST_VZ_LAUNCHER: Record = Record {
+    quota: FAST_COMMAND_QUOTA,
+    ..super::net::NET_VZ2_TABLE[5]
+};
+
+/// The same on Apple VZ (`cargo xtask net-vz --fast --nginx`).
+pub const FAST_NGINX_VZ_TABLE: &[Record] = &[
+    super::net::NET_VZ2_TABLE[0],
+    super::net::NET_VZ2_TABLE[1],
+    FAST_VZ_PROCESS_SERVICE,
+    super::net::NET_VZ2_TABLE[3],
+    super::net::NET_VZ2_TABLE[4],
+    FAST_VZ_LAUNCHER,
+    super::net::NET_VZ2_TABLE[6],
+    super::net::NET_VZ2_TABLE[7],
+    super::net::NET_VZ2_TABLE[8],
+    super::net::NET_VZ2_TABLE[9],
+];

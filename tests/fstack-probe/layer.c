@@ -1111,6 +1111,105 @@ rules_busy(int t)
     ok("claim_wait_signal");
 }
 
+/* What the calls on a ticket answer while the stack is being started by
+ * another thread, which waits for the device that another process holds:
+ * the handler of a signal that runs on the starting thread gets EAGAIN, and a
+ * second thread waits for the start and then gets the answer of the stack's
+ * socket (EAGAIN for an empty queue). Neither hangs, neither gets EINTR. */
+static volatile int alarm_hits, alarm_result, alarm_errno;
+static volatile int thread_result, thread_errno;
+static int thread_ticket;
+
+static void
+on_alarm_in_start(int sig)
+{
+    (void)sig;
+    errno = 0;
+    alarm_result = accept(thread_ticket, NULL, NULL);
+    alarm_errno = errno;
+    alarm_hits++;
+}
+
+static void *
+accept_thread(void *arg)
+{
+    struct timespec nap = { 0, 300 * 1000 * 1000 };
+    sigset_t blocked;
+
+    (void)arg;
+    /* The alarm goes to the thread that starts the stack. */
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &blocked, NULL);
+    nanosleep(&nap, NULL);
+    errno = 0;
+    thread_result = accept(thread_ticket, NULL, NULL);
+    thread_errno = errno;
+    return NULL;
+}
+
+static void
+rules_threads(int t)
+{
+    int held[2], ready[2];
+    pid_t holder, waiter;
+    char byte;
+
+    REQUIRE(pipe(held) == 0 && pipe(ready) == 0);
+    holder = fork();
+    REQUIRE(holder >= 0);
+    if (holder == 0) {
+        struct epoll_event ev;
+        struct timespec hold = { 3, 0 };
+        int e = epoll_create1(0);
+
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        if (e < 0 || epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != 0)
+            _exit(2);
+        if (write(held[1], "h", 1) != 1)
+            _exit(3);
+        nanosleep(&hold, NULL);
+        _exit(0);
+    }
+    REQUIRE(read(held[0], &byte, 1) == 1);
+    waiter = fork();
+    REQUIRE(waiter >= 0);
+    if (waiter == 0) {
+        struct sigaction sa;
+        struct epoll_event ev;
+        pthread_t thread;
+        int e;
+
+        thread_ticket = t;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_alarm_in_start;
+        if (sigaction(SIGALRM, &sa, NULL) != 0)
+            _exit(2);
+        memset(&ev, 0, sizeof(ev));
+        ev.events = EPOLLIN;
+        e = epoll_create1(0);
+        if (e < 0 || write(ready[1], "r", 1) != 1)
+            _exit(3);
+        if (pthread_create(&thread, NULL, accept_thread, NULL) != 0)
+            _exit(4);
+        alarm(1);
+        if (epoll_ctl(e, EPOLL_CTL_ADD, t, &ev) != 0)
+            _exit(errno == EINTR ? 5 : 6);
+        if (pthread_join(thread, NULL) != 0)
+            _exit(7);
+        if (alarm_hits != 1 || alarm_result != -1 || alarm_errno != EAGAIN)
+            _exit(8);
+        if (thread_result != -1 || thread_errno != EAGAIN)
+            _exit(9);
+        _exit(0);
+    }
+    REQUIRE(read(ready[0], &byte, 1) == 1);
+    REQUIRE(wait_child(waiter) == 0);
+    REQUIRE(wait_child(holder) == 0);
+    ok("claim_threads");
+}
+
 /* The process that holds the stack. */
 static void
 rules_stack(int t)
@@ -1315,6 +1414,7 @@ rules_mode(void)
     rules_fork(t);
     rules_nobody(t);
     rules_busy(t);
+    rules_threads(t);
     rules_stack(t);
     rules_watch(t);
     printf("fast-layer: rules passed\n");

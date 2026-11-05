@@ -32,8 +32,10 @@
 //!    the process ends allows;
 //! 8. `fast-layer --rules`: what the tickets answer, `fork` before the stack,
 //!    a process of nobody refused, the claim that waits for another's device
-//!    while a signal runs its handler (no EINTR), and the refusals of the
-//!    process that holds the stack;
+//!    while a signal runs its handler (no EINTR), the same wait with the
+//!    handler calling `accept` on the ticket (EAGAIN) and a second thread
+//!    that calls it during the start (it waits, then EAGAIN), and the refusals
+//!    of the process that holds the stack;
 //! 9. `fast-layer --loss`: the echo is served, then the network service is
 //!    made to fault: the process ends with status 2 within two seconds after
 //!    the line of the layer (the glue's table asks to end on the loss).
@@ -93,6 +95,7 @@ pub const RULES: &[&str] = &[
     "fork_before_stack",
     "nobody_refused",
     "claim_wait_signal",
+    "claim_threads",
     "ticket_made",
     "ticket_refused",
     "stack_rules",

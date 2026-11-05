@@ -102,6 +102,13 @@ pub struct Package {
 }
 
 impl Package {
+    /// Whether the package needs the network and the second device both,
+    /// so only the images with the network service hold it (nginx on the
+    /// stack).
+    pub fn needs_network_device(&self) -> bool {
+        self.group() == Group::Fstack && self.needs.iter().any(|n| n == "net")
+    }
+
     /// The group of the build and of the images (spec 5, 3.3 and the
     /// note of stage PK0, R12.2).
     pub fn group(&self) -> Group {
@@ -636,6 +643,7 @@ pub fn check() -> Result<(), String> {
         "boot-nginx-bench.img",
         "boot-nginx-bench-vz-nobuf.img",
         "boot-net-bench.img",
+        "boot-fast-nginx.img",
     ] {
         crate::rootfs::check_owners(image, &crate::rootfs::files_of(image), &of_image(image)?)?;
     }
@@ -701,10 +709,21 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
     let of = |groups: &[Group]| -> Result<Vec<Package>, String> {
         Ok(load()?
             .into_iter()
-            .filter(|p| groups.contains(&p.group()))
+            .filter(|p| groups.contains(&p.group()) && !p.needs_network_device())
             .collect())
     };
     match name {
+        // The images of nginx on the stack (`cargo xtask fast-probe nginx`
+        // and `cargo xtask net-vz --fast --nginx`) hold the packages of the
+        // images with the network and those that need the second device.
+        "boot-fast-nginx.img"
+        | "boot-fast-nginx-crash.img"
+        | "boot-fast-nginx-steps.img"
+        | "boot-fast-nginx-vz.img"
+        | "boot-fast-nginx-vz-steps.img" => Ok(load()?
+            .into_iter()
+            .filter(|p| [Group::Base, Group::Addon, Group::Fstack, Group::Net].contains(&p.group()))
+            .collect()),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
         "boot-net.img"
         | "boot-net-curl-steps.img"
@@ -1068,20 +1087,50 @@ files = [
         let probe = of_image("boot-fstack-probe.img").unwrap();
         assert!(probe.iter().any(|p| p.name == "f-stack"));
         assert!(probe.iter().all(|p| p.group() != Group::Net));
+        // nginx on the stack is in the images with both devices and nowhere
+        // else.
+        for image in [
+            "boot-net.img",
+            "boot-fstack-probe.img",
+            "boot-fast-layer.img",
+        ] {
+            let held = of_image(image).unwrap();
+            assert!(held.iter().all(|p| p.name != "nginx-fast"), "{image}");
+        }
+        for image in [
+            "boot-fast-nginx.img",
+            "boot-fast-nginx-crash.img",
+            "boot-fast-nginx-steps.img",
+            "boot-fast-nginx-vz.img",
+            "boot-fast-nginx-vz-steps.img",
+        ] {
+            let held = of_image(image).unwrap();
+            assert!(held.iter().any(|p| p.name == "nginx-fast"), "{image}");
+            assert!(held.iter().any(|p| p.name == "nginx"), "{image}");
+        }
     }
 
     #[test]
     fn the_descriptions_of_the_workspace_are_good() {
         let packages = load().unwrap();
-        assert_eq!(packages.len(), 22);
+        assert_eq!(packages.len(), 23);
         let get = |n: &str| packages.iter().find(|p| p.name == n).unwrap();
         assert_eq!(get("busybox").group(), Group::Base);
         assert_eq!(get("nano").group(), Group::Addon);
         assert_eq!(get("f-stack").group(), Group::Fstack);
         assert_eq!(get("curl").kind, Kind::Base);
         assert_eq!(get("nginx").build_depends, ["openssl", "pcre2"]);
+        // nginx on the stack: F-Stack's package and notices travel with it.
+        let fast = get("nginx-fast");
+        assert_eq!(fast.group(), Group::Fstack);
+        assert_eq!(fast.kind, Kind::Optional);
+        assert_eq!(fast.depends, ["f-stack"]);
+        assert_eq!(fast.build_depends, ["f-stack", "openssl", "pcre2"]);
+        assert_eq!(fast.needs, ["net"]);
+        assert!(fast.needs_network_device());
+        assert!(get("f-stack").notices.iter().any(|n| n.0 == "NOTICES"));
         assert_eq!(get("doomgeneric").provides, ["doom"]);
-        assert_eq!(get("f-stack").notices.len(), 2);
+        assert_eq!(get("f-stack").notices.len(), 3);
         assert!(packages.iter().all(|p| p.release == "1"));
     }
 }

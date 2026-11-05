@@ -45,10 +45,15 @@ pub fn terms() -> Result<(Vec<u8>, String), String> {
     let mut licence = crate::notices::licence_text("f-stack")?;
     licence.extend_from_slice(b"\n");
     licence.extend(read("ACKNOWLEDGEMENTS")?);
+    // The copyright lines and terms of the files the stack compiled
+    // (tools/build-fstack.py): the second condition of every BSD licence.
+    licence.extend_from_slice(b"\n");
+    licence.extend(read("NOTICES")?);
     let url = crate::packages::value("f-stack", "url")?;
     let sha256 = crate::packages::value("f-stack", "sha256")?;
     let source = format!(
-        "fstack-probe holds F-Stack (the TCP/IP stack of FreeBSD 15 in user space),\n\
+        "The image holds F-Stack (the TCP/IP stack of FreeBSD 15 in user space) in\n\
+         fstack-probe, fast-layer and nginx-fast,\n\
          under BSD-2-Clause, BSD-3-Clause, BSD-4-Clause, RSA-MD, Beerware, MIT-CMU,\n\
          ISC and MIT (FSTACK-LICENSE).\n\n\
          Its source: {url}\n\

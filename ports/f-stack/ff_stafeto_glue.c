@@ -32,6 +32,8 @@
 
 #define CONF "/etc/fstack.ini"
 
+void ff_stafeto_counters(uint64_t *dropped, uint64_t *ticks, uint64_t *pass_count);
+
 _Static_assert(sizeof(struct kevent) == 64, "struct kevent of FreeBSD");
 
 /* The flags of a message: Linux's from the layer, FreeBSD's for the stack. */
@@ -69,6 +71,36 @@ flags_of(int linux_flags)
     return r;
 }
 
+/*
+ * With STAFETO_FAST_STATS in the environment the process says every 500 ticks
+ * of the stack's clock (5 s) how often the device's notifications woke the
+ * stack and how many steps it made, in totals (the probes subtract two lines
+ * and divide by the time between them). A process that ends by exit() runs
+ * no handler of the library here, so the totals are said as they stand.
+ */
+static int stats_on;
+static uint64_t stats_said;
+
+static void
+glue_stats(void)
+{
+    struct ff_stafeto_device_stats st;
+    uint64_t dropped, ticks, passes;
+
+    ff_stafeto_counters(&dropped, &ticks, &passes);
+    if (ticks < stats_said + 500)
+        return;
+    stats_said = ticks;
+    ff_stafeto_device_stats(&st);
+    fprintf(stderr,
+        "fast: stats ticks=%llu notifications=%llu kicks=%llu sleeps=%llu found_work=%llu passes=%llu rx=%llu tx=%llu\n",
+        (unsigned long long)ticks, (unsigned long long)st.notifications,
+        (unsigned long long)st.kicks, (unsigned long long)st.sleeps,
+        (unsigned long long)st.sleeps_found_work, (unsigned long long)passes,
+        (unsigned long long)st.rx_frames, (unsigned long long)st.tx_frames);
+    fflush(stderr);
+}
+
 static int
 glue_start(const struct stafeto_fast_claim *claim)
 {
@@ -82,13 +114,18 @@ glue_start(const struct stafeto_fast_claim *claim)
         claim->config.address[1], claim->config.address[2], claim->config.address[3],
         claim->config.prefix);
     fflush(stderr);
+    stats_on = getenv("STAFETO_FAST_STATS") != NULL;
     return 0;
 }
 
 static int
 glue_pass(void)
 {
-    return ff_stafeto_pass();
+    int work = ff_stafeto_pass();
+
+    if (stats_on)
+        glue_stats();
+    return work;
 }
 
 static uint64_t

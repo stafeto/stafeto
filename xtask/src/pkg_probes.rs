@@ -265,8 +265,14 @@ pub fn dist_licenses() -> Result<(), String> {
     }
     let n = repo::check(&dir, &[crate::keys::dev_keys(&crate::root())?.root])?;
     say(&format!(
-        "the notices of F-Stack are in its packages alone, {n} packages pass the policy"
+        "the notices of F-Stack are in {marked:?} alone, {n} packages pass the policy"
     ));
+    // The package that links F-Stack carries them with it.
+    if !marked.contains("nginx-fast") {
+        return Err(
+            "dist-licenses: nginx-fast links F-Stack and carries none of its notices".into(),
+        );
+    }
     // 5: the sources of the GPL packages.
     crate::run_cmd(
         Command::new("python3")

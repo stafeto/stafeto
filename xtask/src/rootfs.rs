@@ -247,7 +247,7 @@ static UTMPX: [u8; 96] = {
 /// The files the base system owns in the shell image (init and the
 /// services): their directories, the RAM service and the files of the
 /// accounts and the device nodes. Every other file belongs to a package.
-const SYSTEM_PATHS: [&str; 49] = [
+const SYSTEM_PATHS: [&str; 53] = [
     "/bin",
     "/lib",
     "/lib/libc.so",
@@ -301,7 +301,15 @@ const SYSTEM_PATHS: [&str; 49] = [
     // The image of `nginx-probe`: the files it fetches and the setting of
     // nginx with one listening socket for all the workers.
     "/www/10k.bin",
+    // ... and the file of 1 MiB of the download of nginx on the stack.
+    "/www/1m.bin",
+    // ... and the small page whose answer times the wake of the idle loop.
+    "/www/tiny.txt",
     "/etc/nginx/exclusive.conf",
+    // The images of nginx on the stack: the variant of its settings that
+    // runs the worker under nobody.
+    "/etc/nginx/nginx-fast-nobody.conf",
+    "/etc/nginx/nginx-fast-sndbuf.conf",
     // ... and nginx's server of TLS with the key and the certificate the
     // probe CA made for it.
     "/etc/nginx/tls.conf",
@@ -467,6 +475,7 @@ fn named_bytes(name: &str) -> Result<&'static [u8], String> {
         "ca-certificates.crt" => Ok(crate::net_tls::ca_bundle()),
         "mime.types" => Ok(crate::nginx_probe::mime_types()),
         "nginx.conf" => Ok(crate::nginx_probe::NGINX_CONF.as_bytes()),
+        "nginx-fast.conf" => Ok(crate::fast_nginx::NGINX_FAST_CONF.as_bytes()),
         other => Err(format!("no bytes are named {other}")),
     }
 }
@@ -1102,6 +1111,102 @@ fn nginx_files(image: &str) -> Vec<RootFile> {
     files
 }
 
+/// The files of the images of nginx on the stack (`cargo xtask fast-probe
+/// nginx`, `net-vz --fast --nginx`): those of the shell with the network, with
+/// the probe's variant of the settings of `nginx-fast` in place of the
+/// package's, the variant under nobody, the files of 10 KiB and 256 KiB the
+/// probe fetches, the second device's fixed address in `netd.conf`, and the
+/// server of TLS with the probe CA's certificate and key.
+fn fast_nginx_files(image: &str) -> Vec<RootFile> {
+    let mut files = net_files(image);
+    let settings = files
+        .iter_mut()
+        .find(|f| f.path == "/etc/nginx/nginx-fast.conf")
+        .unwrap_or_else(|| panic!("{image}: no /etc/nginx/nginx-fast.conf"));
+    settings.source = Some(Source::Bytes(
+        "nginx-fast-probe.conf",
+        crate::fast_nginx::probe_conf().as_bytes(),
+    ));
+    files.extend([
+        of(
+            "/etc/nginx/nginx-fast-nobody.conf",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-fast-nobody.conf",
+                crate::fast_nginx::nobody_conf().as_bytes(),
+            ),
+        ),
+        of(
+            crate::fast_nginx::SNDBUF_CONF,
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "nginx-fast-sndbuf.conf",
+                crate::fast_nginx::sndbuf_conf().as_bytes(),
+            ),
+        ),
+        of(
+            "/www/10k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-10k", crate::nginx_probe::www_10k()),
+        ),
+        of(
+            "/www/256k.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("www-256k", crate::net_tls::big_file()),
+        ),
+        of(
+            "/www/1m.bin",
+            0o644,
+            ROOT,
+            Source::Bytes("www-1m", crate::fast_nginx::one_mib()),
+        ),
+        of(
+            "/www/tiny.txt",
+            0o644,
+            ROOT,
+            Source::Bytes("www-tiny", crate::fast_nginx::TINY),
+        ),
+        of(
+            "/etc/netd.conf",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "netd.conf",
+                if image == crate::fast_nginx::VZ_IMAGE
+                    || image == crate::fast_nginx::VZ_STEPS_IMAGE
+                {
+                    crate::fast_probe::NETD_CONF_VZ_STATIC
+                } else {
+                    crate::fstack_device::NETD_CONF
+                },
+            ),
+        ),
+        of(
+            crate::nginx_probe::TLS_CONF_PATH,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx-tls.conf", crate::nginx_probe::TLS_CONF.as_bytes()),
+        ),
+        of(
+            crate::nginx_probe::SERVER_CRT,
+            0o644,
+            ROOT,
+            Source::Bytes("nginx.crt", crate::probe_ca::nginx_certificate()),
+        ),
+        of(
+            crate::nginx_probe::SERVER_KEY,
+            0o600,
+            ROOT,
+            Source::Bytes("nginx.key", crate::probe_ca::nginx_key()),
+        ),
+    ]);
+    files
+}
+
 /// The files of the images of nginx's measurement (`nginx-bench`): those of
 /// the shell with the network (nginx with the package's settings among
 /// them), the variant of the settings with one listening socket, the files
@@ -1210,6 +1315,11 @@ pub const IMAGES: &[&str] = &[
     "boot-nginx-bench-nobuf.img",
     "boot-nginx-bench-vz.img",
     "boot-nginx-bench-vz-nobuf.img",
+    "boot-fast-nginx.img",
+    "boot-fast-nginx-crash.img",
+    "boot-fast-nginx-steps.img",
+    "boot-fast-nginx-vz.img",
+    "boot-fast-nginx-vz-steps.img",
     "boot-net-vz.img",
     "boot-net-vz2.img",
     "boot-net-vz2-static.img",
@@ -1338,6 +1448,18 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-nginx-probe.img" | "boot-nginx-probe-steps.img" => nginx_files(name),
+        "boot-fast-nginx.img"
+        | "boot-fast-nginx-crash.img"
+        | "boot-fast-nginx-steps.img"
+        | "boot-fast-nginx-vz.img"
+        | "boot-fast-nginx-vz-steps.img" => {
+            let mut files = fast_nginx_files(name);
+            // The method that makes the service fault is `fast-echo`'s.
+            if name == crate::fast_nginx::CRASH_IMAGE {
+                files.push(file("/bin/fast-echo", 0o755, ROOT, "fast-echo"));
+            }
+            files
+        }
         "boot-nginx-bench.img"
         | "boot-nginx-bench-nobuf.img"
         | "boot-nginx-bench-vz.img"
@@ -1910,6 +2032,21 @@ mod tests {
                     crate::net_curl::steps_programs()
                 }
                 "boot-net-tls.img" => crate::net::programs(),
+                "boot-fast-nginx.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Plain)
+                }
+                "boot-fast-nginx-crash.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Crash)
+                }
+                "boot-fast-nginx-steps.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Steps)
+                }
+                "boot-fast-nginx-vz.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz)
+                }
+                "boot-fast-nginx-vz-steps.img" => {
+                    crate::fast_nginx::programs(crate::fast_nginx::Kind::VzSteps)
+                }
                 "boot-nginx-probe.img" => crate::nginx_probe::programs(),
                 "boot-nginx-probe-steps.img" => crate::nginx_probe::steps_programs(),
                 "boot-nginx-bench.img" | "boot-nginx-bench-nobuf.img" => {
