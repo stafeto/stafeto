@@ -50,6 +50,7 @@ mod htop_dialog;
 mod image;
 mod input_probe;
 mod jobs;
+mod linux_guest;
 mod measure;
 mod monitor;
 mod nano_dialog;
@@ -1743,6 +1744,14 @@ commands:
             one listening socket, the guest's reads of the files; `host`
             runs the load against Homebrew's nginx; table and raw output in
             target/nginx-bench/
+  linux-guest build|run|check  the Linux guest of the measurement of the
+            network (stage P7; Alpine 3.24 packages pinned in
+            tools/linux-guest/alpine.lock, built on this Mac and never
+            shipped): `build` makes target/linux-guest/, `run` boots it on
+            Apple VZ with its shell on the terminal, `check` boots it and
+            stafeto's image of the measurement (four CPUs, 1 GiB each) and
+            compares the versions of nginx and OpenSSL, the fingerprint of
+            `nginx -T` and the SHA-256 of /www, and fetches every file
   posix-net [steps] [MACHINE] run `posix-net` in the guest: the limit of 1 024
             descriptors, 1 000 sockets, a fork and an exec with many
             descriptors, epoll, poll and select over many descriptors; with
@@ -2012,6 +2021,7 @@ fn main() {
         Some("net-curl") => net_curl::command(&args[1..]),
         Some("nginx-probe") => nginx_probe::command(&args[1..]),
         Some("nginx-bench") => nginx_bench::command(&args[1..]),
+        Some("linux-guest") => linux_guest::command(&args[1..]),
         Some("net-vz") => net_vz::command(&args[1..]),
         Some("net-wget") => net_wget::command(&args[1..]),
         Some("net-tls") => net_tls::command(&args[1..]),
@@ -9019,6 +9029,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_os_test_headers.py",
         "tools/test_ca_bundle.py",
         "tools/test_nginx_answer.py",
+        "tools/test_linux_guest.py",
     ] {
         run_cmd(Command::new("python3").arg(root().join(script)))?;
     }

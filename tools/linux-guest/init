@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The init of the Linux guest of the measurement of the network
+# (tools/build-linux-guest.py): the network on the first Virtio device,
+# nginx with the settings of stafeto's image, iperf3, and a shell on the
+# console with a constant prompt, where xtask types its commands. The kernel
+# settings stay at their defaults.
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mkdir -p /run/nginx
+# The kernel's own lines stay on the console at the level of warnings.
+dmesg -n 4
+
+for module in failover net_failover virtio_net af_packet; do
+    insmod /lib/modules/$module.ko || echo "linux-guest: insmod $module failed"
+done
+ip link set lo up
+ip link set eth0 up
+
+tries=0
+while [ $tries -lt 5 ]; do
+    udhcpc -i eth0 -n -q -t 5 -T 2 -s /usr/share/udhcpc/default.script && break
+    tries=$((tries + 1))
+done
+
+address=$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1)
+echo "linux-guest: address $address"
+echo "linux-guest: mac $(cat /sys/class/net/eth0/address)"
+echo "linux-guest: features $(cat /sys/class/net/eth0/device/features 2>/dev/null)"
+echo "linux-guest: kernel $(uname -r)"
+echo "linux-guest: cpus $(nproc)"
+
+nginx -c /etc/nginx/nginx.conf &
+iperf3 -s -D > /dev/null 2>&1
+echo "linux-guest: ready"
+
+export PS1='# '
+exec sh < /dev/hvc0 > /dev/hvc0 2>&1

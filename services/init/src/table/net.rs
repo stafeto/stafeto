@@ -489,7 +489,7 @@ const _: () = assert!(str_eq(
 /// The launcher of the shell with a session with the network service: the
 /// shell and its commands get the same (the launcher's connections are the
 /// shell's).
-const NET_LAUNCHER: Record = Record {
+pub const NET_LAUNCHER: Record = Record {
     connects: &[
         "ramfs",
         "tty",

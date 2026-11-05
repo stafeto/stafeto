@@ -1256,7 +1256,7 @@ fn buffers_note(run: &mut qemu::Run, when: &str) -> Result<Row, String> {
 /// `vz-run` with the same MAC suffix would share the lease on the NAT
 /// and take it over in the middle of a stage; the run claims a suffix
 /// of its own.
-fn other_guests(own: usize) -> String {
+pub(crate) fn other_guests(own: usize) -> String {
     let guests = guests();
     let load = Command::new("sysctl")
         .args(["-n", "vm.loadavg"])

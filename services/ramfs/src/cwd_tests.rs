@@ -473,8 +473,10 @@ fn result_chain_81_pages_boundary_and_two_page_chunk_have_exact_live_ownership()
             left -= n;
         }
     }
-    assert_eq!(pages.count, 81);
-    assert_eq!(pages.length, 328705);
+    // The chain holds one name of 256 bytes for each node but the root: its
+    // length follows `NODES` (2 309 with the 2 048 entries of the boot image).
+    assert_eq!(pages.length as usize, 256 * (crate::storage::NODES - 1) + 1);
+    assert_eq!(pages.count, 145);
     let before = ram.storage.available();
     assert_eq!(
         ram.storage.cwd_result_allocate(&mut pages),

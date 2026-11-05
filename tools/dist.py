@@ -270,6 +270,40 @@ def cache_name(description: dict) -> str:
     return f"{description['name']}-{description['version']}-{base}"
 
 
+# What of the Linux guest of the measurement (tools/build-linux-guest.py) a
+# release must not hold: the Alpine packages, the unpacked kernel and the
+# initramfs. The guest is built on the owner's Mac for the measurement and is
+# never shipped (its kernel and BusyBox are GPL-2.0-only, and shipping them
+# would owe their sources). Our build script, the lock and the init are source
+# files of the repository and ship with it.
+GUEST_NAMES = re.compile(r"(^|/)(target/linux-guest(/|$)|initramfs\.cpio|vmlinuz)|\.apk$")
+
+
+def refuse_linux_guest(out: Path, guest: Path) -> None:
+    """Stops the release if a file of it is a file of the Linux guest: by the
+    name of a member of an archive, or by the SHA-256 of its bytes against
+    the Image and the initramfs of `guest` (target/linux-guest) if built."""
+    secret = {}
+    for name in ("Image", "initramfs.cpio.gz"):
+        if (guest / name).is_file():
+            secret[sha256_file(guest / name)] = name
+    for path in sorted(out.iterdir()):
+        if GUEST_NAMES.search(path.name):
+            raise SystemExit(f"dist: {path.name} is a file of the Linux guest")
+        if secret and path.is_file() and sha256_file(path) in secret:
+            raise SystemExit(f"dist: {path.name} is the {secret[sha256_file(path)]} of the Linux guest")
+        if not path.name.endswith((".tar.xz", ".tar")):
+            continue
+        with tarfile.open(path) as tar:
+            for member in tar:
+                if GUEST_NAMES.search(member.name):
+                    raise SystemExit(f"dist: {path.name} holds {member.name}, a file of the Linux guest")
+                if member.isfile() and secret:
+                    digest = hashlib.sha256(tar.extractfile(member).read()).hexdigest()
+                    if digest in secret:
+                        raise SystemExit(f"dist: {path.name} holds {member.name}, which is the {secret[digest]} of the Linux guest")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
@@ -308,6 +342,7 @@ def main() -> None:
 
     (out / f"stafeto-{version}-sbom.spdx.json").write_text(
         json.dumps(sbom(version, relibc_commit(), cache), indent=2) + "\n")
+    refuse_linux_guest(out, ROOT / "target" / "linux-guest")
     lines = [f"{sha256_file(p)}  {p.name}" for p in sorted(out.iterdir())]
     (out / "SHA256SUMS").write_text("\n".join(lines) + "\n")
     shutil.rmtree(work)

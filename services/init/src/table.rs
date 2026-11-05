@@ -249,6 +249,12 @@ pub const GENERAL_CPUS: u8 = 0b0011;
 pub const NETD_CPUS: u8 = 0b0001;
 /// The CPUs of the tasks of realtime, away from the ordinary processes.
 pub const RT_CPUS: u8 = 0b1100;
+/// The CPUs of the shell and its processes in the image of the measurement
+/// of stage P7 (`bench::BENCH_VZ_TABLE`): all four, as the Linux guest it is
+/// measured against has them. That image has no tasks of realtime, so the
+/// decision of the SMP stage for the other images stands, and no table but
+/// `bench.rs` names this constant.
+pub const BENCH_CPUS: u8 = 0b1111;
 /// Every CPU that is up: a record with it is cut to the CPUs the machine
 /// has (the process service has them all, to give its processes the CPUs
 /// they may use).
@@ -914,6 +920,7 @@ fn order(table: &[Record]) -> Order {
     order
 }
 
+pub mod bench;
 pub mod ceiling;
 pub mod cycle;
 pub mod doom;
@@ -973,6 +980,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-pci-walk-vz") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
+    + cfg!(feature = "table-bench-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1033,6 +1041,7 @@ const _: () = assert!(
     feature = "table-pci-walk-vz",
     feature = "table-net-vz",
     feature = "table-net-vz2",
+    feature = "table-bench-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1127,6 +1136,8 @@ pub const TABLE: &[Record] = net::NET_PROBE_TABLE;
 pub const TABLE: &[Record] = net::NET_VZ_TABLE;
 #[cfg(feature = "table-net-vz2")]
 pub const TABLE: &[Record] = net::NET_VZ2_TABLE;
+#[cfg(feature = "table-bench-vz")]
+pub const TABLE: &[Record] = bench::BENCH_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -1870,6 +1881,7 @@ mod tests {
             net::NET_PROBE_TABLE,
             net::NET_VZ_TABLE,
             net::NET_VZ2_TABLE,
+            bench::BENCH_VZ_TABLE,
             net::NET_PROBE_TWO_TABLE,
             net::NET_TWO_TABLE,
             doom::TABLE,
@@ -2100,6 +2112,126 @@ mod tests {
                 "busybox-probe"
             ]
         );
+    }
+
+    /// The image of the measurement of stage P7 is the network image of VZ
+    /// with the launcher of the shell on all four CPUs; the network service
+    /// stays on the boot CPU and the services on the CPUs of the services.
+    #[test]
+    fn the_bench_image_differs_from_the_network_image_of_vz_in_the_launcher_alone() {
+        assert_eq!(order_of(bench::BENCH_VZ_TABLE), order_of(net::NET_VZ_TABLE));
+        assert_eq!(BENCH_CPUS, 0b1111);
+        assert_eq!(bench::BENCH_LAUNCHER.name, net::NET_LAUNCHER.name);
+        assert_eq!(
+            bench::BENCH_VZ_TABLE
+                .iter()
+                .filter(|r| r.cpus == BENCH_CPUS)
+                .count(),
+            1
+        );
+        for (bench, net) in bench::BENCH_VZ_TABLE.iter().zip(net::NET_VZ_TABLE) {
+            if bench.name == bench::BENCH_LAUNCHER.name {
+                assert_eq!(bench.cpus, BENCH_CPUS);
+                assert_eq!(
+                    Record {
+                        cpus: net.cpus,
+                        ..*bench
+                    },
+                    *net
+                );
+            } else {
+                assert_eq!(bench, net, "{}", bench.name);
+            }
+        }
+        let netd = bench::BENCH_VZ_TABLE
+            .iter()
+            .find(|r| r.name == NET_SERVICE)
+            .unwrap();
+        assert_eq!(netd.cpus, NETD_CPUS);
+    }
+
+    /// No other table names `BENCH_CPUS`: not by the constant (a scan of the
+    /// sources of `table/`), and not by the value (every record of every
+    /// other table stands on a mask of the SMP decision or on a mask of a
+    /// test image's own, which is none of the four CPUs).
+    #[test]
+    fn only_the_bench_table_stands_on_the_bench_cpus() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/table");
+        let mut users = Vec::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("BENCH_CPUS")
+            {
+                users.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert_eq!(users, ["bench.rs"]);
+        for table in all_tables() {
+            for r in table {
+                assert_ne!(r.cpus, BENCH_CPUS, "{}", r.name);
+            }
+        }
+    }
+
+    /// Every table of the images but the bench table (feature-gated tables
+    /// are listed as they stand in a test build).
+    fn all_tables() -> Vec<&'static [Record]> {
+        vec![
+            normal::TABLE,
+            cycle::TABLE,
+            ceiling::TABLE,
+            test::TABLE,
+            lock_ring::TABLE,
+            doom::TABLE,
+            gpu::TABLE,
+            input::TABLE,
+            entropy::TABLE,
+            entropy::VZ_TABLE,
+            fstack::FSTACK_TABLE,
+            fstack::FSTACK_DEVICE_TABLE,
+            net::NET_TABLE,
+            net::NET_TWO_TABLE,
+            net::NET_VZ_TABLE,
+            net::NET_VZ2_TABLE,
+            net::NET_PROBE_TABLE,
+            net::NET_PROBE_TWO_TABLE,
+            vz::TABLE,
+            vz::PCI_WALK_TABLE,
+            vz::POSIX_ABI_TABLE,
+            vz::POSIX_NATIVE_TABLE,
+            vz::BUSYBOX_DIALOG_TABLE,
+            vz::POSIX_TTY_TABLE,
+            vz::POSIX_DIALOG_TABLE,
+            vz::RTBENCH_TABLE,
+            vz::RTBENCH_POSIX_TABLE,
+            vz::TTY_TABLE,
+            ramfs::TABLE,
+            ramfs::BUSYBOX_TABLE,
+            ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_TTY_TABLE,
+            ramfs::POSIX_DIALOG_TABLE,
+            ramfs::POSIX_FILES_TABLE,
+            ramfs::POSIX_ABI_TABLE,
+            ramfs::RELIBC_TABLE,
+            ramfs::POSIX_PROCS_TABLE,
+            ramfs::POSIX_SHARES_TABLE,
+            ramfs::POSIX_STEPS_TABLE,
+            ramfs::OS_TEST_TABLE,
+            ramfs::RELIBC_THREADS_TABLE,
+            ramfs::RTBENCH_POSIX_TABLE,
+            ramfs::TTY_TABLE,
+            ramfs::TTY_STEPS_TABLE,
+            ramfs::POSIX_RANDOM_TABLE,
+            ramfs::POSIX_DISPLAY_TABLE,
+            ramfs::DISPLAY_TABLE,
+            ramfs::LOADER_CHANNELS_TABLE,
+            ramfs::POSIX_POLL_TABLE,
+            ramfs::POSIX_SOCK_TABLE,
+            ramfs::POSIX_IPC_TABLE,
+            ramfs::POSIX_PTY_TABLE,
+        ]
     }
 
     #[test]
