@@ -5,8 +5,10 @@
 //! part 2): `cargo xtask net-bench run|tables`. See `docs/net-bench.md` for
 //! the method; this file holds it.
 //!
-//! The rows are L1 (Linux, nginx with one worker), L4 (Linux, four workers)
-//! and S4 (stafeto, four workers on `netd`'s shared sockets), each on VZ with
+//! The rows are L1 (Linux, nginx with one worker), L4 (Linux, four workers),
+//! S4 (stafeto, four workers on `netd`'s shared sockets) and F1 (stafeto,
+//! `nginx-fast`: one worker with the TCP/IP stack in its process on the
+//! second network device, `netd` out of the data path), each on VZ with
 //! four CPUs and 1 GiB, one guest at a time. The loads are W1 (900 files of
 //! 10 KiB over 64 long connections), W2 (64 files of 256 KiB over 64 long
 //! connections) and W3 (the files of W1, a new connection for each request).
@@ -79,11 +81,20 @@ const GRID: [u32; 16] = [
     250, 500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000,
     96000,
 ];
+/// The pairs of rows whose ratios the tables print.
+const PAIRS: [(System, System); 4] = [
+    (System::S4, System::L4),
+    (System::F1, System::L4),
+    (System::F1, System::S4),
+    (System::F1, System::L1),
+];
 const GRID_NEW: [u32; 6] = [100, 200, 300, 500, 700, 1000];
 const CONNECTIONS: u32 = 64;
 /// USER_HZ of Linux and of stafeto's `/proc/stat`: a jiffy is 10 ms.
 const JIFFY_US: f64 = 10_000.0;
 const START_WITHIN: Duration = Duration::from_secs(30);
+/// The settings of nginx in the image of F1.
+const FAST_CONF: &str = "/etc/nginx/nginx-fast.conf";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Workload {
@@ -170,34 +181,47 @@ enum System {
     L1,
     L4,
     S4,
+    F1,
 }
 
 impl System {
+    const ALL: [System; 4] = [System::L1, System::L4, System::S4, System::F1];
+
     fn name(self) -> &'static str {
         match self {
             System::L1 => "L1",
             System::L4 => "L4",
             System::S4 => "S4",
+            System::F1 => "F1",
         }
     }
 
     fn of(name: &str) -> Option<System> {
-        [System::L1, System::L4, System::S4]
+        System::ALL
             .into_iter()
             .find(|s| s.name().eq_ignore_ascii_case(name))
     }
 
     fn linux(self) -> bool {
-        self != System::S4
+        !matches!(self, System::S4 | System::F1)
     }
 
     fn workers(self) -> usize {
-        if self == System::L1 { 1 } else { 4 }
+        if matches!(self, System::L1 | System::F1) {
+            1
+        } else {
+            4
+        }
     }
 
-    /// The row this one is compared with (S4 with L4).
+    /// The row this one is compared with (S4 with L4, F1 with L1: a worker
+    /// against a worker).
     fn peer(self) -> Option<System> {
-        (self == System::S4).then_some(System::L4)
+        match self {
+            System::S4 => Some(System::L4),
+            System::F1 => Some(System::L1),
+            _ => None,
+        }
     }
 }
 
@@ -1064,7 +1088,11 @@ struct Prepared {
     linux: PathBuf,
     kernel: PathBuf,
     image: PathBuf,
+    /// The image of F1.
+    fast_image: PathBuf,
     config: String,
+    /// The fingerprint of the settings of F1 (its own file).
+    fast_config: String,
     www: String,
 }
 
@@ -1307,14 +1335,17 @@ fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
     }
 }
 
-fn boot_stafeto(prep: &Prepared) -> Result<Guest, String> {
+fn boot_stafeto(prep: &Prepared, sys: System) -> Result<Guest, String> {
+    let fast = sys == System::F1;
     let suffix = vz::claim_suffix()?;
     let mut report = Report {
-        system: "S4",
+        system: sys.name(),
         ..Report::default()
     };
     let (load_start, others_start) = (load_now(), nginx_bench::other_guests(0));
-    let command = vz::command_on(&prep.kernel, &prep.image, linux_guest::machine(&suffix))?;
+    let image = if fast { &prep.fast_image } else { &prep.image };
+    let machine = linux_guest::machine_with(&suffix, if fast { 2 } else { 1 });
+    let command = vz::command_on(&prep.kernel, image, machine)?;
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -1333,6 +1364,30 @@ fn boot_stafeto(prep: &Prepared) -> Result<Guest, String> {
             .map(|m| m.trim().to_owned())
             .ok_or_else(|| format!("the driver's line {driver:?} names no MAC"))?;
         net_vz::lease_is_ours("net-bench", &vz::mac(suffix.value, 0), lease.address)?;
+        if fast {
+            // The stack starts with the program, on the second device: the
+            // address the load goes to is the static one of `netd.conf`.
+            run.send(&format!("nginx-fast -c {FAST_CONF} & M=$!"))?;
+            run.expect_line(
+                "the stack",
+                |l| l.contains("fast: the stack is up on "),
+                START_WITHIN,
+            )?;
+            linux_guest::workers_up(&mut run, DIALOG_STEP, 1)?;
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx-fast",
+                &format!("nginx-fast -T -c {FAST_CONF}"),
+            )?;
+            linux_guest::verify(&report, &prep.fast_config, &prep.www)?;
+            let address: Ipv4Addr = linux_guest::FAST_ADDRESS
+                .parse()
+                .map_err(|e| format!("{e}"))?;
+            expect_fetch((address, 80).into())?;
+            return Ok(address);
+        }
         run.send("nginx -c /etc/nginx/nginx.conf & M=$!")?;
         run.expect_line(
             "the event method",
@@ -1347,7 +1402,7 @@ fn boot_stafeto(prep: &Prepared) -> Result<Guest, String> {
     })();
     match result {
         Ok(address) => Ok(Guest {
-            sys: System::S4,
+            sys,
             run,
             address: (address, 80).into(),
             mac: report.mac.clone(),
@@ -1373,6 +1428,8 @@ struct Options {
     workloads: Vec<Workload>,
     phases: Vec<String>,
     rounds: u32,
+    /// The most rounds, those after `rounds` taking the open pairs alone.
+    max_rounds: u32,
     /// Seconds of the warm-up and of a step of the first walk.
     warm: u32,
     stage: u32,
@@ -1403,7 +1460,7 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4] [--workloads w1,w2,w3] [--phases nat,sweep,rounds] [--rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--quick] [--resume DIR] | tables DIR";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--quick] [--resume DIR] | tables DIR";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -1411,6 +1468,7 @@ fn options(args: &[String]) -> Result<Options, String> {
         workloads: Workload::ALL.to_vec(),
         phases: ["nat", "sweep", "rounds"].map(str::to_owned).to_vec(),
         rounds: CONFIRMS,
+        max_rounds: MAX_ROUNDS,
         warm: 10,
         stage: 60,
         confirm: 300,
@@ -1438,7 +1496,9 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--systems" => {
                 o.systems = value(arg)?
                     .split(',')
-                    .map(|s| System::of(s).ok_or_else(|| format!("no system {s:?} (l1, l4, s4)")))
+                    .map(|s| {
+                        System::of(s).ok_or_else(|| format!("no system {s:?} (l1, l4, s4, f1)"))
+                    })
                     .collect::<Result<_, _>>()?
             }
             "--workloads" => {
@@ -1462,6 +1522,7 @@ fn options(args: &[String]) -> Result<Options, String> {
             }
             "--phases" => o.phases = value(arg)?.split(',').map(str::to_owned).collect(),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
+            "--max-rounds" => o.max_rounds = number(value(arg)?, arg)?,
             "--warm" => o.warm = number(value(arg)?, arg)?,
             "--stage" => o.stage = number(value(arg)?, arg)?,
             "--confirm" => o.confirm = number(value(arg)?, arg)?,
@@ -1488,6 +1549,12 @@ fn options(args: &[String]) -> Result<Options, String> {
     }
     if o.rounds == 0 {
         return Err("--rounds 0".to_owned());
+    }
+    if o.max_rounds < o.rounds || o.max_rounds > MAX_ROUNDS {
+        return Err(format!(
+            "--max-rounds {} is below --rounds {} or above {MAX_ROUNDS}",
+            o.max_rounds, o.rounds
+        ));
     }
     Ok(o)
 }
@@ -1531,7 +1598,7 @@ impl Bench {
         let guest = if sys.linux() {
             boot_linux(&self.prep, sys)
         } else {
-            boot_stafeto(&self.prep)
+            boot_stafeto(&self.prep, sys)
         };
         match guest {
             Ok(g) => {
@@ -1956,9 +2023,24 @@ impl Bench {
                 }
             }
         }
-        for round in 1..=MAX_ROUNDS {
+        for round in 1..=self.opts.max_rounds {
             self.phase = format!("round {round}");
             for sys in order(&self.opts.systems.clone(), round) {
+                // The ceilings of every load of the system come first, with
+                // or without an R* (a row that holds no 1 ms, S4 on W2 or F1,
+                // has its ceiling and its CPU time all the same).
+                if round <= self.opts.rounds {
+                    for wl in self.opts.workloads.clone() {
+                        for c in [CONNECTIONS, wl.criterion()] {
+                            self.ceiling(
+                                &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
+                                sys,
+                                wl,
+                                c,
+                            )?;
+                        }
+                    }
+                }
                 let pairs: Vec<Workload> = self
                     .opts
                     .workloads
@@ -1983,16 +2065,6 @@ impl Bench {
                             wl,
                             *rate,
                         )?;
-                    }
-                    if round <= self.opts.rounds {
-                        for c in [CONNECTIONS, wl.criterion()] {
-                            self.ceiling(
-                                &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
-                                sys,
-                                wl,
-                                c,
-                            )?;
-                        }
                     }
                     let verdict = self.confirm_run(round, sys, wl, confirm.rstar)?;
                     if round <= self.opts.rounds {
@@ -2339,7 +2411,7 @@ impl Results {
     fn rows(&self) -> Vec<(Workload, System)> {
         let mut rows = Vec::new();
         for wl in Workload::ALL {
-            for sys in [System::L1, System::L4, System::S4] {
+            for sys in System::ALL {
                 if self
                     .recs
                     .contains_key(&format!("search.{}.{}", sys.name(), wl.name()))
@@ -2508,62 +2580,72 @@ impl Results {
 
     fn table_ratios(&self) -> String {
         let mut t = String::from(
-            "### Table 2a. Ratios of stafeto to Linux (S4 over L4)\n\nBy R* over the recorded runs (not paired: the runs of the two rows were taken in different rounds, some at other loads of the Mac):\n\n| load | R* S4 | R* L4 | S4 / L4 |\n|---|---|---|---|\n",
+            "### Table 2a. Ratios between the rows (S4 over L4, F1 over L4, S4 and L1)\n\n",
         );
-        for wl in Workload::ALL {
-            if let (Some(s), Some(l)) = (
-                self.confirmed(System::S4, wl),
-                self.confirmed(System::L4, wl),
-            ) {
-                let mark = |c: &Conf| {
-                    format!(
-                        "{}{}",
-                        c.rate,
-                        if c.proven { "" } else { " (not confirmed)" }
-                    )
-                };
-                t += &format!(
-                    "| {} | {} | {} | {} |\n",
-                    wl.name().to_uppercase(),
-                    mark(&s),
-                    mark(&l),
-                    if l.rate == 0 {
-                        "-".to_owned()
-                    } else {
-                        format!("{:.2}", f64::from(s.rate) / f64::from(l.rate))
-                    }
-                );
+        for (a, b) in PAIRS {
+            let (an, bn) = (a.name(), b.name());
+            let mut by_rstar = String::new();
+            for wl in Workload::ALL {
+                if let (Some(x), Some(y)) = (self.confirmed(a, wl), self.confirmed(b, wl)) {
+                    let mark = |c: &Conf| {
+                        format!(
+                            "{}{}",
+                            c.rate,
+                            if c.proven { "" } else { " (not confirmed)" }
+                        )
+                    };
+                    by_rstar += &format!(
+                        "| {} | {} | {} | {} |\n",
+                        wl.name().to_uppercase(),
+                        mark(&x),
+                        mark(&y),
+                        if y.rate == 0 {
+                            "-".to_owned()
+                        } else {
+                            format!("{:.2}", f64::from(x.rate) / f64::from(y.rate))
+                        }
+                    );
+                }
             }
-        }
-        t += "\nBy the ceiling of `wrk -c64`, paired in each round (the Mac's one-minute load at the start and at the end of each guest):\n\n| load | round | S4 requests/s | L4 requests/s | S4 / L4 | load of S4 | load of L4 |\n|---|---|---|---|---|---|---|\n";
-        for wl in Workload::ALL {
-            for round in 1..=MAX_ROUNDS {
-                let rps = |sys: System| {
-                    self.num(
-                        &format!(
-                            "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
-                            sys.name(),
-                            wl.name()
-                        ),
-                        "per_second",
-                    )
-                };
-                let (Some(s), Some(l)) = (rps(System::S4), rps(System::L4)) else {
-                    continue;
-                };
-                let phase = format!("round {round}");
-                let load = |sys: System| {
-                    self.boot_load(&phase, sys)
-                        .map_or("-".to_owned(), |(a, b)| format!("{a:.2} / {b:.2}"))
-                };
-                t += &format!(
-                    "| {} | {round} | {s:.0} | {l:.0} | {:.4} | {} | {} |\n",
-                    wl.name().to_uppercase(),
-                    s / l,
-                    load(System::S4),
-                    load(System::L4)
-                );
+            let mut by_ceiling = String::new();
+            for wl in Workload::ALL {
+                for round in 1..=MAX_ROUNDS {
+                    let rps = |sys: System| {
+                        self.num(
+                            &format!(
+                                "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
+                                sys.name(),
+                                wl.name()
+                            ),
+                            "per_second",
+                        )
+                    };
+                    let (Some(x), Some(y)) = (rps(a), rps(b)) else {
+                        continue;
+                    };
+                    let phase = format!("round {round}");
+                    let load = |sys: System| {
+                        self.boot_load(&phase, sys)
+                            .map_or("-".to_owned(), |(p, q)| format!("{p:.2} / {q:.2}"))
+                    };
+                    by_ceiling += &format!(
+                        "| {} | {round} | {x:.0} | {y:.0} | {:.4} | {} | {} |\n",
+                        wl.name().to_uppercase(),
+                        x / y,
+                        load(a),
+                        load(b)
+                    );
+                }
             }
+            if by_rstar.is_empty() && by_ceiling.is_empty() {
+                continue;
+            }
+            t += &format!(
+                "#### {an} over {bn}\n\nBy R* over the recorded runs (not paired: the runs of the two rows were taken in different rounds, some at other loads of the Mac):\n\n| load | R* {an} | R* {bn} | {an} / {bn} |\n|---|---|---|---|\n{by_rstar}"
+            );
+            t += &format!(
+                "\nBy the ceiling of `wrk -c64`, paired in each round (the Mac's one-minute load at the start and at the end of each guest):\n\n| load | round | {an} requests/s | {bn} requests/s | {an} / {bn} | load of {an} | load of {bn} |\n|---|---|---|---|---|---|---|\n{by_ceiling}\n"
+            );
         }
         t
     }
@@ -2573,7 +2655,7 @@ impl Results {
             "### Table 4. At the rates of the walk both rows of a pair hold (R* of the walk under the present rule) (one run each, the length of a step of the walk)\n\n| load | pair | rate | p50 ms | p99 ms | p99.9 ms | the other row: p50 | p99 | p99.9 |\n|---|---|---|---|---|---|---|---|---|\n",
         );
         for wl in Workload::ALL {
-            for sys in [System::S4] {
+            for sys in [System::S4, System::F1] {
                 let Some(peer) = sys.peer() else { continue };
                 let (Some(a), Some(b)) = (
                     self.search_of(sys, wl).and_then(|f| f.0.rstar),
@@ -2662,7 +2744,7 @@ impl Results {
         let mut t = String::from(
             "### Table 8. W3 by rate (new connection for each request)\n\n| system | rate | achieved/s | answers 200 | failed | p99 ms | counters after | marks |\n|---|---|---|---|---|---|---|---|\n",
         );
-        for sys in [System::L1, System::L4, System::S4] {
+        for sys in System::ALL {
             for (k, m) in self.all(&format!("sweep.{}.w3.", sys.name())) {
                 if !k.ends_with(".0") {
                     continue;
@@ -2754,24 +2836,32 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     } else {
         linux_guest::linux_dir()
     };
-    let (mut kernel, mut image) = (PathBuf::new(), PathBuf::new());
-    if o.systems.contains(&System::S4) {
+    let (mut kernel, mut image, mut fast_image) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
+    if o.systems.iter().any(|s| !s.linux()) {
         crate::busybox_build()?;
         crate::nano_build()?;
         kernel = build(Variant::Normal)?.image;
-        image = match o.image {
-            ImageKind::Plain => linux_guest::build_image()?,
-            ImageKind::Profile => linux_guest::build_variant(linux_guest::BenchImage::Profile)?,
-            ImageKind::Pinned => linux_guest::build_variant(linux_guest::BenchImage::Pinned)?,
-            ImageKind::Cpu0 => linux_guest::build_variant(linux_guest::BenchImage::Cpu0)?,
-        };
+        if o.systems.contains(&System::S4) {
+            image = match o.image {
+                ImageKind::Plain => linux_guest::build_image()?,
+                ImageKind::Profile => linux_guest::build_variant(linux_guest::BenchImage::Profile)?,
+                ImageKind::Pinned => linux_guest::build_variant(linux_guest::BenchImage::Pinned)?,
+                ImageKind::Cpu0 => linux_guest::build_variant(linux_guest::BenchImage::Cpu0)?,
+            };
+        }
+        if o.systems.contains(&System::F1) {
+            fast_image = linux_guest::build_fast_image()?;
+        }
     }
     let (config, www) = linux_guest::expected()?;
+    let (fast_config, _) = linux_guest::expected_fast();
     Ok(Prepared {
         linux,
         kernel,
         image,
+        fast_image,
         config,
+        fast_config,
         www,
     })
 }
@@ -3342,6 +3432,10 @@ mod tests {
         assert!(script.contains("\"/a\",\"/b\"") && script.contains("Connection"));
         assert!(!wrk_script(&["/a".into()], true).contains("Connection"));
         assert_eq!(System::S4.peer(), Some(System::L4));
+        assert_eq!(System::F1.peer(), Some(System::L1));
+        assert_eq!(System::of("f1"), Some(System::F1));
+        assert!(!System::F1.linux());
+        assert_eq!(System::F1.workers(), 1);
         assert_eq!(System::of("l1"), Some(System::L1));
     }
 

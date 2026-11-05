@@ -53,6 +53,13 @@ pub enum BenchImage {
     Cpu0,
 }
 
+/// The image of the row F1: nginx on the stack in its own process on the
+/// second network device, the same one change of the CPUs
+/// (`init::table::bench::BENCH_FAST_VZ_TABLE`).
+pub const BENCH_FAST_IMAGE: &str = "boot-net-bench-fast.img";
+/// The second device's address in the image of F1 (the static address of
+/// `netd.conf`: the NAT of VZ has no lease for a device that the stack owns).
+pub const FAST_ADDRESS: &str = "192.168.64.250";
 /// The machine of both guests (the provisional ruling B2 of the owner).
 pub const CPUS: usize = 4;
 pub const MEMORY_MIB: u64 = 1024;
@@ -116,10 +123,30 @@ pub fn build_variant(variant: BenchImage) -> Result<PathBuf, String> {
     }
 }
 
+/// The programs of the image of F1: those of the image of nginx on the stack
+/// on VZ with init's table of the measurement (`table-bench-fast-vz`).
+pub fn bench_fast_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz).to_vec();
+        for program in &mut programs {
+            if program.0 == "init" {
+                program.3 = &["table-bench-fast-vz"];
+            }
+        }
+        programs
+    })
+}
+
 /// Builds the image of the measurement (a step of ci, which can run
 /// neither HVF nor VZ).
 pub fn build_image() -> Result<PathBuf, String> {
     build_boot_image(BENCH_IMAGE, bench_programs(), BOOT_PROFILE)
+}
+
+/// Builds the image of F1.
+pub fn build_fast_image() -> Result<PathBuf, String> {
+    build_boot_image(BENCH_FAST_IMAGE, bench_fast_programs(), BOOT_PROFILE)
 }
 
 // What both guests carry -------------------------------------------------------
@@ -190,6 +217,13 @@ pub fn fetched_files() -> Vec<(&'static str, &'static [u8])> {
 /// The settings of nginx in both guests.
 pub fn nginx_conf() -> &'static str {
     nginx_probe::NGINX_CONF
+}
+
+/// The settings of nginx on the stack (F1): its own file, which differs from
+/// `nginx_conf` in the directives of the allowed list, in the types written
+/// in the file, and in the path of the pid file.
+pub fn nginx_fast_conf() -> &'static str {
+    crate::fast_nginx::NGINX_FAST_CONF
 }
 
 /// Writes the overlay of the Linux guest into the empty `dir`: the settings
@@ -291,6 +325,11 @@ pub fn expected_config_output(conf: &str, mime: &[u8]) -> String {
         "# configuration file /etc/nginx/nginx.conf:\n{conf}\n# configuration file /etc/nginx/mime.types:\n{}\n",
         String::from_utf8_lossy(mime)
     )
+}
+
+/// What `nginx-fast -T` prints for the settings of F1: the one file.
+pub fn expected_fast_config_output(conf: &str) -> String {
+    format!("# configuration file /etc/nginx/nginx-fast.conf:\n{conf}\n")
 }
 
 /// The digest of the files under `/www`: SHA-256 of the lines `HASH  PATH`,
@@ -520,6 +559,19 @@ pub(crate) fn read_fingerprints(
     report: &mut Report,
     kernel_settings: bool,
 ) -> Result<(), String> {
+    read_fingerprints_of(run, report, kernel_settings, "nginx", "nginx -T")
+}
+
+/// The same for a program of nginx other than `nginx`: `program` for the
+/// versions, `dump` the command that prints its settings (`nginx-fast -T -c
+/// FILE` for F1, whose settings are its own file).
+pub(crate) fn read_fingerprints_of(
+    run: &mut qemu::Run,
+    report: &mut Report,
+    kernel_settings: bool,
+    program: &str,
+    dump: &str,
+) -> Result<(), String> {
     run.send("S=ok")?;
     run.expect("# ", DIALOG_STEP)?;
     report.cpus = capture(run, "nproc", "nproc", DIALOG_STEP)?
@@ -533,7 +585,7 @@ pub(crate) fn read_fingerprints(
             report.system, report.cpus
         ));
     }
-    report.nginx_v = capture(run, "nginx -V 2>&1", "version", DIALOG_STEP)?;
+    report.nginx_v = capture(run, &format!("{program} -V 2>&1"), "version", DIALOG_STEP)?;
     let (nginx, openssl) = check_versions(
         &report.nginx_v,
         &crate::packages::value("nginx", "version")?,
@@ -542,7 +594,7 @@ pub(crate) fn read_fingerprints(
     .map_err(|e| format!("{}: {e}", report.system))?;
     report.nginx = nginx;
     report.openssl = openssl;
-    let dump = capture(run, "nginx -T 2>&1", "config", DIALOG_STEP)?.join("\n");
+    let dump = capture(run, &format!("{dump} 2>&1"), "config", DIALOG_STEP)?.join("\n");
     report.config_digest = config_digest(&dump);
     let www = capture(
         run,
@@ -582,6 +634,15 @@ pub(crate) fn expected() -> Result<(String, String), String> {
         config_digest(&expected_config_output(nginx_conf(), mime)),
         www_digest(&www_files()),
     ))
+}
+
+/// The fingerprints of F1: the settings are its own file (`nginx-fast.conf`),
+/// the files under `/www` are those of the other rows.
+pub(crate) fn expected_fast() -> (String, String) {
+    (
+        config_digest(&expected_fast_config_output(nginx_fast_conf())),
+        www_digest(&www_files()),
+    )
 }
 
 /// Refuses a guest whose fingerprints are not the expected ones.
@@ -643,10 +704,15 @@ fn fetch_all(address: SocketAddr, from: Instant) -> Result<(Duration, Vec<String
 
 /// The machine of both guests, with the MAC suffix of the run.
 pub(crate) fn machine(suffix: &vz::Suffix) -> vz::Machine {
+    machine_with(suffix, 1)
+}
+
+/// The same with `net` network devices (two for F1).
+pub(crate) fn machine_with(suffix: &vz::Suffix, net: usize) -> vz::Machine {
     vz::Machine {
         cpus: Some(CPUS),
         memory_mib: Some(MEMORY_MIB),
-        net: 1,
+        net,
         mac_suffix: suffix.value,
     }
 }
@@ -1179,6 +1245,77 @@ mod tests {
             ]
         );
         assert!(configure_difference(&linux, &linux).is_empty());
+    }
+
+    #[test]
+    fn the_image_of_f1_starts_init_with_its_own_table_and_holds_nginx_fast() {
+        let programs = bench_fast_programs();
+        assert_eq!(programs[0].0, "init");
+        assert_eq!(programs[0].3, &["table-bench-fast-vz"]);
+        assert!(programs.iter().any(|p| p.0 == "nginx-fast"));
+        assert_eq!(
+            programs.len(),
+            crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz).len()
+        );
+        // The row F1 is the only image of the measurement with two devices,
+        // and its address is the static one of its `netd.conf`.
+        assert!(
+            crate::fast_probe::NETD_CONF_VZ_STATIC
+                .windows(FAST_ADDRESS.len())
+                .any(|w| w == FAST_ADDRESS.as_bytes())
+        );
+    }
+
+    /// Everything of the settings of F1 that the other rows do not have is
+    /// listed: the directives of the allowed list, the types written in the
+    /// file, the path of the pid file and the one port. The `http` block of
+    /// the two files is otherwise the same line for line (breakage 1 of the note).
+    #[test]
+    fn the_settings_of_f1_differ_from_the_others_in_the_listed_lines_alone() {
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|l| mask_allowed(l.trim()))
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect()
+        };
+        let (fast, plain) = (lines(nginx_fast_conf()), lines(nginx_conf()));
+        let only_fast: Vec<_> = fast.iter().filter(|l| !plain.contains(l)).collect();
+        let only_plain: Vec<_> = plain.iter().filter(|l| !fast.contains(l)).collect();
+        assert_eq!(
+            only_fast,
+            [
+                "pid /var/run/nginx-fast.pid;",
+                "worker_shutdown_timeout <allowed>;",
+                "types { text/html html htm; text/plain txt; application/octet-stream bin; }",
+            ],
+            "{only_fast:?}"
+        );
+        assert_eq!(
+            only_plain,
+            ["pid /var/run/nginx.pid;", "include /etc/nginx/mime.types;"],
+            "{only_plain:?}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_of_f1_is_that_of_its_own_file() {
+        let (config, www) = expected_fast();
+        assert_ne!(config, expected().map(|e| e.0).unwrap_or_default());
+        assert_eq!(www, www_digest(&www_files()));
+        // A change in a directive of the http block changes it.
+        let changed =
+            nginx_fast_conf().replace("keepalive_requests 100000", "keepalive_requests 100");
+        assert_ne!(
+            config_digest(&expected_fast_config_output(&changed)),
+            config
+        );
+        // The allowed directives do not.
+        let workers =
+            nginx_fast_conf().replace("worker_connections 1024", "worker_connections 512");
+        assert_eq!(
+            config_digest(&expected_fast_config_output(&workers)),
+            config
+        );
     }
 
     #[test]

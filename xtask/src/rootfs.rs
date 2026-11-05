@@ -1718,6 +1718,18 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-net-bench-profile.img"
         | "boot-net-bench-pinned.img"
         | "boot-net-bench-cpu0.img" => net_bench_files(name),
+        // The row F1: the files of S4's image and the static address of the
+        // second device, the one the stack owns.
+        "boot-net-bench-fast.img" => {
+            let mut files = net_bench_files(name);
+            files.push(of(
+                "/etc/netd.conf",
+                0o644,
+                ROOT,
+                Source::Bytes("netd.conf", crate::fast_probe::NETD_CONF_VZ_STATIC),
+            ));
+            files
+        }
         // The images on Apple VZ: the network service writes `resolv.conf`
         // from the lease. The image with a static address for the second
         // device has the file `netd.conf` too.

@@ -503,7 +503,8 @@ fn all_steps(njobs: usize) -> Vec<Step> {
         use super::linux_guest::{BenchImage, build_variant};
         build_variant(BenchImage::Profile)?;
         build_variant(BenchImage::Pinned)?;
-        build_variant(BenchImage::Cpu0).map(|_| ())
+        build_variant(BenchImage::Cpu0)?;
+        super::linux_guest::build_fast_image().map(|_| ())
     }));
 
     // os-test: a boot a suite, and the complete basic suite.

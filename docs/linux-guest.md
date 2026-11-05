@@ -55,6 +55,12 @@ boot CPU and the other services on the CPUs of the services. No other image
 names `BENCH_CPUS` (a test of `init` scans the tables). Provisional owner ruling
 B2: four CPUs and 1 GiB for both guests (`vz-run --cpus 4 --memory 1024`).
 
+The row F1 has its own image, `boot-net-bench-fast.img`: the image of nginx on
+the stack on VZ (two network devices, `nginx-fast`) with the table
+`table-bench-fast-vz`, which differs from that image's table in the launcher of
+the shell alone (all four CPUs). The second device has the static address
+`192.168.64.250`. ci builds both images.
+
 ## The check
 
 ```
