@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 19 of the bounded RAM file service. Numbers are little endian.
+//! Version 20 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
+//! Init grants the layer client (`LAYER_CLIENTS`) the session label `LAYERS`: LayerStart and
+//! LayerStep attach and detach package files as layers of the tree (see `layers`).
 //! BindPending admits a real Loader identity and a genuine unclaimed clone;
 //! an unsuitable empty endpoint may be replaced when descriptors are optional.
 //! With require_fds=0 the offered endpoint may be omitted: only LoaderOf is sent.
@@ -121,6 +123,9 @@ pub use wait::{
 mod fifo;
 pub use fifo::{FifoAck, FifoGrant};
 
+mod layers;
+pub use layers::{IMAGE_LAYER_FIRST, LAYER_NUMBER_MAX, LayerOp, LayerReply, LayerStart, LayerStep};
+
 mod close;
 pub use close::{CLOSE_KEY_FIRST, CLOSE_KEY_PLACES, CloseEvent, CloseKey};
 
@@ -131,7 +136,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 19;
+pub const VERSION: u16 = 20;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -262,6 +267,15 @@ pub const FILE_SIZE_LIMIT: u32 = 333;
 /// ENFILE: the service's table of open descriptions, or the share of the client's root,
 /// is full. TOO_MANY_OPEN_FILES (EMFILE) is the session's own numbers.
 pub const TOO_MANY_FILES_IN_SYSTEM: u32 = 334;
+/// A layer's path is already taken by a name of the system, of another layer or of a
+/// user. The reply carries the number of the entry of the layer's table.
+pub const CONFLICT: u32 = 335;
+/// The package file or its table of paths breaks a rule of the layer (order, parent,
+/// file number, hard link modes). The reply carries the number of the entry.
+pub const BAD_LAYER: u32 = 336;
+/// An entry of the layer has a set-ID, set-GID or sticky bit, or an owner other than 0:0.
+/// The reply carries the number of the entry.
+pub const BAD_MODE: u32 = 337;
 /// Existing local hold slots give independent idempotency domains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenKey {
@@ -277,6 +291,17 @@ impl OpenKey {
     }
 }
 pub const BOOT_PROFILE: u64 = 1 << 61;
+
+/// The label of the one session that attaches and detaches layers
+/// (`LAYER_CLIENTS` in the table of init). Init's labels count up from small
+/// numbers and never reach bit 60.
+pub const LAYERS: u64 = 1 << 60;
+
+/// Whether `label` is that of the layer session: bit 60, and none of the
+/// marks above it.
+pub const fn is_layers(label: u64) -> bool {
+    label & (OWN | LOADERS | BOOT_PROFILE) == 0 && label & LAYERS != 0
+}
 
 /// Init issues this profile only to the clients of its list
 /// (`BOOT_PROFILE_CLIENTS` in the table of init): the diagnostic client of
@@ -415,7 +440,11 @@ pub enum Method {
     /// that sent nothing yet; a number the birth holds is passed over. The whole list is
     /// checked before the birth changes. Reply: status.
     CloneMore = 52,
-    /// Numbers 51 and 53 stay reserved.
+    /// The layer session begins an attach or a detach: `LayerStart` has the operation in its
+    /// body (see `layers`), so a future operation is a new value of it and needs no number.
+    LayerStart = 51,
+    /// The next portion of the running layer operation.
+    LayerStep = 53,
     WaitStart = 54,
     WaitQuery = 55,
     WaitCancel = 56,
@@ -498,7 +527,9 @@ impl Method {
             48 => Some(Self::ChangeRelease),
             49 => Some(Self::CloseEvent),
             50 => Some(Self::LockStart),
+            51 => Some(Self::LayerStart),
             52 => Some(Self::CloneMore),
+            53 => Some(Self::LayerStep),
             54 => Some(Self::WaitStart),
             55 => Some(Self::WaitQuery),
             56 => Some(Self::WaitCancel),
@@ -516,8 +547,8 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 52,
-    54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -594,6 +625,17 @@ mod tests {
 
     /// Only init's mark names the loaders; the service's own labels have
     /// bit 63, and an image session's carries its entry.
+    /// The layer label is bit 60; the marks above it exclude it.
+    #[test]
+    fn the_layer_label_is_bit_60_and_alone() {
+        assert!(is_layers(LAYERS));
+        assert!(is_layers(LAYERS | 5));
+        assert!(!is_layers(5));
+        assert!(!is_layers(LAYERS | BOOT_PROFILE));
+        assert!(!is_layers(LAYERS | LOADERS));
+        assert!(!is_layers(LAYERS | OWN));
+    }
+
     #[test]
     fn labels_of_the_loaders_and_of_image_sessions() {
         assert!(is_loaders(LOADERS | 7));
