@@ -158,7 +158,8 @@ impl LayerReply {
                 status,
                 entry: input.u32()?,
             },
-            _ => Self::Refused { status },
+            // A refusal that is a status alone comes as a reply of the header's length.
+            _ => return Ok(Self::Refused { status }),
         };
         input.finish()?;
         Ok(reply)
@@ -304,7 +305,11 @@ mod tests {
             }
             let mut extra = wire.clone();
             extra.push(0);
-            assert!(LayerReply::read(Reader::new(&extra)).is_err());
+            // A refusal that is a status alone may come padded to the header's length.
+            assert_eq!(
+                LayerReply::read(Reader::new(&extra)).is_err(),
+                !matches!(reply, LayerReply::Refused { .. })
+            );
         }
         let mut out = Writer::new();
         assert!(

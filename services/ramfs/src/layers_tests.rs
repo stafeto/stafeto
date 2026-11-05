@@ -164,7 +164,7 @@ fn attach_counting(ram: &mut Ram<'_>, number: u32, bytes: &'static [u8]) -> (Lay
         Err(status) => return (LayerReply::Refused { status }, 0),
     };
     if let Err(reply) = ram.storage.layer_mapped(index, bytes.as_ptr(), bytes.len()) {
-        ram.storage.layer_unmapped(index);
+        settle(ram);
         return (reply, 0);
     }
     let mut steps = 0;
@@ -1052,4 +1052,58 @@ fn a_layer_of_the_image_is_not_detached() {
         })
     ));
     assert_eq!(ram.storage.layers_in_use(), 1);
+}
+
+#[test]
+fn entries_with_long_paths_and_names_go_one_to_a_step_in_every_phase() {
+    let mut ram = ram();
+    let a = "a".repeat(255);
+    let mut spec = Spec::new().dir("/w").dir(&format!("/w/{a}"));
+    for n in 0..6 {
+        spec = spec.file(&format!("/w/{a}/{}{n}", "x".repeat(251)), 0o644, b"x");
+    }
+    let bytes = spec.build();
+    let index = ram.storage.layer_begin_attach(1, false).unwrap();
+    ram.storage
+        .layer_mapped(index, bytes.as_ptr(), bytes.len())
+        .unwrap();
+    let mut longest = 0;
+    let mut steps = 0;
+    loop {
+        let before = ram.storage.layer_cursor(1);
+        let reply = ram.storage.layer_step(1, NOW, &Limits::PORTIONS);
+        steps += 1;
+        // The cursor goes back to 0 at the end of a phase: only whole steps count.
+        let after = ram.storage.layer_cursor(1);
+        if after > before {
+            longest = longest.max(after - before);
+        }
+        if reply != LayerReply::Resolving {
+            assert_eq!(reply, LayerReply::Done { names: 8 });
+            break;
+        }
+        assert!(steps < 100);
+    }
+    // The two short entries go together in each phase; each file goes alone.
+    assert_eq!(longest, 2);
+    assert_eq!(steps, 2 * (1 + 6));
+    assert_eq!(detach(&mut ram, 1), LayerReply::Done { names: 8 });
+    settle(&mut ram);
+}
+
+#[test]
+fn the_portions_are_the_ones_the_measurement_chose() {
+    // xtask layer-probe steps checks the longest steps at these numbers.
+    assert_eq!(
+        (
+            CHECK_ENTRIES,
+            CHECK_BYTES,
+            INSERT_ENTRIES,
+            INSERT_BYTES,
+            INSERT_LINKS,
+            DETACH_ENTRIES,
+            DETACH_BYTES
+        ),
+        (16, 512, 4, 256, 1, 8, 256)
+    );
 }

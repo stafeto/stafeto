@@ -27,6 +27,8 @@ image-info-probe = ["auth-probe"]
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
+# The diagnostic of the layer probe: the number of mappings the service holds (0xfff0).
+layer-probe = []
 # Full dispatch samples in the dedicated filled-lock measurement image.
 
 [dependencies]

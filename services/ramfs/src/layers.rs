@@ -40,17 +40,24 @@ const NO_LAYER: u8 = u8::MAX;
 /// `entry` of a refusal that names no entry of the table.
 pub const NO_ENTRY_NUMBER: u32 = u32::MAX;
 
+/// The portions of the work of one step, chosen by measurement under -icount (xtask
+/// layer-probe steps; stafeto-design reports/2026-11-05-pkg-pk1a.md): the largest powers of two
+/// at which the longest step stays under 0.8 B on the layers with paths of 511 bytes, names
+/// of 255 bytes in one bucket, and 1 023 entries with short names. A step takes at most this
+/// many entries, and a further entry only when its bytes still fit the budget of bytes (the
+/// first entry of a step always goes).
+///
 /// Entries one step of the check visits, and the bytes of their paths.
 pub const CHECK_ENTRIES: usize = 16;
-pub const CHECK_BYTES: usize = 1536;
+pub const CHECK_BYTES: usize = 512;
 /// Entries one step of the insertion takes in, the bytes of their names and the links of
 /// name chains it follows.
-pub const INSERT_ENTRIES: usize = 8;
-pub const INSERT_BYTES: usize = 1024;
-pub const INSERT_LINKS: usize = 32;
+pub const INSERT_ENTRIES: usize = 4;
+pub const INSERT_BYTES: usize = 256;
+pub const INSERT_LINKS: usize = 1;
 /// Entries one step of the detach takes out, and the bytes of their names.
-pub const DETACH_ENTRIES: usize = 32;
-pub const DETACH_BYTES: usize = 1024;
+pub const DETACH_ENTRIES: usize = 8;
+pub const DETACH_BYTES: usize = 256;
 
 /// What a step may do. The layers of the boot image run with `Limits::WHOLE`.
 #[derive(Clone, Copy, Debug)]
@@ -215,20 +222,33 @@ struct Job {
     layer: u8,
     /// The entry that is the parent of each entry, `NONE` for `/`.
     parent: [u16; LAYER_ENTRIES],
+    /// Where the last name of each path starts, found once by the check.
+    name_start: [u16; LAYER_ENTRIES],
     /// The first entry of each container file.
     first_of_file: [u16; CONTAINER_FILES_MAX],
-    /// The directories above the entry being checked, as entry numbers.
+    /// The directories above the entry being checked, as entry numbers, with the offset in the
+    /// mapping and the length of the path of each.
     stack: [u16; DEPTH_MAX],
+    stack_at: [u32; DEPTH_MAX],
+    stack_length: [u16; DEPTH_MAX],
     depth: u16,
 }
 impl Job {
     const NONE: Self = Self {
         layer: NO_LAYER,
         parent: [NONE; LAYER_ENTRIES],
+        name_start: [0; LAYER_ENTRIES],
         first_of_file: [NONE; CONTAINER_FILES_MAX],
         stack: [NONE; DEPTH_MAX],
+        stack_at: [0; DEPTH_MAX],
+        stack_length: [0; DEPTH_MAX],
         depth: 0,
     };
+
+    /// The path of the directory at `place` of the stack, read from the mapping.
+    fn stack_path<'x>(&self, mapping: &'x [u8], place: usize) -> &'x [u8] {
+        &mapping[self.stack_at[place] as usize..][..usize::from(self.stack_length[place])]
+    }
 }
 
 /// The layers of the service.
@@ -305,6 +325,9 @@ impl Layers {
     }
 }
 
+/// The bytes of the tables of the layers.
+pub const LAYERS_BYTES: usize = core::mem::size_of::<Layers>();
+
 /// A layer that has no places left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Released {
@@ -317,6 +340,33 @@ pub struct Released {
 
 const SLOT_BASE: usize = ENTRIES_MAX;
 const RESERVE_BASE: usize = ENTRIES_MAX + LAYER_SLOTS;
+
+/// The order of two byte strings, eight bytes at a time: the compiler's own comparison is a
+/// byte loop in the service, and the paths of a layer share long prefixes.
+fn compare(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let common = a.len().min(b.len());
+    let mut at = 0;
+    while at + 8 <= common {
+        let x = u64::from_be_bytes(a[at..at + 8].try_into().expect("eight bytes"));
+        let y = u64::from_be_bytes(b[at..at + 8].try_into().expect("eight bytes"));
+        if x != y {
+            return x.cmp(&y);
+        }
+        at += 8;
+    }
+    while at < common {
+        if a[at] != b[at] {
+            return a[at].cmp(&b[at]);
+        }
+        at += 1;
+    }
+    a.len().cmp(&b.len())
+}
+
+fn starts_with(path: &[u8], prefix: &[u8]) -> bool {
+    path.len() >= prefix.len()
+        && compare(&path[..prefix.len()], prefix) == core::cmp::Ordering::Equal
+}
 
 fn refuse(status: u32, entry: u32) -> LayerReply {
     LayerReply::Entry { status, entry }
@@ -440,10 +490,21 @@ impl Storage<'_> {
             .count()
     }
 
+    /// Whether a layer waits in the release queue.
+    pub fn layer_released_pending(&self) -> bool {
+        self.state.layers.released_len != 0
+    }
+
     /// Whether a job of a layer is running.
     pub fn layer_job(&self) -> Option<u32> {
         let layer = self.state.layers.job.layer;
         (layer != NO_LAYER).then(|| self.state.layers.layers[layer as usize].number)
+    }
+
+    /// The cursor of the walk of layer `number`: the next entry to take.
+    pub fn layer_cursor(&self, number: u32) -> u16 {
+        self.layer_index(number)
+            .map_or(0, |i| self.state.layers.layers[i].cursor)
     }
 
     /// The names of the layer now in the tree.
@@ -482,9 +543,22 @@ impl Storage<'_> {
     }
 
     /// The mapping is made: reads the header and the bounds of the table, which is all that is
-    /// checked in this step. The error is what to answer; the caller then gives the layer up
-    /// with `layer_unmapped`.
+    /// checked in this step. The error is what to answer; the layer then goes to the release
+    /// queue like any layer that holds no place.
     pub fn layer_mapped(
+        &mut self,
+        index: usize,
+        pointer: *const u8,
+        length: usize,
+    ) -> Result<(), LayerReply> {
+        let result = self.layer_read_header(index, pointer, length);
+        if let Err(reply) = result {
+            self.check_failed(index, reply);
+        }
+        result
+    }
+
+    fn layer_read_header(
         &mut self,
         index: usize,
         pointer: *const u8,
@@ -585,30 +659,43 @@ impl Storage<'_> {
 
     fn check_step(&mut self, index: usize, limits: &Limits) -> LayerReply {
         let table = self.layer_rootfs(index);
+        let mapping = self.layer_bytes(index);
         let (count, files) = {
             let layer = &self.state.layers.layers[index];
             (layer.count as usize, layer.files)
         };
-        let mut bytes = 0;
+        let mut bytes = 0usize;
         let mut done = 0;
+        // The path of the entry before, carried from entry to entry so that no path is read
+        // twice; the first of a step reads its predecessor's.
+        let mut previous: Option<&[u8]> = None;
         while self.state.layers.layers[index].cursor as usize != count
             && done < limits.check_entries
-            && bytes < limits.check_bytes
         {
             let i = self.state.layers.layers[index].cursor as usize;
+            // The next path counts before it is read: one that does not fit waits.
+            let length = table.raw_entry(i as u32).map_or(0, |raw| raw.path.len());
+            if done > 0 && bytes.saturating_add(length) > limits.check_bytes {
+                break;
+            }
             let entry = match table.entry_checked(i as u32) {
                 Ok(entry) => entry,
                 Err(_) => return self.check_failed(index, bad_layer(i as u32)),
             };
-            bytes += entry.path.len();
+            let path = entry.path.as_bytes();
+            bytes += path.len();
             done += 1;
             if i > 0 {
-                let previous = table.entry_checked(i as u32 - 1).expect("checked before");
-                if previous.path >= entry.path {
+                let before = match previous {
+                    Some(before) => before,
+                    None => table.raw_entry(i as u32 - 1).expect("checked before").path,
+                };
+                if compare(before, path) != core::cmp::Ordering::Less {
                     return self.check_failed(index, bad_layer(i as u32));
                 }
             }
-            if table.check_entry(i as u32, files).is_err() {
+            previous = Some(path);
+            if Rootfs::check_fields(i as u32, entry.mode, entry.file, files).is_err() {
                 return self.check_failed(index, bad_layer(i as u32));
             }
             if entry.mode & 0o7000 != 0 || entry.uid != 0 || entry.gid != 0 {
@@ -620,41 +707,44 @@ impl Storage<'_> {
                 if *slot == NONE {
                     *slot = i as u16;
                 } else {
-                    let first = table.entry(u32::from(*slot));
-                    if (first.mode, first.uid, first.gid) != (entry.mode, entry.uid, entry.gid) {
+                    // The owners are 0:0 for both; the modes must agree.
+                    let first = table.raw_entry(u32::from(*slot)).expect("checked before");
+                    if first.mode != entry.mode {
                         return self.check_failed(index, bad_layer(i as u32));
                     }
                 }
             }
             // The parent is the nearest directory above on the stack; the stack holds the
             // directories that are prefixes of the path.
-            let parent_length = entry.path.rfind('/').unwrap_or(0);
             while job.depth > 0 {
-                let top = table.entry(u32::from(job.stack[job.depth as usize - 1]));
-                let prefix = entry.path.len() > top.path.len()
-                    && entry.path.starts_with(top.path)
-                    && entry.path.as_bytes()[top.path.len()] == b'/';
-                if prefix {
+                let top = job.stack_path(mapping, job.depth as usize - 1);
+                if path.len() > top.len() && starts_with(path, top) && path[top.len()] == b'/' {
                     break;
                 }
                 job.depth -= 1;
             }
-            if parent_length == 0 {
-                job.parent[i] = NONE;
-            } else {
-                let Some(&top) = job.stack[..job.depth as usize].last() else {
-                    return self.check_failed(index, bad_layer(i as u32));
-                };
-                if table.entry(u32::from(top)).path.len() != parent_length {
-                    return self.check_failed(index, bad_layer(i as u32));
+            // What is left of the path after the directory above it is one name; without a
+            // directory above, the whole path is.
+            let (parent, name_start) = match job.depth {
+                0 => (NONE, 1),
+                depth => {
+                    let at = depth as usize - 1;
+                    (job.stack[at], usize::from(job.stack_length[at]) + 1)
                 }
-                job.parent[i] = top;
+            };
+            if path[name_start..].contains(&b'/') {
+                return self.check_failed(index, bad_layer(i as u32));
             }
+            job.parent[i] = parent;
+            job.name_start[i] = name_start as u16;
             if entry.is_directory() {
                 if job.depth as usize == DEPTH_MAX {
                     return self.check_failed(index, bad_layer(i as u32));
                 }
-                job.stack[job.depth as usize] = i as u16;
+                let at = job.depth as usize;
+                job.stack[at] = i as u16;
+                job.stack_at[at] = (path.as_ptr() as usize - mapping.as_ptr() as usize) as u32;
+                job.stack_length[at] = path.len() as u16;
                 job.depth += 1;
             }
             self.state.layers.layers[index].cursor += 1;
@@ -670,9 +760,12 @@ impl Storage<'_> {
 
     /// The check found a fault: nothing was changed, the layer goes out.
     fn check_failed(&mut self, index: usize, reply: LayerReply) -> LayerReply {
-        if let LayerReply::Entry { status, entry } = reply {
-            self.state.layers.layers[index].failure = Some((status, entry));
-        }
+        let failure = match reply {
+            LayerReply::Entry { status, entry } => (status, entry),
+            LayerReply::Refused { status } => (status, NO_ENTRY_NUMBER),
+            _ => (CONFLICT, NO_ENTRY_NUMBER),
+        };
+        self.state.layers.layers[index].failure = Some(failure);
         self.layer_end(index);
         reply
     }
@@ -749,23 +842,24 @@ impl Storage<'_> {
     ) -> LayerReply {
         let table = self.layer_rootfs(index);
         let count = self.state.layers.layers[index].count as usize;
-        let mut bytes = 0;
+        let mut bytes = 0usize;
         let mut links = 0;
         let mut done = 0;
         while self.state.layers.layers[index].cursor as usize != count {
-            if done >= limits.insert_entries
-                || bytes >= limits.insert_bytes
-                || links >= limits.insert_links
-            {
+            if done >= limits.insert_entries || links >= limits.insert_links {
                 return LayerReply::Resolving;
             }
             let i = self.state.layers.layers[index].cursor as usize;
-            let entry = table.entry(i as u32);
+            let entry = table.raw_entry(i as u32).expect("checked before");
             let Ok(parent) = self.layer_parent(index, i) else {
                 return self.insert_failed(index, refuse(CONFLICT, i as u32));
             };
-            let name_start = entry.path.rfind('/').map_or(0, |at| at + 1);
-            let name = &entry.path.as_bytes()[name_start..];
+            let name_start = usize::from(self.state.layers.job.name_start[i]);
+            let name = &entry.path[name_start..];
+            // A name that does not fit the bytes of this step waits for the next.
+            if done > 0 && bytes.saturating_add(name.len()) > limits.insert_bytes {
+                return LayerReply::Resolving;
+            }
             // Look the name up in the chain of its bucket, a few links at a time.
             let found = match self.layer_search(index, parent, name, limits.insert_links - links) {
                 Search::More => return LayerReply::Resolving,
@@ -816,7 +910,7 @@ impl Storage<'_> {
         {
             (chain.link, 0)
         } else {
-            (self.name_head(parent, name), 0)
+            (self.state.name_heads[bucket as usize], 0)
         };
         let stamp = self.stamp(bucket as usize);
         while link != NONE {
@@ -831,7 +925,8 @@ impl Storage<'_> {
             }
             spent += 1;
             if let Some((found, token)) = self.entry(parent, link as usize)
-                && found == name
+                && found.len() == name.len()
+                && compare(found, name) == core::cmp::Ordering::Equal
             {
                 return Search::Done(Some(token), spent);
             }
@@ -858,7 +953,7 @@ impl Storage<'_> {
         &mut self,
         index: usize,
         i: usize,
-        entry: &rootfs::Entry<'_>,
+        entry: &rootfs::RawEntry<'_>,
         parent: Token,
         name_start: usize,
         found: Option<Token>,
@@ -942,7 +1037,7 @@ impl Storage<'_> {
                     layers.reserve_len -= 1;
                     layers.reserve_free[layers.reserve_len] as usize
                 };
-                let name = &entry.path.as_bytes()[name_start..];
+                let name = &entry.path[name_start..];
                 let reserve = &mut self.state.layers.reserve[r];
                 reserve.name[..name.len()].copy_from_slice(name);
                 reserve.length = name_length;
@@ -1330,7 +1425,9 @@ impl Storage<'_> {
     ) -> Result<u32, LayerReply> {
         let index = self.layer_begin_attach(number, true).map_err(refused)?;
         if let Err(reply) = self.layer_mapped(index, bytes.as_ptr(), bytes.len()) {
-            self.layer_unmapped(index);
+            while let Some(done) = self.layer_next_released() {
+                self.layer_unmapped(done.index);
+            }
             return Err(reply);
         }
         loop {
