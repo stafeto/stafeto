@@ -49,8 +49,10 @@ pub struct Extent {
 }
 
 impl Extent {
+    /// The block after the extent; saturates, so a table that names an extent
+    /// at the end of the number line never wraps (`Table::check` refuses it).
     pub const fn end(&self) -> u64 {
-        self.first + self.blocks
+        self.first.saturating_add(self.blocks)
     }
 }
 
@@ -354,17 +356,23 @@ impl Table {
                 return Err(TableError::Record(i));
             }
         }
+        let own = Extent {
+            first: at,
+            blocks: TABLE_BLOCKS,
+        };
+        // Each extent lies in the disk, whatever the numbers: no sum wraps.
+        let inside = |e: &Extent| e.first <= blocks && e.blocks <= blocks - e.first;
+        let records = (0..RECORDS)
+            .map(|i| self.record(i))
+            .filter(|r| r.kind != EMPTY);
+        if !inside(&own) || records.into_iter().any(|r| !inside(&r.extent())) {
+            return Err(TableError::Extents);
+        }
         let mut list = [Extent {
             first: 0,
             blocks: 0,
         }; RECORDS + 1];
-        let n = self.occupied(
-            Extent {
-                first: at,
-                blocks: TABLE_BLOCKS,
-            },
-            &mut list,
-        );
+        let n = self.occupied(own, &mut list);
         let mut end = SUPERS;
         for e in &list[..n] {
             if e.first < end || e.end() > blocks {
@@ -406,7 +414,7 @@ pub fn find_free(occupied: &[Extent], taken: &[Extent], blocks: u64, need: u64) 
     let mut all = [Extent {
         first: 0,
         blocks: 0,
-    }; RECORDS + 1 + 16];
+    }; 2 * (RECORDS + 1) + 16];
     let mut n = 0;
     for e in occupied.iter().chain(taken) {
         let mut i = n;

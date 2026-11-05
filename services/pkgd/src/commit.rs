@@ -62,10 +62,17 @@ fn load(dev: &mut impl Device, sb: &Superblock, table: &mut Table) -> Result<boo
     if sb.table_len as usize != TABLE_BYTES || sb.table_first < SUPERS {
         return Ok(false);
     }
-    if sb.table_first + TABLE_BLOCKS > sb.blocks {
+    if sb
+        .table_first
+        .checked_add(TABLE_BLOCKS)
+        .is_none_or(|end| end > sb.blocks)
+    {
         return Ok(false);
     }
-    read_table(dev, sb.table_first, table)?;
+    // A table that cannot be read makes this copy no good; the other may be.
+    if read_table(dev, sb.table_first, table).is_err() {
+        return Ok(false);
+    }
     Ok(table.sha() == sb.table_sha
         && table
             .check(sb.generation, sb.blocks, sb.table_first)
@@ -88,7 +95,11 @@ pub fn open(dev: &mut impl Device, table: &mut Table) -> Result<Start, Failed> {
     let mut zeros = true;
     let mut buf = [0u8; BLOCK];
     for (copy, slot) in found.iter_mut().enumerate() {
-        dev.read(copy as u64, &mut buf)?;
+        // A superblock that cannot be read is a copy that is not good.
+        if dev.read(copy as u64, &mut buf).is_err() {
+            zeros = false;
+            continue;
+        }
         zeros &= buf.iter().all(|&b| b == 0);
         *slot = Superblock::decode(&buf, blocks).ok();
     }
@@ -149,13 +160,20 @@ pub fn write_super(dev: &mut impl Device, copy: u8, sb: &Superblock) -> Result<(
     dev.flush()
 }
 
-/// The next state: `table` (already the next generation) goes into a free
-/// extent and the superblock into the copy `opened` does not hold. Fails
-/// with `Failed` also when no extent of the table's size is free.
-pub fn publish(dev: &mut impl Device, opened: &Opened, table: &Table) -> Result<Opened, Failed> {
-    let first = free_table_extent(table, opened).ok_or(Failed)?;
-    write_table(dev, table, first)?;
-    let sb = superblock_of(dev.blocks(), table, first);
+/// The next state: `next` (already the next generation) goes into a free
+/// extent and the superblock into the copy `opened` does not hold. `accepted`
+/// is the table of the state `opened` names: its records and its own extent
+/// stay clear, since a crash before the superblock leaves that state in use.
+/// Fails with `Failed` also when no extent of the table's size is free.
+pub fn publish(
+    dev: &mut impl Device,
+    opened: &Opened,
+    accepted: &Table,
+    next: &Table,
+) -> Result<Opened, Failed> {
+    let first = free_table_extent(accepted, next, opened).ok_or(Failed)?;
+    write_table(dev, next, first)?;
+    let sb = superblock_of(dev.blocks(), next, first);
     let copy = 1 - opened.copy;
     write_super(dev, copy, &sb)?;
     Ok(Opened {
@@ -164,18 +182,25 @@ pub fn publish(dev: &mut impl Device, opened: &Opened, table: &Table) -> Result<
     })
 }
 
-/// Where the next table goes: free in the accepted table (so also clear of
-/// the accepted table itself, which the old state still needs).
-pub fn free_table_extent(next: &Table, opened: &Opened) -> Option<u64> {
-    // The next table's own records are the ones that must stay clear, and
-    // the accepted table's extent: a crash before the superblock leaves the
-    // old table in use.
-    let mut list = [Extent {
+/// Where the next table goes: clear of everything the accepted state holds
+/// (its records, its table) and of what the next state's records name.
+pub fn free_table_extent(accepted: &Table, next: &Table, opened: &Opened) -> Option<u64> {
+    let mut held = [Extent {
         first: 0,
         blocks: 0,
     }; RECORDS + 1];
-    let n = next.occupied(opened.table_extent(), &mut list);
-    find_free(&list[..n], &[], opened.superblock.blocks, TABLE_BLOCKS)
+    let n = accepted.occupied(opened.table_extent(), &mut held);
+    let mut new = [Extent {
+        first: 0,
+        blocks: 0,
+    }; RECORDS + 1];
+    let m = next.occupied(opened.table_extent(), &mut new);
+    find_free(
+        &held[..n],
+        &new[..m],
+        opened.superblock.blocks,
+        TABLE_BLOCKS,
+    )
 }
 
 /// The blocks free in the table of the state `opened`.

@@ -134,6 +134,8 @@ pub struct ModelDisk {
     pub ops: usize,
     pub limit: Option<usize>,
     pub log: Vec<String>,
+    /// Blocks whose read fails.
+    pub bad: Vec<u64>,
 }
 
 /// What a power failure does to the writes that were not flushed.
@@ -157,6 +159,7 @@ impl ModelDisk {
             ops: 0,
             limit: None,
             log: Vec::new(),
+            bad: Vec::new(),
         }
     }
 
@@ -198,6 +201,7 @@ impl ModelDisk {
             ops: 0,
             limit: None,
             log: Vec::new(),
+            bad: Vec::new(),
         }
     }
 
@@ -222,6 +226,9 @@ impl Device for ModelDisk {
     }
 
     fn read(&mut self, block: u64, out: &mut [u8; BLOCK]) -> Result<(), Failed> {
+        if self.bad.contains(&block) {
+            return Err(Failed);
+        }
         *out = self.peek(block);
         Ok(())
     }

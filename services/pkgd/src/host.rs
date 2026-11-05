@@ -67,6 +67,7 @@ pub fn write_store(dev: &mut impl Device, contents: &Contents) -> Result<Layout,
     let mut table = Box::new(Table::zeroed());
     let opened = commit::format(dev, &mut table)?;
     let blocks = opened.superblock.blocks;
+    let accepted = Table(table.0);
     table.set_repo(0, b"stafeto", 0);
     for (i, (name, serial)) in contents.repositories.iter().enumerate() {
         if !table.set_repo(i + 1, name.as_bytes(), *serial) {
@@ -145,7 +146,7 @@ pub fn write_store(dev: &mut impl Device, contents: &Contents) -> Result<Layout,
     // F1: the data before the table that names it.
     dev.flush()?;
     table.set_generation(opened.superblock.generation + 1);
-    let state = commit::publish(dev, &opened, &table)?;
+    let state = commit::publish(dev, &opened, &accepted, &table)?;
     let mut list = [Extent {
         first: 0,
         blocks: 0,

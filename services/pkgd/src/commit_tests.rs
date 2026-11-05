@@ -161,7 +161,7 @@ fn install(
     disk.flush()?;
     next.set_record(slot, &package_record(first, blocks, name));
     next.set_generation(opened.superblock.generation + 1);
-    commit::publish(disk, opened, &next)
+    commit::publish(disk, opened, table, &next)
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn an_installation_that_crashes_anywhere_gives_the_old_state_or_the_new() {
     let mut with_repo = Table(table.0);
     with_repo.set_generation(2);
     let mut base = disk.after(Loss::None, false);
-    let opened = commit::publish(&mut base, &opened, &with_repo).unwrap();
+    let opened = commit::publish(&mut base, &opened, &table, &with_repo).unwrap();
     let total = crash_everywhere(
         &base,
         |d| install(d, &opened, &with_repo, "hello", 3, 0).map(drop),
@@ -251,7 +251,7 @@ fn a_torn_superblock_never_costs_the_old_state() {
     commit::open(&mut base, &mut read).unwrap();
     let mut next = Table(read.0);
     next.set_generation(opened.superblock.generation + 1);
-    let first = commit::free_table_extent(&next, &opened).unwrap();
+    let first = commit::free_table_extent(&read, &next, &opened).unwrap();
     commit::write_table(&mut base, &next, first).unwrap();
     let sb = commit::superblock_of(DISK, &next, first);
     base.write(u64::from(1 - opened.copy), &sb.encode())
@@ -265,4 +265,108 @@ fn a_torn_superblock_never_costs_the_old_state() {
         assert!(now.superblock.generation >= opened.superblock.generation);
         assert_clean(&now, &table);
     }
+}
+
+/// A store of three packages `a` (blocks 1), `b` and `c`, each with its data on the disk.
+fn three() -> (ModelDisk, Opened, Table) {
+    let (mut disk, mut opened, mut table) = formatted();
+    table.set_repo(0, b"stafeto", 0);
+    for (i, name) in ["a", "b", "c"].iter().enumerate() {
+        opened = install(&mut disk, &opened, &table, name, 2, i).unwrap();
+        let mut read = Table::zeroed();
+        commit::open(&mut disk, &mut read).unwrap();
+        table = read;
+    }
+    (disk, opened, table)
+}
+
+#[test]
+fn a_table_without_a_package_never_lands_on_the_extent_of_that_package() {
+    // The table at 2..7, `a` at 7..12 (room for a table), `b` at 12..14.
+    let mut accepted = Table::zeroed();
+    accepted.init(5);
+    accepted.set_repo(0, b"stafeto", 0);
+    accepted.set_record(0, &package_record(7, 5, "a"));
+    accepted.set_record(1, &package_record(12, 2, "b"));
+    let sb = commit::superblock_of(DISK, &accepted, 2);
+    let opened = Opened {
+        superblock: sb,
+        copy: 0,
+    };
+    let a = accepted.record(0).extent();
+    // The next state drops `a`. Seen from the next table alone `a`'s extent is
+    // the first free run: the place the old rule chose.
+    let mut next = Table(accepted.0);
+    next.set_record(0, &Record::EMPTY);
+    next.set_generation(6);
+    let mut alone = [Extent {
+        first: 0,
+        blocks: 0,
+    }; RECORDS + 1];
+    let n = next.occupied(opened.table_extent(), &mut alone);
+    assert_eq!(
+        find_free(&alone[..n], &[], DISK, TABLE_BLOCKS),
+        Some(a.first)
+    );
+    let first = commit::free_table_extent(&accepted, &next, &opened).unwrap();
+    assert!(
+        first >= a.end() || first + TABLE_BLOCKS <= a.first,
+        "{first} lands on {a:?}"
+    );
+    assert_eq!(first, 14);
+}
+
+#[test]
+fn a_removal_that_crashes_anywhere_keeps_the_old_state_whole_until_the_superblock() {
+    let (disk, opened, accepted) = three();
+    let a = accepted.record(0);
+    let total = crash_everywhere(
+        &disk,
+        |d| {
+            let mut next = Table(accepted.0);
+            next.set_record(0, &Record::EMPTY);
+            next.set_generation(opened.superblock.generation + 1);
+            commit::publish(d, &opened, &accepted, &next).map(drop)
+        },
+        |limit, loss, tear, found| {
+            let (start, table) = state(found);
+            let Start::Store(now) = start else {
+                panic!("no store after {limit} {loss:?} {tear}")
+            };
+            assert_clean(&now, &table);
+            if table.record(0) == Record::EMPTY {
+                assert_eq!(now.superblock.generation, opened.superblock.generation + 1);
+                assert!(limit >= 6, "the new state after {limit}");
+            } else {
+                // The old state: the data of `a` are whole.
+                assert_eq!(table.record(0), a);
+                for i in 0..u64::from(a.blocks) {
+                    assert_eq!(found.peek(a.first + i), [0xD0; BLOCK]);
+                }
+            }
+        },
+    );
+    // Five blocks of the table, F2, the superblock, F3.
+    assert_eq!(total, 8);
+}
+
+#[test]
+fn an_unreadable_table_falls_back_to_the_other_copy() {
+    let (mut disk, opened, table) = three();
+    // The newest copy's table cannot be read: the older state answers.
+    disk.bad.push(opened.superblock.table_first);
+    let mut read = Table::zeroed();
+    let Start::Store(found) = commit::open(&mut disk, &mut read).unwrap() else {
+        panic!("a store");
+    };
+    assert_eq!(
+        found.superblock.generation,
+        opened.superblock.generation - 1
+    );
+    assert_eq!(found.copy, 1 - opened.copy);
+    assert!(read.record(2) == Record::EMPTY && table.record(2) != Record::EMPTY);
+    // Neither superblock can be read: damaged, not an error and not blank.
+    let mut both = ModelDisk::new(DISK);
+    both.bad = vec![0, 1];
+    assert_eq!(commit::open(&mut both, &mut read).unwrap(), Start::Damaged);
 }

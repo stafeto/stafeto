@@ -314,7 +314,54 @@ fn a_table_past_the_superblocks_has_the_whole_disk_free() {
         DISK - SUPERS - TABLE_BLOCKS
     );
     assert_eq!(
-        commit::free_table_extent(&table, &opened),
+        commit::free_table_extent(&table, &table, &opened),
         Some(SUPERS + TABLE_BLOCKS)
     );
+}
+
+#[test]
+fn extents_at_the_end_of_the_number_line_are_refused_and_never_wrap() {
+    let edge = Record {
+        first: u64::MAX - 1,
+        blocks: 4,
+        length: 4 * BLOCK as u64,
+        ..record(10, 4, "edge")
+    };
+    assert_eq!(
+        table_with(&[(0, edge)]).check(7, DISK, 2),
+        Err(TableError::Extents)
+    );
+    let huge = Record {
+        first: 10,
+        blocks: u32::MAX,
+        length: u64::from(u32::MAX) * BLOCK as u64,
+        ..edge
+    };
+    assert_eq!(
+        table_with(&[(0, huge)]).check(7, DISK, 2),
+        Err(TableError::Extents)
+    );
+    assert_eq!(
+        table_with(&[]).check(7, DISK, u64::MAX - 2),
+        Err(TableError::Extents)
+    );
+    assert_eq!(
+        Extent {
+            first: u64::MAX,
+            blocks: 5
+        }
+        .end(),
+        u64::MAX
+    );
+    // A superblock that names a table at the edge is no good, and the start says so.
+    let mut t = table_with(&[]);
+    let mut disk = disk_with(&mut t, 5, 0, 2);
+    let sb = Superblock {
+        table_first: u64::MAX - 1,
+        ..commit::superblock_of(DISK, &t, 2)
+    };
+    disk.write(0, &sb.encode()).unwrap();
+    disk.write(1, &sb.encode()).unwrap();
+    let mut table = Table::zeroed();
+    assert_eq!(commit::open(&mut disk, &mut table).unwrap(), Start::Damaged);
 }
