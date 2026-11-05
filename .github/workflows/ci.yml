@@ -157,7 +157,7 @@ jobs:
     name: doom-probe
     needs: build
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -180,8 +180,15 @@ jobs:
       - name: Date the sources before the build
         run: git ls-files -z | xargs -0 touch -d '2001-01-01 00:00:00'
 
-      - name: cargo xtask doom-probe
-        run: cargo xtask doom-probe
+      - name: posix-net checks of 574, twelve times each
+        run: |
+          rc=0
+          for name in reuseport-4 reuseport-handoff reuseport-churn; do
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              POSIX_NET_ONLY=$name cargo xtask posix-net > run-$name-$i.log 2>&1 && echo "$name run $i passed: $(grep -a 'note:' run-$name-$i.log | tail -1)" || { echo "$name run $i FAILED"; rc=1; grep -a "^xtask\|posix-net:\|netd:" run-$name-$i.log | tail -10; }
+            done
+          done
+          exit $rc
 
       - name: Collect logs
         if: failure()
@@ -227,7 +234,12 @@ jobs:
         run: git ls-files -z | xargs -0 touch -d '2001-01-01 00:00:00'
 
       - name: cargo xtask nginx-probe
-        run: cargo xtask nginx-probe
+        run: |
+          rc=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            cargo xtask nginx-probe > run$i.log 2>&1 && echo "run $i passed: $(grep -a 'after the reload' run$i.log | head -1)" || { echo "run $i FAILED"; rc=1; grep -a "^xtask\|after the reload" run$i.log | tail -15; }
+          done
+          exit $rc
 
       - name: Collect logs
         if: failure()
