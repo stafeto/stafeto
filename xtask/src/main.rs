@@ -13,15 +13,15 @@ mod coverage;
 #[path = "../../lib/posix-abi/src/drain_hooks.rs"]
 mod drain_hooks;
 #[cfg(test)]
-#[path = "../../lib/posix-abi/src/fast_events.rs"]
-mod fast_events;
-#[cfg(test)]
-mod fast_events_tests;
-#[cfg(test)]
 #[path = "../../lib/posix-sync/src/fast_bank.rs"]
 mod fast_bank;
 #[cfg(test)]
 mod fast_bank_tests;
+#[cfg(test)]
+#[path = "../../lib/posix-abi/src/fast_events.rs"]
+mod fast_events;
+#[cfg(test)]
+mod fast_events_tests;
 #[cfg(test)]
 #[path = "../../tests/posix-threads/src/futex_deadline.rs"]
 mod futex_deadline;
@@ -2556,13 +2556,10 @@ fn write_elf_image(
     }
     // An image with F-Stack (BSD) carries its licence, the acknowledgements
     // of its four-clause files and where the exact source is.
-    let fstack_files = if sources
-        .iter()
-        .any(|(_, elf, _)| {
-            elf.file_name()
-                .is_some_and(|n| n == "fstack-probe" || n == "fast-layer")
-        })
-    {
+    let fstack_files = if sources.iter().any(|(_, elf, _)| {
+        elf.file_name()
+            .is_some_and(|n| n == "fstack-probe" || n == "fast-layer")
+    }) {
         Some(fstack_probe::terms()?)
     } else {
         None

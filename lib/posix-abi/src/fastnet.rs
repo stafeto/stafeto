@@ -263,14 +263,25 @@ pub fn lost() -> bool {
 
 /// One step of the stack and a look at the kqueue `kq` for up to `room`
 /// events, under the lock. Returns the work the step found and the events.
-pub fn pass_and_poll(kq: c_int, out: &mut [crate::fast_events::Kevent]) -> Result<(i32, usize), i32> {
+pub fn pass_and_poll(
+    kq: c_int,
+    out: &mut [crate::fast_events::Kevent],
+) -> Result<(i32, usize), i32> {
     locked(|t| {
         // SAFETY: the table's functions; `out` holds `len` events.
         let work = unsafe { (t.pass)() };
         let got = if out.is_empty() {
             0
         } else {
-            unsafe { (t.kevent)(kq, core::ptr::null(), 0, out.as_mut_ptr().cast(), out.len() as c_int) }
+            unsafe {
+                (t.kevent)(
+                    kq,
+                    core::ptr::null(),
+                    0,
+                    out.as_mut_ptr().cast(),
+                    out.len() as c_int,
+                )
+            }
         };
         (work, got)
     })
@@ -287,7 +298,15 @@ pub fn pass_and_poll(kq: c_int, out: &mut [crate::fast_events::Kevent]) -> Resul
 pub fn poll(kq: c_int, out: &mut [crate::fast_events::Kevent]) -> Result<usize, i32> {
     count(|t| {
         // SAFETY: as above.
-        unsafe { (t.kevent)(kq, core::ptr::null(), 0, out.as_mut_ptr().cast(), out.len() as c_int) as isize }
+        unsafe {
+            (t.kevent)(
+                kq,
+                core::ptr::null(),
+                0,
+                out.as_mut_ptr().cast(),
+                out.len() as c_int,
+            ) as isize
+        }
     })
 }
 
@@ -476,8 +495,10 @@ pub fn getsockopt(fd: i32, level: i32, option: i32, out: &mut [u8]) -> Result<us
 pub fn setsockopt(fd: i32, level: i32, option: i32, value: &[u8]) -> Result<(), i32> {
     let n = number(fd)?;
     // SAFETY: the table's function; `value` is readable.
-    count(|t| unsafe { (t.setsockopt)(n, level, option, value.as_ptr(), value.len() as u32) as isize })
-        .map(drop)
+    count(|t| unsafe {
+        (t.setsockopt)(n, level, option, value.as_ptr(), value.len() as u32) as isize
+    })
+    .map(drop)
 }
 
 pub fn shutdown(fd: i32, how: i32) -> Result<(), i32> {
@@ -558,12 +579,18 @@ pub fn send(
         // SAFETY: the table's function; the buffers are readable.
         return count(|t| unsafe { (t.sendto)(n, part.as_ptr(), part.len(), flags, to, to_len) });
     }
-    let mut vector = [IoVec { base: core::ptr::null_mut(), len: 0 }; 16];
+    let mut vector = [IoVec {
+        base: core::ptr::null_mut(),
+        len: 0,
+    }; 16];
     if iov.len() > vector.len() {
         return Err(EINVAL);
     }
     for (slot, part) in vector.iter_mut().zip(iov) {
-        *slot = IoVec { base: part.as_ptr().cast_mut(), len: part.len() };
+        *slot = IoVec {
+            base: part.as_ptr().cast_mut(),
+            len: part.len(),
+        };
     }
     let message = MsgHdr {
         name: to.cast_mut(),
@@ -593,19 +620,29 @@ pub fn recv(
         Some(name) => (name.as_mut_ptr(), name.len() as u32),
         None => (core::ptr::null_mut(), 0),
     };
-    let from_pointer: *mut u32 = if from.is_null() { core::ptr::null_mut() } else { &raw mut from_len };
+    let from_pointer: *mut u32 = if from.is_null() {
+        core::ptr::null_mut()
+    } else {
+        &raw mut from_len
+    };
     let got = if let [part] = iov {
         // SAFETY: the table's function; the buffers are this call's.
         count(|t| unsafe {
             (t.recvfrom)(n, part.as_mut_ptr(), part.len(), flags, from, from_pointer)
         })?
     } else {
-        let mut vector = [IoVec { base: core::ptr::null_mut(), len: 0 }; 16];
+        let mut vector = [IoVec {
+            base: core::ptr::null_mut(),
+            len: 0,
+        }; 16];
         if iov.len() > vector.len() {
             return Err(EINVAL);
         }
         for (slot, part) in vector.iter_mut().zip(iov.iter_mut()) {
-            *slot = IoVec { base: part.as_mut_ptr(), len: part.len() };
+            *slot = IoVec {
+                base: part.as_mut_ptr(),
+                len: part.len(),
+            };
         }
         let mut message = MsgHdr {
             name: from,
@@ -703,12 +740,20 @@ pub fn stat(fd: i32) -> Result<proto_fs::NodeInfo, i32> {
 /// Everything else over a fast number (`lseek`, `pread`, `mmap` and the
 /// like): the socket is no file.
 pub fn unsupported(fd: i32) -> i32 {
-    if registered() && classify(fd).is_some() { ESPIPE } else { EBADF }
+    if registered() && classify(fd).is_some() {
+        ESPIPE
+    } else {
+        EBADF
+    }
 }
 
 /// `dup` of a fast number: no other number can name the socket.
 pub fn refuse_copy(fd: i32) -> i32 {
-    if registered() && classify(fd).is_some() { EOPNOTSUPP } else { EBADF }
+    if registered() && classify(fd).is_some() {
+        EOPNOTSUPP
+    } else {
+        EBADF
+    }
 }
 
 /// `dup2` and `dup3`: a fast number as the source is refused as `dup` is,

@@ -111,7 +111,10 @@ fn each_filter_and_flag_has_its_epoll_events() {
         EPOLLOUT | EPOLLHUP
     );
     assert_eq!(events_of(&event(1, EVFILT_READ, EV_ERROR, 0)), EPOLLERR);
-    assert_eq!(events_of(&event(1, EVFILT_WRITE, EV_ERROR | EV_EOF, 0)), EPOLLERR);
+    assert_eq!(
+        events_of(&event(1, EVFILT_WRITE, EV_ERROR | EV_EOF, 0)),
+        EPOLLERR
+    );
     // A filter the layer never adds gives nothing.
     assert_eq!(events_of(&event(1, -4, 0, 0)), 0);
 }
@@ -199,7 +202,11 @@ fn every_call_of_the_table_is_under_the_lock() {
     for (n, line) in source.lines().enumerate() {
         let code = line.split("//").next().unwrap();
         if code.contains("(t.start)") {
-            assert!(body(&source, "pub fn ensure_stack()").contains(code.trim()), "line {}", n + 1);
+            assert!(
+                body(&source, "pub fn ensure_stack()").contains(code.trim()),
+                "line {}",
+                n + 1
+            );
         }
     }
 }
@@ -285,5 +292,9 @@ fn the_idle_loop_turns_the_interrupts_on_and_asks_the_bank() {
     let run = body(&wait, "fn run_waking(");
     assert!(run.matches("wake.is_some_and(|w| w())").count() >= 2);
     let before_receive = run.find("crate::fast::receive(&channel)").expect("receive");
-    assert!(run[..before_receive].rfind("wake.is_some_and(|w| w())").is_some());
+    assert!(
+        run[..before_receive]
+            .rfind("wake.is_some_and(|w| w())")
+            .is_some()
+    );
 }

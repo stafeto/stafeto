@@ -101,7 +101,11 @@ fn echo(port: u16, payload: &[u8], retries: usize) -> Result<f64, String> {
     for attempt in 0..=retries {
         let mut stream = connect(port)?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(if attempt < retries { 3 } else { 20 })))
+            .set_read_timeout(Some(Duration::from_secs(if attempt < retries {
+                3
+            } else {
+                20
+            })))
             .map_err(|e| format!("timeout: {e}"))?;
         stream
             .write_all(payload)
@@ -109,7 +113,12 @@ fn echo(port: u16, payload: &[u8], retries: usize) -> Result<f64, String> {
         let mut got = vec![0u8; payload.len()];
         match stream.read_exact(&mut got) {
             Ok(()) if got == payload => return Ok(started.elapsed().as_secs_f64()),
-            Ok(()) => return Err(format!("echo of {} bytes came back different", payload.len())),
+            Ok(()) => {
+                return Err(format!(
+                    "echo of {} bytes came back different",
+                    payload.len()
+                ));
+            }
             Err(_) if attempt < retries => {}
             Err(e) => return Err(format!("echo of {} bytes: {e}", payload.len())),
         }
@@ -263,7 +272,9 @@ pub fn probe(machine: &'static qemu::Machine) -> Result<(), String> {
             "idle: {ticks:.0} clock ticks and {passes:.0} steps of the stack a second"
         ));
         if !(70.0..=130.0).contains(&ticks) {
-            return Err(format!("the stack's clock ran {ticks:.0} ticks a second, wanted 100"));
+            return Err(format!(
+                "the stack's clock ran {ticks:.0} ticks a second, wanted 100"
+            ));
         }
         let mut stream = connect(echo_host)?;
         stream
@@ -322,11 +333,15 @@ mod tests {
                 "layer.c does not print {name}"
             );
         }
-        for text in ["fast-layer: serving", "fast-layer: ended", "ticks=%llu passes=%llu"] {
+        for text in [
+            "fast-layer: serving",
+            "fast-layer: ended",
+            "ticks=%llu passes=%llu",
+        ] {
             assert!(source.contains(text), "layer.c does not print {text}");
         }
-        let glue = std::fs::read_to_string(crate::root().join("ports/f-stack/ff_stafeto_glue.c"))
-            .unwrap();
+        let glue =
+            std::fs::read_to_string(crate::root().join("ports/f-stack/ff_stafeto_glue.c")).unwrap();
         assert!(glue.contains("fast: the stack is up on"));
     }
 }

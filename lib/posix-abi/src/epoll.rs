@@ -1056,7 +1056,14 @@ fn fast_round(
         let tick = fastnet::next_tick_ns().min(TICK_NS);
         let wake_at = wait::now().saturating_add(tick);
         let sleep_until = until.map_or(wake_at, |deadline| deadline.min(wake_at));
-        let slept = round_once(id, out, Some(sleep_until), handled, consumed, Some(fast_wake));
+        let slept = round_once(
+            id,
+            out,
+            Some(sleep_until),
+            handled,
+            consumed,
+            Some(fast_wake),
+        );
         fastnet::notify(false);
         SHARED_AT.store(wait::now(), Ordering::Relaxed);
         let bits = posix_sync::receiver::take_pending();
