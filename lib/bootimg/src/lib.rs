@@ -66,6 +66,15 @@ pub const BOOT: Format = Format {
     name: "STAFBOOT",
 };
 
+/// The container format of a package file (`.stpkg`): the layout of the boot
+/// image under its own signature. The RAM file service reads the table of a
+/// layer with it, so it lives here and `pkgfmt` re-exports it.
+pub const PACKAGE: Format = Format {
+    magic: *b"STAFPKG1",
+    version: 1,
+    name: "STAFPKG1",
+};
+
 const HEADER_SIZE: u64 = 16;
 const ENTRY_SIZE: u64 = 48;
 const PROGRAM_HEADER_SIZE: u64 = 120;
@@ -210,31 +219,7 @@ impl<'a> BootImage<'a> {
     /// Parses a container of the given format with the layout rules of the
     /// boot image.
     pub fn parse_as(bytes: &'a [u8], format: &Format) -> Result<BootImage<'a>, Error> {
-        let len = bytes.len() as u64;
-        if len < HEADER_SIZE {
-            return Err(Error::Truncated {
-                need: HEADER_SIZE,
-                len,
-            });
-        }
-        if bytes[..8] != format.magic {
-            return Err(Error::BadSignature(format.name));
-        }
-        let version = u32_at(bytes, 8);
-        if version != format.version {
-            return Err(Error::BadVersion {
-                found: version,
-                known: format.version,
-            });
-        }
-        let count = u32_at(bytes, 12);
-        let table_end = HEADER_SIZE + ENTRY_SIZE * u64::from(count);
-        if len < table_end {
-            return Err(Error::Truncated {
-                need: table_end,
-                len,
-            });
-        }
+        let (count, table_end) = header_of(bytes, format)?;
         let image = BootImage { bytes, count };
         let mut end = table_end;
         for n in 0..count {
@@ -299,6 +284,77 @@ impl<'a> BootImage<'a> {
             data: &self.bytes[offset as usize..end],
         })
     }
+}
+
+/// A container whose header and the bounds of its table are checked and
+/// nothing else: `view_as` is O(1), and `file(n)` checks the one file it
+/// returns. For a reader that walks a large table in portions and cannot
+/// afford `BootImage::parse`, which visits every file at once.
+#[derive(Debug, Clone, Copy)]
+pub struct View<'a> {
+    image: BootImage<'a>,
+}
+
+impl<'a> View<'a> {
+    /// The number of files in the table.
+    pub fn count(&self) -> u32 {
+        self.image.count
+    }
+
+    /// File `n`: its name, offset (at a 4 KiB boundary) and length are
+    /// checked to lie inside the bytes. The order of the files and
+    /// repeated names are `parse`'s business and not checked here.
+    pub fn file(&self, n: u32) -> Result<File<'a>, Error> {
+        if n >= self.image.count {
+            return Err(Error::Truncated {
+                need: u64::from(n) + 1,
+                len: u64::from(self.image.count),
+            });
+        }
+        self.image.file(n)
+    }
+}
+
+impl<'a> BootImage<'a> {
+    /// The header and the bounds of the table of a container of the given
+    /// format, without a visit to any file.
+    pub fn view_as(bytes: &'a [u8], format: &Format) -> Result<View<'a>, Error> {
+        let (count, _) = header_of(bytes, format)?;
+        Ok(View {
+            image: BootImage { bytes, count },
+        })
+    }
+}
+
+/// The number of files and the end of the table of a container whose
+/// header and table bounds are good.
+fn header_of(bytes: &[u8], format: &Format) -> Result<(u32, u64), Error> {
+    let len = bytes.len() as u64;
+    if len < HEADER_SIZE {
+        return Err(Error::Truncated {
+            need: HEADER_SIZE,
+            len,
+        });
+    }
+    if bytes[..8] != format.magic {
+        return Err(Error::BadSignature(format.name));
+    }
+    let version = u32_at(bytes, 8);
+    if version != format.version {
+        return Err(Error::BadVersion {
+            found: version,
+            known: format.version,
+        });
+    }
+    let count = u32_at(bytes, 12);
+    let table_end = HEADER_SIZE + ENTRY_SIZE * u64::from(count);
+    if len < table_end {
+        return Err(Error::Truncated {
+            need: table_end,
+            len,
+        });
+    }
+    Ok((count, table_end))
 }
 
 /// A segment of a program.
@@ -1013,5 +1069,55 @@ mod tests {
             Error::BadEntry(0),
             "entry point 0x0 is not an aligned address in the code segment",
         );
+    }
+
+    #[test]
+    fn a_view_checks_the_table_bounds_and_one_file_at_a_time() {
+        let bytes = image();
+        let view = BootImage::view_as(&bytes, &BOOT).unwrap();
+        assert_eq!(view.count(), 2);
+        let parsed = BootImage::parse(&bytes).unwrap();
+        for n in 0..2 {
+            assert_eq!(view.file(n).unwrap(), parsed.file_at(n).unwrap());
+        }
+        assert!(view.file(2).is_err());
+        for cut in 0..entry_at(2) {
+            assert!(BootImage::view_as(&bytes[..cut], &BOOT).is_err(), "{cut}");
+        }
+        assert_eq!(
+            BootImage::view_as(&bytes, &PACKAGE).unwrap_err(),
+            Error::BadSignature("STAFPKG1")
+        );
+        let mut bad = bytes.clone();
+        bad[8] = 7;
+        assert!(matches!(
+            BootImage::view_as(&bad, &BOOT).unwrap_err(),
+            Error::BadVersion { found: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn a_view_refuses_a_file_that_is_cut_short_misplaced_or_badly_named() {
+        let bytes = image();
+        let view_of = |b: &[u8]| {
+            BootImage::view_as(b, &BOOT)
+                .unwrap()
+                .file(1)
+                .map(|f| f.offset)
+        };
+        // The length of file 1 runs past the end.
+        let mut bad = bytes.clone();
+        put_u64(&mut bad, entry_at(1) + NAME_MAX + 8, u64::MAX / 2);
+        assert!(matches!(view_of(&bad), Err(Error::Truncated { .. })));
+        // The offset is off the 4 KiB boundary.
+        let mut bad = bytes.clone();
+        put_u64(&mut bad, entry_at(1) + NAME_MAX, 0x1001);
+        assert_eq!(view_of(&bad), Err(Error::Misplaced(1)));
+        // The name is empty.
+        let mut bad = bytes.clone();
+        bad[entry_at(1)] = 0;
+        assert_eq!(view_of(&bad), Err(Error::BadName(1)));
+        // `parse` refuses the same images.
+        assert!(BootImage::parse(&bad).is_err());
     }
 }

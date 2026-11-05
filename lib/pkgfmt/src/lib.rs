@@ -39,12 +39,8 @@ pub use container::Package;
 pub use sig::{Block, Kind};
 pub use trust::{Key, Revocation, Signer, Trust};
 
-/// The container format of a package file.
-pub const PACKAGE: Format = Format {
-    magic: *b"STAFPKG1",
-    version: 1,
-    name: "STAFPKG1",
-};
+/// The container format of a package file; it lives in `bootimg`.
+pub use bootimg::PACKAGE;
 
 /// The public keys of the official roots, one `.pub` line each.
 pub const OFFICIAL_ROOTS: &[&str] = &[include_str!("../../../keys/stafeto-root-1.pub")];

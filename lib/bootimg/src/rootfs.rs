@@ -140,6 +140,43 @@ impl<'a> Rootfs<'a> {
     /// `bytes` is the file `rootfs`; its regular files name files below
     /// `files`, the number of files of the boot image.
     pub fn parse(bytes: &'a [u8], files: u32) -> Result<Rootfs<'a>, Error> {
+        let table = Self::open(bytes, files)?;
+        let count = table.count;
+        // The first entry of each file number, to compare its links with.
+        let mut first = [u16::MAX; FILES_MAX];
+        for n in 0..count {
+            let entry = table.entry_checked(n)?;
+            if n > 0 && table.entry(n - 1).path >= entry.path {
+                return Err(Error::Order(n));
+            }
+            table.check_entry(n, files)?;
+            if !entry.is_directory() {
+                let slot = &mut first[entry.file as usize];
+                if *slot == u16::MAX {
+                    *slot = n as u16;
+                } else {
+                    let other = table.entry(u32::from(*slot));
+                    if (other.mode, other.uid, other.gid) != (entry.mode, entry.uid, entry.gid) {
+                        return Err(Error::LinkMismatch(n));
+                    }
+                }
+            }
+            let parent = &entry.path[..entry.path.rfind('/').unwrap_or(0)];
+            if !parent.is_empty() {
+                match table.find_before(parent, n) {
+                    Some(p) if table.entry(p as u32).is_directory() => {}
+                    _ => return Err(Error::NoParent(n)),
+                }
+            }
+        }
+        Ok(table)
+    }
+
+    /// The header and the bounds of the table, without a visit to any
+    /// entry: O(1). The entries are then checked one at a time with
+    /// `entry_checked` and `check_entry`, and `parse` is the same checks in
+    /// a loop plus the rules that look across entries.
+    pub fn open(bytes: &'a [u8], _files: u32) -> Result<Rootfs<'a>, Error> {
         let len = bytes.len() as u64;
         if len < HEADER_SIZE as u64 {
             return Err(Error::Truncated {
@@ -168,50 +205,32 @@ impl<'a> Rootfs<'a> {
                 len,
             });
         }
-        let table = Rootfs {
+        Ok(Rootfs {
             bytes,
             count,
             time: u64_at(bytes, 16),
-        };
-        // The first entry of each file number, to compare its links with.
-        let mut first = [u16::MAX; FILES_MAX];
-        for n in 0..count {
-            let entry = table.checked(n)?;
-            if n > 0 && table.entry(n - 1).path >= entry.path {
-                return Err(Error::Order(n));
-            }
-            match entry.mode & FORMAT {
-                DIRECTORY | REGULAR if entry.mode & !(FORMAT | 0o7777) == 0 => {}
-                SYMLINK if entry.mode == SYMLINK | SYMLINK_MODE => {}
-                _ => return Err(Error::BadMode(n)),
-            }
-            if entry.is_directory() {
-                if entry.file != 0 {
-                    return Err(Error::BadFile(n));
-                }
-            } else {
-                if entry.file >= files || entry.file as usize >= FILES_MAX {
-                    return Err(Error::BadFile(n));
-                }
-                let slot = &mut first[entry.file as usize];
-                if *slot == u16::MAX {
-                    *slot = n as u16;
-                } else {
-                    let other = table.entry(u32::from(*slot));
-                    if (other.mode, other.uid, other.gid) != (entry.mode, entry.uid, entry.gid) {
-                        return Err(Error::LinkMismatch(n));
-                    }
-                }
-            }
-            let parent = &entry.path[..entry.path.rfind('/').unwrap_or(0)];
-            if !parent.is_empty() {
-                match table.find_before(parent, n) {
-                    Some(p) if table.entry(p as u32).is_directory() => {}
-                    _ => return Err(Error::NoParent(n)),
-                }
-            }
+        })
+    }
+
+    /// The mode and the file number of entry `n`: a directory, regular file
+    /// or link with its bits, a directory with file 0, any other entry with
+    /// a file below `files` (and `FILES_MAX`). The rules of `parse` that
+    /// need no other entry.
+    pub fn check_entry(&self, n: u32, files: u32) -> Result<(), Error> {
+        let entry = self.entry_checked(n)?;
+        match entry.mode & FORMAT {
+            DIRECTORY | REGULAR if entry.mode & !(FORMAT | 0o7777) == 0 => {}
+            SYMLINK if entry.mode == SYMLINK | SYMLINK_MODE => {}
+            _ => return Err(Error::BadMode(n)),
         }
-        Ok(table)
+        if entry.is_directory() {
+            if entry.file != 0 {
+                return Err(Error::BadFile(n));
+            }
+        } else if entry.file >= files || entry.file as usize >= FILES_MAX {
+            return Err(Error::BadFile(n));
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -230,7 +249,7 @@ impl<'a> Rootfs<'a> {
 
     /// Entry `n`, which is below `len`.
     pub fn entry(&self, n: u32) -> Entry<'a> {
-        self.checked(n).expect("parse checked every entry")
+        self.entry_checked(n).expect("parse checked every entry")
     }
 
     /// The entry with the path `path`, by binary search.
@@ -252,8 +271,13 @@ impl<'a> Rootfs<'a> {
         None
     }
 
-    /// Entry `n` with its path checked; `parse` adds the rest.
-    fn checked(&self, n: u32) -> Result<Entry<'a>, Error> {
+    /// Entry `n`, which is below `len`, with its path checked: the bounds
+    /// of the path, UTF-8, an absolute path without `.` or `..`. The mode
+    /// and the file number are `check_entry`'s.
+    pub fn entry_checked(&self, n: u32) -> Result<Entry<'a>, Error> {
+        if n >= self.count {
+            return Err(Error::BadPath(n));
+        }
         let at = HEADER_SIZE + ENTRY_SIZE * n as usize;
         let offset = u64::from(u32_at(self.bytes, at));
         let length = usize::from(u16_at(self.bytes, at + 4));
@@ -389,6 +413,14 @@ mod tests {
             dir("/bin/sub"),
             file("/bin/sub/x", 0o4750, 4),
         ]
+    }
+
+    /// `sample` with the hard links of file 3 agreeing on the owner.
+    fn agreeing() -> [Entry<'static>; 5] {
+        let mut entries = sample();
+        entries[2].uid = 0;
+        entries[2].gid = 0;
+        entries
     }
 
     #[test]
@@ -620,5 +652,51 @@ mod tests {
             Error::LinkMismatch(1)
         );
         assert!(rootfs(&[file("/a", 0o644, 1), file("/b", 0o644, 1)], 2).is_ok());
+    }
+
+    #[test]
+    fn open_checks_only_the_header_and_the_table_bounds() {
+        let bytes = rootfs(&agreeing(), 5).unwrap();
+        let table = Rootfs::open(&bytes, 5).unwrap();
+        assert_eq!(table.len(), 5);
+        assert_eq!(table.entry_checked(1).unwrap().path, "/bin/ash");
+        assert_eq!(table.entry_checked(5).unwrap_err(), Error::BadPath(5));
+        // Every cut of the header or of the table is refused.
+        for cut in 0..HEADER_SIZE + ENTRY_SIZE * 5 {
+            assert!(Rootfs::open(&bytes[..cut], 5).is_err(), "cut {cut}");
+        }
+        let mut bad = bytes.clone();
+        bad[0] ^= 1;
+        assert_eq!(Rootfs::open(&bad, 5).unwrap_err(), Error::BadSignature);
+        let mut bad = bytes.clone();
+        bad[8] = 9;
+        assert!(matches!(
+            Rootfs::open(&bad, 5).unwrap_err(),
+            Error::BadVersion { found: 9, .. }
+        ));
+        let mut bad = bytes.clone();
+        bad[12..16].copy_from_slice(&(ENTRIES_MAX as u32 + 1).to_le_bytes());
+        assert!(matches!(
+            Rootfs::open(&bad, 5).unwrap_err(),
+            Error::TooMany(_)
+        ));
+    }
+
+    #[test]
+    fn check_entry_is_the_mode_and_file_rules_of_parse() {
+        let bytes = rootfs(&agreeing(), 5).unwrap();
+        let table = Rootfs::open(&bytes, 5).unwrap();
+        for n in 0..5 {
+            assert_eq!(table.check_entry(n, 5), Ok(()));
+        }
+        // File 4 is out of range when the container has four files.
+        assert_eq!(table.check_entry(4, 4), Err(Error::BadFile(4)));
+        // A mode with a bit beyond the type and the permissions.
+        let mut bad = bytes.clone();
+        let at = HEADER_SIZE + ENTRY_SIZE;
+        bad[at + 8..at + 12].copy_from_slice(&(REGULAR | 0o10_000).to_le_bytes());
+        let table = Rootfs::open(&bad, 5).unwrap();
+        assert_eq!(table.check_entry(1, 5), Err(Error::BadMode(1)));
+        assert_eq!(Rootfs::parse(&bad, 5).unwrap_err(), Error::BadMode(1));
     }
 }
