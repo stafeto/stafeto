@@ -27,10 +27,10 @@
 //! is one comparison.
 
 use crate::constants::{EBADF, EBUSY, EINTR, EINVAL, EIO, ENODEV, ENOMEM, EPERM, ETIMEDOUT};
-use crate::fast_bank::{Bank, CLIENT_GONE};
-pub use crate::fast_bank::{FAST_LABEL, FAST_MASK, GONE};
 use crate::threads;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use posix_sync::fast_bank::CLIENT_GONE;
+pub use posix_sync::fast_bank::{FAST_LABEL, FAST_MASK, GONE};
 use proto_net::fast::{self as wire, Claimed, RING_PAGES};
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX, Rights};
@@ -53,42 +53,7 @@ const ENETDOWN: i32 = 100;
 const _: () = assert!(CLIENT_GONE == rt::abi::CLIENT_GONE);
 const _: () = assert!(TIMER_LABEL & FAST_MASK != FAST_LABEL);
 
-static BANK: Bank = Bank::new();
-
-/// Takes the bits the receivers banked (each bit goes to one taker).
-pub fn take_pending() -> u32 {
-    BANK.take()
-}
-
-/// Whether the service let go of its notifications.
-pub fn lost() -> bool {
-    BANK.lost()
-}
-
-#[inline(always)]
-fn bank(got: &Result<Received, Error>) {
-    if let Ok(Received::Notification { label, bits, .. }) = got
-        && label & FAST_MASK == FAST_LABEL
-    {
-        BANK.deposit(*label, *bits);
-    }
-}
-
-/// `sys::receive` on the thread's channel; every receive of the layer goes
-/// through here (a test of the sources holds it). A notification with the
-/// label of the fast path is banked and still returned as it came.
-pub fn receive(channel: &Handle<Channel>) -> Result<Received, Error> {
-    let got = sys::receive(channel);
-    bank(&got);
-    got
-}
-
-/// `sys::try_receive` with the same banking.
-pub fn try_receive(channel: &Handle<Channel>) -> Result<Received, Error> {
-    let got = sys::try_receive(channel);
-    bank(&got);
-    got
-}
+pub use posix_sync::receiver::{lost, receive, take_pending, try_receive};
 
 /// `struct stafeto_fast_object`.
 #[repr(C)]
@@ -304,7 +269,7 @@ pub fn claim(out: &mut FastClaim, flags: u32) -> Result<(), i32> {
         let label = FAST_LABEL | (TRY.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff);
         match ask(&service, &ring, label) {
             Ok(got) => {
-                BANK.activate(label);
+                posix_sync::receiver::activate(label);
                 break got;
             }
             Err((ENETDOWN, _)) if crate::wait::now() < started + ADDRESS_WAIT_NS => {}
@@ -429,6 +394,16 @@ pub fn wait(timeout_ns: u64) -> Result<u32, i32> {
             drop(guard);
             crate::signals::deliver_now();
             return Err(EINTR);
+        }
+        // With the entries deferred no handler can bank a bit from here to
+        // `receive`; one that came since the loop above (a handler that
+        // waited on this channel) is in the bank and would otherwise sleep
+        // until the deadline.
+        let bits = take_pending();
+        if bits != 0 {
+            drop(guard);
+            let _ = sys::timer_cancel(&timer);
+            return Ok(bits);
         }
         let got = receive(&own);
         drop(guard);

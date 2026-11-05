@@ -78,44 +78,100 @@ fn the_mask_takes_the_fast_label_of_every_try_and_nothing_else() {
     assert_ne!(7u64 & FAST_MASK, FAST_LABEL);
 }
 
-fn sources(dir: &Path, found: &mut Vec<(String, String)>) {
+fn sources(dir: &Path, root: &Path, found: &mut Vec<(String, String)>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            sources(&path, found);
+            sources(&path, root, found);
         } else if path.extension().is_some_and(|e| e == "rs") {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             found.push((name, fs::read_to_string(&path).unwrap()));
         }
     }
 }
 
-/// The raw receive of the kernel is named only in `fast.rs` (the wrappers),
-/// in `relibc.rs` (the EXITS channel, another channel), in `process.rs` (the
-/// fake channel of a probe) and in `loader_probe.rs`.
-#[test]
-fn every_receive_of_the_layer_goes_through_the_wrappers() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/posix-abi/src");
-    let mut files = Vec::new();
-    sources(&root, &mut files);
-    assert!(files.len() > 40, "the sources were not found");
-    let allowed = ["fast.rs", "relibc.rs", "process.rs", "loader_probe.rs"];
-    let mut wrapped = 0;
-    for (name, text) in &files {
-        for (n, line) in text.lines().enumerate() {
-            let code = line.split("//").next().unwrap();
-            if code.contains("sys::receive(") || code.contains("sys::try_receive(") {
-                assert!(
-                    allowed.contains(&name.as_str()),
-                    "{name}:{}: a raw receive outside the wrappers: {line}",
-                    n + 1
-                );
-            }
-            if code.contains("fast::receive(") {
-                wrapped += 1;
-            }
+/// The raw calls of the kernel's receive that each file of the layer may
+/// hold, by path from the root of the repository. The wrappers are in
+/// `receiver.rs`; the others listen on a channel that is not the thread's
+/// (the EXITS channel, a probe's fake channel, the loader probe's root, the
+/// platform's parked child).
+const RAW: [(&str, usize); 5] = [
+    ("lib/posix-sync/src/receiver.rs", 2),
+    ("lib/posix-abi/src/relibc.rs", 1),
+    ("lib/posix-abi/src/process.rs", 1),
+    ("lib/posix-abi/src/loader_probe.rs", 1),
+    ("lib/posix-platform/src/lib.rs", 1),
+];
+
+/// The number of raw receives in the code of a text: a call of
+/// `sys::receive(` or `sys::try_receive(`, or a `use` that brings either
+/// name into scope (a call without the path would escape the first form).
+fn raw_receives(text: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap();
+        let call = code.contains("sys::receive(") || code.contains("sys::try_receive(");
+        let import = code.trim_start().starts_with("use ")
+            && code.contains("sys::")
+            && (code.contains("receive") || code.contains("try_receive"));
+        if call || import {
+            lines.push(n + 1);
         }
     }
-    // wait 1, long 2, lock_wait 1, signals 5, open_driver 1, sleep 1.
-    assert!(wrapped >= 11, "only {wrapped} wrapped receives");
+    lines
+}
+
+#[test]
+fn every_receive_of_the_layer_goes_through_the_wrappers() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for dir in [
+        "lib/posix-abi/src",
+        "lib/posix-sync/src",
+        "lib/posix-platform/src",
+    ] {
+        let mut part = Vec::new();
+        sources(&repo.join(dir), &repo, &mut part);
+        files.extend(part);
+    }
+    assert!(files.len() > 45, "the sources were not found");
+    let mut wrapped = 0;
+    for (name, text) in &files {
+        let raw = raw_receives(text);
+        let expected = RAW
+            .iter()
+            .find(|(path, _)| name.as_str() == *path)
+            .map_or(0, |(_, count)| *count);
+        assert_eq!(
+            raw.len(),
+            expected,
+            "{name}: {} raw receives at lines {raw:?}, {expected} allowed",
+            raw.len()
+        );
+        wrapped += text
+            .lines()
+            .filter(|l| {
+                let code = l.split("//").next().unwrap();
+                code.contains("fast::receive(") || code.contains("receiver::receive(")
+            })
+            .count();
+    }
+    for (path, _) in RAW {
+        assert!(files.iter().any(|(name, _)| name == path), "{path} is gone");
+    }
+    // wait 1, long 2, lock_wait 1, signals 5, open_driver 1, sleep 1,
+    // the wait on an address in posix-sync 1.
+    assert!(wrapped >= 12, "only {wrapped} wrapped receives");
+}
+
+#[test]
+fn the_scan_sees_a_raw_receive_and_an_import() {
+    assert_eq!(raw_receives("let a = sys::receive(&c);\nlet b = 1;"), [1]);
+    assert_eq!(raw_receives("use rt::sys::{receive, send};"), [1]);
+    assert_eq!(raw_receives("    // sys::receive(&c)"), Vec::<usize>::new());
+    assert_eq!(raw_receives("fast::receive(&c)"), Vec::<usize>::new());
 }

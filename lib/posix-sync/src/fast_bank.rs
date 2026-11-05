@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The bank of the service's notifications (see `fast.rs`): the part that
+//! The bank of the service's notifications (`receiver.rs`; the claim is in `posix-abi/src/fast.rs`): the part that
 //! takes no kernel call, so that the host tests can run it.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

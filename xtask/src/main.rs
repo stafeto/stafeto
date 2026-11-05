@@ -13,7 +13,7 @@ mod coverage;
 #[path = "../../lib/posix-abi/src/drain_hooks.rs"]
 mod drain_hooks;
 #[cfg(test)]
-#[path = "../../lib/posix-abi/src/fast_bank.rs"]
+#[path = "../../lib/posix-sync/src/fast_bank.rs"]
 mod fast_bank;
 #[cfg(test)]
 mod fast_bank_tests;

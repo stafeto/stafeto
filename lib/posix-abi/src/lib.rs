@@ -38,7 +38,6 @@ pub fn record_locks_none() -> bool {
 pub mod display;
 pub mod epoll;
 pub mod fast;
-mod fast_bank;
 pub mod ipc;
 pub mod lock_fields;
 pub mod long;
