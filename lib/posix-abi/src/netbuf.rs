@@ -115,7 +115,9 @@ fn ask() -> Option<usize> {
     {
         return None;
     }
-    match make() {
+    let r = make();
+    rt::println!("DIAGW ask result ok={}", r.is_ok());
+    match r {
         Ok(base) => {
             FREE.store(u16::MAX, Ordering::Release);
             STATE.store(base, Ordering::Release);
@@ -131,8 +133,8 @@ fn ask() -> Option<usize> {
 /// The object, mapped as the network buffer piece and handed to the
 /// service; the piece goes again when the service refuses.
 fn make() -> Result<usize, ()> {
-    let service = crate::net::session().ok_or(())?;
-    let object = sys::mem_create(BUFFER_SIZE as u64).map_err(drop)?;
+    let service = crate::net::session().ok_or_else(|| rt::println!("DIAGW no session"))?;
+    let object = sys::mem_create(BUFFER_SIZE as u64).map_err(|e| rt::println!("DIAGW mem_create {e:?}"))?;
     let copy = sys::handle_duplicate(
         &object,
         Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
@@ -142,11 +144,12 @@ fn make() -> Result<usize, ()> {
     let base = crate::allocation::heap(|state| {
         state.map_special(object, pages, posix_map::Kind::NetBuffer)
     })
-    .map_err(drop)?;
+    .map_err(|e| rt::println!("DIAGW map_special {e:?}"))?;
     let mut w = Writer::new();
     let asked = proto_net::write_buffer(BUFFER_SIZE as u32, &mut w).is_ok()
         && given(&rt::handle::Handle::borrowed(service), w.as_bytes(), copy);
     if !asked {
+        rt::println!("DIAGW BUFFER not taken");
         let _ = crate::allocation::heap(|state| state.unmap_special(posix_map::Kind::NetBuffer));
         return Err(());
     }

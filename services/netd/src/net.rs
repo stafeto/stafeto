@@ -1373,6 +1373,10 @@ impl Net {
             }
             let hash = self.demux.hash_of(conn);
             let socks = &self.socks;
+            {
+                let live = self.groups.members(usize::from(group)).iter().filter(|&&m| socks[usize::from(m)].listening).count();
+                rt::println!("DIAG pick group {} members {} live {} hash%live {}", group, self.groups.members(usize::from(group)).len(), live, if live > 0 { hash % live as u64 } else { 99 });
+            }
             self.groups.pick(
                 usize::from(group),
                 hash,
@@ -1381,6 +1385,7 @@ impl Net {
             )
         }?;
         let member = self.listening_member(stack, listener);
+        rt::println!("DIAG picked listener {} member {:?}", listener, member);
         if member.is_none() {
             // The count was behind: none listens.
             let s = &mut self.socks[listener];
