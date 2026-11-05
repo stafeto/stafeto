@@ -17,6 +17,7 @@ netd = { path = "../services/netd" }
 pkgfmt = { path = "../lib/pkgfmt", features = ["write"] }
 proto-net = { path = "../proto/net" }
 rtc = { path = "../lib/rtc" }
+virtio-pci = { path = "../lib/virtio-pci" }
 
 [dev-dependencies]
 entries = { path = "../lib/entries" }

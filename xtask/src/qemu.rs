@@ -70,7 +70,7 @@ impl Machine {
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
     name: "512M",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "cortex-a72",
     memory: "512M",
     accel: "tcg",
@@ -80,7 +80,7 @@ pub const VIRT: Machine = Machine {
 /// goes through SMC.
 pub const VIRT_EL2: Machine = Machine {
     name: "EL2",
-    machine: "virt,gic-version=2,virtualization=on",
+    machine: "virt,gic-version=2,highmem-ecam=off,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
     accel: "tcg",
@@ -93,7 +93,7 @@ pub const VIRT_EL2: Machine = Machine {
 /// through HVC, as on VIRT.
 pub const VIRT_2G: Machine = Machine {
     name: "2G",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "cortex-a53",
     memory: "2G",
     accel: "tcg",
@@ -103,7 +103,7 @@ pub const VIRT_2G: Machine = Machine {
 /// the kernel takes the version from the device tree.
 pub const VIRT_V3: Machine = Machine {
     name: "GICv3",
-    machine: "virt,gic-version=3",
+    machine: "virt,gic-version=3,highmem-ecam=off",
     cpu: "cortex-a72",
     memory: "512M",
     accel: "tcg",
@@ -113,7 +113,7 @@ pub const VIRT_V3: Machine = Machine {
 /// before it drops there.
 pub const VIRT_EL2_V3: Machine = Machine {
     name: "EL2 GICv3",
-    machine: "virt,gic-version=3,virtualization=on",
+    machine: "virt,gic-version=3,highmem-ecam=off,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
     accel: "tcg",
@@ -125,7 +125,7 @@ pub const VIRT_EL2_V3: Machine = Machine {
 /// entered at EL1; the entry at EL2 is the TCG machines' to check.
 pub const HVF_V3: Machine = Machine {
     name: "HVF GICv3",
-    machine: "virt,gic-version=3",
+    machine: "virt,gic-version=3,highmem-ecam=off",
     cpu: "host",
     memory: "512M",
     accel: "hvf,kernel-irqchip=on",
@@ -136,7 +136,7 @@ pub const HVF_V3: Machine = Machine {
 /// and barriers, as the PinePhone's GIC-400 will have them.
 pub const HVF_V2: Machine = Machine {
     name: "HVF GICv2",
-    machine: "virt,gic-version=2",
+    machine: "virt,gic-version=2,highmem-ecam=off",
     cpu: "host",
     memory: "512M",
     accel: "hvf,kernel-irqchip=off",
@@ -318,6 +318,59 @@ pub fn net_two_with(forwards: &[Forward]) -> Vec<String> {
 /// 14. The monitor's `sendkey` reaches it when no other device takes keys
 /// (`-display none`). The images that run the service add these arguments.
 pub const KEYBOARD: &[&str] = &["-device", "virtio-keyboard-device,bus=virtio-mmio-bus.15"];
+
+/// The disk of a run (services/virtio-blk): a modern virtio-blk-pci at
+/// device 1 of bus 0, where `virtio_pci::qemu::DISK` expects it, over the
+/// raw file `image`. No legacy interface and no MSI-X (`vectors=0`), so the
+/// function has the one BAR 4 and raises INTx. The write cache is on
+/// (`cache=writeback`) and a FLUSH reaches the host file; `unsafe` would
+/// swallow it. Errors go to the guest (`werror`, `rerror`) where QEMU would
+/// stop the machine on a full host disk. With `faults`, the drive goes
+/// through `blkdebug` with that rules file.
+pub fn store(image: &Path, faults: Option<&Path>) -> Vec<String> {
+    let drive = match faults {
+        None => format!(
+            "if=none,id=store,format=raw,file={},cache=writeback,werror=report,rerror=report",
+            image.display()
+        ),
+        Some(rules) => format!(
+            "if=none,id=store,driver=raw,file.driver=blkdebug,file.config={},file.image.filename={},cache=writeback,werror=report,rerror=report",
+            rules.display(),
+            image.display()
+        ),
+    };
+    [
+        "-drive",
+        &drive,
+        "-device",
+        "virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The file of a disk: a sparse file of `bytes` zeros, made when it is
+/// missing or when `fresh` asks for a new one. An existing file of another
+/// length is an error, so that a disk with data on it is never cut or
+/// grown.
+pub fn store_file(path: &Path, bytes: u64, fresh: bool) -> Result<(), String> {
+    if path.exists() && !fresh {
+        let have = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        if have != bytes {
+            return Err(format!(
+                "{} is {have} bytes, {bytes} expected; --fresh-store makes a new one",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.set_len(bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
 
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
@@ -1239,10 +1292,49 @@ mod tests {
     }
 
     #[test]
+    fn every_machine_puts_ecam_below_4_gib() {
+        for m in MACHINES {
+            assert!(m.machine.contains("highmem-ecam=off"), "{}", m.name);
+        }
+    }
+
+    #[test]
+    fn the_store_is_a_modern_blk_at_device_1_with_a_write_cache() {
+        let joined = store(Path::new("s.img"), None).join(" ");
+        assert!(joined.contains("-drive if=none,id=store,format=raw,file=s.img,cache=writeback,werror=report,rerror=report"));
+        assert!(joined.contains(
+            "-device virtio-blk-pci,drive=store,bus=pcie.0,addr=0x1,disable-legacy=on,disable-modern=off,vectors=0,num-queues=1,serial=stafeto-store"
+        ));
+        assert!(!joined.contains("unsafe"));
+        let faulty = store(Path::new("s.img"), Some(Path::new("r.cfg"))).join(" ");
+        assert!(faulty.contains("driver=raw,file.driver=blkdebug,file.config=r.cfg,file.image.filename=s.img,cache=writeback"));
+    }
+
+    #[test]
+    fn the_store_file_is_made_once_and_kept_at_its_length() {
+        let dir = std::env::temp_dir().join(format!("stafeto-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.img");
+        store_file(&path, 8192, false).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+        std::fs::write(&path, [7u8; 8192]).unwrap();
+        store_file(&path, 8192, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[0], 7);
+        assert!(
+            store_file(&path, 4096, false)
+                .unwrap_err()
+                .contains("--fresh-store")
+        );
+        store_file(&path, 4096, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; 4096]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn args_select_the_spec_machine_and_boot_image() {
         let a = args(&VIRT, Path::new("k.img"), Some(Path::new("b.img")));
         let joined = a.join(" ");
-        assert!(joined.contains("-machine virt,gic-version=2"));
+        assert!(joined.contains("-machine virt,gic-version=2,highmem-ecam=off"));
         assert!(!joined.contains("virtualization"));
         assert!(joined.contains("-cpu cortex-a72"));
         assert!(joined.contains("-m 512M"));
@@ -1309,20 +1401,24 @@ mod tests {
     #[test]
     fn gicv3_machines_ask_for_gic_version_3() {
         let joined = args(&VIRT_V3, Path::new("k.img"), None).join(" ");
-        assert!(joined.contains("-machine virt,gic-version=3 "));
+        assert!(joined.contains("-machine virt,gic-version=3,highmem-ecam=off "));
         assert!(joined.contains("-cpu cortex-a72"));
         assert!(joined.contains("-m 512M"));
         let joined = args(&VIRT_EL2_V3, Path::new("k.img"), None).join(" ");
-        assert!(joined.contains("-machine virt,gic-version=3,virtualization=on"));
+        assert!(joined.contains("-machine virt,gic-version=3,highmem-ecam=off,virtualization=on"));
         assert!(joined.contains("-cpu cortex-a53"));
     }
 
     #[test]
     fn hvf_machines_pin_the_irqchip() {
         let v3 = args(&HVF_V3, Path::new("k.img"), None).join(" ");
-        assert!(v3.contains("-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on "));
+        assert!(v3.contains(
+            "-machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on "
+        ));
         let v2 = args(&HVF_V2, Path::new("k.img"), None).join(" ");
-        assert!(v2.contains("-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off "));
+        assert!(v2.contains(
+            "-machine virt,gic-version=2,highmem-ecam=off -accel hvf,kernel-irqchip=off "
+        ));
         for m in [&HVF_V3, &HVF_V2] {
             let a = args(m, Path::new("k.img"), None).join(" ");
             assert!(m.is_hvf());
@@ -1608,7 +1704,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     fn el2_args_turn_on_virtualization_on_a_cortex_a53() {
         let a = args(&VIRT_EL2, Path::new("k.img"), Some(Path::new("b.img")));
         let joined = a.join(" ");
-        assert!(joined.contains("-machine virt,gic-version=2,virtualization=on"));
+        assert!(joined.contains("-machine virt,gic-version=2,highmem-ecam=off,virtualization=on"));
         assert!(joined.contains("-cpu cortex-a53"));
         assert!(joined.contains("-m 512M"));
         assert!(joined.contains("-kernel k.img"));

@@ -7,6 +7,11 @@
 //! what the drivers of the machine expect: the console at device 5
 //! (1af4:1043), the entropy device at device 6 (1af4:1044), and N network
 //! functions (1af4:1041).
+//!
+//! `cargo xtask pci-walk [--hvf]` is the same walk on QEMU's `virt` machine
+//! with the disk (`qemu::store`), checked against `virtio_pci::qemu`: the
+//! host bridge at device 0 and the disk, 1af4:1042, at device 1 with the
+//! one BAR 4 of 16 KiB and the common configuration at its start.
 
 use super::*;
 
@@ -16,9 +21,17 @@ const ENTROPY_DEVICE: u32 = 6;
 
 /// The image of the walk: init with the table of the walk, the console's
 /// driver and the program.
-const PROGRAMS: [ImageProgram; 3] = [
+const PROGRAMS_VZ: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-pci-walk-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("pci-walk", "pci-walk", CHILD_STACK_SIZE, &[]),
+];
+
+/// The image of the walk on QEMU: init with its table, the PL011's driver
+/// and the program.
+const PROGRAMS_QEMU: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-pci-walk-qemu"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
     ("pci-walk", "pci-walk", CHILD_STACK_SIZE, &[]),
 ];
 
@@ -30,6 +43,8 @@ pub struct Function {
     pub vendor: u32,
     pub id: u32,
     pub class: u32,
+    /// The interrupt pin: 1 is INTA.
+    pub pin: u32,
     /// The lines of the BARs and capabilities that follow, as printed
     /// after `dev D fn F`.
     pub details: Vec<String>,
@@ -70,6 +85,7 @@ pub fn parse(lines: &[String]) -> Vec<Function> {
                 vendor,
                 id,
                 class,
+                pin: words.get(10).and_then(|w| w.parse().ok()).unwrap_or(0),
                 details: Vec::new(),
             });
         } else if let Some(last) = found
@@ -130,6 +146,98 @@ pub fn check(functions: &[Function], net: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// What the walk of QEMU's `virt` machine with the disk must show, from
+/// `virtio_pci::qemu`: the host bridge at device 0, the disk at device 1
+/// with INTA, one BAR (BAR 4, 64-bit, of the table's length) and the
+/// common configuration at its start; no other function.
+pub fn check_qemu(functions: &[Function]) -> Result<(), String> {
+    let disk = virtio_pci::qemu::DISK;
+    let (vendor, id) = (disk.id & 0xFFFF, disk.id >> 16);
+    let device = virtio_pci::qemu::DISK_DEVICE as u32;
+    let [bridge, store] = functions else {
+        return Err(format!("{} functions, 2 expected", functions.len()));
+    };
+    if (bridge.device, bridge.function, bridge.vendor, bridge.id) != (0, 0, 0x1b36, 0x0008) {
+        return Err(format!(
+            "device 0 function 0 is {:04x}:{:04x}, 1b36:0008 expected",
+            bridge.vendor, bridge.id
+        ));
+    }
+    if (store.device, store.function) != (device, 0) || (store.vendor, store.id) != (vendor, id) {
+        return Err(format!(
+            "the disk is {vendor:04x}:{id:04x} at device {device} function 0, found {:04x}:{:04x} at device {} function {}",
+            store.vendor, store.id, store.device, store.function
+        ));
+    }
+    if store.class >> 16 != 0x01 || store.pin != 1 {
+        return Err(format!(
+            "class {:06x} pin {}, storage with INTA expected",
+            store.class, store.pin
+        ));
+    }
+    let bar = format!("bar {} size {:#x} mem64", disk.index, disk.len);
+    let common = format!("common bar {} offset 0x0", disk.index);
+    let bars = store
+        .details
+        .iter()
+        .filter(|d| d.starts_with("bar "))
+        .count();
+    for wanted in [bar.as_str(), common.as_str()] {
+        if !store.details.iter().any(|d| d == wanted) {
+            return Err(format!("the disk lacks {wanted:?}: {:?}", store.details));
+        }
+    }
+    if bars != 1 {
+        return Err(format!(
+            "the disk has {bars} BARs, one expected: {:?}",
+            store.details
+        ));
+    }
+    Ok(())
+}
+
+/// `cargo xtask pci-walk [--hvf]`: the walk on QEMU with a disk file of
+/// 1 MiB; with `--hvf`, on both HVF machines.
+pub fn command_qemu(args: &[String]) -> Result<(), String> {
+    let machines: &[&qemu::Machine] = match args {
+        [] => &[&qemu::VIRT],
+        [flag] if flag == "--hvf" => {
+            hvf_host()?;
+            &[&qemu::HVF_V3, &qemu::HVF_V2]
+        }
+        _ => return Err("usage: cargo xtask pci-walk [--hvf]".into()),
+    };
+    let kernel = build(Variant::Normal)?;
+    let boot = build_boot_image("boot-pci-walk-qemu.img", &PROGRAMS_QEMU, BOOT_PROFILE)?;
+    // One file per run, so that runs side by side share no disk.
+    let store = std::env::temp_dir().join(format!("stafeto-pci-walk-{}.img", std::process::id()));
+    let result = qemu::store_file(&store, 1 << 20, true)
+        .and_then(|()| walk(machines, &kernel, &boot, &store));
+    let _ = std::fs::remove_file(&store);
+    result
+}
+
+fn walk(
+    machines: &[&qemu::Machine],
+    kernel: &Artifacts,
+    boot: &Path,
+    store: &Path,
+) -> Result<(), String> {
+    for machine in machines {
+        let mut cmd = qemu::command(machine, &kernel.image, Some(boot));
+        cmd.args(qemu::HEADLESS).args(qemu::store(store, None));
+        let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+        let result = run.expect_seen(DONE, BOOT_TIMEOUT);
+        let lines: Vec<String> = run.lines().to_vec();
+        run.stop();
+        result.map_err(|e| format!("pci-walk on {}: {e}", machine.name))?;
+        let functions = parse(&lines);
+        check_qemu(&functions).map_err(|e| format!("pci-walk on {}: {e}", machine.name))?;
+        println!("pci-walk on {}: ok", machine.name);
+    }
+    Ok(())
+}
+
 pub fn command(args: &[String]) -> Result<(), String> {
     let net = match args {
         [] => 0,
@@ -141,7 +249,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         _ => return Err("usage: cargo xtask pci-walk-vz [--net N]".into()),
     };
     let kernel = build(Variant::Normal)?;
-    let boot = build_boot_image("boot-pci-walk-vz.img", &PROGRAMS, BOOT_PROFILE)?;
+    let boot = build_boot_image("boot-pci-walk-vz.img", &PROGRAMS_VZ, BOOT_PROFILE)?;
     let suffix = if net > 0 {
         Some(vz::claim_suffix()?)
     } else {
@@ -231,6 +339,66 @@ pci: dev 6 fn 0 id 1af4:1044 class 00ff00 header 00 pin 1
             check(&parse(&lines(&moved)), 1)
                 .unwrap_err()
                 .contains("device 5")
+        );
+    }
+    const QEMU_WALK: &str = "\
+pci: dev 0 fn 0 id 1b36:0008 class 060000 header 00 pin 0
+pci: dev 1 fn 0 id 1af4:1042 class 010000 header 00 pin 1
+pci: dev 1 fn 0 bar 4 size 0x4000 mem64
+pci: dev 1 fn 0 cap type 5 bar 0 offset 0x0 length 0x0
+pci: dev 1 fn 0 cap type 2 bar 4 offset 0x3000 length 0x1000
+pci: dev 1 fn 0 cap type 4 bar 4 offset 0x2000 length 0x1000
+pci: dev 1 fn 0 cap type 3 bar 4 offset 0x1000 length 0x1000
+pci: dev 1 fn 0 cap type 1 bar 4 offset 0x0 length 0x1000
+pci: dev 1 fn 0 common bar 4 offset 0x0
+";
+
+    #[test]
+    fn the_walk_of_qemu_shows_the_disk_the_table_names() {
+        let functions = parse(&lines(QEMU_WALK));
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[1].pin, 1);
+        check_qemu(&functions).unwrap();
+    }
+
+    #[test]
+    fn another_id_a_bigger_bar_or_a_moved_structure_fails() {
+        let other = QEMU_WALK.replace("1af4:1042", "1af4:1001");
+        assert!(
+            check_qemu(&parse(&lines(&other)))
+                .unwrap_err()
+                .contains("1042")
+        );
+        let bigger = QEMU_WALK.replace("size 0x4000", "size 0x8000");
+        assert!(
+            check_qemu(&parse(&lines(&bigger)))
+                .unwrap_err()
+                .contains("bar 4 size 0x4000")
+        );
+        let moved = QEMU_WALK.replace("common bar 4", "common bar 0");
+        assert!(
+            check_qemu(&parse(&lines(&moved)))
+                .unwrap_err()
+                .contains("common bar 4")
+        );
+        let more =
+            format!("{QEMU_WALK}pci: dev 2 fn 0 id 1af4:1041 class 020000 header 00 pin 1\n");
+        assert!(
+            check_qemu(&parse(&lines(&more)))
+                .unwrap_err()
+                .contains("3 functions")
+        );
+        let extra_bar = format!("{QEMU_WALK}pci: dev 1 fn 0 bar 0 size 0x1000 io\n");
+        assert!(
+            check_qemu(&parse(&lines(&extra_bar)))
+                .unwrap_err()
+                .contains("2 BARs")
+        );
+        let moved_dev = QEMU_WALK.replace("dev 1 fn 0", "dev 2 fn 0");
+        assert!(
+            check_qemu(&parse(&lines(&moved_dev)))
+                .unwrap_err()
+                .contains("device 1")
         );
     }
 }

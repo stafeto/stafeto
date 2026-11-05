@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The configuration space of a Virtio PCI function on Apple VZ, as its
-//! driver sets it up before the Virtio transport reads it: memory
-//! decoding off, the BARs at addresses of the host bridge's windows
+//! The configuration space of a Virtio PCI function on Apple VZ and on
+//! QEMU's `virt` machine, as its driver sets it up before the Virtio transport reads it: memory
+//! and I/O decoding off, the BARs at addresses of the host bridge's windows
 //! (`ranges` of the tree) that the driver's `Place` names, then memory
 //! decoding on; bus mastering comes only after the driver reset the
 //! device (`bus_master`), so that the device starts from no queue. The
@@ -30,6 +30,8 @@ pub struct Place {
 pub const ID: usize = 0x00;
 /// Command (low half) and status (high half).
 pub const COMMAND: usize = 0x04;
+/// I/O space decoding.
+pub const IO: u32 = 1 << 0;
 pub const MEMORY: u32 = 1 << 1;
 pub const BUS_MASTER: u32 = 1 << 2;
 /// INTx Disable: with it set the function raises no INTA, and a driver's
@@ -55,11 +57,11 @@ pub const BAR2: usize = 0x18;
 impl Place {
     /// The writes that set the function up, in their order, as (offset,
     /// value), from `command`, the command word read before them:
-    /// decoding and bus mastering off, the BARs, decoding on.
+    /// memory and I/O decoding and bus mastering off, the BARs, decoding on.
     pub fn set_up(&self, command: u32) -> [(usize, u32); 5] {
         let command = command & 0xFFFF & !BUS_MASTER & !INTX_DISABLE;
         [
-            (COMMAND, command & !MEMORY),
+            (COMMAND, command & !(MEMORY | IO)),
             // The low word keeps its type bits and the low half of the
             // address: a 64-bit memory BAR.
             (BAR0, self.bar as u32 | 0b100),
@@ -68,6 +70,93 @@ impl Place {
             (COMMAND, command | MEMORY),
         ]
     }
+}
+
+/// A function whose Virtio structures lie in one 64-bit memory BAR, the
+/// register pair `index`, `index + 1`: the shape of a modern Virtio PCI
+/// device on QEMU's `virt` machine, where no firmware has placed the BAR
+/// and the driver does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bar64 {
+    pub id: u32,
+    pub index: usize,
+    pub bar: u64,
+    pub len: u64,
+}
+
+impl Bar64 {
+    /// The offset of the low register of the BAR.
+    pub const fn register(&self) -> usize {
+        0x10 + 4 * self.index
+    }
+
+    /// The writes that set the function up, in their order, as (offset,
+    /// value), from `command`, the command word read before them:
+    /// memory and I/O decoding and bus mastering off, the BAR, decoding on.
+    pub fn set_up(&self, command: u32) -> [(usize, u32); 4] {
+        let command = command & 0xFFFF & !BUS_MASTER & !INTX_DISABLE;
+        [
+            (COMMAND, command & !(MEMORY | IO)),
+            // The type bits (64-bit, prefetchable) are the device's own;
+            // writing them leaves them as they are.
+            (self.register(), self.bar as u32 | 0b1100),
+            (self.register() + 4, (self.bar >> 32) as u32),
+            (COMMAND, command | MEMORY),
+        ]
+    }
+}
+
+/// QEMU's `virt` machine with `highmem-ecam=off` (xtask sets it on every
+/// machine): ECAM below 4 GiB, the 32-bit window of the host bridge, and
+/// the INTx swizzle of the tree's `interrupt-map`.
+pub mod qemu {
+    use super::Bar64;
+
+    /// ECAM: buses 0 to 15.
+    pub const ECAM: u64 = 0x3f00_0000;
+    pub const ECAM_LEN: u64 = 0x100_0000;
+    /// The 32-bit window of the host bridge; PCI address = CPU address.
+    pub const MMIO32: u64 = 0x1000_0000;
+    pub const MMIO32_LEN: u64 = 0x2eff_0000;
+    /// The 64-bit window. Unused: QEMU drops it under HVF on hosts with a
+    /// 36-bit IPA, so every BAR of the table lies in `MMIO32`.
+    pub const MMIO64: u64 = 0x80_0000_0000;
+    pub const MMIO64_LEN: u64 = 0x80_0000_0000;
+    /// INTA to INTD of device 0 are SPI 3 to 6.
+    pub const INTX_FIRST: u32 = 35;
+    pub const PAGE: u64 = 4096;
+
+    /// The page of function 0 of `device` on bus 0.
+    pub const fn function(device: u64) -> u64 {
+        ECAM + (device << 15)
+    }
+
+    /// The INTID of pin `pin` (1 = INTA) of `device`: the swizzle of the
+    /// tree's `interrupt-map`.
+    pub const fn intx(device: u64, pin: u32) -> u32 {
+        assert!(pin >= 1 && pin <= 4);
+        INTX_FIRST + ((device as u32 + pin - 1) % 4)
+    }
+
+    /// The disk: device 1, modern virtio-blk, BAR 4 of 16 KiB at the start
+    /// of `MMIO32`. Further devices of the table follow from there, each
+    /// aligned to its size.
+    pub const DISK_DEVICE: u64 = 1;
+    pub const DISK: Bar64 = Bar64 {
+        id: 0x1042_1af4,
+        index: 4,
+        bar: MMIO32,
+        len: 0x4000,
+    };
+    pub const DISK_FUNCTION: u64 = function(DISK_DEVICE);
+    pub const DISK_LINE: u32 = intx(DISK_DEVICE, 1);
+
+    const _: () = {
+        assert!(DISK.bar.is_multiple_of(DISK.len));
+        assert!(DISK.bar + DISK.len <= MMIO32 + MMIO32_LEN);
+        assert!(DISK_FUNCTION + PAGE <= ECAM + ECAM_LEN);
+        assert!(DISK_LINE >= INTX_FIRST && DISK_LINE <= INTX_FIRST + 3);
+    };
 }
 
 /// The command word once the device is reset: decoding and bus mastering,
@@ -121,7 +210,7 @@ mod tests {
     #[test]
     fn set_up_turns_decoding_off_around_the_bars_and_leaves_mastering_off() {
         let writes = CONSOLE.set_up(0x0010_0007);
-        assert_eq!(writes[0], (COMMAND, 0x0001));
+        assert_eq!(writes[0], (COMMAND, 0x0000));
         assert_eq!(writes[4], (COMMAND, 0x0003));
         assert_eq!(writes[1..4], [(BAR0, 4), (BAR1, 1), (BAR2, 0x5000_0000)]);
         let mut commands = writes.iter().filter(|&&(at, _)| at == COMMAND);
@@ -149,6 +238,69 @@ mod tests {
         assert!(writes.iter().all(|&(_, v)| v & INTX_DISABLE == 0));
         assert_eq!(writes[4], (COMMAND, MEMORY));
         assert_eq!(bus_master(0x0000_0402), 0x0006);
+    }
+
+    #[test]
+    fn bar64_sets_the_function_up_around_its_bar() {
+        let writes = qemu::DISK.set_up(0x0010_0407);
+        assert_eq!(
+            writes,
+            [
+                (COMMAND, 0x0000),
+                (0x20, 0x1000_000C),
+                (0x24, 0),
+                (COMMAND, 0x0003),
+            ]
+        );
+        assert!(
+            writes
+                .iter()
+                .filter(|&&(at, _)| at == COMMAND)
+                .all(|&(_, v)| v & (BUS_MASTER | INTX_DISABLE) == 0)
+        );
+        let high = Bar64 {
+            bar: 0x80_0000_4000,
+            ..qemu::DISK
+        };
+        assert_eq!(high.set_up(0)[1..3], [(0x20, 0x0000_400C), (0x24, 0x80)]);
+        assert_eq!(qemu::DISK.register(), 0x20);
+    }
+
+    #[test]
+    fn intx_follows_the_interrupt_map_of_the_tree() {
+        // QEMU 11.1.2, dumpdtb, highmem-ecam=off: (device, pin, SPI).
+        let map: [(u64, u32, u32); 16] = [
+            (0, 1, 3),
+            (0, 2, 4),
+            (0, 3, 5),
+            (0, 4, 6),
+            (1, 1, 4),
+            (1, 2, 5),
+            (1, 3, 6),
+            (1, 4, 3),
+            (2, 1, 5),
+            (2, 2, 6),
+            (2, 3, 3),
+            (2, 4, 4),
+            (3, 1, 6),
+            (3, 2, 3),
+            (3, 3, 4),
+            (3, 4, 5),
+        ];
+        for (device, pin, spi) in map {
+            assert_eq!(
+                qemu::intx(device, pin),
+                32 + spi,
+                "device {device} pin {pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_disk_sits_where_the_tree_puts_it() {
+        assert_eq!(qemu::function(1), 0x3f00_8000);
+        assert_eq!(qemu::DISK_FUNCTION, 0x3f00_8000);
+        assert_eq!(qemu::DISK_LINE, 36);
     }
 
     /// A configuration space of 256 bytes as words, read by offset.

@@ -248,6 +248,7 @@ dependencies = [
  "proto-wire",
  "rt",
  "uart",
+ "virtio-pci",
 ]
 
 [[package]]
@@ -1349,6 +1350,7 @@ dependencies = [
  "proto-net",
  "proto-wire",
  "rtc",
+ "virtio-pci",
 ]
 
 [[package]]

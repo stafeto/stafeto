@@ -1707,6 +1707,7 @@ commands:
             under -icount: fills, a restart of the driver, its longest
             steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
   entropy-vz run the probe of the entropy device's driver on Apple VZ
+  pci-walk [--hvf]      walk bus 0 on QEMU with the disk (virtio-blk-pci)
   pci-walk-vz [--net N] walk bus 0 on Apple VZ with N network devices (0 to 2)
             and check the console, the entropy device and the network functions
   gpu-probe [--hvf] run the probe of the display service in QEMU: a pattern
@@ -2038,6 +2039,7 @@ fn main() {
             Some(_) => Err("entropy [--hvf]".to_owned()),
         },
         Some("entropy-vz") => entropy::probe_vz(),
+        Some("pci-walk") => pci_walk::command_qemu(&args[1..]),
         Some("pci-walk-vz") => pci_walk::command(&args[1..]),
         Some("gpu-probe") => match args.get(1).map(String::as_str) {
             None => gpu_probe::probe(&qemu::VIRT),
@@ -8999,6 +9001,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("tty", || tty_probe(false)),
         // The entropy device's driver under -icount, its steps measured.
         job("entropy", || entropy::probe(&qemu::VIRT)),
+        // The bus walk of QEMU's `virt` with the disk: the numbers of
+        // virtio_pci::qemu against the machine.
+        job("pci-walk", || pci_walk::command_qemu(&[])),
         job("posix-random", || entropy::random_probe(&qemu::VIRT)),
         job("posix-display", || posix_display::probe(&qemu::VIRT)),
         // The screen and the keys of libc.so against QEMU's screenshots and

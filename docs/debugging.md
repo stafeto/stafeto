@@ -5,7 +5,7 @@
 1. Run QEMU with an exception log:
 
    ```
-   qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m 512M -nographic \
+   qemu-system-aarch64 -M virt,gic-version=2,highmem-ecam=off -cpu cortex-a72 -m 512M -nographic \
      -kernel target/stafeto.img -initrd target/boot.img \
      -d int,cpu_reset,guest_errors -D qemu.log
    ```
@@ -179,9 +179,9 @@ output and xtask prints how to enable symbolization.
 `cargo xtask hvf` runs the boot checks, the console dialog with the
 shell, the test init and the kernel tests under HVF on a Mac with Apple
 silicon, on two machines:
-`-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on -cpu host`, with
+`-machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on -cpu host`, with
 Apple's GICv3 in the macOS kernel, and
-`-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
+`-machine virt,gic-version=2,highmem-ecam=off -accel hvf,kernel-irqchip=off -cpu host`,
 with QEMU's GICv2. On any other host it prints why it skips and succeeds;
 `cargo xtask ci` does not run it. `cargo xtask run --hvf` boots the
 normal build on the first machine with the console on the terminal, and
@@ -190,10 +190,19 @@ fails with the reason on any other host. To run one by hand, after
 `CARGO_TARGET_DIR` when it is set):
 
 ~~~
-qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf,kernel-irqchip=on \
+qemu-system-aarch64 -machine virt,gic-version=3,highmem-ecam=off -accel hvf,kernel-irqchip=on \
   -cpu host -m 512M -display none -serial stdio -monitor none \
   -kernel target/stafeto-ktest.img -initrd target/boot.img
 ~~~
+
+A machine with a disk gets it from `qemu::store` (`xtask/src/qemu.rs`): a
+modern virtio-blk-pci at device 1 of bus 0 over a raw file, with
+`cache=writeback`, no legacy interface and no MSI-X. With
+`highmem-ecam=off` the ECAM is at 0x3f00_0000, so the disk is the function
+at 0x3f00_8000, its BAR 4 sits at 0x1000_0000, and its INTx is line 36 (the
+swizzle of the tree's `interrupt-map`). `cargo xtask pci-walk [--hvf]`
+boots a probe that prints the functions of the bus with the disk attached
+and checks them; run it first when a disk driver sees no device.
 
 What differs from QEMU's own emulation:
 
