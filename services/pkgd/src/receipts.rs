@@ -135,6 +135,13 @@ pub struct BeginArgs<'a> {
     pub world: bool,
 }
 
+/// What to do with the result of a job whose session went before anyone took it: a begin
+/// that was made opened a group that no session owns, and the group is dropped (with its
+/// object); every other result is forgotten, since the other jobs end their group themselves.
+pub fn orphan_drops_group(begin: bool, code: u32) -> bool {
+    begin && code == 0
+}
+
 /// A package received and checked, that waits for the end of its group.
 #[derive(Clone, Copy, Debug)]
 pub struct Staged {

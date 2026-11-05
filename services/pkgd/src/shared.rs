@@ -75,8 +75,8 @@ pub static DISK_PACKAGES: AtomicU32 = AtomicU32::new(0);
 pub static IMAGE_PACKAGES: AtomicU32 = AtomicU32::new(0);
 pub static SETTINGS_LEN: AtomicUsize = AtomicUsize::new(0);
 pub static LAYER: AtomicU32 = AtomicU32::new(0);
-/// A change of the state is being made: `TABLE`, the entries and the blobs are not to be read.
-pub static WRITING: AtomicBool = AtomicBool::new(false);
+/// The count of changes of the state: odd while `TABLE`, the entries and the blobs change.
+pub static SEQ: pkgd::seq::Seq = pkgd::seq::Seq::new();
 /// The longest of each kind of work, in ticks, for the line of the report.
 pub static SHA_TICKS: AtomicU64 = AtomicU64::new(0);
 pub static PARSE_TICKS: AtomicU64 = AtomicU64::new(0);

@@ -16,6 +16,7 @@ pub mod commit;
 pub mod packages;
 pub mod plans;
 pub mod receipts;
+pub mod seq;
 pub mod settings;
 pub mod store;
 pub mod verify;
@@ -27,6 +28,8 @@ pub mod host;
 mod commit_tests;
 #[cfg(test)]
 mod receipts_tests;
+#[cfg(test)]
+mod seq_tests;
 #[cfg(test)]
 mod settings_tests;
 #[cfg(test)]

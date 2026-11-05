@@ -420,3 +420,22 @@ fn a_session_that_goes_at_any_step_leaves_the_store_free() {
         );
     }
 }
+
+#[test]
+fn a_begin_that_finished_for_a_session_that_went_leaves_no_group_behind() {
+    // The job ran after the cancel of the session was spent on a store with no group.
+    assert!(orphan_drops_group(true, 0));
+    assert!(!orphan_drops_group(true, proto_pkg::NO_SPACE));
+    assert!(!orphan_drops_group(false, 0));
+    // The group such a begin opened has its owner and its object until it is dropped, and
+    // then the store takes another session at once.
+    let t = table();
+    let mut g = Group::new();
+    begin(&mut g, OWNER, &t, "a", 2 * BLOCK as u64).unwrap();
+    assert_eq!(
+        begin(&mut g, 8, &t, "b", 2 * BLOCK as u64),
+        Err(proto_pkg::BUSY)
+    );
+    g.release();
+    assert!(begin(&mut g, 8, &t, "b", 2 * BLOCK as u64).is_ok());
+}

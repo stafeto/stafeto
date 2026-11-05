@@ -363,8 +363,8 @@ impl Worker {
             unsafe {
                 let (entries, objects) = (&mut *DISK_ENTRIES.get(), &mut *OBJECTS.get());
                 for &slot in (*NEXT.get()).detach() {
-                    entries[slot] = None;
                     PUBLISHED[slot].store(false, Release);
+                    entries[slot] = None;
                     objects[slot] = None;
                 }
                 for (i, &slot) in (*NEXT.get()).attach().iter().enumerate() {
@@ -416,19 +416,20 @@ impl Worker {
     /// The state `now` is the store's: the main thread reads the table, the entries and the
     /// blobs again after `apply` changed them.
     fn publish(&mut self, now: Opened, apply: impl FnOnce(&mut Worker)) {
-        WRITING.store(true, Release);
-        let scratch = next();
-        let copy: &Table = scratch;
-        // SAFETY: nothing else reads the table while WRITING is set.
-        unsafe { (*TABLE.get()).0 = copy.0 };
-        // SAFETY: as above.
-        unsafe { *OPENED.get() = Some(now) };
-        GENERATION.store(now.superblock.generation, Release);
-        FREE.store(commit::free_of(table(), &now), Release);
-        apply(self);
-        let live = PUBLISHED.iter().filter(|p| p.load(Acquire)).count();
-        DISK_PACKAGES.store(live as u32, Release);
-        WRITING.store(false, Release);
+        let copy: &Table = next();
+        let free = commit::free_of(copy, &now);
+        SEQ.write(|| {
+            // SAFETY: the count is odd: a read that overlaps is thrown away by its reader.
+            unsafe {
+                (*TABLE.get()).0 = copy.0;
+                *OPENED.get() = Some(now);
+            }
+            GENERATION.store(now.superblock.generation, Release);
+            FREE.store(free, Release);
+            apply(self);
+            let live = PUBLISHED.iter().filter(|p| p.load(Acquire)).count();
+            DISK_PACKAGES.store(live as u32, Release);
+        });
     }
 
     /// REMOVE of the names in the job.
@@ -465,8 +466,8 @@ impl Worker {
             unsafe {
                 let (entries, objects) = (&mut *DISK_ENTRIES.get(), &mut *OBJECTS.get());
                 for &slot in &slots[..n] {
-                    entries[slot] = None;
                     PUBLISHED[slot].store(false, Release);
+                    entries[slot] = None;
                     objects[slot] = None;
                 }
             }

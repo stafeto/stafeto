@@ -24,7 +24,7 @@ mod worker;
 use abi::{Access, Error, Rights, Source};
 use core::sync::atomic::Ordering::{Acquire, Release};
 use pkgd::packages::Entry;
-use pkgd::receipts::check_feed;
+use pkgd::receipts::{check_feed, orphan_drops_group};
 use pkgd::store::{self, PACKAGES};
 use proto_pkg::{
     BEGIN_WORLD, BUFFER_SIZE, CELL_BYTES, COMMIT_END, Feed, INFO_MAX, LIST_MAX, Method,
@@ -214,8 +214,18 @@ fn refuse(c: u32) -> Answer {
     Answer::Status(code(c))
 }
 
-fn busy_reads() -> bool {
-    WRITING.load(Acquire)
+/// The count a read starts from, or the BUSY it answers while the worker changes the state
+/// (`pkgd::seq`): a read ends by checking the count again, and answers BUSY when it moved.
+fn start_read() -> Result<u32, Answer> {
+    SEQ.begin().ok_or_else(|| refuse(proto_pkg::BUSY))
+}
+
+fn end_read(start: u32, answer: Answer) -> Answer {
+    if SEQ.unchanged(start) {
+        answer
+    } else {
+        refuse(proto_pkg::BUSY)
+    }
 }
 
 /// The entry at LIST position `i`: the disk's 64, then the image's.
@@ -241,9 +251,10 @@ impl Pkgd {
         let Ok(first) = read_word(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        if busy_reads() {
-            return refuse(proto_pkg::BUSY);
-        }
+        let start = match start_read() {
+            Ok(start) => start,
+            Err(busy) => return busy,
+        };
         let end = PACKAGES + IMAGE_MAX;
         let mut at = first as usize;
         let mut found = [None; LIST_MAX as usize];
@@ -280,16 +291,17 @@ impl Pkgd {
                 return Answer::Status(Status::BadSize);
             }
         }
-        Answer::Reply(Outgoing::new())
+        end_read(start, Answer::Reply(Outgoing::new()))
     }
 
     fn info(&self, r: &mut Request<'_>) -> Answer {
         let Ok((name, offset)) = read_info(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        if busy_reads() {
-            return refuse(proto_pkg::BUSY);
-        }
+        let start = match start_read() {
+            Ok(start) => start,
+            Err(busy) => return busy,
+        };
         let found = (0..PACKAGES + IMAGE_MAX)
             .filter_map(listed)
             .find(|e| e.name() == name);
@@ -307,17 +319,24 @@ impl Pkgd {
         {
             return Answer::Status(Status::BadSize);
         }
-        Answer::Reply(Outgoing::new())
+        // The entry is not held past this step: the bytes are in the reply, and a change
+        // that came meanwhile throws the reply away.
+        end_read(start, Answer::Reply(Outgoing::new()))
     }
 
     fn serial(&self, r: &mut Request<'_>) -> Answer {
         let Ok((repo, _)) = proto_pkg::read_serial(r.body(), false) else {
             return Answer::Status(Status::BadSize);
         };
-        if STARTING.load(Acquire) || busy_reads() {
+        if STARTING.load(Acquire) {
             return Answer::Status(code(proto_pkg::BUSY));
         }
-        // SAFETY: nothing writes the table while WRITING is clear and the start is over.
+        let start = match start_read() {
+            Ok(start) => start,
+            Err(busy) => return busy,
+        };
+        // SAFETY: the start is over; a change that comes while this reads is seen by the check
+        // at the end, and the copy of the number is all that is kept.
         let table = unsafe { &*TABLE.get() };
         let serial = table
             .find_repo(repo)
@@ -327,16 +346,17 @@ impl Pkgd {
         if w.u32(0).and_then(|()| w.u64(serial)).is_err() {
             return Answer::Status(Status::BadSize);
         }
-        Answer::Reply(Outgoing::new())
+        end_read(start, Answer::Reply(Outgoing::new()))
     }
 
     fn status(&self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if busy_reads() {
-            return refuse(proto_pkg::BUSY);
-        }
+        let start = match start_read() {
+            Ok(start) => start,
+            Err(busy) => return busy,
+        };
         let mut flags = 0;
         for (on, bit) in [
             (DAMAGED.load(Acquire), STATUS_DAMAGED),
@@ -359,7 +379,7 @@ impl Pkgd {
         if w.u32(0).and_then(|()| stat.write(w)).is_err() {
             return Answer::Status(Status::BadSize);
         }
-        Answer::Reply(Outgoing::new())
+        end_read(start, Answer::Reply(Outgoing::new()))
     }
 
     /// BUFFER: the client's object, four cells, mapped for the session's life.
@@ -415,13 +435,18 @@ impl Pkgd {
         let Some(place) = s.data.buffer else {
             return Answer::Status(code(proto_pkg::NO_BUFFER));
         };
-        if STARTING.load(Acquire) || busy_reads() {
+        if STARTING.load(Acquire) {
             return Answer::Status(code(proto_pkg::BUSY));
         }
+        let start = match start_read() {
+            Ok(start) => start,
+            Err(busy) => return busy,
+        };
         let len = SETTINGS_LEN.load(Acquire);
         let from = (offset as usize).min(len);
         let n = (len - from).min(CELL_BYTES as usize);
-        // SAFETY: the blob is the main thread's now; the cell is the client's, written raw.
+        // SAFETY: a change that comes while this copies is seen by the check below, which
+        // throws the copy away; the cell is the client's, written raw.
         unsafe {
             let blob = (*SETTINGS.get()).as_ptr().add(from);
             core::ptr::copy_nonoverlapping(blob, buffer_at(usize::from(place)) as *mut u8, n);
@@ -435,7 +460,7 @@ impl Pkgd {
         if w.u32(0).and_then(|()| reply.write(w)).is_err() {
             return Answer::Status(Status::BadSize);
         }
-        Answer::Reply(Outgoing::new())
+        end_read(start, Answer::Reply(Outgoing::new()))
     }
 
     /// Wakes the worker.
@@ -739,6 +764,11 @@ impl Pkgd {
                 self.ops.tell(label, key);
             }
             None => {
+                // A begin that finished for a session that went opened a group no one owns.
+                if orphan_drops_group(kind == JobKind::Begin, JOB_CODE.load(Acquire)) {
+                    CANCEL.store(true, Release);
+                    self.wake();
+                }
                 JOB_STATE.store(IDLE, Release);
                 self.release_stale();
             }
