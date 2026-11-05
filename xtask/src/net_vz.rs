@@ -532,10 +532,13 @@ fn owner(
     let cidr = format!("{}/{}", second.address, second.prefix);
     let claimed = format!("fast-echo: claimed {cidr} mac {}", MACS[1]);
     let renewed = format!("net: renew1 {cidr}");
-    let again = if static1 {
-        format!("net: static1 {cidr}")
-    } else {
-        format!("net: lease1 {cidr}")
+    // The static address needs no lease and prints no line when the device
+    // comes back: the second claim shows the address is kept.
+    let again = (!static1).then(|| format!("net: lease1 {cidr}"));
+    let back = |again: &Option<String>| -> Vec<String> {
+        std::iter::once("net: device 1 back".to_owned())
+            .chain(again.clone())
+            .collect()
     };
     let mut socket_target = None;
     for round in 1..=2 {
@@ -560,6 +563,35 @@ fn owner(
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|e| format!("timeout: {e}"))?;
+        std::thread::sleep(Duration::from_millis(
+            std::env::var("PAUSE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        ));
+        if std::env::var("EXPERIMENT").is_ok() {
+            let begin = Instant::now();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .map_err(|e| format!("timeout: {e}"))?;
+            let mut buffer = [0u8; 64];
+            let mut answered = Vec::new();
+            for seq in 0u8..60 {
+                let _ = socket.send(&[seq; 32]);
+                let until = Instant::now() + Duration::from_millis(5);
+                while Instant::now() < until {
+                    if let Ok(n) = socket.recv(&mut buffer) {
+                        if n == 32 {
+                            answered.push((buffer[0], begin.elapsed().as_millis()));
+                        }
+                    }
+                }
+            }
+            println!("net-vz: EXPERIMENT answered (seq, ms): {answered:?}");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|e| format!("timeout: {e}"))?;
+        }
         let at = Instant::now();
         let mut sent_again = fast_probe::echoes(socket, 200, 64)?;
         sent_again += fast_probe::echoes(socket, 100, 1400)?;
@@ -611,13 +643,17 @@ fn owner(
         }
         if round == 2 {
             run.send("kill -QUIT $!")?;
-            fast_probe::expect_all(run, &["net: device 1 back", again.as_str()], within)?;
+            let wanted = back(&again);
+            let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+            fast_probe::expect_all(run, &wanted, within)?;
             http_alive(guest, "after the second owner ended")?;
             break;
         }
         let killed_at = Instant::now();
         run.send("kill -9 $!")?;
-        fast_probe::expect_all(run, &["net: device 1 back", again.as_str()], within)?;
+        let wanted = back(&again);
+        let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
+        fast_probe::expect_all(run, &wanted, within)?;
         println!(
             "net-vz: kill -9 to the lease or address again {} ms",
             killed_at.elapsed().as_millis()

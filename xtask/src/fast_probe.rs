@@ -216,7 +216,8 @@ pub fn rate(socket: &UdpSocket, size: usize, span: Duration) -> Result<(u64, u64
         for _ in 0..WINDOW {
             match socket.recv(&mut buffer) {
                 Ok(len) if len == size => got += 1,
-                Ok(len) => return Err(format!("rate: {len} bytes came back for {size}")),
+                // A late echo of an earlier round.
+                Ok(_) => {}
                 Err(_) => break,
             }
         }
@@ -412,18 +413,24 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
         if !steps {
             // The owner waits 1 000 ms at a time. After a pause only the
             // interrupt of the device can wake it in time.
-            std::thread::sleep(Duration::from_secs(2));
-            let woken = echo_time(&socket, b"after a pause of two seconds")?;
-            if woken > IDLE_ECHO_WITHIN {
-                return Err(format!(
-                    "the echo after a pause took {} ms (wanted {} ms at most): the interrupt did not wake the owner",
-                    woken.as_millis(),
-                    IDLE_ECHO_WITHIN.as_millis()
-                ));
+            // Three pauses of different lengths: the wait of the owner is
+            // 1 000 ms, and one echo may come soon by luck of the timer.
+            let mut woke = Vec::new();
+            for pause_ms in [2000, 1300, 1700] {
+                std::thread::sleep(Duration::from_millis(pause_ms));
+                let woken = echo_time(&socket, b"after a pause")?;
+                if woken > IDLE_ECHO_WITHIN {
+                    return Err(format!(
+                        "the echo after a pause of {pause_ms} ms took {} ms (wanted {} ms at most): the interrupt did not wake the owner",
+                        woken.as_millis(),
+                        IDLE_ECHO_WITHIN.as_millis()
+                    ));
+                }
+                woke.push(woken.as_millis().to_string());
             }
             notes.push(format!(
-                "echo after a pause of 2 s {} ms",
-                woken.as_millis()
+                "echoes after pauses of 2.0, 1.3 and 1.7 s {} ms",
+                woke.join(", ")
             ));
             // A datagram that arrives while the owner stays away from its
             // queue brings no interrupt; the owner looks at the queue once
