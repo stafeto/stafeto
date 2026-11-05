@@ -219,6 +219,24 @@ impl<'a> BootImage<'a> {
     /// Parses a container of the given format with the layout rules of the
     /// boot image.
     pub fn parse_as(bytes: &'a [u8], format: &Format) -> Result<BootImage<'a>, Error> {
+        Self::parse_checked(bytes, format, true)
+    }
+
+    /// `parse_as` for a container whose names the caller checks by their
+    /// places (each file has the one name its number gives, as the files of a
+    /// package do): a repeated name cannot get through that check, so the
+    /// search for one, which is quadratic in the files, is left out. The
+    /// caller owns the check: a container with its names unchecked may hold a
+    /// name twice.
+    pub fn parse_places(bytes: &'a [u8], format: &Format) -> Result<BootImage<'a>, Error> {
+        Self::parse_checked(bytes, format, false)
+    }
+
+    fn parse_checked(
+        bytes: &'a [u8],
+        format: &Format,
+        repeats: bool,
+    ) -> Result<BootImage<'a>, Error> {
         let (count, table_end) = header_of(bytes, format)?;
         let image = BootImage { bytes, count };
         let mut end = table_end;
@@ -227,12 +245,20 @@ impl<'a> BootImage<'a> {
             if file.offset < end {
                 return Err(Error::Misplaced(n));
             }
-            if image.files().take(n as usize).any(|f| f.name == file.name) {
+            // The names are checked as bytes of the table: a name is its field
+            // up to the zeros (`file`), so equal names are equal fields.
+            if repeats && (0..n).any(|m| image.name_field(m) == image.name_field(n)) {
                 return Err(Error::DuplicateName(n));
             }
             end = file.offset + file.data.len() as u64;
         }
         Ok(image)
+    }
+
+    /// The bytes of the name of file `n` in the table, which are below `count`.
+    fn name_field(&self, n: u32) -> &'a [u8] {
+        let at = (HEADER_SIZE + ENTRY_SIZE * u64::from(n)) as usize;
+        &self.bytes[at..at + NAME_MAX]
     }
 
     /// The files in the order of the table.
@@ -850,6 +876,30 @@ mod tests {
             Error::DuplicateName(2).to_string(),
             "file 2 has the name of a file before it"
         );
+    }
+
+    /// `parse_places` leaves the search for a repeat to the caller, and is `parse` for all else.
+    #[test]
+    fn places_parse_leaves_the_names_to_the_caller() {
+        let init = write::program(&sample()).unwrap();
+        let good = write::image(&[("init", &init), ("child", b"a"), ("shell", b"b")]).unwrap();
+        assert_eq!(
+            BootImage::parse_places(&good, &BOOT).unwrap().count(),
+            BootImage::parse(&good).unwrap().count()
+        );
+        let mut twice = good.clone();
+        twice[entry_at(2)..entry_at(2) + NAME_MAX].fill(0);
+        twice[entry_at(2)..entry_at(2) + 4].copy_from_slice(b"init");
+        assert_eq!(
+            BootImage::parse(&twice).err(),
+            Some(Error::DuplicateName(2))
+        );
+        let image = BootImage::parse_places(&twice, &BOOT).unwrap();
+        assert_eq!(image.files().filter(|f| f.name == "init").count(), 2);
+        // The other checks stay: a file before the end of the table is misplaced.
+        let mut short = good.clone();
+        short[entry_at(1) + NAME_MAX..entry_at(1) + NAME_MAX + 8].fill(0);
+        assert!(BootImage::parse_places(&short, &BOOT).is_err());
     }
 
     #[test]

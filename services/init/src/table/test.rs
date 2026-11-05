@@ -46,6 +46,7 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     }
 }
 

@@ -79,6 +79,14 @@ extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> 
     let mode = mode();
     let done = match mode.as_slice() {
         b"" => run(),
+        // The client of xtask init-wait: it says when init started it.
+        b"wait" => {
+            say!(
+                "client started at {} ns",
+                rt::time::ticks_to_ns(rt::time::now())
+            );
+            Ok(())
+        }
         other => scenario(other),
     };
     match done {
@@ -216,6 +224,11 @@ impl Pkgd {
 
     /// BUFFER with a new object, mapped for the run when `map`.
     fn buffer(&self, map: bool) -> Result<(), Status> {
+        self.buffer_with(map, true)
+    }
+
+    /// BUFFER, with the identity session of the process after the object when `identity`.
+    fn buffer_with(&self, map: bool, identity: bool) -> Result<(), Status> {
         let object = sys::mem_create(u64::from(pkg::BUFFER_SIZE))?;
         let process = posix_abi::allocation::process();
         if map {
@@ -234,9 +247,20 @@ impl Pkgd {
         )?;
         let mut w = Writer::new();
         pkg::write_word(Method::Buffer, pkg::BUFFER_SIZE, &mut w)?;
+        let who = identity
+            .then(posix_abi::process::identity)
+            .flatten()
+            .and_then(|i| sys::handle_duplicate(i, Rights::NOTIFY | Rights::TRANSFER).ok());
+        let reply = match who {
+            None => sys::send_handles(&self.0, w.as_bytes(), [copy.erase()]),
+            Some(who) => sys::send_handles(&self.0, w.as_bytes(), [copy.erase(), who.erase()]),
+        }
+        .map_err(|r| r.error)?;
         let mut out = [0; MESSAGE_MAX];
-        self.call(w.as_bytes(), Some(copy.erase()), &mut out)
-            .map(drop)
+        match Status::from_code(Reader::new(reply.bytes(&mut out)).u32()?) {
+            Status::Ok => Ok(()),
+            status => Err(status),
+        }
     }
 }
 
@@ -364,6 +388,25 @@ fn run() -> Result<(), Fail> {
         return Err("TAKE of an unknown key");
     }
     say!("clone, a second buffer and an unknown key are refused as they should be");
+    buffers(&pkgd)
+}
+
+/// The places of the buffers: two sessions that are no one's in particular take the two places
+/// for them and a third is BUSY, while the superuser's session still gets one of the two kept for it.
+fn buffers(pkgd: &Pkgd) -> Result<(), Fail> {
+    let (a, b, c, d) = (pkgd.other()?, pkgd.other()?, pkgd.other()?, pkgd.other()?);
+    if a.buffer_with(false, false).is_err() || b.buffer_with(false, false).is_err() {
+        return Err("the two places for any session");
+    }
+    if !is(c.buffer_with(false, false), pkg::BUSY) {
+        return Err("a third session that is not the superuser's has a place");
+    }
+    if d.buffer_with(false, true).is_err() {
+        return Err("the superuser's session has no place kept for it");
+    }
+    say!(
+        "buffers: two places for any session, a third is BUSY, the superuser's session still has one"
+    );
     Ok(())
 }
 
@@ -892,12 +935,87 @@ fn scenario(mode: &[u8]) -> Result<(), Fail> {
                 .map(drop)
                 .map_err(|_| "the settings went through: the crash point was not reached")
         }
+        // The disk service stops answering at the first write of data (xtask store-probe deaf).
+        b"deaf" => deaf(&pkgd, &index),
+        // The disk is deaf from the first read: the start of the service fails (xtask store-probe no-store).
+        b"no-store" => no_store(&pkgd, &index),
         // The store as a restart finds it: what the service lists, its numbers, its tree.
         b"verify" => verify(&pkgd),
         // A format that crashed: the service never finishes its start before the host kills the machine.
         b"crash-format" => begin(&pkgd).map(drop),
         _ => Err("an unknown mode"),
     }
+}
+
+/// The disk service that stops answering in the middle of an installation (built with `deaf`; the
+/// service built with `short-deadline`): the wait of the service ends with IO within the deadline,
+/// the store is as it was and free for the next receipt, and the next installation is refused at
+/// once, since the disk is not asked any more.
+fn deaf(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
+    let was = begin(pkgd)?;
+    let big = index.get(b"big")?;
+    let from = rt::time::now();
+    if !is(pkgd.install(big, &Install::new(b"stafeto", false)), pkg::IO) {
+        return Err("the installation on a deaf disk is not IO");
+    }
+    let first = since_ms(from);
+    // The service waited for the deadline (3 s) and no more than seven times it.
+    if !(2_900..20_000).contains(&first) {
+        return Err("the wait of the service for the disk is not its deadline");
+    }
+    if !snap(pkgd)?.same(&was) {
+        return Err("the store changed");
+    }
+    if pkgd.status().map_err(|_| "STATUS")?.flags & pkg::STATUS_NO_STORE == 0 {
+        return Err("STATUS does not say the store is not served");
+    }
+    let hello = index.get(b"hello")?;
+    let from = rt::time::now();
+    if !is(
+        pkgd.install(hello, &Install::new(b"stafeto", false)),
+        pkg::IO,
+    ) {
+        return Err("the second installation on a deaf disk is not IO");
+    }
+    let second = since_ms(from);
+    // Without the dead mark it would wait for the deadline again (3 s).
+    if second >= 2_000 {
+        say!("the second installation took {second} ms");
+        return Err("the second installation did not end at once");
+    }
+    if !snap(pkgd)?.same(&was) {
+        return Err("the store changed after the second installation");
+    }
+    say!(
+        "the disk stopped answering: INSTALL is IO after {first} ms, the store is as it was and free, the next one is IO after {second} ms"
+    );
+    Ok(())
+}
+
+/// The disk service deaf from its first read (built with `deaf-start`, the package service with
+/// `short-deadline`): the start of the service fails, it says READY all the same, STATUS says the
+/// store is not served and a change is refused IO at once, where it used to be taken and never
+/// answered.
+fn no_store(pkgd: &Pkgd, index: &Index) -> Result<(), Fail> {
+    begin(pkgd)?;
+    if pkgd.status().map_err(|_| "STATUS")?.flags & pkg::STATUS_NO_STORE == 0 {
+        return Err("STATUS does not say the store is not served");
+    }
+    let hello = index.get(b"hello")?;
+    let from = rt::time::now();
+    if !is(
+        pkgd.install(hello, &Install::new(b"stafeto", false)),
+        pkg::IO,
+    ) {
+        return Err("the installation without a store is not IO");
+    }
+    let took = since_ms(from);
+    if took >= 2_000 {
+        say!("the installation took {took} ms");
+        return Err("the installation without a store did not end at once");
+    }
+    say!("the start failed on the disk: STATUS says no store, INSTALL is IO after {took} ms");
+    Ok(())
 }
 
 /// Says what a restarted service made of the store: the status, the names, the settings, the tree.

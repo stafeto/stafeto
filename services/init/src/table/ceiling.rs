@@ -34,6 +34,7 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     },
     Record {
         name: "high",
@@ -57,5 +58,6 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     },
 ];

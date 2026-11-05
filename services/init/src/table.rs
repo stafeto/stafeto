@@ -330,7 +330,24 @@ pub struct Record {
     /// the CPUs that are up (`on_cpus`); the POSIX processes of a record
     /// inherit it through the process service.
     pub cpus: u8,
+    /// The services whose READY the record waits for before it starts
+    /// (spec 5, section 4; `waits.rs`): at most two, each a service of the
+    /// table with no waits of its own.
+    pub waits: &'static [Wait],
 }
+
+/// A service a record waits for: its name, and how long the record waits at
+/// most before it starts all the same, in milliseconds (1 to `WAIT_MAX_MS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wait {
+    pub service: &'static str,
+    pub deadline_ms: u32,
+}
+
+/// The waits of one record at most.
+pub const WAITS_MAX: usize = 2;
+/// The longest deadline of a wait, in milliseconds.
+pub const WAIT_MAX_MS: u32 = 60_000;
 
 /// `cpus` cut to the CPUs that are up (the mask `up`): a record whose mask
 /// names none of them gets all that are up, and `false` says that was so.
@@ -500,6 +517,13 @@ pub enum TableError<'a> {
     Layers {
         record: &'static str,
     },
+    /// A wait for a record that does not exist, is a client, waits itself or
+    /// is the record, a deadline outside 1 to WAIT_MAX_MS ms, or more than
+    /// WAITS_MAX waits.
+    Waits {
+        record: &'static str,
+        service: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -611,6 +635,10 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} is a layer client: there is one at most, it is a native program, and it connects to {RAM_SERVICE}"
             ),
+            TableError::Waits { record, service } => write!(
+                f,
+                "{record} waits for {service}: a wait names another record that is a service with no waits of its own, a deadline of 1 to {WAIT_MAX_MS} ms, and a record has {WAITS_MAX} waits at most, each service once"
+            ),
         }
     }
 }
@@ -685,6 +713,7 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     check_shares(table)?;
     check_cpus(table)?;
     check_layers(table)?;
+    check_waits(table)?;
     Ok(order(table))
 }
 
@@ -717,6 +746,29 @@ fn check_layers(table: &[Record]) -> Result<(), TableError<'static>> {
             return Err(TableError::Layers { record: r.name });
         }
         seen = true;
+    }
+    Ok(())
+}
+
+/// The waits of `table` (spec 5, section 4): each names another record that
+/// is a service and waits for none (so no chain and no cycle of waits), once,
+/// with a deadline of 1 to WAIT_MAX_MS ms; WAITS_MAX at most.
+fn check_waits(table: &[Record]) -> Result<(), TableError<'static>> {
+    for r in table {
+        for (i, wait) in r.waits.iter().enumerate() {
+            let fine = i < WAITS_MAX
+                && (1..=WAIT_MAX_MS).contains(&wait.deadline_ms)
+                && wait.service != r.name
+                && !r.waits[..i].iter().any(|w| w.service == wait.service)
+                && find(table, wait.service.as_bytes())
+                    .is_some_and(|s| !table[s].is_client() && table[s].waits.is_empty());
+            if !fine {
+                return Err(TableError::Waits {
+                    record: r.name,
+                    service: wait.service,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1028,6 +1080,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-pci-walk-qemu") as usize
     + cfg!(feature = "table-blk-probe") as usize
     + cfg!(feature = "table-store-probe") as usize
+    + cfg!(feature = "table-init-wait") as usize
+    + cfg!(feature = "table-pkg-slot") as usize
     + cfg!(feature = "table-net-vz") as usize
     + cfg!(feature = "table-net-vz2") as usize
     + cfg!(feature = "table-bench-vz") as usize
@@ -1096,6 +1150,8 @@ const _: () = assert!(
     feature = "table-pci-walk-qemu",
     feature = "table-blk-probe",
     feature = "table-store-probe",
+    feature = "table-init-wait",
+    feature = "table-pkg-slot",
     feature = "table-net-vz",
     feature = "table-net-vz2",
     feature = "table-bench-vz",
@@ -1213,6 +1269,10 @@ pub const TABLE: &[Record] = pkg::PCI_WALK_QEMU_TABLE;
 pub const TABLE: &[Record] = pkg::BLK_PROBE_TABLE;
 #[cfg(feature = "table-store-probe")]
 pub const TABLE: &[Record] = pkg::STORE_PROBE_TABLE;
+#[cfg(feature = "table-init-wait")]
+pub const TABLE: &[Record] = pkg::INIT_WAIT_TABLE;
+#[cfg(feature = "table-pkg-slot")]
+pub const TABLE: &[Record] = pkg::PKG_SLOT_TABLE;
 #[cfg(feature = "table-input")]
 pub const TABLE: &[Record] = input::TABLE;
 #[cfg(feature = "table-posix-random")]
@@ -1264,6 +1324,7 @@ mod tests {
             root: false,
             shares: Shares::CREATOR,
             cpus: GENERAL_CPUS,
+            waits: &[],
         }
     }
 
@@ -2718,7 +2779,8 @@ mod tests {
     /// The base image is the games table with the network service: the
     /// launcher reaches the display and the network services under the
     /// larger quota of a command, the process service has the pool of the
-    /// network image, and the services of both tables are in it once.
+    /// network image, and the services of both tables are in it once, with
+    /// the disk and the package service, which the launcher waits for.
     #[test]
     fn the_base_table_is_the_games_table_with_the_network_service() {
         assert!(check(base::BASE_TABLE).is_ok());
@@ -2726,7 +2788,9 @@ mod tests {
         let at = |names: &[&str], name: &str| names.iter().position(|&n| n == name).unwrap();
         assert!(at(&names, "input") < at(&names, "gpu"));
         assert!(at(&names, NET_SERVICE) < names.len());
-        names.retain(|&n| n != NET_SERVICE);
+        assert!(at(&names, "blk") < at(&names, "pkgd"));
+        assert!(at(&names, "ramfs") < at(&names, "pkgd"));
+        names.retain(|&n| n != NET_SERVICE && n != "blk" && n != "pkgd");
         let mut games = order_of(doom::TABLE);
         names.sort_unstable();
         games.sort_unstable();
@@ -2738,13 +2802,31 @@ mod tests {
         assert!(launcher.connects.contains(&"gpu"));
         assert!(launcher.connects.contains(&NET_SERVICE));
         assert_eq!(launcher.quota, net::NET_COMMAND_QUOTA);
+        // The launcher gets the package session, and waits 30 s for READY.
+        assert!(launcher.connects.contains(&"pkgd"));
+        assert_eq!(
+            launcher.waits,
+            &[Wait {
+                service: "pkgd",
+                deadline_ms: 30_000
+            }]
+        );
+        assert_eq!(base::PKGD_READY_MS, 30_000);
         let posix = base::BASE_TABLE
             .iter()
             .find(|r| r.name == PROCESS_SERVICE)
             .unwrap();
-        assert_eq!(posix.quota, net::NET_TABLE[2].quota);
-        // The service of the network is the one of the network image.
-        assert_eq!(base::BASE_TABLE.last().unwrap().name, net::NETD.name);
+        // The pool of the network image less the two quotas of a command that
+        // the package service takes from init.
+        assert_eq!(
+            posix.quota + (16 - base::COMMAND_QUOTAS) * net::NET_COMMAND_QUOTA,
+            net::NET_TABLE[2].quota
+        );
+        // The service of the network is the one of the network image, and the
+        // disk and package services close the table: 14 of 16 records.
+        assert_eq!(base::BASE_TABLE[11].name, net::NETD.name);
+        assert_eq!(base::BASE_TABLE.last().unwrap().name, "pkgd");
+        assert_eq!(base::BASE_TABLE.len(), 14);
     }
 
     /// Every POSIX process leaves one level above main for its thread

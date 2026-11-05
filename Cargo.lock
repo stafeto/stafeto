@@ -423,6 +423,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkg-slot-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
+ "proto-pkg",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "pkgd"
 version = "0.2.0"
 dependencies = [
@@ -476,6 +487,7 @@ dependencies = [
  "proto-loader",
  "proto-net",
  "proto-pipe",
+ "proto-pkg",
  "proto-process",
  "proto-tty",
  "proto-uart",

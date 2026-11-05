@@ -31,8 +31,7 @@ impl<T> Shared<T> {
     }
 }
 
-/// The most packages of the boot image the service lists.
-pub const IMAGE_MAX: usize = 16;
+pub use pkgd::packages::IMAGE_MAX;
 /// The most bytes of the revocation list file: the text and its block.
 pub const REVOKED_FILE_MAX: usize = 16 * 1024 + 456;
 
@@ -84,6 +83,11 @@ pub static KEY: Shared<Option<Key>> = Shared::new(None);
 pub static PUBLISHED: [AtomicBool; PACKAGES] = [const { AtomicBool::new(false) }; PACKAGES];
 
 pub static STARTING: AtomicBool = AtomicBool::new(true);
+/// The counter when the process began, for the line of the time its start took.
+pub static BEGAN: AtomicU64 = AtomicU64::new(0);
+/// The store is not served: the start of the worker failed, or the disk service stopped
+/// answering. A change is refused with IO at its gate, and STATUS says so.
+pub static NO_STORE: AtomicBool = AtomicBool::new(false);
 pub static DAMAGED: AtomicBool = AtomicBool::new(false);
 pub static READ_ONLY: AtomicBool = AtomicBool::new(false);
 pub static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +190,10 @@ pub const LABEL_KICK: u64 = 1;
 pub const BUFFERS_AT: usize = 0x58_0000_0000;
 /// The buffers at once, one for each session that gave one.
 pub const BUFFERS: usize = 4;
+/// The places the superuser's sessions alone may take (the first ones): a session that is not
+/// the superuser's has the rest, so that four programs that ask for a buffer and keep it cannot
+/// leave `pkg install` and the changes of the settings without one.
+pub const RESERVED: usize = 2;
 
 pub const fn buffer_at(place: usize) -> usize {
     BUFFERS_AT + place * proto_pkg::BUFFER_SIZE as usize

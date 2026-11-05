@@ -241,6 +241,9 @@ pub unsafe fn posix_init_process(
     // The network service, when the record names it ("net"); none otherwise,
     // and AF_INET stays with the pipe service's loopback. SAFETY: as above.
     unsafe { posix_abi::net::init(rt::service::connect(parent, "net").ok()) };
+    // The package service, when the record names it ("pkgd"); none otherwise,
+    // and a package tool says so. SAFETY: as above.
+    unsafe { posix_abi::packages::init(rt::service::connect(parent, "pkgd").ok()) };
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
     // CLOCK_REALTIME without IPC; a clock service without its page leaves
@@ -501,6 +504,16 @@ fn loaded_main() -> u64 {
     // inherits sockets (inetd style) keeps serving them; the service
     // checks the identity only through the process service. SAFETY: as above.
     unsafe { posix_abi::net::init(one(Slot::Net).map(Handle::from_raw)) };
+    // A set-ID program takes no package session from its caller, who could
+    // put a channel of its own there and have the program believe its
+    // answers: the handle closes. SAFETY: as above.
+    unsafe {
+        posix_abi::packages::init(
+            one(Slot::Packages)
+                .map(Handle::from_raw)
+                .filter(|_| area.flags & SECURE == 0),
+        )
+    };
     posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };

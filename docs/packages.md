@@ -610,11 +610,55 @@ crash point (or for point `N`), kills the machine on the line, starts it again o
 compares the store with the state before or after the change (point 8 allows either; point 13
 checks that the disk is formatted again). `cargo xtask store-probe doom` installs Doom from
 `target/pkg` (`cargo xtask pkg-build freedoom doomgeneric`) as a group and prints the memory the
-service holds. The jobs of the CI are `store-probe`, `store-probe steps` and `store-crash`.
+service holds. The service starts with Doom on the disk (read, hashed, checked and attached, from its first
+instruction to READY) in 522 ms under QEMU's emulation and 103 ms under HVF (`cargo xtask store-probe doom
+[--hvf]`), against the 30 s the launcher waits. The jobs of the CI are `store-probe` (the disk, the empty
+disk, the full scenario and `deaf`), `store-probe steps` and `store-crash`.
+
+**The wait for the disk.** The worker waits for the notification of the disk service at most 10 s for a
+request (a timer on its channel). A service that died or stopped answering with a request in flight
+leaves the thread no other end; past the deadline the disk is dead for this run of `pkgd`
+(`pkgd: the disk service did not answer in time`), the job that waits ends with `IO` and drops its
+group, and every later request that needs the disk is `IO` at once. The disk service that restarts is
+not followed: the machine is restarted (the reconnection the design note promised is not made; it is a task before the tool `pkg`). STATUS says `no store` (flag 8) once the disk is dead and when the start of the worker failed, and a change is `IO` at its gate; the service says READY in both cases. `cargo xtask store-probe deaf` builds the disk service to go
+deaf at the first write of a package's data and `pkgd` with a wait of 3 s: the installation is `IO`
+after the deadline, the store is as it was and free, and the next one is `IO` at once. `store-probe no-store` builds the disk service deaf from its first read: the start fails, STATUS says no store and an installation is `IO` at once. The jobs of the
+CI add `init-wait` and `pkg-slot` below.
+
+**The buffers.** There are four places. BUFFER may bring the identity session of the process after
+the object; the service asks the process service who it is (Vouch), and the superuser's session may
+take any place, any other session the two last ones (BUSY when they are in use). Four programs that
+are not the superuser's cannot keep `pkg install` from a buffer. The stack of the worker is an
+object of its own with no mapping on the page below it: an overflow faults on that page and ends the
+process.
+
+**The place in the start area and in the start order.** Every process of the shell has a session with
+`pkgd` in the slot `Packages` (13 of 14 slots of the start area; `START_VERSION` 8, the header
+grows by one handle, so every image and libc.so is built again). A process of an `init` record gets
+it by the name `pkgd` (`posix-crt`), a process that the loader starts takes the slot, and a set-ID
+program takes none, since its caller could put a channel of its own there and make it believe the
+answers. `fork` and a spawn give the child a CLONE of the session (one request, 68 µs under
+QEMU's emulation: 2.127 ms against 2.098 ms for the call of fork with and without it, 1.4 %), `exec`
+moves it. A process that is not the superuser's has the session and is `NOT_ALLOWED` for the methods
+that change the store (the service asks the process service, with the identity session the request
+brings). `cargo xtask pkg-slot` runs a C probe of all of it on the image of the store probe.
+
+A record of the table of `init` may wait for services: `waits: &[Wait { service, deadline_ms }]`,
+two at most, each a service that waits for nothing itself (`services/init/src/waits.rs`, with host
+tests of the graph). The record does not start until each service has sent READY (the method 12 of
+`proto/init`, from the instance of a service that registered), or the longest deadline has passed
+(`init: pkgd not ready after 30 s`, and the record starts all the same), or an instance of a named
+service has ended before its READY (`init: pkgd ended before ready`). A record that fails stands at its
+gate again for its next start. `pkgd` says READY when its start is over (the disk read, the packages
+checked, the layers attached, also when the store is damaged or absent), and the launcher of the base
+and the full image waits for it 30 s: the shell starts after the layers are in place, in 0.2 s of the
+boot under QEMU's emulation. The base table is 14 of 16 records with `blk` and `pkgd`; the 16,896
+pages of the service come out of the pool of the process service, which has fourteen quotas of a
+command (init has 17,503 pages free on the base image after the services started, 137,537 on the
+full image on 1 GiB). `cargo xtask init-wait` runs the three ways to start a waiting record: after
+READY, at the deadline (a service built never to say it), and when the service ends.
 
 ## What stays for subproject 5
 
-The place of `pkgd` in the images and the order of the start (the clients ask for the place
-`Packages`, and the shell waits for the service), delivery (in the image, from a disk, over the
-network), dependency resolution at install time, and the sandbox and quotas of an application. Nothing here changes the quotas of
-the image.
+Delivery (in the image, from a disk, over the network), dependency resolution at install time, and
+the sandbox and quotas of an application. Nothing here changes the quotas of the image.

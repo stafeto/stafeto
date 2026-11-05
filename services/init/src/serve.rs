@@ -43,6 +43,7 @@ use init::labels::Labels;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
+use init::waits::{self, Gate, Release, Standing, Step};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
@@ -241,6 +242,16 @@ struct Entry {
     /// The label of the witness of its POSIX process: the process service
     /// closes it once the process ended (`adoption`, `closed`).
     witness: u64,
+    /// The gate of a record with waits that stands at it, with its deadline
+    /// on the record's timer (init::waits); `passed` once the record went
+    /// through it, until its instance fails.
+    gate: Option<Gate>,
+    passed: bool,
+    /// The running instance of a service said READY.
+    ready: bool,
+    /// Some instance of the service said READY (kept when it ends, for a record that comes to
+    /// its gate later and need not say the service ended before READY).
+    was_ready: bool,
 }
 
 impl Entry {
@@ -262,6 +273,10 @@ impl Entry {
         offered: false,
         ticket: 0,
         witness: 0,
+        gate: None,
+        passed: false,
+        ready: false,
+        was_ready: false,
     };
 }
 
@@ -371,6 +386,10 @@ impl Init {
     /// and loads its process and pays for it (`offer`).
     fn launch(&mut self, place: usize) {
         self.entries[place].state = State::Loading;
+        if !TABLE[place].waits.is_empty() && !self.entries[place].passed {
+            self.hold(place);
+            return;
+        }
         if TABLE[place].is_posix() {
             let entry = &mut self.entries[place];
             entry.adopting = true;
@@ -384,6 +403,83 @@ impl Init {
             return;
         }
         self.push(Job::new(Work::Load, place, &TABLE[place]));
+    }
+
+    /// What init knows of the service `name` for a record at its gate.
+    fn standing(&self, name: &str) -> Standing {
+        let Some(service) = table::find(TABLE, name.as_bytes()) else {
+            return Standing::Over;
+        };
+        let entry = &self.entries[service];
+        match entry.state {
+            State::Ended | State::Broken if entry.was_ready => Standing::Gone,
+            State::Ended | State::Broken => Standing::Over,
+            _ if entry.ready => Standing::Ready,
+            _ => Standing::NotReady,
+        }
+    }
+
+    /// The record at `place` has waits: it goes to its gate (init::waits)
+    /// with the record's timer at the deadline, or starts at once when the
+    /// services are ready already or over.
+    fn hold(&mut self, place: usize) {
+        match Gate::open(&TABLE[place], now(), |name| self.standing(name)) {
+            Err(why) => self.release(place, why),
+            Ok(gate) => {
+                let at = gate.deadline();
+                self.entries[place].gate = Some(gate);
+                self.set_deadline(place, at);
+            }
+        }
+    }
+
+    /// The record at `place` leaves its gate, for `why`, and starts; a
+    /// reason that is no READY gets its line.
+    fn release(&mut self, place: usize, why: Release) {
+        let entry = &mut self.entries[place];
+        entry.gate = None;
+        entry.passed = true;
+        entry.deadline = None;
+        if why != Release::Ready {
+            println!("init: {why}");
+        }
+        self.launch(place);
+    }
+
+    /// What the gates make of an event of the service at `place`: its READY
+    /// or the end of its instance; the records whose waits it settles start.
+    fn gates(&mut self, place: usize, ready: bool) {
+        let name = TABLE[place].name;
+        for waiter in 0..TABLE.len() {
+            let step = match self.entries[waiter].gate.as_mut() {
+                Some(gate) if ready => gate.ready(name),
+                Some(gate) => gate.ended(name),
+                None => continue,
+            };
+            if let Step::Start(why) = step {
+                self.release(waiter, why);
+            }
+        }
+    }
+
+    /// READY from the service at `place`: its instance finished its start
+    /// (proto_init `Ready`). BAD_SIZE for bytes after the header, BAD_STATE
+    /// for a record that is no service or has not registered; a second READY
+    /// changes nothing.
+    fn ready(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let record = &TABLE[place];
+        if !waits::ready_taken(!record.is_client(), self.entries[place].state) {
+            return refuse(Error::BadState);
+        }
+        if !self.entries[place].ready {
+            self.entries[place].ready = true;
+            self.entries[place].was_ready = true;
+            self.gates(place, true);
+        }
+        Answer::Status(Status::Ok)
     }
 
     /// The quota of an instance of the record at `place` in bytes: the
@@ -954,6 +1050,11 @@ impl Init {
         let now = now();
         let record = &TABLE[place];
         let entry = &mut self.entries[place];
+        // Its READY goes with the instance, and its own record stands at its
+        // gate again for the next start; the records that wait for it and
+        // had no READY start now (init::waits).
+        let had_ready = mem::replace(&mut entry.ready, false);
+        entry.passed = false;
         let teardown = gone.is_some();
         if let Some(instance) = gone {
             entry.held = Held::Gone(instance);
@@ -988,6 +1089,9 @@ impl Init {
         }
         if teardown {
             self.push(Job::new(work, place, record));
+        }
+        if !had_ready {
+            self.gates(place, false);
         }
         // With the process service ended or broken for good, the POSIX
         // records that wait for their processes get none; a service that
@@ -1054,6 +1158,13 @@ impl Init {
         let now = now();
         let entry = &mut self.entries[place];
         if !entry.deadline.is_some_and(time::reached) {
+            return;
+        }
+        // A record at its gate: the deadline of its waits.
+        if let Some(gate) = entry.gate {
+            if let Step::Start(why) = gate.expired(now) {
+                self.release(place, why);
+            }
             return;
         }
         match entry.state {
@@ -1503,6 +1614,7 @@ impl Service<1> for Init {
         Method::Adopt.number(),
         Method::Adopted.number(),
         Method::Replaced.number(),
+        Method::Ready.number(),
     ];
     type Data = ();
 
@@ -1520,6 +1632,7 @@ impl Service<1> for Init {
             Some(Method::Adopt) => self.adopt(place, r),
             Some(Method::Adopted) => self.adopted(place, r),
             Some(Method::Replaced) => self.replaced(place, r),
+            Some(Method::Ready) => self.ready(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),

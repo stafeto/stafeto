@@ -169,8 +169,8 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display and Net; 0 for
-/// none.
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes, Terminal, Entropy, Display, Net and
+/// Packages; 0 for none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
@@ -181,6 +181,7 @@ pub struct Sessions {
     pub entropy: u64,
     pub display: u64,
     pub net: u64,
+    pub packages: u64,
 }
 
 impl Sessions {
@@ -198,6 +199,7 @@ impl Sessions {
             (Slot::Entropy, self.entropy),
             (Slot::Display, self.display),
             (Slot::Net, self.net),
+            (Slot::Packages, self.packages),
         ] {
             if raw != 0 {
                 mask |= slot.bit();
@@ -221,6 +223,7 @@ impl Sessions {
             self.entropy,
             self.display,
             self.net,
+            self.packages,
         ] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -274,7 +277,7 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
 
 /// Handles: the sessions for the child to its loader `c`, each that is
 /// there; they move whatever comes of it. Four go in one message, the rest
-/// (the entropy and display services') in a second.
+/// (the entropy, display, network and package services') in a second and third.
 fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
     use proto_loader::Slot;
     let session = |raw: u64| (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
@@ -287,6 +290,7 @@ fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
         (Slot::Entropy, session(sessions.entropy)),
         (Slot::Display, session(sessions.display)),
         (Slot::Net, session(sessions.net)),
+        (Slot::Packages, session(sessions.packages)),
     ];
     match crate::process::give_sessions(c, given) {
         0 => Ok(()),
@@ -830,6 +834,10 @@ fn sessions() -> Result<Sessions, i32> {
         if let Some(clone) = crate::net::clone_kept(crate::net::kept_by_fork_portions())? {
             out.net = clone.into_raw().0;
         }
+        sub(11);
+        if let Some(clone) = crate::packages::clone_session() {
+            out.packages = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -969,6 +977,9 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the network service is the clone the
         // parent made, which holds the descriptions the child keeps.
         crate::net::after_fork(handle(raw(Slot::Net)));
+        // The child's session with the package service is the clone the
+        // parent made.
+        crate::packages::after_fork(handle(raw(Slot::Packages)));
         // The instances of epoll are the parent's, whose set the parent's
         // session holds: the child's calls on them are EBADF.
         crate::epoll::after_fork();

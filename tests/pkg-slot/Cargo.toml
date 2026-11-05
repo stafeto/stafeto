@@ -1,0 +1,21 @@
+[package]
+name = "pkg-slot-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The C probe of the package service's place in a process: fork, spawn, exec, set-ID programs and the superuser's right"
+build = "build.rs"
+
+[[bin]]
+name = "pkg-slot-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
+proto-pkg = { path = "../../proto/pkg" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt", features = ["count-calls"] }

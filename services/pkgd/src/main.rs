@@ -49,8 +49,18 @@ static LAST_WORK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// Where the service maps the boot image.
 const IMAGE_AT: usize = 0x50_0000_0000;
 /// The sessions the loop keeps, and the clones of them at most.
-const SESSIONS: usize = 128;
-const CLONES: usize = 64;
+/// A session for each of the 255 records of the process service, one more for each fork in
+/// flight and the services beside it: the number the neighbours (`clock`, `entropy`, `pipe`,
+/// `tty`) are sized to, since every process of the shell has a session here. A session holds
+/// no handle of the service's own (the quota of 16,896 pages pays for its slot), so the
+/// record's 512 handles hold the buffers, the layers and the objects of 64 packages with room
+/// over.
+const SESSIONS: usize = 320;
+const _: () = assert!(
+    SESSIONS >= 255 + 64 && CLONES >= 255,
+    "a session for each process and its clone"
+);
+const CLONES: usize = 320;
 /// The long operations at once: one change of the store at a time.
 const OPERATIONS: usize = 4;
 const OWN: u64 = 1 << 63;
@@ -62,6 +72,7 @@ const NOT_REGISTERED: u64 = 3;
 const STOPPED: u64 = 5;
 
 fn main(_: u64) -> u64 {
+    BEGAN.store(rt::time::now(), Release);
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
     };
@@ -132,6 +143,7 @@ fn main(_: u64) -> u64 {
         ops: LongOps::new(),
         pending: None,
         rx: None,
+        ready: false,
     };
     let config = Config {
         issued: 0,
@@ -187,6 +199,9 @@ struct Rx {
 }
 
 struct Pkgd {
+    /// READY went to init (once the start of the worker is over, in the
+    /// store's good state or not).
+    ready: bool,
     process: core::mem::ManuallyDrop<Handle<Process>>,
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
     parent: core::mem::ManuallyDrop<Handle<Channel>>,
@@ -362,6 +377,7 @@ impl Pkgd {
             (DAMAGED.load(Acquire), STATUS_DAMAGED),
             (READ_ONLY.load(Acquire), STATUS_READ_ONLY),
             (STARTING.load(Acquire), STATUS_STARTING),
+            (NO_STORE.load(Acquire), proto_pkg::STATUS_NO_STORE),
         ] {
             if on {
                 flags |= bit;
@@ -382,14 +398,18 @@ impl Pkgd {
         end_read(start, Answer::Reply(Outgoing::new()))
     }
 
-    /// BUFFER: the client's object, four cells, mapped for the session's life.
+    /// BUFFER: the client's object, four cells, mapped for the session's life. A second handle,
+    /// the identity session of the process, lets the service ask the process service who the
+    /// caller is (Vouch): the superuser's session may take any place, any other the places
+    /// after the `RESERVED` first ones (BUSY when they are all in use).
     fn give_buffer(&mut self, s: &mut Session<Sess, 0>, r: &mut Request<'_>) -> Answer {
         let Ok(size) = read_word(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        if size != BUFFER_SIZE || r.handles.len() != 1 {
+        if size != BUFFER_SIZE || !(1..=2).contains(&r.handles.len()) {
             return Answer::Status(Status::BadSize);
         }
+        let with_identity = r.handles.len() == 2;
         let needed = Rights::MAP_READ | Rights::MAP_WRITE;
         let rights = r.handles.info(0).map_or(Rights::NONE, |(_, rights)| rights);
         let Ok(object) = r.handles.take::<Memory>(0) else {
@@ -406,7 +426,12 @@ impl Pkgd {
         if s.data.buffer.is_some() {
             return Answer::Status(code(proto_pkg::INVALID));
         }
-        let Some(place) = self.buffers.iter().position(Option::is_none) else {
+        let identity = with_identity
+            .then(|| r.handles.take::<Channel>(1).ok())
+            .flatten();
+        let superuser = identity.and_then(|channel| self.vouch(channel)) == Some(0);
+        let from = if superuser { 0 } else { RESERVED };
+        let Some(place) = (from..BUFFERS).find(|&p| self.buffers[p].is_none()) else {
             return Answer::Status(code(proto_pkg::BUSY));
         };
         let mapped = sys::mem_map(
@@ -496,6 +521,9 @@ impl Pkgd {
         }
         if STARTING.load(Acquire) {
             return Err(refuse(proto_pkg::BUSY));
+        }
+        if NO_STORE.load(Acquire) {
+            return Err(refuse(proto_pkg::IO));
         }
         if DAMAGED.load(Acquire) {
             return Err(refuse(proto_pkg::DAMAGED));
@@ -775,6 +803,17 @@ impl Pkgd {
         }
     }
 
+    /// READY to init: the start is over (the probes of the wait change it: `no-ready` says
+    /// nothing, `exit-before-ready` ends the process).
+    fn say_ready(&mut self) {
+        #[cfg(feature = "exit-before-ready")]
+        sys::process_exit(7);
+        #[cfg(not(any(feature = "no-ready", feature = "exit-before-ready")))]
+        if let Err(why) = rt::service::ready(&self.parent) {
+            rt::println!("pkgd: READY refused: {why:?}");
+        }
+    }
+
     /// The buffers of sessions that went while the worker might read them go now that it
     /// does not.
     fn release_stale(&mut self) {
@@ -962,6 +1001,13 @@ impl Service<0> for Pkgd {
         // The step of a notification is measured apart from the heartbeat's.
         rt::service::step_own();
         if n.source == Source::Session && n.label == LABEL_DONE {
+            // The start is over (the worker cleared STARTING, whatever the
+            // store is: a damaged disk or none is served as such): init may
+            // start the records that wait for the service (spec 5, section 4).
+            if !self.ready && !STARTING.load(Acquire) {
+                self.ready = true;
+                self.say_ready();
+            }
             self.settle();
             #[cfg(feature = "steps")]
             {

@@ -67,14 +67,16 @@ impl<'a> Package<'a> {
         if trailer.covered != covered as u64 {
             return Err(Error::LengthMismatch);
         }
-        // The reader of the table looks for a repeated name among all the
-        // files before, so the number of files is bounded before it runs.
+        // The number of files is bounded before the table is read.
         if covered < 16 || crate::u32_at(bytes, 12) > FILES_MAX {
             return Err(Error::BadLayout(
                 "more content files than entries are allowed",
             ));
         }
-        let image = BootImage::parse_as(&bytes[..covered], &PACKAGE).map_err(Error::Container)?;
+        // No search for a repeated name: each file has the name of its place below, which
+        // no repeat survives (the search is quadratic, 176 million ticks for 1,027 files).
+        let image =
+            BootImage::parse_places(&bytes[..covered], &PACKAGE).map_err(Error::Container)?;
         let count = image.count();
         if count < 3 {
             return Err(Error::BadLayout("fewer than three files"));
@@ -680,6 +682,14 @@ mod tests {
         b = good.clone();
         let name_at = 16 + 48 * 3;
         b[name_at] = b'9';
+        assert_eq!(
+            verify_err(&b),
+            Error::BadLayout("a file has not the name of its place")
+        );
+        // A name twice (file 4 is called "3"): no search for it is made, the name of its place
+        // refuses it all the same.
+        b = good.clone();
+        b[16 + 48 * 4] = b'3';
         assert_eq!(
             verify_err(&b),
             Error::BadLayout("a file has not the name of its place")

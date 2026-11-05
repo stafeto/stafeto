@@ -553,6 +553,10 @@ impl Driver {
                 break;
             };
             let (kind, count) = self.cells.request(place);
+            #[cfg(feature = "deaf")]
+            if deaf(kind, count) {
+                break;
+            }
             let outcome = self.reap(token, place, kind, count);
             if let Completion::Tell { label, key } = self.cells.complete(place, outcome) {
                 self.ops.tell(label, key);
@@ -797,6 +801,23 @@ impl Service<0> for Driver {
             self.interrupt();
         }
     }
+}
+
+/// Whether the driver has stopped answering (feature `deaf`): from the first write of
+/// 32 sectors or more on, it reaps nothing and tells no one.
+#[cfg(feature = "deaf")]
+fn deaf(kind: Kind, count: u32) -> bool {
+    static DEAF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    use core::sync::atomic::Ordering::Relaxed;
+    let trip = if cfg!(feature = "deaf-start") {
+        kind == Kind::Read
+    } else {
+        kind == Kind::Write && count >= 32
+    };
+    if trip && !DEAF.swap(true, Relaxed) {
+        rt::println!("virtio-blk: deaf from the request of {count} sectors");
+    }
+    DEAF.load(Relaxed)
 }
 
 /// CRASH: a load from page 0 ends the driver with a fault while the device

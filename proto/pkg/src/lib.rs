@@ -21,11 +21,17 @@
 //! | CLONE (12) | all | none | the new session as the reply's handle |
 //! | REVOKED_SET (13) | UID 0 | `len` u32 (the list is in the buffer); the identity session | long: none |
 //! | TAKE (14) | all | `key` u64; the first time a handle with NOTIFY labelled k | READY and the result, ARMED, or the refusal |
-//! | BUFFER (15) | all | `size` u32 and a memory object with MAP_READ and MAP_WRITE | none |
+//! | BUFFER (15) | all | `size` u32 and a memory object with MAP_READ and MAP_WRITE; optionally the identity session after it | none |
 //! | STATUS (16) | all | none | `generation` u64, `blocks` u64, `free` u64, `disk` u32, `image` u32, `flags` u32 |
 //!
 //! A string is one byte of length and the bytes. The buffer is CELLS cells
-//! of CELL_BYTES, the client's object, as in proto_blk.
+//! of CELL_BYTES, the client's object, as in proto_blk. The service has four
+//! places for buffers: the two first are for sessions of the superuser, whom
+//! the service knows by the identity session that BUFFER may bring (Vouch, as
+//! for the requests that change the store), and the other two are for any
+//! session, so that programs that are not the superuser's cannot keep the
+//! others from installing; BUSY when the places of the session's kind are all
+//! in use.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -62,10 +68,12 @@ pub const ENTRY_REVOKED: u32 = 8;
 pub const BEGIN_WORLD: u32 = 1;
 /// Bit 0 of the flags of INSTALL_COMMIT: the last package of the group.
 pub const COMMIT_END: u32 = 1;
-/// Flags of STATUS: the store is damaged, read-only, or still being read.
+/// Flags of STATUS: the store is damaged, read-only, or still being read, or not served at
+/// all (`STATUS_NO_STORE`: its start failed or the disk stopped answering; a change is `IO`).
 pub const STATUS_DAMAGED: u32 = 1;
 pub const STATUS_READ_ONLY: u32 = 2;
 pub const STATUS_STARTING: u32 = 4;
+pub const STATUS_NO_STORE: u32 = 8;
 
 /// The codes of the service (`Status::Unknown`), clear of the codes of the
 /// wire (below 512) and of proto_blk's (1101 to 1108).

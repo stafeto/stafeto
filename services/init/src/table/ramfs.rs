@@ -62,6 +62,7 @@ const RAM_BASE: Record = Record {
     root: false,
     shares: Shares::CREATOR,
     cpus: GENERAL_CPUS,
+    waits: &[],
 };
 
 /// Standalone RAM probes use an explicit deterministic source.
@@ -107,6 +108,7 @@ pub const TABLE: &[Record] = &[
         root: false,
         shares: Shares::CREATOR,
         cpus: GENERAL_CPUS,
+        waits: &[],
     },
 ];
 
