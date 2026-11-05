@@ -118,6 +118,11 @@ pub struct Interests<const PLACES: usize> {
     changes: [u16; PLACES],
     /// The events of each place as the service worked them out last.
     cache: [u32; PLACES],
+    /// For the records added with EPOLLEXCLUSIVE: the changes of the place
+    /// when a set was last given the event, and whether one was. The event
+    /// goes to another set only when the place changed since.
+    excl_at: [u16; PLACES],
+    excl_given: [bool; PLACES],
     /// The records in use in all the sets.
     live: u16,
     /// The sets with ready records and operations that wait: the step of
@@ -180,6 +185,8 @@ impl<const PLACES: usize> Interests<PLACES> {
         self.heads.fill(NONE);
         self.changes.fill(0);
         self.cache.fill(0);
+        self.excl_at.fill(0);
+        self.excl_given.fill(false);
         self.live = 0;
         self.due = 0;
         self.departing = 0;
@@ -488,6 +495,7 @@ impl<const PLACES: usize> Interests<PLACES> {
         }
         if self.heads[place] == NONE {
             self.cache[place] = 0;
+            self.excl_given[place] = false;
         }
     }
 
@@ -571,7 +579,11 @@ impl<const PLACES: usize> Interests<PLACES> {
     /// them are listed. Returns how many records it looked at. Of the records
     /// added with EPOLLEXCLUSIVE only the first whose set has an operation
     /// waiting is listed (and so its set woken): the other sets leave the
-    /// event to it, as the waiters of Linux that wake one.
+    /// event to it, as the waiters of Linux that wake one. Once a set has it,
+    /// another set is given it only when the place has changed since (a new
+    /// connection); a scan caused by something else, such as a timer of a
+    /// neighbour in the same set of places, wakes nobody more (Linux wakes
+    /// from the callback of a new event alone).
     pub fn scan(&mut self, place: usize, ev: u32) -> usize {
         self.cache[place] = ev;
         let mut looked = 0;
@@ -585,10 +597,24 @@ impl<const PLACES: usize> Interests<PLACES> {
                 if taken {
                     continue;
                 }
-                self.consider(idx, ev, true);
                 let e = self.entries[idx];
-                if e.flags & READY != 0 && self.sets[usize::from(e.set)].waiters != 0 {
+                let changes = self.changes[place];
+                let waits = self.sets[usize::from(e.set)].waiters != 0;
+                if e.flags & READY == 0
+                    && waits
+                    && self.excl_given[place]
+                    && self.excl_at[place] == changes
+                {
+                    continue;
+                }
+                self.consider(idx, ev, true);
+                let now = self.entries[idx];
+                if now.flags & READY != 0 && waits {
                     taken = true;
+                    if e.flags & READY == 0 {
+                        self.excl_given[place] = true;
+                        self.excl_at[place] = changes;
+                    }
                 }
             } else {
                 self.consider(idx, ev, true);
@@ -941,6 +967,32 @@ mod tests {
         assert_eq!(t.due.count_ones(), 1);
         let woken = if ra { a } else { b };
         assert_eq!(t.due, 1 << woken);
+    }
+
+    #[test]
+    fn a_second_scan_without_a_change_does_not_wake_the_other_set() {
+        let mut t = table();
+        let a = t.new_set(1).unwrap();
+        let b = t.new_set(2).unwrap();
+        t.add(a, 1, IN | EXCL, 10, 0).unwrap();
+        t.add(b, 1, IN | EXCL, 20, 0).unwrap();
+        t.add_waiter(a, 3);
+        t.add_waiter(b, 4);
+        t.scan(1, IN);
+        let (first, second) = if t.has_ready(a) { (a, b) } else { (b, a) };
+        // The first set takes the event and leaves its wait.
+        assert_eq!(pairs(&mut t, first, 8).len(), 1);
+        t.remove_waiter(first, if first == a { 3 } else { 4 });
+        t.due = 0;
+        // A scan with no new change (a timer of a neighbour) wakes nobody.
+        t.scan(1, IN);
+        assert!(!t.has_ready(second));
+        assert_eq!(t.due & (1 << second), 0);
+        // A new connection changes the place: the second set is woken.
+        t.changed(1);
+        t.scan(1, IN);
+        assert!(t.has_ready(second));
+        assert_eq!(t.due, 1 << second);
     }
 
     #[test]

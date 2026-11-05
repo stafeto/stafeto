@@ -2601,12 +2601,16 @@ static void epoll_exclusive(void)
 	REQUIRE(c1 >= 0);
 	REQUIRE(connect(c1, (struct sockaddr *)&a, sizeof a) == 0);
 	pause_ms(600);
+	if (excl_woke != 1)
+		printf("posix-net: epoll-exclusive note: %d sets woke after the first connection\n", excl_woke);
 	REQUIRE(excl_woke == 1);
 	int c2 = socket(AF_INET, SOCK_STREAM, 0);
 	REQUIRE(c2 >= 0);
 	REQUIRE(connect(c2, (struct sockaddr *)&a, sizeof a) == 0);
 	for (int i = 0; i < 2; i++)
 		REQUIRE(pthread_join(t[i], NULL) == 0);
+	if (excl_woke != 2)
+		printf("posix-net: epoll-exclusive note: %d sets woke after the second connection\n", excl_woke);
 	REQUIRE(excl_woke == 2);
 	REQUIRE(close(c1) == 0 && close(c2) == 0);
 	for (int i = 0; i < 2; i++)
