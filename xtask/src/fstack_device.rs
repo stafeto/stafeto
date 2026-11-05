@@ -61,6 +61,10 @@ const PAGE_BYTES: usize = 1 << 20;
 const HOLD_CONNECTIONS: usize = 500;
 const HOLD_SEGMENTS: usize = 20;
 const HOLD_BYTES: usize = 200;
+/// The most the median of the echo after a pause may take: a tenth of the
+/// stack's clock tick and a little over the times the probe sees (0.1 to
+/// 1.1 ms on TCG and HVF).
+const IDLE_MEDIAN_MAX_US: u64 = 3000;
 
 /// How long a line may take on TCG, and under -icount.
 const LINE_WITHIN: Duration = Duration::from_secs(60);
@@ -415,6 +419,13 @@ fn session(machine: &'static qemu::Machine, steps: bool, dhcp: bool) -> Result<(
             notes.push(format!(
                 "echo after a pause of 60 ms: median {median} us, 90th percentile {p90} us"
             ));
+            // The interrupts on while idle wake the stack at once; without
+            // them it looks at the queue at its next clock tick (10 ms).
+            if median > IDLE_MEDIAN_MAX_US {
+                return Err(format!(
+                    "a datagram after a pause took {median} us at the median, over {IDLE_MEDIAN_MAX_US}: the idle stack does not wake on the device's interrupt"
+                ));
+            }
             let rate = echo_rate(&udp, 3000, 32)?;
             notes.push(format!("echo rate with 32 in flight {rate:.0} datagrams/s"));
         }

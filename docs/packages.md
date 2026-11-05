@@ -85,7 +85,10 @@ them for the licence notes of the image.
   `libfstack.a` from the pinned commit with `ports/f-stack` (the patch and
   the host layer of stafeto in place of DPDK) and joins it with the probe
   of `tests/fstack-probe`; `cargo xtask fstack-probe` runs the stack on its
-  own loopback in the image `boot-fstack-probe.img`, which carries
+  own loopback in the image `boot-fstack-probe.img`, and `cargo xtask
+  fstack-probe device` runs it on the second network device the program
+  claims (`libvirtio_net.a`, the images `boot-fstack-device.img` and its
+  variants with the shell and the network service); the images carry
   F-Stack's licence and the acknowledgements its four-clause files and its
   MD5 ask for (`FSTACK-LICENSE`, `FSTACK-SOURCE`). The installed headers are
   those of the build without thread-local storage: `ff_api.h` declares

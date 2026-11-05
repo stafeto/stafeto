@@ -387,6 +387,9 @@ fstack_device_main(int argc, char **argv)
         claim.config.address[3], claim.config.prefix, claim.config.mac[0],
         claim.config.mac[1], claim.config.mac[2], claim.config.mac[3], claim.config.mac[4],
         claim.config.mac[5], (unsigned long long)(now_ms() - started));
+    printf("fstack-probe: objects at %#llx %#llx %#llx %#llx (the buffers' physical addresses)\n",
+        (unsigned long long)claim.objects[1].pa, (unsigned long long)claim.objects[2].pa,
+        (unsigned long long)claim.objects[3].pa, (unsigned long long)claim.objects[4].pa);
     udp_fd = open_udp(UDP_PORT);
     tcp_fd = open_tcp(TCP_PORT);
     if (mode == MODE_FLOOD)
