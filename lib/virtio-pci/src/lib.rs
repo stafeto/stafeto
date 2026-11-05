@@ -3,7 +3,7 @@
 
 //! The configuration space of a Virtio PCI function on Apple VZ and on
 //! QEMU's `virt` machine, as its driver sets it up before the Virtio transport reads it: memory
-//! decoding off, the BARs at addresses of the host bridge's windows
+//! and I/O decoding off, the BARs at addresses of the host bridge's windows
 //! (`ranges` of the tree) that the driver's `Place` names, then memory
 //! decoding on; bus mastering comes only after the driver reset the
 //! device (`bus_master`), so that the device starts from no queue. The
@@ -30,6 +30,8 @@ pub struct Place {
 pub const ID: usize = 0x00;
 /// Command (low half) and status (high half).
 pub const COMMAND: usize = 0x04;
+/// I/O space decoding.
+pub const IO: u32 = 1 << 0;
 pub const MEMORY: u32 = 1 << 1;
 pub const BUS_MASTER: u32 = 1 << 2;
 /// INTx Disable: with it set the function raises no INTA, and a driver's
@@ -55,11 +57,11 @@ pub const BAR2: usize = 0x18;
 impl Place {
     /// The writes that set the function up, in their order, as (offset,
     /// value), from `command`, the command word read before them:
-    /// decoding and bus mastering off, the BARs, decoding on.
+    /// memory and I/O decoding and bus mastering off, the BARs, decoding on.
     pub fn set_up(&self, command: u32) -> [(usize, u32); 5] {
         let command = command & 0xFFFF & !BUS_MASTER & !INTX_DISABLE;
         [
-            (COMMAND, command & !MEMORY),
+            (COMMAND, command & !(MEMORY | IO)),
             // The low word keeps its type bits and the low half of the
             // address: a 64-bit memory BAR.
             (BAR0, self.bar as u32 | 0b100),
@@ -90,11 +92,11 @@ impl Bar64 {
 
     /// The writes that set the function up, in their order, as (offset,
     /// value), from `command`, the command word read before them:
-    /// decoding and bus mastering off, the BAR, decoding on.
+    /// memory and I/O decoding and bus mastering off, the BAR, decoding on.
     pub fn set_up(&self, command: u32) -> [(usize, u32); 4] {
         let command = command & 0xFFFF & !BUS_MASTER & !INTX_DISABLE;
         [
-            (COMMAND, command & !MEMORY),
+            (COMMAND, command & !(MEMORY | IO)),
             // The type bits (64-bit, prefetchable) are the device's own;
             // writing them leaves them as they are.
             (self.register(), self.bar as u32 | 0b1100),
@@ -132,6 +134,7 @@ pub mod qemu {
     /// The INTID of pin `pin` (1 = INTA) of `device`: the swizzle of the
     /// tree's `interrupt-map`.
     pub const fn intx(device: u64, pin: u32) -> u32 {
+        assert!(pin >= 1 && pin <= 4);
         INTX_FIRST + ((device as u32 + pin - 1) % 4)
     }
 
@@ -207,7 +210,7 @@ mod tests {
     #[test]
     fn set_up_turns_decoding_off_around_the_bars_and_leaves_mastering_off() {
         let writes = CONSOLE.set_up(0x0010_0007);
-        assert_eq!(writes[0], (COMMAND, 0x0001));
+        assert_eq!(writes[0], (COMMAND, 0x0000));
         assert_eq!(writes[4], (COMMAND, 0x0003));
         assert_eq!(writes[1..4], [(BAR0, 4), (BAR1, 1), (BAR2, 0x5000_0000)]);
         let mut commands = writes.iter().filter(|&&(at, _)| at == COMMAND);
@@ -243,7 +246,7 @@ mod tests {
         assert_eq!(
             writes,
             [
-                (COMMAND, 0x0001),
+                (COMMAND, 0x0000),
                 (0x20, 0x1000_000C),
                 (0x24, 0),
                 (COMMAND, 0x0003),

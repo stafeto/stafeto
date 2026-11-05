@@ -2204,6 +2204,7 @@ mod tests {
             net::NET_PROBE_TWO_TABLE,
             vz::TABLE,
             vz::PCI_WALK_TABLE,
+            pkg::PCI_WALK_QEMU_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::POSIX_NATIVE_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,

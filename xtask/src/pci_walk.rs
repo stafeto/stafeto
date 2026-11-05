@@ -209,11 +209,23 @@ pub fn command_qemu(args: &[String]) -> Result<(), String> {
     };
     let kernel = build(Variant::Normal)?;
     let boot = build_boot_image("boot-pci-walk-qemu.img", &PROGRAMS_QEMU, BOOT_PROFILE)?;
-    let store = root().join("target").join("pci-walk-store.img");
-    qemu::store_file(&store, 1 << 20, true)?;
+    // One file per run, so that runs side by side share no disk.
+    let store = std::env::temp_dir().join(format!("stafeto-pci-walk-{}.img", std::process::id()));
+    let result = qemu::store_file(&store, 1 << 20, true)
+        .and_then(|()| walk(machines, &kernel, &boot, &store));
+    let _ = std::fs::remove_file(&store);
+    result
+}
+
+fn walk(
+    machines: &[&qemu::Machine],
+    kernel: &Artifacts,
+    boot: &Path,
+    store: &Path,
+) -> Result<(), String> {
     for machine in machines {
-        let mut cmd = qemu::command(machine, &kernel.image, Some(&boot));
-        cmd.args(qemu::HEADLESS).args(qemu::store(&store, None));
+        let mut cmd = qemu::command(machine, &kernel.image, Some(boot));
+        cmd.args(qemu::HEADLESS).args(qemu::store(store, None));
         let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
         let result = run.expect_seen(DONE, BOOT_TIMEOUT);
         let lines: Vec<String> = run.lines().to_vec();

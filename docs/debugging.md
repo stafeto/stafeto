@@ -195,6 +195,15 @@ qemu-system-aarch64 -machine virt,gic-version=3,highmem-ecam=off -accel hvf,kern
   -kernel target/stafeto-ktest.img -initrd target/boot.img
 ~~~
 
+A machine with a disk gets it from `qemu::store` (`xtask/src/qemu.rs`): a
+modern virtio-blk-pci at device 1 of bus 0 over a raw file, with
+`cache=writeback`, no legacy interface and no MSI-X. With
+`highmem-ecam=off` the ECAM is at 0x3f00_0000, so the disk is the function
+at 0x3f00_8000, its BAR 4 sits at 0x1000_0000, and its INTx is line 36 (the
+swizzle of the tree's `interrupt-map`). `cargo xtask pci-walk [--hvf]`
+boots a probe that prints the functions of the bus with the disk attached
+and checks them; run it first when a disk driver sees no device.
+
 What differs from QEMU's own emulation:
 
 - The counter runs at 24 MHz. A fast round trip takes a few ticks, so
