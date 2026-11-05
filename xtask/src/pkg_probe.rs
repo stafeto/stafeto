@@ -118,7 +118,7 @@ impl Mirror {
         };
         let started = Instant::now();
         let listening = format!("pkg-mirror: listening {port}");
-        while !mirror.lines().iter().any(|l| *l == listening) {
+        while !mirror.lines().contains(&listening) {
             if started.elapsed() > Duration::from_secs(30) {
                 return Err(format!(
                     "the mirror did not say \"{listening}\" within 30 s"

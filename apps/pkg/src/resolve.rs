@@ -623,7 +623,7 @@ mod tests {
             candidate: 2,
             world: true,
         }];
-        assert_eq!(super::steps(&one)[0].end, true);
+        assert!(super::steps(&one)[0].end);
     }
 
     #[test]
