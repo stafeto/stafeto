@@ -3981,14 +3981,30 @@ fn image_has_notices(path: &Path) -> Result<(), String> {
     let image =
         bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     let notices = std::fs::read(notices_path()).map_err(|e| format!("{NOTICES}: {e}"))?;
-    if image
+    if !image
         .files()
         .any(|file| file.name == NOTICES && file.data == notices.as_slice())
     {
-        Ok(())
-    } else {
-        Err(format!("{} carries no {NOTICES}", path.display()))
+        return Err(format!("{} carries no {NOTICES}", path.display()));
     }
+    // An image with layers names the file in the notices of the system.
+    if image.files().any(|f| f.name.ends_with(".stpkg")) {
+        let table = image
+            .files()
+            .find(|f| f.name == "rootfs")
+            .ok_or_else(|| format!("{}: no table of files", path.display()))?;
+        let table = bootimg::rootfs::Rootfs::parse(table.data, image.count())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let want = "/usr/share/licenses/stafeto/relibc-THIRD-PARTY-NOTICES";
+        let held = table
+            .find(want)
+            .and_then(|n| image.file_at(table.entry(n as u32).file))
+            .is_some_and(|f| f.data == notices.as_slice());
+        if !held {
+            return Err(format!("{} carries no {want}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn relibc_hello_probe() -> Result<(), String> {
@@ -7830,6 +7846,7 @@ fn ash_dialog() -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     clock_probe::date_images_back()?;
     let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
+    image_has_notices(&image)?;
     notices::image_has_package_notices(&image, "boot-ash-dialog.img", "busybox")?;
     notices::image_has_package_notices(&image, "boot-ash-dialog.img", "bash")?;
     packages::check()?;

@@ -591,6 +591,10 @@ pub fn identity() -> Result<(), String> {
     );
     // 6: the base image in QEMU: no game, the notices of the base packages, the screen and the keys.
     let (services, took) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
+        // The services of the screen and of the keys came up.
+        for line in ["virtio-gpu: screen ready", "input: QEMU Virtio Keyboard"] {
+            run.expect_bytes(line.as_bytes(), crate::DIALOG_STEP)?;
+        }
         let missing = shell(run, "ls /bin/doom")?;
         if !missing
             .iter()
