@@ -23,8 +23,8 @@
 //!    after a warm-up of 10 s at its rate whose results are dropped;
 //! 4. `/1k.bin` at 50 % of R_max; `/256k.bin`: its own ceiling by `wrk`
 //!    and a stage at 50 % of it, with MB/s;
-//! 5. `/10k.bin` on a new connection for every request, at 100 a second and
-//!    at 25 % of R_max (it runs after step 6, nginx started again with the
+//! 5. `/10k.bin` on a new connection for every request, at 100 and 300 a
+//!    second and at 25 % of R_max (it runs after step 6, nginx started again with the
 //!    package's settings: on QEMU the flood of new connections leaves the
 //!    forwarded port refusing for a while);
 //! 6. nginx again with one listening socket for the four workers
@@ -642,6 +642,71 @@ fn run_tool(dir: &Path, name: &str, program: &str, args: &[String]) -> Result<St
     Ok(text)
 }
 
+/// Runs `program args` for its `seconds`, its output into `name` in `dir`,
+/// while xtask reads the guest's console: at nginx's first line `[alert]`
+/// or `[crit]` it ends nginx (`kill -QUIT` of the master; a worker whose
+/// `epoll_wait` fails logs a line each turn of its loop, and reading such a
+/// flood takes xtask longer than the guest takes to write it) and gives the
+/// line. With `top`, halfway through the load the guest's `top` shows what
+/// its processes take of its CPUs (into `top-TAG.txt`).
+fn watched(
+    server: &mut Server<'_>,
+    dir: &Path,
+    name: &str,
+    program: &str,
+    args: &[String],
+    seconds: u32,
+    top: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let (owned_dir, owned_name, owned_program, owned_args) = (
+        dir.to_path_buf(),
+        name.to_owned(),
+        program.to_owned(),
+        args.to_vec(),
+    );
+    let load =
+        std::thread::spawn(move || run_tool(&owned_dir, &owned_name, &owned_program, &owned_args));
+    let mut seen = None;
+    if let Server::Guest(run) = server {
+        let started = Instant::now();
+        let half = started + Duration::from_secs(u64::from(seconds) / 2);
+        let end = started + Duration::from_secs(u64::from(seconds) + 2);
+        if let Some(tag) = top {
+            seen = alert_until(run, half);
+            if seen.is_none() {
+                let from = run.lines().len();
+                run.send("top -b -n 1 | head -24")?;
+                nginx_probe::marker(run, &format!("top-{tag}"), DIALOG_STEP * 3)?;
+                let text = run.lines()[from..].join("\n");
+                std::fs::write(dir.join(format!("top-{tag}.txt")), text)
+                    .map_err(|e| format!("top: {e}"))?;
+            }
+        }
+        if seen.is_none() {
+            seen = alert_until(run, end);
+        }
+        if seen.is_some() {
+            run.send("kill -QUIT $M")?;
+        }
+    }
+    let text = load
+        .join()
+        .map_err(|_| format!("the thread of {program} panicked"))??;
+    Ok((text, seen))
+}
+
+/// The first line of nginx at `alert` or `crit` on the console before
+/// `until`.
+fn alert_until(run: &mut qemu::Run, until: Instant) -> Option<String> {
+    let left = until.saturating_duration_since(Instant::now());
+    run.expect_line(
+        "a line of nginx at alert",
+        |l| l.contains("[alert]") || l.contains("[crit]"),
+        left,
+    )
+    .ok()
+}
+
 impl Bench {
     /// Runs `program args`, its output into `name` in the run's directory.
     fn tool(&self, name: &str, program: &str, args: &[String]) -> Result<String, String> {
@@ -668,27 +733,20 @@ impl Bench {
         let command = format!("wrk {}", args.join(" "));
         let mark = server.mark()?;
         let name = format!("wrk-{}.txt", slug(step));
-        let (dir, wrk_args) = (self.dir.clone(), args.clone());
-        let wrk_name = name.clone();
-        let load = std::thread::spawn(move || run_tool(&dir, &wrk_name, "wrk", &wrk_args));
-        // Halfway through the load, what the guest's processes take of its
-        // CPUs: the network service against nginx's workers.
-        if let Server::Guest(run) = server {
-            std::thread::sleep(Duration::from_secs(u64::from(self.lengths.ceiling) / 2));
-            let from = run.lines().len();
-            run.send("top -b -n 1 | head -24")?;
-            nginx_probe::marker(run, &format!("top-{}", slug(step)), DIALOG_STEP * 3)?;
-            let top = run.lines()[from..].join("\n");
-            std::fs::write(self.dir.join(format!("top-{}.txt", slug(step))), top)
-                .map_err(|e| format!("top: {e}"))?;
-        }
-        let text = load
-            .join()
-            .map_err(|_| "the thread of wrk panicked".to_owned())??;
+        let (text, seen) = watched(
+            server,
+            &self.dir,
+            &name,
+            "wrk",
+            &args,
+            self.lengths.ceiling,
+            Some(&slug(step)),
+        )?;
         let wrk = parse_wrk(&text).ok_or_else(|| format!("wrk printed no rate: {text}"))?;
         let log = server.log_since(mark)?;
         let malloc = malloc_failures(&log);
-        let alerts = alerts(&log);
+        let mut alerts = alerts(&log);
+        alerts.extend(seen);
         println!(
             "nginx-bench: {step}: {:.0} requests/s, socket errors connect {} read {} write {} timeout {}, non-2xx {}, malloc failed {malloc}",
             wrk.per_second, wrk.connect, wrk.read, wrk.write, wrk.timeout, wrk.non_2xx
@@ -735,12 +793,17 @@ impl Bench {
         };
         let slug = slug(step);
         let warm = self.dir.join(format!("vegeta-{slug}-warm-up.bin"));
-        self.tool(
+        let (_, seen) = watched(
+            server,
+            &self.dir,
             &format!("vegeta-{slug}-warm-up.txt"),
             "vegeta",
             &attack(self.lengths.warm_up, &warm),
+            self.lengths.warm_up,
+            None,
         )?;
         let _ = std::fs::remove_file(&warm);
+        stop_on(&format!("{step} (warm-up)"), &Vec::from_iter(seen))?;
         let results = self.dir.join(format!("vegeta-{slug}.bin"));
         let args = attack(self.lengths.stage, &results);
         let command = format!("vegeta {}", args.join(" "))
@@ -750,10 +813,19 @@ impl Bench {
             )
             .replace(&format!("{}/", self.dir.display()), "");
         let mark = server.mark()?;
-        self.tool(&format!("vegeta-{slug}.txt"), "vegeta", &args)?;
+        let (_, seen) = watched(
+            server,
+            &self.dir,
+            &format!("vegeta-{slug}.txt"),
+            "vegeta",
+            &args,
+            self.lengths.stage,
+            None,
+        )?;
         let log = server.log_since(mark)?;
         let malloc = malloc_failures(&log);
-        let alerts = alerts(&log);
+        let mut alerts = alerts(&log);
+        alerts.extend(seen);
         self.tool(
             &format!("vegeta-{slug}-report.txt"),
             "vegeta",
@@ -907,11 +979,12 @@ fn load(bench: &mut Bench, server: &mut Server<'_>, options: &Options) -> Result
     Ok(r_max)
 }
 
-/// Step 5 against `server`: a new connection for every request, at 100 a
-/// second and at 25 % of R_max.
+/// Step 5 against `server`: a new connection for every request, at 100 and
+/// 300 a second and at 25 % of R_max.
 fn no_keep_alive(bench: &mut Bench, server: &mut Server<'_>, r_max: f64) -> Result<(), String> {
     for (step, rate) in [
         ("5. no keep-alive at 100/s".to_owned(), 100),
+        ("5. no keep-alive at 300/s".to_owned(), 300),
         (
             "5. no keep-alive at 25 % of R_max".to_owned(),
             share_of(r_max, 25),
@@ -983,29 +1056,42 @@ fn buffers_note(run: &mut qemu::Run, when: &str) -> Result<Row, String> {
 }
 
 /// The machines of QEMU and VZ running on the Mac besides the run's own
-/// `own`: they share its cores, and every guest of `vz-run` has the same
+/// `own`, and the Mac's load average: they share its cores, and every guest of `vz-run` has the same
 /// MAC address and so the same lease on the NAT, which a second guest
 /// takes over in the middle of a stage.
 fn other_guests(own: usize) -> String {
+    let guests = guests();
+    let load = Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    if guests.len() <= own {
+        format!("none; the Mac's load average {load}")
+    } else {
+        format!(
+            "{} ({}); the Mac's load average {load}",
+            guests.len() - own,
+            guests.join("; ")
+        )
+    }
+}
+
+/// The lines of `ps` of the machines of QEMU and VZ running on the Mac.
+fn guests() -> Vec<String> {
     let list = Command::new("ps")
         .args(["-Ao", "pid,command"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let guests: Vec<String> = list
-        .lines()
+    list.lines()
         .filter(|l| {
             l.split_whitespace().nth(1).is_some_and(|c| {
                 c.ends_with("/vz-run") || c == "vz-run" || c.ends_with("qemu-system-aarch64")
             })
         })
         .map(|l| l.trim().chars().take(120).collect())
-        .collect();
-    if guests.len() <= own {
-        "none".to_owned()
-    } else {
-        format!("{} ({})", guests.len() - own, guests.join("; "))
-    }
+        .collect()
 }
 
 /// The directory of a run: `target/nginx-bench/<seconds>-<what>`.
@@ -1111,6 +1197,11 @@ pub fn command(args: &[String]) -> Result<(), String> {
 /// The run against stafeto in a guest.
 fn guest(options: &Options) -> Result<(), String> {
     let vz = options.target == Target::Vz;
+    if vz && let Some(other) = guests().iter().find(|g| g.contains("vz-run")) {
+        return Err(format!(
+            "another guest of vz-run runs ({other}): it has the same MAC address and takes the guest's lease; wait for it to end"
+        ));
+    }
     if !vz {
         crate::hvf_host().map_err(|why| format!("hvf needs macOS on Apple Silicon: {why}"))?;
     }

@@ -47,8 +47,8 @@ check the command. A full run takes about 15 minutes:
    25, 50, 75 and 90 % of R_max, 60 s each after a warm-up of 10 s;
 4. `/1k.bin` at 50 % of R_max; the ceiling of `/256k.bin` and a stage at
    50 % of it;
-5. `/10k.bin` with a new connection for each request, at 100 a second and
-   at 25 % of R_max (run after step 6, with nginx started again);
+5. `/10k.bin` with a new connection for each request, at 100 and 300 a
+   second and at 25 % of R_max (run after step 6, with nginx started again);
 6. nginx with `exclusive.conf`: its ceiling and a stage at 50 %;
 7. `posix-net readfile` of `/www/256k.bin` and `/www/10k.bin` in the guest.
 
