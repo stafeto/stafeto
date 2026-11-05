@@ -317,6 +317,10 @@ fn dir_size(dir: &Path) -> u64 {
 /// commands of the probe, on TCG.
 const BOOT_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The pages of its own quota that init keeps free after the services of an
+/// image started (the rule of the images with the network).
+const FREE_PAGES_MIN: u64 = 16_384;
+
 /// The package files an image holds in its container: name and bytes.
 fn layers_of(image: &BootImage<'_>) -> Vec<(String, Vec<u8>)> {
     image
@@ -414,9 +418,9 @@ fn boot(
     name: &str,
     path: &Path,
     check: impl FnOnce(&mut crate::qemu::Run) -> Result<(), String>,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64, u64), String> {
     let kernel = crate::build(crate::Variant::Normal)?;
-    let mut cmd = crate::qemu::command(&crate::qemu::VIRT, &kernel.image, Some(path));
+    let mut cmd = crate::qemu::command(crate::base_image::machine(name), &kernel.image, Some(path));
     cmd.args(crate::qemu::HEADLESS);
     cmd.args(crate::base_image::machine_args());
     let started = std::time::Instant::now();
@@ -434,11 +438,26 @@ fn boot(
     if let Some(line) = output.lines.iter().find(|l| l.contains("not attached")) {
         return Err(format!("{name}: {line}"));
     }
+    // What init has left of its quota once the services are up: the number
+    // stays watched as the services of the disk and of packages come.
+    let free = output
+        .lines
+        .iter()
+        .find_map(|l| {
+            let rest = l.strip_prefix("init: free pages ")?;
+            rest.split(' ').next()?.parse::<u64>().ok()
+        })
+        .ok_or_else(|| format!("{name}: init printed no line of free pages"))?;
+    if free < FREE_PAGES_MIN {
+        return Err(format!(
+            "{name}: init has {free} free pages after the services started, under {FREE_PAGES_MIN}"
+        ));
+    }
     let took = started.elapsed();
     if took > BOOT_WITHIN {
         return Err(format!("{name}: the run took {:.0} s", took.as_secs_f64()));
     }
-    Ok((services, took.as_secs_f64()))
+    Ok((services, took.as_secs_f64(), free))
 }
 
 /// The entries of `/usr/share/licenses`, as `ls -1` lists them.
@@ -530,13 +549,36 @@ pub fn identity() -> Result<(), String> {
             "pkg-identity: the {n} entries of the table rootfs of {name} are paths of the system"
         );
     }
+    // The notices of every package are in its package file, and the notices
+    // of F-Stack are in the files of its two packages alone, not in the
+    // container of an image as files of their own.
+    for (name, path, list) in [
+        (crate::base_image::FULL_IMAGE, &full, &with_files),
+        (crate::base_image::BASE_IMAGE, &base, &base_packages),
+    ] {
+        for p in list {
+            notices::image_has_package_notices(path, name, &p.name)?;
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let image = BootImage::parse(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        if let Some(f) = image.files().find(|f| f.name.starts_with("FSTACK-")) {
+            return Err(format!(
+                "pkg-identity: the container of {name} holds {}, a notice of F-Stack outside its packages",
+                f.name
+            ));
+        }
+        println!(
+            "pkg-identity: the notices of the {} packages of {name} are whole in their package files, the container holds none of F-Stack's",
+            list.len()
+        );
+    }
     // 4: the index and the packages.
     let n = repo::check(&dir, &[crate::keys::dev_keys(&crate::root())?.root])?;
     println!("pkg-identity: repo --check: {n} packages whole and signed");
     // 5: the full image in QEMU: the program of a package with its mode, the
     // licence of another in its directory, the directories of the notices.
     let licence = notices::licence_text("freedoom")?;
-    let (services, took) = boot(crate::base_image::FULL_IMAGE, &full, |run| {
+    let (services, took, free) = boot(crate::base_image::FULL_IMAGE, &full, |run| {
         let listing = shell(run, "ls -l /bin/doom")?;
         let doom = with_files
             .iter()
@@ -575,6 +617,8 @@ pub fn identity() -> Result<(), String> {
                 wanted.get(at)
             ));
         }
+        let dirs = shell(run, "find /usr/share/licenses -type d | wc -l")?;
+        println!("pkg-identity: find counts {dirs:?} directories under /usr/share/licenses");
         let mut names = want(&with_files);
         names.insert("stafeto".into());
         let held = licence_directories(run)?;
@@ -586,11 +630,11 @@ pub fn identity() -> Result<(), String> {
         Ok(())
     })?;
     println!(
-        "pkg-identity: {} in QEMU: ls -l /bin/doom, the licence of freedoom, the directories of the notices, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s)",
+        "pkg-identity: {} in QEMU: ls -l /bin/doom, the licence of freedoom, the directories of the notices, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages)",
         crate::base_image::FULL_IMAGE
     );
     // 6: the base image in QEMU: no game, the notices of the base packages, the screen and the keys.
-    let (services, took) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
+    let (services, took, free) = boot(crate::base_image::BASE_IMAGE, &base, |run| {
         // The services of the screen and of the keys came up.
         for line in ["virtio-gpu: screen ready", "input: QEMU Virtio Keyboard"] {
             run.expect_bytes(line.as_bytes(), crate::DIALOG_STEP)?;
@@ -613,7 +657,7 @@ pub fn identity() -> Result<(), String> {
         Ok(())
     })?;
     println!(
-        "pkg-identity: {} in QEMU: no /bin/doom, the notices of the base packages and of the system, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s)",
+        "pkg-identity: {} in QEMU: no /bin/doom, the notices of the base packages and of the system, no layer left out (services started after {services:.1} s, the checks done after {took:.1} s, init has {free} free pages)",
         crate::base_image::BASE_IMAGE
     );
     // 7: a package builds again to the same bytes.

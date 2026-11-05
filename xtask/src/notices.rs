@@ -283,10 +283,9 @@ pub fn image_has_package_notices(path: &Path, image: &str, package: &str) -> Res
     let licence = licence_text(package)?;
     let layered = crate::rootfs::layered(image)?;
     let all = packages::load()?;
-    let wanted = all
-        .iter()
-        .find(|p| p.name == package)
-        .ok_or_else(|| format!("no package {package}"))?;
+    if !all.iter().any(|p| p.name == package) {
+        return Err(format!("no package {package}"));
+    }
     let at = |name: &str| container.files().find(|f| f.name == name);
     if let Some(layer) = layered.packages.iter().find(|l| l.package.name == package) {
         // The licences of the ready-made utilities went with BusyBox's.
@@ -304,28 +303,39 @@ pub fn image_has_package_notices(path: &Path, image: &str, package: &str) -> Res
             }
         }
         let file = crate::pkg::file_name(&layer.package);
-        let dir = directory(package);
-        let text = layer_content(&bytes, &file, &format!("{dir}/LICENSE"))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if text != licence {
+        let held = container
+            .files()
+            .find(|f| f.name == file)
+            .ok_or_else(|| format!("{}: the image holds no {file}", path.display()))?;
+        let package_file = pkgfmt::Package::parse(held.data).map_err(|e| format!("{file}: {e}"))?;
+        // Every notice file the build of the package writes is in the layer,
+        // byte for byte: its LICENSE and SOURCE, the files its description
+        // names, and the LICENSE of each package linked into it (the
+        // packages with no file of their own, pcre2 and musl-fts, have
+        // their notices only there).
+        let meta = package_file.meta;
+        let build = Build {
+            commit: meta.commit,
+            relibc: (meta.relibc != "-").then_some(meta.relibc),
+            recipe: meta.recipe,
+        };
+        for (notice, want) in files(&layer.package, &all, &build)? {
+            let at = package_file
+                .rootfs
+                .find(&notice)
+                .ok_or_else(|| format!("{}: {file} has no {notice}", path.display()))?;
+            if package_file.content(at as u32) != want.as_slice() {
+                return Err(format!(
+                    "{}: {notice} of {file} is not what the build of {package} writes",
+                    path.display()
+                ));
+            }
+        }
+        if layer_content(&bytes, &file, &format!("{}/LICENSE", directory(package)))? != licence {
             return Err(format!(
                 "{}: {file} carries a LICENSE that is not the licence of {package}",
                 path.display()
             ));
-        }
-        let source = layer_content(&bytes, &file, &format!("{dir}/SOURCE"))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if source.is_empty() {
-            return Err(format!("{}: the SOURCE of {file} is empty", path.display()));
-        }
-        for dep in &wanted.build_depends {
-            let linked = format!("{dir}/{dep}/LICENSE");
-            let has_files = all
-                .iter()
-                .any(|p| p.name == *dep && !(p.files.is_empty() && p.dirs.is_empty()));
-            if has_files && layer_content(&bytes, &file, &linked).is_err() {
-                return Err(format!("{}: {file} has no {linked}", path.display()));
-            }
         }
         return Ok(());
     }
@@ -335,7 +345,20 @@ pub fn image_has_package_notices(path: &Path, image: &str, package: &str) -> Res
     }
     for name in names {
         let held = at(name).ok_or_else(|| format!("{} carries no {name}", path.display()))?;
-        if held.data.is_empty() || (name.ends_with("-LICENSE") && held.data != licence) {
+        // Each licence file holds the licence of the package it names.
+        let of = match *name {
+            "NCURSES-LICENSE" => Some("ncurses"),
+            "PCRE2-LICENCE" => Some("pcre2"),
+            "DOOM-LICENSE" => Some("doomgeneric"),
+            "FREEDOOM-LICENSE" => Some("freedoom"),
+            n if n.ends_with("-LICENSE") => Some(package),
+            _ => None,
+        };
+        let wrong = match of {
+            Some(licensee) => held.data != licence_text(licensee)?,
+            None => held.data.is_empty(),
+        };
+        if wrong {
             return Err(format!("{} carries a wrong {name}", path.display()));
         }
     }

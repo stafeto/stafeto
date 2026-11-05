@@ -604,8 +604,7 @@ pub struct Layered {
 /// A package of an image.
 pub struct LayerPackage {
     pub package: crate::packages::Package,
-    /// The bytes the image puts at paths of the package in place of the
-    /// package's own (a probe's settings, a certificate file with its own
+    /// The bytes that replace the package's own at paths of the package (a probe's settings, a certificate file with its own
     /// authority): the image holds a variant of the package file.
     pub replaced: Vec<(&'static str, &'static [u8])>,
 }
@@ -1218,7 +1217,7 @@ fn net_files(image: &str) -> Vec<RootFile> {
 }
 /// The files of the images of `nginx-probe`: those of the shell with the
 /// network (nginx among them), with the probe's variant of nginx's settings
-/// in place of the package's, the variant with one listening socket, the
+/// as the package's, the variant with one listening socket, the
 /// files of 10 KiB and 256 KiB the probe fetches, `netd.conf` with eight
 /// buffers, and the server of TLS (`tls.conf`) with nginx's certificate and
 /// key from the probe CA, the key readable by root alone.
@@ -1284,7 +1283,7 @@ fn nginx_files(image: &str) -> Vec<RootFile> {
 
 /// The files of the images of nginx on the stack (`cargo xtask fast-probe
 /// nginx`, `net-vz --fast --nginx`): those of the shell with the network, with
-/// the probe's variant of the settings of `nginx-fast` in place of the
+/// the probe's variant of the settings of `nginx-fast` as the
 /// package's, the variant under nobody, the files of 10 KiB and 256 KiB the
 /// probe fetches, the second device's fixed address in `netd.conf`, and the
 /// server of TLS with the probe CA's certificate and key.
@@ -2178,6 +2177,16 @@ mod tests {
                 merged.push((f.path, f.mode, f.uid, f.gid, source));
             }
             merged.sort_by(|a, b| a.0.cmp(b.0));
+            // A path two sources name is a directory both name, alike.
+            for pair in merged.windows(2) {
+                if pair[0].0 == pair[1].0 {
+                    assert!(
+                        pair[0].4.is_none() && pair[0] == pair[1],
+                        "{image}: {} is in two sources",
+                        pair[0].0
+                    );
+                }
+            }
             merged.dedup_by(|a, b| a.0 == b.0);
             let mut want: Vec<_> = full
                 .iter()

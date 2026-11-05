@@ -80,6 +80,9 @@ pub fn series() -> String {
 /// The time of the tables of the packages and the sources of the archives:
 /// the time a run has fixed for its images (`rootfs::set_build_time`), else
 /// SOURCE_DATE_EPOCH, else the time of the commit.
+///
+/// The order inside one run matters: a package written before the run fixed
+/// its time keeps the time it had (the clock probe sets the time first).
 fn table_time() -> Result<u64, String> {
     // A run that dates its images back dates the packages the same.
     if let Some(fixed) = rootfs::fixed_build_time() {
@@ -508,8 +511,8 @@ pub struct Options {
     pub time: Option<u64>,
     pub out: Option<PathBuf>,
     pub recipe: bool,
-    /// Bytes to put at paths of the selected packages in place of their
-    /// own: the package file is a variant for one image (`image_files`).
+    /// Bytes that replace the packages' own at paths of the selected
+    /// packages: the package file is a variant for one image (`image_files`).
     pub replace: Vec<(String, Vec<u8>)>,
 }
 

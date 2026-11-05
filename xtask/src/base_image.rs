@@ -47,6 +47,18 @@ pub fn machine_args() -> Vec<String> {
     args
 }
 
+/// The machine of an image: the full image runs on 1 GiB, because on 512 MiB
+/// its container of 54 MB leaves init 15 837 free pages (the base image, 26 843
+/// on 512 MiB, stays there); the archive of the full image names it in its
+/// `run.sh` (spec 5, release).
+pub fn machine(image: &str) -> &'static qemu::Machine {
+    if image == FULL_IMAGE {
+        &qemu::VIRT_1G
+    } else {
+        &qemu::VIRT
+    }
+}
+
 /// The image `name` built.
 pub fn build_image(name: &'static str) -> Result<PathBuf, String> {
     relibc()?;
@@ -74,7 +86,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
         None => Ok(()),
         Some("run") => {
             let kernel = build(Variant::Normal)?;
-            let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+            let mut cmd = qemu::command(machine(name), &kernel.image, Some(&image));
             cmd.args(["-nographic"]);
             cmd.args(machine_args());
             run_interactive_qemu(cmd, &kernel.elf)

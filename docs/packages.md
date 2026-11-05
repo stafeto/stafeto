@@ -396,10 +396,15 @@ the list of an image in the table and the packages; a test checks that the two m
 `cargo xtask image-listing` writes the tree an image shows (path, mode, owner, SHA-256 of the
 content, table and layers merged), so that two builds can be compared.
 
+The name of a package file in a container is at most 32 bytes (`<name>-<version>-<release>.stpkg`);
+a longer name stops the build of the image.
+
 A probe that changes the bytes of a path of a package (the settings of nginx and nginx on the
 stack, the CA file with the probe's authority in the image of the probe of TLS) gets a variant of
 the package file, built for that image into `target/pkg/variants/<image>/` with the development key;
-the variants go to no repository. A program that only a package names has no ELF file of its own
+the variants go to no repository. A variant keeps the name, the version and the signature fields of
+the package it varies, so it is only for the images of probes: the package service must not take one
+for a release. A program that only a package names has no ELF file of its own
 in the image, and the files of notices that an image holds for a program of its table
 (`BUSYBOX-LICENSE`, `BASH-LICENSE` and the like) stay only where the table names the program;
 `notices::image_has_package_notices` checks both cases. The files of a package carry the time of its
@@ -412,7 +417,14 @@ service) and on a machine with the network, the screen and the keyboard; `run` b
 of the index, that their tables hold no path of a package, and that both boot: `ls -l /bin/doom`
 and the text of the licence of freedoom in the full image, no `/bin/doom` in the base image, the
 directories of `/usr/share/licenses`, the services of the screen and the keys, and no `not
-attached` line of the service.
+attached` line of the service (every run of QEMU fails on that line, `qemu::Run`). The notices of
+every package are checked whole in its package file (the licences of the packages linked into it
+too, `pcre2` and `musl-fts` among them), and the container of an image holds no file of F-Stack's
+notices. The full image runs on 1 GiB: on 512 MiB its container of 54 MB leaves init 15 837 free
+pages, under the 16 384 that `pkg-identity` keeps (the line `init: free pages` after `init:
+services started`); on 1 GiB and for the base image on 512 MiB the numbers are in the report of the
+stage. Whoever starts the full image, `run.sh` of its archive among them (stage 5 of subproject 5),
+passes `-m 1024`.
 
 ## The disk service
 

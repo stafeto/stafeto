@@ -63,4 +63,4 @@ fixes defects.
 The images of the shell, the network, the games and the probes hold their packages as package files
 (layers of the RAM file service) and keep the files of their table for the system. `boot-base.img`
 holds the base packages and `boot-full.img` every package; both are built by `cargo xtask image
-base|full` and are not part of the archives of a release yet (docs/packages.md, "Images on layers").
+base|full` and are not part of the archives of a release yet (the full image needs `-m 1024`: the `run.sh` of its archive must pass it) (docs/packages.md, "Images on layers").

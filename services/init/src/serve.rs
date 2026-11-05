@@ -526,6 +526,16 @@ impl Init {
         self.started += 1;
         if self.started == TABLE.len() {
             println!("{STARTED}");
+            // What is left of init's own quota once every record has its
+            // own: the images with many packages watch it (cargo xtask
+            // pkg-identity keeps it from 16 384 pages).
+            if let Ok(memory) = sys::process_memory(&self.own) {
+                println!(
+                    "init: free pages {} of {}",
+                    memory.quota.saturating_sub(memory.used) / PAGE,
+                    memory.quota / PAGE
+                );
+            }
         }
     }
 

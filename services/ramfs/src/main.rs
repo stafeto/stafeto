@@ -191,6 +191,7 @@ fn image_tree(start: &mut rt::startup::Startup) -> Option<(tree::Tree<'static>, 
 /// cannot go in is left out with a line that says why, and the service goes on.
 fn image_layers(ram: &mut Ram<'static>, image: &'static [u8], now: proto_fs::Timestamp) {
     let Ok(container) = bootimg::BootImage::parse(image) else {
+        rt::println!("ramfs: image: the container is not read, no layers");
         return;
     };
     for (n, file) in container.files().enumerate() {
