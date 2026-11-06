@@ -23,6 +23,7 @@ mod boot;
 mod channel;
 mod cleanup;
 mod cmd;
+mod idle;
 mod init;
 mod interrupt;
 mod irq;
@@ -77,6 +78,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     memory::forbid(&boot.info);
     let clock = arch::timer::init();
     sched::init(clock);
+    idle::init();
     smp::start(boot);
     report(boot, clock, &init);
     smp::sgi_probe();

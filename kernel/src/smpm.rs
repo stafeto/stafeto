@@ -25,6 +25,15 @@ struct Row {
     acquires: AtomicU64,
     wait: AtomicU64,
     longest_wait: AtomicU64,
+    /// The idle poll (idle.rs): windows that ended with an interrupt or a
+    /// bell, windows that ran out, ticks in windows, the window now, bells
+    /// this CPU rang that needed no SGI, and those that did.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    polled: AtomicU64,
+    window: AtomicU64,
+    saved: AtomicU64,
+    sent: AtomicU64,
 }
 
 impl Row {
@@ -37,6 +46,12 @@ impl Row {
             acquires: AtomicU64::new(0),
             wait: AtomicU64::new(0),
             longest_wait: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            polled: AtomicU64::new(0),
+            window: AtomicU64::new(0),
+            saved: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
         }
     }
 
@@ -48,6 +63,11 @@ impl Row {
             &self.acquires,
             &self.wait,
             &self.longest_wait,
+            &self.hits,
+            &self.misses,
+            &self.polled,
+            &self.saved,
+            &self.sent,
         ] {
             word.store(0, Relaxed);
         }
@@ -89,6 +109,25 @@ pub fn waited(ticks: u64) {
     }
 }
 
+/// The idle loop slept: with a `window` of poll in ticks (0 for none), the
+/// window ended with an interrupt or a bell (`hit`), and the whole wait took
+/// `ticks`.
+pub fn polled(window: u64, hit: bool, ticks: u64) {
+    let row = row();
+    row.window.store(window, Relaxed);
+    if window != 0 {
+        row.polled.fetch_add(ticks.min(window), Relaxed);
+        let which = if hit { &row.hits } else { &row.misses };
+        which.fetch_add(1, Relaxed);
+    }
+}
+
+/// This CPU rang another one; `sgi` when the SGI went too.
+pub fn rang(sgi: bool) {
+    let which = if sgi { &row().sent } else { &row().saved };
+    which.fetch_add(1, Relaxed);
+}
+
 /// Starts a new count.
 pub fn reset() {
     for row in &ROWS {
@@ -103,6 +142,18 @@ pub fn report() {
     kprintln!("smp-measure counter {} Hz", crate::arch::timer::frequency());
     for (i, row) in ROWS.iter().enumerate() {
         let entries = row.entries.load(Relaxed);
+        let rings = row.saved.load(Relaxed) + row.sent.load(Relaxed);
+        if rings + row.hits.load(Relaxed) + row.misses.load(Relaxed) != 0 {
+            kprintln!(
+                "smp-measure poll cpu {i}: windows hit {}, missed {}, {} ticks polled, window {} ticks, bells without SGI {}, with SGI {}",
+                row.hits.load(Relaxed),
+                row.misses.load(Relaxed),
+                row.polled.load(Relaxed),
+                row.window.load(Relaxed),
+                row.saved.load(Relaxed),
+                row.sent.load(Relaxed),
+            );
+        }
         if entries == 0 {
             continue;
         }

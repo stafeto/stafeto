@@ -290,7 +290,7 @@ pub fn flush() {
         o.n = 0;
     }
     for to in (0..MAX_CPUS).filter(|c| mask & (1 << c) != 0) {
-        gic::send_sgi(to, SGI_CMD);
+        crate::idle::ring(to);
     }
 }
 

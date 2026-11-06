@@ -69,6 +69,20 @@ break-asid-flush = ["asid-probe", "kcore/break-flush"]
 break-asid-aside = ["asid-probe", "kcore/break-aside"]
 break-asid-retire = ["asid-probe"]
 break-unmap-local = []
+# The CPUs poll in the idle loop everywhere (idle-poll), or nowhere
+# (no-idle-poll); with neither, where kcore::idlepoll::enabled says (the MIDR
+# of a guest of Apple's hypervisor).
+idle-poll = []
+no-idle-poll = []
+# The poll with a window of 1 ms and the line xtask looks for when a window
+# ends with an interrupt pending (xtask smp-idle-bell).
+idle-probe = ["idle-poll"]
+# The probe kernel with one deliberate break each: the sender reads POLLING
+# and writes BELL in two steps with a wait between them, the bell ends the poll
+# with no drain of the queues, and the poll does not read ISR_EL1.
+break-idle-bell = ["idle-probe", "window-probe"]
+break-idle-drain = ["idle-probe", "window-probe"]
+break-idle-irq = ["idle-probe", "window-probe"]
 atomic-locks = ["kcore/atomic-locks"]
 locked-decide = []
 baseline = ["ktest", "atomic-locks", "locked-decide"]
