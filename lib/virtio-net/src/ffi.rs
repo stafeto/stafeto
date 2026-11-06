@@ -23,6 +23,7 @@ use crate::books::QUEUE_SIZE;
 use crate::frames::{BUFFER_LEN, HDR_LEN, MAX_FRAME, fill_sums, rx_frame, tx_prepare};
 use crate::host::{self, Host, Region};
 use crate::open::{MAC, MTU, STATUS};
+use crate::rings::Stock;
 use crate::transport::{self, Snapshot};
 use crate::{barrier, open};
 use core::cell::UnsafeCell;
@@ -163,7 +164,8 @@ struct State {
     tx: Queue,
     rx_of: [u32; QUEUE_SIZE],
     tx_of: [u32; QUEUE_SIZE],
-    rx_dirty: bool,
+    /// The buffers of the queue of receiving as far as its doorbell goes.
+    stock: Stock,
     tx_dirty: bool,
     ring: usize,
 }
@@ -267,7 +269,7 @@ pub unsafe extern "C" fn vnet_open(c: *const Claim) -> c_int {
             tx,
             rx_of: [NONE; QUEUE_SIZE],
             tx_of: [NONE; QUEUE_SIZE],
-            rx_dirty: false,
+            stock: Stock::new(),
             tx_dirty: false,
             ring: c.ring as usize,
         });
@@ -279,7 +281,7 @@ pub unsafe extern "C" fn vnet_open(c: *const Claim) -> c_int {
     refill(s);
     s.transport.finish_init();
     barrier::ring(&mut s.transport, RECEIVEQ);
-    s.rx_dirty = false;
+    s.stock.rung();
     0
 }
 
@@ -297,7 +299,7 @@ fn refill(s: &mut State) {
         match unsafe { s.rx.add(&[], &mut [slice]) } {
             Ok(token) if usize::from(token) < QUEUE_SIZE => {
                 s.rx_of[usize::from(token)] = n;
-                s.rx_dirty = true;
+                s.stock.added();
             }
             _ => {
                 pool().give(n);
@@ -320,8 +322,13 @@ pub unsafe extern "C" fn vnet_rx_burst(out: *mut Buf, n: c_int) -> c_int {
         return -1;
     };
     refill(s);
-    if core::mem::take(&mut s.rx_dirty) && s.rx.should_notify() {
-        barrier::ring(&mut s.transport, RECEIVEQ);
+    // The doorbell waits until the device runs low on the buffers it was
+    // shown (`Stock`): a burst of the program is a few frames.
+    if s.stock.due() {
+        s.stock.rung();
+        if s.rx.should_notify() {
+            barrier::ring(&mut s.transport, RECEIVEQ);
+        }
     }
     let mut got = 0;
     while got < n.max(0) && s.rx.can_pop() {
@@ -341,6 +348,7 @@ pub unsafe extern "C" fn vnet_rx_burst(out: *mut Buf, n: c_int) -> c_int {
             return -1;
         };
         s.rx_of[usize::from(token)] = NONE;
+        s.stock.used();
         match rx_frame(slice, used as usize) {
             Some(frame) => {
                 // SAFETY: the caller's room for `n`.

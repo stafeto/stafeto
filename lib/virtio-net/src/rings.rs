@@ -63,6 +63,58 @@ pub unsafe fn buffer_at<'a>(base: usize, n: u16) -> &'a mut [u8] {
     unsafe { core::slice::from_raw_parts_mut((base + offset(n)) as *mut u8, BUFFER_LEN) }
 }
 
+/// The buffers of the ring of receiving as far as its doorbell goes. A device
+/// reads the ring of available buffers when a frame comes, so the driver may
+/// leave the doorbell until the device has few of the buffers its last
+/// doorbell showed it (`RX_LOW`): a doorbell is an exit from the guest, far
+/// dearer than a frame. A device that looks at the ring only after a doorbell
+/// finds buffers as long as `left` is above 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stock {
+    /// In the queue: given, and neither used by the device nor taken back.
+    queued: u32,
+    /// Added since the last doorbell.
+    pending: u32,
+}
+
+/// The least buffers the device is left with when the doorbell rings.
+pub const RX_LOW: u32 = 64;
+
+impl Stock {
+    pub const fn new() -> Stock {
+        Stock {
+            queued: 0,
+            pending: 0,
+        }
+    }
+
+    /// A buffer went into the queue.
+    pub fn added(&mut self) {
+        self.queued += 1;
+        self.pending += 1;
+    }
+
+    /// The driver took a used buffer back.
+    pub fn used(&mut self) {
+        self.queued = self.queued.saturating_sub(1);
+    }
+
+    /// The doorbell rang, or the device asked for none.
+    pub fn rung(&mut self) {
+        self.pending = 0;
+    }
+
+    /// The buffers the last doorbell showed the device and it has left.
+    pub const fn left(&self) -> u32 {
+        self.queued.saturating_sub(self.pending)
+    }
+
+    /// Whether the doorbell is due: buffers went in and the device runs low.
+    pub const fn due(&self) -> bool {
+        self.pending > 0 && self.left() <= RX_LOW
+    }
+}
+
 /// The ring of receiving.
 pub struct RxRing<H: Hal> {
     pub queue: Queue<H>,
@@ -70,6 +122,8 @@ pub struct RxRing<H: Hal> {
     base: usize,
     /// Buffers went back in since the last doorbell.
     pub dirty: bool,
+    /// What the device was shown of the buffers (`Stock`).
+    pub stock: Stock,
 }
 
 impl<H: Hal> RxRing<H> {
@@ -80,12 +134,19 @@ impl<H: Hal> RxRing<H> {
             book: RxBook::new(),
             base,
             dirty: false,
+            stock: Stock::new(),
         }
     }
 
     /// Where its buffers lie in the driver.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// The doorbell rang (or the device asked for none): nothing is pending.
+    pub fn rung(&mut self) {
+        self.dirty = false;
+        self.stock.rung();
     }
 
     /// Puts buffer `n` in the queue.
@@ -99,6 +160,7 @@ impl<H: Hal> RxRing<H> {
         match token {
             Ok(token) if self.book.put(token, n) => {
                 self.dirty = true;
+                self.stock.added();
                 Ok(())
             }
             _ => Err(Broken::Refused),
@@ -131,6 +193,7 @@ impl<H: Hal> RxRing<H> {
         // SAFETY: the same buffer `give` added with this token.
         let popped = unsafe { self.queue.pop_used(token, &[], &mut [&mut *slice]) };
         let used = popped.map_err(|_| Broken::NotTaken)?;
+        self.stock.used();
         Ok(Some((n, used as usize)))
     }
 }
@@ -142,6 +205,8 @@ pub struct TxRing<H: Hal> {
     base: usize,
     /// Buffers went in since the last doorbell.
     pub dirty: bool,
+    /// How many.
+    pub pending: u32,
 }
 
 /// What became of a frame given to the ring of sending.
@@ -165,12 +230,19 @@ impl<H: Hal> TxRing<H> {
             book: TxBook::new(),
             base,
             dirty: false,
+            pending: 0,
         }
     }
 
     /// Where its buffers lie in the driver.
     pub fn base(&self) -> usize {
         self.base
+    }
+
+    /// The doorbell rang (or the device asked for none): nothing is pending.
+    pub fn rung(&mut self) {
+        self.dirty = false;
+        self.pending = 0;
     }
 
     /// Puts the frame of `len` bytes in buffer `n` (the pool's, after its
@@ -190,6 +262,7 @@ impl<H: Hal> TxRing<H> {
         match sent {
             Ok(token) if self.book.sent(token, n) => {
                 self.dirty = true;
+                self.pending += 1;
                 Ok(Sent::Queued)
             }
             Ok(_) => Err(Broken::Twice),
@@ -220,5 +293,36 @@ impl<H: Hal> TxRing<H> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_doorbell_of_receiving_waits_until_the_device_runs_low() {
+        let mut stock = Stock::new();
+        assert!(!stock.due(), "nothing went in");
+        for _ in 0..QUEUE_SIZE {
+            stock.added();
+        }
+        assert!(stock.due(), "the device was shown nothing: the first ring");
+        stock.rung();
+        assert_eq!(stock.left(), QUEUE_SIZE as u32);
+        assert!(!stock.due());
+        // The device uses a buffer, the driver takes it back and gives it
+        // again: the device is left with one buffer less of those it saw.
+        for _ in 0..(QUEUE_SIZE as u32 - RX_LOW - 1) {
+            stock.used();
+            stock.added();
+        }
+        assert_eq!(stock.left(), RX_LOW + 1);
+        assert!(!stock.due());
+        stock.used();
+        stock.added();
+        assert!(stock.due());
+        stock.rung();
+        assert_eq!(stock.left(), QUEUE_SIZE as u32);
     }
 }

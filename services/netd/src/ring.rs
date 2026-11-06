@@ -57,6 +57,18 @@ pub const STEP_TX: usize = 2;
     feature = "send-2"
 )))]
 pub const STEP_TX: usize = 1;
+/// The frames the ring of sending holds before its doorbell rings while
+/// steps of the service follow, which bounds how long a frame waits.
+pub const BELL_TX: u32 = 8;
+/// Whether the ring of sending rings its doorbell at the end of a step:
+/// `pending` frames went in since the last one, and `more` says that
+/// another step of the service follows at once. One ring serves the frames
+/// of the whole run of steps (a ring is an exit from the guest, far dearer
+/// than a frame).
+pub const fn tx_bell_due(pending: u32, more: bool) -> bool {
+    pending > 0 && (!more || pending >= BELL_TX)
+}
+
 /// The frames the loopback keeps for the next reception: two steps of
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
@@ -572,6 +584,15 @@ impl Default for Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_of_steps_of_sending_rings_once_at_its_end() {
+        assert!(!tx_bell_due(0, false), "nothing went in");
+        assert!(!tx_bell_due(1, true), "a step follows");
+        assert!(!tx_bell_due(BELL_TX - 1, true));
+        assert!(tx_bell_due(BELL_TX, true), "a frame does not wait for ever");
+        assert!(tx_bell_due(1, false), "the last step rings what is left");
+    }
 
     #[test]
     fn a_step_that_ends_its_receiving_keeps_the_frames_it_took() {

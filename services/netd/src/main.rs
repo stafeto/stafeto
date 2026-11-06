@@ -22,10 +22,12 @@
 //! sending come back, the stack takes the frames of the loopback and then of
 //! the wire (`ring::STEP_RX` at most) and sends in one pass over its
 //! sockets (`ring::STEP_TX` frames at most), the operations that wait are
-//! told, the buffers of receiving go back to the queue, the doorbells ring,
-//! and the timer is set for the stack's next deadline. A step that left
-//! frames behind notifies the service again and keeps the line closed;
-//! otherwise the line opens again (irq_ack) with the source cleared. A
+//! told, the buffers of receiving go back to the queue, and the timer is set
+//! for the stack's next deadline. A step that left frames behind notifies
+//! the service again and keeps the line closed, and asks the device for no
+//! interrupt meanwhile; otherwise the line opens again (irq_ack) with the
+//! source cleared. The doorbells ring once for a run of steps, when it ends
+//! (`doorbells`): a ring is an exit from the guest. A
 //! call of a socket never runs the stack: it changes the buffers of one
 //! socket and asks for a step.
 //!
@@ -405,7 +407,7 @@ fn main(_: u64) -> u64 {
     device.rx.fill();
     transport.finish_init();
     ring(&mut transport, RECEIVEQ);
-    device.rx.ring.dirty = false;
+    device.rx.ring.rung();
     let line = sys::irq_info(&irq).map_or(0, |info| info.line);
     if pci {
         rt::println!(
@@ -941,7 +943,16 @@ impl Driver<'_> {
         let more = self.device.rx.ring.queue.can_pop()
             || self.device.looped.waiting() > 0
             || self.device.has_deferred();
-        let continued = more && self.tell(RX);
+        let mut continued = more && self.tell(RX);
+        // While steps follow, the device is asked for no interrupt (the
+        // line is closed and the steps look at the queue anyway). The run
+        // ends with the interrupts asked for again and one more look at the
+        // queue, so that a frame that came between is not left to wait.
+        self.device.rx.ring.queue.set_dev_notify(!continued);
+        if !continued && self.device.rx.ring.queue.can_pop() {
+            continued = self.tell(RX);
+            self.device.rx.ring.queue.set_dev_notify(!continued);
+        }
         if !continued && core::mem::take(&mut self.line_closed) {
             let began = profile::now();
             virtio_mmio::reopen(&self.irq);
@@ -952,7 +963,8 @@ impl Driver<'_> {
                 began,
             );
         }
-        self.next_steps(now, continued);
+        let sending = self.next_steps(now, continued);
+        self.doorbells(continued || sending);
         let end = split::now();
         split::record(split::KERNEL, end - kernel);
         let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
@@ -1000,7 +1012,8 @@ impl Driver<'_> {
         rt::service::step_detail(self.device.step_frames() as u64);
         let kernel = split::now();
         let continued = self.device.looped.waiting() > 0 && self.tell(RX);
-        self.next_steps(now, continued);
+        let sending = self.next_steps(now, continued);
+        self.doorbells(continued || sending);
         let end = split::now();
         split::record(split::KERNEL, end - kernel);
         let counted = split::get(&split::RX_TURNS) + split::get(&split::PASSES);
@@ -1008,18 +1021,18 @@ impl Driver<'_> {
     }
 
     /// What every step ends with: the operations that wait are looked at by a
-    /// step of their own, and the doorbells ring.
+    /// step of their own.
     fn finish_step(&mut self, _now: u64) {
         self.net.schedule_wake();
         if self.net.wake_pending() {
             self.tell(WAKE);
         }
-        self.doorbells();
     }
 
     /// Groups with work left want a step of sending; when no step follows,
-    /// the timer is set for the next deadline.
-    fn next_steps(&mut self, now: u64, receiving: bool) {
+    /// the timer is set for the next deadline. True when a step of sending
+    /// follows.
+    fn next_steps(&mut self, now: u64, receiving: bool) -> bool {
         // The DHCP client's set has a message to send after a frame of the
         // server (a request after an offer) that only a pass of sending
         // makes; without this step it would wait for the client's retry.
@@ -1027,6 +1040,7 @@ impl Driver<'_> {
         if !receiving && !sending {
             self.arm(now);
         }
+        sending
     }
 
     /// The second device's step (second.rs): its status if an interrupt
@@ -1238,10 +1252,19 @@ impl Driver<'_> {
         }
     }
 
-    /// Rings the doorbell of each queue that got buffers in the step.
-    fn doorbells(&mut self) {
-        if core::mem::take(&mut self.device.rx.ring.dirty) {
-            if self.device.rx.ring.queue.should_notify() {
+    /// Rings the doorbell of each queue that got buffers, once for a batch
+    /// of steps: a ring is an exit from the guest and costs far more than
+    /// the frame it announces. The queue of sending rings when the run of
+    /// steps ends (`more` false) or holds `ring::BELL_TX` frames. The queue of
+    /// receiving rings when the buffers the device was shown last run low
+    /// (`virtio_net::rings::RX_LOW`): it reads the ring of available buffers when a frame
+    /// comes, and the 256 buffers outlast a long run of frames. The device
+    /// may ask not to be rung (`should_notify`).
+    fn doorbells(&mut self, more: bool) {
+        let rx = &mut self.device.rx.ring;
+        if rx.stock.due() {
+            rx.rung();
+            if rx.queue.should_notify() {
                 let began = profile::now();
                 ring(&mut self.transport, RECEIVEQ);
                 profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
@@ -1250,8 +1273,10 @@ impl Driver<'_> {
                 profile::count(Counter::Skipped);
             }
         }
-        if core::mem::take(&mut self.device.tx.ring.dirty) {
-            if self.device.tx.ring.queue.should_notify() {
+        let tx = &mut self.device.tx.ring;
+        if netd::ring::tx_bell_due(tx.pending, more) {
+            tx.rung();
+            if tx.queue.should_notify() {
                 let began = profile::now();
                 ring(&mut self.transport, TRANSMITQ);
                 profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
