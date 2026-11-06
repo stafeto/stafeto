@@ -82,6 +82,32 @@ pub fn fork_mark(
     })
 }
 
+/// Whether the pool admits a child of `quota` bytes: the service's free
+/// quota `free` less the reserve of the free places of the grants (a child
+/// that `holder`s a place takes them) keeps RESERVE after the child.
+pub fn pool_admits(
+    free: u64,
+    grants: &proto_init::Grants,
+    held: impl Fn(u8) -> u32,
+    holder: bool,
+    quota: u64,
+) -> bool {
+    let reserve = if holder || grants.len == 0 {
+        0
+    } else {
+        pool_reserve(grants, held)
+    };
+    pool_allows(free.saturating_sub(reserve), quota)
+}
+
+/// Whether the pool, less its own RESERVE, holds the places of all the
+/// grants: the service refuses lines that do not fit, since every other
+/// child would find the pool empty.
+pub fn grants_fit(free: u64, grants: &proto_init::Grants) -> bool {
+    free.checked_sub(RESERVE)
+        .is_some_and(|pool| grants.pages_total() * 4096 <= pool)
+}
+
 /// The bytes of the pool set apart for the places of the grants that are
 /// free: another child cannot take them (a child that holds a place takes
 /// them). `held` counts the places held of a grant.
@@ -499,6 +525,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn exec_and_the_other_children_leave_the_free_places_to_the_holders() {
+        let g = grants();
+        let page = 4096u64;
+        let all = (2 * 65_536 + 16_384) * page;
+        let free = RESERVE + 100 * page + all;
+        let none = |_| 0;
+        // fork, posix_spawn and exec of a process that holds nothing:
+        assert!(pool_admits(free, &g, none, false, 100 * page));
+        assert!(!pool_admits(free, &g, none, false, 101 * page));
+        // a child that holds a place takes from the reserve:
+        assert!(pool_admits(free, &g, none, true, 65_536 * page));
+        // no grants, no reserve:
+        let no = proto_init::Grants::NONE;
+        assert!(pool_admits(
+            RESERVE + 101 * page,
+            &no,
+            none,
+            false,
+            101 * page
+        ));
+        // the grants fit a pool that holds their places and RESERVE:
+        assert!(grants_fit(RESERVE + all, &g));
+        assert!(!grants_fit(RESERVE + all - 1, &g));
+        assert!(!grants_fit(10, &g));
     }
 
     #[test]

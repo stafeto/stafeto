@@ -846,9 +846,17 @@ fn path_ok(path: &[u8]) -> bool {
             .all(|part| !part.is_empty() && part != b"." && part != b"..")
 }
 
+/// A decimal number of digits alone (no sign).
+fn number(text: &[u8]) -> Option<u64> {
+    if text.is_empty() || !text.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    core::str::from_utf8(text).ok()?.parse().ok()
+}
+
 fn size_pages(text: &[u8]) -> Option<u32> {
     let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
-    let number: u64 = core::str::from_utf8(digits).ok()?.parse().ok()?;
+    let number: u64 = number(digits)?;
     let bytes = number.checked_mul(match unit[0] {
         b'K' => 1 << 10,
         b'M' => 1 << 20,
@@ -860,7 +868,7 @@ fn size_pages(text: &[u8]) -> Option<u32> {
 }
 
 fn small(text: &[u8], most: u8) -> Option<u8> {
-    let n: u8 = core::str::from_utf8(text).ok()?.parse().ok()?;
+    let n: u8 = u8::try_from(number(text)?).ok()?;
     (1..=most).contains(&n).then_some(n)
 }
 
@@ -925,7 +933,7 @@ impl Grants {
             if grants.len == GRANTS_MAX
                 || grants.lines[..grants.len]
                     .iter()
-                    .any(|g| g.name() == parsed.name())
+                    .any(|g| g.name() == parsed.name() || g.program() == parsed.program())
             {
                 return Err(GrantsError(n + 1));
             }
@@ -1392,6 +1400,9 @@ mod tests {
             ok.replace(" depth=1", ""),
             ok.replace("depth=1", "depth=1 depth=1"),
             ok.replace("depth=1", "colour=1"),
+            ok.replace("places=2", "places=+2"),
+            ok.replace("memory=768M", "memory=+768M"),
+            ok.replace("depth=1", "depth=+1"),
             ok.replace("grant nginx-fast", "grant Nginx"),
             ok.replace("under=ash-launcher", "under="),
         ] {
@@ -1416,6 +1427,12 @@ mod tests {
         let mut twice = BIG.to_vec();
         twice.extend_from_slice(BIG);
         assert_eq!(Grants::parse(&twice), Err(GrantsError(2)));
+        // Two lines with one path: the second would never be found.
+        let mut same_path = BIG.to_vec();
+        same_path.extend_from_slice(
+            b"grant other program=/bin/procs-child under=u memory=64M places=1 depth=1\n",
+        );
+        assert_eq!(Grants::parse(&same_path), Err(GrantsError(2)));
     }
 
     #[test]

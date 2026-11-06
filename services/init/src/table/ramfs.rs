@@ -586,15 +586,19 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
-/// The grant of the probe of the big room (`posix-map big`): the children
+/// The grants of the probe of the big room (`posix-map big`): the children
 /// of fork of `/bin/procs-child` started by the probe's record hold two
 /// places of 256 MiB, above the 64 MiB from which a process may grow its
-/// room, down to the depth 2 (the child and its own child of fork).
+/// room, down to the depth 2 (the child and its own child of fork). The
+/// second line names a copy the probe makes at `/tmp/procs-mode`, to see
+/// that the loader gives the path to the service only for a file of UID 0
+/// that the group and the others cannot write.
 pub const MAP_BIG_GRANTS: &[u8] =
-    b"grant map-big program=/bin/procs-child under=posix-procs memory=256M places=2 depth=2\n";
+    b"grant map-big program=/bin/procs-child under=posix-procs memory=256M places=2 depth=2\n\
+grant map-mode program=/tmp/procs-mode under=posix-procs memory=80M places=1 depth=1\n";
 
-/// The pages of the two places of the grant above, set apart in the pool.
-const MAP_BIG_PAGES: u64 = 2 * 65_536;
+/// The pages of the places of the grants above, set apart in the pool.
+const MAP_BIG_PAGES: u64 = 2 * 65_536 + 20_480;
 
 /// The probe of the big room and of the grant of quota (tests/posix-map,
 /// the argument `big`): the table of POSIX_PROCS_TABLE with the grant above
@@ -656,6 +660,10 @@ pub const POSIX_SHARES_TABLE: &[Record] = &[
 /// services at 40 it measures. The pool for the crowd of
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
+pub const STEPS_GRANTS: &[u8] =
+    b"grant steps program=/bin/steps-grant under=ramfs memory=64M places=1 depth=1\n";
+const STEPS_GRANT_PAGES: u64 = 16_384;
+
 pub const POSIX_STEPS_TABLE: &[Record] = &[
     // Room for the crowd's descriptions in the RAM file service.
     Record {
@@ -663,7 +671,13 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         ..RAM_FIFO_CLOCKED
     },
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + (STEPS_CHILDREN + 2) * STEPS_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota
+            + (STEPS_CHILDREN + 2) * STEPS_QUOTA
+            + 384 * PAGE
+            + STEPS_GRANT_PAGES * PAGE,
+        // A grant no program of the image uses: the steps of fork, spawn and
+        // exec are measured with the reserve and the counter of places there.
+        args: STEPS_GRANTS,
         ..POSIX_ABI_TABLE[1]
     },
     Record {

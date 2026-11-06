@@ -2428,16 +2428,18 @@ mod tests {
     }
 
     /// The grants of quota in the tables (spec 2, 3.12.2, K5): every line
-    /// is read, the init record it is `under` is in the same table, and the
-    /// pool of the process service holds the pages of all the places.
+    /// is read, the init record it is `under` is the only one of its
+    /// program in the same table, and the pool of the process service holds
+    /// the pages of all the places.
     #[test]
     fn the_grants_of_the_tables_are_read_name_a_record_and_fit_the_pool() {
-        let mut seen = 0;
-        for table in [
-            fstack::FAST_SCALE_TABLE,
-            fstack::FAST_SCALE_VZ_TABLE,
-            ramfs::POSIX_MAP_BIG_TABLE,
-        ] {
+        let tables: [(&[Record], &[Record]); 4] = [
+            (fstack::FAST_SCALE_TABLE, fstack::FAST_NGINX_TABLE),
+            (fstack::FAST_SCALE_VZ_TABLE, fstack::FAST_NGINX_VZ_TABLE),
+            (ramfs::POSIX_MAP_BIG_TABLE, ramfs::POSIX_PROCS_TABLE),
+            (ramfs::POSIX_STEPS_TABLE, ramfs::POSIX_STEPS_TABLE),
+        ];
+        for (n, (table, plain)) in tables.into_iter().enumerate() {
             let service = table
                 .iter()
                 .find(|r| r.args.starts_with(b"grant "))
@@ -2448,27 +2450,26 @@ mod tests {
             assert!(grants.len > 0);
             for line in grants.lines() {
                 let under = core::str::from_utf8(line.under()).unwrap();
-                assert!(
-                    table.iter().any(|r| r.program == under),
-                    "{under} is no program of the table"
+                assert_eq!(
+                    table.iter().filter(|r| r.program == under).count(),
+                    1,
+                    "{under} is not the program of exactly one record of the table"
                 );
             }
-            let plain = match table.len() {
-                _ if core::ptr::eq(table, fstack::FAST_SCALE_TABLE) => fstack::FAST_NGINX_TABLE,
-                _ if core::ptr::eq(table, fstack::FAST_SCALE_VZ_TABLE) => {
-                    fstack::FAST_NGINX_VZ_TABLE
-                }
-                _ => ramfs::POSIX_PROCS_TABLE,
-            };
-            let base = plain.iter().find(|r| r.program == service.program).unwrap();
-            assert_eq!(
-                service.quota,
-                base.quota + grants.pages_total() * PAGE,
-                "the pool holds the places of the grants and no more"
+            let pool = service.quota;
+            if n < 3 {
+                let base = plain.iter().find(|r| r.program == service.program).unwrap();
+                assert_eq!(
+                    pool,
+                    base.quota + grants.pages_total() * PAGE,
+                    "the pool holds the places of the grants and no more"
+                );
+            }
+            assert!(
+                pool >= grants.pages_total() * PAGE + 384 * PAGE,
+                "the pool holds the places of the grants and the reserve of the service"
             );
-            seen += 1;
         }
-        assert_eq!(seen, 3);
     }
 
     /// The image of the row F1 is the image of nginx on the stack on VZ with

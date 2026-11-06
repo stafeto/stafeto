@@ -194,6 +194,9 @@ pub struct Records<P> {
     /// The group and the session each place's PID names.
     numbers: [Numbers; RECORDS],
     orphaned: crate::queue::Queue,
+    /// The places each grant of quota has held (K5), kept as the marks
+    /// change, so that a fork reads them without a walk of the table.
+    held: [u8; proto_init::GRANTS_MAX],
 }
 
 /// What a place keeps of the group and the session its PID names.
@@ -372,6 +375,7 @@ impl<P> Records<P> {
             generations: [0; RECORDS],
             free,
             free_len: RECORDS,
+            held: [0; proto_init::GRANTS_MAX],
             listed: [true; RECORDS],
             numbers: [Numbers {
                 members: 0,
@@ -419,9 +423,15 @@ impl<P> Records<P> {
         self.records.get_mut(index)?.as_mut()
     }
 
-    /// The records that hold a place of grant `grant` and still run: a
-    /// zombie has given its quota back.
+    /// The places of grant `grant` held by records that still run: a
+    /// zombie has given its quota back. O(1).
     pub fn places_held(&self, grant: u8) -> u32 {
+        u32::from(self.held.get(usize::from(grant)).copied().unwrap_or(0))
+    }
+
+    /// The same by a walk of the table, for the tests of the counter.
+    #[cfg(test)]
+    fn places_held_by_walk(&self, grant: u8) -> u32 {
         self.records
             .iter()
             .flatten()
@@ -430,6 +440,32 @@ impl<P> Records<P> {
                     && !matches!(r.state, State::Zombie(_))
             })
             .count() as u32
+    }
+
+    fn give_up_place(&mut self, mark: Option<Mark>) {
+        if let Some(m) = mark.filter(|m| m.holds)
+            && let Some(count) = self.held.get_mut(usize::from(m.grant))
+        {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// The mark of the record in `index` becomes `mark` (a load committed,
+    /// or a child of fork came); the places held follow.
+    pub fn set_mark(&mut self, index: usize, mark: Option<Mark>) {
+        let Some(record) = self.records.get_mut(index).and_then(Option::as_mut) else {
+            return;
+        };
+        let old = core::mem::replace(&mut record.mark, mark);
+        let alive = !matches!(record.state, State::Zombie(_));
+        if alive {
+            self.give_up_place(old);
+            if let Some(m) = mark.filter(|m| m.holds)
+                && let Some(count) = self.held.get_mut(usize::from(m.grant))
+            {
+                *count = count.saturating_add(1);
+            }
+        }
     }
 
     /// The unavailable places: records, live group/session numbers and
@@ -921,6 +957,11 @@ impl<P> Records<P> {
         }
         let record = self.records[index].as_mut().expect("an ended record");
         record.children = 0;
+        let (mark, was_zombie) = (record.mark, matches!(record.state, State::Zombie(_)));
+        if !was_zombie {
+            self.give_up_place(mark);
+        }
+        let record = self.records[index].as_mut().expect("an ended record");
         // A zombie is no process any more: its link to its parent's group
         // goes with its end (it stays a member of its own group).
         let (pgid, linked) = (record.pgid, core::mem::take(&mut record.linked));
@@ -1231,13 +1272,16 @@ mod tests {
     }
 
     #[test]
-    fn the_places_of_a_grant_are_those_of_the_live_records_that_hold_one() {
+    fn the_counter_of_places_follows_the_marks_and_equals_the_walk() {
         let mut t = Records::<u32>::new();
         let make = |t: &mut Records<u32>| {
             let label = t.next_label().unwrap();
             t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession)
         };
         let (a, b, c) = (make(&mut t), make(&mut t), make(&mut t));
+        for r in [a, b, c] {
+            t.get_mut(r).unwrap().state = State::Alive;
+        }
         let hold = |grant, holds| {
             Some(Mark {
                 grant,
@@ -1245,20 +1289,29 @@ mod tests {
                 holds,
             })
         };
+        let same = |t: &Records<u32>| {
+            for g in 0..4 {
+                assert_eq!(t.places_held(g), t.places_held_by_walk(g), "grant {g}");
+            }
+        };
+        same(&t);
         assert_eq!((t.places_held(0), t.places_held(1)), (0, 0));
-        t.get_mut(a).unwrap().mark = hold(0, true);
-        t.get_mut(b).unwrap().mark = hold(0, true);
-        t.get_mut(c).unwrap().mark = hold(1, true);
+        t.set_mark(a, hold(0, true));
+        t.set_mark(b, hold(0, true));
+        t.set_mark(c, hold(1, true));
         assert_eq!((t.places_held(0), t.places_held(1)), (2, 1));
+        same(&t);
         // A marked record that holds no place counts for none.
-        t.get_mut(c).unwrap().mark = hold(1, false);
+        t.set_mark(c, hold(1, false));
         assert_eq!(t.places_held(1), 0);
-        // An exec takes the mark off (the image has the quota of the record).
-        t.get_mut(a).unwrap().mark = None;
+        // A new mark of a holder (an exec) takes its place off.
+        t.set_mark(a, None);
         assert_eq!(t.places_held(0), 1);
-        // A zombie has given its quota back.
-        t.get_mut(b).unwrap().state = State::Zombie(End::exited(0));
+        same(&t);
+        // The end of a holder gives its place back, once.
+        let (_, _) = t.exited(b, End::exited(0));
         assert_eq!(t.places_held(0), 0);
+        same(&t);
     }
 
     #[test]
