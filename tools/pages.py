@@ -107,6 +107,15 @@ def previous(series: str, tree: Path, fetch) -> str:
     return ""
 
 
+def fetch_quietly(url: str):
+    """`fetch_text` for the gate: a pages site that cannot be reached is no
+    published series, and the next weekly run looks again."""
+    try:
+        return fetch_text(url)
+    except (OSError, ValueError):
+        return None
+
+
 def new_files(directory: Path) -> list[Path]:
     """The package files of `directory` that were built for this release and
     the source archives of them: all `.stpkg` files except those that
@@ -316,7 +325,7 @@ def main() -> None:
             p.add_argument("--index-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.step == "gate":
-        go, reason = gate(args.event, args.prerelease, args.tag, args.assets.split(), fetch_text)
+        go, reason = gate(args.event, args.prerelease, args.tag, args.assets.split(), fetch_quietly)
         print(f"pages: {reason}", file=sys.stderr)
         print(f"go={'true' if go else 'false'}")
     elif args.step == "previous":

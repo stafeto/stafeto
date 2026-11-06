@@ -184,3 +184,81 @@ fn the_token_check_is_started_by_hand_alone() {
     assert!(has_environment(&jobs(&text)["token"]));
     assert!(text.contains("gh release delete"));
 }
+
+/// The steps of a job: the text of each, from its `- ` line on.
+fn steps(job: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in job.lines() {
+        if line.starts_with("      - ") {
+            found.push(String::new());
+        }
+        if let Some(step) = found.last_mut() {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    found
+}
+
+#[test]
+fn nothing_publishes_or_signs_again_before_the_owner_has_made_the_environment_and_a_series() {
+    let text = workflow("publish-packages.yml");
+    let all = jobs(&text);
+    assert_eq!(
+        all.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["gate", "publish"]
+    );
+    // The gate looks at public facts only.
+    let gate = &all["gate"];
+    assert!(
+        !has_environment(gate)
+            && secrets_named(gate).is_empty()
+            && !code(gate).contains("secrets.")
+    );
+    assert!(gate.contains("tools/pages.py gate"));
+    // The job with the secrets runs only when the gate says so, and each of its
+    // steps but the checkout and the check of the secrets waits for them.
+    let publish = &all["publish"];
+    assert!(has_environment(publish));
+    assert!(publish.contains("needs: gate"));
+    assert!(publish.contains("if: needs.gate.outputs.go == 'true'"));
+    assert!(
+        publish.contains("group: packages-pages") && publish.contains("cancel-in-progress: false")
+    );
+    let mut waits = 0;
+    for step in steps(publish) {
+        let guarded = step.contains("steps.secrets.outputs.ok == 'true'");
+        let free = step.contains("uses: actions/checkout@") || step.contains("id: secrets");
+        assert!(
+            guarded || free,
+            "a step runs before the secrets are known:\n{step}"
+        );
+        waits += usize::from(guarded);
+    }
+    assert!(waits >= 6);
+    // An empty secret is a warning and a clean end.
+    let check = steps(publish)
+        .into_iter()
+        .find(|s| s.contains("id: secrets"))
+        .unwrap();
+    assert!(
+        check.contains("::warning::") && check.contains("ok=false") && !check.contains("exit 1")
+    );
+}
+
+#[test]
+fn the_publication_runs_for_a_release_without_a_suffix_and_the_week_for_the_pages() {
+    let text = code(&workflow("publish-packages.yml"));
+    assert!(text.contains("types: [published]"));
+    assert!(text.contains("cron: \"17 3 * * 1\""));
+    assert!(text.contains("- keys/revoked") && text.contains("- keys/revoked.sig"));
+    // The storage release is published only after its attachments are checked against the signed index.
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    assert!(at("pages.py verify-storage") < at("draft=false"));
+    assert!(at("draft=false") < at("pages.py check-addresses"));
+    assert!(at("pages.py check-addresses") < at("pages.py publish"));
+    assert!(at("pages.py publish") < at("repo --check --official --remote"));
+    // The key leaves the machine whatever happens.
+    assert!(text.contains("if: always() && steps.secrets.outputs.ok == 'true'"));
+    assert!(text.contains("--min-certificate-days 35"));
+}
