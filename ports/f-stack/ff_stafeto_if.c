@@ -764,6 +764,14 @@ ff_stafeto_device_stats(struct ff_stafeto_device_stats *out)
 {
     *out = stats;
     out->free_now = dev_on ? vnet_buf_free() : 0;
+    if (dev_on) {
+        uint64_t b[3] = { 0, 0, 0 };
+
+        vnet_bells(b);
+        out->bell_rx_passes = b[0];
+        out->bell_rx = b[1];
+        out->bell_tx = b[2];
+    }
 }
 
 /* The counters of the layer, for the probes. */

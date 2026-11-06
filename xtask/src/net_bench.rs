@@ -1730,7 +1730,18 @@ fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String
             } else {
                 FAST_CONF
             };
-            run.send(&format!("nginx-fast -c {conf} & M=$!"))?;
+            if std::env::var_os("NET_BENCH_FAST_STATS").is_some() {
+                // The stack says its counters on the console (the doorbells
+                // among them): the copy of the configuration passes the
+                // variable on to the worker.
+                run.send(&format!(
+                    "(echo 'env STAFETO_FAST_STATS;'; cat {conf}) > /tmp/fast-stats.conf"
+                ))?;
+                run.expect("# ", DIALOG_STEP)?;
+                run.send("STAFETO_FAST_STATS=1 nginx-fast -c /tmp/fast-stats.conf & M=$!")?;
+            } else {
+                run.send(&format!("nginx-fast -c {conf} & M=$!"))?;
+            }
             run.expect_line(
                 "the stack",
                 |l| l.contains("fast: the stack is up on "),

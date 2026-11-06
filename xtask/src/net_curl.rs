@@ -312,6 +312,35 @@ fn answered_frames(udp_port: u16, closed_port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// The datagrams of the flood: more than the 256 buffers of the ring of
+/// receiving, sent with no pause.
+const FLOOD_UDP: usize = 1500;
+
+/// A flood of `FLOOD_UDP` datagrams of 1 472 bytes to a UDP port no socket has
+/// reaches the guest in a run longer than its ring of receiving (the device
+/// that looks at the ring after a doorbell only must not starve for want of
+/// one). Then a connection to the port with no listener is answered within
+/// two seconds, which a ring that waits for a doorbell for ever would not.
+fn flood(udp_port: u16, closed_port: u16) -> Result<(), String> {
+    let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("udp socket: {e}"))?;
+    let datagram = [0x55u8; 1472];
+    let started = Instant::now();
+    for _ in 0..FLOOD_UDP {
+        socket
+            .send_to(&datagram, local(udp_port))
+            .map_err(|e| format!("udp send: {e}"))?;
+    }
+    let sent = started.elapsed();
+    let answered = closed_connection(closed_port, Duration::from_secs(2))
+        .map_err(|e| format!("after the flood: {e}"))?;
+    println!(
+        "net-curl: flood of {FLOOD_UDP} datagrams sent in {} ms, the next connection answered in {} ms",
+        sent.as_millis(),
+        answered.as_millis()
+    );
+    Ok(())
+}
+
 /// UDP with the guest: the echo through the forwarded port, and a datagram
 /// the guest sends to the host (10.0.2.2 is the host for slirp).
 fn udp(run: &mut qemu::Run, address: &str, forward: u16) -> Result<(), String> {
@@ -498,6 +527,7 @@ pub fn probe(machine: &'static qemu::Machine, steps: bool) -> Result<(), String>
             Err(why) => return Err(why),
         }
         answered_frames(udp_port, closed_port)?;
+        flood(udp_port, closed_port)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("httpd -f -p 80 -h /www & H=$!")?;
         run.expect("# ", DIALOG_STEP)?;

@@ -331,13 +331,13 @@ impl Second {
             .map(|at| (at.total_micros().max(0) as u64).saturating_mul(1000));
         if self.device.rx.ring.dirty {
             self.device.rx.ring.rung();
-            if self.device.rx.ring.queue.should_notify() {
+            if virtio_net::rings::wants_ring(&self.device.rx.ring.queue) {
                 ring(&mut self.transport, RECEIVEQ);
             }
         }
         if self.device.tx.ring.dirty {
             self.device.tx.ring.rung();
-            if self.device.tx.ring.queue.should_notify() {
+            if virtio_net::rings::wants_ring(&self.device.tx.ring.queue) {
                 ring(&mut self.transport, TRANSMITQ);
             }
         }

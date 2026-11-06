@@ -64,17 +64,29 @@ pub unsafe fn buffer_at<'a>(base: usize, n: u16) -> &'a mut [u8] {
 }
 
 /// The buffers of the ring of receiving as far as its doorbell goes. A device
-/// reads the ring of available buffers when a frame comes, so the driver may
-/// leave the doorbell until the device has few of the buffers its last
-/// doorbell showed it (`RX_LOW`): a doorbell is an exit from the guest, far
-/// dearer than a frame. A device that looks at the ring only after a doorbell
-/// finds buffers as long as `left` is above 0.
+/// reads the ring of available buffers when a frame comes (VZ), so the
+/// driver may leave the doorbell until the device has few of the buffers its
+/// last doorbell showed it (`RX_LOW`): a doorbell is an exit from the guest,
+/// far dearer than a frame.
+///
+/// `left` counts the buffers the last doorbell showed and the driver has not
+/// taken back. That is more than the device holds: it also counts the buffers
+/// the device filled and the driver has yet to take (the crate gives no
+/// access to the used index). A device that looks at the ring only after a
+/// doorbell (QEMU, once it found the ring empty) says so with the flag of
+/// Virtio 1.2, 2.7.10.1 (`flags` 0 means the driver MUST notify). Two rules
+/// bound the time such a device waits: the doorbell rings when the device
+/// has used the flag once (`wanted` false was seen) and now asks for a
+/// notification, and in any case after `RX_LOW` buffers went back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stock {
     /// In the queue: given, and neither used by the device nor taken back.
     queued: u32,
     /// Added since the last doorbell.
     pending: u32,
+    /// The device has asked for no notification at least once: it uses the
+    /// flag, and the flag 0 is its call for a doorbell.
+    flagged: bool,
 }
 
 /// The least buffers the device is left with when the doorbell rings.
@@ -85,6 +97,7 @@ impl Stock {
         Stock {
             queued: 0,
             pending: 0,
+            flagged: false,
         }
     }
 
@@ -96,6 +109,7 @@ impl Stock {
 
     /// The driver took a used buffer back.
     pub fn used(&mut self) {
+        debug_assert!(self.queued > 0, "a buffer taken back that was never given");
         self.queued = self.queued.saturating_sub(1);
     }
 
@@ -104,14 +118,48 @@ impl Stock {
         self.pending = 0;
     }
 
-    /// The buffers the last doorbell showed the device and it has left.
+    /// Buffers added since the last doorbell.
+    pub const fn pending(&self) -> u32 {
+        self.pending
+    }
+
+    /// The buffers the last doorbell showed the device and the driver has
+    /// not taken back. Below 0 when the device used buffers added after the
+    /// doorbell: 0 then.
     pub const fn left(&self) -> u32 {
         self.queued.saturating_sub(self.pending)
     }
 
-    /// Whether the doorbell is due: buffers went in and the device runs low.
-    pub const fn due(&self) -> bool {
-        self.pending > 0 && self.left() <= RX_LOW
+    /// Whether the doorbell is due: buffers went in, and the device runs
+    /// low, or `RX_LOW` of them went in since the last doorbell, or the
+    /// device that uses the flag asks for it. `wanted` is the flag as the
+    /// queue reads it (`should_notify`).
+    pub fn due(&mut self, wanted: bool) -> bool {
+        if !wanted {
+            self.flagged = true;
+        }
+        self.pending > 0
+            && (self.left() <= RX_LOW || self.pending >= RX_LOW || (self.flagged && wanted))
+    }
+}
+
+/// Whether the device wants a doorbell for the buffers added to `queue`:
+/// reads its flag after a full barrier (Virtio 1.2, 2.7.13.4.1: a driver
+/// MUST do a barrier before reading the flag or `avail_event`; the crate's
+/// store of the index is a release and its read of the flag an acquire,
+/// which AArch64 with `rcpc` may reorder).
+pub fn wants_ring<H: Hal>(queue: &Queue<H>) -> bool {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    queue.should_notify()
+}
+
+/// Interrupts of `queue` on or off. Switching them on is followed by a full
+/// barrier, so that the next look at the used index is not served before the
+/// flag reaches the device (Virtio 1.2, 2.7.14).
+pub fn notify_on<H: Hal>(queue: &mut Queue<H>, on: bool) {
+    queue.set_dev_notify(on);
+    if on {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -207,6 +255,8 @@ pub struct TxRing<H: Hal> {
     pub dirty: bool,
     /// How many.
     pub pending: u32,
+    /// Steps that ended since the first of them went in (`Pace`).
+    pub waited: u32,
 }
 
 /// What became of a frame given to the ring of sending.
@@ -231,6 +281,7 @@ impl<H: Hal> TxRing<H> {
             base,
             dirty: false,
             pending: 0,
+            waited: 0,
         }
     }
 
@@ -243,6 +294,7 @@ impl<H: Hal> TxRing<H> {
     pub fn rung(&mut self) {
         self.dirty = false;
         self.pending = 0;
+        self.waited = 0;
     }
 
     /// Puts the frame of `len` bytes in buffer `n` (the pool's, after its
@@ -301,28 +353,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_doorbell_of_receiving_waits_until_the_device_runs_low() {
+    fn a_device_that_starved_and_waits_for_the_doorbell_gets_it() {
         let mut stock = Stock::new();
-        assert!(!stock.due(), "nothing went in");
         for _ in 0..QUEUE_SIZE {
             stock.added();
         }
-        assert!(stock.due(), "the device was shown nothing: the first ring");
+        assert!(stock.due(true));
         stock.rung();
-        assert_eq!(stock.left(), QUEUE_SIZE as u32);
-        assert!(!stock.due());
-        // The device uses a buffer, the driver takes it back and gives it
-        // again: the device is left with one buffer less of those it saw.
-        for _ in 0..(QUEUE_SIZE as u32 - RX_LOW - 1) {
+        // The device used 250 buffers and the driver took back 2: `left`
+        // shows 254 of 256, the device holds 6 (QEMU asked for the doorbell:
+        // the flag is 0).
+        for _ in 0..2 {
             stock.used();
             stock.added();
         }
-        assert_eq!(stock.left(), RX_LOW + 1);
-        assert!(!stock.due());
+        assert_eq!(stock.left(), QUEUE_SIZE as u32 - 2);
+        // A device that never used the flag is not rung for it.
+        assert!(
+            !stock.due(true),
+            "VZ never sets the flag: the old threshold"
+        );
+        // The device that sets the flag once (it has buffers) and clears it
+        // (it ran dry) gets its doorbell with 2 buffers pending.
+        assert!(!stock.due(false), "has buffers: no doorbell");
+        assert!(stock.due(true), "the flag is 0 after it was 1: ring");
+    }
+
+    #[test]
+    fn the_doorbell_is_due_after_rx_low_buffers_went_back() {
+        let mut stock = Stock::new();
+        for _ in 0..QUEUE_SIZE {
+            stock.added();
+        }
+        stock.rung();
+        for _ in 0..RX_LOW - 1 {
+            stock.used();
+            stock.added();
+        }
+        assert!(!stock.due(true));
         stock.used();
         stock.added();
-        assert!(stock.due());
-        stock.rung();
-        assert_eq!(stock.left(), QUEUE_SIZE as u32);
+        assert!(stock.due(true));
+    }
+
+    #[test]
+    #[should_panic(expected = "never given")]
+    fn a_buffer_taken_back_that_was_never_given_is_a_count_error() {
+        Stock::new().used();
     }
 }

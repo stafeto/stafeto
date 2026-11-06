@@ -943,16 +943,21 @@ impl Driver<'_> {
         let more = self.device.rx.ring.queue.can_pop()
             || self.device.looped.waiting() > 0
             || self.device.has_deferred();
-        let mut continued = more && self.tell(RX);
+        let continued = more && self.tell(RX);
         // While steps follow, the device is asked for no interrupt (the
         // line is closed and the steps look at the queue anyway). The run
-        // ends with the interrupts asked for again and one more look at the
-        // queue, so that a frame that came between is not left to wait.
-        self.device.rx.ring.queue.set_dev_notify(!continued);
-        if !continued && self.device.rx.ring.queue.can_pop() {
-            continued = self.tell(RX);
-            self.device.rx.ring.queue.set_dev_notify(!continued);
-        }
+        // ends with the interrupts asked for again, a full barrier and one
+        // more look at the queue, so that a frame that came between is not
+        // left to wait (`ring::settle_interrupts`).
+        let continued = {
+            let this = core::cell::RefCell::new(&mut *self);
+            netd::ring::settle_interrupts(
+                continued,
+                || this.borrow_mut().tell(RX),
+                |on| virtio_net::rings::notify_on(&mut this.borrow_mut().device.rx.ring.queue, on),
+                || this.borrow().device.rx.ring.queue.can_pop(),
+            )
+        };
         if !continued && core::mem::take(&mut self.line_closed) {
             let began = profile::now();
             virtio_mmio::reopen(&self.irq);
@@ -1262,9 +1267,10 @@ impl Driver<'_> {
     /// may ask not to be rung (`should_notify`).
     fn doorbells(&mut self, more: bool) {
         let rx = &mut self.device.rx.ring;
-        if rx.stock.due() {
+        let wanted = virtio_net::rings::wants_ring(&rx.queue);
+        if rx.stock.due(wanted) {
             rx.rung();
-            if rx.queue.should_notify() {
+            if wanted {
                 let began = profile::now();
                 ring(&mut self.transport, RECEIVEQ);
                 profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
@@ -1274,9 +1280,12 @@ impl Driver<'_> {
             }
         }
         let tx = &mut self.device.tx.ring;
-        if netd::ring::tx_bell_due(tx.pending, more) {
+        if tx.pending > 0 {
+            tx.waited += 1;
+        }
+        if netd::ring::tx_bell_due(tx.pending, tx.waited, more) {
             tx.rung();
-            if tx.queue.should_notify() {
+            if virtio_net::rings::wants_ring(&tx.queue) {
                 let began = profile::now();
                 ring(&mut self.transport, TRANSMITQ);
                 profile::timed(Counter::RingN, Counter::RingTicks, Counter::RingMax, began);
