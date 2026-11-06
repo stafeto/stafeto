@@ -1217,6 +1217,27 @@ mod tests {
     }
 
     #[test]
+    fn the_places_of_a_grant_are_those_of_the_live_records_that_hold_one() {
+        let mut t = Records::<u32>::new();
+        let mut make = |t: &mut Records<u32>| {
+            let label = t.next_label().unwrap();
+            t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession)
+        };
+        let (a, b, c) = (make(&mut t), make(&mut t), make(&mut t));
+        assert_eq!(t.granted(), 0);
+        t.get_mut(a).unwrap().granted = true;
+        t.get_mut(b).unwrap().granted = true;
+        assert_eq!(t.granted(), 2);
+        // An exec takes the flag off (the image has the quota of the record).
+        t.get_mut(a).unwrap().granted = false;
+        assert_eq!(t.granted(), 1);
+        // A zombie has given its quota back.
+        t.get_mut(b).unwrap().state = State::Zombie(End::exited(0));
+        assert_eq!(t.granted(), 0);
+        let _ = c;
+    }
+
+    #[test]
     fn exhausted_credentials_leave_the_real_record_unchanged() {
         let mut t = Records::<u32>::new();
         let label = t.next_label().unwrap();

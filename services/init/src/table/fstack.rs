@@ -133,23 +133,31 @@ pub const FAST_NGINX_VZ_TABLE: &[Record] = &[
     super::net::NET_VZ2_TABLE[9],
 ];
 
-/// The grant of the images of scale (`proto_init::Grant`): the worker of
-/// `nginx-fast`, the child of fork of its master, gets the quota of the
-/// grant and the master keeps the quota of a command. On QEMU of the check
-/// (`-m 1024`) 128 MiB, on Apple VZ (2 GiB) 768 MiB, which hold 100 000
-/// connections: about 3.5 KiB each and 102 MiB of the worker's own.
+/// The grant of the images of scale (`proto_init::Grant`): the children of
+/// fork of the master of `nginx-fast`, the file the loader opens from
+/// `/bin/nginx-fast`, get the quota of the grant and the master keeps the
+/// quota of a command. On QEMU of the check (`-m 1024`) 128 MiB, on Apple
+/// VZ (2 GiB) 768 MiB, which hold 100 000 connections: about 3.5 KiB each
+/// and 102 MiB of the worker's own. There are two places: the worker, and
+/// the new worker of a reload while the old one ends. The master of these
+/// images forks workers alone (`daemon off`, no cache manager), so the two
+/// places go to workers.
 pub const SCALE_GRANT_PAGES: u32 = 32_768;
 pub const SCALE_GRANT_PAGES_VZ: u32 = 196_608;
+pub const SCALE_GRANT_PLACES: u32 = 2;
 const SCALE_GRANT: [u8; proto_init::GRANT_LEN] =
-    proto_init::Grant::bytes(SCALE_GRANT_PAGES, 1, "nginx-fast");
+    proto_init::Grant::bytes(SCALE_GRANT_PAGES, SCALE_GRANT_PLACES, "/bin/nginx-fast");
 const SCALE_GRANT_VZ: [u8; proto_init::GRANT_LEN] =
-    proto_init::Grant::bytes(SCALE_GRANT_PAGES_VZ, 1, "nginx-fast");
+    proto_init::Grant::bytes(SCALE_GRANT_PAGES_VZ, SCALE_GRANT_PLACES, "/bin/nginx-fast");
 
 /// The process service of an image of scale: the pool of the image of
-/// nginx on the stack and the place of the grant.
+/// nginx on the stack and the places of the grant. The pages of the grant
+/// are in the pool but not set apart: another child may take them first,
+/// and a fork of the worker then ends with NO_MEMORY (the image of scale
+/// starts nothing else that big).
 const fn scale_process_service(base: Record, pages: u32, args: &'static [u8]) -> Record {
     Record {
-        quota: base.quota + pages as u64 * PAGE,
+        quota: base.quota + SCALE_GRANT_PLACES as u64 * pages as u64 * PAGE,
         args,
         ..base
     }

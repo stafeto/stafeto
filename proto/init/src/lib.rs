@@ -760,59 +760,82 @@ impl<'a> ServiceArgs<'a> {
 }
 
 /// The bytes of a quota grant in the own arguments of the process service.
-pub const GRANT_LEN: usize = 24;
-/// The longest name of a grant (a record's name has 15 bytes at most).
-pub const GRANT_NAME_LEN: usize = 16;
+pub const GRANT_LEN: usize = 56;
+/// The longest path of a grant, with its zero.
+pub const GRANT_PATH_LEN: usize = 44;
+/// The first four bytes of a grant (`GRNT`).
+pub const GRANT_MAGIC: u32 = 0x544E_5247;
 
-/// A quota the process service gives the child of fork of one program
-/// (spec 2, 3.12.2): `pages` pages for each of `places` children at a
-/// time, when the parent's process runs the program `name` with the
-/// effective user ID 0. Own arguments of the process service: bytes 0..4
-/// the pages, 4..8 the places, 8..24 the name, zeros after it. A record
-/// with no grant has own arguments of another length.
+/// A quota the process service gives the children of fork of one program
+/// file (spec 2, 3.12.2): `pages` pages for each of `places` children at a
+/// time, when the parent runs the file the loader opened from `path` and
+/// has the effective user ID 0. The own arguments of the process service:
+/// bytes 0..4 `GRANT_MAGIC`, 4..8 the pages, 8..12 the places, 12..56 the
+/// path of a file of a read-only layer, zeros after it. Other own arguments
+/// carry no grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub pages: u32,
     pub places: u32,
-    pub name: [u8; GRANT_NAME_LEN],
+    pub path: [u8; GRANT_PATH_LEN],
 }
 
 impl Grant {
-    /// The grant of `pages` pages at `places` places for the program
-    /// `name` (15 bytes at most), as constant bytes for a table.
-    pub const fn bytes(pages: u32, places: u32, name: &str) -> [u8; GRANT_LEN] {
-        let name = name.as_bytes();
-        assert!(name.len() < GRANT_NAME_LEN);
+    /// The grant of `pages` pages at `places` places for the file at
+    /// `path` (43 bytes at most), as constant bytes for a table.
+    pub const fn bytes(pages: u32, places: u32, path: &str) -> [u8; GRANT_LEN] {
+        let path = path.as_bytes();
+        assert!(!path.is_empty() && path.len() < GRANT_PATH_LEN);
         let mut out = [0; GRANT_LEN];
-        let (p, q) = (pages.to_le_bytes(), places.to_le_bytes());
-        let mut i = 0;
-        while i < 4 {
-            out[i] = p[i];
-            out[4 + i] = q[i];
-            i += 1;
+        let words = [
+            GRANT_MAGIC.to_le_bytes(),
+            pages.to_le_bytes(),
+            places.to_le_bytes(),
+        ];
+        let mut w = 0;
+        while w < 3 {
+            let mut i = 0;
+            while i < 4 {
+                out[4 * w + i] = words[w][i];
+                i += 1;
+            }
+            w += 1;
         }
         let mut i = 0;
-        while i < name.len() {
-            out[8 + i] = name[i];
+        while i < path.len() {
+            out[12 + i] = path[i];
             i += 1;
         }
         out
     }
 
     /// The grant in the own arguments `own` of the service: None unless
-    /// they are exactly a grant with a name.
+    /// they are exactly a grant.
     pub fn read(own: &[u8]) -> Option<Grant> {
-        if own.len() != GRANT_LEN || own[8] == 0 {
+        if own.len() != GRANT_LEN {
             return None;
         }
         let word = |at: usize| u32::from_le_bytes(own[at..at + 4].try_into().expect("4 bytes"));
-        let mut name = [0; GRANT_NAME_LEN];
-        name.copy_from_slice(&own[8..]);
+        if word(0) != GRANT_MAGIC || own[12] == 0 {
+            return None;
+        }
+        let mut path = [0; GRANT_PATH_LEN];
+        path.copy_from_slice(&own[12..]);
         Some(Grant {
-            pages: word(0),
-            places: word(4),
-            name,
+            pages: word(4),
+            places: word(8),
+            path,
         })
+    }
+
+    /// The path without its zeros.
+    pub fn path_bytes(&self) -> &[u8] {
+        let end = self
+            .path
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.path.len());
+        &self.path[..end]
     }
 }
 
@@ -1206,13 +1229,17 @@ mod tests {
 
     #[test]
     fn a_grant_round_trips_through_the_own_arguments() {
-        const BYTES: [u8; GRANT_LEN] = Grant::bytes(196_608, 1, "nginx-fast");
+        const BYTES: [u8; GRANT_LEN] = Grant::bytes(196_608, 2, "/bin/nginx-fast");
         let grant = Grant::read(&BYTES).unwrap();
-        assert_eq!((grant.pages, grant.places), (196_608, 1));
-        assert_eq!(&grant.name[..11], b"nginx-fast\0");
-        assert_eq!(Grant::read(&BYTES[..23]), None);
+        assert_eq!((grant.pages, grant.places), (196_608, 2));
+        assert_eq!(grant.path_bytes(), b"/bin/nginx-fast");
+        assert_eq!(Grant::read(&BYTES[..55]), None);
         assert_eq!(Grant::read(&[0; GRANT_LEN]), None);
         assert_eq!(Grant::read(b"posix-procs\0"), None);
+        // Own arguments of the length of a grant that carry no label.
+        let mut plain = BYTES;
+        plain[0] ^= 1;
+        assert_eq!(Grant::read(&plain), None);
     }
 
     #[test]

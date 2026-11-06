@@ -586,27 +586,36 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
-/// The pages of the quota of the probe of the big room (`posix-map big`):
-/// 240 MiB, above the 64 MiB from which a process may grow its room. The
-/// launcher, the probe it spawns and the child of fork of the probe each
-/// have it: three of them in the 1 GiB of the guest.
-pub const MAP_BIG_PAGES: u64 = 61_440;
+/// The pages of the grant of the probe of the big room (`posix-map big`):
+/// 256 MiB, above the 64 MiB from which a process may grow its room.
+pub const MAP_BIG_PAGES: u32 = 65_536;
 
-/// The probe of the big room (tests/posix-map, the argument `big`): the
-/// table of POSIX_PROCS_TABLE with a quota of MAP_BIG_PAGES for the probe
-/// and a pool that holds two children of that size at a time (the probe
-/// and its child of fork or of posix_spawn). The guest has 1 GiB.
+/// The places of the grant: the child of fork of the probe and its own
+/// child of fork.
+pub const MAP_BIG_PLACES: u32 = 2;
+
+const MAP_BIG_GRANT: [u8; proto_init::GRANT_LEN] =
+    proto_init::Grant::bytes(MAP_BIG_PAGES, MAP_BIG_PLACES, "/bin/procs-child");
+
+/// The probe of the big room and of the grant of the process service
+/// (tests/posix-map, the argument `big`): the table of POSIX_PROCS_TABLE
+/// with a grant for the children of fork of `/bin/procs-child`, and the
+/// pages of three grants in the pool of the service (two places, and the
+/// pages a third fork would take if the place rule let it). The probe
+/// itself and its children of spawn have the quota of a command. The guest
+/// has 1 GiB.
 pub const POSIX_MAP_BIG_TABLE: &[Record] = &[
     POSIX_PROCS_TABLE[0],
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 2 * MAP_BIG_PAGES * PAGE + 384 * PAGE,
-        ..POSIX_ABI_TABLE[1]
+        quota: POSIX_PROCS_TABLE[1].quota
+            + (MAP_BIG_PLACES as u64 + 1) * MAP_BIG_PAGES as u64 * PAGE,
+        args: &MAP_BIG_GRANT,
+        ..POSIX_PROCS_TABLE[1]
     },
     POSIX_PROCS_TABLE[2],
     POSIX_PROCS_TABLE[3],
     Record {
         args: b"posix-procs\0big\0",
-        quota: MAP_BIG_PAGES * PAGE,
         ..POSIX_PROCS_TABLE[4]
     },
     POSIX_PROCS_TABLE[5],

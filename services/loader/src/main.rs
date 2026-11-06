@@ -1440,6 +1440,7 @@ fn load(
     block: &Block<'_>,
     source: Option<(Handle<Channel>, rt::fs::PreparedOpen)>,
 ) -> Result<(u64, Handle<Channel>, Maps, Option<Dynamic>), u32> {
+    let mut origin = 0;
     let image = if let Some((source, held)) = source {
         let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
             Handle::from_raw(own.files.raw()),
@@ -1454,6 +1455,7 @@ fn load(
             BlockError::NameTooLong => pl::NAME_TOO_LONG,
             _ => pl::NO_ENTRY,
         })?;
+        origin = proto_process::origin_hash(path);
         open(own, path)?
     };
     let info = file_info(own, &image)?;
@@ -1466,7 +1468,7 @@ fn load(
     };
     let mut maps = Maps::default();
     steps::timed(kind::PROGRAM_SEGMENTS, 0, || {
-        map_segments(own, &image, &info, &layout.segments, &mut maps)
+        map_segments(own, &image, &info, &layout.segments, &mut maps, origin)
     })?;
     let dynamic = match library {
         None => None,
@@ -1478,6 +1480,7 @@ fn load(
                     &library.info,
                     &library.layout.segments,
                     &mut maps,
+                    0,
                 )
             })?;
             steps::timed(kind::RECHECK, 0, || {
@@ -1526,6 +1529,7 @@ fn map_segments(
     info: &proto_fs::NodeInfo,
     segments: &[Load; 3],
     maps: &mut Maps,
+    origin: u32,
 ) -> Result<(), u32> {
     for part in Part::ALL {
         let load = &segments[part as usize];
@@ -1535,7 +1539,16 @@ fn map_segments(
                 Part::Rodata => Some(image_key(info, proto_process::IMAGE_RODATA)),
                 Part::Data => None,
             };
-            segment(own, image, info, load, part, maps, key.as_ref())?;
+            let origin = if part == Part::Code { origin } else { 0 };
+            segment(
+                own,
+                image,
+                info,
+                load,
+                part,
+                maps,
+                key.as_ref().map(|k| (k, origin)),
+            )?;
         }
     }
     Ok(())
@@ -1817,14 +1830,14 @@ fn segment(
     load: &Load,
     part: Part,
     maps: &mut Maps,
-    key: Option<&proto_process::ImageKey>,
+    key: Option<(&proto_process::ImageKey, u32)>,
 ) -> Result<(), u32> {
     let pages = load.pages();
     let len = pages.end - pages.start;
-    let Some(key) = key else {
+    let Some((key, origin)) = key else {
         return build(own, image, load, part, maps);
     };
-    match image_get(key)? {
+    match image_get(key, origin)? {
         Table::Found(count, memory) => {
             if u64::from(count) * PAGE != len {
                 return Err(pl::IO);
@@ -1973,9 +1986,9 @@ fn image_request(
 
 /// Get of the table of images. An answer the loader does not know makes an
 /// object of its own, as a table with no place does.
-fn image_get(key: &proto_process::ImageKey) -> Result<Table, u32> {
+fn image_get(key: &proto_process::ImageKey, origin: u32) -> Result<Table, u32> {
     Ok(
-        match image_request(proto_process::IMAGE_GET, key, 0, None)? {
+        match image_request(proto_process::IMAGE_GET, key, origin, None)? {
             (proto_process::IMAGE_FOUND, pages, Some(memory)) => Table::Found(pages, memory),
             (proto_process::IMAGE_RESERVED, _, None) => Table::Reserved,
             _ => Table::Full,

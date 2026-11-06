@@ -310,9 +310,15 @@ struct Processes {
     window_issued: [[u32; MAX_CPUS]; 2],
     /// The ticket init gave each record of its table, 0 for the others.
     tickets: [u64; RECORDS],
-    /// The quota init's table grants the child of fork of one program
-    /// (`loaders::grant_applies`); `pages` 0 for none.
+    /// The quota init's table grants the children of fork of one file
+    /// (`loaders::grant_applies`); `pages` 0 for none. The file is pinned
+    /// by its key: the loader of a record that opened the grant's path
+    /// (`grant_origin`) reports the key of its code, which `grant_pin`
+    /// keeps, `grant_pinned` once it is set.
     grant: proto_init::Grant,
+    grant_origin: u32,
+    grant_pin: proto_process::ImageKey,
+    grant_pinned: bool,
     /// The ExecCommit of each record that waits for init, by the record's
     /// index, the records whose new process waits for the thread that
     /// tells init, and that thread's Replace that waits for one.
@@ -509,6 +515,7 @@ fn main(_: u64) -> u64 {
     }
     let args = proto_init::ServiceArgs::read(start.args()).ok();
     if let Some(grant) = args.and_then(|a| proto_init::Grant::read(a.own)) {
+        owner.grant_origin = proto_process::origin_hash(grant.path_bytes());
         owner.grant = grant;
     }
     let config = Config {
@@ -1533,6 +1540,17 @@ impl Processes {
         ) else {
             return Answer::Status(Status::BadSize);
         };
+        // The loader says which path it opened for the code (a hash in the
+        // `pages` of a Get): the key it reports for that path is the file
+        // the grant belongs to, wherever a copy of it may lie.
+        if operation == proto_process::IMAGE_GET
+            && key.part == proto_process::IMAGE_CODE
+            && self.grant.pages != 0
+            && pages == self.grant_origin
+        {
+            self.grant_pin = key;
+            self.grant_pinned = true;
+        }
         match operation {
             proto_process::IMAGE_GET if r.handles.is_empty() => {
                 let (kind, found) = match self.image_take(child, &key) {
@@ -3298,18 +3316,23 @@ impl Processes {
         // the record less those pages (the record keeps the whole quota for
         // the children and the execs it makes; spec 2, 3.12.2).
         let fork = matches!(birth.page, PageStart::Fork { .. });
-        // The child of fork of the program the table grants a quota to
-        // gets it, while a place of the grant is free.
+        // The child of fork of a process that runs the file the table grants
+        // a quota to gets it, while a place of the grant is free.
         let granted = fork
-            && loaders::grant_applies(&self.grant, &parent.name, parent.credentials.euid, || {
-                self.records.granted()
-            });
+            && loaders::grant_applies(
+                &self.grant,
+                parent.credentials.euid,
+                // A holder of a place runs the file it forked from, until it
+                // execs (which takes the place off).
+                parent.granted || (self.grant_pinned && self.images.uses(&self.grant_pin, index)),
+                || self.records.granted(),
+            );
         let process_quota = if granted {
             u64::from(self.grant.pages) * 4096
         } else if fork {
             // A record no Create or exec set the quota of its process for
-            // has the whole; a child of a grant has the quota of its
-            // record (the grant is not passed on).
+            // has the whole; a process that holds a place of the grant has
+            // the quota of its record for a child that finds no place.
             let own = if parent.granted || parent.process_quota == 0 {
                 parent.quota
             } else {
@@ -3876,6 +3899,8 @@ impl Processes {
         record.image = image;
         record.image_pages = image_pages;
         record.process_quota = record.quota;
+        // The new image has the quota of the record: no place of a grant.
+        record.granted = false;
         record.committed_loader_ticket = committed_ticket;
         record.execed = true;
         if record.next_name[0] != 0 {
