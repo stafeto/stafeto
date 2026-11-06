@@ -38,8 +38,13 @@ pub struct Options {
     pub from: Option<PathBuf>,
     /// The release of the storage new files are stored in (`v0.3.0-aarch64`).
     pub storage: Option<String>,
+    /// The serial is that of the index published at this address, plus one.
+    pub serial_after: Option<String>,
     /// `--serial` was given.
     pub serial_given: bool,
+    /// `--check` reads the repository at this address, every file over the
+    /// network, and takes no directory.
+    pub remote: Option<String>,
     /// Packages whose recipe is changed on purpose (the carrying probe of `pkg-identity`).
     pub perturb: Vec<String>,
 }
@@ -60,6 +65,8 @@ impl Default for Options {
             from: None,
             storage: None,
             serial_given: false,
+            serial_after: None,
+            remote: None,
             perturb: Vec::new(),
         }
     }
@@ -83,6 +90,8 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
             "--previous" => o.previous = Some(value),
             "--from" => o.from = Some(value.into()),
             "--storage" => o.storage = Some(value),
+            "--remote" => o.remote = Some(value),
+            "--serial-after" => o.serial_after = Some(value),
             "--serial" => {
                 o.serial_given = true;
                 o.serial = value
@@ -482,6 +491,12 @@ pub fn sizes(built: &[Built]) -> (u64, u64) {
 /// the list, and for each entry its file, size, SHA-256, `meta`, signature,
 /// policy and source. `roots` are the roots that vouch for the release key.
 pub fn check(dir: &Path, roots: &[Key]) -> Result<usize, String> {
+    check_with(dir, roots, true)
+}
+
+/// `check`; with `sources` false a relative `source` need not be a file of
+/// `dir` (a check over the network does not fetch the source archives).
+pub fn check_with(dir: &Path, roots: &[Key], sources: bool) -> Result<usize, String> {
     let fail = |what: &str, e: String| format!("{}: {what}: {e}", dir.display());
     let read = |name: &str| std::fs::read(dir.join(name)).map_err(|e| fail(name, e.to_string()));
     let trust = Trust { roots, direct: &[] };
@@ -551,6 +566,7 @@ pub fn check(dir: &Path, roots: &[Key]) -> Result<usize, String> {
         file.check_policy(e.name)
             .map_err(|e2| fail(e.file, e2.to_string()))?;
         if let Some(source) = e.source
+            && sources
             && !source.starts_with("https://")
             && !dir.join(source).is_file()
         {
@@ -561,8 +577,34 @@ pub fn check(dir: &Path, roots: &[Key]) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Fetches the index, its signature, the list of revocations and every package
+/// file of the repository at `base` into `dir` and checks them as `check` does.
+/// A file that the index names and the server lacks is an error.
+fn check_remote(base: &str, dir: &Path, roots: &[Key]) -> Result<usize, String> {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let get = |address: String, name: &str| -> Result<(), String> {
+        let bytes =
+            crate::carry::fetch(&address)?.ok_or_else(|| format!("{address}: not found"))?;
+        std::fs::write(dir.join(name), bytes).map_err(|e| format!("{name}: {e}"))
+    };
+    for name in ["INDEX", "INDEX.sig", "revoked", "revoked.sig"] {
+        get(crate::carry::address_of(base, name), name)?;
+    }
+    let text = std::fs::read_to_string(dir.join("INDEX")).map_err(|e| format!("INDEX: {e}"))?;
+    let index = Index::parse(&text).map_err(|e| format!("INDEX: {e}"))?;
+    for e in index.entries() {
+        let local = e.file.rsplit('/').next().unwrap_or(e.file);
+        get(crate::carry::address_of(base, e.file), local)?;
+    }
+    check_with(dir, roots, false)
+}
+
 /// `cargo xtask repo [--serial N] [--expires-days D] [--no-sources] [--key K.key --cert K.cert] [--check [--official]]`.
 pub fn command(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("resign") {
+        return crate::resign::command(&args[1..]);
+    }
     run(&parse_options(args)?).map(drop)
 }
 
@@ -576,6 +618,16 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
             "--from writes next to the files it reads: no --check, --previous or --dir".into(),
         );
     }
+    let mut o = o.clone();
+    if let Some(base) = &o.serial_after {
+        if o.serial_given || o.from.is_none() {
+            return Err("--serial-after goes with --from and without --serial".into());
+        }
+        o.serial =
+            crate::resign::serial_after(base, &crate::carry::fetch, &keys::official_roots()?)?;
+        o.serial_given = true;
+    }
+    let o = &o;
     if o.from.is_some() && !o.serial_given {
         return Err("--from wants --serial: an index with a number a device has seen is refused as a rollback".into());
     }
@@ -602,6 +654,15 @@ pub fn run(o: &Options) -> Result<PathBuf, String> {
         }
         None => vec![keys::dev_keys(&tree)?.root],
     };
+    if let Some(base) = &o.remote {
+        if !o.check || o.dir.is_some() {
+            return Err("--remote goes with --check and without --dir".into());
+        }
+        let dir = crate::target_dir().join("repo-remote");
+        let n = check_remote(base, &dir, &roots)?;
+        println!("repo --check: {n} packages at {base} are whole and signed");
+        return Ok(dir);
+    }
     if o.check {
         let dir = o.dir.clone().unwrap_or_else(directory);
         let n = check(&dir, &roots)?;
@@ -992,5 +1053,18 @@ mod tests {
         std::fs::remove_file(dir.join(CARRIED)).unwrap();
         assert!(read_carried(&dir).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_check_over_the_network_names_the_file_the_server_lacks() {
+        let base = std::env::temp_dir().join(format!("stafeto-remote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let work = base.join("work");
+        let e = check_remote(base.to_str().unwrap(), &work, &[]).unwrap_err();
+        assert!(e.contains("INDEX") && e.contains("not found"), "{e}");
+        let o = parse_options(&["--check".into(), "--remote".into(), "x".into()]).unwrap();
+        assert_eq!(o.remote.as_deref(), Some("x"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

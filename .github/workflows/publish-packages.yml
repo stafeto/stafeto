@@ -1,0 +1,200 @@
+name: publish-packages
+
+# Publishes the packages of a release and signs the indexes of the published
+# series again every week (docs/release.md). The event `release: published`
+# comes from the owner publishing a release without a suffix; `schedule` is
+# the weekly signature; a push to `main` that changes the list of revocations
+# writes the new list to every series.
+#
+# Until the owner has made the environment `packages` and its secrets and has
+# published a series, every run ends green without doing anything: the job
+# `gate` (no environment, no secret) decides from public facts. Once it says go,
+# an empty secret fails the run loudly: a silent skip would let a published
+# index run out without a letter to the owner.
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "17 3 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - keys/revoked
+      - keys/revoked.sig
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Is there anything to do
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          TAG: ${{ github.event.release.tag_name }}
+          ASSETS: ${{ join(github.event.release.assets.*.name, ' ') }}
+        run: python3 tools/pages.py gate --event "$EVENT" --prerelease "$PRERELEASE" --tag "$TAG" --assets "$ASSETS" --tree . >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: packages
+    concurrency:
+      group: packages-pages
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: The secrets of the environment
+        id: secrets
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ] || [ -z "$PACKAGES_TOKEN" ]; then
+            echo "::error::RELEASE_SIGNING_KEY or PACKAGES_TOKEN of the environment packages is empty or missing"
+            exit 1
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: The pinned toolchain and xtask, before the key is written
+        if: steps.secrets.outputs.ok == 'true'
+        run: |
+          rustup toolchain install
+          cargo build --locked -p xtask
+
+      - name: The release key
+        if: steps.secrets.outputs.ok == 'true'
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          name=$(basename "$(ls keys/*.cert | sort | tail -1)" .cert)
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/keys/$name.key"
+          echo "KEY=$RUNNER_TEMP/keys/$name.key" >> "$GITHUB_ENV"
+          echo "CERT=keys/$name.cert" >> "$GITHUB_ENV"
+
+      # A release: the signed copy of the index is checked, the storage
+      # release is checked against it and published, the addresses are tried,
+      # and the index is signed again into the pages.
+      - name: The signed copy of the index
+        if: steps.secrets.outputs.ok == 'true' && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          version=${TAG#v}
+          mkdir -p copy
+          gh release download "$TAG" --repo stafeto/stafeto --dir copy \
+            --pattern "stafeto-$version-INDEX" --pattern "stafeto-$version-INDEX.sig"
+          mv "copy/stafeto-$version-INDEX" copy/INDEX
+          mv "copy/stafeto-$version-INDEX.sig" copy/INDEX.sig
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          python3 tools/pages.py check-copy --tag "$TAG" --index copy/INDEX --releases releases.json
+          serial=$(sed -n 's/^serial //p' copy/INDEX | head -1)
+          # Signing it again to nowhere shows that the roots of the tree accept the copy.
+          cargo xtask repo resign --index copy/INDEX --anchor copy/INDEX --serial "$serial" --out "$RUNNER_TEMP/verify" \
+            --key "$KEY" --cert "$CERT" --strict
+
+      - name: The attachments of the storage release
+        if: steps.secrets.outputs.ok == 'true' && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          storage="${TAG}-aarch64"
+          # A draft has no tag to look it up by: find it in the list.
+          id=$(gh api --paginate repos/stafeto/packages/releases --jq ".[] | select(.tag_name == \"$storage\") | .id" | head -1)
+          test -n "$id" || { echo "::error::stafeto/packages has no release $storage"; exit 1; }
+          echo "STORAGE_ID=$id" >> "$GITHUB_ENV"
+          mkdir -p storage
+          gh api --paginate "repos/stafeto/packages/releases/$id/assets?per_page=100" --jq '.[] | "\(.id) \(.name)"' | while read -r asset name; do
+            gh api -H "Accept: application/octet-stream" "repos/stafeto/packages/releases/assets/$asset" > "storage/$name"
+          done
+          python3 tools/pages.py verify-storage --index copy/INDEX --storage "$storage" --dir storage
+
+      - name: Publish the storage release and try its addresses
+        if: steps.secrets.outputs.ok == 'true' && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          set -e
+          gh api -X PATCH "repos/stafeto/packages/releases/$STORAGE_ID" -F draft=false --silent
+          python3 tools/pages.py check-addresses --index copy/INDEX
+
+      - name: The index into the pages
+        if: steps.secrets.outputs.ok == 'true' && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          RELEASES_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          # The tag must be the newest of its series, with a serial above the copies of the others.
+          GH_TOKEN="$RELEASES_TOKEN" gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          gh auth setup-git
+          gh repo clone stafeto/packages pages -- --branch gh-pages --single-branch
+          python3 tools/pages.py publish --pages-dir pages --revoked-dir keys --version "${TAG#v}" --index-dir copy --push --releases releases.json \
+            --resign-command "cargo xtask repo resign --key $KEY --cert $CERT --min-certificate-days 35"
+
+      # The weekly signature, and the list of revocations after a push.
+      # The records of every series are those of the signed copy in its newest release;
+      # the pages hold what is delivered and are written by whoever holds the token.
+      - name: Every series signed again
+        if: steps.secrets.outputs.ok == 'true' && github.event_name != 'release'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          RELEASES_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          GH_TOKEN="$RELEASES_TOKEN" gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          gh auth setup-git
+          gh repo clone stafeto/packages pages -- --branch gh-pages --single-branch
+          python3 tools/pages.py weekly --pages-dir pages --revoked-dir keys --push --releases releases.json --anchors anchors \
+            --resign-command "cargo xtask repo resign --key $KEY --cert $CERT --min-certificate-days 35"
+
+      - name: Remove the key
+        if: always() && steps.secrets.outputs.ok == 'true'
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: The pages answer with the new indexes, and the packages check out over the network
+        if: steps.secrets.outputs.ok == 'true'
+        run: |
+          set -e
+          for series in $(cat pages/series.txt); do
+            address="https://stafeto.github.io/packages/$series/aarch64"
+            ok=no
+            for _ in $(seq 1 40); do
+              if curl -fsSL "$address/INDEX" | cmp -s - "pages/$series/aarch64/INDEX"; then ok=yes; break; fi
+              sleep 15
+            done
+            test "$ok" = yes || { echo "::error::$address/INDEX is not the index just written after 10 minutes"; exit 1; }
+            cargo xtask repo --check --official --remote "$address"
+          done

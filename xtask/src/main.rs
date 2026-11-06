@@ -103,7 +103,9 @@ mod posix_display;
 mod posix_net;
 mod probe_ca;
 mod qemu;
+mod release;
 mod repo;
+mod resign;
 mod ring;
 mod rootfs;
 mod rtbench;
@@ -116,6 +118,7 @@ mod symbolize;
 mod vz;
 mod wcet;
 mod window;
+mod workflows;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1660,7 +1663,12 @@ commands:
   ash       run a BusyBox ash builtin script in QEMU
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits; the end of
             the shell ends the machine and gives its status)
-  dist       build the release files of this version in target/dist (docs/release.md)
+  dist       build the release files of this version in target/dist, signed with the development
+            key (docs/release.md)
+  release-build [--previous INDEX] [--no-abi]  the first half of a release in target/stafeto-release: the
+            packages (carried from INDEX), both images, the kernel and the stage of tools/dist.py
+  release-check [DIR]  refuse what the build job left that is not a file of a release
+  release-pack  the archives of a release in target/dist from target/stafeto-release after it is signed
   ash-shell-exit  check that `exit 3` ends the machine and gives 3
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   image base|full [run]
@@ -2078,7 +2086,10 @@ fn main() {
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
-        Some("dist") => dist(),
+        Some("dist") => release::dist(),
+        Some("release-build") => release::build_command(&args[1..]),
+        Some("release-check") => release::check_command(&args[1..]),
+        Some("release-pack") => release::pack(&target_dir().join("dist")),
         Some("ash-shell-exit") => ash_shell_exit(),
         Some("bash-shell-exit") => bash_dialog::bash_shell_exit(),
         Some("bash-dialog") => bash_dialog::bash_dialog(),
@@ -8715,50 +8726,6 @@ fn ash_shell() -> Result<(), String> {
     }
 }
 
-/// `cargo xtask dist`: the release files of the workspace's version in
-/// target/dist (tools/dist.py): the QEMU archive with the boot image of the
-/// shell, the kernel with its symbols, the sources of the GPL packages, the
-/// SBOM and SHA256SUMS.
-fn dist() -> Result<(), String> {
-    // The commit goes into the version field of `uname`; the builds below
-    // see it through their environment.
-    let commit = Command::new("git")
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .current_dir(root())
-        .output()
-        .map_err(|e| format!("git rev-parse: {e}"))?;
-    let commit = String::from_utf8_lossy(&commit.stdout).trim().to_string();
-    if commit.is_empty() {
-        return Err("git rev-parse gave no commit".into());
-    }
-    // SAFETY: xtask is one thread here, before any build starts.
-    unsafe { std::env::set_var("STAFETO_COMMIT", &commit) };
-    relibc()?;
-    busybox_build()?;
-    nano_build()?;
-    bash_build()?;
-    let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-ash-dialog.img", shell_programs(), BOOT_PROFILE)?;
-    // The archive carries the notices of the packages of the shell image,
-    // as those packages carry them.
-    let licenses = pkg_probes::stage_licenses()?;
-    run_cmd(
-        Command::new("python3")
-            .arg(root().join("tools/dist.py"))
-            .args(["--version", env!("CARGO_PKG_VERSION")])
-            .arg("--image")
-            .arg(&kernel.image)
-            .arg("--elf")
-            .arg(&kernel.elf)
-            .arg("--boot")
-            .arg(&image)
-            .arg("--licenses")
-            .arg(&licenses)
-            .arg("--out")
-            .arg(target_dir().join("dist")),
-    )
-}
-
 /// The probe of the end of the interactive shell: `exit 3` typed at its
 /// prompt ends the machine and the run gives 3.
 fn ash_shell_exit() -> Result<(), String> {
@@ -9273,6 +9240,8 @@ fn host_tests() -> Result<(), String> {
         "tools/test_ca_bundle.py",
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
+        "tools/test_dist.py",
+        "tools/test_pages.py",
         "tools/test_nginx_answer.py",
         "tools/test_linux_guest.py",
     ] {

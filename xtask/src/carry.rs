@@ -140,6 +140,12 @@ pub struct Policy {
     /// The series is frozen in `packages/abi.txt`, so it is published: no index
     /// is a failure of the place it is served from, not a new series.
     pub frozen: bool,
+    /// The index is the signed copy that the release of the series carries
+    /// (a directory): the place it is kept vouches for its records, so a key
+    /// revoked since it signed, the term it has run out and the serial of the
+    /// pages do not stop the carrying. The revocations still judge the tail
+    /// of every package, which is how a revoked key's packages are built again.
+    pub anchored: bool,
 }
 
 /// `keys/revoked` of the tree with its signature checked by the official
@@ -217,6 +223,7 @@ impl Policy {
             tree_list,
             min_serial,
             frozen,
+            anchored: !base.starts_with("https://"),
         })
     }
 }
@@ -281,18 +288,18 @@ pub fn load(
         &sha::sha256(&index_bytes),
         index_bytes.len() as u64,
         &trust,
-        &revocations,
+        if policy.anchored { &[] } else { &revocations },
     )
     .map_err(|e| fail("INDEX.sig", e.to_string()))?;
     let h = &index.header;
-    if h.expires < policy.now {
+    if h.expires < policy.now && !policy.anchored {
         return Err(fail(
             "INDEX",
             "the index expired; the series is signed again every week, so something has failed"
                 .into(),
         ));
     }
-    if h.serial < policy.min_serial {
+    if h.serial < policy.min_serial && !policy.anchored {
         return Err(fail(
             "INDEX",
             format!(
@@ -1075,6 +1082,36 @@ pub(crate) mod tests {
         })
         .unwrap_err();
         assert!(err.contains("INDEX.sig"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_signed_copy_of_a_release_carries_after_its_key_is_revoked_and_its_term_has_run_out() {
+        let a = "a".repeat(64);
+        let dir = repository("anchored", &[("alpha", "1", "1", &a, "t-release")], &[]);
+        let leak = Policy {
+            now: 6000,
+            min_serial: 8,
+            tree_list: Some((
+                1,
+                vec![Revocation {
+                    name: n("t-release"),
+                    since: 500,
+                }],
+            )),
+            ..Policy::default()
+        };
+        assert!(load(&base(&dir), "0.2", &fetch, &[root()], &leak).is_err());
+        let anchored = Policy {
+            anchored: true,
+            ..leak
+        };
+        let previous = load(&base(&dir), "0.2", &fetch, &[root()], &anchored)
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.entries.len(), 1);
+        // The list still stands for the packages: one signed by the revoked key is built again.
+        assert_eq!(previous.revocations.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

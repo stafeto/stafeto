@@ -1,41 +1,53 @@
-# stafeto @VERSION@ for QEMU (aarch64, `virt` machine)
+# stafeto @VERSION@ for QEMU (aarch64, `virt` machine): @FLAVOUR@
 
-A pre-release of stafeto: a POSIX system on its own capability microkernel,
-written in Rust for AArch64. This archive boots the kernel in QEMU to a
-BusyBox `ash` shell.
+@RELEASE@ A POSIX system on its own capability microkernel, written in Rust
+for AArch64. This archive boots the kernel in QEMU to a BusyBox `ash` shell
+with a screen, a keyboard, the network and a disk.
+
+@ABOUT@
 
 ## Run
 
 You need `qemu-system-aarch64` (macOS: `brew install qemu`; Debian and
 Ubuntu: `sudo apt install qemu-system-arm`).
 
-    ./run.sh                 # QEMU's own emulation (TCG), 1 CPU
+    ./run.sh                 # QEMU's own emulation (TCG), 1 CPU, @MEMORY@
     ./run.sh --cpus 4        # 4 CPUs (1 to 8)
     ./run.sh --hvf           # Apple silicon Mac: the host's CPU through HVF
+    ./run.sh --nographic     # no window: the console only
+    ./run.sh --print         # print the QEMU command and stop
 
-Wait for the prompt, then try `uname -a`, `ls /bin`, `top`, `nano`, `htop`,
-`bash`. `exit` at the prompt or Ctrl-A X ends the machine.
+The console is this terminal; the window of QEMU shows the screen and takes
+the keyboard. Wait for the prompt, then try `uname -a`, `pkg list`,
+`pkg install doom` and, once it is installed, `doom -iwad /games/freedoom1.wad`.
+`poweroff` at the prompt or Ctrl-A X ends the machine.
+
+## The disk
+
+`pkg install` keeps the packages on the disk `store.img`, a sparse file of
+512 MiB that `run.sh` makes next to itself at the first run. What you install
+stays there between runs. `./run.sh --fresh-store` starts with a new empty
+disk. The index of the packages comes from `https://stafeto.github.io/packages/`
+over the network of the machine (user-mode networking of QEMU).
 
 ## What is inside
 
 | File | Content |
 | --- | --- |
 | `Image` | the kernel, in the arm64 Linux boot image format |
-| `boot.img` | the boot image: init, the services (UART, RAM files, pipes, terminal, clock, process, entropy) and the packages: BusyBox, GNU bash, GNU nano, htop, ncdu, ncurses and small ready-made utilities |
-| `run.sh` | starts QEMU with these two files |
-| `LICENSES/` | the licence texts of the kernel and of every package |
+| `@IMAGE@` | the boot image: init, the services and the packages of the @FLAVOUR@ image |
+| `run.sh` | starts QEMU with these files |
+| `LICENSES/` | the licence texts of the kernel and, in `LICENSES/packages/<name>/`, the notices of every package of this image |
 
 Next to this archive a release carries the kernel with its symbols, the
 sources of the GPL packages with our build scripts and patches, an SBOM
-(`.spdx.json`) and `SHA256SUMS`.
+(`.spdx.json`), the signed index of the packages and `SHA256SUMS`.
 
 ## Limits
 
-- All files live in memory: what you create is gone when the machine stops.
-  There is no disk, network or graphics yet.
-- One user shell on the serial console; no installation of packages in the
-  running system.
-- A pre-release: the interfaces and the image layout can change before 0.2.0.
+- @LIMIT@
+- The shell talks on the console of this terminal; the window of QEMU shows the
+  screen and takes the keyboard.
 
 ## Licences
 

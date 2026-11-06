@@ -1,11 +1,23 @@
 name: release
 
-# A tag `v<version>` builds the release files of that version on a clean
-# machine, after the same groups as ci have passed on the tagged commit, and
-# leaves a draft release for the owner to read and publish (docs/release.md).
+# A tag `v<version>` builds the release files of that version, after the same
+# groups as ci have passed on the tagged commit, and leaves draft releases for
+# the owner to read and publish (docs/release.md). Four jobs keep the secrets
+# away from the code that builds the packages:
+#
+#   ci     the groups of ci, called without secrets
+#   build  carries the packages of the published index, builds the rest, the
+#          images and the kernel; no secret, no environment
+#   sign   a clean machine that builds nothing but xtask; holds the release
+#          key alone, signs the packages again, the images and the index
+#   draft  holds the token of stafeto/packages alone and creates the drafts
+#
+# `workflow_dispatch` from `main` is the dry run: the same jobs with the real
+# key, no draft, the files only in the artifacts of the run for three days.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,30 +36,35 @@ jobs:
     permissions:
       contents: read
 
-  release:
-    name: release
+  build:
+    name: build
     needs: ci
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
-      - name: The tag names the version of the workspace
+      - name: The version of the workspace, and that the tag names it
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-          test "$GITHUB_REF_NAME" = "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = push ]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
 
       - uses: ./.github/actions/setup
         with:
           qemu: "false"
 
       - name: Restore caches
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -59,14 +76,161 @@ jobs:
             ci3-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'tools/build-*.py') }}-
             ci3-${{ runner.arch }}-
 
+      - name: Source archives of the packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/dist-cache
+          key: dist-cache-${{ hashFiles('packages/*.toml') }}
+
       - name: Install the pinned toolchain
         run: rustup toolchain install
 
-      - name: cargo xtask dist
-        run: cargo xtask dist
+      - name: Where the packages are carried from
+        id: previous
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          series=$(echo "$VERSION" | cut -d. -f1,2)
+          # The records of a published series come from the signed index that its release carries.
+          gh api --paginate repos/stafeto/stafeto/releases --jq '.[]' | jq -s '.' > releases.json
+          flag=$(python3 tools/pages.py previous --series "$series" --releases releases.json --out anchor)
+          echo "flag=$flag" >> "$GITHUB_OUTPUT"
+
+      # The fingerprint of the ABI (a frozen series for a final version), the
+      # packages carried from the index of the series and built otherwise, both
+      # boot images, the kernel and the stage of tools/dist.py.
+      - name: cargo xtask release-build
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.flag }}
+        run: cargo xtask release-build $PREVIOUS
+
+      - name: Keep what the signing job needs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-input
+          path: target/stafeto-release
+          retention-days: 3
+          if-no-files-found: error
+
+  sign:
+    name: sign
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    environment: packages
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The dependencies of xtask as Cargo.lock pins them; their build scripts run here.
+      - name: The pinned toolchain and xtask, before any key is on the machine
+        run: |
+          rustup toolchain install
+          cargo build --locked -p xtask
+
+      - name: What the build job made
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-input
+          path: target/stafeto-release
+
+      # Nothing from the build job reaches a shell of this job: the version is that of this
+      # checkout, the serial comes from the published index, and xtask reads every file of
+      # the artifact in its strict form before the key is written.
+      - name: Only the files of a release are there
+        run: |
+          echo "VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+          cargo xtask release-check
+
+      - name: The release key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY" || { echo "::error::the secret RELEASE_SIGNING_KEY of the environment packages is empty or missing"; exit 1; }
+          # The certificate of the tree names the key; the secret holds that key.
+          name=$(basename "$(ls keys/*.cert | sort | tail -1)" .cert)
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/keys/$name.key"
+          echo "KEY=$RUNNER_TEMP/keys/$name.key" >> "$GITHUB_ENV"
+          echo "CERT=keys/$name.cert" >> "$GITHUB_ENV"
+
+      - name: Sign the packages, the images and the index
+        run: |
+          set -e
+          dir=target/stafeto-release/pkg
+          cargo xtask pkg-sign --key "$KEY" --cert "$CERT" --dir "$dir"
+          cargo xtask image-repack target/stafeto-release/boot-base.img --packages "$dir"
+          cargo xtask image-repack target/stafeto-release/boot-full.img --packages "$dir"
+          series=$(echo "$VERSION" | cut -d. -f1,2)
+          cargo xtask repo --from "$dir" --official --key "$KEY" --cert "$CERT" \
+            --serial-after "https://stafeto.github.io/packages/$series/aarch64" --storage "v$VERSION-aarch64"
+
+      - name: Remove the key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+      - name: Check the signed repository with the roots of the tree
+        run: cargo xtask repo --check --official --dir target/stafeto-release/pkg
+
+      - name: The archives
+        run: cargo xtask release-pack
+
+      - name: Keep the signed files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-signed
+          path: |
+            target/dist
+            target/stafeto-release/pkg
+          retention-days: 3
+          if-no-files-found: error
+
+  draft:
+    name: draft
+    needs: [build, sign]
+    # The dry run (workflow_dispatch) leaves no draft.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: packages
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The version of this checkout
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          case "$version" in *-*) echo "FINAL=false" >> "$GITHUB_ENV" ;; *) echo "FINAL=true" >> "$GITHUB_ENV" ;; esac
+
+      - name: A storage release of this name stops the job before any draft is made
+        if: env.FINAL == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN" || { echo "::error::the secret PACKAGES_TOKEN of the environment packages is empty or missing"; exit 1; }
+          if gh release view "v$VERSION-aarch64" --repo stafeto/packages >/dev/null 2>&1; then
+            echo "::error::stafeto/packages has a release v$VERSION-aarch64 already; the owner deletes the draft before a tag is set again"
+            exit 1
+          fi
+
+      - name: The signed files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-signed
+          path: signed
 
       - name: Check the sums
-        run: cd target/dist && sha256sum --check SHA256SUMS
+        run: cd signed/dist && sha256sum --check SHA256SUMS
 
       - name: Notes of the release
         run: |
@@ -81,4 +245,19 @@ jobs:
           case "$VERSION" in *-*) flags="$flags --prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" $flags \
             --title "stafeto $VERSION" --notes-file release-notes.md \
-            target/dist/*
+            signed/dist/*
+
+      - name: Draft of the storage release in stafeto/packages
+        if: env.FINAL == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          set -ef
+          dir=signed/stafeto-release/pkg
+          # The new packages and their sources; a carried package is already in the storage it came from.
+          files=$(python3 tools/pages.py new-files --dir "$dir")
+          # shellcheck disable=SC2086
+          gh release create "v$VERSION-aarch64" --draft --repo stafeto/packages \
+            --title "stafeto $VERSION packages" \
+            --notes "The packages built for stafeto $VERSION, signed by the release key. Published by the workflow after the owner publishes the release v$VERSION of stafeto/stafeto." \
+            $files

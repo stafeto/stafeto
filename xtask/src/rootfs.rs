@@ -1635,7 +1635,12 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         // The probe of the package tool (crate::pkg_probe) is the base image with the probe CA
         // in the certificate file and the mirror of the probe as the official repository,
         // trusting the development root.
-        "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img" => {
+        // The full image without a package (`image full --without`) is the full image.
+        name if matches!(
+            name,
+            "boot-base.img" | "boot-full.img" | "boot-pkg-probe.img"
+        ) || crate::packages::without_name(name).is_some() =>
+        {
             let mut files = dialog(name);
             for d in ["/usr", "/usr/share"] {
                 if !files.iter().any(|f| f.path == d) {

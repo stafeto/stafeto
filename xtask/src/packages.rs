@@ -707,6 +707,54 @@ pub fn value(name: &str, key: &str) -> Result<String, String> {
     }
 }
 
+/// The prefix of the names of the full image built without a package
+/// (`cargo xtask image full --without f-stack`).
+const WITHOUT: &str = "boot-full-without-";
+
+/// The name of the full image without the package `package`.
+pub fn without_image(package: &str) -> String {
+    format!("{WITHOUT}{package}.img")
+}
+
+/// The package that an image name of `without_image` leaves out.
+pub fn without_name(image: &str) -> Option<&str> {
+    image.strip_prefix(WITHOUT)?.strip_suffix(".img")
+}
+
+/// The packages of `all` without the optional package `name` and without the
+/// packages that depend on it, or on what it provides, one after the other.
+pub fn without(all: Vec<Package>, name: &str) -> Result<Vec<Package>, String> {
+    let first = all
+        .iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("--without {name}: no such package"))?;
+    if first.kind != Kind::Optional {
+        return Err(format!(
+            "--without {name}: a base package; only an optional one can be left out"
+        ));
+    }
+    let mut gone: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    gone.insert(name.to_string());
+    gone.extend(first.provides.iter().cloned());
+    loop {
+        let more: Vec<&Package> = all
+            .iter()
+            .filter(|p| !gone.contains(&p.name) && p.depends.iter().any(|d| gone.contains(d)))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for p in more {
+            gone.insert(p.name.clone());
+            gone.extend(p.provides.iter().cloned());
+        }
+    }
+    Ok(all
+        .into_iter()
+        .filter(|p| !gone.contains(&p.name))
+        .collect())
+}
+
 /// The packages the image `name` holds: the shell image holds the base ones
 /// and the add-ons, the images with the network service F-Stack and the
 /// network packages too, the image of the probe of F-Stack its own package,
@@ -737,6 +785,7 @@ pub fn of_image(name: &str) -> Result<Vec<Package>, String> {
             .filter(|p| p.kind == Kind::Base)
             .collect()),
         "boot-full.img" => load(),
+        other if without_name(other).is_some() => without(load()?, without_name(other).unwrap()),
         "boot-ash-dialog.img" => of(&[Group::Base, Group::Addon]),
         "boot-net.img"
         | "boot-net-curl-steps.img"

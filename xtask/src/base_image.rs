@@ -22,38 +22,43 @@ pub const PKG_STACK_SIZE: u32 = 256 * 1024;
 /// network, the screen and the keys, and the programs of the packages the
 /// image holds (their ELF files are what the packages carry).
 pub fn programs(image: &str) -> &'static [ImageProgram] {
-    static LISTS: [std::sync::OnceLock<Vec<ImageProgram>>; 2] =
-        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
-    let at = usize::from(image == FULL_IMAGE);
-    LISTS[at].get_or_init(|| {
-        let packages = packages::of_image(image).unwrap_or_else(|e| panic!("{image}: {e}"));
-        // The package service lists this many packages of the image and says `too many packages,
-        // skipped` to the rest: the build refuses an image it would fail.
-        assert!(
-            packages.len() <= pkgd::packages::IMAGE_MAX,
-            "{image} holds {} packages, the package service lists {} (pkgd::packages::IMAGE_MAX)",
-            packages.len(),
-            pkgd::packages::IMAGE_MAX
-        );
-        let mut programs = SHELL_SERVICES.to_vec();
-        programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
-        programs.extend(package_programs(&packages));
-        programs.extend(SHELL_SERVICES_LAST);
-        programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
-        programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
-        programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
-        // The tool is started from its file `/bin/pkg`: stack 0 keeps it out of the image as a
-        // program of the loader, and its stack is the `PT_GNU_STACK` that build.rs asks the linker for.
-        programs.push(("pkg", "pkg", 0, &[]));
-        programs.push((
-            "virtio-input",
-            "virtio-input",
-            input_probe::INPUT_STACK_SIZE,
-            &[],
-        ));
-        programs.push(("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]));
-        programs
-    })
+    static LISTS: std::sync::Mutex<Vec<(String, &'static [ImageProgram])>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut lists = LISTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, list)) = lists.iter().find(|(name, _)| name == image) {
+        return list;
+    }
+    let packages = packages::of_image(image).unwrap_or_else(|e| panic!("{image}: {e}"));
+    // The package service lists this many packages of the image and says `too many packages,
+    // skipped` to the rest: the build refuses an image it would fail.
+    assert!(
+        packages.len() <= pkgd::packages::IMAGE_MAX,
+        "{image} holds {} packages, the package service lists {} (pkgd::packages::IMAGE_MAX)",
+        packages.len(),
+        pkgd::packages::IMAGE_MAX
+    );
+    let mut programs = SHELL_SERVICES.to_vec();
+    programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-base"]);
+    programs.extend(package_programs(&packages));
+    programs.extend(SHELL_SERVICES_LAST);
+    programs.push(("netd", "netd", net::NETD_STACK_SIZE, &[]));
+    programs.push(("virtio-blk", "virtio-blk", blk_probe::BLK_STACK_SIZE, &[]));
+    programs.push(("pkgd", "pkgd", store_probe::PKGD_STACK_SIZE, &[]));
+    // The tool is started from its file `/bin/pkg`: stack 0 keeps it out of the image as a
+    // program of the loader, and its stack is the `PT_GNU_STACK` that build.rs asks the linker for.
+    programs.push(("pkg", "pkg", 0, &[]));
+    programs.push((
+        "virtio-input",
+        "virtio-input",
+        input_probe::INPUT_STACK_SIZE,
+        &[],
+    ));
+    programs.push(("virtio-gpu", "virtio-gpu", gpu_probe::GPU_STACK_SIZE, &[]));
+    let list: &'static [ImageProgram] = Box::leak(programs.into_boxed_slice());
+    lists.push((image.to_string(), list));
+    list
 }
 
 /// The devices of the machine of both images: the screen, the keyboard, the
@@ -72,7 +77,7 @@ pub fn machine_args(store: &Path) -> Vec<String> {
 /// on 512 MiB, stays there); the archive of the full image names it in its
 /// `run.sh` (spec 5, release).
 pub fn machine(image: &str) -> &'static qemu::Machine {
-    if image == FULL_IMAGE {
+    if image == FULL_IMAGE || packages::without_name(image).is_some() {
         &qemu::VIRT_1G
     } else {
         &qemu::VIRT
@@ -103,19 +108,35 @@ pub fn rebuild_image(name: &'static str) -> Result<PathBuf, String> {
     crate::write_boot_image(name, programs(name), BOOT_PROFILE)
 }
 
-/// `cargo xtask image base|full [run]`.
+const USAGE: &str = "usage: cargo xtask image base|full [--without PACKAGE] [run]";
+
+/// `cargo xtask image base|full [--without PACKAGE] [run]`. `--without` builds the full
+/// image without an optional package and the packages that depend on it, as
+/// `target/boot-full-without-<package>.img`.
 pub fn command(args: &[String]) -> Result<(), String> {
-    let name = match args.first().map(String::as_str) {
+    let mut rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let mut name: &'static str = match args.first().map(String::as_str) {
         Some("base") => BASE_IMAGE,
         Some("full") => FULL_IMAGE,
-        _ => return Err("usage: cargo xtask image base|full [run]".to_owned()),
+        _ => return Err(USAGE.to_owned()),
     };
+    if let Some(at) = rest.iter().position(|a| *a == "--without") {
+        if name != FULL_IMAGE || at + 1 >= rest.len() {
+            return Err(USAGE.to_owned());
+        }
+        let package = rest.remove(at + 1);
+        rest.remove(at);
+        name = Box::leak(packages::without_image(package).into_boxed_str());
+        // The refusal comes before the long build.
+        packages::of_image(name)?;
+    }
+    let args = &rest;
     let image = build_image(name)?;
     let size = std::fs::metadata(&image)
         .map_err(|e| format!("{}: {e}", image.display()))?
         .len();
     println!("image: {} ({size} bytes)", image.display());
-    match args.get(1).map(String::as_str) {
+    match args.first().copied() {
         None => Ok(()),
         Some("run") => {
             let kernel = build(Variant::Normal)?;
@@ -127,7 +148,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             cmd.args(machine_args(&store));
             run_interactive_qemu(cmd, &kernel.elf)
         }
-        Some(other) => Err(format!("image {}: unknown argument {other}", args[0])),
+        Some(other) => Err(format!("image {name}: unknown argument {other}")),
     }
 }
 
@@ -183,5 +204,54 @@ mod tests {
                 "the bytes of pkg are in boot-base.img {hits} times"
             );
         }
+    }
+
+    /// `--without f-stack` leaves out F-Stack and nginx-fast, which links it,
+    /// in the programs, in the files of the image and in the memory it needs.
+    #[test]
+    fn the_image_without_f_stack_holds_neither_f_stack_nor_what_links_it() {
+        let image = packages::without_image("f-stack");
+        assert_eq!(image, "boot-full-without-f-stack.img");
+        let names: Vec<String> = packages::of_image(&image)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let full: Vec<String> = packages::of_image(FULL_IMAGE)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "f-stack" || n == "nginx-fast"));
+        assert_eq!(names.len() + 2, full.len());
+        assert!(
+            names.iter().any(|n| n == "nginx"),
+            "nginx without the stack stays"
+        );
+        assert!(programs(&image).len() < programs(FULL_IMAGE).len());
+        assert!(
+            !crate::rootfs::files_of(&image)
+                .iter()
+                .any(|f| f.path.contains("fstack"))
+        );
+        assert_eq!(machine(&image).memory, "1G");
+        assert_eq!(machine(BASE_IMAGE).memory, "512M");
+    }
+
+    #[test]
+    fn only_an_optional_package_can_be_left_out() {
+        let base = packages::of_image(BASE_IMAGE).unwrap().remove(0).name;
+        assert!(
+            packages::without(packages::load().unwrap(), &base)
+                .unwrap_err()
+                .contains("base package")
+        );
+        assert!(
+            packages::without(packages::load().unwrap(), "nosuch")
+                .unwrap_err()
+                .contains("no such package")
+        );
+        assert!(command(&["base".into(), "--without".into(), "f-stack".into()]).is_err());
+        assert!(command(&["full".into(), "--without".into(), "busybox".into()]).is_err());
     }
 }
