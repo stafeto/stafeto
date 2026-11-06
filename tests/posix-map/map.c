@@ -2246,6 +2246,21 @@ static int bigrun(void) {
           symlink("/bin/procs-child", "/tmp/procs-link") == 0 && ask_child("/tmp/procs-link") == 0);
     unlink("/tmp/procs-child");
     unlink("/tmp/procs-link");
+    check("grant: a hard link to the file has none",
+          link("/bin/procs-child", "/tmp/procs-hard") == 0 && ask_child("/tmp/procs-hard") == 0);
+    unlink("/tmp/procs-hard");
+    /* The second line names /tmp/procs-mode: the loader gives the path to the
+     * service only for a file of UID 0 that the group and the others
+     * cannot write, so the mode and the owner decide here. */
+    const char *mode_path = "/tmp/procs-mode";
+    check("grant: a copy for the second line", copy_file("/bin/procs-child", mode_path) == 0);
+    check("grant: mode 0775 has none", chmod(mode_path, 0775) == 0 && ask_child(mode_path) == 0);
+    check("grant: mode 0757 has none", chmod(mode_path, 0757) == 0 && ask_child(mode_path) == 0);
+    check("grant: a file of nobody's has none",
+          chmod(mode_path, 0755) == 0 && chown(mode_path, 65534, 65534) == 0 && ask_child(mode_path) == 0);
+    check("grant: mode 0755 of UID 0 has it",
+          chown(mode_path, 0, 0) == 0 && chmod(mode_path, 0755) == 0 && ask_child(mode_path) == 1);
+    unlink(mode_path);
     check("grant: the third generation has the quota of a command", run_role("/bin/procs-child", "deep") == 0);
     pid_t child = fork();
     if (child < 0) { printf("posix-map: big: fork failed with %d\n", errno); return 1; }
