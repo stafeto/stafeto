@@ -84,6 +84,27 @@ const GRID: [u32; 16] = [
     250, 500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000,
     96000,
 ];
+/// The loads whose ceilings a system takes in round `round`: all of them in
+/// the first `rounds` rounds, those of HTTP and the long connections of TLS
+/// (W5 has no closed loop), none after.
+fn ceiling_loads(workloads: &[Workload], round: u32, rounds: u32) -> Vec<Workload> {
+    if round > rounds {
+        return Vec::new();
+    }
+    workloads
+        .iter()
+        .copied()
+        .filter(|w| *w != Workload::W5)
+        .collect()
+}
+
+/// Whether the rounds end after `round`: the rounds with ceilings are all
+/// taken whether the rows have an R* to confirm or not, and the later ones go
+/// on for the open pairs.
+fn rounds_end(round: u32, rounds: u32, max_rounds: u32, all_done: bool) -> bool {
+    round >= max_rounds || (round >= rounds && all_done)
+}
+
 /// The pairs of rows whose ratios the tables print.
 const PAIRS: [(System, System); 4] = [
     (System::S4, System::L4),
@@ -422,6 +443,23 @@ fn measure(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measu
     }
 }
 
+/// The largest stall of the generator in `samples`, in ns: the largest gap
+/// between the starts of two neighbouring requests, less four intervals of
+/// the rate. With one thread of `h2load` (rates up to 16 000 a second) all
+/// the connections live in that thread, so its stall opens a gap in the
+/// starts of all of them together, which the phases of the connections do
+/// not touch. With two threads one thread alone can stall unseen, so the
+/// number is a lower bound there.
+fn largest_stall(samples: &[Sample], rate: u32) -> u64 {
+    let allowed = 4_000_000_000 / u64::from(rate.max(1));
+    samples
+        .windows(2)
+        .map(|w| w[1].at.saturating_sub(w[0].at))
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(allowed)
+}
+
 /// The step of `samples` from `h2load`, asked at `rate`. The percentiles are
 /// the log's own, from the start of a request to the end of its answer. The
 /// correction of `measure` does not apply: it reads the requests against one
@@ -429,12 +467,15 @@ fn measure(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measu
 /// starting when its handshake ends, so the starts of the connections meet and
 /// part by a millisecond or two with nothing stalled (the lag so counted
 /// was 1 to 3 ms on the floor, which no `h2load` stall explains). The floor
-/// is the same `h2load` on the loopback and takes that noise in the rule; the
-/// lag against the single schedule stays in `lag_max` and in the seconds file
-/// as information, and `lag_p99` is 0.
+/// is the same `h2load` on the loopback and takes that noise in the rule. What
+/// the floor cannot take is a stall of `h2load` in the run of a guest: the
+/// largest stall (`largest_stall`) stands in the place of the p99 of lag, so
+/// that above 0.5 ms the step is marked "generator" and a failure it explains
+/// is noise.
 fn measure_h2(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measured {
     let stage = stage_of(samples, rate, malloc, length);
     let p99 = stage.p99.unwrap_or(0);
+    let stall = largest_stall(samples, rate);
     Measured {
         rate,
         requests: stage.requests,
@@ -446,8 +487,8 @@ fn measure_h2(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Me
         p99,
         p999: stage.p999,
         p99_raw: p99,
-        lag_p99: 0,
-        lag_max: stage.lag_max.unwrap_or(0),
+        lag_p99: stall,
+        lag_max: stall,
         mbps: stage.megabytes_per_second,
         ..Measured::default()
     }
@@ -1008,17 +1049,21 @@ fn wrk_script(paths: &[String], keep_alive: bool) -> String {
 
 // The load over TLS ----------------------------------------------------------------------
 
-/// The connections of W4 and how fast `h2load` opens them. A connection
-/// has its own timer, so connections opened together would send together:
-/// they open one after the other, a request interval apart (`rate` in a
-/// second, at most 1 000 connections a second as `--rate-period` counts
-/// milliseconds), and the 64 requests of each period come evenly.
+/// The connections of W4 and W5 and how fast `h2load` opens them: `count`
+/// connections every `period` milliseconds (`--rate-period` counts whole
+/// milliseconds), exactly `rate` in a second. A connection of W4 has its
+/// own timer, so connections opened together would send together: they open
+/// one after the other, a request interval apart, and the 64 requests of
+/// each period come evenly. Rounding the period or the count would deliver
+/// less or more than the asked rate (300 a second as one connection every
+/// 4 ms is 250), so the pair is the exact ratio.
 fn connection_pace(rate: u32) -> (u32, u32) {
-    if rate <= 1000 {
-        (1, 1000_u32.div_ceil(rate.max(1)))
-    } else {
-        (rate.div_ceil(1000), 1)
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
     }
+    let rate = rate.max(1);
+    let period = 1000 / gcd(rate, 1000);
+    (rate * period / 1000, period)
 }
 
 /// The arguments of `h2load` for a step of W4 (`keep_alive`: 64 long
@@ -1060,6 +1105,9 @@ fn h2load_args(uris: &Path, rate: u32, secs: u32, keep_alive: bool, log: &Path) 
 /// The ceiling of W4 as `wrk -c64` finds it for W1: `connections` long
 /// connections with one request in flight on each, as fast as the guest
 /// answers (ten streams on each hang the guest of F1 after 640 requests).
+/// There is no warm-up of its own: `/proc/stat` is read around the whole run
+/// and the requests `h2load` counts are those of the whole run, so the CPU
+/// time per request has the same window in both.
 fn h2load_ceiling_args(uris: &Path, connections: u32, secs: u32) -> Vec<String> {
     vec![
         "-i".to_owned(),
@@ -1068,7 +1116,6 @@ fn h2load_ceiling_args(uris: &Path, connections: u32, secs: u32) -> Vec<String> 
         "-m1".to_owned(),
         "-t2".to_owned(),
         format!("-D{secs}s"),
-        "--warm-up-time=2s".to_owned(),
     ]
 }
 
@@ -1898,6 +1945,12 @@ fn options(args: &[String]) -> Result<Options, String> {
             o.max_rounds, o.rounds
         ));
     }
+    if o.image != ImageKind::Plain && o.systems.contains(&System::F1) {
+        return Err(
+            "--image has no variant of F1: its image is boot-net-bench-fast.img (run F1 apart from --image)"
+                .to_owned(),
+        );
+    }
     Ok(o)
 }
 
@@ -2403,25 +2456,17 @@ impl Bench {
                 // The ceilings of every load of the system come first, with
                 // or without an R* (a row that holds no 1 ms, S4 on W2 or F1,
                 // has its ceiling and its CPU time all the same).
-                if round <= self.opts.rounds {
-                    // W5 has no ceiling: a connection for each request has no
-                    // closed loop that `h2load` runs.
-                    let loads: Vec<Workload> = self
-                        .opts
-                        .workloads
-                        .iter()
-                        .copied()
-                        .filter(|w| *w != Workload::W5)
-                        .collect();
-                    for wl in loads {
-                        for c in [CONNECTIONS, wl.criterion()] {
-                            self.ceiling(
-                                &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
-                                sys,
-                                wl,
-                                c,
-                            )?;
-                        }
+                // W5 has no ceiling: a connection for each request has no
+                // closed loop that `h2load` runs.
+                let loads = ceiling_loads(&self.opts.workloads, round, self.opts.rounds);
+                for wl in loads {
+                    for c in [CONNECTIONS, wl.criterion()] {
+                        self.ceiling(
+                            &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
+                            sys,
+                            wl,
+                            c,
+                        )?;
                     }
                 }
                 let pairs: Vec<Workload> = self
@@ -2470,9 +2515,8 @@ impl Bench {
                 }
                 self.release();
             }
-            // The rounds with ceilings are all taken, whether the rows have an
-            // R* to confirm or not; the later ones go on for the open pairs.
-            if round >= self.opts.rounds && states.values().all(|(_, c)| c.done()) {
+            let all_done = states.values().all(|(_, c)| c.done());
+            if rounds_end(round, self.opts.rounds, self.opts.max_rounds, all_done) {
                 break;
             }
         }
@@ -2965,7 +3009,7 @@ impl Results {
 
     fn table_ratios(&self) -> String {
         let mut t = String::from(
-            "### Table 2a. Ratios between the rows (S4 over L4, F1 over L4, S4 and L1)\n\n",
+            "### Table 2a. Ratios between the rows (S4 over L4; F1 over L4, S4 and L1)\n\n",
         );
         for (a, b) in PAIRS {
             let (an, bn) = (a.name(), b.name());
@@ -3779,6 +3823,20 @@ mod tests {
     fn the_connections_of_w4_open_a_request_interval_apart() {
         assert_eq!(connection_pace(250), (1, 4));
         assert_eq!(connection_pace(1000), (1, 1));
+        // The pair delivers the asked rate: count a period of period ms.
+        for rate in [
+            100, 200, 300, 500, 700, 1500, 2000, 3000, 4000, 12_000, 24_000, 333,
+        ] {
+            let (count, period) = connection_pace(rate);
+            assert_eq!(
+                u64::from(count) * 1000,
+                u64::from(rate) * u64::from(period),
+                "{rate}"
+            );
+        }
+        assert_eq!(connection_pace(300), (3, 10));
+        assert_eq!(connection_pace(700), (7, 10));
+        assert_eq!(connection_pace(1500), (3, 2));
         assert_eq!(connection_pace(3000), (3, 1));
         assert_eq!(connection_pace(96_000), (96, 1));
         let args = h2load_args(Path::new("u.txt"), 1000, 30, true, Path::new("l.log"));
@@ -3810,9 +3868,54 @@ mod tests {
     }
 
     #[test]
+    fn the_rounds_and_their_limits_are_read_and_kept() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let o = options(&[]).unwrap();
+        assert_eq!((o.rounds, o.max_rounds), (CONFIRMS, MAX_ROUNDS));
+        let o = options(&args(&["--rounds", "2", "--max-rounds", "4"])).unwrap();
+        assert_eq!((o.rounds, o.max_rounds), (2, 4));
+        // Fewer rounds in all than rounds with ceilings, or more than the limit.
+        assert!(options(&args(&["--rounds", "3", "--max-rounds", "2"])).is_err());
+        assert!(options(&args(&["--max-rounds", "13"])).is_err());
+        assert!(options(&args(&["--rounds", "0"])).is_err());
+    }
+
+    #[test]
+    fn the_ceilings_of_a_round_are_those_of_every_load_but_w5_in_the_first_rounds() {
+        use Workload::*;
+        let all = [W1, W2, W3, W4, W5];
+        assert_eq!(ceiling_loads(&all, 1, 3), [W1, W2, W3, W4]);
+        assert_eq!(ceiling_loads(&all, 3, 3), [W1, W2, W3, W4]);
+        assert!(ceiling_loads(&all, 4, 3).is_empty());
+        // A row with no R* has no pair to confirm and still has them.
+        assert_eq!(ceiling_loads(&[W1], 2, 3), [W1]);
+    }
+
+    #[test]
+    fn the_rounds_end_after_those_with_ceilings_and_when_the_pairs_are_done() {
+        // Nothing to confirm: the rounds with ceilings are all taken.
+        assert!(!rounds_end(1, 3, 3, true));
+        assert!(!rounds_end(2, 3, 3, true));
+        assert!(rounds_end(3, 3, 3, true));
+        // Open pairs go on up to the limit.
+        assert!(!rounds_end(3, 3, 6, false));
+        assert!(rounds_end(6, 3, 6, false));
+        assert!(rounds_end(4, 3, 6, true));
+    }
+
+    #[test]
+    fn the_image_variants_are_refused_with_f1() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(options(&args(&["--systems", "f1", "--image", "cpu0"])).is_err());
+        assert!(options(&args(&["--systems", "s4,f1", "--image", "pinned"])).is_err());
+        assert!(options(&args(&["--systems", "s4", "--image", "pinned"])).is_ok());
+        assert!(options(&args(&["--systems", "f1"])).is_ok());
+    }
+
+    #[test]
     fn the_ceiling_of_w4_keeps_one_request_in_flight_on_each_connection() {
         let args = h2load_ceiling_args(Path::new("u.txt"), 64, 15);
-        for wanted in ["-c64", "-m1", "-D15s", "--warm-up-time=2s"] {
+        for wanted in ["-c64", "-m1", "-D15s"] {
             assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
         }
     }
@@ -3838,6 +3941,22 @@ mod tests {
         let m = measure_h2(&samples, 1000, 10240, 0);
         assert_eq!((m.requests, m.ok, m.failed), (3, 2, 1));
         assert_eq!((m.p99, m.p99_raw, m.lag_p99), (5_000_000, 5_000_000, 0));
+        // A gap of 3 ms between the starts at 1 000 a second is a stall of
+        // 3 ms less four intervals (4 ms): none; of 20 ms: 16 ms.
+        let at = |ms: u64| Sample {
+            at: ms * 1_000_000,
+            code: 200,
+            latency: 1,
+            seq: 0,
+        };
+        assert_eq!(largest_stall(&[at(0), at(1), at(4)], 1000), 0);
+        assert_eq!(
+            largest_stall(&[at(0), at(1), at(21), at(22)], 1000),
+            16_000_000
+        );
+        let stalled = measure_h2(&[at(0), at(1), at(21), at(22)], 1000, 10240, 0);
+        assert_eq!(stalled.lag_p99, 16_000_000);
+        assert!(stalled.marks().contains(&"generator"));
         assert_eq!(m.p50, 900_000);
     }
 
