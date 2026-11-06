@@ -114,6 +114,46 @@ impl Space {
         self.pages = ROOM_MAX;
     }
 
+    /// The address of the bitmap of a room that grew (the object the layer
+    /// keeps it in); None for the bitmap inside.
+    pub fn bitmap_address(&self) -> Option<usize> {
+        (!self.grown.is_null()).then_some(self.grown as usize)
+    }
+
+    /// The first run of pages in `state` that begins at or after the page
+    /// `from`: its first page and its length. A word of 32 pages with none
+    /// or all of them in `state` costs one comparison, so a walk over the
+    /// runs of the whole room is at most ROOM_MAX / 32 words and a step per
+    /// run.
+    pub fn next_run(&self, from: usize, state: State) -> Option<(usize, usize)> {
+        let total = self.pages;
+        let mut page = from;
+        // The start: skip the words with none in `state`.
+        while page < total {
+            if page.is_multiple_of(PER_WORD) && self.matches(page / PER_WORD, state) == 0 {
+                page += PER_WORD;
+            } else if self.state_of(page) == state {
+                break;
+            } else {
+                page += 1;
+            }
+        }
+        if page >= total {
+            return None;
+        }
+        let start = page;
+        while page < total {
+            if page.is_multiple_of(PER_WORD) && self.matches(page / PER_WORD, state) == LOW {
+                page += PER_WORD;
+            } else if self.state_of(page) == state {
+                page += 1;
+            } else {
+                break;
+            }
+        }
+        Some((start, page - start))
+    }
+
     fn bytes(&self) -> &[u8] {
         if self.grown.is_null() {
             &self.bits
@@ -388,6 +428,44 @@ mod tests {
                 assert_eq!(space.longest(state), longest, "round {round} {state:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_runs_by_words_are_the_runs_by_pages_in_a_big_room_with_eighty_places() {
+        let mut bits = vec![0u8; MAX_BITS_BYTES];
+        let mut space = Space::new(BASE);
+        // SAFETY: `bits` is zeros, lives as long as the room and is used by no one else.
+        unsafe { space.extend(bits.as_mut_ptr()) };
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        for _ in 0..80 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let page = seed as usize % (ROOM_MAX - 3000);
+            let length = 1 + (seed >> 40) as usize % 2500;
+            space.set(BASE + page * PAGE, length, State::Free);
+        }
+        let mut words = Vec::new();
+        let mut from = 0;
+        while let Some((start, length)) = space.next_run(from, State::Free) {
+            words.push((start, length));
+            from = start + length;
+        }
+        let mut pages = Vec::new();
+        let mut page = 0;
+        while page < ROOM_MAX {
+            if space.get(BASE + page * PAGE) == Some(State::Free) {
+                let start = page;
+                while page < ROOM_MAX && space.get(BASE + page * PAGE) == Some(State::Free) {
+                    page += 1;
+                }
+                pages.push((start, page - start));
+            } else {
+                page += 1;
+            }
+        }
+        assert_eq!(words, pages);
+        assert!(!words.is_empty() && words.len() <= 80);
     }
 
     #[test]
