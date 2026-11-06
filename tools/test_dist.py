@@ -163,6 +163,15 @@ class Pack(unittest.TestCase):
                 self.assertEqual(tar.getmember(f"{top}/run.sh").mode & 0o111, 0o111)
                 self.assertEqual(tar.extractfile(f"{top}/LICENSES/INDEX.txt").read().decode(), f"{flavour}\n")
 
+    def test_the_readme_tells_a_pre_release_from_a_release(self):
+        self.assertIn("may not exist yet", dist.release_words("0.3.0-pre.1")[1])
+        self.assertNotIn("pre-release", " ".join(dist.release_words("0.3.0")))
+        self.assertIn("packages/0.3/aarch64", dist.release_words("0.3.0")[1])
+        self.pack()
+        with tarfile.open(self.out / "stafeto-1.2.3-aarch64-virt-base.tar.xz") as tar:
+            text = tar.extractfile("stafeto-1.2.3-aarch64-virt-base/README.md").read().decode()
+        self.assertIn("Series 1.2:", text)
+
     def test_the_sbom_pins_the_signed_package(self):
         self.pack()
         sbom = json.loads((self.out / "stafeto-1.2.3-sbom.spdx.json").read_text())

@@ -1,8 +1,8 @@
 # stafeto @VERSION@ for QEMU (aarch64, `virt` machine): @FLAVOUR@
 
-A pre-release of stafeto: a POSIX system on its own capability microkernel,
-written in Rust for AArch64. This archive boots the kernel in QEMU to a
-BusyBox `ash` shell with a screen, a keyboard, the network and a disk.
+@RELEASE@ A POSIX system on its own capability microkernel, written in Rust
+for AArch64. This archive boots the kernel in QEMU to a BusyBox `ash` shell
+with a screen, a keyboard, the network and a disk.
 
 @ABOUT@
 
@@ -45,9 +45,9 @@ sources of the GPL packages with our build scripts and patches, an SBOM
 
 ## Limits
 
-- A pre-release: the interfaces and the image layout can change before the
-  next minor version.
-- One user shell on the serial console.
+- @LIMIT@
+- The shell talks on the console of this terminal; the window of QEMU shows the
+  screen and takes the keyboard.
 
 ## Licences
 

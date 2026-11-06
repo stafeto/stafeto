@@ -280,6 +280,20 @@ FLAVOURS = {
 }
 
 
+def release_words(version: str) -> tuple[str, str]:
+    """What the README says of the release: a version with a suffix is a
+    pre-release, whose series may have no repository of packages yet."""
+    series = ".".join(version.split(".")[:2])
+    if "-" in version:
+        return (f"A pre-release of stafeto {version}.",
+                f"A pre-release: the interfaces and the image layout can change, and the repository of the "
+                f"series {series} (https://stafeto.github.io/packages/{series}/aarch64) may not exist yet, "
+                "so `pkg install` can say that it cannot reach it.")
+    return (f"stafeto {version}.",
+            f"Series {series}: the packages of the series run on every system of the series, and `pkg` "
+            f"takes them from https://stafeto.github.io/packages/{series}/aarch64.")
+
+
 def index_entries(index: Path) -> dict[str, tuple[str, str]]:
     """The entries of an INDEX text: package name to the last part of its
     `file` and its `sha256`."""
@@ -342,6 +356,7 @@ def pack(args: argparse.Namespace) -> None:
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
     images = {"base": args.base_image, "full": args.full_image}
+    release = release_words(version)
     for flavour, (image_name, memory, about) in FLAVOURS.items():
         run = work / f"stafeto-{version}-aarch64-virt-{flavour}"
         run.mkdir()
@@ -352,7 +367,7 @@ def pack(args: argparse.Namespace) -> None:
         (run / "run.sh").chmod(0o755)
         (run / "README.md").write_text(fill(
             (HERE / "dist" / "README.md").read_text(), version=version, flavour=flavour,
-            image=image_name, memory=memory, about=about))
+            image=image_name, memory=memory, about=about, release=release[0], limit=release[1]))
         shutil.copytree(staged / flavour / "LICENSES", run / "LICENSES")
         write_tar_xz(out / f"{run.name}.tar.xz", run)
     for name in (f"stafeto-{version}-kernel.tar.xz", f"stafeto-{version}-gpl-sources.tar.xz"):
