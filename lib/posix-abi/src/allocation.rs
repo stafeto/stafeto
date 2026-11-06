@@ -303,12 +303,13 @@ pub unsafe fn after_fork(
             object.wait_key,
         );
     }
-    // The parent's display piece and network buffer piece are no mappings
+    // The parent's display piece, network buffer piece and file buffer piece are no mappings
     // of the child's: their pages of the room are free again.
     let display = state.map.display_piece();
     let network = state.map.kind_piece(posix_map::Kind::NetBuffer);
+    let files = state.map.kind_piece(posix_map::Kind::FileBuffer);
     state.map.forget();
-    for (address, pages) in [display, network].into_iter().flatten() {
+    for (address, pages) in [display, network, files].into_iter().flatten() {
         state.space.set(address, pages, Page::Unbacked);
     }
     let mut last = None;

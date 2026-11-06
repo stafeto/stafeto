@@ -768,6 +768,22 @@ impl Transport {
         self.files().read_at(fd, offset, out).map_err(FsError::from)
     }
 
+    /// READ_FD_INTO (READ_AT_FD_INTO with `offset`) of the service's description `fd`: up to
+    /// `count` bytes, `proto_fs::READ_PORTION` at most, into `memory` from `place`, one step of
+    /// the service (see `rt::fs::Files::read_into`).
+    pub fn read_into(
+        &self,
+        fd: u32,
+        offset: Option<u64>,
+        count: usize,
+        memory: &Handle<rt::handle::Memory>,
+        place: u64,
+    ) -> Result<usize, FsError> {
+        self.files()
+            .read_into(fd, offset, count, memory, place)
+            .map_err(FsError::from)
+    }
+
     /// pwrite of the service's description `fd`.
     pub fn write_at(&self, fd: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
         self.files()

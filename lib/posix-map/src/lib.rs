@@ -11,14 +11,15 @@
 //! range across several pieces is walked one piece at a time, as the
 //! kernel's calls take a range inside one entry. `Space` records what each
 //! page of the layer's room is for. No device window is ever in the map: a
-//! POSIX process has no device resource. Two pieces are the layer's own and
+//! POSIX process has no device resource. Three pieces are the layer's own and
 //! of a kind of their own (`Kind`): the buffer of the screen, the *display
-//! piece* (spec 3, 7.3), a DMA object, and the process's shared buffer with
-//! the network service, the *network buffer piece*; the pieces of a claimed
-//! network device (`Kind::Fast`) are of a kind of their own as well. `fork` copies neither
-//! into the child (`Map::inherited` leaves them out, so the child has a hole
-//! there), `munmap` and `mprotect` refuse both (`Refused::Special`, EINVAL),
-//! and only `unmap_kind` takes one out. The handle type is a parameter, so
+//! piece* (spec 3, 7.3), a DMA object, the process's shared buffer with
+//! the network service, the *network buffer piece*, and the buffer through
+//! which the file service fills the large reads, the *file buffer piece*; the
+//! pieces of a claimed network device (`Kind::Fast`) are of a kind of their own as well.
+//! `fork` copies none of them into the child (`Map::inherited` leaves them out, so the
+//! child has a hole there), `munmap` and `mprotect` refuse them (`Refused::Special`,
+//! EINVAL), and only `unmap_kind` takes one out. The handle type is a parameter, so
 //! that the host tests use plain numbers.
 
 #![cfg_attr(not(test), no_std)]
@@ -236,6 +237,9 @@ pub enum Kind {
     Display,
     /// The shared buffer of the process with the network service.
     NetBuffer,
+    /// The buffer of the large reads of files: the memory object the file service fills in
+    /// one step of a read (`READ_FD_INTO`), writable, never shared with a child.
+    FileBuffer,
     /// The window, the objects and the bypass ring of the second network
     /// device that the process claimed (spec 6, 3.9): several pieces, which
     /// stay until the process ends; `fork` and `exec` are refused while
@@ -253,8 +257,8 @@ pub enum Refused {
     Malformed,
     /// The range meets a piece the map holds.
     Overlap,
-    /// The range meets the display piece or the network buffer piece, which
-    /// only `unmap_kind` changes.
+    /// The range meets the display piece, the network buffer piece or the file buffer
+    /// piece, which only `unmap_kind` changes.
     Special,
 }
 
@@ -485,22 +489,22 @@ impl<H> Map<H> {
         at == address.saturating_add(pages.saturating_mul(PAGE))
     }
 
-    /// Whether some page of the range lies in the display piece or in the
-    /// network buffer piece.
+    /// Whether some page of the range lies in a piece of the layer's own (the display, network
+    /// buffer or file buffer piece).
     pub fn meets_special(&self, address: usize, pages: usize) -> bool {
         self.walk(address, pages)
             .any(|(i, ..)| self.object(self.piece(i).object()).special())
     }
 
-    /// The pieces a forked child gets: all but the display piece and the
-    /// network buffer piece.
+    /// The pieces a forked child gets: all but the layer's own (the display piece, the network
+    /// buffer piece and the file buffer piece).
     pub fn inherited(&self) -> impl Iterator<Item = &Piece> {
         self.iter()
             .filter(|piece| !self.object(piece.object()).special())
     }
 
-    /// The first address and the pages of the piece of `kind` (Display or
-    /// NetBuffer), when the map has one.
+    /// The first address and the pages of the piece of `kind` (Display, NetBuffer or
+    /// FileBuffer), when the map has one.
     pub fn kind_piece(&self, kind: Kind) -> Option<(usize, usize)> {
         self.iter()
             .find(|piece| self.object(piece.object()).kind == kind)
@@ -1036,6 +1040,37 @@ mod tests {
         // A range that ends inside the hole frees what lies below its end.
         assert_eq!(run(&mut make(), 0x1C000, 2), (vec![(0x1D000, 1)], 2));
         assert_eq!(run(&mut make(), 0x1E000, 1), (vec![(0x1D000, 2)], 1));
+    }
+
+    /// The file buffer piece (the cells of the large reads of files) follows the same rule, and
+    /// stands for neither the network buffer piece nor the display piece.
+    #[test]
+    fn the_file_buffer_piece_follows_the_rule_of_the_network_buffer_piece() {
+        let mut map = with_screen();
+        let mut object = Object::new(9, false, None);
+        object.kind = Kind::FileBuffer;
+        map.push(0x4800_0000, 16, Access::ReadWrite, 0, object)
+            .unwrap();
+        let child: Vec<usize> = map.inherited().map(|p| p.address).collect();
+        assert_eq!(child, [0x1000_0000, 0x3000_0000]);
+        assert_eq!(map.kind_piece(Kind::FileBuffer), Some((0x4800_0000, 16)));
+        assert_eq!(map.kind_piece(Kind::NetBuffer), None);
+        assert!(
+            map.object(map.piece(map.find(0x4800_0000).unwrap()).object())
+                .special()
+        );
+        let at = map.find(0x4800_0000).unwrap();
+        assert_eq!(map.unmap(at, 0x4800_0000, 16), Err(Refused::Special));
+        assert_eq!(
+            map.protect(at, 0x4800_0000, 16, Access::Read),
+            Err(Refused::Special)
+        );
+        let (address, pages, object) = map.unmap_kind(Kind::FileBuffer).unwrap();
+        assert_eq!(
+            (address, pages, object.handle, object.kind),
+            (0x4800_0000, 16, 9, Kind::FileBuffer)
+        );
+        assert!(map.unmap_kind(Kind::FileBuffer).is_none());
     }
 
     /// The network buffer piece is kept from a forked child, refused by

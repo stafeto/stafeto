@@ -1031,6 +1031,105 @@ static int usage_split(void) {
     return 0;
 }
 
+/* Reads of more than one message of the file service (1,016 bytes) go in portions of up to
+ * 12 KiB, one step of the service each: the bytes against the pattern written, the position
+ * and the end of the file, an appending writer beside, and the atomicity of XSH 2.9.7: a read
+ * of a portion sees a write of a message whole or not at all. */
+#define LARGE_SIZE 40000
+static unsigned char large_byte(size_t i) { return (unsigned char)((i * 7 + (i >> 8)) & 0xff); }
+
+static int large_same(const unsigned char *bytes, size_t at, size_t count) {
+    for (size_t i = 0; i < count; i++) if (bytes[i] != large_byte(at + i)) return 0;
+    return 1;
+}
+
+struct torn_context { int fd; volatile int stop; volatile int failure; };
+
+/* A write of 1,000 bytes at 504 is one message; its bytes cross the 1,016 of the old cut. */
+static void *torn_writer(void *argument) {
+    struct torn_context *context = argument;
+    unsigned char block[1000];
+    for (unsigned int round = 0; !__atomic_load_n(&context->stop, __ATOMIC_ACQUIRE) && round < 20000; round++) {
+        memset(block, (int)('a' + round % 26), sizeof block);
+        if (pwrite(context->fd, block, sizeof block, 504) != (ssize_t)sizeof block) {
+            context->failure = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
+static int torn_region(const unsigned char *bytes) {
+    for (size_t i = 505; i < 1504; i++) if (bytes[i] != bytes[504]) return 1;
+    return 0;
+}
+
+static int large_reads(void) {
+    static unsigned char pattern[LARGE_SIZE], buffer[LARGE_SIZE + 4096];
+    for (size_t i = 0; i < LARGE_SIZE; i++) pattern[i] = large_byte(i);
+    int fd = open("/tmp/large", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 400;
+    size_t done = 0;
+    while (done < LARGE_SIZE) {
+        ssize_t n = write(fd, pattern + done, LARGE_SIZE - done);
+        if (n <= 0) return 401;
+        done += (size_t)n;
+    }
+    if (lseek(fd, 0, SEEK_CUR) != LARGE_SIZE || lseek(fd, 0, SEEK_SET) != 0) return 402;
+    /* read: a portion and a few, each filled whole unless the file ends. */
+    if (read(fd, buffer, 1017) != 1017 || !large_same(buffer, 0, 1017)) return 403;
+    if (read(fd, buffer, 5000) != 5000 || !large_same(buffer, 1017, 5000)) return 404;
+    if (lseek(fd, 0, SEEK_CUR) != 6017) return 405;
+    if (read(fd, buffer, 12288) != 12288 || !large_same(buffer, 6017, 12288)) return 406;
+    if (read(fd, buffer, 12289) != 12289 || !large_same(buffer, 18305, 12289)) return 407;
+    size_t at = 30594;
+    if (read(fd, buffer, 20000) != (ssize_t)(LARGE_SIZE - at) || !large_same(buffer, at, LARGE_SIZE - at)) return 408;
+    if (read(fd, buffer, 20000) != 0 || read(fd, buffer, 1017) != 0 || lseek(fd, 0, SEEK_CUR) != LARGE_SIZE) return 409;
+    /* pread: the position stays; the rest is short at the end; nothing at or past it. */
+    if (pread(fd, buffer, 1017, 1) != 1017 || !large_same(buffer, 1, 1017)) return 410;
+    if (pread(fd, buffer, 12289, 100) != 12289 || !large_same(buffer, 100, 12289)) return 411;
+    if (pread(fd, buffer, LARGE_SIZE, 0) != LARGE_SIZE || !large_same(buffer, 0, LARGE_SIZE)) return 412;
+    if (pread(fd, buffer, LARGE_SIZE + 4096, 100) != LARGE_SIZE - 100 || !large_same(buffer, 100, LARGE_SIZE - 100)) return 413;
+    if (pread(fd, buffer, 3000, LARGE_SIZE - 10) != 10 || !large_same(buffer, LARGE_SIZE - 10, 10)) return 414;
+    if (pread(fd, buffer, 3000, LARGE_SIZE) != 0 || pread(fd, buffer, 3000, LARGE_SIZE + 5) != 0) return 415;
+    if (lseek(fd, 0, SEEK_CUR) != LARGE_SIZE) return 416;
+    /* An appending writer beside: the size grows and the reader sees the new end. */
+    int appender = open("/tmp/large", O_WRONLY | O_APPEND);
+    if (appender < 0) return 417;
+    unsigned char more[100];
+    memset(more, 'Z', sizeof more);
+    if (write(appender, more, sizeof more) != (ssize_t)sizeof more) return 418;
+    if (pread(fd, buffer, 3000, LARGE_SIZE - 10) != 110 || !large_same(buffer, LARGE_SIZE - 10, 10)
+            || buffer[10] != 'Z' || buffer[109] != 'Z') return 419;
+    if (lseek(fd, LARGE_SIZE - 10, SEEK_SET) != LARGE_SIZE - 10 || read(fd, buffer, 3000) != 110) return 420;
+    if (close(appender)) return 421;
+    /* Reads of the portion never see half of a message. The writer rewrites 1,000 bytes at
+     * 504 with one letter after another while this thread reads 4,096 and 12,288 bytes by
+     * pread and by read. */
+    struct torn_context context = { .fd = fd };
+    int reader = open("/tmp/large", O_RDONLY);
+    if (reader < 0) return 422;
+    unsigned char first[1000];
+    memset(first, 'a', sizeof first);
+    if (pwrite(fd, first, sizeof first, 504) != (ssize_t)sizeof first) return 428;
+    pthread_t writer;
+    if (pthread_create(&writer, NULL, torn_writer, &context)) return 423;
+    int torn = 0;
+    for (unsigned int round = 0; round < 3000 && !torn && !context.failure; round++) {
+        size_t count = (round & 1) ? 12288 : 4096;
+        if (pread(reader, buffer, count, 0) != (ssize_t)count) { torn = 2; break; }
+        if (torn_region(buffer)) { torn = 1; break; }
+        if (lseek(reader, 0, SEEK_SET) != 0 || read(reader, buffer, count) != (ssize_t)count) { torn = 2; break; }
+        if (torn_region(buffer)) torn = 1;
+    }
+    __atomic_store_n(&context.stop, 1, __ATOMIC_RELEASE);
+    if (pthread_join(writer, NULL) || context.failure) return 424;
+    if (torn == 2) return 425;
+    if (torn) return 426;
+    if (close(reader) || close(fd) || unlink("/tmp/large")) return 427;
+    return 0;
+}
+
 static int probe(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -1114,6 +1213,8 @@ static int probe(int argc, char **argv) {
     if (split_result) return split_result;
     int usage_result = usage_split();
     if (usage_result) return usage_result;
+    int large_result = large_reads();
+    if (large_result) return large_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

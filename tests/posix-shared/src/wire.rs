@@ -79,12 +79,28 @@ pub fn payload() -> bool {
         return fail(68);
     }
     let mut copy = [0; 1024];
-    if abi::read(fd, &mut copy) != Ok(MAX_READ)
+    if abi::read(fd, &mut copy[..MAX_READ]) != Ok(MAX_READ)
         || abi::read(fd, &mut copy[MAX_READ..]) != Ok(copy.len() - MAX_READ)
         || copy != bytes
-        || abi::close(fd).is_err()
     {
         return fail(69);
+    }
+    // A read of more than one message goes through the buffer of the large reads when it has a
+    // cell and by two messages when it has none: all the bytes come back either way.
+    let mut again = [0; 1024];
+    if abi::lseek(fd, 0, SEEK_SET) != Ok(0) {
+        return fail(72);
+    }
+    let first = abi::read(fd, &mut again);
+    if !matches!(first, Ok(n) if n == again.len() || n == MAX_READ) {
+        return fail(72);
+    }
+    let first = first.unwrap_or(0);
+    if abi::read(fd, &mut again[first..]) != Ok(again.len() - first)
+        || again != bytes
+        || abi::close(fd).is_err()
+    {
+        return fail(73);
     }
     rt::println!("posix-message-probe: full request and reply payloads preserved");
     true

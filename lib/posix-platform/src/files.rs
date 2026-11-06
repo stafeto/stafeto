@@ -284,21 +284,33 @@ pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offs
     unsafe { read_at(Place::Fd(fd), buf, len, offset) }
 }
 
+/// Whether a read of a file that asked for `size` bytes and got `got` stopped at a portion
+/// or a message and not at the end of the file: more is read after it.
+pub(crate) fn full_portion(got: isize, size: usize) -> bool {
+    size > posix_request::MAX_READ
+        && (got == posix_request::MAX_READ as isize || got == proto_fs::READ_PORTION as isize)
+}
+
 /// # Safety
 /// `buf` is writable for `len` bytes.
 pub(crate) unsafe fn read_at(place: Place, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    // One message of the service holds MAX_READ bytes; a longer read gets
-    // the rest after it, up to the end of the file.
+    // A read of more than one message goes in portions of up to READ_PORTION bytes, one step of
+    // the service each (through the buffer of the large reads), or by messages of MAX_READ
+    // bytes when it has no cell; a longer read gets the rest after a full portion or message,
+    // up to the end of the file.
     let mut done = 0;
     loop {
         let size = out.len() - done;
         let at = offset.saturating_add(done as i64);
         let rest = &mut out[done..];
-        let got = at_offset(place, at, |files, fd, at| files.read_at(fd, at, rest));
-        if got == posix_request::MAX_READ as isize && size > posix_request::MAX_READ {
-            done += posix_request::MAX_READ;
+        let got = at_offset(place, at, |files, fd, at| {
+            posix_abi::pread_file_large(&files, fd, at, rest)
+                .unwrap_or_else(|| files.read_at(fd, at, rest))
+        });
+        if full_portion(got, size) {
+            done += got as usize;
             continue;
         }
         return if got < 0 && done > 0 {

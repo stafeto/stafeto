@@ -49,8 +49,8 @@ const BASE_METHODS: &[u16] = proto_fs::METHODS;
 const BASE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb, 0xfffc,
-    0xfffd, 0xfffe,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68, 0xfff7, 0xfff8, 0xfff9, 0xfffa, 0xfffb,
+    0xfffc, 0xfffd, 0xfffe,
 ];
 #[cfg(not(any(
     feature = "steps",
@@ -1633,6 +1633,78 @@ impl Fs {
     }
 }
 
+impl Fs {
+    /// READ_FD_INTO and READ_AT_FD_INTO of an ordinary session: up to `READ_PORTION` bytes of
+    /// the file of `fd` into the object of the request from its place, through the window INTO
+    /// of the service's own space, mapped for the copy alone. The read is the one of READ or
+    /// READ_AT, a step of the service, so what it returns is one state of the file.
+    fn read_portion(&mut self, s: &mut Session<Fds, 0>, r: &mut Request<'_>) -> Answer {
+        let at_offset = r.method() == Method::ReadAtFdInto as u16;
+        let mut body = r.body();
+        let Ok(fd) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        let offset = if at_offset {
+            let Ok(offset) = body.u64() else {
+                return Answer::Status(Status::BadSize);
+            };
+            Some(offset)
+        } else {
+            None
+        };
+        let (Ok(count), Ok(place)) = (body.u32(), body.u64()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE;
+        let writable = matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Memory, got)) if got.contains(rights));
+        let handles = r.handles.len();
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(memory) = r.handles.take::<Memory>(0) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let size = sys::memory_info(&memory).map_or(0, |i| i.size);
+        let count = count as usize;
+        if !ramfs::read_portion_valid(count, place, handles, writable, size) {
+            return Answer::Status(Status::BadSize);
+        }
+        // The statistics put every method from 64 on in the kind 63: the detail of the longest
+        // step says whether it was a read through an object (1 READ_FD_INTO or 2
+        // READ_AT_FD_INTO, then the count).
+        #[cfg(feature = "steps")]
+        rt::service::step_detail((1 + u64::from(at_offset)) << 32 | count as u64);
+        let now = self.time_source.now();
+        if count == 0 {
+            let read = match offset {
+                Some(offset) => self.ram.pread(&s.data, fd, offset, &mut [], now),
+                None => self.ram.read_at(&mut s.data, fd, &mut [], now),
+            };
+            return match read {
+                Ok(n) => value(r, n as u32),
+                Err(code) => status(code),
+            };
+        }
+        let len = (count as u64).next_multiple_of(4096);
+        if let Err(e) = sys::mem_map(&self.process, &memory, place, len, INTO, Access::ReadWrite) {
+            return Answer::Status(Status::Kernel(e));
+        }
+        // SAFETY: the window maps `len` bytes of the object, which only this step touches
+        // until the unmap below.
+        let out = unsafe { core::slice::from_raw_parts_mut(INTO as *mut u8, count) };
+        let read = match offset {
+            Some(offset) => self.ram.pread(&s.data, fd, offset, out, now),
+            None => self.ram.read_at(&mut s.data, fd, out, now),
+        };
+        // SAFETY: the mapping made above, which nothing uses now.
+        let _ = unsafe { sys::mem_unmap(&self.process, INTO, len) };
+        match read {
+            Ok(n) => value(r, n as u32),
+            Err(code) => status(code),
+        }
+    }
+}
+
 fn layer_reply(r: &mut Request<'_>, reply: LayerReply) -> Answer {
     if reply.write(r.reply()).is_err() {
         return Answer::Status(Status::BadSize);
@@ -3090,6 +3162,7 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::ReadFdInto | Method::ReadAtFdInto) => self.read_portion(s, r),
             Some(Method::Write) => {
                 if let Err(code) = self.authenticate(&mut s.data, r.label()) {
                     return status(code);

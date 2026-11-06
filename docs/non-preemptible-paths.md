@@ -797,6 +797,17 @@ place on a page boundary, one memory object with `MAP_READ` and `MAP_WRITE`,
 room in the object) are `ramfs::read_into_valid`, with a host test that
 fails when any check goes.
 
+A `read` or `pread` of an ordinary session for more than one message goes the same way
+(READ_FD_INTO and READ_AT_FD_INTO, `proto_fs::READ_PORTION` = 12 KiB at most): the service maps
+the caller's object, makes the read of READ or READ_AT into it in one step, and unmaps it. The
+copy takes about 550 ticks a KiB, so 12 KiB is the portion: a larger one passes 0.9 B (18,369
+ticks) with the fixed part of the step. A read of up to the portion is one step, hence atomic
+against the writes of other processes (XSH 2.9.7); a longer read goes in portions, and a read that
+finds no cell of the layer's buffer goes by messages of 1,016 bytes and is not atomic. The
+statistics of `process-steps` count the methods from 64 on in the kind 63; the detail of its
+row says whether the longest step was a read through an object. The checks of the arguments are
+`ramfs::read_portion_valid`, with a host test.
+
 ### The entropy service
 
 It runs at level 36, below the services at 40, and its CLONE walks the

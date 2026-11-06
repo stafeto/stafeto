@@ -12,8 +12,10 @@ use proto_fs::{
     ACCESS_DENIED, BAD_FD, INVALID_ARGUMENT, NO_ENTRY, READ_ONLY, READ_WRITE, WRITE_ONLY,
 };
 use proto_wire::Status;
+use rt::abi::{Access, Rights};
 use rt::fs::Files;
-use rt::handle::Resource;
+use rt::handle::{Process, Resource};
+use rt::sys;
 
 rt::entry!(main);
 
@@ -104,23 +106,30 @@ fn alias_clone_list(
     Ok(kept[0])
 }
 
+/// The start channel, the program's own process and the result of the initialization checks.
+type Parent = (
+    rt::Handle<rt::handle::Channel>,
+    rt::Handle<Process>,
+    Result<(), &'static str>,
+);
+
 // Startup capabilities stay live through initialization checks alone.
 #[inline(never)]
-fn probe_parent() -> Option<(rt::Handle<rt::handle::Channel>, Result<(), &'static str>)> {
+fn probe_parent() -> Option<Parent> {
     let mut start = rt::startup().ok()?;
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
     let result = check_initialization(&start.parent, &start.process)
         .and_then(|()| check_exact_imports(&start.parent, &start.process));
-    Some((start.parent, result))
+    Some((start.parent, start.process, result))
 }
 
 fn main(_: u64) -> u64 {
-    let Some((parent, initial)) = probe_parent() else {
+    let Some((parent, process, initial)) = probe_parent() else {
         return 1;
     };
-    let result = initial.and_then(|()| check(&parent));
+    let result = initial.and_then(|()| check(&parent, &process));
     match result {
         Ok(()) => {
             rt::println!("ramfs-probe: ok");
@@ -422,7 +431,10 @@ fn check_cancel_ack(files: &mut PosixFs) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+fn check(
+    parent: &rt::Handle<rt::handle::Channel>,
+    process: &rt::Handle<Process>,
+) -> Result<(), &'static str> {
     let fs = Files::connect(parent).map_err(|_| "connect")?;
     let mut name = [0; 32];
     if fs.read_dir("/", 2, &mut name) != Ok(Some((3, 1))) || &name[..3] != b"etc" {
@@ -490,10 +502,186 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     }
     fs.close(fd).map_err(|_| "close scratch")?;
     check_image(&fs)?;
+    check_read_into(&fs, process)?;
     check_posix(parent)?;
     check_seek(parent)?;
     check_duplicates(parent)?;
     check_descriptor_limit(parent)?;
+    Ok(())
+}
+
+/// Where the probe maps the object a READ_FD_INTO fills.
+const INTO_AT: usize = 0x10_5000_0000;
+/// The pages of that object: a few more than the portion.
+const INTO_PAGES: usize = proto_fs::READ_PORTION / 4096 + 3;
+
+/// READ_FD_INTO and READ_AT_FD_INTO of an ordinary session on the image file `/bin/ramfs-probe`
+/// (larger than a portion): the bytes against the same read by messages, the position of the
+/// description after each, the end of the file, the short rest, and each refusal of the
+/// arguments.
+fn check_read_into(fs: &Files, process: &rt::Handle<Process>) -> Result<(), &'static str> {
+    let portion = proto_fs::READ_PORTION;
+    let len = (INTO_PAGES * 4096) as u64;
+    let object = sys::mem_create(len).map_err(|_| "read-into object")?;
+    sys::mem_map(process, &object, 0, len, INTO_AT, Access::ReadWrite)
+        .map_err(|_| "map the read-into object")?;
+    // The service writes the bytes of the mapping during a call: they are read and written
+    // by volatile accesses.
+    let fill = |value: u8| {
+        for i in 0..len as usize {
+            // SAFETY: the mapping shows the object's `len` bytes at INTO_AT, writable.
+            unsafe { ((INTO_AT + i) as *mut u8).write_volatile(value) };
+        }
+    };
+    let byte = |i: usize| -> u8 {
+        // SAFETY: as above, readable.
+        unsafe { ((INTO_AT + i) as *const u8).read_volatile() }
+    };
+    let matches =
+        |from: usize, bytes: &[u8]| bytes.iter().enumerate().all(|(i, &b)| byte(from + i) == b);
+    let size = fs
+        .node_information("/bin/ramfs-probe")
+        .map_err(|_| "stat the file to read into")?
+        .size;
+    if size < 2 * portion as u64 + 5000 {
+        return Err("the file to read into is too short");
+    }
+    let fd = fs
+        .open("/bin/ramfs-probe", READ_ONLY)
+        .map_err(|_| "open the file to read into")?;
+    // The same bytes by messages of 1,000, the reference.
+    let reference = |at: u64, out: &mut [u8]| -> Result<(), &'static str> {
+        let mut done = 0;
+        while done < out.len() {
+            let want = (out.len() - done).min(1000);
+            let n = fs
+                .read_at(fd, at + done as u64, &mut out[done..done + want])
+                .map_err(|_| "reference read")?;
+            if n == 0 {
+                return Err("reference read ends early");
+            }
+            done += n;
+        }
+        Ok(())
+    };
+    // The whole portion at the head: READ_AT_FD_INTO and READ_FD_INTO agree with messages.
+    let mut expected = [0u8; 4096];
+    let mut at = 0u64;
+    let mut position = 0u64;
+    for (count, place) in [
+        (portion, 0u64),
+        (portion, 4096),
+        (1017, 8192),
+        (2 * 1016, 0),
+    ] {
+        fill(0xEE);
+        let got = fs
+            .read_into(fd, Some(at), count, &object, place)
+            .map_err(|_| "read-at into")?;
+        if got != count {
+            return Err("read-at into count");
+        }
+        let base = place as usize;
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(expected.len());
+            reference(at + done as u64, &mut expected[..n])?;
+            if !matches(base + done, &expected[..n]) {
+                return Err("read-at into bytes");
+            }
+            done += n;
+        }
+        // The bytes past the count in its last page are the service's to leave alone.
+        if (base + count..(base + count).next_multiple_of(4096)).any(|i| byte(i) != 0xEE) {
+            return Err("read-at into wrote past the count");
+        }
+        // READ_AT_FD_INTO left the position: READ_FD_INTO reads from where it was.
+        fill(0xEE);
+        let got = fs
+            .read_into(fd, None, count, &object, place)
+            .map_err(|_| "read into")?;
+        if got != count {
+            return Err("read into count");
+        }
+        let mut done = 0;
+        while done < count {
+            let n = (count - done).min(expected.len());
+            reference(position + done as u64, &mut expected[..n])?;
+            if !matches(base + done, &expected[..n]) {
+                return Err("read into bytes");
+            }
+            done += n;
+        }
+        position += count as u64;
+        at += 4000;
+    }
+    // The position after the reads by READ_FD_INTO is where READ continues.
+    let mut next = [0u8; 16];
+    if fs.read(fd, &mut next) != Ok(16) {
+        return Err("read after read into");
+    }
+    reference(position, &mut expected[..16])?;
+    if next != expected[..16] {
+        return Err("position after read into");
+    }
+    // Across the end: the short rest, then 0 at the end, past it and far past it.
+    let tail = 700u64;
+    let got = fs
+        .read_into(fd, Some(size - tail), portion, &object, 0)
+        .map_err(|_| "read into at the end")?;
+    if got != tail as usize {
+        return Err("the short rest");
+    }
+    reference(size - tail, &mut expected[..tail as usize])?;
+    if !matches(0, &expected[..tail as usize]) {
+        return Err("the short rest bytes");
+    }
+    if fs.read_into(fd, Some(size), portion, &object, 0) != Ok(0)
+        || fs.read_into(fd, Some(1 << 40), portion, &object, 0) != Ok(0)
+        || fs.read_into(fd, Some(0), 0, &object, 0) != Ok(0)
+    {
+        return Err("read into at and past the end");
+    }
+    fs.lseek(fd, size as u32 - 10)
+        .map_err(|_| "seek near the end")?;
+    if fs.read_into(fd, None, portion, &object, 0) != Ok(10)
+        || fs.read_into(fd, None, portion, &object, 0) != Ok(0)
+    {
+        return Err("read into at the end of the description");
+    }
+    // Refusals: each argument on its own.
+    let bad = |result: Result<usize, proto_wire::Status>| result == Err(Status::BadSize);
+    if !bad(fs.read_into(fd, Some(0), portion + 1, &object, 0))
+        || !bad(fs.read_into(fd, None, 100, &object, 100))
+        || !bad(fs.read_into(fd, Some(0), 4097, &object, len - 4096))
+        || !bad(fs.read_into(fd, Some(0), 100, &object, len))
+    {
+        return Err("read into refusals of the arguments");
+    }
+    let read_only = sys::handle_duplicate(&object, Rights::MAP_READ | Rights::TRANSFER)
+        .map_err(|_| "a read-only copy")?;
+    // The copy the layer sends carries MAP_WRITE from the object it has: a copy without it
+    // cannot be made, so the refusal is the caller's.
+    if fs.read_into(fd, Some(0), 100, &read_only, 0).is_ok() {
+        return Err("read into a read-only object");
+    }
+    if fs.read_into(99, Some(0), 100, &object, 0) != Err(Status::Unknown(BAD_FD))
+        || fs.read_into(99, None, 100, &object, 0) != Err(Status::Unknown(BAD_FD))
+    {
+        return Err("read into of a closed number");
+    }
+    // A file opened for writing alone cannot be read; a directory is no file to read.
+    let scratch = fs
+        .open("/tmp/probe", WRITE_ONLY)
+        .map_err(|_| "open scratch for writing")?;
+    if fs.read_into(scratch, None, 100, &object, 0) != Err(Status::Unknown(BAD_FD)) {
+        return Err("read into of a write-only description");
+    }
+    fs.close(scratch).map_err(|_| "close scratch")?;
+    fs.close(fd).map_err(|_| "close the file read into")?;
+    // SAFETY: the mapping made above, which nothing uses now.
+    unsafe { sys::mem_unmap(process, INTO_AT, len) }.map_err(|_| "unmap the read-into object")?;
+    rt::println!("ramfs-probe: read into ok");
     Ok(())
 }
 
