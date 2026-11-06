@@ -915,12 +915,11 @@ impl Driver<'_> {
         profile::count(Counter::StepRx);
         // Seen before the ring is looked at: frames the switch passes after
         // this tell the stack again.
-        switch::INNER
-            .stack_told
-            .store(false, core::sync::atomic::Ordering::Release);
+        switch::INNER.stack_awake();
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_rx = true;
+            switch::INNER.kick(false);
             return;
         }
         let began = split::now();
@@ -956,6 +955,7 @@ impl Driver<'_> {
         #[cfg(feature = "probe")]
         if self.hold {
             self.held_tx = true;
+            switch::INNER.kick(false);
             return;
         }
         let began = split::now();
@@ -1316,6 +1316,11 @@ impl Driver<'_> {
             self.net.counters.syn_stray,
             self.device.bad_sum,
             self.net.demux.probe_max
+        );
+        rt::println!(
+            "net: bells tx {} frames {}",
+            switch::INNER.bells_tx(),
+            tx.tx
         );
         let [first, all] = self.net.counters.buffers_used;
         if all != 0 {

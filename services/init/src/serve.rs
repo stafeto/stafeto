@@ -1211,7 +1211,9 @@ impl Init {
     /// service that has not registered; BAD_SIZE for bytes after the
     /// header; ACCESS_DENIED unless it brought one handle, a channel with
     /// SEND, NOTIFY, DUPLICATE and TRANSFER and without RECEIVE, whose copy
-    /// would keep the service's channel open after it ended (spec 13.4).
+    /// would keep the service's channel open after it ended (spec 13.4), or
+    /// two such channels when the record declares a thread for its first line
+    /// (`table::line_thread`): the second is where that line is bound.
     /// The reply names the windows and bindings of the record (`objects`);
     /// the service runs from then on, and the CONNECT requests that wait
     /// for it get their sessions.
@@ -1234,6 +1236,10 @@ impl Init {
         let Some(channel) = fits.then(|| r.handles.take::<Channel>(0).ok()).flatten() else {
             return refuse(Error::AccessDenied);
         };
+        // The second channel only for a record that declares it.
+        if r.handles.len() == 2 && !table::line_thread(record) {
+            return refuse(Error::AccessDenied);
+        }
         let bound = if r.handles.len() == 2 {
             match r.handles.take::<Channel>(1) {
                 Ok(bound) => Some(bound),
@@ -1316,29 +1322,24 @@ impl Init {
         // (table::binding_label): the kernel gives the interrupts of a
         // line the label of the handle it was bound through, and the service
         // tells its lines apart. The session goes right after; the binding
-        // keeps its label.
+        // keeps its label. The exception is the first line of a record that
+        // declares a thread for it (`table::binding_route`).
         for (i, b) in record.bindings.iter().enumerate() {
-            // The first binding of a service that brought a second channel
-            // goes through it, at the record's ceiling: the interrupts of
-            // the line reach a thread of that level on its own.
-            if let (0, Some(bound)) = (i, bound) {
-                let bound = sys::irq_bind(&self.resource, b.line, bound, record.ceiling, b.edge)?;
-                let only = sys::handle_duplicate(&bound, Rights::MANAGE | Rights::TRANSFER)?;
-                drop(bound);
-                let _ = handles.push(only.erase());
-                continue;
-            }
-            let session = match table::binding_label(record, i) {
-                Some(label) => Some(sys::handle_label(
-                    channel,
-                    Rights::NOTIFY,
-                    label,
-                    record.priority,
-                )?),
-                None => None,
-            };
-            let through = session.as_ref().unwrap_or(channel);
-            let bound = sys::irq_bind(&self.resource, b.line, through, record.priority, b.edge)?;
+            let (through, priority, session) =
+                match (table::binding_route(record, i, bound.is_some()), bound) {
+                    // The first line of a record that declares a thread for it
+                    // goes through the second channel, at the record's ceiling:
+                    // the interrupts reach a thread of that level on their own.
+                    (table::Through::Bound, Some(bound)) => (bound, record.ceiling, None),
+                    (table::Through::Labelled(label), _) => {
+                        let session =
+                            sys::handle_label(channel, Rights::NOTIFY, label, record.priority)?;
+                        (channel, record.priority, Some(session))
+                    }
+                    _ => (channel, record.priority, None),
+                };
+            let through = session.as_ref().unwrap_or(through);
+            let bound = sys::irq_bind(&self.resource, b.line, through, priority, b.edge)?;
             drop(session);
             let only = sys::handle_duplicate(&bound, Rights::MANAGE | Rights::TRANSFER)?;
             drop(bound);

@@ -87,6 +87,12 @@ pub const fn bell_due(limit: u32, pending: u32, waited: u32, more: bool) -> bool
 /// -icount, and the step is bound by 0.9 of term B (18 369).
 pub const SWITCH_RX: usize = 8;
 pub const SWITCH_TX: usize = 16;
+/// The buffers the stack gave back (of receiving, of sending) the switch
+/// takes in a step, each.
+pub const SWITCH_BACK: usize = 32;
+/// The buffers of receiving the stack gives back before it wakes the switch
+/// for them alone (with a frame to send or a held doorbell it wakes it anyway).
+pub const RX_BACK_LAZY: usize = 16;
 /// The frames of the wire the switch leaves for the stack at most: more
 /// stay in the queue of the device until the stack gave buffers back.
 pub const RX_AHEAD: usize = 32;
@@ -99,6 +105,18 @@ pub const TX_SHARE: usize = TX_BUFFERS;
 /// follows with steps (the stack's own queue rang after `BELL_TX`).
 pub const SWITCH_BELL: u32 = 32;
 const _: () = assert!(TX_SHARE <= TX_BUFFERS && RX_AHEAD <= RX_BUFFERS && SWITCH_RX <= RX_AHEAD);
+/// The longest step of the switch under -icount as its parts bound it: the
+/// rest of the step (the interrupt status, up to `SWITCH_TX` frames put in the
+/// queue, `RECLAIM_STEP` buffers taken back, up to `SWITCH_BACK` buffers of
+/// each kind given back, the doorbells) about 9 400 ticks as a worst case,
+/// and a frame of the wire taken off the queue about 210. Measured: 3 300
+/// ticks the longest in `posix-net steps` and `net-curl steps` (the rest
+/// before the cap of `SWITCH_BACK` reached 11 063). A step of the switch is
+/// no longer than the longest step of the stack (12 521, `RECLAIM_STEP`
+/// above) and so well under the bound of 18 369.
+pub const SWITCH_STEP_REST: usize = 9_400;
+pub const SWITCH_STEP_RX_FRAME: usize = 210;
+const _: () = assert!(SWITCH_STEP_REST + SWITCH_RX * SWITCH_STEP_RX_FRAME <= 12_521);
 
 /// The end of a run of steps for the interrupts of receiving: while steps
 /// follow (`continued`) the device is asked for none; at the end it is asked

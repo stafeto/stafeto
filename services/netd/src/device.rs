@@ -133,7 +133,7 @@ impl<const D: usize> RxRing<D> {
                 }
             }
             RxPort::Inner => {
-                let _ = switch::INNER.rx_back.push(u32::from(n));
+                switch::must(&switch::INNER.rx_back, u32::from(n));
             }
         }
     }
@@ -291,7 +291,7 @@ impl<const D: usize> TxRing<D> {
                 ring.book.release(n);
             }
             TxPort::Inner => {
-                let _ = switch::INNER.tx_back.push(u32::from(n));
+                switch::must(&switch::INNER.tx_back, u32::from(n));
             }
         }
     }
@@ -341,7 +341,7 @@ impl<const D: usize> TxRing<D> {
             // The ring holds as many words as there are buffers, and the
             // pool lent this one.
             TxPort::Inner => {
-                let _ = switch::INNER.tx_sub.push(pack(n, len as u16));
+                switch::must(&switch::INNER.tx_sub, pack(n, len as u16));
                 profile::count(Counter::FramesTx);
                 self.counters.tx += 1;
                 self.counters.dhcp += u64::from(dhcp);

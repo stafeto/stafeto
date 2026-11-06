@@ -511,6 +511,46 @@ fn frames(line: &str) -> Option<Frames> {
     })
 }
 
+/// The lines `net: bells tx B frames F`: the doorbells of the queue of
+/// sending against the frames sent. The switch rings once for a run of steps
+/// of the stack and for 32 frames at most, so a burst of replies rings
+/// less than once in a frame and a quarter; a service that rings for each
+/// frame (the breakage this check is for) rings once in one.
+const BELLS: &str = "net: bells tx ";
+/// Under this many frames a line says nothing (a few replies ring each).
+const BELLS_FROM: u64 = 1000;
+/// The most doorbells a burst may ring, in fifths of the frames: 4 of 5. The
+/// switch serves about two frames a bell in the burst of `net-curl` (about
+/// 0.53 bells a frame on QEMU), a service that rings for each frame, one.
+const BELLS_MOST: u64 = 4;
+
+/// The lines that carry at least `BELLS_FROM` frames, each judged; an error
+/// for a line that does not parse or rings too often. How many were judged.
+pub fn bells_serve_frames(lines: &[String]) -> Result<usize, String> {
+    let mut judged = 0;
+    for line in lines {
+        let Some(rest) = line.strip_prefix(BELLS) else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [bells, "frames", sent] = words.as_slice() else {
+            return Err(format!("a line of bells that does not parse: {line:?}"));
+        };
+        let (Ok(bells), Ok(sent)) = (bells.parse::<u64>(), sent.parse::<u64>()) else {
+            return Err(format!("a line of bells that does not parse: {line:?}"));
+        };
+        if sent >= BELLS_FROM {
+            judged += 1;
+            if bells * 5 > sent * BELLS_MOST {
+                return Err(format!(
+                    "the queue of sending rang {bells} times for {sent} frames: a bell serves too few frames (at most {BELLS_MOST} bells for 5 frames)"
+                ));
+            }
+        }
+    }
+    Ok(judged)
+}
+
 /// The lines the service prints when a SYN went to a queue other than the
 /// chosen one, and when a queue socket of a group member found no set free of
 /// other members' queue sockets: faults of the placing, and the run fails.
@@ -1935,6 +1975,20 @@ mod tests {
             lines.push("virtio-net: first interrupt".to_owned());
         }
         lines
+    }
+
+    #[test]
+    fn a_bell_for_each_frame_fails_the_run() {
+        let line = |b: u64, f: u64| format!("net: bells tx {b} frames {f}");
+        assert!(bells_serve_frames(&[line(300, 2304)]).is_ok());
+        assert!(bells_serve_frames(&[line(2304, 2304)]).is_err());
+        assert!(bells_serve_frames(&[line(1900, 2304)]).is_err());
+        assert!(
+            bells_serve_frames(&[line(4, 4)]).is_ok(),
+            "few frames say nothing"
+        );
+        assert!(bells_serve_frames(&["net: bells tx x frames 4".to_owned()]).is_err());
+        assert!(bells_serve_frames(&["net: frames rx 1".to_owned()]).is_ok());
     }
 
     #[test]

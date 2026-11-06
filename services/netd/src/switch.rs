@@ -16,8 +16,7 @@
 //!   length. The stack gives the buffer back in `rx_back` once it is done
 //!   with the frame, and the switch puts it in the queue.
 //! * `tx_supply`: the free buffers of sending the switch lends the stack
-//!   (`TX_SHARE` of the 256; the rest stay with the switch for its own
-//!   frames and for the stack that runs dry). The stack builds a frame in
+//!   (`TX_SHARE`, all 256 while the stack is the only consumer). The stack builds a frame in
 //!   one and passes it in `tx_sub`; the switch puts it in the queue, takes
 //!   the sent buffers back (`reclaim`, at most `RECLAIM_STEP` a step) and
 //!   lends them again. A buffer the stack did not send comes back in
@@ -27,10 +26,10 @@
 //! as there are buffers, so no push finds a ring full. The rules of the
 //! doorbells and of the interrupts are the stack's of the stage before the
 //! split (`ring::settle_interrupts`, `ring::bell_due`, `Stock`): the line
-//! stays closed and the device asks for no interrupt while steps follow, the
-//! doorbell of sending rings once for a run of steps of the stack
-//! (`Inner::stack_more`), and the queue is looked at once more after the
-//! interrupts are asked for again.
+//! stays closed and the device asks for no interrupt while the switch's own
+//! steps follow, the doorbell of sending rings once for a run of steps of
+//! the stack (`netd::gates::Run`), and the queue is looked at once more after
+//! the interrupts are asked for again.
 //!
 //! The wakes between the two threads are one notification each, told once
 //! until the other thread saw it (`stack_told`, `switch_told`): the switch
@@ -43,11 +42,13 @@ use crate::device::{DEVICE, Queue, fail};
 use crate::dma::{Host, net_at};
 use core::cell::{RefCell, UnsafeCell};
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use netd::frames::{self, RxFrame};
+use netd::gates::{Run, Told};
 use netd::profile::{self, Counter};
 use netd::ring::{
-    RECLAIM_STEP, RX_AHEAD, RX_BUFFERS, SWITCH_BELL, SWITCH_RX, SWITCH_TX, TX_SHARE, bell_due,
+    RECLAIM_STEP, RX_AHEAD, RX_BACK_LAZY, RX_BUFFERS, SWITCH_BACK, SWITCH_BELL, SWITCH_RX,
+    SWITCH_TX, TX_SHARE, bell_due,
 };
 use netd::spsc::{Spsc, pack, unpack};
 use rt::handle::{Channel, Interrupt, Process, Thread};
@@ -73,15 +74,13 @@ pub struct Inner {
     /// Stack to switch: a buffer of sending the stack did not use.
     pub tx_back: Spsc<256>,
     /// The switch told the stack of frames, and the stack has not looked.
-    pub stack_told: AtomicBool,
+    pub stack_told: Told,
     /// The stack told the switch, and the switch has not looked.
-    pub switch_told: AtomicBool,
+    pub switch_told: Told,
+    /// The stack's run of steps, and what the switch holds for its end.
+    pub run: Run,
     /// The stack found no buffer of sending free.
     starved: AtomicBool,
-    /// A doorbell of sending waits for the end of the stack's run.
-    held: AtomicBool,
-    /// Another step of the stack follows at once.
-    stack_more: AtomicBool,
     /// The channel of the stack and of the switch, raw, for NOTIFY.
     stack_channel: AtomicU64,
     switch_channel: AtomicU64,
@@ -90,6 +89,21 @@ pub struct Inner {
     dropped: AtomicU32,
     martian: AtomicU32,
     tx_dropped: AtomicU32,
+    /// Doorbells rung for the queue of sending (the probe's line checks that
+    /// a bell serves many frames).
+    bells_tx: AtomicU32,
+    /// Frames of sending the switch put in the queue.
+    frames_tx: AtomicU32,
+}
+
+/// Puts `word` in `ring`. Each ring holds as many words as there are
+/// buffers and every buffer is in one place, so a full ring says the books
+/// of the buffers are wrong: the service ends and init starts it again
+/// (a lost buffer would show only as a slower service hours later).
+pub fn must(ring: &Spsc<256>, word: u32) {
+    if !ring.push(word) {
+        fail("a ring between the threads is full");
+    }
 }
 
 impl Inner {
@@ -100,16 +114,17 @@ impl Inner {
             tx_sub: Spsc::new(),
             tx_supply: Spsc::new(),
             tx_back: Spsc::new(),
-            stack_told: AtomicBool::new(false),
-            switch_told: AtomicBool::new(false),
+            stack_told: Told::new(),
+            switch_told: Told::new(),
+            run: Run::new(),
             starved: AtomicBool::new(false),
-            held: AtomicBool::new(false),
-            stack_more: AtomicBool::new(false),
             stack_channel: AtomicU64::new(0),
             switch_channel: AtomicU64::new(0),
             dropped: AtomicU32::new(0),
             martian: AtomicU32::new(0),
             tx_dropped: AtomicU32::new(0),
+            bells_tx: AtomicU32::new(0),
+            frames_tx: AtomicU32::new(0),
         }
     }
 
@@ -119,6 +134,16 @@ impl Inner {
             u64::from(self.dropped.load(Ordering::Relaxed)),
             u64::from(self.martian.load(Ordering::Relaxed)),
         )
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn frames_tx(&self) -> u64 {
+        u64::from(self.frames_tx.load(Ordering::Relaxed))
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn bells_tx(&self) -> u64 {
+        u64::from(self.bells_tx.load(Ordering::Relaxed))
     }
 
     pub fn tx_dropped(&self) -> u64 {
@@ -131,7 +156,7 @@ impl Inner {
     pub fn supply_len(&self) -> usize {
         let len = self.tx_supply.len();
         if len == 0 {
-            self.starved.store(true, Ordering::Release);
+            self.starved.store(true, Ordering::SeqCst);
         }
         len
     }
@@ -140,7 +165,7 @@ impl Inner {
     pub fn take_supply(&self) -> Option<u16> {
         let taken = self.tx_supply.pop().map(|w| w as u16);
         if taken.is_none() {
-            self.starved.store(true, Ordering::Release);
+            self.starved.store(true, Ordering::SeqCst);
         }
         taken
     }
@@ -150,40 +175,52 @@ impl Inner {
         self.stack_channel.store(raw, Ordering::Release);
     }
 
-    /// The end of a step of the stack: `more` says another follows at
-    /// once. The switch is woken when the run is over (or the rings hold
-    /// a good deal) and a buffer, a frame or a doorbell waits for it.
+    /// The start of a step of the stack that the notification of the switch
+    /// brought (receiving, sending): the frames the switch passed are looked
+    /// at after this.
+    pub fn stack_awake(&self) {
+        self.stack_told.seen();
+    }
+
+    /// The end of a step of the stack: `more` says another follows at once.
+    /// The switch is woken when the run is over and a frame to send, a held
+    /// doorbell or a good deal of buffers waits for it, and inside a run when
+    /// the rings hold a good deal.
     pub fn kick(&self, more: bool) {
-        self.stack_more.store(more, Ordering::Release);
-        let starved = self.starved.load(Ordering::Acquire);
-        let work = !self.tx_sub.is_empty() || !self.rx_back.is_empty();
+        fence(Ordering::SeqCst);
+        let starved = self.starved.load(Ordering::SeqCst);
         let due = if more {
             self.tx_sub.len() >= SWITCH_TX / 2 || self.rx_back.len() >= RX_AHEAD || starved
         } else {
-            work || starved || self.held.load(Ordering::Acquire)
+            // One read-modify-write ends the run and reads what the switch
+            // held, so that neither misses the other.
+            let held = self.run.end();
+            // Buffers of receiving given back wait for the switch's next step
+            // (the queue has 256 of them), a frame to send does not.
+            held || !self.tx_sub.is_empty() || self.rx_back.len() >= RX_BACK_LAZY || starved
         };
-        if due {
-            self.wake_switch();
-        }
-    }
-
-    fn wake_switch(&self) {
-        if !self.switch_told.swap(true, Ordering::AcqRel) {
-            profile::count(Counter::Told);
+        if due && self.switch_told.tell() {
+            profile::count(Counter::WakeSwitch);
             let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
                 self.switch_channel.load(Ordering::Acquire),
             ));
             if sys::notify(&channel, 1).is_err() {
-                self.switch_told.store(false, Ordering::Release);
+                self.switch_told.failed();
             }
         }
     }
 
+    /// The switch wakes the stack with `bits` (RX or TX): a run of steps of
+    /// the stack follows, and the switch holds its doorbell until it ends.
     fn wake_stack(&self, bits: u64) {
+        self.run.begin();
+        profile::count(Counter::WakeStack);
         let channel = Handle::<Channel>::borrowed(rt::abi::Handle(
             self.stack_channel.load(Ordering::Acquire),
         ));
-        let _ = sys::notify(&channel, bits);
+        if sys::notify(&channel, bits).is_err() && bits == crate::RX {
+            self.stack_told.failed();
+        }
     }
 }
 
@@ -206,6 +243,9 @@ pub struct Switch {
     /// The longest step so far, in ticks of the thread's own time.
     #[cfg(feature = "steps")]
     longest: u64,
+    /// The multiples of 500 frames the probe's line said.
+    #[cfg(feature = "probe")]
+    said: u64,
 }
 
 impl Switch {
@@ -240,6 +280,8 @@ impl Switch {
             link,
             #[cfg(feature = "steps")]
             longest: 0,
+            #[cfg(feature = "probe")]
+            said: 0,
         };
         switch.lend();
         switch
@@ -252,7 +294,7 @@ impl Switch {
             let Some(n) = self.tx.book.alloc() else {
                 break;
             };
-            let _ = INNER.tx_supply.push(u32::from(n));
+            must(&INNER.tx_supply, u32::from(n));
         }
         !INNER.tx_supply.is_empty() && INNER.starved.swap(false, Ordering::AcqRel)
     }
@@ -274,7 +316,7 @@ impl Switch {
     /// follows at once (frames left in the queue with room for them, or
     /// frames of the stack left in its ring).
     fn step(&mut self, interrupt: bool) -> bool {
-        profile::count(Counter::StepRx);
+        profile::count(Counter::StepSwitch);
         if interrupt {
             self.line_closed = true;
             let began = profile::now();
@@ -289,12 +331,20 @@ impl Switch {
         }
         // What the stack passed: buffers of receiving, buffers of sending
         // it did not use, then its frames to send.
-        while let Some(word) = INNER.rx_back.pop() {
+        // At most `SWITCH_BACK` of each a step (the step is bound, and the
+        // rest makes the step follow at once).
+        for _ in 0..SWITCH_BACK {
+            let Some(word) = INNER.rx_back.pop() else {
+                break;
+            };
             if let Err(broken) = self.rx.give(word as u16) {
                 fail(broken.text(false));
             }
         }
-        while let Some(word) = INNER.tx_back.pop() {
+        for _ in 0..SWITCH_BACK {
+            let Some(word) = INNER.tx_back.pop() else {
+                break;
+            };
             self.tx.book.release(word as u16);
         }
         for _ in 0..SWITCH_TX {
@@ -303,7 +353,9 @@ impl Switch {
             };
             let (n, len) = unpack(word);
             match self.tx.submit(n, usize::from(len)) {
-                Ok(Sent::Queued) => {}
+                Ok(Sent::Queued) => {
+                    INNER.frames_tx.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(Sent::Dropped) => {
                     INNER.tx_dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -317,8 +369,7 @@ impl Switch {
         // The frames of the wire.
         let room = RX_AHEAD.saturating_sub(INNER.rx_ready.len());
         let passed = self.receive(room.min(SWITCH_RX));
-        if passed > 0 && !INNER.stack_told.swap(true, Ordering::AcqRel) {
-            profile::count(Counter::Told);
+        if passed > 0 && INNER.stack_told.tell() {
             INNER.wake_stack(crate::RX);
         }
         if lent {
@@ -332,26 +383,32 @@ impl Switch {
         // ends with the interrupts asked for again, a full barrier and one
         // more look at the queue, so that a frame that came between is not
         // left to wait (`ring::settle_interrupts`).
-        let continued = {
-            let queue = RefCell::new(&mut self.rx.queue);
-            netd::ring::settle_interrupts(
-                more_rx,
-                || room_left > 0,
-                |on| virtio_net::rings::notify_on(&mut queue.borrow_mut(), on),
-                || queue.borrow().can_pop(),
-            )
-        } || !INNER.tx_sub.is_empty();
-        if !continued && core::mem::take(&mut self.line_closed) {
-            let began = profile::now();
-            virtio_mmio::reopen(&self.irq);
-            profile::timed(
-                Counter::ReopenN,
-                Counter::ReopenTicks,
-                Counter::ReopenMax,
-                began,
-            );
+        let mut continued = more_rx
+            || !INNER.tx_sub.is_empty()
+            || !INNER.rx_back.is_empty()
+            || !INNER.tx_back.is_empty();
+        if !continued {
+            continued = {
+                let queue = RefCell::new(&mut self.rx.queue);
+                netd::ring::settle_interrupts(
+                    false,
+                    || room_left > 0,
+                    |on| virtio_net::rings::notify_on(&mut queue.borrow_mut(), on),
+                    || queue.borrow().can_pop(),
+                )
+            };
+            if !continued && core::mem::take(&mut self.line_closed) {
+                let began = profile::now();
+                virtio_mmio::reopen(&self.irq);
+                profile::timed(
+                    Counter::ReopenN,
+                    Counter::ReopenTicks,
+                    Counter::ReopenMax,
+                    began,
+                );
+            }
         }
-        self.doorbells(continued || INNER.stack_more.load(Ordering::Acquire));
+        self.doorbells(continued);
         continued
     }
 
@@ -374,7 +431,7 @@ impl Switch {
             let slice = unsafe { virtio_net::rings::buffer_at(self.rx.base(), n) };
             match frames::classify(slice, used) {
                 RxFrame::Frame(len) => {
-                    let _ = INNER.rx_ready.push(pack(n, len as u16));
+                    must(&INNER.rx_ready, pack(n, len as u16));
                     passed += 1;
                 }
                 // A frame of the loopback network on the wire never reaches
@@ -402,7 +459,8 @@ impl Switch {
     /// of steps: a ring is an exit from the guest and costs far more than
     /// the frame it announces (the rules are those of the stage before the
     /// split, with the batch of `SWITCH_BELL`).
-    fn doorbells(&mut self, more: bool) {
+    fn doorbells(&mut self, continued: bool) {
+        let more = continued;
         let rx = &mut self.rx;
         let wanted = virtio_net::rings::wants_ring(&rx.queue);
         if rx.stock.due(wanted) {
@@ -420,7 +478,14 @@ impl Switch {
         if tx.pending > 0 {
             tx.waited += 1;
         }
-        if bell_due(SWITCH_BELL, tx.pending, tx.waited, more) {
+        let more = more || INNER.run.busy();
+        let due = bell_due(SWITCH_BELL, tx.pending, tx.waited, more);
+        // Held for the end of the stack's run, which tells the switch; when
+        // the run is over meanwhile, it rings now.
+        let ring_now = due || (tx.pending > 0 && !continued && !INNER.run.hold());
+        if ring_now {
+            INNER.run.unhold();
+            INNER.bells_tx.fetch_add(1, Ordering::Relaxed);
             tx.rung();
             if virtio_net::rings::wants_ring(&tx.queue) {
                 let began = profile::now();
@@ -431,7 +496,6 @@ impl Switch {
                 profile::count(Counter::Skipped);
             }
         }
-        INNER.held.store(self.tx.pending > 0, Ordering::Release);
     }
 }
 
@@ -499,7 +563,7 @@ extern "C" fn run(_: u64) -> ! {
             Ok(sys::Received::Notification { source, .. }) => {
                 // Seen before the rings are looked at: a word pushed after
                 // that tells again.
-                INNER.switch_told.store(false, Ordering::Release);
+                INNER.switch_told.seen();
                 source == abi::Source::Interrupt
             }
             Ok(_) => continue,
@@ -527,6 +591,16 @@ extern "C" fn run(_: u64) -> ! {
             }
             if !more {
                 break;
+            }
+        }
+        // The probe's line, for the check that a doorbell serves many frames
+        // of a burst (xtask `net_probe::bells_serve_frames`): every 500 frames.
+        #[cfg(feature = "probe")]
+        {
+            let frames = INNER.frames_tx();
+            if frames / 500 > switch.said {
+                switch.said = frames / 500;
+                rt::println!("net: bells tx {} frames {frames}", INNER.bells_tx());
             }
         }
     }

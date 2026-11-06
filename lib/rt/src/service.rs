@@ -1108,8 +1108,10 @@ pub fn register(parent: &Handle<Channel>, channel: &Handle<Channel>) -> Result<R
 
 /// `register` with a second channel, `bound`, a thread of the service waits
 /// on: init binds the first interrupt line of the record through it (at the
-/// record's ceiling), so that the interrupts come to that thread and not to
-/// the loop of `channel`. The copy has the rights of the first.
+/// record's ceiling), so that the interrupts come to that thread directly.
+/// Only a record that declares it takes the second channel (init's
+/// `table::LINE_THREAD`; ACCESS_DENIED otherwise). The copy has the rights of
+/// the first.
 pub fn register_with(
     parent: &Handle<Channel>,
     channel: &Handle<Channel>,
