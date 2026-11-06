@@ -301,6 +301,10 @@ fn the_publication_runs_for_a_release_without_a_suffix_and_the_week_for_the_page
     // The weekly signature and the one of a release follow the signed copy of a release.
     assert!(text.contains("--releases releases.json --anchors anchors"));
     assert!(text.contains("resign --index copy/INDEX --anchor copy/INDEX"));
+    // A release is published only as the newest of its series, with the list judging its copy.
+    assert!(text.contains("--index-dir copy --push --releases releases.json"));
+    assert!(at("pages.py check-copy") < at("pages.py verify-storage"));
+    assert!(text.contains("--key \"$KEY\" --cert \"$CERT\" --strict"));
 }
 
 #[test]
@@ -349,4 +353,11 @@ fn the_owner_is_told_to_guard_the_tags_and_main_before_a_secret_goes_into_the_en
     };
     assert!(at("refs/tags/v*") < at("gh secret set RELEASE_SIGNING_KEY"));
     assert!(text.contains("\"type\": \"creation\"") && text.contains("refs/heads/main"));
+    // Merging into main is the owner's alone: both rulesets restrict updates and let the admin role
+    // bypass them, and the owner is asked to check that they are the only admin.
+    assert_eq!(text.matches("{\"type\": \"update\"}").count(), 2);
+    assert_eq!(text.matches("\"actor_id\": 5").count(), 2);
+    assert!(text.contains("collaborators?permission=admin"));
+    // The setting that keeps a published release as it is comes before the first secret too.
+    assert!(at("Immutable releases") < at("gh secret set RELEASE_SIGNING_KEY"));
 }

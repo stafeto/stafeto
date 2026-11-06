@@ -386,11 +386,11 @@ link programs (for a package with programs) and `build-depends <name>
   package file of the repository at `ADDRESS` (the pages of a published series) and checks them as a
   directory is checked, except for the source archives.
 - `cargo xtask repo resign --index F --anchor COPY --serial N --out D [--sig F.sig] [--expires-days D]
-  [--key K.key --cert K.cert] [--root R.pub] [--min-certificate-days N]` signs a published index
+  [--key K.key --cert K.cert] [--root R.pub] [--min-certificate-days N] [--strict]` signs a published index
   again: the roots of `keys/` (or the root of a probe) accept the signature of the index and of `COPY`, the
   signed index in the release of the series, whose records the index must have byte for byte (the
   time of a key revoked since does not matter there, an index laid into the pages is not signed);
-  the list judges the key that signs the new one; the serial may not go back; the certificate of the
+  the list judges the key that signs the new one, and with `--strict` the signatures of the index and of `COPY` too (the path that publishes a release); the serial may not go back; the certificate of the
   signing key has to last `--min-certificate-days` more; only `serial` and `expires` change and the
   records stay byte for byte (the new text is parsed again and its entries compared). The weekly job
   and the publication of a release run it through `tools/pages.py`.

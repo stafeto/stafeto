@@ -191,10 +191,12 @@ owner for the rulesets below.
 The environment `packages` lets in any run on a tag `v*` and on `main`, and anyone
 who may write to the repository can set a tag on a commit of their own branch with
 a changed `release.yml`. Before any secret goes into the environment the owner makes
-two rulesets: tags `v*` that only the owner may create, change or delete (the owner
-is the only actor that bypasses the rule), and `main` that takes changes through a
-pull request only, with no force push and no deletion. Replace `OWNER_ID` with the
-id of the owner (`gh api user --jq .id`); the role "repository admin" is `5`.
+two rulesets and, when GitHub offers it, one setting. The first ruleset covers the tags `v*`: only the owner may create, change or delete them. The second covers `main`: it takes changes through a pull request, forbids force pushes and deletion, and restricts updates to the owner (the rule `update`), so that only the owner, or the coordinator acting as the owner, merges. Without that rule anyone who may write merges their own pull request and starts a run on `main` with the secrets. Both rulesets let the repository role "admin" (id `5`) bypass them and nobody else. That role covers every administrator of the repository and every owner of the organization, so the owner confirms that they are the only one:
+
+    gh api 'repos/stafeto/stafeto/collaborators?permission=admin' --jq '.[].login'
+    gh api 'orgs/stafeto/members?role=admin' --jq '.[].login'
+
+The setting is "Immutable releases" (repository settings, General, Releases): the files of a published release can no longer be replaced. The signed copy of the index in a release is the anchor of the records of its series, and a holder of the right to write could swap it; turn the setting on before the first release is published. The serial check of `pages.py` (the next paragraph) stays when it is on.
 
     gh api -X POST repos/stafeto/stafeto/rulesets --input - <<'JSON'
     {"name": "release tags", "target": "tag", "enforcement": "active",
@@ -205,12 +207,14 @@ id of the owner (`gh api user --jq .id`); the role "repository admin" is `5`.
     gh api -X POST repos/stafeto/stafeto/rulesets --input - <<'JSON'
     {"name": "main", "target": "branch", "enforcement": "active",
      "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
-     "rules": [{"type": "pull_request", "parameters": {"required_approving_review_count": 0,
+     "rules": [{"type": "update"}, {"type": "non_fast_forward"}, {"type": "deletion"},
+       {"type": "pull_request", "parameters": {"required_approving_review_count": 0,
        "dismiss_stale_reviews_on_push": false, "require_code_owner_review": false,
-       "require_last_push_approval": false, "required_review_thread_resolution": false}},
-       {"type": "non_fast_forward"}, {"type": "deletion"}],
-     "bypass_actors": []}
+       "require_last_push_approval": false, "required_review_thread_resolution": false}}],
+     "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
     JSON
+
+What the publication checks whatever the settings are: the copy of the index of the release that is published follows the list of revocations of the tree, its series is the series of the tag, the tag is the newest release of that series, and the serial of the copy is above that of the copy of every other published release of the series. The weekly signature applies the serial and series checks to the copy it anchors on. A copy signed by a revoked key, swapped into the newest release while the setting is off, passes the weekly checks; that residue is the reason to turn the setting on.
 
 The agents that work on the repository push branches and open pull requests, and the
 coordinator creates tags only on the word of the owner. A leaked token of the owner's
