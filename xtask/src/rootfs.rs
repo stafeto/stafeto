@@ -1590,6 +1590,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-fifo-steps.img",
     "boot-posix-resources.img",
     "boot-posix-map.img",
+    "boot-posix-map-big.img",
     "boot-posix-so.img",
     "boot-posix-lock-ring.img",
     "boot-posix-shares.img",
@@ -1911,6 +1912,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         | "boot-posix-fifo-steps.img"
         | "boot-posix-resources.img"
         | "boot-posix-map.img"
+        | "boot-posix-map-big.img"
         | "boot-posix-lock-ring.img"
         | "boot-posix-shares.img" => procs(),
         "boot-posix-poll.img" => {
@@ -2342,6 +2344,7 @@ mod tests {
             "boot-posix-sync.img",
             "boot-posix-resources.img",
             "boot-posix-map.img",
+            "boot-posix-map-big.img",
             "boot-posix-so.img",
         ] {
             let files = files_of(image);
@@ -2664,6 +2667,7 @@ mod tests {
                 "boot-posix-sync.img" => &crate::POSIX_SYNC_PROGRAMS,
                 "boot-posix-resources.img" => &crate::POSIX_RESOURCES_PROGRAMS,
                 "boot-posix-map.img" => &crate::POSIX_MAP_PROGRAMS,
+                "boot-posix-map-big.img" => &crate::POSIX_MAP_BIG_PROGRAMS,
                 "boot-posix-so.img" => &crate::POSIX_SO_PROGRAMS,
                 "boot-posix-lock-ring.img" => &crate::POSIX_LOCK_RING_PROGRAMS,
                 "boot-posix-shares.img" => &crate::POSIX_SHARES_PROGRAMS,
@@ -2778,6 +2782,7 @@ mod tests {
             "boot-posix-sync.img",
             "boot-posix-resources.img",
             "boot-posix-map.img",
+            "boot-posix-map-big.img",
             "boot-posix-so.img",
             "boot-posix-lock-ring.img",
             "boot-posix-shares.img",

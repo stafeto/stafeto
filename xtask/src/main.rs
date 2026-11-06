@@ -750,6 +750,13 @@ const POSIX_MAP_PROGRAMS: [ImageProgram; 10] = {
     programs[5] = ("posix-procs", "posix-map-probe", POSIX_STACK_SIZE, &[]);
     programs
 };
+/// The probe of the big room (`posix-map big`): init's table gives the probe
+/// a quota above 64 MiB (`table-posix-map-big`).
+const POSIX_MAP_BIG_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_MAP_PROGRAMS;
+    programs[0] = ("init", "init", INIT_STACK_SIZE, &["table-posix-map-big"]);
+    programs
+};
 /// The probe of dynamic programs on libc.so (tests/posix-so): the image of the
 /// probe of POSIX processes with the library and the dynamic programs in its
 /// table of files (rootfs.rs, `shared_files`) and the probe as its program.
@@ -1985,7 +1992,11 @@ fn main() {
             };
             jobs::parse_jobs("open-posix", rest).and_then(|jobs| openposix::run(select, jobs))
         }
-        Some("posix-map") => posix_map_probe(),
+        Some("posix-map") => match args.get(1).map(String::as_str) {
+            None => posix_map_probe(),
+            Some("big") => posix_map_big_probe(),
+            Some(other) => Err(format!("posix-map: unknown argument {other}")),
+        },
         Some("libc-so") => libc_so(),
         Some("posix-so") => match args.get(1).map(String::as_str) {
             None => posix_so_run(false, false),
@@ -5258,6 +5269,40 @@ fn posix_map_on(machine: &qemu::Machine) -> Result<(), String> {
         "posix-map: shared memory, files and shm ok",
     ] {
         qemu::expect_marker(&outcome, marker)?;
+    }
+    Ok(())
+}
+
+/// `cargo xtask posix-map big`: the probe of the room that grows to 1 GiB
+/// for a process with a quota of 240 MiB, on 1 GiB of memory (#598).
+fn posix_map_big_probe() -> Result<(), String> {
+    relibc()?;
+    busybox_build()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-map-big.img",
+        &POSIX_MAP_BIG_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT_1G, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let outcome = run_until(
+        cmd,
+        Duration::from_secs(600),
+        Some("init: posix-procs ended:"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(
+        &outcome,
+        "init: posix-procs ended: exit code 0, not restarted",
+    )?;
+    qemu::expect_marker(&outcome, "posix-map: big room ok")?;
+    for line in outcome
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("posix-map: big:"))
+    {
+        println!("{line}");
     }
     Ok(())
 }
@@ -8959,6 +9004,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             qemu::on_cpus(SMP_CPUS, || posix_shares_probe(&qemu::VIRT))
         }),
         job("posix-map", posix_map_probe),
+        job("posix-map big", posix_map_big_probe),
         job("posix-so", posix_so_probe),
         job("posix-resources", posix_resources_probe),
         job("posix-sync", posix_sync_probe),
