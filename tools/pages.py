@@ -10,6 +10,10 @@ of stafeto/packages.
 
   gate            whether an event has anything to do (never fails: no secret,
                   no published series and a pre-release are a clean end)
+  previous        where a release carries its packages from: the published index
+                  of its series, or nothing when the series is not published yet
+  new-files       the package files and source archives of a release that its
+                  storage release takes (the carried packages are in theirs)
   verify-storage  the attachments of the draft of the storage release are
                   the files of the signed index and no others
   check-addresses every address of the index answers with the size it says
@@ -85,6 +89,41 @@ def gate(event: str, prerelease: str, tag: str, assets: list[str], fetch) -> tup
     if series is None or not series.split():
         return False, f"no series is published at {PAGES}/series.txt: there is nothing to sign again"
     return True, f"series published: {' '.join(series.split())}"
+
+
+def previous(series: str, tree: Path, fetch) -> str:
+    """The published index of `series` for `--previous`, or an empty string
+    when the series was never published. A series that the pages list and the
+    tree does not record as published is an error: building it as new would
+    give new packages the names of published ones with other bytes."""
+    recorded = (tree / "packages" / "published-serial.txt")
+    known = recorded.is_file() and any(
+        l.split(" ")[0] == series for l in recorded.read_text().splitlines() if l.strip())
+    listed = (fetch(f"{PAGES}/series.txt") or "").split()
+    if known:
+        return f"{PAGES}/{series}/{ARCH}"
+    if series in listed:
+        raise Refusal(f"the pages list the series {series} and packages/published-serial.txt does not record it; add its line first")
+    return ""
+
+
+def new_files(directory: Path) -> list[Path]:
+    """The package files of `directory` that were built for this release and
+    the source archives of them: all `.stpkg` files except those that
+    `carried.txt` lists, and `src/<stem>-src.tar.xz` for each."""
+    carried = set()
+    path = directory / "carried.txt"
+    if path.is_file():
+        carried = {line.split("\t")[0] for line in path.read_text().splitlines() if line}
+    found = []
+    for package in sorted(directory.glob("*.stpkg")):
+        if package.name in carried:
+            continue
+        found.append(package)
+        source = directory / "src" / f"{package.stem}-src.tar.xz"
+        if source.is_file():
+            found.append(source)
+    return found
 
 
 def fetch_text(url: str):
@@ -255,6 +294,11 @@ def main() -> None:
     g.add_argument("--prerelease", default="false")
     g.add_argument("--tag", default="")
     g.add_argument("--assets", default="")
+    r = steps.add_parser("previous")
+    r.add_argument("--series", required=True)
+    r.add_argument("--tree", type=Path, default=Path("."))
+    n = steps.add_parser("new-files")
+    n.add_argument("--dir", type=Path, required=True)
     v = steps.add_parser("verify-storage")
     v.add_argument("--index", type=Path, required=True)
     v.add_argument("--storage", required=True)
@@ -275,6 +319,13 @@ def main() -> None:
         go, reason = gate(args.event, args.prerelease, args.tag, args.assets.split(), fetch_text)
         print(f"pages: {reason}", file=sys.stderr)
         print(f"go={'true' if go else 'false'}")
+    elif args.step == "previous":
+        address = previous(args.series, args.tree, fetch_text)
+        print(f"--previous {address}" if address else "")
+        print(f"pages: {'carrying from ' + address if address else 'series ' + args.series + ' is not published: every package is new'}",
+              file=sys.stderr)
+    elif args.step == "new-files":
+        print(" ".join(str(p) for p in new_files(args.dir)))
     elif args.step == "verify-storage":
         print(f"pages: {verify_storage(args.index, args.storage, args.dir)} attachments are the files of the signed index")
     elif args.step == "check-addresses":

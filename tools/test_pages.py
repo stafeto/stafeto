@@ -245,6 +245,47 @@ class Storage(unittest.TestCase):
         self.assertIn("404", str(stopped.exception))
 
 
+class NewFiles(unittest.TestCase):
+    def test_the_carried_packages_stay_in_their_own_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "src").mkdir()
+            for name in ("a-1-1.stpkg", "b-2-1.stpkg", "c-3-1.stpkg"):
+                (d / name).write_bytes(b"x")
+            (d / "src" / "a-1-1-src.tar.xz").write_bytes(b"s")
+            (d / "src" / "b-2-1-src.tar.xz").write_bytes(b"s")
+            (d / "carried.txt").write_text("b-2-1.stpkg\thttps://example.org/b-2-1.stpkg\t-\n")
+            self.assertEqual([p.name for p in pages.new_files(d)],
+                             ["a-1-1.stpkg", "a-1-1-src.tar.xz", "c-3-1.stpkg"])
+            (d / "carried.txt").unlink()
+            self.assertEqual(len(pages.new_files(d)), 5)
+
+
+class Previous(unittest.TestCase):
+    def tree(self, tmp: str, line: str | None) -> Path:
+        tree = Path(tmp)
+        (tree / "packages").mkdir(exist_ok=True)
+        if line is not None:
+            (tree / "packages" / "published-serial.txt").write_text(line)
+        return tree
+
+    def test_a_series_that_nobody_published_is_built_new(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(pages.previous("0.3", self.tree(tmp, None), lambda url: None), "")
+            self.assertEqual(pages.previous("0.3", self.tree(tmp, "0.2 4\n"), lambda url: "0.2\n"), "")
+
+    def test_a_recorded_series_is_carried_from_its_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(pages.previous("0.3", self.tree(tmp, "0.3 12\n"), lambda url: None),
+                             "https://stafeto.github.io/packages/0.3/aarch64")
+
+    def test_a_series_on_the_pages_and_not_recorded_stops_the_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as stopped:
+                pages.previous("0.3", self.tree(tmp, None), lambda url: "0.3\n")
+            self.assertIn("published-serial.txt", str(stopped.exception))
+
+
 class Gate(unittest.TestCase):
     def test_nothing_is_published_while_no_series_is(self):
         for event in ("schedule", "push", "workflow_dispatch"):
