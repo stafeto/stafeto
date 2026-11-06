@@ -36,7 +36,8 @@ RELIBC = ROOT / "target" / "relibc" / "sysroot"
 # relibc's own (-idirafter).
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 # BusyBox sources of our own, copied into the tree by directory: the
-# applet login-probe, which the tests of getlogin and utmpx run.
+# applets login-probe, which the tests of getlogin and utmpx run, and
+# crypt-probe, which those of crypt, /etc/shadow and newgrp run.
 OWN = ROOT / "tools" / "busybox" / "stafeto"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
@@ -67,7 +68,8 @@ def relibc_commit() -> str:
 # reads the mask of sched_getaffinity, is among them: nproc and taskset
 # use it); objects a program does not name stay out of the link.
 # Nothing of BusyBox's own is written here: an applet BusyBox lacks is not
-# provided (login-probe, the guest test of the C library, is the exception).
+# provided (login-probe and crypt-probe, the guest tests of the C library, are
+# the exceptions).
 EXCLUDED_OBJECTS = ()
 # The small build keeps the objects of libbb it always had: the others pull
 # in more of relibc (syslog, and with it the time zone data) than the probes

@@ -21,6 +21,7 @@
 //usage:       "newgrp refuses a user with a long password"
 
 #include <crypt.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include "libbb.h"
 
@@ -31,6 +32,13 @@ static void check(int ok, const char *what)
 	printf("crypt-probe: %s: %s\n", what, ok ? "ok" : "FAILED");
 	if (!ok)
 		failures++;
+}
+
+/* A refused setting: NULL with errno EINVAL. */
+static int refused(const char *key, const char *setting)
+{
+	errno = 0;
+	return crypt(key, setting) == NULL && errno == EINVAL;
 }
 
 /* What a program that compares strings does: the password is right when
@@ -64,7 +72,7 @@ static void probe_crypt(void)
 		for (j = 0; j < ARRAY_SIZE(fields); j++) {
 			errno = 0;
 			out = crypt(key, fields[j]);
-			if (out != NULL || errno == 0 || accepts(key, fields[j])) {
+			if (out != NULL || errno != EINVAL || accepts(key, fields[j])) {
 				printf("crypt-probe: key %u field \"%s\" gave %s\n",
 					(unsigned)lengths[i], fields[j], out ? out : "an error without errno");
 				ok = 0;
@@ -74,7 +82,7 @@ static void probe_crypt(void)
 		snprintf(borrowed, sizeof(borrowed), "%s", hash);
 		errno = 0;
 		out = crypt(key, borrowed);
-		if (out != NULL || errno == 0 || (out && out[0] == '*')) {
+		if (out != NULL || errno != EINVAL) {
 			printf("crypt-probe: key %u with a $6$ salt gave %s\n",
 				(unsigned)lengths[i], out ? out : "an error without errno");
 			ok = 0;
@@ -87,11 +95,31 @@ static void probe_crypt(void)
 	key[sizeof(key) - 1] = '\0';
 	check(ok, "a key of 257 to 1024 bytes against *, !, x, an empty field and a borrowed $6$ salt is refused");
 
-	errno = 0;
-	check(crypt("pw", "$5$saltstring") != NULL && crypt(key, "$5$saltstring") == NULL && errno != 0,
-		"a long key against $5$ gives NULL with errno");
-	check(crypt("pw", "$6$\xc3\xa9") == NULL, "a non-ASCII salt gives NULL");
-	check(crypt("pw", "$6$rounds=10000000$x") == NULL, "rounds above 9999999 give NULL");
+	check(crypt("pw", "$5$saltstring") != NULL, "a short key hashes with $5$");
+	check(refused(key, "$5$saltstring"), "a long key against $5$ gives NULL with EINVAL");
+	check(refused("pw", "$6$\xc3\xa9"), "a $6$ salt with a byte outside ASCII gives EINVAL");
+	check(refused("pw", "$1$aaaaaaa\xc3\xa9") && refused("pw", "$1$a\xc3\xa9$"),
+		"a $1$ salt with a byte outside ASCII gives EINVAL");
+	check(refused("pw", "$7$CCCCC\xc3\xa9" "aaaaaaaaa"), "a $7$ salt with a byte outside ASCII gives EINVAL");
+	check(refused("pw", "\xff\xfe"), "a setting that is not UTF-8 gives EINVAL");
+	check(refused("pw", "$9$abc"), "an unknown algorithm $9$ gives EINVAL");
+	check(refused("pw", "$6$rounds=abc$x") && refused("pw", "$6$rounds=+5000$x"),
+		"rounds that do not start with a digit give EINVAL");
+	check(refused("pw", "$6$a:b"), "a colon in the salt gives EINVAL");
+	check(refused("pw", "$6$rounds=10000000$x"), "rounds above 9999999 give EINVAL");
+	out = crypt("pw", "$6$rounds=10$x");
+	check(out && strncmp(out, "$6$rounds=1000$x$", 17) == 0, "rounds below 1000 are raised to 1000");
+	{
+		crypt_data data;
+
+		memset(&data, 0, sizeof(data));
+		out = crypt_r("pw", "$6$saltstring", &data);
+		ok = out && strcmp(out, hash) == 0;
+		memset(key, 'k', 300);
+		key[300] = '\0';
+		ok = ok && crypt_r(key, "$6$saltstring", &data) == NULL && strcmp(data.buff, hash) == 0;
+		check(ok, "crypt_r keeps its buffer when a long key fails");
+	}
 	check(accepts("pw", hash), "the right password is accepted");
 	check(!accepts("other", hash), "another password is refused");
 	snprintf(borrowed, sizeof(borrowed), "!%s", hash);
@@ -137,14 +165,15 @@ static void probe_accounts(void)
 
 static void probe_newgrp(void)
 {
-	char key[1026];
-	int fds[2], status = 0;
+	char key[1026], text[1024];
+	int fds[2], errs[2], status = 0;
+	ssize_t got, used = 0;
 	pid_t pid;
 
 	memset(key, 'k', 1024);
 	key[1024] = '\n';
 	key[1025] = '\0';
-	if (pipe(fds) != 0) {
+	if (pipe(fds) != 0 || pipe(errs) != 0) {
 		check(0, "pipe");
 		return;
 	}
@@ -154,22 +183,42 @@ static void probe_newgrp(void)
 		return;
 	}
 	if (pid == 0) {
+		int fd;
+
 		/* user 1000 of group 100: not a member of group root */
 		if (setgid(100) != 0 || setuid(1000) != 0)
 			_exit(125);
+		/* the user cannot read the shadow file */
+		fd = open("/etc/shadow", O_RDONLY);
+		if (fd >= 0 || errno != EACCES)
+			_exit(124);
 		dup2(fds[0], 0);
+		dup2(errs[1], 1);
+		dup2(errs[1], 2);
 		close(fds[0]);
 		close(fds[1]);
+		close(errs[0]);
+		close(errs[1]);
 		execl("/bin/newgrp", "newgrp", "-c", "echo GRANTED", "root", (char *)NULL);
 		_exit(126);
 	}
 	close(fds[0]);
+	close(errs[1]);
 	if (write(fds[1], key, 1025) != 1025)
 		check(0, "the password is written");
 	close(fds[1]);
+	while (used < (ssize_t)sizeof(text) - 1
+			&& (got = read(errs[0], text + used, sizeof(text) - 1 - used)) > 0)
+		used += got;
+	close(errs[0]);
+	text[used] = '\0';
 	check(waitpid(pid, &status, 0) == pid, "newgrp ends");
 	printf("crypt-probe: newgrp status %d\n", status);
-	check(WIFEXITED(status) && WEXITSTATUS(status) == 1, "newgrp as user refuses a password of 1024 bytes");
+	check(!(WIFEXITED(status) && WEXITSTATUS(status) == 124), "user 1000 cannot open /etc/shadow");
+	check(WIFEXITED(status) && WEXITSTATUS(status) == 1, "newgrp ends with status 1");
+	check(strstr(text, "crypt failed") && strstr(text, "permission denied")
+			&& !strstr(text, "setgid() failed") && !strstr(text, "GRANTED"),
+		"newgrp as user refuses a password of 1024 bytes");
 }
 
 int crypt_probe_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;

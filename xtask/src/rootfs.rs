@@ -2226,8 +2226,17 @@ mod tests {
             let names =
                 |rows: &[(String, String)]| rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
             assert_eq!(names(&passwd), names(&shadow), "{image}");
-            let mode = files.iter().find(|f| f.path == "/etc/shadow").unwrap().mode;
-            assert_eq!(mode & 0o077, 0, "{image}: /etc/shadow is open to others");
+            let shadow_file = files.iter().find(|f| f.path == "/etc/shadow").unwrap();
+            assert_eq!(
+                shadow_file.mode & 0o077,
+                0,
+                "{image}: /etc/shadow is open to others"
+            );
+            assert_eq!(
+                (shadow_file.uid, shadow_file.gid),
+                ROOT,
+                "{image}: /etc/shadow owner"
+            );
         }
     }
 
