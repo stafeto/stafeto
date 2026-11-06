@@ -97,6 +97,7 @@ come from the single-CPU tests, waits and latencies from HVF.
 | S5x, target in WFI | 246 ticks | 310 ticks |
 | S5x, target behind a lower thread | 94 ticks | 199 ticks |
 | call to a service on another CPU | 347 ticks | 493 ticks |
+| call to a service on another CPU, back to back, poll in the idle loop on (since F2; 350 with it off) | 35 ticks | |
 | call to a service on this CPU | 12 ticks | 12 ticks |
 | S5 on CPU 0 under a call storm of the others | 21 ticks | 23 ticks |
 | local call under the storm | 111 ticks | 52 ticks |
