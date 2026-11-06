@@ -4121,7 +4121,7 @@ fn relibc_hello_probe() -> Result<(), String> {
     // stand in front of it.
     qemu::expect_line_end(
         &outcome,
-        "end_badly: hello.c:457: Assertion `how == NULL` failed.",
+        "end_badly: hello.c:458: Assertion `how == NULL` failed.",
     )?;
     println!("relibc C-program guest probe passed");
     Ok(())
