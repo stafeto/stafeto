@@ -7686,6 +7686,30 @@ const UTILITY_DIALOG: &[(&str, &[&str])] = &[
             r#"login-probe: 0 failures"#,
         ],
     ),
+    // stafeto-design#631: crypt gives NULL, never a string that equals a
+    // short password field; every account is locked in /etc/shadow; newgrp
+    // refuses a user with a password of 1024 bytes.
+    (
+        r#"/libexec/crypt-probe crypt"#,
+        &[
+            r#"crypt-probe: a key of 257 to 1024 bytes against *, !, x, an empty field and a borrowed $6$ salt is refused: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
+    (
+        r#"/libexec/crypt-probe accounts"#,
+        &[
+            r#"crypt-probe: every entry of /etc/shadow is locked with !: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
+    (
+        r#"/libexec/crypt-probe newgrp"#,
+        &[
+            r#"crypt-probe: newgrp as user refuses a password of 1024 bytes: ok"#,
+            r#"crypt-probe: 0 failures"#,
+        ],
+    ),
 ];
 
 /// Types `command` and waits for the lines `lines` and the prompt.
@@ -7929,8 +7953,8 @@ fn ash_dialog() -> Result<(), String> {
     let link = |name: &'static str| ("lrwxrwxrwx", "1".to_string(), name, "7".to_string());
     let bin_listing = [
         link("ash"),
-        // One more link: /libexec/login-probe is a name of the same file.
-        ("-rwxr-xr-x", "2".to_string(), "busybox", busybox.clone()),
+        // Two more links: /libexec/login-probe and /libexec/crypt-probe are names of the same file.
+        ("-rwxr-xr-x", "3".to_string(), "busybox", busybox.clone()),
         ("-rwxr-xr-x", "1".to_string(), "bash", elf_size("bash")?),
         link("cat"),
         link("head"),
