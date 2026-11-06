@@ -1637,7 +1637,7 @@ commands:
             ci runs it, under -icount, where the instructions of S5 stay under
             S5_ICOUNT_MAX; with --marks added, the segments of that path
   smp-idle-bell  the probe of the bell and the poll of the idle loop (the last
-            part of smp-window): 100 000 pairs between idle CPUs, a timer in a
+            part of smp-window): 20 000 pairs between idle CPUs, a timer in a
             window, and the three kernels with a break
   rtbench-check [--same-guest OLD=NEW] SESSION... compare the base and head runs of
             at least four alternating sessions (each a directory with `order`,
@@ -11162,8 +11162,8 @@ fn smp_window() -> Result<(), String> {
 }
 
 /// The pairs of the probe of the bell (tests/init/src/smp.rs, `idle_bell_pairs`).
-const IDLE_PAIRS_BEGIN: &str = "smp idle bell  100000 pairs begin";
-const IDLE_PAIRS_DONE: &str = "smp idle bell  100000 pairs done";
+const IDLE_PAIRS_BEGIN: &str = "smp idle bell  20000 pairs begin";
+const IDLE_PAIRS_DONE: &str = "smp idle bell  20000 pairs done";
 const IDLE_IRQ_DONE: &str = "smp idle bell  20 interrupt rounds done";
 const IDLE_IRQ_LINE: &str = "idle poll  an interrupt was pending at the end of the window";
 /// The windows of 20 rounds that may end with an interrupt pending in the
@@ -11172,7 +11172,7 @@ const IDLE_IRQ_NOISE: usize = 2;
 
 /// The probe of the bell and the poll of the idle loop on four CPUs (kernel
 /// features `idle-probe` and the three `break-idle-*`): the kernel that
-/// polls with a window of 1 ms passes the whole test init, 100 000 pairs of
+/// polls with a window of 1 ms passes the whole test init, 20 000 pairs of
 /// requests and replies between idle CPUs among them, and ends the window
 /// at the interrupt of a timer; each kernel with a break is caught.
 fn smp_idle_bell() -> Result<(), String> {

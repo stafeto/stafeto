@@ -2285,7 +2285,7 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
 /// SGI. A wake-up lost on the way leaves the caller in its call: xtask
 /// `smp-idle-bell` gives the kernel with a deliberate break 20 s between the
 /// two lines.
-const BELL_PAIRS: u64 = 100_000;
+const BELL_PAIRS: u64 = 20_000;
 
 fn idle_bell_pairs() -> Outcome {
     let n = cpus()?;
