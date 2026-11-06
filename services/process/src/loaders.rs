@@ -49,15 +49,16 @@ pub const fn fork_quota(nominal: u64, image_pages: u32) -> u64 {
 /// Whether the child of fork of a process that runs the program `name`
 /// with the effective user ID `euid` gets the quota of `grant`: the grant
 /// names that program, the user is root (a device is root's alone, so the
-/// grant widens no circle) and `taken` places of the grant are in use
-/// fewer than it has.
+/// grant widens no circle) and fewer places of the grant than it has are in
+/// use. `taken` counts the places and runs only for the one program the
+/// grant names, since it walks the table of records.
 pub fn grant_applies(
     grant: &proto_init::Grant,
     name: &[u8; proto_process::NAME_LEN],
     euid: u32,
-    taken: u32,
+    taken: impl FnOnce() -> u32,
 ) -> bool {
-    grant.pages != 0 && euid == 0 && grant.name == *name && taken < grant.places
+    grant.pages != 0 && euid == 0 && grant.name == *name && taken() < grant.places
 }
 
 /// The credentials a child of `parent` starts with: those of an exec, the
@@ -410,18 +411,33 @@ mod tests {
         let g = grant(Grant::bytes(196_608, 1, "nginx-fast"));
         let mut name = [0; proto_process::NAME_LEN];
         name[..10].copy_from_slice(b"nginx-fast");
-        assert!(grant_applies(&g, &name, 0, 0));
-        assert!(!grant_applies(&g, &name, 1000, 0), "not root");
-        assert!(!grant_applies(&g, &name, 0, 1), "the place is taken");
+        assert!(grant_applies(&g, &name, 0, || 0));
+        assert!(!grant_applies(&g, &name, 1000, || 0), "not root");
+        assert!(!grant_applies(&g, &name, 0, || 1), "the place is taken");
         let mut other = name;
         other[9] = b'x';
-        assert!(!grant_applies(&g, &other, 0, 0), "another program");
+        assert!(!grant_applies(&g, &other, 0, || 0), "another program");
         let none = Grant {
             pages: 0,
             places: 0,
             name: [0; proto_init::GRANT_NAME_LEN],
         };
-        assert!(!grant_applies(&none, &[0; proto_process::NAME_LEN], 0, 0));
+        let counted = core::cell::Cell::new(0);
+        assert!(!grant_applies(&g, &other, 0, || {
+            counted.set(1);
+            0
+        }));
+        assert_eq!(
+            counted.get(),
+            0,
+            "the table is walked for the one program only"
+        );
+        assert!(!grant_applies(
+            &none,
+            &[0; proto_process::NAME_LEN],
+            0,
+            || 0
+        ));
     }
 
     #[test]

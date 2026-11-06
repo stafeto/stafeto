@@ -3301,12 +3301,9 @@ impl Processes {
         // The child of fork of the program the table grants a quota to
         // gets it, while a place of the grant is free.
         let granted = fork
-            && loaders::grant_applies(
-                &self.grant,
-                &parent.name,
-                parent.credentials.euid,
-                self.records.granted(),
-            );
+            && loaders::grant_applies(&self.grant, &parent.name, parent.credentials.euid, || {
+                self.records.granted()
+            });
         let process_quota = if granted {
             u64::from(self.grant.pages) * 4096
         } else if fork {
