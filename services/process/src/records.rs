@@ -1219,7 +1219,7 @@ mod tests {
     #[test]
     fn the_places_of_a_grant_are_those_of_the_live_records_that_hold_one() {
         let mut t = Records::<u32>::new();
-        let mut make = |t: &mut Records<u32>| {
+        let make = |t: &mut Records<u32>| {
             let label = t.next_label().unwrap();
             t.insert(label, 0, None, Credentials::ROOT, 31, Join::NewSession)
         };
