@@ -1091,6 +1091,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-bench-vz") as usize
     + cfg!(feature = "table-bench-pinned-vz") as usize
     + cfg!(feature = "table-bench-cpu0-vz") as usize
+    + cfg!(feature = "table-bench-fast-vz") as usize
     + cfg!(feature = "table-net-probe-two") as usize
     + cfg!(feature = "table-net-two") as usize
     + cfg!(feature = "table-input") as usize
@@ -1163,6 +1164,7 @@ const _: () = assert!(
     feature = "table-bench-vz",
     feature = "table-bench-pinned-vz",
     feature = "table-bench-cpu0-vz",
+    feature = "table-bench-fast-vz",
     feature = "table-net-probe-two",
     feature = "table-net-two",
     feature = "table-input",
@@ -1269,6 +1271,8 @@ pub const TABLE: &[Record] = bench::BENCH_VZ_TABLE;
 pub const TABLE: &[Record] = bench::BENCH_PINNED_VZ_TABLE;
 #[cfg(feature = "table-bench-cpu0-vz")]
 pub const TABLE: &[Record] = bench::BENCH_CPU0_VZ_TABLE;
+#[cfg(feature = "table-bench-fast-vz")]
+pub const TABLE: &[Record] = bench::BENCH_FAST_VZ_TABLE;
 #[cfg(feature = "table-net-probe-two")]
 pub const TABLE: &[Record] = net::NET_PROBE_TWO_TABLE;
 #[cfg(feature = "table-net-two")]
@@ -2062,6 +2066,7 @@ mod tests {
             bench::BENCH_VZ_TABLE,
             bench::BENCH_PINNED_VZ_TABLE,
             bench::BENCH_CPU0_VZ_TABLE,
+            bench::BENCH_FAST_VZ_TABLE,
             net::NET_PROBE_TWO_TABLE,
             net::NET_TWO_TABLE,
             doom::TABLE,
@@ -2376,6 +2381,45 @@ mod tests {
             };
             assert_eq!(*one, Record { cpus, ..*plain }, "{}", one.name);
         }
+    }
+
+    /// The image of the row F1 is the image of nginx on the stack on VZ with
+    /// the launcher of the shell on all four CPUs and nothing else changed.
+    #[test]
+    fn the_fast_bench_image_differs_from_the_image_of_nginx_on_vz_in_the_launcher_alone() {
+        assert_eq!(
+            order_of(bench::BENCH_FAST_VZ_TABLE),
+            order_of(fstack::FAST_NGINX_VZ_TABLE)
+        );
+        assert_eq!(
+            bench::BENCH_FAST_VZ_TABLE
+                .iter()
+                .filter(|r| r.cpus == BENCH_CPUS)
+                .count(),
+            1
+        );
+        for (bench, fast) in bench::BENCH_FAST_VZ_TABLE
+            .iter()
+            .zip(fstack::FAST_NGINX_VZ_TABLE)
+        {
+            if bench.name == net::NET_LAUNCHER.name {
+                assert_eq!(bench.cpus, BENCH_CPUS);
+                assert_eq!(
+                    Record {
+                        cpus: fast.cpus,
+                        ..*bench
+                    },
+                    *fast
+                );
+            } else {
+                assert_eq!(bench, fast, "{}", bench.name);
+            }
+        }
+        let netd = bench::BENCH_FAST_VZ_TABLE
+            .iter()
+            .find(|r| r.name == NET_SERVICE)
+            .unwrap();
+        assert_eq!(netd.cpus, NETD_CPUS);
     }
 
     /// No other table names `BENCH_CPUS`: not by the constant (a scan of the

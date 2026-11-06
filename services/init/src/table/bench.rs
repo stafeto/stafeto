@@ -14,7 +14,12 @@
 //! (ordinary processes on CPUs 0 and 1, CPUs 2 and 3 for realtime) does not
 //! apply to it; every other image keeps it, and a test below keeps
 //! `BENCH_CPUS` out of their tables.
+//!
+//! `boot-net-bench-fast.img` (the row F1) is the image of nginx on the
+//! stack on VZ (`fstack::FAST_NGINX_VZ_TABLE`, both network devices) with the
+//! same one change: the launcher of the shell on the four CPUs.
 
+use super::fstack::FAST_NGINX_VZ_TABLE;
 use super::net::{NET_LAUNCHER, NET_VZ_TABLE};
 use super::{BENCH_CPUS, BENCH_PINNED_CPUS, Record};
 
@@ -59,17 +64,19 @@ const fn on_cpu_0(table: [Record; 10]) -> [Record; 10] {
     out
 }
 
-const fn bench_table(launcher: Record) -> [Record; 10] {
-    assert!(NET_VZ_TABLE.len() == 10);
-    let mut out = [NET_VZ_TABLE[0]; 10];
+/// `table` with the record of the shell's launcher (found by its name) on
+/// the CPUs `cpus`; the launcher keeps the quota of the table it came from.
+const fn with_launcher<const N: usize>(table: &[Record], cpus: u8) -> [Record; N] {
+    assert!(table.len() == N);
+    let mut out = [table[0]; N];
     let mut at = 0;
     let mut launchers = 0;
-    while at < 10 {
-        out[at] = if str_eq(NET_VZ_TABLE[at].name, NET_LAUNCHER.name) {
+    while at < N {
+        out[at] = if str_eq(table[at].name, NET_LAUNCHER.name) {
             launchers += 1;
-            launcher
+            Record { cpus, ..table[at] }
         } else {
-            NET_VZ_TABLE[at]
+            table[at]
         };
         at += 1;
     }
@@ -77,9 +84,10 @@ const fn bench_table(launcher: Record) -> [Record; 10] {
     out
 }
 
-const TABLE: [Record; 10] = bench_table(BENCH_LAUNCHER);
-const PINNED: [Record; 10] = bench_table(BENCH_PINNED_LAUNCHER);
-const CPU0: [Record; 10] = on_cpu_0(bench_table(BENCH_LAUNCHER));
+const TABLE: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_CPUS);
+const PINNED: [Record; 10] = with_launcher(NET_VZ_TABLE, BENCH_PINNED_CPUS);
+const CPU0: [Record; 10] = on_cpu_0(with_launcher(NET_VZ_TABLE, BENCH_CPUS));
+const FAST_TABLE: [Record; 10] = with_launcher(FAST_NGINX_VZ_TABLE, BENCH_CPUS);
 
 /// The image of the shell with the network service on VZ, with the shell's
 /// processes on all four CPUs: the record of `NET_LAUNCHER` by name, so that
@@ -94,3 +102,7 @@ pub const BENCH_PINNED_VZ_TABLE: &[Record] = &PINNED;
 /// CPU of the network service: every call of a program to it is a call on its
 /// own CPU.
 pub const BENCH_CPU0_VZ_TABLE: &[Record] = &CPU0;
+
+/// The image of nginx on the stack on VZ with the shell's processes on all
+/// four CPUs (the row F1).
+pub const BENCH_FAST_VZ_TABLE: &[Record] = &FAST_TABLE;

@@ -53,6 +53,13 @@ pub enum BenchImage {
     Cpu0,
 }
 
+/// The image of the row F1: nginx on the stack in its own process on the
+/// second network device, the same one change of the CPUs
+/// (`init::table::bench::BENCH_FAST_VZ_TABLE`).
+pub const BENCH_FAST_IMAGE: &str = "boot-net-bench-fast.img";
+/// The second device's address in the image of F1 (the static address of
+/// `netd.conf`: the NAT of VZ has no lease for a device that the stack owns).
+pub const FAST_ADDRESS: &str = "192.168.64.250";
 /// The machine of both guests (the provisional ruling B2 of the owner).
 pub const CPUS: usize = 4;
 pub const MEMORY_MIB: u64 = 1024;
@@ -116,10 +123,32 @@ pub fn build_variant(variant: BenchImage) -> Result<PathBuf, String> {
     }
 }
 
+/// The programs of the image of F1: those of the image of nginx on the stack
+/// on VZ with init's table of the measurement (`table-bench-fast-vz`).
+pub fn bench_fast_programs() -> &'static [ImageProgram] {
+    static LIST: std::sync::OnceLock<Vec<ImageProgram>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        let mut programs = crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz).to_vec();
+        for program in &mut programs {
+            if program.0 == "init" {
+                program.3 = &["table-bench-fast-vz"];
+            }
+        }
+        programs
+    })
+}
+
 /// Builds the image of the measurement (a step of ci, which can run
 /// neither HVF nor VZ).
 pub fn build_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
     build_boot_image(BENCH_IMAGE, bench_programs(), BOOT_PROFILE)
+}
+
+/// Builds the image of F1.
+pub fn build_fast_image() -> Result<PathBuf, String> {
+    crate::probe_ca::ensure(false)?;
+    build_boot_image(BENCH_FAST_IMAGE, bench_fast_programs(), BOOT_PROFILE)
 }
 
 // What both guests carry -------------------------------------------------------
@@ -192,6 +221,70 @@ pub fn nginx_conf() -> &'static str {
     nginx_probe::NGINX_CONF
 }
 
+/// The settings of nginx on the stack (F1): its own file, which differs from
+/// `nginx_conf` in the directives of the allowed list, in the types written
+/// in the file, and in the path of the pid file.
+pub fn nginx_fast_conf() -> &'static str {
+    crate::fast_nginx::NGINX_FAST_CONF
+}
+
+/// The path of the settings with the server of TLS in the guests of Linux
+/// and in S4, and in F1.
+pub const TLS_CONF: &str = "/etc/nginx/nginx-tls.conf";
+pub const FAST_TLS_CONF: &str = "/etc/nginx/nginx-fast-tls.conf";
+
+/// `conf` with the server of TLS (`tls.conf`) included before its server of
+/// HTTP, the one change W4 and W5 make: the same `http` block, the same
+/// listener on port 80, and the listener of TLS 1.3 and HTTP/2 on 443.
+pub fn with_tls(conf: &str) -> String {
+    nginx_probe::replaced(
+        conf,
+        "    server {\n",
+        &format!(
+            "    include {};\n    server {{\n",
+            nginx_probe::TLS_CONF_PATH
+        ),
+    )
+}
+
+/// The settings of nginx of the guests of Linux and S4 for W4 and W5.
+pub fn nginx_tls_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(nginx_conf()))
+}
+
+/// The settings of F1 for W4 and W5.
+pub fn nginx_fast_tls_conf() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| with_tls(nginx_fast_conf()))
+}
+
+/// What `nginx -T -c PATH` prints: each file of `parts` (its path and its
+/// bytes) after the line that names it, in the order nginx reads them.
+pub fn expected_dump(parts: &[(&str, &str)]) -> String {
+    parts
+        .iter()
+        .map(|(path, text)| format!("# configuration file {path}:\n{text}\n"))
+        .collect()
+}
+
+/// The dump of the settings with TLS: for the rows with `nginx.conf` (the
+/// types before the server of TLS) and for F1.
+pub fn expected_tls_dump(fast: bool, mime: &[u8]) -> String {
+    let (path, conf) = if fast {
+        (FAST_TLS_CONF, nginx_fast_tls_conf())
+    } else {
+        (TLS_CONF, nginx_tls_conf())
+    };
+    let mime = String::from_utf8_lossy(mime);
+    let mut parts = vec![(path, conf)];
+    if !fast {
+        parts.push(("/etc/nginx/mime.types", mime.as_ref()));
+    }
+    parts.push((nginx_probe::TLS_CONF_PATH, nginx_probe::TLS_CONF));
+    expected_dump(&parts)
+}
+
 /// Writes the overlay of the Linux guest into the empty `dir`: the settings
 /// of nginx, its `mime.types` (the file of the nginx source that stafeto's image
 /// carries) and the files under `/www`.
@@ -204,6 +297,15 @@ pub fn write_overlay(dir: &Path, mime: &[u8]) -> Result<(), String> {
     };
     put("/etc/nginx/nginx.conf", nginx_conf().as_bytes())?;
     put("/etc/nginx/mime.types", mime)?;
+    // W4 and W5: the same settings with the server of TLS, and the key and
+    // the certificate of the probe CA.
+    put(TLS_CONF, nginx_tls_conf().as_bytes())?;
+    put(nginx_probe::TLS_CONF_PATH, nginx_probe::TLS_CONF.as_bytes())?;
+    put(
+        nginx_probe::SERVER_CRT,
+        crate::probe_ca::nginx_certificate(),
+    )?;
+    put(nginx_probe::SERVER_KEY, crate::probe_ca::nginx_key())?;
     for (path, bytes) in www_files() {
         put(path, bytes)?;
     }
@@ -291,6 +393,11 @@ pub fn expected_config_output(conf: &str, mime: &[u8]) -> String {
         "# configuration file /etc/nginx/nginx.conf:\n{conf}\n# configuration file /etc/nginx/mime.types:\n{}\n",
         String::from_utf8_lossy(mime)
     )
+}
+
+/// What `nginx-fast -T` prints for the settings of F1: the one file.
+pub fn expected_fast_config_output(conf: &str) -> String {
+    format!("# configuration file /etc/nginx/nginx-fast.conf:\n{conf}\n")
 }
 
 /// The digest of the files under `/www`: SHA-256 of the lines `HASH  PATH`,
@@ -520,6 +627,19 @@ pub(crate) fn read_fingerprints(
     report: &mut Report,
     kernel_settings: bool,
 ) -> Result<(), String> {
+    read_fingerprints_of(run, report, kernel_settings, "nginx", "nginx -T")
+}
+
+/// The same for a program of nginx other than `nginx`: `program` for the
+/// versions, `dump` the command that prints its settings (`nginx-fast -T -c
+/// FILE` for F1, whose settings are its own file).
+pub(crate) fn read_fingerprints_of(
+    run: &mut qemu::Run,
+    report: &mut Report,
+    kernel_settings: bool,
+    program: &str,
+    dump: &str,
+) -> Result<(), String> {
     run.send("S=ok")?;
     run.expect("# ", DIALOG_STEP)?;
     report.cpus = capture(run, "nproc", "nproc", DIALOG_STEP)?
@@ -533,7 +653,7 @@ pub(crate) fn read_fingerprints(
             report.system, report.cpus
         ));
     }
-    report.nginx_v = capture(run, "nginx -V 2>&1", "version", DIALOG_STEP)?;
+    report.nginx_v = capture(run, &format!("{program} -V 2>&1"), "version", DIALOG_STEP)?;
     let (nginx, openssl) = check_versions(
         &report.nginx_v,
         &crate::packages::value("nginx", "version")?,
@@ -542,7 +662,7 @@ pub(crate) fn read_fingerprints(
     .map_err(|e| format!("{}: {e}", report.system))?;
     report.nginx = nginx;
     report.openssl = openssl;
-    let dump = capture(run, "nginx -T 2>&1", "config", DIALOG_STEP)?.join("\n");
+    let dump = capture(run, &format!("{dump} 2>&1"), "config", DIALOG_STEP)?.join("\n");
     report.config_digest = config_digest(&dump);
     let www = capture(
         run,
@@ -582,6 +702,28 @@ pub(crate) fn expected() -> Result<(String, String), String> {
         config_digest(&expected_config_output(nginx_conf(), mime)),
         www_digest(&www_files()),
     ))
+}
+
+/// The fingerprints of the settings with TLS: for the rows with `nginx.conf`
+/// and for F1.
+pub(crate) fn expected_tls() -> Result<(String, String), String> {
+    let mime = nginx_probe::mime_types();
+    if mime.is_empty() {
+        return Err("nginx's mime.types is missing: run tools/build-nginx.py".to_owned());
+    }
+    Ok((
+        config_digest(&expected_tls_dump(false, mime)),
+        config_digest(&expected_tls_dump(true, mime)),
+    ))
+}
+
+/// The fingerprints of F1: the settings are its own file (`nginx-fast.conf`),
+/// the files under `/www` are those of the other rows.
+pub(crate) fn expected_fast() -> (String, String) {
+    (
+        config_digest(&expected_fast_config_output(nginx_fast_conf())),
+        www_digest(&www_files()),
+    )
 }
 
 /// Refuses a guest whose fingerprints are not the expected ones.
@@ -643,10 +785,15 @@ fn fetch_all(address: SocketAddr, from: Instant) -> Result<(Duration, Vec<String
 
 /// The machine of both guests, with the MAC suffix of the run.
 pub(crate) fn machine(suffix: &vz::Suffix) -> vz::Machine {
+    machine_with(suffix, 1)
+}
+
+/// The same with `net` network devices (two for F1).
+pub(crate) fn machine_with(suffix: &vz::Suffix, net: usize) -> vz::Machine {
     vz::Machine {
         cpus: Some(CPUS),
         memory_mib: Some(MEMORY_MIB),
-        net: 1,
+        net,
         mac_suffix: suffix.value,
     }
 }
@@ -657,6 +804,8 @@ pub(crate) fn linux_dir() -> PathBuf {
 
 /// `cargo xtask linux-guest build`.
 pub fn build_guest() -> Result<PathBuf, String> {
+    // The overlay carries the key and the certificate of the probe CA (W4, W5).
+    crate::probe_ca::ensure(false)?;
     // The overlay takes `mime.types` of the nginx source, which the build of
     // the network packages unpacks.
     crate::relibc()?;
@@ -1179,6 +1328,122 @@ mod tests {
             ]
         );
         assert!(configure_difference(&linux, &linux).is_empty());
+    }
+
+    #[test]
+    fn the_image_of_f1_starts_init_with_its_own_table_and_holds_nginx_fast() {
+        let programs = bench_fast_programs();
+        assert_eq!(programs[0].0, "init");
+        assert_eq!(programs[0].3, &["table-bench-fast-vz"]);
+        assert!(programs.iter().any(|p| p.0 == "nginx-fast"));
+        assert_eq!(
+            programs.len(),
+            crate::fast_nginx::programs(crate::fast_nginx::Kind::Vz).len()
+        );
+        // The row F1 is the only image of the measurement with two devices,
+        // and its address is the static one of its `netd.conf`.
+        assert!(
+            crate::fast_probe::NETD_CONF_VZ_STATIC
+                .windows(FAST_ADDRESS.len())
+                .any(|w| w == FAST_ADDRESS.as_bytes())
+        );
+    }
+
+    /// Everything of the settings of F1 that the other rows do not have is
+    /// listed: the directives of the allowed list, the types written in the
+    /// file, the path of the pid file and the one port. The `http` block of
+    /// the two files is otherwise the same line for line (breakage 1 of the note).
+    #[test]
+    fn the_settings_of_f1_differ_from_the_others_in_the_listed_lines_alone() {
+        let lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|l| mask_allowed(l.trim()))
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .collect()
+        };
+        let (fast, plain) = (lines(nginx_fast_conf()), lines(nginx_conf()));
+        let only_fast: Vec<_> = fast.iter().filter(|l| !plain.contains(l)).collect();
+        let only_plain: Vec<_> = plain.iter().filter(|l| !fast.contains(l)).collect();
+        assert_eq!(
+            only_fast,
+            [
+                "pid /var/run/nginx-fast.pid;",
+                "worker_shutdown_timeout <allowed>;",
+                "types { text/html html htm; text/plain txt; application/octet-stream bin; }",
+            ],
+            "{only_fast:?}"
+        );
+        assert_eq!(
+            only_plain,
+            ["pid /var/run/nginx.pid;", "include /etc/nginx/mime.types;"],
+            "{only_plain:?}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_of_f1_is_that_of_its_own_file() {
+        let (config, www) = expected_fast();
+        assert_ne!(config, expected().map(|e| e.0).unwrap_or_default());
+        assert_eq!(www, www_digest(&www_files()));
+        // A change in a directive of the http block changes it.
+        let changed =
+            nginx_fast_conf().replace("keepalive_requests 100000", "keepalive_requests 100");
+        assert_ne!(
+            config_digest(&expected_fast_config_output(&changed)),
+            config
+        );
+        // The allowed directives do not.
+        let workers =
+            nginx_fast_conf().replace("worker_connections 1024", "worker_connections 512");
+        assert_eq!(
+            config_digest(&expected_fast_config_output(&workers)),
+            config
+        );
+    }
+
+    /// W4 and W5 change one thing in the settings of the rows: the server
+    /// of TLS, included before the server of HTTP. Every line of the plain
+    /// settings is still there, in its place.
+    #[test]
+    fn the_settings_with_tls_add_the_include_and_change_nothing_else() {
+        for (plain, tls) in [
+            (nginx_conf(), nginx_tls_conf()),
+            (nginx_fast_conf(), nginx_fast_tls_conf()),
+        ] {
+            let added: Vec<&str> = tls
+                .lines()
+                .filter(|l| !plain.lines().any(|p| p == *l))
+                .collect();
+            assert_eq!(added, ["    include /etc/nginx/tls.conf;"]);
+            assert_eq!(tls.lines().count(), plain.lines().count() + 1);
+            assert!(tls.contains("    include /etc/nginx/tls.conf;\n    server {\n"));
+        }
+        assert!(nginx_probe::TLS_CONF.contains("listen 443 ssl"));
+        assert!(nginx_probe::TLS_CONF.contains("ssl_protocols TLSv1.3;"));
+    }
+
+    #[test]
+    fn the_dump_with_tls_names_the_files_in_the_order_nginx_reads_them() {
+        let plain = expected_tls_dump(false, b"types {}\n");
+        let paths: Vec<&str> = plain
+            .lines()
+            .filter(|l| l.starts_with("# configuration file "))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "# configuration file /etc/nginx/nginx-tls.conf:",
+                "# configuration file /etc/nginx/mime.types:",
+                "# configuration file /etc/nginx/tls.conf:"
+            ]
+        );
+        let fast = expected_tls_dump(true, b"types {}\n");
+        assert!(fast.starts_with("# configuration file /etc/nginx/nginx-fast-tls.conf:"));
+        assert!(!fast.contains("mime.types"));
+        // A guest whose server of TLS differs from the file of the sources
+        // has another fingerprint.
+        let changed = fast.replace("ssl_protocols TLSv1.3;", "ssl_protocols TLSv1.2 TLSv1.3;");
+        assert_ne!(config_digest(&changed), config_digest(&fast));
     }
 
     #[test]

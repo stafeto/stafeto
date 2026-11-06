@@ -5,8 +5,10 @@
 //! part 2): `cargo xtask net-bench run|tables`. See `docs/net-bench.md` for
 //! the method; this file holds it.
 //!
-//! The rows are L1 (Linux, nginx with one worker), L4 (Linux, four workers)
-//! and S4 (stafeto, four workers on `netd`'s shared sockets), each on VZ with
+//! The rows are L1 (Linux, nginx with one worker), L4 (Linux, four workers),
+//! S4 (stafeto, four workers on `netd`'s shared sockets) and F1 (stafeto,
+//! `nginx-fast`: one worker with the TCP/IP stack in its process on the
+//! second network device, `netd` out of the data path), each on VZ with
 //! four CPUs and 1 GiB, one guest at a time. The loads are W1 (900 files of
 //! 10 KiB over 64 long connections), W2 (64 files of 256 KiB over 64 long
 //! connections) and W3 (the files of W1, a new connection for each request).
@@ -72,6 +74,9 @@ const MAX_ROUNDS: u32 = 12;
 const SHARES: [u32; 2] = [50, 80];
 /// The warm-up pass over a set before a block, its rate for the set.
 const PASS_RATE: u32 = 2000;
+/// The same for W4 and W5: TLS costs a guest more, and a pass over the set
+/// that overloads it spoils the first step (W2 had that).
+const TLS_PASS_RATE: u32 = 1000;
 /// Idle time after which the cache of nginx's open files may have expired
 /// (`inactive=60s`): the set is passed again.
 const COLD_AFTER: Duration = Duration::from_secs(45);
@@ -79,27 +84,71 @@ const GRID: [u32; 16] = [
     250, 500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000,
     96000,
 ];
+/// The loads whose ceilings a system takes in round `round`: all of them in
+/// the first `rounds` rounds, those of HTTP and the long connections of TLS
+/// (W5 has no closed loop), none after.
+fn ceiling_loads(workloads: &[Workload], round: u32, rounds: u32) -> Vec<Workload> {
+    if round > rounds {
+        return Vec::new();
+    }
+    workloads
+        .iter()
+        .copied()
+        .filter(|w| *w != Workload::W5)
+        .collect()
+}
+
+/// Whether the rounds end after `round`: the rounds with ceilings are all
+/// taken whether the rows have an R* to confirm or not, and the later ones go
+/// on for the open pairs.
+fn rounds_end(round: u32, rounds: u32, max_rounds: u32, all_done: bool) -> bool {
+    round >= max_rounds || (round >= rounds && all_done)
+}
+
+/// The pairs of rows whose ratios the tables print.
+const PAIRS: [(System, System); 4] = [
+    (System::S4, System::L4),
+    (System::F1, System::L4),
+    (System::F1, System::S4),
+    (System::F1, System::L1),
+];
 const GRID_NEW: [u32; 6] = [100, 200, 300, 500, 700, 1000];
 const CONNECTIONS: u32 = 64;
 /// USER_HZ of Linux and of stafeto's `/proc/stat`: a jiffy is 10 ms.
 const JIFFY_US: f64 = 10_000.0;
 const START_WITHIN: Duration = Duration::from_secs(30);
+/// The settings of nginx in the image of F1.
+const FAST_CONF: &str = "/etc/nginx/nginx-fast.conf";
+/// The settings of nginx of the other rows.
+const NGINX_CONF: &str = "/etc/nginx/nginx.conf";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Workload {
     W1,
     W2,
     W3,
+    W4,
+    W5,
 }
 
 impl Workload {
-    const ALL: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
+    const ALL: [Workload; 5] = [
+        Workload::W1,
+        Workload::W2,
+        Workload::W3,
+        Workload::W4,
+        Workload::W5,
+    ];
+    /// The loads of HTTP; W4 and W5 (TLS) are asked for by name.
+    const DEFAULT: [Workload; 3] = [Workload::W1, Workload::W2, Workload::W3];
 
     fn name(self) -> &'static str {
         match self {
             Workload::W1 => "w1",
             Workload::W2 => "w2",
             Workload::W3 => "w3",
+            Workload::W4 => "w4",
+            Workload::W5 => "w5",
         }
     }
 
@@ -108,13 +157,18 @@ impl Workload {
     }
 
     fn keep_alive(self) -> bool {
-        self != Workload::W3
+        !matches!(self, Workload::W3 | Workload::W5)
+    }
+
+    /// Whether the load speaks TLS 1.3 and HTTP/2 (`h2load`, port 443).
+    fn tls(self) -> bool {
+        matches!(self, Workload::W4 | Workload::W5)
     }
 
     /// The paths of the set, in the order the load takes them.
     fn paths(self) -> Vec<String> {
         match self {
-            Workload::W1 | Workload::W3 => (0..linux_guest::W1_FILES)
+            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 => (0..linux_guest::W1_FILES)
                 .map(|n| format!("/s/{n:04}.bin"))
                 .collect(),
             Workload::W2 => (0..linux_guest::W2_FILES)
@@ -125,7 +179,7 @@ impl Workload {
 
     fn length(self) -> usize {
         match self {
-            Workload::W1 | Workload::W3 => linux_guest::W1_LEN,
+            Workload::W1 | Workload::W3 | Workload::W4 | Workload::W5 => linux_guest::W1_LEN,
             Workload::W2 => linux_guest::W2_LEN,
         }
     }
@@ -133,7 +187,7 @@ impl Workload {
     /// The rates of the first walk, from the bottom up.
     fn grid(self) -> Vec<u32> {
         match self {
-            Workload::W1 => GRID.to_vec(),
+            Workload::W1 | Workload::W4 => GRID.to_vec(),
             _ => GRID_NEW
                 .iter()
                 .chain(GRID.iter().filter(|r| **r > 1000))
@@ -160,6 +214,7 @@ impl Workload {
     fn pass(self) -> (u32, u32) {
         match self {
             Workload::W2 => (500, 8),
+            Workload::W4 | Workload::W5 => (TLS_PASS_RATE, 10),
             _ => (PASS_RATE, 10),
         }
     }
@@ -170,34 +225,47 @@ enum System {
     L1,
     L4,
     S4,
+    F1,
 }
 
 impl System {
+    const ALL: [System; 4] = [System::L1, System::L4, System::S4, System::F1];
+
     fn name(self) -> &'static str {
         match self {
             System::L1 => "L1",
             System::L4 => "L4",
             System::S4 => "S4",
+            System::F1 => "F1",
         }
     }
 
     fn of(name: &str) -> Option<System> {
-        [System::L1, System::L4, System::S4]
+        System::ALL
             .into_iter()
             .find(|s| s.name().eq_ignore_ascii_case(name))
     }
 
     fn linux(self) -> bool {
-        self != System::S4
+        !matches!(self, System::S4 | System::F1)
     }
 
     fn workers(self) -> usize {
-        if self == System::L1 { 1 } else { 4 }
+        if matches!(self, System::L1 | System::F1) {
+            1
+        } else {
+            4
+        }
     }
 
-    /// The row this one is compared with (S4 with L4).
+    /// The row this one is compared with (S4 with L4, F1 with L1: a worker
+    /// against a worker).
     fn peer(self) -> Option<System> {
-        (self == System::S4).then_some(System::L4)
+        match self {
+            System::S4 => Some(System::L4),
+            System::F1 => Some(System::L1),
+            _ => None,
+        }
     }
 }
 
@@ -370,6 +438,57 @@ fn measure(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measu
         p99_raw: stage.p99.unwrap_or(0),
         lag_p99: stage.lag_p99.unwrap_or(0),
         lag_max: stage.lag_max.unwrap_or(0),
+        mbps: stage.megabytes_per_second,
+        ..Measured::default()
+    }
+}
+
+/// The largest stall of the generator in `samples`, in ns: the largest gap
+/// between the starts of two neighbouring requests, less four intervals of
+/// the rate. With one thread of `h2load` (rates up to 16 000 a second) all
+/// the connections live in that thread, so its stall opens a gap in the
+/// starts of all of them together, which the phases of the connections do
+/// not touch. With two threads one thread alone can stall unseen, so the
+/// number is a lower bound there.
+fn largest_stall(samples: &[Sample], rate: u32) -> u64 {
+    let allowed = 4_000_000_000 / u64::from(rate.max(1));
+    samples
+        .windows(2)
+        .map(|w| w[1].at.saturating_sub(w[0].at))
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(allowed)
+}
+
+/// The step of `samples` from `h2load`, asked at `rate`. The percentiles are
+/// the log's own, from the start of a request to the end of its answer. The
+/// correction of `measure` does not apply: it reads the requests against one
+/// clock, and `h2load` has a timer for each of its 64 connections, each
+/// starting when its handshake ends, so the starts of the connections meet and
+/// part by a millisecond or two with nothing stalled (the lag so counted
+/// was 1 to 3 ms on the floor, which no `h2load` stall explains). The floor
+/// is the same `h2load` on the loopback and takes that noise in the rule. What
+/// the floor cannot take is a stall of `h2load` in the run of a guest: the
+/// largest stall (`largest_stall`) stands in the place of the p99 of lag, so
+/// that above 0.5 ms the step is marked "generator" and a failure it explains
+/// is noise.
+fn measure_h2(samples: &[Sample], rate: u32, length: usize, malloc: usize) -> Measured {
+    let stage = stage_of(samples, rate, malloc, length);
+    let p99 = stage.p99.unwrap_or(0);
+    let stall = largest_stall(samples, rate);
+    Measured {
+        rate,
+        requests: stage.requests,
+        ok: stage.ok,
+        failed: stage.failed,
+        malloc,
+        achieved: stage.achieved,
+        p50: stage.p50.unwrap_or(0),
+        p99,
+        p999: stage.p999,
+        p99_raw: p99,
+        lag_p99: stall,
+        lag_max: stall,
         mbps: stage.megabytes_per_second,
         ..Measured::default()
     }
@@ -928,9 +1047,150 @@ fn wrk_script(paths: &[String], keep_alive: bool) -> String {
     )
 }
 
-/// One attack of `vegeta` at `base`: `warm` seconds with their results
-/// dropped, then `secs`. On a guest, nginx's console is read through the
-/// step and a line at crit or above ends the run with an error.
+// The load over TLS ----------------------------------------------------------------------
+
+/// The connections of W4 and W5 and how fast `h2load` opens them: `count`
+/// connections every `period` milliseconds (`--rate-period` counts whole
+/// milliseconds), exactly `rate` in a second. A connection of W4 has its
+/// own timer, so connections opened together would send together: they open
+/// one after the other, a request interval apart, and the 64 requests of
+/// each period come evenly. Rounding the period or the count would deliver
+/// less or more than the asked rate (300 a second as one connection every
+/// 4 ms is 250), so the pair is the exact ratio.
+fn connection_pace(rate: u32) -> (u32, u32) {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let rate = rate.max(1);
+    let period = 1000 / gcd(rate, 1000);
+    (rate * period / 1000, period)
+}
+
+/// The arguments of `h2load` for a step of W4 (`keep_alive`: 64 long
+/// connections, 100 streams each at most, each connection at its share of
+/// the rate) or of W5 (a connection for each request, opened at the rate).
+/// It is an open loop: `h2load` sends at the rate whatever the answers do,
+/// and writes the start and the length of each request into `log`.
+fn h2load_args(uris: &Path, rate: u32, secs: u32, keep_alive: bool, log: &Path) -> Vec<String> {
+    let total = u64::from(rate.max(1)) * u64::from(secs);
+    let threads = if rate > 16_000 { 2 } else { 1 };
+    let (count, period) = connection_pace(rate);
+    let mut args = vec![
+        "-i".to_owned(),
+        uris.display().to_string(),
+        format!("-n{total}"),
+        format!("-t{threads}"),
+        // The rate of opening cannot pass the connections there are.
+        format!(
+            "-r{}",
+            count
+                .max(threads)
+                .min(if keep_alive { CONNECTIONS } else { u32::MAX })
+        ),
+        format!("--rate-period={period}ms"),
+        format!("--log-file={}", log.display()),
+    ];
+    if keep_alive {
+        args.extend([
+            format!("-c{CONNECTIONS}"),
+            "-m100".to_owned(),
+            format!("--rps={:.6}", f64::from(rate) / f64::from(CONNECTIONS)),
+        ]);
+    } else {
+        args.extend([format!("-c{total}"), "-m1".to_owned()]);
+    }
+    args
+}
+
+/// The ceiling of W4 as `wrk -c64` finds it for W1: `connections` long
+/// connections with one request in flight on each, as fast as the guest
+/// answers (ten streams on each hang the guest of F1 after 640 requests).
+/// There is no warm-up of its own: `/proc/stat` is read around the whole run
+/// and the requests `h2load` counts are those of the whole run, so the CPU
+/// time per request has the same window in both.
+fn h2load_ceiling_args(uris: &Path, connections: u32, secs: u32) -> Vec<String> {
+    vec![
+        "-i".to_owned(),
+        uris.display().to_string(),
+        format!("-c{connections}"),
+        "-m1".to_owned(),
+        "-t2".to_owned(),
+        format!("-D{secs}s"),
+    ]
+}
+
+fn write_uris(path: &Path, base: &str, paths: &[String]) -> Result<(), String> {
+    let text: String = paths.iter().map(|p| format!("{base}{p}\n")).collect();
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The requests of a log of `h2load`: lines of the start (microseconds since
+/// the epoch), the status and the time to the end of the answer
+/// (microseconds). The lines are in the order of the ends of the answers;
+/// the samples are in the order of the starts, numbered in that order, so
+/// that the schedule of the rate (`lags`) reads them as it reads `vegeta`'s.
+fn parse_h2load_log(text: &str) -> Vec<Sample> {
+    let mut samples: Vec<Sample> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let at: u64 = fields.next()?.trim().parse().ok()?;
+            let code: u16 = fields.next()?.trim().parse().ok()?;
+            let micros: u64 = fields.next()?.trim().parse().ok()?;
+            Some(Sample {
+                at: at * 1000,
+                code,
+                latency: micros * 1000,
+                seq: 0,
+            })
+        })
+        .collect();
+    samples.sort_by_key(|s| s.at);
+    for (n, s) in samples.iter_mut().enumerate() {
+        s.seq = n as u64;
+    }
+    samples
+}
+
+/// The numbers of the summary of `h2load` at the end of a run of the
+/// ceiling, in the fields `wrk` has: requests done, rate, transfer, errored
+/// requests (as connect), timeouts, answers other than 2xx.
+fn parse_h2load(text: &str) -> Option<Wrk> {
+    let mut found = Wrk::default();
+    let mut rate = false;
+    let number = |line: &str, label: &str| -> Option<u64> {
+        let before = line.split(label).next()?;
+        before
+            .rsplit([' ', ','])
+            .find(|w| !w.is_empty())?
+            .parse()
+            .ok()
+    };
+    let mut ok2xx = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("finished in ") {
+            let mut parts = rest.split(", ");
+            found.seconds = parts.next()?.trim_end_matches('s').parse().ok()?;
+            found.per_second = parts.next()?.trim_end_matches(" req/s").parse().ok()?;
+            found.transfer = parts.next()?.trim_end_matches("/s").to_owned();
+            rate = true;
+        } else if line.starts_with("requests: ") {
+            found.requests = number(line, " done")?;
+            found.connect = number(line, " errored")?;
+            found.timeout = number(line, " timeout")?;
+        } else if line.starts_with("status codes: ") {
+            ok2xx = number(line, " 2xx")?;
+        }
+    }
+    found.non_2xx = found.requests.saturating_sub(ok2xx);
+    rate.then_some(found)
+}
+
+/// One attack of `vegeta` at `base` (W1 to W3) or of `h2load` (W4 and W5):
+/// `warm` seconds with their results dropped, then `secs`. On a guest,
+/// nginx's console is read through the step and a line at crit or above ends
+/// the run with an error.
 #[allow(clippy::too_many_arguments)]
 fn attack(
     raw: &Path,
@@ -944,38 +1204,61 @@ fn attack(
     keep_alive: bool,
 ) -> Result<Measured, String> {
     let tag = slug(key);
+    let (program, extension) = if wl.tls() {
+        ("h2load", "log")
+    } else {
+        ("vegeta", "bin")
+    };
     let targets = raw.join(format!("targets-{tag}.txt"));
-    write_targets(&targets, base, &wl.paths())?;
+    if wl.tls() {
+        write_uris(&targets, base, &wl.paths())?;
+    } else {
+        write_targets(&targets, base, &wl.paths())?;
+    }
     let mut go =
         |name: &str, seconds: u32, out: &Path| -> Result<(Option<String>, usize), String> {
-            let args = vegeta_args(&targets, rate, seconds, keep_alive, out);
+            let args = if wl.tls() {
+                h2load_args(&targets, rate, seconds, keep_alive, out)
+            } else {
+                vegeta_args(&targets, rate, seconds, keep_alive, out)
+            };
             match guest.as_deref_mut() {
                 Some(run) => {
                     let mut server = Server::Guest(run);
                     let mark = server.mark()?;
-                    let (_, seen) =
-                        watched(&mut server, raw, name, "vegeta", &args, seconds, None)?;
+                    let (_, seen) = watched(&mut server, raw, name, program, &args, seconds, None)?;
                     let log = server.log_since(mark)?;
                     let mut found = alerts(&log);
                     found.extend(seen);
                     Ok((found.first().cloned(), malloc_failures(&log)))
                 }
                 None => {
-                    run_tool(raw, name, "vegeta", &args)?;
+                    run_tool(raw, name, program, &args)?;
                     Ok((None, 0))
                 }
             }
         };
     if warm > 0 {
-        let out = raw.join(format!("{tag}-warm.bin"));
-        let (alert, _) = go(&format!("vegeta-{tag}-warm.txt"), warm, &out)?;
+        let out = raw.join(format!("{tag}-warm.{extension}"));
+        let (alert, _) = go(&format!("{program}-{tag}-warm.txt"), warm, &out)?;
         let _ = std::fs::remove_file(&out);
         stop_on(&format!("{key} (warm-up)"), &Vec::from_iter(alert))?;
     }
-    let results = raw.join(format!("{tag}.bin"));
-    let (alert, malloc) = go(&format!("vegeta-{tag}.txt"), secs, &results)?;
-    let samples = samples_of(&results)?;
-    let mut m = measure(&samples, rate, wl.length(), malloc);
+    let results = raw.join(format!("{tag}.{extension}"));
+    let (alert, malloc) = go(&format!("{program}-{tag}.txt"), secs, &results)?;
+    let samples = if wl.tls() {
+        parse_h2load_log(
+            &std::fs::read_to_string(&results)
+                .map_err(|e| format!("{}: {e}", results.display()))?,
+        )
+    } else {
+        samples_of(&results)?
+    };
+    let mut m = if wl.tls() {
+        measure_h2(&samples, rate, wl.length(), malloc)
+    } else {
+        measure(&samples, rate, wl.length(), malloc)
+    };
     m.seconds = secs;
     m.alert = alert;
     std::fs::write(
@@ -992,7 +1275,23 @@ fn attack(
 struct Floor {
     child: Child,
     port: u16,
+    /// The port of the server of TLS 1.3 and HTTP/2 of the same nginx.
+    tls_port: u16,
     root: PathBuf,
+}
+
+/// The settings of the floor: those of `host_conf` and a second server of
+/// TLS 1.3 with HTTP/2 on its own port, with the key and certificate of the
+/// probe CA in the floor's directory.
+fn floor_conf(root: &Path, port: u16, tls_port: u16) -> String {
+    let d = root.display();
+    nginx_probe::replaced(
+        &nginx_bench::host_conf(root, port),
+        "    server {\n",
+        &format!(
+            "    server {{\n        listen 127.0.0.1:{tls_port} ssl;\n        http2 on;\n        server_name _;\n        root {d}/www;\n        ssl_certificate {d}/server.crt;\n        ssl_certificate_key {d}/server.key;\n        ssl_protocols TLSv1.3;\n        ssl_session_cache shared:SSL:1m;\n        ssl_session_tickets on;\n        ssl_buffer_size 16k;\n        location / {{ }}\n    }}\n    server {{\n"
+        ),
+    )
 }
 
 impl Floor {
@@ -1008,8 +1307,18 @@ impl Floor {
                 .map_err(|e| format!("{path}: {e}"))?;
         }
         let port = crate::net_curl::free_tcp_port()?;
+        let mut tls_port = port;
+        while tls_port == port {
+            tls_port = crate::net_curl::free_tcp_port()?;
+        }
+        for (name, bytes) in [
+            ("server.crt", crate::probe_ca::nginx_certificate()),
+            ("server.key", crate::probe_ca::nginx_key()),
+        ] {
+            std::fs::write(root.join(name), bytes).map_err(|e| format!("{name}: {e}"))?;
+        }
         let conf = root.join("nginx.conf");
-        std::fs::write(&conf, nginx_bench::host_conf(&root, port))
+        std::fs::write(&conf, floor_conf(&root, port, tls_port))
             .map_err(|e| format!("nginx.conf: {e}"))?;
         let log =
             std::fs::File::create(root.join("error.log")).map_err(|e| format!("error.log: {e}"))?;
@@ -1023,7 +1332,12 @@ impl Floor {
             .stderr(log)
             .spawn()
             .map_err(|e| format!("nginx of Homebrew: {e} (brew install nginx)"))?;
-        let floor = Floor { child, port, root };
+        let floor = Floor {
+            child,
+            port,
+            tls_port,
+            root,
+        };
         let address: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
         let started = Instant::now();
         while Connection::open(address, Duration::from_secs(2))
@@ -1061,10 +1375,18 @@ impl Floor {
 
 /// What a run builds before it boots anything.
 struct Prepared {
+    /// The fingerprints of the settings with TLS (W4, W5): the rows with
+    /// `nginx.conf`, and F1.
+    config_tls: String,
+    fast_config_tls: String,
     linux: PathBuf,
     kernel: PathBuf,
     image: PathBuf,
+    /// The image of F1.
+    fast_image: PathBuf,
     config: String,
+    /// The fingerprint of the settings of F1 (its own file).
+    fast_config: String,
     www: String,
 }
 
@@ -1080,6 +1402,8 @@ struct Window {
 
 struct Guest {
     sys: System,
+    /// Whether nginx runs the settings with the server of TLS.
+    tls: bool,
     run: qemu::Run,
     address: SocketAddr,
     mac: String,
@@ -1219,7 +1543,44 @@ fn expect_fetch(address: SocketAddr) -> Result<(), String> {
     }
 }
 
-fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
+/// The first file over TLS and HTTP/2 from the Mac (the server speaks TLS 1.3
+/// alone, and the curl of macOS has no option to ask for it): the protocol is
+/// HTTP/2 and the bytes are the file's. The certificate of the probe CA is
+/// not checked here (the load does not check it either).
+fn expect_tls(address: Ipv4Addr) -> Result<(), String> {
+    let out = Command::new("curl")
+        .args([
+            "-sk",
+            "--http2",
+            "--max-time",
+            "10",
+            "-w",
+            "\n%{http_version}",
+            &format!("https://{address}:443/s/0000.bin"),
+        ])
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    let wanted = linux_guest::www_files()
+        .into_iter()
+        .find(|f| f.0 == "/www/s/0000.bin")
+        .map(|f| f.1)
+        .ok_or("no /www/s/0000.bin")?;
+    let split = out
+        .stdout
+        .len()
+        .checked_sub(2)
+        .filter(|at| out.stdout.get(*at..) == Some(b"\n2"))
+        .ok_or_else(|| {
+            format!(
+                "the first request over TLS did not use HTTP/2 (curl {:?}: {})",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+    nginx_probe::same("GET /s/0000.bin over TLS", &out.stdout[..split], wanted)
+}
+
+fn boot_linux(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
     let suffix = vz::claim_suffix()?;
     let mut report = Report {
         system: sys.name(),
@@ -1263,33 +1624,58 @@ fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
         run.expect_line("ready", |l| l == "linux-guest: ready", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         linux_guest::workers_up(&mut run, DIALOG_STEP, 4)?;
-        linux_guest::read_fingerprints(&mut run, &mut report, false)?;
-        linux_guest::verify(&report, &prep.config, &prep.www)?;
+        let conf = if tls {
+            linux_guest::TLS_CONF
+        } else {
+            NGINX_CONF
+        };
+        if tls {
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx",
+                &format!("nginx -T -c {conf}"),
+            )?;
+        } else {
+            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+        }
+        let wanted = if tls { &prep.config_tls } else { &prep.config };
+        linux_guest::verify(&report, wanted, &prep.www)?;
         run.send("M=$(cat /var/run/nginx.pid)")?;
-        if sys.workers() == 1 {
-            // The same settings with one worker, the one allowed difference.
+        if sys.workers() == 1 || tls {
+            // The settings of the row: one worker for L1, the one allowed
+            // difference, and the server of TLS for W4 and W5.
+            let workers = sys.workers();
             let from = run.lines().len();
-            run.send("sed 's/^worker_processes 4;/worker_processes 1;/' /etc/nginx/nginx.conf > /tmp/one.conf; kill -QUIT $M; while kill -0 $M 2>/dev/null; do sleep 0.2; done; nginx -c /tmp/one.conf & M=$!")?;
+            run.send(&format!("sed 's/^worker_processes 4;/worker_processes {workers};/' {conf} > /tmp/run.conf; kill -QUIT $M; while kill -0 $M 2>/dev/null; do sleep 0.2; done; nginx -c /tmp/run.conf & M=$!"))?;
             nginx_probe::marker(&mut run, "one", START_WITHIN)?;
             let started = Instant::now();
             while run.lines()[from..]
                 .iter()
                 .filter(|l| l.contains("start worker process "))
                 .count()
-                < 1
+                < workers
             {
                 if started.elapsed() > START_WITHIN {
-                    return Err("the worker of L1 did not start".to_owned());
+                    return Err(format!(
+                        "the {workers} workers of {} did not start",
+                        sys.name()
+                    ));
                 }
                 let _ = run.expect_seen("\u{0}pump", Duration::from_millis(100));
             }
         }
         expect_fetch((address, 80).into())?;
+        if tls {
+            expect_tls(address)?;
+        }
         Ok(address)
     })();
     match result {
         Ok(address) => Ok(Guest {
             sys,
+            tls,
             run,
             address: (address, 80).into(),
             mac: report.mac.clone(),
@@ -1307,14 +1693,17 @@ fn boot_linux(prep: &Prepared, sys: System) -> Result<Guest, String> {
     }
 }
 
-fn boot_stafeto(prep: &Prepared) -> Result<Guest, String> {
+fn boot_stafeto(prep: &Prepared, sys: System, tls: bool) -> Result<Guest, String> {
+    let fast = sys == System::F1;
     let suffix = vz::claim_suffix()?;
     let mut report = Report {
-        system: "S4",
+        system: sys.name(),
         ..Report::default()
     };
     let (load_start, others_start) = (load_now(), nginx_bench::other_guests(0));
-    let command = vz::command_on(&prep.kernel, &prep.image, linux_guest::machine(&suffix))?;
+    let image = if fast { &prep.fast_image } else { &prep.image };
+    let machine = linux_guest::machine_with(&suffix, if fast { 2 } else { 1 });
+    let command = vz::command_on(&prep.kernel, image, machine)?;
     let mut run = qemu::Run::start(command, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
@@ -1333,21 +1722,78 @@ fn boot_stafeto(prep: &Prepared) -> Result<Guest, String> {
             .map(|m| m.trim().to_owned())
             .ok_or_else(|| format!("the driver's line {driver:?} names no MAC"))?;
         net_vz::lease_is_ours("net-bench", &vz::mac(suffix.value, 0), lease.address)?;
-        run.send("nginx -c /etc/nginx/nginx.conf & M=$!")?;
+        if fast {
+            // The stack starts with the program, on the second device: the
+            // address the load goes to is the static one of `netd.conf`.
+            let conf = if tls {
+                linux_guest::FAST_TLS_CONF
+            } else {
+                FAST_CONF
+            };
+            run.send(&format!("nginx-fast -c {conf} & M=$!"))?;
+            run.expect_line(
+                "the stack",
+                |l| l.contains("fast: the stack is up on "),
+                START_WITHIN,
+            )?;
+            linux_guest::workers_up(&mut run, DIALOG_STEP, 1)?;
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx-fast",
+                &format!("nginx-fast -T -c {conf}"),
+            )?;
+            let wanted = if tls {
+                &prep.fast_config_tls
+            } else {
+                &prep.fast_config
+            };
+            linux_guest::verify(&report, wanted, &prep.www)?;
+            let address: Ipv4Addr = linux_guest::FAST_ADDRESS
+                .parse()
+                .map_err(|e| format!("{e}"))?;
+            expect_fetch((address, 80).into())?;
+            if tls {
+                expect_tls(address)?;
+            }
+            return Ok(address);
+        }
+        let conf = if tls {
+            linux_guest::TLS_CONF
+        } else {
+            NGINX_CONF
+        };
+        run.send(&format!("nginx -c {conf} & M=$!"))?;
         run.expect_line(
             "the event method",
             |l| l.contains("using the \"epoll\" event method"),
             START_WITHIN,
         )?;
         linux_guest::workers_up(&mut run, DIALOG_STEP, 4)?;
-        linux_guest::read_fingerprints(&mut run, &mut report, false)?;
-        linux_guest::verify(&report, &prep.config, &prep.www)?;
+        if tls {
+            linux_guest::read_fingerprints_of(
+                &mut run,
+                &mut report,
+                false,
+                "nginx",
+                &format!("nginx -T -c {conf}"),
+            )?;
+        } else {
+            linux_guest::read_fingerprints(&mut run, &mut report, false)?;
+        }
+        let wanted = if tls { &prep.config_tls } else { &prep.config };
+        linux_guest::verify(&report, wanted, &prep.www)?;
         expect_fetch((lease.address, 80).into())?;
+        if tls {
+            expect_tls(lease.address)?;
+        }
         Ok(lease.address)
     })();
     match result {
         Ok(address) => Ok(Guest {
-            sys: System::S4,
+            sys,
+            tls,
             run,
             address: (address, 80).into(),
             mac: report.mac.clone(),
@@ -1373,6 +1819,8 @@ struct Options {
     workloads: Vec<Workload>,
     phases: Vec<String>,
     rounds: u32,
+    /// The most rounds, those after `rounds` taking the open pairs alone.
+    max_rounds: u32,
     /// Seconds of the warm-up and of a step of the first walk.
     warm: u32,
     stage: u32,
@@ -1403,14 +1851,15 @@ enum ImageKind {
     Cpu0,
 }
 
-const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4] [--workloads w1,w2,w3] [--phases nat,sweep,rounds] [--rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--quick] [--resume DIR] | tables DIR";
+const USAGE: &str = "usage: cargo xtask net-bench run [--systems l1,l4,s4,f1] [--workloads w1,w2,w3,w4,w5] [--phases nat,sweep,rounds] [--rounds N] [--max-rounds N] [--warm S] [--stage S] [--confirm S] [--confirm-warm S] [--cap S] [--floor S] [--ceiling S] [--nat S] [--max-rate R] [--image plain|profile|pinned|cpu0] [--quick] [--resume DIR] | tables DIR";
 
 fn options(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
         systems: vec![System::L1, System::L4, System::S4],
-        workloads: Workload::ALL.to_vec(),
+        workloads: Workload::DEFAULT.to_vec(),
         phases: ["nat", "sweep", "rounds"].map(str::to_owned).to_vec(),
         rounds: CONFIRMS,
+        max_rounds: MAX_ROUNDS,
         warm: 10,
         stage: 60,
         confirm: 300,
@@ -1438,15 +1887,15 @@ fn options(args: &[String]) -> Result<Options, String> {
             "--systems" => {
                 o.systems = value(arg)?
                     .split(',')
-                    .map(|s| System::of(s).ok_or_else(|| format!("no system {s:?} (l1, l4, s4)")))
+                    .map(|s| {
+                        System::of(s).ok_or_else(|| format!("no system {s:?} (l1, l4, s4, f1)"))
+                    })
                     .collect::<Result<_, _>>()?
             }
             "--workloads" => {
                 o.workloads = value(arg)?
                     .split(',')
-                    .map(|s| {
-                        Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1, w2, w3)"))
-                    })
+                    .map(|s| Workload::of(s).ok_or_else(|| format!("no workload {s:?} (w1 to w5)")))
                     .collect::<Result<_, _>>()?
             }
             "--image" => {
@@ -1462,6 +1911,7 @@ fn options(args: &[String]) -> Result<Options, String> {
             }
             "--phases" => o.phases = value(arg)?.split(',').map(str::to_owned).collect(),
             "--rounds" => o.rounds = number(value(arg)?, arg)?,
+            "--max-rounds" => o.max_rounds = number(value(arg)?, arg)?,
             "--warm" => o.warm = number(value(arg)?, arg)?,
             "--stage" => o.stage = number(value(arg)?, arg)?,
             "--confirm" => o.confirm = number(value(arg)?, arg)?,
@@ -1488,6 +1938,18 @@ fn options(args: &[String]) -> Result<Options, String> {
     }
     if o.rounds == 0 {
         return Err("--rounds 0".to_owned());
+    }
+    if o.max_rounds < o.rounds || o.max_rounds > MAX_ROUNDS {
+        return Err(format!(
+            "--max-rounds {} is below --rounds {} or above {MAX_ROUNDS}",
+            o.max_rounds, o.rounds
+        ));
+    }
+    if o.image != ImageKind::Plain && o.systems.contains(&System::F1) {
+        return Err(
+            "--image has no variant of F1: its image is boot-net-bench-fast.img (run F1 apart from --image)"
+                .to_owned(),
+        );
     }
     Ok(o)
 }
@@ -1523,15 +1985,19 @@ impl Bench {
     }
 
     /// Brings `sys` up if it is not the guest that stands.
-    fn boot(&mut self, sys: System) -> Result<(), String> {
-        if self.guest.as_ref().is_some_and(|g| g.sys == sys) {
+    fn boot(&mut self, sys: System, tls: bool) -> Result<(), String> {
+        if self
+            .guest
+            .as_ref()
+            .is_some_and(|g| g.sys == sys && g.tls == tls)
+        {
             return Ok(());
         }
         self.release();
         let guest = if sys.linux() {
-            boot_linux(&self.prep, sys)
+            boot_linux(&self.prep, sys, tls)
         } else {
-            boot_stafeto(&self.prep)
+            boot_stafeto(&self.prep, sys, tls)
         };
         match guest {
             Ok(g) => {
@@ -1606,12 +2072,16 @@ impl Bench {
         if let Some(m) = self.measured(key) {
             return Ok(m);
         }
-        self.boot(sys)?;
+        self.boot(sys, wl.tls())?;
         let raw = self.raw.clone();
-        let profiled = self.opts.image != ImageKind::Plain && !sys.linux();
+        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
-            let base = format!("http://{}", g.address);
+            let base = if wl.tls() {
+                format!("https://{}:443", g.address.ip())
+            } else {
+                format!("http://{}", g.address)
+            };
             if g.warmed
                 .is_none_or(|(w, t)| w != wl || t.elapsed() > COLD_AFTER)
             {
@@ -1697,8 +2167,12 @@ impl Bench {
         if let Some(m) = self.measured(key) {
             return Ok(m);
         }
-        let port = self.floor.as_ref().ok_or("the floor is not up")?.port;
-        let base = format!("http://127.0.0.1:{port}");
+        let floor = self.floor.as_ref().ok_or("the floor is not up")?;
+        let base = if wl.tls() {
+            format!("https://127.0.0.1:{}", floor.tls_port)
+        } else {
+            format!("http://127.0.0.1:{}", floor.port)
+        };
         let mut m = attack(
             &self.raw,
             None,
@@ -1806,39 +2280,59 @@ impl Bench {
         if self.get(key).is_some() {
             return Ok(());
         }
-        self.boot(sys)?;
+        self.boot(sys, wl.tls())?;
         let (raw, secs) = (self.raw.clone(), self.opts.ceiling);
-        let profiled = self.opts.image != ImageKind::Plain && !sys.linux();
+        let profiled = self.opts.image != ImageKind::Plain && sys == System::S4;
         let script = raw.join(format!("wrk-{}.lua", wl.name()));
         std::fs::write(&script, wrk_script(&wl.paths(), wl.keep_alive()))
             .map_err(|e| format!("{}: {e}", script.display()))?;
+        let uris = raw.join(format!("uris-{}.txt", slug(key)));
         let result = (|| {
             let g = self.guest.as_mut().ok_or("no guest")?;
-            let args: Vec<String> = [
-                "-t2".to_owned(),
-                format!("-c{connections}"),
-                format!("-d{secs}s"),
-                "--timeout".to_owned(),
-                "10s".to_owned(),
-                "-s".to_owned(),
-                script.display().to_string(),
-                format!("http://{}/", g.address),
-            ]
-            .to_vec();
+            // W4: `h2load` with the connections open and streams to fill
+            // them, as fast as the guest answers; the others: `wrk`.
+            let (program, args): (&str, Vec<String>) = if wl.tls() {
+                write_uris(
+                    &uris,
+                    &format!("https://{}:443", g.address.ip()),
+                    &wl.paths(),
+                )?;
+                ("h2load", h2load_ceiling_args(&uris, connections, secs))
+            } else {
+                (
+                    "wrk",
+                    [
+                        "-t2".to_owned(),
+                        format!("-c{connections}"),
+                        format!("-d{secs}s"),
+                        "--timeout".to_owned(),
+                        "10s".to_owned(),
+                        "-s".to_owned(),
+                        script.display().to_string(),
+                        format!("http://{}/", g.address),
+                    ]
+                    .to_vec(),
+                )
+            };
             let before = g.open_window(profiled)?;
             let mut server = Server::Guest(&mut g.run);
             let mark = server.mark()?;
             let (text, seen) = watched(
                 &mut server,
                 &raw,
-                &format!("wrk-{}.txt", slug(key)),
-                "wrk",
+                &format!("{program}-{}.txt", slug(key)),
+                program,
                 &args,
                 secs,
                 None,
             )?;
             let log = server.log_since(mark)?;
-            let wrk = parse_wrk(&text).ok_or_else(|| format!("wrk printed no rate: {text}"))?;
+            let wrk = if wl.tls() {
+                parse_h2load(&text)
+            } else {
+                parse_wrk(&text)
+            }
+            .ok_or_else(|| format!("{program} printed no rate: {text}"))?;
             let cpu = g.close_window(&before, wrk.requests as usize)?;
             let mut found = alerts(&log);
             found.extend(seen);
@@ -1905,7 +2399,7 @@ impl Bench {
                 if self.get(&key).is_some() {
                     continue;
                 }
-                self.boot(System::L4)?;
+                self.boot(System::L4, false)?;
                 let address = self.guest.as_ref().ok_or("no guest")?.address.ip();
                 let mut args = vec![
                     "-c".to_owned(),
@@ -1956,9 +2450,25 @@ impl Bench {
                 }
             }
         }
-        for round in 1..=MAX_ROUNDS {
+        for round in 1..=self.opts.max_rounds {
             self.phase = format!("round {round}");
             for sys in order(&self.opts.systems.clone(), round) {
+                // The ceilings of every load of the system come first, with
+                // or without an R* (a row that holds no 1 ms, S4 on W2 or F1,
+                // has its ceiling and its CPU time all the same).
+                // W5 has no ceiling: a connection for each request has no
+                // closed loop that `h2load` runs.
+                let loads = ceiling_loads(&self.opts.workloads, round, self.opts.rounds);
+                for wl in loads {
+                    for c in [CONNECTIONS, wl.criterion()] {
+                        self.ceiling(
+                            &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
+                            sys,
+                            wl,
+                            c,
+                        )?;
+                    }
+                }
                 let pairs: Vec<Workload> = self
                     .opts
                     .workloads
@@ -1984,16 +2494,6 @@ impl Bench {
                             *rate,
                         )?;
                     }
-                    if round <= self.opts.rounds {
-                        for c in [CONNECTIONS, wl.criterion()] {
-                            self.ceiling(
-                                &format!("ceiling.r{round}.{}.{}.c{c}", sys.name(), wl.name()),
-                                sys,
-                                wl,
-                                c,
-                            )?;
-                        }
-                    }
                     let verdict = self.confirm_run(round, sys, wl, confirm.rstar)?;
                     if round <= self.opts.rounds {
                         for (share, rate) in SHARES.iter().zip(&rates[1..]) {
@@ -2015,7 +2515,8 @@ impl Bench {
                 }
                 self.release();
             }
-            if states.values().all(|(_, c)| c.done()) {
+            let all_done = states.values().all(|(_, c)| c.done());
+            if rounds_end(round, self.opts.rounds, self.opts.max_rounds, all_done) {
                 break;
             }
         }
@@ -2339,7 +2840,7 @@ impl Results {
     fn rows(&self) -> Vec<(Workload, System)> {
         let mut rows = Vec::new();
         for wl in Workload::ALL {
-            for sys in [System::L1, System::L4, System::S4] {
+            for sys in System::ALL {
                 if self
                     .recs
                     .contains_key(&format!("search.{}.{}", sys.name(), wl.name()))
@@ -2508,62 +3009,72 @@ impl Results {
 
     fn table_ratios(&self) -> String {
         let mut t = String::from(
-            "### Table 2a. Ratios of stafeto to Linux (S4 over L4)\n\nBy R* over the recorded runs (not paired: the runs of the two rows were taken in different rounds, some at other loads of the Mac):\n\n| load | R* S4 | R* L4 | S4 / L4 |\n|---|---|---|---|\n",
+            "### Table 2a. Ratios between the rows (S4 over L4; F1 over L4, S4 and L1)\n\n",
         );
-        for wl in Workload::ALL {
-            if let (Some(s), Some(l)) = (
-                self.confirmed(System::S4, wl),
-                self.confirmed(System::L4, wl),
-            ) {
-                let mark = |c: &Conf| {
-                    format!(
-                        "{}{}",
-                        c.rate,
-                        if c.proven { "" } else { " (not confirmed)" }
-                    )
-                };
-                t += &format!(
-                    "| {} | {} | {} | {} |\n",
-                    wl.name().to_uppercase(),
-                    mark(&s),
-                    mark(&l),
-                    if l.rate == 0 {
-                        "-".to_owned()
-                    } else {
-                        format!("{:.2}", f64::from(s.rate) / f64::from(l.rate))
-                    }
-                );
+        for (a, b) in PAIRS {
+            let (an, bn) = (a.name(), b.name());
+            let mut by_rstar = String::new();
+            for wl in Workload::ALL {
+                if let (Some(x), Some(y)) = (self.confirmed(a, wl), self.confirmed(b, wl)) {
+                    let mark = |c: &Conf| {
+                        format!(
+                            "{}{}",
+                            c.rate,
+                            if c.proven { "" } else { " (not confirmed)" }
+                        )
+                    };
+                    by_rstar += &format!(
+                        "| {} | {} | {} | {} |\n",
+                        wl.name().to_uppercase(),
+                        mark(&x),
+                        mark(&y),
+                        if y.rate == 0 {
+                            "-".to_owned()
+                        } else {
+                            format!("{:.2}", f64::from(x.rate) / f64::from(y.rate))
+                        }
+                    );
+                }
             }
-        }
-        t += "\nBy the ceiling of `wrk -c64`, paired in each round (the Mac's one-minute load at the start and at the end of each guest):\n\n| load | round | S4 requests/s | L4 requests/s | S4 / L4 | load of S4 | load of L4 |\n|---|---|---|---|---|---|---|\n";
-        for wl in Workload::ALL {
-            for round in 1..=MAX_ROUNDS {
-                let rps = |sys: System| {
-                    self.num(
-                        &format!(
-                            "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
-                            sys.name(),
-                            wl.name()
-                        ),
-                        "per_second",
-                    )
-                };
-                let (Some(s), Some(l)) = (rps(System::S4), rps(System::L4)) else {
-                    continue;
-                };
-                let phase = format!("round {round}");
-                let load = |sys: System| {
-                    self.boot_load(&phase, sys)
-                        .map_or("-".to_owned(), |(a, b)| format!("{a:.2} / {b:.2}"))
-                };
-                t += &format!(
-                    "| {} | {round} | {s:.0} | {l:.0} | {:.4} | {} | {} |\n",
-                    wl.name().to_uppercase(),
-                    s / l,
-                    load(System::S4),
-                    load(System::L4)
-                );
+            let mut by_ceiling = String::new();
+            for wl in Workload::ALL {
+                for round in 1..=MAX_ROUNDS {
+                    let rps = |sys: System| {
+                        self.num(
+                            &format!(
+                                "ceiling.r{round}.{}.{}.c{CONNECTIONS}",
+                                sys.name(),
+                                wl.name()
+                            ),
+                            "per_second",
+                        )
+                    };
+                    let (Some(x), Some(y)) = (rps(a), rps(b)) else {
+                        continue;
+                    };
+                    let phase = format!("round {round}");
+                    let load = |sys: System| {
+                        self.boot_load(&phase, sys)
+                            .map_or("-".to_owned(), |(p, q)| format!("{p:.2} / {q:.2}"))
+                    };
+                    by_ceiling += &format!(
+                        "| {} | {round} | {x:.0} | {y:.0} | {:.4} | {} | {} |\n",
+                        wl.name().to_uppercase(),
+                        x / y,
+                        load(a),
+                        load(b)
+                    );
+                }
             }
+            if by_rstar.is_empty() && by_ceiling.is_empty() {
+                continue;
+            }
+            t += &format!(
+                "#### {an} over {bn}\n\nBy R* over the recorded runs (not paired: the runs of the two rows were taken in different rounds, some at other loads of the Mac):\n\n| load | R* {an} | R* {bn} | {an} / {bn} |\n|---|---|---|---|\n{by_rstar}"
+            );
+            t += &format!(
+                "\nBy the ceiling of `wrk -c64`, paired in each round (the Mac's one-minute load at the start and at the end of each guest):\n\n| load | round | {an} requests/s | {bn} requests/s | {an} / {bn} | load of {an} | load of {bn} |\n|---|---|---|---|---|---|---|\n{by_ceiling}\n"
+            );
         }
         t
     }
@@ -2573,7 +3084,7 @@ impl Results {
             "### Table 4. At the rates of the walk both rows of a pair hold (R* of the walk under the present rule) (one run each, the length of a step of the walk)\n\n| load | pair | rate | p50 ms | p99 ms | p99.9 ms | the other row: p50 | p99 | p99.9 |\n|---|---|---|---|---|---|---|---|---|\n",
         );
         for wl in Workload::ALL {
-            for sys in [System::S4] {
+            for sys in [System::S4, System::F1] {
                 let Some(peer) = sys.peer() else { continue };
                 let (Some(a), Some(b)) = (
                     self.search_of(sys, wl).and_then(|f| f.0.rstar),
@@ -2662,7 +3173,7 @@ impl Results {
         let mut t = String::from(
             "### Table 8. W3 by rate (new connection for each request)\n\n| system | rate | achieved/s | answers 200 | failed | p99 ms | counters after | marks |\n|---|---|---|---|---|---|---|---|\n",
         );
-        for sys in [System::L1, System::L4, System::S4] {
+        for sys in System::ALL {
             for (k, m) in self.all(&format!("sweep.{}.w3.", sys.name())) {
                 if !k.ends_with(".0") {
                     continue;
@@ -2728,7 +3239,7 @@ fn tables(dir: &Path) -> Result<String, String> {
 
 // The command ---------------------------------------------------------------------------
 
-fn tools_present(phases: &[String]) -> Result<(), String> {
+fn tools_present(phases: &[String], workloads: &[Workload]) -> Result<(), String> {
     let mut tools = vec![
         ("vegeta", "-version"),
         ("wrk", "--version"),
@@ -2737,16 +3248,21 @@ fn tools_present(phases: &[String]) -> Result<(), String> {
     if phases.iter().any(|p| p == "nat") {
         tools.push(("iperf3", "--version"));
     }
+    if workloads.iter().any(|w| w.tls()) {
+        tools.push(("h2load", "--version"));
+        tools.push(("curl", "--version"));
+    }
     for (program, flag) in tools {
-        Command::new(program)
-            .arg(flag)
-            .output()
-            .map_err(|e| format!("{program}: {e} (brew install vegeta wrk nginx iperf3)"))?;
+        Command::new(program).arg(flag).output().map_err(|e| {
+            format!("{program}: {e} (brew install vegeta wrk nginx iperf3 nghttp2)")
+        })?;
     }
     Ok(())
 }
 
 fn prepare(o: &Options) -> Result<Prepared, String> {
+    // The key and certificate of the probe CA go into every guest.
+    crate::probe_ca::ensure(false)?;
     crate::relibc()?;
     crate::net_build()?;
     let linux = if o.systems.iter().any(|s| s.linux()) {
@@ -2754,31 +3270,42 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     } else {
         linux_guest::linux_dir()
     };
-    let (mut kernel, mut image) = (PathBuf::new(), PathBuf::new());
-    if o.systems.contains(&System::S4) {
+    let (mut kernel, mut image, mut fast_image) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
+    if o.systems.iter().any(|s| !s.linux()) {
         crate::busybox_build()?;
         crate::nano_build()?;
         kernel = build(Variant::Normal)?.image;
-        image = match o.image {
-            ImageKind::Plain => linux_guest::build_image()?,
-            ImageKind::Profile => linux_guest::build_variant(linux_guest::BenchImage::Profile)?,
-            ImageKind::Pinned => linux_guest::build_variant(linux_guest::BenchImage::Pinned)?,
-            ImageKind::Cpu0 => linux_guest::build_variant(linux_guest::BenchImage::Cpu0)?,
-        };
+        if o.systems.contains(&System::S4) {
+            image = match o.image {
+                ImageKind::Plain => linux_guest::build_image()?,
+                ImageKind::Profile => linux_guest::build_variant(linux_guest::BenchImage::Profile)?,
+                ImageKind::Pinned => linux_guest::build_variant(linux_guest::BenchImage::Pinned)?,
+                ImageKind::Cpu0 => linux_guest::build_variant(linux_guest::BenchImage::Cpu0)?,
+            };
+        }
+        if o.systems.contains(&System::F1) {
+            fast_image = linux_guest::build_fast_image()?;
+        }
     }
     let (config, www) = linux_guest::expected()?;
+    let (fast_config, _) = linux_guest::expected_fast();
+    let (config_tls, fast_config_tls) = linux_guest::expected_tls()?;
     Ok(Prepared {
+        config_tls,
+        fast_config_tls,
         linux,
         kernel,
         image,
+        fast_image,
         config,
+        fast_config,
         www,
     })
 }
 
 fn run(args: &[String]) -> Result<(), String> {
     let o = options(args)?;
-    tools_present(&o.phases)?;
+    tools_present(&o.phases, &o.workloads)?;
     let dir = match &o.resume {
         Some(dir) => std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?,
         None => {
@@ -3293,6 +3820,190 @@ mod tests {
     }
 
     #[test]
+    fn the_connections_of_w4_open_a_request_interval_apart() {
+        assert_eq!(connection_pace(250), (1, 4));
+        assert_eq!(connection_pace(1000), (1, 1));
+        // The pair delivers the asked rate: count a period of period ms.
+        for rate in [
+            100, 200, 300, 500, 700, 1500, 2000, 3000, 4000, 12_000, 24_000, 333,
+        ] {
+            let (count, period) = connection_pace(rate);
+            assert_eq!(
+                u64::from(count) * 1000,
+                u64::from(rate) * u64::from(period),
+                "{rate}"
+            );
+        }
+        assert_eq!(connection_pace(300), (3, 10));
+        assert_eq!(connection_pace(700), (7, 10));
+        assert_eq!(connection_pace(1500), (3, 2));
+        assert_eq!(connection_pace(3000), (3, 1));
+        assert_eq!(connection_pace(96_000), (96, 1));
+        let args = h2load_args(Path::new("u.txt"), 1000, 30, true, Path::new("l.log"));
+        for wanted in [
+            "-n30000",
+            "-t1",
+            "-r1",
+            "--rate-period=1ms",
+            "-c64",
+            "-m100",
+            "--rps=15.625000",
+            "--log-file=l.log",
+        ] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+        // W5: a connection for each request, opened at the rate, no pacing of
+        // requests on a connection.
+        let args = h2load_args(Path::new("u.txt"), 250, 10, false, Path::new("l.log"));
+        for wanted in ["-n2500", "-c2500", "-m1", "-r1", "--rate-period=4ms"] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+        assert!(!args.iter().any(|a| a.starts_with("--rps")));
+        // Above 16 000 a second two threads, each with at least a connection a period.
+        let args = h2load_args(Path::new("u.txt"), 24_000, 10, true, Path::new("l.log"));
+        assert!(args.contains(&"-t2".to_owned()) && args.contains(&"-r24".to_owned()));
+        // Never more connections a period than the 64 there are.
+        let args = h2load_args(Path::new("u.txt"), 96_000, 10, true, Path::new("l.log"));
+        assert!(args.contains(&"-r64".to_owned()));
+    }
+
+    #[test]
+    fn the_rounds_and_their_limits_are_read_and_kept() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let o = options(&[]).unwrap();
+        assert_eq!((o.rounds, o.max_rounds), (CONFIRMS, MAX_ROUNDS));
+        let o = options(&args(&["--rounds", "2", "--max-rounds", "4"])).unwrap();
+        assert_eq!((o.rounds, o.max_rounds), (2, 4));
+        // Fewer rounds in all than rounds with ceilings, or more than the limit.
+        assert!(options(&args(&["--rounds", "3", "--max-rounds", "2"])).is_err());
+        assert!(options(&args(&["--max-rounds", "13"])).is_err());
+        assert!(options(&args(&["--rounds", "0"])).is_err());
+    }
+
+    #[test]
+    fn the_ceilings_of_a_round_are_those_of_every_load_but_w5_in_the_first_rounds() {
+        use Workload::*;
+        let all = [W1, W2, W3, W4, W5];
+        assert_eq!(ceiling_loads(&all, 1, 3), [W1, W2, W3, W4]);
+        assert_eq!(ceiling_loads(&all, 3, 3), [W1, W2, W3, W4]);
+        assert!(ceiling_loads(&all, 4, 3).is_empty());
+        // A row with no R* has no pair to confirm and still has them.
+        assert_eq!(ceiling_loads(&[W1], 2, 3), [W1]);
+    }
+
+    #[test]
+    fn the_rounds_end_after_those_with_ceilings_and_when_the_pairs_are_done() {
+        // Nothing to confirm: the rounds with ceilings are all taken.
+        assert!(!rounds_end(1, 3, 3, true));
+        assert!(!rounds_end(2, 3, 3, true));
+        assert!(rounds_end(3, 3, 3, true));
+        // Open pairs go on up to the limit.
+        assert!(!rounds_end(3, 3, 6, false));
+        assert!(rounds_end(6, 3, 6, false));
+        assert!(rounds_end(4, 3, 6, true));
+    }
+
+    #[test]
+    fn the_image_variants_are_refused_with_f1() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(options(&args(&["--systems", "f1", "--image", "cpu0"])).is_err());
+        assert!(options(&args(&["--systems", "s4,f1", "--image", "pinned"])).is_err());
+        assert!(options(&args(&["--systems", "s4", "--image", "pinned"])).is_ok());
+        assert!(options(&args(&["--systems", "f1"])).is_ok());
+    }
+
+    #[test]
+    fn the_ceiling_of_w4_keeps_one_request_in_flight_on_each_connection() {
+        let args = h2load_ceiling_args(Path::new("u.txt"), 64, 15);
+        for wanted in ["-c64", "-m1", "-D15s"] {
+            assert!(args.iter().any(|a| a == wanted), "{wanted} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn the_log_of_h2load_is_read_in_the_order_of_the_starts() {
+        let text = "1000000\t200\t900\n1000500\t200\t300\n999900\t404\t5000\nnot a line\n";
+        let samples = parse_h2load_log(text);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|s| (s.at, s.code, s.latency, s.seq))
+                .collect::<Vec<_>>(),
+            [
+                (999_900_000, 404, 5_000_000, 0),
+                (1_000_000_000, 200, 900_000, 1),
+                (1_000_500_000, 200, 300_000, 2)
+            ]
+        );
+        // A step read from it: the percentiles are the log's own and the lag
+        // against the one schedule is not part of them.
+        let m = measure_h2(&samples, 1000, 10240, 0);
+        assert_eq!((m.requests, m.ok, m.failed), (3, 2, 1));
+        assert_eq!((m.p99, m.p99_raw, m.lag_p99), (5_000_000, 5_000_000, 0));
+        // A gap of 3 ms between the starts at 1 000 a second is a stall of
+        // 3 ms less four intervals (4 ms): none; of 20 ms: 16 ms.
+        let at = |ms: u64| Sample {
+            at: ms * 1_000_000,
+            code: 200,
+            latency: 1,
+            seq: 0,
+        };
+        assert_eq!(largest_stall(&[at(0), at(1), at(4)], 1000), 0);
+        assert_eq!(
+            largest_stall(&[at(0), at(1), at(21), at(22)], 1000),
+            16_000_000
+        );
+        let stalled = measure_h2(&[at(0), at(1), at(21), at(22)], 1000, 10240, 0);
+        assert_eq!(stalled.lag_p99, 16_000_000);
+        assert!(stalled.marks().contains(&"generator"));
+        assert_eq!(m.p50, 900_000);
+    }
+
+    #[test]
+    fn the_summary_of_h2load_is_read() {
+        let text = "starting benchmark...\nfinished in 15.00s, 52345.50 req/s, 12.50MB/s\nrequests: 785183 total, 785183 started, 785180 done, 785100 succeeded, 83 failed, 3 errored, 2 timeout\nstatus codes: 785000 2xx, 0 3xx, 177 4xx, 0 5xx\n";
+        let got = parse_h2load(text).unwrap();
+        assert_eq!(got.requests, 785_180);
+        assert_eq!(got.per_second, 52345.5);
+        assert_eq!(got.transfer, "12.50MB");
+        assert_eq!((got.connect, got.timeout, got.non_2xx), (3, 2, 180));
+        assert_eq!(parse_h2load("h2load: nothing"), None);
+    }
+
+    #[test]
+    fn the_loads_over_tls_are_the_set_of_w1_on_port_443() {
+        for wl in [Workload::W4, Workload::W5] {
+            assert!(wl.tls());
+            assert_eq!(wl.paths(), Workload::W1.paths());
+            assert_eq!(wl.length(), linux_guest::W1_LEN);
+            assert_eq!(wl.pass(), (TLS_PASS_RATE, 10));
+        }
+        assert!(Workload::W4.keep_alive() && !Workload::W5.keep_alive());
+        assert_eq!(Workload::W4.grid(), Workload::W1.grid());
+        assert_eq!(Workload::W5.grid(), Workload::W3.grid());
+        assert!(!Workload::W1.tls() && !Workload::W2.tls() && !Workload::W3.tls());
+        assert_eq!(Workload::of("w5"), Some(Workload::W5));
+        // A run takes the loads of HTTP unless asked for the others.
+        let o = options(&[]).unwrap();
+        assert_eq!(o.workloads, Workload::DEFAULT);
+        let o = options(&["--workloads".to_owned(), "w4,w5".to_owned()]).unwrap();
+        assert_eq!(o.workloads, [Workload::W4, Workload::W5]);
+    }
+
+    #[test]
+    fn the_floor_has_a_server_of_tls_beside_the_one_of_http() {
+        let text = floor_conf(Path::new("/f"), 8080, 8443);
+        assert!(text.contains("listen 127.0.0.1:8080;"));
+        assert!(text.contains("listen 127.0.0.1:8443 ssl;"));
+        assert!(text.contains("http2 on;"));
+        assert!(text.contains("ssl_certificate /f/server.crt;"));
+        assert!(text.contains("ssl_protocols TLSv1.3;"));
+        assert!(text.contains("ssl_session_tickets on;"));
+        assert_eq!(text.matches("    server {").count(), 2);
+    }
+
+    #[test]
     fn the_numbers_of_the_tools_are_read() {
         let json = r#"{"end":{"sum_sent":{"bits_per_second":900000000.5},"sum_received":{"start":0,"bits_per_second":8.5e8,"sender":false}}}"#;
         assert!((parse_iperf(json, false).unwrap() - 850.0).abs() < 1e-6);
@@ -3342,6 +4053,10 @@ mod tests {
         assert!(script.contains("\"/a\",\"/b\"") && script.contains("Connection"));
         assert!(!wrk_script(&["/a".into()], true).contains("Connection"));
         assert_eq!(System::S4.peer(), Some(System::L4));
+        assert_eq!(System::F1.peer(), Some(System::L1));
+        assert_eq!(System::of("f1"), Some(System::F1));
+        assert!(!System::F1.linux());
+        assert_eq!(System::F1.workers(), 1);
         assert_eq!(System::of("l1"), Some(System::L1));
     }
 
