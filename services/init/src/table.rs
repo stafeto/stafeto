@@ -362,6 +362,16 @@ pub fn on_cpus(cpus: u8, up: u8) -> (u8, bool) {
     }
 }
 
+/// The CPU the first thread of an instance is asked for (the loader's
+/// `Params::cpu`: 0 for none, else the CPU plus one) when its mask is `mask`:
+/// the driver of the console and its log (`log`) goes to CPU 1 when the mask
+/// has it, and every other instance, or one whose mask lacks CPU 1, is asked
+/// for none, so that the kernel puts it on the CPU of the caller or the
+/// lowest of the mask. An explicit CPU outside the mask is ACCESS_DENIED.
+pub fn first_cpu(log: bool, mask: u8) -> u8 {
+    if log && mask & 0b0010 != 0 { 2 } else { 0 }
+}
+
 impl Record {
     /// The watchdog of a service; None for a client.
     pub const fn watch(&self) -> Option<Watch> {
@@ -2303,6 +2313,28 @@ mod tests {
     /// The image of the measurement of stage P7 is the network image of VZ
     /// with the launcher of the shell on all four CPUs; the network service
     /// stays on the boot CPU and the services on the CPUs of the services.
+    /// The log driver's first thread asks for CPU 1 only when its mask has
+    /// it: the image `cpu0` keeps every program but the process service on
+    /// CPU 0 and must start on two CPUs or more.
+    #[test]
+    fn the_first_cpu_of_the_log_driver_is_in_its_mask() {
+        assert_eq!(first_cpu(true, GENERAL_CPUS), 2);
+        assert_eq!(first_cpu(true, BENCH_CPUS), 2);
+        assert_eq!(first_cpu(true, NETD_CPUS), 0);
+        assert_eq!(first_cpu(true, RT_CPUS), 0);
+        assert_eq!(first_cpu(false, GENERAL_CPUS), 0);
+        for r in bench::BENCH_CPU0_VZ_TABLE {
+            let (mask, _) = on_cpus(r.cpus, 0b1111);
+            let cpu = first_cpu(r.log, mask);
+            assert!(cpu == 0 || mask & (1 << (cpu - 1)) != 0, "{}", r.name);
+        }
+        assert!(
+            bench::BENCH_CPU0_VZ_TABLE
+                .iter()
+                .any(|r| r.log && first_cpu(r.log, r.cpus) == 0)
+        );
+    }
+
     #[test]
     fn the_bench_image_differs_from_the_network_image_of_vz_in_the_launcher_alone() {
         assert_eq!(order_of(bench::BENCH_VZ_TABLE), order_of(net::NET_VZ_TABLE));
