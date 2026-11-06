@@ -477,7 +477,11 @@ pub enum Method {
     LoaderClock = 45,
     /// The table of images (spec 2, 3.12.2), through the session of a loader
     /// that loads: a body of the operation u32 (`IMAGE_GET`, `IMAGE_PUT`,
-    /// `IMAGE_DETACH`), an `ImageKey` and the pages u32. Put carries the
+    /// `IMAGE_DETACH`), an `ImageKey`, the pages u32 and a path (its length
+    /// u32 and its bytes, at most `IMAGE_PATH_MAX`). The path of a Get of a
+    /// code part is the one the loader opened for the program, when the
+    /// file belongs to UID 0 and has no write bit for the group and the
+    /// others; empty for the rest. Put carries the
     /// memory object (MAP_READ, DUPLICATE, TRANSFER, MAP_EXEC for the code,
     /// never MAP_WRITE); a Get that finds the object answers with a copy of
     /// it. The reply to Get: status, the kind u32 (`IMAGE_FOUND` ...) and
@@ -603,11 +607,10 @@ pub const SHARED_BUSY: u32 = 3;
 /// The entries of the table of images (spec 2, 3.12.2): two for a program
 /// (its code and its read-only data).
 pub const IMAGES: usize = 32;
-/// Image: the object of a key, or the right to make it (Get). The `pages`
-/// of a Get of a code part tell where the file came from: `origin_hash` of
-/// the path the loader opened for the program, 0 for a library, a data
-/// part or a program opened by descriptor.
+/// Image: the object of a key, or the right to make it (Get).
 pub const IMAGE_GET: u32 = 1;
+/// The longest path an Image request carries (see `Method::Image`).
+pub const IMAGE_PATH_MAX: usize = 63;
 /// Image: the maker of an object hands it over (Put).
 pub const IMAGE_PUT: u32 = 2;
 /// Image: the caller made nothing of the entry it reserved (Detach).
@@ -622,21 +625,6 @@ pub const IMAGE_FULL: u32 = 2;
 /// The parts of a program's image that processes share.
 pub const IMAGE_CODE: u32 = 0;
 pub const IMAGE_RODATA: u32 = 1;
-
-/// The origin of a program's code, a hash of the path the loader opened
-/// (32-bit FNV-1a, never 0). The loader resolves the path itself, so the
-/// hash tells the process service which file of a read-only layer the
-/// code came from, whatever name the program gave itself.
-pub const fn origin_hash(path: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811C_9DC5;
-    let mut i = 0;
-    while i < path.len() {
-        hash ^= path[i] as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-        i += 1;
-    }
-    if hash == 0 { 1 } else { hash }
-}
 
 /// What names an image part in the table: the part and the identity of the
 /// file the loader's image session shows (spec 2, 3.12.2). The table
@@ -2188,18 +2176,5 @@ mod tests {
         assert!(!may_set_id(NOTARY | 7));
         assert!(!may_set_id(1 << 63 | NOTARY | SET_ID));
         assert!(is_notary(NOTARY | SET_ID | 7));
-    }
-
-    #[test]
-    fn the_origin_of_a_path_is_never_zero_and_names_the_path() {
-        assert_ne!(origin_hash(b""), 0);
-        assert_ne!(
-            origin_hash(b"/bin/nginx-fast"),
-            origin_hash(b"/tmp/nginx-fast")
-        );
-        assert_eq!(
-            origin_hash(b"/bin/nginx-fast"),
-            origin_hash(b"/bin/nginx-fast")
-        );
     }
 }

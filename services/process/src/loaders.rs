@@ -14,6 +14,7 @@
 //! is, at SpawnCommit; Abort, the end of the process and Take wipe it with
 //! the place.
 
+use crate::records::Mark;
 use proto_process::{Credentials, NO_ID, RECORDS, SPAWN_RESETIDS};
 
 /// The service's own pages it keeps out of the pool of the children's
@@ -46,20 +47,54 @@ pub const fn fork_quota(nominal: u64, image_pages: u32) -> u64 {
     if quota > nominal { nominal } else { quota }
 }
 
-/// Whether the child of fork of a process gets the quota of `grant`: the
-/// parent's effective user ID is 0 (a device is root's alone), the parent
-/// runs the file the grant is pinned to (`pinned`: the committed code of
-/// its image has the key the loader reported when it opened the grant's
-/// path, whatever name the parent gave itself), and fewer places of the
-/// grant than it has are in use. `taken` counts the places and runs last,
-/// since it walks the table of records.
-pub fn grant_applies(
-    grant: &proto_init::Grant,
-    euid: u32,
-    pinned: bool,
-    taken: impl FnOnce() -> u32,
-) -> bool {
-    grant.pages != 0 && euid == 0 && pinned && taken() < grant.places
+/// The mark a record gets when its load commits (SpawnCommit, ExecCommit):
+/// the loader opened the file of grant `grant` (None for no grant) and the
+/// record descends from the init record the grant is `under` (`in_scope`).
+/// Depth 0: the program itself, which never holds a place (its quota is
+/// that of the record, K4).
+pub fn load_mark(grant: Option<u8>, in_scope: bool) -> Option<Mark> {
+    grant.filter(|_| in_scope).map(|grant| Mark {
+        grant,
+        depth: 0,
+        holds: false,
+    })
+}
+
+/// The mark of the child of fork of a process marked `parent`: one
+/// generation deeper, and it holds a place of the grant when the depth is
+/// within the grant's and fewer places than it has are held. `held` counts
+/// the places of a grant and runs only for a marked parent, since it walks
+/// the table of records. The effective user ID, the name of the record and
+/// `argv[0]` play no part.
+pub fn fork_mark(
+    parent: Option<Mark>,
+    grants: &proto_init::Grants,
+    held: impl FnOnce(u8) -> u32,
+) -> Option<Mark> {
+    let parent = parent?;
+    let line = grants.lines().get(usize::from(parent.grant))?;
+    let depth = parent.depth.saturating_add(1);
+    let holds = depth <= line.depth && held(parent.grant) < u32::from(line.places);
+    Some(Mark {
+        grant: parent.grant,
+        depth,
+        holds,
+    })
+}
+
+/// The bytes of the pool set apart for the places of the grants that are
+/// free: another child cannot take them (a child that holds a place takes
+/// them). `held` counts the places held of a grant.
+pub fn pool_reserve(grants: &proto_init::Grants, held: impl Fn(u8) -> u32) -> u64 {
+    grants
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(n, g)| {
+            let free = u32::from(g.places).saturating_sub(held(n as u8));
+            u64::from(free) * u64::from(g.pages) * 4096
+        })
+        .sum()
 }
 
 /// The credentials a child of `parent` starts with: those of an exec, the
@@ -155,6 +190,9 @@ pub struct Place<T> {
     /// The pages of the code and the read-only data the loader mapped, as
     /// it said in Ready: the record's `image_pages` once it commits.
     pub image_pages: u32,
+    /// The grant of quota the file the loader opened for the code belongs
+    /// to, as its number plus one (0 for none).
+    pub grant: u8,
     /// What the service holds for the loader.
     pub held: T,
 }
@@ -251,6 +289,7 @@ impl<T> Loaders<T> {
             #[cfg(feature = "image-probe")]
             image_probe_counts: crate::image_probe::Counts::default(),
             image_pages: 0,
+            grant: 0,
             held,
         });
         self.of_record[record] = Some(index as u8);
@@ -405,30 +444,77 @@ impl<T> Loaders<T> {
 mod tests {
     use super::*;
 
+    fn grants() -> proto_init::Grants {
+        proto_init::Grants::parse(
+            b"grant a program=/bin/a under=u memory=256M places=2 depth=2\n\
+              grant b program=/bin/b under=u memory=64M places=1 depth=1\n",
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn a_grant_goes_to_root_running_the_pinned_file_while_a_place_is_free() {
-        use proto_init::Grant;
-        let g = Grant::read(&Grant::bytes(196_608, 2, "/bin/nginx-fast")).unwrap();
-        assert!(grant_applies(&g, 0, true, || 0));
-        assert!(grant_applies(&g, 0, true, || 1), "the second place");
-        assert!(!grant_applies(&g, 1000, true, || 0), "not root");
-        assert!(!grant_applies(&g, 0, true, || 2), "the places are taken");
-        assert!(!grant_applies(&g, 0, false, || 0), "another file");
-        let counted = core::cell::Cell::new(false);
-        assert!(!grant_applies(&g, 0, false, || {
-            counted.set(true);
-            0
-        }));
-        assert!(
-            !counted.get(),
-            "the table is walked for the pinned file only"
-        );
-        let none = Grant {
-            pages: 0,
-            places: 0,
-            path: [0; proto_init::GRANT_PATH_LEN],
+    fn the_mark_comes_from_the_file_and_the_scope_alone() {
+        assert_eq!(load_mark(None, true), None);
+        assert_eq!(load_mark(Some(1), false), None, "another init record");
+        let mark = load_mark(Some(1), true).unwrap();
+        assert_eq!((mark.grant, mark.depth, mark.holds), (1, 0, false));
+    }
+
+    #[test]
+    fn a_child_of_fork_holds_a_place_by_depth_and_free_places() {
+        let g = grants();
+        let marked = |depth, holds| {
+            Some(Mark {
+                grant: 0,
+                depth,
+                holds,
+            })
         };
-        assert!(!grant_applies(&none, 0, true, || 0));
+        // No mark, no walk of the table.
+        assert_eq!(fork_mark(None, &g, |_| panic!("walked")), None);
+        let first = fork_mark(marked(0, false), &g, |_| 0).unwrap();
+        assert_eq!((first.depth, first.holds), (1, true));
+        let second = fork_mark(marked(1, true), &g, |_| 1).unwrap();
+        assert_eq!((second.depth, second.holds), (2, true), "depth 2 of 2");
+        let third = fork_mark(marked(2, true), &g, |_| 0).unwrap();
+        assert_eq!((third.depth, third.holds), (3, false), "past the depth");
+        let full = fork_mark(marked(0, false), &g, |_| 2).unwrap();
+        assert!(!full.holds && full.depth == 1, "the places are held");
+        // Grant b has one place and depth 1.
+        let b = Some(Mark {
+            grant: 1,
+            depth: 1,
+            holds: true,
+        });
+        assert!(!fork_mark(b, &g, |_| 0).unwrap().holds, "depth 2 of 1");
+        assert_eq!(
+            fork_mark(
+                Some(Mark {
+                    grant: 9,
+                    depth: 0,
+                    holds: false
+                }),
+                &g,
+                |_| 0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_free_places_are_set_apart_in_the_pool() {
+        let g = grants();
+        let page = 4096u64;
+        let all = (2 * 65_536 + 16_384) * page;
+        assert_eq!(pool_reserve(&g, |_| 0), all);
+        assert_eq!(pool_reserve(&g, |n| u32::from(n == 0)), all - 65_536 * page);
+        assert_eq!(pool_reserve(&g, |_| 5), 0, "never below zero");
+        // An ordinary child sees the pool less the reserve.
+        let free = RESERVE + 100 * page + all;
+        assert!(!pool_allows(free - pool_reserve(&g, |_| 0), 101 * page));
+        assert!(pool_allows(free - pool_reserve(&g, |_| 0), 100 * page));
+        // A child that holds a place takes from the reserve.
+        assert!(pool_allows(free, 65_536 * page));
     }
 
     #[test]

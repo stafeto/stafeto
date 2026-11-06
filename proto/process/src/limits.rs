@@ -120,6 +120,21 @@ impl ResourceLimits {
         };
         Self { values }
     }
+    /// The limits of data and of the address space that still show the
+    /// quota `from` of the record (the value `initial` gave) show `to`; a
+    /// lower limit the program set stays. For a child that holds a place of
+    /// a grant of quota (spec 2, 3.12.2, K5).
+    pub fn raise_memory(&mut self, from: u64, to: u64) {
+        for resource in [DATA, AS] {
+            let l = &mut self.values[resource];
+            if l.hard == from {
+                l.hard = to;
+            }
+            if l.soft == from {
+                l.soft = to;
+            }
+        }
+    }
     /// Public limits may be infinite; paid memory limits must remain finite.
     pub fn valid(&self) -> bool {
         self.values.iter().enumerate().all(|(i, l)| {
@@ -247,5 +262,23 @@ mod tests {
         assert_eq!(limits.values[CORE].hard, 0);
         assert_eq!(limits.values[STACK].hard, 64 * 1024);
         assert_eq!(limits.values[NOFILE].hard, 1024);
+    }
+
+    #[test]
+    fn a_place_of_a_grant_raises_the_untouched_memory_limits_only() {
+        let mut l = ResourceLimits::initial(32 << 20);
+        l.values[DATA].soft = 8 << 20;
+        l.raise_memory(32 << 20, 256 << 20);
+        assert_eq!(l.values[DATA].soft, 8 << 20, "set lower by the program");
+        assert_eq!(l.values[DATA].hard, 256 << 20);
+        assert_eq!(
+            l.values[AS],
+            Limit {
+                soft: 256 << 20,
+                hard: 256 << 20
+            }
+        );
+        assert_eq!(l.values[NOFILE], ResourceLimits::initial(0).values[NOFILE]);
+        assert!(l.valid());
     }
 }

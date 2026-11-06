@@ -133,42 +133,43 @@ pub const FAST_NGINX_VZ_TABLE: &[Record] = &[
     super::net::NET_VZ2_TABLE[9],
 ];
 
-/// The grant of the images of scale (`proto_init::Grant`): the children of
-/// fork of the master of `nginx-fast`, the file the loader opens from
-/// `/bin/nginx-fast`, get the quota of the grant and the master keeps the
-/// quota of a command. On QEMU of the check (`-m 1024`) 128 MiB, on Apple
-/// VZ (2 GiB) 768 MiB, which hold 100 000 connections: about 3.5 KiB each
-/// and 102 MiB of the worker's own. There are two places: the worker, and
-/// the new worker of a reload while the old one ends. The master of these
-/// images forks workers alone (`daemon off`, no cache manager), so the two
-/// places go to workers.
-pub const SCALE_GRANT_PAGES: u32 = 32_768;
-pub const SCALE_GRANT_PAGES_VZ: u32 = 196_608;
-pub const SCALE_GRANT_PLACES: u32 = 2;
-const SCALE_GRANT: [u8; proto_init::GRANT_LEN] =
-    proto_init::Grant::bytes(SCALE_GRANT_PAGES, SCALE_GRANT_PLACES, "/bin/nginx-fast");
-const SCALE_GRANT_VZ: [u8; proto_init::GRANT_LEN] =
-    proto_init::Grant::bytes(SCALE_GRANT_PAGES_VZ, SCALE_GRANT_PLACES, "/bin/nginx-fast");
+/// The grants of quota of the images of scale (spec 2, 3.12.2, K5): the
+/// children of fork of `/bin/nginx-fast`, the workers, get the quota of a
+/// grant, and the program itself keeps the quota of a command. On QEMU of
+/// the check (`-m 1024`) 128 MiB, on Apple VZ (2 GiB) 768 MiB, which hold
+/// 100 000 connections: about 3.5 KiB each and 102 MiB of the worker's own.
+/// The shell's launcher starts nginx-fast, so the grant is `under` its
+/// record. There are two places, since a reload makes the new worker while
+/// the old one ends (two for each `worker_processes`), and the depth is 1:
+/// the workers are the children of the master. The master of these images
+/// forks workers alone (`daemon off`, no cache manager).
+pub const SCALE_GRANTS: &[u8] =
+    b"grant nginx-fast program=/bin/nginx-fast under=ash-launcher memory=128M places=2 depth=1\n";
+pub const SCALE_GRANTS_VZ: &[u8] =
+    b"grant nginx-fast program=/bin/nginx-fast under=ash-launcher memory=768M places=2 depth=1\n";
+
+/// The pages of the places of the grants above (two places of 128 MiB, and
+/// of 768 MiB), which the pool of the process service holds besides its
+/// own; a test of init reads them from the lines.
+const SCALE_GRANT_PAGES: u64 = 2 * 32_768;
+const SCALE_GRANT_PAGES_VZ: u64 = 2 * 196_608;
 
 /// The process service of an image of scale: the pool of the image of
-/// nginx on the stack and the places of the grant. The pages of the grant
-/// are in the pool but not set apart: another child may take them first,
-/// and a fork of the worker then ends with NO_MEMORY (the image of scale
-/// starts nothing else that big).
-const fn scale_process_service(base: Record, pages: u32, args: &'static [u8]) -> Record {
+/// nginx on the stack and the places of the grants, set apart there.
+const fn scale_process_service(base: Record, own: &'static [u8], pages: u64) -> Record {
     Record {
-        quota: base.quota + SCALE_GRANT_PLACES as u64 * pages as u64 * PAGE,
-        args,
+        quota: base.quota + pages * PAGE,
+        args: own,
         ..base
     }
 }
 
 const SCALE_PROCESS_SERVICE: Record =
-    scale_process_service(FAST_PROCESS_SERVICE, SCALE_GRANT_PAGES, &SCALE_GRANT);
+    scale_process_service(FAST_PROCESS_SERVICE, SCALE_GRANTS, SCALE_GRANT_PAGES);
 const SCALE_VZ_PROCESS_SERVICE: Record = scale_process_service(
     FAST_VZ_PROCESS_SERVICE,
+    SCALE_GRANTS_VZ,
     SCALE_GRANT_PAGES_VZ,
-    &SCALE_GRANT_VZ,
 );
 
 /// The image of nginx on the stack on QEMU with the grant of the worker

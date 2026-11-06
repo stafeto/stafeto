@@ -125,17 +125,6 @@ impl<T, W> Images<T, W> {
             .position(|e| e.as_ref().is_some_and(|e| e.key == *key))
     }
 
-    /// Whether the load of `record` committed with the entry of `key`: the
-    /// record runs the file that key names (the table is filled by the
-    /// loaders, which read the identity of the file themselves).
-    pub fn uses(&self, key: &ImageKey, record: usize) -> bool {
-        self.find(key).is_some_and(|i| {
-            self.entries[i]
-                .as_ref()
-                .is_some_and(|e| e.users[record / 64] & (1 << (record % 64)) != 0)
-        })
-    }
-
     /// The entry in `i` goes; the requests that wait for it lose their entry.
     fn free(&mut self, i: usize) {
         self.entries[i] = None;
@@ -423,23 +412,6 @@ mod tests {
             modify: (10, 5),
             change: (11, 6),
         }
-    }
-
-    #[test]
-    fn a_record_uses_the_file_it_committed_with_and_a_copy_is_another_file() {
-        let mut t = Images::<u32, u32>::new();
-        // The file of the layer, key 7, and its copy in /tmp, key 9.
-        assert_eq!(t.get(&key(7), 1), Got::Reserved);
-        assert_eq!(t.put(&key(7), 1, 4, 55), Ok(()));
-        assert_eq!(t.get(&key(9), 2), Got::Reserved);
-        assert_eq!(t.put(&key(9), 2, 4, 56), Ok(()));
-        assert!(!t.uses(&key(7), 1), "not committed yet");
-        t.commit(1);
-        t.commit(2);
-        assert!(t.uses(&key(7), 1));
-        assert!(!t.uses(&key(7), 2), "the copy's record runs another file");
-        assert!(t.uses(&key(9), 2));
-        assert!(!t.uses(&key(8), 1));
     }
 
     #[test]

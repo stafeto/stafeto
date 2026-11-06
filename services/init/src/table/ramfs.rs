@@ -586,30 +586,26 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     super::entropy::ENTROPY,
 ];
 
-/// The pages of the grant of the probe of the big room (`posix-map big`):
-/// 256 MiB, above the 64 MiB from which a process may grow its room.
-pub const MAP_BIG_PAGES: u32 = 65_536;
+/// The grant of the probe of the big room (`posix-map big`): the children
+/// of fork of `/bin/procs-child` started by the probe's record hold two
+/// places of 256 MiB, above the 64 MiB from which a process may grow its
+/// room, down to the depth 2 (the child and its own child of fork).
+pub const MAP_BIG_GRANTS: &[u8] =
+    b"grant map-big program=/bin/procs-child under=posix-procs memory=256M places=2 depth=2\n";
 
-/// The places of the grant: the child of fork of the probe and its own
-/// child of fork.
-pub const MAP_BIG_PLACES: u32 = 2;
+/// The pages of the two places of the grant above, set apart in the pool.
+const MAP_BIG_PAGES: u64 = 2 * 65_536;
 
-const MAP_BIG_GRANT: [u8; proto_init::GRANT_LEN] =
-    proto_init::Grant::bytes(MAP_BIG_PAGES, MAP_BIG_PLACES, "/bin/procs-child");
-
-/// The probe of the big room and of the grant of the process service
-/// (tests/posix-map, the argument `big`): the table of POSIX_PROCS_TABLE
-/// with a grant for the children of fork of `/bin/procs-child`, and the
-/// pages of three grants in the pool of the service (two places, and the
-/// pages a third fork would take if the place rule let it). The probe
-/// itself and its children of spawn have the quota of a command. The guest
-/// has 1 GiB.
+/// The probe of the big room and of the grant of quota (tests/posix-map,
+/// the argument `big`): the table of POSIX_PROCS_TABLE with the grant above
+/// and the pages of its places in the pool of the service. The probe itself
+/// and its children of spawn have the quota of a command. The guest has
+/// 1 GiB.
 pub const POSIX_MAP_BIG_TABLE: &[Record] = &[
     POSIX_PROCS_TABLE[0],
     Record {
-        quota: POSIX_PROCS_TABLE[1].quota
-            + (MAP_BIG_PLACES as u64 + 1) * MAP_BIG_PAGES as u64 * PAGE,
-        args: &MAP_BIG_GRANT,
+        quota: POSIX_PROCS_TABLE[1].quota + MAP_BIG_PAGES * PAGE,
+        args: MAP_BIG_GRANTS,
         ..POSIX_PROCS_TABLE[1]
     },
     POSIX_PROCS_TABLE[2],

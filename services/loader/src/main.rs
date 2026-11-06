@@ -1440,7 +1440,10 @@ fn load(
     block: &Block<'_>,
     source: Option<(Handle<Channel>, rt::fs::PreparedOpen)>,
 ) -> Result<(u64, Handle<Channel>, Maps, Option<Dynamic>), u32> {
-    let mut origin = 0;
+    // The path the loader opened, for the table of images (K5): kept
+    // short, and used only when the file is the system's own (below).
+    let mut opened = [0u8; proto_process::IMAGE_PATH_MAX];
+    let mut opened_len = 0;
     let image = if let Some((source, held)) = source {
         let files = core::mem::ManuallyDrop::new(rt::fs::Files::from_sessions(
             Handle::from_raw(own.files.raw()),
@@ -1455,11 +1458,21 @@ fn load(
             BlockError::NameTooLong => pl::NAME_TOO_LONG,
             _ => pl::NO_ENTRY,
         })?;
-        origin = proto_process::origin_hash(path);
+        if path.len() <= opened.len() {
+            opened[..path.len()].copy_from_slice(path);
+            opened_len = path.len();
+        }
         open(own, path)?
     };
     let info = file_info(own, &image)?;
     let size = info.size;
+    // The path counts only for a file of UID 0 that the group and the
+    // others cannot write: a grant of quota names such a file.
+    let origin: &[u8] = if info.uid == 0 && info.permissions & 0o022 == 0 {
+        &opened[..opened_len]
+    } else {
+        &[]
+    };
     let layout = program_layout(&image, size)?;
     // A dynamic program brings libc.so, checked before anything is mapped.
     let library = match layout.kind {
@@ -1480,7 +1493,7 @@ fn load(
                     &library.info,
                     &library.layout.segments,
                     &mut maps,
-                    0,
+                    &[],
                 )
             })?;
             steps::timed(kind::RECHECK, 0, || {
@@ -1529,7 +1542,7 @@ fn map_segments(
     info: &proto_fs::NodeInfo,
     segments: &[Load; 3],
     maps: &mut Maps,
-    origin: u32,
+    origin: &[u8],
 ) -> Result<(), u32> {
     for part in Part::ALL {
         let load = &segments[part as usize];
@@ -1539,7 +1552,7 @@ fn map_segments(
                 Part::Rodata => Some(image_key(info, proto_process::IMAGE_RODATA)),
                 Part::Data => None,
             };
-            let origin = if part == Part::Code { origin } else { 0 };
+            let origin: &[u8] = if part == Part::Code { origin } else { &[] };
             segment(
                 own,
                 image,
@@ -1830,7 +1843,7 @@ fn segment(
     load: &Load,
     part: Part,
     maps: &mut Maps,
-    key: Option<(&proto_process::ImageKey, u32)>,
+    key: Option<(&proto_process::ImageKey, &[u8])>,
 ) -> Result<(), u32> {
     let pages = load.pages();
     let len = pages.end - pages.start;
@@ -1864,7 +1877,7 @@ fn segment(
             if let Err(e) =
                 build(own, image, load, part, maps).and_then(|()| unchanged(own, image, info))
             {
-                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
+                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, &[], None);
                 return Err(e);
             }
             // The creator's handle with the right to write is closed; the
@@ -1881,11 +1894,12 @@ fn segment(
                     proto_process::IMAGE_PUT,
                     key,
                     (len / PAGE) as u32,
+                    &[],
                     Some(copy),
                 )
             });
             if !matches!(put, Some(Ok(_))) {
-                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, None);
+                let _ = image_request(proto_process::IMAGE_DETACH, key, 0, &[], None);
             }
             Ok(())
         }
@@ -1956,6 +1970,7 @@ fn image_request(
     operation: u32,
     key: &proto_process::ImageKey,
     pages: u32,
+    path: &[u8],
     object: Option<Handle<Memory>>,
 ) -> Result<(u32, u32, Option<Handle<Memory>>), u32> {
     let session = core::mem::ManuallyDrop::new(Handle::<Channel>::from_raw(START_CHANNEL));
@@ -1966,6 +1981,8 @@ fn image_request(
         .and_then(|()| w.u32(operation))
         .and_then(|()| key.write(&mut w))
         .and_then(|()| w.u32(pages))
+        .and_then(|()| w.u32(path.len() as u32))
+        .and_then(|()| w.bytes(path))
         .map_err(|_| pl::IO)?;
     let mut reply = match object {
         Some(object) => sys::send_handles(&session, w.as_bytes(), [object.erase()])
@@ -1986,9 +2003,9 @@ fn image_request(
 
 /// Get of the table of images. An answer the loader does not know makes an
 /// object of its own, as a table with no place does.
-fn image_get(key: &proto_process::ImageKey, origin: u32) -> Result<Table, u32> {
+fn image_get(key: &proto_process::ImageKey, origin: &[u8]) -> Result<Table, u32> {
     Ok(
-        match image_request(proto_process::IMAGE_GET, key, origin, None)? {
+        match image_request(proto_process::IMAGE_GET, key, 0, origin, None)? {
             (proto_process::IMAGE_FOUND, pages, Some(memory)) => Table::Found(pages, memory),
             (proto_process::IMAGE_RESERVED, _, None) => Table::Reserved,
             _ => Table::Full,

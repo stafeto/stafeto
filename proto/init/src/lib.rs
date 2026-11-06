@@ -759,83 +759,198 @@ impl<'a> ServiceArgs<'a> {
     }
 }
 
-/// The bytes of a quota grant in the own arguments of the process service.
-pub const GRANT_LEN: usize = 56;
-/// The longest path of a grant, with its zero.
-pub const GRANT_PATH_LEN: usize = 44;
-/// The first four bytes of a grant (`GRNT`).
-pub const GRANT_MAGIC: u32 = 0x544E_5247;
+/// The grants one table gives the process service at most.
+pub const GRANTS_MAX: usize = 4;
+/// The longest path of a grant (a path the loader reports is not longer).
+pub const GRANT_PATH_MAX: usize = 63;
+/// The longest name of a grant or of the init record it is under.
+pub const GRANT_NAME_MAX: usize = 15;
+/// The pages of the smallest grant: 64 MiB, below which the rule of a child
+/// of fork gives as much already.
+pub const GRANT_PAGES_MIN: u32 = 64 * 256;
 
-/// A quota the process service gives the children of fork of one program
-/// file (spec 2, 3.12.2): `pages` pages for each of `places` children at a
-/// time, when the parent runs the file the loader opened from `path` and
-/// has the effective user ID 0. The own arguments of the process service:
-/// bytes 0..4 `GRANT_MAGIC`, 4..8 the pages, 8..12 the places, 12..56 the
-/// path of a file of a read-only layer, zeros after it. Other own arguments
-/// carry no grant.
+/// One grant of quota (spec 2, 3.12.2, K5): a program, the part of the
+/// table it works in, the quota of one place and how many places and
+/// generations of fork have one. A line of text in the own arguments of the
+/// process service:
+///
+/// `grant <name> program=<path> under=<init record> memory=<size> places=<n> depth=<n>`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Grant {
+pub struct GrantLine {
+    pub name: [u8; GRANT_NAME_MAX + 1],
+    pub program: [u8; GRANT_PATH_MAX + 1],
+    pub under: [u8; GRANT_NAME_MAX + 1],
+    /// The quota of one place, in pages.
     pub pages: u32,
-    pub places: u32,
-    pub path: [u8; GRANT_PATH_LEN],
+    pub places: u8,
+    pub depth: u8,
 }
 
-impl Grant {
-    /// The grant of `pages` pages at `places` places for the file at
-    /// `path` (43 bytes at most), as constant bytes for a table.
-    pub const fn bytes(pages: u32, places: u32, path: &str) -> [u8; GRANT_LEN] {
-        let path = path.as_bytes();
-        assert!(!path.is_empty() && path.len() < GRANT_PATH_LEN);
-        let mut out = [0; GRANT_LEN];
-        let words = [
-            GRANT_MAGIC.to_le_bytes(),
-            pages.to_le_bytes(),
-            places.to_le_bytes(),
-        ];
-        let mut w = 0;
-        while w < 3 {
-            let mut i = 0;
-            while i < 4 {
-                out[4 * w + i] = words[w][i];
-                i += 1;
-            }
-            w += 1;
-        }
-        let mut i = 0;
-        while i < path.len() {
-            out[12 + i] = path[i];
-            i += 1;
-        }
-        out
+fn text(field: &[u8]) -> &[u8] {
+    &field[..field.iter().position(|&b| b == 0).unwrap_or(field.len())]
+}
+
+impl GrantLine {
+    pub const ZERO: GrantLine = GrantLine {
+        name: [0; GRANT_NAME_MAX + 1],
+        program: [0; GRANT_PATH_MAX + 1],
+        under: [0; GRANT_NAME_MAX + 1],
+        pages: 0,
+        places: 0,
+        depth: 0,
+    };
+
+    pub fn name(&self) -> &[u8] {
+        text(&self.name)
     }
 
-    /// The grant in the own arguments `own` of the service: None unless
-    /// they are exactly a grant.
-    pub fn read(own: &[u8]) -> Option<Grant> {
-        if own.len() != GRANT_LEN {
-            return None;
-        }
-        let word = |at: usize| u32::from_le_bytes(own[at..at + 4].try_into().expect("4 bytes"));
-        if word(0) != GRANT_MAGIC || own[12] == 0 {
-            return None;
-        }
-        let mut path = [0; GRANT_PATH_LEN];
-        path.copy_from_slice(&own[12..]);
-        Some(Grant {
-            pages: word(4),
-            places: word(8),
-            path,
+    /// The exact path of the file the loader opened.
+    pub fn program(&self) -> &[u8] {
+        text(&self.program)
+    }
+
+    /// The name of the init record whose processes may hold places.
+    pub fn under(&self) -> &[u8] {
+        text(&self.under)
+    }
+}
+
+/// The grants of a table, at most GRANTS_MAX.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grants {
+    pub lines: [GrantLine; GRANTS_MAX],
+    pub len: usize,
+}
+
+/// Why the lines were refused: the number of the first line at fault, from 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantsError(pub usize);
+
+fn name_ok(name: &[u8], capitals: bool) -> bool {
+    !name.is_empty()
+        && name.len() <= GRANT_NAME_MAX
+        && name.iter().all(|&b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || b == b'-'
+                || (capitals && (b.is_ascii_uppercase() || b == b'_'))
         })
+}
+
+fn path_ok(path: &[u8]) -> bool {
+    path.first() == Some(&b'/')
+        && path.len() <= GRANT_PATH_MAX
+        && path.len() > 1
+        && path[1..]
+            .split(|&b| b == b'/')
+            .all(|part| !part.is_empty() && part != b"." && part != b"..")
+}
+
+fn size_pages(text: &[u8]) -> Option<u32> {
+    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    let number: u64 = core::str::from_utf8(digits).ok()?.parse().ok()?;
+    let bytes = number.checked_mul(match unit[0] {
+        b'K' => 1 << 10,
+        b'M' => 1 << 20,
+        b'G' => 1 << 30,
+        _ => return None,
+    })?;
+    let pages = u32::try_from(bytes / 4096).ok()?;
+    (bytes % 4096 == 0 && pages >= GRANT_PAGES_MIN).then_some(pages)
+}
+
+fn small(text: &[u8], most: u8) -> Option<u8> {
+    let n: u8 = core::str::from_utf8(text).ok()?.parse().ok()?;
+    (1..=most).contains(&n).then_some(n)
+}
+
+fn copy_into<const N: usize>(into: &mut [u8; N], from: &[u8]) {
+    into[..from.len()].copy_from_slice(from);
+}
+
+fn parse_line(line: &[u8]) -> Option<GrantLine> {
+    let mut words = line.split(|&b| b == b' ').filter(|w| !w.is_empty());
+    if words.next()? != b"grant" {
+        return None;
+    }
+    let name = words.next()?;
+    if !name_ok(name, false) {
+        return None;
+    }
+    let mut out = GrantLine::ZERO;
+    copy_into(&mut out.name, name);
+    let mut seen = 0u8;
+    for word in words {
+        let eq = word.iter().position(|&b| b == b'=')?;
+        let (key, value) = (&word[..eq], &word[eq + 1..]);
+        let (bit, ok) = match key {
+            b"program" => (
+                1,
+                path_ok(value).then(|| copy_into(&mut out.program, value)),
+            ),
+            b"under" => (
+                2,
+                name_ok(value, true).then(|| copy_into(&mut out.under, value)),
+            ),
+            b"memory" => (4, size_pages(value).map(|p| out.pages = p)),
+            b"places" => (8, small(value, 8).map(|n| out.places = n)),
+            b"depth" => (16, small(value, 4).map(|n| out.depth = n)),
+            _ => return None,
+        };
+        if seen & bit != 0 || ok.is_none() {
+            return None;
+        }
+        seen |= bit;
+    }
+    (seen == 31).then_some(out)
+}
+
+impl Grants {
+    pub const NONE: Grants = Grants {
+        lines: [GrantLine::ZERO; GRANTS_MAX],
+        len: 0,
+    };
+
+    /// The grants in the own arguments `own` of the process service: lines
+    /// of text separated by `\n` (empty ones and ones that begin with `#`
+    /// are left out). One line at fault refuses all of them.
+    pub fn parse(own: &[u8]) -> Result<Grants, GrantsError> {
+        let mut grants = Grants::NONE;
+        for (n, line) in own.split(|&b| b == b'\n').enumerate() {
+            let line = text(line);
+            if line.iter().all(|&b| b == b' ') || line[0] == b'#' {
+                continue;
+            }
+            let parsed = parse_line(line).ok_or(GrantsError(n + 1))?;
+            if grants.len == GRANTS_MAX
+                || grants.lines[..grants.len]
+                    .iter()
+                    .any(|g| g.name() == parsed.name())
+            {
+                return Err(GrantsError(n + 1));
+            }
+            grants.lines[grants.len] = parsed;
+            grants.len += 1;
+        }
+        Ok(grants)
     }
 
-    /// The path without its zeros.
-    pub fn path_bytes(&self) -> &[u8] {
-        let end = self
-            .path
+    pub fn lines(&self) -> &[GrantLine] {
+        &self.lines[..self.len]
+    }
+
+    /// The grant for the file the loader opened from `path`: its number.
+    pub fn find(&self, path: &[u8]) -> Option<usize> {
+        (!path.is_empty()).then_some(())?;
+        self.lines().iter().position(|g| g.program() == path)
+    }
+
+    /// The pages all the places of all the grants hold when taken.
+    pub fn pages_total(&self) -> u64 {
+        self.lines()
             .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.path.len());
-        &self.path[..end]
+            .map(|g| u64::from(g.places) * u64::from(g.pages))
+            .sum()
     }
 }
 
@@ -1227,19 +1342,85 @@ mod tests {
         assert_eq!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX, 256);
     }
 
+    const VZ: &[u8] =
+        b"grant nginx-fast program=/bin/nginx-fast under=ash-launcher memory=768M places=2 depth=1\n";
+    const BIG: &[u8] =
+        b"grant map-big program=/bin/procs-child under=posix-procs memory=256M places=2 depth=2\n";
+
     #[test]
-    fn a_grant_round_trips_through_the_own_arguments() {
-        const BYTES: [u8; GRANT_LEN] = Grant::bytes(196_608, 2, "/bin/nginx-fast");
-        let grant = Grant::read(&BYTES).unwrap();
-        assert_eq!((grant.pages, grant.places), (196_608, 2));
-        assert_eq!(grant.path_bytes(), b"/bin/nginx-fast");
-        assert_eq!(Grant::read(&BYTES[..55]), None);
-        assert_eq!(Grant::read(&[0; GRANT_LEN]), None);
-        assert_eq!(Grant::read(b"posix-procs\0"), None);
-        // Own arguments of the length of a grant that carry no label.
-        let mut plain = BYTES;
-        plain[0] ^= 1;
-        assert_eq!(Grant::read(&plain), None);
+    fn the_lines_of_the_tables_are_read() {
+        let g = Grants::parse(VZ).unwrap();
+        assert_eq!(g.len, 1);
+        let line = g.lines()[0];
+        assert_eq!(line.name(), b"nginx-fast");
+        assert_eq!(line.program(), b"/bin/nginx-fast");
+        assert_eq!(line.under(), b"ash-launcher");
+        assert_eq!((line.pages, line.places, line.depth), (196_608, 2, 1));
+        assert_eq!(g.find(b"/bin/nginx-fast"), Some(0));
+        assert_eq!(g.find(b"/tmp/nginx-fast"), None);
+        assert_eq!(g.find(b"nginx-fast"), None);
+        assert_eq!(g.find(b""), None);
+        assert_eq!(Grants::parse(BIG).unwrap().lines()[0].pages, 65_536);
+        assert_eq!(Grants::parse(BIG).unwrap().pages_total(), 131_072);
+        let mut two = VZ.to_vec();
+        two.extend_from_slice(b"# a comment\n\n");
+        two.extend_from_slice(BIG);
+        let g = Grants::parse(&two).unwrap();
+        assert_eq!(g.len, 2);
+        assert_eq!(g.find(b"/bin/procs-child"), Some(1));
+        assert_eq!(Grants::parse(b"").unwrap().len, 0);
+        assert_eq!(Grants::parse(&[0; 40]).unwrap().len, 0);
+    }
+
+    #[test]
+    fn a_line_at_fault_refuses_every_line() {
+        let ok = core::str::from_utf8(VZ).unwrap().trim_end().to_owned();
+        for bad in [
+            ok.replace("grant ", "gift "),
+            ok.replace("program=/bin/nginx-fast", "program=bin/nginx-fast"),
+            ok.replace("/bin/nginx-fast", "/bin/../nginx-fast"),
+            ok.replace("/bin/nginx-fast", "/bin/./nginx-fast"),
+            ok.replace("/bin/nginx-fast", "/bin//nginx-fast"),
+            ok.replace("/bin/nginx-fast", &format!("/{}", "x".repeat(63))),
+            ok.replace("memory=768M", "memory=768"),
+            ok.replace("memory=768M", "memory=32M"),
+            ok.replace("memory=768M", "memory=1025K"),
+            ok.replace("places=2", "places=0"),
+            ok.replace("places=2", "places=9"),
+            ok.replace("depth=1", "depth=0"),
+            ok.replace("depth=1", "depth=5"),
+            ok.replace(" depth=1", ""),
+            ok.replace("depth=1", "depth=1 depth=1"),
+            ok.replace("depth=1", "colour=1"),
+            ok.replace("grant nginx-fast", "grant Nginx"),
+            ok.replace("under=ash-launcher", "under="),
+        ] {
+            let mut lines = bad.into_bytes();
+            lines.push(b'\n');
+            lines.extend_from_slice(BIG);
+            assert_eq!(Grants::parse(&lines), Err(GrantsError(1)), "{lines:?}");
+        }
+        // The line at fault is numbered, the good lines before it too.
+        let mut lines = BIG.to_vec();
+        lines.extend_from_slice(b"grant x program=/x\n");
+        assert_eq!(Grants::parse(&lines), Err(GrantsError(2)));
+        // A fifth grant and a name used twice.
+        let mut five = Vec::new();
+        for n in 0..5 {
+            five.extend_from_slice(
+                format!("grant g{n} program=/bin/g{n} under=u memory=64M places=1 depth=1\n")
+                    .as_bytes(),
+            );
+        }
+        assert_eq!(Grants::parse(&five), Err(GrantsError(5)));
+        let mut twice = BIG.to_vec();
+        twice.extend_from_slice(BIG);
+        assert_eq!(Grants::parse(&twice), Err(GrantsError(2)));
+    }
+
+    #[test]
+    fn two_lines_fit_the_own_arguments_of_a_service() {
+        assert!(VZ.len() + BIG.len() <= OWN_ARGS_MAX);
     }
 
     #[test]
