@@ -846,20 +846,25 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
         return Err("opendir close-on-exec flag");
     }
     let mut name = [0; 32];
-    for expected in [
-        b".".as_slice(),
-        b"..".as_slice(),
-        b"motd".as_slice(),
-        b"group".as_slice(),
-        b"passwd".as_slice(),
-    ] {
+    let mut seen = 0u32;
+    for _ in 0..6 {
         let entry = posix
             .readdir(&mut dir, &mut name)
             .map_err(|_| "POSIX readdir")?
             .ok_or("POSIX directory short")?;
-        if &name[..entry.name_len] != expected {
-            return Err("POSIX directory entry");
+        let bit = match &name[..entry.name_len] {
+            b"." => 1,
+            b".." => 2,
+            b"motd" => 4,
+            b"group" => 8,
+            b"passwd" => 16,
+            b"shadow" => 32,
+            _ => return Err("POSIX directory entry"),
+        };
+        if seen & bit != 0 {
+            return Err("POSIX directory entry twice");
         }
+        seen |= bit;
     }
     if posix.readdir(&mut dir, &mut name) != Ok(None)
         || posix.opendir(b"motd").err() != Some(FsError::NotDirectory)

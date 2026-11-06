@@ -824,8 +824,8 @@ static int names_directories(void) {
 }
 
 /* The records of posix_getdents. The directories that the service lists
- * are the fixed ones and those of the boot image: /etc holds `motd`, `group`
- * and `passwd`; the root
+ * are the fixed ones and those of the boot image: /etc holds `motd`, `group`,
+ * `passwd` and `shadow`; the root
  * holds `etc` and `tmp`. The listing of a directory made at run time is the
  * next section. */
 static int names_entries(void) {
@@ -858,7 +858,7 @@ static int names_entries(void) {
     CHECK(lseek(fd, 0, SEEK_SET) == 0);
     ssize_t total = posix_getdents(fd, buffer.bytes, sizeof buffer, 0);
     CHECK(total > 0);
-    int dots = 0, dotdots = 0, motds = 0, groups = 0, passwds = 0, count = 0;
+    int dots = 0, dotdots = 0, motds = 0, groups = 0, passwds = 0, shadows = 0, count = 0;
     ssize_t used = 0;
     while (used < total) {
         record = (struct posix_dent *)(buffer.bytes + used);
@@ -873,12 +873,13 @@ static int names_entries(void) {
         else if (!strcmp(record->d_name, "motd")) { motds++; CHECK(record->d_type == DT_REG); }
         else if (!strcmp(record->d_name, "group")) { groups++; CHECK(record->d_type == DT_REG); }
         else if (!strcmp(record->d_name, "passwd")) { passwds++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "shadow")) { shadows++; CHECK(record->d_type == DT_REG); }
         else CHECK(0);
         used += record->d_reclen;
         count++;
     }
-    CHECK(used == total && count == 5 && dots == 1 && dotdots == 1
-        && motds == 1 && groups == 1 && passwds == 1);
+    CHECK(used == total && count == 6 && dots == 1 && dotdots == 1
+        && motds == 1 && groups == 1 && passwds == 1 && shadows == 1);
     /* The end is 0, and the offset and errno stay. */
     at = lseek(fd, 0, SEEK_CUR);
     CHECK(at > 0);
@@ -887,9 +888,9 @@ static int names_entries(void) {
     CHECK(lseek(fd, 0, SEEK_CUR) == at);
     CHECK(posix_getdents(fd, buffer.bytes, sizeof buffer, 0) == 0 && errno == 123);
     CHECK(lseek(fd, 0, SEEK_CUR) == at);
-    /* One record at a time reaches the same five exactly once. */
+    /* One record at a time reaches the same six exactly once. */
     CHECK(lseek(fd, 0, SEEK_SET) == 0);
-    count = dots = dotdots = motds = groups = passwds = 0;
+    count = dots = dotdots = motds = groups = passwds = shadows = 0;
     for (;;) {
         ssize_t got = posix_getdents(fd, buffer.bytes, 32, 0);
         CHECK(got >= 0);
@@ -904,12 +905,13 @@ static int names_entries(void) {
         else if (!strcmp(record->d_name, "motd")) { motds++; CHECK(record->d_type == DT_REG); }
         else if (!strcmp(record->d_name, "group")) { groups++; CHECK(record->d_type == DT_REG); }
         else if (!strcmp(record->d_name, "passwd")) { passwds++; CHECK(record->d_type == DT_REG); }
+        else if (!strcmp(record->d_name, "shadow")) { shadows++; CHECK(record->d_type == DT_REG); }
         else CHECK(0);
         count++;
-        CHECK(count <= 5);
+        CHECK(count <= 6);
     }
-    CHECK(count == 5 && dots == 1 && dotdots == 1
-        && motds == 1 && groups == 1 && passwds == 1);
+    CHECK(count == 6 && dots == 1 && dotdots == 1
+        && motds == 1 && groups == 1 && passwds == 1 && shadows == 1);
     CHECK(close(fd) == 0);
     FAILS(posix_getdents(fd, buffer.bytes, sizeof buffer, 0), EBADF);
     /* The root: `etc` and `tmp` are directories. */

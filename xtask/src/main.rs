@@ -5586,14 +5586,14 @@ fn posix_procs_verdict(outcome: &qemu::Outcome) -> Result<(), String> {
         .iter()
         .filter(|line| {
             let names: Vec<_> = line.split_whitespace().collect();
-            names.len() == 3
-                && ["motd", "passwd", "group"]
+            names.len() == 4
+                && ["motd", "passwd", "group", "shadow"]
                     .iter()
                     .all(|name| names.contains(name))
         })
         .count();
     if listings < 2 {
-        return Err("ls of /etc printed the three account-file names fewer than twice".into());
+        return Err("ls of /etc printed the four account-file names fewer than twice".into());
     }
     check_process_memory_reserve(&outcome.lines)?;
     // The new image of an exec whose old image ended first never runs.
@@ -8406,7 +8406,7 @@ fn ash_dialog() -> Result<(), String> {
         // ends and gives its status.
         run.send("/bin/ls -1 /etc & wait")?;
         run.expect("/bin/ls -1 /etc & wait", DIALOG_STEP)?;
-        let mut accounts = vec!["motd", "passwd", "group"];
+        let mut accounts = vec!["motd", "passwd", "group", "shadow"];
         while !accounts.is_empty() {
             let name = run.expect_line(
                 "a remaining /etc account file",

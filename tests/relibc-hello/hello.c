@@ -83,11 +83,12 @@ static int files(void) {
         else if (strcmp(entry->d_name, "motd") == 0) { CHECK(entry->d_type == DT_REG); bit = 4; }
         else if (strcmp(entry->d_name, "passwd") == 0) { CHECK(entry->d_type == DT_REG); bit = 8; }
         else if (strcmp(entry->d_name, "group") == 0) { CHECK(entry->d_type == DT_REG); bit = 16; }
+        else if (strcmp(entry->d_name, "shadow") == 0) { CHECK(entry->d_type == DT_REG); bit = 32; }
         else CHECK(!"an entry /etc does not have");
         CHECK((seen & bit) == 0);
         seen |= bit;
     }
-    CHECK(seen == 31);
+    CHECK(seen == 63);
     rewinddir(etc);
     CHECK(readdir(etc) != NULL);
     CHECK(closedir(etc) == 0);
