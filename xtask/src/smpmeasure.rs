@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! `cargo xtask smp-measure [tcg|hvf|hvf2] [RUNS]`: the numbers of SMP
+//! `cargo xtask smp-measure [tcg|hvf|hvf2|hvf-nopoll|hvf2-nopoll] [RUNS]`: the numbers of SMP
 //! stage 6 on 2 and on 4 CPUs. The test init of the kernel built with
 //! `smp-measure` runs its rows (tests/init/src/smp.rs, `stage_6_measures`):
 //! a request to a thread on another CPU (S5x) with the target waiting in
@@ -139,11 +139,18 @@ pub fn needs_finer_locks(share_tenths: u64, longest_wait: u64, hold: u64, cpus: 
 }
 
 fn one_run(mode: &str, cpus: usize) -> Result<(Vec<Row>, Vec<Counted>), String> {
-    let a = build(Variant::SmpMeasure)?;
+    // `-nopoll`: the same kernel with the poll of the idle loop off, for the
+    // pair of images of one session.
+    let variant = if mode.ends_with("-nopoll") {
+        Variant::SmpMeasureNoPoll
+    } else {
+        Variant::SmpMeasure
+    };
+    let a = build(variant)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
     let machine = match mode {
-        "hvf" => &qemu::HVF_V3,
-        "hvf2" => &qemu::HVF_V2,
+        "hvf" | "hvf-nopoll" => &qemu::HVF_V3,
+        "hvf2" | "hvf2-nopoll" => &qemu::HVF_V2,
         _ => &qemu::VIRT,
     };
     let mut cmd = qemu::command(machine, &a.image, Some(&image));
@@ -151,6 +158,13 @@ fn one_run(mode: &str, cpus: usize) -> Result<(Vec<Row>, Vec<Counted>), String> 
     cmd.args(qemu::HEADLESS);
     let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let (rows, storms) = parse(&o.lines);
+    for l in o
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("smp-measure poll cpu"))
+    {
+        println!("{mode} {cpus} CPUs: {l}");
+    }
     if rows.len() != 6 || storms.len() != 2 {
         return Err(format!(
             "the test init printed {} rows and {} storms of 6 and 2 (the lines: {:?})",
@@ -168,8 +182,8 @@ fn one_run(mode: &str, cpus: usize) -> Result<(Vec<Row>, Vec<Counted>), String> 
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let mode = args.first().map_or("tcg", String::as_str);
-    if !["tcg", "hvf", "hvf2"].contains(&mode) {
-        return Err("usage: smp-measure [tcg|hvf|hvf2] [RUNS]".into());
+    if !["tcg", "hvf", "hvf2", "hvf-nopoll", "hvf2-nopoll"].contains(&mode) {
+        return Err("usage: smp-measure [tcg|hvf|hvf2|hvf-nopoll|hvf2-nopoll] [RUNS]".into());
     }
     let runs: usize = args
         .get(1)
