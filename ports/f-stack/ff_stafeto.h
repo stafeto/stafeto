@@ -64,6 +64,7 @@ struct ff_stafeto_device_stats {
     uint64_t rx_layer_ticks, rx_input_ticks, tx_send_ticks;
     uint64_t kicks, sleeps, sleeps_found_work, notifications;
     uint32_t free_low, free_now;
+    uint64_t bell_rx_passes, bell_rx, bell_tx;
 };
 void ff_stafeto_device_stats(struct ff_stafeto_device_stats *out);
 

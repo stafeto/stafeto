@@ -23,6 +23,7 @@ use crate::books::QUEUE_SIZE;
 use crate::frames::{BUFFER_LEN, HDR_LEN, MAX_FRAME, fill_sums, rx_frame, tx_prepare};
 use crate::host::{self, Host, Region};
 use crate::open::{MAC, MTU, STATUS};
+use crate::rings::{RX_LOW, Stock, wants_ring};
 use crate::transport::{self, Snapshot};
 use crate::{barrier, open};
 use core::cell::UnsafeCell;
@@ -163,7 +164,12 @@ struct State {
     tx: Queue,
     rx_of: [u32; QUEUE_SIZE],
     tx_of: [u32; QUEUE_SIZE],
-    rx_dirty: bool,
+    /// The buffers of the queue of receiving as far as its doorbell goes.
+    stock: Stock,
+    /// Doorbells as counted for the batching report: the passes that gave
+    /// buffers (one doorbell each before the batching), the doorbells of receiving and
+    /// those of sending.
+    bells: [u64; 3],
     tx_dirty: bool,
     ring: usize,
 }
@@ -267,7 +273,8 @@ pub unsafe extern "C" fn vnet_open(c: *const Claim) -> c_int {
             tx,
             rx_of: [NONE; QUEUE_SIZE],
             tx_of: [NONE; QUEUE_SIZE],
-            rx_dirty: false,
+            stock: Stock::new(),
+            bells: [0; 3],
             tx_dirty: false,
             ring: c.ring as usize,
         });
@@ -279,13 +286,19 @@ pub unsafe extern "C" fn vnet_open(c: *const Claim) -> c_int {
     refill(s);
     s.transport.finish_init();
     barrier::ring(&mut s.transport, RECEIVEQ);
-    s.rx_dirty = false;
+    s.stock.rung();
     0
 }
 
 /// The queue of receiving gets buffers of the pool until it is full
 /// (Virtio 1.2, 5.1.6.3: a driver keeps it so).
-fn refill(s: &mut State) {
+fn refill(s: &mut State) -> bool {
+    let before = s.stock.pending();
+    refill_all(s);
+    s.stock.pending() != before
+}
+
+fn refill_all(s: &mut State) {
     while s.rx.available_desc() > 0 {
         let Some(n) = pool().take() else {
             return;
@@ -297,7 +310,7 @@ fn refill(s: &mut State) {
         match unsafe { s.rx.add(&[], &mut [slice]) } {
             Ok(token) if usize::from(token) < QUEUE_SIZE => {
                 s.rx_of[usize::from(token)] = n;
-                s.rx_dirty = true;
+                s.stock.added();
             }
             _ => {
                 pool().give(n);
@@ -319,9 +332,22 @@ pub unsafe extern "C" fn vnet_rx_burst(out: *mut Buf, n: c_int) -> c_int {
     let Some(s) = state() else {
         return -1;
     };
-    refill(s);
-    if core::mem::take(&mut s.rx_dirty) && s.rx.should_notify() {
-        barrier::ring(&mut s.transport, RECEIVEQ);
+    // The check of the doorbell stands before the frames are taken: a burst
+    // of more than RX_LOW could take the device's stock to 0 without it.
+    const { assert!(RX_LOW >= 32, "the programs' bursts are 32") };
+    let n = n.min(RX_LOW as c_int);
+    if refill(s) {
+        s.bells[0] += 1;
+    }
+    // The doorbell waits until the device runs low on the buffers it was
+    // shown (`Stock`): a burst of the program is a few frames.
+    let wanted = wants_ring(&s.rx);
+    if s.stock.due(wanted) {
+        s.stock.rung();
+        if wanted {
+            s.bells[1] += 1;
+            barrier::ring(&mut s.transport, RECEIVEQ);
+        }
     }
     let mut got = 0;
     while got < n.max(0) && s.rx.can_pop() {
@@ -341,6 +367,7 @@ pub unsafe extern "C" fn vnet_rx_burst(out: *mut Buf, n: c_int) -> c_int {
             return -1;
         };
         s.rx_of[usize::from(token)] = NONE;
+        s.stock.used();
         match rx_frame(slice, used as usize) {
             Some(frame) => {
                 // SAFETY: the caller's room for `n`.
@@ -419,8 +446,9 @@ pub extern "C" fn vnet_tx(buf: u32, len: u16) -> c_int {
 pub extern "C" fn vnet_tx_kick() {
     if let Some(s) = state()
         && core::mem::take(&mut s.tx_dirty)
-        && s.tx.should_notify()
+        && wants_ring(&s.tx)
     {
+        s.bells[2] += 1;
         barrier::ring(&mut s.transport, TRANSMITQ);
     }
 }
@@ -459,14 +487,9 @@ pub extern "C" fn vnet_tx_reclaim() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn vnet_notify(on: c_int) {
     if let Some(s) = state() {
-        s.rx.set_dev_notify(on != 0);
-        if on != 0 {
-            // A full barrier between the flag and the next look at the used
-            // index (Virtio 1.2, 2.7.10): the flag store is a release and
-            // the look an acquire, which AArch64 may reorder past each
-            // other without it.
-            core::sync::atomic::fence(Ordering::SeqCst);
-        }
+        // On: a full barrier follows the flag (Virtio 1.2, 2.7.10), before
+        // the next look at the used index.
+        crate::rings::notify_on(&mut s.rx, on != 0);
     }
 }
 
@@ -614,5 +637,22 @@ mod tests {
         pool.give(BUFFERS as u32);
         assert_eq!(pool.take(), Some(7));
         assert_eq!(pool.take(), None);
+    }
+}
+
+/// The doorbells so far: `out[0]` the passes of receiving that gave buffers
+/// (one doorbell each before the batching), `out[1]` the doorbells of receiving,
+/// `out[2]` those of sending.
+///
+/// # Safety
+///
+/// `out` has room for 3 values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vnet_bells(out: *mut u64) {
+    if let Some(s) = state() {
+        for (i, b) in s.bells.iter().enumerate() {
+            // SAFETY: the caller's room for 3 values.
+            unsafe { out.add(i).write(*b) };
+        }
     }
 }

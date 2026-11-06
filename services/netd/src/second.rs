@@ -204,7 +204,7 @@ impl Second {
             device.rx.fill();
             transport.finish_init();
             ring(&mut transport, RECEIVEQ);
-            device.rx.ring.dirty = false;
+            device.rx.ring.rung();
             let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
             config.random_seed = seed;
             let iface = Interface::new(config, device, instant(now_ns));
@@ -329,15 +329,17 @@ impl Second {
             .iface
             .poll_at(now, &self.sockets)
             .map(|at| (at.total_micros().max(0) as u64).saturating_mul(1000));
-        if core::mem::take(&mut self.device.rx.ring.dirty)
-            && self.device.rx.ring.queue.should_notify()
-        {
-            ring(&mut self.transport, RECEIVEQ);
+        if self.device.rx.ring.dirty {
+            self.device.rx.ring.rung();
+            if virtio_net::rings::wants_ring(&self.device.rx.ring.queue) {
+                ring(&mut self.transport, RECEIVEQ);
+            }
         }
-        if core::mem::take(&mut self.device.tx.ring.dirty)
-            && self.device.tx.ring.queue.should_notify()
-        {
-            ring(&mut self.transport, TRANSMITQ);
+        if self.device.tx.ring.dirty {
+            self.device.tx.ring.rung();
+            if virtio_net::rings::wants_ring(&self.device.tx.ring.queue) {
+                ring(&mut self.transport, TRANSMITQ);
+            }
         }
         outcome.more = self.device.rx.ring.queue.can_pop();
         outcome
@@ -511,7 +513,7 @@ impl Second {
                 }
                 self.transport.finish_init();
                 ring(&mut self.transport, RECEIVEQ);
-                self.device.rx.ring.dirty = false;
+                self.device.rx.ring.rung();
                 self.mode = Mode::Own;
                 // A static address stays; the DHCP client starts again.
                 if let Some(handle) = self.dhcp {

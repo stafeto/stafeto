@@ -57,6 +57,45 @@ pub const STEP_TX: usize = 2;
     feature = "send-2"
 )))]
 pub const STEP_TX: usize = 1;
+/// The frames the ring of sending holds before its doorbell rings while
+/// steps of the service follow.
+pub const BELL_TX: u32 = 8;
+/// The steps a frame of sending waits at most for its doorbell while steps
+/// of the service follow (a run of receiving that brings no answers must not
+/// hold a short reply: a step is about 100 us, so 4 steps are under half a
+/// millisecond).
+pub const BELL_STEPS: u32 = 4;
+/// Whether the ring of sending rings its doorbell at the end of a step:
+/// `pending` frames went in since the last one, `waited` steps ended since
+/// the first of them, and `more` says that another step of the service
+/// follows at once. One ring serves the frames of the whole run of steps (a
+/// ring is an exit from the guest, far dearer than a frame), and no frame
+/// waits more than `BELL_STEPS` steps.
+pub const fn tx_bell_due(pending: u32, waited: u32, more: bool) -> bool {
+    pending > 0 && (!more || pending >= BELL_TX || waited >= BELL_STEPS)
+}
+
+/// The end of a run of steps for the interrupts of receiving: while steps
+/// follow (`continued`) the device is asked for none; at the end it is asked
+/// for them (`set(true)` includes the full barrier) and the queue is looked
+/// at once more, since a frame that came in between brings no interrupt
+/// (Virtio 1.2, 2.7.14); a frame found continues the run. Whether the run
+/// continues.
+pub fn settle_interrupts(
+    continued: bool,
+    mut tell: impl FnMut() -> bool,
+    mut set: impl FnMut(bool),
+    mut can_pop: impl FnMut() -> bool,
+) -> bool {
+    set(!continued);
+    if !continued && can_pop() {
+        let continued = tell();
+        set(!continued);
+        return continued;
+    }
+    continued
+}
+
 /// The frames the loopback keeps for the next reception: two steps of
 /// sending, or of the answers to receiving.
 pub const LOOP_FRAMES: usize = 2 * if STEP_TX > STEP_RX { STEP_TX } else { STEP_RX };
@@ -572,6 +611,58 @@ impl Default for Budget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_of_steps_of_sending_rings_once_at_its_end() {
+        assert!(!tx_bell_due(0, 0, false), "nothing went in");
+        assert!(!tx_bell_due(1, 0, true), "a step follows");
+        assert!(!tx_bell_due(BELL_TX - 1, BELL_STEPS - 1, true));
+        assert!(
+            tx_bell_due(BELL_TX, 0, true),
+            "a frame does not wait for ever"
+        );
+        assert!(tx_bell_due(1, 0, false), "the last step rings what is left");
+        assert!(
+            tx_bell_due(1, BELL_STEPS, true),
+            "one reply under a one-way flow of inbound frames waits at most BELL_STEPS steps"
+        );
+        assert!(!tx_bell_due(0, BELL_STEPS, true), "nothing to ring");
+    }
+
+    #[test]
+    fn a_frame_that_came_while_the_interrupts_went_on_continues_the_run() {
+        use core::cell::Cell;
+        // The gap: the queue is empty at the last look of the step and a
+        // frame is there after the interrupts are on.
+        let on = Cell::new(false);
+        let told = Cell::new(0);
+        let settled = settle_interrupts(
+            false,
+            || {
+                told.set(told.get() + 1);
+                true
+            },
+            |v| on.set(v),
+            || on.get(),
+        );
+        assert!(
+            settled,
+            "without the second look the run ends with the frame waiting"
+        );
+        assert_eq!(told.get(), 1);
+        assert!(
+            !on.get(),
+            "the interrupts are off again while the run goes on"
+        );
+        // A run that goes on asks for no look and keeps the interrupts off.
+        let settled = settle_interrupts(true, || false, |v| on.set(v), || true);
+        assert!(settled);
+        assert!(!on.get());
+        // Nothing in the queue: the interrupts stay on.
+        let settled = settle_interrupts(false, || false, |v| on.set(v), || false);
+        assert!(!settled);
+        assert!(on.get());
+    }
 
     #[test]
     fn a_step_that_ends_its_receiving_keeps_the_frames_it_took() {

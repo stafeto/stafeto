@@ -59,6 +59,11 @@ int vnet_tx_reclaim(void);
  * look at the queue once more: a frame that came in between brings none. */
 void vnet_notify(int on);
 
+/* The doorbells so far, for the report: out[0] the passes of receiving that
+ * gave buffers (one doorbell each before the batching), out[1] the doorbells
+ * of receiving, out[2] those of sending. */
+void vnet_bells(uint64_t *out);
+
 /* 1 when the device was taken away (reset under the program: the network
  * service ended). The program stops touching it and ends. */
 int vnet_lost(void);
