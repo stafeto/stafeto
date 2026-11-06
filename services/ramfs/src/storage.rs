@@ -85,6 +85,38 @@ pub(crate) fn name_bucket(parent: Token, name: &[u8]) -> usize {
     }
     ((hash ^ (hash >> 15)) as usize) & (BUCKETS - 1)
 }
+/// `dst` gets the bytes of `src` (the same length). On AArch64 the bulk goes by pairs of words, 32
+/// bytes at a time, which avoids the freestanding byte copy of `copy_from_slice` at
+/// `opt-level = "s"` (about three ticks a byte under -icount): a read of the portion of a file
+/// with private pages stays within the step the design allows.
+fn copy_bytes(src: &[u8], dst: &mut [u8]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(not(target_arch = "aarch64"))]
+    let copied = 0;
+    #[cfg(target_arch = "aarch64")]
+    let mut copied = 0;
+    #[cfg(target_arch = "aarch64")]
+    while copied + 32 <= src.len() {
+        // SAFETY: every scalar word pair stays inside both checked slices. AArch64
+        // normal-memory loads and stores support unaligned addresses; the slices are distinct
+        // borrows, so they do not overlap.
+        unsafe {
+            core::arch::asm!(
+                "ldp {a}, {b}, [{source}]",
+                "ldp {c}, {d}, [{source}, #16]",
+                "stp {a}, {b}, [{destination}]",
+                "stp {c}, {d}, [{destination}, #16]",
+                source = in(reg) src.as_ptr().add(copied),
+                destination = in(reg) dst.as_mut_ptr().add(copied),
+                a = out(reg) _, b = out(reg) _, c = out(reg) _, d = out(reg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+        copied += 32;
+    }
+    dst[copied..].copy_from_slice(&src[copied..]);
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     extern crate std;
@@ -2198,32 +2230,10 @@ impl<'a> Storage<'a> {
         let boot = self.boot_bytes(token);
         if n.overlay == NONE && offset <= boot.len() as u64 && count <= boot.len() - offset as usize
         {
-            let bytes = &boot[offset as usize..offset as usize + count];
-            #[cfg(not(target_arch = "aarch64"))]
-            let copied = 0;
-            #[cfg(target_arch = "aarch64")]
-            let mut copied = 0;
-            #[cfg(target_arch = "aarch64")]
-            while copied + 32 <= count {
-                // SAFETY: every scalar word pair stays inside both checked slices.
-                // AArch64 normal-memory loads/stores support unaligned addresses;
-                // output cannot alias the immutable boot mapping. This avoids the
-                // freestanding byte-copy builtin at opt-level="s", without SIMD.
-                unsafe {
-                    core::arch::asm!(
-                        "ldp {a}, {b}, [{source}]",
-                        "ldp {c}, {d}, [{source}, #16]",
-                        "stp {a}, {b}, [{destination}]",
-                        "stp {c}, {d}, [{destination}, #16]",
-                        source = in(reg) bytes.as_ptr().add(copied),
-                        destination = in(reg) out.as_mut_ptr().add(copied),
-                        a = out(reg) _, b = out(reg) _, c = out(reg) _, d = out(reg) _,
-                        options(nostack, preserves_flags),
-                    );
-                }
-                copied += 32;
-            }
-            out[copied..count].copy_from_slice(&bytes[copied..]);
+            copy_bytes(
+                &boot[offset as usize..offset as usize + count],
+                &mut out[..count],
+            );
             return Ok(count);
         }
         let mut copied = 0;
@@ -2238,12 +2248,14 @@ impl<'a> Storage<'a> {
             let chunk = &mut out[copied..copied + amount];
             if p == NONE {
                 let available = boot.len().saturating_sub(at).min(amount);
-                chunk[..available]
-                    .copy_from_slice(&boot[at.min(boot.len())..at.min(boot.len()) + available]);
+                copy_bytes(
+                    &boot[at.min(boot.len())..at.min(boot.len()) + available],
+                    &mut chunk[..available],
+                );
                 chunk[available..].fill(0);
             } else {
                 let start = p as usize * PAGE + at % PAGE;
-                chunk.copy_from_slice(&self.data[start..start + amount]);
+                copy_bytes(&self.data[start..start + amount], chunk);
             }
             copied += amount;
         }

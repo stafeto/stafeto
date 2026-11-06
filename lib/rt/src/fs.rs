@@ -5,7 +5,7 @@
 //! standard descriptors use the console; file descriptors 3 and above
 //! belong to one session with `ramfs`.
 
-use crate::handle::{Channel, Handle};
+use crate::handle::{Channel, Handle, Memory};
 use crate::{console, service, sys};
 use abi::{Error, MESSAGE_MAX};
 use proto_fs::{MAX_READ, MAX_WRITE, Metadata, Method, valid_path};
@@ -1285,6 +1285,68 @@ impl Files {
         out[..n].copy_from_slice(r.bytes(n)?);
         r.finish()?;
         Ok(n)
+    }
+
+    /// READ_FD_INTO, or READ_AT_FD_INTO with `offset`: up to `count` bytes (at most
+    /// `READ_PORTION`) of the file of `fd` into `memory` from `place`, a whole page, through a
+    /// copy of `memory` the service maps for the copy; the count read. The position of the
+    /// description moves as READ moves it unless `offset` is given. One step of the service,
+    /// so the bytes are those of one state of the file.
+    pub fn read_into(
+        &self,
+        fd: u32,
+        offset: Option<u64>,
+        count: usize,
+        memory: &Handle<Memory>,
+        place: u64,
+    ) -> Result<usize, Status> {
+        let mut w = Writer::new();
+        match offset {
+            None => Method::ReadFdInto.header().write(&mut w)?,
+            Some(_) => Method::ReadAtFdInto.header().write(&mut w)?,
+        }
+        w.u32(fd)?;
+        if let Some(offset) = offset {
+            w.u64(offset)?;
+        }
+        w.u32(count as u32)?;
+        w.u64(place)?;
+        let rights = abi::Rights::MAP_READ | abi::Rights::MAP_WRITE | abi::Rights::TRANSFER;
+        loop {
+            // A refusal consumes the outgoing handle: each ask owns a fresh copy.
+            let copy = sys::handle_duplicate(memory, rights).map_err(Status::Kernel)?;
+            let reply = sys::send_handles(&self.channel, w.as_bytes(), [copy.erase()])
+                .map_err(|refused| Status::Kernel(refused.error))?;
+            let code = Self::reply_code(&reply)?;
+            if code == proto_fs::AUTHENTICATING {
+                if reply.len != proto_wire::HEADER_LEN
+                    || reply.words[0] >> 32 != 0
+                    || !reply.handles.is_empty()
+                {
+                    return Err(Status::BadSize);
+                }
+                Self::finish_on(&self.channel)?;
+                continue;
+            }
+            if !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            if code != 0 {
+                return Err(Status::from_code(code));
+            }
+            let mut buffer = [0; MESSAGE_MAX];
+            let mut r = Reader::new(reply.bytes(&mut buffer));
+            if r.u32()? != 0 {
+                return Err(Status::BadSize);
+            }
+            let n = r.u32()? as usize;
+            r.finish()?;
+            return if n <= count {
+                Ok(n)
+            } else {
+                Err(Status::BadSize)
+            };
+        }
     }
 
     /// WRITE_AT: `bytes` at `offset` of the file of `fd`, the open

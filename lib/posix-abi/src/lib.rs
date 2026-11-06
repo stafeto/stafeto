@@ -18,6 +18,7 @@ pub mod cpu;
 pub mod cpus;
 mod drain_driver;
 mod drain_hooks;
+mod filebuf;
 #[cfg(feature = "close-probe")]
 pub use close_driver::{Probe as CloseProbe, probe_hook as probe_close_hook};
 pub mod constants;
@@ -371,6 +372,12 @@ pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
 fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     let mut message = [0; MESSAGE_MAX];
     let fd = fd(number)?;
+    // A read of a file of more than one message goes through the buffer of the large reads.
+    if buffer.len() > posix_request::MAX_READ
+        && let Some(result) = read_file_large(fd, buffer)
+    {
+        return result;
+    }
     let count = buffer.len().min(posix_request::MAX_READ);
     match shared::dispatch(
         Request::Read {
@@ -394,6 +401,49 @@ fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
         }
         _ => Err(EIO),
     }
+}
+
+/// A read of the file `fd` of the RAM service for more than one message, in one step of the
+/// service (READ_FD_INTO): up to `proto_fs::READ_PORTION` bytes, the count. None for any other
+/// descriptor, and when no cell of the buffer is to be had; the read then goes by messages.
+#[inline(never)]
+fn read_file_large(fd: u32, buffer: &mut [u8]) -> Option<Result<usize, c_int>> {
+    // Only a file of the RAM service is held for it; the kind is looked at under the lock of the
+    // files without a hold, so that the other descriptors are held once, by their own reads.
+    let ram = shared::with_fd(fd, |files| files.target(fd).map_err(error))
+        .is_ok_and(|target| matches!(target, posix_fs::Target::Ram(_)));
+    if !ram {
+        return None;
+    }
+    let result =
+        shared::held(fd, |transport, target| match target {
+            posix_fs::Target::Ram(file) => Ok(filebuf::read(&transport, file.fd(), None, buffer)
+                .map(|result| result.map_err(error))),
+            _ => Ok(None),
+        });
+    match result {
+        Ok(read) => read,
+        Err(errno) => Some(Err(errno)),
+    }
+}
+
+/// How many reads went through a cell of the buffer of the large reads (for the probes).
+pub fn probe_file_reads() -> u64 {
+    filebuf::probe_through()
+}
+
+/// The same for `pread` of the description `fd` of the RAM service at `offset`: the platform's
+/// call, inside the hold of the descriptor, with the transport `held` gave it.
+pub fn pread_file_large(
+    transport: &posix_fs::Transport,
+    fd: u32,
+    offset: u64,
+    out: &mut [u8],
+) -> Option<Result<usize, FsError>> {
+    if out.len() <= posix_request::MAX_READ {
+        return None;
+    }
+    filebuf::read(transport, fd, Some(offset), out)
 }
 
 /// The console's branch of `read`, in its own frame: its buffers stay off

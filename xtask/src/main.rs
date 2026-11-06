@@ -5904,7 +5904,7 @@ const NOISE_MARGIN: u64 = 1_500;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
-const RAM_STEP_KINDS: [(usize, &str); 25] = [
+const RAM_STEP_KINDS: [(usize, &str); 26] = [
     (1, "Open"),
     (13, "ReadAt"),
     (14, "OpenExec"),
@@ -5927,6 +5927,9 @@ const RAM_STEP_KINDS: [(usize, &str); 25] = [
     (46, "ChangeStep"),
     (47, "ChangeQuery"),
     (48, "ChangeRelease"),
+    // The statistics count every method from 64 on in the kind 63 (IpcJobs, ReadFdInto and
+    // ReadAtFdInto): the detail of the longest step says which it was.
+    (63, "IpcJobs, ReadFdInto, ReadAtFdInto"),
     (64, "notification"),
     (65, "maintenance"),
     (66, "session gone"),

@@ -759,16 +759,20 @@ static void image_spawned(void) {
     close(done[1]);
 }
 
-/* A fork of a map with 97 groups of regions that do not adjoin (the table of
- * pieces holds 128, the program's own take some 30): four objects of 64
- * pages, of which every second page is given back (the last object keeps
- * one page and loses the rest in one run). The child binds an
- * object for each group (the loader joins adjoining regions of one object),
- * and the table of objects holds as many as the table of pieces, 128: the
- * fork has to succeed, and the child has the map. Blocks of 64 pages keep
- * the memory held small. */
+/* A fork of a map with 96 groups of regions that do not adjoin (the table of
+ * pieces holds 128, the program's own take some 30 and the buffer of the
+ * large reads of files one, which the 16 KiB reads of `copy_file` make before this test and
+ * which stays until the process ends): four objects of 64 pages, of which every second
+ * page is given back (the first object keeps 31 groups and gives back its
+ * last two pages in one run, the last keeps one page and loses the rest in
+ * one run). The child binds an object for each group (the loader joins
+ * adjoining regions of one object), and the table of objects holds as many
+ * as the table of pieces, 128: the fork has to succeed, and the child has the
+ * map. Blocks of 64 pages keep the memory held small. */
 #define BLOCKS 4
 #define BLOCK_PAGES 64
+/* The pages of a block that stay in groups: the first one up to page 61. */
+static size_t block_limit(int b) { return b == BLOCKS - 1 ? 2 : b == 0 ? BLOCK_PAGES - 2 : BLOCK_PAGES; }
 static void forked_many(void) {
     char *block[BLOCKS];
     size_t kept = 0;
@@ -777,13 +781,13 @@ static void forked_many(void) {
         check("many: mmap", block[b] != NULL);
         if (!block[b]) return;
         for (size_t i = 0; i < BLOCK_PAGES; i += 2) block[b][i * PAGE] = (char)(b * 40 + i / 2 + 1);
-        size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+        size_t limit = block_limit(b);
         for (size_t i = 1; i < limit; i += 2) check("many: hole", munmap(block[b] + i * PAGE, PAGE) == 0);
-        if (b == BLOCKS - 1)
+        if (limit < BLOCK_PAGES)
             check("many: the run of holes", munmap(block[b] + limit * PAGE, (BLOCK_PAGES - limit) * PAGE) == 0);
         kept += limit / 2;
     }
-    check("many: 97 groups", kept == 3 * 32 + 1);
+    check("many: 96 groups", kept == 31 + 32 + 32 + 1);
     pid_t child = fork();
     if (child < 0) {
         printf("posix-map: many: fork gave errno %d\n", errno);
@@ -791,7 +795,7 @@ static void forked_many(void) {
     } else if (child == 0) {
         int bad = 0;
         for (int b = 0; b < BLOCKS; b++) {
-            size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+            size_t limit = block_limit(b);
             for (size_t i = 0; i < limit; i += 2)
                 if (block[b][i * PAGE] != (char)(b * 40 + i / 2 + 1)) bad = 1;
             if (!read_faults(block[b] + PAGE)) bad |= 2;
@@ -804,7 +808,7 @@ static void forked_many(void) {
               WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     for (int b = 0; b < BLOCKS; b++) {
-        size_t limit = b == BLOCKS - 1 ? 2 : BLOCK_PAGES;
+        size_t limit = block_limit(b);
         for (size_t i = 0; i < limit; i += 2) munmap(block[b] + i * PAGE, PAGE);
     }
 }

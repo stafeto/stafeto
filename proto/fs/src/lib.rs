@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 20 of the bounded RAM file service. Numbers are little endian.
+//! Version 21 of the bounded RAM file service. Numbers are little endian.
 //! Ordinary sessions first Bind with a genuine Process identity capability,
 //! then FinishBinding until OK. Admission, Vouch, validation and commit are separate steps.
 //! Init grants the named RAM diagnostic client an explicit boot profile.
@@ -89,6 +89,10 @@
 //! Raw LoaderRoot Resolve requests are refused; executable proofs require the
 //! genuine fresh BindPending session described above.
 //! READ_INTO on an image session: fd0, offset/count, destination memory capability.
+//! READ_FD_INTO and READ_AT_FD_INTO serve the ordinary session: fd u32, count u32 (READ) or fd u32,
+//! offset u64, count u32 (READ_AT), then the place u64 in the memory object, one handle with
+//! MAP_READ, MAP_WRITE and TRANSFER. They read at most `READ_PORTION` bytes in one step of the
+//! service, so a read of that size is atomic against writes. Reply: status, count u32.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -136,7 +140,7 @@ use proto_wire::{HEADER_LEN, Header, Status};
 pub const RAM_TIME_LEGACY: &[u8] = b"time-legacy";
 /// Explicit startup mode requiring the shared Clock realtime page.
 pub const RAM_TIME_CLOCKED: &[u8] = b"time-clocked";
-pub const VERSION: u16 = 20;
+pub const VERSION: u16 = 21;
 /// Original descriptor custody keys and sixteen independent Control keys.
 pub const JOB_KEY_PLACES: usize = 48;
 pub const MAX_PATH: usize = 511;
@@ -145,6 +149,12 @@ pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
 /// The bytes of one READ_INTO at most: the copy one request of an image
 /// session makes in the service's step.
 pub const READ_INTO_MAX: usize = 12 * 1024;
+/// The bytes of one READ_FD_INTO or READ_AT_FD_INTO at most: the portion of a read of an ordinary
+/// session through a memory object, one step of the service. A read of this many bytes or fewer is
+/// one step, hence atomic against the writes of other processes (XSH 2.9.7). The copy of the step
+/// is that of READ_INTO, whose longest step stays under 0.9 B (18,369 ticks) at 12 KiB; a larger
+/// portion would pass it, the copy being most of the step.
+pub const READ_PORTION: usize = READ_INTO_MAX;
 
 pub const READ_ONLY: u32 = 0;
 pub const WRITE_ONLY: u32 = 1;
@@ -469,6 +479,14 @@ pub enum Method {
     /// are left, to be asked again). Any session may ask: it carries no
     /// authority, the jobs come from the pipe service alone.
     IpcJobs = 63,
+    /// Numbers 64 to 66 are the step kinds of the service's notification, maintenance and
+    /// departed sessions. fd u32, count u32, place u64 and one memory handle: READ of at most
+    /// `READ_PORTION` bytes into the object from the page-aligned place, the position of the
+    /// description moving as READ does. Reply: status, count u32.
+    ReadFdInto = 67,
+    /// fd u32, offset u64, count u32, place u64 and one memory handle: READ_AT of at most
+    /// `READ_PORTION` bytes into the object, the position of the description staying.
+    ReadAtFdInto = 68,
 }
 
 impl Method {
@@ -540,6 +558,8 @@ impl Method {
             61 => Some(Self::OpenFifoAck),
             62 => Some(Self::ShareGrant),
             63 => Some(Self::IpcJobs),
+            67 => Some(Self::ReadFdInto),
+            68 => Some(Self::ReadAtFdInto),
             _ => None,
         }
     }
@@ -548,7 +568,7 @@ impl Method {
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 51,
-    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 67, 68,
 ];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
@@ -612,9 +632,25 @@ mod tests {
         );
     }
 
+    /// The portion of a read through an object is more than one message, whole pages, within
+    /// the copy of READ_INTO whose step the probes bound; the methods that carry it are
+    /// listed and keep clear of the step kinds 64 to 66 of the service's statistics.
+    #[test]
+    fn the_read_portion_and_its_methods() {
+        const { assert!(READ_PORTION > MAX_READ) };
+        const { assert!(READ_PORTION <= READ_INTO_MAX) };
+        const { assert!(READ_PORTION.is_multiple_of(4096)) };
+        assert_eq!(Method::from_number(67), Some(Method::ReadFdInto));
+        assert_eq!(Method::from_number(68), Some(Method::ReadAtFdInto));
+        assert!(METHODS.contains(&67) && METHODS.contains(&68));
+        for number in 64..=66 {
+            assert_eq!(Method::from_number(number), None);
+        }
+    }
+
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=64u16 {
+        for number in 0..=70u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {

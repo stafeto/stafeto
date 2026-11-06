@@ -170,8 +170,9 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
         unsafe { core::slice::from_raw_parts_mut(buf, len) }
     };
     // A read of a regular file fills the buffer unless the file ends; the
-    // layer returns one message of it, so the rest is read after a full
-    // message. A pipe, a terminal or a socket return what is there.
+    // layer returns a portion of it (up to READ_PORTION bytes, or one
+    // message), so the rest is read after a full one. A pipe, a terminal or
+    // a socket return what is there.
     let mut done = 0;
     loop {
         let rest = &mut buffer[done..];
@@ -180,11 +181,8 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
         if got == -(posix_abi::constants::EAGAIN as isize) {
             posix_abi::epoll::would_block(fd, false);
         }
-        if got == posix_request::MAX_READ as isize
-            && size > posix_request::MAX_READ
-            && files::is_file(fd)
-        {
-            done += posix_request::MAX_READ;
+        if files::full_portion(got, size) && files::is_file(fd) {
+            done += got as usize;
             continue;
         }
         return if got < 0 && done > 0 {
@@ -922,6 +920,13 @@ pub unsafe extern "C" fn stafeto_probe_start_refusals(out: *mut u64, n: usize) -
     }
     // SAFETY: the caller's contract.
     posix_abi::process::probe_start_refusals(unsafe { core::slice::from_raw_parts_mut(out, n) })
+}
+
+/// How many reads went through a cell of the buffer of the large reads so far
+/// (posix_abi::probe_file_reads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_file_reads() -> u64 {
+    posix_abi::probe_file_reads()
 }
 
 /// Where the last fork of the process was refused (posix_abi::fork::

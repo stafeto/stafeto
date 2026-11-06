@@ -977,6 +977,8 @@ fn child() -> Result<(), &'static str> {
         // The child's session with the network service is the clone the
         // parent made, which holds the descriptions the child keeps.
         crate::net::after_fork(handle(raw(Slot::Net)));
+        // The child asks for a buffer of the large reads of files of its own.
+        crate::filebuf::after_fork();
         // The child's session with the package service is the clone the
         // parent made.
         crate::packages::after_fork(handle(raw(Slot::Packages)));

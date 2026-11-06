@@ -929,3 +929,77 @@ fn process_fsize_admission_snapshot_survives_new_limits_and_restart() {
         Err(proto_fs::FILE_SIZE_LIMIT)
     ));
 }
+
+/// A read of the portion is one call of the service: while it runs nothing else does, so the
+/// bytes of a portion are those of one state of the file, as a write of a message (one step
+/// too) leaves them. The cases of the layer: through the end of the file, the short rest, the
+/// position after `read` and the position `pread` leaves, a writer beside.
+#[test]
+fn a_portion_read_is_one_state_of_the_file() {
+    let now = proto_fs::Timestamp::legacy_ns(10);
+    let mut ram = Ram::new(now);
+    let (writer, wfd, _) = create(&mut ram, FIRST, b"portion");
+    let portion = proto_fs::READ_PORTION;
+    let size = 3 * portion / 2 + 7;
+    let pattern: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let mut done = 0;
+    while done < size {
+        let n = (size - done).min(proto_fs::MAX_WRITE - 8);
+        assert_eq!(
+            write(
+                &mut ram,
+                &writer,
+                wfd,
+                Some(done as u64),
+                &pattern[done..done + n],
+                10
+            ),
+            n
+        );
+        done += n;
+    }
+    let mut reader = Fds {
+        root: FIRST,
+        ..Fds::default()
+    };
+    let token = ram.get(&writer, wfd).unwrap();
+    let rfd = ram
+        .insert(
+            &mut reader,
+            Open {
+                flags: READ_ONLY,
+                ..token
+            },
+        )
+        .unwrap();
+    // A read of the portion returns it whole and moves the position by it.
+    let mut out = vec![0; portion];
+    assert_eq!(ram.read_at(&mut reader, rfd, &mut out, now), Ok(portion));
+    assert_eq!(out, pattern[..portion]);
+    // The next read ends at the end of the file: the short rest.
+    assert_eq!(
+        ram.read_at(&mut reader, rfd, &mut out, now),
+        Ok(size - portion)
+    );
+    assert_eq!(out[..size - portion], pattern[portion..]);
+    assert_eq!(ram.read_at(&mut reader, rfd, &mut out, now), Ok(0));
+    // pread leaves the position where it is, across the end of the file as well.
+    assert_eq!(ram.pread(&reader, rfd, 5, &mut out, now), Ok(portion));
+    assert_eq!(out, pattern[5..5 + portion]);
+    assert_eq!(
+        ram.pread(&reader, rfd, (size - 3) as u64, &mut out, now),
+        Ok(3)
+    );
+    assert_eq!(ram.read_at(&mut reader, rfd, &mut out, now), Ok(0));
+    // The portion after a write shows the write whole; the one before it shows the bytes that were there.
+    let mut before = vec![0; portion];
+    assert_eq!(ram.pread(&reader, rfd, 0, &mut before, now), Ok(portion));
+    let patch = vec![0xA5; 1000];
+    assert_eq!(write(&mut ram, &writer, wfd, Some(1000), &patch, 11), 1000);
+    let mut after = vec![0; portion];
+    assert_eq!(ram.pread(&reader, rfd, 0, &mut after, now), Ok(portion));
+    assert_eq!(before[..1000], after[..1000]);
+    assert_eq!(after[1000..2000], patch[..]);
+    assert_eq!(before[1000..2000], pattern[1000..2000]);
+    assert_eq!(before[2000..], after[2000..]);
+}

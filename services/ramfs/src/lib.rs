@@ -152,10 +152,27 @@ pub fn read_into_valid(
     writable: bool,
     size: u64,
 ) -> bool {
+    fd == 0 && count <= proto_fs::READ_INTO_MAX && window_valid(count, at, handles, writable, size)
+}
+
+/// Whether a READ_FD_INTO or READ_AT_FD_INTO of an ordinary session may run: a count within
+/// `proto_fs::READ_PORTION` (the step of the service copies it whole, which is what makes a
+/// read of that size atomic), and the object as `read_into_valid` asks.
+pub fn read_portion_valid(
+    count: usize,
+    at: u64,
+    handles: usize,
+    writable: bool,
+    size: u64,
+) -> bool {
+    count <= proto_fs::READ_PORTION && window_valid(count, at, handles, writable, size)
+}
+
+/// A place on a page boundary, exactly one handle that is a memory object with `MAP_READ`
+/// and `MAP_WRITE` (`writable`), and room for the count's pages in the object from the place.
+fn window_valid(count: usize, at: u64, handles: usize, writable: bool, size: u64) -> bool {
     let len = (count as u64).next_multiple_of(4096);
-    fd == 0
-        && count <= proto_fs::READ_INTO_MAX
-        && at.is_multiple_of(4096)
+    at.is_multiple_of(4096)
         && handles == 1
         && writable
         && at.checked_add(len).is_some_and(|end| end <= size)
@@ -2611,6 +2628,30 @@ mod tests {
         assert!(!ok(0, 10, 4096, 1, true, 4096), "place at the object's end");
         assert!(
             !ok(0, 10, u64::MAX - 4095, 1, true, u64::MAX),
+            "place that wraps"
+        );
+    }
+
+    /// The checks of a read of an ordinary session through an object: the portion bounds the
+    /// count, the object is checked as READ_INTO checks it.
+    #[test]
+    fn read_portion_checks_each_argument() {
+        let ok = read_portion_valid;
+        let max = proto_fs::READ_PORTION;
+        assert!(max > proto_fs::MAX_READ && max <= proto_fs::READ_INTO_MAX);
+        assert_eq!(max % 4096, 0);
+        assert!(ok(max, 0, 1, true, max as u64));
+        assert!(ok(proto_fs::MAX_READ + 1, 4096, 1, true, 4096 + max as u64));
+        assert!(ok(0, 0, 1, true, 4096));
+        assert!(!ok(max + 1, 0, 1, true, 1 << 20), "count past the portion");
+        assert!(!ok(10, 100, 1, true, 8192), "place off a page boundary");
+        assert!(!ok(10, 0, 0, true, 4096), "no object");
+        assert!(!ok(10, 0, 2, true, 4096), "two handles");
+        assert!(!ok(10, 0, 1, false, 4096), "no MAP_WRITE");
+        assert!(!ok(4097, 0, 1, true, 4096), "object shorter than the count");
+        assert!(!ok(10, 4096, 1, true, 4096), "place at the object's end");
+        assert!(
+            !ok(10, u64::MAX - 4095, 1, true, u64::MAX),
             "place that wraps"
         );
     }
