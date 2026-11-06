@@ -1,0 +1,35 @@
+name: packages-token
+
+# A check of the write right of PACKAGES_TOKEN, started by hand from `main`
+# (docs/release.md): the job reads the repository `stafeto/packages`, creates a
+# draft release there and deletes it. A draft is invisible to readers, so
+# nothing is published. The secret lives in the environment `packages`, which
+# only `main` and the tags `v*` may use; a run from another ref is refused
+# before the job starts.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  token:
+    name: token
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: packages
+    steps:
+      - name: The right to write to stafeto/packages
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::the secret PACKAGES_TOKEN of the environment packages is empty or missing"
+            exit 1
+          fi
+          gh api repos/stafeto/packages --jq .full_name
+          tag="token-check-${GITHUB_RUN_ID}"
+          gh release create "$tag" --draft --repo stafeto/packages \
+            --title "$tag" --notes "A check of the write right; deleted at once."
+          gh release delete "$tag" --yes --repo stafeto/packages
+          echo "PACKAGES_TOKEN may create and delete a draft release in stafeto/packages"
