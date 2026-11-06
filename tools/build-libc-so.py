@@ -397,7 +397,7 @@ def build_vnet() -> Path:
 
 # The functions of vnet.h.
 VNET_NAMES = ["vnet_open", "vnet_rx_burst", "vnet_rx_return", "vnet_buf_take", "vnet_buf_ptr", "vnet_buf_free",
-              "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost",
+              "vnet_tx", "vnet_tx_kick", "vnet_tx_reclaim", "vnet_notify", "vnet_lost", "vnet_bells",
               "vnet_fill_sums", "vnet_copy", "vnet_bypass_push", "vnet_bypass_pop"]
 
 
