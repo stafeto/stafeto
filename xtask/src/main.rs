@@ -105,6 +105,7 @@ mod probe_ca;
 mod qemu;
 mod release;
 mod repo;
+mod resign;
 mod ring;
 mod rootfs;
 mod rtbench;
@@ -9235,6 +9236,7 @@ fn host_tests() -> Result<(), String> {
         "tools/test_pkg_source.py",
         "tools/test_pkg_mirror.py",
         "tools/test_dist.py",
+        "tools/test_pages.py",
         "tools/test_nginx_answer.py",
         "tools/test_linux_guest.py",
     ] {

@@ -143,6 +143,25 @@ class PkgSource(unittest.TestCase):
             self.assertEqual(len(pkg_source.scan(out, [], ["tree"])), 3)
             self.assertEqual(pkg_source.scan(out, ["absent"], ["absent"]), [])
 
+    def test_scan_leaves_the_members_it_is_told_to_allow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = World(Path(tmp))
+            out = Path(tmp) / "app.tar.xz"
+            w.build("app", out)
+            self.assertEqual(len(pkg_source.scan(out, ["library source"], [])), 1)
+            self.assertEqual(pkg_source.scan(out, ["library source"], [], ["/lib-1.0.tar"]), [])
+
+    def test_an_entry_with_an_address_for_a_source_is_checked_in_src_or_left_to_the_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            w = World(Path(tmp))
+            address = "https://github.com/stafeto/packages/releases/download/v1-aarch64/app-1.0-1-src.tar.xz"
+            repo = self.repo(w, [{"name": "app", "source": address}])
+            # The archive was published before (a carried package): nothing to look at here.
+            self.assertEqual(pkg_source.check(repo, w.describe), 0)
+            # This build made it: it is looked at.
+            w.build("app", repo / "src" / "app-1.0-1-src.tar.xz")
+            self.assertEqual(pkg_source.check(repo, w.describe), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
