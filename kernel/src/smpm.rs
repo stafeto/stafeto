@@ -29,6 +29,7 @@ struct Row {
     /// bell, windows that ran out, ticks in windows, the window now, bells
     /// this CPU rang that needed no SGI, and those that did.
     hits: AtomicU64,
+    naps: AtomicU64,
     misses: AtomicU64,
     polled: AtomicU64,
     window: AtomicU64,
@@ -47,6 +48,7 @@ impl Row {
             wait: AtomicU64::new(0),
             longest_wait: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            naps: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             polled: AtomicU64::new(0),
             window: AtomicU64::new(0),
@@ -64,6 +66,7 @@ impl Row {
             &self.wait,
             &self.longest_wait,
             &self.hits,
+            &self.naps,
             &self.misses,
             &self.polled,
             &self.saved,
@@ -115,7 +118,9 @@ pub fn waited(ticks: u64) {
 pub fn polled(window: u64, hit: bool, ticks: u64) {
     let row = row();
     row.window.store(window, Relaxed);
-    if window != 0 {
+    if window == 0 {
+        row.naps.fetch_add(1, Relaxed);
+    } else {
         row.polled.fetch_add(ticks.min(window), Relaxed);
         let which = if hit { &row.hits } else { &row.misses };
         which.fetch_add(1, Relaxed);
@@ -137,23 +142,32 @@ pub fn reset() {
     crate::obj::reset_stretches();
 }
 
-/// Prints the count, a line for each CPU that entered the kernel.
-pub fn report() {
-    kprintln!("smp-measure counter {} Hz", crate::arch::timer::frequency());
+/// Prints the counters of the idle poll, a line for each CPU that polled or
+/// rang.
+pub fn report_poll() {
     for (i, row) in ROWS.iter().enumerate() {
-        let entries = row.entries.load(Relaxed);
         let rings = row.saved.load(Relaxed) + row.sent.load(Relaxed);
-        if rings + row.hits.load(Relaxed) + row.misses.load(Relaxed) != 0 {
+        if rings + row.hits.load(Relaxed) + row.misses.load(Relaxed) + row.naps.load(Relaxed) != 0 {
             kprintln!(
-                "smp-measure poll cpu {i}: windows hit {}, missed {}, {} ticks polled, window {} ticks, bells without SGI {}, with SGI {}",
+                "smp-measure poll cpu {i}: windows hit {}, missed {}, sleeps without a window {}, {} ticks polled, window {} ticks, bells without SGI {}, with SGI {}",
                 row.hits.load(Relaxed),
                 row.misses.load(Relaxed),
+                row.naps.load(Relaxed),
                 row.polled.load(Relaxed),
                 row.window.load(Relaxed),
                 row.saved.load(Relaxed),
                 row.sent.load(Relaxed),
             );
         }
+    }
+}
+
+/// Prints the count, a line for each CPU that entered the kernel.
+pub fn report() {
+    kprintln!("smp-measure counter {} Hz", crate::arch::timer::frequency());
+    report_poll();
+    for (i, row) in ROWS.iter().enumerate() {
+        let entries = row.entries.load(Relaxed);
         if entries == 0 {
             continue;
         }

@@ -225,7 +225,9 @@ impl Timer for VirtualTimer {
 pub fn init(clock: Clock) {
     let quantum = clock.ns_to_ticks(abi::RR_QUANTUM_NS);
     QUANTUM.store(quantum, core::sync::atomic::Ordering::Relaxed);
-    local().sched.lock().s.set_quantum(quantum);
+    let mut g = local().sched.lock();
+    g.s.set_quantum(quantum);
+    g.poll.scale(clock.hz());
 }
 
 /// The quantum in ticks, which every CPU's scheduler takes (`init_cpu`).

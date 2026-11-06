@@ -2155,7 +2155,11 @@ fn upcall_rounds(t: &Handle<Thread>) -> Result<[u64; MEASURE_ROUNDS], &'static s
 }
 
 /// The ticks of each of the rounds of a call to the service on `cpu`.
-fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
+fn call_rounds(
+    cpu: usize,
+    slot: usize,
+    gap_ns: u64,
+) -> Result<[u64; MEASURE_ROUNDS], &'static str> {
     reset_marks();
     let c = channel(QUIET)?;
     CHANNEL.store(c.raw().0, Relaxed);
@@ -2168,7 +2172,7 @@ fn call_rounds(cpu: usize, slot: usize) -> Result<[u64; MEASURE_ROUNDS], &'stati
         let before = time::now();
         done &= sys::send(&c, &[1]).is_ok();
         *row = time::now().wrapping_sub(before);
-        pause(50_000);
+        pause(gap_ns);
     }
     let _ = sys::send(&c, &[0]);
     let ended =
@@ -2252,7 +2256,7 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     let rows = if kind == 0 {
         target_rows(0, &[3], false)
     } else {
-        call_rounds(0, 3)
+        call_rounds(0, 3, 50_000)
     };
     let _ = sys::debug_write(&resource(), b"smp-measure report");
     STORM_OVER.store(1, Relaxed);
@@ -2274,11 +2278,6 @@ fn storm_rows(n: usize, kind: u64) -> Result<[u64; MEASURE_ROUNDS], &'static str
     rows
 }
 
-/// The numbers of the decision of SMP (tasks/2026-10-17-smp/decision.md,
-/// stage 6): the latency of a request to a thread on another CPU (S5x) with
-/// the target waiting in WFI and with a lower thread on its CPU, a call to
-/// a service on this CPU and on another, and under a storm of calls from
-/// the other CPUs the request to a thread of this CPU (S5) and a local call.
 /// Requests and replies between two CPUs that are idle between them: each
 /// request wakes the service on CPU 1 and each reply the caller on CPU 0, and
 /// with the poll of the idle loop (kernel idle.rs) the bell of either wake-up
@@ -2338,6 +2337,11 @@ fn idle_poll_interrupts() -> Outcome {
     check(fired == IRQ_ROUNDS, "a timer of an idle CPU did not fire")
 }
 
+/// The numbers of the decision of SMP (tasks/2026-10-17-smp/decision.md,
+/// stage 6): the latency of a request to a thread on another CPU (S5x) with
+/// the target waiting in WFI and with a lower thread on its CPU, a call to
+/// a service on this CPU and on another, and under a storm of calls from
+/// the other CPUs the request to a thread of this CPU (S5) and a local call.
 fn stage_6_measures() -> Outcome {
     let n = cpus()?;
     if n < 2 {
@@ -2351,9 +2355,18 @@ fn stage_6_measures() -> Outcome {
         "S5x target waiting, a lower thread on its CPU",
         target_rows(1, &[0, 1], true)?,
     );
-    print_row("call to a service on this CPU", call_rounds(0, 0)?);
+    print_row("call to a service on this CPU", call_rounds(0, 0, 50_000)?);
     let far = if n > 2 { 2 } else { 1 };
-    print_row("call to a service on another CPU", call_rounds(far, 0)?);
+    print_row(
+        "call to a service on another CPU",
+        call_rounds(far, 0, 50_000)?,
+    );
+    // The next call comes within the window of the poll of the idle CPUs
+    // (kcore::idlepoll), which a gap of 50 us never meets.
+    let _ = sys::debug_write(&resource(), b"smp-measure reset");
+    let rows = call_rounds(far, 0, 0);
+    let _ = sys::debug_write(&resource(), b"smp-measure poll");
+    print_row("call to a service on another CPU, back to back", rows?);
     print_row(
         "S5 on this CPU under a storm of the others",
         storm_rows(n, 0)?,

@@ -293,6 +293,10 @@ pub(super) fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
             crate::smpm::reset();
             return Ok(Values::new(&[a[1]]));
         }
+        b"smp-measure poll" => {
+            crate::smpm::report_poll();
+            return Ok(Values::new(&[a[1]]));
+        }
         b"smp-measure report" => {
             crate::smpm::report();
             return Ok(Values::new(&[a[1]]));

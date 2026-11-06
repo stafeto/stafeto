@@ -165,9 +165,9 @@ fn one_run(mode: &str, cpus: usize) -> Result<(Vec<Row>, Vec<Counted>), String> 
     {
         println!("{mode} {cpus} CPUs: {l}");
     }
-    if rows.len() != 6 || storms.len() != 2 {
+    if rows.len() != 7 || storms.len() != 2 {
         return Err(format!(
-            "the test init printed {} rows and {} storms of 6 and 2 (the lines: {:?})",
+            "the test init printed {} rows and {} storms of 7 and 2 (the lines: {:?})",
             rows.len(),
             storms.len(),
             o.lines
