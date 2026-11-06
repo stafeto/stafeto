@@ -158,8 +158,8 @@ REPOSITORY = "https://github.com/stafeto/relibc.git"
 # (nginx's workers drop root's groups by initgroups); tagged pin-e0e895e4.
 # crypt (stafeto-design#631): errno on every failure, the SHA setting read as
 # bytes (a salt with a non-ASCII character is refused), rounds above
-# 9,999,999 refused; the head of stafeto/relibc#6, tagged at its merge.
-COMMIT = "b30142b6eb03206b25c5f80cf221ca034068e11c"
+# 9,999,999 refused, a setting that starts with $ and is not ASCII refused; the head of stafeto/relibc#6, tagged at its merge.
+COMMIT = "2de2abb6916048aeed99069fe0022afa056016ad"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
