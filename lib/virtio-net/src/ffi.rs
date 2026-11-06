@@ -166,8 +166,8 @@ struct State {
     tx_of: [u32; QUEUE_SIZE],
     /// The buffers of the queue of receiving as far as its doorbell goes.
     stock: Stock,
-    /// Doorbells as counted for the report of Ш3: the passes that gave
-    /// buffers (one doorbell each before Ш3), the doorbells of receiving and
+    /// Doorbells as counted for the batching report: the passes that gave
+    /// buffers (one doorbell each before the batching), the doorbells of receiving and
     /// those of sending.
     bells: [u64; 3],
     tx_dirty: bool,
@@ -641,7 +641,7 @@ mod tests {
 }
 
 /// The doorbells so far: `out[0]` the passes of receiving that gave buffers
-/// (one doorbell each before Ш3), `out[1]` the doorbells of receiving,
+/// (one doorbell each before the batching), `out[1]` the doorbells of receiving,
 /// `out[2]` those of sending.
 ///
 /// # Safety
